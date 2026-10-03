@@ -3,15 +3,13 @@
 # pure-math graph `rk_expm_rule`, and the Enzyme adapter in ReactiveKernels'
 # own extension reads them from that graph's cuts. Ordinary reverse Enzyme
 # through `LinearAlgebra.exp` fails (`EnzymeNoDerivativeError` on the LAPACK
-# `ccall`), so this rule is the native-execution replacement path for the
-# hand-ported `_pk_expm3`; no Reactant custom rule is emitted (no release
+# `ccall`); no Reactant custom rule is emitted (no release
 # carries the upstream mechanism), so no XLA assertions here by design.
 using DifferentiationInterface: AutoEnzyme, gradient
 import Enzyme
 using Enzyme: Const, Duplicated, Forward
 using LinearAlgebra: dot, exp
 using ReactiveKernels
-using ReactiveKernelsPPL
 using Test
 
 _expm_fd_gradient(f, X; h = 1e-6) = begin
@@ -24,7 +22,7 @@ _expm_fd_gradient(f, X; h = 1e-6) = begin
     G
 end
 
-# Deterministic inputs: the 3x3 PK shape plus a second size proving the rule
+# Deterministic inputs at two sizes proving the rule
 # is size-generic, not a small-case special.
 const _EXPM_CASES = (
     [0.1 0.2 0.0; -0.1 0.1 0.3; 0.0 -0.2 0.2],
@@ -37,11 +35,8 @@ _expm_covector(n) = [0.2 * cos(2i + j) for i in 1:n, j in 1:n]
     @test rk_expm isa DerivativeRule
     @test sprint(show, rk_expm) ==
         "DerivativeRule(:rk_expm; inputs = (:A,), branches = forward+reverse)"
-    # Served by ReactiveKernels' generic adapter: this package defines no
-    # AD extension of its own.
+    # Served by ReactiveKernels' generic generated-rule adapter.
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsEnzymeExt) !== nothing
-    @test Base.get_extension(
-        ReactiveKernelsPPL, :ReactiveKernelsPPLEnzymeExt) === nothing
     for A in _EXPM_CASES
         @test rk_expm(A) == exp(A)
     end
@@ -49,10 +44,10 @@ _expm_covector(n) = [0.2 * cos(2i + j) for i in 1:n, j in 1:n]
     A = first(_EXPM_CASES)
     dA = _expm_direction(3)
     yb = _expm_covector(3)
-    primal = prepare(ReactiveKernelsPPL.rk_expm_rule; have = (:A,), want = :Y)
-    fwd = prepare(ReactiveKernelsPPL.rk_expm_rule;
+    primal = prepare(ReactiveKernels.rk_expm_rule; have = (:A,), want = :Y)
+    fwd = prepare(ReactiveKernels.rk_expm_rule;
         have = (:A, :A_dot), want = (:Y, :Y_dot))
-    rev = prepare(ReactiveKernelsPPL.rk_expm_rule;
+    rev = prepare(ReactiveKernels.rk_expm_rule;
         have = (:A, :Y_bar), want = :A_bar)
     @test primal(A) == rk_expm(A)
     @test fwd(A, dA) == forward_cut(rk_expm, A, dA)

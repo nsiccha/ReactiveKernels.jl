@@ -68,12 +68,76 @@ end
     _dv_check_regression(bound, 0.7)
     # `lower_rkppl(ast, data)` reads each value's shape; the plan then binds
     # any number for `s` without lowering again.
-    plan = lower_rkppl(_dv_regression(),
-        Dict{Symbol,Any}(:y => y, :x => x, :s => 0.7); conditioned = Dict{Symbol,Any}(:y => y, :x => x, :s => 0.7))
-    for sd in (0.7, 1.1)
-        _dv_check_regression(bind_data(plan,
-            Dict{Symbol,ColumnData}(:y => y, :x => x, :s => sd)), sd)
+    for data in ((; y, x, s = 0.7), Dict{Symbol,Any}(:y => y, :x => x, :s => 0.7))
+        plan = lower_rkppl(_dv_regression(), data; conditioned = (:y,))
+        for sd in (0.7, 1.1)
+            for values in ((; y, x, s = sd), Dict{Symbol,ColumnData}(:y => y, :x => x, :s => sd))
+                _dv_check_regression(bind_data(plan, values), sd)
+            end
+        end
     end
+end
+
+@testset "data values: NamedTuple binding shares validation and preserves inputs" begin
+    data = (; x = _DV_X, y = _DV_Y, s = 0.7, A = fill(0.125, 2, 2, 2))
+    saved = deepcopy(data)
+    plan = lower_rkppl(quote
+        a ~ Normal(0, 5)
+        b ~ Normal(0, 2)
+        width = s * total(A)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, width)
+    end, data; conditioned = (:y,), mod = _DV)
+    bound = bind_data(plan, data; roles = Dict(:x => :data))
+    control = bind_data(plan, Dict{Symbol,Any}(pairs(data)); roles = Dict(:x => :data))
+    @test bound.columns == control.columns
+    @test bound.roles == control.roles
+    @test bound.roles[:x] == :data
+    @test bound.n_obs == control.n_obs == length(data.y)
+    @test bound.columns[:x] === data.x
+    @test bound.columns[:A] === data.A
+    @test isempty(plan.columns)
+    @test isequal(data, saved)
+    built, control_built = build_kernel(bound), build_kernel(control)
+    @test kernel_expr(bound, built.layout) == kernel_expr(control, control_built.layout)
+    for preset in (:prior, :likelihood, :log_jacobian, :sampler)
+        @test _dv_value(built, bound, preset, _DV_U) ==
+            _dv_value(control_built, control, preset, _DV_U)
+    end
+    rebound = bind_data(bound, (; data..., s = 1.1))
+    _dv_check_regression(rebound, 1.1)
+    @test bound.columns[:s] == 0.7
+    @test rebound.columns[:s] == 1.1
+    @test isequal(data, saved)
+
+    # refused: role overrides must name supplied data and admitted roles.
+    @test_throws ContractValidationError bind_data(plan, data; roles = Dict(:absent => :data))
+    @test_throws ContractValidationError bind_data(plan, data; roles = Dict(:x => :unknown))
+    # refused: every supplied plate dimension must be consumed by the plan.
+    @test_throws ContractValidationError bind_data(plan, data; dims = Dict(:unused => 2))
+
+    observed = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        tau ~ Exponential(1)
+        y .~ Normal.(a .+ x, tau)
+    end, (; x = _DV_X, y = _DV_Y); conditioned = (:y,))
+    observed_data = (; x = _DV_X, y = _DV_Y, tau = 0.9)
+    conditioned = bind_data(observed, observed_data; conditioned = (:y, :tau))
+    conditioned_control = bind_data(observed, Dict{Symbol,Any}(pairs(observed_data));
+        conditioned = (:y, :tau))
+    @test conditioned.conditioned == Set((:tau,))
+    @test coordinate_names(build_kernel(conditioned).layout) == [:a]
+    @test conditioned.columns == conditioned_control.columns
+    @test isempty(observed.conditioned)
+    @test observed_data.tau == 0.9
+
+    # Prior-only models need no data mapping or observation axis.
+    prior = lower_rkppl(quote
+        a ~ Normal(0, 1)
+    end, (;))
+    empty_bound = bind_data(prior, (;))
+    @test isempty(empty_bound.columns)
+    @test coordinate_names(build_kernel(empty_bound).layout) == [:a]
 end
 
 @testset "data values: a pinned number is the definition it replaces" begin
@@ -183,7 +247,9 @@ end
 end
 
 @testset "data values: gradient through a number (Enzyme vs FD)" begin
-    bound = RKPPLModel(_dv_regression(), _DV)(; x = _DV_X, s = 0.7) | (; y = _DV_Y)
+    data = (; x = _DV_X, y = _DV_Y, s = 0.7)
+    plan = lower_rkppl(_dv_regression(), data; conditioned = (:y,), mod = _DV)
+    bound = bind_data(plan, data)
     built = _dv_built(bound)
     u = [0.2, -0.4]
     q = prepare_sampler(built, bound, u; backend =

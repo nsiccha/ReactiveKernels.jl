@@ -52,6 +52,8 @@ using .NativeSlotCompiler: prepare_transpiled, initial_transpiled_state, transpi
 include("reactive.jl")
 include("stateful.jl")
 include("visualization.jl")
+include("expm_rule.jl")
+include("symmetric_eigen_rules.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan
@@ -60,6 +62,7 @@ export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
 export prepare_ad_pullback, ad_pullback
 export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
 export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residuals
+export rk_expm, rk_symmetric_eigvals, rk_symmetric_eigvecs
 export has_forward_branch, has_reverse_branch, rule_inputs
 export stage_primal, stage_reverse, stage_residuals
 export ad_value_and_pullback, ad_value_and_pullback!
