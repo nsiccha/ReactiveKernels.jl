@@ -506,7 +506,8 @@ end
 
 # ── value expressions over arrays ────────────────────────────────────
 
-# True when `ex` reads an array parameter, directly or through assignments.
+# True when `ex` constructs an array value or reads an array parameter,
+# directly or through assignments.
 # For indexed assignments, `opaque` also includes module results: a Julia
 # call may produce an array without reading a declared one.
 function _mentions_array(ex, plan::StructuralPlan,
@@ -522,6 +523,7 @@ function _mentions_array(ex, plan::StructuralPlan,
             _mentions_array(plan.assignments[i].expr, plan, seen; opaque)
     end
     ex isa Expr || return false
+    ex.head === :vect && return true
     _level_plate_axis(ex) === nothing || return true
     return any(a -> _mentions_array(ex.head === :tuple ?
         _tuple_field_value(a) : a, plan, seen; opaque), ex.args)
@@ -574,6 +576,10 @@ function _value_axes(plan::StructuralPlan, ex,
     levelaxis === nothing || return Any[:(levels($levelaxis))]
     ax(a) = _value_axes(plan, a, seen; data_axes)
     head = ex.head
+    # A vector literal keeps its outer axis even when its entries are live
+    # scalars. Matrix products contract that axis rather than broadcasting
+    # the matrix's columns into the observation domain.
+    head === :vect && return Any[length(ex.args)]
     head === Symbol("'") && return _adjoint_axes(ax(ex.args[1]))
     if head === :.
         _is_dotted_call(ex) || return nothing
