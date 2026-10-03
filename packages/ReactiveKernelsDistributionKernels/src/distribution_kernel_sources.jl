@@ -1535,15 +1535,11 @@ docs_example = (;
 )
 """
 
-# Exact-GP latent construct (plain Julia functions, NOT @kernel sources:
-# the PPL splices these calls into generated code like any other Julia
-# call, and Enzyme differentiates the straight-line arithmetic natively).
-# Native path only: Reactant reverse through dense Cholesky gradients is
-# upstream-blocked (EnzymeMLIR), so XLA over these stays unverified until
-# that gap closes. Written traceably (broadcasts/loops, no LAPACK) for that
-# day — the potrf below is pure Julia precisely because Enzyme cannot
-# differentiate LAPACK.
+# Exact-GP covariance is an RK pair plate. Dense factorization remains a
+# numerical leaf; covariance support does not imply compiled Cholesky AD.
 export gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
+
+include("gp_covariance.jl")
 
 """
     gp_exp_quad_cov(x, sigma, rho, jitter) -> Matrix{Float64}
@@ -1557,24 +1553,7 @@ silent `NaN`s).
 """
 function gp_exp_quad_cov(x::AbstractVector, sigma::Real, rho::Real,
         jitter::Real)
-    n = length(x)
-    n >= 1 || throw(ArgumentError(
-        "gp_exp_quad_cov needs at least one location, got n = $n"))
-    sigma > 0 || throw(ArgumentError(
-        "gp_exp_quad_cov sigma must be positive, got $sigma"))
-    rho > 0 || throw(ArgumentError(
-        "gp_exp_quad_cov rho must be positive, got $rho"))
-    isfinite(jitter) && jitter >= 0 || throw(ArgumentError(
-        "gp_exp_quad_cov jitter must be finite and nonnegative, got $jitter"))
-    s2 = Float64(sigma)^2
-    denom = 2 * Float64(rho)^2
-    jit = Float64(jitter)
-    K = Matrix{Float64}(undef, n, n)
-    @inbounds for j_ in 1:n, i in 1:n
-        d = Float64(x[i]) - Float64(x[j_])
-        K[i, j_] = s2 * exp(-d * d / denom) + (i == j_ ? jit : 0.0)
-    end
-    return K
+    _GP_EXP_QUAD_COV(x, sigma, rho, jitter)
 end
 
 function gp_exp_quad_cov(x::AbstractMatrix, sigma::Real, rho,
@@ -1596,28 +1575,7 @@ never silent `NaN`s).
 """
 function gp_periodic_cov(x::AbstractVector, sigma::Real, rho::Real,
         period::Real, jitter::Real)
-    n = length(x)
-    n >= 1 || throw(ArgumentError(
-        "gp_periodic_cov needs at least one location, got n = $n"))
-    sigma > 0 || throw(ArgumentError(
-        "gp_periodic_cov sigma must be positive, got $sigma"))
-    rho > 0 || throw(ArgumentError(
-        "gp_periodic_cov rho must be positive, got $rho"))
-    isfinite(period) && period > 0 || throw(ArgumentError(
-        "gp_periodic_cov period must be finite and positive, got $period"))
-    isfinite(jitter) && jitter >= 0 || throw(ArgumentError(
-        "gp_periodic_cov jitter must be finite and nonnegative, got $jitter"))
-    s2 = Float64(sigma)^2
-    r2 = Float64(rho)^2
-    per = Float64(period)
-    jit = Float64(jitter)
-    K = Matrix{Float64}(undef, n, n)
-    @inbounds for j_ in 1:n, i in 1:n
-        d = abs(Float64(x[i]) - Float64(x[j_]))
-        s = sin(pi * d / per)
-        K[i, j_] = s2 * exp(-2 * s * s / r2) + (i == j_ ? jit : 0.0)
-    end
-    return K
+    _GP_PERIODIC_COV(x, sigma, rho, period, jitter)
 end
 
 function gp_periodic_cov(x::AbstractMatrix, sigma::Real, rho::Real,

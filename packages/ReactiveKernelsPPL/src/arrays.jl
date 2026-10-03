@@ -701,6 +701,11 @@ function _validate_gather_axis(plan::StructuralPlan, name::Symbol, label,
     _is_levels_dim(d) || return _validate_positional_gather(plan, name,
         label, g, _array_dim_size(plan, name, label, d))
     col = _gather_index_column(plan, name, label, g)
+    return _validate_level_gather(plan, name, label, d, g, col)
+end
+
+function _validate_level_gather(plan::StructuralPlan, name::Symbol, label,
+        d, g::Symbol, col::AbstractVector)
     lv = _array_axis_levels(plan, name, label, d.args[2])
     codes = _declared_codes(col, lv)
     any(==(0), codes) && _fail(label, "`$name[$g]` looks values of " *
@@ -1117,6 +1122,33 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
     # cell body indexes by those codes and is RK's to plan.
     _is_plate_column_expr(ex) && return Expr(:do,
         _array_gather_rewrite(ex.args[1], plan, needed), ex.args[2])
+    if ex.head === :call && length(ex.args) == 4 &&
+            ex.args[1] === :_ppl_level_gather
+        name, g, ld = ex.args[2:end]
+        axs = _gather_axes(plan, name)
+        d = axs[ld]
+        lv = _array_axis_levels(plan, name, :plan, d.args[2])
+        lv = _apply_subset(lv, LevelMap(name, d.args[2], [], :levels,
+            _levels_subset(d)))
+        # These codes depend only on bound labels, not the number of cells
+        # in the graph. Omitted selected levels use the usual zero row.
+        codes = _declared_codes(_array_axis_levels(plan, name, :plan, g), lv)
+        source = name
+        if _levels_subset(d) !== Colon()
+            source = length(axs) == 1 ? :(vcat(0.0, $name)) :
+                ld == 1 ? :(vcat(zeros(1, size($name, 2)), $name)) :
+                :(cat(zeros(size($name, 1), size($name, 2), 1), $name; dims = 3))
+            codes = codes .+ 1
+        end
+        ix = Expr(:vect, codes...)
+        length(axs) == 1 && return Expr(:ref, source, ix)
+        if ld == 1
+            aligned = Expr(:ref, source, ix, :(:))
+            return :(eachcol(permutedims($aligned)))
+        end
+        aligned = Expr(:ref, source, :(:), :(:), ix)
+        return :(eachcol(reshape($aligned, size($name, 1) * size($name, 2), :)))
+    end
     if ex.head === :call && !isempty(ex.args) &&
             ex.args[1] in (:_ppl_level_indices, :_ppl_level_values)
         g = ex.args[2]

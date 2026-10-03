@@ -97,3 +97,67 @@ end
     Base.invokelatest(_pcr_measure, built, bound, u; expected,
         reference = string_oracle, structure_ad = true)
 end
+
+@testset "Reactant: level-axis gathers precede the cell" begin
+    for kind in (:selected, :reordered, :other, :other_selected, :varying,
+            :matrix_selected, :matrix_other, :lazy, :live)
+        histograms = map(((7, 3), (21, 5))) do (n, S)
+            built, bound, cols, u, oracle = _plv_axis_build(kind, n, S)
+            reference(w) = first(oracle(w))
+            expected = (reference(u), _findiff_grad(reference, u))
+            Base.invokelatest(_pcr_measure, built, bound, u; expected,
+                reference, structure_ad = true)
+        end
+        @test get(histograms[1], "enzyme.batch", 0) > 0
+        @test histograms[1] == histograms[2]
+    end
+    histograms = map(((7, 3), (21, 5))) do (n, S)
+        built, bound, cols, u, oracle = _plv_stack_build(n, S)
+        reference(w) = first(oracle(w))
+        expected = (reference(u), _findiff_grad(reference, u))
+        Base.invokelatest(_pcr_measure, built, bound, u; expected,
+            reference, structure_ad = true)
+    end
+    @test get(histograms[1], "enzyme.batch", 0) > 0
+    @test histograms[1] == histograms[2]
+    for kind in (:selected, :other)
+        built, bound, cols, u, oracle = _plv_axis_build(kind, 9, 3;
+            labels = ["c", "a", "b"])
+        reference(w) = first(oracle(w))
+        expected = (reference(u), _findiff_grad(reference, u))
+        Base.invokelatest(_pcr_measure, built, bound, u; expected,
+            reference, structure_ad = true)
+    end
+    for kind in (:selected, :other)
+        histograms = map(((9, ["c", "a", "b", "unused"]),
+                (21, ["c", "a", "b", "unused", "extra", "more"]))) do (n, labels)
+            built, bound, cols, u, oracle = _plv_axis_build(kind, n, length(labels);
+                labels, pooled = true)
+            reference(w) = first(oracle(w))
+            expected = (reference(u), _findiff_grad(reference, u))
+            Base.invokelatest(_pcr_measure, built, bound, u; expected,
+                reference, structure_ad = true)
+        end
+        @test get(histograms[1], "enzyme.batch", 0) > 0
+        @test histograms[1] == histograms[2]
+    end
+end
+
+@testset "Reactant limitation: inactive invalid constant read in a live branch" begin
+    # Native primal and AD pass above. The backend-only reproducer is
+    # benchmark/repro_reactant_inactive_constant_index.jl.
+    built, bound, cols, u, oracle = _plv_axis_build(:live_oob, 7, 3)
+    kernel = prepare_query(built, bound, :sampler)
+    ru = Reactant.to_rarray(u)
+    err = try
+        Reactant.@compile kernel(ru)
+        nothing
+    catch e
+        e
+    end
+    if err !== nothing
+        @test err isa BoundsError
+        @test err.i == (100,)
+    end
+    @test_broken err === nothing
+end
