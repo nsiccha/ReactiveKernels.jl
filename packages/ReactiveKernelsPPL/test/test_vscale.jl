@@ -382,7 +382,7 @@ end
                     :(theta[i] ~ Normal(mu, tau)),
                     :(y[i] ~ Normal.(theta[i], _t2[i]))))))
     # capability: deterministic transform of a plate latent (_t2 = theta .+ 1) as per-cell scale (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(expr, (:y,); conditioned = (:y,)); true)
+    @test (lower_rkppl(expr, (:y,); conditioned = (:y,)); true)
 end
 
 @testset "contract: hand-built scale-predictor plans" begin

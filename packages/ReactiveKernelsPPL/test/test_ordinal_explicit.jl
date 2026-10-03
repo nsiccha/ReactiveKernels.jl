@@ -329,7 +329,7 @@ end
     end, data); true)
     # Nothing reads or consumes it: unused, like an unused simplex.
     # capability: an unused declared parameter is a prior-only draw (10gzbm9 degenerate) (todo `1qlbn5b`)
-    @test_broken (_oe_lower(quote
+    @test (_oe_lower(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         k ~ Ordered(Normal(0, 1), 2)
@@ -349,7 +349,7 @@ end
             @test occursin("element prior", refused(program))
         else
             # capability: non-Normal and sampled-argument ordered priors (P8 1cmodra; todo `0fkd9yk`).
-            @test_broken (_oe_lower(program, data); true)
+            @test (_oe_lower(program, data); true)
         end
     end
     # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)

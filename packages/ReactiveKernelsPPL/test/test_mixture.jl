@@ -391,8 +391,8 @@ end
     supported = Set(["frequency weights rejected", "evidence rejected",
         "partial range rejected", "fully fixed", "assignment location",
         "data-column location", "split Binomial trials", "stated scalar loc alias",
-        "uniform default weights"])
-    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "boolean weights", "wrapped param", "bare predictor"])
+        "uniform default weights", "wrapped param"])
+    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "boolean weights", "bare predictor"])
     for (label, prog, E) in cases
         @testset "$label" begin
             if label in supported
