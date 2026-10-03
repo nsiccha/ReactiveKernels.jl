@@ -1095,12 +1095,33 @@ end
 # partial or replacing a product with a reassociated prefix recurrence.
 _lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
 _lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
+_lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
 
 function _lkj_array_transform_statements(e::LayoutEntry)
     L, K = e.name, e.dims[1]
     z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
+    diagonal = _lkj_array_diagonal(L)
     return Expr[
         :($z::Vector{Float64} = tanh.($(block_read(e.offset, e.size)))),
+        # The diagonal is part of constructing the factor. Publish it as a
+        # graph value so a guarded prior need not share the whole matrix with
+        # response products. Each diagonal entry is still computed once.
+        :($diagonal::Vector{Float64} = let
+            out = ones(Float64, $K)
+            for j in 2:$K
+                base = (j - 1) * (j - 2) ÷ 2
+                d = 1.0
+                for ip in 1:$(K - 1)
+                    d = if ip < j
+                        d * sqrt(1 - $z[base + ip]^2)
+                    else
+                        d
+                    end
+                end
+                out[j] = d
+            end
+            out
+        end),
         :($L::Matrix{Float64} = let
             out = zeros(Float64, $K, $K)
             out[1, 1] = 1.0
@@ -1124,15 +1145,7 @@ function _lkj_array_transform_statements(e::LayoutEntry)
                     end
                     out[j, i] = entry_value
                 end
-                d = 1.0
-                for ip in 1:$(K - 1)
-                    d = if ip < j
-                        d * sqrt(1 - $z[base + ip]^2)
-                    else
-                        d
-                    end
-                end
-                out[j, j] = d
+                out[j, j] = $diagonal[j]
             end
             out
         end),
@@ -1155,13 +1168,15 @@ end
 
 # The normalization constant is preparation-only metadata. The diagonal sum
 # remains a retained recipe loop even for a conditioned, caller-owned factor.
-function _lkj_array_prior_terms(L::Symbol, K::Int, eta::Float64)
+function _lkj_array_prior_terms(L::Symbol, K::Int, eta::Float64;
+        diagonal::Union{Nothing,Symbol} = nothing)
     c = lkj_logconst(K, eta)
-    diagonal = _lkj_prior_diagonal(:(log($L[i, i])), K, :i, eta)
+    entry = diagonal === nothing ? :($L[i, i]) : :($diagonal[i])
+    term = _lkj_prior_diagonal(:(log($entry)), K, :i, eta)
     return :(let
         total = $c
         for i in 2:$K
-            total += $diagonal
+            total += $term
         end
         total
     end)
@@ -1294,8 +1309,11 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             continue
         end
         if p.family === :lkj_cholesky
+            diagonal = p.name in plan.conditioned ? nothing :
+                _lkj_array_diagonal(p.name)
             push!(stmts, :($node::Float64 =
-                $(_lkj_array_prior_terms(p.name, dims[1], Float64(p.args.arg1)))))
+                $(_lkj_array_prior_terms(p.name, dims[1], Float64(p.args.arg1);
+                    diagonal))))
             push!(terms, node)
             push!(pointwise, p.name => node)
             continue
