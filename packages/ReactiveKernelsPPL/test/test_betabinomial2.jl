@@ -139,7 +139,7 @@ end
             end, (:c, :x); conditioned = (:c, :x))
         # Bare mean (link-space predictors wrap; Beta precedent).
         # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
-        @test_broken (lower_rkppl(quote
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 mu = a .+ b .* x

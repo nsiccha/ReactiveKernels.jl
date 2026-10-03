@@ -72,8 +72,8 @@ _bare_posterior(kern, lay, q::NamedTuple) =
         k .~ Binomial.(n, 0.3)
     end"""), (:k, :n); conditioned = (:k, :n))).responses)
 
-    # Other families keep the strict broadcast-link message.
-    # refused: undeclared phi (P6, 05oe96l); NB2 mean is also a real-support parameter with no link
+    # Auxiliary names obey the same declaration requirement as locations.
+    # refused: undeclared phi (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(Meta.parse("""begin
         mu ~ Normal(0.0, 5.0)
         y .~ NegativeBinomial2.(mu, phi)
@@ -89,22 +89,22 @@ _bare_posterior(kern, lay, q::NamedTuple) =
     # Bare predictors keep their link: the bare slot admits sampled
     # parameters only, so a deterministic definition still needs its
     # link wrapper (mirrors the slice-1 / error-paths pins).
-    # capability: identity-link Binomial probability from an affine predictor (identity-scale precedent) (todo `05fuzch`)
-    @test_broken (lower_rkppl(Meta.parse("""begin
+    # admitted: identity-link Binomial probability from an affine predictor (identity-scale precedent)
+    @test (lower_rkppl(Meta.parse("""begin
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         k .~ Binomial.(n, mu)
     end"""), (:k, :n, :x); conditioned = (:k, :n, :x)); true)
-    # capability: identity-link Bernoulli probability from an affine predictor (todo `05fuzch`)
-    @test_broken (lower_rkppl(Meta.parse("""begin
+    # admitted: identity-link Bernoulli probability from an affine predictor
+    @test (lower_rkppl(Meta.parse("""begin
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Bernoulli.(mu)
     end"""), (:y, :x); conditioned = (:y, :x)); true)
-    # capability: identity-link Poisson rate from an affine predictor (todo `05fuzch`)
-    @test_broken (lower_rkppl(Meta.parse("""begin
+    # admitted: identity-link Poisson rate from an affine predictor
+    @test (lower_rkppl(Meta.parse("""begin
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
@@ -401,7 +401,7 @@ end""")
         isempty(t.options.subs)
     @test [p.name for p in plan.parameters] == [:mu, :s]
     @test isempty(plan.population_priors)
-    # The per-index twin desugars to the identical plan.
+    # The per-index twin retains its authored selector; the math agrees.
     twin = lower_rkppl(Meta.parse("""begin
         mu ~ Normal(0, 1)
         s ~ Exponential(1)
@@ -409,7 +409,11 @@ end""")
             y[i] ~ Normal(mu, s)
         end
     end"""), (:y,); conditioned = (:y,))
-    @test _plans_equal(plan, twin)
+    @test only(twin.responses).range == :(y[eachindex(y)])
+    @test twin.indexed_observations == Set([:y])
+    twin_math = ReactiveKernelsPPL._with(twin; responses = [
+        ReactiveKernelsPPL._with(r; range = nothing) for r in twin.responses])
+    @test _plans_equal(plan, twin_math)
     # Any prior family: the parameter is never a coefficient.
     ep = lower_rkppl(Meta.parse("""begin
         mu ~ Exponential(1)

@@ -186,3 +186,18 @@ end
 end
 
 end
+
+module EndpointBranchCaller
+using ReactiveKernels
+using ..BranchPartition
+nonbase_endpoint_helper(x) = error("endpoint helper rebound into caller")
+@kernel scoped_endpoint_arm(y::Vector{Float64}, m::Vector{Float64},
+                            g::Vector{Int}) = begin
+    pointwise = plate(y, m, g) do yf, mf, gf
+        cell::Float64 = gf == 0 ?
+            BranchPartition.helper_normal(mf, 1.5).logpdf(yf) : 0.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+end

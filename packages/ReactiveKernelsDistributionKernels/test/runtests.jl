@@ -24,7 +24,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     NEGATIVE_BINOMIAL_KERNEL_SOURCE,
     WEIBULL_KERNEL_SOURCE,
     ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE,
-    normal, cauchy, laplace, logistic, bernoulli, lognormal,
+    normal, cauchy, laplace, logistic, bernoulli, binomial, poisson, lognormal,
     exponential, geometric, uniform, mvnormal, ar1,
     categorical_logit, categorical_logit_ref,
     negative_binomial2, beta_binomial, negative_binomial, weibull,
@@ -581,6 +581,40 @@ end
     @test_throws ArgumentError gp_chol_latent(fill(1.0, 3, 3), ones(3))
 end
 
+@testset "poisson and binomial selected HAVE tails" begin
+    bm = prepare(binomial.logpdf; have = (:observed, :n, :logit), want = :logpdf)
+    ps = prepare(poisson.logpdf; have = (:observed, :log_rate), want = :logpdf)
+    for eta in (-1000.0, -80.0, 80.0, 1000.0), y in (0, 1, 3)
+        combination = y == 1 ? log(3.0) : 0.0
+        expected = combination - y * log1pexp(-eta) - (3 - y) * log1pexp(eta)
+        @test bm(y, 3, eta) ≈ expected
+    end
+    @test ps(1, 1000.0) == -Inf
+    @test ps(1, -1000.0) ≈ -1000.0
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    bm_ad = prepare_ad(bm, backend, 1, 3, 0.0; active = :logit)
+    zib = prepare(zero_inflated_binomial.logpdf;
+        have = (:observed, :n, :logit, :zi), want = :logpdf)
+    zib_ad = prepare_ad(zib, backend, 1, 3, 0.0, 0.2; active = :logit)
+    for eta in (-1000.0, -80.0, 80.0, 1000.0), y in (0, 1, 3)
+        p = 1 / (1 + exp(-eta))
+        combination = y == 1 ? log(3.0) : 0.0
+        binomial_mass = combination - y * log1pexp(-eta) - (3 - y) * log1pexp(eta)
+        score = y / (1 + exp(eta)) - (3 - y) * p
+        @test ad_gradient(bm_ad, y, 3, eta) ≈ score
+        binomial_arm = log1p(-0.2) + binomial_mass
+        expected = y == 0 ? log1p(0.8 * expm1(binomial_mass)) : binomial_arm
+        @test zib(y, 3, eta, 0.2) ≈ expected
+        expected_gradient = y == 0 ?
+            -3p * exp(binomial_arm - expected) : score
+        @test ad_gradient(zib_ad, y, 3, eta, 0.2) ≈ expected_gradient atol = 1e-13
+    end
+    for eta in (-1000.0, 1000.0), zi in (0.0, 1.0)
+        @test bm(0, 0, eta) == 0.0
+        @test zib(0, 0, eta, zi) == 0.0
+    end
+end
+
 @testset "negative_binomial2 Stan lpmf parity" begin
     # NB2(mu, phi) is Stan's neg_binomial_2: var = mu + mu^2/phi, which is
     # exactly NegativeBinomial(phi, phi/(phi+mu)) — the independent oracle.
@@ -721,16 +755,13 @@ end
             zip(0, log(2.5), NaN))
         @test !isnan(v)
     end
-    # A NaN rate reaches the guard through the linear `rate` port
-    # (`log(NaN)` is NaN, not a throw). A negative rate instead throws
-    # DomainError at the eager `log(rate)` route node — invalid HAVE,
-    # not an event (the `poisson` kernel's identical structure throws
-    # the same way).
+    # Direct rate inputs use the lazy parameter guard, including NaN
+    # and negative rates, without evaluating log(rate) in the inactive arm.
     zip_rate = prepare(zero_inflated_poisson.logpdf;
         have = (:observed, :rate, :zi), want = :logpdf)
     @test zip_rate(2, NaN, 0.2) == -Inf
     @test !isnan(zip_rate(2, NaN, 0.2))
-    @test_throws DomainError zip_rate(2, -1.0, 0.2)
+    @test zip_rate(2, -1.0, 0.2) == -Inf
 end
 
 @testset "zero_inflated_binomial Stan lpmf parity" begin
@@ -748,6 +779,9 @@ end
             log1p(-zi) + bb
         @test zib(y, n, p, zi) ≈ ref
     end
+    # A tiny ordinary-binomial zero mass stays finite in log space.
+    @test zib(0, 2000, 0.5, 0.0) ≈ 2000log1p(-0.5)
+    @test zib(0, 2000, 0.5, 1e-20) ≈ log(1e-20)
     # A certain structural zero forbids positive counts.
     @test zib(2, 3, 0.5, 1.0) == -Inf
     # Impossible events are -Inf, never NaN (lazy support guard).

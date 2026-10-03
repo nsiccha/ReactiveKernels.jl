@@ -78,8 +78,8 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
             (BetaLogitFam, ScalePredictorRef(:lk, LogLink))
     end
     @testset "bare predictor kappa fails closed" begin
-        # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
-        @test_broken (lower_rkppl(quote
+        # admitted: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links)
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)
@@ -90,8 +90,8 @@ _bk_cols() = Dict{Symbol,AbstractVector}(:prop => copy(_BK_PROP),
             end, (:prop, :x, :z); conditioned = (:prop, :x, :z)); true)
     end
     @testset "logit-wrapped predictor kappa fails closed" begin
-        # capability: Beta precision under a positive non-log link (logistic.(lk) in (0,1)) (todo `05fuzch`)
-        @test_broken (lower_rkppl(quote
+        # admitted: Beta precision under a positive non-log link (logistic.(lk) in (0,1))
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)

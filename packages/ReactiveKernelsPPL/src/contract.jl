@@ -211,23 +211,15 @@ end
 """
     ScalePredictorRef(predictor, link)
 
-A predictor-fed scale/shape use: the response's auxiliary (Gaussian
-sigma, NB2 dispersion phi, Gamma shape alpha, Beta concentration
-kappa, Student sigma, Student nu, hurdle p_zero, VonMises
-concentration kappa, BetaBinomial2 precision phi, NB1 success
-probability p, InverseGaussian shape lambda, and — on the dedicated
-`zi` slot — ZIP zero-inflation zi; LogNormal sigma and Weibull k stay
-scalar-only) is a whole linear predictor, varying per observation.
-`predictor` names the
-[`PredictorSpec`](@ref) (planned exactly like a location predictor:
-terms, priors, one link); `link` is the scale use-site wrapper —
-[`IdentityLink`](@ref) (bare predictor), [`LogLink`](@ref)
-(`exp.(predictor)`), or [`LogitLink`](@ref) (`logistic.(predictor)`) —
-and must equal the predictor's own link (the one-link-per-predictor
-rule). The generator binds the constrained vector once per response
-(`_ppl_sc_<label>`, `_ppl_sc_<label>_nu` for the Student nu slot) and
-threads it through the likelihood plate per cell, so evidence
-corrections read the per-cell scale.
+A per-observation auxiliary use, including scale, shape, probability,
+Student degrees of freedom and zero inflation. `predictor` names the
+[`PredictorSpec`](@ref), whose emitted value is unchanged. `link` belongs
+to this use: identity reads the value directly; log, logit, probit and
+cloglog apply `exp`, `logistic`, `normcdf` and `cexpexp`, respectively.
+Several positions may share the same predictor under different links.
+The generator binds each transformed vector once and threads it through
+the likelihood plate. A value outside the distribution parameter's
+support contributes `-Inf` through a lazy density branch.
 """
 struct ScalePredictorRef
     predictor::Symbol
@@ -256,20 +248,11 @@ Gaussian sigma, NB2 dispersion phi, Gamma shape alpha, hurdle p_zero,
 InverseGaussian shape lambda, BetaBinomial2 precision phi, VonMises
 concentration kappa, NB1 success probability p, LogNormal scale sigma,
 Weibull shape k — either scalar (parameter, assignment, folded
-literal, or a raw per-observation data column) or, for
-Gaussian/NB2/Gamma/Beta/Student/hurdle/VonMises/BB2/NB1/IG only, a
-[`ScalePredictorRef`](@ref) (predictor-fed per-observation auxiliary);
-it must be `nothing` otherwise. A hurdle p_zero is a probability
-(scalar in [0, 1], predictor-fed logit-only). An NB1 p is a probability
-too (scalar in [0, 1], a raw per-observation data column, or
-predictor-fed logit-only). A Beta or
-VonMises kappa is
-predictor-fed log-only (a concentration), as is an InverseGaussian
-lambda (a shape). A BetaBinomial2 phi takes
-identity/log/logit (the NB2-phi precedent — the SB spelling is log
-precision). A LogNormal sigma is scalar-only
-(predictor-fed sigma deferred); a Weibull k is scalar-only
-(predictor-fed k deferred).
+literal, or a raw per-observation data column) or a
+[`ScalePredictorRef`](@ref). The latter includes LogNormal sigma and
+Weibull k. Probability auxiliaries (hurdle p_zero and NB1 p) take values
+in [0, 1]; other scale/shape auxiliaries take positive values. The link
+need not guarantee support: the density checks the evaluated value.
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `nu` is the StudentT
 degrees of freedom, `nothing` otherwise: a sampled parameter/assignment
@@ -309,9 +292,9 @@ at their defaults:
   `nothing` otherwise.
 - `discrimination`: OrdinalFam positive latent scale
   (`nothing` = 1.0), `nothing` otherwise: a positive Real literal, a
-  finite-positive data column, a legacy LogLink predictor name, or an
-  IdentityLink `ScalePredictorRef` reading an authored value directly.
-  The latter has finite-positive support checked by a lazy likelihood guard.
+  finite-positive data column, a legacy predictor name, or a `ScalePredictorRef`
+  whose link belongs to this discrimination use.
+  Modeled values have finite-positive support checked by a lazy likelihood guard.
 - `threshold_columns`: OrdinalFam per-threshold design columns
   (StoppingRatio only), empty otherwise.
 - `threshold_coefs`: the (K−1)×p threshold-coefficient matrix packed as a
@@ -1303,7 +1286,9 @@ carries a LIST). `location`/`scale` are the first/second positional
 family args; `params` the remaining args (`()` for two-arg families).
 Multi-param families (joint PK/QT/TGI) are grouped-only."""
 const KernelObs =
-    NamedTuple{(:response, :family, :location, :scale, :params)}
+    Union{NamedTuple{(:response, :family, :location, :scale, :params)},
+        NamedTuple{(:response, :family, :location, :scale, :params, :link)}}
+_kernel_obs_link(obs::KernelObs) = hasproperty(obs, :link) ? obs.link : IdentityLink
 
 """Scalar response-space in-cell obs families (v2 panel set; grouped
 admits these plus the joint families). Cell args are constrained-scale
@@ -1900,12 +1885,12 @@ _matrix_element_addressees(m::DesignMatrix) =
 isbound(plan::StructuralPlan) = !isempty(plan.columns) ||
     (plan.n_obs > 0 && !_has_observation_axis(plan))
 
-"""Admitted (family, likelihood-link, predictor-link) triples (triple pin).
-Triples 2 and 3 lower identically; the triple is admission key + lowering
-selector, never pairwise link equality. Multinomial/Categorical name a
+"""Canonical likelihood links, retained for family vocabulary and stable routes.
+Predictor metadata does not transform a value or restrict another use.
+Multinomial/Categorical name a
 simplex vector parameter instead of a linear predictor, so they skip the
 triple (the scan-state precedent) and validate on the simplex path."""
-const ADMITTED_TRIPLES = (
+const _CANONICAL_TRIPLES = (
     (GaussianFam, IdentityLink, IdentityLink),
     (BernoulliLogitFam, LogitLink, IdentityLink),
     (BernoulliLogitFam, LogitLink, LogitLink),
@@ -1937,6 +1922,20 @@ const ADMITTED_TRIPLES = (
     (GammaValueFam, IdentityLink, IdentityLink),
     (WeibullValueFam, IdentityLink, IdentityLink),
 )
+
+# Predictor metadata never applies a transform. Each scalar likelihood
+# parameter owns its use-site inverse; categorical/ordinal links retain
+# their distribution-specific meaning.
+const _VALUE_LINK_FAMILIES = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
+    BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam, BetaLogitFam,
+    StudentTFam, HurdlePoissonFam, ZeroInflatedPoissonFam, InverseGaussianFam,
+    BetaBinomial2Fam, VonMisesFam, NegativeBinomialFam, ExponentialLogFam,
+    LogNormalFam, WeibullFam, ZeroInflatedBinomialFam)
+const ADMITTED_TRIPLES = Tuple((family, link, predictor_link)
+    for (family, canonical, _) in (_CANONICAL_TRIPLES...,
+        (ZeroInflatedBinomialFam, IdentityLink, IdentityLink))
+    for link in (family in _VALUE_LINK_FAMILIES ? instances(LinkFunction) : (canonical,))
+    for predictor_link in instances(LinkFunction))
 
 """Positional arity per sampled family (Distributions.jl order; `:student_t`
 is `(nu, mu, sigma)` in Stan order, matching the response spelling)."""
@@ -4319,6 +4318,11 @@ end
 function _validate_kernel_scalar_obs(kp::KernelPlate, obs::KernelObs,
         known::Set{Symbol}, grouped::Bool)
     fam = obs.family
+    link = _kernel_obs_link(obs)
+    (link === IdentityLink ||
+        (fam === BernoulliLogitFam && link === LogitLink) ||
+        (fam === PoissonLogFam && link === LogLink)) ||
+        _fail(kp.label, "in-cell $fam does not take link $link")
     one_arg = fam === BernoulliLogitFam || fam === PoissonLogFam
     if one_arg
         obs.scale === nothing ||
@@ -4383,6 +4387,7 @@ function _kernel_obs_literal_domain(kp::KernelPlate, obs::KernelObs,
     end
     isfinite(v) ||
         _fail(kp.label, "kernel obs $slot literal must be finite, got $v")
+    slot === :location && _kernel_obs_link(obs) !== IdentityLink && return nothing
     ok = if fam === BinomialProbFam
         slot === :location ? (v isa Integer && v >= 0) : 0 <= v <= 1
     elseif fam === BernoulliLogitFam
@@ -4474,9 +4479,6 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
                   "args name subject-level predictors; model scalars " *
                   "enter the cell as globals)")
         pred = plan.predictors[i]
-        pred.link === IdentityLink ||
-            _fail(kp.label, "kernel LP arg `$p` needs IdentityLink " *
-                  "(got $(pred.link) — subject LPs feed the cell raw)")
         _predictor_level(plan, p) === :subject ||
             _fail(kp.label, "kernel LP arg `$p` is unreachable " *
                   "(internal: mixed-level predictors fail in " *
@@ -7195,7 +7197,7 @@ const _COMPOSED_OPS = (:.*, :.+, :.-)
 # the IRT discrimination `a = exp(log_a)`; `logistic.(xi)` — sigmoid
 # transient/saturating curves), spelled as Julia dotted calls. At a
 # location, one of these over ONE bare sub-predictor is a link spelling.
-const _COMPOSED_UNARY = (:exp, :logistic)
+const _COMPOSED_UNARY = (:exp, :logistic, :normcdf, :cexpexp)
 # The other dotted operators (`mu ./ s`, `mu .^ 2`, comparisons for
 # `ifelse.`): plain broadcast math over the LP nodes.
 const _COMPOSED_MORE_OPS = Tuple(op for op in ELEMENTWISE_OPS
@@ -8103,10 +8105,8 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
 end
 
 # Ordinal-only extras: discrimination (a positive literal, a data
-# column resolved at bind, or a modeled scale naming a LogLink plan
-# predictor — positivity is structural via `exp`, the `log(disc)` recipe;
-# a predictor under any other link, and any other in-graph name, fail
-# closed), per-threshold design columns (StoppingRatio only: cumulative
+# column resolved at bind, or a modeled scale with support checked at
+# execution), per-threshold design columns (StoppingRatio only: cumulative
 # category-specific effects can break monotonicity), and their coefficient
 # matrix (a `:vector_normal` vector parameter packing (K−1)×p, required
 # exactly when design columns are present).
@@ -8123,8 +8123,6 @@ function _validate_ordinal_extras(r::LikelihoodSpec, plan::StructuralPlan,
     end
     d = r.discrimination
     if d isa ScalePredictorRef
-        d.link === IdentityLink || _fail(r.label,
-            "an ordinal discrimination value uses IdentityLink")
         any(p -> p.name === d.predictor, plan.predictors) || _fail(r.label,
             "ordinal discrimination predictor $(d.predictor) is missing")
         push!(used_predictors, d.predictor)
@@ -8135,11 +8133,6 @@ function _validate_ordinal_extras(r::LikelihoodSpec, plan::StructuralPlan,
     elseif d isa Symbol
         si = findfirst(p -> p.name === d, plan.predictors)
         if si !== nothing
-            sp = plan.predictors[si]
-            sp.link === LogLink || _fail(r.label,
-                "ordinal discrimination predictor $d must carry LogLink " *
-                "(a modeled scale is positive by construction via exp, " *
-                "got $(sp.link))")
             push!(used_predictors, d)
         end
         # else a data column — resolved at bind.
@@ -8282,19 +8275,9 @@ end
 # `predictor`, trials ride the shared Binomial rule, and zi (structural-zero
 # probability, parameter or literal) is checked by `_validate_zi`.
 function _validate_zib_response(r::LikelihoodSpec, plan::StructuralPlan)
-    r.link === IdentityLink || _fail(r.label,
-        "a zero-inflated prob-space Binomial response uses IdentityLink " *
-        "(probs are used as-is), got $(r.link)")
-    pred = findfirst(p -> p.name === r.predictor, plan.predictors)
-    pred !== nothing && plan.predictors[pred].link === IdentityLink && return nothing
-    i = findfirst(p -> p.name === r.predictor, plan.parameters)
-    i === nothing && _fail(r.label,
-        "a zero-inflated prob-space Binomial response names its " *
-        "Beta-sampled probability in `predictor` " *
-        "(`p ~ Beta(...)` in the model), got $(r.predictor)")
-    plan.parameters[i].family === :beta || _fail(r.label,
-        "a zero-inflated prob-space Binomial probability is Beta-sampled, " *
-        "got $(r.predictor) ~ $(plan.parameters[i].family)")
+    any(p -> p.name === r.predictor, plan.predictors) && return nothing
+    any(p -> p.name === r.predictor, plan.parameters) ||
+        _fail(r.label, "zero-inflated Binomial probability is undeclared")
     return nothing
 end
 
@@ -8334,9 +8317,6 @@ function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
         i = findfirst(p -> p.name === q, plan.predictors)
         i === nothing && _fail(r.label,
             "joint mean predictor $q is not a plan predictor")
-        plan.predictors[i].link === IdentityLink || _fail(r.label,
-            "joint mean predictor $q must carry IdentityLink (got " *
-            "$(plan.predictors[i].link)) — means enter the MvNormal directly")
         push!(used_predictors, q)
     end
     r.factor_scales === nothing && _fail(r.label,
@@ -8557,9 +8537,6 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
         "mixture components over $f are not admitted in v1 (admitted: " *
         "Gaussian/identity, Bernoulli-logit, Poisson-log, Binomial-logit, " *
         "NB2-log, Gamma-log, Beta-logit)")
-    r.link === _mixture_canon_link(f) || _fail(r.label,
-        "a mixture response carries its components' canonical link " *
-        "(got $(r.link) for $f)")
     K = length(r.mixture_locs)
     K >= 1 || _fail(r.label, "a mixture response needs ≥ 1 component")
     length(r.mixture_scales) == K || _fail(r.label,
@@ -8871,7 +8848,8 @@ function _validate_responses(plan::StructuralPlan)
         # A zero-inflated prob-space Binomial location (the BinomialProb
         # precedent plus zi): the location names a Beta-sampled scalar
         # parameter in `predictor`.
-        if r.family === ZeroInflatedBinomialFam
+        if r.family === ZeroInflatedBinomialFam &&
+                any(p -> p.name === r.predictor, plan.parameters)
             _validate_zib_response(r, plan)
             any(p -> p.name === r.predictor, plan.predictors) &&
                 push!(used_predictors, r.predictor)
@@ -9285,20 +9263,9 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
     return _fail(r.label, "$what references unknown name $s")
 end
 
-# A predictor-fed scale/shape use (Gaussian sigma, NB2 phi, Gamma alpha,
-# Beta kappa, Student sigma, Student nu, hurdle p_zero, VonMises
-# kappa, BetaBinomial2 phi, NB1 p, InverseGaussian lambda; LogNormal
-# sigma and Weibull k are deferred above):
-# the predictor exists, carries the use-site link (the
-# registered predictor's link). Several slots may read the same authored
-# value; use-site transforms retain the same declared coefficients.
-# Predictor-fed Binomial trials are deferred (trials stay
-# column-or-literal by type). A hurdle p_zero predictor is logit-only
-# (a probability), as is an NB1 p predictor (a success probability);
-# a Beta or VonMises kappa predictor is log-only (a
-# concentration), as is an InverseGaussian lambda predictor (a shape);
-# the remaining admitted families take identity/log/logit
-# on either slot.
+# An auxiliary use reads the raw predictor under its own link. Several
+# slots and responses may read the same predictor with different links;
+# the predictor's metadata does not transform its emitted value.
 function _validate_scale_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef)
     return _validate_scale_predictor_use(r, plan, s, r.family, [r.predictor])
@@ -9307,54 +9274,10 @@ end
 function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         s::ScalePredictorRef, fam::LikelihoodFamily,
         forbidden::Vector{Symbol}, slot::String = "scale")
-    fam === LogNormalFam && _fail(r.label,
-        "LogNormal response with a $slot predictor: predictor-fed " *
-        "scale (sigma) is deferred — use a scalar sigma (parameter, " *
-        "literal, or data column)")
-    fam === WeibullFam && _fail(r.label,
-        "Weibull response with a $slot predictor: predictor-fed " *
-        "shape (k) is deferred — use a scalar k (parameter, literal, " *
-        "or data column)")
-    (fam === GaussianFam || fam === NegativeBinomial2Fam ||
-        fam in (GammaLogFam, GammaValueFam, WeibullValueFam) || fam === BetaLogitFam ||
-        fam === StudentTFam ||
-        fam === HurdlePoissonFam || fam === VonMisesFam ||
-        fam === BetaBinomial2Fam || fam === NegativeBinomialFam ||
-        fam === InverseGaussianFam) ||
+    _scale_need(fam) !== nothing || fam === StudentTFam ||
         _fail(r.label, "this response family takes no $slot predictor")
-    if fam === HurdlePoissonFam
-        s.link === LogitLink ||
-            _fail(r.label, "hurdle p_zero predictor link must be logit " *
-                "(a probability — got $(s.link))")
-    elseif fam === NegativeBinomialFam
-        s.link === LogitLink ||
-            _fail(r.label, "NB1 p predictor link must be logit " *
-                "(a success probability — got $(s.link))")
-    elseif fam === VonMisesFam
-        s.link === LogLink ||
-            _fail(r.label, "VonMises kappa predictor link must be log " *
-                "(a concentration — got $(s.link))")
-    elseif fam === BetaLogitFam
-        s.link === LogLink ||
-            _fail(r.label, "Beta kappa predictor link must be log " *
-                "(a concentration — got $(s.link))")
-    elseif fam === InverseGaussianFam
-        s.link === LogLink ||
-            _fail(r.label, "InverseGaussian lambda predictor link must be log " *
-                "(a shape — got $(s.link))")
-    else
-        (s.link === IdentityLink || s.link === LogLink ||
-            s.link === LogitLink) ||
-            _fail(r.label, "$slot predictor link must be identity, log, or " *
-                "logit (got $(s.link))")
-    end
-    idx = findfirst(p -> p.name === s.predictor, plan.predictors)
-    idx === nothing && _fail(r.label,
+    any(p -> p.name === s.predictor, plan.predictors) || _fail(r.label,
         "$slot addresses unknown predictor $(s.predictor)")
-    pred = plan.predictors[idx]
-    pred.link === s.link ||
-        _fail(r.label, "$slot predictor $(s.predictor) carries link " *
-            "$(pred.link), $slot use wraps $(s.link) — one link per predictor")
     return nothing
 end
 
@@ -9419,13 +9342,6 @@ function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "Student response requires nu (degrees of freedom, " *
             "parameter, literal, or predictor)")
     if n isa ScalePredictorRef
-        # All three slots take distinct predictors: the scale slot's
-        # forbidden list covers location only, so the nu/scale cross-hit
-        # is enforced here, where both slots are visible.
-        r.scale isa ScalePredictorRef && n.predictor === r.scale.predictor &&
-            _fail(r.label, "nu predictor $(n.predictor) is the response's " *
-                "own scale predictor — location, scale, and nu take " *
-                "distinct predictors")
         return _validate_scale_predictor_use(r, plan, n, r.family,
             [r.predictor], "nu")
     end
@@ -9459,27 +9375,11 @@ function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     return nothing
 end
 
-# A predictor-fed zi (ZIP zero-inflation submodel, the hurdle p_zero
-# precedent): logit-only (a probability), over an existing predictor
-# carrying the use-site link (the one-link-per-predictor rule), distinct
-# from the response's own location predictor (the BRM-side plan rule,
-# mirrored here as defense in depth).
+# The zero-inflation slot uses the same per-use link semantics as scale.
 function _validate_zi_predictor(r::LikelihoodSpec, plan::StructuralPlan,
         z::ScalePredictorRef)
-    z.link === LogitLink ||
-        _fail(r.label, "ZIP zi predictor link must be logit " *
-            "(a probability — got $(z.link))")
-    idx = findfirst(p -> p.name === z.predictor, plan.predictors)
-    idx === nothing && _fail(r.label,
+    any(p -> p.name === z.predictor, plan.predictors) || _fail(r.label,
         "zi addresses unknown predictor $(z.predictor)")
-    pred = plan.predictors[idx]
-    pred.link === z.link ||
-        _fail(r.label, "zi predictor $(z.predictor) carries link " *
-            "$(pred.link), zi use wraps $(z.link) — one link per predictor")
-    z.predictor === r.predictor &&
-        _fail(r.label, "zi predictor $(z.predictor) is the response's " *
-            "own location predictor — location and zi take distinct " *
-            "predictors")
     return nothing
 end
 
@@ -9629,9 +9529,8 @@ end
 
 # Ordinal extras at data level: a discrimination column is raw finite
 # positive numerics of length n_obs (a literal validated structurally; a
-# log-link predictor names a modeled scale — structural positivity, no
-# data check; any other in-graph name is rejected), and threshold design
-# columns are raw finite numerics of length n_obs.
+# predictor names a modeled scale whose support is checked at execution),
+# and threshold design columns are raw finite numerics of length n_obs.
 function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
     r.family === OrdinalFam || return nothing
     d = r.discrimination
@@ -9645,7 +9544,7 @@ function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
             "discrimination column $d is derived — slice-2 binds " *
             "discrimination raw (derived columns need shape metadata — planned)")
         haskey(plan.columns, d) || _fail(r.label,
-            "discrimination $d must be a data column or a log-link " *
+            "discrimination $d must be a data column or a " *
             "predictor (a modeled scale)")
         col = _vector_column(plan.columns, d, r.label, "discrimination column")
         (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||

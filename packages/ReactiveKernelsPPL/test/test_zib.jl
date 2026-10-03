@@ -102,8 +102,8 @@ end
 
 @testset "zib contract failures" begin
     # Non-Beta p fails at contract (surface admits sampled params).
-    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    # admitted: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links)
+    @test (lower_rkppl(quote
         p ~ Normal(0.0, 1.0)
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, zi)
@@ -116,7 +116,7 @@ end
     end, (:s,); conditioned = (:s,))
     # zi names nothing in the plan.
     # refused: undeclared name (P6, 05oe96l)
-    @test_throws ContractValidationError lower_rkppl(quote
+    @test_throws SurfaceLoweringError lower_rkppl(quote
         p ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, p, nosuch)
     end, (:s,); conditioned = (:s,))

@@ -195,8 +195,7 @@ end
             @test_throws SurfaceLoweringError lower_rkppl(bad, Set([:x1, :y]); conditioned = Set([:x1, :y]))
         end
     end
-    # A horseshoe coefficient aliased as a scale stays loud (the
-    # single-assignment gate, ahead of scale admission).
+    # A Horseshoe coefficient alias reads its reconstructed scalar value.
     aliased = quote
         a ~ Normal(0, 1)
         b1 ~ Horseshoe()
@@ -205,8 +204,8 @@ end
         sigma ~ Exponential(1.0)
         y .~ Normal.(mu, s)
     end
-    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
-    @test_broken (lower_rkppl(aliased, Set([:x1, :y]); conditioned = Set([:x1, :y])); true)
+    # admitted: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links)
+    @test (lower_rkppl(aliased, Set([:x1, :y]); conditioned = Set([:x1, :y])); true)
     # Structural coverage (hand-built plans): exactly one prior per key,
     # triples present with half-Cauchy geometry.
     good = lower_rkppl(_horseshoe_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y]))

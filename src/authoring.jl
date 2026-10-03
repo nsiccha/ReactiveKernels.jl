@@ -1240,6 +1240,16 @@ function _kernel_inline_reject_unless_symbol(name, endpoint_name, context)
                            "a keyword or named-field label is not a name")
 end
 
+# A recipe keeps its callable when spliced into another object's graph.
+# Resolve its source globals in that defining module, even when the branch
+# belongs to a different caller module. The wrapper's module is core RK;
+# its captured body carries the authored scope.
+_kernel_endpoint_source_module(op) = parentmodule(typeof(op))
+_kernel_endpoint_source_module(op::_KernelSourceOp) =
+    _kernel_endpoint_source_module(op.f)
+_kernel_endpoint_source_module(op::_KernelBranch) =
+    _kernel_endpoint_source_module(op.call)
+
 # Render a constructed-endpoint call as source for a branch-arm position.
 # `actuals` are the call-site binding sources in the endpoint HAVE order
 # (owner actuals, then explicit arguments). Each planned recipe becomes one
@@ -1305,15 +1315,9 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
                 Expr(:(=), Expr(:tuple, outs...), inlined))
             continue
         end
-        # A spliced child recipe's source keeps its original bare names while
-        # the namespace holds the scoped ones, so the port namespace alone
-        # would miss them. Collect every bare name as known, then classify:
-        # an endpoint port is an input (ports shadow globals, exactly as
-        # `_kernel_free_ports` resolves them), a `Base`/`Core` global stays a
-        # global, and anything else is an input candidate. The count check
-        # below proves the candidates are exactly the inputs: every true
-        # input is reported, so a match leaves no room for a non-`Base`
-        # global, which would otherwise rebind into the caller's module.
+        # Spliced child recipes retain their bare port names and defining
+        # callables. Recompute the ports, while qualifying globals from the
+        # callable's module so a caller cannot change the endpoint's meaning.
         leaves = Set{Symbol}()
         _kernel_symbol_leaves!(leaves, r.source)
         reported = try
@@ -1323,9 +1327,17 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
             _kernel_inline_reject(endpoint_name, context,
                                   "one recipe is not a pure value expression")
         end
+        source_mod = _kernel_endpoint_source_module(r.op)
+        globals = Dict{Symbol,Any}()
+        for name in reported
+            name in known && continue
+            origin = isdefined(source_mod, name) ? source_mod :
+                isdefined(Base, name) ? Base :
+                isdefined(Core, name) ? Core : nothing
+            origin === nothing || (globals[name] = GlobalRef(origin, name))
+        end
         params = Symbol[name for name in reported
-                        if name in known ||
-                           !(isdefined(Base, name) || isdefined(Core, name))]
+                        if name in known || !haskey(globals, name)]
         if length(params) != length(r.inputs)
             suspicious = [":$name" for name in params
                           if !(name in known) &&
@@ -1341,7 +1353,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
                                   "one recipe mentions $(length(params)) " *
                                   "ports for $(length(r.inputs)) inputs$hint")
         end
-        subst = Dict{Symbol,Any}()
+        subst = globals
         for (name, v) in zip(params, r.inputs)
             cid = canon_id(g, v.id)
             haskey(expr_of, cid) || _kernel_inline_reject(

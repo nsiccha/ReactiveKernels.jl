@@ -299,9 +299,9 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(
         plate_ast([good_cell[1],
             :(yy .~ TgiResponse.(mu, sigma, a, b, c, d)), :mu], [subj]), data; conditioned = data)
-    # Fused link-space heads fail closed naming the pre-assignment fix.
-    # capability: fused link-space obs heads in cells (Distributions.BernoulliLogit) (todo `05fuzch`)
-    @test_broken (lower_rkppl(
+    # Fused heads retain their link-space endpoint semantics in cells.
+    # Admitted: the standard BernoulliLogit constructor in a cell.
+    @test (lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ BernoulliLogit.(mu)), :mu],
             [subj]), data; conditioned = data); true)
     # Response-space Binomial threads integer trials and probability values.
