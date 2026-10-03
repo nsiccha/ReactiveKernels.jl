@@ -39,11 +39,16 @@ code is not executed by the docs build.
   lane consecutively. An authored `sum(lanes)` adds arrays across lanes, preserving
   their per-lane shape. A directly returned compiled plate still materializes
   to its dense storage with the lane axis first.
-- Authored `if`, `?:`, `&&` and `||` keep their lazy Julia semantics: the
-  tensorized companion lowers them to `stablehlo.if` regions (also inside a
-  batched plate cell), so an inactive side is never evaluated or
-  differentiated. `Base.ifelse` remains an eager select of two already valid
-  values. See [core constraints](constraints.md).
+- Authored `if`, `?:`, `&&` and `||` lower to lazy `stablehlo.if` regions
+  (also inside a batched plate cell), retained through ordinary MLIR AD.
+  Default CPU XLA on Reactant 0.2.290 can subsequently replace pure live
+  guards with eager selection, including inactive logarithms and division.
+  Correct values/gradients and matching inventories alone do not establish
+  executable laziness. Preserve the authored guard; use native execution when
+  inactive arithmetic must stay inactive. `Base.ifelse` remains an eager
+  select of two already valid values. See the executable boundary and removal
+  criteria in [core constraints](constraints.md) and the backend-only
+  `benchmark/repro_reactant_pure_lazy_guard.jl`.
 - An authored `for`/`while` inside a recipe keeps its iteration: the
   tensorized companion expands it with `ReactantCore.@trace` at kernel
   definition, so it becomes one `stablehlo.while` region whatever the trip
