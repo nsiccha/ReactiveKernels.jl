@@ -2343,8 +2343,8 @@ end
         # refused: undeclared n (P6, 05oe96l)
         @test_throws SurfaceLoweringError lower_rkppl(bound, (:y, :g); conditioned = (:y, :g))
     end
-    # Unknown and non-levels index names fail closed; so does a binding over
-    # a non-data grouping column.
+    # Unknown index names fail closed. A data-only alias is an ordinary
+    # supplied axis and retains its own order.
     unknown = Expr(:block, Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
         :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
     # refused: undeclared index name sel (P6, 05oe96l)
@@ -2353,10 +2353,19 @@ end
     nonlevels = Expr(:block, :(sel = g),
         Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
         :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
-    # refused: sel = g is an observation column, not a level set (duplicate keys)
-    @test_throws "sel must be data" lower_rkppl(
-        nonlevels, (:y, :g); conditioned = (:y, :g))
-    for assignment in (nothing, :(x = 1.0), :(sel = g))
+    aliasplan = lower_rkppl(nonlevels, (:y, :g); conditioned = (:y, :g))
+    aliasbound = bind_data(aliasplan,
+        Dict(:y => [-0.7, 0.2], :g => ["b", "a"]))
+    aliasbuilt = build_kernel(aliasbound)
+    u = [0.4, -0.3]
+    @test aliasbuilt.layout.total == 2
+    @test _query(aliasbuilt.spec, aliasbound, :posterior, u) ≈
+        sum(logpdf.(Normal(0, 2), u)) +
+        sum(logpdf.(Normal.(u, 1.5), aliasbound.columns[:y]))
+    _check_gradient(aliasbuilt.spec, aliasbound, u)
+    @test_throws "LevelMap selects duplicate positions of sel" bind_data(
+        aliasplan, Dict(:y => [0.1, 0.2, 0.3], :g => [1, 1, 2]))
+    for assignment in (nothing, :(x = 1.0))
         block = Expr(:block)
         assignment === nothing || push!(block.args, assignment)
         append!(block.args, (Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
