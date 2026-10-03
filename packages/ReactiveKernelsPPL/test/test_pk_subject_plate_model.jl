@@ -28,15 +28,17 @@ function structure(plan, counts=Dict{Symbol,Int}())
 end
 
 @testset "PK subject plate: generated density, default reverse and graph growth" begin
-    for chain in (false, true)
-        file = chain ? "99_plate_49_grouped_pk.jl" : "49_kernel_grouped_pk.jl"
-        ast = Meta.parse(read(joinpath(@__DIR__, "corpus", file), String))
+    for form in (:legacy, :eachindex, :axes)
+        file = form === :legacy ? "49_kernel_grouped_pk.jl" : "99_plate_49_grouped_pk.jl"
+        source = read(joinpath(@__DIR__, "corpus", file), String)
+        form === :axes && (source = replace(source, "eachindex(dv)" => "axes(dv, 1)"))
+        ast = Meta.parse(source)
         inventories = Dict{Symbol,Int}[]
         for G in (2, 5)
             data = rawdata(G)
             names = Tuple(keys(data))
             plan = lower_rkppl(ast, names; conditioned=names)
-            dims = chain ? Dict{Symbol,Int}() : Dict(:kernel_nsub_conc=>G)
+            dims = form === :legacy ? Dict(:kernel_nsub_conc=>G) : Dict{Symbol,Int}()
             bound = bind_data(plan, data; dims)
             built = build_kernel(bound)
             u = [0.02cos(i) for i in 1:built.layout.total]
