@@ -149,6 +149,7 @@ end
         @test grad ≈ _adv_findiff(sampler, u) rtol = 1e-5 atol = 1e-7
         @test isequal(data, original)
         mismatch = _adv_data(3, 7)
+        mismatch[:gx] = copy(data[:gx])
         mismatch[:y2] = reverse(mismatch[:y])
         @test_throws ContractValidationError bind_data(plan, mismatch)
     end
