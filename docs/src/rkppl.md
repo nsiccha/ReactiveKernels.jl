@@ -32,6 +32,16 @@ declared variable pins it: `model(; x, sigma = 0.3) | (; y)` removes the
 `build_kernel` generates the program, and `prepare_query(built, plan, :sampler)`
 returns the log-posterior over the packed unconstrained coordinates.
 
+An explicitly observed empty vector has zero observations and contributes
+zero log-likelihood. Scalar priors and their transforms still contribute as
+authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an
+empty vector with no coordinates and zero prior and log-Jacobian. The same
+identity applies to empty matrix axes and empty data-sized elementwise arrays;
+negative declared sizes and out-of-bounds gathers remain errors.
+Native gradients also support a completely empty coordinate pack. Compiled
+values support it; compiled gradients currently fail at the backend's empty
+tensor export boundary (see [Core constraints](constraints.md)).
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("01_gaussian.jl", :rkppl_first_model; preamble = "using ReactiveKernelsPPL")
 ```
@@ -62,6 +72,18 @@ Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
 `LogNormal`, `Beta`, `InverseGamma`, `StudentT`, `Laplace`, `Logistic`,
 `Uniform` and `Weibull`. Arguments can read data, sampled parameters and
 ordinary definitions; scalar expressions such as `1 + exp(a)` are values too.
+
+Positive priors have the same normalized meaning in every slot:
+`HalfNormal(s)`, `HalfCauchy(s)` and their equivalent truncated Normal/Cauchy
+forms work for sampled parameters and the built-in varying and smooth scales. A bare
+`Normal(0, s)` or `Cauchy(0, s)` keeps its full support and is rejected in a
+positive scale slot. Write the explicit half or truncation instead.
+
+Support keywords on distribution constructors, such as
+`Normal(0, s; lower=0)`, are rejected. Use `truncated(Normal(0, s), 0, Inf)`.
+`Flat()` is an improper real prior and accepts no support keywords; choose
+`Exponential(s)` for a positive prior or `Uniform(lo, hi)` for a bounded
+uniform. These are proper densities and change an improper prior's model.
 
 `x ~ truncated(D, lo, hi)` uses the normalized Distributions.jl density for
 any of these univariate families. Bounds may be literals, model-level data,
@@ -103,6 +125,13 @@ Reactant limitation also applies to hierarchical Dirichlet priors.
   priors are translated as written.
 - Single assignment, no `if`, no `target +=`. Loops are written as
   `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
+
+A data-only call used only by a parameter-dependent function runs once when
+`prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
+named tuple containing arrays. Named definitions, aliases and inline
+calls follow the same rule, including beside declared vector or matrix
+parameters. A value also needed during binding, such as a prior argument or an
+array dimension, keeps its bind-time evaluation and validation.
 
 ## Factor levels
 
@@ -149,7 +178,13 @@ at a packed point differ from the non-centered entries.
 Centered correlated coefficients use ordinary row priors:
 `eachrow(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`, with a K-vector
 mean `mu` and lower-triangular covariance factor `F`. Read their effects as
-`B[g, 1] .+ x .* B[g, 2]`. The legacy `varying_draws` / `varying_effect`
+`B[g, 1] .+ x .* B[g, 2]`. The column-oriented declaration
+`eachcol(B[1:K, levels(g)]) .~ MvNormalCholesky(mu, F)` uses a K×G
+array instead: read `B[1, g] .+ x .* B[2, g]`, or `B[:, g]' * v`
+for a K-vector `v`. Level lookup follows the indexed axis. On an integer
+axis, the index column contains positive integer positions. A column
+gather stays K×N until the authored adjoint turns it into N×K.
+The legacy `varying_draws` / `varying_effect`
 keywords are `eta`, `levels`, and `sd`; centered coefficients are declared
 through array priors or the centered library entries above.
 
@@ -241,6 +276,17 @@ broadcast spelling.
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
+
+Responses may have different row counts. Each statement reads columns on its
+own observation axis; statements that read a common observation column must
+agree on its rows. A latent plate follows its authored range, while a scan
+with a symbolic length and a `dar` trajectory follow their consuming response.
+Varying effects, smooth bases, and design matrices follow their input rows.
+Declared `axes(X, 1)` arrays have X's rows; `axes(X, 2)` coefficient vectors
+have X's width. The total `n_obs` does not size these values. A trajectory used
+by responses of different lengths fails binding because its axis is ambiguous.
+Kernel plates may also contribute likelihoods beside ordinary responses;
+their subject/time or schedule dimensions retain their own rows.
 
 The stratified library body above uses both per-level and per-observation
 cells. `L[k] ~ LKJCholesky(K, eta)` inside a plate over `levels(s)` declares
