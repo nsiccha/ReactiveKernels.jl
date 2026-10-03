@@ -57,6 +57,8 @@ end
 
 Base.copy(callable::_KernelSignatureCallable{<:BorrowedBatchedKernel}) =
     _KernelSignatureCallable(copy(callable.target), callable.signature)
+Base.copy(callable::_KernelSignatureCallable{<:_ScheduledBatchedKernel}) =
+    _KernelSignatureCallable(copy(callable.target), callable.signature)
 
 @inline function (callable::_KernelSignatureCallable)(args...; kwargs...)
     _kernel_signature_invoke(callable, args, NamedTuple(kwargs))
@@ -1238,6 +1240,16 @@ function _kernel_inline_reject_unless_symbol(name, endpoint_name, context)
                            "a keyword or named-field label is not a name")
 end
 
+# A recipe keeps its callable when spliced into another object's graph.
+# Resolve its source globals in that defining module, even when the branch
+# belongs to a different caller module. The wrapper's module is core RK;
+# its captured body carries the authored scope.
+_kernel_endpoint_source_module(op) = parentmodule(typeof(op))
+_kernel_endpoint_source_module(op::_KernelSourceOp) =
+    _kernel_endpoint_source_module(op.f)
+_kernel_endpoint_source_module(op::_KernelBranch) =
+    _kernel_endpoint_source_module(op.call)
+
 # Render a constructed-endpoint call as source for a branch-arm position.
 # `actuals` are the call-site binding sources in the endpoint HAVE order
 # (owner actuals, then explicit arguments). Each planned recipe becomes one
@@ -1287,15 +1299,25 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
                                   "it contains a plate or scan")
         r.source === _NO_KERNEL_SOURCE && _kernel_inline_reject(
             endpoint_name, context, "one recipe has no source")
-        # A spliced child recipe's source keeps its original bare names while
-        # the namespace holds the scoped ones, so the port namespace alone
-        # would miss them. Collect every bare name as known, then classify:
-        # an endpoint port is an input (ports shadow globals, exactly as
-        # `_kernel_free_ports` resolves them), a `Base`/`Core` global stays a
-        # global, and anything else is an input candidate. The count check
-        # below proves the candidates are exactly the inputs: every true
-        # input is reported, so a match leaves no room for a non-`Base`
-        # global, which would otherwise rebind into the caller's module.
+        if r.op isa Union{_KernelSourceOp,Function}
+            # Authored operations already retain their defining module and
+            # native/traced bodies. Calling that operation inside the arm
+            # preserves globals, port order and lazy evaluation, including
+            # recipes spliced from a differently scoped child endpoint. A
+            # validated bare function operation also keeps its defining module.
+            actual_inputs = Any[expr_of[canon_id(g, v.id)] for v in r.inputs]
+            inlined = Expr(:call, QuoteNode(r.op), actual_inputs...)
+            outs = Symbol[gensym(:endpoint_value) for _ in r.outputs]
+            for (v, temp) in zip(r.outputs, outs)
+                expr_of[canon_id(g, v.id)] = temp
+            end
+            push!(statements, length(outs) == 1 ? Expr(:(=), outs[1], inlined) :
+                Expr(:(=), Expr(:tuple, outs...), inlined))
+            continue
+        end
+        # Spliced child recipes retain their bare port names and defining
+        # callables. Recompute the ports, while qualifying globals from the
+        # callable's module so a caller cannot change the endpoint's meaning.
         leaves = Set{Symbol}()
         _kernel_symbol_leaves!(leaves, r.source)
         reported = try
@@ -1305,9 +1327,17 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
             _kernel_inline_reject(endpoint_name, context,
                                   "one recipe is not a pure value expression")
         end
+        source_mod = _kernel_endpoint_source_module(r.op)
+        globals = Dict{Symbol,Any}()
+        for name in reported
+            name in known && continue
+            origin = isdefined(source_mod, name) ? source_mod :
+                isdefined(Base, name) ? Base :
+                isdefined(Core, name) ? Core : nothing
+            origin === nothing || (globals[name] = GlobalRef(origin, name))
+        end
         params = Symbol[name for name in reported
-                        if name in known ||
-                           !(isdefined(Base, name) || isdefined(Core, name))]
+                        if name in known || !haskey(globals, name)]
         if length(params) != length(r.inputs)
             suspicious = [":$name" for name in params
                           if !(name in known) &&
@@ -1323,7 +1353,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
                                   "one recipe mentions $(length(params)) " *
                                   "ports for $(length(r.inputs)) inputs$hint")
         end
-        subst = Dict{Symbol,Any}()
+        subst = globals
         for (name, v) in zip(params, r.inputs)
             cid = canon_id(g, v.id)
             haskey(expr_of, cid) || _kernel_inline_reject(
@@ -1384,6 +1414,24 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     # established nested-KernelSpec splicer clone the complete endpoint graph.
     if ex.head === :call && !isempty(ex.args)
         callee = ex.args[1]
+        if callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
+                callee.args[2] isa QuoteNode && !(callee.args[1] isa Expr &&
+                callee.args[1].head === :call)
+            object = _kernel_resolve_binding(mod, callee.args[1])
+            name = callee.args[2].value
+            if object isa Union{KernelObjectSpec,_StatefulKernelSkeleton} &&
+                    name in kernel_endpoint_names(object)
+                signature = extract(object; want=name).call_signature
+                if signature isa _KernelEndpointCallSignature &&
+                        isempty(first(typeof(signature).parameters))
+                    # A zero-owner object has the same graph application with
+                    # or without `()`. Normalize before descending into an arm,
+                    # so `standard_normal.ccdf(z)` never plans at runtime/AD.
+                    callee = Expr(:., Expr(:call, callee.args[1]), callee.args[2])
+                    ex = Expr(:call, callee, ex.args[2:end]...)
+                end
+            end
+        end
         if callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
            callee.args[1] isa Expr && callee.args[1].head === :call &&
            callee.args[2] isa QuoteNode
@@ -1964,15 +2012,26 @@ _tensorized_callee_replacement(callee::Symbol) =
     callee === :getindex ? :_tensorized_getindex :
     callee === :get ? :_tensorized_get :
     callee === :dot ? :_tensorized_dot : nothing
-_tensorized_callee_replacement(callee::GlobalRef) =
-    callee.mod === Base && callee.name === :eachcol ? :_tensorized_eachcol :
-    callee.mod === Base && callee.name === :getindex ? :_tensorized_getindex :
-    callee.mod === Base && callee.name === :get ? :_tensorized_get :
-    callee.mod === Base && callee.name === :vect ? :_tensorized_vect :
-    callee.name === :dot && nameof(callee.mod) === :LinearAlgebra ?
-        :_tensorized_dot :
-    nothing
+function _tensorized_callee_replacement(callee::GlobalRef)
+    isdefined(callee.mod, callee.name) || return nothing
+    _tensorized_function_replacement(getglobal(callee.mod, callee.name))
+end
+_tensorized_function_replacement(fn) = nothing
+function _tensorized_function_replacement(fn::Function)
+    # A resolved call (including an imported binding or alias) names the
+    # same function as its bare spelling. Reuse that lowering without
+    # rewriting a caller-owned function that merely has the same name.
+    parentmodule(fn) === Base && return _tensorized_callee_replacement(nameof(fn))
+    fn === dot ? :_tensorized_dot : nothing
+end
 _tensorized_callee_replacement(callee) = nothing
+function _tensorized_callee_replacement(callee, mod::Union{Module,Nothing})
+    callee isa GlobalRef && return _tensorized_callee_replacement(callee)
+    mod === nothing && return _tensorized_callee_replacement(callee)
+    fn = _kernel_resolve_binding(mod, callee)
+    fn === nothing ? _tensorized_callee_replacement(callee) :
+        _tensorized_function_replacement(fn)
+end
 
 # Factorization callees whose tensorized result passes through
 # `_tensorized_factorization` (core.jl).  The call itself is kept, so this
@@ -2045,8 +2104,9 @@ function _kernel_tensorized_undef_vector(ex)
 end
 
 # A lazy two-way branch in the tensorized companion: the condition and both
-# sides are tensorized, each side is wrapped as a thunk, and
-# `_recurrence_branch` evaluates exactly one of them.  An `elseif` chain
+# sides are tensorized, and `_recurrence_branch` evaluates exactly one arm.
+# Locals rebound by an arm cross it as explicit arguments and results.
+# An `elseif` chain
 # arrives as a nested `:elseif` expression on the else side and lowers
 # recursively; a block-wrapped condition (Julia's `elseif` spelling) is
 # unwrapped.
@@ -2172,11 +2232,13 @@ function _kernel_tensorized_loop(ex, known, mod, scope)
         _kernel_tensorized_rhs(binding.args[2], known, mod, scope) : nothing
     lowered = if ex.head === :for
         Expr(:for, Expr(:(=), binding.args[1], iterator),
-             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner))
+             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner;
+                                    value_used = false))
     else
         Expr(:while,
              _kernel_tensorized_rhs(substitute(condition), known, mod, inner),
-             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner))
+             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner;
+                                    value_used = false))
     end
     traced = Expr(:macrocall, GlobalRef(ReactantCore, Symbol("@trace")),
                   LineNumberNode(@__LINE__, @__FILE__), lowered)
@@ -2205,15 +2267,47 @@ function _kernel_tensorized_loop(ex, known, mod, scope)
 end
 
 function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
-                                   scope=known)
+                                   scope=known; value_used=true)
     unwrap(x) = x isa Expr && x.head === :block ?
         (filtered = [arg for arg in x.args if !(arg isa LineNumberNode)];
          length(filtered) == 1 ? unwrap(only(filtered)) : x) : x
-    thunk(side) = Expr(:->, Expr(:tuple),
-                       _kernel_tensorized_rhs(unwrap(side), known, mod, scope))
-    Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
+    assigned = Set{Symbol}()
+    _kernel_loop_assigned!(assigned, then_side, scope)
+    _kernel_loop_assigned!(assigned, else_side, scope)
+    names = sort!(collect(assigned))
+    # An arm that assigns an enclosing local must return its new binding;
+    # mutating a closure box is not a conditional result or a loop carry.
+    # Explicit arguments also make those reads visible to `@trace`'s loop
+    # analysis. Both arms return the same state, including unchanged locals.
+    # A used branch expression retains its value beside that state. A
+    # discarded statement needs only the state, so `if p; x = ...; end`
+    # does not ask the backend to merge a value with implicit `nothing`.
+    function thunk(side)
+        lowered = _kernel_tensorized_rhs(unwrap(side), known, mod, scope;
+                                        value_used = value_used)
+        isempty(names) && return Expr(:->, Expr(:tuple), lowered)
+        if value_used
+            value = gensym(:branch_value)
+            body = Expr(:block, Expr(:(=), value, lowered),
+                        Expr(:tuple, value, names...))
+        else
+            body = Expr(:block, lowered, Expr(:tuple, names...))
+        end
+        Expr(:->, Expr(:tuple, names...), body)
+    end
+    call = Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
          _kernel_tensorized_rhs(unwrap(condition), known, mod, scope),
-         thunk(then_side), thunk(else_side), Expr(:tuple))
+         thunk(then_side), thunk(else_side), Expr(:tuple, names...))
+    isempty(names) && return call
+    if !value_used
+        return Expr(:block, Expr(:(=), Expr(:tuple, names...), call), nothing)
+    end
+    result = gensym(:branch_result)
+    bindings = Any[Expr(:(=), name,
+        Expr(:call, GlobalRef(Core, :getfield), result, i + 1))
+        for (i, name) in enumerate(names)]
+    Expr(:block, Expr(:(=), result, call), bindings...,
+         Expr(:call, GlobalRef(Core, :getfield), result, 1))
 end
 
 # A generator reduction `sum(term for i in iter [if condition]; init = x)` in a
@@ -2525,7 +2619,8 @@ end
 function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                                 mod::Union{Module,Nothing} = nothing,
                                 scope::Set{Symbol} = known;
-                                in_dotted::Bool = false)
+                                in_dotted::Bool = false,
+                                value_used::Bool = true)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     if ex.head === :macrocall && mod isa Module
@@ -2540,7 +2635,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         # definition (snag `batched-broadcas-9269c801`).  Lower the macro's
         # expansion instead: that is the code the native body runs.
         return _kernel_tensorized_rhs(macroexpand(mod, ex), known, mod, scope;
-                                      in_dotted = in_dotted)
+                                      in_dotted = in_dotted, value_used = value_used)
     end
     undef_vector = _kernel_tensorized_undef_vector(ex)
     if undef_vector !== nothing
@@ -2632,12 +2727,15 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         end
         lowered = length(lowered_bindings) == 1 ? only(lowered_bindings) :
             Expr(:block, lowered_bindings...)
-        return Expr(:let, lowered, _kernel_tensorized_rhs(ex.args[2], known, mod, inner))
+        return Expr(:let, lowered, _kernel_tensorized_rhs(ex.args[2], known, mod, inner;
+                                                        value_used = value_used))
     elseif ex.head === :block
         inner = copy(scope)
         statements = Any[]
-        for statement in ex.args
-            push!(statements, _kernel_tensorized_rhs(statement, known, mod, inner))
+        tail = findlast(arg -> !(arg isa LineNumberNode), ex.args)
+        for (i, statement) in enumerate(ex.args)
+            push!(statements, _kernel_tensorized_rhs(statement, known, mod, inner;
+                value_used = value_used && i == tail))
             statement isa Expr && _kernel_tensorized_assignment_head(statement.head) &&
                 length(statement.args) == 2 && _lhs_symbols!(inner, statement.args[1])
         end
@@ -2653,13 +2751,16 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         # broadcast, which is left untouched.
         return _kernel_tensorized_branch(
             ex.args[1], ex.args[2],
-            length(ex.args) == 3 ? ex.args[3] : nothing, known, mod, scope)
+            length(ex.args) == 3 ? ex.args[3] : nothing, known, mod, scope;
+            value_used = value_used)
     elseif ex.head === :&& && length(ex.args) == 2
         return _kernel_tensorized_branch(
-            ex.args[1], ex.args[2], false, known, mod, scope)
+            ex.args[1], ex.args[2], false, known, mod, scope;
+            value_used = value_used)
     elseif ex.head === :|| && length(ex.args) == 2
         return _kernel_tensorized_branch(
-            ex.args[1], true, ex.args[2], known, mod, scope)
+            ex.args[1], true, ex.args[2], known, mod, scope;
+            value_used = value_used)
     elseif ex.head === :call && !isempty(ex.args) &&
            (!(ex.args[1] isa Symbol) || !(ex.args[1] in known))
         reduction = _kernel_generator_sum_parts(ex)
@@ -2667,7 +2768,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
             lowered = _kernel_tensorized_generator_sum(reduction, known, mod, scope)
             lowered === nothing || return lowered
         end
-        replacement = _tensorized_callee_replacement(ex.args[1])
+        replacement = _tensorized_callee_replacement(ex.args[1], mod)
         callee = replacement === nothing ?
             _kernel_tensorized_callee(ex.args[1], known, mod) :
             GlobalRef(@__MODULE__, replacement)
@@ -2802,7 +2903,8 @@ function _traceable_definition(def, mod::Module)
         companion = Expr(:where, companion, layer...)
     end
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
-    esc(Expr(:block, native, Expr(:(=), companion, rewritten), callee))
+    ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
+    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., callee))
 end
 
 # The body with its tail-position `return`s replaced by their values: the
@@ -2836,6 +2938,19 @@ function _traceable_no_return(ex, signature)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
+                           kwargs...)
+    normal = _kernel_operation_body(rhs, deps, known; kwargs...)
+    # A bare exact-identity operation keeps its original identity. Transparent
+    # helpers have separate opted-in methods; source closures retain a twin.
+    normal isa Expr && normal.head === :call &&
+        normal.args[1] == GlobalRef(@__MODULE__, :_KernelSourceOp) || return normal
+    mod = get(kwargs, :mod, nothing)
+    ignored_rhs = _kernel_ignore_throw_source(rhs, mod, known)
+    ignored = _kernel_operation_body(ignored_rhs, deps, known; kwargs...)
+    Expr(:call, GlobalRef(@__MODULE__, :_kernel_with_ignored_throws), normal, ignored)
+end
+
+function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
                            nested_specs = Dict{Symbol,Any}())
@@ -2855,7 +2970,7 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
             return generated_spec === nothing ? callee : generated_spec
         end
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
-           (!tensorize || (_tensorized_callee_replacement(callee) === nothing &&
+           (!tensorize || (_tensorized_callee_replacement(callee, mod) === nothing &&
                            !_kernel_callee_has_traced_method(callee, mod))) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
@@ -3808,7 +3923,7 @@ function _kernel_bound_pairs(spec::KernelSpec, bound)
 end
 
 """
-    prepare(spec::KernelSpec; have, want, passes=(), bound=(;)) -> callable
+    prepare(spec::KernelSpec; have, want, passes=(), bound=(;), on_error=nothing) -> callable
 
 Prepare an authored kernel. With a non-empty `bound` NamedTuple
 (`bound = (; X, y)`), the [`partial_evaluation`](@ref) pre-pass runs first:
@@ -3823,15 +3938,23 @@ reuses the plan and compiled code of earlier bindings and runs only the
 data-only subgraph on the new values (see `prepare` on a `Graph`), so binding
 per request needs no caller-held cache; [`prepare!`](@ref) with a
 [`PreparationCache`](@ref) gives that reuse an explicit lifetime.
+
+The default `on_error = nothing` preserves authored assertions and throws.
+Opt in with `on_error = :ignore` to replace visible `throw(...)` sites in
+captured `@kernel` and `@traceable` source with `nothing`, including expanded
+`@assert`s. The policy applies to native execution, tracing and bound-data
+mathematics. Ordinary opaque function bodies keep their behavior. This first
+policy continues execution; it does not catch exceptions or return a fallback.
 """
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                 bound = NamedTuple())
+                 bound = NamedTuple(), on_error = nothing)
     isempty(bound) || return prepare(spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound))
-    prepared = prepare(plan(spec; have = have, want = want); passes = passes)
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error)
+    prepared = prepare(plan(spec; have = have, want = want); passes = passes,
+                       on_error = on_error)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end
@@ -3851,15 +3974,15 @@ over the remaining HAVE ports exactly as `prepare(spec; bound)` returns it.
 function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
                   want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                  bound = NamedTuple())
+                  bound = NamedTuple(), on_error = nothing)
     isempty(bound) || return prepare!(cache, spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound))
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error)
     prepared = prepare!(cache, spec.graph;
                         have = _kernel_selection(spec, have, spec.have_names, :have),
                         want = _kernel_selection(spec, want, spec.want_names, :want),
-                        passes = passes)
+                        passes = passes, on_error = on_error)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end
@@ -3904,7 +4027,8 @@ end
 
 """
     prepare_batched(spec::KernelSpec; batched, have=inputs(spec),
-                    want=outputs(spec), passes=(), reuse=false) -> callable
+                    want=outputs(spec), passes=(), reuse=false,
+                    schedule=nothing) -> callable
 
 First-class position batching for a scalar `@kernel`. The named HAVE ports
 carry one shared trailing batch axis; all other HAVE ports are shared by every
@@ -3932,6 +4056,19 @@ runs as its fused loop at every position. The default allocates fresh stacked ou
 retaining a result across calls is safe. It is not the allocation-free reducing
 `plate` contract.
 
+Native batching is serial unless `schedule=NativeScheduling(chunk_size=...,
+workers=...)` explicitly opts in. The scheduler computes shared-only work once,
+then distributes runtime position ranges among independent borrowed workers.
+Each worker retains at most `chunk_size` positions and copies completed chunks
+into the final stacked result. The result still spans the whole batch. Hints
+are caller-selected: there is no automatic cost threshold. Empty batches and
+one-worker calls use the ordinary serial driver. Scheduled instances, including
+owning ones, retain worker buffers and are not reentrant; use `copy(template)`
+per concurrent caller. Copies share computation and start with empty buffers.
+Owning Reactant calls retain the ordinary compiled position loop. Scheduling
+applies to native primal evaluation; prepare scalar AD with `scalar_kernel` and
+lift it with `replica` for the existing per-position derivative path.
+
 `reuse=true` opts into native borrowed stacked-output buffers. A later call may
 overwrite every returned array; consume synchronously or `deepcopy` before
 publishing, retaining or passing it to a callback. Prepare a template once,
@@ -3956,20 +4093,21 @@ function prepare_batched(spec::KernelSpec;
                          have = _KERNEL_DEFAULT_BOUNDARY,
                          want = _KERNEL_DEFAULT_BOUNDARY,
                          passes = (),
-                         reuse = false)
+                         reuse = false,
+                         schedule = nothing)
     selected_have = have === _KERNEL_DEFAULT_BOUNDARY ? inputs(spec) : have
     selected_want = want === _KERNEL_DEFAULT_BOUNDARY ? outputs(spec) : want
     prepared = prepare(plan(spec; have = selected_have, want = selected_want);
                        passes = passes)
-    replicated = vectorize(prepared; batched, reuse)
+    replicated = vectorize(prepared; batched, reuse, schedule)
     have === _KERNEL_DEFAULT_BOUNDARY || return replicated
     _kernel_signature_callable(replicated, spec.call_signature)
 end
 
 """
-    vectorize(kernel::PreparedKernel; batched, reuse=false) -> callable
+    vectorize(kernel::PreparedKernel; batched, reuse=false, schedule=nothing) -> callable
     vectorize(spec::KernelSpec; batched, have=inputs(spec),
-              want=outputs(spec), passes=(), reuse=false) -> callable
+              want=outputs(spec), passes=(), reuse=false, schedule=nothing) -> callable
 
 Lift a scalar kernel over position batching. This is the concise public spelling
 for [`prepare_batched`](@ref); `replica` remains the equivalent lower-level
@@ -3980,9 +4118,9 @@ For a native `reuse=true` result, `copy(kernel)` creates an independent executio
 instance with empty output buffers and the same prepared computation. See
 [`prepare_batched`](@ref) for its lifetime and concurrency contract.
 """
-function vectorize(kernel::PreparedKernel; batched, reuse = false)
+function vectorize(kernel::PreparedKernel; batched, reuse = false, schedule = nothing)
     replicated = replica_graph(kernel; batched)
-    reuse ? _borrowed_batch(replicated) : replicated
+    _position_schedule(replicated, schedule, Val(reuse))
 end
 
 function vectorize(spec::KernelSpec;
@@ -3990,12 +4128,13 @@ function vectorize(spec::KernelSpec;
                    have = _KERNEL_DEFAULT_BOUNDARY,
                    want = _KERNEL_DEFAULT_BOUNDARY,
                    passes = (),
-                   reuse = false)
-    prepare_batched(spec; batched, have, want, passes, reuse)
+                   reuse = false,
+                   schedule = nothing)
+    prepare_batched(spec; batched, have, want, passes, reuse, schedule)
 end
 
-function vectorize(callable::_KernelSignatureCallable; batched, reuse = false)
-    replicated = vectorize(callable.target; batched, reuse)
+function vectorize(callable::_KernelSignatureCallable; batched, reuse = false, schedule = nothing)
+    replicated = vectorize(callable.target; batched, reuse, schedule)
     _kernel_signature_callable(replicated, callable.signature)
 end
 
@@ -4005,11 +4144,13 @@ batched_ports(kernel::ReplicatedKernel{B}) where {B} =
 batched_ports(kernel::GraphReplicatedKernel{B}) where {B} =
     Tuple(kernel.inputs[index].name for index in B)
 batched_ports(kernel::BorrowedBatchedKernel) = batched_ports(kernel.target)
+batched_ports(kernel::_KernelSignatureCallable) = batched_ports(kernel.target)
 
 "The scalar prepared kernel retained as the mathematical authority."
 scalar_kernel(kernel::ReplicatedKernel) = kernel.target
 scalar_kernel(kernel::GraphReplicatedKernel) = kernel.target
 scalar_kernel(kernel::BorrowedBatchedKernel) = scalar_kernel(kernel.target)
+scalar_kernel(kernel::_KernelSignatureCallable) = scalar_kernel(kernel.target)
 
 """
     plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel

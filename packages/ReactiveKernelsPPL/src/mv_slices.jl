@@ -70,7 +70,7 @@ _arg_count(a::_PerSlice) = _slice_count(a.orientation, a.value)
 _arg_rows(v::AbstractVector) = reshape(v, 1, length(v))
 _arg_rows(a::_PerSlice) = _slice_rows(a.orientation, a.value)
 
-function _check_slice_vector_arg(what, a, groups, k)
+@traceable function _check_slice_vector_arg(what, a, groups, k)
     _arg_length(a) == k || throw(DimensionMismatch("$what has slices of " *
         "length $(_arg_length(a)), but the declared slices have length $k"))
     n = _arg_count(a)
@@ -79,38 +79,42 @@ function _check_slice_vector_arg(what, a, groups, k)
     return nothing
 end
 
-# ── multivariate normal slices (native) ──────────────────────────────
+# ── multivariate normal slices ───────────────────────────────────────
 
-# Sum the row densities by forward substitution. The inputs and factor
-# remain read-only; the solve buffer is fresh and local to this call.
-@inline function _lower_solve_rows_logpdf(input, factor, logdet, k, groups)
-    value = -groups*(0.5k*log(2pi)+logdet)
-    z = zeros(Float64,k)
-    for g in 1:groups
+# Forward substitution across every slice at once. Keep the margin axis
+# leading so a traced row read/write uses the retained loop's storage layout.
+# Unsolved rows of Z are zero; the full row product therefore sums exactly
+# the already solved margins. No body is duplicated for either data axis.
+# X and F remain read-only; Z is fresh and local until construction finishes.
+@traceable function _lower_solve_rows_logpdf(X, F, logdet)
+    groups, k = size(X)
+    if groups == 0
+        0.0
+    else
+        input = permutedims(X)
+        Z = zero(input)
         for i in 1:k
-            residual = input(g,i)
-            for j in 1:(i-1)
-                residual -= factor(i,j)*z[j]
-            end
-            z[i] = residual/factor(i,i)
-            value -= 0.5z[i]^2
+            residual = input[i, :] - vec(F[i, :]' * Z)
+            Z[i, :] = residual ./ F[i, i]
         end
+        -0.5sum(abs2, Z) - groups*(0.5k*log(2pi)+logdet)
     end
-    return value
 end
 
 # Σ log F[i, i] of a K×K lower-triangular Cholesky factor, checking the
 # positive diagonal and the zero upper triangle.
-function _cholesky_factor_logdet(F, k)
+@traceable function _cholesky_factor_logdet(F, k)
     size(F) == (k, k) || throw(DimensionMismatch("MvNormalCholesky slices " *
         "have length $k, but the factor has size $(size(F))"))
     logdet = 0.0
     for i in 1:k
-        F[i, i] > 0 || throw(ArgumentError("MvNormalCholesky factor has a " *
-            "nonpositive diagonal entry F[$i, $i]"))
-        for j in (i + 1):k
-            iszero(F[i, j]) || throw(ArgumentError("MvNormalCholesky factor " *
-                "is not lower triangular: F[$i, $j] = $(F[i, j])"))
+        ReactiveKernels._runtime_check(F[i, i] > 0,
+            ArgumentError("MvNormalCholesky factor has a nonpositive diagonal entry"))
+        for j in 1:k
+            if j > i
+                ReactiveKernels._runtime_check(iszero(F[i, j]),
+                    ArgumentError("MvNormalCholesky factor is not lower triangular"))
+            end
         end
         logdet += log(F[i, i])
     end
@@ -120,70 +124,70 @@ end
 # The lower Cholesky factor of a K×K covariance (Cholesky–Banachiewicz) in
 # a fresh local buffer. Reads the lower triangle; the upper must agree to
 # Stan's symmetry tolerance (1e-8).
-function _covariance_cholesky(Sigma, k)
+@traceable function _covariance_cholesky_entry(Sigma, F, i, j)
+    s = Sigma[i, j]
+    for p in 1:size(Sigma, 1)
+        s = if p < j
+            s - F[i, p] * F[j, p]
+        else
+            s
+        end
+    end
+    if i == j
+        ReactiveKernels._runtime_check(s > 0,
+            ArgumentError("MvNormal covariance is not positive definite"))
+        sqrt(s)
+    else
+        s / F[j, j]
+    end
+end
+
+@traceable function _covariance_cholesky(Sigma, k)
     size(Sigma) == (k, k) || throw(DimensionMismatch("MvNormal slices " *
         "have length $k, but the covariance has size $(size(Sigma))"))
     F = zeros(eltype(Sigma), k, k)
+    factor_entry = zero(eltype(Sigma))
     for i in 1:k
-        for j in 1:(i - 1)
-            abs(Sigma[i, j] - Sigma[j, i]) <= 1e-8 ||
-                throw(ArgumentError("MvNormal covariance is not symmetric: " *
-                    "Sigma[$i, $j] = $(Sigma[i, j]), Sigma[$j, $i] = " *
-                    "$(Sigma[j, i])"))
+        for j in 1:k
+            if j < i
+                ReactiveKernels._runtime_check(abs(Sigma[i, j] - Sigma[j, i]) <= 1e-8,
+                    ArgumentError("MvNormal covariance is not symmetric"))
+            end
         end
-        for j in 1:i
-            s = Sigma[i, j]
-            for p in 1:(j - 1)
-                s -= F[i, p] * F[j, p]
-            end
-            if i == j
-                s > 0 || throw(ArgumentError("MvNormal covariance is not " *
-                    "positive definite (pivot $i)"))
-                F[i, i] = sqrt(s)
+        for j in 1:k
+            factor_entry = if j <= i
+                _covariance_cholesky_entry(Sigma, F, i, j)
             else
-                F[i, j] = s / F[j, j]
+                F[i, j]
             end
+            F[i, j] = factor_entry
         end
     end
     return F
 end
 
-@inline function _mvnormal_slices_core(o, B, mu, F, logdet)
-    groups, k = _slice_count(o, B), _slice_length(o, B)
+@traceable function _mvnormal_slices_core(o, B, mu, F, logdet)
     return _lower_solve_rows_logpdf(
-        (g, i) -> _slice_entry(o, B, g, i) - _arg_entry(mu, g, i),
-        (i, j) -> F[i, j], logdet, k, groups)
+        _slice_rows(o, B) .- _arg_rows(mu), F, logdet)
 end
 
-"""
-    _mvnormal_cholesky_slices_logpdf(o, B, mu, F)
-
-Σ over the slices `x_g` of `B` (orientation `o`) of
-`logpdf(MvNormal(mu_g, F * F'), x_g)`, `F` the lower-triangular Cholesky
-factor of the covariance (Stan's `multi_normal_cholesky`). `mu` is a
-shared K-vector or a [`_PerSlice`](@ref) argument. Native execution: the
-slices are an ordinary runtime loop.
-"""
-@inline function _mvnormal_cholesky_slices_logpdf(o, B, mu, F)
-    ReactiveKernels._dynamic_tensorized_marker((B, mu, F)) === nothing ||
-        throw(ArgumentError("MvNormalCholesky slice priors support native " *
-            "execution only"))
+@traceable function _mvnormal_cholesky_slices_logpdf(o, B, mu, F)
     groups, k = _slice_count(o, B), _slice_length(o, B)
     _check_slice_vector_arg("the MvNormalCholesky mean", mu, groups, k)
     return _mvnormal_slices_core(o, B, mu, F, _cholesky_factor_logdet(F, k))
 end
 
-"""
-    _mvnormal_slices_logpdf(o, B, mu, Sigma)
+@doc """
+    _mvnormal_cholesky_slices_logpdf(o, B, mu, F)
 
-Σ over the slices `x_g` of `B` of `logpdf(MvNormal(mu_g, Sigma), x_g)`
-for a symmetric positive-definite covariance `Sigma`, through its lower
-Cholesky factor. Native execution.
-"""
-@inline function _mvnormal_slices_logpdf(o, B, mu, Sigma)
-    ReactiveKernels._dynamic_tensorized_marker((B, mu, Sigma)) === nothing ||
-        throw(ArgumentError("MvNormal slice priors support native execution " *
-            "only"))
+Σ over the slices `x_g` of `B` (orientation `o`) of
+`logpdf(MvNormal(mu_g, F * F'), x_g)`, `F` the lower-triangular Cholesky
+factor of the covariance (Stan's `multi_normal_cholesky`). `mu` is a
+shared K-vector or a [`_PerSlice`](@ref) argument. Native and compiled
+execution both check the factor at runtime.
+""" _mvnormal_cholesky_slices_logpdf
+
+@traceable function _mvnormal_slices_logpdf(o, B, mu, Sigma)
     groups, k = _slice_count(o, B), _slice_length(o, B)
     _check_slice_vector_arg("the MvNormal mean", mu, groups, k)
     F = _covariance_cholesky(Sigma, k)
@@ -193,6 +197,15 @@ Cholesky factor. Native execution.
     end
     return _mvnormal_slices_core(o, B, mu, F, logdet)
 end
+
+@doc """
+    _mvnormal_slices_logpdf(o, B, mu, Sigma)
+
+Σ over the slices `x_g` of `B` of `logpdf(MvNormal(mu_g, Sigma), x_g)`
+for a symmetric positive-definite covariance `Sigma`, through its lower
+Cholesky factor. Native and compiled execution both check the covariance
+at runtime.
+""" _mvnormal_slices_logpdf
 
 # ── simplex and ordered slices (vectorized) ──────────────────────────
 

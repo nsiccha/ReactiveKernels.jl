@@ -1481,8 +1481,7 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
     # bare invariant array met the lane axis in `combine_axes` and the whole
     # plate failed with `DimensionMismatch` under Reactant while the native
     # kernel was correct (snag `plate-cell-gathe-94d4a929`). The distinguished
-    # result is never treated as invariant, so a degenerate constant cell keeps
-    # its former lowering.
+    # result retains the whole plate domain, even when it reads no lane input.
     root_positions = Dict(
         canon_id(inner.graph, input.id) => position
         for (position, input) in enumerate(inner.have))
@@ -1523,16 +1522,28 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
             continue
         end
         args = Any[locals[canon_id(inner.graph, input.id)] for input in recipe.inputs]
+        if output_cid == result_cid &&
+           all(invariant_root, dependencies.recipes[recipe_index])
+            # The terminal recipe can read only shared values while unused
+            # lane arguments still determine its broadcast domain. Retain
+            # every lane axis through ignored arguments; no cell is unrolled.
+            for index in eachindex(inner.have)
+                index in atomic && continue
+                valtype(callvalues[index]) <: Number && continue
+                operation = Expr(:call, GlobalRef(@__MODULE__, :_LaneAnchored), operation)
+                pushfirst!(args, callargs[index])
+            end
+        end
         call = Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_call),
                     operation, args...)
         push!(body.args, Expr(:(=), out, call))
         locals[output_cid] = out
     end
     scalar_result = locals[result_cid]
-    materialized = Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), scalar_result)
+    pointwise = Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_pointwise), scalar_result)
     pointwise_lhs === nothing ||
-        push!(body.args, :($pointwise_lhs = $materialized))
+        push!(body.args, :($pointwise_lhs = $pointwise))
     total = Expr(:call,
         GlobalRef(@__MODULE__, :_tensorized_plate_sum), scalar_result)
     total_lhs === nothing || push!(body.args, :($total_lhs = $total))
@@ -1714,8 +1725,10 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     _embedded_statements(inner_ast, callargs, lhs, op_offset))
         end
     end
-    retval = length(p.want) == 1 ? nm(p.want[1]) :
-             Expr(:tuple, (nm(w) for w in p.want)...)
+    output(w) = tensorized ? Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), nm(w)) : nm(w)
+    retval = length(p.want) == 1 ? output(p.want[1]) :
+             Expr(:tuple, (output(w) for w in p.want)...)
     push!(body.args, Expr(:return, retval))
     Expr(:function, Expr(:tuple, argexprs...), body),
     Tuple(runtime_ops), Tuple(runtime_recipes)
@@ -3615,8 +3628,8 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
 end
 
 """
-    prepare(p::Plan; passes=(), bound=()) -> PreparedKernel
-    prepare(g::Graph; have, want, passes=(), bound=()) -> PreparedKernel
+    prepare(p::Plan; passes=(), bound=(), on_error=nothing) -> PreparedKernel
+    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing) -> PreparedKernel
 
 Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
 tuple of AST passes applied before compilation.
@@ -3646,7 +3659,8 @@ for an intermediate, supplying it as HAVE, or selecting another consumer keeps
 that boundary. Whole-array (`Ref`) consumers and opaque intervening recipes
 also retain their materialization boundary.
 """
-function prepare(p::Plan; passes = (), bound = ())
+function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
+    p = _kernel_error_policy(p, on_error)
     p = _partial_apply(p, bound)
     lowered_plan = _fuse_authored_plate_chains(p)
     native_ast, ops, recipes = _lower_with_ops(lowered_plan)
@@ -3683,11 +3697,11 @@ function prepare(p::Plan; passes = (), bound = ())
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 
-function prepare(g::Graph; have = (), want = (), passes = (), bound = ())
+function prepare(g::Graph; have = (), want = (), passes = (), bound = (), on_error = nothing)
     _reuses_bound_preparation(bound, passes) &&
-        return _graph_bound_preparation(g, have, want, passes, bound)
+        return _graph_bound_preparation(g, have, want, passes, bound, on_error)
     p = plan(g; have = have, want = want)
-    prepare(p; passes = passes, bound = bound)
+    prepare(p; passes = passes, bound = bound, on_error = on_error)
 end
 
 """

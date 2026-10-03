@@ -433,15 +433,18 @@ function preprocessing_recipes(plan::StructuralPlan)
     return stmts
 end
 
-# Affine predictors with singleton or non-vector operands use the same
-# per-block mathematics as monotonic predictors, retaining Julia's
-# broadcast axes instead of assembling an hcat with forced n_obs rows.
+# Affine predictors with singleton, non-vector or live derived operands
+# use the same per-block mathematics as monotonic predictors. This retains
+# Julia's broadcast axes and avoids mixing bound and active columns in a
+# generated hcat. Data-only derived columns are already present in columns.
 function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     _uses_structured_observation_axes(plan) && return false
     _predictor_level(plan, pred.name) === :obs || return false
     for t in pred.terms
         t.kind in (ContinuousTerm, OffsetTerm, FactorTerm, ComposedTerm) || continue
         for c in t.columns
+            t.kind === ContinuousTerm && !haskey(plan.columns, c) &&
+                _is_derived(plan, c) && return true
             col = get(plan.columns, c, nothing)
             col isa AbstractArray || continue
             (ndims(col) != 1 || length(col) != plan.n_obs) && return true
@@ -498,10 +501,10 @@ end
 function _contrast_expr(b::DesignBlock)
     @assert b.kind === FactorTerm
     lvlvec = Expr(:vect, (_level_literal(lvl) for lvl in b.levels)...)
-    # Build `g .== permutedims(lvlvec)` via quasiquote for stable lowering.
+    # Compare labels with Julia's identity relation, including missing/NaN.
     g = b.column
     perms = :(permutedims($lvlvec))
-    return :(Float64.($g .== $perms))
+    return :(Float64.(isequal.($g, $perms)))
 end
 
 # One matrix block as an in-graph data expression:
@@ -515,14 +518,11 @@ function _matrix_block_expr(b::DesignBlock, n_obs::Int)
     return :(Float64.($(Expr(:call, :hcat, parts...))))
 end
 
-# Grouping levels embed as literals; Symbols need QuoteNode (a bare Symbol
-# in an Expr would resolve as a variable). Anything else is loud.
+# Nonliteral level values stay quoted data; a Symbol must also be quoted
+# so the emitted expression never interprets a label as a variable.
 _level_literal(lvl::Union{Number,String,Bool,Char}) = lvl
 _level_literal(lvl::Symbol) = QuoteNode(lvl)
-_level_literal(lvl) = throw(
-    ContractValidationError("[preprocessing] grouping level $(repr(lvl)) " *
-                            "is not literal-embeddable (numeric/string/symbol only)"),
-)
+_level_literal(lvl) = QuoteNode(lvl)
 
 """
     _declared_codes(x, levels) -> Vector{Int}
@@ -543,7 +543,7 @@ function _declared_codes(x::AbstractVector, levels::AbstractVector)
     for (i, v) in enumerate(x)
         c = 0
         for (j, lv) in enumerate(levels)
-            if v == lv
+            if isequal(v, lv)
                 c = j
                 break
             end

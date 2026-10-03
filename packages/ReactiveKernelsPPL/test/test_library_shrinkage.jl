@@ -355,10 +355,9 @@ end
     # refused: caller X collides with the computed X definition (single assignment)
     @test_throws ContractValidationError bind_data(plan,
         merge(cols, Dict{Symbol,Any}(:X => Xv)))
-    # Capability gap: a value matrix over a column the model derives
-    # (`lx = log.(x2 .+ 3)`) is not built at bind yet.
-    derived_ok = try
-        _ls_build(quote
+    # Derived data columns build before their value matrix. Independent
+    # transform, density and reverse-mode coverage is in test_matrix_values.jl.
+    derived = _ls_build(quote
                 a ~ Normal(0, 1)
                 lx = log.(x2 .+ 3)
                 X = hcat(x1, lx)
@@ -367,12 +366,7 @@ end
                 sigma ~ Exponential(1.0)
                 y .~ Normal.(mu, sigma)
             end, cols)
-        true
-    catch e
-        e isa SurfaceLoweringError || rethrow()
-        false
-    end
-    @test_broken derived_ok
+    @test derived[1].columns[:X] ≈ hcat(cols[:x1], log.(cols[:x2] .+ 3))
 end
 
 @testset "library re-spells of corpus 42, 47 and 56 bind" begin

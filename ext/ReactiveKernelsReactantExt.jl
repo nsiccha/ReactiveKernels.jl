@@ -5,6 +5,18 @@ import Reactant
 import DifferentiationInterface
 import LinearAlgebra
 
+function ReactiveKernels._runtime_check(
+        valid::Reactant.TracedRNumber{Bool}, error::Exception)
+    # Only the Boolean crosses this runtime boundary. Passing active
+    # diagnostic values would require an adjoint for a host callback.
+    # A valid check stays on the device. Only the failing arm calls the host,
+    # preserving lazy error execution in primal and ordinary reverse mode.
+    Reactant.@trace if !valid
+        Reactant.Ops.julia_callback(ReactiveKernels._RuntimeCheckCallback(error), (), valid)
+    end
+    nothing
+end
+
 function __init__()
     # This function emits an MLIR batch. Its host samples must remain host
     # values; only the authored cell invoked by make_mlir_fn is rewritten.
@@ -619,14 +631,14 @@ function Reactant.traced_type_inner(
 end
 
 function Reactant.make_tracer(
-        seen, previous::ReactiveKernels.GraphReplicatedKernel,
+        seen, previous::Union{ReactiveKernels.GraphReplicatedKernel,ReactiveKernels._ScheduledBatchedKernel},
         path, mode; kwargs...)
     previous
 end
 
 function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
-        ndevices, runtime) where {T<:ReactiveKernels.GraphReplicatedKernel}
+        ndevices, runtime) where {T<:Union{ReactiveKernels.GraphReplicatedKernel,ReactiveKernels._ScheduledBatchedKernel}}
     T
 end
 
@@ -1099,6 +1111,23 @@ end
         marker::_TracedReshapedArray, arg::AbstractArray) =
     Reactant.promote_to(Reactant.TracedRArray, arg)
 
+# Base's scalar fill path still iterates after promoting the array beside it.
+# Lift each scalar to a rank-zero tensor, then normalize missing dimensions
+# exactly as Julia concatenation does (unit axes, never scalar broadcasting).
+# This hook is separate from broadcast's array-only promotion above.
+@inline _rk_concat_array(arg::AbstractArray) =
+    Reactant.promote_to(Reactant.TracedRArray, arg)
+@inline _rk_concat_array(arg::Number) =
+    Reactant.promote_to(Reactant.TracedRArray,
+        Reactant.promote_to(Reactant.TracedRNumber, arg))
+@inline function ReactiveKernels._tensorized_concat_operand(
+        marker::Union{Reactant.TracedType,_TracedReshapedArray},
+        arg::Union{Number,AbstractArray}, ::Val{N}) where {N}
+    array = _rk_concat_array(arg)
+    ndims(array) == N ? array :
+        reshape(array, ntuple(dim -> size(array, dim), N))
+end
+
 # A traced scalar index is a deliberate gather at this compiler boundary: one
 # element read with one integer index per dimension (`x[j]`, `W[i, j]`) is
 # one slice, including an authored read at literal indices. Reactant 0.2.284 preserves
@@ -1115,6 +1144,9 @@ const _RKScalarIndex = Union{Integer,Reactant.TracedRNumber{<:Integer}}
 @inline _rk_int_index(index::Reactant.TracedRNumber{Int}) = index
 @inline _rk_int_index(index::Reactant.TracedRNumber{<:Integer}) =
     convert(Reactant.TracedRNumber{Int}, index)
+@inline ReactiveKernels._tensorized_trunc(
+    ::Type{T}, x::Reactant.TracedRNumber{<:Integer}) where {T<:Integer} =
+    convert(Reactant.TracedRNumber{T}, x)
 @inline _rk_gather(array::Reactant.TracedRArray, indices) =
     Reactant.@allowscalar array[map(_rk_int_index, indices)...]
 
@@ -1433,6 +1465,24 @@ _fresh_tracers(x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = copy(x)
 ReactiveKernels._loop_capture_traced(
         x::Union{Reactant.TracedRArray,Reactant.TracedRNumber}) = _fresh_tracers(x)
 
+# A SubArray's offsets and strides are host layout, not numeric loop state.
+# Reactant's recursive tracer cannot rebuild it with traced offset fields.
+# Carry the parent and indices separately, using the ordinary capture rules
+# for each leaf, and restore the view only where the loop reads it. This keeps
+# view dispatch and the caller's parent intact; it does not materialize a copy
+# of the viewed elements or add methods to the foreign SubArray tracer.
+struct _LoopViewCapture{P,I}
+    parent::P
+    indices::I
+end
+
+ReactiveKernels._loop_capture_traced(x::SubArray) = _LoopViewCapture(
+    ReactiveKernels._loop_capture(parent(x)),
+    ReactiveKernels._loop_capture(parentindices(x)))
+@inline ReactiveKernels._loop_open(x::_LoopViewCapture) = view(
+    ReactiveKernels._loop_open(x.parent),
+    ReactiveKernels._loop_open(x.indices)...)
+
 # A scan's `Ref(...)` operands are read by its retained loop the way an
 # authored loop reads its captures (`ReactiveKernels._loop_capture` /
 # `_loop_open`): a traced leaf enters as a fresh tracer, and an untraced leaf
@@ -1592,7 +1642,8 @@ _recurrence_trace(x::Reactant.TracedRNumber) = _fresh_tracers(x)
 # scalar or dense numeric `Array` becomes a traced value of the same element
 # type, a traced value a fresh tracer (`_fresh_tracers`: the loop's in-place
 # carry update never reaches another binding of the same tracer), and tuples
-# recurse.  Every other value — a `Diagonal` metric, a Cholesky or triangular
+# and immutable arrays with fixed tuple storage recurse while preserving their
+# wrappers. Every other value — a `Diagonal` metric, a Cholesky or triangular
 # wrapper, a struct — keeps its exact type: the carry's type is part of the
 # compiled contract of the code around the loop, and `_recurrence_trace`'s
 # wrapper-to-backing-array normalization belongs to the ext's own loops, which
@@ -1609,6 +1660,12 @@ ReactiveKernels._loop_seed_traced(x::Tuple) =
     map(ReactiveKernels._loop_seed_traced, x)
 ReactiveKernels._loop_seed_traced(x::NamedTuple) =
     map(ReactiveKernels._loop_seed_traced, x)
+function ReactiveKernels._loop_seed_traced(x::AbstractArray)
+    T = typeof(x)
+    fixed = !ismutabletype(T) && fieldcount(T) == 1 &&
+        fieldtype(T, 1) <: NTuple{length(x),Any}
+    fixed ? map(ReactiveKernels._loop_seed_traced, x) : x
+end
 
 function ReactiveKernels._rectangular_fold_impl(
         marker::Reactant.TracedType, step, init, columns, shared, n)
@@ -1663,6 +1720,15 @@ function ReactiveKernels._recurrence_branch(
     result
 end
 
+# Bound arrays must be traced constants before crossing an outer lazy region.
+# Promoting them inside the arm changes the captured operand paths while
+# Reactant constructs the conditional. Atomic wrappers retain their meaning.
+ReactiveKernels._plate_branch_operands(
+        ::Reactant.TracedRNumber{Bool}, args::Tuple) = map(_plate_branch_operand, args)
+_plate_branch_operand(arg) = _reactant_plate_operand(arg)
+_plate_branch_operand(arg::Base.RefValue) = Ref(_plate_branch_operand(arg[]))
+_plate_branch_operand(arg::Union{Tuple,NamedTuple}) = map(_plate_branch_operand, arg)
+
 # Batched slice-collection plates preserve eachcol structurally in the core.
 # Move the observation axis to the leading batch dimension and lower the
 # scalar recipe with Reactant's batch primitive; no Base.Slices object or host
@@ -1674,6 +1740,11 @@ struct _AuthoredPlateBatchCall{B,S,N,O,A,L}
 end
 
 @inline _authored_plate_batch_scalar(array) = Reactant.@allowscalar array[]
+# A reshape view over a traced tensor remains one tensor result, rather than a
+# host collection whose entries would need a compound fixed-storage schema.
+@inline _authored_plate_batch_result(value) = value
+@inline _authored_plate_batch_result(value::_TracedReshapedArray) =
+    Reactant.promote_to(Reactant.TracedRArray, value)
 
 struct _PlateLaneLayout{N,S}
     schema::S
@@ -1708,7 +1779,7 @@ _plate_layout_width(::Type{<:_PlateLaneLayout{N}}) where {N} = N
             push!(values, :(getfield(getfield(call, :shared), $shared_position)))
         end
     end
-    :(getfield(call, :operation)($(values...)))
+    :(_authored_plate_batch_result(getfield(call, :operation)($(values...))))
 end
 
 @inline _authored_plate_batch_length(arg::ReactiveKernels._TensorizedEachcol) =
@@ -1727,7 +1798,13 @@ end
     arg.schema === nothing ? nothing :
     _PlateLaneLayout{length(arg.values),typeof(arg.schema)}(arg.schema)
 @inline _authored_plate_shared(arg) = arg
-@inline _authored_plate_shared(arg::Base.RefValue) = arg[]
+# Shared numeric arrays cross the cell boundary as whole traced tensors, just
+# like lane arrays. Leaving a bound Ref payload on the host lets a nested
+# traced branch collect its elements as scalar result paths into a host Array.
+@inline function _authored_plate_shared(arg::Base.RefValue)
+    value = arg[]
+    value isa AbstractArray{<:Number} ? _reactant_plate_operand(value) : value
+end
 
 @inline _authored_plate_is_explicit_batch(
     arg::ReactiveKernels._TensorizedEachcol, count) = true
@@ -1822,8 +1899,11 @@ end
 
 function _reactant_plate_batch(operation, args, batch_positions, scalar_positions,
         batch_inputs, batch_shape)
-    shared = Tuple(_authored_plate_shared(getfield(args, index))
-        for index in eachindex(args) if !(index in batch_positions))
+    # Mapping a tuple preserves heterogeneous tensor types; collecting a
+    # generator would try to promote integer and floating-point traced arrays.
+    shared_indices = Tuple(index for index in eachindex(args)
+        if !(index in batch_positions))
+    shared = map(index -> _authored_plate_shared(getfield(args, index)), shared_indices)
     layouts = Tuple(_authored_plate_batch_schema(getfield(args, index))
         for index in batch_positions)
     call = _AuthoredPlateBatchCall{
@@ -1902,6 +1982,10 @@ end
 _sum_plate_tree(schema::Number, values, count) = schema * count
 _sum_plate_tree(schema, values, count) = schema
 _plate_leaf_sum(value) = sum(value; dims=1)
+ReactiveKernels._tensorized_plate_sum(
+        value::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray}) =
+    _sum_plate_tree(_PlateLaneLeaf{1,Base.tail(size(value.values))}(),
+        (value.values,), _authored_plate_batch_length(value))
 function _sum_plate_tree(::_PlateLaneLeaf{I,D}, values, count) where {I,D}
     reduced = Reactant.call_with_reactant(_plate_leaf_sum,
         _reactant_plate_operand(getfield(values, I)))
@@ -1943,7 +2027,17 @@ ReactiveKernels._tensorized_plate_sum(
     types = [Reactant.MLIR.IR.TensorType(vcat(shape, collect(Int64, size(leaf))),
         Reactant.MLIR.IR.Type(Reactant.unwrapped_eltype(leaf)))
         for leaf in staged.linear_results]
-    results = Reactant.Ops.batch(actual_inputs, types, shape; fn=staged.f)
+    # A zero-lane batch executes no cell. Letting Enzyme's batch pass realize
+    # it as a loop creates a one-element update into a zero-element buffer and
+    # aborts before the later empty-result normalization can run. The traced
+    # leaf schemas already supply its exact shape and type; construct those
+    # empty outputs directly, with no call to the cell or its lazy condition.
+    results = if any(iszero, shape)
+        [Reactant.Ops.fill(Reactant.unwrapped_eltype(leaf)(0),
+            vcat(shape, collect(Int64, size(leaf)))) for leaf in staged.linear_results]
+    else
+        Reactant.Ops.batch(actual_inputs, types, shape; fn=staged.f)
+    end
     logical = staged.traced_result
     logical isa Union{Reactant.TracedRArray,Reactant.TracedRNumber} && return only(results)
     length(shape) == 1 || throw(ArgumentError(
@@ -2052,8 +2146,8 @@ ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
 # `similar(::Broadcasted{AbstractReactantArrayStyle}, ::Type{Number})`.
 # Promoting the host operands first (the same `promote_to` the cat/broadcast
 # wrappers of a fused body use) types the cell body on traced scalars exactly
-# as Reactant's element application evaluates it, so the deduced eltype is
-# concrete.
+# as Reactant's element application evaluates it. Any remaining abstract result
+# inference goes through batch tracing below instead of broadcast allocation.
 # The core routes a recipe to the FIRST marker-bearing operand, and this
 # extension claims plain traced vectors (above) so a vector plate lowers here.
 # Inside an `eachcol`/batched plate a traced data vector can therefore precede
@@ -2145,9 +2239,22 @@ function ReactiveKernels._tensorized_plate_call(
         return _reactant_authored_plate_call(structural, operation, args)
     any(_reactant_plate_ref_array, args) &&
         return _reactant_ref_plate_call(operation, args)
+    # A split arm with only shared inputs receives an ignored lane anchor.
+    # Its live branch can return a host fallback or a traced scalar. Generic
+    # broadcast infers their join as Number before tracing the cell; batch
+    # traces the shared branch and preserves the anchored lane domain.
+    (operation isa ReactiveKernels._LaneAnchored ||
+        (operation isa ReactiveKernels._KernelSourceOp &&
+         operation.tensor_f isa ReactiveKernels._LaneAnchored)) &&
+        return _reactant_ref_plate_call(operation, args)
     operands = map(_reactant_plate_operand, args)
     result_type = Base.promote_op(operation, map(Base.eltype, operands)...)
-    result_type <: Number || return _reactant_ref_plate_call(operation, args)
+    # Inference can widen a valid scalar cell to Number (or a numeric union),
+    # including after other generated kernels have compiled. Reactant's
+    # broadcast cannot allocate an abstract eltype; batch traces the cell once
+    # and derives its concrete result leaves without changing lazy branches.
+    (isconcretetype(result_type) && result_type <: Number) ||
+        return _reactant_ref_plate_call(operation, args)
     Base.broadcast(operation, operands...)
 end
 

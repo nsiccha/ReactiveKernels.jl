@@ -14,6 +14,8 @@ BRM–RK backend plan; the emitter→layer input contract lives in
 module ReactiveKernelsPPL
 
 using ReactiveKernels
+using ReactiveKernels: rk_expm_rule, rk_symmetric_eigvals_rule,
+    rk_symmetric_eigvecs_rule
 import DataAPI
 import SpecialFunctions
 using SpecialFunctions: erfc, loggamma
@@ -25,7 +27,7 @@ export ColumnRef, ParamName, ColumnData
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-    BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
+    BinomialCloglogFam, BinomialProbFam, BetaLogitFam, BetaShapeFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, CensoredAddpropnormalFam, TgiCategoryFam,
     TgiResponseFam, TgiCensoredFam, NormalIDGLMFam, BernoulliLogitGLMFam,
@@ -118,13 +120,9 @@ export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
     prepare_transit_twocmt_rule
 
 include("contract.jl")
-include("expm_rule.jl")
-# Owned symmetric-eigendecomposition rules: defined in
-# ReactiveKernelsDistributionKernels (beside `loggamma` / `logbeta`),
-# re-exported here with their rule graphs.
-using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    rk_symmetric_eigvals, rk_symmetric_eigvecs, rk_symmetric_eigvals_rule,
-    rk_symmetric_eigvecs_rule
+import ReactiveKernelsDistributionKernels: DistributionKernelSources
+# The general numerical callables and rule graphs are owned by RK proper;
+# existing PPL-qualified names import those same bindings for compatibility.
 include("pkcells.jl")
 include("transit_twocmt.jl")
 include("transit_twocmt_rule.jl")

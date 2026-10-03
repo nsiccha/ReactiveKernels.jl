@@ -1,15 +1,13 @@
 # Owned symmetric-eigendecomposition primitives with generated AD rules.
-# They live here, beside the owned `loggamma` / `logbeta` rules, so every
-# consumer that already depends on ReactiveKernelsDistributionKernels (the
-# PPL layer and the hand-written PPL examples) reaches them without a new
-# package edge; ReactiveKernelsPPL re-exports the two callables.
+# General numerical primitives live in ReactiveKernels itself. Nested
+# distribution and PPL packages import the same owned callables and graphs.
 #
 # Ordinary reverse Enzyme through `eigen(::Symmetric)` fails: the call lowers
 # to LAPACK `syevr!` (`dsyevr_64_`), for which Enzyme has no derivative rule
 # (`EnzymeNoDerivativeError: No augmented forward pass found for dsyevr_64_`;
 # Enzyme's bitcode-replacement table covers BLAS plus `potrf` only). That is
-# why a symmetric-eigendecomposition-based density (the posteriordb
-# `kronecker_gp` marginal likelihood) has no native reverse gradient.
+# why an ordinary symmetric-eigendecomposition call needs an owned rule
+# for native reverse gradients.
 #
 # These rules are the replacement path: one pure-math `@kernel` graph per
 # output authors the primal plus its forward (JVP) and reverse (VJP)

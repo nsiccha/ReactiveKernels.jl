@@ -32,10 +32,9 @@ end
             val, grad = cad(ru)
             @test Float64(val) ≈ expected
             if kind === :observation && n > 1
-                # Existing released-backend issue #17: the default pipeline
-                # loses n-1 log-scale contributions. Use its approved
-                # :only_enzyme correctness control; retain the default pin.
-                @test_broken Array(grad) ≈ r.grad rtol = 2e-5 atol = 1e-7
+                # Require the default gradient before the independent
+                # Enzyme-only control, so an optimizer regression fails here.
+                @test Array(grad) ≈ r.grad rtol = 2e-5 atol = 1e-7
                 val, grad = compile_ad_value_and_gradient(r.sampler.ad, ru;
                     optimize = :only_enzyme)(ru)
                 @test Float64(val) ≈ expected

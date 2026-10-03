@@ -315,8 +315,8 @@ end
         sigma = c .+ d .* z
         y .~ Normal.(mu, sqrt.(sigma))
     end, (:y, :x, :z); conditioned = (:y, :x, :z))).responses)
-    # capability: probit.-wrapped scale predictor (arbitrary scale wrapper) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    # admitted: normcdf-wrapped scale predictor (todo `05fuzch`)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         c ~ Normal(0, 1)
@@ -342,8 +342,8 @@ end
     end, (:y, :x); conditioned = (:y, :x))).responses)
     # Beta-kappa predictors are log-only (a concentration — contract
     # gate): a bare predictor use fails closed.
-    # capability: identity-link Beta concentration predictor (bare k) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    # admitted: identity-link Beta concentration predictor (bare k)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         c ~ Normal(0, 1)
@@ -370,8 +370,8 @@ end
         sg = cs[g]
         y .~ Normal.(mu, exp.(sg))
     end, (:y, :x, :g); conditioned = (:y, :x, :g))
-    # A latent transform is not an affine predictor: it stays on the
-    # scalar path and fails there, never analyzed for coefficients.
+    # A latent transform remains an ordinary per-cell scale value.
+    # Numerical density and reverse checks live in test_auxiliary_data.jl.
     expr = Expr(:block,
         :(mu ~ Normal(0, 5)),
         :(tau ~ HalfNormal(5)),
@@ -381,8 +381,8 @@ end
                 Expr(:block,
                     :(theta[i] ~ Normal(mu, tau)),
                     :(y[i] ~ Normal.(theta[i], _t2[i]))))))
-    # capability: deterministic transform of a plate latent (_t2 = theta .+ 1) as per-cell scale (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(expr, (:y,); conditioned = (:y,)); true)
+    # Admitted: a deterministic plate-latent transform supplies per-cell scale.
+    @test (lower_rkppl(expr, (:y,); conditioned = (:y,)); true)
 end
 
 @testset "contract: hand-built scale-predictor plans" begin
@@ -403,7 +403,7 @@ end
         PredictorSpec(:mu, IdentityLink, terms_mu, :mu),
         PredictorSpec(:sigma, LogLink, terms_sg, :sigma)]
     function _mk(scale; family = GaussianFam, link = IdentityLink,
-            predictor = :mu, preds = preds)
+            predictor = :mu, preds = preds, priors = priors)
         return StructuralPlan(
             LikelihoodSpec[LikelihoodSpec(family, link, :y, predictor,
                 scale, nothing, _none_evidence(), :y_resp)],
@@ -416,26 +416,26 @@ end
     # refused: scale ref names an unknown predictor (IR contract)
     @test_throws ContractValidationError validate_structure(
         _mk(ScalePredictorRef(:nosuch, LogLink)))
-    # refused: scale ref link disagrees with its PredictorSpec link (IR contract)
-    @test_throws ContractValidationError validate_structure(
-        _mk(ScalePredictorRef(:sigma, IdentityLink)))
-    # refused: scale ref ProbitLink disagrees with predictor LogLink; scale links identity/log/logit only (IR contract)
-    @test_throws ContractValidationError validate_structure(
-        _mk(ScalePredictorRef(:sigma, ProbitLink)))
+    # Admitted: links belong to each reference.
+    @test isnothing(validate_structure(
+        _mk(ScalePredictorRef(:sigma, IdentityLink))))
+    # Admitted: the probit wrapper yields an auxiliary value.
+    @test isnothing(validate_structure(
+        _mk(ScalePredictorRef(:sigma, ProbitLink))))
     # Scale is the response's own location predictor.
-    # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
-    @test_broken (validate_structure(
-        _mk(ScalePredictorRef(:mu, IdentityLink))); true)
+    # admitted: one linear predictor feeding several slots of one response (10gzbm9 shared-slots)
+    @test isnothing(validate_structure(_mk(ScalePredictorRef(:mu, IdentityLink);
+        preds = preds[1:1], priors = priors[1:2])))
     # Beta-kappa predictors admitted log-only (a concentration);
     # scaleless families take no ref.
     validate_structure(_mk(ScalePredictorRef(:sigma, LogLink);
         family = BetaLogitFam, link = LogitLink))
-    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
-    @test_broken (validate_structure(
+    # admitted: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links)
+    @test (validate_structure(
         _mk(ScalePredictorRef(:sigma, IdentityLink); family = BetaLogitFam,
             link = LogitLink)); true)
-    # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
-    @test_broken (validate_structure(
+    # admitted: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links)
+    @test (validate_structure(
         _mk(ScalePredictorRef(:sigma, LogitLink); family = BetaLogitFam,
             link = LogitLink)); true)
     # refused: scaleless family (Poisson) takes no scale ref (IR contract)

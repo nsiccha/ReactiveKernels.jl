@@ -232,14 +232,16 @@ end
         Float64.(hcat(ones(6), Float64.(x_true))))
 end
 
-@testset "contract me: non-continuous terms over a plate fail" begin
+@testset "contract me: latent offsets and invalid factor terms" begin
     cols, n = _me_columns()
-    mkplan(terms) = StructuralPlan(
+    mkplan(terms; latent_coefficient=true) = StructuralPlan(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
             :sigma, nothing, _none_evidence(), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
-            PopulationPrior(:mu, :x_true, 0.0, 2.0)],
+        latent_coefficient ?
+            PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+                PopulationPrior(:mu, :x_true, 0.0, 2.0)] :
+            PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0)],
         SampledParameter[SampledParameter(:sigma, :exponential,
             (arg1 = 1.0,), nothing, :sigma)],
         AssignmentSpec[], cols, n;
@@ -256,8 +258,9 @@ end
     off = mkplan(TermSpec[
         TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
             :intercept),
-        TermSpec(OffsetTerm, [:x_true], NamedTuple(), :x_true, :x_true_off)])
-    # refused: OffsetTerm over a plate latent (IR contract)
+        TermSpec(OffsetTerm, [:x_true], NamedTuple(), :x_true, :x_true_off)];
+        latent_coefficient=false)
+    # refused: an unscaled plate latent uses LatentTerm, not OffsetTerm (IR contract).
     @test_throws ContractValidationError validate_plan(off)
     # Factor over a latent: latents carry no levels. (The LevelMap gets
     # the plan past structure validation so the term check fires.)

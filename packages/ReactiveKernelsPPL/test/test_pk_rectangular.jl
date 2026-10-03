@@ -1,5 +1,5 @@
 module PKRectangularTests
-using ReactiveKernels, ReactiveKernelsPPL, Test
+using ReactiveKernels, ReactiveKernelsPPL, Test, LinearAlgebra, StaticArrays
 const RKP = ReactiveKernelsPPL
 
 # Native-only: the Reactant compiles of the rectangular path need
@@ -36,5 +36,41 @@ const RKP = ReactiveKernelsPPL
     zargs = (RKP.SubjectSlice(zeros(length(zero_sched.op_type))), lp...)
     @test RKP._pk_rectangular(linear_pk_read_locs_auc, zero_sched.op_ends,
         zero_cols, zargs, lp) ≈ zero_dt(lp)
+end
+
+@testset "PK integer powers and repeated-dose entry points" begin
+    A = linear_pk_system_3(log.([1.0, 10.0, 2.0, 20.0, 0.5])...)
+    state = SVector(0.4, 0.2, 0.1)
+    amount, interval = 2.3, 0.7
+    B = RKP._pk_dose_affine(A, amount, interval)
+    for count in (Int8(1), Int32(3), Int64(9), UInt32(17))
+        # Independent dense propagation visits each individual dose.
+        expected = Vector(state)
+        transition = exp(Matrix(A) * interval)
+        for j in 1:count
+            j > 1 && (expected = transition * expected)
+            expected[1] += amount
+        end
+        @test linear_pk_add_regular_doses_3(A, state, amount, interval, count) ≈ expected
+        @test ReactiveKernels.traced(linear_pk_add_regular_doses_3,
+            A, state, amount, interval, count) ≈ expected
+        @test RKP._pk_smat_pow4(B, count) ≈ Matrix(B)^count
+        @test ReactiveKernels.traced(RKP._pk_smat_pow4, B, count) ≈ Matrix(B)^count
+    end
+    @test RKP._pk_smat_pow4(B, 0) == SMatrix{4,4}(I)
+    @test ReactiveKernels.traced(RKP._pk_smat_pow4, B, 0) == SMatrix{4,4}(I)
+    # The inactive affine/exponential arm must not read invalid values.
+    invalid_A = SMatrix{3,3}(fill(NaN, 3, 3))
+    expected = linear_pk_add_dose_3(state, amount)
+    @test linear_pk_add_regular_doses_3(invalid_A, state, amount, NaN, 1) == expected
+    @test ReactiveKernels.traced(linear_pk_add_regular_doses_3,
+        invalid_A, state, amount, NaN, 1) == expected
+    # Refused: these helpers' existing count/exponent contracts require an
+    # integer scalar; accepting a Float64 would change native admission.
+    @test_throws MethodError linear_pk_add_regular_doses_3(A, state, amount, interval, 3.0)
+    @test_throws MethodError RKP._pk_smat_pow4(B, 3.0)
+    @test_throws ArgumentError ReactiveKernels.traced(linear_pk_add_regular_doses_3,
+        A, state, amount, interval, 3.0)
+    @test_throws ArgumentError ReactiveKernels.traced(RKP._pk_smat_pow4, B, 3.0)
 end
 end

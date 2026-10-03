@@ -177,7 +177,14 @@ const _SM_DATA = (
             hsgp_basis(:h_x, x; k = 8, sd = $bad)
             y .~ Normal.(mu, 1.0)
         end
-        if bad == :(StudentT(3, 0))
+        if bad == :(Normal(0, s))
+            # User 1cmodra/10ldrvz chose explicit smooth submodels for
+            # sampled hyper arguments. The live-scale variant is covered
+            # by test_expression_arguments.jl; this retained built-in
+            # takes literal hyper-prior arguments.
+            @test_throws SurfaceLoweringError lower_rkppl(ex,
+                (:y, :x); conditioned = (:y, :x))
+        elseif bad == :(StudentT(3, 0))
             # refused: StudentT is missing its scale argument (P3 arity).
             @test_throws SurfaceLoweringError lower_rkppl(ex, (:y, :x); conditioned = (:y, :x))
         else

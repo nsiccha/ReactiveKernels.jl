@@ -6,8 +6,8 @@ using ReactiveKernelsPPL
 using Test
 
 # One `@plate` (decision 1cmodra, prong `plates`): a cell means one
-# iteration of the Julia `for` loop it is written as — every value in it is
-# a scalar — and shapes come from named data (the range, a data index
+# iteration of the Julia `for` loop it is written as. These fixtures use
+# scalar observations; cell values may be arrays. Shapes come from named data (the range, a data index
 # column, a schedule's subject column), never from dims keys. Uses `_canon`
 # from test_corpus.jl (included right after it). Data and models are
 # synthetic; densities are checked against Distributions.jl.
@@ -30,21 +30,37 @@ _pl_plate(R, cells...) = Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
     head = (:(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)))
     top = lower_rkppl(Expr(:block, head..., :(mu = a .+ b .* x),
         :(y .~ Normal.(mu, s))), data; conditioned = data)
+    cols = Dict(:y => [0.2, 1.1, 0.7], :x => [-0.5, 0.3, 1.2])
+    function check(plan; truncated = false, scale = 1)
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        u = unconstrain(built.layout, (; a = 0.4, b = -0.2, s = 1.1))
+        oracle = v -> begin
+            q = constrain(built.layout, v)
+            distributions = Normal.(q.a .+ q.b .* cols[:x], scale * q.s)
+            truncated && (distributions = Distributions.truncated.(distributions, 0, 10))
+            logpdf(Normal(), q.a) + logpdf(Normal(0, 2), q.b) +
+                logpdf(Exponential(), q.s) + log(q.s) +
+                sum(logpdf.(distributions, cols[:y]))
+        end
+        _check_model_math(built, bound, u, oracle)
+    end
+    check(top)
     # A scalar observation object and its broadcast spelling are the same
     # statement in a loop body (broadcasting over scalars returns the
     # scalar); both are the vectorized observation.
     for obj in (:(Normal(mu[i], s)), :(Normal.(mu[i], s)))
         got = lower_rkppl(Expr(:block, head..., :(mu = a .+ b .* x),
             _pl_plate(:(eachindex(y)), :(y[i] ~ $obj))), data; conditioned = data)
-        @test _pl_canon(got) == _pl_canon(top)
+        check(got)
     end
     # Scalar arithmetic in a cell local: `a + b * x[i]` is the cell value;
-    # the dotted spelling of the same line lowers identically.
+    # the dotted spelling has the same density and ordinary reverse.
     for rhs in (:(a + b * x[i]), :(a .+ b .* x[i]))
         got = lower_rkppl(Expr(:block, head...,
             _pl_plate(:(eachindex(y)), :(mu = $rhs), :(y[i] ~ Normal(mu, s)))),
             data; conditioned = data)
-        @test _pl_canon(got) == _pl_canon(top)
+        check(got)
     end
     # Response wrappers draw once per index too.
     wraptop = lower_rkppl(Expr(:block, head..., :(mu = a .+ b .* x),
@@ -52,7 +68,8 @@ _pl_plate(R, cells...) = Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
     wrap = lower_rkppl(Expr(:block, head..., :(mu = a .+ b .* x),
         _pl_plate(:(eachindex(y)), :(y[i] ~ truncated(Normal(mu[i], s), 0, 10)))),
         data; conditioned = data)
-    @test _pl_canon(wrap) == _pl_canon(wraptop)
+    check(wraptop; truncated = true)
+    check(wrap; truncated = true)
     # Operators over scalar-only operands stay scalar (`2 * s` is the same
     # value in every iteration): the cell local is a scalar definition.
     sc = lower_rkppl(Expr(:block, head..., :(mu = a .+ b .* x),
@@ -60,7 +77,8 @@ _pl_plate(R, cells...) = Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
         data; conditioned = data)
     sctop = lower_rkppl(Expr(:block, head..., :(mu = a .+ b .* x),
         :(sd = 2 * s), :(y .~ Normal.(mu, sd))), data; conditioned = data)
-    @test _pl_canon(sc) == _pl_canon(sctop)
+    check(sctop; scale = 2)
+    check(sc; scale = 2)
 end
 
 @testset "plate gathers through a data index column" begin
@@ -69,17 +87,23 @@ end
     top = lower_rkppl(Expr(:block, head..., :(y .~ Normal.(c[g], s))), data; conditioned = data)
     got = lower_rkppl(Expr(:block, head...,
         _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(c[g[i]], s)))), data; conditioned = data)
-    @test _pl_canon(got) == _pl_canon(top)
-    # The index column must be data.
-    err = try
-        lower_rkppl(Expr(:block, head..., :(h = g),
-            _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(c[h[i]], s)))), data; conditioned = data)
-        nothing
-    catch e
-        e
-    end
     # capability: a data-index alias is an ordinary value (P8 1cmodra; todo `15lq8iu`).
-    @test_broken (err === nothing || throw(err))
+    aliased = lower_rkppl(Expr(:block, head..., :(h = g),
+        _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(c[h[i]], s)))), data; conditioned = data)
+    # A retained plate and a vectorized gather may have different plans;
+    # both, including the index alias, must preserve the authored density.
+    cols = Dict(:y => [-0.1, 0.8, 0.2], :g => [1, 2, 1])
+    for plan in (top, got, aliased)
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        u = unconstrain(built.layout, (; s = 1.1, c = [-0.2, 0.4]))
+        oracle = v -> begin
+            q = constrain(built.layout, v)
+            sum(logpdf.(Normal(0, 2), q.c)) + logpdf(Exponential(), q.s) +
+                log(q.s) + sum(logpdf.(Normal.(q.c[cols[:g]], q.s), cols[:y]))
+        end
+        _check_model_math(built, bound, u, oracle)
+    end
     # Other cross-index reads stay refused.
     # refused: reads `g[i - 1]`, out of bounds at i = 1 in the Julia loop (P3)
     @test_throws "cross-index reads" lower_rkppl(Expr(:block, head...,
@@ -132,7 +156,11 @@ _pl_pk_chain(obs...) = Expr(:block, _pl_pk_head().args...,
     legacy, lb = _pl_bind(_pl_pk_legacy(:(dv .~ Normal.(mu, sigma))),
         _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
     for obs in (:(dv .~ Normal.(conc, sigma)),
-            _pl_plate(:(eachindex(dv)), :(dv[i] ~ Normal(conc[i], sigma))))
+            :(dv[eachindex(dv)] .~ Normal.(conc, sigma)),
+            :(dv[axes(dv, 1)] .~ Normal.(conc, sigma)),
+            :(dv[:] .~ Normal.(conc, sigma)),
+            _pl_plate(:(eachindex(dv)), :(dv[i] ~ Normal(conc[i], sigma))),
+            _pl_plate(:(axes(dv, 1)), :(dv[i] ~ Normal(conc[i], sigma))))
         plan = lower_rkppl(_pl_pk_chain(obs), _PL_PK_DATA; conditioned = _PL_PK_DATA)
         kp = only(plan.kernel_plates)
         @test isempty(plan.responses)
@@ -160,40 +188,66 @@ _pl_pk_chain(obs...) = Expr(:block, _pl_pk_head().args...,
     end
 end
 
+@testset "schedule extraction preserves selected-domain boundaries" begin
+    # These are valid Julia selections, but carrying their indices through
+    # the grouped schedule cell is an existing capability gap. An extraction
+    # that silently drops the selection must not appear to support them.
+    for obs in (:(dv[eachindex(time)] .~ Normal.(conc, sigma)),
+            :(dv[axes(time, 1)] .~ Normal.(conc, sigma)),
+            :(dv[axes(dv, 2)] .~ Normal.(conc, sigma)),
+            :(dv[1:4] .~ Normal.(conc, sigma)),
+            _pl_plate(:(axes(dv, 2)), :(dv[i] ~ Normal(conc[i], sigma))))
+        supported = try
+            lower_rkppl(_pl_pk_chain(obs), _PL_PK_DATA;
+                conditioned = _PL_PK_DATA)
+            true
+        catch err
+            err isa SurfaceLoweringError || rethrow()
+            @test occursin("explicitly sized or selected domain", sprint(showerror, err))
+            false
+        end
+        @test_broken supported
+    end
+end
+
 @testset "schedule chain with two observations is one kernel" begin
     cols = _pl_pk_cols()
-    two = _pl_pk_chain(
-        _pl_plate(:(eachindex(dv)), :(dv[i] ~ Normal(conc[i], sigma))),
-        _pl_plate(:(eachindex(cc)), :(lam = exp(conc[i])),
-            :(cc[i] ~ Poisson(lam))))
-    plan = lower_rkppl(two, _PL_PK_DATA; conditioned = _PL_PK_DATA)
-    kp = only(plan.kernel_plates)
-    @test length(kp.obs) == 2
-    @test kp.result === :conc
-    @test [nm for (nm, _) in kp.assignments] == [:read_locs, :conc, :lam]
-    bound, built = _pl_bind(two, _PL_PK_DATA, cols)
-    # Each observation alone, in the legacy form, at the same draws: the
-    # joint likelihood is their sum (shared chain, two response axes).
-    gauss, gb = _pl_bind(_pl_pk_legacy(:(dv .~ Normal.(mu, sigma))),
-        _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
-    pois, pb = _pl_bind(_pl_pk_legacy(:(lam = exp.(mu)), :(cc .~ Poisson.(lam))),
-        _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
-    names = coordinate_names(built.layout)
-    @test names == coordinate_names(gb.layout)
-    u = 0.03 .* (1:length(names)) .- 0.05
-    pnames = coordinate_names(pb.layout)
-    up = [u[findfirst(==(n), names)] for n in pnames]
-    @test _pl_q(built, bound, :likelihood, u) ≈
-        _pl_q(gb, gauss, :likelihood, u) + _pl_q(pb, pois, :likelihood, up) rtol = 1e-12
-    # A chain value is a cell value, never a sampled name or a response.
-    # refused: `conc` bound by `=` then sampled with `.~` (single assignment)
-    @test_throws "schedule-chain value" lower_rkppl(_pl_pk_chain(
-        :(dv .~ Normal.(conc, sigma)), :(conc .~ Normal.(0.0, 1.0))),
-        _PL_PK_DATA; conditioned = _PL_PK_DATA)
-    # capability: schedule chain that feeds no observation (unused deterministic value) (todo `1qlbn5b`)
-    free_chain = lower_rkppl(_pl_pk_chain(), _PL_PK_DATA; conditioned = _PL_PK_DATA)
-    @test isempty(only(free_chain.kernel_plates).obs)
-    @test isempty(free_chain.responses)
+    for axis in (:eachindex, :axes)
+        dv_indices = axis === :eachindex ? :(eachindex(dv)) : :(axes(dv, 1))
+        cc_indices = axis === :eachindex ? :(eachindex(cc)) : :(axes(cc, 1))
+        two = _pl_pk_chain(
+            _pl_plate(dv_indices, :(dv[i] ~ Normal(conc[i], sigma))),
+            _pl_plate(cc_indices, :(lam = exp(conc[i])),
+                :(cc[i] ~ Poisson(lam))))
+        plan = lower_rkppl(two, _PL_PK_DATA; conditioned = _PL_PK_DATA)
+        kp = only(plan.kernel_plates)
+        @test length(kp.obs) == 2
+        @test kp.result === :conc
+        @test [nm for (nm, _) in kp.assignments] == [:read_locs, :conc, :lam]
+        bound, built = _pl_bind(two, _PL_PK_DATA, cols)
+        # Each observation alone, in the legacy form, at the same draws: the
+        # joint likelihood is their sum (shared chain, two response axes).
+        gauss, gb = _pl_bind(_pl_pk_legacy(:(dv .~ Normal.(mu, sigma))),
+            _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
+        pois, pb = _pl_bind(_pl_pk_legacy(:(lam = exp.(mu)), :(cc .~ Poisson.(lam))),
+            _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
+        names = coordinate_names(built.layout)
+        @test names == coordinate_names(gb.layout)
+        u = 0.03 .* (1:length(names)) .- 0.05
+        pnames = coordinate_names(pb.layout)
+        up = [u[findfirst(==(n), names)] for n in pnames]
+        @test _pl_q(built, bound, :likelihood, u) ≈
+            _pl_q(gb, gauss, :likelihood, u) + _pl_q(pb, pois, :likelihood, up) rtol = 1e-12
+        # A chain value is a cell value, never a sampled name or a response.
+        # refused: `conc` bound by `=` then sampled with `.~` (single assignment)
+        @test_throws "schedule-chain value" lower_rkppl(_pl_pk_chain(
+            :(dv .~ Normal.(conc, sigma)), :(conc .~ Normal.(0.0, 1.0))),
+            _PL_PK_DATA; conditioned = _PL_PK_DATA)
+        # capability: schedule chain that feeds no observation (unused deterministic value) (todo `1qlbn5b`)
+        free_chain = lower_rkppl(_pl_pk_chain(), _PL_PK_DATA; conditioned = _PL_PK_DATA)
+        @test isempty(only(free_chain.kernel_plates).obs)
+        @test isempty(free_chain.responses)
+    end
 end
 
 # --- The 99_plate_* corpus re-spellings against the forms they replace ----
@@ -293,8 +347,6 @@ end
         _pl_plate(:(eachindex(k2)), :(k2[i] ~ Binomial(n2[i], theta2))))
     twin = Expr(:block, head..., :(k1 .~ Binomial.(n1, theta1)),
         :(k2 .~ Binomial.(n2, theta2)))
-    @test _pl_canon(lower_rkppl(plates, data; conditioned = data)) ==
-        _pl_canon(lower_rkppl(twin, data; conditioned = data))
     cols = Dict{Symbol,AbstractVector}(:k1 => [3, 1, 4], :n1 => [5, 5, 6],
         :k2 => [0, 2, 2, 1, 3], :n2 => [4, 4, 3, 2, 5])
     bound, built = _pl_bind(plates, data, cols)
@@ -304,17 +356,27 @@ end
     @test _pl_q(built, bound, :likelihood, u) ≈
         sum(logpdf.(Binomial.(cols[:n1], nt.theta1), cols[:k1])) +
         sum(logpdf.(Binomial.(cols[:n2], nt.theta2), cols[:k2])) rtol = 1e-12
-    # refused: the columns one statement reads share its rows — Julia's
-    # broadcast throws a DimensionMismatch there (standard-Julia semantics,
-    # language principle 3).
+    for ast in (plates, twin)
+        bnd, model = _pl_bind(ast, data, cols)
+        oracle = v -> begin
+            q = constrain(model.layout, v)
+            sum(logpdf.(Binomial.(cols[:n1], q.theta1), cols[:k1])) +
+                sum(logpdf.(Binomial.(cols[:n2], q.theta2), cols[:k2])) +
+                logpdf(Beta(1, 1), q.theta1) + logpdf(Beta(1, 1), q.theta2) +
+                log(q.theta1 * (1 - q.theta1)) + log(q.theta2 * (1 - q.theta2))
+        end
+        _check_model_math(model, bnd, u, oracle)
+    end
+    # refused: explicit indexing must cover the authored response range
+    # (standard-Julia semantics, language principle 3).
     bad = merge(cols, Dict{Symbol,AbstractVector}(:n2 => [4, 4, 3]))
-    @test_throws "column length 3 ≠ the 5 rows of k2" _pl_bind(plates, data,
+    @test_throws "indexed operand n2 does not cover the authored response range" _pl_bind(plates, data,
         bad)
     # refused: responses reading a common column observe one axis, so a
     # shared covariate cannot serve rows of two lengths (principle 3).
     shared = Expr(:block, :(b ~ Normal(0, 1)), :(s ~ Exponential(1)),
         :(y1 .~ Normal.(b .* x, s)), :(y2 .~ Normal.(b .* x, s)))
-    @test_throws "column length 3 ≠ the 4 rows of" bind_data(
+    @test_throws "column length 4 ≠ the 3 rows of y2" bind_data(
         lower_rkppl(shared, (:y1, :y2, :x); conditioned = (:y1, :y2, :x)), Dict{Symbol,AbstractVector}(
             :y1 => [0.1, 0.2, 0.3, 0.4], :y2 => [0.5, 0.6, 0.7],
             :x => [1.0, 2.0, 3.0, 4.0]))
@@ -453,7 +515,7 @@ end
             Expr(:for, :(s = eachindex(age_s)), Expr(:block,
                 :(eta[s] ~ Normal(0, 1))))))
     plan = lower_rkppl(ast, _PL_PK_DATA; conditioned = _PL_PK_DATA)
-    @test only(plan.plate_parameters).range === :age_s
+    @test only(plan.plate_parameters).range == :(eachindex(age_s))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     u = [0.1cos(i) for i in 1:built.layout.total]
@@ -475,7 +537,7 @@ end
         _pl_plate(:(eachindex(y)), :(theta[i] ~ Normal(0, tau)),
             :(y[i] ~ Normal(theta[i], s))))
     plan = lower_rkppl(ast, (:y,); conditioned = (:y,))
-    @test only(plan.plate_parameters).range === :y
+    @test only(plan.plate_parameters).range == :(eachindex(y))
     ok = bind_data(plan, Dict{Symbol,AbstractVector}(:y => [0.1, 0.4, -0.2]))
     @test assign_layout(ok).total == 2 + 3
 end

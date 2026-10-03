@@ -56,6 +56,19 @@ enters prepared hot-state tuples.
 struct _NoKernelSource end
 const _NO_KERNEL_SOURCE = _NoKernelSource()
 
+# A source-visible domain check. Backends retain this check at execution
+# time; its predicate is nondifferentiable, and the exception is static
+# diagnostic data rather than an active mathematical operand.
+@inline function _runtime_check(valid, error::Exception)
+    valid || throw(error)
+    nothing
+end
+
+struct _RuntimeCheckCallback{E}
+    error::E
+end
+(check::_RuntimeCheckCallback)(valid) = _runtime_check(valid, check.error)
+
 struct Recipe
     id::Int
     inputs::Tuple{Vararg{Value}}
@@ -70,7 +83,7 @@ Recipe(id, inputs, outputs, op, cost, cse_key, effectful) =
     Recipe(id, inputs, outputs, op, cost, cse_key, effectful, _NO_KERNEL_SOURCE)
 
 """
-    _KernelSourceOp{DefToken,Form,F,TF}
+    _KernelSourceOp{DefToken,Form,F,TF,IG}
 
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
 COMPILER-OWNED provenance (RK 07:21). Authoring wraps ONLY the anonymous-closure path of
@@ -85,17 +98,20 @@ distinguishes a `:portcall` — a call THROUGH A PORT, `callable(args…)`, whos
 source and the rest are ordered args — from a general `:fused` expression, so a prepared handle can
 self-derive the DESTINATION contract (a port-call with one owned buffer + one owned scalar output →
 `f(dest, args…)::scalar`) from source SHAPE + typed slot roles, never from a name/Recipe id/inspection.
+`IG` holds the captured source's throw-stripped twin, selected only by an
+explicit `on_error = :ignore` preparation; older internal fixtures use `nothing`.
 The call forwards INLINE. A RAW anonymous closure inserted into a Graph carries no wrapper and is
 rejected as opaque when captured into a prepared handle.
 """
-struct _KernelSourceOp{DefToken,Form,F,TF}
+struct _KernelSourceOp{DefToken,Form,F,TF,IG}
     f::F
     tensor_f::TF
+    ignored_throws::IG
 end
 
-_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF) where
-        {DefToken,Form,F,TF} =
-    _KernelSourceOp{DefToken,Form,F,TF}(f, tensor_f)
+_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF,
+                ignored_throws::IG = nothing) where {DefToken,Form,F,TF,IG} =
+    _KernelSourceOp{DefToken,Form,F,TF,IG}(f, tensor_f, ignored_throws)
 # Preserve the established internal constructor for compiler fixtures and
 # already-authored handles; without an alternate body it uses the same callable
 # in both modes.
@@ -197,6 +213,9 @@ kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = F
     Base.Broadcast.broadcasted(bc.f,
         map(arg -> _tensorized_cat_operand(marker, arg), bc.args)...)
 @inline _tensorized_getindex(array, indices...) = getindex(array, indices...)
+# Typed conversion at the compiler boundary keeps Base.trunc semantics in
+# native execution. Tracing extensions can preserve already-integer values.
+@inline _tensorized_trunc(::Type{T}, x) where {T<:Integer} = trunc(T, x)
 @inline function _tensorized_setindex(array, value, indices...)
     setindex!(array, value, indices...)
     array
@@ -207,15 +226,25 @@ end
 @inline _tensorized_cat_arg_marker(::Val{:tensorized}, arg, rest) = arg
 @inline _tensorized_cat_arg_marker(::Val{:native}, arg, rest) =
     _tensorized_cat_marker(rest)
-@inline function _tensorized_cat_operands(args::Tuple)
+@inline function _tensorized_cat_operands(args::Tuple,
+        operand = _tensorized_cat_operand)
     marker = _tensorized_cat_marker(args)
     marker === nothing ? args :
-        map(arg -> _tensorized_cat_operand(marker, arg), args)
+        map(arg -> operand(marker, arg), args)
 end
-@inline _tensorized_vcat(args...) = vcat(_tensorized_cat_operands(args)...)
-@inline _tensorized_hcat(args...) = hcat(_tensorized_cat_operands(args)...)
+# Concatenation treats a scalar as one entry; broadcast must keep it a scalar.
+# Give concatenation its own operand hook, with the structural argument rank,
+# so a tracing extension can lift scalars and pad missing unit dimensions.
+@inline _tensorized_concat_operand(marker, arg, rank) =
+    _tensorized_cat_operand(marker, arg)
+@inline _tensorized_concat_operands(args::Tuple) =
+    _tensorized_cat_operands(args,
+        (marker, arg) -> _tensorized_concat_operand(
+            marker, arg, Val(maximum(ndims, args))))
+@inline _tensorized_vcat(args...) = vcat(_tensorized_concat_operands(args)...)
+@inline _tensorized_hcat(args...) = hcat(_tensorized_concat_operands(args)...)
 @inline _tensorized_cat(args...; dims) =
-    cat(_tensorized_cat_operands(args)...; dims = dims)
+    cat(_tensorized_concat_operands(args)...; dims = dims)
 # A scalar-vector literal (`[a, b, c]`) in a tensorized body.  The default
 # is the plain `Base.vect` construction; a tracing extension builds a real
 # traced vector when any element is traced (a host container of traced
@@ -766,6 +795,28 @@ end
 @inline _tensorized_plate_fallback_arg(arg::_TensorizedPlateBatch) = arg.values
 @inline _tensorized_plate_materialize(value) = value
 @inline _tensorized_plate_materialize(value::_TensorizedPlateBatch) = value.values
+# Keep array-valued lanes identifiable until their consumer decides how to
+# arrange them. A bare lanes-leading tensor is not a collection of arrays:
+# `stack` would flatten its scalar entries and silently lose the lane layout.
+@inline _tensorized_plate_pointwise(value) = _tensorized_plate_materialize(value)
+@inline _tensorized_plate_pointwise(value::_TensorizedPlateBatch{<:AbstractArray}) =
+    ndims(value.values) > 1 ? value : value.values
+@inline _tensorized_plate_pointwise(
+    value::_TensorizedPlateBatch{<:Tuple,<:AbstractArray}) = value
+
+# The marker is owned by RK, so ordinary helpers can use Base.stack without a
+# backend-specific helper method. Only the fixed tensor rank determines this
+# permutation; no recipe or indexing operation is replicated per lane.
+Base.stack(value::_TensorizedPlateBatch; dims = :) =
+    _tensorized_plate_stack(_tensorized_plate_materialize(value), dims)
+@inline _tensorized_plate_stack(value::AbstractArray, ::Colon) =
+    _tensorized_plate_stack(value, ndims(value))
+@inline function _tensorized_plate_stack(value::AbstractArray, dim::Integer)
+    rank = ndims(value)
+    1 <= dim <= rank || throw(ArgumentError("stack dimension must be in 1:$rank"))
+    permutation = ntuple(i -> i == dim ? 1 : i < dim ? i + 1 : i, rank)
+    permutedims(value, permutation)
+end
 # The authored `sum(pointwise)` consumer of a plate.  Native semantics are
 # exactly `sum` over the materialized pointwise vector; a backend that keeps
 # the plate as per-lane values may reduce those lanes directly instead of
@@ -791,10 +842,78 @@ end
 # It reduces to plain `broadcast` for a non-`Bool` all-host recipe, so values and
 # shapes are unchanged.
 @inline function _tensorized_plate_call(operation, args...)
+    _tensorized_plate_dispatch(operation, args)
+end
+
+@inline function _tensorized_plate_dispatch(operation, args::Tuple)
+    _tensorized_plate_default_call(operation, args)
+end
+
+@inline function _tensorized_plate_default_call(operation, args::Tuple)
     marker = _tensorized_plate_marker(args)
     marker === nothing ?
         _tensorized_broadcast(operation, args...) :
         _tensorized_plate_call(marker, operation, args)
+end
+
+# Branch metadata identifies the exact condition ports. A scalar or atomic
+# operand has no lane axis, so a condition reading only those operands is one
+# lazy decision around the whole batch. Keep lane-dependent conditions in the
+# cell. In particular, a singleton lane array is still a lane operand.
+@inline _plate_branch_shared(arg) = false
+@inline _plate_branch_shared(arg::Number) = true
+@inline _plate_branch_shared(arg::Base.RefValue) = true
+@inline _plate_branch_value(arg) = arg
+@inline _plate_branch_value(arg::Base.RefValue) = arg[]
+@inline _plate_branch_operands(predicate, args::Tuple) = args
+@inline _plate_branch_empty(arg) = false
+@inline _plate_branch_empty(arg::AbstractArray) = isempty(arg)
+@inline _plate_branch_empty(arg::_TensorizedEachcol) = size(arg.parent, 2) == 0
+@inline _plate_branch_empty(arg::_TensorizedPlateBatch) =
+    _plate_branch_empty(arg.values)
+@inline _plate_branch_empty(args::Tuple) = any(_plate_branch_empty, args)
+
+@inline @generated function _plate_branch_arguments(args::Tuple, ::Val{I}) where {I}
+    Expr(:tuple, [:(getfield(args, $index)) for index in I]...)
+end
+
+struct _PlateBranchArm{I,O}
+    operation::O
+end
+
+@inline @generated function (arm::_PlateBranchArm{I})(args::Vararg{Any,N}) where {I,N}
+    operation = :(getfield(arm, :operation))
+    inputs = Any[:(getfield(args, $index)) for index in I]
+    # An arm may ignore every lane operand (a constant fallback, for example).
+    # Preserve the original broadcast domain and marker with ignored anchors;
+    # selecting an arm must not shrink its axes or turn it into a host loop.
+    for index in 1:N
+        index in I && continue
+        operation = :(_LaneAnchored($operation))
+        pushfirst!(inputs, :(getfield(args, $index)))
+    end
+    :(_tensorized_plate_call($operation, $(inputs...)))
+end
+
+@inline function _tensorized_plate_dispatch(
+        operation::_KernelSourceOp{D,F,N,T}, args::Tuple) where
+        {D,F,N<:_KernelBranch,T<:_KernelBranch}
+    branch = operation.tensor_f
+    CI, TI, EI = typeof(branch).parameters[1:3]
+    condition_args = _plate_branch_arguments(args, Val(CI))
+    # Empty domains run no cells and must not evaluate a new shared condition.
+    # Their existing batch lowering also owns shape/type validation.
+    if !all(_plate_branch_shared, condition_args) || _plate_branch_empty(args)
+        return _tensorized_plate_default_call(operation, args)
+    end
+    predicate = branch.condition(map(_plate_branch_value, condition_args)...)
+    args = _plate_branch_operands(predicate, args)
+    yes = _KernelSourceOp(Val(D), Val(F), operation.f.then_arm,
+        branch.then_arm, operation.ignored_throws)
+    no = _KernelSourceOp(Val(D), Val(F), operation.f.else_arm,
+        branch.else_arm, operation.ignored_throws)
+    _recurrence_branch(predicate, _PlateBranchArm{TI,typeof(yes)}(yes),
+        _PlateBranchArm{EI,typeof(no)}(no), args)
 end
 
 @inline function _tensorized_plate_call(

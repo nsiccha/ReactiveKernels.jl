@@ -4,6 +4,17 @@ These constraints apply to every ReactiveKernels lowering, extension, and
 example package. They also apply when data is bound during preparation.
 Backend limitations must be reported explicitly; they do not relax these rules.
 
+## Place implementations in their owning layer
+
+Totally general numerical and compiler machinery belongs in ReactiveKernels
+proper. General PPL authoring, binding and lowering belongs in ReactiveKernelsPPL.
+Reusable statistical model construction and backend emission belongs in BRM;
+its statistical implementations serve both backends. PK-specific models and
+helpers belong only in downstream RKPPLBench. StanBlocks owns transpilation to
+Stan. Existing implementations in the wrong layer must migrate; historical
+placement and sharing a repository are not exceptions. Temporary compatibility
+must have a concrete migration task and a consumer-adoption condition.
+
 ## Preserve data-dependent iteration
 
 **Do not statically unroll a loop whose trip count derives from data.** This
@@ -67,10 +78,11 @@ or both over array or scalar ports, into an RK-owned callable. The Enzyme and
 ChainRules adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
 `ext/ReactiveKernelsChainRulesCoreExt.jl`)
 derive every direction from the activity-selected cuts of that graph. The rules in package source are
-DistributionKernels' `loggamma`, `logbeta`, `rk_symmetric_eigvals` and
-`rk_symmetric_eigvecs` (the eigen pair re-exported by ReactiveKernelsPPL), plus
-ReactiveKernelsPPL's `rk_expm` and its transit two-compartment response rule
-(`prepare_transit_twocmt_rule`); the ODE backsolve
+ReactiveKernels' `rk_expm`, `rk_symmetric_eigvals` and `rk_symmetric_eigvecs`,
+plus DistributionKernels' `loggamma` and `logbeta`. The generic matrix rules
+are also imported by existing PPL/distribution consumers. The PK-specific
+transit two-compartment response rule (`prepare_transit_twocmt_rule`) remains
+in the existing PPL source pending its downstream migration; the ODE backsolve
 adjoint consumes a caller's `DerivativeRule` right-hand side. Reverse-mode adapters
 stage each rule in two cuts whose residuals come from cross-stage liveness, so
 a shared intermediate is retained rather than recomputed. Rule cuts already
@@ -102,6 +114,27 @@ including inactive branches and empty or ragged cases where supported. A small
 Julia statement count alone does not establish this: tracing can still expand
 a host loop.
 
+Compare retained control-flow regions, nonlinear work and indexing across all
+tested data sizes, and keep complete optimized operation inventories as
+diagnostics. Shape specialization may share constants, simplify scalar
+arithmetic or simplify singleton derivative tapes, including an identity
+broadcast of one scalar tape index, so small shapes need not
+have identical raw inventories. Complete inventories must stop growing as
+data lengths increase; these bounded simplifications must preserve one
+authored loop and branch body at every size.
+
+For compiled acceptance inspect both optimized MLIR and the HLO of the actual
+default executable. XLA may remove singleton loops, turn pure lazy branches
+into eager selections, or move invariant work out of a zero-trip body after
+MLIR checks pass. Verify retained executable regions and inactive arithmetic
+as well as operation-growth diagnostics.
+
+Default XLA vector reductions can add reduction stages as array lengths grow
+even when optimized MLIR retains one vector-reduction expression. This separate
+complete-inventory growth limit is isolated by
+`benchmark/repro_reactant_vector_reduction_growth.jl`; retaining scalar loops
+and lazy branches alone does not satisfy it.
+
 These are required constraints, not a claim that every existing path already
 conforms. Every functional stateful method with authored control flow lowers
 through the retained control program, and host-drained observational records
@@ -116,7 +149,8 @@ Their fixed-size matrix and named carry intermediates batch as typed leaves,
 with their authored wrappers restored inside each cell. Their full Reactant
 path still fails in the ordinary StaticArrays matrix exponential: its branch
 condition is a traced Boolean. This is a dependency capability boundary,
-isolated by `benchmark/repro_reactant_static_matrix_exp.jl`.
+isolated by `benchmark/repro_reactant_static_matrix_exp.jl` and tracked in
+[issue #34](https://github.com/nsiccha/ReactiveKernels.jl/issues/34).
 Eager branches, parameter-dependent host propagation, and data-derived
 unrolling are not acceptable fixes. See the [scan limitations](scan.md).
 
@@ -152,7 +186,14 @@ and lock the one Reactant 0.2.289 lifted:
   unrolled per lane, succeeded). The boundary concerned only branches whose
   condition reads a live value: a condition on bound data is split away
   during preparation and never reaches the backend.
-  Default optimized reverse still expands small lazy batches into one branch
+  A plate branch whose condition reads only shared scalar or `Ref` operands
+  now lowers to one lazy decision around the batch, using its authored branch
+  dependency metadata. Its selected arm retains the original lane domain,
+  including constant fallbacks and otherwise unused lane inputs. Ordinary
+  optimized primal and reverse have matching complete operation inventories
+  at three, seven and eleven lanes; no inactive arithmetic is evaluated.
+  Lane-dependent conditions still reach the backend's small-batch boundary.
+  Default optimized reverse expands those small lazy batches into one branch
   region per lane instead of retaining the batch loop:
   `repro_reactant_lazy_batch_growth.jl` has correct values and gradients at
   two and five lanes, but different operation inventories. The fixed-structure
@@ -161,8 +202,12 @@ and lock the one Reactant 0.2.289 lifted:
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:
-  `repro_reactant_adaptive_while_reverse.jl`. The solver keeps the retained
-  loop; its supported gradient is the backsolve adjoint, whose right-hand
+  `repro_reactant_adaptive_while_reverse.jl`. Generic matrix binary power
+  shape has the same default reverse failure on Reactant 0.2.290:
+  `repro_reactant_matrix_power_reverse.jl` checks its native and compiled primal,
+  retained integer loop and lazy branch, and native ordinary Enzyme gradient.
+  Compiled reverse remains unsupported for that shape. The solver keeps the
+  retained loop; its supported gradient is the backsolve adjoint, whose right-hand
   side is a `DerivativeRule` (the rule constraint above): the augmented
   system's vector-Jacobian products are the rule's authored reverse cut,
   evaluated inside the retained loop, so nothing differentiates anything.
@@ -174,6 +219,22 @@ and lock the one Reactant 0.2.289 lifted:
   and AD parity. The invalid host-constant indexing shape remains unsupported;
   its named acceptance case is excluded from compiled parity, with the exact
   `BoundsError` pinned. No index clamping or dummy buffer is introduced.
+- Reverse compilation through a guarded diagonal reduction can fail with an
+  MLIR dominance error when its matrix also feeds shared response expressions:
+  `repro_reactant_shared_matrix_loop_reverse.jl` reproduces this on Reactant
+  0.2.290 with plain matrix products, weighted gathers and a retained diagonal
+  loop. PPL constructs the diagonal as one graph value, reuses those entries
+  in the factor, and reads that value in its guarded prior. The named
+  `LKJCholesky(size(M, 1), eta)` shared-response case now passes ordinary
+  compiled reverse at K = 2, 4, 8 and 16, including reused coordinates and
+  invalid inactive logarithms. Its emitted transform and prior retain loops;
+  default optimized primal and reverse have identical operation inventories
+  at K = 8 and 16 as observation and group counts grow. The backend still
+  expands small data-derived K = 2 and 4, so full fixed-structure acceptance
+  remains unmet. `repro_reactant_guarded_diagonal_growth.jl` isolates this
+  optimizer boundary with the backend alone. No flag change is acceptance.
+  A declared literal two-dimensional factor keeps its one scalar diagonal
+  prior equation.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around
@@ -184,6 +245,18 @@ and lock the one Reactant 0.2.289 lifted:
   rules generated from their pure-math graphs (the rule constraint above),
   which makes them primitives for Enzyme, so the failing body is never
   differentiated.
+- Native Enzyme 0.13.209 reverse differentiation of
+  `LogExpFunctions.logistic` returns `NaN` at `1000.0` and `1000.0f0`,
+  despite finite primal values. It also loses representable tail derivatives,
+  such as the Float64 derivative at `40.0`. This reproduces without
+  ReactiveKernels on Julia 1.10.12 with LogExpFunctions 0.3.29 and 1.0.1:
+  `repro_enzyme_logistic_reverse.jl`. The equivalent ordinary primal
+  `exp(-log1pexp(-x))` passes native reverse checks against a high-precision
+  oracle in both precisions, including `-1000`, `0`, `1000` and saturated
+  tails. This is native evidence; it does not establish compiled acceptance.
+  [Enzyme issue #3583](https://github.com/EnzymeAD/Enzyme.jl/issues/3583)
+  and [PR #3595](https://github.com/EnzymeAD/Enzyme.jl/pull/3595) track the
+  dependency boundary. No local rule is attached to the foreign function.
 - Native Enzyme reverse mode fails static activity analysis
   (`EnzymeRuntimeActivityError`) when a non-inlined function returns a
   `Float64` array read from constant data, bare or inside a tuple, named
@@ -199,6 +272,31 @@ and lock the one Reactant 0.2.289 lifted:
   differentiates it. A bound tuple or named tuple then crosses the
   differentiated call as one operand per array leaf. Helpers inside a
   parameter-dependent function remain the backend's limitation.
+- Native Enzyme 0.13.209 on Julia 1.10.12 also rejects an ordinary untyped
+  comprehension whose generator captures both an active array and a constant
+  floating-point array: `repro_enzyme_generator_const_array_capture.jl`
+  reproduces the failure with Enzyme only. Typed Julia IR constructs the mixed
+  closure and calls `Base.collect(::Generator)`; the rejected store is the
+  constant array pointer into that closure. This is distinct from returning
+  data through a non-inlined helper. Merely inlining the reader, replacing
+  `eachindex(idx)` with dynamic `1:length(idx)`, or using `map`/`zip` still
+  fails. Explicitly typed comprehensions, an explicit generator with a
+  call-site-inlined `collect`, and a fresh-buffer runtime loop pass ordinary
+  reverse for Float32 and Float64, including empty inputs. A typed
+  comprehension performs Julia's ordinary element conversion, so it is only
+  an equivalent control when that element type is intended. PPL's ordinary
+  and array-bearing prepared-input readers keep their authored primal and
+  remain native reverse capability gaps in `test_native_generator_capture.jl`.
+  No consumer function, activity configuration or derivative rule is replaced.
+  A six-line isolated Enzyme compiler prototype marks
+  `Base.collect(::Generator)` for inlining before activity analysis and makes
+  the byte-unchanged ordinary and prepared readers pass standard reverse,
+  with runtime activity disabled. That prototype is not in released Enzyme
+  and still needs broader compiler validation. The repair belongs in the
+  backend compiler; related
+  [Enzyme issue #2386](https://github.com/EnzymeAD/Enzyme.jl/issues/2386)
+  tracks comprehension activity analysis. This evidence and boundary note are
+  interim tracking, not completion of that capability.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later
@@ -231,6 +329,42 @@ and lock the one Reactant 0.2.289 lifted:
   but cannot compile with Reactant. Its acceptance test pins this exact
   `MethodError`; other failures remain errors. The ordinary formula stays
   intact, with no foreign-function derivative rule or tracing workaround.
+- Evidence normalizers that call `SpecialFunctions.gamma_inc` or `beta_inc`
+  have no traced scalar method in Reactant 0.2.290:
+  `repro_specialfunctions_evidence.jl` isolates both calls (and `besselix`)
+  without ReactiveKernels. This affects compiled Gamma/Beta, Poisson/Binomial,
+  negative-binomial and zero-inflated/hurdle evidence; their native values and
+  Enzyme gradients work. VonMises evidence reaches the Bessel limitation
+  above. The PPL acceptance pins each exact missing-function `MethodError`,
+  rather than refusing those families or accepting unrelated exceptions.
+- The default slice optimizer aborts reverse compilation of chained strided
+  gathers with a mismatched `stablehlo.add` shape:
+  `repro_reactant_partition_gather_reverse.jl` reproduces it with Reactant and
+  Enzyme only. Mixed clamp arms of LogNormal and Weibull evidence reach this
+  shape. Their compiled primal works, and compiled reverse matches native
+  gradients at 6, 12 and 24 rows with the explicit `optimize=:only_enzyme`
+  pipeline, which retains the trace and reverse pass. The lazy arms and
+  observation loops stay intact; this is an optimizer limitation.
+- A retained `@trace` loop updates its input tracer handles even when the
+  authored inputs are read-only. If a lazy thunk captures those handles, they
+  can escape into a child region and tracing fails with an operand-dominance
+  error: `repro_reactant_captured_loop_branch.jl borrowed` isolates the failure
+  with Reactant and Enzyme only. The `copied` mode passes primal and reverse
+  with the same lazy branch and retained loop. Owned evidence-tail helpers
+  enter with fresh handles through `_loop_capture_traced`; native values pass
+  through unchanged, and no branch or iteration is expanded or predicated.
+- Mixed beta-binomial clamp arms support native values and reverse, compiled
+  primal, and compiled reverse with RK's explicit `optimize=:no_slice_slice`
+  pipeline. That pipeline removes the faulty slice-combination pass and
+  count-loop unrolling, preserving retained data-derived loops. Default
+  compiled reverse reaches the chained-slice abort above; `only_enzyme`
+  instead fails with `WhileOp does not have induction
+  variable for cache removal`. `repro_reactant_batched_count_reverse.jl`
+  isolates a retained count loop in a batched cell with Reactant and Enzyme
+  only; its `only_enzyme` reverse segfaults in `LoopCheckpointing`. The clamp
+  reverse acceptance selects the verified pipeline explicitly. Beta-binomial
+  truncation and interval evidence retain their loops and pass compiled
+  reverse and fixed-operation-count acceptance at 6, 12 and 24 observations.
 - Linear indexing of an adjoint vector (`b = (z * sd)'`, then `b[g]`)
   fails during Reactant 0.2.290 tracing: the adjoint converts the integer
   positions to two-dimensional Cartesian indices, which the backend applies
@@ -251,11 +385,35 @@ and lock the one Reactant 0.2.289 lifted:
   Declared second-axis gathers, elementwise array definitions and level
   subsets pass compiled primal, AD and operation-count checks.
 
-- Reverse compilation with a zero-length active vector leaves `tensor.empty`,
+- A one-dimensional traced view indexed by `CartesianIndex{1}` fails in
+  Reactant 0.2.290 because `Base.reindex` expects an index tuple:
+  `repro_reactant_simplex_view.jl`. RKPPL's simplex transform now uses
+  ordinary range indexing to materialize its packed-coordinate and
+  Jacobian slices before fused broadcasts. Its stick-breaking arithmetic
+  is unchanged; hierarchical Dirichlet and monotonic values pass compiled
+  primal, reverse and operation-count acceptance.
+- Ordinary vector cutpoints also materialize the packed range before the
+  cumulative-order validity reduction, avoiding the same traced-view
+  reindexing boundary. Their element priors and identity transform are
+  unchanged; invalid order takes a lazy `-Inf` branch.
+- Reverse compilation with an empty active array leaves `tensor.empty`,
   which Reactant 0.2.290 cannot export to XLA:
   `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its
-  ordinary Enzyme gradient without ReactiveKernels. Native reverse returns
-  the correct empty gradient, and compiled primal succeeds. A zero-coordinate
+  ordinary Enzyme gradient, plus an empty multivariate batch beside a nonempty
+  factor, without ReactiveKernels. Native reverse returns the correct empty/zero
+  gradients, and compiled primal succeeds. Empty multivariate slice batches
+  return zero natively and in compiled primal execution. A zero-coordinate
   RK-PPL sampler therefore supports native AD and compiled values; compiled
   gradient acceptance pins this exact export error. Empty observation and
   parameter domains with a nonempty coordinate pack pass compiled reverse.
+  No dummy batch or handwritten derivative substitutes for the empty case.
+- An opaque Julia function's ordinary `hcat` of a live scalar and a constant one-entry vector fails
+  during Reactant 0.2.290 primal tracing with `Scalar indexing is disallowed`
+  in `Base.typed_hcat`: `repro_reactant_scalar_hcat.jl` isolates it without
+  ReactiveKernels. Native values and ordinary Enzyme reverse match independent
+  algebra; an equivalent scalar-formula control compiles primal and reverse.
+  Compiler-visible calls resolve to RK's ordinary concatenation lowering,
+  including imported, qualified, aliased and `GlobalRef` bindings. RKPPL's
+  one-row `sampled_scalar` matrix case keeps its authored column and passes
+  default compiled values and reverse. The opaque function remains the backend
+  boundary; no scalar-indexing override or derivative rule replaces its body.

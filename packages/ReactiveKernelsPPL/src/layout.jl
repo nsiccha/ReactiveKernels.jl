@@ -437,7 +437,7 @@ function assign_layout(plan::StructuralPlan)
             offset += packed
             continue
         end
-        transform = p.family === :ordered_normal ? :ordered :
+        transform = _is_ordered_parameter(p.family) ? :ordered :
             p.family === :simplex_dirichlet ? :simplex :
             p.family === :positive_exponential ? :exp : :identity
         # `size` is the PACKED (unconstrained) length: a simplex packs
@@ -1269,7 +1269,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
                     for b in e.scan_blocks]...)))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
-        elseif e.kind === :array && e.transform === :lkj_stack
+        elseif e.kind === :array && _is_lkj_stack(e.transform)
             push!(pairs, e.name => _lkj_stack_constrain(e, seg))
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
@@ -1281,8 +1281,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             # Both LKJ-factor kinds share the host hyperspherical edges
             # (name/size-keyed — kind-agnostic); only `:varying_corr`
             # grows the derived `b_` draws below.
-            push!(pairs, e.name =>
-                lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size)))
+            L = lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size))
+            push!(pairs, e.name => (_is_upper_lkj(e.transform) ? permutedims(L) : L))
         else
             v = _constrain_elt(e, Float64(only(seg)))
             push!(pairs, e.name => v)
@@ -1433,7 +1433,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             size(v) == Tuple(e.dims) || throw(ContractValidationError(
                 "[layout] array parameter $(e.name) has size $(size(v)), " *
                 "want $(Tuple(e.dims))"))
-            if e.transform === :lkj_stack
+            if _is_lkj_stack(e.transform)
                 u[e.offset:(e.offset + e.size - 1)] .=
                     _lkj_stack_unconstrain(e, v)
                 continue
@@ -1466,7 +1466,8 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                       "must be a K×K matrix, got $(typeof(v))"),
             )
             u[e.offset:(e.offset + e.size - 1)] .=
-                lkj_chol_unconstrain(v, _lkj_dim(e.size))
+                lkj_chol_unconstrain(_is_upper_lkj(e.transform) ?
+                    permutedims(v) : v, _lkj_dim(e.size))
         else
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing parameter $(e.name)"),
@@ -1506,7 +1507,7 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             total += _vector_logjac(e, seg)
             continue
         end
-        if e.kind === :array && e.transform === :lkj_stack
+        if e.kind === :array && _is_lkj_stack(e.transform)
             # Level by level, the vine's coupled thetas.
             total += _lkj_stack_logjac(e, seg)
             continue
@@ -1821,7 +1822,9 @@ _vector_lr(e::LayoutEntry) = Symbol(:_ppl_vlr_, e.name)
 # Consumers gather from the vector (`Ref(v)` plate inputs, `v[idx]`).
 # Every leading/pivot slice is materialized: a
 # `vcat` mixing a `SubArray` and a `Vector` lowers through a Union-typed
-# path the native Enzyme reverse pass rejects. Size specializations
+# path the native Enzyme reverse pass rejects. Simplex slices use ordinary
+# range indexing to materialize an array before fused broadcasts; their
+# packed coordinates already have Float64 elements. Size specializations
 # (empty packs emit nothing — their consumers never read them; a one-element
 # ordered vector is its coordinate; a 1-simplex is the constant `[1.0]`)
 # are finite shape cases, never per-level expansion.
@@ -1840,8 +1843,10 @@ function _vector_transform_statements(e::LayoutEntry)
     end
     if e.transform === :identity
         e.size == 0 && return Expr[]
+        # Materialize the ordinary range slice. A traced SubArray cannot
+        # be reindexed by the cumulative-cutpoint validity reduction.
         return Expr[:($(e.name)::AbstractVector{Float64} =
-            view(unconstrained, $lo:$hi))]
+            unconstrained[$lo:$hi])]
     end
     if e.transform === :ordered
         e.size == 0 && return Expr[]
@@ -1993,7 +1998,7 @@ function jacobian_term(e::LayoutEntry)
         # reading the `_vector_transform_statements` temps (the host
         # `simplex_logjac`).
         e.size < 1 && return nothing
-        return :(sum(view($(_vector_lr(e)), 1:$(e.size)) .+
+        return :(sum($(_vector_lr(e))[1:$(e.size)] .+
             log.($(_vector_z(e))) .+ $(_vector_l(e))))
     end
     if e.kind === :plate || e.kind === :spline ||

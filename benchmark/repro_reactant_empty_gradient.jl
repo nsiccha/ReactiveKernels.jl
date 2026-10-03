@@ -23,3 +23,26 @@ else
     @test occursin("'tensor.empty' op unsupported op for export to XLA", sprint(showerror, err))
     println("PINNED_BACKEND_LIMITATION ", sprint(showerror, err))
 end
+
+# The same export boundary occurs with an empty multivariate slice batch
+# beside a nonempty live factor; both gradients come from ordinary reverse.
+
+function empty_batch(X, F)
+    if size(X, 1) == 0
+        0.0
+    else
+        sum(abs2, X) + sum(abs2, F)
+    end
+end
+
+empty_batch_gradient(X, F) = Enzyme.gradient(Enzyme.Reverse, empty_batch, X, F)
+
+X, F = zeros(0, 2), ones(2, 2)
+rx, rf = Reactant.to_rarray(X), Reactant.to_rarray(F)
+compiled = Reactant.@compile empty_batch(rx, rf)
+@test Float64(compiled(rx, rf)) == 0.0
+native = empty_batch_gradient(X, F)
+@test native[1] == X
+@test native[2] == zeros(2, 2)
+println(Reactant.@code_hlo optimize = :only_enzyme empty_batch_gradient(rx, rf))
+@test_throws r"'tensor.empty' op unsupported op for export to XLA" Reactant.@compile empty_batch_gradient(rx, rf)

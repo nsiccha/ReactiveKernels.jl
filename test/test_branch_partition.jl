@@ -240,8 +240,14 @@ end
                       for (yf, lpi, mp) in zip(y_full, lp, mis_pos)]
     end
 
-    @testset "a non-Base global is rejected loudly" begin
-        ex = :(@kernel reject_endpoint_arm(y::Vector{Float64},
+    @testset "defining-module globals remain callable in a lazy arm" begin
+        raw = prepare(C.bare_helper_branch; have=(:x,:flag), want=:total,
+            bound=(flag=mis_pos,))
+        @test raw(y_full) ≈ sum(mp == 0 ? 2yf : 0.0 for (yf,mp) in zip(y_full,mis_pos))
+        rawad = prepare_ad(raw, AutoEnzyme(; mode=Enzyme.Reverse), y_full; active=:x)
+        _, rawgrad = RK.ad_value_and_gradient!(rawad, similar(y_full), y_full)
+        @test rawgrad ≈ [mp == 0 ? 2.0 : 0.0 for mp in mis_pos]
+        ex = :(@kernel module_endpoint_arm(y::Vector{Float64},
                                            m::Vector{Float64},
                                            g::Vector{Int}) = begin
             pointwise = plate(y, m, g) do yf, mf, gf
@@ -251,14 +257,38 @@ end
             end
             total::Float64 = sum(pointwise)
         end)
-        err = try
-            macroexpand(C, ex)
-            nothing
-        catch e
-            e
-        end
-        @test err isa ArgumentError
-        @test occursin("cannot be evaluated under a branch arm", sprint(showerror, err))
-        @test occursin("hoist the endpoint call above the branch", sprint(showerror, err))
+        Core.eval(C, ex)
+        spec = getproperty(C, :module_endpoint_arm)
+        kernel = prepare(spec; have=(:y, :m, :g), want=:total)
+        expected = sum(mp == 0 ? 2(yf-lpi)/1.5 - 0.5log(2pi) - log(1.5) : 0.0
+            for (yf, lpi, mp) in zip(y_full, lp, mis_pos))
+        @test Base.invokelatest(kernel, y_full, lp, mis_pos) ≈ expected
+        # An inactive negative scale still remains inactive through the
+        # original defining-module helper, including native reverse mode.
+        bound = prepare(spec; have=(:y, :m, :g), want=:total,
+            bound=(y=y_full, g=mis_pos))
+        pb = prepare_ad(bound, AutoEnzyme(; mode=Enzyme.Reverse), lp; active=:m)
+        value, grad = Base.invokelatest(RK.ad_value_and_gradient!, pb, similar(lp), lp)
+        @test value ≈ expected
+        @test grad ≈ [(mp == 0 ? -2/1.5 : 0.0)
+            for (yf,lpi,mp) in zip(y_full,lp,mis_pos)]
+    end
+
+    @testset "endpoint helpers keep their defining module" begin
+        k = prepare(EndpointBranchCaller.scoped_endpoint_arm;
+            have = (:y, :m, :g), want = :total)
+        oracle = sum(g == 0 ? 2 * (y - m) / 1.5 -
+            0.5 * log(2π) - log(1.5) : 0.0
+            for (y, m, g) in zip(y_full, lp, mis_pos))
+        @test k(y_full, lp, mis_pos) ≈ oracle
+        bound = prepare(EndpointBranchCaller.scoped_endpoint_arm;
+            have = (:y, :m, :g), want = :total,
+            bound = (; y = y_full, g = mis_pos))
+        @test bound(lp) ≈ oracle
+        ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), lp;
+            active = :m)
+        val, grad = ReactiveKernels.ad_value_and_gradient!(ad, similar(lp), lp)
+        @test val ≈ oracle
+        @test grad ≈ [-2 / 1.5, 0, -2 / 1.5, 0]
     end
 end

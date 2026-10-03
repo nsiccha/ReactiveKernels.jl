@@ -280,18 +280,18 @@ end
         y .~ OrderedLogistic.(b .* x, c)
     end))
     # refused: remaining entries violate broadcast argument shape, strict declarations or constructor arity (P3/P6, 05oe96l)
-    @test occursin("must be an ordered vector declared", refused(quote
+    @test occursin("must be a one-axis vector declared", refused(quote
         b ~ Normal(0, 1)
         y .~ OrderedLogistic.(b .* x, Ref(c))
     end))
     # capability: cutpoints with an ordinary vector prior; unordered points have -Inf density (10gzbm9 support-links; todo `1qlbn5b`).
-    @test_broken (_oe_lower(quote
+    @test (_oe_lower(quote
         b ~ Normal(0, 1)
         c[1:2] .~ Normal.(0, 1)
         y .~ OrderedLogistic.(b .* x, Ref(c))
     end, data); true)
     # capability: an ordered prior is also a valid prior on stopping-ratio thresholds (P3/P8; todo `1qlbn5b`)
-    @test_broken (_oe_lower(quote
+    @test (_oe_lower(quote
         b ~ Normal(0, 1)
         c ~ Ordered(Normal(0, 1), 2)
         y .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(c))
@@ -310,18 +310,19 @@ end
     end, data)
     @test length(shared.vector_parameters) == 1
     @test all(r -> r.thresholds === :c, shared.responses)
-    # The data-sized length names the response the cutpoints serve.
+    # Extents are expressions over actual bound data; independent numerical
+    # and invalid-support controls are in test_prior_observation_audit.jl.
     for n in (:(length(levels(x)) - 1), :(length(levels(y)) - 2),
             :(length(unique(y)) - 1))
         # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)
-        @test_broken (_oe_lower(quote
+        @test (_oe_lower(quote
             b ~ Normal(0, 1)
             c ~ Ordered(Normal(0, 1), $n)
             y .~ OrderedLogistic.(b .* x, Ref(c))
         end, data); true)
     end
     # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)
-    @test_broken (_oe_lower(quote
+    @test (_oe_lower(quote
         a ~ Normal(0, 1)
         c ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
         mu = a .+ c[1] .* x
@@ -329,7 +330,7 @@ end
     end, data); true)
     # Nothing reads or consumes it: unused, like an unused simplex.
     # capability: an unused declared parameter is a prior-only draw (10gzbm9 degenerate) (todo `1qlbn5b`)
-    @test_broken (_oe_lower(quote
+    @test (_oe_lower(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         k ~ Ordered(Normal(0, 1), 2)
@@ -349,11 +350,11 @@ end
             @test occursin("element prior", refused(program))
         else
             # capability: non-Normal and sampled-argument ordered priors (P8 1cmodra; todo `0fkd9yk`).
-            @test_broken (_oe_lower(program, data); true)
+            @test (_oe_lower(program, data); true)
         end
     end
     # capability: ordinary cutpoint/vector priors, sizes and reuse (P8 1cmodra; 10gzbm9 shared-slots/level-coverage; todo `1qlbn5b`)
-    @test_broken (_oe_lower(quote
+    @test (_oe_lower(quote
         b ~ Normal(0, 1)
         t[1:2] .~ Cauchy.(0, 1)
         y .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(t))

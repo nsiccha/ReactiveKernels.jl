@@ -391,11 +391,11 @@ end
     supported = Set(["frequency weights rejected", "evidence rejected",
         "partial range rejected", "fully fixed", "assignment location",
         "data-column location", "split Binomial trials", "stated scalar loc alias",
-        "uniform default weights"])
-    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "boolean weights", "wrapped param", "bare predictor"])
+        "uniform default weights", "wrapped param"])
+    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "boolean weights", "bare predictor"])
     for (label, prog, E) in cases
         @testset "$label" begin
-            if label in supported
+            if label in supported || label in ("heterogeneous links, same base", "probit outside v1", "bare predictor")
                 # Density and gradient oracles: test_response_combinations.jl.
                 @test lower_rkppl(prog, (:y, :x, :n1, :n2, :wt);
                     conditioned = (:y, :x, :n1, :n2, :wt)) isa StructuralPlan
@@ -448,8 +448,8 @@ end
         @test_throws ContractValidationError validate_structure(_mixplan(bad))
         # The response link is the components' canonical link.
         bad = _mixresp(link = LogLink)
-        # refused: mixture response link must be the components' canonical link (IR contract)
-        @test_throws ContractValidationError validate_structure(_mixplan(bad))
+        # The link belongs to this component use.
+        @test validate_structure(_mixplan(bad)) === nothing
         # Binomial mixtures require trials (surface always emits them, so
         # this is programmatic-only).
         bloc = Union{Symbol,Real}[:mu, :mu2]

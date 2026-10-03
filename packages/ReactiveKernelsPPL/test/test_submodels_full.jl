@@ -5,10 +5,10 @@ using Test
 
 # Full submodels: nested calls, indexed / sized priors, `@plate` / `@scan` /
 # construct statements and data / vector arguments inside bodies. Expansion
-# is transparent: every submodel program here lowers to a plan whose
-# canonical serialization (`_canon`, test_corpus.jl) is byte-identical to its
-# hand-inlined twin, written out with the documented namespacing rule
-# (`RKPPLSubmodel`). Helpers from earlier includes: `_canon`
+# is transparent: submodels and their hand-inlined twins retain the same
+# authored math. Matching plan forms compare canonical serialization
+# (`_canon`, test_corpus.jl); retained per-cell values compare densities and
+# gradients. Helpers from earlier includes: `_canon`
 # (test_corpus.jl), `_plans_equal` (test_surface.jl), `_gen_columns`,
 # `_query`, `_check_gradient` (test_generator.jl). Toy data only.
 
@@ -465,17 +465,35 @@ end
     end, D)
     @test !startswith(s6, "SurfaceLoweringError")
 
-    # Per-cell: the nested call keeps its namespace and equals the
-    # hand-written math using that distinct local path.
+    # Per-cell: the nested call keeps its namespace and has the same
+    # density as the hand-written math, including its native gradient.
     pc(cells...) = Expr(:block,
         :(mu ~ Normal(0, 5)), :(sigma ~ Exponential(1)), :(tau ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, cells..., :(y[i] ~ Normal.(theta[i], sigma))))))
-    @test _smf_canon(lower_rkppl(pc(:(theta[i] ~ smf_pcs_outer(mu, tau))),
-            (:y, :x); mod = _SMF, conditioned = (:y, :x))) ==
-        _smf_canon(lower_rkppl(pc(:(theta_w_z[i] ~ Normal(0, 1)),
-            :(theta[i] = mu .+ tau .* theta_w_z[i])), (:y, :x); mod = _SMF, conditioned = (:y, :x)))
+    cols = Dict(:y => [-0.1, 0.8, 0.2], :x => [0.3, 0.5, -0.2])
+    z = [-0.2, 0.4, 0.1]
+    for (ast, values, latent) in (
+        (pc(:(theta[i] ~ smf_pcs_outer(mu, tau))),
+            (; mu = 0.1, sigma = 0.8, tau = 0.6, theta = (; w = (; z))),
+            q -> q.theta.w.z),
+        (pc(:(theta_w_z[i] ~ Normal(0, 1)), :(theta[i] = mu .+ tau .* theta_w_z[i])),
+            (; mu = 0.1, sigma = 0.8, tau = 0.6, theta_w_z = z),
+            q -> q.theta_w_z))
+        bound = bind_data(lower_rkppl(ast, cols; mod = _SMF, conditioned = keys(cols)), cols)
+        built = build_kernel(bound)
+        u = unconstrain(built.layout, values)
+        oracle = v -> begin
+            q = constrain(built.layout, v)
+            zz = latent(q)
+            logpdf(Normal(0, 5), q.mu) + logpdf(Exponential(), q.sigma) +
+                log(q.sigma) + logpdf(Exponential(), q.tau) + log(q.tau) +
+                sum(logpdf.(Normal(), zz)) +
+                sum(logpdf.(Normal.(q.mu .+ q.tau .* zz, q.sigma), cols[:y]))
+        end
+        _check_model_math(built, bound, u, oracle)
+    end
 end
 
 @testset "full submodels: hierarchical density vs Distributions.jl" begin
@@ -567,7 +585,7 @@ end
         y .~ Normal.(v, 1.0)
     end, D; mod = _SMF, conditioned = D))
     # capability: a submodel may accept a Julia function value (P8 1cmodra; todo `15lq8iu`).
-    @test_broken isempty(msg)
+    @test isempty(msg)
     # A body binding an argument name: a parameter declaration through an
     # argument, and a redefinition.
     msg = _smf_errmsg(() -> lower_rkppl(quote
@@ -603,6 +621,7 @@ end
             Expr(:for, :(i = eachindex(y)), Expr(:block,
                 :(theta[i] ~ smf_pcs_plate(0.0)),
                 :(y[i] ~ Normal.(theta[i], sigma)))))), D; mod = _SMF, conditioned = D))
-    # capability: nested plates in a per-cell submodel (P8 1cmodra submodels; todo `15lq8iu`).
+    # capability: nested plates in a per-cell submodel (P8 1cmodra;
+    # reclassified by decision `01ep3vb` to model shapes, todo `1qlbn5b`).
     @test_broken isempty(msg)
 end

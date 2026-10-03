@@ -299,9 +299,9 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(
         plate_ast([good_cell[1],
             :(yy .~ TgiResponse.(mu, sigma, a, b, c, d)), :mu], [subj]), data; conditioned = data)
-    # Fused link-space heads fail closed naming the pre-assignment fix.
-    # capability: fused link-space obs heads in cells (Distributions.BernoulliLogit) (todo `05fuzch`)
-    @test_broken (lower_rkppl(
+    # Fused heads retain their link-space endpoint semantics in cells.
+    # Admitted: the standard BernoulliLogit constructor in a cell.
+    @test (lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ BernoulliLogit.(mu)), :mu],
             [subj]), data; conditioned = data); true)
     # Response-space Binomial threads integer trials and probability values.
@@ -344,7 +344,7 @@ end
     @test_throws "must be positive" lower_rkppl(
         plate_ast(good_cell, [Expr(:kw, :subjects, 0)]), data; conditioned = data)
     # capability: computed `subjects=` expression (`1 + 1`) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(
+    @test (lower_rkppl(
         plate_ast(good_cell, [Expr(:kw, :subjects, :(1 + 1))]), data; conditioned = data); true)
     # refused: unknown keyword `group` (Julia MethodError, P3)
     @test_throws "exactly one keyword" lower_rkppl(

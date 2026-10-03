@@ -60,6 +60,12 @@ function _check_gradient(spec, plan, u)
     return g
 end
 
+function _check_model_math(built, bound, u, oracle)
+    @test _query(built.spec, bound, :posterior, u) ≈ oracle(u)
+    gradient = _check_gradient(built.spec, bound, u)
+    @test gradient ≈ _findiff_grad(oracle, u) rtol = 1e-5 atol = 1e-7
+end
+
 function _gen_columns()
     n = 6
     cols = Dict{Symbol,AbstractVector}(
@@ -203,6 +209,20 @@ _has_sym(ex::Expr, s::Symbol) =
         ex.args)
 _has_sym(_, ::Symbol) = false
 
+function _gen_query_outputs(spec, plan, want)
+    kern = Base.invokelatest(prepare, spec; have = _have(plan), want,
+        bound = _bound_nt(plan))
+    return Set(out.name for recipe in kern.plan.recipes for out in recipe.outputs)
+end
+
+function _gen_query_has_response_plate(spec, plan, want)
+    # Bound lazy guards can split the observation plate into arm plates.
+    # A density cut sums those arms without assembling the pointwise vector.
+    names = _gen_query_outputs(spec, plan, want)
+    return any(name -> name === :_ppl_pw_y_resp ||
+        startswith(String(name), "_ppl_pw_y_resp_"), names)
+end
+
 # Base Bernoulli-logit / Poisson-log lower to a fused whole-vector
 # reduction (`dot` + `sum(f, x)`); literal ranges, weights, and evidence
 # stay on the per-cell plate path. Ranged ≡ bare up to summation order
@@ -228,14 +248,29 @@ end
     built = build_kernel(plan)
     ex = kernel_expr(plan, built.layout)
     @test _has_call(ex, :dot)
-    @test !_has_sym(ex, :_ppl_pw_y_resp)
+    # The shared graph also supplies pointwise queries. Density cuts must
+    # prune that plate, while the pointwise cut must select it.
+    @test _has_sym(ex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test !_gen_query_has_response_plate(built.spec, plan, want)
+    end
+    @test _gen_query_has_response_plate(built.spec, plan, :pointwise)
     # Ranged Bernoulli routes plate and matches the fused density.
     rplan = _gen_ranged_plan(plan, 1:6)
     rbuilt = build_kernel(rplan)
     rex = kernel_expr(rplan, rbuilt.layout)
     @test !_has_call(rex, :dot)
     @test _has_sym(rex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test _gen_query_has_response_plate(rbuilt.spec, rplan, want)
+    end
     u = [0.25, 0.5]
+    eta = u[1] .+ u[2] .* plan.columns[:x]
+    points = _query(built.spec, plan, :pointwise, u)
+    @test keys(points) == (:y,)
+    @test size(points.y) == size(plan.columns[:y])
+    @test points.y ≈ logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-eta))), plan.columns[:y])
+    @test sum(points.y) ≈ _query(built.spec, plan, :likelihood, u)
     @test _query(rbuilt.spec, rplan, :posterior, u) ≈
         _query(built.spec, plan, :posterior, u)
     _check_gradient(rbuilt.spec, rplan, u)
@@ -244,14 +279,27 @@ end
     pbuilt = build_kernel(pplan)
     pex = kernel_expr(pplan, pbuilt.layout)
     @test _has_call(pex, :dot)
-    @test !_has_sym(pex, :_ppl_pw_y_resp)
+    @test _has_sym(pex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test !_gen_query_has_response_plate(pbuilt.spec, pplan, want)
+    end
+    @test _gen_query_has_response_plate(pbuilt.spec, pplan, :pointwise)
     # Ranged Poisson routes plate and matches the fused density.
     rpplan = _gen_ranged_plan(pplan, 1:6)
     rpbuilt = build_kernel(rpplan)
     rpex = kernel_expr(rpplan, rpbuilt.layout)
     @test !_has_call(rpex, :dot)
     @test _has_sym(rpex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test _gen_query_has_response_plate(rpbuilt.spec, rpplan, want)
+    end
     up = [0.1, -0.2]
+    peta = up[1] .+ up[2] .* pplan.columns[:x]
+    ppoints = _query(pbuilt.spec, pplan, :pointwise, up)
+    @test keys(ppoints) == (:y,)
+    @test size(ppoints.y) == size(pplan.columns[:y])
+    @test ppoints.y ≈ logpdf.(Poisson.(exp.(peta)), pplan.columns[:y])
+    @test sum(ppoints.y) ≈ _query(pbuilt.spec, pplan, :likelihood, up)
     @test _query(rpbuilt.spec, rpplan, :posterior, up) ≈
         _query(pbuilt.spec, pplan, :posterior, up)
     _check_gradient(rpbuilt.spec, rpplan, up)
@@ -270,6 +318,11 @@ end
     wex = kernel_expr(wplan, wbuilt.layout)
     @test !_has_call(wex, :dot)
     @test _has_sym(wex, :_ppl_pw_y_resp)
+    for want in (:likelihood, :posterior)
+        @test _gen_query_has_response_plate(wbuilt.spec, wplan, want)
+    end
+    @test _query(wbuilt.spec, wplan, :likelihood, u) ≈
+        sum(cols[:w] .* logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-eta))), cols[:y]))
     _check_gradient(wbuilt.spec, wplan, u)
 end
 

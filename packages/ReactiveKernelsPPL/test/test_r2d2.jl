@@ -224,17 +224,10 @@ end
     # refused: constant column has zero variance (R2D2 scale divides by var(x); unidentified with the intercept)
     @test_throws ContractValidationError bind_data(
         lower_rkppl(_r2d2_demo(), Set([:x1, :x2, :y]); conditioned = Set([:x1, :x2, :y])), flat)
-    # Monotonic columns are out of the flat slice.
-    momodel = quote
-        R2 ~ Beta(1.0, 1.0)
-        phi ~ Dirichlet([1.0, 1.0])
-        s ~ Dirichlet([1.0, 1.0])
-        mu = a .+ b1 .* x1 .+ b3 .* mo(c, s)
-        r2d2(mu, R2, phi)
-        sigma ~ Exponential(1.0)
-        y .~ Normal.(mu, sigma)
-    end
-    # capability: r2d2 over predictors with mo() terms (todo `1308iv0`)
-    @test_broken (lower_rkppl(momodel,
-        Set([:x1, :x2, :c, :y]); conditioned = Set([:x1, :x2, :c, :y])); true)
+    # Retire the monotonic flat-slice pin with the fully declared R2D2
+    # body, including a and both coefficient priors (user 1cmodra / 10ldrvz;
+    # follow-up 17gw1zm). Its contrast variance stays parameter-dependent;
+    # test_shrinkage_values checks the independent numerical oracle.
+    case = _sh_case(:r2, 7, 3)
+    @test (lower_rkppl(case.ast, case.data; conditioned = (:y,)); true)
 end

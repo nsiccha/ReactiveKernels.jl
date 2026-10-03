@@ -21,14 +21,23 @@ ppl_examples_testfile = joinpath(
     @__DIR__, "test_ppl_examples_reactant.jl")
 authored_scan_testfile = joinpath(@__DIR__, "test_authored_scan_reactant.jl")
 lazy_branches_testfile = joinpath(@__DIR__, "test_lazy_branches_reactant.jl")
+abstract_plate_testfile = joinpath(@__DIR__, "test_abstract_plate_reactant.jl")
+invariant_plate_branches_testfile = joinpath(
+    @__DIR__, "test_invariant_plate_branches_reactant.jl")
 authored_loops_testfile = joinpath(@__DIR__, "test_authored_loops_reactant.jl")
+branch_loop_assignments_testfile = joinpath(
+    @__DIR__, "test_branch_loop_assignments_reactant.jl")
+loop_view_capture_testfile = joinpath(@__DIR__, "test_loop_view_capture_reactant.jl")
 rectangular_fold_testfile = joinpath(@__DIR__, "test_rectangular_fold_reactant.jl")
 inner_partial_evaluation_testfile = joinpath(
     @__DIR__, "test_inner_plate_partial_evaluation_reactant.jl")
 ref_array_plate_testfile = joinpath(@__DIR__, "test_ref_array_plate_reactant.jl")
+plate_consumer_layout_testfile = joinpath(
+    @__DIR__, "test_plate_consumer_layout_reactant.jl")
 position_batching_testfile = joinpath(@__DIR__, "test_position_batching_reactant.jl")
 glm_testfile = joinpath(@__DIR__, "test_glm_reactant.jl")
 tensorized_vect_testfile = joinpath(@__DIR__, "test_tensorized_vect_reactant.jl")
+tensorized_cat_testfile = joinpath(@__DIR__, "test_tensorized_cat_reactant.jl")
 tensorized_macros_testfile = joinpath(
     @__DIR__, "test_tensorized_macros_reactant.jl")
 example_packages = (
@@ -54,6 +63,7 @@ mktempdir() do env
         PackageSpec(name = "LambertW"),
         PackageSpec(name = "LogExpFunctions"),
         PackageSpec(name = "DifferentiationInterface"),
+        PackageSpec(name = "StaticArrays"),
     ])
     Pkg.instantiate()
 
@@ -68,11 +78,17 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $position_batching_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $plate_consumer_layout_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $lazy_branches_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $abstract_plate_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $invariant_plate_branches_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_loops_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $branch_loop_assignments_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $loop_view_capture_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $glm_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $tensorized_vect_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $tensorized_cat_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $tensorized_macros_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $rectangular_fold_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $effect_boundary_testfile`)
@@ -98,10 +114,16 @@ mktempdir() do env
     elseif selector == "authored-scan"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $rectangular_fold_testfile`)
+    elseif selector == "invariant-plate-branches"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $invariant_plate_branches_testfile`)
     elseif selector == "glm"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $glm_testfile`)
     elseif selector == "ref-array-plate"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ref_array_plate_testfile`)
+    elseif selector == "plate-consumer-layout"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $plate_consumer_layout_testfile`)
+    elseif selector == "abstract-plate"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $abstract_plate_testfile`)
     elseif selector == "ppl-examples"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ppl_examples_testfile`)
     elseif selector == "ad"

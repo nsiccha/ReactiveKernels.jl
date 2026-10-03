@@ -1,4 +1,4 @@
-using Distributions: Exponential, Gamma, Normal, logpdf
+using Distributions: Categorical, Exponential, Gamma, Multinomial, Normal, logpdf
 using ReactiveKernelsPPL
 using Test
 
@@ -383,11 +383,12 @@ end
     for (msg, ast) in cases
         err = _mx_err(ast, D)
         if msg != "over unknown name"
-            # capability: value-valued matrix construction and unused data/parameters (P3/P8, 10gzbm9 degenerate; todo `15lq8iu`).
-            @test_broken (lower_rkppl(ast, D; conditioned = D); true)
+            # Lowering preserves Julia's construction. Matched controls and
+            # original dimension failures are numerical tests in
+            # test_matrix_values.jl; hcat() itself returns a vector.
+            @test lower_rkppl(ast, D; conditioned = D) isa StructuralPlan
         else
-            # refused: unknown names, dimension mismatch, unidentified
-            # coefficients or non-scalar constructor arguments (P3/P6).
+            # An unknown column remains a source-scope error.
             @test err isa SurfaceLoweringError && occursin(msg, err.message)
         end
     end
@@ -418,8 +419,9 @@ end
                 # Admitted: ordinary coefficient vectors retain all value readers.
                 @test (lower_rkppl(ast, data; conditioned = data); true)
             else
-                # capability: other matrix value operands and shapes (P3/P8; todo `15lq8iu`).
-                @test_broken (lower_rkppl(ast, data; conditioned = data); true)
+                # Whole matrix arithmetic retains its ordinary dimensions.
+                # Numeric controls and mismatches live in test_matrix_values.jl.
+                @test lower_rkppl(ast, data; conditioned = data) isa StructuralPlan
             end
         else
             # refused: coefficient dimensions or sizing source violate
@@ -429,8 +431,7 @@ end
     end
     # Named-definition RHS violations screen at extraction.
     err = _mx_err(quote X = hcat(ones(length(x1)), x1); mu = X * 2; y .~ Normal.(mu, 1.0) end, D)
-    # capability: a scaled matrix-valued response (P3/P10a; todo `1qlbn5b`).
-    @test_broken (err === nothing || throw(err))
+    @test err === nothing
 end
 
 @testset "matrix surface stray positions" begin
@@ -457,16 +458,30 @@ end
             # admitted: a matrix reduction is an ordinary scalar value (P3/P10a).
             @test (lower_rkppl(ast, data; conditioned = data); true)
         elseif !(occursin("argument X", msg) || occursin("multinomial probs", msg) || occursin("categorical probs", msg))
-            # capability: matrix values in broadcast locations/scales and expressions (P3/P10a 0dejlw1; todo `1qlbn5b`).
-            @test_broken (lower_rkppl(ast, data; conditioned = data); true)
+            # These slots retain Julia broadcasting over the matrix value.
+            @test lower_rkppl(ast, data; conditioned = data) isa StructuralPlan
         else
-            # refused: unknown names, dimension mismatch, unidentified
-            # coefficients or non-scalar constructor arguments (P3/P6).
-            @test err isa SurfaceLoweringError && occursin(msg, err.message)
+            # These constructors require scalar arguments or a probability
+            # vector; preserving a matrix value does not change their arity.
+            if occursin("argument X", msg)
+                @test err isa ContractValidationError &&
+                    occursin("matrix value X", sprint(showerror, err))
+                @test_throws MethodError Normal(ones(2,2), 1.0)
+                @test_throws MethodError Normal(0.0, ones(2,2))
+            else
+                @test err isa ContractValidationError &&
+                    occursin("simplex response", sprint(showerror, err))
+                if occursin("multinomial", msg)
+                    @test_throws MethodError Multinomial(10, ones(2,2))
+                else
+                    @test_throws MethodError Categorical(ones(2,2))
+                end
+            end
         end
     end
     # Submodel inlining routes matrices to the same arms.
     m = @rkppl begin
+        b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(ones(length(x)), x)
         mu = X * b
         y ~ _mx_stream(X, 1.0)
@@ -477,9 +492,9 @@ end
     catch e
         e
     end
-    # capability: pass a matrix-valued location through a submodel (P8/P10a;
-    # todo `1qlbn5b`).
-    @test_broken (err === nothing || throw(err))
+    # The original fixture had an undeclared b. Keep that separate from
+    # matrix argument semantics and retain b's prior in the numerical case.
+    @test err === nothing
 end
 
 @testset "matrix surface prior errors" begin

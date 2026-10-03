@@ -70,13 +70,23 @@ end
             y[i] ~ Normal(a + x[i], 0.7)
         end
     end
-    # Refused: x[2] is out of bounds in the authored Julia loop (P3).
-    @test_throws "explicit `@plate` indexing does not stretch" (indexed(;
-        x = [0.5]) | (; y = zeros(3)))
-    # Linear indexing of differently shaped arrays needs a distinct
-    # lowering; silently broadcasting would change this loop's density.
-    @test_throws "different operand axes is not built yet" (indexed(;
-        x = zeros(1, 2)) | (; y = zeros(2)))
+    # Evaluation preserves ordinary Julia bounds checks for indexed reads.
+    invalid = indexed(; x = [0.5]) | (; y = zeros(3))
+    @test_throws BoundsError begin
+        built = build_kernel(invalid)
+        post = prepare_query(built, invalid, :sampler)
+        Base.invokelatest(post, [0.3])
+    end
+    # The authored loop linearly indexes the matrix. Broadcasting these
+    # differently shaped operands would instead create four observations.
+    x = reshape([0.5, -0.3], 1, 2)
+    y = [0.2, -0.1]
+    mu = 0.3 .+ vec(x)
+    linear = indexed(; x) | (; y)
+    @test linear.n_obs == 2
+    _os_check(linear, logpdf(Normal(), 0.3) +
+        sum(logpdf.(Normal.(mu, 0.7), y)),
+        [sum(y .- mu) / 0.7^2 - 0.3], [0.3])
     empty_loop = indexed(; x = ones(3)) | (; y = Float64[])
     _os_check(empty_loop, logpdf(Normal(), 0.3), [-0.3], [0.3])
 
@@ -162,4 +172,65 @@ end
     k = build_kernel(b)
     @test Base.invokelatest(prepare_query(k, b, :likelihood), u) ≈
         sum(logpdf.(Bernoulli(p), y))
+end
+
+function _os_design_fixture(kind, n, weighted_case; value_aware = false)
+    x = [0.1 + 0.07i for i in 1:n]
+    y = [0.2 - 0.03cos(i) for i in 1:n]
+    w = [1 + mod(i, 3) for i in 1:n]
+    data = kind === :supplied ? (; X = hcat(ones(n), x), y, w) : (; x, y, w)
+    source = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+    end
+    kind === :supplied || push!(source.args, :(X = hcat(ones(length(x)), x)))
+    push!(source.args, :(beta = [a, b]))
+    location = kind === :inline ? :(X * [a, b]) :
+        kind === :broadcast_coefficients ? :(X * (beta .* 1.0)) : :(X * beta)
+    push!(source.args, :(mu = $location))
+    observation = weighted_case ? :(y .~ weighted.(Normal.(mu, 0.7), w)) :
+        :(y .~ Normal.(mu, 0.7))
+    push!(source.args, observation)
+    plan = lower_rkppl(source, value_aware ? data : keys(data); conditioned = (:y,))
+    return bind_data(plan, data), x, y, weighted_case ? w : ones(n)
+end
+
+function _os_design_oracle(x, y, w)
+    mu = _OS_U[1] .+ _OS_U[2] .* x
+    residual = w .* (y .- mu)
+    value = sum(w .* logpdf.(Normal.(mu, 0.7), y)) +
+        sum(logpdf.(Normal(), _OS_U))
+    gradient = [sum(residual) / 0.7^2 - _OS_U[1],
+        sum(residual .* x) / 0.7^2 - _OS_U[2]]
+    return value, gradient
+end
+
+@testset "matrix-vector products count their consuming observation domain" begin
+    for kind in (:prepared, :supplied, :inline, :broadcast_coefficients),
+            weighted_case in (false, true), n in (0, 1, 6, 18)
+        bound, x, y, w = _os_design_fixture(kind, n, weighted_case)
+        value_bound, _, _, _ = _os_design_fixture(kind, n, weighted_case;
+            value_aware = true)
+        @test bound.n_obs == value_bound.n_obs == n
+        @test size(bound.columns[:X]) == (n, 2)
+        original = deepcopy(bound.columns)
+        _os_check(bound, _os_design_oracle(x, y, w)...)
+        @test bound.columns == original
+    end
+    # A scalar product retains the whole matrix result. Its columns really
+    # do broadcast with y, so this domain has twice as many cells.
+    for n in (0, 1, 6, 18)
+        source = quote
+            X = hcat(ones(length(x)), x)
+            mu = X * 2.0
+            y .~ Normal.(mu, 0.7)
+        end
+        data = (; x = collect(1.0:n), y = zeros(n))
+        bound = bind_data(lower_rkppl(source, keys(data); conditioned = (:y,)), data)
+        @test bound.n_obs == 2n
+        built = build_kernel(bound)
+        likelihood = prepare_query(built, bound, :likelihood)
+        @test Base.invokelatest(likelihood, Float64[]) ≈
+            sum(logpdf.(Normal.(2.0 .* hcat(ones(n), data.x), 0.7), data.y))
+    end
 end
