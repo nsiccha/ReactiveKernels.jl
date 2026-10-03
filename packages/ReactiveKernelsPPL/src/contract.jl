@@ -5105,21 +5105,28 @@ end
 # sampled seeds and the per-step innovations, and the emitter reconstructs
 # every carried array via the RK-core `scan(...)` carry-fold. Otherwise
 # (every carried write samples) the slice holds the state itself (centered
-# form). A scan mixing both kinds of carried write is a non-centered scan the
-# emitter refuses (not built yet).
+# form). Mixed statements and tuple carries use the ordered reconstruction.
 _is_noncentered_scan(s::ScanSpec) =
-    any(st -> st.kind === :assign && st.indexed, s.step)
+    !(length(s.states) == 1 && all(f -> f.kind === :sample, s.setup) &&
+        length(s.step) == 1 && only(s.step).kind === :sample && only(s.step).indexed)
 
-# A scan's trajectory length T: the literal loop bound, or `n_obs` when the
-# bound is a data length name.
+# A scan's trajectory length: a literal, a supplied integer value, or the
+# historical unsupplied length-name form which uses `n_obs`.
 _scan_length(plan::StructuralPlan, s::ScanSpec) =
-    s.hi isa Int ? s.hi : plan.n_obs
+    s.hi isa Int ? s.hi : haskey(plan.columns, s.hi) ?
+        _scan_bound_length(plan.columns[s.hi], s) : plan.n_obs
+
+function _scan_bound_length(value, s)
+    (value isa Integer && !(value isa Bool) && value >= s.lo - 1) ||
+        _fail(s.label, "scan bound $(s.hi) must bind an integer at least $(s.lo - 1), got $(repr(value))")
+    return Int(value)
+end
 
 # A non-centered scan's latent slice length: one coordinate per sampled seed,
 # plus `T - m` per innovation local (one per loop iteration).
 _scan_latent_size(s::ScanSpec, T::Int) =
     count(f -> f.kind === :sample, s.setup) +
-    count(st -> st.kind === :sample && !st.indexed, s.step) * (T - (s.lo - 1))
+    count(st -> st.kind === :sample, s.step) * (T - (s.lo - 1))
 
 # In-graph name of a non-centered scan's latent slice
 # (`_ppl_scan_z_<first state>`). Reserved-prefix validation guarantees no
@@ -5152,8 +5159,8 @@ function _validate_scans(plan::StructuralPlan)
                 "scan seed fill kind must be :sample or :assign, got " *
                 "$(repr(f.kind))")
         end
-        s.maxlag >= 1 || _fail(s.label,
-            "a scan must read a backward lag of a carried array (maxlag ≥ 1)")
+        s.maxlag >= 0 || _fail(s.label, "scan maxlag must be nonnegative")
+        isbound(plan) && _resolve_scan(plan, s)
         m >= s.maxlag || _fail(s.label,
             "scan maxlag $(s.maxlag) exceeds the $m seeded value(s) per array")
         for a in s.states
@@ -10129,6 +10136,13 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         p.family === :simplex_dirichlet || continue
         push!(defs, Symbol(:_ppl_prior_input_, p.name) => p.args.arg1)
     end
+    for s in plan.scans
+        exprs = Any[s.hi]
+        for st in (s.setup..., s.step...)
+            append!(exprs, st.kind === :sample ? st.args : (st.expr,))
+        end
+        push!(defs, Symbol(:_ppl_scan_input_, s.label) => Expr(:tuple, exprs...))
+    end
     _has_observation_axis(plan) || return Set{Symbol}(raw), Set{Symbol}(first.(defs))
 
     # Pinning only shrinks the verdict: skip the slot walk when even the
@@ -10149,6 +10163,10 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
                 delete!(free, p.name)
                 p.family === :simplex_dirichlet || _drop_held_names!(free, p.args)
             end
+        elseif f === :scans
+            # Raw scan reads are model values indexed inside the retained loop.
+            # Other uses (response columns, affine columns) still pin their axis.
+            continue
         elseif f === :array_parameters
             for p in plan.array_parameters
                 delete!(free, p.name)

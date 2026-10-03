@@ -18,22 +18,6 @@ _scan_min_plan(scans; n = 3) = StructuralPlan(
     scans = scans,
 )
 
-# A shape this file pins as not built yet: `f()` fails with an error whose
-# message contains `needle` (`@test_broken`), and a different failure is a
-# real error. When the shape starts working, `@test_broken` reports an
-# unexpected pass, so the pin turns into a positive test.
-function _scan_gap(f, needle)
-    ok = try
-        f()
-        true
-    catch e
-        occursin(needle, sprint(showerror, e)) || rethrow()
-        false
-    end
-    # capability: generalized scan values and recurrence shapes (P8 1cmodra; todo `0yc2qgp`).
-    @test_broken ok
-end
-
 # Front-end parse tests for `@scan` (sequential recurrence). `parse_scan_block`
 # is purely syntactic — it consumes the quoted inner `begin … end` block, so
 # distribution constructors here are unevaluated AST symbols (no Distributions).
@@ -126,7 +110,7 @@ end
     reject(blk) = @test_throws SurfaceLoweringError parse_scan_block(blk)
     # capability: lag-free and data-integer-lag scans (10gzbm9 degenerate;
     # P8 1cmodra; todo `0yc2qgp`).
-    capable(blk) = @test_broken (parse_scan_block(blk); true)
+    capable(blk) = @test parse_scan_block(blk) isa ScanSpec
 
     # refused: forward read `h[t + 1]` before it is written (P3)
     # forward reference
@@ -514,7 +498,7 @@ end
             _scan_ar_plan(scan; options = opts))
     end
     # non-Normal coefficient (v1 admits SB's Normal `ar` beta only)
-    # capability: non-Normal scan-summand coefficient prior (v1 admits Normal only) (todo `0yc2qgp`)
+    # A scan-summand coefficient keeps its ordinary stated prior (`0yc2qgp`).
     @test validate_structure(
         _scan_ar_plan(scan; coef_family = :exponential)) === nothing
     # a computed scalar is not a sampled coefficient
@@ -683,7 +667,7 @@ end
     @test (validate_structure(dotted); true)
 end
 
-@testset "non-centered emission: gaps and refusals" begin
+@testset "non-centered emission: supported shapes and refusals" begin
     scan_block(stmts...) = Expr(:macrocall, Symbol("@scan"),
         LineNumberNode(1), Expr(:block, stmts...))
     build_block(stmts...) = build_kernel(bind_data(
@@ -714,24 +698,24 @@ end
             eps ~ Normal(0, 1)
             h[t] = nosuch * h[t - 1] + eps
         end))
-    # Valid recurrences the emitter does not build yet.
-    # capability: arbitrary-support innovations and retained deterministic/data-dependent scans (P8 1cmodra; todo `0yc2qgp`).
-    gap(needle, stmts...) = _scan_gap(() -> build_block(stmts...), needle)
-    # a positive-support innovation or seed (the latent slice is identity)
-    gap("must have real support",
+    # Each admitted recurrence builds; independent value/gradient and compiled
+    # structure checks live in test_scan_recurrence_capabilities*.jl.
+    accepted(stmts...) = @test build_block(stmts...).layout.total > 0
+    # Positive-support innovations and seeds use their support transforms.
+    accepted(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Exponential(1)
             h[t] = phi * h[t - 1] + eps
         end))
-    gap("must have real support",
+    accepted(
         :(h[1] ~ Exponential(1)),
         :(for t in 2:T
             eps ~ Normal(0, 1)
             h[t] = phi * h[t - 1] + eps
         end))
     # the loop index read directly
-    gap("uses the loop index",
+    accepted(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Normal(0, 1)
@@ -744,7 +728,7 @@ end
             h[t] = phi * h[t - 1]
         end)).layout.entries if e.kind === :scan).size == 1
     # centered and non-centered carried writes mixed in one scan
-    gap("mixing centered and non-centered",
+    accepted(
         :(h[1] ~ Normal(0, 1)),
         :(g[1] = 0.0),
         :(for t in 2:T
@@ -752,14 +736,14 @@ end
             g[t] = g[t - 1] + h[t]
         end))
     # an innovation scale that reads a carried array (stochastic volatility)
-    gap("innovation scales",
+    accepted(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Normal(0, exp(h[t - 1]))
             h[t] = phi * h[t - 1] + eps
         end))
     # a data column read inside the recurrence
-    gap("data-varying",
+    accepted(
         :(h[1] = 0.0),
         :(for t in 2:T
             eps ~ Normal(0, 1)
