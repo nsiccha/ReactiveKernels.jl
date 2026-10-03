@@ -445,8 +445,18 @@ struct LikelihoodSpec
     threshold_effects::Union{Nothing,Symbol}
 end
 # Preserve the all-fields constructor predating per-component trials.
-LikelihoodSpec(args::Vararg{Any,32}) = LikelihoodSpec(args[1:27]...,
-    Union{ColumnRef,Int}[], args[28:32]...)
+LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
+    label, trials, range, n_levels, thresholds, extra_predictors, count_columns,
+    ordinal_structure, discrimination, threshold_columns, threshold_coefs,
+    extra_responses, factor_scales, factor_corr, glm_alpha, glm_beta,
+    mixture_family, mixture_locs, mixture_scales, mixture_weights,
+    nu, zi, mi_jobs, interval, threshold_effects) =
+    LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
+        label, trials, range, n_levels, thresholds, extra_predictors, count_columns,
+        ordinal_structure, discrimination, threshold_columns, threshold_coefs,
+        extra_responses, factor_scales, factor_corr, glm_alpha, glm_beta,
+        mixture_family, mixture_locs, mixture_scales, mixture_weights,
+        Union{ColumnRef,Int}[], nu, zi, mi_jobs, interval, threshold_effects)
 
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
