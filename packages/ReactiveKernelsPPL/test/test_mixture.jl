@@ -200,8 +200,8 @@ end
                 s ~ Exponential(1.0)
                 y .~ MixtureModel.(Normal.(mu1, s), Ref([1.0]))
             end), SurfaceLoweringError),
-        # capability: MixtureModel(components) with its standard uniform weights (todo `1nb43fj`).
-        ("bad arity",
+        # admitted: MixtureModel(components) with its standard uniform weights (todo `139j2uo`).
+        ("uniform default weights",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
@@ -390,8 +390,9 @@ end
     ]
     supported = Set(["frequency weights rejected", "evidence rejected",
         "partial range rejected", "fully fixed", "assignment location",
-        "data-column location", "split Binomial trials", "stated scalar loc alias"])
-    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "bad arity", "boolean weights", "wrapped param", "bare predictor"])
+        "data-column location", "split Binomial trials", "stated scalar loc alias",
+        "uniform default weights"])
+    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "boolean weights", "wrapped param", "bare predictor"])
     for (label, prog, E) in cases
         @testset "$label" begin
             if label in supported

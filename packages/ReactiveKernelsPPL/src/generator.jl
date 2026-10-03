@@ -1800,8 +1800,11 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     end
     # Equal trial arguments share one input; distinct arguments thread per component.
     nref = nothing
-    if f === BinomialLogitFam && r.trials !== nothing
-        nref = _thread_ref!(inputs, r.trials, true)
+    if f === BinomialLogitFam
+        inputs[1] = _count_yplate!(pre, plan, y, r.label)
+        if r.trials !== nothing
+            nref = _thread_ref!(inputs, r.trials, true)
+        end
     end
     # Weights: literals fold at codegen; a simplex parameter binds one
     # log-vector hoisted out of the plate, threaded by `Ref` (the
@@ -2201,6 +2204,17 @@ end
 # the recipe. Returns the plate input symbol and the cell lane ref.
 _ybool_name(label::Symbol) = Symbol(:_ppl_yb_, label)
 
+# Count endpoints take integer values. Keep the caller's Bool column available
+# to every other reader and form a separate zero/one integer value for the
+# density. This data-only recipe is shared by native and compiled execution.
+function _count_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
+        y::Symbol, label::Symbol)
+    eltype(plan.columns[y]) === Bool || return y
+    yi = Symbol(:_ppl_yi_, label)
+    push!(pre, :($yi = Int.($y)))
+    return yi
+end
+
 function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
         y::Symbol, label::Symbol, yv::Symbol)
     col = plan.columns[y]
@@ -2550,7 +2564,9 @@ end
 
 function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    inputs = Any[y]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
     yv = _dovar(1)
     if _is_bare_param_location(r, plan)
         nref = _thread_ref!(inputs, r.trials, true)
@@ -2569,7 +2585,7 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Prob-space Binomial (SB `binomial(n, theta)` with a Beta prior — the Rate
@@ -2578,7 +2594,9 @@ end
 # through the plate against the positional prob-space kernel.
 function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    inputs = Any[y]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
     pref = _thread_ref!(inputs, r.predictor)
@@ -2587,7 +2605,7 @@ function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Zero-inflated-Binomial plate (the ZIB head): prob-space scalar p (the
@@ -2596,7 +2614,9 @@ end
 # cell (the NB2 precedent).
 function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    inputs = Any[y]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
     pref = _thread_ref!(inputs, r.predictor)
@@ -2606,7 +2626,7 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Mean/rate vectors are precomputed statements (like `_ppl_lp_*`): plate
@@ -2804,7 +2824,9 @@ function _binomial_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, n
     lp = _location_node(r, plan)
     p = _prob_name(r.label)
     logitp = _logitp_name(r.label)
-    inputs = Any[y, logitp]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, logitp]
     yv, lpv = _dovar(1), _dovar(2)
     nref = _thread_ref!(inputs, r.trials, true)
     cell = :(binomial(; n = $nref, logit = $lpv).logpdf($yv))
@@ -2812,7 +2834,7 @@ function _binomial_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, n
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($p = 0.5 .* erfc.(-$lp ./ sqrt(2))),
+    return Expr[pre..., :($p = 0.5 .* erfc.(-$lp ./ sqrt(2))),
         :($logitp = log.($p) .- log1p.(-$p)),
         _plate_sum_stmts(pw, node, inputs, cell)...]
 end
@@ -2822,7 +2844,9 @@ function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, 
     lp = _location_node(r, plan)
     p = _prob_name(r.label)
     logitp = _logitp_name(r.label)
-    inputs = Any[y, logitp]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, logitp]
     yv, lpv = _dovar(1), _dovar(2)
     nref = _thread_ref!(inputs, r.trials, true)
     cell = :(binomial(; n = $nref, logit = $lpv).logpdf($yv))
@@ -2830,7 +2854,7 @@ function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, 
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($p = 1 .- exp.(-exp.($lp))),
+    return Expr[pre..., :($p = 1 .- exp.(-exp.($lp))),
         :($logitp = log.($p) .- log1p.(-$p)),
         _plate_sum_stmts(pw, node, inputs, cell)...]
 end
@@ -2877,7 +2901,8 @@ function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
-    inputs = Any[y, a, b]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, a, b]
     yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
     nref = _thread_ref!(inputs, r.trials, true)
     cell = :(beta_binomial($nref, $avv, $bvv).logpdf($yv))
