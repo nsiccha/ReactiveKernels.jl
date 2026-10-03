@@ -861,8 +861,10 @@ function _indexed_observation_definitions(ast::Expr, data::Set{Symbol})
         if st isa Expr && _is_broadcast_sample(st)
             lhs = st.args[2]
             if lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
-                    lhs.args[1] in data && lhs.args[2] isa Symbol &&
-                    lhs.args[2] in data
+                    lhs.args[1] in data &&
+                    ((lhs.args[2] isa Symbol && lhs.args[2] in data) ||
+                     (_mentions_symbol(st.args[3], :MixtureModel) &&
+                      _literal_row_range(lhs.args[2])))
                 k = 1
                 name = Symbol(:_rkppl_observed_, lhs.args[1], :_, k)
                 while name in taken
@@ -878,6 +880,14 @@ function _indexed_observation_definitions(ast::Expr, data::Set{Symbol})
         push!(out, st)
     end
     return Expr(:block, out...)
+end
+
+function _literal_row_range(ex)
+    ex isa Expr && ex.head === :call && length(ex.args) == 3 || return false
+    fn = ex.args[1]
+    colon = fn === :(:) || (fn isa GlobalRef &&
+        getfield(fn.mod, fn.name) === getfield(Base, :(:)))
+    return colon && all(x -> x isa Integer, ex.args[2:end])
 end
 
 # Ordinary parameters may have any number of readers. Legacy
@@ -1407,6 +1417,22 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     union!(used_locs, kernel_lp_predictors)
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
         used_locs)
+    # A definition inlined into a location may still be read by the raw
+    # recurrence body. Keep it and its definition dependencies as value nodes.
+    scan_reads = Symbol[]
+    for s in scans, st in (s.setup..., s.step...)
+        for ex in (st.kind === :sample ? st.args : (st.expr,))
+            append!(scan_reads, _value_symbols(ex))
+        end
+    end
+    kept = Set{Symbol}()
+    while !isempty(scan_reads)
+        nm = pop!(scan_reads)
+        (nm in kept || !haskey(canonmap, nm)) && continue
+        push!(kept, nm)
+        delete!(skip, nm)
+        append!(scan_reads, _value_symbols(canonmap[nm]))
+    end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
     # Axes of every declared array an array-cell plate may read.
@@ -1463,9 +1489,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors),
         plate_names)
     for m in matrices
-        m.name in ctx.matrices_used || _sfail(
+        used_axis = any(p -> any(d -> _is_axis_dim(d) && d.args[2] === m.name,
+            p.dims), arrays)
+        m.name in ctx.matrices_used || used_axis || _sfail(
             "design matrix `$(m.name)` is never used in a predictor " *
-            "matmul — drop it or add the use (`mu = $(m.name) * b`)")
+            "matmul or array axis — drop it or add the use (`mu = $(m.name) * b`)")
     end
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
@@ -1727,6 +1755,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     end
     if head === :ref
         base = ex.args[1]
+        base in data && length(ex.args) == 2 &&
+            _literal_row_range(ex.args[2]) && return :vector
         base isa Symbol && (shape(base) === :array ||
             _model_valued(base, detmap, env, Set{Symbol}())) &&
             return _ref_shape(ex, data)
@@ -1734,8 +1764,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
     end
-    head === Symbol("'") && return shape(ex.args[1]) === :array ? :array :
-        :scalar
+    head === Symbol("'") && return shape(ex.args[1]) in (:array, :matrix) ?
+        shape(ex.args[1]) : :scalar
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
@@ -1773,9 +1803,9 @@ end
 function _ref_shape(ex, data)
     idx = ex.args[2:end]
     isempty(idx) && return :scalar
-    if idx[1] isa Symbol && idx[1] in data
-        # Per-observation gather: one value (or row) per observation.
-        length(idx) == 2 && idx[2] === :(:) && return :matrix
+    if any(i -> i isa Symbol && i in data, idx)
+        # Per-observation gather: scalar selection or an oriented matrix.
+        any(i -> i === :(:), idx) && return :matrix
         return :vector
     end
     any(i -> i === :(:), idx) && return :array
@@ -1824,13 +1854,17 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
-        # A gather from an array value (`z[g, 1]`, `b[g, 1]` with
-        # `b = z * M`) follows its first index, like a one-index gather.
+        # A gather from an array value follows its observation index on
+        # either axis, including definitions such as `b = z * M`.
         array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
             (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
                 _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
         array_base || _is_gather(ex, data, detmap, env) || return false
-        return _obs_axis(ex.args[2], data, detmap, memo, active, env)
+        any(_literal_row_range, ex.args[2:end]) && return true
+        return any(i -> _obs_axis(i, data, detmap, memo, active, env),
+            ex.args[2:end])
+    elseif ex.head === Symbol("'")
+        return _obs_axis(ex.args[1], data, detmap, memo, active, env)
     end
     return false
 end
@@ -1902,8 +1936,6 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     elseif fn === :^ || _is_plain_comparison(fn) || fn === :ifelse ||
             fn in ASSIGNMENT_FNS
         return nvec == 0 ? :scalar : :invalid
-    elseif fn in VECTOR_FNS
-        return :vector
     end
     return nvec == 0 ? :scalar : :vector  # unknown heads: follow the args
 end
@@ -2150,7 +2182,7 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
         # (responses) with bind-to-a-name guidance.
         fn === :_ppl_plate_column && return nothing  # array-cell plate
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn ∉ VECTOR_FNS && fn !== :spline &&
+                fn !== :spline &&
                 fn !== :hsgp && fn !== :mo && fn !== :mo1 &&
                 fn !== :hcat && fn !== :dar
             startswith(string(fn), ".") && _sfail(
@@ -2220,7 +2252,7 @@ end
 const _CONSTRUCT_VALUE_HEADS = (:spline, :hsgp, :mo, :mo1, :hcat, :dar)
 
 _builtin_value_head(fn::Symbol) =
-    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS || fn in VECTOR_FNS ||
+    fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS ||
     fn in REDUCTION_FNS || fn in _CONSTRUCT_VALUE_HEADS ||
     fn in CELL_FNS || fn in SEGMENT_CELL_FNS ||
     startswith(string(fn), ".") || fn === :treatment || fn === :ifelse ||
@@ -2371,14 +2403,18 @@ end
 # `_confirm_whole_value_data`.
 function _check_module_calls(det, detmap, data, env::_ShapeEnv;
         whole::Set{Symbol} = Set{Symbol}())
-    # Whole columns are model-level values there: still gatherable
-    # (`gx[g]` follows its index), never aligned themselves.
+    # A sampled vector (plate, scan or varying result) passes whole to an
+    # undotted module call. Its alignment outside that call does not give
+    # the call an observation axis. Raw data still obey the whole-column
+    # check: `gx[g]` follows its index, while `gx` passes whole only when
+    # no other consumer needs it per observation.
     aligned = setdiff(data, whole)
-    wenv = _ShapeEnv(env.aligned, union(env.values, whole))
+    call_env = _ShapeEnv(Set{Symbol}(), env.values)
+    wenv = _ShapeEnv(call_env.aligned, union(env.values, whole))
     memos = (Dict{Symbol,Symbol}(), Dict{Symbol,Symbol}())
     waived = Tuple{String,Set{Symbol}}[]
     for (nm, rhs) in det
-        _check_module_calls(nm, rhs, detmap, data, aligned, whole, env, wenv,
+        _check_module_calls(nm, rhs, detmap, data, aligned, whole, call_env, wenv,
             memos, waived)
     end
     return waived
@@ -2423,8 +2459,9 @@ function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
 end
 
 # Names held by non-definition statements. A gathered
-# value is whole even in a response (`v[g]`); its index is aligned. Plates
-# and scans retain their conservative statement-wide alignment. Extracted
+# value is whole even in a response (`v[g]`); its index is aligned. Plate
+# cells distinguish whole calls from indexed lane reads; scans retain
+# conservative statement-wide alignment. Extracted
 # kernel cells remain consumers too: a schedule-chain definition moved out
 # of `det` still reads its subject-level predictors. Otherwise those now
 # apparently unused definitions would be classified as whole values.
@@ -2435,7 +2472,17 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
     for st in ast.args
         st isa LineNumberNode && continue
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
-        if st isa Expr && st.head === :macrocall
+        if st isa Expr && st.head === :macrocall &&
+                st.args[1] === Symbol("@plate")
+            loop = st.args[3]
+            ivar = loop.args[1].args[1]
+            _all_symbols!(out, loop.args[1].args[2])
+            for c in loop.args[2].args
+                c isa Expr && (_is_sample(c) || _is_broadcast_sample(c)) || continue
+                _classify_cell_reads!(whole, out, c.args[2], known, ivar)
+                _classify_cell_reads!(whole, out, c.args[3], known, ivar)
+            end
+        elseif st isa Expr && st.head === :macrocall
             _all_symbols!(out, st)
         elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
                 _merge_stem(_stmt_lhs(st)) in whole_priors
@@ -2448,6 +2495,24 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
     free = copy(known)
     _drop_held_names!(free, kernel_stmts)
     return union!(out, setdiff(known, free))
+end
+
+function _classify_cell_reads!(whole, aligned, ex, known, ivar, full=false)
+    if ex isa Expr && ex.head === :ref && length(ex.args) == 2 && ex.args[2] === ivar
+        _classify_reads!(whole, aligned, ex.args[1], known, false)
+    elseif ex isa Expr && ex.head === :call
+        context = full || _cell_whole_call(ex.args[1])
+        for a in ex.args[2:end]
+            _classify_cell_reads!(whole, aligned, a, known, ivar, context)
+        end
+    elseif _is_dotted_call(ex)
+        for a in ex.args[2].args
+            _classify_cell_reads!(whole, aligned, a, known, ivar, full)
+        end
+    else
+        _classify_reads!(whole, aligned, ex, known, full)
+    end
+    return nothing
 end
 
 # The names of `among` that `ex` reads, directly or through definitions.
@@ -2605,60 +2670,34 @@ _varying_head(rhs::Expr) = rhs.args[1]::Symbol
 # `_validate_varying_margins` proves vector shape after lowering.
 # Claims the draws label up front so user definitions can never
 # collide with in-graph names (L/tau/z).
-# A draws block's `sd=` keyword: one zero-located scale call for every
-# margin (`sd=Cauchy(0, 5)`), at any K. sd priors are Stan-kernel by
-# construction (support `nothing` — no `+log2`), so the proper-half
-# spellings are rejected with the bare form (a `HalfCauchy` prior means
-# `+log2` everywhere else; aliasing it here would lie). Per-margin
-# tuples are planned, not admitted. The default spelled out
-# (`sd=Normal(0, 1)`) lowers to the empty all-default vector, so it
-# gives the plan omitting `sd=` gives.
+# Marginal scales use explicit normalized positive priors. A bare Normal or
+# Cauchy remains full-support everywhere and cannot declare a positive scale.
 function _lower_varying_sd_prior(raw, K::Int, where)
-    raw isa Expr && raw.head === :tuple &&
-        _sfail("$where per-margin sd priors are planned — pass one " *
-              "`sd=` call for all $K margins")
-    raw isa Expr && raw.head === :vect &&
-        _sfail("$where per-margin sd priors are planned — pass one " *
-              "`sd=` call for all $K margins, not a vector")
-    raw isa Expr && raw.head === :call && !isempty(raw.args) &&
-        raw.args[1] isa Symbol || _sfail(
-            "$where `sd=` takes `Cauchy(0, σ)`, `Normal(0, σ)`, or " *
-            "`Exponential(θ)` (literal args), got $(repr(raw))")
-    fam = raw.args[1]
-    args = raw.args[2:end]
-    if fam === :HalfCauchy || fam === :HalfNormal || _sd_is_truncated(raw)
-        _sfail("$where sd priors are Stan-kernel (no `+log2`) — spell " *
-              "the bare form (`sd=Cauchy(0, σ)`), not `$(repr(raw))`")
+    raw isa Expr && raw.head in (:tuple, :vect) &&
+        _sfail("$where per-margin sd priors are planned — pass one `sd=` call for all $K margins")
+    p = _lower_parameter(:sd, raw, Dict{Symbol,Any}(), Dict{Symbol,Any}())
+    p.family in (:normal, :cauchy, :exponential) ||
+        _sfail("$where `sd=` takes `HalfNormal(s)`, `HalfCauchy(s)`, " *
+            "`truncated(Normal(0, s), 0, Inf)`, `truncated(Cauchy(0, s), 0, Inf)`, or `Exponential(s)`")
+    length(p.args) == SAMPLED_ARITY[p.family] ||
+        _sfail("$where sd prior $(p.family) takes $(SAMPLED_ARITY[p.family]) argument(s)")
+    if p.family === :exponential
+        p.support_override in (nothing, (:truncated, 0.0, Inf)) ||
+            _sfail("$where `sd=Exponential(s)` uses its natural positive support; " *
+                "bounded Exponential sd priors are not supported")
+    else
+        p.support_override in (:positive, (:truncated, 0.0, Inf)) ||
+            _sfail("$where `sd=` needs an explicit positive prior: use " *
+                "`HalfNormal(s)`, `HalfCauchy(s)`, or `truncated(D, 0, Inf)`; bare Normal/Cauchy have full support")
+        p.args.arg1 isa Real && !(p.args.arg1 isa Bool) && p.args.arg1 == 0 ||
+            _sfail("$where sd half priors require zero location")
     end
-    fam === :Cauchy || fam === :Normal || fam === :Exponential ||
-        _sfail("$where `sd=` takes `Cauchy(0, σ)`, `Normal(0, σ)`, or " *
-              "`Exponential(θ)`, got `$(repr(raw))`")
-    if fam === :Exponential
-        length(args) == 1 || _sfail("$where `sd=Exponential(θ)` takes " *
-            "one scale argument (Distributions scale convention, like " *
-            "sampled `s ~ Exponential(1)`), got $(repr(raw))")
-        th = args[1]
-        th isa Real && !(th isa Bool) && th > 0 ||
-            _sfail("$where sd Exponential scale must be a positive " *
-                  "literal, got $(repr(th))")
-        return fill(VaryingSdPrior(:exponential, Float64(th)), K)
-    end
-    length(args) == 2 || _sfail("$where `sd=$fam(0, σ)` takes a " *
-        "zero location and a scale, got $(repr(raw))")
-    loc, sc = args
-    loc isa Real && !(loc isa Bool) && loc == 0 ||
-        _sfail("$where sd $fam location must be literal 0, got " *
-              "$(repr(loc))")
-    sc isa Real && !(sc isa Bool) && sc > 0 ||
-        _sfail("$where sd $fam scale must be a positive literal, got " *
-              "$(repr(sc))")
-    fam === :Normal && sc == 1 && return VaryingSdPrior[]
-    sym = fam === :Cauchy ? :cauchy : :normal
-    return fill(VaryingSdPrior(sym, Float64(sc)), K)
+    scale = last(values(p.args))
+    scale isa Real && !(scale isa Bool) && isfinite(scale) && scale > 0 ||
+        _sfail("$where sd prior scale must be a positive finite literal")
+    p.family === :normal && scale == 1 && return VaryingSdPrior[]
+    return fill(VaryingSdPrior(p.family, Float64(scale)), K)
 end
-
-_sd_is_truncated(raw::Expr) =
-    raw.head === :call && !isempty(raw.args) && raw.args[1] === :truncated
 
 function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
         data::Set{Symbol}, detnames::Set{Symbol}, seen::Set{Symbol},
@@ -3111,7 +3150,7 @@ _is_dar_inf(b) = b === :Inf || (b isa Real && isinf(Float64(b)) && Float64(b) > 
 # declarations do work at lowering — they build IR + claim the
 # generated names — so the "bare call does nothing" rejection does not
 # apply). `sd=` states the smoothing-sd prior (SB `sd(mu, s(x)) ~ ...`,
-# `_lower_hyper_prior`; default Stan-kernel `Normal(0, 1)`). Quoted
+# `_lower_hyper_prior`; default normalized `HalfNormal(1)`). Quoted
 # id, bare raw axes (1 → :tps, 2 → :t2 when `kind` is omitted), literal `k`
 # (default 10 / (5, 5)). Lowers directly to SplineBasis IR + the fully
 # determined SplineVector set (contract `_spline_*` rules); claims the
@@ -3154,41 +3193,27 @@ function _lower_r2d2_decl(st::Expr, line::Int)
     return (predictor = pred, r2 = r2, phi = phi, tau = tau, line = line)
 end
 
-# A basis hyper-prior keyword (`hsgp_basis(...; length_scale=...,
-# sd=...)`, `spline_basis(...; sd=...)` — SB `length_scale(:, hsgp(x))
-# ~ ...` / `sd(:, s(x)) ~ ...`): one Distributions.jl call with literal
-# arguments from the admitted positive-hyperparameter families. Stan
-# kernel semantics on the positive support (no `+log2` renormalizer) for
-# the real-support families, so the proper-half spellings fail closed
-# toward the bare form; positive-support families and `Uniform` keep
-# their own density (`_hyper_support_override`).
+# The sampled-parameter grammar defines what a prior means in every slot.
+# These legacy basis slots still require literal arguments and bounds.
 function _lower_hyper_prior(raw, where, what::Symbol)
-    admitted = "LogNormal, InverseGamma, Gamma, Exponential, Normal, " *
-        "Cauchy, StudentT, Uniform (literal arguments)"
-    raw isa Expr && raw.head === :call && !isempty(raw.args) &&
-        raw.args[1] isa Symbol || _sfail(
-            "$where `$what=` takes one distribution call ($admitted), " *
-            "got $(repr(raw))")
-    fam = raw.args[1]
-    (fam === :HalfNormal || fam === :HalfCauchy || fam === :truncated) &&
-        _sfail("$where `$what=` priors are Stan-kernel on the positive " *
-              "support (no `+log2`) — spell the bare form " *
-              "(`$what=Normal(0, s)`), not `$(repr(raw))`")
-    sym = get(_PARAM_FAMILIES, fam, nothing)
-    sym !== nothing && haskey(_HYPER_PRIOR_FAMILIES, sym) || _sfail(
-        "$where `$what=` family `$fam` is not admitted ($admitted)")
-    args = _plain_args(raw, "$where `$what=$fam`")
-    length(args) in _HYPER_PRIOR_FAMILIES[sym] || _sfail(
-        "$where `$what=$fam` takes $(only(_HYPER_PRIOR_FAMILIES[sym])) " *
-        "argument(s), got $(length(args))")
-    vals = map(args) do a
-        a isa Real && !(a isa Bool) && isfinite(Float64(a)) || _sfail(
-            "$where `$what=$fam` arguments must be finite numeric " *
-            "literals, got $(repr(a))")
-        Float64(a)
+    p = _lower_parameter(what, raw, Dict{Symbol,Any}(), Dict{Symbol,Any}())
+    haskey(_HYPER_PRIOR_FAMILIES, p.family) ||
+        _sfail("$where `$what=` family $(p.family) is not admitted")
+    length(p.args) in _HYPER_PRIOR_FAMILIES[p.family] ||
+        _sfail("$where `$what=` prior $(p.family) has the wrong number of arguments")
+    all(a -> a isa Real && !(a isa Bool) && isfinite(a), values(p.args)) ||
+        _sfail("$where `$what=` prior arguments must be finite numeric literals")
+    p.support_override isa Tuple &&
+        !all(a -> a isa Real, p.support_override[2:end]) &&
+        _sfail("$where `$what=` truncation bounds must be literal")
+    if SAMPLED_SUPPORT[p.family] === :real && p.support_override === nothing
+        _sfail("$where `$what=` needs an explicit positive prior: use " *
+            "`HalfNormal(s)`, `HalfCauchy(s)`, or `truncated(D, 0, Inf)`; " *
+            "bare real-support distributions are not halves")
     end
-    return HyperPrior(sym,
-        NamedTuple{ntuple(i -> Symbol(:arg, i), length(vals))}(Tuple(vals)))
+    hp = HyperPrior(p.family, map(Float64, p.args), p.support_override)
+    _validate_hyper_prior(hp, what, "$where `$what=`")
+    return hp
 end
 
 function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
@@ -3817,7 +3842,7 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
                "only — `$head.(...)` is grouped-only (declare a schedule)")
     end
     fam, arity = spec
-    dargs = dist.args[2].args
+    dargs = _distribution_args(head, dist.args[2].args)
     length(dargs) == arity ||
         _sfail("$where `$head.(...)` takes exactly $arity arguments, " *
                "got $(length(dargs))")
@@ -4973,7 +4998,7 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
     # array operand to take the ordinary matrix-value route.
     fn = (ex.head === :call || _is_dotted_call(ex)) && !isempty(a) ? a[1] : nothing
     composed = fn in _MATRIX_OPERAND_HEADS || fn in ELEMENTWISE_FNS ||
-        fn in ASSIGNMENT_FNS || fn in VECTOR_FNS || fn isa GlobalRef ||
+        fn in ASSIGNMENT_FNS || fn isa GlobalRef ||
         (fn isa Expr && fn.head === :.)
     child_affine = affine && !(composed && fn ∉ (:+, :.+, :-, :.-))
     for x in a
@@ -5411,7 +5436,9 @@ end
 # Lanes are the per-index inputs: a data column read at the loop index
 # (`x[i]`), or the level codes of a column that indexes an array's levels
 # axis (`sd[s[i], :]`, `z[g[i], :]`, a per-level factor `L[s[i]]` —
-# `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Every other name
+# `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Level cells align
+# selected or different declared axes through `_ppl_level_gather` inputs.
+# Every other name
 # the cell reads (arrays, parameters, definitions) is passed whole with
 # `Ref`. Inside the cell those reads are ordinary integer indexing
 # (`sd[c, :]`, `L[:, :, c]`); RK generates the loop.
@@ -5450,12 +5477,21 @@ function _plate_column_expr(nm::Symbol, call::Expr,
             if axis !== nothing && d !== nothing && idx[1] === ivar
                 dim = length(d) == 3 && length(idx) == 1 ? d[3] : d[1]
                 _is_levels_dim(dim) || return Expr(:ref, X, map(rw, idx)...)
-                _levels_subset(dim) === Colon() || _sfail("$where reads " *
-                    "a selected level axis of $X; per-level cells currently " *
-                    "take full level axes")
                 h = dim.args[2]
-                h === axis || _sfail("$where reads $X on levels($h); " *
-                    "per-level cells currently take the same level axis")
+                if _levels_subset(dim) !== Colon() || h !== axis
+                    # Align values by their declared labels before entering
+                    # the cell. A parameter can be a view; indexing that view
+                    # at a traced lane code is not supported by Reactant.
+                    ld = length(d) == 3 && length(idx) == 1 ? 3 : 1
+                    value = lane(Expr(:call, :_ppl_level_gather, X, axis, ld),
+                        Symbol(:_ppl_pv_, X))
+                    length(d) == 1 && return value
+                    ld == 3 && return Expr(:call, :reshape, value, d[1], d[2])
+                    length(idx) == length(d) || _sfail("$where reads $X " *
+                        "on a selected or different level axis; give one " *
+                        "index per axis")
+                    return Expr(:ref, value, map(rw, idx[2:end])...)
+                end
                 # The same scalar level axis is already aligned with
                 # the plate lanes. Passing it directly also avoids an
                 # unnecessary dynamic gather from a parameter view.
@@ -5612,12 +5648,12 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
 end
 
 # The per-cell latent's size follows the plate range: a literal `1:N` rides as
-# a UnitRange (validated to cover 1:n_obs at bind); `eachindex(v)` / `axes(v,
+# a UnitRange (validated against its response axis at bind); `eachindex(v)` / `axes(v,
 # 1)` over a data column ride as the column `v` (one cell per entry, proved
-# at bind); over a definition (an observation-aligned column) ⇒ n_obs.
+# at bind); over a definition ⇒ the definition's own observation axis.
 function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
     rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2])
-    return rkind[2] in data ? rkind[2] : nothing
+    return rkind[2]
 end
 
 function _cell_lhs_error(lhs, ivar)
@@ -5672,8 +5708,15 @@ function _cell_bares!(ex::Expr, ivar, bares, data)
         return nothing
     end
     if ex.head === :call
+        fn = ex.args[1]
+        # Undotted module calls and reductions consume whole values.
+        # Still walk their arguments to validate indexed reads and the
+        # loop variable, while exempting bare whole arguments from the
+        # per-observation column check.
+        whole = _cell_whole_call(fn)
+        reads = whole ? Set{Symbol}() : bares
         for a in ex.args[2:end]
-            _cell_bares!(a, ivar, bares, data)
+            _cell_bares!(a, ivar, reads, data)
         end
         return nothing
     end
@@ -5716,6 +5759,13 @@ const _CELL_OBJECT_WRAPPERS = (:truncated, :censored, :interval_censored,
 _cell_object_call(f::Symbol) =
     isuppercase(first(string(f))) || f in _CELL_OBJECT_WRAPPERS
 _cell_object_call(f) = false
+
+_cell_whole_call(f::Symbol) = f in REDUCTION_FNS || f in _WHOLE_READ_FNS ||
+    (!_builtin_value_head(f) && !_cell_object_call(f))
+_cell_whole_call(f::GlobalRef) = !_cell_object_call(f.name)
+_cell_whole_call(f::Expr) = f.head === :. && length(f.args) == 2 &&
+    f.args[2] isa QuoteNode && !_cell_object_call(f.args[2].value)
+_cell_whole_call(f) = false
 
 # Strip a validated cell expression to whole values and take the broadcast
 # form of every call and operator over a per-index operand (`v[i]`, a
@@ -5946,7 +5996,7 @@ _is_axes2_call(index) =
 # (each axis `1:K`, `levels(g)`, or `axes(M, d)`). One-axis
 # `z[levels(g)]` / `z[axes(X, 2)]` have separate parse arms but the same
 # ordinary array semantics. A `levels(gg)` axis over a definition `gg`
-# (data computed at bind, `gg = vcat(g1, g2)`) uses this arm too.
+# (data computed at bind, `gg = vcat(g1, g2)`) and `axes(X, 1)` use this arm too.
 # Returns `(name, dims)` or `nothing` (not an array).
 function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
         detnames::Set{Symbol} = Set{Symbol}())
@@ -5955,8 +6005,10 @@ function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
     target isa Symbol && target ∉ data || return nothing
     idx = lhs.args[2:end]
     if length(idx) == 1
+        row_axis = _is_axis_dim(idx[1]) && idx[1].args[1] === :axes &&
+            idx[1].args[3] == 1 && idx[1].args[2] !== target
         _is_literal_range(idx[1]) || _is_def_levels_call(idx[1], data,
-            detnames) || return nothing
+            detnames) || row_axis || return nothing
     elseif length(idx) != 2
         _sfail("array $target takes one or two axes, got $(repr(lhs))")
     end
@@ -6102,12 +6154,17 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
             n = Expr(:call, :length, Expr(:call, :levels, g))
             return k == 0 ? n : Expr(:call, :-, n, k)
         end
-        lo === 1 && hi isa Integer && !(hi isa Bool) && hi >= 1 || _sfail(
+        lo === 1 && hi isa Integer && !(hi isa Bool) && hi >= 0 || _sfail(
             "array $target axis $(repr(a)) must be a literal `1:K` with " *
-            "K ≥ 1, or `1:length(levels(g)) - k`")
+            "K ≥ 0, or `1:length(levels(g)) - k`")
         return Int(hi)
     end
     _is_def_levels_call(a, data, detnames) && return a
+    if a isa Expr && a.head === :ref && !isempty(a.args) &&
+            _is_levels_call(a.args[1])
+        g, subset = _levels_subset_index(target, a, data)
+        return Expr(:call, :levels, g, QuoteNode(subset))
+    end
     if _is_levels_call(a)
         return Expr(:call, :levels,
             _levels_column(target, a, data, "array $target"))
@@ -6117,7 +6174,8 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
         return Expr(:call, :axes, a.args[2], a.args[3])
     end
     return _sfail("array $target axis $(repr(a)) must be a literal `1:K`, " *
-                  "`levels(g)`, or `axes(M, d)` of a matrix `M`")
+                  "`levels(g)` (optionally selected), or `axes(M, d)` " *
+                  "of a matrix `M`")
 end
 
 # Joint-response statement: `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`
@@ -6498,6 +6556,10 @@ function _resolve_submodel(rhs, mod::Module)
     head = rhs.args[1]
     if head isa GlobalRef
         mod, head = head.mod, head.name
+    elseif head isa Expr && head.head === :. && length(head.args) == 2 &&
+            head.args[2] isa QuoteNode && head.args[2].value isa Symbol
+        mod = _resolve_module_path(head.args[1], mod, "submodel call")
+        head = head.args[2].value
     end
     head isa Symbol || return nothing
     isdefined(mod, head) || return nothing
@@ -7590,28 +7652,27 @@ end
 function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         predictors, pred_idx, coefuse)
     label = Symbol(lhs, "_resp")
-    weights === nothing || _sfail("response $lhs: mixture responses take " *
-        "no frequency weights (v1 — `weighted.(...)` over a mixture is a " *
-        "follow-up)")
-    evidence.kind === :none || _sfail("response $lhs: mixture responses " *
-        "take no censoring/truncation evidence (v1)")
     range === nothing || _sfail("response $lhs: mixture responses take no " *
         "range (v1 — mixtures cover the whole column)")
     args = _plain_args(call, "`MixtureModel`")
-    length(args) == 2 || _sfail("response $lhs: `MixtureModel` takes " *
+    length(args) in (1, 2) || _sfail("response $lhs: `MixtureModel` takes " *
         "`MixtureModel.(vcat.(C1, ..., CK), Ref(w))` " *
         "(per-observation component vectors + shared weights)")
-    comps, wraw = args
+    comps = args[1]
     _is_dotted_call(comps) && comps.args[1] === :vcat ||
         _sfail("response $lhs: `MixtureModel` needs per-observation " *
             "component vectors; use `MixtureModel.(vcat.(Normal.(mu1, s), " *
             "Normal.(mu2, s)), Ref(w))`, got $(repr(comps))")
-    _is_ref_call(wraw) || _sfail("response $lhs: mixture weights are " *
-        "shared as a vector — use `Ref(w)` in `MixtureModel.(..., Ref(w))`")
-    wraw = wraw.args[2]
     components = comps.args[2].args
     K = length(components)
     K >= 1 || _sfail("response $lhs: `MixtureModel` needs ≥ 1 component")
+    wraw = if length(args) == 1
+        Expr(:vect, fill(1.0 / K, K)...)
+    else
+        _is_ref_call(args[2]) || _sfail("response $lhs: mixture weights are " *
+            "shared as a vector — use `Ref(w)` in `MixtureModel.(..., Ref(w))`")
+        args[2].args[2]
+    end
     fams = LikelihoodFamily[]
     llinks = LinkFunction[]
     plinks = LinkFunction[]
@@ -7649,10 +7710,7 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
     trials = nothing
     if f === BinomialLogitFam
         t1 = trials_raw[1]
-        all(t -> isequal(t, t1), trials_raw) || _sfail("response $lhs: " *
-            "mixture Binomial components must share one identical " *
-            "trial-count expression (SB rule — share one column)")
-        trials = t1
+        trials = all(t -> isequal(t, t1), trials_raw) ? t1 : nothing
     end
     loc_uses = Union{Symbol,Real}[
         _lower_mixture_loc(lhs, k, loc, pl, wrappeds[k], ctx, predictors,
@@ -7664,13 +7722,17 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         end
         push!(scale_uses, lowered_sc)
     end
+    wraw isa Symbol && wraw ∉ ctx.data && wraw ∉ ctx.dirichlet_names &&
+        _sfail("response $lhs: mixture weights $wraw are undeclared; bind an input or state a Dirichlet prior")
     w = _lower_mixture_weights(lhs, wraw)
     prednames = Set{Symbol}(p.name for p in predictors)
     anchor = _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     return LikelihoodSpec(MixtureFam, ll, lhs, anchor, nothing, weights,
         evidence, label, trials, range; mixture_family = f,
         mixture_locs = loc_uses, mixture_scales = scale_uses,
-        mixture_weights = w)
+        mixture_weights = w,
+        mixture_trials = f === BinomialLogitFam && trials === nothing ?
+            Union{ColumnRef,Int}[trials_raw...] : Union{ColumnRef,Int}[])
 end
 
 # Dotted→call conversion for one mixture component: like
@@ -7845,9 +7907,11 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
             return _lower_location(lhs, loc, pred_link, ctx, predictors,
                 pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"))
         end
-        haskey(ctx.detmap, loc) && _sfail("response $lhs: mixture " *
-            "component $k location $loc is a scalar definition — v1 " *
-            "locations are predictors, sampled parameters, or literals")
+        if haskey(ctx.detmap, loc) && pred_link === IdentityLink
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
+                value = true)
+        end
         if loc in ctx.prior_names
             wrapped && _sfail("response $lhs: mixture component $k " *
                 "wraps the sampled parameter $loc in a link function — " *
@@ -7855,9 +7919,11 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
                 "parameters bare, constrained-scale)")
             return loc
         end
-        loc in ctx.data && _sfail("response $lhs: mixture component $k " *
-            "location is the data column $loc — wrap it in a predictor " *
-            "(`eta = a .+ b .* $loc`, or offset-only `mu = $loc`)")
+        if loc in ctx.data && pred_link === IdentityLink
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
+                value = true)
+        end
         _sfail("response $lhs: mixture component $k location $loc is not " *
                "a predictor definition, sampled parameter, or literal")
     else
@@ -7930,9 +7996,7 @@ function _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     for s in scale_uses
         s isa Symbol && return s # A data-column scale: opaque anchor, never resolved.
     end
-    _sfail("response $lhs: fully-fixed mixture (all literals) is a " *
-        "constant density with no plan — leave at least one slot free " *
-        "or drop the response")
+    return lhs
 end
 
 const _LEVELED_FAMS =
@@ -8406,12 +8470,14 @@ function _dot2call_spine_arg(lhs, f, i, a)
     elseif f === :NegativeBinomial2 && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :NegativeBinomial && i == 1
+        a isa Real && return a
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :HurdlePoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :ZeroInflatedPoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :InverseGaussian && i == 1
+        a isa Real && return a
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Exponential && i == 1
         return _dot2call_nested_link(lhs, a, f)
@@ -8590,7 +8656,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         :ZeroInflatedPoisson, :ZeroInflatedBinomial, :InverseGaussian, :Exponential,
         :BetaBinomial2, :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
         return _lower_response_base_error(lhs, rhs, fam)
-    args = _plain_args(rhs, "`$fam`")
+    args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
@@ -8642,7 +8708,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial` takes " *
                                     "`NegativeBinomial.(exp.(eta), p)`")
         return NegativeBinomialFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        _exp_response_location(lhs, args[1]), args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Weibull
         length(args) == 2 || _sfail("response $lhs: `Weibull` takes " *
@@ -8705,7 +8771,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `InverseGaussian` takes " *
                                     "`InverseGaussian.(exp.(eta), lambda)`")
         return InverseGaussianFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        _exp_response_location(lhs, args[1]), args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Exponential
         length(args) == 1 || _sfail("response $lhs: `Exponential` takes " *
@@ -8814,6 +8880,11 @@ function _lower_beta_args(lhs, args, ctx)
     length(args) == 2 ||
         _sfail("response $lhs: `Beta` takes $_BETA_MSG")
     a1, a2 = args
+    swapped = a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
+        a1.args[1] === Symbol(".*") && a1.args[2] isa Expr &&
+        a1.args[2].head === :call && length(a1.args[2].args) == 3 &&
+        a1.args[2].args[1] === Symbol(".-") && a1.args[2].args[2] == 1
+    swapped && ((a1, a2) = (a2, a1))
     a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
         a1.args[1] === Symbol(".*") ||
         _sfail("response $lhs: `Beta` first position is `mu .* kappa` " *
@@ -8836,7 +8907,7 @@ function _lower_beta_args(lhs, args, ctx)
         "response $lhs: both `Beta` positions must name the same kappa " *
         "(got $(repr(k1)) and $(repr(k2)))")
     loc = _lower_link_arg(lhs, _dot2call_nested_link(lhs, m1, :Beta), :logistic)
-    return loc, k1
+    return swapped ? Expr(:call, Symbol(".-"), loc) : loc, k1
 end
 
 function _lower_response_base_error(lhs, rhs, fam)
@@ -9269,6 +9340,7 @@ function _is_scalar_coef_def(s::Symbol, ctx, allow_stated::Bool)
     _derived_reads_latent(s, ctx) && return false
     get(ctx.detshape, s, :scalar) === :scalar || return false
     rhs = ctx.detmap[s]
+    _contains_scan(rhs, ctx.scan_states) && return false
     rhs isa Symbol || return false
     rhs in ctx.data && return false
     rhs in ctx.vecdefs && return false
@@ -10509,22 +10581,13 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
         end
         push!(terms, term)
     end
-    # Zero-coefficient predictors: bare-data affines (a non-empty all-
-    # offset summand list) and beta-free monotonic (`mo1`) predictors are
-    # admitted — both evaluate the likelihood over a coefficient-free LP
-    # (data for offsets, the increment-simplex contrast for `mo1`) with an
-    # empty coefficient layout. Any other coefficient-free shape
-    # (latent/effect/spline/hsgp/scan-only, or an empty summand list)
-    # stays fail-closed: a scan summand needs a sibling coefficient
-    # (SB's `ar` always pairs with an intercept).
-    # A composed sub-predictor may be varying-effect-only (brms
-    # `theta ~ 0 + (1 | person)`): its coefficients live in the draws.
-    # HSGP-summand-only predictors are admitted too (SB `0 + hsgp(x)`,
-    # brm_hsgp): the basis weights are self-priored.
+    # Coefficient-free values and self-priored trajectory/basis terms can
+    # feed a predictor directly; an empty predictor still has no value.
     if isempty(uses) && !(!isempty(terms) &&
             all(t -> t.kind === OffsetTerm ||
                 t.kind === MonotonicSummandTerm ||
                 t.kind === HSGPSummandTerm ||
+                t.kind === ScanSummandTerm ||
                 (composed_sub && t.kind === VaryingEffectTerm), terms))
         _sfail("predictor $pname has no estimated coefficients — add an " *
                "intercept or coefficient (bare-data offset affines and " *
@@ -10651,11 +10714,8 @@ function _classify_summand(pname, core, sign::Int, ctx)
         return _classify_dar(pname, core, sign, ctx)
     end
     if _contains_scan(core, ctx.scan_states)
-        _is_scan_product(core) ||
-            _sfail("predictor $pname: scan states lower only as direct " *
-                  "scaled summands (`mu = a .+ b .* u`), not nested in " *
-                  "$(repr(core))")
-        return _classify_scan(pname, core, sign, ctx)
+        return _is_scan_product(core) ? _classify_scan(pname, core, sign, ctx) :
+            _extract_summand(pname, core, sign, ctx)
     end
     if _contains_mo1(core)
         _is_mo1_call(core) ||
@@ -10870,46 +10930,24 @@ _is_scan_product(core) =
 # (checked disjoint from predictor coefficients after lowering) and lowers
 # to a `SampledParameter`, never a population prior.
 function _classify_scan(pname, core::Expr, sign::Int, ctx)
-    where = "predictor $pname"
     factors = core.args[2:end]
-    length(factors) == 2 ||
-        _sfail("$where scales a scan state with $(length(factors)) " *
-              "factors — write `coef .* state` exactly, got $(repr(core))")
+    length(factors) == 2 || return _extract_summand(pname, core, sign, ctx)
     stripped = [_strip_sign(f) for f in factors]
     inner = sign * prod(first, stripped)
-    inner > 0 ||
-        _sfail("$where negates a scan summand — summands are additive " *
-              "only (write `.+ b .* u`)")
     states = [g for (_, g) in stripped if g isa Symbol && g in ctx.scan_states]
-    if isempty(states)
-        _sfail("$where nests a scan read inside $(repr(core)) — scan " *
-              "states lower only as direct scaled summands " *
-              "(`mu = a .+ b .* u`)")
-    end
-    length(states) == 1 ||
-        _sfail("$where combines two scan states in $(repr(core)) — " *
-              "products of latents are nonlinear (one `coef .* state` " *
-              "summand per scan read)")
     others = [g for (_, g) in stripped if !(g isa Symbol && g in ctx.scan_states)]
+    (inner > 0 && length(states) == 1 && length(others) == 1) ||
+        return _extract_summand(pname, core, sign, ctx)
     coef = only(others)
-    coef isa Symbol ||
-        _sfail("$where scales scan state :$(only(states)) by " *
-              "$(repr(coef)) — scan coefficients are bare sampled " *
-              "scalars (`b .* u`)")
-    coef in ctx.data &&
-        _sfail("$where scales scan state :$(only(states)) by the data " *
-              "column $coef — data-varying (interaction) scalings are planned")
-    (coef in ctx.vecdefs || coef in ctx.plate_names) &&
-        _sfail("$where scales scan state :$(only(states)) by $coef, " *
-              "which is vector-valued — scan coefficients are scalars")
-    haskey(ctx.detmap, coef) &&
-        _sfail("$where scales scan state :$(only(states)) by the " *
-              "computed scalar $coef — computed coefficients are not " *
-              "in slice 1")
-    coef in ctx.prior_names ||
-        _sfail("$where scales scan state :$(only(states)) by $coef, " *
-              "which has no `~` statement — scan coefficients are " *
-              "sampled scalars (`$coef ~ Normal(0, 1)`)")
+    if coef isa Symbol && coef ∉ ctx.prior_names && coef ∉ ctx.data &&
+            !haskey(ctx.detmap, coef) && coef ∉ ctx.scan_states &&
+            coef ∉ ctx.plate_names
+        _sfail("predictor $pname reads undeclared coefficient $coef")
+    end
+    # Preserve the compact direct-splice IR for a sampled scalar. Other
+    # arithmetic over a trajectory is an ordinary derived vector value.
+    (coef isa Symbol && coef in ctx.prior_names && coef ∉ ctx.sized_decls) ||
+        return _extract_summand(pname, core, sign, ctx)
     push!(ctx.scan_coefs, coef)
     label = Symbol("scan_", pname, "_", only(states))
     return TermSpec(ScanSummandTerm, ColumnRef[],
@@ -11104,17 +11142,21 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     # (Design matrices never reach here as bare summands: named
     # definitions screen them at extraction, inline locations at the
     # location arm, and dotted compositions at canonicalization.)
-    (core in ctx.data || core in ctx.vecdefs) &&
+    if core in ctx.data || core in ctx.vecdefs
+        # An offset has no signed coefficient coordinate. Keep a negative
+        # summand in its value expression instead of discarding the sign.
+        sign < 0 && return _extract_summand(pname,
+            Expr(:call, :.-, core), 1, ctx)
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
+    end
     core in ctx.plate_names && _sfail(
         "predictor $pname: bare latent $core is not a term — scale it " *
         "by a coefficient (`b .* $core`, the SB `me` mirror)")
     if core in ctx.scan_states
         # A bare scan state is a beta-free summand: the state spliced
-        # unscaled (`mu = a .+ x`, the dar/`mo1` shape). Additive only.
-        sign > 0 || _sfail("predictor $pname negates the scan state " *
-            "$core — scan summands are additive only (write `.+ $core`)")
+        # unscaled (`mu = a .+ x`, the dar/`mo1` shape). Negation is a value.
+        sign > 0 || return _extract_summand(pname, Expr(:call, :.-, core), 1, ctx)
         label = Symbol("scan_", pname, "_", core)
         return TermSpec(ScanSummandTerm, ColumnRef[],
             (scan_id = core, coef = nothing), label, label), nothing
@@ -11671,9 +11713,9 @@ function _lower_horseshoe_priors(sample, coefuse, predictors,
                         (horseshoe_raw_name(pred.name, addr), :normal,
                             (arg1 = 0, arg2 = 1), nothing),
                         (horseshoe_lambda_name(pred.name, addr), :cauchy,
-                            (arg1 = 0, arg2 = ls), :positive_stan),
+                            (arg1 = 0, arg2 = ls), :positive),
                         (horseshoe_tau_name(pred.name, addr), :cauchy,
-                            (arg1 = 0, arg2 = gs), :positive_stan))
+                            (arg1 = 0, arg2 = gs), :positive))
                     nm in taken && _sfail(
                         "horseshoe over $(pred.name): synthesized $nm " *
                         "collides with a model name — rename yours")
@@ -12040,8 +12082,8 @@ end
 # A scalar coefficient prior the affine block can carry: a coefficient
 # family over positional literal/name arguments (expression arguments are
 # names by now — `_hoist_prior_args!`), literal `Uniform` bounds and
-# literal StudentT `nu`. Anything else (keyword halves such as
-# `Normal(0, s; lower=0)`, parameter bounds) is an ordinary parameter
+# literal StudentT `nu`. Anything else (half or truncated distributions,
+# parameter bounds) is an ordinary parameter
 # prior. Arity mistakes stay with the coefficient path's message.
 function _coef_prior_expressible(rhs)
     args = rhs.args[2:end]
@@ -12204,7 +12246,7 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Normal => :normal, :Cauchy => :cauchy,
     :Exponential => :exponential, :Gamma => :gamma,
     :LogNormal => :lognormal, :Beta => :beta,
-    :InverseGamma => :inverse_gamma, :StudentT => :student_t,
+    :InverseGamma => :inverse_gamma, :StudentT => :student_t, :TDist => :student_t,
     :Laplace => :laplace, :Logistic => :logistic, :Uniform => :uniform,
     :Weibull => :weibull,
 )
@@ -12790,81 +12832,21 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
     haskey(_PARAM_FAMILIES, fam) ||
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
-               "Beta, InverseGamma, StudentT, Laplace, Logistic, Uniform, Weibull, " *
+               "Beta, InverseGamma, StudentT, TDist, Laplace, Logistic, Uniform, Weibull, " *
                "HalfNormal, HalfCauchy, Flat, " *
                "Dirichlet, LKJCovarianceFactor, truncated). If `$fam` is " *
                "meant as a submodel, define it with " *
                "`@rkppl $fam(args...) = begin ... end` and " *
                "make it visible in the lowering module (`mod=`).")
-    if any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end])
-        return _lower_stan_half_param(lhs, rhs, fam, coefuse, matrices)
-    end
-    args = _plain_args(rhs, "`$fam`")
+    any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end]) &&
+        _sfail("parameter $lhs: `$fam` does not take support keywords; " *
+            "use `truncated($fam(args...), lo, hi)`, `HalfNormal(s)`, " *
+            "or `HalfCauchy(s)` for a normalized positive prior")
+    args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
     vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in args]
     argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
     return SampledParameter(lhs, _PARAM_FAMILIES[fam],
         NamedTuple{argkeys}(Tuple(vals)), nothing, lhs)
-end
-
-# Stan-kernel halves: `s ~ Normal(0, sc; lower=0)` (and the other
-# symmetric bases) lowers to the `:positive_stan` support override — the
-# bare symmetric density on positive support with NO `+log(2)`
-# renormalizer, matching Stan's `real<lower=0>` + `~ normal()` kernel and
-# the posteriordb reference kernels. This is the complement of
-# `HalfNormal(sc)` / `truncated(Normal(0, sc), 0, Inf)`, which are the
-# PROPER (renormalized) halves. IR validation, layout, and generation
-# already cover `:positive_stan`; this is only the surface spelling.
-# Admitted narrowly: exactly `lower=0` (literal zero), symmetric base,
-# literal-zero location. Anything else fails closed naming the form.
-function _lower_stan_half_param(lhs, rhs, fam, coefuse, matrices)
-    kws = Expr[]
-    posargs = Any[]
-    for a in rhs.args[2:end]
-        if a isa Expr && a.head === :parameters
-            append!(kws, a.args)
-        else
-            push!(posargs, a)
-        end
-    end
-    for kw in kws
-        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-            _sfail("parameter $lhs: Stan-kernel halves take exactly " *
-                   "`lower=0` (`$fam(0, s; lower=0)`), got $(repr(kw))")
-        k = kw.args[1]
-        k === :lower || _sfail(k === :upper ?
-            "parameter $lhs: `upper=` is spelled `truncated(Normal(mu, s), " *
-            "-Inf, hi)` — `; lower=0` is the only admitted prior keyword" :
-            "parameter $lhs: unknown prior keyword `$k` — the only " *
-            "admitted prior keyword is `lower=0` " *
-            "(`$fam(0, s; lower=0)`)")
-        v = kw.args[2]
-        v isa Real && v == 0 ||
-            _sfail("parameter $lhs: Stan-kernel `lower` must be literal " *
-                   "0, got $(repr(v))")
-    end
-    length(kws) == 1 ||
-        _sfail("parameter $lhs: Stan-kernel halves take exactly one " *
-               "keyword (`$fam(0, s; lower=0)`)")
-    haskey(_TRUNCATED_BASES, fam) ||
-        _sfail("parameter $lhs: `; lower=0` needs a symmetric base " *
-               "(Normal, Cauchy, StudentT, Laplace, Logistic) with " *
-               "zero location — `$fam` carries its own support " *
-               "(`HalfNormal`/`truncated` are already positive; " *
-               "`Uniform` carries its interval)")
-    arity, locpos = _TRUNCATED_BASES[fam]
-    length(posargs) == arity ||
-        _sfail("parameter $lhs: `$fam` takes $arity positional " *
-               "arguments (`$fam(0, s; lower=0)`), got " *
-               "$(length(posargs))")
-    loc = posargs[locpos]
-    loc isa Real && loc == 0 ||
-        _sfail("parameter $lhs: Stan-kernel `; lower=0` requires " *
-               "literal zero location (the half shape truncates at 0), " *
-               "got $(repr(loc))")
-    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in posargs]
-    argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
-    return SampledParameter(lhs, _PARAM_FAMILIES[fam],
-        NamedTuple{argkeys}(Tuple(vals)), :positive_stan, lhs)
 end
 
 function _lower_param_arg(lhs, a, coefuse, matrices)
@@ -12880,72 +12862,12 @@ function _lower_param_arg(lhs, a, coefuse, matrices)
 end
 
 function _lower_flat(lhs, rhs)
-    posargs = Any[]
-    kws = Expr[]
-    for a in rhs.args[2:end]
-        if a isa Expr && a.head === :parameters
-            append!(kws, a.args)
-        else
-            push!(posargs, a)
-        end
-    end
-    isempty(posargs) ||
-        _sfail("parameter $lhs: `Flat()` takes no arguments in slice 1")
-    isempty(kws) &&
-        return SampledParameter(lhs, :flat, NamedTuple(), nothing, lhs)
-    return _lower_flat_support(lhs, kws)
-end
-
-# Flat with support: `Flat(; lower=0)` (positive, Stan kernel),
-# `Flat(; upper=hi)` (upper-bounded), `Flat(; lower=lo, upper=hi)`
-# (finite interval). Improper throughout: density 0.0, Jacobian only —
-# the posteriordb flat-sigma / flat-interval shape (e.g. radon_county
-# sigmas, kidscore/wells flat sigmas). Bounds are finite literals;
-# one-sided lower at nonzero has no spelling (no :floored override in
-# slice 1) and fails closed naming the admitted forms.
-function _lower_flat_support(lhs, kws::Vector{Expr})
-    have_lower = false
-    have_upper = false
-    lower = NaN
-    upper = NaN
-    for kw in kws
-        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-            _sfail("parameter $lhs: flat support takes `lower=`/`upper=` " *
-                   "(`Flat(; lower=0)`, `Flat(; upper=hi)`, or " *
-                   "`Flat(; lower=lo, upper=hi)`), got $(repr(kw))")
-        k, v = kw.args[1], kw.args[2]
-        k === :lower || k === :upper ||
-            _sfail("parameter $lhs: unknown flat keyword `$k` — " *
-                   "admitted: `Flat(; lower=0)`, `Flat(; upper=hi)`, " *
-                   "`Flat(; lower=lo, upper=hi)`")
-        v isa Real && isfinite(v) ||
-            _sfail("parameter $lhs: flat `$k` must be a finite " *
-                   "literal, got $(repr(v))")
-        if k === :lower
-            lower = Float64(v)
-            have_lower = true
-        else
-            upper = Float64(v)
-            have_upper = true
-        end
-    end
-    if have_lower && !have_upper
-        lower == 0 || _sfail("parameter $lhs: one-sided flat `lower` " *
-                             "must be literal 0 (`Flat(; lower=0)` for " *
-                             "positive support); a lower bound at $lower " *
-                             "needs its pair (`Flat(; lower=$lower, " *
-                             "upper=hi)` with $lower < hi)")
-        return SampledParameter(lhs, :flat, NamedTuple(),
-            :positive_stan, lhs)
-    end
-    if have_upper && !have_lower
-        return SampledParameter(lhs, :flat, NamedTuple(),
-            (:upper, upper), lhs)
-    end
-    lower < upper || _sfail("parameter $lhs: flat interval needs " *
-                            "lower < upper, got ($lower, $upper)")
-    return SampledParameter(lhs, :flat, NamedTuple(),
-        (:interval, lower, upper), lhs)
+    any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end]) &&
+        _sfail("parameter $lhs: `Flat()` has no support keywords; use " *
+            "`Exponential(s)` for a positive prior, `Uniform(lo, hi)` for " *
+            "a bounded uniform, or `Flat()` for an improper real prior")
+    isempty(rhs.args[2:end]) || _sfail("parameter $lhs: `Flat()` takes no arguments")
+    return SampledParameter(lhs, :flat, NamedTuple(), nothing, lhs)
 end
 
 # `HalfNormal(s)` / `HalfCauchy(s)` lower to the `:positive` support

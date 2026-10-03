@@ -701,8 +701,8 @@ end
 @testset "nb1 response failures" begin
     Dn2 = (:y, :x)
     # Arity: exactly (r, p).
-    # capability: one-arg Distributions NegativeBinomial(r) (p = 0.5 default) (todo `139j2uo`)
-    @test_broken (lower_rkppl(quote
+    # admitted: one-arg Distributions NegativeBinomial(r) (p = 0.5 default) (todo `139j2uo`)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
@@ -1377,8 +1377,8 @@ end
 @testset "ig response failures" begin
     Dn2 = (:y, :x)
     # Arity: exactly (mu, lambda).
-    # capability: one-arg Distributions InverseGaussian(mu) (lambda = 1 default) (todo `139j2uo`)
-    @test_broken (lower_rkppl(quote
+    # admitted: one-arg Distributions InverseGaussian(mu) (lambda = 1 default) (todo `139j2uo`)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
@@ -1429,8 +1429,8 @@ end
 @testset "weibull response failures" begin
     Dn2 = (:y, :x)
     # Arity: exactly (k, theta).
-    # capability: one-arg Distributions Weibull(k) (theta = 1 default) (todo `139j2uo`)
-    @test_broken (lower_rkppl(quote
+    # admitted: one-arg Distributions Weibull(k) (theta = 1 default) (todo `139j2uo`)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
@@ -1636,8 +1636,8 @@ end
 @testset "lognormal response failures" begin
     Dn2 = (:y, :x)
     # Arity: exactly (mu, sigma).
-    # capability: one-arg Distributions LogNormal(mu) (sigma = 1 default) (todo `139j2uo`)
-    @test_broken (lower_rkppl(quote
+    # admitted: one-arg Distributions LogNormal(mu) (sigma = 1 default) (todo `139j2uo`)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
@@ -1720,8 +1720,8 @@ end
         p .~ Beta.(normcdf.(mu) .* kappa, (1 .- normcdf.(mu)) .* kappa)
     end, Dp2; conditioned = Dp2); true)
     # Beta: canonical argument order only.
-    # capability: Beta arguments in swapped order (a valid Beta(alpha, beta)) (todo `139j2uo`)
-    @test_broken (lower_rkppl(quote
+    # admitted: Beta arguments in swapped order (a valid Beta(alpha, beta)) (todo `139j2uo`)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 1000.0)

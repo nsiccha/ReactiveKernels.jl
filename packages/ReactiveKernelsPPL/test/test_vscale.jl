@@ -640,7 +640,7 @@ end
 
 @testset "vscale: gaussian evidence reads the per-cell scale" begin
     cols = _vs_cols()
-    mk(ev) = bind_data(lower_rkppl(quote
+    mk(ev; columns = cols) = bind_data(lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)
@@ -648,7 +648,7 @@ end
                 mu = a .+ b .* x
                 sigma = c .+ d .* z
                 y .~ $ev
-            end, (:y, :x, :z); conditioned = (:y, :x, :z)), cols)
+            end, (:y, :x, :z); conditioned = (:y, :x, :z)), columns)
     u = [0.5, -0.25, 0.1, 0.2]
     function _lps(built)
         nt = constrain(built.layout, u)
@@ -670,16 +670,19 @@ end
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;
         rtol = 1e-12, atol = 1e-12)
     _check_gradient(built.spec, plan, u)
-    # Censored (upper-only literal bound; hi=2.0 exercises both arms; the
-    # y == 2.0 rows are censored observations per the clamp law).
-    plan = mk(:(censored.(Normal.(mu, exp.(sigma)), -Inf, 2.0)))
+    # Censored observations obey the clamp law. Keep the original out-of-bound
+    # responses as a refusal check, then bind their observed, saturated values.
+    censored = :(censored.(Normal.(mu, exp.(sigma)), -Inf, 2.0))
+    @test_throws ContractValidationError mk(censored)
+    censored_cols = merge(cols, Dict(:y => min.(cols[:y], 2.0)))
+    plan = mk(censored; columns = censored_cols)
     built = build_kernel(plan)
     muv, sgv, pr = _lps(built)
     ll = sum(
-        cols[:y][i] >= 2.0 ?
+        censored_cols[:y][i] == 2.0 ?
             log1p(-cdf(Normal(muv[i], sgv[i]), 2.0)) :
-            logpdf(Normal(muv[i], sgv[i]), cols[:y][i])
-        for i in eachindex(cols[:y]))
+            logpdf(Normal(muv[i], sgv[i]), censored_cols[:y][i])
+        for i in eachindex(censored_cols[:y]))
     @test isapprox(_query(built.spec, plan, :likelihood, u), ll;
         rtol = 1e-12, atol = 1e-12)
     @test isapprox(_query(built.spec, plan, :posterior, u), ll + pr;

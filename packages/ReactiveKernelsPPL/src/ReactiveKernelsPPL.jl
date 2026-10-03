@@ -82,9 +82,9 @@ export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
 export varying_coefs, varying_coefs_correlated, varying_coefs_centered,
     varying_coefs_centered_correlated, varying_stratified,
     varying_stratified_correlated
-export tps_basis, t2_basis, hsgp_basis, hsgp_periodic_basis, hsgp_sqrt_spd,
+export tps_basis, cr_basis, t2_basis, hsgp_basis, hsgp_periodic_basis, hsgp_sqrt_spd,
     hsgp_grouped_sqrt_spd, hsgp_periodic_sqrt_spd, hsgp_rho_floors,
-    hsgp_periodic_rho_floor
+    hsgp_periodic_rho_floor, hsgp_matern_sqrt_spd, hsgp_periodic_grouped_sqrt_spd
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export DarSpec
 export LINEAR_EVENT_READ, LINEAR_EVENT_DOSE, LINEAR_EVENT_DOSE_SEGMENT
@@ -137,6 +137,7 @@ include("preprocessing.jl")
 include("generator.jl")
 include("arrays.jl")
 include("query.jl")
+include("distribution_defaults.jl")
 include("surface.jl")
 include("scan.jl")
 include("qt_joint.jl")

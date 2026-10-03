@@ -12,7 +12,7 @@
 # named is resolved (user chose independent+reconcile, scan-lane decision
 # `0bowtxh`); the centered primitive landed on main @ `7fd989c`.
 #
-# Grammar — one or more carried arrays (a tuple carry), literal backward lags:
+# Grammar — one or more carried arrays (a tuple carry), literal or bound-integer backward lags:
 #   @scan begin
 #       x[1] = 0.0                        # setup: every carried array is seeded at
 #       d[1] = 0.0                        #   1..m, by a deterministic `=` or a
@@ -26,7 +26,7 @@
 #       end
 #   end
 # Statements run in order, as in a Julia loop body: a step reads a carried
-# array's backward lag `a[t-k]` (k ≥ 1 literal, k ≤ m), its current value `a[t]`
+# array's backward lag `a[t-k]` (1 ≤ k ≤ m; a literal or bound integer), its current value `a[t]`
 # once an earlier step of the same iteration wrote it, and locals defined by
 # earlier steps. Each carried array is written exactly once per step. The
 # observation lives OUTSIDE the block (`y .~ Normal.(h, 1)`), so it is not
@@ -50,7 +50,8 @@ function _scan_parse_dist(call, what)
     haskey(_PARAM_FAMILIES, fam) || _scan_fail(
         "$what: unknown distribution `$(repr(fam))` (admitted: Normal, " *
         "Cauchy, Exponential, Gamma, LogNormal, Beta, InverseGamma)")
-    return _PARAM_FAMILIES[fam], collect(Any, _plain_args(call, "`$(fam)`"))
+    return _PARAM_FAMILIES[fam], collect(Any,
+        _distribution_args(fam, _plain_args(call, "`$(fam)`")))
 end
 
 """
@@ -92,9 +93,8 @@ function parse_scan_block(block; label::Union{Symbol,Nothing} = nothing)
     _scan_check_order(step, states, loopvar)
 
     maxlag = _scan_maxlag(step, states, loopvar)
-    maxlag >= 1 || _scan_fail(
-        "no backward lag read of a carried array in the body — independent " *
-        "cells are `@plate`, not `@scan`")
+    any(k -> k isa Symbol, Iterators.flatten(values(_scan_lags(step, states, loopvar)))) &&
+        (maxlag = m)
     m >= maxlag || _scan_fail(
         "the recurrence reads a lag of $(maxlag) but only $(m) initial " *
         "value(s) are seeded per carried array; add fills up to index $(maxlag)")
@@ -347,8 +347,9 @@ function _scan_lag_of(idx, state, loopvar)
     if idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
        idx.args[1] === :- && idx.args[2] === loopvar
         k = idx.args[3]
-        k isa Int && k >= 1 && return k
-        _scan_fail("lag depth in `$(state)[$(loopvar)-…]` must be a literal " *
+        k isa Int && !(k isa Bool) && k >= 1 && return k
+        k isa Symbol && return k
+        _scan_fail("lag depth in `$(state)[$(loopvar)-…]` must be a literal or data " *
                    "integer ≥ 1, got $(repr(k))")
     end
     if idx isa Expr && idx.head === :call && length(idx.args) == 3 &&
@@ -363,7 +364,7 @@ end
 # Distinct backward lags `a[loopvar - k]` read across a scan's steps, per
 # carried array (current-value reads `a[loopvar]` are not lags).
 function _scan_lags(step, states, loopvar)
-    lags = Dict{Symbol,Set{Int}}(a => Set{Int}() for a in states)
+    lags = Dict{Symbol,Set{Union{Int,Symbol}}}(a => Set{Union{Int,Symbol}}() for a in states)
     walk(ex) = begin
         if ex isa Expr
             if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in states
@@ -390,101 +391,45 @@ function _scan_lags(step, states, loopvar)
 end
 
 _scan_maxlag(step, states, loopvar) =
-    maximum((isempty(l) ? 0 : maximum(l) for l in values(
+    maximum((maximum((k for k in l if k isa Int); init = 0) for l in values(
         _scan_lags(step, states, loopvar))); init = 0)
 
-# Shapes the parser admits but the emitter does not build yet, as one rule
-# shared by lowering (`SurfaceLoweringError`, so a program fails where it is
-# written) and the generator (`ContractValidationError`, for hand-built
-# plans). Returns the first gap's message, or `nothing`:
-# - a centered scan (`state[t] ~ dist`) is one carried array, sampled seeds
-#   and exactly one step;
-# - a non-centered scan writes every carried array deterministically, has at
-#   least one per-step innovation, and its latents (sampled seeds,
-#   innovations) have real support;
-# The loop index is an ordinary per-step value.
-const _SCAN_LATENT_FAMILIES = (:normal, :cauchy, :student_t, :laplace, :logistic)
-
+# Scalar continuous distributions keep their declared support and density.
+# The layout owns the support transforms; recurrence samples remain ordered.
 function _scan_shape_gap(s::ScanSpec)
-    who = "scan $(join(s.states, ", "))"
-    carried = [st for st in s.step if st.indexed]
-    if !_is_noncentered_scan(s)
-        length(s.states) == 1 || return "$who: a centered scan " *
-            "(`state[t] ~ dist`) carries one array; a tuple carry writes each " *
-            "array deterministically (`state[t] = …`) from sampled innovations"
-        all(f -> f.kind === :sample, s.setup) || return "$who: a centered " *
-            "scan samples its seeds (`$(only(s.states))[1] ~ dist`); a " *
-            "deterministic seed needs the non-centered form " *
-            "(`eps ~ Normal(0, 1)`, `$(only(s.states))[t] = …`)"
-        length(s.step) == 1 || return "$who: a centered recurrence is " *
-            "exactly one step (`$(only(s.states))[$(s.loopvar)] ~ dist`); " *
-            "per-step locals need the non-centered form (innovation samples " *
-            "+ deterministic carry writes)"
-        return nothing
+    for st in (s.setup..., s.step...)
+        st.kind === :sample || continue
+        haskey(SAMPLED_SUPPORT, st.family) || return "scan $(join(s.states, ", ")): " *
+            "sampled family :$(st.family) has no scalar continuous support"
     end
-    for st in carried
-        st.kind === :sample && return "$who: `$(st.target)[$(s.loopvar)] ~ …` " *
-            "samples a carried array while another carried write is " *
-            "deterministic — mixing centered and non-centered carried writes " *
-            "in one scan is not supported yet"
-    end
-    real = "real support (Normal, Cauchy, StudentT, Laplace or Logistic)"
-    for f in s.setup
-        (f.kind === :sample && !(f.family in _SCAN_LATENT_FAMILIES)) &&
-            return "$who: the sampled seed `$(f.target)[$(f.index)]` of a " *
-            "non-centered scan must have $real; got :$(f.family)"
-    end
-    innov = [st for st in s.step if st.kind === :sample && !st.indexed]
-    for st in innov
-        st.family in _SCAN_LATENT_FAMILIES || return "$who: the innovation " *
-            "`$(st.target)` must have $real; got :$(st.family)"
-    end
-    isempty(innov) && return "$who: a non-centered scan needs a per-step " *
-        "innovation (`eps ~ Normal(0, 1)`); a fully deterministic recurrence " *
-        "is not supported yet"
     return nothing
 end
 
-# Whether `ex` reads the loop index `nm` outside a carried array's index
-# (`a[t - 1]`, `a[t]` are carried reads, not loop-index reads).
-_scan_mentions(ex, nm::Symbol, states) = ex === nm ||
-    (ex isa Expr &&
-     !(ex.head === :ref && !isempty(ex.args) && ex.args[1] in states) &&
-     any(a -> _scan_mentions(a, nm, states),
-        ex.head === :call ? ex.args[2:end] : ex.args))
-
-# Lowering-time screen of a parsed scan: an emitter gap (`_scan_shape_gap`)
-# or a data read inside the recurrence fails where the program is written.
-# Seeds and steps read scalars (parameters, definitions, literals); a data
-# column read per step (`y[t]`) is not supported yet.
+# Shared lowering-time check; data reads are ordinary captured values.
 function _screen_scan(s::ScanSpec, data)
-    exprs = Tuple{Any,Set{Symbol}}[]
-    for f in s.setup
-        append!(exprs, ((a, Set{Symbol}(data)) for a in
-            (f.kind === :sample ? f.args : Any[f.expr])))
-    end
-    stepdata = setdiff(Set{Symbol}(data), Set([s.loopvar]))
-    for st in s.step
-        append!(exprs, ((a, stepdata) for a in
-            (st.kind === :sample ? st.args : Any[st.expr])))
-    end
-    for (ex, visible_data) in exprs
-        d = _scan_data_read(ex, visible_data)
-        d === nothing || _scan_fail("scan $(join(s.states, ", ")) reads the " *
-            "data column `$(d)` — data-varying seeds and steps are not " *
-            "supported yet (a scan reads carried arrays, locals and scalars)")
-    end
     gap = _scan_shape_gap(s)
     gap === nothing || _scan_fail(gap)
     return nothing
 end
 
-function _scan_data_read(ex, data)
-    ex isa Symbol && return ex in data ? ex : nothing
-    ex isa Expr || return nothing
-    for a in (ex.head === :call ? ex.args[2:end] : ex.args)
-        d = _scan_data_read(a, data)
-        d === nothing || return d
+# Bound integer lags choose a field of the authored seed-depth window. The
+# window's shape stays fixed; the data never expand a recurrence body.
+function _resolve_scan(plan::StructuralPlan, s::ScanSpec)
+    function resolve(ex)
+        ex isa Expr || return ex
+        if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in s.states &&
+                ex.args[2] !== s.loopvar
+            k = _scan_lag_of(ex.args[2], ex.args[1], s.loopvar)
+            if k isa Symbol
+                value = get(plan.columns, k, nothing)
+                (value isa Integer && !(value isa Bool) && 1 <= value < s.lo) ||
+                    _fail(s.label, "scan lag $k must bind an integer in 1:$(s.lo - 1), got $(repr(value))")
+                return Expr(:ref, ex.args[1], Expr(:call, :-, s.loopvar, Int(value)))
+            end
+        end
+        return Expr(ex.head, map(resolve, ex.args)...)
     end
-    return nothing
+    step = [ScanStep(st.kind, st.target, st.indexed, st.family,
+        st.args === nothing ? nothing : map(resolve, st.args), resolve(st.expr)) for st in s.step]
+    return ScanSpec(s.states, s.loopvar, s.lo, s.hi, s.setup, step, s.maxlag, s.label)
 end

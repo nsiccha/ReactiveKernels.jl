@@ -63,9 +63,8 @@ using Test
                 mu = phi[node1] .- phi[node2]
                 y .~ Normal.(mu, 1.0)
             end), (:y, :node1, :node2), SurfaceLoweringError),
-        # losscurve_sislob: Weibull/log-logistic CDF growth curve; no
-        # Weibull in the response vocabulary.
-        # capability: a Weibull observation with an ordinary parameter (todo `1qlbn5b`).
+        # losscurve_sislob: the ordinary Weibull shape parameter and literal
+        # scale are admitted by constructor-value lowering (`1qlbn5b`).
         ("losscurve_sislob", "Weibull response",
             :(begin
                 a ~ Normal(0, 1)
@@ -108,8 +107,8 @@ using Test
             end), (:y,), SurfaceLoweringError),
         # arma11: ARMA(1,1) sequential error recursion is deterministic
         # given data+params; a @scan seed and step that read the data
-        # column `y` (data-varying recurrences) are not built yet.
-        # capability: data-varying retained recurrences (P8 1cmodra) (todo `1qlbn5b`).
+        # column `y`, now supported. Density/gradient oracles for both models
+        # live in test_scan_recurrence_capabilities.jl.
         ("arma11", "data-varying scan recurrence",
             :(begin
                 mu ~ Normal(0.0, 5.0)
@@ -127,8 +126,7 @@ using Test
         # Prophet is admitted by ordinary-parameter fallback and checked
         # against an independent density oracle below.
         # garch11: GARCH(1,1) variance recursion is deterministic given
-        # data+params; same data-varying-recurrence gap.
-        # capability: data-varying retained recurrences (P8 1cmodra) (todo `1qlbn5b`).
+        # data+params, with a retained scan and ordinary indexed data reads.
         ("garch11", "data-varying scan recurrence",
             :(begin
                 m ~ Normal(0.0, 1.0)
@@ -145,11 +143,17 @@ using Test
                 y .~ Normal.(m, sigma)
             end), (:y,), SurfaceLoweringError),
     ]
-    capabilities = Set(["scalar-data likelihood", "literal prob rejected", "data-column mixture weights", "Weibull response", "data-varying scan recurrence"])
+    capabilities = Set(["scalar-data likelihood", "literal prob rejected"])
     for (item, label, prog, datanames, E) in cases
         @testset "$item: $label" begin
-            if label in ("literal prob rejected", "Weibull response")
-                @test !isempty(lower_rkppl(prog, datanames; conditioned=datanames).responses)
+            if label == "data-varying scan recurrence"
+                observed = item == "arma11" ? (:z,) : (:y,)
+                data = Dict{Symbol,Any}(:y => [0.3sin(t) for t in 1:4])
+                item == "arma11" && (data[:z] = zeros(4))
+                plan = bind_data(lower_rkppl(prog, datanames; conditioned = observed), data)
+                @test build_kernel(plan).spec isa KernelSpec
+            elseif label in ("literal prob rejected", "data-column mixture weights", "Weibull response")
+                @test lower_rkppl(prog, datanames; conditioned=datanames) isa StructuralPlan
             elseif label in capabilities
                 # capability: each entry above names a valid model shape (todo `1qlbn5b`).
                 @test_broken (lower_rkppl(prog, datanames; conditioned = datanames); true)

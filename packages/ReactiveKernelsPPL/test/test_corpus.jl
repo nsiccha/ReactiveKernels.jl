@@ -5,6 +5,8 @@
 # unbound plan. Any lowering drift fails loudly; re-bless deliberately with
 # RKPPL_REBLESS=1 after review, never to make red green.
 
+import ReactiveKernelsDistributionKernels
+
 const _CORPUS_DIR = joinpath(@__DIR__, "corpus")
 const _CORPUS_GOLDEN_DIR = joinpath(_CORPUS_DIR, "golden")
 
@@ -87,6 +89,8 @@ function _canon(io::IO, x, depth::Int = 0)
             (fs = filter(!=(:submodel_scopes), fs))
         x isa LikelihoodSpec && x.threshold_effects === nothing &&
             (fs = filter(!=(:threshold_effects), fs))
+        x isa LikelihoodSpec && isempty(x.mixture_trials) &&
+            (fs = filter(!=(:mixture_trials), fs))
         x isa StructuralPlan && isempty(x.conditioned) &&
             (fs = filter(!=(:conditioned), fs))
 
@@ -135,6 +139,11 @@ end
     other = ReactiveKernelsPPL._with(response; threshold_effects = :other_effects)
     @test occursin("threshold_effects=:effects", sprint(_canon, effects))
     @test sprint(_canon, effects) != sprint(_canon, other)
+    @test !occursin("mixture_trials=", sprint(_canon, response))
+    trials = ReactiveKernelsPPL._with(response; mixture_trials = Any[2, 3])
+    other_trials = ReactiveKernelsPPL._with(response; mixture_trials = Any[2, 4])
+    @test occursin("mixture_trials=[2 3]", sprint(_canon, trials))
+    @test sprint(_canon, trials) != sprint(_canon, other_trials)
 end
 
 @testset "corpus drift guard" begin
@@ -191,7 +200,7 @@ end
         sprint(_canon, lower_rkppl(prog(group, margins, kws), data; conditioned = data))
     # Only supported defaults participate in parity. The removed centered
     # keyword's refusal is checked in test_varying_centered.jl.
-    plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(Normal(0, 1))]
+    plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(HalfNormal(1))]
     mm_group = :(mm(g1, g2))
     mm_spelled = :(mm(g1, g2; normalize = true))
     gr_group = :(gr(g; by = b))

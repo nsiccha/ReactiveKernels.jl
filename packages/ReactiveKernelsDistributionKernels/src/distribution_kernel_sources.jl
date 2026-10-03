@@ -1543,96 +1543,86 @@ docs_example = (;
 )
 """
 
-# Exact-GP latent construct (plain Julia functions, NOT @kernel sources:
-# the PPL splices these calls into generated code like any other Julia
-# call, and Enzyme differentiates the straight-line arithmetic natively).
-# Native path only: Reactant reverse through dense Cholesky gradients is
-# upstream-blocked (EnzymeMLIR), so XLA over these stays unverified until
-# that gap closes. Written traceably (broadcasts/loops, no LAPACK) for that
-# day — the potrf below is pure Julia precisely because Enzyme cannot
-# differentiate LAPACK.
+# Vector-location GP covariance is an RK pair plate. Matrix locations use
+# broadcast/reduction helpers. Dense factorization remains a numerical leaf;
+# covariance support does not imply compiled Cholesky AD.
 export gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
 
-"""
-    gp_exp_quad_cov(x, sigma, rho, jitter) -> Matrix{Float64}
+include("gp_covariance.jl")
 
-Isotropic squared-exponential covariance (Stan `gp_exp_quad_cov` math):
-`K[i,j] = σ² exp(−(xᵢ−xⱼ)² / 2ρ²)`, plus `jitter` on the diagonal.
-`x` is one axis (iso first); `sigma`/`rho` are positive scalars.
-Matrix locations (aniso) are sequenced and fail closed; the periodic
-sibling is `gp_periodic_cov`. Validates args (`ArgumentError`, never
-silent `NaN`s).
+"""
+    gp_exp_quad_cov(x, sigma, rho, jitter)
+
+Squared-exponential covariance plus diagonal jitter. A vector holds
+one-dimensional locations; each row of a matrix is one multi-dimensional
+location. `rho` is a positive scalar or, for matrix locations, one length
+scale per column. The kernel is
+`sigma^2 * exp(-sum(((x[i,:]-x[j,:])./rho).^2)/2)`.
 """
 function gp_exp_quad_cov(x::AbstractVector, sigma::Real, rho::Real,
         jitter::Real)
-    n = length(x)
-    n >= 1 || throw(ArgumentError(
-        "gp_exp_quad_cov needs at least one location, got n = $n"))
-    sigma > 0 || throw(ArgumentError(
-        "gp_exp_quad_cov sigma must be positive, got $sigma"))
-    rho > 0 || throw(ArgumentError(
-        "gp_exp_quad_cov rho must be positive, got $rho"))
-    isfinite(jitter) && jitter >= 0 || throw(ArgumentError(
-        "gp_exp_quad_cov jitter must be finite and nonnegative, got $jitter"))
-    s2 = Float64(sigma)^2
-    denom = 2 * Float64(rho)^2
-    jit = Float64(jitter)
-    K = Matrix{Float64}(undef, n, n)
-    @inbounds for j_ in 1:n, i in 1:n
-        d = Float64(x[i]) - Float64(x[j_])
-        K[i, j_] = s2 * exp(-d * d / denom) + (i == j_ ? jit : 0.0)
-    end
-    return K
+    _GP_EXP_QUAD_COV(x, sigma, rho, jitter)
 end
 
-function gp_exp_quad_cov(x::AbstractMatrix, sigma::Real, rho,
-        jitter::Real)
-    throw(ArgumentError(
-        "gp_exp_quad_cov with matrix locations (aniso, one rho per axis) " *
-        "is sequenced after the isotropic slice — pass one axis vector"))
+function gp_exp_quad_cov(x::AbstractMatrix, sigma::Real,
+        rho::Union{Real,AbstractVector}, jitter::Real)
+    _gp_cov_args(x, sigma, rho, jitter)
+    delta = _gp_differences(x) ./ _gp_axis_scale(rho)
+    distance2 = dropdims(sum(delta .* delta; dims=3); dims=3)
+    return sigma^2 .* exp.(-0.5 .* distance2) .+ _gp_jitter(size(x,1), jitter)
 end
 
 """
-    gp_periodic_cov(x, sigma, rho, period, jitter) -> Matrix{Float64}
+    gp_periodic_cov(x, sigma, rho, period, jitter)
 
-Isotropic periodic covariance (Stan `gp_periodic_cov` math):
-`K[i,j] = σ² exp(−2 sin²(π|xᵢ−xⱼ|/period) / ρ²)`, plus `jitter` on the
-diagonal. `x` is one axis (SB admits one isotropic axis only);
-`sigma`/`rho`/`period` are positive scalars. Matrix locations fail
-closed, as does a non-positive period. Validates args (`ArgumentError`,
-never silent `NaN`s).
+Isotropic periodic covariance plus diagonal jitter. A vector holds one
+axis; each row of a matrix is one multi-dimensional location. Uses the
+Euclidean distance `r = norm(x[i,:]-x[j,:])`, as in Stan's periodic
+covariance: `sigma^2 * exp(-2sin(pi*r/period)^2/rho^2)`.
+`rho` and `period` are positive scalars.
 """
 function gp_periodic_cov(x::AbstractVector, sigma::Real, rho::Real,
         period::Real, jitter::Real)
-    n = length(x)
-    n >= 1 || throw(ArgumentError(
-        "gp_periodic_cov needs at least one location, got n = $n"))
-    sigma > 0 || throw(ArgumentError(
-        "gp_periodic_cov sigma must be positive, got $sigma"))
-    rho > 0 || throw(ArgumentError(
-        "gp_periodic_cov rho must be positive, got $rho"))
-    isfinite(period) && period > 0 || throw(ArgumentError(
-        "gp_periodic_cov period must be finite and positive, got $period"))
-    isfinite(jitter) && jitter >= 0 || throw(ArgumentError(
-        "gp_periodic_cov jitter must be finite and nonnegative, got $jitter"))
-    s2 = Float64(sigma)^2
-    r2 = Float64(rho)^2
-    per = Float64(period)
-    jit = Float64(jitter)
-    K = Matrix{Float64}(undef, n, n)
-    @inbounds for j_ in 1:n, i in 1:n
-        d = abs(Float64(x[i]) - Float64(x[j_]))
-        s = sin(pi * d / per)
-        K[i, j_] = s2 * exp(-2 * s * s / r2) + (i == j_ ? jit : 0.0)
-    end
-    return K
+    _GP_PERIODIC_COV(x, sigma, rho, period, jitter)
 end
 
 function gp_periodic_cov(x::AbstractMatrix, sigma::Real, rho::Real,
         period::Real, jitter::Real)
-    throw(ArgumentError(
-        "gp_periodic_cov with matrix locations is out of slice " *
-        "(SB admits one isotropic axis only) — pass one axis vector"))
+    _gp_cov_args(x, sigma, rho, jitter)
+    isfinite(period) && period > 0 || throw(ArgumentError(
+        "gp_periodic_cov period must be finite and positive"))
+    delta = _gp_differences(x)
+    distance = sqrt.(dropdims(sum(delta .* delta; dims=3); dims=3))
+    sine = sin.((pi / period) .* distance)
+    return sigma^2 .* exp.((-2 / rho^2) .* sine .* sine) .+
+        _gp_jitter(size(x,1), jitter)
+end
+
+# Broadcast/reduction kernels: no body replication with location count or
+# dimension. All arrays are fresh, and caller-owned locations stay read-only.
+_gp_differences(x::AbstractMatrix) =
+    reshape(x, size(x,1), 1, size(x,2)) .-
+        reshape(x, 1, size(x,1), size(x,2))
+_gp_axis_scale(rho::Real) = rho
+_gp_axis_scale(rho::AbstractVector) = reshape(rho, 1, 1, :)
+_gp_jitter(n, jitter) = jitter .* (collect(1:n) .== permutedims(collect(1:n)))
+
+function _gp_cov_args(x, sigma, rho, jitter)
+    size(x,1) > 0 && size(x,2) > 0 || throw(ArgumentError("GP locations must be nonempty"))
+    all(isfinite, x) || throw(ArgumentError("GP locations must be finite"))
+    isfinite(sigma) && sigma > 0 || throw(ArgumentError("GP sigma must be finite and positive"))
+    _gp_rho_args(rho, size(x,2))
+    isfinite(jitter) && jitter >= 0 || throw(ArgumentError("GP jitter must be finite and nonnegative"))
+    return nothing
+end
+function _gp_rho_args(rho::Real, d)
+    isfinite(rho) && rho > 0 || throw(ArgumentError("GP rho must be finite and positive"))
+    return nothing
+end
+function _gp_rho_args(rho::AbstractVector, d)
+    length(rho) == d || throw(DimensionMismatch("GP requires one length scale per location axis"))
+    all(r -> isfinite(r) && r > 0, rho) || throw(ArgumentError("GP length scales must be finite and positive"))
+    return nothing
 end
 
 """

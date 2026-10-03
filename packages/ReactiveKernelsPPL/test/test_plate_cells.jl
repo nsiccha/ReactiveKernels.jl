@@ -139,22 +139,57 @@ end
         :(mu = a .+ c[g]), :(y .~ Normal.(mu, 1.0))), data; conditioned = data)
     @test lower(:(c[k] ~ Normal(m[k], 1))) isa StructuralPlan
     @test lower(:(c[k] = 2.0)) isa StructuralPlan
-    selected = quote
-        z[levels(g)[2:end]] .~ Normal.(0, 1)
-        @plate for k in levels(g)
-            c[k] = z[k]
-        end
-        y .~ Normal.(c[g], 1)
+end
+
+@testset "per-level cells align selected and different level axes" begin
+    for kind in (:selected, :reordered, :other, :other_selected, :varying,
+            :matrix_selected, :matrix_other, :lazy, :live, :live_oob), S in (3, 5)
+        built, bound, cols, u, oracle = _plv_axis_build(kind, 2S + 1, S)
+        saved = deepcopy(cols)
+        expected, c = oracle(u)
+        @test prepare_query(built, bound, :sampler)(u) ≈ expected
+        @test _query(built.spec, bound, :c, u) ≈ c
+        @test _check_gradient(built.spec, bound, u) ≈
+            _findiff_grad(w -> first(oracle(w)), u) rtol = 1e-5 atol = 1e-7
+        @test cols == saved
     end
-    @test_throws SurfaceLoweringError lower_rkppl(selected, (:y, :g); conditioned = (:y, :g))
-    otheraxis = quote
+    for kind in (:selected, :other)
+        labels = ["c", "a", "b", "unused"]
+        built, bound, cols, u, oracle = _plv_axis_build(kind, 9, 4;
+            labels, pooled = true)
+        @test prepare_query(built, bound, :sampler)(u) ≈ first(oracle(u))
+        @test _query(built.spec, bound, :c, u) ≈ last(oracle(u))
+        @test _check_gradient(built.spec, bound, u) ≈
+            _findiff_grad(w -> first(oracle(w)), u) rtol = 1e-5 atol = 1e-7
+        @test levels(cols[:g]) == labels
+    end
+    for kind in (:selected, :other, :other_selected)
+        built, bound, cols, u, oracle = _plv_axis_build(kind, 9, 3;
+            labels = ["c", "a", "b"])
+        @test prepare_query(built, bound, :sampler)(u) ≈ first(oracle(u))
+        @test _check_gradient(built.spec, bound, u) ≈
+            _findiff_grad(w -> first(oracle(w)), u) rtol = 1e-5 atol = 1e-7
+    end
+    built, bound, cols, u, oracle = _plv_stack_build(9, 3)
+    @test prepare_query(built, bound, :sampler)(u) ≈ first(oracle(u))
+    @test _query(built.spec, bound, :c, u) ≈ last(oracle(u))
+    @test _check_gradient(built.spec, bound, u) ≈
+        _findiff_grad(w -> first(oracle(w)), u) rtol = 1e-5 atol = 1e-7
+    # A different declared axis still needs coverage of every loop label.
+    prog = quote
         z[levels(h)] .~ Normal.(0, 1)
         @plate for k in levels(g)
             c[k] = z[k]
         end
         y .~ Normal.(c[g], 1)
     end
-    @test_throws SurfaceLoweringError lower_rkppl(otheraxis, (:y, :g, :h); conditioned = (:y, :g, :h))
+    plan = lower_rkppl(prog, (:y, :g, :h); conditioned = (:y,))
+    @test_throws ContractValidationError bind_data(plan,
+        Dict(:y => zeros(3), :g => [2, 4, 6], :h => [0, 2, 4]))
+    @test_throws ContractValidationError bind_data(plan,
+        Dict(:y => zeros(3),
+            :g => categorical([2, 4, 2]; levels = [2, 4, 6]),
+            :h => categorical([0, 2, 4]; levels = [0, 2, 4])))
 end
 
 @testset "per-level assignments keep inactive branches inactive" begin

@@ -325,8 +325,8 @@ end
         plate_ast([good_cell[1], :(yy .~ Normal(mu, sigma)), :mu], [subj]), data; conditioned = data)
     # Arity message generalized to digits when the joint families joined
     # the obs table (same fail-closed behavior).
-    # capability: 1-arg `Normal.(mu)` (Distributions default sigma = 1) in cells (todo `139j2uo`)
-    @test_broken (lower_rkppl(
+    # admitted: 1-arg `Normal.(mu)` (Distributions default sigma = 1) in cells (todo `139j2uo`)
+    @test (lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ Normal.(mu)), :mu], [subj]), data; conditioned = data); true)
     # capability: inline expression arguments in in-cell observations (`Normal.(mu .+ 1.0, sigma)`) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(
@@ -355,9 +355,7 @@ end
     # refused: collected name `zz` is undeclared (P6, 05oe96l)
     @test_throws "not a cell name" lower_rkppl(
         plate_ast([good_cell[1], good_cell[2], :zz], [subj]), data; conditioned = data)
-    # Plate alongside a top-level response: the plate no longer carries
-    # the only likelihood (hand-built plan — the surface would trip on
-    # the response's predictor first).
+    # A plate may carry a likelihood beside a top-level response.
     resp = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s, nothing,
         ResponseEvidence(:none, nothing, nothing), :y_resp)
     pred_spec = PredictorSpec(:mu, IdentityLink,
@@ -373,8 +371,7 @@ end
         PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0)],
         [sparam], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
         kernel_plates = [kp_hand])
-    # capability: kernel-plate likelihood alongside top-level responses (v2 contract; hand-built plan) (todo `1308iv0`)
-    @test_broken (validate_structure(both_plan); true)
+    @test validate_structure(both_plan) === nothing
     # Two panel plates in one model (v2: panels compose freely —
     # distinct cell names; shared names trip single-assignment first).
     # A shared subjects dims key consumes once.
@@ -395,10 +392,10 @@ end
         plate_ast(cell2, [subj]; params = [:ts2, :d2, :yy2]).args[3])
     # refused: plate result `pred` defined twice (single assignment)
     @test_throws "defined twice" lower_rkppl(dupe, data; conditioned = data)
-    # Responseless GLM plans (no plate) still fail as before.
+    # Prior-only declarations are valid model statements.
     nolhs = Expr(:block, Expr(:call, :~, :sigma, Expr(:call, :Exponential, 1.0)))
-    # capability: responseless (prior-only) model (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(nolhs, (:y,); conditioned = (:y,)); true)
+    # admitted: prior-only model (already supported on the canonical base).
+    @test (lower_rkppl(nolhs, (:y,); conditioned = (:y,)); true)
 end
 
 @testset "kernel cell + bind fail-closed battery" begin
@@ -424,10 +421,15 @@ end
     # capability: per-subject series reductions (`mean(ts)`) in a panel cell (panel v1) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(
         plate_ast([:(m = mean(ts)), mu_stmt, obs_stmt, :mu]), data; conditioned = data); true)
-    # Whole-column GP functions are whole-model constructs.
-    # capability: whole-column vocabulary functions (`gp_exp_quad_cov`) inside a panel cell (todo `0bfiemp`)
-    @test_broken (lower_rkppl(
-        plate_ast([:(m = gp_exp_quad_cov(ts)), mu_stmt, obs_stmt, :mu]), data; conditioned = data); true)
+    # Supported: module functions consume whole values in ordinary
+    # plate cells (P3; todo `0bfiemp`), with explicit covariance arguments.
+    @test validate_structure(lower_rkppl(quote
+        @plate for i in eachindex(y)
+            cs = cumsum(grid)
+            K = gp_exp_quad_cov(grid,1.0,1.0,1e-9)
+            y[i] ~ Normal(sum(K) + sum(cs),1.0)
+        end
+    end,(:y,:grid);conditioned=(:y,:grid))) === nothing
     # Cross-cell refs fail closed.
     # refused: undeclared name `zz` (P6, 05oe96l)
     @test_throws "unknown name" lower_rkppl(
@@ -659,8 +661,9 @@ end
     # Hand-bound plans verify the twin (verified, not trusted).
     notwin = deepcopy(bound)
     delete!(notwin.columns, ReactiveKernelsPPL._kbool_name(:pred, :yy))
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (ReactiveKernelsPPL._validate_kernels_data(notwin); true)
+    # refused: a hand-bound plan deleted the required Bernoulli Bool twin;
+    # this is missing generated metadata, rather than a Bool numeric value.
+    @test_throws ContractValidationError ReactiveKernelsPPL._validate_kernels_data(notwin)
     u = [0.5]
     eta = 0.5 .* _AXIS2_DEX .* _AXIS2_T
     p = 1 ./ (1 .+ exp.(-eta))
@@ -903,7 +906,7 @@ end
     stray = merge(dims, Dict{Symbol,Int}(:kernel_T_preed => 3))
     # refused: stray dims key not consumed by any plate (wrong data)
     @test_throws "not consumed by any kernel plate" bind_data(unbound, columns; dims = stray)
-    # Top-level responses alongside plates name every plate result.
+    # Several plates may contribute beside a top-level response.
     resp = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, :s, nothing,
         ResponseEvidence(:none, nothing, nothing), :y_resp)
     pred_spec = PredictorSpec(:mu, IdentityLink,
@@ -920,16 +923,15 @@ end
         [sparam], AssignmentSpec[], Dict{Symbol,AbstractVector}(), 0;
         kernel_plates = [mkplate(:pred1, :t, :ts),
             mkplate(:pred2, :t2, :ts2)])
-    # capability: kernel plates alongside top-level responses (v2 contract; hand-built plan) (todo `1308iv0`)
-    @test_broken (validate_structure(both2); true)
+    @test validate_structure(both2) === nothing
     # Hand-bound n_obs must be the lanes sum (positive control first).
     bound = bind_data(unbound, columns; dims = dims)
     mkhand(n) = StructuralPlan(bound.responses, bound.predictors,
         bound.population_priors, bound.parameters, bound.assignments,
         bound.columns, n; kernel_plates = bound.kernel_plates)
     @test validate_data(mkhand(7)) === nothing
-    # refused: hand-bound n_obs != total kernel lanes (IR contract)
-    @test_throws "total kernel lanes" validate_data(mkhand(6))
+    # refused: hand-bound n_obs differs from the total likelihood lanes.
+    @test_throws "total likelihood lanes" validate_data(mkhand(6))
     # A shared subjects key consumes once (all-scalar pair).
     shr = quote
         b0 ~ Normal(0.0, 1.0)
@@ -980,4 +982,3 @@ end
         dims = Dict{Symbol,Int}(:kernel_nsub_p1 => 2, :kernel_nsub_p2 => 2,
             :Tee => 3))
 end
-

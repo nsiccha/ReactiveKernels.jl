@@ -29,11 +29,57 @@ function tps_basis(x::AbstractVector{<:Real}; k::Integer = 10)
 end
 
 """
-    t2_basis(x, z; k = (5, 5)) -> (X, Zrr, Zrn, Znr)
+    tps_basis(x, z; k = 10) -> (X, Z)
 
-Tensor-product (`t2`) cubic regression spline basis over the data vectors
-`x` and `z`, with per-margin basis dimensions `k` (an integer for both
-margins, or a `(k1, k2)` pair, each `> 2`).
+Isotropic two-dimensional thin-plate regression spline. The radial kernel
+is `r^2 log(r) / (8pi)` (zero at `r = 0`), with null space `(1, x, z)`.
+`X` contains the two centered linear columns; `Z` has `k - 3` whitened
+penalized columns. Requires `k > 3`, at least `k` distinct locations and
+a full-rank polynomial null space. Use with [`penalized_smooth`](@ref).
+"""
+function tps_basis(x::AbstractVector{<:Real}, z::AbstractVector{<:Real};
+        k::Integer = 10)
+    length(x) == length(z) || throw(DimensionMismatch("TPS axes must have equal lengths"))
+    points = hcat(Float64.(x), Float64.(z))
+    all(isfinite, points) || _rk_spline_fail("TPS locations must be finite")
+    k > 3 || _rk_spline_fail("two-axis TPS needs k > 3")
+    length(unique(eachrow(points))) >= k || _rk_spline_fail("TPS needs at least k distinct locations")
+    centered = points .- mean(points; dims=1)
+    T = hcat(ones(length(x)), centered)
+    rank(T) == 3 || _rk_spline_fail("two-axis TPS needs non-collinear locations")
+    E = Matrix{Float64}(undef, length(x), length(x))
+    for j in axes(E, 2), i in axes(E, 1)
+        r2 = sum(abs2, centered[i, :] .- centered[j, :])
+        E[i, j] = iszero(r2) ? 0.0 : r2 * log(r2) / (16pi)
+    end
+    projection = _rk_tps_projection(E, T, Int(k))
+    return (centered, E * projection)
+end
+
+"""
+    cr_basis(x; k = 10) -> (X, Z)
+
+Natural cubic regression spline, using quantile knots and the integrated
+squared-second-derivative penalty. `X` is the centered linear null column
+(the constant is omitted); `Z` has `k - 2` whitened range columns.
+"""
+function cr_basis(x::AbstractVector{<:Real}; k::Integer = 10)
+    N, R = _rk_apply_cr_spline(_rk_fit_cr_spline(x; k=Int(k)), x)
+    return (Matrix(N[:, 2:2]), Matrix(R))
+end
+
+"""
+    t2_basis(axes...; k = 5) -> (X, penalized_blocks...)
+
+Tensor-product (`t2`) cubic regression spline basis over one or more data
+vectors. `k` is one integer for every margin, or one per margin, each `> 2`.
+For `d` margins, `X` has `2^d - 1` centered null-space products (the
+constant product is omitted). The `2^d - 1` penalized blocks follow
+descending binary masks, with range = 1 and null = 0, the first margin
+the most significant bit. Each block takes its own smoothing sd; within
+a block the last margin varies fastest. One margin returns `(X, Z)`.
+
+For two margins:
 
 - `X` (`n × 3`): the unpenalized null-space products, column-centered (the
   constant product is left out; the model's intercept owns it).
@@ -41,28 +87,21 @@ margins, or a `(k1, k2)` pair, each `> 2`).
   null, null × range), of widths `(k1-2)(k2-2)`, `2(k1-2)` and `2(k2-2)`,
   each penalized by its own smoothing sd.
 
-These are the columns the built-in `spline_basis(:id, x, z; k)` binds. Use
-them with [`t2_smooth`](@ref).
+For two margins these are the columns the built-in
+`spline_basis(:id, x, z; k)` binds. Use them with [`t2_smooth`](@ref).
 """
-function t2_basis(x::AbstractVector{<:Real}, z::AbstractVector{<:Real};
-        k = (5, 5))
-    kk = _t2_k(k)
-    X, rr, rn, nr = _rk_apply_t2(_rk_fit_t2(x, z; k = kk), x, z)
-    return (Matrix{Float64}(X), Matrix{Float64}(rr), Matrix{Float64}(rn),
-        Matrix{Float64}(nr))
+function t2_basis(axes_::AbstractVector{<:Real}...; k = 5)
+    isempty(axes_) && throw(ArgumentError("t2_basis takes at least one margin"))
+    kk = Tuple(Int.(_per_axis(k, length(axes_), :k)))
+    return _rk_apply_t2(_rk_fit_t2(axes_...; k=kk), axes_...)
 end
-
-_t2_k(k::Integer) = (Int(k), Int(k))
-_t2_k(k::Tuple{Integer,Integer}) = (Int(k[1]), Int(k[2]))
-_t2_k(k) = throw(ArgumentError(
-    "t2_basis: `k` is an integer or a `(k1, k2)` pair, got $(repr(k))"))
 
 # One value per axis: a scalar applies to every axis, a tuple or vector
 # gives one entry per axis.
 _per_axis(v::Number, d::Int, what) = fill(v, d)
 function _per_axis(v::Union{Tuple,AbstractVector}, d::Int, what)
     length(v) == d || throw(ArgumentError(
-        "hsgp_basis: `$what` takes one value or one per axis ($d), got " *
+        "`$what` takes one value or one per axis ($d), got " *
         repr(v)))
     return collect(v)
 end
@@ -179,7 +218,7 @@ Hilbert-space approximate GP basis for the periodic kernel with the given
 them with [`hsgp_periodic_effect`](@ref).
 """
 function hsgp_periodic_basis(x::AbstractVector{<:Real}; k::Integer = 20,
-        period::Real)
+        period::Real, by = nothing)
     k > 0 || throw(ArgumentError("hsgp_periodic_basis: `k` must be positive"))
     isfinite(period) && period > 0 || throw(ArgumentError(
         "hsgp_periodic_basis: `period` must be finite and positive"))
@@ -189,7 +228,68 @@ function hsgp_periodic_basis(x::AbstractVector{<:Real}; k::Integer = 20,
     w0 = 2.0 * pi / Float64(period)
     PHI = hcat((cos.((w0 * j) .* xs) for j in 1:k)...,
         (sin.((w0 * j) .* xs) for j in 1:k)...)
-    return (Matrix{Float64}(PHI), vcat(collect(1:Int(k)), collect(1:Int(k))))
+    basis = by === nothing ? Matrix{Float64}(PHI) : _grouped_basis(PHI, by)
+    return (basis, vcat(collect(1:Int(k)), collect(1:Int(k))))
+end
+
+"""
+    hsgp_periodic_basis(x, z, axes...; k = 20, period, by = nothing)
+
+Separable periodic Fourier basis over multiple axes. `k` and `period` are
+scalar or per-axis. Includes constant, cosine and sine factors on each
+axis and omits only the all-constant product, leaving `prod(2k .+ 1)-1`
+columns. The returned harmonic matrix has one row per column and one
+column per axis, including zero for a constant factor. `by` uses the
+same group-fastest ordering as [`hsgp_basis`](@ref).
+"""
+function hsgp_periodic_basis(x::AbstractVector{<:Real},
+        z::AbstractVector{<:Real}, rest::AbstractVector{<:Real}...;
+        k = 20, period, by = nothing)
+    axes_ = (x, z, rest...)
+    d, n = length(axes_), length(x)
+    all(a -> length(a) == n, axes_) || throw(DimensionMismatch("periodic axes must have equal lengths"))
+    K = Int.(_per_axis(k, d, :k))
+    periods = _per_axis(period, d, :period)
+    margins = map(1:d) do j
+        P, h = hsgp_periodic_basis(axes_[j]; k=K[j], period=periods[j])
+        (hcat(ones(n), P), vcat(0, h))
+    end
+    indices = vec(collect(CartesianIndices(Tuple(2 .* K .+ 1))))[2:end]
+    PHI = Matrix{Float64}(undef, n, length(indices))
+    harmonics = Matrix{Int}(undef, length(indices), d)
+    for (m, I) in enumerate(indices)
+        col = copy(margins[1][1][:, I[1]])
+        for j in 2:d
+            col .*= margins[j][1][:, I[j]]
+        end
+        PHI[:, m] = col
+        harmonics[m, :] = [margins[j][2][I[j]] for j in 1:d]
+    end
+    return (by === nothing ? PHI : _grouped_basis(PHI, by), harmonics)
+end
+
+"""
+    hsgp_matern_sqrt_spd(lambda, sigma, rho, nu)
+
+Square root of the d-dimensional Matérn spectral density, evaluated at
+the Laplacian eigenvalues from [`hsgp_basis`](@ref). `nu` is explicitly
+positive (`1.5` for Matérn 3/2, `2.5` for Matérn 5/2); `rho` is a scalar
+or one length scale per axis. Angular-frequency convention of Solin &
+Särkkä (2020), https://doi.org/10.1007/s11222-019-09886-w.
+"""
+function hsgp_matern_sqrt_spd(lambda::AbstractMatrix, sigma::Number, rho, nu::Real)
+    nu > 0 && isfinite(nu) || throw(ArgumentError("Matérn nu must be finite and positive"))
+    d = size(lambda, 2)
+    r = _matern_rho(rho, d)
+    c = d * log(2.0) + (d/2) * log(pi) +
+        SpecialFunctions.loggamma(nu + d/2) - SpecialFunctions.loggamma(nu) + nu * log(2nu)
+    return sigma .* exp.(0.5 .* (c + sum(log.(r)) .-
+        (nu + d/2) .* log.(2nu .+ lambda * (r .* r))))
+end
+_matern_rho(rho::Number, d) = fill(rho, d)
+function _matern_rho(rho::AbstractVector, d)
+    length(rho) == d || throw(DimensionMismatch("one Matérn length scale per axis is required"))
+    return rho
 end
 
 """
@@ -240,9 +340,36 @@ through the exponentially scaled `besselix` so it never overflows.
 function hsgp_periodic_sqrt_spd(harmonics::AbstractVector, sigma::Number,
         rho::Number)
     a = 1.0 / (rho * rho)
-    return exp.(log(sigma) .+ 0.5 .* (0.6931471805599453 .+
+    return sigma .* exp.(0.5 .* (0.6931471805599453 .+
         log.(SpecialFunctions.besselix.(harmonics, a))))
 end
+
+function hsgp_periodic_sqrt_spd(harmonics::AbstractMatrix, sigma::Number, rho)
+    r = _matern_rho(rho, size(harmonics, 2))
+    a = permutedims(1.0 ./ (r .* r))
+    logweights = log.(SpecialFunctions.besselix.(harmonics, a)) .+
+        log(2.0) .* (harmonics .!= 0)
+    return sigma .* exp.(0.5 .* vec(sum(logweights; dims=2)))
+end
+
+"""
+    hsgp_periodic_grouped_sqrt_spd(harmonics, sigma, rho)
+
+Periodic spectral weights with one scale and isotropic length scale per
+group (or shared scalars), flattened in group-fastest basis order.
+"""
+function hsgp_periodic_grouped_sqrt_spd(harmonics::AbstractVector, sigma, rho)
+    a = 1.0 ./ (rho .* rho)
+    return vec(sigma .* sqrt.(2.0 .* SpecialFunctions.besselix.(permutedims(harmonics), a)))
+end
+function hsgp_periodic_grouped_sqrt_spd(harmonics::AbstractMatrix, sigma, rho)
+    a = reshape(1.0 ./ (_group_vector(rho) .* _group_vector(rho)), :, 1, 1)
+    h = reshape(harmonics, 1, size(harmonics)...)
+    logweights = log.(SpecialFunctions.besselix.(h, a)) .+ log(2.0) .* (h .!= 0)
+    return vec(_group_vector(sigma) .* exp.(0.5 .* dropdims(sum(logweights; dims=3); dims=3)))
+end
+_group_vector(x::Number) = [x]
+_group_vector(x::AbstractVector) = x
 
 """
     hsgp_rho_floors(lambda) -> Vector{Float64}
@@ -270,3 +397,5 @@ which the highest harmonic's spectral weight falls to 1/100 of the first's
 """
 hsgp_periodic_rho_floor(harmonics::AbstractVector) =
     _hsgp_periodic_rho_lower(maximum(harmonics))
+hsgp_periodic_rho_floor(harmonics::AbstractMatrix) =
+    maximum(_hsgp_periodic_rho_lower(maximum(col)) for col in eachcol(harmonics))

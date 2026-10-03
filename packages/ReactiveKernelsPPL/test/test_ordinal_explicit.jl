@@ -250,7 +250,7 @@ end
         log(nt.sigma) + sum(logpdf.(Normal(), w)) +
         sum(logpdf.(Normal.(nt.a .+ w[3] .* cols[:x], nt.sigma),
             cols[:z]))
-    # `k` beyond the level count leaves an empty axis: bind refuses it.
+    # `k` equal to the level count leaves an empty axis: w[1] has no element.
     empty = _oe_lower(quote
         a ~ Normal(0, 1)
         w[1:length(levels(g)) - 4] .~ Normal.(0, 1)
