@@ -1,6 +1,9 @@
 using Reactant
 
-function _probability_value_inventory(hlo)
+function _probability_value_inventory(hlo,label=nothing)
+    if label !== nothing && haskey(ENV,"RK_PPL_ACCEPTANCE_HLO_DIR")
+        write(joinpath(ENV["RK_PPL_ACCEPTANCE_HLO_DIR"],"$label.mlir"),hlo)
+    end
     counts=Dict{String,Int}()
     for m in eachmatch(r"\b(?:stablehlo|chlo|func|arith|enzyme|scf|tensor|cf|math|linalg|memref)\.\w+",hlo)
         counts[m.match]=get(counts,m.match,0)+1
@@ -37,8 +40,8 @@ end
         @test Float64(value) ≈ f.oracle(f.u)
         @test Array(gradient) ≈ _distributional_findiff(f.oracle,f.u) rtol=2e-5 atol=2e-7
         both=reverse.f
-        pair=(_probability_value_inventory(repr(Reactant.@code_hlo kernel(ru))),
-            _probability_value_inventory(repr(Reactant.@code_hlo both(ru))))
+        pair=(_probability_value_inventory(repr(Reactant.@code_hlo kernel(ru)),"probability-$family-$named-$scalar-$n-primal"),
+            _probability_value_inventory(repr(Reactant.@code_hlo both(ru)),"probability-$family-$named-$scalar-$n-reverse"))
         @test !isempty(pair[1]) && !isempty(pair[2])
         key=(family,named,scalar)
         n==15 ? (previous[key]=pair) : (@test pair==previous[key])

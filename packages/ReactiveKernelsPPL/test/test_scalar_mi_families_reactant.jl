@@ -38,8 +38,8 @@ using Reactant
             @test Array(gradient) ≈ _distributional_findiff(f.oracle,f.u) rtol=2e-5 atol=2e-7
             @test f.data == f.saved
             both=reverse.f
-            pair=(_probability_value_inventory(repr(Reactant.@code_hlo kernel(ru))),
-                _probability_value_inventory(repr(Reactant.@code_hlo both(ru))))
+            pair=(_probability_value_inventory(repr(Reactant.@code_hlo kernel(ru)),"scalar-$kind-$variant-$n-primal"),
+                _probability_value_inventory(repr(Reactant.@code_hlo both(ru)),"scalar-$kind-$variant-$n-reverse"))
             @test !isempty(pair[1]) && !isempty(pair[2])
             n==15 ? (previous[(kind,variant)]=pair) : (@test pair==previous[(kind,variant)])
             executable=(_probability_value_executable_inventory(compiled,"scalar-$kind-$variant-$n-primal"),
@@ -60,7 +60,7 @@ end
         ru=Reactant.to_rarray(f.u)
         compiled=Reactant.@compile kernel(ru)
         @test Array(only(values(compiled(ru)))) ≈ f.pointwise(f.u)
-        graph=_probability_value_inventory(repr(Reactant.@code_hlo kernel(ru)))
+        graph=_probability_value_inventory(repr(Reactant.@code_hlo kernel(ru)),"pointwise-$variant-$n-primal")
         @test !isempty(graph)
         n==15 ? (previous[variant]=graph) : (@test graph==previous[variant])
         executable=_probability_value_executable_inventory(compiled,"pointwise-$variant-$n-primal")
