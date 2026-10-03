@@ -187,6 +187,11 @@ scale prior is `HalfNormal(1)`; correlated margins use `LKJCholesky(K, 1.0)`.
 | `u ~ varying_stratified(g, s)` | One value per observation, with a scale per stratum | `u`, or slope `x .* u` |
 | `r ~ varying_stratified_correlated(g, s, K)` | One K-component row per observation, with scales and a correlation factor per stratum | `r[:, 1] .+ x .* r[:, 2]` |
 
+Scalar margins compose in the same way: `m = mean(x)` followed by
+`mu = a .+ m .* b[g]`. If the same `m` supplies a Gaussian scale in
+`y .~ Normal.(mu, m)`, binding evaluates the data reduction once and requires
+a finite, strictly positive result.
+
 These are the actual library definitions, read from the loaded submodels:
 
 ```@eval
