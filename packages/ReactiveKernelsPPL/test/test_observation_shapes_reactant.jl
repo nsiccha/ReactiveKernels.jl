@@ -6,18 +6,23 @@ function _os_compiled_fixture(bound, x, y; expected = nothing, gradient = nothin
         expected, gradient = _os_oracle(x, y, _OS_U)
     end
     original = deepcopy((x, y))
+    original_columns = deepcopy(bound.columns)
     built, post, sampler = _os_check(bound, expected, gradient)
     # Generated recipes must exist before entering the compilation world.
-    return Base.invokelatest(_os_compiled_measure, sampler, x, y, original,
+    operations = Base.invokelatest(_os_compiled_measure, sampler, x, y, original,
         expected, gradient)
+    @test bound.columns == original_columns
+    return operations
 end
 
 function _os_compiled_measure(sampler, x, y, original, expected, gradient)
     post, ad = sampler.kernel, sampler.ad
     ru = Reactant.to_rarray(_OS_U)
-    hlo = repr(Reactant.@code_hlo optimize = false post(ru))
+    # Check the ordinary executable pipeline, including optimization.
+    # Raw tracing can retain shape-dependent redundant broadcasts/constants.
+    hlo = repr(Reactant.@code_hlo post(ru))
     both(v) = ad_value_and_gradient(ad, v)
-    derivative_hlo = repr(Reactant.@code_hlo optimize = false both(ru))
+    derivative_hlo = repr(Reactant.@code_hlo both(ru))
     operations = Dict{String,Int}()
     for (prefix, ir) in (("primal.", hlo), ("ad.", derivative_hlo))
         for m in eachmatch(r"\b(?:stablehlo|chlo|enzyme|func|arith)\.\w+", ir)
@@ -83,5 +88,18 @@ end
     for (x, y) in (([0.5], Float64[]),
         (ones(1, 1), zeros(0, 2)), (ones(1, 2, 1), zeros(0, 2, 2)))
         _os_compiled_fixture(model(; x) | (; y), x, y)
+    end
+end
+
+@testset "compiled matrix-vector observation domains retain their structure" begin
+    for kind in (:prepared, :supplied, :inline, :broadcast_coefficients),
+            weighted_case in (false, true)
+        counts = map((6, 18)) do n
+            bound, x, y, w = _os_design_fixture(kind, n, weighted_case)
+            @test bound.n_obs == n
+            expected, gradient = _os_design_oracle(x, y, w)
+            _os_compiled_fixture(bound, x, y; expected, gradient)
+        end
+        @test counts[1] == counts[2]
     end
 end

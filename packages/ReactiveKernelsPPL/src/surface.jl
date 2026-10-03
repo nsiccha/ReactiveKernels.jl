@@ -1826,6 +1826,7 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     ex isa Expr || return :scalar
     shape(a) = _shape_of(a, data, detmap, memo, active, env)
     head = ex.head
+    head === :vect && return :array
     if head === :.
         # Over a declared array value the elementwise array rules apply
         # (`sd .* z` stays an array; `z .+ x` checks Julia's actual axes).
