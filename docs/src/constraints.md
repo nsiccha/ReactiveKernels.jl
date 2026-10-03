@@ -222,11 +222,3 @@ and lock the one Reactant 0.2.289 lifted:
   excluded by name from compiled parity and structure acceptance. Linear
   matrix gathers and positional gathers from module-produced arrays pass
   compiled primal, reverse and fixed-operation-count checks.
-
-- A one-dimensional traced view indexed by `CartesianIndex{1}` fails in
-  Reactant 0.2.290 because `Base.reindex` expects an index tuple:
-  `repro_reactant_simplex_view.jl`. Reactant's broadcast element-type probe
-  reaches that index in the existing simplex transform's `Float64.(view)`
-  nest. Dirichlet priors, including live concentrations, retain native
-  primal and Enzyme reverse support; compiled acceptance pins this exact
-  failure until the backend fixes it. The authored transform stays intact.
