@@ -1540,10 +1540,10 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
         locals[output_cid] = out
     end
     scalar_result = locals[result_cid]
-    materialized = Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), scalar_result)
+    pointwise = Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_pointwise), scalar_result)
     pointwise_lhs === nothing ||
-        push!(body.args, :($pointwise_lhs = $materialized))
+        push!(body.args, :($pointwise_lhs = $pointwise))
     total = Expr(:call,
         GlobalRef(@__MODULE__, :_tensorized_plate_sum), scalar_result)
     total_lhs === nothing || push!(body.args, :($total_lhs = $total))
@@ -1725,8 +1725,10 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     _embedded_statements(inner_ast, callargs, lhs, op_offset))
         end
     end
-    retval = length(p.want) == 1 ? nm(p.want[1]) :
-             Expr(:tuple, (nm(w) for w in p.want)...)
+    output(w) = tensorized ? Expr(:call,
+        GlobalRef(@__MODULE__, :_tensorized_plate_materialize), nm(w)) : nm(w)
+    retval = length(p.want) == 1 ? output(p.want[1]) :
+             Expr(:tuple, (output(w) for w in p.want)...)
     push!(body.args, Expr(:return, retval))
     Expr(:function, Expr(:tuple, argexprs...), body),
     Tuple(runtime_ops), Tuple(runtime_recipes)
