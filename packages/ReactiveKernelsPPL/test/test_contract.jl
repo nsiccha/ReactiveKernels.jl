@@ -2204,13 +2204,44 @@ end
     # refused: cumulative cutpoints not an ordered vector (simplex) (malformed distribution)
     @test_throws ContractValidationError _ordered_plan(;
         vecfam = :simplex_dirichlet)
-    # Explicit sizes assert both ways.
+    # A declared threshold extent states support, including unobserved levels
+    # (rkppl-use §4, "Cutpoints as an argument").
     @test (validate_plan(_ordered_plan(; vecsize = 2)); true)
-    # refused: explicit threshold size disagrees with K-1 (IR contract: size assertion)
-    @test_throws ContractValidationError _ordered_plan(; vecsize = 3)
+    for observed in ([1, 2, 3], [1, 3], [1, 4], [1], [1, 2, 3, 4])
+        cols = _leveled_columns(length(observed))
+        cols[:y] = observed
+        for n_levels in (nothing, 4)
+            declared = _ordered_plan(length(observed);
+                cols = cols, vecsize = 3, n_levels = n_levels)
+            @test validate_plan(declared) === nothing
+            @test only(declared.responses).n_levels == 4
+            @test only(declared.vector_parameters).size == 3
+        end
+    end
+    # Inferred support still requires observed levels 1..K without gaps.
+    for observed in ([1, 3], [2, 3])
+        cols = _leveled_columns(length(observed))
+        cols[:y] = observed
+        # refused: gaps cannot infer support (rkppl-use §4: inferred length)
+        @test_throws ContractValidationError _ordered_plan(length(observed);
+            cols = cols)
+    end
+    for observed in ([0, 1], [-1, 1], [1, 5], [1.0, 2.0], [true, true])
+        cols = _leveled_columns(length(observed))
+        cols[:y] = observed
+        # refused: codes must be non-Bool integers in declared 1..K (IR contract)
+        @test_throws ContractValidationError _ordered_plan(length(observed);
+            cols = cols, vecsize = 3)
+    end
+    # refused: observed category 3 lies outside declared 1..2 (IR contract)
+    @test_throws ContractValidationError _ordered_plan(; vecsize = 1)
+    # Explicit n_levels must agree with the declared threshold extent.
     @test (validate_plan(_ordered_plan(; n_levels = 3, vecsize = 2)); true)
-    # refused: explicit n_levels disagrees with the data's K (IR contract: size assertion)
+    # refused: explicit n_levels disagrees with threshold size+1 (IR contract)
     @test_throws ContractValidationError _ordered_plan(; n_levels = 2,
+        vecsize = 2)
+    # refused: explicit n_levels disagrees with threshold size+1 (IR contract)
+    @test_throws ContractValidationError _ordered_plan(; n_levels = 4,
         vecsize = 2)
     # K=1 is uniform: zero thresholds, zero-information likelihood.
     cols1 = _leveled_columns(6)
