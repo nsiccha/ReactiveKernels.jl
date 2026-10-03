@@ -212,9 +212,12 @@ function _validate_array_parameters(plan::StructuralPlan)
             end
             if p.family === :uniform
                 lo, hi = p.args.arg1, p.args.arg2
-                lo isa Real && hi isa Real && lo < hi || _fail(p.label,
-                    "array $(p.name): `Uniform.(lo, hi)` bounds are " *
-                    "literals with lo < hi, got ($(repr(lo)), $(repr(hi)))")
+                all(x -> !(x isa Real) || isfinite(x), (lo, hi)) ||
+                    _fail(p.label, "array $(p.name): Uniform bounds must be finite")
+                if lo isa Real && hi isa Real
+                    lo < hi || _fail(p.label, "array $(p.name): " *
+                        "Uniform bounds need lo < hi")
+                end
             end
             if nd == 2
                 # Two-axis arrays take shared (scalar) prior arguments:

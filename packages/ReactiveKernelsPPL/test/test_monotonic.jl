@@ -220,12 +220,14 @@ end
             mu = a .+ b .* contrast .* x
             y .~ Normal.(mu, 1.0)
         end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
-    # capability: mo() nested in an arithmetic subexpression (`b .* (mo(c, s) .+ x)`) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    # Admitted under the explicit-library direction (user 1cmodra):
+    # a monotonic submodel returns an ordinary value, which may nest.
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             s ~ Dirichlet(2, 1.0)
-            mu = a .+ b .* (mo(c, s) .+ x)
+            m ~ monotonic(c, s)
+            mu = a .+ b .* (m .+ x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
     # Named library contrast values remain usable through definitions.

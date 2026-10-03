@@ -437,7 +437,7 @@ function assign_layout(plan::StructuralPlan)
             offset += packed
             continue
         end
-        transform = p.family === :ordered_normal ? :ordered :
+        transform = _is_ordered_parameter(p.family) ? :ordered :
             p.family === :simplex_dirichlet ? :simplex :
             p.family === :positive_exponential ? :exp : :identity
         # `size` is the PACKED (unconstrained) length: a simplex packs
@@ -1822,7 +1822,9 @@ _vector_lr(e::LayoutEntry) = Symbol(:_ppl_vlr_, e.name)
 # Consumers gather from the vector (`Ref(v)` plate inputs, `v[idx]`).
 # Every leading/pivot slice is materialized: a
 # `vcat` mixing a `SubArray` and a `Vector` lowers through a Union-typed
-# path the native Enzyme reverse pass rejects. Size specializations
+# path the native Enzyme reverse pass rejects. Simplex slices use ordinary
+# range indexing to materialize an array before fused broadcasts; their
+# packed coordinates already have Float64 elements. Size specializations
 # (empty packs emit nothing — their consumers never read them; a one-element
 # ordered vector is its coordinate; a 1-simplex is the constant `[1.0]`)
 # are finite shape cases, never per-level expansion.
@@ -1994,7 +1996,7 @@ function jacobian_term(e::LayoutEntry)
         # reading the `_vector_transform_statements` temps (the host
         # `simplex_logjac`).
         e.size < 1 && return nothing
-        return :(sum(view($(_vector_lr(e)), 1:$(e.size)) .+
+        return :(sum($(_vector_lr(e))[1:$(e.size)] .+
             log.($(_vector_z(e))) .+ $(_vector_l(e))))
     end
     if e.kind === :plate || e.kind === :spline ||
