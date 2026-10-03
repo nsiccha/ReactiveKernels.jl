@@ -4259,12 +4259,8 @@ _has_cell_call(ex) = ex isa Expr && (
         (ex.args[1] in CELL_FNS || ex.args[1] in SEGMENT_CELL_FNS)) ||
     any(_has_cell_call, ex.args))
 
-function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
-        data::Set{Symbol})
-    seeds = Set{Symbol}(nm for (nm, rhs) in det if _has_cell_call(rhs))
-    isempty(seeds) && return sample, det, nothing
-    detmap = Dict{Symbol,Any}(det)
-    chain = copy(seeds)
+function _kernel_chain_names(det)
+    chain = Set{Symbol}(nm for (nm, rhs) in det if _has_cell_call(rhs))
     grown = true
     while grown
         grown = false
@@ -4275,6 +4271,25 @@ function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
             grown = true
         end
     end
+    return chain
+end
+
+# Explicit self indices still observe the complete response column. Keep
+# other ranges for their selection/axis validation instead of dropping them.
+function _self_covering_response_range(range, name::Symbol)
+    range === nothing && return true
+    Meta.isexpr(range, :ref, 2) && range.args[1] === name || return false
+    index = range.args[2]
+    return index === :(:) || index == Expr(:call, :eachindex, name) ||
+        index == Expr(:call, :axes, name, 1)
+end
+
+function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
+        data::Set{Symbol})
+    seeds = Set{Symbol}(nm for (nm, rhs) in det if _has_cell_call(rhs))
+    isempty(seeds) && return sample, det, nothing
+    detmap = Dict{Symbol,Any}(det)
+    chain = _kernel_chain_names(det)
     where = "schedule chain ($(join(sort!(collect(seeds)), ", ")))"
     obs = SampleStmt[]
     rest = SampleStmt[]
@@ -4290,7 +4305,7 @@ function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
             s.matrix === nothing || _sfail("$where: `$(s.lhs)` reads a " *
             "schedule-chain value; only `.~` observations of data columns " *
             "read one (`$(s.lhs) .~ Normal.(conc, sigma)`)")
-        s.range === nothing || _sfail("$where: `$(s.lhs)[...]` observes a " *
+        _self_covering_response_range(s.range, s.lhs) || _sfail("$where: `$(s.lhs)[...]` observes a " *
             "literal range; a schedule chain observes whole columns " *
             "(`@plate for i in eachindex($(s.lhs))` or `$(s.lhs) .~ ...`)")
         push!(obs, s)
@@ -5078,6 +5093,12 @@ function _expand_plates(args, data::Set{Symbol})
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
+    # Complete scalar schedule observations belong to the grouped cell.
+    # Find their column reads before selected plates hide local transforms
+    # inside an ordinary observation-column helper.
+    kernel_chain = _kernel_chain_names(Pair{Symbol,Any}[
+        arg.args[1] => arg.args[2] for arg in args
+        if Meta.isexpr(arg, :(=), 2) && arg.args[1] isa Symbol])
     line = 0
     for arg in args
         if arg isa LineNumberNode
@@ -5094,7 +5115,7 @@ function _expand_plates(args, data::Set{Symbol})
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
-            stmts, stx, prm = _desugar_plate(arg, pl, data)
+            stmts, stx, prm = _desugar_plate(arg, pl, data; kernel_chain)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
                 push!(expanded, st)
@@ -5108,7 +5129,8 @@ function _expand_plates(args, data::Set{Symbol})
     return expanded, ctx, params
 end
 
-function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
+function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
+        kernel_chain=Set{Symbol}())
     (length(st.args) == 3 && st.args[3] isa Expr &&
         st.args[3].head === :for) ||
         _sfail("`@plate` takes `@plate for i in R ... end` exactly")
@@ -5151,7 +5173,19 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     selected = rkind[1] !== :levels && any(c -> c isa Expr &&
         (_is_sample(c) || _is_broadcast_sample(c)) &&
         Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
-    selected && return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
+    # In a grouped schedule cell these full scalar columns are evaluated
+    # only by the observations that read them. Their scalar transforms
+    # can use the ordinary column spelling; no unselected lane is evaluated.
+    whole_kernel_obs = any(c -> any(in(kernel_chain), _plate_value_names(c)), cells) &&
+        !_plate_has_array_cells(cells) &&
+        !any(c -> _cell_uses_index_value(c, ivar), cells) &&
+        all(c -> !(_is_sample(c) || _is_broadcast_sample(c)) ||
+            (Meta.isexpr(c.args[2], :ref, 2) && c.args[2].args[2] === ivar &&
+             c.args[2].args[1] in data &&
+             ((rkind[1] === :eachindex && rkind[2] === c.args[2].args[1]) ||
+              (rkind[1] === :axes && rkind[2] === c.args[2].args[1] && rkind[3] == 1))), cells)
+    selected && !whole_kernel_obs &&
+        return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)

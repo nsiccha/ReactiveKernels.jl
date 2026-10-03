@@ -132,7 +132,11 @@ _pl_pk_chain(obs...) = Expr(:block, _pl_pk_head().args...,
     legacy, lb = _pl_bind(_pl_pk_legacy(:(dv .~ Normal.(mu, sigma))),
         _PL_PK_DATA, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
     for obs in (:(dv .~ Normal.(conc, sigma)),
-            _pl_plate(:(eachindex(dv)), :(dv[i] ~ Normal(conc[i], sigma))))
+            _pl_plate(:(eachindex(dv)), :(dv[i] ~ Normal(conc[i], sigma))),
+            _pl_plate(:(axes(dv, 1)), :(dv[i] ~ Normal(conc[i], sigma))),
+            :(dv[eachindex(dv)] .~ Normal.(conc, sigma)),
+            :(dv[axes(dv, 1)] .~ Normal.(conc, sigma)),
+            :(dv[:] .~ Normal.(conc, sigma)))
         plan = lower_rkppl(_pl_pk_chain(obs), _PL_PK_DATA; conditioned = _PL_PK_DATA)
         kp = only(plan.kernel_plates)
         @test isempty(plan.responses)
