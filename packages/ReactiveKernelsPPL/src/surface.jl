@@ -5077,7 +5077,7 @@ end
 function _expand_plates(args, data::Set{Symbol})
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     line = 0
     for arg in args
         if arg isa LineNumberNode
@@ -5130,7 +5130,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     body = loop.args[2]
     cells = Any[a for a in body.args if !(a isa LineNumberNode)]
     isempty(cells) && return Expr[], Tuple{Symbol,Int,Set{Symbol}}[],
-        Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+        Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     # Names bound by `=` anywhere in this plate (cell locals, excluded
     # from the bare-vector check even on forward reference) — a bare LHS
     # (`t = ...`) or an i-indexed LHS (`theta[i] = ...`).
@@ -5147,7 +5147,11 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     end
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
+    selected = rkind[1] !== :levels && any(c -> c isa Expr &&
+        (_is_sample(c) || _is_broadcast_sample(c)) &&
+        Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
+    selected && return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
@@ -5158,7 +5162,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
         indexname = gensym(:_rkppl_index)
         indices = rkind[1] === :coloncall ? rkind[2] :
             rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
-            Expr(:call, GlobalRef(Base, :axes), rkind[2], 1)
+            Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
         indexvalues = Expr(:call, GlobalRef(Base, :collect), indices)
         push!(out, Expr(:(=), indexname,
             _plate_column_call(ivar, Pair{Symbol,Any}[], ivar, nothing; indices=indexvalues)))
@@ -5169,6 +5173,82 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     for c in cells
         push!(out, _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx,
             params, pidx)...)
+    end
+    return out, ctx, params
+end
+
+# Partial observation loops compute their arguments inside retained RK cells.
+# Slicing a fully computed vector would evaluate arithmetic in unselected cells.
+function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
+    iterator = rkind[1] === :coloncall ? rkind[2] :
+        rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
+        Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
+    indices = Expr(:call, GlobalRef(Base, :collect), iterator)
+    locals = Pair{Symbol,Any}[]
+    out = Expr[]
+    ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
+    pidx = Set{Symbol}()
+    indexedlocals = Set{Symbol}()
+    function localread(ex)
+        Meta.isexpr(ex, :ref, 2) && ex.args[1] in indexedlocals &&
+            ex.args[2] === ivar && return ex.args[1]
+        ex isa Expr ? Expr(ex.head, map(localread, ex.args)...) : ex
+    end
+    function checkrefs(ex)
+        ex isa Expr || return
+        if ex.head === :ref && _expr_has_sym(ex, ivar)
+            for index in ex.args[2:end]
+                index === ivar && continue
+                if Meta.isexpr(index, :ref, 2) && index.args[2] === ivar
+                    index.args[1] in data || _sfail("cell gather indexes through `$(index.args[1])`, which is not bound data")
+                elseif _expr_has_sym(index, ivar)
+                    _cell_lhs_error(ex, ivar)
+                end
+            end
+        end
+        foreach(checkrefs, ex.args)
+    end
+    for c in cells
+        checkrefs(c)
+        if Meta.isexpr(c, :(=), 2)
+            lhs, rhs = c.args
+            col = lhs isa Symbol ? lhs :
+                Meta.isexpr(lhs, :ref, 2) && lhs.args[2] === ivar ? lhs.args[1] : nothing
+            col isa Symbol || _sfail("selected plate assignments bind a local or an indexed scalar column")
+            col in data && _sfail("cell assignment `$col = ...` redefines bound data")
+            rhs = localread(rhs)
+            if lhs isa Expr
+                push!(out, Expr(:(=), col, _plate_column_call(ivar, locals, rhs, nothing; indices)))
+                push!(indexedlocals, col)
+            end
+            push!(locals, col => rhs)
+            continue
+        end
+        (_is_sample(c) || _is_broadcast_sample(c)) ||
+            _sfail("cells hold `~` observations and `=` assignments only")
+        lnames = Set(first.(locals))
+        function arg(ex)
+            Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
+                ex.args[1] isa Symbol && ex.args[1] ∉ lnames && return ex
+            if ex isa Expr && (ex.head === :call || _is_dotted_call(ex)) &&
+                    !isempty(ex.args) && _cell_object_call(ex.args[1])
+                vals = ex.head === :call ? ex.args[2:end] : ex.args[2].args
+                return Expr(:call, ex.args[1], map(arg, vals)...)
+            end
+            if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames)
+                nm = gensym(:_rkppl_selected)
+                push!(out, Expr(:(=), nm,
+                    _plate_column_call(ivar, locals, ex, nothing; indices)))
+                push!(plate_defs, nm)
+                push!(pidx, nm)
+                return Expr(:ref, nm, ivar)
+            end
+            return ex
+        end
+        obj = arg(localread(c.args[3]))
+        append!(out, _desugar_cell_sample(Expr(:call, c.args[1], c.args[2], obj),
+            ivar, rkind, line, data, plate_defs, ctx, params, pidx))
     end
     return out, ctx, params
 end
@@ -5211,7 +5291,7 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
     locals = Pair{Symbol,Any}[]
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     samples = Any[]
     for c in cells
         c isa Expr || _sfail("cells hold `~` observations and `=` " *
@@ -5353,7 +5433,8 @@ function _plate_range_kind(R)
     R.args[1] === :eachindex && length(R.args) == 2 &&
         R.args[2] isa Symbol && return (:eachindex, R.args[2])
     R.args[1] === :axes && length(R.args) == 3 && R.args[2] isa Symbol &&
-        R.args[3] == 1 && return (:axes, R.args[2])
+        R.args[3] isa Integer && !(R.args[3] isa Bool) && R.args[3] >= 1 &&
+        return (:axes, R.args[2], Int(R.args[3]))
     R.args[1] === :levels && length(R.args) == 2 && R.args[2] isa Symbol &&
         return (:levels, R.args[2])
     return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, " *
@@ -5505,6 +5586,7 @@ function _plate_column_expr(nm::Symbol, call::Expr,
     where = "array plate column `$nm`"
     inputs = Any[]
     lanevars = Symbol[]
+    sharedsources = Dict{Symbol,Any}()
     lane(inp, var) = (var in lanevars || (push!(inputs, inp);
         push!(lanevars, var)); var)
     pos = indices !== nothing ? lane(indices, Symbol(:_ppl_pi_, nm)) :
@@ -5512,14 +5594,16 @@ function _plate_column_expr(nm::Symbol, call::Expr,
             Expr(:call, :_ppl_level_indices, axis), Symbol(:_ppl_pi_, axis))
     level() = lane(Expr(:call, :_ppl_level_values, axis),
         Symbol(:_ppl_pl_, axis))
-    isidx(a) = axis === nothing && a isa Expr && a.head === :ref && length(a.args) == 2 &&
+    isidx(a) = indices === nothing && axis === nothing && a isa Expr && a.head === :ref && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[1] in data && a.args[2] === ivar
     function code(a, d)
         _is_levels_dim(d) && d.args[2] isa Symbol || _sfail("$where reads " *
             "an array axis $(repr(d)) by `$(repr(a))`; per-index reads " *
             "take a `levels(g)` axis")
         col, h = a.args[1], d.args[2]
-        return lane(Expr(:call, :_ppl_codes, col, h),
+        codes = Expr(:call, :_ppl_codes, col, h)
+        indices === nothing || (codes = Expr(:ref, codes, indices))
+        return lane(codes,
             Symbol(:_ppl_pc_, col, :_, h))
     end
     function rw(ex)
@@ -5528,6 +5612,11 @@ function _plate_column_expr(nm::Symbol, call::Expr,
         ex isa Expr || return ex
         if ex.head === :ref && ex.args[1] isa Symbol
             X, idx = ex.args[1], ex.args[2:end]
+            if indices !== nothing && X in data && length(idx) == 1
+                linear = Symbol(:_ppl_linear_, X)
+                sharedsources[linear] = Expr(:call, GlobalRef(Base, :vec), X)
+                return Expr(:ref, linear, rw(only(idx)))
+            end
             d = get(dims, X, nothing)
             if axis !== nothing && d !== nothing && idx[1] === ivar
                 dim = length(d) == 3 && length(idx) == 1 ? d[3] : d[1]
@@ -5558,7 +5647,9 @@ function _plate_column_expr(nm::Symbol, call::Expr,
                 return Expr(:ref, X, codevar, map(rw, idx[2:end])...)
             end
             isidx(ex) && return lane(X, Symbol(:_ppl_pv_, X))
-            if d !== nothing && !isempty(idx) && isidx(idx[1])
+            indexedcode = !isempty(idx) && Meta.isexpr(idx[1], :ref, 2) &&
+                idx[1].args[1] isa Symbol && idx[1].args[1] in data && idx[1].args[2] === ivar
+            if d !== nothing && indexedcode
                 if length(d) == 3 && length(idx) == 1
                     return Expr(:ref, X, :(:), :(:), code(idx[1], d[3]))
                 end
@@ -5582,7 +5673,7 @@ function _plate_column_expr(nm::Symbol, call::Expr,
         "through a data column (`x[$ivar]`) or a levels gather " *
         "(`z[g[$ivar], :]`)")
     shared = sort!(collect(free))
-    append!(inputs, (Expr(:call, :Ref, nm2) for nm2 in shared))
+    append!(inputs, (Expr(:call, :Ref, get(sharedsources, nm2, nm2)) for nm2 in shared))
     lam = Expr(:->, Expr(:tuple, lanevars..., shared...),
         Expr(:block, LineNumberNode(0, :rkppl_plate), stmts..., outx))
     return Expr(:do, Expr(:call, :plate, inputs...), lam)
@@ -5658,12 +5749,14 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
                              "lower — index the latent (`$lhs[$ivar] ~ ...`) " *
                              "for a per-cell parameter, or write a shared " *
                              "prior outside the plate")
-    (lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
-        lhs.args[1] isa Symbol && lhs.args[2] === ivar) ||
+    (lhs isa Expr && lhs.head === :ref && length(lhs.args) >= 2 &&
+        lhs.args[1] isa Symbol && lhs.args[2] === ivar &&
+        all(a -> a isa Integer && !(a isa Bool) && a >= 1, lhs.args[3:end])) ||
         _cell_lhs_error(lhs, ivar)
     col = lhs.args[1]
     obj = c.args[3]
     if col ∉ data
+        length(lhs.args) == 2 || _cell_lhs_error(lhs, ivar)
         # Per-cell latent PARAMETER: a scalar (undotted) distribution. Its args
         # are shared across cells (a captured scalar) or per-cell (`eta[$ivar]`,
         # a varying prior mean/scale); the `[$ivar]` strip and the bare-vector
@@ -5689,13 +5782,11 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     if rkind[1] === :coloncall
         # Literal ranges validate through the slice-A `y[a:b]` path
         # (start-1, literal endpoints, bind-time cover check).
-        return Expr[Expr(:call, :.~, Expr(:ref, col, rkind[2]), obj)]
+        return Expr[Expr(:call, :.~, Expr(:ref, col, rkind[2], lhs.args[3:end]...), obj)]
     end
-    rcol = rkind[2]
-    rcol === col || _sfail("plate over `$(rkind[1])($rcol)` cannot " *
-                           "sample `$col[$ivar]` (one response column " *
-                           "per range)")
-    return Expr[Expr(:call, :.~, col, obj)]
+    index = rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
+        Expr(:call, :axes, rkind[2], rkind[3])
+    return Expr[Expr(:call, :.~, Expr(:ref, col, index, lhs.args[3:end]...), obj)]
 end
 
 _undot_cell_object(ex) = ex
@@ -5714,7 +5805,8 @@ end
 # at bind); over a definition ⇒ the definition's own observation axis.
 function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
     rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2])
-    return rkind[2]
+    return rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
+        Expr(:call, :axes, rkind[2], rkind[3])
 end
 
 function _cell_lhs_error(lhs, ivar)
@@ -5840,6 +5932,11 @@ _dotify_cell(ex, ivar, pidx, object::Bool) = (ex, false)
 _dotify_cell(ex::Symbol, ivar, pidx, object::Bool) = (ex, ex in pidx)
 function _dotify_cell(ex::Expr, ivar, pidx, object::Bool)
     ex.head === :ref && return (_strip_cell(ex, ivar), true)
+    # Ref denotes one whole shared argument to a broadcasted constructor.
+    # Broadcasting Ref itself would replace that argument by scalar wrappers.
+    Meta.isexpr(ex, :call, 2) && ex.args[1] === :Ref &&
+        return (ex, false)
+    Meta.isexpr(ex, :call, 1) && return (ex, false)
     if ex.head === :call && !isempty(ex.args)
         f = ex.args[1]
         args = Any[]
@@ -5982,6 +6079,16 @@ function _sample_lhs(lhs, bc, tilde, data, level_bindings)
                            "(`b[axes(X, 2)]`), got $(repr(lhs))")
     lhs.head === :. && _sfail("dotted left-hand side $(repr(lhs)) does " *
                               "not lower (nested targets are out of scope)")
+    if lhs.head === :ref && length(lhs.args) > 2 && lhs.args[1] isa Symbol && lhs.args[1] in data
+        bc || _sfail("a response slice broadcasts with `.~`")
+        all(a -> a isa Integer && !(a isa Bool) && a >= 1, lhs.args[3:end]) ||
+            _sfail("response trailing indices must be positive literal integers")
+        range = _lower_lhs_range(lhs.args[1], lhs.args[2])
+        range isa UnitRange && (range = Expr(:ref, lhs.args[1], lhs.args[2]))
+        range isa Expr || _sfail("multidimensional response slices need an index axis")
+        append!(range.args, lhs.args[3:end])
+        return lhs.args[1], range, nothing, nothing
+    end
     lhs.head === :ref && length(lhs.args) == 2 || _sfail(
         "$tilde left-hand side must be a bare Symbol or a one-dimensional " *
         "ref (`y[1:N]`, `c[levels(g)]`, `b[axes(X, 2)]`), got $(repr(lhs))")
@@ -6000,8 +6107,7 @@ function _sample_lhs(lhs, bc, tilde, data, level_bindings)
     if _is_axes2_call(index)
         bc || _sfail("sized prior `$(target)[axes(...)]` is a vector — " *
                      "use `.~`, not `~`")
-        target in data && _sfail("`axes` sizes coefficient priors, not " *
-                                 "responses ($target is data)")
+        target in data && return target, _lower_lhs_range(target, index), nothing, nothing
         return target, nothing, nothing, index.args[2]
     end
     if index isa Expr && index.head === :call && !isempty(index.args) &&
@@ -6385,21 +6491,15 @@ function _lower_lhs_range(col::Symbol, r)
         length(r.args) == 2 && r.args[2] isa Symbol || _sfail(
             "response $col range takes `eachindex($col)` — " *
             "got $(repr(r))")
-        r.args[2] === col || _sfail("response $col range covers " *
-                                    "$(r.args[2]), not $col — ranges cover " *
-                                    "their own column exactly " *
-                                    "(`eachindex($col)`)")
-        return nothing
+        return Expr(:ref, col, r)
     end
     if r isa Expr && r.head === :call && !isempty(r.args) && r.args[1] === :axes
-        length(r.args) == 3 && r.args[2] isa Symbol && r.args[3] == 1 || _sfail(
-            "response $col range takes `axes($col, 1)` — got $(repr(r))")
-        r.args[2] === col || _sfail("response $col range covers " *
-                                    "$(r.args[2]), not $col (`axes($col, 1)`)")
-        return nothing
+        length(r.args) == 3 && r.args[2] isa Symbol && r.args[3] isa Integer &&
+            !(r.args[3] isa Bool) && r.args[3] >= 1 || _sfail(
+            "response $col range takes `axes(v, d)` with a positive literal axis — got $(repr(r))")
+        return Expr(:ref, col, r)
     end
-    r === :(:) && _sfail("whole-column `$col[:]` is not admitted — " *
-                            "write the range out (`$col[eachindex($col)]`)")
+    r === :(:) && return Expr(:ref, col, r)
     (r isa Symbol || r isa Integer) &&
         _sfail("scalar cell index `$col[$(r)]` at top level does not " *
                "lower — per-cell refs live in `@plate` (slice B); " *
@@ -6425,7 +6525,7 @@ struct SampleStmt
     lhs::Symbol
     rhs::Any
     broadcast::Bool
-    range::Union{Nothing,UnitRange{Int}}
+    range::Union{Nothing,UnitRange{Int},Expr}
     levels::Any
     matrix::Union{Nothing,Symbol}
     dims::Union{Nothing,Vector{Any}}

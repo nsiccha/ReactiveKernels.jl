@@ -1743,13 +1743,16 @@ end
 # hand-kept broadcast. `constrain` yields the constrained cell vector; a
 # companion `logjac` plate supplies the per-cell Jacobian this block's
 # `jacobian_term` sums (pruned by have→want when the Jacobian is not wanted).
-# `:identity` (real support) is a direct view read — no transform, no Jacobian.
+# Real per-cell latents use an ordinary packed slice, so an indexed RK
+# cell receives an array it can gather from. No transform or Jacobian.
 function _plate_transform_statements(e::LayoutEntry)
     lo = e.offset
     hi = e.offset + e.size - 1
     view_read = :(view(unconstrained, $lo:$hi))
-    e.transform === :identity &&
-        return Expr[:($(e.name)::AbstractVector{Float64} = $view_read)]
+    if e.transform === :identity
+        read = e.kind === :plate ? :(unconstrained[$lo:$hi]) : view_read
+        return Expr[:($(e.name)::AbstractVector{Float64} = $read)]
+    end
     if e.transform === :interval
         # Parameterized bounds ⇒ not in the (parameterless) bijector registry;
         # hand-rolled broadcast edges over the block view, identical math to the

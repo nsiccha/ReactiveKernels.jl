@@ -277,9 +277,13 @@ own `_ppl_sc_<label>_nu` node so scale and nu predictors coexist).
 `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
 closed emitter-side. `trials` is the Binomial/BetaBinomial2 trial count
-(Int column or Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
-response range (`nothing` = whole column: bare `.~`, `eachindex`,
-`axes`); it must cover that response's full observation axis (checked at bind).
+(Int column or Int literal), `nothing` otherwise. `range` carries a literal
+`y[1:N]` range, or the indexed response expression for `eachindex`, `axes`
+and `:` selections, including positive literal trailing indices.
+`nothing` means the whole column. Literal one-dimensional ranges retain
+their full-cover check; indexed expressions select the stated response cells.
+An explicit indexed observation loop also selects its row operands before
+evaluating the retained cell; a top-level slice uses ordinary broadcasting.
 
 Leveled families (categorical / ordinal / multinomial) use the trailing
 fields, built with keywords (`n_levels=`, `thresholds=`,
@@ -422,7 +426,7 @@ struct LikelihoodSpec
     evidence::ResponseEvidence
     label::Symbol
     trials::Union{Nothing,ColumnRef,Int}
-    range::Union{Nothing,UnitRange{Int}}
+    range::Union{Nothing,UnitRange{Int},Expr}
     n_levels::Union{Nothing,Int}
     thresholds::Union{Nothing,ParamName}
     extra_predictors::Vector{Symbol}
@@ -698,7 +702,7 @@ struct PlateParameter
     family::Symbol
     args::NamedTuple
     support_override::SupportOverride
-    range::Union{Nothing,UnitRange{Int},Symbol}
+    range::Union{Nothing,UnitRange{Int},Symbol,Expr}
     label::Symbol
 end
 """Provenance/range default to the consuming response's axis under the name."""
@@ -707,7 +711,7 @@ PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     PlateParameter(name, family, args, support_override, nothing, name)
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     support_override::SupportOverride,
-    range::Union{Nothing,UnitRange{Int},Symbol}) =
+    range::Union{Nothing,UnitRange{Int},Symbol,Expr}) =
     PlateParameter(name, family, args, support_override, range, name)
 
 """
@@ -2781,6 +2785,10 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
                 _fail(p.label, "arg $k references unknown name $v")
         end
         p.range === nothing && continue
+        if p.range isa Expr
+            _plate_rows(plan, p)
+            continue
+        end
         if p.range isa Symbol
             # One cell per entry of the iterated column (Julia's
             # `eachindex(v)`), sized at the observation axis.
@@ -3333,8 +3341,9 @@ end
 # elementwise responses use Julia broadcast axes, including singleton dimensions.
 function _uses_structured_observation_axes(plan::StructuralPlan)
     any(r -> r.mi_jobs !== nothing, plan.responses) && return true
+    !isempty(plan.plate_parameters) && !any(r -> r.range isa Expr, plan.responses) && return true
     return any(f -> !isempty(getfield(plan, f)),
-        (:plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
+        (:scans, :dar_paths, :varying_draws, :varying_slices,
          :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
          :r2d2_priors, :horseshoe_priors, :kernel_plates, :event_lps))
 end
@@ -3406,6 +3415,72 @@ function _structured_observation_axes(plan::StructuralPlan)
     return (; rows = axisrows, total)
 end
 
+function _validate_response_range_expr(r::LikelihoodSpec)
+    ex = r.range
+    ex isa Expr || return nothing
+    Meta.isexpr(ex, :ref) && length(ex.args) >= 2 && ex.args[1] === r.response ||
+        _fail(r.label, "response range must retain its indexed response expression")
+    index = ex.args[2]
+    valid = index === :(:) ||
+        (Meta.isexpr(index, :call, 3) && index.args[1] === :(:) &&
+            index.args[2] === 1 && index.args[3] isa Int && index.args[3] >= 1) ||
+        (Meta.isexpr(index, :call, 2) && index.args[1] === :eachindex && index.args[2] isa Symbol) ||
+        (Meta.isexpr(index, :call, 3) && index.args[1] === :axes && index.args[2] isa Symbol &&
+            index.args[3] isa Integer && !(index.args[3] isa Bool) && index.args[3] >= 1)
+    valid || _fail(r.label, "response range uses eachindex(v), axes(v, d), or :")
+    all(i -> i isa Integer && !(i isa Bool) && i >= 1, ex.args[3:end]) ||
+        _fail(r.label, "response trailing indices must be positive literal integers")
+    r.mi_jobs === nothing || _fail(r.label, "dynamic index ranges beside packed mi rows are not built yet")
+    return nothing
+end
+
+_response_range_source(r::LikelihoodSpec) = r.range.args[2] === :(:) ?
+    r.response : r.range.args[2].args[1] === :(:) ? r.response : r.range.args[2].args[2]
+
+function _response_range_indices(plan::StructuralPlan, r::LikelihoodSpec)
+    _validate_response_range_expr(r)
+    source = _response_range_source(r)
+    haskey(plan.columns, source) || _fail(r.label, "response index source $source is not bound")
+    value = plan.columns[source]
+    value isa AbstractArray || _fail(r.label, "response index source $source must be an array")
+    index = r.range.args[2]
+    index isa Expr && index.args[1] === :(:) && return 1:index.args[3]
+    return index === :(:) || index.args[1] === :eachindex ? eachindex(value) :
+        axes(value, index.args[3])
+end
+
+function _selected_response_column(plan::StructuralPlan, r::LikelihoodSpec)
+    indices = _response_range_indices(plan, r)
+    value = _observation_column(plan.columns, r.response, r.label, "response")
+    # An empty authored loop performs no indexed read, including a
+    # trailing dimension that contains no element.
+    isempty(indices) && r.response in plan.indexed_observations && return eltype(value)[]
+    trailing = r.range.args[3:end]
+    checkbounds(Bool, value, indices, trailing...) ||
+        _fail(r.label, "response slice $(repr(r.range)) indexes outside $(size(value))")
+    return getindex(value, indices, trailing...)
+end
+
+function _indexed_operand_axes(plan::StructuralPlan, r::LikelihoodSpec, col, design)
+    indices = _response_range_indices(plan, r)
+    value = plan.columns[col]
+    isempty(indices) && return (Base.OneTo(0),)
+    valid = design ? checkbounds(Bool, value, indices, Colon()) : checkbounds(Bool, value, indices)
+    valid || _fail(r.label, "indexed operand $col does not cover the authored response range")
+    return (Base.OneTo(length(indices)),)
+end
+
+function _response_slot_column(plan, r, name, what)
+    value = _observation_column(plan.columns, name, r.label, what)
+    r.range isa Expr || return value
+    name === r.response && return _selected_response_column(plan, r)
+    r.response in plan.indexed_observations || return value
+    indices = _response_range_indices(plan, r)
+    checkbounds(Bool, value, indices) || _fail(r.label,
+        "$what $name does not cover the authored response range")
+    value[indices]
+end
+
 """Broadcast domains of bound observation statements: `(; rows, total,
 domains)`, where `domains` maps response labels to Julia broadcast axes.
 Singleton operands do not join independent domains. Structured constructors
@@ -3427,8 +3502,12 @@ function _observation_axes(plan::StructuralPlan)
         axes(plan.columns[c]) for c in perobs)
     domains = Dict{Symbol,Tuple}()
     for (r, rd) in zip(plan.responses, reads)
+        responseaxes = r.range isa Expr ? axes(_selected_response_column(plan, r)) : colaxes[r.response]
+        operandaxes(c) = r.range isa Expr && r.response in plan.indexed_observations ?
+            _indexed_operand_axes(plan, r, c, c in designs) : colaxes[c]
+        valuesread = r.range isa Expr ? _response_reads(plan, _with(r; range=nothing), perobs) : rd
         if r.response in plan.indexed_observations
-            domain = colaxes[r.response]
+            domain = responseaxes
             n = prod(length, domain; init = 1)
             if n == 0
                 # An empty authored loop never indexes its other operands.
@@ -3436,8 +3515,9 @@ function _observation_axes(plan::StructuralPlan)
                 continue
             end
             for c in rd
-                colaxes[c] == domain && continue
-                m = prod(length, colaxes[c]; init = 1)
+                c === r.response && continue
+                operandaxes(c) == domain && continue
+                m = prod(length, operandaxes(c); init = 1)
                 m < n && _fail(c, "indexed column length $m ≠ the $n " *
                     "rows of $(r.response); explicit `@plate` indexing " *
                     "does not stretch singleton operands")
@@ -3446,10 +3526,11 @@ function _observation_axes(plan::StructuralPlan)
                     "$(r.response) has $domain")
             end
         end
-        domain = colaxes[r.response]
+        domain = responseaxes
         for c in sort!(collect(setdiff(rd, (r.response,))))
+            c in valuesread || continue # a range source contributes indices, not broadcast values
             domain = try
-                Base.Broadcast.broadcast_shape(domain, colaxes[c])
+                Base.Broadcast.broadcast_shape(domain, operandaxes(c))
             catch e
                 e isa DimensionMismatch || rethrow()
                 if length(colaxes[c]) == length(domain) == 1
@@ -3572,6 +3653,7 @@ end
 """Rows of a response's full observation axis; mi() packs only its observed
 entries, so its location's data establishes the full axis."""
 function _structured_response_rows(plan::StructuralPlan, r::LikelihoodSpec)
+    r.range isa Expr && return length(_selected_response_column(plan, r))
     r.mi_jobs === nothing && haskey(plan.columns, r.response) &&
         return _column_nrows(plan.columns[r.response])
     modelvals, _ = _axis_exempt_columns(plan)
@@ -3613,9 +3695,23 @@ function _value_rows(plan::StructuralPlan, name::Symbol)
     _fail(name, "value $name reads or feeds different row counts $ns")
 end
 
-_plate_rows(plan::StructuralPlan, p::PlateParameter) =
-    p.range isa UnitRange ? length(p.range) :
-    _value_rows(plan, p.range isa Symbol ? p.range : p.name)
+function _plate_rows(plan::StructuralPlan, p::PlateParameter)
+    p.range isa UnitRange && return length(p.range)
+    if p.range isa Expr
+        iterator = p.range
+        source = iterator.args[2]
+        if haskey(plan.columns, source)
+            value = plan.columns[source]
+            value isa AbstractArray || _fail(p.label, "plate index source $source must be an array")
+            return iterator.args[1] === :eachindex ? length(eachindex(value)) :
+                length(axes(value, iterator.args[3]))
+        end
+        iterator.args[1] === :eachindex && return _value_rows(plan, source)
+        iterator.args[3] === 1 && return _value_rows(plan, source)
+        _fail(p.label, "plate axis $(repr(iterator)) needs its bound source array")
+    end
+    return _value_rows(plan, p.range isa Symbol ? p.range : p.name)
+end
 
 function _validate_columns(plan::StructuralPlan)
     plan.n_obs >= 0 || _fail(:plan, "n_obs must be nonnegative, got $(plan.n_obs)")
@@ -5852,7 +5948,8 @@ end
 function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
     known = union(_union_names(plan), _vector_value_names(plan),
         Set{Symbol}(d.name for d in plan.derived),
-        Set{Symbol}(p.name for p in plan.array_parameters))
+        Set{Symbol}(p.name for p in plan.array_parameters),
+        Set{Symbol}(p.name for p in plan.plate_parameters))
     for inp in ex.args[1].args[2:end]
         if inp isa Symbol
             bound && !haskey(plan.columns, inp) && !(inp in known) &&
@@ -5860,6 +5957,13 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
             push!(refs, inp)
         elseif inp isa Expr && inp.head === :call && inp.args[1] isa GlobalRef
             _collect_opaque_refs!(refs, inp, plan, label, bound)
+        elseif Meta.isexpr(inp, :ref, 2) && Meta.isexpr(inp.args[1], :call, 3) &&
+                inp.args[1].args[1] === :_ppl_codes
+            for c in inp.args[1].args[2:end]
+                c isa Symbol && (!bound || haskey(plan.columns, c)) ||
+                    _fail(label, "selected level codes need bound source columns")
+            end
+            _collect_opaque_refs!(refs, inp.args[2], plan, label, bound)
         elseif inp isa Expr && inp.head === :call && length(inp.args) == 4 &&
                 inp.args[1] === :_ppl_level_gather
             nm, g, ld = inp.args[2:end]
@@ -5887,6 +5991,10 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
             nm = inp.args[2]
             bound && !haskey(plan.columns, nm) && !(nm in known) &&
                 _fail(label, "array plate column reads unknown name $nm")
+        elseif Meta.isexpr(inp, :call, 2) && inp.args[1] === :Ref &&
+                Meta.isexpr(inp.args[2], :call, 2) &&
+                inp.args[2].args[1] === GlobalRef(Base, :vec)
+            _collect_opaque_refs!(refs, inp.args[2], plan, label, bound)
         else
             _fail(label, "array plate column input $(repr(inp)) is not a " *
                 "column, aligned level values, level codes or `Ref(name)`")
@@ -6304,6 +6412,12 @@ function _validate_plate_parameters(plan::StructuralPlan)
             r = p.range
             (first(r) == 1 && last(r) >= 1) || _fail(p.label,
                 "plate range must start at 1 (`1:N`), got $(first(r)):$(last(r))")
+        elseif p.range isa Expr
+            r = p.range
+            valid = (Meta.isexpr(r, :call, 2) && r.args[1] === :eachindex && r.args[2] isa Symbol) ||
+                (Meta.isexpr(r, :call, 3) && r.args[1] === :axes && r.args[2] isa Symbol &&
+                    r.args[3] isa Int && r.args[3] >= 1)
+            valid || _fail(p.label, "plate iterator must be eachindex(v) or axes(v, d)")
         end
     end
     return nothing
@@ -7967,7 +8081,7 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
         r.n_levels === nothing || r.n_levels >= 1 || _fail(r.label,
             "n_levels must be ≥ 1, got $(r.n_levels)")
     end
-    if r.range !== nothing
+    if r.range isa UnitRange
         first(r.range) == 1 || _fail(r.label,
             "response range must start at 1 (got $(r.range)) — " *
             "ranges cover eachindex exactly, no partial windows")
@@ -8102,7 +8216,7 @@ function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
     r.weights === nothing ||
         _fail(r.label, "joint responses take no weights " *
             "(row weights on a joint density are planned)")
-    if r.range !== nothing
+    if r.range isa UnitRange
         first(r.range) == 1 || _fail(r.label,
             "response range must start at 1 (got $(r.range)) — " *
             "ranges cover eachindex exactly, no partial windows")
@@ -8458,6 +8572,7 @@ function _validate_responses(plan::StructuralPlan)
     length(unique(rlabels)) == length(rlabels) ||
         _fail(:plan, "duplicate response labels")
     for r in plan.responses
+        _validate_response_range_expr(r)
         r.label in RESERVED_NODES && _fail(
             r.label,
             "response label collides with a canonical node",
@@ -8629,7 +8744,7 @@ function _validate_responses(plan::StructuralPlan)
         _validate_interval(r, plan)
         _validate_evidence_structure(r, plan)
         _validate_leveled_fields(r, plan, pred, used_predictors)
-        if r.range !== nothing
+        if r.range isa UnitRange
             (r.mi_jobs === nothing ? first(r.range) == 1 : first(r.range) >= 1) ||
                 _fail(r.label, "response range must use valid one-based indices")
             length(r.range) >= 1 || _fail(r.label,
@@ -8684,12 +8799,13 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     end
     haskey(plan.columns, r.response) ||
         _fail(r.label, "response column $(r.response) missing")
-    if r.range !== nothing
+    if r.range isa UnitRange
         n = _response_rows(plan, r)
         (r.mi_jobs === nothing ? last(r.range) == n : last(r.range) <= n) ||
             _fail(r.label, "response range $(r.range) is incompatible with $n rows")
     end
-    col = _observation_column(plan.columns, r.response, r.label, "response")
+    col = r.range isa Expr ? _selected_response_column(plan, r) :
+        _observation_column(plan.columns, r.response, r.label, "response")
     if _is_bernoulli_family(r.family)
         eltype(col) === Bool && return nothing
         eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
@@ -9074,7 +9190,7 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
         "raw (derived-column scales need shape metadata — planned)")
     haskey(plan.columns, s) ||
         _fail(r.label, "scale references unknown name $s")
-    col = _observation_column(plan.columns, s, r.label, "scale column")
+    col = _response_slot_column(plan, r, s, "scale column")
     if r.family === HurdlePoissonFam
         (eltype(col) <: Real && all(isfinite, col) &&
             all(x -> 0 <= x <= 1, col)) ||
@@ -9242,7 +9358,7 @@ end
 
 function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
         what::AbstractString; check_support::Bool = true)
-    ycol = _observation_column(plan.columns, r.response, r.label, "response")
+    ycol = _response_slot_column(plan, r, r.response, "response")
     t = r.trials
     if t isa Int
         t >= 0 || _fail(r.label, "trials literal must be non-negative")
@@ -9255,7 +9371,7 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
         "raw (derived trials need shape metadata — planned)")
     haskey(plan.columns, t) ||
         _fail(r.label, "trials column $t missing")
-    col = _observation_column(plan.columns, t, r.label, "trials column")
+    col = _response_slot_column(plan, r, t, "trials column")
     (eltype(col) <: Integer && eltype(col) !== Bool) ||
         _fail(r.label, "trials column must hold integers")
     all(>=(0), col) ||
@@ -9356,7 +9472,7 @@ function _validate_weights(r::LikelihoodSpec, plan::StructuralPlan)
         "raw (derived weights need shape metadata — planned)")
     haskey(plan.columns, r.weights) ||
         _fail(r.label, "weights column $(r.weights) missing")
-    col = _observation_column(plan.columns, r.weights, r.label, "weights column")
+    col = _response_slot_column(plan, r, r.weights, "weights column")
     eltype(col) <: Real && all(isfinite, col) && all(>=(0), col) ||
         _fail(r.label, "frequency weights must be finite non-negative numerics")
     return nothing
@@ -9391,7 +9507,7 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
         hi = hi isa AbstractArray ? hi[jobs] : hi
     end
     if ev.kind === :interval_censored
-        resp = _observation_column(plan.columns, r.response, r.label, "response")
+        resp = _response_slot_column(plan, r, r.response, "response")
         all(isfinite, resp) ||
             _fail(r.label, "interval evidence requires finite response values")
         all(resp .< hi) ||
@@ -9430,7 +9546,7 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
         "bounds raw (derived bounds need shape metadata — planned)")
     haskey(plan.columns, bound) ||
         _fail(r.label, "$side bound column $bound missing")
-    col = _observation_column(plan.columns, bound, r.label, "$side bound column")
+    col = _response_slot_column(plan, r, bound, "$side bound column")
     if r.family === PoissonLogFam
         (eltype(col) <: Integer && eltype(col) !== Bool) || _fail(r.label,
             "$side bound column must hold integers for Poisson evidence")

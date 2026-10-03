@@ -1252,13 +1252,14 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
         append!(stmts, _response_likelihood_stmts(r, plan))
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
-        if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.n_levels > 1
+        if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.n_levels > 1 && _response_rows(plan, r) > 0
             # Stopping-ratio emits one lane per visited stage. Gather the
             # prefix sum at each observation's last stage, then difference.
             ends = Symbol(pw, :_ends)
             cumulative = Symbol(pw, :_cumulative)
             values = Symbol(pw, :_observations)
-            push!(stmts, :($ends = cumsum(min.($(r.response), $(r.n_levels-1)))),
+            observed = r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) : r.response
+            push!(stmts, :($ends = cumsum(min.($observed, $(r.n_levels-1)))),
                 :($cumulative = cumsum($pw)[$ends]),
                 :($values = $cumulative .- vcat(0.0, $cumulative[1:end-1])))
             pw = values
@@ -1729,6 +1730,51 @@ end
 _mi_row_value(x::Number, i) = x
 @traceable _mi_row_value(x::AbstractVector, i) = x[i]
 
+_ppl_range_values(x::Number, indices) = x
+_ppl_range_values(x::AbstractArray, indices) = x[indices]
+
+function _ranged_response_stmts(r, plan, stmts)
+    idx = Symbol(:_ppl_range_indices_, r.label)
+    selected = Symbol(:_ppl_range_response_, r.label)
+    index = r.range.args[2]
+    index === :(:) && (index = Expr(:call, :eachindex, r.response))
+    pre = Expr[:($idx = collect($index))]
+    if _response_rows(plan, r) == 0 && r.response in plan.indexed_observations
+        push!(pre, :($selected = zeros(0)))
+    else
+        push!(pre, Expr(:(=), selected, Expr(:ref, r.response, idx, r.range.args[3:end]...)))
+    end
+    aliases = Dict{Symbol,Symbol}(r.response => selected)
+    if r.response in plan.indexed_observations
+        rows = Set{Symbol}()
+        # Select ordinary row values before family-specific conversions or
+        # ordinal stage expansion. Simplexes and covariance factors stay whole.
+        if r.family ∉ (CategoricalFam, MultinomialFam)
+            push!(rows, _location_node(r, plan))
+            foreach(p -> push!(rows, _lp_name(_predictor(plan, p))), r.extra_predictors)
+        end
+        for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
+                r.evidence.lower, r.evidence.upper, r.threshold_columns...,
+                r.count_columns..., r.extra_responses...)
+            if slot isa ScalePredictorRef
+                push!(rows, _lp_name(_predictor(plan, slot.predictor)))
+            elseif slot isa Symbol
+                pred = findfirst(p -> p.name === slot, plan.predictors)
+                push!(rows, pred === nothing ? slot : _lp_name(plan.predictors[pred]))
+            end
+        end
+        for (i, value) in enumerate(sort!(collect(rows)))
+            value === r.response && continue
+            alias = Symbol(:_ppl_range_operand_, r.label, :_, i)
+            getter = GlobalRef(@__MODULE__, :_ppl_range_values)
+            push!(pre, :($alias = $getter($value, $idx)))
+            aliases[value] = alias
+        end
+    end
+    stmts = Expr[_hsubst(st, aliases, Dict()) for st in stmts]
+    return Expr[pre..., stmts...]
+end
+
 # Pure scalar math keeps the CDF inside the selected censoring arm; endpoint
 # expansion currently cannot splice the normal CDF's multi-recipe graph there.
 _mixture_normal_cdf(x, mu, sigma) = 0.5 * erfc((mu - x) / (sqrt(2.0) * sigma))
@@ -1737,9 +1783,10 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     # No cell is evaluated on an empty bound observation domain. Its sum is
     # the additive identity, independently of the response family.
     _response_rows(plan, r) == 0 && return Expr[
-        :($(_pw_name(r.label)) = zeros(size($(r.response)))),
+        :($(_pw_name(r.label)) = zeros($(r.range isa Expr ? size(_selected_response_column(plan, r)) : size(plan.columns[r.response])))),
         :($(_lik_name(r.label))::Float64 = 0.0)]
     stmts = _response_likelihood_stmts_full(r, plan)
+    r.range isa Expr && return _ranged_response_stmts(r, plan, stmts)
     r.mi_jobs === nothing && return stmts
     pre = Expr[]
     jobs = r.mi_jobs
