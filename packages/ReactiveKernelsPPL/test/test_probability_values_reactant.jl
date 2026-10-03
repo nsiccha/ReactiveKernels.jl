@@ -52,7 +52,7 @@ end
     end
 end
 
-@testset "ordinary probability support stays lazy in the default executable" begin
+@testset "invalid probability numerical parity and exact executable lazy boundary" begin
     data=(; x=[-0.4,0.1,0.6],y=[false,true,true])
     f=_distributional_model(quote
         a ~ Normal(0,1)
@@ -71,6 +71,15 @@ end
     @test Float64(value) == -Inf
     @test Array(gradient) ≈ -u
     @test data == (; x=[-0.4,0.1,0.6],y=[false,true,true])
-    _probability_value_executable_inventory(compiled,"probability-invalid-primal")
-    _probability_value_executable_inventory(reverse,"probability-invalid-reverse")
+    primal_ops=_probability_value_executable_inventory(compiled,"probability-invalid-primal")
+    reverse_ops=_probability_value_executable_inventory(reverse,"probability-invalid-reverse")
+    # reactant-xla-laz-3679d90e: actual XLA evaluates log/divide before
+    # select although optimized MLIR retains lazy guards. Numerical parity
+    # does not establish inactive arithmetic or executable-region acceptance.
+    @test get(primal_ops,"conditional",0)==0 && get(primal_ops,"log",0)==2 &&
+        get(primal_ops,"select",0)==3
+    @test get(reverse_ops,"conditional",0)==0 && get(reverse_ops,"log",0)==2 &&
+        get(reverse_ops,"divide",0)==3 && get(reverse_ops,"select",0)==7
+    @test_broken get(primal_ops,"conditional",0)>0
+    @test_broken get(reverse_ops,"conditional",0)>0
 end
