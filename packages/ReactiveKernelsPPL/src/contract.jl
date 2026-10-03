@@ -880,10 +880,11 @@ thresholds, or a shared simplex), packed as one contiguous block:
   elementwise `Normal(arg1, arg2)` prior (Stan `ordered` semantics: no
   factorial normalizer) + the ordered-transform Jacobian. The surface
   `c ~ Ordered(Normal(m, s), n)`; unlinked (a free-standing ordered value)
-  it carries its concrete literal `size`.
+  it carries a literal extent or a data-only expression resolved at bind.
 - `:vector_normal` — a plain (unconstrained, identity-transform) vector
   with an elementwise `Normal(arg1, arg2)` prior (stopping-ratio stage
-  thresholds).
+  thresholds). Cauchy, Laplace, Logistic and StudentT have corresponding
+  `:ordered_*` and `:vector_*` element-density families.
 - `:simplex_dirichlet` — a simplex with a `Dirichlet(arg1)` prior
   (`arg1` a literal concentration vector — frozen data, the
   coefficient-prior precedent) + the stick-breaking Jacobian.
@@ -895,11 +896,10 @@ thresholds, or a shared simplex), packed as one contiguous block:
   `lkj_corr_cholesky(arg1)` prior (`arg1` the shape hyperparameter,
   a finite positive literal), packing K(K−1)/2 thetas.
 
-`size` is the constrained length (K−1 for thresholds, K for a simplex;
-`nothing` = infer at bind from the linked leveled response). Args are
-LITERALS only (hierarchical threshold/Dirichlet concentrations fail
-closed — planned), except an exponential scale, which also admits a
-scalar parameter/assignment name. K=1 is uniform: zero-length
+`size` is the constrained length (K−1 for thresholds, K for a simplex),
+or a data-only expression resolved at bind. `nothing` fills from a linked
+response or concentration. Element prior arguments may be scalar literals,
+data or declared values. K=1 is uniform: zero-length
 threshold vectors carry no statements/prior/Jacobian, a 1-simplex is
 the constant `[1.0]`, and a 1×1 LKJ factor packs zero thetas
 (constraining to `[1.0]` with a `0.0` prior node — Stan's K=1 LKJ).
@@ -910,12 +910,17 @@ struct VectorParameter
     name::ParamName
     family::Symbol
     args::NamedTuple
-    size::Union{Nothing,Int}
+    size::Union{Nothing,Int,Expr}
     label::Symbol
+    # Retain whole-value sizing dependencies after `size` resolves at bind.
+    extent_expr::Union{Nothing,Expr}
 end
+VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
+    size::Union{Nothing,Int,Expr}, label::Symbol) =
+    VectorParameter(name, family, args, size, label, size isa Expr ? size : nothing)
 """Provenance defaults to the parameter's own name."""
 VectorParameter(name::ParamName, family::Symbol, args::NamedTuple,
-    size::Union{Nothing,Int}) =
+    size::Union{Nothing,Int,Expr}) =
     VectorParameter(name, family, args, size, name)
 
 """
@@ -6331,12 +6336,13 @@ end
 function _validate_parameters(plan::StructuralPlan)
     names = _union_names(plan)
     for p in plan.parameters
-        haskey(SAMPLED_ARITY, p.family) || _fail(
+        observed_binomial = p.family === :binomial && p.name in plan.conditioned
+        (observed_binomial || haskey(SAMPLED_ARITY, p.family)) || _fail(
             p.label,
             "sampled family $(p.family) not in the slice-1 set " *
             "($(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")))",
         )
-        arity = SAMPLED_ARITY[p.family]
+        arity = observed_binomial ? 2 : SAMPLED_ARITY[p.family]
         expected_keys = ntuple(i -> Symbol(:arg, i), arity)
         Tuple(keys(p.args)) == expected_keys || _fail(
             p.label,
@@ -6349,7 +6355,7 @@ function _validate_parameters(plan::StructuralPlan)
                 p.label,
                 "arg $k must be a literal or a parameter/assignment name",
             )
-            v in names ||
+            (v in names || (observed_binomial && (!isbound(plan) || haskey(plan.columns,v)))) ||
                 _fail(p.label, "arg $k references unknown name $v")
         end
         _validate_uniform_args(p.label, p.family, p.args)
@@ -6469,9 +6475,6 @@ function _validate_plate_parameters(plan::StructuralPlan)
         haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
             "plate family $(p.family) not in the slice-1 set " *
             "($(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")))")
-        p.family === :flat && _fail(p.label,
-            "a per-cell `flat()` latent has no proper prior to draw a cell " *
-            "from — give the plate parameter a proper family")
         arity = SAMPLED_ARITY[p.family]
         expected_keys = ntuple(i -> Symbol(:arg, i), arity)
         Tuple(keys(p.args)) == expected_keys || _fail(p.label,
@@ -6519,9 +6522,11 @@ const _VECTOR_ELEMENT_FAMILIES = Dict{Symbol,Symbol}(
     :ordered_normal => :normal, :vector_normal => :normal,
     :ordered_cauchy => :cauchy, :ordered_laplace => :laplace,
     :ordered_logistic => :logistic, :ordered_student_t => :student_t,
+    :vector_cauchy => :cauchy, :vector_laplace => :laplace,
+    :vector_logistic => :logistic, :vector_student_t => :student_t,
 )
 _is_ordered_parameter(f) = haskey(_VECTOR_ELEMENT_FAMILIES, f) &&
-    f !== :vector_normal
+    startswith(String(f), "ordered_")
 
 """Vector-parameter families and their positional arg keys."""
 const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
@@ -6531,6 +6536,10 @@ const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :ordered_logistic => (:arg1, :arg2),
     :ordered_student_t => (:arg1, :arg2, :arg3),
     :vector_normal => (:arg1, :arg2),
+    :vector_cauchy => (:arg1, :arg2),
+    :vector_laplace => (:arg1, :arg2),
+    :vector_logistic => (:arg1, :arg2),
+    :vector_student_t => (:arg1, :arg2, :arg3),
     :simplex_dirichlet => (:arg1,),
     :positive_exponential => (:arg1,),
     :cholesky_corr_lkj => (:arg1,),
@@ -6546,6 +6555,8 @@ const _JOINT_FACTOR_FAMILIES = (:positive_exponential, :cholesky_corr_lkj)
 # `_validate_responses`. Vector declarations can have several readers.
 function _validate_vector_parameters(plan::StructuralPlan)
     for p in plan.vector_parameters
+        p.size isa Expr && !haskey(_VECTOR_ELEMENT_FAMILIES, p.family) &&
+            _fail(p.label, "family $(p.family) needs a concrete integer size")
         haskey(VECTOR_ARITY, p.family) || _fail(p.label,
             "vector family $(p.family) unknown (admitted: ordered_normal, " *
             "vector_normal, simplex_dirichlet, positive_exponential, " *
@@ -6609,15 +6620,15 @@ function _validate_vector_parameters(plan::StructuralPlan)
                         "element prior $key must be finite, got $(repr(arg))")
                 end
             end
-            scale = p.family === :ordered_student_t ? p.args.arg3 : p.args.arg2
+            scale = _VECTOR_ELEMENT_FAMILIES[p.family] === :student_t ? p.args.arg3 : p.args.arg2
             scale isa Real && scale <= 0 && _fail(p.label,
                 "element prior scale must be positive")
-            if p.family === :ordered_student_t
+            if _VECTOR_ELEMENT_FAMILIES[p.family] === :student_t
                 nu = p.args.arg1
                 nu isa Real && nu <= 0 && _fail(p.label,
                     "element prior degrees of freedom must be positive")
             end
-            p.size === nothing || p.size >= 0 || _fail(p.label,
+            p.size === nothing || p.size isa Expr || p.size >= 0 || _fail(p.label,
                 "threshold size must be ≥ 0, got $(p.size)")
         end
     end
@@ -6716,8 +6727,10 @@ function topological_order(plan::StructuralPlan)
         refs = Set{Symbol}()
         for v in (values(p.args)..., _support_args(p.support_override)...)
             for ref in _value_symbols(v)
-                ref in names || _fail(p.label, "bound or arg references unknown name $ref")
-                push!(refs, ref)
+                (ref in names || (p.family === :binomial && p.name in plan.conditioned &&
+                    (!isbound(plan) || haskey(plan.columns,ref)))) ||
+                    _fail(p.label, "bound or arg references unknown name $ref")
+                ref in names && push!(refs, ref)
             end
         end
         deps[p.name] = refs
@@ -8014,14 +8027,12 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
         r.ordinal_structure === nothing ||
             _fail(r.label, "OrderedLogistic takes no ordinal_structure")
     end
-    want_family = want_ordered ? :ordered_normal : :vector_normal
     (want_ordered || want_plain) || _fail(r.label,
         "internal: ordinal structure $(r.ordinal_structure) unresolved")
-    (want_ordered ? _is_ordered_parameter(tp.family) :
-        tp.family === want_family) || _fail(r.label,
+    haskey(_VECTOR_ELEMENT_FAMILIES, tp.family) || _fail(r.label,
         "thresholds $(tp.name) is $(tp.family) but this response needs " *
-        "$want_family")
-    if r.n_levels !== nothing && tp.size !== nothing
+        "a real-support vector element prior")
+    if r.n_levels !== nothing && tp.size isa Int
         tp.size == r.n_levels - 1 || _fail(r.label,
             "thresholds size $(tp.size) disagrees with n_levels " *
             "$(r.n_levels) (thresholds number K−1)")
@@ -10530,6 +10541,9 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     for p in plan.array_parameters, d in p.dims
         _is_levels_dim(d) && push!(required, d.args[2])
     end
+    for p in plan.vector_parameters
+        p.extent_expr === nothing || union!(required, _expr_value_symbols(p.extent_expr))
+    end
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
         # Literal definitions can be dependencies of a module call, such
@@ -10689,6 +10703,8 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     for p in plan.vector_parameters
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)...))
+        p.extent_expr === nothing || push!(defs, Symbol(:_ppl_extent_input_, p.name) =>
+            p.extent_expr)
     end
     for s in plan.scans
         exprs = Any[s.hi]
@@ -11417,6 +11433,17 @@ function _validate_conditioned_values(plan)
         push!(known, p.name)
         plan.columns[_conditioned_input(p.name)] isa Number ||
             _fail(:condition, "$(p.name) is scalar; broadcast an observation vector with `.~`")
+        if p.family === :binomial
+            n = _layout_bound(plan,p.args.arg1)
+            n isa Real && isfinite(n) && isinteger(n) && n >= 0 || _fail(p.label,
+                "Binomial trials must be a nonnegative integer, got $(repr(n))")
+            probability = p.args.arg2
+            if probability isa Number || haskey(plan.columns,probability)
+                value = probability isa Number ? probability : plan.columns[probability]
+                value isa Real && 0 <= value <= 1 || _fail(p.label,
+                    "Binomial probability must be a scalar in [0,1], got $(repr(value))")
+            end
+        end
     end
     for p in plan.array_parameters
         p.name in plan.conditioned || continue
@@ -11479,10 +11506,51 @@ function _dirichlet_size(plan, alpha, label)
     return _array_dim_size(plan, Symbol(label), label, only(axes))
 end
 
+function _resolve_vector_extent(p::VectorParameter, plan, columns, responses)
+    extent = p.size
+    if extent === nothing && haskey(_VECTOR_ELEMENT_FAMILIES, p.family)
+        reader = findfirst(r -> r.thresholds === p.name, responses)
+        reader === nothing && return p
+        name = responses[reader].response
+        haskey(columns,name) || _fail(p.label,"vector $(p.name) length needs bound data $name")
+        extent = length(DataAPI.levels(columns[name])) - 1
+    elseif extent isa Expr
+        definitions = Dict(a.name => a.expr for a in
+            (plan === nothing ? () : (plan.assignments...,plan.derived...)))
+        active = Set{Symbol}()
+        function lookup(name)
+            haskey(columns,name) && return columns[name]
+            haskey(definitions,name) && name ∉ active || _fail(p.label,
+                "vector $(p.name) length needs data-only value $name")
+            push!(active,name)
+            value = _eval_value_expr(resolve_levels(definitions[name]),lookup,p.label)
+            delete!(active,name)
+            return value
+        end
+        resolve_levels(ex) = ex isa Expr ? Expr(ex.head,
+            (i == 1 && ex.head === :call && a === :levels ? GlobalRef(DataAPI,:levels) :
+                resolve_levels(a) for (i,a) in enumerate(ex.args))...) : ex
+        extent = try
+            _eval_value_expr(resolve_levels(extent),lookup,p.label)
+        catch e
+            e isa ContractValidationError && rethrow()
+            _fail(p.label,"vector $(p.name) length failed in Julia: " * sprint(showerror,e))
+        end
+    else
+        return p
+    end
+    extent isa Integer && !(extent isa Bool) && extent >= 0 || _fail(p.label,
+        "vector $(p.name) length must be a nonnegative integer, got $(repr(extent))")
+    return _with(p;size=Int(extent))
+end
+
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         vectors::Vector{VectorParameter}, columns::AbstractDict{Symbol},
         predictors::Vector{PredictorSpec} = PredictorSpec[],
         r2d2::Vector{R2D2Prior} = R2D2Prior[], plan = nothing)
+    # Explicit extents are ordinary data-only Julia expressions. Resolve
+    # them before responses read the vector's declared support.
+    vectors = VectorParameter[_resolve_vector_extent(p, plan, columns, responses) for p in vectors]
     out_r = LikelihoodSpec[]
     for r in responses
         _is_leveled_family(r.family) || (push!(out_r, r); continue)
@@ -11603,7 +11671,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "R2D2 phi size $(p.size) disagrees with its " *
                 "concentration length $want")
             push!(out_v, _with(p; size = want))
-        elseif p.family === :vector_normal && p.size !== nothing
+        elseif haskey(_VECTOR_ELEMENT_FAMILIES, p.family) && p.size !== nothing
             # A plain vector with a concrete structural size (read whole
             # by definitions or unused) retains its declared extent.
             push!(out_v, p)

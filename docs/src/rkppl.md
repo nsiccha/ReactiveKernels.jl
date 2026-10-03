@@ -157,6 +157,28 @@ element priors with live scalar arguments, for example
 `c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log
 densities on increasing vectors, with no factorial normalizer.
 
+Ordered extents may be data-only expressions, including
+`length(levels(x)) - 1`, `length(levels(y)) - 2` and
+`length(unique(y)) - 1`. Binding evaluates the actual nonnegative integer
+extent even when a Gaussian response reads the vector. An ordinal response
+has support `1:length(c)+1`; an observed category outside it fails at bind.
+`levels` includes a declared DataAPI level pool; `unique` counts observed
+values. The prior and support come from the declaration: cumulative
+cutpoints may have an ordinary Normal vector prior (non-increasing values
+give `-Inf`), and stopping-ratio thresholds may have an Ordered or ordinary
+Normal/Cauchy/Laplace/Logistic/StudentT prior.
+
+A per-cell `Flat()` prior contributes zero density and retains its layout
+coordinates. Its posterior may be proper through the likelihood; density
+evaluation requests no draw from the unnormalizable prior.
+
+Scalar observations also keep their declaration's density. For
+`m = @rkppl begin theta ~ Beta(1, 1); k ~ Binomial(n, theta) end`,
+`m(; n=5) | (; k=2)` packs only `theta`. Direct lowering with
+`conditioned=(:k,)` has the same density and Jacobian. Trials must be a
+nonnegative integer value, and the observed `k` must be scalar; use `.~`
+for an observation vector.
+
 Uniform bounds may be live scalar values, including in factor arrays:
 `lo ~ Normal(0, 1); c[levels(g)] .~ Uniform.(lo, lo + 3)`.
 

@@ -3166,6 +3166,8 @@ end
 # level, so nothing in the emitted program — statements or cell — grows
 # with the level count K. K=1 lowers to a zero cell (SB's
 # zero-information likelihood).
+_ordinal_cutpoints_valid(c) = all(c[2:end] .> c[1:end-1])
+
 function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     K = r.n_levels
     K === nothing && throw(ContractValidationError(
@@ -3178,6 +3180,8 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     inputs = Any[r.response, lp]
     yv, etav = _dovar(1), _dovar(2)
     prests = Expr[]
+    cutref = nothing
+    validref = nothing
     dref = _ordinal_lane_ref!(inputs, prests,
         _ordinal_scale_source!(prests, r, plan), nothing, :_)
     cell = if K == 1
@@ -3187,12 +3191,27 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         :(0.0 * $yv)
     else
         push!(inputs, :(Ref($(r.thresholds))))
-        _ordinal_cumulative_cell(r.link, K, yv, etav, dref, _dovar(length(inputs)))
+        cutref = _dovar(length(inputs))
+        cumulative = _ordinal_cumulative_cell(r.link, K, yv, etav, dref, cutref)
+        # A response reads the authored vector; it does not impose an
+        # Ordered transform or replace its prior. Guard before logarithms,
+        # including when only boundary categories are observed.
+        parameter = only(p for p in plan.vector_parameters if p.name === r.thresholds)
+        if _is_ordered_parameter(parameter.family) && parameter.name ∉ plan.conditioned
+            cumulative
+        else
+            valid = Symbol(:_ppl_cutpoints_valid_,r.label)
+            check = Expr(:call,GlobalRef(@__MODULE__,:_ordinal_cutpoints_valid),r.thresholds)
+            push!(prests,:($valid = $check))
+            push!(inputs,valid)
+            validref = _dovar(length(inputs))
+            cumulative
+        end
     end
     if r.discrimination isa ScalePredictorRef
         cell = :(isfinite($dref) && $dref > 0 ? $cell : -Inf)
     end
-    c = K == 1 ? nothing : _dovar(length(inputs))
+    c = cutref
     function ordinal_tail(b, upper)
         K == 1 && return upper ? :($b < 1 ? 1.0 : 0.0) : :($b < 1 ? 0.0 : 1.0)
         logtail=upper ? _ordinal_logCC(r.link,:($dref * ($c[$b]-$etav))) :
@@ -3201,6 +3220,7 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     end
     cell=_wrap_evidence!(r,plan,prests,inputs,cell;
         cdf=b->ordinal_tail(b,false),ccdf=b->ordinal_tail(b,true))
+    validref === nothing || (cell = :($validref ? $cell : -Inf))
     if r.weights !== nothing
         cell = _weighted_cell(_thread_ref!(inputs, r.weights), cell)
     end
@@ -4096,6 +4116,13 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         support::SupportOverride; conditioned = false, rows = nothing)
     node = Symbol(:_ppl_prior_, name)
     pw = Symbol(:_ppl_pw_prior_, name)
+    if family === :flat
+        # An improper density contributes zero; evaluating a posterior does
+        # not request a draw from the unnormalizable prior.
+        push!(stmts, :($pw = zero.($name)), :($node::Float64 = 0.0))
+        push!(terms, node)
+        return nothing
+    end
     if rows === 0
         # An empty authored loop evaluates no prior arguments or cell body.
         # Keep its pointwise identity so conditioned declarations retain shape.
@@ -4161,6 +4188,9 @@ end
 
 function _family_logpdf_expr(family::Symbol, a, x)
     family === :flat && return :(0.0)
+    family === :binomial && return :((isfinite($x) && floor($x) == $x &&
+        isfinite($(a[2])) && 0 <= $(a[2]) && $(a[2]) <= 1) ?
+        binomial(Int($(a[1])), 1.0 * $(a[2])).logpdf(Int($x)) : -Inf)
     return _prior_endpoint_expr(family, a, :logpdf, x)
 end
 

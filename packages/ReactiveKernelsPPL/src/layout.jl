@@ -1843,8 +1843,10 @@ function _vector_transform_statements(e::LayoutEntry)
     end
     if e.transform === :identity
         e.size == 0 && return Expr[]
+        # Materialize the ordinary range slice. A traced SubArray cannot
+        # be reindexed by the cumulative-cutpoint validity reduction.
         return Expr[:($(e.name)::AbstractVector{Float64} =
-            view(unconstrained, $lo:$hi))]
+            unconstrained[$lo:$hi])]
     end
     if e.transform === :ordered
         e.size == 0 && return Expr[]

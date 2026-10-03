@@ -1163,7 +1163,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # Interned predictors by name (shared with `ctx`: a composition over a
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
-    ctx = (; data, mod, detmap = canonmap, prior_names, coef_priors,
+    ctx = (; data, mod, conditioned, detmap = canonmap, prior_names, coef_priors,
         ordinary_parameters,
         detshape, shape_env, declaration_data,
         vecdefs, structural, derived_responses = derived_response_names,
@@ -8347,9 +8347,8 @@ end
 # Explicit cutpoints/thresholds of an ordinal response: the trailing
 # argument `Ref(c)` names one declared vector shared by every observation
 # (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
-# Cumulative structures take an `Ordered(...)` vector; stopping-ratio
-# stage thresholds are unconstrained, a one-axis sized
-# `c[1:K] .~ Normal.(m, s)` declaration. A vector may serve several
+# Either structure reads an Ordered vector or a one-axis sized vector
+# with its stated element prior and support. A vector may serve several
 # responses; its first use records a size source for `_lower_parameters`.
 function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         shown::String)
@@ -8363,14 +8362,7 @@ function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         _sfail("response $lhs: $shown takes its cutpoints as `Ref(c)` of " *
                "a declared vector, got $(repr(arg))")
     end
-    if ordered
-        name in ctx.ordered_names || _sfail("response $lhs: cutpoints " *
-            "$name must be an ordered vector declared in the model " *
-            "(`$name ~ Ordered(Normal(0, 1), length(levels($lhs)) - 1)`)")
-    else
-        name in ctx.ordered_names && _sfail("response $lhs: stopping-ratio " *
-            "thresholds are unconstrained, not ordered — declare " *
-            "`$name[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`")
+    if name ∉ ctx.ordered_names
         dims = get(ctx.array_dims, name, nothing)
         dims !== nothing && length(dims) == 1 || _sfail("response $lhs: " *
             "thresholds $name must be a one-axis vector declared in the " *
@@ -12510,7 +12502,15 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
                 syms))
             continue
         end
-        p = _lower_parameter(s.lhs, s.rhs, coefuse, ctx.matrices)
+        p = if s.lhs in ctx.conditioned && s.rhs isa Expr &&
+                s.rhs.head === :call && first(s.rhs.args) === :Binomial
+            args = _distribution_args(:Binomial, _plain_args(s.rhs, "`Binomial`"))
+            length(args) == 2 || _sfail("observed scalar Binomial takes a trial count and probability")
+            vals = Tuple(_lower_param_arg(s.lhs, a, coefuse, ctx.matrices) for a in args)
+            SampledParameter(s.lhs, :binomial, (arg1=vals[1], arg2=vals[2]), nothing, s.lhs)
+        else
+            _lower_parameter(s.lhs, s.rhs, coefuse, ctx.matrices)
+        end
         push!(params, p)
         for v in (values(p.args)..., _support_args(p.support_override)...)
             union!(syms, _value_symbols(v))
@@ -12861,18 +12861,21 @@ function _levels_count(ex)
     return (ex.args[2].args[2], k)
 end
 
-# A cutpoint vector's length: a literal `K − 1` (concrete size), or
-# `length(levels(y)) - 1` over the response `y` it serves (`nothing`: bind
-# infers K − 1 from `y`, whose level codes `validate_data` proves are
-# exactly 1..K, so the two counts agree on every bound data set). Any other
-# count fails closed.
-function _threshold_size(lhs::Symbol, n, response::Symbol)
+# A vector's literal extent or data-only Julia expression. The exact linked
+# default retains `nothing` in the unbound IR; binding evaluates DataAPI
+# levels before the response reads its support.
+function _threshold_size(lhs::Symbol, n, response::Union{Nothing,Symbol})
     n isa Integer && !(n isa Bool) && n >= 0 && return Int(n)
-    _levels_count(n) == (response, 1) && return nothing
-    _sfail("$lhs serves response $response, so its length is a literal or " *
-           "`length(levels($response)) - 1` (one cutpoint between each " *
-           "pair of adjacent levels), got $(repr(n))")
+    # Retain the historical inferred representation for the exact linked
+    # default; bind resolves it from DataAPI levels, including unused levels.
+    response !== nothing && _levels_count(n) == (response, 1) && return nothing
+    n isa Expr && return n
+    _sfail("vector $lhs length must be a nonnegative integer or a data-only expression, got $(repr(n))")
 end
+
+_resolve_extent_levels(ex) = ex isa Expr ? Expr(ex.head,
+    (i == 1 && ex.head === :call && a === :levels ? GlobalRef(DataAPI,:levels) :
+        _resolve_extent_levels(a) for (i,a) in enumerate(ex.args))...) : ex
 
 # Normal's constructor defaults are explicit distribution semantics.
 # Its arguments may be named values, just as in scalar priors.
@@ -12910,7 +12913,8 @@ end
 # plain `Vector{Float64}` value (`c[1]`, `c[2] - c[1]`); a cumulative
 # ordinal response consumes it as its cutpoints
 # (`OrderedLogistic.(eta, Ref(c))`), which also admits the data-sized
-# length `length(levels(y)) - 1`. Unconsumed, the length is a literal.
+# length `length(levels(y)) - 1`. Other data-only lengths evaluate at bind,
+# whether or not an ordinal response consumes the vector.
 function _lower_ordered(lhs, rhs, coefuse, ctx)
     haskey(coefuse, lhs) && _sfail("$lhs is a predictor coefficient and " *
         "cannot also be an Ordered vector")
@@ -12922,34 +12926,31 @@ function _lower_ordered(lhs, rhs, coefuse, ctx)
     family, prior_args = _ordered_element_prior(lhs, args[1], coefuse, ctx)
     n = args[2]
     use = get(ctx.threshold_uses, lhs, nothing)
-    size = if use !== nothing
-        _threshold_size(lhs, n, use.response)
-    elseif n isa Integer && !(n isa Bool) && n >= 1
-        Int(n)
-    else
-        _sfail("Ordered vector $lhs serves no ordinal response, so its " *
-               "length is a literal ≥ 1 (`$lhs ~ Ordered(Normal(0, 1), 3)`) " *
-               "— `length(levels(y)) - 1` sizes the cutpoints of the " *
-               "response `y` they serve (`y .~ OrderedLogistic.(eta, " *
-               "Ref($lhs))`), got $(repr(n))")
+    size = _threshold_size(lhs, n, use === nothing ? nothing : use.response)
+    if size isa Expr
+        size = _resolve_module_calls(_resolve_extent_levels(size), ctx.mod, union(ctx.data,ctx.prior_names,keys(ctx.detmap)),
+            "vector $lhs length")
     end
     return VectorParameter(lhs, family, prior_args, size, lhs)
 end
 
-# Stopping-ratio stage thresholds `c[1:n] .~ Normal.(m, s)`: one
-# unconstrained vector with an iid `Normal(m, s)` prior (the response
-# consumes it as `Ordinal.(StoppingRatio(), link, eta, Ref(c))`).
+# Sized ordinal thresholds keep the stated real-support element family
+# with an identity transform. Cumulative and stopping responses read it.
 function _lower_plain_thresholds(s, coefuse, ctx)
     lhs = s.lhs
     haskey(coefuse, lhs) && _sfail("$lhs is a predictor coefficient and " *
         "cannot also be thresholds")
-    m, sc = _threshold_normal_args(lhs, _undot_distribution(lhs, s.rhs),
-        "thresholds")
+    rhs = _undot_distribution(lhs, s.rhs)
+    family, args = _ordered_element_prior(lhs, rhs, coefuse, ctx)
+    family = Symbol(replace(String(family), "ordered_" => "vector_"))
     n = only(s.dims)
     size = n isa Int ? n : _threshold_size(lhs, n,
         ctx.threshold_uses[lhs].response)
-    return VectorParameter(lhs, :vector_normal, (arg1 = m, arg2 = sc), size,
-        lhs)
+    if size isa Expr
+        size = _resolve_module_calls(_resolve_extent_levels(size),ctx.mod,union(ctx.data,ctx.prior_names,keys(ctx.detmap)),
+            "vector $lhs length")
+    end
+    return VectorParameter(lhs, family, args, size, lhs)
 end
 
 _is_lkj_factor_call(rhs) =
