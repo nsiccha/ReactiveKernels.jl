@@ -2,6 +2,7 @@ using Reactant
 
 @testset "scalar Case-A families retain default primal and reverse graphs" begin
     previous=Dict{Any,Any}()
+    executable_previous=Dict{Any,Any}()
     # Fourfold packed-row growth (8 to 32). The complete ordinal inventories
     # at 15/31/63 show shape-specific canonicalization at 31, not body growth;
     # both primal and reverse inventories at 63 exactly match those at 15.
@@ -41,12 +42,18 @@ using Reactant
                 _probability_value_inventory(repr(Reactant.@code_hlo both(ru))))
             @test !isempty(pair[1]) && !isempty(pair[2])
             n==15 ? (previous[(kind,variant)]=pair) : (@test pair==previous[(kind,variant)])
+            executable=(_probability_value_executable_inventory(compiled,"scalar-$kind-$variant-$n-primal"),
+                _probability_value_executable_inventory(reverse,"scalar-$kind-$variant-$n-reverse"))
+            @test !isempty(executable[1]) && !isempty(executable[2])
+            n==15 ? (executable_previous[(kind,variant)]=executable) :
+                (@test executable==executable_previous[(kind,variant)])
         end
     end
 end
 
 @testset "uncensored stopping-ratio pointwise retains default structure" begin
     previous=Dict{Symbol,Any}()
+    executable_previous=Dict{Symbol,Any}()
     for n in (15,31), variant in (:plain,:gathered)
         f=_scalar_mi_fixture(:stopping,n;variant)
         kernel=prepare_query(f.built,f.bound,:pointwise)
@@ -56,5 +63,8 @@ end
         graph=_probability_value_inventory(repr(Reactant.@code_hlo kernel(ru)))
         @test !isempty(graph)
         n==15 ? (previous[variant]=graph) : (@test graph==previous[variant])
+        executable=_probability_value_executable_inventory(compiled,"pointwise-$variant-$n-primal")
+        @test !isempty(executable)
+        n==15 ? (executable_previous[variant]=executable) : (@test executable==executable_previous[variant])
     end
 end
