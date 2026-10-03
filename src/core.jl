@@ -226,15 +226,25 @@ end
 @inline _tensorized_cat_arg_marker(::Val{:tensorized}, arg, rest) = arg
 @inline _tensorized_cat_arg_marker(::Val{:native}, arg, rest) =
     _tensorized_cat_marker(rest)
-@inline function _tensorized_cat_operands(args::Tuple)
+@inline function _tensorized_cat_operands(args::Tuple,
+        operand = _tensorized_cat_operand)
     marker = _tensorized_cat_marker(args)
     marker === nothing ? args :
-        map(arg -> _tensorized_cat_operand(marker, arg), args)
+        map(arg -> operand(marker, arg), args)
 end
-@inline _tensorized_vcat(args...) = vcat(_tensorized_cat_operands(args)...)
-@inline _tensorized_hcat(args...) = hcat(_tensorized_cat_operands(args)...)
+# Concatenation treats a scalar as one entry; broadcast must keep it a scalar.
+# Give concatenation its own operand hook, with the structural argument rank,
+# so a tracing extension can lift scalars and pad missing unit dimensions.
+@inline _tensorized_concat_operand(marker, arg, rank) =
+    _tensorized_cat_operand(marker, arg)
+@inline _tensorized_concat_operands(args::Tuple) =
+    _tensorized_cat_operands(args,
+        (marker, arg) -> _tensorized_concat_operand(
+            marker, arg, Val(maximum(ndims, args))))
+@inline _tensorized_vcat(args...) = vcat(_tensorized_concat_operands(args)...)
+@inline _tensorized_hcat(args...) = hcat(_tensorized_concat_operands(args)...)
 @inline _tensorized_cat(args...; dims) =
-    cat(_tensorized_cat_operands(args)...; dims = dims)
+    cat(_tensorized_concat_operands(args)...; dims = dims)
 # A scalar-vector literal (`[a, b, c]`) in a tensorized body.  The default
 # is the plain `Base.vect` construction; a tracing extension builds a real
 # traced vector when any element is traced (a host container of traced
@@ -785,6 +795,28 @@ end
 @inline _tensorized_plate_fallback_arg(arg::_TensorizedPlateBatch) = arg.values
 @inline _tensorized_plate_materialize(value) = value
 @inline _tensorized_plate_materialize(value::_TensorizedPlateBatch) = value.values
+# Keep array-valued lanes identifiable until their consumer decides how to
+# arrange them. A bare lanes-leading tensor is not a collection of arrays:
+# `stack` would flatten its scalar entries and silently lose the lane layout.
+@inline _tensorized_plate_pointwise(value) = _tensorized_plate_materialize(value)
+@inline _tensorized_plate_pointwise(value::_TensorizedPlateBatch{<:AbstractArray}) =
+    ndims(value.values) > 1 ? value : value.values
+@inline _tensorized_plate_pointwise(
+    value::_TensorizedPlateBatch{<:Tuple,<:AbstractArray}) = value
+
+# The marker is owned by RK, so ordinary helpers can use Base.stack without a
+# backend-specific helper method. Only the fixed tensor rank determines this
+# permutation; no recipe or indexing operation is replicated per lane.
+Base.stack(value::_TensorizedPlateBatch; dims = :) =
+    _tensorized_plate_stack(_tensorized_plate_materialize(value), dims)
+@inline _tensorized_plate_stack(value::AbstractArray, ::Colon) =
+    _tensorized_plate_stack(value, ndims(value))
+@inline function _tensorized_plate_stack(value::AbstractArray, dim::Integer)
+    rank = ndims(value)
+    1 <= dim <= rank || throw(ArgumentError("stack dimension must be in 1:$rank"))
+    permutation = ntuple(i -> i == dim ? 1 : i < dim ? i + 1 : i, rank)
+    permutedims(value, permutation)
+end
 # The authored `sum(pointwise)` consumer of a plate.  Native semantics are
 # exactly `sum` over the materialized pointwise vector; a backend that keeps
 # the plate as per-lane values may reduce those lanes directly instead of

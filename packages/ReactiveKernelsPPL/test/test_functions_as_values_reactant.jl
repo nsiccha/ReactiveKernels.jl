@@ -15,18 +15,22 @@ using Reactant
             both(w) = ad_value_and_gradient(ad, w)
             ops(hlo) = begin
                 counts = Dict{String,Int}()
-                for m in eachmatch(r"(?:stablehlo|enzyme)\.[a-z_]+", repr(hlo))
+                for m in eachmatch(r"\b(?:stablehlo|chlo|func|arith|enzyme|scf|tensor|cf|math|linalg|memref)\.\w+", repr(hlo))
                     counts[m.match] = get(counts, m.match, 0) + 1
                 end
                 counts
             end
+            # Raw tracing may materialize shape-dependent broadcasts. Keep
+            # its retained iteration checks, and compare every operation in
+            # both ordinary executable graphs without exclusions.
+            raw_primal = ops(Reactant.@code_hlo optimize = false kernel(ru))
+            raw_reverse = ops(Reactant.@code_hlo optimize = false both(ru))
             push!(structures, (
-                ops(Reactant.@code_hlo optimize = false kernel(ru)),
-                ops(Reactant.@code_hlo optimize = false both(ru)),
-                ops(Reactant.@code_hlo optimize = true kernel(ru)),
-                ops(Reactant.@code_hlo optimize = true both(ru))))
+                ops(Reactant.@code_hlo kernel(ru)),
+                ops(Reactant.@code_hlo both(ru))))
             @test all(inventory -> !isempty(inventory), structures[end])
-            @test get(structures[end][1], "stablehlo.reduce", 0) > 0
+            @test get(raw_primal, "stablehlo.reduce", 0) > 0
+            @test get(raw_reverse, "enzyme.batch", 0) > 0
             push!(recipes, length(built.spec.graph.recipes))
             primal = Reactant.@compile kernel(ru)
             compiled = compile_ad_value_and_gradient(ad, ru)

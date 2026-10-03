@@ -1111,6 +1111,23 @@ end
         marker::_TracedReshapedArray, arg::AbstractArray) =
     Reactant.promote_to(Reactant.TracedRArray, arg)
 
+# Base's scalar fill path still iterates after promoting the array beside it.
+# Lift each scalar to a rank-zero tensor, then normalize missing dimensions
+# exactly as Julia concatenation does (unit axes, never scalar broadcasting).
+# This hook is separate from broadcast's array-only promotion above.
+@inline _rk_concat_array(arg::AbstractArray) =
+    Reactant.promote_to(Reactant.TracedRArray, arg)
+@inline _rk_concat_array(arg::Number) =
+    Reactant.promote_to(Reactant.TracedRArray,
+        Reactant.promote_to(Reactant.TracedRNumber, arg))
+@inline function ReactiveKernels._tensorized_concat_operand(
+        marker::Union{Reactant.TracedType,_TracedReshapedArray},
+        arg::Union{Number,AbstractArray}, ::Val{N}) where {N}
+    array = _rk_concat_array(arg)
+    ndims(array) == N ? array :
+        reshape(array, ntuple(dim -> size(array, dim), N))
+end
+
 # A traced scalar index is a deliberate gather at this compiler boundary: one
 # element read with one integer index per dimension (`x[j]`, `W[i, j]`) is
 # one slice, including an authored read at literal indices. Reactant 0.2.284 preserves
@@ -1714,6 +1731,11 @@ struct _AuthoredPlateBatchCall{B,S,N,O,A,L}
 end
 
 @inline _authored_plate_batch_scalar(array) = Reactant.@allowscalar array[]
+# A reshape view over a traced tensor remains one tensor result, rather than a
+# host collection whose entries would need a compound fixed-storage schema.
+@inline _authored_plate_batch_result(value) = value
+@inline _authored_plate_batch_result(value::_TracedReshapedArray) =
+    Reactant.promote_to(Reactant.TracedRArray, value)
 
 struct _PlateLaneLayout{N,S}
     schema::S
@@ -1748,7 +1770,7 @@ _plate_layout_width(::Type{<:_PlateLaneLayout{N}}) where {N} = N
             push!(values, :(getfield(getfield(call, :shared), $shared_position)))
         end
     end
-    :(getfield(call, :operation)($(values...)))
+    :(_authored_plate_batch_result(getfield(call, :operation)($(values...))))
 end
 
 @inline _authored_plate_batch_length(arg::ReactiveKernels._TensorizedEachcol) =
@@ -1942,6 +1964,10 @@ end
 _sum_plate_tree(schema::Number, values, count) = schema * count
 _sum_plate_tree(schema, values, count) = schema
 _plate_leaf_sum(value) = sum(value; dims=1)
+ReactiveKernels._tensorized_plate_sum(
+        value::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray}) =
+    _sum_plate_tree(_PlateLaneLeaf{1,Base.tail(size(value.values))}(),
+        (value.values,), _authored_plate_batch_length(value))
 function _sum_plate_tree(::_PlateLaneLeaf{I,D}, values, count) where {I,D}
     reduced = Reactant.call_with_reactant(_plate_leaf_sum,
         _reactant_plate_operand(getfield(values, I)))

@@ -29,6 +29,8 @@ rectangular_fold_testfile = joinpath(@__DIR__, "test_rectangular_fold_reactant.j
 inner_partial_evaluation_testfile = joinpath(
     @__DIR__, "test_inner_plate_partial_evaluation_reactant.jl")
 ref_array_plate_testfile = joinpath(@__DIR__, "test_ref_array_plate_reactant.jl")
+plate_consumer_layout_testfile = joinpath(
+    @__DIR__, "test_plate_consumer_layout_reactant.jl")
 position_batching_testfile = joinpath(@__DIR__, "test_position_batching_reactant.jl")
 glm_testfile = joinpath(@__DIR__, "test_glm_reactant.jl")
 tensorized_vect_testfile = joinpath(@__DIR__, "test_tensorized_vect_reactant.jl")
@@ -73,6 +75,7 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $position_batching_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $plate_consumer_layout_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $lazy_branches_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_loops_testfile`)
@@ -110,6 +113,8 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $glm_testfile`)
     elseif selector == "ref-array-plate"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ref_array_plate_testfile`)
+    elseif selector == "plate-consumer-layout"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $plate_consumer_layout_testfile`)
     elseif selector == "ppl-examples"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ppl_examples_testfile`)
     elseif selector == "ad"
