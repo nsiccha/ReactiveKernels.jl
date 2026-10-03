@@ -161,8 +161,8 @@ end
 
 """Slice-1 predictor term kinds (core set; stretch adds variants later).
 `LatentTerm` carries a per-cell latent parameter vector (a [`PlateParameter`](@ref))
-as the whole linear predictor (`lp = theta`, identity design) — the
-random-effects / per-observation-latent location. `ScanSummandTerm` splices a
+as a linear-predictor value (`lp = theta` or an unscaled summand, identity
+design) — the random-effects / per-observation-latent location. `ScanSummandTerm` splices a
 sequential-recurrence state into the predictor scaled by a sampled scalar
 coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta), or
 unscaled when its `coef` is `nothing` (`mu = a .+ x`).

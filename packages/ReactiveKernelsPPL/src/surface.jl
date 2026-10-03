@@ -9457,8 +9457,8 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     # referenced directly). A derived location with NO latent stays a design
     # predictor; a latent-reading definition WITH coefficient structure is a
     # design predictor too (`b .* theta` classifies as a ContinuousTerm over
-    # the latent — the SB `me` mirror), while a bare latent inside a larger
-    # expression fails in `_classify_symbol`.
+    # the latent), while an unscaled latent summand contributes its value
+    # through the same LatentTerm used for a direct location.
     if loc isa Symbol && loc in ctx.plate_names
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
@@ -9566,8 +9566,8 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             return _value_location!(lhs, loc, pred_link, ctx,
                 predictors, pred_idx; synth)
         # Per-cell latents classify inline like data columns: `b .* x_true`
-        # is a ContinuousTerm over the latent (the SB `me` mirror); a bare
-        # latent fails in `_classify_symbol`, never silently.
+        # is a ContinuousTerm over the latent; an unscaled summand is a
+        # LatentTerm, just as when the whole location names that latent.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
         pin = get(ctx.predictor_pins, lhs, nothing)
@@ -10534,14 +10534,13 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
     # feed a predictor directly; an empty predictor still has no value.
     if isempty(uses) && !(!isempty(terms) &&
             all(t -> t.kind === OffsetTerm ||
+                t.kind === LatentTerm ||
                 t.kind === MonotonicSummandTerm ||
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
                 (composed_sub && t.kind === VaryingEffectTerm), terms))
-        _sfail("predictor $pname has no estimated coefficients — add an " *
-               "intercept or coefficient (bare-data offset affines and " *
-               "beta-free `mo1()` predictors are the only " *
-               "coefficient-free shapes)")
+        _sfail("predictor $pname has no estimated coefficients or " *
+               "coefficient-free value terms")
     end
     return terms, uses
 end
@@ -11099,9 +11098,12 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
     end
-    core in ctx.plate_names && _sfail(
-        "predictor $pname: bare latent $core is not a term — scale it " *
-        "by a coefficient (`b .* $core`, the SB `me` mirror)")
+    if core in ctx.plate_names
+        sign < 0 && return _extract_summand(pname,
+            Expr(:call, :.-, core), 1, ctx)
+        return TermSpec(LatentTerm, [core], NamedTuple(),
+            core, Symbol(core, "_lat")), nothing
+    end
     if core in ctx.scan_states
         # A bare scan state is a beta-free summand: the state spliced
         # unscaled (`mu = a .+ x`, the dar/`mo1` shape). Negation is a value.

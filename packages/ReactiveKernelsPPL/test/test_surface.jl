@@ -4449,8 +4449,8 @@ _pcs(cells...) = Expr(:block,
     @test only(subh.plate_parameters).support_override === :positive
 
     # ── Two use sites of the same submodel namespace independently (no clash).
-    # Their latents join through a derived cell (a bare multi-latent location is
-    # a separate, pre-existing plate limitation).
+    # Their latents join through a derived cell; inline locations also compose
+    # the same ordinary values.
     two = lower_rkppl(_pcs(:(a[i] ~ pcs_ncp(mu, tau)),
                            :(c[i] ~ pcs_ncp(mu, tau)),
                            :(s[i] = a[i] .+ c[i]),
