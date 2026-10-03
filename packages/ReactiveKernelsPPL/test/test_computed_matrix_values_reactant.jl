@@ -1,12 +1,31 @@
 using Reactant
 
-function _cm_inventory(text, executable = false)
-    pattern = executable ?
-        r"(?m)^\s*(?:ROOT\s+)?%?[\w.-]+ = .*?\s+([A-Za-z][A-Za-z0-9_-]*)\(" :
-        r"\b(?:stablehlo|chlo|func|arith|enzyme|scf|tensor|cf|math|linalg|memref)\.\w+"
+function _cm_mlir_inventory(module_)
+    IR = Reactant.MLIR.IR
+    counts = Dict{String,Int}()
+    function visit(op)
+        name = IR.name(op)
+        counts[name] = get(counts, name, 0) + 1
+        for region in op, block in region, child in block
+            visit(child)
+        end
+    end
+    Reactant.MLIR.IR.@dispose ctx = Reactant.ReactantContext() begin
+        mod = parse(IR.Module, String(module_); context = ctx)
+        try
+            visit(IR.Operation(mod))
+        finally
+            IR.dispose(mod)
+        end
+    end
+    return counts
+end
+
+function _cm_executable_inventory(text)
+    pattern = r"(?m)^\s*(?:ROOT\s+)?%?[\w.-]+ = .*?\s+([A-Za-z][A-Za-z0-9_-]*)\("
     counts = Dict{String,Int}()
     for m in eachmatch(pattern, text)
-        name = executable ? m.captures[1] : m.match
+        name = m.captures[1]
         counts[name] = get(counts, name, 0) + 1
     end
     return counts
@@ -46,20 +65,21 @@ end
         end
         @test isequal(fx.data, original)
         both = reverse.f
-        modules = (repr(Reactant.@code_hlo optimize=false kernel(ru)),
-            repr(Reactant.@code_hlo kernel(ru)),
-            repr(Reactant.@code_hlo optimize=false both(ru)),
-            repr(Reactant.@code_hlo both(ru)))
+        modules = (Reactant.@code_hlo(optimize=false, kernel(ru)),
+            Reactant.@code_hlo(kernel(ru)),
+            Reactant.@code_hlo(optimize=false, both(ru)),
+            Reactant.@code_hlo(both(ru)))
         executables = (repr(only(Reactant.XLA.get_hlo_modules(primal.exec))),
             repr(only(Reactant.XLA.get_hlo_modules(reverse.exec))))
         labels = ("primal.raw.mlir", "primal.default.mlir", "reverse.raw.mlir",
             "reverse.default.mlir", "primal.hlo", "reverse.hlo")
-        for (label, text) in zip(labels, (modules..., executables...))
+        for (label, text) in zip(labels, (map(repr, modules)..., executables...))
             _cm_save_backend("matrix-$mode-$n-$label", text)
         end
-        inventories = (map(_cm_inventory, modules)...,
-            map(t -> _cm_inventory(t, true), executables)...)
+        inventories = (map(_cm_mlir_inventory, modules)...,
+            map(_cm_executable_inventory, executables)...)
         @test all(!isempty, inventories)
+        @test all(i -> get(i, "func.return", 0) > 0, inventories[1:4])
         println("MATRIX_INVENTORIES ", mode, " ", n, " ", inventories)
         if haskey(previous, mode)
             # At three rows the raw product trace folds one constant and
