@@ -476,6 +476,12 @@ function _ad_na_walk(node, tainted::Set{Symbol}, have_free::Set{Symbol},
                     Expr(:ref, _OPS_ARG, step), rewritten...),
             step_tainted, !step_tainted && step_free
     end
+    # The operation table is preparation-owned, not a HAVE input. Plain
+    # constant loads and cacheless steps must propagate HAVE-freedom through
+    # their callee just as cached steps do through their arguments.
+    slot = _operation_slot(node)
+    slot !== nothing && 1 <= slot <= length(ops) &&
+        return node, false, true
     node isa Symbol && return node, node in tainted, node in have_free
     node isa GlobalRef && return node, false, true
     node isa LineNumberNode && return node, false, true
