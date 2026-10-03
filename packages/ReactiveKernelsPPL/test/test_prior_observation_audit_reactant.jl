@@ -4,12 +4,18 @@ function _audit_backend_structure(sampler,ru)
     primal=sampler.kernel
     ad=sampler.ad
     both(v)=ad_value_and_gradient(ad,v)
-    return [(prefix*m.match) for (prefix,hlo) in (
-        ("primal.",repr(Reactant.@code_hlo optimize=false primal(ru))),
-        ("reverse.",repr(Reactant.@code_hlo optimize=false both(ru))),
-        ("primal.optimized.",repr(Reactant.@code_hlo primal(ru))),
-        ("reverse.optimized.",repr(Reactant.@code_hlo both(ru)))) for m in
-        eachmatch(r"\b(?:stablehlo|chlo|enzyme|func|arith)\.\w+",hlo)]
+    # Compare complete operation counts in the ordinary executable pipeline.
+    # Transient unoptimized broadcasts can change when a larger shape folds
+    # a scalar; their ordered listing does not measure body replication.
+    counts=Dict{String,Int}()
+    for (prefix,hlo) in (("primal.",repr(Reactant.@code_hlo primal(ru))),
+            ("reverse.",repr(Reactant.@code_hlo both(ru))))
+        for m in eachmatch(r"\b(?:stablehlo|chlo|enzyme|func|arith|scf|tensor)\.\w+",hlo)
+            key=prefix*m.match
+            counts[key]=get(counts,key,0)+1
+        end
+    end
+    return counts
 end
 
 function _audit_backend_check(bound,built,q,oracle)
@@ -33,7 +39,7 @@ function _audit_backend_check(bound,built,q,oracle)
 end
 
 @testset "later prior and ordinal audit: compiled primal, reverse and retained structure" begin
-    structures=Dict{String,Vector{String}}()
+    structures=Dict{String,Dict{String,Int}}()
     for n in (12,24),case in _audit_cases(n)
         @testset "$(case.label) n=$n" begin
             println("AUDIT_COMPILED ",case.label," n=",n);flush(stdout)
@@ -72,7 +78,7 @@ end
 
 @testset "scalar observed Binomial: compiled doors and structure" begin
     for door in (:names,:values,:public)
-        structures=Vector{String}[]
+        structures=Dict{String,Int}[]
         for (n,k) in ((5,2),(9,4),(0,0))
             println("AUDIT_COMPILED scalar ",door," n=",n);flush(stdout)
             bound=_audit_scalar_binomial(door,n,k)

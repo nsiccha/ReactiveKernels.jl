@@ -75,9 +75,9 @@ _wb_cols() = Dict{Symbol,AbstractVector}(:y => copy(_WB_Y), :x => copy(_WB_X))
             end, (:y, :x, :kc); conditioned = (:y, :x, :kc))
         @test only(plan.responses).scale === :kc
     end
-    @testset "modeled k deferred" begin
-        # capability: modeled Weibull shape via a log-link predictor (exp.(ls)); 'deferred' (todo `05fuzch`)
-        @test_broken (lower_rkppl(quote
+    @testset "modeled k" begin
+        # admitted: modeled Weibull shape via a log-link predictor (exp.(ls)) (todo `05fuzch`)
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)

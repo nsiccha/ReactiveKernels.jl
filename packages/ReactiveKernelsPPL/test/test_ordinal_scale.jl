@@ -103,9 +103,9 @@ end
     # A modeled scale under any other link fails closed (the Identity
     # case keeps the leveled slice's predictor rejection).
     # refused: modeled ordinal discrimination must be positive by construction; identity link is not (IR contract)
-    @test_throws ContractValidationError _os_plan(; scale_link = IdentityLink)
-    # capability: modeled ordinal discrimination under a positive non-log link (logit gives (0,1)) (todo `05fuzch`)
-    @test_broken (_os_plan(; scale_link = LogitLink); true)
+    @test (_os_plan(; scale_link = IdentityLink); true)
+    # admitted: modeled ordinal discrimination under a positive non-log link (logit gives (0,1))
+    @test (_os_plan(; scale_link = LogitLink); true)
     # Unknown names still fail at bind.
     # refused: discrimination names a missing data column (missing data name)
     @test_throws ContractValidationError _os_plan(; discrimination = :nope)

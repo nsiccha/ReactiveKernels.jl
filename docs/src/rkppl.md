@@ -200,6 +200,19 @@ Uniform bounds may be live scalar values, including in factor arrays:
   `Beta.(logistic.(eta) .* k, (1 .- logistic.(eta)) .* k)` changes its mean
   from `logistic.(eta)` to `1 .- logistic.(eta)`.
 - Broadcasting is explicit: `mu = a .+ b .* x`.
+- Distribution arguments use their ordinary values. `exp.`, `logistic.`,
+  `normcdf.` and `cexpexp.` apply at each use, including means, rates,
+  probabilities, scales, shapes, Student degrees of freedom and zero
+  inflation. One predictor may feed several slots or responses under
+  different links, with its original parameter names and priors.
+  Values outside parameter support contribute `-Inf` through a lazy
+  density branch. Mixture components may use independent links.
+  Scalar Horseshoe coefficient aliases read the value reconstructed from
+  the existing coordinates, so a scale use retains the same prior.
+- Plate cells accept `BernoulliLogit.(eta)` and `PoissonLog.(eta)` directly
+  on the logit and log-rate scales. A bare modeled `VonMises.(kappa)` uses
+  zero mean. Live concentration supports native density and AD; compiled
+  execution remains gated by the missing traced `besseli` method.
 - A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
   `y ~ Normal(...)` on a data vector is rejected.
 - A `~` whose left-hand side is a bound data column is an observation; every

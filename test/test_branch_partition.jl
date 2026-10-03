@@ -273,4 +273,22 @@ end
         @test grad ≈ [(mp == 0 ? -2/1.5 : 0.0)
             for (yf,lpi,mp) in zip(y_full,lp,mis_pos)]
     end
+
+    @testset "endpoint helpers keep their defining module" begin
+        k = prepare(EndpointBranchCaller.scoped_endpoint_arm;
+            have = (:y, :m, :g), want = :total)
+        oracle = sum(g == 0 ? 2 * (y - m) / 1.5 -
+            0.5 * log(2π) - log(1.5) : 0.0
+            for (y, m, g) in zip(y_full, lp, mis_pos))
+        @test k(y_full, lp, mis_pos) ≈ oracle
+        bound = prepare(EndpointBranchCaller.scoped_endpoint_arm;
+            have = (:y, :m, :g), want = :total,
+            bound = (; y = y_full, g = mis_pos))
+        @test bound(lp) ≈ oracle
+        ad = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), lp;
+            active = :m)
+        val, grad = ReactiveKernels.ad_value_and_gradient!(ad, similar(lp), lp)
+        @test val ≈ oracle
+        @test grad ≈ [-2 / 1.5, 0, -2 / 1.5, 0]
+    end
 end

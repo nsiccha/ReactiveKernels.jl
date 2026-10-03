@@ -1490,8 +1490,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         push!(derived, VectorAssignmentSpec(d.name, rhs, d.label))
     end
     append!(assigns, ctx.synth_assigns)
+    coefficient_values = _horseshoe_value_bindings!(assigns, derived,
+        responses, params, plate_parameters, priors, predictors, coefuse,
+        hses, hsset)
     _check_coefficient_readers(coefuse, ctx, predictors, priors, params,
-        plate_parameters, assigns, derived, responses)
+        plate_parameters, assigns, derived, responses; coefficient_values)
     _validate_varying_margins(varying_draws, data, derived, detshape,
         used_locs)
     # Varying bindings compose only as direct predictor summands:
@@ -3767,7 +3770,9 @@ const _KERNEL_OBS_FAMILIES = Dict{Symbol,Tuple{Any,Int}}(
     :Cauchy => (CauchyFam, 2),
     :Binomial => (BinomialProbFam, 2),
     :Bernoulli => (BernoulliLogitFam, 1),
+    :BernoulliLogit => (BernoulliLogitFam, 1),
     :Poisson => (PoissonLogFam, 1),
+    :PoissonLog => (PoissonLogFam, 1),
     :NegativeBinomial2 => (NegativeBinomial2Fam, 2),
     :Gamma => (GammaLogFam, 2),
     :Beta => (BetaLogitFam, 2),
@@ -3779,15 +3784,13 @@ const _KERNEL_OBS_FAMILIES = Dict{Symbol,Tuple{Any,Int}}(
 
 # Scalar response-space heads a panel cell admits (v2; the grouped
 # joint heads stay grouped-only — they need a schedule).
-const _PANEL_OBS_HEADS = (:Normal, :Bernoulli, :Poisson,
+const _PANEL_OBS_HEADS = (:Normal, :Bernoulli, :BernoulliLogit, :Poisson, :PoissonLog,
     :NegativeBinomial2, :Gamma, :Beta, :StudentT, :Binomial, :Cauchy)
 
 # Fused link-space heads rejected in cells (response-space node — the
 # link inverts via a pre-assignment, the julianic delta): head => the
 # admitted spelling.
 const _KERNEL_FUSED_HEADS = Dict{Symbol,String}(
-    :BernoulliLogit => "`p = 1 ./ (1 .+ exp.(-eta))` + `Bernoulli.(p)`",
-    :PoissonLog => "`mu = exp.(eta)` + `Poisson.(mu)`",
     :BernoulliProbit => "probit link (not admitted in cells)",
     :BernoulliCloglog => "cloglog link (not admitted in cells)")
 
@@ -3811,8 +3814,8 @@ _kernel_admitted_msg(grouped::Bool) =
 # plate: like grouped but the response names its data column
 # directly). Panels and automatic schedule chains hoist inline arguments
 # to cell assignments before this parser. Authored grouped cells use named
-# arguments. Fused link-space heads require a response-space assignment.
-# The response surface's
+# arguments. Fused BernoulliLogit and PoissonLog heads retain their
+# explicit link as observation metadata. The response surface's
 # link-unwrapping/shape-decomposition does NOT apply in cells (args are
 # opaque names — the julianic delta): the user applies links in
 # pre-assignments, and values agree with the standard spelling whenever
@@ -3911,9 +3914,12 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
             _sfail("$where obs $nm must be a cell/model name or a " *
                    "numeric literal, got $(repr(ref))")
     end
-    return (response = resp, family = fam, location = dargs[1],
+    obs = (response = resp, family = fam, location = dargs[1],
         scale = arity == 1 ? nothing : dargs[2],
         params = arity <= 2 ? () : Tuple(dargs[3:end]))
+    head === :BernoulliLogit && return merge(obs, (; link = LogitLink))
+    head === :PoissonLog && return merge(obs, (; link = LogLink))
+    return obs
 end
 
 # Grouped-kernel statement (plate form, SB `@plate for` verbatim modulo
@@ -8081,8 +8087,7 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
     # routes through `_lower_location`, which admits a value location
     # here (a scalar parameter or data column under the written link).
     pname = family === BetaShapeFam ? _argument_location!(lhs, loc, ctx,
-        predictors, pred_idx) : (family === BinomialProbFam ||
-            family === ZeroInflatedBinomialFam) ?
+        predictors, pred_idx) : family === BinomialProbFam ?
         _lower_prob_location(lhs, loc, ctx, predictors, pred_idx,
             family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
         family in (GammaValueFam, WeibullValueFam) ?
@@ -8171,6 +8176,11 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         push!(trials_raw, tr)
         push!(wrappeds, wrapped)
     end
+    canonical_family(f) = f in (BernoulliProbitFam, BernoulliCloglogFam) ?
+        BernoulliLogitFam : f in (BinomialProbitFam, BinomialCloglogFam) ?
+        BinomialLogitFam : f
+    original_fams = copy(fams)
+    fams = canonical_family.(fams)
     f = fams[1]
     all(==(f), fams) || _sfail("response $lhs: mixture components must " *
         "share one family (found $(join(unique!(string.(fams)), ", "))); " *
@@ -8179,15 +8189,26 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         "components over $f are not admitted in v1 (admitted: Normal, " *
         "Bernoulli-logit, Poisson-log, Binomial-logit, " *
         "NegativeBinomial2-log, Gamma-log, Beta-logit)")
-    ll, pl = llinks[1], plinks[1]
+    canonical = _mixture_canon_link(f)
+    value_components = !all(==(canonical), llinks) || !all(==(f), original_fams)
+    ll = value_components ? IdentityLink : canonical
     trials = nothing
     if f === BinomialLogitFam
         t1 = trials_raw[1]
         trials = all(t -> isequal(t, t1), trials_raw) ? t1 : nothing
     end
-    loc_uses = Union{Symbol,Real}[
-        _lower_mixture_loc(lhs, k, loc, pl, wrappeds[k], ctx, predictors,
-            pred_idx, coefuse) for (k, loc) in enumerate(locs_raw)]
+    loc_uses = Union{Symbol,Real}[]
+    for (k, loc) in enumerate(locs_raw)
+        use = if value_components && wrappeds[k]
+            value = _inverse_link_spelling(llinks[k], loc)
+            _lower_location(lhs, value, IdentityLink, ctx, predictors,
+                pred_idx, coefuse; value = true, synth = Symbol(lhs, :_mix_, k, :_value))
+        else
+            _lower_mixture_loc(lhs, k, loc, plinks[k], wrappeds[k], ctx,
+                predictors, pred_idx, coefuse)
+        end
+        push!(loc_uses, use)
+    end
     scale_uses = Union{Nothing,Symbol,Real,ScalePredictorRef}[]
     for (k, sc) in enumerate(scales_raw)
         lowered_sc = _mixture_component_context(lhs, k) do
@@ -8262,36 +8283,36 @@ function _lower_mixture_component(lhs, compcall::Expr, ctx)
     elseif head === :Bernoulli
         args = _plain_args(compcall, "`Bernoulli`")
         if length(args) == 1 && (args[1] isa Symbol || args[1] isa Real)
-            return BernoulliLogitFam, LogitLink, IdentityLink, args[1],
+            return BernoulliLogitFam, IdentityLink, IdentityLink, args[1],
             nothing, nothing, false
         end
     elseif head === :Poisson
         args = _plain_args(compcall, "`Poisson`")
         if length(args) == 1 && (args[1] isa Symbol || args[1] isa Real)
-            return PoissonLogFam, LogLink, LogLink, args[1], nothing,
+            return PoissonLogFam, IdentityLink, IdentityLink, args[1], nothing,
             nothing, false
         end
     elseif head === :Binomial
         args = _plain_args(compcall, "`Binomial`")
         if length(args) == 2 && (args[2] isa Symbol || args[2] isa Real)
-            return BinomialLogitFam, LogitLink, IdentityLink, args[2],
+            return BinomialLogitFam, IdentityLink, IdentityLink, args[2],
             nothing, _lower_trials(lhs, args[1], ctx), false
         end
     elseif head === :NegativeBinomial2
         args = _plain_args(compcall, "`NegativeBinomial2`")
         if length(args) == 2 && (args[1] isa Symbol || args[1] isa Real)
-            return NegativeBinomial2Fam, LogLink, LogLink, args[1], args[2],
+            return NegativeBinomial2Fam, IdentityLink, IdentityLink, args[1], args[2],
             nothing, false
         end
     elseif head === :Gamma
         bare = _match_bare_gamma(lhs, compcall)
         bare !== nothing &&
-            return GammaLogFam, LogLink, LogLink, bare[1], bare[2],
+            return GammaLogFam, IdentityLink, IdentityLink, bare[1], bare[2],
             nothing, false
     elseif head === :Beta
         bare = _match_bare_beta(lhs, compcall)
         bare !== nothing &&
-            return BetaLogitFam, LogitLink, IdentityLink, bare[1], bare[2],
+            return BetaLogitFam, IdentityLink, IdentityLink, bare[1], bare[2],
             nothing, false
     end
     fam, ll, pl, loc, sc, tr = _lower_response_base(lhs, compcall, ctx)
@@ -8340,14 +8361,74 @@ end
 # slot; an explicit link applies equally to a parameter or a definition.
 function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
         predictors, pred_idx, coefuse)
-    loc isa Bool && _sfail("response $lhs: mixture component $k location is Boolean " *
-        "— locations are numeric")
     if wrapped
         return _mixture_component_context(lhs, k) do
             _lower_location(lhs, loc, pred_link, ctx, predictors,
                 pred_idx, coefuse; value=true,
                 synth=Symbol(lhs, "_mix_", k, "_eta"))
         end
+    end
+    if loc isa Bool
+        _sfail("response $lhs: mixture component $k location is Boolean " *
+               "— locations are numeric")
+    elseif loc isa Real
+        wrapped && _sfail("response $lhs: mixture component $k wraps a " *
+            "literal in a link function — link wrappers apply to " *
+            "predictors (spell literals constrained-scale)")
+        return loc
+    elseif loc isa Symbol
+        loc in ctx.scan_states && _sfail("response $lhs: mixture " *
+            "component $k location is a scan state — scan-state mixture " *
+            "locations are a follow-up")
+        loc in ctx.plate_names && _sfail("response $lhs: mixture " *
+            "component $k location is a per-cell latent — latent mixture " *
+            "locations are a follow-up")
+        haskey(ctx.matrices, loc) && _sfail("response $lhs: mixture " *
+            "component $k location $loc is a design matrix — locations " *
+            "are predictors, sampled parameters, or literals")
+        # A stated-prior alias reads like the name itself (a sampled
+        # parameter), so it never routes here. Only an undeclared
+        # intercept-only def (the SB `mu ~ 1` mirror) did, and strict
+        # declarations refuse that name at prior lowering: a constant
+        # location is a declared scalar spelled bare.
+        if loc in ctx.vecdefs && haskey(ctx.detmap, loc) ||
+                _is_scalar_coef_def(loc, ctx, false)
+            _derived_reads_latent(loc, ctx) &&
+                !_is_design_shaped(loc, ctx) && _sfail("response $lhs: " *
+                "mixture component $k location reads a latent — latent " *
+                "mixture locations are a follow-up")
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; value = true, synth = Symbol(lhs, "_mix_", k, "_eta"))
+        end
+        if haskey(ctx.detmap, loc) && pred_link === IdentityLink
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
+                value = true)
+        end
+        if loc in ctx.prior_names
+            wrapped && _sfail("response $lhs: mixture component $k " *
+                "wraps the sampled parameter $loc in a link function — " *
+                "link wrappers apply to predictors (spell sampled " *
+                "parameters bare, constrained-scale)")
+            return loc
+        end
+        if loc in ctx.data && pred_link === IdentityLink
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
+                value = true)
+        end
+        _sfail("response $lhs: mixture component $k location $loc is not " *
+               "a predictor definition, sampled parameter, or literal")
+    else
+        wrapped || _sfail("response $lhs: mixture component $k location " *
+            "is an inline expression — inline locations lower as " *
+            "predictors, so link-space expressions wrap " *
+            "(`Poisson.(exp.(eta))`); bare slots are sampled parameters " *
+            "or literals")
+        # An inline link-space expression: a synthetic predictor, the
+        # CategoricalLogit-eta precedent.
+        return _lower_location(lhs, loc, pred_link, ctx, predictors,
+            pred_idx, coefuse; value = true, synth = Symbol(lhs, "_mix_", k, "_eta"))
     end
     loc isa Real && return loc
     loc isa Symbol && loc in ctx.prior_names && return loc
@@ -8903,7 +8984,7 @@ function _dot2call_spine_arg(lhs, f, i, a)
     elseif f === :BetaBinomial2 && i == 2
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Weibull && i == 2
-        return _is_composed_map(a) && a.args[1] === :exp ?
+        return _is_composed_map(a) && haskey(_AUXILIARY_LINKS, a.args[1]) ?
             _dot2call_nested_link(lhs, a, f) : a
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
@@ -8930,6 +9011,7 @@ function _dot2call_nested_object(lhs, a)
 end
 
 function _dot2call_nested_link(lhs, a, base)
+    (a isa Symbol || a isa Real) && return a
     want = (base === :Bernoulli || base === :Binomial) ? "logistic/normcdf/cexpexp" :
         (base === :Beta || base === :BetaBinomial2) ? "logistic" : "exp"
     a isa Expr && a.head === :. && length(a.args) == 2 &&
@@ -9123,33 +9205,38 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :NegativeBinomial2
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial2` takes " *
                                     "`NegativeBinomial2.(exp.(eta), phi)`")
-        return NegativeBinomial2Fam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        link, loc = _lower_slot_link(lhs, args[1])
+        return NegativeBinomial2Fam, link, link,
+        loc, args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :NegativeBinomial
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial` takes " *
                                     "`NegativeBinomial.(exp.(eta), p)`")
-        return NegativeBinomialFam, LogLink, LogLink,
-        _exp_response_location(lhs, args[1]), args[2], nothing, nothing,
+        link, loc = _lower_slot_link(lhs, args[1])
+        return NegativeBinomialFam, link, link,
+        loc, args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Weibull
         length(args) == 2 || _sfail("response $lhs: `Weibull` takes " *
                                     "`Weibull.(k, exp.(eta))`")
-        if Meta.isexpr(args[2], :call) && args[2].args[1] === :exp
-            return WeibullFam, LogLink, LogLink,
-            _lower_link_arg(lhs, args[2], :exp), args[1], nothing, nothing,
+        value = args[2]
+        _reject_legacy_inverse_link(lhs, value)
+        if Meta.isexpr(value, :call) && !isempty(value.args) &&
+                haskey(_AUXILIARY_LINKS, value.args[1])
+            link, loc = _lower_slot_link(lhs, value)
+            return WeibullFam, link, link, loc, args[1], nothing, nothing,
             nothing, nothing
         end
         return WeibullValueFam, IdentityLink, IdentityLink,
-        args[2], args[1], nothing, nothing, nothing, nothing
+        value, args[1], nothing, nothing, nothing, nothing
     elseif fam === :Gamma
         length(args) == 2 || _sfail("response $lhs: `Gamma` takes shape and scale")
         a1, div = args
         if Meta.isexpr(div, :call) && length(div.args) == 3 &&
                 div.args[1] === Symbol("./") && _same_aux(a1, div.args[3]) &&
                 Meta.isexpr(div.args[2], :.) && div.args[2].args[1] === :exp
-            loc, scale = _lower_gamma_args(lhs, args, ctx)
-            return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing,
+            link, loc, scale = _lower_gamma_args(lhs, args, ctx)
+            return GammaLogFam, link, link, loc, scale, nothing, nothing,
             nothing, nothing
         end
         return GammaValueFam, IdentityLink, IdentityLink, div, a1,
@@ -9161,45 +9248,45 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :BetaBinomial2
         length(args) == 3 || _sfail("response $lhs: `BetaBinomial2` takes " *
                                     "`BetaBinomial2.(n, logistic.(mu), phi)`")
-        return BetaBinomial2Fam, LogitLink, IdentityLink,
-        _lower_link_arg(lhs, args[2], :logistic), args[3],
+        link, loc = _lower_slot_link(lhs, args[2])
+        return BetaBinomial2Fam, link, IdentityLink,
+        loc, args[3],
         _lower_trials(lhs, args[1], ctx), nothing, nothing, nothing
     elseif fam === :HurdlePoisson
         length(args) == 2 || _sfail("response $lhs: `HurdlePoisson` takes " *
                                     "`HurdlePoisson.(exp.(eta), p_zero)`")
-        return HurdlePoissonFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        link, loc = _lower_slot_link(lhs, args[1])
+        return HurdlePoissonFam, link, link,
+        loc, args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :ZeroInflatedPoisson
         length(args) == 2 || _sfail("response $lhs: `ZeroInflatedPoisson` takes " *
                                     "`ZeroInflatedPoisson.(exp.(eta), zi)`")
-        return ZeroInflatedPoissonFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
+        link, loc = _lower_slot_link(lhs, args[1])
+        return ZeroInflatedPoissonFam, link, link,
+        loc, nothing, nothing, nothing,
         args[2], nothing
     elseif fam === :ZeroInflatedBinomial
         length(args) == 3 || _sfail("response $lhs: `ZeroInflatedBinomial` takes " *
                                     "`ZeroInflatedBinomial.(n, p, zi)`")
-        # v1 is prob-space only (the BinomialProb precedent): a bare
-        # Beta-sampled p. Link-wrapped probabilities (a predictor-fed GLM
-        # shape) are a planned slice, never a silent misroute.
-        pp = args[2]
-        (pp isa Symbol || pp isa Real) ||
-            _sfail("response $lhs: `ZeroInflatedBinomial` probability takes " *
-                "a bare Beta parameter (`p ~ Beta(...)` in the model), " *
-                "got $(repr(pp))")
-        return ZeroInflatedBinomialFam, IdentityLink, IdentityLink, pp,
+        link, loc = _lower_slot_link(lhs,
+            _dot2call_nested_link(lhs, args[2], :Binomial))
+        args[2] isa Symbol && loc in ctx.prior_names && (loc = _BareSlot(loc))
+        return ZeroInflatedBinomialFam, link, IdentityLink, loc,
         nothing, _lower_trials(lhs, args[1], ctx), nothing, args[3], nothing
     elseif fam === :InverseGaussian
         length(args) == 2 || _sfail("response $lhs: `InverseGaussian` takes " *
                                     "`InverseGaussian.(exp.(eta), lambda)`")
-        return InverseGaussianFam, LogLink, LogLink,
-        _exp_response_location(lhs, args[1]), args[2], nothing, nothing,
+        link, loc = _lower_slot_link(lhs, args[1])
+        return InverseGaussianFam, link, link,
+        loc, args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Exponential
         length(args) == 1 || _sfail("response $lhs: `Exponential` takes " *
                                     "`Exponential.(exp.(eta))`")
-        return ExponentialLogFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
+        link, loc = _lower_slot_link(lhs, args[1])
+        return ExponentialLogFam, link, link,
+        loc, nothing, nothing, nothing,
         nothing, nothing
     elseif fam === :VonMises
         length(args) == 2 || _sfail("response $lhs: `VonMises` takes " *
@@ -9228,8 +9315,9 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
             return PoissonLogFam, LogLink, LogLink, _BareSlot(args[1]),
             nothing, nothing, nothing, nothing, nothing
         end
-        return PoissonLogFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), nothing, nothing, nothing,
+        link, loc = _lower_slot_link(lhs, args[1])
+        return PoissonLogFam, link, link,
+        loc, nothing, nothing, nothing,
         nothing, nothing
     end
 end
@@ -9260,13 +9348,13 @@ function _lower_gamma_args(lhs, args, ctx)
         div.args[1] === Symbol("./") ||
         _sfail("response $lhs: `Gamma` takes " *
                "`Gamma.(alpha, exp.(eta) ./ alpha)`")
-    loc = _lower_link_arg(lhs,
-        _dot2call_nested_link(lhs, div.args[2], :Gamma), :exp)
+    link, loc = _lower_slot_link(lhs,
+        _dot2call_nested_link(lhs, div.args[2], :Gamma))
     a2 = div.args[3]
     _same_aux(a1, a2) || _sfail(
         "response $lhs: both `Gamma` positions must name the same alpha " *
         "(got $(repr(a1)) and $(repr(a2)))")
-    return loc, a1
+    return link, loc, a1
 end
 
 # Both auxiliary positions name the same use: bare names, equal literals,
@@ -9291,12 +9379,20 @@ function _lower_beta_args(lhs, args, ctx)
                     c.args[1] === :.- && c.args[2] == 1 &&
                     a1.args[2] == c.args[3] && _same_aux(a1.args[3], a2.args[3])
                 mu = a1.args[2]
-                if _is_dotted_call(mu) && mu.args[1] === :logistic &&
-                        length(mu.args[2].args) == 1
-                    loc = _lower_link_arg(lhs,
-                        _dot2call_nested_link(lhs, mu, :Beta), :logistic)
-                    swapped && (loc = Expr(:call, :.-, loc))
-                    return BetaLogitFam, LogitLink, IdentityLink, loc, a1.args[3]
+                if mu isa Symbol || mu isa Real ||
+                        (_is_dotted_call(mu) && haskey(_AUXILIARY_LINKS, mu.args[1]) &&
+                            length(mu.args[2].args) == 1)
+                    link, loc = _lower_slot_link(lhs,
+                        _dot2call_nested_link(lhs, mu, :Beta))
+                    if swapped
+                        if link === LogitLink
+                            loc = Expr(:call, :.-, loc)
+                        else
+                            loc = Expr(:call, :.-, 1.0, mu)
+                            link = IdentityLink
+                        end
+                    end
+                    return BetaLogitFam, link, IdentityLink, loc, a1.args[3]
                 end
             end
         end
@@ -9405,14 +9501,36 @@ const _BERNOULLI_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
     :logistic => (BernoulliLogitFam, LogitLink),
     :normcdf => (BernoulliProbitFam, ProbitLink),
     :cexpexp => (BernoulliCloglogFam, CloglogLink),
+    :exp => (BernoulliLogitFam, LogLink),
 )
 const _BINOMIAL_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
     :logistic => (BinomialLogitFam, LogitLink),
     :normcdf => (BinomialProbitFam, ProbitLink),
     :cexpexp => (BinomialCloglogFam, CloglogLink),
+    :exp => (BinomialLogitFam, LogLink),
 )
 
+_inverse_link_spelling(link::LinkFunction, value) =
+    _inverse_link_spelling(Val(link), value)
+_inverse_link_spelling(::Val{IdentityLink}, value) = value
+_inverse_link_spelling(::Val{LogLink}, value) = _dotted_obj(:exp, value)
+_inverse_link_spelling(::Val{LogitLink}, value) = _dotted_obj(:logistic, value)
+_inverse_link_spelling(::Val{ProbitLink}, value) = _dotted_obj(:normcdf, value)
+_inverse_link_spelling(::Val{CloglogLink}, value) = _dotted_obj(:cexpexp, value)
+
+function _lower_slot_link(lhs, arg)
+    _reject_legacy_inverse_link(lhs, arg)
+    if arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
+            haskey(_AUXILIARY_LINKS, arg.args[1])
+        return _AUXILIARY_LINKS[arg.args[1]], arg.args[2]
+    end
+    (arg isa Symbol || arg isa Real) && return IdentityLink, arg
+    _sfail("response $lhs: parameter takes a Julia value or a dotted " *
+        "exp/logistic/normcdf/cexpexp wrapper, got $(repr(arg))")
+end
+
 function _lower_bernoulli_link(lhs, arg)
+    (arg isa Symbol || arg isa Real) && return BernoulliLogitFam, IdentityLink, arg
     _reject_legacy_inverse_link(lhs, arg)
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         haskey(_BERNOULLI_LINKS, arg.args[1]) ||
@@ -9428,7 +9546,7 @@ function _lower_binomial_link(lhs, arg)
     # Bare prob (a Beta-sampled parameter, constrained-scale — the
     # mixture bare-mean precedent): prob-space Binomial, no link.
     if arg isa Symbol || arg isa Real
-        return BinomialProbFam, IdentityLink, arg
+        return BinomialLogitFam, IdentityLink, arg
     end
     arg isa Expr && arg.head === :call && !isempty(arg.args) &&
         haskey(_BINOMIAL_LINKS, arg.args[1]) ||
@@ -9471,17 +9589,16 @@ end
 # Distribution arguments are values. Named affine predictors retain their
 # design representation; other expressions share the ordinary assignment
 # graph, including scalar calls and per-observation broadcasts.
-# Link maps are also ordinary functions in a value argument. Resolve
-# them to the same scalar arithmetic used by the predictor inverse link.
+# Link maps are ordinary functions in a value argument. The generator's
+# value-math rewrite resolves logistic to its stable mathematical binding.
+const _AUXILIARY_LINKS = Dict(:exp => LogLink, :logistic => LogitLink,
+    :normcdf => ProbitLink, :cexpexp => CloglogLink)
+
 function _argument_value_calls(ex)
     ex isa Expr || return ex
     args = Any[_argument_value_calls(a) for a in ex.args]
-    if _is_dotted_call(ex) && ex.args[1] === :logistic &&
-            length(ex.args[2].args) == 1
-        x = only(args[2].args)
-        return :(1 ./ (1 .+ exp.(-1 .* $x)))
-    elseif ex.head === :call && ex.args[1] === :logistic && length(ex.args) == 2
-        return :(1 / (1 + exp(-$(args[2]))))
+    if ex.head in (:call, :.) && !isempty(args) && args[1] === :logistic
+        args[1] = GlobalRef(PPLGeneratedModels, :_ppl_logistic)
     end
     return Expr(ex.head, args...)
 end
@@ -9532,17 +9649,17 @@ end
 function _lower_argument_use(lhs, slot, value, ctx, predictors, pred_idx,
         coefuse)
     value === nothing && return nothing
-    if slot !== :zi && value isa Symbol &&
+    if value isa Symbol &&
             _is_scale_predictor_def(value, ctx, false)
         pname = _lower_scale_predictor(lhs, value, IdentityLink, ctx,
             predictors, pred_idx, coefuse)
         return ScalePredictorRef(pname, IdentityLink)
     end
-    if _is_dotted_call(value) && value.args[1] in (:exp, :logistic) &&
+    if _is_dotted_call(value) && haskey(_AUXILIARY_LINKS, value.args[1]) &&
             length(value.args[2].args) == 1
         inner = only(value.args[2].args)
         if inner isa Symbol && _is_scale_predictor_def(inner, ctx, true)
-            link = value.args[1] === :exp ? LogLink : LogitLink
+            link = _AUXILIARY_LINKS[value.args[1]]
             pname = _lower_scale_predictor(lhs, inner, link, ctx,
                 predictors, pred_idx, coefuse)
             return ScalePredictorRef(pname, link)
@@ -9585,8 +9702,8 @@ end
 # scalar assignments, data gathers (`x[g]`), and literal indexing
 # (`v[1]`) likewise stay scalar-path, exactly as before.
 # `allow_stated` gates aliases over stated priors: a link-wrapped use
-# admits stated-Normal coefficients (links exist only over predictors,
-# so the scalar path cannot spell the use at all), while a bare use
+# admits stated-Normal coefficients through the ordinary value path,
+# while a bare use
 # keeps them scalar — naming a stated name must not re-bucket it.
 _is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
     haskey(ctx.detmap, s) && !(s in ctx.plate_names) &&
@@ -9613,8 +9730,7 @@ _is_hsgp_only_def(rhs) = rhs isa Expr && rhs.head === :call &&
 # the alias to analysis would re-bucket the same prior by spelling.
 # Under a link wrapper (`allow_stated == true`) stated coef-prior names
 # route to analysis like the location path's stated intercept priors
-# (`a ~ Normal(0, 5)` over `eta = a .+ b .* x`): the wrapper has no
-# scalar meaning, so the predictor path is the only spelling.
+# (`a ~ Normal(0, 5)` over `eta = a .+ b .* x`).
 function _is_scalar_coef_def(s::Symbol, ctx, allow_stated::Bool)
     haskey(ctx.detmap, s) || return false
     s in ctx.plate_names && return false
@@ -9661,28 +9777,13 @@ _is_factor_coefficient_alias(ex::Expr, ctx, seen::Set{Symbol}) =
     _is_factor_index_def(ex, ctx) && ex.args[1] in ctx.factor_decls
 _is_factor_coefficient_alias(ex, ctx, seen::Set{Symbol}) = false
 
-# Analyze (or intern) a scale predictor: exactly the location-predictor
-# treatment (`_lower_location`'s named-definition arm) under the use-site
-# link — affine analysis and coefficient-use recording. A different link
-# interns another use of the same authored terms. Family admission
-# (Gaussian/NB2/Gamma/Beta-log-only/Student
-# sigma/Student nu/hurdle/VonMises-log-only/BB2/NB1-logit-only/
-# IG-log-only; LogNormal/Weibull deferred) is the
-# contract's gate (`_validate_scale_predictor` / `_validate_nu`), so
-# hand-built plans get the same rule.
+# Intern the raw predictor once; each auxiliary reference carries its link.
 function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
         pred_idx, coefuse)
     haskey(pred_idx, name) || haskey(ctx.detmap, name) ||
         return _lower_scale_predictor_error(lhs, name, ctx)
     if haskey(pred_idx, name)
-        pred = predictors[pred_idx[name]]
-        pred.link === link && return name
-        # A slot's link belongs to the use, not to the authored value.
-        # Reuse the same terms/declared coefficients under a private name.
-        alias = _argument_name!(Symbol(name, "_use"), ctx)
-        push!(predictors, PredictorSpec(alias, link, pred.terms, alias))
-        pred_idx[alias] = length(predictors)
-        return alias
+        return name
     end
     if _composed_root(ctx.detmap[name], ctx)
         return _lower_composed_predictor(name, ctx.detmap[name], ctx, lhs,
@@ -9861,14 +9962,11 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             end
             pname = loc
             if haskey(pred_idx, pname)
-                pred = predictors[pred_idx[pname]]
-                pred.link === pred_link || _sfail(
-                    "predictor $pname is shared by responses needing links " *
-                    "$(pred.link) and $pred_link — one link per predictor")
                 return pname
             end
         end
-        if _composed_root(ctx.detmap[loc], ctx)
+        if _composed_root(ctx.detmap[loc], ctx) ||
+                (value && _is_bare_sub_map(ctx.detmap[loc], ctx))
             return _lower_composed_predictor(pname, ctx.detmap[loc], ctx,
                 lhs, pred_link, predictors, pred_idx, coefuse)
         end
@@ -9902,7 +10000,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                 "derived predictor name $pname collides with your definition — " *
                 "rename yours")
         end
-        if _composed_root(loc, ctx)
+        if _composed_root(loc, ctx) || (value && _is_bare_sub_map(loc, ctx))
             return _lower_composed_predictor(pname, loc, ctx, lhs,
                 pred_link, predictors, pred_idx, coefuse)
         end
@@ -10225,10 +10323,12 @@ end
 # Other readers do not alter ordinary parameter semantics. Reject readers
 # of legacy construct-owned coefficient packs that cannot represent them.
 function _check_coefficient_readers(coefuse, ctx, predictors, priors,
-        params, plate_parameters, assigns, derived, responses)
+        params, plate_parameters, assigns, derived, responses;
+        coefficient_values = Set{Symbol}())
     isempty(coefuse) && return nothing
     function read!(who, s)
         s isa Symbol && haskey(coefuse, s) || return nothing
+        s in coefficient_values && return nothing
         return _check_owned_coefficient(s, ctx, "$s is a predictor coefficient and " *
                                "cannot also be read by $who")
     end
@@ -10263,6 +10363,53 @@ function _check_coefficient_readers(coefuse, ctx, predictors, priors,
         foreach(v -> read!(who, v), r.mixture_scales)
     end
     return nothing
+end
+
+# A scalar coefficient in a Horseshoe pack still denotes its declared
+# value outside the predictor. Reconstruct that value from the existing
+# coordinates as an ordinary assignment; aliases then share the same
+# prior and geometry. The predictor's sign belongs to its use, not to
+# the authored coefficient value.
+function _horseshoe_value_bindings!(assigns, derived, responses, params,
+        plate_parameters, priors, predictors, coefuse, hses, hsset)
+    reads = Set{Symbol}()
+    for a in (assigns..., derived...)
+        union!(reads, _value_symbols(a.expr))
+    end
+    for p in predictors, t in p.terms
+        t.kind === ComposedTerm && union!(reads, t.options.scalars)
+    end
+    for p in (params..., plate_parameters...), v in values(p.args)
+        union!(reads, _value_symbols(v))
+    end
+    for p in priors, v in (p.location, p.scale)
+        union!(reads, _value_symbols(v))
+    end
+    for r in responses, v in (r.scale, r.nu, r.zi, r.mixture_weights,
+            r.mixture_locs..., r.mixture_scales...)
+        union!(reads, _value_symbols(v))
+    end
+    bound = Set{Symbol}()
+    for name in sort!(collect(reads))
+        haskey(coefuse, name) || continue
+        uses = coefuse[name]
+        length(uses) == 1 || continue
+        pname, addr, sign = only(uses)
+        pname in hsset || continue
+        h = findfirst(h -> h.predictor === pname && h.addressee === addr, hses)
+        value = if h === nothing
+            normal = horseshoe_normal_name(pname, addr)
+            sign == 1 ? normal : :(-$normal)
+        else
+            raw = horseshoe_raw_name(pname, addr)
+            lam = horseshoe_lambda_name(pname, addr)
+            tau = horseshoe_tau_name(pname, addr)
+            :($raw * $lam * $tau)
+        end
+        push!(assigns, AssignmentSpec(name, value, name))
+        push!(bound, name)
+    end
+    return bound
 end
 
 # Predictor analysis: inline deterministic structure (scalars always;
@@ -10564,10 +10711,9 @@ end
 
 # A root that is only an admitted map over ONE bare sub-predictor
 # (`exp.(mu)`, `logistic.(mu)`, or a name bound to one) is a link
-# spelling, not a composition: at a response/scale location it keeps the
-# link path (Poisson `exp.`, Bernoulli `logistic.` peel there; any other
-# family fails closed with the link guidance or at bind). Inside a real
-# combination the same map composes (`exp.(la) .* th`).
+# spelling when the distribution slot peels that inverse. A value use
+# retains the same map as a composition; inside a larger expression it
+# likewise composes (`exp.(la) .* th`).
 function _is_bare_sub_map(rhs, ctx)
     if rhs isa Symbol
         haskey(ctx.detmap, rhs) && ctx.detmap[rhs] !== rhs || return false
@@ -10752,9 +10898,6 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
     for s in subs
         if haskey(pred_idx, s)
             pred = predictors[pred_idx[s]]
-            pred.link === IdentityLink || _sfail(
-                "predictor $s is shared by slots needing links " *
-                "$(pred.link) and $IdentityLink — one link per predictor")
             all(t -> t.kind in _COMPOSED_SUB_KINDS, pred.terms) || _sfail(
                 "predictor $pname: sub-predictor $s must be affine plus " *
                 "varying effects (no nested compositions, latents, or " *

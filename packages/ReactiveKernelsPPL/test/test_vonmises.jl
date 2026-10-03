@@ -99,9 +99,9 @@ _vm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_VM_Y), :x => copy(_VM_X))
             end, (:y, :x); conditioned = (:y, :x))
         @test only(plan.responses).scale == ScalePredictorRef(:lk, LogLink)
     end
-    @testset "non-log predictor kappa deferred" begin
+    @testset "non-log predictor kappa admitted" begin
         # capability: a link or value that can leave a slot's support; an out-of-support value has -Inf density (10gzbm9 support-links) (todo `05fuzch`)
-        @test_broken (lower_rkppl(quote
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)

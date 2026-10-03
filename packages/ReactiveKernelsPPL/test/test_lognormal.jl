@@ -74,9 +74,9 @@ _ln_cols() = Dict{Symbol,AbstractVector}(:y => copy(_LN_Y), :x => copy(_LN_X))
             end, (:y, :x, :sigmac); conditioned = (:y, :x, :sigmac))
         @test only(plan.responses).scale === :sigmac
     end
-    @testset "modeled sigma deferred" begin
-        # capability: modeled LogNormal sigma via a log-link predictor (exp.(ls)); 'deferred' (todo `05fuzch`)
-        @test_broken (lower_rkppl(quote
+    @testset "modeled sigma" begin
+        # admitted: modeled LogNormal sigma via a log-link predictor (exp.(ls)) (todo `05fuzch`)
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 c ~ Normal(0, 1)

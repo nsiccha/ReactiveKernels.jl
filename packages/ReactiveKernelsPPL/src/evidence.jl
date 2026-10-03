@@ -56,7 +56,11 @@ _evidence_discrete(f::LikelihoodFamily) = _is_bernoulli_family(f) ||
 # Recover the already-authored scalar distribution from its logpdf endpoint.
 # This keeps prior argument preparation and parameterization in the existing
 # emitter, while every family uses the same wrapper algebra.
+_evidence_density_guard(cell) = cell isa Expr && cell.head === :if &&
+    length(cell.args) == 3 && (cell.args[3] === -Inf || cell.args[3] == :(-Inf))
+
 function _evidence_endpoint(cell::Expr)
+    _evidence_density_guard(cell) && return _evidence_endpoint(cell.args[2])
     cell.head === :call && cell.args[1] isa Expr &&
         cell.args[1].head === :. && cell.args[1].args[2] == QuoteNode(:logpdf) ||
         throw(ContractValidationError("[generator] evidence requires a distribution endpoint"))
@@ -80,6 +84,13 @@ end
 
 function _wrap_evidence!(r, plan, pre, inputs, base; cdf = nothing, ccdf = nothing)
     r.evidence.kind === :none && return base
+    # Parameter support remains outside the evidence computation. Its inactive
+    # density, normalizer, tails and derivative work must stay unevaluated.
+    if _evidence_density_guard(base) &&
+            !(_dovar(1) in _expr_value_symbols(base.args[1]))
+        guarded = _wrap_evidence!(r, plan, pre, inputs, base.args[2]; cdf, ccdf)
+        return Expr(:if, base.args[1], guarded, base.args[3])
+    end
     family = r.family === MixtureFam ? r.mixture_family :
         r.family === NormalIDGLMFam ? GaussianFam :
         r.family === BernoulliLogitGLMFam ? BernoulliLogitFam :
