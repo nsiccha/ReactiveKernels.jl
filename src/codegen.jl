@@ -3615,8 +3615,8 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
 end
 
 """
-    prepare(p::Plan; passes=(), bound=()) -> PreparedKernel
-    prepare(g::Graph; have, want, passes=(), bound=()) -> PreparedKernel
+    prepare(p::Plan; passes=(), bound=(), on_error=nothing) -> PreparedKernel
+    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing) -> PreparedKernel
 
 Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
 tuple of AST passes applied before compilation.
@@ -3646,7 +3646,8 @@ for an intermediate, supplying it as HAVE, or selecting another consumer keeps
 that boundary. Whole-array (`Ref`) consumers and opaque intervening recipes
 also retain their materialization boundary.
 """
-function prepare(p::Plan; passes = (), bound = ())
+function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
+    p = _kernel_error_policy(p, on_error)
     p = _partial_apply(p, bound)
     lowered_plan = _fuse_authored_plate_chains(p)
     native_ast, ops, recipes = _lower_with_ops(lowered_plan)
@@ -3683,11 +3684,11 @@ function prepare(p::Plan; passes = (), bound = ())
     PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 
-function prepare(g::Graph; have = (), want = (), passes = (), bound = ())
+function prepare(g::Graph; have = (), want = (), passes = (), bound = (), on_error = nothing)
     _reuses_bound_preparation(bound, passes) &&
-        return _graph_bound_preparation(g, have, want, passes, bound)
+        return _graph_bound_preparation(g, have, want, passes, bound, on_error)
     p = plan(g; have = have, want = want)
-    prepare(p; passes = passes, bound = bound)
+    prepare(p; passes = passes, bound = bound, on_error = on_error)
 end
 
 """

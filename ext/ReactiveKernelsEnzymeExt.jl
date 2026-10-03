@@ -51,9 +51,11 @@ function EnzymeRules.reverse(
 end
 
 function EnzymeRules.reverse(
-        ::RevConfig, ::Const{<:ScalarDerivativeRule}, ::Type{<:Const}, tape,
+        config::RevConfig, ::Const{<:ScalarDerivativeRule}, ::Type{<:Const}, tape,
         args::Vararg{Annotation,N}) where {N}
-    ntuple(_ -> nothing, Val(N))
+    # A constant result contributes zero even when an input annotation is
+    # Active. Enzyme requires a numeric cotangent for that input slot.
+    map(arg -> arg isa Active ? _zero_tangent(Val(width(config)), arg.val) : nothing, args)
 end
 
 @inline _reverse_shadows(ȳ, ::Nothing, args::Tuple) = map(_ -> nothing, args)

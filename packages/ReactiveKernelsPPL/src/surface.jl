@@ -145,8 +145,8 @@ decomposed program. A pin claims a fresh predictor name (once — a second
 claim fails); it renames one response's predictor, so the pinned location
 cannot lower under another name. Pins apply to single-predictor responses
 (a multi-eta categorical or a predictorless simplex response fails closed)
-at top-level stream calls (a per-cell pin, or a pin inside a submodel body,
-fails closed).
+at top-level and per-cell stream calls. A pin inside a submodel body fails
+closed.
 """
 struct RKPPLSubmodel
     name::Symbol
@@ -764,20 +764,19 @@ body resolves against that submodel's defining module.
 Functions as values: an `=` definition may call any function visible in
 `mod` (a submodel body: in its own defining module). Call heads outside the
 built-in value vocabulary resolve to `GlobalRef`s at lowering, and an
-undefined one fails here naming it. An undotted call is a model-level value
-(no observation axis); a dotted call `f.(...)` is elementwise, observation
+undefined one fails here naming it. An undotted call takes and returns whole
+Julia values; a dotted call `f.(...)` is elementwise, observation
 aligned exactly when an argument is; `v[c]` with an observation index is a
 gather. A data-only definition calling such a function is evaluated once by
 [`bind_data`](@ref) and bound as data; one that a parameter-dependent
 expression consumes (named or inline) is evaluated once by preparation and
 never differentiated. Any other call runs in the generated kernel under
 generic AD (an RK-owned derivative rule, when the callee is one, is used by
-Enzyme). A parameter-dependent undotted call over an
-observation column fails closed: its result shape is unknown before
-sampling, so broadcast it or bind its data-only part first. A data column
-the definitions read only inside undotted module-call arguments, and no
-other statement names, is a whole value instead (a model-level data input
-of any length at bind), so such a call may take it directly.
+Enzyme). A parameter-dependent undotted call may read observation columns
+and return a scalar or an observation-length vector for use as a location
+or predictor operand. Julia checks its concrete shape when evaluated.
+A data column read only inside whole-value calls, with no per-observation
+consumer, is a model-level data input of any length at bind.
 
 Input ownership and concurrency: neither `ast` nor the submodel bodies
 reachable through `mod` is mutated, so one AST may be lowered repeatedly
@@ -1117,8 +1116,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         sized_decls)
     # A data column the definitions read only as whole values (module-call
     # arguments, gathered values) is a model-level data input at bind, so
-    # a parameter-dependent call may take it; each refusal that waiver
-    # skips is re-checked once the plan shows no other slot reads it.
+    # a parameter-dependent call may take it. Confirm the whole-value
+    # classification once the plan includes every consumer.
     # An array prior consumes its arguments as whole values too. Seed that
     # context before shaping definitions, then confirm it on the final plan.
     prior_defs = Pair{Symbol,Any}[Symbol(:_ppl_prior_input_, s.lhs) => s.rhs
@@ -1126,7 +1125,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     whole = _whole_value_data(vcat(det, prior_defs), data,
         _statement_names(ast, union(data, Set{Symbol}(keys(detmap))), kstmts;
             whole_priors = sized_decls))
-    waived = _check_module_calls(det, detmap, data, shape_env; whole)
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
     # remains Julia's business at bind/evaluation, never an observation axis.
@@ -1417,21 +1415,29 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     union!(used_locs, kernel_lp_predictors)
     skip = _absorbed_skip(det, canonmap, responses, paramsyms, ctx.absorbed,
         used_locs)
-    # A definition inlined into a location may still be read by the raw
-    # recurrence body. Keep it and its definition dependencies as value nodes.
-    scan_reads = Symbol[]
+    # Optimizing a definition as a predictor must retain its value for
+    # other consumers, including reductions, extracted leaves and the
+    # retained recurrence body. Keep their definition dependencies too.
+    needed = Set{Symbol}()
+    for a in (ctx.synth_assigns..., ctx.synth_derived...)
+        union!(needed, _value_symbols(a.expr))
+    end
+    for (nm, _) in det
+        nm in skip || union!(needed, _value_symbols(canonmap[nm]))
+    end
     for s in scans, st in (s.setup..., s.step...)
         for ex in (st.kind === :sample ? st.args : (st.expr,))
-            append!(scan_reads, _value_symbols(ex))
+            union!(needed, _value_symbols(ex))
         end
     end
+    pending = collect(needed)
     kept = Set{Symbol}()
-    while !isempty(scan_reads)
-        nm = pop!(scan_reads)
+    while !isempty(pending)
+        nm = pop!(pending)
         (nm in kept || !haskey(canonmap, nm)) && continue
         push!(kept, nm)
         delete!(skip, nm)
-        append!(scan_reads, _value_symbols(canonmap[nm]))
+        append!(pending, _value_symbols(canonmap[nm]))
     end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
@@ -1465,7 +1471,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     for (nm, rhs) in aligned_defs
         push!(derived, VectorAssignmentSpec(nm, rhs, nm))
     end
-    append!(derived, ctx.synth_derived)
+    for d in ctx.synth_derived
+        rhs = _is_plate_column_call(d.expr) ?
+            _plate_column_expr(d.name, d.expr, pc_dims, data) : d.expr
+        push!(derived, VectorAssignmentSpec(d.name, rhs, d.label))
+    end
     append!(assigns, ctx.synth_assigns)
     _check_coefficient_readers(coefuse, ctx, predictors, priors, params,
         plate_parameters, assigns, derived, responses)
@@ -1508,7 +1518,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned,
         indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
             Set{Symbol}(r.response for r in responses)))
-    _confirm_whole_value_data(plan, rawdata, waived; whole)
+    _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
 end
@@ -1741,7 +1751,7 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     head = ex.head
     if head === :.
         # Over a declared array value the elementwise array rules apply
-        # (`sd .* z` stays an array; `z .+ x` is a Julia length mismatch).
+        # (`sd .* z` stays an array; `z .+ x` checks Julia's actual axes).
         if _is_dotted_call(ex)
             argsh = [shape(a) for a in ex.args[2].args]
             (:array in argsh || :invalid in argsh) &&
@@ -1759,9 +1769,12 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         base = ex.args[1]
         base in data && length(ex.args) == 2 &&
             _literal_row_range(ex.args[2]) && return :vector
-        base isa Symbol && (shape(base) === :array ||
-            _model_valued(base, detmap, env, Set{Symbol}())) &&
-            return _ref_shape(ex, data)
+        if base isa Symbol && (shape(base) === :array ||
+                _model_valued(base, detmap, env, Set{Symbol}()))
+            indices = Set{Symbol}(i for i in ex.args[2:end]
+                if i isa Symbol && _obs_axis(i, data, detmap, memo, active, env))
+            return _ref_shape(ex, union(data, indices))
+        end
         _is_gather(ex, data, detmap, env) || return :scalar
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
@@ -1791,9 +1804,8 @@ end
 # slice-1 rule: dotted ⇒ vector).
 function _elementwise_shape(argshapes)
     :invalid in argshapes && return :invalid
-    # An array value never meets a per-observation column elementwise
-    # (lengths differ; index the array per observation: `z[g] .* x`).
-    :array in argshapes && :vector in argshapes && return :invalid
+    # Julia determines broadcast compatibility from the actual axes.
+    # A declared array can share the observation axis of another operand.
     :vector in argshapes && return :vector
     :array in argshapes && return :array
     return :vector
@@ -1905,7 +1917,8 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
         return :invalid
     elseif fn === :+ || fn === :-
         length(argshapes) == 1 && return only(argshapes)
-        return nvec == 0 ? :scalar : :invalid
+        return nvec == 0 ? :scalar :
+            nvec == length(argshapes) ? :vector : :invalid
     elseif fn === :*
         if nmat > 0
             # Matmul shapes: matrix×matrix → matrix, matrix×vector →
@@ -1924,7 +1937,6 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
             a === :scalar && b === :matrix && return :matrix
             return :invalid
         end
-        length(argshapes) == 2 || return nvec == 0 ? :scalar : :invalid
         nvec == 0 && return :scalar
         nvec == 1 && return :vector
         return :invalid
@@ -1993,6 +2005,17 @@ function _canonical_expr(ex, data, detmap, detshape, env, where)
     end
     _shape_of_call(fn, argshapes) === :invalid &&
         _sfail(_julia_mismatch_msg(fn, where, ex, argshapes))
+    if fn === :* && length(args) > 2 && :matrix ∉ argshapes &&
+            :array ∉ argshapes && :vector in argshapes
+        # Keep the scalar products in Julia order, then normalize only
+        # the scalar-vector multiplication to its broadcast equivalent.
+        return _canonical_expr(Expr(:call, :*,
+            Expr(:call, :*, args[1:end-1]...), args[end]), data, detmap,
+            detshape, env, where)
+    end
+    if fn in (:+, :-) && length(args) >= 2 && all(==(:vector), argshapes)
+        return Expr(:call, fn === :+ ? :.+ : :.-, args...)
+    end
     if (fn === :* || fn === :/) && length(args) == 2
         # Matrices never dotted-rewrite: `X * b` keeps its shape for
         # predictor classification (which checks the coefficient
@@ -2222,11 +2245,6 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
             rhs.args[2] isa Expr && rhs.args[2].head === :tuple ||
             return nothing  # malformed dotted: downstream rejects
         f = rhs.args[1]
-        # (`exp.` is both the Poisson link and admitted elementwise math,
-        # so only `logistic.` guides here.)
-        f === :logistic && !composed_maps && _sfail(
-            "$where calls `logistic.`, which only lowers as a `.~` link " *
-            "(`Bernoulli.(logistic.(eta))`) or as a composed-predictor map")
         f === :ifelse || f in ELEMENTWISE_FNS ||
             (composed_maps && f in _COMPOSED_UNARY) || _sfail(
             "$where calls `$f.`, which is not in the slice-1 value " *
@@ -2258,7 +2276,7 @@ _builtin_value_head(fn::Symbol) =
     fn in REDUCTION_FNS || fn in _CONSTRUCT_VALUE_HEADS ||
     fn in CELL_FNS || fn in SEGMENT_CELL_FNS ||
     startswith(string(fn), ".") || fn === :treatment || fn === :ifelse ||
-    fn in _RESPONSE_ONLY_FNS || fn in _DIST_VALUE_FNS ||
+    fn in _RESPONSE_ONLY_FNS ||
     fn in (:varying_effect, :varying_draws, :varying_slice)
 
 _builtin_dotted_head(f::Symbol) =
@@ -2395,66 +2413,11 @@ function _data_only(ex, data, detmap, active::Set{Symbol} = Set{Symbol}())
     return true
 end
 
-# An undotted module call takes whole values, so over an observation
-# column its result shape is the function's business: known once its
-# data-only inputs are bound, but never guessed for a parameter-dependent
-# call. Such a call fails here with the honest spellings. A data column
-# in `whole` (read only as module-call arguments) has no observation axis;
-# a refusal that only its alignment would raise is returned as waived —
-# (message, the whole columns it rests on) — for
-# `_confirm_whole_value_data`.
-function _check_module_calls(det, detmap, data, env::_ShapeEnv;
-        whole::Set{Symbol} = Set{Symbol}())
-    # A sampled vector (plate, scan or varying result) passes whole to an
-    # undotted module call. Its alignment outside that call does not give
-    # the call an observation axis. Raw data still obey the whole-column
-    # check: `gx[g]` follows its index, while `gx` passes whole only when
-    # no other consumer needs it per observation.
-    aligned = setdiff(data, whole)
-    call_env = _ShapeEnv(Set{Symbol}(), env.values)
-    wenv = _ShapeEnv(call_env.aligned, union(env.values, whole))
-    memos = (Dict{Symbol,Symbol}(), Dict{Symbol,Symbol}())
-    waived = Tuple{String,Set{Symbol}}[]
-    for (nm, rhs) in det
-        _check_module_calls(nm, rhs, detmap, data, aligned, whole, call_env, wenv,
-            memos, waived)
-    end
-    return waived
-end
-
-function _check_module_calls(nm, ex, detmap, data, aligned, whole, env, wenv,
-        memos, waived)
-    ex isa Expr || return nothing
-    if ex.head === :call && !isempty(ex.args) && ex.args[1] isa GlobalRef
-        for a in ex.args[2:end]
-            _obs_axis(a, data, detmap, memos[1], Set{Symbol}(), env) ||
-                continue
-            _data_only(ex, data, detmap) && break
-            f = ex.args[1].name
-            msg = "definition `$nm = $(repr(ex))` calls `$f` on the " *
-                "observation-aligned value `$(repr(a))` together with " *
-                "parameters, so its result shape is unknown until " *
-                "sampling — broadcast it for an elementwise column " *
-                "(`$f.(...)`), or compute the data-only part in its own " *
-                "definition (evaluated once at bind)"
-            _obs_axis(a, aligned, detmap, memos[2], Set{Symbol}(), wenv) &&
-                _sfail(msg)
-            push!(waived, (msg, _reached_names(a, detmap, whole)))
-        end
-    end
-    for a in ex.args
-        _check_module_calls(nm, a, detmap, data, aligned, whole, env, wenv,
-            memos, waived)
-    end
-    return nothing
-end
-
 # Data columns the definitions read only as whole values — the bind-time
 # model-level data-input rule (`_model_level_inputs`) over the
 # definitions, with each per-observation statement read (`held`: a
 # response, prior, `@plate`, …) pinned observation-aligned.
-# `_confirm_whole_value_data` re-checks the inputs and each waiver against
-# the finished plan.
+# `_confirm_whole_value_data` checks these inputs against the finished plan.
 function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
     inputs, _ = _whole_value_reads(det, data, held)
     return setdiff!(inputs, held)
@@ -2533,19 +2496,14 @@ function _reached_names(ex, detmap, among::Set{Symbol},
     return out
 end
 
-# A waived refusal stands unless every whole column it rests on is a
-# model-level data input of the finished plan: any other slot reading one
-# (a response, predictor, plate, …) makes it observation-aligned after
-# all, and the call fails exactly as it would have without the waiver.
-function _confirm_whole_value_data(plan::StructuralPlan, data::Set{Symbol},
-        waived; whole::Set{Symbol} = Set{Symbol}())
-    isempty(waived) && isempty(whole) && return nothing
+# Explicit whole-value inputs must keep their model-level role in the
+# finished plan. Ordinary function calls may also read observation data.
+function _confirm_whole_value_data(plan::StructuralPlan, data::Set{Symbol};
+        whole::Set{Symbol} = Set{Symbol}())
+    isempty(whole) && return nothing
     inputs, _ = _model_level_inputs(plan, data)
     whole ⊆ inputs || _sfail("whole-value data also read per observation: " *
         join(sort!(collect(setdiff(whole, inputs))), ", "))
-    for (msg, needed) in waived
-        needed ⊆ inputs || _sfail(msg)
-    end
     return nothing
 end
 
@@ -3592,9 +3550,8 @@ end
 
 # Panel-kernel plate statement:
 #   `result ~ plate(cols...; subjects=N) do slices... <cell> end`
-# The cell is a REAL subgraph (assignments + exactly one dotted `.~`
-# observation + a trailing collected name) — NOT desugared to flat
-# top-level statements. `subjects` is an integer literal or a dims-key
+# The cell carries assignments, an optional dotted `.~` observation and
+# a trailing collected name. `subjects` is an integer literal or a dims-key
 # name resolved at bind; slice columns must be bound data.
 function _is_kernel_plate_stmt(st::Expr)
     (_is_sample(st) || _is_broadcast_sample(st)) || return false
@@ -3681,13 +3638,14 @@ function _lower_kernel_plate(st::Expr, line::Int, data::Set{Symbol},
                "$(length(cols)) slice columns (one param per column)")
     body isa Expr && body.head === :block ||
         _sfail("$where cell must be a `begin ... end`-style block")
-    # Cell: assignments + exactly one `.~` + trailing collected name.
+    # Cell: assignments, an optional `.~`, and a trailing collected name.
     assignments = Pair{Symbol,Any}[]
     obs_stmt = nothing
     collected = nothing
     cell = Any[s for s in body.args if !(s isa LineNumberNode)]
-    isempty(cell) && _sfail("$where cell is empty (need assignments, " *
-                            "one `.~` observation, and a collected name)")
+    isempty(cell) && _sfail("$where cell is empty (need a collected name)")
+    taken = union(data, seen, Set{Symbol}(params),
+        Set{Symbol}(s.args[1] for s in cell if s isa Expr && s.head === :(=)))
     for (k, s) in enumerate(cell)
         last_stmt = k == length(cell)
         if s isa Symbol
@@ -3707,21 +3665,18 @@ function _lower_kernel_plate(st::Expr, line::Int, data::Set{Symbol},
                        "vectors is rejected per the explicit-dots ruling")
             obs_stmt !== nothing &&
                 _sfail("$where cell has more than one `.~` observation " *
-                       "(panel v1 admits exactly one)")
-            obs_stmt = s
+                       "(panel admits at most one)")
+            obs_stmt = _hoist_kernel_obs_args!(assignments, s, taken, where)
         else
-            _sfail("$where cell statements are `name = ...`, one " *
+            _sfail("$where cell statements are `name = ...`, an optional " *
                    "`yy .~ Normal.(mu, sigma)`, and a trailing collected " *
                    "name — got $(repr(s))")
         end
     end
-    obs_stmt === nothing &&
-        _sfail("$where cell has no `.~` observation (panel v1 needs " *
-               "exactly one in-cell likelihood)")
     collected === nothing &&
         _sfail("$where cell must end with a collected result name (a " *
                "bare cell name)")
-    obs = _lower_kernel_obs(obs_stmt, params, where)
+    obs = obs_stmt === nothing ? KernelObs[] : _lower_kernel_obs(obs_stmt, params, where)
     local_names = union(Set{Symbol}(params),
         Set{Symbol}(nm for (nm, _) in assignments))
     collected in local_names ||
@@ -3751,6 +3706,8 @@ end
 # admits the joint families too.
 const _KERNEL_OBS_FAMILIES = Dict{Symbol,Tuple{Any,Int}}(
     :Normal => (GaussianFam, 2),
+    :Cauchy => (CauchyFam, 2),
+    :Binomial => (BinomialProbFam, 2),
     :Bernoulli => (BernoulliLogitFam, 1),
     :Poisson => (PoissonLogFam, 1),
     :NegativeBinomial2 => (NegativeBinomial2Fam, 2),
@@ -3765,7 +3722,7 @@ const _KERNEL_OBS_FAMILIES = Dict{Symbol,Tuple{Any,Int}}(
 # Scalar response-space heads a panel cell admits (v2; the grouped
 # joint heads stay grouped-only — they need a schedule).
 const _PANEL_OBS_HEADS = (:Normal, :Bernoulli, :Poisson,
-    :NegativeBinomial2, :Gamma, :Beta, :StudentT)
+    :NegativeBinomial2, :Gamma, :Beta, :StudentT, :Binomial, :Cauchy)
 
 # Fused link-space heads rejected in cells (response-space node — the
 # link inverts via a pre-assignment, the julianic delta): head => the
@@ -3776,9 +3733,8 @@ const _KERNEL_FUSED_HEADS = Dict{Symbol,String}(
     :BernoulliProbit => "probit link (not admitted in cells)",
     :BernoulliCloglog => "cloglog link (not admitted in cells)")
 
-# Binomial heads (sequenced follow-up — the obs node has no trials
-# slot; the mixture precedent threads trials separately).
-const _KERNEL_BINOMIAL_HEADS = (:Binomial, :BinomialLogit,
+# Fused Binomial heads require an explicit response-space probability.
+const _KERNEL_BINOMIAL_HEADS = (:BinomialLogit,
     :BinomialProbit, :BinomialCloglog)
 
 # Admitted-head list for the in-cell obs errors (hardcoded order —
@@ -3787,22 +3743,43 @@ const _KERNEL_BINOMIAL_HEADS = (:Binomial, :BinomialLogit,
 _kernel_admitted_msg(grouped::Bool) =
     "`Normal.(...)`, `Bernoulli.(...)`, `Poisson.(...)`, " *
     "`NegativeBinomial2.(...)`, `Gamma.(...)`, `Beta.(...)`, " *
-    "`StudentT.(...)`" *
+    "`StudentT.(...)`, `Binomial.(...)`, `Cauchy.(...)`" *
     (grouped ? ", `CensoredAddpropnormal.(...)`, `TgiCategory.(...)`, " *
      "`TgiResponse.(...)`, `TgiCensored.(...)` " : " ")
 
 # One in-cell observation: `yy .~ Fam.(args...)` with a slice-param
 # response and name-or-literal args (panel: the scalar response-space
-# set, exactly one obs; grouped: the joint families too, a list;
+# set, at most one obs; grouped: the joint families too, a list;
 # plate: like grouped but the response names its data column
-# directly). Inline scale/location expressions are NOT admitted —
-# complex values spell via a pre-assignment (julianic delta, one
-# line) — and fused link-space heads are rejected for the same reason
-# (the node is response-space-pure). The response surface's
+# directly). Panels and automatic schedule chains hoist inline arguments
+# to cell assignments before this parser. Authored grouped cells use named
+# arguments. Fused link-space heads require a response-space assignment.
+# The response surface's
 # link-unwrapping/shape-decomposition does NOT apply in cells (args are
 # opaque names — the julianic delta): the user applies links in
 # pre-assignments, and values agree with the standard spelling whenever
 # the pre-assignment computes the same constrained quantity.
+function _hoist_kernel_obs_args!(assignments, stmt::Expr, taken::Set{Symbol}, where)
+    rhs = stmt.args[3]
+    rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+        rhs.args[1] isa Symbol && rhs.args[2] isa Expr &&
+        rhs.args[2].head === :tuple || return stmt
+    args = Any[]
+    for (k, arg) in enumerate(rhs.args[2].args)
+        if arg isa Symbol || arg isa Number
+            push!(args, arg)
+        else
+            name = Symbol(stmt.args[2], :_arg, k)
+            name in taken && _sfail("$where observation argument $k binds `$name`, " *
+                "which is already a model name; bind the argument to a name of your own")
+            push!(taken, name)
+            push!(assignments, name => arg)
+            push!(args, name)
+        end
+    end
+    return Expr(:call, stmt.args[1], stmt.args[2], Expr(:., rhs.args[1], Expr(:tuple, args...)))
+end
+
 function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
         form::String = "panel v1")
     resp = stmt.args[2]
@@ -3835,9 +3812,8 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
                    "heads (the link inverts via a pre-assignment): got " *
                    "fused `$head.(...)` — spell $fused")
         head in _KERNEL_BINOMIAL_HEADS &&
-            _sfail("$where `$head.(...)` needs trials threading " *
-                   "(sequenced follow-up — the in-cell obs node has no " *
-                   "trials slot)")
+            _sfail("$where fused `$head.(...)` requires a response-space " *
+                   "probability assignment; use `Binomial.(n, p)`")
         _sfail("$where $form admits in-cell observations " *
                _kernel_admitted_msg(grouped) * "only, got `$head.(...)`")
     end
@@ -4081,9 +4057,6 @@ function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
                    "name — got $(repr(s))")
         end
     end
-    isempty(obs_stmts) &&
-        _sfail("$where cell has no `.~` observation (need at least one " *
-               "in-cell likelihood)")
     collected === nothing &&
         _sfail("$where cell must end with a collected result name (a " *
                "bare cell name)")
@@ -4276,8 +4249,6 @@ function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
             "(`@plate for i in eachindex($(s.lhs))` or `$(s.lhs) .~ ...`)")
         push!(obs, s)
     end
-    isempty(obs) && _sfail("$where feeds no observation (observe a data " *
-        "column with the chain's value: `y .~ Normal.(conc, sigma)`)")
     taken = union(data, Set{Symbol}(first.(det)),
         Set{Symbol}(s.lhs for s in sample))
     assignments = Pair{Symbol,Any}[nm => detmap[nm]
@@ -4310,7 +4281,7 @@ function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
         end
         push!(obs_stmts, Expr(:call, :.~, s.lhs, rhs))
     end
-    first_reads = _plate_value_names(obs_stmts[1].args[3])
+    first_reads = isempty(obs_stmts) ? Symbol[] : _plate_value_names(obs_stmts[1].args[3])
     hit = findfirst(in(chain_names), first_reads)
     collected = hit === nothing ? last(assignments).first : first_reads[hit]
     return rest, Pair{Symbol,Any}[p for p in det if p.first ∉ chain],
@@ -4444,6 +4415,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     # vector shape after lowering (`_validate_varying_margins`). The
     # scan never throws — the main loop below owns every rejection.
     detnames = Set{Symbol}()
+    valueaxisnames = Set{Symbol}()
     for arg in args
         arg isa Expr || continue
         st = try
@@ -4451,8 +4423,10 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         catch
             continue
         end
-        st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol &&
+        if st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             push!(detnames, st.args[1])
+            _is_levels_binding_rhs(st.args[2]) || push!(valueaxisnames, st.args[1])
+        end
     end
     for arg in args
         if arg isa LineNumberNode
@@ -4572,7 +4546,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 continue
             end
             _reject_derived_ref_lhs(st.args[2], detnames)
-            arr = _array_sample_lhs(st.args[2], bc, tilde, data, detnames)
+            arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames)
             if arr !== nothing
                 alhs, adims = arr
                 _claim!(seen, seelines, alhs, line)
@@ -5058,9 +5032,14 @@ end
 # plate context: `(lhs, line, bare-symbols)` per spliced statement for
 # the post-analysis whole-vector check.
 function _expand_plates(args, data::Set{Symbol})
+    definitions = Dict{Symbol,Any}(arg.args[1] => arg.args[2] for arg in args
+        if arg isa Expr && arg.head === :(=) && length(arg.args) == 2 &&
+            arg.args[1] isa Symbol)
+    plate_data = union(data, Set{Symbol}(name for (name, rhs) in definitions
+        if _data_only(rhs, data, definitions)))
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     line = 0
     for arg in args
         if arg isa LineNumberNode
@@ -5077,7 +5056,7 @@ function _expand_plates(args, data::Set{Symbol})
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
-            stmts, stx, prm = _desugar_plate(arg, pl, data)
+            stmts, stx, prm = _desugar_plate(arg, pl, plate_data)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
                 push!(expanded, st)
@@ -5112,7 +5091,8 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     rkind = _plate_range_kind(R)
     body = loop.args[2]
     cells = Any[a for a in body.args if !(a isa LineNumberNode)]
-    isempty(cells) && _sfail("`@plate` body is empty")
+    isempty(cells) && return Expr[], Tuple{Symbol,Int,Set{Symbol}}[],
+        Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     # Names bound by `=` anywhere in this plate (cell locals, excluded
     # from the bare-vector check even on forward reference) — a bare LHS
     # (`t = ...`) or an i-indexed LHS (`theta[i] = ...`).
@@ -5129,13 +5109,29 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     end
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
+    selected = rkind[1] !== :levels && any(c -> c isa Expr &&
+        (_is_sample(c) || _is_broadcast_sample(c)) &&
+        Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
+    selected && return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
+    if any(c -> _cell_uses_index_value(c, ivar), cells)
+        indexname = gensym(:_rkppl_index)
+        indices = rkind[1] === :coloncall ? rkind[2] :
+            rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
+            Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
+        indexvalues = Expr(:call, GlobalRef(Base, :collect), indices)
+        push!(out, Expr(:(=), indexname,
+            _plate_column_call(ivar, Pair{Symbol,Any}[], ivar, nothing; indices=indexvalues)))
+        push!(plate_defs, indexname)
+        push!(pidx, indexname)
+        cells = Any[_cell_index_values(c, ivar, indexname) for c in cells]
+    end
     for c in cells
         push!(out, _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx,
             params, pidx)...)
@@ -5143,13 +5139,109 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     return out, ctx, params
 end
 
+# Partial observation loops compute their arguments inside retained RK cells.
+# Slicing a fully computed vector would evaluate arithmetic in unselected cells.
+function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
+    iterator = rkind[1] === :coloncall ? rkind[2] :
+        rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
+        Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
+    indices = Expr(:call, GlobalRef(Base, :collect), iterator)
+    locals = Pair{Symbol,Any}[]
+    out = Expr[]
+    ctx = Tuple{Symbol,Int,Set{Symbol}}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
+    pidx = Set{Symbol}()
+    indexedlocals = Set{Symbol}()
+    function localread(ex)
+        Meta.isexpr(ex, :ref, 2) && ex.args[1] in indexedlocals &&
+            ex.args[2] === ivar && return ex.args[1]
+        ex isa Expr ? Expr(ex.head, map(localread, ex.args)...) : ex
+    end
+    function checkrefs(ex)
+        ex isa Expr || return
+        if ex.head === :ref && _expr_has_sym(ex, ivar)
+            for index in ex.args[2:end]
+                index === ivar && continue
+                if Meta.isexpr(index, :ref, 2) && index.args[2] === ivar
+                    index.args[1] in data || _sfail("cell gather indexes through `$(index.args[1])`, which is not bound data")
+                elseif _expr_has_sym(index, ivar)
+                    _cell_lhs_error(ex, ivar)
+                end
+            end
+        end
+        foreach(checkrefs, ex.args)
+    end
+    for c in cells
+        checkrefs(c)
+        if Meta.isexpr(c, :(=), 2)
+            lhs, rhs = c.args
+            col = lhs isa Symbol ? lhs :
+                Meta.isexpr(lhs, :ref, 2) && lhs.args[2] === ivar ? lhs.args[1] : nothing
+            col isa Symbol || _sfail("selected plate assignments bind a local or an indexed scalar column")
+            col in data && _sfail("cell assignment `$col = ...` redefines bound data")
+            rhs = localread(rhs)
+            if lhs isa Expr
+                push!(out, Expr(:(=), col, _plate_column_call(ivar, locals, rhs, nothing; indices)))
+                push!(indexedlocals, col)
+            end
+            push!(locals, col => rhs)
+            continue
+        end
+        (_is_sample(c) || _is_broadcast_sample(c)) ||
+            _sfail("cells hold `~` observations and `=` assignments only")
+        lnames = Set(first.(locals))
+        function arg(ex)
+            Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
+                ex.args[1] isa Symbol && ex.args[1] ∉ lnames && return ex
+            if ex isa Expr && (ex.head === :call || _is_dotted_call(ex)) &&
+                    !isempty(ex.args) && _cell_object_call(ex.args[1])
+                vals = ex.head === :call ? ex.args[2:end] : ex.args[2].args
+                return Expr(:call, ex.args[1], map(arg, vals)...)
+            end
+            if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames)
+                nm = gensym(:_rkppl_selected)
+                push!(out, Expr(:(=), nm,
+                    _plate_column_call(ivar, locals, ex, nothing; indices)))
+                push!(plate_defs, nm)
+                push!(pidx, nm)
+                return Expr(:ref, nm, ivar)
+            end
+            return ex
+        end
+        obj = arg(localread(c.args[3]))
+        append!(out, _desugar_cell_sample(Expr(:call, c.args[1], c.args[2], obj),
+            ivar, rkind, line, data, plate_defs, ctx, params, pidx))
+    end
+    return out, ctx, params
+end
+
+# Numeric index values become one data-only index column. Indexed reads
+# retain their original syntax for the cell's index validation.
+_cell_uses_index_value(ex, ivar) = ex === ivar
+function _cell_uses_index_value(ex::Expr, ivar)
+    ex.head === :ref && return false
+    start = ex.head in (:call, :kw, :.) ? 2 : 1
+    return any(a -> _cell_uses_index_value(a, ivar), ex.args[start:end])
+end
+_cell_index_values(ex, ivar, name) = ex === ivar ? name : ex
+function _cell_index_values(ex::Expr, ivar, name)
+    ex.head === :ref && return ex
+    start = ex.head in (:call, :kw, :.) ? 2 : 1
+    return Expr(ex.head, ex.args[1:start-1]...,
+        (_cell_index_values(a, ivar, name) for a in ex.args[start:end])...)
+end
+
 # A plate whose definitions hold arrays: some definition reads a whole
 # axis (`sd[s[i], :]`, `z[g[i], :]`). Such cells cannot be vectorized by
 # broadcasting their operators; they lower as RK plates (below).
 _plate_has_array_cells(cells) = any(c -> c isa Expr && c.head === :(=) &&
-    length(c.args) == 2 && _has_colon_index(c.args[2]), cells)
+    length(c.args) == 2 &&
+    (_has_colon_index(c.args[2]) || _has_crossed_cell_index(c.args[2])), cells)
 _has_colon_index(ex) = ex isa Expr && ((ex.head === :ref &&
     any(a -> a === :(:), ex.args[2:end])) || any(_has_colon_index, ex.args))
+_has_crossed_cell_index(ex) = ex isa Expr &&
+    ((ex.head === :ref && count(a -> a isa Expr && a.head === :ref,
+        ex.args[2:end]) > 1) || any(_has_crossed_cell_index, ex.args))
 
 # A per-index plate with array-valued cells. Every cell means one
 # iteration of the Julia loop: cell locals (`F = sd[s[i], :] .* L[s[i]]`)
@@ -5165,7 +5257,7 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
     locals = Pair{Symbol,Any}[]
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
-    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
+    params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     samples = Any[]
     for c in cells
         c isa Expr || _sfail("cells hold `~` observations and `=` " *
@@ -5257,7 +5349,7 @@ end
 # Shared cell construction for observation and level axes. The fourth
 # field records a level axis, so constant outputs still have one value
 # per level and subsequent gathers preserve that axis.
-function _plate_column_call(ivar, locals, rhs, axis)
+function _plate_column_call(ivar, locals, rhs, axis; indices=nothing)
     body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...)
     deps = Set{Symbol}()
     for (_, v) in locals
@@ -5267,9 +5359,13 @@ function _plate_column_call(ivar, locals, rhs, axis)
     setdiff!(deps, Set{Symbol}(first.(locals)))
     delete!(deps, ivar)
     spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body), QuoteNode(rhs))
-    if axis !== nothing
+    if axis !== nothing || indices !== nothing
         push!(spec.args, QuoteNode(axis))
-        push!(deps, axis)
+        axis !== nothing && push!(deps, axis)
+    end
+    if indices !== nothing
+        push!(spec.args, QuoteNode(indices))
+        _cell_free_syms!(deps, indices)
     end
     return Expr(:call, :_ppl_plate_column, spec, sort!(collect(deps))...)
 end
@@ -5303,7 +5399,8 @@ function _plate_range_kind(R)
     R.args[1] === :eachindex && length(R.args) == 2 &&
         R.args[2] isa Symbol && return (:eachindex, R.args[2])
     R.args[1] === :axes && length(R.args) == 3 && R.args[2] isa Symbol &&
-        R.args[3] == 1 && return (:axes, R.args[2])
+        R.args[3] isa Integer && !(R.args[3] isa Bool) && R.args[3] >= 1 &&
+        return (:axes, R.args[2], Int(R.args[3]))
     R.args[1] === :levels && length(R.args) == 2 && R.args[2] isa Symbol &&
         return (:levels, R.args[2])
     return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, " *
@@ -5333,12 +5430,9 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params,
                "factor/levels for crossed effects (`c[levels(g)]`), `@scan` " *
                "for sequential recurrence")
     end
-    if _is_broadcast_sample(c)
-        _sfail("cells are scalar (`~`); broadcast (`.~`) at top level")
-    end
     rkind[1] === :levels && return _desugar_levels_cell(c, ivar, rkind[2],
         data)
-    if _is_sample(c)
+    if _is_sample(c) || _is_broadcast_sample(c)
         return _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
             ctx, params, pidx)
     end
@@ -5453,37 +5547,55 @@ function _plate_column_expr(nm::Symbol, call::Expr,
     ivar = spec.args[1].value
     body = spec.args[2].value
     out = spec.args[3].value
-    axis = length(spec.args) == 4 ? spec.args[4].value : nothing
+    axis = length(spec.args) >= 4 ? spec.args[4].value : nothing
+    indices = length(spec.args) >= 5 ? spec.args[5].value : nothing
     where = "array plate column `$nm`"
     inputs = Any[]
     lanevars = Symbol[]
+    sharedsources = Dict{Symbol,Any}()
     lane(inp, var) = (var in lanevars || (push!(inputs, inp);
         push!(lanevars, var)); var)
-    pos = axis === nothing ? nothing : lane(
-        Expr(:call, :_ppl_level_indices, axis), Symbol(:_ppl_pi_, axis))
+    pos = indices !== nothing ? lane(indices, Symbol(:_ppl_pi_, nm)) :
+        axis === nothing ? nothing : lane(
+            Expr(:call, :_ppl_level_indices, axis), Symbol(:_ppl_pi_, axis))
     level() = lane(Expr(:call, :_ppl_level_values, axis),
         Symbol(:_ppl_pl_, axis))
-    isidx(a) = axis === nothing && a isa Expr && a.head === :ref && length(a.args) == 2 &&
+    iscodeidx(a) = a isa Expr && a.head === :ref && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[1] in data && a.args[2] === ivar
-    function code(a, d)
+    isidx(a) = indices === nothing && axis === nothing && iscodeidx(a)
+    function code(a, d, X, j)
         _is_levels_dim(d) && d.args[2] isa Symbol || _sfail("$where reads " *
             "an array axis $(repr(d)) by `$(repr(a))`; per-index reads " *
             "take a `levels(g)` axis")
         col, h = a.args[1], d.args[2]
-        return lane(Expr(:call, :_ppl_codes, col, h),
+        if d.args[1] !== :levels || _levels_subset(d) !== Colon()
+            codes = Expr(:call, :_ppl_axis_codes, col, X, j)
+            indices === nothing || (codes = Expr(:ref, codes, indices))
+            return lane(codes,
+                Symbol(:_ppl_pc_, col, :_, X, :_, j))
+        end
+        codes = Expr(:call, :_ppl_codes, col, h)
+        indices === nothing || (codes = Expr(:ref, codes, indices))
+        return lane(codes,
             Symbol(:_ppl_pc_, col, :_, h))
     end
     function rw(ex)
+        indices !== nothing && ex === ivar && return pos
         axis !== nothing && ex === ivar && return level()
         ex isa Expr || return ex
         if ex.head === :ref && ex.args[1] isa Symbol
             X, idx = ex.args[1], ex.args[2:end]
+            if indices !== nothing && X in data && length(idx) == 1
+                linear = Symbol(:_ppl_linear_, X)
+                sharedsources[linear] = Expr(:call, GlobalRef(Base, :vec), X)
+                return Expr(:ref, linear, rw(only(idx)))
+            end
             d = get(dims, X, nothing)
             if axis !== nothing && d !== nothing && idx[1] === ivar
                 dim = length(d) == 3 && length(idx) == 1 ? d[3] : d[1]
                 _is_levels_dim(dim) || return Expr(:ref, X, map(rw, idx)...)
                 h = dim.args[2]
-                if _levels_subset(dim) !== Colon() || h !== axis
+                if dim.args[1] !== :levels || _levels_subset(dim) !== Colon() || h !== axis
                     # Align values by their declared labels before entering
                     # the cell. A parameter can be a view; indexing that view
                     # at a traced lane code is not supported by Reactant.
@@ -5508,11 +5620,22 @@ function _plate_column_expr(nm::Symbol, call::Expr,
                 return Expr(:ref, X, codevar, map(rw, idx[2:end])...)
             end
             isidx(ex) && return lane(X, Symbol(:_ppl_pv_, X))
-            if d !== nothing && !isempty(idx) && isidx(idx[1])
+            if d !== nothing && !isempty(idx) && any(iscodeidx, idx)
                 if length(d) == 3 && length(idx) == 1
-                    return Expr(:ref, X, :(:), :(:), code(idx[1], d[3]))
+                    return Expr(:ref, X, :(:), :(:), code(idx[1], d[3], X, 3))
                 end
-                return Expr(:ref, X, code(idx[1], d[1]), map(rw, idx[2:end])...)
+                base, gatherindices = X, Any[iscodeidx(a) ? a : rw(a) for a in idx]
+                for j in eachindex(idx)
+                    iscodeidx(idx[j]) || continue
+                    gatherindices[j] = code(idx[j], d[j], X, j)
+                    if _levels_subset(d[j]) !== Colon()
+                        zero = length(d) == 1 ? 0.0 :
+                            j == 1 ? :(zeros(1, size($X, 2))) : :(zeros(size($X, 1), 1))
+                        base = Expr(:call, j == 1 ? :vcat : :hcat, zero, base)
+                        gatherindices[j] = Expr(:call, :+, gatherindices[j], 1)
+                    end
+                end
+                return Expr(:ref, base, gatherindices...)
             end
         end
         return Expr(ex.head, map(rw, ex.args)...)
@@ -5532,7 +5655,7 @@ function _plate_column_expr(nm::Symbol, call::Expr,
         "through a data column (`x[$ivar]`) or a levels gather " *
         "(`z[g[$ivar], :]`)")
     shared = sort!(collect(free))
-    append!(inputs, (Expr(:call, :Ref, nm2) for nm2 in shared))
+    append!(inputs, (Expr(:call, :Ref, get(sharedsources, nm2, nm2)) for nm2 in shared))
     lam = Expr(:->, Expr(:tuple, lanevars..., shared...),
         Expr(:block, LineNumberNode(0, :rkppl_plate), stmts..., outx))
     return Expr(:do, Expr(:call, :plate, inputs...), lam)
@@ -5608,24 +5731,22 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
                              "lower — index the latent (`$lhs[$ivar] ~ ...`) " *
                              "for a per-cell parameter, or write a shared " *
                              "prior outside the plate")
-    (lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
-        lhs.args[1] isa Symbol && lhs.args[2] === ivar) ||
+    (lhs isa Expr && lhs.head === :ref && length(lhs.args) >= 2 &&
+        lhs.args[1] isa Symbol && lhs.args[2] === ivar &&
+        all(a -> a isa Integer && !(a isa Bool) && a >= 1, lhs.args[3:end])) ||
         _cell_lhs_error(lhs, ivar)
     col = lhs.args[1]
     obj = c.args[3]
     if col ∉ data
+        length(lhs.args) == 2 || _cell_lhs_error(lhs, ivar)
         # Per-cell latent PARAMETER: a scalar (undotted) distribution. Its args
         # are shared across cells (a captured scalar) or per-cell (`eta[$ivar]`,
         # a varying prior mean/scale); the `[$ivar]` strip and the bare-vector
         # check enforce the index discipline, exactly like an observation cell.
-        obj isa Expr && obj.head === :. && _sfail(
-            "per-cell latent `$col[$ivar] ~ ...` takes a scalar (undotted) " *
-            "distribution (`$col[$ivar] ~ Normal(mu, tau)` / " *
-            "`$col[$ivar] ~ Normal(eta[$ivar], tau)`), got the dotted $(repr(obj))")
         bares = _cell_bares(obj, ivar, data)
         setdiff!(bares, plate_defs)
         push!(ctx, (col, line, bares))
-        push!(params, (col, _strip_cell(obj, ivar),
+        push!(params, (col, _strip_cell(_undot_cell_object(obj), ivar),
             _plate_param_range(col, rkind, data), line))
         return Expr[]
     end
@@ -5643,13 +5764,21 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     if rkind[1] === :coloncall
         # Literal ranges validate through the slice-A `y[a:b]` path
         # (start-1, literal endpoints, bind-time cover check).
-        return Expr[Expr(:call, :.~, Expr(:ref, col, rkind[2]), obj)]
+        return Expr[Expr(:call, :.~, Expr(:ref, col, rkind[2], lhs.args[3:end]...), obj)]
     end
-    rcol = rkind[2]
-    rcol === col || _sfail("plate over `$(rkind[1])($rcol)` cannot " *
-                           "sample `$col[$ivar]` (one response column " *
-                           "per range)")
-    return Expr[Expr(:call, :.~, col, obj)]
+    index = rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
+        Expr(:call, :axes, rkind[2], rkind[3])
+    return Expr[Expr(:call, :.~, Expr(:ref, col, index, lhs.args[3:end]...), obj)]
+end
+
+_undot_cell_object(ex) = ex
+function _undot_cell_object(ex::Expr)
+    if ex.head === :. && length(ex.args) == 2 && ex.args[1] isa Symbol &&
+            _cell_object_call(ex.args[1]) && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        return Expr(:call, ex.args[1], map(_undot_cell_object, ex.args[2].args)...)
+    end
+    return Expr(ex.head, map(_undot_cell_object, ex.args)...)
 end
 
 # The per-cell latent's size follows the plate range: a literal `1:N` rides as
@@ -5658,7 +5787,8 @@ end
 # at bind); over a definition ⇒ the definition's own observation axis.
 function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
     rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2])
-    return rkind[2]
+    return rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
+        Expr(:call, :axes, rkind[2], rkind[3])
 end
 
 function _cell_lhs_error(lhs, ivar)
@@ -5784,6 +5914,11 @@ _dotify_cell(ex, ivar, pidx, object::Bool) = (ex, false)
 _dotify_cell(ex::Symbol, ivar, pidx, object::Bool) = (ex, ex in pidx)
 function _dotify_cell(ex::Expr, ivar, pidx, object::Bool)
     ex.head === :ref && return (_strip_cell(ex, ivar), true)
+    # Ref denotes one whole shared argument to a broadcasted constructor.
+    # Broadcasting Ref itself would replace that argument by scalar wrappers.
+    Meta.isexpr(ex, :call, 2) && ex.args[1] === :Ref &&
+        return (ex, false)
+    Meta.isexpr(ex, :call, 1) && return (ex, false)
     if ex.head === :call && !isempty(ex.args)
         f = ex.args[1]
         args = Any[]
@@ -5926,6 +6061,16 @@ function _sample_lhs(lhs, bc, tilde, data, level_bindings)
                            "(`b[axes(X, 2)]`), got $(repr(lhs))")
     lhs.head === :. && _sfail("dotted left-hand side $(repr(lhs)) does " *
                               "not lower (nested targets are out of scope)")
+    if lhs.head === :ref && length(lhs.args) > 2 && lhs.args[1] isa Symbol && lhs.args[1] in data
+        bc || _sfail("a response slice broadcasts with `.~`")
+        all(a -> a isa Integer && !(a isa Bool) && a >= 1, lhs.args[3:end]) ||
+            _sfail("response trailing indices must be positive literal integers")
+        range = _lower_lhs_range(lhs.args[1], lhs.args[2])
+        range isa UnitRange && (range = Expr(:ref, lhs.args[1], lhs.args[2]))
+        range isa Expr || _sfail("multidimensional response slices need an index axis")
+        append!(range.args, lhs.args[3:end])
+        return lhs.args[1], range, nothing, nothing
+    end
     lhs.head === :ref && length(lhs.args) == 2 || _sfail(
         "$tilde left-hand side must be a bare Symbol or a one-dimensional " *
         "ref (`y[1:N]`, `c[levels(g)]`, `b[axes(X, 2)]`), got $(repr(lhs))")
@@ -5944,8 +6089,7 @@ function _sample_lhs(lhs, bc, tilde, data, level_bindings)
     if _is_axes2_call(index)
         bc || _sfail("sized prior `$(target)[axes(...)]` is a vector — " *
                      "use `.~`, not `~`")
-        target in data && _sfail("`axes` sizes coefficient priors, not " *
-                                 "responses ($target is data)")
+        target in data && return target, _lower_lhs_range(target, index), nothing, nothing
         return target, nothing, nothing, index.args[2]
     end
     if index isa Expr && index.head === :call && !isempty(index.args) &&
@@ -6013,7 +6157,8 @@ function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
         row_axis = _is_axis_dim(idx[1]) && idx[1].args[1] === :axes &&
             idx[1].args[3] == 1 && idx[1].args[2] !== target
         _is_literal_range(idx[1]) || _is_def_levels_call(idx[1], data,
-            detnames) || row_axis || return nothing
+            detnames) || row_axis || _is_unique_axis(idx[1]) ||
+            (idx[1] isa Symbol && idx[1] in union(data, detnames)) || return nothing
     elseif length(idx) != 2
         _sfail("array $target takes one or two axes, got $(repr(lhs))")
     end
@@ -6036,7 +6181,7 @@ function _check_definition_levels_axes(sample, det, data::Set{Symbol})
     for s in sample
         s.dims === nothing && continue
         for d in s.dims
-            d isa Expr && d.head === :call && d.args[1] === :levels &&
+            _is_levels_dim(d) &&
                 d.args[2] ∉ data || continue
             gg = d.args[2]
             _is_bind_data_definition(gg, detmap, data, Set{Symbol}()) ||
@@ -6053,7 +6198,6 @@ function _is_bind_data_definition(nm::Symbol, detmap, data::Set{Symbol},
         active::Set{Symbol})
     haskey(detmap, nm) && nm ∉ active || return false
     rhs = detmap[nm]
-    _contains_module_call(rhs) || return false
     push!(active, nm)
     ok = all(v -> v in data ||
             _is_bind_data_definition(v, detmap, data, active),
@@ -6146,6 +6290,18 @@ end
 
 function _array_axis(target::Symbol, a, data::Set{Symbol},
         detnames::Set{Symbol} = Set{Symbol}())
+    if a isa Symbol && a in union(data, detnames)
+        return Expr(:call, :_ppl_axis_values, a)
+    elseif _is_unique_axis(a)
+        call = a.head === :ref ? a.args[1] : a
+        length(call.args) == 2 && call.args[2] isa Symbol &&
+            call.args[2] in union(data, detnames) || _sfail("array $target: " *
+                "`unique` enumerates a bound data column")
+        d = Expr(:call, :unique, call.args[2])
+        a.head === :ref && push!(d.args, QuoteNode(
+            _lower_levels_subset(target, call.args[2], a.args[2])))
+        return d
+    end
     if _is_literal_range(a)
         lo, hi = a.args[2], a.args[3]
         cnt = lo === 1 ? _levels_count(hi) : nothing
@@ -6242,9 +6398,13 @@ end
 # the same `(grouping, subset)` pair carried by a `SampleStmt`, so reuse in
 # coefficient indices follows the ordinary inline lowering path.
 _is_levels_binding_rhs(rhs) =
-    _is_levels_call(rhs) ||
+    (_is_levels_call(rhs) && rhs.args[1] === :levels) ||
     rhs isa Expr && rhs.head === :ref && length(rhs.args) == 2 &&
-        _is_levels_call(rhs.args[1])
+        _is_levels_call(rhs.args[1]) && rhs.args[1].args[1] === :levels
+
+_is_unique_axis(a) = a isa Expr &&
+    ((a.head === :call && !isempty(a.args) && a.args[1] === :unique) ||
+     (a.head === :ref && length(a.args) == 2 && _is_unique_axis(a.args[1])))
 
 function _lower_levels_binding(name::Symbol, rhs, data::Set{Symbol})
     if rhs isa Expr && rhs.head === :ref && length(rhs.args) == 2
@@ -6282,6 +6442,16 @@ end
 # Returns the LevelMap subset value.
 function _lower_levels_subset(col::Symbol, gcol::Symbol, s)
     if s isa Expr && s.head === :call && !isempty(s.args) && s.args[1] === :(:)
+        if length(s.args) == 4
+            lo, step, hi = s.args[2:end]
+            all(x -> x isa Integer && !(x isa Bool), (lo, step)) &&
+                lo >= 1 && step != 0 || _sfail("coefficient $col: " *
+                "stepped subsets need a positive start and a nonzero integer step")
+            hi === :end && return (Int(lo), Int(step), :end)
+            hi isa Integer && !(hi isa Bool) || _sfail("coefficient $col: " *
+                "subset endpoint is a literal integer or `end`")
+            return collect(Int(lo):Int(step):Int(hi))
+        end
         length(s.args) == 3 || _sfail("coefficient $col: level subsets " *
                                       "are `a:b` or `a:end`, got $(repr(s))")
         lo, hi = s.args[2], s.args[3]
@@ -6329,21 +6499,15 @@ function _lower_lhs_range(col::Symbol, r)
         length(r.args) == 2 && r.args[2] isa Symbol || _sfail(
             "response $col range takes `eachindex($col)` — " *
             "got $(repr(r))")
-        r.args[2] === col || _sfail("response $col range covers " *
-                                    "$(r.args[2]), not $col — ranges cover " *
-                                    "their own column exactly " *
-                                    "(`eachindex($col)`)")
-        return nothing
+        return Expr(:ref, col, r)
     end
     if r isa Expr && r.head === :call && !isempty(r.args) && r.args[1] === :axes
-        length(r.args) == 3 && r.args[2] isa Symbol && r.args[3] == 1 || _sfail(
-            "response $col range takes `axes($col, 1)` — got $(repr(r))")
-        r.args[2] === col || _sfail("response $col range covers " *
-                                    "$(r.args[2]), not $col (`axes($col, 1)`)")
-        return nothing
+        length(r.args) == 3 && r.args[2] isa Symbol && r.args[3] isa Integer &&
+            !(r.args[3] isa Bool) && r.args[3] >= 1 || _sfail(
+            "response $col range takes `axes(v, d)` with a positive literal axis — got $(repr(r))")
+        return Expr(:ref, col, r)
     end
-    r === :(:) && _sfail("whole-column `$col[:]` is not admitted — " *
-                            "write the range out (`$col[eachindex($col)]`)")
+    r === :(:) && return Expr(:ref, col, r)
     (r isa Symbol || r isa Integer) &&
         _sfail("scalar cell index `$col[$(r)]` at top level does not " *
                "lower — per-cell refs live in `@plate` (slice B); " *
@@ -6369,7 +6533,7 @@ struct SampleStmt
     lhs::Symbol
     rhs::Any
     broadcast::Bool
-    range::Union{Nothing,UnitRange{Int}}
+    range::Union{Nothing,UnitRange{Int},Expr}
     levels::Any
     matrix::Union{Nothing,Symbol}
     dims::Union{Nothing,Vector{Any}}
@@ -6410,15 +6574,23 @@ struct GLMSampleStmt
     beta::Symbol
     sigma::Any
     line::Int
+    wrapper::Union{Nothing,Expr}
 end
 
 const _GLM_HEADS = (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
 
-_is_glm_call(rhs) = rhs isa Expr && rhs.head === :call &&
-    !isempty(rhs.args) && first(rhs.args) isa Symbol && first(rhs.args) in _GLM_HEADS
+function _glm_distribution(rhs)
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || return rhs
+    first(rhs.args) in (:truncated, :censored, :interval_censored) &&
+        length(rhs.args) >= 2 && return rhs.args[2]
+    return rhs
+end
+_is_glm_call(rhs) = (dist = _glm_distribution(rhs); dist isa Expr &&
+    dist.head === :call && !isempty(dist.args) && first(dist.args) in _GLM_HEADS)
 
 function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
-    lhs, rhs = st.args[2], st.args[3]
+    lhs, raw = st.args[2], st.args[3]
+    rhs = _glm_distribution(raw)
     head = rhs.args[1]
     lhs isa Symbol || _sfail("`$head` left-hand side must be a bare " *
                              "data column, got $(repr(lhs))")
@@ -6444,7 +6616,7 @@ function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
             "response $lhs: `$head` sigma must be a parameter name or " *
             "a positive literal, got $(repr(sigma))")
     end
-    return GLMSampleStmt(lhs, head, X, alpha, beta, sigma, line)
+    return GLMSampleStmt(lhs, head, X, alpha, beta, sigma, line, raw === rhs ? nothing : raw)
 end
 
 _is_doc_macro(m) =
@@ -6630,10 +6802,11 @@ mutable struct _ScopeExpansion
     rewrites::Vector{Tuple{Expr,Module}}
     fixes::Dict{Symbol,ColumnData}
     bound_values::Union{Nothing,Dict{Symbol,ColumnData}}
+    declared::Set{Symbol}
 end
 _ScopeExpansion(scopes, bindings, paths, used, next) =
     _ScopeExpansion(scopes, bindings, paths, used, next,
-        Tuple{Expr,Module}[], Dict{Symbol,ColumnData}(), nothing)
+        Tuple{Expr,Module}[], Dict{Symbol,ColumnData}(), nothing, Set{Symbol}())
 
 function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
         per_cell::Bool = false)
@@ -6729,6 +6902,10 @@ function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
     out = Any[]
     ctx = _ScopeExpansion(SubmodelScope[], Dict{Symbol,SubmodelScope}(),
         Dict{Symbol,Tuple{Vararg{Symbol}}}(), used, 0)
+    union!(ctx.declared, data)
+    for a in ast.args
+        _collect_binders!(ctx.declared, a)
+    end
     ctx.rewrites = Tuple{Expr,Module}[(edit, mod) for edit in rewrites]
     ctx.fixes = Dict{Symbol,ColumnData}(fixes)
     ctx.bound_values = bound_values
@@ -6759,7 +6936,7 @@ function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
             _expand_submodel_stmt!(out, g, sm.mod, data, pins, used, inner)
         end
     elseif _plate_has_submodel_cell(arg, mod)
-        push!(out, _expand_plate_cell_submodels(arg, mod, data, used, chain))
+        push!(out, _expand_plate_cell_submodels(arg, mod, data, pins, used, chain))
     else
         push!(out, arg)
     end
@@ -6997,6 +7174,9 @@ function _hsubst(ex::Expr, map::AbstractDict, ids::AbstractDict)
     sub(a) = _hsubst(a, map, ids)
     if h === :call && !isempty(ex.args)
         f = ex.args[1]
+        if f isa Symbol && get(map, f, nothing) isa GlobalRef
+            f = map[f]
+        end
         args = Any[f]
         idpos = f isa Symbol && f in _BASIS_ID_HEADS ? _basis_id_pos(ex) : 0
         for (k, a) in enumerate(ex.args)
@@ -7010,7 +7190,9 @@ function _hsubst(ex::Expr, map::AbstractDict, ids::AbstractDict)
         return Expr(:call, args...)
     elseif h === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
             ex.args[2].head === :tuple
-        return Expr(:., ex.args[1], sub(ex.args[2]))
+        f = ex.args[1]
+        f isa Symbol && get(map, f, nothing) isa GlobalRef && (f = map[f])
+        return Expr(:., f, sub(ex.args[2]))
     elseif h === :kw && length(ex.args) == 2
         return Expr(:kw, ex.args[1], sub(ex.args[2]))
     elseif h === :tuple
@@ -7040,7 +7222,7 @@ end
 
 # A call head that names an argument or a body binder would silently stay
 # unrenamed (heads are never substituted): fail closed naming it.
-function _check_call_heads(sm::RKPPLSubmodel, ex, names::Set{Symbol})
+function _check_call_heads(sm::RKPPLSubmodel, ex, names::Set{Symbol}, substitutions)
     ex isa Expr || return nothing
     f = nothing
     if ex.head === :call && !isempty(ex.args)
@@ -7049,11 +7231,13 @@ function _check_call_heads(sm::RKPPLSubmodel, ex, names::Set{Symbol})
             ex.args[2].head === :tuple
         f = ex.args[1]
     end
-    f isa Symbol && f in names && _sfail(
+    value = get(substitutions, f, nothing)
+    callable = value isa GlobalRef && getglobal(value.mod, value.name) isa Function
+    f isa Symbol && f in names && !callable && _sfail(
         "submodel `$(sm.name)`: `$f` is an argument or local name but is " *
         "called as a function — a submodel's names are values; rename it")
     for a in ex.args
-        _check_call_heads(sm, a, names)
+        _check_call_heads(sm, a, names, substitutions)
     end
     return nothing
 end
@@ -7069,6 +7253,56 @@ function _stream_response(sm::RKPPLSubmodel, stmts, ret)
     length(hits) == 1 || _sfail("stream submodel `$(sm.name)`: return `$ret` " *
         "names more than one `.~` response")
     return stmts[first(hits)]
+end
+
+# A stream used as a latent samples its private return slot. Its vector
+# arguments supply the plate axis; scalars stay shared. The alias at the
+# use site remains separate from the namespace containing its priors.
+function _generative_stream_stmts(stmts, ret, data)
+    det = Pair{Symbol,Any}[st.args[1] => st.args[2] for st in stmts
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol]
+    defs = Dict{Symbol,Any}(det)
+    shapes = _def_shapes(det, data, defs)
+    aligned(x) = _obs_axis(x, data, defs, shapes, Set{Symbol}(), _NO_SHAPE_ENV)
+    function anchor(ex)
+        ex isa Symbol && return aligned(ex) ? ex : nothing
+        ex isa Expr || return nothing
+        ex.head === :call && ex.args[1] === :Ref && return nothing
+        start = ex.head in (:call, :.) ? 2 : 1
+        for a in ex.args[start:end]
+            found = anchor(a)
+            found === nothing || return found
+        end
+        return nothing
+    end
+    function indexed(ex, ivar)
+        ex isa Symbol && return aligned(ex) ? Expr(:ref, ex, ivar) : ex
+        ex isa Expr || return ex
+        ex.head === :call && ex.args[1] === :Ref && return ex
+        start = ex.head in (:call, :.) ? 2 : 1
+        return Expr(ex.head, ex.args[1:start-1]...,
+            (indexed(a, ivar) for a in ex.args[start:end])...)
+    end
+    out = Any[]
+    for st in stmts
+        if _is_broadcast_sample(st) && st.args[2] === ret
+            obj = st.args[3]
+            source = anchor(obj)
+            if source === nothing
+                push!(out, Expr(:call, :~, ret, _undot_cell_object(obj)))
+            else
+                ivar = gensym(:_rkppl_stream_index)
+                cell = Expr(:call, :~, Expr(:ref, ret, ivar),
+                    _undot_cell_object(indexed(obj, ivar)))
+                push!(out, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                    Expr(:for, Expr(:(=), ivar, Expr(:call, :eachindex, source)),
+                        Expr(:block, cell))))
+            end
+        else
+            push!(out, st)
+        end
+    end
+    return out
 end
 
 # Bind positional arguments and declared keyword defaults, then peel an
@@ -7164,9 +7398,9 @@ function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
         for id in sort!(collect(ids); by = string))
     names = union(argset, binders)
     for st in stmts
-        _check_call_heads(sm, st, names)
+        _check_call_heads(sm, st, names, submap)
     end
-    _check_call_heads(sm, ret, names)
+    _check_call_heads(sm, ret, names, submap)
     return submap, idmap
 end
 
@@ -7200,6 +7434,9 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     _check_submodel_cycle(sm, chain)
     callargs, pin = _peel_predictor_pin(callexpr, sm)
+    callargs = Any[_resolve_function_arg(a, mod,
+        union(used.declared, Set{Symbol}(keys(used.name_paths))),
+        "submodel `$(sm.name)` argument") for a in callargs]
     if pin !== nothing && !isempty(chain)
         _sfail("`predictor = $pin` pins a top-level use site only — " *
                "`$(chain[end].name)` calls `$(sm.name)` with a pin inside " *
@@ -7231,19 +7468,18 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
         ret in _submodel_args(sm) && _sfail("stream submodel `$(sm.name)`: the " *
             "response slot `$ret` is an argument — the slot is a local name " *
             "the use-site data column replaces")
-    else
-        stream && _sfail("`$(sm.name)` is an observation-stream submodel (it " *
-            "returns the `.~` response slot `$ret`); bind it to a DATA column " *
-            "(`<data> ~ $(sm.name)(...)`), not the non-data name `$lhs`.")
     end
+    observed = stream && lhs in data
+    pin !== nothing && !observed && _sfail(
+        "`predictor = $pin` names an observation predictor; `$lhs` is latent")
     if pin !== nothing
         haskey(pins, lhs) && _sfail("response $lhs pins two predictors " *
             "($(pins[lhs]) and $pin) — one `predictor =` per response")
         pins[lhs] = pin
     end
-    # The stream response slot binds to the data LHS; all other binders are
-    # namespaced under the LHS.
-    keep = stream ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
+    # An observed slot binds to the data LHS. A generative slot retains
+    # its private name beside every other binder in the call's namespace.
+    keep = observed ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
     scope = _new_submodel_scope!(used, lhs)
     submap, idmap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(lhs, nothing, scope, used), keep)
@@ -7252,11 +7488,16 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     # heads and function values pass `_hsubst` intact).
     bodynames = Set{Symbol}(k for k in keys(submap) if k isa Symbol)
     union!(bodynames, _submodel_args(sm))
-    out = Any[_hsubst(_resolve_submodel_stmt(st, sm, bodynames), submap, idmap)
+    functions = Dict(k => v for (k, v) in submap if v isa GlobalRef &&
+        getglobal(v.mod, v.name) isa Function)
+    out = Any[_hsubst(_resolve_submodel_stmt(_hsubst(st, functions, idmap),
+        sm, bodynames), submap, idmap)
         for st in stmts]
-    # Latent: bind the LHS to the return value. Stream: the response IS the
-    # binding (the data LHS is already bound), so no trailing assignment.
-    stream || push!(out, Expr(:(=), lhs, _hsubst(_resolve_module_calls(ret,
+    stream && !observed && (out = _generative_stream_stmts(out, submap[ret], data))
+    # Every latent call binds its return value. An observed stream already
+    # binds the response column, so it has no trailing assignment.
+    observed || push!(out, Expr(:(=), lhs, _hsubst(_resolve_module_calls(
+        _hsubst(ret, functions, idmap),
         sm.mod, bodynames, "submodel `$(sm.name)` return `$(repr(ret))`"),
         submap, idmap)))
     return sm, out
@@ -7323,14 +7564,14 @@ end
 # Rewrite a `@plate` block, replacing each per-cell submodel-call cell with the
 # submodel's inlined `i`-indexed cell statements; other cells pass through.
 function _expand_plate_cell_submodels(pl::Expr, mod::Module, data::Set{Symbol},
-        used::_ScopeExpansion, chain)
+        pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
     loop = pl.args[end]::Expr
     asg = loop.args[1]::Expr
     ivar = asg.args[1]::Symbol
     body = loop.args[2]::Expr
     cells = Any[]
     for c in body.args
-        _expand_cell_stmt!(cells, c, ivar, mod, data, used, chain)
+        _expand_cell_stmt!(cells, c, ivar, mod, data, pins, used, chain)
     end
     newloop = Expr(:for, asg, Expr(:block, cells...))
     return Expr(:macrocall, pl.args[1:end-1]..., newloop)
@@ -7339,23 +7580,24 @@ end
 # Expand one plate cell into `cells`, recursively (a per-cell body may call a
 # per-cell submodel in turn; it resolves in the enclosing submodel's module).
 function _expand_cell_stmt!(cells, c, ivar::Symbol, mod::Module,
-        data::Set{Symbol}, used::_ScopeExpansion, chain)
+        data::Set{Symbol}, pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
     call = _cell_submodel_call(c, ivar, mod)
     if call === nothing
         push!(cells, c)
     else
-        sm, gen = _expand_cell_submodel(call[1], call[2], ivar, mod, data,
+        sm, gen = _expand_cell_submodel(call[1], call[2], ivar, mod, data, pins,
             used, chain)
         inner = RKPPLSubmodel[chain; sm]
         for g in gen
-            _expand_cell_stmt!(cells, g, ivar, sm.mod, data, used, inner)
+            _expand_cell_stmt!(cells, g, ivar, sm.mod, data, pins, used, inner)
         end
     end
     return cells
 end
 
 _is_dotted_obj(st::Expr) =
-    _is_sample(st) && st.args[3] isa Expr && st.args[3].head === :.
+    (_is_sample(st) || _is_broadcast_sample(st)) &&
+        st.args[3] isa Expr && st.args[3].head === :.
 
 # Inline one per-cell submodel call `col[i] ~ sm(callargs…)` into a sequence of
 # `i`-indexed cell statements. The submodel's own `~`/`=` names are namespaced
@@ -7374,14 +7616,11 @@ _is_dotted_obj(st::Expr) =
 # desugar the inlined statements flow through.
 function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
                                mod::Module, data::Set{Symbol},
-                               used::_ScopeExpansion, chain)
+                               pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
     col = colref.args[1]::Symbol
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     _check_submodel_cycle(sm, chain)
     callargs, pin = _peel_predictor_pin(callexpr, sm)
-    pin === nothing || _sfail("`predictor = $pin` is top-level-only " *
-        "(`y ~ sm(...; predictor = ...)`); per-cell predictors lower " *
-        "through the plate path")
     length(callargs) == length(_submodel_args(sm)) || _sfail(
         "submodel `$(sm.name)` expects $(length(sm.argnames)) argument(s) " *
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$col[$ivar] ~ " *
@@ -7426,11 +7665,12 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
              _is_sample(stmts[slot]) ? "a scalar (latent) distribution" :
              "a derived assignment") *
             ", so use a non-data LHS.")
-    elseif slot !== nothing && _is_dotted_obj(stmts[slot])
-        _sfail("`$(sm.name)` is a per-cell observation submodel (its return " *
-            "slot `$ret` is a `~ family.(...)` dotted response); bind it to a " *
-            "DATA column (`<data>[$ivar] ~ $(sm.name)(...)`), not the non-data " *
-            "name `$col`.")
+    end
+    latent_stream = col ∉ data && slot !== nothing && _is_dotted_obj(stmts[slot])
+    if pin !== nothing
+        col in data || _sfail("`predictor = $pin` names an observation predictor; `$col` is latent")
+        haskey(pins, col) && _sfail("response $col pins two predictors")
+        pins[col] = pin
     end
     argset = Set{Symbol}(_submodel_args(sm))
     for st in stmts
@@ -7446,14 +7686,15 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     end
     # Build the substitution: args → call args; each internal name → its indexed
     # namespaced ref, except the direct-bound slot → `col[i]`.
-    keep = slot === nothing ? Dict{Symbol,Any}() :
+    keep = slot === nothing || latent_stream ? Dict{Symbol,Any}() :
         Dict{Symbol,Any}(_stmt_lhs(stmts[slot]) => colref)
     scope = _new_submodel_scope!(used, col; per_cell = true)
     submap, idmap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(col, ivar, scope, used), keep)
     out = Any[_hsubst(st, submap, idmap) for st in stmts]
     # Compound-return latent: bind `col[i]` to the substituted return value.
-    slot === nothing && push!(out, Expr(:(=), colref, _hsubst(ret, submap, idmap)))
+    (slot === nothing || latent_stream) &&
+        push!(out, Expr(:(=), colref, _hsubst(ret, submap, idmap)))
     return sm, out
 end
 
@@ -7609,15 +7850,17 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
     end
     family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
     interval_raw = _lower_response_base(lhs, call, ctx)
-    # Prob-space families bypass the predictor-building location
-    # lowering (their location names a Beta-sampled scalar parameter;
-    # the Beta family is checked at contract). Every other family
+    # Prob-space families retain a sampled scalar or a fixed value
+    # predictor. Every other family
     # routes through `_lower_location`, which admits a value location
     # here (a scalar parameter or data column under the written link).
     pname = (family === BinomialProbFam ||
             family === ZeroInflatedBinomialFam) ?
-        _lower_prob_location(lhs, loc, ctx,
+        _lower_prob_location(lhs, loc, ctx, predictors, pred_idx,
             family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
+        family in (GammaValueFam, WeibullValueFam) ?
+        _lower_argument_predictor!(lhs, loc, ctx, predictors, pred_idx,
+            coefuse, Symbol(lhs, "_value")) :
         _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse; value = true)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
@@ -8064,8 +8307,8 @@ end
 # (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
 # Cumulative structures take an `Ordered(...)` vector; stopping-ratio
 # stage thresholds are unconstrained, a one-axis sized
-# `c[1:K] .~ Normal.(m, s)` declaration. Each vector serves exactly one
-# response (recorded for `_lower_parameters`, which sizes it).
+# `c[1:K] .~ Normal.(m, s)` declaration. A vector may serve several
+# responses; its first use records a size source for `_lower_parameters`.
 function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         shown::String)
     name = arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
@@ -8091,10 +8334,9 @@ function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
             "thresholds $name must be a one-axis vector declared in the " *
             "model (`$name[1:length(levels($lhs)) - 1] .~ Normal.(0, 1)`)")
     end
-    prev = get(ctx.threshold_uses, name, nothing)
-    prev === nothing || _sfail("response $lhs: cutpoints $name already " *
-        "serve response $(prev.response) — one response per cutpoint vector")
-    ctx.threshold_uses[name] = (response = lhs, ordered = ordered)
+    # A declaration owns its vector; responses only read it. Keep the first
+    # use for an inferred extent, then validate every reader's extent at bind.
+    get!(ctx.threshold_uses, name, (response = lhs, ordered = ordered))
     return name
 end
 
@@ -8242,14 +8484,22 @@ end
 function _lower_joint_response(j::JointSampleStmt, factor_names::Set{Symbol},
         ctx, predictors, pred_idx, coefuse)
     tag = "[$(join(j.outcomes, ", "))]"
-    j.factor in factor_names || _sfail(
-        "joint response $tag factor $(j.factor) must name an " *
-        "`LKJCovarianceFactor` declaration " *
-        "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` in the model)")
+    scales, corr = if j.factor in factor_names
+        _lkj_factor_names(j.factor)
+    else
+        rhs = get(ctx.detmap, j.factor, nothing)
+        rhs isa Expr && rhs.head === :call && length(rhs.args) == 3 &&
+            rhs.args[1] === :.* && all(a -> a isa Symbol &&
+                a in ctx.array_decls, rhs.args[2:end]) || _sfail(
+            "joint response $tag factor $(j.factor) must name an " *
+            "`LKJCovarianceFactor` declaration or an explicit " *
+            "`$(j.factor) = sd .* C` over a declared scale vector " *
+            "and LKJCholesky factor")
+        (rhs.args[2], rhs.args[3])
+    end
     pnames = Symbol[_lower_location(o, m, IdentityLink, ctx, predictors,
         pred_idx, coefuse; synth = Symbol(o, "_joint_", k), value = true)
         for (k, (o, m)) in enumerate(zip(j.outcomes, j.means))]
-    scales, corr = _lkj_factor_names(j.factor)
     label = Symbol(join(j.outcomes, "_") * "_resp")
     return LikelihoodSpec(MvNormalCholeskyFam, IdentityLink, j.outcomes[1],
         pnames[1], nothing, nothing, ResponseEvidence(:none, nothing, nothing),
@@ -8302,8 +8552,10 @@ function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
     label = Symbol(g.response, "_resp")
     push!(ctx.matrices_used, g.matrix)
     glmuse[g.beta] = (label, g.matrix)
+    ev = g.wrapper === nothing ? ResponseEvidence(:none, nothing, nothing) :
+        first(_peel_evidence(g.response, g.wrapper, ctx))
     return LikelihoodSpec(fam, link, g.response, g.matrix, sigma, nothing,
-        ResponseEvidence(:none, nothing, nothing), label, nothing, nothing;
+        ev, label, nothing, nothing;
         glm_alpha = g.alpha, glm_beta = g.beta)
 end
 
@@ -8488,8 +8740,8 @@ function _dot2call_spine_arg(lhs, f, i, a)
     elseif f === :BetaBinomial2 && i == 2
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Weibull && i == 2
-        a isa Real && return a
-        return _dot2call_nested_link(lhs, a, f)
+        return _is_composed_map(a) && a.args[1] === :exp ?
+            _dot2call_nested_link(lhs, a, f) : a
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
     # response branch matches the `./` structure (link + alpha identity).
@@ -8538,11 +8790,10 @@ function _peel_weighted(lhs, rhs::Expr, ctx)
     dist isa Expr && dist.head === :call || _sfail(
         "`weighted` wraps a distribution object " *
         "(`weighted.(Normal.(mu, sigma), w)`), got $(repr(dist))")
-    w isa Symbol && w in ctx.vecdefs && _sfail(
-        "`weighted` weights column $w is derived — slice-1 binds weights " *
-        "raw (derived weights need shape metadata — planned)")
-    w isa Symbol && w in ctx.data || _sfail("`weighted` weights must be a " *
-                                            "bare data column, got $(repr(w))")
+    w isa Symbol && (w in ctx.data ||
+        _is_bind_data_definition(w, ctx.detmap, ctx.data, Set{Symbol}())) ||
+        _sfail("`weighted` weights must be data (a raw column or a " *
+            "data-only definition), got $(repr(w))")
     return w, dist
 end
 
@@ -8591,12 +8842,16 @@ function _bound(lhs, b, side::Symbol, ctx)
             b.args[1] === :- && b.args[2] === :Inf
         return _bound_infinite(lhs, -Inf, side)
     end
-    b isa Symbol && b in ctx.data && return b
-    b isa Symbol && b in ctx.vecdefs && _sfail(
-        "response $lhs bound $b is a derived column — slice-1 binds " *
-        "evidence bounds raw (derived bounds need shape metadata — planned)")
+    b isa Symbol && (b in ctx.data || b in ctx.prior_names ||
+        haskey(ctx.detmap, b)) && return b
+    if b isa Expr
+        shape = _shape_of(b, ctx.data, ctx.detmap, copy(ctx.detshape),
+            Set{Symbol}(), ctx.shape_env)
+        return shape === :scalar ? _composed_scalar_leaf!(lhs, b, ctx, Symbol[]) :
+            _extract_column(lhs, b, ctx)
+    end
     return _sfail("response $lhs bound $(repr(b)) must be a literal or a " *
-                  "data column")
+                  "declared value")
 end
 
 function _bound_infinite(lhs, v::Real, side::Symbol)
@@ -8717,13 +8972,25 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Weibull
         length(args) == 2 || _sfail("response $lhs: `Weibull` takes " *
                                     "`Weibull.(k, exp.(eta))`")
-        return WeibullFam, LogLink, LogLink,
-        _exp_response_location(lhs, args[2]), args[1], nothing, nothing,
-        nothing, nothing
+        if Meta.isexpr(args[2], :call) && args[2].args[1] === :exp
+            return WeibullFam, LogLink, LogLink,
+            _lower_link_arg(lhs, args[2], :exp), args[1], nothing, nothing,
+            nothing, nothing
+        end
+        return WeibullValueFam, IdentityLink, IdentityLink,
+        args[2], args[1], nothing, nothing, nothing, nothing
     elseif fam === :Gamma
-        loc, scale = _lower_gamma_args(lhs, args, ctx)
-        return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing,
-        nothing, nothing
+        length(args) == 2 || _sfail("response $lhs: `Gamma` takes shape and scale")
+        a1, div = args
+        if Meta.isexpr(div, :call) && length(div.args) == 3 &&
+                div.args[1] === Symbol("./") && _same_aux(a1, div.args[3]) &&
+                Meta.isexpr(div.args[2], :.) && div.args[2].args[1] === :exp
+            loc, scale = _lower_gamma_args(lhs, args, ctx)
+            return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing,
+            nothing, nothing
+        end
+        return GammaValueFam, IdentityLink, IdentityLink, div, a1,
+        nothing, nothing, nothing, nothing
     elseif fam === :Beta
         loc, scale = _lower_beta_args(lhs, args, ctx)
         return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing,
@@ -9037,14 +9304,16 @@ function _reject_legacy_inverse_link(lhs, arg)
     _sfail("response $lhs: $reason; use `$inverse.(eta)`")
 end
 
-# Prob-space Binomial-family location: a sampled parameter name (the Beta
-# family is checked at contract, the Categorical deferral precedent).
-# Literals stay rejected — a fully fixed Binomial contributes a constant.
-function _lower_prob_location(lhs, loc, ctx, what::String = "Binomial")
+# Prob-space Binomial-family location: a sampled name or a fixed value
+# predictor. A fully fixed likelihood contributes density without coordinates.
+function _lower_prob_location(lhs, loc, ctx, predictors, pred_idx,
+        what::String = "Binomial")
     loc isa Symbol && loc in ctx.prior_names && return loc
-    loc isa Real && _sfail("response $lhs: prob-space $what " *
-                           "probability $loc is a literal — v1 probabilities " *
-                           "are Beta-sampled (`theta ~ Beta(...)` in the model)")
+    if loc isa Real
+        isfinite(loc) && 0 <= loc <= 1 || _sfail(
+            "response $lhs: $what literal probability must lie in [0, 1]")
+        return _value_location!(lhs, loc, IdentityLink, ctx, predictors, pred_idx)
+    end
     return _sfail("response $lhs: prob-space $what probability takes a " *
                   "Beta parameter name (`theta ~ Beta(...)` in the model), " *
                   "got $(repr(loc))")
@@ -9070,9 +9339,12 @@ function _lower_scale(lhs, s, ctx)
             "parameter/assignment name (planned: derived-column scales)")
         return s
     end
-    return _sfail("response $lhs scale must be a bare parameter/assignment " *
-                  "name, a per-observation data column, or a literal (bind " *
-                  "expressions via an assignment first), got $(repr(s))")
+    if s isa Expr && s.head === :ref && !_obs_axis(s, ctx.data,
+            ctx.detmap, ctx.detshape, Set{Symbol}(), ctx.shape_env)
+        return _composed_scalar_leaf!(Symbol(lhs, :_scale), s, ctx, Symbol[])
+    end
+    return _sfail("response $lhs scale must be a parameter, data value, " *
+        "scalar expression or predictor, got $(repr(s))")
 end
 
 # Student nu use-site lowering: a bare parameter/assignment name or a
@@ -9248,7 +9520,19 @@ function _lower_scale_use(lhs, s, ctx, predictors, pred_idx, coefuse)
     # through untouched.
     s === nothing && return nothing
     if s isa Expr && s.head === :.
-        return _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+        if s.args[1] in (:exp, :logistic) &&
+                length(s.args[2].args) == 1 &&
+                only(s.args[2].args) isa Symbol &&
+                _is_scale_predictor_def(only(s.args[2].args), ctx, true)
+            return _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+        end
+        pname = _lower_argument_predictor!(lhs, s, ctx, predictors,
+            pred_idx, coefuse, Symbol(lhs, "_scale_value"))
+        return ScalePredictorRef(pname, IdentityLink)
+    elseif s isa Expr && _canon_shape(s, ctx) === :vector
+        pname = _lower_argument_predictor!(lhs, s, ctx, predictors,
+            pred_idx, coefuse, Symbol(lhs, "_scale_value"))
+        return ScalePredictorRef(pname, IdentityLink)
     end
     if s isa Expr && s.head === :call && !isempty(s.args) &&
             s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
@@ -9382,8 +9666,9 @@ end
 
 # Analyze (or intern) a scale predictor: exactly the location-predictor
 # treatment (`_lower_location`'s named-definition arm) under the use-site
-# link — affine analysis, coefficient-use recording, one link per
-# predictor. Family admission (Gaussian/NB2/Gamma/Beta-log-only/Student
+# link — affine analysis and coefficient-use recording. A different link
+# interns another use of the same authored terms. Family admission
+# (Gaussian/NB2/Gamma/Beta-log-only/Student
 # sigma/Student nu/hurdle/VonMises-log-only/BB2/NB1-logit-only/
 # IG-log-only; LogNormal/Weibull deferred) is the
 # contract's gate (`_validate_scale_predictor` / `_validate_nu`), so
@@ -9394,10 +9679,13 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
         return _lower_scale_predictor_error(lhs, name, ctx)
     if haskey(pred_idx, name)
         pred = predictors[pred_idx[name]]
-        pred.link === link || _sfail(
-            "predictor $name is shared by slots needing links " *
-            "$(pred.link) and $link — one link per predictor")
-        return name
+        pred.link === link && return name
+        # A slot's link belongs to the use, not to the authored value.
+        # Reuse the same terms/declared coefficients under a private name.
+        alias = _argument_name!(Symbol(name, "_use"), ctx)
+        push!(predictors, PredictorSpec(alias, link, pred.terms, alias))
+        pred_idx[alias] = length(predictors)
+        return alias
     end
     if _composed_root(ctx.detmap[name], ctx)
         return _lower_composed_predictor(name, ctx.detmap[name], ctx, lhs,
@@ -9408,6 +9696,30 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
     push!(predictors, PredictorSpec(name, link, terms, name))
     pred_idx[name] = length(predictors)
     return name
+end
+
+function _argument_name!(base::Symbol, ctx)
+    nm, k = base, 0
+    while nm in ctx.taken
+        k += 1
+        nm = Symbol(base, "_", k)
+    end
+    push!(ctx.taken, nm)
+    return nm
+end
+
+# Distribution arguments are ordinary values. A scalar keeps its scalar
+# assignment; dotted expressions retain their array computation over LPs,
+# data and scalar declarations without inventing a new coefficient prior.
+function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
+        coefuse, base::Symbol)
+    pname = _argument_name!(base, ctx)
+    if ex isa Expr && (_canon_shape(ex, ctx) !== :scalar || _is_composed_map(ex))
+        return _lower_composed_predictor(pname, ex, ctx, lhs, IdentityLink,
+            predictors, pred_idx, coefuse)
+    end
+    return _lower_location(lhs, ex, IdentityLink, ctx, predictors, pred_idx,
+        coefuse; value = true, synth = pname)
 end
 
 function _lower_scale_predictor_error(lhs, name, ctx)
@@ -9460,8 +9772,8 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     # referenced directly). A derived location with NO latent stays a design
     # predictor; a latent-reading definition WITH coefficient structure is a
     # design predictor too (`b .* theta` classifies as a ContinuousTerm over
-    # the latent — the SB `me` mirror), while a bare latent inside a larger
-    # expression fails in `_classify_symbol`.
+    # the latent), while an unscaled latent summand contributes its value
+    # through the same LatentTerm used for a direct location.
     if loc isa Symbol && loc in ctx.plate_names
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
@@ -9569,8 +9881,8 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             return _value_location!(lhs, loc, pred_link, ctx,
                 predictors, pred_idx; synth)
         # Per-cell latents classify inline like data columns: `b .* x_true`
-        # is a ContinuousTerm over the latent (the SB `me` mirror); a bare
-        # latent fails in `_classify_symbol`, never silently.
+        # is a ContinuousTerm over the latent; an unscaled summand is a
+        # LatentTerm, just as when the whole location names that latent.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
         pin = get(ctx.predictor_pins, lhs, nothing)
@@ -9665,16 +9977,18 @@ function _scalar_location_reads(loc, ctx,
         return value
     end
     loc isa Expr || return true
+    loc.head === :kw && return _scalar_location_reads(loc.args[2], ctx,
+        seen; allow_data)
     _is_bound_value_call(loc) && return true
     loc.head === :ref && return false
     loc.head === :call && !isempty(loc.args) &&
         loc.args[1] in _CONSTRUCT_VALUE_HEADS && return false
     args = loc.head === :call ? loc.args[2:end] :
         _is_dotted_call(loc) ? loc.args[2].args : loc.args
-    # A reduction returns a scalar from columns; an arbitrary whole-value
-    # call over columns has unknown shape and retains its existing guidance.
+    # Reductions and module functions take whole column arguments. A
+    # function's actual scalar/vector result is checked when evaluated.
     whole = allow_data || (loc.head === :call && !isempty(loc.args) &&
-        loc.args[1] in REDUCTION_FNS)
+        (loc.args[1] isa GlobalRef || loc.args[1] in REDUCTION_FNS))
     return all(a -> _scalar_location_reads(a, ctx, seen; allow_data = whole), args)
 end
 
@@ -10007,7 +10321,8 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     # `th = c[g]` over a coefficient-capable `c[levels(g)]`, which keeps
     # its composed factor-sub meaning.
     rhs = ctx.detmap[s]
-    _reads_array_value(rhs, ctx) && !factor_alias && return false
+    (_reads_array_value(rhs, ctx) || _reads_value_array(rhs, ctx)) &&
+        !factor_alias && return false
     # Likewise a parameter offset: data and non-coefficient scalar
     # parameters combined by sums only (`w = s .+ x`, `s ~ Exponential(1)`).
     # It has no coefficient to compose, so it stays an offset local. Under
@@ -10090,6 +10405,7 @@ _is_model_value_def(name, ctx) = name isa Symbol &&
 function _reads_value_array(ex, ctx, seen::Set{Symbol} = Set{Symbol}())
     _is_bound_array_value_call(ex) && return true
     isval(nm) = nm isa Symbol && (nm in ctx.value_arrays ||
+        nm in ctx.dirichlet_names || nm in ctx.ordered_names ||
         nm in ctx.array_decls || _is_array_def(nm, ctx))
     if ex isa Symbol
         isval(ex) && return true
@@ -10302,12 +10618,10 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             return node
         elseif get(ctx.detshape, node, :scalar) === :vector &&
                 _reads_value_array(ctx.detmap[node], ctx)
-            # A per-observation definition reading array values
-            # (`th = r[person]`, `b = b0 .+ r[item]`) is a sub-predictor:
-            # its array reads extract as offset columns beside any
-            # coefficients (affine, as `_lower_composed_predictor`
-            # checks).
-            node in subs || push!(subs, node)
+            # Array-derived values remain graph values. Interning one
+            # as an LP would consume the definition needed by other
+            # readers, such as a reduction of a library contrast.
+            node in datas || push!(datas, node)
             return node
         elseif haskey(ctx.detmap, node)
             return _sfail("$where combines $node, which is neither an " *
@@ -10325,6 +10639,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     node isa Expr || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
         "sub-predictors and scalars)")
+    if node.head === :ref && _reads_array_value(node, ctx; follow = false)
+        column = _extract_column(pname, node, ctx)
+        push!(datas, column)
+        return column
+    end
     if _is_composed_map(node)
         f = node.args[1]
         _composed_map_fn(f) || return _sfail("$where maps " *
@@ -10389,6 +10708,8 @@ end
 function _is_composed_scalar_expr(node, ctx)
     node isa Number && return true
     node isa Expr || return false
+    Meta.isexpr(node, :call) && !isempty(node.args) &&
+        node.args[1] in REDUCTION_FNS && return true
     _composed_has_sub(node, ctx, true) && return false
     _reads_column(node, ctx) && return false
     _is_composed_map(node) && return false
@@ -10425,8 +10746,6 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
     scalars = Symbol[]
     datas = Symbol[]
     tree = _extract_composed_tree(pname, rhs, ctx, subs, scalars, datas)
-    isempty(subs) && _sfail("predictor $pname has no sub-predictor — " *
-        "compositions combine at least one sub-predictor LP")
     for s in subs
         if haskey(pred_idx, s)
             pred = predictors[pred_idx[s]]
@@ -10537,14 +10856,14 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
     # feed a predictor directly; an empty predictor still has no value.
     if isempty(uses) && !(!isempty(terms) &&
             all(t -> t.kind === OffsetTerm ||
+                t.kind === LatentTerm ||
+                t.kind === ComposedTerm ||
                 t.kind === MonotonicSummandTerm ||
                 t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
                 (composed_sub && t.kind === VaryingEffectTerm), terms))
-        _sfail("predictor $pname has no estimated coefficients — add an " *
-               "intercept or coefficient (bare-data offset affines and " *
-               "beta-free `mo1()` predictors are the only " *
-               "coefficient-free shapes)")
+        _sfail("predictor $pname has no estimated coefficients or " *
+               "coefficient-free value terms")
     end
     return terms, uses
 end
@@ -10626,9 +10945,7 @@ function _collect_signed!(out, ex, sign::Int, pname)
 end
 
 function _classify_summand(pname, core, sign::Int, ctx)
-    core isa Number && _sfail("predictor $pname: literal $core is not a " *
-                              "term — fold constants into an intercept " *
-                              "coefficient with an offset prior location")
+    core isa Number && return _extract_summand(pname, core, sign, ctx)
     core isa Symbol && return _classify_symbol(pname, core, sign, ctx)
     core isa Expr || _sfail("predictor $pname: $(repr(core)) is not affine " *
                             "in data (terms are bare coefficients, " *
@@ -10730,19 +11047,14 @@ function _classify_summand(pname, core, sign::Int, ctx)
     if _canon_shape(core, ctx) === :vector
         return _extract_summand(pname, core, sign, ctx)
     end
-    # A number bound as data is a constant, read as its definition
-    # (`off = 0.25`) is: a constant is not a term, exactly as a literal.
-    _is_bound_value_call(core) && _sfail("predictor $pname: data value " *
-        "$(repr(core)) is a number, and a constant is not a term — fold " *
-        "constants into an intercept coefficient with an offset prior " *
-        "location")
+    # A bound number keeps its constant offset value, as a literal or a
+    # scalar definition (`off = 0.25`) does.
+    _is_bound_value_call(core) && return _extract_summand(pname, core, sign, ctx)
     # An undotted module call returns a whole (model-level) value, even
     # over columns it reads whole.
-    _contains_module_call(core) && _sfail("predictor $pname: " *
-        "$(repr(core)) is a model-level value (an undotted module call " *
-        "takes and returns whole values), not an observation column — " *
-        "gather it with an observation index (`v[c]`), or broadcast the " *
-        "call (`f.(...)`) for an elementwise column")
+    _contains_module_call(core) && return _extract_summand(pname, core, sign, ctx)
+    _canon_shape(core, ctx) === :scalar &&
+        return _extract_summand(pname, core, sign, ctx)
     return _scalar_summand_error(pname, core)
 end
 
@@ -11102,9 +11414,12 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
     end
-    core in ctx.plate_names && _sfail(
-        "predictor $pname: bare latent $core is not a term — scale it " *
-        "by a coefficient (`b .* $core`, the SB `me` mirror)")
+    if core in ctx.plate_names
+        sign < 0 && return _extract_summand(pname,
+            Expr(:call, :.-, core), 1, ctx)
+        return TermSpec(LatentTerm, [core], NamedTuple(),
+            core, Symbol(core, "_lat")), nothing
+    end
     if core in ctx.scan_states
         # A bare scan state is a beta-free summand: the state spliced
         # unscaled (`mu = a .+ x`, the dar/`mo1` shape). Negation is a value.
@@ -11113,9 +11428,9 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
         return TermSpec(ScanSummandTerm, ColumnRef[],
             (scan_id = core, coef = nothing), label, label), nothing
     end
-    haskey(ctx.detmap, core) && _scalar_summand_error(pname, core)
+    haskey(ctx.detmap, core) && return _extract_summand(pname, core, sign, ctx)
     core in ctx.prior_names && core ∉ ctx.coef_priors &&
-        _scalar_summand_error(pname, core)
+        return _extract_summand(pname, core, sign, ctx)
     return TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
         :intercept), (core, :Intercept, sign)
 end
@@ -11170,10 +11485,21 @@ end
 
 # Anonymous value substructure becomes an offset. Model-level scalars
 # stay scalar assignments; preprocessing broadcasts them over the rows.
-function _extract_summand(pname, core::Expr, sign::Int, ctx)
-    if _canon_shape(core, ctx) === :scalar
+function _extract_summand(pname, core, sign::Int, ctx)
+    if core isa Symbol && core in ctx.value_arrays
+        value = sign < 0 ? Expr(:call, :.-, core) : core
+        leaf = _composed_scalar_leaf!(pname, value, ctx, Symbol[])
+        label = Symbol(core, :_value)
+        return TermSpec(ComposedTerm, ColumnRef[],
+            (tree = leaf, subs = Symbol[], scalars = [leaf]), label, label), nothing
+    end
+    if core isa Number || _canon_shape(core, ctx) === :scalar
         e = sign < 0 ? Expr(:call, :-, core) : core
         nm = _composed_scalar_leaf!(pname, e, ctx, Symbol[])
+        if _contains_module_call(core) && !_is_bound_value_call(core)
+            return TermSpec(ComposedTerm, ColumnRef[],
+                (tree = nm, subs = Symbol[], scalars = [nm]), nm, nm), nothing
+        end
         return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
             Symbol(nm, "_off")), nothing
     end
@@ -12144,6 +12470,12 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
     function hoist_call(lhs, rhs)
         rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol || return rhs
+        if rhs.args[1] === :LKJCholesky && length(rhs.args) in (3, 4)
+            # Shape and orientation are structural; only eta is a prior value.
+            eta = bind(lhs, Symbol(lhs, :_arg2), rhs.args[3])
+            eta === rhs.args[3] && return rhs
+            return Expr(:call, rhs.args[1], rhs.args[2], eta, rhs.args[4:end]...)
+        end
         if rhs.args[1] === :truncated && length(rhs.args) == 4
             inner = hoist_call(lhs, rhs.args[2])
             bounds = hoist_args(lhs, rhs.args[3:end])
@@ -12218,7 +12550,9 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
         if s.slices === :per_level
             haskey(coefuse, s.lhs) && _sfail("$(s.lhs) is a predictor " *
                 "coefficient and cannot also be an LKJCholesky factor")
-            push!(arrays, _lower_lkj_stack(s.lhs, s.dims, s.rhs))
+            p = _lower_lkj_stack(s.lhs, s.dims, s.rhs)
+            push!(arrays, p)
+            union!(syms, _value_symbols(p.args.arg1))
             continue
         end
         if s.slices !== nothing
@@ -12243,7 +12577,9 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             haskey(coefuse, s.lhs) && _sfail(
                 "$(s.lhs) is a predictor coefficient and cannot also be " *
                 "an LKJCholesky factor")
-            push!(arrays, _lower_lkj_cholesky(s.lhs, s.rhs))
+            p = _lower_lkj_cholesky(s.lhs, s.rhs)
+            push!(arrays, p)
+            union!(syms, _value_symbols(p.args.arg1))
             continue
         end
         if _is_dirichlet_call(s.rhs)
@@ -12296,19 +12632,17 @@ _is_lkj_cholesky_call(rhs) =
     rhs.args[1] === :LKJCholesky
 
 # `L ~ LKJCholesky(K, eta)` (Distributions.jl; the optional third argument
-# is `'L'` — `L` is the lower factor). `K` is a literal or `size(M, d)` of
-# a matrix `M`; `eta` a finite positive literal.
+# is `'L'` or `'U'`). `K` is a literal or `size(M, d)` of
+# a matrix `M`; `eta` is a scalar prior value.
 function _lower_lkj_cholesky(lhs, rhs)
     args = _plain_args(rhs, "`LKJCholesky`")
     (length(args) == 2 || length(args) == 3) || _sfail("parameter $lhs: " *
         "`LKJCholesky` takes (K, eta) (`$lhs ~ LKJCholesky(3, 2.0)`), got " *
         "$(length(args)) arguments")
     K, eta = args[1], args[2]
-    if length(args) == 3
-        args[3] == 'L' || _sfail("parameter $lhs: `$lhs` is the LOWER " *
-            "Cholesky factor (`LKJCholesky(K, eta)` or `LKJCholesky(K, " *
-            "eta, 'L')`), got uplo $(repr(args[3]))")
-    end
+    uplo = length(args) == 3 ? args[3] : 'L'
+    uplo in ('L', 'U') || _sfail("parameter $lhs: `LKJCholesky` uplo " *
+        "is 'L' or 'U', got $(repr(uplo))")
     dim = if K isa Integer && !(K isa Bool)
         K >= 1 || _sfail("parameter $lhs: `LKJCholesky` dimension must be " *
             "≥ 1, got $K")
@@ -12320,10 +12654,12 @@ function _lower_lkj_cholesky(lhs, rhs)
         _sfail("parameter $lhs: `LKJCholesky` dimension is a literal or " *
             "`size(M, d)` of a matrix `M`, got $(repr(K))")
     end
-    eta isa Real && !(eta isa Bool) && isfinite(eta) && eta > 0 || _sfail(
-        "parameter $lhs: LKJ shape `eta` must be a finite positive literal, " *
-        "got $(repr(eta))")
-    return ArrayParameter(lhs, :lkj_cholesky, (arg1 = Float64(eta),),
+    (eta isa Symbol || (eta isa Real && !(eta isa Bool) && isfinite(eta) &&
+        eta > 0)) || _sfail("parameter $lhs: LKJ shape `eta` must be a " *
+        "positive scalar literal or a declared value, got $(repr(eta))")
+    prior_args = (arg1 = eta isa Real ? Float64(eta) : eta,)
+    uplo === 'U' && (prior_args = merge(prior_args, (; uplo)))
+    return ArrayParameter(lhs, :lkj_cholesky, prior_args,
         Any[dim, dim], nothing, lhs)
 end
 
@@ -12351,6 +12687,13 @@ function _lower_array_parameter(lhs, dims::Vector{Any}, rhs, coefuse, ctx,
         "coefficient — read it as a value (`$lhs[g]` per observation, " *
         "`B * $lhs` through a data matrix)")
     call = _undot_distribution(lhs, rhs)
+    if Meta.isexpr(rhs, :call)
+        for a in call.args[2:end]
+            _canon_shape(a, ctx) === :scalar || _sfail("array $lhs: " *
+                "a shared scalar distribution constructor requires scalar " *
+                "arguments; use `$(call.args[1]).(...)` to broadcast arguments")
+        end
+    end
     held = Dict{Symbol,Any}()
     call = _hold_array_args(lhs, call, held)
     p = _lower_parameter(lhs, call, coefuse, ctx.matrices)
@@ -12549,6 +12892,7 @@ end
 # `Fam.(args...)` → `Fam(args...)`, recursively through the distribution
 # arguments of `truncated.(...)` (`truncated.(Normal.(0, s), 0, Inf)`).
 function _undot_distribution(lhs, rhs)
+    Meta.isexpr(rhs, :call) && return rhs
     rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
         rhs.args[1] isa Symbol && rhs.args[2] isa Expr &&
         rhs.args[2].head === :tuple || _sfail("array $lhs takes an " *

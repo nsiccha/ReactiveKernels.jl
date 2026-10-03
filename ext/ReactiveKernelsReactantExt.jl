@@ -1115,6 +1115,9 @@ const _RKScalarIndex = Union{Integer,Reactant.TracedRNumber{<:Integer}}
 @inline _rk_int_index(index::Reactant.TracedRNumber{Int}) = index
 @inline _rk_int_index(index::Reactant.TracedRNumber{<:Integer}) =
     convert(Reactant.TracedRNumber{Int}, index)
+@inline ReactiveKernels._tensorized_trunc(
+    ::Type{T}, x::Reactant.TracedRNumber{<:Integer}) where {T<:Integer} =
+    convert(Reactant.TracedRNumber{T}, x)
 @inline _rk_gather(array::Reactant.TracedRArray, indices) =
     Reactant.@allowscalar array[map(_rk_int_index, indices)...]
 
@@ -2145,6 +2148,13 @@ function ReactiveKernels._tensorized_plate_call(
         return _reactant_authored_plate_call(structural, operation, args)
     any(_reactant_plate_ref_array, args) &&
         return _reactant_ref_plate_call(operation, args)
+    # A split arm with only shared inputs receives an ignored lane anchor.
+    # Its live branch can return a host fallback or a traced scalar. Generic
+    # broadcast infers their join as Number before tracing the cell; batch
+    # traces the shared branch and preserves the anchored lane domain.
+    operation isa ReactiveKernels._KernelSourceOp &&
+        operation.tensor_f isa ReactiveKernels._LaneAnchored &&
+        return _reactant_ref_plate_call(operation, args)
     operands = map(_reactant_plate_operand, args)
     result_type = Base.promote_op(operation, map(Base.eltype, operands)...)
     result_type <: Number || return _reactant_ref_plate_call(operation, args)
@@ -2342,7 +2352,7 @@ _rk_reactant_ad_op(::Val{:gradient}) = DifferentiationInterface.gradient
 _rk_reactant_ad_op(::Val{:value_and_gradient}) =
     DifferentiationInterface.value_and_gradient
 
-# --- Opt-in Reactant pipeline without fused-slice miscompiles ---------------
+# --- Opt-in Reactant pipeline with retained loops and unfused slices --------
 # reactant-full-pr-f9f453e4 (interim; see reactivekernels-use §7j).
 #
 # Reactant 0.2.284's `slice_slice` transform fuses nested strided slices into a
@@ -2351,12 +2361,17 @@ _rk_reactant_ad_op(::Val{:value_and_gradient}) =
 # Enzyme's reverse emits a mismatched `stablehlo.add(N, N-1)` (multi-use
 # chains), SIGABRTing the compile. The raw trace is correct (`optimize =
 # :only_enzyme` compiles with correct values/gradients), so compiling the
-# default `:all` pipeline minus just that one pattern restores correct
-# compiles. This builder replicates Reactant's default `:all` pipeline via
-# Reactant's own builders and strips the pattern, so it adapts to Reactant
+# default `:all` pipeline minus that pattern restores correct compiles.
+# Its `enzyme_hlo_unroll` pass also replicates bound data-derived count loops,
+# including loops inside a batch (Reactant 0.2.290). Remove that pass as well
+# to preserve the authored program structure in both primal and reverse AD.
+# This builder replicates Reactant's default `:all` pipeline via
+# Reactant's own builders and strips both patterns, so it adapts to Reactant
 # versions that keep the builder API; it fails loudly (instead of silently
 # running `:all`) when the builders or the pattern are absent.
-const _RK_NO_SLICE_SLICE_PATTERNS = (r"slice_slice<\d+>;",)
+const _RK_NO_SLICE_SLICE_PATTERNS = (
+    r"slice_slice<\d+>;", r"enzyme_hlo_unroll\(\d+\);",
+)
 
 function _rk_reactant_default_pipeline(backend::String)
     C = Reactant.Compiler

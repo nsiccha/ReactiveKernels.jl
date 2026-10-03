@@ -9,20 +9,7 @@ using Reactant
             grad = similar(f.u)
             val, _ = sampler_value_and_gradient!(sampler, grad, f.u)
             ru = Reactant.to_rarray(f.u)
-            pinned = f.label in ("monotonic coefficient", "monotonic column",
-                "monotonic whole minus")
-            compiled = try
-                Reactant.@compile sampler.kernel(ru)
-            catch e
-                # Capability: the existing Reactant traced-view indexing gap
-                # blocks simplex lowering (reactivekernels-use §7r,
-                # test_leveled_reactant.jl). Only that exact error is admitted.
-                pinned && e isa MethodError && e.f === Base.reindex &&
-                    length(e.args) == 2 && e.args[1] isa Tuple{UnitRange{Int}} &&
-                    e.args[2] isa CartesianIndex{1} || rethrow()
-                @test_broken false
-                continue
-            end
+            compiled = Reactant.@compile sampler.kernel(ru)
             @test Float64(compiled(ru)) ≈ f.oracle(f.u)
             cad = compile_ad_value_and_gradient(sampler.ad, ru)
             rval, rgrad = cad(ru)
@@ -40,9 +27,6 @@ using Reactant
             else
                 @test ops == operations[f.label]
             end
-            # Unexpected Pass requires removing the capability pin once the
-            # backend admits these ordinary programs.
-            pinned && @test_broken true
         end
     end
 end

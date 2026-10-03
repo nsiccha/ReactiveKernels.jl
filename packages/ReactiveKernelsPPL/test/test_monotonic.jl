@@ -122,12 +122,13 @@ end
 end
 
 @testset "mo surface fail-closed" begin
-    # Bare `mo()` (no coefficient) names both spellings.
+    # A library contrast may be read with coefficient one.
     err = try
         lower_rkppl(quote
                 a ~ Normal(0, 1)
-                s ~ Dirichlet(2, 1.0)
-                mu = a .+ mo(c, s)
+                s ~ Dirichlet([1.0, 1.0])
+                contrast ~ monotonic(c, s)
+                mu = a .+ contrast
                 y .~ Normal.(mu, 1.0)
             end, (:y, :c); conditioned = (:y, :c))
         nothing
@@ -135,29 +136,32 @@ end
         e
     end
     # capability: a library contrast is a value with coefficient one (P8 1cmodra mo-dar; todo `15lq8iu`).
-    @test_broken (err === nothing || throw(err))
-    # `mo1()` under a coefficient (or any nesting) fails closed.
-    # capability: mo1 contrast under a coefficient (`b .* mo1(c, s)`; values compose, P3/P8; same value as `b .* mo(c, s)`) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (err === nothing || throw(err))
+    # capability: a library contrast under a declared coefficient
+    # (values compose, P3/P8; todo `15lq8iu`).
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            mu = a .+ b .* mo1(c, s)
+            s ~ Dirichlet([1.0, 1.0])
+            contrast ~ monotonic(c, s)
+            mu = a .+ b .* contrast
             y .~ Normal.(mu, 1.0)
         end, (:y, :c); conditioned = (:y, :c)); true)
     # capability: a reduction of a monotonic value can feed an ordinary scalar offset (P8; todo `15lq8iu`).
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            mu = a .+ sum(mo1(c, s))
+            s ~ Dirichlet([1.0, 1.0])
+            contrast ~ monotonic(c, s)
+            mu = a .+ sum(contrast)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c); conditioned = (:y, :c)); true)
-    # Negated mo1 summands fail closed (additive only).
-    # capability: negated mo1 summand (`a .- mo1(c, s)`) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    # capability: negated library contrast (`a .- contrast`;
+    # todo `15lq8iu`).
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            mu = a .- mo1(c, s)
+            s ~ Dirichlet([1.0, 1.0])
+            contrast ~ monotonic(c, s)
+            mu = a .- contrast
             y .~ Normal.(mu, 1.0)
         end, (:y, :c); conditioned = (:y, :c)); true)
     # Arity is exactly (index column, increments).
@@ -191,25 +195,29 @@ end
             mu = a .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c); conditioned = (:y, :c))
-    # One monotonic term per simplex (SB allocates one submodel per term).
-    # capability: one increments simplex shared by several mo/mo1 terms (SB one-submodel-per-term is not a principle, P10) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    # The library effects read one explicitly declared simplex.
+    shared = lower_rkppl(quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             d ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            mu = a .+ b .* mo(c, s)
-            nu = d .+ mo1(c, s)
+            s ~ Dirichlet([1.0, 1.0])
+            m1 ~ monotonic(c, s)
+            m2 ~ monotonic(c, s)
+            mu = a .+ b .* m1
+            nu = d .+ m2
             y .~ Normal.(mu, 1.0)
             z .~ Normal.(nu, 1.0)
-        end, (:y, :z, :c); conditioned = (:y, :z, :c)); true)
-    # `mo()` neither interacts nor nests.
+        end, (:y, :z, :c); conditioned = (:y, :z, :c))
+    @test count(p -> p.name === :s, shared.vector_parameters) == 1
+    @test length(shared.responses) == 2
+    # Explicit library contrast values participate in ordinary arithmetic.
     # capability: mo() interaction with a data column (`b .* mo(c, s) .* x`) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            mu = a .+ b .* mo(c, s) .* x
+            s ~ Dirichlet([1.0, 1.0])
+            contrast ~ monotonic(c, s)
+            mu = a .+ b .* contrast .* x
             y .~ Normal.(mu, 1.0)
         end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
     # capability: mo() nested in an arithmetic subexpression (`b .* (mo(c, s) .+ x)`) (todo `0fkd9yk`)
@@ -220,29 +228,32 @@ end
             mu = a .+ b .* (mo(c, s) .+ x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)
-    # Neither spelling hides in definitions.
+    # Named library contrast values remain usable through definitions.
     # capability: mo value in a definition (`w = b .* mo(c, s)`) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            w = b .* mo(c, s)
+            s ~ Dirichlet([1.0, 1.0])
+            contrast ~ monotonic(c, s)
+            w = b .* contrast
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
         end, (:y, :c); conditioned = (:y, :c)); true)
     # capability: mo1 value in a definition (`w = mo1(c, s)`) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            w = mo1(c, s)
+            s ~ Dirichlet([1.0, 1.0])
+            contrast ~ monotonic(c, s)
+            w = contrast
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
         end, (:y, :c); conditioned = (:y, :c)); true)
     # capability: mo value in an unused derived definition (`m = sum(mo(c, s))`) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            m = sum(mo(c, s))
+            s ~ Dirichlet([1.0, 1.0])
+            contrast ~ monotonic(c, s)
+            m = sum(contrast)
             mu = a .+ x
             y .~ Normal.(mu, 1.0)
         end, (:y, :c, :x); conditioned = (:y, :c, :x)); true)

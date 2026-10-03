@@ -66,11 +66,11 @@ _bare_posterior(kern, lay, q::NamedTuple) =
     end"""), (:k, :n); conditioned = (:k, :n))
     @test Set(p.name for p in prior.parameters) == Set([:theta, :thetaprior])
 
-    # Literals stay fail-closed (intercept-only predictor message).
+    # A fixed probability contributes likelihood without a sampled coordinate.
     # capability: literal probability Binomial.(n, 0.3) (fixed-p likelihood) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(Meta.parse("""begin
+    @test !isempty((lower_rkppl(Meta.parse("""begin
         k .~ Binomial.(n, 0.3)
-    end"""), (:k, :n); conditioned = (:k, :n)); true)
+    end"""), (:k, :n); conditioned = (:k, :n))).responses)
 
     # Other families keep the strict broadcast-link message.
     # refused: undeclared phi (P6, 05oe96l); NB2 mean is also a real-support parameter with no link
@@ -111,14 +111,10 @@ _bare_posterior(kern, lay, q::NamedTuple) =
         y .~ Poisson.(mu)
     end"""), (:y, :x); conditioned = (:y, :x)); true)
 
-    # Evidence on a bare location fails closed (cdf arms are link-space).
-    # capability: censoring evidence on a bare sampled-parameter location (todo `0ze68k8`)
-    @test_broken (bind_data(
+    # Evidence normalizers use the bare probability parameter directly.
+    # admitted: censoring evidence on a bare sampled-parameter location (todo `0ze68k8`)
+    @test (bind_data(
         lower_rkppl(Meta.parse("""begin
-            a ~ Normal(0, 1)
-            b ~ Normal(0, 1)
-            mu = a .+ b .* x
-            sigma ~ Exponential(1.0)
             theta ~ Beta(1.0, 1.0)
             k .~ censored.(Binomial.(n, theta), lo, hi)
         end"""), (:k, :n, :x, :lo, :hi); conditioned = (:k, :n, :x, :lo, :hi)),

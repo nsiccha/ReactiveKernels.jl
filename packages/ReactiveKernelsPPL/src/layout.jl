@@ -1269,7 +1269,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
                     for b in e.scan_blocks]...)))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
-        elseif e.kind === :array && e.transform === :lkj_stack
+        elseif e.kind === :array && _is_lkj_stack(e.transform)
             push!(pairs, e.name => _lkj_stack_constrain(e, seg))
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
@@ -1281,8 +1281,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             # Both LKJ-factor kinds share the host hyperspherical edges
             # (name/size-keyed — kind-agnostic); only `:varying_corr`
             # grows the derived `b_` draws below.
-            push!(pairs, e.name =>
-                lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size)))
+            L = lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size))
+            push!(pairs, e.name => (_is_upper_lkj(e.transform) ? permutedims(L) : L))
         else
             v = _constrain_elt(e, Float64(only(seg)))
             push!(pairs, e.name => v)
@@ -1433,7 +1433,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             size(v) == Tuple(e.dims) || throw(ContractValidationError(
                 "[layout] array parameter $(e.name) has size $(size(v)), " *
                 "want $(Tuple(e.dims))"))
-            if e.transform === :lkj_stack
+            if _is_lkj_stack(e.transform)
                 u[e.offset:(e.offset + e.size - 1)] .=
                     _lkj_stack_unconstrain(e, v)
                 continue
@@ -1466,7 +1466,8 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                       "must be a K×K matrix, got $(typeof(v))"),
             )
             u[e.offset:(e.offset + e.size - 1)] .=
-                lkj_chol_unconstrain(v, _lkj_dim(e.size))
+                lkj_chol_unconstrain(_is_upper_lkj(e.transform) ?
+                    permutedims(v) : v, _lkj_dim(e.size))
         else
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing parameter $(e.name)"),
@@ -1506,7 +1507,7 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             total += _vector_logjac(e, seg)
             continue
         end
-        if e.kind === :array && e.transform === :lkj_stack
+        if e.kind === :array && _is_lkj_stack(e.transform)
             # Level by level, the vine's coupled thetas.
             total += _lkj_stack_logjac(e, seg)
             continue
@@ -1743,13 +1744,16 @@ end
 # hand-kept broadcast. `constrain` yields the constrained cell vector; a
 # companion `logjac` plate supplies the per-cell Jacobian this block's
 # `jacobian_term` sums (pruned by have→want when the Jacobian is not wanted).
-# `:identity` (real support) is a direct view read — no transform, no Jacobian.
+# Real per-cell latents use an ordinary packed slice, so an indexed RK
+# cell receives an array it can gather from. No transform or Jacobian.
 function _plate_transform_statements(e::LayoutEntry)
     lo = e.offset
     hi = e.offset + e.size - 1
     view_read = :(view(unconstrained, $lo:$hi))
-    e.transform === :identity &&
-        return Expr[:($(e.name)::AbstractVector{Float64} = $view_read)]
+    if e.transform === :identity
+        read = e.kind === :plate ? :(unconstrained[$lo:$hi]) : view_read
+        return Expr[:($(e.name)::AbstractVector{Float64} = $read)]
+    end
     if e.transform === :interval
         # Parameterized bounds ⇒ not in the (parameterless) bijector registry;
         # hand-rolled broadcast edges over the block view, identical math to the
@@ -1816,7 +1820,7 @@ _vector_lr(e::LayoutEntry) = Symbol(:_ppl_vlr_, e.name)
 # constraint 1). They emit the host `ordered_constrain`/`simplex_constrain`
 # vector operations verbatim, so in-graph and host agree bit-for-bit.
 # Consumers gather from the vector (`Ref(v)` plate inputs, `v[idx]`).
-# Every leading/pivot slice is materialized with `Float64.(…)`: a
+# Every leading/pivot slice is materialized: a
 # `vcat` mixing a `SubArray` and a `Vector` lowers through a Union-typed
 # path the native Enzyme reverse pass rejects. Size specializations
 # (empty packs emit nothing — their consumers never read them; a one-element
@@ -1852,9 +1856,11 @@ function _vector_transform_statements(e::LayoutEntry)
     K = e.size + 1
     K == 1 && return Expr[:($(e.name)::AbstractVector{Float64} = ones(1))]
     z, l, lr = _vector_z(e), _vector_l(e), _vector_lr(e)
+    # The packed port is already Float64. Materialize its slice once;
+    # a nested Float64 broadcast over a SubArray fails Reactant reindexing.
     return Expr[
-        :($z::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(Float64.(
-            view(unconstrained, $lo:$hi)) .+ log.($K .- (1:$(K - 1))))))),
+        :($z::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(
+            unconstrained[$lo:$hi] .+ log.($K .- (1:$(K - 1))))))),
         :($l::AbstractVector{Float64} = log1p.(-$z)),
         :($lr::AbstractVector{Float64} = cumsum(vcat(0.0, $l))),
         :($(e.name)::AbstractVector{Float64} = exp.($lr) .* vcat($z, ones(1))),

@@ -122,11 +122,10 @@ end
             _mi_none_evidence(), :y_resp, nothing, nothing; mi_jobs = :Jobs_y)
         @test r.mi_jobs === :Jobs_y
     end
-    # Rejected families carry no mi lowering.
+    # Legacy scalar/link fixtures remain under their existing audit.
     for family in (BernoulliLogitFam, PoissonLogFam, BinomialLogitFam,
             NegativeBinomial2Fam, CategoricalLogitFam, OrderedLogisticFam,
-            OrdinalFam, MultinomialFam, CategoricalFam, MvNormalCholeskyFam,
-            NormalIDGLMFam)
+            OrdinalFam, CategoricalFam)
         pred = PredictorSpec(:mu, IdentityLink, _mi_terms(), :mu)
         plan = StructuralPlan(
             LikelihoodSpec[LikelihoodSpec(family, IdentityLink, :y, :mu,
@@ -136,6 +135,27 @@ end
             AssignmentSpec[], cols, n)
         # capability: (IR-level) Case-A mi (obs-only rows) for families beyond Gaussian/Gamma/Beta; entries also use IdentityLink/no scale, so link/scale gates may fire first (todo `1308iv0`)
         @test_broken (validate_plan(plan); true)
+    end
+    # These original scalar plans omit the tensor families' required
+    # simplex/trials, covariance factor or design matrix. Valid packed
+    # counterparts are numerical fixtures in test_capability_packed_tensor.
+    for (family, diagnostic) in ((MultinomialFam, "simplex"),
+            (MvNormalCholeskyFam, "factor_scales"),
+            (NormalIDGLMFam, "bound design matrix"))
+        pred = PredictorSpec(:mu, IdentityLink, _mi_terms(), :mu)
+        plan = StructuralPlan(
+            LikelihoodSpec[LikelihoodSpec(family, IdentityLink, :y, :mu,
+                nothing, nothing, _mi_none_evidence(), :y_resp, nothing,
+                nothing; mi_jobs=:Jobs_y)],
+            [pred], _mi_priors(:mu), SampledParameter[], AssignmentSpec[], cols, n)
+        err = try
+            validate_plan(plan)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ContractValidationError
+        @test err isa ContractValidationError && occursin(diagnostic, err.message)
     end
     # Packed observations compose with row-specific likelihood inputs.
     struct_args = (GaussianFam, IdentityLink, :y, :mu, :sigma)
