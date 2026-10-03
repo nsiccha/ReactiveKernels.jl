@@ -165,7 +165,14 @@ and lock the one Reactant 0.2.289 lifted:
   unrolled per lane, succeeded). The boundary concerned only branches whose
   condition reads a live value: a condition on bound data is split away
   during preparation and never reaches the backend.
-  Default optimized reverse still expands small lazy batches into one branch
+  A plate branch whose condition reads only shared scalar or `Ref` operands
+  now lowers to one lazy decision around the batch, using its authored branch
+  dependency metadata. Its selected arm retains the original lane domain,
+  including constant fallbacks and otherwise unused lane inputs. Ordinary
+  optimized primal and reverse have matching complete operation inventories
+  at three, seven and eleven lanes; no inactive arithmetic is evaluated.
+  Lane-dependent conditions still reach the backend's small-batch boundary.
+  Default optimized reverse expands those small lazy batches into one branch
   region per lane instead of retaining the batch loop:
   `repro_reactant_lazy_batch_growth.jl` has correct values and gradients at
   two and five lanes, but different operation inventories. The fixed-structure

@@ -346,6 +346,30 @@ struct _LaneAnchored{F}
 end
 @inline (arm::_LaneAnchored)(anchor, args...) = arm.f(args...)
 
+# An ignored domain anchor does not make a shared branch condition vary by
+# lane. Retain its metadata with shifted argument positions, including when
+# several unused lane inputs anchor the terminal recipe.
+_plate_branch_anchor(operation) = nothing
+function _plate_branch_anchor(operation::_KernelSourceOp{D,F,N,T}) where
+        {D,F,N<:_KernelBranch,T<:_KernelBranch}
+    _KernelSourceOp(Val(D), Val(F), _plate_branch_anchor_metadata(operation.f),
+        _plate_branch_anchor_metadata(operation.tensor_f), operation.ignored_throws)
+end
+function _plate_branch_anchor_metadata(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
+    shift(indices) = map(index -> index + 1, indices)
+    _KernelBranch(Val(shift(CI)), Val(shift(TI)), Val(shift(EI)),
+        _LaneAnchored(branch.call), branch.condition, branch.then_arm, branch.else_arm)
+end
+function _plate_branch_anchor(operation::_LaneAnchored)
+    inner = _plate_branch_anchor(operation.f)
+    inner === nothing ? nothing : _plate_branch_anchor(inner)
+end
+@inline function _tensorized_plate_dispatch(operation::_LaneAnchored, args::Tuple)
+    branch = _plate_branch_anchor(operation.f)
+    branch === nothing ? _tensorized_plate_default_call(operation, args) :
+        _tensorized_plate_dispatch(branch, args)
+end
+
 _partition_plate_recipe(g, recipe, known, op, pending, want, fresh) = nothing
 function _partition_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A},
                                  pending::Vector{Recipe}, want, fresh) where {K,A}
