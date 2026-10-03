@@ -1,5 +1,7 @@
-# Backend-only boundary: default optimized reverse compiles and keeps lazy
-# arithmetic, but a small lane count expands the batch's control-flow regions.
+# Backend-only MLIR growth boundary: default optimized reverse compiles, but a
+# small lane count expands the batch's control-flow regions. Retained MLIR
+# branches do not prove executable laziness: default XLA may speculate them
+# even inside a retained loop (repro_reactant_pure_lazy_guard.jl).
 using Reactant, Enzyme, Test
 Reactant.set_default_backend("cpu")
 
