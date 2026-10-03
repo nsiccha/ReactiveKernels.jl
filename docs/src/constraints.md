@@ -88,6 +88,13 @@ a generated rule on an owned callable covers it.
 
 ## Acceptance and existing limitations
 
+Reactant 0.2.290 rejects a nested `Float64` broadcast over a packed view
+with a `SubArray` reindexing error. The simplex transform reads an ordinary
+slice of its already `Float64` packed port instead, with identical values
+and ordinary reverse-mode derivatives. The backend-only reproducer is
+`benchmark/reactant_subarray_broadcast_reindex.jl`; prior-only and shared
+simplex acceptance is in `test_capability_scan_priors_reactant.jl`.
+
 A lowering change must demonstrate that increasing relevant data lengths or
 capacities does not replicate loop bodies or control-flow regions. Check the
 generated backend structure as well as primal and AD parity with native Julia,
@@ -234,13 +241,6 @@ and lock the one Reactant 0.2.289 lifted:
   Declared second-axis gathers, elementwise array definitions and level
   subsets pass compiled primal, AD and operation-count checks.
 
-- A one-dimensional traced view indexed by `CartesianIndex{1}` fails in
-  Reactant 0.2.290 because `Base.reindex` expects an index tuple:
-  `repro_reactant_simplex_view.jl`. Reactant's broadcast element-type probe
-  reaches that index in the existing simplex transform's `Float64.(view)`
-  nest. Dirichlet priors, including live concentrations, retain native
-  primal and Enzyme reverse support; compiled acceptance pins this exact
-  failure until the backend fixes it. The authored transform stays intact.
 - Reverse compilation with a zero-length active vector leaves `tensor.empty`,
   which Reactant 0.2.290 cannot export to XLA:
   `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its

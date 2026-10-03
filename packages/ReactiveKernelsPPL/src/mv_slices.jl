@@ -233,6 +233,51 @@ function _ordered_normal_slices_logpdf(o, B, m, s)
     return -0.5 * sum(((B .- m) ./ s) .^ 2) - n * (log(s) + 0.5 * log(2pi))
 end
 
+# Querying a broadcast of joint slice draws keeps one log density per
+# slice. Whole-vector draws remain scalar in the query emitter. These
+# native multivariate-normal helpers retain the existing compiled refusal.
+function _mvnormal_cholesky_slices_pointwise(o, B, mu, F)
+    ReactiveKernels._dynamic_tensorized_marker((B, mu, F)) === nothing ||
+        throw(ArgumentError("MvNormalCholesky slice priors support native execution only"))
+    groups, k = _slice_count(o, B), _slice_length(o, B)
+    _check_slice_vector_arg("the MvNormalCholesky mean", mu, groups, k)
+    logdet = _cholesky_factor_logdet(F, k)
+    out = zeros(Float64, groups)
+    for g in 1:groups
+        out[g] = _lower_solve_rows_logpdf(
+            (_, i) -> _slice_entry(o, B, g, i) - _arg_entry(mu, g, i),
+            (i, j) -> F[i, j], logdet, k, 1)
+    end
+    return out
+end
+
+function _mvnormal_slices_pointwise(o, B, mu, Sigma)
+    ReactiveKernels._dynamic_tensorized_marker((B, mu, Sigma)) === nothing ||
+        throw(ArgumentError("MvNormal slice priors support native execution only"))
+    return _mvnormal_cholesky_slices_pointwise(o, B, mu,
+        _covariance_cholesky(Sigma, _slice_length(o, B)))
+end
+
+@traceable function _dirichlet_slices_pointwise(o, B, alpha)
+    groups, k = _slice_count(o, B), _slice_length(o, B)
+    _check_slice_vector_arg("the Dirichlet concentration", alpha, groups, k)
+    X, A = _slice_rows(o, B), _arg_rows(alpha)
+    if all(isfinite.(A) .& (A .> 0))
+        normalizer = DistributionKernelSources.loggamma.(sum(A; dims = 2)) .-
+            sum(DistributionKernelSources.loggamma.(A); dims = 2)
+        vec(normalizer .+ sum((A .- 1.0) .* log.(X); dims = 2))
+    else
+        fill(-Inf, groups)
+    end
+end
+
+function _ordered_normal_slices_pointwise(o, B, m, s)
+    X = _slice_rows(o, B)
+    k = _slice_length(o, B)
+    return vec(-0.5 .* sum(((X .- m) ./ s) .^ 2; dims = 2) .-
+        k * (log(s) + 0.5 * log(2pi)))
+end
+
 # Ordered slices: the first entry, then cumulative exp-increments along
 # each slice (the vector `ordered_constrain`, per slice).
 _ordered_slices_constrain(::_SliceRows, U) =
