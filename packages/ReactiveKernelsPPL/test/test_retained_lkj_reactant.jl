@@ -8,6 +8,43 @@ function _rlkj_hlo_ops(hlo)
     ops
 end
 
+# Preparation sizes either matrix axis without imposing observation alignment.
+@testset "Reactant: first-axis LKJ size and empty reverse" begin
+    for (K, axis) in ((4, 1), (1, 2))
+        fx = _rlkj_case(K, 2.3; axis)
+        u = [0.3 * sin(i) for i in 1:fx.built.layout.total]
+        original = deepcopy(fx.data)
+        q = prepare_sampler(fx.built, fx.bound, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        value, grad = sampler_value_and_gradient!(q, similar(u), u)
+        @test value ≈ _rlkj_oracle(fx, u) rtol = 1e-12
+        @test grad ≈ _rlkj_gradient(fx, u) rtol = 1e-10 atol = 1e-11
+        ru = Reactant.to_rarray(u)
+        if K == 1
+            # Native reverse is the empty vector; compiled density passes in
+            # the main testset. Reactant cannot export its empty AD buffer.
+            # See benchmark/repro_reactant_empty_gradient.jl.
+            error = try
+                compile_ad_value_and_gradient(q.ad, ru)
+                nothing
+            catch error
+                error
+            end
+            @test error !== nothing
+            @test occursin("'tensor.empty' op unsupported op for export to XLA",
+                sprint(showerror, error))
+            @test_broken error === nothing
+            continue
+        end
+        compiled = compile_ad_value_and_gradient(q.ad, ru)
+        value, grad = compiled(ru)
+        @test Float64(value) ≈ _rlkj_oracle(fx, u) rtol = 1e-10
+        @test Array(grad) ≈ _rlkj_gradient(fx, u) rtol = 1e-9 atol = 1e-10
+        @test fx.data == original
+        @test Array(ru) == u
+    end
+end
+
 @testset "Reactant: retained LKJ transform and reverse" begin
     for eta in (1.0, 2.3)
         structures = Dict{String,Int}[]
@@ -56,4 +93,22 @@ end
     ru = Reactant.to_rarray(Float64[])
     compiled = Reactant.@compile k(ru)
     @test Float64(compiled(ru)) ≈ _rlkj_oracle(fx, Float64[])
+end
+
+# Reverse AD retains the same operation inventory beyond small-loop optimization.
+@testset "Reactant: LKJ reverse structure is independent of K" begin
+    structures = Dict{String,Int}[]
+    for K in (8, 16)
+        fx = _rlkj_case(K, 2.3)
+        u = [0.3 * sin(i) for i in 1:fx.built.layout.total]
+        k = prepare_query(fx.built, fx.bound, :sampler)
+        ru = Reactant.to_rarray(u)
+        gradient = v -> only(Enzyme.gradient(Enzyme.Reverse, Enzyme.Const(k), v))
+        ops = _rlkj_hlo_ops(Reactant.@code_hlo optimize = true gradient(ru))
+        @test get(ops, "stablehlo.while", 0) > 0
+        push!(structures, ops)
+        compiled = Reactant.@compile gradient(ru)
+        @test Array(compiled(ru)) ≈ _rlkj_gradient(fx, u) rtol = 1e-9 atol = 1e-10
+    end
+    @test allequal(structures)
 end

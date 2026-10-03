@@ -1883,8 +1883,8 @@ coordinate the `constrain` edge reads (shared via structural CSE); a per-cell
 latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`);
 a leveled vector entry sums its unrolled twin of the host
 `ordered_logjac`/`simplex_logjac` (shared coordinates via CSE); an LKJ
-entry sums its unrolled twin of the host `lkj_chol_logjac` (named
-partial temps, shared with the constrain edges).
+declared LKJ entry reads the retained sum over the partials shared with its
+transform. Legacy structural-margin LKJ blocks sum their named scalar edges.
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing

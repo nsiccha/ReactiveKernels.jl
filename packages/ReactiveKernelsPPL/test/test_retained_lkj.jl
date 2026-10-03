@@ -1,14 +1,15 @@
 using ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme
 using Distributions, LinearAlgebra, Test
 
-function _rlkj_case(K, eta; literal = false, observed = nothing)
-    dimension = literal ? K : :(size(M, 2))
+function _rlkj_case(K, eta; literal = false, observed = nothing, axis = 2)
+    dimension = literal ? K : :(size(M, $axis))
     ast = quote
         L ~ LKJCholesky($dimension, $eta)
         mu = L[$K, 1] .* x
         y .~ Normal.(mu, 0.7)
     end
-    data = Dict{Symbol,Any}(:M => zeros(literal ? 3 : 7, K),
+    shape = literal ? (3, K) : axis == 1 ? (K, 7) : (7, K)
+    data = Dict{Symbol,Any}(:M => zeros(shape...),
         :x => [0.3, -0.5, 0.7], :y => [0.1, -0.2, 0.3])
     conditioned = observed === nothing ? (:y,) : (:y, :L)
     observed === nothing || (data[:L] = observed)
