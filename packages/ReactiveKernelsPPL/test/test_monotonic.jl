@@ -191,18 +191,21 @@ end
             mu = a .+ mo1(c, s)
             y .~ Normal.(mu, 1.0)
         end, (:y, :c); conditioned = (:y, :c))
-    # One monotonic term per simplex (SB allocates one submodel per term).
-    # capability: one increments simplex shared by several mo/mo1 terms (SB one-submodel-per-term is not a principle, P10) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    # The library effects read one explicitly declared simplex.
+    shared = lower_rkppl(quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             d ~ Normal(0, 1)
-            s ~ Dirichlet(2, 1.0)
-            mu = a .+ b .* mo(c, s)
-            nu = d .+ mo1(c, s)
+            s ~ Dirichlet([1.0, 1.0])
+            m1 ~ monotonic(c, s)
+            m2 ~ monotonic(c, s)
+            mu = a .+ b .* m1
+            nu = d .+ m2
             y .~ Normal.(mu, 1.0)
             z .~ Normal.(nu, 1.0)
-        end, (:y, :z, :c); conditioned = (:y, :z, :c)); true)
+        end, (:y, :z, :c); conditioned = (:y, :z, :c))
+    @test count(p -> p.name === :s, shared.vector_parameters) == 1
+    @test length(shared.responses) == 2
     # `mo()` neither interacts nor nests.
     # capability: mo() interaction with a data column (`b .* mo(c, s) .* x`) (todo `15lq8iu`)
     @test_broken (lower_rkppl(quote

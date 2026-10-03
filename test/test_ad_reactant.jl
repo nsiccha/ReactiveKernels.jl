@@ -19,6 +19,7 @@ const AD_REACTANT_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 _trace(x) = Reactant.to_rarray(x)
 
 include("test_ad_fused_reactant.jl")
+include("test_ad_retained_count_reactant.jl")
 
 @testset "Reactant-compiled AD" begin
     @testset "standalone objective: authored defaults, keywords, parity" begin
@@ -345,12 +346,13 @@ include("test_ad_fused_reactant.jl")
         @test Array(explicit_gradient) ≈ reference
     end
 
-    @testset "surgical pipeline builder strips only slice_slice" begin
+    @testset "pipeline builder preserves loops and unfused slices" begin
         ext = Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt)
         pipe = ext._rk_reactant_pipeline_no_slice_slice()
         @test pipe isa String
         @test occursin("enzyme{", pipe)
         @test !occursin(r"slice_slice<\d+>;", pipe)
+        @test !occursin("enzyme_hlo_unroll", pipe)
         @test occursin("slice_elementwise", pipe)
     end
 end
