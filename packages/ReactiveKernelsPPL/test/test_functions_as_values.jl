@@ -90,6 +90,16 @@ function bind_matrix(x)
     return reshape(copy(x), 1, length(x))
 end
 matrix_reads(M, w, b) = w .* vec(M) .+ b
+const POOLS = Ref(0)
+function group_pool(g, h)
+    POOLS[] += 1
+    return vcat(g, h)
+end
+function group_index(g, gg)
+    lv = sort(unique(gg))
+    return Int[findfirst(isequal(v), lv) for v in g]
+end
+read_rows(values, rows) = values[rows]
 end
 const _FV = FunctionsAsValuesModels
 
@@ -128,6 +138,97 @@ _fv_cols() = Dict{Symbol,AbstractVector}(
     :c => [1, 2, 3, 2, 1, 3, 3],
     :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0, 0.25],
 )
+
+# A group definition used by both a declared axis and an inlined reader.
+# Keep the original vcat spelling as well as a transitive helper/alias chain.
+function _fv_group_axis_case(n; chained = false)
+    ast = quote
+        gg = vcat(g, h)
+        sd[1:1] .~ HalfNormal.(1)
+        z[levels(gg), 1:1] .~ Normal.(0, 1)
+        C = z .* sd[1]
+        i = group_index(g, gg)
+        j = group_index(h, gg)
+        mu = C[i, 1] .+ C[j, 1]
+        reads = read_rows(mu, rows)
+        y .~ Normal.(reads, 1)
+    end
+    if chained
+        idx = findfirst(ex -> ex isa Expr && ex.head === :(=) && ex.args[1] === :gg,
+            ast.args)
+        splice!(ast.args, idx:idx,
+            [:(pool = group_pool(g, h)), :(gg = identity(pool))])
+    end
+    g = collect(1:n)
+    cols = Dict{Symbol,Any}(:g => g, :h => circshift(g, 1),
+        :rows => reverse(g), :y => [0.2 * cos(i) for i in g])
+    # Only y is conditioned, matching the reported public API call.
+    plan = lower_rkppl(ast, Tuple(keys(cols)); mod = _FV, conditioned = (:y,))
+    bound = bind_data(plan, cols)
+    return plan, bound, build_kernel(bound), cols
+end
+
+function _fv_group_axis_reference(built, cols, u)
+    th = ReactiveKernelsPPL.constrain(built.layout, u)
+    c = vec(th.z) .* only(th.sd)
+    mu = c[cols[:g]] .+ c[cols[:h]]
+    return sum(logpdf.(Normal.(mu[cols[:rows]], 1), cols[:y]); init = 0.0) +
+        logpdf(truncated(Normal(), 0, Inf), only(th.sd)) +
+        sum(logpdf.(Normal(), th.z); init = 0.0) +
+        u[1] # log Jacobian of the single positive scale (sd = exp(u[1]))
+end
+
+@testset "functions as values: absorbed declaration dependencies" begin
+    for n in (0, 3, 7), chained in (false, true)
+        _FV.POOLS[] = 0
+        plan, bound, built, cols = _fv_group_axis_case(n; chained)
+        @test any(a -> a.name === :gg, (plan.assignments..., plan.derived...))
+        @test bound.columns[:gg] == vcat(cols[:g], cols[:h])
+        @test built.layout.total == n + 1
+        @test bound.n_obs == n
+        @test _FV.POOLS[] == Int(chained)
+        original = deepcopy(cols)
+        u = [0.15 * sin(i) for i in 1:built.layout.total]
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        for w in (u, u .+ 0.1)
+            value, grad = sampler_value_and_gradient!(q, similar(w), w)
+            reference(v) = _fv_group_axis_reference(built, cols, v)
+            @test value ≈ reference(w)
+            @test grad ≈ _fv_findiff(reference, w) rtol = 1e-5 atol = 1e-7
+        end
+        @test _FV.POOLS[] == Int(chained) # no second call during preparation/AD
+        @test cols == original
+        # refused: data cannot shadow the model's computed definition.
+        @test_throws ContractValidationError bind_data(plan, merge(cols, Dict(:gg => [1])))
+    end
+    # Prior slots retain the same transitive dependencies as dimension slots.
+    for declaration in (:(b ~ Normal(0, k)), :(b[1:3] .~ Normal.(0, k)))
+        ast = quote
+            k = bind_scale(x)
+            $declaration
+            reads = shifted(b .* k; by = 0.2)
+            y .~ Normal.(reads, 1)
+        end
+        cols = Dict{Symbol,Any}(:x => [1.0, 2.0, 3.0], :y => [0.1, -0.2, 0.3])
+        _FV.UNWRAPS[] = 0
+        _, bound, built = _fv_build(ast, cols)
+        @test bound.columns[:k] == 2.0
+        @test _FV.UNWRAPS[] == 1
+        u = fill(0.1, built.layout.total)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        reference(w) = begin
+            th = ReactiveKernelsPPL.constrain(built.layout, w)
+            b = th.b isa Number ? fill(th.b, 3) : th.b
+            prior = th.b isa Number ? logpdf(Normal(0, 2), th.b) :
+                sum(logpdf.(Normal(0, 2), th.b))
+            sum(logpdf.(Normal.(2 .* b .+ 0.2, 1), cols[:y])) + prior
+        end
+        value, grad = sampler_value_and_gradient!(q, similar(u), u)
+        @test value ≈ reference(u)
+        @test grad ≈ _fv_findiff(reference, u) rtol = 1e-5 atol = 1e-7
+        @test _FV.UNWRAPS[] == 1
+    end
+end
 
 # Cumulative-simplex contrast through ordinary Julia functions: the
 # monotonic-effect mathematics with no built-in construct.
