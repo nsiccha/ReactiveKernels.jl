@@ -63,21 +63,10 @@ end
             y .~ Normal.(mu, 1)
         end
         println("BACKEND_BEGIN dirichlet k=", k); flush(stdout)
-        try
-            push!(structs, _pp_backend_check(expr, Dict(:y => fill(0.2, 5), :z => ones(5)),
-                (a=1.2, p=fill(1/k,k))))
-        catch error
-            # Existing simplex transform gap: the backend applies a bare
-            # Cartesian index to a one-dimensional traced view. Pin only
-            # this exact signature, so an upstream fix fires Unexpected Pass.
-            error isa MethodError && error.f === Base.reindex &&
-                length(error.args) == 2 && error.args[2] isa CartesianIndex{1} || rethrow()
-            @test_broken false
-            continue
-        end
-        @test_broken true
+        push!(structs, _pp_backend_check(expr, Dict(:y => fill(0.2, 5), :z => ones(5)),
+            (a=1.2, p=fill(1/k,k))))
     end
-    isempty(structs) || @test length(structs) == 2 && structs[1] == structs[2]
+    @test length(structs) == 2 && structs[1] == structs[2]
 end
 
 _numeric_backend_scale(x) = 2x

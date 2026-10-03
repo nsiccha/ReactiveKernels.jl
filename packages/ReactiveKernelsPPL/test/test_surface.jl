@@ -132,7 +132,7 @@ _resps_equal(a::LikelihoodSpec, b::LikelihoodSpec) =
     a.family === b.family && a.link === b.link && a.response === b.response &&
     a.predictor === b.predictor && a.scale === b.scale &&
     a.weights === b.weights && _evs_equal(a.evidence, b.evidence) &&
-    a.label === b.label && a.range === b.range
+    a.label === b.label && a.range == b.range
 
 _evs_equal(a::ResponseEvidence, b::ResponseEvidence) =
     a.kind === b.kind && a.lower === b.lower && a.upper === b.upper
@@ -940,13 +940,12 @@ end
         eta = a .+ b .* x
         s .~ ZeroInflatedBinomial.(3, logistic.(eta), zi)
     end, (:s, :x); conditioned = (:s, :x)); true)
-    # Literal probabilities stay rejected (a fully fixed ZIB
-    # contributes a constant).
+    # Fixed probabilities contribute likelihood without a probability coordinate.
     # capability: literal probability in ZeroInflatedBinomial (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, 0.5, zi)
-    end, Ds; conditioned = Ds); true)
+    end, Ds; conditioned = Ds)).responses)
     # An unbracketed head names the broadcast fix.
     # refused: undotted ZeroInflatedBinomial head over per-obs args (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -1448,15 +1447,14 @@ end
         eta = a .+ b .* x
         y .~ weibull.(2.0, exp.(eta))
     end, Dn2; conditioned = Dn2)
-    # The scale position needs its `exp.` link wrapper (the Binomial
-    # link-fed-second precedent).
+    # Weibull also accepts its scale as an ordinary value.
     # capability: identity-link (bare) Weibull scale (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Weibull.(2.0, eta)
-    end, Dn2; conditioned = Dn2); true)
+    end, Dn2; conditioned = Dn2)).responses)
     # A modeled-k predictor fails at the contract gate (deferred).
     # capability: modeled Weibull shape-k predictor (exp.) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1795,22 +1793,22 @@ end
         y .~ negative_binomial2.(exp.(eta), phi)
     end, Dn2; conditioned = Dn2)
     # capability: identity-link (bare) Gamma mean (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         alpha ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ Gamma.(alpha, eta ./ alpha)
-    end, Dn2; conditioned = Dn2); true)
+    end, Dn2; conditioned = Dn2)).responses)
     # capability: general Gamma(alpha, theta) (mismatched alpha) beyond the mean template (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         alpha ~ Exponential(1.0)
         alpha2 ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ Gamma.(alpha, exp.(eta) ./ alpha2)
-    end, Dn2; conditioned = Dn2); true)
+    end, Dn2; conditioned = Dn2)).responses)
     # refused: gamma is SpecialFunctions.gamma, not a distribution (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         alpha ~ Exponential(1.0)
@@ -3285,16 +3283,29 @@ _ranged_ast(lhs) = Expr(:block,
     LineNumberNode(4), :(mu = a .+ b .* x),
     LineNumberNode(5), Expr(:call, :.~, lhs, :(Normal.(mu, s))))
 
+function _surface_bound_density_equal(a, b, cols, u)
+    ba, bb = bind_data(a, cols), bind_data(b, cols)
+    ka, kb = build_kernel(ba), build_kernel(bb)
+    va = Base.invokelatest(prepare_query(ka, ba, :sampler), u)
+    vb = Base.invokelatest(prepare_query(kb, bb, :sampler), u)
+    pa = Base.invokelatest(prepare_query(ka, ba, :pointwise), u)
+    pb = Base.invokelatest(prepare_query(kb, bb, :pointwise), u)
+    va ≈ vb && keys(pa) == keys(pb) &&
+        all(k -> size(pa[k]) == size(pb[k]) && pa[k] ≈ pb[k], keys(pa))
+end
+
 @testset "surface ranged responses y[R]" begin
     cols, n = _gen_columns()
     @test n == 6
     bare = lower_rkppl(_ranged_ast(:y), (:y, :x); conditioned = (:y, :x))
     @test bare.responses[1].range === nothing
-    # Self-covering forms are plan-identical to bare.
-    for lhs in (:(y[eachindex(y)]), :(y[axes(y, 1)]))
+    # Explicit indices remain in the plan; these vector fixtures have the
+    # same density and pointwise shape as the whole response.
+    for lhs in (:(y[eachindex(y)]), :(y[axes(y, 1)]),
+            :(y[eachindex(x)]), :(y[axes(x, 1)]), :(y[:]))
         got = lower_rkppl(_ranged_ast(lhs), (:y, :x); conditioned = (:y, :x))
-        @test _plans_equal(got, bare)
-        @test got.responses[1].range === nothing
+        @test _surface_bound_density_equal(got, bare, cols, [0.5, -0.25, 0.1])
+        @test repr(got.responses[1].range) == repr(lhs)
     end
     # Literal range rides the plan and values identically end to end.
     lit = lower_rkppl(_ranged_ast(:(y[1:6])), (:y, :x); conditioned = (:y, :x))
@@ -3313,11 +3324,10 @@ _ranged_ast(lhs) = Expr(:block,
         e
     end
     # refused: the explicit range disagrees with the bound response length (index dimensions, P3).
-    @test err isa ContractValidationError && occursin("n_obs is 6", err.message)
+    @test err isa ContractValidationError && occursin("6 rows", err.message)
     # Structural range violations fail at lowering.
     for lhs in (:(y[2:6]), :(y[0:6]), :(y[1:0]), :(y[1:n]), :(y[1:2:6]),
-            :(y[eachindex(x)]), :(y[axes(y, 2)]), :(y[axes(x, 1)]),
-            :(y[axes(y)]), :(y[i]), :(y[3]), :(y[:]))
+            :(y[axes(y)]), :(y[i]), :(y[3]))
         # refused: length mismatch with obs-aligned likelihood (5 vs 6)
         @test_throws SurfaceLoweringError lower_rkppl(_ranged_ast(lhs), (:y, :x); conditioned = (:y, :x))
     end
@@ -3372,9 +3382,9 @@ _plate_gauss(R) = Expr(:block,
     bare = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x); conditioned = (:y, :x))
-    # eachindex/axes plates are plan-identical to bare `.~`.
+    # Index metadata remains explicit; vector-domain densities agree.
     for R in (:(eachindex(y)), :(axes(y, 1)))
-        @test _plans_equal(lower_rkppl(_plate_gauss(R), (:y, :x); conditioned = (:y, :x)), bare)
+        @test _surface_bound_density_equal(lower_rkppl(_plate_gauss(R), (:y, :x); conditioned = (:y, :x)), bare, cols, [0.5, -0.25, 0.1])
     end
     # Literal-range plates carry the range like `y[1:N]`.
     lit = lower_rkppl(_plate_gauss(:(1:6)), (:y, :x); conditioned = (:y, :x))
@@ -3395,7 +3405,7 @@ _plate_gauss(R) = Expr(:block,
     top = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             :(t = a .+ b .* x), :(y .~ Normal.(t, s))), (:y, :x); conditioned = (:y, :x))
-    @test _plans_equal(cell, top)
+    @test _surface_bound_density_equal(cell, top, cols, [0.5, -0.25, 0.1])
     # Values agree end to end.
     u = [0.5, -0.25, 0.1]
     bb, pb = bind_data(bare, cols), bind_data(
@@ -3404,13 +3414,13 @@ _plate_gauss(R) = Expr(:block,
         _query(build_kernel(bb).spec, bb, :posterior, u)
     # A scalar cell object is one draw per index, exactly what the
     # broadcast spelling means (a cell is one loop iteration).
-    @test _plans_equal(lower_rkppl(Expr(:block,
+    @test _surface_bound_density_equal(lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             :(mu = a .+ b .* x),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                     Expr(:block, LineNumberNode(6),
-                        :(y[i] ~ Normal(mu[i], s)))))), (:y, :x); conditioned = (:y, :x)), bare)
+                        :(y[i] ~ Normal(mu[i], s)))))), (:y, :x); conditioned = (:y, :x)), bare, cols, u)
     # Dotted wrappers strip through the desugar.
     wrap = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
@@ -3424,7 +3434,7 @@ _plate_gauss(R) = Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             :(mu = a .+ b .* x),
             :(y .~ truncated.(Normal.(mu, s), 0, 10))), (:y, :x); conditioned = (:y, :x))
-    @test _plans_equal(wrap, wraptop)
+    @test _surface_bound_density_equal(wrap, wraptop, cols, u)
 end
 
 @testset "surface plate failures" begin
@@ -3470,9 +3480,17 @@ end
     for (i, bad) in enumerate(badloops)
         program = Expr(:block, :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(s ~ Exponential(1)), :(mu = a .+ b .* x), bad)
-        if i in (5, 6)
-            # capability: a trailing singleton axis or an empty prior-only plate (P10a 0dejlw1; 10gzbm9 degenerate; todo `1qlbn5b`).
-            @test_broken (lower_rkppl(program, Dn; conditioned = Dn); true)
+        if i == 6
+            # An empty loop contributes no observation or latent draws.
+            empty_plan = lower_rkppl(program, Dn; conditioned=Dn)
+            @test isempty(empty_plan.responses)
+            @test isempty(empty_plan.plate_parameters)
+        elseif i == 5
+            admitted = lower_rkppl(program, Dn; conditioned=Dn)
+            cols = Dict(:y => [0.2, 0.4, 0.1], :x => [0.3, 0.5, 0.8])
+            bound = bind_data(admitted, cols)
+            @test bound.n_obs == 1
+            @test length(Base.invokelatest(prepare_query(build_kernel(bound), bound, :pointwise), [0.2, -0.1, 0.0]).y) == 1
         else
             # refused: non-for macro syntax, undeclared range names,
             # repeated observations in nested loops or parameter-dependent if (P3/P6; 05oe96l, 10gzbm9).
@@ -3499,10 +3517,14 @@ end
             :(mu = a .+ b .* x),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))), Expr(:block, bad))))
-        if i in (1, 4, 6, 9)
-            # capability: scalar .~, loop-index values, a prior-only latent
-            # plate and singleton trailing dimensions (P3/P10a; 10gzbm9 degenerate; todo `1qlbn5b`).
-            @test_broken (lower_rkppl(program, Dn; conditioned = Dn); true)
+        if i in (1, 4, 6)
+            admitted = lower_rkppl(program, Dn; conditioned=Dn)
+            @test i == 6 ? length(admitted.plate_parameters) == 1 : length(admitted.responses) == 1
+        elseif i == 9
+            admitted = lower_rkppl(program, Dn; conditioned=Dn)
+            bound = bind_data(admitted, Dict(:y => reshape([0.2, 0.4, 0.1], 3, 1), :x => [0.3, 0.5, 0.8]))
+            @test bound.n_obs == 3
+            @test size(Base.invokelatest(prepare_query(build_kernel(bound), bound, :pointwise), [0.2, -0.1, 0.0]).y) == (3,)
         else
             # refused: undeclared j/c, index 0 at the first iteration,
             # observing y[3] repeatedly or redefining scalar s (P3/P6, single assignment; 05oe96l).
@@ -3536,13 +3558,22 @@ end
         occursin("reads a whole vector", err.message) &&
         occursin("line 9", err.message)
     # Cross-column ranges; write violations; ownership across forms.
-    # capability: a plate range from another observation-aligned column eachindex(x) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(Expr(:block,
+    cross = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)), :(s ~ Exponential(1)),
             :(mu = a .+ b .* x),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(x))),
-                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn; conditioned = Dn); true)
+                    Expr(:block, :(y[i] ~ Normal.(mu[i], s)))))), Dn; conditioned = Dn)
+    @test only(cross.responses).range == :(y[eachindex(x)])
+    @test _surface_bound_density_equal(cross,
+        lower_rkppl(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            s ~ Exponential(1)
+            mu = a .+ b .* x
+            y .~ Normal.(mu, s)
+        end, Dn; conditioned=Dn),
+        Dict(:y => [0.2, 0.4, 0.1], :x => [0.3, 0.5, 0.8]), [0.2, -0.1, 0.0])
     # refused: single assignment (a rebound in a cell)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)),
@@ -3591,7 +3622,7 @@ _re_surface(R) = Expr(:block,
     pp = plan.plate_parameters[1]
     @test pp.name === :theta && pp.family === :normal &&
         Tuple(keys(pp.args)) == (:arg1, :arg2) &&
-        collect(values(pp.args)) == [:mu, :tau] && pp.range === :y
+        collect(values(pp.args)) == [:mu, :tau] && pp.range == :(eachindex(y))
     @test Set(p.name for p in plan.parameters) == Set([:mu, :sigma, :tau])
     loc = only(plan.predictors)
     @test loc.name === :y_loc && length(loc.terms) == 1 &&
@@ -3610,14 +3641,15 @@ _re_surface(R) = Expr(:block,
             SampledParameter(:mu, :normal, (arg1 = 0, arg2 = 5), nothing, :mu),
             SampledParameter(:sigma, :exponential, (arg1 = 1,), nothing, :sigma),
             SampledParameter(:tau, :exponential, (arg1 = 1,), nothing, :tau)])
-    hand = StructuralPlan(hand.responses, hand.predictors, hand.population_priors,
+    hand = StructuralPlan([ReactiveKernelsPPL._with(only(hand.responses); range=:(y[eachindex(y)]))], hand.predictors, hand.population_priors,
         hand.parameters, hand.assignments, Dict{Symbol,AbstractVector}(), 0;
         plate_parameters = PlateParameter[
             PlateParameter(:theta, :normal, (arg1 = :mu, arg2 = :tau), nothing,
-                :y)])
+                :(eachindex(y)))])
     @test _plans_equal(plan, hand)
-    # eachindex/axes plates are plan-identical.
-    @test _plans_equal(lower_rkppl(_re_surface(:(axes(y, 1))), (:y, :x); conditioned = (:y, :x)), plan)
+    # The two authored iterators have the same cells on these bound vectors.
+    @test _surface_bound_density_equal(lower_rkppl(_re_surface(:(axes(y, 1))), (:y, :x); conditioned = (:y, :x)), plan,
+        cols, [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2])
     # Literal range rides on the plate parameter and the response.
     lit = lower_rkppl(_re_surface(:(1:6)), (:y, :x); conditioned = (:y, :x))
     @test lit.plate_parameters[1].range == 1:6
@@ -3645,13 +3677,14 @@ end
 
 @testset "surface plate per-cell sampling failures" begin
     Dn = (:y, :x)
-    # Dotted object for a per-cell latent declaration (must be scalar/undotted).
+    # Broadcasting a distribution over scalar cell arguments is scalar.
     # capability: dotted scalar object for a per-cell latent (Normal.(0, 1) == Normal(0, 1)); observation cells already admit it (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(Expr(:block,
+    dotted_latent = lower_rkppl(Expr(:block,
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal.(0, 1)),
-                    :(y[i] ~ Normal.(theta[i], 1)))))), Dn; conditioned = Dn); true)
+                    :(y[i] ~ Normal.(theta[i], 1)))))), Dn; conditioned = Dn)
+    @test only(dotted_latent.plate_parameters).family === :normal
     # Bare per-cell sample (must index the latent, or move the prior out).
     # refused: theta declared once per cell (single assignment)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
@@ -3667,14 +3700,22 @@ end
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal(x, tau)),
                     :(y[i] ~ Normal.(theta[i], sigma)))))), Dn; conditioned = Dn)
-    # A latent buried in a predictor expression (mixed latent + fixed) defers.
-    # capability: mixed latent + fixed predictor expression in a plate cell (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(Expr(:block,
+    # A mixed latent/data expression runs in the retained cell graph.
+    mixed = lower_rkppl(Expr(:block,
         :(sigma ~ Exponential(1)), :(b ~ Normal(0, 1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal(0, 1)),
-                    :(y[i] ~ Normal.(theta[i] .+ b .* x[i], sigma)))))), Dn; conditioned = Dn); true)
+                    :(y[i] ~ Normal.(theta[i] .+ b .* x[i], sigma)))))), Dn; conditioned = Dn)
+    cols, n = _gen_columns()
+    bound = bind_data(mixed, cols)
+    built = build_kernel(bound)
+    u = unconstrain(built.layout, (; sigma=0.9, b=0.2, theta=fill(-0.1, n)))
+    pw = logpdf.(Normal.(-0.1 .+ 0.2 .* cols[:x], 0.9), cols[:y])
+    prior = logpdf(Exponential(), 0.9) + logpdf(Normal(), 0.2) + n*logpdf(Normal(), -0.1)
+    @test _query(built.spec, bound, :posterior, u) ≈ sum(pw) + prior + log(0.9)
+    @test Base.invokelatest(prepare_query(built, bound, :pointwise), u).y ≈ pw
+    _check_gradient(built.spec, bound, u)
 end
 
 # Non-centered / latent-transform: a per-cell latent feeding a deterministic
@@ -3692,10 +3733,6 @@ end
                     :(y[i] ~ Normal.(theta[i], sigma))))))
     plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     @test [p.name for p in plan.plate_parameters] == [:z]
-    @test isempty(plan.derived)
-    loc = only(plan.predictors)
-    @test [t.kind for t in loc.terms] == [InterceptTerm, ContinuousTerm]
-    @test [t.options.parameter for t in loc.terms] == [:mu, :tau]
     # Value + gradient vs an independent oracle.
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
@@ -3703,13 +3740,17 @@ end
     nt = constrain(built.layout, u)
     mu, sigma, tau, z = nt.mu, nt.sigma, nt.tau, Vector(nt.z)
     theta = mu .+ tau .* z
+    @test _query(built.spec, bound, :theta, u) ≈ theta
+    @test size(_query(built.spec, bound, :theta, u)) == (n,)
+    @test Base.invokelatest(prepare_query(built, bound, :pointwise), u).y ≈
+        logpdf.(Normal.(theta, sigma), cols[:y])
     ll = sum(logpdf.(Normal.(theta, sigma), cols[:y]))
     pr = logpdf(Normal(0, 5), mu) + logpdf(Exponential(1), sigma) +
         logpdf(Exponential(1), tau) + sum(logpdf.(Normal(0, 1), z))
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[2] + u[3]
     _check_gradient(built.spec, bound, u)
-    # An indexed deterministic cell with NO latent still lowers as a design
-    # predictor (identical to the bare-LHS spelling) — the discriminator works.
+    # An indexed deterministic cell without a latent has the same density
+    # as the bare-LHS spelling and adds no parameter coordinates.
     a = lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(4),
@@ -3719,8 +3760,8 @@ end
     bare = lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
         :(mu = a .+ b .* x), :(y .~ Normal.(mu, s))), (:y, :x); conditioned = (:y, :x))
-    @test _plans_equal(a, bare)
-    @test all(t.kind !== LatentTerm for p in a.predictors for t in p.terms)
+    @test _surface_bound_density_equal(a, bare, cols, [0.5, -0.25, 0.1])
+    @test isempty(a.plate_parameters)
 end
 
 # Per-cell prior args: a per-cell latent's prior mean/scale may be per-cell —
@@ -4093,12 +4134,18 @@ end
         y ~ obs_latent(1.0)
     end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 
-    # A stream submodel on a non-data LHS is rejected (bind it to data).
-    # capability: stream submodel on a latent (non-data) LHS (generative stream) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    # A latent stream samples its private return slot and retains its
+    # other priors. The caller's free coefficient remains explicit.
+    generated = lower_rkppl(quote
+        b ~ Normal(0, 1)
         z ~ obs_gstream(x)
         w .~ Normal.(z, 1.0)
-    end, (:w, :x); mod = @__MODULE__, conditioned = (:w, :x)); true)
+    end, (:w, :x); mod = @__MODULE__, conditioned = (:w, :x))
+    gb = bind_data(generated, Dict(:w => cols[:y], :x => cols[:x]))
+    gk = build_kernel(gb)
+    @test gk.layout.total == 3 + length(cols[:x])
+    @test length(constrain(gk.layout, zeros(gk.layout.total)).z.slot) == length(cols[:x])
+    _check_gradient(gk.spec, gb, zeros(gk.layout.total))
 end
 
 # ── Fused-GLM stream fixtures for predictor pins ─────────────────────────
@@ -4400,11 +4447,7 @@ _pcs(cells...) = Expr(:block,
     handn = lower_rkppl(_pcs(:(theta_z[i] ~ Normal(0, 1)),
                              :(theta[i] = mu .+ tau .* theta_z[i]),
                              :(y[i] ~ Normal.(theta[i], sigma))), (:y, :x); conditioned = (:y, :x))
-    @test _plans_equal(subn, handn)
     @test [_test_scope_name(subn, p.name) for p in subn.plate_parameters] == [:theta_z]
-    @test isempty(subn.derived)
-    @test [t.kind for t in only(subn.predictors).terms] ==
-        [InterceptTerm, ContinuousTerm]
     # Value + gradient vs an independent Distributions.jl oracle.
     bound = bind_data(subn, cols)
     built = build_kernel(bound)
@@ -4412,6 +4455,10 @@ _pcs(cells...) = Expr(:block,
     nt = constrain(built.layout, u)
     mu, sigma, tau, z = nt.mu, nt.sigma, nt.tau, Vector(nt.theta.z)
     theta = mu .+ tau .* z
+    @test _surface_bound_density_equal(subn, handn, cols, u)
+    @test _query(built.spec, bound, :theta, u) ≈ theta
+    @test Base.invokelatest(prepare_query(built, bound, :pointwise), u).y ≈
+        logpdf.(Normal.(theta, sigma), cols[:y])
     ll = sum(logpdf.(Normal.(theta, sigma), cols[:y]))
     pr = logpdf(Normal(0, 5), mu) + logpdf(Exponential(1), sigma) +
         logpdf(Exponential(1), tau) + sum(logpdf.(Normal(0, 1), z))
@@ -4478,7 +4525,7 @@ _pcs(cells...) = Expr(:block,
 
     # ── Explicit-`return` per-cell observation slot == the implicit twin.
     subor = lower_rkppl(_pcs(:(y[i] ~ pcs_obs_ret(mu, sigma))), (:y, :x); mod = M, conditioned = (:y, :x))
-    @test _plans_equal(subor, subo)
+    @test _surface_bound_density_equal(subor, subo, cols, uo)
     @test _test_scope_name(subor, only(subor.plate_parameters).name) === :y_b
 end
 
@@ -4492,31 +4539,35 @@ end
              :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D)
     # A nested per-cell call expands per cell (the direct-bound slot `s` is a
     # per-cell call in turn): it equals the hand-written per-cell parameter.
-    @test _plans_equal(lower_rkppl(
+    @test _surface_bound_density_equal(lower_rkppl(
         _pcs(:(theta[i] ~ pcs_nested(tau)),
              :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D),
         lower_rkppl(_pcs(:(theta_s[i] ~ Normal(0, tau)),
              :(theta[i] = theta_s[i]),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; conditioned = D))
+             :(y[i] ~ Normal.(theta[i], sigma))), D; conditioned = D),
+        first(_gen_columns()), [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2])
     # No trailing return expression.
     # refused: submodel used as a value has no return expression
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(theta[i] ~ pcs_noret(tau)),
              :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D)
-    # An observation submodel bound to a NON-data latent LHS.
-    # capability: observation-stream submodel on a latent per-cell LHS (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(
+    # A stream bound to a latent cell keeps its internal prior and
+    # samples a private scalar slot in every cell.
+    generated = lower_rkppl(
         _pcs(:(theta[i] ~ pcs_obs(mu, sigma)),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D); true)
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D)
+    @test Set(_test_scope_name(generated, p.name) for p in generated.plate_parameters) ==
+        Set([:theta_b, :theta_slot])
     # A latent submodel bound to a DATA column (needs a dotted observation slot).
     # refused: a data LHS observes a stream; a latent submodel value is conditioned through `|` / `condition` (P9, 18h1h54; 10gzbm9)
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(y[i] ~ pcs_centered(mu, tau))), D; mod = M, conditioned = D)
-    # A `predictor = ...` pin is top-level-only (per-cell predictors lower
-    # through the plate path, not the pinned location path).
-    # capability: predictor pin on a per-cell submodel; NB pins taken name mu, re-pin with a free name (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(
-        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = mu))), D; mod = M, conditioned = D); true)
+    # A cell observation may name its predictor with a free use-site pin.
+    pinned = lower_rkppl(
+        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = qpin))), D; mod = M, conditioned = D)
+    @test only(pinned.responses).predictor === :qpin
+    @test_throws "already taken" lower_rkppl(
+        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = mu))), D; mod = M, conditioned = D)
     # Without a submodel binding in scope, an unknown call head stays an
     # ordinary per-cell distribution error (no submodel capture).
     # refused: undefined submodel/distribution not_a_submodel
