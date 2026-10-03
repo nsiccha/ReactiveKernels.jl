@@ -344,7 +344,7 @@ end
     @test_throws "must be positive" lower_rkppl(
         plate_ast(good_cell, [Expr(:kw, :subjects, 0)]), data; conditioned = data)
     # capability: computed `subjects=` expression (`1 + 1`) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(
+    @test (lower_rkppl(
         plate_ast(good_cell, [Expr(:kw, :subjects, :(1 + 1))]), data; conditioned = data); true)
     # refused: unknown keyword `group` (Julia MethodError, P3)
     @test_throws "exactly one keyword" lower_rkppl(

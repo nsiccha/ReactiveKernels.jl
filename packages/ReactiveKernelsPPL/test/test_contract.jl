@@ -368,7 +368,7 @@ end
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
         ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
         NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
-        ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam)
+        ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -2501,17 +2501,23 @@ end
     # refused: wrong positional arity for the vector family (IR contract: positional-args pin)
     @test_throws ContractValidationError validate_structure(bad)
     # Non-literal / non-positive threshold args.
-    bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
-        (arg1 = :mu, arg2 = 1.0), nothing, :y_cutpoints)])
+    bad = ReactiveKernelsPPL._with(_with_vectors(base,
+        [VectorParameter(:y_cutpoints, :ordered_normal,
+            (arg1 = :threshold_location, arg2 = 1.0), nothing, :y_cutpoints)]);
+        parameters = [base.parameters;
+            SampledParameter(:threshold_location, :normal,
+                (arg1 = 0.0, arg2 = 1.0), nothing, :threshold_location)])
     # capability: hierarchical (parameter-valued) threshold prior location (todo `0fkd9yk`)
-    @test_broken (validate_structure(bad); true)
+    @test (validate_structure(bad); true)
     bad = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
         (arg1 = 0.0, arg2 = 0.0), nothing, :y_cutpoints)])
     # refused: zero threshold prior scale (mathematically invalid input)
     @test_throws ContractValidationError validate_structure(bad)
     # Dirichlet: vector concentration, finite positive, size agreement.
     # capability: non-literal (named/data) Dirichlet concentration (todo `0fkd9yk`)
-    @test_broken (_multinomial_plan(; alpha = :alpha_col); true)
+    @test (_multinomial_plan(; alpha = :alpha_col,
+        cols = merge(_multinomial_columns(),
+            Dict(:alpha_col => [2.0, 2.0, 2.0]))); true)
     # refused: zero Dirichlet concentration (mathematically invalid input)
     @test_throws ContractValidationError _multinomial_plan(;
         alpha = [1.0, 0.0, 2.0])
@@ -2527,8 +2533,8 @@ end
         VectorParameter(:stray, :ordered_normal, (arg1 = 0.0, arg2 = 1.0),
             nothing, :stray),
     ])
-    # refused: vector parameter consumed by no response (IR contract: no dangling parameters)
-    @test_throws ContractValidationError validate_structure(orphan)
+    # An unused declared vector keeps its authored prior (10gzbm9 degenerate).
+    @test validate_structure(orphan) === nothing
     dup = _with_vectors(base, [VectorParameter(:y_cutpoints, :ordered_normal,
             (arg1 = 0.0, arg2 = 1.0), nothing, :y_cutpoints),
         VectorParameter(:y_cutpoints, :ordered_normal,

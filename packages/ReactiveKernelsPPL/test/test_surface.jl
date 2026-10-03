@@ -473,9 +473,9 @@ end
         mu = a .+ b .* x
         y .~ student_t.(4.0, mu, 2.0)
     end, Dn2; conditioned = Dn2)
-    # nu takes no expressions (bind via an assignment first).
+    # Inline and named degrees-of-freedom expressions share value semantics.
     # capability: expression argument in StudentT nu slot (P8 admits expression args) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
@@ -857,9 +857,9 @@ end
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(eta, 0.2)
     end, Dn2; conditioned = Dn2); true)
-    # zi takes no expressions (bind via an assignment first).
+    # Inline and named zero-inflation expressions share value semantics.
     # capability: expression argument in zi slot (P8) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
@@ -877,21 +877,21 @@ end
     # A zi wrapper over anything but a predictor definition fails
     # closed, as does a non-link wrapper.
     # capability: link-wrapped literal zi (logistic.(0.25)) - expression arg (P8) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), logistic.(0.25))
     end, Dn2; conditioned = Dn2); true)
     # capability: data-derived zi (logistic.(x)) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ ZeroInflatedPoisson.(exp.(eta), logistic.(x))
     end, Dn2; conditioned = Dn2); true)
     # capability: arbitrary non-link wrapper on zi predictor (sqrt.) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         c ~ Normal(0, 1)
@@ -1571,9 +1571,9 @@ end
         mu = a .+ b .* x
         y .~ circular_von_mises.(mu, 1.7, -pi, pi)
     end, Dn2; conditioned = Dn2)
-    # Endpoints are compile-time literals, never names.
+    # Named endpoints are ordinary scalar values.
     # capability: named CircularVonMises endpoints (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         mu = a .+ b .* x
         lo = -pi
         hi = pi
@@ -1692,7 +1692,7 @@ end
     Dn3 = (:y, :x, :n)
     # Beta: mismatched kappa across the two positions.
     # capability: general Beta(alpha, beta) expressions (mismatched kappa) beyond the mean-precision template (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 1000.0)
@@ -1702,7 +1702,7 @@ end
     end, Dp2; conditioned = Dp2); true)
     # Beta: mismatched mu expressions.
     # capability: general Beta(alpha, beta) expressions (mismatched mu) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         kappa ~ Gamma(2.0, 1000.0)
@@ -1719,7 +1719,7 @@ end
         mu = a .+ b .* x
         p .~ Beta.(normcdf.(mu) .* kappa, (1 .- normcdf.(mu)) .* kappa)
     end, Dp2; conditioned = Dp2); true)
-    # Beta: canonical argument order only.
+    # Swapping Beta arguments swaps its shape parameters.
     # admitted: Beta arguments in swapped order (a valid Beta(alpha, beta)) (todo `139j2uo`)
     @test (lower_rkppl(quote
         a ~ Normal(0, 1)

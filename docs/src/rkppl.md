@@ -121,8 +121,44 @@ replicate the density body. Concentrations must be positive.
 Dynamic Normal, Cauchy and Weibull truncation supports native and Reactant
 primal and reverse execution. Gamma, Beta and InverseGamma truncation calls
 incomplete gamma or beta functions whose traced methods are still unavailable;
-those normalizers support native execution. The existing simplex transform's
-Reactant limitation also applies to hierarchical Dirichlet priors.
+those normalizers support native execution. Hierarchical Dirichlet supports
+native and compiled primal and reverse execution.
+
+## Distribution arguments are values
+
+Locations, scales, StudentT degrees of freedom and zero-inflation
+probabilities may be scalar or per-observation expressions. Naming an
+expression keeps the same density. Scalar calls stay scalar, and vector
+operations use Julia's dots:
+
+```julia
+a ~ Normal(0, 1)
+b ~ Normal(0, 1)
+s ~ Normal(0, 1)
+nu ~ Exponential(1)
+mu = exp.(a .+ b .* x)
+y .~ StudentT.(2 + nu, mu, exp(s))
+```
+
+Data-computed scales such as `exp.(x)` and mixed plate-latent locations
+such as `theta .+ b .* x` also use their written values. Literal and named
+scalar offsets add directly to a predictor. Gaussian mixture components also
+accept these value locations, including scalar aliases; explicit component
+links such as `Poisson.(exp.(a))` apply to sampled scalars.
+
+`Beta.(alpha, beta)` accepts two ordinary shape values. Circular
+VonMises endpoints may be named, bound as data or sampled; they must define
+a finite interval of width `2pi`. A live lower endpoint can use
+`hi = lo + 2pi`. The interval and support are checked before wrapping the
+location or evaluating the density.
+
+An ordered vector may use Normal, Cauchy, Laplace, Logistic or StudentT
+element priors with live scalar arguments, for example
+`c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log
+densities on increasing vectors, with no factorial normalizer.
+
+Uniform bounds may be live scalar values, including in factor arrays:
+`lo ~ Normal(0, 1); c[levels(g)] .~ Uniform.(lo, lo + 3)`.
 
 ## Julia semantics, written out
 
@@ -165,7 +201,10 @@ array dimension, keeps its bind-time evaluation and validation.
 `c[g]` gathers them per observation. A full-cover factor may appear alongside
 an intercept, with the fixed or hierarchical priors written in the model.
 RK-PPL translates these declarations without imposing an identifiability or
-posterior-propriety test. Offsets are plain data summands.
+posterior-propriety test. Offsets are plain data or scalar value summands.
+A grouping axis may be computed from data, for example
+`z = x .+ 1; c[levels(z)] .~ Normal.(0, s); mu = c[z]`. Binding computes
+these grouping values once and preserves the caller's data.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("10_levels_prior.jl", :rkppl_levels)

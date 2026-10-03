@@ -150,6 +150,7 @@ univariate components, SB `MixtureModel` mirror)."""
     GammaValueFam
     WeibullValueFam
     CauchyFam
+    BetaShapeFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -450,7 +451,7 @@ struct LikelihoodSpec
     nu::Union{Nothing,ParamName,Real,ScalePredictorRef}
     zi::Union{Nothing,ParamName,Real,ScalePredictorRef}
     mi_jobs::Union{Nothing,ColumnRef}
-    interval::Union{Nothing,Tuple{Float64,Float64}}
+    interval::Union{Nothing,Tuple{Union{Real,Symbol},Union{Real,Symbol}}}
     threshold_effects::Union{Nothing,Symbol}
 end
 # Preserve the all-fields constructor predating per-component trials.
@@ -501,7 +502,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
-        interval::Union{Nothing,Tuple{Float64,Float64}} = nothing,
+        interval::Union{Nothing,Tuple{Union{Real,Symbol},Union{Real,Symbol}}} = nothing,
         threshold_effects::Union{Nothing,Symbol} = nothing)
     return LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range, n_levels, thresholds,
@@ -1912,6 +1913,7 @@ const ADMITTED_TRIPLES = (
     (BinomialProbitFam, ProbitLink, IdentityLink),
     (BinomialCloglogFam, CloglogLink, IdentityLink),
     (BetaLogitFam, LogitLink, IdentityLink),
+    (BetaShapeFam, IdentityLink, IdentityLink),
     (CategoricalLogitFam, LogitLink, IdentityLink),
     (OrderedLogisticFam, LogitLink, IdentityLink),
     (OrdinalFam, LogitLink, IdentityLink),
@@ -2371,7 +2373,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
     NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
-    ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam)
+    ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -6511,9 +6513,23 @@ _is_leveled_family(f) = f === CategoricalLogitFam || _is_ordered_family(f) ||
 _is_glm_family(f) = f === NormalIDGLMFam || f === BernoulliLogitGLMFam ||
     f === PoissonLogGLMFam
 
+# Ordered vectors use the same scalar element densities as ordinary
+# priors, with the ordering transform independent of the chosen family.
+const _VECTOR_ELEMENT_FAMILIES = Dict{Symbol,Symbol}(
+    :ordered_normal => :normal, :vector_normal => :normal,
+    :ordered_cauchy => :cauchy, :ordered_laplace => :laplace,
+    :ordered_logistic => :logistic, :ordered_student_t => :student_t,
+)
+_is_ordered_parameter(f) = haskey(_VECTOR_ELEMENT_FAMILIES, f) &&
+    f !== :vector_normal
+
 """Vector-parameter families and their positional arg keys."""
 const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :ordered_normal => (:arg1, :arg2),
+    :ordered_cauchy => (:arg1, :arg2),
+    :ordered_laplace => (:arg1, :arg2),
+    :ordered_logistic => (:arg1, :arg2),
+    :ordered_student_t => (:arg1, :arg2, :arg3),
     :vector_normal => (:arg1, :arg2),
     :simplex_dirichlet => (:arg1,),
     :positive_exponential => (:arg1,),
@@ -6524,9 +6540,7 @@ const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
 const _JOINT_FACTOR_FAMILIES = (:positive_exponential, :cholesky_corr_lkj)
 
 # Constrained vector (cutpoint/threshold/simplex) parameters: family/arity
-# plus literal-only args (a threshold Normal takes literal location/scale; a
-# Dirichlet takes a literal concentration vector — hierarchical args fail
-# closed). Sizes resolve at bind (`nothing` = infer from the linked leveled
+# plus ordinary value arguments. Sizes resolve at bind (`nothing` = infer from the linked leveled
 # response, or from the concentration length for a monotonic-linked
 # simplex); an explicit size is bounds-checked here and linked-checked in
 # `_validate_responses`. Vector declarations can have several readers.
@@ -6585,12 +6599,24 @@ function _validate_vector_parameters(plan::StructuralPlan)
             p.size >= 1 || _fail(p.label,
                 "joint-factor LKJ Cholesky size must be ≥ 1, got $(p.size)")
         else
-            mu, s = p.args.arg1, p.args.arg2
-            (mu isa Real && isfinite(mu)) || _fail(p.label,
-                "threshold location must be a finite literal, got $(repr(mu))")
-            (s isa Real && isfinite(s) && s > 0) || _fail(p.label,
-                "threshold scale must be a finite positive literal, got " *
-                "$(repr(s))")
+            for (key, arg) in pairs(p.args)
+                if arg isa Symbol
+                    (!isbound(plan) || arg in _all_names(plan) ||
+                        haskey(plan.columns, arg)) || _fail(p.label,
+                            "element prior $key references unknown name $arg")
+                else
+                    (arg isa Real && isfinite(arg)) || _fail(p.label,
+                        "element prior $key must be finite, got $(repr(arg))")
+                end
+            end
+            scale = p.family === :ordered_student_t ? p.args.arg3 : p.args.arg2
+            scale isa Real && scale <= 0 && _fail(p.label,
+                "element prior scale must be positive")
+            if p.family === :ordered_student_t
+                nu = p.args.arg1
+                nu isa Real && nu <= 0 && _fail(p.label,
+                    "element prior degrees of freedom must be positive")
+            end
             p.size === nothing || p.size >= 0 || _fail(p.label,
                 "threshold size must be ≥ 0, got $(p.size)")
         end
@@ -7991,7 +8017,8 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
     want_family = want_ordered ? :ordered_normal : :vector_normal
     (want_ordered || want_plain) || _fail(r.label,
         "internal: ordinal structure $(r.ordinal_structure) unresolved")
-    tp.family === want_family || _fail(r.label,
+    (want_ordered ? _is_ordered_parameter(tp.family) :
+        tp.family === want_family) || _fail(r.label,
         "thresholds $(tp.name) is $(tp.family) but this response needs " *
         "$want_family")
     if r.n_levels !== nothing && tp.size !== nothing
@@ -8975,7 +9002,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         # kernel guards it.
         (eltype(col) <: Real && all(isfinite, col)) ||
             _fail(r.label, "VonMises response must be finite numerics")
-        if r.interval !== nothing
+        if r.interval !== nothing && all(a -> a isa Real, r.interval)
             lo, hi = r.interval
             all(y -> lo <= y < hi, col) ||
                 _fail(r.label, "CircularVonMises response must lie in " *
@@ -9016,7 +9043,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         (eltype(col) <: Real && all(>(0), col)) ||
             _fail(r.label, "Gamma response must be strictly positive numerics")
         return nothing
-    elseif r.family === BetaLogitFam
+    elseif r.family === BetaLogitFam || r.family === BetaShapeFam
         # Strictly inside (0, 1): the beta kernel guards 0 < x < 1, and at
         # exactly 0/1 it is wrong for shapes ≤ 1 (says -Inf; truth is
         # finite/+Inf) — fail closed instead of flowing a wrong value.
@@ -9149,6 +9176,7 @@ _scale_need(fam::LikelihoodFamily) =
     fam === NegativeBinomial2Fam ? "NB2 response requires a dispersion phi" :
     fam in (GammaLogFam, GammaValueFam) ? "Gamma response requires a shape alpha" :
     fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
+    fam === BetaShapeFam ? "Beta response requires a second shape beta" :
     fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
     fam === StudentTFam ? "Student response requires a scale sigma" :
     fam === HurdlePoissonFam ? "Hurdle response requires a hurdle probability p_zero" :
@@ -9278,11 +9306,9 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     return nothing
 end
 
-# Data-level per-observation scale check: a scalar parameter/assignment name
-# resolves structurally; a raw data-column scale (the eight-schools known SE)
-# must be finite-positive numerics of length n_obs (a Gaussian/NB2/Gamma/
-# Student scale is strictly positive). A derived column scale is rejected —
-# per-obs scales bind raw (mirrors the weights/trials raw-only rule).
+# Bound scale data must satisfy their distribution's domain and row count.
+# Derived and sampled arguments are checked by the value graph and density
+# endpoint because their values depend on the query.
 function _validate_scale_data(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family === MixtureFam
         for s in r.mixture_scales
@@ -9302,10 +9328,8 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
     # A data-only scalar definition used as a scale is materialized at bind.
     # Validate that value just like a caller-supplied scale; live definitions
     # and sampled parameters have no bound value here.
-    s in _union_names(plan) && !haskey(plan.columns, s) && return nothing
-    _is_derived(plan, s) && _fail(r.label,
-        "scale column $s is derived — slice-1 binds per-observation scales " *
-        "raw (derived-column scales need shape metadata — planned)")
+    (s in _union_names(plan) || s in _all_names(plan)) &&
+        !haskey(plan.columns, s) && return nothing
     haskey(plan.columns, s) ||
         _fail(r.label, "scale references unknown name $s")
     value = plan.columns[s]
@@ -9330,8 +9354,8 @@ end
 
 # Student degrees of freedom: required (a sampled parameter/assignment
 # name, a finite-positive literal, or a predictor-fed per-observation nu),
-# scalar only — no per-observation columns. Unknown names fail
-# structurally: unlike scale there is no bind-time column form to defer to.
+# scalar or per observation. Declared value nodes resolve structurally;
+# their values are guarded by the density endpoint.
 function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family !== StudentTFam
         r.nu === nothing ||
@@ -9355,16 +9379,15 @@ function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
     end
     n isa Real && ((isfinite(n) && n > 0) ||
         _fail(r.label, "nu literal must be finite positive"))
-    n isa Symbol && (n in _union_names(plan) ||
+    n isa Symbol && (n in _all_names(plan) ||
         _fail(r.label, "nu references unknown name $n"))
     return nothing
 end
 
 # Zero-inflation probability: required (a sampled parameter/assignment
 # name, a literal in [0, 1], or a predictor-fed zi submodel), scalar or
-# predictor only — no per-observation columns. Unknown names fail
-# structurally: unlike scale there is no bind-time column form to defer
-# to.
+# per-observation value. Declared value nodes resolve structurally;
+# their values are guarded by the density endpoint.
 function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     if r.family !== ZeroInflatedPoissonFam &&
             r.family !== ZeroInflatedBinomialFam
@@ -9379,7 +9402,7 @@ function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     z isa ScalePredictorRef && return _validate_zi_predictor(r, plan, z)
     z isa Real && ((isfinite(z) && 0 <= z <= 1) ||
         _fail(r.label, "zi literal must lie in [0, 1]"))
-    z isa Symbol && (z in _union_names(plan) ||
+    z isa Symbol && (z in _all_names(plan) ||
         _fail(r.label, "zi references unknown name $z"))
     return nothing
 end
@@ -9410,7 +9433,7 @@ end
 
 # VonMises principal interval: `nothing` for exact `VonMises` (moving
 # support), or the `(lo, hi)` literal pair for `CircularVonMises`
-# (fixed half-open support) — the BRM `_brm_circular_interval` rule:
+# (half-open support) — the BRM `_brm_circular_interval` rule:
 # finite endpoints, `lo < hi`, width exactly `2pi` (within `8eps`,
 # the shared tolerance). Only VonMises responses take it.
 function _validate_interval(r::LikelihoodSpec, plan::StructuralPlan)
@@ -9421,14 +9444,21 @@ function _validate_interval(r::LikelihoodSpec, plan::StructuralPlan)
         return nothing
     end
     r.interval === nothing && return nothing
-    lo, hi = r.interval
-    (isfinite(lo) && isfinite(hi) && lo < hi) ||
-        _fail(r.label, "VonMises interval must be finite with lo < hi " *
-            "(got ($(lo), $(hi)))")
-    isapprox(hi - lo, 2 * Float64(pi); rtol = 8eps(Float64),
-        atol = 8eps(Float64)) ||
-        _fail(r.label, "VonMises interval must have length 2pi " *
-            "(got $(hi - lo))")
+    for a in r.interval
+        a isa Real || a in _all_names(plan) ||
+            (!isbound(plan) || haskey(plan.columns, a)) || _fail(r.label,
+                "interval references unknown name $a")
+    end
+    # Live endpoints are checked in the generated cell, before modulo or
+    # density evaluation. Literal endpoints can be checked immediately.
+    if all(a -> a isa Real, r.interval)
+        lo, hi = r.interval
+        (isfinite(lo) && isfinite(hi) && lo < hi) || _fail(r.label,
+            "VonMises interval must be finite with lo < hi")
+        isapprox(hi - lo, 2 * Float64(pi); rtol = 8eps(Float64),
+            atol = 8eps(Float64)) || _fail(r.label,
+                "VonMises interval must have length 2pi")
+    end
     return nothing
 end
 
@@ -10532,6 +10562,25 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         memo[nm] = ok
         return ok
     end
+    axes = Set{Symbol}()
+    function gather_indices(ex)
+        ex isa Expr || return
+        if ex.head === :ref && length(ex.args) >= 2 &&
+                ex.args[1] isa Symbol &&
+                (_is_array_param(plan, ex.args[1]) ||
+                    _is_array_assignment(plan, ex.args[1]))
+            for idx in ex.args[2:end]
+                idx isa Symbol && push!(axes, idx)
+            end
+        end
+        foreach(gather_indices, ex.args)
+    end
+    foreach(gather_indices, values(nodes))
+    for p in plan.array_parameters, dim in p.dims
+        dim isa Expr && dim.head === :call && dim.args[1] === :levels &&
+            dim.args[2] isa Symbol && push!(axes, dim.args[2])
+    end
+    union!(required, axes)
     names = Set{Symbol}(nm for (nm, ex) in nodes
         if nm ∉ resps && (_contains_module_call(ex) || nm in required) &&
             dataonly(nm, Set{Symbol}()))
@@ -10638,8 +10687,8 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             Expr(:call, GlobalRef(Base, :identity), d.args[2]))
     end
     for p in plan.vector_parameters
-        p.family === :simplex_dirichlet || continue
-        push!(defs, Symbol(:_ppl_prior_input_, p.name) => p.args.arg1)
+        push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
+            Expr(:tuple, values(p.args)...))
     end
     for s in plan.scans
         exprs = Any[s.hi]
@@ -10671,7 +10720,6 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         elseif f === :vector_parameters
             for p in plan.vector_parameters
                 delete!(free, p.name)
-                p.family === :simplex_dirichlet || _drop_held_names!(free, p.args)
             end
         elseif f === :scans
             # Raw scan reads are model values indexed inside the retained loop.
@@ -11559,7 +11607,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             # A plain vector with a concrete structural size (read whole
             # by definitions or unused) retains its declared extent.
             push!(out_v, p)
-        elseif p.family === :ordered_normal && p.size !== nothing
+        elseif _is_ordered_parameter(p.family) && p.size !== nothing
             # A free-standing ordered vector (`c ~ Ordered(Normal(0, 1), 3)`
             # read as a value) has its literal structural size.
             push!(out_v, p)

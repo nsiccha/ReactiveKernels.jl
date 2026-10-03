@@ -304,6 +304,13 @@ and lock the one Reactant 0.2.289 lifted:
   Declared second-axis gathers, elementwise array definitions and level
   subsets pass compiled primal, AD and operation-count checks.
 
+- A one-dimensional traced view indexed by `CartesianIndex{1}` fails in
+  Reactant 0.2.290 because `Base.reindex` expects an index tuple:
+  `repro_reactant_simplex_view.jl`. RKPPL's simplex transform now uses
+  ordinary range indexing to materialize its packed-coordinate and
+  Jacobian slices before fused broadcasts. Its stick-breaking arithmetic
+  is unchanged; hierarchical Dirichlet and monotonic values pass compiled
+  primal, reverse and operation-count acceptance.
 - Reverse compilation with an empty active array leaves `tensor.empty`,
   which Reactant 0.2.290 cannot export to XLA:
   `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its
