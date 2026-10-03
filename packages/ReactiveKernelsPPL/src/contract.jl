@@ -10155,6 +10155,14 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
     end
+    # A matrix read only for a declared axis is a whole preparation input.
+    # Its row count does not become an observation count. In contrast, a
+    # grouping axis retains its existing alignment and level-code contract.
+    for p in plan.array_parameters
+        axes = filter(_is_axis_dim, p.dims)
+        isempty(axes) || push!(defs, Symbol(:_ppl_axis_input_, p.name) =>
+            Expr(:tuple, axes...))
+    end
     for p in plan.vector_parameters
         p.family === :simplex_dirichlet || continue
         push!(defs, Symbol(:_ppl_prior_input_, p.name) => p.args.arg1)
@@ -10187,7 +10195,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         elseif f === :array_parameters
             for p in plan.array_parameters
                 delete!(free, p.name)
-                _drop_held_names!(free, p.dims)
+                _drop_held_names!(free, filter(d -> !_is_axis_dim(d), p.dims))
             end
         elseif f === :responses
             for r in plan.responses
