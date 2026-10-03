@@ -193,7 +193,8 @@ end
     ResponseEvidence(kind, lower, upper)
 
 Censoring/truncation evidence wrapper on an admitted family (D3 response
-evidence). Bounds are literals or [`ColumnRef`](@ref)s. For
+evidence). Bounds are real literals or names of data, sampled values and
+ordinary definitions (scalar or per observation). For
 `:interval_censored` the response itself is the lower endpoint, so `lower`
 must be `nothing` and `upper` is required. The interval is open below:
 the cell is `log(CDF(upper) - CDF(response))` for `(response, upper]`.
@@ -8697,6 +8698,7 @@ function _validate_responses(plan::StructuralPlan)
         # and plate-param checks below).
         if r.family === MixtureFam
             _validate_mixture_response(r, plan, used_predictors)
+            _validate_evidence_structure(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
             _validate_interval(r, plan)
@@ -8752,10 +8754,6 @@ function _validate_responses(plan::StructuralPlan)
                 "a sampled-parameter response location ($(r.predictor)) is " *
                 "Bernoulli/Binomial-logit or Poisson-log only in v1 " *
                 "(got $(r.family)/$(r.link))")
-            r.evidence.kind === :none || _fail(r.label,
-                "a sampled-parameter location ($(r.predictor)) takes no " *
-                "censoring/truncation evidence in v1 (the cdf arms are " *
-                "link-space)")
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
@@ -8913,6 +8911,15 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     end
     col = r.range isa Expr ? _selected_response_column(plan, r) :
         _observation_column(plan.columns, r.response, r.label, "response")
+    if r.evidence.kind in (:interval_censored, :censored) ||
+            (r.evidence.kind === :truncated && (_evidence_discrete(r.family) ||
+            r.family in (BernoulliLogitGLMFam, PoissonLogGLMFam)))
+        # Interval endpoints need not lie in the underlying support. A clamp
+        # atom can likewise lie outside that support, or between integers.
+        eltype(col) <: Real && all(isfinite, col) ||
+            _fail(r.label, "evidence observations must be finite numerics")
+        return nothing
+    end
     if _is_bernoulli_family(r.family)
         eltype(col) === Bool && return nothing
         eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
@@ -9033,7 +9040,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         all(x -> 1 <= x <= K, col) ||
             return _fail(r.label, "leveled response must hold integers " *
                 "1..$K (recoded levels)")
-        _is_ordered_family(r.family) || sort(unique(col)) == collect(1:K) ||
+        (_is_ordered_family(r.family) || r.evidence.kind !== :none ||
+            sort(unique(col)) == collect(1:K)) ||
             return _fail(r.label, "leveled response must cover every level " *
                 "1..$K exactly (recoded levels have no gaps)")
         return nothing
@@ -9469,7 +9477,8 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
     t = r.trials
     if t isa Int
         t >= 0 || _fail(r.label, "trials literal must be non-negative")
-        !check_support || all(ycol .<= t) ||
+        (!check_support || r.evidence.kind in (:censored, :interval_censored) ||
+            all(ycol .<= t)) ||
             _fail(r.label, "$what exceeds trials $t")
         return nothing
     end
@@ -9490,7 +9499,8 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
             _fail(r.label, "trials column length $(length(col)) ≠ n_obs $n")
     end
     observed_trials = r.mi_jobs === nothing ? col : col[plan.columns[r.mi_jobs]]
-    !check_support || all(ycol .<= observed_trials) ||
+    (!check_support || r.evidence.kind in (:censored, :interval_censored) ||
+        all(ycol .<= observed_trials)) ||
         _fail(r.label, "$what exceeds trials in some row")
     return nothing
 end
@@ -9589,10 +9599,12 @@ function _validate_evidence_structure(r::LikelihoodSpec, plan::StructuralPlan)
     ev.kind in (:none, :truncated, :censored, :interval_censored) ||
         _fail(r.label, "evidence kind $(ev.kind) unknown")
     ev.kind === :none && return nothing
-    (r.family === GaussianFam || r.family === PoissonLogFam ||
-        r.family === StudentTFam ||
-        (r.family === MixtureFam && r.mixture_family === GaussianFam)) ||
-        _fail(r.label, "evidence wrappers apply to Gaussian/Poisson/StudentT only (slice 1)")
+    r.family in (MvNormalCholeskyFam, MultinomialFam) &&
+        _fail(r.label, "scalar evidence bounds require a univariate distribution")
+    for b in (ev.lower, ev.upper)
+        isbound(plan) && b isa Symbol && b ∉ _all_names(plan) && !haskey(plan.columns, b) &&
+            _fail(r.label, "evidence bound $b is not a declared value")
+    end
     if ev.kind === :interval_censored
         ev.lower === nothing ||
             _fail(r.label, "interval evidence takes no lower (the response is the lower endpoint)")
@@ -9616,13 +9628,13 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
         resp = _response_slot_column(plan, r, r.response, "response")
         all(isfinite, resp) ||
             _fail(r.label, "interval evidence requires finite response values")
-        all(resp .< hi) ||
+        (hi === nothing || all(resp .< hi)) ||
             _fail(r.label, "interval evidence requires response < upper every row")
         return nothing
     end
-    (lo === nothing || hi === nothing || all(lo .< hi)) ||
-        _fail(r.label, "evidence requires strict lower < upper every row")
-    resp = _observation_column(plan.columns, r.response, r.label, "response")
+    (lo === nothing || hi === nothing || all(lo .<= hi)) ||
+        _fail(r.label, "evidence requires lower ≤ upper every row")
+    resp = _response_slot_column(plan, r, r.response, "response")
     below = lo === nothing ? false : resp .< lo
     above = hi === nothing ? false : resp .> hi
     bad = lo === nothing && hi === nothing ? Int[] : findall(below .| above)
@@ -9638,29 +9650,18 @@ end
 
 function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
     bound === nothing && return nothing
-    if bound isa Real
-        isfinite(bound) || _fail(r.label, "$side bound literal must be finite")
-        if r.family === PoissonLogFam
-            isinteger(bound) || _fail(r.label,
-                "$side bound literal must be integer-valued for Poisson evidence")
-        end
-        return Float64(bound)
+    value = bound isa Real ? bound : get(plan.columns, bound, nothing)
+    # Live bounds are validated by the generated cell; bound data retain
+    # their Julia broadcast axes and are gathered once for packed outcomes.
+    value === nothing && return nothing
+    if value isa Real
+        isfinite(value) || _fail(r.label, "$side bound must be finite")
+        return Float64(value)
     end
-    bound isa Symbol || _fail(r.label, "$side bound must be a literal or column")
-    _is_derived(plan, bound) && _fail(r.label,
-        "$side bound column $bound is derived — slice-1 binds evidence " *
-        "bounds raw (derived bounds need shape metadata — planned)")
-    haskey(plan.columns, bound) ||
-        _fail(r.label, "$side bound column $bound missing")
-    col = _response_slot_column(plan, r, bound, "$side bound column")
-    if r.family === PoissonLogFam
-        (eltype(col) <: Integer && eltype(col) !== Bool) || _fail(r.label,
-            "$side bound column must hold integers for Poisson evidence")
-        return col
-    end
-    eltype(col) <: Real && all(isfinite, col) ||
-        _fail(r.label, "$side bound column must be finite numerics")
-    return col
+    value = _response_slot_column(plan, r, bound, "$side bound")
+    eltype(value) <: Real && all(isfinite, value) ||
+        _fail(r.label, "$side bound must contain finite numerics")
+    return value
 end
 
 const _ROLE_RANK = Dict{Symbol,Int}(
@@ -11436,7 +11437,25 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             findfirst(p -> p.name === r.thresholds, vectors)
         declared = _is_ordered_family(r.family) && tp !== nothing ?
             vectors[tp].size : nothing
-        K = declared === nothing ? _infer_response_levels(r, columns) : declared + 1
+        K = declared !== nothing ? declared + 1 : if r.evidence.kind !== :none && r.n_levels === nothing &&
+                r.family !== CategoricalLogitFam
+            # Clamp endpoints need not be category integers. Infer the law's
+            # support from its explicit probability/threshold vector first.
+            ref = r.family === CategoricalFam ? r.predictor : r.thresholds
+            vi = findfirst(v -> v.name === ref, vectors)
+            width = if vi !== nothing
+                v = vectors[vi]
+                v.family === :simplex_dirichlet ? _dirichlet_size(plan, v.args.arg1, v.label) : v.size
+            elseif haskey(columns, ref)
+                length(columns[ref])
+            else
+                nothing
+            end
+            width === nothing ? _infer_response_levels(r, columns) :
+                width + (r.family === CategoricalFam ? 0 : 1)
+        else
+            _infer_response_levels(r, columns)
+        end
         push!(out_r, _with_levels(r, K))
     end
     by_label = Dict{Symbol,LikelihoodSpec}(r.label => r for r in out_r)

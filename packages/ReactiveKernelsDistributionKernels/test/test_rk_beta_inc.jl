@@ -3,11 +3,11 @@
 # Enzyme gradients (no rule: the continued-fraction body differentiates
 # ordinarily) and the student-t cdf rewire pin.
 using DifferentiationInterface: AutoEnzyme, gradient
-using Distributions: TDist, cdf
+using Distributions: TDist, cdf, pdf
 import Enzyme
 using ReactiveKernels: prepare
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    LOCATION_SCALE_SOURCE, rk_beta_inc, standard_student_t
+    LOCATION_SCALE_SOURCE, rk_beta_inc, rk_student_tail, standard_student_t
 import SpecialFunctions
 using Test
 
@@ -44,12 +44,22 @@ end
 end
 
 @testset "standard_student_t cdf rides rk_beta_inc" begin
-    @test occursin("rk_beta_inc(nu / 2, 0.5", LOCATION_SCALE_SOURCE)
+    @test occursin("rk_student_tail(nu, z", LOCATION_SCALE_SOURCE)
     @test !occursin("first(beta_inc(", LOCATION_SCALE_SOURCE)
     student_cdf = prepare(standard_student_t.cdf; have = (:z, :nu), want = :cdf)
     for nu in (1.0, 3.0, 4.0, 30.0)
         for z in (-37.0, -4.0, -0.4, 0.0, 0.7, 5.0, 41.0)
             @test student_cdf(z, nu) ≈ cdf(TDist(nu), z) atol = 1e-12
         end
+    end
+end
+
+@testset "Student tails have finite centre derivatives" begin
+    backend=AutoEnzyme(;mode=Enzyme.Reverse)
+    for nu in (.5,1.,3.,30.,100.)
+        @test rk_student_tail(nu,0.,false)==.5
+        @test rk_student_tail(nu,0.,true)==.5
+        @test gradient(z->rk_student_tail(nu,z,false),backend,0.)≈pdf(TDist(nu),0.) rtol=1e-12
+        @test gradient(z->rk_student_tail(nu,z,true),backend,0.)≈-pdf(TDist(nu),0.) rtol=1e-12
     end
 end
