@@ -32,6 +32,13 @@ code is not executed by the docs build.
   scalar recipes (see [core constraints](constraints.md)). The automatic AD
   compile keeps bound arrays of at most 4096 elements embedded as compiler
   literals.
+- A plate with one lane axis and array-valued cells retains its layout
+  through outer consumers.
+  Ordinary helpers can use `stack(lanes)` or `stack(lanes; dims=d)` to place
+  the lane axis as in native Julia; `vec(stack(lanes))` packs each complete
+  lane consecutively. An authored `sum(lanes)` adds arrays across lanes, preserving
+  their per-lane shape. A directly returned compiled plate still materializes
+  to its dense storage with the lane axis first.
 - Authored `if`, `?:`, `&&` and `||` keep their lazy Julia semantics: the
   tensorized companion lowers them to `stablehlo.if` regions (also inside a
   batched plate cell), so an inactive side is never evaluated or
