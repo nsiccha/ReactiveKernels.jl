@@ -69,9 +69,12 @@ Coefficient vectors are declared the same way, sized by their design matrix:
 ## Parameter priors
 
 Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
-`LogNormal`, `Beta`, `InverseGamma`, `StudentT`, `Laplace`, `Logistic`,
+`LogNormal`, `Beta`, `InverseGamma`, `StudentT`, `TDist`, `Laplace`, `Logistic`,
 `Uniform` and `Weibull`. Arguments can read data, sampled parameters and
 ordinary definitions; scalar expressions such as `1 + exp(a)` are values too.
+Omitted positional arguments use Distributions.jl defaults: `Normal()` is
+standard normal, `Gamma(k)` has unit scale, `Beta(k)` has two equal shape
+parameters, and `TDist(nu)` is the standard Student t distribution.
 
 Positive priors have the same normalized meaning in every slot:
 `HalfNormal(s)`, `HalfCauchy(s)` and their equivalent truncated Normal/Cauchy
@@ -115,6 +118,20 @@ Reactant limitation also applies to hierarchical Dirichlet priors.
 ## Julia semantics, written out
 
 - Use Distributions.jl constructors (`Normal`, `Exponential`, `Gamma`, …).
+- Response constructor defaults have their ordinary meaning: `Normal.(mu)`
+  and `LogNormal.(mu)` use unit scale, `NegativeBinomial.(exp.(eta))` uses
+  probability `0.5`, `InverseGaussian.(exp.(eta))` uses unit shape,
+  `Weibull.(k)` uses unit scale, and `VonMises.(exp.(eta))` has zero mean
+  and concentration `exp.(eta)`. Plate observations accept `Normal.(mu)` too.
+  Live VonMises concentration supports native values and derivatives;
+  Reactant compilation still encounters its existing traced `besseli` gap.
+- `Bool` response values retain their numeric meaning, zero or one.
+  Responses with a strictly positive data domain require `true`.
+- `MixtureModel.(vcat.(C1, C2))` gives the components equal weights.
+  Explicit shared weights use `MixtureModel.(vcat.(C1, C2), Ref(w))`.
+- `Beta.(alpha, beta)` preserves argument order. Swapping the arguments in
+  `Beta.(logistic.(eta) .* k, (1 .- logistic.(eta)) .* k)` changes its mean
+  from `logistic.(eta)` to `1 .- logistic.(eta)`.
 - Broadcasting is explicit: `mu = a .+ b .* x`.
 - A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
   `y ~ Normal(...)` on a data vector is rejected.
@@ -233,6 +250,14 @@ K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
 array follows the same rule. A data-only definition can size a declared array
 through `levels(gg)`, as in the multi-membership example above.
 
+The library's `gp_exp_quad_cov` and `gp_periodic_cov` functions build covariance
+with an RK plate over two location axes. Data-only locations cache pair
+distances during preparation; locations derived from parameters retain live
+distance calculations. The covariance matrix remains dense and diagonal jitter
+depends on position, including when two locations are equal. Dense Cholesky in
+`gp_chol_latent` remains a separate numerical leaf with native gradient support;
+compiled covariance support does not imply compiled Cholesky gradients.
+
 A single index on a multi-axis definition is linear and positional:
 `b = (z * sd)'` makes a row, and `b[g]` reads its column-major positions.
 A module function's result has no tracked level axes: `b = identity(z)`
@@ -312,8 +337,15 @@ Here `m[k]` uses the authored Julia index; a declared `z[levels(g)]` instead
 uses its level axis, so noncontiguous and string labels gather the correct
 coordinate. Deterministic outputs retain that axis for later reads such as
 `d[g]`. Each cell remains one RK plate body as the number of levels grows.
-Declared array reads inside a level cell currently take the full same level
-axis; selected subsets and different level axes are rejected.
+Declared array reads inside a level cell are aligned by label before entering
+the plate. With `z[levels(g)[2:end]]`, `z[k]` is zero for the omitted first
+level and reads the selected coordinate for every other level. A declaration
+on `levels(h)` also works when every loop label occurs on that full axis;
+the order and number of its coordinates can differ from `levels(g)`.
+Matrix row reads follow the same rule. Raw bound-array reads and lazy
+branches keep their authored Julia semantics.
+Reactant's remaining limitation for an invalid host-constant index inside
+an inactive live branch is recorded in the [core constraints](constraints.md).
 
 In an array cell, an observation must read a named per-index output
 (`y[i] ~ Normal(r[i], sigma)`), rather than a cell local directly.

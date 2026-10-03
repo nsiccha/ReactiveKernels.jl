@@ -311,28 +311,21 @@ end
 @testset "contract me: direct plate-mean observation" begin
     cols, n = _me_columns()
     @test validate_plan(_me_direct_plan(cols, n)) === nothing
-    # A non-literal sd fails closed (SB: sd is a positive constant).
-    # capability: (IR-level) plate-mean observation with a parameter (non-literal) sd (SB-mirroring gate) (todo `1308iv0`)
+    # A plate location uses the ordinary scale, evidence and weight paths.
     named_sd = _me_direct_plan(cols, n; sd = :sd_p)
     push!(named_sd.parameters, SampledParameter(:sd_p, :exponential,
         (arg1 = 1.0,), nothing, :sd_p))
-    @test_broken (validate_plan(named_sd); true)
-    # Non-Gaussian plate-mean locations fail closed.
+    @test validate_plan(named_sd) === nothing
     badfam = StructuralPlan(
         LikelihoodSpec[LikelihoodSpec(BernoulliLogitFam, LogitLink, :yb,
             :x_true, nothing, nothing, _none_evidence(), :yb_resp)],
-        PredictorSpec[PredictorSpec(:mu, IdentityLink,
-            TermSpec[TermSpec(InterceptTerm, ColumnRef[], NamedTuple(),
-                :Intercept, :intercept)], :mu)],
-        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0)],
+        PredictorSpec[], PopulationPrior[],
         SampledParameter[], AssignmentSpec[],
         Dict{Symbol,AbstractVector}(:yb => [true, false, true, false,
             true, false]),
         n; plate_parameters = PlateParameter[PlateParameter(:x_true,
             :normal, (arg1 = 0.0, arg2 = 1.0), nothing)])
-    # capability: (IR-level) non-Gaussian plate-mean response (todo `1308iv0`)
-    @test_broken (validate_structure(badfam); true)
-    # Weights, evidence, and ranges fail closed on a plate-mean response.
+    @test validate_plan(badfam) === nothing
     wplan = _me_direct_plan(cols, n)
     wresp = wplan.responses[2]
     wcols = Dict{Symbol,AbstractVector}(:y => cols[:y],
@@ -344,9 +337,8 @@ end
         wplan.predictors, wplan.population_priors, wplan.parameters,
         wplan.assignments, wcols, n;
         plate_parameters = wplan.plate_parameters)
-    # capability: (IR-level) weights on a plate-mean response (todo `1308iv0`)
-    @test_broken (validate_plan(wbad); true)
-    ev = ResponseEvidence(:truncated, 0.0, nothing)
+    @test validate_plan(wbad) === nothing
+    ev = ResponseEvidence(:truncated, -2.0, nothing)
     evbad = StructuralPlan(
         LikelihoodSpec[wplan.responses[1], LikelihoodSpec(wresp.family,
             wresp.link, wresp.response, wresp.predictor, wresp.scale,
@@ -354,8 +346,7 @@ end
         wplan.predictors, wplan.population_priors, wplan.parameters,
         wplan.assignments, cols, n;
         plate_parameters = wplan.plate_parameters)
-    # capability: (IR-level) truncation evidence on a plate-mean response (todo `0ze68k8`)
-    @test_broken (validate_plan(evbad); true)
+    @test validate_plan(evbad) === nothing
     rbad = StructuralPlan(
         LikelihoodSpec[wplan.responses[1], LikelihoodSpec(wresp.family,
             wresp.link, wresp.response, wresp.predictor, wresp.scale,
@@ -364,8 +355,7 @@ end
         wplan.predictors, wplan.population_priors, wplan.parameters,
         wplan.assignments, cols, n;
         plate_parameters = wplan.plate_parameters)
-    # capability: (IR-level) row range on a plate-mean response (todo `1308iv0`)
-    @test_broken (validate_plan(rbad); true)
+    @test validate_plan(rbad) === nothing
 end
 
 @testset "generator me: surface-model values and gradient" begin

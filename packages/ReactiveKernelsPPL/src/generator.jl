@@ -12,6 +12,8 @@
 # The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
 # (counter-suffixed binding per build).
 
+import ReactiveKernelsDistributionKernels.DistributionKernelSources as _GPDistributionSources
+
 """
     build_kernel(plan) -> (; spec, layout)
 
@@ -62,7 +64,6 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     end
     append!(stmts, _coef_reassembly_statements(plan, layout))
     append!(stmts, _conditioned_value_statements(plan))
-    append!(stmts, _array_value_statements(plan))
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, assigns)
     append!(stmts, preprocessing_recipes(plan))
@@ -100,7 +101,7 @@ function _conditioned_value_statements(plan)
         for p in plan.array_parameters
             p.name === name || continue
             nd = length(_array_dims(plan, p))
-            if p.family in (:lkj_cholesky, :lkj_cholesky_stack)
+            if p.family === :lkj_cholesky_stack
                 # Only the intrinsic factor width expands; a stack's data axis
                 # stays a vector read and reduction in the existing LKJ graph.
                 K = _array_dims(plan, p)[1]
@@ -108,7 +109,7 @@ function _conditioned_value_statements(plan)
                     rhs = nd == 3 ? :($name[$i, $i, :]) : :($name[$i, $i])
                     push!(stmts, :($(_rl_name(name, i, i)) = $rhs))
                 end
-            elseif nd > 1 && !_is_slice_array(p)
+            elseif nd > 1 && !_is_structured_array(p)
                 push!(stmts, :($(_array_flat_name(name, nd)) = vec($name)))
             end
         end
@@ -233,6 +234,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
+import ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    gp_exp_quad_cov_graph as _ppl_gp_exp_quad_cov,
+    gp_periodic_cov_graph as _ppl_gp_periodic_cov
 using SpecialFunctions: besseli, besselix, erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
@@ -317,6 +321,7 @@ function _assignment_statements(plan::StructuralPlan;
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
         ex = _array_gather_rewrite(by_name[name].expr, plan, gathers)
+        ex = _split_gp_cov_calls!(stmts, name, ex, plan)
         if _expr_value_symbols(ex) ⊆ dataonly
             push!(dataonly, name)
         else
@@ -325,6 +330,64 @@ function _assignment_statements(plan::StructuralPlan;
         push!(stmts, :($(name) = $(ex)))
     end
     return stmts
+end
+
+# Resolve the callable, rather than its spelling: module-qualified calls and
+# aliases share the library graph, while a model's own GP-named function keeps
+# its ordinary Julia implementation and shape semantics.
+function _gp_covariance_graph(callee)
+    callee isa GlobalRef || return nothing
+    fn = getfield(callee.mod, callee.name)
+    fn === _GPDistributionSources.gp_exp_quad_cov &&
+        return :_ppl_gp_exp_quad_cov
+    fn === _GPDistributionSources.gp_periodic_cov &&
+        return :_ppl_gp_periodic_cov
+    nothing
+end
+
+# Lift a covariance nested in a value call before the ordinary KernelSpec
+# splicer attaches its pair plate. Untyped aliases match the graph's ports.
+# Lazy branches, closures and generators keep their local evaluation.
+function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex,
+        plan::StructuralPlan)
+    count = 0
+    function walk(node)
+        node isa Expr || return node
+        if node.head in (:ref, :tuple, :vect)
+            return Expr(node.head, map(walk, node.args)...)
+        elseif node.head === :kw && length(node.args) == 2
+            return Expr(:kw, node.args[1], walk(node.args[2]))
+        elseif node.head === :. && length(node.args) == 2 &&
+                Meta.isexpr(node.args[2], :tuple)
+            return Expr(:., node.args[1], Expr(:tuple, map(walk, node.args[2].args)...))
+        end
+        node.head === :call || return node
+        callee = node.args[1]
+        args = map(walk, node.args[2:end])
+        graph = _gp_covariance_graph(callee)
+        graph === nothing && return Expr(:call, callee, args...)
+        nargs = graph === :_ppl_gp_exp_quad_cov ? 4 : 5
+        length(args) == nargs && all(a -> !Meta.isexpr(a, :parameters) &&
+            !Meta.isexpr(a, :(...)), args) || return Expr(:call, callee, args...)
+        # The registered pair graphs implement vector locations. A bound
+        # matrix selects the ordinary Julia matrix method instead; routing
+        # it through a vector graph would change the location semantics.
+        locations = first(args)
+        locations isa Symbol && haskey(plan.columns, locations) &&
+            plan.columns[locations] isa AbstractMatrix &&
+            return Expr(:call, callee, args...)
+        count += 1
+        prefix = Symbol(:_ppl_gp_, name, :_, count)
+        inputs = Symbol[]
+        for (i, arg) in enumerate(args)
+            input = Symbol(prefix, :_arg_, i)
+            push!(stmts, :($input = $arg))
+            push!(inputs, input)
+        end
+        push!(stmts, :($prefix = $graph($(inputs...))))
+        prefix
+    end
+    walk(ex)
 end
 
 # Functions as values: a data-only module call nested in a parameter-
@@ -1586,22 +1649,60 @@ function _rewrite_kernel_refs(ex, flatmap::Dict{Symbol,Symbol})
     return Expr(ex.head, (_rewrite_kernel_refs(a, flatmap) for a in ex.args)...)
 end
 
-# One plate likelihood per response (pointwise plate + scalar sum node).
-# Triples 2 and 3 (Bernoulli-logit) lower identically; the triple only
-# selects the form. Branches are explicit per family; the else is a
-# fail-closed guard for enum members without an emitter (never silent).
+# Packed observations keep their own axis. Every other observation input
+# uses the same retained gather plate, including bounds, weights and trials.
+_mi_row_value(x::Number, i) = x
+@traceable _mi_row_value(x::AbstractVector, i) = x[i]
+
+# Pure scalar math keeps the CDF inside the selected censoring arm; endpoint
+# expansion currently cannot splice the normal CDF's multi-recipe graph there.
+_mixture_normal_cdf(x, mu, sigma) = 0.5 * erfc((mu - x) / (sqrt(2.0) * sigma))
+
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     # No cell is evaluated on an empty bound observation domain. Its sum is
     # the additive identity, independently of the response family.
     _response_rows(plan, r) == 0 && return Expr[:($(_lik_name(r.label))::Float64 = 0.0)]
+    stmts = _response_likelihood_stmts_full(r, plan)
+    r.mi_jobs === nothing && return stmts
+    pre = Expr[]
+    jobs = r.mi_jobs
+    packed = nothing
+    if r.range !== nothing
+        packed = Symbol(:_ppl_mi_packed_, r.label)
+        selected = Symbol(:_ppl_mi_rows_, r.label)
+        # Data-only selection runs at preparation; it never emits one body
+        # per selected row. Jobs address the full axis, y the packed axis.
+        rng = r.range
+        push!(pre, :($packed = findall(j -> j in $rng, $jobs)))
+        push!(pre, :($selected = $jobs[$packed]))
+        jobs = selected
+    end
+    obsidx = findfirst(st -> st.head === :(=) && st.args[1] === _pw_name(r.label), stmts)
+    obsidx === nothing && throw(ContractValidationError(
+        "[generator] mi response $(r.label) has no observation plate"))
+    let st = stmts[obsidx]
+        call = st.args[2].args[1]
+        call.args[1] === :plate || throw(ContractValidationError(
+            "[generator] mi response $(r.label) needs a scalar observation plate"))
+        for i in 2:length(call.args)
+            ref = call.args[i]
+            # Ref inputs are whole model values (e.g. a simplex), never rows.
+            ref isa Symbol || continue
+            i == 2 && packed === nothing && continue
+            rows = i == 2 ? packed : jobs
+            call.args[i] = _mi_gather_node!(pre, rows, ref, r.label)
+        end
+    end
+    return Expr[stmts[1:obsidx-1]..., pre..., stmts[obsidx:end]...]
+end
+
+# One plate likelihood per response (pointwise plate + scalar sum node).
+# Triples 2 and 3 (Bernoulli-logit) lower identically; the triple only
+# selects the form. Branches are explicit per family; the else is a
+# fail-closed guard for enum members without an emitter (never silent).
+function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan)
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
-    if r.mi_jobs !== nothing && !(r.family === GaussianFam ||
-            r.family === GammaLogFam || r.family === BetaLogitFam)
-        throw(ContractValidationError(
-            "[generator] mi() response $(r.label) family $(r.family) " *
-            "has no mi emitter (v1: Gaussian/Gamma/Beta)"))
-    end
     if r.family === GaussianFam
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
@@ -1614,7 +1715,7 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         # (the cover rule makes them whole-column today, but the fused sum
         # must never silently outgrow a future partial range).
         r.evidence.kind === :none && r.weights === nothing &&
-            r.range === nothing && !_is_bare_param_location(r, plan) &&
+            r.range === nothing && r.mi_jobs === nothing && !_is_bare_param_location(r, plan) &&
             return _bernoulli_wholevec_stmts(r, plan, node)
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
@@ -1622,7 +1723,7 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         # whole-vector reduction (faster native + Reactant; the per-cell
         # plate handles evidence/weights/ranges).
         r.evidence.kind === :none && r.weights === nothing &&
-            r.range === nothing && !_is_bare_param_location(r, plan) &&
+            r.range === nothing && r.mi_jobs === nothing && !_is_bare_param_location(r, plan) &&
             return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === HurdlePoissonFam
@@ -1705,10 +1806,13 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
         inputs[1] = yin
     end
-    # Binomial trials are shared across components: one threaded use.
+    # Equal trial arguments share one input; distinct arguments thread per component.
     nref = nothing
     if f === BinomialLogitFam
-        nref = _thread_ref!(inputs, r.trials, true)
+        inputs[1] = _count_yplate!(pre, plan, y, r.label)
+        if r.trials !== nothing
+            nref = _thread_ref!(inputs, r.trials, true)
+        end
     end
     # Weights: literals fold at codegen; a simplex parameter binds one
     # log-vector hoisted out of the plate, threaded by `Ref` (the
@@ -1731,25 +1835,59 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         logw_comp = w.param_first ? (first, second) : (second, first)
     end
     terms = Expr[]
+    lo_terms, hi_terms = Expr[], Expr[]
+    lb, ub = _thread_bounds!(inputs, r.evidence, false)
+    r.evidence.kind === :interval_censored && (lb = yv)
     for k in 1:K
         klab = Symbol(r.label, :_mix, k)
         locref, is_lp = _mixture_loc_ref(r, plan, k)
+        nk = isempty(r.mixture_trials) ? nref :
+            _thread_ref!(inputs, r.mixture_trials[k], true)
         lpdf = _mixture_component_lpdf(f, r, plan, pre, inputs, k, klab,
-            locref, is_lp, yv, yref, nref)
+            locref, is_lp, yv, yref, nk)
         logw_k = logw_lit === nothing ?
             (logw_comp === nothing ? :($lwv[$k]) : logw_comp[k]) :
             logw_lit[k]
         push!(terms, :($logw_k + $lpdf))
+        if r.evidence.kind !== :none
+            endpoint = lpdf.args[1].args[1]
+            mu, sigma = endpoint.args[2:3]
+            cdf_fn = GlobalRef(@__MODULE__, :_mixture_normal_cdf)
+            lb === nothing || push!(lo_terms,
+                :(exp($logw_k) * $cdf_fn($lb, $mu, $sigma)))
+            ub === nothing || push!(hi_terms,
+                :(exp($logw_k) * $cdf_fn($ub, $mu, $sigma)))
+        end
     end
-    m = terms[1]
-    for t in terms[2:end]
-        m = :(max($m, $t))
+    cell = foldl((a, b) -> :(logaddexp($a, $b)), terms)
+    if r.evidence.kind !== :none
+        lcdf = isempty(lo_terms) ? 0.0 : foldl((a,b) -> :($a + $b), lo_terms)
+        ucdf = isempty(hi_terms) ? 1.0 : foldl((a,b) -> :($a + $b), hi_terms)
+        if r.evidence.kind === :truncated
+            cell = :($cell - log($ucdf - $lcdf))
+        elseif r.evidence.kind === :censored
+            if ub !== nothing
+                cell = :(if $yv >= $ub
+                    log1p(-$ucdf)
+                else
+                    $cell
+                end)
+            end
+            if lb !== nothing
+                cell = :(if $yv <= $lb
+                    log($lcdf)
+                else
+                    $cell
+                end)
+            end
+        elseif r.evidence.kind === :interval_censored
+            cell = :(log($ucdf - $lcdf))
+        end
     end
-    sumexp = :(exp($(terms[1]) - $m))
-    for t in terms[2:end]
-        sumexp = :($sumexp + exp($t - $m))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
     end
-    cell = :($m + log($sumexp))
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
@@ -1912,7 +2050,7 @@ end
 _mi_gather_name(label::Symbol, ref::Symbol) = Symbol(:_ppl_mi_, label, :_, ref)
 
 # Gather a computed full-length node by `Jobs` (an lp/rate/shape/scale
-# node the emitter created — always a vector), returning the short node.
+# node the emitter created), returning the short node. Scalars broadcast.
 # The gather is its own short plate over `Jobs` with the source `Ref`'d
 # (the ordinal `c[yv]` per-lane-gather precedent): a caller-level fancy
 # `node[Jobs]` does not trace under Reactant (`TracedRArray[Vector{Int}]`
@@ -1921,38 +2059,12 @@ function _mi_gather_node!(pre::Vector{Expr}, jobs::Symbol, node::Symbol,
         label::Symbol)
     g = _mi_gather_name(label, node)
     jv, rf = _dovar(1), _dovar(2)
-    body = Expr(:block, LineNumberNode(0, :generator), :($rf[$jv]))
+    getter = GlobalRef(@__MODULE__, :_mi_row_value)
+    body = Expr(:block, LineNumberNode(0, :generator), :($getter($rf, $jv)))
     lambda = Expr(:(->), Expr(:tuple, jv, rf), body)
     doex = Expr(:do, Expr(:call, :plate, jobs, :(Ref($node))), lambda)
     push!(pre, :($g = $doex))
     return g
-end
-
-# Gather a scale-like ref under `mi()`: scalar parameter/assignment names
-# broadcast untouched, columns gather through a short plate, Real
-# literals pass through for `_thread_ref!` to inline; anything else fails
-# closed (gathering a scalar would index nonsense, an unknown name would
-# thread garbage).
-function _mi_gather_ref!(pre::Vector{Expr}, jobs::Symbol, ref,
-        plan::StructuralPlan, label::Symbol)
-    ref isa Real && return ref
-    ref isa Symbol || throw(ContractValidationError(
-        "[generator] mi() response $label gathers Symbol/Real refs only " *
-        "(got $(repr(ref)))"))
-    ref in _union_names(plan) && return ref
-    haskey(plan.columns, ref) || throw(ContractValidationError(
-        "[generator] mi() response $label cannot gather unknown name $ref"))
-    return _mi_gather_node!(pre, jobs, ref, label)
-end
-
-# Gather a resolved scale arg under `mi()`: a predictor-fed scale already
-# resolved to its `_ppl_sc_` node (always a full-length vector — gather
-# it as a node); every other scale shape routes through `_mi_gather_ref!`.
-function _mi_gather_scale!(pre::Vector{Expr}, jobs::Symbol, sarg, r::LikelihoodSpec,
-        plan::StructuralPlan)
-    r.scale isa ScalePredictorRef &&
-        return _mi_gather_node!(pre, jobs, sarg, r.label)
-    return _mi_gather_ref!(pre, jobs, sarg, plan, r.label)
 end
 
 # Thread a Symbol ref as a plate input (returning its do-var); Real
@@ -1986,12 +2098,6 @@ function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
     lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
-    if r.mi_jobs !== nothing
-        # Packed y_obs threads directly (it IS the short plate axis);
-        # every other vector input gathers by Jobs.
-        lp = _mi_gather_node!(pre, r.mi_jobs, lp, r.label)
-        sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)
-    end
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
     sref = _thread_ref!(inputs, sarg)
@@ -2106,6 +2212,17 @@ end
 # the recipe. Returns the plate input symbol and the cell lane ref.
 _ybool_name(label::Symbol) = Symbol(:_ppl_yb_, label)
 
+# Count endpoints take integer values. Keep the caller's Bool column available
+# to every other reader and form a separate zero/one integer value for the
+# density. This data-only recipe is shared by native and compiled execution.
+function _count_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
+        y::Symbol, label::Symbol)
+    eltype(plan.columns[y]) === Bool || return y
+    yi = Symbol(:_ppl_yi_, label)
+    push!(pre, :($yi = Int.($y)))
+    return yi
+end
+
 function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
         y::Symbol, label::Symbol, yv::Symbol)
     col = plan.columns[y]
@@ -2158,7 +2275,7 @@ function _bernoulli_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::S
         pv = _thread_ref!(inputs, r.predictor)
         cell = :(bernoulli($pv).logpdf($yref))
     else
-        lp = _lp_name(_predictor(plan, r.predictor))
+        lp = _location_node(r, plan)
         push!(inputs, lp)
         etav = _dovar(2)
         cell = :(bernoulli(; logit = $etav).logpdf($yref))
@@ -2187,7 +2304,7 @@ _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
 # and `sum(f, x)` treatment as the Poisson form. Gradient stays ordinary AD.
 function _bernoulli_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     yf = _yfloat_name(r.label)
     return Expr[
         :($yf = Float64.($y)),
@@ -2197,7 +2314,7 @@ end
 
 function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     ycol = plan.columns[y]
     cterm = sum(SpecialFunctions.loggamma(Float64(v) + 1.0) for v in ycol)
     yf = _yfloat_name(r.label)
@@ -2216,7 +2333,7 @@ function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         ratev = _thread_ref!(inputs, r.predictor)
         cell = :(poisson($ratev).logpdf($yv))
     else
-        lp = _lp_name(_predictor(plan, r.predictor))
+        lp = _location_node(r, plan)
         push!(inputs, lp)
         etav = _dovar(2)
         lb, ub = _thread_bounds!(inputs, r.evidence, true)
@@ -2240,7 +2357,7 @@ end
 # plate iterates it per cell.
 function _zip_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, r.label)
     inputs = Any[y, lp]
@@ -2324,7 +2441,7 @@ end
 # slice.
 function _hurdle_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
@@ -2360,7 +2477,7 @@ end
 # perf-lane follow-up, not this slice.
 function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
     pre = Expr[:($mu = exp.($lp))]
     sarg = _scale_plate_arg(r, plan, pre)
@@ -2392,7 +2509,7 @@ end
 # No whole-vector fusion yet — a perf-lane follow-up, not this slice.
 function _exponential_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
     pre = Expr[:($mu = exp.($lp))]
     inputs = Any[y, mu]
@@ -2425,7 +2542,7 @@ end
 # a perf-lane follow-up, not this slice.
 function _vonmises_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
@@ -2455,14 +2572,16 @@ end
 
 function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    inputs = Any[y]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
     yv = _dovar(1)
     if _is_bare_param_location(r, plan)
         nref = _thread_ref!(inputs, r.trials, true)
         pv = _thread_ref!(inputs, r.predictor)
         cell = :(binomial($nref, $pv).logpdf($yv))
     else
-        lp = _lp_name(_predictor(plan, r.predictor))
+        lp = _location_node(r, plan)
         push!(inputs, lp)
         etav = _dovar(2)
         nref = _thread_ref!(inputs, r.trials, true)
@@ -2474,7 +2593,7 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Prob-space Binomial (SB `binomial(n, theta)` with a Beta prior — the Rate
@@ -2483,7 +2602,9 @@ end
 # through the plate against the positional prob-space kernel.
 function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    inputs = Any[y]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
     pref = _thread_ref!(inputs, r.predictor)
@@ -2492,7 +2613,7 @@ function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Zero-inflated-Binomial plate (the ZIB head): prob-space scalar p (the
@@ -2501,7 +2622,9 @@ end
 # cell (the NB2 precedent).
 function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    inputs = Any[y]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
     pref = _thread_ref!(inputs, r.predictor)
@@ -2511,7 +2634,7 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return _plate_sum_stmts(pw, node, inputs, cell)
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 # Mean/rate vectors are precomputed statements (like `_ppl_lp_*`): plate
@@ -2522,7 +2645,7 @@ _rate_name(label::Symbol) = Symbol(:_ppl_rate_, label)
 
 function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
     pre = Expr[:($mu = exp.($lp))]
     sarg = _scale_plate_arg(r, plan, pre)
@@ -2549,7 +2672,7 @@ _nb1_r_name(label::Symbol) = Symbol(:_ppl_r_, label)
 
 function _nb1_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     rr = _nb1_r_name(r.label)
     pre = Expr[:($rr = exp.($lp))]
     sarg = _scale_plate_arg(r, plan, pre)
@@ -2573,7 +2696,7 @@ end
 # follow-up, not this slice.
 function _weibull_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, lp]
@@ -2591,7 +2714,7 @@ end
 
 function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     # Surface is Distributions-SCALE `Gamma(alpha, mu/alpha)`; the kernel
@@ -2599,10 +2722,6 @@ function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbo
     av = sarg isa Symbol ? sarg : Float64(sarg)
     rate = _rate_name(r.label)
     push!(pre, :($rate = $av ./ exp.($lp)))
-    if r.mi_jobs !== nothing
-        rate = _mi_gather_node!(pre, r.mi_jobs, rate, r.label)
-        sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)
-    end
     inputs = Any[y, rate]
     yv, ratev = _dovar(1), _dovar(2)
     aref = _thread_ref!(inputs, sarg)
@@ -2674,7 +2793,7 @@ _shape_b_name(label::Symbol) = Symbol(:_ppl_b_, label)
 # activity on the const kernel object). Positional-p cell (primary form).
 function _bernoulli_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     p = _prob_name(r.label)
     pre = Expr[:($p = 0.5 .* erfc.(-$lp ./ sqrt(2)))]
     yv, pv = _dovar(1), _dovar(2)
@@ -2691,7 +2810,7 @@ end
 # Bernoulli cloglog: pure-arithmetic p precompute, positional-p cell.
 function _bernoulli_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     p = _prob_name(r.label)
     pre = Expr[:($p = 1 .- exp.(-exp.($lp)))]
     yv, pv = _dovar(1), _dovar(2)
@@ -2710,10 +2829,12 @@ end
 # the (:n, :logit) route is what slice-1 Binomial emits.
 function _binomial_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     p = _prob_name(r.label)
     logitp = _logitp_name(r.label)
-    inputs = Any[y, logitp]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, logitp]
     yv, lpv = _dovar(1), _dovar(2)
     nref = _thread_ref!(inputs, r.trials, true)
     cell = :(binomial(; n = $nref, logit = $lpv).logpdf($yv))
@@ -2721,17 +2842,19 @@ function _binomial_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, n
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($p = 0.5 .* erfc.(-$lp ./ sqrt(2))),
+    return Expr[pre..., :($p = 0.5 .* erfc.(-$lp ./ sqrt(2))),
         :($logitp = log.($p) .- log1p.(-$p)),
         _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
 function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     p = _prob_name(r.label)
     logitp = _logitp_name(r.label)
-    inputs = Any[y, logitp]
+    pre = Expr[]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, logitp]
     yv, lpv = _dovar(1), _dovar(2)
     nref = _thread_ref!(inputs, r.trials, true)
     cell = :(binomial(; n = $nref, logit = $lpv).logpdf($yv))
@@ -2739,7 +2862,7 @@ function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, 
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($p = 1 .- exp.(-exp.($lp))),
+    return Expr[pre..., :($p = 1 .- exp.(-exp.($lp))),
         :($logitp = log.($p) .- log1p.(-$p)),
         _plate_sum_stmts(pw, node, inputs, cell)...]
 end
@@ -2752,7 +2875,7 @@ end
 # form).
 function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
@@ -2760,12 +2883,6 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     sarg = _scale_plate_arg(r, plan, pre)
     k = sarg isa Symbol ? sarg : Float64(sarg)
     push!(pre, :($a = $mu .* $k), :($b = (1 .- $mu) .* $k))
-    if r.mi_jobs !== nothing
-        # kappa never threads (it folds into the a/b precomputes), so
-        # only the shape nodes gather.
-        a = _mi_gather_node!(pre, r.mi_jobs, a, r.label)
-        b = _mi_gather_node!(pre, r.mi_jobs, b, r.label)
-    end
     inputs = Any[y, a, b]
     yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
     cell = :(beta($avv, $bvv).logpdf($yv))
@@ -2785,14 +2902,15 @@ end
 # (`_ppl_sc_`, the NB2 precedent) and broadcasts through `a`/`b`.
 function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
     k = sarg isa Symbol ? sarg : Float64(sarg)
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
-    inputs = Any[y, a, b]
+    yin = _count_yplate!(pre, plan, y, r.label)
+    inputs = Any[yin, a, b]
     yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
     nref = _thread_ref!(inputs, r.trials, true)
     cell = :(beta_binomial($nref, $avv, $bvv).logpdf($yv))
@@ -2923,7 +3041,7 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     structure = r.family === OrderedLogisticFam ? :cumulative : r.ordinal_structure
     structure === :cumulative ||
         return _ordinal_stopping_stmts(r, plan, node, pw, K)
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     inputs = Any[r.response, lp]
     yv, etav = _dovar(1), _dovar(2)
     prests = Expr[]
@@ -2982,7 +3100,7 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     if K == 1
         return _plate_sum_stmts(pw, node, Any[y], :(0.0 * $(_dovar(1))))
     end
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     obs, stage = _stage_lane(r.label, :obs), _stage_lane(r.label, :stage)
     prests = Expr[:($obs = _ordinal_stage_obs($y, $K)),
         :($stage = _ordinal_stage_idx($y, $K))]
@@ -3648,18 +3766,16 @@ function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64;
     terms = Any[nstack === nothing ? c : nstack * c]
     lg(i) = nstack === nothing ? :(log($(_rl_name(L, i, i)))) :
         :(sum(log.($(_rl_name(L, i, i)))))
-    if eta == 1.0
-        for i in 2:K
-            push!(terms, :($(K - i) * $(lg(i))))
-        end
-    else
-        bcoef = 2 * eta - 2
-        for i in 2:K
-            k = i - 2
-            push!(terms, :($(K - 1 - k - 1) * $(lg(i)) + $bcoef * $(lg(i))))
-        end
+    for i in 2:K
+        push!(terms, _lkj_prior_diagonal(lg(i), K, i, eta))
     end
     return foldl((a, c) -> :($a + $c), terms)
+end
+
+function _lkj_prior_diagonal(ld, K, i, eta)
+    coefficient = i isa Int ? K - i : :($K - $i)
+    return eta == 1.0 ? :($coefficient * $ld) :
+        :($coefficient * $ld + $(2 * eta - 2) * $ld)
 end
 
 # One correlated draws block's LKJ prior node (names/sizes from the draws).

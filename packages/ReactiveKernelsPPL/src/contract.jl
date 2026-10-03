@@ -362,28 +362,31 @@ their defaults:
   Empty otherwise.
 - `mixture_weights`: the length-K mixing weights: a literal
   `Vector{Float64}` (finite, nonnegative, sums to 1), a
-  `:simplex_dirichlet` [`VectorParameter`](@ref) name, or a
+  shared bound numeric vector, a `:simplex_dirichlet` [`VectorParameter`](@ref) name, or a
   [`MixtureComplementWeights`](@ref) pair (K == 2), `nothing`
   otherwise.
+- `mixture_trials`: one trial-count column or literal per Binomial component
+  when their arguments differ. Empty when `trials` supplies the shared argument.
 
 `predictor` is an anchor only (first location predictor, else first
 scale predictor, else the weights simplex name, else the first
-location/scale parameter name — fully-fixed mixtures fail closed before
-anchoring); `scale` is `nothing`. Mixture widths are structural
+location/scale parameter name, else the response name); `scale` is `nothing`.
+Mixture widths are structural
 (K = `length(mixture_locs)`): no `n_levels`, no bind-time size
-inference. Binomial components share one `trials`.
+inference. Binomial components may have distinct trial counts.
 Case-A `mi()` missingness (SB parity, log density only) names its observed-row
 index column in the trailing `mi_jobs` field, built with keywords (`mi_jobs=`);
 every other response leaves it at `nothing`:
 
 - `mi_jobs`: the `Jobs` column (sorted-ascending unique `Int` row indices,
-  a strict nonempty subset of the response's full observation axis). The
+  a nonempty selection on the response's full observation axis). The
   response column itself crosses
   PACKED (`y_obs`, aligned with `Jobs`); both ride the managed-columns
   exemption. The generator gathers every vector likelihood input by `Jobs`
   and runs the existing cell over the short plate — obs rows only, no
-  latent (SB keeps `y_mis` in generated quantities here). v1 admits
-  Gaussian/Gamma/Beta, uncomposed (no weights/evidence/range/trials);
+  latent (SB keeps `y_mis` in generated quantities here). Scalar observation
+  families compose with weights, evidence, ranges and trials. A range filters
+  Jobs on the full axis and the corresponding packed response positions;
   Case-B downstream merged-response uses fail closed emitter-side.
 
 VonMises responses (`VonMisesFam`, SB `brm_von_mises` mirror) carry the
@@ -425,6 +428,7 @@ struct LikelihoodSpec
     mixture_locs::Vector{Union{Symbol,Real}}
     mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}}
     mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights}
+    mixture_trials::Vector{Union{ColumnRef,Int}}
     nu::Union{Nothing,ParamName,Real,ScalePredictorRef}
     zi::Union{Nothing,ParamName,Real,ScalePredictorRef}
     mi_jobs::Union{Nothing,ColumnRef}
@@ -461,6 +465,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         mixture_scales::Vector{Union{Nothing,Symbol,Real,ScalePredictorRef}} =
             Union{Nothing,Symbol,Real,ScalePredictorRef}[],
         mixture_weights::Union{Nothing,Symbol,Vector{Float64},MixtureComplementWeights} = nothing,
+        mixture_trials::Vector{Union{ColumnRef,Int}} = Union{ColumnRef,Int}[],
         nu::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         zi::Union{Nothing,ParamName,Real,ScalePredictorRef} = nothing,
         mi_jobs::Union{Nothing,ColumnRef} = nothing,
@@ -471,7 +476,7 @@ function LikelihoodSpec(family, link, response, predictor, scale, weights,
         extra_predictors, count_columns, ordinal_structure, discrimination,
         threshold_columns, threshold_coefs, extra_responses, factor_scales,
         factor_corr, glm_alpha, glm_beta, mixture_family, mixture_locs,
-        mixture_scales, mixture_weights, nu, zi, mi_jobs, interval,
+        mixture_scales, mixture_weights, mixture_trials, nu, zi, mi_jobs, interval,
         threshold_effects)
 end
 
@@ -5612,6 +5617,18 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
             bound && !haskey(plan.columns, inp) && !(inp in known) &&
                 _fail(label, "array plate column reads unknown name $inp")
             push!(refs, inp)
+        elseif inp isa Expr && inp.head === :call && length(inp.args) == 4 &&
+                inp.args[1] === :_ppl_level_gather
+            nm, g, ld = inp.args[2:end]
+            axs = _gather_axes(plan, nm)
+            axs !== nothing && ld isa Int && 1 <= ld <= length(axs) &&
+                _is_levels_dim(axs[ld]) || _fail(label,
+                    "array plate column cannot align $(repr(inp))")
+            push!(refs, nm)
+            # levels(g) includes unused categorical pool members too;
+            # validate every cell label rather than only observed g rows.
+            bound && _validate_level_gather(plan, nm, label, axs[ld], g,
+                _array_axis_levels(plan, nm, label, g))
         elseif inp isa Expr && inp.head === :call &&
                 ((length(inp.args) == 3 && inp.args[1] === :_ppl_codes) ||
                  (length(inp.args) == 2 && inp.args[1] in
@@ -5629,7 +5646,7 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
                 _fail(label, "array plate column reads unknown name $nm")
         else
             _fail(label, "array plate column input $(repr(inp)) is not a " *
-                "column, level codes or `Ref(name)`")
+                "column, aligned level values, level codes or `Ref(name)`")
         end
     end
     return nothing
@@ -5834,7 +5851,7 @@ function _is_vector_valued(ex, plan::StructuralPlan)
     ex isa Expr || return false
     head = ex.head
     head === :ref && length(ex.args) == 2 &&
-        return _is_vector_valued(ex.args[2], plan)  # a gather follows its index
+        return _literal_row_range(ex.args[2]) || _is_vector_valued(ex.args[2], plan)
     if head === :call
         isempty(ex.args) && return false
         fn = ex.args[1]
@@ -7957,6 +7974,17 @@ _mixture_canon_link(f::LikelihoodFamily) =
     f === BetaLogitFam ? LogitLink :
     throw(ContractValidationError("internal: mixture link for $f unresolved"))
 
+function _validate_mixture_weights(r::LikelihoodSpec, w, K::Int)
+    w isa AbstractVector{<:Real} ||
+        _fail(r.label, "mixture weights must be a numeric probability vector")
+    length(w) == K || _fail(r.label, "mixture has $K components but $(length(w)) weights")
+    all(isfinite, w) || _fail(r.label, "mixture weights must be finite")
+    all(>=(0), w) || _fail(r.label, "mixture weights must be nonnegative")
+    isapprox(sum(w), 1.0; atol = 1e-8) ||
+        _fail(r.label, "mixture weights must sum to 1 (got $(sum(w)))")
+    return nothing
+end
+
 # A literal component location: finite, and inside the family's
 # constrained domain (bare params/literals skip link inversion, so the
 # value itself must be valid — the SB runtime-domain mirror).
@@ -8060,15 +8088,20 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
         "length-K vector, a simplex parameter, or a complement pair)")
     if w isa Symbol
         vi = findfirst(p -> p.name === w, plan.vector_parameters)
-        vi === nothing && _fail(r.label,
-            "mixture weights $w is not a vector parameter")
-        vp = plan.vector_parameters[vi]
-        vp.family === :simplex_dirichlet || _fail(r.label,
-            "mixture weights $w must be :simplex_dirichlet, got " *
-            "$(vp.family)")
-        count = vp.args.arg1 isa AbstractVector ? length(vp.args.arg1) : vp.size
-        count === nothing || count == K || _fail(r.label,
-            "mixture weights concentration length $count disagrees with the $K components")
+        if vi === nothing
+            # A shared input vector is checked when bound, just as a literal.
+            if isbound(plan)
+                haskey(plan.columns, w) || _fail(r.label, "mixture weights $w are not bound")
+                _validate_mixture_weights(r, plan.columns[w], K)
+            end
+        else
+            vp = plan.vector_parameters[vi]
+            vp.family === :simplex_dirichlet || _fail(r.label,
+                "mixture weights $w must be :simplex_dirichlet, got $(vp.family)")
+            count = vp.args.arg1 isa AbstractVector ? length(vp.args.arg1) : vp.size
+            count === nothing || count == K || _fail(r.label,
+                "mixture weights concentration length $count disagrees with the $K components")
+        end
     elseif w isa MixtureComplementWeights
         K == 2 || _fail(r.label,
             "complement-pair mixture weights take exactly 2 components " *
@@ -8083,24 +8116,12 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
             ":unit-support (a Beta/uniform/interval parameter), got " *
             "$(plan.parameters[pi].family)")
     else
-        length(w) == K || _fail(r.label,
-            "mixture has $K components but $(length(w)) weights")
-        all(isfinite, w) || _fail(r.label,
-            "mixture weights must be finite")
-        all(>=(0), w) || _fail(r.label,
-            "mixture weights must be nonnegative")
-        total = sum(w)
-        isapprox(total, 1.0; atol = 1e-8) || _fail(r.label,
-            "mixture weights must sum to 1 (got $total)")
+        _validate_mixture_weights(r, w, K)
     end
     r.scale === nothing ||
         _fail(r.label, "a mixture response carries no top-level scale " *
             "(scales ride the per-component mixture_scales)")
-    r.weights === nothing ||
-        _fail(r.label, "mixture responses take no frequency weights (v1)")
-    r.evidence.kind === :none ||
-        _fail(r.label, "mixture responses take no censoring/truncation " *
-            "evidence (v1)")
+    _validate_evidence_structure(r, plan)
     r.range === nothing ||
         _fail(r.label, "mixture responses take no range (v1)")
     r.n_levels === nothing ||
@@ -8132,19 +8153,14 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
     r.glm_beta === nothing ||
         _fail(r.label, "a mixture response takes no glm_beta")
     if f === BinomialLogitFam
-        r.trials === nothing && _fail(r.label,
-            "mixture over Binomial requires trials (one shared Int column " *
-            "or literal — SB's identical-expression rule, structurally)")
+        (r.trials !== nothing || length(r.mixture_trials) == K) ||
+            _fail(r.label, "mixture over Binomial requires shared trials or one trials use per component")
+        isempty(r.mixture_trials) || (r.trials === nothing && length(r.mixture_trials) == K) ||
+            _fail(r.label, "Binomial mixture trials must use either a shared argument or exactly $K component arguments")
     else
-        r.trials === nothing ||
+        (r.trials === nothing && isempty(r.mixture_trials)) ||
             _fail(r.label, "only Binomial mixtures take trials")
     end
-    named = any(l -> l isa Symbol, r.mixture_locs) ||
-        any(s -> s isa Symbol || s isa ScalePredictorRef, r.mixture_scales) ||
-        r.mixture_weights isa Symbol
-    named || _fail(r.label,
-        "fully-fixed mixture (all literals) is a constant density with no " *
-        "plan — leave at least one slot free or drop the response")
     return nothing
 end
 
@@ -8162,37 +8178,14 @@ function _mi_managed_columns(plan::StructuralPlan)
     return out
 end
 
-# v1 admits Gaussian/Gamma/Beta over a linear predictor, uncomposed.
 # Runs first in the per-response loop: every special predictor shape
 # (scan/plate/simplex/joint/GLM) `continue`s past the standard checks,
 # so the mi gate must precede them all.
 function _validate_mi_structure(r::LikelihoodSpec, plan::StructuralPlan)
     r.mi_jobs === nothing && return nothing
-    (r.family === GaussianFam || r.family === GammaLogFam ||
-     r.family === BetaLogitFam) ||
-        _fail(r.label, "mi() missingness is Gaussian/Gamma/Beta only in " *
-              "v1 (got $(r.family) — SB's Univariate Continuous mirror)")
-    any(p -> p.name === r.predictor, plan.predictors) ||
-        _fail(r.label, "mi() response $(r.response) takes a linear " *
-              "predictor (scan/plate/simplex/joint/GLM locations compose " *
-              "in a later increment)")
-    pred = plan.predictors[findfirst(p -> p.name === r.predictor, plan.predictors)]
-    any(!isempty(t.columns) for t in pred.terms) ||
-        _fail(r.label, "mi() response $(r.response) takes a location " *
-              "predictor with a data column (intercept-only crosses no " *
-              "length-n anchor, so n_obs is underivable — deferred)")
-    r.weights === nothing ||
-        _fail(r.label, "mi() response $(r.response) takes no weights " *
-              "(SB's tested mi surface is uncomposed)")
-    r.evidence.kind === :none ||
-        _fail(r.label, "mi() response $(r.response) takes no " *
-              "censoring/truncation evidence (SB's tested mi surface is " *
-              "uncomposed)")
-    r.range === nothing ||
-        _fail(r.label, "mi() response $(r.response) takes no range " *
-              "(Jobs already selects the observed rows)")
-    r.trials === nothing ||
-        _fail(r.label, "mi() response $(r.response) takes no trials")
+    (r.family === MvNormalCholeskyFam || r.family === MultinomialFam ||
+        _is_glm_family(r.family)) && _fail(r.label,
+            "mi() packed rows require a scalar observation family")
     r.mi_jobs !== r.response ||
         _fail(r.label, "mi() Jobs column $(r.mi_jobs) must differ from " *
               "the response column")
@@ -8215,9 +8208,6 @@ function _validate_mi_data(r::LikelihoodSpec, plan::StructuralPlan)
         "mi() Jobs column $(r.mi_jobs) is empty (at least one observed " *
         "row is required)")
     n = _response_rows(plan, r)
-    o < n || _fail(r.label,
-        "mi() Jobs column $(r.mi_jobs) covers every row (no missing " *
-        "values — drop the mi() wrapper)")
     all(j -> 1 <= j <= n, jobs) ||
         _fail(r.label, "mi() Jobs column $(r.mi_jobs) must index " *
               "1:n_obs ($n)")
@@ -8287,29 +8277,10 @@ function _validate_responses(plan::StructuralPlan)
             _validate_unleveled_fields(r)
             continue
         end
-        # A per-cell latent location (no linear predictor — the scan-state
-        # precedent): a latent-mean observation `x_obs ~ Normal(x_true, sd)`
-        # with scalar constant `sd` (the SB `me` mirror). Gaussian-identity
-        # only; SB's observation likelihood is never weighted, truncated,
-        # or ranged, so those fields fail closed.
+        # A per-cell latent feeds the ordinary scalar-family location path.
         if _is_plate_param(plan, r.predictor)
-            (r.family === GaussianFam && r.link === IdentityLink) || _fail(
-                r.label,
-                "a plate-mean response location ($(r.predictor)) is " *
-                "Gaussian-identity only (got $(r.family)/$(r.link))",
-            )
-            r.scale isa Real || _fail(r.label,
-                "a plate-mean observation ($(r.predictor)) takes a scalar " *
-                "constant scale (SB `me` sd — got " *
-                "$(r.scale === nothing ? "nothing" : repr(r.scale)))")
-            r.weights === nothing || _fail(r.label,
-                "a plate-mean observation ($(r.predictor)) takes no weights")
-            r.evidence.kind === :none || _fail(r.label,
-                "a plate-mean observation ($(r.predictor)) takes no " *
-                "censoring/truncation evidence")
-            r.range === nothing || _fail(r.label,
-                "a plate-mean observation ($(r.predictor)) takes no range " *
-                "(the latent covers the whole column)")
+            any(t -> t[1] === r.family && t[2] === r.link, ADMITTED_TRIPLES) ||
+                _fail(r.label, "plate location family/link $(r.family)/$(r.link) has no scalar observation emitter")
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
@@ -8432,9 +8403,8 @@ function _validate_responses(plan::StructuralPlan)
         _validate_evidence_structure(r, plan)
         _validate_leveled_fields(r, plan, pred, used_predictors)
         if r.range !== nothing
-            first(r.range) == 1 || _fail(r.label,
-                "response range must start at 1 (got $(r.range)) — " *
-                "ranges cover eachindex exactly, no partial windows")
+            (r.mi_jobs === nothing ? first(r.range) == 1 : first(r.range) >= 1) ||
+                _fail(r.label, "response range must use valid one-based indices")
             length(r.range) >= 1 || _fail(r.label,
                 "response range $(r.range) is empty")
         end
@@ -8462,6 +8432,12 @@ end
 
 function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
+        if r.family === MixtureFam && r.mixture_weights isa Symbol &&
+                !any(p -> p.name === r.mixture_weights, plan.vector_parameters)
+            w = r.mixture_weights
+            haskey(plan.columns, w) || _fail(r.label, "mixture weights $w are not bound")
+            _validate_mixture_weights(r, plan.columns[w], length(r.mixture_locs))
+        end
         _validate_mi_data(r, plan)
         _validate_response_column(r, plan)
         _validate_scale_data(r, plan)
@@ -8483,9 +8459,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "response column $(r.response) missing")
     if r.range !== nothing
         n = _response_rows(plan, r)
-        last(r.range) == n || _fail(r.label,
-            "response range $(r.range) covers $(length(r.range)) cells " *
-            "but n_obs is $n — ranges cover eachindex exactly")
+        (r.mi_jobs === nothing ? last(r.range) == n : last(r.range) <= n) ||
+            _fail(r.label, "response range $(r.range) is incompatible with $n rows")
     end
     col = _vector_column(plan.columns, r.response, r.label, "response")
     if _is_bernoulli_family(r.family)
@@ -8523,10 +8498,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         # Non-negative (0 is valid: Exponential(μ) logpdf at 0 is finite):
         # the exponential kernel guards y >= 0 (SB `exponential_lpdf`
         # returns -inf at y < 0) — fail closed instead of flowing a
-        # wrong value. Bool is not a continuous support (the VonMises
-        # precedent).
-        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
-            all(>=(0), col)) ||
+        # wrong value. Bool values have their ordinary numeric meaning.
+        (eltype(col) <: Real && all(>=(0), col)) ||
             _fail(r.label, "Exponential response must be non-negative numerics")
         return nothing
     elseif r.family === WeibullFam
@@ -8537,14 +8510,13 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
             _fail(r.label, "Weibull response must be strictly positive numerics")
         return nothing
     elseif r.family === VonMisesFam
-        # Finite angles (Bool is not an angle support); a circular
+        # Finite numeric angles; a circular
         # response additionally honors the half-open principal interval
         # (SB `brm_von_mises_lpdf` returns -inf at y < lo / y >= hi) —
         # fail closed instead of flowing a wrong value. The exact
         # moving support [mu - pi, mu + pi] reads live mu, so only the
         # kernel guards it.
-        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
-            all(isfinite, col)) ||
+        (eltype(col) <: Real && all(isfinite, col)) ||
             _fail(r.label, "VonMises response must be finite numerics")
         if r.interval !== nothing
             lo, hi = r.interval
@@ -8554,12 +8526,11 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         end
         return nothing
     elseif r.family === LogNormalFam
-        # Strictly positive (Bool is not a positive-continuous support):
+        # Strictly positive:
         # the lognormal kernel guards y > 0 (Stan `lognormal_lpdf`
         # returns -inf at y ≤ 0) — fail closed instead of flowing a
         # wrong value.
-        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
-            all(>(0), col)) ||
+        (eltype(col) <: Real && all(>(0), col)) ||
             _fail(r.label, "LogNormal response must be strictly positive numerics")
         return nothing
     elseif r.family === GaussianFam
@@ -8694,10 +8665,9 @@ function _validate_mixture_response_column(r::LikelihoodSpec,
     return _fail(r.label, "mixture over $f has no column rule")
 end
 
-# Non-Bool integer column, all non-negative (Binomial/NB2 responses;
-# Bool would pass `<: Integer` and die downstream — exclude it here).
+# Integer column, all non-negative. Bool is an Integer with values zero/one.
 _is_count_column(col) =
-    eltype(col) <: Integer && eltype(col) !== Bool && all(>=(0), col)
+    eltype(col) <: Integer && all(>=(0), col)
 
 # Bernoulli spans three link variants (logit + slice-2 probit/cloglog);
 # Binomial spans those three plus prob-space (BinomialProbFam, a
@@ -9032,10 +9002,18 @@ end
 # other component family takes none.
 function _validate_mixture_trials(r::LikelihoodSpec, plan::StructuralPlan)
     if r.mixture_family === BinomialLogitFam
-        r.trials === nothing && _fail(r.label,
-            "mixture over Binomial requires trials (one shared Int column " *
-            "or literal)")
-        return _validate_trials_values(r, plan, "mixture response")
+        (r.trials !== nothing || !isempty(r.mixture_trials)) ||
+            _fail(r.label, "mixture over Binomial requires trials")
+        if isempty(r.mixture_trials)
+            return _validate_trials_values(r, plan, "mixture response")
+        end
+        for t in r.mixture_trials
+            # An observation can be outside one component's support; that
+            # component contributes zero probability to the mixture.
+            _validate_trials_values(_with(r; trials = t), plan,
+                "mixture component"; check_support = false)
+        end
+        return nothing
     end
     r.trials === nothing ||
         _fail(r.label, "only Binomial mixtures take trials")
@@ -9043,12 +9021,12 @@ function _validate_mixture_trials(r::LikelihoodSpec, plan::StructuralPlan)
 end
 
 function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
-        what::AbstractString)
+        what::AbstractString; check_support::Bool = true)
     ycol = _vector_column(plan.columns, r.response, r.label, "response")
     t = r.trials
     if t isa Int
         t >= 0 || _fail(r.label, "trials literal must be non-negative")
-        all(ycol .<= t) ||
+        !check_support || all(ycol .<= t) ||
             _fail(r.label, "$what exceeds trials $t")
         return nothing
     end
@@ -9065,7 +9043,8 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
     n = _response_rows(plan, r)
     length(col) == n ||
         _fail(r.label, "trials column length $(length(col)) ≠ n_obs $n")
-    all(ycol .<= col) ||
+    observed_trials = r.mi_jobs === nothing ? col : col[plan.columns[r.mi_jobs]]
+    !check_support || all(ycol .<= observed_trials) ||
         _fail(r.label, "$what exceeds trials in some row")
     return nothing
 end
@@ -9166,7 +9145,8 @@ function _validate_evidence_structure(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "evidence kind $(ev.kind) unknown")
     ev.kind === :none && return nothing
     (r.family === GaussianFam || r.family === PoissonLogFam ||
-        r.family === StudentTFam) ||
+        r.family === StudentTFam ||
+        (r.family === MixtureFam && r.mixture_family === GaussianFam)) ||
         _fail(r.label, "evidence wrappers apply to Gaussian/Poisson/StudentT only (slice 1)")
     if ev.kind === :interval_censored
         ev.lower === nothing ||
@@ -9182,6 +9162,11 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
     ev.kind === :none && return nothing
     lo = _bound_values(ev.lower, :lower, r, plan)
     hi = _bound_values(ev.upper, :upper, r, plan)
+    if r.mi_jobs !== nothing
+        jobs = plan.columns[r.mi_jobs]
+        lo = lo === nothing ? nothing : lo[jobs]
+        hi = hi === nothing ? nothing : hi[jobs]
+    end
     if ev.kind === :interval_censored
         resp = _vector_column(plan.columns, r.response, r.label, "response")
         all(isfinite, resp) ||
@@ -9193,7 +9178,9 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
     (lo === nothing || hi === nothing || all(lo .< hi)) ||
         _fail(r.label, "evidence requires strict lower < upper every row")
     resp = _vector_column(plan.columns, r.response, r.label, "response")
-    bad = findall(eachindex(resp)) do i
+    selected = r.mi_jobs !== nothing && r.range !== nothing ?
+        findall(j -> j in r.range, plan.columns[r.mi_jobs]) : eachindex(resp)
+    bad = filter(selected) do i
         (lo !== nothing && resp[i] < lo[i]) ||
             (hi !== nothing && resp[i] > hi[i])
     end
@@ -9986,11 +9973,8 @@ and never sets `n_obs` (see `_model_level_inputs`).
 # n_obs derivation skips mi-managed columns (packed y_obs/Jobs), bound
 # module data values and model-level data inputs: every other column
 # crosses at length n, so the first non-managed column pins n_obs
-# order-independently. All-managed (an mi response whose
-# location crosses no full-length column) fails closed — n is
-# underivable, and the structure gate already rejects that shape, so
-# this is unreachable past validation (defense in depth for direct
-# bind_data callers).
+# order-independently. A bound hand-authored mi plan may supply its full
+# extent explicitly; an unbound plan without an anchor cannot derive it.
 function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
     for (k, v) in columns
         k in managed && continue
@@ -10172,9 +10156,22 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
     end
+    # A matrix read only for a declared axis is a whole preparation input.
+    # Its row count does not become an observation count. In contrast, a
+    # grouping axis retains its existing alignment and level-code contract.
+    for p in plan.array_parameters
+        axes = filter(_is_axis_dim, p.dims)
+        isempty(axes) || push!(defs, Symbol(:_ppl_axis_input_, p.name) =>
+            Expr(:tuple, axes...))
+    end
     for p in plan.vector_parameters
         p.family === :simplex_dirichlet || continue
         push!(defs, Symbol(:_ppl_prior_input_, p.name) => p.args.arg1)
+    end
+    for r in plan.responses
+        r.family === MixtureFam && r.mixture_weights isa Symbol || continue
+        push!(defs, Symbol(:_ppl_weights_input_, r.label) =>
+            Expr(:call, GlobalRef(Base, :identity), r.mixture_weights))
     end
     _has_observation_axis(plan) || return Set{Symbol}(raw), Set{Symbol}(first.(defs))
 
@@ -10199,7 +10196,12 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         elseif f === :array_parameters
             for p in plan.array_parameters
                 delete!(free, p.name)
-                _drop_held_names!(free, p.dims)
+                _drop_held_names!(free, filter(d -> !_is_axis_dim(d), p.dims))
+            end
+        elseif f === :responses
+            for r in plan.responses
+                _drop_held_names!(free, r.family === MixtureFam ?
+                    _with(r; mixture_weights = nothing) : r)
             end
         else
             _drop_held_names!(free, getfield(plan, f))

@@ -1535,15 +1535,11 @@ docs_example = (;
 )
 """
 
-# Exact-GP latent construct (plain Julia functions, NOT @kernel sources:
-# the PPL splices these calls into generated code like any other Julia
-# call, and Enzyme differentiates the straight-line arithmetic natively).
-# Native path only: Reactant reverse through dense Cholesky gradients is
-# upstream-blocked (EnzymeMLIR), so XLA over these stays unverified until
-# that gap closes. Written traceably (broadcasts/loops, no LAPACK) for that
-# day — the potrf below is pure Julia precisely because Enzyme cannot
-# differentiate LAPACK.
+# Exact-GP covariance is an RK pair plate. Dense factorization remains a
+# numerical leaf; covariance support does not imply compiled Cholesky AD.
 export gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
+
+include("gp_covariance.jl")
 
 """
     gp_exp_quad_cov(x, sigma, rho, jitter)
@@ -1554,8 +1550,10 @@ location. `rho` is a positive scalar or, for matrix locations, one length
 scale per column. The kernel is
 `sigma^2 * exp(-sum(((x[i,:]-x[j,:])./rho).^2)/2)`.
 """
-gp_exp_quad_cov(x::AbstractVector, sigma::Real, rho::Real, jitter::Real) =
-    gp_exp_quad_cov(reshape(x, :, 1), sigma, rho, jitter)
+function gp_exp_quad_cov(x::AbstractVector, sigma::Real, rho::Real,
+        jitter::Real)
+    _GP_EXP_QUAD_COV(x, sigma, rho, jitter)
+end
 
 function gp_exp_quad_cov(x::AbstractMatrix, sigma::Real,
         rho::Union{Real,AbstractVector}, jitter::Real)
@@ -1574,9 +1572,10 @@ Euclidean distance `r = norm(x[i,:]-x[j,:])`, as in Stan's periodic
 covariance: `sigma^2 * exp(-2sin(pi*r/period)^2/rho^2)`.
 `rho` and `period` are positive scalars.
 """
-gp_periodic_cov(x::AbstractVector, sigma::Real, rho::Real,
-        period::Real, jitter::Real) =
-    gp_periodic_cov(reshape(x, :, 1), sigma, rho, period, jitter)
+function gp_periodic_cov(x::AbstractVector, sigma::Real, rho::Real,
+        period::Real, jitter::Real)
+    _GP_PERIODIC_COV(x, sigma, rho, period, jitter)
+end
 
 function gp_periodic_cov(x::AbstractMatrix, sigma::Real, rho::Real,
         period::Real, jitter::Real)

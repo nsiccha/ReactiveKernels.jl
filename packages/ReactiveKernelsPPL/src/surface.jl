@@ -861,8 +861,10 @@ function _indexed_observation_definitions(ast::Expr, data::Set{Symbol})
         if st isa Expr && _is_broadcast_sample(st)
             lhs = st.args[2]
             if lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
-                    lhs.args[1] in data && lhs.args[2] isa Symbol &&
-                    lhs.args[2] in data
+                    lhs.args[1] in data &&
+                    ((lhs.args[2] isa Symbol && lhs.args[2] in data) ||
+                     (_mentions_symbol(st.args[3], :MixtureModel) &&
+                      _literal_row_range(lhs.args[2])))
                 k = 1
                 name = Symbol(:_rkppl_observed_, lhs.args[1], :_, k)
                 while name in taken
@@ -878,6 +880,14 @@ function _indexed_observation_definitions(ast::Expr, data::Set{Symbol})
         push!(out, st)
     end
     return Expr(:block, out...)
+end
+
+function _literal_row_range(ex)
+    ex isa Expr && ex.head === :call && length(ex.args) == 3 || return false
+    fn = ex.args[1]
+    colon = fn === :(:) || (fn isa GlobalRef &&
+        getfield(fn.mod, fn.name) === getfield(Base, :(:)))
+    return colon && all(x -> x isa Integer, ex.args[2:end])
 end
 
 # Ordinary parameters may have any number of readers. Legacy
@@ -1729,6 +1739,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     end
     if head === :ref
         base = ex.args[1]
+        base in data && length(ex.args) == 2 &&
+            _literal_row_range(ex.args[2]) && return :vector
         base isa Symbol && (shape(base) === :array ||
             _model_valued(base, detmap, env, Set{Symbol}())) &&
             return _ref_shape(ex, data)
@@ -1832,6 +1844,7 @@ function _obs_axis(ex, data, detmap, memo, active, env)
             (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
                 _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
         array_base || _is_gather(ex, data, detmap, env) || return false
+        any(_literal_row_range, ex.args[2:end]) && return true
         return any(i -> _obs_axis(i, data, detmap, memo, active, env),
             ex.args[2:end])
     elseif ex.head === Symbol("'")
@@ -3813,7 +3826,7 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
                "only — `$head.(...)` is grouped-only (declare a schedule)")
     end
     fam, arity = spec
-    dargs = dist.args[2].args
+    dargs = _distribution_args(head, dist.args[2].args)
     length(dargs) == arity ||
         _sfail("$where `$head.(...)` takes exactly $arity arguments, " *
                "got $(length(dargs))")
@@ -5407,7 +5420,9 @@ end
 # Lanes are the per-index inputs: a data column read at the loop index
 # (`x[i]`), or the level codes of a column that indexes an array's levels
 # axis (`sd[s[i], :]`, `z[g[i], :]`, a per-level factor `L[s[i]]` —
-# `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Every other name
+# `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Level cells align
+# selected or different declared axes through `_ppl_level_gather` inputs.
+# Every other name
 # the cell reads (arrays, parameters, definitions) is passed whole with
 # `Ref`. Inside the cell those reads are ordinary integer indexing
 # (`sd[c, :]`, `L[:, :, c]`); RK generates the loop.
@@ -5446,12 +5461,21 @@ function _plate_column_expr(nm::Symbol, call::Expr,
             if axis !== nothing && d !== nothing && idx[1] === ivar
                 dim = length(d) == 3 && length(idx) == 1 ? d[3] : d[1]
                 _is_levels_dim(dim) || return Expr(:ref, X, map(rw, idx)...)
-                _levels_subset(dim) === Colon() || _sfail("$where reads " *
-                    "a selected level axis of $X; per-level cells currently " *
-                    "take full level axes")
                 h = dim.args[2]
-                h === axis || _sfail("$where reads $X on levels($h); " *
-                    "per-level cells currently take the same level axis")
+                if _levels_subset(dim) !== Colon() || h !== axis
+                    # Align values by their declared labels before entering
+                    # the cell. A parameter can be a view; indexing that view
+                    # at a traced lane code is not supported by Reactant.
+                    ld = length(d) == 3 && length(idx) == 1 ? 3 : 1
+                    value = lane(Expr(:call, :_ppl_level_gather, X, axis, ld),
+                        Symbol(:_ppl_pv_, X))
+                    length(d) == 1 && return value
+                    ld == 3 && return Expr(:call, :reshape, value, d[1], d[2])
+                    length(idx) == length(d) || _sfail("$where reads $X " *
+                        "on a selected or different level axis; give one " *
+                        "index per axis")
+                    return Expr(:ref, value, map(rw, idx[2:end])...)
+                end
                 # The same scalar level axis is already aligned with
                 # the plate lanes. Passing it directly also avoids an
                 # unnecessary dynamic gather from a parameter view.
@@ -6134,7 +6158,8 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
         return Expr(:call, :axes, a.args[2], a.args[3])
     end
     return _sfail("array $target axis $(repr(a)) must be a literal `1:K`, " *
-                  "`levels(g)`, or `axes(M, d)` of a matrix `M`")
+                  "`levels(g)` (optionally selected), or `axes(M, d)` " *
+                  "of a matrix `M`")
 end
 
 # Joint-response statement: `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`
@@ -7609,28 +7634,27 @@ end
 function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         predictors, pred_idx, coefuse)
     label = Symbol(lhs, "_resp")
-    weights === nothing || _sfail("response $lhs: mixture responses take " *
-        "no frequency weights (v1 — `weighted.(...)` over a mixture is a " *
-        "follow-up)")
-    evidence.kind === :none || _sfail("response $lhs: mixture responses " *
-        "take no censoring/truncation evidence (v1)")
     range === nothing || _sfail("response $lhs: mixture responses take no " *
         "range (v1 — mixtures cover the whole column)")
     args = _plain_args(call, "`MixtureModel`")
-    length(args) == 2 || _sfail("response $lhs: `MixtureModel` takes " *
+    length(args) in (1, 2) || _sfail("response $lhs: `MixtureModel` takes " *
         "`MixtureModel.(vcat.(C1, ..., CK), Ref(w))` " *
         "(per-observation component vectors + shared weights)")
-    comps, wraw = args
+    comps = args[1]
     _is_dotted_call(comps) && comps.args[1] === :vcat ||
         _sfail("response $lhs: `MixtureModel` needs per-observation " *
             "component vectors; use `MixtureModel.(vcat.(Normal.(mu1, s), " *
             "Normal.(mu2, s)), Ref(w))`, got $(repr(comps))")
-    _is_ref_call(wraw) || _sfail("response $lhs: mixture weights are " *
-        "shared as a vector — use `Ref(w)` in `MixtureModel.(..., Ref(w))`")
-    wraw = wraw.args[2]
     components = comps.args[2].args
     K = length(components)
     K >= 1 || _sfail("response $lhs: `MixtureModel` needs ≥ 1 component")
+    wraw = if length(args) == 1
+        Expr(:vect, fill(1.0 / K, K)...)
+    else
+        _is_ref_call(args[2]) || _sfail("response $lhs: mixture weights are " *
+            "shared as a vector — use `Ref(w)` in `MixtureModel.(..., Ref(w))`")
+        args[2].args[2]
+    end
     fams = LikelihoodFamily[]
     llinks = LinkFunction[]
     plinks = LinkFunction[]
@@ -7668,10 +7692,7 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
     trials = nothing
     if f === BinomialLogitFam
         t1 = trials_raw[1]
-        all(t -> isequal(t, t1), trials_raw) || _sfail("response $lhs: " *
-            "mixture Binomial components must share one identical " *
-            "trial-count expression (SB rule — share one column)")
-        trials = t1
+        trials = all(t -> isequal(t, t1), trials_raw) ? t1 : nothing
     end
     loc_uses = Union{Symbol,Real}[
         _lower_mixture_loc(lhs, k, loc, pl, wrappeds[k], ctx, predictors,
@@ -7683,13 +7704,17 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         end
         push!(scale_uses, lowered_sc)
     end
+    wraw isa Symbol && wraw ∉ ctx.data && wraw ∉ ctx.dirichlet_names &&
+        _sfail("response $lhs: mixture weights $wraw are undeclared; bind an input or state a Dirichlet prior")
     w = _lower_mixture_weights(lhs, wraw)
     prednames = Set{Symbol}(p.name for p in predictors)
     anchor = _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     return LikelihoodSpec(MixtureFam, ll, lhs, anchor, nothing, weights,
         evidence, label, trials, range; mixture_family = f,
         mixture_locs = loc_uses, mixture_scales = scale_uses,
-        mixture_weights = w)
+        mixture_weights = w,
+        mixture_trials = f === BinomialLogitFam && trials === nothing ?
+            Union{ColumnRef,Int}[trials_raw...] : Union{ColumnRef,Int}[])
 end
 
 # Dotted→call conversion for one mixture component: like
@@ -7864,9 +7889,11 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
             return _lower_location(lhs, loc, pred_link, ctx, predictors,
                 pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"))
         end
-        haskey(ctx.detmap, loc) && _sfail("response $lhs: mixture " *
-            "component $k location $loc is a scalar definition — v1 " *
-            "locations are predictors, sampled parameters, or literals")
+        if haskey(ctx.detmap, loc) && pred_link === IdentityLink
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
+                value = true)
+        end
         if loc in ctx.prior_names
             wrapped && _sfail("response $lhs: mixture component $k " *
                 "wraps the sampled parameter $loc in a link function — " *
@@ -7874,9 +7901,11 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
                 "parameters bare, constrained-scale)")
             return loc
         end
-        loc in ctx.data && _sfail("response $lhs: mixture component $k " *
-            "location is the data column $loc — wrap it in a predictor " *
-            "(`eta = a .+ b .* $loc`, or offset-only `mu = $loc`)")
+        if loc in ctx.data && pred_link === IdentityLink
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
+                value = true)
+        end
         _sfail("response $lhs: mixture component $k location $loc is not " *
                "a predictor definition, sampled parameter, or literal")
     else
@@ -7949,9 +7978,7 @@ function _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     for s in scale_uses
         s isa Symbol && return s # A data-column scale: opaque anchor, never resolved.
     end
-    _sfail("response $lhs: fully-fixed mixture (all literals) is a " *
-        "constant density with no plan — leave at least one slot free " *
-        "or drop the response")
+    return lhs
 end
 
 const _LEVELED_FAMS =
@@ -8426,18 +8453,21 @@ function _dot2call_spine_arg(lhs, f, i, a)
     elseif f === :NegativeBinomial2 && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :NegativeBinomial && i == 1
+        a isa Real && return a
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :HurdlePoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :ZeroInflatedPoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :InverseGaussian && i == 1
+        a isa Real && return a
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Exponential && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :BetaBinomial2 && i == 2
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Weibull && i == 2
+        a isa Real && return a
         return _dot2call_nested_link(lhs, a, f)
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
@@ -8609,7 +8639,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         :ZeroInflatedPoisson, :ZeroInflatedBinomial, :InverseGaussian, :Exponential,
         :BetaBinomial2, :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
         return _lower_response_base_error(lhs, rhs, fam)
-    args = _plain_args(rhs, "`$fam`")
+    args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
@@ -8661,13 +8691,13 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial` takes " *
                                     "`NegativeBinomial.(exp.(eta), p)`")
         return NegativeBinomialFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        _exp_response_location(lhs, args[1]), args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Weibull
         length(args) == 2 || _sfail("response $lhs: `Weibull` takes " *
                                     "`Weibull.(k, exp.(eta))`")
         return WeibullFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[2], :exp), args[1], nothing, nothing,
+        _exp_response_location(lhs, args[2]), args[1], nothing, nothing,
         nothing, nothing
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
@@ -8712,7 +8742,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `InverseGaussian` takes " *
                                     "`InverseGaussian.(exp.(eta), lambda)`")
         return InverseGaussianFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        _exp_response_location(lhs, args[1]), args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Exponential
         length(args) == 1 || _sfail("response $lhs: `Exponential` takes " *
@@ -8821,6 +8851,11 @@ function _lower_beta_args(lhs, args, ctx)
     length(args) == 2 ||
         _sfail("response $lhs: `Beta` takes $_BETA_MSG")
     a1, a2 = args
+    swapped = a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
+        a1.args[1] === Symbol(".*") && a1.args[2] isa Expr &&
+        a1.args[2].head === :call && length(a1.args[2].args) == 3 &&
+        a1.args[2].args[1] === Symbol(".-") && a1.args[2].args[2] == 1
+    swapped && ((a1, a2) = (a2, a1))
     a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
         a1.args[1] === Symbol(".*") ||
         _sfail("response $lhs: `Beta` first position is `mu .* kappa` " *
@@ -8843,7 +8878,7 @@ function _lower_beta_args(lhs, args, ctx)
         "response $lhs: both `Beta` positions must name the same kappa " *
         "(got $(repr(k1)) and $(repr(k2)))")
     loc = _lower_link_arg(lhs, _dot2call_nested_link(lhs, m1, :Beta), :logistic)
-    return loc, k1
+    return swapped ? Expr(:call, Symbol(".-"), loc) : loc, k1
 end
 
 function _lower_response_base_error(lhs, rhs, fam)
@@ -12176,7 +12211,7 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Normal => :normal, :Cauchy => :cauchy,
     :Exponential => :exponential, :Gamma => :gamma,
     :LogNormal => :lognormal, :Beta => :beta,
-    :InverseGamma => :inverse_gamma, :StudentT => :student_t,
+    :InverseGamma => :inverse_gamma, :StudentT => :student_t, :TDist => :student_t,
     :Laplace => :laplace, :Logistic => :logistic, :Uniform => :uniform,
     :Weibull => :weibull,
 )
@@ -12762,7 +12797,7 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
     haskey(_PARAM_FAMILIES, fam) ||
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
-               "Beta, InverseGamma, StudentT, Laplace, Logistic, Uniform, Weibull, " *
+               "Beta, InverseGamma, StudentT, TDist, Laplace, Logistic, Uniform, Weibull, " *
                "HalfNormal, HalfCauchy, Flat, " *
                "Dirichlet, LKJCovarianceFactor, truncated). If `$fam` is " *
                "meant as a submodel, define it with " *
@@ -12772,7 +12807,7 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
         _sfail("parameter $lhs: `$fam` does not take support keywords; " *
             "use `truncated($fam(args...), lo, hi)`, `HalfNormal(s)`, " *
             "or `HalfCauchy(s)` for a normalized positive prior")
-    args = _plain_args(rhs, "`$fam`")
+    args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
     vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in args]
     argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
     return SampledParameter(lhs, _PARAM_FAMILIES[fam],

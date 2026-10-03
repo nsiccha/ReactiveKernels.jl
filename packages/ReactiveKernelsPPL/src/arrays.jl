@@ -701,6 +701,11 @@ function _validate_gather_axis(plan::StructuralPlan, name::Symbol, label,
     _is_levels_dim(d) || return _validate_positional_gather(plan, name,
         label, g, _array_dim_size(plan, name, label, d))
     col = _gather_index_column(plan, name, label, g)
+    return _validate_level_gather(plan, name, label, d, g, col)
+end
+
+function _validate_level_gather(plan::StructuralPlan, name::Symbol, label,
+        d, g::Symbol, col::AbstractVector)
     lv = _array_axis_levels(plan, name, label, d.args[2])
     codes = _declared_codes(col, lv)
     any(==(0), codes) && _fail(label, "`$name[$g]` looks values of " *
@@ -897,7 +902,7 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
             packed = K * (K - 1) ÷ 2
             labels = [Symbol(p.name, ".", i) for i in 1:packed]
             push!(entries, LayoutEntry(:cholesky_corr, nothing, p.name,
-                labels, offset, packed, :lkj))
+                labels, offset, packed, :lkj, NaN, NaN, dims))
             offset += packed
         elseif p.family === :lkj_cholesky_stack
             # Level k's K(K-1)/2 vine partials are contiguous (`L.p.k`,
@@ -1080,14 +1085,86 @@ end
 
 # ── generator ────────────────────────────────────────────────────────
 
-# `L::Matrix{Float64}` assembled from the LKJ vine's lower-triangle
-# scalars (`_ppl_rl_<L>_<i>_<j>`), row-major `hvcat` (zeros above the
-# diagonal) — the value the model reads; the prior and the log-Jacobian
-# keep reading the scalars.
-function _lkj_matrix_statement(L::Symbol, K::Int)
-    elems = Any[i >= j ? _rl_name(L, i, j) : 0.0 for i in 1:K for j in 1:K]
-    rows = Expr(:tuple, ntuple(_ -> K, K)...)
-    return :($L::Matrix{Float64} = hvcat($rows, $(elems...)))
+# One triangular transform graph for every declared factor. Preparation fixes
+# K and the packed slice; neither a literal nor a data-derived K replicates
+# the body. The partials follow Stan's column-block order. Each entry retains
+# the original left-associated product (starting at z for an off-diagonal
+# entry, at 1 for a diagonal), including its floating-point operation order.
+# Inner loops have preparation-fixed bounds and lazy triangular guards. This
+# keeps nested reverse tapes statically sized without evaluating an unused
+# partial or replacing a product with a reassociated prefix recurrence.
+_lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
+_lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
+
+function _lkj_array_transform_statements(e::LayoutEntry)
+    L, K = e.name, e.dims[1]
+    z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
+    return Expr[
+        :($z::Vector{Float64} = tanh.($(block_read(e.offset, e.size)))),
+        :($L::Matrix{Float64} = let
+            out = zeros(Float64, $K, $K)
+            out[1, 1] = 1.0
+            entry_value = 0.0
+            for j in 2:$K
+                base = (j - 1) * (j - 2) ÷ 2
+                for i in 1:$(K - 1)
+                    entry_value = if i < j
+                        let v = $z[base + i]
+                            for ip in 1:$(K - 1)
+                                v = if ip < i
+                                    v * sqrt(1 - $z[base + ip]^2)
+                                else
+                                    v
+                                end
+                            end
+                            v
+                        end
+                    else
+                        0.0
+                    end
+                    out[j, i] = entry_value
+                end
+                d = 1.0
+                for ip in 1:$(K - 1)
+                    d = if ip < j
+                        d * sqrt(1 - $z[base + ip]^2)
+                    else
+                        d
+                    end
+                end
+                out[j, j] = d
+            end
+            out
+        end),
+        :($lj::Float64 = let
+            total = 0.0
+            p = 0
+            for j in 2:$K
+                for i in 1:$(K - 1)
+                    p, total = if i < j
+                        p + 1, total + ((j - i + 1) / 2) * log(1 - $z[p + 1]^2)
+                    else
+                        p, total
+                    end
+                end
+            end
+            total
+        end),
+    ]
+end
+
+# The normalization constant is preparation-only metadata. The diagonal sum
+# remains a retained recipe loop even for a conditioned, caller-owned factor.
+function _lkj_array_prior_terms(L::Symbol, K::Int, eta::Float64)
+    c = lkj_logconst(K, eta)
+    diagonal = _lkj_prior_diagonal(:(log($L[i, i])), K, :i, eta)
+    return :(let
+        total = $c
+        for i in 2:$K
+            total += $diagonal
+        end
+        total
+    end)
 end
 
 # Name of the level-code vector for gathers by column `g` on the
@@ -1106,6 +1183,33 @@ function _array_gather_rewrite(ex, plan::StructuralPlan,
     # cell body indexes by those codes and is RK's to plan.
     _is_plate_column_expr(ex) && return Expr(:do,
         _array_gather_rewrite(ex.args[1], plan, needed), ex.args[2])
+    if ex.head === :call && length(ex.args) == 4 &&
+            ex.args[1] === :_ppl_level_gather
+        name, g, ld = ex.args[2:end]
+        axs = _gather_axes(plan, name)
+        d = axs[ld]
+        lv = _array_axis_levels(plan, name, :plan, d.args[2])
+        lv = _apply_subset(lv, LevelMap(name, d.args[2], [], :levels,
+            _levels_subset(d)))
+        # These codes depend only on bound labels, not the number of cells
+        # in the graph. Omitted selected levels use the usual zero row.
+        codes = _declared_codes(_array_axis_levels(plan, name, :plan, g), lv)
+        source = name
+        if _levels_subset(d) !== Colon()
+            source = length(axs) == 1 ? :(vcat(0.0, $name)) :
+                ld == 1 ? :(vcat(zeros(1, size($name, 2)), $name)) :
+                :(cat(zeros(size($name, 1), size($name, 2), 1), $name; dims = 3))
+            codes = codes .+ 1
+        end
+        ix = Expr(:vect, codes...)
+        length(axs) == 1 && return Expr(:ref, source, ix)
+        if ld == 1
+            aligned = Expr(:ref, source, ix, :(:))
+            return :(eachcol(permutedims($aligned)))
+        end
+        aligned = Expr(:ref, source, :(:), :(:), ix)
+        return :(eachcol(reshape($aligned, size($name, 1) * size($name, 2), :)))
+    end
     if ex.head === :call && !isempty(ex.args) &&
             ex.args[1] in (:_ppl_level_indices, :_ppl_level_values)
         g = ex.args[2]
@@ -1165,17 +1269,6 @@ function _array_level_index_statements(plan::StructuralPlan,
     return stmts
 end
 
-# Value statements after the layout transforms: each LKJ factor's matrix.
-function _array_value_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    for p in plan.array_parameters
-        p.name in plan.conditioned && continue
-        p.family === :lkj_cholesky || continue
-        push!(stmts, _lkj_matrix_statement(p.name, _array_dims(plan, p)[1]))
-    end
-    return stmts
-end
-
 # Prior nodes `_ppl_prior_<name>` of the plan's array parameters.
 function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         plan::StructuralPlan, needed::Set{Tuple{Symbol,Symbol,Int}}; context = plan)
@@ -1191,7 +1284,7 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         end
         if p.family === :lkj_cholesky
             push!(stmts, :($node::Float64 =
-                $(_lkj_prior_terms(p.name, dims[1], Float64(p.args.arg1)))))
+                $(_lkj_array_prior_terms(p.name, dims[1], Float64(p.args.arg1)))))
             push!(terms, node)
             continue
         end
