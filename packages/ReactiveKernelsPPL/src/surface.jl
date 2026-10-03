@@ -1139,6 +1139,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         canonmap[nm] = _canonical_expr(rhs, data, detmap, detshape, shape_env,
             "definition `$nm = $(repr(rhs))`")
     end
+    declaration_dependencies = _declaration_dependencies(sample, plate_specs,
+        data, canonmap)
+    declaration_data = Set{Symbol}(nm for nm in declaration_dependencies
+        if haskey(canonmap, nm) && _data_only(canonmap[nm], data, canonmap))
     # Design matrices leave `det` for the plan-level table (validated
     # here; `detshape` keeps their `:matrix` shape for downstream
     # honesty, but nothing inlines or assigns them).
@@ -1161,7 +1165,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     pred_idx = Dict{Symbol,Int}()
     ctx = (; data, mod, detmap = canonmap, prior_names, coef_priors,
         ordinary_parameters,
-        detshape, shape_env,
+        detshape, shape_env, declaration_data,
         vecdefs, structural, derived_responses = derived_response_names,
         pred_idx,
         plate_names, absorbed = Set{Symbol}(),
@@ -1418,7 +1422,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # Optimizing a definition as a predictor must retain its value for
     # other consumers, including reductions, extracted leaves and the
     # retained recurrence body. Keep their definition dependencies too.
-    needed = Set{Symbol}()
+    needed = copy(declaration_dependencies)
     for a in (ctx.synth_assigns..., ctx.synth_derived...)
         union!(needed, _value_symbols(a.expr))
     end
@@ -2412,6 +2416,35 @@ function _data_only(ex, data, detmap, active::Set{Symbol} = Set{Symbol}())
         ok || return false
     end
     return true
+end
+
+# Declarations keep named dimensions, prior arguments and support bounds.
+# Follow their definitions before predictor inlining, so shared data values
+# still bind once and are consumed by name everywhere else.
+function _declaration_dependencies(sample, plate_specs, data, detmap)
+    needed = Set{Symbol}()
+    for s in sample
+        s.lhs in data && continue
+        for ex in (s.rhs, s.range, s.matrix)
+            union!(needed, _value_symbols(ex))
+        end
+        s.levels === nothing || push!(needed, first(s.levels))
+        s.dims === nothing || foreach(d -> union!(needed, _value_symbols(d)), s.dims)
+    end
+    for (_, rhs, range, _) in plate_specs, ex in (rhs, range)
+        union!(needed, _value_symbols(ex))
+    end
+    pending = collect(needed)
+    while !isempty(pending)
+        nm = pop!(pending)
+        haskey(detmap, nm) || continue
+        for dep in _value_symbols(detmap[nm])
+            dep in needed && continue
+            push!(needed, dep)
+            push!(pending, dep)
+        end
+    end
+    return needed
 end
 
 # Data columns the definitions read only as whole values — the bind-time
@@ -10714,6 +10747,7 @@ end
 function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
     ex isa Symbol || return _inline_structure_expr(ex, ctx, visited, where)
     haskey(ctx.detmap, ex) || return ex
+    ex in ctx.declaration_data && return ex
     # Summand atoms never hide in definitions: an inlined alias would
     # silently become a direct summand, bypassing the lowering screens
     # (scalar defs always inline; structural vector defs inline too).
