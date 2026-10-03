@@ -1,9 +1,8 @@
 # Owned matrix-exponential primitive with generated AD rules.
 #
 # `LinearAlgebra.exp` on a matrix cannot reverse under Enzyme
-# (`EnzymeNoDerivativeError` on its LAPACK `ccall`), which is why the PK cells
-# carry a hand-ported Pade approximant (`_pk_expm3` in `pkcells.jl`). This rule
-# is the replacement path for native execution: one pure-math `@kernel` graph
+# (`EnzymeNoDerivativeError` on its LAPACK `ccall`). This general numerical
+# primitive lives in ReactiveKernels itself: one pure-math `@kernel` graph
 # authors the primal plus its forward (JVP) and reverse (VJP) branches, and
 # `derivative_rule` generates the owned callable plus every AD-protocol adapter
 # from that graph's cuts. No hand-written rule, no rule on a foreign function
@@ -11,7 +10,7 @@
 #
 # Under Reactant the cuts trace as plain graph mathematics only once the
 # backend supports `exp` on traced arrays (no release carries that yet); until
-# then the port stays for the compiled path.
+# then compiled consumers retain that backend limitation.
 using LinearAlgebra: exp
 
 # Both derivative branches are one augmented-matrix exponential plus

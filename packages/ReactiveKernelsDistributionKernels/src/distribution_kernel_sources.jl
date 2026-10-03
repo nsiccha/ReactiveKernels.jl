@@ -35,11 +35,9 @@ const logbeta = scalar_derivative_rule(
     logbeta_graph; primal = :y, partials = (a = :dy_da, b = :dy_db),
     name = :logbeta)
 
-# The owned symmetric-eigendecomposition pair (`rk_symmetric_eigvals` /
-# `rk_symmetric_eigvecs`), the same generated-rule shape for a linear-algebra
-# primitive: reached as `DistributionKernelSources.rk_symmetric_*` (and
-# re-exported by ReactiveKernelsPPL).
-include("symmetric_eigen_rules.jl")
+# General symmetric-eigendecomposition primitives live in RK proper.
+# Preserve qualified consumer names as imports of the same owned graphs.
+using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
 
 # Owned regularized incomplete beta, I_x(a, b), over the Student-t cdf
 # slice (one shape is 1/2, the other is nu/2 with nu > 0, x in [0, 1]).

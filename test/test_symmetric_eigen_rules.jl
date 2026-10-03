@@ -5,16 +5,14 @@
 # ReactiveKernels' own extension reads them from those graphs' cuts. Ordinary
 # reverse Enzyme through `eigen(::Symmetric)` fails
 # (`EnzymeNoDerivativeError` on the LAPACK `syevr!` `ccall`), so these rules
-# are the native-execution replacement path for
-# symmetric-eigendecomposition-based densities (the posteriordb `kronecker_gp`
-# marginal likelihood); no Reactant custom rule is emitted (no release
+# are the native-execution replacement path for general eigendecomposition
+# calls; no Reactant custom rule is emitted (no release
 # carries the upstream mechanism), so no XLA assertions here by design.
 using DifferentiationInterface: AutoEnzyme, gradient
 import Enzyme
 using Enzyme: Const, Duplicated, Forward
 using LinearAlgebra: Diagonal, Symmetric, dot, eigen, qr
 using ReactiveKernels
-using ReactiveKernelsPPL
 using Test
 
 # Deterministic symmetric inputs with distinct eigenvalues: a fixed
@@ -63,11 +61,8 @@ end
         ":rk_symmetric_eigvals; inputs = (:A,), branches = forward+reverse)"
     @test sprint(show, rk_symmetric_eigvecs) == "DerivativeRule(" *
         ":rk_symmetric_eigvecs; inputs = (:A,), branches = forward+reverse)"
-    # Served by ReactiveKernels' generic adapter: this package defines no
-    # AD extension of its own.
+    # Served by ReactiveKernels' generic generated-rule adapter.
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsEnzymeExt) !== nothing
-    @test Base.get_extension(
-        ReactiveKernelsPPL, :ReactiveKernelsPPLEnzymeExt) === nothing
     for (A, _) in _SEIG_CASES
         F = eigen(Symmetric(A))
         @test rk_symmetric_eigvals(A) == F.values
@@ -79,20 +74,20 @@ end
     dA = _seig_direction(n, 1.0)
     rb = _seig_rbar(n, 1.0)
     qb = _seig_qbar(n, 1.0)
-    vprimal = prepare(ReactiveKernelsPPL.rk_symmetric_eigvals_rule;
+    vprimal = prepare(ReactiveKernels.rk_symmetric_eigvals_rule;
         have = (:A,), want = :R)
-    vfwd = prepare(ReactiveKernelsPPL.rk_symmetric_eigvals_rule;
+    vfwd = prepare(ReactiveKernels.rk_symmetric_eigvals_rule;
         have = (:A, :A_dot), want = (:R, :R_dot))
-    vrev = prepare(ReactiveKernelsPPL.rk_symmetric_eigvals_rule;
+    vrev = prepare(ReactiveKernels.rk_symmetric_eigvals_rule;
         have = (:A, :R_bar), want = :A_bar)
     @test vprimal(A) == rk_symmetric_eigvals(A)
     @test vfwd(A, dA) == forward_cut(rk_symmetric_eigvals, A, dA)
     @test vrev(A, rb) == only(reverse_cut(rk_symmetric_eigvals, Val(1), A, rb))
-    qprimal = prepare(ReactiveKernelsPPL.rk_symmetric_eigvecs_rule;
+    qprimal = prepare(ReactiveKernels.rk_symmetric_eigvecs_rule;
         have = (:A,), want = :Q)
-    qfwd = prepare(ReactiveKernelsPPL.rk_symmetric_eigvecs_rule;
+    qfwd = prepare(ReactiveKernels.rk_symmetric_eigvecs_rule;
         have = (:A, :A_dot), want = (:Q, :Q_dot))
-    qrev = prepare(ReactiveKernelsPPL.rk_symmetric_eigvecs_rule;
+    qrev = prepare(ReactiveKernels.rk_symmetric_eigvecs_rule;
         have = (:A, :Q_bar), want = :A_bar)
     @test qprimal(A) == rk_symmetric_eigvecs(A)
     @test qfwd(A, dA) == forward_cut(rk_symmetric_eigvecs, A, dA)
@@ -168,7 +163,7 @@ end
 end
 
 # A kernel using BOTH rules in a gauge-invariant loss (whitened quadratic
-# plus log-eigenvalues, the kronecker_gp shape at n = 4): `prepare_ad` with
+# plus log-eigenvalues at n = 4): `prepare_ad` with
 # `AutoEnzyme(Reverse)` differentiates it, which raw `eigen(Symmetric)`
 # cannot do.
 @kernel _seig_mini_loss(u::Vector{Float64}, y::Vector{Float64},
