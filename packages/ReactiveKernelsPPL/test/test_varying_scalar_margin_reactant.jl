@@ -14,7 +14,7 @@ end
         for (n, G) in ((7, 3), (19, 5))
             bound, built, data = _sm_build(kind, n, G)
             u = [0.2 * sin(i) for i in 1:built.layout.total]
-            oracle(w) = _sm_oracle(built, data, kind, w).posterior
+            oracle = w -> _sm_oracle(built, data, kind, w).posterior
             expected = (oracle(u), _findiff_grad(oracle, u))
             push!(recipes, length(built.spec.graph.recipes))
             push!(traces, Base.invokelatest(_pcr_measure, built, bound, u;
@@ -35,7 +35,7 @@ end
     end
     bound, built, data = _sm_build(:library, 7, 3; labels = true)
     u = [0.2 * sin(i) for i in 1:built.layout.total]
-    oracle(w) = _sm_oracle(built, data, :library, w).posterior
+    oracle = w -> _sm_oracle(built, data, :library, w).posterior
     Base.invokelatest(_pcr_measure, built, bound, u;
         expected = (oracle(u), _findiff_grad(oracle, u)),
         reference = oracle, structure_ad = true)
