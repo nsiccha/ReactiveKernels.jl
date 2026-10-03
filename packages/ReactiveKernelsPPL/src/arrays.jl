@@ -506,31 +506,33 @@ end
 
 # ── value expressions over arrays ────────────────────────────────────
 
-# True when `ex` reads an array parameter anywhere, directly or through
-# assignments computed from one.
+# True when `ex` reads an array parameter, directly or through assignments.
+# For indexed assignments, `opaque` also includes module results: a Julia
+# call may produce an array without reading a declared one.
 function _mentions_array(ex, plan::StructuralPlan,
-        seen::Set{Symbol} = Set{Symbol}())
+        seen::Set{Symbol} = Set{Symbol}(); opaque::Bool = false)
     _is_bound_array_value_call(ex) && return true
+    opaque && _contains_module_call(ex) && !_is_bound_value_call(ex) && return true
     if ex isa Symbol
         _is_array_param(plan, ex) && return true
         ex in seen && return false
         push!(seen, ex)
         i = findfirst(a -> a.name === ex, plan.assignments)
         return i !== nothing &&
-            _mentions_array(plan.assignments[i].expr, plan, seen)
+            _mentions_array(plan.assignments[i].expr, plan, seen; opaque)
     end
     ex isa Expr || return false
     _level_plate_axis(ex) === nothing || return true
     return any(a -> _mentions_array(ex.head === :tuple ?
-        _tuple_field_value(a) : a, plan, seen), ex.args)
+        _tuple_field_value(a) : a, plan, seen; opaque), ex.args)
 end
 
-# An assignment computed from array parameters (`M = (sd .* L)'`) is an
-# array value too: readable by position, and per observation along an axis
+# An assignment computed from array parameters or module calls is a
+# Julia value too: readable by position, and per observation along an axis
 # its expression carries (`b = z * (sd .* L)'` keeps `z`'s `levels(g)`
 # rows, so `b[g, 1]` reads each observation's level).
 _is_array_assignment(plan::StructuralPlan, name) =
-    name isa Symbol && any(a -> a.name === name && _mentions_array(a.expr, plan),
+    name isa Symbol && any(a -> a.name === name && _mentions_array(a.expr, plan; opaque=true),
         plan.assignments)
 
 # ── axes of array values ─────────────────────────────────────────────

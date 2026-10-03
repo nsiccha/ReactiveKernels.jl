@@ -5908,6 +5908,8 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     )
     if head === :ref
         # Indexing a model-level value, or one element of a column.
+        _collect_array_ref!(refs, ex, plan, label, bound;
+            allow_gather=false) && return nothing
         obj = ex.args[1]
         if !(bound && obj isa Symbol && haskey(plan.columns, obj))
             _collect_assignment_refs!(refs, obj, plan, label, bound)
