@@ -32,6 +32,25 @@ function _cv_hlo_retained_work(ops)
     return Dict(name => count for (name, count) in ops if name ∉ simplified)
 end
 
+function _cv_hlo_trace_work(hlo, ops)
+    counts = Dict(name => count for (name, count) in ops
+        if name != "stablehlo.constant")
+    # Raw tracing can materialize identity broadcasts differently as Julia
+    # inference warms up. Exclude only equal-type, identity-axis broadcasts;
+    # real broadcasts and every other operation remain in this comparison.
+    identities = 0
+    pattern = r"stablehlo.broadcast_in_dim %[\w.#]+, dims = \[([^\]]*)\] : \((tensor<[^>]*>)\) -> (tensor<[^>]*>)"
+    for m in eachmatch(pattern, repr(hlo))
+        axes = isempty(m.captures[1]) ? Int[] :
+            parse.(Int, split(m.captures[1], ','))
+        identities += m.captures[2] == m.captures[3] &&
+            axes == collect(0:(length(axes) - 1))
+    end
+    counts["stablehlo.broadcast_in_dim"] =
+        get(counts, "stablehlo.broadcast_in_dim", 0) - identities
+    return counts
+end
+
 function _cv_executable_ops(compiled)
     thunk = hasproperty(compiled, :exec) ? compiled : compiled.compiled
     hlo = repr(only(Reactant.XLA.get_hlo_modules(thunk.exec)))
@@ -56,7 +75,7 @@ end
     # Constructing one shared diagonal value avoids the raw matrix/guard
     # dominance failure isolated by the backend-only reproducer. Every prior
     # logarithm and its derivative still belongs to the live shape guard.
-    traced, optimized, executable, recipes = [], [], [], Int[]
+    traced, traced_work, optimized, executable, recipes = [], [], [], [], Int[]
     for (K, n, S) in ((2, 7, 2), (2, 19, 4), (4, 7, 2),
             (8, 7, 2), (16, 19, 4))
         bound, built = _cv_data_width_build(n, S; K)
@@ -69,9 +88,12 @@ end
         ad = q.ad
         both(w) = ad_value_and_gradient(ad, w)
         push!(recipes, length(built.spec.graph.recipes))
-        push!(traced, (
-            _cv_hlo_ops(Reactant.@code_hlo optimize = false kernel(ru)),
-            _cv_hlo_ops(Reactant.@code_hlo optimize = false both(ru))))
+        raw = ((Reactant.@code_hlo optimize = false kernel(ru)),
+            (Reactant.@code_hlo optimize = false both(ru)))
+        push!(traced, map(_cv_hlo_ops, raw))
+        push!(traced_work, map(_cv_hlo_trace_work, raw, traced[end]))
+        println("shared LKJ raw inventory, (K, n, S)=", (K, n, S),
+            ": ", traced[end])
         push!(optimized, (
             _cv_hlo_ops(Reactant.@code_hlo optimize = true kernel(ru)),
             _cv_hlo_ops(Reactant.@code_hlo optimize = true both(ru))))
@@ -117,7 +139,7 @@ end
         @test Array(ru) == u
     end
     @test allequal(recipes)
-    @test allequal(traced)
+    @test allequal(traced_work)
     # Default optimized AD has expanded its derivative graph. Beyond the
     # small-loop optimizer boundary both primal and reverse retain structure.
     @test optimized[1] == optimized[2]

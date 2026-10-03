@@ -1,5 +1,5 @@
 # Backend-only boundary: XLA adds reduction stages as vector lengths grow,
-# even when the optimized MLIR has one fixed reduction body.
+# even when optimized MLIR has one fixed vector-reduction expression.
 using Reactant, Enzyme, Test
 Reactant.set_default_backend("cpu")
 
