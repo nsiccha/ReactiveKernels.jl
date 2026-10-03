@@ -104,9 +104,10 @@ no stateful path replicates a body per admitted iteration. The
 Reactant [scan](scan.md) lowering retains one `while` loop for every
 iterated-sequence shape, including bound host sequences.
 
-The experimental rectangular PK path retains its loops and lazy branches but
-still fails reverse compilation. Its eager-branch and data-derived unrolling
-workarounds are not acceptable fixes. See the [scan limitations](scan.md).
+Grouped PK recurrences expose a subject plate containing retained event scans.
+Their full Reactant path currently fails at fixed-size system-matrix batching.
+Eager branches, parameter-dependent host propagation, and data-derived
+unrolling are not acceptable fixes. See the [scan limitations](scan.md).
 
 A generator reduction inside a traced body, such as a sum over the doses of a
 schedule, lowers to one retained loop when it has an `init` and iterates a

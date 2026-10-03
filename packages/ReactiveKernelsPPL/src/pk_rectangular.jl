@@ -1,175 +1,195 @@
-# Rectangular backend adapter for grouped PK cells. The host schedule becomes
-# fixed-length columns; subject boundaries and ragged read ranges are data.
-@inline _subject_value(a) = a
-@inline _subject_value(a::Union{SubjectSlice,SubjectScalar}) = a.v
-@inline _subject_mode(a) = Val(:shared)
-@inline _subject_mode(a::SubjectSlice) = Val(:slice)
-@inline _subject_mode(a::SubjectScalar) = Val(:subject)
-@inline _pk_row_arg(::Val{:shared}, a, s, j) = a
-@inline _pk_row_arg(::Val{:slice}, a, s, j) = _traced_op_read(a, j)
-@inline _pk_row_arg(::Val{:subject}, a, s, j) = _traced_op_read(a, s)
-
-# exp(A*t) for the given rows, as nine column vectors (entry k of every row's
-# column-major 3x3 result); `nothing` when no row needs one. Rows come from
-# bound schedule data, so only rows whose lazy branch is taken are evaluated.
-# The table builds outside the sequential recurrence (the exponential does not
-# depend on the state) with the StaticArrays built-in, one row at a time.
-function _pk_expm_table(modes, values, subject, rows, t)
-    isempty(rows) && return nothing
-    outs = [Any[] for _ in 1:9]
-    for j in rows
-        _, log_Vc, log_k10, log_k12, log_k21, log_ka =
-            map((mode, a) -> _pk_row_arg(mode, a, subject[j], j), modes,
-                values)
-        A = linear_pk_system_3(log_Vc + log_k10, log_Vc, log_Vc + log_k12,
-            log_Vc + log_k12 - log_k21, log_ka)
-        P = exp(A * t[j])
-        for e in 1:9
-            push!(outs[e], P[e])
-        end
+# Schedule-only rectangular storage. No parameter-dependent work runs here.
+# Zero indices are inactive slots, guarded lazily by the event recurrence.
+function _pk_subject_plan(ends, kinds; auc=false)
+    previous = 0
+    lengths = Int[]
+    reads = Int[]
+    for hi in ends
+        previous <= hi <= length(kinds) || throw(ArgumentError("invalid PK subject ends"))
+        push!(lengths, hi - previous)
+        push!(reads, count(==(LINEAR_EVENT_READ), view(kinds, previous+1:hi)))
+        previous = hi
     end
-    return outs
-end
-@inline _pk_table_smat(P, i) = SMatrix{3,3}(
-    _traced_op_read(P[1], i), _traced_op_read(P[2], i),
-    _traced_op_read(P[3], i), _traced_op_read(P[4], i),
-    _traced_op_read(P[5], i), _traced_op_read(P[6], i),
-    _traced_op_read(P[7], i), _traced_op_read(P[8], i),
-    _traced_op_read(P[9], i))
-_pk_has_auc(::typeof(linear_pk_read_locs)) = false
-_pk_has_auc(::typeof(linear_pk_read_locs_auc)) = true
-
-function _pk_rectangular(cell, ends, opcols, args, marker)
-    n = length(first(opcols))
-    isempty(ends) && throw(ArgumentError("subject-batched cell needs a subject"))
-    all(c -> length(c) == n, opcols) || throw(DimensionMismatch("PK op columns"))
-    ends[end] == n || throw(DimensionMismatch("PK subject ends and op columns"))
-    # Normalize the v1 no-bioavailability spelling before building the step.
-    fullargs = length(args) == 5 ? (SubjectSlice(zeros(n)), args...) : args
-    length(fullargs) == 6 || throw(ArgumentError("PK recurrence expects six parameters"))
-    auc = _pk_has_auc(cell)
-    subject = zeros(Int, n)
-    reset = zeros(Bool, n)
-    conc_index = zeros(Int, n)
-    auc_index = zeros(Int, n)
-    prev = 0
-    offset = 0
+    previous == length(kinds) || throw(DimensionMismatch("PK subject ends and operations"))
+    width = maximum(lengths; init=0)
+    capacity = maximum(reads; init=0)
+    indices = zeros(Int, width, length(ends))
+    slots = ones(Int, capacity, length(ends))
+    packing = Int[]
+    previous = 0
     for s in eachindex(ends)
         hi = ends[s]
-        hi > prev || throw(ArgumentError("each PK subject needs at least one op"))
-        reads = count(==(LINEAR_EVENT_READ), view(opcols[1], prev+1:hi))
-        reset[prev+1] = true
         r = 0
-        for j in prev+1:hi
-            kind = opcols[1][j]
+        for j in previous+1:hi
+            kind = kinds[j]
             kind in (LINEAR_EVENT_READ, LINEAR_EVENT_DOSE, LINEAR_EVENT_DOSE_SEGMENT) ||
                 throw(ArgumentError("unknown linear PK operation type $kind"))
-            subject[j] = s
+            indices[j - previous, s] = j
             if kind == LINEAR_EVENT_READ
                 r += 1
-                conc_index[j] = offset + r
-                auc_index[j] = offset + reads + r
+                slots[r, s] = j - previous
             end
         end
-        offset += (auc ? 2 : 1) * reads
-        prev = hi
+        offset = (s - 1) * capacity * (auc ? 2 : 1)
+        append!(packing, offset .+ (1:r))
+        auc && append!(packing, offset .+ capacity .+ (1:r))
+        previous = hi
     end
-    # The power recurrence has a static capacity, with inactive iterations
-    # frozen after each individual exponent is exhausted. This preserves the
-    # original binary-power arithmetic for unequal segment dose counts.
-    maxcount = maximum(opcols[5])
-    bits = ndigits(max(maxcount - 1, 0); base=2)
+    (; indices, slots, packing, capacity)
+end
+
+# The scalar-output scan owns its compartment and accumulated-dose carry.
+# Non-read steps emit zero; schedule-only read positions gather its buffer.
+@kernel _pk_event_values(indices, op_type, op_dt, op_amount,
+        op_interval, op_count, log_F, log_Vc, log_k10, log_k12, log_k21,
+        log_ka, exposure) = begin
+    A = linear_pk_system_3(log_Vc + log_k10, log_Vc, log_Vc + log_k12,
+        log_Vc + log_k12 - log_k21, log_ka)
+    Vc = exp(log_Vc)
+    CL = exp(log_Vc + log_k10)
+    seed = (state = SVector(0.0, 0.0, 0.0), given = zero(Vc))
+    values = scan(indices, Ref(A), Ref(Vc), Ref(CL), Ref(op_type), Ref(op_dt),
+            Ref(op_amount), Ref(op_interval), Ref(op_count), Ref(log_F),
+            Ref(exposure); init=seed) do carry, j, system, volume, clearance,
+                kinds, dts, amounts, intervals, counts, bioavailability, auc
+        advanced = if j > 0
+            state = linear_pk_propagate_3(system, carry.state, dts[j])
+            given = carry.given
+            result = if kinds[j] == LINEAR_EVENT_READ
+                value = if auc
+                    (given - sum(state)) / clearance
+                else
+                    state[2] / volume
+                end
+                ((state=state, given=given), value)
+            else
+                effective = amounts[j] * exp(bioavailability[j])
+                updated = if kinds[j] == LINEAR_EVENT_DOSE
+                    (state=linear_pk_add_dose_3(state, effective),
+                        given=given + effective)
+                else
+                    (state=linear_pk_add_regular_doses_3(system, state,
+                        effective, intervals[j], counts[j]),
+                        given=given + counts[j] * effective)
+                end
+                (updated, zero(volume))
+            end
+            result
+        else
+            (carry, zero(volume))
+        end
+        (advanced[1], advanced[2])
+    end
+    return values
+end
+
+# Both outputs use the same step graph. Two scalar scans fit the current
+# compiled scan contract; their fixed buffers are gathered before packing.
+@kernel _pk_event_scan(indices, slots, capacity, op_type, op_dt, op_amount,
+        op_interval, op_count, log_F, log_Vc, log_k10, log_k12, log_k21,
+        log_ka, auc) = begin
+    conc_mode = false
+    conc = _pk_event_values(indices, op_type, op_dt, op_amount, op_interval,
+        op_count, log_F, log_Vc, log_k10, log_k12, log_k21, log_ka, conc_mode)
+    reads = conc[slots]
+    return reads
+end
+@kernel _pk_event_scan_auc(indices, slots, capacity, op_type, op_dt, op_amount,
+        op_interval, op_count, log_F, log_Vc, log_k10, log_k12, log_k21,
+        log_ka, auc) = begin
+    conc_mode = false
+    auc_mode = true
+    conc = _pk_event_values(indices, op_type, op_dt, op_amount, op_interval,
+        op_count, log_F, log_Vc, log_k10, log_k12, log_k21, log_ka, conc_mode)
+    exposure = _pk_event_values(indices, op_type, op_dt, op_amount,
+        op_interval, op_count, log_F, log_Vc, log_k10, log_k12, log_k21,
+        log_ka, auc_mode)
+    reads = vcat(conc[slots], exposure[slots])
+    return reads
+end
+
+# Emit the same graph for generated models and the direct grouped-cell API.
+# Argument axes are positional facts: the event vector stays whole and each
+# event gathers its entry; subject values are plate operands; shared values
+# are Ref operands.
+function _pk_subject_statements(nm, auc, ends, cols, values, modes)
+    table = gensym(:pk_schedule)
+    indices, slots, packing, capacity, lanes =
+        (gensym(n) for n in (:pk_indices, :pk_slots, :pk_packing, :pk_capacity, :pk_lanes))
+    formals = [gensym(:pk_parameter) for _ in values]
+    parameters = Any[m === :subject ? a : :(Ref($a)) for (a, m) in zip(values, modes)]
+    colformals = [gensym(:pk_column) for _ in cols]
+    ix, rs, cap = gensym(:pk_events), gensym(:pk_read_slots), gensym(:pk_capacity)
+    af = gensym(:pk_auc)
+    callargs = Any[ix, rs, cap, colformals[1:5]..., formals..., af]
+    subject = gensym(:pk_subject)
+    cell = Expr(:block)
+    for i in eachindex(modes)
+        if modes[i] === :marked
+            localparam = gensym(:pk_local_parameter)
+            push!(cell.args, :($localparam = _pk_subject_parameter($(formals[i]), $subject)))
+            callargs[8 + i] = localparam
+        end
+    end
+    callee = auc ? :_pk_event_scan_auc : :_pk_event_scan
+    push!(cell.args, :($callee($(callargs...))))
+    bodyformals = Any[ix, rs, cap, colformals..., formals..., af, subject]
+    operands = Any[:(eachcol($indices)), :(eachcol($slots)), :(Ref($capacity)),
+        [:(Ref($c)) for c in cols]..., parameters..., :(Ref($auc)), :(eachindex($ends))]
+    mapped = Expr(:do, Expr(:call, :plate, operands...),
+        Expr(:->, Expr(:tuple, bodyformals...), cell))
+    Expr[
+        :($table = _pk_subject_plan($ends, $(first(cols)); auc=$auc)),
+        :($indices = $table.indices), :($slots = $table.slots),
+        :($packing = $table.packing), :($capacity = $table.capacity),
+        :($lanes = $mapped),
+        :($nm = _pk_pack_subjects($lanes, $packing)),
+    ]
+end
+
+_pk_pack_subjects(lanes, packing) = isempty(packing) ? Float64[] : vec(stack(lanes))[packing]
+_pk_pack_subjects(lanes::ReactiveKernels._TensorizedPlateBatch, packing) =
+    vec(permutedims(ReactiveKernels._tensorized_plate_materialize(lanes)))[packing]
+@inline _pk_subject_parameter(a, s) = a
+@inline _pk_subject_parameter(a::SubjectScalar, s) = _traced_op_read(a.v, s)
+
+@inline _subject_value(a) = a
+@inline _subject_value(a::Union{SubjectSlice,SubjectScalar}) = a.v
+@inline _subject_mode(a) = :shared
+@inline _subject_mode(a::SubjectSlice) = :event
+@inline _subject_mode(a::SubjectScalar) = :subject
+
+function _pk_direct_spec(auc)
+    columns = [:op_type, :op_dt, :op_amount, :op_interval, :op_count, :op_read_idx]
+    parameters = [:log_F, :log_Vc, :log_k10, :log_k12, :log_k21, :log_ka]
+    modes = (:event, :marked, :marked, :marked, :marked, :marked)
+    body = Expr(:block,
+        _pk_subject_statements(:reads, auc, :ends, columns, parameters, modes)...,
+        :(return reads))
+    signature = [(n, Any) for n in [:ends; columns; parameters]]
+    Core.eval(@__MODULE__, ReactiveKernels._kernel_expand(
+        body, signature, nothing, @__MODULE__))
+end
+const _pk_conc_spec = _pk_direct_spec(false)
+const _pk_auc_spec = _pk_direct_spec(true)
+const _pk_direct_conc = prepare(_pk_conc_spec)
+const _pk_direct_auc = prepare(_pk_auc_spec)
+_pk_direct_kernel(::typeof(linear_pk_read_locs)) = _pk_direct_conc
+_pk_direct_kernel(::typeof(linear_pk_read_locs_auc)) = _pk_direct_auc
+
+function _pk_subject_call(cell, ends, cols, args)
+    n = length(first(cols))
+    all(c -> length(c) == n, cols) || throw(DimensionMismatch("PK op columns"))
+    fullargs = length(args) == 5 ? (SubjectSlice(zeros(n)), args...) : args
+    length(fullargs) == 6 || throw(ArgumentError("PK recurrence expects six parameters"))
     modes = map(_subject_mode, fullargs)
-    step = _PKRectangularStep{auc,typeof(modes)}(modes)
+    first(modes) === :event || throw(ArgumentError("PK log_F requires an explicit event axis"))
     values = map(_subject_value, fullargs)
-    kinds, dts, intervals, counts = opcols[1], opcols[2], opcols[4], opcols[5]
-    prop_rows = [j for j in 1:n if dts[j] > 0]
-    segment_rows = [j for j in 1:n if kinds[j] == LINEAR_EVENT_DOSE_SEGMENT && counts[j] > 1]
-    prop_index = zeros(Int, n)
-    prop_index[prop_rows] = eachindex(prop_rows)
-    segment_index = zeros(Int, n)
-    segment_index[segment_rows] = eachindex(segment_rows)
-    prop = _pk_expm_table(modes, values, subject, prop_rows, dts)
-    segment = _pk_expm_table(modes, values, subject, segment_rows, intervals)
-    columns = (collect(1:n), subject, reset, conc_index, auc_index, opcols[1:5]...,
-        prop_index, segment_index)
-    init = (state=SVector(0.0, 0.0, 0.0), given=0.0, out=zeros(offset))
-    shared = (values, zeros(Int, bits), prop, segment)
-    ReactiveKernels._rectangular_fold(step, init, columns, shared, marker).out
+    length(first(values)) == n || throw(DimensionMismatch("PK log_F and operations"))
+    kernel = _pk_direct_kernel(cell)
+    kernel(ends, cols..., first(values), fullargs[2:end]...)
 end
 
-struct _PKRectangularStep{AUC,M}
-    modes::M
-end
-
-function (step::_PKRectangularStep{AUC})(carry, row, args, powcols, prop,
-        segment) where {AUC}
-    j, s, reset, ci, ai, kind, dt, amount, interval, count, pidx, sidx = row
-    log_F, log_Vc, log_k10 = map((mode, a) -> _pk_row_arg(mode, a, s, j),
-        step.modes[1:3], args[1:3])
-    log_CL = log_Vc + log_k10
-    state = map(x -> ifelse(reset, zero(x), x), carry.state)
-    given = ifelse(reset, zero(carry.given), carry.given)
-    state = ReactiveKernels._recurrence_branch(dt > 0,
-        _pk_propagate_row, (P, i, state) -> state, (prop, pidx, state))
-    context = (state, given, carry.out, ci, ai, exp(log_Vc), exp(log_CL),
-        segment, sidx, amount, log_F, ifelse(kind == LINEAR_EVENT_DOSE, 1, count), powcols)
-    ReactiveKernels._recurrence_branch(kind == LINEAR_EVENT_READ,
-        _PKRectangularRead{AUC}(), _PKRectangularDose(), context)
-end
-
-# The hoisted exp(A*dt) of this row applied to the state. Without a table no
-# row has dt > 0, so the branch calling this is never taken.
-_pk_propagate_row(P, i, state) = _pk_table_smat(P, i) * state
-_pk_propagate_row(::Nothing, i, state) = state
-
-struct _PKRectangularRead{AUC} end
-function (::_PKRectangularRead{AUC})(state, given, out, ci, ai, Vc, CL,
-        segment, si, amount, log_F, count, powcols) where {AUC}
-    out = ReactiveKernels._tensorized_setindex(out, state[2] / Vc, ci)
-    if AUC
-        out = ReactiveKernels._tensorized_setindex(out,
-            (given - (state[1] + state[2] + state[3])) / CL, ai)
-    end
-    (; state, given, out)
-end
-
-struct _PKRectangularDose end
-function (::_PKRectangularDose)(state, given, out, ci, ai, Vc, CL,
-        segment, si, amount, log_F, count, powcols)
-    effective = amount * exp(log_F)
-    first = linear_pk_add_dose_3(state, effective)
-    state = ReactiveKernels._recurrence_branch(count > 1,
-        _pk_rectangular_regular, (P, i, first, effective, count, cols) -> first,
-        (segment, si, first, effective, count, powcols))
-    (; state, given=given + count * effective, out)
-end
-
-# `count` doses at a fixed interval from the hoisted exp(A*interval) of this
-# segment row. Without a table no segment repeats, so this is never taken.
-function _pk_rectangular_regular(P, i, first, amount, count, cols)
-    S = _pk_table_smat(P, i)
-    B = SMatrix{4,4}(S[1], S[2], S[3], 0.0, S[4], S[5], S[6], 0.0,
-        S[7], S[8], S[9], 0.0, amount, 0.0, 0.0, 1.0)
-    Q = _pk_retained_power(B, count - 1, cols, amount)
-    q = Q * SVector(first[1], first[2], first[3], 1.0)
-    return SVector(q[1], q[2], q[3])
-end
-_pk_rectangular_regular(::Nothing, i, first, amount, count, cols) = first
-
-# Shared by standalone matrix powers and the grouped recurrence. The exponent
-# and matrix are loop-carried data; the bit capacity only sizes the row table.
-function _pk_retained_power(B, exponent, cols, marker)
-    R = SMatrix{4,4}(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
-    init = (; R, B, e=exponent)
-    step = (c, row) -> ReactiveKernels._recurrence_branch(c.e > 0,
-        _pk_power_step, identity, (c,))
-    ReactiveKernels._rectangular_fold(step, init, (cols,), (), marker).R
-end
-
-function _pk_power_step(c)
-    R = ReactiveKernels._recurrence_branch((c.e & 1) == 1,
-        (R, B) -> R * B, (R, B) -> R, (c.R, c.B))
-    (; R, B=c.B * c.B, e=div(c.e, 2))
-end
+# Compatibility for the old experimental diagnostic entry point. It uses the
+# ordinary plate graph, with no parameter-dependent host propagator table.
+_pk_rectangular(cell, ends, cols, args, marker) = _pk_subject_call(cell, ends, cols, args)

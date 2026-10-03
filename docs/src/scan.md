@@ -361,24 +361,34 @@ fold for traced TGI nadir assessments. Reset flags represent unequal subject
 lengths, including subjects without assessments. Its primal and reverse paths
 preserve the existing output-before-update semantics.
 
-A PK adapter is experimental and disabled for ordinary callers. It carries
-compartment amounts and a concentration/AUC buffer over a flat operation table;
-repeated-dose segments use a bounded binary-power loop. Primal parity and the
-bounded loop structure pass with CPU fusion enabled, but PK reverse
-compilation currently fails while tracing the rectangular path's StaticArrays
-matrix exponential (`TypeError: non-boolean (TracedRNumber{Bool})` in
-`StaticArrays._exp` via `_pk_expm_table`, since `f396c41e`; seen on Reactant
-0.2.289 with StaticArrays 1.9.22). The upstream Enzyme-JAX defects behind the
-original backend failure are fixed in Reactant 0.2.289+ (RK issue #13 closed,
-both standalone reproducers passing exactly). It is not a supported sampler
-path.
-The standalone CPU reproducers for the two upstream reverse defects are in
-`benchmark/joint_stan_tiled/` in the repository.
+Grouped PK calls lower to an ordinary RK subject `plate`, with an authored
+`scan` inside each cell. The named carry holds the three compartment amounts
+and accumulated bioavailable dose. Each scan writes scalar outputs into an
+explicit buffer. Concentration and AUC use two instances of the same step
+specification, then gather the subject's READ slots. Schedule-only padding and
+packing restore ragged order, including empty subjects; parameter-dependent
+system construction and propagation remain in the graph.
 
-This runtime path does not change the authored `scan` contract above. The
-rectangular fold is an internal lowering boundary, not a new public
-authoring function. Bound table shapes still specialize an executable; changing
-the bound schedule requires preparing and compiling again.
+READ, DOSE, repeated-dose, and padded arms are lazy. Same-time reads precede
+doses, each subject resets to zero, and repeated-dose propagation retains a
+binary-power loop. The event curve's axis follows its argument position, so
+its variable name does not affect slicing. Native concentration/AUC, generated
+densities, default Enzyme reverse, and warmed nonallocating queries are covered
+by synthetic independent references.
+
+Full PK Reactant compilation is currently unsupported: batching the fixed-size
+system matrix fails with a `similar(::Broadcasted, ::Type{SMatrix}, ...)`
+method error before the event scan. `test_pk_subject_plate_reactant.jl` records
+this boundary. The generic nested plate/scan path has compiled primal and
+reverse parity and a fixed backend operation inventory as both subjects and
+sequence lengths grow (`test/test_scan_plate_reactant.jl`). Those checks do
+not establish compiled PK support. Eager branches or parameter-dependent host
+precomputation are not substitutes for repairing the matrix boundary.
+
+The standalone CPU reproducers in `benchmark/joint_stan_tiled/` also retain the
+two historical upstream reverse defects, fixed in Reactant 0.2.289+; the PK
+reproducer now uses the ordinary authored graph. Bound schedule shapes still
+specialize an executable; changing the schedule requires preparing again.
 
 ## Limitations
 
