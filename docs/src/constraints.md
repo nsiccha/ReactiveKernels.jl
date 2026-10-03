@@ -244,6 +244,26 @@ and lock the one Reactant 0.2.289 lifted:
   differentiates it. A bound tuple or named tuple then crosses the
   differentiated call as one operand per array leaf. Helpers inside a
   parameter-dependent function remain the backend's limitation.
+- Native Enzyme 0.13.209 on Julia 1.10.12 also rejects an ordinary untyped
+  comprehension whose generator captures both an active array and a constant
+  floating-point array: `repro_enzyme_generator_const_array_capture.jl`
+  reproduces the failure with Enzyme only. Typed Julia IR constructs the mixed
+  closure and calls `Base.collect(::Generator)`; the rejected store is the
+  constant array pointer into that closure. This is distinct from returning
+  data through a non-inlined helper. Merely inlining the reader, replacing
+  `eachindex(idx)` with dynamic `1:length(idx)`, or using `map`/`zip` still
+  fails. Explicitly typed comprehensions, an explicit generator with a
+  call-site-inlined `collect`, and a fresh-buffer runtime loop pass ordinary
+  reverse for Float32 and Float64, including empty inputs. A typed
+  comprehension performs Julia's ordinary element conversion, so it is only
+  an equivalent control when that element type is intended. PPL's ordinary
+  and array-bearing prepared-input readers keep their authored primal and
+  remain native reverse capability gaps in `test_native_generator_capture.jl`.
+  No consumer function, activity configuration or derivative rule is replaced.
+  The original-source repair belongs in the backend compiler; related
+  [Enzyme issue #2386](https://github.com/EnzymeAD/Enzyme.jl/issues/2386)
+  tracks comprehension activity analysis. This evidence and boundary note are
+  interim tracking, not completion of that capability.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later
