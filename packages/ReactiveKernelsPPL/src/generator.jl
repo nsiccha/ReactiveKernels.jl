@@ -3369,20 +3369,26 @@ function _mvn_cholesky_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     outcomes = [r.response; r.extra_responses...]
     preds = [r.predictor; r.extra_predictors...]
     K = length(outcomes)
-    si = findfirst(p -> p.name === r.factor_scales, plan.vector_parameters)
-    ci = findfirst(p -> p.name === r.factor_corr, plan.vector_parameters)
-    (si === nothing || ci === nothing) && throw(ContractValidationError(
-        "[generator] joint response $(r.label) factor pieces unresolved " *
-        "(validate_plan links them)"))
-    sc, cr = plan.vector_parameters[si], plan.vector_parameters[ci]
-    (sc.size == K && cr.size == K) || throw(ContractValidationError(
-        "[generator] joint response $(r.label) factor sizes disagree " *
-        "with the $K outcomes (validate_plan checks this)"))
+    ap = _joint_factor_arrays(r, plan)
+    if ap === nothing
+        si = findfirst(p -> p.name === r.factor_scales, plan.vector_parameters)
+        ci = findfirst(p -> p.name === r.factor_corr, plan.vector_parameters)
+        (si === nothing || ci === nothing) && throw(ContractValidationError(
+            "[generator] joint response $(r.label) factor pieces unresolved " *
+            "(validate_plan links them)"))
+        sc, cr = plan.vector_parameters[si], plan.vector_parameters[ci]
+        (sc.size == K && cr.size == K) || throw(ContractValidationError(
+            "[generator] joint response $(r.label) factor sizes disagree " *
+            "with the $K outcomes (validate_plan checks this)"))
+    else
+        sc, cr = ap
+    end
     stmts = Expr[]
     # L[i,j] = scales[i] * L_corr[i,j] (j ≤ i), one scalar per lower entry.
     for i in 1:K, j in 1:i
-        push!(stmts, :($(_mvn_L_entry(r.label, i, j))::Float64 =
-            $(_vector_elt_name(sc.name, i)) * $(_rl_name(cr.name, i, j))))
+        scale = ap === nothing ? _vector_elt_name(sc.name, i) : :($(sc.name)[$i])
+        corr = ap === nothing ? _rl_name(cr.name, i, j) : :($(cr.name)[$i, $j])
+        push!(stmts, :($(_mvn_L_entry(r.label, i, j))::Float64 = $scale * $corr))
     end
     lps = [_lp_name(_predictor(plan, q)) for q in preds]
     inputs = Any[outcomes...; lps...]
@@ -3926,6 +3932,30 @@ function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64;
         push!(terms, _lkj_prior_diagonal(lg(i), K, i, eta))
     end
     return foldl((a, c) -> pointwise ? :($a .+ $c) : :($a + $c), terms)
+end
+
+# Live eta uses the differentiable normalizer, including at eta == 1.
+# Only the intrinsic factor width expands; stack/observation lengths are
+# reductions over arrays. loggamma's adapters come from its owned math graph.
+function _lkj_prior_terms(L::Symbol, K::Int, eta::Symbol;
+        nstack::Union{Nothing,Int} = nothing)
+    lgamma = GlobalRef(DistributionKernelSources, :loggamma)
+    constant = :($(K - 1) * $lgamma($eta + $(0.5 * (K - 1))))
+    for k in 1:(K - 1)
+        constant = :($constant - $(0.5 * k * log(pi)) -
+            $lgamma($eta + $(0.5 * (K - 1 - k))))
+    end
+    rhs = nstack === nothing ? constant : :($nstack * $constant)
+    for i in 2:K
+        diagonal = _rl_name(L, i, i)
+        term = nstack === nothing ? :(log($diagonal)) : :(sum(log.($diagonal)))
+        rhs = :($rhs + ($(K - i) + 2 * $eta - 2) * $term)
+    end
+    return :(if isfinite($eta) && $eta > 0
+        $rhs
+    else
+        -Inf
+    end)
 end
 
 function _lkj_prior_diagonal(ld, K, i, eta)

@@ -4415,6 +4415,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     # vector shape after lowering (`_validate_varying_margins`). The
     # scan never throws — the main loop below owns every rejection.
     detnames = Set{Symbol}()
+    valueaxisnames = Set{Symbol}()
     for arg in args
         arg isa Expr || continue
         st = try
@@ -4422,8 +4423,10 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         catch
             continue
         end
-        st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol &&
+        if st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             push!(detnames, st.args[1])
+            _is_levels_binding_rhs(st.args[2]) || push!(valueaxisnames, st.args[1])
+        end
     end
     for arg in args
         if arg isa LineNumberNode
@@ -4543,7 +4546,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 continue
             end
             _reject_derived_ref_lhs(st.args[2], detnames)
-            arr = _array_sample_lhs(st.args[2], bc, tilde, data, detnames)
+            arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames)
             if arr !== nothing
                 alhs, adims = arr
                 _claim!(seen, seelines, alhs, line)
@@ -5232,9 +5235,13 @@ end
 # axis (`sd[s[i], :]`, `z[g[i], :]`). Such cells cannot be vectorized by
 # broadcasting their operators; they lower as RK plates (below).
 _plate_has_array_cells(cells) = any(c -> c isa Expr && c.head === :(=) &&
-    length(c.args) == 2 && _has_colon_index(c.args[2]), cells)
+    length(c.args) == 2 &&
+    (_has_colon_index(c.args[2]) || _has_crossed_cell_index(c.args[2])), cells)
 _has_colon_index(ex) = ex isa Expr && ((ex.head === :ref &&
     any(a -> a === :(:), ex.args[2:end])) || any(_has_colon_index, ex.args))
+_has_crossed_cell_index(ex) = ex isa Expr &&
+    ((ex.head === :ref && count(a -> a isa Expr && a.head === :ref,
+        ex.args[2:end]) > 1) || any(_has_crossed_cell_index, ex.args))
 
 # A per-index plate with array-valued cells. Every cell means one
 # iteration of the Julia loop: cell locals (`F = sd[s[i], :] .* L[s[i]]`)
@@ -5553,13 +5560,20 @@ function _plate_column_expr(nm::Symbol, call::Expr,
             Expr(:call, :_ppl_level_indices, axis), Symbol(:_ppl_pi_, axis))
     level() = lane(Expr(:call, :_ppl_level_values, axis),
         Symbol(:_ppl_pl_, axis))
-    isidx(a) = indices === nothing && axis === nothing && a isa Expr && a.head === :ref && length(a.args) == 2 &&
+    iscodeidx(a) = a isa Expr && a.head === :ref && length(a.args) == 2 &&
         a.args[1] isa Symbol && a.args[1] in data && a.args[2] === ivar
-    function code(a, d)
+    isidx(a) = indices === nothing && axis === nothing && iscodeidx(a)
+    function code(a, d, X, j)
         _is_levels_dim(d) && d.args[2] isa Symbol || _sfail("$where reads " *
             "an array axis $(repr(d)) by `$(repr(a))`; per-index reads " *
             "take a `levels(g)` axis")
         col, h = a.args[1], d.args[2]
+        if d.args[1] !== :levels || _levels_subset(d) !== Colon()
+            codes = Expr(:call, :_ppl_axis_codes, col, X, j)
+            indices === nothing || (codes = Expr(:ref, codes, indices))
+            return lane(codes,
+                Symbol(:_ppl_pc_, col, :_, X, :_, j))
+        end
         codes = Expr(:call, :_ppl_codes, col, h)
         indices === nothing || (codes = Expr(:ref, codes, indices))
         return lane(codes,
@@ -5581,7 +5595,7 @@ function _plate_column_expr(nm::Symbol, call::Expr,
                 dim = length(d) == 3 && length(idx) == 1 ? d[3] : d[1]
                 _is_levels_dim(dim) || return Expr(:ref, X, map(rw, idx)...)
                 h = dim.args[2]
-                if _levels_subset(dim) !== Colon() || h !== axis
+                if dim.args[1] !== :levels || _levels_subset(dim) !== Colon() || h !== axis
                     # Align values by their declared labels before entering
                     # the cell. A parameter can be a view; indexing that view
                     # at a traced lane code is not supported by Reactant.
@@ -5606,13 +5620,22 @@ function _plate_column_expr(nm::Symbol, call::Expr,
                 return Expr(:ref, X, codevar, map(rw, idx[2:end])...)
             end
             isidx(ex) && return lane(X, Symbol(:_ppl_pv_, X))
-            indexedcode = !isempty(idx) && Meta.isexpr(idx[1], :ref, 2) &&
-                idx[1].args[1] isa Symbol && idx[1].args[1] in data && idx[1].args[2] === ivar
-            if d !== nothing && indexedcode
+            if d !== nothing && !isempty(idx) && any(iscodeidx, idx)
                 if length(d) == 3 && length(idx) == 1
-                    return Expr(:ref, X, :(:), :(:), code(idx[1], d[3]))
+                    return Expr(:ref, X, :(:), :(:), code(idx[1], d[3], X, 3))
                 end
-                return Expr(:ref, X, code(idx[1], d[1]), map(rw, idx[2:end])...)
+                base, gatherindices = X, Any[iscodeidx(a) ? a : rw(a) for a in idx]
+                for j in eachindex(idx)
+                    iscodeidx(idx[j]) || continue
+                    gatherindices[j] = code(idx[j], d[j], X, j)
+                    if _levels_subset(d[j]) !== Colon()
+                        zero = length(d) == 1 ? 0.0 :
+                            j == 1 ? :(zeros(1, size($X, 2))) : :(zeros(size($X, 1), 1))
+                        base = Expr(:call, j == 1 ? :vcat : :hcat, zero, base)
+                        gatherindices[j] = Expr(:call, :+, gatherindices[j], 1)
+                    end
+                end
+                return Expr(:ref, base, gatherindices...)
             end
         end
         return Expr(ex.head, map(rw, ex.args)...)
@@ -6134,7 +6157,8 @@ function _array_sample_lhs(lhs, bc::Bool, tilde, data::Set{Symbol},
         row_axis = _is_axis_dim(idx[1]) && idx[1].args[1] === :axes &&
             idx[1].args[3] == 1 && idx[1].args[2] !== target
         _is_literal_range(idx[1]) || _is_def_levels_call(idx[1], data,
-            detnames) || row_axis || return nothing
+            detnames) || row_axis || _is_unique_axis(idx[1]) ||
+            (idx[1] isa Symbol && idx[1] in union(data, detnames)) || return nothing
     elseif length(idx) != 2
         _sfail("array $target takes one or two axes, got $(repr(lhs))")
     end
@@ -6157,7 +6181,7 @@ function _check_definition_levels_axes(sample, det, data::Set{Symbol})
     for s in sample
         s.dims === nothing && continue
         for d in s.dims
-            d isa Expr && d.head === :call && d.args[1] === :levels &&
+            _is_levels_dim(d) &&
                 d.args[2] ∉ data || continue
             gg = d.args[2]
             _is_bind_data_definition(gg, detmap, data, Set{Symbol}()) ||
@@ -6266,6 +6290,18 @@ end
 
 function _array_axis(target::Symbol, a, data::Set{Symbol},
         detnames::Set{Symbol} = Set{Symbol}())
+    if a isa Symbol && a in union(data, detnames)
+        return Expr(:call, :_ppl_axis_values, a)
+    elseif _is_unique_axis(a)
+        call = a.head === :ref ? a.args[1] : a
+        length(call.args) == 2 && call.args[2] isa Symbol &&
+            call.args[2] in union(data, detnames) || _sfail("array $target: " *
+                "`unique` enumerates a bound data column")
+        d = Expr(:call, :unique, call.args[2])
+        a.head === :ref && push!(d.args, QuoteNode(
+            _lower_levels_subset(target, call.args[2], a.args[2])))
+        return d
+    end
     if _is_literal_range(a)
         lo, hi = a.args[2], a.args[3]
         cnt = lo === 1 ? _levels_count(hi) : nothing
@@ -6362,9 +6398,13 @@ end
 # the same `(grouping, subset)` pair carried by a `SampleStmt`, so reuse in
 # coefficient indices follows the ordinary inline lowering path.
 _is_levels_binding_rhs(rhs) =
-    _is_levels_call(rhs) ||
+    (_is_levels_call(rhs) && rhs.args[1] === :levels) ||
     rhs isa Expr && rhs.head === :ref && length(rhs.args) == 2 &&
-        _is_levels_call(rhs.args[1])
+        _is_levels_call(rhs.args[1]) && rhs.args[1].args[1] === :levels
+
+_is_unique_axis(a) = a isa Expr &&
+    ((a.head === :call && !isempty(a.args) && a.args[1] === :unique) ||
+     (a.head === :ref && length(a.args) == 2 && _is_unique_axis(a.args[1])))
 
 function _lower_levels_binding(name::Symbol, rhs, data::Set{Symbol})
     if rhs isa Expr && rhs.head === :ref && length(rhs.args) == 2
@@ -6402,6 +6442,16 @@ end
 # Returns the LevelMap subset value.
 function _lower_levels_subset(col::Symbol, gcol::Symbol, s)
     if s isa Expr && s.head === :call && !isempty(s.args) && s.args[1] === :(:)
+        if length(s.args) == 4
+            lo, step, hi = s.args[2:end]
+            all(x -> x isa Integer && !(x isa Bool), (lo, step)) &&
+                lo >= 1 && step != 0 || _sfail("coefficient $col: " *
+                "stepped subsets need a positive start and a nonzero integer step")
+            hi === :end && return (Int(lo), Int(step), :end)
+            hi isa Integer && !(hi isa Bool) || _sfail("coefficient $col: " *
+                "subset endpoint is a literal integer or `end`")
+            return collect(Int(lo):Int(step):Int(hi))
+        end
         length(s.args) == 3 || _sfail("coefficient $col: level subsets " *
                                       "are `a:b` or `a:end`, got $(repr(s))")
         lo, hi = s.args[2], s.args[3]
@@ -8426,14 +8476,22 @@ end
 function _lower_joint_response(j::JointSampleStmt, factor_names::Set{Symbol},
         ctx, predictors, pred_idx, coefuse)
     tag = "[$(join(j.outcomes, ", "))]"
-    j.factor in factor_names || _sfail(
-        "joint response $tag factor $(j.factor) must name an " *
-        "`LKJCovarianceFactor` declaration " *
-        "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` in the model)")
+    scales, corr = if j.factor in factor_names
+        _lkj_factor_names(j.factor)
+    else
+        rhs = get(ctx.detmap, j.factor, nothing)
+        rhs isa Expr && rhs.head === :call && length(rhs.args) == 3 &&
+            rhs.args[1] === :.* && all(a -> a isa Symbol &&
+                a in ctx.array_decls, rhs.args[2:end]) || _sfail(
+            "joint response $tag factor $(j.factor) must name an " *
+            "`LKJCovarianceFactor` declaration or an explicit " *
+            "`$(j.factor) = sd .* C` over a declared scale vector " *
+            "and LKJCholesky factor")
+        (rhs.args[2], rhs.args[3])
+    end
     pnames = Symbol[_lower_location(o, m, IdentityLink, ctx, predictors,
         pred_idx, coefuse; synth = Symbol(o, "_joint_", k), value = true)
         for (k, (o, m)) in enumerate(zip(j.outcomes, j.means))]
-    scales, corr = _lkj_factor_names(j.factor)
     label = Symbol(join(j.outcomes, "_") * "_resp")
     return LikelihoodSpec(MvNormalCholeskyFam, IdentityLink, j.outcomes[1],
         pnames[1], nothing, nothing, ResponseEvidence(:none, nothing, nothing),
@@ -10567,6 +10625,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     node isa Expr || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
         "sub-predictors and scalars)")
+    if node.head === :ref && _reads_array_value(node, ctx; follow = false)
+        column = _extract_column(pname, node, ctx)
+        push!(datas, column)
+        return column
+    end
     if _is_composed_map(node)
         f = node.args[1]
         _composed_map_fn(f) || return _sfail("$where maps " *
@@ -12393,6 +12456,12 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
     function hoist_call(lhs, rhs)
         rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol || return rhs
+        if rhs.args[1] === :LKJCholesky && length(rhs.args) in (3, 4)
+            # Shape and orientation are structural; only eta is a prior value.
+            eta = bind(lhs, Symbol(lhs, :_arg2), rhs.args[3])
+            eta === rhs.args[3] && return rhs
+            return Expr(:call, rhs.args[1], rhs.args[2], eta, rhs.args[4:end]...)
+        end
         if rhs.args[1] === :truncated && length(rhs.args) == 4
             inner = hoist_call(lhs, rhs.args[2])
             bounds = hoist_args(lhs, rhs.args[3:end])
@@ -12467,7 +12536,9 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
         if s.slices === :per_level
             haskey(coefuse, s.lhs) && _sfail("$(s.lhs) is a predictor " *
                 "coefficient and cannot also be an LKJCholesky factor")
-            push!(arrays, _lower_lkj_stack(s.lhs, s.dims, s.rhs))
+            p = _lower_lkj_stack(s.lhs, s.dims, s.rhs)
+            push!(arrays, p)
+            union!(syms, _value_symbols(p.args.arg1))
             continue
         end
         if s.slices !== nothing
@@ -12492,7 +12563,9 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             haskey(coefuse, s.lhs) && _sfail(
                 "$(s.lhs) is a predictor coefficient and cannot also be " *
                 "an LKJCholesky factor")
-            push!(arrays, _lower_lkj_cholesky(s.lhs, s.rhs))
+            p = _lower_lkj_cholesky(s.lhs, s.rhs)
+            push!(arrays, p)
+            union!(syms, _value_symbols(p.args.arg1))
             continue
         end
         if _is_dirichlet_call(s.rhs)
@@ -12545,19 +12618,17 @@ _is_lkj_cholesky_call(rhs) =
     rhs.args[1] === :LKJCholesky
 
 # `L ~ LKJCholesky(K, eta)` (Distributions.jl; the optional third argument
-# is `'L'` — `L` is the lower factor). `K` is a literal or `size(M, d)` of
-# a matrix `M`; `eta` a finite positive literal.
+# is `'L'` or `'U'`). `K` is a literal or `size(M, d)` of
+# a matrix `M`; `eta` is a scalar prior value.
 function _lower_lkj_cholesky(lhs, rhs)
     args = _plain_args(rhs, "`LKJCholesky`")
     (length(args) == 2 || length(args) == 3) || _sfail("parameter $lhs: " *
         "`LKJCholesky` takes (K, eta) (`$lhs ~ LKJCholesky(3, 2.0)`), got " *
         "$(length(args)) arguments")
     K, eta = args[1], args[2]
-    if length(args) == 3
-        args[3] == 'L' || _sfail("parameter $lhs: `$lhs` is the LOWER " *
-            "Cholesky factor (`LKJCholesky(K, eta)` or `LKJCholesky(K, " *
-            "eta, 'L')`), got uplo $(repr(args[3]))")
-    end
+    uplo = length(args) == 3 ? args[3] : 'L'
+    uplo in ('L', 'U') || _sfail("parameter $lhs: `LKJCholesky` uplo " *
+        "is 'L' or 'U', got $(repr(uplo))")
     dim = if K isa Integer && !(K isa Bool)
         K >= 1 || _sfail("parameter $lhs: `LKJCholesky` dimension must be " *
             "≥ 1, got $K")
@@ -12569,10 +12640,12 @@ function _lower_lkj_cholesky(lhs, rhs)
         _sfail("parameter $lhs: `LKJCholesky` dimension is a literal or " *
             "`size(M, d)` of a matrix `M`, got $(repr(K))")
     end
-    eta isa Real && !(eta isa Bool) && isfinite(eta) && eta > 0 || _sfail(
-        "parameter $lhs: LKJ shape `eta` must be a finite positive literal, " *
-        "got $(repr(eta))")
-    return ArrayParameter(lhs, :lkj_cholesky, (arg1 = Float64(eta),),
+    (eta isa Symbol || (eta isa Real && !(eta isa Bool) && isfinite(eta) &&
+        eta > 0)) || _sfail("parameter $lhs: LKJ shape `eta` must be a " *
+        "positive scalar literal or a declared value, got $(repr(eta))")
+    prior_args = (arg1 = eta isa Real ? Float64(eta) : eta,)
+    uplo === 'U' && (prior_args = merge(prior_args, (; uplo)))
+    return ArrayParameter(lhs, :lkj_cholesky, prior_args,
         Any[dim, dim], nothing, lhs)
 end
 
