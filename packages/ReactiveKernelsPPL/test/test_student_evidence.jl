@@ -60,8 +60,8 @@ end
     @test ir.evidence.kind === :interval_censored
 
     # Other families keep the fail-closed gate (new message).
-    # capability: censored evidence over HurdlePoisson (families beyond Gaussian/Student-t) (todo `0ze68k8`)
-    @test_broken (bind_data(
+    # admitted: censored evidence over HurdlePoisson (families beyond Gaussian/Student-t) (todo `0ze68k8`)
+    @test (bind_data(
         lower_rkppl(Meta.parse("""begin
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
@@ -199,9 +199,13 @@ function _stev_reactant_measure(built, bound, post_q, u)
     val, _ = sampler_value_and_gradient!(q, g, u)
     cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
     rval, rgrad = cad(Reactant.to_rarray(u))
+    ops = Dict{String,Int}()
+    for m in eachmatch(r"stablehlo\.[a-z_]+", hlo)
+        ops[m.match] = get(ops, m.match, 0) + 1
+    end
     return (; lines = count(==('\n'), hlo),
         whiles = count("stablehlo.while", hlo),
-        batches = count("enzyme.batch", hlo), native, primal, val, g,
+        batches = count("enzyme.batch", hlo), ops, native, primal, val, g,
         rval = Float64(rval), rgrad = Array(rgrad))
 end
 
@@ -223,21 +227,21 @@ end
     @test fx.primal ≈ fx.native rtol = 1e-9
     @test fx.rval ≈ fx.val rtol = 1e-9
     @test fx.rgrad ≈ fx.g rtol = 1e-7 atol = 1e-9
-    # Data-length invariance (constraints.md): more rows must not
-    # replicate the loop body. Structural op counts are exactly equal
-    # (retained CF loops, vectorized plate); raw line counts may differ
-    # by constant-dedup noise (measured: one extra deduplicated zero
-    # constant at 6 rows vs 2), so that comparison carries a tight
-    # window that still catches any replication (which would add
-    # hundreds of lines per row — an unrolled CF loop explodes the
-    # reverse past 8 GB on 3 rows).
+    # Compare the same mix of all three clamp arms at larger row counts.
+    # Omitting the interior arm removes its batch entirely during binding;
+    # that tests different branch populations rather than length invariance.
     small = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
-        :y => [0.0, 10.0], :x => [0.0, 1.0], :lo => fill(0.0, 2),
-        :hi => fill(10.0, 2)))
+        :y => repeat([0.0, 4.0, 10.0], 4), :x => collect(0.0:11.0),
+        :lo => fill(0.0, 12), :hi => fill(10.0, 12)))
     large = _stev_reactant(prog, Dict{Symbol,AbstractVector}(
-        :y => [0.0, 0.0, 4.0, 10.0, 10.0, 5.0], :x => collect(0.0:5.0),
-        :lo => fill(0.0, 6), :hi => fill(10.0, 6)))
+        :y => repeat([0.0, 4.0, 10.0], 8), :x => collect(0.0:23.0),
+        :lo => fill(0.0, 24), :hi => fill(10.0, 24)))
+    for result in (small, large)
+        @test result.primal ≈ result.native rtol=1e-9
+        @test result.rval ≈ result.val rtol=1e-9
+        @test result.rgrad ≈ result.g rtol=1e-7 atol=1e-9
+    end
     @test small.whiles == large.whiles
     @test small.batches == large.batches
-    @test abs(small.lines - large.lines) <= 2
+    @test small.ops == large.ops
 end
