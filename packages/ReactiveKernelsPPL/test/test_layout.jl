@@ -340,10 +340,10 @@ end
     @test transform_statements(one_ord) == Expr[
         :(o::AbstractVector{Float64} = view(unconstrained, 7:7))]
     @test jacobian_term(one_ord) === nothing
-    # Identity vector: one packed-slice view, no Jacobian.
+    # Identity vector: one ordinary packed slice, no Jacobian.
     ientry = LayoutEntry(:vector, nothing, :t, [:t_1, :t_2], 4, 2, :identity)
     @test transform_statements(ientry) == Expr[
-        :(t::AbstractVector{Float64} = view(unconstrained, 4:5))]
+        :(t::AbstractVector{Float64} = unconstrained[4:5])]
     @test jacobian_term(ientry) === nothing
     # Simplex: closed-form stick-breaking in four vector statements + the
     # break Jacobian (K=3 here).

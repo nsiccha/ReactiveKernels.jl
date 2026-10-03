@@ -1979,9 +1979,9 @@ end
     @test_throws ContractValidationError validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :studentt,
             (arg1 = :mu, arg2 = :tau), nothing)))
-    # `flat()` per-cell latent has no proper prior to draw a cell from.
-    # capability: a per-cell flat latent (an improper prior like the admitted scalar flat; P3) (todo `1qlbn5b`)
-    @test_broken (validate_structure(
+    # Flat is an improper density; posterior evaluation requests no prior draw.
+    # Numerical density/Jacobian/AD coverage is in test_prior_observation_audit.jl.
+    @test (validate_structure(
         _re_plan(; plate = PlateParameter(:theta, :flat, NamedTuple(), nothing))); true)
     # Wrong arity keys.
     # refused: wrong positional arity for the plate family (IR contract: positional-args pin)

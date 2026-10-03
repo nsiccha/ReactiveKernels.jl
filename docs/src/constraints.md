@@ -311,6 +311,10 @@ and lock the one Reactant 0.2.289 lifted:
   Jacobian slices before fused broadcasts. Its stick-breaking arithmetic
   is unchanged; hierarchical Dirichlet and monotonic values pass compiled
   primal, reverse and operation-count acceptance.
+- Ordinary vector cutpoints also materialize the packed range before the
+  cumulative-order validity reduction, avoiding the same traced-view
+  reindexing boundary. Their element priors and identity transform are
+  unchanged; invalid order takes a lazy `-Inf` branch.
 - Reverse compilation with an empty active array leaves `tensor.empty`,
   which Reactant 0.2.290 cannot export to XLA:
   `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its
