@@ -191,8 +191,9 @@ end
         :(dv .~ Normal.(conc, sigma)), :(conc .~ Normal.(0.0, 1.0))),
         _PL_PK_DATA; conditioned = _PL_PK_DATA)
     # capability: schedule chain that feeds no observation (unused deterministic value) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(_pl_pk_chain(
-        :(dv .~ Normal.(log_Vc, sigma))), _PL_PK_DATA; conditioned = _PL_PK_DATA); true)
+    free_chain = lower_rkppl(_pl_pk_chain(), _PL_PK_DATA; conditioned = _PL_PK_DATA)
+    @test isempty(only(free_chain.kernel_plates).obs)
+    @test isempty(free_chain.responses)
 end
 
 # --- The 99_plate_* corpus re-spellings against the forms they replace ----

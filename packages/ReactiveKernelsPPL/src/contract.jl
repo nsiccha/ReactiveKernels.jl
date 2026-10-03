@@ -140,6 +140,7 @@ univariate components, SB `MixtureModel` mirror)."""
     ZeroInflatedBinomialFam
     GammaValueFam
     WeibullValueFam
+    CauchyFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -1274,7 +1275,7 @@ admits these plus the joint families). Cell args are constrained-scale
 values (bare args skip link inversion — literals prove domains)."""
 const _KERNEL_SCALAR_FAMS = (GaussianFam, BernoulliLogitFam,
     PoissonLogFam, NegativeBinomial2Fam, GammaLogFam, BetaLogitFam,
-    StudentTFam)
+    StudentTFam, BinomialProbFam, CauchyFam)
 
 """
     KernelPlate(result, subjects, timepoints, slices, assignments, obs, collected, label;
@@ -2317,6 +2318,8 @@ const ELEMENTWISE_COMPARISONS = (:.==, :.!=, :.<, :.>, :.<=, :.>=)
 plus two-argument `logaddexp` for occupancy marginalization)."""
 const ELEMENTWISE_FNS =
     (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp)
+
+const _KERNEL_ELEMENTWISE_FNS = (ELEMENTWISE_FNS..., :logistic)
 
 """Operand count of a built-in elementwise map (`ifelse.(c, x, y)`,
 `logaddexp.(a, b)`; every other one takes one)."""
@@ -3811,8 +3814,8 @@ function _validate_panel_kernel(plan::StructuralPlan, kp::KernelPlate)
         _fail(kp.label, "panel plates take a subject count (an integer " *
               "or a dims-key name); only schedule-fed kernels derive it " *
               "from data")
-    length(kp.obs) == 1 ||
-        _fail(kp.label, "panel v1 admits exactly one in-cell observation " *
+    length(kp.obs) <= 1 ||
+        _fail(kp.label, "panel admits at most one in-cell observation " *
               "(got $(length(kp.obs)))")
     isempty(kp.lp_args) ||
         _fail(kp.label, "panel plates take no LP args (LP args are the " *
@@ -3843,9 +3846,9 @@ function _validate_panel_kernel(plan::StructuralPlan, kp::KernelPlate)
         push!(known, nm)
         push!(cell_locals, nm)
     end
-    # The single in-cell observation (Gaussian-identity v1).
-    obs = only(kp.obs)
-    _validate_kernel_obs_ref(kp, obs, params, known, false)
+    for obs in kp.obs
+        _validate_kernel_obs_ref(kp, obs, params, known, false)
+    end
     kp.collected in union(Set{Symbol}(params), cell_locals) ||
         _fail(kp.label, "collected result `$(kp.collected)` is not a cell " *
               "name (slice param or cell-local assignment)")
@@ -3992,7 +3995,7 @@ end
 function _kernel_obs_literal_domain(kp::KernelPlate, obs::KernelObs,
         slot::Symbol, v::Real)
     fam = obs.family
-    if fam === GaussianFam
+    if fam === GaussianFam || fam === CauchyFam
         # v1 message, byte-preserved.
         positive = slot === :scale
         (isfinite(v) && (!positive || v > 0)) ||
@@ -4002,7 +4005,9 @@ function _kernel_obs_literal_domain(kp::KernelPlate, obs::KernelObs,
     end
     isfinite(v) ||
         _fail(kp.label, "kernel obs $slot literal must be finite, got $v")
-    ok = if fam === BernoulliLogitFam
+    ok = if fam === BinomialProbFam
+        slot === :location ? (v isa Integer && v >= 0) : 0 <= v <= 1
+    elseif fam === BernoulliLogitFam
         0 <= v <= 1
     elseif fam === PoissonLogFam
         v >= 0
@@ -4016,7 +4021,9 @@ function _kernel_obs_literal_domain(kp::KernelPlate, obs::KernelObs,
         true
     end
     ok && return nothing
-    domain, role = if fam === BernoulliLogitFam
+    domain, role = if fam === BinomialProbFam
+        slot === :location ? ("a nonnegative integer", "n") : ("a probability in [0, 1]", "p")
+    elseif fam === BernoulliLogitFam
         "a probability in [0, 1]", "p"
     elseif fam === PoissonLogFam
         "a nonnegative mean", "mu"
@@ -4063,8 +4070,6 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
         _fail(kp.label, "schedule `$(sched.name)` reuses a raw column " *
               "($(raw)) — obs/dose/extra axes need distinct columns)")
     slices = kp.slices
-    isempty(slices) &&
-        _fail(kp.label, "kernel plate `$(kp.result)` takes at least one slice")
     cols = [c for (c, _, _) in slices]
     length(unique(cols)) == length(cols) ||
         _fail(kp.label, "duplicate slice columns $(cols)")
@@ -4125,9 +4130,6 @@ function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
         push!(known, nm)
         push!(cell_locals, nm)
     end
-    isempty(kp.obs) &&
-        _fail(kp.label, "grouped kernels take at least one in-cell " *
-              "observation")
     for obs in kp.obs
         _validate_kernel_obs_ref(kp, obs, params, known, true)
     end
@@ -4166,14 +4168,11 @@ function _collect_kernel_cell_refs!(refs, ex, kp::KernelPlate, known::Set{Symbol
             return nothing
         end
         if fn isa Symbol && fn in REDUCTION_FNS
-            # A reduction over a series is cross-timepoint (per-subject
-            # aggregation) — not flat-lowerable in panel v1 (P3 needs real
-            # per-subject loop codegen); over a cell scalar it is
-            # degenerate. Either way it does not lower in a cell.
-            return _fail(label, "reduction `$fn` does not lower in a cell " *
-                                "(series reductions are cross-timepoint — P3)")
+            length(ex.args) == 2 || _fail(label, "cell reduction `$fn` takes one value")
+            _collect_kernel_cell_refs!(refs, ex.args[2], kp, known)
+            return nothing
         end
-        if fn isa Symbol && fn in ASSIGNMENT_FNS
+        if fn isa Symbol && (fn in ASSIGNMENT_FNS || fn === :logistic)
             # Undotted arithmetic is admitted syntactically here (the
             # emitter passes scalar-context user code verbatim — Ex1's
             # `ke = CLi / Vci`); bind canonicalizes with slice-kind
@@ -4219,7 +4218,7 @@ function _collect_kernel_cell_dot!(refs, ex, kp::KernelPlate, known::Set{Symbol}
         end
         return nothing
     end
-    f in ELEMENTWISE_FNS ||
+    f in _KERNEL_ELEMENTWISE_FNS ||
         _fail(label, "dotted call `$f.(...)` is not in the panel-v1 cell " *
                      "vocabulary")
     for arg in args
@@ -4307,7 +4306,7 @@ function _canonicalize_kernel_cell(ex, kp::KernelPlate, shapes::Dict{Symbol,Symb
             derived || return (Expr(:call, fn, cargs...), shape)
             return (Expr(:call, Symbol(:., fn), cargs...), shape)
         end
-        if fn isa Symbol && fn in ELEMENTWISE_FNS
+        if fn isa Symbol && fn in _KERNEL_ELEMENTWISE_FNS
             cargs = Any[]
             shape = :scalar
             derived = false
@@ -4321,8 +4320,9 @@ function _canonicalize_kernel_cell(ex, kp::KernelPlate, shapes::Dict{Symbol,Symb
             return (Expr(:., fn, Expr(:tuple, cargs...)), shape)
         end
         if fn isa Symbol && fn in REDUCTION_FNS
-            return _fail(label, "reduction `$fn` does not lower in a cell " *
-                                "(series reductions are cross-timepoint — P3)")
+            length(ex.args) == 2 || _fail(label, "cell reduction `$fn` takes one value")
+            arg, _ = _canonicalize_kernel_cell(ex.args[2], kp, shapes)
+            return (Expr(:call, fn, arg), :scalar)
         end
         return _fail(label, "call `$fn` is not in the panel-v1 cell vocabulary")
     end
@@ -4332,7 +4332,7 @@ function _canonicalize_kernel_cell(ex, kp::KernelPlate, shapes::Dict{Symbol,Symb
             _fail(label, "field access does not lower in a cell " *
                          "(dotted calls take `f.(...)`)")
         f = ex.args[1]
-        (f === :ifelse || f in ELEMENTWISE_FNS) ||
+        (f === :ifelse || f in _KERNEL_ELEMENTWISE_FNS) ||
             _fail(label, "dotted call `$f.(...)` is not in the panel-v1 " *
                          "cell vocabulary")
         f === :ifelse &&
@@ -4796,6 +4796,7 @@ function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
     _validate_grouped_gather_maps(kp, shapes, plan.columns,
         built.n_reads_total)
     _validate_tgi_axis_order(kp, sched, plan.columns)
+    _validate_kernel_binomial_trials(kp, plan)
     return nothing
 end
 
@@ -4809,6 +4810,7 @@ end
 function _kernel_plate_nlanes(kp::KernelPlate, columns::AbstractDict{Symbol})
     _is_grouped_kernel(kp) ||
         return _kernel_flat_length(kp.subjects, kp.timepoints)
+    isempty(kp.obs) && return length(columns[only(kp.schedules).obs_subj])
     rcol0 = only(c for (c, p, _) in kp.slices if p === first(kp.obs).response)
     return length(columns[rcol0])
 end
@@ -4886,7 +4888,7 @@ function _validate_panel_kernel_data(plan::StructuralPlan, kp::KernelPlate)
             length(expv) == flat ||
                 _fail(kp.label, "expansion `$exp` has length " *
                       "$(length(expv)), want flat $flat")
-            expv == repeat(Vector{Float64}(colv); inner = T) ||
+            expv == repeat(colv; inner = T) ||
                 _fail(kp.label, "expansion `$exp` is not the flat " *
                       "T-block repeat of `$col`")
         end
@@ -4896,22 +4898,46 @@ function _validate_panel_kernel_data(plan::StructuralPlan, kp::KernelPlate)
         si = findfirst(s -> s[2] === obs.response, kp.slices)
         kind = kp.slices[si][3]
         rcol = kp.slices[si][1]
-        if (obs.family === PoissonLogFam ||
-                obs.family === NegativeBinomial2Fam) &&
-                kind === :scalar && T !== nothing
-            _fail(kp.label, (obs.family === PoissonLogFam ? "Poisson" :
-                  "NB2") * " in-cell response `$(obs.response)` rides a " *
-                  "scalar slice (one count per subject over T=$T " *
-                  "timepoints) — the count endpoints take Int lanes, but " *
-                  "scalar expansions are Float64: bind per-timepoint " *
-                  "counts as a vector slice (length n_sub*T), or drop T " *
-                  "for an all-scalar plate")
-        end
         colv = _vector_column(plan.columns, rcol, kp.label, "obs response")
         _validate_kernel_obs_column(kp, obs, rcol, colv)
         flat = (kind === :scalar && T !== nothing) ?
             _kexp_name(kp.result, rcol) : rcol
         _validate_kernel_bool_twin(kp, obs, flat, plan)
+    end
+    _validate_kernel_binomial_trials(kp, plan)
+    return nothing
+end
+
+function _validate_kernel_binomial_trials(kp::KernelPlate, plan::StructuralPlan)
+    any(o -> o.family === BinomialProbFam, kp.obs) || return nothing
+    integers = Set{Symbol}()
+    for (column, param, _) in kp.slices
+        eltype(plan.columns[column]) <: Integer && push!(integers, param)
+    end
+    function integer_value(ex)
+        ex isa Integer && return true
+        ex isa Symbol && return ex in integers
+        ex isa Expr || return false
+        ex.head === :call && !isempty(ex.args) || return false
+        fn = ex.args[1]
+        fn === :length && return true
+        fn in (:+, :-, :*, :%, :.+, :.-, :.*, :.% , :sum, :minimum, :maximum) &&
+            return all(integer_value, ex.args[2:end])
+        return false
+    end
+    for (name, ex) in kp.assignments
+        integer_value(ex) && push!(integers, name)
+    end
+    for obs in kp.obs
+        obs.family === BinomialProbFam || continue
+        integer_value(obs.location) || _fail(kp.label,
+            "Binomial trials must be integer data or an integer-valued cell expression")
+        if obs.location isa Symbol
+            index = findfirst(s -> s[2] === obs.location, kp.slices)
+            index === nothing && continue
+            raw = plan.columns[kp.slices[index][1]]
+            all(>=(0), raw) || _fail(kp.label, "Binomial trials must be nonnegative")
+        end
     end
     return nothing
 end
@@ -4949,6 +4975,11 @@ function _validate_kernel_obs_column(kp::KernelPlate, obs::KernelObs,
             (eltype(colv) <: Integer && all(x -> x == 0 || x == 1, colv))) ||
             _fail(kp.label, "Bernoulli in-cell response `$col` must be " *
                   "Bool or 0/1 integers")
+    elseif fam === BinomialProbFam
+        _is_count_column(colv) ||
+            _fail(kp.label, "Binomial in-cell response `$col` must be non-negative integers")
+        obs.location isa Number && any(>(obs.location), colv) &&
+            _fail(kp.label, "Binomial in-cell response `$col` exceeds its trials")
     elseif fam === PoissonLogFam || fam === NegativeBinomial2Fam
         _is_count_column(colv) ||
             _fail(kp.label, (fam === PoissonLogFam ? "Poisson" : "NB2") *
@@ -9914,7 +9945,7 @@ function _resolve_panel_kernel!(kp::KernelPlate,
             eltype(colv) <: Real ||
                 _fail(kp.label, "slice column `$col` must be numeric, " *
                       "got $(eltype(colv))")
-            columns[exp] = repeat(Vector{Float64}(colv); inner = T)
+            columns[exp] = repeat(colv; inner = T)
         end
     end
     for obs in kp.obs

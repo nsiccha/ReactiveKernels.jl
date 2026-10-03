@@ -1297,14 +1297,32 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
     return stmts
 end
 
-# Panel-kernel likelihood (flat codegen): panel-v1 cell bodies are
-# elementwise, so the subject map dissolves into flat vector ops over the
-# `n_sub*T` block (numerically identical to a per-subject loop for the
-# admitted subset): slice params rewrite to flat column refs (scalar
-# slices to their bind-time T-block expansions), cell assignments emit as
-# flat statements, and the single Gaussian obs lowers as a flat plate
-# reusing the plate-sum machinery. The collected name aliases its flat
-# value (future generated quantities read it).
+# Panel likelihoods use flat T-blocked arrays for elementwise operations
+# and T-by-subject frames for reductions. Scalar slices repeat per subject;
+# collected scalars return one entry per subject. The optional observation
+# uses the scalar-family plate-sum machinery.
+_panel_frame(x::Number, T::Int, subjects::Int) = fill(x, T, subjects)
+_panel_frame(x::AbstractVector, T::Int, subjects::Int) = reshape(x, T, subjects)
+_panel_subject_values(x::Number, T::Int, subjects::Int) = fill(x, subjects)
+_panel_subject_values(x::AbstractVector, T::Int, subjects::Int) = x[1:T:end]
+
+function _rewrite_panel_value(ex, kp::KernelPlate, flatmap, shapes)
+    ex isa Expr || return _rewrite_kernel_refs(ex, flatmap)
+    if ex.head === :call && !isempty(ex.args) && ex.args[1] in REDUCTION_FNS
+        fn, arg = ex.args
+        _, kind = _canonicalize_kernel_cell(arg, kp, shapes)
+        value = _rewrite_panel_value(arg, kp, flatmap, shapes)
+        T = something(kp.timepoints, 1)
+        frame = Expr(:call, GlobalRef(@__MODULE__, :_panel_frame), value, T, kp.subjects)
+        kind === :scalar && (frame = :($frame[1:1, :]))
+        reduced = fn === :length ? :(fill(size($frame, 1), 1, $(kp.subjects))) :
+            Expr(:call, fn, Expr(:parameters, Expr(:kw, :dims, 1)), frame)
+        return :(repeat(vec($reduced); inner=$T))
+    end
+    return _rewrite_kernel_refs(Expr(ex.head,
+        (_rewrite_panel_value(a, kp, flatmap, shapes) for a in ex.args)...), flatmap)
+end
+
 function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
     isbound(plan) ||
         throw(ContractValidationError("[generator] kernel plates lower " *
@@ -1314,22 +1332,28 @@ function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwi
               "`$(kp.result)` subjects unresolved (bind_data with dims first)"))
     flatmap = _kernel_flatmap(kp)
     stmts = Expr[]
-    for (nm, ex) in _canonicalize_kernel_assignments(kp)
-        push!(stmts, :($nm = $(_rewrite_kernel_refs(ex, flatmap))))
+    shapes = _kernel_cell_shapes(kp)
+    for (nm, ex) in kp.assignments
+        canon, kind = _canonicalize_kernel_cell(ex, kp, shapes)
+        push!(stmts, :($nm = $(_rewrite_panel_value(canon, kp, flatmap, shapes))))
+        shapes[nm] = kind
     end
-    obs = only(kp.obs)
-    obs.family in _KERNEL_SCALAR_FAMS ||
-        throw(ContractValidationError("[generator] kernel plate " *
-              "`$(kp.result)` obs family $(obs.family) has no panel " *
-              "emitter (admitted: Normal, Bernoulli, Poisson, " *
-              "NegativeBinomial2, Gamma, Beta, StudentT)"))
     klabel = Symbol(:kernel_, kp.result)
-    rcol = _kernel_obs_rcol(kp, obs, flatmap[obs.response], plan)
-    append!(stmts, _kernel_scalar_obs_stmts(obs, rcol,
-        flatmap, plan, klabel, _pw_name(klabel), _lik_name(klabel)))
-    col = only(c for (c, p, _) in kp.slices if p === obs.response)
-    push!(pointwise, col => _pw_name(klabel))
+    if isempty(kp.obs)
+        push!(stmts, :($(_lik_name(klabel))::Float64 = 0.0))
+    else
+        obs = only(kp.obs)
+        rcol = _kernel_obs_rcol(kp, obs, flatmap[obs.response], plan)
+        append!(stmts, _kernel_scalar_obs_stmts(obs, rcol,
+            flatmap, plan, klabel, _pw_name(klabel), _lik_name(klabel)))
+        col = only(c for (c, p, _) in kp.slices if p === obs.response)
+        push!(pointwise, col => _pw_name(klabel))
+    end
     collected = haskey(flatmap, kp.collected) ? flatmap[kp.collected] : kp.collected
+    if get(shapes, kp.collected, :vector) === :scalar
+        T = something(kp.timepoints, 1)
+        collected = Expr(:call, GlobalRef(@__MODULE__, :_panel_subject_values), collected, T, kp.subjects)
+    end
     collected === kp.result ||
         push!(stmts, :($(kp.result) = $collected))
     return stmts, _lik_name(klabel)
@@ -1359,6 +1383,17 @@ function _kernel_scalar_obs_stmts(obs::KernelObs, rcol::Symbol,
         locv = _thread_ref!(inputs, loc)
         sref = _thread_ref!(inputs, scale)
         :(normal($locv, $sref).logpdf($rv))
+    elseif fam === CauchyFam
+        locv = _thread_ref!(inputs, loc)
+        sref = _thread_ref!(inputs, scale)
+        :(cauchy($locv, $sref).logpdf($rv))
+    elseif fam === BinomialProbFam
+        counts = Symbol(:_ppl_counts_, label)
+        push!(pre, :($counts = Int.($rcol)))
+        inputs[1] = counts
+        nv = _thread_ref!(inputs, loc, true)
+        pv = _thread_ref!(inputs, scale)
+        :(binomial(Int($nv), $pv).logpdf($rv))
     elseif fam === BernoulliLogitFam
         pv = _thread_ref!(inputs, loc)
         :(bernoulli($pv).logpdf($rv))
@@ -1681,6 +1716,13 @@ _kernel_obs_ref(ref, flatmap::Dict{Symbol,Symbol}) =
 function _rewrite_kernel_refs(ex, flatmap::Dict{Symbol,Symbol})
     ex isa Symbol && return get(flatmap, ex, ex)
     ex isa Expr || return ex
+    if ex.head === :call && !isempty(ex.args) && ex.args[1] === :logistic
+        return Expr(:call, :_ppl_logistic,
+            (_rewrite_kernel_refs(a, flatmap) for a in ex.args[2:end])...)
+    elseif ex.head === :. && length(ex.args) == 2 && ex.args[1] === :logistic &&
+            ex.args[2] isa Expr && ex.args[2].head === :tuple
+        return Expr(:., :_ppl_logistic, _rewrite_kernel_refs(ex.args[2], flatmap))
+    end
     return Expr(ex.head, (_rewrite_kernel_refs(a, flatmap) for a in ex.args)...)
 end
 

@@ -2474,7 +2474,7 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
         if st isa Expr && st.head === :macrocall &&
                 st.args[1] === Symbol("@plate")
-            loop = st.args[3]
+            loop = st.args[end]
             ivar = loop.args[1].args[1]
             _all_symbols!(out, loop.args[1].args[2])
             for c in loop.args[2].args
@@ -3587,9 +3587,8 @@ end
 
 # Panel-kernel plate statement:
 #   `result ~ plate(cols...; subjects=N) do slices... <cell> end`
-# The cell is a REAL subgraph (assignments + exactly one dotted `.~`
-# observation + a trailing collected name) — NOT desugared to flat
-# top-level statements. `subjects` is an integer literal or a dims-key
+# The cell carries assignments, an optional dotted `.~` observation and
+# a trailing collected name. `subjects` is an integer literal or a dims-key
 # name resolved at bind; slice columns must be bound data.
 function _is_kernel_plate_stmt(st::Expr)
     (_is_sample(st) || _is_broadcast_sample(st)) || return false
@@ -3676,13 +3675,14 @@ function _lower_kernel_plate(st::Expr, line::Int, data::Set{Symbol},
                "$(length(cols)) slice columns (one param per column)")
     body isa Expr && body.head === :block ||
         _sfail("$where cell must be a `begin ... end`-style block")
-    # Cell: assignments + exactly one `.~` + trailing collected name.
+    # Cell: assignments, an optional `.~`, and a trailing collected name.
     assignments = Pair{Symbol,Any}[]
     obs_stmt = nothing
     collected = nothing
     cell = Any[s for s in body.args if !(s isa LineNumberNode)]
-    isempty(cell) && _sfail("$where cell is empty (need assignments, " *
-                            "one `.~` observation, and a collected name)")
+    isempty(cell) && _sfail("$where cell is empty (need a collected name)")
+    taken = union(data, seen, Set{Symbol}(params),
+        Set{Symbol}(s.args[1] for s in cell if s isa Expr && s.head === :(=)))
     for (k, s) in enumerate(cell)
         last_stmt = k == length(cell)
         if s isa Symbol
@@ -3702,21 +3702,18 @@ function _lower_kernel_plate(st::Expr, line::Int, data::Set{Symbol},
                        "vectors is rejected per the explicit-dots ruling")
             obs_stmt !== nothing &&
                 _sfail("$where cell has more than one `.~` observation " *
-                       "(panel v1 admits exactly one)")
-            obs_stmt = s
+                       "(panel admits at most one)")
+            obs_stmt = _hoist_kernel_obs_args!(assignments, s, taken, where)
         else
-            _sfail("$where cell statements are `name = ...`, one " *
+            _sfail("$where cell statements are `name = ...`, an optional " *
                    "`yy .~ Normal.(mu, sigma)`, and a trailing collected " *
                    "name — got $(repr(s))")
         end
     end
-    obs_stmt === nothing &&
-        _sfail("$where cell has no `.~` observation (panel v1 needs " *
-               "exactly one in-cell likelihood)")
     collected === nothing &&
         _sfail("$where cell must end with a collected result name (a " *
                "bare cell name)")
-    obs = _lower_kernel_obs(obs_stmt, params, where)
+    obs = obs_stmt === nothing ? KernelObs[] : _lower_kernel_obs(obs_stmt, params, where)
     local_names = union(Set{Symbol}(params),
         Set{Symbol}(nm for (nm, _) in assignments))
     collected in local_names ||
@@ -3746,6 +3743,8 @@ end
 # admits the joint families too.
 const _KERNEL_OBS_FAMILIES = Dict{Symbol,Tuple{Any,Int}}(
     :Normal => (GaussianFam, 2),
+    :Cauchy => (CauchyFam, 2),
+    :Binomial => (BinomialProbFam, 2),
     :Bernoulli => (BernoulliLogitFam, 1),
     :Poisson => (PoissonLogFam, 1),
     :NegativeBinomial2 => (NegativeBinomial2Fam, 2),
@@ -3760,7 +3759,7 @@ const _KERNEL_OBS_FAMILIES = Dict{Symbol,Tuple{Any,Int}}(
 # Scalar response-space heads a panel cell admits (v2; the grouped
 # joint heads stay grouped-only — they need a schedule).
 const _PANEL_OBS_HEADS = (:Normal, :Bernoulli, :Poisson,
-    :NegativeBinomial2, :Gamma, :Beta, :StudentT)
+    :NegativeBinomial2, :Gamma, :Beta, :StudentT, :Binomial, :Cauchy)
 
 # Fused link-space heads rejected in cells (response-space node — the
 # link inverts via a pre-assignment, the julianic delta): head => the
@@ -3771,9 +3770,8 @@ const _KERNEL_FUSED_HEADS = Dict{Symbol,String}(
     :BernoulliProbit => "probit link (not admitted in cells)",
     :BernoulliCloglog => "cloglog link (not admitted in cells)")
 
-# Binomial heads (sequenced follow-up — the obs node has no trials
-# slot; the mixture precedent threads trials separately).
-const _KERNEL_BINOMIAL_HEADS = (:Binomial, :BinomialLogit,
+# Fused Binomial heads require an explicit response-space probability.
+const _KERNEL_BINOMIAL_HEADS = (:BinomialLogit,
     :BinomialProbit, :BinomialCloglog)
 
 # Admitted-head list for the in-cell obs errors (hardcoded order —
@@ -3782,22 +3780,43 @@ const _KERNEL_BINOMIAL_HEADS = (:Binomial, :BinomialLogit,
 _kernel_admitted_msg(grouped::Bool) =
     "`Normal.(...)`, `Bernoulli.(...)`, `Poisson.(...)`, " *
     "`NegativeBinomial2.(...)`, `Gamma.(...)`, `Beta.(...)`, " *
-    "`StudentT.(...)`" *
+    "`StudentT.(...)`, `Binomial.(...)`, `Cauchy.(...)`" *
     (grouped ? ", `CensoredAddpropnormal.(...)`, `TgiCategory.(...)`, " *
      "`TgiResponse.(...)`, `TgiCensored.(...)` " : " ")
 
 # One in-cell observation: `yy .~ Fam.(args...)` with a slice-param
 # response and name-or-literal args (panel: the scalar response-space
-# set, exactly one obs; grouped: the joint families too, a list;
+# set, at most one obs; grouped: the joint families too, a list;
 # plate: like grouped but the response names its data column
-# directly). Inline scale/location expressions are NOT admitted —
-# complex values spell via a pre-assignment (julianic delta, one
-# line) — and fused link-space heads are rejected for the same reason
-# (the node is response-space-pure). The response surface's
+# directly). Panels and automatic schedule chains hoist inline arguments
+# to cell assignments before this parser. Authored grouped cells use named
+# arguments. Fused link-space heads require a response-space assignment.
+# The response surface's
 # link-unwrapping/shape-decomposition does NOT apply in cells (args are
 # opaque names — the julianic delta): the user applies links in
 # pre-assignments, and values agree with the standard spelling whenever
 # the pre-assignment computes the same constrained quantity.
+function _hoist_kernel_obs_args!(assignments, stmt::Expr, taken::Set{Symbol}, where)
+    rhs = stmt.args[3]
+    rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
+        rhs.args[1] isa Symbol && rhs.args[2] isa Expr &&
+        rhs.args[2].head === :tuple || return stmt
+    args = Any[]
+    for (k, arg) in enumerate(rhs.args[2].args)
+        if arg isa Symbol || arg isa Number
+            push!(args, arg)
+        else
+            name = Symbol(stmt.args[2], :_arg, k)
+            name in taken && _sfail("$where observation argument $k binds `$name`, " *
+                "which is already a model name; bind the argument to a name of your own")
+            push!(taken, name)
+            push!(assignments, name => arg)
+            push!(args, name)
+        end
+    end
+    return Expr(:call, stmt.args[1], stmt.args[2], Expr(:., rhs.args[1], Expr(:tuple, args...)))
+end
+
 function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
         form::String = "panel v1")
     resp = stmt.args[2]
@@ -3830,9 +3849,8 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
                    "heads (the link inverts via a pre-assignment): got " *
                    "fused `$head.(...)` — spell $fused")
         head in _KERNEL_BINOMIAL_HEADS &&
-            _sfail("$where `$head.(...)` needs trials threading " *
-                   "(sequenced follow-up — the in-cell obs node has no " *
-                   "trials slot)")
+            _sfail("$where fused `$head.(...)` requires a response-space " *
+                   "probability assignment; use `Binomial.(n, p)`")
         _sfail("$where $form admits in-cell observations " *
                _kernel_admitted_msg(grouped) * "only, got `$head.(...)`")
     end
@@ -4076,9 +4094,6 @@ function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
                    "name — got $(repr(s))")
         end
     end
-    isempty(obs_stmts) &&
-        _sfail("$where cell has no `.~` observation (need at least one " *
-               "in-cell likelihood)")
     collected === nothing &&
         _sfail("$where cell must end with a collected result name (a " *
                "bare cell name)")
@@ -4271,8 +4286,6 @@ function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
             "(`@plate for i in eachindex($(s.lhs))` or `$(s.lhs) .~ ...`)")
         push!(obs, s)
     end
-    isempty(obs) && _sfail("$where feeds no observation (observe a data " *
-        "column with the chain's value: `y .~ Normal.(conc, sigma)`)")
     taken = union(data, Set{Symbol}(first.(det)),
         Set{Symbol}(s.lhs for s in sample))
     assignments = Pair{Symbol,Any}[nm => detmap[nm]
@@ -4305,7 +4318,7 @@ function _extract_kernel_cells(sample::Vector, det::Vector{Pair{Symbol,Any}},
         end
         push!(obs_stmts, Expr(:call, :.~, s.lhs, rhs))
     end
-    first_reads = _plate_value_names(obs_stmts[1].args[3])
+    first_reads = isempty(obs_stmts) ? Symbol[] : _plate_value_names(obs_stmts[1].args[3])
     hit = findfirst(in(chain_names), first_reads)
     collected = hit === nothing ? last(assignments).first : first_reads[hit]
     return rest, Pair{Symbol,Any}[p for p in det if p.first ∉ chain],
