@@ -608,14 +608,14 @@ function Reactant.traced_type_inner(
 end
 
 function Reactant.make_tracer(
-        seen, previous::ReactiveKernels.GraphReplicatedKernel,
+        seen, previous::Union{ReactiveKernels.GraphReplicatedKernel,ReactiveKernels._ScheduledBatchedKernel},
         path, mode; kwargs...)
     previous
 end
 
 function Reactant.traced_type_inner(
         ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
-        ndevices, runtime) where {T<:ReactiveKernels.GraphReplicatedKernel}
+        ndevices, runtime) where {T<:Union{ReactiveKernels.GraphReplicatedKernel,ReactiveKernels._ScheduledBatchedKernel}}
     T
 end
 
