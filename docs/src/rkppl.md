@@ -53,6 +53,15 @@ the graph that the sampler cut is prepared from:
 Main.ReactiveKernelsDocs.render_rkppl_kernel_program("01_gaussian.jl")
 ```
 
+Elementwise observations follow Julia broadcasting. A singleton input such as
+`x = [0.5]` can serve a longer response, and matrix or tensor responses keep
+their axes. For `mu = a .+ b .* x; y .~ Normal.(mu, 1)`, an `x` of size
+`(2, 1)` broadcasts beside a `y` of size `(2, 3)`. The likelihood sums every
+broadcast cell. Incompatible non-singleton dimensions fail during binding.
+Shared singleton inputs can also serve independent responses of different
+sizes. Explicit `@plate` indexing keeps its authored indexing requirements;
+`x[i]` does not stretch a singleton `x`.
+
 ## Every parameter is declared
 
 Declarations are strict: every parameter needs an explicit prior statement. A
