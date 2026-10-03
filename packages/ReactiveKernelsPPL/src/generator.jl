@@ -64,7 +64,6 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     end
     append!(stmts, _coef_reassembly_statements(plan, layout))
     append!(stmts, _conditioned_value_statements(plan))
-    append!(stmts, _array_value_statements(plan))
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, assigns)
     append!(stmts, preprocessing_recipes(plan))
@@ -102,7 +101,7 @@ function _conditioned_value_statements(plan)
         for p in plan.array_parameters
             p.name === name || continue
             nd = length(_array_dims(plan, p))
-            if p.family in (:lkj_cholesky, :lkj_cholesky_stack)
+            if p.family === :lkj_cholesky_stack
                 # Only the intrinsic factor width expands; a stack's data axis
                 # stays a vector read and reduction in the existing LKJ graph.
                 K = _array_dims(plan, p)[1]
@@ -110,7 +109,7 @@ function _conditioned_value_statements(plan)
                     rhs = nd == 3 ? :($name[$i, $i, :]) : :($name[$i, $i])
                     push!(stmts, :($(_rl_name(name, i, i)) = $rhs))
                 end
-            elseif nd > 1 && !_is_slice_array(p)
+            elseif nd > 1 && !_is_structured_array(p)
                 push!(stmts, :($(_array_flat_name(name, nd)) = vec($name)))
             end
         end
@@ -3759,18 +3758,16 @@ function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64;
     terms = Any[nstack === nothing ? c : nstack * c]
     lg(i) = nstack === nothing ? :(log($(_rl_name(L, i, i)))) :
         :(sum(log.($(_rl_name(L, i, i)))))
-    if eta == 1.0
-        for i in 2:K
-            push!(terms, :($(K - i) * $(lg(i))))
-        end
-    else
-        bcoef = 2 * eta - 2
-        for i in 2:K
-            k = i - 2
-            push!(terms, :($(K - 1 - k - 1) * $(lg(i)) + $bcoef * $(lg(i))))
-        end
+    for i in 2:K
+        push!(terms, _lkj_prior_diagonal(lg(i), K, i, eta))
     end
     return foldl((a, c) -> :($a + $c), terms)
+end
+
+function _lkj_prior_diagonal(ld, K, i, eta)
+    coefficient = i isa Int ? K - i : :($K - $i)
+    return eta == 1.0 ? :($coefficient * $ld) :
+        :($coefficient * $ld + $(2 * eta - 2) * $ld)
 end
 
 # One correlated draws block's LKJ prior node (names/sizes from the draws).
