@@ -200,6 +200,9 @@ kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = F
     Base.Broadcast.broadcasted(bc.f,
         map(arg -> _tensorized_cat_operand(marker, arg), bc.args)...)
 @inline _tensorized_getindex(array, indices...) = getindex(array, indices...)
+# Typed conversion at the compiler boundary keeps Base.trunc semantics in
+# native execution. Tracing extensions can preserve already-integer values.
+@inline _tensorized_trunc(::Type{T}, x) where {T<:Integer} = trunc(T, x)
 @inline function _tensorized_setindex(array, value, indices...)
     setindex!(array, value, indices...)
     array

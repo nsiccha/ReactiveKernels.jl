@@ -184,6 +184,10 @@ end
                                Duplicated(a, ẋ[1]), Duplicated(b, ẋ[2])))
     vjp = only(Enzyme.autodiff(Reverse, Const(rule), Active, Active(a), Active(b)))
     @test ȳ * jvp ≈ ȳ * (vjp[1] * ẋ[1] + vjp[2] * ẋ[2])
+    # A call whose result is inactive still has numeric zero cotangents for
+    # Active inputs (the annotation contract used by finite-CDF loops).
+    inactive_vjp = only(Enzyme.autodiff(Reverse, Const(rule), Const, Active(a), Active(b)))
+    @test inactive_vjp == (0.0, 0.0)
 
     # Through DifferentiationInterface, both modes.
     @test gradient(x -> rule(x, b), AutoEnzyme(; mode = Enzyme.Reverse), a) ≈ ref.dy_da

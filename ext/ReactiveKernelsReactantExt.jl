@@ -1115,6 +1115,9 @@ const _RKScalarIndex = Union{Integer,Reactant.TracedRNumber{<:Integer}}
 @inline _rk_int_index(index::Reactant.TracedRNumber{Int}) = index
 @inline _rk_int_index(index::Reactant.TracedRNumber{<:Integer}) =
     convert(Reactant.TracedRNumber{Int}, index)
+@inline ReactiveKernels._tensorized_trunc(
+    ::Type{T}, x::Reactant.TracedRNumber{<:Integer}) where {T<:Integer} =
+    convert(Reactant.TracedRNumber{T}, x)
 @inline _rk_gather(array::Reactant.TracedRArray, indices) =
     Reactant.@allowscalar array[map(_rk_int_index, indices)...]
 
@@ -2144,6 +2147,13 @@ function ReactiveKernels._tensorized_plate_call(
     structural === nothing ||
         return _reactant_authored_plate_call(structural, operation, args)
     any(_reactant_plate_ref_array, args) &&
+        return _reactant_ref_plate_call(operation, args)
+    # A split arm with only shared inputs receives an ignored lane anchor.
+    # Its live branch can return a host fallback or a traced scalar. Generic
+    # broadcast infers their join as Number before tracing the cell; batch
+    # traces the shared branch and preserves the anchored lane domain.
+    operation isa ReactiveKernels._KernelSourceOp &&
+        operation.tensor_f isa ReactiveKernels._LaneAnchored &&
         return _reactant_ref_plate_call(operation, args)
     operands = map(_reactant_plate_operand, args)
     result_type = Base.promote_op(operation, map(Base.eltype, operands)...)

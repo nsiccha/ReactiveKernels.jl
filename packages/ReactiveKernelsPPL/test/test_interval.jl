@@ -149,8 +149,8 @@ _int_pcols() = Dict{Symbol,AbstractVector}(:y => copy(_INT_YP),
                 s ~ Exponential(1)
             end, (:y, :x); conditioned = (:y, :x))
         # Evidence is Gaussian/Poisson-only (slice 1 family gate).
-        # capability: interval-censored evidence over Bernoulli (non-Gaussian/Poisson families; 'slice 1 family gate') (todo `0ze68k8`)
-        @test_broken (lower_rkppl(quote
+        # admitted: interval-censored evidence over Bernoulli (non-Gaussian/Poisson families; 'slice 1 family gate') (todo `0ze68k8`)
+        @test (lower_rkppl(quote
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
@@ -398,6 +398,8 @@ end
     # capability: Poisson interval probabilities under XLA (generic AD;
     # todo `0ze68k8`). A tracing failure is a gap, not a forbidden model.
     @test_broken err === :traced
+    @test err isa MethodError && err.f === ReactiveKernelsPPL.SpecialFunctions.gamma_inc &&
+        any(arg -> arg isa Reactant.TracedRNumber, err.args)
 end
 
 # I1/I2 parity probes (N=80; Xoshiro(90210)/Xoshiro(90211) recipes — see
