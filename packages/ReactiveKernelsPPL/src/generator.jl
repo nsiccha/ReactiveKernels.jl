@@ -904,6 +904,11 @@ _composed_map_emit(f) = f
 """Rewrite a composed tree to in-graph nodes (contract validated it)."""
 function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
         pred::Symbol)
+    if _is_plate_column_expr(node)
+        aliases = Dict{Symbol,Symbol}(s => _lp_name(_predictor(plan, s)) for s in subs)
+        inputs = [_hsubst(a, aliases, Dict()) for a in node.args[1].args[2:end]]
+        return Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
+    end
     if node isa Symbol
         node in subs || return node
         i = findfirst(p -> p.name === node, plan.predictors)
@@ -924,6 +929,7 @@ end
 function _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     o = t.options
     ex = _composed_rewrite(o.tree, o.subs, plan, pred.name)
+    _is_plate_column_expr(ex) && return ex
     # Retain scalar shape when observation operands need broadcasting;
     # ordinary full-length vector plans keep their established lowering.
     isempty(o.subs) && isempty(t.columns) || return ex
@@ -1775,7 +1781,8 @@ function _ranged_response_stmts(r, plan, stmts)
         # Select ordinary row values before family-specific conversions or
         # ordinal stage expansion. Simplexes and covariance factors stay whole.
         if r.family ∉ (CategoricalFam, MultinomialFam)
-            push!(rows, _location_node(r, plan))
+            push!(rows, _is_bare_param_location(r, plan) ? r.predictor :
+                _location_node(r, plan))
             foreach(p -> push!(rows, _lp_name(_predictor(plan, p))), r.extra_predictors)
         end
         for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
