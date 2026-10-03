@@ -32,11 +32,31 @@ function _cv_hlo_retained_work(ops)
     return Dict(name => count for (name, count) in ops if name ∉ simplified)
 end
 
+function _cv_executable_ops(compiled)
+    thunk = hasproperty(compiled, :exec) ? compiled : compiled.compiled
+    hlo = repr(only(Reactant.XLA.get_hlo_modules(thunk.exec)))
+    ops = Dict{String,Int}()
+    # Tuple result types contain index comments with '=' in them.
+    for m in eachmatch(r"(?m)^\s*(?:ROOT\s+)?%?[\w.-]+ = .*?\s+([A-Za-z][A-Za-z0-9_-]*)\(", hlo)
+        name = m.captures[1]
+        ops[name] = get(ops, name, 0) + 1
+    end
+    return ops
+end
+
+function _cv_executable_retained_work(ops)
+    # Inspect actual executable regions and nonlinear work separately from
+    # XLA's shape-specific fusion, layout and derivative-tape machinery.
+    names = ("while", "conditional", "log", "log-plus-one", "exponential",
+        "sqrt", "tanh", "sine", "cosine", "floor", "dot", "gather")
+    return Dict(name => get(ops, name, 0) for name in names)
+end
+
 @testset "Reactant: data-sized shared LKJ factor reverse" begin
     # Constructing one shared diagonal value avoids the raw matrix/guard
     # dominance failure isolated by the backend-only reproducer. Every prior
     # logarithm and its derivative still belongs to the live shape guard.
-    traced, optimized, recipes = [], [], Int[]
+    traced, optimized, executable, recipes = [], [], [], Int[]
     for (K, n, S) in ((2, 7, 2), (2, 19, 4), (4, 7, 2),
             (8, 7, 2), (16, 19, 4))
         bound, built = _cv_data_width_build(n, S; K)
@@ -60,6 +80,9 @@ end
         @test get(traced[end][1], "stablehlo.while", 0) > 0
         primal = Reactant.@compile kernel(ru)
         compiled = compile_ad_value_and_gradient(q.ad, ru)
+        push!(executable, map(_cv_executable_ops, (primal, compiled)))
+        println("shared LKJ executable inventory, (K, n, S)=", (K, n, S),
+            ": ", executable[end])
         # Reuse both executables at new coordinates; eta, scales and every
         # partial correlation change without rebuilding the graph.
         for w in (u, u .+ 0.03)
@@ -107,6 +130,11 @@ end
     # Stock Reactant still expands small data-derived loops. Promote this
     # named marker when the generic compiler retention fix is delivered.
     @test_broken allequal(retained)
+    @test executable[1] == executable[2]
+    # MLIR retention alone does not protect a singleton loop or lazy branch
+    # from later XLA simplification. Keep this stock limitation named too.
+    @test_broken allequal([map(_cv_executable_retained_work, pair)
+        for pair in executable])
 end
 
 @testset "Reactant: retained LKJ prior guard is lazy" begin
