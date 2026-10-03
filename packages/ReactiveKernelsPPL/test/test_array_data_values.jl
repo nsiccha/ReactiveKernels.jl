@@ -110,20 +110,47 @@ end
 
 @testset "whole-value array composition retains observation alignment" begin
     for kind in (:vector, :column),
-            extra in (:(begin mu = r[g] .+ gx; y .~ Normal.(mu, sigma) end),
+            (case, extra) in enumerate((:(begin mu = r[g] .+ gx; y .~ Normal.(mu, sigma) end),
                 :(y .~ weighted.(Normal.(r[g], sigma), gx)),
                 :(begin y .~ Normal.(r[g], sigma); y2 .~ Normal.(gx, sigma) end),
                 :(begin y .~ Normal.(r[g], sigma);
-                    u = gx .+ 1; y2 .~ Normal.(u, sigma) end))
+                    u = gx .+ 1; y2 .~ Normal.(u, sigma) end)))
         ast = _adv_model(kind, :named)
         pop!(ast.args)
         append!(ast.args, extra.head === :block ? extra.args : Any[extra])
-        # Refused: any observation read retains the data's observation
-        # axis; a bare declared array cannot broadcast over that axis
-        # (standard Julia array-value contract, rkppl-use §2/§3).
-        # capability: one whole array also read per observation; check its broadcast alignment at bind (P3, P10a 0dejlw1) (todo `1qlbn5b`)
-        @test_broken (lower_rkppl(ast,
-            (:y, :y2, :g, :gx); mod = ArrayDataValueModels, conditioned = (:y, :y2, :g, :gx)); true)
+        # A computed whole value is legal. Its shared source still has an
+        # observation axis, whose alignment is checked against bound data.
+        plan = lower_rkppl(ast, (:y, :y2, :g, :gx);
+            mod = ArrayDataValueModels, conditioned = (:y, :y2, :g, :gx))
+        data = _adv_data(3, 3)
+        data[:g] = [3, 1, 2]
+        data[:gx] = [0.2, 0.5, 0.8]
+        data[:y2] = reverse(data[:y])
+        original = deepcopy(data)
+        bound = bind_data(plan, data)
+        @test bound.n_obs == 3
+        @test :gx ∉ first(ReactiveKernelsPPL._model_level_inputs(plan, Set(keys(data))))
+        built = build_kernel(bound)
+        u = [0.25 * cos(i) for i in 1:built.layout.total]
+        th = constrain(built.layout, u)
+        ref = _adv_reference(kind, th, data)
+        lik = if case == 1
+            sum(logpdf.(Normal.(ref.v[data[:g]] .+ data[:gx], th.sigma), data[:y]))
+        elseif case == 2
+            sum(data[:gx] .* logpdf.(Normal.(ref.v[data[:g]], th.sigma), data[:y]))
+        else
+            mu2 = case == 3 ? data[:gx] : data[:gx] .+ 1
+            ref.lik + sum(logpdf.(Normal.(mu2, th.sigma), data[:y2]))
+        end
+        sampler = prepare_sampler(built, bound, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ lik + ref.prior + logjac(built.layout, u)
+        @test grad ≈ _adv_findiff(sampler, u) rtol = 1e-5 atol = 1e-7
+        @test isequal(data, original)
+        mismatch = _adv_data(3, 7)
+        mismatch[:y2] = reverse(mismatch[:y])
+        @test_throws ContractValidationError bind_data(plan, mismatch)
     end
 end
 

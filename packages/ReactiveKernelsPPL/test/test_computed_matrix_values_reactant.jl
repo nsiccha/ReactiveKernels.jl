@@ -75,3 +75,28 @@ end
         previous[mode] = inventories
     end
 end
+
+@testset "compiled empty and singleton computed matrices" begin
+    for mode in (:product, :matvec), intercept in (false, true), (n, nobs) in ((0, 0), (1, 3))
+        fx = _cm_fixture(mode, intercept, n, nobs)
+        original = deepcopy(fx.data)
+        f = _cm_build(fx)
+        snapshots = deepcopy(f.bound.columns)
+        u = fill(0.13, length(coordinate_names(f.built.layout)))
+        sampler = prepare_sampler(f.built, f.bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        ru = Reactant.to_rarray(u)
+        kernel = sampler.kernel
+        primal = Reactant.@compile kernel(ru)
+        reverse = compile_ad_value_and_gradient(sampler.ad, ru)
+        for v in (u, u .- 0.2)
+            ref = _cm_oracle(fx, f.built.layout, v)
+            rv = Reactant.to_rarray(v)
+            value, gradient = reverse(rv)
+            @test Float64(primal(rv)) ≈ ref.value rtol = 1e-12 atol = 1e-12
+            @test Float64(value) ≈ ref.value rtol = 1e-12 atol = 1e-12
+            @test Array(gradient) ≈ ref.gradient rtol = 1e-12 atol = 1e-12
+            @test isequal(fx.data, original)
+            @test isequal(f.bound.columns, snapshots)
+        end
+    end
+end
