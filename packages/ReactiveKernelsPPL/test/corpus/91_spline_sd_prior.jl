@@ -2,8 +2,8 @@
 # accel_splines: distributional spline pair with stated smoothing-sd
 # priors (SB `sd(mu, s(x)) ~ LocationScale(0, 36, TDist(3))`).
 begin
-    spline_basis(:s_x, x; sd = StudentT(3, 0, 36))
-    spline_basis(:s_x2, x2; sd = StudentT(3, 0, 10))
+    spline_basis(:s_x, x; sd = truncated(StudentT(3, 0, 36), 0, Inf))
+    spline_basis(:s_x2, x2; sd = truncated(StudentT(3, 0, 10), 0, Inf))
     b0 ~ StudentT(3, -13, 36)
     s0 ~ StudentT(3, 0, 10)
     mu = b0 .+ spline(:s_x)

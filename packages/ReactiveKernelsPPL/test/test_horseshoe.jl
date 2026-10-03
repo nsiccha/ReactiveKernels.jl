@@ -45,10 +45,10 @@ end
         @test raw.support_override === nothing
         lam = got[Symbol(:horseshoe_mu_, addr, :_lambda)]
         @test lam.family === :cauchy && lam.args == (arg1 = 0, arg2 = ls)
-        @test lam.support_override === :positive_stan
+        @test lam.support_override === :positive
         tau = got[Symbol(:horseshoe_mu_, addr, :_tau)]
         @test tau.family === :cauchy && tau.args == (arg1 = 0, arg2 = gs)
-        @test tau.support_override === :positive_stan
+        @test tau.support_override === :positive
     end
     # A stated Normal beside a horseshoe stays Normal (mixed predictor).
     mixed = lower_rkppl(quote
@@ -103,11 +103,11 @@ end
     ll = sum(logpdf.(Normal.(mu, sig), cols[:y]))
     pr = logpdf(Normal(0, 1), icpt) +
         logpdf(Normal(0, 1), raw1) +
-        logpdf(Cauchy(0, 1), lam1) +
-        logpdf(Cauchy(0, 1), tau1) +
+        logpdf(truncated(Cauchy(0, 1), 0, Inf), lam1) +
+        logpdf(truncated(Cauchy(0, 1), 0, Inf), tau1) +
         logpdf(Normal(0, 1), raw2) +
-        logpdf(Cauchy(0, 0.5), lam2) +
-        logpdf(Cauchy(0, 0.25), tau2) +
+        logpdf(truncated(Cauchy(0, 0.5), 0, Inf), lam2) +
+        logpdf(truncated(Cauchy(0, 0.25), 0, Inf), tau2) +
         logpdf(Exponential(1), sig)
     jac = u[1] + u[4] + u[5] + u[7] + u[8]
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
@@ -138,8 +138,8 @@ end
     mu = u[2] .+ b1 .* cols[:x1]
     ll = sum(logpdf.(Normal.(mu, sig), cols[:y]))
     pr = logpdf(Normal(0, 1), u[2]) + logpdf(Normal(0, 1), u[3]) +
-        logpdf(Cauchy(0, 1), exp(u[4])) +
-        logpdf(Cauchy(0, 1), exp(u[5])) +
+        logpdf(truncated(Cauchy(0, 1),0,Inf), exp(u[4])) +
+        logpdf(truncated(Cauchy(0, 1),0,Inf), exp(u[5])) +
         logpdf(Exponential(1), sig)
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[1] + u[4] + u[5]
     _check_gradient(built.spec, bound, u)

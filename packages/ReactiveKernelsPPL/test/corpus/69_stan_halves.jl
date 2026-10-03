@@ -4,6 +4,6 @@ begin
     mu = a .+ b .* x
     y .~ Normal.(mu, s)
     b ~ Normal(0, 1)
-    s ~ Normal(0, 2; lower=0)
-    t ~ Cauchy(0, 5; lower=0)
+    s ~ HalfNormal(2)
+    t ~ HalfCauchy(5)
 end

@@ -267,7 +267,7 @@ frequency/power-objective column (D1); analytic/precision weights fail
 closed emitter-side. `trials` is the Binomial/BetaBinomial2 trial count
 (Int column or Int literal), `nothing` otherwise. `range` carries a literal `y[1:N]`
 response range (`nothing` = whole column: bare `.~`, `eachindex`,
-`axes`); it must cover `1:n_obs` exactly (checked at bind).
+`axes`); it must cover that response's full observation axis (checked at bind).
 
 Leveled families (categorical / ordinal / multinomial) use the trailing
 fields, built with keywords (`n_levels=`, `thresholds=`,
@@ -377,7 +377,8 @@ index column in the trailing `mi_jobs` field, built with keywords (`mi_jobs=`);
 every other response leaves it at `nothing`:
 
 - `mi_jobs`: the `Jobs` column (sorted-ascending unique `Int` row indices,
-  a strict nonempty subset of `1:n_obs`). The response column itself crosses
+  a strict nonempty subset of the response's full observation axis). The
+  response column itself crosses
   PACKED (`y_obs`, aligned with `Jobs`); both ride the managed-columns
   exemption. The generator gathers every vector likelihood input by `Jobs`
   and runs the existing cell over the short plate — obs rows only, no
@@ -584,25 +585,13 @@ end
 """
     HorseshoePrior(predictor, addressee, local_scale, global_scale, sign)
 
-One per-coefficient horseshoe shrinkage prior (SB mirror: `coef ~
-Horseshoe(...)` lowers per call site to `raw ~ std_normal()`, `lambda ~
-cauchy(0, local_scale; lower=0)`, `tau ~ cauchy(0, global_scale;
-lower=0)`, `beta = raw * lambda * tau` — each scalar call owns its own
-tau; the halves ride `:positive_stan`, Stan lower-bound kernel
-semantics with NO truncation renormalizer, matching SB which never
-renormalizes bounds). `addressee` is `:Intercept` or a continuous
-column of `predictor` (factor/matrix/monotonic addressees are out of
-the flat slice). `sign`
-is the use polarity (`+1` for `.+`, `-1` for `.-`): the derived coordinate
-holds `sign * raw * lambda * tau`.
-
-A predictor with any `HorseshoePrior` carries NO
-[`PopulationPrior`](@ref) rows and NO `:coefficient` layout block:
-every design coordinate is derived in-graph — horseshoe addressees
-from their `(raw, lambda, tau)` triple, every other addressee from a
-Normal scalar — and the triple/scalar priors ride the ordinary
-[`SampledParameter`](@ref) path. Scales are finite strictly-positive
-literals (SB's formula constants); a sampled scale is a follow-up.
+One per-coefficient horseshoe prior: standard-normal raw coefficient,
+normalized HalfCauchy(local_scale) lambda, and HalfCauchy(global_scale) tau.
+Each scalar built-in call owns its own tau. For one shared global tau use
+`horseshoe_coefs(X)`. `addressee` is a predictor's intercept or continuous
+column and `sign` is its use polarity. The derived coordinate is
+`sign * raw * lambda * tau`; the latent priors use SampledParameter.
+Scales are finite strictly positive literals.
 """
 struct HorseshoePrior
     predictor::Symbol
@@ -626,27 +615,12 @@ horseshoe_normal_name(pred::Symbol, addr::Symbol) =
 """
     SupportOverride
 
-A latent's support override: `nothing` (infer from the family), the bare
-`Symbol` `:positive` (half-Normal/half-Cauchy truncation of a real-support
-family, exact +log(2) at a literal-zero location), the bare `Symbol`
-`:positive_stan` (the same exp-constrained half shape under Stan
-lower-bound kernel semantics — plain `_lpdf` plus the bare-`u` Jacobian,
-NO truncation renormalizer, matching SB which never renormalizes
-bounds), the tuple
-`(:interval, lo, hi)` (a two-sided finite truncation `truncated(Normal(mu, s),
-lo, hi)` — an affine-logistic constrained transform onto `(lo, hi)` with the
-renormalized truncated density), the tuple `(:interval_stan, lo, hi)`
-(the same affine-logistic constrained transform onto `(lo, hi)` under
-Stan two-sided-bound kernel semantics — plain `_lpdf` plus the bare-`u`
-Jacobian, NO truncation renormalizer), or the tuple `(:upper, hi)` (an
-upper-only truncation `truncated(Normal(mu, s), -Inf, hi)` — Stan's
-upper-bound kernel `x = hi - exp(u)` with the bare-`u` Jacobian and NO
-truncation renormalizer), or the tuple `(:lower, lo)` (a lower-only
-truncation `truncated(LogNormal(m, s), lo, Inf)` of a positive-support base,
-renormalized as in Distributions — `x = lo + exp(u)` with the bare-`u`
-Jacobian; `lo` a literal, or the name of a model-level data value resolved
-from the bound columns, e.g. an HSGP validity floor). Shared by scalar
-[`SampledParameter`](@ref)s and per-cell [`PlateParameter`](@ref)s.
+A latent's support override is `nothing` (infer natural support), `:positive`
+(a normalized symmetric half at literal-zero location), or
+`(:truncated, lo, hi)` (normalized base density on the intersection with its
+natural support). Bounds may be literals, data or sampled expressions.
+The older normalized `:interval`, `:upper` and `:lower` representations
+remain supported for hand-built plans. Shared by scalar and per-cell priors.
 """
 const SupportOverride =
     Union{Nothing,Symbol,Tuple{Symbol,Float64,Float64},Tuple{Symbol,Float64},
@@ -658,16 +632,10 @@ _support_args(ov) = ov isa Tuple ? ov[2:end] : ()
 """
     SampledParameter(name, family, args, support_override, label)
 
-One non-coefficient latent (scalar, slice 1). `args` use POSITIONAL keys
-`(arg1, arg2, …)` in Distributions.jl constructor order with Distributions.jl
-semantics (`Exponential(θ)` = scale θ). Values are literals or
-[`ParamName`](@ref)s (hierarchical OK, cycles rejected). `support_override`
-is a [`SupportOverride`](@ref): `nothing` (infer from family), `:positive`
-(half-Normal/half-Cauchy), `:positive_stan` (the Stan-kernel half,
-unnormalized), `(:interval, lo, hi)` (a finite truncated
-interval), `(:interval_stan, lo, hi)` (a finite interval with Stan
-kernel semantics, unnormalized), or `(:upper, hi)` (an upper-only
-truncation with Stan kernel semantics).
+One scalar latent with positional `(arg1, arg2, …)` arguments in
+Distributions constructor order (Exponential uses scale). Arguments may read
+data, sampled parameters or ordinary definitions. Explicit support follows
+SupportOverride and its density is normalized on that support.
 """
 struct SampledParameter
     name::ParamName
@@ -687,11 +655,10 @@ follow [`SampledParameter`](@ref) exactly (POSITIONAL `(arg1, …)` keys,
 Distributions.jl semantics), except the args are SHARED across cells — literals
 or scalar parameter/assignment names (per-cell vector args are a later
 increment). `range` is the plate's index set: the `Symbol` of the column `v`
-of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of `v`; bind
-proves `length(v) == n_obs` — latents over another axis do not lower yet), a
-literal `UnitRange{Int}` that must cover `1:n_obs` exactly (the `1:N` case),
-mirroring [`LikelihoodSpec`](@ref)'s response range, or `nothing` (size =
-`n_obs`, hand-built plans). A
+of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of bound or
+defined `v`), a literal `UnitRange{Int}` covering its consuming response's
+axis (the `1:N` case), or `nothing` (the consuming response establishes the
+axis in hand-built plans). A
 real-support prior (`normal`/`cauchy`/half-versions) lays out identity (an
 unconstrained block); positive/unit support constrains per element.
 """
@@ -703,7 +670,7 @@ struct PlateParameter
     range::Union{Nothing,UnitRange{Int},Symbol}
     label::Symbol
 end
-"""Provenance/range default to a whole-column (n_obs) plate under the name."""
+"""Provenance/range default to the consuming response's axis under the name."""
 PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     support_override::SupportOverride) =
     PlateParameter(name, family, args, support_override, nothing, name)
@@ -745,23 +712,10 @@ end
 """
     VaryingSdPrior(family, param)
 
-One margin's marginal-scale (`tau`) prior inside a [`VaryingDraws`](@ref)
-block — the SB `brm_ranef_sd` per-margin codes in native form:
-
-- `:std_normal` — SB family 0, the unconfigured default (`tau ~ Normal(0, 1)`
-  on the positive half; `param` ignored, conventionally `1.0`).
-- `:exponential` — SB family 1 (`sd ~ Exponential(scale)` in the caller's
-  spelling): `param` is the SCALE `θ` (the `:exponential` /
-  `:positive_exponential` convention everywhere else in this contract — an
-  SB `rate` inverts once at the boundary, `θ = 1 / rate`).
-- `:normal` — SB family 2 (`sd ~ Normal(0, sd)`): `param` is the standard
-  deviation `σ`.
-- `:cauchy` — RK extension, no SB code (`sd ~ Cauchy(0, σ)`): `param` is
-  the scale `σ` (Stan-kernel, no `+log2` — the posteriordb
-  eight-schools-noncentered `tau ~ Cauchy(0, 5)` shape).
-
-An empty `sd_priors` vector (the default) is all-`:std_normal`: SB's
-unconfigured prior, emitted exactly as before.
+One margin's normalized positive-scale prior. `:std_normal` is HalfNormal(1),
+`:normal` is HalfNormal(param), `:cauchy` is HalfCauchy(param), and
+`:exponential` is Exponential(param) in the Distributions scale convention.
+An empty sd_priors vector gives the HalfNormal(1) default for every margin.
 """
 struct VaryingSdPrior
     family::Symbol
@@ -1022,15 +976,9 @@ end
 """
     SplineVector(name, family, args, support_override, width, basis, label)
 
-One free spline coefficient block (SB `_sb_s_generic`/`_sb_t2_generic`):
-flat `b_fixed`, standard-normal `b_*_raw`, Stan-kernel half-normal `sd`
-(`:normal` + `:positive_stan` — plain `_lpdf` plus the bare-`u` Jacobian,
-NO truncation renormalizer, matching SB which never renormalizes
-bounds). A stated `sd` prior from a positive-support family, or a
-bounding `Uniform`, carries no override (`_hyper_support_override`).
-`width` is static from `k`; `basis` is the owning
-[`SplineBasis`](@ref) id. Layout packs each as one contiguous block
-(plate-shaped); priors broadcast over cells.
+One free spline coefficient block: flat fixed coefficients, standard-normal
+raw coefficients, and normalized positive smoothing scales. `width` derives
+from structural `k`; `basis` is the owning basis id. Priors retain one plate.
 """
 struct SplineVector
     name::Symbol
@@ -1043,43 +991,36 @@ struct SplineVector
 end
 
 """
-    HyperPrior(family, args)
+    HyperPrior(family, args[, support_override])
 
-A literal-argument prior on a positive hyperparameter (HSGP length
-scale / marginal scale, spline smoothing sd): `family` in
-[`_HYPER_PRIOR_FAMILIES`](@ref), `args` its literal arguments as
-`(arg1 = ..., ...)` in Distributions.jl order. Stan-kernel semantics
-on the positive support: the plain `_lpdf` plus the transform
-Jacobian, no truncation normalizer (SB `length_scale(...)`/`sd(...)`
-term priors).
+A literal-argument positive hyperparameter prior with the same family,
+arguments and explicit normalized support as a sampled parameter.
 """
 struct HyperPrior
     family::Symbol
     args::NamedTuple
+    support_override::SupportOverride
 end
 
-# Admitted hyperparameter prior families (positive-support or Stan-kernel
-# halves of symmetric families) and their Distributions arities.
+HyperPrior(family::Symbol, args::NamedTuple) = HyperPrior(family, args, nothing)
+
+# Admitted base families and their Distributions arities. Real-support
+# families require an explicit half or truncation.
 const _HYPER_PRIOR_FAMILIES = Dict{Symbol,Tuple{Vararg{Int}}}(
     :lognormal => (2,), :inverse_gamma => (2,), :gamma => (2,),
     :exponential => (1,), :normal => (2,), :cauchy => (2,),
     :student_t => (3,), :uniform => (2,))
 
-# The support override a positive hyperparameter takes under a hyper
-# prior of `family`: a real-support family (Normal, Cauchy, StudentT) rides
-# the Stan-kernel half (`:positive_stan` — plain `_lpdf`, no `+log2`); a
-# positive-support family (LogNormal, InverseGamma, Gamma, Exponential)
-# and the bounding `Uniform` already live on their own support and take
-# none (their own density, Distributions.jl semantics).
-_hyper_support_override(family::Symbol) =
-    SAMPLED_SUPPORT[family] === :real ? :positive_stan : nothing
-
-# A `Uniform(lo, hi)` hyper prior BOUNDS its hyperparameter (the SB
-# prior-bound intersection with the positive support): the
-# hyperparameter rides an `(:interval, lo, hi)` transform. `nothing`
-# for every other family (positive `exp` support).
-_hyper_prior_bounds(hp::HyperPrior) = hp.family === :uniform ?
-    (Float64(hp.args.arg1), Float64(hp.args.arg2)) : nothing
+# Explicit support travels with a hyper prior, just as for a sampled prior.
+_hyper_support_override(hp::HyperPrior) = hp.support_override
+function _hyper_prior_bounds(hp::HyperPrior)
+    hp.support_override === nothing && hp.family !== :uniform && return nothing
+    transform, lo, hi = _entry_transform(hp.family, hp.support_override, hp.args)
+    transform === :interval && return (lo, hi)
+    transform === :floored && return (lo, Inf)
+    transform === :exp && return nothing
+    throw(ContractValidationError("[hyper prior] use an explicit positive distribution, got $(hp.family) with support $(hp.support_override)"))
+end
 _hyper_prior_bounds(::Nothing) = nothing
 
 function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
@@ -1096,11 +1037,13 @@ function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
     all(v -> v isa Real && !(v isa Bool) && isfinite(v), values(hp.args)) ||
         _fail(label, "$what prior args must be finite numeric " *
               "literals, got $(hp.args)")
-    if hp.family === :uniform
-        lo, hi = hp.args.arg1, hp.args.arg2
-        0 <= lo < hi || _fail(label, "$what prior Uniform($lo, $hi) must " *
-            "satisfy 0 <= lo < hi (it bounds a positive hyperparameter)")
-    end
+    _validate_support_override(label, hp.family, hp.support_override, hp.args)
+    _validate_uniform_args(label, hp.family, hp.args)
+    SAMPLED_SUPPORT[hp.family] === :real && hp.support_override === nothing &&
+        _fail(label, "$what needs an explicit positive prior: HalfNormal, HalfCauchy or truncated(D, 0, Inf)")
+    bounds = _hyper_prior_bounds(hp)
+    bounds === nothing || (0 <= bounds[1] < bounds[2]) ||
+        _fail(label, "$what prior must have positive support, got $bounds")
     return nothing
 end
 
@@ -1110,8 +1053,7 @@ end
 A grouped HSGP hyperparameter's log-linear hyper-predictor (SB
 `log(length_scale(hsgp(x))) ~ 1 + (1 | g)` / `~ (1 | g)`): per group
 `log h_g = beta0 + sd * z_g` (`intercept` false drops `beta0`), with the
-BRM defaults `beta0 ~ Normal(0, 1)`, `sd ~ Normal(0, 1)` on the positive
-support (Stan kernel), non-centered `z ~ Normal(0, 1)`. `group` must be
+BRM defaults `beta0 ~ Normal(0, 1)`, `sd ~ HalfNormal(1)`, non-centered `z ~ Normal(0, 1)`. `group` must be
 the basis's `by` column (one hyper level per term group). A length scale
 is floored per group at the validity floor (SB `brm_hsgp_by_hyper_S`
 `fmax(rho_g, rho_lower)`).
@@ -1621,12 +1563,10 @@ increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
 and innovation-scale (half-Normal, including `truncated(Normal(0, s), 0, Inf)`)
 [`SampledParameter`](@ref)s, each with Distributions semantics (the
 truncation normalizers stay);
-the `z` innovations (length `n_obs - 1`) are owned internally under the
-reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
-`_ppl_scan_z_<state>` slice. The path length is `n_obs` by construction
-(the LP direct summand adds elementwise to an `n_obs` predictor), so no
-length probe is carried — a `T ≠ n_obs` time axis needs the future
-gathering extension (the `rw` free rider), not this node.
+the `z` innovations (one fewer than the path's rows) are owned internally
+under the reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
+`_ppl_scan_z_<state>` slice. The path length follows its consuming response's
+axis, because the LP direct summand adds elementwise to that predictor.
 
 A dedicated node rather than a `ScanSpec`: the v1 scan grammar threads
 one carried array from SAMPLED seeds with full-length innovations, while
@@ -2054,7 +1994,7 @@ function _spline_vector_specs(id::Symbol, kind::Symbol, k,
     nsd = kind === :tps ? 1 : 3
     sdfam, sdargs = sd_prior === nothing ? (:normal, (arg1=0, arg2=1)) :
         (sd_prior.family, sd_prior.args)
-    push!(specs, (sd, sdfam, sdargs, _hyper_support_override(sdfam), nsd))
+    push!(specs, (sd, sdfam, sdargs, sd_prior === nothing ? :positive : _hyper_support_override(sd_prior), nsd))
     return specs
 end
 
@@ -2476,6 +2416,12 @@ function validate_data(plan::StructuralPlan)
     _validate_levelmaps_data(plan)
     _validate_response_data(plan)
     _validate_plate_parameters_data(plan)
+    for s in plan.scans
+        _scan_length(plan, s)
+    end
+    for s in plan.dar_paths
+        _value_rows(plan, s.state)
+    end
     _validate_varying_draws_data(plan)
     _validate_splines_data(plan)
     _validate_hsgp_data(plan)
@@ -2781,8 +2727,8 @@ function _validate_varying_levels_shape(d::VaryingDraws)
     return nothing
 end
 
-# A literal plate range covers 1:n_obs exactly (the size the latent vector
-# packs), mirroring the response-range cover check.
+# A literal plate range covers its consuming response's axis, mirroring
+# the response-range cover check.
 function _validate_plate_parameters_data(plan::StructuralPlan)
     scalarnames = _union_names(plan)
     derivednames = Set{Symbol}(d.name for d in plan.derived)
@@ -2799,18 +2745,16 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
         if p.range isa Symbol
             # One cell per entry of the iterated column (Julia's
             # `eachindex(v)`), sized at the observation axis.
-            haskey(plan.columns, p.range) || _fail(p.label,
-                "plate over `eachindex($(p.range))`: `$(p.range)` is not bound")
-            n = length(plan.columns[p.range])
-            n == plan.n_obs || _fail(p.label,
-                "plate over `eachindex($(p.range))` has $n cells but n_obs " *
-                "is $(plan.n_obs) — a per-cell latent over another axis " *
-                "does not lower yet (iterate an observation-axis column)")
+            (haskey(plan.columns, p.range) || _is_derived(plan, p.range) ||
+                any(a -> a.name === p.range, plan.assignments)) || _fail(p.label,
+                "plate over `eachindex($(p.range))`: `$(p.range)` is not bound or defined")
+            _plate_rows(plan, p)
             continue
         end
-        last(p.range) == plan.n_obs || _fail(p.label,
+        n = _value_rows(plan, p.name)
+        last(p.range) == n || _fail(p.label,
             "plate range $(p.range) covers $(length(p.range)) cells " *
-            "but n_obs is $(plan.n_obs) — ranges cover eachindex exactly")
+            "but its observation axis has $n rows — ranges cover eachindex exactly")
     end
     return nothing
 end
@@ -2906,7 +2850,7 @@ function _validate_mm_draws_data(d::VaryingDraws, plan::StructuralPlan)
         _fail(d.label, "draws block has no declared grouping levels " *
               "(bind_data fills the union — hand-built bound plans must too)")
     levels = d.levels::Vector
-    n_obs = plan.n_obs
+    n_obs = _value_rows(plan, first(mm.groups))
     for (mi, gcol) in enumerate(mm.groups)
         haskey(plan.columns, gcol) ||
             _fail(d.label, "membership column $gcol (slot $mi of $M) " *
@@ -2972,9 +2916,10 @@ function _validate_strata_draws_data(d::VaryingDraws, plan::StructuralPlan)
               "(bind_data fills these — hand-built bound plans must too)")
     slevels = st.levels::Vector
     bycol = _vector_column(plan.columns, st.by, d.label, "stratum column")
-    length(bycol) == plan.n_obs ||
+    n = _value_rows(plan, d.group)
+    length(bycol) == n ||
         _fail(d.label, "stratum column $(st.by) has $(length(bycol)) " *
-              "rows; expected $(plan.n_obs)")
+              "rows; expected $n")
     for v in bycol
         v in slevels ||
             _fail(d.label, "stratum value $(repr(v)) of $(st.by) " *
@@ -3267,24 +3212,26 @@ end
 # the one axis that reads it, and `n_obs` is the total observed rows (the
 # kernel-plate precedent: total likelihood lanes).
 
-"""Plan slots a plan with several observation axes may fill. Every other
-slot reads or sizes by the one `n_obs` axis (latent plates, scans, dar
-paths, varying draws, splines, HSGP and design matrices, R2D2 and
-horseshoe priors, array parameters, kernels, event LPs); per-axis
-versions are not built, so such a plan fails closed — and a slot added
-later does too until it is listed here."""
+"""Plan slots whose dimensions resolve from their authored inputs or uses.
+New slots must establish the same property before joining this list."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
-    :levelmaps, :vector_parameters, :submodel_scopes, :conditioned)
+    :levelmaps, :vector_parameters, :submodel_scopes, :conditioned,
+    :plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
+    :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
+    :r2d2_priors, :horseshoe_priors, :array_parameters, :kernel_plates,
+    :event_lps)
 
-"""Per-observation columns (of `perobs`) a response reads: the names its
-own fields hold, then — transitively — the names every predictor, derived
-column and definition among them holds."""
-function _response_reads(plan::StructuralPlan, r::LikelihoodSpec,
-        perobs::Set{Symbol})
+# Observation-shaped values and their data dependencies. Parameters sized
+# by levels or coefficient width are shared values, so their priors do not
+# join observation axes. A draws application, basis or matrix does carry
+# rows and must expose its inputs through the same dependency walk.
+function _observation_nodes(plan::StructuralPlan)
     nodes = Dict{Symbol,Any}()
     for p in plan.predictors
-        nodes[p.name] = p
+        draws = [d for sl in plan.varying_slices if sl.target === p.name
+            for d in plan.varying_draws if d.label === sl.draws]
+        nodes[p.name] = (p, draws)
     end
     for d in plan.derived
         nodes[d.name] = d.expr
@@ -3292,6 +3239,38 @@ function _response_reads(plan::StructuralPlan, r::LikelihoodSpec,
     for a in plan.assignments
         nodes[a.name] = a.expr
     end
+    for m in plan.matrices
+        nodes[m.name] = m.columns
+    end
+    for sb in plan.spline_bases
+        nodes[sb.id] = (sb.axes, [b.columns for b in sb.blocks])
+    end
+    for hb in plan.hsgp_bases
+        nodes[hb.id] = (hb.axes, hb.by)
+    end
+    for p in plan.plate_parameters
+        nodes[p.name] = (p.range, p.args)
+    end
+    for s in plan.scans, state in s.states
+        nodes[state] = s.hi
+    end
+    for p in plan.array_parameters
+        # An axes(X, 1) vector has X's rows. Width- and level-sized
+        # coefficient arrays stay shared values rather than joining axes.
+        length(p.dims) == 1 || continue
+        d = only(p.dims)
+        _is_axis_dim(d) && d.args[3] == 1 || continue
+        nodes[p.name] = (d.args[2], p.args)
+    end
+    return nodes
+end
+
+"""Per-observation columns (of `perobs`) a response reads: the names its
+own fields hold, then — transitively — the names every predictor, derived
+column and definition among them holds."""
+function _response_reads(plan::StructuralPlan, r,
+        perobs::Set{Symbol})
+    nodes = _observation_nodes(plan)
     cands = union(perobs, keys(nodes))
     function held(x)
         free = copy(cands)
@@ -3319,16 +3298,18 @@ and `total` the observed rows summed over axes. Fails when the plan fills
 a slot outside [`_MULTI_AXIS_SLOTS`](@ref), when the columns one axis
 reads differ in rows, or when no observation statement reads a column."""
 function _observation_axes(plan::StructuralPlan)
-    isempty(plan.kernel_plates) || return nothing
+    isempty(plan.responses) && return nothing
     modelvals, managed = _axis_exempt_columns(plan)
+    mi_managed = _mi_managed_columns(plan)
     perobs = Set{Symbol}(k for (k, v) in plan.columns
-        if k ∉ modelvals && k ∉ managed &&
+        if k ∉ modelvals && k ∉ mi_managed &&
             v isa Union{AbstractVector,AbstractMatrix})
     resps = [r.response for r in plan.responses]
-    all(in(perobs), resps) || return nothing
+    all(r -> haskey(plan.columns, r.response), plan.responses) || return nothing
     rows = Dict{Symbol,Int}(c => _column_nrows(plan.columns[c]) for c in perobs)
-    length(unique(rows[c] for c in resps)) <= 1 && return nothing
-    lens = join(sort!(unique(rows[c] for c in resps)), ", ")
+    response_rows = [_response_rows(plan, r) for r in plan.responses]
+    length(unique(response_rows)) <= 1 && isempty(plan.kernel_plates) && return nothing
+    lens = join(sort!(unique(response_rows)), ", ")
     for f in fieldnames(StructuralPlan)
         f in _MULTI_AXIS_SLOTS && continue
         isempty(getfield(plan, f)) || _fail(:plan, "the responses " *
@@ -3336,12 +3317,11 @@ function _observation_axes(plan::StructuralPlan)
             "reads or sizes by a single observation axis — `$f` beside " *
             "several observation axes is not built yet")
     end
-    for r in plan.responses
-        r.mi_jobs === nothing || _fail(r.label, "mi() missingness on " *
-            "$(r.response) beside responses of $lens rows (several " *
-            "observation axes) is not built yet")
-    end
     reads = [_response_reads(plan, r, perobs) for r in plan.responses]
+    # A kernel-managed column used by an ordinary response also has to
+    # agree with that response's rows. Other kernel columns keep their
+    # own subject/time or schedule validation.
+    filter!(c -> c ∉ managed || any(cs -> c in cs, reads), perobs)
     # Union-find: responses reading a common column share an axis.
     link = collect(eachindex(reads))
     root(i) = link[i] == i ? i : (link[i] = root(link[i]))
@@ -3355,8 +3335,13 @@ function _observation_axes(plan::StructuralPlan)
         root(i) == i || continue
         members = [j for j in eachindex(reads) if root(j) == i]
         resp = resps[first(members)]
-        n = rows[resp]
+        n = response_rows[first(members)]
         total += n
+        for j in members
+            response_rows[j] == n || _fail(resps[j], "column length " *
+                "$(response_rows[j]) ≠ the $n rows of $resp, which an " *
+                "observation statement reads beside it (one observation axis)")
+        end
         for j in members, c in sort!(collect(reads[j]))
             rows[c] == n || _fail(c, "column length $(rows[c]) ≠ the $n " *
                 "rows of $resp, which an observation statement reads " *
@@ -3372,14 +3357,53 @@ function _observation_axes(plan::StructuralPlan)
     return (; rows = axisrows, total)
 end
 
-"""Rows a response observes: its own column's rows — its observation
-axis. An mi() response observes `n_obs` rows through its packed column."""
-_response_rows(plan::StructuralPlan, r::LikelihoodSpec) =
-    r.mi_jobs === nothing && haskey(plan.columns, r.response) ?
-    _column_nrows(plan.columns[r.response]) : plan.n_obs
+"""Rows of a response's full observation axis; mi() packs only its observed
+entries, so its location's data establishes the full axis."""
+function _response_rows(plan::StructuralPlan, r::LikelihoodSpec)
+    r.mi_jobs === nothing && haskey(plan.columns, r.response) &&
+        return _column_nrows(plan.columns[r.response])
+    modelvals, _ = _axis_exempt_columns(plan)
+    managed = _mi_managed_columns(plan)
+    perobs = Set{Symbol}(k for (k, v) in plan.columns
+        if k ∉ modelvals && k ∉ managed && v isa Union{AbstractVector,AbstractMatrix})
+    reads = _response_reads(plan, r, perobs)
+    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    length(ns) == 1 && return only(ns)
+    isempty(ns) && return plan.n_obs
+    _fail(r.label, "mi() location reads columns with different rows $ns")
+end
+
+"""Rows of an observation-shaped value, resolved from its bound inputs.
+Values with no data anchor (an intercept or dar path) use their response
+consumers. No dimension is inferred from the total of unrelated axes."""
+function _value_rows(plan::StructuralPlan, name::Symbol)
+    haskey(plan.columns, name) && return _column_nrows(plan.columns[name])
+    perobs = Set{Symbol}(k for (k, v) in plan.columns
+        if v isa Union{AbstractVector,AbstractMatrix} && k ∉ _mi_managed_columns(plan))
+    reads = _response_reads(plan, name, perobs)
+    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    if isempty(ns)
+        names = Set{Symbol}([name])
+        ns = unique!([_response_rows(plan, r) for r in plan.responses
+            if name in _response_reads(plan, r, names)])
+    end
+    length(ns) == 1 && return only(ns)
+    if isempty(ns)
+        axes = unique!(vcat([_response_rows(plan, r) for r in plan.responses],
+            [_kernel_plate_nlanes(kp, plan.columns) for kp in plan.kernel_plates]))
+        length(axes) == 1 && return only(axes)
+        isempty(axes) && return plan.n_obs
+        _fail(name, "value $name has no data range or response to establish its rows")
+    end
+    _fail(name, "value $name reads or feeds different row counts $ns")
+end
+
+_plate_rows(plan::StructuralPlan, p::PlateParameter) =
+    p.range isa UnitRange ? length(p.range) :
+    _value_rows(plan, p.range isa Symbol ? p.range : p.name)
 
 function _validate_columns(plan::StructuralPlan)
-    plan.n_obs > 0 || _fail(:plan, "n_obs must be positive, got $(plan.n_obs)")
+    plan.n_obs >= 0 || _fail(:plan, "n_obs must be nonnegative, got $(plan.n_obs)")
     modelvals, managed = _axis_exempt_columns(plan)
     axes = _observation_axes(plan)
     for (name, col) in plan.columns
@@ -3469,15 +3493,15 @@ function _validate_splines(plan::StructuralPlan)
             # The smoothing-sd vector may carry a stated hyper prior
             # (SB `sd(mu, s(x)) ~ ...`) — same width, family/args from
             # the admitted set, support derived from the family.
-            if vname === sdname && !(v.family === vfamily && v.args == vargs)
-                hp = HyperPrior(v.family, v.args)
+            if vname === sdname && !(v.family === vfamily && v.args == vargs && v.support_override == vsupport)
+                hp = HyperPrior(v.family, v.args, v.support_override)
                 _validate_hyper_prior(hp, :plan, "spline :$(sb.id) sd")
                 _, vfamily, vargs, vsupport, _ = only(s for s in
                     _spline_vector_specs(sb.id, sb.kind, sb.k, hp)
                     if first(s) === sdname)
             end
             (v.family === vfamily && v.args == vargs &&
-             v.support_override === vsupport && v.width == vwidth) ||
+             v.support_override == vsupport && v.width == vwidth) ||
                 _fail(:plan, "spline :$(sb.id): vector :$vname must be " *
                       "$vfamily$(vargs) with support $(repr(vsupport)) " *
                       "and width $vwidth — the prior structure is part " *
@@ -3737,25 +3761,19 @@ end
 # Kernel (KernelPlate) structure: everything provable without data.
 # v2: N kernel plates per model (panel plates compose freely; at most
 # one grouped plate — multi-schedule grouped models are a sequenced
-# follow-up). The plates jointly carry the ONLY likelihood (no
-# top-level responses alongside — BRM routes kernel models away from
-# the GLM flow). Panel plates (no schedules) follow
+# follow-up). Top-level responses retain their own axes beside the
+# kernel-managed likelihood lanes. Panel plates (no schedules) follow
 # `_validate_panel_kernel` (grouping ABSENT — implicit 1:n subjects,
 # structural, no sentinel, pinned here + tests); grouped plates follow
 # `_validate_grouped_kernel`.
 function _validate_kernels(plan::StructuralPlan)
     plates = plan.kernel_plates
     isempty(plates) && return nothing
-    # Mixed-level predictors (a response and a kernel LP arg sharing one
-    # definition) fail with the precise message before the only-likelihood
-    # gate below (which would otherwise mask the use-site confusion).
+    # A predictor shared by an observation and a subject-level kernel
+    # argument still has to satisfy the predictor-level contract.
     for kp in plates, (p, _) in kp.lp_args
         _predictor_level(plan, p)
     end
-    results = join(["`$(kp.result)`" for kp in plates], ", ")
-    isempty(plan.responses) ||
-        _fail(:plan, "kernel plates carry the only likelihood " *
-              "(v2: no top-level responses alongside $results)")
     ngrouped = count(_is_grouped_kernel, plates)
     ngrouped <= 1 ||
         _fail(:plan, "v2 admits at most one grouped kernel plate per " *
@@ -4795,12 +4813,14 @@ function _validate_kernels_data(plan::StructuralPlan)
             _validate_panel_kernel_data(plan, kp)
         end
     end
-    # n_obs is the total likelihood lanes across plates (bind_data sets
-    # the sum; a hand-bound plan must carry it).
+    # n_obs totals kernel lanes and ordinary observation axes (bind_data
+    # sets the sum; a hand-bound plan must carry it).
     lanes =
         [_kernel_plate_nlanes(kp, plan.columns) for kp in plan.kernel_plates]
-    plan.n_obs == sum(lanes) ||
-        _fail(:plan, "n_obs $(plan.n_obs) ≠ total kernel lanes $(sum(lanes)) " *
+    axes = _observation_axes(plan)
+    total = sum(lanes) + (axes === nothing ? 0 : axes.total)
+    plan.n_obs == total ||
+        _fail(:plan, "n_obs $(plan.n_obs) ≠ total likelihood lanes $total " *
               "($(join(["$(kp.result)=$n"
                            for (kp, n) in zip(plan.kernel_plates, lanes)], ", ")))")
     return nothing
@@ -5098,10 +5118,10 @@ end
 _is_noncentered_scan(s::ScanSpec) =
     any(st -> st.kind === :assign && st.indexed, s.step)
 
-# A scan's trajectory length T: the literal loop bound, or `n_obs` when the
-# bound is a data length name.
+# A scan's trajectory length T: the literal loop bound, or the rows of the
+# response that consumes the trajectory when the bound is a length name.
 _scan_length(plan::StructuralPlan, s::ScanSpec) =
-    s.hi isa Int ? s.hi : plan.n_obs
+    s.hi isa Int ? s.hi : _value_rows(plan, first(s.states))
 
 # A non-centered scan's latent slice length: one coordinate per sampled seed,
 # plus `T - m` per innovation local (one per loop iteration).
@@ -5922,8 +5942,7 @@ end
 # the exact -log(cdf(hi) - cdf(lo)) renormalization at any location.
 # `(:upper, hi)` is an upper-only truncation with a finite hi; the family must
 # be real-support (a truncated Normal), and the density is Stan's upper-bound
-# kernel (plain normal_lpdf plus the bare-`u` Jacobian — NO truncation
-# renormalizer, matching SB which never renormalizes bounds).
+# transform with its normalized upper-tail density.
 function _validate_support_override(label, family::Symbol,
         ov::SupportOverride, args::NamedTuple)
     ov === nothing && return nothing
@@ -5962,22 +5981,22 @@ function _validate_support_override(label, family::Symbol,
                 "an :upper override is a truncated Normal or an " *
                 "upper-bounded flat in slice 1 " *
                 "(`truncated(Normal(mu, s), -Inf, hi)` / " *
-                "`Flat(; upper=hi)`); got $family")
+                "`Flat()` with a hand-built upper support); got $family")
             hi = ov[2]
             isfinite(hi) || _fail(label,
                 ":upper bound must be finite; got $hi")
             return nothing
         end
         head = ov[1]
-        ((head === :interval || head === :interval_stan) &&
+        (head === :interval &&
             length(ov) == 3) || _fail(label,
             "tuple support override must be (:interval, lo, hi), " *
-            "(:interval_stan, lo, hi), or (:upper, hi); got $ov")
+            "or (:upper, hi); got $ov")
         (family === :normal || family === :flat) || _fail(label,
             "an $head override is a truncated Normal or a " *
             "flat-on-an-interval in slice 1 " *
             "(`truncated(Normal(mu, s), lo, hi)` / " *
-            "`Flat(; lower=lo, upper=hi)`); got $family")
+            "`Uniform(lo, hi)`); got $family")
         lo, hi = ov[2], ov[3]
         (isfinite(lo) && isfinite(hi)) || _fail(label,
             "$head bounds must be finite (a one-sided or half truncation " *
@@ -5986,19 +6005,10 @@ function _validate_support_override(label, family::Symbol,
             "$head lower bound must be < upper bound; got ($lo, $hi)")
         return nothing
     end
-    (ov === :positive || ov === :positive_stan) ||
-        _fail(label, "support override must be :positive or " *
-              ":positive_stan, got $ov")
-    if family === :flat
-        # Flat is improper (density 0.0, Jacobian only): only the
-        # kernel half applies — a proper :positive would renormalize a
-        # density flat does not have.
-        ov === :positive_stan || _fail(label,
-            "a flat takes :positive_stan (`Flat(; lower=0)`), not " *
-            ":positive (proper halves renormalize a density flat " *
-            "does not have)")
-        return nothing
-    end
+    ov === :positive ||
+        _fail(label, "support override must be :positive; use HalfNormal(s), HalfCauchy(s) or truncated(D, lo, hi), got $ov")
+    family === :flat && _fail(label,
+        "Flat() is an improper real prior; use Exponential(s) or Uniform(lo, hi) for explicit support")
     family in SYMMETRIC_SAMPLED_FAMILIES || _fail(label,
         "$ov override only applies to symmetric real-support families " *
         "($(join(SYMMETRIC_SAMPLED_FAMILIES, ", "))); got $family")
@@ -6013,8 +6023,8 @@ end
 # scalar SampledParameters. Prior args are either SHARED across cells (a
 # literal or a scalar parameter/assignment name) or PER-CELL (a derived column,
 # giving a varying prior mean/scale — the varying-intercept shape); never
-# another latent vector. `range` is `nothing` (whole-column, size n_obs) or a
-# literal UnitRange (validated to cover 1:n_obs at bind, mirroring responses).
+# another latent vector. The range names its own column or covers the
+# consuming response's axis; `nothing` infers that axis at binding.
 function _validate_plate_parameters(plan::StructuralPlan)
     for p in plan.plate_parameters
         haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
@@ -7034,9 +7044,11 @@ function _validate_levelmaps_data(plan::StructuralPlan)
     # Rows whose codes fall outside the mapped levels contribute 0 (the
     # subset is explicit on the page — e.g. reference rows under an
     # intercept); unobserved mapped levels are allowed like any
-    # zero-variance column. The one failure is unfilled values.
+    # zero-variance column. An empty evaluated pool is valid; an unfilled
+    # map over a nonempty pool still fails.
     for m in plan.levelmaps
-        isempty(m.values) && _fail(:plan,
+        isempty(m.values) || continue
+        isempty(only(_eval_levelmaps(LevelMap[m], plan.columns)).values) || _fail(:plan,
             "LevelMap for ($(m.predictor), $(m.column)) has no evaluated " *
             "values (bind_data fills these — hand-built bound plans must too)")
     end
@@ -7138,15 +7150,15 @@ function _validate_priors(plan::StructuralPlan)
                       "vector)")
             # Interval hypers count when the whole interval is
             # non-negative (the open-interval transform keeps reads
-            # strictly inside, so the scale stays positive) — the
-            # radon_county `Flat(; lower=0, upper=100)` shape.
+            # strictly inside, so the scale stays positive), as with
+            # `Uniform(0, hi)`.
             _hyper_scale_positive(by_param[_sc]) ||
                 _fail(:plan, "prior for $key has scale hyperparameter " *
                       "$_sc — a scale hyperparameter names a " *
                       "positive-support sampled parameter " *
                       "(`Exponential`, `Gamma`, `HalfNormal`, " *
-                      "`Normal(0, s; lower=0)`, `Flat(; lower=0, " *
-                      "upper=hi)`, `Uniform(0, hi)`, ...)")
+                      "`HalfCauchy`, `truncated(Normal(0, s), 0, Inf)`, " *
+                      "`Uniform(0, hi)`, ...)")
         else
             (isfinite(_sc) && _sc > 0) ||
                 _fail(:plan, "prior for $key must be $(pr.family) " *
@@ -7342,8 +7354,7 @@ end
 # per predictor, scalar-only addressees on scalar-only predictors, use
 # polarity, finite positive scales, and triple linkage (each entry's
 # (raw, lambda, tau) sampled parameters exist with the SB geometry:
-# standard-Normal raw, Stan-kernel half-Cauchy scales agreeing with the
-# entry — no truncation renormalizer, SB never renormalizes bounds).
+# standard-Normal raw and normalized half-Cauchy scales agreeing with the entry).
 function _validate_horseshoe(plan::StructuralPlan)
     r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
     seen = Set{Tuple{Symbol,Symbol}}()
@@ -7404,12 +7415,10 @@ function _validate_horseshoe(plan::StructuralPlan)
             q = get(by_name, nm, nothing)
             q === nothing && _fail(h.predictor,
                 "horseshoe prior for $key names no $role parameter ($nm)")
-            (q.family === :cauchy && q.support_override === :positive_stan &&
+            (q.family === :cauchy && q.support_override === :positive &&
                 length(q.args) == 2 && q.args[1] == 0 &&
                 q.args[2] == sc) || _fail(h.predictor,
-                "horseshoe $role $nm must be Stan-kernel half-Cauchy " *
-                "(0, $sc) (`:positive_stan`, no renormalizer — SB " *
-                "never renormalizes bounds), got $(q.family)$(q.args) " *
+                "horseshoe $role $nm must be normalized HalfCauchy($sc), got $(q.family)$(q.args) " *
                 "with override $(repr(q.support_override))")
         end
     end
@@ -8217,12 +8226,13 @@ function _validate_mi_data(r::LikelihoodSpec, plan::StructuralPlan)
     o >= 1 || _fail(r.label,
         "mi() Jobs column $(r.mi_jobs) is empty (at least one observed " *
         "row is required)")
-    o < plan.n_obs || _fail(r.label,
+    n = _response_rows(plan, r)
+    o < n || _fail(r.label,
         "mi() Jobs column $(r.mi_jobs) covers every row (no missing " *
         "values — drop the mi() wrapper)")
-    all(j -> 1 <= j <= plan.n_obs, jobs) ||
+    all(j -> 1 <= j <= n, jobs) ||
         _fail(r.label, "mi() Jobs column $(r.mi_jobs) must index " *
-              "1:n_obs ($(plan.n_obs))")
+              "1:n_obs ($n)")
     length(unique(jobs)) == o ||
         _fail(r.label, "mi() Jobs column $(r.mi_jobs) must not repeat " *
               "rows (a repeated row would double-count its likelihood)")
@@ -10016,12 +10026,13 @@ end
 # ── Functions as values: bind-time data definitions ───────────────────
 # A definition whose expression calls a module function and reads only
 # data (raw columns or other data-only definitions) is data: `bind_data`
-# evaluates it once, as plain Julia, and binds the value under the
-# definition's name. Every consumer then reads it exactly like a bound
+# evaluates bind-time definitions once, as plain Julia, and binds each value
+# under the definition's name. Every consumer reads it exactly like a bound
 # column — the generated kernel takes it as a data argument (bound by
 # `prepare_query`), never recomputing it. A derived column (observation
 # aligned) must come out a length-n_obs vector and validates as a column;
-# a model-level assignment may be any number, vector or matrix.
+# a model-level assignment may be any number, vector or matrix. Whole-value
+# definitions used only by parameter-dependent calls fold at preparation.
 
 # Plan names an expression reads (call heads, keyword names and function
 # values are not reads).
@@ -10050,11 +10061,14 @@ function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
     return out
 end
 
-"""Names of the bind-materialized data definitions of `plan`, given the raw
+"""Names of the data-only definitions of `plan`, given the raw
 (caller-supplied) column names: assignments and derived columns that call a
 module function and read only raw columns or other data-only definitions.
-Derived responses keep their own materialization."""
-function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol})
+Derived responses keep their own materialization. `bind_only` excludes
+definitions used only during preparation, while preserving their names
+for caller-supplied column collision checks."""
+function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
+        bind_only = false)
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
         # Literal definitions can be dependencies of a module call, such
@@ -10076,9 +10090,60 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol})
         memo[nm] = ok
         return ok
     end
-    return Set{Symbol}(nm for (nm, ex) in nodes
+    names = Set{Symbol}(nm for (nm, ex) in nodes
         if nm ∉ resps && _contains_module_call(ex) &&
             dataonly(nm, Set{Symbol}()))
+    bind_only || return names
+    onlydata = union(raw, Set{Symbol}(nm for nm in keys(nodes)
+        if dataonly(nm, Set{Symbol}())))
+    return setdiff(names, _preparation_data_names(plan, nodes, raw, onlydata, names))
+end
+
+# Whole-value data definitions consumed by a parameter-dependent module
+# call belong to preparation, whether lowering inlined them or retained
+# them as assignments (notably beside declared arrays). They may return
+# arbitrary Julia values; the generated data-only statements fold once.
+# Keep every dependency needed by bind-time consumers at bind instead.
+function _preparation_data_names(plan, nodes, raw, onlydata, names)
+    isempty(names) && return Set{Symbol}()
+    _, wholedefs = _model_level_inputs(plan, raw)
+    function dependencies!(found, nm; data_only = false)
+        nm in found && return
+        haskey(nodes, nm) || return
+        data_only && nm ∉ onlydata && return
+        push!(found, nm)
+        for dep in _expr_value_symbols(nodes[nm])
+            dependencies!(found, dep; data_only)
+        end
+    end
+    runtime = Set{Symbol}()
+    for (nm, ex) in nodes
+        nm ∈ onlydata && continue
+        _contains_module_call(ex) || continue
+        dependencies!(runtime, nm)
+    end
+    prepared = intersect(names, wholedefs, runtime)
+    isempty(prepared) && return prepared
+
+    # Any other structural slot can require a value during binding (prior
+    # arguments, array dimensions, responses, matrices, ...). Follow its
+    # dependencies as well as those of all remaining bind-time calls, so
+    # a shared helper is never evaluated both at bind and at preparation.
+    free = Set{Symbol}(keys(nodes))
+    for f in fieldnames(StructuralPlan)
+        f in (:assignments, :derived, :columns, :submodel_scopes) && continue
+        _drop_held_names!(free, getfield(plan, f))
+    end
+    # Whole-value classification exempts `axes(M, d)` from observation
+    # alignment, but resolving an array's shape still needs M at bind.
+    for p in plan.array_parameters, d in p.dims
+        _drop_held_names!(free, d)
+    end
+    needed = Set{Symbol}()
+    for nm in union(setdiff(Set{Symbol}(keys(nodes)), free), setdiff(names, prepared))
+        dependencies!(needed, nm; data_only = true)
+    end
+    return setdiff!(prepared, needed)
 end
 
 """In a bound plan: the module data definitions bound as columns."""
@@ -10381,6 +10446,9 @@ function _materialize_module_data!(plan::StructuralPlan,
             "[bind] column $nm is computed by the model (`$nm = ...` calls " *
             "a module function on data) — drop it from bind_data"))
     end
+    names = setdiff(_module_data_names(plan, Set{Symbol}(keys(columns));
+        bind_only = true), already)
+    isempty(names) && return names
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     for d in plan.derived
         exprs[d.name] = d.expr
@@ -10767,14 +10835,18 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # contract (deriving from a packed column fails every full-length
     # column by order luck). Observation columns of several lengths are
     # several observation axes: n_obs is their total rows.
+    axis_plan = _with(plan; columns = columns, spline_bases = bases,
+        hsgp_bases = hbases, kernel_plates = kbases)
     n = if !_has_observation_axis(plan)
         1 # There is no observation axis; conditioned declarations have their own shapes.
     elseif isempty(kbases)
-        axes = _observation_axes(_with(plan; columns = columns))
+        axes = _observation_axes(axis_plan)
         axes === nothing ? _bind_nrows(columns,
             union(_mi_managed_columns(plan), computed, inputs)) : axes.total
     else
-        sum(kp -> _kernel_plate_nlanes(kp, columns), kbases)
+        axes = _observation_axes(axis_plan)
+        sum(kp -> _kernel_plate_nlanes(kp, columns), kbases) +
+            (axes === nothing ? 0 : axes.total)
     end
     maps = _eval_levelmaps(plan.levelmaps, columns)
     draws = _eval_draws_levels(plan.varying_draws, columns)
@@ -10827,7 +10899,7 @@ function _validate_conditioned_values(plan)
         p.name in plan.conditioned || continue
         push!(known, p.name)
         value = plan.columns[_conditioned_input(p.name)]
-        n = p.range isa UnitRange ? length(p.range) : plan.n_obs
+        n = _plate_rows(plan, p)
         value isa AbstractVector && length(value) == n ||
             _fail(:condition, "$(p.name) needs a vector of length $n")
     end

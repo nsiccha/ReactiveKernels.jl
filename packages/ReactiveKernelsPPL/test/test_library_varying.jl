@@ -15,9 +15,7 @@ using Test
 #
 # Each re-spelled corpus program (`test/corpus/*_lib.jl`) is checked
 # against its built-in original at matching values: the same likelihood
-# and log-Jacobian, and a prior that differs only by the documented
-# constant (the built-in sd prior is Stan's unnormalized half,
-# `+log(2)` short per half-Normal or half-Cauchy margin). Library
+# and log-Jacobian, and the same normalized positive-scale priors. Library
 # densities are checked against Distributions.jl, and gradients against
 # central differences. Data are synthetic. Helpers: `_canon`,
 # `_load_corpus_case`, `_CORPUS_DIR` (test_corpus.jl), `_query`,
@@ -126,7 +124,7 @@ function _lv_parity(orig, lib, map, prior_shift; kw...)
     return nothing
 end
 
-_lv_halves(n) = (_, _) -> n * log(2)
+_lv_halves(n) = (_, _) -> 0.0
 
 # `ex` with every occurrence of the expression `from` replaced by `to`.
 postwalk_replace(ex, from, to) = ex == from ? to :
@@ -215,7 +213,7 @@ end
     # held at 0) adds its standard-normal term.
     _lv_parity("45_varying_levels", "45_varying_levels_lib",
         _lv_block_map(:r, :g, 1, 3; levels = [2, 3, 1]),
-        (ub, lb) -> log(2) - logpdf(Normal(0, 1),
+        (ub, lb) -> -logpdf(Normal(0, 1),
             ub[findfirst(==(Symbol("z_flat_g.4")), coordinate_names(lb))]);
         string_groups = true)
     # Multi-membership over the union of the membership columns.
@@ -233,8 +231,7 @@ end
     end
     _lv_parity("66_stratified_k1", "66_stratified_k1_lib", strat,
         _lv_halves(2))
-    # Stated non-default sd priors: half-Cauchy (proper vs the built-in's
-    # unnormalized half) and Exponential (identical).
+    # Stated HalfCauchy and Exponential priors have identical semantics.
     _lv_parity("75_varying_sd_cauchy", "75_varying_sd_cauchy_lib",
         _lv_block_map(:r, :g, 1, G; scoped = false), _lv_halves(1))
     # `b0` is a plain parameter in the library spelling (its `eta` lowers
