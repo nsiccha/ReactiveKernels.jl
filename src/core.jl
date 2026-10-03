@@ -56,6 +56,19 @@ enters prepared hot-state tuples.
 struct _NoKernelSource end
 const _NO_KERNEL_SOURCE = _NoKernelSource()
 
+# A source-visible domain check. Backends retain this check at execution
+# time; its predicate is nondifferentiable, and the exception is static
+# diagnostic data rather than an active mathematical operand.
+@inline function _runtime_check(valid, error::Exception)
+    valid || throw(error)
+    nothing
+end
+
+struct _RuntimeCheckCallback{E}
+    error::E
+end
+(check::_RuntimeCheckCallback)(valid) = _runtime_check(valid, check.error)
+
 struct Recipe
     id::Int
     inputs::Tuple{Vararg{Value}}
