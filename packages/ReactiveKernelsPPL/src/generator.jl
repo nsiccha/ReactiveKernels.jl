@@ -320,8 +320,8 @@ function _assignment_statements(plan::StructuralPlan;
     for d in plan.derived
         by_name[d.name] = d
     end
-    # Data definitions calling module functions were evaluated once at
-    # bind and arrive as data arguments; the kernel never recomputes them.
+    # Data definitions needed at bind (including reduced scales) were
+    # evaluated once and arrive as data arguments; the kernel never recomputes them.
     computed = _bound_module_data_names(plan)
     dataonly = Set{Symbol}(keys(plan.columns))
     stmts = Expr[]

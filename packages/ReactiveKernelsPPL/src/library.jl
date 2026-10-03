@@ -413,9 +413,12 @@ end
 ```
 
 `b` is a vector over `levels(g)`: `b[g]` is each observation's
-coefficient (a varying intercept), `x .* b[g]` a varying slope. Draws are
-`nt.b.sd` and `nt.b.z`. For multi-membership, pass the union of the membership
-columns as one data definition (`gg = vcat(g1, g2)`; `b ~
+coefficient (a varying intercept), `x .* b[g]` a varying slope.
+For a scalar data reduction, write `m = mean(x)` and multiply `m .* b[g]`.
+If `m` also supplies a Gaussian scale, binding requires it to be finite
+and strictly positive.
+Draws are `nt.b.sd` and `nt.b.z`. For multi-membership, pass the union of
+the membership columns as one data definition (`gg = vcat(g1, g2)`; `b ~
 varying_coefs(gg)`) and weight the gathers (`b[g1] ./ 2 .+ b[g2] ./ 2`).
 """
 @rkppl varying_coefs(g) = begin

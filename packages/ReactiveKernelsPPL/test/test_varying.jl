@@ -1153,15 +1153,24 @@ end
 end
 
 @testset "varying derived margin failures" begin
-    # Scalar derived local stays rejected (vector-shaped only).
-    # capability: scalar derived margin (`m = mean(x)`; Z broadcast) — 0dejlw1 lane (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    # refused: legacy margin template; user decisions 1cmodra / 10ldrvz
+    # choose explicit varying libraries over declared vectors and stated priors.
+    # Scalar multiplication is numerically covered in test_varying_scalar_margin.jl.
+    legacy_scalar_margin = quote
             a ~ Normal(0, 5)
             m = mean(x)
             r ~ varying_effect(g, [m])
             mu = a .+ r
             y .~ Normal.(mu, m)
-        end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
+        end
+    scalar_margin_error = try
+        lower_rkppl(legacy_scalar_margin, (:y, :x, :g); conditioned = (:y, :x, :g))
+        nothing
+    catch e
+        e
+    end
+    @test scalar_margin_error isa SurfaceLoweringError
+    @test occursin("margin `m` is a scalar model definition", sprint(showerror, scalar_margin_error))
     # The library's gathered coefficient multiplies any ordinary margin value.
     @test (lower_rkppl(quote
             a ~ Normal(0, 1)
