@@ -108,28 +108,13 @@ function _semantics_compiled_measure(sampler, u)
     return operations
 end
 
-# Existing simplex traced-view boundary (reactivekernels-use §7r), also
-# pinned by test_leveled_reactant.jl and test_mixture.jl. No substitute
-# math or AD rule is introduced to get around this backend limitation.
-_semantics_simplex_gap(e) = e isa MethodError && (
-    (e.f === Base.reindex && length(e.args) == 2 && !(e.args[2] isa Tuple)) ||
-    (e.f === Float64 && length(e.args) == 1 && e.args[1] isa Reactant.TracedRNumber))
-
 @testset "semantics: compiled parity and observation-count invariance" begin
     for kind in (:factor, :matrix, :mixture, :normcdf, :cexpexp,
             :censored, :truncated, :iid, :categorical, :multinomial)
         @testset "$kind" begin
-            try
-                small = _semantics_compiled_fixture(kind, 12)
-                large = _semantics_compiled_fixture(kind, 24)
-                @test small == large
-                if kind in (:categorical, :multinomial)
-                    @test_broken true # self-firing when the pinned gap lifts
-                end
-            catch e
-                kind in (:categorical, :multinomial) && _semantics_simplex_gap(e) || rethrow()
-                @test_broken false
-            end
+            small = _semantics_compiled_fixture(kind, 12)
+            large = _semantics_compiled_fixture(kind, 24)
+            @test small == large
         end
     end
 end

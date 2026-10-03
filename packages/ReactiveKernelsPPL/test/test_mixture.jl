@@ -885,38 +885,17 @@ end
     end
 end
 
-# Simplex (Dirichlet) mixture weights under Reactant: blocked on the §7r
-# upstream gap — Cartesian `getindex` of a 1-D traced view reaches
-# `Base.reindex` with a bare (non-tuple) index (gap 1; gap 2 is the
-# nested-cast scalar conversion behind it). Same signature the leveled
-# `categorical_simplex` pin carries (test_leveled_reactant.jl); either
-# signature below is exactly one of those gaps, anything else rethrows
-# loudly. Native + native-Enzyme are green (the simplex-weights Enzyme
-# testset above); only the XLA trace is pinned. The `@test_broken true`
-# FIRES (Unexpected Pass) once upstream closes the gap — then promote
-# this program to the trio testset above and drop the pin.
-_mix_is_upstream_gap(e) =
-    e isa MethodError && (
-        (e.f === Base.reindex && length(e.args) == 2 && !(e.args[2] isa Tuple)) ||
-        (e.f === Float64 && length(e.args) == 1 && e.args[1] isa Reactant.TracedRNumber))
-
-@testset "mixture simplex weights XLA gap is pinned upstream" begin
+@testset "mixture simplex weights compiled parity" begin
     prog_w = quote
         w ~ Dirichlet([1.0, 1.0])
         y .~ MixtureModel.(vcat.(Normal.(-1.0, 0.5), Normal.(1.0, 0.5)), Ref(w))
     end
     cols_w = Dict{Symbol,AbstractVector}(:y => [1.0, 2.0, 1.5, 2.5])
-    try
-        fx = _mix_reactant(prog_w, cols_w)
-        @test fx.primal ≈ fx.native rtol = 1e-9
-        @test fx.val ≈ fx.native rtol = 1e-12
-        @test fx.rval ≈ fx.native rtol = 1e-9
-        @test fx.rgrad ≈ fx.g rtol = 1e-8
-        @test_broken true
-    catch e
-        _mix_is_upstream_gap(e) || rethrow()
-        @test_broken false
-    end
+    fx = _mix_reactant(prog_w, cols_w)
+    @test fx.primal ≈ fx.native rtol = 1e-9
+    @test fx.val ≈ fx.native rtol = 1e-12
+    @test fx.rval ≈ fx.native rtol = 1e-9
+    @test fx.rgrad ≈ fx.g rtol = 1e-8
 end
 
 # SB parity vs the peer lane's BridgeStan numbers (brief
