@@ -109,7 +109,8 @@ Their fixed-size matrix and named carry intermediates batch as typed leaves,
 with their authored wrappers restored inside each cell. Their full Reactant
 path still fails in the ordinary StaticArrays matrix exponential: its branch
 condition is a traced Boolean. This is a dependency capability boundary,
-isolated by `benchmark/repro_reactant_static_matrix_exp.jl`.
+isolated by `benchmark/repro_reactant_static_matrix_exp.jl` and tracked in
+[issue #34](https://github.com/nsiccha/ReactiveKernels.jl/issues/34).
 Eager branches, parameter-dependent host propagation, and data-derived
 unrolling are not acceptable fixes. See the [scan limitations](scan.md).
 
