@@ -8,6 +8,19 @@ function _cap_stream_operations(hlo)
     out
 end
 
+@testset "Reactant: empty conditioned priors retain the pointwise identity" begin
+    fx = _cap_empty_conditioned_prior()
+    ru = Reactant.to_rarray(fx.u)
+    cad = compile_ad_value_and_gradient(fx.sampler.ad, ru)
+    value, gradient = cad(ru)
+    @test Float64(value) ≈ logpdf(Normal(), only(fx.u))
+    @test Array(gradient) ≈ -fx.u
+    pointwise = prepare_query(fx.built, fx.bound, :pointwise)
+    cp = Reactant.@compile pointwise(ru)
+    @test isempty(Array(cp(ru).z))
+    @test Array(ru) == fx.u
+end
+
 @testset "Reactant: generative streams and per-cell predictor pins" begin
     for kind in (:vector, :scalar, :cell, :pin)
         primal, reverse = Dict{String, Int}[], Dict{String, Int}[]

@@ -23,6 +23,31 @@ end
 end
 end
 
+function _cap_empty_conditioned_prior()
+    data = Dict(:y => Float64[], :z => Float64[])
+    plan = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            b[i] ~ Normal(a, 1)
+            z[i] ~ Normal(a + b[i], 0.8)
+        end
+    end, data; conditioned=(:z,))
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    u = unconstrain(built.layout, (; a=0.2, b=Float64[]))
+    sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+    (; data, bound, built, u, sampler)
+end
+
+@testset "empty conditioned cell priors skip indexed latent arguments" begin
+    fx = _cap_empty_conditioned_prior()
+    value, gradient = sampler_value_and_gradient!(fx.sampler, similar(fx.u), fx.u)
+    @test value ≈ logpdf(Normal(), only(fx.u))
+    @test gradient ≈ -fx.u
+    @test Base.invokelatest(prepare_query(fx.built, fx.bound, :likelihood), fx.u) == 0.0
+    @test Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), fx.u) == (; z=Float64[])
+end
+
 function _cap_stream_fixture(kind, n)
     data = Dict(:x => collect(range(-0.5, 0.7; length=n)),
         :y => collect(range(-0.3, 0.4; length=n)))

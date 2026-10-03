@@ -1286,7 +1286,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
     end
     for p in observed.plate_parameters
         _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-            p.support_override; conditioned = true)
+            p.support_override; conditioned = true, rows = _plate_rows(plan, p))
         push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
     _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points)
@@ -3792,7 +3792,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
     # threaded.
     for p in plan.plate_parameters
         _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-            p.support_override)
+            p.support_override; rows = _plate_rows(plan, p))
     end
     # Spline coefficient vectors: the same plate-prior shape (broadcast the
     # shared prior over cells). `b_fixed` is flat — a 0.0 node, mirroring a
@@ -4008,9 +4008,16 @@ end
 # expander, exactly as the Gaussian-likelihood scale is threaded.
 function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         name::Symbol, family::Symbol, args::NamedTuple,
-        support::SupportOverride; conditioned = false)
+        support::SupportOverride; conditioned = false, rows = nothing)
     node = Symbol(:_ppl_prior_, name)
     pw = Symbol(:_ppl_pw_prior_, name)
+    if rows === 0
+        # An empty authored loop evaluates no prior arguments or cell body.
+        # Keep its pointwise identity so conditioned declarations retain shape.
+        push!(stmts, :($pw = zeros(0)), :($node::Float64 = 0.0))
+        push!(terms, node)
+        return nothing
+    end
     inputs = Any[name]
     tv = _dovar(1)
     argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
