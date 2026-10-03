@@ -3393,10 +3393,11 @@ end
 
 """Broadcast domains of bound observation statements: `(; rows, total,
 domains)`, where `domains` maps response labels to Julia broadcast axes.
-Singleton operands do not join independent domains. Structured kernel and
-mi-managed observations retain their existing validation (`nothing`).
+Singleton operands do not join independent domains. Structured constructors
+retain their existing row-domain validation.
 Several domains beside slots outside `_MULTI_AXIS_SLOTS` are not built yet."""
 function _observation_axes(plan::StructuralPlan)
+    _uses_structured_observation_axes(plan) && return _structured_observation_axes(plan)
     isempty(plan.kernel_plates) || return nothing
     modelvals, managed = _axis_exempt_columns(plan)
     perobs = Set{Symbol}(k for (k, v) in plan.columns
