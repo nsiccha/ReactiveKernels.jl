@@ -34,8 +34,24 @@ function operation_inventory(hlo)
     return counts
 end
 
+function retained_work_inventory(ops)
+    simplified = ("stablehlo.constant", "stablehlo.reshape", "stablehlo.add",
+        "stablehlo.multiply", "stablehlo.subtract", "stablehlo.negate")
+    return Dict(name => count for (name, count) in ops if name ∉ simplified)
+end
+
+function executable_inventory(compiled)
+    hlo = repr(only(Reactant.XLA.get_hlo_modules(compiled.exec)))
+    counts = Dict{String,Int}()
+    for m in eachmatch(r"(?m)^\s*(?:ROOT\s+)?%?[\w.-]+ = .*?\s+([A-Za-z][A-Za-z0-9_-]*)\(", hlo)
+        name = m.captures[1]
+        counts[name] = get(counts, name, 0) + 1
+    end
+    return counts
+end
+
 @testset "Reactant guarded diagonal default-reverse growth boundary" begin
-    inventories = []
+    inventories, executable = [], []
     for K in (2, 4, 8, 16)
         u = [1.5; fill(0.8, K)]
         ru = Reactant.to_rarray(u)
@@ -54,8 +70,20 @@ end
             operation_inventory(Reactant.@code_hlo optimize=true diagonal_gradient(ru)))
         println("guarded diagonal inventory, K=", K, ": ", ops)
         push!(inventories, ops)
+        xla_ops = map(executable_inventory, (loss, gradient))
+        println("guarded diagonal executable inventory, K=", K, ": ", xla_ops)
+        push!(executable, xla_ops)
     end
     @test inventories[3] == inventories[4]
     @test all(ops -> get(ops, "stablehlo.while", 0) > 0, inventories[3])
-    @test_broken allequal(inventories)
+    # Small-shape scalar identities may change raw counts; retained control
+    # flow, nonlinear work and indexing must agree at every dimension.
+    retained = [map(retained_work_inventory, pair) for pair in inventories]
+    @test_broken allequal(retained)
+    # Require the authored loop and lazy guard after default XLA optimization,
+    # including the K=2 one-trip body. The marker describes stock Reactant.
+    @test_broken all(pair ->
+        get(pair[1], "while", 0) == 1 && get(pair[2], "while", 0) == 2 &&
+        get(pair[1], "conditional", 0) == 1 && get(pair[2], "conditional", 0) == 2 &&
+        all(ops -> get(ops, "log", 0) == 1, pair), executable)
 end

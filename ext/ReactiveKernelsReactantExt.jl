@@ -1720,6 +1720,15 @@ function ReactiveKernels._recurrence_branch(
     result
 end
 
+# Bound arrays must be traced constants before crossing an outer lazy region.
+# Promoting them inside the arm changes the captured operand paths while
+# Reactant constructs the conditional. Atomic wrappers retain their meaning.
+ReactiveKernels._plate_branch_operands(
+        ::Reactant.TracedRNumber{Bool}, args::Tuple) = map(_plate_branch_operand, args)
+_plate_branch_operand(arg) = _reactant_plate_operand(arg)
+_plate_branch_operand(arg::Base.RefValue) = Ref(_plate_branch_operand(arg[]))
+_plate_branch_operand(arg::Union{Tuple,NamedTuple}) = map(_plate_branch_operand, arg)
+
 # Batched slice-collection plates preserve eachcol structurally in the core.
 # Move the observation axis to the leading batch dimension and lower the
 # scalar recipe with Reactant's batch primitive; no Base.Slices object or host
@@ -2009,7 +2018,17 @@ ReactiveKernels._tensorized_plate_sum(
     types = [Reactant.MLIR.IR.TensorType(vcat(shape, collect(Int64, size(leaf))),
         Reactant.MLIR.IR.Type(Reactant.unwrapped_eltype(leaf)))
         for leaf in staged.linear_results]
-    results = Reactant.Ops.batch(actual_inputs, types, shape; fn=staged.f)
+    # A zero-lane batch executes no cell. Letting Enzyme's batch pass realize
+    # it as a loop creates a one-element update into a zero-element buffer and
+    # aborts before the later empty-result normalization can run. The traced
+    # leaf schemas already supply its exact shape and type; construct those
+    # empty outputs directly, with no call to the cell or its lazy condition.
+    results = if any(iszero, shape)
+        [Reactant.Ops.fill(Reactant.unwrapped_eltype(leaf)(0),
+            vcat(shape, collect(Int64, size(leaf)))) for leaf in staged.linear_results]
+    else
+        Reactant.Ops.batch(actual_inputs, types, shape; fn=staged.f)
+    end
     logical = staged.traced_result
     logical isa Union{Reactant.TracedRArray,Reactant.TracedRNumber} && return only(results)
     length(shape) == 1 || throw(ArgumentError(
