@@ -97,7 +97,7 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
         @test t.family === :student_t
         @test t.args == (arg1 = :nu, arg2 = 0, arg3 = 1)
     end
-    @testset "lowercase and TDist spellings rejected" begin
+    @testset "constructor spellings" begin
         for (rhs, msg) in ((:(student_t(3, 0, 1)), "Normal"),
                 (:(laplace(0, 1)), "Normal"),
                 (:(TDist(3)), "unknown distribution"))
@@ -115,8 +115,8 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 e
             end
             if rhs == :(TDist(3))
-                # capability: standard TDist prior constructor (P3; todo `139j2uo`).
-                @test_broken (err === nothing || throw(err))
+                # admitted: standard TDist prior constructor (P3; todo `139j2uo`).
+                @test (err === nothing || throw(err))
             else
                 # refused: remaining entries violate constructor signature,
                 # strict declarations or distribution domains (P3/P6, 05oe96l).

@@ -325,8 +325,8 @@ end
         plate_ast([good_cell[1], :(yy .~ Normal(mu, sigma)), :mu], [subj]), data; conditioned = data)
     # Arity message generalized to digits when the joint families joined
     # the obs table (same fail-closed behavior).
-    # capability: 1-arg `Normal.(mu)` (Distributions default sigma = 1) in cells (todo `139j2uo`)
-    @test_broken (lower_rkppl(
+    # admitted: 1-arg `Normal.(mu)` (Distributions default sigma = 1) in cells (todo `139j2uo`)
+    @test (lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ Normal.(mu)), :mu], [subj]), data; conditioned = data); true)
     # capability: inline expression arguments in in-cell observations (`Normal.(mu .+ 1.0, sigma)`) (todo `0fkd9yk`)
     @test_broken (lower_rkppl(
@@ -392,10 +392,10 @@ end
         plate_ast(cell2, [subj]; params = [:ts2, :d2, :yy2]).args[3])
     # refused: plate result `pred` defined twice (single assignment)
     @test_throws "defined twice" lower_rkppl(dupe, data; conditioned = data)
-    # Responseless GLM plans (no plate) still fail as before.
+    # Prior-only declarations are valid model statements.
     nolhs = Expr(:block, Expr(:call, :~, :sigma, Expr(:call, :Exponential, 1.0)))
-    # capability: responseless (prior-only) model (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(nolhs, (:y,); conditioned = (:y,)); true)
+    # admitted: prior-only model (already supported on the canonical base).
+    @test (lower_rkppl(nolhs, (:y,); conditioned = (:y,)); true)
 end
 
 @testset "kernel cell + bind fail-closed battery" begin
@@ -656,8 +656,9 @@ end
     # Hand-bound plans verify the twin (verified, not trusted).
     notwin = deepcopy(bound)
     delete!(notwin.columns, ReactiveKernelsPPL._kbool_name(:pred, :yy))
-    # capability: a Bool where a number is expected (Bool <: Real, P3; 10gzbm9 bool-values) (todo `139j2uo`)
-    @test_broken (ReactiveKernelsPPL._validate_kernels_data(notwin); true)
+    # refused: a hand-bound plan deleted the required Bernoulli Bool twin;
+    # this is missing generated metadata, rather than a Bool numeric value.
+    @test_throws ContractValidationError ReactiveKernelsPPL._validate_kernels_data(notwin)
     u = [0.5]
     eta = 0.5 .* _AXIS2_DEX .* _AXIS2_T
     p = 1 ./ (1 .+ exp.(-eta))

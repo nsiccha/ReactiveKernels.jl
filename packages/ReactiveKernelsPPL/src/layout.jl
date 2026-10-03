@@ -146,7 +146,8 @@ coefficient-vector block (`beta_raw`), or an elementwise array parameter
 (`:array`, column-major over `dims`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
 `hi`; an `:upper` transform sets `hi` only; `NaN` otherwise). `dims` is
-the axis lengths of an `:array` entry (empty for every other kind)."""
+the axes of a declared array, including an LKJ factor (empty for legacy
+scalar/block entries)."""
 struct LayoutEntry
     kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :spline | :varying | :varying_corr | :cholesky_corr | :hsgp | :glm | :array
     predictor::Union{Nothing,Symbol}
@@ -157,9 +158,9 @@ struct LayoutEntry
     transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :upper | :ordered | :simplex | :lkj
     lo::Union{Float64,Symbol,Expr} # constrained lower bound (else NaN)
     hi::Union{Float64,Symbol,Expr} # constrained upper bound (else NaN)
-    dims::Vector{Int} # :array axis lengths (else empty)
+    dims::Vector{Int} # declared-array axes, including :cholesky_corr (else empty)
 end
-# Entries other than arrays carry no axes.
+# Legacy scalar/block entries carry no axes.
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
     lo, hi) =
@@ -1610,8 +1611,9 @@ function transform_statements(e::LayoutEntry)
     end
     e.kind === :array && return _array_transform_statements(e)
     if e.kind === :varying_corr || e.kind === :cholesky_corr
-        # Both LKJ-factor kinds share the scalar-unrolled vine twin
-        # (name/size-keyed `_ppl_rl_` temps — kind-agnostic).
+        isempty(e.dims) || return _lkj_array_transform_statements(e)
+        # Legacy structural-margin blocks still read named scalar edges.
+        # Declared arrays above retain their triangular iteration for every K.
         return _lkj_corr_transform_statements(e)
     end
     o = e.offset
@@ -1873,7 +1875,7 @@ function _lkj_vine_logjac(L::Symbol, K::Int; stacked::Bool = false)
 end
 
 """
-    jacobian_term(entry) -> Union{Nothing,Expr}
+    jacobian_term(entry) -> Union{Nothing,Expr,Symbol}
 
 This entry's log-Jacobian contribution (`nothing` for identity). A scalar
 constrained support splices the bijector's `logjac` endpoint over the same
@@ -1881,8 +1883,8 @@ coordinate the `constrain` edge reads (shared via structural CSE); a per-cell
 latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`);
 a leveled vector entry sums its unrolled twin of the host
 `ordered_logjac`/`simplex_logjac` (shared coordinates via CSE); an LKJ
-entry sums its unrolled twin of the host `lkj_chol_logjac` (named
-partial temps, shared with the constrain edges).
+declared LKJ entry reads the retained sum over the partials shared with its
+transform. Legacy structural-margin LKJ blocks sum their named scalar edges.
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
@@ -1898,6 +1900,7 @@ function jacobian_term(e::LayoutEntry)
                      log($bhi - $blo)))
     end
     if e.kind === :varying_corr || e.kind === :cholesky_corr
+        isempty(e.dims) || return _lkj_array_logjac(e.name)
         return _lkj_vine_logjac(e.name, _lkj_dim(e.size))
     end
     e.kind === :array && return _array_jacobian_term(e)

@@ -8714,10 +8714,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         # Non-negative (0 is valid: Exponential(μ) logpdf at 0 is finite):
         # the exponential kernel guards y >= 0 (SB `exponential_lpdf`
         # returns -inf at y < 0) — fail closed instead of flowing a
-        # wrong value. Bool is not a continuous support (the VonMises
-        # precedent).
-        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
-            all(>=(0), col)) ||
+        # wrong value. Bool values have their ordinary numeric meaning.
+        (eltype(col) <: Real && all(>=(0), col)) ||
             _fail(r.label, "Exponential response must be non-negative numerics")
         return nothing
     elseif r.family === WeibullFam
@@ -8728,14 +8726,13 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
             _fail(r.label, "Weibull response must be strictly positive numerics")
         return nothing
     elseif r.family === VonMisesFam
-        # Finite angles (Bool is not an angle support); a circular
+        # Finite numeric angles; a circular
         # response additionally honors the half-open principal interval
         # (SB `brm_von_mises_lpdf` returns -inf at y < lo / y >= hi) —
         # fail closed instead of flowing a wrong value. The exact
         # moving support [mu - pi, mu + pi] reads live mu, so only the
         # kernel guards it.
-        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
-            all(isfinite, col)) ||
+        (eltype(col) <: Real && all(isfinite, col)) ||
             _fail(r.label, "VonMises response must be finite numerics")
         if r.interval !== nothing
             lo, hi = r.interval
@@ -8745,12 +8742,11 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         end
         return nothing
     elseif r.family === LogNormalFam
-        # Strictly positive (Bool is not a positive-continuous support):
+        # Strictly positive:
         # the lognormal kernel guards y > 0 (Stan `lognormal_lpdf`
         # returns -inf at y ≤ 0) — fail closed instead of flowing a
         # wrong value.
-        (eltype(col) <: Real && !(eltype(col) <: Bool) &&
-            all(>(0), col)) ||
+        (eltype(col) <: Real && all(>(0), col)) ||
             _fail(r.label, "LogNormal response must be strictly positive numerics")
         return nothing
     elseif r.family === GaussianFam
@@ -8885,10 +8881,9 @@ function _validate_mixture_response_column(r::LikelihoodSpec,
     return _fail(r.label, "mixture over $f has no column rule")
 end
 
-# Non-Bool integer column, all non-negative (Binomial/NB2 responses;
-# Bool would pass `<: Integer` and die downstream — exclude it here).
+# Integer column, all non-negative. Bool is an Integer with values zero/one.
 _is_count_column(col) =
-    eltype(col) <: Integer && eltype(col) !== Bool && all(>=(0), col)
+    eltype(col) <: Integer && all(>=(0), col)
 
 # Bernoulli spans three link variants (logit + slice-2 probit/cloglog);
 # Binomial spans those three plus prob-space (BinomialProbFam, a
@@ -10373,6 +10368,14 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
     end
+    # A matrix read only for a declared axis is a whole preparation input.
+    # Its row count does not become an observation count. In contrast, a
+    # grouping axis retains its existing alignment and level-code contract.
+    for p in plan.array_parameters
+        axes = filter(_is_axis_dim, p.dims)
+        isempty(axes) || push!(defs, Symbol(:_ppl_axis_input_, p.name) =>
+            Expr(:tuple, axes...))
+    end
     for p in plan.vector_parameters
         p.family === :simplex_dirichlet || continue
         push!(defs, Symbol(:_ppl_prior_input_, p.name) => p.args.arg1)
@@ -10405,7 +10408,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         elseif f === :array_parameters
             for p in plan.array_parameters
                 delete!(free, p.name)
-                _drop_held_names!(free, p.dims)
+                _drop_held_names!(free, filter(d -> !_is_axis_dim(d), p.dims))
             end
         elseif f === :responses
             for r in plan.responses
