@@ -507,8 +507,8 @@ end
         y .~ Normal.(mu, 1.0)
     end), (:y, :x); conditioned = (:y, :x))
     # LKJCholesky: non-literal eta, upper factor.
-    # capability: sampled LKJCholesky eta (P8 1cmodra admits sampled prior args) (todo `1308iv0`)
-    @test_broken (lower_rkppl(:(begin
+    # A sampled scalar is an ordinary LKJCholesky prior argument (P8).
+    @test (lower_rkppl(:(begin
         e ~ Exponential(1)
         L ~ LKJCholesky(2, e)
         a ~ Normal(0, 1)
@@ -516,11 +516,11 @@ end
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end), (:y, :x); conditioned = (:y, :x)); true)
-    # capability: LKJCholesky upper factor (uplo = 'U') (todo `1308iv0`)
-    @test_broken (lower_rkppl(:(begin
+    # LKJCholesky's stated orientation is retained in the matrix value.
+    @test (lower_rkppl(:(begin
         L ~ LKJCholesky(2, 2.0, 'U')
         a ~ Normal(0, 1)
-        w = L[2, 1] .* x
+        w = L[1, 2] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end), (:y, :x); conditioned = (:y, :x)); true)

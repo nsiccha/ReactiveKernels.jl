@@ -2238,7 +2238,7 @@ end
         @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g); conditioned = (:y, :g))
     end
     # Levels column must match the use column; levels() takes one data column.
-    for lhs in (:(c[unique(g)]), :(c[sort(g)]),
+    for lhs in (:(c[sort(g)]),
             :(c[levels()]), :(c[levels(g, 1)]),
             :(c[f(g)]), :(y[levels(g)]))
         block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
@@ -2253,7 +2253,7 @@ end
         :(mu = c[g]), :(y .~ Normal.(mu, 1.5))), (:y, :g); conditioned = (:y, :g))
     # Subset violations: unbound/start-0/empty/non-literal selections.
     for sub in (:(1:n), :(0:2), :(3:2), :([]), :([1.5]), :([true]),
-            :([i]), :(1:2:6), :(eachindex(g)))
+            :([i]), :(eachindex(g)))
         lhs = Expr(:ref, :c, Expr(:ref, :(levels(g)), sub))
         block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
@@ -2261,7 +2261,9 @@ end
         @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g); conditioned = (:y, :g))
     end
     # Valid subsets lower with their selectors.
-    for (sub, want) in ((:(2:3), 2:3), (:([1, 3]), [1, 3]))
+    for (sub, want) in ((:(2:3), 2:3), (:([1, 3]), [1, 3]),
+            (:(1:2:6), [1, 3, 5]),
+            (Expr(:call, :(:), 1, 2, :end), (1, 2, :end)))
         lhs = Expr(:ref, :c, Expr(:ref, :(levels(g)), sub))
         block = Expr(:block, Expr(:call, :.~, lhs, :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
@@ -2334,7 +2336,7 @@ end
     # rejects.
     for rhs in (:(levels(g)[1:n]), :(levels(g)[0:2]),
                 :(levels(g)[3:2]), :(levels(g)[[]]),
-                :(levels(g)[[1.5]]), :(levels(g)[1:2:4]))
+                :(levels(g)[[1.5]]))
         bound = Expr(:block, Expr(:(=), :sel, rhs),
             Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
@@ -2352,15 +2354,23 @@ end
         Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
         :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5))))
     # refused: sel = g is an observation column, not a level set (duplicate keys)
-    @test_throws "index name sel must be a bound levels-subset" lower_rkppl(
+    @test_throws "sel must be data" lower_rkppl(
         nonlevels, (:y, :g); conditioned = (:y, :g))
-    for assignment in (nothing, :(x = 1.0), :(sel = g), :(sel = unique(g)))
+    for assignment in (nothing, :(x = 1.0), :(sel = g))
         block = Expr(:block)
         assignment === nothing || push!(block.args, assignment)
         append!(block.args, (Expr(:call, :.~, :(c[sel]), :(Normal.(0, 2))),
             :(mu = c[g]), Expr(:call, :.~, :y, :(Normal.(mu, 1.5)))))
         # refused: sel undeclared (P6, 05oe96l)
         @test_throws SurfaceLoweringError lower_rkppl(block, (:y, :g, :x); conditioned = (:y, :g, :x))
+    end
+    for definition in (nothing, :(sel = unique(g)))
+        axis = definition === nothing ? :(unique(g)) : :sel
+        block = Expr(:block, Expr(:call, :.~, Expr(:ref, :c, axis), :(Normal.(0, 2))),
+            :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
+        definition === nothing || pushfirst!(block.args, definition)
+        @test validate_structure(lower_rkppl(block, (:y, :g);
+            conditioned = (:y, :g))) === nothing
     end
     nongroup = quote
         sel = levels(z)
@@ -2755,14 +2765,17 @@ end
         mu = 1.5 .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, Dn; conditioned = Dn); true)
-    # capability: a crossed two-factor gather b[g, h] (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    # Paired crossed effects use scalar indices in an explicit loop.
+    # Two vector indices in Julia instead select a Cartesian matrix.
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         sg ~ Exponential(1)
         b[levels(g), levels(h)] .~ Normal.(0, sg)
-        mu = a .+ b[g, h]
+        @plate for i in eachindex(g)
+            mu[i] = a + b[g[i], h[i]]
+        end
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x, :g, :h); conditioned = (:y, :x, :g, :h)); true)
+    end, (:y, :g, :h); conditioned = (:y, :g, :h)); true)
     # Admitted: explicit priors retain each coefficient across direct and nested affine uses.
     @test (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -3258,19 +3271,21 @@ end
     dbuilt = build_kernel(dbound)
     dll = sum(logpdf.(Normal.(log.(pcols[:z]), s), pcols[:y]))
     @test _query(dbuilt.spec, dbound, :likelihood, u) ≈ dll
-    # Other coefficient-free shapes stay fail-closed (message pinned).
-    err = try
-        lower_rkppl(quote
-                r ~ varying_effect(g, [1])
-                mu = r
-                y .~ Normal.(mu, 1.0)
-            end, (:y, :g); conditioned = (:y, :g))
-        nothing
-    catch e
-        e
-    end
-    # capability: a varying draw is an ordinary value without a sibling coefficient (10gzbm9 degenerate; todo `1308iv0`).
-    @test_broken (err === nothing || throw(err))
+    # A library value can supply the whole location without a coefficient.
+    varying = lower_rkppl(quote
+            r ~ varying_coefs(g)
+            mu = r[g]
+            y .~ Normal.(mu, 1.0)
+        end, (:y, :g); conditioned = (:y, :g))
+    vcols = Dict(:y => [0.2, -0.1, 0.4], :g => [1, 2, 1])
+    vbound = bind_data(varying, vcols)
+    vbuilt = build_kernel(vbound)
+    vu = [0.2 * sin(i) for i in 1:vbuilt.layout.total]
+    vnt = constrain(vbuilt.layout, vu)
+    vmu = vnt.r.sd .* vnt.r.z[vcols[:g]]
+    @test _query(vbuilt.spec, vbound, :likelihood, vu) ≈
+        sum(logpdf.(Normal.(vmu, 1.0), vcols[:y]))
+    _check_gradient(vbuilt.spec, vbound, vu)
 end
 
 # Slice A: range-explicit response LHS (`y[R] .~ ...`) + single-LHS

@@ -174,6 +174,15 @@ and lock the one Reactant 0.2.289 lifted:
   and AD parity. The invalid host-constant indexing shape remains unsupported;
   its named acceptance case is excluded from compiled parity, with the exact
   `BoundsError` pinned. No index clamping or dummy buffer is introduced.
+- Reverse compilation through a guarded diagonal reduction can fail with an
+  MLIR dominance error when its matrix also feeds shared response expressions:
+  `repro_reactant_shared_matrix_loop_reverse.jl` reproduces this on Reactant
+  0.2.290 with plain matrix products, weighted gathers and a retained diagonal
+  loop. Native PPL primal/reverse and compiled primal pass. The named PPL
+  acceptance case uses `LKJCholesky(size(M, 1), eta)` with a sampled shape;
+  its data-derived transform and prior loops remain retained. A declared
+  literal two-dimensional factor uses its one scalar diagonal-prior equation
+  and passes compiled reverse, while its transform still retains its loops.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around
