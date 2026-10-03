@@ -1788,6 +1788,7 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     stmts = _response_likelihood_stmts_full(r, plan)
     r.range isa Expr && return _ranged_response_stmts(r, plan, stmts)
     r.mi_jobs === nothing && return stmts
+    _is_glm_family(r.family) && return stmts # its data-only design selects Jobs before eta
     pre = Expr[]
     jobs = r.mi_jobs
     packed = nothing
@@ -1807,13 +1808,14 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     let st = stmts[obsidx]
         call = st.args[2].args[1]
         call.args[1] === :plate || throw(ContractValidationError(
-            "[generator] mi response $(r.label) needs a scalar observation plate"))
+            "[generator] mi response $(r.label) needs an observation plate"))
         for i in 2:length(call.args)
             ref = call.args[i]
             # Ref inputs are whole model values (e.g. a simplex), never rows.
             ref isa Symbol || continue
-            i == 2 && packed === nothing && continue
-            rows = i == 2 ? packed : jobs
+            ispacked = i == 2 || ref in _mi_packed_columns(r)
+            ispacked && packed === nothing && continue
+            rows = ispacked ? packed : jobs
             call.args[i] = _mi_gather_node!(pre, rows, ref, r.label)
         end
     end
@@ -2126,9 +2128,11 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     call = r.family === NormalIDGLMFam ?
         :($obj($xaug, $bfull, $s).pointwise($yf)) :
         :($obj($xaug, $bfull).pointwise($yf))
+    design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
+    n = r.mi_jobs === nothing ? _response_rows(plan, r) : Expr(:call, :length, r.mi_jobs)
     return Expr[
         :($yf = $yconv.($y)),
-        :($xaug = hcat(ones($(_response_rows(plan, r))), $X)),
+        :($xaug = hcat(ones($n), $design)),
         :($bfull = [$(r.glm_alpha); $(r.glm_beta)]),
         :($pw = $call),
         :($node::Float64 = sum($pw)),
@@ -3279,8 +3283,8 @@ end
 # Shared-simplex multinomial (SB `brm_multinomial` vector[K] method): the
 # count matrix crosses as K raw columns — program structure (the count
 # columns the model names), not a data-inferred size — and the level
-# log-probabilities `log.(p)` thread as one shared vector the cell reads
-# per column. The cell is Stan's `multinomial_lpmf` in scalar form —
+# probabilities thread as one shared vector the cell reads per column.
+# The cell is Stan's `multinomial_lpmf` in scalar form —
 # `lgamma(N+1) − Σ lgamma(c+1) + Σ c*log(p)` — with the `0*log(0) = 0`
 # convention guarded per term (Stan treats a zero count at a zero
 # probability as 0, not NaN). A literal N folds its `lgamma(N+1)`
@@ -3291,21 +3295,28 @@ function _multinomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
     inputs = Any[counts...]
     cvs = [_dovar(i) for i in 1:K]
     nref = _thread_ref!(inputs, r.trials, true)
-    logp = _logp_name(r.label)
-    push!(inputs, :(Ref($logp)))
-    lv = _dovar(length(inputs))
+    push!(inputs, :(Ref($(r.predictor))))
+    pv = _dovar(length(inputs))
     lfact = r.trials isa Int ? loggamma(r.trials + 1.0) : :(loggamma($nref + 1.0))
     cell = :($lfact)
+    stmts = Expr[]
     for (i, cv) in enumerate(cvs)
-        cell = :($cell - loggamma($cv + 1.0) +
-            ifelse($cv == 0, 0.0, $cv * $lv[$i]))
+        term = Symbol(:_ppl_multinomial_term_, r.label, :_, i)
+        # Bound zero counts take the constant arm during plate preparation.
+        # Their logarithm and its derivative must never be evaluated.
+        push!(stmts, :($term = if $cv == 0
+            0.0
+        else
+            $cv * log($pv[$i])
+        end))
+        cell = :($cell - loggamma($cv + 1.0) + $term)
     end
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
     end
-    return Expr[:($logp::AbstractVector{Float64} = log.($(r.predictor))),
-        _plate_sum_stmts(pw, node, inputs, cell)...]
+    push!(stmts, cell)
+    return _plate_sum_stmts(pw, node, inputs, stmts)
 end
 
 # Plain categorical over shared-simplex probabilities (Stan

@@ -396,13 +396,14 @@ every other response leaves it at `nothing`:
 
 - `mi_jobs`: the `Jobs` column (sorted-ascending unique `Int` row indices,
   a nonempty selection on the response's full observation axis). The
-  response column itself crosses
-  PACKED (`y_obs`, aligned with `Jobs`); both ride the managed-columns
-  exemption. The generator gathers every vector likelihood input by `Jobs`
-  and runs the existing cell over the short plate — obs rows only, no
-  latent (SB keeps `y_mis` in generated quantities here). Scalar observation
-  families compose with weights, evidence, ranges and trials. A range filters
-  Jobs on the full axis and the corresponding packed response positions;
+  response, every Multinomial count column and every joint outcome cross
+  PACKED (aligned with `Jobs`); they ride the managed-columns exemption.
+  Vector predictors and trials gather by full-row `Jobs`; shared probabilities
+  and covariance factors stay whole. GLM objects select full design rows
+  before constructing eta. Only observed rows contribute, with no missing
+  response latent (SB keeps `y_mis` in generated quantities here). Scalar
+  observation families compose with weights, evidence, ranges and trials.
+  A range filters Jobs on the full axis and the same packed outcome positions;
   Case-B downstream merged-response uses fail closed emitter-side.
 
 VonMises responses (`VonMisesFam`, SB `brm_von_mises` mirror) carry the
@@ -8082,7 +8083,7 @@ function _validate_simplex_response(r::LikelihoodSpec, plan::StructuralPlan)
             "n_levels must be ≥ 1, got $(r.n_levels)")
     end
     if r.range isa UnitRange
-        first(r.range) == 1 || _fail(r.label,
+        (r.mi_jobs === nothing ? first(r.range) == 1 : first(r.range) >= 1) || _fail(r.label,
             "response range must start at 1 (got $(r.range)) — " *
             "ranges cover eachindex exactly, no partial windows")
         length(r.range) >= 1 || _fail(r.label,
@@ -8217,7 +8218,7 @@ function _validate_joint_response(r::LikelihoodSpec, plan::StructuralPlan,
         _fail(r.label, "joint responses take no weights " *
             "(row weights on a joint density are planned)")
     if r.range isa UnitRange
-        first(r.range) == 1 || _fail(r.label,
+        (r.mi_jobs === nothing ? first(r.range) == 1 : first(r.range) >= 1) || _fail(r.label,
             "response range must start at 1 (got $(r.range)) — " *
             "ranges cover eachindex exactly, no partial windows")
         length(r.range) >= 1 || _fail(r.label,
@@ -8511,11 +8512,14 @@ end
 # precedent), validated under mi rules instead of the uniform-`n_obs`
 # rule. The exemption names exactly the columns the `mi_jobs` field
 # points at, so a stray caller column cannot hide behind it.
+_mi_packed_columns(r::LikelihoodSpec) = [r.response; r.count_columns; r.extra_responses]
+
 function _mi_managed_columns(plan::StructuralPlan)
     out = Set{Symbol}()
     for r in plan.responses
         r.mi_jobs === nothing && continue
-        push!(out, r.response, r.mi_jobs)
+        union!(out, _mi_packed_columns(r))
+        push!(out, r.mi_jobs)
     end
     return out
 end
@@ -8525,12 +8529,9 @@ end
 # so the mi gate must precede them all.
 function _validate_mi_structure(r::LikelihoodSpec, plan::StructuralPlan)
     r.mi_jobs === nothing && return nothing
-    (r.family === MvNormalCholeskyFam || r.family === MultinomialFam ||
-        _is_glm_family(r.family)) && _fail(r.label,
-            "mi() packed rows require a scalar observation family")
-    r.mi_jobs !== r.response ||
+    r.mi_jobs ∉ _mi_packed_columns(r) ||
         _fail(r.label, "mi() Jobs column $(r.mi_jobs) must differ from " *
-              "the response column")
+              "every packed response column")
     return nothing
 end
 
@@ -8559,10 +8560,12 @@ function _validate_mi_data(r::LikelihoodSpec, plan::StructuralPlan)
     issorted(jobs) ||
         _fail(r.label, "mi() Jobs column $(r.mi_jobs) must ascend " *
               "(the emitter crosses findall order)")
-    yobs = _vector_column(plan.columns, r.response, r.label, "mi() response")
-    length(yobs) == o ||
-        _fail(r.label, "mi() response $(r.response) has $(length(yobs)) " *
-              "rows but Jobs selects $o (y_obs must align with Jobs exactly)")
+    for name in _mi_packed_columns(r)
+        yobs = _vector_column(plan.columns, name, r.label, "mi() response")
+        length(yobs) == o ||
+            _fail(r.label, "mi() response $name has $(length(yobs)) " *
+                  "rows but Jobs selects $o (every outcome must align with Jobs exactly)")
+    end
     return nothing
 end
 
@@ -9396,7 +9399,8 @@ function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
     t === nothing && _fail(r.label,
         "Multinomial response requires trials (Int column or literal)")
     counts = [r.response; r.count_columns...]
-    rowsums = zeros(Int, _response_rows(plan, r))
+    n = r.mi_jobs === nothing ? _response_rows(plan, r) : length(plan.columns[r.mi_jobs])
+    rowsums = zeros(Int, n)
     for c in counts
         rowsums .+= plan.columns[c]
     end
@@ -9417,7 +9421,8 @@ function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "trials column must hold integers")
     all(>=(0), col) ||
         _fail(r.label, "trials column must be non-negative")
-    all(rowsums .== col) ||
+    observed_trials = r.mi_jobs === nothing ? col : col[plan.columns[r.mi_jobs]]
+    all(rowsums .== observed_trials) ||
         _fail(r.label, "multinomial row counts must sum to trials in every row")
     return nothing
 end
