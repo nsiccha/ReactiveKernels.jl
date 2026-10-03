@@ -6574,15 +6574,23 @@ struct GLMSampleStmt
     beta::Symbol
     sigma::Any
     line::Int
+    wrapper::Union{Nothing,Expr}
 end
 
 const _GLM_HEADS = (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
 
-_is_glm_call(rhs) = rhs isa Expr && rhs.head === :call &&
-    !isempty(rhs.args) && first(rhs.args) isa Symbol && first(rhs.args) in _GLM_HEADS
+function _glm_distribution(rhs)
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || return rhs
+    first(rhs.args) in (:truncated, :censored, :interval_censored) &&
+        length(rhs.args) >= 2 && return rhs.args[2]
+    return rhs
+end
+_is_glm_call(rhs) = (dist = _glm_distribution(rhs); dist isa Expr &&
+    dist.head === :call && !isempty(dist.args) && first(dist.args) in _GLM_HEADS)
 
 function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
-    lhs, rhs = st.args[2], st.args[3]
+    lhs, raw = st.args[2], st.args[3]
+    rhs = _glm_distribution(raw)
     head = rhs.args[1]
     lhs isa Symbol || _sfail("`$head` left-hand side must be a bare " *
                              "data column, got $(repr(lhs))")
@@ -6608,7 +6616,7 @@ function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
             "response $lhs: `$head` sigma must be a parameter name or " *
             "a positive literal, got $(repr(sigma))")
     end
-    return GLMSampleStmt(lhs, head, X, alpha, beta, sigma, line)
+    return GLMSampleStmt(lhs, head, X, alpha, beta, sigma, line, raw === rhs ? nothing : raw)
 end
 
 _is_doc_macro(m) =
@@ -8544,8 +8552,10 @@ function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
     label = Symbol(g.response, "_resp")
     push!(ctx.matrices_used, g.matrix)
     glmuse[g.beta] = (label, g.matrix)
+    ev = g.wrapper === nothing ? ResponseEvidence(:none, nothing, nothing) :
+        first(_peel_evidence(g.response, g.wrapper, ctx))
     return LikelihoodSpec(fam, link, g.response, g.matrix, sigma, nothing,
-        ResponseEvidence(:none, nothing, nothing), label, nothing, nothing;
+        ev, label, nothing, nothing;
         glm_alpha = g.alpha, glm_beta = g.beta)
 end
 
@@ -8832,12 +8842,16 @@ function _bound(lhs, b, side::Symbol, ctx)
             b.args[1] === :- && b.args[2] === :Inf
         return _bound_infinite(lhs, -Inf, side)
     end
-    b isa Symbol && b in ctx.data && return b
-    b isa Symbol && b in ctx.vecdefs && _sfail(
-        "response $lhs bound $b is a derived column — slice-1 binds " *
-        "evidence bounds raw (derived bounds need shape metadata — planned)")
+    b isa Symbol && (b in ctx.data || b in ctx.prior_names ||
+        haskey(ctx.detmap, b)) && return b
+    if b isa Expr
+        shape = _shape_of(b, ctx.data, ctx.detmap, copy(ctx.detshape),
+            Set{Symbol}(), ctx.shape_env)
+        return shape === :scalar ? _composed_scalar_leaf!(lhs, b, ctx, Symbol[]) :
+            _extract_column(lhs, b, ctx)
+    end
     return _sfail("response $lhs bound $(repr(b)) must be a literal or a " *
-                  "data column")
+                  "declared value")
 end
 
 function _bound_infinite(lhs, v::Real, side::Symbol)
