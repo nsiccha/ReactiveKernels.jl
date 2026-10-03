@@ -10435,33 +10435,6 @@ function _resolve_panel_kernel!(kp::KernelPlate,
         canon, kp.obs, kp.collected, kp.label)
 end
 
-"""
-    bind_data(plan, columns; roles=Dict(), dims=Dict()) -> StructuralPlan
-
-Attach `columns` to a structure-only plan (or rebind an already-bound one,
-replacing columns + roles): infer column roles, merge explicit `roles` over
-them, and run data validation. Returns a NEW bound plan; the input is
-untouched. Inference precedence: response > trials > evidence > weight >
-group > predictor > data; term columns are the only `:predictor` source, so
-assignment/extra columns stay `:data`. Varying-draws grouping columns
-upgrade to `:group` (grouping dominates predictor use in the label; both
-facts stay visible in terms + draws). Draws blocks with
-`levels === nothing` gain sort-ordered observed levels (SB numbering for
-plain vectors — emitter-declared levels pass through). `dims` binds
-kernel-plate dims keys
-(`subject_count`, `timepoint_count`) to positive integers; every key must
-be consumed. Columns are vectors or matrices (whole-design data, Stan
-`matrix[N,K]`): a matrix binds with `n_obs` rows, ≥ 1 column, and a
-numeric eltype; every per-observation role reads vectors only and fails
-closed on a matrix. Data-only definitions that call a module function
-(functions as values) are evaluated here, once, and bound under their own
-names — never supplied by the caller; a model-level one may be a number,
-vector or matrix and carries no `n_obs` requirement. So does a model-level
-data input: a column every definition reads only inside an argument of an
-undotted module call (`gx_m = f(gx)`, or inlined `(b .* f(gx))[g]`) and no
-response, predictor or other slot names — it may have any length or shape
-and never sets `n_obs` (see `_model_level_inputs`).
-"""
 # n_obs derivation skips mi-managed columns (packed y_obs/Jobs), bound
 # module data values and model-level data inputs: every other column
 # crosses at length n, so the first non-managed column pins n_obs
@@ -11285,6 +11258,38 @@ function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
         "[bind] derived response $root: unsupported expression head " *
         "$(ex.head) in a derived response"))
 end
+
+"""
+    bind_data(plan, columns; roles=Dict(), dims=Dict(), conditioned=plan.conditioned) -> StructuralPlan
+
+`columns` accepts a symbol-keyed `AbstractDict` or a `NamedTuple` of data
+values, as does value-based `lower_rkppl`. Named tuples use the same binding
+and validation path as dictionaries; neither container nor its values is mutated.
+Attach `columns` to a structure-only plan (or rebind an already-bound one,
+replacing columns + roles): infer column roles, merge explicit `roles` over
+them, and run data validation. Returns a NEW bound plan; the input is
+untouched. Inference precedence: response > trials > evidence > weight >
+group > predictor > data; term columns are the only `:predictor` source, so
+assignment/extra columns stay `:data`. Varying-draws grouping columns
+upgrade to `:group` (grouping dominates predictor use in the label; both
+facts stay visible in terms + draws). Draws blocks with
+`levels === nothing` gain sort-ordered observed levels (SB numbering for
+plain vectors — emitter-declared levels pass through). `dims` binds
+kernel-plate dims keys
+(`subject_count`, `timepoint_count`) to positive integers; every key must
+be consumed. Data values are numbers or arrays of any shape; observation
+values follow their authored broadcast axes and structured operations retain
+their own shape requirements. Data-only definitions that call a module
+function (functions as values) are evaluated here, once, and bound under
+their own names — never supplied by the caller; a model-level one may be a
+number or an array of any shape and carries no `n_obs` requirement. So does a model-level
+data input: a column every definition reads only inside an argument of an
+undotted module call (`gx_m = f(gx)`, or inlined `(b .* f(gx))[g]`) and no
+response, predictor or other slot names — it may have any length or shape
+and never sets `n_obs` (see `_model_level_inputs`).
+"""
+bind_data(plan::StructuralPlan, columns::NamedTuple; kwargs...) =
+    bind_data(plan, Dict{Symbol,Any}(pairs(columns)); kwargs...)
 
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
