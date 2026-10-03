@@ -383,7 +383,8 @@ end
     for (msg, ast) in cases
         err = _mx_err(ast, D)
         if msg != "over unknown name"
-            # capability: value-valued matrix construction and unused data/parameters (P3/P8, 10gzbm9 degenerate; todo `15lq8iu`).
+            # capability: matrix construction and unused data/parameters
+            # (P3/P8, 10gzbm9; decision `01ep3vb`, model shapes `1qlbn5b`).
             @test_broken (lower_rkppl(ast, D; conditioned = D); true)
         else
             # refused: unknown names, dimension mismatch, unidentified
@@ -418,7 +419,8 @@ end
                 # Admitted: ordinary coefficient vectors retain all value readers.
                 @test (lower_rkppl(ast, data; conditioned = data); true)
             else
-                # capability: other matrix value operands and shapes (P3/P8; todo `15lq8iu`).
+                # capability: matrix operands and shapes (P3/P8;
+                # decision `01ep3vb`, model shapes todo `1qlbn5b`).
                 @test_broken (lower_rkppl(ast, data; conditioned = data); true)
             end
         else
