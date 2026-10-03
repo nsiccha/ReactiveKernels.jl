@@ -1,6 +1,6 @@
 using DifferentiationInterface: AutoEnzyme, gradient
 using Distributions: MvNormal, Normal, Exponential, logpdf
-using LinearAlgebra: Diagonal
+using LinearAlgebra: Diagonal, Symmetric
 using InteractiveUtils: code_llvm
 using ReactiveKernels, ReactiveKernelsPPL, Test
 import Enzyme
@@ -17,10 +17,10 @@ _rows_prior_value(B, mu, F) =
     ReactiveKernelsPPL._mvnormal_cholesky_slices_logpdf(
         ReactiveKernelsPPL._SliceRows(), B, mu, F)
 
-@testset "row-wise MvNormalCholesky keeps runtime row and margin loops" begin
+@testset "row-wise MvNormalCholesky keeps a runtime margin loop" begin
     io = IOBuffer()
-    code_llvm(io, _rows_prior_value,
-        Tuple{Matrix{Float64},Vector{Float64},Matrix{Float64}}; debuginfo=:none)
+    code_llvm(io, ReactiveKernelsPPL._lower_solve_rows_logpdf,
+        Tuple{Matrix{Float64},Matrix{Float64},Float64}; debuginfo=:none)
     ir = String(take!(io))
     @test occursin(" phi i64 ", ir) && occursin("br i1", ir)
 end
@@ -60,6 +60,14 @@ end
     @test_throws ArgumentError _rows_prior_value(B, mu, [1. 0.; .5 -1.])
     # refused: a Cholesky factor must be lower triangular with positive diagonal (distribution domain, P3)
     @test_throws ArgumentError _rows_prior_value(B, mu, [1. .2; .5 1.])
+    @test_throws ArgumentError ReactiveKernelsPPL._mvnormal_slices_logpdf(
+        ReactiveKernelsPPL._SliceRows(), B, mu, [1. .2; .5 1.])
+    @test_throws ArgumentError ReactiveKernelsPPL._mvnormal_slices_logpdf(
+        ReactiveKernelsPPL._SliceRows(), B, mu, [1. 2.; 2. 1.])
+    Sigma = F * F'
+    @test ReactiveKernelsPPL._mvnormal_slices_logpdf(
+        ReactiveKernelsPPL._SliceRows(), B, mu, Symmetric(Sigma)) ≈
+        _rows_prior_value(B, mu, F) rtol = 1e-12
 end
 
 function _centered_test_plan()

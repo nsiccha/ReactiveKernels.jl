@@ -88,14 +88,14 @@ data-bound branch partitions) is still specialized and compiled per binding;
 it reuses the plan and prefix only.
 """
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
-                  passes = (), bound = ())
+                  passes = (), bound = (), on_error = nothing)
     bound === () || return _prepare_bound!(cache, g, have, want, passes, bound,
-                                           objectid(g))
+                                           objectid(g); on_error)
     key = (objectid(g), g.version, _sig(g, have), _sig(g, want),
-           Tuple(objectid(p) for p in passes))
+           Tuple(objectid(p) for p in passes), on_error)
     lock(cache.lock) do
         get!(cache.kernels, key) do
-            prepare(g; have = have, want = want, passes = passes)
+            prepare(g; have = have, want = want, passes = passes, on_error = on_error)
         end
     end
 end
@@ -134,21 +134,22 @@ function _reuses_bound_preparation(@nospecialize(bound), @nospecialize(passes))
 end
 
 _graph_bound_preparation(g::Graph, @nospecialize(have), @nospecialize(want),
-                         @nospecialize(passes), @nospecialize(bound)) =
-    _prepare_bound!(_graph_preparations(g), g, have, want, passes, bound, nothing)
+                         @nospecialize(passes), @nospecialize(bound), on_error = nothing) =
+    _prepare_bound!(_graph_preparations(g), g, have, want, passes, bound, nothing; on_error)
 
 # `graph_key` names the graph in a caller-owned cache (its `objectid`), and is
 # `nothing` in the graph's own cache.
 function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
                          @nospecialize(want), @nospecialize(passes), @nospecialize(bound),
-                         graph_key)
+                         graph_key; on_error = nothing)
     ports, data = _partial_bound_pairs(bound)
-    isempty(ports) && return prepare!(cache, g; have = have, want = want, passes = passes)
+    isempty(ports) && return prepare!(cache, g; have = have, want = want,
+                                     passes = passes, on_error = on_error)
     key = (:bound, graph_key, g.version, _sig(g, have), _sig(g, want),
-           _sig(g, ports), Tuple(_pass_key(p) for p in passes))
+           _sig(g, ports), Tuple(_pass_key(p) for p in passes), on_error)
     entry = lock(cache.lock) do
         get!(cache.bound, key) do
-            _bound_entry(plan(g; have = have, want = want), ports)
+            _bound_entry(_kernel_error_policy(plan(g; have = have, want = want), on_error), ports)
         end
     end
     # The per-binding mathematics runs outside the lock.

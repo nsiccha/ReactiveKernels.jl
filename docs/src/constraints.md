@@ -112,7 +112,11 @@ Reactant [scan](scan.md) lowering retains one `while` loop for every
 iterated-sequence shape, including bound host sequences.
 
 Grouped PK recurrences expose a subject plate containing retained event scans.
-Their full Reactant path currently fails at fixed-size system-matrix batching.
+Their fixed-size matrix and named carry intermediates batch as typed leaves,
+with their authored wrappers restored inside each cell. Their full Reactant
+path still fails in the ordinary StaticArrays matrix exponential: its branch
+condition is a traced Boolean. This is a dependency capability boundary,
+isolated by `benchmark/repro_reactant_static_matrix_exp.jl`.
 Eager branches, parameter-dependent host propagation, and data-derived
 unrolling are not acceptable fixes. See the [scan limitations](scan.md).
 
@@ -148,6 +152,12 @@ and lock the one Reactant 0.2.289 lifted:
   unrolled per lane, succeeded). The boundary concerned only branches whose
   condition reads a live value: a condition on bound data is split away
   during preparation and never reaches the backend.
+  Default optimized reverse still expands small lazy batches into one branch
+  region per lane instead of retaining the batch loop:
+  `repro_reactant_lazy_batch_growth.jl` has correct values and gradients at
+  two and five lanes, but different operation inventories. The fixed-structure
+  requirement remains unmet for that shape; changing optimizer flags is not
+  acceptance of the ordinary path.
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:
@@ -241,11 +251,14 @@ and lock the one Reactant 0.2.289 lifted:
   Declared second-axis gathers, elementwise array definitions and level
   subsets pass compiled primal, AD and operation-count checks.
 
-- Reverse compilation with a zero-length active vector leaves `tensor.empty`,
+- Reverse compilation with an empty active array leaves `tensor.empty`,
   which Reactant 0.2.290 cannot export to XLA:
   `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its
-  ordinary Enzyme gradient without ReactiveKernels. Native reverse returns
-  the correct empty gradient, and compiled primal succeeds. A zero-coordinate
+  ordinary Enzyme gradient, plus an empty multivariate batch beside a nonempty
+  factor, without ReactiveKernels. Native reverse returns the correct empty/zero
+  gradients, and compiled primal succeeds. Empty multivariate slice batches
+  return zero natively and in compiled primal execution. A zero-coordinate
   RK-PPL sampler therefore supports native AD and compiled values; compiled
   gradient acceptance pins this exact export error. Empty observation and
   parameter domains with a nonempty coordinate pack pass compiled reverse.
+  No dummy batch or handwritten derivative substitutes for the empty case.
