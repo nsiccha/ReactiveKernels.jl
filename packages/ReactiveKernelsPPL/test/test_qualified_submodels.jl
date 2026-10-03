@@ -43,17 +43,17 @@ const _QS_HEADS = (:outer, :(_QSLibrary.Blocks.outer),
     GlobalRef(_QSLibrary.Blocks, :outer))
 const _QS_STREAM_HEADS = (:stream, :(_QSLibrary.Blocks.stream), :_QSStreamAlias)
 
-function _qs_ast(head; cell = false, stream = false)
+function _qs_ast(head; cell = false, stream = false,
+        cell_location = :(z[i]), named = false)
     stream && return Expr(:block, Expr(:call, :~, :y, Expr(:call, head, :x)))
     call = Expr(:call, head, Expr(:parameters, Expr(:kw, :scale, 1.3)), :x)
     if cell
         call.args[end] = :(x[i])
-        return quote
-            @plate for i in eachindex(y)
-                z[i] ~ $call
-                y[i] ~ Normal(z[i], 0.5)
-            end
-        end
+        cells = Any[:(z[i] ~ $call)]
+        named && push!(cells, :(mu[i] = $cell_location))
+        push!(cells, :(y[i] ~ Normal($(named ? :(mu[i]) : cell_location), 0.5)))
+        return Expr(:block, Expr(:macrocall, Symbol("@plate"), LineNumberNode(0),
+            Expr(:for, :(i = eachindex(y)), Expr(:block, cells...))))
     end
     return quote
         z_b ~ Normal(0, 1)
@@ -70,14 +70,19 @@ function _qs_build(ast, data)
     return bound, built, u
 end
 
+function _qs_cell_oracle(nt, data, local_scale)
+    b = nt.z.nested.b
+    return sum(logpdf.(Normal(), b); init = 0.0) +
+        sum(logpdf.(Normal.(1.3 .* b .* data.x .+ local_scale .* b,
+            0.5), data.y); init = 0.0)
+end
+
 function _qs_oracle(kind, nt, data)
     if kind === :stream
         return logpdf(Normal(), nt.y.b) +
             sum(logpdf.(Normal.(nt.y.b .* data.x, 0.5), data.y))
-    elseif kind === :cell
-        b = nt.z.nested.b
-        return sum(logpdf.(Normal(), b)) +
-            sum(logpdf.(Normal.(1.3 .* b .* data.x, 0.5), data.y))
+    elseif kind in (:cell, :cell_sum)
+        return _qs_cell_oracle(nt, data, kind === :cell_sum ? 1 : 0)
     end
     b = nt.z.nested.b
     return logpdf(Normal(), b) + logpdf(Normal(), nt.z_b) +
@@ -85,23 +90,28 @@ function _qs_oracle(kind, nt, data)
 end
 
 function _qs_fd(f, u; h = 1e-6)
-    map(eachindex(u)) do i
+    g = similar(u, Float64)
+    for i in eachindex(u)
         up, dn = copy(u), copy(u)
         up[i] += h
         dn[i] -= h
-        (f(up) - f(dn)) / (2h)
+        g[i] = (f(up) - f(dn)) / (2h)
     end
+    return g
 end
 
 @testset "qualified submodels: transparent binding, density and gradient" begin
     data = (; x = [-0.5, 0.2, 1.0], y = [0.1, -0.2, 0.3])
     saved = deepcopy(data)
-    for kind in (:latent, :cell, :stream)
+    for kind in (:latent, :cell, :cell_sum, :stream)
         heads = kind === :stream ? _QS_STREAM_HEADS : _QS_HEADS
         expanded = Expr[]
         coordinates = Vector{Symbol}[]
         for head in heads
-            ast = _qs_ast(head; cell = kind === :cell, stream = kind === :stream)
+            ast = _qs_ast(head; cell = kind in (:cell, :cell_sum),
+                stream = kind === :stream,
+                cell_location = kind === :cell_sum ?
+                    :(z[i] + z[i].nested.b) : :(z[i]))
             expansion, _ = ReactiveKernelsPPL._expand_submodels(
                 ast, Set((:x, :y)), @__MODULE__)
             push!(expanded, Base.remove_linenums!(deepcopy(expansion)))
@@ -145,6 +155,28 @@ end
         @test g ≈ _qs_fd(reference, u) rtol = 1e-5 atol = 1e-7
     end
     @test all(≈(first(values)), values)
+end
+
+@testset "cell submodels: signed and repeated locals compose inline or named" begin
+    for n in (0, 1, 3)
+        data = (; x = collect(range(-0.5, 1.0; length = max(n, 2)))[1:n],
+            y = fill(0.1, n))
+        saved = deepcopy(data)
+        for (loc, scale) in ((:(z[i] - z[i].nested.b), -1),
+                (:(z[i].nested.b + z[i]), 1),
+                (:(z[i] + z[i].nested.b + z[i].nested.b), 2)),
+                named in (false, true)
+            bound, built, u = _qs_build(_qs_ast(:outer; cell = true,
+                cell_location = loc, named), data)
+            reference(v) = _qs_cell_oracle(constrain(built.layout, v), data, scale)
+            q = prepare_sampler(built, bound, u; backend = _QS_BACKEND)
+            g = similar(u)
+            value, _ = sampler_value_and_gradient!(q, g, u)
+            @test value ≈ reference(u) rtol = 1e-12
+            @test g ≈ _qs_fd(reference, u) rtol = 1e-5 atol = 1e-7
+        end
+        @test data == saved
+    end
 end
 
 @testset "qualified submodels: binding reads and expansion guards" begin

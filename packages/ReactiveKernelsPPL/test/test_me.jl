@@ -108,17 +108,18 @@ end
     @test priors[:b].args == (arg1 = 0, arg2 = 1)
 end
 
-@testset "surface me lowering: bare latent stays fail-closed" begin
+@testset "surface me lowering: inline latent values and index validation" begin
     Dn = (:y, :x_obs)
     plate = Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
         Expr(:for, Expr(:(=), :i, :(eachindex(x_obs))),
             Expr(:block, :(x_true[i] ~ Normal(0, 1)),
                 :(x_obs[i] ~ Normal.(x_true[i], 0.5)))))
-    # Bare latent in an inline location (no named derived to transform).
-    # capability: latent in an inline likelihood location Normal.(a .+ x_true, sigma) (named form admitted; naming never changes legality) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(Expr(:block,
+    # An inline location composes a latent value like the named form (P3).
+    inline = lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(sigma ~ Exponential(1)), plate,
-        :(y .~ Normal.(a .+ x_true, sigma))), Dn; conditioned = Dn); true)
+        :(y .~ Normal.(a .+ x_true, sigma))), Dn; conditioned = Dn)
+    @test any(t -> t.kind === LatentTerm && t.columns == [:x_true],
+        only(p for p in inline.predictors if p.name === :y_eta).terms)
     # Two coefficients on one latent column.
     twice = lower_rkppl(Expr(:block,
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)), :(c ~ Normal(0, 1)),
@@ -250,8 +251,8 @@ end
         TermSpec(ContinuousTerm, [:x_true], NamedTuple(), :x_true,
             :x_true_term)])
     @test validate_plan(good) === nothing
-    # Offset over a latent: the latent takes a free coefficient, never a
-    # bare add.
+    # Offset over a latent uses the wrong IR kind; an unscaled latent
+    # value is represented by LatentTerm.
     off = mkplan(TermSpec[
         TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
             :intercept),
