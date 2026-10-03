@@ -63,9 +63,8 @@ using Test
                 mu = phi[node1] .- phi[node2]
                 y .~ Normal.(mu, 1.0)
             end), (:y, :node1, :node2), SurfaceLoweringError),
-        # losscurve_sislob: Weibull/log-logistic CDF growth curve; no
-        # Weibull in the response vocabulary.
-        # capability: a Weibull observation with an ordinary parameter (todo `1qlbn5b`).
+        # losscurve_sislob: the ordinary Weibull shape parameter and literal
+        # scale are admitted by constructor-value lowering (`1qlbn5b`).
         ("losscurve_sislob", "Weibull response",
             :(begin
                 a ~ Normal(0, 1)
@@ -144,7 +143,7 @@ using Test
                 y .~ Normal.(m, sigma)
             end), (:y,), SurfaceLoweringError),
     ]
-    capabilities = Set(["scalar-data likelihood", "literal prob rejected", "data-column mixture weights", "Weibull response"])
+    capabilities = Set(["scalar-data likelihood", "literal prob rejected"])
     for (item, label, prog, datanames, E) in cases
         @testset "$item: $label" begin
             if label == "data-varying scan recurrence"
@@ -153,7 +152,7 @@ using Test
                 item == "arma11" && (data[:z] = zeros(4))
                 plan = bind_data(lower_rkppl(prog, datanames; conditioned = observed), data)
                 @test build_kernel(plan).spec isa KernelSpec
-            elseif label == "data-column mixture weights"
+            elseif label in ("data-column mixture weights", "Weibull response")
                 @test lower_rkppl(prog, datanames; conditioned=datanames) isa StructuralPlan
             elseif label in capabilities
                 # capability: each entry above names a valid model shape (todo `1qlbn5b`).
