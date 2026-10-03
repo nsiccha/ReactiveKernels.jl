@@ -60,8 +60,9 @@ code is not executed by the docs build.
   such as `if flag; acc = acc + x; end` carries the updated binding out of
   the selected arm; the other arm keeps its existing value. Assignments to
   several locals keep their order. A branch used as an expression also
-  returns its authored value. These branches stay lazy inside the retained
-  loop, including an empty loop. A loop may read a host struct such as a
+  returns its authored value. These branches lower to lazy regions inside
+  the retained loop, including an empty loop; the default executable boundary
+  above still applies. A loop may read a host struct such as a
   schedule plan; it crosses the loop untraced, and a traced value it reads
   enters as a fresh
   tracer, so a zero-sized input is not returned as an aliased output (which
