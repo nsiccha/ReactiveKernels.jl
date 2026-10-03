@@ -3602,7 +3602,7 @@ function _validate_columns(plan::StructuralPlan)
     plan.n_obs >= 0 || _fail(:plan, "n_obs must be nonnegative, got $(plan.n_obs)")
     modelvals, managed = _axis_exempt_columns(plan)
     axes = _observation_axes(plan)
-    axes === nothing || axes.total == plan.n_obs || _fail(:plan,
+    axes === nothing || !hasproperty(axes, :domains) || axes.total == plan.n_obs || _fail(:plan,
         "n_obs $(plan.n_obs) disagrees with the $(axes.total) broadcast observations")
     for (name, col) in plan.columns
         name in modelvals && continue
