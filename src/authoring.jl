@@ -57,6 +57,8 @@ end
 
 Base.copy(callable::_KernelSignatureCallable{<:BorrowedBatchedKernel}) =
     _KernelSignatureCallable(copy(callable.target), callable.signature)
+Base.copy(callable::_KernelSignatureCallable{<:_ScheduledBatchedKernel}) =
+    _KernelSignatureCallable(copy(callable.target), callable.signature)
 
 @inline function (callable::_KernelSignatureCallable)(args...; kwargs...)
     _kernel_signature_invoke(callable, args, NamedTuple(kwargs))
@@ -3971,7 +3973,8 @@ end
 
 """
     prepare_batched(spec::KernelSpec; batched, have=inputs(spec),
-                    want=outputs(spec), passes=(), reuse=false) -> callable
+                    want=outputs(spec), passes=(), reuse=false,
+                    schedule=nothing) -> callable
 
 First-class position batching for a scalar `@kernel`. The named HAVE ports
 carry one shared trailing batch axis; all other HAVE ports are shared by every
@@ -3999,6 +4002,19 @@ runs as its fused loop at every position. The default allocates fresh stacked ou
 retaining a result across calls is safe. It is not the allocation-free reducing
 `plate` contract.
 
+Native batching is serial unless `schedule=NativeScheduling(chunk_size=...,
+workers=...)` explicitly opts in. The scheduler computes shared-only work once,
+then distributes runtime position ranges among independent borrowed workers.
+Each worker retains at most `chunk_size` positions and copies completed chunks
+into the final stacked result. The result still spans the whole batch. Hints
+are caller-selected: there is no automatic cost threshold. Empty batches and
+one-worker calls use the ordinary serial driver. Scheduled instances, including
+owning ones, retain worker buffers and are not reentrant; use `copy(template)`
+per concurrent caller. Copies share computation and start with empty buffers.
+Owning Reactant calls retain the ordinary compiled position loop. Scheduling
+applies to native primal evaluation; prepare scalar AD with `scalar_kernel` and
+lift it with `replica` for the existing per-position derivative path.
+
 `reuse=true` opts into native borrowed stacked-output buffers. A later call may
 overwrite every returned array; consume synchronously or `deepcopy` before
 publishing, retaining or passing it to a callback. Prepare a template once,
@@ -4023,20 +4039,21 @@ function prepare_batched(spec::KernelSpec;
                          have = _KERNEL_DEFAULT_BOUNDARY,
                          want = _KERNEL_DEFAULT_BOUNDARY,
                          passes = (),
-                         reuse = false)
+                         reuse = false,
+                         schedule = nothing)
     selected_have = have === _KERNEL_DEFAULT_BOUNDARY ? inputs(spec) : have
     selected_want = want === _KERNEL_DEFAULT_BOUNDARY ? outputs(spec) : want
     prepared = prepare(plan(spec; have = selected_have, want = selected_want);
                        passes = passes)
-    replicated = vectorize(prepared; batched, reuse)
+    replicated = vectorize(prepared; batched, reuse, schedule)
     have === _KERNEL_DEFAULT_BOUNDARY || return replicated
     _kernel_signature_callable(replicated, spec.call_signature)
 end
 
 """
-    vectorize(kernel::PreparedKernel; batched, reuse=false) -> callable
+    vectorize(kernel::PreparedKernel; batched, reuse=false, schedule=nothing) -> callable
     vectorize(spec::KernelSpec; batched, have=inputs(spec),
-              want=outputs(spec), passes=(), reuse=false) -> callable
+              want=outputs(spec), passes=(), reuse=false, schedule=nothing) -> callable
 
 Lift a scalar kernel over position batching. This is the concise public spelling
 for [`prepare_batched`](@ref); `replica` remains the equivalent lower-level
@@ -4047,9 +4064,9 @@ For a native `reuse=true` result, `copy(kernel)` creates an independent executio
 instance with empty output buffers and the same prepared computation. See
 [`prepare_batched`](@ref) for its lifetime and concurrency contract.
 """
-function vectorize(kernel::PreparedKernel; batched, reuse = false)
+function vectorize(kernel::PreparedKernel; batched, reuse = false, schedule = nothing)
     replicated = replica_graph(kernel; batched)
-    reuse ? _borrowed_batch(replicated) : replicated
+    _position_schedule(replicated, schedule, Val(reuse))
 end
 
 function vectorize(spec::KernelSpec;
@@ -4057,12 +4074,13 @@ function vectorize(spec::KernelSpec;
                    have = _KERNEL_DEFAULT_BOUNDARY,
                    want = _KERNEL_DEFAULT_BOUNDARY,
                    passes = (),
-                   reuse = false)
-    prepare_batched(spec; batched, have, want, passes, reuse)
+                   reuse = false,
+                   schedule = nothing)
+    prepare_batched(spec; batched, have, want, passes, reuse, schedule)
 end
 
-function vectorize(callable::_KernelSignatureCallable; batched, reuse = false)
-    replicated = vectorize(callable.target; batched, reuse)
+function vectorize(callable::_KernelSignatureCallable; batched, reuse = false, schedule = nothing)
+    replicated = vectorize(callable.target; batched, reuse, schedule)
     _kernel_signature_callable(replicated, callable.signature)
 end
 
@@ -4072,11 +4090,13 @@ batched_ports(kernel::ReplicatedKernel{B}) where {B} =
 batched_ports(kernel::GraphReplicatedKernel{B}) where {B} =
     Tuple(kernel.inputs[index].name for index in B)
 batched_ports(kernel::BorrowedBatchedKernel) = batched_ports(kernel.target)
+batched_ports(kernel::_KernelSignatureCallable) = batched_ports(kernel.target)
 
 "The scalar prepared kernel retained as the mathematical authority."
 scalar_kernel(kernel::ReplicatedKernel) = kernel.target
 scalar_kernel(kernel::GraphReplicatedKernel) = kernel.target
 scalar_kernel(kernel::BorrowedBatchedKernel) = scalar_kernel(kernel.target)
+scalar_kernel(kernel::_KernelSignatureCallable) = scalar_kernel(kernel.target)
 
 """
     plate(spec::KernelSpec; have, want, batched, reduce = :+) -> PreparedKernel

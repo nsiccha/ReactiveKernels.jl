@@ -58,6 +58,7 @@ const _MATRIX_CORE_TESTS = (
     "test_precompiled_prepared.jl",
     "test_position_batching.jl",
     "test_position_batching_reuse.jl",
+    "test_native_scheduling.jl",
     "test_position_batching_allocation_slices.jl",
     "test_kernel_stateful.jl",
     "test_kernel_methodir.jl",
