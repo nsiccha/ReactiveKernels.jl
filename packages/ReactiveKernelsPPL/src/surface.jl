@@ -967,6 +967,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # `in_model`): it lowers as data, computed once by `bind_data`, which
     # checks its length or row count. Read whole, it stays model-level.
     rawdata = data
+    sample, det, matrix_values = _route_hcat_values(sample, det, data, glms;
+        resolve = a -> _resolve_module_calls(a, mod, model_names, "matrix value"))
     aligned = _aligned_module_data(sample, det, data)
     aligned_defs = Pair{Symbol,Any}[p for p in det if first(p) in aligned]
     if !isempty(aligned)
@@ -1128,7 +1130,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
     # remains Julia's business at bind/evaluation, never an observation axis.
-    shape_env = _ShapeEnv(shape_env.aligned, union(shape_env.values, whole))
+    shape_env = _ShapeEnv(shape_env.aligned, union(shape_env.values, whole),
+        matrix_values)
     detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
         env = shape_env)
     canonmap = Dict{Symbol,Any}()
@@ -1423,6 +1426,12 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # other consumers, including reductions, extracted leaves and the
     # retained recurrence body. Keep their definition dependencies too.
     needed = copy(declaration_dependencies)
+    for p in arrays, d in p.dims
+        union!(needed, _value_symbols(d))
+    end
+    for p in params, arg in values(p.args)
+        union!(needed, _value_symbols(arg))
+    end
     for a in (ctx.synth_assigns..., ctx.synth_derived...)
         union!(needed, _value_symbols(a.expr))
     end
@@ -1716,10 +1725,14 @@ end
 # model-level array parameters (Dirichlet simplexes) and whole-value data
 # inputs definitions may compute with. Whole data have unknown Julia
 # shape, like an undotted module call result (`:scalar` in this analysis).
+# `matrices` retains the rank of ordinary hcat values after data-only
+# definitions leave the definition table, preventing dotted matmul rewrites.
 struct _ShapeEnv
     aligned::Set{Symbol}
     values::Set{Symbol}
+    matrices::Set{Symbol}
 end
+_ShapeEnv(aligned, values) = _ShapeEnv(aligned, values, Set{Symbol}())
 const _NO_SHAPE_ENV = _ShapeEnv(Set{Symbol}(), Set{Symbol}())
 
 function _def_shapes(det, data::Set{Symbol}, detmap;
@@ -1736,6 +1749,7 @@ function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
         env::_ShapeEnv = _NO_SHAPE_ENV)
     ex isa Symbol ||
         return _shape_of_expr(ex, data, detmap, memo, active, env)
+    ex in env.matrices && return :matrix
     ex in data && return ex in env.values ? :scalar : :vector
     haskey(detmap, ex) || return get(memo, ex, :scalar)
     haskey(memo, ex) && return memo[ex]
@@ -1788,6 +1802,7 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
+    fn === GlobalRef(Base, :hcat) && return length(ex.args) > 1 ? :matrix : :array
     fn isa GlobalRef && fn.mod === (@__MODULE__) && fn.name === :_bound_array_value &&
         return :array
     fn isa Symbol || return :scalar  # module/anonymous calls: model-level
@@ -1810,6 +1825,7 @@ function _elementwise_shape(argshapes)
     :invalid in argshapes && return :invalid
     # Julia determines broadcast compatibility from the actual axes.
     # A declared array can share the observation axis of another operand.
+    :matrix in argshapes && return :matrix
     :vector in argshapes && return :vector
     :array in argshapes && return :array
     return :scalar
@@ -1906,6 +1922,7 @@ end
 function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
     fn in (:hsgp, :spline) && return :vector
     :invalid in argshapes && return :invalid
+    fn in ELEMENTWISE_OPS && return _elementwise_shape(argshapes)
     :array in argshapes && return _array_call_shape(fn, argshapes)
     nvec = count(==(:vector), argshapes)
     nmat = count(==(:matrix), argshapes)
@@ -1914,6 +1931,10 @@ function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
         # validation — intercept `ones(length(x))` plus vector columns — lives in
         # matrix-def extraction, not here).
         return :matrix
+    elseif nmat > 0 && fn in (:+, :-)
+        return nmat == length(argshapes) ? :matrix : :invalid
+    elseif nmat > 0 && fn === :/
+        return argshapes == [:matrix, :scalar] ? :matrix : :invalid
     elseif nmat > 0 && fn !== :*
         # Slice D1 admits matrices only in predictor matmuls (`mu =
         # X * b`); every other matrix operation fails closed at the
@@ -4783,11 +4804,9 @@ end
 # statements lower to plan tables, not kernel assignments). The generator
 # emits each matrix once (`X = Float64.(hcat(...))`); predictor matmuls
 # (`mu = X * b`) reference it by name. Columns are the intercept `ones(length(x))`
-# plus bare data/derived-data columns — latent, scan, parameter, and
-# nested-matrix columns fail closed here; duplicate columns and double
-# intercepts fail in contract validation. Only named definitions are
-# admitted: inline `hcat` binds to a name first (a synth-naming
-# follow-up, the `_extract_column` precedent).
+# plus bare data/derived-data columns. Other constructions and consumers
+# keep ordinary Julia values through _route_hcat_values. Duplicate columns
+# and double intercepts fail in this affine optimization's validation.
 
 _is_hcat_def(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
@@ -4956,6 +4975,116 @@ function _matrix_column(nm, c, detshape, detmap, data, prior_names,
                                              "columns only)")
     _sfail("design matrix `$nm` over unknown name `$c` — columns are " *
            "the intercept `ones(length(x))` or bare data/derived columns")
+end
+
+# Keep the affine column-table recipe only for its supported construction
+# and consumers. Every other hcat keeps Base's ordinary value semantics.
+function _ordinary_hcat_values(sample, det, data, glms)
+    detmap = Dict{Symbol,Any}(det)
+    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
+    glm_mats = Set{Symbol}(g.matrix for g in glms)
+    setdiff!(mats, glm_mats)
+    generic = Set{Symbol}()
+    isempty(mats) && return generic
+    params = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
+    coefvec = Set{Symbol}(s.lhs for s in sample
+        if s.broadcast && s.matrix !== nothing)
+    arrays = Set{Symbol}(s.lhs for s in sample if s.dims !== nothing ||
+        s.levels !== nothing || s.matrix !== nothing ||
+        _is_dirichlet_call(s.rhs) || _is_ordered_call(s.rhs))
+    shape(ex) = _shape_of(ex, data, detmap, Dict{Symbol,Symbol}(
+        a => :array for a in arrays), Set{Symbol}())
+    pure = Set{Symbol}()
+    for nm in mats
+        args = detmap[nm].args[2:end]
+        isempty(args) && (push!(generic, nm); continue)
+        all(a -> a isa Symbol && a in data ||
+            (_matrix_intercept_anchor(a) !== nothing &&
+             _matrix_intercept_anchor(a) in args), args) && push!(pure, nm)
+        for a in args
+            if a isa Symbol
+                # Unknown names retain their ordinary scope diagnostic.
+                a ∉ data && !haskey(detmap, a) && a ∉ params && continue
+                (a in params || shape(a) !== :vector) && push!(generic, nm)
+            elseif _matrix_intercept_anchor(a) === nothing ||
+                    _matrix_intercept_anchor(a) ∉ args
+                push!(generic, nm)
+            end
+        end
+    end
+    legacy = intersect(pure, _hcat_value_reads(det, detmap, sample, data,
+        glms, arrays, Set{Symbol}()))
+    used = Set{Symbol}()
+    function walk(ex; whole = false)
+        if ex isa Symbol
+            if ex in mats
+                push!(used, ex)
+                whole && ex in legacy || push!(generic, ex)
+            end
+            return nothing
+        end
+        ex isa Expr || return nothing
+        a = ex.args
+        if ex.head === :call && length(a) == 3 && a[1] === :* &&
+                a[2] isa Symbol && a[2] in mats
+            push!(used, a[2])
+            # Construct-owned legacy priors resolve an undeclared bare
+            # coefficient vector later. Keep that candidate on the affine
+            # route; ordinary models still require its stated prior.
+            implicit = a[3] isa Symbol && a[3] ∉ data &&
+                a[3] ∉ params && !haskey(detmap, a[3])
+            if !(a[3] isa Symbol && a[3] in coefvec) &&
+                    !implicit &&
+                    !(a[2] in legacy && shape(a[3]) === :array)
+                push!(generic, a[2])
+            end
+            walk(a[3])
+            return nothing
+        end
+        fn = ex.head === :call && !isempty(a) ? a[1] : nothing
+        valuecall = fn isa GlobalRef ||
+            (fn isa Symbol && fn ∉ _MATRIX_OPERAND_HEADS)
+        wh = whole || valuecall || ex.head in (:ref, Symbol("'"))
+        for x in a
+            walk(x; whole = wh)
+        end
+        return nothing
+    end
+    for (nm, rhs) in det
+        nm in mats && continue
+        walk(rhs)
+    end
+    for s in sample
+        s.matrix in mats && push!(used, s.matrix)
+        walk(s.rhs)
+    end
+    union!(generic, setdiff(mats, used))
+    return generic
+end
+
+function _resolve_hcat_values(ex; keep = false, resolve = identity)
+    ex isa Expr || return ex
+    ex.head === :quote && return ex
+    if _is_hcat_def(ex)
+        head = keep ? :hcat : GlobalRef(Base, :hcat)
+        value = Expr(:call, head, map(a -> _resolve_hcat_values(a;
+            resolve), ex.args[2:end])...)
+        return keep ? value : resolve(value)
+    end
+    return Expr(ex.head, map(a -> _resolve_hcat_values(a; resolve), ex.args)...)
+end
+
+function _route_hcat_values(sample, det, data, glms; resolve = identity)
+    generic = _ordinary_hcat_values(sample, det, data, glms)
+    det = Pair{Symbol,Any}[nm => _resolve_hcat_values(rhs;
+        keep = _is_hcat_def(rhs) && nm ∉ generic, resolve) for (nm, rhs) in det]
+    sample = SampleStmt[SampleStmt(s.lhs, _resolve_hcat_values(s.rhs; resolve),
+        s.broadcast, s.range, s.levels, s.matrix, s.dims, s.slices,
+        s.count_columns) for s in sample]
+    matrices = Set{Symbol}(nm for (nm, rhs) in det if nm in generic &&
+        rhs isa Expr && rhs.head === :call && length(rhs.args) > 1 &&
+        rhs.args[1] === GlobalRef(Base, :hcat))
+    return sample, det, matrices
 end
 
 # ── `hcat` matrices read as values ───────────────────────────────────
@@ -9686,6 +9815,12 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             return _lower_location_symbol_error(lhs, loc, ctx; bare,
                 value)
         end
+        # Ordinary matrix values broadcast in a response slot. Keep the
+        # authored value, including aliases, when axes or another definition
+        # also reads it; a predictor with its name would shadow that value.
+        value && !bare && _canon_shape(loc, ctx) === :matrix &&
+            return _value_location!(lhs, loc, pred_link, ctx,
+                predictors, pred_idx; synth)
         # Scalar definitions stay ordinary values, except for the already
         # admitted signed coefficient aliases (their intercept plan stays).
         value && !bare && _scalar_location_value(loc, ctx) &&

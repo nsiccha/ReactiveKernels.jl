@@ -118,12 +118,60 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d)
     if m !== nothing
         return k == 2 ? length(m.columns) : _value_rows(plan, M)
     end
+    if !haskey(plan.columns, M)
+        shape = _hcat_value_axes(plan, M, label)
+        shape === nothing || return shape[k]
+    end
     haskey(plan.columns, M) || _fail(label, "array $name axis " *
         "`$fn($M, $k)` needs a bound matrix $M")
     col = plan.columns[M]
-    col isa AbstractMatrix || _fail(label, "array $name axis " *
-        "`$fn($M, $k)` sizes over a matrix, but $M is a vector column")
+    col isa AbstractArray || _fail(label, "array $name axis " *
+        "`$fn($M, $k)` needs an array, got $(summary(col))")
     return size(col, k)
+end
+
+# A live hcat can size a declared coefficient vector from its operands'
+# shapes without evaluating parameters. Scalars contribute one column;
+# vectors and matrices keep their actual dimensions. Rows still obey
+# hcat's equal-row rule, including singleton and empty domains.
+function _hcat_value_axes(plan::StructuralPlan, ex, label,
+        active = Set{Symbol}())
+    ex isa Number && return (1, 1)
+    if ex isa Symbol
+        if haskey(plan.columns, ex)
+            v = plan.columns[ex]
+            v isa Number && return (1, 1)
+            v isa AbstractVector && return (length(v), 1)
+            v isa AbstractMatrix && return size(v)
+            return nothing
+        end
+        any(p -> p.name === ex, plan.parameters) && return (1, 1)
+        ex in active && return nothing
+        i = findfirst(a -> a.name === ex, plan.assignments)
+        j = findfirst(d -> d.name === ex, plan.derived)
+        rhs = i !== nothing ? plan.assignments[i].expr :
+            j !== nothing ? plan.derived[j].expr : nothing
+        rhs === nothing && return nothing
+        push!(active, ex)
+        shape = _hcat_value_axes(plan, rhs, label, active)
+        delete!(active, ex)
+        return shape
+    end
+    ex isa Expr || return nothing
+    anchor = _matrix_intercept_anchor(ex)
+    if anchor !== nothing && haskey(plan.columns, anchor)
+        return (length(plan.columns[anchor]), 1)
+    end
+    ex.head === :call && !isempty(ex.args) &&
+        ex.args[1] === GlobalRef(Base, :hcat) || return nothing
+    parts = map(a -> _hcat_value_axes(plan, a, label, active), ex.args[2:end])
+    any(isnothing, parts) && return nothing
+    isempty(parts) && return (0, 1) # Base.hcat() returns an empty vector
+    rows = first(parts)[1]
+    all(p -> p[1] == rows, parts) || _fail(label,
+        "hcat operands have different row counts: " *
+        repr([p[1] for p in parts]) * " (DimensionMismatch)")
+    return (rows, sum(p[2] for p in parts))
 end
 _array_dim_size(plan::StructuralPlan, p::ArrayParameter, d) =
     _array_dim_size(plan, p.name, p.label, d)
