@@ -10652,6 +10652,16 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     end
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
     append!(defs, Pair{Symbol,Any}[d.name => d.expr for d in plan.derived])
+    # A value matrix is a data-only definition, even when its hcat recipe
+    # lives in the matrix table. Its consumers determine its observation
+    # axis; construction reads the source columns whole. Keep this edge in
+    # the same dependency analysis as ordinary data-only definitions.
+    value_matrices = _value_design_matrix_names(plan)
+    for m in plan.matrices
+        m.name in value_matrices || continue
+        push!(defs, m.name => Expr(:call, GlobalRef(Base, :hcat),
+            (c for c in m.columns if c !== nothing)...))
+    end
     # Scalar and declared-array prior arguments are whole model values.
     # Propagate that context through their definitions just as for a
     # module-call argument; their raw data have no observation axis.
@@ -10722,6 +10732,12 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             for r in plan.responses
                 _drop_held_names!(free, r.family === MixtureFam ?
                     _with(r; mixture_weights = nothing) : r)
+            end
+        elseif f === :matrices
+            # Affine/GLM matrices retain their row contract. Value-matrix
+            # recipes are definitions above, not observation consumers.
+            for m in plan.matrices
+                m.name in value_matrices || _drop_held_names!(free, m)
             end
         else
             _drop_held_names!(free, getfield(plan, f))
