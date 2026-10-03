@@ -376,14 +376,29 @@ its variable name does not affect slicing. Native concentration/AUC, generated
 densities, default Enzyme reverse, and warmed nonallocating queries are covered
 by synthetic independent references.
 
-Full PK Reactant compilation is currently unsupported: batching the fixed-size
-system matrix fails with a `similar(::Broadcasted, ::Type{SMatrix}, ...)`
-method error before the event scan. `test_pk_subject_plate_reactant.jl` records
-this boundary. The generic nested plate/scan path has compiled primal and
+Fixed-size matrix and named carry intermediates now batch through the same
+authored cell graph. Each traced leaf keeps its own element type and tensor
+shape; metadata restores the matrix or named tuple in the next cell. The
+matrix portion has compiled primal/default-reverse parity and fixed backend
+structure across subject counts in `test_pk_subject_plate_reactant.jl`.
+Compound results currently require a one-dimensional lane axis and immutable
+fixed structure or traced tensor leaves; unsupported host collections fail
+explicitly.
+
+Full PK Reactant compilation is still unsupported: the ordinary
+`StaticArrays.exp` inside the event scan uses a traced Boolean as a host branch
+condition. The same test pins that exact error across growing subject/event
+axes; `benchmark/repro_reactant_static_matrix_exp.jl` isolates it without RK.
+The exponential capability is tracked in
+[issue #34](https://github.com/nsiccha/ReactiveKernels.jl/issues/34).
+The generic nested plate/scan path has compiled primal and
 reverse parity and a fixed backend operation inventory as both subjects and
 sequence lengths grow (`test/test_scan_plate_reactant.jl`). Those checks do
 not establish compiled PK support. Eager branches or parameter-dependent host
-precomputation are not substitutes for repairing the matrix boundary.
+precomputation are not substitutes for repairing the exponential boundary.
+Full PK acceptance must also check default optimized reverse structure:
+`benchmark/repro_reactant_lazy_batch_growth.jl` isolates small lazy batches
+whose values and gradients pass but whose branch regions expand per lane.
 
 The standalone CPU reproducers in `benchmark/joint_stan_tiled/` also retain the
 two historical upstream reverse defects, fixed in Reactant 0.2.289+; the PK

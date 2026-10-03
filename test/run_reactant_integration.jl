@@ -22,6 +22,7 @@ ppl_examples_testfile = joinpath(
 authored_scan_testfile = joinpath(@__DIR__, "test_authored_scan_reactant.jl")
 lazy_branches_testfile = joinpath(@__DIR__, "test_lazy_branches_reactant.jl")
 authored_loops_testfile = joinpath(@__DIR__, "test_authored_loops_reactant.jl")
+loop_view_capture_testfile = joinpath(@__DIR__, "test_loop_view_capture_reactant.jl")
 rectangular_fold_testfile = joinpath(@__DIR__, "test_rectangular_fold_reactant.jl")
 inner_partial_evaluation_testfile = joinpath(
     @__DIR__, "test_inner_plate_partial_evaluation_reactant.jl")
@@ -54,6 +55,7 @@ mktempdir() do env
         PackageSpec(name = "LambertW"),
         PackageSpec(name = "LogExpFunctions"),
         PackageSpec(name = "DifferentiationInterface"),
+        PackageSpec(name = "StaticArrays"),
     ])
     Pkg.instantiate()
 
@@ -71,6 +73,7 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $lazy_branches_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_loops_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $loop_view_capture_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $glm_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $tensorized_vect_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $tensorized_macros_testfile`)

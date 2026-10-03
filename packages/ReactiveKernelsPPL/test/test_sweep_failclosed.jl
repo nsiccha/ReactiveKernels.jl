@@ -10,9 +10,8 @@ using Test
 @testset "sweep refusals and capability gaps" begin
     # Each entry: (sweep item, label, program, data names, error type).
     cases = [
-        # Rate scalar spelling: the thin layer is column-oriented; scalar
-        # data has no admission (rate replicates via 1-element columns).
-        # capability: scalar data at every model door (P10a 0dejlw1) (todo `1qlbn5b`).
+        # Scalar observed Binomial: lower and public doors have independent
+        # density/Jacobian/AD coverage in test_prior_observation_audit.jl.
         ("rate_1", "scalar-data likelihood",
             :(begin
                 theta ~ Beta(1.0, 1.0)
@@ -143,7 +142,7 @@ using Test
                 y .~ Normal.(m, sigma)
             end), (:y,), SurfaceLoweringError),
     ]
-    capabilities = Set(["scalar-data likelihood", "literal prob rejected"])
+    capabilities = Set(["literal prob rejected"])
     for (item, label, prog, datanames, E) in cases
         @testset "$item: $label" begin
             if label == "data-varying scan recurrence"
@@ -152,7 +151,7 @@ using Test
                 item == "arma11" && (data[:z] = zeros(4))
                 plan = bind_data(lower_rkppl(prog, datanames; conditioned = observed), data)
                 @test build_kernel(plan).spec isa KernelSpec
-            elseif label in ("data-column mixture weights", "Weibull response")
+            elseif label in ("scalar-data likelihood", "literal prob rejected", "data-column mixture weights", "Weibull response")
                 @test lower_rkppl(prog, datanames; conditioned=datanames) isa StructuralPlan
             elseif label in capabilities
                 # capability: each entry above names a valid model shape (todo `1qlbn5b`).

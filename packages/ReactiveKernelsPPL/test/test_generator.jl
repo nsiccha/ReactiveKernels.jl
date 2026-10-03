@@ -60,6 +60,12 @@ function _check_gradient(spec, plan, u)
     return g
 end
 
+function _check_model_math(built, bound, u, oracle)
+    @test _query(built.spec, bound, :posterior, u) ≈ oracle(u)
+    gradient = _check_gradient(built.spec, bound, u)
+    @test gradient ≈ _findiff_grad(oracle, u) rtol = 1e-5 atol = 1e-7
+end
+
 function _gen_columns()
     n = 6
     cols = Dict{Symbol,AbstractVector}(

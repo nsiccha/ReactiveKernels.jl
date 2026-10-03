@@ -1,7 +1,9 @@
 # Focused synthetic PK subject-plate reproducer. The historical upstream
 # while/nested-if reverse defects are fixed in Reactant 0.2.289+. This ordinary
-# graph currently fails compilation at fixed-size system-matrix batching,
-# before the retained event scan. No private diagnostic toggle is needed.
+# graph batches its fixed-size system matrix, then fails in StaticArrays.exp
+# on a traced branch condition inside the retained event scan. No private
+# diagnostic toggle is needed. The backend-only exponential reproducer is
+# benchmark/repro_reactant_static_matrix_exp.jl.
 using ReactiveKernels, ReactiveKernelsPPL, Reactant, Enzyme, DifferentiationInterface
 const PK_READS = ReactiveKernelsPPL._pk_auc_spec
 @kernel pk_objective(q::Vector{Float64}, ends, op_type, op_dt, op_amount,

@@ -5,6 +5,7 @@ using ReactiveKernels
 using MutatingFunctions
 using DifferentiationInterface
 using DifferentiationInterface: Cache
+using LinearAlgebra
 import Enzyme
 using Test
 
@@ -341,15 +342,14 @@ end
     vna, _ = ad_value_and_gradient!(prepna, gna, a0)
     @test vna == v_
     @test gna == g == ones(n)
-    # The bound-only product folded to exactly one appended constant.
-    primal_bounds = count(
-        op -> op isa ReactiveKernels._BoundConstant, kbna.ops)
-    @test length(prepna.call.ops) == length(kbna.ops) + 1
-    @test count(op -> op isa ReactiveKernels._BoundConstant,
-                prepna.call.ops) == primal_bounds + 1
+    # Locate the product by its value, independently of operation-table layout.
+    product = m * v
+    folded_ops = filter(op -> op isa ReactiveKernels._BoundConstant &&
+        op.value isa AbstractVector && op.value == product, prepna.call.ops)
+    @test length(folded_ops) == 1
     # The folded value is an owned copy, never the primal slot's buffer.
-    folded = last(prepna.call.ops).value
-    @test folded == kbna.caches[matmul_step][] == m * v
+    folded = only(folded_ops).value
+    @test folded == kbna.caches[matmul_step][] == product
     @test folded !== kbna.caches[matmul_step][]
     # The gradient never recomputes the bound-only product.
     dataflow_bytes = @allocated ad_value_and_gradient!(prep, g, a0)
@@ -359,6 +359,97 @@ end
     @test dataflow_bytes > 0
     @test na_bytes < sizeof(a0)
     @test na_bytes < dataflow_bytes
+end
+
+# Test-only observation of product execution; the numerical inputs stay intact.
+struct NAADCountedMatrix <: AbstractMatrix{Float64}
+    data::Matrix{Float64}
+    products::Base.RefValue{Int}
+end
+Base.size(m::NAADCountedMatrix) = size(m.data)
+Base.getindex(m::NAADCountedMatrix, i::Int, j::Int) = m.data[i, j]
+function Base.:*(m::NAADCountedMatrix, v::Vector{Float64})
+    m.products[] += 1
+    m.data * v
+end
+function LinearAlgebra.mul!(out::Vector{Float64}, m::NAADCountedMatrix,
+                            v::Vector{Float64})
+    m.products[] += 1
+    LinearAlgebra.mul!(out, m.data, v)
+end
+
+@testset "bound-only folding execution, ownership and growth" begin
+    spec = @kernel counted_fold_naad(m, v::Vector{Float64},
+                                     a::Vector{Float64}) = begin
+        t = m * v .+ a
+        # A declared scalar avoids the separate exemplar value/type probe.
+        s::Float64 = sum(t)
+        return s
+    end
+    allocations = Int[]
+    for n in (0, 64, 4096)
+        data = hcat(ones(n), collect(1.0:n))
+        m = NAADCountedMatrix(data, Ref(0))
+        v = [0.5, -0.25]
+        # Binary-exact inputs keep the independent reduction oracle exact.
+        a = fill(0.125, n)
+        originals = (copy(data), copy(v), copy(a))
+        product = data * v
+        kernel = prepare_nonallocating(spec; have = (:m, :v, :a),
+            want = :s, bound = (; m, v))
+        @test m.products[] == 0
+        prepared = prepare_ad(kernel, NA_AD_BACKEND, a; active = :a)
+        @test m.products[] == 1
+        folded = only(op.value for op in prepared.call.ops
+            if op isa ReactiveKernels._BoundConstant &&
+               op.value isa AbstractVector && op.value == product)
+        matmul = only(i for i in eachindex(kernel.ops)
+            if kernel.ops[i] isa ReactiveKernels._MatMulStep)
+        @test folded == product
+        @test folded !== kernel.caches[matmul][]
+        preparation = prepared.preparation
+        gradient = similar(a)
+        for point in (a, fill(-0.25, n), a)
+            value, returned = ad_value_and_gradient!(prepared, gradient, point)
+            @test value == sum(product .+ point)
+            @test returned === gradient
+            @test gradient == ones(n)
+            @test m.products[] == 1
+        end
+        @test prepared.preparation === preparation
+        push!(allocations, @allocated ad_value_and_gradient!(
+            prepared, gradient, a))
+        @test m.products[] == 1
+        second = prepare_ad(kernel, NA_AD_BACKEND, a; active = :a)
+        @test m.products[] == 2
+        second_folded = only(op.value for op in second.call.ops
+            if op isa ReactiveKernels._BoundConstant &&
+               op.value isa AbstractVector && op.value == product)
+        @test second_folded == folded
+        @test second_folded !== folded
+        @test kernel(a) == sum(product .+ a)
+        @test m.products[] == 3
+        @test ad_value_and_gradient!(prepared, gradient, a)[1] ==
+              sum(product .+ a)
+        @test m.products[] == 3
+        @test (data, v, a) == originals
+
+        # An inactive but unbound operand still requires a product per call.
+        live = prepare_nonallocating(spec; have = (:m, :v, :a),
+            want = :s, bound = (; m))
+        live_prepared = prepare_ad(live, NA_AD_BACKEND, v, a; active = :a)
+        for live_v in (v, 2v)
+            before = m.products[]
+            value, _ = ad_value_and_gradient!(live_prepared, gradient, live_v, a)
+            @test m.products[] == before + 1
+            @test value == sum(data * live_v .+ a)
+            @test gradient == ones(n)
+        end
+        @test (data, v, a) == originals
+    end
+    println("NONALLOCATING_AD_ALLOC\tfold_growth\t", allocations)
+    @test maximum(allocations) <= 64
+    @test allocations[end] <= allocations[2] + 64
 end
 
 @testset "inactive unbound steps still recompute per call" begin

@@ -279,9 +279,9 @@ end
     # refused: the cell observes `yy` twice (single assignment)
     @test_throws "more than one `.~`" lower_rkppl(
         plate_ast([good_cell[1], good_cell[2], good_cell[2], :mu], [subj]), data; conditioned = data)
-    # capability: observation-free panel cell (panel v1 needs exactly one in-cell likelihood) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :mu], [subj]), data; conditioned = data); true)
+    # capability: deterministic panel cells collect their value with zero likelihood (todo `1qlbn5b`).
+    free = lower_rkppl(plate_ast([good_cell[1], :mu], [subj]), data; conditioned = data)
+    @test isempty(only(free.kernel_plates).obs)
     # refused: plate cell has no trailing collected name; a `.~` statement has no value to collect (P2, P3)
     @test_throws "collected result name" lower_rkppl(
         plate_ast([good_cell[1], good_cell[2]], [subj]), data; conditioned = data)
@@ -304,14 +304,16 @@ end
     @test_broken (lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ BernoulliLogit.(mu)), :mu],
             [subj]), data; conditioned = data); true)
-    # Binomial needs trials threading (sequenced follow-up).
+    # Response-space Binomial threads integer trials and probability values.
     # capability: Binomial in-cell observations with explicit trials and probabilities (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Binomial.(2, logistic.(mu))), :mu], [subj]), data; conditioned = data); true)
+    binom = lower_rkppl(plate_ast([good_cell[1], :(yy .~ Binomial.(2, logistic.(mu))), :mu],
+        [subj]), data; conditioned = data)
+    @test only(only(binom.kernel_plates).obs).family === BinomialProbFam
     # Unknown heads fail with the admitted list.
     # capability: arbitrary Distributions families as in-cell observations (Cauchy) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Cauchy.(mu, sigma)), :mu], [subj]), data; conditioned = data); true)
+    cauchy_plan = lower_rkppl(plate_ast([good_cell[1], :(yy .~ Cauchy.(mu, sigma)), :mu],
+        [subj]), data; conditioned = data)
+    @test only(only(cauchy_plan.kernel_plates).obs).family === CauchyFam
     # 1-arg arity pins.
     # refused: malformed distribution, Poisson takes one argument (Julia MethodError, P3)
     @test_throws "exactly 1 arguments" lower_rkppl(
@@ -329,8 +331,9 @@ end
     @test (lower_rkppl(
         plate_ast([good_cell[1], :(yy .~ Normal.(mu)), :mu], [subj]), data; conditioned = data); true)
     # capability: inline expression arguments in in-cell observations (`Normal.(mu .+ 1.0, sigma)`) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(
-        plate_ast([good_cell[1], :(yy .~ Normal.(mu .+ 1.0, sigma)), :mu], [subj]), data; conditioned = data); true)
+    inline = lower_rkppl(plate_ast([good_cell[1], :(yy .~ Normal.(mu .+ 1.0, sigma)), :mu],
+        [subj]), data; conditioned = data)
+    @test :yy_arg1 in first.(only(inline.kernel_plates).assignments)
     # refused: undeclared name `zz` observed (P6, 05oe96l)
     @test_throws "not a slice param" lower_rkppl(
         plate_ast([good_cell[1], :(zz .~ Normal.(mu, sigma)), :mu], [subj]), data; conditioned = data)
@@ -341,7 +344,7 @@ end
     @test_throws "must be positive" lower_rkppl(
         plate_ast(good_cell, [Expr(:kw, :subjects, 0)]), data; conditioned = data)
     # capability: computed `subjects=` expression (`1 + 1`) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(
+    @test (lower_rkppl(
         plate_ast(good_cell, [Expr(:kw, :subjects, :(1 + 1))]), data; conditioned = data); true)
     # refused: unknown keyword `group` (Julia MethodError, P3)
     @test_throws "exactly one keyword" lower_rkppl(
@@ -417,10 +420,11 @@ end
     dims = Dict{Symbol,Int}(:kernel_nsub_pred => 2, :kernel_T_pred => 3)
     mu_stmt = :(mu = (b0 .* d) .* ts)
     obs_stmt = :(yy .~ Normal.(mu, sigma))
-    # Series reductions are cross-timepoint (P3).
+    # Series reductions return one value per subject.
     # capability: per-subject series reductions (`mean(ts)`) in a panel cell (panel v1) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(
-        plate_ast([:(m = mean(ts)), mu_stmt, obs_stmt, :mu]), data; conditioned = data); true)
+    reduced = lower_rkppl(plate_ast([:(m = mean(ts)), mu_stmt, obs_stmt, :mu]), data;
+        conditioned = data)
+    @test :m in first.(only(reduced.kernel_plates).assignments)
     # Supported: module functions consume whole values in ordinary
     # plate cells (P3; todo `0bfiemp`), with explicit covariance arguments.
     @test validate_structure(lower_rkppl(quote
@@ -546,14 +550,16 @@ end
         plate_ast([mu_stmt, :(yy .~ Bernoulli.(mu)), :mu]), data; conditioned = data)
     # refused: Bernoulli response not Bool/0-1 (wrong eltype)
     @test_throws "Bool or 0/1" bind_data(bern_unbound, float_cols; dims)
-    # Scalar count slices in T-models fail closed (Float64 expansions).
+    # Scalar count slices keep their integer type when repeated over T.
     scalar_count_cols = Dict{Symbol,AbstractVector}(
         :t => [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
         :dose => [10.0, 20.0],
         :obs => [1, 2],
     )
     # capability: count (Poisson/NB2) response on a scalar slice in a T-model (Int expansion; Bernoulli twin already admits it) (todo `1308iv0`)
-    @test_broken (bind_data(pois_unbound, scalar_count_cols; dims); true)
+    scalar_count_bound = bind_data(pois_unbound, scalar_count_cols; dims)
+    @test scalar_count_bound.columns[:pred_kexp_obs] == [1,1,1,2,2,2]
+    @test eltype(scalar_count_bound.columns[:pred_kexp_obs]) === Int
     # Gamma/Beta response domains.
     gamma_unbound = lower_rkppl(
         plate_ast([mu_stmt, :(yy .~ Gamma.(sigma, mu)), :mu]), data; conditioned = data)
@@ -687,11 +693,10 @@ end
         :t => _AXIS2_T, :dose => _AXIS2_DOSE, :obs => Bool[1, 0])
     bound = bind_data(lower_rkppl(ast, (:dose, :obs, :t); conditioned = (:dose, :obs, :t)), columns;
         dims = _AXIS2_DIMS)
-    # Scalar Bool response → Float64 expansion → Bool twin.
-    @test eltype(bound.columns[:pred_kexp_obs]) === Float64
-    twin = bound.columns[ReactiveKernelsPPL._kbool_name(:pred, :yy)]
-    @test twin isa Vector{Bool}
-    @test twin == Bool[1, 1, 1, 0, 0, 0]
+    # Scalar Bool responses stay Bool through their flat expansion.
+    expanded = bound.columns[:pred_kexp_obs]
+    @test expanded isa Vector{Bool}
+    @test expanded == Bool[1, 1, 1, 0, 0, 0]
     built = build_kernel(bound)
     u = [0.5]
     eta = 0.5 .* _AXIS2_DEX .* _AXIS2_T

@@ -259,11 +259,9 @@ end
         @test r.rval ≈ r.native rtol = 1e-9
         @test r.rgrad ≈ r.g rtol = 1e-9
     end
-    # Capability gap: multivariate normal slices run natively only (their
-    # density throws under tracing) — todo
-    # ReactiveKernels/todos/2026-10-02T09-46-03-194-1318xn3.
-    compiled_mvn = try
-        r = _rj_slices_check(:(begin
+    # Default preparation keeps transparent errors. The opt-in compiled
+    # multivariate policy is covered separately below.
+    @test_throws "native execution only" _rj_slices_check(:(begin
             s ~ Exponential(1)
             L ~ LKJCholesky(2, 2.0)
             sd[1:2] .~ Exponential.(1)
@@ -271,11 +269,7 @@ end
             eachrow(B[levels(k), 1:2]) .~ MvNormalCholesky(zeros(2), F)
             y .~ Normal.(B[k, 1], s)
         end))
-        isapprox(r.primal, r.native; rtol = 1e-9)
-    catch e
-        e isa ArgumentError && occursin("native execution only",
-            sprint(showerror, e)) || rethrow()
-        false
-    end
-    @test_broken compiled_mvn
 end
+
+include("test_mv_solve_reactant.jl")
+include("test_mv_orientations_reactant.jl")

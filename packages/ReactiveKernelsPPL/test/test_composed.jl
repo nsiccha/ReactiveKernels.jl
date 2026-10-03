@@ -235,9 +235,13 @@ end
 end
 
 @testset "composed fail-closed" begin
-    # Undotted vector combination: Julia-truthful, write the dots.
-    # capability: undotted array arithmetic be * th - al (valid Julia: scalar*vector and vector-vector) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    # Admitted: scalar-vector multiplication and vector-vector subtraction
+    # preserve ordinary Julia arithmetic (P3, todo `15lq8iu`).
+    @test (lower_rkppl(quote
+        a_th ~ Normal(0, 1)
+        b_th ~ Normal(0, 1)
+        a_al ~ Normal(0, 1)
+        b_al ~ Normal(0, 1)
         th = a_th .+ b_th .* xs
         al = a_al .+ b_al .* xs
         be ~ Normal(0.0, 100.0)
@@ -270,7 +274,7 @@ end
         e
     end
     # capability: valid ordinary value composition (P8 1cmodra; todo `15lq8iu`).
-    @test_broken (err === nothing || throw(err))
+    @test (err === nothing || throw(err))
     # A scalar leaf names a sampled name or scalar definition — or fails.
     # refused: be has no declaration (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote

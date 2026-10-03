@@ -25,13 +25,14 @@ export ColumnRef, ParamName, ColumnData
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BinomialLogitFam, NegativeBinomial2Fam, GammaLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
-    BinomialCloglogFam, BinomialProbFam, BetaLogitFam, CategoricalLogitFam,
+    BinomialCloglogFam, BinomialProbFam, BetaLogitFam, BetaShapeFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
     MvNormalCholeskyFam, CensoredAddpropnormalFam, TgiCategoryFam,
     TgiResponseFam, TgiCensoredFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
     NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
+    GammaValueFam, WeibullValueFam, CauchyFam,
     ZeroInflatedBinomialFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
@@ -118,6 +119,7 @@ export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
 
 include("contract.jl")
 include("expm_rule.jl")
+import ReactiveKernelsDistributionKernels: DistributionKernelSources
 # Owned symmetric-eigendecomposition rules: defined in
 # ReactiveKernelsDistributionKernels (beside `loggamma` / `logbeta`),
 # re-exported here with their rule graphs.

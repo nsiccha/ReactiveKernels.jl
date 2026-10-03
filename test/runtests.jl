@@ -44,6 +44,7 @@ const _MATRIX_CORE_TESTS = (
     "test_derivative_rules.jl",
     "test_derivative_rule_multioutput.jl",
     "test_authoring.jl",
+    "test_error_policy.jl",
     "test_tensorized_vect.jl",
     "test_tensorized_macros.jl",
     "test_docs_navigation.jl",

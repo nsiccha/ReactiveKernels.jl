@@ -56,6 +56,19 @@ enters prepared hot-state tuples.
 struct _NoKernelSource end
 const _NO_KERNEL_SOURCE = _NoKernelSource()
 
+# A source-visible domain check. Backends retain this check at execution
+# time; its predicate is nondifferentiable, and the exception is static
+# diagnostic data rather than an active mathematical operand.
+@inline function _runtime_check(valid, error::Exception)
+    valid || throw(error)
+    nothing
+end
+
+struct _RuntimeCheckCallback{E}
+    error::E
+end
+(check::_RuntimeCheckCallback)(valid) = _runtime_check(valid, check.error)
+
 struct Recipe
     id::Int
     inputs::Tuple{Vararg{Value}}
@@ -70,7 +83,7 @@ Recipe(id, inputs, outputs, op, cost, cse_key, effectful) =
     Recipe(id, inputs, outputs, op, cost, cse_key, effectful, _NO_KERNEL_SOURCE)
 
 """
-    _KernelSourceOp{DefToken,Form,F,TF}
+    _KernelSourceOp{DefToken,Form,F,TF,IG}
 
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
 COMPILER-OWNED provenance (RK 07:21). Authoring wraps ONLY the anonymous-closure path of
@@ -85,17 +98,20 @@ distinguishes a `:portcall` — a call THROUGH A PORT, `callable(args…)`, whos
 source and the rest are ordered args — from a general `:fused` expression, so a prepared handle can
 self-derive the DESTINATION contract (a port-call with one owned buffer + one owned scalar output →
 `f(dest, args…)::scalar`) from source SHAPE + typed slot roles, never from a name/Recipe id/inspection.
+`IG` holds the captured source's throw-stripped twin, selected only by an
+explicit `on_error = :ignore` preparation; older internal fixtures use `nothing`.
 The call forwards INLINE. A RAW anonymous closure inserted into a Graph carries no wrapper and is
 rejected as opaque when captured into a prepared handle.
 """
-struct _KernelSourceOp{DefToken,Form,F,TF}
+struct _KernelSourceOp{DefToken,Form,F,TF,IG}
     f::F
     tensor_f::TF
+    ignored_throws::IG
 end
 
-_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF) where
-        {DefToken,Form,F,TF} =
-    _KernelSourceOp{DefToken,Form,F,TF}(f, tensor_f)
+_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF,
+                ignored_throws::IG = nothing) where {DefToken,Form,F,TF,IG} =
+    _KernelSourceOp{DefToken,Form,F,TF,IG}(f, tensor_f, ignored_throws)
 # Preserve the established internal constructor for compiler fixtures and
 # already-authored handles; without an alternate body it uses the same callable
 # in both modes.
@@ -197,6 +213,9 @@ kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = F
     Base.Broadcast.broadcasted(bc.f,
         map(arg -> _tensorized_cat_operand(marker, arg), bc.args)...)
 @inline _tensorized_getindex(array, indices...) = getindex(array, indices...)
+# Typed conversion at the compiler boundary keeps Base.trunc semantics in
+# native execution. Tracing extensions can preserve already-integer values.
+@inline _tensorized_trunc(::Type{T}, x) where {T<:Integer} = trunc(T, x)
 @inline function _tensorized_setindex(array, value, indices...)
     setindex!(array, value, indices...)
     array
@@ -739,9 +758,12 @@ struct _TensorizedEachcol{A}
     parent::A
 end
 
-struct _TensorizedPlateBatch{A}
+struct _TensorizedPlateBatch{A,S}
     values::A
+    schema::S
 end
+
+_TensorizedPlateBatch(values) = _TensorizedPlateBatch(values, nothing)
 
 @inline _tensorized_eachcol(parent) = _TensorizedEachcol(parent)
 # A backend may represent an in-flight plate value with its own marker type

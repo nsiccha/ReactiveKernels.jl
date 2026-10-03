@@ -121,8 +121,66 @@ replicate the density body. Concentrations must be positive.
 Dynamic Normal, Cauchy and Weibull truncation supports native and Reactant
 primal and reverse execution. Gamma, Beta and InverseGamma truncation calls
 incomplete gamma or beta functions whose traced methods are still unavailable;
-those normalizers support native execution. The existing simplex transform's
-Reactant limitation also applies to hierarchical Dirichlet priors.
+those normalizers support native execution. Hierarchical Dirichlet supports
+native and compiled primal and reverse execution.
+
+## Distribution arguments are values
+
+Locations, scales, StudentT degrees of freedom and zero-inflation
+probabilities may be scalar or per-observation expressions. Naming an
+expression keeps the same density. Scalar calls stay scalar, and vector
+operations use Julia's dots:
+
+```julia
+a ~ Normal(0, 1)
+b ~ Normal(0, 1)
+s ~ Normal(0, 1)
+nu ~ Exponential(1)
+mu = exp.(a .+ b .* x)
+y .~ StudentT.(2 + nu, mu, exp(s))
+```
+
+Data-computed scales such as `exp.(x)` and mixed plate-latent locations
+such as `theta .+ b .* x` also use their written values. Literal and named
+scalar offsets add directly to a predictor. Gaussian mixture components also
+accept these value locations, including scalar aliases; explicit component
+links such as `Poisson.(exp.(a))` apply to sampled scalars.
+
+`Beta.(alpha, beta)` accepts two ordinary shape values. Circular
+VonMises endpoints may be named, bound as data or sampled; they must define
+a finite interval of width `2pi`. A live lower endpoint can use
+`hi = lo + 2pi`. The interval and support are checked before wrapping the
+location or evaluating the density.
+
+An ordered vector may use Normal, Cauchy, Laplace, Logistic or StudentT
+element priors with live scalar arguments, for example
+`c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log
+densities on increasing vectors, with no factorial normalizer.
+
+Ordered extents may be data-only expressions, including
+`length(levels(x)) - 1`, `length(levels(y)) - 2` and
+`length(unique(y)) - 1`. Binding evaluates the actual nonnegative integer
+extent even when a Gaussian response reads the vector. An ordinal response
+has support `1:length(c)+1`; an observed category outside it fails at bind.
+`levels` includes a declared DataAPI level pool; `unique` counts observed
+values. The prior and support come from the declaration: cumulative
+cutpoints may have an ordinary Normal vector prior (non-increasing values
+give `-Inf`), and stopping-ratio thresholds may have an Ordered or ordinary
+Normal/Cauchy/Laplace/Logistic/StudentT prior.
+
+A per-cell `Flat()` prior contributes zero density and retains its layout
+coordinates. Its posterior may be proper through the likelihood; density
+evaluation requests no draw from the unnormalizable prior.
+
+Scalar observations also keep their declaration's density. For
+`m = @rkppl begin theta ~ Beta(1, 1); k ~ Binomial(n, theta) end`,
+`m(; n=5) | (; k=2)` packs only `theta`. Direct lowering with
+`conditioned=(:k,)` has the same density and Jacobian. Trials must be a
+nonnegative integer value, and the observed `k` must be scalar; use `.~`
+for an observation vector.
+
+Uniform bounds may be live scalar values, including in factor arrays:
+`lo ~ Normal(0, 1); c[levels(g)] .~ Uniform.(lo, lo + 3)`.
 
 ## Julia semantics, written out
 
@@ -165,7 +223,10 @@ array dimension, keeps its bind-time evaluation and validation.
 `c[g]` gathers them per observation. A full-cover factor may appear alongside
 an intercept, with the fixed or hierarchical priors written in the model.
 RK-PPL translates these declarations without imposing an identifiability or
-posterior-propriety test. Offsets are plain data summands.
+posterior-propriety test. Offsets are plain data or scalar value summands.
+A grouping axis may be computed from data, for example
+`z = x .+ 1; c[levels(z)] .~ Normal.(0, s); mu = c[z]`. Binding computes
+these grouping values once and preserves the caller's data.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("10_levels_prior.jl", :rkppl_levels)
@@ -186,6 +247,11 @@ scale prior is `HalfNormal(1)`; correlated margins use `LKJCholesky(K, 1.0)`.
 | `b ~ varying_coefs_centered_correlated(g, K)` | Directly sampled multivariate rows | `b[g, 1] .+ x .* b[g, 2]` |
 | `u ~ varying_stratified(g, s)` | One value per observation, with a scale per stratum | `u`, or slope `x .* u` |
 | `r ~ varying_stratified_correlated(g, s, K)` | One K-component row per observation, with scales and a correlation factor per stratum | `r[:, 1] .+ x .* r[:, 2]` |
+
+Scalar margins compose in the same way: `m = mean(x)` followed by
+`mu = a .+ m .* b[g]`. If the same `m` supplies a Gaussian scale in
+`y .~ Normal.(mu, m)`, binding evaluates the data reduction once and requires
+a finite, strictly positive result.
 
 These are the actual library definitions, read from the loaded submodels:
 
@@ -213,6 +279,14 @@ gather stays K×N until the authored adjoint turns it into N×K.
 The legacy `varying_draws` / `varying_effect`
 keywords are `eta`, `levels`, and `sd`; centered coefficients are declared
 through array priors or the centered library entries above.
+
+Valid multivariate row, column and vector priors compile with Reactant when
+prepared with `on_error = :ignore` (also accepted by `prepare_query` and
+`prepare_sampler`). This explicit policy strips visible throws and assertions;
+default native preparation checks the factor or covariance. The shared solve
+retains its loops and uses ordinary reverse AD. Empty batches return zero in
+native and compiled primal execution; compiled empty gradients remain subject
+to the [Reactant export limitation](constraints.md#acceptance-and-existing-limitations).
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("27_varying_slope_lib.jl", :rkppl_varying_slope)
@@ -247,17 +321,48 @@ Main.ReactiveKernelsDocs.render_rkppl_corpus_example("62_mm_intercept_lib.jl", :
 ## Declared arrays as values
 
 `z[levels(g), 1:K] .~ Normal.(0, 1)` declares a groups × K matrix;
-`L ~ LKJCholesky(K, eta)` declares a lower-triangular matrix. Sized vectors
+`L ~ LKJCholesky(K, eta)` declares a lower-triangular matrix; an explicit
+third argument `'U'` returns its upper-triangular counterpart. Sized vectors
 (`sd[1:K] .~ HalfNormal.(1)`) and multivariate rows
 (`eachrow(c[levels(g), 1:K]) .~ MvNormalCholesky(zeros(K), F)`) are also plain
 Julia values. Their priors are explicit, and their dimensions determine their
 packed coordinates.
+
+The LKJ shape `eta` is a scalar value: it can be a positive literal, bound
+data, a sampled parameter, or a definition using those values. A per-level
+LKJ prior can share that same value across all its factors.
+
+Compiled reverse mode currently fails for a data-sized whole factor with a
+live shape when its retained diagonal prior and shared response expressions
+both read the factor. Native density and gradients and compiled primal pass.
+The literal two-dimensional and per-level forms have compiled reverse coverage;
+see the [backend limitation](constraints.md#acceptance-and-existing-limitations).
+
+Joint correlated responses can also use explicit factor priors:
+declare `sd[1:2] .~ Gamma.(2, 1)` and `C ~ LKJCholesky(2, eta)`,
+then bind `F = sd .* C` and use
+`[y1, y2] ~ MvNormalCholesky([mu1, mu2], F)`. The scale vector has
+positive support and the factor width matches the outcome count.
 
 Array-valued definitions retain known axes: `b = z * (sd .* L)'` is groups ×
 K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
 `L[2, 1]` and `M[:, 1]` remain ordinary Julia reads. A submodel's returned
 array follows the same rule. A data-only definition can size a declared array
 through `levels(gg)`, as in the multi-membership example above.
+
+Level axes preserve the order of their source. `z[levels(g)]` uses the
+`DataAPI.levels` pool, including unobserved categorical levels;
+`z[unique(g)]` uses first occurrence order. A supplied vector or range
+`lv`, or a data-only definition such as `lv = reverse(unique(g))`, can
+declare `z[lv]` in that order. Selections such as
+`levels(g)[1:2:end]` and `unique(g)[3:-2:1]` select positions in the
+source pool. Labels compare with `isequal`, including `missing`, `NaN`,
+and array values. A column read only as labels may contain `missing`;
+numeric observations retain their missing-value checks.
+
+For paired crossed effects, index each axis by one observation's label
+inside a plate: `mu[i] = a + b[g[i], h[i]]`. Julia's `b[g, h]` with two
+vectors selects a Cartesian matrix.
 
 The library's `gp_exp_quad_cov` and `gp_periodic_cov` functions build covariance
 with an RK plate over two location axes. Data-only locations cache pair

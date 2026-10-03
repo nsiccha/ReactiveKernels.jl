@@ -137,10 +137,9 @@ end
         y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(s))
     end, (:y, :x, :z); conditioned = (:y, :x, :z))
     @test only(gamma.responses).scale == ScalePredictorRef(:s, LogLink)
-    # Both Gamma positions must name the same alpha spelling — mixed
-    # wrappers never merge.
+    # Shape and scale can use distinct alpha values or wrappers.
     # capability: Gamma args beyond the Gamma.(A, M ./ A) template: mixed alpha spellings s vs exp.(s) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         c ~ Normal(0, 1)
@@ -148,9 +147,9 @@ end
         eta = a .+ b .* x
         s = c .+ d .* z
         y .~ Gamma.(s, exp.(eta) ./ exp.(s))
-    end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))).responses)
     # capability: Gamma args beyond the (alpha, mu/alpha) template: different predictors in shape and mean divisor (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         c ~ Normal(0, 1)
@@ -161,7 +160,7 @@ end
         s = c .+ d .* z
         t = e .+ f .* x
         y .~ Gamma.(exp.(s), exp.(eta) ./ exp.(t))
-    end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))).responses)
 end
 
 @testset "surface: shared scale predictor" begin
@@ -182,9 +181,9 @@ end
     @test all(r -> r.scale == ScalePredictorRef(:sigma, LogLink),
         plan0.responses)
     @test count(p -> p.name === :sigma, plan0.predictors) == 1
-    # One link per predictor across slots: a second use-site link fails.
+    # One authored value can feed several use-site links.
     # capability: one predictor used under two use-site links (exp.(sigma) and bare sigma) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a1 ~ Normal(0, 1)
         a2 ~ Normal(0, 1)
         b1 ~ Normal(0, 1)
@@ -196,7 +195,7 @@ end
         sigma = c .+ d .* z
         y1 .~ Normal.(mu1, exp.(sigma))
         y2 .~ Normal.(mu2, sigma)
-    end, (:y1, :y2, :x, :z); conditioned = (:y1, :y2, :x, :z)); true)
+    end, (:y1, :y2, :x, :z); conditioned = (:y1, :y2, :x, :z))).responses)
 end
 
 @testset "surface: intercept-only scale predictor" begin
@@ -280,34 +279,34 @@ end
     end, (:y, :x, :z); conditioned = (:y, :x, :z))
     # Wrappers take exactly one predictor definition.
     # capability: constant-expression scale exp.(1.5) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(1.5))
-    end, (:y, :x); conditioned = (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x))).responses)
     # capability: link-wrapped scalar parameter as scale exp.(tau) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         tau ~ Exponential(1.0)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(tau))
-    end, (:y, :x); conditioned = (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x))).responses)
     # capability: data-expression scale exp.(x) (data-computed scales already admitted) (todo `0fkd9yk`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(x))
-    end, (:y, :x); conditioned = (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x))).responses)
     # refused: undeclared name nosuch (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(nosuch))
     end, (:y, :x); conditioned = (:y, :x))
     # capability: arbitrary elementwise function on a scale predictor sqrt.(sigma) (P8, 1cmodra) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         c ~ Normal(0, 1)
@@ -315,7 +314,7 @@ end
         mu = a .+ b .* x
         sigma = c .+ d .* z
         y .~ Normal.(mu, sqrt.(sigma))
-    end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
+    end, (:y, :x, :z); conditioned = (:y, :x, :z))).responses)
     # capability: probit.-wrapped scale predictor (arbitrary scale wrapper) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -326,23 +325,21 @@ end
         sigma = c .+ d .* z
         y .~ Normal.(mu, normcdf.(sigma))
     end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
-    # The two slots take distinct predictors (contract gate, BRM-mirroring).
-    # A same-link self-use reaches the contract rule; a wrapped self-use
-    # trips the one-link-per-predictor rule first (same fail-closed).
+    # Location and scale may read the same authored predictor value.
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, exp.(mu))
-    end, (:y, :x); conditioned = (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x))).responses)
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
         y .~ Normal.(mu, mu)
-    end, (:y, :x); conditioned = (:y, :x)); true)
+    end, (:y, :x); conditioned = (:y, :x))).responses)
     # Beta-kappa predictors are log-only (a concentration — contract
     # gate): a bare predictor use fails closed.
     # capability: identity-link Beta concentration predictor (bare k) (todo `05fuzch`)
@@ -385,7 +382,7 @@ end
                     :(theta[i] ~ Normal(mu, tau)),
                     :(y[i] ~ Normal.(theta[i], _t2[i]))))))
     # capability: deterministic transform of a plate latent (_t2 = theta .+ 1) as per-cell scale (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(expr, (:y,); conditioned = (:y,)); true)
+    @test (lower_rkppl(expr, (:y,); conditioned = (:y,)); true)
 end
 
 @testset "contract: hand-built scale-predictor plans" begin

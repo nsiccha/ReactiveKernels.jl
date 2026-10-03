@@ -16,6 +16,51 @@ using Test
 import ReactiveKernelsPPL: lkj_chol_constrain, lkj_logconst, lkj_chol_logjac,
     lkj_corr_cholesky_logpdf
 
+# Current equivalents of the retired mm/gr templates. Collection and
+# normalization choices are ordinary author arithmetic; every prior lives
+# in an explicit submodel body. The density/gradient oracles and compiled
+# checks for these bodies are in test_varying_values*.jl.
+function _mm_explicit_plan(kind = :membership; eta = 2.0,
+        groups = (:g, :h), weights = (:w1, :w2), normalize = true,
+        distinct_sd = false, names = false)
+    length(groups) == 1 && (kind = :single)
+    ast, data = _cv_program(kind, 7, 2)
+    function rw(x)
+        x isa Expr || return x
+        x.head === :call && x.args[1] === :~ && x.args[2] === :eta &&
+            return Expr(:(=), :eta, eta)
+        x.head === :call && x.args[1] === :_cv_coefs && distinct_sd &&
+            return Expr(:call, :_cv_distinct, x.args[2:end]...)
+        if !normalize && x.head === :(=) && x.args[1] in (:r1, :r2) &&
+                x.args[2] isa Expr && x.args[2].head === :call &&
+                x.args[2].args[1] === :./
+            return Expr(:(=), x.args[1], rw(x.args[2].args[2]))
+        end
+        return Expr(x.head, map(rw, x.args)...)
+    end
+    ast = rw(ast)
+    if kind === :membership
+        # Both tuple and vector inputs select the same two explicit weight
+        # columns. Their values remain observation vectors.
+        for (target, source) in zip((:w1, :w2), weights)
+            data[target] = copy(data[source])
+        end
+    end
+    if names
+        data[:g_s1] = [mod1(i, 2) for i in 1:7]
+        append!(ast.args, (:(d2 ~ varying_coefs_correlated(g_s1, 2)),
+            :(r3 = d2[g_s1, 1])))
+        for (i, ex) in enumerate(ast.args)
+            ex isa Expr && ex.head === :(=) && ex.args[1] === :nu || continue
+            # Keep the multi-slice predictor and add the independently named
+            # block. This probe checks binding names as well as composition.
+            ast.args[i] = Expr(:(=), :nu, Expr(:call, :.+, ex.args[2], :r3))
+        end
+    end
+    return bind_data(lower_rkppl(ast, data; mod = @__MODULE__,
+        conditioned = (:y, :y2)), data)
+end
+
 # Lower + bind + build + query a program; return
 # `(bound, built, kern, layout)`.
 function _mm_query(prog::Expr, cols::Dict{Symbol,AbstractVector})
@@ -160,23 +205,11 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
     end
     @testset "error spellings" begin
         # One group.
-        # capability: one-group `mm(g1)` lowers as plain grouping (10gzbm9 degenerate) (todo `1308iv0`)
-        @test_broken (lower_rkppl(quote
-                a ~ Normal(0, 5)
-                d ~ varying_draws(mm(g1), [1])
-                r ~ varying_slice(d, 1)
-                mu = a .+ r
-                y .~ Normal.(mu, 1.0)
-            end, (:y, :g1); conditioned = (:y, :g1)); true)
+        # Admitted by the explicit-library program below (todo `1308iv0`).
+        @test validate_plan(_mm_explicit_plan(groups = (:g,))) === nothing
         # Weights as a vector, not a tuple.
-        # capability: mm weights as a vector literal `[w1, w2]` (tuple vs vect collection kind; P3) (todo `1308iv0`)
-        @test_broken (lower_rkppl(quote
-                a ~ Normal(0, 5)
-                d ~ varying_draws(mm(g1, g2; weights = [w1, w2]), [1])
-                r ~ varying_slice(d, 1)
-                mu = a .+ r
-                y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2, :w1, :w2); conditioned = (:y, :g1, :g2, :w1, :w2)); true)
+        # Admitted by the explicit-library program below (todo `1308iv0`).
+        @test validate_plan(_mm_explicit_plan(weights = [:w1, :w2])) === nothing
         # Weight arity mismatch.
         # refused: weight count != group count (malformed construct call)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -214,23 +247,11 @@ _mm_cols() = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y), :x => copy(_MM_X),
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2))
         # Missing semicolon.
-        # capability: comma keyword `mm(g1, g2, normalize = false)` (Julia treats it as `;` kwarg; P3) (todo `1308iv0`)
-        @test_broken (lower_rkppl(quote
-                a ~ Normal(0, 5)
-                d ~ varying_draws(mm(g1, g2, normalize = false), [1])
-                r ~ varying_slice(d, 1)
-                mu = a .+ r
-                y .~ Normal.(mu, 1.0)
-            end, (:y, :g1, :g2); conditioned = (:y, :g1, :g2)); true)
+        # Admitted by the explicit-library program below (todo `1308iv0`).
+        @test validate_plan(_mm_explicit_plan(normalize = false)) === nothing
         # eta != 1.0 on correlated.
-        # capability: LKJ eta != 1 on multi-membership draws (SB-parity scope) (todo `1308iv0`)
-        @test_broken (lower_rkppl(quote
-                a ~ Normal(0, 5)
-                d ~ varying_draws(mm(g1, g2), [1, x]; eta = 2.0)
-                r ~ varying_slice(d, 1:2)
-                mu = a .+ r
-                y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g1, :g2); conditioned = (:y, :x, :g1, :g2)); true)
+        # Admitted by the explicit-library program below (todo `1308iv0`).
+        @test validate_plan(_mm_explicit_plan(eta = 2.0)) === nothing
         # A non-default eta at K=1 (nothing to parameterize).
         # refused: K = 1 has no correlation; eta must be 1, whether explicit or omitted (user decisions 1hqmdas, 1nh2dia)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -294,14 +315,8 @@ end
     end
     @testset "error spellings" begin
         # Bare gr(g).
-        # capability: `gr(g)` without `by` lowers as plain grouping (10gzbm9 degenerate) (todo `1308iv0`)
-        @test_broken (lower_rkppl(quote
-                a ~ Normal(0, 5)
-                d ~ varying_draws(gr(g), [1])
-                r ~ varying_slice(d, 1)
-                mu = a .+ r
-                y .~ Normal.(mu, 1.0)
-            end, (:y, :g); conditioned = (:y, :g)); true)
+        # Admitted by the explicit-library program below (todo `1308iv0`).
+        @test validate_plan(_mm_explicit_plan(:single)) === nothing
         # Two groups.
         # refused: `gr` takes one grouping; two groups have no stated meaning (P2)
         @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -339,23 +354,11 @@ end
                 y .~ Normal.(mu, 1.0)
             end, (:y, :g, :b); conditioned = (:y, :g, :b))
         # eta != 1.0.
-        # capability: LKJ eta != 1 on stratified draws (SB-parity scope) (todo `1308iv0`)
-        @test_broken (lower_rkppl(quote
-                a ~ Normal(0, 5)
-                d ~ varying_draws(gr(g; by = b), [1, x]; eta = 2.0)
-                r ~ varying_slice(d, 1:2)
-                mu = a .+ r
-                y .~ Normal.(mu, 1.0)
-            end, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b)); true)
+        # Admitted by the explicit-library program below (todo `1308iv0`).
+        @test validate_plan(_mm_explicit_plan(:stratified; eta = 2.0)) === nothing
         # Missing semicolon.
-        # capability: comma keyword `gr(g, by = b)` (Julia treats it as `;` kwarg; P3) (todo `1308iv0`)
-        @test_broken (lower_rkppl(quote
-                a ~ Normal(0, 5)
-                d ~ varying_draws(gr(g, by = b), [1])
-                r ~ varying_slice(d, 1)
-                mu = a .+ r
-                y .~ Normal.(mu, 1.0)
-            end, (:y, :g, :b); conditioned = (:y, :g, :b)); true)
+        # Admitted by the explicit-library program below (todo `1308iv0`).
+        @test validate_plan(_mm_explicit_plan(:stratified, eta = 2.0)) === nothing
     end
     @testset "reserved grouping names" begin
         # refused: reserved name `mm`
@@ -434,26 +437,16 @@ end
         @test_throws ContractValidationError _mm_validate(
             _mm_draws(lkj_eta = 2.0))
     end
-    @testset "mm eta != 1.0 rejected" begin
-        d = _mm_draws(kind = :correlated, lkj_eta = 2.0,
-            margins = vcat(ones1(), slope1()))
-        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
-        @test_broken (_mm_validate(d); true)
+    @testset "mm explicit eta" begin
+        @test validate_plan(_mm_explicit_plan(eta = 2.0)) === nothing
     end
-    @testset "mm sd priors rejected" begin
-        d = _mm_draws(kind = :correlated, lkj_eta = 1.0,
-            margins = vcat(ones1(), slope1()),
-            sd_priors = [VaryingSdPrior(:std_normal, 1.0),
-                VaryingSdPrior(:std_normal, 1.0)])
-        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
-        @test_broken (_mm_validate(d); true)
+    @testset "mm explicit scale priors" begin
+        bound = _mm_explicit_plan(distinct_sd = true)
+        @test :gamma in (p.family for p in bound.parameters)
+        @test :cauchy in (p.family for p in bound.parameters)
     end
-    @testset "mm x strata rejected" begin
-        d = _mm_draws(kind = :correlated, lkj_eta = 1.0,
-            margins = vcat(ones1(), slope1()),
-            strata = VaryingStrata(:b, nothing))
-        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
-        @test_broken (_mm_validate(d); true)
+    @testset "mm with stratified covariance" begin
+        @test validate_plan(_mm_explicit_plan(:both)) === nothing
     end
     @testset "stratified non-correlated rejected" begin
         d = _mm_draws(group = :g, kind = :intercept1, lkj_eta = NaN,
@@ -462,23 +455,12 @@ end
         # refused: retired kind on stratified draws (IR contract)
         @test_throws ContractValidationError _mm_validate(d)
     end
-    @testset "stratified eta != 1.0 rejected" begin
-        d = _mm_draws(group = :g, kind = :correlated, lkj_eta = 2.0,
-            margins = vcat(ones1(), slope1()), mm = nothing,
-            label = :draws_g, suffix = "g",
-            strata = VaryingStrata(:b, nothing))
-        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
-        @test_broken (_mm_validate(d); true)
+    @testset "stratified explicit eta" begin
+        @test validate_plan(_mm_explicit_plan(:stratified; eta = 2.0)) === nothing
     end
-    @testset "stratified sd priors rejected" begin
-        d = _mm_draws(group = :g, kind = :correlated, lkj_eta = 1.0,
-            margins = vcat(ones1(), slope1()), mm = nothing,
-            label = :draws_g, suffix = "g",
-            sd_priors = [VaryingSdPrior(:std_normal, 1.0),
-                VaryingSdPrior(:std_normal, 1.0)],
-            strata = VaryingStrata(:b, nothing))
-        # capability: multi-membership/stratified geometry beyond the current SB parity subset (1cmodra varying) (todo `1308iv0`)
-        @test_broken (_mm_validate(d); true)
+    @testset "stratified explicit scale priors" begin
+        bound = _mm_explicit_plan(:stratified)
+        @test any(p -> p.family === :gamma, bound.array_parameters)
     end
     @testset "stratified by === group rejected" begin
         d = _mm_draws(group = :g, kind = :correlated, lkj_eta = 1.0,
@@ -488,20 +470,9 @@ end
         # refused: by === group (IR contract; surface twin 312)
         @test_throws ContractValidationError _mm_validate(d)
     end
-    @testset "mm multi-slice rejected (ID defense)" begin
-        # Lowering validates structure, so the rejection fires here.
-        # capability: mm draws sliced into multiple targets (SB-parity "ID defense") (todo `1308iv0`)
-        @test_broken (lower_rkppl(quote
-                a ~ Normal(0, 5)
-                c ~ Normal(0, 5)
-                d ~ varying_draws(mm(g1, g2), [1, x])
-                r1 ~ varying_slice(d, 1:1)
-                r2 ~ varying_slice(d, 2:2)
-                mu = a .+ r1
-                nu = c .+ r2
-                y .~ Normal.(mu, 1.0)
-                z .~ Normal.(nu, 1.0)
-            end, (:y, :z, :x, :g1, :g2); conditioned = (:y, :z, :x, :g1, :g2)); true)
+    @testset "membership values used by several responses" begin
+        # Admitted by the explicit-library program below (todo `1308iv0`).
+        @test length(_mm_explicit_plan().responses) == 2
     end
     @testset "stratified multi-slice allowed (ID+gr path)" begin
         plan = lower_rkppl(quote
@@ -688,19 +659,13 @@ end
         @test lay.total == 13
         @test length(coordinate_names(lay)) == 13
     end
-    @testset "constrain fail-closed on stratified" begin
-        _, _, _, lay = _mm_query(quote
-                a ~ Normal(0, 5)
-                d ~ varying_draws(gr(g; by = b), [1, x])
-                r ~ varying_slice(d, 1:2)
-                mu = a .+ r
-                y .~ Normal.(mu, 1.0)
-            end, Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
-            :x => copy(_MM_X), :g => [1, 2, 1, 3], :b => copy(_MM_B)))
+    @testset "constrained stratified values" begin
+        bound = _mm_explicit_plan(:stratified)
+        lay = assign_layout(bound)
         u = collect(range(-0.4, 0.4; length = lay.total))
-        # capability: restore constrained stratified draws (ordinary values;
-        # P8 1cmodra; todo `1308iv0`).
-        @test_broken (constrain(lay, u); true)
+        nt = constrain(lay, u)
+        @test hasproperty(nt.d, :L) && hasproperty(nt.d, :sd)
+        @test unconstrain(lay, nt) ≈ u
     end
 end
 
@@ -716,28 +681,14 @@ end
             end, (:y, :x, :g, :b); conditioned = (:y, :x, :g, :b))
         @test validate_structure(plan) === nothing
     end
-    @testset "bound per-stratum names proven unique" begin
-        plan = lower_rkppl(quote
-                a ~ Normal(0, 5)
-                c ~ Normal(0, 5)
-                d ~ varying_draws(gr(g; by = b), [1, x])
-                r ~ varying_slice(d, 1:2)
-                d2 ~ varying_draws(g_s1, [1, x])
-                r2 ~ varying_slice(d2, 1:2)
-                mu = a .+ r
-                nu = c .+ r2
-                y .~ Normal.(mu, 1.0)
-                z .~ Normal.(nu, 1.0)
-            end, (:y, :z, :x, :g, :b, :g_s1); conditioned = (:y, :z, :x, :g, :b, :g_s1))
-        # Unbound: only the shared z is tabled — no false positive.
-        @test validate_structure(plan) === nothing
-        cols = Dict{Symbol,AbstractVector}(:y => copy(_MM_Y),
-            :z => copy(_MM_Y), :x => copy(_MM_X), :g => [1, 2, 1, 3],
-            :b => copy(_MM_B), :g_s1 => [1, 1, 2, 2])
-        bound = bind_data(plan, cols)
-        # Bound: per-stratum `L_g_s1` vs plain `L_g_s1` collide loudly.
-        # capability: distinct draws whose minted names collide (`gr(g; by=b)` stratum s1 vs group `g_s1`); names should key off author bindings (P8) (todo `1308iv0`)
-        @test_broken (build_kernel(bound); true)
+    @testset "author bindings keep overlapping group names distinct" begin
+        bound = _mm_explicit_plan(:stratified; names = true)
+        built = build_kernel(bound)
+        u = zeros(built.layout.total)
+        nt = constrain(built.layout, u)
+        @test hasproperty(nt, :d) && hasproperty(nt, :d2)
+        @test hasproperty(nt.d, :L) && hasproperty(nt.d2, :L)
+        @test unconstrain(built.layout, nt) ≈ u
     end
 end
 

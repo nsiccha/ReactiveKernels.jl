@@ -1289,6 +1289,22 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
                                   "it contains a plate or scan")
         r.source === _NO_KERNEL_SOURCE && _kernel_inline_reject(
             endpoint_name, context, "one recipe has no source")
+        if r.op isa Union{_KernelSourceOp,Function}
+            # Authored operations already retain their defining module and
+            # native/traced bodies. Calling that operation inside the arm
+            # preserves globals, port order and lazy evaluation, including
+            # recipes spliced from a differently scoped child endpoint. A
+            # validated bare function operation also keeps its defining module.
+            actual_inputs = Any[expr_of[canon_id(g, v.id)] for v in r.inputs]
+            inlined = Expr(:call, QuoteNode(r.op), actual_inputs...)
+            outs = Symbol[gensym(:endpoint_value) for _ in r.outputs]
+            for (v, temp) in zip(r.outputs, outs)
+                expr_of[canon_id(g, v.id)] = temp
+            end
+            push!(statements, length(outs) == 1 ? Expr(:(=), outs[1], inlined) :
+                Expr(:(=), Expr(:tuple, outs...), inlined))
+            continue
+        end
         # A spliced child recipe's source keeps its original bare names while
         # the namespace holds the scoped ones, so the port namespace alone
         # would miss them. Collect every bare name as known, then classify:
@@ -1386,6 +1402,24 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     # established nested-KernelSpec splicer clone the complete endpoint graph.
     if ex.head === :call && !isempty(ex.args)
         callee = ex.args[1]
+        if callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
+                callee.args[2] isa QuoteNode && !(callee.args[1] isa Expr &&
+                callee.args[1].head === :call)
+            object = _kernel_resolve_binding(mod, callee.args[1])
+            name = callee.args[2].value
+            if object isa Union{KernelObjectSpec,_StatefulKernelSkeleton} &&
+                    name in kernel_endpoint_names(object)
+                signature = extract(object; want=name).call_signature
+                if signature isa _KernelEndpointCallSignature &&
+                        isempty(first(typeof(signature).parameters))
+                    # A zero-owner object has the same graph application with
+                    # or without `()`. Normalize before descending into an arm,
+                    # so `standard_normal.ccdf(z)` never plans at runtime/AD.
+                    callee = Expr(:., Expr(:call, callee.args[1]), callee.args[2])
+                    ex = Expr(:call, callee, ex.args[2:end]...)
+                end
+            end
+        end
         if callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
            callee.args[1] isa Expr && callee.args[1].head === :call &&
            callee.args[2] isa QuoteNode
@@ -2804,7 +2838,8 @@ function _traceable_definition(def, mod::Module)
         companion = Expr(:where, companion, layer...)
     end
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
-    esc(Expr(:block, native, Expr(:(=), companion, rewritten), callee))
+    ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
+    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., callee))
 end
 
 # The body with its tail-position `return`s replaced by their values: the
@@ -2838,6 +2873,19 @@ function _traceable_no_return(ex, signature)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
+                           kwargs...)
+    normal = _kernel_operation_body(rhs, deps, known; kwargs...)
+    # A bare exact-identity operation keeps its original identity. Transparent
+    # helpers have separate opted-in methods; source closures retain a twin.
+    normal isa Expr && normal.head === :call &&
+        normal.args[1] == GlobalRef(@__MODULE__, :_KernelSourceOp) || return normal
+    mod = get(kwargs, :mod, nothing)
+    ignored_rhs = _kernel_ignore_throw_source(rhs, mod, known)
+    ignored = _kernel_operation_body(ignored_rhs, deps, known; kwargs...)
+    Expr(:call, GlobalRef(@__MODULE__, :_kernel_with_ignored_throws), normal, ignored)
+end
+
+function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
                            nested_specs = Dict{Symbol,Any}())
@@ -3810,7 +3858,7 @@ function _kernel_bound_pairs(spec::KernelSpec, bound)
 end
 
 """
-    prepare(spec::KernelSpec; have, want, passes=(), bound=(;)) -> callable
+    prepare(spec::KernelSpec; have, want, passes=(), bound=(;), on_error=nothing) -> callable
 
 Prepare an authored kernel. With a non-empty `bound` NamedTuple
 (`bound = (; X, y)`), the [`partial_evaluation`](@ref) pre-pass runs first:
@@ -3825,15 +3873,23 @@ reuses the plan and compiled code of earlier bindings and runs only the
 data-only subgraph on the new values (see `prepare` on a `Graph`), so binding
 per request needs no caller-held cache; [`prepare!`](@ref) with a
 [`PreparationCache`](@ref) gives that reuse an explicit lifetime.
+
+The default `on_error = nothing` preserves authored assertions and throws.
+Opt in with `on_error = :ignore` to replace visible `throw(...)` sites in
+captured `@kernel` and `@traceable` source with `nothing`, including expanded
+`@assert`s. The policy applies to native execution, tracing and bound-data
+mathematics. Ordinary opaque function bodies keep their behavior. This first
+policy continues execution; it does not catch exceptions or return a fallback.
 """
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                 bound = NamedTuple())
+                 bound = NamedTuple(), on_error = nothing)
     isempty(bound) || return prepare(spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound))
-    prepared = prepare(plan(spec; have = have, want = want); passes = passes)
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error)
+    prepared = prepare(plan(spec; have = have, want = want); passes = passes,
+                       on_error = on_error)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end
@@ -3853,15 +3909,15 @@ over the remaining HAVE ports exactly as `prepare(spec; bound)` returns it.
 function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
                   want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                  bound = NamedTuple())
+                  bound = NamedTuple(), on_error = nothing)
     isempty(bound) || return prepare!(cache, spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound))
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error)
     prepared = prepare!(cache, spec.graph;
                         have = _kernel_selection(spec, have, spec.have_names, :have),
                         want = _kernel_selection(spec, want, spec.want_names, :want),
-                        passes = passes)
+                        passes = passes, on_error = on_error)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end
