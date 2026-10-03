@@ -445,9 +445,8 @@ end
 
 @testset "a latent plate's size is its range" begin
     # `eachindex(v)` iterates `v`: the latent has one cell per entry of `v`.
-    # Latents over a non-observation axis do not lower yet, so a plate over
-    # a subject-level column (here `age_s`, 2 subjects beside 4 observation
-    # rows) is refused at bind instead of being sized by the response rows.
+    # A subject-level range has two entries beside four observations.
+    # Binding must retain the authored latent axis.
     cols = _pl_pk_cols()
     ast = _pl_pk_chain(:(dv .~ Normal.(conc, sigma)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
@@ -455,8 +454,22 @@ end
                 :(eta[s] ~ Normal(0, 1))))))
     plan = lower_rkppl(ast, _PL_PK_DATA; conditioned = _PL_PK_DATA)
     @test only(plan.plate_parameters).range === :age_s
-    # capability: latent @plate over a non-observation axis (subject-level range) (todo `1308iv0`)
-    @test_broken (bind_data(plan, cols); true)
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = [0.1cos(i) for i in 1:built.layout.total]
+    q = constrain(built.layout, u)
+    @test length(q.eta) == length(cols[:age_s]) == 2
+    @test bound.n_obs == length(cols[:dv]) == 4
+    baseline = _pl_pk_chain(:(dv .~ Normal.(conc, sigma)))
+    basebound, basebuilt = _pl_bind(baseline, _PL_PK_DATA, cols)
+    @test built.layout.total == basebuilt.layout.total + 2
+    names = filter(!=(:eta), propertynames(q))
+    baseq = NamedTuple{Tuple(names)}(Tuple(getproperty(q, name) for name in names))
+    baseu = unconstrain(basebuilt.layout, baseq)
+    @test _pl_q(built, bound, :likelihood, u) ≈ _pl_q(basebuilt, basebound, :likelihood, baseu)
+    @test _pl_q(built, bound, :prior, u) ≈ _pl_q(basebuilt, basebound, :prior, baseu) +
+        sum(logpdf.(Normal(), q.eta))
+    _check_gradient(built.spec, bound, u)
     # Over the observation axis it binds with one cell per row.
     ast = Expr(:block, :(tau ~ Exponential(1)), :(s ~ Exponential(1)),
         _pl_plate(:(eachindex(y)), :(theta[i] ~ Normal(0, tau)),

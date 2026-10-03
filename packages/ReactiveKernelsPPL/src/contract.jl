@@ -8795,8 +8795,9 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         return nothing
     elseif r.family === CategoricalLogitFam || _is_ordered_family(r.family) ||
             r.family === CategoricalFam
-        # Recoded levels (SB `_brm_response_levels` recodes to contiguous
-        # 1..K via sort(unique)): exact contiguity 1..K, K≥1. K=1 is uniform
+        # Ordinal support is stated by its cutpoints; observed categories
+        # need not exhaust that support. Other recoded responses retain
+        # exact contiguity 1..K. K=1 is uniform
         # (a zero-information likelihood, SB's one-emission rule) — except
         # CategoricalLogit, whose structural K needs ≥1 non-reference
         # predictor (a single-level categorical is degenerate and stays
@@ -8809,7 +8810,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         all(x -> 1 <= x <= K, col) ||
             return _fail(r.label, "leveled response must hold integers " *
                 "1..$K (recoded levels)")
-        sort(unique(col)) == collect(1:K) ||
+        _is_ordered_family(r.family) || sort(unique(col)) == collect(1:K) ||
             return _fail(r.label, "leveled response must cover every level " *
                 "1..$K exactly (recoded levels have no gaps)")
         return nothing
@@ -11178,7 +11179,14 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     out_r = LikelihoodSpec[]
     for r in responses
         _is_leveled_family(r.family) || (push!(out_r, r); continue)
-        K = _infer_response_levels(r, columns)
+        # A stated threshold vector owns its extent, including categories
+        # absent from these observations. An inferred extent still comes
+        # from contiguous observed level codes.
+        tp = r.thresholds === nothing ? nothing :
+            findfirst(p -> p.name === r.thresholds, vectors)
+        declared = _is_ordered_family(r.family) && tp !== nothing ?
+            vectors[tp].size : nothing
+        K = declared === nothing ? _infer_response_levels(r, columns) : declared + 1
         push!(out_r, _with_levels(r, K))
     end
     by_label = Dict{Symbol,LikelihoodSpec}(r.label => r for r in out_r)
@@ -11309,6 +11317,9 @@ function _infer_response_levels(r::LikelihoodSpec, columns::AbstractDict{Symbol}
         _fail(r.label, "a leveled response must hold integers 1..K")
     K = maximum(col)
     K >= 1 || _fail(r.label, "a leveled response must hold integers 1..K")
+    sort(unique(col)) == collect(1:K) || _fail(r.label,
+        "an inferred leveled response must cover every level 1..$K " *
+        "(declare ordinal cutpoints to state unobserved categories)")
     return K
 end
 

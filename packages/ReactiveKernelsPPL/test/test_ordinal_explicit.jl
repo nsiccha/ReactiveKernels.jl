@@ -132,14 +132,16 @@ end
     # The ordered transform's Jacobian: log(c[2] − c[1]).
     @test _query(built.spec, bound, :log_jacobian, u) ≈ log(c[2] - c[1])
     _check_gradient(built.spec, bound, u)
-    # A literal length that disagrees with the bound levels fails at bind.
+    # Three declared cutpoints state four categories even when the top
+    # category is absent from this sample.
     long = _oe_lower(quote
         b ~ Normal(0, 2)
         c ~ Ordered(Normal(0, 1), 3)
         y .~ OrderedLogistic.(b .* x, Ref(c))
     end)
-    # capability: declared categories beyond the observed levels (10gzbm9 level-coverage) (todo `1308iv0`)
-    @test_broken (bind_data(long, cols); true)
+    long_bound = bind_data(long, cols)
+    @test only(long_bound.responses).n_levels == 4
+    @test only(long_bound.vector_parameters).size == 3
 end
 
 @testset "explicit cutpoints: Ordinal cumulative and stopping densities" begin
