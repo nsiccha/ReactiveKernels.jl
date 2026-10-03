@@ -7227,6 +7227,18 @@ function _validate_composed_tree(tree, subs::Vector{Symbol},
         datas::Vector{Symbol} = Symbol[])
     allowed = union(subs, scalars, datas)
     leaves = Symbol[]
+    if _is_plate_column_expr(tree)
+        # The lambda owns its cell locals; only the plate inputs reference
+        # model values. Its body remains the ordinary retained RK cell.
+        for input in tree.args[1].args[2:end]
+            for name in _expr_value_symbols(input)
+                name in allowed || _fail(label,
+                    "composed plate input $name is not a declared value")
+                push!(leaves, name)
+            end
+        end
+        return leaves
+    end
     function walk(node)
         if node isa Symbol
             node in allowed || _fail(label,
