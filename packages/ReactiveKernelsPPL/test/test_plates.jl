@@ -320,7 +320,7 @@ end
     # shared covariate cannot serve rows of two lengths (principle 3).
     shared = Expr(:block, :(b ~ Normal(0, 1)), :(s ~ Exponential(1)),
         :(y1 .~ Normal.(b .* x, s)), :(y2 .~ Normal.(b .* x, s)))
-    @test_throws "column length 3 ≠ the 4 rows of" bind_data(
+    @test_throws "column length 4 ≠ the 3 rows of y2" bind_data(
         lower_rkppl(shared, (:y1, :y2, :x); conditioned = (:y1, :y2, :x)), Dict{Symbol,AbstractVector}(
             :y1 => [0.1, 0.2, 0.3, 0.4], :y2 => [0.5, 0.6, 0.7],
             :x => [1.0, 2.0, 3.0, 4.0]))

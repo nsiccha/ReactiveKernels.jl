@@ -321,7 +321,7 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "reactivehmc-corpus.md" => 6,
         "nuts.md" => 0,
         "nutpie-diagonal.md" => 2,
-        "rkppl.md" => 8,
+        "rkppl.md" => 11,
         "eight-schools.md" => 1,
         "sum-to-zero.md" => 1,
         "linear-regression.md" => 1,

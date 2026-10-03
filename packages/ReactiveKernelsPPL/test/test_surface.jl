@@ -2517,8 +2517,8 @@ end
         y .~ weighted.(Normal.(mu, 1.0), w)
         w = x .+ 1
     end, (:y, :x); conditioned = (:y, :x)); true)
-    # capability: derived evidence (truncation bound) column (todo `0ze68k8`)
-    @test_broken (lower_rkppl(quote
+    # admitted: derived evidence (truncation bound) column (todo `0ze68k8`)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x
@@ -2888,8 +2888,8 @@ end
         y .~ Normal.(mu, 1.0)
     end, Dn; conditioned = Dn); true)
     # Wrappers, bounds, broadcast, miscellany.
-    # capability: parameter-valued truncation bound (todo `0ze68k8`)
-    @test_broken (lower_rkppl(quote
+    # admitted: parameter-valued truncation bound (todo `0ze68k8`)
+    @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         mu = a .+ b .* x

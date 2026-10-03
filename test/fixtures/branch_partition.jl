@@ -163,8 +163,7 @@ end
     return out
 end
 
-# An endpoint reading a module-private global cannot be relocated into an
-# arm (the name would rebind into the caller's module): rejected loudly.
+# An endpoint retains its module-private helper inside a lazy branch arm.
 nonbase_endpoint_helper(x) = 2x
 
 @kernel helper_standard_normal() = begin
@@ -173,5 +172,17 @@ end
 
 @kernel helper_normal =
     endpoint_location_scale(helper_standard_normal)
+
+@kernel bare_helper() = begin
+    value(x::Float64)::Float64 = nonbase_endpoint_helper(x)
+end
+
+@kernel bare_helper_branch(x::Vector{Float64}, flag::Vector{Int}) = begin
+    pointwise = plate(x, flag) do xi, fi
+        cell::Float64 = fi == 0 ? bare_helper.value(xi) : 0.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
 
 end
