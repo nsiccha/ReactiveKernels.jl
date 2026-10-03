@@ -28,6 +28,7 @@ RuntimeGeneratedFunctions.init(@__MODULE__)
 include("core.jl")
 include("planner.jl")
 include("codegen.jl")
+include("native_scheduling.jl")
 include("inverse_edges.jl")
 include("partial_evaluation.jl")
 include("nonallocating.jl")
@@ -68,6 +69,7 @@ export ad_value_and_pullback, ad_value_and_pullback!
 export compile_ad_gradient, compile_ad_value_and_gradient
 export lower, lower_with_ops, lower_batched, replica, plate_body, scan_body, transform, compile
 export prepare_batched, vectorize
+export NativeScheduling
 export batched_ports, scalar_kernel
 export explain, code_expr, inputs, outputs, valtype
 export compose, extract, PreparationCache, prepare!, canon_id

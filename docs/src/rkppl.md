@@ -566,6 +566,9 @@ Main.ReactiveKernelsDocs.render_rkppl_rewrites_example()
 
 Direct lowering declares observation roles separately from supplied data:
 `lower_rkppl(ast, data; conditioned = (:y, :tau))`, then `bind_data(plan, data)`.
+Both calls accept a `NamedTuple` or a symbol-keyed `AbstractDict` of data values;
+the same container can pass through the pipeline. Binding returns a new plan
+and also supports rebinding an already-bound plan with either container.
 Pass a captured model to `lower_rkppl` when it carries scoped merge edits.
 Sized array observations must have the declaration's shape. Partial indexed
 writes do not replace a complete declaration and fail explicitly.

@@ -30,6 +30,7 @@ ref_array_plate_testfile = joinpath(@__DIR__, "test_ref_array_plate_reactant.jl"
 position_batching_testfile = joinpath(@__DIR__, "test_position_batching_reactant.jl")
 glm_testfile = joinpath(@__DIR__, "test_glm_reactant.jl")
 tensorized_vect_testfile = joinpath(@__DIR__, "test_tensorized_vect_reactant.jl")
+tensorized_cat_testfile = joinpath(@__DIR__, "test_tensorized_cat_reactant.jl")
 tensorized_macros_testfile = joinpath(
     @__DIR__, "test_tensorized_macros_reactant.jl")
 example_packages = (
@@ -76,6 +77,7 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $loop_view_capture_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $glm_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $tensorized_vect_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $tensorized_cat_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $tensorized_macros_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $rectangular_fold_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $effect_boundary_testfile`)
