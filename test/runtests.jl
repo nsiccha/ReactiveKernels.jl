@@ -43,6 +43,8 @@ const _MATRIX_CORE_TESTS = (
     "test_manual_derivative_rule_example.jl",
     "test_derivative_rules.jl",
     "test_derivative_rule_multioutput.jl",
+    "test_expm_rule.jl",
+    "test_symmetric_eigen_rules.jl",
     "test_authoring.jl",
     "test_error_policy.jl",
     "test_tensorized_vect.jl",

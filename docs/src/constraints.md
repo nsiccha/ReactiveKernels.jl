@@ -4,6 +4,17 @@ These constraints apply to every ReactiveKernels lowering, extension, and
 example package. They also apply when data is bound during preparation.
 Backend limitations must be reported explicitly; they do not relax these rules.
 
+## Place implementations in their owning layer
+
+Totally general numerical and compiler machinery belongs in ReactiveKernels
+proper. General PPL authoring, binding and lowering belongs in ReactiveKernelsPPL.
+Reusable statistical model construction and backend emission belongs in BRM;
+its statistical implementations serve both backends. PK-specific models and
+helpers belong only in downstream RKPPLBench. StanBlocks owns transpilation to
+Stan. Existing implementations in the wrong layer must migrate; historical
+placement and sharing a repository are not exceptions. Temporary compatibility
+must have a concrete migration task and a consumer-adoption condition.
+
 ## Preserve data-dependent iteration
 
 **Do not statically unroll a loop whose trip count derives from data.** This
@@ -67,10 +78,11 @@ or both over array or scalar ports, into an RK-owned callable. The Enzyme and
 ChainRules adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
 `ext/ReactiveKernelsChainRulesCoreExt.jl`)
 derive every direction from the activity-selected cuts of that graph. The rules in package source are
-DistributionKernels' `loggamma`, `logbeta`, `rk_symmetric_eigvals` and
-`rk_symmetric_eigvecs` (the eigen pair re-exported by ReactiveKernelsPPL), plus
-ReactiveKernelsPPL's `rk_expm` and its transit two-compartment response rule
-(`prepare_transit_twocmt_rule`); the ODE backsolve
+ReactiveKernels' `rk_expm`, `rk_symmetric_eigvals` and `rk_symmetric_eigvecs`,
+plus DistributionKernels' `loggamma` and `logbeta`. The generic matrix rules
+are also imported by existing PPL/distribution consumers. The PK-specific
+transit two-compartment response rule (`prepare_transit_twocmt_rule`) remains
+in the existing PPL source pending its downstream migration; the ODE backsolve
 adjoint consumes a caller's `DerivativeRule` right-hand side. Reverse-mode adapters
 stage each rule in two cuts whose residuals come from cross-stage liveness, so
 a shared intermediate is retained rather than recomputed. Rule cuts already

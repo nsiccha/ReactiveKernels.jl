@@ -211,18 +211,21 @@ The first vector consumer is the backsolve adjoint of
 reverse cut once per stage, so nothing differentiates the adaptive loop or
 the right-hand side.
 
-The linear-algebra consumer is `ReactiveKernelsPPL.rk_expm`: ordinary reverse
+The linear-algebra primitive is `ReactiveKernels.rk_expm`: ordinary reverse
 Enzyme through `LinearAlgebra.exp` fails on its LAPACK `ccall`, so the owned
 callable authors the primal plus JVP/VJP branches — each an augmented-matrix
 exponential with top-right-block extraction — in one graph, and both Enzyme
-directions verify against finite differences. Cholesky needs no rule:
+directions verify against finite differences. Its implementation and generic
+numerical tests live in RK proper; the existing `ReactiveKernelsPPL.rk_expm`
+binding imports the same callable. Cholesky needs no rule:
 ordinary Enzyme differentiates the built-in correctly, so the GP latent path
 swaps to it directly.
 
 The second linear-algebra consumer is the symmetric-eigendecomposition pair
 `rk_symmetric_eigvals` / `rk_symmetric_eigvecs`, defined in
-`ReactiveKernelsDistributionKernels.DistributionKernelSources` beside the
-owned `loggamma` / `logbeta` rules and re-exported by `ReactiveKernelsPPL`:
+ReactiveKernels itself (`src/symmetric_eigen_rules.jl`). Existing
+`ReactiveKernelsDistributionKernels.DistributionKernelSources` and
+`ReactiveKernelsPPL` bindings import the same callables and rule graphs:
 ordinary reverse Enzyme through
 `eigen(::Symmetric)` fails on the LAPACK `syevr!` `ccall`
 (`EnzymeNoDerivativeError` for `dsyevr_64_`; Enzyme's derivative table covers
