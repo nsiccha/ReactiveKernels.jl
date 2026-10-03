@@ -18,22 +18,6 @@ _scan_min_plan(scans; n = 3) = StructuralPlan(
     scans = scans,
 )
 
-# A shape this file pins as not built yet: `f()` fails with an error whose
-# message contains `needle` (`@test_broken`), and a different failure is a
-# real error. When the shape starts working, `@test_broken` reports an
-# unexpected pass, so the pin turns into a positive test.
-function _scan_gap(f, needle)
-    ok = try
-        f()
-        true
-    catch e
-        occursin(needle, sprint(showerror, e)) || rethrow()
-        false
-    end
-    # capability: generalized scan values and recurrence shapes (P8 1cmodra; todo `0yc2qgp`).
-    @test_broken ok
-end
-
 # Front-end parse tests for `@scan` (sequential recurrence). `parse_scan_block`
 # is purely syntactic — it consumes the quoted inner `begin … end` block, so
 # distribution constructors here are unevaluated AST symbols (no Distributions).
@@ -126,7 +110,7 @@ end
     reject(blk) = @test_throws SurfaceLoweringError parse_scan_block(blk)
     # capability: lag-free and data-integer-lag scans (10gzbm9 degenerate;
     # P8 1cmodra; todo `0yc2qgp`).
-    capable(blk) = @test_broken (parse_scan_block(blk); true)
+    capable(blk) = @test parse_scan_block(blk) isa ScanSpec
 
     # refused: forward read `h[t + 1]` before it is written (P3)
     # forward reference
@@ -398,8 +382,8 @@ end
             h[t] ~ Normal(phi * h[t - 1], s)
         end
     end)
-    # capability: zero-step @scan (T equals the seed count) (todo `0yc2qgp`)
-    @test_broken (assign_layout(_scan_min_plan([ar_long]; n = 3)); true)
+    @test only(e for e in assign_layout(_scan_min_plan([ar_long]; n = 3)).entries
+        if e.kind === :scan).size == 3
 end
 
 @testset "scan surface: scan state as a response location (4a)" begin
@@ -435,7 +419,7 @@ end
         PredictorSpec[], PopulationPrior[], SampledParameter[], AssignmentSpec[],
         Dict{Symbol,AbstractVector}(:y => zeros(3)), 3; scans = [ar1])
     # capability: non-Gaussian response over a scan state (slice 1; hand-built plan) (todo `0yc2qgp`)
-    @test_broken (validate_structure(bad); true)
+    @test validate_structure(bad) === nothing
 end
 
 # A non-centered AR(1) scan (SB-`ar` shape): `Normal(0, 1)` seed, one
@@ -466,7 +450,8 @@ function _scan_ar_plan(scan; coef = :beta_ar, coef_family = :normal,
         [SampledParameter(:sigma, :exponential, (arg1 = 1.0,), nothing, :sigma),
             SampledParameter(:phi, :normal, (arg1 = 0.0, arg2 = 1.0), nothing,
                 :phi),
-            SampledParameter(coef, coef_family, (arg1 = 0.0, arg2 = 2.0),
+            SampledParameter(coef, coef_family,
+                coef_family === :exponential ? (arg1 = 2.0,) : (arg1 = 0.0, arg2 = 2.0),
                 nothing, coef)],
         AssignmentSpec[],
         Dict{Symbol,AbstractVector}(:y => zeros(3)),
@@ -513,9 +498,9 @@ end
             _scan_ar_plan(scan; options = opts))
     end
     # non-Normal coefficient (v1 admits SB's Normal `ar` beta only)
-    # capability: non-Normal scan-summand coefficient prior (v1 admits Normal only) (todo `0yc2qgp`)
-    @test_broken (validate_structure(
-        _scan_ar_plan(scan; coef_family = :exponential)); true)
+    # A scan-summand coefficient keeps its ordinary stated prior (`0yc2qgp`).
+    @test validate_structure(
+        _scan_ar_plan(scan; coef_family = :exponential)) === nothing
     # a computed scalar is not a sampled coefficient
     p0 = _scan_ar_plan(scan)
     params = filter(p -> p.name !== :beta_ar, p0.parameters)
@@ -523,7 +508,7 @@ end
         params, [AssignmentSpec(:beta_ar, :(phi * phi), :beta_ar)],
         p0.columns, p0.n_obs; scans = p0.scans)
     # capability: computed (assignment) scan-summand coefficient (P8 admits computed coefficients) (todo `0yc2qgp`)
-    @test_broken (validate_structure(p); true)
+    @test validate_structure(p) === nothing
     # summands carry no columns and are self-addressed
     # refused: scan summand carrying columns (IR contract)
     @test_throws ContractValidationError validate_structure(
@@ -624,19 +609,15 @@ end
     # refused: q has no declaration (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(prog(:(mu = a .+ q .* u)),
         (:x, :y); conditioned = (:x, :y))
-    # Valid Julia the emitter does not build yet (a scan state is spliced
-    # bare or scaled by one sampled scalar, additively): pinned as gaps so
-    # building one fails this file instead of a silent refusal surviving.
-    # capability: scan-state arithmetic composes as ordinary values (P8 1cmodra; todo `0yc2qgp`).
-    gap(loc, needle) = _scan_gap(needle) do
-        lower_rkppl(prog(loc), (:x, :y); conditioned = (:x, :y))
+    # Trajectory arithmetic composes as ordinary vector values. Independent
+    # density and gradient oracles live in test_scan_capabilities.jl.
+    for loc in (:(mu = a .+ 2.0 .* u), :(mu = a .+ x .* u),
+            :(mu = a .+ phi .* u), :(mu = a .- beta_ar .* u),
+            :(mu = a .+ beta_ar .* (u .+ x)), :(mu = beta_ar .* u))
+        p = bind_data(lower_rkppl(prog(loc), (:x, :y);
+            conditioned = (:x, :y)), Dict(:x => ones(3), :y => zeros(3)))
+        @test build_kernel(p).layout.total > 0
     end
-    gap(:(mu = a .+ 2.0 .* u), "scan coefficients are bare sampled scalars")
-    gap(:(mu = a .+ x .* u), "scales scan state")
-    gap(:(mu = a .+ phi .* u), "scan coefficients are bare sampled scalars")
-    gap(:(mu = a .- beta_ar .* u), "additive")
-    gap(:(mu = a .+ beta_ar .* (u .+ x)), "scan states lower only as direct")
-    gap(:(mu = beta_ar .* u), "no estimated coefficients")
     # One name as both a population coefficient and a scan coefficient is
     # one ordinary parameter read by both summands (test_fallback.jl).
     both = lower_rkppl(quote
@@ -686,7 +667,7 @@ end
     @test (validate_structure(dotted); true)
 end
 
-@testset "non-centered emission: gaps and refusals" begin
+@testset "non-centered emission: supported shapes and refusals" begin
     scan_block(stmts...) = Expr(:macrocall, Symbol("@scan"),
         LineNumberNode(1), Expr(:block, stmts...))
     build_block(stmts...) = build_kernel(bind_data(
@@ -717,37 +698,37 @@ end
             eps ~ Normal(0, 1)
             h[t] = nosuch * h[t - 1] + eps
         end))
-    # Valid recurrences the emitter does not build yet.
-    # capability: arbitrary-support innovations and retained deterministic/data-dependent scans (P8 1cmodra; todo `0yc2qgp`).
-    gap(needle, stmts...) = _scan_gap(() -> build_block(stmts...), needle)
-    # a positive-support innovation or seed (the latent slice is identity)
-    gap("must have real support",
+    # Each admitted recurrence builds; independent value/gradient and compiled
+    # structure checks live in test_scan_recurrence_capabilities*.jl.
+    accepted(stmts...) = @test build_block(stmts...).layout.total > 0
+    # Positive-support innovations and seeds use their support transforms.
+    accepted(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Exponential(1)
             h[t] = phi * h[t - 1] + eps
         end))
-    gap("must have real support",
+    accepted(
         :(h[1] ~ Exponential(1)),
         :(for t in 2:T
             eps ~ Normal(0, 1)
             h[t] = phi * h[t - 1] + eps
         end))
     # the loop index read directly
-    gap("uses the loop index",
+    accepted(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Normal(0, 1)
             h[t] = phi * h[t - 1] + eps * t
         end))
     # a fully deterministic recurrence (no per-step innovation)
-    gap("needs a per-step innovation",
+    @test only(e for e in build_block(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             h[t] = phi * h[t - 1]
-        end))
+        end)).layout.entries if e.kind === :scan).size == 1
     # centered and non-centered carried writes mixed in one scan
-    gap("mixing centered and non-centered",
+    accepted(
         :(h[1] ~ Normal(0, 1)),
         :(g[1] = 0.0),
         :(for t in 2:T
@@ -755,14 +736,14 @@ end
             g[t] = g[t - 1] + h[t]
         end))
     # an innovation scale that reads a carried array (stochastic volatility)
-    gap("innovation scales",
+    accepted(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Normal(0, exp(h[t - 1]))
             h[t] = phi * h[t - 1] + eps
         end))
     # a data column read inside the recurrence
-    gap("data-varying",
+    accepted(
         :(h[1] = 0.0),
         :(for t in 2:T
             eps ~ Normal(0, 1)
