@@ -1,6 +1,6 @@
 # Public generic compiler stress reproducer; no RK/model code.
-# Full-active4D retained ordinary reverse exceeded63GiB RSS and was terminated by the host memory guard (Db7dXE).
-# Not an accepted numerical regression: retain lazy branches and default compiler settings.
+# The scalar-expanded implementation exceeded 63 GiB RSS in ordinary reverse.
+# Run the numerical checks with lazy branches and default compiler settings.
 using Reactant, StaticArrays, Enzyme, LinearAlgebra, Test
 
 function retained_exp4_term(q, t)

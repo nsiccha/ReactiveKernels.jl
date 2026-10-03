@@ -1,14 +1,11 @@
 # Generic array-valued plate consumer layout reproducer.
-# Exact provisional RK 47945ce0 with Reactant 0.2.290 preserves correct native
-# values but flattens the compiled lane-leading rectangle in the wrong order.
-# The weighted loss exposes the same discrepancy in ordinary reverse mode.
+# The original lowering flattened the lane-leading rectangle in the wrong order.
+# An ordinary helper and weighted loss check packing and ordinary reverse mode.
 # Run with Reactant, Enzyme and DifferentiationInterface available in the project.
 using ReactiveKernels, Reactant, Enzyme, DifferentiationInterface, Test
 Reactant.set_default_backend("cpu")
 
 pack_lanes(lanes) = vec(stack(lanes))
-pack_lanes(lanes::ReactiveKernels._TensorizedPlateBatch) =
-    vec(permutedims(ReactiveKernels._tensorized_plate_materialize(lanes)))
 
 @kernel packed_columns(q, X) = begin
     lanes = plate(eachcol(X), Ref(q)) do xs, p

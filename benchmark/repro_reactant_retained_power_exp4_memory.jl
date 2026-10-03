@@ -1,6 +1,6 @@
 # Public generic compiler stress reproducer; no RK/model code.
-# Full-active4D retained exponential and binary power ordinary reverse was terminated under host memory pressure (TEsBFY).
-# Not an accepted numerical regression: retain lazy branches and default compiler settings.
+# The scalar-expanded implementation exceeded the host memory limit in ordinary reverse.
+# Run the numerical, reuse and isolation checks with lazy branches and default settings.
 using Reactant, StaticArrays, Enzyme, LinearAlgebra, Test
 
 function retained_binary_matrix_power(B, count)
