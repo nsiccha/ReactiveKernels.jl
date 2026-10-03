@@ -44,8 +44,14 @@ code is not executed by the docs build.
   on the host (`acc = 0.0`, `zeros(n)`): it is re-bound to a fresh traced copy
   before the loop, because `@trace` carries a value only by updating a traced
   object that exists before the loop (before, such a loop silently returned
-  its seed). A loop may read a host struct such as a schedule plan; it
-  crosses the loop untraced, and a traced value it reads enters as a fresh
+  its seed). Inside a recipe or `@traceable` helper, a conditional assignment
+  such as `if flag; acc = acc + x; end` carries the updated binding out of
+  the selected arm; the other arm keeps its existing value. Assignments to
+  several locals keep their order. A branch used as an expression also
+  returns its authored value. These branches stay lazy inside the retained
+  loop, including an empty loop. A loop may read a host struct such as a
+  schedule plan; it crosses the loop untraced, and a traced value it reads
+  enters as a fresh
   tracer, so a zero-sized input is not returned as an aliased output (which
   XLA export rejects). A tuple or named tuple it reads is opened leaf by
   leaf, so a partly traced model keeps a host matrix host instead of handing
