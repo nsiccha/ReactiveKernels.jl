@@ -433,15 +433,18 @@ function preprocessing_recipes(plan::StructuralPlan)
     return stmts
 end
 
-# Affine predictors with singleton or non-vector operands use the same
-# per-block mathematics as monotonic predictors, retaining Julia's
-# broadcast axes instead of assembling an hcat with forced n_obs rows.
+# Affine predictors with singleton, non-vector or live derived operands
+# use the same per-block mathematics as monotonic predictors. This retains
+# Julia's broadcast axes and avoids mixing bound and active columns in a
+# generated hcat. Data-only derived columns are already present in columns.
 function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     _uses_structured_observation_axes(plan) && return false
     _predictor_level(plan, pred.name) === :obs || return false
     for t in pred.terms
         t.kind in (ContinuousTerm, OffsetTerm, FactorTerm, ComposedTerm) || continue
         for c in t.columns
+            t.kind === ContinuousTerm && !haskey(plan.columns, c) &&
+                _is_derived(plan, c) && return true
             col = get(plan.columns, c, nothing)
             col isa AbstractArray || continue
             (ndims(col) != 1 || length(col) != plan.n_obs) && return true

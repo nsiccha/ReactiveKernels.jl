@@ -147,27 +147,13 @@ end
 
 @testset "horseshoe fail-closed battery" begin
     cols = _horseshoe_cols()
-    # Non-scalar terms are out of the slice.
-    fac = quote
-        a ~ Normal(0, 1)
-        c[levels(g)] .~ Horseshoe()
-        mu = a .+ c[g]
-        sigma ~ Exponential(1.0)
-        y .~ Normal.(mu, sigma)
+    # Retire the flat-slice pins with explicit libraries (user 1cmodra /
+    # 10ldrvz; follow-up 17gw1zm). The companion test_shrinkage_values
+    # checks their density, transforms, coordinates and reverse derivatives.
+    for kind in (:indexed, :monotonic)
+        case = _sh_case(kind, 7, 3)
+        @test (lower_rkppl(case.ast, case.data; conditioned = (:y,)); true)
     end
-    # capability: horseshoe on factor/indexed coefficients c[g]`) (todo `1308iv0`)
-    @test_broken (lower_rkppl(fac, Set([:g, :y]); conditioned = Set([:g, :y])); true)
-    mo = quote
-        a ~ Normal(0, 1)
-        b1 ~ Normal(0, 1)
-        s ~ Dirichlet([1.0, 1.0])
-        b3 ~ Horseshoe()
-        mu = a .+ b1 .* x1 .+ b3 .* mo(c, s)
-        sigma ~ Exponential(1.0)
-        y .~ Normal.(mu, sigma)
-    end
-    # capability: horseshoe on an mo() term coefficient (flat-slice limit) (todo `1308iv0`)
-    @test_broken (lower_rkppl(mo, Set([:x1, :c, :y]); conditioned = Set([:x1, :c, :y])); true)
     # One structured prior per predictor.
     both = quote
         R2 ~ Beta(1.0, 1.0)
