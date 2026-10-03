@@ -69,9 +69,12 @@ Coefficient vectors are declared the same way, sized by their design matrix:
 ## Parameter priors
 
 Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
-`LogNormal`, `Beta`, `InverseGamma`, `StudentT`, `Laplace`, `Logistic`,
+`LogNormal`, `Beta`, `InverseGamma`, `StudentT`, `TDist`, `Laplace`, `Logistic`,
 `Uniform` and `Weibull`. Arguments can read data, sampled parameters and
 ordinary definitions; scalar expressions such as `1 + exp(a)` are values too.
+Omitted positional arguments use Distributions.jl defaults: `Normal()` is
+standard normal, `Gamma(k)` has unit scale, `Beta(k)` has two equal shape
+parameters, and `TDist(nu)` is the standard Student t distribution.
 
 Positive priors have the same normalized meaning in every slot:
 `HalfNormal(s)`, `HalfCauchy(s)` and their equivalent truncated Normal/Cauchy
@@ -115,6 +118,20 @@ Reactant limitation also applies to hierarchical Dirichlet priors.
 ## Julia semantics, written out
 
 - Use Distributions.jl constructors (`Normal`, `Exponential`, `Gamma`, …).
+- Response constructor defaults have their ordinary meaning: `Normal.(mu)`
+  and `LogNormal.(mu)` use unit scale, `NegativeBinomial.(exp.(eta))` uses
+  probability `0.5`, `InverseGaussian.(exp.(eta))` uses unit shape,
+  `Weibull.(k)` uses unit scale, and `VonMises.(exp.(eta))` has zero mean
+  and concentration `exp.(eta)`. Plate observations accept `Normal.(mu)` too.
+  Live VonMises concentration supports native values and derivatives;
+  Reactant compilation still encounters its existing traced `besseli` gap.
+- `Bool` response values retain their numeric meaning, zero or one.
+  Responses with a strictly positive data domain require `true`.
+- `MixtureModel.(vcat.(C1, C2))` gives the components equal weights.
+  Explicit shared weights use `MixtureModel.(vcat.(C1, C2), Ref(w))`.
+- `Beta.(alpha, beta)` preserves argument order. Swapping the arguments in
+  `Beta.(logistic.(eta) .* k, (1 .- logistic.(eta)) .* k)` changes its mean
+  from `logistic.(eta)` to `1 .- logistic.(eta)`.
 - Broadcasting is explicit: `mu = a .+ b .* x`.
 - A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
   `y ~ Normal(...)` on a data vector is rejected.

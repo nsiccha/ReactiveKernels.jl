@@ -3813,7 +3813,7 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
                "only — `$head.(...)` is grouped-only (declare a schedule)")
     end
     fam, arity = spec
-    dargs = dist.args[2].args
+    dargs = _distribution_args(head, dist.args[2].args)
     length(dargs) == arity ||
         _sfail("$where `$head.(...)` takes exactly $arity arguments, " *
                "got $(length(dargs))")
@@ -7610,20 +7610,24 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
     range === nothing || _sfail("response $lhs: mixture responses take no " *
         "range (v1 — mixtures cover the whole column)")
     args = _plain_args(call, "`MixtureModel`")
-    length(args) == 2 || _sfail("response $lhs: `MixtureModel` takes " *
+    length(args) in (1, 2) || _sfail("response $lhs: `MixtureModel` takes " *
         "`MixtureModel.(vcat.(C1, ..., CK), Ref(w))` " *
         "(per-observation component vectors + shared weights)")
-    comps, wraw = args
+    comps = args[1]
     _is_dotted_call(comps) && comps.args[1] === :vcat ||
         _sfail("response $lhs: `MixtureModel` needs per-observation " *
             "component vectors; use `MixtureModel.(vcat.(Normal.(mu1, s), " *
             "Normal.(mu2, s)), Ref(w))`, got $(repr(comps))")
-    _is_ref_call(wraw) || _sfail("response $lhs: mixture weights are " *
-        "shared as a vector — use `Ref(w)` in `MixtureModel.(..., Ref(w))`")
-    wraw = wraw.args[2]
     components = comps.args[2].args
     K = length(components)
     K >= 1 || _sfail("response $lhs: `MixtureModel` needs ≥ 1 component")
+    wraw = if length(args) == 1
+        Expr(:vect, fill(1.0 / K, K)...)
+    else
+        _is_ref_call(args[2]) || _sfail("response $lhs: mixture weights are " *
+            "shared as a vector — use `Ref(w)` in `MixtureModel.(..., Ref(w))`")
+        args[2].args[2]
+    end
     fams = LikelihoodFamily[]
     llinks = LinkFunction[]
     plinks = LinkFunction[]
@@ -8422,18 +8426,21 @@ function _dot2call_spine_arg(lhs, f, i, a)
     elseif f === :NegativeBinomial2 && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :NegativeBinomial && i == 1
+        a isa Real && return a
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :HurdlePoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :ZeroInflatedPoisson && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :InverseGaussian && i == 1
+        a isa Real && return a
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Exponential && i == 1
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :BetaBinomial2 && i == 2
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Weibull && i == 2
+        a isa Real && return a
         return _dot2call_nested_link(lhs, a, f)
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
@@ -8605,7 +8612,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         :ZeroInflatedPoisson, :ZeroInflatedBinomial, :InverseGaussian, :Exponential,
         :BetaBinomial2, :VonMises, :CircularVonMises, :LogNormal, :Weibull) ||
         return _lower_response_base_error(lhs, rhs, fam)
-    args = _plain_args(rhs, "`$fam`")
+    args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
     if fam === :Normal
         length(args) == 2 || _sfail("response $lhs: `Normal` takes " *
                                     "`Normal.(mu, sigma)`")
@@ -8657,13 +8664,13 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `NegativeBinomial` takes " *
                                     "`NegativeBinomial.(exp.(eta), p)`")
         return NegativeBinomialFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        _exp_response_location(lhs, args[1]), args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Weibull
         length(args) == 2 || _sfail("response $lhs: `Weibull` takes " *
                                     "`Weibull.(k, exp.(eta))`")
         return WeibullFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[2], :exp), args[1], nothing, nothing,
+        _exp_response_location(lhs, args[2]), args[1], nothing, nothing,
         nothing, nothing
     elseif fam === :Gamma
         loc, scale = _lower_gamma_args(lhs, args, ctx)
@@ -8708,7 +8715,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         length(args) == 2 || _sfail("response $lhs: `InverseGaussian` takes " *
                                     "`InverseGaussian.(exp.(eta), lambda)`")
         return InverseGaussianFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[1], :exp), args[2], nothing, nothing,
+        _exp_response_location(lhs, args[1]), args[2], nothing, nothing,
         nothing, nothing
     elseif fam === :Exponential
         length(args) == 1 || _sfail("response $lhs: `Exponential` takes " *
@@ -8817,6 +8824,11 @@ function _lower_beta_args(lhs, args, ctx)
     length(args) == 2 ||
         _sfail("response $lhs: `Beta` takes $_BETA_MSG")
     a1, a2 = args
+    swapped = a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
+        a1.args[1] === Symbol(".*") && a1.args[2] isa Expr &&
+        a1.args[2].head === :call && length(a1.args[2].args) == 3 &&
+        a1.args[2].args[1] === Symbol(".-") && a1.args[2].args[2] == 1
+    swapped && ((a1, a2) = (a2, a1))
     a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
         a1.args[1] === Symbol(".*") ||
         _sfail("response $lhs: `Beta` first position is `mu .* kappa` " *
@@ -8839,7 +8851,7 @@ function _lower_beta_args(lhs, args, ctx)
         "response $lhs: both `Beta` positions must name the same kappa " *
         "(got $(repr(k1)) and $(repr(k2)))")
     loc = _lower_link_arg(lhs, _dot2call_nested_link(lhs, m1, :Beta), :logistic)
-    return loc, k1
+    return swapped ? Expr(:call, Symbol(".-"), loc) : loc, k1
 end
 
 function _lower_response_base_error(lhs, rhs, fam)
@@ -12133,7 +12145,7 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Normal => :normal, :Cauchy => :cauchy,
     :Exponential => :exponential, :Gamma => :gamma,
     :LogNormal => :lognormal, :Beta => :beta,
-    :InverseGamma => :inverse_gamma, :StudentT => :student_t,
+    :InverseGamma => :inverse_gamma, :StudentT => :student_t, :TDist => :student_t,
     :Laplace => :laplace, :Logistic => :logistic, :Uniform => :uniform,
     :Weibull => :weibull,
 )
@@ -12719,7 +12731,7 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
     haskey(_PARAM_FAMILIES, fam) ||
         _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
-               "Beta, InverseGamma, StudentT, Laplace, Logistic, Uniform, Weibull, " *
+               "Beta, InverseGamma, StudentT, TDist, Laplace, Logistic, Uniform, Weibull, " *
                "HalfNormal, HalfCauchy, Flat, " *
                "Dirichlet, LKJCovarianceFactor, truncated). If `$fam` is " *
                "meant as a submodel, define it with " *
@@ -12729,7 +12741,7 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
         _sfail("parameter $lhs: `$fam` does not take support keywords; " *
             "use `truncated($fam(args...), lo, hi)`, `HalfNormal(s)`, " *
             "or `HalfCauchy(s)` for a normalized positive prior")
-    args = _plain_args(rhs, "`$fam`")
+    args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
     vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in args]
     argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
     return SampledParameter(lhs, _PARAM_FAMILIES[fam],
