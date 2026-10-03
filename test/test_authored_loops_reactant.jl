@@ -55,6 +55,23 @@ end
     @test _host(compiled(_traced(x), _traced(0.5))) ≈ k(x, 0.5)
 end
 
+@kernel literal_array_reads(x::Vector{Float64}, M::Matrix{Float64}) = begin
+    total::Float64 = x[2] + M[2, 1]
+    return total
+end
+
+@testset "authored scalar reads at literal indices are backend slices" begin
+    k = prepare(literal_array_reads)
+    x, M = [0.5, 1.2], [0.7 0.8; 1.4 0.9]
+    compiled = Reactant.@compile k(_traced(x), _traced(M))
+    @test _host(compiled(_traced(x), _traced(M))) == k(x, M)
+    gradient(v) = Enzyme.gradient(Enzyme.Reverse, w -> k(w, M), v)
+    cg = Reactant.@compile gradient(_traced(x))
+    @test _host(only(cg(_traced(x)))) == [0.0, 1.0]
+    @test x == [0.5, 1.2]
+    @test M == [0.7 0.8; 1.4 0.9]
+end
+
 # `ReactantCore.@trace` carries a loop value by updating the traced object that
 # exists before the loop; it never assigns results back to the enclosing
 # variables. A carry seeded on the host (`acc = 0.0`, `zeros(n)`) therefore had

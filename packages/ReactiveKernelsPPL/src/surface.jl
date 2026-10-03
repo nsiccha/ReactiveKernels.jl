@@ -861,8 +861,10 @@ function _indexed_observation_definitions(ast::Expr, data::Set{Symbol})
         if st isa Expr && _is_broadcast_sample(st)
             lhs = st.args[2]
             if lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
-                    lhs.args[1] in data && lhs.args[2] isa Symbol &&
-                    lhs.args[2] in data
+                    lhs.args[1] in data &&
+                    ((lhs.args[2] isa Symbol && lhs.args[2] in data) ||
+                     (_mentions_symbol(st.args[3], :MixtureModel) &&
+                      _literal_row_range(lhs.args[2])))
                 k = 1
                 name = Symbol(:_rkppl_observed_, lhs.args[1], :_, k)
                 while name in taken
@@ -878,6 +880,14 @@ function _indexed_observation_definitions(ast::Expr, data::Set{Symbol})
         push!(out, st)
     end
     return Expr(:block, out...)
+end
+
+function _literal_row_range(ex)
+    ex isa Expr && ex.head === :call && length(ex.args) == 3 || return false
+    fn = ex.args[1]
+    colon = fn === :(:) || (fn isa GlobalRef &&
+        getfield(fn.mod, fn.name) === getfield(Base, :(:)))
+    return colon && all(x -> x isa Integer, ex.args[2:end])
 end
 
 # Ordinary parameters may have any number of readers. Legacy
@@ -1729,6 +1739,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     end
     if head === :ref
         base = ex.args[1]
+        base in data && length(ex.args) == 2 &&
+            _literal_row_range(ex.args[2]) && return :vector
         base isa Symbol && (shape(base) === :array ||
             _model_valued(base, detmap, env, Set{Symbol}())) &&
             return _ref_shape(ex, data)
@@ -1832,6 +1844,7 @@ function _obs_axis(ex, data, detmap, memo, active, env)
             (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
                 _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
         array_base || _is_gather(ex, data, detmap, env) || return false
+        any(_literal_row_range, ex.args[2:end]) && return true
         return any(i -> _obs_axis(i, data, detmap, memo, active, env),
             ex.args[2:end])
     elseif ex.head === Symbol("'")
@@ -7578,11 +7591,6 @@ end
 function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         predictors, pred_idx, coefuse)
     label = Symbol(lhs, "_resp")
-    weights === nothing || _sfail("response $lhs: mixture responses take " *
-        "no frequency weights (v1 — `weighted.(...)` over a mixture is a " *
-        "follow-up)")
-    evidence.kind === :none || _sfail("response $lhs: mixture responses " *
-        "take no censoring/truncation evidence (v1)")
     range === nothing || _sfail("response $lhs: mixture responses take no " *
         "range (v1 — mixtures cover the whole column)")
     args = _plain_args(call, "`MixtureModel`")
@@ -7637,10 +7645,7 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
     trials = nothing
     if f === BinomialLogitFam
         t1 = trials_raw[1]
-        all(t -> isequal(t, t1), trials_raw) || _sfail("response $lhs: " *
-            "mixture Binomial components must share one identical " *
-            "trial-count expression (SB rule — share one column)")
-        trials = t1
+        trials = all(t -> isequal(t, t1), trials_raw) ? t1 : nothing
     end
     loc_uses = Union{Symbol,Real}[
         _lower_mixture_loc(lhs, k, loc, pl, wrappeds[k], ctx, predictors,
@@ -7652,13 +7657,17 @@ function _lower_mixture_response(lhs, call, range, weights, evidence, ctx,
         end
         push!(scale_uses, lowered_sc)
     end
+    wraw isa Symbol && wraw ∉ ctx.data && wraw ∉ ctx.dirichlet_names &&
+        _sfail("response $lhs: mixture weights $wraw are undeclared; bind an input or state a Dirichlet prior")
     w = _lower_mixture_weights(lhs, wraw)
     prednames = Set{Symbol}(p.name for p in predictors)
     anchor = _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     return LikelihoodSpec(MixtureFam, ll, lhs, anchor, nothing, weights,
         evidence, label, trials, range; mixture_family = f,
         mixture_locs = loc_uses, mixture_scales = scale_uses,
-        mixture_weights = w)
+        mixture_weights = w,
+        mixture_trials = f === BinomialLogitFam && trials === nothing ?
+            Union{ColumnRef,Int}[trials_raw...] : Union{ColumnRef,Int}[])
 end
 
 # Dotted→call conversion for one mixture component: like
@@ -7833,9 +7842,11 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
             return _lower_location(lhs, loc, pred_link, ctx, predictors,
                 pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"))
         end
-        haskey(ctx.detmap, loc) && _sfail("response $lhs: mixture " *
-            "component $k location $loc is a scalar definition — v1 " *
-            "locations are predictors, sampled parameters, or literals")
+        if haskey(ctx.detmap, loc) && pred_link === IdentityLink
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
+                value = true)
+        end
         if loc in ctx.prior_names
             wrapped && _sfail("response $lhs: mixture component $k " *
                 "wraps the sampled parameter $loc in a link function — " *
@@ -7843,9 +7854,11 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
                 "parameters bare, constrained-scale)")
             return loc
         end
-        loc in ctx.data && _sfail("response $lhs: mixture component $k " *
-            "location is the data column $loc — wrap it in a predictor " *
-            "(`eta = a .+ b .* $loc`, or offset-only `mu = $loc`)")
+        if loc in ctx.data && pred_link === IdentityLink
+            return _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
+                value = true)
+        end
         _sfail("response $lhs: mixture component $k location $loc is not " *
                "a predictor definition, sampled parameter, or literal")
     else
@@ -7918,9 +7931,7 @@ function _mixture_anchor(lhs, loc_uses, scale_uses, w, prednames, ctx)
     for s in scale_uses
         s isa Symbol && return s # A data-column scale: opaque anchor, never resolved.
     end
-    _sfail("response $lhs: fully-fixed mixture (all literals) is a " *
-        "constant density with no plan — leave at least one slot free " *
-        "or drop the response")
+    return lhs
 end
 
 const _LEVELED_FAMS =

@@ -1089,8 +1089,8 @@ end
     Reactant.promote_to(Reactant.TracedRArray, arg)
 
 # A traced scalar index is a deliberate gather at this compiler boundary: one
-# element read with one integer index per dimension (`x[j]`, `W[i, j]`), at
-# least one of them traced, is one dynamic slice. Reactant 0.2.284 preserves
+# element read with one integer index per dimension (`x[j]`, `W[i, j]`) is
+# one slice, including an authored read at literal indices. Reactant 0.2.284 preserves
 # lane-varying dynamic-slice indices under `Ops.batch`, so lower the authored
 # index directly rather than materializing an O(K) select/reduction workaround.
 # Every index is passed to Reactant as an `Int`: a traced `Int32` index
