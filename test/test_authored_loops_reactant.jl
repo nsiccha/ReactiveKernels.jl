@@ -1,5 +1,68 @@
 using ReactiveKernels, Reactant, Test
+using StaticArrays: SMatrix
 import Enzyme
+
+# Independent synthetic fixed-storage matrix: no domain package or model.
+# The loop must keep its wrapper and lift each host seed entry into a distinct
+# tracer, as it does for immutable arrays with fixed tuple storage.
+@traceable function _loop_matrix_recurrence(B::SMatrix{2,2}, n)
+    R = SMatrix{2,2}(1.0, 0.0, 0.0, 1.0)
+    i = zero(n)
+    while i < n
+        R = R * B
+        B = B * B
+        i = i + one(i)
+    end
+    R
+end
+@traceable _loop_matrix_sum(A::SMatrix{2,2}) =
+    A[1, 1] + A[2, 1] + A[1, 2] + A[2, 2]
+
+@kernel fixed_tuple_matrix_loop(q, n) = begin
+    B = SMatrix{2,2}(q[1], 0.1, 0.2, q[2])
+    R = _loop_matrix_recurrence(B, n)
+    # The typed helper proves wrapper preservation, and B is read after the
+    # loop to detect accidental mutation of the caller's tracer handles.
+    total = _loop_matrix_sum(R) + _loop_matrix_sum(B)
+    return total
+end
+
+@testset "fixed-tuple matrix carries retain their wrapper and caller values" begin
+    k = prepare(fixed_tuple_matrix_loop)
+    q = [0.6, 0.7]
+    rq = Reactant.to_rarray(q)
+    function inventory(hlo)
+        counts = Dict{String,Int}()
+        for m in eachmatch(r"\b(?:stablehlo|chlo|func|arith|enzyme|scf|tensor)\.\w+", hlo)
+            counts[m.match] = get(counts, m.match, 0) + 1
+        end
+        counts
+    end
+    for T in (Int32, Int64)
+        rn = Reactant.to_rarray(T(3); track_numbers=true)
+        compiled = Reactant.@compile k(rq, rn)
+        inventories = Dict{String,Int}[]
+        for n in (0, 1, 2, 5, 17)
+            input = Reactant.to_rarray(T(n); track_numbers=true)
+            for point in (q, [0.45, 0.75])
+                B = [point[1] 0.2; 0.1 point[2]]
+                reference = sum(B^(2^n - 1)) + sum(B)
+                @test k(point, T(n)) ≈ reference
+                @test Float64(compiled(Reactant.to_rarray(point), input)) ≈ reference
+            end
+            hlo = repr(Reactant.@code_hlo optimize=true k(rq, input))
+            push!(inventories, inventory(hlo))
+        end
+        @test all(==(first(inventories)), inventories)
+        @test first(inventories)["stablehlo.while"] == 1
+        println("fixed-tuple matrix default inventory $T: ", first(inventories))
+    end
+    gradient(v) = only(Enzyme.gradient(Enzyme.Reverse, w -> k(w, 3), v))
+    h = 1e-6
+    finite_gradient = [(e = zeros(2); e[j] = h;
+        (k(q + e, 3) - k(q - e, 3)) / (2h)) for j in 1:2]
+    @test gradient(q) ≈ finite_gradient rtol=1e-8
+end
 
 # An authored `for` inside a recipe keeps its iteration under Reactant: the
 # loop body is emitted once inside one `stablehlo.while` region, whatever the

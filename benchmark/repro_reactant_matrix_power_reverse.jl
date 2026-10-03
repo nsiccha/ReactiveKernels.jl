@@ -1,4 +1,4 @@
-# Backend-only PK binary-power shape: retained integer loop and lazy multiply.
+# Backend-only matrix binary power: retained integer loop and lazy multiply.
 # Reactant 0.2.290 compiles the primal but ordinary default reverse fails with
 # "WhileOp does not have known iteration count for cache removal". No RK
 # lowering, derivative rule, unrolling, or optimizer override is involved.
@@ -35,7 +35,7 @@ end
 gradient(q, n) = only(Enzyme.gradient(Enzyme.Reverse,
     Enzyme.Const(x -> power_loss(x, n)), q))
 
-@testset "backend-only retained PK integer power" begin
+@testset "backend-only retained matrix integer power" begin
     q = [0.7, 0.9]
     rq = Reactant.to_rarray(q)
     rn = Reactant.to_rarray(Int64(3); track_numbers=true)

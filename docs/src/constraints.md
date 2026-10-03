@@ -162,9 +162,9 @@ and lock the one Reactant 0.2.289 lifted:
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:
-  `repro_reactant_adaptive_while_reverse.jl`. The repeated-dose binary-power
+  `repro_reactant_adaptive_while_reverse.jl`. Generic matrix binary power
   shape has the same default reverse failure on Reactant 0.2.290:
-  `repro_reactant_pk_integer_power.jl` checks its native and compiled primal,
+  `repro_reactant_matrix_power_reverse.jl` checks its native and compiled primal,
   retained integer loop and lazy branch, and native ordinary Enzyme gradient.
   Compiled reverse remains unsupported for that shape. The solver keeps the
   retained loop; its supported gradient is the backsolve adjoint, whose right-hand
