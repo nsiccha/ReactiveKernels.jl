@@ -159,7 +159,13 @@ struct LayoutEntry
     lo::Union{Float64,Symbol,Expr} # constrained lower bound (else NaN)
     hi::Union{Float64,Symbol,Expr} # constrained upper bound (else NaN)
     dims::Vector{Int} # declared-array axes, including :cholesky_corr (else empty)
+    scan_blocks::Vector{LayoutEntry} # structural latent-family blocks (else empty)
 end
+LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
+    labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
+    lo, hi, dims::Vector{Int}) =
+    LayoutEntry(kind, predictor, name, labels, offset, size, transform, lo, hi,
+        dims, LayoutEntry[])
 # Legacy scalar/block entries carry no axes.
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
@@ -170,6 +176,37 @@ LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol) =
     LayoutEntry(kind, predictor, name, labels, offset, size, transform, NaN, NaN)
+
+# One block per sampled seed / body statement, independent of the number of
+# iterations. Native and generated transforms use the existing bijectors.
+function _scan_layout_entry(plan, s, name, offset, T)
+    blocks = LayoutEntry[]
+    pos = offset
+    for st in (s.setup..., s.step...)
+        st.kind === :sample || continue
+        width = st isa ScanSetup ? 1 : T - (s.lo - 1)
+        width == 0 && continue
+        args = NamedTuple{Tuple(Symbol(:arg, i) for i in eachindex(st.args))}(Tuple(st.args))
+        transform, lo, hi = _entry_transform(st.family, nothing, args)
+        if transform === :interval
+            locals = Set(step.target for step in s.step if !step.indexed)
+            bounds = union(_expr_value_symbols(lo), _expr_value_symbols(hi))
+            (_scan_reads_carried(lo, s) || _scan_reads_carried(hi, s) ||
+                s.loopvar in bounds || !isdisjoint(locals, bounds)) &&
+                _fail(s.label, "scan Uniform bounds that vary by step are not supported yet")
+            lo, hi = _layout_bound(plan, lo), _layout_bound(plan, hi)
+        end
+        blockname = Symbol(name, :_block_, length(blocks) + 1)
+        push!(blocks, LayoutEntry(:plate, nothing, blockname, Symbol[], pos,
+            width, transform, lo, hi))
+        pos += width
+    end
+    n = pos - offset
+    all(e -> e.transform === :identity, blocks) &&
+        return LayoutEntry(:scan, nothing, name, Symbol[Symbol(i) for i in 1:n], offset, n, :identity)
+    return LayoutEntry(:scan, nothing, name, Symbol[Symbol(i) for i in 1:n],
+        offset, n, :scan_blocks, NaN, NaN, Int[], blocks)
+end
 
 """Packed unconstrained layout: ordered entries + total dimension."""
 struct LayoutTable
@@ -494,22 +531,21 @@ function assign_layout(plan::StructuralPlan)
     # while the state names bind the emitter's `scan(...)` reconstruction. A
     # non-centered scan with no sampled seed and no innovation (a fully
     # deterministic recurrence) has no slice.
-    for s in plan.scans
+    for raw in plan.scans
+        s = _resolve_scan(plan, raw)
         T = _scan_length(plan, s)
-        T >= s.lo || throw(ContractValidationError(
-            "[layout] scan $(join(s.states, ", ")) length $(T) < loop start " *
-            "$(s.lo) — the recurrence must run at least once"))
+        T >= s.lo - 1 || throw(ContractValidationError(
+            "[layout] scan $(join(s.states, ", ")) length $(T) cannot hold " *
+            "the $(s.lo - 1) seed values"))
         if _is_noncentered_scan(s)
             n = _scan_latent_size(s, T)
             n == 0 && continue
-            push!(entries, LayoutEntry(:scan, nothing, _scan_innovation_name(s),
-                Symbol[Symbol(i) for i in 1:n], offset, n, :identity))
+            push!(entries, _scan_layout_entry(plan, s, _scan_innovation_name(s), offset, T))
             offset += n
         else
             gap = _scan_shape_gap(s)
             gap === nothing || throw(ContractValidationError("[layout] " * gap))
-            push!(entries, LayoutEntry(:scan, nothing, only(s.states),
-                Symbol[Symbol(i) for i in 1:T], offset, T, :identity))
+            push!(entries, _scan_layout_entry(plan, s, only(s.states), offset, T))
             offset += T
         end
     end
@@ -1131,7 +1167,8 @@ end
 
 # Bounds read the same constrained values and ordinary definitions as the
 # graph. Packing order stays fixed; evaluation follows bound dependencies.
-_dynamic_bounds(e::LayoutEntry) = !(e.lo isa Real && e.hi isa Real)
+_dynamic_bounds(e::LayoutEntry) = !(e.lo isa Real && e.hi isa Real) ||
+    any(_dynamic_bounds, e.scan_blocks)
 function _layout_lookup(layout::LayoutTable, values)
     active = Set{Symbol}()
     function lookup(name)
@@ -1164,7 +1201,8 @@ function _resolved_entry(layout::LayoutTable, e::LayoutEntry, values)
         isfinite(hi) || throw(ContractValidationError("[layout] upper bound for $(e.name) must be finite"))
     end
     return LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset,
-        e.size, e.transform, Float64(lo), Float64(hi), e.dims)
+        e.size, e.transform, Float64(lo), Float64(hi), e.dims,
+        [_resolved_entry(layout, b, values) for b in e.scan_blocks])
 end
 function _bound_entry_order(layout::LayoutTable)
     any(_dynamic_bounds, layout.entries) || return layout.entries
@@ -1177,7 +1215,7 @@ function _bound_entry_order(layout::LayoutTable)
         push!(active, name)
         if haskey(byname, name)
             e = byname[name]
-            for x in (e.lo, e.hi), dep in _value_symbols(x)
+            for block in (e, e.scan_blocks...), x in (block.lo, block.hi), dep in _value_symbols(x)
                 visit(dep)
             end
             push!(out, e)
@@ -1226,7 +1264,9 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
-            push!(pairs, e.name => Vector{Float64}(seg))
+            push!(pairs, e.name => (isempty(e.scan_blocks) ? Vector{Float64}(seg) :
+                vcat([[_constrain_elt(b, Float64(u[i])) for i in b.offset:(b.offset + b.size - 1)]
+                    for b in e.scan_blocks]...)))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
         elseif e.kind === :array && e.transform === :lkj_stack
@@ -1378,7 +1418,13 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             length(v) == e.size || throw(
                 ContractValidationError("[layout] scan state $(e.name) length mismatch"),
             )
-            u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
+            if isempty(e.scan_blocks)
+                u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
+            else
+                for b in e.scan_blocks, i in b.offset:(b.offset + b.size - 1)
+                    u[i] = _unconstrain_elt(b, Float64(v[i - e.offset + 1]))
+                end
+            end
         elseif e.kind === :array
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing array parameter $(e.name)"),
@@ -1448,6 +1494,12 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
         e = _resolved_entry(layout, entry, values)
         e.transform === :identity && continue
         seg = u[e.offset:(e.offset + e.size - 1)]
+        if e.kind === :scan && !isempty(e.scan_blocks)
+            for b in e.scan_blocks, i in b.offset:(b.offset + b.size - 1)
+                total += _logjac_elt(b, Float64(u[i]))
+            end
+            continue
+        end
         if e.kind === :vector
             # Vector Jacobians couple coordinates (ordered sums, simplex
             # stick-breaking) — entry-level, never per-coordinate.
@@ -1564,6 +1616,18 @@ sampled entry (`:exp`/`:logistic`) splices the bijector's `constrain` endpoint,
 which the planner inlines.
 """
 function transform_statements(e::LayoutEntry)
+    if e.kind === :scan && !isempty(e.scan_blocks)
+        stmts = Expr[]
+        for b in e.scan_blocks
+            if b.transform === :identity
+                push!(stmts, :($(b.name)::Vector{Float64} = copy($(block_read(b.offset, b.size)))))
+            else
+                append!(stmts, _plate_transform_statements(b))
+            end
+        end
+        push!(stmts, :($(e.name)::AbstractVector{Float64} = vcat($([b.name for b in e.scan_blocks]...))))
+        return stmts
+    end
     if e.kind === :scan
         # scan-state slices read a view into `e.name` (a scan-state slice,
         # a non-centered scan's `_ppl_scan_z_<state>` innovation slice, or
@@ -1888,6 +1952,10 @@ transform. Legacy structural-margin LKJ blocks sum their named scalar edges.
 """
 function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
+    if e.kind === :scan && !isempty(e.scan_blocks)
+        terms = Any[jacobian_term(b) for b in e.scan_blocks if b.transform !== :identity]
+        return foldl((a, b) -> :($a + $b), terms; init = 0.0)
+    end
     if e.kind === :coefficient
         # Interval runs (uniform coefficients) hand-roll the per-cell
         # Jacobian sum — the same expression as the host `_logjac_elt`
