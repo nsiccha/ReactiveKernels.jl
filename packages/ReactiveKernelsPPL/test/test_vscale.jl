@@ -370,8 +370,8 @@ end
         sg = cs[g]
         y .~ Normal.(mu, exp.(sg))
     end, (:y, :x, :g); conditioned = (:y, :x, :g))
-    # A latent transform is not an affine predictor: it stays on the
-    # scalar path and fails there, never analyzed for coefficients.
+    # A latent transform remains an ordinary per-cell scale value.
+    # Numerical density and reverse checks live in test_auxiliary_data.jl.
     expr = Expr(:block,
         :(mu ~ Normal(0, 5)),
         :(tau ~ HalfNormal(5)),
@@ -381,7 +381,7 @@ end
                 Expr(:block,
                     :(theta[i] ~ Normal(mu, tau)),
                     :(y[i] ~ Normal.(theta[i], _t2[i]))))))
-    # capability: deterministic transform of a plate latent (_t2 = theta .+ 1) as per-cell scale (todo `1qlbn5b`)
+    # Admitted: a deterministic plate-latent transform supplies per-cell scale.
     @test (lower_rkppl(expr, (:y,); conditioned = (:y,)); true)
 end
 

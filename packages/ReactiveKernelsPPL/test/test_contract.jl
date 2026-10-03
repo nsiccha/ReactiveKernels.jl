@@ -585,7 +585,7 @@ end
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = 4.0)
     @test validate_plan(good) === nothing
-    # nu names resolve structurally (no bind-time column form).
+    # nu names resolve from model values or bound data.
     bad = _student_plan()
     bad.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
@@ -596,8 +596,8 @@ end
     bad.responses[1] =
         LikelihoodSpec(StudentTFam, IdentityLink, :y, :mu, :sigma, nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = :x)
-    # capability: per-observation data column for StudentT nu (scalar-only today; P10a, 0dejlw1) (todo `1qlbn5b`)
-    @test_broken (validate_plan(bad); true)
+    # Raw per-observation degrees of freedom use the bound column.
+    @test validate_plan(bad) === nothing
     # Student response must be numeric.
     bad = _student_plan()
     bad.columns[:y] = fill("a", 9)
@@ -887,7 +887,7 @@ end
                 _none_evidence(), :y_resp, nothing, nothing; zi = lit)
         @test validate_plan(good) === nothing
     end
-    # zi names resolve structurally (no bind-time column form).
+    # zi names resolve from model values or bound data.
     bad = _zip_plan()
     bad.responses[1] =
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
@@ -898,8 +898,10 @@ end
     bad.responses[1] =
         LikelihoodSpec(ZeroInflatedPoissonFam, LogLink, :y, :eta, nothing, nothing,
             _none_evidence(), :y_resp, nothing, nothing; zi = :x)
-    # capability: per-observation data column for ZIP zi (scalar/predictor-only today; P10a, 0dejlw1) (todo `1qlbn5b`)
-    @test_broken (validate_plan(bad); true)
+    # The original x=1:9 fixture has invalid probability data.
+    @test_throws ContractValidationError validate_plan(bad)
+    bad.columns[:x] = repeat([0.15,0.35,0.65],3)
+    @test validate_plan(bad) === nothing
     # ZIP takes no scale auxiliary.
     bad = _zip_plan()
     bad.responses[1] =
