@@ -354,3 +354,13 @@ and lock the one Reactant 0.2.289 lifted:
   gradient acceptance pins this exact export error. Empty observation and
   parameter domains with a nonempty coordinate pack pass compiled reverse.
   No dummy batch or handwritten derivative substitutes for the empty case.
+- An opaque Julia function's ordinary `hcat` of a live scalar and a constant one-entry vector fails
+  during Reactant 0.2.290 primal tracing with `Scalar indexing is disallowed`
+  in `Base.typed_hcat`: `repro_reactant_scalar_hcat.jl` isolates it without
+  ReactiveKernels. Native values and ordinary Enzyme reverse match independent
+  algebra; an equivalent scalar-formula control compiles primal and reverse.
+  Compiler-visible calls resolve to RK's ordinary concatenation lowering,
+  including imported, qualified, aliased and `GlobalRef` bindings. RKPPL's
+  one-row `sampled_scalar` matrix case keeps its authored column and passes
+  default compiled values and reverse. The opaque function remains the backend
+  boundary; no scalar-indexing override or derivative rule replaces its body.

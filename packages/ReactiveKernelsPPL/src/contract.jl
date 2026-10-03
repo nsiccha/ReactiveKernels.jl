@@ -5802,6 +5802,8 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     ex isa LineNumberNode && return nothing
     _is_plate_column_expr(ex) &&
         return _collect_plate_column_refs!(refs, ex, plan, label, bound)
+    _is_matrix_math(ex, plan) &&
+        return _collect_opaque_refs!(refs, ex, plan, label, bound)
     # Expressions over declared array parameters (`phi[1]`, `sd .* z`,
     # `sum(z)`) follow the array-value vocabulary (`arrays.jl`).
     _mentions_array(ex, plan) &&
@@ -6113,6 +6115,8 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     end
     if head === :call
         fn = ex.args[1]
+        _is_matrix_math(ex, plan) &&
+            return _collect_opaque_refs!(refs, ex, plan, label, bound)
         _is_data_matvec(ex, plan) &&
             return _collect_data_matvec!(refs, ex, plan, label, bound)
         if fn isa GlobalRef
@@ -6293,7 +6297,9 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         return _literal_row_range(ex.args[2]) || _is_vector_valued(ex.args[2], plan)
     if head === :call
         isempty(ex.args) && return false
+        _is_matrix_math(ex, plan) && return true
         fn = ex.args[1]
+        fn === GlobalRef(Base, :hcat) && return length(ex.args) > 1
         fn isa GlobalRef && return false  # undotted module call: model-level
         if fn === :* && length(ex.args) == 3 &&
                 _observation_matrix_gather(ex.args[2], plan) &&
@@ -6316,6 +6322,35 @@ function _is_vector_valued(ex, plan::StructuralPlan)
     end
     return false
 end
+
+# Matrix values retain Julia's whole-value arithmetic even when a matrix
+# definition is stored in the observation-column table. This shape test
+# never evaluates live values or changes their dimensions.
+function _is_matrix_value(ex, plan::StructuralPlan, active = Set{Symbol}())
+    if ex isa Symbol
+        haskey(plan.columns, ex) && return plan.columns[ex] isa AbstractMatrix
+        ex in active && return false
+        i = findfirst(d -> d.name === ex, plan.derived)
+        j = findfirst(a -> a.name === ex, plan.assignments)
+        rhs = i !== nothing ? plan.derived[i].expr :
+            j !== nothing ? plan.assignments[j].expr : nothing
+        rhs === nothing && return false
+        push!(active, ex)
+        result = _is_matrix_value(rhs, plan, active)
+        delete!(active, ex)
+        return result
+    end
+    ex isa Expr || return false
+    ex.head === :call && !isempty(ex.args) || return false
+    fn = ex.args[1]
+    fn === GlobalRef(Base, :hcat) && return length(ex.args) > 1
+    fn in (:+, :-, :*, :/, ELEMENTWISE_OPS...) || return false
+    return any(a -> _is_matrix_value(a, plan, active), ex.args[2:end])
+end
+
+_is_matrix_math(ex, plan) = ex isa Expr && ex.head === :call &&
+    !isempty(ex.args) && ex.args[1] in (:+, :-, :*, :/) &&
+    any(a -> _is_matrix_value(a, plan), ex.args[2:end])
 
 function _observation_matrix_gather(ex, plan)
     return _is_row_gather(plan, ex)
@@ -6355,6 +6390,8 @@ function _validate_parameters(plan::StructuralPlan)
                 p.label,
                 "arg $k must be a literal or a parameter/assignment name",
             )
+            _is_matrix_value(v, plan) && _fail(p.label,
+                "arg $k references matrix value $v; $(p.family) takes scalar arguments")
             (v in names || (observed_binomial && (!isbound(plan) || haskey(plan.columns,v)))) ||
                 _fail(p.label, "arg $k references unknown name $v")
         end
@@ -7394,6 +7431,7 @@ end
 unobserved levels. Copy the result so binder-owned metadata never aliases
 caller-owned pool storage. DataAPI's plain-vector fallback sorts uniques."""
 _grouping_levels(col::AbstractVector) = Vector(DataAPI.levels(col))
+_grouping_levels(col::AbstractArray) = _grouping_levels(vec(col))
 
 # One map per factor term, keyed (predictor, column), so a factor lookup
 # resolves to exactly one map.
@@ -7461,8 +7499,9 @@ function _eval_levelmaps(levelmaps::Vector{LevelMap},
     for m in levelmaps
         haskey(columns, m.column) ||
             _fail(:plan, "LevelMap addresses missing column $(m.column)")
-        groupcol =
-            _vector_column(columns, m.column, :plan, "grouping column")
+        groupcol = columns[m.column]
+        groupcol isa AbstractArray ||
+            _fail(:plan, "grouping column $(m.column) must be an array")
         levels =
             try
                 _grouping_levels(groupcol)
@@ -10651,6 +10690,14 @@ name a response, predictor, plate or other slot holds (a slot added later
 stays fail-closed). Returns `(inputs, defs)`: the columns, and the
 whole-context definitions (whose values may have any length too)."""
 function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
+    # A column with no value consumer has no observation axis. Infer this
+    # from the finished plan, where optimized matrix/predictor reads are
+    # represented too, rather than from an intermediate definition table.
+    unused = Set{Symbol}(raw)
+    for f in fieldnames(StructuralPlan)
+        f in (:columns, :n_obs, :roles, :submodel_scopes) && continue
+        _drop_held_names!(unused, getfield(plan, f))
+    end
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
     append!(defs, Pair{Symbol,Any}[d.name => d.expr for d in plan.derived])
     # Scalar and declared-array prior arguments are whole model values.
@@ -10696,7 +10743,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     # Pinning only shrinks the verdict: skip the slot walk when even the
     # unpinned pass finds nothing.
     inputs, _ = _whole_value_reads(defs, raw, Set{Symbol}())
-    isempty(inputs) && return inputs, Set{Symbol}()
+    isempty(inputs) && return unused, Set{Symbol}()
     free = union(Set{Symbol}(raw), Set{Symbol}(first(d) for d in defs))
     named = copy(free)
     for f in fieldnames(StructuralPlan)
@@ -10730,7 +10777,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     end
     held = setdiff!(named, free)
     inputs, ctx = _whole_value_reads(defs, raw, held)
-    return setdiff!(inputs, held), ctx
+    return union!(setdiff!(inputs, held), unused), ctx
 end
 
 """Whole-value reads over `defs` (`name => expr`): the columns of `raw`
