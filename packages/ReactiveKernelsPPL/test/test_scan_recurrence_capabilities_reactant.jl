@@ -7,7 +7,8 @@
         (:support, n -> _scan_cap_support(n, :exponential, :exponential)),
         (:interval, n -> _scan_cap_support(n, :uniform, :uniform)),
         (:arma, n -> _scan_cap_data_model(n, :arma)),
-        (:garch, n -> _scan_cap_data_model(n, :garch))]
+        (:garch, n -> _scan_cap_data_model(n, :garch)),
+        (:defaults, n -> _scan_cap_defaults(n))]
     for (kind, fixture) in fixtures
         operations = nothing
         for n in (4, 8)

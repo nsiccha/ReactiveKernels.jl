@@ -50,7 +50,8 @@ function _scan_parse_dist(call, what)
     haskey(_PARAM_FAMILIES, fam) || _scan_fail(
         "$what: unknown distribution `$(repr(fam))` (admitted: Normal, " *
         "Cauchy, Exponential, Gamma, LogNormal, Beta, InverseGamma)")
-    return _PARAM_FAMILIES[fam], collect(Any, _plain_args(call, "`$(fam)`"))
+    return _PARAM_FAMILIES[fam], collect(Any,
+        _distribution_args(fam, _plain_args(call, "`$(fam)`")))
 end
 
 """

@@ -234,3 +234,43 @@ end
         _scan_cap_check(f,oracle)
     end
 end
+
+function _scan_cap_defaults(n)
+    program = quote
+        phi ~ Normal()
+        @scan begin
+            h[1] ~ Normal()
+            for t in 2:T
+                e ~ Normal()
+                h[t] = phi * h[t - 1] + e
+            end
+        end
+        y .~ Binomial.(2, logistic.(h))
+    end
+    data = Dict{Symbol,Any}(:y => [iseven(t) for t in 1:n])
+    snapshot = deepcopy(data)
+    f = _scan_cap_sampler(program, data)
+    pe = only(e for e in f.built.layout.entries if e.name === :phi)
+    ze = only(e for e in f.built.layout.entries if e.kind === :scan)
+    function oracle(u)
+        phi = u[pe.offset]
+        z = u[ze.offset:(ze.offset + ze.size - 1)]
+        lp = logpdf(Normal(), phi) + sum(logpdf.(Normal(), z))
+        h = z[1]
+        for t in 1:n
+            t == 1 || (h = phi * h + z[t])
+            lp += logpdf(Binomial(2, 1 / (1 + exp(-h))), data[:y][t])
+        end
+        return lp
+    end
+    return f, oracle, data, snapshot
+end
+
+@testset "scan capabilities: constructor defaults and Boolean counts" begin
+    for n in (1, 4)
+        f, oracle, data, snapshot = _scan_cap_defaults(n)
+        @test f.built.layout.total == n + 1
+        _scan_cap_check(f, oracle)
+        @test data == snapshot
+    end
+end
