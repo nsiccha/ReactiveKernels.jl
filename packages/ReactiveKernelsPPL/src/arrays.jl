@@ -833,20 +833,9 @@ end
 # A derived column the model computes at bind from data alone (a module
 # call reading only raw columns or other such columns): bound data, so
 # its value may be a matrix with one row per observation.
-function _is_bind_data_derived(plan::StructuralPlan, name::Symbol,
-        active::Set{Symbol} = Set{Symbol}())
-    i = findfirst(d -> d.name === name, plan.derived)
-    i === nothing && return false
-    ex = plan.derived[i].expr
-    _contains_module_call(ex) || return false
-    name in active && return false
-    push!(active, name)
-    known = _all_names(plan)
-    ok = all(s -> !(s in known) || _is_bind_data_derived(plan, s, active),
-        _expr_value_symbols(ex))
-    delete!(active, name)
-    return ok
-end
+_is_bind_data_derived(plan::StructuralPlan, name::Symbol) =
+    any(d -> d.name === name, plan.derived) &&
+        name in _module_data_names(plan; unbound=true)
 
 # `z[g, :]` or `z[:, g]'`: one row per observation. Adjoint preserves
 # the author's Julia orientation, rather than changing the gather itself.

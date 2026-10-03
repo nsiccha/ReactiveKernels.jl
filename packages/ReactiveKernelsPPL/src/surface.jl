@@ -1505,7 +1505,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
-        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned)
+        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned,
+        indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
+            Set{Symbol}(r.response for r in responses)))
     _confirm_whole_value_data(plan, rawdata, waived; whole)
     validate_structure(plan)
     return plan
@@ -2459,8 +2461,9 @@ function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
 end
 
 # Names held by non-definition statements. A gathered
-# value is whole even in a response (`v[g]`); its index is aligned. Plates
-# and scans retain their conservative statement-wide alignment. Extracted
+# value is whole even in a response (`v[g]`); its index is aligned. Plate
+# cells distinguish whole calls from indexed lane reads; scans retain
+# conservative statement-wide alignment. Extracted
 # kernel cells remain consumers too: a schedule-chain definition moved out
 # of `det` still reads its subject-level predictors. Otherwise those now
 # apparently unused definitions would be classified as whole values.
@@ -2471,7 +2474,17 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
     for st in ast.args
         st isa LineNumberNode && continue
         st isa Expr && st.head === :(=) && st.args[1] isa Symbol && continue
-        if st isa Expr && st.head === :macrocall
+        if st isa Expr && st.head === :macrocall &&
+                st.args[1] === Symbol("@plate")
+            loop = st.args[3]
+            ivar = loop.args[1].args[1]
+            _all_symbols!(out, loop.args[1].args[2])
+            for c in loop.args[2].args
+                c isa Expr && (_is_sample(c) || _is_broadcast_sample(c)) || continue
+                _classify_cell_reads!(whole, out, c.args[2], known, ivar)
+                _classify_cell_reads!(whole, out, c.args[3], known, ivar)
+            end
+        elseif st isa Expr && st.head === :macrocall
             _all_symbols!(out, st)
         elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
                 _merge_stem(_stmt_lhs(st)) in whole_priors
@@ -2484,6 +2497,24 @@ function _statement_names(ast::Expr, known::Set{Symbol}, kernel_stmts = ();
     free = copy(known)
     _drop_held_names!(free, kernel_stmts)
     return union!(out, setdiff(known, free))
+end
+
+function _classify_cell_reads!(whole, aligned, ex, known, ivar, full=false)
+    if ex isa Expr && ex.head === :ref && length(ex.args) == 2 && ex.args[2] === ivar
+        _classify_reads!(whole, aligned, ex.args[1], known, false)
+    elseif ex isa Expr && ex.head === :call
+        context = full || _cell_whole_call(ex.args[1])
+        for a in ex.args[2:end]
+            _classify_cell_reads!(whole, aligned, a, known, ivar, context)
+        end
+    elseif _is_dotted_call(ex)
+        for a in ex.args[2].args
+            _classify_cell_reads!(whole, aligned, a, known, ivar, full)
+        end
+    else
+        _classify_reads!(whole, aligned, ex, known, full)
+    end
+    return nothing
 end
 
 # The names of `among` that `ex` reads, directly or through definitions.
@@ -5679,8 +5710,15 @@ function _cell_bares!(ex::Expr, ivar, bares, data)
         return nothing
     end
     if ex.head === :call
+        fn = ex.args[1]
+        # Undotted module calls and reductions consume whole values.
+        # Still walk their arguments to validate indexed reads and the
+        # loop variable, while exempting bare whole arguments from the
+        # per-observation column check.
+        whole = _cell_whole_call(fn)
+        reads = whole ? Set{Symbol}() : bares
         for a in ex.args[2:end]
-            _cell_bares!(a, ivar, bares, data)
+            _cell_bares!(a, ivar, reads, data)
         end
         return nothing
     end
@@ -5723,6 +5761,13 @@ const _CELL_OBJECT_WRAPPERS = (:truncated, :censored, :interval_censored,
 _cell_object_call(f::Symbol) =
     isuppercase(first(string(f))) || f in _CELL_OBJECT_WRAPPERS
 _cell_object_call(f) = false
+
+_cell_whole_call(f::Symbol) = f in REDUCTION_FNS || f in _WHOLE_READ_FNS ||
+    (!_builtin_value_head(f) && !_cell_object_call(f))
+_cell_whole_call(f::GlobalRef) = !_cell_object_call(f.name)
+_cell_whole_call(f::Expr) = f.head === :. && length(f.args) == 2 &&
+    f.args[2] isa QuoteNode && !_cell_object_call(f.args[2].value)
+_cell_whole_call(f) = false
 
 # Strip a validated cell expression to whole values and take the broadcast
 # form of every call and operator over a per-index operand (`v[i]`, a
@@ -11046,9 +11091,14 @@ function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
     # (Design matrices never reach here as bare summands: named
     # definitions screen them at extraction, inline locations at the
     # location arm, and dotted compositions at canonicalization.)
-    (core in ctx.data || core in ctx.vecdefs) &&
+    if core in ctx.data || core in ctx.vecdefs
+        # An offset has no signed coefficient coordinate. Keep a negative
+        # summand in its value expression instead of discarding the sign.
+        sign < 0 && return _extract_summand(pname,
+            Expr(:call, :.-, core), 1, ctx)
         return TermSpec(OffsetTerm, [core], NamedTuple(),
         core, Symbol(core, "_off")), nothing
+    end
     core in ctx.plate_names && _sfail(
         "predictor $pname: bare latent $core is not a term — scale it " *
         "by a coefficient (`b .* $core`, the SB `me` mirror)")

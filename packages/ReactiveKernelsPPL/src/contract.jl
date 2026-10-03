@@ -28,13 +28,11 @@ const ColumnRef = Symbol
 """Reference to a sampled parameter or scalar assignment by name."""
 const ParamName = Symbol
 
-"""Bound data values: numbers and arrays of any shape. A value read per
-observation is a length-n vector or an n-row matrix (whole-design data,
-Stan `matrix[N,K]`); every per-observation role (response, term, weights,
-trials, scales, bounds, grouping, axes, slices) reads vectors only — those
-readers fetch through [`_vector_column`](@ref) and fail closed on a
-matrix. Any other value — a number, or an array read only as a whole
-value — is model-level: it has no observation axis, so its shape is free."""
+"""Bound data values: numbers and arrays of any shape. Elementwise
+observations broadcast over their operands' Julia axes; singleton axes
+stretch and incompatible dimensions fail. Structured operations such as
+design-matrix products, schedule slices and level tables retain their own
+shape requirements. Model-level values have no observation axis."""
 const ColumnData = Union{AbstractArray,Number}
 # What a caller may pass at every entry point (the model call, `@rkppl data`,
 # `merge` pins, `bind_data`): anything `ColumnData` holds.
@@ -89,6 +87,17 @@ function _vector_column(columns::AbstractDict{Symbol}, name::Symbol,
         _fail(label, "$what `$name` must be a vector column, got " *
               "$(summary(col)) (matrix columns bind whole-design :data — " *
               "no $what reads one)")
+    return col
+end
+
+# Elementwise observation operands retain their Julia axes. Structured
+# readers (schedule slices, level tables, and design columns) still use
+# `_vector_column` where their operation requires a vector.
+function _observation_column(columns::AbstractDict{Symbol}, name::Symbol,
+        label::Symbol, what::AbstractString)
+    col = columns[name]
+    col isa AbstractArray ||
+        _fail(label, "$what `$name` must be an array, got $(summary(col))")
     return col
 end
 
@@ -435,6 +444,20 @@ struct LikelihoodSpec
     interval::Union{Nothing,Tuple{Float64,Float64}}
     threshold_effects::Union{Nothing,Symbol}
 end
+# Preserve the all-fields constructor predating per-component trials.
+LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
+    label, trials, range, n_levels, thresholds, extra_predictors, count_columns,
+    ordinal_structure, discrimination, threshold_columns, threshold_coefs,
+    extra_responses, factor_scales, factor_corr, glm_alpha, glm_beta,
+    mixture_family, mixture_locs, mixture_scales, mixture_weights,
+    nu, zi, mi_jobs, interval, threshold_effects) =
+    LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
+        label, trials, range, n_levels, thresholds, extra_predictors, count_columns,
+        ordinal_structure, discrimination, threshold_columns, threshold_coefs,
+        extra_responses, factor_scales, factor_corr, glm_alpha, glm_beta,
+        mixture_family, mixture_locs, mixture_scales, mixture_weights,
+        Union{ColumnRef,Int}[], nu, zi, mi_jobs, interval, threshold_effects)
+
 LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
     label) =
     LikelihoodSpec(family, link, response, predictor, scale, weights,
@@ -1694,7 +1717,21 @@ struct StructuralPlan
     array_parameters::Vector{ArrayParameter}
     submodel_scopes::Vector{SubmodelScope}
     conditioned::Set{Symbol}
+    indexed_observations::Set{Symbol}
 end
+
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+    conditioned) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        conditioned, Set{Symbol}())
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
@@ -1791,14 +1828,15 @@ function StructuralPlan(
         event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[],
         array_parameters::Vector{ArrayParameter} = ArrayParameter[],
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
-        conditioned::Set{Symbol} = Set{Symbol}())
+        conditioned::Set{Symbol} = Set{Symbol}(),
+        indexed_observations::Set{Symbol} = Set{Symbol}())
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
         kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
-        array_parameters, submodel_scopes, conditioned)
+        array_parameters, submodel_scopes, conditioned, indexed_observations)
 end
 
 """The horseshoe entries covering `pred` (empty when the predictor keeps
@@ -3214,7 +3252,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
     :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
     :r2d2_priors, :horseshoe_priors, :array_parameters, :kernel_plates,
-    :event_lps)
+    :event_lps, :indexed_observations)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -3284,6 +3322,16 @@ function _response_reads(plan::StructuralPlan, r,
     return reads
 end
 
+# Structured constructors keep their established row-domain contract. Ordinary
+# elementwise responses use Julia broadcast axes, including singleton dimensions.
+function _uses_structured_observation_axes(plan::StructuralPlan)
+    any(r -> r.mi_jobs !== nothing, plan.responses) && return true
+    return any(f -> !isempty(getfield(plan, f)),
+        (:plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
+         :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
+         :r2d2_priors, :horseshoe_priors, :kernel_plates, :event_lps))
+end
+
 """Observation axes of a plan whose `columns` are bound: `nothing` when
 every response column has the same rows (one axis — `n_obs`; any other
 column validates against it), otherwise `(; rows, total)` with `rows`
@@ -3291,7 +3339,7 @@ mapping each per-observation column to the rows of the axis that reads it
 and `total` the observed rows summed over axes. Fails when the plan fills
 a slot outside [`_MULTI_AXIS_SLOTS`](@ref), when the columns one axis
 reads differ in rows, or when no observation statement reads a column."""
-function _observation_axes(plan::StructuralPlan)
+function _structured_observation_axes(plan::StructuralPlan)
     isempty(plan.responses) && return nothing
     modelvals, managed = _axis_exempt_columns(plan)
     mi_managed = _mi_managed_columns(plan)
@@ -3301,7 +3349,7 @@ function _observation_axes(plan::StructuralPlan)
     resps = [r.response for r in plan.responses]
     all(r -> haskey(plan.columns, r.response), plan.responses) || return nothing
     rows = Dict{Symbol,Int}(c => _column_nrows(plan.columns[c]) for c in perobs)
-    response_rows = [_response_rows(plan, r) for r in plan.responses]
+    response_rows = [_structured_response_rows(plan, r) for r in plan.responses]
     length(unique(response_rows)) <= 1 && isempty(plan.kernel_plates) && return nothing
     lens = join(sort!(unique(response_rows)), ", ")
     for f in fieldnames(StructuralPlan)
@@ -3351,9 +3399,172 @@ function _observation_axes(plan::StructuralPlan)
     return (; rows = axisrows, total)
 end
 
+"""Broadcast domains of bound observation statements: `(; rows, total,
+domains)`, where `domains` maps response labels to Julia broadcast axes.
+Singleton operands do not join independent domains. Structured constructors
+retain their existing row-domain validation.
+Several domains beside slots outside `_MULTI_AXIS_SLOTS` are not built yet."""
+function _observation_axes(plan::StructuralPlan)
+    _uses_structured_observation_axes(plan) && return _structured_observation_axes(plan)
+    isempty(plan.kernel_plates) || return nothing
+    modelvals, managed = _axis_exempt_columns(plan)
+    perobs = Set{Symbol}(k for (k, v) in plan.columns
+        if k ∉ modelvals && k ∉ managed &&
+            v isa AbstractArray)
+    resps = [r.response for r in plan.responses]
+    all(in(perobs), resps) || return nothing
+    isempty(resps) && return nothing
+    reads = [_response_reads(plan, r, perobs) for r in plan.responses]
+    designs = _observation_design_columns(plan)
+    colaxes = Dict(c => c in designs ? (axes(plan.columns[c], 1),) :
+        axes(plan.columns[c]) for c in perobs)
+    domains = Dict{Symbol,Tuple}()
+    for (r, rd) in zip(plan.responses, reads)
+        if r.response in plan.indexed_observations
+            domain = colaxes[r.response]
+            n = prod(length, domain; init = 1)
+            if n == 0
+                # An empty authored loop never indexes its other operands.
+                domains[r.label] = domain
+                continue
+            end
+            for c in rd
+                colaxes[c] == domain && continue
+                m = prod(length, colaxes[c]; init = 1)
+                m < n && _fail(c, "indexed column length $m ≠ the $n " *
+                    "rows of $(r.response); explicit `@plate` indexing " *
+                    "does not stretch singleton operands")
+                _fail(c, "explicit `@plate` indexing with different " *
+                    "operand axes is not built yet: $c has $(colaxes[c]), " *
+                    "$(r.response) has $domain")
+            end
+        end
+        domain = colaxes[r.response]
+        for c in sort!(collect(setdiff(rd, (r.response,))))
+            domain = try
+                Base.Broadcast.broadcast_shape(domain, colaxes[c])
+            catch e
+                e isa DimensionMismatch || rethrow()
+                if length(colaxes[c]) == length(domain) == 1
+                    _fail(c, "column length $(length(plan.columns[c])) ≠ " *
+                        "the $(length(only(domain))) rows of $(r.response), " *
+                        "which an observation statement reads beside it " *
+                        "(one observation axis): " * sprint(showerror, e))
+                end
+                _fail(c, "column shape $(size(plan.columns[c])) is not " *
+                    "broadcast-compatible with response $(r.response): " *
+                    sprint(showerror, e))
+            end
+        end
+        domains[r.label] = domain
+    end
+    several = length(unique(values(domains))) > 1
+    lens = join(sort!(unique(prod(length, a; init = 1) for a in values(domains))), ", ")
+    if several
+        for f in fieldnames(StructuralPlan)
+            f in _MULTI_AXIS_SLOTS && continue
+            isempty(getfield(plan, f)) || _fail(:plan, "the responses " *
+                "observe $lens rows (several observation axes), and `$f` " *
+                "reads or sizes by a single observation axis — `$f` beside " *
+                "several observation axes is not built yet")
+        end
+        for r in plan.responses
+            r.mi_jobs === nothing || _fail(r.label, "mi() missingness on " *
+                "$(r.response) beside several observation axes is not built yet")
+        end
+    elseif any(r -> r.mi_jobs !== nothing, plan.responses)
+        return nothing
+    end
+    # Shared singleton operands impose no domain. Shared non-singleton
+    # operands join equal domains; partially shared dimensions can also
+    # broadcast over distinct response domains.
+    link = collect(eachindex(reads))
+    root(i) = link[i] == i ? i : (link[i] = root(link[i]))
+    owner = Dict{Tuple{Symbol,Tuple},Int}()
+    for (i, rd) in enumerate(reads), c in rd
+        all(a -> length(a) == 1, colaxes[c]) && continue
+        key = (c, domains[plan.responses[i].label])
+        link[root(i)] = root(get!(owner, key, i))
+    end
+    axisrows = Dict{Symbol,Int}()
+    total = 0
+    for i in eachindex(reads)
+        root(i) == i || continue
+        members = [j for j in eachindex(reads) if root(j) == i]
+        n = prod(length, domains[plan.responses[i].label]; init = 1)
+        total += n
+        for j in members, c in sort!(collect(reads[j]))
+            axisrows[c] = prod(length, colaxes[c]; init = 1)
+        end
+    end
+    for c in sort!(collect(perobs))
+        haskey(axisrows, c) && continue
+        several && _fail(c, "column $c has $(size(plan.columns[c])) shape, " *
+            "but no observation statement reads it, so it has no axis")
+    end
+    several || (total = prod(length, first(values(domains)); init = 1))
+    return (; rows = axisrows, total, domains)
+end
+
+# A matrix used in a matrix-vector product contributes its row axis.
+# Its columns remain the contracted dimension, rather than observations.
+function _observation_design_columns(plan::StructuralPlan)
+    out = Set{Symbol}()
+    function visit(ex)
+        ex isa Expr || return
+        if ex.head === :call && length(ex.args) == 3 && ex.args[1] === :* &&
+                ex.args[2] isa Symbol &&
+                get(plan.columns, ex.args[2], nothing) isa AbstractMatrix
+            _observation_array_operand(plan, ex.args[3]) && push!(out, ex.args[2])
+        end
+        foreach(visit, ex.args)
+    end
+    for d in (plan.assignments..., plan.derived...)
+        visit(d.expr)
+    end
+    for p in plan.predictors, t in p.terms
+        t.kind === ComposedTerm && visit(t.options.tree)
+    end
+    return out
+end
+
+# An opaque helper can obscure sizes without making a broadcast with a
+# known array scalar-valued. Follow definitions and elementwise operands;
+# an undotted opaque call alone proves no array shape.
+function _observation_array_operand(plan, ex, seen = Set{Symbol}())
+    a = _value_axes(plan, ex; data_axes = true)
+    a === nothing || return !isempty(a)
+    if ex isa Symbol
+        ex in seen && return false
+        push!(seen, ex)
+        defs = (plan.assignments..., plan.derived...)
+        i = findfirst(d -> d.name === ex, defs)
+        result = i !== nothing && _observation_array_operand(plan, defs[i].expr, seen)
+        delete!(seen, ex)
+        return result
+    end
+    ex isa Expr || return false
+    if _is_dotted_call(ex)
+        return any(x -> _observation_array_operand(plan, x, seen), ex.args[2].args)
+    elseif ex.head === :call && ex.args[1] in ELEMENTWISE_OPS
+        return any(x -> _observation_array_operand(plan, x, seen), ex.args[2:end])
+    end
+    return false
+end
+
+"""Observation count of a response's full domain. Ordinary elementwise
+responses use broadcast cells; structured responses retain their row contract."""
+function _response_rows(plan::StructuralPlan, r::LikelihoodSpec)
+    if !_uses_structured_observation_axes(plan) && haskey(plan.columns, r.response)
+        obs = _observation_axes(plan)
+        obs === nothing || return prod(length, obs.domains[r.label]; init = 1)
+    end
+    return _structured_response_rows(plan, r)
+end
+
 """Rows of a response's full observation axis; mi() packs only its observed
 entries, so its location's data establishes the full axis."""
-function _response_rows(plan::StructuralPlan, r::LikelihoodSpec)
+function _structured_response_rows(plan::StructuralPlan, r::LikelihoodSpec)
     r.mi_jobs === nothing && haskey(plan.columns, r.response) &&
         return _column_nrows(plan.columns[r.response])
     modelvals, _ = _axis_exempt_columns(plan)
@@ -3372,8 +3583,11 @@ Values with no data anchor (an intercept or dar path) use their response
 consumers. No dimension is inferred from the total of unrelated axes."""
 function _value_rows(plan::StructuralPlan, name::Symbol)
     haskey(plan.columns, name) && return _column_nrows(plan.columns[name])
+    modelvals, _ = _axis_exempt_columns(plan)
+    managed = _mi_managed_columns(plan)
     perobs = Set{Symbol}(k for (k, v) in plan.columns
-        if v isa Union{AbstractVector,AbstractMatrix} && k ∉ _mi_managed_columns(plan))
+        if v isa Union{AbstractVector,AbstractMatrix} &&
+            k ∉ modelvals && k ∉ managed)
     reads = _response_reads(plan, name, perobs)
     ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
     if isempty(ns)
@@ -3400,22 +3614,24 @@ function _validate_columns(plan::StructuralPlan)
     plan.n_obs >= 0 || _fail(:plan, "n_obs must be nonnegative, got $(plan.n_obs)")
     modelvals, managed = _axis_exempt_columns(plan)
     axes = _observation_axes(plan)
+    axes === nothing || !hasproperty(axes, :domains) || axes.total == plan.n_obs || _fail(:plan,
+        "n_obs $(plan.n_obs) disagrees with the $(axes.total) broadcast observations")
     for (name, col) in plan.columns
         name in modelvals && continue
         col isa Number && _fail(name, "data value $name is a number, but " *
             "the model reads it per observation — lower with the values " *
             "(`lower_rkppl(ast, data)`, which every `@rkppl` entry point " *
             "does) so a number lowers as a model-level value")
-        col isa AbstractArray && ndims(col) > 2 && _fail(name, "data value " *
-            "$name is a $(ndims(col))-dimensional array read per " *
-            "observation; per-observation data are vectors (one entry per " *
-            "observation) or matrices (one row per observation), and other " *
-            "arrays read as whole values (module-call arguments, gathers)")
+        _uses_structured_observation_axes(plan) && col isa AbstractArray &&
+            ndims(col) > 2 && _fail(name, "structured per-observation data " *
+                "$name must retain its vector or matrix row contract")
         # Kernel-managed columns (slices + scalar expansions) carry two
         # lengths by design — they validate under kernel rules, not here.
         # On several observation axes a column has its axis's rows.
         n = axes === nothing ? plan.n_obs : get(axes.rows, name, plan.n_obs)
-        if col isa AbstractMatrix
+        if axes !== nothing && hasproperty(axes, :domains) && haskey(axes.rows, name)
+            # The response's broadcast_shape check validated every axis.
+        elseif col isa AbstractMatrix
             size(col, 1) == n ||
                 _fail(name, "matrix column has $(size(col, 1)) rows ≠ " *
                       "n_obs $n")
@@ -3426,7 +3642,7 @@ function _validate_columns(plan::StructuralPlan)
                 _fail(name, "matrix column must be numeric, " *
                       "got $(eltype(col))")
         else
-            name in managed || length(col) == n ||
+            name in managed || length(col) == n || length(col) == 1 ||
                 _fail(name, "column length $(length(col)) ≠ n_obs $n")
         end
         !any(ismissing, col) ||
@@ -6884,7 +7100,7 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         # Derived columns are length-n by construction; their eltype is
         # unknown statically (in-graph Julia errors are loud).
         _is_derived(plan, c) && return nothing
-        col = _vector_column(plan.columns, c, t.label, "term column")
+        col = _observation_column(plan.columns, c, t.label, "term column")
         eltype(col) <: Real ||
             _fail(t.label, "column $c must be numeric")
     end
@@ -8456,7 +8672,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         (r.mi_jobs === nothing ? last(r.range) == n : last(r.range) <= n) ||
             _fail(r.label, "response range $(r.range) is incompatible with $n rows")
     end
-    col = _vector_column(plan.columns, r.response, r.label, "response")
+    col = _observation_column(plan.columns, r.response, r.label, "response")
     if _is_bernoulli_family(r.family)
         eltype(col) === Bool && return nothing
         eltype(col) <: Integer && all(x -> x == 0 || x == 1, col) && return nothing
@@ -8846,7 +9062,7 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
         "raw (derived-column scales need shape metadata — planned)")
     haskey(plan.columns, s) ||
         _fail(r.label, "scale references unknown name $s")
-    col = _vector_column(plan.columns, s, r.label, "scale column")
+    col = _observation_column(plan.columns, s, r.label, "scale column")
     if r.family === HurdlePoissonFam
         (eltype(col) <: Real && all(isfinite, col) &&
             all(x -> 0 <= x <= 1, col)) ||
@@ -8861,9 +9077,7 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
         (eltype(col) <: Real && all(isfinite, col) && all(>(0), col)) ||
             _fail(r.label, "per-observation scale $s must be finite positive numerics")
     end
-    n = _response_rows(plan, r)
-    length(col) == n ||
-        _fail(r.label, "scale column $s length $(length(col)) ≠ n_obs $n")
+    # The observation domain validates every broadcast dimension.
     return nothing
 end
 
@@ -9016,7 +9230,7 @@ end
 
 function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
         what::AbstractString; check_support::Bool = true)
-    ycol = _vector_column(plan.columns, r.response, r.label, "response")
+    ycol = _observation_column(plan.columns, r.response, r.label, "response")
     t = r.trials
     if t isa Int
         t >= 0 || _fail(r.label, "trials literal must be non-negative")
@@ -9029,14 +9243,17 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
         "raw (derived trials need shape metadata — planned)")
     haskey(plan.columns, t) ||
         _fail(r.label, "trials column $t missing")
-    col = _vector_column(plan.columns, t, r.label, "trials column")
+    col = _observation_column(plan.columns, t, r.label, "trials column")
     (eltype(col) <: Integer && eltype(col) !== Bool) ||
         _fail(r.label, "trials column must hold integers")
     all(>=(0), col) ||
         _fail(r.label, "trials column must be non-negative")
-    n = _response_rows(plan, r)
-    length(col) == n ||
-        _fail(r.label, "trials column length $(length(col)) ≠ n_obs $n")
+    # The observation domain validates every broadcast dimension.
+    if r.mi_jobs !== nothing
+        n = _response_rows(plan, r)
+        length(col) == n ||
+            _fail(r.label, "trials column length $(length(col)) ≠ n_obs $n")
+    end
     observed_trials = r.mi_jobs === nothing ? col : col[plan.columns[r.mi_jobs]]
     !check_support || all(ycol .<= observed_trials) ||
         _fail(r.label, "$what exceeds trials in some row")
@@ -9127,7 +9344,7 @@ function _validate_weights(r::LikelihoodSpec, plan::StructuralPlan)
         "raw (derived weights need shape metadata — planned)")
     haskey(plan.columns, r.weights) ||
         _fail(r.label, "weights column $(r.weights) missing")
-    col = _vector_column(plan.columns, r.weights, r.label, "weights column")
+    col = _observation_column(plan.columns, r.weights, r.label, "weights column")
     eltype(col) <: Real && all(isfinite, col) && all(>=(0), col) ||
         _fail(r.label, "frequency weights must be finite non-negative numerics")
     return nothing
@@ -9158,11 +9375,11 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
     hi = _bound_values(ev.upper, :upper, r, plan)
     if r.mi_jobs !== nothing
         jobs = plan.columns[r.mi_jobs]
-        lo = lo === nothing ? nothing : lo[jobs]
-        hi = hi === nothing ? nothing : hi[jobs]
+        lo = lo isa AbstractArray ? lo[jobs] : lo
+        hi = hi isa AbstractArray ? hi[jobs] : hi
     end
     if ev.kind === :interval_censored
-        resp = _vector_column(plan.columns, r.response, r.label, "response")
+        resp = _observation_column(plan.columns, r.response, r.label, "response")
         all(isfinite, resp) ||
             _fail(r.label, "interval evidence requires finite response values")
         all(resp .< hi) ||
@@ -9171,12 +9388,13 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
     end
     (lo === nothing || hi === nothing || all(lo .< hi)) ||
         _fail(r.label, "evidence requires strict lower < upper every row")
-    resp = _vector_column(plan.columns, r.response, r.label, "response")
-    selected = r.mi_jobs !== nothing && r.range !== nothing ?
-        findall(j -> j in r.range, plan.columns[r.mi_jobs]) : eachindex(resp)
-    bad = filter(selected) do i
-        (lo !== nothing && resp[i] < lo[i]) ||
-            (hi !== nothing && resp[i] > hi[i])
+    resp = _observation_column(plan.columns, r.response, r.label, "response")
+    below = lo === nothing ? false : resp .< lo
+    above = hi === nothing ? false : resp .> hi
+    bad = lo === nothing && hi === nothing ? Int[] : findall(below .| above)
+    if r.mi_jobs !== nothing && r.range !== nothing
+        selected = findall(j -> j in r.range, plan.columns[r.mi_jobs])
+        filter!(i -> i in selected, bad)
     end
     isempty(bad) || _fail(r.label,
         "response $(r.response) is outside its $(ev.kind) bounds " *
@@ -9192,7 +9410,7 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
             isinteger(bound) || _fail(r.label,
                 "$side bound literal must be integer-valued for Poisson evidence")
         end
-        return fill(Float64(bound), _response_rows(plan, r))
+        return Float64(bound)
     end
     bound isa Symbol || _fail(r.label, "$side bound must be a literal or column")
     _is_derived(plan, bound) && _fail(r.label,
@@ -9200,7 +9418,7 @@ function _bound_values(bound, side, r::LikelihoodSpec, plan::StructuralPlan)
         "bounds raw (derived bounds need shape metadata — planned)")
     haskey(plan.columns, bound) ||
         _fail(r.label, "$side bound column $bound missing")
-    col = _vector_column(plan.columns, bound, r.label, "$side bound column")
+    col = _observation_column(plan.columns, bound, r.label, "$side bound column")
     if r.family === PoissonLogFam
         (eltype(col) <: Integer && eltype(col) !== Bool) || _fail(r.label,
             "$side bound column must hold integers for Poisson evidence")
@@ -10034,7 +10252,7 @@ Derived responses keep their own materialization. `bind_only` excludes
 definitions used only during preparation, while preserving their names
 for caller-supplied column collision checks."""
 function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
-        bind_only = false)
+        bind_only = false, unbound::Bool=false)
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
         # Literal definitions can be dependencies of a module call, such
@@ -10045,12 +10263,14 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         d.expr isa Expr && (nodes[d.name] = d.expr)
     end
     resps = Set{Symbol}(r.response for r in plan.responses)
+    known = _all_names(plan)
     memo = Dict{Symbol,Bool}()
     function dataonly(nm, active)
         haskey(memo, nm) && return memo[nm]
         nm in active && return false
         push!(active, nm)
-        ok = all(s -> s in raw || (haskey(nodes, s) && dataonly(s, active)),
+        ok = all(s -> s in raw || (unbound && s ∉ known) ||
+                (haskey(nodes, s) && dataonly(s, active)),
             _expr_value_symbols(nodes[nm]))
         delete!(active, nm)
         memo[nm] = ok
@@ -10112,12 +10332,16 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names)
     return setdiff!(prepared, needed)
 end
 
-"""In a bound plan: the module data definitions bound as columns."""
-function _bound_module_data_names(plan::StructuralPlan)
+function _module_data_names(plan::StructuralPlan; unbound::Bool=false)
     nodes = union(Set{Symbol}(a.name for a in plan.assignments),
         Set{Symbol}(d.name for d in plan.derived))
     raw = Set{Symbol}(k for k in keys(plan.columns) if k ∉ nodes)
-    return Set{Symbol}(n for n in _module_data_names(plan, raw)
+    return _module_data_names(plan, raw; unbound)
+end
+
+"""In a bound plan: the module data definitions bound as columns."""
+function _bound_module_data_names(plan::StructuralPlan)
+    return Set{Symbol}(n for n in _module_data_names(plan)
         if haskey(plan.columns, n))
 end
 
@@ -10471,17 +10695,16 @@ function _materialize_module_data!(plan::StructuralPlan,
                 sprint(showerror, e)))
         end
         if nm in vector_defs
-            v isa AbstractVector || v isa AbstractMatrix ||
+            v isa AbstractArray ||
                 throw(ContractValidationError(
                 "[bind] data definition $nm is read per observation (an " *
-                "observation column, or a matrix with one row per " *
-                "observation) but evaluated to $(summary(v))"))
+                "operand with Julia broadcast axes) but evaluated to $(summary(v))"))
         else
             v isa ColumnData || throw(ContractValidationError(
                 "[bind] data definition $nm evaluated to $(summary(v)); " *
-                "model-level data values are numbers, vectors or matrices"))
+                "model-level data values are numbers or arrays"))
         end
-        # Dense storage: the kernel's data arguments are `Vector`/`Matrix`.
+        # Dense storage retains every observation operand's rank and axes.
         columns[nm] = v isa AbstractVector ? collect(v) :
             v isa AbstractArray ? Array(v) : v
     end

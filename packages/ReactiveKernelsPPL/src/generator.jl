@@ -322,7 +322,7 @@ function _assignment_statements(plan::StructuralPlan;
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
         ex = _array_gather_rewrite(by_name[name].expr, plan, gathers)
-        ex = _split_gp_cov_calls!(stmts, name, ex)
+        ex = _split_gp_cov_calls!(stmts, name, ex, plan)
         if _expr_value_symbols(ex) ⊆ dataonly
             push!(dataonly, name)
         else
@@ -349,7 +349,8 @@ end
 # Lift a covariance nested in a value call before the ordinary KernelSpec
 # splicer attaches its pair plate. Untyped aliases match the graph's ports.
 # Lazy branches, closures and generators keep their local evaluation.
-function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex)
+function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex,
+        plan::StructuralPlan)
     count = 0
     function walk(node)
         node isa Expr || return node
@@ -369,6 +370,13 @@ function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex)
         nargs = graph === :_ppl_gp_exp_quad_cov ? 4 : 5
         length(args) == nargs && all(a -> !Meta.isexpr(a, :parameters) &&
             !Meta.isexpr(a, :(...)), args) || return Expr(:call, callee, args...)
+        # The registered pair graphs implement vector locations. A bound
+        # matrix selects the ordinary Julia matrix method instead; routing
+        # it through a vector graph would change the location semantics.
+        locations = first(args)
+        locations isa Symbol && haskey(plan.columns, locations) &&
+            plan.columns[locations] isa AbstractMatrix &&
+            return Expr(:call, callee, args...)
         count += 1
         prefix = Symbol(:_ppl_gp_, name, :_, count)
         inputs = Symbol[]
@@ -429,7 +437,9 @@ function _predictor_statements(plan::StructuralPlan)
             matrices = plan.matrices)
         lp = _lp_name(pred)
         terms = Any[]
-        if any(b -> b.kind === MonotonicTerm, shape.blocks)
+        if _broadcast_affine(plan, pred)
+            append!(terms, _mo_block_terms(plan, shape; broadcast = true))
+        elseif any(b -> b.kind === MonotonicTerm, shape.blocks)
             append!(terms, _mo_block_terms(plan, shape))
         elseif shape.width > 0
             push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
@@ -495,7 +505,7 @@ function _predictor_statements(plan::StructuralPlan)
         end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
-        rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
+        rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a .+ $b), terms)
         push!(stmts, :($lp = $rhs))
     end
     return stmts
@@ -515,15 +525,17 @@ _coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
 # monotonic blocks scale one column by one coordinate, factor and matrix
 # blocks keep the data-matrix × coefficient-slice matvec. Predictors
 # without `mo` keep the fused form above, untouched.
-function _mo_block_terms(plan::StructuralPlan, shape::DesignShape)
+function _mo_block_terms(plan::StructuralPlan, shape::DesignShape;
+        broadcast::Bool = false)
     pred = only(p for p in plan.predictors if p.name === shape.predictor)
     coef = _affine_block_name(pred)
     terms = Any[]
     k = 1
     for b in shape.blocks
         if b.kind === InterceptTerm
-            push!(terms, Expr(:call, :.*, Expr(:call, :ones, _predictor_rows(plan,shape.predictor)),
-                _coef_coord(coef, k)))
+            push!(terms, broadcast ? _coef_coord(coef, k) :
+                Expr(:call, :.*, Expr(:call, :ones, _predictor_rows(plan,shape.predictor)),
+                    _coef_coord(coef, k)))
             k += 1
         elseif b.kind === ContinuousTerm
             push!(terms, :($(b.column) .* $(_coef_coord(coef, k))))
@@ -890,13 +902,11 @@ end
 function _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     o = t.options
     ex = _composed_rewrite(o.tree, o.subs, plan, pred.name)
-    # A composition over scalars only (a value location, `y .~
-    # Normal.(mu, s)`) has no rows of its own: broadcast it over the rows
-    # of the response it locates like an intercept (the `mo` intercept
-    # shape), so every family emitter reads an ordinary LP vector.
+    # Retain scalar shape when observation operands need broadcasting;
+    # ordinary full-length vector plans keep their established lowering.
     isempty(o.subs) && isempty(t.columns) || return ex
-    return Expr(:call, :.*, Expr(:call, :ones, _located_rows(plan, pred)),
-        ex)
+    _broadcast_affine(plan, pred) && return ex
+    return Expr(:call, :.*, Expr(:call, :ones, _located_rows(plan, pred)), ex)
 end
 
 # Rows of the responses a predictor locates — their own observation axis,
@@ -2216,7 +2226,7 @@ function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
     col = plan.columns[y]
     eltype(col) === Bool && return y, yv
     yb = _ybool_name(label)
-    push!(pre, :($yb = Vector{Bool}($y .!= 0)))
+    push!(pre, :($yb = Array{Bool}($y .!= 0)))
     return yb, yv
 end
 
@@ -2760,12 +2770,14 @@ function _scale_use_plate_arg(r::LikelihoodSpec, plan::StructuralPlan,
     # plate form. Unannotated (metadata-`Any`) vector inputs lower with the
     # runtime `_authored_plate_is_axis` / `_plate_dependency_changed` guards,
     # whose form defeats Enzyme's static-activity analysis on some endpoint
-    # bodies (NB2, found by test: silently wrong gradients). `AbstractVector`
-    # is eltype-free so integer offset-only LPs still match. The LP is
-    # always a vector here: codegen entry points validate first (empty
-    # predictors rejected) and gate HSGP (the only termless-at-emission
-    # shape), so every scale predictor contributes a vector summand.
-    push!(pre, :($sc::AbstractVector = $rhs))
+    # bodies (NB2, found by test: silently wrong gradients). The eltype-free
+    # array annotation retains matrix/tensor axes and integer offset LPs;
+    # a parameter-only composed expression retains scalar metadata.
+    broadcast = _broadcast_affine(plan, pred)
+    scalar = broadcast && all(t -> t.kind === ComposedTerm && isempty(t.columns) &&
+        isempty(t.options.subs), pred.terms)
+    typ = scalar ? :Number : (broadcast ? :AbstractArray : :AbstractVector)
+    push!(pre, :($sc::$typ = $rhs))
     return sc
 end
 
