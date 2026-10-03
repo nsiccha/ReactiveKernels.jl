@@ -4100,12 +4100,18 @@ end
         y ~ obs_latent(1.0)
     end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
 
-    # A stream submodel on a non-data LHS is rejected (bind it to data).
-    # capability: stream submodel on a latent (non-data) LHS (generative stream) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    # A latent stream samples its private return slot and retains its
+    # other priors. The caller's free coefficient remains explicit.
+    generated = lower_rkppl(quote
+        b ~ Normal(0, 1)
         z ~ obs_gstream(x)
         w .~ Normal.(z, 1.0)
-    end, (:w, :x); mod = @__MODULE__, conditioned = (:w, :x)); true)
+    end, (:w, :x); mod = @__MODULE__, conditioned = (:w, :x))
+    gb = bind_data(generated, Dict(:w => cols[:y], :x => cols[:x]))
+    gk = build_kernel(gb)
+    @test gk.layout.total == 3 + length(cols[:x])
+    @test length(constrain(gk.layout, zeros(gk.layout.total)).z.slot) == length(cols[:x])
+    _check_gradient(gk.spec, gb, zeros(gk.layout.total))
 end
 
 # ── Fused-GLM stream fixtures for predictor pins ─────────────────────────
@@ -4510,20 +4516,23 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(theta[i] ~ pcs_noret(tau)),
              :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D)
-    # An observation submodel bound to a NON-data latent LHS.
-    # capability: observation-stream submodel on a latent per-cell LHS (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(
+    # A stream bound to a latent cell keeps its internal prior and
+    # samples a private scalar slot in every cell.
+    generated = lower_rkppl(
         _pcs(:(theta[i] ~ pcs_obs(mu, sigma)),
-             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D); true)
+             :(y[i] ~ Normal.(theta[i], sigma))), D; mod = M, conditioned = D)
+    @test Set(_test_scope_name(generated, p.name) for p in generated.plate_parameters) ==
+        Set([:theta_b, :theta_slot])
     # A latent submodel bound to a DATA column (needs a dotted observation slot).
     # refused: a data LHS observes a stream; a latent submodel value is conditioned through `|` / `condition` (P9, 18h1h54; 10gzbm9)
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(y[i] ~ pcs_centered(mu, tau))), D; mod = M, conditioned = D)
-    # A `predictor = ...` pin is top-level-only (per-cell predictors lower
-    # through the plate path, not the pinned location path).
-    # capability: predictor pin on a per-cell submodel; NB pins taken name mu, re-pin with a free name (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(
-        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = mu))), D; mod = M, conditioned = D); true)
+    # A cell observation may name its predictor with a free use-site pin.
+    pinned = lower_rkppl(
+        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = qpin))), D; mod = M, conditioned = D)
+    @test only(pinned.responses).predictor === :qpin
+    @test_throws "already taken" lower_rkppl(
+        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = mu))), D; mod = M, conditioned = D)
     # Without a submodel binding in scope, an unknown call head stays an
     # ordinary per-cell distribution error (no submodel capture).
     # refused: undefined submodel/distribution not_a_submodel

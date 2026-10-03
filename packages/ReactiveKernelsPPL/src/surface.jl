@@ -145,8 +145,8 @@ decomposed program. A pin claims a fresh predictor name (once — a second
 claim fails); it renames one response's predictor, so the pinned location
 cannot lower under another name. Pins apply to single-predictor responses
 (a multi-eta categorical or a predictorless simplex response fails closed)
-at top-level stream calls (a per-cell pin, or a pin inside a submodel body,
-fails closed).
+at top-level and per-cell stream calls. A pin inside a submodel body fails
+closed.
 """
 struct RKPPLSubmodel
     name::Symbol
@@ -6815,7 +6815,7 @@ function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
             _expand_submodel_stmt!(out, g, sm.mod, data, pins, used, inner)
         end
     elseif _plate_has_submodel_cell(arg, mod)
-        push!(out, _expand_plate_cell_submodels(arg, mod, data, used, chain))
+        push!(out, _expand_plate_cell_submodels(arg, mod, data, pins, used, chain))
     else
         push!(out, arg)
     end
@@ -7127,6 +7127,56 @@ function _stream_response(sm::RKPPLSubmodel, stmts, ret)
     return stmts[first(hits)]
 end
 
+# A stream used as a latent samples its private return slot. Its vector
+# arguments supply the plate axis; scalars stay shared. The alias at the
+# use site remains separate from the namespace containing its priors.
+function _generative_stream_stmts(stmts, ret, data)
+    det = Pair{Symbol,Any}[st.args[1] => st.args[2] for st in stmts
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol]
+    defs = Dict{Symbol,Any}(det)
+    shapes = _def_shapes(det, data, defs)
+    aligned(x) = _obs_axis(x, data, defs, shapes, Set{Symbol}(), _NO_SHAPE_ENV)
+    function anchor(ex)
+        ex isa Symbol && return aligned(ex) ? ex : nothing
+        ex isa Expr || return nothing
+        ex.head === :call && ex.args[1] === :Ref && return nothing
+        start = ex.head in (:call, :.) ? 2 : 1
+        for a in ex.args[start:end]
+            found = anchor(a)
+            found === nothing || return found
+        end
+        return nothing
+    end
+    function indexed(ex, ivar)
+        ex isa Symbol && return aligned(ex) ? Expr(:ref, ex, ivar) : ex
+        ex isa Expr || return ex
+        ex.head === :call && ex.args[1] === :Ref && return ex
+        start = ex.head in (:call, :.) ? 2 : 1
+        return Expr(ex.head, ex.args[1:start-1]...,
+            (indexed(a, ivar) for a in ex.args[start:end])...)
+    end
+    out = Any[]
+    for st in stmts
+        if _is_broadcast_sample(st) && st.args[2] === ret
+            obj = st.args[3]
+            source = anchor(obj)
+            if source === nothing
+                push!(out, Expr(:call, :~, ret, _undot_cell_object(obj)))
+            else
+                ivar = gensym(:_rkppl_stream_index)
+                cell = Expr(:call, :~, Expr(:ref, ret, ivar),
+                    _undot_cell_object(indexed(obj, ivar)))
+                push!(out, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+                    Expr(:for, Expr(:(=), ivar, Expr(:call, :eachindex, source)),
+                        Expr(:block, cell))))
+            end
+        else
+            push!(out, st)
+        end
+    end
+    return out
+end
+
 # Bind positional arguments and declared keyword defaults, then peel an
 # optional `predictor = name` use-site pin. Returns (callargs, pin-or-nothing)
 # with the declared keywords following the positional arguments.
@@ -7287,19 +7337,18 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
         ret in _submodel_args(sm) && _sfail("stream submodel `$(sm.name)`: the " *
             "response slot `$ret` is an argument — the slot is a local name " *
             "the use-site data column replaces")
-    else
-        stream && _sfail("`$(sm.name)` is an observation-stream submodel (it " *
-            "returns the `.~` response slot `$ret`); bind it to a DATA column " *
-            "(`<data> ~ $(sm.name)(...)`), not the non-data name `$lhs`.")
     end
+    observed = stream && lhs in data
+    pin !== nothing && !observed && _sfail(
+        "`predictor = $pin` names an observation predictor; `$lhs` is latent")
     if pin !== nothing
         haskey(pins, lhs) && _sfail("response $lhs pins two predictors " *
             "($(pins[lhs]) and $pin) — one `predictor =` per response")
         pins[lhs] = pin
     end
-    # The stream response slot binds to the data LHS; all other binders are
-    # namespaced under the LHS.
-    keep = stream ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
+    # An observed slot binds to the data LHS. A generative slot retains
+    # its private name beside every other binder in the call's namespace.
+    keep = observed ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
     scope = _new_submodel_scope!(used, lhs)
     submap, idmap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(lhs, nothing, scope, used), keep)
@@ -7310,9 +7359,10 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     union!(bodynames, _submodel_args(sm))
     out = Any[_hsubst(_resolve_submodel_stmt(st, sm, bodynames), submap, idmap)
         for st in stmts]
-    # Latent: bind the LHS to the return value. Stream: the response IS the
-    # binding (the data LHS is already bound), so no trailing assignment.
-    stream || push!(out, Expr(:(=), lhs, _hsubst(_resolve_module_calls(ret,
+    stream && !observed && (out = _generative_stream_stmts(out, submap[ret], data))
+    # Every latent call binds its return value. An observed stream already
+    # binds the response column, so it has no trailing assignment.
+    observed || push!(out, Expr(:(=), lhs, _hsubst(_resolve_module_calls(ret,
         sm.mod, bodynames, "submodel `$(sm.name)` return `$(repr(ret))`"),
         submap, idmap)))
     return sm, out
@@ -7379,14 +7429,14 @@ end
 # Rewrite a `@plate` block, replacing each per-cell submodel-call cell with the
 # submodel's inlined `i`-indexed cell statements; other cells pass through.
 function _expand_plate_cell_submodels(pl::Expr, mod::Module, data::Set{Symbol},
-        used::_ScopeExpansion, chain)
+        pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
     loop = pl.args[end]::Expr
     asg = loop.args[1]::Expr
     ivar = asg.args[1]::Symbol
     body = loop.args[2]::Expr
     cells = Any[]
     for c in body.args
-        _expand_cell_stmt!(cells, c, ivar, mod, data, used, chain)
+        _expand_cell_stmt!(cells, c, ivar, mod, data, pins, used, chain)
     end
     newloop = Expr(:for, asg, Expr(:block, cells...))
     return Expr(:macrocall, pl.args[1:end-1]..., newloop)
@@ -7395,23 +7445,24 @@ end
 # Expand one plate cell into `cells`, recursively (a per-cell body may call a
 # per-cell submodel in turn; it resolves in the enclosing submodel's module).
 function _expand_cell_stmt!(cells, c, ivar::Symbol, mod::Module,
-        data::Set{Symbol}, used::_ScopeExpansion, chain)
+        data::Set{Symbol}, pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
     call = _cell_submodel_call(c, ivar, mod)
     if call === nothing
         push!(cells, c)
     else
-        sm, gen = _expand_cell_submodel(call[1], call[2], ivar, mod, data,
+        sm, gen = _expand_cell_submodel(call[1], call[2], ivar, mod, data, pins,
             used, chain)
         inner = RKPPLSubmodel[chain; sm]
         for g in gen
-            _expand_cell_stmt!(cells, g, ivar, sm.mod, data, used, inner)
+            _expand_cell_stmt!(cells, g, ivar, sm.mod, data, pins, used, inner)
         end
     end
     return cells
 end
 
 _is_dotted_obj(st::Expr) =
-    _is_sample(st) && st.args[3] isa Expr && st.args[3].head === :.
+    (_is_sample(st) || _is_broadcast_sample(st)) &&
+        st.args[3] isa Expr && st.args[3].head === :.
 
 # Inline one per-cell submodel call `col[i] ~ sm(callargs…)` into a sequence of
 # `i`-indexed cell statements. The submodel's own `~`/`=` names are namespaced
@@ -7430,14 +7481,11 @@ _is_dotted_obj(st::Expr) =
 # desugar the inlined statements flow through.
 function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
                                mod::Module, data::Set{Symbol},
-                               used::_ScopeExpansion, chain)
+                               pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
     col = colref.args[1]::Symbol
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     _check_submodel_cycle(sm, chain)
     callargs, pin = _peel_predictor_pin(callexpr, sm)
-    pin === nothing || _sfail("`predictor = $pin` is top-level-only " *
-        "(`y ~ sm(...; predictor = ...)`); per-cell predictors lower " *
-        "through the plate path")
     length(callargs) == length(_submodel_args(sm)) || _sfail(
         "submodel `$(sm.name)` expects $(length(sm.argnames)) argument(s) " *
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$col[$ivar] ~ " *
@@ -7482,11 +7530,12 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
              _is_sample(stmts[slot]) ? "a scalar (latent) distribution" :
              "a derived assignment") *
             ", so use a non-data LHS.")
-    elseif slot !== nothing && _is_dotted_obj(stmts[slot])
-        _sfail("`$(sm.name)` is a per-cell observation submodel (its return " *
-            "slot `$ret` is a `~ family.(...)` dotted response); bind it to a " *
-            "DATA column (`<data>[$ivar] ~ $(sm.name)(...)`), not the non-data " *
-            "name `$col`.")
+    end
+    latent_stream = col ∉ data && slot !== nothing && _is_dotted_obj(stmts[slot])
+    if pin !== nothing
+        col in data || _sfail("`predictor = $pin` names an observation predictor; `$col` is latent")
+        haskey(pins, col) && _sfail("response $col pins two predictors")
+        pins[col] = pin
     end
     argset = Set{Symbol}(_submodel_args(sm))
     for st in stmts
@@ -7502,14 +7551,15 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     end
     # Build the substitution: args → call args; each internal name → its indexed
     # namespaced ref, except the direct-bound slot → `col[i]`.
-    keep = slot === nothing ? Dict{Symbol,Any}() :
+    keep = slot === nothing || latent_stream ? Dict{Symbol,Any}() :
         Dict{Symbol,Any}(_stmt_lhs(stmts[slot]) => colref)
     scope = _new_submodel_scope!(used, col; per_cell = true)
     submap, idmap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(col, ivar, scope, used), keep)
     out = Any[_hsubst(st, submap, idmap) for st in stmts]
     # Compound-return latent: bind `col[i]` to the substituted return value.
-    slot === nothing && push!(out, Expr(:(=), colref, _hsubst(ret, submap, idmap)))
+    (slot === nothing || latent_stream) &&
+        push!(out, Expr(:(=), colref, _hsubst(ret, submap, idmap)))
     return sm, out
 end
 
