@@ -568,13 +568,15 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using SpecialFunctions: gamma_inc, gamma_inc_inv
 
 @kernel gamma(shape::Float64, rate::Float64) = begin
-    log_rate::Float64 = log(rate)
+    # The log-rate view is also a captured density input. Guard its
+    # undefined arithmetic before it reaches the rejecting logpdf arm.
+    log_rate::Float64 = rate > 0 ? log(rate) : -Inf
     rate::Float64 = exp(log_rate)
     scale::Float64 = 1 / rate
     rate::Float64 = 1 / scale
 
     logpdf(x::Float64)::Float64 =
-        x > 0 ?
+        (x > 0) & (shape > 0) & (log_rate > -Inf) ?
             (shape * log_rate - loggamma(shape) +
              (shape - 1) * log(x) - rate * x) :
             -Inf

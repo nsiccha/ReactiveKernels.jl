@@ -148,7 +148,9 @@ using Test
     capabilities = Set(["scalar-data likelihood", "literal prob rejected", "data-column mixture weights", "Weibull response", "data-varying scan recurrence"])
     for (item, label, prog, datanames, E) in cases
         @testset "$item: $label" begin
-            if label in capabilities
+            if label in ("literal prob rejected", "Weibull response")
+                @test !isempty(lower_rkppl(prog, datanames; conditioned=datanames).responses)
+            elseif label in capabilities
                 # capability: each entry above names a valid model shape (todo `1qlbn5b`).
                 @test_broken (lower_rkppl(prog, datanames; conditioned = datanames); true)
             else

@@ -940,13 +940,12 @@ end
         eta = a .+ b .* x
         s .~ ZeroInflatedBinomial.(3, logistic.(eta), zi)
     end, (:s, :x); conditioned = (:s, :x)); true)
-    # Literal probabilities stay rejected (a fully fixed ZIB
-    # contributes a constant).
+    # Fixed probabilities contribute likelihood without a probability coordinate.
     # capability: literal probability in ZeroInflatedBinomial (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         zi ~ Beta(1.0, 1.0)
         s .~ ZeroInflatedBinomial.(3, 0.5, zi)
-    end, Ds; conditioned = Ds); true)
+    end, Ds; conditioned = Ds)).responses)
     # An unbracketed head names the broadcast fix.
     # refused: undotted ZeroInflatedBinomial head over per-obs args (P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -1448,15 +1447,14 @@ end
         eta = a .+ b .* x
         y .~ weibull.(2.0, exp.(eta))
     end, Dn2; conditioned = Dn2)
-    # The scale position needs its `exp.` link wrapper (the Binomial
-    # link-fed-second precedent).
+    # Weibull also accepts its scale as an ordinary value.
     # capability: identity-link (bare) Weibull scale (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
         y .~ Weibull.(2.0, eta)
-    end, Dn2; conditioned = Dn2); true)
+    end, Dn2; conditioned = Dn2)).responses)
     # A modeled-k predictor fails at the contract gate (deferred).
     # capability: modeled Weibull shape-k predictor (exp.) (todo `05fuzch`)
     @test_broken (lower_rkppl(quote
@@ -1795,22 +1793,22 @@ end
         y .~ negative_binomial2.(exp.(eta), phi)
     end, Dn2; conditioned = Dn2)
     # capability: identity-link (bare) Gamma mean (todo `05fuzch`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         alpha ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ Gamma.(alpha, eta ./ alpha)
-    end, Dn2; conditioned = Dn2); true)
+    end, Dn2; conditioned = Dn2)).responses)
     # capability: general Gamma(alpha, theta) (mismatched alpha) beyond the mean template (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(quote
+    @test !isempty((lower_rkppl(quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         alpha ~ Exponential(1.0)
         alpha2 ~ Exponential(1.0)
         eta = a .+ b .* x
         y .~ Gamma.(alpha, exp.(eta) ./ alpha2)
-    end, Dn2; conditioned = Dn2); true)
+    end, Dn2; conditioned = Dn2)).responses)
     # refused: gamma is SpecialFunctions.gamma, not a distribution (P2, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
         alpha ~ Exponential(1.0)

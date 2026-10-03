@@ -138,6 +138,8 @@ univariate components, SB `MixtureModel` mirror)."""
     LogNormalFam
     WeibullFam
     ZeroInflatedBinomialFam
+    GammaValueFam
+    WeibullValueFam
 end
 
 """Link functions. The enum crosses the boundary; the thin layer owns the
@@ -1936,6 +1938,8 @@ const ADMITTED_TRIPLES = (
     (ExponentialLogFam, LogLink, LogLink),
     (LogNormalFam, IdentityLink, IdentityLink),
     (WeibullFam, LogLink, LogLink),
+    (GammaValueFam, IdentityLink, IdentityLink),
+    (WeibullValueFam, IdentityLink, IdentityLink),
 )
 
 """Positional arity per sampled family (Distributions.jl order; `:student_t`
@@ -2390,7 +2394,7 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
     NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
-    ZeroInflatedBinomialFam)
+    ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam)
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
@@ -7720,13 +7724,14 @@ end
 
 # Prob-space Binomial responses (SB `binomial(n, theta)` with a Beta prior,
 # the Rate family): no linear predictor — the location names the
-# Beta-sampled scalar probability in `predictor`, used as-is under
-# IdentityLink (the simplex precedent). Literals stay rejected: a fully
-# fixed Binomial contributes a constant, never a coordinate.
+# scalar probability in `predictor`, or an identity-link value predictor.
+# A fixed probability contributes likelihood without a coordinate.
 function _validate_binomial_prob_response(r::LikelihoodSpec, plan::StructuralPlan)
     r.link === IdentityLink || _fail(r.label,
         "a prob-space Binomial response uses IdentityLink (probs are used " *
         "as-is), got $(r.link)")
+    pred = findfirst(p -> p.name === r.predictor, plan.predictors)
+    pred !== nothing && plan.predictors[pred].link === IdentityLink && return nothing
     i = findfirst(p -> p.name === r.predictor, plan.parameters)
     i === nothing && _fail(r.label,
         "a prob-space Binomial response names its Beta-sampled probability " *
@@ -7746,6 +7751,8 @@ function _validate_zib_response(r::LikelihoodSpec, plan::StructuralPlan)
     r.link === IdentityLink || _fail(r.label,
         "a zero-inflated prob-space Binomial response uses IdentityLink " *
         "(probs are used as-is), got $(r.link)")
+    pred = findfirst(p -> p.name === r.predictor, plan.predictors)
+    pred !== nothing && plan.predictors[pred].link === IdentityLink && return nothing
     i = findfirst(p -> p.name === r.predictor, plan.parameters)
     i === nothing && _fail(r.label,
         "a zero-inflated prob-space Binomial response names its " *
@@ -8347,6 +8354,8 @@ function _validate_responses(plan::StructuralPlan)
         # parameter in `predictor`.
         if r.family === BinomialProbFam
             _validate_binomial_prob_response(r, plan)
+            any(p -> p.name === r.predictor, plan.predictors) &&
+                push!(used_predictors, r.predictor)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
@@ -8360,6 +8369,8 @@ function _validate_responses(plan::StructuralPlan)
         # parameter in `predictor`.
         if r.family === ZeroInflatedBinomialFam
             _validate_zib_response(r, plan)
+            any(p -> p.name === r.predictor, plan.predictors) &&
+                push!(used_predictors, r.predictor)
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
@@ -8511,7 +8522,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
             all(>=(0), col)) ||
             _fail(r.label, "Exponential response must be non-negative numerics")
         return nothing
-    elseif r.family === WeibullFam
+    elseif r.family === WeibullFam || r.family === WeibullValueFam
         # Strictly positive: the Weibull kernel guards y > 0 (Stan
         # `weibull_lpdf` rejects y < 0 and returns -inf at y = 0 for
         # k < 1) — fail closed instead of flowing a wrong value.
@@ -8563,7 +8574,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     elseif r.family === PoissonLogGLMFam
         eltype(col) <: Integer && all(>=(0), col) && return nothing
         return _fail(r.label, "PoissonLogGLM response must be non-negative integers")
-    elseif r.family === GammaLogFam
+    elseif r.family === GammaLogFam || r.family === GammaValueFam
         # Strictly positive: the gamma kernel guards x > 0, and at exactly
         # 0 it is wrong for shape ≤ 1 (says -Inf; truth is finite/+Inf) —
         # fail closed instead of flowing a wrong value.
@@ -8700,7 +8711,7 @@ _is_binomial_family(f) =
 _scale_need(fam::LikelihoodFamily) =
     fam === GaussianFam ? "Gaussian response requires a scale" :
     fam === NegativeBinomial2Fam ? "NB2 response requires a dispersion phi" :
-    fam === GammaLogFam ? "Gamma response requires a shape alpha" :
+    fam in (GammaLogFam, GammaValueFam) ? "Gamma response requires a shape alpha" :
     fam === BetaLogitFam ? "Beta response requires a concentration kappa" :
     fam === NormalIDGLMFam ? "NormalIDGLM response requires a scale sigma" :
     fam === StudentTFam ? "Student response requires a scale sigma" :
@@ -8710,7 +8721,7 @@ _scale_need(fam::LikelihoodFamily) =
     fam === VonMisesFam ? "VonMises response requires a concentration kappa" :
     fam === NegativeBinomialFam ? "NB1 response requires a success probability p" :
     fam === LogNormalFam ? "LogNormal response requires a scale sigma" :
-    fam === WeibullFam ? "Weibull response requires a shape k" : nothing
+    fam in (WeibullFam, WeibullValueFam) ? "Weibull response requires a shape k" : nothing
 
 function _validate_scale(r::LikelihoodSpec, plan::StructuralPlan)
     need = _scale_need(r.family)
@@ -8763,10 +8774,8 @@ end
 # kappa, BetaBinomial2 phi, NB1 p, InverseGaussian lambda; LogNormal
 # sigma and Weibull k are deferred above):
 # the predictor exists, carries the use-site link (the
-# one-link-per-predictor rule), and is not the response's own location
-# predictor (slots take distinct predictors — the BRM-side plan rule,
-# mirrored here as defense in depth; the Student nu/scale cross-hit is
-# enforced at the nu gate, where both slots are visible).
+# registered predictor's link). Several slots may read the same authored
+# value; use-site transforms retain the same declared coefficients.
 # Predictor-fed Binomial trials are deferred (trials stay
 # column-or-literal by type). A hurdle p_zero predictor is logit-only
 # (a probability), as is an NB1 p predictor (a success probability);
@@ -8791,7 +8800,7 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
         "shape (k) is deferred — use a scalar k (parameter, literal, " *
         "or data column)")
     (fam === GaussianFam || fam === NegativeBinomial2Fam ||
-        fam === GammaLogFam || fam === BetaLogitFam ||
+        fam in (GammaLogFam, GammaValueFam, WeibullValueFam) || fam === BetaLogitFam ||
         fam === StudentTFam ||
         fam === HurdlePoissonFam || fam === VonMisesFam ||
         fam === BetaBinomial2Fam || fam === NegativeBinomialFam ||
@@ -8830,10 +8839,6 @@ function _validate_scale_predictor_use(r::LikelihoodSpec, plan::StructuralPlan,
     pred.link === s.link ||
         _fail(r.label, "$slot predictor $(s.predictor) carries link " *
             "$(pred.link), $slot use wraps $(s.link) — one link per predictor")
-    s.predictor in forbidden &&
-        _fail(r.label, "$slot predictor $(s.predictor) is the response's " *
-            "own location predictor — location and $slot take distinct " *
-            "predictors")
     return nothing
 end
 

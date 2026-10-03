@@ -1677,9 +1677,9 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         return _nb2_plate_stmts(r, plan, node, pw)
     elseif r.family === NegativeBinomialFam
         return _nb1_plate_stmts(r, plan, node, pw)
-    elseif r.family === WeibullFam
+    elseif r.family === WeibullFam || r.family === WeibullValueFam
         return _weibull_plate_stmts(r, plan, node, pw)
-    elseif r.family === GammaLogFam
+    elseif r.family === GammaLogFam || r.family === GammaValueFam
         return _gamma_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliProbitFam
         return _bernoulli_probit_plate_stmts(r, plan, node, pw)
@@ -2520,7 +2520,8 @@ function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
     inputs = Any[y]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
-    pref = _thread_ref!(inputs, r.predictor)
+    pref = _thread_ref!(inputs, any(p -> p.name === r.predictor, plan.predictors) ?
+        _lp_name(_predictor(plan, r.predictor)) : r.predictor)
     cell = :(binomial($nref, $pref).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
@@ -2538,7 +2539,8 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     inputs = Any[y]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
-    pref = _thread_ref!(inputs, r.predictor)
+    pref = _thread_ref!(inputs, any(p -> p.name === r.predictor, plan.predictors) ?
+        _lp_name(_predictor(plan, r.predictor)) : r.predictor)
     ziref = _thread_ref!(inputs, r.zi)
     cell = :(zero_inflated_binomial($nref, $pref, $ziref).logpdf($yv))
     if r.weights !== nothing
@@ -2615,7 +2617,9 @@ function _weibull_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     kref = _thread_ref!(inputs, sarg)
     # All-keyword: the object constructor cannot mix positional and named
     # owner bindings (the ZIP precedent).
-    cell = :(weibull(; k = $kref, log_theta = $etav).logpdf($yv))
+    cell = r.family === WeibullValueFam ?
+        :(weibull($kref, $etav).logpdf($yv)) :
+        :(weibull(; k = $kref, log_theta = $etav).logpdf($yv))
     if r.weights !== nothing
         wv = _thread_ref!(inputs, r.weights)
         cell = :($wv * $cell)
@@ -2632,7 +2636,8 @@ function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbo
     # takes rate, so the boundary inverts (same as the sampled-gamma prior).
     av = sarg isa Symbol ? sarg : Float64(sarg)
     rate = _rate_name(r.label)
-    push!(pre, :($rate = $av ./ exp.($lp)))
+    push!(pre, r.family === GammaValueFam ? :($rate = 1.0 ./ $lp) :
+        :($rate = $av ./ exp.($lp)))
     if r.mi_jobs !== nothing
         rate = _mi_gather_node!(pre, r.mi_jobs, rate, r.label)
         sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)

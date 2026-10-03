@@ -66,11 +66,11 @@ _bare_posterior(kern, lay, q::NamedTuple) =
     end"""), (:k, :n); conditioned = (:k, :n))
     @test Set(p.name for p in prior.parameters) == Set([:theta, :thetaprior])
 
-    # Literals stay fail-closed (intercept-only predictor message).
+    # A fixed probability contributes likelihood without a sampled coordinate.
     # capability: literal probability Binomial.(n, 0.3) (fixed-p likelihood) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(Meta.parse("""begin
+    @test !isempty((lower_rkppl(Meta.parse("""begin
         k .~ Binomial.(n, 0.3)
-    end"""), (:k, :n); conditioned = (:k, :n)); true)
+    end"""), (:k, :n); conditioned = (:k, :n))).responses)
 
     # Other families keep the strict broadcast-link message.
     # refused: undeclared phi (P6, 05oe96l); NB2 mean is also a real-support parameter with no link

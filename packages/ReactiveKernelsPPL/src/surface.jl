@@ -7542,15 +7542,17 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
     end
     family, lik_link, pred_link, loc, scale_raw, trials, nu_raw, zi_raw,
     interval_raw = _lower_response_base(lhs, call, ctx)
-    # Prob-space families bypass the predictor-building location
-    # lowering (their location names a Beta-sampled scalar parameter;
-    # the Beta family is checked at contract). Every other family
+    # Prob-space families retain a sampled scalar or a fixed value
+    # predictor. Every other family
     # routes through `_lower_location`, which admits a value location
     # here (a scalar parameter or data column under the written link).
     pname = (family === BinomialProbFam ||
             family === ZeroInflatedBinomialFam) ?
-        _lower_prob_location(lhs, loc, ctx,
+        _lower_prob_location(lhs, loc, ctx, predictors, pred_idx,
             family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
+        family in (GammaValueFam, WeibullValueFam) ?
+        _lower_argument_predictor!(lhs, loc, ctx, predictors, pred_idx,
+            coefuse, Symbol(lhs, "_value")) :
         _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         coefuse; value = true)
     scale = _lower_scale_use(lhs, scale_raw, ctx, predictors, pred_idx,
@@ -8416,7 +8418,8 @@ function _dot2call_spine_arg(lhs, f, i, a)
     elseif f === :BetaBinomial2 && i == 2
         return _dot2call_nested_link(lhs, a, f)
     elseif f === :Weibull && i == 2
-        return _dot2call_nested_link(lhs, a, f)
+        return _is_composed_map(a) && a.args[1] === :exp ?
+            _dot2call_nested_link(lhs, a, f) : a
     end
     # Gamma position 2 (`exp.(eta) ./ alpha`) passes through; the
     # response branch matches the `./` structure (link + alpha identity).
@@ -8644,13 +8647,25 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Weibull
         length(args) == 2 || _sfail("response $lhs: `Weibull` takes " *
                                     "`Weibull.(k, exp.(eta))`")
-        return WeibullFam, LogLink, LogLink,
-        _lower_link_arg(lhs, args[2], :exp), args[1], nothing, nothing,
-        nothing, nothing
+        if Meta.isexpr(args[2], :call) && args[2].args[1] === :exp
+            return WeibullFam, LogLink, LogLink,
+            _lower_link_arg(lhs, args[2], :exp), args[1], nothing, nothing,
+            nothing, nothing
+        end
+        return WeibullValueFam, IdentityLink, IdentityLink,
+        args[2], args[1], nothing, nothing, nothing, nothing
     elseif fam === :Gamma
-        loc, scale = _lower_gamma_args(lhs, args, ctx)
-        return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing,
-        nothing, nothing
+        length(args) == 2 || _sfail("response $lhs: `Gamma` takes shape and scale")
+        a1, div = args
+        if Meta.isexpr(div, :call) && length(div.args) == 3 &&
+                div.args[1] === Symbol("./") && _same_aux(a1, div.args[3]) &&
+                Meta.isexpr(div.args[2], :.) && div.args[2].args[1] === :exp
+            loc, scale = _lower_gamma_args(lhs, args, ctx)
+            return GammaLogFam, LogLink, LogLink, loc, scale, nothing, nothing,
+            nothing, nothing
+        end
+        return GammaValueFam, IdentityLink, IdentityLink, div, a1,
+        nothing, nothing, nothing, nothing
     elseif fam === :Beta
         loc, scale = _lower_beta_args(lhs, args, ctx)
         return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing,
@@ -8959,14 +8974,16 @@ function _reject_legacy_inverse_link(lhs, arg)
     _sfail("response $lhs: $reason; use `$inverse.(eta)`")
 end
 
-# Prob-space Binomial-family location: a sampled parameter name (the Beta
-# family is checked at contract, the Categorical deferral precedent).
-# Literals stay rejected — a fully fixed Binomial contributes a constant.
-function _lower_prob_location(lhs, loc, ctx, what::String = "Binomial")
+# Prob-space Binomial-family location: a sampled name or a fixed value
+# predictor. A fully fixed likelihood contributes density without coordinates.
+function _lower_prob_location(lhs, loc, ctx, predictors, pred_idx,
+        what::String = "Binomial")
     loc isa Symbol && loc in ctx.prior_names && return loc
-    loc isa Real && _sfail("response $lhs: prob-space $what " *
-                           "probability $loc is a literal — v1 probabilities " *
-                           "are Beta-sampled (`theta ~ Beta(...)` in the model)")
+    if loc isa Real
+        isfinite(loc) && 0 <= loc <= 1 || _sfail(
+            "response $lhs: $what literal probability must lie in [0, 1]")
+        return _value_location!(lhs, loc, IdentityLink, ctx, predictors, pred_idx)
+    end
     return _sfail("response $lhs: prob-space $what probability takes a " *
                   "Beta parameter name (`theta ~ Beta(...)` in the model), " *
                   "got $(repr(loc))")
@@ -9170,7 +9187,19 @@ function _lower_scale_use(lhs, s, ctx, predictors, pred_idx, coefuse)
     # through untouched.
     s === nothing && return nothing
     if s isa Expr && s.head === :.
-        return _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+        if s.args[1] in (:exp, :logistic) &&
+                length(s.args[2].args) == 1 &&
+                only(s.args[2].args) isa Symbol &&
+                _is_scale_predictor_def(only(s.args[2].args), ctx, true)
+            return _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+        end
+        pname = _lower_argument_predictor!(lhs, s, ctx, predictors,
+            pred_idx, coefuse, Symbol(lhs, "_scale_value"))
+        return ScalePredictorRef(pname, IdentityLink)
+    elseif s isa Expr && _canon_shape(s, ctx) === :vector
+        pname = _lower_argument_predictor!(lhs, s, ctx, predictors,
+            pred_idx, coefuse, Symbol(lhs, "_scale_value"))
+        return ScalePredictorRef(pname, IdentityLink)
     end
     if s isa Expr && s.head === :call && !isempty(s.args) &&
             s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
@@ -9303,8 +9332,9 @@ end
 
 # Analyze (or intern) a scale predictor: exactly the location-predictor
 # treatment (`_lower_location`'s named-definition arm) under the use-site
-# link — affine analysis, coefficient-use recording, one link per
-# predictor. Family admission (Gaussian/NB2/Gamma/Beta-log-only/Student
+# link — affine analysis and coefficient-use recording. A different link
+# interns another use of the same authored terms. Family admission
+# (Gaussian/NB2/Gamma/Beta-log-only/Student
 # sigma/Student nu/hurdle/VonMises-log-only/BB2/NB1-logit-only/
 # IG-log-only; LogNormal/Weibull deferred) is the
 # contract's gate (`_validate_scale_predictor` / `_validate_nu`), so
@@ -9315,10 +9345,13 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
         return _lower_scale_predictor_error(lhs, name, ctx)
     if haskey(pred_idx, name)
         pred = predictors[pred_idx[name]]
-        pred.link === link || _sfail(
-            "predictor $name is shared by slots needing links " *
-            "$(pred.link) and $link — one link per predictor")
-        return name
+        pred.link === link && return name
+        # A slot's link belongs to the use, not to the authored value.
+        # Reuse the same terms/declared coefficients under a private name.
+        alias = _argument_name!(Symbol(name, "_use"), ctx)
+        push!(predictors, PredictorSpec(alias, link, pred.terms, alias))
+        pred_idx[alias] = length(predictors)
+        return alias
     end
     if _composed_root(ctx.detmap[name], ctx)
         return _lower_composed_predictor(name, ctx.detmap[name], ctx, lhs,
@@ -9329,6 +9362,30 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
     push!(predictors, PredictorSpec(name, link, terms, name))
     pred_idx[name] = length(predictors)
     return name
+end
+
+function _argument_name!(base::Symbol, ctx)
+    nm, k = base, 0
+    while nm in ctx.taken
+        k += 1
+        nm = Symbol(base, "_", k)
+    end
+    push!(ctx.taken, nm)
+    return nm
+end
+
+# Distribution arguments are ordinary values. A scalar keeps its scalar
+# assignment; dotted expressions retain their array computation over LPs,
+# data and scalar declarations without inventing a new coefficient prior.
+function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
+        coefuse, base::Symbol)
+    pname = _argument_name!(base, ctx)
+    if ex isa Expr && (_canon_shape(ex, ctx) !== :scalar || _is_composed_map(ex))
+        return _lower_composed_predictor(pname, ex, ctx, lhs, IdentityLink,
+            predictors, pred_idx, coefuse)
+    end
+    return _lower_location(lhs, ex, IdentityLink, ctx, predictors, pred_idx,
+        coefuse; value = true, synth = pname)
 end
 
 function _lower_scale_predictor_error(lhs, name, ctx)
@@ -10346,8 +10403,6 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
     scalars = Symbol[]
     datas = Symbol[]
     tree = _extract_composed_tree(pname, rhs, ctx, subs, scalars, datas)
-    isempty(subs) && _sfail("predictor $pname has no sub-predictor — " *
-        "compositions combine at least one sub-predictor LP")
     for s in subs
         if haskey(pred_idx, s)
             pred = predictors[pred_idx[s]]

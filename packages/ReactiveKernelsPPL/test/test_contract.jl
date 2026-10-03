@@ -368,7 +368,7 @@ end
         PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
         ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
         NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
-        ZeroInflatedBinomialFam)
+        ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
         OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
         HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
@@ -634,7 +634,7 @@ end
             ScalePredictorRef(:mu, IdentityLink), nothing,
             _none_evidence(), :y_resp, nothing, nothing; nu = :nu)
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
-    @test_broken (validate_plan(bad); true)
+    @test validate_plan(bad) === nothing
     # A predictor-fed nu is admitted on every link (the modeled-nu
     # vscale shape — the sigma precedent above).
     for link in (IdentityLink, LogLink, LogitLink)
@@ -654,7 +654,7 @@ end
             _none_evidence(), :y_resp, nothing, nothing;
             nu = ScalePredictorRef(:mu, IdentityLink))
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
-    @test_broken (validate_plan(bad); true)
+    @test validate_plan(bad) === nothing
     # Nor the response's own scale predictor (all three slots distinct).
     bad = _student_plan()
     push!(bad.predictors, PredictorSpec(:sc, LogLink, _terms(), :sc))
@@ -1029,7 +1029,7 @@ end
             ScalePredictorRef(:eta, LogLink), nothing,
             _none_evidence(), :y_resp)
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
-    @test_broken (validate_plan(bad); true)
+    @test validate_plan(bad) === nothing
     # InverseGaussian response must be strictly positive (Bool excluded).
     bad = _ig_plan()
     bad.columns[:y] = [0.7, 1.4, 0.0, 0.5, 1.0, 3.0, 1.2, 0.8, 1.1]
@@ -1182,7 +1182,7 @@ end
             ScalePredictorRef(:mu, IdentityLink), nothing,
             _none_evidence(), :y_resp, :n, nothing)
     # capability: one linear predictor feeding several slots of one response (10gzbm9 shared-slots) (todo `05fuzch`)
-    @test_broken (validate_plan(bad); true)
+    @test validate_plan(bad) === nothing
     # BetaBinomial2 requires trials (Binomial rule).
     bad = _betabinomial2_plan()
     bad.responses[1] =
