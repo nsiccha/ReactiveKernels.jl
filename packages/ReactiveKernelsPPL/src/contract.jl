@@ -5118,21 +5118,28 @@ end
 # sampled seeds and the per-step innovations, and the emitter reconstructs
 # every carried array via the RK-core `scan(...)` carry-fold. Otherwise
 # (every carried write samples) the slice holds the state itself (centered
-# form). A scan mixing both kinds of carried write is a non-centered scan the
-# emitter refuses (not built yet).
+# form). Mixed statements and tuple carries use the ordered reconstruction.
 _is_noncentered_scan(s::ScanSpec) =
-    any(st -> st.kind === :assign && st.indexed, s.step)
+    !(length(s.states) == 1 && all(f -> f.kind === :sample, s.setup) &&
+        length(s.step) == 1 && only(s.step).kind === :sample && only(s.step).indexed)
 
-# A scan's trajectory length T: the literal loop bound, or the rows of the
-# response that consumes the trajectory when the bound is a length name.
+# A scan's trajectory length: a literal, a supplied integer value, or the
+# consuming response's rows for the historical unsupplied length-name form.
 _scan_length(plan::StructuralPlan, s::ScanSpec) =
-    s.hi isa Int ? s.hi : _value_rows(plan, first(s.states))
+    s.hi isa Int ? s.hi : haskey(plan.columns, s.hi) ?
+        _scan_bound_length(plan.columns[s.hi], s) : _value_rows(plan, first(s.states))
+
+function _scan_bound_length(value, s)
+    (value isa Integer && !(value isa Bool) && value >= s.lo - 1) ||
+        _fail(s.label, "scan bound $(s.hi) must bind an integer at least $(s.lo - 1), got $(repr(value))")
+    return Int(value)
+end
 
 # A non-centered scan's latent slice length: one coordinate per sampled seed,
 # plus `T - m` per innovation local (one per loop iteration).
 _scan_latent_size(s::ScanSpec, T::Int) =
     count(f -> f.kind === :sample, s.setup) +
-    count(st -> st.kind === :sample && !st.indexed, s.step) * (T - (s.lo - 1))
+    count(st -> st.kind === :sample, s.step) * (T - (s.lo - 1))
 
 # In-graph name of a non-centered scan's latent slice
 # (`_ppl_scan_z_<first state>`). Reserved-prefix validation guarantees no
@@ -5165,8 +5172,8 @@ function _validate_scans(plan::StructuralPlan)
                 "scan seed fill kind must be :sample or :assign, got " *
                 "$(repr(f.kind))")
         end
-        s.maxlag >= 1 || _fail(s.label,
-            "a scan must read a backward lag of a carried array (maxlag ≥ 1)")
+        s.maxlag >= 0 || _fail(s.label, "scan maxlag must be nonnegative")
+        isbound(plan) && _resolve_scan(plan, s)
         m >= s.maxlag || _fail(s.label,
             "scan maxlag $(s.maxlag) exceeds the $m seeded value(s) per array")
         for a in s.states
@@ -5332,6 +5339,7 @@ end
 function _validate_vector_alias(d::VectorAssignmentSpec, plan, bound::Bool)
     d.expr isa Symbol || return nothing
     target = d.expr
+    any(s -> target in s.states, plan.scans) && return nothing
     _is_derived(plan, target) && return nothing
     target in _union_names(plan) &&
         _fail(d.label, "alias target $target is a scalar name — aliases " *
@@ -5352,7 +5360,7 @@ so a scalar arg can never reference a latent vector)."""
 _all_names(plan::StructuralPlan) =
     union(_union_names(plan), [d.name for d in plan.derived],
         [p.name for p in plan.plate_parameters], _vector_value_names(plan),
-        _array_names(plan))
+        _array_names(plan), [a for s in plan.scans for a in s.states])
 
 """Vector-parameter names (simplexes, cutpoints, …): model-level array values
 that definitions may read whole (`cumsum(vcat(0.0, zeta))`), never scalars."""
@@ -5659,6 +5667,7 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
         # Per-cell latent (plate) parameters are vectors, so a derived column
         # may transform one (`theta = mu .+ tau .* z`) — the non-centered shape.
         if _is_derived(plan, ex) || _is_plate_param(plan, ex) ||
+                any(s -> ex in s.states, plan.scans) ||
                 ex in _union_names(plan) || ex in _vector_value_names(plan)
             push!(refs, ex)
             return nothing
@@ -6262,6 +6271,19 @@ function topological_order(plan::StructuralPlan)
     names = _union_names(plan)
     allnames = _all_names(plan)
     deps = Dict{Symbol,Set{Symbol}}()
+    for s in plan.scans
+        refs = Set{Symbol}()
+        locals = Set(st.target for st in s.step if !st.indexed)
+        for st in (s.setup..., s.step...)
+            for expr in (st.kind === :sample ? st.args : (st.expr,))
+                union!(refs, _expr_value_symbols(expr))
+            end
+        end
+        filter!(r -> r in allnames && r ∉ s.states && r ∉ locals, refs)
+        for state in s.states
+            deps[state] = copy(refs)
+        end
+    end
     for p in plan.parameters
         refs = Set{Symbol}()
         for v in (values(p.args)..., _support_args(p.support_override)...)
@@ -6323,7 +6345,7 @@ function topological_order(plan::StructuralPlan)
         refs = Symbol[]
         if d.expr isa Symbol
             _validate_vector_alias(d, plan, isbound(plan))
-            _is_derived(plan, d.expr) && push!(refs, d.expr)
+            d.expr in allnames && push!(refs, d.expr)
         else
             _collect_vector_refs!(refs, d.expr, plan, d.label, isbound(plan))
         end
@@ -6655,14 +6677,9 @@ function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralP
         _fail(t.label, "scan summand addresses unknown scan state " *
               ":$(o.scan_id) (no such `@scan` carried array)")
     o.coef === nothing && return nothing
-    i = findfirst(p -> p.name === o.coef, plan.parameters)
-    i === nothing &&
+    o.coef in _union_names(plan) ||
         _fail(t.label, "scan summand coef :$(o.coef) must name a scalar " *
-              "sampled parameter (`$(o.coef) ~ Normal(...)`)")
-    plan.parameters[i].family === :normal ||
-        _fail(t.label, "scan summand coef :$(o.coef) must be Normal in v1 " *
-              "(SB's `ar` beta is a Normal population coefficient), got " *
-              ":$(plan.parameters[i].family)")
+              "parameter or assignment")
     return nothing
 end
 
@@ -8262,13 +8279,8 @@ function _validate_responses(plan::StructuralPlan)
         r.zi isa ScalePredictorRef &&
             push!(used_predictors, r.zi.predictor)
         # A scan-state latent vector location: the mean is the carried state
-        # directly (no linear predictor). Slice 1 admits Gaussian-identity only.
+        # directly (no linear predictor), with the response's ordinary family/link.
         if r.predictor in scan_states
-            (r.family === GaussianFam && r.link === IdentityLink) || _fail(
-                r.label,
-                "a scan-state response location ($(r.predictor)) is " *
-                "Gaussian-identity only in slice 1 (got $(r.family)/$(r.link))",
-            )
             _validate_scale(r, plan)
             _validate_nu(r, plan)
             _validate_zi(r, plan)
@@ -10168,6 +10180,13 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         p.family === :simplex_dirichlet || continue
         push!(defs, Symbol(:_ppl_prior_input_, p.name) => p.args.arg1)
     end
+    for s in plan.scans
+        exprs = Any[s.hi]
+        for st in (s.setup..., s.step...)
+            append!(exprs, st.kind === :sample ? st.args : (st.expr,))
+        end
+        push!(defs, Symbol(:_ppl_scan_input_, s.label) => Expr(:tuple, exprs...))
+    end
     for r in plan.responses
         r.family === MixtureFam && r.mixture_weights isa Symbol || continue
         push!(defs, Symbol(:_ppl_weights_input_, r.label) =>
@@ -10193,6 +10212,10 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
                 delete!(free, p.name)
                 p.family === :simplex_dirichlet || _drop_held_names!(free, p.args)
             end
+        elseif f === :scans
+            # Raw scan reads are model values indexed inside the retained loop.
+            # Other uses (response columns, affine columns) still pin their axis.
+            continue
         elseif f === :array_parameters
             for p in plan.array_parameters
                 delete!(free, p.name)

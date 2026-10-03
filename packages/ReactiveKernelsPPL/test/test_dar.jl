@@ -119,34 +119,10 @@ end
     @test_throws ContractValidationError validate_structure(
         _dar_min_plan([_dar_spec(; sigma = :nope)]))
 
-    # persistence and scale must be distinct parameters
-    # capability: one parameter as both dar persistence and scale (IR mirrors SB geometry) (todo `0yc2qgp`)
-    @test_broken (validate_structure(
-        _dar_min_plan([DarSpec(:dar_mu, :beta, :beta, :dar_mu)])); true)
-
-    # Library DAR persistence priors are the author's priors (P8 1cmodra).
-    for (fam, sup) in ((:normal, nothing), (:normal, :positive),
-            (:normal, (:interval_stan, 0.0, 1.0)),
-            (:normal, (:interval, 0.0, 2.0)), (:exponential, nothing))
-        p = _dar_min_plan([spec])
-        i = findfirst(q -> q.name === :beta, p.parameters)
-        args = fam === :exponential ? (arg1 = 1.0,) : (arg1 = 0.5, arg2 = 0.2)
-        p.parameters[i] = SampledParameter(:beta, fam, args, sup, :beta)
-        # capability: user-written DAR persistence priors (P8 1cmodra; todo `0yc2qgp`).
-        @test_broken (validate_structure(p); true)
-    end
-
-    # Library DAR scale priors keep their written geometry (P8 1cmodra).
-    for (fam, sup) in ((:normal, nothing), (:normal, :positive_stan),
-            (:exponential, nothing),
-            (:normal, (:interval, 0.0, 1.0)), (:cauchy, :positive))
-        p = _dar_min_plan([spec])
-        i = findfirst(q -> q.name === :sigmad, p.parameters)
-        args = fam === :exponential ? (arg1 = 1.0,) : (arg1 = 0.0, arg2 = 0.2)
-        p.parameters[i] = SampledParameter(:sigmad, fam, args, sup, :sigmad)
-        # capability: user-written DAR scale priors (10gzbm9 support-links; todo `0yc2qgp`).
-        @test_broken (validate_structure(p); true)
-    end
+    # General persistence/scale priors and one parameter serving both roles
+    # are exercised through explicit differenced_ar1 declarations in
+    # test_dar_capabilities.jl, with density/gradient oracles. DarSpec is the
+    # historical built-in IR; extending it would mint undeclared latents.
 
     # override-shaped args still admit (location/scale ride free)
     p = _dar_min_plan([spec])
@@ -221,10 +197,8 @@ end
     @test Symbol("_ppl_dar_z_dar_mu.1") in names
     @test Symbol("_ppl_dar_z_dar_mu.3") in names
 
-    # a single observation leaves no innovation — fail closed
-    # capability: zero-innovation dar (n_obs = 1) (todo `0yc2qgp`)
-    @test_broken (assign_layout(
-        _dar_min_plan([spec]; n = 1)); true)
+    # The zero-innovation case uses the explicit library declaration; its
+    # positive layout and density/gradient tests are in test_dar_capabilities.jl.
 
     # dar and scan innovation slices coexist under distinct names
     ar1 = parse_scan_block(quote
@@ -311,36 +285,16 @@ end
         $(loc)
         y .~ Normal.(mu, sigma)
     end, (:x, :y); conditioned = (:x, :y))
-    # capability: ordinary DAR value composition (P8 1cmodra; todo `0yc2qgp`).
-    capable(loc, decl = Expr(:block)) = @test_broken (lower_rkppl(quote
-        a ~ Normal(0, 1)
-        b ~ Normal(0, 1)
-        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
-        sigmad ~ HalfNormal(0.2)
-        sigma ~ Exponential(1)
-        $(decl)
-        $(loc)
-        y .~ Normal.(mu, sigma)
-    end, (:x, :y); conditioned = (:x, :y)); true)
-    # scaled dar (dar is beta-free — scaling is the ar shape, not dar)
-    capable(:(mu = a .+ b .* dar(beta, sigmad)))
-    # nested dar read (direct `dar(beta, sigma)` only)
-    capable(:(mu = a .+ dar(beta, sigmad) .* 2.0))
-    capable(:(mu = a .+ dar(beta, sigmad) .* x))
-    # subtracted summand (additive only)
-    capable(:(mu = a .- dar(beta, sigmad)))
+    # Ordinary scaled/nested/data/subtracted DAR values use an explicitly
+    # declared library trajectory; test_dar_capabilities.jl checks each against
+    # an independent sequential oracle, rather than minting latents in a call.
     # wrong arity / non-name args
     # refused: `dar(beta)` arity (Julia MethodError, P3)
     reject(:(mu = a .+ dar(beta)))
     # refused: `dar(beta, sigmad, sigma)` arity (Julia MethodError, P3)
     reject(:(mu = a .+ dar(beta, sigmad, sigma)))
-    capable(:(mu = a .+ dar(0.5, sigmad)))
-    # same parameter twice
-    capable(:(mu = a .+ dar(beta, beta)))
-    # dar-only predictor (a summand needs a sibling coefficient)
-    capable(:(mu = dar(beta, sigmad)))
-    # two dar calls in one predictor (one per predictor in v1)
-    capable(:(mu = a .+ dar(beta, sigmad) .+ dar(beta, sigmad)))
+    # Literal arguments, shared arguments, standalone locations and two
+    # independent declarations are covered by the explicit library fixtures.
     # A dar parameter also retains its ordinary affine reader.
     dplan = lower_rkppl(quote
         a ~ Normal(0, 1)
@@ -353,8 +307,6 @@ end
     @test :beta in Set(p.name for p in dplan.parameters)
     @test only(t for t in only(dplan.predictors).terms
         if t.kind === ContinuousTerm).options.parameter === :beta
-    # bare dar-state name (splices via its call, not as a coefficient)
-    capable(:(mu = a .+ dar(beta, sigmad) .+ dar_mu), :(dar_mu ~ Normal(0, 1)))
 
     # dar() inside a definition (referenced or not) fails closed
     # refused: `w = dar(...)` mints latent innovations through `=`; parameters come from `~` (P2, P8 1cmodra; 10gzbm9)
@@ -378,34 +330,9 @@ end
         y .~ Normal.(mu, sigma)
     end, (:y,); conditioned = (:y,))
 
-    # persistence geometry rejections (use-site spelling)
-    for beta_rhs in (:(Normal(0.5, 0.2)),
-            :(truncated(Normal(0.5, 0.2), 0, 2)),
-            :(truncated(Normal(0.5, 0.2), 0, Inf)),
-            :(Exponential(1)))
-        # capability: user-written DAR persistence priors (P8 1cmodra; todo `0yc2qgp`).
-        @test_broken (lower_rkppl(quote
-            a ~ Normal(0, 1)
-            beta ~ $(beta_rhs)
-            sigmad ~ HalfNormal(0.2)
-            sigma ~ Exponential(1)
-            mu = a .+ dar(beta, sigmad)
-            y .~ Normal.(mu, sigma)
-        end, (:y,); conditioned = (:y,)); true)
-    end
-    # scale geometry rejections (use-site spelling)
-    for sigma_rhs in (:(Normal(0, 0.2)), :(Exponential(1)),
-            :(truncated(Normal(0, 0.2), 0, 1)))
-        # capability: user-written DAR scale priors (10gzbm9 support-links; todo `0yc2qgp`).
-        @test_broken (lower_rkppl(quote
-            a ~ Normal(0, 1)
-            beta ~ truncated(Normal(0.5, 0.2), 0, 1)
-            sigmad ~ $(sigma_rhs)
-            sigma ~ Exponential(1)
-            mu = a .+ dar(beta, sigmad)
-            y .~ Normal.(mu, sigma)
-        end, (:y,); conditioned = (:y,)); true)
-    end
+    # Authored persistence and scale priors retain their stated densities in
+    # the explicit library path, including Normal, Exponential, HalfNormal,
+    # HalfCauchy and truncated-Normal priors (test_dar_capabilities.jl).
     # parameters with no `~` statement
     # refused: undeclared dar argument `q` (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -415,17 +342,9 @@ end
         mu = a .+ dar(q, sigmad)
         y .~ Normal.(mu, sigma)
     end, (:y,); conditioned = (:y,))
-    # synthesized state colliding with a user definition
-    # capability: a user name colliding with a synthesized `dar_<lhs>` state; synthesize no author-visible names (1cmodra names) (todo `0yc2qgp`)
-    @test_broken (lower_rkppl(quote
-        a ~ Normal(0, 1)
-        dar_mu ~ Normal(0, 1)
-        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
-        sigmad ~ HalfNormal(0.2)
-        sigma ~ Exponential(1)
-        mu = a .+ dar(beta, sigmad)
-        y .~ Normal.(mu, sigma)
-    end, (:y,); conditioned = (:y,)); true)
+    # Library scopes keep an authored dar_mu declaration distinct from the
+    # trajectory; the collision fixture checks both density and gradient.
+
 end
 
 # Independent oracle for the zero-started differenced-AR(1) model
