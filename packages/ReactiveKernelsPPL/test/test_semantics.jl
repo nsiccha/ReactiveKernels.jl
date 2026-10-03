@@ -126,18 +126,25 @@ end
     end
     _semantics_check(outside, data, q -> sum(logpdf.(
         Normal.(q.a .+ hcat(x1, x2) * q.b, 1), data[:y])))
-    # refused: scalar hcat intercepts are Julia dimension errors (0tz0qfu,
-    # matrix prong). The error gives both approved migration choices.
+    # refused: a scalar hcat column cannot match three-row vectors (0tz0qfu,
+    # matrix prong). Ordinary syntax lowers; binding checks its dimensions.
     bad = quote
         b[axes(X, 2)] .~ Normal.(0, 1)
         X = hcat(1, x1, x2)
         mu = X * b
         y .~ Normal.(mu, 1)
     end
-    err = try lower_rkppl(bad, data; conditioned = data); nothing catch e; e end
-    @test err isa SurfaceLoweringError
-    @test occursin("ones(length(x1))", sprint(showerror, err))
-    @test occursin("mu = a .+ X * b", sprint(showerror, err))
+    @test_throws DimensionMismatch hcat(1, x1, x2)
+    original = deepcopy(data)
+    plan = lower_rkppl(bad, data; conditioned = data)
+    err = try bind_data(plan, data); nothing catch e; e end
+    @test err isa ContractValidationError
+    @test occursin("DimensionMismatch", sprint(showerror, err))
+    @test data == original
+    # A scalar is a one-row column, so this same syntax fits singleton data.
+    singleton = Dict{Symbol,Any}(:x1 => [-1.0], :x2 => [0.5], :y => [0.2])
+    _semantics_check(bad, singleton, q -> sum(logpdf.(
+        Normal.(hcat(1, singleton[:x1], singleton[:x2]) * q.b, 1), singleton[:y])))
 end
 
 @testset "Julia inverse-link function spellings" begin
