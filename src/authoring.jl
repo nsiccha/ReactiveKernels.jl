@@ -1998,15 +1998,26 @@ _tensorized_callee_replacement(callee::Symbol) =
     callee === :getindex ? :_tensorized_getindex :
     callee === :get ? :_tensorized_get :
     callee === :dot ? :_tensorized_dot : nothing
-_tensorized_callee_replacement(callee::GlobalRef) =
-    callee.mod === Base && callee.name === :eachcol ? :_tensorized_eachcol :
-    callee.mod === Base && callee.name === :getindex ? :_tensorized_getindex :
-    callee.mod === Base && callee.name === :get ? :_tensorized_get :
-    callee.mod === Base && callee.name === :vect ? :_tensorized_vect :
-    callee.name === :dot && nameof(callee.mod) === :LinearAlgebra ?
-        :_tensorized_dot :
-    nothing
+function _tensorized_callee_replacement(callee::GlobalRef)
+    isdefined(callee.mod, callee.name) || return nothing
+    _tensorized_function_replacement(getglobal(callee.mod, callee.name))
+end
+_tensorized_function_replacement(fn) = nothing
+function _tensorized_function_replacement(fn::Function)
+    # A resolved call (including an imported binding or alias) names the
+    # same function as its bare spelling. Reuse that lowering without
+    # rewriting a caller-owned function that merely has the same name.
+    parentmodule(fn) === Base && return _tensorized_callee_replacement(nameof(fn))
+    fn === dot ? :_tensorized_dot : nothing
+end
 _tensorized_callee_replacement(callee) = nothing
+function _tensorized_callee_replacement(callee, mod::Union{Module,Nothing})
+    callee isa GlobalRef && return _tensorized_callee_replacement(callee)
+    mod === nothing && return _tensorized_callee_replacement(callee)
+    fn = _kernel_resolve_binding(mod, callee)
+    fn === nothing ? _tensorized_callee_replacement(callee) :
+        _tensorized_function_replacement(fn)
+end
 
 # Factorization callees whose tensorized result passes through
 # `_tensorized_factorization` (core.jl).  The call itself is kept, so this
@@ -2701,7 +2712,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
             lowered = _kernel_tensorized_generator_sum(reduction, known, mod, scope)
             lowered === nothing || return lowered
         end
-        replacement = _tensorized_callee_replacement(ex.args[1])
+        replacement = _tensorized_callee_replacement(ex.args[1], mod)
         callee = replacement === nothing ?
             _kernel_tensorized_callee(ex.args[1], known, mod) :
             GlobalRef(@__MODULE__, replacement)
@@ -2903,7 +2914,7 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
             return generated_spec === nothing ? callee : generated_spec
         end
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
-           (!tensorize || (_tensorized_callee_replacement(callee) === nothing &&
+           (!tensorize || (_tensorized_callee_replacement(callee, mod) === nothing &&
                            !_kernel_callee_has_traced_method(callee, mod))) &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
