@@ -3574,8 +3574,11 @@ Values with no data anchor (an intercept or dar path) use their response
 consumers. No dimension is inferred from the total of unrelated axes."""
 function _value_rows(plan::StructuralPlan, name::Symbol)
     haskey(plan.columns, name) && return _column_nrows(plan.columns[name])
+    modelvals, _ = _axis_exempt_columns(plan)
+    managed = _mi_managed_columns(plan)
     perobs = Set{Symbol}(k for (k, v) in plan.columns
-        if v isa Union{AbstractVector,AbstractMatrix} && k ∉ _mi_managed_columns(plan))
+        if v isa Union{AbstractVector,AbstractMatrix} &&
+            k ∉ modelvals && k ∉ managed)
     reads = _response_reads(plan, name, perobs)
     ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
     if isempty(ns)
