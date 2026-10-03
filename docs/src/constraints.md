@@ -186,7 +186,14 @@ and lock the one Reactant 0.2.289 lifted:
   unrolled per lane, succeeded). The boundary concerned only branches whose
   condition reads a live value: a condition on bound data is split away
   during preparation and never reaches the backend.
-  Default optimized reverse still expands small lazy batches into one branch
+  A plate branch whose condition reads only shared scalar or `Ref` operands
+  now lowers to one lazy decision around the batch, using its authored branch
+  dependency metadata. Its selected arm retains the original lane domain,
+  including constant fallbacks and otherwise unused lane inputs. Ordinary
+  optimized primal and reverse have matching complete operation inventories
+  at three, seven and eleven lanes; no inactive arithmetic is evaluated.
+  Lane-dependent conditions still reach the backend's small-batch boundary.
+  Default optimized reverse expands those small lazy batches into one branch
   region per lane instead of retaining the batch loop:
   `repro_reactant_lazy_batch_growth.jl` has correct values and gradients at
   two and five lanes, but different operation inventories. The fixed-structure
@@ -265,6 +272,31 @@ and lock the one Reactant 0.2.289 lifted:
   differentiates it. A bound tuple or named tuple then crosses the
   differentiated call as one operand per array leaf. Helpers inside a
   parameter-dependent function remain the backend's limitation.
+- Native Enzyme 0.13.209 on Julia 1.10.12 also rejects an ordinary untyped
+  comprehension whose generator captures both an active array and a constant
+  floating-point array: `repro_enzyme_generator_const_array_capture.jl`
+  reproduces the failure with Enzyme only. Typed Julia IR constructs the mixed
+  closure and calls `Base.collect(::Generator)`; the rejected store is the
+  constant array pointer into that closure. This is distinct from returning
+  data through a non-inlined helper. Merely inlining the reader, replacing
+  `eachindex(idx)` with dynamic `1:length(idx)`, or using `map`/`zip` still
+  fails. Explicitly typed comprehensions, an explicit generator with a
+  call-site-inlined `collect`, and a fresh-buffer runtime loop pass ordinary
+  reverse for Float32 and Float64, including empty inputs. A typed
+  comprehension performs Julia's ordinary element conversion, so it is only
+  an equivalent control when that element type is intended. PPL's ordinary
+  and array-bearing prepared-input readers keep their authored primal and
+  remain native reverse capability gaps in `test_native_generator_capture.jl`.
+  No consumer function, activity configuration or derivative rule is replaced.
+  A six-line isolated Enzyme compiler prototype marks
+  `Base.collect(::Generator)` for inlining before activity analysis and makes
+  the byte-unchanged ordinary and prepared readers pass standard reverse,
+  with runtime activity disabled. That prototype is not in released Enzyme
+  and still needs broader compiler validation. The repair belongs in the
+  backend compiler; related
+  [Enzyme issue #2386](https://github.com/EnzymeAD/Enzyme.jl/issues/2386)
+  tracks comprehension activity analysis. This evidence and boundary note are
+  interim tracking, not completion of that capability.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later
