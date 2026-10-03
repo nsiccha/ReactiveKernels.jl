@@ -29,14 +29,14 @@ function _mv_solve_ops(hlo)
 end
 
 function _mv_generated_measure(built, bound, u)
-    post = prepare_query(built, bound, :sampler; on_error = :ignore)
+    post = prepare_query(built, bound, :sampler)
     native = post(u)
     ru = Reactant.to_rarray(u)
     hlo = repr(Reactant.@code_hlo optimize = false post(ru))
     compiled = Reactant.@compile post(ru)
     @test Float64(compiled(ru)) ≈ native rtol = 1e-10
     sampler = prepare_sampler(built, bound, u;
-        backend = AutoEnzyme(; mode = Enzyme.Reverse), on_error = :ignore)
+        backend = AutoEnzyme(; mode = Enzyme.Reverse))
     g = similar(u)
     value, _ = sampler_value_and_gradient!(sampler, g, u)
     @test value ≈ native rtol = 1e-12
@@ -82,11 +82,52 @@ end
     end
 end
 
+@testset "compiled factor and covariance errors remain runtime checks" begin
+    X = [.2 -.3; .1 .4; -.5 .3]
+    mu = [.1, -.2]
+    F = [.9 0.; .15 1.1]
+    for (spec, covariance) in ((_mv_checked_cholesky_test, false),
+                               (_mv_checked_covariance_test, true))
+        factor = covariance ? F * F' : F
+        kernel = prepare(spec)
+        ignored = prepare(spec; on_error = :ignore)
+        rx, rm, rf = Reactant.to_rarray(X), Reactant.to_rarray(mu), Reactant.to_rarray(factor)
+        hlo = repr(Reactant.@code_hlo optimize = false kernel(rx, rm, rf))
+        ignored_hlo = repr(Reactant.@code_hlo optimize = false ignored(rx, rm, rf))
+        @test occursin("reactant_julia_callback", hlo)
+        @test !occursin("reactant_julia_callback", ignored_hlo)
+        compiled = Reactant.@compile kernel(rx, rm, rf)
+        grad(X, mu, factor) = Enzyme.gradient(Enzyme.Reverse, kernel, X, mu, factor)
+        compiled_grad = Reactant.@compile grad(rx, rm, rf)
+        reference = kernel(X, mu, factor)
+        @test ignored(X, mu, factor) == reference
+        bad_diagonal = copy(factor)
+        bad_diagonal[1, 1] = 0.0
+        bad_triangle = copy(factor)
+        bad_triangle[1, 2] += 0.02
+        bad_domain = covariance ? [1. 2.; 2. 1.] : [.9 0.; .15 NaN]
+        for bad in (bad_diagonal, bad_triangle, bad_domain)
+            # refused: factors must have a positive diagonal and zero upper
+            # triangle; covariances must be symmetric positive definite.
+            @test_throws ArgumentError kernel(X, mu, bad)
+            rbad = Reactant.to_rarray(bad)
+            # Reactant propagates a callback's exception as its runtime error.
+            @test_throws Reactant.XLA.ReactantInternalError compiled(rx, rm, rbad)
+            @test_throws Reactant.XLA.ReactantInternalError compiled_grad(rx, rm, rbad)
+            @test Array(rbad) == bad || isequal(Array(rbad), bad)
+            @test Float64(compiled(rx, rm, rf)) ≈ reference rtol = 1e-10
+        end
+        @test Array(rx) == X && Array(rm) == mu && Array(rf) == factor
+        @test_throws DimensionMismatch kernel(X, mu, zeros(3, 3))
+        @test_throws DimensionMismatch kernel(X, zeros(3), factor)
+    end
+end
+
 _mv_solve_gradient(k, X, F) = Enzyme.gradient(Enzyme.Reverse, k, X, F)
 
-@testset "visible multivariate assertions with opt-in compiled execution" begin
+@testset "multivariate validation with default compiled execution" begin
     for spec in (_mv_checked_cholesky_test, _mv_checked_covariance_test)
-        kernel = prepare(spec; on_error = :ignore)
+        kernel = prepare(spec)
         maps, reverse_maps = [], []
         for (K, G) in ((2, 3), (5, 8), (8, 13))
             X = [.2sin(i + 3j) for i in 1:G, j in 1:K]
@@ -97,10 +138,6 @@ _mv_solve_gradient(k, X, F) = Enzyme.gradient(Enzyme.Reverse, k, X, F)
             reference = sum(logpdf(MvNormal(mu, Sigma), X[g, :]) for g in 1:G)
             @test kernel(X, mu, factor) ≈ reference rtol = 1e-12
             rx, rm, rf = Reactant.to_rarray(X), Reactant.to_rarray(mu), Reactant.to_rarray(factor)
-            if K == 2
-                ordinary = prepare(spec)
-                @test_throws "native execution only" Reactant.compile(ordinary, (rx, rm, rf))
-            end
             hlo = repr(Reactant.@code_hlo optimize = false kernel(rx, rm, rf))
             push!(maps, _mv_solve_ops(hlo))
             compiled = Reactant.@compile kernel(rx, rm, rf)

@@ -79,7 +79,7 @@ _arg_rows(a::_PerSlice) = _slice_rows(a.orientation, a.value)
     return nothing
 end
 
-# ── multivariate normal slices (native) ──────────────────────────────
+# ── multivariate normal slices ───────────────────────────────────────
 
 # Forward substitution across every slice at once. Keep the margin axis
 # leading so a traced row read/write uses the retained loop's storage layout.
@@ -108,12 +108,12 @@ end
         "have length $k, but the factor has size $(size(F))"))
     logdet = 0.0
     for i in 1:k
-        F[i, i] > 0 || throw(ArgumentError("MvNormalCholesky factor has a " *
-            "nonpositive diagonal entry F[$i, $i]"))
+        ReactiveKernels._runtime_check(F[i, i] > 0,
+            ArgumentError("MvNormalCholesky factor has a nonpositive diagonal entry"))
         for j in 1:k
             if j > i
-                iszero(F[i, j]) || throw(ArgumentError("MvNormalCholesky factor " *
-                    "is not lower triangular: F[$i, $j] = $(F[i, j])"))
+                ReactiveKernels._runtime_check(iszero(F[i, j]),
+                    ArgumentError("MvNormalCholesky factor is not lower triangular"))
             end
         end
         logdet += log(F[i, i])
@@ -134,8 +134,8 @@ end
         end
     end
     if i == j
-        s > 0 || throw(ArgumentError("MvNormal covariance is not " *
-            "positive definite (pivot $i)"))
+        ReactiveKernels._runtime_check(s > 0,
+            ArgumentError("MvNormal covariance is not positive definite"))
         sqrt(s)
     else
         s / F[j, j]
@@ -150,10 +150,8 @@ end
     for i in 1:k
         for j in 1:k
             if j < i
-                abs(Sigma[i, j] - Sigma[j, i]) <= 1e-8 ||
-                    throw(ArgumentError("MvNormal covariance is not symmetric: " *
-                        "Sigma[$i, $j] = $(Sigma[i, j]), Sigma[$j, $i] = " *
-                        "$(Sigma[j, i])"))
+                ReactiveKernels._runtime_check(abs(Sigma[i, j] - Sigma[j, i]) <= 1e-8,
+                    ArgumentError("MvNormal covariance is not symmetric"))
             end
         end
         for j in 1:k
@@ -174,9 +172,6 @@ end
 end
 
 @traceable function _mvnormal_cholesky_slices_logpdf(o, B, mu, F)
-    ReactiveKernels._dynamic_tensorized_marker((B, mu, F)) === nothing ||
-        throw(ArgumentError("MvNormalCholesky slice priors support native " *
-            "execution only"))
     groups, k = _slice_count(o, B), _slice_length(o, B)
     _check_slice_vector_arg("the MvNormalCholesky mean", mu, groups, k)
     return _mvnormal_slices_core(o, B, mu, F, _cholesky_factor_logdet(F, k))
@@ -188,14 +183,11 @@ end
 Σ over the slices `x_g` of `B` (orientation `o`) of
 `logpdf(MvNormal(mu_g, F * F'), x_g)`, `F` the lower-triangular Cholesky
 factor of the covariance (Stan's `multi_normal_cholesky`). `mu` is a
-shared K-vector or a [`_PerSlice`](@ref) argument. Native execution checks
-the factor; compilation requires explicit `on_error = :ignore` preparation.
+shared K-vector or a [`_PerSlice`](@ref) argument. Native and compiled
+execution both check the factor at runtime.
 """ _mvnormal_cholesky_slices_logpdf
 
 @traceable function _mvnormal_slices_logpdf(o, B, mu, Sigma)
-    ReactiveKernels._dynamic_tensorized_marker((B, mu, Sigma)) === nothing ||
-        throw(ArgumentError("MvNormal slice priors support native execution " *
-            "only"))
     groups, k = _slice_count(o, B), _slice_length(o, B)
     _check_slice_vector_arg("the MvNormal mean", mu, groups, k)
     F = _covariance_cholesky(Sigma, k)
@@ -211,8 +203,8 @@ end
 
 Σ over the slices `x_g` of `B` of `logpdf(MvNormal(mu_g, Sigma), x_g)`
 for a symmetric positive-definite covariance `Sigma`, through its lower
-Cholesky factor. Native execution checks the covariance; compilation requires
-explicit `on_error = :ignore` preparation.
+Cholesky factor. Native and compiled execution both check the covariance
+at runtime.
 """ _mvnormal_slices_logpdf
 
 # ── simplex and ordered slices (vectorized) ──────────────────────────

@@ -5,6 +5,18 @@ import Reactant
 import DifferentiationInterface
 import LinearAlgebra
 
+function ReactiveKernels._runtime_check(
+        valid::Reactant.TracedRNumber{Bool}, error::Exception)
+    # Only the Boolean crosses this runtime boundary. Passing active
+    # diagnostic values would require an adjoint for a host callback.
+    # A valid check stays on the device. Only the failing arm calls the host,
+    # preserving lazy error execution in primal and ordinary reverse mode.
+    Reactant.@trace if !valid
+        Reactant.Ops.julia_callback(ReactiveKernels._RuntimeCheckCallback(error), (), valid)
+    end
+    nothing
+end
+
 function __init__()
     # This function emits an MLIR batch. Its host samples must remain host
     # values; only the authored cell invoked by make_mlir_fn is rewritten.

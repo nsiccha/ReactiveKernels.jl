@@ -7,6 +7,11 @@
 @inline _ignored_throw_call(::Val{:tensorized}, f, args::Vararg{Any,N}) where {N} =
     traced(f, args...)
 
+# These are explicit captured checks, so the existing opt-in policy strips
+# them as it strips a captured throw. Ordinary preparation retains them.
+@inline _ignored_throw_call(::Val{:native}, ::typeof(_runtime_check), valid, error) = nothing
+@inline _ignored_throw_call(::Val{:tensorized}, ::typeof(_runtime_check), valid, error) = nothing
+
 struct _IgnoredThrowFunction{F}
     f::F
 end

@@ -24,7 +24,7 @@ using ReactiveKernelsPPL: _SliceRows, _SliceCols, _SliceWhole, _PerSlice,
         spec = permean ? (covariance ? _mv_permean_covariance : _mv_permean_cholesky) :
                          (covariance ? _mv_orientation_covariance : _mv_orientation_cholesky)
         factor = covariance ? F * F' : F
-        kernel = prepare(spec; bound = (; o), on_error = :ignore)
+        kernel = prepare(spec; bound = (; o))
         rb, rm, rf = Reactant.to_rarray(B), Reactant.to_rarray(mu), Reactant.to_rarray(factor)
         compiled = Reactant.@compile kernel(rb, rm, rf)
         @test Float64(compiled(rb, rm, rf)) ≈ kernel(B, mu, factor) rtol = 1e-10
@@ -47,7 +47,7 @@ end
         spec = permean ? (covariance ? _mv_permean_covariance : _mv_permean_cholesky) :
                          (covariance ? _mv_orientation_covariance : _mv_orientation_cholesky)
         factor = covariance ? F * F' : F
-        kernel = prepare(spec; bound = (; o), on_error = :ignore)
+        kernel = prepare(spec; bound = (; o))
         @test kernel(B, mu, factor) == 0.0
         native = Enzyme.gradient(Enzyme.Reverse, kernel, B, mu, factor)
         @test all(g -> all(iszero, g), native)
