@@ -114,6 +114,27 @@ including inactive branches and empty or ragged cases where supported. A small
 Julia statement count alone does not establish this: tracing can still expand
 a host loop.
 
+Compare retained control-flow regions, nonlinear work and indexing across all
+tested data sizes, and keep complete optimized operation inventories as
+diagnostics. Shape specialization may share constants, simplify scalar
+arithmetic or simplify singleton derivative tapes, including an identity
+broadcast of one scalar tape index, so small shapes need not
+have identical raw inventories. Complete inventories must stop growing as
+data lengths increase; these bounded simplifications must preserve one
+authored loop and branch body at every size.
+
+For compiled acceptance inspect both optimized MLIR and the HLO of the actual
+default executable. XLA may remove singleton loops, turn pure lazy branches
+into eager selections, or move invariant work out of a zero-trip body after
+MLIR checks pass. Verify retained executable regions and inactive arithmetic
+as well as operation-growth diagnostics.
+
+Default XLA vector reductions can add reduction stages as array lengths grow
+even when optimized MLIR retains one vector-reduction expression. This separate
+complete-inventory growth limit is isolated by
+`benchmark/repro_reactant_vector_reduction_growth.jl`; retaining scalar loops
+and lazy branches alone does not satisfy it.
+
 These are required constraints, not a claim that every existing path already
 conforms. Every functional stateful method with authored control flow lowers
 through the retained control program, and host-drained observational records
