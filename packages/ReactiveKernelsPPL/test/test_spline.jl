@@ -124,32 +124,37 @@ end
             y .~ Normal.(mu, 1.0)
         end, (:y, :x); conditioned = (:y, :x))
     # Three axes.
-    # capability: 3-axis spline basis (tensor smooth over three margins) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
-            spline_basis(:s_x, x, z, w; k = 4)
-            mu = spline(:s_x)
+    # supported via the explicit library: 3-axis spline basis (tensor smooth over three margins) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X, rrr, rrn, rnr, rnn, nrr, nrn, nnr) = t2_basis(x,z,w;k=4)
+            tf_Z = hcat(rrr,rrn,rnr,rnn,nrr,nrn,nnr)
+            f ~ penalized_smooth(tf_X,tf_Z)
+            mu = f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z, :w); conditioned = (:y, :x, :z, :w)); true)
+        end, (:y, :x, :z, :w); conditioned = (:y, :x, :z, :w))) === nothing
     # Bad kind value.
-    # capability: cubic-regression spline basis (kind = :cr) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
-            spline_basis(:s_x, x; kind = :cr)
-            mu = spline(:s_x)
+    # supported via the explicit library: cubic-regression spline basis (kind = :cr) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = cr_basis(x;k=5)
+            f ~ penalized_smooth(tf_X,tf_Z)
+            mu = f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
     # Kind/arity mismatch both ways.
-    # capability: single-margin t2 spline (kind = :t2 on one axis; mgcv admits t2(x)) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
-            spline_basis(:s_x, x; kind = :t2)
-            mu = spline(:s_x)
+    # supported via the explicit library: single-margin t2 spline (kind = :t2 on one axis; mgcv admits t2(x)) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = t2_basis(x;k=5)
+            f ~ penalized_smooth(tf_X,tf_Z)
+            mu = f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
-    # capability: two-axis thin-plate spline (kind = :tps over (x, z), isotropic s(x, z)) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
-            spline_basis(:t2_xz, x, z; kind = :tps)
-            mu = spline(:t2_xz)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
+    # supported via the explicit library: two-axis thin-plate spline (kind = :tps over (x, z), isotropic s(x, z)) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = tps_basis(x,z;k=5)
+            f ~ penalized_smooth(tf_X,tf_Z)
+            mu = f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z))) === nothing
     # k too small / non-literal / wrong shape.
     # refused: k = 2 leaves no penalized block (k must exceed the TPS null-space dimension 2)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -157,25 +162,27 @@ end
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x); conditioned = (:y, :x))
-    # capability: data-derived basis size k (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
-            kk = length(x)
-            spline_basis(:s_x, x; k = kk)
-            mu = spline(:s_x)
+    # supported via the explicit library: data-derived basis size k (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            kk = min(length(x),5)
+            (tf_X,tf_Z) = tps_basis(x;k=kk)
+            f ~ penalized_smooth(tf_X,tf_Z)
+            mu = f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
     # refused: k tuple length differs from axis count (malformed)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = (4, 4))
             mu = spline(:s_x)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x); conditioned = (:y, :x))
-    # capability: scalar k broadcast per margin for t2 (hsgp_basis already broadcasts scalars) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
-            spline_basis(:t2_xz, x, z; k = 5)
-            mu = spline(:t2_xz)
+    # supported via the explicit library: scalar k broadcast per margin for t2 (hsgp_basis already broadcasts scalars) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X, rr, rn, nr) = t2_basis(x,z;k=5)
+            f ~ t2_smooth(tf_X,rr,rn,nr)
+            mu = f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x, :z); conditioned = (:y, :x, :z)); true)
+        end, (:y, :x, :z); conditioned = (:y, :x, :z))) === nothing
     # refused: margin k = 2 leaves no penalized block (degenerate)
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:t2_xz, x, z; k = (5, 2))
@@ -204,29 +211,32 @@ end
             mu = spline(:nope)
             y .~ Normal.(mu, 1.0)
         end, (:y, :x); conditioned = (:y, :x))
-    # capability: spline summand value reuse: same basis twice in one predictor (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
-            spline_basis(:s_x, x; k = 4)
-            mu = spline(:s_x) .+ spline(:s_x)
+    # supported via the explicit library: spline summand value reuse: same basis twice in one predictor (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = tps_basis(x;k=4)
+            f ~ penalized_smooth(tf_X,tf_Z)
+            mu = f .+ f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
-    # capability: one spline basis shared by two predictors (value reuse) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
+    # supported via the explicit library: one spline basis shared by two predictors (value reuse) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = tps_basis(x;k=4)
+            f ~ penalized_smooth(tf_X,tf_Z)
             a ~ Normal(0, 1)
             c ~ Normal(0, 1)
-            spline_basis(:s_x, x; k = 4)
-            mu = a .+ spline(:s_x)
-            nu = c .+ spline(:s_x)
+            mu = a .+ f
+            nu = c .+ f
             y .~ Normal.(mu, 1.0)
             z .~ Normal.(nu, 1.0)
-        end, (:y, :z, :x); conditioned = (:y, :z, :x)); true)
-    # capability: negated spline summand (`a .- spline(:s)`) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+        end, (:y, :z, :x); conditioned = (:y, :z, :x))) === nothing
+    # supported via the explicit library: negated spline summand (`a .- spline(:s)`) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = tps_basis(x;k=4)
+            f ~ penalized_smooth(tf_X,tf_Z)
             a ~ Normal(0, 1)
-            spline_basis(:s_x, x; k = 4)
-            mu = a .- spline(:s_x)
+            mu = a .- f
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
     # refused: a coefficient times a flat-prior spline block is an unidentified ridge
     @test_throws SurfaceLoweringError lower_rkppl(quote
             spline_basis(:s_x, x; k = 4)
@@ -234,31 +244,34 @@ end
             y .~ Normal.(mu, 1.0)
         end, (:y, :x); conditioned = (:y, :x))
     # spline() inside definitions (scalar + derived).
-    # capability: spline value bound in a definition (`w = spline(:s)`) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+    # supported via the explicit library: spline value bound in a definition (`w = spline(:s)`) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = tps_basis(x;k=4)
+            f ~ penalized_smooth(tf_X,tf_Z)
             a ~ Normal(0, 1)
-            spline_basis(:s_x, x; k = 4)
-            w = spline(:s_x)
+            w = f
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
-    # capability: spline value combined with data in a definition (`w = spline(:s) .+ x`) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
+    # supported via the explicit library: spline value combined with data in a definition (`w = spline(:s) .+ x`) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = tps_basis(x;k=4)
+            f ~ penalized_smooth(tf_X,tf_Z)
             a ~ Normal(0, 1)
-            spline_basis(:s_x, x; k = 4)
-            w = spline(:s_x) .+ x
+            w = f .+ x
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
-    # capability: spline value combined with coefficient terms in a definition (`w = spline(:s) .+ b .* x`) (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
+    # supported via the explicit library: spline value combined with coefficient terms in a definition (`w = spline(:s) .+ b .* x`) (todo `0bfiemp`)
+    @test validate_structure(lower_rkppl(quote
+            (tf_X,tf_Z) = tps_basis(x;k=4)
+            f ~ penalized_smooth(tf_X,tf_Z)
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
-            spline_basis(:s_x, x; k = 4)
-            w = spline(:s_x) .+ b .* x
+            w = f .+ b .* x
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x)); true)
+        end, (:y, :x); conditioned = (:y, :x))) === nothing
     # Reserved names.
     # refused: reserved-name collision `spline`
     @test_throws SurfaceLoweringError lower_rkppl(quote

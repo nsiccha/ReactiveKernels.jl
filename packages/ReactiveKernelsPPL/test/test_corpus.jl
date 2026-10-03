@@ -143,6 +143,11 @@ end
     other = ReactiveKernelsPPL._with(response; threshold_effects = :other_effects)
     @test occursin("threshold_effects=:effects", sprint(_canon, effects))
     @test sprint(_canon, effects) != sprint(_canon, other)
+    @test !occursin("mixture_trials=", sprint(_canon, response))
+    trials = ReactiveKernelsPPL._with(response; mixture_trials = Any[2, 3])
+    other_trials = ReactiveKernelsPPL._with(response; mixture_trials = Any[2, 4])
+    @test occursin("mixture_trials=[2 3]", sprint(_canon, trials))
+    @test sprint(_canon, trials) != sprint(_canon, other_trials)
 end
 
 @testset "corpus drift guard" begin
