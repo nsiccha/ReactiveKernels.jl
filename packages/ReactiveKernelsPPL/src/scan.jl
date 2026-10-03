@@ -402,18 +402,11 @@ _scan_maxlag(step, states, loopvar) =
 # - a non-centered scan writes every carried array deterministically, has at
 #   least one per-step innovation, and its latents (sampled seeds,
 #   innovations) have real support;
-# - no step reads the loop index directly.
+# The loop index is an ordinary per-step value.
 const _SCAN_LATENT_FAMILIES = (:normal, :cauchy, :student_t, :laplace, :logistic)
 
 function _scan_shape_gap(s::ScanSpec)
     who = "scan $(join(s.states, ", "))"
-    for st in s.step
-        reads = st.kind === :sample ? st.args : Any[st.expr]
-        any(r -> _scan_mentions(r, s.loopvar, s.states), reads) &&
-            return "$who: a " *
-            "step uses the loop index `$(s.loopvar)` directly — not supported " *
-            "yet (read carried arrays, locals and scalars)"
-    end
     carried = [st for st in s.step if st.indexed]
     if !_is_noncentered_scan(s)
         length(s.states) == 1 || return "$who: a centered scan " *
@@ -465,15 +458,18 @@ _scan_mentions(ex, nm::Symbol, states) = ex === nm ||
 # Seeds and steps read scalars (parameters, definitions, literals); a data
 # column read per step (`y[t]`) is not supported yet.
 function _screen_scan(s::ScanSpec, data)
-    exprs = Any[]
+    exprs = Tuple{Any,Set{Symbol}}[]
     for f in s.setup
-        f.kind === :sample ? append!(exprs, f.args) : push!(exprs, f.expr)
+        append!(exprs, ((a, Set{Symbol}(data)) for a in
+            (f.kind === :sample ? f.args : Any[f.expr])))
     end
+    stepdata = setdiff(Set{Symbol}(data), Set([s.loopvar]))
     for st in s.step
-        st.kind === :sample ? append!(exprs, st.args) : push!(exprs, st.expr)
+        append!(exprs, ((a, stepdata) for a in
+            (st.kind === :sample ? st.args : Any[st.expr])))
     end
-    for ex in exprs
-        d = _scan_data_read(ex, data)
+    for (ex, visible_data) in exprs
+        d = _scan_data_read(ex, visible_data)
         d === nothing || _scan_fail("scan $(join(s.states, ", ")) reads the " *
             "data column `$(d)` — data-varying seeds and steps are not " *
             "supported yet (a scan reads carried arrays, locals and scalars)")

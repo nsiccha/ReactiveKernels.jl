@@ -733,13 +733,14 @@ end
             eps ~ Normal(0, 1)
             h[t] = phi * h[t - 1] + eps
         end))
-    # the loop index read directly
-    gap("uses the loop index",
+    # The loop index is a numeric per-step value.
+    indexed = build_block(
         :(h[1] ~ Normal(0, 1)),
         :(for t in 2:T
             eps ~ Normal(0, 1)
             h[t] = phi * h[t - 1] + eps * t
         end))
+    @test any(e -> e.kind === :scan, indexed.layout.entries)
     # a fully deterministic recurrence (no per-step innovation)
     gap("needs a per-step innovation",
         :(h[1] ~ Normal(0, 1)),

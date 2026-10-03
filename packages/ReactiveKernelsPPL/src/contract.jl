@@ -6207,28 +6207,8 @@ function _validate_vector_parameters(plan::StructuralPlan)
             ":simplex_dirichlet vector parameter, got $(p.family)")
         push!(refs[rp.phi], rp.predictor)
     end
-    # Definitions read vector parameters as whole values (functions as
-    # values); definitions and construct links read the same declared value.
-    defreads = Set{Symbol}()
-    for a in plan.assignments
-        _expr_value_symbols(a.expr, defreads)
-    end
-    for d in plan.derived
-        _expr_value_symbols(d.expr, defreads)
-    end
-    for p in (plan.parameters..., plan.vector_parameters..., plan.array_parameters...)
-        for value in values(p.args)
-            _expr_value_symbols(value, defreads)
-        end
-    end
-    for p in plan.vector_parameters
-        got = refs[p.name]
-        isempty(got) && p.name ∉ defreads &&
-            p.family ∉ _JOINT_FACTOR_FAMILIES && _fail(p.label,
-            "vector parameter $(p.name) unused by any response, " *
-            "monotonic term, joint-factor link, R2D2 prior, " *
-            "or definition")
-    end
+    # Every declaration contributes its prior, including an otherwise
+    # unused latent. Its extent must resolve from the declaration at bind.
     return nothing
 end
 
@@ -10971,7 +10951,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             push!(out_v, _with(p; size = want))
         elseif p.family === :vector_normal && p.size !== nothing
             # A plain vector with a concrete structural size (read whole
-            # by definitions) passes through; structure proved its use.
+            # by definitions or unused) retains its declared extent.
             push!(out_v, p)
         elseif p.family === :ordered_normal && p.size !== nothing
             # A free-standing ordered vector (`c ~ Ordered(Normal(0, 1), 3)`
@@ -10987,7 +10967,8 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "length $want")
             push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
         else
-            _fail(p.label, "internal: vector parameter unlinked at bind")
+            _fail(p.label, "vector parameter $(p.name) needs a declared extent " *
+                "or a linked response from which to infer it")
         end
     end
     return out_r, out_v

@@ -1788,9 +1788,11 @@ function _vector_transform_statements(e::LayoutEntry)
     K = e.size + 1
     K == 1 && return Expr[:($(e.name)::AbstractVector{Float64} = ones(1))]
     z, l, lr = _vector_z(e), _vector_l(e), _vector_lr(e)
+    # The packed port is already Float64. Materialize its slice once;
+    # a nested Float64 broadcast over a SubArray fails Reactant reindexing.
     return Expr[
-        :($z::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(Float64.(
-            view(unconstrained, $lo:$hi)) .+ log.($K .- (1:$(K - 1))))))),
+        :($z::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(
+            unconstrained[$lo:$hi] .+ log.($K .- (1:$(K - 1))))))),
         :($l::AbstractVector{Float64} = log1p.(-$z)),
         :($lr::AbstractVector{Float64} = cumsum(vcat(0.0, $l))),
         :($(e.name)::AbstractVector{Float64} = exp.($lr) .* vcat($z, ones(1))),

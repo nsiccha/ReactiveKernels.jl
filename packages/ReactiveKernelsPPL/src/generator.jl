@@ -4152,9 +4152,6 @@ function _scan_translate_step(ex, s::ScanSpec, env, refs::Set{Symbol}, scalars)
     where = _scan_where(s)
     if ex isa Symbol
         haskey(env.locals, ex) && return env.locals[ex]
-        ex === s.loopvar && throw(ContractValidationError(
-            "$where: a step uses the loop index `$(s.loopvar)` directly — not " *
-            "supported yet"))
         ex in s.states && throw(ContractValidationError(
             "$where: bare read of the carried array `$(ex)` — read the " *
             "backward lag `$(ex)[$(s.loopvar) - 1]`"))
@@ -4190,6 +4187,7 @@ end
 function _scan_step_block(s::ScanSpec, innov, output::Symbol, scalars)
     refs = Set{Symbol}()
     env = (; locals = Dict{Symbol,Any}(), current = Dict{Symbol,Symbol}())
+    env.locals[s.loopvar] = :_ppl_index
     for (j, st) in enumerate(innov)
         env.locals[st.target] = Symbol(:_ppl_e, j)
     end
@@ -4260,6 +4258,9 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
         end
         seqs = Any[:(view($zname, $(first(r)):$(last(r)))) for r in ranges]
         elems = Symbol[Symbol(:_ppl_e, j) for j in eachindex(innov)]
+        # The index is a sequence port, read once per retained scan step.
+        push!(seqs, :(collect($(s.lo):$T)))
+        push!(elems, :_ppl_index)
         for a in s.states
             body, refs = _scan_step_block(s, innov, a, scalars)
             lambda = Expr(:->, Expr(:tuple, :_ppl_carry, elems..., refs...),
@@ -4305,7 +4306,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
             _scan_cell_caps!(caps, a)
         end
         for c in caps
-            c in scalars || throw(ContractValidationError(
+            c === s.loopvar || c in scalars || throw(ContractValidationError(
                 "$(_scan_where(s)): the innovation `$(st.target)` reads " *
                 "`$(c)`, which is not a scalar parameter or definition " *
                 "(per-step innovation scales are not supported yet)"))
@@ -4319,7 +4320,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
         inputs = Any[:(view($zname, $(first(ranges[j])):$(last(ranges[j]))))]
         capmap = Dict{Symbol,Symbol}()
         for c in caps
-            push!(inputs, c)
+            push!(inputs, c === s.loopvar ? :(collect($(s.lo):$T)) : c)
             capmap[c] = _dovar(length(inputs))
         end
         cell = _family_logpdf_expr(st.family,
@@ -4384,12 +4385,9 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         for a in lagargs
             _scan_cell_caps!(caps, a)
         end
-        sc.loopvar in caps && throw(ContractValidationError(
-            "[generator] scan $(state): the recurrence uses the loop index " *
-            "`$(sc.loopvar)` directly — not supported in slice 1"))
         capmap = Dict{Symbol,Symbol}()
         for c in caps
-            push!(inputs, c)
+            push!(inputs, c === sc.loopvar ? :(collect($(sc.lo):$T)) : c)
             capmap[c] = _dovar(length(inputs))
         end
         cellargs = [_subst_syms(a, capmap) for a in lagargs]
