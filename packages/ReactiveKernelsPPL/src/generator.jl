@@ -1278,16 +1278,18 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
         append!(stmts, _response_likelihood_stmts(r, plan))
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
-        if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.n_levels > 1 && _response_rows(plan, r) > 0
+        if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.evidence.kind === :none &&
+                r.n_levels > 1 && _response_rows(plan, r) > 0
             # Stopping-ratio emits one lane per visited stage. Gather the
             # prefix sum at each observation's last stage, then difference.
             ends = Symbol(pw, :_ends)
             cumulative = Symbol(pw, :_cumulative)
             values = Symbol(pw, :_observations)
-            observed = r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) : r.response
+            observed = r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) :
+                r.mi_jobs !== nothing ? Symbol(:_ppl_mi_response_, r.label) : r.response
             push!(stmts, :($ends = cumsum(min.($observed, $(r.n_levels-1)))),
                 :($cumulative = cumsum($pw)[$ends]),
-                :($values = $cumulative .- vcat(0.0, $cumulative[1:end-1])))
+                :($values = $cumulative .- vcat(0.0, $cumulative)[1:end-1]))
             pw = values
         end
         push!(points, r.response => pw)
@@ -1820,6 +1822,9 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     stmts = _response_likelihood_stmts_full(r, plan)
     r.range isa Expr && return _ranged_response_stmts(r, plan, stmts)
     r.mi_jobs === nothing && return stmts
+    if r.family === OrdinalFam && r.ordinal_structure === :stopping
+        return _mi_stopping_response_stmts(r, plan, stmts)
+    end
     _is_glm_family(r.family) && r.evidence.kind === :none && return stmts # fused design selects Jobs before eta
     pre = Expr[]
     jobs = r.mi_jobs
@@ -1852,6 +1857,44 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         end
     end
     return Expr[stmts[1:obsidx-1]..., pre..., stmts[obsidx:end]...]
+end
+
+# Stopping-ratio inputs must be packed before stage expansion. Selecting
+# its final plate would mistake stage lanes for full observation rows.
+function _mi_stopping_response_stmts(r, plan, stmts)
+    pre = Expr[]
+    jobs = r.mi_jobs
+    observed = Symbol(:_ppl_mi_response_, r.label)
+    if r.range === nothing
+        push!(pre, :($observed = $(r.response)))
+    else
+        packed = Symbol(:_ppl_mi_packed_, r.label)
+        selected = Symbol(:_ppl_mi_rows_, r.label)
+        push!(pre, :($packed = findall(j -> j in $(r.range), $jobs)),
+            :($selected = $jobs[$packed]),
+            :($observed = $(r.response)[$packed]))
+        jobs = selected
+    end
+    aliases = Dict{Symbol,Symbol}(r.response => observed)
+    rows = Set{Symbol}([_location_node(r, plan)])
+    for ref in (r.weights, r.discrimination, r.evidence.lower, r.evidence.upper,
+            r.threshold_columns...)
+        if ref isa ScalePredictorRef
+            push!(rows, _lp_name(_predictor(plan, ref.predictor)))
+        elseif ref isa Symbol
+            pred = findfirst(p -> p.name === ref, plan.predictors)
+            push!(rows, pred === nothing ? ref : _lp_name(plan.predictors[pred]))
+        end
+    end
+    for ref in sort!(collect(rows))
+        aliases[ref] = _mi_gather_node!(pre, jobs, ref, r.label)
+    end
+    if r.threshold_effects !== nothing
+        matrix = Symbol(:_ppl_mi_effects_, r.label)
+        push!(pre, :($matrix = $(r.threshold_effects)[$jobs, :]))
+        aliases[r.threshold_effects] = matrix
+    end
+    return Expr[pre..., (_hsubst(st, aliases, Dict()) for st in stmts)...]
 end
 
 # One plate likelihood per response (pointwise plate + scalar sum node).

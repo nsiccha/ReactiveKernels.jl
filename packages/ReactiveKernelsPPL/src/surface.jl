@@ -9089,6 +9089,14 @@ end
 
 function _dot2call_nested_link(lhs, a, base)
     (a isa Symbol || a isa Real) && return a
+    # Probability arguments are ordinary Julia values. Preserve their
+    # broadcast tree unless this is a recognized inverse-link spelling.
+    if base in (:Bernoulli, :Binomial) &&
+            !(_is_dotted_call(a) && a.args[1] isa Symbol &&
+              (haskey(_BERNOULLI_LINKS, a.args[1]) ||
+               haskey(_LEGACY_INVERSE_LINKS, a.args[1])))
+        return a
+    end
     want = (base === :Bernoulli || base === :Binomial) ? "logistic/normcdf/cexpexp" :
         (base === :Beta || base === :BetaBinomial2) ? "logistic" : "exp"
     a isa Expr && a.head === :. && length(a.args) == 2 &&
@@ -9572,8 +9580,8 @@ function _lower_link_arg(lhs, arg, wrap)
 end
 
 # Bernoulli/Binomial link dispatch (logit + slice-2 probit/cloglog). The
-# wrapper arrives converted to `:call` by `_dot2call_nested_link`; unknown
-# wrappers fail here (the spine converter is wrapper-generic).
+# recognized wrapper arrives converted to `:call` by `_dot2call_nested_link`;
+# other probability expressions retain their ordinary value tree.
 const _BERNOULLI_LINKS = Dict{Symbol,Tuple{LikelihoodFamily,LinkFunction}}(
     :logistic => (BernoulliLogitFam, LogitLink),
     :normcdf => (BernoulliProbitFam, ProbitLink),
@@ -9607,32 +9615,23 @@ function _lower_slot_link(lhs, arg)
 end
 
 function _lower_bernoulli_link(lhs, arg)
-    (arg isa Symbol || arg isa Real) && return BernoulliLogitFam, IdentityLink, arg
     _reject_legacy_inverse_link(lhs, arg)
-    arg isa Expr && arg.head === :call && !isempty(arg.args) &&
-        haskey(_BERNOULLI_LINKS, arg.args[1]) ||
-        _sfail("response $lhs: `Bernoulli` takes a link wrapper " *
-               "(`logistic.(eta)`, `normcdf.(eta)`, or `cexpexp.(eta)`), " *
-               "got $(repr(arg))")
-    fam, link = _BERNOULLI_LINKS[arg.args[1]]
-    return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
+    if arg isa Expr && arg.head === :call && !isempty(arg.args) &&
+            haskey(_BERNOULLI_LINKS, arg.args[1])
+        fam, link = _BERNOULLI_LINKS[arg.args[1]]
+        return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
+    end
+    return BernoulliLogitFam, IdentityLink, arg
 end
 
 function _lower_binomial_link(lhs, arg)
     _reject_legacy_inverse_link(lhs, arg)
-    # Bare prob (a Beta-sampled parameter, constrained-scale — the
-    # mixture bare-mean precedent): prob-space Binomial, no link.
-    if arg isa Symbol || arg isa Real
-        return BinomialLogitFam, IdentityLink, arg
+    if arg isa Expr && arg.head === :call && !isempty(arg.args) &&
+            haskey(_BINOMIAL_LINKS, arg.args[1])
+        fam, link = _BINOMIAL_LINKS[arg.args[1]]
+        return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
     end
-    arg isa Expr && arg.head === :call && !isempty(arg.args) &&
-        haskey(_BINOMIAL_LINKS, arg.args[1]) ||
-        _sfail("response $lhs: `Binomial` probability takes a link wrapper " *
-               "(`logistic.(mu)`, `normcdf.(mu)`, or `cexpexp.(mu)`) or a " *
-               "bare Beta parameter (`theta ~ Beta(...)`), " *
-               "got $(repr(arg))")
-    fam, link = _BINOMIAL_LINKS[arg.args[1]]
-    return fam, link, _lower_link_arg(lhs, arg, arg.args[1])
+    return BinomialLogitFam, IdentityLink, arg
 end
 
 const _LEGACY_INVERSE_LINKS = Dict(
@@ -10959,6 +10958,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             Expr(:call, :*, args[1:end-1]...)
         return _extract_composed_tree(pname, Expr(:call, :.*, lhs,
             args[end]), ctx, subs, scalars, datas)
+    elseif op === :- && length(args) == 1
+        # Unary negation is ordinary Julia array arithmetic. Its
+        # elementwise canonical form preserves the authored value.
+        return Expr(:call, :.-, _extract_composed_tree(pname, only(args),
+            ctx, subs, scalars, datas))
     elseif op === :+ || op === :- || op === :/ || op === :^
         return _sfail("$where combines vectors without dots: " *
             "$(repr(node)) — as in Julia, write the dotted form " *

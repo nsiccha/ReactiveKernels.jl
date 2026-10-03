@@ -9605,7 +9605,7 @@ function _validate_ordinal_data(r::LikelihoodSpec, plan::StructuralPlan)
     if r.threshold_effects !== nothing &&
             haskey(plan.columns, r.threshold_effects)
         _ordinal_effects_matrix(plan.columns[r.threshold_effects],
-            plan.columns[r.response], r.n_levels)
+            _response_rows(plan, r), r.n_levels)
     end
     return nothing
 end

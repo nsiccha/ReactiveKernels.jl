@@ -122,7 +122,8 @@ end
             _mi_none_evidence(), :y_resp, nothing, nothing; mi_jobs = :Jobs_y)
         @test r.mi_jobs === :Jobs_y
     end
-    # Legacy scalar/link fixtures remain under their existing audit.
+    # These legacy plans omit required link, scale, cutpoint or simplex
+    # declarations. Valid numerical counterparts are in test_scalar_mi_families.jl.
     for family in (BernoulliLogitFam, PoissonLogFam, BinomialLogitFam,
             NegativeBinomial2Fam, CategoricalLogitFam, OrderedLogisticFam,
             OrdinalFam, CategoricalFam)
@@ -133,8 +134,8 @@ end
                 nothing; mi_jobs = :Jobs_y)],
             PredictorSpec[pred], _mi_priors(:mu), SampledParameter[],
             AssignmentSpec[], cols, n)
-        # capability: (IR-level) Case-A mi (obs-only rows) for families beyond Gaussian/Gamma/Beta; entries also use IdentityLink/no scale, so link/scale gates may fire first (todo `1308iv0`)
-        @test_broken (validate_plan(plan); true)
+        # A malformed family declaration is not an MI capability gap.
+        @test_throws ContractValidationError validate_plan(plan)
     end
     # These original scalar plans omit the tensor families' required
     # simplex/trials, covariance factor or design matrix. Valid packed
