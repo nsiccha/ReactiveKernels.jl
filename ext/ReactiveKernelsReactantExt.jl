@@ -1798,7 +1798,10 @@ end
     arg.schema === nothing ? nothing :
     _PlateLaneLayout{length(arg.values),typeof(arg.schema)}(arg.schema)
 @inline _authored_plate_shared(arg) = arg
-@inline _authored_plate_shared(arg::Base.RefValue) = arg[]
+# Shared numeric arrays cross the cell boundary as whole traced tensors, just
+# like lane arrays. Leaving a bound Ref payload on the host lets a nested
+# traced branch collect its elements as scalar result paths into a host Array.
+@inline _authored_plate_shared(arg::Base.RefValue) = _reactant_plate_operand(arg[])
 
 @inline _authored_plate_is_explicit_batch(
     arg::ReactiveKernels._TensorizedEachcol, count) = true
