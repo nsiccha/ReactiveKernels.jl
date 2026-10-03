@@ -100,7 +100,30 @@ function _ipb_check(spec, host_args, changed_args; structure=false, label="guard
             end
             @test occursin("stablehlo.if", hlo)
         end
-        return result
+        executable = Dict{String,Dict{String,Int}}()
+        for (mode, compiled) in (("primal", primal), ("reverse", reverse))
+            hlo = repr(only(Reactant.XLA.get_hlo_modules(compiled.exec)))
+            instructions = collect(eachmatch(
+                r"(?m)^\s*(?:ROOT\s+)?%?[\w.-]+ = .*?\s+([A-Za-z][A-Za-z0-9_-]*)\(", hlo))
+            assignments = collect(eachmatch(r"(?m)^\s*(?:ROOT\s+)?%?[\w.-]+ = ", hlo))
+            @test length(instructions) == length(assignments)
+            counts = Dict{String,Int}()
+            for m in instructions
+                op = m.captures[1]
+                counts[op] = get(counts, op, 0) + 1
+            end
+            executable[mode] = counts
+            if haskey(ENV, "RK_INVARIANT_BRANCH_HLO_DIR")
+                write(joinpath(ENV["RK_INVARIANT_BRANCH_HLO_DIR"],
+                    "$label-$mode.executable.hlo"), hlo)
+            end
+            if startswith(label, "scalar-")
+                # Default CPU XLA can speculate pure arithmetic after MLIR AD.
+                # Equal inventories across sizes do not establish laziness.
+                @test_broken get(counts, "conditional", 0) > 0
+            end
+        end
+        return (; mlir=result, executable)
     end
 end
 

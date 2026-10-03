@@ -190,8 +190,25 @@ and lock the one Reactant 0.2.289 lifted:
   now lowers to one lazy decision around the batch, using its authored branch
   dependency metadata. Its selected arm retains the original lane domain,
   including constant fallbacks and otherwise unused lane inputs. Ordinary
-  optimized primal and reverse have matching complete operation inventories
-  at three, seven and eleven lanes; no inactive arithmetic is evaluated.
+  MLIR primal and reverse have matching complete operation inventories
+  at three, seven and eleven lanes. This is not executable lazy acceptance:
+  default CPU XLA on Reactant 0.2.290 removes pure shared guards in both
+  directions and eagerly evaluates logarithms/division before selecting the
+  result, even though numerical values and gradients agree with native Julia.
+  `repro_reactant_pure_lazy_guard.jl` isolates this without ReactiveKernels;
+  `test_invariant_plate_branches_reactant.jl` records the executable boundary
+  as broken acceptance. Preserve the authored guard and use native execution
+  when inactive arithmetic must remain inactive. Fixed operation inventories
+  alone do not satisfy this constraint.
+  `probe_reactant_late_branch_barrier.jl` is a compiler experiment that adds
+  return barriers after ordinary AD, then uses default XLA. Its scalar, nested
+  and shared-plate executables retain lazy regions without derivative rules
+  or consumer changes. It is not an installed backend repair: broader coverage
+  and upstream integration/release remain required. A barrier inserted before
+  AD instead fails because its backend adjoint is missing. Remove this boundary
+  only after released default compilation retains the relevant branch regions
+  and their inactive arithmetic in primal and ordinary reverse, with complete
+  module/call-graph and size-growth checks; changed optimizer flags do not count.
   Lane-dependent conditions still reach the backend's small-batch boundary.
   Default optimized reverse expands those small lazy batches into one branch
   region per lane instead of retaining the batch loop:

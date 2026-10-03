@@ -39,11 +39,16 @@ code is not executed by the docs build.
   lane consecutively. An authored `sum(lanes)` adds arrays across lanes, preserving
   their per-lane shape. A directly returned compiled plate still materializes
   to its dense storage with the lane axis first.
-- Authored `if`, `?:`, `&&` and `||` keep their lazy Julia semantics: the
-  tensorized companion lowers them to `stablehlo.if` regions (also inside a
-  batched plate cell), so an inactive side is never evaluated or
-  differentiated. `Base.ifelse` remains an eager select of two already valid
-  values. See [core constraints](constraints.md).
+- Authored `if`, `?:`, `&&` and `||` lower to lazy `stablehlo.if` regions
+  (also inside a batched plate cell), retained through ordinary MLIR AD.
+  Default CPU XLA on Reactant 0.2.290 can subsequently replace pure live
+  guards with eager selection, including inactive logarithms and division.
+  Correct values/gradients and matching inventories alone do not establish
+  executable laziness. Preserve the authored guard; use native execution when
+  inactive arithmetic must stay inactive. `Base.ifelse` remains an eager
+  select of two already valid values. See the executable boundary and removal
+  criteria in [core constraints](constraints.md) and the backend-only
+  `benchmark/repro_reactant_pure_lazy_guard.jl`.
 - An authored `for`/`while` inside a recipe keeps its iteration: the
   tensorized companion expands it with `ReactantCore.@trace` at kernel
   definition, so it becomes one `stablehlo.while` region whatever the trip
@@ -55,8 +60,9 @@ code is not executed by the docs build.
   such as `if flag; acc = acc + x; end` carries the updated binding out of
   the selected arm; the other arm keeps its existing value. Assignments to
   several locals keep their order. A branch used as an expression also
-  returns its authored value. These branches stay lazy inside the retained
-  loop, including an empty loop. A loop may read a host struct such as a
+  returns its authored value. These branches lower to lazy regions inside
+  the retained loop, including an empty loop; the default executable boundary
+  above still applies. A loop may read a host struct such as a
   schedule plan; it crosses the loop untraced, and a traced value it reads
   enters as a fresh
   tracer, so a zero-sized input is not returned as an aliased output (which
