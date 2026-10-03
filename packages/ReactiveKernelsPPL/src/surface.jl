@@ -1474,6 +1474,17 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         axis = _plate_column_axis(rhs)
         axis === nothing || (pc_dims[nm] = Any[:(levels($axis))])
     end
+    for (i, p) in enumerate(predictors)
+        terms = TermSpec[if t.kind === ComposedTerm &&
+                _is_plate_column_call(t.options.tree)
+            TermSpec(t.kind, t.columns, merge(t.options,
+                (; tree = _plate_column_expr(p.name, t.options.tree, pc_dims, data))),
+                t.addressee, t.label)
+        else
+            t
+        end for t in p.terms]
+        predictors[i] = PredictorSpec(p.name, p.link, terms, p.label)
+    end
     for (nm, _) in det
         nm in skip && continue
         rhs = canonmap[nm]
@@ -10031,6 +10042,14 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                 return pname
             end
         end
+        if _is_plate_column_call(ctx.detmap[loc]) &&
+                any(n -> n in ctx.varying_contribs ||
+                    (haskey(ctx.detmap, n) &&
+                     _uses_varying_contrib(ctx.detmap[n], ctx.varying_contribs)),
+                    ctx.detmap[loc].args[3:end])
+            return _lower_plate_varying_location(pname, ctx.detmap[loc], ctx,
+                lhs, pred_link, predictors, pred_idx, coefuse)
+        end
         if _composed_root(ctx.detmap[loc], ctx) ||
                 (value && _is_bare_sub_map(ctx.detmap[loc], ctx))
             return _lower_composed_predictor(pname, ctx.detmap[loc], ctx,
@@ -10075,6 +10094,42 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     _record_coefuses!(coefuse, pname, uses, lhs)
     push!(predictors, PredictorSpec(pname, pred_link, terms, pname))
     pred_idx[pname] = length(predictors)
+    return pname
+end
+
+# A retained cell reads a varying contribution as an ordinary vector value.
+# Intern its existing affine/varying predictor, then pass that LP to the
+# cell as a shared input. The cell's arithmetic and selected iterator stay
+# inside the RK plate rather than becoming eager full-column arithmetic.
+function _lower_plate_varying_location(pname, call, ctx, lhs, pred_link,
+        predictors, pred_idx, coefuse)
+    subs, scalars, datas = Symbol[], Symbol[], Symbol[]
+    for name in call.args[3:end]
+        varying = name in ctx.varying_contribs ||
+            (haskey(ctx.detmap, name) &&
+             _uses_varying_contrib(ctx.detmap[name], ctx.varying_contribs))
+        if varying
+            if !haskey(pred_idx, name)
+                rhs = get(ctx.detmap, name, name)
+                terms, uses = _analyze_predictor(name, rhs, ctx, lhs;
+                    composed_sub = true)
+                _record_coefuses!(coefuse, name, uses, lhs)
+                push!(predictors, PredictorSpec(name, IdentityLink, terms, name))
+                pred_idx[name] = length(predictors)
+                push!(ctx.absorbed, name)
+            end
+            push!(subs, name)
+        elseif name in ctx.data || name in ctx.vecdefs
+            push!(datas, name)
+        else
+            push!(scalars, name)
+        end
+    end
+    term = TermSpec(ComposedTerm, ColumnRef[datas...],
+        (; tree = call, subs, scalars), pname, pname)
+    push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
+    pred_idx[pname] = length(predictors)
+    push!(ctx.absorbed, pname)
     return pname
 end
 

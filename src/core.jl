@@ -842,10 +842,78 @@ end
 # It reduces to plain `broadcast` for a non-`Bool` all-host recipe, so values and
 # shapes are unchanged.
 @inline function _tensorized_plate_call(operation, args...)
+    _tensorized_plate_dispatch(operation, args)
+end
+
+@inline function _tensorized_plate_dispatch(operation, args::Tuple)
+    _tensorized_plate_default_call(operation, args)
+end
+
+@inline function _tensorized_plate_default_call(operation, args::Tuple)
     marker = _tensorized_plate_marker(args)
     marker === nothing ?
         _tensorized_broadcast(operation, args...) :
         _tensorized_plate_call(marker, operation, args)
+end
+
+# Branch metadata identifies the exact condition ports. A scalar or atomic
+# operand has no lane axis, so a condition reading only those operands is one
+# lazy decision around the whole batch. Keep lane-dependent conditions in the
+# cell. In particular, a singleton lane array is still a lane operand.
+@inline _plate_branch_shared(arg) = false
+@inline _plate_branch_shared(arg::Number) = true
+@inline _plate_branch_shared(arg::Base.RefValue) = true
+@inline _plate_branch_value(arg) = arg
+@inline _plate_branch_value(arg::Base.RefValue) = arg[]
+@inline _plate_branch_operands(predicate, args::Tuple) = args
+@inline _plate_branch_empty(arg) = false
+@inline _plate_branch_empty(arg::AbstractArray) = isempty(arg)
+@inline _plate_branch_empty(arg::_TensorizedEachcol) = size(arg.parent, 2) == 0
+@inline _plate_branch_empty(arg::_TensorizedPlateBatch) =
+    _plate_branch_empty(arg.values)
+@inline _plate_branch_empty(args::Tuple) = any(_plate_branch_empty, args)
+
+@inline @generated function _plate_branch_arguments(args::Tuple, ::Val{I}) where {I}
+    Expr(:tuple, [:(getfield(args, $index)) for index in I]...)
+end
+
+struct _PlateBranchArm{I,O}
+    operation::O
+end
+
+@inline @generated function (arm::_PlateBranchArm{I})(args::Vararg{Any,N}) where {I,N}
+    operation = :(getfield(arm, :operation))
+    inputs = Any[:(getfield(args, $index)) for index in I]
+    # An arm may ignore every lane operand (a constant fallback, for example).
+    # Preserve the original broadcast domain and marker with ignored anchors;
+    # selecting an arm must not shrink its axes or turn it into a host loop.
+    for index in 1:N
+        index in I && continue
+        operation = :(_LaneAnchored($operation))
+        pushfirst!(inputs, :(getfield(args, $index)))
+    end
+    :(_tensorized_plate_call($operation, $(inputs...)))
+end
+
+@inline function _tensorized_plate_dispatch(
+        operation::_KernelSourceOp{D,F,N,T}, args::Tuple) where
+        {D,F,N<:_KernelBranch,T<:_KernelBranch}
+    branch = operation.tensor_f
+    CI, TI, EI = typeof(branch).parameters[1:3]
+    condition_args = _plate_branch_arguments(args, Val(CI))
+    # Empty domains run no cells and must not evaluate a new shared condition.
+    # Their existing batch lowering also owns shape/type validation.
+    if !all(_plate_branch_shared, condition_args) || _plate_branch_empty(args)
+        return _tensorized_plate_default_call(operation, args)
+    end
+    predicate = branch.condition(map(_plate_branch_value, condition_args)...)
+    args = _plate_branch_operands(predicate, args)
+    yes = _KernelSourceOp(Val(D), Val(F), operation.f.then_arm,
+        branch.then_arm, operation.ignored_throws)
+    no = _KernelSourceOp(Val(D), Val(F), operation.f.else_arm,
+        branch.else_arm, operation.ignored_throws)
+    _recurrence_branch(predicate, _PlateBranchArm{TI,typeof(yes)}(yes),
+        _PlateBranchArm{EI,typeof(no)}(no), args)
 end
 
 @inline function _tensorized_plate_call(
