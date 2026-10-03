@@ -226,15 +226,25 @@ end
 @inline _tensorized_cat_arg_marker(::Val{:tensorized}, arg, rest) = arg
 @inline _tensorized_cat_arg_marker(::Val{:native}, arg, rest) =
     _tensorized_cat_marker(rest)
-@inline function _tensorized_cat_operands(args::Tuple)
+@inline function _tensorized_cat_operands(args::Tuple,
+        operand = _tensorized_cat_operand)
     marker = _tensorized_cat_marker(args)
     marker === nothing ? args :
-        map(arg -> _tensorized_cat_operand(marker, arg), args)
+        map(arg -> operand(marker, arg), args)
 end
-@inline _tensorized_vcat(args...) = vcat(_tensorized_cat_operands(args)...)
-@inline _tensorized_hcat(args...) = hcat(_tensorized_cat_operands(args)...)
+# Concatenation treats a scalar as one entry; broadcast must keep it a scalar.
+# Give concatenation its own operand hook, with the structural argument rank,
+# so a tracing extension can lift scalars and pad missing unit dimensions.
+@inline _tensorized_concat_operand(marker, arg, rank) =
+    _tensorized_cat_operand(marker, arg)
+@inline _tensorized_concat_operands(args::Tuple) =
+    _tensorized_cat_operands(args,
+        (marker, arg) -> _tensorized_concat_operand(
+            marker, arg, Val(maximum(ndims, args))))
+@inline _tensorized_vcat(args...) = vcat(_tensorized_concat_operands(args)...)
+@inline _tensorized_hcat(args...) = hcat(_tensorized_concat_operands(args)...)
 @inline _tensorized_cat(args...; dims) =
-    cat(_tensorized_cat_operands(args)...; dims = dims)
+    cat(_tensorized_concat_operands(args)...; dims = dims)
 # A scalar-vector literal (`[a, b, c]`) in a tensorized body.  The default
 # is the plain `Base.vect` construction; a tracing extension builds a real
 # traced vector when any element is traced (a host container of traced
