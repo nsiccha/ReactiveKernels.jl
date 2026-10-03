@@ -2118,8 +2118,8 @@ ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
 # `similar(::Broadcasted{AbstractReactantArrayStyle}, ::Type{Number})`.
 # Promoting the host operands first (the same `promote_to` the cat/broadcast
 # wrappers of a fused body use) types the cell body on traced scalars exactly
-# as Reactant's element application evaluates it, so the deduced eltype is
-# concrete.
+# as Reactant's element application evaluates it. Any remaining abstract result
+# inference goes through batch tracing below instead of broadcast allocation.
 # The core routes a recipe to the FIRST marker-bearing operand, and this
 # extension claims plain traced vectors (above) so a vector plate lowers here.
 # Inside an `eachcol`/batched plate a traced data vector can therefore precede
@@ -2221,7 +2221,12 @@ function ReactiveKernels._tensorized_plate_call(
         return _reactant_ref_plate_call(operation, args)
     operands = map(_reactant_plate_operand, args)
     result_type = Base.promote_op(operation, map(Base.eltype, operands)...)
-    result_type <: Number || return _reactant_ref_plate_call(operation, args)
+    # Inference can widen a valid scalar cell to Number (or a numeric union),
+    # including after other generated kernels have compiled. Reactant's
+    # broadcast cannot allocate an abstract eltype; batch traces the cell once
+    # and derives its concrete result leaves without changing lazy branches.
+    (isconcretetype(result_type) && result_type <: Number) ||
+        return _reactant_ref_plate_call(operation, args)
     Base.broadcast(operation, operands...)
 end
 
