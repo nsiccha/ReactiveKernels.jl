@@ -4344,6 +4344,8 @@ end
 function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         pre::Vector{Expr} = Expr[], stem::Symbol = :prior)
     ov === nothing && return nothing
+    ov isa Tuple && ov[1] === :restricted && return nothing
+    ov isa Tuple && ov[1] === :restricted_half && return :(log(2))
     if ov isa Tuple && ov[1] === :truncated
         lo, hi = ov[2], ov[3]
         cdf(x) = _prior_endpoint_expr(family, argvals, :cdf, x)

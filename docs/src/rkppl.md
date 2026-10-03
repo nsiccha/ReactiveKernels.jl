@@ -92,7 +92,9 @@ forms work for sampled parameters and the built-in varying and smooth scales. A 
 positive scale slot. Write the explicit half or truncation instead.
 
 Support keywords on distribution constructors, such as
-`Normal(0, s; lower=0)`, are rejected. Use `truncated(Normal(0, s), 0, Inf)`.
+`Normal(0, s; lower=0)`, are rejected. Use normalized
+`truncated(Normal(0, s), 0, Inf)` or the density-preserving `restricted` form
+below according to the intended model.
 `Flat()` is an improper real prior and accepts no support keywords; choose
 `Exponential(s)` for a positive prior or `Uniform(lo, hi)` for a bounded
 uniform. These are proper densities and change an improper prior's model.
@@ -111,6 +113,35 @@ x ~ truncated(Weibull(2 + exp(a), 1), exp(a), 3 + exp(a))
 p ~ Dirichlet(3, exp(a))
 y .~ Normal.(x, 1)
 ```
+
+`x ~ restricted(D, lo, hi)` declares the same support intersection and
+coordinate transform, while preserving `D`'s original log density. It does
+not divide by the probability mass inside the bounds. This is a dedicated
+`@rkppl` prior form for bounded density kernels, distinct from normalized
+`truncated`. The original family arguments and literal, data or sampled
+scalar bounds stay live. The existing normalized half prior retains its
+`log(2)` constant when used as `D`.
+
+```julia
+scale ~ restricted(Normal(0, 1), 0, Inf)
+invdf ~ restricted(Exponential(0.125), 0, 0.5)
+```
+
+At the same physical point these priors have the original Normal and
+Exponential densities. Normalized truncation instead adds `log(2)` and
+`-log1p(-exp(-4))`, respectively. Both forms have the same coordinates and
+Jacobians; a live bound or family argument can make the normalization
+parameter dependent, so their gradients need not agree in general.
+
+`restricted(Flat(), lo, hi)` has zero log density inside its support and
+uses only the transform Jacobian. It supplies an improper flat density
+kernel, without a uniform normalizer. Scalar conditioning keeps the original
+density and returns `-Inf` outside the declared support; pinning removes the
+density as usual. Array and plate priors accept shared scalar bounds with
+`restricted.(D.(args...), lo, hi)` or a per-cell `restricted(D, lo, hi)`.
+Assign a computed array bound to a name first (`hi = 2 + exp(a)`), as
+with `truncated` array priors. Per-element bounds and nested
+restrictions/truncations are not built yet.
 
 `Dirichlet(alpha)` takes a concentration vector from data, a sampled array,
 a vector literal containing live values, or an array-valued definition.

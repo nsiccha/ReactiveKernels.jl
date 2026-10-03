@@ -24,7 +24,7 @@ function support_of(family::Symbol, override::SupportOverride)
         throw(ContractValidationError("[layout] sampled family $family unknown"))
     inferred = SAMPLED_SUPPORT[family]
     override === nothing && return inferred
-    override isa Tuple && override[1] === :truncated && return :truncated
+    _has_interval_bounds(override) && return :truncated
     family === :uniform && throw(ContractValidationError(
         "[layout] a uniform prior carries its own interval support — no " *
         "support override applies, got $override"))
