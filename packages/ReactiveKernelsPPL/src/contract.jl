@@ -9299,13 +9299,17 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
     # bound rows); there is no column length to check at bind.
     s isa ScalePredictorRef && return nothing
     s isa Symbol || return nothing
-    s in _union_names(plan) && return nothing
+    # A data-only scalar definition used as a scale is materialized at bind.
+    # Validate that value just like a caller-supplied scale; live definitions
+    # and sampled parameters have no bound value here.
+    s in _union_names(plan) && !haskey(plan.columns, s) && return nothing
     _is_derived(plan, s) && _fail(r.label,
         "scale column $s is derived — slice-1 binds per-observation scales " *
         "raw (derived-column scales need shape metadata — planned)")
     haskey(plan.columns, s) ||
         _fail(r.label, "scale references unknown name $s")
-    col = _response_slot_column(plan, r, s, "scale column")
+    value = plan.columns[s]
+    col = value isa Number ? value : _response_slot_column(plan, r, s, "scale column")
     if r.family === HurdlePoissonFam
         (eltype(col) <: Real && all(isfinite, col) &&
             all(x -> 0 <= x <= 1, col)) ||
@@ -10482,13 +10486,17 @@ end
 
 """Names of the data-only definitions of `plan`, given the raw
 (caller-supplied) column names: assignments and derived columns that call a
-module function and read only raw columns or other data-only definitions.
+module function or fill a bind-time slot, and read only raw data or other
+data-only definitions.
 Derived responses keep their own materialization. `bind_only` excludes
 definitions used only during preparation, while preserving their names
 for caller-supplied column collision checks."""
 function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         bind_only = false, unbound::Bool=false)
     required = Set{Symbol}(r.weights for r in plan.responses if r.weights !== nothing)
+    for r in plan.responses, scale in (r.scale, r.mixture_scales...)
+        scale isa Symbol && push!(required, scale)
+    end
     for p in plan.array_parameters, d in p.dims
         _is_levels_dim(d) && push!(required, d.args[2])
     end

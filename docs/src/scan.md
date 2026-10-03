@@ -389,6 +389,8 @@ Full PK Reactant compilation is still unsupported: the ordinary
 `StaticArrays.exp` inside the event scan uses a traced Boolean as a host branch
 condition. The same test pins that exact error across growing subject/event
 axes; `benchmark/repro_reactant_static_matrix_exp.jl` isolates it without RK.
+The exponential capability is tracked in
+[issue #34](https://github.com/nsiccha/ReactiveKernels.jl/issues/34).
 The generic nested plate/scan path has compiled primal and
 reverse parity and a fixed backend operation inventory as both subjects and
 sequence lengths grow (`test/test_scan_plate_reactant.jl`). Those checks do
