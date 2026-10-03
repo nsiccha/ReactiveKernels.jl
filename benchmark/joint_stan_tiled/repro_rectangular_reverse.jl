@@ -13,7 +13,8 @@ const PK_READS = ReactiveKernelsPPL._pk_auc_spec
     log_ka = q[5]
     reads = PK_READS(ends, op_type, op_dt, op_amount, op_interval, op_count,
         op_read_idx, log_F, log_Vc, log_k10, log_k12, log_k21, log_ka)
-    sum(reads)
+    objective = sum(reads)
+    return objective
 end
 s = build_linear_pk_schedule([1, 1, 2, 2], [96., 120., 0., 5.],
     [1, 1, 1, 1, 2], [0., 24., 48., 72., 0.], [100., 100., 100., 100., 50.])
