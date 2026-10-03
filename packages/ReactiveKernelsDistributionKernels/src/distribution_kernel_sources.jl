@@ -611,6 +611,8 @@ end
 # route (matching `bernoulli`); `p` is the equivalent probability. No
 # closed-form quantile (discrete inversion), so only `logpdf` and `cdf` are
 # exposed. `cdf` is the regularized incomplete beta I_{1-p}(n-k, k+1).
+# The lazy zero-count arms omit zero log-probability terms, including
+# the degenerate n=0 distribution and p=0/1 endpoint masses.
 const BINOMIAL_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using LogExpFunctions: log1pexp
@@ -624,7 +626,10 @@ using SpecialFunctions: beta_inc
 
     logpdf(observed::Int)::Float64 =
         (observed >= 0) & (observed <= n) ?
-            (loggamma(n + 1.0) - loggamma(observed + 1.0) -
+            (n == 0 ? 0.0 :
+             observed == 0 ? n * log1mp :
+             observed == n ? n * logp :
+             loggamma(n + 1.0) - loggamma(observed + 1.0) -
              loggamma(n - observed + 1.0) +
              observed * logp + (n - observed) * log1mp) :
             -Inf
@@ -885,10 +890,11 @@ using LogExpFunctions: logaddexp, log1pexp
     logpdf(observed::Int)::Float64 =
         ((observed >= 0) & (observed <= n) & (zi >= 0) & (zi <= 1)) ?
             (observed == 0 ?
-                logaddexp(log(zi), log1p(-zi) + n * log1mp) :
-                log1p(-zi) + loggamma(n + 1.0) - loggamma(observed + 1.0) -
-                loggamma(n - observed + 1.0) + observed * logp +
-                (n - observed) * log1mp) :
+                logaddexp(log(zi), log1p(-zi) + (n == 0 ? 0.0 : n * log1mp)) :
+                log1p(-zi) + (observed == n ? n * logp :
+                    loggamma(n + 1.0) - loggamma(observed + 1.0) -
+                    loggamma(n - observed + 1.0) + observed * logp +
+                    (n - observed) * log1mp)) :
             -Inf
 end
 """
