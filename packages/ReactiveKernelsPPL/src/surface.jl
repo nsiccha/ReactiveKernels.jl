@@ -962,6 +962,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     det = _hoist_prior_args!(sample, det, data, plate_specs;
         resolve = a -> _resolve_module_calls(a, mod, model_names,
             "prior argument `$(repr(a))`"))
+    det = _hoist_data_gather_indices!(sample, det, data,
+        union(model_names, _expr_names(ast));
+        resolve = a -> _resolve_module_calls(a, mod, model_names,
+            "gather index `$(repr(a))`"))
     # A data-only module value a response reads per observation is that
     # observation column or matrix (user decision `0z5bsqi`, prong
     # `in_model`): it lowers as data, computed once by `bind_data`, which
@@ -1627,6 +1631,58 @@ _is_module_value_call(ex) =
 const _WHOLE_READ_FNS = (:size, :axes, :levels, :eachindex, :Ref)
 const _ADDITIVE_OPS = (:+, :-, :.+, :.-)
 
+# An inline data-only index call is the same bind-time value as its named
+# definition. Give it a hygienic name before observation-axis analysis,
+# which then routes it through the existing data-definition materializer.
+# Only ordinary value compositions are visited: a lazy arm or loop keeps
+# its authored evaluation context, just as in `_split_data_calls!`.
+function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identity)
+    detmap = Dict{Symbol,Any}(det)
+    extra = Pair{Symbol,Any}[]
+    names = Dict{Any,Symbol}()
+    function index_name(ex)
+        ex isa Expr || return ex
+        value = resolve(ex)
+        _contains_module_call(value) && _data_only(value, data, detmap) || return ex
+        return get!(names, value) do
+            k = length(names) + 1
+            nm = Symbol(:_rkppl_index_, k)
+            while nm in taken
+                k += 1
+                nm = Symbol(:_rkppl_index_, k)
+            end
+            push!(taken, nm)
+            push!(extra, nm => value)
+            nm
+        end
+    end
+    function walk(ex)
+        ex isa Expr || return ex
+        _is_plate_column_expr(ex) && return ex
+        if ex.head === :ref
+            return Expr(:ref, walk(ex.args[1]),
+                (index_name(walk(a)) for a in ex.args[2:end])...)
+        elseif ex.head === :call
+            return Expr(:call, ex.args[1], map(walk, ex.args[2:end])...)
+        elseif ex.head === :. && length(ex.args) == 2 &&
+                Meta.isexpr(ex.args[2], :tuple)
+            return Expr(:., ex.args[1], Expr(:tuple, map(walk, ex.args[2].args)...))
+        elseif ex.head === :kw && length(ex.args) == 2
+            return Expr(:kw, ex.args[1], walk(ex.args[2]))
+        elseif ex.head in (:parameters, :tuple, :vect)
+            return Expr(ex.head, map(walk, ex.args)...)
+        end
+        return ex
+    end
+    out = Pair{Symbol,Any}[nm => walk(rhs) for (nm, rhs) in det]
+    for (i, s) in enumerate(sample)
+        rhs = walk(s.rhs)
+        sample[i] = SampleStmt(s.lhs, rhs, s.broadcast, s.range, s.levels,
+            s.matrix, s.dims, s.slices, s.count_columns)
+    end
+    return append!(out, extra)
+end
+
 # Record the data-only module values `ex` needs as observation columns.
 # `need`: `ex` itself must carry the observations (a term of a sum); in a
 # distribution argument, or beside a per-observation operand, it need not,
@@ -1648,7 +1704,7 @@ function _column_reads!(aligned, ex, cands, detmap, visited, data,
     ex isa Expr || return nothing
     if ex.head === :ref
         # A gather `v[c]`: the value whole, the index per observation.
-        foreach(walk, ex.args[2:end])
+        foreach(a -> walk(a, true), ex.args[2:end])
         return nothing
     end
     dotted = _is_dotted_call(ex)
