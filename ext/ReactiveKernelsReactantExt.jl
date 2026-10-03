@@ -1801,7 +1801,10 @@ end
 # Shared numeric arrays cross the cell boundary as whole traced tensors, just
 # like lane arrays. Leaving a bound Ref payload on the host lets a nested
 # traced branch collect its elements as scalar result paths into a host Array.
-@inline _authored_plate_shared(arg::Base.RefValue) = _reactant_plate_operand(arg[])
+@inline function _authored_plate_shared(arg::Base.RefValue)
+    value = arg[]
+    value isa AbstractArray{<:Number} ? _reactant_plate_operand(value) : value
+end
 
 @inline _authored_plate_is_explicit_batch(
     arg::ReactiveKernels._TensorizedEachcol, count) = true
@@ -1896,8 +1899,11 @@ end
 
 function _reactant_plate_batch(operation, args, batch_positions, scalar_positions,
         batch_inputs, batch_shape)
-    shared = Tuple(_authored_plate_shared(getfield(args, index))
-        for index in eachindex(args) if !(index in batch_positions))
+    # Mapping a tuple preserves heterogeneous tensor types; collecting a
+    # generator would try to promote integer and floating-point traced arrays.
+    shared_indices = Tuple(index for index in eachindex(args)
+        if !(index in batch_positions))
+    shared = map(index -> _authored_plate_shared(getfield(args, index)), shared_indices)
     layouts = Tuple(_authored_plate_batch_schema(getfield(args, index))
         for index in batch_positions)
     call = _AuthoredPlateBatchCall{
