@@ -256,9 +256,13 @@ need not guarantee support: the density checks the evaluated value.
 (One slot covers every admitted family; a two-auxiliary family such as
 Beta needs a new field — noted, not built.) `nu` is the StudentT
 degrees of freedom, `nothing` otherwise: a sampled parameter/assignment
-name, a finite-positive literal, or a [`ScalePredictorRef`](@ref)
+name, a bound data name, a finite-positive literal, or a
+[`ScalePredictorRef`](@ref)
 (predictor-fed per-observation nu — the scale-slot mechanism, with its
 own `_ppl_sc_<label>_nu` node so scale and nu predictors coexist).
+`zi` is the ZIP/ZIB zero-inflation probability and accepts the same value
+forms. Fixed `nu` data must be finite positive reals; fixed `zi` data must
+be finite reals in [0, 1]. Model-valued inputs use the lazy density guard.
 `weights` is a
 frequency/power-objective column (D1); analytic/precision weights fail
 closed emitter-side. `trials` is the Binomial/BetaBinomial2 trial count
@@ -8945,6 +8949,8 @@ function _validate_response_data(plan::StructuralPlan)
         _validate_mi_data(r, plan)
         _validate_response_column(r, plan)
         _validate_scale_data(r, plan)
+        _validate_auxiliary_data(r, plan, r.nu, :nu)
+        _validate_auxiliary_data(r, plan, r.zi, :zi)
         _validate_weights(r, plan)
         _validate_trials(r, plan)
         _validate_evidence_data(r, plan)
@@ -9347,8 +9353,8 @@ function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
     end
     n isa Real && ((isfinite(n) && n > 0) ||
         _fail(r.label, "nu literal must be finite positive"))
-    n isa Symbol && (n in _all_names(plan) ||
-        _fail(r.label, "nu references unknown name $n"))
+    n isa Symbol && (n in _all_names(plan) || haskey(plan.columns, n) ||
+        !isbound(plan) || _fail(r.label, "nu references unknown name $n"))
     return nothing
 end
 
@@ -9370,8 +9376,31 @@ function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     z isa ScalePredictorRef && return _validate_zi_predictor(r, plan, z)
     z isa Real && ((isfinite(z) && 0 <= z <= 1) ||
         _fail(r.label, "zi literal must lie in [0, 1]"))
-    z isa Symbol && (z in _all_names(plan) ||
-        _fail(r.label, "zi references unknown name $z"))
+    z isa Symbol && (z in _all_names(plan) || haskey(plan.columns, z) ||
+        !isbound(plan) || _fail(r.label, "zi references unknown name $z"))
+    return nothing
+end
+
+# Raw data arguments resolve at binding, like scales. Live definitions and
+# sampled values keep the ordinary endpoint's lazy support guard.
+function _validate_auxiliary_data(r::LikelihoodSpec, plan::StructuralPlan, value,
+        slot::Symbol)
+    value isa Symbol || return nothing
+    value in _all_names(plan) && !haskey(plan.columns, value) && return nothing
+    haskey(plan.columns, value) ||
+        _fail(r.label, "$slot references unknown name $value")
+    data = plan.columns[value]
+    selected = data isa Number ? data :
+        _response_slot_column(plan, r, value, "$slot data")
+    (eltype(selected) <: Real && all(isfinite, selected)) ||
+        _fail(r.label, "$slot data $value must be finite real numerics")
+    if slot === :nu
+        all(>(0), selected) ||
+            _fail(r.label, "nu data $value must be finite positive numerics")
+    else
+        all(x -> 0 <= x <= 1, selected) ||
+            _fail(r.label, "zi data $value must lie in [0, 1]")
+    end
     return nothing
 end
 
