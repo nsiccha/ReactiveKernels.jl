@@ -214,6 +214,14 @@ The legacy `varying_draws` / `varying_effect`
 keywords are `eta`, `levels`, and `sd`; centered coefficients are declared
 through array priors or the centered library entries above.
 
+Valid multivariate row, column and vector priors compile with Reactant when
+prepared with `on_error = :ignore` (also accepted by `prepare_query` and
+`prepare_sampler`). This explicit policy strips visible throws and assertions;
+default native preparation checks the factor or covariance. The shared solve
+retains its loops and uses ordinary reverse AD. Empty batches return zero in
+native and compiled primal execution; compiled empty gradients remain subject
+to the [Reactant export limitation](constraints.md#acceptance-and-existing-limitations).
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("27_varying_slope_lib.jl", :rkppl_varying_slope)
 ```

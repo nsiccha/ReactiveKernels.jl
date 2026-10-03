@@ -2802,7 +2802,8 @@ function _traceable_definition(def, mod::Module)
         companion = Expr(:where, companion, layer...)
     end
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
-    esc(Expr(:block, native, Expr(:(=), companion, rewritten), callee))
+    ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
+    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., callee))
 end
 
 # The body with its tail-position `return`s replaced by their values: the
@@ -2836,6 +2837,19 @@ function _traceable_no_return(ex, signature)
 end
 
 function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
+                           kwargs...)
+    normal = _kernel_operation_body(rhs, deps, known; kwargs...)
+    # A bare exact-identity operation keeps its original identity. Transparent
+    # helpers have separate opted-in methods; source closures retain a twin.
+    normal isa Expr && normal.head === :call &&
+        normal.args[1] == GlobalRef(@__MODULE__, :_KernelSourceOp) || return normal
+    mod = get(kwargs, :mod, nothing)
+    ignored_rhs = _kernel_ignore_throw_source(rhs, mod, known)
+    ignored = _kernel_operation_body(ignored_rhs, deps, known; kwargs...)
+    Expr(:call, GlobalRef(@__MODULE__, :_kernel_with_ignored_throws), normal, ignored)
+end
+
+function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
                            nested_specs = Dict{Symbol,Any}())
@@ -3808,7 +3822,7 @@ function _kernel_bound_pairs(spec::KernelSpec, bound)
 end
 
 """
-    prepare(spec::KernelSpec; have, want, passes=(), bound=(;)) -> callable
+    prepare(spec::KernelSpec; have, want, passes=(), bound=(;), on_error=nothing) -> callable
 
 Prepare an authored kernel. With a non-empty `bound` NamedTuple
 (`bound = (; X, y)`), the [`partial_evaluation`](@ref) pre-pass runs first:
@@ -3823,15 +3837,23 @@ reuses the plan and compiled code of earlier bindings and runs only the
 data-only subgraph on the new values (see `prepare` on a `Graph`), so binding
 per request needs no caller-held cache; [`prepare!`](@ref) with a
 [`PreparationCache`](@ref) gives that reuse an explicit lifetime.
+
+The default `on_error = nothing` preserves authored assertions and throws.
+Opt in with `on_error = :ignore` to replace visible `throw(...)` sites in
+captured `@kernel` and `@traceable` source with `nothing`, including expanded
+`@assert`s. The policy applies to native execution, tracing and bound-data
+mathematics. Ordinary opaque function bodies keep their behavior. This first
+policy continues execution; it does not catch exceptions or return a fallback.
 """
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                 bound = NamedTuple())
+                 bound = NamedTuple(), on_error = nothing)
     isempty(bound) || return prepare(spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound))
-    prepared = prepare(plan(spec; have = have, want = want); passes = passes)
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error)
+    prepared = prepare(plan(spec; have = have, want = want); passes = passes,
+                       on_error = on_error)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end
@@ -3851,15 +3873,15 @@ over the remaining HAVE ports exactly as `prepare(spec; bound)` returns it.
 function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
                   want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                  bound = NamedTuple())
+                  bound = NamedTuple(), on_error = nothing)
     isempty(bound) || return prepare!(cache, spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound))
+        passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error)
     prepared = prepare!(cache, spec.graph;
                         have = _kernel_selection(spec, have, spec.have_names, :have),
                         want = _kernel_selection(spec, want, spec.want_names, :want),
-                        passes = passes)
+                        passes = passes, on_error = on_error)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end

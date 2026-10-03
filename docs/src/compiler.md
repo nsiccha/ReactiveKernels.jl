@@ -202,6 +202,25 @@ HAVE/WANT signatures, and pass identities. Mutating a graph increments its
 version, so a cache entry for the old graph cannot be returned. Cache lookup is
 preparation-time work only.
 
+### Visible throw policy
+
+`prepare(spec; on_error = :ignore)` opts into a source transform that replaces
+visible `throw(...)` sites with `nothing`, including the throws in expanded
+`@assert`s. The default `on_error = nothing` retains normal throwing behavior.
+The same option is available for graphs, plans and `prepare!`; caches keep
+the two policies separate. Bound-data mathematics uses the selected policy
+before its first evaluation.
+
+The transform sees captured `@kernel` source and the bodies of `@traceable`
+helpers. It keeps the original methods and selects separate stripped bodies
+only for an opted-in prepared call. Ordinary opaque function bodies stay
+opaque and their errors remain errors. It preserves unrelated lazy branches
+and retained loops, and does not evaluate a removed throw's message arguments.
+
+This first policy simply continues execution after a removed throw. It does
+not map failure to a fallback value, provide exception recovery, or make
+invalid mathematical inputs valid. Further policies are not implemented yet.
+
 ### Preparation-time partial evaluation
 
 When some HAVE values stay fixed across many calls, `bound` opts into a
