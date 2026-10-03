@@ -180,9 +180,14 @@ end
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
         end
-        if rhs in (:(Horseshoe(local_scale = true)), :(Horseshoe(local_scale = s)))
-            # capability: Bool and sampled Horseshoe scale arguments
-            # (10gzbm9 bool-values; P8 1cmodra; todo `0fkd9yk`).
+        if rhs == :(Horseshoe(local_scale = s))
+            # User 1cmodra chose explicit library bodies for sampled hyper
+            # arguments. The retained built-in has a literal-scale signature;
+            # its live counterpart is tested in test_expression_arguments.jl.
+            @test_throws SurfaceLoweringError lower_rkppl(bad,
+                Set([:x1, :y]); conditioned = Set([:x1, :y]))
+        elseif rhs == :(Horseshoe(local_scale = true))
+            # capability: Bool Horseshoe scale argument (10gzbm9 bool-values).
             @test_broken (lower_rkppl(bad, Set([:x1, :y]); conditioned = Set([:x1, :y])); true)
         else
             # refused: unknown/positional arguments or a non-finite,

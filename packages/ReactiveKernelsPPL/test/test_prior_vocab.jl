@@ -955,7 +955,7 @@ _pv_m10_q() = (a = 0.5, b1 = -1.0, b2 = 2.0,)
             end
             if occursin("hyper bound", label)
                 # capability: sampled Uniform bounds (P8 1cmodra; todo `0fkd9yk`).
-                @test_broken (err === nothing || throw(err))
+                @test err === nothing
             else
                 # refused: remaining entries violate constructor signature,
                 # strict declarations or distribution domains (P3/P6, 05oe96l).

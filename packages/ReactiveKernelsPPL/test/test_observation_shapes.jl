@@ -70,13 +70,23 @@ end
             y[i] ~ Normal(a + x[i], 0.7)
         end
     end
-    # Refused: x[2] is out of bounds in the authored Julia loop (P3).
-    @test_throws "explicit `@plate` indexing does not stretch" (indexed(;
-        x = [0.5]) | (; y = zeros(3)))
-    # Linear indexing of differently shaped arrays needs a distinct
-    # lowering; silently broadcasting would change this loop's density.
-    @test_throws "different operand axes is not built yet" (indexed(;
-        x = zeros(1, 2)) | (; y = zeros(2)))
+    # Evaluation preserves ordinary Julia bounds checks for indexed reads.
+    invalid = indexed(; x = [0.5]) | (; y = zeros(3))
+    @test_throws BoundsError begin
+        built = build_kernel(invalid)
+        post = prepare_query(built, invalid, :sampler)
+        Base.invokelatest(post, [0.3])
+    end
+    # The authored loop linearly indexes the matrix. Broadcasting these
+    # differently shaped operands would instead create four observations.
+    x = reshape([0.5, -0.3], 1, 2)
+    y = [0.2, -0.1]
+    mu = 0.3 .+ vec(x)
+    linear = indexed(; x) | (; y)
+    @test linear.n_obs == 2
+    _os_check(linear, logpdf(Normal(), 0.3) +
+        sum(logpdf.(Normal.(mu, 0.7), y)),
+        [sum(y .- mu) / 0.7^2 - 0.3], [0.3])
     empty_loop = indexed(; x = ones(3)) | (; y = Float64[])
     _os_check(empty_loop, logpdf(Normal(), 0.3), [-0.3], [0.3])
 

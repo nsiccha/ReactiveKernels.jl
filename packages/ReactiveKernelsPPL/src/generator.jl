@@ -242,6 +242,7 @@ import ReactiveKernelsDistributionKernels.DistributionKernelSources:
     gp_exp_quad_cov_graph as _ppl_gp_exp_quad_cov,
     gp_periodic_cov_graph as _ppl_gp_periodic_cov
 using SpecialFunctions: besseli, besselix, erfc, loggamma
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: logbeta
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
 # names in the assignment allowlist.
@@ -1901,6 +1902,8 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         return _binomial_cloglog_plate_stmts(r, plan, node, pw)
     elseif r.family === BetaLogitFam
         return _beta_plate_stmts(r, plan, node, pw)
+    elseif r.family === BetaShapeFam
+        return _beta_shape_plate_stmts(r, plan, node, pw)
     elseif r.family === BetaBinomial2Fam
         return _betabinomial2_plate_stmts(r, plan, node, pw)
     elseif r.family === CategoricalLogitFam
@@ -2611,13 +2614,17 @@ function _vonmises_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         inner = :($yv > $muv + 3.141592653589793 ? -Inf : $base)
         sup = :($yv < $muv - 3.141592653589793 ? -Inf : $inner)
     else
-        lo, hi = r.interval
-        w = hi - lo
+        lo = _thread_ref!(inputs, r.interval[1])
+        hi = _thread_ref!(inputs, r.interval[2])
+        w = :($hi - $lo)
         wmu = :($lo + rem(rem($muv - $lo, $w) + $w, $w))
         base = :(-1.8378770664093456 - log(besseli(0, $kapv)) +
             $kapv * cos($yv - $wmu))
         inner = :($yv >= $hi ? -Inf : $base)
-        sup = :($yv < $lo ? -Inf : $inner)
+        support = :($yv < $lo ? -Inf : $inner)
+        valid = :(isfinite($lo) && isfinite($hi) && $lo < $hi &&
+            abs($w - $(2 * Float64(pi))) <= $(8eps(Float64) * 2 * Float64(pi)))
+        sup = :($valid ? $support : -Inf)
     end
     cell = :($kapv <= 0 ? -Inf : $sup)
     ecdf = if r.interval === nothing
@@ -2960,6 +2967,30 @@ end
 # into the a/b precomputes through broadcast); cell needs only (y, a,
 # b), so kappa is never a plate input. Positional beta cell (primary
 # form).
+function _beta_shape_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        node::Symbol, pw::Symbol)
+    pre = Expr[]
+    inputs = Any[r.response, _lp_name(_predictor(plan, r.predictor))]
+    y, alpha = _dovar(1), _dovar(2)
+    beta_arg = _thread_ref!(inputs, _scale_plate_arg(r, plan, pre))
+    valid = :(isfinite($alpha) && $alpha > 0 &&
+        isfinite($beta_arg) && $beta_arg > 0)
+    # The ordinary Beta density stays inside the domain branch. The
+    # existing owned logbeta callable carries its generated derivative
+    # rule; endpoint expansion cannot currently bind that global here.
+    density = :(($alpha - 1) * log($y) +
+        ($beta_arg - 1) * log1p(-$y) - logbeta($alpha, $beta_arg))
+    density = _wrap_evidence!(r, plan, pre, inputs, density;
+        cdf = b -> :(beta($alpha, $beta_arg).cdf($b)),
+        ccdf = b -> :(beta($alpha, $beta_arg).ccdf($b)))
+    cell = :($valid ? $density : -Inf)
+    if r.weights !== nothing
+        weight = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(weight, cell)
+    end
+    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+end
+
 function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     y = r.response
     lp = _location_node(r, plan)
@@ -4261,14 +4292,14 @@ function _vector_parameter_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         "[generator] vector parameter $(p.name) has unresolved size " *
         "(bind_data infers it)"))
     node = Symbol(:_ppl_prior_, p.name)
-    if p.family === :ordered_normal || p.family === :vector_normal
+    if haskey(_VECTOR_ELEMENT_FAMILIES, p.family)
         if m == 0
             push!(stmts, :($node::Float64 = 0.0))
             push!(terms, node)
             return nothing
         end
-        _vector_prior_stmts!(stmts, terms, p.name, :normal,
-            (arg1 = Float64(p.args.arg1), arg2 = Float64(p.args.arg2)), nothing)
+        _vector_prior_stmts!(stmts, terms, p.name,
+            _VECTOR_ELEMENT_FAMILIES[p.family], p.args, nothing)
         return nothing
     end
     rhs = if p.family === :simplex_dirichlet

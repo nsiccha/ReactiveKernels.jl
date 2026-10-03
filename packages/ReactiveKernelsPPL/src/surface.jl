@@ -1159,7 +1159,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # Interned predictors by name (shared with `ctx`: a composition over a
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
-    ctx = (; data, detmap = canonmap, prior_names, coef_priors,
+    ctx = (; data, mod, detmap = canonmap, prior_names, coef_priors,
         ordinary_parameters,
         detshape, shape_env,
         vecdefs, structural, derived_responses = derived_response_names,
@@ -1799,16 +1799,16 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     return _shape_of_call(fn, argshapes)
 end
 
-# Elementwise (dotted) results: per-observation when any operand is,
-# array-shaped over arrays and scalars, per-observation otherwise (the
-# slice-1 rule: dotted ⇒ vector).
+# Elementwise results keep their operands' Julia shape: an observation
+# column contributes its row axis, arrays retain their axes, and broadcasts
+# over scalars remain scalar.
 function _elementwise_shape(argshapes)
     :invalid in argshapes && return :invalid
     # Julia determines broadcast compatibility from the actual axes.
     # A declared array can share the observation axis of another operand.
     :vector in argshapes && return :vector
     :array in argshapes && return :array
-    return :vector
+    return :scalar
 end
 
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
@@ -1826,14 +1826,11 @@ function _ref_shape(ex, data)
     return :scalar
 end
 
-# Built-in broadcasts (dotted operators and math) shape `:vector`, except
-# over model-level arrays with no observation-aligned operand
-# (`zeta .* 2.0`, `sqrt.(phi .* s)`): standard Julia broadcasting of a
-# model-level value stays model-level.
+# A broadcast has an observation axis exactly when an operand has one.
+# Broadcasting scalar values remains scalar, as in Julia.
 function _broadcast_shape(ex, data, detmap, memo, active, env)
     _obs_axis(ex, data, detmap, memo, active, env) && return :vector
-    _model_valued(ex, detmap, env, Set{Symbol}()) && return :scalar
-    return :vector
+    return :scalar
 end
 
 # `A[i]` with one index over a value (data, a definition, a call result,
@@ -1861,6 +1858,8 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         fn = ex.args[1]
         fn isa Symbol || return false
         fn in REDUCTION_FNS && return false
+        # Retained smooth summands read the row axis of their named basis.
+        fn in (:hsgp, :spline) && return true
         fn === :_ppl_plate_column && return _plate_column_axis(ex) === nothing
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2:end])
@@ -1901,6 +1900,7 @@ end
 
 # Single rule table for undotted `:call` shapes over argument shapes.
 function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
+    fn in (:hsgp, :spline) && return :vector
     :invalid in argshapes && return :invalid
     :array in argshapes && return _array_call_shape(fn, argshapes)
     nvec = count(==(:vector), argshapes)
@@ -2366,6 +2366,7 @@ _is_dotted_call(ex) =
     ex.args[2] isa Expr && ex.args[2].head === :tuple
 
 function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
+    ex in (:pi, :π) && ex ∉ names && return Float64(pi)
     ex isa Expr || return ex
     ex.head === :quote && return ex
     # An array-cell plate column: its cell runs inside an RK plate, in
@@ -3603,6 +3604,8 @@ function _lower_kernel_plate(st::Expr, line::Int, data::Set{Symbol},
     subj === nothing &&
         _sfail("$where needs `subjects=N` (an integer literal or a " *
                "dims-key name bound at bind)")
+    count = _static_count(subj)
+    count === nothing || (subj = count)
     subjects = if subj isa Int
         subj > 0 ||
             _sfail("$where subject count must be positive, got $subj")
@@ -3676,7 +3679,8 @@ function _lower_kernel_plate(st::Expr, line::Int, data::Set{Symbol},
     collected === nothing &&
         _sfail("$where cell must end with a collected result name (a " *
                "bare cell name)")
-    obs = obs_stmt === nothing ? KernelObs[] : _lower_kernel_obs(obs_stmt, params, where)
+    obs = obs_stmt === nothing ? KernelObs[] :
+        _lower_kernel_obs(obs_stmt, params, where; assignments)
     local_names = union(Set{Symbol}(params),
         Set{Symbol}(nm for (nm, _) in assignments))
     collected in local_names ||
@@ -3781,7 +3785,7 @@ function _hoist_kernel_obs_args!(assignments, stmt::Expr, taken::Set{Symbol}, wh
 end
 
 function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
-        form::String = "panel v1")
+        form::String = "panel v1"; assignments = nothing)
     resp = stmt.args[2]
     plate = form == "plate v1"
     resp isa Symbol ||
@@ -3823,12 +3827,32 @@ function _lower_kernel_obs(stmt::Expr, params::Vector{Symbol}, where,
                "only — `$head.(...)` is grouped-only (declare a schedule)")
     end
     fam, arity = spec
-    dargs = _distribution_args(head, dist.args[2].args)
+    dargs = copy(_distribution_args(head, dist.args[2].args))
     length(dargs) == arity ||
         _sfail("$where `$head.(...)` takes exactly $arity arguments, " *
                "got $(length(dargs))")
     for (i, ref) in enumerate(dargs)
         nm = i == 1 ? :location : i == 2 ? :scale : :params
+        if ref isa Expr && assignments !== nothing
+            _reject_unknown_calls("$where obs $nm", ref; composed_maps = true)
+            folded = _fold_literal(ref)
+            if folded !== nothing
+                ref = folded
+            else
+                taken = union(Set{Symbol}(params),
+                    Set{Symbol}(first(a) for a in assignments),
+                    Set{Symbol}(_plate_value_names(dist)))
+                k = length(assignments) + 1
+                name = Symbol(:_rkppl_obs_, k)
+                while name in taken
+                    k += 1
+                    name = Symbol(:_rkppl_obs_, k)
+                end
+                push!(assignments, name => _argument_value_calls(ref))
+                ref = name
+            end
+            dargs[i] = ref
+        end
         ref isa Symbol || (ref isa Number && !(ref isa Bool)) ||
             _sfail("$where obs $nm must be a cell/model name or a " *
                    "numeric literal, got $(repr(ref))")
@@ -4014,6 +4038,8 @@ function _lower_plate_stmt(st::Expr, line::Int, data::Set{Symbol}, ctx,
         _sfail("$where range is `1:<N>` (an integer literal or a " *
                "dims-key name bound at bind), got $(repr(rng))")
     subj = rng.args[3]
+    count = _static_count(subj)
+    count === nothing || (subj = count)
     subjects = if subj isa Int
         subj > 0 ||
             _sfail("$where subject count must be positive, got $subj")
@@ -4142,7 +4168,7 @@ function _lower_grouped_cell(where, result::Symbol, subjects,
         end
         push!(lp_args, (pname, raw))
     end
-    obses = KernelObs[_lower_kernel_obs(s, resps, where, "plate v1")
+    obses = KernelObs[_lower_kernel_obs(s, resps, where, "plate v1"; assignments)
         for s in obs_stmts]
     local_names = union(Set{Symbol}(resps), Set{Symbol}(lpraws),
         Set{Symbol}(nm for (nm, _) in assignments))
@@ -5696,8 +5722,9 @@ function _plate_column_expr(nm::Symbol, call::Expr,
 end
 
 _literal_range_len(r) = (r isa Expr && r.head === :call && length(r.args) == 3 &&
-    r.args[1] === :(:) && r.args[2] == 1 && r.args[3] isa Int &&
-    r.args[3] >= 1) ? r.args[3] : nothing
+    r.args[1] === :(:) && _static_count(r.args[2]) == 1 &&
+    _static_count(r.args[3]) !== nothing && _static_count(r.args[3]) >= 1) ?
+    _static_count(r.args[3]) : nothing
 
 # Rows per index (`b[i, 1:K] = row` in an array plate): `b` stands for the
 # matrix whose column k is the plate column `_rkppl_row_b_k`. A read of a
@@ -6338,6 +6365,8 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
     end
     if _is_literal_range(a)
         lo, hi = a.args[2], a.args[3]
+        count = _static_count(hi)
+        count === nothing || (hi = count)
         cnt = lo === 1 ? _levels_count(hi) : nothing
         if cnt !== nothing
             # `1:length(levels(g)) - k`: a positional axis whose length is
@@ -6518,7 +6547,7 @@ function _lower_lhs_range(col::Symbol, r)
     # Literal `1:N`: structural cover check now (start 1, non-empty);
     # `N == n_obs` is verified at bind (the range rides the plan).
     if r isa Expr && r.head === :call && length(r.args) == 3 && r.args[1] === :(:)
-        lo, hi = r.args[2], r.args[3]
+        lo, hi = _static_count(r.args[2]), _static_count(r.args[3])
         lo === 1 || _sfail("response $col range must start at 1 " *
                            "(got $(repr(r))) — ranges cover eachindex exactly")
         hi isa Integer || _sfail("response $col range endpoint is " *
@@ -7889,7 +7918,8 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
     # predictor. Every other family
     # routes through `_lower_location`, which admits a value location
     # here (a scalar parameter or data column under the written link).
-    pname = (family === BinomialProbFam ||
+    pname = family === BetaShapeFam ? _argument_location!(lhs, loc, ctx,
+        predictors, pred_idx) : (family === BinomialProbFam ||
             family === ZeroInflatedBinomialFam) ?
         _lower_prob_location(lhs, loc, ctx, predictors, pred_idx,
             family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
@@ -8143,81 +8173,25 @@ function _match_bare_beta(lhs, compcall::Expr)
     return m1, k1
 end
 
-# One mixture location: a vector predictor definition (or inline affine)
-# lowers to a predictor (link-space; shared definitions intern by name
-# like CategoricalLogit etas); a sampled scalar parameter or numeric
-# literal rides scalar (constrained-scale). Link wrappers apply to
-# predictors only (a wrapped param/literal fails); bare predictors fail
-# (link-space predictors wrap). Scan/latent/matrix/data columns fail
-# closed (data wraps in an offset-only predictor first).
+# Mixture component locations use the same value/predictor lowering as a
+# standalone response. A bare sampled parameter remains a constrained-scale
+# slot; an explicit link applies equally to a parameter or a definition.
 function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
         predictors, pred_idx, coefuse)
-    if loc isa Bool
-        _sfail("response $lhs: mixture component $k location is Boolean " *
-               "— locations are numeric")
-    elseif loc isa Real
-        wrapped && _sfail("response $lhs: mixture component $k wraps a " *
-            "literal in a link function — link wrappers apply to " *
-            "predictors (spell literals constrained-scale)")
-        return loc
-    elseif loc isa Symbol
-        loc in ctx.scan_states && _sfail("response $lhs: mixture " *
-            "component $k location is a scan state — scan-state mixture " *
-            "locations are a follow-up")
-        loc in ctx.plate_names && _sfail("response $lhs: mixture " *
-            "component $k location is a per-cell latent — latent mixture " *
-            "locations are a follow-up")
-        haskey(ctx.matrices, loc) && _sfail("response $lhs: mixture " *
-            "component $k location $loc is a design matrix — locations " *
-            "are predictors, sampled parameters, or literals")
-        # A stated-prior alias reads like the name itself (a sampled
-        # parameter), so it never routes here. Only an undeclared
-        # intercept-only def (the SB `mu ~ 1` mirror) did, and strict
-        # declarations refuse that name at prior lowering: a constant
-        # location is a declared scalar spelled bare.
-        if loc in ctx.vecdefs && haskey(ctx.detmap, loc) ||
-                _is_scalar_coef_def(loc, ctx, false)
-            wrapped || _sfail("response $lhs: mixture component $k " *
-                "location $loc is a predictor — link-space predictors " *
-                "wrap (`Poisson.(exp.(eta))`); bare slots are sampled " *
-                "parameters or literals")
-            _derived_reads_latent(loc, ctx) &&
-                !_is_design_shaped(loc, ctx) && _sfail("response $lhs: " *
-                "mixture component $k location reads a latent — latent " *
-                "mixture locations are a follow-up")
-            return _lower_location(lhs, loc, pred_link, ctx, predictors,
-                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"))
+    loc isa Bool && _sfail("response $lhs: mixture component $k location is Boolean " *
+        "— locations are numeric")
+    if wrapped
+        return _mixture_component_context(lhs, k) do
+            _lower_location(lhs, loc, pred_link, ctx, predictors,
+                pred_idx, coefuse; value=true,
+                synth=Symbol(lhs, "_mix_", k, "_eta"))
         end
-        if haskey(ctx.detmap, loc) && pred_link === IdentityLink
-            return _lower_location(lhs, loc, pred_link, ctx, predictors,
-                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
-                value = true)
-        end
-        if loc in ctx.prior_names
-            wrapped && _sfail("response $lhs: mixture component $k " *
-                "wraps the sampled parameter $loc in a link function — " *
-                "link wrappers apply to predictors (spell sampled " *
-                "parameters bare, constrained-scale)")
-            return loc
-        end
-        if loc in ctx.data && pred_link === IdentityLink
-            return _lower_location(lhs, loc, pred_link, ctx, predictors,
-                pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
-                value = true)
-        end
-        _sfail("response $lhs: mixture component $k location $loc is not " *
-               "a predictor definition, sampled parameter, or literal")
-    else
-        wrapped || _sfail("response $lhs: mixture component $k location " *
-            "is an inline expression — inline locations lower as " *
-            "predictors, so link-space expressions wrap " *
-            "(`Poisson.(exp.(eta))`); bare slots are sampled parameters " *
-            "or literals")
-        # An inline link-space expression: a synthetic predictor, the
-        # CategoricalLogit-eta precedent.
-        return _lower_location(lhs, loc, pred_link, ctx, predictors,
-            pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"))
     end
+    loc isa Real && return loc
+    loc isa Symbol && loc in ctx.prior_names && return loc
+    _sfail("response $lhs: mixture component $k bare location $(repr(loc)) " *
+        "must be a sampled parameter or literal; an explicit link " *
+        "uses the ordinary response value lowering")
 end
 
 # Mixture weights: a literal numeric vector, a simplex parameter name,
@@ -9027,8 +9001,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
         return GammaValueFam, IdentityLink, IdentityLink, div, a1,
         nothing, nothing, nothing, nothing
     elseif fam === :Beta
-        loc, scale = _lower_beta_args(lhs, args, ctx)
-        return BetaLogitFam, LogitLink, IdentityLink, loc, scale, nothing,
+        bfam, blink, plink, loc, scale = _lower_beta_args(lhs, args, ctx)
+        return bfam, blink, plink, loc, scale, nothing,
         nothing, nothing, nothing
     elseif fam === :BetaBinomial2
         length(args) == 3 || _sfail("response $lhs: `BetaBinomial2` takes " *
@@ -9145,63 +9119,49 @@ end
 # or structurally equal scale-predictor spellings (bare or one
 # `exp.`/`logistic.` wrapper over the same predictor). Anything else —
 # mixed wrappers, distinct predictors — is a mismatch, never a merge.
-function _same_aux(a, b)
-    ka = _aux_key(a)
-    kb = _aux_key(b)
-    return ka !== nothing && ka == kb
-end
-
-function _aux_key(a)
-    a isa Symbol && return (:bare, a)
-    a isa Real && return (:lit, a)
-    if a isa Expr && a.head === :. && length(a.args) == 2 &&
-            a.args[1] isa Symbol && a.args[1] in (:exp, :logistic) &&
-            a.args[2] isa Expr && a.args[2].head === :tuple &&
-            length(a.args[2].args) == 1 && a.args[2].args[1] isa Symbol
-        return (:wrap, a.args[1], a.args[2].args[1])
-    end
-    return nothing
-end
+_same_aux(a, b) = a == b
 
 const _BETA_MSG = "`Beta.(logistic.(mu) .* kappa, (1 .- logistic.(mu)) .* kappa)`"
 
-# Beta mean-concentration shape: both positions share the SAME mu expression
-# (structurally) and the SAME kappa (name or literal, Gamma-precedent check);
-# mu link is logistic only in slice 2. Arguments arrive in `:call` form
-# (dotted operators parse as calls); the nested `logistic.(mu)` stays dotted
-# and converts explicitly, mirroring `_lower_gamma_args`.
+# Preserve the mean/concentration design when the authored shapes match
+# it exactly; every other Beta(alpha, beta) uses its two ordinary values.
 function _lower_beta_args(lhs, args, ctx)
-    length(args) == 2 ||
-        _sfail("response $lhs: `Beta` takes $_BETA_MSG")
-    a1, a2 = args
-    swapped = a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
-        a1.args[1] === Symbol(".*") && a1.args[2] isa Expr &&
-        a1.args[2].head === :call && length(a1.args[2].args) == 3 &&
-        a1.args[2].args[1] === Symbol(".-") && a1.args[2].args[2] == 1
-    swapped && ((a1, a2) = (a2, a1))
-    a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
-        a1.args[1] === Symbol(".*") ||
-        _sfail("response $lhs: `Beta` first position is `mu .* kappa` " *
-               "(`$_BETA_MSG`), got $(repr(a1))")
-    a2 isa Expr && a2.head === :call && length(a2.args) == 3 &&
-        a2.args[1] === Symbol(".*") ||
-        _sfail("response $lhs: `Beta` second position is " *
-               "`(1 .- mu) .* kappa` (`$_BETA_MSG`), got $(repr(a2))")
-    c = a2.args[2]
-    c isa Expr && c.head === :call && length(c.args) == 3 &&
-        c.args[1] === Symbol(".-") && c.args[2] == 1 ||
-        _sfail("response $lhs: `Beta` second position is " *
-               "`(1 .- mu) .* kappa` (`$_BETA_MSG`), got $(repr(a2))")
-    m1, k1 = a1.args[2], a1.args[3]
-    m2, k2 = c.args[3], a2.args[3]
-    m1 == m2 || _sfail("response $lhs: both `Beta` positions must share " *
-                       "the same mu expression " *
-                       "(got $(repr(m1)) and $(repr(m2)))")
-    _same_aux(k1, k2) || _sfail(
-        "response $lhs: both `Beta` positions must name the same kappa " *
-        "(got $(repr(k1)) and $(repr(k2)))")
-    loc = _lower_link_arg(lhs, _dot2call_nested_link(lhs, m1, :Beta), :logistic)
-    return swapped ? Expr(:call, Symbol(".-"), loc) : loc, k1
+    length(args) == 2 || _sfail("response $lhs: Beta takes (alpha, beta)")
+    # Try both mean/concentration orders without changing arbitrary shapes.
+    for (a1, a2, swapped) in ((args[1], args[2], false), (args[2], args[1], true))
+        if a1 isa Expr && a1.head === :call && length(a1.args) == 3 &&
+                a1.args[1] === :.* && a2 isa Expr && a2.head === :call &&
+                length(a2.args) == 3 && a2.args[1] === :.*
+            c = a2.args[2]
+            if c isa Expr && c.head === :call && length(c.args) == 3 &&
+                    c.args[1] === :.- && c.args[2] == 1 &&
+                    a1.args[2] == c.args[3] && _same_aux(a1.args[3], a2.args[3])
+                mu = a1.args[2]
+                if _is_dotted_call(mu) && mu.args[1] === :logistic &&
+                        length(mu.args[2].args) == 1
+                    loc = _lower_link_arg(lhs,
+                        _dot2call_nested_link(lhs, mu, :Beta), :logistic)
+                    swapped && (loc = Expr(:call, :.-, loc))
+                    return BetaLogitFam, LogitLink, IdentityLink, loc, a1.args[3]
+                end
+            end
+        end
+    end
+    return BetaShapeFam, IdentityLink, IdentityLink, args[1], args[2]
+end
+
+function _argument_location!(lhs, raw, ctx, predictors, pred_idx)
+    value = _lower_argument_value(lhs, :alpha, raw, ctx)
+    if value isa Symbol && (value in ctx.data || value in ctx.vecdefs ||
+            value in ctx.plate_names || any(d -> d.name === value, ctx.synth_derived))
+        name = get(ctx.predictor_pins, lhs, Symbol(lhs, :_alpha))
+        haskey(ctx.predictor_pins, lhs) && _claim_pin!(lhs, name, ctx, pred_idx)
+        term = TermSpec(OffsetTerm, [value], NamedTuple(), value, Symbol(name, :_off))
+        push!(predictors, PredictorSpec(name, IdentityLink, [term], name))
+        pred_idx[name] = length(predictors)
+        return name
+    end
+    return _value_location!(lhs, value, IdentityLink, ctx, predictors, pred_idx)
 end
 
 function _lower_response_base_error(lhs, rhs, fam)
@@ -9354,238 +9314,108 @@ function _lower_prob_location(lhs, loc, ctx, predictors, pred_idx,
                   "got $(repr(loc))")
 end
 
-function _lower_scale(lhs, s, ctx)
-    s isa Real && return s
-    s === :Inf && return Inf
-    if s isa Symbol
-        haskey(ctx.matrices, s) && _sfail(
-            "response $lhs scale $s is a design matrix — scales are " *
-            "scalar (a parameter/assignment name, a per-observation data " *
-            "column, or a literal)")
-        # A per-observation scale is a RAW data column (the eight-schools known
-        # SE `se[i]`): it threads through the response plate per cell exactly
-        # like a per-obs weight column (the generator's `_thread_ref!`
-        # broadcasts a scalar param and iterates a per-obs column). A DERIVED
-        # column scale still needs shape metadata the plate cannot yet size,
-        # so keep it rejected with an actionable message.
-        s in ctx.vecdefs && _sfail(
-            "response $lhs scale $s is a derived column — a per-observation " *
-            "scale must be a raw data column (bind it raw) or a scalar " *
-            "parameter/assignment name (planned: derived-column scales)")
-        return s
+# Distribution arguments are values. Named affine predictors retain their
+# design representation; other expressions share the ordinary assignment
+# graph, including scalar calls and per-observation broadcasts.
+# Link maps are also ordinary functions in a value argument. Resolve
+# them to the same scalar arithmetic used by the predictor inverse link.
+function _argument_value_calls(ex)
+    ex isa Expr || return ex
+    args = Any[_argument_value_calls(a) for a in ex.args]
+    if _is_dotted_call(ex) && ex.args[1] === :logistic &&
+            length(ex.args[2].args) == 1
+        x = only(args[2].args)
+        return :(1 ./ (1 .+ exp.(-1 .* $x)))
+    elseif ex.head === :call && ex.args[1] === :logistic && length(ex.args) == 2
+        return :(1 / (1 + exp(-$(args[2]))))
     end
-    if s isa Expr && s.head === :ref && !_obs_axis(s, ctx.data,
-            ctx.detmap, ctx.detshape, Set{Symbol}(), ctx.shape_env)
-        return _composed_scalar_leaf!(Symbol(lhs, :_scale), s, ctx, Symbol[])
-    end
-    return _sfail("response $lhs scale must be a parameter, data value, " *
-        "scalar expression or predictor, got $(repr(s))")
+    return Expr(ex.head, args...)
 end
 
-# Student nu use-site lowering: a bare parameter/assignment name or a
-# literal stays scalar; a predictor definition feeds the nu slot — bare
-# for an identity-link nu (`StudentT.(lognu, mu, sigma)`), or under one
-# dotted link wrapper (`StudentT.(exp.(lognu), mu, sigma)` for log,
-# `logistic.(lognu)` for logit). The wrapper arrives unconverted (the nu
-# position passes the spine converter through, like scale), so it matches
-# here in dotted `Expr(:., ...)` form. Undotted wrappers fail closed
-# (scalar `exp(log_nu)` use-site wrappers are deferred — the LP link
-# spells the transform instead), as do wrappers over anything but a
-# predictor definition. No per-observation columns (a column name fails at
-# the contract's unknown-name gate), no expressions (bind via an
-# assignment first).
-function _lower_nu_use(lhs, s, ctx, predictors, pred_idx, coefuse)
-    s === nothing && return nothing
-    s isa Real && return s
-    if s isa Expr && s.head === :.
-        return _lower_nu_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
+function _lower_argument_value(lhs, slot, value, ctx)
+    value isa Real && return value
+    value === :Inf && return Inf
+    value in (:pi, :π) && value ∉ ctx.taken && return Float64(pi)
+    if value isa Symbol
+        value in ctx.taken || _sfail("response $lhs $slot references " *
+            "undeclared name $value")
+        haskey(ctx.matrices, value) && _sfail("response $lhs $slot " *
+            "$value is a design matrix; use a scalar or one value per row")
+        return value
     end
-    if s isa Expr && s.head === :call && !isempty(s.args) &&
-            s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
-        return _sfail("response $lhs nu wraps `$(s.args[1])` undotted " *
-                      "(`$(repr(s))`) — nu link wrappers broadcast " *
-                      "(`$(s.args[1]).(predictor)` over a predictor " *
-                      "definition); scalar `exp(log_nu)` use-site " *
-                      "wrappers are deferred (spell the transform as the " *
-                      "predictor's link instead)")
+    value isa Expr || _sfail("response $lhs $slot must be a value, " *
+        "got $(repr(value))")
+    rhs = _resolve_module_calls(value, ctx.mod, ctx.taken,
+        "response $lhs $slot")
+    _reject_unknown_calls("response $lhs $slot", rhs; composed_maps = true)
+    rhs = _argument_value_calls(rhs)
+    rhs = _canonical_expr(rhs, ctx.data, ctx.detmap, ctx.detshape,
+        ctx.shape_env, "response $lhs $slot")
+    for name in _value_symbols(rhs)
+        name in ctx.taken || name in (:pi, :Inf) || _sfail(
+            "response $lhs $slot references undeclared name $name")
     end
-    # A bare nu keeps the scalar meaning: an alias over a stated prior
-    # lowers like the name itself (a parameter), never as a predictor.
-    if s isa Symbol && _is_scale_predictor_def(s, ctx, false)
-        pname = _lower_scale_predictor(lhs, s, IdentityLink, ctx, predictors,
-            pred_idx, coefuse)
+    folded = _fold_literal(rhs)
+    folded === nothing || return folded
+    shape = _canon_shape(rhs, ctx)
+    shape in (:scalar, :vector) || _sfail("response $lhs $slot " *
+        "needs a scalar or one value per row, got $shape")
+    if shape === :vector
+        return _extract_column(lhs, rhs, ctx)
+    end
+    return get!(ctx.leaf_exprs, rhs) do
+        while true
+            ctx.synth[] += 1
+            name = Symbol(:_rkppl_arg_, ctx.synth[])
+            name in ctx.taken && continue
+            push!(ctx.taken, name)
+            push!(ctx.synth_assigns, AssignmentSpec(name, rhs, name))
+            return name
+        end
+    end
+end
+
+function _lower_argument_use(lhs, slot, value, ctx, predictors, pred_idx,
+        coefuse)
+    value === nothing && return nothing
+    if slot !== :zi && value isa Symbol &&
+            _is_scale_predictor_def(value, ctx, false)
+        pname = _lower_scale_predictor(lhs, value, IdentityLink, ctx,
+            predictors, pred_idx, coefuse)
         return ScalePredictorRef(pname, IdentityLink)
     end
-    if s isa Symbol
-        return s
+    if _is_dotted_call(value) && value.args[1] in (:exp, :logistic) &&
+            length(value.args[2].args) == 1
+        inner = only(value.args[2].args)
+        if inner isa Symbol && _is_scale_predictor_def(inner, ctx, true)
+            link = value.args[1] === :exp ? LogLink : LogitLink
+            pname = _lower_scale_predictor(lhs, inner, link, ctx,
+                predictors, pred_idx, coefuse)
+            return ScalePredictorRef(pname, link)
+        end
     end
-    return _sfail("response $lhs nu must be a bare parameter/assignment " *
-                  "name, a literal, a bare predictor definition, or one " *
-                  "`exp.`/`logistic.` wrapper over a predictor definition " *
-                  "(bind expressions via an assignment first), got $(repr(s))")
+    # Bare data in nu/zi uses the same derived-value graph as an inline
+    # expression, so its declared shape is present before data binding.
+    if slot !== :scale && value isa Symbol && value in ctx.data
+        return _extract_column(lhs, Expr(:call, :.*, 1.0, value), ctx)
+    end
+    return _lower_argument_value(lhs, slot, value, ctx)
 end
 
-function _lower_nu_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
-    f = length(s.args) >= 1 ? s.args[1] : nothing
-    targs = length(s.args) == 2 && s.args[2] isa Expr &&
-            s.args[2].head === :tuple ? s.args[2].args : Any[]
-    if !(f isa Symbol && f in (:exp, :logistic)) || length(targs) != 1
-        return _sfail("response $lhs nu $(repr(s)) is not an admitted " *
-                      "nu use — write a bare parameter/assignment name, " *
-                      "a literal, a bare predictor definition, or one " *
-                      "`exp.`/`logistic.` wrapper over a predictor definition")
-    end
-    inner = only(targs)
-    inner isa Symbol && _is_scale_predictor_def(inner, ctx, true) || return _sfail(
-        "response $lhs nu $(repr(s)): `$f.` wraps a predictor " *
-        "definition (`$f.(predictor)` with `predictor = ...` affine in " *
-        "data) — got $(repr(inner))")
-    link = f === :exp ? LogLink : LogitLink
-    pname = _lower_scale_predictor(lhs, inner, link, ctx, predictors,
-        pred_idx, coefuse)
-    return ScalePredictorRef(pname, link)
-end
+_lower_nu_use(lhs, s, ctx, predictors, pred_idx, coefuse) =
+    _lower_argument_use(lhs, :nu, s, ctx, predictors, pred_idx, coefuse)
+_lower_zi_use(lhs, s, ctx, predictors, pred_idx, coefuse) =
+    _lower_argument_use(lhs, :zi, s, ctx, predictors, pred_idx, coefuse)
+_lower_scale_use(lhs, s, ctx, predictors, pred_idx, coefuse) =
+    _lower_argument_use(lhs, :scale, s, ctx, predictors, pred_idx, coefuse)
 
-# ZIP zi use-site lowering (the hurdle p_zero precedent): a scalar zi
-# (parameter/assignment name, literal) passes through untouched; a
-# predictor definition feeds the zi slot — bare for an identity-link zi,
-# or under one dotted link wrapper (`logistic.(zeta)` for logit,
-# `exp.(zeta)` for log). The wrapper arrives unconverted (the zi
-# position passes the spine converter through), so it matches here in
-# dotted `Expr(:., ...)` form. Undotted wrappers fail closed (scalar
-# `exp(log_zi)` use-site wrappers are deferred — the LP link spells the
-# transform instead), as do wrappers over anything but a predictor
-# definition. The contract gates the link (logit-only — a probability)
-# and the predictor rules, so hand-built plans get the same rule. No
-# per-observation columns (a column name fails at the contract's
-# unknown-name gate), no expressions (bind via an assignment first).
-function _lower_zi_use(lhs, s, ctx, predictors, pred_idx, coefuse)
-    s === nothing && return nothing
-    s isa Real && return s
-    if s isa Expr && s.head === :.
-        return _lower_zi_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
-    end
-    if s isa Expr && s.head === :call && !isempty(s.args) &&
-            s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
-        return _sfail("response $lhs zi wraps `$(s.args[1])` undotted " *
-                      "(`$(repr(s))`) — zi link wrappers broadcast " *
-                      "(`$(s.args[1]).(predictor)` over a predictor " *
-                      "definition); scalar `exp(log_zi)` use-site " *
-                      "wrappers are deferred (spell the transform as the " *
-                      "predictor's link instead)")
-    end
-    # A bare zi keeps the scalar meaning: an alias over a stated prior
-    # lowers like the name itself (a parameter), never as a predictor.
-    if s isa Symbol && _is_scale_predictor_def(s, ctx, false)
-        pname = _lower_scale_predictor(lhs, s, IdentityLink, ctx, predictors,
-            pred_idx, coefuse)
-        return ScalePredictorRef(pname, IdentityLink)
-    end
-    s isa Symbol && return s
-    return _sfail("response $lhs zi must be a bare parameter/assignment " *
-                  "name, a literal, a bare predictor definition, or one " *
-                  "`exp.`/`logistic.` wrapper over a predictor definition " *
-                  "(bind expressions via an assignment first), got $(repr(s))")
-end
-
-function _lower_zi_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
-    f = length(s.args) >= 1 ? s.args[1] : nothing
-    targs = length(s.args) == 2 && s.args[2] isa Expr &&
-            s.args[2].head === :tuple ? s.args[2].args : Any[]
-    if !(f isa Symbol && f in (:exp, :logistic)) || length(targs) != 1
-        return _sfail("response $lhs zi $(repr(s)) is not an admitted " *
-                      "zi use — write a bare parameter/assignment name, " *
-                      "a literal, a bare predictor definition, or one " *
-                      "`exp.`/`logistic.` wrapper over a predictor definition")
-    end
-    inner = only(targs)
-    inner isa Symbol && _is_scale_predictor_def(inner, ctx, true) || return _sfail(
-        "response $lhs zi $(repr(s)): `$f.` wraps a predictor " *
-        "definition (`$f.(predictor)` with `predictor = ...` affine in " *
-        "data) — got $(repr(inner))")
-    link = f === :exp ? LogLink : LogitLink
-    pname = _lower_scale_predictor(lhs, inner, link, ctx, predictors,
-        pred_idx, coefuse)
-    return ScalePredictorRef(pname, link)
-end
-
-# VonMises interval use-site lowering: `nothing` for exact `VonMises`
-# (moving support), or the `(lo, hi)` endpoint pair for
-# `CircularVonMises` (fixed principal interval). Endpoints are
-# compile-time numeric literals — a Real, `:pi`, or unary minus over
-# those (the BRM `interval=` rule); anything else fails closed here,
-# and the contract re-checks finiteness, order, and the `2pi` width.
+# Principal-interval endpoints use the same value graph as other
+# distribution arguments; their width and support are guarded lazily.
 function _lower_interval_use(lhs, raw, ctx)
     raw === nothing && return nothing
-    raw isa Tuple && length(raw) == 2 ||
-        _sfail("response $lhs: `CircularVonMises` takes literal endpoints " *
-               "`CircularVonMises.(mu, kappa, lo, hi)`")
-    return (Float64(_lower_interval_endpoint(lhs, raw[1])),
-        Float64(_lower_interval_endpoint(lhs, raw[2])))
-end
-
-function _lower_interval_endpoint(lhs, a)
-    a isa Real && return a
-    a === :pi && return pi
-    if a isa Expr && a.head === :call && length(a.args) == 2 &&
-            a.args[1] === :(-)
-        inner = a.args[2]
-        inner isa Real && return -inner
-        inner === :pi && return -pi
-    end
-    return _sfail("response $lhs interval endpoints must be numeric " *
-                  "literals (a Real, `pi`, or `-pi`), got $(repr(a))")
-end
-
-# Scale use-site lowering (Gaussian sigma, NB2 phi, Gamma alpha, Beta
-# kappa, Student sigma, hurdle p_zero, BetaBinomial2 phi, VonMises
-# kappa, NB1 p): a scalar scale
-# (parameter/assignment name, raw per-observation data column, literal)
-# passes through `_lower_scale` untouched; a
-# predictor definition feeds the scale slot — bare for an identity-link
-# scale (`Normal.(mu, sigma)`), or under one dotted link wrapper
-# (`Normal.(mu, exp.(sigma))` for log, `logistic.(sigma)` for logit).
-# The wrapper arrives unconverted (the scale position passes the spine
-# converter through), so it matches here in dotted `Expr(:., ...)` form.
-# Undotted wrappers fail closed (scalar `exp(log_sigma)` use-site
-# wrappers are deferred — the LP link spells the transform instead), as
-# do wrappers over anything but a predictor definition.
-function _lower_scale_use(lhs, s, ctx, predictors, pred_idx, coefuse)
-    # Scaleless families (Bernoulli/Poisson/Binomial) carry `nothing`
-    # through untouched.
-    s === nothing && return nothing
-    if s isa Expr && s.head === :.
-        if s.args[1] in (:exp, :logistic) &&
-                length(s.args[2].args) == 1 &&
-                only(s.args[2].args) isa Symbol &&
-                _is_scale_predictor_def(only(s.args[2].args), ctx, true)
-            return _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
-        end
-        pname = _lower_argument_predictor!(lhs, s, ctx, predictors,
-            pred_idx, coefuse, Symbol(lhs, "_scale_value"))
-        return ScalePredictorRef(pname, IdentityLink)
-    elseif s isa Expr && _canon_shape(s, ctx) === :vector
-        pname = _lower_argument_predictor!(lhs, s, ctx, predictors,
-            pred_idx, coefuse, Symbol(lhs, "_scale_value"))
-        return ScalePredictorRef(pname, IdentityLink)
-    end
-    if s isa Expr && s.head === :call && !isempty(s.args) &&
-            s.args[1] isa Symbol && s.args[1] in (:exp, :logistic)
-        return _sfail("response $lhs scale wraps `$(s.args[1])` undotted " *
-                      "(`$(repr(s))`) — scale link wrappers broadcast " *
-                      "(`$(s.args[1]).(predictor)` over a predictor " *
-                      "definition); scalar `exp(log_sigma)` use-site " *
-                      "wrappers are deferred (spell the transform as the " *
-                      "predictor's link instead)")
-    end
-    # A bare scale keeps the scalar meaning: an alias over a stated prior
-    # lowers like the name itself (a parameter), never as a predictor.
-    if s isa Symbol && _is_scale_predictor_def(s, ctx, false)
-        pname = _lower_scale_predictor(lhs, s, IdentityLink, ctx, predictors,
-            pred_idx, coefuse)
-        return ScalePredictorRef(pname, IdentityLink)
-    end
-    return _lower_scale(lhs, s, ctx)
+    raw isa Tuple && length(raw) == 2 || _sfail("response $lhs: " *
+        "CircularVonMises takes (mu, kappa, lo, hi)")
+    return map(a -> _lower_argument_value(lhs, :interval, a, ctx), raw)
 end
 
 # A bare scale name feeds the predictor slot when it is a per-observation
@@ -9676,28 +9506,6 @@ end
 _is_factor_coefficient_alias(ex::Expr, ctx, seen::Set{Symbol}) =
     _is_factor_index_def(ex, ctx) && ex.args[1] in ctx.factor_decls
 _is_factor_coefficient_alias(ex, ctx, seen::Set{Symbol}) = false
-
-function _lower_scale_wrapped(lhs, s, ctx, predictors, pred_idx, coefuse)
-    f = length(s.args) >= 1 ? s.args[1] : nothing
-    targs = length(s.args) == 2 && s.args[2] isa Expr &&
-            s.args[2].head === :tuple ? s.args[2].args : Any[]
-    if !(f isa Symbol && f in (:exp, :logistic)) || length(targs) != 1
-        return _sfail("response $lhs scale $(repr(s)) is not an admitted " *
-                      "scale use — write a bare parameter/assignment name, " *
-                      "a per-observation data column, a literal, a bare " *
-                      "predictor definition, or one `exp.`/`logistic.` " *
-                      "wrapper over a predictor definition")
-    end
-    inner = only(targs)
-    inner isa Symbol && _is_scale_predictor_def(inner, ctx, true) || return _sfail(
-        "response $lhs scale $(repr(s)): `$f.` wraps a predictor " *
-        "definition (`$f.(predictor)` with `predictor = ...` affine in " *
-        "data) — got $(repr(inner))")
-    link = f === :exp ? LogLink : LogitLink
-    pname = _lower_scale_predictor(lhs, inner, link, ctx, predictors,
-        pred_idx, coefuse)
-    return ScalePredictorRef(pname, link)
-end
 
 # Analyze (or intern) a scale predictor: exactly the location-predictor
 # treatment (`_lower_location`'s named-definition arm) under the use-site
@@ -11071,11 +10879,13 @@ function _classify_summand(pname, core, sign::Int, ctx)
         return _extract_summand(pname, core, sign, ctx)
     end
     head === :ref && return _classify_ref(pname, core, sign, ctx)
+    head === :macrocall && _sfail("predictor $pname: macros do not lower " *
+        "inside predictor expressions")
+    _canon_shape(core, ctx) === :scalar &&
+        return _extract_summand(pname, core, sign, ctx)
     if head === :call && !isempty(core.args) && core.args[1] === :.*
         return _classify_product(pname, core, sign, ctx)
     end
-    head === :macrocall && _sfail("predictor $pname: macros do not lower " *
-                                  "inside predictor expressions")
     # Any other per-observation summand (a computed coefficient, a
     # parameter-scaled column, `exp.(s .* x)`) is an in-graph derived
     # column: the fallback, never a refusal.
@@ -12440,6 +12250,15 @@ function _fold_literal(a)
     return r isa Real && isfinite(r) ? Float64(r) : nothing
 end
 
+# Preserve Julia's integer result when folding a structural count; the
+# prior arithmetic folder deliberately returns floating-point values.
+function _static_count(ex)
+    ex isa Integer && !(ex isa Bool) && return Int(ex)
+    _fold_literal(ex) === nothing && return nothing
+    value = _eval_value_expr(ex, s -> _sfail("unbound count $s"), :count)
+    return value isa Integer && !(value isa Bool) ? Int(value) : nothing
+end
+
 """Prior-argument hoisting: an expression in a prior's argument position
 (`b ~ Normal(0, 2 * s)`, `c[levels(g)] .~ Normal.(0, sqrt(v))`,
 `b[axes(X, 2)] .~ Normal.(0, [s1, 2 * s2])`) binds to a synthetic scalar
@@ -12510,6 +12329,10 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
             eta = bind(lhs, Symbol(lhs, :_arg2), rhs.args[3])
             eta === rhs.args[3] && return rhs
             return Expr(:call, rhs.args[1], rhs.args[2], eta, rhs.args[4:end]...)
+        end
+        if rhs.args[1] === :Ordered && length(rhs.args) == 3
+            inner = hoist_call(lhs, rhs.args[2])
+            return Expr(:call, :Ordered, inner, rhs.args[3])
         end
         if rhs.args[1] === :truncated && length(rhs.args) == 4
             inner = hoist_call(lhs, rhs.args[2])
@@ -13017,22 +12840,33 @@ function _threshold_size(lhs::Symbol, n, response::Symbol)
            "pair of adjacent levels), got $(repr(n))")
 end
 
-# `Normal(m, s)` with finite literal arguments (`Normal()` and `Normal(m)`
-# take Distributions.jl's defaults) → `(m, s)`: the iid element prior of a
-# cutpoint vector.
+# Normal's constructor defaults are explicit distribution semantics.
+# Its arguments may be named values, just as in scalar priors.
 function _threshold_normal_args(lhs::Symbol, d, what::String)
     d isa Expr && d.head === :call && !isempty(d.args) &&
-        d.args[1] === :Normal && length(d.args) <= 3 &&
-        all(a -> a isa Real && !(a isa Bool) && isfinite(a), d.args[2:end]) ||
-        _sfail("$what $lhs: the element prior is `Normal(m, s)` with " *
-               "finite literal arguments (other families and parameter " *
-               "arguments are not admitted for cutpoints yet), got " *
-               "$(repr(d))")
-    m = length(d.args) >= 2 ? Float64(d.args[2]) : 0.0
-    s = length(d.args) == 3 ? Float64(d.args[3]) : 1.0
-    s > 0 || _sfail("$what $lhs: the element prior scale must be positive, " *
-                    "got $s")
+        d.args[1] === :Normal && length(d.args) <= 3 || _sfail(
+            "$what $lhs: the element prior is `Normal(m, s)`, got $(repr(d))")
+    m = length(d.args) >= 2 ? d.args[2] : 0.0
+    s = length(d.args) == 3 ? d.args[3] : 1.0
+    all(a -> a isa Symbol || (a isa Real && !(a isa Bool) && isfinite(a)),
+        (m, s)) || _sfail("$what $lhs: element prior arguments must be " *
+            "finite values or declared names")
+    s isa Real && s <= 0 && _sfail("$what $lhs: element prior scale " *
+        "must be positive, got $s")
     return m, s
+end
+
+function _ordered_element_prior(lhs, d, coefuse, ctx)
+    if d isa Expr && d.head === :call && !isempty(d.args) && d.args[1] === :Normal
+        m, s = _threshold_normal_args(lhs, d, "Ordered vector")
+        return :ordered_normal, (arg1 = m, arg2 = s)
+    end
+    p = _lower_parameter(lhs, d, coefuse, ctx.matrices)
+    family = Symbol(:ordered_, p.family)
+    haskey(_VECTOR_ELEMENT_FAMILIES, family) && p.support_override === nothing ||
+        _sfail("Ordered vector $lhs: the element prior must have real " *
+            "support (Normal, Cauchy, Laplace, Logistic or StudentT)")
+    return family, p.args
 end
 
 # `c ~ Ordered(Normal(m, s), n)`: n iid `Normal(m, s)` elements restricted
@@ -13051,7 +12885,7 @@ function _lower_ordered(lhs, rhs, coefuse, ctx)
         "element distribution and the length " *
         "(`$lhs ~ Ordered(Normal(0, 1), length(levels(y)) - 1)`), got " *
         "$(length(args)) arguments")
-    m, s = _threshold_normal_args(lhs, args[1], "Ordered vector")
+    family, prior_args = _ordered_element_prior(lhs, args[1], coefuse, ctx)
     n = args[2]
     use = get(ctx.threshold_uses, lhs, nothing)
     size = if use !== nothing
@@ -13065,8 +12899,7 @@ function _lower_ordered(lhs, rhs, coefuse, ctx)
                "response `y` they serve (`y .~ OrderedLogistic.(eta, " *
                "Ref($lhs))`), got $(repr(n))")
     end
-    return VectorParameter(lhs, :ordered_normal, (arg1 = m, arg2 = s), size,
-        lhs)
+    return VectorParameter(lhs, family, prior_args, size, lhs)
 end
 
 # Stopping-ratio stage thresholds `c[1:n] .~ Normal.(m, s)`: one
@@ -13285,7 +13118,7 @@ function _lower_assignment(nm, rhs, coefuse)
     rhs isa Expr || rhs isa Symbol || rhs isa Real ||
         _sfail("assignment $nm must be an expression, name or literal, " *
                "got $(repr(rhs))")
-    return AssignmentSpec(nm, rhs, nm)
+    return AssignmentSpec(nm, _argument_value_calls(rhs), nm)
 end
 
 # Vector shape rules belong to validation (contract v3); lowering checks
@@ -13310,5 +13143,5 @@ function _lower_vector_assignment(nm, rhs, coefuse)
     rhs isa Expr || rhs isa Symbol ||
         _sfail("derived column $nm must be an expression or column alias, " *
                "got $(repr(rhs))")
-    return VectorAssignmentSpec(nm, rhs, nm)
+    return VectorAssignmentSpec(nm, _argument_value_calls(rhs), nm)
 end
