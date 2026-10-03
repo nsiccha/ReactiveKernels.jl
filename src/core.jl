@@ -742,9 +742,12 @@ struct _TensorizedEachcol{A}
     parent::A
 end
 
-struct _TensorizedPlateBatch{A}
+struct _TensorizedPlateBatch{A,S}
     values::A
+    schema::S
 end
+
+_TensorizedPlateBatch(values) = _TensorizedPlateBatch(values, nothing)
 
 @inline _tensorized_eachcol(parent) = _TensorizedEachcol(parent)
 # A backend may represent an in-flight plate value with its own marker type
