@@ -1269,7 +1269,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
                     for b in e.scan_blocks]...)))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
-        elseif e.kind === :array && e.transform === :lkj_stack
+        elseif e.kind === :array && _is_lkj_stack(e.transform)
             push!(pairs, e.name => _lkj_stack_constrain(e, seg))
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
@@ -1281,8 +1281,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             # Both LKJ-factor kinds share the host hyperspherical edges
             # (name/size-keyed — kind-agnostic); only `:varying_corr`
             # grows the derived `b_` draws below.
-            push!(pairs, e.name =>
-                lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size)))
+            L = lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size))
+            push!(pairs, e.name => (_is_upper_lkj(e.transform) ? permutedims(L) : L))
         else
             v = _constrain_elt(e, Float64(only(seg)))
             push!(pairs, e.name => v)
@@ -1433,7 +1433,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             size(v) == Tuple(e.dims) || throw(ContractValidationError(
                 "[layout] array parameter $(e.name) has size $(size(v)), " *
                 "want $(Tuple(e.dims))"))
-            if e.transform === :lkj_stack
+            if _is_lkj_stack(e.transform)
                 u[e.offset:(e.offset + e.size - 1)] .=
                     _lkj_stack_unconstrain(e, v)
                 continue
@@ -1466,7 +1466,8 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                       "must be a K×K matrix, got $(typeof(v))"),
             )
             u[e.offset:(e.offset + e.size - 1)] .=
-                lkj_chol_unconstrain(v, _lkj_dim(e.size))
+                lkj_chol_unconstrain(_is_upper_lkj(e.transform) ?
+                    permutedims(v) : v, _lkj_dim(e.size))
         else
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing parameter $(e.name)"),
@@ -1506,7 +1507,7 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             total += _vector_logjac(e, seg)
             continue
         end
-        if e.kind === :array && e.transform === :lkj_stack
+        if e.kind === :array && _is_lkj_stack(e.transform)
             # Level by level, the vine's coupled thetas.
             total += _lkj_stack_logjac(e, seg)
             continue

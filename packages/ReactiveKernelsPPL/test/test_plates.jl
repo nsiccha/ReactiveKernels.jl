@@ -69,17 +69,23 @@ end
     top = lower_rkppl(Expr(:block, head..., :(y .~ Normal.(c[g], s))), data; conditioned = data)
     got = lower_rkppl(Expr(:block, head...,
         _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(c[g[i]], s)))), data; conditioned = data)
-    @test _pl_canon(got) == _pl_canon(top)
-    # The index column must be data.
-    err = try
-        lower_rkppl(Expr(:block, head..., :(h = g),
-            _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(c[h[i]], s)))), data; conditioned = data)
-        nothing
-    catch e
-        e
-    end
     # capability: a data-index alias is an ordinary value (P8 1cmodra; todo `15lq8iu`).
-    @test_broken (err === nothing || throw(err))
+    aliased = lower_rkppl(Expr(:block, head..., :(h = g),
+        _pl_plate(:(eachindex(y)), :(y[i] ~ Normal(c[h[i]], s)))), data; conditioned = data)
+    # A retained plate and a vectorized gather may have different plans;
+    # both, including the index alias, must preserve the authored density.
+    cols = Dict(:y => [-0.1, 0.8, 0.2], :g => [1, 2, 1])
+    for plan in (top, got, aliased)
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        u = unconstrain(built.layout, (; s = 1.1, c = [-0.2, 0.4]))
+        oracle = v -> begin
+            q = constrain(built.layout, v)
+            sum(logpdf.(Normal(0, 2), q.c)) + logpdf(Exponential(), q.s) +
+                log(q.s) + sum(logpdf.(Normal.(q.c[cols[:g]], q.s), cols[:y]))
+        end
+        _check_model_math(built, bound, u, oracle)
+    end
     # Other cross-index reads stay refused.
     # refused: reads `g[i - 1]`, out of bounds at i = 1 in the Julia loop (P3)
     @test_throws "cross-index reads" lower_rkppl(Expr(:block, head...,

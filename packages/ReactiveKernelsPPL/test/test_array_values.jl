@@ -487,8 +487,9 @@ end
         y .~ Normal.(z[1], 1.0)
     end), (:y,); conditioned = (:y,))
     # A bare array combined with per-observation data.
-    # capability: array parameter broadcast with observation data z .+ x (valid Julia when lengths agree; refused shape-blind at lowering) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(:(begin
+    # capability: array parameters broadcast with observation data using
+    # ordinary Julia dimensions (todo `15lq8iu`).
+    @test (lower_rkppl(:(begin
         z[1:3] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
         w = z .+ x
@@ -507,8 +508,8 @@ end
         y .~ Normal.(mu, 1.0)
     end), (:y, :x); conditioned = (:y, :x))
     # LKJCholesky: non-literal eta, upper factor.
-    # capability: sampled LKJCholesky eta (P8 1cmodra admits sampled prior args) (todo `1308iv0`)
-    @test_broken (lower_rkppl(:(begin
+    # A sampled scalar is an ordinary LKJCholesky prior argument (P8).
+    @test (lower_rkppl(:(begin
         e ~ Exponential(1)
         L ~ LKJCholesky(2, e)
         a ~ Normal(0, 1)
@@ -516,11 +517,11 @@ end
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end), (:y, :x); conditioned = (:y, :x)); true)
-    # capability: LKJCholesky upper factor (uplo = 'U') (todo `1308iv0`)
-    @test_broken (lower_rkppl(:(begin
+    # LKJCholesky's stated orientation is retained in the matrix value.
+    @test (lower_rkppl(:(begin
         L ~ LKJCholesky(2, 2.0, 'U')
         a ~ Normal(0, 1)
-        w = L[2, 1] .* x
+        w = L[1, 2] .* x
         mu = a .+ w
         y .~ Normal.(mu, 1.0)
     end), (:y, :x); conditioned = (:y, :x)); true)

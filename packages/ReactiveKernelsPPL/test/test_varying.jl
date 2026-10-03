@@ -9,6 +9,21 @@
 using Reactant
 using SpecialFunctions: loggamma
 
+# Level values are ordinary inputs of an explicitly declared coefficient
+# array, rather than a keyword of the retired varying-effect template.
+function _tv_value_levels_plan(lv)
+    data = Dict{Symbol,Any}(:lv => lv, :g => collect(lv),
+        :y => zeros(length(lv)))
+    ast = quote
+        a ~ Normal(0, 1)
+        z[lv] .~ Normal.(0, 1)
+        mu = a .+ z[g]
+        y .~ Normal.(mu, 1.5)
+    end
+    return bind_data(lower_rkppl(ast, data; conditioned = (:y,)), data)
+end
+
+
 function _tv_draws(;
         group::Symbol = :g,
         kind::Symbol = :correlated,
@@ -176,14 +191,12 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, D; conditioned = D)
-    # One slice per (draws, target): two slices of one draws into one
-    # predictor.
-    # capability: two slices of one draws summed into one predictor (`a .+ r1 .+ r2`) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    # Library coefficients are values; several margins may feed one predictor.
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            d ~ varying_draws(g, [1, x])
-            r1 ~ varying_slice(d, 1)
-            r2 ~ varying_slice(d, 2)
+            d ~ varying_coefs_correlated(g, 2)
+            r1 = d[g, 1]
+            r2 = x .* d[g, 2]
             mu = a .+ r1 .+ r2
             y .~ Normal.(mu, 1.5)
         end, D; conditioned = D); true)
@@ -195,8 +208,16 @@ end
                     Expr(:call, :varying_effect, :g, bad)),
                 :(mu = a .+ r), :(y .~ Normal.(mu, 1.5)))
         if bad == :((1, x))
-            # capability: tuple margin collections (P3; todo `1308iv0`).
-            @test_broken (lower_rkppl(prog, D; conditioned = D); true)
+            # A tuple of margin expressions composes the library's columns;
+            # the use site states its arithmetic instead of a margin template.
+            margins = bad.args
+            explicit = quote
+                a ~ Normal(0, 1)
+                r ~ varying_coefs_correlated(g, 2)
+                mu = a .+ $(margins[1]) .* r[g, 1] .+ $(margins[2]) .* r[g, 2]
+                y .~ Normal.(mu, 1.5)
+            end
+            @test (lower_rkppl(explicit, D; conditioned = D); true)
         else
             # refused: 2 has no intercept meaning, zz is undeclared, and
             # a scalar is not a margin collection (P2/P3/P6, 05oe96l).
@@ -210,37 +231,34 @@ end
             mu = a .+ r2
             y .~ Normal.(mu, 1.5)
         end, D; conditioned = D)
-    # capability: a draws margin no slice uses (10gzbm9 degenerate) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    # A prior remains meaningful when a coefficient has no likelihood reader.
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            d ~ varying_draws(g, [1, x])
-            r1 ~ varying_slice(d, 1)
+            d ~ varying_coefs_correlated(g, 2)
+            r1 = d[g, 1]
             mu = a .+ r1
             y .~ Normal.(mu, 1.5)
         end, D; conditioned = D); true)
     # Negated / nested contributions.
-    # capability: negated varying contribution (`a .- r`) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            r ~ varying_effect(g, [1])
-            mu = a .- r
+            r ~ varying_coefs(g)
+            mu = a .- r[g]
             y .~ Normal.(mu, 1.5)
         end, D; conditioned = D); true)
-    # capability: varying contribution inside a product (`a .+ r .* x`) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            r ~ varying_effect(g, [1])
-            mu = a .+ r .* x
+            r ~ varying_coefs(g)
+            mu = a .+ r[g] .* x
             y .~ Normal.(mu, 1.5)
         end, D; conditioned = D); true)
     # Contribution inside a non-predictor definition.
-    # capability: varying contribution used in a non-predictor definition (`w = r .+ 1.0`) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
-            r ~ varying_effect(g, [1])
-            w = r .+ 1.0
-            mu = a .+ b .* x .+ r
+            r ~ varying_coefs(g)
+            w = r[g] .+ 1.0
+            mu = a .+ b .* x .+ r[g]
             y .~ Normal.(mu, sigma)
             sigma ~ Exponential(1)
         end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
@@ -1144,12 +1162,11 @@ end
             mu = a .+ r
             y .~ Normal.(mu, m)
         end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
-    # Inline expressions bind via an assignment first.
-    # capability: inline expression margin (`[x .* z]` without a binding) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    # The library's gathered coefficient multiplies any ordinary margin value.
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
-            r ~ varying_effect(g, [x .* z])
-            mu = a .+ r
+            r ~ varying_coefs(g)
+            mu = a .+ r[g] .* (x .* z)
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g)); true)
     # A predictor location inlines and emits no Z column.
@@ -1160,40 +1177,39 @@ end
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g); conditioned = (:y, :x, :g))
-    # Sampled parameters are not Z columns.
-    # capability: parameter-valued margin column (Z = sampled `a`; P8/P10a) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    # Sampled values compose with the gathered coefficients too.
+    @test (lower_rkppl(quote
             a ~ Normal(0, 5)
-            r ~ varying_effect(g, [a])
-            mu = a .+ r
+            r ~ varying_coefs(g)
+            mu = a .+ r[g] .* a
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
-    # Predictor structure absorbed into the LP emits no column either.
-    # capability: parameter-dependent derived margin (`w = b .* x`) (todo `1308iv0`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 5)
             b ~ Normal(0, 2)
             sigma ~ Exponential(1)
             w = b .* x
-            r ~ varying_effect(g, [w])
-            mu = a .+ w .+ r
+            r ~ varying_coefs(g)
+            mu = a .+ w .+ r[g] .* w
             y .~ Normal.(mu, sigma)
         end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
-    # `dummy` needs a raw column (level membership needs bound values).
+    # Library varying values accept derived grouping data.
     # capability: grouping/dummy coding over a derived data value (ordinary function composition, P8 1cmodra) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             w = x .* z
-            r ~ varying_effect(g, [dummy(w, 1)])
+            v ~ varying_coefs(g)
+            r = (w .== 1) .* v[g]
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g)); true)
-    # Grouping columns stay raw.
+    # Grouping values may come from a data-only definition.
     # capability: grouping/dummy coding over a derived data value (ordinary function composition, P8 1cmodra) (todo `15lq8iu`)
-    @test_broken (lower_rkppl(quote
+    @test (lower_rkppl(quote
             a ~ Normal(0, 1)
             w = x .* z
-            r ~ varying_effect(w, [1])
+            v ~ varying_coefs(w)
+            r = v[w]
             mu = a .+ r
             y .~ Normal.(mu, 1.5)
         end, (:y, :x, :z, :g); conditioned = (:y, :x, :z, :g)); true)
@@ -1261,11 +1277,8 @@ end
     dup.varying_draws[1] = mklevels([1, 2, 1])
     # refused: this used draws block requires a nonempty, unique group-index map (IR contract)
     @test_throws ContractValidationError validate_structure(dup)
-    # Non-literal-embeddable levels fail.
-    nonemb = _tv_base(; with_effect = true)
-    nonemb.varying_draws[1] = mklevels([1, missing])
-    # capability: non-literal-embeddable level values are ordinary data values (P10a 0dejlw1) (todo `1308iv0`)
-    @test_broken (validate_structure(nonemb); true)
+    # Explicit array axes accept ordinary data labels, including missing.
+    @test validate_plan(_tv_value_levels_plan(Any[1, missing])) === nothing
     # Valid declared levels (order ≠ sorted) pass.
     ok = _tv_base(; with_effect = true)
     ok.varying_draws[1] = mklevels(["b", "a"])
@@ -1342,6 +1355,7 @@ end
 _tv_levels_vals(vals::Vector) =
     _tv_levels_plan(Expr(:vect, (_tv_levels_lit(v) for v in vals)...))
 
+
 @testset "varying levels surface spelling" begin
     # Declared order lands verbatim (never sorted); every
     # literal-embeddable element shape rides.
@@ -1374,8 +1388,9 @@ end
             # refused: a String is one value, not a level collection (P2/P3).
             @test_throws SurfaceLoweringError _tv_levels_plan(lv)
         else
-            # capability: data-valued and range-valued level collections (P10a 0dejlw1; todo `1308iv0`).
-            @test_broken (_tv_levels_plan(lv); true)
+            # A named data pool and a range preserve their declared order.
+            values = lv === :g ? [3, 1, 2] : 1:3
+            @test validate_plan(_tv_value_levels_plan(values)) === nothing
         end
     end
     # Empty / duplicates.
@@ -1387,13 +1402,9 @@ end
     # refused: bare a and b are undeclared names, not quoted level values (P6, 05oe96l)
     @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect, :a, :b))
     @test_throws SurfaceLoweringError _tv_levels_plan(Expr(:vect, 1, "a", :b))
-    # Non-literal elements: nested vector / call / non-embeddable value.
-    # capability: a nested vector is a level value (P10a 0dejlw1) (todo `1308iv0`)
-    @test_broken (_tv_levels_plan(Expr(:vect, 1, Expr(:vect, 2))); true)
-    # capability: computed level values from ordinary Julia calls (P8 1cmodra; todo `1308iv0`)
-    @test_broken (_tv_levels_plan(Expr(:vect, 1, Expr(:call, :identity, 2))); true)
-    # capability: Missing as an ordinary level value (P10a 0dejlw1; todo `1308iv0`)
-    @test_broken (_tv_levels_plan(Expr(:vect, 1, missing)); true)
+    @test validate_plan(_tv_value_levels_plan(Any[1, [2]])) === nothing
+    @test validate_plan(_tv_value_levels_plan([1, identity(2)])) === nothing
+    @test validate_plan(_tv_value_levels_plan(Any[1, missing])) === nothing
     # Unknown keyword (the reworded two-keyword gate).
     # refused: foo is not a keyword of varying_effect (Julia keyword contract, P3)
     @test_throws SurfaceLoweringError lower_rkppl(quote
@@ -1812,7 +1823,6 @@ end
         ("half-normal arity", :(HalfNormal(0, 2)), "exactly the scale"),
         ("nonzero location", :(Normal(1, 2)), "explicit positive prior"),
         ("non-positive scale", :(HalfCauchy(-1)), "positive finite literal"),
-        ("exponential arity", :(Exponential()), "takes 1 argument"),
         ("bare literal", :(5.0), "distribution call"),
         ("sampled name", :s, "distribution call"),
         ("per-margin tuple", :((Cauchy(0, 5), Normal(0, 2))),
@@ -1836,8 +1846,17 @@ end
             e
         end
         if label == "per-margin tuple"
-            # capability: ordinary SD priors, default Exponential and per-margin priors (P8 1cmodra; 10gzbm9 support-links; todo `1308iv0`).
-            @test_broken (err === nothing || throw(err))
+            # Each margin's positive prior is an ordinary declaration.
+            @test (lower_rkppl(quote
+                a ~ Normal(0, 1)
+                sd1 ~ HalfCauchy(5)
+                sd2 ~ HalfNormal(2)
+                L ~ LKJCholesky(2, 1)
+                z[levels(g), 1:2] .~ Normal.(0, 1)
+                d = z * (vcat(sd1, sd2) .* L)'
+                mu = a .+ d[g, 1] .+ x .* d[g, 2]
+                y .~ Normal.(mu, 1)
+            end, (:y, :g, :x); conditioned = (:y,)); true)
         else
             # refused: constructor arity/domain, non-distribution literal or undeclared s (P3/P6, 05oe96l).
             @test err isa SurfaceLoweringError

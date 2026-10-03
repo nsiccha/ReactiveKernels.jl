@@ -224,8 +224,8 @@ end
     fixed_array = Base.merge(lev, (; c = ones(6)))
     @test fixed_array.fixed[:c] == ones(6)
     @test !occursin("c[levels", sprint(Base.show_unquoted, fixed_array.ast))
-    # A plate-cell name is invisible to the top-level matcher: the append
-    # collides at lowering through the single-assignment gate (still loud).
+    # A plate-cell local has its own scope; appending a top-level definition
+    # of the same name preserves the cell's authored value.
     plated = RKPPLModel(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(4),
@@ -234,8 +234,17 @@ end
                         :(t = a .+ b .* x[i]),
                         :(y[i] ~ Normal.(t, s)))))), @__MODULE__)
     shadowed = Base.merge(plated, :(t = a .+ b .* x))
-    # refused: single assignment: appended t collides with the plate-cell t
-    @test_throws SurfaceLoweringError lower_rkppl(shadowed.ast, (:y, :x); conditioned = (:y, :x))
+    cols = Dict(:y => [-0.1, 0.8, 0.2], :x => [0.3, 0.5, -0.2])
+    bound = bind_data(lower_rkppl(shadowed.ast, cols; conditioned = keys(cols)), cols)
+    built = build_kernel(bound)
+    u = unconstrain(built.layout, (; a = 0.2, b = -0.3, s = 1.1))
+    oracle = v -> begin
+        q = constrain(built.layout, v)
+        logpdf(Normal(), q.a) + logpdf(Normal(0, 2), q.b) +
+            logpdf(Exponential(), q.s) + log(q.s) +
+            sum(logpdf.(Normal.(q.a .+ q.b .* cols[:x], q.s), cols[:y]))
+    end
+    _check_model_math(built, bound, u, oracle)
 end
 
 @testset "merge joint session over shared defs" begin
