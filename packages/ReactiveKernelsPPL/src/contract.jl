@@ -2349,7 +2349,7 @@ const ELEMENTWISE_COMPARISONS = (:.==, :.!=, :.<, :.>, :.<=, :.>=)
 `Expr(:., f, ...)`; single-argument, mirroring the scalar math subset —
 plus two-argument `logaddexp` for occupancy marginalization)."""
 const ELEMENTWISE_FNS =
-    (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp)
+    (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp, :logistic)
 
 const _KERNEL_ELEMENTWISE_FNS = (ELEMENTWISE_FNS..., :logistic)
 
@@ -3246,6 +3246,7 @@ function _axis_exempt_columns(plan::StructuralPlan)
     modelvals = union(
         intersect(computed, Set{Symbol}(a.name for a in plan.assignments)),
         intersect(computed, wholedefs), inputs)
+    union!(modelvals, (n for n in computed if plan.columns[n] isa Number))
     return modelvals, managed
 end
 
@@ -5794,11 +5795,12 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
                 _collect_assignment_refs!(refs, arg, plan, label, bound)
                 return nothing
             end
-            arg isa Symbol || _fail(
-                label,
-                "reduction $fn argument must be a bare column or derived " *
-                "name (stage nested transforms as their own `name = ...` first)",
-            )
+            if arg isa Expr
+                _collect_vector_refs!(refs, arg, plan, label, bound)
+                return nothing
+            end
+            arg isa Symbol || _fail(label,
+                "reduction $fn argument must be an array value")
             (!bound || haskey(plan.columns, arg) || _is_derived(plan, arg)) ||
                 _fail(
                     label,
@@ -6012,14 +6014,11 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
         # may transform one (`theta = mu .+ tau .* z`) — the non-centered shape.
         if _is_derived(plan, ex) || _is_plate_param(plan, ex) ||
                 any(s -> ex in s.states, plan.scans) ||
-                ex in _union_names(plan) || ex in _vector_value_names(plan)
+                ex in _union_names(plan) || ex in _vector_value_names(plan) ||
+                _is_array_param(plan, ex)
             push!(refs, ex)
             return nothing
         end
-        _is_array_param(plan, ex) && _fail(label, "array $ex is not " *
-            "per-observation — read it per observation by index " *
-            "(`$ex[g]`), by position (`$ex[1]`), through a data matrix " *
-            "(`B * $ex`) or a reduction (`sum($ex)`)")
         bound || return nothing
         haskey(plan.columns, ex) && return nothing
         return _fail(label, "derived column references unknown name $ex")
@@ -6093,6 +6092,10 @@ function _collect_vector_reduction!(refs, ex, plan, label, bound::Bool)
         "reduction $fn takes exactly one bare column or derived name",
     )
     arg = ex.args[2]
+    if arg isa Expr
+        _collect_vector_refs!(refs, arg, plan, label, bound)
+        return nothing
+    end
     arg isa Symbol || _fail(
         label,
         "reduction $fn argument must be a bare column or derived name " *
@@ -7130,10 +7133,10 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
         _fail(t.label, "composed column $c collides with a sub-predictor " *
               "or scalar name")
     end
-    length(pred.terms) == 1 ||
+    isempty(o.subs) || length(pred.terms) == 1 ||
         _fail(t.label, "composed term is the whole linear predictor " *
               "(no sibling design terms in v1)")
-    any(pp -> pp.predictor === pred.name, plan.population_priors) &&
+    !isempty(o.subs) && any(pp -> pp.predictor === pred.name, plan.population_priors) &&
         _fail(t.label, "composed predictor $(pred.name) takes no " *
               "population priors (coefficients live in the " *
               "sub-predictors)")
@@ -7179,8 +7182,8 @@ end
 # Scalar offset values have no observation axis until preprocessing
 # broadcasts them. They are assignments, never design coefficients.
 _is_scalar_offset(t::TermSpec, plan::StructuralPlan) =
-    t.kind === OffsetTerm && any(a -> a.name === only(t.columns), plan.assignments) &&
-    _value_axes(plan, only(t.columns)) == Any[]
+    t.kind === OffsetTerm &&
+    _value_axes(plan, only(t.columns); data_axes = true) == Any[]
 
 function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
     _is_scalar_offset(t, plan) && return nothing
@@ -9472,9 +9475,6 @@ end
 
 function _validate_weights(r::LikelihoodSpec, plan::StructuralPlan)
     r.weights === nothing && return nothing
-    _is_derived(plan, r.weights) && _fail(r.label,
-        "weights column $(r.weights) is derived — slice-1 binds weights " *
-        "raw (derived weights need shape metadata — planned)")
     haskey(plan.columns, r.weights) ||
         _fail(r.label, "weights column $(r.weights) missing")
     col = _response_slot_column(plan, r, r.weights, "weights column")
@@ -10386,6 +10386,10 @@ definitions used only during preparation, while preserving their names
 for caller-supplied column collision checks."""
 function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         bind_only = false, unbound::Bool=false)
+    required = Set{Symbol}(r.weights for r in plan.responses if r.weights !== nothing)
+    for p in plan.array_parameters, d in p.dims
+        _is_levels_dim(d) && push!(required, d.args[2])
+    end
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
         # Literal definitions can be dependencies of a module call, such
@@ -10393,8 +10397,17 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         nodes[a.name] = a.expr
     end
     for d in plan.derived
-        d.expr isa Expr && (nodes[d.name] = d.expr)
+        nodes[d.name] = d.expr
     end
+    function indices(ex)
+        ex isa Expr || return nothing
+        if ex.head === :ref && length(ex.args) >= 2 && ex.args[2] isa Symbol
+            push!(required, ex.args[2])
+        end
+        foreach(indices, ex.args)
+        return nothing
+    end
+    foreach(indices, values(nodes))
     resps = Set{Symbol}(r.response for r in plan.responses)
     known = _all_names(plan)
     memo = Dict{Symbol,Bool}()
@@ -10410,7 +10423,7 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         return ok
     end
     names = Set{Symbol}(nm for (nm, ex) in nodes
-        if nm ∉ resps && _contains_module_call(ex) &&
+        if nm ∉ resps && (_contains_module_call(ex) || nm in required) &&
             dataonly(nm, Set{Symbol}()))
     bind_only || return names
     onlydata = union(raw, Set{Symbol}(nm for nm in keys(nodes)
@@ -10828,14 +10841,14 @@ function _materialize_module_data!(plan::StructuralPlan,
                 sprint(showerror, e)))
         end
         if nm in vector_defs
-            v isa AbstractArray ||
+            v isa Number || v isa AbstractArray ||
                 throw(ContractValidationError(
                 "[bind] data definition $nm is read per observation (an " *
                 "operand with Julia broadcast axes) but evaluated to $(summary(v))"))
         else
-            v isa ColumnData || throw(ContractValidationError(
-                "[bind] data definition $nm evaluated to $(summary(v)); " *
-                "model-level data values are numbers or arrays"))
+            # Other Julia values stay graph assignments, where preparation
+            # can fold them without imposing a column type.
+            v isa ColumnData || continue
         end
         # Dense storage retains every observation operand's rank and axes.
         columns[nm] = v isa AbstractVector ? collect(v) :
