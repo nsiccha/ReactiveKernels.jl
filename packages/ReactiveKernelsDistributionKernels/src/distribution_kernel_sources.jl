@@ -1535,8 +1535,9 @@ docs_example = (;
 )
 """
 
-# Exact-GP covariance is an RK pair plate. Dense factorization remains a
-# numerical leaf; covariance support does not imply compiled Cholesky AD.
+# Vector-location GP covariance is an RK pair plate. Matrix locations use
+# broadcast/reduction helpers. Dense factorization remains a numerical leaf;
+# covariance support does not imply compiled Cholesky AD.
 export gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
 
 include("gp_covariance.jl")
