@@ -21,6 +21,7 @@ ppl_examples_testfile = joinpath(
     @__DIR__, "test_ppl_examples_reactant.jl")
 authored_scan_testfile = joinpath(@__DIR__, "test_authored_scan_reactant.jl")
 lazy_branches_testfile = joinpath(@__DIR__, "test_lazy_branches_reactant.jl")
+abstract_plate_testfile = joinpath(@__DIR__, "test_abstract_plate_reactant.jl")
 authored_loops_testfile = joinpath(@__DIR__, "test_authored_loops_reactant.jl")
 branch_loop_assignments_testfile = joinpath(
     @__DIR__, "test_branch_loop_assignments_reactant.jl")
@@ -78,6 +79,7 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $plate_consumer_layout_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $lazy_branches_testfile`)
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $abstract_plate_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_loops_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $branch_loop_assignments_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $loop_view_capture_testfile`)
@@ -115,6 +117,8 @@ mktempdir() do env
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ref_array_plate_testfile`)
     elseif selector == "plate-consumer-layout"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $plate_consumer_layout_testfile`)
+    elseif selector == "abstract-plate"
+        run(`$julia --startup-file=no --check-bounds=yes --project=$env $abstract_plate_testfile`)
     elseif selector == "ppl-examples"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $ppl_examples_testfile`)
     elseif selector == "ad"
