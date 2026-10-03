@@ -48,13 +48,13 @@ end
     @test PPL_NODES.posterior === :posterior
     @test PPL_NODES.log_jacobian === :log_jacobian
     @test Tuple(values(PPL_NODES)) ===
-        (:likelihood, :prior, :log_jacobian, :posterior)
+        (:likelihood, :prior, :log_jacobian, :posterior, :pointwise)
     @test workflow_wants(:sampler) === :posterior
     @test workflow_wants(:likelihood) === :likelihood
     @test workflow_wants(:prior) === :prior
     @test workflow_wants(:log_jacobian) === :log_jacobian
-    # capability: pointwise (per-observation) log-likelihood query preset; if the intent is 'unknown preset', use a nonsense name (todo `1qlbn5b`)
-    @test_broken (workflow_wants(:pointwise); true)
+    @test workflow_wants(:pointwise) === :pointwise
+    @test_throws ArgumentError workflow_wants(:nonsense_preset)
 end
 
 @testset "prepare_query cuts" begin
@@ -71,8 +71,11 @@ end
             bound = (; x = plan.columns[:x], y = plan.columns[:y]))
         @test prepare_query(built, plan, preset)(u) ≈ ref(u)
     end
-    # capability: pointwise (per-observation) log-likelihood query preset; if the intent is 'unknown preset', use a nonsense name (todo `1qlbn5b`)
-    @test_broken (prepare_query(built, plan, :pointwise); true)
+    pointwise = prepare_query(built, plan, :pointwise)(u)
+    @test keys(pointwise) == (:y,)
+    @test size(pointwise.y) == size(plan.columns[:y])
+    @test sum(pointwise.y) ≈ prepare_query(built, plan, :likelihood)(u)
+    @test_throws ArgumentError prepare_query(built, plan, :nonsense_preset)
 end
 
 @testset "sampler value and gradient" begin

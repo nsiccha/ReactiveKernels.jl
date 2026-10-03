@@ -4,7 +4,7 @@ using Distributions: Bernoulli, BetaBinomial, Binomial, Cauchy, Dirichlet, Expon
     MvNormal, NegativeBinomial, Normal, Poisson,
     TDist, Uniform, Weibull, cdf, logpdf, quantile
 import Enzyme
-using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, diag
+using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, diag, norm
 using LogExpFunctions: log1pexp
 using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, ad_gradient, code_expr,
     explain, extract, plan, plate, prepare, prepare_ad
@@ -454,14 +454,59 @@ end
     @test_throws ArgumentError gp_exp_quad_cov(x, 1.0, -2.0, 1e-9)
     @test_throws ArgumentError gp_exp_quad_cov(x, 1.0, 1.0, -1e-9)
     @test_throws ArgumentError gp_exp_quad_cov(x, 1.0, 1.0, Inf)
-    # Aniso (matrix locations) is sequenced, fails closed.
-    @test_throws ArgumentError gp_exp_quad_cov([0.0 0.0; 1.0 1.0], 1.0, 1.0,
-        1e-9)
+    @testset "native matrix locations: isotropic and anisotropic" begin
+        # Each row is a location (approved smooths decision 02bcp3o).
+        # A scalar norm oracle is independent of the broadcast/reduction path.
+        # Matrix methods are native; these checks do not claim compiled AD.
+        for locations in ([0.0 0.0; 1.0 1.0],
+                [0.0 0.0; 1.0 2.0; 1.0 2.0],
+                [0.0 0.0 0.0; 1.0 2.0 3.0])
+            original = copy(locations)
+            sigma, jitter = 1.7, 1e-6
+            for rho in (1.25, collect(0.5 .+ axes(locations, 2)))
+                original_rho = copy(rho)
+                n = size(locations, 1)
+                reference = [sigma^2 * exp(-norm(
+                    (locations[i, :] - locations[j, :]) ./ rho)^2 / 2) +
+                    (i == j ? jitter : 0.0) for i in 1:n, j in 1:n]
+                covariance = gp_exp_quad_cov(locations, sigma, rho, jitter)
+                @test size(covariance) == (n, n)
+                @test covariance ≈ reference
+                @test covariance == covariance'
+                @test diag(covariance) == fill(sigma^2 + jitter, n)
+                @test covariance - gp_exp_quad_cov(locations, sigma, rho, 0.0) ≈
+                    [i == j ? jitter : 0.0 for i in 1:n, j in 1:n] atol=1e-15
+                @test locations == original
+                @test rho == original_rho
+            end
+        end
+
+        locations = [0.0 0.0; 1.0 1.0]
+        # Invalid domains: nonempty finite locations, positive finite scales,
+        # and nonnegative finite jitter (the public matrix covariance contract).
+        for invalid in (zeros(0, 2), zeros(2, 0), [0.0 NaN; 1.0 1.0],
+                [0.0 0.0; Inf 1.0])
+            @test_throws ArgumentError gp_exp_quad_cov(invalid, 1.0, 1.0, 1e-9)
+        end
+        for invalid in (0.0, -1.0, NaN, Inf)
+            @test_throws ArgumentError gp_exp_quad_cov(locations, invalid, 1.0, 1e-9)
+            @test_throws ArgumentError gp_exp_quad_cov(locations, 1.0, invalid, 1e-9)
+            @test_throws ArgumentError gp_exp_quad_cov(locations, 1.0,
+                [1.0, invalid], 1e-9)
+        end
+        for invalid in (-1e-9, NaN, Inf)
+            @test_throws ArgumentError gp_exp_quad_cov(locations, 1.0, 1.0, invalid)
+        end
+        # Invalid shape: one anisotropic length scale is required per column.
+        for invalid in (Float64[], [1.0], [1.0, 2.0, 3.0])
+            @test_throws DimensionMismatch gp_exp_quad_cov(locations, 1.0, invalid, 1e-9)
+        end
+    end
 end
 
 @testset "gp periodic covariance" begin
     # Stan gp_periodic_cov math: σ²exp(−2sin²(π|xᵢ−xⱼ|/p)/ρ²), jitter
-    # on the diagonal. One isotropic axis only.
+    # on the diagonal. Vector locations use one axis; matrices use Euclidean distance.
     x = [0.0, 0.5, 1.5]
     K = gp_periodic_cov(x, 2.0, 1.5, 1.0, 1e-9)
     ref = [4 * exp(-2 * sin(pi * abs(a - b) / 1.0)^2 / 1.5^2) +
@@ -479,9 +524,44 @@ end
     @test_throws ArgumentError gp_periodic_cov(x, 1.0, 1.0, Inf, 1e-9)
     @test_throws ArgumentError gp_periodic_cov(x, 1.0, 1.0, 1.0, -1e-9)
     @test_throws ArgumentError gp_periodic_cov(x, 1.0, 1.0, 1.0, Inf)
-    # Matrix locations are out of slice (SB: one isotropic axis).
-    @test_throws ArgumentError gp_periodic_cov([0.0 0.0; 1.0 1.0], 1.0, 1.0,
-        1.0, 1e-9)
+    @testset "native matrix locations: Euclidean periodic distance" begin
+        # Matrix periodic covariance is also approved by smooths decision 02bcp3o.
+        # Repeated locations ensure jitter follows row identity, not equality.
+        for locations in ([0.0 0.0; 1.0 1.0],
+                [0.0 0.0; 1.0 2.0; 1.0 2.0],
+                [0.0 0.0 0.0; 1.0 2.0 3.0])
+            original = copy(locations)
+            sigma, rho, period, jitter = 1.7, 1.25, 2.3, 1e-6
+            n = size(locations, 1)
+            reference = [sigma^2 * exp(-2 * sin(pi * norm(
+                locations[i, :] - locations[j, :]) / period)^2 / rho^2) +
+                (i == j ? jitter : 0.0) for i in 1:n, j in 1:n]
+            covariance = gp_periodic_cov(locations, sigma, rho, period, jitter)
+            @test size(covariance) == (n, n)
+            @test covariance ≈ reference
+            @test covariance == covariance'
+            @test diag(covariance) == fill(sigma^2 + jitter, n)
+            @test covariance - gp_periodic_cov(locations, sigma, rho, period, 0.0) ≈
+                [i == j ? jitter : 0.0 for i in 1:n, j in 1:n] atol=1e-15
+            @test locations == original
+        end
+
+        locations = [0.0 0.0; 1.0 1.0]
+        # Invalid domains follow the same matrix contract plus a finite,
+        # positive period; they are unrelated to matrix-location capability.
+        for invalid in (zeros(0, 2), zeros(2, 0), [0.0 NaN; 1.0 1.0],
+                [0.0 0.0; Inf 1.0])
+            @test_throws ArgumentError gp_periodic_cov(invalid, 1.0, 1.0, 1.0, 1e-9)
+        end
+        for invalid in (0.0, -1.0, NaN, Inf)
+            @test_throws ArgumentError gp_periodic_cov(locations, invalid, 1.0, 1.0, 1e-9)
+            @test_throws ArgumentError gp_periodic_cov(locations, 1.0, invalid, 1.0, 1e-9)
+            @test_throws ArgumentError gp_periodic_cov(locations, 1.0, 1.0, invalid, 1e-9)
+        end
+        for invalid in (-1e-9, NaN, Inf)
+            @test_throws ArgumentError gp_periodic_cov(locations, 1.0, 1.0, 1.0, invalid)
+        end
+    end
 end
 
 @testset "gp chol latent (pure-Julia potrf)" begin

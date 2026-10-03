@@ -152,7 +152,7 @@ using Test
                 item == "arma11" && (data[:z] = zeros(4))
                 plan = bind_data(lower_rkppl(prog, datanames; conditioned = observed), data)
                 @test build_kernel(plan).spec isa KernelSpec
-            elseif label in ("data-column mixture weights", "Weibull response")
+            elseif label in ("literal prob rejected", "data-column mixture weights", "Weibull response")
                 @test lower_rkppl(prog, datanames; conditioned=datanames) isa StructuralPlan
             elseif label in capabilities
                 # capability: each entry above names a valid model shape (todo `1qlbn5b`).

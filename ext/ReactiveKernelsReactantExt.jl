@@ -5,6 +5,17 @@ import Reactant
 import DifferentiationInterface
 import LinearAlgebra
 
+function __init__()
+    # This function emits an MLIR batch. Its host samples must remain host
+    # values; only the authored cell invoked by make_mlir_fn is rewritten.
+    Reactant.@skip_rewrite_func _reactant_structured_batch
+    # Metadata describes a fixed wrapper. Native map preserves that wrapper;
+    # Reactant's generic map overlay instead returns a flat host vector.
+    Reactant.@skip_rewrite_func _restore_plate_lane
+    Reactant.@skip_rewrite_func _materialize_plate_tree
+    Reactant.@skip_rewrite_func _sum_plate_tree
+end
+
 struct _ReactantRNGNormal{Algorithm} end
 struct _ReactantRNGBool{Algorithm} end
 struct _ReactantRNGExp{Algorithm} end
@@ -1656,23 +1667,41 @@ end
 # Move the observation axis to the leading batch dimension and lower the
 # scalar recipe with Reactant's batch primitive; no Base.Slices object or host
 # elementwise iteration reaches tracing.
-struct _AuthoredPlateBatchCall{B,S,N,O,A}
+struct _AuthoredPlateBatchCall{B,S,N,O,A,L}
     operation::O
     shared::A
+    layouts::L
 end
 
 @inline _authored_plate_batch_scalar(array) = Reactant.@allowscalar array[]
 
-@generated function (call::_AuthoredPlateBatchCall{B,S,N})(
-        batch_args...) where {B,S,N}
+struct _PlateLaneLayout{N,S}
+    schema::S
+end
+_plate_layout_width(::Type) = 1
+_plate_layout_width(::Type{<:_PlateLaneLayout{N}}) where {N} = N
+
+@generated function (call::_AuthoredPlateBatchCall{B,S,N,O,A,L})(
+        batch_args...) where {B,S,N,O,A,L}
     lookup = Dict(index => position for (position, index) in enumerate(B))
+    widths = map(_plate_layout_width, L.parameters)
+    starts = cumsum(vcat(1, collect(widths)[1:end-1]))
     shared_position = 0
     values = Any[]
     for index in 1:N
         if haskey(lookup, index)
             position = lookup[index]
-            value = :(getfield(batch_args, $position))
-            index in S && (value = :(_authored_plate_batch_scalar($value)))
+            start = starts[position]
+            value = widths[position] == 1 && L.parameters[position] === Nothing ?
+                :(getfield(batch_args, $start)) :
+                Expr(:tuple, [:(getfield(batch_args, $k))
+                    for k in start:(start + widths[position] - 1)]...)
+            if index in S
+                value = :(_authored_plate_batch_scalar($value))
+            else
+                value = :(_restore_plate_lane(
+                    getfield(getfield(call, :layouts), $position), $value))
+            end
             push!(values, value)
         else
             shared_position += 1
@@ -1685,12 +1714,18 @@ end
 @inline _authored_plate_batch_length(arg::ReactiveKernels._TensorizedEachcol) =
     size(arg.parent, 2)
 @inline _authored_plate_batch_length(arg::ReactiveKernels._TensorizedPlateBatch) =
-    size(arg.values, 1)
+    _plate_batch_length(arg.values)
+@inline _plate_batch_length(values::AbstractArray) = size(values, 1)
+@inline _plate_batch_length(values::Tuple) = size(first(values), 1)
 @inline _authored_plate_batch_input(arg::ReactiveKernels._TensorizedEachcol) =
     permutedims(arg.parent, (2, 1))
 @inline _authored_plate_batch_input(arg::ReactiveKernels._TensorizedPlateBatch) =
-    arg.values
+    arg.values isa Tuple ? map(_reactant_plate_operand, arg.values) : arg.values
 @inline _authored_plate_batch_input(arg::Reactant.TracedRArray) = arg
+@inline _authored_plate_batch_schema(arg) = nothing
+@inline _authored_plate_batch_schema(arg::ReactiveKernels._TensorizedPlateBatch) =
+    arg.schema === nothing ? nothing :
+    _PlateLaneLayout{length(arg.values),typeof(arg.schema)}(arg.schema)
 @inline _authored_plate_shared(arg) = arg
 @inline _authored_plate_shared(arg::Base.RefValue) = arg[]
 
@@ -1710,6 +1745,8 @@ end
 # untouched, so an all-traced plate lowers exactly as before.
 @inline _reactant_plate_operand(arg) = arg
 @inline _reactant_plate_operand(arg::Reactant.TracedRArray) = arg
+@inline _reactant_plate_operand(arg::Base.ColumnSlices) =
+    ReactiveKernels._TensorizedEachcol(_reactant_plate_operand(parent(arg)))
 @inline function _reactant_plate_operand(arg::AbstractArray)
     # Only dense Number arrays lower to MLIR constants: `collect` preserves the
     # element type, so Reactant's `constant(collect(x))` fallback never makes
@@ -1787,12 +1824,132 @@ function _reactant_plate_batch(operation, args, batch_positions, scalar_position
         batch_inputs, batch_shape)
     shared = Tuple(_authored_plate_shared(getfield(args, index))
         for index in eachindex(args) if !(index in batch_positions))
+    layouts = Tuple(_authored_plate_batch_schema(getfield(args, index))
+        for index in batch_positions)
     call = _AuthoredPlateBatchCall{
         batch_positions,scalar_positions,length(args),
-        typeof(operation),typeof(shared)}(operation, shared)
-    results = Reactant.Ops.batch(call, batch_inputs, batch_shape)
-    isempty(results) || return only(results)
+        typeof(operation),typeof(shared),typeof(layouts)}(operation, shared, layouts)
+    result = _reactant_structured_batch(call, batch_inputs, batch_shape)
+    result === nothing || return result
     return _reactant_constant_plate_batch(call, batch_inputs, batch_shape)
+end
+
+# A compound lane result is a fixed logical structure of scalar/tensor leaves.
+# Preserve that structure as metadata while each live leaf travels in its own
+# lanes-leading buffer, retaining its element type. Reconstruct it inside the
+# next cell, where Julia dispatch must still see the authored wrapper.
+struct _PlateLaneLeaf{O,D} end
+@inline _restore_plate_lane(::Nothing, value) = value
+@inline _restore_plate_lane(layout::_PlateLaneLayout, values) =
+    _restore_plate_lane(layout.schema, values)
+@inline _restore_plate_lane(schema::Union{Tuple,NamedTuple}, value) =
+    map(item -> _restore_plate_lane(item, value), schema)
+@inline _restore_plate_lane(schema::AbstractArray, value) =
+    map(item -> _restore_plate_lane(item, value), schema)
+@inline _restore_plate_lane(schema, value) = schema
+@inline _restore_plate_lane(::_PlateLaneLeaf{O,()}, values::Tuple) where {O} =
+    _authored_plate_batch_scalar(getfield(values, O))
+@inline _restore_plate_lane(::_PlateLaneLeaf{O,D}, values::Tuple) where {O,D} =
+    getfield(values, O)
+
+_plate_lane_schema(value::Union{Tuple,NamedTuple}, leaves) =
+    map(item -> _plate_lane_schema(item, leaves), value)
+function _plate_lane_schema(value::AbstractArray, leaves)
+    # A host collection of traced scalar leaves can only be expanded when
+    # its entries live in a fixed tuple field (such as an SMatrix). Merely
+    # being immutable is insufficient: a view can wrap a data-length array.
+    T = typeof(value)
+    fixed = !ismutabletype(T) && fieldcount(T) == 1 &&
+        fieldtype(T, 1) <: NTuple{length(value),Any}
+    fixed || throw(ArgumentError(
+        "a compound plate array must use immutable fixed tuple storage or a traced tensor"))
+    map(item -> _plate_lane_schema(item, leaves), value)
+end
+_plate_lane_schema(value::Union{Number,Nothing,Symbol,Val}, leaves) = value
+_plate_lane_schema(value, leaves) = throw(ArgumentError(
+    "unsupported compound Reactant plate result $(typeof(value))"))
+function _plate_lane_schema(value::Union{Reactant.TracedRArray,Reactant.TracedRNumber},
+        leaves)
+    index = findfirst(leaf -> leaf === value, leaves)
+    index === nothing && throw(ArgumentError("a plate result leaf was not staged"))
+    _PlateLaneLeaf{index,size(value)}()
+end
+
+function _materialize_plate_tree(schema::Union{Tuple,NamedTuple}, values, count)
+    map(item -> _materialize_plate_tree(item, values, count), schema)
+end
+_materialize_plate_tree(::_PlateLaneLeaf{I,D}, values, count) where {I,D} =
+    _reactant_plate_operand(getfield(values, I))
+_materialize_plate_tree(schema::Number, values, count) =
+    Reactant.Ops.fill(schema, Int64[count])
+_materialize_plate_tree(schema, values, count) = schema
+function _materialize_plate_tree(schema::AbstractArray, values, count)
+    # Export the known empty shape as a constant. Reshaping an empty tensor
+    # can leave tensor.empty in Reactant's optimized program, which XLA rejects.
+    count == 0 && return zeros(
+        Reactant.unwrapped_eltype(first(values)), 0, size(schema)...)
+    columns = map(item -> _materialize_plate_tree(item, values, count), schema)
+    Reactant.Ops.reshape(hcat(Tuple(columns)...), Int64[count, size(schema)...])
+end
+ReactiveKernels._tensorized_plate_materialize(
+        value::ReactiveKernels._TensorizedPlateBatch{<:Tuple}) =
+    _materialize_plate_tree(value.schema, value.values,
+        _authored_plate_batch_length(value))
+
+function _sum_plate_tree(schema::Union{Tuple,NamedTuple,AbstractArray}, values, count)
+    map(item -> _sum_plate_tree(item, values, count), schema)
+end
+_sum_plate_tree(schema::Number, values, count) = schema * count
+_sum_plate_tree(schema, values, count) = schema
+_plate_leaf_sum(value) = sum(value; dims=1)
+function _sum_plate_tree(::_PlateLaneLeaf{I,D}, values, count) where {I,D}
+    reduced = Reactant.call_with_reactant(_plate_leaf_sum,
+        _reactant_plate_operand(getfield(values, I)))
+    result = Reactant.Ops.reshape(reduced, collect(Int64, D))
+    isempty(D) ? _authored_plate_batch_scalar(result) : result
+end
+ReactiveKernels._tensorized_plate_sum(
+        value::ReactiveKernels._TensorizedPlateBatch{<:Tuple,<:AbstractArray}) =
+    _sum_plate_tree(value.schema, value.values,
+        _authored_plate_batch_length(value))
+ReactiveKernels._tensorized_plate_sum(
+        value::ReactiveKernels._TensorizedPlateBatch{<:Tuple}) =
+    throw(ArgumentError("sum of a compound Reactant plate requires an additive array result"))
+
+@noinline function _reactant_structured_batch(call, inputs, shape)
+    # Ops.batch's public result is a flat list of traced leaves. Its tracing
+    # primitive also supplies the logical result and the exact closure inputs;
+    # use those once to retain compound results without sampling another cell.
+    samples = [Reactant.Ops.fill(Reactant.unwrapped_eltype(input)(0),
+        collect(Int64, size(input)[length(shape)+1:end])) for input in inputs]
+    prefix = gensym(:platearg)
+    staged = Reactant.TracedUtils.make_mlir_fn(call, Tuple(samples), (),
+        "unbatched_" * string(call), false; args_in_result=:result,
+        do_transpose=false, argprefix=prefix)
+    isempty(staged.linear_results) && return nothing
+    actual_inputs = if staged.fnwrapped
+        seen = Reactant.OrderedIdDict()
+        Reactant.make_tracer(seen, call, (prefix, 1), Reactant.TracedSetPath;
+            toscalar=false)
+        captured = Reactant.TracedRArray[
+            Reactant.Ops.broadcast_in_dim(value,
+                collect(Int64, (length(shape)+1):(ndims(value)+length(shape))),
+                vcat(shape, collect(Int64, size(value))))
+            for value in values(seen) if value isa Reactant.TracedType]
+        vcat(captured, inputs)
+    else
+        inputs
+    end
+    types = [Reactant.MLIR.IR.TensorType(vcat(shape, collect(Int64, size(leaf))),
+        Reactant.MLIR.IR.Type(Reactant.unwrapped_eltype(leaf)))
+        for leaf in staged.linear_results]
+    results = Reactant.Ops.batch(actual_inputs, types, shape; fn=staged.f)
+    logical = staged.traced_result
+    logical isa Union{Reactant.TracedRArray,Reactant.TracedRNumber} && return only(results)
+    length(shape) == 1 || throw(ArgumentError(
+        "compound Reactant plate results require a one-dimensional lane axis"))
+    schema = _plate_lane_schema(logical, staged.linear_results)
+    ReactiveKernels._TensorizedPlateBatch(Tuple(results), schema)
 end
 
 # `Reactant.Ops.batch` traces the cell once and returns one output per traced
@@ -1844,15 +2001,20 @@ function _reactant_authored_plate_call(marker, operation, args::Tuple)
         "a tensorized eachcol plate requires at least one batched argument"))
     scalar_positions = Tuple(index for index in batch_positions
         if !(getfield(args, index) isa ReactiveKernels._TensorizedEachcol) &&
+           !(getfield(args, index) isa ReactiveKernels._TensorizedPlateBatch{<:Tuple}) &&
            ndims(_authored_plate_batch_input(getfield(args, index))) == 1)
-    batch_inputs = Reactant.TracedRArray[
-        _authored_plate_batch_input(getfield(args, index))
-        for index in batch_positions
-    ]
+    batch_inputs = Reactant.TracedRArray[]
+    for index in batch_positions
+        input = _authored_plate_batch_input(getfield(args, index))
+        input isa Tuple ? append!(batch_inputs, input) : push!(batch_inputs, input)
+    end
     result = _reactant_plate_batch(operation, args, batch_positions,
         scalar_positions, batch_inputs, Int64[count])
-    ReactiveKernels._TensorizedPlateBatch(result)
+    _wrap_authored_plate_batch(result)
 end
+
+_wrap_authored_plate_batch(result) = ReactiveKernels._TensorizedPlateBatch(result)
+_wrap_authored_plate_batch(result::ReactiveKernels._TensorizedPlateBatch) = result
 
 function ReactiveKernels._tensorized_plate_call(
         marker::ReactiveKernels._TensorizedEachcol{<:Union{
@@ -1862,7 +2024,7 @@ function ReactiveKernels._tensorized_plate_call(
 end
 
 function ReactiveKernels._tensorized_plate_call(
-        marker::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray},
+        marker::ReactiveKernels._TensorizedPlateBatch{<:Union{Reactant.TracedRArray,Tuple}},
         operation, args::Tuple)
     _reactant_authored_plate_call(marker, operation, args)
 end
@@ -1906,7 +2068,7 @@ ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
     ::ReactiveKernels._TensorizedEachcol{<:Union{
         Reactant.TracedRArray,_TracedReshapedArray}}) = true
 @inline _reactant_is_structural_marker(
-    ::ReactiveKernels._TensorizedPlateBatch{<:Reactant.TracedRArray}) = true
+    ::ReactiveKernels._TensorizedPlateBatch{<:Union{Reactant.TracedRArray,Tuple}}) = true
 @inline _reactant_structural_marker(::Tuple{}) = nothing
 @inline function _reactant_structural_marker(args::Tuple)
     arg = first(args)
@@ -1957,10 +2119,15 @@ function _reactant_ref_plate_call(operation, args::Tuple)
     # An empty batch can leave tensor.empty after Reactant's batch lowering,
     # which XLA cannot export. Its shape and element type are already known,
     # and it contains no parameter-dependent values: return the empty constant.
-    result = isempty(result) ?
-        zeros(Reactant.unwrapped_eltype(result), size(result)) : result
+    result = _empty_plate_batch(result)
     return _wrap_vector_lane_batch(result, shape)
 end
+
+_empty_plate_batch(result::ReactiveKernels._TensorizedPlateBatch) =
+    ReactiveKernels._TensorizedPlateBatch(_empty_plate_batch(result.values), result.schema)
+_empty_plate_batch(result::Tuple) = map(_empty_plate_batch, result)
+_empty_plate_batch(result) = isempty(result) ?
+    zeros(Reactant.unwrapped_eltype(result), size(result)) : result
 
 function ReactiveKernels._tensorized_plate_call(
         marker::Base.RefValue{<:Union{Reactant.TracedRArray,Reactant.TracedRNumber,
@@ -1978,7 +2145,10 @@ function ReactiveKernels._tensorized_plate_call(
         return _reactant_authored_plate_call(structural, operation, args)
     any(_reactant_plate_ref_array, args) &&
         return _reactant_ref_plate_call(operation, args)
-    Base.broadcast(operation, map(_reactant_plate_operand, args)...)
+    operands = map(_reactant_plate_operand, args)
+    result_type = Base.promote_op(operation, map(Base.eltype, operands)...)
+    result_type <: Number || return _reactant_ref_plate_call(operation, args)
+    Base.broadcast(operation, operands...)
 end
 
 @inline function ReactiveKernels._batched_call(
@@ -2172,7 +2342,7 @@ _rk_reactant_ad_op(::Val{:gradient}) = DifferentiationInterface.gradient
 _rk_reactant_ad_op(::Val{:value_and_gradient}) =
     DifferentiationInterface.value_and_gradient
 
-# --- Opt-in Reactant pipeline without fused-slice miscompiles ---------------
+# --- Opt-in Reactant pipeline with retained loops and unfused slices --------
 # reactant-full-pr-f9f453e4 (interim; see reactivekernels-use §7j).
 #
 # Reactant 0.2.284's `slice_slice` transform fuses nested strided slices into a
@@ -2181,12 +2351,17 @@ _rk_reactant_ad_op(::Val{:value_and_gradient}) =
 # Enzyme's reverse emits a mismatched `stablehlo.add(N, N-1)` (multi-use
 # chains), SIGABRTing the compile. The raw trace is correct (`optimize =
 # :only_enzyme` compiles with correct values/gradients), so compiling the
-# default `:all` pipeline minus just that one pattern restores correct
-# compiles. This builder replicates Reactant's default `:all` pipeline via
-# Reactant's own builders and strips the pattern, so it adapts to Reactant
+# default `:all` pipeline minus that pattern restores correct compiles.
+# Its `enzyme_hlo_unroll` pass also replicates bound data-derived count loops,
+# including loops inside a batch (Reactant 0.2.290). Remove that pass as well
+# to preserve the authored program structure in both primal and reverse AD.
+# This builder replicates Reactant's default `:all` pipeline via
+# Reactant's own builders and strips both patterns, so it adapts to Reactant
 # versions that keep the builder API; it fails loudly (instead of silently
 # running `:all`) when the builders or the pattern are absent.
-const _RK_NO_SLICE_SLICE_PATTERNS = (r"slice_slice<\d+>;",)
+const _RK_NO_SLICE_SLICE_PATTERNS = (
+    r"slice_slice<\d+>;", r"enzyme_hlo_unroll\(\d+\);",
+)
 
 function _rk_reactant_default_pipeline(backend::String)
     C = Reactant.Compiler

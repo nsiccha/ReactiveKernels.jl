@@ -88,6 +88,13 @@ a generated rule on an owned callable covers it.
 
 ## Acceptance and existing limitations
 
+Reactant 0.2.290 rejects a nested `Float64` broadcast over a packed view
+with a `SubArray` reindexing error. The simplex transform reads an ordinary
+slice of its already `Float64` packed port instead, with identical values
+and ordinary reverse-mode derivatives. The backend-only reproducer is
+`benchmark/reactant_subarray_broadcast_reindex.jl`; prior-only and shared
+simplex acceptance is in `test_capability_scan_priors_reactant.jl`.
+
 A lowering change must demonstrate that increasing relevant data lengths or
 capacities does not replicate loop bodies or control-flow regions. Check the
 generated backend structure as well as primal and AD parity with native Julia,
@@ -105,7 +112,11 @@ Reactant [scan](scan.md) lowering retains one `while` loop for every
 iterated-sequence shape, including bound host sequences.
 
 Grouped PK recurrences expose a subject plate containing retained event scans.
-Their full Reactant path currently fails at fixed-size system-matrix batching.
+Their fixed-size matrix and named carry intermediates batch as typed leaves,
+with their authored wrappers restored inside each cell. Their full Reactant
+path still fails in the ordinary StaticArrays matrix exponential: its branch
+condition is a traced Boolean. This is a dependency capability boundary,
+isolated by `benchmark/repro_reactant_static_matrix_exp.jl`.
 Eager branches, parameter-dependent host propagation, and data-derived
 unrolling are not acceptable fixes. See the [scan limitations](scan.md).
 
@@ -141,6 +152,12 @@ and lock the one Reactant 0.2.289 lifted:
   unrolled per lane, succeeded). The boundary concerned only branches whose
   condition reads a live value: a condition on bound data is split away
   during preparation and never reaches the backend.
+  Default optimized reverse still expands small lazy batches into one branch
+  region per lane instead of retaining the batch loop:
+  `repro_reactant_lazy_batch_growth.jl` has correct values and gradients at
+  two and five lanes, but different operation inventories. The fixed-structure
+  requirement remains unmet for that shape; changing optimizer flags is not
+  acceptance of the ordinary path.
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:
@@ -234,13 +251,6 @@ and lock the one Reactant 0.2.289 lifted:
   Declared second-axis gathers, elementwise array definitions and level
   subsets pass compiled primal, AD and operation-count checks.
 
-- A one-dimensional traced view indexed by `CartesianIndex{1}` fails in
-  Reactant 0.2.290 because `Base.reindex` expects an index tuple:
-  `repro_reactant_simplex_view.jl`. Reactant's broadcast element-type probe
-  reaches that index in the existing simplex transform's `Float64.(view)`
-  nest. Dirichlet priors, including live concentrations, retain native
-  primal and Enzyme reverse support; compiled acceptance pins this exact
-  failure until the backend fixes it. The authored transform stays intact.
 - Reverse compilation with a zero-length active vector leaves `tensor.empty`,
   which Reactant 0.2.290 cannot export to XLA:
   `repro_reactant_empty_gradient.jl` isolates a constant scalar loss and its
