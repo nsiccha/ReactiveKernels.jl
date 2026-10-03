@@ -1,38 +1,33 @@
-# Focused reproducer for the Reactant 0.2.285 / EnzymeMLIR reverse failure:
-# "had set op which was not a direct descendant". Two subjects, six operations,
-# one repeated-dose segment; no PPL generator, likelihood, or joint model.
-# With that fixed (EnzymeAD/Enzyme-JAX#3240) it compiles, but the gradient is
-# wrong on subject 1's rate parameters until the nested-if adjoint fix
-# (repro_nested_if_reverse.jl) is in as well.
-# 2026-09-30: both upstream fixes verified in released Reactant 0.2.289+
-# (standalone while/nested-if reproducers pass exactly; RK issue #13 closed),
-# but this PK repro now fails at trace time in StaticArrays._exp via
-# PPL._pk_expm_table (TypeError: non-boolean TracedRNumber{Bool}; since
-# f396c41e) — a separate lane from the upstream defects.
-# Run in an environment with this checkout, ReactiveKernelsPPL, Reactant, Enzyme.
-using ReactiveKernels, ReactiveKernelsPPL, Reactant, Enzyme
-const PPL = ReactiveKernelsPPL
-PPL._rectangular_pk_enabled[] = true
-const schedule = build_linear_pk_schedule([1, 1, 2, 2], [96., 120., 0., 5.],
-    [1, 1, 1, 1, 2], [0., 24., 48., 72., 0.], [100., 100., 100., 100., 50.])
-const columns = (schedule.op_type, schedule.op_dt, schedule.op_amount,
-    schedule.op_interval, schedule.op_count, schedule.op_read_idx)
-
-function pk(q)
-    args = ntuple(i -> PPL.SubjectScalar(
-        ReactiveKernels._tensorized_getindex(q, [2i-1, 2i])), 5)
-    sum(PPL.linear_pk_read_locs_auc_over_subjects(schedule.op_ends, columns...,
-        PPL.SubjectSlice(zeros(length(schedule.op_type))), args...))
+# Focused synthetic PK subject-plate reproducer. The historical upstream
+# while/nested-if reverse defects are fixed in Reactant 0.2.289+. This ordinary
+# graph currently fails compilation at fixed-size system-matrix batching,
+# before the retained event scan. No private diagnostic toggle is needed.
+using ReactiveKernels, ReactiveKernelsPPL, Reactant, Enzyme, DifferentiationInterface
+const PK_READS = ReactiveKernelsPPL._pk_auc_spec
+@kernel pk_objective(q::Vector{Float64}, ends, op_type, op_dt, op_amount,
+        op_interval, op_count, op_read_idx, log_F) = begin
+    log_Vc = q[1]
+    log_k10 = q[2]
+    log_k12 = q[3]
+    log_k21 = q[4]
+    log_ka = q[5]
+    reads = PK_READS(ends, op_type, op_dt, op_amount, op_interval, op_count,
+        op_read_idx, log_F, log_Vc, log_k10, log_k12, log_k21, log_ka)
+    sum(reads)
 end
-
-q = repeat(log.([10., .1, .2, .3, .5]); inner=2)
-println("native value: ", pk(q))
+s = build_linear_pk_schedule([1, 1, 2, 2], [96., 120., 0., 5.],
+    [1, 1, 1, 1, 2], [0., 24., 48., 72., 0.], [100., 100., 100., 100., 50.])
+names = (:op_type, :op_dt, :op_amount, :op_interval, :op_count, :op_read_idx)
+cols = NamedTuple{names}(Tuple(getproperty(s, n) for n in names))
+k = prepare(pk_objective; bound=merge((ends=s.op_ends,
+    log_F=zeros(length(s.op_type))), cols))
+q = log.([10., .1, .2, .3, .5])
+ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), q; active=:q)
+value, gradient = ReactiveKernels.ad_value_and_gradient!(ad, similar(q), q)
+println("native value: ", value, ", gradient: ", gradient)
 flush(stdout)
-gradient(q) = only(Enzyme.gradient(Enzyme.Reverse, pk, q))
-expected_gradient = gradient(q)
-println("native gradient: ", expected_gradient)
-flush(stdout)
-compiled = Reactant.@compile sync=true gradient(Reactant.to_rarray(q))
-got = Array(compiled(Reactant.to_rarray(q)))
-@assert isapprox(got, expected_gradient; rtol=1e-8) "compiled gradient $got, native $expected_gradient"
-println("compiled gradient matches native: ", got)
+rq = Reactant.to_rarray(q)
+compiled = compile_ad_value_and_gradient(ad, rq)
+rvalue, rgradient = compiled(rq)
+@assert Float64(rvalue) ≈ value
+@assert Array(rgradient) ≈ gradient
