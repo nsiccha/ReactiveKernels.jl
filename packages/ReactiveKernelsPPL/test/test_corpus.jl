@@ -197,7 +197,7 @@ end
         sprint(_canon, lower_rkppl(prog(group, margins, kws), data; conditioned = data))
     # Only supported defaults participate in parity. The removed centered
     # keyword's refusal is checked in test_varying_centered.jl.
-    plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(Normal(0, 1))]
+    plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(HalfNormal(1))]
     mm_group = :(mm(g1, g2))
     mm_spelled = :(mm(g1, g2; normalize = true))
     gr_group = :(gr(g; by = b))
