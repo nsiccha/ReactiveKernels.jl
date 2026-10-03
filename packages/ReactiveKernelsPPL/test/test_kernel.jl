@@ -421,10 +421,15 @@ end
     # capability: per-subject series reductions (`mean(ts)`) in a panel cell (panel v1) (todo `1qlbn5b`)
     @test_broken (lower_rkppl(
         plate_ast([:(m = mean(ts)), mu_stmt, obs_stmt, :mu]), data; conditioned = data); true)
-    # capability: ordinary module functions over a series inside a panel
-    # cell (todo `0bfiemp`); this is independent of the callable's spelling.
-    @test_broken (lower_rkppl(
-        plate_ast([:(m = cumsum(ts)), mu_stmt, obs_stmt, :mu]), data; conditioned = data); true)
+    # Supported: module functions consume whole values in ordinary
+    # plate cells (P3; todo `0bfiemp`), with explicit covariance arguments.
+    @test validate_structure(lower_rkppl(quote
+        @plate for i in eachindex(y)
+            cs = cumsum(grid)
+            K = gp_exp_quad_cov(grid,1.0,1.0,1e-9)
+            y[i] ~ Normal(sum(K) + sum(cs),1.0)
+        end
+    end,(:y,:grid);conditioned=(:y,:grid))) === nothing
     # Cross-cell refs fail closed.
     # refused: undeclared name `zz` (P6, 05oe96l)
     @test_throws "unknown name" lower_rkppl(

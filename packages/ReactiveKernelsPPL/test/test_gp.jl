@@ -60,10 +60,9 @@ end
     # Undotted scalar + vector remains a Julia MethodError (P3). A module
     # call's result shape is known at execution, rather than from its name.
     @test_throws MethodError _gp_bad_add(:(gp_exp_quad_cov(x, 1.0, 1.0, 1e-9)))
-    # Aniso/matrix locations fail at first eval (loud ArgumentError).
-    # capability: matrix-location (multi-dimensional) gp_exp_quad_cov (todo `0bfiemp`)
-    @test_broken (gp_exp_quad_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
-        1e-9); true)
+    # Supported: each matrix row is one location (todo `0bfiemp`).
+    @test gp_exp_quad_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0, 1e-9) ≈
+        [1.0 + 1e-9 exp(-4.0); exp(-4.0) 1.0 + 1e-9]
 end
 
 @testset "periodic gp end to end" begin
@@ -106,10 +105,11 @@ end
 @testset "periodic gp emission failures" begin
     # The same Julia arithmetic rule applies to a periodic covariance.
     @test_throws MethodError _gp_bad_add(:(gp_periodic_cov(x, 1.0, 1.0, 1.0, 1e-9)))
-    # Matrix locations and non-positive periods fail at first eval.
-    # capability: matrix-location gp_periodic_cov") (todo `0bfiemp`)
-    @test_broken (gp_periodic_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0,
-        1.0, 1e-9); true)
+    # Supported: Euclidean distance preserves Stan's isotropic kernel
+    # meaning on matrix locations (todo `0bfiemp`).
+    offdiag = exp(-2sin(pi * sqrt(8.0))^2)
+    @test gp_periodic_cov([0.0 1.0; 2.0 3.0], 1.0, 1.0, 1.0, 1e-9) ≈
+        [1.0 + 1e-9 offdiag; offdiag 1.0 + 1e-9]
     # refused: period = 0
     @test_throws ArgumentError gp_periodic_cov([0.0, 1.0], 1.0, 1.0, 0.0, 1e-9)
 end

@@ -166,9 +166,10 @@ const _SM_DATA = (
     @test sd.family === :student_t
     @test sd.args == (arg1 = 3.0, arg2 = 0.0, arg3 = 36.0)
     @test sd.support_override == (:truncated,0.0,Inf)
-    # Fail-closed: proper halves, unadmitted families, non-literal args,
-    # wrong arity, and unknown keywords.
-    for bad in (:(Beta(1, 1)), :(Normal(0, s)), :(StudentT(3, 0)))
+    # Authored proper priors work through library values; malformed
+    # distribution arity and unknown legacy keywords still fail loudly.
+    for bad in (:(HalfNormal(2)), :(Beta(1, 1)), :(Normal(0, s)),
+                :(StudentT(3, 0)), :(truncated(Normal(0, 1), 0, Inf)))
         ex = quote
             a ~ Normal(0, 1)
             s ~ Exponential(1)
@@ -180,9 +181,19 @@ const _SM_DATA = (
             # refused: StudentT is missing its scale argument (P3 arity).
             @test_throws SurfaceLoweringError lower_rkppl(ex, (:y, :x); conditioned = (:y, :x))
         else
-            # capability: proper, bounded and sampled-argument basis
-            # hyper priors (P7/P8 1cmodra; todo `0bfiemp`).
-            @test_broken (lower_rkppl(ex, (:y, :x); conditioned = (:y, :x)); true)
+            # Supported: ordinary authored hyper priors, through the
+            # explicit library/value surface (P7/P8; todo `0bfiemp`).
+            @test validate_structure(lower_rkppl(quote
+                a ~ Normal(0,1)
+                s ~ Exponential(1)
+                (P,lam) = hsgp_basis(x;k=8)
+                sigma_h ~ $bad
+                rho_h ~ LogNormal(0,1)
+                raw_h[axes(P,2)] .~ Normal.(0,1)
+                h = P * (hsgp_sqrt_spd(lam,sigma_h,rho_h) .* raw_h)
+                mu = a .+ h
+                y .~ Normal.(mu,1.0)
+            end, (:y,:x); conditioned=(:y,:x))) === nothing
         end
     end
     # refused: unknown keyword `lengthscale` (unsupported kwarg is a Julia MethodError, P3)
@@ -192,23 +203,27 @@ const _SM_DATA = (
         hsgp_basis(:h_x, x; k = 8, lengthscale = LogNormal(0, 1))
         y .~ Normal.(mu, 1.0)
     end, (:y, :x); conditioned = (:y, :x))
-    # HalfCauchy has the same normalized meaning in the smoothing slot.
-    @test (lower_rkppl(quote
-        spline_basis(:s_x, x; sd = HalfCauchy(2))
+    # Supported: normalized HalfCauchy spline scale (todo `0bfiemp`).
+    @test validate_structure(lower_rkppl(quote
+        (X,Z) = tps_basis(x;k=4)
+        sd_s ~ HalfCauchy(2)
+        b_s[axes(X,2)] .~ Flat.()
+        raw_s[axes(Z,2)] .~ Normal.(0,1)
+        f = X * b_s .+ Z * (sd_s .* raw_s)
         a ~ Normal(0, 1)
-        mu = a .+ spline(:s_x)
+        mu = a .+ f
         y .~ Normal.(mu, 1.0)
-    end, (:y, :x); conditioned = (:y, :x)); true)
-    # A hand-built plan's hyper prior is contract-validated too.
-    bad = HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, hb.fits, hb.label,
-        hb.cov, hb.period, HyperPrior(:beta, (arg1 = 1.0, arg2 = 1.0)),
-        nothing)
-    # capability: a Beta smooth-SD prior with explicit shape arguments (P8 1cmodra; todo `0bfiemp`).
-    @test_broken (validate_structure(
-        StructuralPlan(plan.responses, plan.predictors,
-            plan.population_priors, plan.parameters, plan.assignments,
-            plan.columns, plan.n_obs; derived = plan.derived,
-            hsgp_bases = [bad, plan.hsgp_bases[2]])); true)
+    end, (:y, :x); conditioned = (:y, :x))) === nothing
+    # Supported: a Beta smooth scale is its stated ordinary prior;
+    # no legacy HyperPrior container is required (P8; todo `0bfiemp`).
+    @test validate_structure(lower_rkppl(quote
+        (P,lam) = hsgp_basis(x;k=4)
+        sd_h ~ Beta(1,1)
+        rho_h ~ LogNormal(0,1)
+        raw_h[axes(P,2)] .~ Normal.(0,1)
+        mu = P * (hsgp_sqrt_spd(lam,sd_h,rho_h) .* raw_h)
+        y .~ Normal.(mu,1.0)
+    end, (:y,:x); conditioned=(:y,:x))) === nothing
 end
 
 const _SM_DOMAIN_X = [-1.0, -0.7, -0.4, -0.1, 0.2, 0.5, 0.8, 1.0]
@@ -335,22 +350,31 @@ end
             base(kw(:by, :(g .+ 1))))
         if bad in (base(kw(:by, :g), kw(:cov, QuoteNode(:periodic)),
                 kw(:period, 1.0)), base(kw(:by, :(g .+ 1))))
-            # capability: grouped periodic bases and computed groups
-            # (P8 1cmodra; todo `0bfiemp`).
-            @test_broken (lower_rkppl(bad, cols; conditioned = cols); true)
+            # Supported: data-derived grouping and periodic grouped
+            # bases use ordinary data functions (P8; todo `0bfiemp`).
+            periodic = bad == base(kw(:by,:g),kw(:cov,QuoteNode(:periodic)),kw(:period,1.0))
+            basis = periodic ? :(hsgp_periodic_basis(x;k=4,period=1.0,by=g)) :
+                :(hsgp_basis(x;k=4,by=g .+ 1))
+            @test validate_structure(lower_rkppl(quote
+                (P,spectrum) = $basis
+                b[axes(P,2)] .~ Normal.(0,1)
+                mu = P * b
+                y .~ Normal.(mu,1.0)
+            end,cols;conditioned=cols)) === nothing
         else
             # refused: remaining hyper formulas lack a matching group or
             # contain an observation slope in a group-level slot (IR contract).
             @test_throws SurfaceLoweringError lower_rkppl(bad, cols; conditioned = cols)
         end
     end
-    # capability: grouped multi-axis HSGP (by= with two axes; source: "v1 ... planned") (todo `0bfiemp`)
-    @test_broken (lower_rkppl(quote
+    # Supported: grouped multi-axis HSGP library (todo `0bfiemp`).
+    @test validate_structure(lower_rkppl(quote
         a ~ Normal(0, 1)
-        hsgp_basis(:h, x, q; k = (4, 4), by = g)
-        mu = a .+ hsgp(:h)
+        (P,lam) = hsgp_basis(x,q;k=(4,4),by=g)
+        f ~ hsgp_grouped_effect(P,lam,g)
+        mu = a .+ f
         y .~ Normal.(mu, 1.0)
-    end, cols; conditioned = cols); true)
+    end, cols; conditioned = cols)) === nothing
     # A hand-built hyper-predictor without a grouping is contract-invalid.
     plan = lower_rkppl(base(kw(:by, :g),
         kw(:length_scale, :(1 + (1 | g)))), cols; conditioned = cols)
