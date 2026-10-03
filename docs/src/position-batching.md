@@ -247,6 +247,63 @@ detachment rules. Its outputs remain borrowed until its own next call, so use
 recursively copies graph metadata and populated buffers; it is not the cheap
 empty-instance construction contract.
 
+## Explicit native scheduling
+
+Ordinary native batching runs serially. When a measured workload benefits from
+independent position workers, pass explicit scheduling hints:
+
+```julia
+@kernel scheduled_objective(x::Vector{Float64}, scale::Float64) = begin
+    result::Float64 = scale * sum(abs2, x)
+end
+
+template = vectorize(scheduled_objective; batched=:x,
+    schedule=NativeScheduling(workers=4, chunk_size=8))
+reader = copy(template)
+positions = reshape(collect(1.0:96.0), 3, 32)
+values = reader(positions, 0.5)
+@assert values == 0.5 .* vec(sum(abs2, positions; dims=1))
+```
+
+`workers` is an upper bound capped by available Julia execution threads and
+runtime chunks. `chunk_size` is required and positive: it bounds the positions
+stored in each worker's stacked buffers. Shared-only work runs once per call.
+Workers process bounded chunks, copy them into disjoint positions of the final
+result, and join before returning, including when a task fails. The final
+result still contains the whole ensemble; this is not a streaming reduction.
+Empty batches and calls needing only one worker use the ordinary serial driver.
+All position and inner data loops keep runtime bounds.
+
+Scheduled owning calls return fresh owned arrays. Add `reuse=true` for the
+borrowed final-output lifetime described above. Both scheduled modes retain
+worker buffers and are **not reentrant**: use `copy(template)` per concurrent
+caller. Copies share prepared computation and bound data but start with empty
+worker and final-output slots. Shapes and types reseed buffers; prior outputs
+used as inputs detach. Native lane dispatch follows the ordinary batching
+contract within each chunk: its first position uses scratch and subsequent
+positions may use destination column views. Declare a concrete array WANT when
+downstream recipe dispatch depends on that container type.
+
+There is no automatic cost model or speedup guarantee. Measure the whole
+operation, including reader construction, and account for worker storage plus
+the final result. Scheduling does not remove scalar intermediate allocations.
+Small or allocation-heavy work can run slower with extra workers.
+
+The schedule applies to native primal calls. An owning scheduled kernel compiled
+with Reactant keeps the existing retained position loop; `reuse=true` keeps its
+native-only boundary. Per-position derivatives use the existing scalar AD path:
+
+```julia
+using DifferentiationInterface: AutoEnzyme
+using Enzyme
+ad = prepare_ad(scalar_kernel(reader), AutoEnzyme(mode=Enzyme.Reverse),
+    [1.0, 2.0, 3.0], 0.5; active=:x)
+values, gradients = replica(ad; batched=:x)(positions, 0.5)
+```
+
+This derivative callable uses ordinary replicated scalar AD. Differentiating
+the native task scheduler itself is outside this execution surface.
+
 With Reactant, `@compile batched(positions, shared...)` lowers the same map to a
 retained loop with dynamic slices and output buffers. A scalar kernel that compiles under Reactant therefore
 has the same compiler requirement in vectorized form; reverse gradients have the

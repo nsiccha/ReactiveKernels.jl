@@ -4,6 +4,36 @@ using Reactant
 using DifferentiationInterface: AutoEnzyme
 using Enzyme
 
+@testset "native scheduling retains owning compiled batching" begin
+    @kernel scheduled_compiled_position(x::Float64, data::Vector{Float64}) = begin
+        shared::Float64 = sum(data)
+        result::Float64 = x > 0 ? log(x) + shared : -x + shared
+    end
+    schedule = NativeScheduling(chunk_size=2, workers=4)
+    batch = vectorize(scheduled_compiled_position; batched=:x, schedule)
+    serial = vectorize(scheduled_compiled_position; batched=:x)
+    position = repeat([2.0, -1.0, 4.0], 3)
+    data = [0.5, 1.0]
+    traced, traced_data = Reactant.to_rarray(position), Reactant.to_rarray(data)
+    compiled = Reactant.@compile batch(traced, traced_data)
+    @test Array(compiled(traced, traced_data)) ≈ batch(position, data)
+    @test batch(position, data) == serial(position, data)
+    later = Reactant.to_rarray(position .+ 1)
+    @test Array(compiled(later, traced_data)) ≈ batch(position .+ 1, data)
+    @test Array(traced) == position && Array(traced_data) == data
+    function scheduled_operations(count)
+        input = Reactant.to_rarray(fill(2.0, count))
+        hlo = repr(Reactant.@code_hlo optimize=true batch(input, traced_data))
+        @test Base.count("stablehlo.while", hlo) == 1
+        [m.match for m in eachmatch(r"(?:stablehlo|enzyme)\.[a-z_]+", hlo)]
+    end
+    small = scheduled_operations(3)
+    @test !isempty(small)
+    @test small == scheduled_operations(23)
+    borrowed = vectorize(scheduled_compiled_position; batched=:x, schedule, reuse=true)
+    @test_throws ArgumentError borrowed(traced, traced_data)
+end
+
 @kernel compiled_record_positions(position, data) = begin
     result = (; trajectory=position.scale .* data .+ position.offset,
                 total=position.scale * sum(data))
