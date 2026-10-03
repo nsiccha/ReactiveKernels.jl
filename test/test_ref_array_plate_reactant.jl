@@ -1,6 +1,7 @@
 using ReactiveKernels, Reactant, DifferentiationInterface, Test
 import Enzyme
 include("test_invariant_plate_reactant.jl")
+include("test_shared_host_array_branches_reactant.jl")
 isdefined(@__MODULE__, :AuthoredPlateChains) ||
     include("fixtures/authored_plate_chains.jl")
 
