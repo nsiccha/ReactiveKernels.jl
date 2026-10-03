@@ -10,6 +10,19 @@ import Enzyme
     return guarded
 end
 
+@kernel shared_split_arm(y::Vector{Float64}, scale::Float64) = begin
+    pointwise=plate(y,scale) do yi,si
+        cell::Float64=yi<=0 ? (si>0 ? log(si) : -Inf) : si*yi
+        cell
+    end
+    total::Float64=sum(pointwise)
+end
+
+@kernel typed_count_conversion(x, scale::Float64) = begin
+    count = ReactiveKernels._tensorized_trunc(Int, floor(x))
+    total::Float64 = scale * count
+end
+
 @kernel lazy_plate_guard(x::Vector{Float64}) = begin
     pointwise = plate(x) do xi
         cell::Float64 = xi > 0 ? log(xi) : 0.0
@@ -178,4 +191,61 @@ end
     gradient(v) = Enzyme.gradient(Enzyme.Reverse, k, v)
     compiled_gradient = Reactant.@compile gradient(_traced(lp))
     @test _host(only(compiled_gradient(_traced(lp)))) ≈ gref
+end
+
+@testset "zero-owner endpoints and bare operations stay inside their arm" begin
+    if !isdefined(@__MODULE__, :BranchPartition)
+        include("fixtures/branch_partition.jl")
+    end
+    structures = Dict{String,Int}[]
+    for n in (4,8)
+        x=fill(0.3,n); flag=repeat([0,1],n÷2)
+        k=prepare(BranchPartition.bare_helper_branch;have=(:x,:flag),want=:total,bound=(;flag))
+        hlo=repr(Reactant.@code_hlo optimize=false k(_traced(x)))
+        @test !occursin("stablehlo.if",hlo)
+        @test _host((Reactant.@compile k(_traced(x)))(_traced(x))) ≈ sum(2x[i] for i in eachindex(x) if flag[i]==0)
+        gradient(v)=Enzyme.gradient(Enzyme.Reverse,k,v)
+        cg=Reactant.@compile gradient(_traced(x))
+        @test _host(only(cg(_traced(x)))) ≈ [f==0 ? 2. : 0. for f in flag]
+        ops=Dict{String,Int}()
+        for m in eachmatch(r"stablehlo\.[a-z_]+",hlo)
+            ops[m.match]=get(ops,m.match,0)+1
+        end
+        push!(structures,ops)
+    end
+    @test structures[1]==structures[2]
+end
+
+@testset "a split shared arm retains a traced guard at every lane count" begin
+    structures=Dict{String,Int}[]
+    for n in (12,24)
+        y=repeat([0.,1.,2.],n÷3)
+        k=prepare(shared_split_arm;have=(:y,:scale),want=:total,bound=(;y))
+        s=_traced(1.3)
+        hlo=repr(Reactant.@code_hlo optimize=false k(s))
+        @test occursin("stablehlo.if",hlo)
+        c=Reactant.@compile k(s)
+        @test _host(c(s))≈n÷3*(log(1.3)+3*1.3)
+        gradient(v)=only(Enzyme.gradient(Enzyme.Reverse,k,v))
+        cg=Reactant.@compile gradient(s)
+        @test _host(cg(s))≈n÷3*(1/1.3+3)
+        ops=Dict{String,Int}()
+        for m in eachmatch(r"stablehlo\.[a-z_]+",hlo)
+            ops[m.match]=get(ops,m.match,0)+1
+        end
+        push!(structures,ops)
+    end
+    @test structures[1]==structures[2]
+end
+
+@testset "typed integer conversions accept traced integer and real inputs" begin
+    k = prepare(typed_count_conversion; want=:total)
+    for x in (3, 3.7)
+        rx, rs = _traced(x), _traced(1.2)
+        compiled = Reactant.@compile k(rx, rs)
+        @test _host(compiled(rx, rs)) ≈ 3.6
+        gradient(x, s) = only(Enzyme.gradient(Enzyme.Reverse, t -> k(x, t), s))
+        cg = Reactant.@compile gradient(rx, rs)
+        @test _host(cg(rx, rs)) ≈ 3.0
+    end
 end

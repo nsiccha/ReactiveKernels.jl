@@ -255,17 +255,48 @@ Main.ReactiveKernelsDocs.render_rkppl_corpus_example("62_mm_intercept_lib.jl", :
 ## Declared arrays as values
 
 `z[levels(g), 1:K] .~ Normal.(0, 1)` declares a groups × K matrix;
-`L ~ LKJCholesky(K, eta)` declares a lower-triangular matrix. Sized vectors
+`L ~ LKJCholesky(K, eta)` declares a lower-triangular matrix; an explicit
+third argument `'U'` returns its upper-triangular counterpart. Sized vectors
 (`sd[1:K] .~ HalfNormal.(1)`) and multivariate rows
 (`eachrow(c[levels(g), 1:K]) .~ MvNormalCholesky(zeros(K), F)`) are also plain
 Julia values. Their priors are explicit, and their dimensions determine their
 packed coordinates.
+
+The LKJ shape `eta` is a scalar value: it can be a positive literal, bound
+data, a sampled parameter, or a definition using those values. A per-level
+LKJ prior can share that same value across all its factors.
+
+Compiled reverse mode currently fails for a data-sized whole factor with a
+live shape when its retained diagonal prior and shared response expressions
+both read the factor. Native density and gradients and compiled primal pass.
+The literal two-dimensional and per-level forms have compiled reverse coverage;
+see the [backend limitation](constraints.md#acceptance-and-existing-limitations).
+
+Joint correlated responses can also use explicit factor priors:
+declare `sd[1:2] .~ Gamma.(2, 1)` and `C ~ LKJCholesky(2, eta)`,
+then bind `F = sd .* C` and use
+`[y1, y2] ~ MvNormalCholesky([mu1, mu2], F)`. The scale vector has
+positive support and the factor width matches the outcome count.
 
 Array-valued definitions retain known axes: `b = z * (sd .* L)'` is groups ×
 K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
 `L[2, 1]` and `M[:, 1]` remain ordinary Julia reads. A submodel's returned
 array follows the same rule. A data-only definition can size a declared array
 through `levels(gg)`, as in the multi-membership example above.
+
+Level axes preserve the order of their source. `z[levels(g)]` uses the
+`DataAPI.levels` pool, including unobserved categorical levels;
+`z[unique(g)]` uses first occurrence order. A supplied vector or range
+`lv`, or a data-only definition such as `lv = reverse(unique(g))`, can
+declare `z[lv]` in that order. Selections such as
+`levels(g)[1:2:end]` and `unique(g)[3:-2:1]` select positions in the
+source pool. Labels compare with `isequal`, including `missing`, `NaN`,
+and array values. A column read only as labels may contain `missing`;
+numeric observations retain their missing-value checks.
+
+For paired crossed effects, index each axis by one observation's label
+inside a plate: `mu[i] = a + b[g[i], h[i]]`. Julia's `b[g, h]` with two
+vectors selects a Cartesian matrix.
 
 The library's `gp_exp_quad_cov` and `gp_periodic_cov` functions build covariance
 with an RK plate over two location axes. Data-only locations cache pair

@@ -54,8 +54,8 @@ include("symmetric_eigen_rules.jl")
 # explodes past 8 GB) — so it traces under Reactant as one small loop
 # and differentiates under Enzyme without any rule (no backend-specific
 # derivative code, no method on a function this repository does not
-# own). Both reflection arms stay finite on the whole slice, so the
-# selection is ordinary `ifelse`.
+# own). Endpoint guards and reflection use lazy branches, including their
+# derivative work. Tail selection only selects between already valid values.
 #
 # Validated against `SpecialFunctions.beta_inc` on the slice (see
 # `test_rk_beta_inc.jl`); outside it use `SpecialFunctions.beta_inc`
@@ -111,13 +111,53 @@ function _rk_beta_inc_core(a, b, x)
     return front * _rk_beta_inc_cf(a, b, x) / a
 end
 
-function rk_beta_inc(a, b, x)
-    direct = _rk_beta_inc_core(a, b, x)
-    y = 1 - x
-    reflected = 1 - _rk_beta_inc_core(b, a, y)
-    thresh = (a + 1) / (a + b + 2)
-    core = ifelse(x < thresh, direct, reflected)
-    return ifelse(x <= 0, zero(core), ifelse(x >= 1, one(core), core))
+function _rk_beta_inc_interior(a, b, x, upper::Bool)
+    result = zero(a + b)
+    ReactantCore.@trace if x < (a + 1) / (a + b + 2)
+        small = _rk_beta_inc_core(a, b, x)
+        result = ifelse(upper, 1 - small, small)
+    else
+        small = _rk_beta_inc_core(b, a, 1 - x)
+        result = ifelse(upper, small, 1 - small)
+    end
+    return result
+end
+function _rk_beta_inc_upper_guard(a, b, x, upper::Bool)
+    result = zero(a + b)
+    ReactantCore.@trace if x >= 1
+        result = ifelse(upper, zero(a + b), one(a + b))
+    else
+        result = _rk_beta_inc_interior(a, b, x, upper)
+    end
+    return result
+end
+function rk_beta_inc_tail(a, b, x, upper::Bool)
+    result = zero(a + b)
+    ReactantCore.@trace if x <= 0
+        result = ifelse(upper, one(a + b), zero(a + b))
+    else
+        result = _rk_beta_inc_upper_guard(a, b, x, upper)
+    end
+    return result
+end
+rk_beta_inc(a, b, x) = rk_beta_inc_tail(a, b, x, false)
+
+# Near the centre, the beta change of variables has a removable 0*Inf
+# derivative. Integrating the smooth density's local series avoids that
+# singular coordinate while retaining ordinary differentiation of the primal.
+function rk_student_tail(nu, z, upper::Bool)
+    result = zero(nu + z)
+    ReactantCore.@trace if abs(z) <= 1e-4 * sqrt(nu / (nu + 1))
+        t = z^2 / nu
+        c = exp(loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5log(nu*3.141592653589793))
+        delta = c*z*(1 - (nu+1)*t/6 + (nu+1)*(nu+3)*t^2/40 -
+            (nu+1)*(nu+3)*(nu+5)*t^3/336)
+        result = ifelse(upper, 0.5 - delta, 0.5 + delta)
+    else
+        half = 0.5 * rk_beta_inc(nu / 2, 0.5, nu / (nu + z^2))
+        result = ifelse(ifelse(upper, z >= 0, z <= 0), half, 1 - half)
+    end
+    return result
 end
 
 export LOCATION_SCALE_SOURCE
@@ -167,7 +207,7 @@ export NEGATIVE_BINOMIAL_SOURCE
 export WEIBULL_SOURCE
 
 const LOCATION_SCALE_SOURCE = raw"""
-using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, rk_beta_inc
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, rk_beta_inc, rk_student_tail
 using SpecialFunctions: erfc, erfcinv, beta_inc_inv
 using LogExpFunctions: log1pexp
 
@@ -205,14 +245,8 @@ end
     logpdf(z::Float64)::Float64 =
         loggamma((nu + 1) / 2) - loggamma(nu / 2) - 0.5 * log(nu * π) -
         ((nu + 1) / 2) * log1p(z^2 / nu)
-    cdf(z::Float64)::Float64 = begin
-        half_tail::Float64 = 0.5 * rk_beta_inc(nu / 2, 0.5, nu / (nu + z^2))
-        ifelse(z <= 0, half_tail, 1 - half_tail)
-    end
-    ccdf(z::Float64)::Float64 = begin
-        half_tail::Float64 = 0.5 * rk_beta_inc(nu / 2, 0.5, nu / (nu + z^2))
-        ifelse(z >= 0, half_tail, 1 - half_tail)
-    end
+    cdf(z::Float64)::Float64 = rk_student_tail(nu, z, false)
+    ccdf(z::Float64)::Float64 = rk_student_tail(nu, z, true)
     quantile(p::Float64)::Float64 = begin
         lower::Bool = p < 0.5
         tail::Float64 = ifelse(lower, p, 1 - p)
@@ -385,18 +419,11 @@ const LOGNORMAL_KERNEL_SOURCE = raw"""
     end
     inv(standardized_log, z::Float64)::Float64 = exp(location + scale * z)
 
-    logpdf(x::Float64)::Float64 = begin
-        valid::Bool = x > 0
-        z::Float64 = standardized_log(x)
-        standard_logpdf::Float64 = standard_normal.logpdf(z)
-        valid ? standard_logpdf - log_scale - log(x) : -Inf
-    end
-    cdf(x::Float64)::Float64 = begin
-        valid::Bool = x > 0
-        z::Float64 = standardized_log(x)
-        standard_cdf::Float64 = standard_normal.cdf(z)
-        valid ? standard_cdf : 0.0
-    end
+    logpdf(x::Float64)::Float64 =
+        x > 0 ? standard_normal.logpdf((log(x) - location) / scale) -
+            log_scale - log(x) : -Inf
+    cdf(x::Float64)::Float64 =
+        x > 0 ? standard_normal.cdf((log(x) - location) / scale) : 0.0
     ccdf(x::Float64)::Float64 =
         x > 0 ? standard_normal.ccdf((log(x) - location) / scale) : 1.0
     quantile(p::Float64)::Float64 = begin
@@ -556,6 +583,9 @@ using SpecialFunctions: gamma_inc
             observed * log_rate - rate - loggamma(observed + 1.0) : -Inf
     cdf(observed::Int)::Float64 =
         observed >= 0 ? last(gamma_inc(observed + 1.0, rate)) : 0.0
+    ccdf(observed::Int)::Float64 =
+        observed >= 0 ? first(gamma_inc(observed + 1.0, rate)) : 1.0
+
 end
 """
 
@@ -637,6 +667,11 @@ using SpecialFunctions: beta_inc
         observed < 0 ? 0.0 :
             (observed >= n ? 1.0 :
              first(beta_inc(float(n - observed), observed + 1.0, 1 - p)))
+    ccdf(observed::Int)::Float64 =
+        observed < 0 ? 1.0 :
+            (observed >= n ? 0.0 :
+             last(beta_inc(float(n - observed), observed + 1.0, 1 - p)))
+
 end
 """
 
@@ -654,6 +689,8 @@ const NEGATIVE_BINOMIAL2_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using LogExpFunctions: log1p
 
+using SpecialFunctions: beta_inc
+
 @kernel negative_binomial2(mu::Float64, phi::Float64) = begin
     logpdf(observed::Int)::Float64 = begin
         valid::Bool = (observed >= 0) & (mu >= 0) & (phi > 0)
@@ -664,6 +701,11 @@ using LogExpFunctions: log1p
              (observed == 0 ? 0.0 : -y * log1p(phi / mu))) :
             -Inf
     end
+    cdf(observed::Int)::Float64 = observed < 0 ? 0.0 :
+        first(beta_inc(phi, observed + 1.0, phi / (phi + mu)))
+    ccdf(observed::Int)::Float64 = observed < 0 ? 1.0 :
+        last(beta_inc(phi, observed + 1.0, phi / (phi + mu)))
+
 end
 """
 
@@ -682,6 +724,8 @@ const NEGATIVE_BINOMIAL_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using LogExpFunctions: log1p
 
+using SpecialFunctions: beta_inc
+
 @kernel negative_binomial(r::Float64, p::Float64) = begin
     logpdf(observed::Int)::Float64 = begin
         valid::Bool = (observed >= 0) & (r > 0) & (p > 0) & (p < 1)
@@ -691,6 +735,11 @@ using LogExpFunctions: log1p
              r * log(p) + y * log1p(-p)) :
             -Inf
     end
+    cdf(observed::Int)::Float64 = observed < 0 ? 0.0 :
+        first(beta_inc(r, observed + 1.0, p))
+    ccdf(observed::Int)::Float64 = observed < 0 ? 1.0 :
+        last(beta_inc(r, observed + 1.0, p))
+
 end
 """
 
@@ -740,6 +789,8 @@ end
 const BETA_BINOMIAL_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, logbeta
 
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: rk_beta_binomial_cdf, rk_beta_binomial_ccdf
+
 @kernel beta_binomial(n::Int, alpha::Float64, beta::Float64) = begin
     logpdf(observed::Int)::Float64 =
         (observed >= 0) & (observed <= n) ?
@@ -748,6 +799,9 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma, lo
              logbeta(observed + alpha, n - observed + beta) -
              logbeta(alpha, beta)) :
             -Inf
+    cdf(observed::Int)::Float64 = rk_beta_binomial_cdf(n, alpha, beta, observed)
+    ccdf(observed::Int)::Float64 = rk_beta_binomial_ccdf(n, alpha, beta, observed)
+
 end
 """
 
@@ -850,6 +904,8 @@ const ZERO_INFLATED_POISSON_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using LogExpFunctions: logaddexp, log1p
 
+using SpecialFunctions: gamma_inc
+
 @kernel zero_inflated_poisson(rate::Float64, zi::Float64) = begin
     log_rate::Float64 = log(rate)
     rate::Float64 = exp(log_rate)
@@ -863,6 +919,11 @@ using LogExpFunctions: logaddexp, log1p
                 log1p(-zi) + y * log_rate - rate - loggamma(y + 1.0)) :
             -Inf
     end
+    cdf(observed::Int)::Float64 = observed < 0 ? 0.0 :
+        zi + (1 - zi) * last(gamma_inc(observed + 1.0, rate))
+    ccdf(observed::Int)::Float64 = observed < 0 ? 1.0 :
+        (1 - zi) * first(gamma_inc(observed + 1.0, rate))
+
 end
 """
 
@@ -881,6 +942,8 @@ const ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE = raw"""
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
 using LogExpFunctions: logaddexp, log1pexp
 
+using SpecialFunctions: beta_inc
+
 @kernel zero_inflated_binomial(n::Int, p::Float64, zi::Float64) = begin
     logit::Float64 = log(p) - log1p(-p)
     p::Float64 = 1 / (1 + exp(-logit))
@@ -896,8 +959,17 @@ using LogExpFunctions: logaddexp, log1pexp
                     loggamma(n - observed + 1.0) + observed * logp +
                     (n - observed) * log1mp)) :
             -Inf
+    cdf(observed::Int)::Float64 = observed < 0 ? 0.0 :
+        (observed >= n ? 1.0 :
+         zi + (1 - zi) * first(beta_inc(float(n - observed), observed + 1.0, 1 - p)))
+    ccdf(observed::Int)::Float64 = observed < 0 ? 1.0 :
+        (observed >= n ? 0.0 :
+         (1 - zi) * last(beta_inc(float(n - observed), observed + 1.0, 1 - p)))
+
 end
 """
+
+include("evidence_cdfs.jl")
 
 const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
     join((BERNOULLI_KERNEL_SOURCE, LOGNORMAL_KERNEL_SOURCE,

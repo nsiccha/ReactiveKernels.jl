@@ -382,9 +382,9 @@ _corr_r() = only(_corr_plan2().responses)
         base.range; extra_responses = base.extra_responses,
         extra_predictors = base.extra_predictors,
         factor_scales = base.factor_scales, factor_corr = base.factor_corr)
-    # capability: censored evidence on a joint multivariate response (todo `0ze68k8`)
-    @test_broken (validate_structure(_corr_mutate(;
-        resp = [ev])); true)
+    # User decision 0xtp29y: scalar-bound wrappers are univariate. Joint
+    # rectangle/partial-coordinate evidence requires a separate API.
+    @test_throws ContractValidationError validate_structure(_corr_mutate(resp = [ev]))
     # Factor args: bad scale, unknown scale name, bad shape, missing size.
     for bad_vp in (
             # refused: negative exponential scale (IR contract)
@@ -478,19 +478,19 @@ _corr_surface(extra::Expr...) =
     @test_throws SurfaceLoweringError lower_rkppl(
         _corr_surface(:(L ~ LKJCovarianceFactor(0, Exponential(1.0), 2.0)),
             J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
-    # capability: non-Exponential scale prior in `LKJCovarianceFactor` (e.g. `Gamma`; "Exponential in this slice") (todo `1308iv0`)
-    @test_broken (lower_rkppl(
-        _corr_surface(:(L ~ LKJCovarianceFactor(2, Gamma(2.0, 1.0), 2.0)),
-            J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x)); true)
+    # The covariance factor is an explicit value with ordinary scale priors.
+    @test validate_structure(lower_rkppl(_corr_surface(
+        :(sd[1:2] .~ Gamma.(2.0, 1.0)), :(C ~ LKJCholesky(2, 2.0)),
+        :(L = sd .* C), J2), (:y1, :y2, :x);
+        conditioned = (:y1, :y2, :x))) === nothing
     # refused: LKJ eta must be > 0 (mathematically invalid input)
     @test_throws SurfaceLoweringError lower_rkppl(
         _corr_surface(:(L ~ LKJCovarianceFactor(2, Exponential(1.0), 0.0)),
             J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
-    # capability: sampled LKJ eta in `LKJCovarianceFactor` (P8 admits sampled prior arguments; "finite positive literal") (todo `1308iv0`)
-    @test_broken (lower_rkppl(
-        _corr_surface(:(eta ~ Exponential(1.0)),
-            :(L ~ LKJCovarianceFactor(2, Exponential(1.0), eta)), J2),
-        (:y1, :y2, :x); conditioned = (:y1, :y2, :x)); true)
+    @test validate_structure(lower_rkppl(_corr_surface(
+        :(eta ~ Exponential(1.0)), :(sd[1:2] .~ Exponential.(1.0)),
+        :(C ~ LKJCholesky(2, eta)), :(L = sd .* C), J2),
+        (:y1, :y2, :x); conditioned = (:y1, :y2, :x))) === nothing
     # A factor K that disagrees with the joint width fails contract
     # validation inside lowering.
     # refused: factor K != joint width (dimension mismatch)

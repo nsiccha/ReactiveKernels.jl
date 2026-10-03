@@ -498,10 +498,10 @@ end
 function _contrast_expr(b::DesignBlock)
     @assert b.kind === FactorTerm
     lvlvec = Expr(:vect, (_level_literal(lvl) for lvl in b.levels)...)
-    # Build `g .== permutedims(lvlvec)` via quasiquote for stable lowering.
+    # Compare labels with Julia's identity relation, including missing/NaN.
     g = b.column
     perms = :(permutedims($lvlvec))
-    return :(Float64.($g .== $perms))
+    return :(Float64.(isequal.($g, $perms)))
 end
 
 # One matrix block as an in-graph data expression:
@@ -515,14 +515,11 @@ function _matrix_block_expr(b::DesignBlock, n_obs::Int)
     return :(Float64.($(Expr(:call, :hcat, parts...))))
 end
 
-# Grouping levels embed as literals; Symbols need QuoteNode (a bare Symbol
-# in an Expr would resolve as a variable). Anything else is loud.
+# Nonliteral level values stay quoted data; a Symbol must also be quoted
+# so the emitted expression never interprets a label as a variable.
 _level_literal(lvl::Union{Number,String,Bool,Char}) = lvl
 _level_literal(lvl::Symbol) = QuoteNode(lvl)
-_level_literal(lvl) = throw(
-    ContractValidationError("[preprocessing] grouping level $(repr(lvl)) " *
-                            "is not literal-embeddable (numeric/string/symbol only)"),
-)
+_level_literal(lvl) = QuoteNode(lvl)
 
 """
     _declared_codes(x, levels) -> Vector{Int}
@@ -543,7 +540,7 @@ function _declared_codes(x::AbstractVector, levels::AbstractVector)
     for (i, v) in enumerate(x)
         c = 0
         for (j, lv) in enumerate(levels)
-            if v == lv
+            if isequal(v, lv)
                 c = j
                 break
             end

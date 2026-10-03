@@ -174,6 +174,15 @@ and lock the one Reactant 0.2.289 lifted:
   and AD parity. The invalid host-constant indexing shape remains unsupported;
   its named acceptance case is excluded from compiled parity, with the exact
   `BoundsError` pinned. No index clamping or dummy buffer is introduced.
+- Reverse compilation through a guarded diagonal reduction can fail with an
+  MLIR dominance error when its matrix also feeds shared response expressions:
+  `repro_reactant_shared_matrix_loop_reverse.jl` reproduces this on Reactant
+  0.2.290 with plain matrix products, weighted gathers and a retained diagonal
+  loop. Native PPL primal/reverse and compiled primal pass. The named PPL
+  acceptance case uses `LKJCholesky(size(M, 1), eta)` with a sampled shape;
+  its data-derived transform and prior loops remain retained. A declared
+  literal two-dimensional factor uses its one scalar diagonal-prior equation
+  and passes compiled reverse, while its transform still retains its loops.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its
   shadow-allocation caching, reached while it differentiates SpecialFunctions'
   `logabsgamma` port) when lazily evaluated branches around
@@ -231,6 +240,42 @@ and lock the one Reactant 0.2.289 lifted:
   but cannot compile with Reactant. Its acceptance test pins this exact
   `MethodError`; other failures remain errors. The ordinary formula stays
   intact, with no foreign-function derivative rule or tracing workaround.
+- Evidence normalizers that call `SpecialFunctions.gamma_inc` or `beta_inc`
+  have no traced scalar method in Reactant 0.2.290:
+  `repro_specialfunctions_evidence.jl` isolates both calls (and `besselix`)
+  without ReactiveKernels. This affects compiled Gamma/Beta, Poisson/Binomial,
+  negative-binomial and zero-inflated/hurdle evidence; their native values and
+  Enzyme gradients work. VonMises evidence reaches the Bessel limitation
+  above. The PPL acceptance pins each exact missing-function `MethodError`,
+  rather than refusing those families or accepting unrelated exceptions.
+- The default slice optimizer aborts reverse compilation of chained strided
+  gathers with a mismatched `stablehlo.add` shape:
+  `repro_reactant_partition_gather_reverse.jl` reproduces it with Reactant and
+  Enzyme only. Mixed clamp arms of LogNormal and Weibull evidence reach this
+  shape. Their compiled primal works, and compiled reverse matches native
+  gradients at 6, 12 and 24 rows with the explicit `optimize=:only_enzyme`
+  pipeline, which retains the trace and reverse pass. The lazy arms and
+  observation loops stay intact; this is an optimizer limitation.
+- A retained `@trace` loop updates its input tracer handles even when the
+  authored inputs are read-only. If a lazy thunk captures those handles, they
+  can escape into a child region and tracing fails with an operand-dominance
+  error: `repro_reactant_captured_loop_branch.jl borrowed` isolates the failure
+  with Reactant and Enzyme only. The `copied` mode passes primal and reverse
+  with the same lazy branch and retained loop. Owned evidence-tail helpers
+  enter with fresh handles through `_loop_capture_traced`; native values pass
+  through unchanged, and no branch or iteration is expanded or predicated.
+- Mixed beta-binomial clamp arms support native values and reverse, compiled
+  primal, and compiled reverse with RK's explicit `optimize=:no_slice_slice`
+  pipeline. That pipeline removes the faulty slice-combination pass and
+  count-loop unrolling, preserving retained data-derived loops. Default
+  compiled reverse reaches the chained-slice abort above; `only_enzyme`
+  instead fails with `WhileOp does not have induction
+  variable for cache removal`. `repro_reactant_batched_count_reverse.jl`
+  isolates a retained count loop in a batched cell with Reactant and Enzyme
+  only; its `only_enzyme` reverse segfaults in `LoopCheckpointing`. The clamp
+  reverse acceptance selects the verified pipeline explicitly. Beta-binomial
+  truncation and interval evidence retain their loops and pass compiled
+  reverse and fixed-operation-count acceptance at 6, 12 and 24 observations.
 - Linear indexing of an adjoint vector (`b = (z * sd)'`, then `b[g]`)
   fails during Reactant 0.2.290 tracing: the adjoint converts the integer
   positions to two-dimensional Cartesian indices, which the backend applies

@@ -111,14 +111,10 @@ _bare_posterior(kern, lay, q::NamedTuple) =
         y .~ Poisson.(mu)
     end"""), (:y, :x); conditioned = (:y, :x)); true)
 
-    # Evidence on a bare location fails closed (cdf arms are link-space).
-    # capability: censoring evidence on a bare sampled-parameter location (todo `0ze68k8`)
-    @test_broken (bind_data(
+    # Evidence normalizers use the bare probability parameter directly.
+    # admitted: censoring evidence on a bare sampled-parameter location (todo `0ze68k8`)
+    @test (bind_data(
         lower_rkppl(Meta.parse("""begin
-            a ~ Normal(0, 1)
-            b ~ Normal(0, 1)
-            mu = a .+ b .* x
-            sigma ~ Exponential(1.0)
             theta ~ Beta(1.0, 1.0)
             k .~ censored.(Binomial.(n, theta), lo, hi)
         end"""), (:k, :n, :x, :lo, :hi); conditioned = (:k, :n, :x, :lo, :hi)),
