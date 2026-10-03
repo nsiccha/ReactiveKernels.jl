@@ -5858,6 +5858,8 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
             bound && !haskey(plan.columns, inp) && !(inp in known) &&
                 _fail(label, "array plate column reads unknown name $inp")
             push!(refs, inp)
+        elseif inp isa Expr && inp.head === :call && inp.args[1] isa GlobalRef
+            _collect_opaque_refs!(refs, inp, plan, label, bound)
         elseif inp isa Expr && inp.head === :call && length(inp.args) == 4 &&
                 inp.args[1] === :_ppl_level_gather
             nm, g, ld = inp.args[2:end]

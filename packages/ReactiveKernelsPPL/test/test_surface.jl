@@ -3468,7 +3468,12 @@ end
     for (i, bad) in enumerate(badloops)
         program = Expr(:block, :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(s ~ Exponential(1)), :(mu = a .+ b .* x), bad)
-        if i in (5, 6)
+        if i == 6
+            # An empty loop contributes no observation or latent draws.
+            empty_plan = lower_rkppl(program, Dn; conditioned=Dn)
+            @test isempty(empty_plan.responses)
+            @test isempty(empty_plan.plate_parameters)
+        elseif i == 5
             # capability: a trailing singleton axis or an empty prior-only plate (P10a 0dejlw1; 10gzbm9 degenerate; todo `1qlbn5b`).
             @test_broken (lower_rkppl(program, Dn; conditioned = Dn); true)
         else
@@ -3497,7 +3502,10 @@ end
             :(mu = a .+ b .* x),
             Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
                 Expr(:for, Expr(:(=), :i, :(eachindex(y))), Expr(:block, bad))))
-        if i in (1, 4, 6, 9)
+        if i in (1, 4, 6)
+            admitted = lower_rkppl(program, Dn; conditioned=Dn)
+            @test i == 6 ? length(admitted.plate_parameters) == 1 : length(admitted.responses) == 1
+        elseif i == 9
             # capability: scalar .~, loop-index values, a prior-only latent
             # plate and singleton trailing dimensions (P3/P10a; 10gzbm9 degenerate; todo `1qlbn5b`).
             @test_broken (lower_rkppl(program, Dn; conditioned = Dn); true)
@@ -3643,13 +3651,14 @@ end
 
 @testset "surface plate per-cell sampling failures" begin
     Dn = (:y, :x)
-    # Dotted object for a per-cell latent declaration (must be scalar/undotted).
+    # Broadcasting a distribution over scalar cell arguments is scalar.
     # capability: dotted scalar object for a per-cell latent (Normal.(0, 1) == Normal(0, 1)); observation cells already admit it (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(Expr(:block,
+    dotted_latent = lower_rkppl(Expr(:block,
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal.(0, 1)),
-                    :(y[i] ~ Normal.(theta[i], 1)))))), Dn; conditioned = Dn); true)
+                    :(y[i] ~ Normal.(theta[i], 1)))))), Dn; conditioned = Dn)
+    @test only(dotted_latent.plate_parameters).family === :normal
     # Bare per-cell sample (must index the latent, or move the prior out).
     # refused: theta declared once per cell (single assignment)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,

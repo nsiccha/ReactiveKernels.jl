@@ -1465,7 +1465,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     for (nm, rhs) in aligned_defs
         push!(derived, VectorAssignmentSpec(nm, rhs, nm))
     end
-    append!(derived, ctx.synth_derived)
+    for d in ctx.synth_derived
+        rhs = _is_plate_column_call(d.expr) ?
+            _plate_column_expr(d.name, d.expr, pc_dims, data) : d.expr
+        push!(derived, VectorAssignmentSpec(d.name, rhs, d.label))
+    end
     append!(assigns, ctx.synth_assigns)
     _check_coefficient_readers(coefuse, ctx, predictors, priors, params,
         plate_parameters, assigns, derived, responses)
@@ -5125,7 +5129,8 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     rkind = _plate_range_kind(R)
     body = loop.args[2]
     cells = Any[a for a in body.args if !(a isa LineNumberNode)]
-    isempty(cells) && _sfail("`@plate` body is empty")
+    isempty(cells) && return Expr[], Tuple{Symbol,Int,Set{Symbol}}[],
+        Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol},Int}[]
     # Names bound by `=` anywhere in this plate (cell locals, excluded
     # from the bare-vector check even on forward reference) — a bare LHS
     # (`t = ...`) or an i-indexed LHS (`theta[i] = ...`).
@@ -5149,11 +5154,39 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
+    if any(c -> _cell_uses_index_value(c, ivar), cells)
+        indexname = gensym(:_rkppl_index)
+        indices = rkind[1] === :coloncall ? rkind[2] :
+            rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
+            Expr(:call, GlobalRef(Base, :axes), rkind[2], 1)
+        indexvalues = Expr(:call, GlobalRef(Base, :collect), indices)
+        push!(out, Expr(:(=), indexname,
+            _plate_column_call(ivar, Pair{Symbol,Any}[], ivar, nothing; indices=indexvalues)))
+        push!(plate_defs, indexname)
+        push!(pidx, indexname)
+        cells = Any[_cell_index_values(c, ivar, indexname) for c in cells]
+    end
     for c in cells
         push!(out, _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx,
             params, pidx)...)
     end
     return out, ctx, params
+end
+
+# Numeric index values become one data-only index column. Indexed reads
+# retain their original syntax for the cell's index validation.
+_cell_uses_index_value(ex, ivar) = ex === ivar
+function _cell_uses_index_value(ex::Expr, ivar)
+    ex.head === :ref && return false
+    start = ex.head in (:call, :kw, :.) ? 2 : 1
+    return any(a -> _cell_uses_index_value(a, ivar), ex.args[start:end])
+end
+_cell_index_values(ex, ivar, name) = ex === ivar ? name : ex
+function _cell_index_values(ex::Expr, ivar, name)
+    ex.head === :ref && return ex
+    start = ex.head in (:call, :kw, :.) ? 2 : 1
+    return Expr(ex.head, ex.args[1:start-1]...,
+        (_cell_index_values(a, ivar, name) for a in ex.args[start:end])...)
 end
 
 # A plate whose definitions hold arrays: some definition reads a whole
@@ -5270,7 +5303,7 @@ end
 # Shared cell construction for observation and level axes. The fourth
 # field records a level axis, so constant outputs still have one value
 # per level and subsequent gathers preserve that axis.
-function _plate_column_call(ivar, locals, rhs, axis)
+function _plate_column_call(ivar, locals, rhs, axis; indices=nothing)
     body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...)
     deps = Set{Symbol}()
     for (_, v) in locals
@@ -5280,9 +5313,13 @@ function _plate_column_call(ivar, locals, rhs, axis)
     setdiff!(deps, Set{Symbol}(first.(locals)))
     delete!(deps, ivar)
     spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body), QuoteNode(rhs))
-    if axis !== nothing
+    if axis !== nothing || indices !== nothing
         push!(spec.args, QuoteNode(axis))
-        push!(deps, axis)
+        axis !== nothing && push!(deps, axis)
+    end
+    if indices !== nothing
+        push!(spec.args, QuoteNode(indices))
+        _cell_free_syms!(deps, indices)
     end
     return Expr(:call, :_ppl_plate_column, spec, sort!(collect(deps))...)
 end
@@ -5346,12 +5383,9 @@ function _desugar_cell(c, ivar, rkind, line, data, plate_defs, ctx, params,
                "factor/levels for crossed effects (`c[levels(g)]`), `@scan` " *
                "for sequential recurrence")
     end
-    if _is_broadcast_sample(c)
-        _sfail("cells are scalar (`~`); broadcast (`.~`) at top level")
-    end
     rkind[1] === :levels && return _desugar_levels_cell(c, ivar, rkind[2],
         data)
-    if _is_sample(c)
+    if _is_sample(c) || _is_broadcast_sample(c)
         return _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs,
             ctx, params, pidx)
     end
@@ -5466,14 +5500,16 @@ function _plate_column_expr(nm::Symbol, call::Expr,
     ivar = spec.args[1].value
     body = spec.args[2].value
     out = spec.args[3].value
-    axis = length(spec.args) == 4 ? spec.args[4].value : nothing
+    axis = length(spec.args) >= 4 ? spec.args[4].value : nothing
+    indices = length(spec.args) >= 5 ? spec.args[5].value : nothing
     where = "array plate column `$nm`"
     inputs = Any[]
     lanevars = Symbol[]
     lane(inp, var) = (var in lanevars || (push!(inputs, inp);
         push!(lanevars, var)); var)
-    pos = axis === nothing ? nothing : lane(
-        Expr(:call, :_ppl_level_indices, axis), Symbol(:_ppl_pi_, axis))
+    pos = indices !== nothing ? lane(indices, Symbol(:_ppl_pi_, nm)) :
+        axis === nothing ? nothing : lane(
+            Expr(:call, :_ppl_level_indices, axis), Symbol(:_ppl_pi_, axis))
     level() = lane(Expr(:call, :_ppl_level_values, axis),
         Symbol(:_ppl_pl_, axis))
     isidx(a) = axis === nothing && a isa Expr && a.head === :ref && length(a.args) == 2 &&
@@ -5487,6 +5523,7 @@ function _plate_column_expr(nm::Symbol, call::Expr,
             Symbol(:_ppl_pc_, col, :_, h))
     end
     function rw(ex)
+        indices !== nothing && ex === ivar && return pos
         axis !== nothing && ex === ivar && return level()
         ex isa Expr || return ex
         if ex.head === :ref && ex.args[1] isa Symbol
@@ -5631,14 +5668,10 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
         # are shared across cells (a captured scalar) or per-cell (`eta[$ivar]`,
         # a varying prior mean/scale); the `[$ivar]` strip and the bare-vector
         # check enforce the index discipline, exactly like an observation cell.
-        obj isa Expr && obj.head === :. && _sfail(
-            "per-cell latent `$col[$ivar] ~ ...` takes a scalar (undotted) " *
-            "distribution (`$col[$ivar] ~ Normal(mu, tau)` / " *
-            "`$col[$ivar] ~ Normal(eta[$ivar], tau)`), got the dotted $(repr(obj))")
         bares = _cell_bares(obj, ivar, data)
         setdiff!(bares, plate_defs)
         push!(ctx, (col, line, bares))
-        push!(params, (col, _strip_cell(obj, ivar),
+        push!(params, (col, _strip_cell(_undot_cell_object(obj), ivar),
             _plate_param_range(col, rkind, data), line))
         return Expr[]
     end
@@ -5663,6 +5696,16 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
                            "sample `$col[$ivar]` (one response column " *
                            "per range)")
     return Expr[Expr(:call, :.~, col, obj)]
+end
+
+_undot_cell_object(ex) = ex
+function _undot_cell_object(ex::Expr)
+    if ex.head === :. && length(ex.args) == 2 && ex.args[1] isa Symbol &&
+            _cell_object_call(ex.args[1]) && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        return Expr(:call, ex.args[1], map(_undot_cell_object, ex.args[2].args)...)
+    end
+    return Expr(ex.head, map(_undot_cell_object, ex.args)...)
 end
 
 # The per-cell latent's size follows the plate range: a literal `1:N` rides as

@@ -24,8 +24,16 @@ end
         @test Array(rg) ≈ gradient rtol=1e-10
         collected = fx.collected
         # The sampler prunes the unused recurrence. Selecting its collected
-        # value reaches the existing PK compiler boundary (docs/src/scan.md).
-        @test_throws "compiled PK recurrences are disabled" Reactant.@compile collected(ru)
+        # value reaches the fixed-size matrix batching boundary in scan.md.
+        failure = try
+            Reactant.@compile collected(ru)
+            nothing
+        catch err
+            err
+        end
+        @test failure isa MethodError
+        description = sprint(showerror,failure)
+        @test occursin("similar",description) && occursin("SMatrix",description)
     end
     @test structures[1] == structures[2]
 end
