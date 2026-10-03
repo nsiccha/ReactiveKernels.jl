@@ -388,10 +388,17 @@ end
                 y .~ MixtureModel.(vcat.(Normal.(mu1, s), Normal.(mu1, s)), Ref([0.5, 0.5]))
             end), SurfaceLoweringError),
     ]
-    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "bad arity", "boolean weights", "frequency weights rejected", "evidence rejected", "partial range rejected", "fully fixed", "assignment location", "data-column location", "wrapped param", "bare predictor", "split Binomial trials", "stated scalar loc alias"])
+    supported = Set(["frequency weights rejected", "evidence rejected",
+        "partial range rejected", "fully fixed", "assignment location",
+        "data-column location", "split Binomial trials", "stated scalar loc alias"])
+    capabilities = Set(["heterogeneous links, same base", "probit outside v1", "bad arity", "boolean weights", "wrapped param", "bare predictor"])
     for (label, prog, E) in cases
         @testset "$label" begin
-            if label in capabilities
+            if label in supported
+                # Density and gradient oracles: test_response_combinations.jl.
+                @test lower_rkppl(prog, (:y, :x, :n1, :n2, :wt);
+                    conditioned = (:y, :x, :n1, :n2, :wt)) isa StructuralPlan
+            elseif label in capabilities
                 # capability: each entry above names the valid combination (todo `1nb43fj`).
                 @test_broken (lower_rkppl(prog, (:y, :x, :n1, :n2, :wt); conditioned = (:y, :x, :n1, :n2, :wt)); true)
             else

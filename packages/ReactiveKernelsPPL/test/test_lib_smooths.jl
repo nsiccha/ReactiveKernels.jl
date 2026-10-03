@@ -333,54 +333,48 @@ const _LS_BUILTIN_EXTRA = Dict(
             sd = 1 + (1 | g))
     end)
 
-_ls_lncc(lo) = logccdf(LogNormal(0, 1), lo)
-
 # (library corpus case, built-in case, library → built-in values, the
 # library prior minus the built-in's at matched values)
 function _ls_pairs()
-    x, z, x2 = _ls_x(), _ls_z(), _ls_x2()
-    fl(xs...; kw...) = maximum(hsgp_rho_floors(last(hsgp_basis(xs...; kw...))))
-    pf = hsgp_periodic_rho_floor(collect(1:4))
-    afl = hsgp_rho_floors(last(hsgp_basis(x, z; k = (4, 3), c = (1.5, 2.0))))
     return [
         ("24_spline_s_library", "24_spline_s",
             nt -> (a = nt.a, sigma = nt.sigma, b_s_x_fixed = nt.f.b,
                 b_s_x_raw = nt.f.z, sd_s_x = [nt.f.sd]),
-            _ -> log(2)),
+            _ -> 0.0),
         ("25_spline_t2_library", "25_spline_t2",
             nt -> (a = nt.a, sigma = nt.sigma, b_t2_xz_fixed = nt.f.b,
                 b_t2_xz_rr_raw = nt.f.z_rr, b_t2_xz_rn_raw = nt.f.z_rn,
                 b_t2_xz_nr_raw = nt.f.z_nr, sd_t2_xz = nt.f.sd),
-            _ -> 3 * log(2)),
+            _ -> 0.0),
         ("30_hsgp_1d_library", "30_hsgp_1d",
             nt -> (a = nt.a, rho_h_x = nt.f.rho, sigma_h_x = nt.f.sigma,
                 beta_raw_h_x = nt.f.z),
-            _ -> -_ls_lncc(fl(x; k = 4))),
+            _ -> 0.0),
         ("30_hsgp_domain_library", "30_hsgp_domain_library",
             nt -> (a = nt.a, rho_h_x = nt.f.rho, sigma_h_x = nt.f.sigma,
                 beta_raw_h_x = nt.f.z),
-            _ -> -_ls_lncc(fl(x; k = 6, domain = (-5.0, 5.0)))),
+            _ -> 0.0),
         ("30_hsgp_by_library", "30_hsgp_by_library",
             nt -> (a = nt.a, beta0_rho_h_x = nt.f.rho_mu,
                 sd_rho_h_x = nt.f.rho_sd, z_rho_h_x = nt.f.rho_z,
                 beta0_sigma_h_x = nt.f.sigma_mu,
                 sd_sigma_h_x = nt.f.sigma_sd, z_sigma_h_x = nt.f.sigma_z,
                 beta_raw_h_x = nt.f.z),
-            _ -> 2 * log(2)),
+            _ -> 0.0),
         ("31_hsgp_aniso_library", "31_hsgp_aniso",
             nt -> (a = nt.a, rho_h_xz_1 = nt.rho_1, rho_h_xz_2 = nt.rho_2,
                 sigma_h_xz = nt.sigma_f, beta_raw_h_xz = nt.z_f),
-            _ -> -_ls_lncc(afl[1]) - _ls_lncc(afl[2])),
+            _ -> 0.0),
         ("68_hsgp_periodic_library", "68_hsgp_periodic",
             nt -> (a = nt.a, rho_h_p = nt.f.rho, sigma_h_p = nt.f.sigma,
                 beta_raw_h_p = nt.f.z),
-            _ -> -_ls_lncc(pf)),
+            _ -> 0.0),
         ("89_hsgp_hyper_priors_library", "89_hsgp_hyper_priors",
             nt -> (b0 = nt.b0, s0 = nt.s0, rho_h_x = nt.h_rho,
                 sigma_h_x = nt.h_sigma, beta_raw_h_x = nt.h_z,
                 rho_h_x2 = nt.h2_rho, sigma_h_x2 = nt.h2_sigma,
                 beta_raw_h_x2 = nt.h2_z),
-            _ -> 2 * log(2)),
+            _ -> 0.0),
         ("90_hsgp_only_library", "90_hsgp_only",
             nt -> (rho_h_x = nt.h_rho,
                 sigma_h_x = nt.h_sigma, beta_raw_h_x = nt.h_z,
@@ -392,17 +386,12 @@ function _ls_pairs()
                 b_s_x_raw = nt.s_z, sd_s_x = [nt.s_sd],
                 b_s_x2_fixed = nt.s2_b, b_s_x2_raw = nt.s2_z,
                 sd_s_x2 = [nt.s2_sd]),
-            _ -> 2 * log(2)),
+            _ -> 0.0),
     ]
 end
 
 @testset "library smooths match the built-ins at matched values" begin
-    # Same likelihood and log-Jacobian at the same constrained values; the
-    # priors differ only by stated constants: Distributions halves where
-    # the built-in uses Stan's unnormalized halves (`log(2)` each), and the
-    # normalized truncation of the floored length scale
-    # (`-logccdf(LogNormal(0, 1), floor)`; the built-in's lower-bound kernel
-    # drops it).
+    # Same likelihood, log-Jacobian and normalized priors at matched values.
     for (lib, blt, tobuilt, offset) in _ls_pairs()
         @testset "$lib" begin
             last_ast, names = _load_corpus_case(joinpath(_CORPUS_DIR,

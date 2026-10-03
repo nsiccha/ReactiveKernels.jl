@@ -104,11 +104,9 @@ in the basis: column `(m - 1) * G + g` holds basis function `m` for group
 gradient below it.
 
 The existing built-in smooth constructs remain available. On identical
-data their columns match the data functions. The library's proper
-half-Normal scale contributes `log(2)` more than a built-in Stan-half
-scale; a normalized floored length-scale prior also includes its
-truncation constant. These constants affect densities while leaving the
-matched likelihood and transform unchanged.
+data their columns match the data functions. At matched parameter values,
+the library and built-ins use the same normalized priors, including
+half-Normal scales and truncation at the fitted length-scale floor.
 
 The [library bodies](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/packages/ReactiveKernelsPPL/src/library.jl)
 and [ten corpus examples](https://github.com/nsiccha/ReactiveKernels.jl/tree/main/packages/ReactiveKernelsPPL/test/corpus)

@@ -12,6 +12,8 @@
 # The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
 # (counter-suffixed binding per build).
 
+import ReactiveKernelsDistributionKernels.DistributionKernelSources as _GPDistributionSources
+
 """
     build_kernel(plan) -> (; spec, layout)
 
@@ -51,7 +53,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     stmts = Expr[]
     # Level gathers (`z[g]` over a `levels(h)` axis) read level-code
     # vectors; collect them from every expression before emitting.
-    gathers = Set{Tuple{Symbol,Symbol}}()
+    gathers = Set{Tuple{Symbol,Symbol,Int}}()
     assigns = _assignment_statements(plan; gathers)
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan)
@@ -62,7 +64,6 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     end
     append!(stmts, _coef_reassembly_statements(plan, layout))
     append!(stmts, _conditioned_value_statements(plan))
-    append!(stmts, _array_value_statements(plan))
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, assigns)
     append!(stmts, preprocessing_recipes(plan))
@@ -100,7 +101,7 @@ function _conditioned_value_statements(plan)
         for p in plan.array_parameters
             p.name === name || continue
             nd = length(_array_dims(plan, p))
-            if p.family in (:lkj_cholesky, :lkj_cholesky_stack)
+            if p.family === :lkj_cholesky_stack
                 # Only the intrinsic factor width expands; a stack's data axis
                 # stays a vector read and reduction in the existing LKJ graph.
                 K = _array_dims(plan, p)[1]
@@ -108,7 +109,7 @@ function _conditioned_value_statements(plan)
                     rhs = nd == 3 ? :($name[$i, $i, :]) : :($name[$i, $i])
                     push!(stmts, :($(_rl_name(name, i, i)) = $rhs))
                 end
-            elseif nd > 1 && !_is_slice_array(p)
+            elseif nd > 1 && !_is_structured_array(p)
                 push!(stmts, :($(_array_flat_name(name, nd)) = vec($name)))
             end
         end
@@ -144,9 +145,10 @@ function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTabl
                 legacy_offset += b.width
             end
         end
+        terms = [t for (t, b) in zip(p.terms, shape.blocks) if b.width > 0]
         if length(chunks) == 1 && any(t -> _parameter_term(t) &&
-                t.kind in (FactorTerm, MatrixTerm), p.terms)
-            t = only(t for t in p.terms if _parameter_term(t))
+                t.kind in (FactorTerm, MatrixTerm), terms)
+            t = only(t for t in terms if _parameter_term(t))
             value = t.options.parameter
             rhs = t.options.sign == 1 ? value : :(-$value)
         else
@@ -231,8 +233,10 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     negative_binomial, weibull,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
-    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm
+import ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    gp_exp_quad_cov_graph as _ppl_gp_exp_quad_cov,
+    gp_periodic_cov_graph as _ppl_gp_periodic_cov
 using SpecialFunctions: besseli, besselix, erfc, loggamma
 # Selective (explicit imports win over any re-export chain, so no `using`
 # ambiguity if ReactiveKernels ever exports these too): the only Statistics
@@ -304,7 +308,7 @@ end
 # for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
 function _assignment_statements(plan::StructuralPlan;
-        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}())
+        gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}())
     by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
     for d in plan.derived
         by_name[d.name] = d
@@ -317,6 +321,7 @@ function _assignment_statements(plan::StructuralPlan;
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
         ex = _array_gather_rewrite(by_name[name].expr, plan, gathers)
+        ex = _split_gp_cov_calls!(stmts, name, ex)
         if _expr_value_symbols(ex) ⊆ dataonly
             push!(dataonly, name)
         else
@@ -325,6 +330,56 @@ function _assignment_statements(plan::StructuralPlan;
         push!(stmts, :($(name) = $(ex)))
     end
     return stmts
+end
+
+# Resolve the callable, rather than its spelling: module-qualified calls and
+# aliases share the library graph, while a model's own GP-named function keeps
+# its ordinary Julia implementation and shape semantics.
+function _gp_covariance_graph(callee)
+    callee isa GlobalRef || return nothing
+    fn = getfield(callee.mod, callee.name)
+    fn === _GPDistributionSources.gp_exp_quad_cov &&
+        return :_ppl_gp_exp_quad_cov
+    fn === _GPDistributionSources.gp_periodic_cov &&
+        return :_ppl_gp_periodic_cov
+    nothing
+end
+
+# Lift a covariance nested in a value call before the ordinary KernelSpec
+# splicer attaches its pair plate. Untyped aliases match the graph's ports.
+# Lazy branches, closures and generators keep their local evaluation.
+function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex)
+    count = 0
+    function walk(node)
+        node isa Expr || return node
+        if node.head in (:ref, :tuple, :vect)
+            return Expr(node.head, map(walk, node.args)...)
+        elseif node.head === :kw && length(node.args) == 2
+            return Expr(:kw, node.args[1], walk(node.args[2]))
+        elseif node.head === :. && length(node.args) == 2 &&
+                Meta.isexpr(node.args[2], :tuple)
+            return Expr(:., node.args[1], Expr(:tuple, map(walk, node.args[2].args)...))
+        end
+        node.head === :call || return node
+        callee = node.args[1]
+        args = map(walk, node.args[2:end])
+        graph = _gp_covariance_graph(callee)
+        graph === nothing && return Expr(:call, callee, args...)
+        nargs = graph === :_ppl_gp_exp_quad_cov ? 4 : 5
+        length(args) == nargs && all(a -> !Meta.isexpr(a, :parameters) &&
+            !Meta.isexpr(a, :(...)), args) || return Expr(:call, callee, args...)
+        count += 1
+        prefix = Symbol(:_ppl_gp_, name, :_, count)
+        inputs = Symbol[]
+        for (i, arg) in enumerate(args)
+            input = Symbol(prefix, :_arg_, i)
+            push!(stmts, :($input = $arg))
+            push!(inputs, input)
+        end
+        push!(stmts, :($prefix = $graph($(inputs...))))
+        prefix
+    end
+    walk(ex)
 end
 
 # Functions as values: a data-only module call nested in a parameter-
@@ -1586,19 +1641,60 @@ function _rewrite_kernel_refs(ex, flatmap::Dict{Symbol,Symbol})
     return Expr(ex.head, (_rewrite_kernel_refs(a, flatmap) for a in ex.args)...)
 end
 
+# Packed observations keep their own axis. Every other observation input
+# uses the same retained gather plate, including bounds, weights and trials.
+_mi_row_value(x::Number, i) = x
+@traceable _mi_row_value(x::AbstractVector, i) = x[i]
+
+# Pure scalar math keeps the CDF inside the selected censoring arm; endpoint
+# expansion currently cannot splice the normal CDF's multi-recipe graph there.
+_mixture_normal_cdf(x, mu, sigma) = 0.5 * erfc((mu - x) / (sqrt(2.0) * sigma))
+
+function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
+    # No cell is evaluated on an empty bound observation domain. Its sum is
+    # the additive identity, independently of the response family.
+    _response_rows(plan, r) == 0 && return Expr[:($(_lik_name(r.label))::Float64 = 0.0)]
+    stmts = _response_likelihood_stmts_full(r, plan)
+    r.mi_jobs === nothing && return stmts
+    pre = Expr[]
+    jobs = r.mi_jobs
+    packed = nothing
+    if r.range !== nothing
+        packed = Symbol(:_ppl_mi_packed_, r.label)
+        selected = Symbol(:_ppl_mi_rows_, r.label)
+        # Data-only selection runs at preparation; it never emits one body
+        # per selected row. Jobs address the full axis, y the packed axis.
+        rng = r.range
+        push!(pre, :($packed = findall(j -> j in $rng, $jobs)))
+        push!(pre, :($selected = $jobs[$packed]))
+        jobs = selected
+    end
+    obsidx = findfirst(st -> st.head === :(=) && st.args[1] === _pw_name(r.label), stmts)
+    obsidx === nothing && throw(ContractValidationError(
+        "[generator] mi response $(r.label) has no observation plate"))
+    let st = stmts[obsidx]
+        call = st.args[2].args[1]
+        call.args[1] === :plate || throw(ContractValidationError(
+            "[generator] mi response $(r.label) needs a scalar observation plate"))
+        for i in 2:length(call.args)
+            ref = call.args[i]
+            # Ref inputs are whole model values (e.g. a simplex), never rows.
+            ref isa Symbol || continue
+            i == 2 && packed === nothing && continue
+            rows = i == 2 ? packed : jobs
+            call.args[i] = _mi_gather_node!(pre, rows, ref, r.label)
+        end
+    end
+    return Expr[stmts[1:obsidx-1]..., pre..., stmts[obsidx:end]...]
+end
+
 # One plate likelihood per response (pointwise plate + scalar sum node).
 # Triples 2 and 3 (Bernoulli-logit) lower identically; the triple only
 # selects the form. Branches are explicit per family; the else is a
 # fail-closed guard for enum members without an emitter (never silent).
-function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
+function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan)
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
-    if r.mi_jobs !== nothing && !(r.family === GaussianFam ||
-            r.family === GammaLogFam || r.family === BetaLogitFam)
-        throw(ContractValidationError(
-            "[generator] mi() response $(r.label) family $(r.family) " *
-            "has no mi emitter (v1: Gaussian/Gamma/Beta)"))
-    end
     if r.family === GaussianFam
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
@@ -1611,7 +1707,7 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         # (the cover rule makes them whole-column today, but the fused sum
         # must never silently outgrow a future partial range).
         r.evidence.kind === :none && r.weights === nothing &&
-            r.range === nothing && !_is_bare_param_location(r, plan) &&
+            r.range === nothing && r.mi_jobs === nothing && !_is_bare_param_location(r, plan) &&
             return _bernoulli_wholevec_stmts(r, plan, node)
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
@@ -1619,7 +1715,7 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         # whole-vector reduction (faster native + Reactant; the per-cell
         # plate handles evidence/weights/ranges).
         r.evidence.kind === :none && r.weights === nothing &&
-            r.range === nothing && !_is_bare_param_location(r, plan) &&
+            r.range === nothing && r.mi_jobs === nothing && !_is_bare_param_location(r, plan) &&
             return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === HurdlePoissonFam
@@ -1702,9 +1798,9 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         yin, yref = _bernoulli_yplate!(pre, plan, y, r.label, yv)
         inputs[1] = yin
     end
-    # Binomial trials are shared across components: one threaded use.
+    # Equal trial arguments share one input; distinct arguments thread per component.
     nref = nothing
-    if f === BinomialLogitFam
+    if f === BinomialLogitFam && r.trials !== nothing
         nref = _thread_ref!(inputs, r.trials, true)
     end
     # Weights: literals fold at codegen; a simplex parameter binds one
@@ -1728,25 +1824,59 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         logw_comp = w.param_first ? (first, second) : (second, first)
     end
     terms = Expr[]
+    lo_terms, hi_terms = Expr[], Expr[]
+    lb, ub = _thread_bounds!(inputs, r.evidence, false)
+    r.evidence.kind === :interval_censored && (lb = yv)
     for k in 1:K
         klab = Symbol(r.label, :_mix, k)
         locref, is_lp = _mixture_loc_ref(r, plan, k)
+        nk = isempty(r.mixture_trials) ? nref :
+            _thread_ref!(inputs, r.mixture_trials[k], true)
         lpdf = _mixture_component_lpdf(f, r, plan, pre, inputs, k, klab,
-            locref, is_lp, yv, yref, nref)
+            locref, is_lp, yv, yref, nk)
         logw_k = logw_lit === nothing ?
             (logw_comp === nothing ? :($lwv[$k]) : logw_comp[k]) :
             logw_lit[k]
         push!(terms, :($logw_k + $lpdf))
+        if r.evidence.kind !== :none
+            endpoint = lpdf.args[1].args[1]
+            mu, sigma = endpoint.args[2:3]
+            cdf_fn = GlobalRef(@__MODULE__, :_mixture_normal_cdf)
+            lb === nothing || push!(lo_terms,
+                :(exp($logw_k) * $cdf_fn($lb, $mu, $sigma)))
+            ub === nothing || push!(hi_terms,
+                :(exp($logw_k) * $cdf_fn($ub, $mu, $sigma)))
+        end
     end
-    m = terms[1]
-    for t in terms[2:end]
-        m = :(max($m, $t))
+    cell = foldl((a, b) -> :(logaddexp($a, $b)), terms)
+    if r.evidence.kind !== :none
+        lcdf = isempty(lo_terms) ? 0.0 : foldl((a,b) -> :($a + $b), lo_terms)
+        ucdf = isempty(hi_terms) ? 1.0 : foldl((a,b) -> :($a + $b), hi_terms)
+        if r.evidence.kind === :truncated
+            cell = :($cell - log($ucdf - $lcdf))
+        elseif r.evidence.kind === :censored
+            if ub !== nothing
+                cell = :(if $yv >= $ub
+                    log1p(-$ucdf)
+                else
+                    $cell
+                end)
+            end
+            if lb !== nothing
+                cell = :(if $yv <= $lb
+                    log($lcdf)
+                else
+                    $cell
+                end)
+            end
+        elseif r.evidence.kind === :interval_censored
+            cell = :(log($ucdf - $lcdf))
+        end
     end
-    sumexp = :(exp($(terms[1]) - $m))
-    for t in terms[2:end]
-        sumexp = :($sumexp + exp($t - $m))
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
     end
-    cell = :($m + log($sumexp))
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
@@ -1863,7 +1993,7 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         :($obj($xaug, $bfull).pointwise($yf))
     return Expr[
         :($yf = $yconv.($y)),
-        :($xaug = hcat(ones($(plan.n_obs)), $X)),
+        :($xaug = hcat(ones($(_response_rows(plan, r))), $X)),
         :($bfull = [$(r.glm_alpha); $(r.glm_beta)]),
         :($pw = $call),
         :($node::Float64 = sum($pw)),
@@ -1909,7 +2039,7 @@ end
 _mi_gather_name(label::Symbol, ref::Symbol) = Symbol(:_ppl_mi_, label, :_, ref)
 
 # Gather a computed full-length node by `Jobs` (an lp/rate/shape/scale
-# node the emitter created — always a vector), returning the short node.
+# node the emitter created), returning the short node. Scalars broadcast.
 # The gather is its own short plate over `Jobs` with the source `Ref`'d
 # (the ordinal `c[yv]` per-lane-gather precedent): a caller-level fancy
 # `node[Jobs]` does not trace under Reactant (`TracedRArray[Vector{Int}]`
@@ -1918,38 +2048,12 @@ function _mi_gather_node!(pre::Vector{Expr}, jobs::Symbol, node::Symbol,
         label::Symbol)
     g = _mi_gather_name(label, node)
     jv, rf = _dovar(1), _dovar(2)
-    body = Expr(:block, LineNumberNode(0, :generator), :($rf[$jv]))
+    getter = GlobalRef(@__MODULE__, :_mi_row_value)
+    body = Expr(:block, LineNumberNode(0, :generator), :($getter($rf, $jv)))
     lambda = Expr(:(->), Expr(:tuple, jv, rf), body)
     doex = Expr(:do, Expr(:call, :plate, jobs, :(Ref($node))), lambda)
     push!(pre, :($g = $doex))
     return g
-end
-
-# Gather a scale-like ref under `mi()`: scalar parameter/assignment names
-# broadcast untouched, columns gather through a short plate, Real
-# literals pass through for `_thread_ref!` to inline; anything else fails
-# closed (gathering a scalar would index nonsense, an unknown name would
-# thread garbage).
-function _mi_gather_ref!(pre::Vector{Expr}, jobs::Symbol, ref,
-        plan::StructuralPlan, label::Symbol)
-    ref isa Real && return ref
-    ref isa Symbol || throw(ContractValidationError(
-        "[generator] mi() response $label gathers Symbol/Real refs only " *
-        "(got $(repr(ref)))"))
-    ref in _union_names(plan) && return ref
-    haskey(plan.columns, ref) || throw(ContractValidationError(
-        "[generator] mi() response $label cannot gather unknown name $ref"))
-    return _mi_gather_node!(pre, jobs, ref, label)
-end
-
-# Gather a resolved scale arg under `mi()`: a predictor-fed scale already
-# resolved to its `_ppl_sc_` node (always a full-length vector — gather
-# it as a node); every other scale shape routes through `_mi_gather_ref!`.
-function _mi_gather_scale!(pre::Vector{Expr}, jobs::Symbol, sarg, r::LikelihoodSpec,
-        plan::StructuralPlan)
-    r.scale isa ScalePredictorRef &&
-        return _mi_gather_node!(pre, jobs, sarg, r.label)
-    return _mi_gather_ref!(pre, jobs, sarg, plan, r.label)
 end
 
 # Thread a Symbol ref as a plate input (returning its do-var); Real
@@ -1983,12 +2087,6 @@ function _gaussian_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
     lp = _location_node(r, plan)
     pre = Expr[]
     sarg = _scale_plate_arg(r, plan, pre)
-    if r.mi_jobs !== nothing
-        # Packed y_obs threads directly (it IS the short plate axis);
-        # every other vector input gathers by Jobs.
-        lp = _mi_gather_node!(pre, r.mi_jobs, lp, r.label)
-        sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)
-    end
     inputs = Any[y, lp]
     yv, lpv = _dovar(1), _dovar(2)
     sref = _thread_ref!(inputs, sarg)
@@ -2596,10 +2694,6 @@ function _gamma_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbo
     av = sarg isa Symbol ? sarg : Float64(sarg)
     rate = _rate_name(r.label)
     push!(pre, :($rate = $av ./ exp.($lp)))
-    if r.mi_jobs !== nothing
-        rate = _mi_gather_node!(pre, r.mi_jobs, rate, r.label)
-        sarg = _mi_gather_scale!(pre, r.mi_jobs, sarg, r, plan)
-    end
     inputs = Any[y, rate]
     yv, ratev = _dovar(1), _dovar(2)
     aref = _thread_ref!(inputs, sarg)
@@ -2757,12 +2851,6 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     sarg = _scale_plate_arg(r, plan, pre)
     k = sarg isa Symbol ? sarg : Float64(sarg)
     push!(pre, :($a = $mu .* $k), :($b = (1 .- $mu) .* $k))
-    if r.mi_jobs !== nothing
-        # kappa never threads (it folds into the a/b precomputes), so
-        # only the shape nodes gather.
-        a = _mi_gather_node!(pre, r.mi_jobs, a, r.label)
-        b = _mi_gather_node!(pre, r.mi_jobs, b, r.label)
-    end
     inputs = Any[y, a, b]
     yv, avv, bvv = _dovar(1), _dovar(2), _dovar(3)
     cell = :(beta($avv, $bvv).logpdf($yv))
@@ -3429,7 +3517,7 @@ function _parameter_prior_statements!(stmts, terms, plan, layout; prefix = :_ppl
 end
 
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
-        gathers::Set{Tuple{Symbol,Symbol}} = Set{Tuple{Symbol,Symbol}}(), context = plan)
+        gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}(), context = plan)
     stmts = Expr[]
     terms = Any[]
     for pred in plan.predictors
@@ -3542,15 +3630,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
             v.support_override)
     end
-    # Varying draws: the LKJ node plus the `tau` prior plus the
-    # `z_flat` plate (shared vector-prior helper), at every K (the 1x1
-    # LKJ node is the `0.0` literal). `tau` emits WITHOUT the thin
-    # layer's `+log(2)` half renormalizer: SB's `std_normal(; lower=0)`
-    # is Stan lower-bound kernel semantics (exp Jacobian only, no
-    # truncation normalizer). User-facing `HalfNormal` priors keep the
-    # proper-half convention; draws-internal `tau` follows SB — under
-    # every configured sd prior too (SB's generic path keeps the
-    # positive bound with no truncation normalizer).
+    # Varying scales are normalized halves in every geometry.
     for d in plan.varying_draws
         if d.strata !== nothing
             _stratified_prior_stmts!(stmts, terms, d, layout)
@@ -3564,14 +3644,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         _vector_prior_stmts!(stmts, terms, z, :normal,
             (arg1 = 0, arg2 = 1), nothing)
     end
-    # HSGP bases (SB `_sb_hsgp`/`_sb_hsgp_aniso`): the length scales and
-    # marginal scale as scalar `lognormal(0, 1)` nodes plus the
-    # standardized `beta_raw` plate (shared vector-prior helper). The
-    # floored rhos emit WITHOUT a truncation normalizer: SB's
-    # `lognormal(0,1; lower=rho_lower)` is Stan lower-bound kernel
-    # semantics (offset-exp Jacobian only — the varying-`tau` precedent).
-    # Stated hyper priors (`HyperPrior`) replace the defaults with the
-    # same Stan-kernel semantics (plain `_lpdf`, no normalizer).
+    # HSGP hyperparameters use normalized declared priors. A default
+    # length-scale prior is truncated at its actual fitted validity floor.
     for hb in plan.hsgp_bases
         names = _hsgp_names(hb)
         rfam, rargs = hb.rho_prior isa HyperPrior ?
@@ -3581,9 +3655,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             (hb.sigma_prior.family,
                 collect(Any, values(hb.sigma_prior.args))) :
             (:lognormal, Any[0, 1])
-        # Per-group hyper-predictors (BRM defaults): intercept
-        # `Normal(0, 1)`, sd `Normal(0, 1)` on the positive support
-        # (Stan kernel — plain `_lpdf`), non-centered `z` standard normal.
+        # Grouped hyper-predictors: Normal intercept, HalfNormal sd,
+        # and standard-normal non-centered coordinates.
         function hyper_priors!(h)
             if h.intercept
                 bnode = Symbol(:_ppl_prior_, h.beta0)
@@ -3593,7 +3666,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             end
             dnode = Symbol(:_ppl_prior_, h.sd)
             push!(stmts, :($dnode::Float64 =
-                $(_family_logpdf_expr(:normal, Any[0, 1], h.sd))))
+                $(_family_logpdf_expr(:normal, Any[0, 1], h.sd)) + log(2)))
             push!(terms, dnode)
             _vector_prior_stmts!(stmts, terms, h.z, :normal,
                 (arg1 = 0, arg2 = 1), nothing)
@@ -3603,7 +3676,12 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         else
             for rho in names.rhos
                 node = Symbol(:_ppl_prior_, rho)
-                cell = _family_logpdf_expr(rfam, rargs, rho)
+                entry = only(e for e in layout.entries if e.name === rho)
+                support = hb.rho_prior isa HyperPrior ? hb.rho_prior.support_override :
+                    (:truncated, entry.transform === :floored ? entry.lo : 0.0, Inf)
+                cell = _sampled_prior_expr(SampledParameter(rho, rfam,
+                    NamedTuple{ntuple(i -> Symbol(:arg, i), length(rargs))}(Tuple(rargs)),
+                    support, rho); pre = stmts)
                 push!(stmts, :($node::Float64 = $cell))
                 push!(terms, node)
             end
@@ -3612,7 +3690,10 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             hyper_priors!(names.sigma_hyper)
         else
             snode = Symbol(:_ppl_prior_, names.sigma)
-            scell = _family_logpdf_expr(sfam, sargs, names.sigma)
+            support = hb.sigma_prior isa HyperPrior ? hb.sigma_prior.support_override : nothing
+            scell = _sampled_prior_expr(SampledParameter(names.sigma, sfam,
+                NamedTuple{ntuple(i -> Symbol(:arg, i), length(sargs))}(Tuple(sargs)),
+                support, names.sigma); pre = stmts)
             push!(stmts, :($snode::Float64 = $scell))
             push!(terms, snode)
         end
@@ -3652,18 +3733,16 @@ function _lkj_prior_terms(L::Symbol, K::Int, eta::Float64;
     terms = Any[nstack === nothing ? c : nstack * c]
     lg(i) = nstack === nothing ? :(log($(_rl_name(L, i, i)))) :
         :(sum(log.($(_rl_name(L, i, i)))))
-    if eta == 1.0
-        for i in 2:K
-            push!(terms, :($(K - i) * $(lg(i))))
-        end
-    else
-        bcoef = 2 * eta - 2
-        for i in 2:K
-            k = i - 2
-            push!(terms, :($(K - 1 - k - 1) * $(lg(i)) + $bcoef * $(lg(i))))
-        end
+    for i in 2:K
+        push!(terms, _lkj_prior_diagonal(lg(i), K, i, eta))
     end
     return foldl((a, c) -> :($a + $c), terms)
+end
+
+function _lkj_prior_diagonal(ld, K, i, eta)
+    coefficient = i isa Int ? K - i : :($K - $i)
+    return eta == 1.0 ? :($coefficient * $ld) :
+        :($coefficient * $ld + $(2 * eta - 2) * $ld)
 end
 
 # One correlated draws block's LKJ prior node (names/sizes from the draws).
@@ -3688,7 +3767,7 @@ function _stratified_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         $(_lkj_prior_terms(sL, g.K, d.lkj_eta; nstack = g.S))))
     push!(terms, lnode)
     _vector_prior_stmts!(stmts, terms, _strata_tau_name(d), :normal,
-        (arg1 = 0, arg2 = 1), nothing)
+        (arg1 = 0, arg2 = 1), :positive)
     z = _varying_corr_names(d)[3]
     _vector_prior_stmts!(stmts, terms, z, :normal,
         (arg1 = 0, arg2 = 1), nothing)
@@ -3717,32 +3796,27 @@ function _sd_prior_shapes(d::VaryingDraws)
     return [_sd_prior_shape(p) for p in d.sd_priors]
 end
 
-# One correlated draws block's `tau` prior (SB's homogeneous /
-# heterogeneous split): all-Normal(0, 1) keeps the historical plate
-# emission bit-identical; a uniform configured prior stays one plate
-# with the mapped family; mixed margins unroll to one scalar density
-# per margin over `tau[k]` refs (the LKJ-sandwich precedent). Every
-# path keeps `support = nothing` (Stan lower-bound kernel semantics —
-# the layout's `:exp` Jacobian, no truncation renormalizer).
+# A homogeneous prior stays one retained plate; structurally stated mixed
+# margins share the same normalized half densities.
 function _sd_prior_tau_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         d::VaryingDraws, tau::Symbol)
     shapes = _sd_prior_shapes(d)
     if all(s -> s == (:normal, (arg1 = 0.0, arg2 = 1.0)), shapes)
         _vector_prior_stmts!(stmts, terms, tau, :normal,
-            (arg1 = 0, arg2 = 1), nothing)
+            (arg1 = 0, arg2 = 1), :positive)
         return nothing
     end
     if all(s -> s == shapes[1], shapes)
         fam, args = shapes[1]
-        _vector_prior_stmts!(stmts, terms, tau, fam, args, nothing)
+        _vector_prior_stmts!(stmts, terms, tau, fam, args, fam === :exponential ? nothing : :positive)
         return nothing
     end
     node = Symbol(:_ppl_prior_, tau)
     cells = Any[]
     for k in eachindex(shapes)
         fam, args = shapes[k]
-        push!(cells, _family_logpdf_expr(fam, Any[values(args)...],
-            Expr(:ref, tau, k)))
+        cell = _family_logpdf_expr(fam, Any[values(args)...], Expr(:ref, tau, k))
+        push!(cells, fam === :exponential ? cell : :($cell + log(2)))
     end
     push!(stmts, :($node::Float64 = $(foldl((a, c) -> :($a + $c), cells))))
     push!(terms, node)
@@ -3797,11 +3871,8 @@ const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
 # setup/recurrence read, or a coefficient element read). Args are literals
 # (inlined) or parameter/assignment/threaded refs (Distributions.jl
 # semantics). Shared by scalar priors, per-cell plate priors, population
-# priors, and the scan density. `gamma` takes rate, so the contract's
-# scale inverts; `:flat` is the vacuous 0.0. Symmetric `:positive`
-# halves (`+log(2)`) and the `:interval` correction live in
-# `_support_correction` (the Stan-kernel `:positive_stan` /
-# `:interval_stan` / `:upper` overrides add nothing there).
+# priors, and the scan density. Gamma takes rate, so the contract's scale
+# inverts; Flat() contributes zero. Explicit support is normalized below.
 # Distribution kernels use Float64 ports. Promote at that boundary rather
 # than redeclaring the source name: bound data and ordinary Julia helpers
 # must retain their original numeric types. The same boundary applies to
@@ -3823,22 +3894,8 @@ function _family_logpdf_expr(family::Symbol, a, x)
     return _prior_endpoint_expr(family, a, :logpdf, x)
 end
 
-# The additive support-override correction for a prior log-density (or `nothing`
-# for no override): `:positive` (half-Normal/half-Cauchy) renormalizes by exactly
-# +log(2) (symmetry at literal 0); `:positive_stan` (the Stan-kernel half)
-# adds NOTHING — plain `_lpdf` plus the bare-`u` Jacobian;
-# `(:interval, lo, hi)` (a truncated Normal) renormalizes by
-# -log(cdf(hi) - cdf(lo)) at any location, where `argvals` are the family's
-# (mu, s) argument expressions (literals/refs for a scalar prior, or per-cell
-# do-vars for a plate prior — the CDF endpoints thread identically);
-# `(:interval_stan, lo, hi)` adds NOTHING — Stan's two-sided-bound kernel
-# is the plain normal_lpdf plus the bare-`u` Jacobian (the dar-beta
-# precedent: SB truncation never renormalizes) — and neither does
-# `:flat`, which is improper (Jacobian only, no renormalization,
-# matching Stan lower/interval-bound kernel semantics);
-# `(:upper, hi)` adds NOTHING — Stan's upper-bound kernel is the plain
-# normal_lpdf plus the bare-`u` Jacobian (the varying-`tau`/`:floored`
-# precedent: SB truncation never renormalizes).
+# Normalize the base density over the declared support. Symmetric halves
+# at literal zero add log(2); general bounds use the owned CDF endpoints.
 function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         pre::Vector{Expr} = Expr[], stem::Symbol = :prior)
     ov === nothing && return nothing
@@ -3860,7 +3917,6 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         # a rounded-to-zero inactive difference must never be logged or AD'd.
         return :($fl > 0.5 ? -log($sl - $sh) : -log($fh - $fl))
     end
-    ov === :positive_stan && return nothing  # Stan kernel semantics
     if ov isa Tuple
         if ov[1] === :lower
             # `truncated(LogNormal(m, s), lo, Inf)`: `-log P(X > lo)` =
@@ -3872,10 +3928,13 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
             tail = _prior_endpoint_expr(:normal, Any[:(-$m), s], :cdf, :(-log($lo)))
             return :(-log($tail))
         end
-        (ov[1] === :upper || ov[1] === :interval_stan) && return nothing  # Stan kernel semantics
+        if ov[1] === :upper
+            family === :flat && return nothing
+            return :(-log($(_prior_endpoint_expr(family, argvals, :cdf, ov[2]))))
+        end
         ov[1] === :interval || throw(ContractValidationError(
             "[generator] tuple support override must be (:interval, lo, hi), " *
-            "(:interval_stan, lo, hi), or (:upper, hi), got $ov"))
+            "or (:upper, hi), got $ov"))
         family === :flat && return nothing  # improper: Jacobian only
         lo, hi = ov[2], ov[3]
         mu, s = argvals[1], argvals[2]
@@ -3884,16 +3943,11 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
         return :(-log($upper - $lower))
     end
     ov === :positive || throw(ContractValidationError(
-        "[generator] support override must be :positive or " *
-        ":positive_stan, got $ov"))
+        "[generator] support override must be :positive, got $ov"))
     return :(log(2))  # :positive half
 end
 
-# Scalar prior log-density per family via distribution-kernel endpoints
-# (Distributions.jl semantics). The support override adds the +log(2) half or
-# the -log(cdf(hi)-cdf(lo)) truncated-interval renormalization (`_support_correction`;
-# `:positive_stan`/`(:interval_stan, lo, hi)`/`(:upper, hi)` overrides add
-# nothing — Stan kernel semantics).
+# One normalized scalar prior body, shared by parameter and hyper-prior slots.
 function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false)
     argvals = [v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)
@@ -3932,7 +3986,7 @@ _conditioned_endpoint_calls(ex) = ex
 
 function _conditioned_support_guard(value, support, density)
     support === nothing && return density
-    valid = if support in (:positive, :positive_stan)
+    valid = if support === :positive
         :($value >= 0)
     elseif support[1] === :lower
         :($value >= $(support[2]))
