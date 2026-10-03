@@ -63,16 +63,7 @@ end
             original=deepcopy(case.data)
             bound,built=_ma_surface_model(case)
             u=[0.2sin(i) for i in 1:built.layout.total]
-            if kind==:sampled_scalar
-                # Ordinary live-scalar hcat fails during backend primal tracing;
-                # native math and reverse remain covered by the same fixture.
-                # See benchmark/repro_reactant_scalar_hcat.jl.
-                sampler=prepare_sampler(built,bound,u;backend=_GEN_BACKEND)
-                ru=Reactant.to_rarray(u)
-                @test_throws r"Scalar indexing is disallowed" Reactant.@compile sampler.kernel(ru)
-            else
-                _ma_compiled_check(bound,built,u,w->_ma_surface_parts(case,built.layout,w).posterior)
-            end
+            _ma_compiled_check(bound,built,u,w->_ma_surface_parts(case,built.layout,w).posterior)
             @test isequal(case.data,original)
         end
     end
