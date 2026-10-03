@@ -3,8 +3,8 @@ using ReactiveKernelsPPL
 using Test
 
 # Matrix-valued data columns (whole-design data, Stan `matrix[N,K]`): a
-# matrix binds beside vectors with its rows checked against the response,
-# and every per-observation role fails closed on one. Reuses the gaussian
+# matrix used by an observation binds with ordinary broadcast axes.
+# Unused data have no observation shape or numerical requirements. Reuses the gaussian
 # builders from test_contract.jl and the generator oracles from
 # test_generator.jl (both included earlier).
 
@@ -45,35 +45,31 @@ end
     @test validate_plan(b3) === nothing
 end
 
-@testset "matrix shape validation" begin
+@testset "unused data do not acquire matrix shape requirements" begin
     n = 9
     u = _unbind(_gaussian_plan(n))
-    # Ragged rows.
+    # These data are unused by the plan. Their shape and element type
+    # cannot change its nine observations. Numerical coverage is in
+    # test_matrix_values.jl, including native and compiled gradients.
     bad = _md_columns(n, ones(n + 1, 2))
-    # capability: matrix datum whose row count differs from n_obs, unreferenced (0dejlw1 lane) (todo `1qlbn5b`)
-    @test_broken (bind_data(u, bad); true)
+    @test bind_data(u, bad).n_obs == n
     # Non-numeric.
     bad = _md_columns(n, fill("a", n, 2))
-    # capability: a String matrix datum (data are values of any shape, P10a 0dejlw1) (todo `1qlbn5b`)
-    @test_broken (bind_data(u, bad); true)
+    @test bind_data(u, bad).columns[:X] == bad[:X]
     # Zero columns.
     bad = _md_columns(n, ones(n, 0))
-    # capability: zero-column matrix datum (0dejlw1 lane) (todo `1qlbn5b`)
-    @test_broken (bind_data(u, bad); true)
+    @test bind_data(u, bad).columns[:X] == bad[:X]
     # Missing entries (non-numeric eltype).
     bad = _md_columns(n, Matrix{Union{Missing,Float64}}(ones(n, 2)))
     bad[:X][1, 1] = missing
-    # capability: unused data may contain Missing values (P10a 0dejlw1; todo `1qlbn5b`).
-    @test_broken (bind_data(u, bad); true)
-    # 3-D arrays and scalars fail with a contract error, not MethodError.
+    @test isequal(bind_data(u, bad).columns[:X], bad[:X])
+    # Higher-rank arrays and scalars remain ordinary unused data.
     bad = Dict{Symbol,Any}(_columns(n))
     bad[:X] = ones(n, 2, 2)
-    # capability: 3-D array datum (0dejlw1 lane) (todo `1qlbn5b`)
-    @test_broken (bind_data(u, bad); true)
+    @test bind_data(u, bad).columns[:X] == bad[:X]
     bad = Dict{Symbol,Any}(_columns(n))
     bad[:c] = 1.5
-    # capability: scalar datum (0dejlw1 lane) (todo `1qlbn5b`)
-    @test_broken (bind_data(u, bad); true)
+    @test bind_data(u, bad).columns[:c] == 1.5
 end
 
 @testset "matrix values in observation and predictor roles" begin
@@ -84,9 +80,8 @@ end
     u = _unbind(_gaussian_plan(n))
     u.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :X, :mu,
         :sigma, nothing, _none_evidence(), :y_resp)
-    # capability: per-observation response role bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
-    @test_broken (bind_data(u, cols); true)
-    # Term column (with a matching prior, so only the shape guard can fire).
+    @test bind_data(u, cols).n_obs == length(X)
+    # Term column with its matching prior; each column broadcasts over y.
     u = _unbind(_gaussian_plan(n))
     u.predictors[1] = PredictorSpec(:mu, IdentityLink, TermSpec[
             TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
@@ -94,27 +89,23 @@ end
             TermSpec(ContinuousTerm, [:X], NamedTuple(), :X, :x_term),
         ], :mu)
     u.population_priors[2] = PopulationPrior(:mu, :X, 0.0, 1.0)
-    # capability: ContinuousTerm column bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
-    @test_broken (bind_data(u, cols); true)
+    @test bind_data(u, cols).n_obs == length(X)
     # Weights.
     u = _unbind(_gaussian_plan(n))
     u.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
         :sigma, :X, _none_evidence(), :y_resp)
-    # capability: weights role bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
-    @test_broken (bind_data(u, cols); true)
+    @test bind_data(u, cols).n_obs == length(X)
     # Per-observation scale.
     u = _unbind(_gaussian_plan(n))
     u.responses[1] = LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu,
         :X, nothing, _none_evidence(), :y_resp)
-    # capability: per-observation scale role bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
-    @test_broken (bind_data(u, cols); true)
+    @test bind_data(u, cols).n_obs == length(X)
     # Grouping column (the LevelMap forces binder evaluation over :X).
     g = _gaussian_plan(n)
     u = StructuralPlan(g.responses, g.predictors, g.population_priors,
         g.parameters, g.assignments, Dict{Symbol,AbstractVector}(), 0;
         levelmaps = LevelMap[LevelMap(:mu, :X, [], :levels, Colon())])
-    # capability: grouping (LevelMap) column bound to a matrix with ordinary broadcast dimensions (P10a 0dejlw1; todo `1qlbn5b`).
-    @test_broken (bind_data(u, cols); true)
+    @test only(bind_data(u, cols).levelmaps).values == collect(1.0:n)
 end
 
 @testset "matrix datum end to end (surface to kernel value)" begin

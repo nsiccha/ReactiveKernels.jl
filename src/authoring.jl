@@ -2092,8 +2092,9 @@ function _kernel_tensorized_undef_vector(ex)
 end
 
 # A lazy two-way branch in the tensorized companion: the condition and both
-# sides are tensorized, each side is wrapped as a thunk, and
-# `_recurrence_branch` evaluates exactly one of them.  An `elseif` chain
+# sides are tensorized, and `_recurrence_branch` evaluates exactly one arm.
+# Locals rebound by an arm cross it as explicit arguments and results.
+# An `elseif` chain
 # arrives as a nested `:elseif` expression on the else side and lowers
 # recursively; a block-wrapped condition (Julia's `elseif` spelling) is
 # unwrapped.
@@ -2219,11 +2220,13 @@ function _kernel_tensorized_loop(ex, known, mod, scope)
         _kernel_tensorized_rhs(binding.args[2], known, mod, scope) : nothing
     lowered = if ex.head === :for
         Expr(:for, Expr(:(=), binding.args[1], iterator),
-             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner))
+             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner;
+                                    value_used = false))
     else
         Expr(:while,
              _kernel_tensorized_rhs(substitute(condition), known, mod, inner),
-             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner))
+             _kernel_tensorized_rhs(body_with_reference(body), known, mod, inner;
+                                    value_used = false))
     end
     traced = Expr(:macrocall, GlobalRef(ReactantCore, Symbol("@trace")),
                   LineNumberNode(@__LINE__, @__FILE__), lowered)
@@ -2252,15 +2255,47 @@ function _kernel_tensorized_loop(ex, known, mod, scope)
 end
 
 function _kernel_tensorized_branch(condition, then_side, else_side, known, mod,
-                                   scope=known)
+                                   scope=known; value_used=true)
     unwrap(x) = x isa Expr && x.head === :block ?
         (filtered = [arg for arg in x.args if !(arg isa LineNumberNode)];
          length(filtered) == 1 ? unwrap(only(filtered)) : x) : x
-    thunk(side) = Expr(:->, Expr(:tuple),
-                       _kernel_tensorized_rhs(unwrap(side), known, mod, scope))
-    Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
+    assigned = Set{Symbol}()
+    _kernel_loop_assigned!(assigned, then_side, scope)
+    _kernel_loop_assigned!(assigned, else_side, scope)
+    names = sort!(collect(assigned))
+    # An arm that assigns an enclosing local must return its new binding;
+    # mutating a closure box is not a conditional result or a loop carry.
+    # Explicit arguments also make those reads visible to `@trace`'s loop
+    # analysis. Both arms return the same state, including unchanged locals.
+    # A used branch expression retains its value beside that state. A
+    # discarded statement needs only the state, so `if p; x = ...; end`
+    # does not ask the backend to merge a value with implicit `nothing`.
+    function thunk(side)
+        lowered = _kernel_tensorized_rhs(unwrap(side), known, mod, scope;
+                                        value_used = value_used)
+        isempty(names) && return Expr(:->, Expr(:tuple), lowered)
+        if value_used
+            value = gensym(:branch_value)
+            body = Expr(:block, Expr(:(=), value, lowered),
+                        Expr(:tuple, value, names...))
+        else
+            body = Expr(:block, lowered, Expr(:tuple, names...))
+        end
+        Expr(:->, Expr(:tuple, names...), body)
+    end
+    call = Expr(:call, GlobalRef(@__MODULE__, :_recurrence_branch),
          _kernel_tensorized_rhs(unwrap(condition), known, mod, scope),
-         thunk(then_side), thunk(else_side), Expr(:tuple))
+         thunk(then_side), thunk(else_side), Expr(:tuple, names...))
+    isempty(names) && return call
+    if !value_used
+        return Expr(:block, Expr(:(=), Expr(:tuple, names...), call), nothing)
+    end
+    result = gensym(:branch_result)
+    bindings = Any[Expr(:(=), name,
+        Expr(:call, GlobalRef(Core, :getfield), result, i + 1))
+        for (i, name) in enumerate(names)]
+    Expr(:block, Expr(:(=), result, call), bindings...,
+         Expr(:call, GlobalRef(Core, :getfield), result, 1))
 end
 
 # A generator reduction `sum(term for i in iter [if condition]; init = x)` in a
@@ -2572,7 +2607,8 @@ end
 function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                                 mod::Union{Module,Nothing} = nothing,
                                 scope::Set{Symbol} = known;
-                                in_dotted::Bool = false)
+                                in_dotted::Bool = false,
+                                value_used::Bool = true)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     if ex.head === :macrocall && mod isa Module
@@ -2587,7 +2623,7 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         # definition (snag `batched-broadcas-9269c801`).  Lower the macro's
         # expansion instead: that is the code the native body runs.
         return _kernel_tensorized_rhs(macroexpand(mod, ex), known, mod, scope;
-                                      in_dotted = in_dotted)
+                                      in_dotted = in_dotted, value_used = value_used)
     end
     undef_vector = _kernel_tensorized_undef_vector(ex)
     if undef_vector !== nothing
@@ -2679,12 +2715,15 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         end
         lowered = length(lowered_bindings) == 1 ? only(lowered_bindings) :
             Expr(:block, lowered_bindings...)
-        return Expr(:let, lowered, _kernel_tensorized_rhs(ex.args[2], known, mod, inner))
+        return Expr(:let, lowered, _kernel_tensorized_rhs(ex.args[2], known, mod, inner;
+                                                        value_used = value_used))
     elseif ex.head === :block
         inner = copy(scope)
         statements = Any[]
-        for statement in ex.args
-            push!(statements, _kernel_tensorized_rhs(statement, known, mod, inner))
+        tail = findlast(arg -> !(arg isa LineNumberNode), ex.args)
+        for (i, statement) in enumerate(ex.args)
+            push!(statements, _kernel_tensorized_rhs(statement, known, mod, inner;
+                value_used = value_used && i == tail))
             statement isa Expr && _kernel_tensorized_assignment_head(statement.head) &&
                 length(statement.args) == 2 && _lhs_symbols!(inner, statement.args[1])
         end
@@ -2700,13 +2739,16 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
         # broadcast, which is left untouched.
         return _kernel_tensorized_branch(
             ex.args[1], ex.args[2],
-            length(ex.args) == 3 ? ex.args[3] : nothing, known, mod, scope)
+            length(ex.args) == 3 ? ex.args[3] : nothing, known, mod, scope;
+            value_used = value_used)
     elseif ex.head === :&& && length(ex.args) == 2
         return _kernel_tensorized_branch(
-            ex.args[1], ex.args[2], false, known, mod, scope)
+            ex.args[1], ex.args[2], false, known, mod, scope;
+            value_used = value_used)
     elseif ex.head === :|| && length(ex.args) == 2
         return _kernel_tensorized_branch(
-            ex.args[1], true, ex.args[2], known, mod, scope)
+            ex.args[1], true, ex.args[2], known, mod, scope;
+            value_used = value_used)
     elseif ex.head === :call && !isempty(ex.args) &&
            (!(ex.args[1] isa Symbol) || !(ex.args[1] in known))
         reduction = _kernel_generator_sum_parts(ex)

@@ -118,12 +118,60 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d)
     if m !== nothing
         return k == 2 ? length(m.columns) : _value_rows(plan, M)
     end
+    if !haskey(plan.columns, M)
+        shape = _hcat_value_axes(plan, M, label)
+        shape === nothing || return shape[k]
+    end
     haskey(plan.columns, M) || _fail(label, "array $name axis " *
         "`$fn($M, $k)` needs a bound matrix $M")
     col = plan.columns[M]
-    col isa AbstractMatrix || _fail(label, "array $name axis " *
-        "`$fn($M, $k)` sizes over a matrix, but $M is a vector column")
+    col isa AbstractArray || _fail(label, "array $name axis " *
+        "`$fn($M, $k)` needs an array, got $(summary(col))")
     return size(col, k)
+end
+
+# A live hcat can size a declared coefficient vector from its operands'
+# shapes without evaluating parameters. Scalars contribute one column;
+# vectors and matrices keep their actual dimensions. Rows still obey
+# hcat's equal-row rule, including singleton and empty domains.
+function _hcat_value_axes(plan::StructuralPlan, ex, label,
+        active = Set{Symbol}())
+    ex isa Number && return (1, 1)
+    if ex isa Symbol
+        if haskey(plan.columns, ex)
+            v = plan.columns[ex]
+            v isa Number && return (1, 1)
+            v isa AbstractVector && return (length(v), 1)
+            v isa AbstractMatrix && return size(v)
+            return nothing
+        end
+        any(p -> p.name === ex, plan.parameters) && return (1, 1)
+        ex in active && return nothing
+        i = findfirst(a -> a.name === ex, plan.assignments)
+        j = findfirst(d -> d.name === ex, plan.derived)
+        rhs = i !== nothing ? plan.assignments[i].expr :
+            j !== nothing ? plan.derived[j].expr : nothing
+        rhs === nothing && return nothing
+        push!(active, ex)
+        shape = _hcat_value_axes(plan, rhs, label, active)
+        delete!(active, ex)
+        return shape
+    end
+    ex isa Expr || return nothing
+    anchor = _matrix_intercept_anchor(ex)
+    if anchor !== nothing && haskey(plan.columns, anchor)
+        return (length(plan.columns[anchor]), 1)
+    end
+    ex.head === :call && !isempty(ex.args) &&
+        ex.args[1] === GlobalRef(Base, :hcat) || return nothing
+    parts = map(a -> _hcat_value_axes(plan, a, label, active), ex.args[2:end])
+    any(isnothing, parts) && return nothing
+    isempty(parts) && return (0, 1) # Base.hcat() returns an empty vector
+    rows = first(parts)[1]
+    all(p -> p[1] == rows, parts) || _fail(label,
+        "hcat operands have different row counts: " *
+        repr([p[1] for p in parts]) * " (DimensionMismatch)")
+    return (rows, sum(p[2] for p in parts))
 end
 _array_dim_size(plan::StructuralPlan, p::ArrayParameter, d) =
     _array_dim_size(plan, p.name, p.label, d)
@@ -458,31 +506,33 @@ end
 
 # ── value expressions over arrays ────────────────────────────────────
 
-# True when `ex` reads an array parameter anywhere, directly or through
-# assignments computed from one.
+# True when `ex` reads an array parameter, directly or through assignments.
+# For indexed assignments, `opaque` also includes module results: a Julia
+# call may produce an array without reading a declared one.
 function _mentions_array(ex, plan::StructuralPlan,
-        seen::Set{Symbol} = Set{Symbol}())
+        seen::Set{Symbol} = Set{Symbol}(); opaque::Bool = false)
     _is_bound_array_value_call(ex) && return true
+    opaque && _contains_module_call(ex) && !_is_bound_value_call(ex) && return true
     if ex isa Symbol
         _is_array_param(plan, ex) && return true
         ex in seen && return false
         push!(seen, ex)
         i = findfirst(a -> a.name === ex, plan.assignments)
         return i !== nothing &&
-            _mentions_array(plan.assignments[i].expr, plan, seen)
+            _mentions_array(plan.assignments[i].expr, plan, seen; opaque)
     end
     ex isa Expr || return false
     _level_plate_axis(ex) === nothing || return true
     return any(a -> _mentions_array(ex.head === :tuple ?
-        _tuple_field_value(a) : a, plan, seen), ex.args)
+        _tuple_field_value(a) : a, plan, seen; opaque), ex.args)
 end
 
-# An assignment computed from array parameters (`M = (sd .* L)'`) is an
-# array value too: readable by position, and per observation along an axis
+# An assignment computed from array parameters or module calls is a
+# Julia value too: readable by position, and per observation along an axis
 # its expression carries (`b = z * (sd .* L)'` keeps `z`'s `levels(g)`
 # rows, so `b[g, 1]` reads each observation's level).
 _is_array_assignment(plan::StructuralPlan, name) =
-    name isa Symbol && any(a -> a.name === name && _mentions_array(a.expr, plan),
+    name isa Symbol && any(a -> a.name === name && _mentions_array(a.expr, plan; opaque=true),
         plan.assignments)
 
 # ── axes of array values ─────────────────────────────────────────────
