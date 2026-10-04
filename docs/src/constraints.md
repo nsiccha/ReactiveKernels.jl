@@ -33,10 +33,13 @@ from data-derived iteration and may be expanded.
 
 ## Preserve lazy branches
 
-The primary instruction is the user's [September 22 reply](http://localhost:4200/agents/ReactiveKernels:brm:tgi:reactant:no-unroll/messages?ts=2026-09-22T08%3A54%3A55%2B02%3A00)
-to [the eager-workaround brief](http://localhost:4200/agents/ReactiveKernels:brm:tgi:reactant:no-unroll/briefs/2026-09-22T08-50-05-258-15coonh),
-which expressly allowed safe intended elementwise selection. The user
-[clarified on October 4](http://localhost:4200/agents/ReactiveKernels:snag.reactant-xla-laz-3679d90e:upstream/messages?ts=2026-10-04T10%3A13%3A56%2B02%3A00)
+The primary instruction is the user's September 22 reply to the eager-workaround
+brief `15coonh`, which expressly allowed safe intended elementwise selection.
+Its internal source record is `ReactiveKernels:brm:tgi:reactant:no-unroll`,
+message `2026-09-22T08:54:55+02:00`, brief
+`2026-09-22T08-50-05-258-15coonh`. The user clarified on October 4
+(`ReactiveKernels:snag.reactant-xla-laz-3679d90e:upstream`, message
+`2026-10-04T10:13:56+02:00`)
 that they had not requested a blanket ban on inactive pure work. The broader
 execution-policy wording introduced in `3c7af187` was an agent interpretation,
 not an additional user instruction.
@@ -65,8 +68,9 @@ the [compiler](compiler.md), "Data-bound branches in plate cells"). This is
 the lazy semantics made structural: each lane still evaluates only its own
 arm, and no backend receives the branch.
 
-The user's [October 4 recurrence-prevention request](http://localhost:4200/agents/ReactiveKernels:snag.reactant-xla-laz-3679d90e:upstream/messages?ts=2026-10-04T10%3A26%3A24%2B02%3A00)
-and [broader audit request](http://localhost:4200/agents/RKPPLBench/messages?ts=2026-10-04T10%3A55%3A23%2B02%3A00)
+The user's October 4 recurrence-prevention request (the same upstream record,
+message `2026-10-04T10:26:24+02:00`) and broader audit request (`RKPPLBench`,
+message `2026-10-04T10:55:23+02:00`)
 are implemented by this review check: before adding or strengthening a constraint,
 reviewers must identify the primary user instruction or demonstrate its semantic
 or technical necessity, verify the proposed rule's scope, and distinguish
