@@ -28,12 +28,13 @@ function _ma_save_modules(modules,kind,n)
     return nothing
 end
 
-function _ma_compiled_check(bound,built,u,oracle)
+function _ma_compiled_check(bound,built,u,oracle; executables=false)
     sampler=prepare_sampler(built,bound,u;backend=_GEN_BACKEND)
     grad=similar(u)
     native,_=sampler_value_and_gradient!(sampler,grad,u)
     ru=Reactant.to_rarray(u)
     primal=Reactant.@compile sampler.kernel(ru)
+    reverse=nothing
     @test Float64(primal(ru))≈oracle(u) rtol=1e-12
     if isempty(u)
         # Standard zero-coordinate native reverse works; released Reactant
@@ -53,7 +54,7 @@ function _ma_compiled_check(bound,built,u,oracle)
             end
         end
     end
-    return sampler,ru
+    return executables ? (sampler,ru,(primal,reverse)) : (sampler,ru)
 end
 
 @testset "ordinary matrix values: default compiled density and reverse" begin
