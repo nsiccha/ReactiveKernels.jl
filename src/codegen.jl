@@ -204,10 +204,13 @@ function _authored_plate_result_eltype(op::_AuthoredPlateOp{K,A},
         (position in A || argtype <: Number) ? argtype : eltype(argtype)
     end
     T = Base.promote_op(op.kernel, element_types...)
+    _plate_result_eltype(T, valtype(only(outputs(op.kernel))))
+end
+
+@inline function _plate_result_eltype(::Type{T}, ::Type{D}) where {T,D}
     isconcretetype(T) && return T
-    declared = valtype(only(outputs(op.kernel)))
-    isconcretetype(declared) && return declared
-    T === Union{} ? declared : T
+    isconcretetype(D) && return D
+    T === Union{} ? D : T
 end
 
 # A plate is a pure graph map/reduction. Once Julia has instantiated the
@@ -1117,7 +1120,7 @@ end
 # Infer nested regions from their leaf operations, never from a recursive
 # PreparedKernel call. Keep these cold type-only slots in the same order in
 # both products; ordinary reverse AD removes slots unused by execution.
-function _plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types)
+function _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
     p = kernel.plan
     offset = length(runtime_ops)
     append!(runtime_ops, kernel.ops)
@@ -1132,6 +1135,8 @@ function _plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types)
                 arg, position in atomic) for (position, arg) in enumerate(args)]
             element = only(_plate_body_type!(runtime_ops, runtime_recipes,
                                             recipe.op.kernel, elements))
+            element = Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
+                element, valtype(only(recipe.op.kernel.plan.want)))
             Expr(:call, GlobalRef(@__MODULE__, :_plate_array_type), element,
                 Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic)), args...)
         else
@@ -1147,11 +1152,21 @@ function _plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types)
             end
         end
     end
-    Any[types[canon_id(p.graph, v.id)] for v in p.want]
+    types
+end
+
+function _plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types)
+    types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
+    Any[types[canon_id(kernel.plan.graph, v.id)] for v in kernel.plan.want]
 end
 
 @inline _plate_argument_type(::Type{T}, atomic) where {T} =
     atomic || T <: Number ? T : eltype(T)
+# An empty tuple has no coordinate type of its own. Its enclosing collection
+# can still supply one (e.g. Tuple{Vararg{Float64}}). Use that evidence only
+# for bottom; concrete nonempty lanes keep their ordinary inferred types.
+@inline _plate_coordinate_type(::Type{T}, hint) where {T} = T
+@inline _plate_coordinate_type(::Type{Union{}}, hint) = hint
 @inline _plate_axis_types(::Val{A}, ::Val{I}, ::Tuple{}) where {A,I} = ()
 @inline function _plate_axis_types(::Val{A}, ::Val{I}, args::Tuple) where {A,I}
     rest = _plate_axis_types(Val(A), Val(I + 1), Base.tail(args))
@@ -1177,19 +1192,25 @@ end
 # A cell containing another plate is lowered by the same graph compiler as a
 # top-level kernel. Splicing that AST retains each nested runtime loop, fuses
 # selected sum consumers, and preserves all named scalar recipes for replay.
+# Type-only arguments carry the enclosing DAG's coordinate evidence through
+# embedding without rebasing its operation-table references a second time.
 function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types)
     scalar = _fuse_authored_plate_chains(kernel.plan)
-    ast, ops, recipes = _lower_with_ops(scalar)
+    types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
+    hint_ids = sort!(collect(keys(types)))
+    type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
+    ast, ops, recipes = _lower_with_ops(scalar; type_hints)
     offset = length(runtime_ops)
     append!(runtime_ops, ops)
     append!(runtime_recipes, recipes)
-    T = only(_plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types))
-    (; ast, offset, type = T)
+    T = types[canon_id(kernel.plan.graph, only(kernel.plan.want).id)]
+    (; ast, offset, type = T, input_types = Any[types[cid] for cid in hint_ids])
 end
 
 function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
                                        op::_AuthoredPlateOp, callargs, callvalues,
-                                       pointwise_lhs, total_lhs; recycled = nothing)
+                                       pointwise_lhs, total_lhs; recycled = nothing,
+                                       input_type_hints = nothing)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -1376,6 +1397,13 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             (position in atomic || valtype(callvalues[position]) <: Number) ?
                 Expr(:call, GlobalRef(Base, :typeof), callargs[position]) :
                 Expr(:call, GlobalRef(Base, :eltype), raw_arguments[position])
+        if input_type_hints !== nothing
+            hint = Expr(:call, GlobalRef(@__MODULE__, :_plate_argument_type),
+                        input_type_hints[position], position in atomic)
+            plate_type_exprs[cid] = Expr(:call,
+                GlobalRef(@__MODULE__, :_plate_coordinate_type),
+                plate_type_exprs[cid], hint)
+        end
     end
     nested = any(r -> r.op isa _AuthoredPlateOp, inner.recipes) ?
         _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
@@ -1403,9 +1431,12 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             Expr(:call, GlobalRef(Base, :promote_op),
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...) : scan_type
     end
-    push!(body.args, Expr(:(=), plate_eltype, nested === nothing ?
+    inferred_eltype = nested === nothing ?
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
-            GlobalRef(Core, :Any)) : nested.type))
+            GlobalRef(Core, :Any)) : nested.type
+    push!(body.args, Expr(:(=), plate_eltype,
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
+             inferred_eltype, valtype(only(inner.want)))))
     groups = _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues)
     nested === nothing || (groups = [])
@@ -1465,7 +1496,8 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             inner, locals, callargs, callvalues, prepared_arguments, atomic,
             input, index, true) for input in inner.have]
         append!(loopbody.args,
-            _embedded_statements(nested.ast, args, nested_result, nested.offset))
+            _embedded_statements(nested.ast, [args; nested.input_types],
+                                 nested_result, nested.offset))
     end
     for (roots, recipe_indices) in groups
         isempty(roots) && continue
@@ -1688,11 +1720,15 @@ end
 # authored plate or scan may fill instead of allocating its output (the
 # position driver hands back the previous position's lane buffer,
 # `_lower_replicated_with_ops`). Any other producer ignores it.
+# `type_hints` maps logical value ids to extra type-only arguments in an
+# embedded native region. Empty coordinates can use the enclosing DAG's types;
+# no sample value or scalar recipe is evaluated to discover them.
 function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          inline_embedded::Bool = true,
                          declare::Bool = !tensorized && inline_embedded &&
                                          _needs_embedded_tensorization(p),
-                         recycle::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[])
+                         recycle::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[],
+                         type_hints = nothing)
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -1701,6 +1737,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         push!(argexprs, :($(nm(v))::$(valtype(v))))
     end
     append!(argexprs, (last(pair) for pair in recycle))
+    type_hints === nothing ||
+        append!(argexprs, (type_hints[cid] for cid in sort!(collect(keys(type_hints)))))
     recycled(cid) = (index = findfirst(pair -> first(pair) == cid, recycle);
                      index === nothing ? nothing : last(recycle[index]))
     body = Expr(:block)
@@ -1762,7 +1800,9 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             else
                 _lower_authored_plate_native!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
-                    pointwise_lhs, total_lhs; recycled = recycled(pointwise_id))
+                    pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    input_type_hints = type_hints === nothing ? nothing :
+                        Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
             end
             continue
         end
