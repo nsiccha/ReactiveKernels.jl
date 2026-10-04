@@ -382,13 +382,14 @@ end
             return y
         end
         @test @inferred(prepare(repeated_argument_model)(2.0)) == 4.0
-        @test_throws ArgumentError macroexpand(@__MODULE__, quote
-            @kernel nested_expression_argument(x::Float64) = begin
-                y::Float64 =
-                    AuthoringNestedKernelFixture.qualified_sum(x, x + 1)
-                return y
-            end
-        end)
+        @kernel nested_expression_argument(x::Float64) = begin
+            y::Float64 =
+                AuthoringNestedKernelFixture.qualified_sum(x, x + 1)
+            return y
+        end
+        @test prepare(nested_expression_argument)(2.0) == 5.0
+        @test !occursin("qualified_sum(",
+            sprint(show, code_expr(prepare(nested_expression_argument))))
 
         @kernel nested_cse_piece(x::Float64) = begin
             @recipe (cse_key = :nested_increment) y::Float64 = x + 1
