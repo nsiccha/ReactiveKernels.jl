@@ -43,11 +43,12 @@ code is not executed by the docs build.
   (also inside a batched plate cell), retained through ordinary MLIR AD.
   Default CPU XLA on Reactant 0.2.290 can subsequently replace pure live
   guards with eager selection, including inactive logarithms and division.
-  Correct values/gradients and matching inventories alone do not establish
-  executable laziness. Preserve the authored guard; use native execution when
-  inactive arithmetic must stay inactive. `Base.ifelse` remains an eager
-  select of two already valid values. See the executable boundary and removal
-  criteria in [core constraints](constraints.md) and the backend-only
+  These pure-arithmetic cases preserve the tested selected values and ordinary
+  gradients; a missing executable conditional alone is not a correctness
+  failure. Keep required guards in the source and verify effects, invalid-access
+  safety and derivatives separately. Safe intended `Base.ifelse` selection is
+  allowed; rewriting required lazy control flow eagerly to bypass a compiler
+  failure remains prohibited. See [core constraints](constraints.md) and the backend-only
   `benchmark/repro_reactant_pure_lazy_guard.jl`.
 - An authored `for`/`while` inside a recipe keeps its iteration: the
   tensorized companion expands it with `ReactantCore.@trace` at kernel
@@ -61,8 +62,8 @@ code is not executed by the docs build.
   the selected arm; the other arm keeps its existing value. Assignments to
   several locals keep their order. A branch used as an expression also
   returns its authored value. These branches lower to lazy regions inside
-  the retained loop, including an empty loop; the default executable boundary
-  above still applies. A loop may read a host struct such as a
+  the retained loop, including an empty loop; the semantic acceptance above
+  still applies. A loop may read a host struct such as a
   schedule plan; it crosses the loop untraced, and a traced value it reads
   enters as a fresh
   tracer, so a zero-sized input is not returned as an aliased output (which

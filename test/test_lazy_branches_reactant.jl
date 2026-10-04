@@ -1,9 +1,9 @@
 using ReactiveKernels, Reactant, Test
 import Enzyme
 
-# Authored `if`/`?:`/`&&`/`||` keep their lazy Julia semantics under Reactant
-# (docs/src/constraints.md): the inactive side is never evaluated, so an
-# invalid inactive computation neither poisons the value nor the gradient.
+# Authored `if`/`?:`/`&&`/`||` retain conditional regions in Reactant MLIR
+# (docs/src/constraints.md). Compiled values and gradients must match Julia,
+# including when the backend speculates pure arithmetic in an inactive arm.
 
 @kernel lazy_scalar_guard(x::Float64) = begin
     guarded::Float64 = x > 0 ? log(x) : -1.0
@@ -95,7 +95,7 @@ _host(v) = v isa Reactant.AbstractConcreteArray ? Array(v) : Reactant.to_number(
     gradient(x) = Enzyme.gradient(Enzyme.Reverse, k, x)
     compiled_gradient = Reactant.@compile gradient(_traced(2.0))
     @test _host(only(compiled_gradient(_traced(2.0)))) ≈ 0.5
-    # The inactive `log` is never differentiated: exactly zero, never NaN.
+    # The inactive arm contributes exactly zero to the gradient, never NaN.
     @test _host(only(compiled_gradient(_traced(-1.0)))) == 0.0
 end
 

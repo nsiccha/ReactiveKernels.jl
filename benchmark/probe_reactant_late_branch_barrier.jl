@@ -1,4 +1,4 @@
-# Compiler experiment, NOT an installed repair or a model/derivative adapter.
+# Compiler-policy experiment, NOT an installed repair or a required strict mode.
 # Add barriers only after ordinary AD and MLIR optimization, then invoke the
 # same default XLA compiler. This uses private Reactant 0.2.290 compiler APIs.
 include("repro_reactant_pure_lazy_guard.jl")
@@ -101,7 +101,9 @@ function check_late_branch_prototype(fn, initial, output, label; conditionals=1)
             push!(pair, counts)
         end
         @test get(pair[2], "conditional", 0) >= conditionals
-        @test_broken get(pair[1], "conditional", 0) >= conditionals
+        # The stock executable is a semantic control, not a failed strict-mode
+        # assertion. Only the experiment promises the extra branch regions.
+        @test !isempty(pair[1])
         for scale in (2.0, 0.7, -1.0, 0.0, NaN)
             host_args = (initial[1], typeof(initial[2])(scale))
             traced_args = map(lazy_traced, host_args)

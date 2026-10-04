@@ -309,7 +309,9 @@ retained loop with dynamic slices and output buffers. A scalar kernel that compi
 has the same compiler requirement in vectorized form; reverse gradients have the
 same requirement as the scalar prepared AD kernel. The position axis remains a
 backend loop rather than one copied body per position. The loop keeps each
-position's lazy branches, including inactive arithmetic. Compile the
+position's authored guards. Backend optimization must preserve selected values,
+ordinary derivatives, effects and invalid-access safety, as described in the
+[core constraints](constraints.md). Compile the
 ordinary owning batch; `reuse=true` is a native-only borrowed-buffer surface.
 
 The loop reads and writes each position in storage layout, with the position
