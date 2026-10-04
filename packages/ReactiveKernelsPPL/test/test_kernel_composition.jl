@@ -12,6 +12,13 @@ using ReactiveKernels
     return updates
 end
 const alias = recurrence
+@kernel panel(x, gain) = begin
+    totals = plate(eachcol(x), Ref(gain)) do xs, g
+        history = recurrence(xs, g)
+        sum(history)
+    end
+    return totals
+end
 end
 
 const BACKEND = AutoEnzyme(; mode=Enzyme.Reverse)
@@ -40,6 +47,23 @@ reference(data, a) = logpdf(Normal(0, 0.7), a) +
     sum(logpdf.(Normal.(cumsum(data.x .* a), 0.8), data.y))
 gradient(data, a) = -a / 0.7^2 +
     sum((data.y .- cumsum(data.x .* a)) .* cumsum(data.x)) / 0.8^2
+
+function build_subject_case(n, groups)
+    data = (; x=reshape(sin.(1:n*groups), n, groups), y=cos.(1:groups) .* 0.2)
+    ast = quote
+        a ~ Normal(0, 0.7)
+        loc = panel(x, a)
+        y .~ Normal.(loc, 0.8)
+    end
+    bound = bind_data(lower_rkppl(ast, data; conditioned=(:y,), mod=Models), data)
+    return bound, build_kernel(bound), data
+end
+
+subject_weights(data) = [sum(cumsum(xs)) for xs in eachcol(data.x)]
+subject_reference(data, a) = logpdf(Normal(0, 0.7), a) +
+    sum(logpdf.(Normal.(a .* subject_weights(data), 0.8), data.y))
+subject_gradient(data, a) = -a / 0.7^2 +
+    sum((data.y .- a .* subject_weights(data)) .* subject_weights(data)) / 0.8^2
 
 function scan_count(recipes)
     sum(recipes; init=0) do r
@@ -87,5 +111,34 @@ end
         @test value ≈ reference(data, 0.2)
         @test grad ≈ [gradient(data, 0.2)]
     end
+end
+
+@testset "PPL subject plates contain the original child scan" begin
+    counts = Int[]
+    for (n, groups) in ((0, 2), (3, 2), (11, 5))
+        bound, built, data = build_subject_case(n, groups)
+        original = deepcopy(data)
+        @test scan_count(built.spec.graph.recipes) == 1
+        @test any(built.spec.graph.recipes) do r
+            r.op isa ReactiveKernels._AuthoredPlateOp && scan_count(plate_body(r).recipes) == 1
+        end
+        push!(counts, length(built.spec.graph.recipes))
+        sampler = prepare_sampler(built, bound, [0.2]; backend=BACKEND)
+        for a in (0.2, -0.4)
+            value = Base.invokelatest(sampler.kernel, [a])
+            @test value ≈ subject_reference(data, a)
+            if n == 0
+                # Capability gap: native Enzyme static activity analysis fails
+                # for an empty child scan inside the bound eachcol plate.
+                @test_broken sampler_value_and_gradient!(sampler, [0.0], [a])[2] ≈
+                    [subject_gradient(data, a)]
+            else
+                _, grad = sampler_value_and_gradient!(sampler, [0.0], [a])
+                @test grad ≈ [subject_gradient(data, a)]
+            end
+        end
+        @test data == original
+    end
+    @test all(==(first(counts)), counts)
 end
 end
