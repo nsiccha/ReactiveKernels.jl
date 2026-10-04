@@ -16,6 +16,9 @@ end
 @kernel qualified(x) = begin
     result = Base.sin.(x)
 end
+@kernel identity_values(x) = begin
+    result = identity.(x)
+end
 @kernel splatted(xs) = begin
     result = .+(xs...)
 end
@@ -91,6 +94,17 @@ Base.Broadcast.broadcasted(::typeof(sin), x::FixedAxesVector) =
     @test prepare(dotted_or)(mixed) == (mixed .< 0 .|| sqrt.(mixed) .> 0)
     @test prepare(nested_dotted_and)(mixed) ==
         identity.(mixed .> 0 .&& log.(mixed) .> 0)
+    # Nonconcrete inferred elements retain Base's widening copy behavior.
+    values = Any[1, "two", nothing]
+    actual_values = prepare(identity_values)(values)
+    @test actual_values == identity.(values)
+    @test typeof(actual_values) == typeof(identity.(values))
+    @test values == Any[1, "two", nothing]
+    # Boolean results keep Base's BitArray container, including its large-copy path.
+    signs = collect(range(-2.0, 2.0; length=257))
+    mask = prepare(dotted_and)(signs)
+    @test mask == (signs .> 0 .&& log.(signs) .> 0)
+    @test mask isa BitVector
     @test x == saved
     styled = StyledVector(x)
     result = prepare(qualified)(styled)

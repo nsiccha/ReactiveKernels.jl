@@ -100,6 +100,49 @@ isdefined(@__MODULE__, :NestedPlates) || include("fixtures/nested_plates.jl")
     end
 end
 
+@testset "Nested computed axes retain concrete result types in native Reverse" begin
+    N = NestedPlates
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    k = prepare(N.indexed_loss)
+    ast = deepcopy(code_expr(k))
+    @test N.head_count(ast, :for) == 3 # nested projection, then the broadcast consumer
+    for (n, m) in ((0, 3), (4, 0), (4, 3), (17, 9)), shift in (0.0, 0.3)
+        matrix = reshape(sin.(1.0:n*m), n, m)
+        rates = collect(range(0.2, 1.0; length=m))
+        groups = [isodd(i) ? 1 : 2 for i in 1:n]
+        targets = cos.(1.0:n)
+        parameters = [0.8 + shift; 0.4 - shift; 0.15 + shift; sin.(1.0:2*m)]
+        saved = deepcopy((matrix, rates, groups, targets, parameters))
+        coefficients = reshape(parameters[4:end], 2, m)
+        predictions = [parameters[3] + sum(matrix[i, j] * parameters[1] * exp(-parameters[2]*rates[j]) *
+                           coefficients[groups[i], j] for j in 1:m; init=0.0) for i in 1:n]
+        expected = sum(abs2, predictions - targets)
+        gradient = zeros(length(parameters))
+        gradient[3] = 2sum(predictions - targets)
+        for i in 1:n, j in 1:m
+            residual = predictions[i] - targets[i]
+            feature = matrix[i, j] * exp(-parameters[2]*rates[j])
+            coefficient = coefficients[groups[i], j]
+            gradient[1] += 2residual * feature * coefficient
+            gradient[2] -= 2residual * feature * coefficient * parameters[1] * rates[j]
+            gradient[3 + groups[i] + 2(j-1)] += 2residual * feature * parameters[1]
+        end
+        bound = prepare(N.indexed_loss; bound=(; matrix, rates, groups, targets))
+        for (reader, args) in ((k, (matrix, rates, groups, targets, parameters)),
+                               (bound, (parameters,)))
+            @test reader(args...) ≈ expected
+            ad = prepare_ad(reader, backend, args...; active=:parameters)
+            for _ in 1:2
+                value, actual = ad_value_and_gradient(ad, args...)
+                @test value ≈ expected
+                @test actual ≈ gradient
+                @test (matrix, rates, groups, targets, parameters) == saved
+            end
+        end
+        @test code_expr(k) == ast
+    end
+end
+
 @testset "Nested plate endpoint caller scope" begin
     N = NestedPlates
     backend = AutoEnzyme(; mode=Enzyme.Reverse)

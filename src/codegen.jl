@@ -1167,24 +1167,29 @@ end
 # for bottom; concrete nonempty lanes keep their ordinary inferred types.
 @inline _plate_coordinate_type(::Type{T}, hint) where {T} = T
 @inline _plate_coordinate_type(::Type{Union{}}, hint) = hint
-@inline _plate_axis_types(::Val{A}, ::Val{I}, ::Tuple{}) where {A,I} = ()
-@inline function _plate_axis_types(::Val{A}, ::Val{I}, args::Tuple) where {A,I}
-    rest = _plate_axis_types(Val(A), Val(I + 1), Base.tail(args))
-    I in A ? rest : (first(args), rest...)
+@generated function _plate_axis_types(::Val{A}, ::Val{I}, args::T) where {A,I,T<:Tuple}
+    # Select structural argument slots directly. Recursive filtering can widen
+    # a tuple of constant Type values to Tuple{Vararg{DataType}} on Julia 1.10,
+    # leaving nested plate result inference in the differentiated runtime.
+    Expr(:tuple, (:(getfield(args, $j)) for j in 1:fieldcount(T)
+                  if !(I + j - 1 in A))...)
 end
 @inline _plate_marker_type(::Tuple{}) = Nothing
 @inline function _plate_marker_type(args::Tuple)
+    class = _static_plate_axis_class(first(args))
+    class === :axis && return first(args)
+    class === :not_axis && return _plate_marker_type(Base.tail(args))
     axes_type = Base.promote_op(axes, first(args))
     axes_type <: Tuple || return Any
     fieldcount(axes_type) > 0 ? first(args) :
         _plate_marker_type(Base.tail(args))
 end
 @inline function _plate_array_type(::Type{T}, ::Val{A}, args...) where {T,A}
-    # Tuple recursion retains constant Type operands during inference. Building
-    # a generator here would turn these cold probes into runtime inference.
+    # Preserve the structural slots of these type-only operands so known
+    # result types fold before the differentiated runtime.
     axes_args = _plate_axis_types(Val(A), Val(1), args)
     marker = _plate_marker_type(axes_args)
-    marker in (Nothing, Any) && return Any # the emitted region validates its axis
+    (marker === Nothing || marker === Any) && return Any # the emitted region validates its axis
     axes_type = Base.promote_op(Base.Broadcast.combine_axes, axes_args...)
     Base.promote_op(_plate_similar_output, marker, Type{T}, axes_type)
 end
