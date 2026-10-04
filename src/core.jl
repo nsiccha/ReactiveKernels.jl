@@ -267,6 +267,26 @@ end
     _tensorized_materialize(
         Base.broadcasted(f, _tensorized_cat_operands(args)...))
 
+@inline _native_broadcast_materialize(value) = Base.materialize(value)
+# Base's scalar/zero-dimensional path skips axis instantiation, including
+# zero-argument dotted calls for which combine_axes has no method.
+@inline _native_broadcast_materialize(
+    bc::Base.Broadcast.Broadcasted{Base.Broadcast.DefaultArrayStyle{0}}) =
+    Base.materialize(bc)
+@inline function _native_broadcast_materialize(
+        bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle})
+    # A deep fused broadcast can exhaust Julia's inlining budget at the
+    # unannotated singleton combine_axes method. Passing its mixed active and
+    # constant array descriptor across that call defeats native Reverse's
+    # static activity analysis. Keep axis discovery at the materialization
+    # site; the descriptor stays lazy and Base still owns the element loop.
+    # Respect axes supplied by a specialized broadcasted implementation.
+    bc.axes === nothing || return Base.materialize(bc)
+    ax = Base.@inline Base.Broadcast.combine_axes(bc.args...)
+    ready = Base.Broadcast.Broadcasted(bc.style, bc.f, bc.args, ax)
+    Base.materialize(ready)
+end
+
 # Nested dotted calls stay lazy so Julia's broadcast fusion survives the
 # tensorized lowering: only the OUTERMOST dotted call of a nest materializes
 # (via `_tensorized_broadcast` above) — with one exception
