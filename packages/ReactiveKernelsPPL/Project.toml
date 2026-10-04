@@ -32,6 +32,7 @@ ReactiveKernelsDistributionKernels = "0.1"
 Reactant = "0.2.284"
 SpecialFunctions = "2"
 StaticArrays = "1.9"
+StatsFuns = "1, 2"
 Statistics = "1"
 julia = "1.10"
 
@@ -45,8 +46,9 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+StatsFuns = "4c63d2b9-4356-54db-8cca-17b64c39e42c"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["CategoricalArrays", "DifferentiationInterface", "Distributions", "Enzyme", "InteractiveUtils", "Random", "Reactant", "SHA", "Serialization", "Test", "TOML"]
+test = ["CategoricalArrays", "DifferentiationInterface", "Distributions", "Enzyme", "InteractiveUtils", "Random", "Reactant", "SHA", "Serialization", "StatsFuns", "Test", "TOML"]
