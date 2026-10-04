@@ -526,13 +526,17 @@ end
         y .~ Normal.(mu, 1.0)
     end), (:y, :x); conditioned = (:y, :x)); true)
     # A data matrix whose columns do not match the array.
-    # refused: B * w column/length mismatch is a Julia DimensionMismatch (wrong data)
-    @test_throws ContractValidationError bindm(:(begin
+    # The active product keeps Base's dimension error at execution.
+    mismatch = bindm(:(begin
         w[1:2] .~ Normal.(0, 1)
         a ~ Normal(0, 1)
         mu = a .+ B * w
         y .~ Normal.(mu, 1.0)
     end), (; y, B = _av_B()))
+    mismatch_built = build_kernel(mismatch)
+    @test_throws DimensionMismatch Base.invokelatest(
+        prepare_query(mismatch_built, mismatch, :sampler),
+        zeros(mismatch_built.layout.total))
     # A vector where `B * w` needs a matrix.
     # refused: vector * vector for B * w is a Julia MethodError (wrong data, P3)
     @test_throws ContractValidationError bindm(:(begin
