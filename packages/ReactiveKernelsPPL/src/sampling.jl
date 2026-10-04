@@ -18,13 +18,14 @@ Convenience sampling RHS whose density is `f(value, args...)`. Observed use
 requires no geometry or random generator. Parameter use also needs a
 [`sampling_geometry`](@ref) method, as for any other external RHS.
 """
-struct LogDensity{F,A}
+struct LogDensity{F,A,K}
     f::F
     args::A
-    LogDensity(f::F, args::A, ::Val{:packed}) where {F,A} = new{F,A}(f, args)
+    kwargs::K
+    LogDensity(f::F, args::A, kwargs::K, ::Val{:packed}) where {F,A,K} = new{F,A,K}(f, args, kwargs)
 end
-LogDensity(f, args...) = LogDensity(f, args, Val(:packed))
-sampling_logdensity(d::LogDensity, value) = d.f(value, d.args...)
+LogDensity(f, args...; kwargs...) = LogDensity(f, args, (;kwargs...), Val(:packed))
+sampling_logdensity(d::LogDensity, value) = d.f(value, d.args...; d.kwargs...)
 
 """
     ParameterGeometry(shape, unconstrained; support, constrain, unconstrain,
@@ -115,8 +116,6 @@ function _external_parameter(name, rhs, shape, mod, names; observed=false,
         Expr(:call, resolved.args[1], resolved.args[2].args...) : resolved
     (bare || call isa Expr && call.head === :call) || _sfail("sampling RHS $name needs a callable or RHS value")
     arguments = bare ? Any[] : call.args[2:end]
-    any(a -> Meta.isexpr(a, :parameters), arguments) &&
-        _sfail("external RHS $name: bind keyword construction in an ordinary function")
     args = Tuple(arguments)
     geometry = if observed
         nothing
@@ -192,7 +191,10 @@ function _external_layout_entry(plan, p, offset, dims)
 end
 
 _external_call(args) = Meta.isexpr(args.rhs, :call)
-_external_arguments(args) = _external_call(args) ? args.rhs.args[2:end] : Any[]
+_external_authored_arguments(args) = _external_call(args) ? args.rhs.args[2:end] : Any[]
+_external_arguments(args) = filter(a->!Meta.isexpr(a, :parameters), _external_authored_arguments(args))
+_external_keywords(args) = Any[k for a in _external_authored_arguments(args)
+    if Meta.isexpr(a, :parameters) for k in a.args]
 _external_constructor(args) = _external_call(args) ? args.rhs.args[1] : args.rhs
 _sampling_rhs_broadcast(rhs::Union{AbstractArray,Tuple,Ref}) = rhs
 _sampling_rhs_broadcast(rhs) = Ref(rhs)
@@ -203,31 +205,37 @@ function _external_geometry_expr(e)
     # Quoted authored expressions are constants, never active model values.
     # This also keeps kernel_expr printable/replayable with closure endpoints.
     return Expr(:call, GlobalRef(@__MODULE__, :sampling_geometry),
-        _external_constructor(e.sampling), Expr(:tuple, (QuoteNode(a) for a in _external_arguments(e.sampling))...),
+        _external_constructor(e.sampling), Expr(:tuple, (QuoteNode(a) for a in _external_authored_arguments(e.sampling))...),
         Expr(:tuple, (QuoteNode(d) for d in e.sampling.geometry.shape)...))
 end
-_external_edge(e, edge) = Expr(:call, GlobalRef(@__MODULE__, edge),
-    _external_geometry_name(e), _external_u(e), Expr(:tuple, e.dims...),
-    _external_arguments(e.sampling)...)
-_sampling_constrain(g, u, shape, args...) = g.constrain(u, shape, args...)
-_sampling_logjac(g, u, shape, args...) = g.logjac(u, shape, args...)
+function _external_edge(e, edge)
+    return _external_endpoint_call(GlobalRef(@__MODULE__, edge),
+        Any[_external_geometry_name(e), _external_u(e), Expr(:tuple, e.dims...),
+            _external_arguments(e.sampling)...], _external_keywords(e.sampling))
+end
+function _external_endpoint_call(head, args, keywords)
+    return isempty(keywords) ? Expr(:call, head, args...) :
+        Expr(:call, head, Expr(:parameters, keywords...), args...)
+end
+_sampling_constrain(g, u, shape, args...; kwargs...) = g.constrain(u, shape, args...; kwargs...)
+_sampling_logjac(g, u, shape, args...; kwargs...) = g.logjac(u, shape, args...; kwargs...)
 
-function _sampling_scalar_constrain(g, u, args...)
-    value = g.constrain([u], (), args...)
+function _sampling_scalar_constrain(g, u, args...; kwargs...)
+    value = g.constrain([u], (), args...; kwargs...)
     value isa Number || throw(ArgumentError("scalar sampling geometry must constrain to a number"))
     return value
 end
-function _sampling_scalar_unconstrain(g, value, args...)
-    u = g.unconstrain(value, (), args...)
+function _sampling_scalar_unconstrain(g, value, args...; kwargs...)
+    u = g.unconstrain(value, (), args...; kwargs...)
     u isa AbstractVector && length(u) == 1 ||
         throw(ArgumentError("scalar sampling geometry must invert to one packed coordinate"))
     return only(u)
 end
-_sampling_scalar_logjac(g, u, args...) = g.logjac([u], (), args...)
+_sampling_scalar_logjac(g, u, args...; kwargs...) = g.logjac([u], (), args...; kwargs...)
 
-function _external_host_cells(e, edge, values, args)
+function _external_host_cells(e, edge, values, args; kwargs...)
     endpoint = getglobal(@__MODULE__, Symbol(:_sampling_scalar_, edge))
-    cells = broadcast((x, a...)->endpoint(e.sampling.geometry, x, a...), values, args...)
+    cells = broadcast((x, a...)->endpoint(e.sampling.geometry, x, a...; kwargs...), values, args...)
     cells isa AbstractVector && length(cells) == e.size ||
         throw(ContractValidationError("[layout] external plate $(e.name) arguments have incompatible axes"))
     return Float64.(cells)
@@ -244,7 +252,9 @@ function _external_cells_expr(e, edge)
         end
     end
     endpoint = GlobalRef(@__MODULE__, Symbol(:_sampling_scalar_, edge))
-    cell = Expr(:call, endpoint, _external_geometry_expr(e), _dovar(1), arguments...)
+    keywords = _external_cell_keywords!(inputs, e.sampling)
+    cell = _external_endpoint_call(endpoint,
+        Any[_external_geometry_expr(e), _dovar(1), arguments...], keywords)
     # Same retained plate body for transforms and log-Jacobians; only the
     # endpoint changes. Host broadcasting calls these identical endpoints.
     return first(_plate_sum_stmts(:unused, :unused_sum, inputs, cell)).args[2]
@@ -253,6 +263,29 @@ end
 function _external_host_args(layout, e, values)
     lookup = _layout_lookup(layout, values)
     return map(x->_eval_value_expr(x, lookup, e.name), Tuple(_external_arguments(e.sampling)))
+end
+function _external_host_kwargs(layout, e, values)
+    lookup = _layout_lookup(layout, values)
+    pairs = Pair{Symbol,Any}[]
+    for keyword in _external_keywords(e.sampling)
+        if Meta.isexpr(keyword, :kw, 2)
+            push!(pairs, keyword.args[1] => _eval_value_expr(keyword.args[2], lookup, e.name))
+        elseif Meta.isexpr(keyword, :..., 1)
+            append!(pairs, collect(Base.pairs(_eval_value_expr(keyword.args[1], lookup, e.name))))
+        else
+            _fail(e.name, "invalid Julia keyword argument $(repr(keyword))")
+        end
+    end
+    return (; pairs...)
+end
+function _external_cell_keywords!(inputs, args)
+    keywords = Any[]
+    for keyword in _external_keywords(args)
+        value = keyword.args[end]
+        push!(inputs, Expr(:call, GlobalRef(Base, :Ref), value))
+        push!(keywords, Expr(keyword.head, keyword.args[1:end-1]..., _dovar(length(inputs))))
+    end
+    return keywords
 end
 
 function _external_density_statements(p)
@@ -274,7 +307,8 @@ function _external_density_statements(p)
         end
     end
     rhs = if _external_call(p.args)
-        Expr(:call, _external_constructor(p.args), args...)
+        _external_endpoint_call(_external_constructor(p.args), args,
+            _external_cell_keywords!(inputs, p.args))
     elseif p.args.rhs isa GlobalRef
         p.args.rhs
     else

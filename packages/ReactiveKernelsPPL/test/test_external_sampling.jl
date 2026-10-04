@@ -1,4 +1,5 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL
+import ReactiveKernelsDistributionKernels
 import DifferentiationInterface as DI
 import Enzyme
 
@@ -14,6 +15,7 @@ struct NormalDensity{T}
 end
 const standard_normal = NormalDensity(0.0)
 normal_lpdf(x, mu) = -log(2pi)/2 - (x-mu)^2/2
+keyword_lpdf(x, lower; rate=1.0) = x > lower ? log(rate)-rate*(x-lower) : -Inf
 ReactiveKernelsPPL.sampling_logdensity(d::NormalDensity, x) = normal_lpdf(x, d.mu)
 
 struct ShiftExp{T}
@@ -57,6 +59,20 @@ ReactiveKernelsPPL.sampling_geometry(::Type{ClosureExp}, args, shape) =
     ParameterGeometry(shape, 1; support=:positive,
         constrain=(u, shape)->exp(u[1]),
         unconstrain=(x, shape)->[log(x)], logjac=(u, shape)->u[1])
+
+struct KeywordExp{T,R}
+    lower::T
+    rate::R
+end
+KeywordExp(lower; rate=1.0) = KeywordExp(lower, rate)
+ReactiveKernelsPPL.sampling_logdensity(d::KeywordExp, x) =
+    x > d.lower ? log(d.rate)-d.rate*(x-d.lower) : -Inf
+function ReactiveKernelsPPL.sampling_geometry(::Type{KeywordExp}, args, shape)
+    ParameterGeometry(shape, 1; support=:lower_bounded,
+        constrain=(u, shape, lower; rate=1.0)->lower+exp(u[1])/rate,
+        unconstrain=(x, shape, lower; rate=1.0)->[log(rate*(x-lower))],
+        logjac=(u, shape, lower; rate=1.0)->u[1]-log(rate))
+end
 
 # A foreign frontend emits ordinary AST through the public fragment API.
 # Neither function is called as an opaque statistical model at runtime.
@@ -303,4 +319,31 @@ end
         v[1:N] .~ ExternalSamplingFixtures.NormalDensity.(0.0)
     end
     @test_throws ContractValidationError _external_built(active)
+end
+
+@testset "ordinary RHS keyword constructors and geometry" begin
+    y = [0.4, 0.8]
+    plan, built = _external_built(quote
+        a ~ Normal(0, 1)
+        b ~ ExternalSamplingFixtures.KeywordExp(a; rate=1+exp(a))
+        y .~ ExternalSamplingFixtures.KeywordExp.(a; rate=1+exp(a))
+        z .~ LogDensity.(ExternalSamplingFixtures.keyword_lpdf, a; rate=1+exp(a))
+    end, Dict(:y=>y, :z=>copy(y)))
+    u = [0.2, -0.3]
+    nt = constrain(built.layout, u)
+    @test nt.b ≈ u[1]+exp(u[2])/(1+exp(u[1]))
+    @test unconstrain(built.layout, nt) ≈ u
+    @test logjac(built.layout, u) ≈ u[2]-log(1+exp(u[1]))
+    reference = w -> begin
+        rate = 1+exp(w[1])
+        -log(2pi)/2-w[1]^2/2-exp(w[2])+w[2] +
+            2sum(log(rate)-rate*(x-w[1]) for x in y)
+    end
+    _external_gradient(built, plan, u, reference)
+    @test _external_value(built, plan, u, :pointwise).y ==
+        _external_value(built, plan, u, :pointwise).z
+    source = string(kernel_expr(plan, built.layout))
+    replay = Core.eval(@__MODULE__, :(@kernel $(Meta.parse(source))))
+    query = prepare_query((;spec=replay, layout=built.layout), plan, :sampler)
+    @test Base.invokelatest(query, u) ≈ reference(u)
 end

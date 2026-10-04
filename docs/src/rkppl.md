@@ -290,8 +290,9 @@ belongs in visible submodel statements or retained plates/scans, following
 cover native values, ordinary Enzyme Reverse, host/kernel transforms and
 printed-source replay; compiled backend support depends on the caller's Julia
 operations and requires its own retained-loop acceptance. Custom scan-state
-geometry is not yet implemented. For constructors with keyword arguments,
-bind an ordinary positional factory function as the RHS constructor.
+geometry is not yet implemented. Ordinary RHS keyword arguments are preserved;
+geometry endpoints receive those same keyword values. Structural argument
+expressions retain Julia's `Expr(:parameters, ...)` keyword representation.
 
 This protocol currently computes log densities. Generated-only draws and RNG
 execution remain future work; they will require a draw capability separately

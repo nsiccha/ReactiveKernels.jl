@@ -1281,11 +1281,11 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :external_plate
             args = _external_host_args(layout, e, values)
-            v = _external_host_cells(e, :constrain, seg, args)
+            v = _external_host_cells(e, :constrain, seg, args; _external_host_kwargs(layout, e, values)...)
             push!(pairs, e.name => v)
         elseif e.kind === :external
             args = _external_host_args(layout, e, values)
-            v = _sampling_constrain(e.sampling.geometry, seg, Tuple(e.dims), args...)
+            v = _sampling_constrain(e.sampling.geometry, seg, Tuple(e.dims), args...; _external_host_kwargs(layout, e, values)...)
             (isempty(e.dims) ? v isa Number : v isa AbstractArray && size(v) == Tuple(e.dims)) ||
                 throw(ContractValidationError("[layout] external constrain for $(e.name) returned the wrong shape"))
             push!(pairs, e.name => v)
@@ -1409,11 +1409,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             v isa AbstractVector && length(v) == e.size ||
                 throw(ContractValidationError("[layout] external plate $(e.name) has the wrong shape"))
             args = _external_host_args(layout, e, nt)
-            u[e.offset:(e.offset + e.size - 1)] .= _external_host_cells(e, :unconstrain, v, args)
+            u[e.offset:(e.offset + e.size - 1)] .= _external_host_cells(e, :unconstrain, v, args; _external_host_kwargs(layout, e, nt)...)
         elseif e.kind === :external
             haskey(nt, e.name) || throw(ContractValidationError("[layout] missing parameter $(e.name)"))
             args = _external_host_args(layout, e, nt)
-            v = e.sampling.geometry.unconstrain(nt[e.name], Tuple(e.dims), args...)
+            v = e.sampling.geometry.unconstrain(nt[e.name], Tuple(e.dims), args...; _external_host_kwargs(layout, e, nt)...)
             v isa AbstractVector && length(v) == e.size ||
                 throw(ContractValidationError("[layout] external inverse for $(e.name) returned the wrong packed dimension"))
             u[e.offset:(e.offset + e.size - 1)] .= v
@@ -1546,11 +1546,11 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :external_plate
             args = _external_host_args(layout, e, values)
-            total += sum(_external_host_cells(e, :logjac, seg, args))
+            total += sum(_external_host_cells(e, :logjac, seg, args; _external_host_kwargs(layout, e, values)...))
             continue
         elseif e.kind === :external
             args = _external_host_args(layout, e, values)
-            total += _sampling_logjac(e.sampling.geometry, seg, Tuple(e.dims), args...)
+            total += _sampling_logjac(e.sampling.geometry, seg, Tuple(e.dims), args...; _external_host_kwargs(layout, e, values)...)
             continue
         end
         if e.kind === :scan && !isempty(e.scan_blocks)
