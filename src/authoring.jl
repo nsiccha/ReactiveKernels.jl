@@ -246,10 +246,14 @@ end
 function _kernel_inline_alias!(graph::Graph, from::Value, to::Value, context)
     from_type = valtype(from)
     to_type = valtype(to)
-    from_type == to_type || throw(ArgumentError(
+    from_type == to_type || from_type === Any || to_type === Any || throw(ArgumentError(
         "nested kernel $context type mismatch: :$(from.name) has type $from_type, " *
         "but :$(to.name) has type $to_type; declare the caller boundary with the " *
         "exact nested boundary type"))
+    # An omitted annotation is no type contract. Keep a differing declaration
+    # as the same identity/conversion recipe used by an ordinary assignment,
+    # so neither the caller nor the child loses its declared boundary type.
+    from_type == to_type || return _kernel_alias!(graph, from, to, identity, 1.0)
     source = canon_id(graph, from.id)
     target = canon_id(graph, to.id)
     source == target && return graph
@@ -3195,8 +3199,11 @@ _kernel_has_node_marker(x) =
         (x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])) ||
         any(_kernel_has_node_marker, x.args))
 
-# Resolve a callee/macro-head AST (bare `name` or `Mod.name`) to its BINDING VALUE in
+# Resolve a callee/macro-head AST (`name`, `Mod.name`, or a `GlobalRef`) to its BINDING VALUE in
 # `mod`, or `nothing`. Reads bindings only (no call eval) — inside the compiler boundary.
+_kernel_resolve_binding(::Module, callee::GlobalRef) =
+    isdefined(callee.mod, callee.name) ? getglobal(callee.mod, callee.name) : nothing
+
 function _kernel_resolve_binding(mod::Module, callee)
     if callee isa Symbol
         isdefined(mod, callee) ? getglobal(mod, callee) : nothing

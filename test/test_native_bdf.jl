@@ -128,8 +128,29 @@ end
         for bad in ([0.0], [0.2, 0.2], [0.2, 0.1], [Inf], [NaN])
             @test_throws DomainError rk_ode_bdf_tol(_bdf_decay, u, 0.0, bad, 1e-8, 1e-8, 10000, p[1])
         end
-        for (rt, at, mx) in ((0.0, 1e-8, 100), (1.1, 1e-8, 100),
-                (NaN, 1e-8, 100), (1e-8, 0.0, 100), (1e-8, Inf, 100), (1e-8, 1e-8, 0))
+        # These controls are valid for standard FBDF. Compare the adapter's
+        # output with the same standard solve, including loose tolerance.
+        # Retain the affine RHS arithmetic order: reassociating its products
+        # can change adaptive steps, even though the ODE is equivalent.
+        function control_rhs!(du, y, p, t)
+            du[1] = (p[2] - p[1]) * (-p[3] * y[1])
+            nothing
+        end
+        control_times = [0.4, 1.6]
+        control_stops = control_times ./ last(control_times)
+        control_prob = ODEProblem{true,SciMLBase.FullSpecialize}(control_rhs!, copy(u),
+            (0.0, 1.0), [0.0, last(control_times), p[1]])
+        for (rt, at) in ((1.1, 1e-8), (0.0, 1e-8), (1e-8, 0.0))
+            standard = solve(control_prob, FBDF(); tstops = control_stops,
+                reltol = rt, abstol = at, save_start = true, save_everystep = true, dense = true)
+            @test SciMLBase.successful_retcode(standard)
+            actual = rk_ode_bdf_tol(_bdf_decay, u, 0.0, control_times, rt, at, 10000, p[1])
+            @test vec(actual) ≈ [standard(s)[1] for s in control_stops] rtol=1e-12
+        end
+        @test control_times == [0.4, 1.6]
+        for (rt, at, mx) in ((-1e-8, 1e-8, 100), (1e-8, -1e-8, 100), (0.0, 0.0, 100),
+                (NaN, 1e-8, 100), (Inf, 1e-8, 100), (1e-8, NaN, 100),
+                (1e-8, Inf, 100), (1e-8, 1e-8, 0))
             @test_throws DomainError rk_ode_bdf_tol(_bdf_decay, u, 0.0, ts, rt, at, mx, p[1])
         end
         @test_throws DomainError rk_ode_bdf_tol(_bdf_decay, [NaN], 0.0, ts, 1e-8, 1e-8, 100, p[1])
