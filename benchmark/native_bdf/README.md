@@ -1,5 +1,11 @@
 # Native BDF implementation experiments
 
+The user selected Julia's standard BDF implementation on 2026-10-04. The
+generic numerical bridge now lives in `ext/ReactiveKernelsBDFExt.jl` as
+`ReactiveKernels.rk_ode_bdf_tol`, delegating to `OrdinaryDiffEqBDF.FBDF()`.
+Its public acceptance is `test/test_native_bdf.jl`. The CVODE experiments below
+are preserved research; their solver-selection recommendation is superseded.
+
 These public experiments investigate snag `native-bdf-origi-82b23b10`.
 They are research candidates, not installed package capabilities or an
 application replacement. No method is added to `StanBlocks.ode_bdf_tol`.
