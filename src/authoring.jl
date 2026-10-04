@@ -1411,6 +1411,17 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       straight::Bool = true)
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
+    # A nested plate/scan owns a different scalar caller scope. Its authoring
+    # pass rewrites the do-block after registering that region's formals and
+    # locals. Descending here would bind its endpoints against the enclosing
+    # cell and lift their recipes outside the region that supplies the inputs.
+    if ex.head === :do && length(ex.args) == 2
+        call = ex.args[1]
+        if call isa Expr && call.head === :call && !isempty(call.args) &&
+           _kernel_resolve_binding(mod, call.args[1]) in (plate, scan)
+            return ex, nothing
+        end
+    end
 
     # `object(owner_args...).endpoint(endpoint_args...)` is source-level graph
     # application.  Resolve the object and endpoint while the macro expands,

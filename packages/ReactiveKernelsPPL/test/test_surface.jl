@@ -2227,9 +2227,21 @@ end
     end, (:y, :x, :g); conditioned = (:y, :x, :g))
     @test only(full.levelmaps).subset === Colon()
     @test only(full.array_parameters).name === :c
-    # Scalar prior for a vector coefficient: migration error. Missing prior:
-    # required error (no default sizes the block).
-    for stmts in ((:(c ~ Normal(0, 2)),), (:($(Expr(:call, :~,
+    # A scalar declaration preserves its authored scalar[vector] read and
+    # Base's runtime error. It never silently creates a factor coefficient.
+    scalar = lower_rkppl(quote
+        c ~ Normal(0, 2)
+        mu = c[g]
+        y .~ Normal.(mu, 1.5)
+    end, (:y, :g); conditioned=(:y, :g))
+    scalar_bound = bind_data(scalar, Dict(:y=>[0.1, 0.2], :g=>[1, 2]))
+    scalar_built = build_kernel(scalar_bound)
+    @test coordinate_names(scalar_built.layout) == [:c]
+    @test_throws MethodError Base.invokelatest(
+        prepare_query(scalar_built, scalar_bound, :sampler), [0.3])
+    # A missing declaration still fails; dotted constructor syntax does
+    # not turn an undeclared vector coefficient into an implicit parameter.
+    for stmts in ((:($(Expr(:call, :~,
             :c, :(Normal.(0, 2))))),), ())
         block = Expr(:block, stmts...,
             :(mu = c[g]), :(y .~ Normal.(mu, 1.5)))
@@ -3201,7 +3213,7 @@ end
             mu = a .+ b .* x
             p .~ BetaLogit.(mu)
         end, Dp2; conditioned = Dp2)))
-    # Fused heads take positional arguments only, like every dotted object.
+    # These optimized fused heads take positional arguments only.
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("positional arguments only",
         _fused_errmsg(() -> lower_rkppl(quote
@@ -3215,10 +3227,9 @@ end
             mu = a .+ b .* x
             y .~ BernoulliLogit(mu)
         end, Dn; conditioned = Dn)))
-    # `OrderedLogit` is a near-miss name, not a fused head: it guides to the
-    # admitted `OrderedLogistic` spelling instead of failing generically.
-    # refused: OrderedLogit is not a defined distribution head (P6, 05oe96l)
-    @test occursin("OrderedLogistic.(eta)",
+    # Other spellings follow the open protocol and ordinary module resolution.
+    # This module has no OrderedLogit binding; its absence is the error.
+    @test occursin("`OrderedLogit`, which is not defined in module `Main`",
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ OrderedLogit.(mu)
