@@ -24,12 +24,22 @@ of them. Knowing a length at preparation or trace time does not make it a
 structural constant. For example, expanding one statement per bit of the largest
 bound dose count is forbidden just as expanding one statement per subject is.
 
-Retain a runtime loop, scan, or equivalent backend control-flow operation with
-explicit carried state and output buffers. Shapes may specialize an executable;
-the lowering must not duplicate the body according to those shapes or values.
-Native execution retains ordinary iteration. Fixed structural algebra, such as
-the scalar entries of an intrinsically three-compartment operator, is distinct
+The primary instruction is the user's September 22 decision `1rvu25u`, recorded
+under `ReactiveKernels:brm:tgi:reactant:no-unroll`, decision
+`2026-09-22T08-49-18-901-1rvu25u`: retain real loops or batched-array structure.
+Retain a runtime loop, scan, or equivalent batched array structure. Stateful
+iteration needs the appropriate carried state and output storage. Shapes may
+specialize an executable; the lowering must not duplicate the body according
+to those shapes or values. Native execution retains ordinary iteration.
+Fixed structural algebra, such as the scalar entries of an intrinsically
+three-compartment operator, is distinct
 from data-derived iteration and may be expanded.
+
+A surviving loop alone does not establish that it implements the intended
+work. Inspect its reachable body and callees, and any equivalent array work,
+alongside selected values, ordinary derivatives and growth across data sizes.
+Semantics-preserving movement of pure invariant arithmetic is permitted;
+operation counts are evidence to interpret, not an independent user policy.
 
 ## Preserve lazy branches
 
@@ -158,10 +168,15 @@ tested data sizes, and keep complete optimized operation inventories as
 diagnostics. Shape specialization may share constants, simplify scalar
 arithmetic or simplify singleton derivative tapes, including an identity
 broadcast of one scalar tape index, so small shapes need not
-have identical raw inventories. Complete inventories must stop growing as
-data lengths increase; these bounded simplifications must not replicate a
-data-derived loop body. Pure branch simplification is subject to the semantic
-requirements above, rather than a blanket conditional-instruction count.
+have identical raw inventories. The bounded-inventory criterion `1arw7kp` was
+an agent engineering choice following the user's scoped no-preference
+delegations `01pwx0r` and `08vkgt9`, not a user-authored specification. Review
+that criterion with evidence and its actual scope; neither exact count equality
+nor eventual complete-count equality follows from `1rvu25u` alone. Record
+growth and identify replicated data-derived bodies, reduction stages and
+scalar simplifications separately. Pure branch simplification is subject to
+the semantic requirements above, rather than a blanket conditional-instruction
+count.
 
 For compiled acceptance inspect both optimized MLIR and the HLO of the actual
 default executable. XLA may remove singleton loops, simplify pure branches or
@@ -173,9 +188,10 @@ not a failing branch check merely because the executable uses a selection.
 
 Default XLA vector reductions can add reduction stages as array lengths grow
 even when optimized MLIR retains one vector-reduction expression. This separate
-complete-inventory growth limit is isolated by
-`benchmark/repro_reactant_vector_reduction_growth.jl`; retaining scalar loops
-and lazy branches alone does not satisfy it.
+complete-inventory growth diagnostic is isolated by
+`benchmark/repro_reactant_vector_reduction_growth.jl`. Reduction-stage growth
+alone does not establish replicated source bodies or a performance regression;
+inspect the work and measure any relevant resource or runtime impact.
 
 These are required constraints, not a claim that every existing path already
 conforms. Every functional stateful method with authored control flow lowers
