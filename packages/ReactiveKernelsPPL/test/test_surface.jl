@@ -3213,7 +3213,7 @@ end
             mu = a .+ b .* x
             p .~ BetaLogit.(mu)
         end, Dp2; conditioned = Dp2)))
-    # Fused heads take positional arguments only, like every dotted object.
+    # These optimized fused heads take positional arguments only.
     # refused: fused constructor arity/keyword signature (P3)
     @test occursin("positional arguments only",
         _fused_errmsg(() -> lower_rkppl(quote
@@ -3227,10 +3227,9 @@ end
             mu = a .+ b .* x
             y .~ BernoulliLogit(mu)
         end, Dn; conditioned = Dn)))
-    # `OrderedLogit` is a near-miss name, not a fused head: it guides to the
-    # admitted `OrderedLogistic` spelling instead of failing generically.
-    # refused: OrderedLogit is not a defined distribution head (P6, 05oe96l)
-    @test occursin("OrderedLogistic.(eta)",
+    # Other spellings follow the open protocol and ordinary module resolution.
+    # This module has no OrderedLogit binding; its absence is the error.
+    @test occursin("`OrderedLogit`, which is not defined in module `Main`",
         _fused_errmsg(() -> lower_rkppl(quote
             mu = a .+ b .* x
             y .~ OrderedLogit.(mu)
