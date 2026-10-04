@@ -178,6 +178,7 @@ _array_dim_size(plan::StructuralPlan, p::ArrayParameter, d) =
 
 """Concrete axis lengths of an array parameter on a bound plan."""
 function _array_dims(plan::StructuralPlan, p::ArrayParameter)
+    p.family === :external && return Int[_sampling_extent(plan, d, p.name) for d in p.dims]
     isbound(plan) || throw(ContractValidationError(
         "[arrays] array $(p.name) sizes resolve on a bound plan only"))
     return Int[_array_dim_size(plan, p, d) for d in p.dims]
@@ -209,6 +210,10 @@ function _validate_array_parameters(plan::StructuralPlan)
     names = _union_names(plan)
     for p in plan.array_parameters
         _check_name_hygiene(p.name)
+        if p.family === :external
+            _validate_external_parameter(plan, p)
+            continue
+        end
         nd = length(p.dims)
         stack = p.family === :lkj_cholesky_stack
         (1 <= nd <= 2 || (stack && nd == 3)) || _fail(p.label,
@@ -307,6 +312,7 @@ function _validate_array_parameters_data(plan::StructuralPlan)
     known = union(Set{Symbol}(_all_names(plan)), Set{Symbol}(keys(plan.columns)))
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
+        p.family === :external && continue
         all(>=(0), dims) || _fail(p.label, "array $(p.name) has a negative " *
             "axis size (sizes $(repr(dims)))")
         _is_structured_array(p) && !all(>=(1), dims) && _fail(p.label,
@@ -986,7 +992,11 @@ function _array_layout_entries!(entries::Vector{LayoutEntry},
     for p in plan.array_parameters
         p.name in plan.conditioned && continue
         dims = _array_dims(plan, p)
-        if p.family === :lkj_cholesky
+        if p.family === :external
+            entry = _external_layout_entry(plan, p, offset, dims)
+            push!(entries, entry)
+            offset += entry.size
+        elseif p.family === :lkj_cholesky
             K = dims[1]
             packed = K * (K - 1) ÷ 2
             labels = [Symbol(p.name, ".", i) for i in 1:packed]
@@ -1439,6 +1449,12 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         node = Symbol(:_ppl_prior_, p.name)
+        if p.family === :external
+            append!(stmts, _external_density_statements(p))
+            push!(terms, node)
+            push!(pointwise, p.name => Symbol(p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
+            continue
+        end
         if prod(dims) == 0
             # An elementwise declaration over no elements has no density
             # cells. Scalar priors elsewhere in the model remain intact.

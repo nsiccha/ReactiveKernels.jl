@@ -213,6 +213,91 @@ for an observation vector.
 Uniform bounds may be live scalar values, including in factor arrays:
 `lo ~ Normal(0, 1); c[levels(g)] .~ Uniform.(lo, lo + 3)`.
 
+## Caller-owned sampling RHS definitions
+
+Sampling RHS definitions are open Julia bindings. Built-in spellings select
+the existing specialized lowerings; other bindings use the following public
+protocol. An observation needs only a constrained-value log density:
+
+```julia
+struct MyNormal{T}
+    mu::T
+end
+ReactiveKernelsPPL.sampling_logdensity(d::MyNormal, x) =
+    -log(2pi)/2 - (x-d.mu)^2/2
+
+normal_lpdf(x, mu) = -log(2pi)/2 - (x-mu)^2/2
+# Inside an @rkppl model with a declared parameter a:
+y .~ MyNormal.(a)
+# The convenience wrapper has the same density:
+y .~ LogDensity.(normal_lpdf, a)
+```
+
+With `Distributions` loaded, any `Distributions.Distribution` object uses its
+ordinary `Distributions.logpdf` method automatically, including custom types.
+Other types extend `sampling_logdensity`. A module-visible RHS object can be
+used directly; a definition can also construct an RHS value. Undotted `~`
+evaluates one whole-event density; `.~` applies it over Julia broadcast cells,
+retains the broadcast axes in `:pointwise`, and sums those cells. Independent
+custom broadcasts need not share another response's row count. Observations
+acquire no packed coordinates and need no transform or random generator.
+
+A parameter declaration additionally needs structural geometry. The method
+receives the constructor binding, authored argument expressions and declared
+constrained shape; it must not evaluate active statistical arguments. For
+example, a positive exponential residual above a live lower bound:
+
+```julia
+struct ShiftedExp{T}
+    lower::T
+end
+ReactiveKernelsPPL.sampling_logdensity(d::ShiftedExp, x) =
+    x > d.lower ? -(x-d.lower) : -Inf
+function ReactiveKernelsPPL.sampling_geometry(::Type{ShiftedExp}, args, shape)
+    ParameterGeometry(shape, 1; support=(:lower, args[1]),
+        constrain=(u, shape, lower)->lower + exp(u[1]),
+        unconstrain=(x, shape, lower)->[log(x-lower)],
+        logjac=(u, shape, lower)->u[1])
+end
+# Inside a model:
+a ~ Normal(0, 1)
+b ~ ShiftedExp(a + 0.7)
+```
+
+The endpoints receive current argument **values**, including sampled parent
+values, on both the host layout path and the generated kernel path.
+`ParameterGeometry` specifies constrained `shape`, packed dimension,
+support metadata, constrain, inverse and log absolute Jacobian. Shape and
+packed dimension may differ: a two-component simplex can pack one coordinate.
+Declare constrained array dimensions on the LHS, for example `p[1:2] ~ D()`;
+dimensions and packed extents may depend on bound data, never sampled values.
+Optional `coordinate_names` names every packed coordinate. A scalar `@plate`
+cell uses scalar geometry with one packed coordinate. The density and inverse
+must enforce the declared support; metadata alone adds no support check.
+
+An external frontend can supply a submodel without defining it through
+`@rkppl`: extend `sampling_fragment(binding)` to return a stable
+`RKPPLSubmodel(name, argument_names, body_ast, defining_module)`. Its ordinary
+sampling statements, definitions and authored loops then follow the same
+scope, nesting and conditioning expansion as RKPPL submodels. The adapter
+does not execute an opaque model or modify compiler internals. It returns
+`nothing` for bindings that are densities rather than model fragments.
+
+Density bodies and geometry endpoints are pure ordinary Julia and use standard
+backend AD. Statistical bodies remain caller-owned. Model-sized iteration
+belongs in visible submodel statements or retained plates/scans, following
+[Core constraints](constraints.md). The initial custom RHS acceptance tests
+cover native values, ordinary Enzyme Reverse, host/kernel transforms and
+printed-source replay; compiled backend support depends on the caller's Julia
+operations and requires its own retained-loop acceptance. Custom scan-state
+geometry is not yet implemented. Ordinary RHS keyword arguments are preserved;
+geometry endpoints receive those same keyword values. Structural argument
+expressions retain Julia's `Expr(:parameters, ...)` keyword representation.
+
+This protocol currently computes log densities. Generated-only draws and RNG
+execution remain future work; they will require a draw capability separately
+from parameter geometry, without adding generated values to sampler coordinates.
+
 ## Julia semantics, written out
 
 - Use Distributions.jl constructors (`Normal`, `Exponential`, `Gamma`, …).
