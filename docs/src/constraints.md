@@ -33,23 +33,46 @@ from data-derived iteration and may be expanded.
 
 ## Preserve lazy branches
 
+The primary instruction is the user's [September 22 reply](http://localhost:4200/agents/ReactiveKernels:brm:tgi:reactant:no-unroll/messages?ts=2026-09-22T08%3A54%3A55%2B02%3A00)
+to [the eager-workaround brief](http://localhost:4200/agents/ReactiveKernels:brm:tgi:reactant:no-unroll/briefs/2026-09-22T08-50-05-258-15coonh),
+which expressly allowed safe intended elementwise selection. The user
+[clarified on October 4](http://localhost:4200/agents/ReactiveKernels:snag.reactant-xla-laz-3679d90e:upstream/messages?ts=2026-10-04T10%3A13%3A56%2B02%3A00)
+that they had not requested a blanket ban on inactive pure work. The broader
+execution-policy wording introduced in `3c7af187` was an agent interpretation,
+not an additional user instruction.
+
 **Do not replace required lazy control flow with eager `ifelse`, masked
 evaluation of both branches, or equivalent predication to bypass a compiler
-failure.** An inactive branch must remain inactive, including its indexing,
-allocation, mutation, potentially undefined arithmetic, and derivative work.
-Clamping indices or inventing dummy buffers does not make such a rewrite valid.
+failure.** Preserve selected values, ordinary derivatives, observable effects,
+exceptions and invalid-access safety. An eager rewrite must not expose an
+inactive invalid access, side effect or unsafe arithmetic. Clamping indices or
+inventing dummy buffers does not make such a rewrite valid.
 
 Ordinary elementwise selection between already valid values remains a selection;
-it does not authorize evaluating an otherwise inactive computation. Preserve
-the authored Julia branch and loop semantics in both primal and derivative
-execution. If a backend cannot express them, report the unsupported case and
-isolate the backend failure instead of adopting an eager workaround.
+it does not authorize an unsafe rewrite of arbitrary control flow. Keep required
+guards in the authored graph and preserve Julia semantics in primal and
+derivative execution. A backend may simplify or speculate pure arithmetic when
+it preserves those semantics: a discarded floating-point `NaN` or `Inf` is not
+itself a correctness failure if it cannot affect the selected result, gradient
+or observable behavior. This rule does not require a particular conditional
+instruction or prohibit every computation of an unused pure intermediate.
+If a backend cannot preserve the required semantics, report the unsupported
+case and isolate the failure instead of adopting an eager workaround.
 
 When a plate cell's branch condition reads bound data only, preparation
 evaluates it per lane and splits the plate into one plate per taken arm (see
 the [compiler](compiler.md), "Data-bound branches in plate cells"). This is
 the lazy semantics made structural: each lane still evaluates only its own
 arm, and no backend receives the branch.
+
+The user's [October 4 recurrence-prevention request](http://localhost:4200/agents/ReactiveKernels:snag.reactant-xla-laz-3679d90e:upstream/messages?ts=2026-10-04T10%3A26%3A24%2B02%3A00)
+is implemented by this review check: before adding or strengthening a constraint,
+reviewers must identify the primary instruction, check the scope of the proposed
+rule against it, and distinguish observable semantics from explicitly requested
+structure and performance or resource measurements. Copied docs, `AGENTS.md`, repeated summaries, successful
+assertions, brief acknowledgements and experiment-publication approval are not
+independent authority for an expanded policy. A new execution-policy requirement
+needs its own user direction; a diagnostic finding does not supply it.
 
 ## Derivative rules come from one mathematical graph, never by hand
 
@@ -114,20 +137,32 @@ including inactive branches and empty or ragged cases where supported. A small
 Julia statement count alone does not establish this: tracing can still expand
 a host loop.
 
+Interpret acceptance evidence according to what it establishes:
+
+| Evidence | Required interpretation |
+| --- | --- |
+| Changed-input values, ordinary derivatives, observable effects, ownership and invalid-access safety | Semantic correctness checks; do not relax them to accommodate a compiler. |
+| Retained data-derived iteration and bounded body growth | Separately requested structural invariants; pure-branch speculation does not waive them. |
+| Complete inventories and missing HLO conditionals in pure-arithmetic guards | Structural diagnostics; a missing conditional alone is not a correctness failure without a relevant requirement or observable impact. |
+| Runtime, allocations and data movement | Workload-specific performance or resource evidence; state the workload, direction, comparison and measurement conditions. |
+
 Compare retained control-flow regions, nonlinear work and indexing across all
 tested data sizes, and keep complete optimized operation inventories as
 diagnostics. Shape specialization may share constants, simplify scalar
 arithmetic or simplify singleton derivative tapes, including an identity
 broadcast of one scalar tape index, so small shapes need not
 have identical raw inventories. Complete inventories must stop growing as
-data lengths increase; these bounded simplifications must preserve one
-authored loop and branch body at every size.
+data lengths increase; these bounded simplifications must not replicate a
+data-derived loop body. Pure branch simplification is subject to the semantic
+requirements above, rather than a blanket conditional-instruction count.
 
 For compiled acceptance inspect both optimized MLIR and the HLO of the actual
-default executable. XLA may remove singleton loops, turn pure lazy branches
-into eager selections, or move invariant work out of a zero-trip body after
-MLIR checks pass. Verify retained executable regions and inactive arithmetic
-as well as operation-growth diagnostics.
+default executable. XLA may remove singleton loops, simplify pure branches or
+move invariant work after MLIR checks pass. Verify the separate retained
+data-derived iteration requirement and operation-growth diagnostics. For
+branches, check selected values, ordinary derivatives, effects and safety at
+changed valid and invalid inputs; pure speculation with preserved semantics is
+not a failing branch check merely because the executable uses a selection.
 
 Default XLA vector reductions can add reduction stages as array lengths grow
 even when optimized MLIR retains one vector-reduction expression. This separate
@@ -191,24 +226,20 @@ and lock the one Reactant 0.2.289 lifted:
   dependency metadata. Its selected arm retains the original lane domain,
   including constant fallbacks and otherwise unused lane inputs. Ordinary
   MLIR primal and reverse have matching complete operation inventories
-  at three, seven and eleven lanes. This is not executable lazy acceptance:
-  default CPU XLA on Reactant 0.2.290 removes pure shared guards in both
-  directions and eagerly evaluates logarithms/division before selecting the
-  result, even though numerical values and gradients agree with native Julia.
-  `repro_reactant_pure_lazy_guard.jl` isolates this without ReactiveKernels;
-  `test_invariant_plate_branches_reactant.jl` records the executable boundary
-  as broken acceptance. Preserve the authored guard and use native execution
-  when inactive arithmetic must remain inactive. Fixed operation inventories
-  alone do not satisfy this constraint.
-  `probe_reactant_late_branch_barrier.jl` is a compiler experiment that adds
-  return barriers after ordinary AD, then uses default XLA. Its scalar, nested
-  and shared-plate executables retain lazy regions without derivative rules
-  or consumer changes. It is not an installed backend repair: broader coverage
-  and upstream integration/release remain required. A barrier inserted before
-  AD instead fails because its backend adjoint is missing. Remove this boundary
-  only after released default compilation retains the relevant branch regions
-  and their inactive arithmetic in primal and ordinary reverse, with complete
-  module/call-graph and size-growth checks; changed optimizer flags do not count.
+  at three, seven and eleven lanes. Default CPU XLA on Reactant 0.2.290 can
+  replace these pure shared guards with selections and speculate floating-point
+  logarithms/division. The tested selected values and ordinary gradients still
+  agree with native Julia, including negative and zero scales. This is a
+  compiler-policy observation, not by itself a correctness defect.
+  `repro_reactant_pure_lazy_guard.jl` isolates it without ReactiveKernels;
+  `test_invariant_plate_branches_reactant.jl` keeps numerical, ownership and
+  size-growth acceptance, with executable inventories as diagnostics.
+  `probe_reactant_late_branch_barrier.jl` preserves additional executable
+  branch regions as an experiment using private compiler APIs. It establishes
+  no requirement to adopt that stronger execution policy, create a strict mode
+  or change ordinary defaults. A barrier before AD instead fails because its
+  backend adjoint is missing. Required branch effects and invalid-access safety
+  still need their own acceptance; pure-arithmetic parity does not certify them.
   Lane-dependent conditions still reach the backend's small-batch boundary.
   Default optimized reverse expands those small lazy batches into one branch
   region per lane instead of retaining the batch loop:

@@ -28,6 +28,7 @@ using ReactiveKernelsPPLExamples: EightSchoolsExample,
     GLMM1ModelExample, Bym2OffsetOnlyExample, BonesModelExample, MultiOccupancyExample
 using Test
 
+include(joinpath(@__DIR__, "..", "..", "..", "test", "test_native_bdf.jl"))
 include("test_gp_first_use.jl")
 include("test_startup_initialization.jl")
 include("test_ppl_workflow.jl")
