@@ -323,6 +323,7 @@ end
 if "core" in _SELECTED_REACTANT_SUITES
 include("test_error_policy_reactant.jl")
 include("test_precompiled_prepared_reactant.jl")
+include("test_source_world_age_reactant.jl")
 @testset "Reactant optional compiler integration" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsReactantExt) !== nothing
 

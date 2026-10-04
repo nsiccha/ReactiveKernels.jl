@@ -29,9 +29,9 @@
 #
 # Soundness: the fused operation's callable is a module-anonymous function
 # with no captured fields, so its free symbols resolve in
-# `parentmodule(op.f)`. Decomposition resolves every free symbol against that
-# module, requires the binding to be `const`, and emits `GlobalRef`s to those
-# exact bindings — never name-based guesses. Module-qualified callees
+# the native source closure's defining module. Decomposition resolves every
+# free symbol against that module, requires the binding to be `const`, and emits
+# `GlobalRef`s to those exact bindings — never name-based guesses. Module-qualified callees
 # (`Pkg.f`) resolve through the same rule, requiring every path segment to be
 # a `const` module binding. Any source shape outside the grammar (keyword
 # calls other than constant-`dims` reductions, a non-`const` global, a call
@@ -487,14 +487,15 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
                                   input_types, lhs)
     op = r.op
     kernel_sourceop_form(op) === :fused || return nothing
-    fieldcount(typeof(op.f)) == 0 || return nothing     # capturing closure
+    source_f = _kernel_native_source(op.f)
+    fieldcount(typeof(source_f)) == 0 || return nothing # capturing closure
     argmap = Dict{Symbol,Any}()
     argtypes = Dict{Symbol,Any}()
     for (v, aexpr, at) in zip(r.inputs, callargs, input_types)
         argmap[v.name] = aexpr
         argtypes[v.name] = at
     end
-    ctx = _FusedDecomposition(parentmodule(typeof(op.f)), argmap, argtypes,
+    ctx = _FusedDecomposition(parentmodule(typeof(source_f)), argmap, argtypes,
                               Any[], Any[], Any[], length(prog.ops))
     d = _decompose(ctx, r.source, false)
     d === nothing && return nothing

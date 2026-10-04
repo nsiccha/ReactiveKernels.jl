@@ -117,6 +117,48 @@ _KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF,
 # in both modes.
 _KernelSourceOp(token::Val, form::Val, f) = _KernelSourceOp(token, form, f, f)
 
+# A runtime authoring expression can create a source method newer than its
+# caller's world. Keep ordinary, inlineable closure execution whenever that
+# method is visible. A generated body carries explicit lexical captures for
+# immediate execution of newly composed expressions, including ordinary AD.
+# Bodies with Julia's local function/macro/exception scopes keep native lowering.
+struct _KernelSourceFunction{F,RF,C} <: Function
+    f::F
+    runtime_f::RF
+    captures::C
+end
+
+_kernel_native_source(f) = f
+_kernel_native_source(f::_KernelSourceFunction) = f.f
+
+@inline @generated function (f::_KernelSourceFunction)(args::Vararg{Any,N}) where {N}
+    forwarded = [:(getfield(args, $index)) for index in 1:N]
+    argtypes = Tuple{args...}
+    quote
+        # The type-only query uses the caller's world without boxing active
+        # argument values into a method-lookup array during ordinary AD.
+        if hasmethod(f.f, $argtypes)
+            Base.@inline f.f($(forwarded...))
+        else
+            Base.@inline _kernel_runtime_source_call(
+                f.runtime_f, f.f, f.captures, $(forwarded...))
+        end
+    end
+end
+
+@inline @generated function _kernel_runtime_source_call(
+        runtime_f, f, captures, args::Vararg{Any,N}) where {N}
+    forwarded = [:(getfield(args, $index)) for index in 1:N]
+    :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+        runtime_f, captures, $(forwarded...)))
+end
+
+@inline function _kernel_runtime_source_call(::Nothing, f, captures,
+                                            args::Vararg{Any,N}) where {N}
+    result_type = Core.Compiler.return_type(f, typeof(args))
+    Base.invokelatest(f, args...)::(result_type === Union{} ? Any : result_type)
+end
+
 # Optional tracing extensions classify their scalar/array argument types as
 # tensorized.  The tuple fold is ordinary Julia dispatch over argument types,
 # so it is resolved while tracing rather than becoming data-dependent control
