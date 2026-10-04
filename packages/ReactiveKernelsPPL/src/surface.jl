@@ -162,6 +162,7 @@ RKPPLSubmodel(name, args, body, mod) =
 RKPPLSubmodel(name, args, body, mod, kwdefaults) =
     RKPPLSubmodel(name, args, body, mod, kwdefaults, Expr[], Dict{Symbol,ColumnData}())
 _submodel_args(sm::RKPPLSubmodel) = [sm.argnames; first.(sm.kwdefaults)]
+sampling_fragment(sm::RKPPLSubmodel) = sm
 
 """True for the submodel-definition head `sm(args...) = begin ... end`."""
 _is_submodel_def(body) =
@@ -904,7 +905,7 @@ function _ordinary_sampling(s)
     rhs = s.rhs
     return rhs isa Expr && rhs.head === :call &&
         rhs.args[1] in union(keys(_PARAM_FAMILIES),
-            (:HalfNormal, :HalfCauchy, :Flat, :truncated, :restricted))
+            (:HalfNormal, :HalfCauchy, :Flat, :truncated, :restricted)) || _external_rhs(rhs)
 end
 
 function _bind_parameter_terms!(predictors, structured)
@@ -1242,12 +1243,20 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
             Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}(), ctx,
             Dict{Symbol,Tuple{Symbol,Symbol}}())
     responses = LikelihoodSpec[]
+    external_observations = SampledParameter[]
     predictors = PredictorSpec[]
     coefuse = Dict{Symbol,Vector{Tuple{Symbol,Symbol,Int}}}()
     glmuse = Dict{Symbol,Tuple{Symbol,Symbol}}()
     for s in sample
         # Declared arrays lower with the parameters.
         s.dims !== nothing && continue
+        _external_rhs(s.rhs) && s.lhs in conditioned && continue
+        if _external_rhs(s.rhs) && s.broadcast && (s.lhs in data || s.lhs in ctx.vecdefs)
+            args = _external_parameter(s.lhs, s.rhs, (), mod, ctx.taken;
+                observed=true, broadcast=true)
+            push!(external_observations, SampledParameter(s.lhs, :external, args, nothing, s.lhs))
+            continue
+        end
         if s.broadcast
             # Broadcast coefficient priors lower with their factor term.
             s.levels !== nothing && continue
@@ -1394,7 +1403,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     append!(params, taus)
     append!(params, hsparams)
     plate_parameters = PlateParameter[
-        _lower_plate_parameter(nm, rhs, rng, coefuse, ctx.matrices)
+        _lower_plate_parameter(nm, rhs, rng, coefuse, ctx.matrices, ctx)
         for (nm, rhs, rng, _) in plate_specs]
     used_locs = Set{Symbol}()
     # Composed sub-predictors are locations too (interned LP nodes).
@@ -1434,6 +1443,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # other consumers, including reductions, extracted leaves and the
     # retained recurrence body. Keep their definition dependencies too.
     needed = copy(declaration_dependencies)
+    for observation in external_observations
+        push!(needed, observation.name)
+        union!(needed, _value_symbols(observation.args.rhs))
+    end
     for p in arrays, d in p.dims
         union!(needed, _value_symbols(d))
     end
@@ -1560,7 +1573,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
-        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned,
+        array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
         indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
             Set{Symbol}(r.response for r in responses)))
     _confirm_whole_value_data(plan, rawdata; whole)
@@ -1784,7 +1797,12 @@ end
 # A per-cell latent declaration reuses the scalar-parameter distribution
 # parsing (family, args, HalfNormal/truncated → :positive) and rides the
 # plate's range.
-function _lower_plate_parameter(name::Symbol, rhs, range, coefuse, matrices)
+function _lower_plate_parameter(name::Symbol, rhs, range, coefuse, matrices, ctx)
+    if _external_rhs(rhs)
+        args = _external_parameter(name, rhs, (), ctx.mod, ctx.taken;
+            observed=name in ctx.conditioned, broadcast=true)
+        return PlateParameter(name, :external, args, nothing, range, name)
+    end
     sp = _lower_parameter(name, rhs, coefuse, matrices)
     return PlateParameter(sp.name, sp.family, sp.args, sp.support_override,
         range, sp.label)
@@ -4745,7 +4763,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                 continue
             end
             _reject_derived_ref_lhs(st.args[2], detnames)
-            arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames)
+            arr = _external_array_lhs(st.args[2], st.args[3], data, valueaxisnames)
+            arr === nothing && (arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames))
             if arr !== nothing
                 alhs, adims = arr
                 _claim!(seen, seelines, alhs, line)
@@ -5516,11 +5535,11 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
         (_is_sample(c) || _is_broadcast_sample(c)) ||
             _sfail("cells hold `~` observations and `=` assignments only")
         lnames = Set(first.(locals))
-        function arg(ex)
+        function arg(ex; object=false)
             Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
                 ex.args[1] isa Symbol && ex.args[1] ∉ lnames && return ex
             if ex isa Expr && (ex.head === :call || _is_dotted_call(ex)) &&
-                    !isempty(ex.args) && _cell_object_call(ex.args[1])
+                    !isempty(ex.args) && (_cell_object_call(ex.args[1]) || object)
                 vals = ex.head === :call ? ex.args[2:end] : ex.args[2].args
                 return Expr(:call, ex.args[1], map(arg, vals)...)
             end
@@ -5534,7 +5553,7 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
             end
             return ex
         end
-        obj = arg(localread(c.args[3]))
+        obj = arg(localread(c.args[3]); object=true)
         append!(out, _desugar_cell_sample(Expr(:call, c.args[1], c.args[2], obj),
             ivar, rkind, line, data, plate_defs, ctx, params, pidx))
     end
@@ -6059,7 +6078,7 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     bares = _cell_bares(obj, ivar, data)
     setdiff!(bares, plate_defs)
     push!(ctx, (col, line, bares))
-    obj isa Expr && (obj.head === :call || obj.head === :.) || _sfail(
+    (obj isa Expr && (obj.head === :call || obj.head === :.) || _external_rhs(obj)) || _sfail(
         "cell objects are distribution calls " *
         "(`y[$ivar] ~ Normal(mu[$ivar], s)`), got $(repr(obj))")
     # One draw per index: the broadcast form of the object is the
@@ -6067,6 +6086,11 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     # their dotted form even over scalar-only arguments — `y[i] ~ Normal(0,
     # 1)` observes every row).
     obj, _ = _dotify_cell(obj, ivar, pidx, true)
+    # An open RHS constructor at the root is applied once per authored
+    # iteration, including qualified and lowercase caller bindings.
+    if _external_rhs(obj) && Meta.isexpr(obj, :call)
+        obj = Expr(:., obj.args[1], Expr(:tuple, obj.args[2:end]...))
+    end
     if rkind[1] === :coloncall
         # Literal ranges validate through the slice-A `y[a:b]` path
         # (start-1, literal endpoints, bind-time cover check).
@@ -7050,7 +7074,10 @@ function _resolve_submodel(rhs, mod::Module)
     head isa Symbol || return nothing
     isdefined(mod, head) || return nothing
     val = getfield(mod, head)
-    return val isa RKPPLSubmodel ? val : nothing
+    fragment = sampling_fragment(val)
+    (fragment === nothing || fragment isa RKPPLSubmodel) ||
+        _sfail("sampling_fragment for $head must return RKPPLSubmodel or nothing")
+    return fragment
 end
 
 # Reserve the complete reachable source vocabulary before allocating any
@@ -7827,6 +7854,11 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol})
     elseif st.head === :for && length(st.args) == 2
         return Expr(:for, st.args[1],
             _resolve_submodel_stmt(st.args[2], sm, names))
+    end
+    if (_is_sample(st) || _is_broadcast_sample(st)) && _external_rhs(last(st.args)) &&
+            _resolve_submodel(last(st.args), sm.mod) === nothing
+        return Expr(:call, st.args[1], st.args[2],
+            _resolve_module_calls(st.args[3], sm.mod, names, "submodel sampling RHS"))
     end
     (st.head === :(=) && length(st.args) == 2 &&
         (st.args[1] isa Symbol || Meta.isexpr(st.args[1], :ref))) || return st
@@ -12867,6 +12899,16 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
     arrays = ArrayParameter[]
     for s in sample
         (s.lhs in ctx.data || s.lhs in ctx.derived_responses) && continue
+        if _external_rhs(s.rhs)
+            shape = s.dims === nothing ? Any[] : s.dims
+            args = _external_parameter(s.lhs, s.rhs, shape, ctx.mod, ctx.taken;
+                observed=s.lhs in ctx.conditioned, broadcast=s.broadcast)
+            p = isempty(shape) ? SampledParameter(s.lhs, :external, args, nothing, s.lhs) :
+                ArrayParameter(s.lhs, :external, args, shape, nothing, s.lhs)
+            push!(isempty(shape) ? params : arrays, p)
+            union!(syms, _value_symbols(args.rhs))
+            continue
+        end
         if s.slices === :per_level
             haskey(coefuse, s.lhs) && _sfail("$(s.lhs) is a predictor " *
                 "coefficient and cannot also be an LKJCholesky factor")

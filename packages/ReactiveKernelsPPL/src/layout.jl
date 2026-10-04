@@ -160,7 +160,13 @@ struct LayoutEntry
     hi::Union{Float64,Symbol,Expr} # constrained upper bound (else NaN)
     dims::Vector{Int} # declared-array axes, including :cholesky_corr (else empty)
     scan_blocks::Vector{LayoutEntry} # structural latent-family blocks (else empty)
+    sampling::Union{Nothing,NamedTuple} # external RHS and its geometry
 end
+LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
+    labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
+    lo, hi, dims::Vector{Int}, blocks::Vector{LayoutEntry}) =
+    LayoutEntry(kind, predictor, name, labels, offset, size, transform, lo, hi,
+        dims, blocks, nothing)
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
     lo, hi, dims::Vector{Int}) =
@@ -397,6 +403,12 @@ function assign_layout(plan::StructuralPlan)
     end
     for p in plan.parameters
         p.name in plan.conditioned && continue
+        if p.family === :external
+            entry = _external_layout_entry(plan, p, offset, Int[])
+            push!(entries, entry)
+            offset += entry.size
+            continue
+        end
         transform, lo, hi = _entry_transform(p.family,
             _bound_override(plan, p.support_override),
             p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
@@ -407,6 +419,14 @@ function assign_layout(plan::StructuralPlan)
     end
     for p in plan.plate_parameters
         p.name in plan.conditioned && continue
+        if p.family === :external
+            size = _plate_rows(plan, p)
+            labels = [Symbol(p.name, ".", i) for i in 1:size]
+            push!(entries, LayoutEntry(:external_plate, nothing, p.name, labels,
+                offset, size, :external, NaN, NaN, Int[], LayoutEntry[], p.args))
+            offset += size
+            continue
+        end
         transform, lo, hi =
             _entry_transform(p.family, _bound_override(plan, p.support_override),
                 p.family === :uniform ? map(x -> _layout_bound(plan, x), p.args) : p.args)
@@ -1056,7 +1076,7 @@ function coordinate_names(layout::LayoutTable)
             for i in 1:e.size
                 push!(names, Symbol(_draw_name(layout, e.name) * "." * string(i)))
             end
-        elseif e.kind === :vector || e.kind === :array
+        elseif e.kind === :vector || e.kind === :array || e.kind === :external || e.kind === :external_plate
             append!(names, [_authored_coordinate(layout, e.name, label)
                 for label in e.labels])
         elseif e.kind === :varying_corr || e.kind === :cholesky_corr
@@ -1167,7 +1187,7 @@ end
 
 # Bounds read the same constrained values and ordinary definitions as the
 # graph. Packing order stays fixed; evaluation follows bound dependencies.
-_dynamic_bounds(e::LayoutEntry) = !(e.lo isa Real && e.hi isa Real) ||
+_dynamic_bounds(e::LayoutEntry) = e.sampling !== nothing || !(e.lo isa Real && e.hi isa Real) ||
     any(_dynamic_bounds, e.scan_blocks)
 function _layout_lookup(layout::LayoutTable, values)
     active = Set{Symbol}()
@@ -1185,7 +1205,7 @@ function _layout_lookup(layout::LayoutTable, values)
     return lookup
 end
 function _resolved_entry(layout::LayoutTable, e::LayoutEntry, values)
-    _dynamic_bounds(e) || return e
+    (_dynamic_bounds(e) && e.sampling === nothing) || return e
     lookup = _layout_lookup(layout, values)
     resolve(x) = x isa Real ? Float64(x) :
         _eval_value_expr(x, lookup, e.name)
@@ -1215,7 +1235,12 @@ function _bound_entry_order(layout::LayoutTable)
         push!(active, name)
         if haskey(byname, name)
             e = byname[name]
-            for block in (e, e.scan_blocks...), x in (block.lo, block.hi), dep in _value_symbols(x)
+            reads = Any[e.lo, e.hi]
+            e.sampling === nothing || push!(reads, e.sampling.rhs)
+            for block in e.scan_blocks
+                append!(reads, (block.lo, block.hi))
+            end
+            for x in reads, dep in _value_symbols(x)
                 visit(dep)
             end
             push!(out, e)
@@ -1254,7 +1279,17 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     for entry in _bound_entry_order(layout)
         e = _resolved_entry(layout, entry, values)
         seg = u[e.offset:(e.offset + e.size - 1)]
-        if e.kind === :coefficient
+        if e.kind === :external_plate
+            args = _external_host_args(layout, e, values)
+            v = _external_host_cells(e, :constrain, seg, args)
+            push!(pairs, e.name => v)
+        elseif e.kind === :external
+            args = _external_host_args(layout, e, values)
+            v = _sampling_constrain(e.sampling.geometry, seg, Tuple(e.dims), args...)
+            (isempty(e.dims) ? v isa Number : v isa AbstractArray && size(v) == Tuple(e.dims)) ||
+                throw(ContractValidationError("[layout] external constrain for $(e.name) returned the wrong shape"))
+            push!(pairs, e.name => v)
+        elseif e.kind === :coefficient
             p = e.predictor::Symbol
             p in seen_coef && continue
             push!(seen_coef, p)
@@ -1368,7 +1403,21 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
     seen_coef = Set{Symbol}()
     for entry in layout.entries
         e = _resolved_entry(layout, entry, nt)
-        if e.kind === :coefficient
+        if e.kind === :external_plate
+            haskey(nt, e.name) || throw(ContractValidationError("[layout] missing parameter $(e.name)"))
+            v = nt[e.name]
+            v isa AbstractVector && length(v) == e.size ||
+                throw(ContractValidationError("[layout] external plate $(e.name) has the wrong shape"))
+            args = _external_host_args(layout, e, nt)
+            u[e.offset:(e.offset + e.size - 1)] .= _external_host_cells(e, :unconstrain, v, args)
+        elseif e.kind === :external
+            haskey(nt, e.name) || throw(ContractValidationError("[layout] missing parameter $(e.name)"))
+            args = _external_host_args(layout, e, nt)
+            v = e.sampling.geometry.unconstrain(nt[e.name], Tuple(e.dims), args...)
+            v isa AbstractVector && length(v) == e.size ||
+                throw(ContractValidationError("[layout] external inverse for $(e.name) returned the wrong packed dimension"))
+            u[e.offset:(e.offset + e.size - 1)] .= v
+        elseif e.kind === :coefficient
             p = e.predictor::Symbol
             p in seen_coef && continue
             push!(seen_coef, p)
@@ -1495,6 +1544,15 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
         e = _resolved_entry(layout, entry, values)
         e.transform === :identity && continue
         seg = u[e.offset:(e.offset + e.size - 1)]
+        if e.kind === :external_plate
+            args = _external_host_args(layout, e, values)
+            total += sum(_external_host_cells(e, :logjac, seg, args))
+            continue
+        elseif e.kind === :external
+            args = _external_host_args(layout, e, values)
+            total += _sampling_logjac(e.sampling.geometry, seg, Tuple(e.dims), args...)
+            continue
+        end
         if e.kind === :scan && !isempty(e.scan_blocks)
             for b in e.scan_blocks, i in b.offset:(b.offset + b.size - 1)
                 total += _logjac_elt(b, Float64(u[i]))
@@ -1617,6 +1675,12 @@ sampled entry (`:exp`/`:logistic`) splices the bijector's `constrain` endpoint,
 which the planner inlines.
 """
 function transform_statements(e::LayoutEntry)
+    e.kind === :external_plate && return Expr[
+        :($(e.name) = $(_external_cells_expr(e, :constrain))),
+        :($(_plate_logjac_name(e.name)) = $(_external_cells_expr(e, :logjac)))]
+    e.kind === :external && return Expr[
+        :($(_external_geometry_name(e)) = $(_external_geometry_expr(e))),
+        :($(e.name) = $(_external_edge(e, :_sampling_constrain)))]
     if e.kind === :scan && !isempty(e.scan_blocks)
         stmts = Expr[]
         for b in e.scan_blocks
@@ -1961,6 +2025,8 @@ declared LKJ entry reads the retained sum over the partials shared with its
 transform. Legacy structural-margin LKJ blocks sum their named scalar edges.
 """
 function jacobian_term(e::LayoutEntry)
+    e.kind === :external_plate && return :(sum($(_plate_logjac_name(e.name))))
+    e.kind === :external && return _external_edge(e, :_sampling_logjac)
     e.transform === :identity && return nothing
     if e.kind === :scan && !isempty(e.scan_blocks)
         terms = Any[jacobian_term(b) for b in e.scan_blocks if b.transform !== :identity]

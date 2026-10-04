@@ -1727,7 +1727,22 @@ struct StructuralPlan
     submodel_scopes::Vector{SubmodelScope}
     conditioned::Set{Symbol}
     indexed_observations::Set{Symbol}
+    external_observations::Vector{SampledParameter}
 end
+
+# The former full constructor has no external observations.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+    conditioned, indexed_observations) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
+        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, SampledParameter[])
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
@@ -1838,14 +1853,15 @@ function StructuralPlan(
         array_parameters::Vector{ArrayParameter} = ArrayParameter[],
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
-        indexed_observations::Set{Symbol} = Set{Symbol}())
+        indexed_observations::Set{Symbol} = Set{Symbol}(),
+        external_observations::Vector{SampledParameter} = SampledParameter[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
         kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
-        array_parameters, submodel_scopes, conditioned, indexed_observations)
+        array_parameters, submodel_scopes, conditioned, indexed_observations, external_observations)
 end
 
 """The horseshoe entries covering `pred` (empty when the predictor keeps
@@ -2445,6 +2461,9 @@ function validate_structure(plan::StructuralPlan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
     _validate_plate_parameters(plan)
+    for observation in plan.external_observations
+        _validate_external_parameter(plan, observation; observation=true)
+    end
     _validate_vector_parameters(plan)
     _validate_topo_order(plan)
     _validate_matrices(plan)
@@ -3285,7 +3304,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
     :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
     :r2d2_priors, :horseshoe_priors, :array_parameters, :kernel_plates,
-    :event_lps, :indexed_observations)
+    :event_lps, :indexed_observations, :external_observations)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -6390,6 +6409,10 @@ end
 function _validate_parameters(plan::StructuralPlan)
     names = _union_names(plan)
     for p in plan.parameters
+        if p.family === :external
+            _validate_external_parameter(plan, p)
+            continue
+        end
         observed_binomial = p.family === :binomial && p.name in plan.conditioned
         (observed_binomial || haskey(SAMPLED_ARITY, p.family)) || _fail(
             p.label,
@@ -6533,6 +6556,15 @@ end
 # consuming response's axis; `nothing` infers that axis at binding.
 function _validate_plate_parameters(plan::StructuralPlan)
     for p in plan.plate_parameters
+        if p.family === :external
+            _validate_external_parameter(plan, p)
+            if p.name ∉ plan.conditioned
+                p.args.geometry.shape == () || _fail(p.label, "plate geometry must be scalar")
+                p.args.geometry.unconstrained == 1 || _fail(p.label,
+                    "a scalar plate cell needs one packed coordinate; declare an array for joint geometry")
+            end
+            continue
+        end
         haskey(SAMPLED_ARITY, p.family) || _fail(p.label,
             "plate family $(p.family) not in the slice-1 set " *
             "($(join(sort!(collect(keys(SAMPLED_ARITY))), ", ")))")
@@ -6788,7 +6820,7 @@ function topological_order(plan::StructuralPlan)
         refs = Set{Symbol}()
         for v in (values(p.args)..., _support_args(p.support_override)...)
             for ref in _value_symbols(v)
-                (ref in names || (p.family === :binomial && p.name in plan.conditioned &&
+                (ref in names || p.family === :external || (p.family === :binomial && p.name in plan.conditioned &&
                     (!isbound(plan) || haskey(plan.columns,ref)))) ||
                     _fail(p.label, "bound or arg references unknown name $ref")
                 ref in names && push!(refs, ref)
@@ -10679,6 +10711,16 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     for ps in (plan.parameters, plan.array_parameters), p in ps
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
+        p.family === :external && p.name in plan.conditioned && push!(defs,
+            Symbol(:_ppl_external_value_, p.name) =>
+                Expr(:call, GlobalRef(Base, :identity), p.name))
+    end
+    # Open densities receive ordinary whole values. Their explicit broadcast
+    # has its own Julia axes, independent of a legacy response's row axis.
+    for p in plan.external_observations
+        push!(defs, Symbol(:_ppl_external_value_, p.name) =>
+            Expr(:tuple, (Expr(:call, GlobalRef(Base, :identity), value)
+                for value in (p.name, p.args.rhs))...))
     end
     # A matrix read only for a declared axis is a whole preparation input.
     # Its row count does not become an observation count. In contrast, a
@@ -10724,8 +10766,11 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             :submodel_scopes) && continue
         if f === :parameters
             for p in plan.parameters
+                p.family === :external && p.name in plan.conditioned && continue
                 delete!(free, p.name)
             end
+        elseif f === :external_observations
+            continue
         elseif f === :vector_parameters
             for p in plan.vector_parameters
                 delete!(free, p.name)
@@ -11462,6 +11507,7 @@ function _validate_conditioned_values(plan)
     for p in plan.parameters
         p.name in plan.conditioned || continue
         push!(known, p.name)
+        p.family === :external && continue
         plan.columns[_conditioned_input(p.name)] isa Number ||
             _fail(:condition, "$(p.name) is scalar; broadcast an observation vector with `.~`")
         if p.family === :binomial
