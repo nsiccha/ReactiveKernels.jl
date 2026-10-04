@@ -4185,221 +4185,77 @@ end
     _check_gradient(gk.spec, gb, zeros(gk.layout.total))
 end
 
-# ── Fused-GLM stream fixtures for predictor pins ─────────────────────────
-# A fused def carries the affine INSIDE (design + coefficients ride formal
-# positions). Without a pin the location local namespaces under the data
-# LHS (`y_mu`) or an inline compound synthesizes (`y_eta`); a
-# `predictor = ...` use-site pin names the lowered predictor instead (see
-# "surface stream predictor pins").
-@rkppl pin_fused(x1, b1) = begin
+# A stream keeps its local quantities in its own scope. A latent return can
+# bind a quantity at an explicitly authored use-site name.
+@rkppl stream_fused(x1, b1) = begin
     mu = b1 .* x1
     slot .~ Bernoulli.(logistic.(mu))
-    slot
+    return slot
 end
-@rkppl pin_inline(x1, b1) = begin
+@rkppl stream_inline(x1, b1) = begin
     slot .~ Bernoulli.(logistic.(b1 .* x1))
-    slot
+    return slot
 end
-@rkppl pin_fusedhead(x1, b1) = begin
+@rkppl stream_fusedhead(x1, b1) = begin
     mu = b1 .* x1
     slot .~ BernoulliLogit.(mu)
-    slot
+    return slot
 end
-@rkppl pin_cat(x1, b1) = begin
-    slot .~ CategoricalLogit.(b1 .* x1)
-    slot
-end
-@rkppl pin_simplex(sc) = begin
-    slot .~ Categorical(sc)
-    slot
-end
-@rkppl pin_latloc(sc) = begin
-    slot .~ Normal.(theta, sc)
-    slot
-end
-@rkppl pin_sharedloc(sc) = begin
-    slot .~ Normal.(w, sc)
-    slot
+@rkppl stream_affine(x1, b1) = begin
+    return b1 .* x1
 end
 
-@testset "surface stream predictor pins" begin
-    _pin_errmsg(f) = try
-        f()
-        ""
-    catch e
-        sprint(showerror, e)
-    end
-    # A pin names the lowered predictor: the fused def lowers exactly like
-    # the hand-written decomposed program (same predictor, same coef block).
-    got = lower_rkppl(quote
+@testset "surface streams and authored quantity names" begin
+    D = (:y, :x)
+    mod = @__MODULE__
+    fused = lower_rkppl(quote
         b ~ Normal(0, 2)
-        y ~ pin_fused(x, b; predictor = mu)
-    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    want = lower_rkppl(quote
+        y ~ stream_fused(x, b)
+    end, D; mod, conditioned = D)
+    hand = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y_mu = b .* x
+        y .~ Bernoulli.(logistic.(y_mu))
+    end, D; conditioned = D)
+    @test _plans_equal(fused, hand)
+    @test _test_scope_name(fused, only(fused.predictors).name) === :y_mu
+    inline = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ stream_inline(x, b)
+    end, D; mod, conditioned = D)
+    @test only(inline.predictors).name === :y_eta
+    fusedhead = lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ stream_fusedhead(x, b)
+    end, D; mod, conditioned = D)
+    @test _plans_equal(fusedhead, hand)
+    named = @rkppl begin
+        b ~ Normal(0, 2)
+        mu ~ stream_affine(x, b)
+        y .~ Bernoulli.(logistic.(mu))
+    end
+    decomposed = @rkppl begin
         b ~ Normal(0, 2)
         mu = b .* x
         y .~ Bernoulli.(logistic.(mu))
-    end, (:y, :x); conditioned = (:y, :x))
-    @test _plans_equal(got, want)
-    @test only(got.predictors).name === :mu
-    @test got.responses[1].predictor === :mu
-    @test all(pr -> pr.predictor === :mu, got.population_priors)
-    @test isempty(got.derived)
-    # An inline-compound fused def pins the same way (no local needed).
-    goti = lower_rkppl(quote
-        b ~ Normal(0, 2)
-        y ~ pin_inline(x, b; predictor = mu)
-    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    @test _plans_equal(goti, want)
-    # A fused head inside a pinned def composes (the fused spelling rides
-    # the pinned predictor).
-    gotfh = lower_rkppl(quote
-        b ~ Normal(0, 2)
-        y ~ pin_fusedhead(x, b; predictor = mu)
-    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    @test _plans_equal(gotfh, want)
-    # Without a pin the default names are unchanged (namespaced local /
-    # synthetic compound).
-    unp = lower_rkppl(quote
-        b ~ Normal(0, 2)
-        y ~ pin_fused(x, b)
-    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    @test _test_scope_name(unp, only(unp.predictors).name) === :y_mu
-    unpi = lower_rkppl(quote
-        b ~ Normal(0, 2)
-        y ~ pin_inline(x, b)
-    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    @test only(unpi.predictors).name === :y_eta
-    # Pinning the name the default would synthesize is a no-op.
-    noop = lower_rkppl(quote
-        b ~ Normal(0, 2)
-        y ~ pin_fused(x, b; predictor = y_mu)
-    end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    @test only(noop.predictors).name === :y_mu
-    # Two use sites pin distinct predictors (multi-use stays safe; each
-    # predictor keeps its own coefficient — blocks are per-predictor).
-    two = lower_rkppl(quote
-        b1 ~ Normal(0, 2)
-        b2 ~ Normal(0, 2)
-        y1 ~ pin_fused(x, b1; predictor = mu1)
-        y2 ~ pin_fused(x, b2; predictor = mu2)
-    end, (:y1, :y2, :x); mod = @__MODULE__, conditioned = (:y1, :y2, :x))
-    @test Set(p.name for p in two.predictors) == Set([:mu1, :mu2])
-    # A pin over a latent location names the latent predictor.
-    gotl = lower_rkppl(quote
-        @plate for i in eachindex(y)
-            theta[i] ~ Normal(0, 1)
-        end
-        s ~ Exponential(1)
-        y ~ pin_latloc(s; predictor = mu)
-    end, (:y,); mod = @__MODULE__, conditioned = (:y,))
-    @test only(gotl.predictors).name === :mu
-    @test only(gotl.predictors).terms[1].kind === LatentTerm
-    # End-to-end: the pinned program binds, builds and queries identically
-    # to the decomposed twin — including the posterior label (`mu`, not
-    # `y_mu`).
+    end
     cols, _ = _gen_columns()
     yb = repeat([false, true], 3)
-    mp = @rkppl begin
-        b ~ Normal(0, 2)
-        y ~ pin_fused(x, b; predictor = mu)
-    end
-    md = @rkppl begin
-        b ~ Normal(0, 2)
-        mu = b .* x
-        y .~ Bernoulli.(logistic.(mu))
-    end
-    bp = (mp(; x = cols[:x]) | (; y = yb))
-    bd = (md(; x = cols[:x]) | (; y = yb))
-    @test _plans_equal(bp, bd)
-    builtp = build_kernel(bp)
+    bound = named(; x = cols[:x]) | (; y = yb)
+    twin = decomposed(; x = cols[:x]) | (; y = yb)
+    @test _plans_equal(bound, twin)
+    @test only(bound.predictors).name === :mu
+    built = build_kernel(bound)
     u = [0.5]
-    @test propertynames(constrain(builtp.layout, u)) == (:b,)
-    @test _query(builtp.spec, bp, :posterior, u) ≈
-        _query(build_kernel(bd).spec, bd, :posterior, u)
-    _check_gradient(builtp.spec, bp, u)
-    # Fail-closed: two responses pinning one predictor name.
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            b ~ Normal(0, 2)
-            y1 ~ pin_fused(x, b; predictor = mu)
-            y2 ~ pin_fused(x, b; predictor = mu)
-        end, (:y1, :y2, :x); mod = @__MODULE__, conditioned = (:y1, :y2, :x))
-    # Fail-closed: one response pinning two predictors.
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            b ~ Normal(0, 2)
-            y ~ pin_fused(x, b; predictor = mu1)
-            y ~ pin_inline(x, b; predictor = mu2)
-        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    # Fail-closed: a pin on a latent (value-returning) call.
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            sig ~ sub_scale(1.0; predictor = mu)
-            mu = a .+ b .* x
-            y .~ Normal.(mu, sig)
-        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    # Fail-closed: a pin claiming a taken name.
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            a ~ Normal(0, 1)
-            b ~ Normal(0, 2)
-            mu = a .+ b .* x
-            y ~ pin_fused(x, b; predictor = mu)
-        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    # Fail-closed: a pin on a multi-predictor (leveled) response.
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            b ~ Normal(0, 2)
-            y ~ pin_cat(x, b; predictor = mu)
-        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    # Fail-closed: a pin on a predictorless (simplex) response.
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            s ~ Dirichlet(2, 1.0)
-            y ~ pin_simplex(s; predictor = mu)
-        end, (:y,); mod = @__MODULE__, conditioned = (:y,))
-    # Fail-closed: a non-Symbol pin and an unknown keyword.
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            b ~ Normal(0, 2)
-            y ~ pin_fused(x, b; predictor = "mu")
-        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    # refused: foo is not a submodel keyword (Julia signature, P3)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            b ~ Normal(0, 2)
-            y ~ pin_fused(x, b; foo = 1)
-        end, (:y, :x); mod = @__MODULE__, conditioned = (:y, :x))
-    # Fail-closed: a pin cannot fork a shared location (either order, either
-    # claimant shape).
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            w = a .+ b .* x
-            z .~ Normal.(w, 1.0)
-            s ~ Exponential(1)
-            y ~ pin_sharedloc(s; predictor = mu)
-        end, (:z, :y, :x); mod = @__MODULE__, conditioned = (:z, :y, :x))
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            w = a .+ b .* x
-            s ~ Exponential(1)
-            y ~ pin_sharedloc(s; predictor = mu)
-            z .~ Normal.(w, 1.0)
-        end, (:y, :z, :x); mod = @__MODULE__, conditioned = (:y, :z, :x))
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            w = a .+ b .* x
-            s ~ Exponential(1)
-            y1 ~ pin_sharedloc(s; predictor = mu1)
-            y2 ~ pin_sharedloc(s; predictor = mu2)
-        end, (:y1, :y2, :x); mod = @__MODULE__, conditioned = (:y1, :y2, :x))
-    # Fail-closed: a pin claiming a synthesized predictor name.
-    # refused: predictor= pin is retired by the author-name contract (1cmodra names)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            b ~ Normal(0, 2)
-            z .~ Bernoulli.(logistic.(b .* x))
-            y ~ pin_fused(x, b; predictor = z_eta)
-        end, (:z, :y, :x); mod = @__MODULE__, conditioned = (:z, :y, :x))
+    @test propertynames(constrain(built.layout, u)) == (:b,)
+    @test _query(built.spec, bound, :posterior, u) ≈
+        _query(build_kernel(twin).spec, twin, :posterior, u)
+    _check_gradient(built.spec, bound, u)
+    # Refused: USER 1cmodra retires the undeclared predictor keyword.
+    @test_throws "unknown keyword `predictor`" lower_rkppl(quote
+        b ~ Normal(0, 2)
+        y ~ stream_fused(x, b; predictor = mu)
+    end, D; mod, conditioned = D)
 end
 
 # ── Per-cell submodels inside `@plate` (StanBlocks parity) ────────────────
@@ -4599,12 +4455,9 @@ end
     # refused: a data LHS observes a stream; a latent submodel value is conditioned through `|` / `condition` (P9, 18h1h54; 10gzbm9)
     @test_throws SurfaceLoweringError lower_rkppl(
         _pcs(:(y[i] ~ pcs_centered(mu, tau))), D; mod = M, conditioned = D)
-    # A cell observation may name its predictor with a free use-site pin.
-    pinned = lower_rkppl(
+    # Refused: USER 1cmodra retires the undeclared predictor keyword in cells.
+    @test_throws "unknown keyword `predictor`" lower_rkppl(
         _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = qpin))), D; mod = M, conditioned = D)
-    @test only(pinned.responses).predictor === :qpin
-    @test_throws "already taken" lower_rkppl(
-        _pcs(:(y[i] ~ pcs_obs(mu, sigma; predictor = mu))), D; mod = M, conditioned = D)
     # Without a submodel binding in scope, an unknown call head stays an
     # ordinary per-cell distribution error (no submodel capture).
     # refused: undefined submodel/distribution not_a_submodel

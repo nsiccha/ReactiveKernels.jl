@@ -622,6 +622,13 @@ Submodels also accept declared keyword defaults and statement replacements:
 `custom = merge(linear_pk_log_f, :(slope ~ Normal(0, 0.5)))` returns a new
 library body, which a program uses as `log_F ~ custom(sched; k = 5)`.
 
+Submodel calls accept only their declared keywords. The legacy undeclared
+`predictor = name` shortcut is rejected. Bind a returned quantity with an
+ordinary assignment or declaration to give it an explicit use-site name;
+a declared keyword named `predictor` keeps its ordinary argument meaning.
+Catalogue spellings such as `r2d2`, `spline_basis`, and `dummy` are also
+ordinary quantity names in declarations and assignments.
+
 Each call owns a lexical namespace. For `z ~ sm(x)`, `z.b` reads the
 submodel's local `b`, and bare `z` is the actual returned Julia value in
 arithmetic and function arguments. Nested calls compose paths: `z.w.b`.

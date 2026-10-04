@@ -273,12 +273,6 @@ end
             y .~ Normal.(mu, sigma)
             sigma ~ Exponential(1)
         end, (:y, :x, :g); conditioned = (:y, :x, :g)); true)
-    # Reserved names.
-    # refused: reserved name `dummy`
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            dummy ~ Normal(0, 1)
-            y .~ Normal.(mu, 1.5)
-        end, (:y,); conditioned = (:y,))
 end
 
 @testset "varying contract validation" begin

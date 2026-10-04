@@ -272,17 +272,6 @@ end
             mu = a .+ w
             y .~ Normal.(mu, 1.0)
         end, (:y, :x); conditioned = (:y, :x))) === nothing
-    # Reserved names.
-    # refused: reserved-name collision `spline`
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            spline = 1.0
-            y .~ Normal.(mu, 1.0)
-        end, (:y,); conditioned = (:y,))
-    # refused: reserved-name collision `spline_basis`
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            spline_basis ~ Normal(0, 1)
-            y .~ Normal.(mu, 1.0)
-        end, (:y,); conditioned = (:y,))
     # Generated-name claims: user definitions cannot collide.
     # refused: single assignment, collides with basis-claimed `b_s_x_fixed`
     @test_throws SurfaceLoweringError lower_rkppl(quote

@@ -29,7 +29,7 @@ function _smf_outcome(ast, data; mod = _SMF)
 end
 
 function _smf_expand(ast, data = Set{Symbol}())
-    expanded, _, scopes = ReactiveKernelsPPL._expand_submodels(ast,
+    expanded, scopes = ReactiveKernelsPPL._expand_submodels(ast,
         Set{Symbol}(data), _SMF; with_scopes = true)
     return _test_scope_alpha(expanded, _test_scope_renames(scopes))
 end
@@ -613,7 +613,7 @@ end
         y .~ Normal.(v, 1.0)
     end, D; mod = _SMF, conditioned = D))
     # refused: predictor= is retired by the author-name contract (1cmodra names).
-    @test !isempty(msg)
+    @test occursin("unknown keyword `predictor`", msg)
     # A per-cell body holds scalar statements only.
     msg = _smf_errmsg(() -> lower_rkppl(Expr(:block,
         :(sigma ~ Exponential(1)),

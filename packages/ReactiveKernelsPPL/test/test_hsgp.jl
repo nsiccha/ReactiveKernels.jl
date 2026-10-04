@@ -210,19 +210,6 @@ end
             mu = a .+ h
             y .~ Normal.(mu, 1.0)
         end, (:y, :x); conditioned = (:y, :x))) === nothing
-    # refused: reserved-name collision `hsgp` (then calls a Float64)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            hsgp = 1.0
-            mu = a .+ hsgp(:h_x)
-            y .~ Normal.(mu, 1.0)
-            hsgp_basis(:h_x, x)
-        end, (:y, :x); conditioned = (:y, :x))
-    # refused: reserved-name collision `hsgp_basis`
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-            hsgp_basis = 1.0
-            mu = a .+ hsgp(:h_x)
-            y .~ Normal.(mu, 1.0)
-        end, (:y, :x); conditioned = (:y, :x))
     # Claims: user definitions cannot collide with sampled names.
     # refused: single assignment, user definition collides with basis-claimed `rho_h_x`
     @test_throws SurfaceLoweringError lower_rkppl(quote

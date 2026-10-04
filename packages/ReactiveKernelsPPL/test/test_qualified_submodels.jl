@@ -112,7 +112,7 @@ end
                 stream = kind === :stream,
                 cell_location = kind === :cell_sum ?
                     :(z[i] + z[i].nested.b) : :(z[i]))
-            expansion, _ = ReactiveKernelsPPL._expand_submodels(
+            expansion = ReactiveKernelsPPL._expand_submodels(
                 ast, Set((:x, :y)), @__MODULE__)
             push!(expanded, Base.remove_linenums!(deepcopy(expansion)))
             bound, built, u = _qs_build(ast, data)

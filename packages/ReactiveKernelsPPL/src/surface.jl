@@ -137,16 +137,6 @@ WITHOUT moving names, return the affine from a latent def and bind it at a
 named use site (`mu ~ affine_def(X, b)`, then `y .~ family.(...mu...)`): the
 use-site LHS names the predictor, and the plan is identical to the
 hand-written decomposed program.
-
-Alternatively, a stream use site pins the lowered predictor name directly
-(`y ~ fused_def(X, b; predictor = mu)`): the response's predictor is `mu`
-whether the def locates it by a local or inline, and the plan matches the
-decomposed program. A pin claims a fresh predictor name (once — a second
-claim fails); it renames one response's predictor, so the pinned location
-cannot lower under another name. Pins apply to single-predictor responses
-(a multi-eta categorical or a predictorless simplex response fails closed)
-at top-level and per-cell stream calls. A pin inside a submodel body fails
-closed.
 """
 struct RKPPLSubmodel
     name::Symbol
@@ -593,7 +583,7 @@ function _lower_model(m::RKPPLModel, supplied; conditioned = keys(m.conditioned)
     data = Set(keys(values))
     ast = Expr(:block, _desugar_destructuring(m.ast.args)...)
     scoped_values = Dict{Symbol,ColumnData}()
-    ast, pins, scopes = _expand_submodels(ast, data, m.mod; with_scopes = true,
+    ast, scopes = _expand_submodels(ast, data, m.mod; with_scopes = true,
         rewrites = m.rewrites, fixes = scoped, bound_values = scoped_values)
     merge!(values, scoped_values)
     used = Set{Symbol}()
@@ -618,7 +608,7 @@ function _lower_model(m::RKPPLModel, supplied; conditioned = keys(m.conditioned)
         arrays = Set{Symbol}(k for (k, v) in values if v isa AbstractArray &&
             (haskey(m.fixed, k) || haskey(scoped_values, k))))
     ast = _indexed_observation_definitions(ast, data)
-    plan = _lower_rkppl_once(ast, data, pins, m.mod;
+    plan = _lower_rkppl_once(ast, data, m.mod;
         submodel_scopes = scopes, conditioned = observed_parameters)
     for name in observed_parameters
         values[_conditioned_input(name)] = pop!(values, name)
@@ -840,13 +830,13 @@ function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
         if !any(a -> a isa Expr && _stmt_is_submodel_call(a, mod) &&
             _merge_stem(_stmt_lhs(_unwrap_trivia(a))) === n, ast.args))
     setdiff!(data, primitive)
-    ast, pins, scopes = _expand_submodels(ast, data, mod; with_scopes = true)
+    ast, scopes = _expand_submodels(ast, data, mod; with_scopes = true)
     observed_parameters = _conditioned_declarations(ast, observing)
     setdiff!(data, observed_parameters)
     _check_observed_inputs(ast, data, observing)
     ast, data = _scalar_value_definitions(ast, data, setdiff(scalars, observed_parameters))
     ast = _indexed_observation_definitions(ast, data)
-    return _lower_rkppl_once(ast, data, pins, mod;
+    return _lower_rkppl_once(ast, data, mod;
         submodel_scopes = scopes, conditioned = observed_parameters)
 
 end
@@ -919,7 +909,7 @@ function _bind_parameter_terms!(predictors, structured)
     end
 end
 
-function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
+function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
         value_defs::Set{Symbol} = Set{Symbol}())
@@ -1181,9 +1171,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         vecdefs, structural, derived_responses = derived_response_names,
         pred_idx,
         plate_names, absorbed = Set{Symbol}(),
-        predictor_pins = pins, pins_used = Set{Symbol}(),
-        pin_owner = Dict{Symbol,Symbol}(),
-        pin_source = Dict{Symbol,Tuple{Symbol,Symbol}}(),
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
         synth_assigns = AssignmentSpec[],
         negated = Dict{Symbol,Symbol}(),
@@ -1322,14 +1309,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     for g in glms
         push!(responses,
             _lower_glm_response(g, sample, prior_names, ctx, coefuse, glmuse))
-    end
-    # Every use-site pin must name a lowered predictor: a pin the response
-    # never claimed is a silent no-op, never a skip.
-    for (rlhs, pin) in ctx.predictor_pins
-        rlhs in ctx.pins_used || _sfail(
-            "response $rlhs pins predictor $pin, but the response lowered " *
-            "no predictor (nothing to pin — simplex responses and " *
-            "scan-state locations build none)")
     end
     _check_coefficient_uses(coefuse, ctx)
     for c in ctx.scan_coefs
@@ -1480,7 +1459,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     retained = setdiff(intersect(kept, Set(p.name for p in predictors)),
         value_defs)
     if semantic_first && !isempty(retained)
-        return _lower_rkppl_once(ast, input_data, pins, mod;
+        return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, retained))
     end
     assigns = AssignmentSpec[]
@@ -4782,18 +4761,6 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             end
             lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data,
                 level_bindings)
-            lhs === :dummy &&
-                _sfail("`dummy` is reserved (margin surface) and cannot " *
-                       "be sampled")
-            lhs in (:spline, :spline_basis) &&
-                _sfail("`$lhs` is reserved (spline surface) and cannot be " *
-                       "sampled")
-            lhs in (:hsgp, :hsgp_basis) &&
-                _sfail("`$lhs` is reserved (hsgp surface) and cannot be " *
-                       "sampled")
-            lhs === :r2d2 &&
-                _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
-                       "sampled")
             if bc && st.args[2] isa Symbol
                 # A derived response observes an existing deterministic
                 # definition (`ly = log.(earn)` then `ly .~ ...`) instead
@@ -4835,21 +4802,6 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             lhs = st.args[1]
             lhs === :target && _sfail("no `target` in rkppl models " *
                                       "(density comes only from `~`)")
-            lhs === :dummy &&
-                _sfail("`dummy` is reserved (margin surface) and cannot " *
-                       "be redefined")
-            lhs in (:mm, :gr) &&
-                _sfail("`$lhs` is reserved (grouping surface) and cannot " *
-                       "be redefined")
-            lhs in (:spline, :spline_basis) &&
-                _sfail("`$lhs` is reserved (spline surface) and cannot be " *
-                       "redefined")
-            lhs in (:hsgp, :hsgp_basis) &&
-                _sfail("`$lhs` is reserved (hsgp surface) and cannot be " *
-                       "redefined")
-            lhs === :r2d2 &&
-                _sfail("`r2d2` is reserved (r2d2 surface) and cannot be " *
-                       "redefined")
             lhs in data && _sfail("$lhs is bound data and cannot be redefined")
             # Forward `.~`: the observation claimed first — this first
             # definition completes it (a second definition still throws).
@@ -7223,10 +7175,9 @@ end
 
 function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
         with_scopes::Bool = false, rewrites = Expr[], fixes = Dict(), bound_values = nothing)
-    pins = Dict{Symbol,Symbol}()
     if !any(_stmt_is_submodel_call(a, mod) || _plate_has_submodel_cell(a, mod) for a in ast.args)
         isempty(rewrites) && isempty(fixes) || _sfail("merge scoped target matches no submodel declaration")
-        return with_scopes ? (ast, pins, SubmodelScope[]) : (ast, pins)
+        return with_scopes ? (ast, SubmodelScope[]) : ast
     end
     # Names in use by the program (binders at every depth + data): a
     # namespaced name must be fresh against these, and every expansion adds
@@ -7253,13 +7204,13 @@ function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
     ctx.fixes = Dict{Symbol,ColumnData}(fixes)
     ctx.bound_values = bound_values
     for arg in ast.args
-        _expand_submodel_stmt!(out, arg, mod, data, pins, ctx,
+        _expand_submodel_stmt!(out, arg, mod, data, ctx,
             RKPPLSubmodel[])
     end
     isempty(ctx.rewrites) && isempty(ctx.fixes) ||
         _sfail("merge scoped target matches no statement (or names an unsupported plate/scan cell)")
     expanded = _resolve_scope_properties(Expr(:block, out...), ctx)
-    return with_scopes ? (expanded, pins, ctx.scopes) : (expanded, pins)
+    return with_scopes ? (expanded, ctx.scopes) : expanded
 end
 
 # Expand one statement into `out`, recursively: a submodel call is inlined and
@@ -7267,19 +7218,19 @@ end
 # defining module of the enclosing submodel); a plate with per-cell submodel
 # cells is rewritten cell by cell; anything else passes through.
 function _expand_submodel_stmt!(out, arg, mod::Module, data::Set{Symbol},
-        pins::Dict{Symbol,Symbol}, used::_ScopeExpansion,
+        used::_ScopeExpansion,
         chain::Vector{RKPPLSubmodel})
     if _stmt_is_submodel_call(arg, mod)
         st = _unwrap_trivia(arg)
         sm, gen = _expand_one_submodel(st.args[2], st.args[3], mod, data,
-            pins, used, chain)
+            used, chain)
         inner = RKPPLSubmodel[chain; sm]
         gen = _scope_program_edits(sm, gen, st, used, data)
         for g in gen
-            _expand_submodel_stmt!(out, g, sm.mod, data, pins, used, inner)
+            _expand_submodel_stmt!(out, g, sm.mod, data, used, inner)
         end
     elseif _plate_has_submodel_cell(arg, mod)
-        push!(out, _expand_plate_cell_submodels(arg, mod, data, pins, used, chain))
+        push!(out, _expand_plate_cell_submodels(arg, mod, data, used, chain))
     else
         push!(out, arg)
     end
@@ -7302,7 +7253,7 @@ end
 # a submodel use site therefore removes the entire former child program.
 function _scope_program_edits(sm, gen, call, ctx, data)
     scope = ctx.by_binding[call.args[2]]
-    args, _ = _peel_predictor_pin(call.args[3], sm)
+    args = _bind_submodel_arguments(call.args[3], sm)
     substitutions = merge(Dict{Symbol,Any}(zip(_submodel_args(sm), args)), scope.locals)
     variant_edits = Tuple{Expr,Module}[]
     for raw in sm.rewrites
@@ -7648,12 +7599,9 @@ function _generative_stream_stmts(stmts, ret, data)
     return out
 end
 
-# Bind positional arguments and declared keyword defaults, then peel an
-# optional `predictor = name` use-site pin. Returns (callargs, pin-or-nothing)
-# with the declared keywords following the positional arguments.
-function _peel_predictor_pin(callexpr::Expr, sm::RKPPLSubmodel)
+# Bind positional arguments and declared keyword defaults.
+function _bind_submodel_arguments(callexpr::Expr, sm::RKPPLSubmodel)
     posargs = Any[]
-    pin = nothing
     keywords = Dict{Symbol,Any}()
     for a in callexpr.args[2:end]
         if a isa Expr && a.head === :parameters
@@ -7667,17 +7615,9 @@ function _peel_predictor_pin(callexpr::Expr, sm::RKPPLSubmodel)
                     keywords[k] = kw.args[2]
                     continue
                 end
-                k === :predictor ||
-                    _sfail("submodel `$(sm.name)`: unknown keyword `$k`; " *
-                           "expected a declared keyword or `predictor = name`")
-                pin === nothing ||
-                    _sfail("submodel `$(sm.name)`: duplicate `predictor =` " *
-                           "(`$pin` and `$(kw.args[2])` — one pin per call)")
-                v = kw.args[2]
-                v isa Symbol ||
-                    _sfail("submodel `$(sm.name)`: `predictor` takes a bare " *
-                           "predictor name (a Symbol), got $(repr(v))")
-                pin = v
+                _sfail("submodel `$(sm.name)`: unknown keyword `$k`; " *
+                       "only declared keywords are accepted. Name model " *
+                       "quantities with ordinary assignments or declarations.")
             end
         else
             push!(posargs, a)
@@ -7696,7 +7636,7 @@ function _peel_predictor_pin(callexpr::Expr, sm::RKPPLSubmodel)
         push!(posargs, value)
         substitutions[k] = value
     end
-    return posargs, pin
+    return posargs
 end
 
 # The substitution for one use site: arguments → call expressions, body
@@ -7772,19 +7712,14 @@ function _collect_basis_ids!(ids::Set{Symbol}, st::Expr)
 end
 
 function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
-                              data::Set{Symbol}, pins::Dict{Symbol,Symbol},
+                              data::Set{Symbol},
                               used::_ScopeExpansion, chain)
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     _check_submodel_cycle(sm, chain)
-    callargs, pin = _peel_predictor_pin(callexpr, sm)
+    callargs = _bind_submodel_arguments(callexpr, sm)
     callargs = Any[_resolve_function_arg(a, mod,
         union(used.declared, Set{Symbol}(keys(used.name_paths))),
         "submodel `$(sm.name)` argument") for a in callargs]
-    if pin !== nothing && !isempty(chain)
-        _sfail("`predictor = $pin` pins a top-level use site only — " *
-               "`$(chain[end].name)` calls `$(sm.name)` with a pin inside " *
-               "its body")
-    end
     length(callargs) == length(_submodel_args(sm)) || _sfail(
         "submodel `$(sm.name)` expects $(length(sm.argnames)) argument(s) " *
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$lhs ~ " *
@@ -7795,11 +7730,6 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     end
     _all_symbols!(used.used, ret)
     stream = _stream_response(sm, stmts, ret) !== nothing
-    if pin !== nothing && !stream
-        _sfail("`predictor = $pin` names a response predictor, but " *
-               "`$(sm.name)` is a latent submodel (value return) — bind a " *
-               "stream submodel to data (`y ~ sm(...; predictor = ...)`)")
-    end
     # Shape compatibility (dots follow the callee): a data column is
     # vector-shaped, so it admits only a vectorized (stream) callee; a non-data
     # LHS binds a latent value.
@@ -7813,13 +7743,6 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
             "the use-site data column replaces")
     end
     observed = stream && lhs in data
-    pin !== nothing && !observed && _sfail(
-        "`predictor = $pin` names an observation predictor; `$lhs` is latent")
-    if pin !== nothing
-        haskey(pins, lhs) && _sfail("response $lhs pins two predictors " *
-            "($(pins[lhs]) and $pin) — one `predictor =` per response")
-        pins[lhs] = pin
-    end
     # An observed slot binds to the data LHS. A generative slot retains
     # its private name beside every other binder in the call's namespace.
     keep = observed ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
@@ -7931,14 +7854,14 @@ end
 # Rewrite a `@plate` block, replacing each per-cell submodel-call cell with the
 # submodel's inlined `i`-indexed cell statements; other cells pass through.
 function _expand_plate_cell_submodels(pl::Expr, mod::Module, data::Set{Symbol},
-        pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
+        used::_ScopeExpansion, chain)
     loop = pl.args[end]::Expr
     asg = loop.args[1]::Expr
     ivar = asg.args[1]::Symbol
     body = loop.args[2]::Expr
     cells = Any[]
     for c in body.args
-        _expand_cell_stmt!(cells, c, ivar, mod, data, pins, used, chain)
+        _expand_cell_stmt!(cells, c, ivar, mod, data, used, chain)
     end
     newloop = Expr(:for, asg, Expr(:block, cells...))
     return Expr(:macrocall, pl.args[1:end-1]..., newloop)
@@ -7947,16 +7870,16 @@ end
 # Expand one plate cell into `cells`, recursively (a per-cell body may call a
 # per-cell submodel in turn; it resolves in the enclosing submodel's module).
 function _expand_cell_stmt!(cells, c, ivar::Symbol, mod::Module,
-        data::Set{Symbol}, pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
+        data::Set{Symbol}, used::_ScopeExpansion, chain)
     call = _cell_submodel_call(c, ivar, mod)
     if call === nothing
         push!(cells, c)
     else
-        sm, gen = _expand_cell_submodel(call[1], call[2], ivar, mod, data, pins,
+        sm, gen = _expand_cell_submodel(call[1], call[2], ivar, mod, data,
             used, chain)
         inner = RKPPLSubmodel[chain; sm]
         for g in gen
-            _expand_cell_stmt!(cells, g, ivar, sm.mod, data, pins, used, inner)
+            _expand_cell_stmt!(cells, g, ivar, sm.mod, data, used, inner)
         end
     end
     return cells
@@ -7983,11 +7906,11 @@ _is_dotted_obj(st::Expr) =
 # desugar the inlined statements flow through.
 function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
                                mod::Module, data::Set{Symbol},
-                               pins::Dict{Symbol,Symbol}, used::_ScopeExpansion, chain)
+                               used::_ScopeExpansion, chain)
     col = colref.args[1]::Symbol
     sm = _resolve_submodel(callexpr, mod)::RKPPLSubmodel
     _check_submodel_cycle(sm, chain)
-    callargs, pin = _peel_predictor_pin(callexpr, sm)
+    callargs = _bind_submodel_arguments(callexpr, sm)
     length(callargs) == length(_submodel_args(sm)) || _sfail(
         "submodel `$(sm.name)` expects $(length(sm.argnames)) argument(s) " *
         "$(Tuple(sm.argnames)), got $(length(callargs)) at `$col[$ivar] ~ " *
@@ -8034,11 +7957,6 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
             ", so use a non-data LHS.")
     end
     latent_stream = col ∉ data && slot !== nothing && _is_dotted_obj(stmts[slot])
-    if pin !== nothing
-        col in data || _sfail("`predictor = $pin` names an observation predictor; `$col` is latent")
-        haskey(pins, col) && _sfail("response $col pins two predictors")
-        pins[col] = pin
-    end
     argset = Set{Symbol}(_submodel_args(sm))
     for st in stmts
         nm = _stmt_lhs(st)
@@ -9547,8 +9465,7 @@ function _argument_location!(lhs, raw, ctx, predictors, pred_idx)
     value = _lower_argument_value(lhs, :alpha, raw, ctx)
     if value isa Symbol && (value in ctx.data || value in ctx.vecdefs ||
             value in ctx.plate_names || any(d -> d.name === value, ctx.synth_derived))
-        name = get(ctx.predictor_pins, lhs, Symbol(lhs, :_alpha))
-        haskey(ctx.predictor_pins, lhs) && _claim_pin!(lhs, name, ctx, pred_idx)
+        name = Symbol(lhs, :_alpha)
         term = TermSpec(OffsetTerm, [value], NamedTuple(), value, Symbol(name, :_off))
         push!(predictors, PredictorSpec(name, IdentityLink, [term], name))
         pred_idx[name] = length(predictors)
@@ -9966,25 +9883,6 @@ function _lower_scale_predictor_error(lhs, name, ctx)
                   "definition (`$name = ...` affine in data)")
 end
 
-# Claim a use-site predictor pin: the pin names a FRESH predictor, claimed
-# once. Records the claiming response (first claim wins; a second claim of
-# the same name reports its owner) and marks the response's pin used.
-function _claim_pin!(lhs, pin, ctx, pred_idx)
-    pin in ctx.taken && _sfail("response $lhs pins predictor $pin, but " *
-        "`$pin` is already taken (a pin names a fresh predictor — rename one)")
-    if haskey(pred_idx, pin)
-        owner = get(ctx.pin_owner, pin, nothing)
-        owner === nothing && _sfail("response $lhs pins predictor $pin, " *
-            "but `$pin` is already a synthesized predictor (a pin names a " *
-            "fresh predictor — rename it)")
-        _sfail("response $lhs pins predictor $pin, but it is already " *
-               "pinned by response $owner")
-    end
-    push!(ctx.pins_used, lhs)
-    ctx.pin_owner[pin] = lhs
-    return nothing
-end
-
 # A location written bare in a constrained-scale slot lowers like any
 # name, except that a sampled parameter there IS the probability or rate.
 _lower_location(lhs, loc::_BareSlot, pred_link, ctx, predictors, pred_idx,
@@ -10021,8 +9919,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # A scan-state latent vector is a direct per-observation location: the
         # response mean IS the carried state (no linear predictor). Admitted
         # family/link is checked in `_validate_responses` (Gaussian-identity, v1).
-        # A pin over a scan state claims nothing (no predictor is built) and
-        # falls through to the unconsumed-pin error. A pure alias of one
+        # A pure alias of a scan state
         # (`w = u`, a latent submodel's `x = x_level` binding) is that state:
         # naming never changes legality.
         loc in ctx.scan_states && return loc
@@ -10062,43 +9959,8 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             !_scalar_intercept_location(loc, ctx) &&
             return _value_location!(lhs, loc, pred_link, ctx,
                 predictors, pred_idx; synth)
-        pin = get(ctx.predictor_pins, lhs, nothing)
-        if pin !== nothing && pin !== loc
-            # A pin renames one response's predictor — the pinned location
-            # cannot also lower under another name (either direction fails:
-            # an already-interned location, or one pinned away before).
-            haskey(pred_idx, loc) && _sfail(
-                "response $lhs pins predictor $pin, but its location " *
-                "`$loc` already lowers as its own predictor (a pin renames " *
-                "one response's predictor — it cannot fork a shared " *
-                "definition)")
-            if haskey(ctx.pin_source, loc)
-                prior, owner = ctx.pin_source[loc]
-                _sfail("response $lhs pins predictor $pin, but its " *
-                       "location `$loc` is already pinned as `$prior` by " *
-                       "response $owner (a pin renames one response's " *
-                       "predictor — it cannot fork a shared definition)")
-            end
-            _claim_pin!(lhs, pin, ctx, pred_idx)
-            ctx.pin_source[loc] = (pin, lhs)
-            # The source definition vanishes like any absorbed location (it
-            # is referenced nowhere else — any other reader fails above).
-            push!(ctx.absorbed, loc)
-            pname = pin
-        else
-            pin !== nothing && push!(ctx.pins_used, lhs)
-            if haskey(ctx.pin_source, loc)
-                prior, owner = ctx.pin_source[loc]
-                _sfail("response $lhs reads `$loc`, but `$loc` is pinned " *
-                       "as predictor `$prior` by response $owner (a pin " *
-                       "renames one response's predictor — it cannot fork " *
-                       "a shared definition)")
-            end
-            pname = loc
-            if haskey(pred_idx, pname)
-                return pname
-            end
-        end
+        pname = loc
+        haskey(pred_idx, pname) && return pname
         if _is_plate_column_call(ctx.detmap[loc]) &&
                 any(n -> n in ctx.varying_contribs ||
                     (haskey(ctx.detmap, n) &&
@@ -10128,20 +9990,10 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # LatentTerm, just as when the whole location names that latent.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
-        pin = get(ctx.predictor_pins, lhs, nothing)
-        if pin !== nothing
-            synth === nothing || _sfail(
-                "response $lhs pins predictor $pin, but $lhs needs one " *
-                "predictor per index (multi-predictor response) — a pin " *
-                "names exactly one predictor")
-            _claim_pin!(lhs, pin, ctx, pred_idx)
-            pname = pin
-        else
-            pname = synth === nothing ? Symbol(lhs, "_eta") : synth
-            (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
-                "derived predictor name $pname collides with your definition — " *
-                "rename yours")
-        end
+        pname = synth === nothing ? Symbol(lhs, "_eta") : synth
+        (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
+            "derived predictor name $pname collides with your definition — " *
+            "rename yours")
         if _composed_root(loc, ctx) || (value && _is_bare_sub_map(loc, ctx))
             return _lower_composed_predictor(pname, loc, ctx, lhs,
                 pred_link, predictors, pred_idx, coefuse)
@@ -10191,9 +10043,8 @@ function _lower_plate_varying_location(pname, call, ctx, lhs, pred_link,
 end
 
 # Build the LatentTerm location predictor over `col` (a plate parameter or a
-# derived column that reads one); the generator emits `lp = col`. A pin names
-# it like any design predictor; latent predictors stay per-response (no
-# interning here, pinned or not).
+# derived column that reads one); the generator emits `lp = col`.
+# Latent predictors stay per-response (no interning here).
 function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
     # A nested per-cell call can return a sampled local unchanged. The
     # outer binding aliases that vector; it does not create another latent.
@@ -10208,16 +10059,10 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
         union!(ctx.absorbed, seen)
         col = source
     end
-    pin = get(ctx.predictor_pins, lhs, nothing)
-    if pin !== nothing
-        _claim_pin!(lhs, pin, ctx, pred_idx)
-        pname = pin
-    else
-        pname = Symbol(lhs, "_loc")
-        (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
-            "latent-location predictor name $pname collides with your " *
-            "definition — rename it")
-    end
+    pname = Symbol(lhs, "_loc")
+    (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
+        "latent-location predictor name $pname collides with your " *
+        "definition — rename it")
     term = TermSpec(LatentTerm, [col], NamedTuple(), col, Symbol(col, "_lat"))
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
     pred_idx[pname] = length(predictors)
@@ -10324,20 +10169,10 @@ function _value_location!(lhs, loc, pred_link, ctx, predictors,
         ctx.detshape[source] = :scalar
         source = ctx.detmap[source]
     end
-    pin = get(ctx.predictor_pins, lhs, nothing)
-    if pin !== nothing
-        synth === nothing || _sfail(
-            "response $lhs pins predictor $pin, but $lhs needs one " *
-            "predictor per index (multi-predictor response) — a pin " *
-            "names exactly one predictor")
-        _claim_pin!(lhs, pin, ctx, pred_idx)
-        pname = pin
-    else
-        pname = synth === nothing ? Symbol(lhs, "_eta") : synth
-        (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
-            "derived predictor name $pname collides with your definition — " *
-            "rename yours")
-    end
+    pname = synth === nothing ? Symbol(lhs, "_eta") : synth
+    (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
+        "derived predictor name $pname collides with your definition — " *
+        "rename yours")
     term = if loc isa Symbol && loc in ctx.data
         TermSpec(OffsetTerm, ColumnRef[loc], NamedTuple(), loc,
             Symbol(loc, "_off"))

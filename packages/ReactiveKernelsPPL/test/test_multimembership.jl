@@ -360,22 +360,6 @@ end
         # Admitted by the explicit-library program below (todo `1308iv0`).
         @test validate_plan(_mm_explicit_plan(:stratified, eta = 2.0)) === nothing
     end
-    @testset "reserved grouping names" begin
-        # refused: reserved name `mm`
-        @test_throws SurfaceLoweringError lower_rkppl(quote
-                mm = 1.0
-                a ~ Normal(0, 5)
-                mu = a
-                y .~ Normal.(mu, 1.0)
-            end, (:y,); conditioned = (:y,))
-        # refused: reserved name `gr`
-        @test_throws SurfaceLoweringError lower_rkppl(quote
-                gr = 1.0
-                a ~ Normal(0, 5)
-                mu = a
-                y .~ Normal.(mu, 1.0)
-            end, (:y,); conditioned = (:y,))
-    end
 end
 
 # Hand-built draws for contract-validation tests (surface-independent).
