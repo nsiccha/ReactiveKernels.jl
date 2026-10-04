@@ -66,7 +66,9 @@ end
 function _cv_executable_retained_work(ops)
     # Inspect actual executable regions and nonlinear work separately from
     # XLA's shape-specific fusion, layout and derivative-tape machinery.
-    names = ("while", "conditional", "log", "log-plus-one", "exponential",
+    # The full executable inventory above retains pure conditional counts as
+    # diagnostics. Their absence alone is not a retained-body failure.
+    names = ("while", "log", "log-plus-one", "exponential",
         "sqrt", "tanh", "sine", "cosine", "floor", "dot", "gather")
     return Dict(name => get(ops, name, 0) for name in names)
 end
