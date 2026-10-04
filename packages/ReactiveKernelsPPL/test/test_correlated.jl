@@ -262,15 +262,15 @@ _corr_r() = only(_corr_plan2().responses)
     # refused: unknown extra predictor (IR contract)
     @test_throws ContractValidationError validate_structure(_corr_mutate(;
         resp = [unknown_pred]))
-    # A non-identity mean predictor fails (same rebuild, predictor swapped).
+    # Each mean predictor keeps its written link; the joint response itself
+    # consumes those values on the identity scale (rkppl-use, value locations).
     plan = _corr_plan2()
     preds = PredictorSpec[p for p in plan.predictors]
     preds[2] = PredictorSpec(:mu2, LogitLink, preds[2].terms, preds[2].label)
-    # refused: joint mean predictor must be identity-link (IR contract)
-    @test_throws ContractValidationError validate_structure(StructuralPlan(
+    @test validate_structure(StructuralPlan(
         plan.responses, preds, plan.population_priors, plan.parameters,
         plan.assignments, plan.columns, plan.n_obs; roles = plan.roles,
-        vector_parameters = plan.vector_parameters))
+        vector_parameters = plan.vector_parameters)) === nothing
     # Factor linkage.
     # refused: missing factor scales (IR contract)
     for (sc, cr) in ((nothing, base.factor_corr),
@@ -299,14 +299,12 @@ _corr_r() = only(_corr_plan2().responses)
     # refused: factor size disagrees with joint width (IR contract)
     @test_throws ContractValidationError validate_structure(_corr_mutate(;
         vps = vs))
-    # An unlinked factor piece fails (linkage is exactly-once).
+    # A declared parameter may contribute its prior without a likelihood use.
     vs2 = vcat(plan.vector_parameters,
         [VectorParameter(:stray, :positive_exponential, (arg1 = 1.0,), 2,
             :stray)])
-    # refused: unlinked factor piece (IR contract)
-    @test_throws ContractValidationError validate_structure(_corr_mutate(;
-        vps = vs2))
-    # A factor piece shared by two joint responses fails.
+    @test validate_structure(_corr_mutate(; vps = vs2)) === nothing
+    # Two joint responses may consume the same covariance factor.
     r2 = LikelihoodSpec(base.family, base.link, :y3, :mu3, base.scale,
         base.weights, base.evidence, :y3_y4_resp, base.trials, base.range;
         extra_responses = [:y4], extra_predictors = [:mu4],
@@ -319,11 +317,10 @@ _corr_r() = only(_corr_plan2().responses)
             PopulationPrior(:mu3, :x, 0.0, 1.0),
             PopulationPrior(:mu4, :Intercept, 0.0, 1.0),
             PopulationPrior(:mu4, :x, 0.0, 1.0)])
-    # refused: factor piece shared by two joint responses (IR contract)
-    @test_throws ContractValidationError validate_structure(StructuralPlan(
+    @test validate_structure(StructuralPlan(
         [base, r2], preds34, priors34, plan.parameters, plan.assignments,
         Dict{Symbol,AbstractVector}(), 0;
-        vector_parameters = plan.vector_parameters))
+        vector_parameters = plan.vector_parameters)) === nothing
     # Joint-only fields on a Gaussian response fail.
     g = LikelihoodSpec(GaussianFam, IdentityLink, :y1, :mu1, :sigma, nothing,
         ResponseEvidence(:none, nothing, nothing), :y_resp, nothing, nothing;
