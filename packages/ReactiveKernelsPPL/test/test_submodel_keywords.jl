@@ -10,6 +10,11 @@ end
     return slot
 end
 
+# A retired catalogue spelling remains an ordinary caller-defined submodel.
+@rkppl LKJCovarianceFactor(x) = begin
+    return x .+ 1
+end
+
 @testset "submodel keywords have their declared meaning" begin
     data = (; x = [0.1, 0.4], y = [0.2, -0.3])
     ordinary = lower_rkppl(quote
@@ -17,6 +22,11 @@ end
         y .~ Normal.(mu, 1)
     end, data; mod = @__MODULE__, conditioned = (:y,))
     @test validate_structure(ordinary) === nothing
+    renamed = lower_rkppl(quote
+        mu ~ LKJCovarianceFactor(x)
+        y .~ Normal.(mu, 1)
+    end, data; mod = @__MODULE__, conditioned = (:y,))
+    @test validate_structure(renamed) === nothing
 
     # Refused: USER 1cmodra (names) removes the undeclared predictor pin.
     # A declared keyword named predictor remains an ordinary argument above.

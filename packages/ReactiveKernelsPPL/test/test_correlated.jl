@@ -1,5 +1,5 @@
 # Correlated outcomes: joint MvNormalCholesky responses over an LKJ
-# covariance factor (`L ~ LKJCovarianceFactor`, `[y1..yK] ~ MvNormalCholesky`).
+# covariance factor with explicitly declared scale and LKJCholesky priors.
 # Native axes only (the exact-GP precedent): Reactant primal of this emission
 # shape is verified in scratch, and the Reactant-compiled gradient axis is
 # upstream-blocked (no `stablehlo.triangular_solve` adjoint — recorded in
@@ -21,7 +21,9 @@ function _corr_plan2()
             b2 ~ Normal(0, 1)
             mu1 = a1 .+ b1 .* x
             mu2 = a2 .+ b2 .* x
-            L ~ LKJCovarianceFactor(2, Exponential(1.0), 2.0)
+            L_scales[1:2] .~ Exponential.(1.0)
+            L_L_corr ~ LKJCholesky(2, 2.0)
+            L = L_scales .* L_L_corr
             [y1, y2] ~ MvNormalCholesky([mu1, mu2], L)
         end, (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
 end
@@ -55,12 +57,12 @@ end
     @test r.factor_scales === :L_scales
     @test r.factor_corr === :L_L_corr
     @test r.label === :y1_y2_resp
-    @test length(plan.vector_parameters) == 2
-    sc, cr = plan.vector_parameters
-    @test (sc.name, sc.family, sc.args, sc.size) ==
-        (:L_scales, :positive_exponential, (arg1 = 1.0,), 2)
-    @test (cr.name, cr.family, cr.args, cr.size) ==
-        (:L_L_corr, :cholesky_corr_lkj, (arg1 = 2.0,), 2)
+    @test isempty(plan.vector_parameters)
+    sc, cr = plan.array_parameters
+    @test (sc.name, sc.family, sc.args, sc.dims) ==
+        (:L_scales, :exponential, (arg1 = 1.0,), Any[2])
+    @test (cr.name, cr.family, cr.args, cr.dims) ==
+        (:L_L_corr, :lkj_cholesky, (arg1 = 2.0,), Any[2, 2])
     # A sampled scale hyperparameter rides through as a symbol.
     hier = lower_rkppl(quote
             a1 ~ Normal(0, 1)
@@ -70,10 +72,12 @@ end
             tau ~ Exponential(0.5)
             mu1 = a1 .+ b1 .* x
             mu2 = a2 .+ b2 .* x
-            L ~ LKJCovarianceFactor(2, Exponential(tau), 2.0)
+            L_scales[1:2] .~ Exponential.(tau)
+            L_L_corr ~ LKJCholesky(2, 2.0)
+            L = L_scales .* L_L_corr
             [y1, y2] ~ MvNormalCholesky([mu1, mu2], L)
         end, (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
-    @test hier.vector_parameters[1].args == (arg1 = :tau,)
+    @test hier.array_parameters[1].args == (arg1 = :tau,)
     # An assignment-valued scale survives absorption (param-arg edge).
     det = lower_rkppl(quote
             a1 ~ Normal(0, 1)
@@ -84,7 +88,9 @@ end
             tau = exp(t0)
             mu1 = a1 .+ b1 .* x
             mu2 = a2 .+ b2 .* x
-            L ~ LKJCovarianceFactor(2, Exponential(tau), 2.0)
+            L_scales[1:2] .~ Exponential.(tau)
+            L_L_corr ~ LKJCholesky(2, 2.0)
+            L = L_scales .* L_L_corr
             [y1, y2] ~ MvNormalCholesky([mu1, mu2], L)
         end, (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     @test any(a -> a.name === :tau, det.assignments)
@@ -93,12 +99,14 @@ end
             a1 ~ Normal(0, 1)
             b1 ~ Normal(0, 1)
             mu1 = a1 .+ b1 .* x
-            L ~ LKJCovarianceFactor(1, Exponential(1.0), 2.0)
+            L_scales[1:1] .~ Exponential.(1.0)
+            L_L_corr ~ LKJCholesky(1, 2.0)
+            L = L_scales .* L_L_corr
             [y1] ~ MvNormalCholesky([mu1], L)
         end, (:y1, :x); conditioned = (:y1, :x))
     r1 = only(one.responses)
     @test r1.extra_responses == Symbol[] && r1.extra_predictors == Symbol[]
-    @test [p.size for p in one.vector_parameters] == [1, 1]
+    @test [p.dims for p in one.array_parameters] == [Any[1], Any[1, 1]]
 end
 
 @testset "correlated layout edges" begin
@@ -107,7 +115,7 @@ end
     @test layout.total == 7 # 2+2 coefs + 2 scales + 1 theta
     kinds = [(e.kind, e.name, e.size, e.transform) for e in layout.entries]
     @test only(k for k in kinds if k[2] === :L_scales) ==
-        (:vector, :L_scales, 2, :exp)
+        (:array, :L_scales, 2, :exp)
     @test only(k for k in kinds if k[2] === :L_L_corr) ==
         (:cholesky_corr, :L_L_corr, 1, :lkj)
     u = [0.5, -0.25, 0.1, 0.2, 0.3, -0.1, 0.7]
@@ -139,7 +147,9 @@ end
             a1 ~ Normal(0, 1)
             b1 ~ Normal(0, 1)
             mu1 = a1 .+ b1 .* x
-            L ~ LKJCovarianceFactor(1, Exponential(1.0), 2.0)
+            L_scales[1:1] .~ Exponential.(1.0)
+            L_L_corr ~ LKJCholesky(1, 2.0)
+            L = L_scales .* L_L_corr
             [y1] ~ MvNormalCholesky([mu1], L)
         end, (:y1, :x); conditioned = (:y1, :x))
     cols = Dict{Symbol,AbstractVector}(
@@ -173,7 +183,9 @@ end
             mu1 = a1 .+ b1 .* x
             mu2 = a2 .+ b2 .* x
             mu3 = a3 .+ b3 .* x
-            L ~ LKJCovarianceFactor(3, Exponential(tau), 1.0)
+            L_scales[1:3] .~ Exponential.(tau)
+            L_L_corr ~ LKJCholesky(3, 1.0)
+            L = L_scales .* L_L_corr
             [y1, y2, y3] ~ MvNormalCholesky([mu1, mu2, mu3], L)
         end, (:y1, :y2, :y3, :x); conditioned = (:y1, :y2, :y3, :x))
     cols = Dict{Symbol,AbstractVector}(
@@ -208,16 +220,28 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
-# Plan-level admission: mutate the K=2 plan and pin the failure.
+# Hand-built vector IR remains a generic prior representation. These
+# declarations state both pieces explicitly; they exercise contract validation
+# independently of the surface array representation used by `_corr_plan2`.
+function _corr_contract_plan2()
+    p = _corr_plan2()
+    return StructuralPlan(p.responses, p.predictors, p.population_priors,
+        p.parameters, AssignmentSpec[], p.columns, p.n_obs; roles = p.roles,
+        vector_parameters = [
+            VectorParameter(:L_scales, :positive_exponential, (arg1=1.0,), 2, :L_scales),
+            VectorParameter(:L_L_corr, :cholesky_corr_lkj, (arg1=2.0,), 2, :L_L_corr)])
+end
+
+# Plan-level admission: mutate the explicit K=2 IR and pin the failure.
 function _corr_mutate(; resp = nothing, vps = nothing)
-    plan = _corr_plan2()
+    plan = _corr_contract_plan2()
     rs = resp === nothing ? plan.responses : resp
     vs = vps === nothing ? plan.vector_parameters : vps
     return StructuralPlan(rs, plan.predictors, plan.population_priors,
         plan.parameters, plan.assignments, plan.columns, plan.n_obs;
         roles = plan.roles, vector_parameters = vs)
 end
-_corr_r() = only(_corr_plan2().responses)
+_corr_r() = only(_corr_contract_plan2().responses)
 
 @testset "correlated contract admission" begin
     base = _corr_r()
@@ -264,7 +288,7 @@ _corr_r() = only(_corr_plan2().responses)
         resp = [unknown_pred]))
     # Each mean predictor keeps its written link; the joint response itself
     # consumes those values on the identity scale (rkppl-use, value locations).
-    plan = _corr_plan2()
+    plan = _corr_contract_plan2()
     preds = PredictorSpec[p for p in plan.predictors]
     preds[2] = PredictorSpec(:mu2, LogitLink, preds[2].terms, preds[2].label)
     @test validate_structure(StructuralPlan(
@@ -428,44 +452,48 @@ _corr_mu() = quote
     mu1 = a1 .+ b1 .* x
     mu2 = a2 .+ b2 .* x
 end
-_corr_surface(extra::Expr...) =
+_corr_surface(extra...) =
     Expr(:block, _corr_mu().args..., extra...)
 
 @testset "correlated surface admission" begin
-    F2 = :(L ~ LKJCovarianceFactor(2, Exponential(1.0), 2.0))
+    F2 = quote
+        L_scales[1:2] .~ Exponential.(1.0)
+        L_L_corr ~ LKJCholesky(2, 2.0)
+        L = L_scales .* L_L_corr
+    end
     J2 = :([y1, y2] ~ MvNormalCholesky([mu1, mu2], L))
     # Joint form errors.
     # refused: `.~` broadcasts; a joint multivariate observation is `~` (P3)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(F2,
+        _corr_surface(F2.args...,
             :([y1, y2] .~ MvNormalCholesky([mu1, mu2], L))), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     # refused: undeclared factor `L` (P6, 05oe96l)
     @test_throws SurfaceLoweringError lower_rkppl(_corr_surface(J2),
         (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     # refused: mean width != outcome width (malformed distribution)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(F2, :([y1, y2] ~ MvNormalCholesky([mu1], L))),
+        _corr_surface(F2.args..., :([y1, y2] ~ MvNormalCholesky([mu1], L))),
         (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     # refused: `y3` is not data (missing data name / undeclared, P6)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(F2, :([y1, y3] ~ MvNormalCholesky([mu1, mu2], L))),
+        _corr_surface(F2.args..., :([y1, y3] ~ MvNormalCholesky([mu1, mu2], L))),
         (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     # refused: outcome listed twice (single assignment)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(F2, :([y1, y1] ~ MvNormalCholesky([mu1, mu2], L))),
+        _corr_surface(F2.args..., :([y1, y1] ~ MvNormalCholesky([mu1, mu2], L))),
         (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     # refused: `Normal` over a vector mean and matrix factor is a Julia MethodError (P3; malformed distribution)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(F2, :([y1, y2] ~ Normal([mu1, mu2], L))), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+        _corr_surface(F2.args..., :([y1, y2] ~ Normal([mu1, mu2], L))), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     # refused: broadcasting a multivariate over means for one outcome is malformed (P3)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(F2, :(y1 .~ MvNormalCholesky.([mu1, mu2], L))),
+        _corr_surface(F2.args..., :(y1 .~ MvNormalCholesky.([mu1, mu2], L))),
         (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     # Factor-statement errors.
     # refused: LKJ dimension K = 0 (mathematically invalid)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(:(L ~ LKJCovarianceFactor(0, Exponential(1.0), 2.0)),
-            J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+        _corr_surface(:(L_scales[1:2] .~ Exponential.(1.0)),
+            :(L_L_corr ~ LKJCholesky(0, 2.0)), :(L = L_scales .* L_L_corr), J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     # The covariance factor is an explicit value with ordinary scale priors.
     @test validate_structure(lower_rkppl(_corr_surface(
         :(sd[1:2] .~ Gamma.(2.0, 1.0)), :(C ~ LKJCholesky(2, 2.0)),
@@ -473,8 +501,8 @@ _corr_surface(extra::Expr...) =
         conditioned = (:y1, :y2, :x))) === nothing
     # refused: LKJ eta must be > 0 (mathematically invalid input)
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(:(L ~ LKJCovarianceFactor(2, Exponential(1.0), 0.0)),
-            J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+        _corr_surface(:(L_scales[1:2] .~ Exponential.(1.0)),
+            :(L_L_corr ~ LKJCholesky(2, 0.0)), :(L = L_scales .* L_L_corr), J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
     @test validate_structure(lower_rkppl(_corr_surface(
         :(eta ~ Exponential(1.0)), :(sd[1:2] .~ Exponential.(1.0)),
         :(C ~ LKJCholesky(2, eta)), :(L = sd .* C), J2),
@@ -483,25 +511,38 @@ _corr_surface(extra::Expr...) =
     # validation inside lowering.
     # refused: factor K != joint width (dimension mismatch)
     @test_throws ContractValidationError lower_rkppl(
-        _corr_surface(:(L ~ LKJCovarianceFactor(3, Exponential(1.0), 2.0)),
-            J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
-    # The legacy factor stem is not an authored value. Value expressions
-    # lower generically; binding rejects its undeclared assignment input.
-    stemmean = lower_rkppl(quote
-            mu1 = L .+ b1 .* x
-            mu2 = a2 .+ b2 .* x
-            a2 ~ Normal(0, 1)
-            b1 ~ Normal(0, 1)
-            b2 ~ Normal(0, 1)
-            L ~ LKJCovarianceFactor(2, Exponential(1.0), 2.0)
-            [y1, y2] ~ MvNormalCholesky([mu1, mu2], L)
-        end, (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
-    @test_throws "assignment references unknown name L" bind_data(
-        stemmean, _corr_data2())
-    # A user definition colliding with a derived factor piece fails.
-    # refused: name collides with construct-minted factor piece `L_scales` (reserved)
+        _corr_surface(:(L_scales[1:3] .~ Exponential.(1.0)),
+            :(L_L_corr ~ LKJCholesky(3, 2.0)), :(L = L_scales .* L_L_corr), J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+    # Refused: USER 1cmodra/05oe96l require authored quantities and priors.
+    # The retired shortcut has no privileged allocation or minted names.
+    err = try
+        lower_rkppl(_corr_surface(
+            :(L ~ LKJCovarianceFactor(2, Exponential(1), 2)), J2),
+            (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("explicit", sprint(showerror, err))
+    @test occursin("sd .* C", sprint(showerror, err))
+    standalone = try
+        lower_rkppl(quote L ~ LKJCovarianceFactor(2, Exponential(1), 2) end, ())
+    catch e
+        e
+    end
+    @test standalone isa SurfaceLoweringError
+    @test occursin("LKJCholesky", sprint(showerror, standalone))
+    # An explicitly defined factor is also an ordinary value in its means.
+    value_mean = lower_rkppl(_corr_surface(F2.args...,
+        :(mu3 = L[1, 1] .+ b1 .* x),
+        :([y1, y2] ~ MvNormalCholesky([mu3, mu2], L))),
+        (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+    @test validate_structure(bind_data(value_mean, _corr_data2())) === nothing
+    # Refused: duplicate explicit declarations still violate single assignment.
     @test_throws SurfaceLoweringError lower_rkppl(
-        _corr_surface(:(L_scales ~ Normal(0, 1)), F2, J2), (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+        _corr_surface(:(L_scales ~ Normal(0, 1)), F2.args..., J2),
+        (:y1, :y2, :x); conditioned = (:y1, :y2, :x))
+
 end
 
 @testset "correlated emission shape" begin

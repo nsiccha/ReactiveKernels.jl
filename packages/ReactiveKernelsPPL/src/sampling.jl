@@ -97,7 +97,7 @@ function _external_rhs(rhs)
          :NegativeBinomial2Log, :GammaLog, :BetaLogit,
          :HalfNormal, :HalfCauchy, :Flat, :flat, :positive, :truncated, :restricted, :Horseshoe,
          :weighted, :censored, :interval_censored, :Ordered, :Dirichlet,
-         :LKJCholesky, :LKJCovarianceFactor, :MixtureModel,
+         :LKJCholesky, :MixtureModel,
          :Gaussian, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial,
          :NegativeBinomial2, :Gamma, :Beta, :BetaBinomial2, :BetaKappa,
          :CircularVonMises, :Categorical, :CategoricalLogit, :OrderedLogistic, :Ordinal,

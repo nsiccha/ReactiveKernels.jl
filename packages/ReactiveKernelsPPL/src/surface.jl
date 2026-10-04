@@ -1025,11 +1025,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     ordered_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && !s.broadcast && s.slices === nothing &&
             _is_ordered_call(s.rhs))
-    # Covariance-factor declarations (`L ~ LKJCovarianceFactor(...)`): the
-    # only stems a joint response accepts as its factor (checked during
-    # joint lowering, before `_lower_parameters` runs).
-    factor_names = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && _is_lkj_factor_call(s.rhs))
     # Dar trajectory parameters: persistence (`truncated(Normal(mu, s),
     # 0, 1)`) and scale (`HalfNormal(s)` / `truncated(Normal(0, s), 0,
     # Inf)`) — the only names a `dar()` call accepts (checked during
@@ -1196,7 +1191,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             if s.lhs ∉ data && s.dims !== nothing),
         threshold_uses = Dict{Symbol,NamedTuple{(:response, :ordered),
             Tuple{Symbol,Bool}}}(),
-        vector_params = union(dirichlet_names, ordered_names, factor_names,
+        vector_params = union(dirichlet_names, ordered_names,
             Set{Symbol}(s.lhs for s in sample
                 if s.levels !== nothing || s.matrix !== nothing)),
         mo_uses = Dict{Symbol,Symbol}(),
@@ -1271,7 +1266,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # coefficient priors resolve).
     for j in joints
         push!(responses,
-            _lower_joint_response(j, factor_names, ctx, predictors, pred_idx,
+            _lower_joint_response(j, ctx, predictors, pred_idx,
                 coefuse))
     end
     # Grouped kernel statements lower here (LP-arg predictor interning
@@ -2420,9 +2415,15 @@ function _resolve_module_path(ex, mod::Module, where)
 end
 
 function _module_binding(m::Module, s::Symbol, where, shown)
-    isdefined(m, s) || _sfail("$where calls `$shown`, which is not defined " *
-        "in module `$(nameof(m))` — define the function there (or import " *
-        "it) before lowering")
+    if !isdefined(m, s)
+        s === :LKJCovarianceFactor && _sfail("$where: the implicit " *
+            "`LKJCovarianceFactor` shortcut is retired; declare " *
+            "`sd[1:K] .~ Exponential.(scale)` (or your scale prior), " *
+            "`C ~ LKJCholesky(K, eta)` and `F = sd .* C` explicitly")
+        _sfail("$where calls `$shown`, which is not defined " *
+            "in module `$(nameof(m))` — define the function there (or import " *
+            "it) before lowering")
+    end
     v = getfield(m, s)
     v isa Module && _sfail("$where calls `$shown`, which is a module, not " *
                            "a function")
@@ -6631,8 +6632,8 @@ end
 
 # Joint-response statement: `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`
 # (SB's joint form). Outcomes are bare distinct data symbols; means are
-# one location expression per outcome; the factor names an
-# `LKJCovarianceFactor` declaration. Width/factor linkage checks belong
+# one location expression per outcome; the factor names an explicitly
+# defined scale-vector times Cholesky-factor value. Width/linkage checks belong
 # to `_lower_joint_response` + contract validation.
 function _parse_joint_stmt(st::Expr, line::Int, data::Set{Symbol})
     outs = st.args[2].args
@@ -6666,9 +6667,8 @@ function _parse_joint_stmt(st::Expr, line::Int, data::Set{Symbol})
                "$(length(outs)) outcomes but $(repr(means)) means " *
                "(one mean per outcome: `[mu1, mu2]`)")
     factor isa Symbol || _sfail("joint factor $(repr(factor)) must name " *
-                                "an `LKJCovarianceFactor` declaration " *
-                                "(`L ~ LKJCovarianceFactor(K, Exponential(1.0), eta)` " *
-                                "in the model)")
+                                "an explicit factor value (`L = sd .* C` " *
+                                "over declared scale and LKJCholesky priors)")
     _reject_target(rhs, Symbol(join(outs, "_")))
     return JointSampleStmt(Vector{Symbol}(outs), Vector{Any}(means.args),
         factor, line)
@@ -6841,8 +6841,8 @@ SampleStmt(lhs::Symbol, rhs, broadcast::Bool) =
     SampleStmt(lhs, rhs, broadcast, nothing, nothing, nothing)
 
 """One joint `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` statement: K
-outcome columns, K mean expressions, and the factor stem (an
-`LKJCovarianceFactor` declaration elsewhere in the model). Plain `~`
+outcome columns, K mean expressions, and an explicitly defined factor value.
+Plain `~`
 only — the likelihood groups rows, never broadcasts."""
 struct JointSampleStmt
     outcomes::Vector{Symbol}
@@ -8756,23 +8756,18 @@ end
 # `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`. Each mean lowers as an
 # ordinary identity-link location (own predictor per outcome, named
 # definitions interned by name, inline means synthesized per outcome);
-# the factor stem resolves to its two `LKJCovarianceFactor` pieces.
-function _lower_joint_response(j::JointSampleStmt, factor_names::Set{Symbol},
-        ctx, predictors, pred_idx, coefuse)
+# the factor value reads its declared scales and Cholesky factor.
+function _lower_joint_response(j::JointSampleStmt, ctx, predictors, pred_idx,
+        coefuse)
     tag = "[$(join(j.outcomes, ", "))]"
-    scales, corr = if j.factor in factor_names
-        _lkj_factor_names(j.factor)
-    else
-        rhs = get(ctx.detmap, j.factor, nothing)
-        rhs isa Expr && rhs.head === :call && length(rhs.args) == 3 &&
-            rhs.args[1] === :.* && all(a -> a isa Symbol &&
-                a in ctx.array_decls, rhs.args[2:end]) || _sfail(
-            "joint response $tag factor $(j.factor) must name an " *
-            "`LKJCovarianceFactor` declaration or an explicit " *
-            "`$(j.factor) = sd .* C` over a declared scale vector " *
-            "and LKJCholesky factor")
-        (rhs.args[2], rhs.args[3])
-    end
+    rhs = get(ctx.detmap, j.factor, nothing)
+    rhs isa Expr && rhs.head === :call && length(rhs.args) == 3 &&
+        rhs.args[1] === :.* && all(a -> a isa Symbol &&
+            a in ctx.array_decls, rhs.args[2:end]) || _sfail(
+        "joint response $tag factor $(j.factor) must name an explicit " *
+        "`$(j.factor) = sd .* C` over a declared scale vector " *
+        "and LKJCholesky factor")
+    scales, corr = rhs.args[2], rhs.args[3]
     pnames = Symbol[_lower_location(o, m, IdentityLink, ctx, predictors,
         pred_idx, coefuse; synth = Symbol(o, "_joint_", k), value = true)
         for (k, (o, m)) in enumerate(zip(j.outcomes, j.means))]
@@ -12779,16 +12774,6 @@ function _lower_parameters(sample, coefuse, ctx, glmuse)
             union!(syms, _value_symbols(p.args.arg1))
             continue
         end
-        if _is_lkj_factor_call(s.rhs)
-            haskey(coefuse, s.lhs) && _sfail(
-                "$(s.lhs) is a predictor coefficient and cannot also be " *
-                "an LKJCovarianceFactor")
-            sc, cr = _lower_lkj_factor(s.lhs, s.rhs, coefuse, ctx)
-            push!(vectors, sc)
-            push!(vectors, cr)
-            sc.args.arg1 isa Symbol && push!(syms, sc.args.arg1)
-            continue
-        end
         haskey(coefuse, s.lhs) && continue
         haskey(glmuse, s.lhs) && s.lhs ∉ ctx.ordinary_parameters && continue
         # Sized declarations are ordinary array parameters.
@@ -13257,61 +13242,6 @@ function _lower_plain_thresholds(s, coefuse, ctx)
     return VectorParameter(lhs, family, args, size, lhs)
 end
 
-_is_lkj_factor_call(rhs) =
-    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-    rhs.args[1] === :LKJCovarianceFactor
-
-# SB's derived factor-piece names for a stem `L`: `L_scales` (the positive
-# scale vector) and `L_L_corr` (the LKJ Cholesky factor). Single source for
-# the factor allocator and the joint-response linker.
-_lkj_factor_names(stem::Symbol) =
-    (Symbol(stem, :_scales), Symbol(stem, :_L_corr))
-
-# SB's covariance-factor declaration, decomposed:
-# `L ~ LKJCovarianceFactor(K, Exponential(θ), eta)` allocates the factor's
-# two plan nodes — the positive scales vector and the LKJ Cholesky factor
-# (SB's `target_scales` / `target_L_corr`) — which the joint response
-# links explicitly. The `L` factor itself materializes in-graph as
-# `diag_pre_multiply(scales, L_corr)`; the stem binds no plan node.
-# Scale priors are Exponential-only in this slice (SB's default;
-# sampled-θ hyperparameters ride the scalar-prior shape).
-function _lower_lkj_factor(lhs, rhs, coefuse, ctx)
-    args = _plain_args(rhs, "`LKJCovarianceFactor`")
-    length(args) == 3 || _sfail("parameter $lhs: " *
-                                "`LKJCovarianceFactor` takes (K, scale prior, " *
-                                "shape) " *
-                                "(`L ~ LKJCovarianceFactor(2, Exponential(1.0), 2.0)`), " *
-                                "got $(length(args)) arguments")
-    K, prior, shape = args
-    (K isa Integer && !(K isa Bool) && K >= 1) ||
-        _sfail("parameter $lhs: `LKJCovarianceFactor` needs an integer " *
-               "dimension K ≥ 1, got $(repr(K))")
-    prior isa Expr && prior.head === :call && !isempty(prior.args) &&
-        prior.args[1] === :Exponential ||
-        _sfail("parameter $lhs: joint-factor scale prior is " *
-               "`Exponential(θ)` in this slice (SB's default), got " *
-               "$(repr(prior))")
-    pargs = _plain_args(prior, "`Exponential`")
-    length(pargs) == 1 || _sfail("parameter $lhs: `Exponential` takes " *
-                                 "exactly the scale")
-    theta = _lower_param_arg(lhs, only(pargs), coefuse, ctx.matrices)
-    (shape isa Real && isfinite(shape) && shape > 0) ||
-        _sfail("parameter $lhs: LKJ shape must be a finite positive " *
-               "literal (a hyperparameter), got $(repr(shape))")
-    scales, corr = _lkj_factor_names(lhs)
-    for nm in (scales, corr)
-        nm in ctx.taken && _sfail(
-            "implicit factor piece $nm for $lhs collides " *
-            "with your definition — rename yours")
-        push!(ctx.taken, nm)
-    end
-    Ki = Int(K)
-    return (VectorParameter(scales, :positive_exponential, (arg1 = theta,),
-            Ki, lhs),
-        VectorParameter(corr, :cholesky_corr_lkj, (arg1 = Float64(shape),),
-            Ki, lhs))
-end
-
 function _lower_parameter(lhs, rhs, coefuse, matrices)
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || _sfail(
         "parameter $lhs needs a distribution call, got $(repr(rhs))")
@@ -13339,7 +13269,7 @@ function _lower_parameter(lhs, rhs, coefuse, matrices)
                "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
                "Beta, InverseGamma, StudentT, TDist, Laplace, Logistic, Uniform, Weibull, " *
                "HalfNormal, HalfCauchy, Flat, " *
-               "Dirichlet, LKJCovarianceFactor, truncated, restricted). If `$fam` is " *
+               "Dirichlet, LKJCholesky, truncated, restricted). If `$fam` is " *
                "meant as a submodel, define it with " *
                "`@rkppl $fam(args...) = begin ... end` and " *
                "make it visible in the lowering module (`mod=`).")

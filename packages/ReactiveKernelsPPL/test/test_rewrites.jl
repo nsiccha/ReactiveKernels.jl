@@ -139,7 +139,9 @@ const _rewrite_pinned_coefficients = merge(_rewrite_coefficients, (; b = [0.2, -
 
     joint = @rkppl begin
         a ~ Normal(0, 1)
-        L ~ LKJCovarianceFactor(2, Exponential(1), 2)
+        L_scales[1:2] .~ Exponential.(1)
+        L_L_corr ~ LKJCholesky(2, 2)
+        L = L_scales .* L_L_corr
         [y1, y2] ~ MvNormalCholesky([a, a], L)
     end
     changed = merge(joint, :([y1, y2] ~ MvNormalCholesky([a, 2a], L)))

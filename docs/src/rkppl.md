@@ -342,6 +342,19 @@ from parameter geometry, without adding generated values to sampler coordinates.
 - Single assignment, no `if`, no `target +=`. Loops are written as
   `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
 
+Joint `MvNormalCholesky` responses use explicitly declared covariance pieces:
+
+```julia
+sd[1:2] .~ Exponential.(1)
+C ~ LKJCholesky(2, 2)
+F = sd .* C
+[y1, y2] ~ MvNormalCholesky([mu1, mu2], F)
+```
+
+`LKJCovarianceFactor` no longer creates implicit priors or names. The scale
+prior and factor names are the author's; ordinary positive-support scale
+priors and a sampled `LKJCholesky` shape are supported.
+
 A definition may call a function-shaped ReactiveKernels `@kernel` in the model
 module. A positional call such as `loc = recurrence(x, a)` splices the child's
 graph into the generated model, including its authored plates and scans.
