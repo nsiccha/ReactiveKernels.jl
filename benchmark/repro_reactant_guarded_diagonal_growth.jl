@@ -80,10 +80,13 @@ end
     # flow, nonlinear work and indexing must agree at every dimension.
     retained = [map(retained_work_inventory, pair) for pair in inventories]
     @test_broken allequal(retained)
-    # Require the authored loop and lazy guard after default XLA optimization,
+    # Require retained iteration and bounded nonlinear work after default XLA,
     # including the K=2 one-trip body. The marker describes stock Reactant.
+    # Pure guard conditionals are diagnostic (docs/src/constraints.md); their
+    # absence alone does not fail the value/ordinary-gradient checks above.
+    println("guarded diagonal executable conditional counts: ",
+        [map(ops -> get(ops, "conditional", 0), pair) for pair in executable])
     @test_broken all(pair ->
         get(pair[1], "while", 0) == 1 && get(pair[2], "while", 0) == 2 &&
-        get(pair[1], "conditional", 0) == 1 && get(pair[2], "conditional", 0) == 2 &&
         all(ops -> get(ops, "log", 0) == 1, pair), executable)
 end

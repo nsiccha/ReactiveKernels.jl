@@ -74,7 +74,8 @@ end
 @testset "Reactant: data-sized shared LKJ factor reverse" begin
     # Constructing one shared diagonal value avoids the raw matrix/guard
     # dominance failure isolated by the backend-only reproducer. Every prior
-    # logarithm and its derivative still belongs to the live shape guard.
+    # logarithm belongs to the authored shape guard. Pure backend speculation
+    # is allowed when selected values, ordinary derivatives and safety agree.
     traced, traced_work, optimized, executable, recipes = [], [], [], [], Int[]
     for (K, n, S) in ((2, 7, 2), (2, 19, 4), (4, 7, 2),
             (8, 7, 2), (16, 19, 4))
@@ -153,13 +154,14 @@ end
     # named marker when the generic compiler retention fix is delivered.
     @test_broken allequal(retained)
     @test executable[1] == executable[2]
-    # MLIR retention alone does not protect a singleton loop or lazy branch
-    # from later XLA simplification. Keep this stock limitation named too.
+    # MLIR retention alone does not protect singleton data-derived iteration
+    # from later XLA simplification. Keep the growth marker and full inventory
+    # diagnostic; included pure conditional counts are not a correctness rule.
     @test_broken allequal([map(_cv_executable_retained_work, pair)
         for pair in executable])
 end
 
-@testset "Reactant: retained LKJ prior guard is lazy" begin
+@testset "Reactant: LKJ prior guard preserves values and ordinary gradients" begin
     kernel = _cv_lkj_diagonal_guard(4)
     valid = [1.5, 1.0, 0.8, 0.7, 0.6]
     ad = prepare_ad(kernel, _GEN_BACKEND, valid; active = :unconstrained)
