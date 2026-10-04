@@ -576,68 +576,6 @@ PopulationPrior(predictor::Symbol, addressee::Symbol, family::Symbol,
     PopulationPrior(predictor, addressee, family, location, scale, NaN)
 
 """
-    R2D2Prior(predictor, r2, phi, tau, overrides)
-
-Flat whole-predictor R2D2 variance decomposition (SB mirror, the
-`effect(lp,:) ~ r2d2(...)` form — the `sd(...) ~ r2d2(...)` R2D2M2/ICC
-grammar belongs to the hierarchical lane, never here). One per
-predictor at most; a predictor with an `R2D2Prior` carries NO
-[`PopulationPrior`](@ref) rows (coverage moves here).
-
-- `r2` names the scalar `Beta` [`SampledParameter`](@ref).
-- `phi` names the `:simplex_dirichlet` [`VectorParameter`](@ref) whose
-  length is the share count.
-- `tau` is the total scale: a sampled-parameter name (half-Normal) or
-  a positive literal (SB's data `tau_bsv`).
-- `overrides` maps addressees with an explicit Normal prior to their
-  `(location, scale)` — those columns keep their own scale and leave
-  the simplex (the SB share_idx/fallback composition). The intercept
-  is always share 0 (its override, if stated, supplies loc/scale).
-
-Share assignment follows SB exactly: every non-intercept design
-column without an override takes the next share in design-column
-order; the emitter derives
-`scale[j] = sqrt(phi[share] * R2 * tau^2 / varx[j])`.
-"""
-struct R2D2Prior
-    predictor::Symbol
-    r2::Symbol
-    phi::Symbol
-    tau::Union{Symbol,Real}
-    overrides::Dict{Symbol,Tuple{Float64,Float64}}
-end
-
-"""
-    HorseshoePrior(predictor, addressee, local_scale, global_scale, sign)
-
-One per-coefficient horseshoe prior: standard-normal raw coefficient,
-normalized HalfCauchy(local_scale) lambda, and HalfCauchy(global_scale) tau.
-Each scalar built-in call owns its own tau. For one shared global tau use
-`horseshoe_coefs(X)`. `addressee` is a predictor's intercept or continuous
-column and `sign` is its use polarity. The derived coordinate is
-`sign * raw * lambda * tau`; the latent priors use SampledParameter.
-Scales are finite strictly positive literals.
-"""
-struct HorseshoePrior
-    predictor::Symbol
-    addressee::Symbol
-    local_scale::Float64
-    global_scale::Float64
-    sign::Int
-end
-
-"""Synthesized triple/scalar names for one horseshoe addressee (surface,
-validator, and generator share these — the names are the contract)."""
-horseshoe_raw_name(pred::Symbol, addr::Symbol) =
-    Symbol(:horseshoe_, pred, :_, addr, :_raw)
-horseshoe_lambda_name(pred::Symbol, addr::Symbol) =
-    Symbol(:horseshoe_, pred, :_, addr, :_lambda)
-horseshoe_tau_name(pred::Symbol, addr::Symbol) =
-    Symbol(:horseshoe_, pred, :_, addr, :_tau)
-horseshoe_normal_name(pred::Symbol, addr::Symbol) =
-    Symbol(:horseshoe_, pred, :_, addr, :_normal)
-
-"""
     SupportOverride
 
 A latent's support override is `nothing` (infer natural support), `:positive`
@@ -1718,8 +1656,6 @@ struct StructuralPlan
     spline_vectors::Vector{SplineVector}
     hsgp_bases::Vector{HSGPBasis}
     kernel_plates::Vector{KernelPlate}
-    r2d2_priors::Vector{R2D2Prior}
-    horseshoe_priors::Vector{HorseshoePrior}
     matrices::Vector{DesignMatrix}
     event_lps::Vector{LinearPKEventLPSpec}
     array_parameters::Vector{ArrayParameter}
@@ -1733,66 +1669,64 @@ end
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
     scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, matrices,
+    event_lps, array_parameters, submodel_scopes,
     conditioned, indexed_observations) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
         scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates, matrices,
+        event_lps, array_parameters, submodel_scopes,
         conditioned, indexed_observations, SampledParameter[])
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
     scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, matrices,
+    event_lps, array_parameters, submodel_scopes,
     conditioned) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
         scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates, matrices,
+        event_lps, array_parameters, submodel_scopes,
         conditioned, Set{Symbol}())
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
     scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes) =
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, matrices,
+    event_lps, array_parameters, submodel_scopes) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
         scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        spline_bases, spline_vectors, hsgp_bases, kernel_plates, matrices,
+        event_lps, array_parameters, submodel_scopes,
         Set{Symbol}())
 
 # Existing full-positional plans have no lexical submodel metadata.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
     scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps, array_parameters) =
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, matrices, event_lps, array_parameters) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps,
         plate_parameters, scans, dar_paths, varying_draws, varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        kernel_plates, matrices, event_lps,
         array_parameters, SubmodelScope[])
 
-# Pre-array full-positional constructor (24-arg): plans built before
+# Pre-array full-positional constructor: plans built before
 # `array_parameters` existed keep working with none.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
     scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps) =
+    spline_bases, spline_vectors, hsgp_bases, kernel_plates, matrices, event_lps) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps,
         plate_parameters, scans, dar_paths, varying_draws, varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        kernel_plates, matrices, event_lps,
         ArrayParameter[])
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
@@ -1813,7 +1747,7 @@ StructuralPlan(
         LevelMap[], ScanSpec[], DarSpec[], VaryingDraws[], VaryingSlice[],
         VectorParameter[],
         SplineBasis[], SplineVector[], HSGPBasis[], KernelPlate[],
-        R2D2Prior[], HorseshoePrior[], DesignMatrix[],
+        DesignMatrix[],
         LinearPKEventLPSpec[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
@@ -1845,8 +1779,6 @@ function StructuralPlan(
         spline_vectors::Vector{SplineVector} = SplineVector[],
         hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
         kernel_plates::Vector{KernelPlate} = KernelPlate[],
-        r2d2_priors::Vector{R2D2Prior} = R2D2Prior[],
-        horseshoe_priors::Vector{HorseshoePrior} = HorseshoePrior[],
         matrices::Vector{DesignMatrix} = DesignMatrix[],
         event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[],
         array_parameters::Vector{ArrayParameter} = ArrayParameter[],
@@ -1859,14 +1791,9 @@ function StructuralPlan(
         roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
         varying_slices,
         vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        kernel_plates, matrices, event_lps,
         array_parameters, submodel_scopes, conditioned, indexed_observations, external_observations)
 end
-
-"""The horseshoe entries covering `pred` (empty when the predictor keeps
-its sampled coefficient block)."""
-_horseshoe_for(plan::StructuralPlan, pred::Symbol) =
-    [h for h in plan.horseshoe_priors if h.predictor === pred]
 
 """Preserve separate simultaneous doses when a cell consumes an event-axis
 bioavailability vector. Adding amounts before a nonlinear dose effect would
@@ -2469,8 +2396,6 @@ function validate_structure(plan::StructuralPlan)
     _validate_predictors(plan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
-    _validate_r2d2(plan)
-    _validate_horseshoe(plan)
     _validate_kernels(plan)
     _validate_responses(plan)
     _validate_varying_draws(plan)
@@ -2504,7 +2429,6 @@ function validate_data(plan::StructuralPlan)
     _validate_splines_data(plan)
     _validate_hsgp_data(plan)
     _validate_kernels_data(plan)
-    _validate_r2d2_data(plan)
     return nothing
 end
 
@@ -3311,7 +3235,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :levelmaps, :vector_parameters, :submodel_scopes, :conditioned,
     :plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
     :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
-    :r2d2_priors, :horseshoe_priors, :array_parameters, :kernel_plates,
+    :array_parameters, :kernel_plates,
     :event_lps, :indexed_observations, :external_observations)
 
 # Observation-shaped values and their data dependencies. Parameters sized
@@ -3415,7 +3339,7 @@ function _uses_structured_observation_axes(plan::StructuralPlan)
     return any(f -> !isempty(getfield(plan, f)),
         (:scans, :dar_paths, :varying_draws, :varying_slices,
          :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
-         :r2d2_priors, :horseshoe_priors, :kernel_plates, :event_lps))
+         :kernel_plates, :event_lps))
 end
 
 """Observation axes of a plan whose `columns` are bound: `nothing` when
@@ -6749,7 +6673,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
     # (as `thresholds` for ordered families, as `threshold_coefs` for
     # per-threshold Ordinal, as the simplex `predictor`, or as a joint
     # factor piece), by monotonic terms (as their `increments`
-    # simplex), or by an R2D2 prior (as its share `phi`).
+    # simplex).
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -6793,15 +6717,6 @@ function _validate_vector_parameters(plan::StructuralPlan)
             "monotonic increments $incr must be a " *
             ":simplex_dirichlet vector parameter, got $(p.family)")
         push!(refs[incr], t.label)
-    end
-    for rp in plan.r2d2_priors
-        haskey(refs, rp.phi) || _fail(rp.predictor,
-            "R2D2 share parameter $(rp.phi) is not a vector parameter")
-        p = only(q for q in plan.vector_parameters if q.name === rp.phi)
-        p.family === :simplex_dirichlet || _fail(rp.predictor,
-            "R2D2 share parameter $(rp.phi) must be a " *
-            ":simplex_dirichlet vector parameter, got $(p.family)")
-        push!(refs[rp.phi], rp.predictor)
     end
     # Every declaration contributes its prior, including an otherwise
     # unused latent. Its extent must resolve from the declaration at bind.
@@ -7677,10 +7592,6 @@ end
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
     rows = Dict{Tuple{Symbol,Symbol},PopulationPrior}()
-    r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
-    hs = Set{Tuple{Symbol,Symbol}}(
-        (h.predictor, h.addressee) for h in plan.horseshoe_priors)
-    hs_preds = Set{Symbol}(h.predictor for h in plan.horseshoe_priors)
     param_names = Set{Symbol}(p.name for p in plan.parameters)
     by_param = Dict{Symbol,SampledParameter}(p.name => p for p in plan.parameters)
     assign_names = Set{Symbol}(a.name for a in plan.assignments)
@@ -7689,14 +7600,7 @@ function _validate_priors(plan::StructuralPlan)
         any(p -> p.name === pr.predictor, plan.predictors) ||
             pr.predictor in glm_labels ||
             _fail(:plan, "prior addresses unknown predictor $(pr.predictor)")
-        pr.predictor in r2d2 && _fail(:plan,
-            "predictor $(pr.predictor) carries an R2D2Prior — its prior " *
-            "mass lives there, not in a PopulationPrior row (explicit " *
-            "Normal columns ride the overrides map)")
         key = (pr.predictor, pr.addressee)
-        key in hs && _fail(:plan,
-            "prior for $key duplicates a HorseshoePrior — a horseshoe " *
-            "addressee carries its triple, not a PopulationPrior row")
         key in seen &&
             _fail(:plan, "duplicate prior for $key")
         push!(seen, key)
@@ -7771,8 +7675,6 @@ function _validate_priors(plan::StructuralPlan)
                   "finite positive nu, got $(repr(pr.nu))")
     end
     for pred in plan.predictors
-        # R2D2 predictors are covered by _validate_r2d2, not here.
-        pred.name in r2d2 && continue
         # Offset terms carry no coefficient; latent terms carry the per-cell
         # PlateParameter, whose prior lives on the plate parameter itself;
         # effect terms carry a VaryingDraws, spline summands a SplineBasis,
@@ -7820,13 +7722,7 @@ function _validate_priors(plan::StructuralPlan)
         any(t -> t.kind === InterceptTerm && !_parameter_term(t),
             pred.terms) && push!(addressees, :Intercept)
         for a in addressees
-            # A horseshoe predictor covers an addressee by its entry or by
-            # a synthesized Normal scalar (family checked in
-            # _validate_horseshoe); every other predictor by a
-            # PopulationPrior row.
-            (pred.name, a) in seen || (pred.name, a) in hs ||
-                (pred.name in hs_preds &&
-                    horseshoe_normal_name(pred.name, a) in param_names) ||
+            (pred.name, a) in seen ||
                 _fail(:plan, "no prior for ($(pred.name), $a)")
         end
     end
@@ -7845,207 +7741,6 @@ function _validate_priors(plan::StructuralPlan)
                 "GLM-object beta prior for ($(r.label), $c) is " *
                 "Normal-only (got $(rows[(r.label, c)].family)) — write " *
                 "the decomposed predictor form for other families")
-        end
-    end
-    return nothing
-end
-
-# R2D2 structural checks: predictor linkage (one per predictor),
-# parameter families (Beta R2, simplex phi, half-Normal-or-literal tau),
-# and override addressees. Share counts need design widths, so they wait
-# for `_validate_r2d2_data`.
-function _validate_r2d2(plan::StructuralPlan)
-    seen = Set{Symbol}()
-    for rp in plan.r2d2_priors
-        pred = nothing
-        for p in plan.predictors
-            p.name === rp.predictor && (pred = p)
-        end
-        pred === nothing && _fail(:plan,
-            "R2D2 prior addresses unknown predictor $(rp.predictor)")
-        rp.predictor in seen && _fail(:plan,
-            "duplicate R2D2 prior for predictor $(rp.predictor) " *
-            "(one per predictor)")
-        push!(seen, rp.predictor)
-        r2 = nothing
-        for p in plan.parameters
-            p.name === rp.r2 && (r2 = p)
-        end
-        r2 === nothing && _fail(rp.predictor,
-            "R2D2 R2 parameter $(rp.r2) is not a sampled parameter")
-        r2.family === :beta || _fail(rp.predictor,
-            "R2D2 R2 parameter $(rp.r2) must be Beta, got $(r2.family)")
-        # phi linkage + family ride _validate_vector_parameters; tau:
-        if rp.tau isa Symbol
-            tau = nothing
-            for p in plan.parameters
-                p.name === rp.tau && (tau = p)
-            end
-            tau === nothing && _fail(rp.predictor,
-                "R2D2 tau $(rp.tau) names neither a sampled parameter " *
-                "nor a literal (data tau_bsv inlines as a literal)")
-            (tau.family === :normal && tau.support_override === :positive) ||
-                _fail(rp.predictor,
-                    "sampled R2D2 tau $(rp.tau) must be half-Normal " *
-                    "(`HalfNormal(s)`), got $(tau.family) with " *
-                    "override $(repr(tau.support_override))")
-        else
-            isfinite(rp.tau) && rp.tau > 0 || _fail(rp.predictor,
-                "literal R2D2 tau must be finite and strictly positive " *
-                "(SB `_sb_r2d2_positive`), got $(repr(rp.tau))")
-        end
-        allowed = Set{Symbol}()
-        for t in pred.terms
-            if t.kind === MatrixTerm
-                m = _find_matrix(plan, t.options.matrix)
-                m === nothing && _fail(:plan,
-                    "internal: matrix term $(t.label) addresses unknown " *
-                    "matrix (validate_predictors should have caught this)")
-                union!(allowed, _matrix_element_addressees(m))
-                continue
-            end
-            push!(allowed, t.addressee)
-        end
-        any(t -> t.kind === InterceptTerm, pred.terms) &&
-            push!(allowed, :Intercept)
-        for (addr, (loc, sca)) in rp.overrides
-            addr in allowed || _fail(rp.predictor,
-                "R2D2 override addresses $addr, not a column of " *
-                "predictor $(rp.predictor)")
-            isfinite(loc) && isfinite(sca) && sca > 0 || _fail(rp.predictor,
-                "R2D2 override for $addr must be Normal(finite, " *
-                "positive), got ($(repr(loc)), $(repr(sca)))")
-        end
-    end
-    return nothing
-end
-
-# R2D2 data checks: the share composition needs design widths + bound
-# columns. Runs at bind (after levelmaps bind, after phi size inference).
-function _validate_r2d2_data(plan::StructuralPlan)
-    isempty(plan.r2d2_priors) && return nothing
-    for rp in plan.r2d2_priors
-        pred = only(p for p in plan.predictors if p.name === rp.predictor)
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
-            matrices = plan.matrices)
-        share, _, _, varx =
-            r2d2_column_scales(shape, plan.columns, rp.overrides)
-        n_shares = isempty(share) ? 0 : maximum(share)
-        n_shares == 0 && _fail(rp.predictor,
-            "R2D2 over predictor $(rp.predictor) decomposes nothing " *
-            "(intercept-only or every column overridden) — the flat " *
-            "slice has no hierarchical-lane rule to no-op for")
-        phi = only(p for p in plan.vector_parameters if p.name === rp.phi)
-        phi.size == n_shares || _fail(rp.predictor,
-            "R2D2 phi $(rp.phi) has $(phi.size) shares but predictor " *
-            "$(rp.predictor) decomposes $n_shares columns")
-        for j in eachindex(share)
-            share[j] == 0 && continue
-            isfinite(varx[j]) && varx[j] > 0 || _fail(rp.predictor,
-                "R2D2 column $j of predictor $(rp.predictor) has " *
-                "non-positive variance $(repr(varx[j])) — a constant " *
-                "column cannot join the simplex (drop it or give it " *
-                "an explicit Normal prior)")
-        end
-    end
-    return nothing
-end
-
-# Horseshoe structural checks: predictor linkage, one structured prior
-# per predictor, scalar-only addressees on scalar-only predictors, use
-# polarity, finite positive scales, and triple linkage (each entry's
-# (raw, lambda, tau) sampled parameters exist with the SB geometry:
-# standard-Normal raw and normalized half-Cauchy scales agreeing with the entry).
-function _validate_horseshoe(plan::StructuralPlan)
-    r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
-    seen = Set{Tuple{Symbol,Symbol}}()
-    by_name = Dict{Symbol,SampledParameter}(
-        p.name => p for p in plan.parameters)
-    for h in plan.horseshoe_priors
-        pred = nothing
-        for p in plan.predictors
-            p.name === h.predictor && (pred = p)
-        end
-        pred === nothing && _fail(:plan,
-            "horseshoe prior addresses unknown predictor $(h.predictor)")
-        h.predictor in r2d2 && _fail(:plan,
-            "predictor $(h.predictor) carries both an R2D2Prior and a " *
-            "HorseshoePrior — one structured prior per predictor")
-        key = (h.predictor, h.addressee)
-        key in seen && _fail(:plan, "duplicate horseshoe prior for $key")
-        push!(seen, key)
-        for t in pred.terms
-            (t.kind === InterceptTerm || t.kind === ContinuousTerm ||
-                t.kind === OffsetTerm) || _fail(h.predictor,
-                "horseshoe over predictor $(h.predictor) meets a " *
-                "$(t.kind) term — the flat slice covers " *
-                "intercept/continuous coefficients only")
-        end
-        addrs = Set{Symbol}()
-        for t in pred.terms
-            t.kind === InterceptTerm && push!(addrs, :Intercept)
-            t.kind === ContinuousTerm && push!(addrs, only(t.columns))
-        end
-        h.addressee in addrs || _fail(h.predictor,
-            "horseshoe prior addresses $(h.addressee), not an " *
-            "intercept/continuous column of predictor $(h.predictor)")
-        (h.sign == 1 || h.sign == -1) || _fail(h.predictor,
-            "horseshoe prior for $key has sign $(h.sign) (use polarity " *
-            "is +1/-1)")
-        isfinite(h.local_scale) && h.local_scale > 0 || _fail(h.predictor,
-            "horseshoe prior for $key has local_scale " *
-            "$(repr(h.local_scale)) (finite strictly positive)")
-        isfinite(h.global_scale) && h.global_scale > 0 || _fail(h.predictor,
-            "horseshoe prior for $key has global_scale " *
-            "$(repr(h.global_scale)) (finite strictly positive)")
-        raw = get(by_name, horseshoe_raw_name(h.predictor, h.addressee),
-            nothing)
-        raw === nothing && _fail(h.predictor,
-            "horseshoe prior for $key names no raw parameter " *
-            "($(horseshoe_raw_name(h.predictor, h.addressee)))")
-        (raw.family === :normal && raw.args == (arg1 = 0, arg2 = 1) &&
-            raw.support_override === nothing) || _fail(h.predictor,
-            "horseshoe raw $(raw.name) must be standard-Normal " *
-            "(identity support), got $(raw.family)$(raw.args) with " *
-            "override $(repr(raw.support_override))")
-        for (nm, sc, role) in (
-                (horseshoe_lambda_name(h.predictor, h.addressee),
-                    h.local_scale, "lambda"),
-                (horseshoe_tau_name(h.predictor, h.addressee),
-                    h.global_scale, "tau"))
-            q = get(by_name, nm, nothing)
-            q === nothing && _fail(h.predictor,
-                "horseshoe prior for $key names no $role parameter ($nm)")
-            (q.family === :cauchy && q.support_override === :positive &&
-                length(q.args) == 2 && q.args[1] == 0 &&
-                q.args[2] == sc) || _fail(h.predictor,
-                "horseshoe $role $nm must be normalized HalfCauchy($sc), got $(q.family)$(q.args) " *
-                "with override $(repr(q.support_override))")
-        end
-    end
-    # Non-horseshoe addressees of a horseshoe predictor ride Normal
-    # scalars (the mixed-predictor coordinate).
-    for pname in Set{Symbol}(h.predictor for h in plan.horseshoe_priors)
-        pred = only(p for p in plan.predictors if p.name === pname)
-        hs_addrs = Set{Symbol}(h.addressee
-            for h in plan.horseshoe_priors if h.predictor === pname)
-        for t in pred.terms
-            addr = t.kind === InterceptTerm ? :Intercept :
-                t.kind === ContinuousTerm ? only(t.columns) : nothing
-            addr === nothing && continue
-            addr in hs_addrs && continue
-            nm = horseshoe_normal_name(pname, addr)
-            q = get(by_name, nm, nothing)
-            q === nothing && _fail(pname,
-                "horseshoe predictor $pname addressee $addr carries " *
-                "neither an entry nor its Normal scalar ($nm)")
-            (q.family === :normal && q.support_override === nothing &&
-                length(q.args) == 2 && isfinite(q.args[1]) &&
-                isfinite(q.args[2]) && q.args[2] > 0) || _fail(pname,
-                "horseshoe Normal scalar $nm must be " *
-                "Normal(finite, positive) (identity support), got " *
-                "$(q.family)$(q.args) with override " *
-                "$(repr(q.support_override))")
         end
     end
     return nothing
@@ -11518,7 +11213,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     draws = _eval_draws_levels(plan.varying_draws, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
-            plan.predictors, plan.r2d2_priors, _with(plan; columns = columns, n_obs = n))
+            plan.predictors, _with(plan; columns = columns, n_obs = n))
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps, varying_draws = draws,
         vector_parameters = vectors2, spline_bases = bases,
@@ -11592,8 +11287,7 @@ end
 # column (max(y) for OrderedLogistic/Ordinal/Categorical); vector-param
 # `size === nothing` fills from the linked response (K−1 thresholds, K
 # simplex), from its frozen concentration length for a monotonic-linked
-# increments simplex (K−1 increments for K levels) or an R2D2-linked
-# share simplex (K shares). Explicit values assert against the
+# increments simplex (K−1 increments for K levels). Explicit values assert against the
 # inference. Returns new (immutable) vectors; unbound plans keep
 # `nothing`.
 function _dirichlet_size(plan, alpha, label)
@@ -11661,7 +11355,7 @@ end
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         vectors::Vector{VectorParameter}, columns::AbstractDict{Symbol},
         predictors::Vector{PredictorSpec} = PredictorSpec[],
-        r2d2::Vector{R2D2Prior} = R2D2Prior[], plan = nothing)
+        plan = nothing)
     # Explicit extents are ordinary data-only Julia expressions. Resolve
     # them before responses read the vector's declared support.
     vectors = VectorParameter[_resolve_vector_extent(p, plan, columns, responses) for p in vectors]
@@ -11716,10 +11410,6 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) ||
             continue
         monotonic_link[t.options.increments] = t.label
-    end
-    r2d2_link = Dict{Symbol,Symbol}()
-    for rp in r2d2
-        r2d2_link[rp.phi] = rp.predictor
     end
     out_v = VectorParameter[]
     for p in vectors
@@ -11776,15 +11466,6 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             p.size === nothing && _fail(p.label,
                 "internal: joint-factor size unresolved at bind")
             push!(out_v, p)
-        elseif haskey(r2d2_link, p.name)
-            want = concentration_size
-            want >= 1 || _fail(p.label,
-                "R2D2 shares need ≥ 1 share (an empty concentration " *
-                "decomposes nothing)")
-            p.size === nothing || p.size == want || _fail(p.label,
-                "R2D2 phi size $(p.size) disagrees with its " *
-                "concentration length $want")
-            push!(out_v, _with(p; size = want))
         elseif haskey(_VECTOR_ELEMENT_FAMILIES, p.family) && p.size !== nothing
             # A plain vector with a concrete structural size (read whole
             # by definitions or unused) retains its declared extent.

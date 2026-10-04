@@ -95,7 +95,7 @@ function _external_rhs(rhs)
     return !(head in union(keys(_PARAM_FAMILIES), keys(_KERNEL_OBS_FAMILIES), _PANEL_OBS_HEADS, _GLM_HEADS,
         (:BernoulliLogit, :PoissonLog, :BinomialLogit,
          :NegativeBinomial2Log, :GammaLog, :BetaLogit,
-         :HalfNormal, :HalfCauchy, :Flat, :flat, :positive, :truncated, :restricted, :Horseshoe,
+         :HalfNormal, :HalfCauchy, :Flat, :flat, :positive, :truncated, :restricted,
          :weighted, :censored, :interval_censored, :Ordered, :Dirichlet,
          :LKJCholesky, :MixtureModel,
          :Gaussian, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial,

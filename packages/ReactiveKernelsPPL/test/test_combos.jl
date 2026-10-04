@@ -24,10 +24,16 @@ const _CB_Y = [0.4 + 0.8x + 0.2sin(3x) for x in _CB_X]
 const _CB_G = [isodd(i) ? 1 : 2 for i in 1:_CB_N]
 
 const _CB_ADMITTED = (
-    ("horseshoe x mixture", quote
+    ("computed coefficients x mixture", quote
         a1 ~ Normal(0, 1)
-        b1 ~ Horseshoe()
-        b2 ~ Horseshoe(local_scale = 0.5, global_scale = 0.25)
+        raw1 ~ Normal(0, 1)
+        lambda1 ~ HalfCauchy(1)
+        tau1 ~ HalfCauchy(1)
+        b1 = raw1 * lambda1 * tau1
+        raw2 ~ Normal(0, 1)
+        lambda2 ~ HalfCauchy(0.5)
+        tau2 ~ HalfCauchy(0.25)
+        b2 = raw2 * lambda2 * tau2
         mu1 = a1 .+ b1 .* x1 .+ b2 .* x2
         mu2 ~ Normal(0.0, 5.0)
         sigma ~ Exponential(1.0)
@@ -92,14 +98,4 @@ end
         y .~ Normal.(mu, sigma)
         x_obs .~ Normal.(x_true, 0.5)
     end, (; y = _CB_Y, x_obs = _CB_X))
-    # horseshoe x hsgp: the horseshoe slice covers intercept/continuous
-    # coefficients only.
-    gap(quote
-        a ~ Normal(0, 1)
-        b1 ~ Horseshoe()
-        hsgp_basis(:h, x; k = 6)
-        eta = a .+ b1 .* x2 .+ hsgp(:h)
-        cnt .~ Poisson.(exp.(eta))
-    end, (; cnt = [round(Int, 2 + sin(i)) for i in 1:_CB_N], x = _CB_X,
-        x2 = _CB_X2))
 end

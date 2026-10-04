@@ -2,7 +2,7 @@
 # data-inferred level count K must not replicate emitted statements. The
 # emitted program at two level counts must be the SAME expression once
 # literal constants are abstracted (level counts, data lengths, and the
-# frozen literal payloads — Dirichlet α−1, R2D2 column variances — are
+# frozen literal payloads — Dirichlet α−1 — are
 # constants; anything else that differs is K-dependent structure).
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -68,11 +68,12 @@ function _kinv_plans(K::Int)
                 sigma ~ Exponential(1.0)
                 yc .~ Normal.(mu, sigma)
             end, (:yc, :c); conditioned = (:yc, :c)), data(:yc => yc, :c => y)),
-        "r2d2_factor" => bind_data(lower_rkppl(quote
+        "dependent_factor_priors" => bind_data(lower_rkppl(quote
                 R2 ~ Beta(1.0, 1.0)
                 phi ~ Dirichlet($phia)
                 mu = b1 .* x1 .+ c[g]
-                r2d2(mu, R2, phi)
+                b1 ~ Normal(0, sqrt(R2 * phi[1]))
+                c[1:length(levels(g))] .~ Normal.(0, sqrt.(R2 .* phi[2:length(phi)]))
                 sigma ~ Exponential(1.0)
                 yc .~ Normal.(mu, sigma)
             end, Set([:x1, :g, :yc]); conditioned = Set([:x1, :g, :yc])), data(:x1 => x, :g => y, :yc => yc)),

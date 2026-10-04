@@ -297,20 +297,6 @@ end
     @test any(p -> p.name === :b, twice.parameters)
     @test [t.kind for t in twice.predictors[1].terms] ==
         [InterceptTerm, ContinuousTerm]
-    # Shrinkage priors go on the coefficient-holding sub-predictors,
-    # never the composed root.
-    # refused: r2d2 decomposes a coefficient-holding predictor; a nonlinear root has no coefficient block (one stated prior per coefficient, P7/P8 1cmodra)
-    @test_throws SurfaceLoweringError lower_rkppl(quote
-        a_th ~ Normal(0, 1)
-        b_th ~ Normal(0, 1)
-        r2d2(eta, R2, phi)
-        R2 ~ Beta(1, 1)
-        phi ~ Dirichlet(2, 1.0)
-        th = a_th .+ b_th .* xs
-        be ~ Normal(0.0, 100.0)
-        eta = be .* th
-        y .~ Bernoulli.(logistic.(eta))
-    end, (:y, :xs); conditioned = (:y, :xs))
     # A dotted unary map over two operands fails closed with guidance,
     # never a raw `only` ArgumentError (robust G2/G3/G4 re-audit).
     for bad in (:(exp.(th, al)), :(logistic.(th, al)))

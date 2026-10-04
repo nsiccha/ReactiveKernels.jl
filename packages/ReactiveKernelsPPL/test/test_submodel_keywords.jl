@@ -15,6 +15,14 @@ end
     return x .+ 1
 end
 
+@rkppl Horseshoe(x) = begin
+    return x .+ 1
+end
+
+@rkppl r2d2(x) = begin
+    return x .+ 1
+end
+
 @testset "submodel keywords have their declared meaning" begin
     data = (; x = [0.1, 0.4], y = [0.2, -0.3])
     ordinary = lower_rkppl(quote
@@ -27,6 +35,13 @@ end
         y .~ Normal.(mu, 1)
     end, data; mod = @__MODULE__, conditioned = (:y,))
     @test validate_structure(renamed) === nothing
+    for name in (:Horseshoe, :r2d2)
+        ordinary_name = lower_rkppl(quote
+            mu ~ $name(x)
+            y .~ Normal.(mu, 1)
+        end, data; mod = @__MODULE__, conditioned = (:y,))
+        @test validate_structure(ordinary_name) === nothing
+    end
 
     # Refused: USER 1cmodra (names) removes the undeclared predictor pin.
     # A declared keyword named predictor remains an ordinary argument above.

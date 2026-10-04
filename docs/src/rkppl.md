@@ -323,8 +323,8 @@ from parameter geometry, without adding generated values to sampler coordinates.
   different links, with its original parameter names and priors.
   Values outside parameter support contribute `-Inf` through a lazy
   density branch. Mixture components may use independent links.
-  Scalar Horseshoe coefficient aliases read the value reconstructed from
-  the existing coordinates, so a scale use retains the same prior.
+  A computed coefficient such as `b = z * lambda * tau` reads its
+  declared parameters, so using it as a scale retains the same priors.
 - Plate cells accept `BernoulliLogit.(eta)` and `PoissonLog.(eta)` directly
   on the logit and log-rate scales. A bare modeled `VonMises.(kappa)` uses
   zero mean. Live concentration supports native density and AD; compiled
@@ -354,6 +354,13 @@ F = sd .* C
 `LKJCovarianceFactor` no longer creates implicit priors or names. The scale
 prior and factor names are the author's; ordinary positive-support scale
 priors and a sampled `LKJCholesky` shape are supported.
+
+The implicit `r2d2(...)` statement and `b ~ Horseshoe(...)` coefficient
+shortcut are retired. State priors and coefficient arithmetic explicitly,
+or obtain the BRM-owned bodies with
+`BayesianRegressionModels.rkppl_model(:r2d2_coefs)` and
+`BayesianRegressionModels.rkppl_model(:horseshoe_coefs)`. Their statistical
+preparation and model construction belong to BRM.
 
 A definition may call a function-shaped ReactiveKernels `@kernel` in the model
 module. A positional call such as `loc = recurrence(x, a)` splices the child's
@@ -780,9 +787,8 @@ restore_draws(built.layout, U)           # U: layout.total × draws
   flattened names such as `z_b`. Unusual identifiers use Julia's `var"…"`
   spelling in coordinate labels, so a literal name `var"z.b"` stays distinct
   from the scoped path `z.b`.
-  Explicit whole-predictor R2D2 and Horseshoe constructs retain their own
-  coefficient layouts. Read `coordinate_names(built.layout)` and `constrain`;
-  rebuild old prepared models and packed-draw mappings when migrating.
+  Read `coordinate_names(built.layout)` and `constrain`; rebuild old
+  prepared models and packed-draw mappings when migrating.
 - A kernel returned by `prepare_query` closes over code generated at build time.
   Call it from top level or through `Base.invokelatest`; `SamplerQuery` calls
   already carry that barrier.

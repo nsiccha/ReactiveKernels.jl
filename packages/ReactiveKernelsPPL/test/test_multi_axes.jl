@@ -51,24 +51,29 @@ function _ma_check(ast, data, mean; scale = (nt -> 1.0), slots = (), gradient = 
     return (; bound = both, built, q, u)
 end
 
-@testset "multiple observation axes: legacy shrinkage slots" begin
+@testset "multiple observation axes: declared prior dependencies" begin
     cols = (; y = [0.2, -0.1, 0.4, 0.8], x = [-1.0, 0.5, 2.0, 1.0])
     _ma_check(quote
         R2 ~ Beta(1, 1)
         phi ~ Dirichlet([1.0])
+        tau ~ HalfNormal(1)
+        a ~ Normal(0, 1)
+        b ~ Normal(0, sqrt(phi[1] * R2 * tau^2))
         mu = a .+ b .* x
-        r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> nt.mu[1] .+ nt.mu[2] .* cols.x;
-        slots = (:r2d2_priors, :vector_parameters))
+    end, cols, (p, l, nt, u) -> nt.a .+ nt.b .* cols.x;
+        slots = (:parameters, :vector_parameters))
     _ma_check(quote
         a ~ Normal(0, 1)
-        b ~ Horseshoe()
+        raw ~ Normal(0, 1)
+        lambda ~ HalfCauchy(1)
+        tau ~ HalfCauchy(1)
+        b = raw * lambda * tau
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> nt.horseshoe_mu_Intercept_normal .+
-        nt.horseshoe_mu_x_raw .* nt.horseshoe_mu_x_lambda .* nt.horseshoe_mu_x_tau .* cols.x;
-        slots = (:horseshoe_priors,))
+    end, cols, (p, l, nt, u) -> nt.a .+
+        nt.raw * nt.lambda * nt.tau .* cols.x;
+        slots = (:parameters,))
 end
 
 _ma_segment(lay, name) = let e = only(e for e in lay.entries if e.name === name)

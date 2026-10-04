@@ -190,30 +190,6 @@ end
     _check_gradient(built.spec, bound, u)
 end
 
-@testset "library r2d2_coefs matches the r2d2 built-in" begin
-    # Corpus 42's built-in: the intercept takes the share-0 Normal(0, 1)
-    # and tau a half-Normal(0, 1), which the library states explicitly.
-    cols = _ls_cols()
-    bb, builtb = _ls_build(quote
-            R2 ~ Beta(1.0, 1.0)
-            phi ~ Dirichlet([1.0, 1.0])
-            mu = a .+ b1 .* x1 .+ b2 .* x2
-            r2d2(mu, R2, phi)
-            sigma ~ Exponential(1.0)
-            y .~ Normal.(mu, sigma)
-        end, cols)
-    bl, builtl = _ls_build(_LS_R2D2, cols)
-    ub = _ls_u(builtb)
-    v = constrain(builtb.layout, ub)
-    ul = _ls_unconstrain(builtl.layout, (; a = v.mu[1], sigma = v.sigma,
-        b = (; R2 = v.R2, tau = v.r2d2_mu_tau_bsv, phi = v.phi,
-            b = v.mu[2:3])))
-    for want in (:prior, :likelihood, :posterior)
-        @test _query(builtl.spec, bl, want, ul) ≈
-            _query(builtb.spec, bb, want, ub)
-    end
-end
-
 @testset "library horseshoe_coefs: the hand-inlined body" begin
     twin = quote
         a ~ Normal(0, 1)
@@ -248,38 +224,6 @@ end
     @test _query(built.spec, bound, :prior, u) ≈ pr
     @test _query(built.spec, bound, :likelihood, u) ≈ ll
     _check_gradient(built.spec, bound, u)
-end
-
-@testset "library horseshoe_coefs matches Horseshoe() at one coefficient" begin
-    # With one column, built-in and library scales coincide; both use
-    # normalized HalfCauchy priors.
-    cols = _ls_cols()
-    bb, builtb = _ls_build(quote
-            a ~ Normal(0, 1)
-            b1 ~ Horseshoe()
-            mu = a .+ b1 .* x1
-            sigma ~ Exponential(1.0)
-            y .~ Normal.(mu, sigma)
-        end, cols)
-    bl, builtl = _ls_build(quote
-            a ~ Normal(0, 1)
-            X = hcat(x1)
-            b ~ horseshoe_coefs(X)
-            mu = a .+ X * b
-            sigma ~ Exponential(1.0)
-            y .~ Normal.(mu, sigma)
-        end, cols)
-    ub = _ls_u(builtb)
-    v = constrain(builtb.layout, ub)
-    ul = _ls_unconstrain(builtl.layout, (; a = v.horseshoe_mu_Intercept_normal,
-        b = (; tau = v.horseshoe_mu_x1_tau, lambda = [v.horseshoe_mu_x1_lambda],
-            z = [v.horseshoe_mu_x1_raw]), sigma = v.sigma))
-    @test _query(builtl.spec, bl, :likelihood, ul) ≈
-        _query(builtb.spec, bb, :likelihood, ub)
-    for want in (:prior, :posterior)
-        @test _query(builtl.spec, bl, want, ul) ≈
-            _query(builtb.spec, bb, want, ub)
-    end
 end
 
 @testset "hcat matrices read as values" begin

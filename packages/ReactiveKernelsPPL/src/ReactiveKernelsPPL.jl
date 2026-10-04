@@ -43,7 +43,7 @@ export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTe
     DarSummandTerm, ComposedTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export ScalePredictorRef, MixtureComplementWeights
-export PopulationPrior, R2D2Prior, HorseshoePrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec, ArrayParameter
+export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec, ArrayParameter
 export VaryingZRecipe, VaryingMargin, VaryingSdPrior, VaryingDraws, VaryingSlice
 export VaryingMultiMembership, VaryingStrata
 export SplineBasisBlock, SplineBasis, SplineVector

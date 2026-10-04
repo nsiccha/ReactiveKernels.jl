@@ -76,9 +76,12 @@ end
     @test occursin("`beta[axes(X, 2)] .~ Normal.(0, 1)`", sprint(showerror, err))
 end
 
-@testset "strict declarations: horseshoe predictor" begin
+@testset "strict declarations: computed coefficient predictor" begin
     err = _strict_err(() -> lower_rkppl(quote
-            b1 ~ Horseshoe()
+            raw ~ Normal(0, 1)
+            lambda ~ HalfCauchy(1)
+            tau ~ HalfCauchy(1)
+            b1 = raw * lambda * tau
             mu = a .+ b1 .* x1
             sigma ~ Exponential(1.0)
             y .~ Normal.(mu, sigma)
@@ -87,5 +90,4 @@ end
     @test err isa SurfaceLoweringError
     msg = sprint(showerror, err)
     @test occursin("`a ~ Normal(0, 1)`", msg)
-    @test occursin("`a ~ Horseshoe()`", msg)
 end

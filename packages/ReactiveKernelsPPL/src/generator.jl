@@ -73,7 +73,6 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _dar_reconstruction_statements(plan, layout))
-    append!(stmts, _horseshoe_coef_statements(plan))
     append!(stmts, _affine_coefficient_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, likelihoods)
@@ -3649,92 +3648,6 @@ function _mvn_row_cell(K::Int, yvs::Vector{Symbol}, mvs::Vector{Symbol},
     return :( $row_const - $logdet - 0.5 * $quad )
 end
 
-# R2D2 prior bindings: the location vector stays a literal (SB
-# `beta_loc`); the scale vector is ONE broadcast over the share simplex,
-# `sqrt.(phi .* R2 .* tau^2 ./ varx)` (SB `brm_r2d2_scale`), whatever the
-# number of design columns (factor levels included). `r2d2_column_scales`
-# numbers the shares 1..S in design-column order, so the shared columns
-# read `phi` in order; share-0 columns (intercept, explicit-Normal
-# overrides) take literal fallbacks, placed by one constant-index gather
-# over `[shared; fallbacks]` (the share map is static data — no
-# data-dependent branching enters the graph). All radicands are positive
-# by construction (simplex/logistic/exp transforms + validated varx). The
-# consuming plate-sum shape is unchanged.
-function _r2d2_prior_stmts(rp::R2D2Prior, shape::DesignShape,
-        columns::AbstractDict{Symbol}, mut::Symbol, sdt::Symbol)
-    share, fallback, loc, varx =
-        r2d2_column_scales(shape, columns, rp.overrides)
-    shared = findall(>(0), share)
-    share[shared] == 1:length(shared) || throw(ContractValidationError(
-        "[generator] R2D2 shares of $(rp.predictor) are not numbered in " *
-        "design-column order (r2d2_column_scales assigns them so)"))
-    t2 = rp.tau isa Symbol ? :($(rp.tau) * $(rp.tau)) : Float64(rp.tau)^2
-    scales = :(sqrt.($(rp.phi) .* $(rp.r2) .* $t2 ./
-        Float64[$(varx[shared]...)]))
-    rhs = if length(shared) == length(share)
-        scales
-    else
-        # Shared scales first, fallbacks after (`vcat(traced, host)` —
-        # the order Reactant concatenates), gathered into column order.
-        fb = findall(==(0), share)
-        perm = zeros(Int, length(share))
-        perm[shared] .= 1:length(shared)
-        perm[fb] .= length(shared) .+ (1:length(fb))
-        :(vcat($scales, Float64[$(fallback[fb]...)])[$(Expr(:vect, perm...))])
-    end
-    return Any[:($mut = Float64[$(loc...)]), :($sdt = $rhs)]
-end
-
-_r2d2_for(plan::StructuralPlan, pred::Symbol) = begin
-    for rp in plan.r2d2_priors
-        rp.predictor === pred && return rp
-    end
-    return nothing
-end
-
-# Horseshoe derived coefficient blocks: a predictor with any HorseshoePrior
-# lays out no `:coefficient` block (layout skips it), so the block name
-# binds here as a design-ordered vector — triple products on horseshoe
-# addressees, Normal scalars elsewhere. Bound before the linear predictors,
-# which read the name unchanged. Scalar-only by validation (width-1
-# intercept/continuous blocks), so the literal has one entry per term —
-# no data-derived unrolling.
-function _horseshoe_coef_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    for pred in plan.predictors
-        hs = _horseshoe_for(plan, pred.name)
-        isempty(hs) && continue
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
-            matrices = plan.matrices)
-        by_addr = Dict{Symbol,HorseshoePrior}(h.addressee => h for h in hs)
-        coords = Any[]
-        for b in shape.blocks
-            b.width == 0 && continue
-            (b.kind === InterceptTerm || b.kind === ContinuousTerm) ||
-                throw(ContractValidationError(
-                    "[generator] horseshoe over $(pred.name) meets a " *
-                    "$(b.kind) block (validate_horseshoe restricts terms)"))
-            b.width == 1 || throw(ContractValidationError(
-                "[generator] horseshoe over $(pred.name) meets width " *
-                "$(b.width) (scalar blocks only)"))
-            addr = only(b.labels)
-            h = get(by_addr, addr, nothing)
-            if h === nothing
-                push!(coords, horseshoe_normal_name(pred.name, addr))
-            else
-                raw = horseshoe_raw_name(pred.name, addr)
-                lam = horseshoe_lambda_name(pred.name, addr)
-                tau = horseshoe_tau_name(pred.name, addr)
-                prod = :($raw * $lam * $tau)
-                push!(coords, h.sign == 1 ? prod : :(-$prod))
-            end
-        end
-        coef = block_name(pred.name)
-        push!(stmts, :($coef = [$(coords...)]))
-    end
-    return stmts
-end
-
 # One homogeneous coefficient plate over `coefaccess` (the block symbol or
 # a static-range slice) with per-lane (location, scale[, nu]) vectors.
 # A lane is a `Vector{Float64}` (literal lane, bound here) or a `Symbol`
@@ -3945,43 +3858,29 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         shape.width == 0 && continue
-        # A horseshoe predictor carries no Normal plate prior: its
-        # coordinates derive from triples/Normal scalars whose priors ride
-        # the sampled-parameter loop below.
-        isempty(_horseshoe_for(plan, pred.name)) || continue
         node = Symbol(:_ppl_prior_, pred.name)
         pw = Symbol(:_ppl_pw_prior_, pred.name)
         mut = Symbol(:_ppl_prmu_, pred.name)
         sdt = Symbol(:_ppl_prsd_, pred.name)
-        rp = _r2d2_for(plan, pred.name)
-        if rp === nothing
-            specs = coefficient_prior_specs(shape, plan.population_priors)
-            fams = map(s -> s.family, specs)
-            alllit = all(s -> s.location isa Real && s.scale isa Real, specs)
-            if all(==(fams[1]), fams) && fams[1] !== :flat && alllit
-                # Homogeneous fast path: today's exact plate, family cell.
-                nut = Symbol(:_ppl_prnu_, pred.name)
-                loc = [Float64(s.location) for s in specs]
-                sca = [Float64(s.scale) for s in specs]
-                nus = [Float64(s.nu) for s in specs]
-                _append_coef_plate!(stmts, block_name(pred.name), node, pw,
-                    mut, sdt, nut, loc, sca, nus, fams[1])
-                push!(terms, node)
-            elseif all(==(:flat), fams)
-                push!(stmts, :($node::Float64 = 0.0))
-                push!(terms, node)
-            else
-                _mixed_prior_stmts!(stmts, terms, pred, shape,
-                    plan.population_priors)
-            end
-            continue
+        specs = coefficient_prior_specs(shape, plan.population_priors)
+        fams = map(s -> s.family, specs)
+        alllit = all(s -> s.location isa Real && s.scale isa Real, specs)
+        if all(==(fams[1]), fams) && fams[1] !== :flat && alllit
+            # Homogeneous fast path: today's exact plate, family cell.
+            nut = Symbol(:_ppl_prnu_, pred.name)
+            loc = [Float64(s.location) for s in specs]
+            sca = [Float64(s.scale) for s in specs]
+            nus = [Float64(s.nu) for s in specs]
+            _append_coef_plate!(stmts, block_name(pred.name), node, pw,
+                mut, sdt, nut, loc, sca, nus, fams[1])
+            push!(terms, node)
+        elseif all(==(:flat), fams)
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+        else
+            _mixed_prior_stmts!(stmts, terms, pred, shape,
+                plan.population_priors)
         end
-        push!(stmts, _r2d2_prior_stmts(rp, shape, plan.columns, mut, sdt)...)
-        coef = block_name(pred.name)
-        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
-        cell = :(normal($mv, $sv).logpdf($cv))
-        append!(stmts, _plate_sum_stmts(pw, node, Any[coef, mut, sdt], cell))
-        push!(terms, node)
     end
     _parameter_prior_statements!(stmts, terms, plan, layout)
     # GLM-object coefficient vectors: the same plate-prior shape as a

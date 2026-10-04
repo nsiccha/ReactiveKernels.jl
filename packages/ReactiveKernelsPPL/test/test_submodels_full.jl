@@ -96,9 +96,8 @@ end
     spline_basis(:s_in, xx; k = 4)
     return spline(:s_in)
 end
-@rkppl smf_r2d2(mu, R2, phi) = begin
-    r2d2(mu, R2, phi)
-    return mu
+@rkppl smf_scale(mu, R2, phi) = begin
+    return mu .* sqrt(phi[1] * R2)
 end
 @rkppl smf_kw(xx, k) = begin
     spline_basis(:s, xx; k, kind = :tps)
@@ -419,7 +418,7 @@ end
             R2 ~ Beta(1.0, 1.0)
             phi ~ Dirichlet([1.0])
             m0 = a .+ b1 .* x
-            m ~ smf_r2d2(m0, R2, phi)
+            m ~ smf_scale(m0, R2, phi)
             sigma ~ Exponential(1)
             y .~ Normal.(m, sigma)
         end, quote
@@ -428,8 +427,7 @@ end
             R2 ~ Beta(1.0, 1.0)
             phi ~ Dirichlet([1.0])
             m0 = a .+ b1 .* x
-            r2d2(m0, R2, phi)
-            m = m0
+            m = m0 .* sqrt(phi[1] * R2)
             sigma ~ Exponential(1)
             y .~ Normal.(m, sigma)
         end),

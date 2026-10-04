@@ -91,28 +91,6 @@ end
         dup.columns; matrices = dup.matrices)
 end
 
-@testset "matrix r2d2 scales" begin
-    plan = _mx_plan()
-    shape = design_shape(plan.predictors[1], plan.columns;
-        matrices = plan.matrices)
-    cols = plan.columns
-    share, fallback, loc, varx = ReactiveKernelsPPL.r2d2_column_scales(
-        shape, cols, Dict{Symbol,Tuple{Float64,Float64}}())
-    # Intercept takes share 0; data columns take shares 1, 2.
-    @test share == [0, 1, 2]
-    @test fallback == [1.0, 1.0, 1.0]
-    @test loc == [0.0, 0.0, 0.0]
-    @test varx[1] == 0.0
-    @test varx[2] ≈ ReactiveKernelsPPL._r2d2_sample_variance(cols[:x1])
-    @test varx[3] ≈ ReactiveKernelsPPL._r2d2_sample_variance(cols[:x2])
-    # Per-element overrides by element addressee.
-    share, fallback, loc, _ = ReactiveKernelsPPL.r2d2_column_scales(
-        shape, cols, Dict{Symbol,Tuple{Float64,Float64}}(:x1 => (0.5, 2.0)))
-    @test share == [0, 0, 1]
-    @test fallback == [1.0, 2.0, 1.0]
-    @test loc == [0.0, 0.5, 0.0]
-end
-
 @testset "matrix contract fail-closed" begin
     # Unknown matrix.
     bad = _mx_plan(terms = TermSpec[TermSpec(MatrixTerm, [:x1, :x2],
@@ -644,35 +622,6 @@ end
     _check_gradient(built.spec, plan, [0.5, -0.25, 0.1])
 end
 
-@testset "matrix r2d2 twin parity" begin
-    cols = _mx_cols()
-    sub = Dict{Symbol,AbstractVector}(:y => cols[:y], :x1 => cols[:x1],
-        :x2 => cols[:x2])
-    mmat = lower_rkppl(quote
-        R2 ~ Beta(1.0, 1.0)
-        phi ~ Dirichlet([1.0, 1.0])
-        X = hcat(ones(length(x1)), x1, x2)
-        mu = X * b
-        r2d2(mu, R2, phi)
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
-    maff = lower_rkppl(quote
-        R2 ~ Beta(1.0, 1.0)
-        phi ~ Dirichlet([1.0, 1.0])
-        mu = a .+ c1 .* x1 .+ c2 .* x2
-        r2d2(mu, R2, phi)
-        y .~ Normal.(mu, 1.0)
-    end, (:y, :x1, :x2); conditioned = (:y, :x1, :x2))
-    pmat = bind_data(mmat, sub)
-    paff = bind_data(maff, sub)
-    bmat = build_kernel(pmat)
-    baff = build_kernel(paff)
-    @test bmat.layout.total == baff.layout.total == 6
-    u = [0.5, -0.25, 0.1, 0.2, -0.1, 0.3]
-    @test _query(bmat.spec, pmat, :posterior, u) ≈
-        _query(baff.spec, paff, :posterior, u)
-end
-
 @testset "matrix mo splice parity" begin
     cols = Dict{Symbol,AbstractVector}(
         :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
@@ -704,31 +653,4 @@ end
     uaff = unconstrain(baff.layout, (a = 0.5, e = -0.25, d = 0.1, s = [0.4, 0.6]))
     @test _query(bmat.spec, pmat, :posterior, umat) ≈
         _query(baff.spec, paff, :posterior, uaff)
-end
-
-@testset "matrix surface r2d2" begin
-    D = (:y, :x1)
-    plan = lower_rkppl(quote
-        R2 ~ Beta(1.0, 1.0)
-        phi ~ Dirichlet([1.0, 1.0])
-        X = hcat(ones(length(x1)), x1)
-        mu = X * b
-        r2d2(mu, R2, phi)
-        y .~ Normal.(mu, 1.0)
-    end, D; conditioned = D)
-    @test isempty(plan.population_priors)
-    @test only(plan.r2d2_priors).overrides ==
-        Dict{Symbol,Tuple{Float64,Float64}}()
-    @test only(plan.r2d2_priors).tau === :r2d2_mu_tau_bsv
-    plan = lower_rkppl(quote
-        R2 ~ Beta(1.0, 1.0)
-        phi ~ Dirichlet([1.0, 1.0])
-        b[axes(X, 2)] .~ Normal.(0, 2)
-        X = hcat(ones(length(x1)), x1)
-        mu = X * b
-        r2d2(mu, R2, phi)
-        y .~ Normal.(mu, 1.0)
-    end, D; conditioned = D)
-    @test only(plan.r2d2_priors).overrides ==
-        Dict(:Intercept => (0.0, 2.0), :x1 => (0.0, 2.0))
 end

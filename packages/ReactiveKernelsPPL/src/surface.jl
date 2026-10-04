@@ -89,7 +89,7 @@ like a hand-inlined model — transparent and reusable, never an opaque node.
 
 A body holds any statement a top-level program can: `~` / `.~` / `=`
 statements, indexed and sized priors (`c[levels(g)] .~ Normal.(0, s)`,
-`b[axes(X, 2)] .~ …`), `@plate` and `@scan` blocks, basis / `r2d2` /
+`b[axes(X, 2)] .~ …`), `@plate` and `@scan` blocks, basis /
 varying statements, and calls to other submodels. Scope access is static:
 
 - every name the body binds — a `~` / `.~` / `=` left-hand side (the base
@@ -210,9 +210,7 @@ bare data/derived columns), use it only as a predictor matmul
 (`b[axes(X, 2)] .~ Normal.(loc, scale)` — scalar args share over
 elements, literal `[…]` vectors go per element). Declarations are
 strict: an undeclared coefficient name or vector fails naming the
-prior to write — nothing is defaulted. Under `r2d2(mu, R2, phi)` a
-stated vector becomes per-element share-0 overrides and an unstated
-one joins the simplex (the `r2d2` statement is its prior). Every other matrix position (scales, prior
+prior to write — nothing is defaulted. Every other matrix position (scales, prior
 arguments, indexing, arithmetic outside a matmul) fails loudly
 naming the spelling. Emitter guidance: matrix and affine spellings
 of one model evaluate bit-identically with identical coefficient
@@ -784,8 +782,7 @@ reads it as `b .* x`. A sized declaration such as `c[levels(g)]` or
 Affine optimization records references to those values and may pack their
 reads for a matrix multiply. Other predictors, assignments and prior
 arguments can read the same declaration without changing its coordinates
-or adding another prior. Explicit whole-predictor R2D2 and Horseshoe
-constructs retain their construct-owned coefficient packs.
+or adding another prior.
 
 Data are values of any shape. Given the values (`data`), lowering reads
 each one's shape: a number has no observation axis, so it lowers as a
@@ -898,17 +895,6 @@ function _ordinary_sampling(s)
             (:HalfNormal, :HalfCauchy, :Flat, :truncated, :restricted)) || _external_rhs(rhs)
 end
 
-function _bind_parameter_terms!(predictors, structured)
-    for (i, p) in enumerate(predictors)
-        p.name in structured || continue
-        # Explicit whole-predictor constructs own their coefficient pack.
-        terms = TermSpec[_parameter_term(t) ? TermSpec(t.kind, t.columns,
-            _term_structure_options(t), t.addressee, t.label) : t
-            for t in p.terms]
-        predictors[i] = PredictorSpec(p.name, p.link, terms, p.label)
-    end
-end
-
 function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
@@ -920,7 +906,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
     end
     sample, det, plate_ctx, plate_specs, scans, bases, vectors,
-    hbases, kplates, kstmts, schedules, event_lps, r2d2decls, joints,
+    hbases, kplates, kstmts, schedules, event_lps, joints,
     varying_draws, varying_pending, glms = _partition_statements(ast, data)
     sample, det = _rewrite_plate_rows(sample, det)
     # Functions as values: definition call heads outside the built-in
@@ -1012,8 +998,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     scalar_parameters = Set{Symbol}(s.lhs for s in sample
         if s.lhs in ordinary_parameters && !s.broadcast &&
             s.dims === nothing)
-    coef_priors = union(scalar_parameters, Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && _is_horseshoe_call(s.rhs)))
+    coef_priors = scalar_parameters
     # Simplex parameters (`s ~ Dirichlet(...)`): the only names a
     # monotonic term accepts as its increments (checked during response
     # lowering, before `_lower_parameters` runs).
@@ -1210,13 +1195,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         factor_axes = Dict{Symbol,Any}(s.lhs => s.levels for s in sample
             if s.levels !== nothing),
         sized_decls = sized_decls)
-    # Lower ordinary declarations before the optional affine analysis.
-    # Whole-predictor legacy priors retain their explicit construction
-    # path; sized positional declarations wait for response-specific
-    # threshold validation, independently of affine recognition.
-    semantic_first = isempty(r2d2decls) &&
-        !any(s -> _is_horseshoe_call(s.rhs), sample)
-    declarations = [s for s in sample if semantic_first &&
+    # Declarations own their priors and coordinates before affine analysis.
+    # Sized positional declarations wait for response-specific validation.
+    declarations = [s for s in sample if
         s.lhs in ordinary_parameters && s.dims === nothing]
     declared_names = Set(s.lhs for s in declarations)
     declared_params, declared_syms, declared_vectors, declared_arrays =
@@ -1317,17 +1298,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # `r_<target>_<suffix>` labels claim, and each draws block's slice
     # ranges prove exact-once partition of 1:K.
     varying_slices = _finalize_varying_slices(ctx)
-    r2d2set = Set{Symbol}(d.predictor for d in r2d2decls)
-    hsset = _horseshoe_predictors(sample, coefuse, predictors, r2d2set)
-    # Affine analysis has finished. Bind its uses to the declarations,
-    # leaving the declaration's prior and every other reader untouched.
-    _bind_parameter_terms!(predictors, union(r2d2set, hsset))
-    owned_coefs = Dict(k => v for (k, v) in coefuse
-        if k ∉ ordinary_parameters || any(u -> u[1] in r2d2set ||
-            u[1] in hsset, v))
-    # A legacy construct takes ownership of its whole coefficient pack.
-    # Its removed declaration names cannot acquire ordinary outside readers.
-    setdiff!(ordinary_parameters, keys(owned_coefs))
+    # Affine uses reference ordinary declarations without taking their priors.
+    owned_coefs = Dict(k => v for (k, v) in coefuse if k ∉ ordinary_parameters)
     _check_coefficient_uses(coefuse, ctx)
     for c in ctx.dar_coefs
         haskey(coefuse, c) && _check_owned_coefficient(c, ctx, "$c is both a " *
@@ -1348,16 +1320,12 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     hyper_names = union(prior_names,
         Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :scalar))
     priors, levelmaps = _lower_coefficient_priors(sample, coefuse, predictors,
-        ctx.matrices, hyper_names, ctx, r2d2set, hsset)
+        ctx.matrices, hyper_names, ctx)
     for (beta, (label, X)) in glmuse
         beta in ordinary_parameters && continue
         append!(priors, _lower_glm_beta_priors(label, beta, X, sample,
             ctx.matrices, hyper_names))
     end
-    r2d2s, taus = _lower_r2d2_priors(r2d2decls, sample, coefuse, predictors,
-        levelmaps, taken, ctx.matrices, hyper_names)
-    hses, hsparams = _lower_horseshoe_priors(sample, coefuse, predictors,
-        hsset, taken)
     params, paramsyms, dirichlets, arrays =
         _lower_parameters([s for s in sample if s.lhs ∉ declared_names],
             owned_coefs, ctx, glmuse)
@@ -1373,8 +1341,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     for pr in priors, v in (pr.location, pr.scale)
         v isa Symbol && push!(paramsyms, v)
     end
-    append!(params, taus)
-    append!(params, hsparams)
     plate_parameters = PlateParameter[
         _lower_plate_parameter(nm, rhs, rng, coefuse, ctx.matrices, ctx)
         for (nm, rhs, rng, _) in plate_specs]
@@ -1449,10 +1415,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # A predictor optimization cannot also claim a definition retained by
     # an ordinary value reader. Replan those names as values; the set only
     # grows, so every retry releases at least one conflicting definition.
-    # Explicit whole-predictor constructs retain their ownership contract.
     retained = setdiff(intersect(kept, Set(p.name for p in predictors)),
         value_defs)
-    if semantic_first && !isempty(retained)
+    if !isempty(retained)
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, retained))
     end
@@ -1505,11 +1470,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         push!(derived, VectorAssignmentSpec(d.name, rhs, d.label))
     end
     append!(assigns, ctx.synth_assigns)
-    coefficient_values = _horseshoe_value_bindings!(assigns, derived,
-        responses, params, plate_parameters, priors, predictors, coefuse,
-        hses, hsset)
     _check_coefficient_readers(coefuse, ctx, predictors, priors, params,
-        plate_parameters, assigns, derived, responses; coefficient_values)
+        plate_parameters, assigns, derived, responses)
     _validate_varying_margins(varying_draws, data, derived, detshape,
         used_locs)
     # Varying bindings compose only as direct predictor summands:
@@ -1552,7 +1514,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         varying_slices = varying_slices,
         vector_parameters = dirichlets,
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
-        kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
+        kernel_plates = kplates,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
         indexed_observations)
@@ -2211,9 +2173,6 @@ _is_coef_prior_call(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1])
 
-_is_horseshoe_call(rhs) =
-    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-    rhs.args[1] === :Horseshoe
 
 # Dependency order over deterministic definitions (callee before caller;
 # cycles and unknown refs keep source order — cycles error downstream).
@@ -2416,6 +2375,10 @@ end
 
 function _module_binding(m::Module, s::Symbol, where, shown)
     if !isdefined(m, s)
+        s === :Horseshoe && _sfail("$where: the implicit `Horseshoe` " *
+            "coefficient shortcut is retired; declare its priors and " *
+            "coefficient product explicitly, or use the BRM-owned " *
+            "`BayesianRegressionModels.rkppl_model(:horseshoe_coefs)`")
         s === :LKJCovarianceFactor && _sfail("$where: the implicit " *
             "`LKJCovarianceFactor` shortcut is retired; declare " *
             "`sd[1:K] .~ Exponential.(scale)` (or your scale prior), " *
@@ -3282,39 +3245,6 @@ _is_dar_inf(b) = b === :Inf || (b isa Real && isinf(Float64(b)) && Float64(b) > 
 _is_basis_stmt(st) =
     st isa Expr && st.head === :call && !isempty(st.args) &&
     st.args[1] === :spline_basis
-
-# A bare `r2d2(mu, R2, phi[, tau])` call declares a flat R2D2 variance
-# decomposition over one predictor (same bare-call-declaration shape as
-# `spline_basis`): positional predictor + R2/phi parameter names, plus
-# an optional tau (sampled-parameter name or positive literal; omitted
-# synthesizes a half-standard-Normal `r2d2_<pred>_tau_bsv`).
-_is_r2d2_stmt(st) =
-    st isa Expr && st.head === :call && !isempty(st.args) &&
-    st.args[1] === :r2d2
-
-function _lower_r2d2_decl(st::Expr, line::Int)
-    where = line > 0 ? "r2d2 (line $line)" : "r2d2"
-    args = [a for a in st.args[2:end]
-        if !(a isa Expr && a.head === :parameters)]
-    any(a -> a isa Expr && a.head === :parameters, st.args[2:end]) &&
-        _sfail("$where takes positional args only " *
-               "(`r2d2(mu, R2, phi[, tau])`), no keywords")
-    length(args) == 3 || length(args) == 4 ||
-        _sfail("$where takes `(predictor, R2, phi[, tau])` — " *
-               "$(length(args)) positional args, got $(repr(st))")
-    pred, r2, phi = args[1:3]
-    pred isa Symbol || _sfail("$where predictor must be a bare " *
-                              "predictor name, got $(repr(pred))")
-    r2 isa Symbol || _sfail("$where R2 must be a bare scalar-Beta " *
-                            "parameter name, got $(repr(r2))")
-    phi isa Symbol || _sfail("$where phi must be a bare " *
-                             "simplex-parameter name, got $(repr(phi))")
-    tau = length(args) == 4 ? args[4] : nothing
-    tau === nothing || tau isa Symbol || tau isa Real ||
-        _sfail("$where tau must be a sampled-parameter name or a " *
-               "positive literal, got $(repr(tau))")
-    return (predictor = pred, r2 = r2, phi = phi, tau = tau, line = line)
-end
 
 # The sampled-parameter grammar defines what a prior means in every slot.
 # These legacy basis slots still require literal arguments and bounds.
@@ -4599,7 +4529,6 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     kstmts = NamedTuple[]
     schedules = PKScheduleSpec[]
     event_lps = LinearPKEventLPSpec[]
-    r2d2decls = NamedTuple[]
     joints = JointSampleStmt[]
     glms = GLMSampleStmt[]
     varying_raw = NamedTuple[]
@@ -4689,9 +4618,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                    "(decision 0tgodim) — spell " *
                    "`@plate <result> for <s> in 1:<N> ... end`")
         end
-        if _is_r2d2_stmt(st)
-            push!(r2d2decls, _lower_r2d2_decl(st, line))
-            continue
+        if st isa Expr && st.head === :call && !isempty(st.args) &&
+                first(st.args) === :r2d2
+            _sfail("the implicit `r2d2(...)` declaration is retired; state " *
+                "its priors and coefficient values explicitly, or use the " *
+                "BRM-owned `BayesianRegressionModels.rkppl_model(:r2d2_coefs)`")
         end
         if _is_sample(st) || _is_broadcast_sample(st)
             bc = _is_broadcast_sample(st)
@@ -4876,7 +4807,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         end
     end
     return sample, det, plate_ctx, plate_params, scans, bases,
-        vectors, hbases, kplates, kstmts, schedules, event_lps, r2d2decls,
+        vectors, hbases, kplates, kstmts, schedules, event_lps,
         joints, varying_draws, varying_pending, glms
 end
 
@@ -10313,12 +10244,10 @@ end
 # Other readers do not alter ordinary parameter semantics. Reject readers
 # of legacy construct-owned coefficient packs that cannot represent them.
 function _check_coefficient_readers(coefuse, ctx, predictors, priors,
-        params, plate_parameters, assigns, derived, responses;
-        coefficient_values = Set{Symbol}())
+        params, plate_parameters, assigns, derived, responses)
     isempty(coefuse) && return nothing
     function read!(who, s)
         s isa Symbol && haskey(coefuse, s) || return nothing
-        s in coefficient_values && return nothing
         return _check_owned_coefficient(s, ctx, "$s is a predictor coefficient and " *
                                "cannot also be read by $who")
     end
@@ -10353,53 +10282,6 @@ function _check_coefficient_readers(coefuse, ctx, predictors, priors,
         foreach(v -> read!(who, v), r.mixture_scales)
     end
     return nothing
-end
-
-# A scalar coefficient in a Horseshoe pack still denotes its declared
-# value outside the predictor. Reconstruct that value from the existing
-# coordinates as an ordinary assignment; aliases then share the same
-# prior and geometry. The predictor's sign belongs to its use, not to
-# the authored coefficient value.
-function _horseshoe_value_bindings!(assigns, derived, responses, params,
-        plate_parameters, priors, predictors, coefuse, hses, hsset)
-    reads = Set{Symbol}()
-    for a in (assigns..., derived...)
-        union!(reads, _value_symbols(a.expr))
-    end
-    for p in predictors, t in p.terms
-        t.kind === ComposedTerm && union!(reads, t.options.scalars)
-    end
-    for p in (params..., plate_parameters...), v in values(p.args)
-        union!(reads, _value_symbols(v))
-    end
-    for p in priors, v in (p.location, p.scale)
-        union!(reads, _value_symbols(v))
-    end
-    for r in responses, v in (r.scale, r.nu, r.zi, r.mixture_weights,
-            r.mixture_locs..., r.mixture_scales...)
-        union!(reads, _value_symbols(v))
-    end
-    bound = Set{Symbol}()
-    for name in sort!(collect(reads))
-        haskey(coefuse, name) || continue
-        uses = coefuse[name]
-        length(uses) == 1 || continue
-        pname, addr, sign = only(uses)
-        pname in hsset || continue
-        h = findfirst(h -> h.predictor === pname && h.addressee === addr, hses)
-        value = if h === nothing
-            normal = horseshoe_normal_name(pname, addr)
-            sign == 1 ? normal : :(-$normal)
-        else
-            raw = horseshoe_raw_name(pname, addr)
-            lam = horseshoe_lambda_name(pname, addr)
-            tau = horseshoe_tau_name(pname, addr)
-            :($raw * $lam * $tau)
-        end
-        push!(assigns, AssignmentSpec(name, value, name))
-        push!(bound, name)
-    end
-    return bound
 end
 
 # Predictor analysis: inline deterministic structure (scalars always;
@@ -11867,9 +11749,7 @@ end
 # block — required, never defaulted — and each one emits its LevelMap.
 # Plan order follows predictors, addressees in term order.
 function _lower_coefficient_priors(sample, coefuse, predictors,
-        matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol}, ctx,
-        r2d2::Set{Symbol} = Set{Symbol}(),
-        hs::Set{Symbol} = Set{Symbol}())
+        matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol}, ctx)
     stated = Dict{Symbol,Any}()
     for s in sample
         haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
@@ -11878,11 +11758,6 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
     priors = PopulationPrior[]
     levelmaps = LevelMap[]
     for pred in predictors
-        # R2D2 predictors carry their prior mass in the R2D2Prior
-        # (overrides included) — _lower_r2d2_priors, not here. Horseshoe
-        # predictors likewise — _lower_horseshoe_priors, not here.
-        pred.name in r2d2 && continue
-        pred.name in hs && continue
         for t in pred.terms
             if _parameter_term(t)
                 if t.kind === FactorTerm
@@ -12038,317 +11913,6 @@ function _matrix_prior_arg(name, a, pname, K, role, hyper_names::Set{Symbol})
     return fill(elt(a), K)
 end
 
-# Horseshoe predictors: any predictor with a stated scalar `~ Horseshoe()`
-# coefficient prior. Stated beside an `r2d2(...)` declaration, or outside
-# an intercept/continuous term, it fails here (one structured prior per
-# predictor; the flat slice covers scalar coefficients only).
-function _horseshoe_predictors(sample, coefuse, predictors,
-        r2d2::Set{Symbol})
-    by_pred = Dict{Symbol,PredictorSpec}(p.name => p for p in predictors)
-    out = Set{Symbol}()
-    for s in sample
-        haskey(coefuse, s.lhs) || continue
-        _is_horseshoe_call(s.rhs) || continue
-        s.levels === nothing && s.matrix === nothing || _sfail(
-            "coefficient $(s.lhs) takes a scalar `Horseshoe(...)` prior " *
-            "— sized (levels/matrix) horseshoe priors are not in slice 1")
-        for (pname, addr, _) in coefuse[s.lhs]
-            pred = get(by_pred, pname, nothing)
-            pred === nothing && continue
-            pname in r2d2 && _sfail(
-                "predictor $pname carries both `r2d2(...)` and a " *
-                "`~ Horseshoe()` coefficient prior — one structured " *
-                "prior per predictor")
-            scalar = any(pred.terms) do t
-                a = t.kind === InterceptTerm ? :Intercept :
-                    t.kind === ContinuousTerm ? only(t.columns) : nothing
-                a === addr
-            end
-            scalar || _sfail(
-                "coefficient $(s.lhs) of predictor $pname takes " *
-                "`Horseshoe(...)` outside an intercept/continuous term " *
-                "— the flat slice covers scalar coefficients only")
-            push!(out, pname)
-        end
-    end
-    return out
-end
-
-# SB `Horseshoe(...)` keyword contract: keywords `local_scale` /
-# `global_scale` only (no positionals), positive finite literal scales
-# defaulting to 1.0 (Bools rejected — SB's numeric-constant rule).
-function _coefficient_horseshoe(name, rhs, pname, addr)
-    where = "coefficient $name of predictor $pname"
-    kws = Any[]
-    for a in rhs.args[2:end]
-        if a isa Expr && a.head === :parameters
-            append!(kws, a.args)
-        elseif a isa Expr && a.head === :kw
-            push!(kws, a)
-        else
-            _sfail("$where `Horseshoe(...)` takes no positional " *
-                   "arguments — use `local_scale=` and/or `global_scale=`")
-        end
-    end
-    ls, gs = 1.0, 1.0
-    for kw in kws
-        kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-            _sfail("$where `Horseshoe(...)` takes keywords " *
-                   "`local_scale`/`global_scale` only")
-        key, v = kw.args
-        key === :local_scale || key === :global_scale || _sfail(
-            "$where `Horseshoe(...)` takes keywords " *
-            "`local_scale`/`global_scale` only, got `$key`")
-        v isa Bool && _sfail("$where `Horseshoe($key=...)` needs a " *
-                             "numeric literal scale, got `$v`")
-        v isa Real && isfinite(v) && v > 0 || _sfail(
-            "$where `Horseshoe($key=...)` must be finite and " *
-            "strictly positive, got $(repr(v))")
-        if key === :local_scale
-            ls = Float64(v)
-        else
-            gs = Float64(v)
-        end
-    end
-    return ls, gs
-end
-
-# Horseshoe predictors to IR: one HorseshoePrior per stated `~ Horseshoe()`
-# addressee plus its synthesized triple; stated-Normal scalar addressees
-# ride Normal scalars (unstated ones fail — strict declarations) (the mixed-predictor
-# coordinate). Anything but intercept/continuous/offset terms fails
-# closed (the flat slice).
-function _lower_horseshoe_priors(sample, coefuse, predictors,
-        hs::Set{Symbol}, taken::Set{Symbol})
-    stated = Dict{Symbol,Any}()
-    for s in sample
-        haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
-    end
-    out = HorseshoePrior[]
-    params = SampledParameter[]
-    for pred in predictors
-        pred.name in hs || continue
-        for t in pred.terms
-            (t.kind === InterceptTerm || t.kind === ContinuousTerm ||
-                t.kind === OffsetTerm) || _sfail(
-                "horseshoe over predictor $(pred.name) meets a " *
-                "$(t.kind) term — the flat slice covers " *
-                "intercept/continuous coefficients only")
-            t.kind === OffsetTerm && continue
-            addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
-            use = _find_use(coefuse, pred.name, addr)
-            use === nothing && _sfail("internal: no coefficient use for " *
-                                      "($(pred.name), $addr)")
-            name, _, sign = use
-            haskey(stated, name) || _undeclared_coefficient(name, pred.name,
-                "$name ~ Horseshoe()")
-            s = stated[name]
-            if _is_horseshoe_call(s.rhs)
-                ls, gs = _coefficient_horseshoe(name, s.rhs, pred.name,
-                    addr)
-                push!(out, HorseshoePrior(pred.name, addr, ls, gs, sign))
-                for (nm, fam, args, ov) in (
-                        (horseshoe_raw_name(pred.name, addr), :normal,
-                            (arg1 = 0, arg2 = 1), nothing),
-                        (horseshoe_lambda_name(pred.name, addr), :cauchy,
-                            (arg1 = 0, arg2 = ls), :positive),
-                        (horseshoe_tau_name(pred.name, addr), :cauchy,
-                            (arg1 = 0, arg2 = gs), :positive))
-                    nm in taken && _sfail(
-                        "horseshoe over $(pred.name): synthesized $nm " *
-                        "collides with a model name — rename yours")
-                    push!(taken, nm)
-                    push!(params, SampledParameter(nm, fam, args, ov, nm))
-                end
-                continue
-            end
-            s.levels !== nothing && _sfail("coefficient $name takes a " *
-                                           "scalar prior (`$name ~ Normal`), " *
-                                           "not a levels prior — it is used " *
-                                           "as $(t.kind), not a factor")
-            fam, loc, scale, _ = _coefficient_prior(name, s.rhs,
-                pred.name, addr; literal = true)
-            fam === :normal || _sfail("coefficient $name of predictor " *
-                                      "$(pred.name) sits beside a horseshoe prior — " *
-                                      "its scalar prior must be `Normal(...)`")
-            push!(params, _horseshoe_normal_param(pred.name, addr,
-                sign * loc, scale, taken))
-        end
-    end
-    return out, params
-end
-
-# One mixed-predictor Normal coordinate (the PopulationPrior convention:
-# the sign rides the location, the scalar IS the signed coordinate).
-function _horseshoe_normal_param(pname, addr, loc, scale,
-        taken::Set{Symbol})
-    nm = horseshoe_normal_name(pname, addr)
-    nm in taken && _sfail(
-        "horseshoe over $pname: synthesized $nm collides with a " *
-        "model name — rename yours")
-    push!(taken, nm)
-    return SampledParameter(nm, :normal, (arg1 = loc, arg2 = scale),
-        nothing, nm)
-end
-
-# R2D2 declarations to IR: one R2D2Prior per declared predictor.
-# Stated Normal coefficient priors become share-0 overrides (scalar
-# via _coefficient_prior, factor blocks via the broadcast form);
-# unstated columns join the simplex (factors take a full-cover
-# LevelMap — the identified check fires exactly when that collides
-# with an intercept, same as the PopulationPrior path). Omitted tau
-# synthesizes a half-standard-Normal parameter.
-function _lower_r2d2_priors(decls, sample, coefuse, predictors, levelmaps,
-        taken, matrices::Dict{Symbol,DesignMatrix}, hyper_names::Set{Symbol})
-    stated = Dict{Symbol,Any}()
-    for s in sample
-        haskey(coefuse, s.lhs) && (stated[s.lhs] = s)
-    end
-    by_pred = Dict{Symbol,PredictorSpec}(p.name => p for p in predictors)
-    seen = Set{Symbol}()
-    out = R2D2Prior[]
-    taus = SampledParameter[]
-    r2d2preds = PredictorSpec[]
-    for d in decls
-        haskey(by_pred, d.predictor) || _sfail(
-            "r2d2 over unknown predictor $(d.predictor) " *
-            "(predictors come from response linear predictors)")
-        d.predictor in seen && _sfail(
-            "duplicate r2d2 declaration for predictor $(d.predictor) " *
-            "(one per predictor)")
-        push!(seen, d.predictor)
-        pred = by_pred[d.predictor]
-        push!(r2d2preds, pred)
-        overrides = Dict{Symbol,Tuple{Float64,Float64}}()
-        for t in pred.terms
-            t.kind === ComposedTerm && _sfail(
-                "r2d2 over predictor $(pred.name): composed predictors take " *
-                "no shrinkage prior (their coefficients live in the " *
-                "sub-predictors — declare r2d2 over a sub-predictor instead)")
-            (t.kind === OffsetTerm || t.kind === LatentTerm ||
-                t.kind === VaryingEffectTerm ||
-                t.kind === SplineSummandTerm ||
-                t.kind === HSGPSummandTerm ||
-                t.kind === ScanSummandTerm ||
-                t.kind === MonotonicSummandTerm) && continue
-            if t.kind === MatrixTerm
-                for (e, ov) in _lower_r2d2_matrix(pred, t, coefuse,
-                        stated, matrices, hyper_names)
-                    overrides[e] = ov
-                end
-                continue
-            end
-            addr = t.kind === InterceptTerm ? :Intercept : only(t.columns)
-            use = _find_use(coefuse, pred.name, addr)
-            use === nothing && _sfail("internal: no coefficient use for " *
-                                      "($(pred.name), $addr)")
-            t.kind === MonotonicTerm && _sfail(
-                "r2d2 over predictor $(pred.name): monotonic columns " *
-                "are not in the flat slice (the mo contrast is " *
-                "parameter-derived, so no data variance exists)")
-            name = use[1]
-            sign = use[3]
-            if t.kind === FactorTerm
-                ov = _lower_r2d2_factor(pred, t, name, sign, stated,
-                    levelmaps, hyper_names)
-                ov === nothing || (overrides[addr] = ov)
-                continue
-            end
-            haskey(stated, name) || continue
-            s = stated[name]
-            s.levels !== nothing && _sfail("coefficient $name takes a " *
-                                           "scalar prior (`$name ~ Normal`), " *
-                                           "not a levels prior — it is used " *
-                                           "as $(t.kind), not a factor")
-            fam, loc, scale, _ = _coefficient_prior(name, s.rhs,
-                pred.name, addr; literal = true)
-            fam === :normal || _sfail("coefficient $name of predictor " *
-                                      "$(pred.name) carries an r2d2 prior — stated " *
-                                      "scalar priors must be `Normal(...)` " *
-                                      "(r2d2 overrides are Normal-only)")
-            overrides[addr] = (sign * loc, scale)
-        end
-        tau = d.tau
-        if tau === nothing
-            tau = Symbol(:r2d2_, d.predictor, :_tau_bsv)
-            tau in taken && _sfail(
-                "r2d2 over $(d.predictor): synthesized tau $tau " *
-                "collides with a model name — pass tau explicitly " *
-                "(`r2d2($(d.predictor), $(d.r2), $(d.phi), mytau)` " *
-                "with `mytau ~ HalfNormal(1)`)")
-            push!(taus, SampledParameter(tau, :normal, (arg1 = 0, arg2 = 1),
-                :positive, tau))
-        end
-        push!(out, R2D2Prior(d.predictor, d.r2, d.phi, tau, overrides))
-    end
-    return out, taus
-end
-
-# An R2D2 matrix: a stated broadcast prior becomes per-element share-0
-# overrides; an unstated vector joins the simplex (the intercept
-# element takes share 0 by default, as on the scalar path).
-function _lower_r2d2_matrix(pred, t, coefuse, stated, matrices,
-        hyper_names::Set{Symbol})
-    X = t.options.matrix
-    m = get(matrices, X, nothing)
-    m === nothing && _sfail("internal: matrix term over unknown matrix $X")
-    use = _find_use(coefuse, pred.name, X)
-    use === nothing && _sfail("internal: no coefficient use for " *
-                              "($(pred.name), $X)")
-    name, _, sign = use
-    elems = _matrix_element_addressees(m)
-    K = length(elems)
-    haskey(stated, name) || return Tuple{Symbol,Tuple{Float64,Float64}}[]
-    s = stated[name]
-    s.matrix === nothing && _sfail("internal: matrix prior for $name " *
-                                   "lost its sizing matrix")
-    fam, locs, scales, _ =
-        _coefficient_matrix_prior(name, s.rhs, pred.name, K, hyper_names)
-    fam === :normal || _sfail("coefficient $name of predictor " *
-                              "$(pred.name) carries an r2d2 prior — stated " *
-                              "matrix priors must be `Normal.(...)` " *
-                              "(r2d2 overrides are Normal-only)")
-    any(v -> v isa Symbol, (locs..., scales...)) &&
-        _sfail("coefficient $name of predictor $(pred.name) carries an " *
-               "r2d2 prior — stated overrides must be literal " *
-               "`Normal.(...)` (hyperparameter overrides are not in " *
-               "slice 1)")
-    return [(e, (sign * l, sc)) for (e, l, sc) in zip(elems, locs, scales)]
-end
-
-# An R2D2 factor: a stated broadcast prior becomes a share-0 override
-# (with its levels subset, as on the PopulationPrior path); an
-# unstated factor joins the simplex under a full-cover LevelMap.
-function _lower_r2d2_factor(pred, t, name, sign, stated, levelmaps,
-        hyper_names::Set{Symbol})
-    col = only(t.columns)
-    haskey(stated, name) || begin
-        push!(levelmaps, LevelMap(pred.name, col, [], :levels, :))
-        return nothing
-    end
-    s = stated[name]
-    s.levels === nothing && _sfail("coefficient $name is vector-valued " *
-                                   "(factor over $col) — scalar priors " *
-                                   "cannot size it; write " *
-                                   "`$name[levels($col)] .~ Normal.(0, 1)`")
-    gcol, subset = s.levels
-    gcol === col || _sfail("coefficient $name: levels column $gcol " *
-                           "differs from use column $col")
-    fam, loc, scale, _ =
-        _coefficient_broadcast_prior(name, s.rhs, pred.name, col, hyper_names)
-    fam === :normal || _sfail("coefficient $name of predictor " *
-                              "$(pred.name) carries an r2d2 prior — stated " *
-                              "broadcast priors must be `Normal.(...)` " *
-                              "(r2d2 overrides are Normal-only)")
-    (loc isa Symbol || scale isa Symbol) &&
-        _sfail("coefficient $name of predictor $(pred.name) carries an " *
-               "r2d2 prior — stated overrides must be literal " *
-               "`Normal.(...)` (hyperparameter overrides are not in " *
-               "slice 1)")
-    push!(levelmaps, LevelMap(pred.name, col, [], :levels, subset))
-    return (sign * loc, scale)
-end
-
 function _lower_factor_prior(pred, t, name, sign, stated, levelmaps,
         hyper_names::Set{Symbol}, ctx)
     col = only(t.columns)
@@ -12462,9 +12026,8 @@ const _COEF_SHAPES = Dict{Symbol,NTuple{4,Int}}(
 # expressions — the contract resolves their roles); `nu` and `Uniform`
 # bounds are literals (`_coef_prior_expressible` routes anything else to
 # an ordinary parameter). `nu` is `NaN` unless StudentT; `:flat` carries
-# conventional `(0.0, 1.0, NaN)`, ignored downstream. `literal = true`
-# keeps the literal-only grammar of the r2d2/horseshoe override slots.
-function _coefficient_prior(name, rhs, pname, addr; literal::Bool = false)
+# conventional `(0.0, 1.0, NaN)`, ignored downstream.
+function _coefficient_prior(name, rhs, pname, addr)
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
         rhs.args[1] isa Symbol && haskey(_COEF_FAMILIES, rhs.args[1]) ||
         _sfail("coefficient $name of predictor $pname needs a " *
@@ -12480,8 +12043,7 @@ function _coefficient_prior(name, rhs, pname, addr; literal::Bool = false)
     want, lipos, spos, npos = _COEF_SHAPES[fam]
     length(args) == want || _sfail("coefficient $name of predictor $pname " *
                                    "needs `$head` with $want arguments")
-    vals = Any[literal ? _coefficient_literal(name, a, pname) :
-        _coefficient_arg(name, a, pname) for a in args]
+    vals = Any[_coefficient_arg(name, a, pname) for a in args]
     return fam, vals[lipos], vals[spos], npos == 0 ? NaN : vals[npos]
 end
 
@@ -12688,15 +12250,6 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         new === rhs || (plate_specs[i] = (nm, new, rng, line))
     end
     return out
-end
-
-function _coefficient_literal(name, a, pname)
-    (a isa Real || a === :Inf) ||
-        _sfail("coefficient $name prior parameter must be a literal " *
-               "(shared-hyperparameter priors ride factor broadcasts " *
-               "— `c[levels(g)] .~ Normal.(mu, s)` — only), got " *
-               "$(repr(a))")
-    return a === :Inf ? Inf : Float64(a)
 end
 
 const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
