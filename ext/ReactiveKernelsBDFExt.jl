@@ -95,8 +95,9 @@ Base.@noinline function _check(y0, t0, ts, rt, at, mx)
     isempty(ts) && throw(ArgumentError("native BDF output times are empty"))
     isfinite(t0) || throw(DomainError(t0, "native BDF initial time"))
     all(isfinite, y0) || throw(DomainError(y0, "native BDF initial state"))
-    isfinite(rt) && 0 < rt <= 1 || throw(DomainError(rt, "native BDF relative tolerance"))
-    isfinite(at) && at > 0 || throw(DomainError(at, "native BDF absolute tolerance"))
+    isfinite(rt) && rt >= 0 || throw(DomainError(rt, "native BDF relative tolerance"))
+    isfinite(at) && at >= 0 || throw(DomainError(at, "native BDF absolute tolerance"))
+    rt > 0 || at > 0 || throw(DomainError((rt, at), "native BDF tolerances are both zero"))
     0 < mx <= typemax(Int) || throw(DomainError(mx, "native BDF step limit"))
     previous = t0
     for t in ts
