@@ -7857,8 +7857,12 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol})
     end
     if (_is_sample(st) || _is_broadcast_sample(st)) && _external_rhs(last(st.args)) &&
             _resolve_submodel(last(st.args), sm.mod) === nothing
+        rhs = st.args[3]
+        resolved = rhs isa Symbol && rhs ∉ names ?
+            _resolve_call_head(rhs, sm.mod, names, "submodel sampling RHS") :
+            _resolve_module_calls(rhs, sm.mod, names, "submodel sampling RHS")
         return Expr(:call, st.args[1], st.args[2],
-            _resolve_module_calls(st.args[3], sm.mod, names, "submodel sampling RHS"))
+            resolved)
     end
     (st.head === :(=) && length(st.args) == 2 &&
         (st.args[1] isa Symbol || Meta.isexpr(st.args[1], :ref))) || return st

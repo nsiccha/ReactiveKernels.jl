@@ -88,6 +88,12 @@ const STREAM = RKPPLSubmodel(:foreign_stream, [:mu], quote
     return slot
 end, @__MODULE__)
 ReactiveKernelsPPL.sampling_fragment(::typeof(foreign_stream)) = STREAM
+foreign_constant() = error("the frontend must expand this RHS")
+const CONSTANT = RKPPLSubmodel(:foreign_constant, Symbol[], quote
+    slot .~ standard_normal
+    return slot
+end, @__MODULE__)
+ReactiveKernelsPPL.sampling_fragment(::typeof(foreign_constant)) = CONSTANT
 @rkppl nested(mu) = begin
     inner ~ foreign_latent(mu)
     return inner
@@ -194,6 +200,13 @@ end
     oracle = w -> -log(2pi)/2-(w[1]-0.2)^2/2 +
         sum(-log(2pi)/2-(x-w[1])^2/2 for x in y)
     _external_gradient(built, plan, u, oracle)
+    constant_plan, constant_built = _external_built(quote
+        a ~ Normal(0, 1)
+        y ~ ExternalSamplingFixtures.foreign_constant()
+    end, Dict(:y=>y))
+    _external_gradient(constant_built, constant_plan, u,
+        w -> -log(2pi)/2-w[1]^2/2 +
+            sum(ExternalSamplingFixtures.normal_lpdf.(y, 0.0)))
 end
 
 @testset "data-sized custom parameters and density-only RHS values" begin
