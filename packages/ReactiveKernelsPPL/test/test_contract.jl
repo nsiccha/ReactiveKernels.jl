@@ -2057,11 +2057,13 @@ end
     @test_throws ContractValidationError validate_structure(
         _re_plan(; term = TermSpec(LatentTerm, [:absent], NamedTuple(), :absent,
             :absent_lat)))
-    # A literal plate range must cover 1:n_obs exactly (checked at bind/data).
+    # A direct latent-vector likelihood must have compatible dimensions;
+    # the declaration's size itself comes from its authored range.
     good = _re_plan(9; plate = PlateParameter(:theta, :normal,
         (arg1 = :mu, arg2 = :tau), nothing, 1:9))
     @test (validate_plan(good); true)
-    # refused: plate range does not cover 1:n_obs (wrong data: length mismatch)
+    # refused: theta has eight entries beside nine elementwise observations
+    # (standing @rkppl language principle 3: Julia broadcast dimensions).
     @test_throws ContractValidationError validate_data(
         _re_plan(9; plate = PlateParameter(:theta, :normal,
             (arg1 = :mu, arg2 = :tau), nothing, 1:8)))
