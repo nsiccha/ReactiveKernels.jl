@@ -1,5 +1,5 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL
-import ReactiveKernelsDistributionKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources
 import DifferentiationInterface as DI
 import Enzyme
 

@@ -92,7 +92,9 @@ function _external_rhs(rhs)
         _is_dotted_call(rhs) ? first(rhs.args) : nothing
     head === nothing && return false
     head isa Symbol || return true
-    return !(head in union(keys(_PARAM_FAMILIES),
+    return !(head in union(keys(_PARAM_FAMILIES), _PANEL_OBS_HEADS, _GLM_HEADS,
+        (:BernoulliLogit, :PoissonLog, :BinomialLogit,
+         :NegativeBinomialLog, :NegativeBinomial2Log,
         (:HalfNormal, :HalfCauchy, :Flat, :flat, :positive, :truncated, :restricted, :Horseshoe,
          :weighted, :censored, :interval_censored, :Ordered, :Dirichlet,
          :LKJCholesky, :LKJCovarianceFactor, :MixtureModel,
@@ -200,13 +202,19 @@ _sampling_rhs_broadcast(rhs::Union{AbstractArray,Tuple,Ref}) = rhs
 _sampling_rhs_broadcast(rhs) = Ref(rhs)
 _external_u(e) = :(unconstrained[$(e.offset):$(e.offset + e.size - 1)])
 _external_geometry_name(e) = Symbol(:_ppl_geometry_, e.name)
+_sampling_ast_literal(x) = x
+_sampling_ast_literal(x::Symbol) = QuoteNode(x)
+_sampling_ast_literal(x::Expr) = Expr(:call, GlobalRef(Core, :Expr), QuoteNode(x.head),
+    (_sampling_ast_literal(a) for a in x.args)...)
+_sampling_ast_literal(x::QuoteNode) = Expr(:call, GlobalRef(Core, :QuoteNode), _sampling_ast_literal(x.value))
+_sampling_ast_literal(x::GlobalRef) = Expr(:call, GlobalRef(Core, :GlobalRef), x.mod, QuoteNode(x.name))
 function _external_geometry_expr(e)
     # Reconstruct the same structural descriptor through the public method.
     # Quoted authored expressions are constants, never active model values.
     # This also keeps kernel_expr printable/replayable with closure endpoints.
     return Expr(:call, GlobalRef(@__MODULE__, :sampling_geometry),
-        _external_constructor(e.sampling), Expr(:tuple, (QuoteNode(a) for a in _external_authored_arguments(e.sampling))...),
-        Expr(:tuple, (QuoteNode(d) for d in e.sampling.geometry.shape)...))
+        _external_constructor(e.sampling), Expr(:tuple, (_sampling_ast_literal(a) for a in _external_authored_arguments(e.sampling))...),
+        Expr(:tuple, (_sampling_ast_literal(d) for d in e.sampling.geometry.shape)...))
 end
 function _external_edge(e, edge)
     return _external_endpoint_call(GlobalRef(@__MODULE__, edge),
