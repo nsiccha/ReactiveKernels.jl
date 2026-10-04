@@ -92,9 +92,9 @@ function _external_rhs(rhs)
         _is_dotted_call(rhs) ? first(rhs.args) : nothing
     head === nothing && return false
     head isa Symbol || return true
-    return !(head in union(keys(_PARAM_FAMILIES), _PANEL_OBS_HEADS, _GLM_HEADS,
+    return !(head in union(keys(_PARAM_FAMILIES), keys(_KERNEL_OBS_FAMILIES), _PANEL_OBS_HEADS, _GLM_HEADS,
         (:BernoulliLogit, :PoissonLog, :BinomialLogit,
-         :NegativeBinomialLog, :NegativeBinomial2Log,
+         :NegativeBinomial2Log, :GammaLog, :BetaLogit,
         (:HalfNormal, :HalfCauchy, :Flat, :flat, :positive, :truncated, :restricted, :Horseshoe,
          :weighted, :censored, :interval_censored, :Ordered, :Dirichlet,
          :LKJCholesky, :LKJCovarianceFactor, :MixtureModel,
