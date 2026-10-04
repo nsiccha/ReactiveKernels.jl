@@ -1402,13 +1402,27 @@ function _kernel_symbol_leaves!(out::Set{Symbol}, ex)
     out
 end
 
+# Resolve a numerical graph call without confusing a callable caller port
+# with a same-named module binding. Generated object endpoints use this same
+# path, so argument lifting and child-value lifting have one graph boundary.
+function _kernel_called_spec(ex, mod, locals, nested_specs)
+    ex isa Expr && ex.head === :call && !isempty(ex.args) || return nothing
+    callee = ex.args[1]
+    callee isa Symbol && callee in locals && return nothing
+    generated = callee isa Symbol ? get(nested_specs, callee, nothing) : nothing
+    spec = generated === nothing ?
+        (mod isa Module ? _kernel_resolve_binding(mod, callee) : nothing) : generated
+    spec isa KernelSpec ? spec : nothing
+end
+
 function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       nested_specs::Dict{Symbol,Any},
                                       local_types::Dict{Symbol,Any};
                                       context = "inside @kernel",
                                       materialized = Tuple{Symbol,Any,Any}[],
                                       cell_locals::Set{Symbol} = Set{Symbol}(),
-                                      straight::Bool = true)
+                                      straight::Bool = true,
+                                      lift_specs::Bool = true)
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
     # A nested plate/scan owns a different scalar caller scope. Its authoring
@@ -1641,22 +1655,19 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             arg, mod, locals, nested_specs, local_types;
             context = context, materialized = materialized,
             cell_locals = cell_locals,
-            straight = straight && _kernel_straight_child(ex, i))
-        # A constructed object endpoint lowers to a call whose head is a generated
-        # `nested_specs` key. `_kernel_operation` splices such a call ONLY when it is
-        # the WHOLE recipe RHS. A splice used as a SUB-EXPRESSION of a value-combining
-        # call — `normal(0,2).logpdf(a) + normal(0,2).logpdf(b)`, or a `logaddexp(...)`
-        # inside a plate — would otherwise be swept into the fused `_KernelSourceOp`
-        # closure as a bare gensym call with no method definition, failing at call time
-        # with `UndefVarError: ##…_endpoint#N`. Lift each such sub-expression splice into
-        # its own hygienic caller recipe, typed by the endpoint output, so the same
-        # whole-RHS splice path lowers it, and reference the generated port here.
-        # Under a branch arm no lift happens: the endpoint node already emitted a
-        # prepared call there (a non-`Symbol` callee, so this splice-key test fails),
-        # which stays lazy inside the arm.
-        if ex.head === :call && child isa Expr && child.head === :call &&
-           !isempty(child.args) && child.args[1] isa Symbol &&
-           haskey(nested_specs, child.args[1])
+            straight = straight && _kernel_straight_child(ex, i),
+            lift_specs = lift_specs && !(ex.head in
+                (:for, :while, :generator, :comprehension, :try, :->,
+                 :function, :do, :let)))
+        # Graph splicing operates on a whole recipe RHS. Lift a numerical
+        # graph used as a strict subexpression into its own caller recipe,
+        # including generated object endpoints. Otherwise a module KernelSpec
+        # becomes an opaque runtime call, or an endpoint's generated name has
+        # no callable binding. Lazy arms and deferred lexical scopes retain
+        # their evaluation position.
+        child_spec = _kernel_called_spec(child, mod, locals, nested_specs)
+        if lift_specs && straight && _kernel_straight_child(ex, i) &&
+           child_spec !== nothing && length(outputs(child_spec)) == 1
             endpoint_port = gensym(:endpoint_value)
             push!(materialized, (endpoint_port, child_type, child))
             push!(locals, endpoint_port)
@@ -1665,13 +1676,37 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         push!(rewritten, child)
         push!(child_types, child_type)
     end
+    rewritten_ex = Expr(ex.head, rewritten...)
+    spec = _kernel_called_spec(rewritten_ex, mod, locals, nested_specs)
+    if lift_specs && straight && spec !== nothing &&
+       all(arg -> !(arg isa Expr && arg.head in (:parameters, :kw, :(...))),
+           rewritten[2:end])
+        # A composed numerical graph takes values, including literals and
+        # computed/submodel-return expressions. Give each non-port argument
+        # its own ordinary recipe before splicing the child. No model-sized
+        # work is hidden in a PreparedKernel or expanded according to data.
+        for i in 2:length(rewritten)
+            arg = rewritten[i]
+            arg isa Symbol && arg in locals && continue
+            argument_port = gensym(:kernel_argument)
+            push!(materialized, (argument_port, nothing, arg))
+            push!(locals, argument_port)
+            rewritten[i] = argument_port
+        end
+        rewritten_ex = Expr(ex.head, rewritten...)
+    end
     inferred = if ex.head === :block
         index = findlast(i -> !_kernel_is_line(ex.args[i]), eachindex(ex.args))
         index === nothing ? nothing : child_types[index]
+    elseif spec !== nothing && length(outputs(spec)) == 1
+        output_type = valtype(only(outputs(spec)))
+        # Any is an omitted boundary annotation, not an instruction to box
+        # the caller result (notably a vector-valued plate cell).
+        output_type === Any ? nothing : output_type
     else
         nothing
     end
-    Expr(ex.head, rewritten...), inferred
+    rewritten_ex, inferred
 end
 
 # The names a plate do-block assigns as cell-locals. Unlike a top-level @kernel
