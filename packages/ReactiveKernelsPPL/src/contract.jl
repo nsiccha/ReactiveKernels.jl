@@ -3338,6 +3338,13 @@ function _response_reads(plan::StructuralPlan, r,
     nodes = _observation_nodes(plan)
     cands = union(perobs, keys(nodes))
     function held(x)
+        if x isa Expr
+            whole, aligned = Set{Symbol}(), Set{Symbol}()
+            # A gather consumes its source whole. Module-call arguments
+            # also carry their own axes rather than the result's axis.
+            _classify_reads!(whole, aligned, x, cands, false)
+            return aligned
+        end
         free = copy(cands)
         _drop_held_names!(free, x)
         return setdiff(cands, free)
@@ -3806,10 +3813,6 @@ function _validate_columns(plan::StructuralPlan)
         "n_obs $(plan.n_obs) disagrees with the $(axes.total) broadcast observations")
     for (name, col) in plan.columns
         name in modelvals && continue
-        col isa Number && _fail(name, "data value $name is a number, but " *
-            "the model reads it per observation — lower with the values " *
-            "(`lower_rkppl(ast, data)`, which every `@rkppl` entry point " *
-            "does) so a number lowers as a model-level value")
         _uses_structured_observation_axes(plan) && col isa AbstractArray &&
             ndims(col) > 2 && _fail(name, "structured per-observation data " *
                 "$name must retain its vector or matrix row contract")
@@ -5919,6 +5922,9 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     )
     if head === :ref
         # Indexing a model-level value, or one element of a column.
+        # Opaque result shapes do not permit a parameter-derived gather
+        # index to escape the same data-only check as a vector definition.
+        length(ex.args) == 2 && _check_gather_index(ex, plan, label, false)
         _collect_array_ref!(refs, ex, plan, label, bound;
             allow_gather=false) && return nothing
         obj = ex.args[1]
@@ -7394,6 +7400,11 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
                 "(a free coefficient scaling the latent — got $(t.kind))")
             continue
         end
+        # Compositions read retained assignments as whole values. An
+        # ordinary module call may return an array or a scalar without a
+        # statically known shape; it is still declared in the value graph.
+        t.kind === ComposedTerm &&
+            any(a -> a.name === c, plan.assignments) && continue
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end

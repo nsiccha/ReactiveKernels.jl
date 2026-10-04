@@ -262,20 +262,11 @@ end
         rtol = 1e-5, atol = 1e-7)
 end
 
-@testset "data values: a names-only plan keeps per-observation reads" begin
-    # refused: lowering from names alone reads `s` per observation before
-    # its value exists, so the bound plan cannot take a number there;
-    # lowering with the values is the spelling that reads its shape
-    # (decision 0dejlw1). The message names that spelling.
+@testset "data values: names-only binding broadcasts a number" begin
     plan = lower_rkppl(_dv_regression(), (:y, :x, :s); conditioned = (:y, :x, :s))
-    err = try
-        bind_data(plan, Dict{Symbol,ColumnData}(:y => _DV_Y, :x => _DV_X,
-            :s => 0.7))
-        nothing
-    catch e
-        e
+    for s in (0.7,1.1)
+        bound=bind_data(plan, Dict{Symbol,ColumnData}(:y => _DV_Y, :x => _DV_X,
+            :s => s))
+        _dv_check_regression(bound,s)
     end
-    # capability: bind scalar data to a names-only plan at the same model door (P10a 0dejlw1; todo `1qlbn5b`).
-    @test_broken (err === nothing || throw(err))
-
 end

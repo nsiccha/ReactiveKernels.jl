@@ -150,14 +150,15 @@ end
         y ~ NormalIDGLM(X, alpha, b, 1.0)
     end, cols, (p, l, nt, u) -> nt.alpha .+ cols.x .* only(nt.b);
         slots = (:matrices, :array_parameters))
-    _ma_check(quote
+    result = _ma_check(quote
         X = hcat(x)
         center = x .+ 0.2
         z[axes(X, 1)] .~ Normal.(center, 1)
         mu = z[rows]
         y .~ Normal.(mu, 1.0)
     end, merge(cols, (; rows = collect(1:4))), (p, l, nt, u) -> nt.z;
-        slots = (:matrices, :array_parameters, :derived))
+        slots = (:array_parameters, :derived))
+    @test result.bound.columns[:X] == hcat(cols.x)
     for library in (:r2d2_coefs, :horseshoe_coefs)
         draw = library === :r2d2_coefs ? :(r2d2_coefs(X, [1.0])) : :(horseshoe_coefs(X))
         _ma_check(quote

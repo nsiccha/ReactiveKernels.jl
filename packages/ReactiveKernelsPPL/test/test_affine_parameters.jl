@@ -23,9 +23,17 @@ _affine_whole(value) = value
     # the whole-value expression also needs to retain its independent axis.
     aligned = copy(ast)
     push!(aligned.args, :(y2 .~ Normal.(group_x, 1.0)))
-    # capability: the same array can serve whole-value and indexed observation consumers (P10a, 0dejlw1; todo `1qlbn5b`).
-    @test_broken (lower_rkppl(aligned, (keys(data)..., :y2);
-        mod = @__MODULE__, conditioned = (keys(data)..., :y2)); true)
+    values=merge(data,Dict(:y2=>[0.1,-0.2]))
+    shared=bind_data(lower_rkppl(aligned,keys(values);
+        mod = @__MODULE__, conditioned = keys(values)),values)
+    shared_built=build_kernel(shared)
+    @test _query(shared_built.spec,shared,:posterior,u) ≈
+        sum(logpdf.(Normal(),u)) + sum(logpdf.(
+            Normal.((u .+ data[:group_x])[data[:obs_index]],1),data[:y])) +
+        sum(logpdf.(Normal.(data[:group_x],1),values[:y2]))
+    # refused: the second response cannot broadcast length three with two.
+    @test_throws ContractValidationError bind_data(shared,
+        merge(values,Dict(:y2=>zeros(3))))
 end
 
 function _affine_model(ast; data...)
