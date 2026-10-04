@@ -133,8 +133,11 @@ _kernel_native_source(f::_KernelSourceFunction) = f.f
 
 @inline @generated function (f::_KernelSourceFunction)(args::Vararg{Any,N}) where {N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
+    argtypes = Tuple{args...}
     quote
-        if applicable(f.f, $(forwarded...))
+        # The type-only query uses the caller's world without boxing active
+        # argument values into a method-lookup array during ordinary AD.
+        if hasmethod(f.f, $argtypes)
             Base.@inline f.f($(forwarded...))
         else
             Base.@inline _kernel_runtime_source_call(

@@ -3031,7 +3031,11 @@ function _kernel_source_function(f, source::Expr, mod::Module)
     body = Expr(:let, Expr(:block, bindings...), source.args[2])
     runtime_source = Expr(:->, Expr(:tuple, environment, params...), body)
     qualified = macroexpand(mod, Expr(Symbol("hygienic-scope"), runtime_source, mod))
-    _KernelSourceFunction(f, compile(qualified), captures)
+    # The owning RGF cache retains the body. Keeping its mutable Expr in each
+    # leaf would add GC roots to the prepared callable's captured operation
+    # table, obstructing ordinary reverse's read-only function analysis.
+    runtime_f = RuntimeGeneratedFunctions.drop_expr(compile(qualified))
+    _KernelSourceFunction(f, runtime_f, captures)
 end
 
 function _kernel_source_native_scope(ex)
