@@ -67,6 +67,7 @@ function _candidate_recipes(g::Graph, have::Set{Int}, want::Vector{Int})
     end
     sort!(cand)
     _prune_dominated_candidates!(g, have, cand)
+    _prune_ungroundable_candidates!(g, have, cand)
     cand
 end
 
@@ -112,6 +113,52 @@ function _prune_dominated_candidates!(g::Graph, have::Set{Int}, cand::Vector{Int
     end
     isempty(dominated) && return cand
     filter!(rid -> !(rid in dominated), cand)
+end
+
+# A recipe whose only non-HAVE output is v cannot help an optimal plan if
+# its inputs cannot be reached without v. It can never be the first producer
+# of v; after another recipe produces v, it adds no value and only increases
+# cost or recipe count. Test this with forward reachability while withholding
+# v. Multi-output recipes remain candidates whenever they can add other values.
+# Reachability deliberately ignores costs and may overestimate what is possible;
+# failure to reach an input is therefore a proof, not a greedy route choice.
+function _prune_ungroundable_candidates!(g::Graph, have::Set{Int}, cand::Vector{Int})
+    by_value = Dict{Int,Vector{Int}}()
+    for rid in cand, output in g.recipes[rid].outputs
+        cid = canon_id(g, output.id)
+        cid in have && continue
+        ids = get!(by_value, cid, Int[])
+        rid in ids || push!(ids, rid)
+    end
+    rejected = Set{Int}()
+    for vid in sort!(collect(keys(by_value)))
+        ids = by_value[vid]
+        length(ids) > 1 || continue
+        available = copy(have)
+        changed = true
+        while changed
+            changed = false
+            for rid in cand
+                r = g.recipes[rid]
+                all(input -> canon_id(g, input.id) in available, r.inputs) || continue
+                for output in r.outputs
+                    cid = canon_id(g, output.id)
+                    cid == vid && continue
+                    cid in available && continue
+                    push!(available, cid)
+                    changed = true
+                end
+            end
+        end
+        for rid in ids
+            r = g.recipes[rid]
+            all(output -> (cid = canon_id(g, output.id); cid == vid || cid in have),
+                r.outputs) || continue
+            all(input -> canon_id(g, input.id) in available, r.inputs) ||
+                push!(rejected, rid)
+        end
+    end
+    filter!(rid -> !(rid in rejected), cand)
 end
 
 # --- branch-and-bound selection -------------------------------------------

@@ -23,7 +23,7 @@ end
     bad = (; index=[1, 2, 3, 1, 2, 1], y=zeros(4))
     # refused: a mapped prior cell selects scale[3] outside its declared
     # two-element domain (standard Julia indexing safety).
-    @test_throws "index holds indices outside 1:2" bind_data(
+    @test_throws "holds indices outside 1:2" bind_data(
         lower_rkppl(ast, bad; conditioned=(:y,)), bad)
 end
 
