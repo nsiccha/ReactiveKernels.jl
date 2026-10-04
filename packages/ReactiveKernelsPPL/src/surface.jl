@@ -2494,7 +2494,7 @@ end
 function _resolve_function_arg(a, mod::Module, names::Set{Symbol}, where)
     if a isa Symbol
         (a in names || !isdefined(mod, a)) && return a
-        getfield(mod, a) isa Function || return a
+        getfield(mod, a) isa Union{Function,KernelSpec} || return a
         return GlobalRef(mod, a)
     elseif a isa Expr && a.head === :kw && length(a.args) == 2
         return Expr(:kw, a.args[1],

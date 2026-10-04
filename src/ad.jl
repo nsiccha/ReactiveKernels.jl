@@ -172,8 +172,11 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         # Bound views cross this Enzyme boundary as owning copies: a
         # `SubArray`-typed `Constant` operand defeats static activity
         # analysis, while identical owning contents differentiate cleanly.
+        # Bound numeric fields likewise cross as inactive operands, so
+        # reconstructing their table does not appear to mutate the callable.
         externalized, values = _externalize_bound_array_call(
-            kernel.f.native, ops; materialize_view_copies = true)
+            kernel.f.native, ops; materialize_view_copies = true,
+            externalize_scalars = true)
         isempty(values) && return (
             _ADNativeKernelCall{I,typeof(kernel.f.native),typeof(ops)}(
                 kernel.f.native, ops),
@@ -182,7 +185,7 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         return _ADKernelCall{I,typeof(externalized)}(externalized), values
     end
     externalized, values = _externalize_bound_arrays(
-        kernel; materialize_view_copies = true)
+        kernel; materialize_view_copies = true, externalize_scalars = true)
     _ADKernelCall{I,typeof(externalized)}(externalized), values
 end
 
