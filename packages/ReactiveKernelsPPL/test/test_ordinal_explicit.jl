@@ -10,8 +10,7 @@ using Test
 # `y .~ Ordinal.(structure, link, eta, Ref(c))` take the cutpoints as an
 # argument, stopping-ratio thresholds are a sized `t[1:n] .~ Normal.(m, s)`
 # vector, and the shipped `y ~ ordered_logistic(eta)` states the default.
-# With the old default values each explicit spelling lowers to the plan the
-# implicit form (`OrderedLogistic.(eta)`, minted `y_cutpoints`) lowers to.
+# Every threshold vector and its prior are declared in the model body.
 # The ordered-logistic oracle is Turing.jl's `OrderedLogistic(η, c)`
 # definition, P(y = k) = F(c[k] − η) − F(c[k−1] − η), evaluated through
 # Distributions.jl CDFs (Distributions.jl itself has no `OrderedLogistic`).
@@ -46,65 +45,59 @@ _oe_logistic(z) = cdf(Logistic(), z)
 _oe_probit(z) = cdf(Normal(), z)
 _oe_cloglog(z) = 1 - exp(-exp(z))
 
-@testset "explicit cutpoints: twins of the implicit form" begin
-    implicit = _oe_canon(quote
-        a ~ Normal(0, 1)
-        b ~ Normal(0, 1)
-        eta = a .+ b .* x
-        y .~ OrderedLogistic.(eta)
-    end)
+@testset "explicit cutpoints: declaration order and extent" begin
     stated = quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         eta = a .+ b .* x
     end
-    @test _oe_canon(Expr(:block, stated.args...,
-        :(y_cutpoints ~ Ordered(Normal(0, 1), length(levels(y)) - 1)),
-        :(y .~ OrderedLogistic.(eta, Ref(y_cutpoints))))) == implicit
-    # The shipped stream submodel states the same two statements.
-    @test _oe_canon(Expr(:block, stated.args...,
-        :(y ~ ordered_logistic(eta)))) == implicit
-    # Cumulative Ordinal: an Ordered vector, data-sized.
-    @test _oe_canon(quote
-        b ~ Normal(0, 1)
-        y_thresholds ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
-        eta = b .* x
-        y .~ Ordinal.(Cumulative(), ProbitLink(), eta, Ref(y_thresholds))
-    end) == _oe_canon(quote
-        b ~ Normal(0, 1)
-        eta = b .* x
-        y .~ Ordinal.(Cumulative(), ProbitLink(), eta)
-    end)
-    # Stopping ratio: unconstrained sized thresholds.
-    stopping_implicit = quote
-        b ~ Normal(0, 1)
-        eta = b .* x
-        y .~ Ordinal.(StoppingRatio(), LogitLink(), eta)
-    end
-    @test _oe_canon(quote
+    declaration = :(y_cutpoints ~ Ordered(Normal(0, 1), length(levels(y)) - 1))
+    response = :(y .~ OrderedLogistic.(eta, Ref(y_cutpoints)))
+    ordered = Expr(:block, stated.args..., declaration, response)
+    @test _oe_canon(ordered) ==
+        _oe_canon(Expr(:block, stated.args..., response, declaration))
+    cols = _oe_cols()
+    bound(ex) = bind_data(_oe_lower(ex), cols)
+    symbolic = build_kernel(bound(ordered))
+    concrete_ast = Expr(:block, stated.args...,
+        :(y_cutpoints ~ Ordered(Normal(0, 1), 2)), response)
+    concrete = build_kernel(bound(concrete_ast))
+    @test coordinate_names(symbolic.layout) == coordinate_names(concrete.layout)
+    u = _oe_point(symbolic.layout.total)
+    @test _query(symbolic.spec, bound(ordered), :posterior, u) ≈
+        _query(concrete.spec, bound(concrete_ast), :posterior, u)
+    stopping = quote
         b ~ Normal(0, 1)
         y_thresholds[1:length(levels(y)) - 1] .~ Normal.(0, 1)
         eta = b .* x
         y .~ Ordinal.(StoppingRatio(), LogitLink(), eta, Ref(y_thresholds))
-    end) == _oe_canon(stopping_implicit)
-    # A literal length is concrete before bind and the same plan after.
-    cols = _oe_cols()
-    bound(ex) = sprint(_canon, bind_data(_oe_lower(ex), cols))
-    @test bound(Expr(:block, stated.args...,
-        :(y_cutpoints ~ Ordered(Normal(0, 1), 2)),
-        :(y .~ OrderedLogistic.(eta, Ref(y_cutpoints))))) ==
-        bound(quote
-            a ~ Normal(0, 1)
-            b ~ Normal(0, 1)
-            eta = a .+ b .* x
-            y .~ OrderedLogistic.(eta)
-        end)
-    @test bound(quote
+    end
+    stopping_literal = quote
         b ~ Normal(0, 1)
         y_thresholds[1:2] .~ Normal.(0, 1)
         eta = b .* x
         y .~ Ordinal.(StoppingRatio(), LogitLink(), eta, Ref(y_thresholds))
-    end) == bound(stopping_implicit)
+    end
+    dynamic = build_kernel(bound(stopping))
+    fixed = build_kernel(bound(stopping_literal))
+    @test coordinate_names(dynamic.layout) == coordinate_names(fixed.layout)
+    u = _oe_point(dynamic.layout.total)
+    @test _query(dynamic.spec, bound(stopping), :posterior, u) ≈
+        _query(fixed.spec, bound(stopping_literal), :posterior, u)
+end
+
+@testset "ordinal responses require their authored threshold priors" begin
+    # Refused: USER 1cmodra (vectors) and 0d5a67r remove implied priors.
+    @test_throws "requires explicit cutpoints" _oe_lower(quote
+        b ~ Normal(0, 1)
+        y .~ OrderedLogistic.(b .* x)
+    end)
+    for structure in (:Cumulative, :StoppingRatio)
+        @test_throws "requires explicit thresholds" _oe_lower(quote
+            b ~ Normal(0, 1)
+            y .~ Ordinal.($structure(), LogitLink(), b .* x)
+        end)
+    end
 end
 
 @testset "explicit cutpoints: OrderedLogistic density" begin

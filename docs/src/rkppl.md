@@ -336,6 +336,9 @@ from parameter geometry, without adding generated values to sampler coordinates.
 - `Ordinal` permits an intercept alongside its thresholds, for both
   cumulative and stopping-ratio responses. Both declarations and their
   priors are translated as written.
+  `OrderedLogistic` and `Ordinal` require an explicit threshold argument
+  such as `Ref(c)`; declare the modeled vector and its prior in the body.
+  Omitting the argument is rejected.
 - Single assignment, no `if`, no `target +=`. Loops are written as
   `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
 

@@ -1186,7 +1186,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         varying_contribs = varying_contribs,
         varying_draws_names = varying_draws_names,
         varying_use = Dict{Symbol,Symbol}(),
-        implicit_vectors = VectorParameter[],
         splines = Dict{Symbol,SplineBasis}(b.id => b for b in bases),
         spline_uses = Dict{Symbol,Symbol}(),
         hsgps = Dict{Symbol,HSGPBasis}(b.id => b for b in hbases),
@@ -1556,7 +1555,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         dar_paths = ctx.dar_specs,
         varying_draws = varying_draws,
         varying_slices = varying_slices,
-        vector_parameters = vcat(ctx.implicit_vectors, dirichlets),
+        vector_parameters = dirichlets,
         spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
@@ -8594,19 +8593,6 @@ function _lower_categorical_logit_response(lhs, call, range, weights,
         extra_predictors = pnames[2:end])
 end
 
-# Allocate an implicit SB-mirroring vector parameter (`y_cutpoints` /
-# `y_thresholds`): std-normal elementwise prior, size inferred at bind.
-# Loud on collision with a user definition.
-function _implicit_vector!(ctx, name::Symbol, family::Symbol, lhs::Symbol)
-    name in ctx.taken && _sfail(
-        "implicit $family parameter $name for response $lhs collides " *
-        "with your definition — rename yours")
-    push!(ctx.taken, name)
-    push!(ctx.implicit_vectors,
-        VectorParameter(name, family, (arg1 = 0.0, arg2 = 1.0), nothing, name))
-    return name
-end
-
 # Explicit cutpoints/thresholds of an ordinal response: the trailing
 # argument `Ref(c)` names one declared vector shared by every observation
 # (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
@@ -8637,22 +8623,18 @@ function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
     return name
 end
 
-# Cumulative-logit ordinal: `y .~ OrderedLogistic.(eta, Ref(c))` over
-# declared cutpoints `c ~ Ordered(...)`, or the implicit form
-# `y .~ OrderedLogistic.(eta)` + minted ordered cutpoints (SB's
-# `y_cutpoints::ordered[K-1] ~ std_normal()`; removed once BRM emits the
-# explicit form).
+# Cumulative-logit ordinal reads declared cutpoints. USER 1cmodra (vectors)
+# and 0d5a67r require the prior to be stated in the ordinary model body.
 function _lower_ordered_logistic_response(lhs, call, range, weights,
         evidence, label, ctx, predictors, pred_idx, coefuse)
     args = _plain_args(call, "`OrderedLogistic`")
-    1 <= length(args) <= 2 || _sfail("response $lhs: `OrderedLogistic` " *
-        "takes `y .~ OrderedLogistic.(eta, Ref(c))` with " *
-        "`c ~ Ordered(Normal(0, 1), length(levels(y)) - 1)`")
+    length(args) == 2 || _sfail("response $lhs: `OrderedLogistic` " *
+        "requires explicit cutpoints: declare their prior (for example " *
+        "`c ~ Ordered(Normal(0, 1), length(levels($lhs)) - 1)`) and use " *
+        "`$lhs .~ OrderedLogistic.(eta, Ref(c))`")
     pname = _lower_location(lhs, args[1], IdentityLink, ctx, predictors,
         pred_idx, coefuse; value = true)
-    cut = length(args) == 2 ?
-        _explicit_thresholds!(ctx, lhs, args[2], true, "`OrderedLogistic`") :
-        _implicit_vector!(ctx, Symbol(lhs, :_cutpoints), :ordered_normal, lhs)
+    cut = _explicit_thresholds!(ctx, lhs, args[2], true, "`OrderedLogistic`")
     return LikelihoodSpec(OrderedLogisticFam, LogitLink, lhs, pname,
         nothing, weights, evidence, label, nothing, range; thresholds = cut)
 end
@@ -8676,15 +8658,15 @@ const _ORDINAL_LINKS = Dict{Symbol,LinkFunction}(
 
 # General typed ordinal:
 # `y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(c))` over declared
-# thresholds (ordered iff cumulative — see `_explicit_thresholds!`), or the
-# implicit three-positional form + minted thresholds (removed once BRM
-# emits the explicit form). Optional positional arguments broadcast a
+# thresholds (ordered iff cumulative — see `_explicit_thresholds!`).
+# Optional positional arguments broadcast a
 # discrimination value and a threshold-effect row with ordinary Julia
 # semantics (decision 1m7stoc); broadcast keywords do not vary by row.
 function _lower_ordinal_response(lhs, call, range, weights, evidence,
         label, ctx, predictors, pred_idx, coefuse)
     args = _plain_args(call, "`Ordinal`")
-    3 <= length(args) <= 6 || _sfail("response $lhs: `Ordinal` takes " *
+    4 <= length(args) <= 6 || _sfail("response $lhs: `Ordinal` requires " *
+        "explicit thresholds with their stated prior: use " *
         "(structure, link, eta, Ref(c), discrimination, eachrow(effects)); " *
         "the last two arguments are optional")
     structure = _ordinal_tag(lhs, args[1], (:Cumulative, :StoppingRatio),
@@ -8693,11 +8675,8 @@ function _lower_ordinal_response(lhs, call, range, weights, evidence,
         (:LogitLink, :ProbitLink, :CloglogLink), "link")
     pname = _lower_location(lhs, args[3], IdentityLink, ctx, predictors,
         pred_idx, coefuse; value = true)
-    vfam = structure === :Cumulative ? :ordered_normal : :vector_normal
-    thresh = length(args) >= 4 ?
-        _explicit_thresholds!(ctx, lhs, args[4], structure === :Cumulative,
-            "`Ordinal`") :
-        _implicit_vector!(ctx, Symbol(lhs, :_thresholds), vfam, lhs)
+    thresh = _explicit_thresholds!(ctx, lhs, args[4],
+        structure === :Cumulative, "`Ordinal`")
     structure_sym = structure === :Cumulative ? :cumulative : :stopping
     disc = if length(args) < 5
         nothing
@@ -11494,7 +11473,7 @@ end
 # `differenced_ar1` submodel (`src/library.jl`). Additive only; one
 # `dar()` call per predictor in v1. The state synthesizes as
 # `dar_<pname>` and claims the name up front (the
-# `_implicit_vector!` precedent). Both parameters record in `dar_coefs`
+# vector-parameter representation). Both parameters record in `dar_coefs`
 # (checked disjoint from predictor coefficients after lowering) and
 # lower to `SampledParameter`s, never population priors.
 function _classify_dar(pname, core::Expr, sign::Int, ctx)

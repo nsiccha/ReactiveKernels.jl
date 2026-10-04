@@ -41,17 +41,20 @@ function _kinv_plans(K::Int)
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
-                y .~ OrderedLogistic.(eta)
+                y_cutpoints ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
+                y .~ OrderedLogistic.(eta, Ref(y_cutpoints))
             end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "ordinal_cumulative_probit" => bind_data(lower_rkppl(quote
                 b ~ Normal(0, 1)
                 eta = b .* x
-                y .~ Ordinal.(Cumulative(), ProbitLink(), eta)
+                y_thresholds ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
+                y .~ Ordinal.(Cumulative(), ProbitLink(), eta, Ref(y_thresholds))
             end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "ordinal_stopping_logit" => bind_data(lower_rkppl(quote
                 b ~ Normal(0, 1)
                 eta = b .* x
-                y .~ Ordinal.(StoppingRatio(), LogitLink(), eta)
+                y_thresholds[1:length(levels(y)) - 1] .~ Normal.(0, 1)
+                y .~ Ordinal.(StoppingRatio(), LogitLink(), eta, Ref(y_thresholds))
             end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "categorical_simplex" => bind_data(lower_rkppl(quote
                 s ~ Dirichlet($K, 1.0)

@@ -4468,8 +4468,8 @@ end
 
 # ── Leveled responses (categorical / ordinal / multinomial) ─────────────
 # `y .~ CategoricalLogit.(eta_2, ..., eta_K)` (reference-coded multi-logit),
-# `y .~ OrderedLogistic.(eta)` (+ implicit ordered cutpoints),
-# `y .~ Ordinal.(Cumulative(), LogitLink(), eta)` (+ implicit thresholds),
+# `y .~ OrderedLogistic.(eta, Ref(c))` (declared ordered cutpoints),
+# `y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(c))` (declared thresholds),
 # `eachrow(hcat(c1, c2, ..., cK)) .~ Multinomial.(N, Ref(s))` and `y .~ Categorical(s)` over an
 # explicit `s ~ Dirichlet(...)` simplex.
 
@@ -4523,7 +4523,8 @@ end
     ast = Expr(:block,
         :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
         :(eta = a .+ b .* x),
-        :(y .~ OrderedLogistic.(eta)))
+        :(y_cutpoints ~ Ordered(Normal(0, 1), length(levels(y)) - 1)),
+        :(y .~ OrderedLogistic.(eta, Ref(y_cutpoints))))
     plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     r = only(plan.responses)
     @test r.family === OrderedLogisticFam
@@ -4532,14 +4533,13 @@ end
     @test v.name === :y_cutpoints && v.family === :ordered_normal
     @test v.size === nothing # inferred at bind
     @test collect(values(v.args)) == [0.0, 1.0]
-    # An explicit `y_cutpoints` definition collides loudly.
-    # refused: y_cutpoints collides with the reserved synthesized cutpoints name (implicit cutpoint prior itself is P7-suspect)
-    @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
+    # Refused: USER 1cmodra (vectors) and 0d5a67r require explicit cutpoints.
+    @test_throws "requires explicit cutpoints" lower_rkppl(Expr(:block,
             :(y_cutpoints ~ Normal(0, 1)),
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
             :(y .~ OrderedLogistic.(eta))), (:y, :x); conditioned = (:y, :x))
-    # Arity is exactly one eta.
+    # Cutpoints follow the location as one shared vector.
     # refused: OrderedLogistic.(eta, eta): scalar cutpoints are malformed
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
@@ -4568,7 +4568,8 @@ end
     ast = Expr(:block,
         :(b ~ Normal(0, 1)),
         :(eta = b .* x),
-        :(y .~ Ordinal.(Cumulative(), LogitLink(), eta)))
+        :(y_thresholds ~ Ordered(Normal(0, 1), length(levels(y)) - 1)),
+        :(y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(y_thresholds))))
     plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     r = only(plan.responses)
     @test r.family === OrdinalFam
@@ -4579,14 +4580,16 @@ end
     stopping = lower_rkppl(Expr(:block,
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
-            :(y .~ Ordinal.(StoppingRatio(), ProbitLink(), eta))), (:y, :x); conditioned = (:y, :x))
+            :(y_thresholds[1:length(levels(y)) - 1] .~ Normal.(0, 1)),
+            :(y .~ Ordinal.(StoppingRatio(), ProbitLink(), eta, Ref(y_thresholds)))), (:y, :x); conditioned = (:y, :x))
     rs = only(stopping.responses)
     @test rs.link === ProbitLink && rs.ordinal_structure === :stopping
     @test only(stopping.vector_parameters).family === :vector_normal
     clog = lower_rkppl(Expr(:block,
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
-            :(y .~ Ordinal.(Cumulative(), CloglogLink(), eta))), (:y, :x); conditioned = (:y, :x))
+            :(y_thresholds ~ Ordered(Normal(0, 1), length(levels(y)) - 1)),
+            :(y .~ Ordinal.(Cumulative(), CloglogLink(), eta, Ref(y_thresholds)))), (:y, :x); conditioned = (:y, :x))
     @test only(clog.responses).link === CloglogLink
     # Tag misspellings, wrong arity, and discrimination/adhoc extras fail.
     # refused: malformed distribution: wrong arity for the head (Ordinal missing link)
@@ -4603,12 +4606,14 @@ end
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
             :(b ~ Normal(0, 1)),
             :(eta = b .* x),
-            :(y .~ Ordinal.(Sequential(), LogitLink(), eta))), (:y, :x); conditioned = (:y, :x))
+            :(y_thresholds ~ Ordered(Normal(0, 1), length(levels(y)) - 1)),
+            :(y .~ Ordinal.(Sequential(), LogitLink(), eta, Ref(y_thresholds)))), (:y, :x); conditioned = (:y, :x))
     # Intercepts and thresholds are both part of the authored model.
     with_intercept = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 1)),
             :(eta = a .+ b .* x),
-            :(y .~ Ordinal.(Cumulative(), LogitLink(), eta))), (:y, :x); conditioned = (:y, :x))
+            :(y_thresholds ~ Ordered(Normal(0, 1), length(levels(y)) - 1)),
+            :(y .~ Ordinal.(Cumulative(), LogitLink(), eta, Ref(y_thresholds)))), (:y, :x); conditioned = (:y, :x))
     @test any(t -> t.kind === InterceptTerm,
         only(with_intercept.predictors).terms)
 end
