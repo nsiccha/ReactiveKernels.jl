@@ -5,6 +5,11 @@ generic numerical bridge now lives in `ext/ReactiveKernelsBDFExt.jl` as
 `ReactiveKernels.rk_ode_bdf_tol`, delegating to `OrdinaryDiffEqBDF.FBDF()`.
 Its public acceptance is `test/test_native_bdf.jl`. The CVODE experiments below
 are preserved research; their solver-selection recommendation is superseded.
+The compatibility signature does not require consumers to retain old helper
+layouts or argument counts. Equivalent source binding may restructure those
+details while preserving the scientific model, accuracy controls and full
+application acceptance. Recorded dependency versions are qualification
+evidence; supported upgrades require qualification, not permanently frozen pins.
 
 These public experiments investigate snag `native-bdf-origi-82b23b10`.
 They are research candidates, not installed package capabilities or an
@@ -50,9 +55,10 @@ the matrix-exponential control, never the gradient implementation.
    that is a material numerical/performance choice, requiring user direction
    before this prototype becomes production code.
 
-The first route preserves more of the original integration behavior and is
-the recommended final implementation. The second is a smaller, demonstrated
-implementation increment if the user accepts interval restarts. Neither is
+At the time of these experiments, the first route was recommended because it
+preserved more of the original integration behavior. The second was a smaller,
+demonstrated increment requiring a choice about interval restarts. That
+recommendation is historical; the USER selected standard Julia FBDF. Neither is
 an analytical PK substitute or a switch to an explicit/non-BDF solver.
 
 ## Run
@@ -85,7 +91,7 @@ reports the two unresolved diagnostics. Its zero exit is **not** acceptance
 of the callback/time diagnostics. `DIAGNOSTIC_FAIL` is load-bearing evidence.
 
 The public checks establish feasibility and unresolved boundaries. They do
-not establish exact original-source binding, private application numerical
+not establish equivalent application/source binding, private application numerical
 or density parity, full input-type/exception parity, backend portability,
 or the user's original-model performance target. Those remain acceptance
 requirements for the implementation, not waived constraints.
