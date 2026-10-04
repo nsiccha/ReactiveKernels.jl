@@ -69,6 +69,15 @@ _censored_addprop_fd(f, x; h = 1e-6) = [(f(x .+ h .* (eachindex(x) .== i)) -
     end
     # refused: gather indices must be integers within a nonempty source axis (Julia indexing, P3)
     @test_throws "empty" lower_rkppl(_censored_addprop_ast(:([])),Set(keys(cols)); conditioned = Set(keys(cols)))
-    # capability: a gathered vector mixing a data vector and a model scalar (ordinary values, P3/P10a 0dejlw1) (todo `1qlbn5b`)
-    @test_broken (lower_rkppl(_censored_addprop_ast(:([location,a1])),Set(keys(cols)); conditioned = Set(keys(cols))); true)
+    # refused: [data_vector,scalar] is nested; an assay selecting entry one
+    # supplies a vector to scalar hypot, not a scalar additive scale.
+    add=[cols[:location],.4][cols[:assay]]
+    @test add[1] === cols[:location]
+    @test_throws MethodError hypot.(add,.9 .* [.15,.2][cols[:assay]])
+    @test_throws "literal gather entries" lower_rkppl(
+        _censored_addprop_ast(:([location,a1])),Set(keys(cols));
+        conditioned = Set(keys(cols)))
+    # Scalar-data and explicit-vcat controls use generic Normal plates in
+    # test_whole_value_audit.jl. This historical schedule fixture follows
+    # the existing downstream PK migration; it adds no new PK model scope.
 end
