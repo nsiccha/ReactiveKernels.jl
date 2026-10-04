@@ -9,6 +9,7 @@ root = normpath(joinpath(@__DIR__, ".."))
 testfiles = [joinpath(@__DIR__, "test_nonallocating.jl"),
              joinpath(@__DIR__, "test_nonallocating_mnist.jl"),
              joinpath(@__DIR__, "test_nonallocating_ad.jl"),
+             joinpath(@__DIR__, "test_nonallocating_repeated.jl"),
              joinpath(@__DIR__, "test_ppl_glm_nonallocating_ad.jl"),
              joinpath(@__DIR__, "test_scan_plate_nonallocating.jl"),
              joinpath(@__DIR__, "test_ppl_pk_nonallocating.jl"),
