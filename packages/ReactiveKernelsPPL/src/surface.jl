@@ -1611,7 +1611,7 @@ _is_module_value_call(ex) =
 const _WHOLE_READ_FNS = (:size, :axes, :levels, :eachindex, :Ref)
 const _ADDITIVE_OPS = (:+, :-, :.+, :.-)
 
-# An inline data-only index call is the same bind-time value as its named
+# An inline data-only index expression is the same bind-time value as its named
 # definition. Give it a hygienic name before observation-axis analysis,
 # which then routes it through the existing data-definition materializer.
 # Only ordinary value compositions are visited: a lazy arm or loop keeps
@@ -1623,7 +1623,8 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
     function index_name(ex)
         ex isa Expr || return ex
         value = resolve(ex)
-        _contains_module_call(value) && _data_only(value, data, detmap) || return ex
+        (_contains_module_call(value) || value.head === :ref) &&
+            _data_only(value, data, detmap) || return ex
         return get!(names, value) do
             k = length(names) + 1
             nm = Symbol(:_rkppl_index_, k)
@@ -1633,6 +1634,7 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
             end
             push!(taken, nm)
             push!(extra, nm => value)
+            detmap[nm] = value
             nm
         end
     end
@@ -1847,6 +1849,16 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
+    # Collecting a one-dimensional index iterator preserves its vector
+    # domain. It is not an opaque scalar module-call result.
+    if fn === GlobalRef(Base, :collect) && length(ex.args) == 2 &&
+            Meta.isexpr(ex.args[2], :call)
+        iterator = ex.args[2].args[1]
+        index_iterator = iterator in (:eachindex, :axes, :(:)) ||
+            (iterator isa GlobalRef && getfield(iterator.mod, iterator.name) in
+                (Base.eachindex, Base.axes, getfield(Base, :(:))))
+        index_iterator && return :vector
+    end
     fn === GlobalRef(Base, :hcat) && return length(ex.args) > 1 ? :matrix : :array
     fn isa GlobalRef && fn.mod === (@__MODULE__) && fn.name === :_bound_array_value &&
         return :array
@@ -2424,7 +2436,7 @@ end
 function _resolve_function_arg(a, mod::Module, names::Set{Symbol}, where)
     if a isa Symbol
         (a in names || !isdefined(mod, a)) && return a
-        getfield(mod, a) isa Function || return a
+        getfield(mod, a) isa Union{Function,KernelSpec} || return a
         return GlobalRef(mod, a)
     elseif a isa Expr && a.head === :kw && length(a.args) == 2
         return Expr(:kw, a.args[1],
@@ -5956,12 +5968,17 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
         length(lhs.args) == 2 || _cell_lhs_error(lhs, ivar)
         # Per-cell latent PARAMETER: a scalar (undotted) distribution. Its args
         # are shared across cells (a captured scalar) or per-cell (`eta[$ivar]`,
-        # a varying prior mean/scale); the `[$ivar]` strip and the bare-vector
-        # check enforce the index discipline, exactly like an observation cell.
+        # a varying prior mean/scale). Preserve the authored selection: a prior
+        # may read a prefix of a longer column, and an indexed singleton is
+        # not a shared scalar that can broadcast to every cell.
         bares = _cell_bares(obj, ivar, data)
         setdiff!(bares, plate_defs)
         push!(ctx, (col, line, bares))
-        push!(params, (col, _strip_cell(_undot_cell_object(obj), ivar),
+        indices = rkind[1] === :coloncall ? rkind[2] :
+            rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
+            Expr(:call, :axes, rkind[2], rkind[3])
+        indices = Expr(:call, GlobalRef(Base, :collect), indices)
+        push!(params, (col, _strip_cell(_undot_cell_object(obj), ivar, indices),
             _plate_param_range(col, rkind, data), line))
         return Expr[]
     end
@@ -6095,15 +6112,18 @@ function _cell_bares!(ex::Expr, ivar, bares, data)
 end
 
 # Strip per-index refs to whole values (validation ran first): `v[i]` →
-# `v`, a gather `v[g[i]]` → `v[g]`.
-_strip_cell(ex, ivar) = ex
-_strip_cell(s::Symbol, ivar) = s
-function _strip_cell(ex::Expr, ivar)
+# `v`, a gather `v[g[i]]` → `v[g]`. A latent prior supplies its authored
+# indices, retaining `v[indices]` or `v[g[indices]]` instead of reading
+# every element of a potentially larger input.
+_strip_cell(ex, ivar, indices=nothing) = ex
+function _strip_cell(ex::Expr, ivar, indices=nothing)
     if ex.head === :ref
         g = _cell_gather_index(ex, ivar)
-        return g === nothing ? ex.args[1] : Expr(:ref, ex.args[1], g)
+        selected = indices === nothing ? g :
+            g === nothing ? indices : Expr(:ref, g, indices)
+        return selected === nothing ? ex.args[1] : Expr(:ref, ex.args[1], selected)
     end
-    return Expr(ex.head, (_strip_cell(a, ivar) for a in ex.args)...)
+    return Expr(ex.head, (_strip_cell(a, ivar, indices) for a in ex.args)...)
 end
 
 # Wrappers and constructors an observation object broadcasts even over
@@ -12143,8 +12163,9 @@ definition named after its statement (`_rkppl_b_arg2`), so every prior
 position downstream sees a literal or a name — naming a subexpression
 never changes legality. Pure-literal arithmetic folds to its value instead
 (`Normal(0, 1 / 2)` keeps a literal scale). Response arguments are
-predictor locations and never hoist; vector-valued arguments stay put (the
-per-position peelers name them). `resolve` maps an argument through the
+predictor locations and never hoist; ordinary vector-valued arguments stay
+put (the per-position peelers name them), while plate priors name their
+selected columns here too. `resolve` maps an argument through the
 model's module-call resolution first, so a hoisted argument calls exactly
 what the same expression bound to a name would. Rewrites `sample` and
 `plate_specs` in place (both fresh from `_partition_statements`) and
@@ -12157,13 +12178,13 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         Set{Symbol}(p[1] for p in plate_specs))
     out = Pair{Symbol,Any}[nm => rhs for (nm, rhs) in det]
     memo = Dict{Symbol,Symbol}()
-    function bind(lhs::Symbol, stem::Symbol, a)
+    function bind(lhs::Symbol, stem::Symbol, a; scalar_only=true)
         a isa Expr && !_is_signed_inf(a) && a.head !== :vect &&
             a.head !== :parameters && a.head !== :kw || return a
         f = _fold_literal(a)
         f === nothing || return f
         r = resolve(a)
-        _shape_of(r, data, detmap, memo, Set{Symbol}()) === :scalar ||
+        scalar_only && _shape_of(r, data, detmap, memo, Set{Symbol}()) !== :scalar &&
             return a
         _reject_unknown_calls("the prior of $lhs (argument " *
                               "`$(repr(a))`)", r)
@@ -12182,7 +12203,7 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
     # Positional arguments only (a `:parameters` keyword block keeps its
     # place and is never an argument position); unchanged input returns
     # itself, so untouched statements keep their exact AST.
-    function hoist_args(lhs, args)
+    function hoist_args(lhs, args; scalar_only=true)
         local res = Any[]
         i = 0
         for a in args
@@ -12192,13 +12213,13 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
             end
             i += 1
             push!(res, a isa Expr && a.head === :vect ?
-                Expr(:vect, (bind(lhs, Symbol(lhs, :_arg, i, :_, j), x)
+                Expr(:vect, (bind(lhs, Symbol(lhs, :_arg, i, :_, j), x; scalar_only)
                     for (j, x) in enumerate(a.args))...) :
-                bind(lhs, Symbol(lhs, :_arg, i), a))
+                bind(lhs, Symbol(lhs, :_arg, i), a; scalar_only))
         end
         return res == args ? args : res
     end
-    function hoist_call(lhs, rhs)
+    function hoist_call(lhs, rhs; scalar_only=true)
         rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol || return rhs
         if rhs.args[1] === :LKJCholesky && length(rhs.args) in (3, 4)
@@ -12208,18 +12229,18 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
             return Expr(:call, rhs.args[1], rhs.args[2], eta, rhs.args[4:end]...)
         end
         if rhs.args[1] === :Ordered && length(rhs.args) == 3
-            inner = hoist_call(lhs, rhs.args[2])
+            inner = hoist_call(lhs, rhs.args[2]; scalar_only)
             return Expr(:call, :Ordered, inner, rhs.args[3])
         end
         if rhs.args[1] in (:truncated, :restricted) && length(rhs.args) == 4
-            inner = hoist_call(lhs, rhs.args[2])
-            bounds = hoist_args(lhs, rhs.args[3:end])
+            inner = hoist_call(lhs, rhs.args[2]; scalar_only)
+            bounds = hoist_args(lhs, rhs.args[3:end]; scalar_only)
             inner === rhs.args[2] && bounds == rhs.args[3:end] && return rhs
             return Expr(:call, rhs.args[1], inner, bounds...)
         end
         rhs.args[1] in _HOIST_FAMILIES || return rhs
         args = rhs.args[2:end]
-        new = hoist_args(lhs, args)
+        new = hoist_args(lhs, args; scalar_only)
         new === args && return rhs
         return Expr(:call, rhs.args[1], new...)
     end
@@ -12246,7 +12267,9 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
             s.matrix, s.dims, s.slices, s.count_columns)
     end
     for (i, (nm, rhs, rng, line)) in enumerate(plate_specs)
-        new = hoist_call(nm, rhs)
+        # Per-cell prior arguments also hold selected columns. Name those
+        # expressions like scalar arguments before the ordinary value passes.
+        new = hoist_call(nm, rhs; scalar_only=false)
         new === rhs || (plate_specs[i] = (nm, new, rng, line))
     end
     return out

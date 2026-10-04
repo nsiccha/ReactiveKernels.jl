@@ -10477,10 +10477,9 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     end
     _has_observation_axis(plan) || return Set{Symbol}(raw), Set{Symbol}(first.(defs))
 
-    # Pinning only shrinks the verdict: skip the slot walk when even the
-    # unpinned pass finds nothing.
-    inputs, _ = _whole_value_reads(defs, raw, Set{Symbol}())
-    isempty(inputs) && return unused, Set{Symbol}()
+    # Whole-context definitions can exist without raw data dependencies
+    # (for example collected literal indices selecting a sampled vector).
+    # Their actual consumers still determine the context below.
     free = union(Set{Symbol}(raw), Set{Symbol}(first(d) for d in defs))
     named = copy(free)
     for f in fieldnames(StructuralPlan)
