@@ -905,7 +905,7 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
         pred::Symbol)
     if _is_plate_column_expr(node)
         aliases = Dict{Symbol,Symbol}(s => _lp_name(_predictor(plan, s)) for s in subs)
-        inputs = [_hsubst(a, aliases, Dict()) for a in node.args[1].args[2:end]]
+        inputs = [_hsubst(a, aliases) for a in node.args[1].args[2:end]]
         return Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
     end
     if node isa Symbol
@@ -1815,7 +1815,7 @@ function _ranged_response_stmts(r, plan, stmts)
             aliases[value] = alias
         end
     end
-    stmts = Expr[_hsubst(st, aliases, Dict()) for st in stmts]
+    stmts = Expr[_hsubst(st, aliases) for st in stmts]
     return Expr[pre..., stmts...]
 end
 
@@ -1904,7 +1904,7 @@ function _mi_stopping_response_stmts(r, plan, stmts)
         push!(pre, :($matrix = $(r.threshold_effects)[$jobs, :]))
         aliases[r.threshold_effects] = matrix
     end
-    return Expr[pre..., (_hsubst(st, aliases, Dict()) for st in stmts)...]
+    return Expr[pre..., (_hsubst(st, aliases) for st in stmts)...]
 end
 
 # One plate likelihood per response (pointwise plate + scalar sum node).

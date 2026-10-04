@@ -89,17 +89,14 @@ like a hand-inlined model — transparent and reusable, never an opaque node.
 
 A body holds any statement a top-level program can: `~` / `.~` / `=`
 statements, indexed and sized priors (`c[levels(g)] .~ Normal.(0, s)`,
-`b[axes(X, 2)] .~ …`), `@plate` and `@scan` blocks, basis /
-varying statements, and calls to other submodels. Scope access is static:
+`b[axes(X, 2)] .~ …`), `@plate` and `@scan` blocks,
+and calls to other submodels. Scope access is static:
 
 - every name the body binds — a `~` / `.~` / `=` left-hand side (the base
   name of an indexed one), a `@plate` result, cell or loop variable, a
   `@scan` carried state, step local or loop variable, a `do`-block argument
   — receives a private identifier; its author path is retained separately.
   `z.b` reads local `b` of call `z`. Index expressions keep their shape;
-- a basis id the body declares (`spline_basis(:s, …)`, `hsgp_basis(:s, …)`)
-  receives a private identifier at the declaration and at its `spline(:s)` /
-  `hsgp(:s)` uses; no other quoted symbol changes;
 - each argument is replaced by the call's argument expression; a body may
   observe (`~` / `.~`) an argument bound to a data column, and binding an
   argument name any other way fails;
@@ -905,9 +902,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         (input in data || _mentions_symbol(ast, input)) &&
             _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
     end
-    sample, det, plate_ctx, plate_specs, scans, bases, vectors,
-    hbases, kplates, kstmts, schedules, event_lps, joints,
-    varying_draws, varying_pending, glms = _partition_statements(ast, data)
+    sample, det, plate_ctx, plate_specs, scans,
+    kplates, kstmts, schedules, event_lps, joints, glms = _partition_statements(ast, data)
     sample, det = _rewrite_plate_rows(sample, det)
     # Functions as values: definition call heads outside the built-in
     # vocabulary resolve in the model module (submodel bodies resolved in
@@ -917,8 +913,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         Set{Symbol}(s.lhs for s in sample),
         Set{Symbol}(nm for (nm, _, _, _) in plate_specs),
         Set{Symbol}(st for s in scans for st in s.states),
-        Set{Symbol}(p.contrib for p in varying_pending),
-        Set{Symbol}(p.draws_lhs for p in varying_pending),
         Set{Symbol}(s.name for s in schedules),
         Set{Symbol}(el.name for el in event_lps))
     # A top-level schedule chain leaves `det`/`sample` for its grouped
@@ -958,16 +952,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         data = union(data, aligned)
         det = Pair{Symbol,Any}[p for p in det if first(p) ∉ aligned]
     end
-    # Varying bindings (draws + contributions): contributions compose
-    # only as direct predictor summands, never inside definitions.
-    varying_names = Set{Symbol}()
-    varying_contribs = Set{Symbol}()
-    for p in varying_pending
-        push!(varying_names, p.contrib)
-        push!(varying_names, p.draws_lhs)
-        push!(varying_contribs, p.contrib)
-    end
-    varying_draws_names = Set{Symbol}(p.draws_lhs for p in varying_pending)
     plate_names = Set{Symbol}(nm for (nm, _, _, _) in plate_specs)
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     detnames_all = Set{Symbol}(nm for (nm, _) in det)
@@ -1010,17 +994,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     ordered_names = Set{Symbol}(s.lhs for s in sample
         if s.lhs ∉ data && !s.broadcast && s.slices === nothing &&
             _is_ordered_call(s.rhs))
-    # Dar trajectory parameters: persistence (`truncated(Normal(mu, s),
-    # 0, 1)`) and scale (`HalfNormal(s)` / `truncated(Normal(0, s), 0,
-    # Inf)`) — the only names a `dar()` call accepts (checked during
-    # response lowering, before `_lower_parameters` runs; the contract
-    # re-checks for hand-built plans). Both keep the meaning of the
-    # statement as written: Distributions semantics, truncation
-    # normalizers included.
-    dar_beta_names = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && _is_dar_beta_rhs(s.rhs))
-    dar_sigma_names = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && _is_dar_sigma_rhs(s.rhs))
     # An `hcat` matrix the program reads as a value (`var.(eachcol(X))`,
     # `X * v` over a computed or declared-array vector, a coefficient
     # prior the matrix term cannot carry) lowers exactly like a bound data
@@ -1029,8 +1002,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     caller_data = data
     value_mats = _hcat_value_reads(det, detmap, sample, data, glms,
         union(dirichlet_names, ordered_names),
-        union(plate_names, Set{Symbol}(st for s in scans for st in s.states),
-            varying_names))
+        union(plate_names, Set{Symbol}(st for s in scans for st in s.states)))
     value_mat_defs = Pair{Symbol,Any}[p for p in det if first(p) in value_mats]
     if !isempty(value_mats)
         det = Pair{Symbol,Any}[p for p in det if first(p) ∉ value_mats]
@@ -1090,8 +1062,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # an indexed/matmul use as a coefficient. Keep `array_decls` and
     # `value_arrays` separate: they control those coefficient use sites.
     shape_env = _ShapeEnv(
-        union(plate_names, Set{Symbol}(st for s in scans for st in s.states),
-            varying_names),
+        union(plate_names, Set{Symbol}(st for s in scans for st in s.states)),
         sized_decls)
     # A data column the definitions read only as whole values (module-call
     # arguments, gathered values) is a model-level data input at bind, so
@@ -1160,16 +1131,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         # exactly like the named alias `zg = z[g]`.
         scan_states = Set{Symbol}(st for s in scans for st in s.states),
         scan_coefs = Set{Symbol}(),
-        varying_draws = Dict{Symbol,VaryingDraws}(
-            d.label => d for d in varying_draws),
-        varying_pending = varying_pending,
-        varying_contribs = varying_contribs,
-        varying_draws_names = varying_draws_names,
-        varying_use = Dict{Symbol,Symbol}(),
-        splines = Dict{Symbol,SplineBasis}(b.id => b for b in bases),
-        spline_uses = Dict{Symbol,Symbol}(),
-        hsgps = Dict{Symbol,HSGPBasis}(b.id => b for b in hbases),
-        hsgp_uses = Dict{Symbol,Symbol}(),
         dirichlet_names = dirichlet_names,
         ordered_names = ordered_names,
         array_dims = Dict{Symbol,Vector{Any}}(s.lhs => s.dims for s in sample
@@ -1179,16 +1140,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         vector_params = union(dirichlet_names, ordered_names,
             Set{Symbol}(s.lhs for s in sample
                 if s.levels !== nothing || s.matrix !== nothing)),
-        mo_uses = Dict{Symbol,Symbol}(),
         matrices = Dict{Symbol,DesignMatrix}(m.name => m for m in matrices),
         matrices_used = Set{Symbol}(),
         coefvecs = Dict{Symbol,Symbol}(s.lhs => s.matrix for s in sample
             if s.matrix !== nothing),
-        dar_beta_names = dar_beta_names,
-        dar_sigma_names = dar_sigma_names,
-        dar_states = Set{Symbol}(),
-        dar_coefs = Set{Symbol}(),
-        dar_specs = DarSpec[],
         array_decls = array_decls,
         value_arrays = value_arrays,
         factor_decls = factor_decls,
@@ -1292,25 +1247,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             "coefficients are sampled scalars, not population " *
             "coefficients (rename one)")
     end
-    # Varying slices finalize once every predictor is interned: each
-    # contribution resolves to the single predictor that uses it (target
-    # inferred from the single use — never declared twice), in-graph
-    # `r_<target>_<suffix>` labels claim, and each draws block's slice
-    # ranges prove exact-once partition of 1:K.
-    varying_slices = _finalize_varying_slices(ctx)
     # Affine uses reference ordinary declarations without taking their priors.
     owned_coefs = Dict(k => v for (k, v) in coefuse if k ∉ ordinary_parameters)
     _check_coefficient_uses(coefuse, ctx)
-    for c in ctx.dar_coefs
-        haskey(coefuse, c) && _check_owned_coefficient(c, ctx, "$c is both a " *
-            "predictor coefficient and a dar trajectory parameter — dar " *
-            "parameters are sampled scalars, not population coefficients " *
-            "(rename one)")
-    end
-    for c in ctx.dar_states
-        haskey(coefuse, c) && _sfail("$c is a dar trajectory state — it " *
-            "splices via its `dar()` call, not as a coefficient (rename one)")
-    end
     # Hyperparameter names the broadcast peelers admit at the surface:
     # sampled scalar names (derived responses excluded — they are
     # vectors) and scalar definitions. Anything else (data,
@@ -1472,22 +1411,6 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     append!(assigns, ctx.synth_assigns)
     _check_coefficient_readers(coefuse, ctx, predictors, priors, params,
         plate_parameters, assigns, derived, responses)
-    _validate_varying_margins(varying_draws, data, derived, detshape,
-        used_locs)
-    # Varying bindings compose only as direct predictor summands:
-    # non-predictor definitions referencing one fail here (predictor
-    # definitions are the one admitted position; inlined aliases fail
-    # at `_inline_structure` with the use site).
-    for (nm, rhs) in det
-        nm in used_locs && continue
-        if _uses_varying_contrib(rhs, varying_names)
-            _sfail("definition `$nm = $(repr(rhs))` references a varying " *
-                  "binding, which lowers only as a direct predictor " *
-                  "summand (`mu = a .+ r`), not inside definitions — " *
-                  "slice draws explicitly " *
-                  "(`r ~ varying_slice(d, ...)`) and use the slice")
-        end
-    end
     _check_plate_bares(plate_ctx, data, Set{Symbol}(p.name for p in predictors),
         Set{Symbol}(d.name for d in derived), _factor_coefs(coefuse, predictors),
         plate_names)
@@ -1509,11 +1432,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
-        dar_paths = ctx.dar_specs,
-        varying_draws = varying_draws,
-        varying_slices = varying_slices,
         vector_parameters = dirichlets,
-        spline_bases = bases, spline_vectors = vectors, hsgp_bases = hbases,
         kernel_plates = kplates,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
@@ -1935,8 +1854,6 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         fn = ex.args[1]
         fn isa Symbol || return false
         fn in REDUCTION_FNS && return false
-        # Retained smooth summands read the row axis of their named basis.
-        fn in (:hsgp, :spline) && return true
         fn === :_ppl_plate_column && return _plate_column_axis(ex) === nothing
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2:end])
@@ -1980,7 +1897,6 @@ end
 
 # Single rule table for undotted `:call` shapes over argument shapes.
 function _shape_of_call(fn::Symbol, argshapes::Vector{Symbol})
-    fn in (:hsgp, :spline) && return :vector
     :invalid in argshapes && return :invalid
     fn in ELEMENTWISE_OPS && return _elementwise_shape(argshapes)
     :array in argshapes && return _array_call_shape(fn, argshapes)
@@ -2289,9 +2205,7 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
         # (responses) with bind-to-a-name guidance.
         fn === :_ppl_plate_column && return nothing  # array-cell plate
         if fn isa Symbol && fn ∉ ELEMENTWISE_OPS && fn ∉ ASSIGNMENT_FNS &&
-                fn !== :spline &&
-                fn !== :hsgp && fn !== :mo && fn !== :mo1 &&
-                fn !== :hcat && fn !== :dar
+                fn !== :hcat
             startswith(string(fn), ".") && _sfail(
                 "$where uses dotted operator `$fn`, which is not in " *
                 "the slice-1 elementwise vocabulary")
@@ -2307,9 +2221,6 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
             fn in _DIST_VALUE_FNS && _sfail(
                 "$where calls `$fn`, which lowers only under `~`/`.~`, " *
                 "not as a value")
-            fn in (:varying_effect, :varying_draws, :varying_slice) &&
-                _sfail("$where calls `$fn` as a value — varying " *
-                "statements lower only under `~` (`r ~ $fn(...)`)")
             _sfail("$where calls `$fn`, which is not in the slice-1 " *
                    "value vocabulary — arbitrary Julia functions are " *
                    "planned (no-@deffun-ceremony direction) but need " *
@@ -2351,15 +2262,14 @@ end
 # elementwise. Data-only definitions that call one are evaluated once by
 # `bind_data`; the rest run in the generated kernel under generic AD.
 
-const _CONSTRUCT_VALUE_HEADS = (:spline, :hsgp, :mo, :mo1, :hcat, :dar)
+const _CONSTRUCT_VALUE_HEADS = (:hcat,)
 
 _builtin_value_head(fn::Symbol) =
     fn in ELEMENTWISE_OPS || fn in ASSIGNMENT_FNS ||
     fn in REDUCTION_FNS || fn in _CONSTRUCT_VALUE_HEADS ||
     fn in CELL_FNS || fn in SEGMENT_CELL_FNS ||
     startswith(string(fn), ".") || fn === :treatment || fn === :ifelse ||
-    fn in _RESPONSE_ONLY_FNS ||
-    fn in (:varying_effect, :varying_draws, :varying_slice)
+    fn in _RESPONSE_ONLY_FNS
 
 _builtin_dotted_head(f::Symbol) =
     f === :ifelse || f in ELEMENTWISE_FNS || f in _COMPOSED_UNARY
@@ -2385,11 +2295,27 @@ function _resolve_module_path(ex, mod::Module, where)
     return m
 end
 
+const _RETIRED_CONSTRUCT_MODELS = Dict(
+    :varying_effect => :varying_coefs,
+    :varying_draws => :varying_coefs,
+    :varying_slice => :varying_coefs,
+    :mm => :varying_coefs,
+    :gr => :varying_stratified,
+    :dummy => :varying_coefs,
+    :spline => :penalized_smooth,
+    :mo => :monotonic,
+    :mo1 => :monotonic,
+    :dar => :differenced_ar1,
+    :hsgp => :hsgp_effect)
+
 const _RETIRED_MODEL_HEADS = (
     :ordered_logistic, :penalized_smooth, :t2_smooth, :hsgp_effect, :hsgp_periodic_effect, :hsgp_grouped_effect, :monotonic, :differenced_ar1, :r2d2_coefs, :horseshoe_coefs, :varying_coefs, :varying_coefs_correlated, :varying_coefs_centered, :varying_coefs_centered_correlated, :varying_stratified, :varying_stratified_correlated)
 
 function _module_binding(m::Module, s::Symbol, where, shown)
     if !isdefined(m, s)
+        haskey(_RETIRED_CONSTRUCT_MODELS, s) && _sfail("$where: the implicit `$shown` " *
+            "construct is retired; write ordinary priors and values, or use " *
+            "`BayesianRegressionModels.rkppl_model(:$(_RETIRED_CONSTRUCT_MODELS[s]))`")
         s in _RETIRED_MODEL_HEADS && _sfail("$where: the statistical model `$shown` " *
             "is owned by BayesianRegressionModels; obtain its ordinary body with " *
             "`BayesianRegressionModels.rkppl_model(:$s)` and bind it in the model module")
@@ -2677,986 +2603,6 @@ function _absorbed_skip(det, canonmap, responses, paramsyms, absorbed,
         newskip == skip && return skip
         skip = newskip
     end
-end
-
-# Top-level statements: skip line numbers and one leading docstring-to-be
-# (ignored in slice 1); everything else must be an Expr.
-# Declared grouping levels (`levels=["c", "a", "b", "d"]`): a literal
-# vector in DECLARED numbering order (SB `CA.levels` for categorical
-# groupings) — extra entries are unobserved prior-only levels. Elements
-# are literal-embeddable scalars: numbers (Bool rides Real), strings,
-# chars, or QUOTED symbols (`:a` — a bare name is not a level value).
-# Shape (non-empty, duplicate-free) is checked here with line context;
-# the contract re-checks for hand-built plans.
-function _lower_grouping_levels(v, where)
-    v isa Expr && v.head === :vect ||
-        _sfail("$where levels takes a literal level vector " *
-              "(`levels=[\"b\", \"a\"]`), got $(repr(v))")
-    levels = Any[]
-    for e in v.args
-        if e isa QuoteNode && e.value isa Symbol
-            push!(levels, e.value)
-        elseif e isa Union{Real,String,Char}
-            push!(levels, e)
-        elseif e isa Symbol
-            _sfail("$where level $(repr(e)) is a bare name — levels are " *
-                  "literal values: quote symbols (`:$e`) or write strings " *
-                  "(`\"$e\"`)")
-        else
-            _sfail("$where level $(repr(e)) is not literal-embeddable " *
-                  "(numbers, strings, chars, or quoted symbols only)")
-        end
-    end
-    isempty(levels) &&
-        _sfail("$where levels declares zero grouping levels " *
-              "(`levels=[]` carries no groups)")
-    length(unique(levels)) == length(levels) ||
-        _sfail("$where levels declares duplicate grouping levels " *
-              "($(repr(levels)))")
-    return levels
-end
-
-# Varying-effect margin elements: `1` (intercept), a bare data column or
-# vector-shaped derived local (continuous Z), or an explicit `dummy(c, k)`
-# indicator (margins live on the shared draws; targets live on slices).
-function _lower_varying_margin_elem(e, data::Set{Symbol},
-        detnames::Set{Symbol}, where)
-    e isa Integer && !(e isa Bool) ||
-        return _lower_varying_margin_symbol(e, data, detnames, where)
-    e == 1 ||
-        _sfail("$where margin integer must be exactly `1` (intercept); " *
-              "for slopes write the bare column or derived local")
-    return VaryingMargin(:Intercept, VaryingZRecipe(:ones, :none, nothing))
-end
-
-function _lower_varying_margin_symbol(e, data::Set{Symbol},
-        detnames::Set{Symbol}, where)
-    e isa Symbol || return _lower_varying_margin_dummy(e, data, where)
-    e in data || e in detnames ||
-        _sfail("$where margin `$e` is neither bound data nor a model " *
-              "definition (margins are `1`, bare data columns, " *
-              "vector-shaped derived locals, or `dummy(c, k)`)")
-    return VaryingMargin(e, VaryingZRecipe(:column, e, nothing))
-end
-
-function _lower_varying_margin_dummy(e, data::Set{Symbol}, where)
-    e isa Expr && e.head === :call && length(e.args) == 3 &&
-        e.args[1] === :dummy ||
-        _sfail("$where margin $(repr(e)) is not admitted (margins are " *
-              "`1`, bare data columns, vector-shaped derived locals, or " *
-              "`dummy(c, k)` — bind an inline expression via an assignment " *
-              "first, e.g. `w = x .* z` then `[1, w]`)")
-    c, k = e.args[2], e.args[3]
-    c isa Symbol ||
-        _sfail("$where `dummy` column must be a bare data column, got " *
-              "$(repr(c))")
-    c in data ||
-        _sfail("$where `dummy` column `$c` is not data (`dummy` needs a " *
-              "raw column — level membership needs bound values)")
-    (k isa Integer && !(k isa Bool)) || k isa AbstractString ||
-        _sfail("$where `dummy` level must be an Int value or string, got " *
-              "$(repr(k))")
-    return VaryingMargin(Symbol(string(c) * "_dummy_" * string(k)),
-        VaryingZRecipe(:dummy, c, k))
-end
-
-_is_varying_call(rhs) =
-    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-    rhs.args[1] isa Symbol &&
-    rhs.args[1] in (:varying_effect, :varying_draws, :varying_slice)
-
-_varying_head(rhs::Expr) = rhs.args[1]::Symbol
-
-# A draws block shared by fused and split forms:
-# `r ~ varying_effect(g, [margins...]; eta, levels)` binds a contribution
-# over an anonymous draws block; `d ~ varying_draws(g, [margins...];
-# eta, levels)` binds the draws for explicit `varying_slice` consumers.
-# Lowers directly to VaryingDraws IR. Continuous margins reference data
-# columns or vector-shaped derived locals; the partition-time gate
-# admits data-or-defined names (forward references work) and
-# `_validate_varying_margins` proves vector shape after lowering.
-# Claims the draws label up front so user definitions can never
-# collide with in-graph names (L/tau/z).
-# Marginal scales use explicit normalized positive priors. A bare Normal or
-# Cauchy remains full-support everywhere and cannot declare a positive scale.
-function _lower_varying_sd_prior(raw, K::Int, where)
-    raw isa Expr && raw.head in (:tuple, :vect) &&
-        _sfail("$where per-margin sd priors are planned — pass one `sd=` call for all $K margins")
-    p = _lower_parameter(:sd, raw, Dict{Symbol,Any}(), Dict{Symbol,Any}())
-    p.family in (:normal, :cauchy, :exponential) ||
-        _sfail("$where `sd=` takes `HalfNormal(s)`, `HalfCauchy(s)`, " *
-            "`truncated(Normal(0, s), 0, Inf)`, `truncated(Cauchy(0, s), 0, Inf)`, or `Exponential(s)`")
-    length(p.args) == SAMPLED_ARITY[p.family] ||
-        _sfail("$where sd prior $(p.family) takes $(SAMPLED_ARITY[p.family]) argument(s)")
-    if p.family === :exponential
-        p.support_override in (nothing, (:truncated, 0.0, Inf)) ||
-            _sfail("$where `sd=Exponential(s)` uses its natural positive support; " *
-                "bounded Exponential sd priors are not supported")
-    else
-        p.support_override in (:positive, (:truncated, 0.0, Inf)) ||
-            _sfail("$where `sd=` needs an explicit positive prior: use " *
-                "`HalfNormal(s)`, `HalfCauchy(s)`, or `truncated(D, 0, Inf)`; bare Normal/Cauchy have full support")
-        p.args.arg1 isa Real && !(p.args.arg1 isa Bool) && p.args.arg1 == 0 ||
-            _sfail("$where sd half priors require zero location")
-    end
-    scale = last(values(p.args))
-    scale isa Real && !(scale isa Bool) && isfinite(scale) && scale > 0 ||
-        _sfail("$where sd prior scale must be a positive finite literal")
-    p.family === :normal && scale == 1 && return VaryingSdPrior[]
-    return fill(VaryingSdPrior(p.family, Float64(scale)), K)
-end
-
-function _lower_varying_draws_block(lhs::Symbol, call::Expr, line::Int,
-        data::Set{Symbol}, detnames::Set{Symbol}, seen::Set{Symbol},
-        seelines::Dict{Symbol,Int}, used_suffixes::Set{String})
-    head = _varying_head(call)
-    where = line > 0 ? "$head `$lhs` (line $line)" : "$head `$lhs`"
-    pos = Any[]
-    eta = 1.0
-    eta_given = false
-    levels = nothing
-    sd_raw = nothing
-    for a in call.args[2:end]
-        if a isa Expr && a.head === :parameters
-            for kw in a.args
-                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `eta`/`levels`/`sd` only")
-                kw.args[1] === :eta || kw.args[1] === :levels ||
-                    kw.args[1] === :sd ||
-                    _sfail("$where takes keywords `eta`/`levels`/`sd` only, got " *
-                          "`$(kw.args[1])`")
-                if kw.args[1] === :eta
-                    v = kw.args[2]
-                    v isa Real && !(v isa Bool) ||
-                        _sfail("$where eta must be a numeric literal, got $(repr(v))")
-                    eta = Float64(v)
-                    eta_given = true
-                elseif kw.args[1] === :sd
-                    sd_raw = kw.args[2]
-                else
-                    levels = _lower_grouping_levels(kw.args[2], where)
-                end
-            end
-        else
-            push!(pos, a)
-        end
-    end
-    length(pos) == 3 && pos[1] isa QuoteNode && pos[1].value isa Symbol &&
-        _sfail("$where takes `(group, [margins...])` — no id position " *
-              "(independent blocks on one grouping disambiguate " *
-              "by binding name, not labels)")
-    length(pos) == 2 ||
-        _sfail("$where takes `(group, [margins...])` positionally, got " *
-              "$(length(pos)) positional argument(s)")
-    group_raw, vec = pos
-    mm = nothing
-    strata = nothing
-    if group_raw isa Symbol
-        group = group_raw
-        group in data ||
-            _sfail("$where grouping `$group` is not data")
-    elseif _is_grouping_call(group_raw, :mm)
-        mm, group = _lower_mm_grouping(group_raw, data, where)
-    elseif _is_grouping_call(group_raw, :gr)
-        strata, group = _lower_gr_grouping(group_raw, data, where)
-    else
-        _sfail("$where grouping must be a bare data column, `mm(...)`, " *
-              "or `gr(...)`, got $(repr(group_raw))")
-    end
-    vec isa Expr && vec.head === :vect ||
-        _sfail("$where margins must be a vector (`[1, x]`), even for one " *
-              "margin")
-    isempty(vec.args) &&
-        _sfail("$where margin list is empty")
-    margins = VaryingMargin[
-        _lower_varying_margin_elem(e, data, detnames, where)
-        for e in vec.args]
-    K = length(margins)
-    # One geometry for every K, every grouping and every margin: LKJ +
-    # tau + z draws. The parameterization is a function of what is
-    # written, never of whether a default-valued keyword is present.
-    # At K = 1 the LKJ factor is the fixed 1x1 `[1]` whatever eta is, so
-    # eta parameterizes nothing there: the default spelled out is the
-    # plan omitting it gives, and any other value is refused rather
-    # than silently ignored.
-    K == 1 && eta_given && eta != 1.0 &&
-        _sfail("$where has one margin, so there is no correlation for " *
-              "eta to parameterize — omit eta, got $eta")
-    strata !== nothing && eta != 1.0 &&
-        _sfail("$where stratified draws need eta 1.0 (SB hardcodes " *
-              "`lkj_corr_cholesky(1.)`), got $eta")
-    mm !== nothing && eta != 1.0 &&
-        _sfail("$where multi-membership draws need eta 1.0 (SB " *
-              "hardcodes `lkj_corr_cholesky(1.)`), got $eta")
-    eta > 0 || _sfail("$where eta must be positive, got $eta")
-    kind = :correlated
-    suffix = string(group)
-    if suffix in used_suffixes
-        suffix = string(group) * "_" * string(lhs)
-        suffix in used_suffixes &&
-            _sfail("$where in-graph suffix `$suffix` collides (two draws " *
-                  "blocks share grouping and binding stem — rename a binding)")
-    end
-    push!(used_suffixes, suffix)
-    label = Symbol("draws_" * suffix)
-    _claim!(seen, seelines, label, line)
-    sd_priors = sd_raw === nothing ? VaryingSdPrior[] :
-        _lower_varying_sd_prior(sd_raw, K, where)
-    d = VaryingDraws(group, kind, margins, eta, label, suffix, levels,
-        sd_priors, mm, strata)
-    if strata !== nothing
-        # Stratified per-stratum L/tau names are bind-time (S unknown
-        # here), so only the shared `z_flat` is claimed; the generator
-        # owns the per-stratum names and the bound name tables prove
-        # them unique. No `b_<suffix>`: derived stratified draws are
-        # fail-closed (log-density-only slice).
-        _claim!(seen, seelines, _varying_corr_names(d)[3], line)
-    else
-        for nm in _varying_corr_names(d)
-            _claim!(seen, seelines, nm, line)
-        end
-        # The derived draws `b_<suffix>` live in `constrain` output only
-        # (never sampled, never in-graph) — claimed so a user definition
-        # can never shadow them there.
-        _claim!(seen, seelines, Symbol("b_" * suffix), line)
-    end
-    return d
-end
-
-_is_grouping_call(e, head::Symbol) =
-    e isa Expr && e.head === :call && !isempty(e.args) && e.args[1] === head
-
-# `mm(g1, g2, ...; weights=(w1, w2, ...), normalize)` in group
-# position (SB `mm(...)` mirror): two or more bare membership data
-# columns; `weights` absent (equal `1/M`) or a TUPLE of one bare data
-# column per group; `normalize` a Bool literal (default true).
-# Returns the metadata plus the mm naming symbol (SB `_brm_mm_suffix`
-# spelling — a naming stem, not a data column).
-function _lower_mm_grouping(call::Expr, data::Set{Symbol}, where::AbstractString)
-    groups = Symbol[]
-    weights = nothing
-    weights_given = false
-    normalize = true
-    for a in call.args[2:end]
-        if a isa Expr && a.head === :parameters
-            for kw in a.args
-                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where `mm(...)` takes keywords " *
-                          "`weights`/`normalize` only")
-                kw.args[1] === :weights || kw.args[1] === :normalize ||
-                    _sfail("$where `mm(...)` takes keywords " *
-                          "`weights`/`normalize` only, got `$(kw.args[1])`")
-                if kw.args[1] === :weights
-                    weights_given = true
-                    wv = kw.args[2]
-                    wv === nothing && continue
-                    wv isa Expr && wv.head === :tuple ||
-                        _sfail("$where `mm(...)` weights takes a tuple " *
-                              "of one bare data column per group " *
-                              "(`weights=(w1, w2)`), got $(repr(wv))")
-                    weights = Symbol[]
-                    for w in wv.args
-                        w isa Symbol ||
-                            _sfail("$where `mm(...)` weight $(repr(w)) " *
-                                  "is not a bare data column")
-                        w in data ||
-                            _sfail("$where `mm(...)` weight `$w` is not data")
-                        push!(weights, w)
-                    end
-                else
-                    nv = kw.args[2]
-                    nv isa Bool ||
-                        _sfail("$where `mm(...)` normalize must be a " *
-                              "Bool literal, got $(repr(nv))")
-                    normalize = nv
-                end
-            end
-        else
-            a isa Expr && a.head === :kw &&
-                _sfail("$where `mm(...)` keywords need a semicolon " *
-                      "(`mm(g1, g2; weights=..., normalize=...)`), got " *
-                      "$(repr(a))")
-            a isa Symbol ||
-                _sfail("$where `mm(...)` groups must be bare data " *
-                      "columns, got $(repr(a))")
-            a in data ||
-                _sfail("$where `mm(...)` group `$a` is not data")
-            push!(groups, a)
-        end
-    end
-    M = length(groups)
-    M >= 2 ||
-        _sfail("$where `mm(...)` takes two or more grouping columns " *
-              "(`mm(g1, g2)`), got $M")
-    if weights_given && weights !== nothing
-        length(weights) == M ||
-            _sfail("$where `mm(...)` lists $(length(weights)) weight " *
-                  "columns for $M groups (one per group, or omit all)")
-    end
-    stem = _mm_suffix(groups, weights, normalize)
-    return VaryingMultiMembership(groups, weights, normalize), Symbol(stem)
-end
-
-# SB `_brm_mm_suffix` spelling: `mm__g1__g2[__w__w1__w2][__raw]`.
-function _mm_suffix(groups::Vector{Symbol},
-        weights::Union{Nothing,Vector{Symbol}}, normalize::Bool)
-    stem = "mm__" * join(string.(groups), "__")
-    weights !== nothing && (stem *= "__w__" * join(string.(weights), "__"))
-    normalize || (stem *= "__raw")
-    return stem
-end
-
-# `gr(g; by=b)` in group position (SB `gr(g, by=b)` mirror): exactly
-# one bare group data column plus the required `by` bare data column.
-# Bare `gr(g)` spells a plain grouping (write the column); `id` is
-# BRM-side bucket spelling (independent blocks disambiguate by
-# binding name instead). Returns the metadata plus the group column.
-function _lower_gr_grouping(call::Expr, data::Set{Symbol}, where::AbstractString)
-    pos = Any[]
-    by = nothing
-    by_given = false
-    for a in call.args[2:end]
-        if a isa Expr && a.head === :parameters
-            for kw in a.args
-                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where `gr(...)` takes keyword `by` only")
-                kw.args[1] === :by ||
-                    _sfail("$where `gr(...)` takes keyword `by` only, " *
-                          "got `$(kw.args[1])`")
-                bv = kw.args[2]
-                bv isa Symbol ||
-                    _sfail("$where `gr(...)` by must be a bare data " *
-                          "column, got $(repr(bv))")
-                bv in data ||
-                    _sfail("$where `gr(...)` by `$bv` is not data")
-                by = bv
-                by_given = true
-            end
-        else
-            a isa Expr && a.head === :kw &&
-                _sfail("$where `gr(...)` keywords need a semicolon " *
-                      "(`gr(g; by=b)`), got $(repr(a))")
-            push!(pos, a)
-        end
-    end
-    length(pos) == 1 ||
-        _sfail("$where `gr(...)` takes exactly one grouping column " *
-              "(`gr(g; by=b)`), got $(length(pos))")
-    g = only(pos)
-    g isa Symbol ||
-        _sfail("$where `gr(...)` group must be a bare data column, " *
-              "got $(repr(g))")
-    g in data ||
-        _sfail("$where `gr(...)` group `$g` is not data")
-    by_given ||
-        _sfail("$where bare `gr($g)` spells a plain grouping — write " *
-              "the column `$g` directly (stratified grouping needs " *
-              "`gr($g; by=b)`)")
-    by === g &&
-        _sfail("$where stratified draws need distinct group and " *
-              "stratum columns, got `gr($g, by=$g)`")
-    return VaryingStrata(by, nothing), g
-end
-
-# One target application of shared draws:
-# `r ~ varying_slice(d, cols)` with `cols` an Int column or a `lo:hi`
-# UnitRange over the draws block's margins. Columns are explicit and
-# validated against the draws width here; the partition (exact-once
-# coverage of 1:K) is checked once all slices are in.
-function _lower_varying_slice(lhs::Symbol, call::Expr, line::Int,
-        draws_by_lhs::Dict{Symbol,VaryingDraws})
-    where = line > 0 ? "varying_slice `$lhs` (line $line)" :
-        "varying_slice `$lhs`"
-    args = call.args[2:end]
-    (length(args) == 2 && !any(a -> a isa Expr && a.head === :parameters,
-        args)) ||
-        _sfail("$where takes `(draws, cols)` positionally (no keywords)")
-    dref, colsel = args
-    dref isa Symbol ||
-        _sfail("$where names a draws block by its binding, got " *
-              "$(repr(dref))")
-    haskey(draws_by_lhs, dref) ||
-        _sfail("$where names unknown draws `$dref` (bind one first: " *
-              "`$dref ~ varying_draws(group, [margins...])`)")
-    d = draws_by_lhs[dref]
-    K = length(d.margins)
-    cols = _lower_varying_columns(colsel, K, where)
-    return (contrib = lhs, draws = d.label, draws_lhs = dref,
-        columns = cols, line = line)
-end
-
-function _lower_varying_columns(colsel, K::Int, where)
-    if colsel isa Integer && !(colsel isa Bool)
-        c = Int(colsel)
-        (1 <= c <= K) ||
-            _sfail("$where selects column $c outside 1:$K")
-        return c:c
-    end
-    colsel isa Expr && colsel.head === :call && length(colsel.args) == 3 &&
-        colsel.args[1] === :(:) &&
-        colsel.args[2] isa Integer && !(colsel.args[2] isa Bool) &&
-        colsel.args[3] isa Integer && !(colsel.args[3] isa Bool) ||
-        _sfail("$where selects an Int column or a `lo:hi` range, got " *
-              "$(repr(colsel))")
-    lo, hi = Int(colsel.args[2]), Int(colsel.args[3])
-    (1 <= lo <= hi <= K) ||
-        _sfail("$where selects $lo:$hi outside 1:$K")
-    return lo:hi
-end
-
-# A varying contribution referenced by name anywhere in an expression
-# (QuoteNodes are not references — `spline(:s_x)` must not match a
-# contribution named `s_x`). Contribs compose only as direct additive
-# predictor summands; every other position fails closed naming this.
-_uses_varying_contrib(ex::Symbol, names::Set{Symbol}) = ex in names
-_uses_varying_contrib(::QuoteNode, ::Set{Symbol}) = false
-_uses_varying_contrib(ex::Expr, names::Set{Symbol}) =
-    any(a -> _uses_varying_contrib(a, names), ex.args)
-_uses_varying_contrib(::Any, ::Set{Symbol}) = false
-
-function _finalize_varying_slices(ctx)
-    slices = VaryingSlice[]
-    for p in ctx.varying_pending
-        target = get(ctx.varying_use, p.contrib, nothing)
-        target === nothing &&
-            _sfail("varying contribution `$(p.contrib)` (line $(p.line)) " *
-                  "is never used in a predictor — every bound " *
-                  "contribution feeds exactly one predictor " *
-                  "(`mu = a .+ $(p.contrib)`); drop it or use it")
-        d = ctx.varying_draws[p.draws]
-        rlabel = Symbol("r_", target, "_", d.suffix)
-        rlabel in ctx.taken &&
-            _sfail("implicit `$rlabel` collides with your definition — " *
-                  "rename yours")
-        push!(ctx.taken, rlabel)
-        push!(slices, VaryingSlice(p.draws, p.columns, target))
-    end
-    # Exact-once partition of 1:K per draws, in slice order (columns
-    # are explicit, so order is free — sort, then prove contiguity).
-    for (label, d) in ctx.varying_draws
-        K = length(d.margins)
-        own = [s for s in slices if s.draws === label]
-        targets = [s.target for s in own]
-        length(unique(targets)) == length(targets) ||
-            _sfail("draws $label feeds a predictor twice (one slice per " *
-                  "(draws, target) — fuse the column ranges)")
-        lo = 1
-        for s in sort!(own; by = s -> first(s.columns))
-            first(s.columns) == lo ||
-                _sfail("draws $label slice for `$(s.target)` starts at " *
-                      "$(first(s.columns)), want $lo (slices partition " *
-                      "1:$K exactly once — every margin consumed once)")
-            lo = last(s.columns) + 1
-        end
-        lo - 1 == K ||
-            _sfail("draws $label slices cover $(lo - 1) of $K margins " *
-                  "(unconsumed margins sample dead parameters — slice " *
-                  "them or drop them from the draws)")
-    end
-    return slices
-end
-
-# Post-lowering margin proof: the partition-time gate admits
-# data-or-defined names (shapes don't exist yet), so every `:column`
-# margin proves here that it is bound data or an EMITTED
-# vector-shaped derived local.
-function _validate_varying_margins(draws::Vector{VaryingDraws},
-        data::Set{Symbol}, derived::Vector{VectorAssignmentSpec},
-        detshape, used_locs::Set{Symbol})
-    emitted = Set{Symbol}(d.name for d in derived)
-    for d in draws
-        for m in d.margins
-            m.z.kind === :column || continue
-            c = m.z.column
-            c in data && continue
-            c in emitted && continue
-            shape = get(detshape, c, :unknown)
-            if shape === :scalar
-                _sfail("draws $(d.label) margin `$c` is a scalar model " *
-                       "definition — margins need vector-shaped (n_obs) " *
-                       "derived locals (bind `w = x .* z`, then list `[w]`)")
-            elseif shape === :vector && c in used_locs
-                _sfail("draws $(d.label) margin `$c` is the predictor " *
-                       "location `$c`, which inlines into the predictor " *
-                       "and emits no Z column — bind the interaction as " *
-                       "its own derived local (`w = ...`, then list `[w]`)")
-            elseif shape === :vector
-                _sfail("draws $(d.label) margin `$c` is absorbed into " *
-                       "its predictor (predictor structure, not a " *
-                       "standalone column) and emits no Z column — Z " *
-                       "columns must be data-only derivations (`w = x .* z`)")
-            else
-                _sfail("draws $(d.label) margin `$c` is neither bound " *
-                       "data nor a vector-shaped derived local")
-            end
-        end
-    end
-    return nothing
-end
-
-_contains_spline(ex) = ex isa Expr &&
-    (_is_spline_call(ex) || any(_contains_spline, ex.args))
-
-_is_spline_call(ex) =
-    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-    ex.args[1] === :spline
-
-_contains_hsgp(ex) = ex isa Expr &&
-    (_is_hsgp_call(ex) || any(_contains_hsgp, ex.args))
-
-_is_hsgp_call(ex) =
-    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-    ex.args[1] === :hsgp
-
-_contains_mo(ex) = ex isa Expr &&
-    (_is_mo_call(ex) || any(_contains_mo, ex.args))
-
-_is_mo_call(ex) =
-    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-    ex.args[1] === :mo
-
-_contains_mo1(ex) = ex isa Expr &&
-    (_is_mo1_call(ex) || any(_contains_mo1, ex.args))
-
-_is_mo1_call(ex) =
-    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-    ex.args[1] === :mo1
-
-_contains_dar(ex) = ex isa Expr &&
-    (_is_dar_call(ex) || any(_contains_dar, ex.args))
-
-_is_dar_call(ex) =
-    ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-    ex.args[1] === :dar
-
-# A dar-persistence RHS: `truncated(Normal(mu, s), 0, 1)` exactly (SB's
-# `beta ~ normal(0.5, 0.2; lower=0, upper=1)`; location/scale ride free,
-# bounds are literal). Arity/shape details stay with `_lower_parameter`;
-# this is the use-site screen, like `dirichlet_names` for `mo()`.
-_is_dar_beta_rhs(rhs) =
-    rhs isa Expr && rhs.head === :call && length(rhs.args) == 4 &&
-    rhs.args[1] === :truncated && _is_normal_call(rhs.args[2]) &&
-    _dar_bound_eq(rhs.args[3], 0.0) && _dar_bound_eq(rhs.args[4], 1.0)
-
-# A dar-scale RHS: `HalfNormal(s)` or `truncated(Normal(0, s), 0, Inf)`
-# (SB's `sigma ~ normal(0, 0.2; lower=0)`; the zero-location detail
-# stays with `_lower_parameter`).
-_is_dar_sigma_rhs(rhs) =
-    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
-    ((rhs.args[1] === :HalfNormal ||
-      (length(rhs.args) == 4 && rhs.args[1] === :truncated &&
-       _is_normal_call(rhs.args[2]) &&
-       _dar_bound_eq(rhs.args[3], 0.0) && _is_dar_inf(rhs.args[4]))))
-
-_dar_bound_eq(b, v::Float64) = b isa Real && Float64(b) == v
-
-_is_dar_inf(b) = b === :Inf || (b isa Real && isinf(Float64(b)) && Float64(b) > 0)
-
-# A bare `spline_basis(:id, x...; kind=..., k=..., sd=...)` call
-# declares one spline basis (the first bare-call statement:
-# declarations do work at lowering — they build IR + claim the
-# generated names — so the "bare call does nothing" rejection does not
-# apply). `sd=` states the smoothing-sd prior (SB `sd(mu, s(x)) ~ ...`,
-# `_lower_hyper_prior`; default normalized `HalfNormal(1)`). Quoted
-# id, bare raw axes (1 → :tps, 2 → :t2 when `kind` is omitted), literal `k`
-# (default 10 / (5, 5)). Lowers directly to SplineBasis IR + the fully
-# determined SplineVector set (contract `_spline_*` rules); claims the
-# basis label, vector names, and materialized basis-column names up
-# front so user definitions can never collide with bind/graph names.
-_is_basis_stmt(st) =
-    st isa Expr && st.head === :call && !isempty(st.args) &&
-    st.args[1] === :spline_basis
-
-# The sampled-parameter grammar defines what a prior means in every slot.
-# These legacy basis slots still require literal arguments and bounds.
-function _lower_hyper_prior(raw, where, what::Symbol)
-    p = _lower_parameter(what, raw, Dict{Symbol,Any}(), Dict{Symbol,Any}())
-    haskey(_HYPER_PRIOR_FAMILIES, p.family) ||
-        _sfail("$where `$what=` family $(p.family) is not admitted")
-    length(p.args) in _HYPER_PRIOR_FAMILIES[p.family] ||
-        _sfail("$where `$what=` prior $(p.family) has the wrong number of arguments")
-    all(a -> a isa Real && !(a isa Bool) && isfinite(a), values(p.args)) ||
-        _sfail("$where `$what=` prior arguments must be finite numeric literals")
-    p.support_override isa Tuple &&
-        !all(a -> a isa Real, p.support_override[2:end]) &&
-        _sfail("$where `$what=` truncation bounds must be literal")
-    if SAMPLED_SUPPORT[p.family] === :real && p.support_override === nothing
-        _sfail("$where `$what=` needs an explicit positive prior: use " *
-            "`HalfNormal(s)`, `HalfCauchy(s)`, or `truncated(D, 0, Inf)`; " *
-            "bare real-support distributions are not halves")
-    end
-    hp = HyperPrior(p.family, map(Float64, p.args), p.support_override)
-    _validate_hyper_prior(hp, what, "$where `$what=`")
-    return hp
-end
-
-function _lower_basis(st::Expr, line::Int, data::Set{Symbol},
-        seen::Set{Symbol}, seelines::Dict{Symbol,Int},
-        bases::Vector{SplineBasis})
-    where = line > 0 ? "spline basis (line $line)" : "spline basis"
-    pos = Any[]
-    kind = nothing
-    kind_given = false
-    k = nothing
-    sd_prior = nothing
-    for a in st.args[2:end]
-        if a isa Expr && a.head === :parameters
-            for kw in a.args
-                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords `kind`/`k`/`sd` only")
-                key = kw.args[1]
-                key === :kind || key === :k || key === :sd ||
-                    _sfail("$where takes keywords `kind`/`k`/`sd` only, " *
-                          "got `$key`")
-                if key === :sd
-                    sd_prior = _lower_hyper_prior(kw.args[2], where, :sd)
-                elseif key === :kind
-                    v = kw.args[2]
-                    v isa QuoteNode && v.value isa Symbol ||
-                        _sfail("$where quotes its kind: got $(repr(v)) — " *
-                              "write `kind=:tps` or `kind=:t2`")
-                    v.value === :tps || v.value === :t2 ||
-                        _sfail("$where kind must be `:tps` or `:t2`, got " *
-                              "$(repr(v.value))")
-                    kind = v.value
-                    kind_given = true
-                else
-                    k = _lower_basis_k(kw.args[2], where)
-                end
-            end
-        else
-            push!(pos, a)
-        end
-    end
-    length(pos) >= 2 ||
-        _sfail("$where takes `(:id, axis...)` positionally, got " *
-              "($(join(repr.(pos), ", ")))")
-    id, axes = pos[1], pos[2:end]
-    id isa QuoteNode && id.value isa Symbol ||
-        _sfail("$where quotes its basis id: got $(repr(id)) — write " *
-              "`spline_basis(:id, x)` (bare names are data columns)")
-    id = id.value
-    any(b -> b.id === id, bases) &&
-        _sfail("$where duplicates basis :$id (one declaration per id)")
-    for c in axes
-        c isa Symbol ||
-            _sfail("$where axes must be bare data columns, got $(repr(c))")
-        c in data || _sfail("$where axis `$c` is not data")
-    end
-    length(axes) == 1 || length(axes) == 2 ||
-        _sfail("$where takes one axis (`s(x)`) or two (`t2(x, z)`), got " *
-              "$(length(axes))")
-    kind === nothing && (kind = length(axes) == 1 ? :tps : :t2)
-    if kind_given
-        want = kind === :tps ? 1 : 2
-        spell = want == 1 ? "one axis (`s(x)`)" : "two axes (`t2(x, z)`)"
-        length(axes) == want ||
-            _sfail("$where kind=:$kind takes $spell, got $(length(axes))")
-    end
-    if k === nothing
-        k = kind === :tps ? 10 : (5, 5)
-    elseif kind === :tps
-        k isa Int ||
-            _sfail("$where kind=:tps takes an integer `k`, got $(repr(k))")
-    else
-        k isa Tuple{Int,Int} ||
-            _sfail("$where kind=:t2 takes a `(k1, k2)` integer tuple `k`, " *
-                  "got $(repr(k))")
-    end
-    blocks = [SplineBasisBlock(n, w, Symbol[])
-              for (n, w) in _spline_blocks(kind, k)]
-    label = Symbol("spline_", id)
-    _claim!(seen, seelines, label, line)
-    vectors = SplineVector[]
-    for (vname, vfamily, vargs, vsupport, vwidth) in
-            _spline_vector_specs(id, kind, k, sd_prior)
-        _claim!(seen, seelines, vname, line)
-        push!(vectors, SplineVector(vname, vfamily, vargs, vsupport,
-            vwidth, id, vname))
-    end
-    for (_, cols) in _spline_basis_columns(id, kind, k), c in cols
-        _claim!(seen, seelines, c, line)
-    end
-    return SplineBasis(id, kind, Vector{Symbol}(axes), k, blocks, label),
-        vectors
-end
-
-function _lower_basis_k(v, where)
-    v isa Integer && !(v isa Bool) ||
-        (v isa Expr && v.head === :tuple) ||
-        _sfail("$where `k` must be a literal (an integer for `s`, a " *
-              "`(k1, k2)` integer tuple for `t2`), got $(repr(v))")
-    if v isa Expr
-        length(v.args) == 2 ||
-            _sfail("$where `k` tuple takes exactly two entries, got " *
-                  "$(repr(v))")
-        all(e -> e isa Integer && !(e isa Bool), v.args) ||
-            _sfail("$where `k` tuple entries must be integer literals, " *
-                  "got $(repr(v))")
-        all(e -> e > 2, v.args) ||
-            _sfail("$where `k` entries must exceed 2, got $(repr(v))")
-        return (Int(v.args[1]), Int(v.args[2]))
-    end
-    v > 2 || _sfail("$where `k` must exceed 2, got $v")
-    return Int(v)
-end
-
-# A bare `hsgp_basis(:id, x...; k=..., c=..., iso=..., cov=...,
-# period=..., length_scale=..., sd=...)` call declares one HSGP basis
-# (same bare-call-declaration shape as `spline_basis`). Quoted id, bare
-# raw axes (any count ≥ 1; exactly one for periodic), literal `k`
-# (positive integer or per-axis tuple, default 20), literal `c` (real
-# > 1 or per-axis tuple, default 1.5), literal `iso` Bool (default
-# true), quoted `cov` (`:exp_quad` or `:periodic`, default
-# `:exp_quad`), literal `period` (finite positive — required iff
-# periodic, refused otherwise, the SB `_brm_gp_period` contract),
-# and stated hyper priors `length_scale=`/`sd=` (`_lower_hyper_prior`;
-# SB `length_scale(:, hsgp(x)) ~ ...`/`sd(:, hsgp(x)) ~ ...` — a stated
-# length scale drops the validity floor, BRM semantics).
-# Lowers directly to HSGPBasis IR (fits fill at bind); claims the
-# basis label and the sampled names up front so user definitions can
-# never collide with Stage-B graph names (summand labels ride the
-# spline precedent — unclaimed, predictor-derived).
-_is_hsgp_basis_stmt(st) =
-    st isa Expr && st.head === :call && !isempty(st.args) &&
-    st.args[1] === :hsgp_basis
-
-function _lower_hsgp_basis(st::Expr, line::Int, data::Set{Symbol},
-        seen::Set{Symbol}, seelines::Dict{Symbol,Int},
-        hbases::Vector{HSGPBasis})
-    where = line > 0 ? "hsgp basis (line $line)" : "hsgp basis"
-    pos = Any[]
-    k = nothing
-    c = nothing
-    iso = true
-    cov = :exp_quad
-    period = nothing
-    rho_prior = nothing
-    sigma_prior = nothing
-    domain = nothing
-    by = nothing
-    kwlist = "`k`/`c`/`iso`/`cov`/`period`/`length_scale`/`sd`/" *
-        "`domain`/`by`"
-    for a in st.args[2:end]
-        if a isa Expr && a.head === :parameters
-            for kw in a.args
-                kw isa Expr && kw.head === :kw && length(kw.args) == 2 ||
-                    _sfail("$where takes keywords $kwlist only")
-                key = kw.args[1]
-                key === :k || key === :c || key === :iso ||
-                    key === :cov || key === :period ||
-                    key === :length_scale || key === :sd ||
-                    key === :domain || key === :by ||
-                    _sfail("$where takes keywords $kwlist only, got `$key`")
-                if key === :domain
-                    domain = kw.args[2]
-                elseif key === :by
-                    v = kw.args[2]
-                    v isa Symbol && v in data || _sfail("$where `by=` takes " *
-                        "a bare grouping data column, got $(repr(v))")
-                    by = v
-                elseif key === :length_scale
-                    rho_prior = _lower_hsgp_hyper_spec(kw.args[2], where,
-                        :length_scale)
-                elseif key === :sd
-                    sigma_prior = _lower_hsgp_hyper_spec(kw.args[2], where,
-                        :sd)
-                elseif key === :k
-                    k = _lower_hsgp_k(kw.args[2], where)
-                elseif key === :c
-                    c = _lower_hsgp_c(kw.args[2], where)
-                elseif key === :cov
-                    v = kw.args[2]
-                    v isa QuoteNode && v.value isa Symbol ||
-                        _sfail("$where quotes its cov: got $(repr(v)) — " *
-                              "write `cov=:exp_quad` or `cov=:periodic`")
-                    v.value === :exp_quad || v.value === :periodic ||
-                        _sfail("$where cov must be `:exp_quad` or " *
-                              "`:periodic`, got $(repr(v.value))")
-                    cov = v.value
-                elseif key === :period
-                    v = kw.args[2]
-                    v isa Real && !(v isa Bool) && isfinite(Float64(v)) &&
-                        Float64(v) > 0 ||
-                        _sfail("$where `period` must be a finite " *
-                              "positive numeric literal, got $(repr(v))")
-                    period = Float64(v)
-                else
-                    v = kw.args[2]
-                    v isa Bool ||
-                        _sfail("$where `iso` must be a Bool literal, got " *
-                              "$(repr(v))")
-                    iso = v
-                end
-            end
-        else
-            push!(pos, a)
-        end
-    end
-    length(pos) >= 2 ||
-        _sfail("$where takes `(:id, axis...)` positionally, got " *
-              "($(join(repr.(pos), ", ")))")
-    id, axes = pos[1], pos[2:end]
-    id isa QuoteNode && id.value isa Symbol ||
-        _sfail("$where quotes its basis id: got $(repr(id)) — write " *
-              "`hsgp_basis(:id, x)` (bare names are data columns)")
-    id = id.value
-    any(b -> b.id === id, hbases) &&
-        _sfail("$where duplicates basis :$id (one declaration per id)")
-    for ax in axes
-        ax isa Symbol ||
-            _sfail("$where axes must be bare data columns, got $(repr(ax))")
-        ax in data || _sfail("$where axis `$ax` is not data")
-    end
-    length(axes) == length(unique(axes)) ||
-        _sfail("$where axis columns must be distinct, got $axes")
-    # The SB periodic contract: one isotropic axis (BRM term
-    # preparation), `period` required iff periodic (SB
-    # `_brm_gp_period`); `c` stays accepted (SB validates its form
-    # and ignores its value — no domain).
-    if cov === :periodic
-        length(axes) == 1 ||
-            _sfail("$where periodic takes exactly one axis column, " *
-                  "got $axes")
-        iso ||
-            _sfail("$where periodic requires `iso=true` (one " *
-                  "isotropic axis)")
-        period === nothing &&
-            _sfail("$where `cov=:periodic` requires a numeric " *
-                  "`period=` formula constant (the kernel's period on " *
-                  "the axis's own scale)")
-    else
-        period === nothing ||
-            _sfail("$where `period=` is meaningful only with " *
-                  "`cov=:periodic` (got `cov=:exp_quad`)")
-    end
-    d = length(axes)
-    for (spec, what) in ((rho_prior, :length_scale), (sigma_prior, :sd))
-        spec isa HSGPHyperLP || continue
-        by === nothing && _sfail("$where `$what=` hyper-predictor " *
-            "`$(spec.intercept ? "1 + " : "")(1 | $(spec.group))` needs a " *
-            "grouped basis — add `by = $(spec.group)`")
-        spec.group === by || _sfail("$where `$what=` hyper-predictor " *
-            "groups by $(spec.group) but the basis groups by $by — one " *
-            "hyper level per term group")
-    end
-    if by !== nothing
-        (cov === :exp_quad && iso && d == 1) || _sfail("$where `by=` takes " *
-            "one isotropic exp-quad axis in v1 (aniso / periodic grouped " *
-            "bases are planned)")
-    end
-    if domain !== nothing
-        cov === :periodic && _sfail("$where periodic bases have no domain " *
-            "(drop `domain=`)")
-        c === nothing || _sfail("$where `domain=` fixes the approximation " *
-            "boundary directly and cannot also take the data-derived " *
-            "expansion factor `c` (SB `hsgp(...; domain=...)`)")
-        domain = _lower_hsgp_domain(domain, d, where)
-    end
-    k = k === nothing ? fill(20, d) : _hsgp_broadcast_opt(k, d, where, :k)
-    c = c === nothing ? fill(1.5, d) : _hsgp_broadcast_opt(c, d, where, :c)
-    label = Symbol("hsgp_", id)
-    _claim!(seen, seelines, label, line)
-    hb = HSGPBasis(id, Vector{Symbol}(axes), k, c, iso,
-        Tuple{Float64,Float64}[], label, cov,
-        period === nothing ? NaN : period, rho_prior, sigma_prior, domain,
-        by === nothing ? nothing : HSGPGrouping(by, nothing))
-    for nm in _hsgp_all_names(hb)
-        _claim!(seen, seelines, nm, line)
-    end
-    return hb
-end
-
-# A basis `length_scale=`/`sd=` value: a stated hyper prior
-# (`_lower_hyper_prior`) or a per-group log-linear hyper-predictor (SB
-# `log(length_scale(hsgp(x))) ~ 1 + (1 | g)`): `1 + (1 | g)` or
-# `(1 | g)`, spelled with the grouping column the basis takes as `by`.
-function _lower_hsgp_hyper_spec(raw, where, what::Symbol)
-    isbar(e) = e isa Expr && e.head === :call && length(e.args) == 3 &&
-        e.args[1] === :| && e.args[2] == 1 && e.args[3] isa Symbol
-    isbar(raw) && return HSGPHyperLP(false, raw.args[3])
-    if raw isa Expr && raw.head === :call && length(raw.args) == 3 &&
-            raw.args[1] === :+ && raw.args[2] == 1 && isbar(raw.args[3])
-        return HSGPHyperLP(true, raw.args[3].args[3])
-    end
-    raw isa Expr && raw.head === :call && raw.args[1] in (:+, :|) &&
-        _sfail("$where `$what=` hyper-predictors take `1 + (1 | g)` or " *
-            "`(1 | g)` (per-group log-linear, BRM defaults), got " *
-            "$(repr(raw))")
-    return _lower_hyper_prior(raw, where, what)
-end
-
-# `domain=(lo, hi)` (one axis) or `domain=((lo1, hi1), (lo2, hi2), ...)`
-# (one pair per axis): finite numeric literals with lo < hi (SB
-# `_brm_hsgp_domain_fits`).
-function _lower_hsgp_domain(v, d::Int, where)
-    ispair(x) = x isa Expr && x.head === :tuple && length(x.args) == 2 &&
-        all(a -> a isa Real && !(a isa Bool) && isfinite(Float64(a)), x.args)
-    pairs = if d == 1 && ispair(v)
-        Any[v]
-    elseif v isa Expr && v.head === :tuple && length(v.args) == d &&
-            all(ispair, v.args)
-        v.args
-    else
-        _sfail("$where `domain=` takes " * (d == 1 ? "`(lower, upper)`" :
-            "one `(lower, upper)` pair per axis ($d axes)") *
-            " of numeric literals, got $(repr(v))")
-    end
-    out = Tuple{Float64,Float64}[]
-    for p in pairs
-        lo, hi = Float64(p.args[1]), Float64(p.args[2])
-        lo < hi || _sfail("$where `domain=` needs lower < upper, got " *
-            "($lo, $hi)")
-        push!(out, (lo, hi))
-    end
-    return out
-end
-
-function _lower_hsgp_k(v, where)
-    v isa Integer && !(v isa Bool) ||
-        (v isa Expr && v.head === :tuple) ||
-        _sfail("$where `k` must be a literal (a positive integer or a " *
-              "per-axis integer tuple), got $(repr(v))")
-    if v isa Expr
-        all(e -> e isa Integer && !(e isa Bool), v.args) ||
-            _sfail("$where `k` tuple entries must be integer literals, " *
-                  "got $(repr(v))")
-        all(e -> e >= 1, v.args) ||
-            _sfail("$where `k` entries must be positive, got $(repr(v))")
-        return Int[e for e in v.args]
-    end
-    v >= 1 || _sfail("$where `k` must be positive, got $v")
-    return Int(v)
-end
-
-function _lower_hsgp_c(v, where)
-    v isa Real && !(v isa Bool) ||
-        (v isa Expr && v.head === :tuple) ||
-        _sfail("$where `c` must be a literal (a real > 1 or a per-axis " *
-              "tuple), got $(repr(v))")
-    if v isa Expr
-        all(e -> e isa Real && !(e isa Bool), v.args) ||
-            _sfail("$where `c` tuple entries must be real literals, " *
-                  "got $(repr(v))")
-        all(e -> isfinite(Float64(e)) && Float64(e) > 1, v.args) ||
-            _sfail("$where `c` entries must be finite and exceed 1, " *
-                  "got $(repr(v))")
-        return Float64[e for e in v.args]
-    end
-    isfinite(Float64(v)) && Float64(v) > 1 ||
-        _sfail("$where `c` must be finite and exceed 1, got $(repr(v))")
-    return Float64(v)
-end
-
-# Scalar broadcasts per axis (SB `_brm_axis_option` shape); tuples must
-# match the axis count exactly.
-function _hsgp_broadcast_opt(v, d::Int, where, key::Symbol)
-    v isa Vector && length(v) == d && return v
-    v isa Vector &&
-        _sfail("$where `$key` tuple takes one entry per axis ($d), got " *
-              "$(length(v))")
-    T = key === :k ? Int : Float64
-    return fill(T(v), d)
 end
 
 # Panel-kernel plate statement:
@@ -4543,16 +3489,12 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
     scans = ScanSpec[]
-    bases = SplineBasis[]
-    vectors = SplineVector[]
-    hbases = HSGPBasis[]
     kplates = KernelPlate[]
     kstmts = NamedTuple[]
     schedules = PKScheduleSpec[]
     event_lps = LinearPKEventLPSpec[]
     joints = JointSampleStmt[]
     glms = GLMSampleStmt[]
-    varying_raw = NamedTuple[]
     level_bindings = Dict{Symbol,Tuple{Symbol,Any}}()
     seen = Set{Symbol}()
     seelines = Dict{Symbol,Int}()
@@ -4609,16 +3551,11 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         arg.head === :block &&
             _sfail("nested `begin` blocks do not lower — flatten the block")
         st = _unwrap_trivia(arg)
-        if _is_basis_stmt(st)
-            b, vs = _lower_basis(st, line, data, seen, seelines, bases)
-            push!(bases, b)
-            append!(vectors, vs)
-            continue
-        end
-        if _is_hsgp_basis_stmt(st)
-            hb = _lower_hsgp_basis(st, line, data, seen, seelines, hbases)
-            push!(hbases, hb)
-            continue
+        if Meta.isexpr(st, :call) && !isempty(st.args) &&
+                first(st.args) in (:spline_basis, :hsgp_basis)
+            _sfail("the implicit `$(first(st.args))(:id, ...)` declaration is retired; " *
+                "use BRM-owned statistical preparation and an ordinary " *
+                "`BayesianRegressionModels.rkppl_model` body with explicit priors")
         end
         if _is_kernel_plate_stmt(st)
             kp = _lower_kernel_plate(st, line, data, seen, seelines)
@@ -4735,19 +3672,6 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             else
                 _claim!(seen, seelines, lhs, line)
             end
-            if _is_varying_call(st.args[3])
-                head = _varying_head(st.args[3])
-                bc && _sfail("`$lhs` uses `.~` — `$head` statements bind " *
-                             "with `~` (one binding per statement)")
-                st.args[2] isa Symbol ||
-                    _sfail("`$head` left-hand side must be a bare Symbol " *
-                           "(one binding per statement)")
-                lhs in data &&
-                    _sfail("`$lhs` is bound data and cannot bind a " *
-                           "`$head` statement")
-                push!(varying_raw, (st = st, lhs = lhs, line = line))
-                continue
-            end
             _reject_target(st.args[3], lhs)
             push!(sample, SampleStmt(lhs, st.args[3], bc, rng, levs, mat))
         elseif st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
@@ -4780,56 +3704,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
-    # Varying statements lower draws blocks first (statement order),
-    # then slices — slices may precede their draws textually (forward
-    # references resolve against lowered draws).
-    varying_draws = VaryingDraws[]
-    draws_by_lhs = Dict{Symbol,VaryingDraws}()
-    draws_lines = Dict{Symbol,Int}()
-    used_suffixes = Set{String}()
-    for v in varying_raw
-        _varying_head(v.st.args[3]) === :varying_slice && continue
-        d = _lower_varying_draws_block(v.lhs, v.st.args[3], v.line, data,
-            detnames, seen, seelines, used_suffixes)
-        push!(varying_draws, d)
-        draws_by_lhs[v.lhs] = d
-        draws_lines[d.label] = v.line
-    end
-    varying_pending = NamedTuple[]
-    for v in varying_raw
-        head = _varying_head(v.st.args[3])
-        if head === :varying_effect
-            d = draws_by_lhs[v.lhs]
-            K = length(d.margins)
-            push!(varying_pending, (contrib = v.lhs, draws = d.label,
-                draws_lhs = v.lhs, columns = 1:K, line = v.line))
-        elseif head === :varying_slice
-            push!(varying_pending,
-                _lower_varying_slice(v.lhs, v.st.args[3], v.line,
-                    draws_by_lhs))
-        end
-    end
-    # Same-group draws share one per-group encoder: both-declared
-    # differing levels fail here with lines (bind-derived levels agree
-    # by construction; mixed declared/derived agreement is a bind-time
-    # check on values).
-    levels_by_group = Dict{Symbol,Tuple{Any,Int}}()
-    for d in varying_draws
-        d.levels === nothing && continue
-        if haskey(levels_by_group, d.group)
-            prev, pline = levels_by_group[d.group]
-            prev == d.levels ||
-                _sfail("draws $(d.label) declares grouping levels " *
-                      "$(repr(d.levels)) but same-group draws already " *
-                      "declared $(repr(prev)) (line $pline) — one " *
-                      "grouping, one numbering")
-        else
-            levels_by_group[d.group] = (d.levels, draws_lines[d.label])
-        end
-    end
-    return sample, det, plate_ctx, plate_params, scans, bases,
-        vectors, hbases, kplates, kstmts, schedules, event_lps,
-        joints, varying_draws, varying_pending, glms
+    return sample, det, plate_ctx, plate_params, scans,
+        kplates, kstmts, schedules, event_lps, joints, glms
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
@@ -6945,10 +5821,6 @@ end
 #     step local or loop variable, and a `do`-block argument
 #     (`_collect_binders!`). Index expressions keep their shape; names inside
 #     them follow the same substitution. Author paths are separate metadata.
-#   • A basis id the body declares (`spline_basis(:s, …)`,
-#     `hsgp_basis(:s, …)`) is a body name too: its private id replaces `:s` at the
-#     declaration and at every `spline(:s)` / `hsgp(:s)` use in the body. No
-#     other quoted symbol is renamed (`kind = :tps` stays).
 #   • Each argument is replaced by the call's argument expression (the
 #     language is pure, so this has value semantics). A body may observe an
 #     argument bound to a DATA column (`y .~ Normal.(mu, s)` with `y` passed
@@ -6991,6 +5863,9 @@ function _resolve_submodel(rhs, mod::Module)
     end
     head isa Symbol || return nothing
     if !isdefined(mod, head)
+        haskey(_RETIRED_CONSTRUCT_MODELS, head) && _sfail("the implicit `$head` " *
+            "construct is retired; write ordinary priors and values, or use " *
+            "`BayesianRegressionModels.rkppl_model(:$(_RETIRED_CONSTRUCT_MODELS[head]))`")
         head in _RETIRED_MODEL_HEADS && _sfail("the statistical model `$head` " *
             "is owned by BayesianRegressionModels; obtain its ordinary body with " *
             "`BayesianRegressionModels.rkppl_model(:$head)` and bind it in the model module")
@@ -7158,7 +6033,6 @@ function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
     end
     for a in ast.args
         _collect_binders!(used, a)
-        a isa Expr && _collect_basis_ids!(used, a)
     end
     out = Any[]
     ctx = _ScopeExpansion(SubmodelScope[], Dict{Symbol,SubmodelScope}(),
@@ -7225,7 +6099,7 @@ function _scope_program_edits(sm, gen, call, ctx, data)
     variant_edits = Tuple{Expr,Module}[]
     for raw in sm.rewrites
         path = (scope.path..., _merge_path(_stmt_lhs(raw))...)
-        edit = _hsubst(raw, substitutions, Dict{Symbol,Symbol}())
+        edit = _hsubst(raw, substitutions)
         lhs = _replace_scope_path(_stmt_lhs(edit), path)
         push!(variant_edits, (_replace_statement(edit, lhs, last(edit.args)), sm.mod))
     end
@@ -7328,13 +6202,9 @@ _stmt_lhs(st::Expr) =
 # name of an indexed LHS, each name of a `[a, b]` LHS), `@plate` results,
 # cells and loop variables, `@scan` states, step locals and loop variables,
 # and `do`-block arguments. Nested submodel calls contribute only their
-# use-site LHS (their bodies bind under it when they expand). Quoted basis ids
-# are collected separately (`_collect_basis_ids!`). With `sampled = false` a
+# use-site LHS (their bodies bind under it when they expand). With `sampled = false` a
 # `~` / `.~` LHS is skipped — the one position where a data argument is
 # observed rather than bound.
-const _BASIS_DECL_HEADS = (:spline_basis, :hsgp_basis)
-const _BASIS_ID_HEADS = (:spline_basis, :hsgp_basis, :spline, :hsgp)
-
 function _collect_binders!(out::Set{Symbol}, st, sampled::Bool = true)
     st isa Expr || return out
     h = st.head
@@ -7400,16 +6270,6 @@ function _collect_do_binders!(out::Set{Symbol}, rhs, sampled::Bool)
     return out
 end
 
-# The quoted id of a basis declaration/use (`spline_basis(:s, x; k = 4)` →
-# `:s`): its first positional argument when quoted, else nothing.
-function _basis_id_arg(call::Expr)
-    for a in call.args[2:end]
-        a isa Expr && a.head in (:parameters, :kw) && continue
-        return a isa QuoteNode && a.value isa Symbol ? a : nothing
-    end
-    return nothing
-end
-
 # Every Symbol under `ex` (call heads included; QuoteNodes opaque).
 function _all_symbols!(out::Set{Symbol}, ex)
     if ex isa Symbol
@@ -7423,30 +6283,24 @@ function _all_symbols!(out::Set{Symbol}, ex)
 end
 
 # ── Hygienic substitution ────────────────────────────────────────────────
-# Rename value-position Symbols per `map` and quoted basis ids per `ids`.
+# Rename value-position Symbols per `map`.
 # Call heads, dotted function names (`f.(…)`), keyword names and macro names
 # are never renamed; a bare keyword shorthand (`f(; k)`, meaning `k = k`)
-# expands to `k = <renamed>` when `k` is renamed; QuoteNodes are opaque except
-# the id position of `spline_basis` / `hsgp_basis` / `spline` / `hsgp`.
-_hsubst(ex::Symbol, map::AbstractDict, ids::AbstractDict) = get(map, ex, ex)
-_hsubst(ex, ::AbstractDict, ::AbstractDict) = ex
-function _hsubst(ex::Expr, map::AbstractDict, ids::AbstractDict)
+# expands to `k = <renamed>` when `k` is renamed. QuoteNodes remain opaque.
+_hsubst(ex::Symbol, map::AbstractDict) = get(map, ex, ex)
+_hsubst(ex, ::AbstractDict) = ex
+function _hsubst(ex::Expr, map::AbstractDict)
     h = ex.head
-    sub(a) = _hsubst(a, map, ids)
+    sub(a) = _hsubst(a, map)
     if h === :call && !isempty(ex.args)
         f = ex.args[1]
         if f isa Symbol && get(map, f, nothing) isa GlobalRef
             f = map[f]
         end
         args = Any[f]
-        idpos = f isa Symbol && f in _BASIS_ID_HEADS ? _basis_id_pos(ex) : 0
         for (k, a) in enumerate(ex.args)
             k == 1 && continue
-            if k == idpos && haskey(ids, a.value)
-                push!(args, QuoteNode(ids[a.value]))
-            else
-                push!(args, sub(a))
-            end
+            push!(args, sub(a))
         end
         return Expr(:call, args...)
     elseif h === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
@@ -7470,15 +6324,6 @@ function _hsubst(ex::Expr, map::AbstractDict, ids::AbstractDict)
             Any[a isa LineNumberNode ? a : sub(a) for a in ex.args[2:end]]...)
     end
     return Expr(h, Any[sub(a) for a in ex.args]...)
-end
-
-function _basis_id_pos(call::Expr)
-    for (k, a) in enumerate(call.args)
-        k == 1 && continue
-        a isa Expr && a.head in (:parameters, :kw) && continue
-        return a isa QuoteNode && a.value isa Symbol ? k : 0
-    end
-    return 0
 end
 
 # A call head that names an argument or a body binder would silently stay
@@ -7598,7 +6443,7 @@ function _bind_submodel_arguments(callexpr::Expr, sm::RKPPLSubmodel)
             resolved = _resolve_module_calls(default, sm.mod,
                 Set{Symbol}(_submodel_args(sm)),
                 "submodel `$(sm.name)` keyword default `$k`")
-            _hsubst(resolved, substitutions, Dict{Symbol,Symbol}())
+            _hsubst(resolved, substitutions)
         end
         push!(posargs, value)
         substitutions[k] = value
@@ -7607,8 +6452,7 @@ function _bind_submodel_arguments(callexpr::Expr, sm::RKPPLSubmodel)
 end
 
 # The substitution for one use site: arguments → call expressions, body
-# binders → `ns(name)` (except names `keep` maps itself), basis ids →
-# private identifiers. Returns (map, idmap). Fails closed when a
+# binders → `ns(name)` (except names `keep` maps itself). Fails closed when a
 # binder is an argument name, except a `~` / `.~` observation of an argument
 # bound to a data column.
 function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
@@ -7617,11 +6461,9 @@ function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
     argset = Set{Symbol}(argnames)
     binders = Set{Symbol}()
     defined = Set{Symbol}()   # binders outside a `~` / `.~` LHS
-    ids = Set{Symbol}()
     for st in stmts
         _collect_binders!(binders, st)
         _collect_binders!(defined, st, false)
-        st isa Expr && _collect_basis_ids!(ids, st)
     end
     submap = Dict{Symbol,Any}()
     for (a, v) in zip(argnames, callargs)
@@ -7643,15 +6485,12 @@ function _submodel_substitution(sm::RKPPLSubmodel, stmts, ret, callargs,
         v = submap[nm]
         ns.scope.locals[nm] = v isa Symbol ? v : v.args[1]::Symbol
     end
-    idmap = Dict{Symbol,Symbol}(id =>
-        _scope_private_name!(ns.context, ns.scope, id)
-        for id in sort!(collect(ids); by = string))
     names = union(argset, binders)
     for st in stmts
         _check_call_heads(sm, st, names, submap)
     end
     _check_call_heads(sm, ret, names, submap)
-    return submap, idmap
+    return submap
 end
 
 # The namespace root of a use site: `ns` closes over it (`_NsRoot`).
@@ -7665,17 +6504,6 @@ function (n::_NsRoot)(nm::Symbol)
     identifier = _scope_private_name!(n.context, n.scope, nm)
     return n.indexed === nothing ? identifier :
         Expr(:ref, identifier, n.indexed)
-end
-
-function _collect_basis_ids!(ids::Set{Symbol}, st::Expr)
-    if st.head === :call && !isempty(st.args) && st.args[1] in _BASIS_DECL_HEADS
-        id = _basis_id_arg(st)
-        id === nothing || push!(ids, id.value)
-    end
-    for a in st.args
-        a isa Expr && _collect_basis_ids!(ids, a)
-    end
-    return ids
 end
 
 function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
@@ -7714,7 +6542,7 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     # its private name beside every other binder in the call's namespace.
     keep = observed ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
     scope = _new_submodel_scope!(used, lhs)
-    submap, idmap = _submodel_substitution(sm, stmts, ret,
+    submap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(lhs, nothing, scope, used), keep)
     # Body definitions call functions visible in the submodel's OWN module
     # (functions as values); resolution precedes substitution (`GlobalRef`
@@ -7723,16 +6551,16 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     union!(bodynames, _submodel_args(sm))
     functions = Dict(k => v for (k, v) in submap if v isa GlobalRef &&
         getglobal(v.mod, v.name) isa Function)
-    out = Any[_hsubst(_resolve_submodel_stmt(_hsubst(st, functions, idmap),
-        sm, bodynames), submap, idmap)
+    out = Any[_hsubst(_resolve_submodel_stmt(_hsubst(st, functions),
+        sm, bodynames), submap)
         for st in stmts]
     stream && !observed && (out = _generative_stream_stmts(out, submap[ret], data))
     # Every latent call binds its return value. An observed stream already
     # binds the response column, so it has no trailing assignment.
     observed || push!(out, Expr(:(=), lhs, _hsubst(_resolve_module_calls(
-        _hsubst(ret, functions, idmap),
+        _hsubst(ret, functions),
         sm.mod, bodynames, "submodel `$(sm.name)` return `$(repr(ret))`"),
-        submap, idmap)))
+        submap)))
     return sm, out
 end
 
@@ -7888,7 +6716,7 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     end
     _all_symbols!(used.used, ret)
     # A cell is scalar: a per-cell body holds scalar `~` / `=` statements over
-    # bare names (no indexed priors, plates, scans or varying statements).
+    # bare names (no indexed priors, plates or scans).
     for st in stmts
         (st isa Expr && (_is_sample(st) || _is_broadcast_sample(st) ||
             (st.head === :(=) && length(st.args) == 2)) &&
@@ -7897,11 +6725,6 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
             "$(sm.name)(...)`), so its body holds scalar `~`/`=` statements " *
             "over bare names; `$(repr(st))` is not one (call it at top level " *
             "for plates, scans and sized priors)")
-        (_is_sample(st) || _is_broadcast_sample(st)) &&
-            _is_varying_call(st.args[3]) && _sfail(
-            "submodel `$(sm.name)` is called per cell, so it cannot hold the " *
-            "varying statement `$(repr(st))` (varying statements lower over " *
-            "whole columns — call the submodel at top level)")
     end
     # The direct-bound slot: a bare-Symbol return naming exactly one internal
     # statement, whose LHS binds to `col[i]`.
@@ -7941,12 +6764,12 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
     keep = slot === nothing || latent_stream ? Dict{Symbol,Any}() :
         Dict{Symbol,Any}(_stmt_lhs(stmts[slot]) => colref)
     scope = _new_submodel_scope!(used, col; per_cell = true)
-    submap, idmap = _submodel_substitution(sm, stmts, ret,
+    submap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(col, ivar, scope, used), keep)
-    out = Any[_hsubst(st, submap, idmap) for st in stmts]
+    out = Any[_hsubst(st, submap) for st in stmts]
     # Compound-return latent: bind `col[i]` to the substituted return value.
     (slot === nothing || latent_stream) &&
-        push!(out, Expr(:(=), colref, _hsubst(ret, submap, idmap)))
+        push!(out, Expr(:(=), colref, _hsubst(ret, submap)))
     return sm, out
 end
 
@@ -9703,13 +8526,7 @@ _is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
     !_derived_reads_latent(s, ctx) &&
     (get(ctx.detshape, s, :scalar) === :vector ||
         _is_factor_index_def(ctx.detmap[s], ctx) ||
-        _is_hsgp_only_def(ctx.detmap[s]) ||
         _is_scalar_coef_def(s, ctx, allow_stated))
-
-# A bare HSGP summand definition (`lsig = hsgp(:h)`, SB
-# `log(sigma) ~ 0 + hsgp(x)`): per-observation, a scale predictor.
-_is_hsgp_only_def(rhs) = rhs isa Expr && rhs.head === :call &&
-    !isempty(rhs.args) && rhs.args[1] === :hsgp
 
 # A scalar definition spelling an intercept-only predictor (`name =
 # coef` over a bare coefficient): admitted to the scale-predictor slot
@@ -9739,8 +8556,6 @@ function _is_scalar_coef_def(s::Symbol, ctx, allow_stated::Bool)
         return false
     rhs in ctx.plate_names && return false
     rhs in ctx.scan_states && return false
-    rhs in ctx.varying_contribs && return false
-    rhs in ctx.varying_draws_names && return false
     haskey(ctx.matrices, rhs) && return false
     return true
 end
@@ -9903,14 +8718,6 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                 predictors, pred_idx; synth)
         pname = loc
         haskey(pred_idx, pname) && return pname
-        if _is_plate_column_call(ctx.detmap[loc]) &&
-                any(n -> n in ctx.varying_contribs ||
-                    (haskey(ctx.detmap, n) &&
-                     _uses_varying_contrib(ctx.detmap[n], ctx.varying_contribs)),
-                    ctx.detmap[loc].args[3:end])
-            return _lower_plate_varying_location(pname, ctx.detmap[loc], ctx,
-                lhs, pred_link, predictors, pred_idx, coefuse)
-        end
         if _composed_root(ctx.detmap[loc], ctx) ||
                 (value && _is_bare_sub_map(ctx.detmap[loc], ctx))
             return _lower_composed_predictor(pname, ctx.detmap[loc], ctx,
@@ -9948,42 +8755,6 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     return pname
 end
 
-# A retained cell reads a varying contribution as an ordinary vector value.
-# Intern its existing affine/varying predictor, then pass that LP to the
-# cell as a shared input. The cell's arithmetic and selected iterator stay
-# inside the RK plate rather than becoming eager full-column arithmetic.
-function _lower_plate_varying_location(pname, call, ctx, lhs, pred_link,
-        predictors, pred_idx, coefuse)
-    subs, scalars, datas = Symbol[], Symbol[], Symbol[]
-    for name in call.args[3:end]
-        varying = name in ctx.varying_contribs ||
-            (haskey(ctx.detmap, name) &&
-             _uses_varying_contrib(ctx.detmap[name], ctx.varying_contribs))
-        if varying
-            if !haskey(pred_idx, name)
-                rhs = get(ctx.detmap, name, name)
-                terms, uses = _analyze_predictor(name, rhs, ctx, lhs;
-                    composed_sub = true)
-                _record_coefuses!(coefuse, name, uses, lhs)
-                push!(predictors, PredictorSpec(name, IdentityLink, terms, name))
-                pred_idx[name] = length(predictors)
-                push!(ctx.absorbed, name)
-            end
-            push!(subs, name)
-        elseif name in ctx.data || name in ctx.vecdefs
-            push!(datas, name)
-        else
-            push!(scalars, name)
-        end
-    end
-    term = TermSpec(ComposedTerm, ColumnRef[datas...],
-        (; tree = call, subs, scalars), pname, pname)
-    push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
-    pred_idx[pname] = length(predictors)
-    push!(ctx.absorbed, pname)
-    return pname
-end
-
 # Build the LatentTerm location predictor over `col` (a plate parameter or a
 # derived column that reads one); the generator emits `lp = col`.
 # Latent predictors stay per-response (no interning here).
@@ -10016,8 +8787,7 @@ end
 # and scan states carry their own location arms).
 _is_value_location(loc::Symbol, ctx) = loc in ctx.data ||
     (loc in ctx.prior_names && loc ∉ ctx.sized_decls &&
-        loc ∉ ctx.vector_params && loc ∉ ctx.varying_contribs &&
-        loc ∉ ctx.varying_draws_names)
+        loc ∉ ctx.vector_params)
 
 # Scalar definitions/expressions, plus scalar sums the affine path refuses
 # (two intercepts or a literal summand). Other vector-shaped expressions
@@ -10228,14 +8998,6 @@ end
 
 function _lower_location_symbol_error(lhs, loc, ctx; bare::Bool = false,
         value::Bool = false)
-    loc in ctx.varying_contribs && _sfail(
-        "response $lhs location is the varying contribution $loc — " *
-        "locations must be predictors with estimated coefficients " *
-        "(bind: `mu = a .+ $loc`)")
-    loc in ctx.varying_draws_names && loc ∉ ctx.varying_contribs &&
-        _sfail("response $lhs location is the varying draws block $loc " *
-              "— slice it (`r ~ varying_slice($loc, ...)`) and bind the " *
-              "slice in a predictor with estimated coefficients")
     bare && loc in ctx.data && _sfail("response $lhs location is the data " *
         "column $loc written bare — a bare Bernoulli/Binomial/Poisson " *
         "location is a sampled probability or rate; read data under its " *
@@ -10363,13 +9125,11 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
         # A bare alias of a varying contribution (`th = r_t`, brms
         # `theta ~ 0 + (1 | person)`) is per-observation, hence a sub.
         (allow_factor && _is_factor_index_def(ctx.detmap[s], ctx)) ||
-            ctx.detmap[s] in ctx.varying_contribs || return false
+            return false
     end
     s in ctx.data && return false
     s in ctx.plate_names && return false
     s in ctx.scan_states && return false
-    s in ctx.varying_contribs && return false
-    s in ctx.varying_draws_names && return false
     _derived_reads_latent(s, ctx) && return false
     _composed_data_only(s, ctx, Set{Symbol}()) && return false
     # An interned location already has an LP node, including an offset
@@ -10396,8 +9156,7 @@ end
 # the array / varying / latent / scan objects that carry their own arms.
 _composed_scalar_param(leaf::Symbol, ctx) =
     leaf in ctx.prior_names && leaf ∉ ctx.coef_priors &&
-    leaf ∉ ctx.sized_decls && leaf ∉ ctx.varying_contribs &&
-    leaf ∉ ctx.varying_draws_names && leaf ∉ ctx.plate_names &&
+    leaf ∉ ctx.sized_decls && leaf ∉ ctx.plate_names &&
     leaf ∉ ctx.scan_states
 
 """Whether a definition is a parameter offset: data (and data-only parts
@@ -10923,10 +9682,7 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
             all(t -> t.kind === OffsetTerm ||
                 t.kind === LatentTerm ||
                 t.kind === ComposedTerm ||
-                t.kind === MonotonicSummandTerm ||
-                t.kind === HSGPSummandTerm ||
-                t.kind === ScanSummandTerm ||
-                (composed_sub && t.kind === VaryingEffectTerm), terms))
+                t.kind === ScanSummandTerm, terms))
         _sfail("predictor $pname has no estimated coefficients or " *
                "coefficient-free value terms")
     end
@@ -10937,32 +9693,6 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
     ex isa Symbol || return _inline_structure_expr(ex, ctx, visited, where)
     haskey(ctx.detmap, ex) || return ex
     ex in ctx.declaration_data && return ex
-    # Summand atoms never hide in definitions: an inlined alias would
-    # silently become a direct summand, bypassing the lowering screens
-    # (scalar defs always inline; structural vector defs inline too).
-    _uses_varying_contrib(ctx.detmap[ex], ctx.varying_contribs) &&
-        _sfail("definition `$ex` (inlined into $where) references a " *
-        "varying contribution, which lowers only as a direct predictor " *
-        "summand (`mu = a .+ b .* x .+ r`), not inside definitions")
-    _contains_spline(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
-        "into $where) calls `spline()`, which lowers only as a direct " *
-        "predictor summand (`mu = a .+ b .* x .+ spline(:s_x)`), not " *
-        "inside definitions")
-    _contains_hsgp(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
-        "into $where) calls `hsgp()`, which lowers only as a direct " *
-        "predictor summand (`mu = a .+ b .* x .+ hsgp(:h_x)`), not " *
-        "inside definitions")
-    _contains_mo(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
-        "into $where) calls `mo()`, which lowers only in a predictor " *
-        "(`mu = a .+ b .* mo(c, s)`), not inside definitions")
-    _contains_mo1(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
-        "into $where) calls `mo1()`, which lowers only as a direct " *
-        "predictor summand (`mu = a .+ mo1(c, s)`), not " *
-        "inside definitions")
-    _contains_dar(ctx.detmap[ex]) && _sfail("definition `$ex` (inlined " *
-        "into $where) calls `dar()`, which lowers only as a direct " *
-        "predictor summand (`mu = a .+ dar(beta, sigma)`), not " *
-        "inside definitions")
     # Array-valued definitions (`M = (sd .* L)'`) stay named values.
     ctx.detshape[ex] === :array && return ex
     if ex in ctx.structural || ctx.detshape[ex] ∉ (:vector, :array) ||
@@ -11017,58 +9747,9 @@ function _classify_summand(pname, core, sign::Int, ctx)
                             "in data (terms are bare coefficients, " *
                             "`coefficient .* column`, " *
                             "`coefficients[column]`, and bare columns)")
-    # Bare contributions route via `_classify_symbol` above; any other
-    # expression mentioning one fails here (additive-only, never nested).
-    if _uses_varying_contrib(core, ctx.varying_contribs)
-        _sfail("predictor $pname: varying contributions lower only as " *
-              "direct additive summands (`mu = a .+ b .* x .+ r`), not " *
-              "nested in $(repr(core))")
-    end
-    if _contains_spline(core)
-        _is_spline_call(core) ||
-            _sfail("predictor $pname: `spline()` summands lower only as " *
-                  "direct additive summands " *
-                  "(`mu = a .+ b .* x .+ spline(:s_x)`), not nested in " *
-                  "$(repr(core))")
-        return _classify_spline(pname, core, sign, ctx)
-    end
-    if _contains_hsgp(core)
-        _is_hsgp_call(core) ||
-            _sfail("predictor $pname: `hsgp()` summands lower only as " *
-                  "direct additive summands " *
-                  "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not nested in " *
-                  "$(repr(core))")
-        return _classify_hsgp(pname, core, sign, ctx)
-    end
-    if _contains_dar(core)
-        _is_dar_call(core) ||
-            _sfail("predictor $pname: `dar()` summands lower only as " *
-                  "direct additive summands " *
-                  "(`mu = a .+ dar(beta, sigma)`), not nested in " *
-                  "$(repr(core))")
-        return _classify_dar(pname, core, sign, ctx)
-    end
     if _contains_scan(core, ctx.scan_states)
         return _is_scan_product(core) ? _classify_scan(pname, core, sign, ctx) :
             _extract_summand(pname, core, sign, ctx)
-    end
-    if _contains_mo1(core)
-        _is_mo1_call(core) ||
-            _sfail("predictor $pname: `mo1()` summands lower only as " *
-                  "direct additive summands " *
-                  "(`mu = a .+ mo1(c, s)`), not nested in " *
-                  "$(repr(core))")
-        return _classify_mo1(pname, core, sign, ctx)
-    end
-    if _contains_mo(core)
-        # `mo()` lowers only scaled by one free coefficient — the product
-        # arm below routes to `_classify_mo_product`; any other shape
-        # fails here naming the spelling.
-        core isa Expr && core.head === :call && !isempty(core.args) &&
-            core.args[1] === :.* ||
-            _sfail("predictor $pname: `mo()` takes a free coefficient " *
-                  "(`mu = a .+ b .* mo(c, s)`); beta-free monotonic " *
-                  "summands spell `mo1(c, s)`")
     end
     # Design matrices lower as `X * b` matmuls (the arm validates the
     # right-hand side); every other matrix mention fails below (the
@@ -11181,67 +9862,6 @@ function _classify_matmul(pname, core::Expr, sign::Int, ctx)
         Symbol(X, "_term")), (r, X, sign)
 end
 
-# A `spline(:id)` summand: the named basis's direct summand in the
-# enclosing predictor (SB's `X*b + Z*(sd*z)` shape). Additive only, one
-# target per smooth (a second use fails here so the surface error names
-# both predictors; the contract re-checks for hand-built plans).
-function _classify_spline(pname, core::Expr, sign::Int, ctx)
-    where = "predictor $pname"
-    args = core.args[2:end]
-    length(args) == 1 ||
-        _sfail("$where spline summand takes `spline(:id)` exactly, got " *
-              "$(repr(core))")
-    id = only(args)
-    id isa QuoteNode && id.value isa Symbol ||
-        _sfail("$where quotes its spline id: got $(repr(id)) — write " *
-              "`spline(:id)`")
-    id = id.value
-    sign > 0 ||
-        _sfail("$where negates a `spline()` summand — summands are " *
-              "additive only (write `.+ spline(:$id)`)")
-    haskey(ctx.splines, id) ||
-        _sfail("$where uses unknown spline :$id — declare it with " *
-              "`spline_basis(:$id, x)`")
-    haskey(ctx.spline_uses, id) &&
-        _sfail("$where reuses spline :$id, which already feeds predictor " *
-              "`$(ctx.spline_uses[id])` (one target per smooth)")
-    ctx.spline_uses[id] = pname
-    label = Symbol("spline_", pname, "_", id)
-    return TermSpec(SplineSummandTerm, ColumnRef[], (spline_id = id,),
-        label, label), nothing
-end
-
-# An `hsgp(:id)` summand: the named basis's direct summand in the
-# enclosing predictor (SB's `PHI * (sqrt_spd .* beta)` shape, Stage B).
-# Additive only, one target per basis (a second use fails here so the
-# surface error names both predictors; the contract re-checks for
-# hand-built plans).
-function _classify_hsgp(pname, core::Expr, sign::Int, ctx)
-    where = "predictor $pname"
-    args = core.args[2:end]
-    length(args) == 1 ||
-        _sfail("$where hsgp summand takes `hsgp(:id)` exactly, got " *
-              "$(repr(core))")
-    id = only(args)
-    id isa QuoteNode && id.value isa Symbol ||
-        _sfail("$where quotes its hsgp id: got $(repr(id)) — write " *
-              "`hsgp(:id)`")
-    id = id.value
-    sign > 0 ||
-        _sfail("$where negates an `hsgp()` summand — summands are " *
-              "additive only (write `.+ hsgp(:$id)`)")
-    haskey(ctx.hsgps, id) ||
-        _sfail("$where uses unknown hsgp :$id — declare it with " *
-              "`hsgp_basis(:$id, x)`")
-    haskey(ctx.hsgp_uses, id) &&
-        _sfail("$where reuses hsgp :$id, which already feeds predictor " *
-              "`$(ctx.hsgp_uses[id])` (one target per basis)")
-    ctx.hsgp_uses[id] = pname
-    label = Symbol("hsgp_", pname, "_", id)
-    return TermSpec(HSGPSummandTerm, ColumnRef[], (hsgp_id = id,),
-        label, label), nothing
-end
-
 # A scan state read anywhere in a summand (bare Symbol leaves; quoted ids
 # such as `spline(:id)` are not reads).
 _contains_scan(ex, states) = ex isa Expr && _contains_scan_go(ex, states)
@@ -11288,159 +9908,6 @@ function _classify_scan(pname, core::Expr, sign::Int, ctx)
         (scan_id = only(states), coef = coef), label, label), nothing
 end
 
-# Shared `mo(col, s)` / `mo1(col, s)` argument screen: two bare names —
-# the index column (a raw data column of integer level codes 1..K, bound
-# by the emitter — SB's `<c>_idx`) and the increments simplex (a
-# `~ Dirichlet(...)` parameter). Shape-verified here so both classifiers
-# fail with the use-site spelling.
-function _mo_args(pname, core::Expr, ctx, head::Symbol)
-    where = "predictor $pname"
-    args = core.args[2:end]
-    length(args) == 2 ||
-        _sfail("$where `$head()` takes `(index column, increments)` " *
-              "exactly (`$head(c, s)`), got $(repr(core))")
-    col, incr = args
-    col isa Symbol ||
-        _sfail("$where `$head()` index must be a bare data column of " *
-              "level codes, got $(repr(col))")
-    col in ctx.data ||
-        _sfail("$where `$head()` index $col must be a data column " *
-              "(the emitter binds integer codes 1..K)")
-    incr isa Symbol ||
-        _sfail("$where `$head()` increments must name a " *
-              "`~ Dirichlet(...)` simplex parameter, got $(repr(incr))")
-    incr in ctx.dirichlet_names ||
-        _sfail("$where `$head()` increments $incr is not a " *
-              "`~ Dirichlet(...)` simplex parameter")
-    haskey(ctx.mo_uses, incr) &&
-        _sfail("$where reuses increments $incr, which already feed " *
-              "predictor `$(ctx.mo_uses[incr])` (one monotonic term per " *
-              "simplex)")
-    ctx.mo_uses[incr] = pname
-    return col, incr
-end
-
-# A `coef .* mo(col, s)` product: the only `mo()` shape (SB's free-beta
-# monotonic column). Exactly two factors — one coefficient, one `mo()`
-# call — in either order; anything else (unscaled, multi-scaled,
-# interacting, `mo1()`-carrying) fails naming the spelling.
-function _classify_mo_product(pname, core::Expr, sign::Int, ctx)
-    where = "predictor $pname"
-    inner = sign
-    coef = nothing
-    mocall = nothing
-    for f in core.args[2:end]
-        s, g = _strip_sign(f)
-        inner *= s
-        if _is_mo_call(g)
-            mocall === nothing ||
-                _sfail("$where combines two `mo()` calls — one " *
-                      "monotonic column per product " *
-                      "(`b .* mo(c, s)`)")
-            mocall = g
-        elseif _contains_mo(g) || _contains_mo1(g)
-            _sfail("$where nests `$(repr(g))` — `mo()` lowers only as " *
-                  "`coef .* mo(col, s)`")
-        elseif g isa Symbol && _summand_kind(g, ctx) === :coef
-            coef === nothing ||
-                _sfail("$where scales `mo()` by two coefficients — " *
-                      "one coefficient per column")
-            coef = g
-        else
-            _sfail("$where combines `mo()` with $(repr(g)) — `mo()` " *
-                  "lowers only as `coef .* mo(col, s)`")
-        end
-    end
-    mocall === nothing && _sfail("internal: mo product without an `mo()` call")
-    coef === nothing &&
-        _sfail("$where `mo()` takes a free coefficient " *
-              "(`b .* mo(c, s)`); beta-free monotonic summands spell " *
-              "`mo1(c, s)`")
-    col, incr = _mo_args(pname, mocall, ctx, :mo)
-    label = Symbol("mo_", pname, "_", col)
-    return TermSpec(MonotonicTerm, [col], (increments = incr,), col,
-        label), (coef, col, inner)
-end
-
-# A `mo1(col, s)` summand: the named increments' contrast as a direct
-# beta-free summand (SB's `mo1(c)` shape). Additive only, one term per
-# simplex (SB allocates one submodel per term; the contract re-checks
-# for hand-built plans).
-function _classify_mo1(pname, core::Expr, sign::Int, ctx)
-    where = "predictor $pname"
-    sign > 0 ||
-        _sfail("$where negates a `mo1()` summand — summands are " *
-              "additive only (write `.+ mo1(c, s)`)")
-    col, incr = _mo_args(pname, core, ctx, :mo1)
-    label = Symbol("mo1_", pname, "_", col)
-    return TermSpec(MonotonicSummandTerm, [col], (increments = incr,),
-        label, label), nothing
-end
-
-# A `dar(beta, sigma)` summand: the zero-started differenced-AR(1)
-# trajectory as a direct beta-free summand (SB's `dar(time)` shape —
-# the formula intercept is the initial level, the `mo1` splice shape).
-# Exactly two bare sampled scalars: a truncated-`[0, 1]`-Normal
-# persistence and a positive-Normal scale, each keeping the meaning of
-# its statement as written (Distributions semantics: the truncation and
-# half-Normal normalizers stay). The library spelling is the
-# `differenced_ar1` submodel (`src/library.jl`). Additive only; one
-# `dar()` call per predictor in v1. The state synthesizes as
-# `dar_<pname>` and claims the name up front (the
-# vector-parameter representation). Both parameters record in `dar_coefs`
-# (checked disjoint from predictor coefficients after lowering) and
-# lower to `SampledParameter`s, never population priors.
-function _classify_dar(pname, core::Expr, sign::Int, ctx)
-    where = "predictor $pname"
-    sign > 0 ||
-        _sfail("$where negates a `dar()` summand — summands are " *
-              "additive only (write `.+ dar(beta, sigma)`)")
-    args = core.args[2:end]
-    length(args) == 2 ||
-        _sfail("$where `dar()` takes `(persistence, scale)` exactly " *
-              "(`dar(beta, sigma)`), got $(repr(core))")
-    beta, sigma = args
-    beta isa Symbol ||
-        _sfail("$where `dar()` persistence must be a bare sampled " *
-              "parameter, got $(repr(beta))")
-    sigma isa Symbol ||
-        _sfail("$where `dar()` scale must be a bare sampled parameter, " *
-              "got $(repr(sigma))")
-    beta === sigma &&
-        _sfail("$where `dar()` persistence and scale must be distinct " *
-              "parameters (SB samples `beta` and `sigma` separately), " *
-              "got :$beta twice")
-    beta in ctx.prior_names ||
-        _sfail("$where `dar()` persistence $beta has no `~` statement — " *
-              "dar parameters are sampled scalars " *
-              "(`$beta ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
-    beta in ctx.dar_beta_names ||
-        _sfail("$where `dar()` persistence $beta must be " *
-              "`truncated(Normal(mu, s), 0, 1)` (SB's `beta ~ " *
-              "normal(0.5, 0.2; lower=0, upper=1)`)")
-    sigma in ctx.prior_names ||
-        _sfail("$where `dar()` scale $sigma has no `~` statement — dar " *
-              "parameters are sampled scalars (`$sigma ~ HalfNormal(0.2)`)")
-    sigma in ctx.dar_sigma_names ||
-        _sfail("$where `dar()` scale $sigma must be `HalfNormal(s)` or " *
-              "`truncated(Normal(0, s), 0, Inf)` (SB's `sigma ~ " *
-              "normal(0, 0.2; lower=0)`)")
-    state = Symbol(:dar_, pname)
-    state in ctx.dar_states &&
-        _sfail("$where calls `dar()` twice — one dar summand per " *
-              "predictor in v1")
-    state in ctx.taken &&
-        _sfail("$where dar state $state collides with your definition — " *
-              "rename yours")
-    push!(ctx.taken, state)
-    push!(ctx.dar_states, state)
-    push!(ctx.dar_coefs, beta)
-    push!(ctx.dar_coefs, sigma)
-    push!(ctx.dar_specs, DarSpec(state, beta, sigma, state))
-    return TermSpec(DarSummandTerm, ColumnRef[], (dar_id = state,),
-        state, state), nothing
-end
-
 # The scan state a pure alias chain (`w = u`, `v = w`) names, or nothing.
 function _scan_alias_target(nm::Symbol, ctx)
     seen = Set{Symbol}()
@@ -11454,25 +9921,6 @@ function _scan_alias_target(nm::Symbol, ctx)
 end
 
 function _classify_symbol(pname, core::Symbol, sign::Int, ctx)
-    if core in ctx.varying_contribs
-        sign < 0 && _sfail("predictor $pname: varying contribution " *
-                           "`$core` is additive-only (write `.+ $core`)")
-        haskey(ctx.varying_use, core) &&
-            _sfail("predictor $pname: varying contribution `$core` is " *
-                  "already used in predictor $(ctx.varying_use[core]) " *
-                  "(one contribution feeds exactly one predictor)")
-        ctx.varying_use[core] = pname
-        plabel = only(p.draws for p in ctx.varying_pending
-            if p.contrib === core)
-        d = ctx.varying_draws[plabel]
-        rlabel = Symbol("r_", pname, "_", d.suffix)
-        return TermSpec(VaryingEffectTerm, ColumnRef[d.group],
-            (draws = plabel,), rlabel, rlabel), nothing
-    end
-    core in ctx.varying_draws_names && core ∉ ctx.varying_contribs &&
-        _sfail("predictor $pname: `$core` is a varying draws block, not " *
-              "a per-observation value — slice it " *
-              "(`r ~ varying_slice($core, ...)`) and use the slice")
     # (Design matrices never reach here as bare summands: named
     # definitions screen them at extraction, inline locations at the
     # location arm, and dotted compositions at canonicalization.)
@@ -11593,9 +10041,6 @@ function _extract_column(pname, e::Expr, ctx)
 end
 
 function _classify_product(pname, core::Expr, sign::Int, ctx)
-    if any(f -> _contains_mo(f) || _contains_mo1(f), core.args[2:end])
-        return _classify_mo_product(pname, core, sign, ctx)
-    end
     # A product whose factors read a declared array directly
     # (`tau .* z[g]`, `phi[1] .* x`) is a value: extracted whole as an
     # in-graph column (its scalar factors stay ordinary parameters). A
@@ -12972,21 +11417,6 @@ function _lower_bounded_param(lhs, rhs, coefuse, matrices, mode)
 end
 
 function _lower_assignment(nm, rhs, coefuse)
-    _contains_spline(rhs) && _sfail("assignment `$nm` calls `spline()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ b .* x .+ spline(:s_x)`), not inside definitions")
-    _contains_hsgp(rhs) && _sfail("assignment `$nm` calls `hsgp()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not inside definitions")
-    _contains_mo(rhs) && _sfail("assignment `$nm` calls `mo()`, " *
-        "which lowers only in a predictor (`mu = a .+ b .* mo(c, s)`), " *
-        "not inside definitions")
-    _contains_mo1(rhs) && _sfail("assignment `$nm` calls `mo1()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ mo1(c, s)`), not inside definitions")
-    _contains_dar(rhs) && _sfail("assignment `$nm` calls `dar()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ dar(beta, sigma)`), not inside definitions")
     rhs isa Expr || rhs isa Symbol || rhs isa Real ||
         _sfail("assignment $nm must be an expression, name or literal, " *
                "got $(repr(rhs))")
@@ -12997,21 +11427,6 @@ end
 # coefficient discipline and types the node (vocabulary and Julia-shape
 # screens ran at the definition pre-pass).
 function _lower_vector_assignment(nm, rhs, coefuse)
-    _contains_spline(rhs) && _sfail("derived column `$nm` calls `spline()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ b .* x .+ spline(:s_x)`), not inside definitions")
-    _contains_hsgp(rhs) && _sfail("derived column `$nm` calls `hsgp()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ b .* x .+ hsgp(:h_x)`), not inside definitions")
-    _contains_mo(rhs) && _sfail("derived column `$nm` calls `mo()`, " *
-        "which lowers only in a predictor (`mu = a .+ b .* mo(c, s)`), " *
-        "not inside definitions")
-    _contains_mo1(rhs) && _sfail("derived column `$nm` calls `mo1()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ mo1(c, s)`), not inside definitions")
-    _contains_dar(rhs) && _sfail("derived column `$nm` calls `dar()`, " *
-        "which lowers only as a direct predictor summand " *
-        "(`mu = a .+ dar(beta, sigma)`), not inside definitions")
     rhs isa Expr || rhs isa Symbol ||
         _sfail("derived column $nm must be an expression or column alias, " *
                "got $(repr(rhs))")

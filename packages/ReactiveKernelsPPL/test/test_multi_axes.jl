@@ -133,22 +133,7 @@ end
         end
         h
     end; slots = (:scans,))
-    _ma_check(quote
-        a ~ Normal(0, 1)
-        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
-        sd ~ HalfNormal(0.2)
-        mu = a .+ dar(beta, sd)
-        y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> begin
-        s = only(p.dar_paths)
-        z = u[_ma_segment(l, ReactiveKernelsPPL._dar_innovation_name(s))]
-        h, d = [0.0], 0.0
-        for e in z
-            d = nt.beta * d + nt.sd * e
-            push!(h, h[end] + d)
-        end
-        nt.a .+ h
-    end; slots = (:dar_paths,))
+
 end
 
 @testset "multiple observation axes: matrices and declared arrays" begin
@@ -177,65 +162,6 @@ end
         y .~ Normal.(mu, 1.0)
     end, cols, (p, l, nt, u) -> nt.a .+ cols.x .* only(nt.b.c);
         slots = (:matrices, :array_parameters, :submodel_scopes))
-end
-
-@testset "multiple observation axes: spline and HSGP slots" begin
-    cols = (; x = collect(range(-2.0, 3.0; length = 8)), y = collect(range(0.1, 0.8; length = 8)))
-    _ma_check(quote
-        spline_basis(:s_x, x; k = 4)
-        a ~ Normal(0, 1)
-        mu = a .+ spline(:s_x)
-        y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> begin
-        X = reshape(cols.x .- sum(cols.x) / length(cols.x), :, 1)
-        Z = hcat(p.columns[:s_x_Zpen_1], p.columns[:s_x_Zpen_2])
-        nt.a .+ X * nt.b_s_x_fixed + Z * (only(nt.sd_s_x) .* nt.b_s_x_raw)
-    end; slots = (:spline_bases, :spline_vectors))
-    _ma_check(quote
-        hsgp_basis(:h_x, x; k = 3)
-        a ~ Normal(0, 1)
-        mu = a .+ hsgp(:h_x)
-        y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> begin
-        m, L = only(only(p.hsgp_bases).fits)
-        omega = (1:3) .* (pi / (2L))
-        P = [sin(w * (x - m + L)) / sqrt(L) for x in cols.x, w in omega]
-        weights = nt.sigma_h_x .* sqrt(nt.rho_h_x * sqrt(2pi)) .*
-            exp.(-0.25 .* nt.rho_h_x^2 .* omega.^2) .* nt.beta_raw_h_x
-        nt.a .+ P * weights
-    end; slots = (:hsgp_bases,))
-end
-
-@testset "multiple observation axes: varying applications" begin
-    cols = (; y = [0.1, 0.2, 0.3, -0.1], g1 = [1, 2, 1, 3],
-        g2 = [2, 3, 1, 2], w1 = [0.7, 0.2, 0.5, 0.9], w2 = [0.3, 0.8, 0.5, 0.1])
-    _ma_check(quote
-        a ~ Normal(0, 1)
-        d ~ varying_draws(mm(g1, g2; weights = (w1, w2)), [1])
-        r ~ varying_slice(d, 1)
-        mu = a .+ r
-        y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> begin
-        sfx = only(p.varying_draws).suffix
-        tau = only(getproperty(nt, Symbol(:tau_, sfx)))
-        z = getproperty(nt, Symbol(:z_flat_, sfx))
-        nt.a .+ tau .* (cols.w1 .* z[cols.g1] .+ cols.w2 .* z[cols.g2])
-    end; slots = (:varying_draws, :varying_slices))
-    # Stratified constrain remains unsupported; use the declared layout
-    # slices directly, as in the existing single-axis acceptance.
-    strata_cols = (; y = cols.y, g = [1, 2, 1, 3], stratum = [1, 1, 1, 2])
-    _ma_check(quote
-        a ~ Normal(0, 1)
-        d ~ varying_draws(gr(g; by = stratum), [1])
-        r ~ varying_slice(d, 1)
-        mu = a .+ r
-        y .~ Normal.(mu, 1.0)
-    end, strata_cols, (p, l, nt, u) -> begin
-        z = u[_ma_segment(l, :z_flat_g)]
-        tau = [exp(only(u[_ma_segment(l, Symbol(:tau_g_s, k))])) for k in 1:2]
-        a = only(u[_ma_segment(l, :a)])
-        a .+ tau[strata_cols.stratum] .* z[strata_cols.g]
-    end; slots = (:varying_draws, :varying_slices), host_values = (l, u) -> nothing)
 end
 
 @testset "multiple observation axes: packed missing observations" begin

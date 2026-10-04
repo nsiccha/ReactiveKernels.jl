@@ -17,6 +17,8 @@ using ReactiveKernelsPPL
 using Reactant
 using Random
 using Test
+import Distributions as RJDistributions
+using LinearAlgebra: Cholesky, LowerTriangular
 
 const _RJ_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
@@ -130,35 +132,47 @@ end
     @test_broken Array(rgrad_default) ≈ g rtol = 1e-9
 end
 
-# Corpus 17 (varying dummy): the `(c .== level)` mask nests inside the LP's
-# traced `.+`/`.*` fusion with no direct traced operand at the outermost
-# call, so the lazy nest kept its host style and Reactant's per-argument
-# standalone materialize produced the overlay-hostile `BitArray`
-# (`StackOverflowError`; snag `dummy-varying-xl-3b05117e`). The lowering now
-# dense-materializes host-only `Bool` nests (`Array{Bool}`), so the program
-# compiles with primal + gradient parity like its ranef siblings.
-@testset "Reactant ladder 1b: varying dummy (corpus 17) primal + gradient" begin
+# A host Bool mask nested in a traced broadcast must retain dense array
+# materialization. Explicit array priors keep the same gather and mask path.
+@testset "Reactant ladder 1b: nested host mask primal + gradient" begin
     plan = lower_rkppl(quote
             a ~ Normal(0, 1)
-            r ~ varying_effect(g, [1, dummy(c, 2)])
-            mu = a .+ r
+            sd[1:2] .~ HalfNormal.(1)
+            L ~ LKJCholesky(2, 1.0)
+            z[levels(g), 1:2] .~ Normal.(0, 1)
+            B = z * (sd .* L)'
+            mu = a .+ B[g, 1] .+ B[g, 2] .* (c .== 2)
             y .~ Normal.(mu, 1.5)
         end, (:y, :c, :g); conditioned = (:y, :c, :g))
-    bound = bind_data(plan, Dict{Symbol,AbstractVector}(
+    data = Dict{Symbol,AbstractVector}(
         :y => [0.5, -1.2, 0.8, 1.5, -0.3, 0.9, -0.7, 1.1],
         :c => [1, 2, 2, 1, 2, 1, 2, 1],
-        :g => [2, 1, 3, 1, 2, 3, 1, 2]))
+        :g => [2, 1, 3, 1, 2, 3, 1, 2])
+    bound = bind_data(plan, data)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
     u = fill(0.1, built.layout.total)
     native = post_q(u)
-    @test native ≈ -22.189852822758517 rtol = 1e-12
+    nt = constrain(built.layout, u)
+    B = nt.z * (nt.sd .* nt.L)'
+    mu = nt.a .+ B[data[:g], 1] .+ B[data[:g], 2] .* (data[:c] .== 2)
+    normal = RJDistributions.Normal()
+    half = RJDistributions.truncated(normal, 0, Inf)
+    oracle = RJDistributions.logpdf(normal, nt.a) +
+        sum(RJDistributions.logpdf.(half, nt.sd)) +
+        sum(RJDistributions.logpdf.(normal, nt.z)) +
+        RJDistributions.logpdf(RJDistributions.LKJCholesky(2, 1.0),
+            Cholesky(LowerTriangular(nt.L))) +
+        sum(RJDistributions.logpdf.(RJDistributions.Normal.(mu, 1.5), data[:y])) +
+        logjac(built.layout, u)
+    @test native ≈ oracle rtol = 1e-12
     compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
     @test Float64(compiled(Reactant.to_rarray(u))) ≈ native rtol = 1e-9
     q = prepare_sampler(built, bound, u; backend = _RJ_BACKEND)
     g = similar(u)
     val, _ = sampler_value_and_gradient!(q, g, u)
     @test val ≈ native rtol = 1e-12
+    @test g ≈ _rj_findiff(post_q, u) rtol = 1e-5 atol = 1e-7
     cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
     rval, rgrad = cad(Reactant.to_rarray(u))
     @test Float64(rval) ≈ native rtol = 1e-9

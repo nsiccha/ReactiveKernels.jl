@@ -185,46 +185,6 @@ end
     end
 end
 
-@testset "varying default keywords canonical parity" begin
-    # A varying block's plan is a function of what is written, never of
-    # whether a default-valued keyword is present: spelling each keyword
-    # at its default gives the byte-identical unbound plan omitting it
-    # gives — K=1 intercept, K=1 slope, K=2, multi-membership and
-    # stratified grouping alike.
-    data = (:y, :x, :g, :g1, :g2, :b)
-    function prog(group, margins, kws::Vector{Pair{Symbol,Any}})
-        call = Expr(:call, :varying_draws, group, Expr(:vect, margins...))
-        isempty(kws) || insert!(call.args, 2,
-            Expr(:parameters, (Expr(:kw, k, v) for (k, v) in kws)...))
-        K = length(margins)
-        return Expr(:block,
-            :(a ~ Normal(0, 5)),
-            Expr(:call, :~, :d, call),
-            :(r ~ varying_slice(d, $(K == 1 ? 1 : :(1:$K)))),
-            :(mu = a .+ r),
-            :(y .~ Normal.(mu, 1.5)))
-    end
-    canon(group, margins, kws = Pair{Symbol,Any}[]) =
-        sprint(_canon, lower_rkppl(prog(group, margins, kws), data; conditioned = data))
-    # Only supported defaults participate in parity. The removed centered
-    # keyword's refusal is checked in test_varying_centered.jl.
-    plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(HalfNormal(1))]
-    mm_group = :(mm(g1, g2))
-    mm_spelled = :(mm(g1, g2; normalize = true))
-    gr_group = :(gr(g; by = b))
-    for (group, spelled_group) in ((:g, :g), (mm_group, mm_spelled),
-            (gr_group, gr_group))
-        for margins in (Any[1], Any[:x], Any[1, :x])
-            want = canon(group, margins)
-            for kw in plain_defaults
-                @test canon(group, margins, Pair{Symbol,Any}[kw]) == want
-            end
-            @test canon(group, margins, plain_defaults) == want
-            @test canon(spelled_group, margins, plain_defaults) == want
-        end
-    end
-end
-
 @testset "bound levels spelling canonical parity" begin
     # Every subset shape admitted inline is admitted through a bound name,
     # and the unbound plan is byte-identical under the canonical serializer.

@@ -25,15 +25,6 @@ function _max_fixture(kind, n, m)
             end
             y .~ Normal.(h, 1)
         end
-    elseif kind === :dar
-        delete!(cols, :x)
-        quote
-            a ~ Normal(0, 1)
-            beta ~ truncated(Normal(0.5, 0.2), 0, 1)
-            sd ~ HalfNormal(0.2)
-            mu = a .+ dar(beta, sd)
-            y .~ Normal.(mu, 1)
-        end
     elseif kind === :array
         cols[:rows] = collect(1:n)
         quote
@@ -49,20 +40,6 @@ function _max_fixture(kind, n, m)
             a ~ Normal(0, 1)
             b[axes(X, 2)] .~ Normal.(0, 1)
             mu = a .+ X * b
-            y .~ Normal.(mu, 1)
-        end
-    elseif kind === :hsgp
-        quote
-            hsgp_basis(:h_x, x; k=3)
-            a ~ Normal(0, 1)
-            mu = a .+ hsgp(:h_x)
-            y .~ Normal.(mu, 1)
-        end
-    elseif kind === :spline
-        quote
-            spline_basis(:s_x, x; k=4)
-            a ~ Normal(0, 1)
-            mu = a .+ spline(:s_x)
             y .~ Normal.(mu, 1)
         end
     elseif kind === :kernel
@@ -118,7 +95,7 @@ function _max_compiled(fx)
 end
 
 @testset "Reactant: multiple axes preserve array and recurrence structure" begin
-    @testset "$kind" for kind in (:plate, :scan, :dar, :array, :matrix, :hsgp, :spline, :kernel)
+    @testset "$kind" for kind in (:plate, :scan, :array, :matrix, :kernel)
         structures = Dict{String,Int}[]
         for (n, m) in ((8, 3), (17, 6))
             fx = _max_fixture(kind, n, m)

@@ -622,7 +622,7 @@ end
     _check_gradient(built.spec, plan, [0.5, -0.25, 0.1])
 end
 
-@testset "matrix mo splice parity" begin
+@testset "matrix prefix-sum gather parity" begin
     cols = Dict{Symbol,AbstractVector}(
         :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
         :x1 => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
@@ -633,7 +633,7 @@ end
         s ~ Dirichlet([1.0, 2.0])
         d ~ Normal(0, 1)
         X = hcat(ones(length(x1)), x1)
-        mu = X * b .+ d .* mo(c, s)
+        mu = X * b .+ d .* cumsum(vcat(0.0, s))[c]
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1, :c); conditioned = (:y, :x1, :c))
     maff = lower_rkppl(quote
@@ -641,7 +641,7 @@ end
         d ~ Normal(0, 1)
         a ~ Normal(0, 1)
         e ~ Normal(0, 1)
-        mu = a .+ e .* x1 .+ d .* mo(c, s)
+        mu = a .+ e .* x1 .+ d .* cumsum(vcat(0.0, s))[c]
         y .~ Normal.(mu, 1.0)
     end, (:y, :x1, :c); conditioned = (:y, :x1, :c))
     pmat = bind_data(mmat, cols)

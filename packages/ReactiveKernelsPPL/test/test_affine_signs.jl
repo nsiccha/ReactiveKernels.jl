@@ -75,9 +75,9 @@ function _affine_sign_fixtures(n)
 
     c = repeat([1, 3, 2], cld(n, 3))[1:n]
     for (label, definition) in (
-            ("monotonic coefficient", :(mu = .-b .* mo(c, s))),
-            ("monotonic column", :(mu = b .* (.-mo(c, s)))),
-            ("monotonic whole minus", :(mu = .-(b .* mo(c, s)))))
+            ("monotonic coefficient", :(mu = .-b .* cumsum(vcat(0.0, s))[c])),
+            ("monotonic column", :(mu = b .* (.-cumsum(vcat(0.0, s))[c]))),
+            ("monotonic whole minus", :(mu = .-(b .* cumsum(vcat(0.0, s))[c]))))
         ast = quote
             b ~ Normal(1.2, 0.7)
             s ~ Dirichlet([1.3, 2.4])

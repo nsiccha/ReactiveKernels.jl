@@ -55,6 +55,11 @@ using ReactiveKernelsPPL
     return b .* x
 end
 monotonic(x) = x .+ 0.5
+mo(x) = x .+ 0.1
+@rkppl varying_effect(x) = begin
+    b ~ Normal(0, 2)
+    return b .* x
+end
 end
 
 @testset "retired catalogue spellings remain caller-owned bindings" begin
@@ -65,4 +70,40 @@ end
     end, (:x, :y); mod = RetiredCatalogueCaller, conditioned = (:y,))
     bound = bind_data(p, Dict(:x => [0.2, 0.4], :y => [0.3, -0.1]))
     @test coordinate_names(build_kernel(bound).layout) == [Symbol("q.b")]
+    p = lower_rkppl(quote
+        q ~ varying_effect(x)
+        m = mo(q)
+        y .~ Normal.(m, 1)
+    end, (:x, :y); mod = RetiredCatalogueCaller, conditioned = (:y,))
+    bound = bind_data(p, Dict(:x => [0.2, 0.4], :y => [0.3, -0.1]))
+    @test coordinate_names(build_kernel(bound).layout) == [Symbol("q.b")]
+end
+
+@testset "retired implicit statistical constructs explain ordinary replacement" begin
+    for (name, replacement) in ReactiveKernelsPPL._RETIRED_CONSTRUCT_MODELS
+        ast = name in (:varying_effect, :varying_draws, :varying_slice) ?
+            Expr(:block, Expr(:call, :~, :q, Expr(:call, name))) :
+            Expr(:block, Expr(:(=), :q, Expr(:call, name)))
+        err = try
+            lower_rkppl(ast, (); mod = ReactiveKernelsPPL)
+            nothing
+        catch error
+            error
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin("retired", sprint(showerror, err))
+        @test occursin("BayesianRegressionModels.rkppl_model(:$replacement)",
+            sprint(showerror, err))
+    end
+    for name in (:spline_basis, :hsgp_basis)
+        ast = Expr(:block, Expr(:call, name, QuoteNode(:basis), :x))
+        err = try
+            lower_rkppl(ast, (:x,); mod = ReactiveKernelsPPL)
+            nothing
+        catch error
+            error
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin("explicit priors", sprint(showerror, err))
+    end
 end

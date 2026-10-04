@@ -527,7 +527,7 @@ Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", 
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
 agree on its rows. A latent plate follows its authored range, while a scan
-with a symbolic length and a `dar` trajectory follow their consuming response.
+with a symbolic length follows its consuming response.
 Varying effects, smooth bases, and design matrices follow their input rows.
 Declared `axes(X, 1)` arrays have X's rows; `axes(X, 2)` coefficient vectors
 have X's width. The total `n_obs` does not size these values. A trajectory used
@@ -709,10 +709,6 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 - A kernel returned by `prepare_query` closes over code generated at build time.
   Call it from top level or through `Base.invokelatest`; `SamplerQuery` calls
   already carry that barrier.
-- Spline (`s`, `t2`) bases come from host LAPACK eigenvectors, which fix each
-  column only up to sign. The layer flips every penalized column so that its
-  first significant entry is positive, so spline coordinates mean the same thing
-  on every machine.
 
 ## Programs emitted by BRM
 

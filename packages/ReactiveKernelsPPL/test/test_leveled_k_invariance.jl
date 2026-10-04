@@ -64,7 +64,7 @@ function _kinv_plans(K::Int)
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 s ~ Dirichlet($alpha)
-                mu = a .+ b .* mo(c, s)
+                mu = a .+ b .* cumsum(vcat(0.0, s))[c]
                 sigma ~ Exponential(1.0)
                 yc .~ Normal.(mu, sigma)
             end, (:yc, :c); conditioned = (:yc, :c)), data(:yc => yc, :c => y)),
