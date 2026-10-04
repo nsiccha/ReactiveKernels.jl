@@ -66,13 +66,16 @@ the lazy semantics made structural: each lane still evaluates only its own
 arm, and no backend receives the branch.
 
 The user's [October 4 recurrence-prevention request](http://localhost:4200/agents/ReactiveKernels:snag.reactant-xla-laz-3679d90e:upstream/messages?ts=2026-10-04T10%3A26%3A24%2B02%3A00)
-is implemented by this review check: before adding or strengthening a constraint,
-reviewers must identify the primary instruction, check the scope of the proposed
-rule against it, and distinguish observable semantics from explicitly requested
-structure and performance or resource measurements. Copied docs, `AGENTS.md`, repeated summaries, successful
+and [broader audit request](http://localhost:4200/agents/RKPPLBench/messages?ts=2026-10-04T10%3A55%3A23%2B02%3A00)
+are implemented by this review check: before adding or strengthening a constraint,
+reviewers must identify the primary user instruction or demonstrate its semantic
+or technical necessity, verify the proposed rule's scope, and distinguish
+observable semantics from explicitly requested structure and performance or
+resource measurements. Copied docs, `AGENTS.md`, repeated summaries, successful
 assertions, brief acknowledgements and experiment-publication approval are not
 independent authority for an expanded policy. A new execution-policy requirement
-needs its own user direction; a diagnostic finding does not supply it.
+needs its own user direction or demonstrated semantic or technical necessity
+with a clear scope; a diagnostic finding alone does not supply it.
 
 ## Derivative rules come from one mathematical graph, never by hand
 

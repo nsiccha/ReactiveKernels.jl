@@ -170,7 +170,8 @@ end
 
 # Exercise the emitted prior's live guard with an invalid inactive logarithm.
 # The factor construction is tested separately; these ports let the prior see
-# entries outside the factor's valid support so eager evaluation is observable.
+# entries outside the factor's valid support to check the selected value and
+# ordinary gradient. Discarded pure intermediates are executable diagnostics.
 function _cv_lkj_diagonal_guard(K)
     terms = ReactiveKernelsPPL._lkj_array_diagonal_terms(:L, K, :eta;
         diagonal = :diagonal)
