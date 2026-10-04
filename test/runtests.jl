@@ -55,6 +55,7 @@ const _MATRIX_CORE_TESTS = (
     "test_readable_expr.jl",
     "test_plate.jl",
     "test_authored_plate.jl",
+    "test_nested_plate.jl",
     "test_authored_scan.jl",
     "test_replica.jl",
     "test_precompiled_prepared.jl",
