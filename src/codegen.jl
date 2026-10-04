@@ -3760,6 +3760,12 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
     body = ast.args[2]
     Expr(:function, Expr(:tuple, runtime_args...),
          Expr(:block,
+              # RGF caches bodies by content. Equal-looking unseeded cache
+              # tuples still belong to different kernels: reusing the first
+              # body would bind its slots into every later callable. A quoted
+              # per-binding token preserves that identity through local-name
+              # canonicalization and disappears from executable code.
+              QuoteNode(gensym(:_rk_nonallocating_binding)),
               Expr(:(=), _OPS_ARG, ops),
               Expr(:(=), _CACHES_ARG, caches),
               Expr(:(=), _CACHE_APPLY_ARG, cache_apply),
