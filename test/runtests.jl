@@ -46,6 +46,7 @@ const _MATRIX_CORE_TESTS = (
     "test_expm_rule.jl",
     "test_symmetric_eigen_rules.jl",
     "test_authoring.jl",
+    "test_globalref_composition.jl",
     "test_error_policy.jl",
     "test_tensorized_vect.jl",
     "test_tensorized_macros.jl",

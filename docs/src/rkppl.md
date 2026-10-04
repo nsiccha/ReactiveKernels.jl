@@ -254,6 +254,21 @@ Uniform bounds may be live scalar values, including in factor arrays:
 - Single assignment, no `if`, no `target +=`. Loops are written as
   `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
 
+A definition may call a function-shaped ReactiveKernels `@kernel` in the model
+module. A positional call such as `loc = recurrence(x, a)` splices the child's
+graph into the generated model, including its authored plates and scans.
+Imported, aliased and qualified bindings use the same composition. Omitted
+child port annotations accept the caller's declared types; declared boundaries
+keep their types. The emitted `kernel_expr` remains the source of the graph,
+so evaluating that expression retains the same child operations.
+
+Composition exposes the child's execution capabilities. Native Enzyme reverse
+currently fails for an empty child scan inside a bound `eachcol` subject plate.
+The default compiled backend expands small subject plates into copies of the
+child scan, so those shapes still lack retained-loop structural acceptance.
+The composition tests keep both gaps visible; nonempty native values and
+derivatives and larger compiled subject plates are covered separately.
+
 A data-only call used only by a parameter-dependent function runs once when
 `prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
 named tuple containing arrays. Named definitions, aliases and inline
