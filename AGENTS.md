@@ -6,6 +6,6 @@ compiled execution, including bound data. Existing nonconforming paths are
 limitations to fix or reject, not precedents that waive the constraints.
 
 Before adding or strengthening a constraint, cite the primary user instruction
-and verify its intended scope. Copied guidance, test outcomes, brief
-acknowledgements and experiment-publication approval do not authorize a stronger
-policy.
+or demonstrate its semantic or technical necessity, and verify its scope.
+Copied guidance, test outcomes, brief acknowledgements and experiment-publication
+approval do not authorize a stronger policy.
