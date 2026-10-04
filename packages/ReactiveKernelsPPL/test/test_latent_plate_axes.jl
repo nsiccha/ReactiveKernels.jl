@@ -2,9 +2,10 @@ using DifferentiationInterface, Distributions, Enzyme, ReactiveKernels, Reactive
 
 function _latent_axis_fixture(n; iterator=:eachindex, matrix=false, legacy=false)
     domain = matrix ? reshape(collect(1:2n), n, 2) : collect(1:n)
-    extent = iterator === :eachindex ? length(domain) : size(domain, 2)
+    extent = iterator === :axes ? size(domain, 2) : length(domain)
     data = (; observed=[3.2, 5.1], domain, y=[1.1, 1.3, 0.9])
-    range = iterator === :eachindex ? :(eachindex(domain)) : :(axes(domain, 2))
+    range = iterator === :literal ? :(1:$n) :
+        iterator === :eachindex ? :(eachindex(domain)) : :(axes(domain, 2))
     ast = quote
         a ~ Normal(0, 1)
         @plate for j in $range
@@ -38,7 +39,8 @@ end
         (0, false, :eachindex, false), (1, false, :eachindex, false),
         (4, false, :eachindex, false), (9, false, :eachindex, false),
         (3, true, :eachindex, false), (5, true, :axes, false),
-        (3, false, :eachindex, true))
+        (3, false, :eachindex, true), (0, false, :literal, false),
+        (1, false, :literal, false), (9, false, :literal, false))
         fx = _latent_axis_fixture(n; matrix, iterator, legacy)
         @test length(constrain(fx.built.layout, fx.u).missing_value) == fx.extent
         @test fx.bound.n_obs == 5

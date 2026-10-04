@@ -1563,6 +1563,14 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
             "design matrix `$(m.name)` is never used in a predictor " *
             "matmul or array axis — drop it or add the use (`mu = $(m.name) * b`)")
     end
+    indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
+        Set{Symbol}(r.response for r in responses))
+    # Explicit loops select each operand at the authored indices. Keep a
+    # literal response iterator on that same gather path as eachindex/axes;
+    # the older UnitRange response contract only checked full-column cover.
+    responses = [r.range isa UnitRange && r.response in indexed_observations ?
+        _with(r; range=Expr(:ref, r.response,
+            Expr(:call, :(:), first(r.range), last(r.range)))) : r for r in responses]
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
@@ -1574,8 +1582,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         kernel_plates = kplates, r2d2_priors = r2d2s, horseshoe_priors = hses,
         matrices = vcat(matrices, value_matrices), event_lps = event_lps,
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
-        indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
-            Set{Symbol}(r.response for r in responses)))
+        indexed_observations)
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -6112,11 +6119,11 @@ function _undot_cell_object(ex::Expr)
 end
 
 # The per-cell latent's size follows the plate range: a literal `1:N` rides as
-# a UnitRange (validated against its response axis at bind); `eachindex(v)` / `axes(v,
+# a UnitRange defining its own cells; `eachindex(v)` / `axes(v,
 # 1)` over a data column ride as the column `v` (one cell per entry, proved
 # at bind); over a definition ⇒ the definition's own observation axis.
 function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
-    rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2])
+    rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2]; allow_empty=true)
     return rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
         Expr(:call, :axes, rkind[2], rkind[3])
 end
@@ -6812,9 +6819,9 @@ function _subset_range(col::Symbol, lo::Integer, hi::Integer)
     return UnitRange(Int(lo), Int(hi))
 end
 
-function _lower_lhs_range(col::Symbol, r)
-    # Literal `1:N`: structural cover check now (start 1, non-empty);
-    # `N == n_obs` is verified at bind (the range rides the plan).
+function _lower_lhs_range(col::Symbol, r; allow_empty::Bool=false)
+    # Literal `1:N` retains its authored extent. Response callers keep their
+    # existing nonempty range contract; a latent declaration may be empty.
     if r isa Expr && r.head === :call && length(r.args) == 3 && r.args[1] === :(:)
         lo, hi = _static_count(r.args[2]), _static_count(r.args[3])
         lo === 1 || _sfail("response $col range must start at 1 " *
@@ -6823,7 +6830,7 @@ function _lower_lhs_range(col::Symbol, r)
                                  "unbound ($(repr(hi))) — no `n` is bound in " *
                                  "the surface; write `eachindex($col)` or a " *
                                  "literal `1:N`")
-        hi >= 1 || _sfail("response $col range $(repr(r)) is empty")
+        (allow_empty || hi >= 1) || _sfail("response $col range $(repr(r)) is empty")
         return UnitRange(1, Int(hi))
     end
     # Self-covering forms: the column's own full index set, by construction.
