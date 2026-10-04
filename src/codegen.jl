@@ -3035,14 +3035,23 @@ With `materialize_view_copies`, a bound `SubArray` crosses as an owning copy
 automatic differentiation (it
 unboxes the parent pointer into an active slot), while an owning array with
 identical contents differentiates cleanly (snag plain-enzyme-rev-3dc5d563).
+
+With `externalize_scalars`, bound numeric values also leave the callable's
+operation table. They follow the literal rebuilding rule above for a rewritten
+structured body, and otherwise cross as inactive operands. Leaving their fields
+in the callable can defeat native Enzyme's readonly analysis when it
+reconstructs that callable beside active values; moving the same fixed values
+out of those fields preserves the public kernel boundary.
 """
 function _externalize_bound_array_call(f, ops;
                                        min_elements::Integer = 0,
-                                       materialize_view_copies::Bool = false)
+                                       materialize_view_copies::Bool = false,
+                                       externalize_scalars::Bool = false)
     positions = Tuple(
         index for (index, op) in pairs(ops)
         if op isa _BoundConstant &&
-           _has_external_bound_array(op.value, min_elements))
+           (_has_external_bound_array(op.value, min_elements) ||
+            externalize_scalars && op.value isa Number))
     isempty(positions) && return nothing, ()
     values = Tuple(
         _externalize_bound_value(ops[index].value, materialize_view_copies)
@@ -3138,9 +3147,10 @@ _has_external_bound_array(value::Union{Tuple,NamedTuple}, min_elements) =
 
 function _externalize_bound_arrays(kernel::PreparedKernel;
                                    min_elements::Integer = 0,
-                                   materialize_view_copies::Bool = false)
+                                   materialize_view_copies::Bool = false,
+                                   externalize_scalars::Bool = false)
     call, values = _externalize_bound_array_call(
-        kernel.f, kernel.ops; min_elements, materialize_view_copies)
+        kernel.f, kernel.ops; min_elements, materialize_view_copies, externalize_scalars)
     call === nothing ? (kernel, ()) : (call, values)
 end
 

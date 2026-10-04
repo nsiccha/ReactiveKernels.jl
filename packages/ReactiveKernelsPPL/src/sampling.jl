@@ -17,6 +17,10 @@ end
 Convenience sampling RHS whose density is `f(value, args...)`. Observed use
 requires no geometry or random generator. Parameter use also needs a
 [`sampling_geometry`](@ref) method, as for any other external RHS.
+When `f` names a module-visible function-shaped `KernelSpec` (including an
+extracted object endpoint), lowering emits its direct call, so the numerical
+graph composes inside the density's observation plate. Ordinary Julia
+callables retain the numerical callback path.
 """
 struct LogDensity{F,A,K}
     f::F
@@ -296,10 +300,48 @@ function _external_cell_keywords!(inputs, args)
     return keywords
 end
 
+function _external_graph_density(args)
+    constructor = _external_constructor(args)
+    constructor isa GlobalRef && getglobal(constructor.mod, constructor.name) === LogDensity ||
+        return nothing
+    positional = _external_arguments(args)
+    isempty(positional) && return nothing
+    endpoint = first(positional)
+    endpoint isa GlobalRef && getglobal(endpoint.mod, endpoint.name) isa KernelSpec ||
+        return nothing
+    return endpoint
+end
+
+# Direct nested-kernel calls consume graph ports. Preserve literal and computed
+# arguments as visible assignments before that call, including inside a plate.
+function _external_graph_density_call(endpoint, arguments, keywords)
+    statements = Expr[]
+    ports = Any[]
+    for argument in arguments
+        if argument isa Symbol
+            push!(ports, argument)
+        else
+            port = gensym(:_ppl_density_arg)
+            push!(statements, :($port = $argument))
+            push!(ports, port)
+        end
+    end
+    push!(statements, _external_endpoint_call(endpoint, ports, keywords))
+    return statements
+end
+
 function _external_density_statements(p)
     node = Symbol(:_ppl_prior_, p.name)
     density = GlobalRef(@__MODULE__, :sampling_logdensity)
+    graph_density = _external_graph_density(p.args)
     if !p.args.broadcast
+        if graph_density !== nothing
+            statements = _external_graph_density_call(graph_density,
+                Any[p.name, _external_arguments(p.args)[2:end]...],
+                _external_keywords(p.args))
+            statements[end] = :($node::Float64 = $(statements[end]))
+            return statements
+        end
         return Expr[:($node::Float64 = $density($(p.args.rhs), $(p.name)))]
     end
     inputs = Any[p.name]
@@ -314,9 +356,14 @@ function _external_density_statements(p)
             push!(args, _dovar(length(inputs)))
         end
     end
+    keywords = _external_cell_keywords!(inputs, p.args)
+    if graph_density !== nothing
+        cell = _external_graph_density_call(graph_density, Any[_dovar(1), args[2:end]...], keywords)
+        return _plate_sum_stmts(Symbol(:_ppl_pw_prior_, p.name), node, inputs, cell)
+    end
     rhs = if _external_call(p.args)
         _external_endpoint_call(_external_constructor(p.args), args,
-            _external_cell_keywords!(inputs, p.args))
+            keywords)
     elseif p.args.rhs isa GlobalRef
         p.args.rhs
     else
