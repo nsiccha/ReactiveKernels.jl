@@ -2550,8 +2550,39 @@ end
 # whose `sum` is not Base's (a local, a port, or a module binding of that
 # name), a fold without `init`, and one over any other iterator: a tuple's
 # fold is Base's unrolled one, which a loop over a heterogeneous tuple is not.
-_kernel_native_body(ex, mod, names) = _kernel_native_folds(ex, mod,
-    _local_symbols!(Set{Symbol}(names), ex))
+_kernel_native_body(ex, mod, names) = _kernel_native_broadcasts(
+    _kernel_native_folds(ex, mod, _local_symbols!(Set{Symbol}(names), ex)))
+
+function _kernel_native_broadcasts(ex; in_dotted::Bool = false)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert, :meta, :macrocall) && return ex
+    # Julia owns destination/alias handling for dotted assignments. Leave
+    # their entire fused RHS intact, including compound forms such as .+=.
+    startswith(String(ex.head), ".") &&
+        _kernel_tensorized_assignment_head(ex.head) && return ex
+    if ex.head === :call && !isempty(ex.args) &&
+       ex.args[1] isa Symbol && _is_broadcast_operator(ex.args[1])
+        callee = Symbol(String(ex.args[1])[2:end])
+        arguments = ex.args[2:end]
+    elseif ex.head === :. && length(ex.args) == 2 &&
+           ex.args[2] isa Expr && ex.args[2].head === :tuple
+        callee = ex.args[1]
+        arguments = ex.args[2].args
+    elseif ex.head in (Symbol(".&&"), Symbol(".||"))
+        callee = GlobalRef(Base, ex.head === Symbol(".&&") ? :andand : :oror)
+        arguments = ex.args
+    else
+        return Expr(ex.head, map(_kernel_native_broadcasts, ex.args)...)
+    end
+    any(arg -> arg isa Expr && arg.head === :parameters, arguments) && return ex
+    # Match Julia's fusion boundary: a non-dotted parent materializes its
+    # dotted children; only a directly nested dotted call stays lazy.
+    lazy = Expr(:call, GlobalRef(Base, :broadcasted), callee,
+                (_kernel_native_broadcasts(arg; in_dotted = true)
+                 for arg in arguments)...)
+    in_dotted && return lazy
+    Expr(:call, GlobalRef(@__MODULE__, :_native_broadcast_materialize), lazy)
+end
 
 function _kernel_native_folds(ex, mod, shadowed::Set{Symbol})
     mod isa Module || return ex

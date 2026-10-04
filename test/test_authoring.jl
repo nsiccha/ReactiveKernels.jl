@@ -1,3 +1,5 @@
+include("test_native_broadcast.jl")
+
 module AuthoringScopeFixture
 using ..ReactiveKernels
 
