@@ -100,9 +100,15 @@ The planner then performs these steps:
    contains selected recipes. Its available set is HAVE plus every selected
    output; its unresolved frontier is the unsatisfied WANTS plus inputs of
    selected recipes that are not yet available.
-- **Branching.** Pick the first unresolved value and branch over every candidate recipe that
-   can produce it. Non-negative costs allow pruning any branch already more
-   expensive than the incumbent.
+- **Groundability.** For a value with alternative producers, test forward
+   reachability from HAVE while withholding that value. A recipe whose only
+   non-HAVE output is that value cannot be its first producer if one of its
+   inputs remains unreachable. Such a recipe adds no value after another
+   producer has run, so discard it. Multi-output recipes that can supply other
+   non-HAVE values remain candidates.
+- **Branching.** Pick the first unresolved value and branch over every remaining
+   candidate recipe that can produce it. Non-negative costs allow pruning any
+   branch already more expensive than the incumbent.
 - **Ranking.** Rank complete selections lexicographically by total declared cost and then
    by number of recipes. Recipe identifiers provide deterministic traversal
    order; the cost is an author-supplied planning weight, not a timing estimate.
@@ -113,6 +119,13 @@ The planner then performs these steps:
 - **Recorded result.** Record the topological recipe order and one selected owner recipe for each
    produced canonical value. Collateral outputs from a non-owner recipe may be
    computed, but they never overwrite HAVE or an earlier selected owner.
+
+Groundability pruning removes inverse routes that depend on their own result,
+without choosing a heuristic plan or executing any recipe body. Exact
+optimization with arbitrary shared alternatives can still require exponential
+search; topology and declared costs determine that work, rather than parameter
+or observation counts alone. The pass preserves authored plates, scans and
+scalar laws.
 
 The result is exact for the implemented domain: a finite, acyclic graph with
 additive finite non-negative recipe costs. Search is exponential in the worst
@@ -377,6 +390,13 @@ arguments and assignment outputs. This permits repeated calls without internal
 name collisions and leaves no residual runtime call: planning, CSE, lowering,
 reactive preparation, visualization, and batching all operate on the one
 fused graph.
+
+Computed arguments and a single-output child used inside a larger expression
+compose through named, aliased, qualified and `GlobalRef` bindings. A builder
+that authors such a graph with `Core.eval` can immediately prepare and call it
+from its existing world; callers need no `invokelatest` barrier. Computed scalar
+compositions also retain ordinary Enzyme reverse from that builder. Lexical
+captures stay live and lazy arms evaluate only the selected branch.
 
 ## Batch and replica lowering
 
