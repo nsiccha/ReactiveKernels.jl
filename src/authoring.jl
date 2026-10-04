@@ -2996,7 +2996,56 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     mod = get(kwargs, :mod, nothing)
     ignored_rhs = _kernel_ignore_throw_source(rhs, mod, known)
     ignored = _kernel_operation_body(ignored_rhs, deps, known; kwargs...)
-    Expr(:call, GlobalRef(@__MODULE__, :_kernel_with_ignored_throws), normal, ignored)
+    Expr(:call, GlobalRef(@__MODULE__, :_kernel_with_ignored_throws),
+         _kernel_source_functions(normal, mod), _kernel_source_functions(ignored, mod))
+end
+
+# Convert the leaves of compiler-owned branch/reduction metadata as well as
+# ordinary fused bodies. Nested lambdas belong to the leaf's lexical scope;
+# ordinary Julia lowering handles them inside that body.
+function _kernel_source_functions(ex, mod)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    ex.head === :-> && return Expr(:call,
+        GlobalRef(@__MODULE__, :_kernel_source_function), ex, QuoteNode(ex), QuoteNode(mod))
+    Expr(ex.head, map(arg -> _kernel_source_functions(arg, mod), ex.args)...)
+end
+
+function _kernel_source_function(f, source::Expr, mod::Module)
+    # Local functions, generators and exception scopes are lowered by Julia
+    # itself. Do not reinterpret those scopes through RGF's closure converter.
+    # The native closure remains the ordinary path in its visible world.
+    _kernel_source_native_scope(source.args[2]) &&
+        return _KernelSourceFunction(f, nothing, nothing)
+    names = fieldnames(typeof(f))
+    captures = NamedTuple{names}(ntuple(i -> getfield(f, i), length(names)))
+    # Julia owns shared lexical cells too: retain their exact read/write and
+    # undefined-binding behavior rather than reconstructing Box operations.
+    any(value -> value isa Core.Box, values(captures)) &&
+        return _KernelSourceFunction(f, nothing, nothing)
+    environment = gensym(:captures)
+    bindings = [Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield),
+        environment, QuoteNode(name))) for name in names]
+    params = source.args[1]
+    params = params isa Expr && params.head === :tuple ? params.args : Any[params]
+    body = Expr(:let, Expr(:block, bindings...), source.args[2])
+    runtime_source = Expr(:->, Expr(:tuple, environment, params...), body)
+    qualified = macroexpand(mod, Expr(Symbol("hygienic-scope"), runtime_source, mod))
+    _KernelSourceFunction(f, compile(qualified), captures)
+end
+
+function _kernel_source_native_scope(ex)
+    ex isa Expr || return false
+    ex.head in (:quote, :inert) && return false
+    ex.head in (:->, :function, :generator, :try, :macrocall) && return true
+    if ex.head === :(=) && ex.args[1] isa Expr
+        signature = ex.args[1]
+        while signature isa Expr && signature.head in (:(::), :where)
+            signature = signature.args[1]
+        end
+        signature isa Expr && signature.head === :call && return true
+    end
+    any(_kernel_source_native_scope, ex.args)
 end
 
 function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
@@ -3578,7 +3627,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         if length(outputs) == 1 && authored_rhs isa Symbol && authored_rhs in known &&
            authored_rhs != outputs[1][1] && isempty(metadata) &&
            def_count[outputs[1][1]] == 1
-            op = _kernel_operation(authored_rhs, Symbol[authored_rhs], known)
+            op = _kernel_operation(authored_rhs, Symbol[authored_rhs], known; mod = mod)
             cost = 1.0
             push!(recipe_statements, :($alias_ref($graph_var,
                                      $port_values_var[$(port_indices[outputs[1][1]])],

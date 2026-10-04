@@ -378,6 +378,13 @@ name collisions and leaves no residual runtime call: planning, CSE, lowering,
 reactive preparation, visualization, and batching all operate on the one
 fused graph.
 
+Computed arguments and a single-output child used inside a larger expression
+compose through named, aliased, qualified and `GlobalRef` bindings. A builder
+that authors such a graph with `Core.eval` can immediately prepare and call it
+from its existing world; callers need no `invokelatest` barrier. Computed scalar
+compositions also retain ordinary Enzyme reverse from that builder. Lexical
+captures stay live and lazy arms evaluate only the selected branch.
+
 ## Batch and replica lowering
 
 ### Plate: fuse a scalar density across observations
