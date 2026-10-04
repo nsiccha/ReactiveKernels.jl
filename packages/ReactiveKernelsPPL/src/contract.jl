@@ -10722,13 +10722,19 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             Expr(:tuple, (Expr(:call, GlobalRef(Base, :identity), value)
                 for value in (p.name, p.args.rhs))...))
     end
-    # A matrix read only for a declared axis is a whole preparation input.
+    # An array read only for a declared axis is a whole preparation input.
     # Its row count does not become an observation count. In contrast, a
     # grouping axis retains its existing alignment and level-code contract.
     for p in plan.array_parameters
         axes = filter(_is_axis_dim, p.dims)
         isempty(axes) || push!(defs, Symbol(:_ppl_axis_input_, p.name) =>
             Expr(:tuple, axes...))
+    end
+    # A latent plate's authored iterator likewise consumes its source as a
+    # whole array. It sizes that latent block, independently of responses.
+    for p in plan.plate_parameters
+        p.range isa Union{Symbol,Expr} || continue
+        push!(defs, Symbol(:_ppl_axis_input_, p.name) => p.range)
     end
     for p in plan.array_parameters, (i, d) in enumerate(p.dims)
         _is_levels_dim(d) || continue
@@ -10779,6 +10785,12 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             # Raw scan reads are model values indexed inside the retained loop.
             # Other uses (response columns, affine columns) still pin their axis.
             continue
+        elseif f === :plate_parameters
+            for p in plan.plate_parameters
+                # Other uses of the source, including likelihood reads,
+                # still establish their usual observation alignment.
+                _drop_held_names!(free, _with(p; range=nothing))
+            end
         elseif f === :array_parameters
             for p in plan.array_parameters
                 delete!(free, p.name)
