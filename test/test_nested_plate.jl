@@ -90,3 +90,78 @@ isdefined(@__MODULE__, :NestedPlates) || include("fixtures/nested_plates.jl")
         @test N.allocated(k, data, 1.3) == 0
     end
 end
+
+@testset "Nested plate endpoint caller scope" begin
+    N = NestedPlates
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    replay = Module(gensym(:NestedEndpointReplay))
+    Core.eval(replay, :(using ReactiveKernels))
+    Core.eval(replay, Meta.parseall(N.ENDPOINT_SOURCE))
+    normal(y, mu, sigma) = -0.5*log(2*pi) - log(sigma) - 0.5*((y-mu)/sigma)^2
+
+    for name in (:object_observations, :method_observations, :computed_observations)
+        spec = getfield(N, name)
+        k = prepare(spec)
+        replay_k = prepare(getfield(replay, name))
+        outer = only(filter(r -> r.op isa ReactiveKernels._AuthoredPlateOp,
+                            k.plan.recipes))
+        inner = only(filter(r -> r.op isa ReactiveKernels._AuthoredPlateOp,
+                            plate_body(outer).recipes))
+        @test all(r -> !(r.op isa ReactiveKernels._AuthoredPlateOp),
+                  plate_body(inner).recipes)
+        @test any(r -> occursin("log(", string(r.source)), plate_body(inner).recipes)
+        @test N.head_count(code_expr(k), :for) == 2
+        @test !occursin("similar", string(code_expr(k)))
+        ast = deepcopy(code_expr(k))
+        for groups in ([[0.25, 0.9], Float64[], [0.7]],
+                       [Float64[]], Vector{Float64}[],
+                       [collect(range(-0.7, 0.9; length=17)), [0.2]])
+            original = deepcopy(groups)
+            for (mu, sigma) in ((0.1, 1.3), (-0.2, 0.7))
+                n = sum(length, groups; init=0)
+                residual_sum = sum(g -> sum(y -> y-mu, g; init=0.0), groups; init=0.0)
+                sq = sum(g -> sum(y -> (y-mu)^2, g; init=0.0), groups; init=0.0)
+                expected = sum(g -> sum(y -> normal(y, mu, sigma), g; init=0.0),
+                               groups; init=0.0)
+                @test k(groups, mu, sigma) ≈ expected
+                @test replay_k(groups, mu, sigma) ≈ expected
+                bound = prepare(spec; bound=(; groups))
+                @test bound(mu, sigma) ≈ expected
+                @test prepare(spec; want=:grouped)(groups, mu, sigma) ≈
+                      [sum(y -> normal(y, mu, sigma), g; init=0.0) for g in groups]
+                for (reader, args) in ((k, (groups, mu, sigma)), (bound, (mu, sigma)))
+                    ad = prepare_ad(reader, backend, args...; active=(:mu, :sigma))
+                    value, gradient = ad_value_and_gradient(ad, args...)
+                    @test value ≈ expected
+                    @test gradient[1] ≈ residual_sum/sigma^2
+                    @test gradient[2] ≈ -n/sigma + sq/sigma^3
+                end
+                @test groups == original
+                @test code_expr(k) == ast
+            end
+        end
+        @test k([(0.25, 0.9), (0.7,)], 0.1, 1.3) ≈
+              k([[0.25, 0.9], [0.7]], 0.1, 1.3)
+        data = [0.25, 0.9, 0.7]
+        @test k([view(data, 1:2), view(data, 3:3)], 0.1, 1.3) ≈
+              sum(y -> normal(y, 0.1, 1.3), data)
+    end
+
+    guarded = prepare(N.guarded_observations)
+    @test guarded([[0.2, 0.7], Float64[]], 0.1, 1.3) ≈
+          normal(0.2, 0.1, 1.3) + normal(0.7, 0.1, 1.3)
+    @test ad_gradient(prepare_ad(guarded, backend, [[0.2, 0.7]], 0.1, 1.3;
+                                active=:sigma), [[0.2, 0.7]], 0.1, 1.3) ≈
+          -2/1.3 + (0.1^2 + 0.6^2)/1.3^3
+    # Selected negative-scale arm preserves Julia's real log domain error.
+    @test_throws DomainError guarded([[-0.2]], 0.1, 1.3)
+    deep = prepare(N.deep_object_observations)
+    @test N.head_count(code_expr(deep), :for) == 3
+    @test deep([[[0.2], Float64[]], [[0.7]]], 0.1, 1.3) ≈
+          normal(0.2, 0.1, 1.3) + normal(0.7, 0.1, 1.3)
+    @test deep(Vector{Vector{Float64}}[], 0.1, 1.3) == 0.0
+    scanned = prepare(N.scanned_object_observations)
+    @test scanned([[0.2, 0.7], Float64[]], 0.1, 1.3) ≈
+          normal(0.2, 0.1, 1.3) + normal(0.7, 0.1, 1.3)
+    @test scanned(Vector{Float64}[], 0.1, 1.3) == 0.0
+end
