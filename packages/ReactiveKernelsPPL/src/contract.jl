@@ -686,8 +686,8 @@ Distributions.jl semantics), except the args are SHARED across cells — literal
 or scalar parameter/assignment names (per-cell vector args are a later
 increment). `range` is the plate's index set: the `Symbol` of the column `v`
 of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of bound or
-defined `v`), a literal `UnitRange{Int}` covering its consuming response's
-axis (the `1:N` case), or `nothing` (the consuming response establishes the
+defined `v`), a literal `UnitRange{Int}` defining its own cells (the `1:N`
+case), or `nothing` (the consuming response establishes the
 axis in hand-built plans). A
 real-support prior (`normal`/`cauchy`/half-versions) lays out identity (an
 unconstrained block); positive/unit support constrains per element.
@@ -2821,23 +2821,32 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
                 _fail(p.label, "arg $k references unknown name $v")
         end
         p.range === nothing && continue
-        if p.range isa Expr
-            _plate_rows(plan, p)
-            continue
-        end
         if p.range isa Symbol
             # One cell per entry of the iterated column (Julia's
-            # `eachindex(v)`), sized at the observation axis.
+            # `eachindex(v)`), with the column's own domain.
             (haskey(plan.columns, p.range) || _is_derived(plan, p.range) ||
                 any(a -> a.name === p.range, plan.assignments)) || _fail(p.label,
                 "plate over `eachindex($(p.range))`: `$(p.range)` is not bound or defined")
-            _plate_rows(plan, p)
-            continue
         end
-        n = _value_rows(plan, p.name)
-        last(p.range) == n || _fail(p.label,
-            "plate range $(p.range) covers $(length(p.range)) cells " *
-            "but its observation axis has $n rows — ranges cover eachindex exactly")
+        # The declaration owns its domain. A reduction or gather may use the
+        # whole latent array beside responses with unrelated lengths. Only
+        # aligned uses impose observation dimensions, checked below.
+        n = _plate_rows(plan, p)
+        names = Set{Symbol}([p.name])
+        for r in plan.responses
+            p.name in _response_reads(plan, r, names; whole_values=true) || continue
+            if r.response in plan.indexed_observations
+                indices = _response_range_indices(plan, r)
+                checkindex(Bool, Base.OneTo(n), indices) || _fail(p.label,
+                    "latent vector $(p.name) does not cover the authored " *
+                    "response range $(repr(r.range))")
+                continue
+            end
+            m = _response_rows(plan, r)
+            (n == m || n == 1 || m == 1) || _fail(p.label,
+                "latent vector $(p.name) has $n cells, which cannot broadcast " *
+                "with the $m rows of $(r.response)")
+        end
     end
     return nothing
 end
@@ -3351,23 +3360,39 @@ end
 
 """Per-observation columns (of `perobs`) a response reads: the names its
 own fields hold, then — transitively — the names every predictor, derived
-column and definition among them holds."""
+column and definition among them holds. `whole_values=true` follows composed
+expressions and treats reductions as whole-array reads for latent-domain
+validation, without changing the default observation-axis classification."""
 function _response_reads(plan::StructuralPlan, r,
-        perobs::Set{Symbol})
+        perobs::Set{Symbol}; whole_values::Bool=false)
     nodes = _observation_nodes(plan)
     cands = union(perobs, keys(nodes))
+    function record_reads(x)
+        free = copy(cands)
+        _drop_held_names!(free, x)
+        return setdiff(cands, free)
+    end
     function held(x)
         if x isa Expr
             whole, aligned = Set{Symbol}(), Set{Symbol}()
             # A gather consumes its source whole. Module-call arguments
             # also carry their own axes rather than the result's axis.
-            _classify_reads!(whole, aligned, x, cands, false)
+            _classify_reads!(whole, aligned, x, cands, false;
+                reductions_whole=whole_values)
             return aligned
         end
-        free = copy(cands)
-        _drop_held_names!(free, x)
-        return setdiff(cands, free)
+        return record_reads(x)
     end
+    # A composed term's columns are dependency metadata, not aligned reads.
+    # Follow its mathematical expression so reductions and gathers retain
+    # their own domains, even when nested under predictor records.
+    held(x::TermSpec) = !whole_values ? record_reads(x) :
+        x.kind === ComposedTerm ? held(x.options.tree) :
+            union(held(x.columns), held(x.options))
+    held(x::PredictorSpec) = whole_values ?
+        reduce(union, (held(t) for t in x.terms); init=Set{Symbol}()) : record_reads(x)
+    held(x::Tuple) = whole_values ?
+        reduce(union, (held(v) for v in x); init=Set{Symbol}()) : record_reads(x)
     reads = Set{Symbol}()
     seen = Set{Symbol}()
     queue = collect(held(r))
@@ -6582,7 +6607,7 @@ function _validate_plate_parameters(plan::StructuralPlan)
         _validate_support_override(p.label, p.family, p.support_override, p.args)
         if p.range isa UnitRange
             r = p.range
-            (first(r) == 1 && last(r) >= 1) || _fail(p.label,
+            first(r) == 1 || _fail(p.label,
                 "plate range must start at 1 (`1:N`), got $(first(r)):$(last(r))")
         elseif p.range isa Expr
             r = p.range
@@ -10857,50 +10882,53 @@ end
 
 _conditioned_input(name::Symbol) = Symbol("_rkppl_conditioned_", name)
 _has_observation_axis(plan) = !isempty(plan.responses) || !isempty(plan.kernel_plates) ||
-    !isempty(plan.plate_parameters) || !isempty(plan.scans) || !isempty(plan.dar_paths)
+    any(p -> p.range === nothing, plan.plate_parameters) ||
+    !isempty(plan.scans) || !isempty(plan.dar_paths)
 
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
 # inside an argument of an undotted module call into `whole`, anywhere
 # else into `per_obs`.
 function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
-        raw::AbstractSet{Symbol}, inside::Bool)
+        raw::AbstractSet{Symbol}, inside::Bool; reductions_whole::Bool=false)
+    visit(a, context) = _classify_reads!(whole, per_obs, a, raw, context;
+        reductions_whole)
     if ex isa Symbol
         ex in raw && push!(inside ? whole : per_obs, ex)
     elseif ex isa Expr
         if _is_plate_column_call(ex) && _plate_column_axis(ex) !== nothing
             axis = _plate_column_axis(ex)
             for a in ex.args[3:end]
-                _classify_reads!(whole, per_obs, a, raw, a !== axis)
+                visit(a, a !== axis)
             end
         elseif ex.head === :call && length(ex.args) == 3 &&
                 ex.args[1] === :_ppl_codes
-            _classify_reads!(whole, per_obs, ex.args[2], raw, inside)
-            _classify_reads!(whole, per_obs, ex.args[3], raw, true)
+            visit(ex.args[2], inside)
+            visit(ex.args[3], true)
         elseif _is_plate_column_expr(ex)
             for a in ex.args[1].args[2:end]
                 shared = _is_ref_call(a)
-                _classify_reads!(whole, per_obs, shared ? a.args[2] : a,
-                    raw, inside || shared)
+                visit(shared ? a.args[2] : a, inside || shared)
             end
         elseif ex.head === :kw && length(ex.args) == 2
-            _classify_reads!(whole, per_obs, ex.args[2], raw, inside)
+            visit(ex.args[2], inside)
         elseif ex.head === :call
-            inner = inside || (!isempty(ex.args) && ex.args[1] isa GlobalRef)
+            inner = inside || (!isempty(ex.args) && (ex.args[1] isa GlobalRef ||
+                reductions_whole && ex.args[1] in REDUCTION_FNS))
             for a in ex.args[2:end]
-                _classify_reads!(whole, per_obs, a, raw, inner)
+                visit(a, inner)
             end
         elseif _is_dotted_call(ex)
             for a in ex.args[2].args
-                _classify_reads!(whole, per_obs, a, raw, inside)
+                visit(a, inside)
             end
         elseif ex.head === :ref && length(ex.args) == 2
             # A gather `v[c]` takes the gathered value whole; its index
             # keeps the surrounding context.
-            _classify_reads!(whole, per_obs, ex.args[1], raw, true)
-            _classify_reads!(whole, per_obs, ex.args[2], raw, inside)
+            visit(ex.args[1], true)
+            visit(ex.args[2], inside)
         else
             for a in ex.args
-                _classify_reads!(whole, per_obs, a, raw, inside)
+                visit(a, inside)
             end
         end
     end

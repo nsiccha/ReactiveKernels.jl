@@ -12,10 +12,12 @@ end
     # The documented default optimizer expands small constant loop bounds.
     # Verify that size with the existing retained-loop pipeline; inspect both
     # pipelines at larger sizes instead of treating small unrolling as support.
-    for (pipeline, optimize, n) in ((:retained, retained, 3),
-        (:retained, retained, 9), (:retained, retained, 17),
-        (:default, :all, 9), (:default, :all, 17))
-        fx = _latent_axis_fixture(n)
+    for (pipeline, optimize, n, iterator) in ((:retained, retained, 3, :eachindex),
+        (:retained, retained, 9, :eachindex), (:retained, retained, 17, :eachindex),
+        (:default, :all, 9, :eachindex), (:default, :all, 17, :eachindex),
+        (:default, :all, 0, :literal), (:default, :all, 1, :literal),
+        (:default, :all, 9, :literal))
+        fx = _latent_axis_fixture(n; iterator)
         saved = deepcopy(fx.data)
         ru = Reactant.to_rarray(fx.u)
         kernel = fx.sampler.kernel
@@ -32,13 +34,14 @@ end
             end
             # Complete inventories are diagnostics: shape specialization and
             # reduction stages may change without replicating authored bodies.
-            println("LATENT_AXIS_IR pipeline=", pipeline, " n=", n, " direction=", direction,
+            println("LATENT_AXIS_IR pipeline=", pipeline, " iterator=", iterator,
+                " n=", n, " direction=", direction,
                 " operations=", sort!(collect(_latent_axis_inventory(mlir)); by=first))
             if haskey(ENV, "RKPPL_LATENT_AXIS_IR_DIR")
                 dir = ENV["RKPPL_LATENT_AXIS_IR_DIR"]
                 mkpath(dir)
-                write(joinpath(dir, "$pipeline-$n-$direction.mlir"), mlir)
-                write(joinpath(dir, "$pipeline-$n-$direction.hlo"), hlo)
+                write(joinpath(dir, "$pipeline-$iterator-$n-$direction.mlir"), mlir)
+                write(joinpath(dir, "$pipeline-$iterator-$n-$direction.hlo"), hlo)
             end
         end
         @test Array(ru) == fx.u

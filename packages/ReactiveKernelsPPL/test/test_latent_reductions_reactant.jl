@@ -16,6 +16,7 @@ function _compiled_latent_reduction(fx, label)
         @test Float64(primal(r)) ≈ fx.oracle(u) rtol=1e-10
         @test Float64(value) ≈ native rtol=1e-10
         @test Array(compiled_gradient) ≈ gradient rtol=1e-9 atol=1e-9
+        @test Array(r) == u
     end
     @test fx.inputs == original
     if haskey(ENV, "RK_LATENT_REDUCTION_IR_DIR")
@@ -52,4 +53,13 @@ end
         fx = _latent_reduction_fixture(:sum, 9; position)
         Base.invokelatest(_compiled_latent_reduction, fx, "sum-$position-9")
     end
+    for (n, n1, n2, position) in ((9, 2, 3, :inline),
+        (9, 7, 11, :inline), (19, 13, 17, :inline),
+        (9, 5, 11, :named), (9, 0, 3, :derived))
+        fx = _latent_reduction_fixture(:sum, n; iterator=:literal, n1, n2, position)
+        Base.invokelatest(_compiled_latent_reduction, fx,
+            "literal-$position-$n-$n1-$n2")
+    end
+    fx = _latent_reduction_fixture(:sum, 9; iterator=:literal, position=:indexed)
+    Base.invokelatest(_compiled_latent_reduction, fx, "literal-indexed-9")
 end
