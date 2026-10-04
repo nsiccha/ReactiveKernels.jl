@@ -10003,7 +10003,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
     if loc isa Symbol && haskey(ctx.detmap, loc) && _derived_reads_latent(loc, ctx) &&
-            !_is_design_shaped(loc, ctx)
+            !_is_design_shaped(loc, ctx) && !_scalar_location_value(loc, ctx)
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
     if loc isa Symbol
@@ -10239,7 +10239,8 @@ _scalar_location_value(loc, ctx) =
 function _scalar_location_reads(loc, ctx,
         seen::Set{Symbol} = Set{Symbol}(); allow_data::Bool = false)
     if loc isa Symbol
-        haskey(ctx.detmap, loc) || return (allow_data && loc in ctx.data) ||
+        haskey(ctx.detmap, loc) || return (allow_data &&
+            (loc in ctx.data || loc in ctx.plate_names)) ||
             (loc in ctx.prior_names && loc ∉ ctx.sized_decls &&
                 loc ∉ ctx.vector_params)
         loc in seen && return false

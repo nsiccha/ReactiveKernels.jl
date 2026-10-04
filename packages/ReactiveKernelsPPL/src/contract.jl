@@ -5909,16 +5909,7 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
                 _collect_vector_refs!(refs, arg, plan, label, bound)
                 return nothing
             end
-            arg isa Symbol || _fail(label,
-                "reduction $fn argument must be an array value")
-            (!bound || haskey(plan.columns, arg) || _is_derived(plan, arg)) ||
-                _fail(
-                    label,
-                    "reduction $fn argument $arg is not a bound column or " *
-                    "derived name",
-                )
-            _is_derived(plan, arg) && push!(refs, arg)
-            return nothing
+            return _collect_vector_reduction!(refs, ex, plan, label, bound)
         end
         for arg in ex.args[2:end]
             _collect_assignment_refs!(refs, arg, plan, label, bound)
@@ -6226,7 +6217,10 @@ function _collect_vector_reduction!(refs, ex, plan, label, bound::Bool)
         "reduction $fn argument must be a bare column or derived name " *
         "(stage nested transforms as their own `name = ...` first)",
     )
-    if _is_derived(plan, arg)
+    # Reductions read a graph value whole, including latent plate vectors,
+    # declared arrays and scan states. Keep its dependency edge just as for
+    # a derived value; its observation axis is irrelevant to the reduction.
+    if arg in _all_names(plan)
         push!(refs, arg)
         return nothing
     end
