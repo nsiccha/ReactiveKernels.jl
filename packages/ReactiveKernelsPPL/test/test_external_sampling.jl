@@ -15,12 +15,18 @@ struct NormalDensity{T}
 end
 const standard_normal = NormalDensity(0.0)
 normal_lpdf(x, mu) = -log(2pi)/2 - (x-mu)^2/2
+function threshold_lpdf(y, mu, add, prop, limit)
+    sigma = sqrt(add^2 + (mu*prop)^2)
+    law = Distributions.Normal(mu, sigma)
+    y <= limit ? Distributions.logcdf(law, limit) : Distributions.logpdf(law, y)
+end
 keyword_lpdf(x, lower; rate=1.0) = x > lower ? log(rate)-rate*(x-lower) : -Inf
 ReactiveKernelsPPL.sampling_logdensity(d::NormalDensity, x) = normal_lpdf(x, d.mu)
 
 struct ShiftExp{T}
     lower::T
 end
+
 ReactiveKernelsPPL.sampling_logdensity(d::ShiftExp, x) = x > d.lower ? -(x-d.lower) : -Inf
 shift_constrain(u, shape, lower) = lower + exp(u[1])
 shift_unconstrain(x, shape, lower) = [log(x-lower)]
@@ -359,4 +365,47 @@ end
     replay = Core.eval(@__MODULE__, :(@kernel $(Meta.parse(source))))
     query = prepare_query((;spec=replay, layout=built.layout), plan, :sampler)
     @test Base.invokelatest(query, u) ≈ reference(u)
+end
+
+@testset "caller-owned inclusive threshold law with live additive/proportional scale" begin
+    # Independent public mathematics from the original report. This is a
+    # density fixture, not a builtin statistical family or custom derivative.
+    for n in (0, 3, 11), rowwise in (false, true)
+        x = [0.2sin(i) for i in 1:n]
+        limit = rowwise ? [0.1+0.02i for i in 1:n] : 0.3
+        y = [(rowwise ? limit[i] : limit) +
+            (mod(i, 3) == 1 ? -0.2 : mod(i, 3) == 2 ? 0.0 : 0.4) for i in 1:n]
+        data = Dict(:y=>y, :x=>x, :limit=>limit)
+        plan, built = _external_built(quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            add ~ Exponential(1)
+            prop ~ Exponential(1)
+            mu = a .+ b .* x
+            y .~ LogDensity.(ExternalSamplingFixtures.threshold_lpdf, mu, add, prop, limit)
+        end, data)
+        u = [0.2, -0.3, log(0.7), log(0.25)]
+        function oracle(w)
+            a, b, add, prop = w[1], w[2], exp(w[3]), exp(w[4])
+            points = map(eachindex(y)) do i
+                mu = a+b*x[i]
+                sigma = hypot(add, mu*prop)
+                ll = rowwise ? limit[i] : limit
+                law = ExternalSamplingFixtures.Distributions.Normal(mu, sigma)
+                y[i] <= ll ? ExternalSamplingFixtures.Distributions.logcdf(law, ll) :
+                    ExternalSamplingFixtures.Distributions.logpdf(law, y[i])
+            end
+            prior = -log(2pi)-(a^2+b^2)/2-add-prop
+            return points, prior, sum(points; init=0.0)+prior+w[3]+w[4]
+        end
+        points, prior, sampler = oracle(u)
+        @test length(coordinate_names(built.layout)) == 4
+        @test _external_value(built, plan, u, :pointwise).y ≈ points
+        @test _external_value(built, plan, u, :likelihood) ≈ sum(points; init=0.0)
+        @test _external_value(built, plan, u, :prior) ≈ prior
+        @test _external_value(built, plan, u) ≈ sampler
+        _external_gradient(built, plan, u, w->last(oracle(w)))
+    end
+    @test ExternalSamplingFixtures.threshold_lpdf(-0.2, 0.3, 0.7, 0.2, 0.1) ==
+        ExternalSamplingFixtures.threshold_lpdf(0.1, 0.3, 0.7, 0.2, 0.1)
 end
