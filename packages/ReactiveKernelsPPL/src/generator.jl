@@ -1299,11 +1299,17 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
         append!(stmts, kstmts)
         push!(terms, kterm)
     end
+    for p in plan.external_observations
+        append!(stmts, _external_density_statements(p))
+        push!(terms, Symbol(:_ppl_prior_, p.name))
+        push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
+    end
     observed = _density_selection(plan, n -> n in plan.conditioned)
     _parameter_prior_statements!(stmts, terms, observed, layout;
         prefix = :_ppl_condition_, group_scalars = false)
     for p in observed.parameters
-        push!(points, p.name => Symbol(:_ppl_prior_, p.name))
+        push!(points, p.name => Symbol(
+            p.family === :external && p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
     end
     for p in observed.vector_parameters
         _vector_parameter_prior_stmts!(stmts, terms, p)
@@ -1313,8 +1319,13 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
         push!(points, p.name => value)
     end
     for p in observed.plate_parameters
-        _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-            p.support_override; conditioned = true, rows = _plate_rows(plan, p))
+        if p.family === :external
+            append!(stmts, _external_density_statements(p))
+            push!(terms, Symbol(:_ppl_prior_, p.name))
+        else
+            _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
+                p.support_override; conditioned = true, rows = _plate_rows(plan, p))
+        end
         push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
     _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points)
@@ -3913,6 +3924,11 @@ function _parameter_prior_statements!(stmts, terms, plan, layout;
     for p in plan.parameters
         p.name in grouped && continue
         node = Symbol(:_ppl_prior_, p.name)
+        if p.family === :external
+            append!(stmts, _external_density_statements(p))
+            push!(terms, node)
+            continue
+        end
         prior = _sampled_prior_expr(p; pre = stmts, conditioned = p.name in plan.conditioned)
         push!(stmts, :($node::Float64 = $prior))
         push!(terms, node)
@@ -4017,8 +4033,13 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
     # `@kernel` plate expander, exactly as the Gaussian-likelihood scale is
     # threaded.
     for p in plan.plate_parameters
-        _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-            p.support_override; rows = _plate_rows(plan, p))
+        if p.family === :external
+            append!(stmts, _external_density_statements(p))
+            push!(terms, Symbol(:_ppl_prior_, p.name))
+        else
+            _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
+                p.support_override; rows = _plate_rows(plan, p))
+        end
     end
     # Spline coefficient vectors: the same plate-prior shape (broadcast the
     # shared prior over cells). `b_fixed` is flat — a 0.0 node, mirroring a

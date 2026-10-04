@@ -77,6 +77,7 @@ export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
+export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
 export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
     horseshoe_coefs, penalized_smooth, t2_smooth, hsgp_effect,
@@ -120,6 +121,7 @@ export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
     prepare_transit_twocmt_rule
 
 include("contract.jl")
+include("sampling.jl")
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 # The general numerical callables and rule graphs are owned by RK proper;
 # existing PPL-qualified names import those same bindings for compatibility.
