@@ -425,6 +425,35 @@ This is dependency-stratified map-plus-reduce/collect. It is not a general scan,
 fold with loop-carried state, segmented reduction, parallel reduction,
 associative tree reduction, or an effect-ordering construct.
 
+### Nested observation plates
+
+An authored plate cell can contain another authored plate. Native lowering
+retains each axis as a runtime loop and fuses a selected `sum` into its plate;
+a total-only reader needs no intermediate pointwise arrays. Ragged groups,
+empty groups, and array views use the same graph and generated loop structure.
+`Ref` marks a value shared across the current axis, including the scale passed
+from a group cell to its observation cells.
+
+The example below keeps the complete normalized scalar Normal law visible in
+the inner graph. Its source is shared with native acceptance; the documentation
+build executes it and renders that reader's generated kernel and compute DAG.
+
+```@eval
+Main.ReactiveKernelsDocs.render_nested_plate_example(@__MODULE__)
+```
+
+`plate_body` exposes the nested scalar plans. `prepare` supports bound group
+data with a live scalar scale, and `prepare_ad` with ordinary native Enzyme
+Reverse differentiates the scale through both loops. No custom derivative
+rule is required. The native acceptance suite also replays the displayed
+authoring source in a fresh module without its producer's operation table.
+
+Compiled nested plate regions are not implemented yet: traced execution reports
+that capability gap explicitly. Native lowering of a cell containing another
+plate currently executes the whole selected cell graph per outer coordinate;
+it does not apply the scalar-only plate scheduler's outer invariant hoisting
+across that boundary.
+
 ### Prepared-kernel composition is flattened
 
 If an outer `@kernel` calls a prepared RK kernel, `prepare` treats it as

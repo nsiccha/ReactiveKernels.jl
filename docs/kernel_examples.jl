@@ -1066,6 +1066,14 @@ toolchain (user decision `00jueci`).
 render_inert_source(source::AbstractString) =
     Markdown.MD(Markdown.Code("julia", strip(source, '\n')))
 
+# The public Normal observation example is the same source replayed in native
+# acceptance. All three panels come from the kernel executed in this sandbox.
+function render_nested_plate_example(mod::Module)
+    fixture = joinpath(pkgdir(ReactiveKernels), "test", "fixtures", "nested_plates.jl")
+    isdefined(mod, :NestedPlates) || Base.include(mod, fixture)
+    execute_example(mod, getfield(mod, :NestedPlates).DOCS_SOURCE)
+end
+
 # Pathfinder is an external compiler-acceptance artifact, so the documentation
 # loads its reviewed benchmark fixture instead of maintaining a second copy of
 # the mathematics.  The raw pane is extracted from that same file through the

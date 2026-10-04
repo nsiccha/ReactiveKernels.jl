@@ -127,11 +127,13 @@ end
     @test tbound.f isa ReactiveKernels._EmbeddedFunctionPair
     @test tbound(dose) ≈ ref
 
-    # Provably scalar live ports still throw the contract error.
+    # The axis is already bound. A scalar live port needs no runtime array
+    # marker; it selects the native body while retaining the bound axis.
     souter = C.embedded_dose_outer_graph(; dose_type = Float64)
-    @test_throws ArgumentError prepare(
+    sbound = prepare(
         souter.graph; have = (souter.schedule, souter.dose),
         want = souter.result, bound = [souter.schedule => schedule])
+    @test sbound(0.5) ≈ 2 .* plan_axis .+ 0.5
 end
 
 @kernel authored_standard_normal() = begin
@@ -1302,34 +1304,6 @@ _plate_gather_allocated(k, plan, units, weights) = @allocated k(plan, units, wei
     @test growth(:exact) <= per_cell_output + 64
     # The vector-temporary cell allocates several small arrays per cell.
     @test growth(:broadcast) > 100 * (513 - 257)
-end
-
-@testset "authored plate block: nested plate inside a cell is rejected" begin
-    # Before the authoring check this expanded and prepared, then called the
-    # wrong operation with the wrong arguments at the first invocation
-    # (`MethodError: no method matching -(::Vector{Int64}, ::Vector{Float64}, …)`).
-    @test_throws ArgumentError macroexpand(@__MODULE__, quote
-        @kernel nested_plate_in_cell(xs, ys) = begin
-            out = plate(xs, Ref(ys)) do x, shared
-                inner = plate(shared, Ref(x)) do y, xi
-                    xi * y
-                end
-                sum(inner)
-            end
-            return out
-        end
-    end)
-    # A nested plate deeper in an expression is rejected too.
-    @test_throws ArgumentError macroexpand(@__MODULE__, quote
-        @kernel nested_plate_in_sum(xs, ys) = begin
-            out = plate(xs, Ref(ys)) do x, shared
-                sum(plate(shared, Ref(x)) do y, xi
-                    xi * y
-                end)
-            end
-            return out
-        end
-    end)
 end
 
 # --- the natural superposition cell (snag one-natural-supe-39da86a4)
