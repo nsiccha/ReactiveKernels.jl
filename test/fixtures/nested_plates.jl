@@ -121,6 +121,34 @@ docs_example = (; name = :nested_observation_plate,
     return out
 end
 
+# Computed axes and several shared ports require concrete type propagation
+# through a materialized inner plate followed by its sum consumer.
+@kernel indexed_projection(matrix, rates, groups, parameters::Vector{Float64}) = begin
+    scale = parameters[1]
+    decay = parameters[2]
+    coefficients = reshape(parameters[4:end], 2, size(matrix, 2))
+    projected = plate(axes(matrix, 1), groups, Ref(matrix), Ref(rates),
+                      Ref(scale), Ref(decay), Ref(coefficients)) do i, g, matrix, rates, scale, decay, coefficients
+        terms = plate(axes(matrix, 2), Ref(i), Ref(g), Ref(matrix), Ref(rates),
+                      Ref(scale), Ref(decay), Ref(coefficients)) do j, i, g, matrix, rates, scale, decay, coefficients
+            weight = scale * exp(-decay * rates[j])
+            matrix[i, j] * weight * coefficients[g, j]
+        end
+        sum(terms)
+    end
+    values() = projected
+end
+
+@kernel indexed_loss(matrix, rates, groups, targets, parameters::Vector{Float64}) = begin
+    predictions = indexed_projection(matrix, rates, groups, parameters).values()
+    shifted = parameters[3] .* ones(length(targets)) .+ predictions
+    errors = plate(shifted, targets) do prediction, target
+        (prediction - target)^2
+    end
+    total = sum(errors)
+    return total
+end
+
 @kernel inline_product(xs, ys) = begin
     out = plate(xs, Ref(ys)) do x, shared
         sum(plate(shared, Ref(x)) do y, xi
