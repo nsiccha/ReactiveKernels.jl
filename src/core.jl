@@ -284,8 +284,21 @@ end
     bc.axes === nothing || return Base.materialize(bc)
     ax = Base.@inline Base.Broadcast.combine_axes(bc.args...)
     ready = Base.Broadcast.Broadcasted(bc.style, bc.f, bc.args, ax)
-    Base.materialize(ready)
+    _native_broadcast_copy(Base.Broadcast.instantiate(ready))
 end
+
+@inline function _native_broadcast_copy(bc)
+    T = Base.Broadcast.combine_eltypes(bc.f, bc.args)
+    isconcretetype(T) || return Base.materialize(bc)
+    _native_broadcast_copyto!(similar(bc, T), bc)
+end
+@inline _native_broadcast_copyto!(dest, bc) = copyto!(dest, bc)
+# `similar` has just allocated this dense output, so no input can alias it.
+# Extrude with no destination before Base's copy loop: checking aliasing against
+# the output would needlessly mix a constant input with a possible fresh copy.
+# Other destination types retain their specialized copy/alias protocol.
+@inline _native_broadcast_copyto!(dest::Array, bc) =
+    copyto!(dest, Base.Broadcast.preprocess(nothing, bc))
 
 # Nested dotted calls stay lazy so Julia's broadcast fusion survives the
 # tensorized lowering: only the OUTERMOST dotted call of a nest materializes
