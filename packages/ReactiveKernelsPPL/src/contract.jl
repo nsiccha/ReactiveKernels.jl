@@ -682,9 +682,8 @@ One per-cell latent parameter VECTOR (`@plate` sampling statement, e.g.
 `theta ~ Normal(mu, tau)`): `size` independent draws from `family`, one per
 plate cell, packed as one contiguous block. `family`/`args`/`support_override`
 follow [`SampledParameter`](@ref) exactly (POSITIONAL `(arg1, …)` keys,
-Distributions.jl semantics), except the args are SHARED across cells — literals
-or scalar parameter/assignment names (per-cell vector args are a later
-increment). `range` is the plate's index set: the `Symbol` of the column `v`
+Distributions.jl semantics). Arguments may be shared scalars or per-cell
+data/derived columns. `range` is the plate's index set: the `Symbol` of the column `v`
 of an `eachindex(v)` / `axes(v, 1)` plate (one cell per entry of bound or
 defined `v`), a literal `UnitRange{Int}` defining its own cells (the `1:N`
 case), or `nothing` (the consuming response establishes the
@@ -2806,8 +2805,8 @@ function _validate_varying_levels_shape(d::VaryingDraws)
     return nothing
 end
 
-# A literal plate range covers its consuming response's axis, mirroring
-# the response-range cover check.
+# A latent plate owns its declared domain; aligned response uses must cover
+# their authored indices or obey Julia's broadcast dimensions.
 function _validate_plate_parameters_data(plan::StructuralPlan)
     scalarnames = _union_names(plan)
     derivednames = Set{Symbol}(d.name for d in plan.derived)
@@ -3342,7 +3341,9 @@ function _observation_nodes(plan::StructuralPlan)
         nodes[hb.id] = (hb.axes, hb.by)
     end
     for p in plan.plate_parameters
-        nodes[p.name] = (p.range, p.args)
+        # The iterator determines the latent array's extent. Prior inputs
+        # affect its density, but do not join a consuming response's axis.
+        nodes[p.name] = p.range
     end
     for s in plan.scans, state in s.states
         nodes[state] = s.hi
@@ -6571,8 +6572,8 @@ end
 # scalar SampledParameters. Prior args are either SHARED across cells (a
 # literal or a scalar parameter/assignment name) or PER-CELL (a derived column,
 # giving a varying prior mean/scale — the varying-intercept shape); never
-# another latent vector. The range names its own column or covers the
-# consuming response's axis; `nothing` infers that axis at binding.
+# another latent vector. The range declares its own domain; `nothing`
+# infers a consuming response's axis at binding.
 function _validate_plate_parameters(plan::StructuralPlan)
     for p in plan.plate_parameters
         if p.family === :external
@@ -10700,8 +10701,9 @@ axis — any length or shape, like the model-level values computed from
 it — and it neither anchors nor crosses `n_obs`. Any other read keeps a
 column observation-aligned: a definition read outside those positions
 (`gx .+ 1` in a predictor, `f.(gx)`, `mean(gx)`, a gather index), or any
-name a response, predictor, plate or other slot holds (a slot added later
-stays fail-closed). Returns `(inputs, defs)`: the columns, and the
+name an observation-bearing structural slot holds (new slots remain
+fail-closed). Prior-only reads keep their declared latent domain.
+Returns `(inputs, defs)`: the columns, and the
 whole-context definitions (whose values may have any length too)."""
 function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     # A column with no value consumer has no observation axis. Infer this
@@ -10724,10 +10726,10 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         push!(defs, m.name => Expr(:call, GlobalRef(Base, :hcat),
             (c for c in m.columns if c !== nothing)...))
     end
-    # Scalar and declared-array prior arguments are whole model values.
+    # Scalar, declared-array and latent-plate prior arguments are model values.
     # Propagate that context through their definitions just as for a
     # module-call argument; their raw data have no observation axis.
-    for ps in (plan.parameters, plan.array_parameters), p in ps
+    for ps in (plan.parameters, plan.array_parameters, plan.plate_parameters), p in ps
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
         p.family === :external && p.name in plan.conditioned && push!(defs,
@@ -10806,9 +10808,10 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             continue
         elseif f === :plate_parameters
             for p in plan.plate_parameters
-                # Other uses of the source, including likelihood reads,
-                # still establish their usual observation alignment.
-                _drop_held_names!(free, _with(p; range=nothing))
+                # The iterator and prior inputs belong to this latent domain.
+                # Other uses, including likelihood reads, still pin their
+                # usual observation alignment in the same dependency analysis.
+                delete!(free, p.name)
             end
         elseif f === :array_parameters
             for p in plan.array_parameters
