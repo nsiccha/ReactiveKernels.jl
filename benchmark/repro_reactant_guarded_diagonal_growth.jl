@@ -82,11 +82,13 @@ end
     @test_broken allequal(retained)
     # Require retained iteration and bounded nonlinear work after default XLA,
     # including the K=2 one-trip body. The marker describes stock Reactant.
+    # The contract requires real data-derived iteration, not an exact number
+    # of primal/reverse loops. Equivalent AD may fuse or remove unused work.
     # Pure guard conditionals are diagnostic (docs/src/constraints.md); their
     # absence alone does not fail the value/ordinary-gradient checks above.
     println("guarded diagonal executable conditional counts: ",
         [map(ops -> get(ops, "conditional", 0), pair) for pair in executable])
     @test_broken all(pair ->
-        get(pair[1], "while", 0) == 1 && get(pair[2], "while", 0) == 2 &&
+        all(ops -> get(ops, "while", 0) > 0, pair) &&
         all(ops -> get(ops, "log", 0) == 1, pair), executable)
 end
