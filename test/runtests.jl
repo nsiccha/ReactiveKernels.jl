@@ -60,6 +60,7 @@ const _MATRIX_CORE_TESTS = (
     "test_authored_plate.jl",
     "test_nested_plate.jl",
     "test_authored_scan.jl",
+    "test_scan_endpoint_scope.jl",
     "test_replica.jl",
     "test_precompiled_prepared.jl",
     "test_position_batching.jl",
