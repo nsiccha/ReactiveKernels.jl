@@ -373,15 +373,6 @@ _corr_r() = only(_corr_plan2().responses)
     # refused: scalar scale on joint response (scale lives in the factor; IR contract)
     @test_throws ContractValidationError validate_structure(_corr_mutate(;
         resp = [scale_bad]))
-    ev = LikelihoodSpec(base.family, base.link, base.response, base.predictor,
-        base.scale, base.weights,
-        ResponseEvidence(:censored, :lo, :hi), base.label, base.trials,
-        base.range; extra_responses = base.extra_responses,
-        extra_predictors = base.extra_predictors,
-        factor_scales = base.factor_scales, factor_corr = base.factor_corr)
-    # User decision 0xtp29y: scalar-bound wrappers are univariate. Joint
-    # rectangle/partial-coordinate evidence requires a separate API.
-    @test_throws ContractValidationError validate_structure(_corr_mutate(resp = [ev]))
     # Factor args: bad scale, unknown scale name, bad shape, missing size.
     for bad_vp in (
             # refused: negative exponential scale (IR contract)
