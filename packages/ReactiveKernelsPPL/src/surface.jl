@@ -802,9 +802,9 @@ model-level value — exactly as the definition `s = 2.0` would read, except
 that `bind_data` binds the number and the kernel takes it as a typed
 scalar argument (`y .~ Normal.(mu, s)` broadcasts it, as Julia does).
 Every `@rkppl` entry point (the model call, `@rkppl data`, `merge` pins)
-lowers with the values. Given names only, a name the model reads per
-observation lowers as per-observation data, and binding a number to it
-fails naming this method. A number bound to a response is one observation.
+lowers with the values. Given names only, binding a number to an ordinary
+broadcast argument also keeps Julia's scalar broadcasting. A number bound
+to a response is one observation.
 """
 lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=()) =
     lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned)
@@ -920,7 +920,9 @@ end
 
 function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
-        conditioned::Set{Symbol} = Set{Symbol}())
+        conditioned::Set{Symbol} = Set{Symbol}(),
+        value_defs::Set{Symbol} = Set{Symbol}())
+    input_data = data
     for name in conditioned
         input = _conditioned_input(name)
         (input in data || _mentions_symbol(ast, input)) &&
@@ -1164,13 +1166,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
     # All other vector definitions stay symbolic as named locals.
     structural = _structural_defs(det, data, canonmap, coef_priors,
         prior_names, plate_names)
+    setdiff!(structural, value_defs)
     vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
         plate_names)
     # Interned predictors by name (shared with `ctx`: a composition over a
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
-    ctx = (; data, mod, conditioned, detmap = canonmap, prior_names, coef_priors,
+    ctx = (; data, mod, conditioned, value_defs, detmap = canonmap,
+        prior_names, coef_priors,
         ordinary_parameters,
         detshape, shape_env, declaration_data,
         vecdefs, structural, derived_responses = derived_response_names,
@@ -1455,6 +1459,16 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, pins, mod::Module;
         push!(kept, nm)
         delete!(skip, nm)
         append!(pending, _value_symbols(canonmap[nm]))
+    end
+    # A predictor optimization cannot also claim a definition retained by
+    # an ordinary value reader. Replan those names as values; the set only
+    # grows, so every retry releases at least one conflicting definition.
+    # Explicit whole-predictor constructs retain their ownership contract.
+    retained = setdiff(intersect(kept, Set(p.name for p in predictors)),
+        value_defs)
+    if semantic_first && !isempty(retained)
+        return _lower_rkppl_once(ast, input_data, pins, mod;
+            submodel_scopes, conditioned, value_defs = union(value_defs, retained))
     end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
@@ -9993,10 +10007,10 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             return _lower_location_symbol_error(lhs, loc, ctx; bare,
                 value)
         end
-        # Ordinary matrix values broadcast in a response slot. Keep the
-        # authored value, including aliases, when axes or another definition
-        # also reads it; a predictor with its name would shadow that value.
-        value && !bare && _canon_shape(loc, ctx) === :matrix &&
+        # Retained definitions and ordinary matrix values keep their names
+        # for every reader; a predictor cannot shadow the authored value.
+        value && !bare &&
+            (loc in ctx.value_defs || _canon_shape(loc, ctx) === :matrix) &&
             return _value_location!(lhs, loc, pred_link, ctx,
                 predictors, pred_idx; synth)
         # Scalar definitions stay ordinary values, except for the already
@@ -10260,7 +10274,8 @@ function _value_location!(lhs, loc, pred_link, ctx, predictors,
     # ordinary scalar definitions, rather than observation columns.
     source = loc
     seen = Set{Symbol}()
-    while source isa Symbol && haskey(ctx.detmap, source) && source ∉ seen
+    while loc ∉ ctx.value_defs && source isa Symbol &&
+            haskey(ctx.detmap, source) && source ∉ seen
         push!(seen, source)
         ctx.detshape[source] = :scalar
         source = ctx.detmap[source]
@@ -10285,13 +10300,14 @@ function _value_location!(lhs, loc, pred_link, ctx, predictors,
     else
         label = Symbol(pname, "_value")
         scalars = Symbol[]
+        columns = ColumnRef[]
         tree = if loc isa Symbol
-            push!(scalars, loc)
+            push!(loc in ctx.value_defs ? columns : scalars, loc)
             loc
         else
             _composed_scalar_leaf!(pname, loc, ctx, scalars)
         end
-        TermSpec(ComposedTerm, ColumnRef[],
+        TermSpec(ComposedTerm, columns,
             (tree = tree, subs = Symbol[], scalars = scalars), label,
             label)
     end
@@ -10568,6 +10584,7 @@ affine merge (its coefficients declared like any other — strict
 declarations)."""
 function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     haskey(ctx.detmap, s) || return false
+    s in ctx.value_defs && return false
     factor_alias = _is_factor_coefficient_alias(s, ctx)
     factor_alias && !allow_factor && return false
     if get(ctx.detshape, s, :scalar) !== :vector
@@ -10696,7 +10713,8 @@ function _reads_array_value(ex, ctx, seen::Set{Symbol} = Set{Symbol}();
         follow::Bool = true)
     _is_bound_array_value_call(ex) && return true
     if ex isa Symbol
-        (ex in ctx.array_decls || _is_array_def(ex, ctx)) && return true
+        (ex in ctx.value_defs || ex in ctx.array_decls || ex in ctx.dirichlet_names ||
+            ex in ctx.ordered_names || _is_array_def(ex, ctx)) && return true
         follow && haskey(ctx.detmap, ex) && ex ∉ seen || return false
         push!(seen, ex)
         return _reads_array_value(ctx.detmap[ex], ctx, seen)
@@ -10862,6 +10880,10 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[])
     where = "predictor $pname"
     if node isa Symbol
+        if node in ctx.value_defs
+            node in datas || push!(datas, node)
+            return node
+        end
         # A name bound to a composition inlines its tree (the definition
         # is absorbed — it never also emits as a derived column).
         if haskey(ctx.detmap, node) && _composed_trigger(node, ctx)
@@ -11310,7 +11332,9 @@ function _classify_summand(pname, core, sign::Int, ctx)
     head === :ref && return _classify_ref(pname, core, sign, ctx)
     head === :macrocall && _sfail("predictor $pname: macros do not lower " *
         "inside predictor expressions")
-    _canon_shape(core, ctx) === :scalar &&
+    # Literal arrays and other model-level arrays keep their whole Julia
+    # value; broadcasting at the response decides their observation axes.
+    _canon_shape(core, ctx) in (:scalar, :array) &&
         return _extract_summand(pname, core, sign, ctx)
     if head === :call && !isempty(core.args) && core.args[1] === :.*
         return _classify_product(pname, core, sign, ctx)
@@ -11903,11 +11927,18 @@ function _summand_kind(_, _)
 end
 
 function _classify_ref(pname, core::Expr, sign::Int, ctx)
+    if core.args[1] in ctx.prior_names && core.args[1] ∉ ctx.sized_decls
+        # Base owns scalar indexing too: index 1 returns the value; other
+        # integer or vector indices keep their ordinary Julia failures.
+        return _extract_summand(pname,
+            Expr(:call, GlobalRef(Base, :getindex), core.args...), sign, ctx)
+    end
     # Reads of a declared array value (`z[g]`, `phi[1]`) or of an
     # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
     # values, not factor coefficients: scalar assignments by position,
     # per-observation columns when gathered.
-    (core.args[1] in ctx.value_arrays || _is_array_def(core.args[1], ctx) ||
+    (core.args[1] in ctx.value_arrays ||
+        _is_array_def(core.args[1], ctx) ||
         _is_model_value_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
     length(core.args) == 2 || _sfail("predictor $pname: factor indexing " *
