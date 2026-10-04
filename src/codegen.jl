@@ -753,7 +753,8 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
     result = append_body(consumer, intermediate)
     # Keep the complete HAVE boundary, including unused axis arguments.
     scalar_plan = plan(scalar_graph; have = scalar_have, want = (result.value,))
-    kernel = prepare(scalar_plan)
+    kernel = _prepare(scalar_plan,
+        _lower_with_ops(scalar_plan; inline_embedded = false)...)
     # Source RHSs use the original scalar formal names. Keep their original
     # recipe metadata in operation-table order so readable code binds those
     # names to the newly projected scalar arguments, including across chains.
@@ -1113,6 +1114,79 @@ function _lower_plate_recipe_native!(body, recipe, args, out, operation, offset)
     body
 end
 
+# Infer nested regions from their leaf operations, never from a recursive
+# PreparedKernel call. Keep these cold type-only slots in the same order in
+# both products; ordinary reverse AD removes slots unused by execution.
+function _plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types)
+    p = kernel.plan
+    offset = length(runtime_ops)
+    append!(runtime_ops, kernel.ops)
+    append!(runtime_recipes, kernel.lowered_recipes)
+    types = Dict{Int,Any}(canon_id(p.graph, v.id) => T
+                         for (v, T) in zip(p.have, input_types))
+    for (i, recipe) in enumerate(p.recipes)
+        args = Any[types[canon_id(p.graph, v.id)] for v in recipe.inputs]
+        T = if recipe.op isa _AuthoredPlateOp
+            atomic = typeof(recipe.op).parameters[2]
+            elements = Any[Expr(:call, GlobalRef(@__MODULE__, :_plate_argument_type),
+                arg, position in atomic) for (position, arg) in enumerate(args)]
+            element = only(_plate_body_type!(runtime_ops, runtime_recipes,
+                                            recipe.op.kernel, elements))
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_array_type), element,
+                Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic)), args...)
+        else
+            Expr(:call, GlobalRef(Base, :promote_op),
+                 Expr(:ref, _OPS_ARG, offset + i), args...)
+        end
+        if length(recipe.outputs) == 1
+            types[canon_id(p.graph, only(recipe.outputs).id)] = T
+        else
+            for (j, output) in enumerate(recipe.outputs)
+                types[canon_id(p.graph, output.id)] =
+                    Expr(:call, GlobalRef(Base, :fieldtype), T, j)
+            end
+        end
+    end
+    Any[types[canon_id(p.graph, v.id)] for v in p.want]
+end
+
+@inline _plate_argument_type(::Type{T}, atomic) where {T} =
+    atomic || T <: Number ? T : eltype(T)
+@inline _plate_axis_types(::Val{A}, ::Val{I}, ::Tuple{}) where {A,I} = ()
+@inline function _plate_axis_types(::Val{A}, ::Val{I}, args::Tuple) where {A,I}
+    rest = _plate_axis_types(Val(A), Val(I + 1), Base.tail(args))
+    I in A ? rest : (first(args), rest...)
+end
+@inline _plate_marker_type(::Tuple{}) = Nothing
+@inline function _plate_marker_type(args::Tuple)
+    axes_type = Base.promote_op(axes, first(args))
+    axes_type <: Tuple || return Any
+    fieldcount(axes_type) > 0 ? first(args) :
+        _plate_marker_type(Base.tail(args))
+end
+@inline function _plate_array_type(::Type{T}, ::Val{A}, args...) where {T,A}
+    # Tuple recursion retains constant Type operands during inference. Building
+    # a generator here would turn these cold probes into runtime inference.
+    axes_args = _plate_axis_types(Val(A), Val(1), args)
+    marker = _plate_marker_type(axes_args)
+    marker in (Nothing, Any) && return Any # the emitted region validates its axis
+    axes_type = Base.promote_op(Base.Broadcast.combine_axes, axes_args...)
+    Base.promote_op(_plate_similar_output, marker, Type{T}, axes_type)
+end
+
+# A cell containing another plate is lowered by the same graph compiler as a
+# top-level kernel. Splicing that AST retains each nested runtime loop, fuses
+# selected sum consumers, and preserves all named scalar recipes for replay.
+function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types)
+    scalar = _fuse_authored_plate_chains(kernel.plan)
+    ast, ops, recipes = _lower_with_ops(scalar)
+    offset = length(runtime_ops)
+    append!(runtime_ops, ops)
+    append!(runtime_recipes, recipes)
+    T = only(_plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types))
+    (; ast, offset, type = T)
+end
+
 function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
                                        op::_AuthoredPlateOp, callargs, callvalues,
                                        pointwise_lhs, total_lhs; recycled = nothing)
@@ -1303,6 +1377,10 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
                 Expr(:call, GlobalRef(Base, :typeof), callargs[position]) :
                 Expr(:call, GlobalRef(Base, :eltype), raw_arguments[position])
     end
+    nested = any(r -> r.op isa _AuthoredPlateOp, inner.recipes) ?
+        _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
+            Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inner.have]) :
+        nothing
     for (recipe_index, recipe) in enumerate(inner.recipes)
         input_type_exprs = Any[
             get(plate_type_exprs, canon_id(inner.graph, input.id),
@@ -1325,11 +1403,12 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
             Expr(:call, GlobalRef(Base, :promote_op),
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...) : scan_type
     end
-    push!(body.args, Expr(:(=), plate_eltype,
+    push!(body.args, Expr(:(=), plate_eltype, nested === nothing ?
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
-            GlobalRef(Core, :Any))))
+            GlobalRef(Core, :Any)) : nested.type))
     groups = _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues)
+    nested === nothing || (groups = [])
     has_scheduled_groups = any(groups) do (roots, _)
         !isempty(roots) && !_authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues)
@@ -1380,6 +1459,14 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     end
 
     loopbody = Expr(:block)
+    nested_result = gensym(:plate_nested_result)
+    if nested !== nothing
+        args = Any[_authored_plate_scalar_ref(
+            inner, locals, callargs, callvalues, prepared_arguments, atomic,
+            input, index, true) for input in inner.have]
+        append!(loopbody.args,
+            _embedded_statements(nested.ast, args, nested_result, nested.offset))
+    end
     for (roots, recipe_indices) in groups
         isempty(roots) && continue
         assignments = Expr(:block)
@@ -1414,9 +1501,9 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     # result. That input never appears in `locals`, so reuse the shared scalar
     # projection, which resolves a HAVE input to its per-coordinate reference and
     # otherwise falls back to `locals`.
-    scalar_result = _authored_plate_scalar_ref(
+    scalar_result = nested === nothing ? _authored_plate_scalar_ref(
         inner, locals, callargs, callvalues, prepared_arguments, atomic,
-        only(inner.want), index, true)
+        only(inner.want), index, true) : nested_result
     pointwise_lhs === nothing ||
         push!(loopbody.args, :($pointwise_lhs[$index] = $scalar_result))
     accumulator === nothing ||
@@ -1431,9 +1518,9 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
-    reduction = _plate_reduction_plan(
+    reduction = nested === nothing ? _plate_reduction_plan(
         inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
-        pointwise_lhs)
+        pointwise_lhs) : nothing
     if reduction === nothing
         push!(body.args, cell_loop)
     else
@@ -1505,6 +1592,17 @@ function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
     _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
+    if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)
+        _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
+            Any[GlobalRef(Core, :Any) for _ in inner.have])
+        # The current tensor product batches individual scalar recipes. Calling
+        # a nested plate's host fallback there would trace a data-sized loop.
+        # Keep this capability gap explicit until nested backend regions exist.
+        push!(body.args, :(throw(ArgumentError(
+            "nested authored plates currently support native execution and native reverse AD; " *
+            "compiled nested plate regions are not implemented"))))
+        return body
+    end
     for (recipe_index, recipe) in enumerate(inner.recipes)
         length(recipe.outputs) == 1 || throw(ArgumentError(
             "an authored plate currently requires single-output scalar recipes"))
@@ -3103,7 +3201,8 @@ function _embedded_marker_candidates(p::Plan)
         # (`_batched_call` dispatches native vs. tensorized on it), never its
         # axis, so an admitted port can never be mistaken for the plate axis;
         # the dynamic runtime selection skips scalar values. Only provably
-        # scalar live ports (e.g. `::Float64`) still throw below.
+        # scalar live ports (e.g. `::Float64`) use the non-axis native sentinel;
+        # a traced scalar is detected separately at the call boundary.
         for (position, input) in enumerate(p.have)
             _static_plate_axis_class(valtype(input)) === :not_axis ||
                 push!(candidates, position)
@@ -3680,8 +3779,9 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
     native = compile(native_ast)
     tensorized = compile(tensorized_ast)
     candidates = _embedded_marker_candidates(p)
-    isempty(candidates) && throw(ArgumentError(
-        "an embedded plate requires an array-valued HAVE port in the outer kernel"))
+    # Every axis may be bound while the remaining HAVE ports are scalars.
+    # The dynamic pair selects native execution with its non-axis sentinel,
+    # and a traced scalar still selects the tensor product at call time.
     typed_candidate = findfirst(
         index -> valtype(p.have[index]) <: AbstractArray, candidates)
     f = if typed_candidate === nothing

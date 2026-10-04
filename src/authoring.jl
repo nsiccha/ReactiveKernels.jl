@@ -246,10 +246,14 @@ end
 function _kernel_inline_alias!(graph::Graph, from::Value, to::Value, context)
     from_type = valtype(from)
     to_type = valtype(to)
-    from_type == to_type || throw(ArgumentError(
+    from_type == to_type || from_type === Any || to_type === Any || throw(ArgumentError(
         "nested kernel $context type mismatch: :$(from.name) has type $from_type, " *
         "but :$(to.name) has type $to_type; declare the caller boundary with the " *
         "exact nested boundary type"))
+    # An omitted annotation is no type contract. Keep a differing declaration
+    # as the same identity/conversion recipe used by an ordinary assignment,
+    # so neither the caller nor the child loses its declared boundary type.
+    from_type == to_type || return _kernel_alias!(graph, from, to, identity, 1.0)
     source = canon_id(graph, from.id)
     target = canon_id(graph, to.id)
     source == target && return graph
@@ -1684,7 +1688,6 @@ function _kernel_authored_plate_expr(rhs, mod,
     lambda isa Expr && lambda.head === :(->) && length(lambda.args) == 2 ||
         throw(ArgumentError("plate do-block requires an ordinary argument list and body"))
     formals_expr, scalar_body = lambda.args
-    _kernel_reject_nested_plate(scalar_body, mod)
     formals = formals_expr isa Symbol ? Symbol[formals_expr] :
               formals_expr isa Expr && formals_expr.head === :tuple &&
               all(arg -> arg isa Symbol, formals_expr.args) ?
@@ -1777,43 +1780,12 @@ function _kernel_authored_plate_expr(rhs, mod,
        materialized_arguments)
 end
 
-# A `plate(...) do` nested inside another plate's cell is not lowered today:
-# the cell body is prepared as its own scalar kernel and consumed one operation
-# per transparent recipe (`_lower_authored_plate_native!`), and a nested plate
-# recipe's inner operations enter that table at the wrong positions, so the
-# cell called a wrong operation with the wrong arguments at runtime — a
-# `MethodError` for the reporter's shape, silently wrong values elsewhere
-# (snag `plate-cell-gathe-94d4a929`). Reject at authoring time and name the
-# supported spellings of a per-cell reduction over a small shared axis.
-function _kernel_reject_nested_plate(body, mod)
-    body isa Expr || return nothing
-    body.head in (:quote, :inert) && return nothing
-    if body.head === :do && length(body.args) == 2
-        call = body.args[1]
-        if call isa Expr && call.head === :call && !isempty(call.args) &&
-           _kernel_resolve_binding(mod, call.args[1]) === plate
-            throw(ArgumentError(
-                "a `plate(...) do` block nested inside a plate cell is not " *
-                "supported: author the per-cell reduction as a scalar generator " *
-                "(`sum(f(i) for i in eachindex(shared))`, allocation-free natively " *
-                "and lowered per lane under Reactant), or prepare the inner " *
-                "reduction as its own kernel and call that prepared kernel from " *
-                "the cell"))
-        end
-    end
-    foreach(arg -> _kernel_reject_nested_plate(arg, mod), body.args)
-    nothing
-end
-
 function _kernel_authored_plate(spec::KernelSpec, ::Val{A}) where {A}
-    kernel = prepare(spec)
-    # Plate lowering consumes one operation per scalar recipe. Standalone
-    # preparation may expand a nested scan into several native operations;
-    # retain the recipe boundary when storing that scalar body as metadata.
-    if length(kernel.ops) != length(kernel.plan.recipes)
-        kernel = _prepare(kernel.plan,
-            _lower_with_ops(kernel.plan; inline_embedded = false)...)
-    end
+    # Store the graph's operation boundary explicitly: an expanded nested
+    # region can coincidentally have the same table length as its parent DAG.
+    # Length equality alone does not establish one operation per recipe.
+    p = plan(spec)
+    kernel = _prepare(p, _lower_with_ops(p; inline_embedded = false)...)
     _AuthoredPlateOp{typeof(kernel),A}(kernel)
 end
 
@@ -3195,8 +3167,11 @@ _kernel_has_node_marker(x) =
         (x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])) ||
         any(_kernel_has_node_marker, x.args))
 
-# Resolve a callee/macro-head AST (bare `name` or `Mod.name`) to its BINDING VALUE in
+# Resolve a callee/macro-head AST (`name`, `Mod.name`, or a `GlobalRef`) to its BINDING VALUE in
 # `mod`, or `nothing`. Reads bindings only (no call eval) — inside the compiler boundary.
+_kernel_resolve_binding(::Module, callee::GlobalRef) =
+    isdefined(callee.mod, callee.name) ? getglobal(callee.mod, callee.name) : nothing
+
 function _kernel_resolve_binding(mod::Module, callee)
     if callee isa Symbol
         isdefined(mod, callee) ? getglobal(mod, callee) : nothing
@@ -3270,6 +3245,39 @@ function _kernel_lift_nodes(block, mod)
     Expr(:block, vcat(lifted, new_stmts)...)
 end
 
+# Lift a plate used as a sub-expression into a named region in the same
+# straight-line scope. Deferred and lazy scopes stay intact; a plate's own
+# body is processed recursively when its scalar graph is constructed.
+function _kernel_lift_plate_expressions(statements, mod)
+    result = Any[]
+    for statement in statements
+        lifted = Any[]
+        function rewrite(ex, root = false)
+            ex isa Expr || return ex
+            if ex.head === :do && length(ex.args) == 2
+                call = ex.args[1]
+                if call isa Expr && call.head === :call &&
+                   _kernel_resolve_binding(mod, call.args[1]) === plate && !root
+                    name = gensym(:nested_plate)
+                    push!(lifted, Expr(:(=), name, ex))
+                    return name
+                end
+                return ex
+            end
+            _kernel_is_nonstraight_head(ex.head) && return ex
+            Expr(ex.head, (rewrite(arg) for arg in ex.args)...)
+        end
+        rewritten = if statement isa Expr && statement.head === :(=)
+            Expr(:(=), statement.args[1], rewrite(statement.args[2], true))
+        else
+            statement
+        end
+        append!(result, lifted)
+        push!(result, rewritten)
+    end
+    result
+end
+
 function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                         call_signature = nothing, mod::Union{Module,Nothing} = nothing;
                         nested_specs = Dict{Symbol,Any}())
@@ -3278,7 +3286,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # for bodies with no `@node` (or only foreign `@node`).
     block = _kernel_normalize_call_kwargs(_kernel_lift_nodes(block, mod))
     raw_statements = block isa Expr && block.head === :block ? block.args : Any[block]
-    statements = _kernel_normalize_return_expressions(raw_statements)
+    statements = _kernel_lift_plate_expressions(
+        _kernel_normalize_return_expressions(raw_statements), mod)
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
     order_var = gensym(:kernel_port_order)
