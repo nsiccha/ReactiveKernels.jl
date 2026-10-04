@@ -78,29 +78,35 @@ end
     end
 end
 
-@testset "shipped horseshoe defaults accept scoped operations" begin
-    body = deepcopy(horseshoe_coefs.body)
+@rkppl _rewrite_scaled_columns(X) = begin
+    scale ~ Exponential(1)
+    center[axes(X, 2)] .~ Normal.(0, 1)
+    z[axes(X, 2)] .~ Normal.(0, 1)
+    return scale .* center .* z
+end
+
+@testset "caller-owned scalar and array priors accept scoped operations" begin
+    body = deepcopy(_rewrite_scaled_columns.body)
     model = @rkppl begin
-        b ~ horseshoe_coefs(X)
+        b ~ _rewrite_scaled_columns(X)
         y .~ Normal.(X * b, 1)
     end
     changed = merge(model, quote
-        b.tau ~ HalfCauchy(0.25)
-        b.lambda[axes(X, 2)] .~ HalfCauchy.([1.0, 0.5])
+        b.scale ~ Exponential(0.25)
+        b.center[axes(X, 2)] .~ Normal.([0.2, -0.1], [1.0, 0.5])
     end)
     X, y = ones(3, 2), [0.1, -0.2, 0.3]
     observed = changed(; X) |
-        (; y, var"b.tau" = 0.3, var"b.lambda" = [0.2, 0.4])
+        (; y, var"b.scale" = 0.3, var"b.center" = [0.2, 0.4])
     @test build_kernel(observed).layout.total == 2
-    halfcauchy(s, x) = logpdf(truncated(Cauchy(0, s), 0, Inf), x)
     @test _rewrite_node(observed, :likelihood, zeros(2)) ≈
-        halfcauchy(0.25, 0.3) + halfcauchy(1, 0.2) +
-        halfcauchy(0.5, 0.4) + sum(logpdf.(Normal(), y))
+        logpdf(Exponential(0.25), 0.3) + logpdf(Normal(0.2, 1), 0.2) +
+        logpdf(Normal(-0.1, 0.5), 0.4) + sum(logpdf.(Normal(), y))
     @test _rewrite_node(observed, :prior, zeros(2)) ≈ 2logpdf(Normal(), 0)
-    pinned = merge(changed, (; var"b.tau" = 0.3,
-        var"b.lambda" = [0.2, 0.4]))(; X) | (; y)
+    pinned = merge(changed, (; var"b.scale" = 0.3,
+        var"b.center" = [0.2, 0.4]))(; X) | (; y)
     @test _rewrite_node(pinned, :likelihood, zeros(2)) ≈ sum(logpdf.(Normal(), y))
-    @test horseshoe_coefs.body == body
+    @test _rewrite_scaled_columns.body == body
 end
 
 @testset "conditioning inputs cannot capture authored names" begin

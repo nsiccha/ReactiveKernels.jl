@@ -2385,8 +2385,17 @@ function _resolve_module_path(ex, mod::Module, where)
     return m
 end
 
+const _RETIRED_MODEL_HEADS = (
+    :ordered_logistic, :penalized_smooth, :t2_smooth, :hsgp_effect, :hsgp_periodic_effect, :hsgp_grouped_effect, :monotonic, :differenced_ar1, :r2d2_coefs, :horseshoe_coefs, :varying_coefs, :varying_coefs_correlated, :varying_coefs_centered, :varying_coefs_centered_correlated, :varying_stratified, :varying_stratified_correlated)
+
 function _module_binding(m::Module, s::Symbol, where, shown)
     if !isdefined(m, s)
+        s in _RETIRED_MODEL_HEADS && _sfail("$where: the statistical model `$shown` " *
+            "is owned by BayesianRegressionModels; obtain its ordinary body with " *
+            "`BayesianRegressionModels.rkppl_model(:$s)` and bind it in the model module")
+        s === :linear_pk_log_f && _sfail("$where: the PK-specific model `$shown` " *
+            "belongs to downstream RKPPLBench; import the consumer-owned submodel " *
+            "into the model module")
         s === :Horseshoe && _sfail("$where: the implicit `Horseshoe` " *
             "coefficient shortcut is retired; declare its priors and " *
             "coefficient product explicitly, or use the BRM-owned " *
@@ -6981,7 +6990,15 @@ function _resolve_submodel(rhs, mod::Module)
         head = head.args[2].value
     end
     head isa Symbol || return nothing
-    isdefined(mod, head) || return nothing
+    if !isdefined(mod, head)
+        head in _RETIRED_MODEL_HEADS && _sfail("the statistical model `$head` " *
+            "is owned by BayesianRegressionModels; obtain its ordinary body with " *
+            "`BayesianRegressionModels.rkppl_model(:$head)` and bind it in the model module")
+        head === :linear_pk_log_f && _sfail("the PK-specific model `$head` " *
+            "belongs to downstream RKPPLBench; import the consumer-owned submodel " *
+            "into the model module")
+        return nothing
+    end
     val = getfield(mod, head)
     fragment = sampling_fragment(val)
     (fragment === nothing || fragment isa RKPPLSubmodel) ||

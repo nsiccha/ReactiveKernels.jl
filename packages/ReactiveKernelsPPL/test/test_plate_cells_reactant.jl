@@ -12,7 +12,11 @@ function _pcr_build(n, S)
     model = @rkppl begin
         a ~ Normal(0, 5)
         sigma ~ Exponential(1)
-        r ~ varying_stratified_correlated(g, s, 2)
+        weights[levels(s), 1:2] .~ Normal.(0, 1)
+        z[levels(g), 1:2] .~ Normal.(0, 1)
+        @plate for i in eachindex(y)
+            r[i, 1:2] = weights[s[i], :] .* z[g[i], :]
+        end
         mu = a .+ r[:, 1] .+ x .* r[:, 2]
         y .~ Normal.(mu, sigma)
     end

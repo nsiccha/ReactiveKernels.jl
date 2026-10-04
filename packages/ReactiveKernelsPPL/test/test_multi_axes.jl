@@ -51,6 +51,11 @@ function _ma_check(ast, data, mean; scale = (nt -> 1.0), slots = (), gradient = 
     return (; bound = both, built, q, u)
 end
 
+@rkppl _ma_declared_columns(X) = begin
+    c[axes(X, 2)] .~ Normal.(0, 1)
+    return c
+end
+
 @testset "multiple observation axes: declared prior dependencies" begin
     cols = (; y = [0.2, -0.1, 0.4, 0.8], x = [-1.0, 0.5, 2.0, 1.0])
     _ma_check(quote
@@ -164,18 +169,14 @@ end
     end, merge(cols, (; rows = collect(1:4))), (p, l, nt, u) -> nt.z;
         slots = (:array_parameters, :derived))
     @test result.bound.columns[:X] == hcat(cols.x)
-    for library in (:r2d2_coefs, :horseshoe_coefs)
-        draw = library === :r2d2_coefs ? :(r2d2_coefs(X, [1.0])) : :(horseshoe_coefs(X))
-        _ma_check(quote
-            a ~ Normal(0, 1)
-            X = hcat(x)
-            b ~ $draw
-            mu = a .+ X * b
-            y .~ Normal.(mu, 1.0)
-        end, cols, (p, l, nt, u) -> nt.a .+ cols.x .*
-            (library === :r2d2_coefs ? only(nt.b.b) : nt.b.tau * only(nt.b.lambda .* nt.b.z));
-            slots = (:matrices, :array_parameters, :submodel_scopes))
-    end
+    _ma_check(quote
+        a ~ Normal(0, 1)
+        X = hcat(x)
+        b ~ _ma_declared_columns(X)
+        mu = a .+ X * b
+        y .~ Normal.(mu, 1.0)
+    end, cols, (p, l, nt, u) -> nt.a .+ cols.x .* only(nt.b.c);
+        slots = (:matrices, :array_parameters, :submodel_scopes))
 end
 
 @testset "multiple observation axes: spline and HSGP slots" begin

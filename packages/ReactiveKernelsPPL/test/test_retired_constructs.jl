@@ -31,3 +31,38 @@ using ReactiveKernelsPPL, Test
         @test occursin("BayesianRegressionModels.rkppl_model(:$model)", message)
     end
 end
+
+@testset "retired producer catalogue points to its owner" begin
+    for name in ReactiveKernelsPPL._RETIRED_MODEL_HEADS
+        ast = Expr(:block, Expr(:call, :~, :q, Expr(:call, name)))
+        err = try
+            lower_rkppl(ast, (); mod = ReactiveKernelsPPL)
+            nothing
+        catch error
+            error
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin("BayesianRegressionModels.rkppl_model(:$name)",
+            sprint(showerror, err))
+        @test !isdefined(ReactiveKernelsPPL, name)
+    end
+end
+
+module RetiredCatalogueCaller
+using ReactiveKernelsPPL
+@rkppl horseshoe_coefs(x) = begin
+    b ~ Normal(0, 3)
+    return b .* x
+end
+monotonic(x) = x .+ 0.5
+end
+
+@testset "retired catalogue spellings remain caller-owned bindings" begin
+    p = lower_rkppl(quote
+        q ~ horseshoe_coefs(x)
+        m = monotonic(q)
+        y .~ Normal.(m, 1)
+    end, (:x, :y); mod = RetiredCatalogueCaller, conditioned = (:y,))
+    bound = bind_data(p, Dict(:x => [0.2, 0.4], :y => [0.3, -0.1]))
+    @test coordinate_names(build_kernel(bound).layout) == [Symbol("q.b")]
+end

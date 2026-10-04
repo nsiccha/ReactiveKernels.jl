@@ -401,89 +401,30 @@ Main.ReactiveKernelsDocs.render_rkppl_corpus_example("10_levels_prior.jl", :rkpp
 
 ## Group-level effects
 
-Varying effects are library submodels. Each body states its priors and returns
-an array that the use site reads with ordinary Julia indexing. The default
-scale prior is `HalfNormal(1)`; correlated margins use `LKJCholesky(K, 1.0)`.
-`K` is a literal, at least two for a correlated entry.
+Statistical varying-effect bodies and their defaults are owned by
+BayesianRegressionModels. Obtain a body with
+`BayesianRegressionModels.rkppl_model(:varying_coefs)` or its correlated,
+centered, multi-membership or stratified counterpart, then bind that ordinary
+submodel in the defining module. RK-PPL compiles the author's declared arrays,
+priors, gathers and matrix arithmetic.
 
-| Statement | Returned value | Observation-level read |
-|---|---|---|
-| `b ~ varying_coefs(g)` | One coefficient per group | `b[g]`, or slope `x .* b[g]` |
-| `b ~ varying_coefs_correlated(g, K)` | A groups × K matrix | `b[g, 1] .+ x .* b[g, 2]` |
-| `b ~ varying_coefs_centered(g)` | One directly sampled coefficient per group | `b[g]` |
-| `b ~ varying_coefs_centered_correlated(g, K)` | Directly sampled multivariate rows | `b[g, 1] .+ x .* b[g, 2]` |
-| `u ~ varying_stratified(g, s)` | One value per observation, with a scale per stratum | `u`, or slope `x .* u` |
-| `r ~ varying_stratified_correlated(g, s, K)` | One K-component row per observation, with scales and a correlation factor per stratum | `r[:, 1] .+ x .* r[:, 2]` |
+For hand-authored arrays, `b[levels(g)] .~ Normal.(0, scale)` declares one
+value per group and `b[g]` gathers it per observation. Multi-membership can
+use `gg = vcat(g1, g2)` as a data-only definition, declare one array over
+`levels(gg)`, and combine its gathers with the authored weights.
 
-Scalar margins compose in the same way: `m = mean(x)` followed by
-`mu = a .+ m .* b[g]`. If the same `m` supplies a Gaussian scale in
-`y .~ Normal.(mu, m)`, binding evaluates the data reduction once and requires
-a finite, strictly positive result.
+Multivariate rows use
+`eachrow(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`;
+columns use `eachcol(B[1:K, levels(g)]) .~ MvNormalCholesky(mu, F)`.
+The mean, factor and their priors are declared values. Read rows with
+`B[g, 1]`, or columns with `B[:, g]`. Integer axes use positive integer
+positions; level axes map the authored labels.
 
-These are the actual library definitions, read from the loaded submodels:
-
-```@eval
-Main.ReactiveKernelsDocs.render_rkppl_varying_definitions()
-```
-
-To use a different prior, write the body at the use site and change its prior
-statement. With the priors unchanged, the library call and the written body
-have the same mathematical plan. Library draws use the call's namespace:
-`nt.b.sd`, `nt.b.z`, and, for correlated margins, `nt.b.L`. Centered entries
-expose `nt.b.c` instead of `nt.b.z`; their coordinates are the coefficients
-themselves, so their densities
-at a packed point differ from the non-centered entries.
-
-Centered correlated coefficients use ordinary row priors:
-`eachrow(B[levels(g), 1:K]) .~ MvNormalCholesky(mu, F)`, with a K-vector
-mean `mu` and lower-triangular covariance factor `F`. Read their effects as
-`B[g, 1] .+ x .* B[g, 2]`. The column-oriented declaration
-`eachcol(B[1:K, levels(g)]) .~ MvNormalCholesky(mu, F)` uses a K×G
-array instead: read `B[1, g] .+ x .* B[2, g]`, or `B[:, g]' * v`
-for a K-vector `v`. Level lookup follows the indexed axis. On an integer
-axis, the index column contains positive integer positions. A column
-gather stays K×N until the authored adjoint turns it into N×K.
-The legacy `varying_draws` / `varying_effect`
-keywords are `eta`, `levels`, and `sd`; centered coefficients are declared
-through array priors or the centered library entries above.
-
-Valid multivariate row, column and vector priors compile with Reactant when
-prepared with `on_error = :ignore` (also accepted by `prepare_query` and
-`prepare_sampler`). This explicit policy strips visible throws and assertions;
-default native preparation checks the factor or covariance. The shared solve
-retains its loops and uses ordinary reverse AD. Empty batches return zero in
-native and compiled primal execution; compiled empty gradients remain subject
-to the [Reactant export limitation](constraints.md#acceptance-and-existing-limitations).
-
-```@eval
-Main.ReactiveKernelsDocs.render_rkppl_corpus_example("27_varying_slope_lib.jl", :rkppl_varying_slope)
-```
-
-The stratified correlated entry returns rows already aligned with the
-observations. Its draws contain S×K scales, a K×K×S stack of factors, and J×K
-standard-normal coordinates, where S and J count the sorted distinct strata
-and groups. Read stratum k's factor as `nt.r.L[:, :, k]`. The returned rows
-currently support literal column reads; passing that result whole to a
-function or reading it by row is not supported yet.
-
-```@eval
-Main.ReactiveKernelsDocs.render_rkppl_corpus_example("65_stratified_lib.jl", :rkppl_stratified)
-```
-
-The stratified array cells run natively and compile under Reactant, including
-reverse-mode gradients. Centered multivariate row priors currently run
-natively; their Reactant density lowering remains unsupported. The older
-`varying_draws` / `varying_effect` statements still lower while their callers
-migrate to these library bodies.
-
-Multi-membership uses the union of the membership columns as one data-only
-definition, `gg = vcat(g1, g2)`. `levels(gg)` then sizes one shared set of
-coefficients. Each observation weights its gathers; the definition runs once
-at binding:
-
-```@eval
-Main.ReactiveKernelsDocs.render_rkppl_corpus_example("62_mm_intercept_lib.jl", :rkppl_membership)
-```
+Valid multivariate priors compile with Reactant when prepared with
+`on_error = :ignore`. This explicit preparation policy strips visible
+throws and assertions; native preparation checks the factor or covariance.
+The shared solve retains its loops and ordinary reverse AD. Compiled empty
+gradients remain subject to the [Reactant export limitation](constraints.md#acceptance-and-existing-limitations).
 
 ## Declared arrays as values
 
@@ -565,9 +506,9 @@ are shared across elements; literal vectors give one value per element.
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
 ```
 
-For spline and approximate GP terms, compute a data-side basis and use a
-library submodel whose body states every prior. See [Smooths and HSGPs with
-`@rkppl`](rkppl-smooths.md) for tensor, periodic and grouped variants.
+Spline and approximate GP preparation and model bodies belong to BRM.
+RK-PPL accepts their supplied matrices and ordinary declared coefficient
+priors. See [Statistical model ownership](rkppl-smooths.md).
 
 ## Plates
 
@@ -594,8 +535,7 @@ by responses of different lengths fails binding because its axis is ambiguous.
 Kernel plates may also contribute likelihoods beside ordinary responses;
 their subject/time or schedule dimensions retain their own rows.
 
-The stratified library body above uses both per-level and per-observation
-cells. `L[k] ~ LKJCholesky(K, eta)` inside a plate over `levels(s)` declares
+Per-level and per-observation cells compose through declared arrays. `L[k] ~ LKJCholesky(K, eta)` inside a plate over `levels(s)` declares
 one factor per stratum. An observation cell can then read `sd[s[i], :]`,
 `L[s[i]]` and `z[g[i], :]`, compute a matrix-vector product, and name a
 scalar output with `r[i] = ...` or a row with `b[i, 1:K] = ...`. Shared arrays
@@ -641,9 +581,9 @@ In an array cell, an observation must read a named per-index output
 it lowers exactly like the hand-inlined program. A submodel whose result is a
 response pointer is used as an observation stream: `y ~ stream(x, g)`.
 `Base.merge(model, override)` replaces or appends statements by name.
-Submodels also accept declared keyword defaults and statement replacements:
-`custom = merge(linear_pk_log_f, :(slope ~ Normal(0, 0.5)))` returns a new
-library body, which a program uses as `log_F ~ custom(sched; k = 5)`.
+Submodels also accept declared keyword defaults and statement replacements.
+For a caller-defined `half_scale`, `custom = merge(half_scale,
+:(tau ~ HalfCauchy(0.5)))` derives a reusable variant.
 
 Submodel calls accept only their declared keywords. The legacy undeclared
 `predictor = name` shortcut is rejected. Bind a returned quantity with an
@@ -671,35 +611,12 @@ to their loop. Per-cell calls support `theta[i].b` and the whole local array
 Main.ReactiveKernelsDocs.render_rkppl_submodel_example()
 ```
 
-### Event-axis bioavailability
+### Consumer-owned models
 
-`log_F ~ linear_pk_log_f(sched; k = 5, c = 1.5)` combines a linear log-dose
-effect with an HSGP in schedule operation order. The schedule's operation
-fields and basis are data; the body states every prior, including the named
-length-scale validity floor. The reference dose defaults to one in the
-amount column's units; replace `reference_dose = 1` in the body to change it.
-These are the live library statements:
-
-```@eval
-Main.ReactiveKernelsDocs.render_rkppl_library_definitions((:linear_pk_log_f,))
-```
-
-The synthetic schedule program below shows the call, preparation, and
-evaluation. Its draws are `nt.log_F.slope`, `nt.log_F.rho`,
-`nt.log_F.sigma`, and `nt.log_F.z`. Replace a prior by merging the library
-body, then replace the call statement in the model. The old
-`log_F = linear_pk_log_f(...)` form is retired because assignments do not
-declare parameters. Rebuild old prepared models and coordinate mappings.
-
-```@eval
-Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_50_grouped_pk_logf.jl", :rkppl_event_lp; preamble = "using ReactiveKernelsPPL")
-```
-
-This is the generated kernel for that program:
-
-```@eval
-Main.ReactiveKernelsDocs.render_rkppl_kernel_program("99_plate_50_grouped_pk_logf.jl")
-```
+Statistical model bodies belong to BayesianRegressionModels, and PK-specific
+bodies belong to downstream RKPPLBench. Import the consumer-owned body into
+the model module and use it as an ordinary submodel. RK-PPL supplies lexical
+namespaces, declared priors, arrays, plates, scans and standard AD.
 
 ## Replace, pin, and condition
 

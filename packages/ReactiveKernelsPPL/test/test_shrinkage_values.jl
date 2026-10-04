@@ -32,7 +32,7 @@ const _SH_MONOTONIC = quote
     a ~ Normal(0, 1)
     b1 ~ Normal(0, 1)
     zeta ~ Dirichlet(alpha_m)
-    m ~ monotonic(c, zeta)
+    m = cumsum(vcat(0.0, zeta))[c]
     b3 ~ _sh_horseshoe_scalar()
     mu = a .+ b1 .* x1 .+ b3 .* m
     sigma ~ Exponential(1)
@@ -41,14 +41,13 @@ end
 
 # The contrast changes with zeta, so its variance and the conditional
 # coefficient scale must be evaluated in the parameter-dependent graph.
-# The shipped r2d2_coefs data-matrix helper is a separate contract.
 const _SH_R2_MONOTONIC = quote
     a ~ Normal(0, 1)
     R2 ~ Beta(1.2, 2.1)
     phi ~ Dirichlet([1.0, 2.0])
     tau ~ HalfNormal(0.8)
     zeta ~ Dirichlet(alpha_m)
-    m ~ monotonic(c, zeta)
+    m = cumsum(vcat(0.0, zeta))[c]
     vx = var(x1)
     vm = var(m)
     b1 ~ Normal(0, sqrt(phi[1] * R2 * tau^2 / vx))

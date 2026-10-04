@@ -9,7 +9,7 @@ using Test
 # ordered vector (a plain value), `y .~ OrderedLogistic.(eta, Ref(c))` and
 # `y .~ Ordinal.(structure, link, eta, Ref(c))` take the cutpoints as an
 # argument, stopping-ratio thresholds are a sized `t[1:n] .~ Normal.(m, s)`
-# vector, and the shipped `y ~ ordered_logistic(eta)` states the default.
+# vector.
 # Every threshold vector and its prior are declared in the model body.
 # The ordered-logistic oracle is Turing.jl's `OrderedLogistic(η, c)`
 # definition, P(y = k) = F(c[k] − η) − F(c[k−1] − η), evaluated through

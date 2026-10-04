@@ -79,12 +79,6 @@ export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
-export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
-    horseshoe_coefs, penalized_smooth, t2_smooth, hsgp_effect,
-    hsgp_periodic_effect, hsgp_grouped_effect, linear_pk_log_f
-export varying_coefs, varying_coefs_correlated, varying_coefs_centered,
-    varying_coefs_centered_correlated, varying_stratified,
-    varying_stratified_correlated
 export tps_basis, cr_basis, t2_basis, hsgp_basis, hsgp_periodic_basis, hsgp_sqrt_spd,
     hsgp_grouped_sqrt_spd, hsgp_periodic_sqrt_spd, hsgp_rho_floors,
     hsgp_periodic_rho_floor, hsgp_matern_sqrt_spd, hsgp_periodic_grouped_sqrt_spd
@@ -143,7 +137,6 @@ include("scan.jl")
 include("qt_joint.jl")
 include("tgi.jl")
 include("smooth_bases.jl")
-include("library.jl")
 
 # Late import into the generated-models scope: `PPLGeneratedModels`
 # binds its `import`s when `generator.jl` loads, before `tgi.jl`
