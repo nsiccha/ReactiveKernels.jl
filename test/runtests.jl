@@ -33,6 +33,7 @@ const _MATRIX_CORE_TESTS = (
     "test_runtests_selector.jl",
     "test_reactant_selector.jl",
     "test_stateless.jl",
+    "test_planner_groundability.jl",
     "test_lower_with_ops.jl",
     "test_declared_output_types.jl",
     "test_partial_evaluation.jl",
