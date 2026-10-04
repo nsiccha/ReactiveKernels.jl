@@ -437,14 +437,18 @@ end
                 q.sigma) + logpdf(Normal(0, 5), q.a) +
             logpdf(Dirichlet([1.0, 1.0]), q.phi) +
             logpdf(Exponential(1), q.sigma))
-        # The whole simplex read as a scalar stays refused.
-        # capability: a vector-valued simplex broadcast with data of matching length; reject mismatched lengths at bind (P3, P10a 0dejlw1) (todo `1qlbn5b`)
-        @test_broken (lower_rkppl(quote
+        # refused: the historical data length does not match phi's two
+        # entries. Matched numerical/AD controls are in the whole-value audit.
+        vector_plan=lower_rkppl(quote
             a ~ Normal(0, 5); phi ~ Dirichlet([1.0, 1.0])
             sigma ~ Exponential(1)
             mu = a .+ phi .* x1
             y .~ Normal.(mu, sigma)
-        end, (:y, :x1), conditioned = (:y, :x1)); true)
+        end, (:y, :x1), conditioned = (:y, :x1))
+        vector_bound=bind_data(vector_plan,Dict(:y=>_FB_COLS[:y],:x1=>x1))
+        vector_built=build_kernel(vector_bound)
+        @test_throws DimensionMismatch _query(vector_built.spec,vector_bound,
+            :posterior,zeros(vector_built.layout.total))
     end
     # One predictor mixing an inline array gather, an n-ary computed
     # coefficient and a simplex element; the emitted kernel is the same

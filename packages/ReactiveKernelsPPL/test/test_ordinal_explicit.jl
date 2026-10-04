@@ -366,10 +366,17 @@ end
             c ~ Ordered(Normal(0, 1))
             y .~ OrderedLogistic.(b .* x, Ref(c))
         end))
-    # capability: a vector draw participates in ordinary broadcast arithmetic (P10a 0dejlw1; todo `1qlbn5b`).
-    @test_broken (_oe_lower(quote
+    # refused: the historical x length cannot broadcast with two cutpoints.
+    # A matched numerical control retains their prior and ordered transform.
+    vector_plan=_oe_lower(quote
         c ~ Ordered(Normal(0, 1), 2)
         mu = c .* x
         y2 .~ Normal.(mu, 1.0)
-    end, data); true)
+    end, data)
+    vector_data=Dict{Symbol,Any}(_oe_cols())
+    vector_data[:y2]=zeros(length(vector_data[:x]))
+    vector_bound=bind_data(vector_plan,vector_data)
+    vector_built=build_kernel(vector_bound)
+    @test_throws DimensionMismatch _query(vector_built.spec,vector_bound,
+        :posterior,zeros(vector_built.layout.total))
 end
