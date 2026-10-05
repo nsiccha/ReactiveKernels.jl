@@ -35,7 +35,7 @@ executable_inventory(call::ReactantExt._ExternalizedADExecutable) =
 # 40, 200 and 1000 rows), so the complete executables are compared there.
 @testset "named matrix products compile with fixed structure" begin
     u = [0.3, -0.7]
-    sizes = (8, 40, 200)
+    sizes = (0, 1, 8, 40, 200)
     inline = Dict{Int,Any}()
     for (label, _, body) in SPELLINGS
         @testset "$label" begin
@@ -48,16 +48,22 @@ executable_inventory(call::ReactantExt._ExternalizedADExecutable) =
                 ru = Reactant.to_rarray(u)
                 primal = Reactant.@compile kernel(ru)
                 reverse = compile_ad_value_and_gradient(ad, ru)
-                @test Float64(primal(ru)) ≈ reference(data, u)
-                value, grad = reverse(ru)
-                @test Float64(value) ≈ reference(data, u)
-                @test Array(grad) ≈ gradient(data, u)
+                original = deepcopy(data)
+                for w in (u, [-0.2, 0.4])
+                    rw = Reactant.to_rarray(w)
+                    @test Float64(primal(rw)) ≈ reference(data, w)
+                    value, grad = reverse(rw)
+                    @test Float64(value) ≈ reference(data, w)
+                    @test Array(grad) ≈ gradient(data, w)
+                    @test Array(rw) == w
+                    @test data == original
+                end
                 inventories[n] = (
                     mlir_inventory(repr(Reactant.@code_hlo kernel(ru))),
                     mlir_inventory(repr(Reactant.@code_hlo both(ru))),
                     executable_inventory(primal), executable_inventory(reverse))
             end
-            @test all(n -> inventories[n][1:2] == inventories[8][1:2], sizes)
+            @test all(n -> inventories[n][1:2] == inventories[8][1:2], (8, 40, 200))
             @test inventories[40] == inventories[200]
             label === :inline && merge!(inline, inventories)
             @test all(n -> inventories[n] == inline[n], sizes)

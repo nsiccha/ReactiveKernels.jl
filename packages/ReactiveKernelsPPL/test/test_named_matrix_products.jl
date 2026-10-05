@@ -56,7 +56,7 @@ const SPELLINGS = [
 ]
 
 function build_case(body, n)
-    x = collect(range(-1.0, 1.5; length=n))
+    x = collect(range(-1.0; step=2.5 / max(n - 1, 1), length=n))
     y = 0.2 .+ 0.6 .* x .+ 0.1 .* sin.(1:n)
     ast = quote
         X = hcat(ones(length(x)), x)
@@ -74,21 +74,26 @@ gradient(data, u) = -u .+ [sum(data.y .- u[1] .- u[2] .* data.x),
     sum((data.y .- u[1] .- u[2] .* data.x) .* data.x)]
 
 @testset "named and submodel-returned matrix products read inside calls" begin
-    u = [0.3, -0.7]
     for (label, name, body) in SPELLINGS
         @testset "$label" begin
-            bound, built, data = build_case(body, 7)
-            original = deepcopy(data)
-            @test coordinate_names(built.layout) ==
-                [Symbol(name, ".1"), Symbol(name, ".2")]
-            post = prepare_query(built, bound, :sampler)
-            @test Base.invokelatest(post, u) ≈ reference(data, u)
-            sampler = prepare_sampler(built, bound, u; backend=BACKEND)
-            g = similar(u)
-            value, _ = sampler_value_and_gradient!(sampler, g, u)
-            @test value ≈ reference(data, u)
-            @test g ≈ gradient(data, u)
-            @test data == original
+            for n in (0, 1, 7)
+                bound, built, data = build_case(body, n)
+                original = deepcopy(data)
+                @test coordinate_names(built.layout) ==
+                    [Symbol(name, ".1"), Symbol(name, ".2")]
+                post = prepare_query(built, bound, :sampler)
+                sampler = prepare_sampler(built, bound, [0.3, -0.7]; backend=BACKEND)
+                for u in ([0.3, -0.7], [-0.2, 0.4])
+                    original_u = copy(u)
+                    @test Base.invokelatest(post, u) ≈ reference(data, u)
+                    g = similar(u)
+                    value, _ = sampler_value_and_gradient!(sampler, g, u)
+                    @test value ≈ reference(data, u)
+                    @test g ≈ gradient(data, u)
+                    @test u == original_u
+                    @test data == original
+                end
+            end
         end
     end
 end
@@ -119,9 +124,8 @@ end
     g = similar(u)
     value, _ = sampler_value_and_gradient!(sampler, g, u)
     @test value ≈ oracle(u)
-    h = cbrt(eps())
-    @test g ≈ [(oracle(u .+ h .* e) - oracle(u .- h .* e)) / 2h
-        for e in ([1.0, 0.0], [0.0, 1.0])] rtol=1e-6
+    residual = y .- eta .+ (y2 .- eta) ./ 0.5^2
+    @test g ≈ -u .+ [sum(residual), sum(residual .* x)]
     @test Base.invokelatest(prepare_query(built, bound, :pointwise), u).y2 ≈
         logpdf.(Normal.(eta, 0.5), y2)
 end
