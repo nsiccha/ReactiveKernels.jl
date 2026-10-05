@@ -250,7 +250,8 @@ function _external_host_cells(e, edge, values, args; kwargs...)
     cells = broadcast((x, a...)->endpoint(e.sampling.geometry, x, a...; kwargs...), values, args...)
     cells isa AbstractVector && length(cells) == e.size ||
         throw(ContractValidationError("[layout] external plate $(e.name) arguments have incompatible axes"))
-    return _host_real.(cells)
+    # An empty plate keeps the input's number type rather than `Any`.
+    return isempty(cells) ? Vector{_host_eltype(values)}() : _host_real.(cells)
 end
 function _external_cells_expr(e, edge)
     inputs = Any[_external_u(e)]
