@@ -2166,31 +2166,30 @@ end
 # independent of the lane count.
 # Plain traced vectors carry no structural marker in the core, so without this
 # claim a vector plate lowers through Reactant's generic broadcast.  Claiming
-# them routes the plate here, where a large plate still takes exactly that
-# broadcast.
+# them routes the plate here, to the same traced batch lowering as a `Ref`
+# plate (below).
 ReactiveKernels._tensorized_plate_is_marker(::Reactant.TracedRArray{<:Any,1}) =
     true
-# Reactant's broadcast promotes every operand to a traced constant before
-# applying the cell body, but it deduces the RESULT eltype first, from the RAW
-# host element type (`Int64`, not `TracedRNumber{Int64}`).  A fused cell body
-# whose result type depends on how a host scalar combines with a traced one —
-# the discrete-family validity guard `ifelse(observed >= 0, <traced>, -Inf)`
-# infers `Union{Float64,TracedRNumber{Float64}}` on a host `Bool` condition —
-# then deduces the abstract typejoin `Number`, for which Reactant defines no
-# traced `similar`, and the plate dies in
-# `similar(::Broadcasted{AbstractReactantArrayStyle}, ::Type{Number})`.
-# Promoting the host operands first (the same `promote_to` the cat/broadcast
-# wrappers of a fused body use) types the cell body on traced scalars exactly
-# as Reactant's element application evaluates it. Any remaining abstract result
-# inference goes through batch tracing below instead of broadcast allocation.
+# A vector plate never takes Reactant's generic broadcast. That broadcast
+# allocates its result from an eltype deduced by Julia inference, and the
+# answer depends on the session rather than on the program: on the raw host
+# element type of bound operands (the discrete-family validity guard
+# `ifelse(observed >= 0, <traced>, -Inf)` on a host `Bool` deduces `Number`),
+# and on what earlier traces already inferred (the first compiled model of a
+# process can deduce `Number` for a cell that later models deduce concretely).
+# Choosing the lowering from that answer made one model's raw MLIR depend on
+# what had been compiled before it, although both lowerings optimize to the
+# same program. Tracing the cell once and batching it derives the concrete
+# result leaves from the traced cell, so every vector plate lowers the same
+# way in every session, with its lazy branches unchanged.
 # The core routes a recipe to the FIRST marker-bearing operand, and this
 # extension claims plain traced vectors (above) so a vector plate lowers here.
 # Inside an `eachcol`/batched plate a traced data vector can therefore precede
-# the structural marker in a cell's operand order, and the generic broadcast
-# below would then receive the structural operand itself
-# (`length(::_TensorizedPlateBatch)` has no method).  The batched lowering
-# handles both operand kinds, so a structural marker among the operands takes
-# precedence over the plain-vector one.
+# the structural marker in a cell's operand order, and the plain-vector
+# lowering below would then receive the structural operand itself, which it
+# cannot batch.  The authored lowering handles both operand kinds, so a
+# structural marker among the operands takes precedence over the plain-vector
+# one.
 @inline _reactant_is_structural_marker(arg) = false
 # eachcol of a Base reshape view carries the same traced parent values.
 @inline _reactant_is_structural_marker(
@@ -2216,8 +2215,6 @@ end
 ReactiveKernels._tensorized_plate_is_marker(
     ::Base.RefValue{<:Union{Reactant.TracedRArray,Reactant.TracedRNumber,
         _TracedReshapedArray}}) = true
-@inline _reactant_plate_ref_array(arg) = false
-@inline _reactant_plate_ref_array(::Base.RefValue{<:AbstractArray}) = true
 @inline _reactant_plate_broadcast_input(arg::AbstractArray) =
     _reactant_plate_operand(arg)
 @inline _reactant_plate_broadcast_input(arg::Tuple) =
@@ -2259,38 +2256,13 @@ _empty_plate_batch(result) = isempty(result) ?
     zeros(Reactant.unwrapped_eltype(result), size(result)) : result
 
 function ReactiveKernels._tensorized_plate_call(
-        marker::Base.RefValue{<:Union{Reactant.TracedRArray,Reactant.TracedRNumber,
-            _TracedReshapedArray}},
+        marker::Union{Reactant.TracedRArray{<:Any,1},
+            Base.RefValue{<:Union{Reactant.TracedRArray,Reactant.TracedRNumber,
+                _TracedReshapedArray}}},
         operation, args::Tuple)
     structural = _reactant_structural_marker(args)
     structural === nothing ? _reactant_ref_plate_call(operation, args) :
         _reactant_authored_plate_call(structural, operation, args)
-end
-
-function ReactiveKernels._tensorized_plate_call(
-        marker::Reactant.TracedRArray{<:Any,1}, operation, args::Tuple)
-    structural = _reactant_structural_marker(args)
-    structural === nothing ||
-        return _reactant_authored_plate_call(structural, operation, args)
-    any(_reactant_plate_ref_array, args) &&
-        return _reactant_ref_plate_call(operation, args)
-    # A split arm with only shared inputs receives an ignored lane anchor.
-    # Its live branch can return a host fallback or a traced scalar. Generic
-    # broadcast infers their join as Number before tracing the cell; batch
-    # traces the shared branch and preserves the anchored lane domain.
-    (operation isa ReactiveKernels._LaneAnchored ||
-        (operation isa ReactiveKernels._KernelSourceOp &&
-         operation.tensor_f isa ReactiveKernels._LaneAnchored)) &&
-        return _reactant_ref_plate_call(operation, args)
-    operands = map(_reactant_plate_operand, args)
-    result_type = Base.promote_op(operation, map(Base.eltype, operands)...)
-    # Inference can widen a valid scalar cell to Number (or a numeric union),
-    # including after other generated kernels have compiled. Reactant's
-    # broadcast cannot allocate an abstract eltype; batch traces the cell once
-    # and derives its concrete result leaves without changing lazy branches.
-    (isconcretetype(result_type) && result_type <: Number) ||
-        return _reactant_ref_plate_call(operation, args)
-    Base.broadcast(operation, operands...)
 end
 
 @inline function ReactiveKernels._batched_call(
