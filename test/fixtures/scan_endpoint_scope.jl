@@ -51,6 +51,16 @@ end
     return trajectory
 end
 
+# A do-block formal passed directly to a typed endpoint argument takes that
+# argument's declared type, as a plate formal does.
+@kernel formal_argument_scan(xs, offset::Float64) = begin
+    trajectory = scan(xs, Ref(offset); init = 0.0) do previous, x, o
+        next_value = step_object(o, previous).shifted(x)
+        (next_value, next_value)
+    end
+    return trajectory
+end
+
 @kernel lazy_scan(xs) = begin
     trajectory = scan(xs; init = 0.0) do previous, x
         next_value = x > 0 ? step_object(log(x), previous).state() : previous
