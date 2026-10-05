@@ -212,15 +212,15 @@ short scans after tracing; the [scan optimization diagnostics](scan.md) record
 that behavior with correct values, ordinary reverse mode and caller ownership.
 It does not violate the RK emission requirement.
 
-Grouped PK recurrences expose a subject plate containing retained event scans.
-Their fixed-size matrix and named carry intermediates batch as typed leaves,
-with their authored wrappers restored inside each cell. Their full Reactant
-path still fails in the ordinary StaticArrays matrix exponential: its branch
-condition is a traced Boolean. This is a dependency capability boundary,
-isolated by `benchmark/repro_reactant_static_matrix_exp.jl` and tracked in
-[issue #34](https://github.com/nsiccha/ReactiveKernels.jl/issues/34).
-Eager branches, parameter-dependent host propagation, and data-derived
-unrolling are not acceptable fixes. See the [scan limitations](scan.md).
+Fixed-size matrix and named carry intermediates batch as typed leaves, with
+their authored wrappers restored inside each cell. The ordinary StaticArrays
+matrix exponential still fails on a traced matrix because its branch condition
+is a traced Boolean. This general dependency boundary is isolated by the
+synthetic dense matrix in `benchmark/repro_reactant_static_matrix_exp.jl` and
+tracked in [issue #34](https://github.com/nsiccha/ReactiveKernels.jl/issues/34).
+The original PK reproducer and model implementation are maintained downstream
+in RKPPLBench. Required lazy branches and data-derived iteration retain their
+stated constraints; see the [scan limitations](scan.md).
 
 A generator reduction inside a traced body, such as a sum over the doses of a
 schedule, lowers to one retained loop when it has an `init` and iterates a

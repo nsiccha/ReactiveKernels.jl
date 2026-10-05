@@ -3,23 +3,22 @@
 using Reactant, StaticArrays, LinearAlgebra, Test
 Reactant.set_default_backend("cpu")
 
-function pk_system(q)
+function static_matrix(q)
     Reactant.@allowscalar begin
-    k10, k12, k21, ka = exp(q[1]), exp(q[2]), exp(q[3]), exp(q[4])
-    SMatrix{3,3}(-ka, ka, 0.0, 0.0, -(k10 + k12), k12,
-        0.0, k21, -k21)
+    SMatrix{3,3}(q[1], q[2], q[3], q[4], q[5], q[6],
+        q[7], q[8], q[9])
     end
 end
-pk_step(q) = exp(pk_system(q)) * SVector(1.0, 0.0, 0.0)
+matrix_step(q) = exp(static_matrix(q)) * SVector(0.25, -0.5, 1.0)
 
 @testset "Reactant static-matrix exponential boundary" begin
-    q = log.([0.1, 0.2, 0.3, 0.5])
+    q = vec([1.2 -0.4 0.7; 0.5 0.9 -0.2; 0.1 -0.3 1.5])
     rq = Reactant.to_rarray(q)
-    matrix = Reactant.@compile pk_system(rq)
-    @test Float64.(matrix(rq)) ≈ pk_system(q)
-    @test pk_step(q) ≈ exp(Matrix(pk_system(q))) * [1.0, 0.0, 0.0]
+    matrix = Reactant.@compile static_matrix(rq)
+    @test Float64.(matrix(rq)) ≈ static_matrix(q)
+    @test matrix_step(q) ≈ exp(Matrix(static_matrix(q))) * [0.25, -0.5, 1.0]
     result = try
-        compiled = Reactant.@compile pk_step(rq)
+        compiled = Reactant.@compile matrix_step(rq)
         Float64.(compiled(rq))
     catch err
         @test err isa TypeError
@@ -29,5 +28,5 @@ pk_step(q) = exp(pk_system(q)) * SVector(1.0, 0.0, 0.0)
             endswith(string(frame.file), "expm.jl"), stacktrace(catch_backtrace()))
         nothing
     end
-    @test_broken result !== nothing && isapprox(result, pk_step(q))
+    @test_broken result !== nothing && isapprox(result, matrix_step(q))
 end

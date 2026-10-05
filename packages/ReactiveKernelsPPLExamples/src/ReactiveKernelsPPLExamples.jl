@@ -125,12 +125,11 @@ include("bym2_offset_only.jl")
 include("bones_model.jl")
 include("multi_occupancy.jl")
 
-# posteriordb dynamics batch: lotka_volterra, sir, one_comp_mm_elim_abs,
+# posteriordb dynamics batch: lotka_volterra, sir,
 # soil_incubation (native + ordinary-Reverse path under 008vhy5; compiled
 # Reactant unsupported — see each module docstring).
 include("lotka_volterra.jl")
 include("sir.jl")
-include("one_comp_mm_elim_abs.jl")
 include("soil_incubation.jl")
 
 # posteriordb structured batch: bball-drive HMMs
@@ -283,7 +282,6 @@ export BonesModelExample
 export MultiOccupancyExample
 export LotkaVolterraExample
 export SIRExample
-export OneCompMMElimAbsExample
 export SoilIncubationExample
 
 # posteriordb structured batch: bball-drive HMMs
