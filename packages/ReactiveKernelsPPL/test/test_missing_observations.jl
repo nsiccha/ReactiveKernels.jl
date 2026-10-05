@@ -91,6 +91,51 @@ function _missing_fd(f, u)
     [(f(u + h*e) - f(u - h*e))/(2h) for e in eachcol(Matrix{Float64}(I, length(u), length(u)))]
 end
 
+@testset "missing GLM rows guard density values and ordinary reverse" begin
+    for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
+        y = head === :NormalIDGLM ? Union{Missing,Float64}[0.2, missing, 0.5, missing] :
+            Union{Missing,Int}[1, missing, 0, missing]
+        # Poisson's inactive rates overflow. A zero selected output must also
+        # have zero derivative, rather than multiplying an infinite tape by 0.
+        data = (; y, x1=[0.1, 10000.0, -0.3, 10000.0], x2=[0.2, 0.2, 0.4, -0.2])
+        saved = deepcopy(data)
+        rhs = Expr(:call, head, :X, :alpha, :beta)
+        head === :NormalIDGLM && push!(rhs.args, 0.7)
+        ast = quote
+            X = hcat(x1, x2)
+            alpha ~ Normal(0, 1)
+            beta[axes(X, 2)] .~ Normal.(0, 1)
+            y ~ $rhs
+        end
+        bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
+        built = build_kernel(bound)
+        u = unconstrain(built.layout, (; alpha=0.2, beta=[0.3, -0.1]))
+        sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+        function oracle(v)
+            p = constrain(built.layout, v)
+            eta = p.alpha .+ hcat(data.x1, data.x2) * p.beta
+            out = logpdf(Normal(), p.alpha) + sum(logpdf.(Normal(), p.beta))
+            for i in eachindex(y)
+                ismissing(y[i]) && continue
+                family = head === :NormalIDGLM ? Normal(eta[i], 0.7) :
+                    head === :BernoulliLogitGLM ? Bernoulli(1/(1 + exp(-eta[i]))) : Poisson(exp(eta[i]))
+                out += logpdf(family, y[i])
+            end
+            out
+        end
+        for v in (u, u .+ [0.1, -0.05, 0.03])
+            value, gradient = sampler_value_and_gradient!(sampler, similar(v), v)
+            @test value ≈ oracle(v)
+            @test gradient ≈ _missing_fd(oracle, v) rtol=1e-5 atol=1e-8
+            pw = Base.invokelatest(prepare_query(built, bound, :pointwise), v).y
+            @test length(pw) == 4
+            @test all(iszero, pw[[2, 4]])
+        end
+        @test bound.n_obs == 4
+        @test isequal(data, saved)
+    end
+end
+
 @testset "presence guards use ordinary response family code" begin
     for kind in (:binomial, :bernoulli, :beta, :stopping, :invalid_missing_scale)
         fx = _missing_family_fixture(kind)

@@ -814,13 +814,8 @@ function _mask_response_stmts(r, plan, stmts)
             Expr(:if, present, lambda.args[2], 0.0))
         return Expr[stmts[1:i-1]..., pre..., st, stmts[i+1:end]...]
     end
-    # Fused GLM pointwise outputs are finite scalar math over the full design.
-    # Their reduction still selects presence through the same ordinary plate.
-    raw = Symbol(:_ppl_unmasked_, r.label)
-    st.args[1] = raw
-    guarded = _plate_sum_stmts(pw, _lik_name(r.label), Any[raw, mask],
-        :($(_dovar(2)) ? $(_dovar(1)) : 0.0))[1]
-    return Expr[stmts[1:i-1]..., pre..., st, guarded, stmts[i+1:end]...]
+    throw(ContractValidationError(
+        "[generator] response $(r.label) needs an observation plate for presence guards"))
 end
 
 # Stopping-ratio inputs must be packed before stage expansion. Selecting
@@ -1169,7 +1164,7 @@ end
 # rejoin as `beta_full = [alpha; beta]` (the validated P2 spelling).
 function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
         pw::Symbol)
-    if r.evidence.kind !== :none
+    if r.evidence.kind !== :none || haskey(plan.columns, _observed_mask_name(r.response))
         lp = Symbol(:_ppl_glm_eta_, r.label)
         pre = Expr[:($lp = $(r.glm_alpha) .+ $(r.predictor) * $(r.glm_beta))]
         inputs = Any[r.response, lp]

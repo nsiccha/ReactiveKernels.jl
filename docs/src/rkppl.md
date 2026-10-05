@@ -472,7 +472,8 @@ declare `z[lv]` in that order. Selections such as
 `levels(g)[1:2:end]` and `unique(g)[3:-2:1]` select positions in the
 source pool. Labels compare with `isequal`, including `missing`, `NaN`,
 and array values. A column read only as labels may contain `missing`;
-numeric observations retain their missing-value checks.
+numeric responses follow the provisional automatic missing-observation
+handling described under Plates.
 
 For paired crossed effects, index each axis by one observation's label
 inside a plate: `mu[i] = a + b[g[i], h[i]]`. Julia's `b[g, h]` with two
