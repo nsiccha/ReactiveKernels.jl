@@ -1,6 +1,6 @@
 using ReactiveKernels, ReactiveKernelsPPL
 import BayesianRegressionModels
-include(joinpath(@__DIR__, "..", "..", "packages", "ReactiveKernelsPPL", "test", "test_gp_binding.jl"))
+include(joinpath(@__DIR__, "..", "..", "packages", "ReactiveKernelsPPL", "test", "gp_binding_fixtures.jl"))
 
 module GPBindingLibrary
 using ReactiveKernels, ReactiveKernelsPPL
@@ -21,7 +21,7 @@ function _gpb_library(kind, spelling, declaration)
     K = 3
     covargs = kind === :exp_quad ? Any[:x, :amp, :rho, 1e-6] : Any[:x, :amp, :rho, 1.2, 1e-6]
     covariance = Expr(:call, covhead, covargs...)
-    value = Expr(:call, lathead, :covariance, :z)
+    value = Expr(:call, lathead, :covariance_matrix, :z)
     decl = declaration === :array ? :(z[1:$K] .~ Normal.(0, 1)) : quote
         @plate for i in eachindex(y)
             z[i] ~ Normal(0, 1)
@@ -33,7 +33,7 @@ function _gpb_library(kind, spelling, declaration)
         amp ~ LogNormal(0, 1)
         rho ~ LogNormal(0, 1)
         $decl
-        covariance = $covariance
+        covariance_matrix = $covariance
         f = $value
         y .~ Normal.(f[oi], 0.7)
     end
