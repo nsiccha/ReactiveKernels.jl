@@ -156,15 +156,10 @@ end
         for a in (0.2, -0.4)
             value = Base.invokelatest(sampler.kernel, [a])
             @test value ≈ subject_reference(data, a)
-            if n == 0
-                # Capability gap: native Enzyme static activity analysis fails
-                # for an empty child scan inside the bound eachcol plate.
-                @test_broken sampler_value_and_gradient!(sampler, [0.0], [a])[2] ≈
-                    [subject_gradient(data, a)]
-            else
-                _, grad = sampler_value_and_gradient!(sampler, [0.0], [a])
-                @test grad ≈ [subject_gradient(data, a)]
-            end
+            # Ordinary native Reverse, including an empty child scan (n == 0)
+            # inside the bound eachcol plate.
+            _, grad = sampler_value_and_gradient!(sampler, [0.0], [a])
+            @test grad ≈ [subject_gradient(data, a)]
         end
         @test data == original
     end

@@ -341,6 +341,20 @@ and lock the one Reactant 0.2.289 lifted:
   differentiates it. A bound tuple or named tuple then crosses the
   differentiated call as one operand per array leaf. Helpers inside a
   parameter-dependent function remain the backend's limitation.
+- Native Enzyme 0.13.209 reverse mode fails static activity analysis
+  (`EnzymeRuntimeActivityError`) when buffers allocated in the two arms of a
+  branch meet in one value, the empty arm's buffer is never written with
+  active data, and Base `sum` reads the merged value:
+  `repro_enzyme_branch_allocation_phi.jl` reproduces it with Enzyme only. One
+  allocation after a branch that peels the first step to type it still fails,
+  because the optimizer splits that allocation back into the arms. This was
+  the shape of an empty authored scan summed by a recipe or plate cell. When
+  the step's inferred output type is concrete, the native scan lowering now
+  allocates each buffer once, before its emptiness branch; values, element
+  types and the retained loop are unchanged, and ordinary reverse passes for
+  empty and nonempty sequences. A step without a concrete inferred output type
+  keeps per-arm allocation. No activity configuration or derivative rule is
+  involved.
 - Native Enzyme 0.13.209 on Julia 1.10.12 also rejects an ordinary untyped
   comprehension whose generator captures both an active array and a constant
   floating-point array: `repro_enzyme_generator_const_array_capture.jl`
