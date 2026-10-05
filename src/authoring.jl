@@ -2546,8 +2546,79 @@ end
 # whose `sum` is not Base's (a local, a port, or a module binding of that
 # name), a fold without `init`, and one over any other iterator: a tuple's
 # fold is Base's unrolled one, which a loop over a heterogeneous tuple is not.
-_kernel_native_body(ex, mod, names) = _kernel_native_broadcasts(
-    _kernel_native_folds(ex, mod, _local_symbols!(Set{Symbol}(names), ex)))
+function _kernel_native_body(ex, mod, names)
+    shadowed = _local_symbols!(Set{Symbol}(names), ex)
+    _kernel_native_broadcasts(_kernel_native_concats(
+        _kernel_native_folds(ex, mod, shadowed), mod, shadowed))
+end
+
+# The NATIVE body's concatenations: a call of Base's `hcat`, `vcat` or `hvcat`
+# by any resolved spelling (bare, qualified, imported, aliased or a
+# `GlobalRef`), and the bracket syntax Julia lowers to them (`[a b]`,
+# `[a; b]`, `[a b; c d]`), call the per-operand companions in core.jl
+# (`_native_hcat`, `_native_vcat`, `_native_hvcat`).  They return Base's
+# result and send every operand combination they do not specialize back to
+# Base; they exist for native Enzyme reverse, which cannot differentiate
+# Base's dense methods when constant and active operands meet (core.jl).  A
+# callee that a port or local shadows keeps its own meaning, as does a
+# function that merely shares the name; bracket syntax always means Base's
+# functions, as in Julia.  The tensorized companion keeps its own lowering
+# (`_tensorized_hcat`, ...).
+function _kernel_native_concats(ex, mod, shadowed::Set{Symbol})
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert, :meta, :macrocall) && return ex
+    args = Any[_kernel_native_concats(arg, mod, shadowed) for arg in ex.args]
+    if ex.head === :hcat
+        return Expr(:call, GlobalRef(@__MODULE__, :_native_hcat), args...)
+    elseif ex.head === :vcat
+        any(arg -> arg isa Expr && arg.head === :row, args) ||
+            return Expr(:call, GlobalRef(@__MODULE__, :_native_vcat), args...)
+        # `[a b; c d]` is `hvcat((2, 2), a, b, c, d)`: one count per block row.
+        rows = Int[arg isa Expr && arg.head === :row ? length(arg.args) : 1
+                   for arg in args]
+        operands = Any[]
+        for arg in args
+            arg isa Expr && arg.head === :row ? append!(operands, arg.args) :
+                push!(operands, arg)
+        end
+        # A splatted block has no static row count; keep Julia's lowering.
+        any(arg -> arg isa Expr && arg.head === :..., operands) &&
+            return Expr(ex.head, args...)
+        return Expr(:call, GlobalRef(@__MODULE__, :_native_hvcat),
+                    Expr(:tuple, rows...), operands...)
+    elseif ex.head === :call && !isempty(args) &&
+           !any(arg -> arg isa Expr && arg.head === :parameters, args)
+        callee = ex.args[1]
+        replacement = _native_concat_shadowed(callee, shadowed) ? nothing :
+            _native_concat_replacement(callee, mod)
+        replacement === nothing ||
+            return Expr(:call, GlobalRef(@__MODULE__, replacement), args[2:end]...)
+    end
+    Expr(ex.head, args...)
+end
+
+_native_concat_shadowed(callee, shadowed) = false
+_native_concat_shadowed(callee::Symbol, shadowed) = callee in shadowed
+_native_concat_shadowed(callee::Expr, shadowed) =
+    callee.head === :. && !isempty(callee.args) &&
+    _native_concat_shadowed(callee.args[1], shadowed)
+
+_native_concat_function_replacement(fn) =
+    fn === Base.hcat ? :_native_hcat :
+    fn === Base.vcat ? :_native_vcat :
+    fn === Base.hvcat ? :_native_hvcat : nothing
+function _native_concat_replacement(callee, mod)
+    if callee isa GlobalRef
+        isdefined(callee.mod, callee.name) || return nothing
+        return _native_concat_function_replacement(
+            getglobal(callee.mod, callee.name))
+    end
+    # Only a resolved binding is rewritten: a module that does not bind the
+    # name, or source lowered without a module, keeps the call as written.
+    mod isa Module || return nothing
+    fn = _kernel_resolve_binding(mod, callee)
+    fn === nothing ? nothing : _native_concat_function_replacement(fn)
+end
 
 function _kernel_native_broadcasts(ex; in_dotted::Bool = false)
     ex isa Expr || return ex
@@ -3070,6 +3141,7 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
         if callee isa Symbol && !callee_is_port && !_is_broadcast_operator(callee) &&
            (!tensorize || (_tensorized_callee_replacement(callee, mod) === nothing &&
                            !_kernel_callee_has_traced_method(callee, mod))) &&
+           _native_concat_replacement(callee, mod) === nothing &&
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
             return callee                                   # BARE exact identity — stays raw (validated)
