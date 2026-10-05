@@ -863,10 +863,10 @@ function _indexed_observation_definitions(ast::Expr, data::Set{Symbol})
                      (_mentions_symbol(st.args[3], :MixtureModel) &&
                       _literal_row_range(lhs.args[2])))
                 k = 1
-                name = Symbol(:_rkppl_observed_, lhs.args[1], :_, k)
+                name = Symbol(_OBSERVED_GATHER_PREFIX, lhs.args[1], :_, k)
                 while name in taken
                     k += 1
-                    name = Symbol(:_rkppl_observed_, lhs.args[1], :_, k)
+                    name = Symbol(_OBSERVED_GATHER_PREFIX, lhs.args[1], :_, k)
                 end
                 push!(taken, name)
                 push!(out, Expr(:(=), name, lhs))
@@ -3130,12 +3130,27 @@ function _hcat_value_reads(det, detmap, sample, data, glms,
         if s.lhs ∉ data && s.broadcast && s.matrix !== nothing)
     valued(X, w, composed) = (composed || !(w isa Symbol && w in sized_by)) &&
         (w isa Symbol || w isa Expr) && shape(w) === :array
+    # Naming a subexpression never changes its classification: a definition
+    # read inside a composition (`p = X * b; mu = f(p)`, or a submodel's
+    # returned product) is composed exactly as its inline spelling
+    # (`mu = f(X * b)`) is, so its own right-hand side is rescanned in that
+    # context until no further definition is reached.
+    composed_defs = Set{Symbol}()
     for (nm, rhs) in det
         nm in mats && continue
-        _matrix_value_reads!(out, rhs, mats, valued, true)
+        _matrix_value_reads!(out, rhs, mats, valued, true;
+            defs = detmap, composed_defs)
     end
     for s in sample
-        _matrix_value_reads!(out, s.rhs, mats, valued, false)
+        _matrix_value_reads!(out, s.rhs, mats, valued, false;
+            defs = detmap, composed_defs)
+    end
+    rescanned = Set{Symbol}()
+    while !issubset(composed_defs, rescanned)
+        nm = first(setdiff(composed_defs, rescanned))
+        push!(rescanned, nm)
+        _matrix_value_reads!(out, detmap[nm], mats, valued, true;
+            affine = false, defs = detmap, composed_defs)
     end
     for s in sample
         X = get(coefvec, s.lhs, nothing)
@@ -3150,16 +3165,23 @@ const _MATRIX_OPERAND_HEADS = (:+, :-, :*, :/, :^, :\, ELEMENTWISE_OPS...)
 
 # Value reads of the matrices `mats` in `ex`: `X * v` with `valued(X, v)`,
 # and, inside a definition (`indef`), `X` as an argument of a function call
-# (`eachcol(X)`, `size(X, 2)`), an indexed `X[...]`, or `X'`.
+# (`eachcol(X)`, `size(X, 2)`), an indexed `X[...]`, or `X'`. A definition
+# name of `defs` read in a composed (non-affine) position joins
+# `composed_defs`, for the caller to rescan its right-hand side.
 function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
-        affine::Bool = true)
+        affine::Bool = true, defs = nothing, composed_defs = nothing)
+    if ex isa Symbol
+        !affine && defs !== nothing && haskey(defs, ex) && ex ∉ mats &&
+            push!(composed_defs, ex)
+        return out
+    end
     ex isa Expr || return out
     a = ex.args
     if ex.head === :call && length(a) == 3 && a[1] === :* &&
             a[2] isa Symbol && a[2] in mats
         valued(a[2], a[3], !affine) && push!(out, a[2])
         return _matrix_value_reads!(out, a[3], mats, valued, indef;
-            affine = false)
+            affine = false, defs, composed_defs)
     end
     if indef
         isarg(x) = x isa Symbol && x in mats
@@ -3180,7 +3202,7 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
     child_affine = affine && !(composed && fn ∉ (:+, :.+, :-, :.-))
     for x in a
         _matrix_value_reads!(out, x, mats, valued, indef;
-            affine = child_affine)
+            affine = child_affine, defs, composed_defs)
     end
     return out
 end
@@ -3599,9 +3621,15 @@ end
 # the desugared `y[a:b]` form), `eachindex(v)`, `axes(v, 1)`.
 function _plate_range_kind(R)
     R isa Expr && R.head === :call && !isempty(R.args) || return _sfail(
-        "`@plate` range must be `1:N`, `eachindex(v)`, `axes(v, 1)`, or " *
+        "`@plate` range must be a literal `a:b`, `eachindex(v)`, `axes(v, 1)`, or " *
         "`levels(g)` — got $(repr(R)) (values-iteration is planned)")
-    R.args[1] === :(:) && return (:coloncall, R)
+    if R.args[1] === :(:)
+        # Folded literal endpoints give the response range and the selected
+        # cells one spelling; an unbound endpoint fails at the response.
+        lo, hi = length(R.args) == 3 ? _static_count.(R.args[2:3]) : (nothing, nothing)
+        return (:coloncall, lo isa Integer && hi isa Integer ?
+            Expr(:call, :(:), lo, hi) : R)
+    end
     R.args[1] === :eachindex && length(R.args) == 2 &&
         R.args[2] isa Symbol && return (:eachindex, R.args[2])
     R.args[1] === :axes && length(R.args) == 3 && R.args[2] isa Symbol &&
@@ -3609,7 +3637,7 @@ function _plate_range_kind(R)
         return (:axes, R.args[2], Int(R.args[3]))
     R.args[1] === :levels && length(R.args) == 2 && R.args[2] isa Symbol &&
         return (:levels, R.args[2])
-    return _sfail("`@plate` range must be `1:N`, `eachindex(v)`, " *
+    return _sfail("`@plate` range must be a literal `a:b`, `eachindex(v)`, " *
                   "`axes(v, 1)`, or `levels(g)` — got $(repr(R))")
 end
 
@@ -3955,9 +3983,9 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
         obj = Expr(:., obj.args[1], Expr(:tuple, obj.args[2:end]...))
     end
     if rkind[1] === :coloncall
-        # Literal ranges take the slice-A `y[a:b]` structural checks (start 1,
-        # literal endpoints); lowering then keeps them as explicit indices
-        # (`indexed_observations`), so the loop selects its authored cells.
+        # A literal range keeps its authored indices (`indexed_observations`),
+        # so the loop selects exactly its cells, as `eachindex` / `axes` do;
+        # binding checks them against the response like Julia indexing.
         return Expr[Expr(:call, :.~, Expr(:ref, col, rkind[2], lhs.args[3:end]...), obj)]
     end
     index = rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
@@ -3980,7 +4008,13 @@ end
 # 1)` over a data column ride as the column `v` (one cell per entry, proved
 # at bind); over a definition ⇒ the definition's own observation axis.
 function _plate_param_range(name::Symbol, rkind, data::Set{Symbol})
-    rkind[1] === :coloncall && return _lower_lhs_range(name, rkind[2]; allow_empty=true)
+    if rkind[1] === :coloncall
+        range = _lower_lhs_range(name, rkind[2])
+        isempty(range) && return 1:0
+        first(range) == 1 || _sfail("per-cell latent $name over " *
+            "$(repr(rkind[2])) is not built yet: latent plate cells are `1:N`")
+        return range
+    end
     return rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
         Expr(:call, :axes, rkind[2], rkind[3])
 end
@@ -4286,7 +4320,8 @@ function _sample_lhs(lhs, bc, tilde, data, level_bindings)
         all(a -> a isa Integer && !(a isa Bool) && a >= 1, lhs.args[3:end]) ||
             _sfail("response trailing indices must be positive literal integers")
         range = _lower_lhs_range(lhs.args[1], lhs.args[2])
-        range isa UnitRange && (range = Expr(:ref, lhs.args[1], lhs.args[2]))
+        range isa UnitRange && (range = Expr(:ref, lhs.args[1],
+            Expr(:call, :(:), first(range), last(range))))
         range isa Expr || _sfail("multidimensional response slices need an index axis")
         append!(range.args, lhs.args[3:end])
         return lhs.args[1], range, nothing, nothing
@@ -4701,19 +4736,17 @@ function _subset_range(col::Symbol, lo::Integer, hi::Integer)
     return UnitRange(Int(lo), Int(hi))
 end
 
-function _lower_lhs_range(col::Symbol, r; allow_empty::Bool=false)
-    # Literal `1:N` retains its authored extent. Response callers keep their
-    # existing nonempty range contract; a latent declaration may be empty.
+function _lower_lhs_range(col::Symbol, r)
+    # A literal `a:b` is its authored range. Each consumer states its own
+    # requirement: a plate observation selects these indices, a top-level
+    # response covers its whole column (the IR contract), and a per-cell
+    # latent defines cells `1:N`.
     if r isa Expr && r.head === :call && length(r.args) == 3 && r.args[1] === :(:)
         lo, hi = _static_count(r.args[2]), _static_count(r.args[3])
-        lo === 1 || _sfail("response $col range must start at 1 " *
-                           "(got $(repr(r))) — ranges cover eachindex exactly")
-        hi isa Integer || _sfail("response $col range endpoint is " *
-                                 "unbound ($(repr(hi))) — no `n` is bound in " *
-                                 "the surface; write `eachindex($col)` or a " *
-                                 "literal `1:N`")
-        (allow_empty || hi >= 1) || _sfail("response $col range $(repr(r)) is empty")
-        return UnitRange(1, Int(hi))
+        lo isa Integer && hi isa Integer || _sfail("response $col range " *
+            "$(repr(r)) has an unbound endpoint — no count is bound in the " *
+            "surface; write `eachindex($col)` or a literal range")
+        return UnitRange(lo, hi)
     end
     # Self-covering forms: the column's own full index set, by construction.
     if r isa Expr && r.head === :call && !isempty(r.args) && r.args[1] === :eachindex
@@ -8535,6 +8568,18 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             # readers, such as a reduction of a library contrast.
             node in datas || push!(datas, node)
             return node
+        elseif get(ctx.detshape, node, :scalar) === :vector &&
+                _composed_data_only(node, ctx, Set{Symbol}())
+            # A data-only definition (`v = log.(x .+ 2)`) is a derived
+            # column, read like the data its inline spelling reads.
+            node in datas || push!(datas, node)
+            return node
+        elseif _is_array_def(node, ctx)
+            # A model-level array definition (`r = d[:, 1]`, a column of a
+            # collected row matrix) is one value leaf, as its inline
+            # spelling is: naming a subexpression never changes legality.
+            node in scalars || push!(scalars, node)
+            return node
         elseif haskey(ctx.detmap, node)
             return _sfail("$where combines $node, which is neither an " *
                 "affine sub-predictor nor a scalar (latent/scan " *
@@ -8577,6 +8622,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         "sub-predictors and scalars)")
     isempty(node.args) && return _sfail("$where has an empty call node")
     op = node.args[1]
+    # An undotted module call over data and model values (`f(x)`,
+    # `f(s, x)`) is one model-level value leaf, as its named spelling
+    # (`v = f(x)`) and a call reading no column are.
+    op isa GlobalRef && !_composed_has_sub(node, ctx, true) &&
+        return _composed_scalar_leaf!(pname, node, ctx, scalars)
     op isa Symbol || return _sfail("$where has an anonymous call node")
     args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
     if op === :.* || op === :.+ || op ===:.-

@@ -16,6 +16,39 @@ end
     return total
 end
 
+@kernel split_arm_scale(y::Vector{Float64}, scale::Float64) = begin
+    pointwise = plate(y, scale) do yi, si
+        cell::Float64 = yi <= 0 ? (si > 0 ? log(si) : -Inf) : si * yi
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@testset "bound split-arm plates under unannotated native Reverse" begin
+    datasets = (Float64[], [0.0, 1.0, 2.0], repeat([0.0, 1.0, 2.0], 11),
+                [-2.0, 0.0, -1.0], [1.0, 2.0, 3.0])
+    for y in datasets
+        saved_y = copy(y)
+        k = prepare(split_arm_scale; have=(:y, :scale), want=:total, bound=(; y))
+        for scale in (1.3, -0.4, 0.0, 3.1)
+            expected, derivative = 0.0, 0.0
+            for yi in y
+                if yi <= 0
+                    expected += scale > 0 ? log(scale) : -Inf
+                    derivative += scale > 0 ? inv(scale) : 0.0
+                else
+                    expected += scale * yi
+                    derivative += yi
+                end
+            end
+            @test k(scale) ≈ expected
+            @test y == saved_y
+            @test only(Enzyme.gradient(Enzyme.Reverse, k, scale)) ≈ derivative
+            @test y == saved_y
+        end
+    end
+end
+
 # Plain Julia control with fresh output and a runtime loop, independent of RK.
 function weighted_loop(q, X, weights)
     packed = similar(X, eltype(q), length(X))

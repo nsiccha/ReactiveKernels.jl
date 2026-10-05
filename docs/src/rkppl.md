@@ -376,12 +376,12 @@ child port annotations accept the caller's declared types; declared boundaries
 keep their types. The emitted `kernel_expr` remains the source of the graph,
 so evaluating that expression retains the same child operations.
 
-Composition exposes the child's execution capabilities. Native Enzyme reverse
-currently fails for an empty child scan inside a bound `eachcol` subject plate.
-The default compiled backend expands small subject plates into copies of the
-child scan, so those shapes still lack retained-loop structural acceptance.
-The composition tests keep both gaps visible; nonempty native values and
-derivatives and larger compiled subject plates are covered separately.
+Composition exposes the child's execution capabilities. Ordinary native
+Enzyme reverse covers empty and nonempty child scans, including inside a bound
+`eachcol` subject plate. The default compiled backend expands small subject
+plates into copies of the child scan, so those shapes still lack retained-loop
+structural acceptance. The composition tests keep that gap visible; larger
+compiled subject plates are covered separately.
 
 A data-only call used only by a parameter-dependent function runs once when
 `prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
@@ -504,9 +504,16 @@ observation axis.
 
 ## Design matrices
 
-Bind the matrix once with `hcat` (the `1` is the intercept column), use it only
-as `X * b`, and size the coefficients with an axes prior. Scalar prior arguments
-are shared across elements; literal vectors give one value per element.
+Bind the matrix once with `hcat` and size the coefficients with an axes prior.
+Use `ones(length(x1))` for an intercept column. Scalar prior arguments are
+shared across elements; literal vectors give one value per element.
+
+Direct `X * b` reads can use the affine design path. A product passed to a
+function, such as `f(X * b)`, reads the matrix as an ordinary Julia value.
+Naming it first (`p = X * b; mu = f(p)`) or returning it from a submodel
+preserves the inline expression's density, priors and coefficient coordinates.
+A direct product can also be an affine component in a composed predictor,
+such as `p = X * b; mu = p .+ q` with another component `q`.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
@@ -529,6 +536,14 @@ broadcast spelling.
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
+
+Literal observation ranges select their authored indices. For example,
+`@plate for i in 2:6` reads `y[2:6]` and the corresponding indexed arguments;
+`3:3` selects one cell, and `1:0` selects none. Every supplied response entry
+must be observed, so entries outside the selection must be `missing`.
+Binding rejects a supplied entry left unobserved, a selected `missing` entry,
+or an index outside the bound array. Skipped missing entries contribute no
+likelihood or pointwise output.
 
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
@@ -692,6 +707,13 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.
+- `constrain`, `unconstrain` and `logjac` follow the number type of their
+  input: `BigFloat` input gives `BigFloat` values, and other number types,
+  such as dual numbers, pass through the transforms unchanged. Plain reals
+  give `Float64` values, as before. Caller-owned parameter geometry receives
+  the same numbers in its endpoints. Generic number support does not establish
+  native Enzyme support for these layout-based calls; use `prepare_sampler`
+  for posterior gradients through the model graph.
 - Explicit parameter declarations keep their authored names. For
   `a ~ Normal(0, 1); b ~ Normal(0, 2); mu = a .+ b .* x`, the coordinates
   are `a`, `b` and the constrained values are `nt.a`, `nt.b`.
@@ -739,6 +761,20 @@ side.
   `bound = plan` to add the generated pre-build `@kernel` program and
   `query = prepare_query(...)` to add that prepared program. The view only
   reads these values; nothing is lowered, bound, built or evaluated again.
+- `recipe_inventory` lists a program's plates and scans with their nesting, so a
+  structure check reads the public contract rather than internal operation
+  types. For a model whose subject plate holds a child scan, beside its
+  observation plate:
+
+  ```julia
+  structure(program) = [(e.kind, e.depth) for e in recipe_inventory(program)
+                        if e.kind !== :ordinary]
+  structure(built.spec)                         # [(:plate, 0), (:scan, 1), (:plate, 0)]
+  structure(prepare_sampler(built, plan, u; backend).kernel)   # the same, data bound
+  ```
+
+  `recipe_kind(recipe)` classifies one recipe, and `plate_body`/`scan_body`
+  return a body plan; see the ReactiveKernels compiler page.
 - `kernel_expr(plan, built.layout)` returns the generated `@kernel` program
   shown above.
 - `packages/ReactiveKernelsPPL/report/transpile_report.jl --surface model.jl
