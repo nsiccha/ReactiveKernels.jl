@@ -1905,6 +1905,24 @@ function _guard_missing_observation_argument(name, ex, plan, columns)
     return guarded
 end
 
+_guarded_argument_is_bound(ex, columns) =
+    all(inp -> _expr_value_symbols(inp) ⊆ Set{Symbol}(keys(columns)), ex.args[1].args[2:end])
+
+# A guarded data-only cell can return a numeric value or its integer neutral
+# arm. Its ordinary preparation-time result needs promoted concrete storage
+# before becoming an RK bound operand. Traced numeric arrays already have a
+# concrete element type; no value-dependent host work is performed on them.
+function _concrete_guarded_numeric_storage(value)
+    if value isa AbstractArray{<:Real} && !isconcretetype(eltype(value)) && !isempty(value)
+        T = foldl((t, v) -> promote_type(t, typeof(v)), value; init=Union{})
+        isconcretetype(T) && return T.(value)
+    end
+    return value
+end
+
+_concrete_guarded_argument(ex) = Expr(:call,
+    GlobalRef(@__MODULE__, :_concrete_guarded_numeric_storage), ex)
+
 """Broadcast domains of bound observation statements: `(; rows, total,
 domains)`, where `domains` maps response labels to Julia broadcast axes.
 Singleton operands do not join independent domains. Structured constructors
@@ -6659,11 +6677,8 @@ function _materialize_module_data!(plan::StructuralPlan,
         bind_only = true), already)
     isempty(names) && return names
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
-    guarded_arguments = Set{Symbol}()
     for d in plan.derived
-        ex = _guard_missing_observation_argument(d.name, d.expr, plan, columns)
-        exprs[d.name] = ex
-        ex === d.expr || push!(guarded_arguments, d.name)
+        exprs[d.name] = _guard_missing_observation_argument(d.name, d.expr, plan, columns)
     end
     vector_defs = Set{Symbol}(d.name for d in plan.derived)
     memo = Dict{Symbol,Any}()
@@ -6675,16 +6690,7 @@ function _materialize_module_data!(plan::StructuralPlan,
         haskey(columns, nm) && return columns[nm]
         haskey(exprs, nm) || throw(ContractValidationError(
             "[bind] data definition reads $nm, which is not bound data"))
-        value = _eval_value_expr(exprs[nm], lookup, nm; calls)
-        if nm in guarded_arguments && value isa AbstractArray{<:Real} &&
-                !isconcretetype(eltype(value)) && !isempty(value)
-            # The private absent arm returns zero without evaluating the
-            # authored cell. Promote its storage with the actual numeric
-            # results, preserving Float32/wider host types and every axis.
-            T = foldl((t, v) -> promote_type(t, typeof(v)), value; init=Union{})
-            isconcretetype(T) && (value = T.(value))
-        end
-        memo[nm] = value
+        memo[nm] = _eval_value_expr(exprs[nm], lookup, nm; calls)
         return memo[nm]
     end
     for nm in sort!(collect(names))

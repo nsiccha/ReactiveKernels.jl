@@ -320,6 +320,8 @@ function _assignment_statements(plan::StructuralPlan;
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
         ex = _guard_missing_observation_argument(name, by_name[name].expr, plan, plan.columns)
+        ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
+            (ex = _concrete_guarded_argument(ex))
         ex = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
         ex = _split_gp_cov_calls!(stmts, name, ex, plan)
         if _expr_value_symbols(ex) ⊆ dataonly
@@ -546,10 +548,13 @@ _composed_map_emit(f) = f
 function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
         pred::Symbol)
     if _is_plate_column_expr(node)
+        original = node
         node = _guard_missing_observation_argument(pred, node, plan, plan.columns)
         aliases = Dict{Symbol,Symbol}(s => _lp_name(_predictor(plan, s)) for s in subs)
         inputs = [_hsubst(a, aliases) for a in node.args[1].args[2:end]]
-        return Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
+        value = Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
+        return node !== original && _guarded_argument_is_bound(node, plan.columns) ?
+            _concrete_guarded_argument(value) : value
     end
     if node isa Symbol
         node in subs || return node

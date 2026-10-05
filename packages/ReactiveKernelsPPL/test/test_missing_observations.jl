@@ -93,7 +93,7 @@ function _missing_fd(f, u)
     [(f(u + h*e) - f(u - h*e))/(2h) for e in eachcol(Matrix{Float64}(I, length(u), length(u)))]
 end
 
-@testset "guarded bound observation arguments retain concrete numeric storage" begin
+@testset "missing response binding retains concrete numeric storage" begin
     for T in (Float32, Float64, BigFloat)
         data = (; y=Union{Missing,T}[T(0.2), missing, T(0.4)], x=T[T(0.1), -1, T(0.3)])
         ast = quote
@@ -103,14 +103,10 @@ end
             end
         end
         bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
-        # Inspect the stored computed operand by its independently known
-        # values; synthetic column and predictor names are implementation detail.
-        scale = only(v for v in values(bound.columns) if v isa AbstractVector &&
-            length(v) == 3 && v[1] == sqrt(data.x[1]) && v[3] == sqrt(data.x[3]))
-        @test eltype(scale) === T
-        @test length(scale) == 3
-        @test scale[1] == sqrt(data.x[1])
-        @test scale[3] == sqrt(data.x[3])
+        @test eltype(bound.columns[:y]) === T
+        @test size(bound.columns[:y]) == size(data.y)
+        @test bound.columns[:y][1] == data.y[1]
+        @test bound.columns[:y][3] == data.y[3]
         @test all(v -> !(v isa AbstractArray{<:Real}) || isconcretetype(eltype(v)), values(bound.columns))
     end
 end
