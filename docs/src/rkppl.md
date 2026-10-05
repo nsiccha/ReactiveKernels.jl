@@ -512,6 +512,8 @@ Direct `X * b` reads can use the affine design path. A product passed to a
 function, such as `f(X * b)`, reads the matrix as an ordinary Julia value.
 Naming it first (`p = X * b; mu = f(p)`) or returning it from a submodel
 preserves the inline expression's density, priors and coefficient coordinates.
+A direct product can also be an affine component in a composed predictor,
+such as `p = X * b; mu = p .+ q` with another component `q`.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
