@@ -358,7 +358,6 @@ function _check_rendered_docs!(advisories, build_dir, page_tree;
         "multi-occupancy.md" => 1,
         "lotka-volterra.md" => 1,
         "sir.md" => 1,
-        "one-comp-mm-elim-abs.md" => 1,
         "soil-incubation.md" => 1,
         "hmm-drive-1.md" => 1,
         "mnist-logistic.md" => 2,

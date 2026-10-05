@@ -96,7 +96,6 @@ site_pages = [
             "Multi-occupancy (marginalized)" => "multi-occupancy.md",
             "Lotka–Volterra adaptive ODE" => "lotka-volterra.md",
             "SIR with environmental bacteria" => "sir.md",
-            "One-compartment Michaelis–Menten" => "one-comp-mm-elim-abs.md",
             "Soil incubation two-pool carbon" => "soil-incubation.md",
         ],
         "Gaussian processes" => [

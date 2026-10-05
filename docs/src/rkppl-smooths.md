@@ -14,6 +14,12 @@ Model-specific bases, spectral weights, defaults and scientific acceptance
 belong with the BRM implementation. PK-specific models and helpers belong to
 downstream RKPPLBench.
 
+The PosteriorDB `one_comp_mm_elim_abs` model, full observation fixture and
+scientific oracle are maintained in RKPPLBench under
+`examples/posteriordb_pk/`. Its former RK-PPL example module and executable
+walkthrough are removed after that downstream adoption. General ODE and
+compiler machinery remain in ReactiveKernels.
+
 Import preparation helpers from
 `BayesianRegressionModels.StatisticalPreparation` into the model module.
 The compiler no longer carries spline, HSGP, monotonic, DAR or varying-effect
