@@ -450,6 +450,31 @@ function _authored_scan_step_output_type(step, input_types, offset)
     get(types, canon_id(p.graph, p.want[2].id), nothing)
 end
 
+# These roots are compiler-generated type queries, not arbitrary user code.
+# Their Expr objects form a DAG: substituting a shared predecessor at every
+# use turns a sequence of diamonds into an exponentially large Julia AST.
+# Emit each reachable query once, in dependency order and in the block where
+# the root already executes. Identity memoization visits the DAG once; after
+# replacing children with locals, structural interning also shares separately
+# constructed identical queries without hashing their expanded trees.
+function _bind_native_type_exprs!(body, roots)
+    nodes = IdDict{Expr,Any}()
+    queries = Dict{Expr,Symbol}()
+    bind(x) = x
+    function bind(ex::Expr)
+        get!(nodes, ex) do
+            ex.head in (:call, :curly) || return ex
+            query = Expr(ex.head, map(bind, ex.args)...)
+            get!(queries, query) do
+                name = gensym(:native_type)
+                push!(body.args, Expr(:(=), name, query))
+                name
+            end
+        end
+    end
+    map(bind, roots)
+end
+
 # Inline the scalar step into the ordered native loop. Calling the nested
 # PreparedKernel from a loop with a changing carry defeats inference across the
 # RGF boundary; the same step AST and operation table specialize normally here.
@@ -503,7 +528,9 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         _authored_scan_step_output_type(step, step_input_types, offset), Any)
     invariant = Any[]
     initial_output, loop_output, final_output = Expr(:block), Expr(:block), Expr(:block)
-    empty_output = Expr(:block, :($output_type = $empty_output_type))
+    empty_output = Expr(:block)
+    empty_output_type = only(_bind_native_type_exprs!(empty_output, [empty_output_type]))
+    push!(empty_output.args, :($output_type = $empty_output_type))
     if lhs !== nothing && _scan_includes_init(op)
         seed, similar_ref = callargs[1], GlobalRef(Base, :similar)
         promote_ref, length_ref = GlobalRef(Base, :promote_type), GlobalRef(Base, :length)
@@ -1439,6 +1466,7 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     inferred_eltype = nested === nothing ?
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
             GlobalRef(Core, :Any)) : nested.type
+    inferred_eltype = only(_bind_native_type_exprs!(body, [inferred_eltype]))
     push!(body.args, Expr(:(=), plate_eltype,
         Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
              inferred_eltype, valtype(only(inner.want)))))
@@ -1500,8 +1528,11 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
         args = Any[_authored_plate_scalar_ref(
             inner, locals, callargs, callvalues, prepared_arguments, atomic,
             input, index, true) for input in inner.have]
+        # Hint queries used only by a cell stay inside its loop: an empty outer
+        # domain must not evaluate new queries merely to bind an unused hint.
+        input_types = _bind_native_type_exprs!(loopbody, nested.input_types)
         append!(loopbody.args,
-            _embedded_statements(nested.ast, [args; nested.input_types],
+            _embedded_statements(nested.ast, [args; input_types],
                                  nested_result, nested.offset))
     end
     for (roots, recipe_indices) in groups
