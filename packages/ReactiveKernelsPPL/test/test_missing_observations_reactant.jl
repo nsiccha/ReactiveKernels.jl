@@ -8,7 +8,7 @@ function _missing_save_ir(name, kind, text)
     write(joinpath(dir, "$name-$kind"), text)
 end
 
-function _missing_compiled_check(fx, name; structure=false)
+function _missing_compiled_check(fx, name; structure=false, oracle_rtol=1e-9)
     println("MISSING_COMPILED ", name)
     saved = deepcopy(fx.data)
     kernel = fx.sampler.kernel
@@ -19,7 +19,7 @@ function _missing_compiled_check(fx, name; structure=false)
         input = Reactant.to_rarray(u)
         value, grad = sampler_value_and_gradient!(fx.sampler, similar(u), u)
         cv, cg = reverse(input)
-        @test Float64(primal(input)) ≈ fx.oracle(u) rtol=1e-9
+        @test Float64(primal(input)) ≈ fx.oracle(u) rtol=oracle_rtol
         @test Float64(cv) ≈ value rtol=1e-9
         @test Array(cg) ≈ grad rtol=1e-8 atol=1e-9
         @test Array(input) == u
@@ -126,6 +126,10 @@ end
     for kind in (:local, :scale), n in (5, 9)
         _missing_compiled_check(_missing_compiled_cell_fixture(kind, n), "$kind-$n"; structure=true)
     end
+    # Float32 scale arithmetic has Float32 rounding; native/compiled parity
+    # and gradient checks above retain their tighter Float64 tolerances.
+    _missing_compiled_check(_missing_compiled_cell_fixture(:scale, 5; T=Float32),
+        "scale-float32-5"; structure=true, oracle_rtol=eps(Float32))
     for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM), n in (5, 9)
         _missing_compiled_check(_missing_compiled_glm_fixture(head, n), "$head-$n"; structure=true)
     end
