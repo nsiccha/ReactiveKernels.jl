@@ -17,8 +17,8 @@
 # Synthesis is authoring-time only: graphs built by hand through `Graph()` /
 # `add!` keep exactly the recipes they are given. A reverse edge is added only
 # when no equivalent recipe (same canonical input, same canonical output,
-# `===` operation) already exists, so hand-written pairs are unchanged, and the
-# pass runs once over a snapshot — a synthesized edge's own reverse is the
+# identical authored function) already exists, so hand-written pairs are unchanged.
+# The pass runs once over a snapshot — a synthesized edge's own reverse is the
 # original recipe, so no fixpoint iteration is needed.
 
 """
@@ -46,7 +46,7 @@ function _kernel_synthesize_recipe_edges!(graph::Graph, recipe::Recipe)
     canon_id(graph, forward_input.id) == canon_id(graph, forward_output.id) &&
         return nothing
     reversed_op = try
-        inverse(recipe.op)
+        inverse(_kernel_operation_identity(recipe))
     catch
         return nothing
     end
@@ -68,7 +68,7 @@ function _kernel_has_equivalent_recipe(
         canon_id(graph, only(candidate.inputs).id) == input_id || continue
         any(o -> canon_id(graph, o.id) == output_id, candidate.outputs) ||
             continue
-        candidate.op === op && return true
+        _kernel_operation_identity(candidate) === op && return true
     end
     false
 end

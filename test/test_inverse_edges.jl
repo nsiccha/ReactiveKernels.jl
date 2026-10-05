@@ -10,6 +10,31 @@ using ReactiveKernels
     y::Float64 = log(x)
 end
 
+# Native exp lowering is wrapped even for scalar ports. Its authored identity
+# still supplies log as the inverse, independently of that execution wrapper.
+@kernel exp_only(x::Float64) = begin
+    y::Float64 = exp(x)
+end
+
+const exp_alias = exp
+@kernel qualified_exp(x::Float64) = begin
+    y::Float64 = Base.exp(x)
+end
+@kernel aliased_exp(x::Float64) = begin
+    y::Float64 = exp_alias(x)
+end
+@eval @kernel generated_exp(x::Float64) = begin
+    y::Float64 = $(GlobalRef(Base, :exp))(x)
+end
+
+# Mutable bindings do not establish immutable authored call identity.
+mutable_exp = exp
+build_mutable_exp() = @kernel begin
+    x::Float64
+    y::Float64 = mutable_exp(x)
+    return y
+end
+
 # The hand-written bidirectional pair this feature replaces: synthesis must
 # detect the already-authored reverse edge and add nothing.
 @kernel manual_pair(scale::Float64) = begin
@@ -68,6 +93,14 @@ build_ubu_spec() = @kernel begin
     return y
 end
 
+# A user-owned function with a tracing companion also gets a source wrapper.
+@traceable cube(x) = x^3
+build_cube_spec() = @kernel begin
+    x::Float64
+    y::Float64 = cube(x)
+    return y
+end
+
 end # module InverseEdgesFixture
 
 using InverseFunctions
@@ -92,11 +125,34 @@ using InverseFunctions
         @test backward(3.0) == -3.0
     end
 
+    @testset "wrapped exact calls retain automatic inverses" begin
+        for spec in (F.exp_only, F.qualified_exp, F.aliased_exp, F.generated_exp)
+            @test length(spec.graph.recipes) == 2
+            @test prepare(spec; have = (:x,), want = :y)(0.7) ≈ exp(0.7)
+            backward = prepare(spec; have = (:y,), want = :x)
+            @test backward(exp(0.7)) ≈ 0.7
+            @test only(plan(spec; have = (:y,), want = :x).recipes).op === log
+        end
+    end
+
+    @testset "mutable bindings cannot change inverse identity" begin
+        @eval InverseEdgesFixture mutable_exp = log
+        try
+            dynamic = F.build_mutable_exp()
+            @test length(dynamic.graph.recipes) == 1
+            @test prepare(dynamic)(0.7) ≈ exp(0.7)
+            @test_throws PlanningError plan(dynamic; have = (:y,), want = :x)
+        finally
+            @eval InverseEdgesFixture mutable_exp = exp
+        end
+    end
+
     @testset "authored bidirectional pair gains no duplicate" begin
         recipes = F.manual_pair.graph.recipes
         @test length(recipes) == 2
         @test count(r -> r.op === log, recipes) == 1
-        @test count(r -> r.op === exp, recipes) == 1
+        @test length(ReactiveKernels.producers_of(
+            F.manual_pair.graph, F.manual_pair[:scale].id)) == 1
 
         from_scale = prepare(F.manual_pair; have = (:scale,), want = :log_scale)
         @test from_scale(2.0) ≈ log(2.0)
@@ -117,8 +173,8 @@ using InverseFunctions
         @test length(F.no_inverse.graph.recipes) == 1
     end
 
-    @testset "qualified calls stay fused (v1 limitation)" begin
-        @test_throws PlanningError plan(F.qualified_log; have = (:y,), want = :x)
+    @testset "qualified calls use their retained inverse identity" begin
+        @test prepare(F.qualified_log; have = (:y,), want = :x)(1.0) ≈ exp(1.0)
     end
 
     @testset "user-registered inverses are honored" begin
@@ -128,6 +184,15 @@ using InverseFunctions
         spec = F.build_ubu_spec()
         backward = prepare(spec; have = (:y,), want = :x)
         @test backward(F.ubu(4.2)) ≈ 4.2
+
+        InverseFunctions.inverse(::typeof(F.cube)) = cbrt
+        wrapped = F.build_cube_spec()
+        @test length(wrapped.graph.recipes) == 2
+        @test prepare(wrapped)(2.0) == 8.0
+        @test prepare(wrapped; have = (:y,), want = :x)(8.0) ≈ 2.0
+        combined = merge(wrapped, F.build_cube_spec())
+        @test length(ReactiveKernels.producers_of(
+            combined.graph, combined[:y].id)) == 1
     end
 end
 
