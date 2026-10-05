@@ -49,14 +49,14 @@ function _rc_compiled_fixture(label, n)
         oracle = nt -> n*logpdf(MixtureModel([Binomial(1,nt.p),Binomial(4,0.3)],
             [0.3,0.7]),3) + logpdf(Beta(2,2),nt.p) + log(nt.p)+log1p(-nt.p)
     elseif label === :range
-        stop = n÷2
+        # Full coverage, as required by USER 1uhcm3b even for missing entries.
         ast = quote
             m ~ Normal(0, 1)
-            y[1:$stop] .~ MixtureModel.(vcat.(Normal.(m, 0.5), Normal.(1.0, 0.5)),
+            y[1:$n] .~ MixtureModel.(vcat.(Normal.(m, 0.5), Normal.(1.0, 0.5)),
                 Ref([0.4, 0.6]))
         end
         data = (; y=fill(0.2,n))
-        oracle = nt -> (n÷2)*logpdf(MixtureModel([Normal(nt.m,0.5),Normal(1,0.5)],
+        oracle = nt -> n*logpdf(MixtureModel([Normal(nt.m,0.5),Normal(1,0.5)],
             [0.4,0.6]),0.2) + logpdf(Normal(0,1),nt.m)
     elseif label === :censored
         ast = quote
