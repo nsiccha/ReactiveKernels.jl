@@ -35,6 +35,13 @@ end
         @test prepare(F.computed_scan)(xs) == reference(xs,
             (previous, x) -> 2 * ((previous + (2x + 1)) + x / 2))
     end
+    for xs in (Float64[], [0.25, -0.5, 1.5], sin.(1:19))
+        saved = copy(xs)
+        expected = reference(xs, (previous, x) -> (previous + 0.75) + x)
+        @test prepare(F.formal_argument_scan)(xs, 0.75) == expected
+        @test prepare(F.formal_argument_scan; bound=(; xs))(0.75) == expected
+        @test xs == saved
+    end
     for xs in (Float64[], [-1.0, 2.0, 0.0, 4.0, -2.0])
         @test prepare(F.lazy_scan)(xs) == reference(xs,
             (previous, x) -> x > 0 ? previous + log(x) : previous)

@@ -120,9 +120,7 @@ ChainRules adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
 derive every direction from the activity-selected cuts of that graph. The rules in package source are
 ReactiveKernels' `rk_expm`, `rk_symmetric_eigvals` and `rk_symmetric_eigvecs`,
 plus DistributionKernels' `loggamma` and `logbeta`. The generic matrix rules
-are also imported by existing PPL/distribution consumers. The PK-specific
-transit two-compartment response rule (`prepare_transit_twocmt_rule`) remains
-in the existing PPL source pending its downstream migration; the ODE backsolve
+are also imported by existing PPL/distribution consumers. The ODE backsolve
 adjoint consumes a caller's `DerivativeRule` right-hand side. Reverse-mode adapters
 stage each rule in two cuts whose residuals come from cross-stage liveness, so
 a shared intermediate is retained rather than recomputed. Rule cuts already
@@ -343,6 +341,20 @@ and lock the one Reactant 0.2.289 lifted:
   differentiates it. A bound tuple or named tuple then crosses the
   differentiated call as one operand per array leaf. Helpers inside a
   parameter-dependent function remain the backend's limitation.
+- Native Enzyme 0.13.209 reverse mode fails static activity analysis
+  (`EnzymeRuntimeActivityError`) when buffers allocated in the two arms of a
+  branch meet in one value, the empty arm's buffer is never written with
+  active data, and Base `sum` reads the merged value:
+  `repro_enzyme_branch_allocation_phi.jl` reproduces it with Enzyme only. One
+  allocation after a branch that peels the first step to type it still fails,
+  because the optimizer splits that allocation back into the arms. This was
+  the shape of an empty authored scan summed by a recipe or plate cell. When
+  the step's inferred output type is concrete, the native scan lowering now
+  allocates each buffer once, before its emptiness branch; values, element
+  types and the retained loop are unchanged, and ordinary reverse passes for
+  empty and nonempty sequences. A step without a concrete inferred output type
+  keeps per-arm allocation. No activity configuration or derivative rule is
+  involved.
 - Native Enzyme 0.13.209 on Julia 1.10.12 also rejects an ordinary untyped
   comprehension whose generator captures both an active array and a constant
   floating-point array: `repro_enzyme_generator_const_array_capture.jl`
@@ -395,10 +407,9 @@ and lock the one Reactant 0.2.289 lifted:
 - Arbitrary-order `SpecialFunctions.besselix(order, x)` has no method for
   a traced scalar `x` in Reactant 0.2.289:
   `repro_reactant_besselix_order.jl` isolates the missing method without
-  ReactiveKernels. The periodic HSGP library's spectral weights require
-  this function, so that effect supports native primal and Enzyme gradients
-  but cannot compile with Reactant. Its acceptance test pins this exact
-  `MethodError`; other failures remain errors. The ordinary formula stays
+  ReactiveKernels. BRM's periodic HSGP spectral weights require this
+  function. The producer-only reproducer preserves the dependency failure
+  after statistical model tests move to BRM. The ordinary formula stays
   intact, with no foreign-function derivative rule or tracing workaround.
 - Evidence normalizers that call `SpecialFunctions.gamma_inc` or `beta_inc`
   have no traced scalar method in Reactant 0.2.290:

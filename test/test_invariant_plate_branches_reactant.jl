@@ -195,4 +195,19 @@ end
         s->empty_kernel(Float64[],s),-1.0)) == 0.0
     compiled=Reactant.@compile empty_kernel(_ipb_traced(Float64[]),_ipb_traced(-1.0))
     @test _ipb_host(compiled(_ipb_traced(Float64[]),_ipb_traced(-1.0))) == 0.0
+
+    # Bound empty data carry no lane marker. The empty plate takes the authored
+    # cell's native element type, evaluates no cell or shared condition, and
+    # its scalar-only reverse compiles.
+    bound_empty=prepare(invariant_plate_guard;have=(:x,:scale),want=:total,
+                        bound=(;x=Float64[]))
+    bound_gradient(v)=only(Enzyme.gradient(Enzyme.Reverse,bound_empty,v))
+    bound_primal=Reactant.@compile bound_empty(_ipb_traced(-1.0))
+    bound_reverse=Reactant.@compile bound_gradient(_ipb_traced(-1.0))
+    for s in (2.0,-1.0)
+        @test bound_empty(s) == 0.0
+        @test bound_gradient(s) == 0.0
+        @test _ipb_host(bound_primal(_ipb_traced(s))) == 0.0
+        @test _ipb_host(bound_reverse(_ipb_traced(s))) == 0.0
+    end
 end

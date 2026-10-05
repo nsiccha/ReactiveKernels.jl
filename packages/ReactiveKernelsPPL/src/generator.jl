@@ -67,20 +67,15 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan)
     likelihoods = _likelihood_statements(plan, layout; gathers)
-    _each_layout_unit(plan, layout) do unit
-        append!(stmts, unit isa LayoutEntry ? transform_statements(unit) :
-            _stratified_transform_statements(unit, layout))
+    for e in layout.entries
+        append!(stmts, transform_statements(e))
     end
     append!(stmts, _coef_reassembly_statements(plan, layout))
     append!(stmts, _conditioned_value_statements(plan))
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, assigns)
     append!(stmts, preprocessing_recipes(plan))
-    append!(stmts, _varying_statements(plan))
-    append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
-    append!(stmts, _dar_reconstruction_statements(plan, layout))
-    append!(stmts, _horseshoe_coef_statements(plan))
     append!(stmts, _affine_coefficient_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, likelihoods)
@@ -272,18 +267,6 @@ import .._declared_codes
 # Stopping-ratio stage-lane tables (data-only recipes over the bound
 # response; `preprocessing.jl`).
 import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
-# Grouped-kernel cell vocabulary: the subject-batched runners (one call
-# per cell assignment over the bound op columns + `op_ends`, per-subject
-# args marked `SubjectScalar` / `SubjectSlice`) and the cells they run.
-# Every `import` here binds when this file loads — names defined by
-# LATER includes (`tgi_segmented_nadir` and the per-element TGI
-# likelihood cells the joint plates call) cannot register here; they
-# import after their file loads (see the bottom of
-# `ReactiveKernelsPPL.jl`).
-import ..linear_pk_read_locs, ..linear_pk_read_locs_auc
-import ..linear_pk_read_locs_over_subjects,
-    ..linear_pk_read_locs_auc_over_subjects, ..SubjectScalar, ..SubjectSlice
-import .._pk_subject_plan, .._pk_event_scan, .._pk_event_scan_auc, .._pk_pack_subjects
 # Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
 # arguments, simplex / ordered slice transforms and the slice densities.
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
@@ -293,9 +276,6 @@ import .._mvnormal_cholesky_slices_pointwise, .._mvnormal_slices_pointwise
 import .._dirichlet_slices_pointwise, .._ordered_normal_slices_pointwise
 import .._simplex_slices_constrain, .._simplex_slices_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
-# Event-LP provider (one call over the flat event axis — the flat
-# `log_F` local the batched cell runner slices per subject).
-import ..linear_pk_event_log_f
 end
 
 const _MODEL_COUNTER = Ref(0)
@@ -466,20 +446,12 @@ function _predictor_statements(plan::StructuralPlan)
         lp = _lp_name(pred)
         terms = Any[]
         if _broadcast_affine(plan, pred)
-            append!(terms, _mo_block_terms(plan, shape; broadcast = true))
-        elseif any(b -> b.kind === MonotonicTerm, shape.blocks)
-            append!(terms, _mo_block_terms(plan, shape))
+            append!(terms, _affine_block_terms(plan, shape; broadcast = true))
         elseif shape.width > 0
             push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
         end
         if any(b -> b.kind === OffsetTerm, shape.blocks)
             push!(terms, offset_name(pred.name))
-        end
-        # A monotonic summand (mo1) contributes its contrast directly —
-        # beta-free, the offset-arm shape with a parameter-derived column.
-        for t in pred.terms
-            t.kind === MonotonicSummandTerm &&
-                push!(terms, monotonic_name(t.options.increments))
         end
         # A latent term contributes the per-cell latent VECTOR directly
         # (identity design): `lp = theta` on its own, or added to fixed-effect
@@ -487,40 +459,12 @@ function _predictor_statements(plan::StructuralPlan)
         for b in shape.blocks
             b.kind === LatentTerm && push!(terms, b.column)
         end
-        # A spline summand contributes its basis's direct summand expression
-        # (SB's `X*b + Z*(sd*z)` shape over materialized basis columns and
-        # SplineVector layout blocks).
-        for b in shape.blocks
-            b.kind === SplineSummandTerm &&
-                push!(terms, _spline_summand_expr(plan, b.column))
-        end
-        # An HSGP summand contributes its basis's direct `PHI * w`
-        # expression (SB `_sb_hsgp`'s `PHI * (sqrt_spd .* beta_raw)`,
-        # evaluated in-graph by `_hsgp_basis_statements`).
-        for b in shape.blocks
-            b.kind === HSGPSummandTerm &&
-                push!(terms, _hsgp_summand_expr(plan, b.column))
-        end
-        # A varying effect contributes its draws block's direct `r`
-        # expression (SB's `r_<target>_<suffix>` summand), resolved from
-        # the TERMS — the draws label does not fit a design block.
-        for t in pred.terms
-            t.kind === VaryingEffectTerm &&
-                push!(terms, _varying_effect_expr(plan, pred, t))
-        end
         # A scan summand contributes its state's direct scaled expression
         # (`state .* coef`, SB's `ar` latent path with its free beta),
         # resolved from the TERMS like any summand.
         for t in pred.terms
             t.kind === ScanSummandTerm &&
                 push!(terms, _scan_summand_expr(plan, pred, t))
-        end
-        # A dar summand contributes its trajectory state directly (bare,
-        # beta-free — SB's `dar` zero-started path; the formula intercept
-        # is the initial level), resolved from the TERMS like a scan.
-        for t in pred.terms
-            t.kind === DarSummandTerm &&
-                push!(terms, _dar_summand_expr(plan, pred, t))
         end
         # A composed term evaluates its combination tree in-graph:
         # sub-predictors resolve to their LP nodes (emitted above —
@@ -544,16 +488,10 @@ end
 # vector).
 _coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
 
-# Per-block LP terms for a predictor with `mo` columns. The fused
-# `design * coef` matvec cannot cover a monotonic block — its contrast
-# column is parameter-derived, and `hcat` cannot mix data with symbolic
-# columns under the Enzyme reverse pass — so each coefficient-carrying
-# block splices against its own coefficient coordinates (positions follow
-# design order, the layout block's own order): intercept/continuous/
-# monotonic blocks scale one column by one coordinate, factor and matrix
-# blocks keep the data-matrix × coefficient-slice matvec. Predictors
-# without `mo` keep the fused form above, untouched.
-function _mo_block_terms(plan::StructuralPlan, shape::DesignShape;
+# Broadcast affine blocks against their coefficient coordinates while
+# retaining the authored axes. Factor and matrix blocks use their own
+# coefficient slices in design order.
+function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
         broadcast::Bool = false)
     pred = only(p for p in plan.predictors if p.name === shape.predictor)
     coef = _affine_block_name(pred)
@@ -578,302 +516,12 @@ function _mo_block_terms(plan::StructuralPlan, shape::DesignShape;
             push!(terms, :($(_matrix_block_expr(b, _predictor_rows(plan,shape.predictor))) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
-        elseif b.kind === MonotonicTerm
-            push!(terms,
-                :($(monotonic_name(b.column)) .* $(_coef_coord(coef, k))))
-            k += 1
         end
     end
     return terms
 end
 
-# One basis's direct summand as a scaled-column sum (SB `_sb_s_generic` /
-# `_sb_t2_generic`): fixed blocks `X[j] .* b[j]`, pen blocks
-# `Z[j] .* (sd[k] * r[j])`, all joined with `.+`. Reads the BOUND basis's
-# materialized columns (bind asserted widths) and the `_spline_block_roles`
-# vector names (the contract's single source — no re-derivation here).
-function _spline_summand_expr(plan::StructuralPlan, id::Symbol)
-    i = findfirst(b -> b.id === id, plan.spline_bases)
-    i === nothing && throw(ContractValidationError(
-        "[generator] spline summand addresses unknown basis :$id"))
-    sb = plan.spline_bases[i]
-    byblock = Dict{Symbol,SplineBasisBlock}(b.name => b for b in sb.blocks)
-    roles, sd = _spline_block_roles(sb.id, sb.kind, sb.k)
-    parts = Any[]
-    for (block, coef, sdidx) in roles
-        haskey(byblock, block) || throw(ContractValidationError(
-            "[generator] spline :$id basis is missing block :$block"))
-        cols = byblock[block].columns
-        isempty(cols) && throw(ContractValidationError(
-            "[generator] spline :$id block :$block has no materialized " *
-            "columns (bind_data fills these)"))
-        for (j, c) in enumerate(cols)
-            cel = Expr(:call, :.*, c, Expr(:ref, coef, j))
-            if sdidx !== nothing
-                scaled = Expr(:call, :*, Expr(:ref, sd, sdidx),
-                    Expr(:ref, coef, j))
-                cel = Expr(:call, :.*, c, scaled)
-            end
-            push!(parts, cel)
-        end
-    end
-    return foldl((a, b) -> :($a .+ $b), parts)
-end
 
-# `sqrt(2π)` verbatim from SB `brm_hsgp_sqrt_spd` (the spectral scale).
-const _HSGP_SQRT2PI = 2.5066282746310002
-
-# In-graph HSGP node names for one basis (all `_ppl_`-hygienic): per-axis
-# trig columns, tensor-product columns, the `hcat` basis matrix, the
-# spectral scale, per-basis `sqrt_spd` scalars, their `vect`, the
-# spectral weights, and the predictor summand.
-_hsgp_ax_name(id::Symbol, j::Int, k::Int) = Symbol(:_ppl_hsgp_, id, :_ax, j, :_k, k)
-_hsgp_phi_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_phi_, b)
-_hsgp_cos_name(id::Symbol, j::Int) = Symbol(:_ppl_hsgp_, id, :_cos_, j)
-_hsgp_sin_name(id::Symbol, j::Int) = Symbol(:_ppl_hsgp_, id, :_sin_, j)
-_hsgp_a_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_a)
-_hsgp_PHI_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_PHI)
-_hsgp_sscale_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_sscale)
-_hsgp_s_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_s_, b)
-_hsgp_S_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_S)
-_hsgp_w_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_w)
-_hsgp_sum_name(id::Symbol) = Symbol(:_ppl_hsgp_, id)
-
-# One basis's in-graph evaluation (SB `_brm_apply_hsgp` /
-# `brm_hsgp_sqrt_spd` / `_sb_hsgp`, SB op order throughout): per-axis 1D
-# trig columns from the frozen bind fits (`(mu, L)` literals), their
-# tensor-product columns in `CartesianIndices(K)` order, the `hcat` basis
-# matrix, unrolled `sqrt_spd` scalars over the sampled `(rho, sigma)`,
-# and the spec-literal matmul summand `PHI * (S .* beta)`. The basis
-# columns are data-only (bound-folded, the `design_recipe` precedent);
-# the spectral weights stay symbolic. Runs before the predictors (the
-# summand node is the LP splice); the priors stay in `_prior_statements`
-# (order-free).
-function _hsgp_basis_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    for hb in plan.hsgp_bases
-        if hb.cov === :periodic
-            isempty(hb.fits) || throw(ContractValidationError(
-                "[generator] hsgp :$(hb.id): periodic carries no fits " *
-                "(no domain to fit)"))
-            append!(stmts, _hsgp_periodic_stmts(hb))
-        else
-            length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
-                "[generator] hsgp :$(hb.id): fits not filled at bind " *
-                "(bind_data fills one (mu, L) per axis)"))
-            append!(stmts, hb.by === nothing ? _hsgp_basis_stmts(hb) :
-                _hsgp_grouped_stmts(hb))
-        end
-    end
-    return stmts
-end
-
-# One grouped basis (SB `_sb_hsgp_by` / `brm_hsgp_by_hyper_S`), one
-# isotropic axis: the shared basis matrix `PHI` (n x M, frozen fits), the
-# per-group length scales / marginal scales (a G-vector from the
-# hyper-predictor `exp.(beta0 .+ sd .* z)` — length scales floored per
-# group at the validity floor, SB `fmax(rho_g, rho_lower)` — or the
-# shared scalar), the per-group spectral weights `SPD` (G x M, SB
-# `brm_hsgp_sqrt_spd` per group), the per-group standardized weights
-# `W = reshape(beta_raw, G, M)`, and the row-wise summand
-# `sum(PHI .* (OH * (SPD .* W)); dims = 2)` over the data-only one-hot
-# group matrix `OH` (n x G) — SB `rows_dot_product(S, beta[group_idx, :])`
-# with its row mask, matmul-only so it traces through Reactant.
-function _hsgp_grouped_stmts(hb::HSGPBasis)
-    id = hb.id
-    stmts = Expr[]
-    axis = only(hb.axes)
-    mu, L = Float64.(only(hb.fits))
-    inv_sqrt_L = 1.0 / sqrt(L)
-    K = only(hb.K)
-    cols = Symbol[]
-    for k in 1:K
-        lam_sqrt = sqrt(_hsgp_lambda(k, L))
-        col = _hsgp_ax_name(id, 1, k)
-        push!(stmts, :($col =
-            $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
-        push!(cols, col)
-    end
-    PHI = _hsgp_PHI_name(id)
-    push!(stmts, :($PHI = hcat($(cols...))))
-    names = _hsgp_names(hb)
-    levels = hb.by.levels
-    G = length(levels)
-    gidx = Symbol(:_ppl_hsgp_, id, :_gidx)
-    lvlvec = Expr(:vect, (_level_literal(lv) for lv in levels)...)
-    push!(stmts, :($gidx = _declared_codes($(hb.by.column), $lvlvec)))
-    OH = Symbol(:_ppl_hsgp_, id, :_OH)
-    push!(stmts, :($OH = hcat($((:(Float64.($gidx .== $g)) for g in 1:G)...))))
-    floor = only(_hsgp_floors(hb.K, hb.fits, hb.iso))
-    function hyper_vec(h, floor)
-        eta = h.intercept ? :($(h.beta0) .+ $(h.sd) .* $(h.z)) :
-            :($(h.sd) .* $(h.z))
-        v = :(exp.($eta))
-        return floor > 0 ? :(max.($v, $floor)) : v
-    end
-    rho = names.rho_hyper === nothing ? only(names.rhos) :
-        hyper_vec(names.rho_hyper, hb.rho_prior isa HSGPHyperLP ? floor : 0.0)
-    sigma = names.sigma_hyper === nothing ? names.sigma :
-        hyper_vec(names.sigma_hyper, 0.0)
-    rv = Symbol(:_ppl_hsgp_, id, :_rho)
-    sv = Symbol(:_ppl_hsgp_, id, :_sigma)
-    push!(stmts, :($rv = $rho))
-    push!(stmts, :($sv = $sigma))
-    lamrow = Expr(:hcat, (_hsgp_lambda(k, L) for k in 1:K)...)
-    SPD = _hsgp_S_name(id)
-    push!(stmts, :($SPD = ($sv .* sqrt.($rv .* $_HSGP_SQRT2PI)) .*
-        exp.(-0.25 .* ($rv .* $rv) .* $lamrow)))
-    W = _hsgp_w_name(id)
-    push!(stmts, :($W = reshape($(names.beta), $G, $K)))
-    push!(stmts, :($(_hsgp_sum_name(id)) =
-        vec(sum($PHI .* ($OH * ($SPD .* $W)); dims = 2))))
-    return stmts
-end
-
-function _hsgp_basis_stmts(hb::HSGPBasis)
-    id = hb.id
-    d = length(hb.axes)
-    stmts = Expr[]
-    # Per-axis 1D columns: `PHI[i,k] = inv_sqrt_L * sin(lam_sqrt[k] *
-    # (x[i] - mu + L))` (SB `_brm_apply_hsgp`, element order verbatim).
-    # `lam[k]` is SB's `lambda` literal, `lam_sqrt[k]` its `sqrt`.
-    for (j, axis) in enumerate(hb.axes)
-        mu, L = hb.fits[j]
-        mu, L = Float64(mu), Float64(L)
-        inv_sqrt_L = 1.0 / sqrt(L)
-        for k in 1:hb.K[j]
-            lam_sqrt = sqrt(_hsgp_lambda(k, L))
-            col = _hsgp_ax_name(id, j, k)
-            push!(stmts, :($col =
-                $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
-        end
-    end
-    # Tensor-product columns in `CartesianIndices(K)` order (SB's
-    # `enumerate(CartesianIndices(K))`): one axis reuses its column.
-    midcs = collect(CartesianIndices(Tuple(hb.K)))
-    phis = Symbol[]
-    for (b, I) in enumerate(midcs)
-        if d == 1
-            push!(phis, _hsgp_ax_name(id, 1, I[1]))
-        else
-            phi = _hsgp_phi_name(id, b)
-            cols = [_hsgp_ax_name(id, j, I[j]) for j in 1:d]
-            push!(stmts, :($phi = $(foldl((a, c) -> :($a .* $c), cols))))
-            push!(phis, phi)
-        end
-    end
-    push!(stmts, :($(_hsgp_PHI_name(id)) = hcat($(phis...))))
-    # Spectral weights (SB `brm_hsgp_sqrt_spd`): `scale = sigma *
-    # prod(sqrt(rho_j * sqrt(2π)))`, `s[b] = scale * exp(-0.25 *
-    # sum(rho_j^2 * omega2[b,j]))` — left-assoc folds, SB order. Iso
-    # shares one rho across axes; `omega2` is the frozen `lambda`
-    # literal above.
-    names = _hsgp_names(hb)
-    rhos = hb.iso ? fill(names.rhos[1], d) : names.rhos
-    factors = Any[names.sigma]
-    for j in 1:d
-        push!(factors, :(sqrt($(rhos[j]) * $_HSGP_SQRT2PI)))
-    end
-    sscale = _hsgp_sscale_name(id)
-    push!(stmts, :($sscale::Float64 = $(foldl((a, c) -> :($a * $c), factors))))
-    snames = Symbol[]
-    for (b, I) in enumerate(midcs)
-        terms = Any[]
-        for j in 1:d
-            lam = _hsgp_lambda(I[j], hb.fits[j][2])
-            push!(terms, :($(rhos[j]) * $(rhos[j]) * $lam))
-        end
-        expsum = foldl((a, c) -> :($a + $c), terms)
-        s = _hsgp_s_name(id, b)
-        push!(stmts, :($s::Float64 = $sscale * exp(-0.25 * $expsum)))
-        push!(snames, s)
-    end
-    S = _hsgp_S_name(id)
-    push!(stmts, :($S = $(Expr(:vect, snames...))))
-    w = _hsgp_w_name(id)
-    push!(stmts, :($w = $S .* $(names.beta)))
-    push!(stmts, :($(_hsgp_sum_name(id)) = $(_hsgp_PHI_name(id)) * $w))
-    return stmts
-end
-
-# One periodic basis's in-graph evaluation (SB
-# `_brm_apply_hsgp_periodic` / `brm_hsgp_periodic_sqrt_spd` /
-# `_sb_hsgp_periodic`): `k` harmonics of the fundamental angular
-# frequency `w0 = 2π/period` as `2k` cosine/sine columns (cosines
-# first, then sines — SB element order), unrolled `sqrt_spd` scalars
-# over the sampled `(rho, sigma)`, and the spec-literal matmul
-# summand `PHI * (S .* beta)`. The basis columns are data-only
-# (bound-folded); the spectral weights stay symbolic.
-#
-# Spectral weights (SB `brm_hsgp_periodic_sqrt_spd`): with `a =
-# 1/(rho*rho)`, `q_j = sigma*sqrt(2*exp(-a)*I_j(a))`. Stan evaluates
-# this in log space through `log_modified_bessel_first_kind`;
-# SpecialFunctions offers no log-Bessel, so the emission uses the
-# exponentially scaled `besselix` (`I_j(a) = besselix(j,a)*exp(a)`,
-# exact algebra): `q_b = exp(log(sigma) + 0.5*(log(2) +
-# log(besselix(h_b, a))))`. Never overflows (the direct
-# `sqrt(2*exp(-a)*besseli(j,a))` form throws AMOS for large `a`),
-# Enzyme-clean (probed vs findiff). The harmonic index `h_b` is the
-# frozen SB `harmonics` literal (`[1..k, 1..k]`).
-function _hsgp_periodic_stmts(hb::HSGPBasis)
-    id = hb.id
-    x = only(hb.axes)
-    k = only(hb.K)
-    period = Float64(hb.period)
-    stmts = Expr[]
-    # Trig columns: `PHI[i,j] = cos(w0*j*x[i])`,
-    # `PHI[i,k+j] = sin(w0*j*x[i])` (SB
-    # `_brm_apply_hsgp_periodic`, element order verbatim). The
-    # `w0*j` literal folds SB's `(w0*j)*x[i]` left-assoc product.
-    w0 = 2.0 * pi / period
-    coscols = Symbol[]
-    sincols = Symbol[]
-    for j in 1:k
-        wj = w0 * j
-        cc = _hsgp_cos_name(id, j)
-        sc = _hsgp_sin_name(id, j)
-        push!(stmts, :($cc = cos.($wj .* $x)))
-        push!(stmts, :($sc = sin.($wj .* $x)))
-        push!(coscols, cc)
-        push!(sincols, sc)
-    end
-    push!(stmts, :($(_hsgp_PHI_name(id)) = hcat($(coscols...), $(sincols...))))
-    # Spectral weights, one scalar per basis column over the frozen
-    # harmonic index (SB `brm_hsgp_periodic_sqrt_spd` in scaled-log
-    # space — see above).
-    names = _hsgp_names(hb)
-    rho = only(names.rhos)
-    a = _hsgp_a_name(id)
-    push!(stmts, :($a::Float64 = 1.0 / ($rho * $rho)))
-    snames = Symbol[]
-    for (b, h) in enumerate(vcat(1:k, 1:k))
-        s = _hsgp_s_name(id, b)
-        push!(stmts, :($s::Float64 = exp(log($(names.sigma)) +
-            0.5 * (0.6931471805599453 + log(besselix($h, $a))))))
-        push!(snames, s)
-    end
-    S = _hsgp_S_name(id)
-    push!(stmts, :($S = $(Expr(:vect, snames...))))
-    w = _hsgp_w_name(id)
-    push!(stmts, :($w = $S .* $(names.beta)))
-    push!(stmts, :($(_hsgp_sum_name(id)) = $(_hsgp_PHI_name(id)) * $w))
-    return stmts
-end
-
-# One HSGP summand's direct expression: the basis's precomputed
-# `_hsgp_basis_statements` node (resolved from the design block's basis
-# id; the lookup below is loud defense in depth).
-function _hsgp_summand_expr(plan::StructuralPlan, id::Symbol)
-    any(hb -> hb.id === id, plan.hsgp_bases) || throw(ContractValidationError(
-        "[generator] hsgp summand addresses unknown basis :$id"))
-    return _hsgp_sum_name(id)
-end
-
-# One scan summand's direct expression (`state .* coef`, explicit dotted
-# form): the in-graph recurrence state scaled by its sampled scalar
-# coefficient, or the bare state for a beta-free summand (`coef ===
-# nothing`). Both names resolve from the term's options (validated up
-# front; the lookups below are loud defense in depth).
 function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     o = t.options
     any(s -> o.scan_id in s.states, plan.scans) || throw(ContractValidationError(
@@ -885,22 +533,6 @@ function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSp
     return Expr(:call, :.*, o.scan_id, o.coef)
 end
 
-# One dar summand's direct expression (the bare trajectory state): the
-# in-graph `scan(...)` reconstruction is bound to the state's name by
-# `_dar_reconstruction_statements`, so the LP splices the name itself.
-# Validated up front; the lookup below is loud defense in depth.
-function _dar_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
-    o = t.options
-    any(s -> s.state === o.dar_id, plan.dar_paths) || throw(ContractValidationError(
-        "[generator] dar summand in predictor $(pred.name) addresses " *
-        "unknown dar :$(o.dar_id)"))
-    return o.dar_id
-end
-
-# Composed elementwise maps → their generated-module bindings (`logistic`
-# is the distribution object there; the math function is `_ppl_logistic`).
-# Every other map keeps its head: a built-in math name resolves in the
-# generated module, a module function is its `GlobalRef`.
 const _COMPOSED_MAP_EMIT = Dict{Symbol,Symbol}(:exp => :exp,
     :logistic => :_ppl_logistic, :normcdf => :_ppl_normcdf,
     :cexpexp => :_ppl_cexpexp)
@@ -913,7 +545,7 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
         pred::Symbol)
     if _is_plate_column_expr(node)
         aliases = Dict{Symbol,Symbol}(s => _lp_name(_predictor(plan, s)) for s in subs)
-        inputs = [_hsubst(a, aliases, Dict()) for a in node.args[1].args[2:end]]
+        inputs = [_hsubst(a, aliases) for a in node.args[1].args[2:end]]
         return Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
     end
     if node isa Symbol
@@ -945,11 +577,8 @@ function _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
 end
 
 # Rows of the responses a predictor locates — their own observation axis,
-# which is not `n_obs` when responses observe different rows. Subject- or
-# dose-level predictors keep their kernel rows.
+# which is not `n_obs` when responses observe different rows.
 function _located_rows(plan::StructuralPlan, pred::PredictorSpec)
-    _predictor_level(plan, pred.name) === :obs ||
-        return _predictor_rows(plan, pred.name)
     rows = unique!([_response_rows(plan, r) for r in plan.responses
         if _response_uses_predictor(r, pred.name)])
     length(rows) == 1 || throw(ContractValidationError("[generator] " *
@@ -958,322 +587,7 @@ function _located_rows(plan::StructuralPlan, pred::PredictorSpec)
     return only(rows)
 end
 
-# Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
-# an in-model `_declared_codes` call over the draws' DECLARED levels
-# (bind-known — filled or emitter-provided — so the order agrees with
-# validation by construction; never sorted). Data-only, hence
-# bound-folded; strings are native-only, exactly like factor contrasts.
-# K=1 and correlated draws on the same group share one encoder
-# (per-group dedup; same-group levels agreement is validated).
-function _varying_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    groups = Symbol[]
-    for d in plan.varying_draws
-        if d.mm !== nothing
-            append!(stmts, _mm_preamble_stmts(d))
-            continue
-        end
-        if !(d.group in groups)
-            push!(groups, d.group)
-            d.levels === nothing && throw(ContractValidationError(
-                "[generator] internal: draws $(d.label) has no declared " *
-                "levels (validate_plan proves this)"))
-            lvlvec = Expr(:vect,
-                (_level_literal(lv) for lv in d.levels)...)
-            push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, d.group),
-                Expr(:call, :_declared_codes, d.group, lvlvec)))
-        end
-        if d.strata !== nothing
-            st = d.strata::VaryingStrata
-            st.levels === nothing && throw(ContractValidationError(
-                "[generator] internal: draws $(d.label) has no declared " *
-                "strata levels (validate_plan proves this)"))
-            slvlvec = Expr(:vect,
-                (_level_literal(lv) for lv in st.levels)...)
-            push!(stmts, Expr(:(=), _sidx_name(d),
-                Expr(:call, :_declared_codes, st.by, slvlvec)))
-        end
-    end
-    return stmts
-end
 
-# One membership slot's group-index encoder name (`_ppl_gidx_<suffix>_m<m>`).
-_mm_gidx_name(d::VaryingDraws, m::Int) =
-    Symbol(:_ppl_gidx_, d.suffix, :_m, m)
-
-# Normalized-weight vector name (`_ppl_mmw_<suffix>_m<m>`) and the shared
-# per-row weight-total name (`_ppl_mmwtot_<suffix>`).
-_mm_w_name(d::VaryingDraws, m::Int) = Symbol(:_ppl_mmw_, d.suffix, :_m, m)
-_mm_wtot_name(d::VaryingDraws) = Symbol(:_ppl_mmwtot_, d.suffix)
-
-# Per-observation stratum-code vector name (`_ppl_sidx_<suffix>`).
-_sidx_name(d::VaryingDraws) = Symbol(:_ppl_sidx_, d.suffix)
-
-# Stratified draws in-graph: the layout keeps SB's per-stratum entries
-# (all `L_<s>_s<k>`, then all `tau_<s>_s<k>` — names, coordinates and
-# parity unchanged), but the stratum count S comes from data
-# (`bind_data` fills the levels), so the graph reads them STACKED: one
-# vine edge chain whose edges are S-vectors (`_ppl_rl_<sL>_<i>_<j>`,
-# `L[1,1]` the scalar `1.0`) and one `tau` plate over the contiguous
-# K×S column-major block. Statement count is independent of S
-# (core constraint 1).
-_strata_L_name(d::VaryingDraws) = Symbol(:_ppl_sL_, d.suffix)
-_strata_tau_name(d::VaryingDraws) = Symbol(:_ppl_stau_, d.suffix)
-
-# Iteration unit of the per-entry edges and Jacobian: every layout entry
-# is its own unit, except a stratified draws block's per-stratum members,
-# which form ONE unit (the draws block, visited at its first member).
-function _each_layout_unit(f, plan::StructuralPlan, layout::LayoutTable)
-    members = Dict{Symbol,VaryingDraws}()
-    for d in plan.varying_draws
-        d.strata === nothing && continue
-        for k in 1:_strata_nlevels(d)
-            Lk, tauk = _varying_strata_names(d, k)
-            members[Lk] = d
-            members[tauk] = d
-        end
-    end
-    seen = Set{Symbol}()
-    for e in layout.entries
-        d = get(members, e.name, nothing)
-        if d === nothing
-            f(e)
-        elseif !(d.label in seen)
-            push!(seen, d.label)
-            f(d)
-        end
-    end
-    return nothing
-end
-
-# The stacked blocks' geometry, checked against the layout: S strata,
-# K margins, P = K(K-1)/2 partials per stratum, and the offsets of the
-# contiguous per-stratum `L` and `tau` runs the stacked reads stride over.
-function _strata_geometry(d::VaryingDraws, layout::LayoutTable)
-    S = _strata_nlevels(d)
-    K = length(d.margins)
-    P = K * (K - 1) ÷ 2
-    byname = Dict(e.name => e for e in layout.entries)
-    member(n) = haskey(byname, n) ? byname[n] :
-        throw(ContractValidationError("[generator] internal: stratified " *
-            "draws $(d.label) has no layout entry $n"))
-    L1, tau1 = _varying_strata_names(d, 1)
-    offL, offT = member(L1).offset, member(tau1).offset
-    for k in 1:S
-        Lk, tauk = _varying_strata_names(d, k)
-        eL, eT = member(Lk), member(tauk)
-        eL.offset == offL + (k - 1) * P && eL.size == P &&
-            eT.offset == offT + (k - 1) * K && eT.size == K &&
-            eT.transform === :exp || throw(ContractValidationError(
-            "[generator] internal: stratified draws $(d.label) layout is " *
-            "not the contiguous per-stratum L/tau runs the stacked edges read"))
-    end
-    return (; S, K, P, offL, offT)
-end
-
-# Partial p of every stratum's vine (stride P through the `L` run).
-function _strata_partial_read(g, p::Int)
-    lo = g.offL + p - 1
-    return :(view(unconstrained, $lo:$(g.P):$(lo + (g.S - 1) * g.P)))
-end
-
-# The stacked `tau` block as one `:exp` plate entry (K×S column-major).
-_strata_tau_entry(d::VaryingDraws, g) =
-    LayoutEntry(:varying, nothing, _strata_tau_name(d),
-        [_strata_tau_name(d)], g.offT, g.S * g.K, :exp)
-
-function _stratified_transform_statements(d::VaryingDraws,
-        layout::LayoutTable)
-    g = _strata_geometry(d, layout)
-    stmts = _lkj_vine_statements(_strata_L_name(d), g.K,
-        p -> _strata_partial_read(g, p); stacked = true)
-    append!(stmts, transform_statements(_strata_tau_entry(d, g)))
-    return stmts
-end
-
-function _stratified_logjac_terms(d::VaryingDraws, layout::LayoutTable)
-    g = _strata_geometry(d, layout)
-    terms = Any[]
-    lj = _lkj_vine_logjac(_strata_L_name(d), g.K; stacked = true)
-    lj === nothing || push!(terms, lj)
-    push!(terms, jacobian_term(_strata_tau_entry(d, g)))
-    return terms
-end
-
-# One mm draws block's data preamble (SB `_brm_prepare_mm`, in-graph):
-# per-slot encoders against the SHARED union levels (per-suffix names —
-# never shared with plain encoders, whose numbering differs), plus —
-# supplied weights with normalize — the per-row total (slot order, SB
-# `sum` order) and the normalized per-slot weight vectors. Raw
-# (`normalize=false`) weights read their bound columns directly (no
-# preamble); default weights are the `inv(M)` scalar in the effect.
-function _mm_preamble_stmts(d::VaryingDraws)
-    mm = d.mm::VaryingMultiMembership
-    M = length(mm.groups)
-    d.levels === nothing && throw(ContractValidationError(
-        "[generator] internal: draws $(d.label) has no declared " *
-        "levels (validate_plan proves this)"))
-    lvlvec = Expr(:vect,
-        (_level_literal(lv) for lv in d.levels)...)
-    stmts = Expr[]
-    for m in 1:M
-        push!(stmts, Expr(:(=), _mm_gidx_name(d, m),
-            Expr(:call, :_declared_codes, mm.groups[m], lvlvec)))
-    end
-    if mm.weights !== nothing && mm.normalize
-        tot = foldl((a, c) -> :($a .+ $c), mm.weights)
-        push!(stmts, Expr(:(=), _mm_wtot_name(d), tot))
-        for m in 1:M
-            push!(stmts, Expr(:(=), _mm_w_name(d, m),
-                :($(mm.weights[m]) ./ $(_mm_wtot_name(d)))))
-        end
-    end
-    return stmts
-end
-
-# One mm slot's weight factor as an rvalue: the `inv(M)` literal for
-# default weights (SB fills `inv(M)` unnormalized), the normalized
-# preamble vector, or the raw bound column.
-function _mm_weight_expr(d::VaryingDraws, m::Int)
-    mm = d.mm::VaryingMultiMembership
-    mm.weights === nothing && return inv(Float64(length(mm.groups)))
-    mm.normalize && return _mm_w_name(d, m)
-    return mm.weights[m]
-end
-
-# Term-to-draws join by label, plus the (draws, target) slice (unique
-# by validation). The term carries the draws label; the slice carries
-# the explicit column range — the generator never re-derives ranges.
-function _slice_draws(plan::StructuralPlan, pred::PredictorSpec,
-        t::TermSpec)
-    i = findfirst(d -> d.label === t.options.draws, plan.varying_draws)
-    i === nothing && throw(ContractValidationError(
-        "[generator] effect term addresses unknown draws " *
-        "($(t.options.draws))"))
-    d = plan.varying_draws[i]
-    si = findfirst(s -> s.draws === d.label && s.target === pred.name,
-        plan.varying_slices)
-    si === nothing && throw(ContractValidationError(
-        "[generator] internal: effect term of draws $(d.label) in " *
-        "predictor $(pred.name) has no slice (validate_plan proves this)"))
-    return d, plan.varying_slices[si]
-end
-
-# One varying margin's Z as an rvalue: bare columns stay bare (raw
-# ports and derived locals alike); dummies compare against the
-# bind-known level value. `:ones` never reaches emission (an intercept
-# needs no Z multiply).
-function _varying_z_expr(z::VaryingZRecipe)
-    z.kind === :column && return z.column
-    z.kind === :dummy &&
-        return Expr(:call, :.==, z.column, _level_literal(z.level))
-    throw(ContractValidationError(
-        "[generator] internal: ones-Z reached effect emission"))
-end
-
-# One varying draws block's direct `r` summand (no `b` node, the draws
-# stay implicit): the K² implicit-draws arm (this slice's columns
-# only, every K); mm draws take the weighted-gather arm (same geometry,
-# per-slot gathers).
-function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
-        t::TermSpec)
-    d, s = _slice_draws(plan, pred, t)
-    d.mm !== nothing && return _varying_mm_effect_expr(plan, d, s)
-    return _varying_corr_effect_expr(plan, d, s)
-end
-
-# One mm draws block's direct `r` summand (SB `multi_membership_*`
-# math, in-graph): per slot `m`, the plain-geometry margin expr at
-# that slot's encoder, weighted by that slot's factor, summed in slot
-# order (SB's per-observation `rv[i] += w*b` association). Every slot
-# reuses the margin expr below with the shared tau/L/z.
-function _varying_mm_effect_expr(plan::StructuralPlan, d::VaryingDraws,
-        s::VaryingSlice)
-    mm = d.mm::VaryingMultiMembership
-    M = length(mm.groups)
-    L, tau, _ = _varying_corr_names(d)
-    parts = Any[]
-    for m in 1:M
-        gidx = _mm_gidx_name(d, m)
-        w = _mm_weight_expr(d, m)
-        inner = _corr_margin_expr(d, s, tau, L, gidx)
-        push!(parts, :($w .* $inner))
-    end
-    return foldl((a, c) -> :($a .+ $c), parts)
-end
-
-# One correlated draws block's direct `r` summand for one slice
-# (SB `rows_dot_product(Z, b[idx,cols])` with the draws implicit — the
-# no-`b`-node precedent); stratified draws take the per-stratum
-# indicator arm below instead.
-function _varying_corr_effect_expr(plan::StructuralPlan, d::VaryingDraws,
-        s::VaryingSlice)
-    d.strata !== nothing && return _varying_strata_effect_expr(plan, d, s)
-    L, tau, _ = _varying_corr_names(d)
-    return _corr_margin_expr(d, s, tau, L, Symbol(:_ppl_gidx_, d.group))
-end
-
-# One stratified draws block's direct `r` summand (SB
-# `ranef_correlated_by` math, in-graph): each observation's margin
-# coefficient `tau[j]*L[j,q]` is GATHERED from its own stratum's frame
-# by the per-observation stratum code — `tau` from the stacked K×S
-# column-major vector (the `z_flat` gather idiom), `L[j,q]` from the
-# stacked S-vector edge (the `xi[gidx]` idiom; `L[1,1]` is the scalar
-# `1.0`). One expression whatever the stratum count S, which `bind_data`
-# fills from data: per-stratum arms would duplicate the body S times
-# (core constraint 1). Each gathered product is the same two-operand
-# multiply the per-stratum frame performs, so values are unchanged.
-function _varying_strata_effect_expr(plan::StructuralPlan, d::VaryingDraws,
-        s::VaryingSlice)
-    K = length(d.margins)
-    sidx = _sidx_name(d)
-    stau = _strata_tau_name(d)
-    sL = _strata_L_name(d)
-    coef(j, q) = begin
-        Ljq = (j == 1 && q == 1) ? _rl_name(sL, 1, 1) :
-            Expr(:ref, _rl_name(sL, j, q), sidx)
-        :($(Expr(:ref, stau, :($j .+ ($sidx .- 1) .* $K))) .* $Ljq)
-    end
-    return _corr_margin_expr(d, s, coef, Symbol(:_ppl_gidx_, d.group))
-end
-
-# Per slice margin j, `Z_j .* sum_s (tau[j]*L[j,s]) .*
-# z_flat[s + (gidx-1)*K]` over `s in 1:j` (L lower-triangular — the
-# `s > j` terms are structural zeros, never emitted). `:ones` Z drops
-# the factor (multiply by 1). K, the slice range, and the `s` bound
-# are all static; tau reads are scalar refs (the coefficient-block
-# precedent) and L reads the named `_ppl_rl_` scalars from the layout
-# edges. Shared by the plain, mm (per-slot `gidx`), and stratified
-# (gathered `coef`) arms.
-_corr_margin_expr(d::VaryingDraws, s::VaryingSlice, tau::Symbol,
-        L::Symbol, gidx::Symbol) =
-    _corr_margin_expr(d, s,
-        (j, q) -> :($(Expr(:ref, tau, j)) * $(_rl_name(L, j, q))), gidx)
-
-# `coef(j, q)` is the margin coefficient expression `tau[j]*L[j,q]`.
-function _corr_margin_expr(d::VaryingDraws, s::VaryingSlice, coef,
-        gidx::Symbol)
-    cols = s.columns
-    K = length(d.margins)
-    z = _varying_corr_names(d)[3]
-    parts = Any[]
-    for j in cols
-        m = d.margins[j]
-        inner = Any[]
-        for q in 1:j
-            A = coef(j, q)
-            idx = :($q .+ ($gidx .- 1) .* $K)
-            push!(inner, :($A .* $(Expr(:ref, z, idx))))
-        end
-        sj = foldl((a, c) -> :($a .+ $c), inner)
-        if m.z.kind === :ones
-            push!(parts, sj)
-        else
-            push!(parts, :($(_varying_z_expr(m.z)) .* $sj))
-        end
-    end
-    return foldl((a, c) -> :($a .+ $c), parts)
-end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 
@@ -1300,11 +614,6 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
             pw = values
         end
         push!(points, r.response => pw)
-    end
-    for kp in plan.kernel_plates
-        kstmts, kterm = _kernel_plate_likelihood(kp, plan; pointwise = points)
-        append!(stmts, kstmts)
-        push!(terms, kterm)
     end
     for p in plan.external_observations
         append!(stmts, _external_density_statements(p))
@@ -1345,435 +654,6 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
         Expr(:tuple, (Expr(:(=), name, value) for (name, value) in points)...)
     push!(stmts, Expr(:(=), :pointwise, values))
     return stmts
-end
-
-# Panel likelihoods use flat T-blocked arrays for elementwise operations
-# and T-by-subject frames for reductions. Scalar slices repeat per subject;
-# collected scalars return one entry per subject. The optional observation
-# uses the scalar-family plate-sum machinery.
-_panel_frame(x::Number, T::Int, subjects::Int) = fill(x, T, subjects)
-_panel_frame(x::AbstractVector, T::Int, subjects::Int) = reshape(x, T, subjects)
-_panel_subject_values(x::Number, T::Int, subjects::Int) = fill(x, subjects)
-_panel_subject_values(x::AbstractVector, T::Int, subjects::Int) = x[1:T:end]
-
-function _rewrite_panel_value(ex, kp::KernelPlate, flatmap, shapes)
-    ex isa Expr || return _rewrite_kernel_refs(ex, flatmap)
-    if ex.head === :call && !isempty(ex.args) && ex.args[1] in REDUCTION_FNS
-        fn, arg = ex.args
-        _, kind = _canonicalize_kernel_cell(arg, kp, shapes)
-        value = _rewrite_panel_value(arg, kp, flatmap, shapes)
-        T = something(kp.timepoints, 1)
-        frame = Expr(:call, GlobalRef(@__MODULE__, :_panel_frame), value, T, kp.subjects)
-        kind === :scalar && (frame = :($frame[1:1, :]))
-        reduced = fn === :length ? :(fill(size($frame, 1), 1, $(kp.subjects))) :
-            Expr(:call, fn, Expr(:parameters, Expr(:kw, :dims, 1)), frame)
-        return :(repeat(vec($reduced); inner=$T))
-    end
-    return _rewrite_kernel_refs(Expr(ex.head,
-        (_rewrite_panel_value(a, kp, flatmap, shapes) for a in ex.args)...), flatmap)
-end
-
-function _panel_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
-    isbound(plan) ||
-        throw(ContractValidationError("[generator] kernel plates lower " *
-              "from a bound plan (bind_data first)"))
-    kp.subjects isa Int ||
-        throw(ContractValidationError("[generator] kernel plate " *
-              "`$(kp.result)` subjects unresolved (bind_data with dims first)"))
-    flatmap = _kernel_flatmap(kp)
-    stmts = Expr[]
-    shapes = _kernel_cell_shapes(kp)
-    for (nm, ex) in kp.assignments
-        canon, kind = _canonicalize_kernel_cell(ex, kp, shapes)
-        push!(stmts, :($nm = $(_rewrite_panel_value(canon, kp, flatmap, shapes))))
-        shapes[nm] = kind
-    end
-    klabel = Symbol(:kernel_, kp.result)
-    if isempty(kp.obs)
-        push!(stmts, :($(_lik_name(klabel))::Float64 = 0.0))
-    else
-        obs = only(kp.obs)
-        rcol = _kernel_obs_rcol(kp, obs, flatmap[obs.response], plan)
-        append!(stmts, _kernel_scalar_obs_stmts(obs, rcol,
-            flatmap, plan, klabel, _pw_name(klabel), _lik_name(klabel)))
-        col = only(c for (c, p, _) in kp.slices if p === obs.response)
-        push!(pointwise, col => _pw_name(klabel))
-    end
-    collected = haskey(flatmap, kp.collected) ? flatmap[kp.collected] : kp.collected
-    if get(shapes, kp.collected, :vector) === :scalar
-        T = something(kp.timepoints, 1)
-        collected = Expr(:call, GlobalRef(@__MODULE__, :_panel_subject_values), collected, T, kp.subjects)
-    end
-    collected === kp.result ||
-        push!(stmts, :($(kp.result) = $collected))
-    return stmts, _lik_name(klabel)
-end
-
-# One scalar response-space in-cell observation → its plate statements
-# (panel and grouped share the emitter — the grouped Gaussian arm was
-# the panel arm's near-duplicate). Cell spellings are the
-# mixture/plate endpoint precedents over the obs node's response-space
-# (location, scale, params). `rcol` is the response plate input (flat
-# for panel, whole-column for grouped); `label` scopes precomputes
-# (Gamma rate); slice-param args ride `flatmap`; cell locals, model
-# scalars, and literals pass through (`_thread_ref!`: symbols ride as
-# inputs — the `_ppl_lp_` precedent — literals inline).
-function _kernel_scalar_obs_stmts(obs::KernelObs, rcol::Symbol,
-        flatmap::Dict{Symbol,Symbol}, plan::Union{StructuralPlan,Nothing},
-        label::Symbol, pw::Symbol, node::Symbol)
-    fam = obs.family
-    loc = _kernel_obs_ref(obs.location, flatmap)
-    scale = obs.scale === nothing ? nothing :
-        _kernel_obs_ref(obs.scale, flatmap)
-    params = map(p -> _kernel_obs_ref(p, flatmap), obs.params)
-    inputs = Any[rcol]
-    rv = _dovar(1)
-    pre = Expr[]
-    cell = if fam === GaussianFam
-        locv = _thread_ref!(inputs, loc)
-        sref = _thread_ref!(inputs, scale)
-        :(normal($locv, $sref).logpdf($rv))
-    elseif fam === CauchyFam
-        locv = _thread_ref!(inputs, loc)
-        sref = _thread_ref!(inputs, scale)
-        :(cauchy($locv, $sref).logpdf($rv))
-    elseif fam === BinomialProbFam
-        counts = Symbol(:_ppl_counts_, label)
-        push!(pre, :($counts = Int.($rcol)))
-        inputs[1] = counts
-        nv = _thread_ref!(inputs, loc, true)
-        pv = _thread_ref!(inputs, scale)
-        :(binomial(Int($nv), $pv).logpdf($rv))
-    elseif fam === BernoulliLogitFam
-        pv = _thread_ref!(inputs, loc)
-        _kernel_obs_link(obs) === LogitLink ?
-            :(bernoulli(; logit = $pv).logpdf($rv)) :
-            :((($pv >= 0) & ($pv <= 1)) ? bernoulli($pv).logpdf($rv) : -Inf)
-    elseif fam === PoissonLogFam
-        muv = _thread_ref!(inputs, loc)
-        _kernel_obs_link(obs) === LogLink ?
-            :(poisson(; log_rate = $muv).logpdf($rv)) :
-            :($muv > 0 ? poisson($muv).logpdf($rv) :
-                ($muv == 0 && $rv == 0 ? -$muv : -Inf))
-    elseif fam === NegativeBinomial2Fam
-        muv = _thread_ref!(inputs, loc)
-        phiref = _thread_ref!(inputs, scale)
-        :(negative_binomial2($muv, $phiref).logpdf($rv))
-    elseif fam === GammaLogFam
-        # Surface is Distributions-SCALE `Gamma(alpha, scale)`; the
-        # kernel takes rate — invert at the boundary (the Gamma-plate
-        # precedent; literals fold, symbols precompute once outside
-        # the plate over layout-legal refs).
-        aref = _thread_ref!(inputs, loc)
-        ratev = if scale isa Symbol
-            rate = _rate_name(label)
-            push!(pre, :($rate = 1 ./ $scale))
-            _thread_ref!(inputs, rate)
-        else
-            1.0 / Float64(scale)
-        end
-        :(gamma($aref, $ratev).logpdf($rv))
-    elseif fam === BetaLogitFam
-        avv = _thread_ref!(inputs, loc)
-        bvv = _thread_ref!(inputs, scale)
-        :(beta($avv, $bvv).logpdf($rv))
-    elseif fam === StudentTFam
-        nuv = _thread_ref!(inputs, loc)
-        muv = _thread_ref!(inputs, scale)
-        sigv = _thread_ref!(inputs, params[1])
-        :(student_t($nuv, $muv, $sigv).logpdf($rv))
-    else
-        throw(ContractValidationError(
-            "[generator] in-cell obs family $fam has no scalar emitter"))
-    end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
-end
-
-# In-cell obs response column: Bernoulli plates read Bool lanes — a
-# non-Bool flat redirects to its bind-materialized Bool twin (exact
-# for 0/1; the `!=` comparison misdifferentiates under native Enzyme —
-# snag `bernoulli-int-la-78487520`). All other families read `rcol`.
-function _kernel_obs_rcol(kp::KernelPlate, obs::KernelObs, rcol::Symbol,
-        plan::Union{StructuralPlan,Nothing})
-    obs.family === BernoulliLogitFam || return rcol
-    plan === nothing && throw(ContractValidationError(
-        "[generator] Bernoulli in-cell obs needs the bound plan " *
-        "(response eltype check — internal: pass plan)"))
-    haskey(plan.columns, rcol) || throw(ContractValidationError(
-        "[generator] Bernoulli in-cell response `$rcol` is not bound"))
-    eltype(plan.columns[rcol]) === Bool && return rcol
-    twin = _kbool_name(kp.result, obs.response)
-    haskey(plan.columns, twin) || throw(ContractValidationError(
-        "[generator] Bernoulli in-cell Bool twin `$twin` missing " *
-        "(bind_data materializes it for non-Bool responses)"))
-    return twin
-end
-
-# One grouped cell assignment — always ONE emitted statement, whatever
-# the subject count (the generated program's statement count is O(1) in
-# the data; only the layout, the bound columns and runtime loop trip
-# counts scale with it): CELL_FN calls emit the subject-batched runner
-# over the bound `op_ends` + op columns with marked per-subject args;
-# segmented-nadir calls emit `tgi_segmented_nadir` over the bound ends
-# column; gathers rewrite `v[sched.map]` to `vflat[mapcol]`; slice
-# do-params rewrite to their bound columns (kernel ports are column
-# names — the panel flatmap precedent); everything else emits verbatim
-# (bind proved shapes).
-function _grouped_cell_assignment(nm::Symbol, ex, kp::KernelPlate,
-        sched::PKScheduleSpec, lps::Dict{Symbol,Symbol},
-        columns::Dict{Symbol,ColumnData}, flatmap::Dict{Symbol,Symbol})
-    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-            ex.args[1] isa Symbol && ex.args[1] in CELL_FNS
-        return _expand_grouped_cell_call(nm, ex, sched, lps, flatmap)
-    end
-    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-            ex.args[1] isa Symbol && ex.args[1] in SEGMENT_CELL_FNS
-        return _expand_segmented_nadir_call(nm, ex, columns, flatmap)
-    end
-    return Expr[:($nm = $(_rewrite_grouped_gather(ex, sched, lps, flatmap)))]
-end
-
-# Segmented nadir: the surface call emits verbatim over the bound ends
-# column — `tgi_segmented_nadir` (tgi.jl) runs the per-segment running
-# minimum as a plain eltype-generic loop (native and Enzyme) or one
-# `_rectangular_fold` over all rows with host-built reset flags
-# (Reactant — a retained traced loop, never a trace-time unroll).
-# Empty segments are the function's own concern (it returns an empty
-# block for them).
-function _expand_segmented_nadir_call(nm::Symbol, ex::Expr,
-        columns::Dict{Symbol,ColumnData}, flatmap::Dict{Symbol,Symbol})
-    # The change vector may be a bare response slice (shapes admit
-    # slices — `(:obs, len)`); slice do-params ride their columns.
-    change = _kernel_obs_ref(ex.args[2], flatmap)
-    endscol = ex.args[3]
-    haskey(columns, endscol) || throw(ContractValidationError(
-        "[generator] segmented nadir ends column `$endscol` is not bound"))
-    return Expr[:($nm = $(ex.args[1])($change, $endscol))]
-end
-
-function _rewrite_grouped_gather(ex, sched::PKScheduleSpec,
-        lps::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
-        flatmap::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}())
-    ex isa Symbol && return get(flatmap, ex, ex)
-    ex isa Expr || return ex
-    if ex.head === :ref && length(ex.args) == 2
-        vec, idx = ex.args[1], ex.args[2]
-        # LP cell params in gather-source position rewrite to their LP
-        # vectors (structure proved bare LPs reach generation ONLY as
-        # gather sources — every other bare use fails closed there —
-        # so any surviving bare LP elsewhere passes through to a loud
-        # UndefVar instead of a silent wrong vector). The LP check
-        # leads: LP params and slice do-params are disjoint, so order
-        # never matters, but the LP rule must not depend on it.
-        if vec isa Symbol && haskey(lps, vec)
-            vec = lps[vec]
-        else
-            vec = _rewrite_grouped_gather(vec, sched, lps, flatmap)
-        end
-        if idx isa Expr && idx.head === :.
-            m = idx.args[2].value
-            return Expr(:ref, vec, _sched_col_name(sched.name, m))
-        end
-        # Plain-symbol (or computed) flat indices — TGI/QT prep maps and
-        # other bind-materialized integer columns — pass through untouched.
-        return Expr(:ref, vec,
-            _rewrite_grouped_gather(idx, sched, lps, flatmap))
-    end
-    return Expr(ex.head,
-        (_rewrite_grouped_gather(a, sched, lps, flatmap)
-            for a in ex.args)...)
-end
-
-# Emit an RK subject plate with retained event scans. LP vectors are
-# subject operands; the positional event vector and model scalars are
-# shared operands. Schedule padding and result packing depend only on data.
-
-function _expand_grouped_cell_call(nm::Symbol, ex::Expr,
-        sched::LinearPKScheduleSpec, lps::Dict{Symbol,Symbol}, flatmap)
-    fn = ex.args[1]
-    callargs = ex.args[2:end]
-    opfields = CELL_FN_OP_FIELDS[fn]
-    cols = [_sched_col_name(sched.name, field) for field in opfields]
-    auc = fn === :linear_pk_read_locs_auc
-    event = auc || length(callargs) == CELL_FN_ARITY[fn] + 1
-    # The event axis follows the argument position, independent of its name.
-    values = event ? Any[callargs[2:end]...] :
-        Any[:(zeros(length($(first(cols))))), callargs[2:end]...]
-    modes = Symbol[:event]
-    for i in 2:length(values)
-        a = values[i]
-        if a isa Symbol && haskey(lps, a)
-            values[i] = lps[a]
-            push!(modes, :subject)
-        else
-            push!(modes, :shared)
-        end
-    end
-    return _pk_subject_statements(nm, auc,
-        _sched_col_name(sched.name, :op_ends), cols, values, modes)
-end
-
-# Grouped-kernel likelihood: the panel flat map cannot express sequential
-# recurrences, so each cell assignment emits a subject plate whose cell
-# graph contains event scans. It packs the subject reads flat; schedule-
-# map gathers move reads to obs space, and each in-cell observation
-# lowers as a Gaussian plate reusing the plate-sum machinery. Cell calls
-# always rewrite to this graph (never emit verbatim — a
-# verbatim schedule handle has no runtime binding); slice do-params
-# rewrite to their bound columns (kernel ports are column names — the
-# panel flatmap precedent); all other assignments emit verbatim under
-# their surface names. The collected name aliases its flat value (future
-# generated quantities + the sibling likelihood-node slice read it).
-#
-# Slice params to columns (grouped `_kernel_flatmap`: grouped slices
-# are all `:response` kind over whole columns — no T-blocks — so the
-# map is do-param → column).
-_grouped_flatmap(kp::KernelPlate) =
-    Dict{Symbol,Symbol}(p => c for (c, p, _) in kp.slices)
-
-function _grouped_kernel_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
-    isbound(plan) ||
-        throw(ContractValidationError("[generator] kernel plates lower " *
-              "from a bound plan (bind_data first)"))
-    kp.subjects isa Int ||
-        throw(ContractValidationError("[generator] kernel plate " *
-              "`$(kp.result)` subjects unresolved (bind_data with dims first)"))
-    sched = only(kp.schedules)
-    # The batched cell runner reads the subject ranges from this bound
-    # column at runtime; it must be a kernel port (bind materializes it).
-    haskey(plan.columns, _sched_col_name(sched.name, _sched_ends_field(sched))) ||
-        throw(ContractValidationError("[generator] schedule " *
-              "`$(sched.name)` has no bound subject-ends column"))
-    lps = Dict{Symbol,Symbol}(c => _lp_name(_predictor(plan, p))
-        for (p, c) in kp.lp_args)
-    flatmap = _grouped_flatmap(kp)
-    stmts = Expr[]
-    for (nm, ex) in kp.assignments
-        append!(stmts, _grouped_cell_assignment(nm, ex, kp, sched, lps,
-            plan.columns, flatmap))
-    end
-    klabel = Symbol(:kernel_, kp.result)
-    oterms = Any[]
-    for (oi, obs) in enumerate(kp.obs)
-        rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
-        olabel = Symbol(klabel, :_o, oi)
-        ostmts, oterm =
-            _grouped_obs_likelihood_stmts(kp, obs, rcol, olabel, plan)
-        append!(stmts, ostmts)
-        push!(oterms, oterm)
-        # All in-cell observation builders end in a sum of their lanes.
-        push!(pointwise, rcol => last(ostmts).args[2].args[2])
-    end
-    joint = foldl((a, b) -> :($a + $b), oterms; init = :(0.0))
-    push!(stmts, :($(_lik_name(klabel))::Float64 = $joint))
-    collected = haskey(flatmap, kp.collected) ? flatmap[kp.collected] :
-        kp.collected
-    collected === kp.result ||
-        push!(stmts, :($(kp.result) = $collected))
-    return stmts, _lik_name(klabel)
-end
-
-# One grouped in-cell observation → `(stmts, term)`: scalar obs
-# (PK-QT-TGI continuous alike) ride the shared scalar emitter; the
-# joint families route to their builders with the obs node's
-# `(response, location, scale, params)` mapped to builder kwargs (the
-# surface arity table + contract family checks proved the shapes, so
-# the positional map below is total). QT Gaussian obs route through
-# the SHARED path (the KernelObs node cannot carry the QT builder's
-# separate weight — the surface spells `qt_sd = qt_scale .*
-# qt_weight` pre-assignments instead; the QT builder stays the golden
-# shape spec the emitter output is pinned to). `plan` threads the
-# bound columns for the Bernoulli eltype check (direct unit calls
-# over non-Bernoulli obs pass `nothing`).
-function _grouped_obs_likelihood_stmts(kp::KernelPlate, obs::KernelObs,
-        rcol::Symbol, olabel::Symbol, plan::Union{StructuralPlan,Nothing} = nothing)
-    flatmap = _grouped_flatmap(kp)
-    if obs.family in _KERNEL_SCALAR_FAMS
-        pw, node = _pw_name(olabel), _lik_name(olabel)
-        rcol2 = _kernel_obs_rcol(kp, obs, rcol, plan)
-        return _kernel_scalar_obs_stmts(obs, rcol2, flatmap, plan, olabel,
-            pw, node), node
-    end
-    # Obs location/scale/params naming slice do-params ride their bound
-    # columns (kernel ports are column names — the panel
-    # `_kernel_obs_ref` precedent); cell locals, model scalars, and
-    # literals pass through.
-    loc = _kernel_obs_ref(obs.location, flatmap)
-    scale = _kernel_obs_ref(obs.scale, flatmap)
-    params = map(p -> _kernel_obs_ref(p, flatmap), obs.params)
-    if obs.family === CensoredAddpropnormalFam
-        # `pk_obs_statement` spelling: `(location, scale = add, prop,
-        # lloq)` — all names (the QT builder threads; literals spell
-        # a pre-assignment).
-        for (nm, ref) in ((:location, loc), (:scale, scale),
-                (:params, params[1]), (:params, params[2]))
-            ref isa Symbol ||
-                throw(ContractValidationError("[generator] kernel plate " *
-                      "`$(kp.result)` censored obs $nm `$ref` must be a " *
-                      "cell/model name (literals do not lower — spell " *
-                      "a pre-assignment)"))
-        end
-        return _qt_joint_pk_likelihood_stmts(; response = rcol,
-            location = loc, add = scale, prop = params[1],
-            lloq = params[2], label = olabel)
-    elseif obs.family === TgiCategoryFam
-        return tgi_category_stmts(; response = rcol, r = loc,
-            ref = scale, c_cr = params[1], c_pr = params[2],
-            c_pd = params[3], sigma = params[4], eps = params[5],
-            label = olabel)
-    elseif obs.family === TgiResponseFam
-        return tgi_response_stmts(; response = rcol, r = loc,
-            ref = scale, c_pr = params[1], c_pd = params[2],
-            sigma = params[3], eps = params[4], label = olabel)
-    elseif obs.family === TgiCensoredFam
-        return tgi_censored_stmts(; response = rcol, mu = loc,
-            sigma = scale, lloq = params[1], label = olabel)
-    end
-    throw(ContractValidationError("[generator] kernel plate " *
-          "`$(kp.result)` obs family $(obs.family) has no in-cell " *
-          "emitter (admitted: Normal, Bernoulli, Poisson, " *
-          "NegativeBinomial2, Gamma, Beta, StudentT, " *
-          "CensoredAddpropnormal, TgiCategory, TgiResponse, TgiCensored)"))
-end
-
-function _kernel_plate_likelihood(kp::KernelPlate, plan::StructuralPlan; pointwise = Pair{Symbol,Any}[])
-    _is_grouped_kernel(kp) && return _grouped_kernel_likelihood(kp, plan; pointwise)
-    return _panel_kernel_likelihood(kp, plan; pointwise)
-end
-
-# Slice params to flat refs: vector slices ride their flat T-blocked
-# column; scalar slices ride the bind-time T-block expansion (or the raw
-# column in all-scalar models, where no expansion exists).
-function _kernel_flatmap(kp::KernelPlate)
-    flatmap = Dict{Symbol,Symbol}()
-    for (col, param, kind) in kp.slices
-        kind in (:vector, :scalar) ||
-            throw(ContractValidationError("[generator] kernel plate " *
-                  "`$(kp.result)` slice `$param` kind unresolved " *
-                  "(bind_data first)"))
-        flatmap[param] =
-            (kind === :vector || kp.timepoints === nothing) ? col :
-            _kexp_name(kp.result, col)
-    end
-    return flatmap
-end
-
-# Obs location/scale through the flatmap (slice params only); cell
-# locals, globals, and literals pass to `_thread_ref!` unchanged.
-_kernel_obs_ref(ref, flatmap::Dict{Symbol,Symbol}) =
-    ref isa Symbol && haskey(flatmap, ref) ? flatmap[ref] : ref
-
-function _rewrite_kernel_refs(ex, flatmap::Dict{Symbol,Symbol})
-    ex isa Symbol && return get(flatmap, ex, ex)
-    ex isa Expr || return ex
-    if ex.head === :call && !isempty(ex.args) && ex.args[1] === :logistic
-        return Expr(:call, :_ppl_logistic,
-            (_rewrite_kernel_refs(a, flatmap) for a in ex.args[2:end])...)
-    elseif ex.head === :. && length(ex.args) == 2 && ex.args[1] === :logistic &&
-            ex.args[2] isa Expr && ex.args[2].head === :tuple
-        return Expr(:., :_ppl_logistic, _rewrite_kernel_refs(ex.args[2], flatmap))
-    end
-    return Expr(ex.head, (_rewrite_kernel_refs(a, flatmap) for a in ex.args)...)
 end
 
 # Packed observations keep their own axis. Every other observation input
@@ -1837,7 +717,7 @@ function _ranged_response_stmts(r, plan, stmts)
             aliases[value] = alias
         end
     end
-    stmts = Expr[_hsubst(st, aliases, Dict()) for st in stmts]
+    stmts = Expr[_hsubst(st, aliases) for st in stmts]
     return Expr[pre..., stmts...]
 end
 
@@ -1926,7 +806,7 @@ function _mi_stopping_response_stmts(r, plan, stmts)
         push!(pre, :($matrix = $(r.threshold_effects)[$jobs, :]))
         aliases[r.threshold_effects] = matrix
     end
-    return Expr[pre..., (_hsubst(st, aliases, Dict()) for st in stmts)...]
+    return Expr[pre..., (_hsubst(st, aliases) for st in stmts)...]
 end
 
 # One plate likelihood per response (pointwise plate + scalar sum node).
@@ -3670,92 +2550,6 @@ function _mvn_row_cell(K::Int, yvs::Vector{Symbol}, mvs::Vector{Symbol},
     return :( $row_const - $logdet - 0.5 * $quad )
 end
 
-# R2D2 prior bindings: the location vector stays a literal (SB
-# `beta_loc`); the scale vector is ONE broadcast over the share simplex,
-# `sqrt.(phi .* R2 .* tau^2 ./ varx)` (SB `brm_r2d2_scale`), whatever the
-# number of design columns (factor levels included). `r2d2_column_scales`
-# numbers the shares 1..S in design-column order, so the shared columns
-# read `phi` in order; share-0 columns (intercept, explicit-Normal
-# overrides) take literal fallbacks, placed by one constant-index gather
-# over `[shared; fallbacks]` (the share map is static data — no
-# data-dependent branching enters the graph). All radicands are positive
-# by construction (simplex/logistic/exp transforms + validated varx). The
-# consuming plate-sum shape is unchanged.
-function _r2d2_prior_stmts(rp::R2D2Prior, shape::DesignShape,
-        columns::AbstractDict{Symbol}, mut::Symbol, sdt::Symbol)
-    share, fallback, loc, varx =
-        r2d2_column_scales(shape, columns, rp.overrides)
-    shared = findall(>(0), share)
-    share[shared] == 1:length(shared) || throw(ContractValidationError(
-        "[generator] R2D2 shares of $(rp.predictor) are not numbered in " *
-        "design-column order (r2d2_column_scales assigns them so)"))
-    t2 = rp.tau isa Symbol ? :($(rp.tau) * $(rp.tau)) : Float64(rp.tau)^2
-    scales = :(sqrt.($(rp.phi) .* $(rp.r2) .* $t2 ./
-        Float64[$(varx[shared]...)]))
-    rhs = if length(shared) == length(share)
-        scales
-    else
-        # Shared scales first, fallbacks after (`vcat(traced, host)` —
-        # the order Reactant concatenates), gathered into column order.
-        fb = findall(==(0), share)
-        perm = zeros(Int, length(share))
-        perm[shared] .= 1:length(shared)
-        perm[fb] .= length(shared) .+ (1:length(fb))
-        :(vcat($scales, Float64[$(fallback[fb]...)])[$(Expr(:vect, perm...))])
-    end
-    return Any[:($mut = Float64[$(loc...)]), :($sdt = $rhs)]
-end
-
-_r2d2_for(plan::StructuralPlan, pred::Symbol) = begin
-    for rp in plan.r2d2_priors
-        rp.predictor === pred && return rp
-    end
-    return nothing
-end
-
-# Horseshoe derived coefficient blocks: a predictor with any HorseshoePrior
-# lays out no `:coefficient` block (layout skips it), so the block name
-# binds here as a design-ordered vector — triple products on horseshoe
-# addressees, Normal scalars elsewhere. Bound before the linear predictors,
-# which read the name unchanged. Scalar-only by validation (width-1
-# intercept/continuous blocks), so the literal has one entry per term —
-# no data-derived unrolling.
-function _horseshoe_coef_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    for pred in plan.predictors
-        hs = _horseshoe_for(plan, pred.name)
-        isempty(hs) && continue
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
-            matrices = plan.matrices)
-        by_addr = Dict{Symbol,HorseshoePrior}(h.addressee => h for h in hs)
-        coords = Any[]
-        for b in shape.blocks
-            b.width == 0 && continue
-            (b.kind === InterceptTerm || b.kind === ContinuousTerm) ||
-                throw(ContractValidationError(
-                    "[generator] horseshoe over $(pred.name) meets a " *
-                    "$(b.kind) block (validate_horseshoe restricts terms)"))
-            b.width == 1 || throw(ContractValidationError(
-                "[generator] horseshoe over $(pred.name) meets width " *
-                "$(b.width) (scalar blocks only)"))
-            addr = only(b.labels)
-            h = get(by_addr, addr, nothing)
-            if h === nothing
-                push!(coords, horseshoe_normal_name(pred.name, addr))
-            else
-                raw = horseshoe_raw_name(pred.name, addr)
-                lam = horseshoe_lambda_name(pred.name, addr)
-                tau = horseshoe_tau_name(pred.name, addr)
-                prod = :($raw * $lam * $tau)
-                push!(coords, h.sign == 1 ? prod : :(-$prod))
-            end
-        end
-        coef = block_name(pred.name)
-        push!(stmts, :($coef = [$(coords...)]))
-    end
-    return stmts
-end
-
 # One homogeneous coefficient plate over `coefaccess` (the block symbol or
 # a static-range slice) with per-lane (location, scale[, nu]) vectors.
 # A lane is a `Vector{Float64}` (literal lane, bound here) or a `Symbol`
@@ -3966,43 +2760,29 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         shape.width == 0 && continue
-        # A horseshoe predictor carries no Normal plate prior: its
-        # coordinates derive from triples/Normal scalars whose priors ride
-        # the sampled-parameter loop below.
-        isempty(_horseshoe_for(plan, pred.name)) || continue
         node = Symbol(:_ppl_prior_, pred.name)
         pw = Symbol(:_ppl_pw_prior_, pred.name)
         mut = Symbol(:_ppl_prmu_, pred.name)
         sdt = Symbol(:_ppl_prsd_, pred.name)
-        rp = _r2d2_for(plan, pred.name)
-        if rp === nothing
-            specs = coefficient_prior_specs(shape, plan.population_priors)
-            fams = map(s -> s.family, specs)
-            alllit = all(s -> s.location isa Real && s.scale isa Real, specs)
-            if all(==(fams[1]), fams) && fams[1] !== :flat && alllit
-                # Homogeneous fast path: today's exact plate, family cell.
-                nut = Symbol(:_ppl_prnu_, pred.name)
-                loc = [Float64(s.location) for s in specs]
-                sca = [Float64(s.scale) for s in specs]
-                nus = [Float64(s.nu) for s in specs]
-                _append_coef_plate!(stmts, block_name(pred.name), node, pw,
-                    mut, sdt, nut, loc, sca, nus, fams[1])
-                push!(terms, node)
-            elseif all(==(:flat), fams)
-                push!(stmts, :($node::Float64 = 0.0))
-                push!(terms, node)
-            else
-                _mixed_prior_stmts!(stmts, terms, pred, shape,
-                    plan.population_priors)
-            end
-            continue
+        specs = coefficient_prior_specs(shape, plan.population_priors)
+        fams = map(s -> s.family, specs)
+        alllit = all(s -> s.location isa Real && s.scale isa Real, specs)
+        if all(==(fams[1]), fams) && fams[1] !== :flat && alllit
+            # Homogeneous fast path: today's exact plate, family cell.
+            nut = Symbol(:_ppl_prnu_, pred.name)
+            loc = [Float64(s.location) for s in specs]
+            sca = [Float64(s.scale) for s in specs]
+            nus = [Float64(s.nu) for s in specs]
+            _append_coef_plate!(stmts, block_name(pred.name), node, pw,
+                mut, sdt, nut, loc, sca, nus, fams[1])
+            push!(terms, node)
+        elseif all(==(:flat), fams)
+            push!(stmts, :($node::Float64 = 0.0))
+            push!(terms, node)
+        else
+            _mixed_prior_stmts!(stmts, terms, pred, shape,
+                plan.population_priors)
         end
-        push!(stmts, _r2d2_prior_stmts(rp, shape, plan.columns, mut, sdt)...)
-        coef = block_name(pred.name)
-        cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
-        cell = :(normal($mv, $sv).logpdf($cv))
-        append!(stmts, _plate_sum_stmts(pw, node, Any[coef, mut, sdt], cell))
-        push!(terms, node)
     end
     _parameter_prior_statements!(stmts, terms, plan, layout)
     # GLM-object coefficient vectors: the same plate-prior shape as a
@@ -4062,98 +2842,10 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
                 p.support_override; rows = _plate_rows(plan, p))
         end
     end
-    # Spline coefficient vectors: the same plate-prior shape (broadcast the
-    # shared prior over cells). `b_fixed` is flat — a 0.0 node, mirroring a
-    # scalar flat parameter (never a plate: a vacuous cell would leave the
-    # do-var unread).
-    for v in plan.spline_vectors
-        if v.family === :flat
-            node = Symbol(:_ppl_prior_, v.name)
-            push!(stmts, :($node::Float64 = 0.0))
-            push!(terms, node)
-            continue
-        end
-        _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
-            v.support_override)
-    end
-    # Varying scales are normalized halves in every geometry.
-    for d in plan.varying_draws
-        if d.strata !== nothing
-            _stratified_prior_stmts!(stmts, terms, d, layout)
-            continue
-        end
-        L, tau, z = _varying_corr_names(d)
-        lnode = Symbol(:_ppl_prior_, L)
-        push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
-        push!(terms, lnode)
-        _sd_prior_tau_stmts!(stmts, terms, d, tau)
-        _vector_prior_stmts!(stmts, terms, z, :normal,
-            (arg1 = 0, arg2 = 1), nothing)
-    end
-    # HSGP hyperparameters use normalized declared priors. A default
-    # length-scale prior is truncated at its actual fitted validity floor.
-    for hb in plan.hsgp_bases
-        names = _hsgp_names(hb)
-        rfam, rargs = hb.rho_prior isa HyperPrior ?
-            (hb.rho_prior.family, collect(Any, values(hb.rho_prior.args))) :
-            (:lognormal, Any[0, 1])
-        sfam, sargs = hb.sigma_prior isa HyperPrior ?
-            (hb.sigma_prior.family,
-                collect(Any, values(hb.sigma_prior.args))) :
-            (:lognormal, Any[0, 1])
-        # Grouped hyper-predictors: Normal intercept, HalfNormal sd,
-        # and standard-normal non-centered coordinates.
-        function hyper_priors!(h)
-            if h.intercept
-                bnode = Symbol(:_ppl_prior_, h.beta0)
-                push!(stmts, :($bnode::Float64 =
-                    $(_family_logpdf_expr(:normal, Any[0, 1], h.beta0))))
-                push!(terms, bnode)
-            end
-            dnode = Symbol(:_ppl_prior_, h.sd)
-            push!(stmts, :($dnode::Float64 =
-                $(_family_logpdf_expr(:normal, Any[0, 1], h.sd)) + log(2)))
-            push!(terms, dnode)
-            _vector_prior_stmts!(stmts, terms, h.z, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
-        end
-        if names.rho_hyper !== nothing
-            hyper_priors!(names.rho_hyper)
-        else
-            for rho in names.rhos
-                node = Symbol(:_ppl_prior_, rho)
-                entry = only(e for e in layout.entries if e.name === rho)
-                support = hb.rho_prior isa HyperPrior ? hb.rho_prior.support_override :
-                    (:truncated, entry.transform === :floored ? entry.lo : 0.0, Inf)
-                cell = _sampled_prior_expr(SampledParameter(rho, rfam,
-                    NamedTuple{ntuple(i -> Symbol(:arg, i), length(rargs))}(Tuple(rargs)),
-                    support, rho); pre = stmts)
-                push!(stmts, :($node::Float64 = $cell))
-                push!(terms, node)
-            end
-        end
-        if names.sigma_hyper !== nothing
-            hyper_priors!(names.sigma_hyper)
-        else
-            snode = Symbol(:_ppl_prior_, names.sigma)
-            support = hb.sigma_prior isa HyperPrior ? hb.sigma_prior.support_override : nothing
-            scell = _sampled_prior_expr(SampledParameter(names.sigma, sfam,
-                NamedTuple{ntuple(i -> Symbol(:arg, i), length(sargs))}(Tuple(sargs)),
-                support, names.sigma); pre = stmts)
-            push!(stmts, :($snode::Float64 = $scell))
-            push!(terms, snode)
-        end
-        _vector_prior_stmts!(stmts, terms, names.beta, :normal,
-            (arg1 = 0, arg2 = 1), nothing)
-    end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
     scanstmts, scannodes = _scan_prior_statements(plan, layout)
     append!(stmts, scanstmts)
     append!(terms, scannodes)
-    # Differenced-AR(1) trajectories: the iid-innovation prior.
-    darstmts, darnodes = _dar_prior_statements(plan, layout)
-    append!(stmts, darstmts)
-    append!(terms, darnodes)
     # Declared array parameters (`arrays.jl`).
     _array_prior_stmts!(stmts, terms, plan, gathers; context)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
@@ -4215,85 +2907,7 @@ function _lkj_prior_diagonal(ld, K, i, eta)
         :($coefficient * $ld + $(2 * eta - 2) * $ld)
 end
 
-# One correlated draws block's LKJ prior node (names/sizes from the draws).
-function _lkj_prior_expr(d::VaryingDraws)
-    return _lkj_prior_terms(_varying_corr_names(d)[1], length(d.margins),
-        d.lkj_eta)
-end
-
-# One stratified draws block's prior nodes, stacked across its S strata
-# (S comes from data, so per-stratum nodes would replicate statements —
-# core constraint 1): ONE LKJ node over the stacked diagonal S-vectors
-# (S copies of the constant, then each diagonal term summed over the
-# strata), ONE half-normal plate over the stacked K×S `tau` (validation
-# proves no sd priors), then the shared `z_flat` plate. The strata are
-# independent, so this is the SB `ranef_correlated_by` sum regrouped.
-function _stratified_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
-        d::VaryingDraws, layout::LayoutTable)
-    g = _strata_geometry(d, layout)
-    sL = _strata_L_name(d)
-    lnode = Symbol(:_ppl_prior_, sL)
-    push!(stmts, :($lnode::Float64 =
-        $(_lkj_prior_terms(sL, g.K, d.lkj_eta; nstack = g.S))))
-    push!(terms, lnode)
-    _vector_prior_stmts!(stmts, terms, _strata_tau_name(d), :normal,
-        (arg1 = 0, arg2 = 1), :positive)
-    z = _varying_corr_names(d)[3]
-    _vector_prior_stmts!(stmts, terms, z, :normal,
-        (arg1 = 0, arg2 = 1), nothing)
-    return nothing
-end
-
-# One margin's sd prior in the shared (family, args) prior shape (SB's
-# generic-path mirror: `:std_normal` is Normal(0, 1), `:exponential`
-# carries the contract's SCALE, `:normal` is Normal(0, σ)).
-function _sd_prior_shape(p::VaryingSdPrior)
-    p.family === :std_normal && return (:normal, (arg1 = 0.0, arg2 = 1.0))
-    p.family === :exponential && return (:exponential, (arg1 = p.param,))
-    p.family === :normal && return (:normal, (arg1 = 0.0, arg2 = p.param))
-    p.family === :cauchy && return (:cauchy, (arg1 = 0.0, arg2 = p.param))
-    throw(ContractValidationError("[generator] sd prior family " *
-        "$(repr(p.family)) is not one of $(_SD_PRIOR_FAMILIES) " *
-        "(validate_plan proves this)"))
-end
-
-# A draws block's per-margin `tau` prior shapes in margin order (empty
-# `sd_priors` is all-`:std_normal`).
-function _sd_prior_shapes(d::VaryingDraws)
-    K = length(d.margins)
-    isempty(d.sd_priors) &&
-        return fill((:normal, (arg1 = 0.0, arg2 = 1.0)), K)
-    return [_sd_prior_shape(p) for p in d.sd_priors]
-end
-
-# A homogeneous prior stays one retained plate; structurally stated mixed
-# margins share the same normalized half densities.
-function _sd_prior_tau_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
-        d::VaryingDraws, tau::Symbol)
-    shapes = _sd_prior_shapes(d)
-    if all(s -> s == (:normal, (arg1 = 0.0, arg2 = 1.0)), shapes)
-        _vector_prior_stmts!(stmts, terms, tau, :normal,
-            (arg1 = 0, arg2 = 1), :positive)
-        return nothing
-    end
-    if all(s -> s == shapes[1], shapes)
-        fam, args = shapes[1]
-        _vector_prior_stmts!(stmts, terms, tau, fam, args, fam === :exponential ? nothing : :positive)
-        return nothing
-    end
-    node = Symbol(:_ppl_prior_, tau)
-    cells = Any[]
-    for k in eachindex(shapes)
-        fam, args = shapes[k]
-        cell = _family_logpdf_expr(fam, Any[values(args)...], Expr(:ref, tau, k))
-        push!(cells, fam === :exponential ? cell : :($cell + log(2)))
-    end
-    push!(stmts, :($node::Float64 = $(foldl((a, c) -> :($a + $c), cells))))
-    push!(terms, node)
-    return nothing
-end
-
-# One plate over a latent VECTOR (a plate parameter or a spline vector),
+# One plate over a latent vector parameter,
 # summing the shared-prior log-density across cells. Every value the cell
 # reads is threaded as a plate PORT (the vector plus each scalar prior
 # arg) — captured free names are rejected by the `@kernel` plate
@@ -4898,78 +3512,11 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
     return stmts, nodes
 end
 
-# --- Differenced-AR(1) trajectory reconstruction (dar slice) ---
-
-# Reconstruction statements for every dar trajectory, in plan order — the
-# shared RK-core `scan(...)` carry-fold with a `(x, d)` NamedTuple carry
-# (level + AR(1) increment), zero-started exactly like SB's
-# `differenced_ar1_path` (`x[1] = 0`, `d[0] = 0`):
-#   `rest = scan(z, Ref(beta), Ref(sigma); init = (x = 0.0, d = 0.0)) do ... end`
-#   `state = vcat(0.0, rest)`
-# The per-step outputs are `x[2..T]`; the `vcat` heads the zero start.
-# Runs before predictors/likelihood (the LP splices the state); the
-# innovation prior stays in `_dar_prior_statements` (order-free).
-function _dar_reconstruction_statements(plan::StructuralPlan,
-        layout::LayoutTable)
-    stmts = Expr[]
-    for s in plan.dar_paths
-        any(p -> p.name === s.beta, plan.parameters) || throw(
-            ContractValidationError(
-                "[generator] dar $(s.state): persistence :$(s.beta) is " *
-                "not a sampled parameter"))
-        any(p -> p.name === s.sigma, plan.parameters) || throw(
-            ContractValidationError(
-                "[generator] dar $(s.state): scale :$(s.sigma) is not a " *
-                "sampled parameter"))
-        zname = _dar_innovation_name(s)
-        any(e -> e.kind === :scan && e.name === zname,
-            layout.entries) || throw(ContractValidationError(
-            "[generator] dar $(s.state): layout has no innovation slice " *
-            ":$zname"))
-        beta, sigma = s.beta, s.sigma
-        lambda = Expr(:->,
-            Expr(:tuple, :_ppl_carry, :_ppl_elem, beta, sigma),
-            Expr(:block,
-                :(_ppl_d = $beta * _ppl_carry.d + $sigma * _ppl_elem),
-                :(_ppl_x = _ppl_carry.x + _ppl_d),
-                :(_ppl_next = (x = _ppl_x, d = _ppl_d)),
-                :((_ppl_next, _ppl_x))))
-        kw = Expr(:parameters, Expr(:kw, :init, :((x = 0.0, d = 0.0))))
-        call = Expr(:call, :scan, kw, zname, :(Ref($beta)), :(Ref($sigma)))
-        rest = Symbol(:_ppl_dar_rest_, s.state)
-        push!(stmts, :($rest = $(Expr(:do, call, lambda))))
-        push!(stmts, :($(s.state) = vcat(0.0, $rest)))
-    end
-    return stmts
-end
-
-# The dar innovation prior: the iid `Normal(0, 1)` plate-vector prior
-# shape over the `_ppl_dar_z_<state>` slice (one cell per innovation,
-# the same `_plate_sum_stmts` reduction the non-centered-scan path
-# uses), totalled under the dar-flavored `_ppl_dar_<state>` node.
-function _dar_prior_statements(plan::StructuralPlan, layout::LayoutTable)
-    stmts = Expr[]
-    nodes = Symbol[]
-    for s in plan.dar_paths
-        zname = _dar_innovation_name(s)
-        cell = _family_logpdf_expr(:normal, Any[0, 1], _dovar(1))
-        node = Symbol(:_ppl_dar_, s.state)
-        pw = Symbol(:_ppl_dar_pw_, s.state)
-        append!(stmts, _plate_sum_stmts(pw, node, Any[zname], cell))
-        push!(nodes, node)
-    end
-    return stmts, nodes
-end
-
 function _log_jacobian_statement(plan::StructuralPlan, layout::LayoutTable)
     terms = Any[]
-    _each_layout_unit(plan, layout) do unit
-        if unit isa LayoutEntry
-            t = jacobian_term(unit)
-            t === nothing || push!(terms, t)
-        else
-            append!(terms, _stratified_logjac_terms(unit, layout))
-        end
+    for e in layout.entries
+        t = jacobian_term(e)
+        t === nothing || push!(terms, t)
     end
     jac = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
     return :(log_jacobian::Float64 = $jac)

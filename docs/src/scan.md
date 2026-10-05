@@ -290,6 +290,17 @@ end
 A traced empty sequence compiles to a program with no `stablehlo.while`. A
 nonempty one keeps its single loop.
 
+Ordinary native Enzyme reverse differentiates through an empty scan, including
+one inside a plate cell; the empty steps contribute nothing. When the step's
+inferred output type is concrete, the native lowering allocates the result once,
+before testing for emptiness, so the empty and nonempty results are the same
+allocation. Separate allocations for the two cases would meet in one value,
+which Enzyme's static activity analysis rejects
+(`benchmark/repro_enzyme_branch_allocation_phi.jl`). When inference gives no
+concrete output type (`Any` for a step containing a plate, scan or embedded
+kernel), each case still allocates its own result as before; native reverse
+through such an empty scan is not covered by this lowering.
+
 A recurrence authored in its own kernel, prepared once and called from a lazy
 branch arm, still works. The arm then runs through an ordinary callable
 boundary, not transparent graph splicing. Declare that arm's result type
@@ -354,56 +365,28 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   as an intermediate, but XLA export still rejects it when it is itself the
   compiled program's output (an upstream gap, `reactivekernels-use` §7l).
 
-## Generated grouped recurrences
+## Nested plates and compound values
 
-The `ReactiveKernelsPPL` example package uses a separate internal rectangular
-fold for traced TGI nadir assessments. Reset flags represent unequal subject
-lengths, including subjects without assessments. Its primal and reverse paths
-preserve the existing output-before-update semantics.
+An authored scan may run inside an RK plate. The generic nested plate/scan
+path has compiled primal and reverse parity and a fixed backend operation
+inventory as both lane counts and sequence lengths grow
+(`test/test_scan_plate_reactant.jl`).
 
-Grouped PK calls lower to an ordinary RK subject `plate`, with an authored
-`scan` inside each cell. The named carry holds the three compartment amounts
-and accumulated bioavailable dose. Each scan writes scalar outputs into an
-explicit buffer. Concentration and AUC use two instances of the same step
-specification, then gather the subject's READ slots. Schedule-only padding and
-packing restore ragged order, including empty subjects; parameter-dependent
-system construction and propagation remain in the graph.
-
-READ, DOSE, repeated-dose, and padded arms are lazy. Same-time reads precede
-doses, each subject resets to zero, and repeated-dose propagation retains a
-binary-power loop. The event curve's axis follows its argument position, so
-its variable name does not affect slicing. Native concentration/AUC, generated
-densities, default Enzyme reverse, and warmed nonallocating queries are covered
-by synthetic independent references.
-
-Fixed-size matrix and named carry intermediates now batch through the same
-authored cell graph. Each traced leaf keeps its own element type and tensor
-shape; metadata restores the matrix or named tuple in the next cell. The
-matrix portion has compiled primal/default-reverse parity and fixed backend
-structure across subject counts in `test_pk_subject_plate_reactant.jl`.
+Fixed-size matrix and named carry intermediates batch through the authored
+cell graph. Each traced leaf keeps its element type and tensor shape;
+metadata restores the matrix or named tuple in the next cell. The matrix
+portion has compiled primal/default-reverse parity and fixed backend
+structure across lane counts in
+`packages/ReactiveKernelsPPL/test/test_compound_plate_reactant.jl`.
 Compound results currently require a one-dimensional lane axis and immutable
 fixed structure or traced tensor leaves; unsupported host collections fail
 explicitly.
 
-Full PK Reactant compilation is still unsupported: the ordinary
-`StaticArrays.exp` inside the event scan uses a traced Boolean as a host branch
-condition. The same test pins that exact error across growing subject/event
-axes; `benchmark/repro_reactant_static_matrix_exp.jl` isolates it without RK.
-The exponential capability is tracked in
-[issue #34](https://github.com/nsiccha/ReactiveKernels.jl/issues/34).
-The generic nested plate/scan path has compiled primal and
-reverse parity and a fixed backend operation inventory as both subjects and
-sequence lengths grow (`test/test_scan_plate_reactant.jl`). Those checks do
-not establish compiled PK support. Eager branches or parameter-dependent host
-precomputation are not substitutes for repairing the exponential boundary.
-Full PK acceptance must also check default optimized reverse structure:
-`benchmark/repro_reactant_lazy_batch_growth.jl` isolates small lazy batches
-whose values and gradients pass but whose branch regions expand per lane.
-
-The standalone CPU reproducers in `benchmark/joint_stan_tiled/` also retain the
-two historical upstream reverse defects, fixed in Reactant 0.2.289+; the PK
-reproducer now uses the ordinary authored graph. Bound schedule shapes still
-specialize an executable; changing the schedule requires preparing again.
+PK and TGI model recurrences and their scientific acceptance belong to
+RKPPLBench. The compiler's retained loops, lazy branches, shape preservation
+and standard AD contracts apply to those ordinary consumer programs. The
+standalone CPU reproducers in `benchmark/joint_stan_tiled/` preserve two
+historical upstream reverse defects, fixed in Reactant 0.2.289+.
 
 ## Limitations
 

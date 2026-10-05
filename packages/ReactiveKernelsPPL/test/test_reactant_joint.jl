@@ -1,8 +1,7 @@
 # Reactant track: full-program `Reactant.@compile` of built RKPPL programs —
 # primal lp parity and compiled value+gradient (Enzyme-through-Reactant)
-# parity against the native kernels. The default grouped linear-PK path
-# rejects compilation explicitly: unrolling its bound schedule violates the
-# core constraints. The tiny model still proves the compiled AD path.
+# parity against the native kernels. Retained numerical plate/scan
+# composition is covered separately by test_kernel_composition_reactant.jl.
 #
 # Call shape (the one thing that decides traceability): compile the RAW
 # prepared kernel / `q.ad` directly (top level, or `invokelatest` AROUND
@@ -17,6 +16,8 @@ using ReactiveKernelsPPL
 using Reactant
 using Random
 using Test
+import Distributions as RJDistributions
+using LinearAlgebra: Cholesky
 
 const _RJ_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
@@ -130,73 +131,51 @@ end
     @test_broken Array(rgrad_default) ≈ g rtol = 1e-9
 end
 
-# Corpus 17 (varying dummy): the `(c .== level)` mask nests inside the LP's
-# traced `.+`/`.*` fusion with no direct traced operand at the outermost
-# call, so the lazy nest kept its host style and Reactant's per-argument
-# standalone materialize produced the overlay-hostile `BitArray`
-# (`StackOverflowError`; snag `dummy-varying-xl-3b05117e`). The lowering now
-# dense-materializes host-only `Bool` nests (`Array{Bool}`), so the program
-# compiles with primal + gradient parity like its ranef siblings.
-@testset "Reactant ladder 1b: varying dummy (corpus 17) primal + gradient" begin
+# A host Bool mask nested in a traced broadcast must retain dense array
+# materialization. Explicit array priors keep the same gather and mask path.
+@testset "Reactant ladder 1b: nested host mask primal + gradient" begin
     plan = lower_rkppl(quote
             a ~ Normal(0, 1)
-            r ~ varying_effect(g, [1, dummy(c, 2)])
-            mu = a .+ r
+            sd[1:2] .~ HalfNormal.(1)
+            L ~ LKJCholesky(2, 1.0)
+            z[levels(g), 1:2] .~ Normal.(0, 1)
+            B = z * (sd .* L)'
+            mu = a .+ B[g, 1] .+ B[g, 2] .* (c .== 2)
             y .~ Normal.(mu, 1.5)
         end, (:y, :c, :g); conditioned = (:y, :c, :g))
-    bound = bind_data(plan, Dict{Symbol,AbstractVector}(
+    data = Dict{Symbol,AbstractVector}(
         :y => [0.5, -1.2, 0.8, 1.5, -0.3, 0.9, -0.7, 1.1],
         :c => [1, 2, 2, 1, 2, 1, 2, 1],
-        :g => [2, 1, 3, 1, 2, 3, 1, 2]))
+        :g => [2, 1, 3, 1, 2, 3, 1, 2])
+    bound = bind_data(plan, data)
     built = build_kernel(bound)
     post_q = prepare_query(built, bound, :sampler)
     u = fill(0.1, built.layout.total)
     native = post_q(u)
-    @test native ≈ -22.189852822758517 rtol = 1e-12
+    nt = constrain(built.layout, u)
+    B = nt.z * (nt.sd .* nt.L)'
+    mu = nt.a .+ B[data[:g], 1] .+ B[data[:g], 2] .* (data[:c] .== 2)
+    normal = RJDistributions.Normal()
+    half = RJDistributions.truncated(normal, 0, Inf)
+    oracle = RJDistributions.logpdf(normal, nt.a) +
+        sum(RJDistributions.logpdf.(half, nt.sd)) +
+        sum(RJDistributions.logpdf.(normal, nt.z)) +
+        RJDistributions.logpdf(RJDistributions.LKJCholesky(2, 1.0),
+            Cholesky(nt.L, 'L', 0)) +
+        sum(RJDistributions.logpdf.(RJDistributions.Normal.(mu, 1.5), data[:y])) +
+        logjac(built.layout, u)
+    @test native ≈ oracle rtol = 1e-12
     compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
     @test Float64(compiled(Reactant.to_rarray(u))) ≈ native rtol = 1e-9
     q = prepare_sampler(built, bound, u; backend = _RJ_BACKEND)
     g = similar(u)
     val, _ = sampler_value_and_gradient!(q, g, u)
     @test val ≈ native rtol = 1e-12
+    @test g ≈ _rj_findiff(post_q, u) rtol = 1e-5 atol = 1e-7
     cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
     rval, rgrad = cad(Reactant.to_rarray(u))
     @test Float64(rval) ≈ native rtol = 1e-9
     @test Array(rgrad) ≈ g rtol = 1e-9
-end
-
-# Synthetic grouped linear-PK program (two subjects, a repeated-dose
-# schedule): bound plan, sampler-cut kernel and a deterministic point.
-function _rj_grouped_pk()
-    plan = lower_rkppl(Meta.parse("begin\nsigma ~ Exponential(1.0)\n" *
-            "b0 ~ Normal(0.0, 1.0)\nlog_Vc = b0\n" *
-            "pk_sched = linear_pk_schedule(obs = (:subj, :time), " *
-            "dose = (:dsubj, :dtime, :damt))\n" *
-            "@plate conc for s in 1:kernel_nsub_conc\n" *
-            " read_locs = linear_pk_read_locs(pk_sched, log_Vc, log_Vc, " *
-            "log_Vc, log_Vc, log_Vc)\n" *
-            " mu = read_locs[pk_sched.obs_map]\n" *
-            " dv .~ Normal.(mu, sigma)\n mu\nend\nend"),
-        (:subj, :time, :dsubj, :dtime, :damt, :dv); conditioned = (:subj, :time, :dsubj, :dtime, :damt, :dv))
-    cols = Dict{Symbol,AbstractVector}(
-        :subj => [1, 1, 2, 2], :time => [96.0, 120.0, 0.0, 5.0],
-        :dsubj => [1, 1, 1, 1, 2], :dtime => [0.0, 24.0, 48.0, 72.0, 0.0],
-        :damt => [100.0, 100.0, 100.0, 100.0, 50.0],
-        :dv => [10.0, 8.0, 0.5, 7.0])
-    bound = bind_data(plan, cols; dims = Dict{Symbol,Int}(:kernel_nsub_conc => 2))
-    built = build_kernel(bound)
-    post_q = prepare_query(built, bound, :sampler)
-    u = Vector{Float64}(0.1 .* randn(Xoshiro(20260917), built.layout.total))
-    return (; post_q, u)
-end
-
-@testset "Reactant ladder 2: grouped PK rejects the unrolled fallback" begin
-    fx = _rj_grouped_pk()
-    @test isfinite(fx.post_q(fx.u))
-    # capability: Reactant-compiled grouped PK recurrences (unrolled fallback refused per core constraints; scan.md PK adapter) (todo `0yc2qgp`)
-    @test_broken (Reactant.@code_hlo fx.post_q(
-        Reactant.to_rarray(fx.u)); true)
-
 end
 
 # Multivariate slice priors (`mv_slices.jl`) under Reactant: simplex and

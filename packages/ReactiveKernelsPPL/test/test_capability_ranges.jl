@@ -135,6 +135,27 @@ end
             y[i] ~ Normal(mu, 0.7)
         end
     end
+    # Nonempty bound arrays can have no observed cells. The selected values,
+    # pointwise output and reverse still follow the authored six-row indices.
+    for (R, rows) in ((:(2:6), 2:6), (:(3:3), 3:3), (:(1:0), 1:0), (:(5:4), 5:4))
+        data = (; x, y = Union{Missing,Float64}[
+            i in rows ? y[i] : missing for i in eachindex(y)])
+        saved = deepcopy(data)
+        bound = bind_data(lower_rkppl(loop(R), data; conditioned = keys(data)), data)
+        built = build_kernel(bound)
+        u = unconstrain(built.layout, (; a = 0.25, b = -0.3))
+        pointwise(v) = [logpdf(Normal(v[1] + v[2] * x[i], 0.7), y[i]) for i in rows]
+        oracle(v) = logpdf(Normal(), v[1]) + logpdf(Normal(), v[2]) +
+            sum(pointwise(v); init = 0.0)
+        sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u)
+        @test gradient ≈ _cap_range_fd(oracle, u) rtol = 5e-6
+        output = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        @test output.y ≈ pointwise(u)
+        @test length(output.y) == length(rows)
+        @test isequal(data, saved)
+    end
     # refused: the loop leaves the supplied `y[1]` (or `y[5:6]`) unobserved
     # (user decision `1g8uvgs`: every supplied response entry is observed).
     for R in (:(2:6), :(1:4))

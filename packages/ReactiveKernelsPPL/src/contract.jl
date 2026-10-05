@@ -129,9 +129,6 @@ univariate components, SB `MixtureModel` mirror)."""
     CategoricalFam
     MvNormalCholeskyFam
     CensoredAddpropnormalFam
-    TgiCategoryFam
-    TgiResponseFam
-    TgiCensoredFam
     NormalIDGLMFam
     BernoulliLogitGLMFam
     PoissonLogGLMFam
@@ -170,23 +167,15 @@ design) — the random-effects / per-observation-latent location. `ScanSummandTe
 sequential-recurrence state into the predictor scaled by a sampled scalar
 coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta), or
 unscaled when its `coef` is `nothing` (`mu = a .+ x`).
-`DarSummandTerm` splices a differenced-AR(1) trajectory state into the
-predictor UNSCALED (SB's `dar` zero-started integrated path; the formula
-intercept is the initial level, so no coefficient is identified)."""
+"""
 @enum TermKind::UInt8 begin
     InterceptTerm
     ContinuousTerm
     FactorTerm
     OffsetTerm
     LatentTerm
-    SplineSummandTerm
-    HSGPSummandTerm
     ScanSummandTerm
-    MonotonicTerm
-    MonotonicSummandTerm
-    VaryingEffectTerm
     MatrixTerm
-    DarSummandTerm
     ComposedTerm
 end
 
@@ -576,68 +565,6 @@ PopulationPrior(predictor::Symbol, addressee::Symbol, family::Symbol,
     PopulationPrior(predictor, addressee, family, location, scale, NaN)
 
 """
-    R2D2Prior(predictor, r2, phi, tau, overrides)
-
-Flat whole-predictor R2D2 variance decomposition (SB mirror, the
-`effect(lp,:) ~ r2d2(...)` form — the `sd(...) ~ r2d2(...)` R2D2M2/ICC
-grammar belongs to the hierarchical lane, never here). One per
-predictor at most; a predictor with an `R2D2Prior` carries NO
-[`PopulationPrior`](@ref) rows (coverage moves here).
-
-- `r2` names the scalar `Beta` [`SampledParameter`](@ref).
-- `phi` names the `:simplex_dirichlet` [`VectorParameter`](@ref) whose
-  length is the share count.
-- `tau` is the total scale: a sampled-parameter name (half-Normal) or
-  a positive literal (SB's data `tau_bsv`).
-- `overrides` maps addressees with an explicit Normal prior to their
-  `(location, scale)` — those columns keep their own scale and leave
-  the simplex (the SB share_idx/fallback composition). The intercept
-  is always share 0 (its override, if stated, supplies loc/scale).
-
-Share assignment follows SB exactly: every non-intercept design
-column without an override takes the next share in design-column
-order; the emitter derives
-`scale[j] = sqrt(phi[share] * R2 * tau^2 / varx[j])`.
-"""
-struct R2D2Prior
-    predictor::Symbol
-    r2::Symbol
-    phi::Symbol
-    tau::Union{Symbol,Real}
-    overrides::Dict{Symbol,Tuple{Float64,Float64}}
-end
-
-"""
-    HorseshoePrior(predictor, addressee, local_scale, global_scale, sign)
-
-One per-coefficient horseshoe prior: standard-normal raw coefficient,
-normalized HalfCauchy(local_scale) lambda, and HalfCauchy(global_scale) tau.
-Each scalar built-in call owns its own tau. For one shared global tau use
-`horseshoe_coefs(X)`. `addressee` is a predictor's intercept or continuous
-column and `sign` is its use polarity. The derived coordinate is
-`sign * raw * lambda * tau`; the latent priors use SampledParameter.
-Scales are finite strictly positive literals.
-"""
-struct HorseshoePrior
-    predictor::Symbol
-    addressee::Symbol
-    local_scale::Float64
-    global_scale::Float64
-    sign::Int
-end
-
-"""Synthesized triple/scalar names for one horseshoe addressee (surface,
-validator, and generator share these — the names are the contract)."""
-horseshoe_raw_name(pred::Symbol, addr::Symbol) =
-    Symbol(:horseshoe_, pred, :_, addr, :_raw)
-horseshoe_lambda_name(pred::Symbol, addr::Symbol) =
-    Symbol(:horseshoe_, pred, :_, addr, :_lambda)
-horseshoe_tau_name(pred::Symbol, addr::Symbol) =
-    Symbol(:horseshoe_, pred, :_, addr, :_tau)
-horseshoe_normal_name(pred::Symbol, addr::Symbol) =
-    Symbol(:horseshoe_, pred, :_, addr, :_normal)
-
-"""
     SupportOverride
 
 A latent's support override is `nothing` (infer natural support), `:positive`
@@ -708,158 +635,6 @@ PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     range::Union{Nothing,UnitRange{Int},Symbol,Expr}) =
     PlateParameter(name, family, args, support_override, range, name)
 
-"""
-    VaryingZRecipe(kind, column, level)
-
-One varying-effect design (Z) column recipe: structure only, never a
-materialized vector pre-codegen. `kind` is `:ones` (intercept — `column`
-is `:none`, `level` is `nothing`), `:column` (continuous raw column),
-or `:dummy` (indicator over `column`: `level` is the level VALUE for
-`Int`, exact match for `AbstractString`). The thin layer performs NO
-coding inference — treatment/cell-means decisions arrive as explicit
-`dummy` recipes from the emitter.
-"""
-struct VaryingZRecipe
-    kind::Symbol
-    column::Symbol
-    level::Union{Nothing,Int,AbstractString}
-end
-
-"""
-    VaryingMargin(coefficient, z)
-
-One varying-effect margin in draws order: `coefficient` is the margin
-address (`:Intercept`, a column, or a dummy label), `z` is the
-[`VaryingZRecipe`](@ref) for its Z column. Margins live on the shared
-draws; per-target column ranges live on [`VaryingSlice`](@ref).
-"""
-struct VaryingMargin
-    coefficient::Symbol
-    z::VaryingZRecipe
-end
-
-"""
-    VaryingSdPrior(family, param)
-
-One margin's normalized positive-scale prior. `:std_normal` is HalfNormal(1),
-`:normal` is HalfNormal(param), `:cauchy` is HalfCauchy(param), and
-`:exponential` is Exponential(param) in the Distributions scale convention.
-An empty sd_priors vector gives the HalfNormal(1) default for every margin.
-"""
-struct VaryingSdPrior
-    family::Symbol
-    param::Float64
-end
-
-VaryingSdPrior(family::Symbol, param::Real) =
-    VaryingSdPrior(family, Float64(param))
-
-const _SD_PRIOR_FAMILIES = (:std_normal, :exponential, :normal, :cauchy)
-
-"""
-    VaryingMultiMembership(groups, weights, normalize)
-
-Multi-membership grouping metadata for a [`VaryingDraws`](@ref) block
-(SB `mm(...)` mirror): `groups` is the ≥2 membership columns (raw
-data — one shared draws block over their UNION levels), `weights` is
-`nothing` (equal `1/M` weights) or one raw numeric column per group,
-`normalize` row-normalizes supplied weights to sum to one (SB
-`_brm_prepare_mm`). `nothing` on the draws = plain single-column
-grouping.
-"""
-struct VaryingMultiMembership
-    groups::Vector{Symbol}
-    weights::Union{Nothing,Vector{Symbol}}
-    normalize::Bool
-end
-
-"""
-    VaryingStrata(by, levels)
-
-Stratified-grouping metadata for a [`VaryingDraws`](@ref) block (SB
-`gr(g, by=b)` mirror): `by` is the raw stratum column, `levels` the
-strata levels in numbering order (`nothing` pre-bind —
-[`bind_data`](@ref) fills sort-ordered observed levels). `nothing` on
-the draws = unstratified.
-"""
-struct VaryingStrata
-    by::Symbol
-    levels::Union{Nothing,Vector}
-end
-
-"""
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix[, levels[, sd_priors[, mm[, strata]]]])
-
-One shared varying-effect draws block over
-`K = length(margins)` margins in `G` groups of raw column `group`.
-`kind` is `:correlated` (non-centered LKJ + tau + z_flat).
-There is one geometry for every K and every margin: a single
-margin, intercept or slope, is the 1x1 case, whose LKJ factor is the
-fixed `[1]` (zero coordinates, a `0.0` prior node), so its sd is the
-same half-normal `tau` (`tau ~ Normal(0, 1)` on `tau > 0` plus the
-`exp`-layout Jacobian) as every margin of a larger block. K = 1 draws
-carry `lkj_eta == 1.0`: no other eta parameterizes anything there.
-(StanBlocks-BRMI samples a K=1 intercept's sd in log space — a
-LogNormal(0, 1) sd. That asymmetry depended on whether `eta` was
-written, so it is not mirrored.) `label` is the link identity
-(`:draws_<suffix>`); `suffix` is the in-graph naming stem (the group,
-or `group_binding` when two draws share a grouping). `levels` is the
-grouping's DECLARED levels in numbering order (`nothing` pre-bind, or
-when the emitter has no declaration — [`bind_data`](@ref) fills
-sort-ordered observed levels). `sd_priors` is the per-margin `tau`
-prior ([`VaryingSdPrior`](@ref); empty — the default — is all
-`:std_normal`), at any K. `mm` is
-[`VaryingMultiMembership`](@ref) metadata (`nothing` = plain
-grouping; `group` is then the mm naming symbol, not a data column).
-`strata` is [`VaryingStrata`](@ref) metadata (`nothing` =
-unstratified). Shared draws are consumed by value flow: each
-[`VaryingSlice`](@ref) names this draws' label plus explicit columns
-— never by label matching across statements.
-"""
-struct VaryingDraws
-    group::ColumnRef
-    kind::Symbol
-    margins::Vector{VaryingMargin}
-    lkj_eta::Float64
-    label::Symbol
-    suffix::String
-    levels::Union{Nothing,Vector}
-    sd_priors::Vector{VaryingSdPrior}
-    mm::Union{Nothing,VaryingMultiMembership}
-    strata::Union{Nothing,VaryingStrata}
-end
-
-# Pre-mm/strata 6/7/8-arg positional construction keeps working with
-# `mm`/`strata` unset (plain single-column grouping).
-VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
-    lkj_eta::Float64, label::Symbol, suffix::String) =
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, nothing,
-        VaryingSdPrior[], nothing, nothing)
-VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
-    lkj_eta::Float64, label::Symbol, suffix::String,
-    levels::Union{Nothing,Vector}) =
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, levels,
-        VaryingSdPrior[], nothing, nothing)
-VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
-    lkj_eta::Float64, label::Symbol, suffix::String,
-    levels::Union{Nothing,Vector}, sd_priors::Vector{VaryingSdPrior}) =
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, levels,
-        sd_priors, nothing, nothing)
-
-"""
-    VaryingSlice(draws, columns, target)
-
-One target application of a [`VaryingDraws`](@ref) block: `draws` names
-the draws label, `columns` selects its explicit column range, `target`
-is the predictor the contribution feeds. One slice per (draws, target);
-a draws block's slices partition `1:K` exactly once, in any slice
-order (columns are explicit, never positional by body order).
-"""
-struct VaryingSlice
-    draws::Symbol
-    columns::UnitRange{Int}
-    target::Symbol
-end
 
 """
     VectorParameter(name, family, args, size[, label])
@@ -973,509 +748,8 @@ ArrayParameter(name::ParamName, family::Symbol, args::NamedTuple,
     dims::Vector{Any}, support_override::SupportOverride) =
     ArrayParameter(name, family, args, dims, support_override, name)
 
-"""
-    SplineBasisBlock(name, width, columns)
-
-One fitted basis block (`:fixed`, `:pen`, `:rr`, `:rn`, `:nr`): `width`
-is static from `k` (known at lowering); `columns` holds the materialized
-bound-vector names, filled at bind (empty pre-bind).
-"""
-struct SplineBasisBlock
-    name::Symbol
-    width::Int
-    columns::Vector{Symbol}
-end
-
-"""
-    SplineBasis(id, kind, axes, k, blocks, label)
-
-One spline term's basis recipe (SB mirror): `kind` is `:tps` (`s(x)`,
-one axis) or `:t2` (`t2(x,z)`, two axes); `k` is the basis dimension
-(`Int` for `s`, `(Int,Int)` for `t2`). `blocks` are static in
-name/width (`:fixed`/`:pen` for `s`, `:fixed`/`:rr`/`:rn`/`:nr` for
-`t2`); bind fits the basis from the raw `axes` columns (host-side
-transformed-data mirror — eigen is inexpressible in-graph) and fills
-each block's materialized `columns`. A term feeds exactly one predictor
-(the `spline(:id)` use-site).
-"""
-struct SplineBasis
-    id::Symbol
-    kind::Symbol
-    axes::Vector{Symbol}
-    k::Union{Int,Tuple{Int,Int}}
-    blocks::Vector{SplineBasisBlock}
-    label::Symbol
-end
-
-"""
-    SplineVector(name, family, args, support_override, width, basis, label)
-
-One free spline coefficient block: flat fixed coefficients, standard-normal
-raw coefficients, and normalized positive smoothing scales. `width` derives
-from structural `k`; `basis` is the owning basis id. Priors retain one plate.
-"""
-struct SplineVector
-    name::Symbol
-    family::Symbol
-    args::NamedTuple
-    support_override::SupportOverride
-    width::Int
-    basis::Symbol
-    label::Symbol
-end
-
-"""
-    HyperPrior(family, args[, support_override])
-
-A literal-argument positive hyperparameter prior with the same family,
-arguments and explicit normalized support as a sampled parameter.
-"""
-struct HyperPrior
-    family::Symbol
-    args::NamedTuple
-    support_override::SupportOverride
-end
-
-HyperPrior(family::Symbol, args::NamedTuple) = HyperPrior(family, args, nothing)
-
-# Admitted base families and their Distributions arities. Real-support
-# families require an explicit half or truncation.
-const _HYPER_PRIOR_FAMILIES = Dict{Symbol,Tuple{Vararg{Int}}}(
-    :lognormal => (2,), :inverse_gamma => (2,), :gamma => (2,),
-    :exponential => (1,), :normal => (2,), :cauchy => (2,),
-    :student_t => (3,), :uniform => (2,))
 
 # Explicit support travels with a hyper prior, just as for a sampled prior.
-_hyper_support_override(hp::HyperPrior) = hp.support_override
-function _hyper_prior_bounds(hp::HyperPrior)
-    hp.support_override === nothing && hp.family !== :uniform && return nothing
-    transform, lo, hi = _entry_transform(hp.family, hp.support_override, hp.args)
-    transform === :interval && return (lo, hi)
-    transform === :floored && return (lo, Inf)
-    transform === :exp && return nothing
-    throw(ContractValidationError("[hyper prior] use an explicit positive distribution, got $(hp.family) with support $(hp.support_override)"))
-end
-_hyper_prior_bounds(::Nothing) = nothing
-
-function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
-    haskey(_HYPER_PRIOR_FAMILIES, hp.family) || _fail(label,
-        "$what prior family $(hp.family) is not admitted (admitted: " *
-        "$(join(sort!(collect(keys(_HYPER_PRIOR_FAMILIES))), ", ")))")
-    length(hp.args) in _HYPER_PRIOR_FAMILIES[hp.family] || _fail(label,
-        "$what prior $(hp.family) takes " *
-        "$(_HYPER_PRIOR_FAMILIES[hp.family]) arguments, got " *
-        "$(length(hp.args))")
-    keys(hp.args) == ntuple(i -> Symbol(:arg, i), length(hp.args)) ||
-        _fail(label, "$what prior args must be `(arg1, ...)`, got " *
-              "$(keys(hp.args))")
-    all(v -> v isa Real && !(v isa Bool) && isfinite(v), values(hp.args)) ||
-        _fail(label, "$what prior args must be finite numeric " *
-              "literals, got $(hp.args)")
-    _validate_support_override(label, hp.family, hp.support_override, hp.args)
-    _validate_uniform_args(label, hp.family, hp.args)
-    SAMPLED_SUPPORT[hp.family] === :real && hp.support_override === nothing &&
-        _fail(label, "$what needs an explicit positive prior: HalfNormal, HalfCauchy or truncated(D, 0, Inf)")
-    bounds = _hyper_prior_bounds(hp)
-    bounds === nothing || (0 <= bounds[1] < bounds[2]) ||
-        _fail(label, "$what prior must have positive support, got $bounds")
-    return nothing
-end
-
-"""
-    HSGPHyperLP(intercept, group)
-
-A grouped HSGP hyperparameter's log-linear hyper-predictor (SB
-`log(length_scale(hsgp(x))) ~ 1 + (1 | g)` / `~ (1 | g)`): per group
-`log h_g = beta0 + sd * z_g` (`intercept` false drops `beta0`), with the
-BRM defaults `beta0 ~ Normal(0, 1)`, `sd ~ HalfNormal(1)`, non-centered `z ~ Normal(0, 1)`. `group` must be
-the basis's `by` column (one hyper level per term group). A length scale
-is floored per group at the validity floor (SB `brm_hsgp_by_hyper_S`
-`fmax(rho_g, rho_lower)`).
-"""
-struct HSGPHyperLP
-    intercept::Bool
-    group::Symbol
-end
-
-# A hyper-predictor carries no stated bounds (its floor is applied
-# in-graph per group).
-_hyper_prior_bounds(::HSGPHyperLP) = nothing
-
-"""
-    HSGPGrouping(column, levels)
-
-A per-group HSGP (SB `hsgp(x; by = g)`): the basis weights vary by the
-levels of data column `column` (`levels` sort-ordered observed levels,
-`nothing` pre-bind — [`bind_data`](@ref) fills them).
-"""
-struct HSGPGrouping
-    column::Symbol
-    levels::Union{Nothing,Vector{Any}}
-end
-
-"""
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period[, rho_prior,
-              sigma_prior[, domain[, by]]])
-
-One Hilbert-space GP basis (SB `_sb_hsgp` / `_sb_hsgp_periodic`):
-`axes` raw data columns, `K` modes per axis, `c` boundary factors per
-axis (`L = c*max|x-mu|`, `c > 1`), `iso` length-scale sharing. `fits`
-holds the bind-time `(mu, L)` per axis (empty pre-bind); the basis
-itself is evaluated in-graph from the raw columns + frozen fits (trig
-is elementwise-expressible — unlike spline eigen, no bind-time
-materialization). `M = prod(K)` basis functions; the term owns
-`beta_raw_<id>` (M-vector), `rho_<id>` (iso scalar) or
-`rho_<id>_1..d` (aniso scalars), `sigma_<id>` (scalar).
-
-`cov` selects the kernel (`:exp_quad` or `:periodic`, SB
-``hsgp(...; cov=...)``); `period` is the periodic kernel's formula
-constant (finite and positive iff periodic, `NaN` otherwise). A
-periodic basis takes exactly one isotropic axis, carries no fits and
-no domain (`c` is validated but ignored, the SB mirror), and owns `M
-= 2k` basis functions (cosines then sines over `k` harmonics).
-
-`rho_prior` / `sigma_prior` override the default `lognormal(0, 1)`
-priors ([`HyperPrior`](@ref), SB `length_scale(:, hsgp(x)) ~ ...` /
-`sd(:, hsgp(x)) ~ ...`). An explicit length-scale prior replaces the
-whole default declaration INCLUDING the approximation-validity floor
-(BRM `_brm_hsgp_declared_rho_lower`): the length scales then ride a
-plain `exp` transform; a `Uniform(lo, hi)` prior instead BOUNDS the
-hyperparameter (`(:interval, lo, hi)`, SB prior-bound intersection).
-`nothing` keeps the default.
-
-`domain` (SB `hsgp(...; domain=...)`) fixes the eigenfunction domain
-per axis as `(lower, upper)` pairs: bind uses `(mu, L) = ((lo+hi)/2,
-(hi-lo)/2)` instead of the data-fitted `L = c*max|x-mu|` (so `c` does
-not apply), and every bound axis value must lie inside its pair.
-
-`by` ([`HSGPGrouping`](@ref), SB `hsgp(x; by = g)`) makes the basis
-weights per group (`G*M` standardized weights) over one shared basis;
-the hyperparameters stay shared unless `rho_prior` / `sigma_prior` carry
-an [`HSGPHyperLP`](@ref) (per-group log-linear hyper-predictors). v1:
-one isotropic exp-quad axis.
-"""
-struct HSGPBasis
-    id::Symbol
-    axes::Vector{Symbol}
-    K::Vector{Int}
-    c::Vector{Float64}
-    iso::Bool
-    fits::Vector{Tuple{Float64,Float64}}
-    label::Symbol
-    cov::Symbol
-    period::Float64
-    rho_prior::Union{Nothing,HyperPrior,HSGPHyperLP}
-    sigma_prior::Union{Nothing,HyperPrior,HSGPHyperLP}
-    domain::Union{Nothing,Vector{Tuple{Float64,Float64}}}
-    by::Union{Nothing,HSGPGrouping}
-end
-
-"""Default-prior construction (SB `_sb_hsgp`'s `lognormal(0, 1)`
-length scales on the validity floor + `lognormal(0, 1)` marginal
-scale)."""
-HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
-    c::Vector{Float64}, iso::Bool,
-    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
-    period::Float64) =
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, nothing,
-        nothing, nothing, nothing)
-
-"""Stated-hyper-prior construction without a fixed domain."""
-HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
-    c::Vector{Float64}, iso::Bool,
-    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
-    period::Float64, rho_prior, sigma_prior) =
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
-        sigma_prior, nothing, nothing)
-
-"""Fixed-domain construction without grouping."""
-HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
-    c::Vector{Float64}, iso::Bool,
-    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
-    period::Float64, rho_prior, sigma_prior, domain) =
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
-        sigma_prior, domain, nothing)
-
-"""Exp-quad v1 positional construction (periodic defaults: `cov =
-:exp_quad`, `period = NaN`)."""
-HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
-    c::Vector{Float64}, iso::Bool,
-    fits::Vector{Tuple{Float64,Float64}}, label::Symbol) =
-    HSGPBasis(id, axes, K, c, iso, fits, label, :exp_quad, NaN)
-
-abstract type PKScheduleSpec end
-
-"""
-    LinearPKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time, dose_amt,
-                         ecg = nothing, tgi = nothing)
-
-One linear-PK event-schedule declaration (grouped kernels): `name` the
-schedule's model-scope handle; the remaining fields the RAW obs/dose
-data columns the bind-time recipe builds the op stream from (surface:
-`name = linear_pk_schedule(obs = (subj, time), dose = (subj, time,
-amount))`). `ecg`/`tgi` are optional `(subject, time)` column pairs
-naming EXTRA READ AXES (surface: `ecg = (subj, time)`, `tgi = (subj,
-time)` keywords) whose rows join the stream as read-only points (SB's
-joint `vcat(pk, qt, tgi)` union). The schedule materializes op columns
-plus `op_ends`, per-axis `(obs_read, obs_map, ecg_read, ecg_map,
-tgi_read, tgi_map)` row products, and the `[conc; auc]`-space
-`conc_map`/`tgi_auc_map` at bind (see
-[`build_linear_pk_schedule`](@ref)); the names here are declaration
-only. Axis products materialize only for declared axes (and the
-`[conc; auc]`-space maps only with an AUC cell call), so v1 bind
-products stay byte-identical without them.
-"""
-struct LinearPKScheduleSpec <: PKScheduleSpec
-    name::Symbol
-    obs_subj::Symbol
-    obs_time::Symbol
-    dose_subj::Symbol
-    dose_time::Symbol
-    dose_amt::Symbol
-    ecg::Union{Nothing,Tuple{Symbol,Symbol}}
-    tgi::Union{Nothing,Tuple{Symbol,Symbol}}
-end
-"""v1 positional construction (no extra read axes)."""
-LinearPKScheduleSpec(name::Symbol, obs_subj::Symbol, obs_time::Symbol,
-    dose_subj::Symbol, dose_time::Symbol, dose_amt::Symbol) =
-    LinearPKScheduleSpec(name, obs_subj, obs_time, dose_subj, dose_time,
-        dose_amt, nothing, nothing)
-
-function _sched_raw_columns(s::LinearPKScheduleSpec)
-    raw = [s.obs_subj, s.obs_time, s.dose_subj, s.dose_time, s.dose_amt]
-    s.ecg !== nothing && append!(raw, s.ecg)
-    s.tgi !== nothing && append!(raw, s.tgi)
-    return raw
-end
-_sched_ends_field(::LinearPKScheduleSpec) = :op_ends
-
-"""The conventional event-LP name used by legacy serialized plans.
-Ordinary cell calls derive the event axis from argument position."""
-const EVENT_LP_NAME = :log_F
-
-"""
-    LinearPKEventLPSpec(name, schedule, k, c, fit, label)
-
-Retired implicit-provider representation, retained for compatibility with
-serialized plan structure. A nonempty `StructuralPlan.event_lps` is rejected:
-use the ordinary [`linear_pk_log_f`](@ref) library submodel instead. Its
-parameters are authored statements rather than layout-generated blocks.
-"""
-struct LinearPKEventLPSpec
-    name::Symbol
-    schedule::Symbol
-    k::Int
-    c::Float64
-    fit::Union{Nothing,Tuple{Float64,Float64}}
-    label::Symbol
-end
-
-# Event-LP sampled names, derived purely from the provider name (the
-# `_hsgp_names` precedent, SB term-prior vocabulary): the dose slope,
-# the HSGP length scale / marginal scale, and the standardized
-# coefficients. Single source for name tables, layout, and the
-# generator.
-function _event_lp_names(el::LinearPKEventLPSpec)
-    id = el.name
-    return (slope = Symbol("slope_", id), rho = Symbol("rho_", id),
-        sigma = Symbol("sigma_", id), beta = Symbol("beta_raw_", id))
-end
-
-"""Flat sampled-name list for name tables + claims (slope, rho, sigma,
-beta — the `_hsgp_all_names` precedent)."""
-function _event_lp_all_names(el::LinearPKEventLPSpec)
-    n = _event_lp_names(el)
-    return Symbol[n.slope, n.rho, n.sigma, n.beta]
-end
-
-"""In-cell observation node: `(response, family, location, scale, params)`
-with `response` a cell param (panel and grouped share the node; grouped
-carries a LIST). `location`/`scale` are the first/second positional
-family args; `params` the remaining args (`()` for two-arg families).
-Multi-param families (joint PK/QT/TGI) are grouped-only."""
-const KernelObs =
-    Union{NamedTuple{(:response, :family, :location, :scale, :params)},
-        NamedTuple{(:response, :family, :location, :scale, :params, :link)}}
-_kernel_obs_link(obs::KernelObs) = hasproperty(obs, :link) ? obs.link : IdentityLink
-
-"""Scalar response-space in-cell obs families (v2 panel set; grouped
-admits these plus the joint families). Cell args are constrained-scale
-values (bare args skip link inversion — literals prove domains)."""
-const _KERNEL_SCALAR_FAMS = (GaussianFam, BernoulliLogitFam,
-    PoissonLogFam, NegativeBinomial2Fam, GammaLogFam, BetaLogitFam,
-    StudentTFam, BinomialProbFam, CauchyFam)
-
-"""
-    KernelPlate(result, subjects, timepoints, slices, assignments, obs, collected, label;
-                lp_args = [], schedules = [])
-
-One kernel (BRM `_RKKernelPlan`) in one of two forms:
-
-PANEL (panel v1: `lp_args`/`schedules` empty): `result` is the collected
-per-subject name (the plate LHS); `subjects` the subject count (integer
-literal, or a dims-key `Symbol` resolved at bind); `timepoints` the
-per-subject timepoint count (`nothing` for all-scalar models, an integer,
-or a dims-key `Symbol` resolved at bind); `slices` the
-`(data column, cell param, kind)` triples with `kind ∈ (:vector, :scalar,
-:unknown)` (`:unknown` pre-bind — kinds resolve from lengths at bind);
-`assignments` the cell-local `name => expr` pairs in cell order (flat
-elementwise vocabulary); `obs` the single in-cell observation;
-`collected` the trailing collected cell name. Grouping is ABSENT for
-panel (implicit 1:n subjects — structural, no sentinel).
-
-GROUPED (joint-kernel form: exactly one schedule in v1): `slices` are
-RESPONSE slices (`kind === :response` once bound) over the schedule's
-obs axis; `lp_args` the `(subject predictor, cell param)` pairs (LP
-values gather per subject in-cell); `schedules` the schedule
-declarations the cell calls address; `obs` the in-cell observation
-LIST (one per response axis); `timepoints` is always `nothing`
-(ragged axes have no rectangular T). `subjects === nothing` (the
-top-level schedule-chain form, see `_extract_kernel_cells`) takes the
-subject count from named data at bind — the schedule's subject column —
-and consumes no dims key. The cell vocabulary is calls to
-[`CELL_FNS`](@ref), schedule-map gathers, and arithmetic (no flat
-dotify — each PK call emits an RK subject plate containing event scans).
-"""
-struct KernelPlate
-    result::Symbol
-    subjects::Union{Nothing,Int,Symbol}
-    timepoints::Union{Nothing,Int,Symbol}
-    slices::Vector{Tuple{Symbol,Symbol,Symbol}}
-    assignments::Vector{Pair{Symbol,Any}}
-    obs::Vector{KernelObs}
-    collected::Symbol
-    label::Symbol
-    lp_args::Vector{Tuple{Symbol,Symbol}}
-    schedules::Vector{PKScheduleSpec}
-end
-
-"""Panel-v1 positional construction (grouped fields default empty)."""
-KernelPlate(result::Symbol, subjects::Union{Int,Symbol},
-    timepoints::Union{Nothing,Int,Symbol},
-    slices::Vector{Tuple{Symbol,Symbol,Symbol}},
-    assignments::Vector{Pair{Symbol,Any}}, obs::KernelObs,
-    collected::Symbol, label::Symbol) =
-    KernelPlate(result, subjects, timepoints, slices, assignments, [obs],
-        collected, label, Tuple{Symbol,Symbol}[], LinearPKScheduleSpec[])
-KernelPlate(result::Symbol, subjects::Union{Int,Symbol},
-    timepoints::Union{Nothing,Int,Symbol},
-    slices::Vector{Tuple{Symbol,Symbol,Symbol}},
-    assignments::Vector{Pair{Symbol,Any}}, obs::Vector{<:KernelObs},
-    collected::Symbol, label::Symbol) =
-    KernelPlate(result, subjects, timepoints, slices, assignments, obs,
-        collected, label, Tuple{Symbol,Symbol}[], LinearPKScheduleSpec[])
-
-"""Grouped ⟺ the plate carries schedules (panel plates carry none)."""
-_is_grouped_kernel(kp::KernelPlate) = !isempty(kp.schedules)
-
-"""Flat length of a resolved kernel plate: `n_sub * T` (`T = 1` all-scalar)."""
-_kernel_flat_length(n_sub::Int, T::Union{Nothing,Int}) =
-    T === nothing ? n_sub : n_sub * T
-
-"""Materialized flat-expansion column for a scalar slice (spline-blocks
-precedent: deterministic bind product, caller collisions fail closed)."""
-_kexp_name(result::Symbol, col::Symbol) = Symbol("$(result)_kexp_$(col)")
-
-"""Bernoulli in-cell Bool twin: `<result>_kbool_<response>` — the exact
-Bool lanes a non-Bool Bernoulli flat reads (the `!=` comparison
-misdifferentiates under native Enzyme — snag
-`bernoulli-int-la-78487520`). Named by response PARAM (one twin per
-obs, stable across raw/expansion flats)."""
-_kbool_name(result::Symbol, response::Symbol) =
-    Symbol("$(result)_kbool_$(response)")
-
-"""Columns a kernel plate manages (slice columns + scalar expansions):
-exempt from the uniform-`n_obs` rule, validated under kernel rules.
-Expansions exist only for resolved vector models (`T isa Int`); gating
-on that keeps a stray caller column from hiding behind the exemption.
-Grouped plates additionally manage their schedules' raw columns, the
-bind-materialized `<sched>_<field>` op columns, and the plain-Symbol
-bind columns the cell references (gather indices + nadir ends — the
-walker admits unknown Symbols ONLY in those positions, and shapes +
-the prep validators prove each one, so the exemption cannot hide a
-stray column)."""
-function _kernel_managed_columns(kp::KernelPlate)
-    out = Set{Symbol}()
-    for (col, _, kind) in kp.slices
-        push!(out, col)
-        kind === :scalar && kp.timepoints isa Int &&
-            push!(out, _kexp_name(kp.result, col))
-    end
-    for s in kp.schedules
-        union!(out, _sched_raw_columns(s))
-        for f in _sched_materialized_fields(s)
-            push!(out, _sched_col_name(s.name, f))
-        end
-        for f in _sched_extra_fields(s, kp.assignments)
-            push!(out, _sched_col_name(s.name, f))
-        end
-        # The event-axis product (present only with a declared
-        # event-LP): op-length by design, like the op columns.
-        s isa LinearPKScheduleSpec &&
-            push!(out, _sched_col_name(s.name, :op_log_dose))
-    end
-    for obs in kp.obs
-        # Bernoulli Bool twins (present only for non-Bool flats —
-        # the absent twin is an inert managed name).
-        obs.family === BernoulliLogitFam &&
-            push!(out, _kbool_name(kp.result, obs.response))
-    end
-    union!(out, _cell_bind_columns(kp))
-    return out
-end
-
-# Bool-twin materialization (the kexp precedent: deterministic bind
-# product, caller-supplied collisions reserved-fail): Bernoulli plates
-# read Bool lanes — the `!=` comparison misdifferentiates under native
-# Enzyme (snag `bernoulli-int-la-78487520`), so non-Bool flats (integer
-# columns, Float64 expansions) gain an exact Bool twin. Dense
-# `Vector{Bool}` — broadcast comparison yields a BitVector and
-# BitArrays are overlay-hostile (reactant ladder-1b). Returns the twin
-# name, or `nothing` when the flat is already Bool.
-function _materialize_kernel_bool_twin!(kp::KernelPlate, obs::KernelObs,
-        flatv::AbstractVector, columns::Dict{Symbol,ColumnData})
-    eltype(flatv) === Bool && return nothing
-    twin = _kbool_name(kp.result, obs.response)
-    haskey(columns, twin) &&
-        _fail(kp.label, "column `$twin` is reserved for kernel plate " *
-              "`$(kp.result)`'s Bool twin of `$(obs.response)` — " *
-              "rename the caller-supplied column")
-    columns[twin] = Vector{Bool}(flatv .!= 0)
-    return twin
-end
-
-"""Plain-Symbol bind columns a grouped cell references: gather indices
-(`v[map]`) + segmented-nadir ends (`nadir(change, ends)`). The walker
-admits unknown Symbols only in these positions; shapes prove
-bound-ness + lengths and the prep validators prove content."""
-function _cell_bind_columns(kp::KernelPlate)
-    out = Set{Symbol}()
-    for (_, ex) in kp.assignments
-        _collect_cell_bind_columns!(out, ex)
-    end
-    return out
-end
-
-function _collect_cell_bind_columns!(out::Set{Symbol}, ex)
-    ex isa Expr || return nothing
-    if ex.head === :ref && length(ex.args) == 2 && ex.args[2] isa Symbol
-        push!(out, ex.args[2])
-    end
-    if ex.head === :call && length(ex.args) == 3 && ex.args[1] isa Symbol &&
-            ex.args[1] in SEGMENT_CELL_FNS && ex.args[3] isa Symbol
-        push!(out, ex.args[3])
-    end
-    for a in ex.args
-        _collect_cell_bind_columns!(out, a)
-    end
-    return nothing
-end
-
-"""Bind-materialized schedule column (`sched` + field → `<sched>_<field>`,
-the `_kexp_name` precedent: deterministic bind product, caller
-collisions fail closed)."""
-_sched_col_name(sched::Symbol, field::Symbol) = Symbol("$(sched)_$(field)")
-
 """
     AssignmentSpec(name, expr)
 
@@ -1589,34 +863,6 @@ struct ScanSpec
 end
 
 """
-    DarSpec(state, beta, sigma, label)
-
-One differenced-AR(1) trajectory (SB `_sb_dar1`'s `differenced_ar1_path`):
-the zero-started integrated path `x[t+1] = x[t] + d[t]` over the AR(1)
-increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
-`beta`/`sigma` name the persistence (`Normal` truncated to `[0, 1]`)
-and innovation-scale (half-Normal, including `truncated(Normal(0, s), 0, Inf)`)
-[`SampledParameter`](@ref)s, each with Distributions semantics (the
-truncation normalizers stay);
-the `z` innovations (one fewer than the path's rows) are owned internally
-under the reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
-`_ppl_scan_z_<state>` slice. The path length follows its consuming response's
-axis, because the LP direct summand adds elementwise to that predictor.
-
-A dedicated node rather than a `ScanSpec`: the v1 scan grammar threads
-one carried array from SAMPLED seeds with full-length innovations, while
-dar starts both carries at zero deterministically, carries (level,
-increment) jointly, and innovates `T - 1` times. The generator still
-lowers through the shared RK-core `scan(...)` carry-fold tier.
-"""
-struct DarSpec
-    state::Symbol
-    beta::Symbol
-    sigma::Symbol
-    label::Symbol
-end
-
-"""
     LevelMap(predictor, column, values, source, subset)
 
 Ordered level values sizing one full-rank factor term: `values` is the
@@ -1688,9 +934,7 @@ name table (duplicates rejected). N≥1 independent responses; shared
 predictor Symbols allowed. `levelmaps` sizes every factor term
 (binder-evaluated values); `plate_parameters` carries per-cell latents,
 `vector_parameters` leveled-response latents (cutpoints/thresholds/simplexes),
-`scans` sequential-recurrence latents, `dar_paths` differenced-AR(1)
-trajectories, `varying_draws`/`varying_slices` the generic
-varying-effect draws blocks plus their per-target applications, and
+`scans` sequential-recurrence latents, and
 `matrices` user-bound design matrices referenced by [`MatrixTerm`](@ref)s
 (empty for a plain population-GLM plan). `array_parameters` are the
 declared array-valued parameters ([`ArrayParameter`](@ref)) the model reads
@@ -1710,18 +954,8 @@ struct StructuralPlan
     levelmaps::Vector{LevelMap}
     plate_parameters::Vector{PlateParameter}
     scans::Vector{ScanSpec}
-    dar_paths::Vector{DarSpec}
-    varying_draws::Vector{VaryingDraws}
-    varying_slices::Vector{VaryingSlice}
     vector_parameters::Vector{VectorParameter}
-    spline_bases::Vector{SplineBasis}
-    spline_vectors::Vector{SplineVector}
-    hsgp_bases::Vector{HSGPBasis}
-    kernel_plates::Vector{KernelPlate}
-    r2d2_priors::Vector{R2D2Prior}
-    horseshoe_priors::Vector{HorseshoePrior}
     matrices::Vector{DesignMatrix}
-    event_lps::Vector{LinearPKEventLPSpec}
     array_parameters::Vector{ArrayParameter}
     submodel_scopes::Vector{SubmodelScope}
     conditioned::Set{Symbol}
@@ -1732,71 +966,67 @@ end
 # The former full constructor has no external observations.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+    scans, vector_parameters,
+    matrices,
+    array_parameters, submodel_scopes,
     conditioned, indexed_observations) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        scans, vector_parameters,
+        matrices,
+        array_parameters, submodel_scopes,
         conditioned, indexed_observations, SampledParameter[])
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+    scans, vector_parameters,
+    matrices,
+    array_parameters, submodel_scopes,
     conditioned) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        scans, vector_parameters,
+        matrices,
+        array_parameters, submodel_scopes,
         conditioned, Set{Symbol}())
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes) =
+    scans, vector_parameters,
+    matrices,
+    array_parameters, submodel_scopes) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-        horseshoe_priors, matrices, event_lps, array_parameters, submodel_scopes,
+        scans, vector_parameters,
+        matrices,
+        array_parameters, submodel_scopes,
         Set{Symbol}())
 
 # Existing full-positional plans have no lexical submodel metadata.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps, array_parameters) =
+    scans, vector_parameters,
+    matrices, array_parameters) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, dar_paths, varying_draws, varying_slices,
-        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        plate_parameters, scans,
+        vector_parameters, matrices,
         array_parameters, SubmodelScope[])
 
-# Pre-array full-positional constructor (24-arg): plans built before
+# Pre-array full-positional constructor: plans built before
 # `array_parameters` existed keep working with none.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, kernel_plates, r2d2_priors,
-    horseshoe_priors, matrices, event_lps) =
+    scans, vector_parameters,
+    matrices) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, dar_paths, varying_draws, varying_slices,
-        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        plate_parameters, scans,
+        vector_parameters, matrices,
         ArrayParameter[])
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
-# before `levelmaps`/`scans`/`varying_draws`/`vector_parameters`/spline/hsgp
+# before `levelmaps`/`scans`/`vector_parameters`
 # nodes existed keep working with all empty.
 StructuralPlan(
     responses::Vector{LikelihoodSpec},
@@ -1810,11 +1040,9 @@ StructuralPlan(
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, _checked_columns(columns), n_obs, roles,
-        LevelMap[], ScanSpec[], DarSpec[], VaryingDraws[], VaryingSlice[],
+        LevelMap[], PlateParameter[], ScanSpec[],
         VectorParameter[],
-        SplineBasis[], SplineVector[], HSGPBasis[], KernelPlate[],
-        R2D2Prior[], HorseshoePrior[], DesignMatrix[],
-        LinearPKEventLPSpec[])
+        DesignMatrix[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -1837,18 +1065,8 @@ function StructuralPlan(
         levelmaps::Vector{LevelMap} = LevelMap[],
         plate_parameters::Vector{PlateParameter} = PlateParameter[],
         scans::Vector{ScanSpec} = ScanSpec[],
-        dar_paths::Vector{DarSpec} = DarSpec[],
-        varying_draws::Vector{VaryingDraws} = VaryingDraws[],
-        varying_slices::Vector{VaryingSlice} = VaryingSlice[],
         vector_parameters::Vector{VectorParameter} = VectorParameter[],
-        spline_bases::Vector{SplineBasis} = SplineBasis[],
-        spline_vectors::Vector{SplineVector} = SplineVector[],
-        hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
-        kernel_plates::Vector{KernelPlate} = KernelPlate[],
-        r2d2_priors::Vector{R2D2Prior} = R2D2Prior[],
-        horseshoe_priors::Vector{HorseshoePrior} = HorseshoePrior[],
         matrices::Vector{DesignMatrix} = DesignMatrix[],
-        event_lps::Vector{LinearPKEventLPSpec} = LinearPKEventLPSpec[],
         array_parameters::Vector{ArrayParameter} = ArrayParameter[],
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
@@ -1856,24 +1074,10 @@ function StructuralPlan(
         external_observations::Vector{SampledParameter} = SampledParameter[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
-        roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
-        varying_slices,
-        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        kernel_plates, r2d2_priors, horseshoe_priors, matrices, event_lps,
+        roles, levelmaps, plate_parameters, scans,
+        vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations, external_observations)
 end
-
-"""The horseshoe entries covering `pred` (empty when the predictor keeps
-its sampled coefficient block)."""
-_horseshoe_for(plan::StructuralPlan, pred::Symbol) =
-    [h for h in plan.horseshoe_priors if h.predictor === pred]
-
-"""Preserve separate simultaneous doses when a cell consumes an event-axis
-bioavailability vector. Adding amounts before a nonlinear dose effect would
-change the model; schedules without that vector may combine amounts."""
-_schedule_combine_simultaneous(plan::StructuralPlan, sched::Symbol) =
-    !any(kp -> any(call -> first(call) === sched,
-        _event_lp_calls(kp)), plan.kernel_plates)
 
 """Find a design matrix by name, or `nothing`."""
 function _find_matrix(plan::StructuralPlan, name::Symbol)
@@ -2006,224 +1210,14 @@ half at a literal-zero location renormalizes by exactly `+log(2)`."""
 const SYMMETRIC_SAMPLED_FAMILIES =
     (:normal, :cauchy, :student_t, :laplace, :logistic)
 
-# Spline block/width/vector/name rules, derived purely from (kind, k):
-# the single source of truth shared by surface lowering (which builds the
-# nodes) and contract validation (which re-derives and compares). Widths
-# are static — the fit can only confirm them at bind, never change them.
-# Block order is SB's data order (:fixed first, then pen/rr/rn/nr); the t2
-# sd index follows the pen-block position (rr→1, rn→2, nr→3). Neither
-# kind carries a constant fixed column: the author's intercept owns it
-# (tps is one column narrower than SB's, `_rk_apply_spline`).
-function _spline_blocks(kind::Symbol, k::Union{Int,Tuple{Int,Int}})
-    if kind === :tps
-        k isa Int ||
-            _fail(:plan, "tps spline k must be an Int, got $(repr(k))")
-        return [(:fixed, 1), (:pen, k - 2)]
-    elseif kind === :t2
-        k isa Tuple{Int,Int} ||
-            _fail(:plan, "t2 spline k must be an (Int, Int) tuple, got " *
-                  repr(k))
-        k1, k2 = k
-        return [(:fixed, 3), (:rr, (k1 - 2) * (k2 - 2)),
-            (:rn, (k1 - 2) * 2), (:nr, 2 * (k2 - 2))]
-    end
-    return _fail(:plan, "spline kind must be :tps or :t2, got $(repr(kind))")
-end
-
-_spline_block_names(id::Symbol, block::Symbol, width::Int) =
-    [Symbol("$(id)_$(block)_$j") for j in 1:width]
-
-function _spline_basis_columns(id::Symbol, kind::Symbol, k)
-    return [(name, _spline_block_names(id, name == :fixed ?
-        (kind === :tps ? :Xnull : :Xfixed) : Symbol(:Z, name), w))
-            for (name, w) in _spline_blocks(kind, k)]
-end
-
-# Per-block emission roles + the shared sd-vector name: `(roles, sd)`
-# with roles `(block, coefficient-vector name, sd index or nothing)`.
-# The sd index follows the pen-block position (tps: the one pen block →
-# 1; t2: rr/rn/nr → 1/2/3, SB's `vector[3]` order).
-function _spline_block_roles(id::Symbol, kind::Symbol, k)
-    roles = Tuple{Symbol,Symbol,Union{Nothing,Int}}[]
-    sdpos = 0
-    for (name, _) in _spline_blocks(kind, k)
-        if name === :fixed
-            push!(roles, (name, Symbol("b_$(id)_fixed"), nothing))
-        else
-            sdpos += 1
-            tag = kind === :tps ? :raw : Symbol("$(name)_raw")
-            push!(roles, (name, Symbol("b_$(id)_$tag"), sdpos))
-        end
-    end
-    return roles, Symbol("sd_$id")
-end
-
-# `sd_prior` is the stated smoothing-sd hyper prior (`spline_basis(...;
-# sd=...)`), `nothing` for the default `Normal(0, 1)`; its family fixes the
-# sd vector's support (`_hyper_support_override`).
-function _spline_vector_specs(id::Symbol, kind::Symbol, k,
-        sd_prior::Union{Nothing,HyperPrior} = nothing)
-    specs = Tuple{Symbol,Symbol,NamedTuple,SupportOverride,Int}[]
-    widths = Dict(first(b) => last(b) for b in _spline_blocks(kind, k))
-    roles, sd = _spline_block_roles(id, kind, k)
-    for (name, coef, sdidx) in roles
-        if sdidx === nothing
-            push!(specs, (coef, :flat, NamedTuple(), nothing, widths[name]))
-        else
-            push!(specs, (coef, :normal, (arg1=0, arg2=1), nothing,
-                widths[name]))
-        end
-    end
-    nsd = kind === :tps ? 1 : 3
-    sdfam, sdargs = sd_prior === nothing ? (:normal, (arg1=0, arg2=1)) :
-        (sd_prior.family, sd_prior.args)
-    push!(specs, (sd, sdfam, sdargs, sd_prior === nothing ? :positive : _hyper_support_override(sd_prior), nsd))
-    return specs
-end
-
-# HSGP sampled names, derived purely from the basis id (SB `_sb_hsgp`
-# vocabulary, basis-qualified): the standardized coefficients
-# (`beta_raw_<id>`, M-vector), the length scale(s) (`rho_<id>` iso
-# scalar, `rho_<id>_1..d` aniso scalars — d scalars, never a
-# floors-vector), and the marginal scale (`sigma_<id>` scalar).
-# Single source for surface claims, name tables, layout, and the
-# generator (Stage B).
-function _hsgp_names(hb::HSGPBasis)
-    id = hb.id
-    beta = Symbol("beta_raw_", id)
-    sigma = Symbol("sigma_", id)
-    rhos = hb.iso ? [Symbol("rho_", id)] :
-        [Symbol("rho_", id, :_, j) for j in 1:length(hb.axes)]
-    hyper(tag, spec) = spec isa HSGPHyperLP ?
-        (beta0 = Symbol("beta0_", tag, :_, id), sd = Symbol("sd_", tag, :_,
-            id), z = Symbol("z_", tag, :_, id), intercept = spec.intercept) :
-        nothing
-    return (beta = beta, rhos = rhos, sigma = sigma,
-        rho_hyper = hyper(:rho, hb.rho_prior),
-        sigma_hyper = hyper(:sigma, hb.sigma_prior))
-end
-
-"""Group count of an [`HSGPBasis`](@ref) (1 ungrouped; the bound
-`by` level count grouped — `nothing` levels pre-bind count as 0)."""
-_hsgp_n_groups(hb::HSGPBasis) = hb.by === nothing ? 1 :
-    hb.by.levels === nothing ? 0 : length(hb.by.levels)
-
-"""Basis-function count for an [`HSGPBasis`](@ref): `M = prod(K)`
-exp-quad, `M = 2k` periodic (cosines then sines over `k`
-harmonics — SB `2 * only(K)`)."""
-_hsgp_n_basis(hb::HSGPBasis) =
-    hb.cov === :periodic ? 2 * only(hb.K) : prod(hb.K)
-
-# Flat sampled-name list for name tables + claims (beta, rhos, sigma).
-function _hsgp_all_names(hb::HSGPBasis)
-    n = _hsgp_names(hb)
-    out = Symbol[n.beta, n.sigma, n.rhos...]
-    for h in (n.rho_hyper, n.sigma_hyper)
-        h === nothing && continue
-        h.intercept && push!(out, h.beta0)
-        push!(out, h.sd, h.z)
-    end
-    return out
-end
-
-# Every model-scope name a kernel plate introduces (cell names become flat
-# model-scope locals at codegen): the result, slice params, and cell-local
-# assignment names. Grouped plates additionally introduce their LP cell
-# params and schedule handles — EXCEPT self-aliasing params (`(c, c)`
-# slices, `(pname, pname)` LP refs): those are lexical references to an
-# outer column/definition (the plate spelling), not introductions.
-# Single source for the global name-table gate.
-function _kernel_all_names(kp::KernelPlate)
-    # A top-level schedule chain names its kernel by the cell value its
-    # first observation reads (`result === collected`, an assignment —
-    # counted once, below).
-    names = any(p -> p.first === kp.result, kp.assignments) ? Symbol[] :
-        Symbol[kp.result]
-    for (c, p, _) in kp.slices
-        p == c || push!(names, p)
-    end
-    for (pname, c) in kp.lp_args
-        c == pname || push!(names, c)
-    end
-    for s in kp.schedules
-        push!(names, s.name)
-    end
-    for (nm, _) in kp.assignments
-        push!(names, nm)
-    end
-    return names
-end
-
-"""
-    _hsgp_floors(K, fits, iso) -> Vector{Float64}
-
-Length-scale floors from bound fits (SB `_brm_hsgp_rho_lower[_s]`
-verbatim): `(4L/pi)*sqrt(log(100)/(K^2-1))` per axis (`K=1` →
-`0.0`, unbounded); iso takes the max. Pure function of fits — no
-storage on the IR (layout calls it on bound fits in Stage B).
-"""
-function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
-        iso::Bool)
-    per = Float64[_hsgp_axis_floor(k, L) for (k, (_, L)) in zip(K, fits)]
-    return iso ? [maximum(per)] : per
-end
-
-"""One axis's length-scale validity floor for `K` basis functions on the
-half-width-`L` domain (SB `_brm_hsgp_rho_lower`): `(4L/pi) *
-sqrt(log(100)/(K^2-1))`, `0.0` (unbounded) at `K == 1`. Shared by the
-built-in layout floors and [`hsgp_rho_floors`](@ref)."""
-_hsgp_axis_floor(K::Integer, L::Real) =
-    K == 1 ? 0.0 : (4 * L / pi) * sqrt(log(100.0) / (K * K - 1))
-
-"""Exp-quad HSGP eigenvalue of basis function `k` on the half-width-`L`
-domain (SB `lambda`): `(k*pi/(2L))^2`. Shared by the in-graph built-in
-basis and the data-side [`hsgp_basis`](@ref)."""
-_hsgp_lambda(k::Integer, L::Real) = (k * pi / (2.0 * L))^2
-
-"""
-    _hsgp_periodic_rho_lower(K) -> Float64
-
-Periodic length-scale validity floor for `K` harmonics (SB
-`_brm_hsgp_periodic_rho_lower` verbatim): the `rho` at which the
-`K`-th harmonic's spectral amplitude has fallen to `1/100` of the
-first's (`I_K(a)/I_1(a) = 100^-2` with `a = 1/rho^2`), solved by
-bisection on the exponentially scaled Bessel functions. Depends on
-`K` alone — no data-derived domain. `K == 1` stays unbounded
-(`0.0`, the exp-quad degenerate-basis rule).
-"""
-function _hsgp_periodic_rho_lower(K::Integer)
-    K > 1 || return 0.0
-    target = 100.0^-2
-    ratio(loga) = let a = exp(loga)
-        SpecialFunctions.besselix(K, a) /
-            SpecialFunctions.besselix(1, a) - target
-    end
-    lo, hi = log(1e-12), log(1e7)
-    ratio(lo) < 0 < ratio(hi) || error(
-        "hsgp: internal periodic validity-floor bracket failed for k=$K")
-    for _ in 1:200
-        mid = (lo + hi) / 2
-        ratio(mid) < 0 ? (lo = mid) : (hi = mid)
-    end
-    return 1 / sqrt(exp((lo + hi) / 2))
-end
-
-"""Slice-1 term-name vocabulary (emitter-side admission keys; `:varying_effect`,
-`:spline_summand`, `:monotonic`, `:monotonic_summand`, and `:matrix` joined
-with their slices)."""
+"""Admitted emitter-side term names."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
     :intercept => InterceptTerm,
     :continuous => ContinuousTerm,
     :factor => FactorTerm,
     :offset => OffsetTerm,
-    :varying_effect => VaryingEffectTerm,
-    :spline_summand => SplineSummandTerm,
-    :hsgp_summand => HSGPSummandTerm,
     :scan_summand => ScanSummandTerm,
-    :monotonic => MonotonicTerm,
-    :monotonic_summand => MonotonicSummandTerm,
     :matrix => MatrixTerm,
-    :dar_summand => DarSummandTerm,
     :composed => ComposedTerm,
 )
 
@@ -2235,136 +1229,6 @@ const ASSIGNMENT_FNS = (
     :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :tanh, :logaddexp,
     :sum, :mean, :std, :var, :minimum, :maximum, :length,
 )
-
-"""Cell-callable functions (grouped kernels): admitted in grouped-kernel
-cell assignments ONLY, always with a declared schedule as the first
-argument. Each call exposes an RK subject plate containing retained event
-scans. Standalone and grouped entry points use the same authored step graph."""
-const CELL_FNS = (:linear_pk_read_locs, :linear_pk_read_locs_auc)
-
-"""Arity (argument count) of each [`CELL_FNS`](@ref) entry, schedule first."""
-const CELL_FN_ARITY = Dict{Symbol,Int}(:linear_pk_read_locs => 6,
-    :linear_pk_read_locs_auc => 7)
-
-"""Op-column fields each [`CELL_FNS`](@ref) entry reads per subject
-(positional, after the schedule — the generator passes the bound
-`<sched>_<field>` columns to the batched runner, which slices them per
-subject at runtime from `op_ends`)."""
-const CELL_FN_OP_FIELDS = Dict{Symbol,Vector{Symbol}}(
-    :linear_pk_read_locs => [:op_type, :op_dt, :op_amount, :op_interval,
-        :op_count, :op_read_idx],
-    :linear_pk_read_locs_auc => [:op_type, :op_dt, :op_amount, :op_interval,
-        :op_count, :op_read_idx])
-
-"""Segmented-scan cell calls: per-subject scans over a row series with
-an explicit cumulative-ends vector (no schedule — the nadir runs over
-an obs-axis series, not the op stream). Only the nadir wires into the
-grouped walker (the rest of `TGI_CELL_FUNCTIONS` stays out — the
-joint cell spells latents as elementwise lines)."""
-const SEGMENT_CELL_FNS = (:tgi_segmented_nadir,)
-"""Arity past the function name: change vector + ends column."""
-const SEGMENT_CELL_FN_ARITY =
-    Dict{Symbol,Int}(:tgi_segmented_nadir => 2)
-
-"""Schedule-map gathers a grouped cell may index (`reads[sched.obs_map]`,
-one static int vector per row — the `reactivekernels-use` §7d
-vectorized-gather shape): the per-axis conc-space maps (`obs_map`,
-`ecg_map`, `tgi_map`) plus the `[conc; auc]`-space `conc_map` and
-`tgi_auc_map` (see [`build_linear_pk_schedule`](@ref)). Each map is
-available only when its axis/cell prerequisite holds (see
-[`_sched_available_maps`](@ref)) — undeclared-axis gathers fail closed
-at structure."""
-const SCHEDULE_MAPS = (:obs_map, :ecg_map, :tgi_map, :conc_map, :tgi_auc_map)
-
-"""Bind-materialized columns per schedule (`<sched>_<field>`): the six
-op columns plus `op_ends`, per-obs-row `obs_read`, and the flat
-`obs_map` gather index (see [`build_linear_pk_schedule`](@ref))."""
-const _SCHED_MATERIALIZED_FIELDS =
-    (:op_type, :op_dt, :op_amount, :op_interval, :op_count, :op_read_idx,
-        :op_ends, :obs_read, :obs_map)
-
-_sched_materialized_fields(::LinearPKScheduleSpec) = _SCHED_MATERIALIZED_FIELDS
-"""Per-axis row products, materialized only for declared extra axes."""
-const _SCHED_ECG_FIELDS = (:ecg_read, :ecg_map)
-const _SCHED_TGI_FIELDS = (:tgi_read, :tgi_map)
-
-"""`[conc; auc]`-space maps, materialized only with an AUC cell call
-(`tgi_auc_map` additionally needs the declared tgi axis)."""
-const _SCHED_CONC_FIELDS = (:conc_map,)
-const _SCHED_TGI_AUC_FIELDS = (:tgi_auc_map,)
-"""Cumulative TGI row ends, materialized only with a nadir cell call
-plus the declared tgi axis."""
-const _SCHED_SEG_ENDS_FIELDS = (:tgi_seg_ends,)
-
-"""Whether any top-level cell assignment calls the AUC recurrence
-(the generator expands top-level calls only, so the scan matches it
-exactly — nested calls mis-generate regardless)."""
-function _cell_has_auc_call(assignments::Vector{Pair{Symbol,Any}})
-    for (_, ex) in assignments
-        ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-            ex.args[1] === :linear_pk_read_locs_auc && return true
-    end
-    return false
-end
-
-"""Whether any top-level cell assignment calls a PK recurrence
-(same top-level-only reading as [`_cell_has_auc_call`](@ref);
-segmented-nadir calls are data-driven and do not count)."""
-function _cell_has_pk_call(assignments::Vector{Pair{Symbol,Any}})
-    for (_, ex) in assignments
-        ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-            ex.args[1] isa Symbol && ex.args[1] in CELL_FNS &&
-            return true
-    end
-    return false
-end
-
-"""Whether any top-level cell assignment calls the segmented nadir
-(same top-level-only reading as [`_cell_has_auc_call`](@ref))."""
-function _cell_has_nadir_call(assignments::Vector{Pair{Symbol,Any}})
-    for (_, ex) in assignments
-        ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-            ex.args[1] isa Symbol && ex.args[1] in SEGMENT_CELL_FNS &&
-            return true
-    end
-    return false
-end
-
-"""Bind-materialized schedule products beyond [`_SCHED_MATERIALIZED_FIELDS`](@ref):
-per-axis products for declared extra axes, `conc_map` with an AUC
-cell call, `tgi_auc_map` with an AUC cell call plus the declared tgi
-axis, `tgi_seg_ends` with a nadir cell call plus the declared tgi
-axis. Single source for bind materialization, exact-rebuild
-verification, and managed columns."""
-function _sched_extra_fields(sched::LinearPKScheduleSpec,
-        assignments::Vector{Pair{Symbol,Any}})
-    out = Symbol[]
-    sched.ecg !== nothing && append!(out, _SCHED_ECG_FIELDS)
-    sched.tgi !== nothing && append!(out, _SCHED_TGI_FIELDS)
-    if _cell_has_auc_call(assignments)
-        append!(out, _SCHED_CONC_FIELDS)
-        sched.tgi !== nothing && append!(out, _SCHED_TGI_AUC_FIELDS)
-    end
-    if sched.tgi !== nothing && _cell_has_nadir_call(assignments)
-        append!(out, _SCHED_SEG_ENDS_FIELDS)
-    end
-    return out
-end
-
-"""Schedule maps available to a cell: `obs_map` always, per-axis maps
-for declared extra axes, `conc_map` with an AUC cell call,
-`tgi_auc_map` with an AUC cell call plus the declared tgi axis."""
-function _sched_available_maps(sched::LinearPKScheduleSpec,
-        assignments::Vector{Pair{Symbol,Any}})
-    maps = Set{Symbol}([:obs_map])
-    sched.ecg !== nothing && push!(maps, :ecg_map)
-    sched.tgi !== nothing && push!(maps, :tgi_map)
-    if _cell_has_auc_call(assignments)
-        push!(maps, :conc_map)
-        sched.tgi !== nothing && push!(maps, :tgi_auc_map)
-    end
-    return maps
-end
 
 """Whole-column reductions (their single argument must be a bare column)."""
 const REDUCTION_FNS = (:sum, :mean, :std, :var, :minimum, :maximum, :length)
@@ -2381,8 +1245,6 @@ const ELEMENTWISE_COMPARISONS = (:.==, :.!=, :.<, :.>, :.<=, :.>=)
 plus two-argument `logaddexp` for occupancy marginalization)."""
 const ELEMENTWISE_FNS =
     (:log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :logaddexp, :logistic)
-
-const _KERNEL_ELEMENTWISE_FNS = (ELEMENTWISE_FNS..., :logistic)
 
 """Operand count of a built-in elementwise map (`ifelse.(c, x, y)`,
 `logaddexp.(a, b)`; every other one takes one)."""
@@ -2405,9 +1267,8 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
-    VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
-    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm,
-    DarSummandTerm, ComposedTerm)
+    ScanSummandTerm, MatrixTerm,
+    ComposedTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions —
@@ -2455,7 +1316,6 @@ function validate_structure(plan::StructuralPlan)
     _validate_name_tables(plan)
     _validate_array_parameters(plan)
     _validate_scans(plan)
-    _validate_dar_paths(plan)
     _validate_assignments_structure(plan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
@@ -2469,14 +1329,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_predictors(plan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
-    _validate_r2d2(plan)
-    _validate_horseshoe(plan)
-    _validate_kernels(plan)
     _validate_responses(plan)
-    _validate_varying_draws(plan)
-    _validate_splines(plan)
-    _validate_hsgp(plan)
-    _validate_event_lps(plan)
     return nothing
 end
 
@@ -2496,311 +1349,6 @@ function validate_data(plan::StructuralPlan)
     _validate_plate_parameters_data(plan)
     for s in plan.scans
         _scan_length(plan, s)
-    end
-    for s in plan.dar_paths
-        _value_rows(plan, s.state)
-    end
-    _validate_varying_draws_data(plan)
-    _validate_splines_data(plan)
-    _validate_hsgp_data(plan)
-    _validate_kernels_data(plan)
-    _validate_r2d2_data(plan)
-    return nothing
-end
-
-function _validate_margin(m::VaryingMargin, label::Symbol)
-    z = m.z
-    z.kind in (:ones, :column, :dummy) ||
-        _fail(label, "margin $(m.coefficient): Z recipe kind must be " *
-              ":ones, :column, or :dummy, got $(repr(z.kind))")
-    if z.kind === :ones
-        z.column === :none && z.level === nothing ||
-            _fail(label, "margin $(m.coefficient): :ones recipe carries " *
-                  "no column/level")
-        m.coefficient === :Intercept ||
-            _fail(label, "margin $(m.coefficient): :ones recipe addresses " *
-                  ":Intercept")
-    elseif z.kind === :column
-        z.level === nothing ||
-            _fail(label, "margin $(m.coefficient): :column recipe carries " *
-                  "no level")
-        m.coefficient === z.column ||
-            _fail(label, "margin $(m.coefficient): :column recipe " *
-                  "addresses its column $(z.column)")
-    else
-        z.level !== nothing ||
-            _fail(label, "margin $(m.coefficient): :dummy recipe needs " *
-                  "a level value")
-    end
-    return nothing
-end
-
-# Sampled names, derived purely from the draws suffix: the LKJ
-# Cholesky factor (`L_<s>`, KxK), the marginal-scale vector
-# (`tau_<s>`, K), and the standardized draws (`z_flat_<s>`, K*G
-# column-major). Single source for surface
-# claims, name tables, layout, and the generator. K=1 draws own the
-# same three names (`L` packs zero coords).
-function _varying_corr_names(d::VaryingDraws)
-    s = d.suffix
-    return (Symbol("L_", s), Symbol("tau_", s),
-        Symbol("z_flat_", s))
-end
-
-_is_correlated_kind(kind) = kind === :correlated
-
-# Stratified sampled names, derived from the draws suffix + stratum
-# position: per-stratum LKJ factor (`L_<s>_s<k>`, KxK) and
-# marginal-scale vector (`tau_<s>_s<k>`, K). The standardized draws
-# (`z_flat_<s>`, K*G column-major) are shared — the third of
-# `_varying_corr_names(d)`. Single source for name tables, layout,
-# and the generator.
-function _varying_strata_names(d::VaryingDraws, k::Int)
-    d.strata !== nothing ||
-        _fail(d.label, "draws block is not stratified (per-stratum " *
-              "names need a `gr(g, by=b)` grouping)")
-    s = d.suffix
-    return (Symbol("L_", s, "_s", k), Symbol("tau_", s, "_s", k))
-end
-
-# Sampled names one `:correlated` draws block contributes to the name
-# tables: the shared triple, or — stratified with known strata levels
-# (bound plans) — the per-stratum frames plus the shared `z_flat`.
-# Unbound stratified draws contribute only the shared `z_flat` (the
-# per-stratum names need S, unknown pre-bind — the bound pass checks
-# the real names, so no placeholder can falsely collide).
-function _varying_corr_table_names(d::VaryingDraws)
-    st = d.strata
-    st === nothing && return collect(_varying_corr_names(d))
-    if st.levels === nothing
-        return [_varying_corr_names(d)[3]]
-    end
-    z = _varying_corr_names(d)[3]
-    out = Symbol[z]
-    for k in 1:length(st.levels)
-        append!(out, _varying_strata_names(d, k))
-    end
-    return out
-end
-
-# Draws labels/suffixes, kinds, margins, slices, and effect-term
-# linkage: everything provable without data. A draws block's slice
-# ranges partition 1:K exactly once, in any slice order (columns are
-# explicit); every slice is consumed by exactly one effect term (a
-# dangling slice samples dead parameters).
-function _validate_varying_draws(plan::StructuralPlan)
-    draws = plan.varying_draws
-    slices = plan.varying_slices
-    labels = [d.label for d in draws]
-    length(unique(labels)) == length(labels) ||
-        _fail(:plan, "duplicate varying draws labels (one label per draws block)")
-    suffixes = [d.suffix for d in draws]
-    length(unique(suffixes)) == length(suffixes) ||
-        _fail(:plan, "duplicate varying draws suffixes (in-graph names " *
-              "derive from the suffix)")
-    prednames = Set{Symbol}(p.name for p in plan.predictors)
-    bylabel = Dict{Symbol,VaryingDraws}(d.label => d for d in draws)
-    for d in draws
-        _validate_draws_shape(d, prednames, slices)
-    end
-    for s in slices
-        haskey(bylabel, s.draws) ||
-            _fail(:plan, "varying slice for $(s.target) names unknown " *
-                  "draws $(s.draws)")
-        s.target in prednames ||
-            _fail(bylabel[s.draws].label, "varying slice names unknown " *
-                  "predictor $(s.target)")
-    end
-    # Slice ranges partition 1:K exactly once per draws (sorted: slice
-    # order is free, columns are explicit), one slice per
-    # (draws, target), and no range is empty. mm draws feed exactly
-    # one target (SB rejects `mm(...)` with a shared `|ID|` — defense
-    # in depth against emitter bugs; stratified multi-slice stays
-    # legal for `|ID|+gr`, which SB supports).
-    for d in draws
-        K = length(d.margins)
-        own = [s for s in slices if s.draws === d.label]
-        if d.mm !== nothing
-            length(own) <= 1 ||
-                _fail(d.label, "multi-membership draws feed " *
-                      "$(length(own)) targets (SB rejects `mm(...)` with " *
-                      "a shared `|ID|` — one slice per mm draws block)")
-        end
-        targets = [s.target for s in own]
-        length(unique(targets)) == length(targets) ||
-            _fail(d.label, "draws lists a target twice (one slice per " *
-                  "(draws, target))")
-        for s in own
-            r = s.columns
-            first(r) <= last(r) ||
-                _fail(d.label, "slice for $(s.target) is empty (each " *
-                      "slice carries at least one margin)")
-            (first(r) >= 1 && last(r) <= K) ||
-                _fail(d.label, "slice for $(s.target) selects $r outside " *
-                      "1:$K")
-        end
-        lo = 1
-        for s in sort!(own; by = s -> first(s.columns))
-            first(s.columns) == lo ||
-                _fail(d.label, "slice for $(s.target) starts at " *
-                      "$(first(s.columns)), want $lo (slices partition " *
-                      "1:$K exactly once)")
-            lo = last(s.columns) + 1
-        end
-        lo - 1 == K ||
-            _fail(d.label, "slices cover $(lo - 1) margins but the draws " *
-                  "block carries $K")
-    end
-    # Effect-term linkage, jointly over predictors + draws + slices.
-    for pred in plan.predictors
-        for t in pred.terms
-            t.kind === VaryingEffectTerm || continue
-            o = t.options
-            haskey(bylabel, o.draws) ||
-                _fail(t.label, "effect term in predictor $(pred.name) " *
-                      "references unknown draws $(o.draws)")
-            any(s -> s.draws === o.draws && s.target === pred.name,
-                slices) ||
-                _fail(t.label, "draws $(o.draws) carries no slice for " *
-                      "predictor $(pred.name)")
-        end
-    end
-    used = Set{Tuple{Symbol,Symbol}}()
-    for pred in plan.predictors
-        for t in pred.terms
-            t.kind === VaryingEffectTerm || continue
-            key = (t.options.draws, pred.name)
-            key in used &&
-                _fail(t.label, "duplicate effect term for draws " *
-                      "$(key[1]) in predictor $(pred.name) (one term per " *
-                      "draws per predictor)")
-            push!(used, key)
-        end
-    end
-    for s in slices
-        (s.draws, s.target) in used ||
-            _fail(bylabel[s.draws].label, "draws $(s.draws) slice for " *
-                  "predictor $(s.target) is never consumed (dangling " *
-                  "slice samples dead parameters — use it or drop it)")
-    end
-    return nothing
-end
-
-function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
-        slices::Vector{VaryingSlice})
-    _is_correlated_kind(d.kind) ||
-        _fail(d.label, "draws kind must be :correlated " *
-              "(one geometry for every K — a single " *
-              "margin is the 1x1 case), got $(repr(d.kind))")
-    K = length(d.margins)
-    K >= 1 || _fail(d.label, "draws block has zero margins")
-    for m in d.margins
-        _validate_margin(m, d.label)
-    end
-    for s in slices
-        s.draws === d.label || continue
-        s.target in prednames ||
-            _fail(d.label, "draws slice for unknown predictor $(s.target)")
-    end
-    isfinite(d.lkj_eta) && d.lkj_eta > 0 ||
-        _fail(d.label, "draws need a positive LKJ eta, got $(d.lkj_eta)")
-    K == 1 && d.lkj_eta != 1.0 &&
-        _fail(d.label, "K=1 draws carry LKJ eta 1.0 (the 1x1 factor is " *
-              "the fixed `[1]`, so no other eta parameterizes anything), " *
-              "got $(d.lkj_eta)")
-    _validate_sd_priors(d, K)
-    _validate_draws_grouping(d, K)
-    _validate_varying_levels_shape(d)
-    return nothing
-end
-
-# Multi-membership / stratified grouping shape (provable without
-# data). Both are `:correlated` with eta exactly 1.0 (SB hardcodes
-# `lkj_corr_cholesky(1.)` on both paths). Neither path has an SB
-# generic-prior sibling, so both reject non-default `sd_priors`; SB
-# has no mm × stratified shape.
-function _validate_draws_grouping(d::VaryingDraws, K::Int)
-    mm = d.mm
-    st = d.strata
-    mm === nothing && st === nothing && return nothing
-    mm !== nothing && st !== nothing &&
-        _fail(d.label, "draws block is both multi-membership and " *
-              "stratified (SB has no `mm(...)` × `gr(g, by=b)` shape — " *
-              "pick one)")
-    if mm !== nothing
-        M = length(mm.groups)
-        M >= 2 ||
-            _fail(d.label, "multi-membership draws need at least two " *
-                  "grouping columns, got $M")
-        # Repeated groups/weights are degenerate but well-defined
-        # (slots are positional) and SB accepts them — no check.
-        if mm.weights !== nothing
-            W = length(mm.weights)
-            W == M ||
-                _fail(d.label, "multi-membership draws list $W weight " *
-                      "columns for $M groups (one per group, or omit all)")
-        end
-        d.lkj_eta == 1.0 ||
-            _fail(d.label, "multi-membership draws need eta 1.0 (SB " *
-                  "hardcodes `lkj_corr_cholesky(1.)`), got $(d.lkj_eta)")
-        isempty(d.sd_priors) ||
-            _fail(d.label, "multi-membership draws take no sd priors " *
-                  "(SB has no generic-prior mm sibling)")
-    end
-    if st !== nothing
-        d.lkj_eta == 1.0 ||
-            _fail(d.label, "stratified draws need eta 1.0 (SB hardcodes " *
-                  "`lkj_corr_cholesky(1.)`), got $(d.lkj_eta)")
-        isempty(d.sd_priors) ||
-            _fail(d.label, "stratified draws take no sd priors (SB " *
-                  "supports no configured priors on `gr(g, by=b)` blocks)")
-        st.by !== d.group ||
-            _fail(d.label, "stratified draws need distinct group and " *
-                  "stratum columns, got `gr($(d.group), by=$(d.group))`")
-    end
-    return nothing
-end
-
-# Per-margin `tau` priors: empty (the default) is all-`:std_normal`,
-# otherwise one entry per margin in margin order. `:exponential` takes
-# a finite positive SCALE, `:normal` a finite positive sd;
-# `:std_normal` ignores its param (finite, conventionally 1.0). Every
-# K takes them (one geometry for every K).
-function _validate_sd_priors(d::VaryingDraws, K::Int)
-    sds = d.sd_priors
-    (isempty(sds) || length(sds) == K) ||
-        _fail(d.label, "draws list $(length(sds)) sd priors for $K " *
-              "margins (empty for all-default, else exactly one per margin)")
-    for (j, p) in enumerate(sds)
-        p.family in _SD_PRIOR_FAMILIES ||
-            _fail(d.label, "margin $j sd prior family must be one of " *
-                  "$(_SD_PRIOR_FAMILIES), got $(repr(p.family))")
-        isfinite(p.param) ||
-            _fail(d.label, "margin $j sd prior param is not finite " *
-                  "(got $(p.param))")
-        p.family === :std_normal || p.param > 0 ||
-            _fail(d.label, "margin $j sd prior needs a positive " *
-                  "param, got $(p.param)")
-    end
-    return nothing
-end
-
-# Declared-levels checks provable without data (coverage needs the bound
-# column — `_validate_varying_draws_data`). Emitter-provided levels must
-# be non-empty, duplicate-free, and literal-embeddable (the admission
-# mirrors `_level_literal` in preprocessing.jl — the generator embeds
-# these values into the `_declared_codes` call).
-function _validate_varying_levels_shape(d::VaryingDraws)
-    d.levels === nothing && return nothing
-    !isempty(d.levels) ||
-        _fail(d.label, "draws block declares zero grouping levels")
-    length(unique(d.levels)) == length(d.levels) ||
-        _fail(d.label, "draws block declares duplicate grouping levels " *
-              "($(repr(d.levels)))")
-    for lv in d.levels
-        lv isa Union{Number,String,Bool,Char,Symbol} ||
-            _fail(d.label, "declared level $(repr(lv)) is not " *
-                  "literal-embeddable (numeric/string/symbol only)")
     end
     return nothing
 end
@@ -2850,311 +1398,6 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
     return nothing
 end
 
-function _validate_margin_data(m::VaryingMargin, label::Symbol,
-        plan::StructuralPlan)
-    z = m.z
-    z.kind === :ones && return nothing
-    haskey(plan.columns, z.column) || _is_derived(plan, z.column) ||
-        _fail(label, "margin $(m.coefficient): Z column $(z.column) is " *
-              "not bound")
-    if z.kind === :column
-        _is_derived(plan, z.column) && return nothing
-        zcol = _vector_column(plan.columns, z.column, label, "Z column")
-        eltype(zcol) <: Real ||
-            _fail(label, "margin $(m.coefficient): Z column $(z.column) " *
-                  "must be numeric (a categorical slope needs explicit " *
-                  "`dummy($(z.column), k)` recipes)")
-    else
-        _is_derived(plan, z.column) &&
-            _fail(label, "margin $(m.coefficient): :dummy needs a raw " *
-                  "column (level membership needs bound values)")
-        zcol = _vector_column(plan.columns, z.column, label, "grouping column")
-        z.level in _grouping_levels(zcol) ||
-            _fail(label, "margin $(m.coefficient): dummy level " *
-                  "$(repr(z.level)) is not a level of $(z.column)")
-    end
-    return nothing
-end
-
-# Grouping columns are raw (level knowledge needs values), Z continuous
-# columns mirror the population rule (raw numeric or derived, whose eltype
-# is unknown statically), and dummy levels must be members of the column's
-# grouping levels (Int value / string exact match).
-function _validate_varying_draws_data(plan::StructuralPlan)
-    for d in plan.varying_draws
-        if d.mm !== nothing
-            _validate_mm_draws_data(d, plan)
-        else
-            haskey(plan.columns, d.group) ||
-                _fail(d.label, "grouping column $(d.group) is not bound")
-            _is_derived(plan, d.group) &&
-                _fail(d.label, "grouping column $(d.group) must be raw data " *
-                      "(level knowledge needs bound values)")
-            d.levels === nothing &&
-                _fail(d.label, "draws block has no declared grouping levels " *
-                      "(bind_data fills these — hand-built bound plans must too)")
-            # Coverage: every observed value needs a declared code (an
-            # uncovered value would encode 0 and gather out of bounds).
-            levels = d.levels::Vector
-            groupcol = _vector_column(plan.columns, d.group, d.label,
-                "grouping column")
-            for v in groupcol
-                v in levels ||
-                    _fail(d.label, "grouping value $(repr(v)) of $(d.group) " *
-                          "is not a declared level (declared: $(repr(levels)))")
-            end
-        end
-        if d.strata !== nothing
-            _validate_strata_draws_data(d, plan)
-        end
-        for m in d.margins
-            _validate_margin_data(m, d.label, plan)
-        end
-    end
-    # One grouping, one numbering: same-group draws share the per-group
-    # `_ppl_gidx_` encoder, so their declared levels must agree exactly
-    # (order included — codes are positions). mm draws carry per-suffix
-    # encoders (never shared), so they sit out the agreement.
-    for i in eachindex(plan.varying_draws)
-        for j in (i + 1):length(plan.varying_draws)
-            di, dj = plan.varying_draws[i], plan.varying_draws[j]
-            di.group === dj.group || continue
-            di.mm === nothing && dj.mm === nothing || continue
-            di.levels == dj.levels ||
-                _fail(:plan, "draws $(di.label) and $(dj.label) share " *
-                      "grouping $(di.group) but declare different levels " *
-                      "($(repr(di.levels)) vs $(repr(dj.levels)))")
-        end
-    end
-    return nothing
-end
-
-# Multi-membership data checks (SB `_brm_prepare_mm` mirror): every
-# membership column bound, raw, n_obs-long, and covered by the UNION
-# levels; every weight column bound, vector, real non-Bool, finite,
-# nonnegative, n_obs-long, with a positive finite row total (SB
-# validates totals whenever weights are supplied, normalized or not).
-function _validate_mm_draws_data(d::VaryingDraws, plan::StructuralPlan)
-    mm = d.mm::VaryingMultiMembership
-    M = length(mm.groups)
-    d.levels === nothing &&
-        _fail(d.label, "draws block has no declared grouping levels " *
-              "(bind_data fills the union — hand-built bound plans must too)")
-    levels = d.levels::Vector
-    n_obs = _value_rows(plan, first(mm.groups))
-    for (mi, gcol) in enumerate(mm.groups)
-        haskey(plan.columns, gcol) ||
-            _fail(d.label, "membership column $gcol (slot $mi of $M) " *
-                  "is not bound")
-        _is_derived(plan, gcol) &&
-            _fail(d.label, "membership column $gcol must be raw data " *
-                  "(level knowledge needs bound values)")
-        col = _vector_column(plan.columns, gcol, d.label, "membership column")
-        length(col) == n_obs ||
-            _fail(d.label, "membership column $gcol has $(length(col)) " *
-                  "rows; expected $n_obs")
-        for v in col
-            v in levels ||
-                _fail(d.label, "grouping value $(repr(v)) of $gcol " *
-                      "is not a declared union level (declared: " *
-                      "$(repr(levels)))")
-        end
-    end
-    mm.weights === nothing && return nothing
-    for (mi, wcol) in enumerate(mm.weights)
-        haskey(plan.columns, wcol) ||
-            _fail(d.label, "weight column $wcol (slot $mi of $M) " *
-                  "is not bound")
-        w = _vector_column(plan.columns, wcol, d.label, "weight column")
-        eltype(w) <: Real && !(eltype(w) <: Bool) ||
-            _fail(d.label, "weight column $wcol must be real-valued, got " *
-                  "eltype $(eltype(w))")
-        length(w) == n_obs ||
-            _fail(d.label, "weight column $wcol has $(length(w)) rows; " *
-                  "expected $n_obs")
-        for (i, v) in enumerate(w)
-            isfinite(v) ||
-                _fail(d.label, "weight column $wcol at row $i must be " *
-                      "finite, got $(repr(v))")
-            v >= 0 ||
-                _fail(d.label, "weight column $wcol at row $i must be " *
-                      "nonnegative, got $(repr(v))")
-        end
-    end
-    wcols = [plan.columns[w] for w in mm.weights]
-    for i in 1:n_obs
-        total = sum(Float64(w[i]) for w in wcols)
-        isfinite(total) ||
-            _fail(d.label, "weights have a non-finite total at row $i")
-        total > 0 ||
-            _fail(d.label, "weights must have a positive total at row $i")
-    end
-    return nothing
-end
-
-# Stratified data checks: the `by` column bound, raw, n_obs-long, and
-# covered by the strata levels; every group level sits in exactly one
-# stratum (SB `_brm_group_strata` — a straddling group is loud).
-function _validate_strata_draws_data(d::VaryingDraws, plan::StructuralPlan)
-    st = d.strata::VaryingStrata
-    haskey(plan.columns, st.by) ||
-        _fail(d.label, "stratum column $(st.by) is not bound")
-    _is_derived(plan, st.by) &&
-        _fail(d.label, "stratum column $(st.by) must be raw data " *
-              "(level knowledge needs bound values)")
-    st.levels === nothing &&
-        _fail(d.label, "draws block has no declared strata levels " *
-              "(bind_data fills these — hand-built bound plans must too)")
-    slevels = st.levels::Vector
-    bycol = _vector_column(plan.columns, st.by, d.label, "stratum column")
-    n = _value_rows(plan, d.group)
-    length(bycol) == n ||
-        _fail(d.label, "stratum column $(st.by) has $(length(bycol)) " *
-              "rows; expected $n")
-    for v in bycol
-        v in slevels ||
-            _fail(d.label, "stratum value $(repr(v)) of $(st.by) " *
-                  "is not a declared stratum (declared: $(repr(slevels)))")
-    end
-    gcol = _vector_column(plan.columns, d.group, d.label, "grouping column")
-    smap = Dict{Any,Any}()
-    for (g, b) in zip(gcol, bycol)
-        if haskey(smap, g)
-            smap[g] == b ||
-                _fail(d.label, "gr($(d.group), by=$(st.by)): group level " *
-                      "$(repr(g)) straddles multiple strata " *
-                      "($(repr(smap[g])) vs $(repr(b)))")
-        else
-            smap[g] = b
-        end
-    end
-    return nothing
-end
-
-# Group count for a draws block: the DECLARED level count (unobserved
-# declared levels keep prior-only coefficients). Loud defense in
-# depth — validate_data proves levels non-nothing on every bound plan.
-function _draws_nlevels(d::VaryingDraws)
-    d.levels === nothing && throw(ContractValidationError(
-        "[layout] draws $(d.label) has no declared grouping levels " *
-        "(bind_data fills these — hand-built bound plans must too)"))
-    return length(d.levels)
-end
-
-# Stratum count for a stratified draws block: the DECLARED strata
-# level count. Loud defense in depth — validate_data proves strata
-# levels non-nothing on every bound stratified plan.
-function _strata_nlevels(d::VaryingDraws)
-    st = d.strata
-    st === nothing && throw(ContractValidationError(
-        "[layout] draws $(d.label) is not stratified (stratum count " *
-        "needs a `gr(g, by=b)` grouping)"))
-    st.levels === nothing && throw(ContractValidationError(
-        "[layout] draws $(d.label) has no declared strata levels " *
-        "(bind_data fills these — hand-built bound plans must too)"))
-    return length(st.levels)
-end
-
-# Binder evaluation for draws levels (the LevelMap precedent):
-# `nothing` fills sort-ordered observed levels; emitter-provided levels
-# pass through (validated by `_validate_varying_levels_shape` +
-# `_validate_varying_draws_data`). mm draws fit the UNION across
-# membership columns (SB `_brm_mm_fit_levels`); stratified draws also
-# fill strata levels from the `by` column.
-function _eval_draws_levels(draws::Vector{VaryingDraws},
-        columns::AbstractDict{Symbol})
-    out = VaryingDraws[]
-    for d in draws
-        if d.mm !== nothing
-            push!(out, _bind_mm_draws(d, columns))
-            continue
-        end
-        if d.levels !== nothing
-            push!(out, _maybe_fill_strata(d, columns))
-            continue
-        end
-        haskey(columns, d.group) ||
-            _fail(d.label, "grouping column $(d.group) is not bound")
-        groupcol = _vector_column(columns, d.group, d.label, "grouping column")
-        levels =
-            try
-                _grouping_levels(groupcol)
-            catch err
-                _fail(d.label, "grouping column $(d.group) levels not " *
-                             "orderable ($err)")
-            end
-        d2 = VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
-            d.label, d.suffix, collect(levels), d.sd_priors, d.mm, d.strata)
-        push!(out, _maybe_fill_strata(d2, columns))
-    end
-    return out
-end
-
-# Union-level fit for one mm draws block (SB `_brm_mm_fit_levels`:
-# pool per-column levels, dedup, sort). Emitter-provided union levels
-# (the categorical escape hatch — same policy as plain groupings)
-# pass through untouched.
-function _bind_mm_draws(d::VaryingDraws, columns::AbstractDict{Symbol})
-    mm = d.mm::VaryingMultiMembership
-    d.levels !== nothing && return _maybe_fill_strata(d, columns)
-    pooled = Any[]
-    for g in mm.groups
-        haskey(columns, g) ||
-            _fail(d.label, "membership column $g is not bound")
-        col = _vector_column(columns, g, d.label, "membership column")
-        append!(pooled, _grouping_levels(col))
-    end
-    unique!(pooled)
-    levels =
-        try
-            sort!(pooled)
-        catch err
-            _fail(d.label, "membership columns have levels that are not " *
-                         "mutually orderable ($err)")
-        end
-    d2 = VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
-        d.label, d.suffix, collect(levels), d.sd_priors, d.mm, d.strata)
-    return _maybe_fill_strata(d2, columns)
-end
-
-# Strata-level fill for one stratified draws block (sort-ordered
-# observed levels of the `by` column — the group-level precedent).
-# Anything unstratified (or already-filled) passes through untouched.
-function _maybe_fill_strata(d::VaryingDraws, columns::AbstractDict{Symbol})
-    st = d.strata
-    st === nothing && return d
-    st.levels !== nothing && return d
-    haskey(columns, st.by) ||
-        _fail(d.label, "stratum column $(st.by) is not bound")
-    bycol = _vector_column(columns, st.by, d.label, "stratum column")
-    slevels =
-        try
-            _grouping_levels(bycol)
-        catch err
-            _fail(d.label, "stratum column $(st.by) levels not " *
-                         "orderable ($err)")
-        end
-    return VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
-        d.label, d.suffix, d.levels, d.sd_priors, d.mm,
-        VaryingStrata(st.by, collect(slevels)))
-end
-
-"""Predictor levels (grouped kernels): a predictor consumed ONLY as a
-kernel LP arg is SUBJECT-level (its design rows are subjects); any
-response use makes it obs-level. Mixed use fails closed — split the
-predictor instead."""
-function _predictor_level(plan::StructuralPlan, pname::Symbol)
-    by_kernel = any(kp -> any(((p, _),) -> p === pname, kp.lp_args),
-        plan.kernel_plates)
-    by_resp = any(r -> _response_uses_predictor(r, pname), plan.responses)
-    by_kernel && by_resp &&
-        _fail(:plan, "predictor `$pname` feeds both a kernel LP arg and " *
-              "a response (mixed-level predictors are not supported — " *
-              "split it into a subject-level and an obs-level predictor)")
-    by_kernel && return :subject
-    return :obs
-end
-
 function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
     r.predictor === pname && return true
     pname in r.extra_predictors && return true
@@ -3176,109 +1419,8 @@ function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
     return false
 end
 
-"""Term columns of subject-level predictors (n_sub rows by design):
-exempt from the uniform-`n_obs` rule like kernel-managed columns (only
-bound columns count — a summand's basis id is not a column and fails
-loudly under kernel rules instead). Transitive through derived
-assignments: a data column feeding ONLY subject-level consumers inherits
-subject level (in-graph `standardize`, etc.). A pulled column that ALSO
-feeds obs-level consumers (responses, slices, obs predictors, weights,
-evidence, trials) fails loudly — mixed-level lengths are genuinely
-ambiguous. (Directly-shared columns across levels predate this rule and
-keep their historical behavior; varying-group sharing across levels is
-out of scope.)"""
-function _subject_predictor_columns(plan::StructuralPlan)
-    out = Set{Symbol}()
-    seed = Set{Symbol}()
-    for pred in plan.predictors
-        _predictor_level(plan, pred.name) === :subject || continue
-        for t in pred.terms, c in t.columns
-            push!(seed, c)
-            haskey(plan.columns, c) && push!(out, c)
-        end
-    end
-    if !isempty(seed)
-        deps = _assignment_name_deps(plan)
-        # Fixpoint: subject names (data or not-yet-materialized deriveds)
-        # pull their assignment sources in; bound data sources join `out`.
-        queue = collect(seed)
-        seen = copy(seed)
-        while !isempty(queue)
-            for src in get(deps, pop!(queue), ())
-                src in seen && continue
-                push!(seen, src)
-                haskey(plan.columns, src) && push!(out, src)
-                push!(queue, src)
-            end
-        end
-        # Mixed-level: pulled data columns feeding obs-level consumers.
-        obs = Set{Symbol}()
-        for r in plan.responses
-            push!(obs, r.response)
-            r.weights isa Symbol && push!(obs, r.weights)
-            r.trials isa Symbol && push!(obs, r.trials)
-            if r.evidence !== nothing && r.evidence.kind !== :none
-                r.evidence.lower isa Symbol && push!(obs, r.evidence.lower)
-                r.evidence.upper isa Symbol && push!(obs, r.evidence.upper)
-            end
-        end
-        for kp in plan.kernel_plates, (c, _, _) in kp.slices
-            push!(obs, c)
-        end
-        for pred in plan.predictors
-            _predictor_level(plan, pred.name) === :obs || continue
-            for t in pred.terms, c in t.columns
-                push!(obs, c)
-            end
-        end
-        for c in out
-            c in obs &&
-                _fail(c, "column feeds both subject-level and obs-level " *
-                      "consumers (mixed-level lengths are ambiguous — " *
-                      "bind explicit per-level copies)")
-        end
-    end
-    return out
-end
-
-"""Assignment name dependencies: derived/assignment name → referenced
-names (function heads included — callers intersect with bound columns)."""
-function _assignment_name_deps(plan::StructuralPlan)
-    deps = Dict{Symbol,Set{Symbol}}()
-    for a in plan.assignments
-        deps[a.name] = _expr_names(a.expr)
-    end
-    for d in plan.derived
-        deps[d.name] = _expr_names(d.expr)
-    end
-    return deps
-end
-
-function _expr_names(ex)::Set{Symbol}
-    out = Set{Symbol}()
-    _expr_names!(out, ex)
-    return out
-end
-
-function _expr_names!(out::Set{Symbol}, ex)
-    ex isa Symbol && (push!(out, ex); return nothing)
-    ex isa Expr || return nothing
-    for a in ex.args
-        _expr_names!(out, a)
-    end
-    return nothing
-end
-
-"""Bound columns without an observation axis of their own: `(modelvals,
-managed)` — model-level values (bind-time data definitions and raw inputs
-read only whole) carry no axis; kernel-, subject- and mi-managed columns
-carry two lengths by design and validate under their own rules."""
 function _axis_exempt_columns(plan::StructuralPlan)
     managed = Set{Symbol}()
-    for kp in plan.kernel_plates
-        union!(managed, _kernel_managed_columns(kp))
-    end
-    union!(managed, _subject_predictor_columns(plan))
     union!(managed, _mi_managed_columns(plan))
     # Model-level data values (functions as values: a data-only
     # assignment bound at bind, or a data-only definition only used
@@ -3309,21 +1451,18 @@ New slots must establish the same property before joining this list."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
     :levelmaps, :vector_parameters, :submodel_scopes, :conditioned,
-    :plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
-    :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
-    :r2d2_priors, :horseshoe_priors, :array_parameters, :kernel_plates,
-    :event_lps, :indexed_observations, :external_observations)
+    :plate_parameters, :scans,
+    :matrices,
+    :array_parameters, :indexed_observations, :external_observations)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
-# join observation axes. A draws application, basis or matrix does carry
-# rows and must expose its inputs through the same dependency walk.
+# join observation axes. A basis or matrix does carry rows and must expose
+# its inputs through the same dependency walk.
 function _observation_nodes(plan::StructuralPlan)
     nodes = Dict{Symbol,Any}()
     for p in plan.predictors
-        draws = [d for sl in plan.varying_slices if sl.target === p.name
-            for d in plan.varying_draws if d.label === sl.draws]
-        nodes[p.name] = (p, draws)
+        nodes[p.name] = p
     end
     for d in plan.derived
         nodes[d.name] = d.expr
@@ -3333,12 +1472,6 @@ function _observation_nodes(plan::StructuralPlan)
     end
     for m in plan.matrices
         nodes[m.name] = m.columns
-    end
-    for sb in plan.spline_bases
-        nodes[sb.id] = (sb.axes, [b.columns for b in sb.blocks])
-    end
-    for hb in plan.hsgp_bases
-        nodes[hb.id] = (hb.axes, hb.by)
     end
     for p in plan.plate_parameters
         # The iterator determines the latent array's extent. Prior inputs
@@ -3413,9 +1546,7 @@ function _uses_structured_observation_axes(plan::StructuralPlan)
     any(r -> r.mi_jobs !== nothing, plan.responses) && return true
     !isempty(plan.plate_parameters) && !any(r -> r.range isa Expr, plan.responses) && return true
     return any(f -> !isempty(getfield(plan, f)),
-        (:scans, :dar_paths, :varying_draws, :varying_slices,
-         :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
-         :r2d2_priors, :horseshoe_priors, :kernel_plates, :event_lps))
+        (:scans, :matrices))
 end
 
 """Observation axes of a plan whose `columns` are bound: `nothing` when
@@ -3436,7 +1567,7 @@ function _structured_observation_axes(plan::StructuralPlan)
     all(r -> haskey(plan.columns, r.response), plan.responses) || return nothing
     rows = Dict{Symbol,Int}(c => _column_nrows(plan.columns[c]) for c in perobs)
     response_rows = [_structured_response_rows(plan, r) for r in plan.responses]
-    length(unique(response_rows)) <= 1 && isempty(plan.kernel_plates) && return nothing
+    length(unique(response_rows)) <= 1 && return nothing
     lens = join(sort!(unique(response_rows)), ", ")
     for f in fieldnames(StructuralPlan)
         f in _MULTI_AXIS_SLOTS && continue
@@ -3661,7 +1792,7 @@ function _validate_observed_selections!(plan::StructuralPlan, columns::AbstractD
         left = [I for I in CartesianIndices(value) if !mask[I] && !ismissing(value[I])]
         isempty(left) || _fail(labels[name], "supplied entries " *
             "$(_entry_names(name, left)) are never observed — every supplied " *
-            "response entry is observed (decision 1g8uvgs); bind only the observed " *
+            "response entry is observed; bind only the observed " *
             "entries or mark the others `missing`")
         name in kernel && Missing <: eltype(value) || continue
         T = Base.nonmissingtype(eltype(value))
@@ -3684,7 +1815,6 @@ retain their existing row-domain validation.
 Several domains beside slots outside `_MULTI_AXIS_SLOTS` are not built yet."""
 function _observation_axes(plan::StructuralPlan)
     _uses_structured_observation_axes(plan) && return _structured_observation_axes(plan)
-    isempty(plan.kernel_plates) || return nothing
     modelvals, managed = _axis_exempt_columns(plan)
     perobs = Set{Symbol}(k for (k, v) in plan.columns
         if k ∉ modelvals && k ∉ managed &&
@@ -3882,8 +2012,7 @@ function _value_rows(plan::StructuralPlan, name::Symbol)
     end
     length(ns) == 1 && return only(ns)
     if isempty(ns)
-        axes = unique!(vcat([_response_rows(plan, r) for r in plan.responses],
-            [_kernel_plate_nlanes(kp, plan.columns) for kp in plan.kernel_plates]))
+        axes = unique!([_response_rows(plan, r) for r in plan.responses])
         length(axes) == 1 && return only(axes)
         isempty(axes) && return plan.n_obs
         _fail(name, "value $name has no data range or response to establish its rows")
@@ -4013,1543 +2142,19 @@ function _validate_columns(plan::StructuralPlan)
     return nothing
 end
 
-function _validate_splines(plan::StructuralPlan)
-    ids = [sb.id for sb in plan.spline_bases]
-    length(unique(ids)) == length(ids) ||
-        _fail(:plan, "duplicate spline basis ids")
-    labels = [sb.label for sb in plan.spline_bases]
-    length(unique(labels)) == length(labels) ||
-        _fail(:plan, "duplicate spline basis labels")
-    for sb in plan.spline_bases
-        sb.kind === :tps || sb.kind === :t2 ||
-            _fail(:plan, "spline :$(sb.id): kind must be :tps or :t2, " *
-                  "got $(repr(sb.kind))")
-        if sb.kind === :tps
-            sb.k isa Int ||
-                _fail(:plan, "tps spline :$(sb.id): k must be an Int, " *
-                      "got $(repr(sb.k))")
-            sb.k > 2 ||
-                _fail(:plan, "tps spline :$(sb.id): k must exceed 2, " *
-                      "got $(sb.k)")
-            length(sb.axes) == 1 ||
-                _fail(:plan, "tps spline :$(sb.id): takes exactly one " *
-                      "axis column, got $(sb.axes)")
-        else
-            sb.k isa Tuple{Int,Int} ||
-                _fail(:plan, "t2 spline :$(sb.id): k must be an " *
-                      "(Int, Int) tuple, got $(repr(sb.k))")
-            all(k -> k > 2, sb.k) ||
-                _fail(:plan, "t2 spline :$(sb.id): k entries must " *
-                      "exceed 2, got $(repr(sb.k))")
-            length(sb.axes) == 2 ||
-                _fail(:plan, "t2 spline :$(sb.id): takes exactly two " *
-                      "axis columns, got $(sb.axes)")
-        end
-        want = _spline_blocks(sb.kind, sb.k)
-        got = [(b.name, b.width) for b in sb.blocks]
-        got == want || _fail(:plan,
-            "spline :$(sb.id): blocks are determined by (kind, k) alone " *
-            "— expected $want, got $got")
-        wantvec = _spline_vector_specs(sb.id, sb.kind, sb.k)
-        gotvec = [v.name for v in plan.spline_vectors if v.basis === sb.id]
-        sort!(gotvec)
-        wantnames = sort!([first(s) for s in wantvec])
-        gotvec == wantnames || _fail(:plan,
-            "spline :$(sb.id): spline-vectors must be exactly " *
-            "$wantnames, got $gotvec")
-        byname = Dict{Symbol,SplineVector}(v.name => v
-            for v in plan.spline_vectors if v.basis === sb.id)
-        _, sdname = _spline_block_roles(sb.id, sb.kind, sb.k)
-        for (vname, vfamily, vargs, vsupport, vwidth) in wantvec
-            v = byname[vname]
-            # The smoothing-sd vector may carry a stated hyper prior
-            # (SB `sd(mu, s(x)) ~ ...`) — same width, family/args from
-            # the admitted set, support derived from the family.
-            if vname === sdname && !(v.family === vfamily && v.args == vargs && v.support_override == vsupport)
-                hp = HyperPrior(v.family, v.args, v.support_override)
-                _validate_hyper_prior(hp, :plan, "spline :$(sb.id) sd")
-                _, vfamily, vargs, vsupport, _ = only(s for s in
-                    _spline_vector_specs(sb.id, sb.kind, sb.k, hp)
-                    if first(s) === sdname)
-            end
-            (v.family === vfamily && v.args == vargs &&
-             v.support_override == vsupport && v.width == vwidth) ||
-                _fail(:plan, "spline :$(sb.id): vector :$vname must be " *
-                      "$vfamily$(vargs) with support $(repr(vsupport)) " *
-                      "and width $vwidth — the prior structure is part " *
-                      "of the contract, not emitter's choice")
-        end
-        # Materialized <id>_<block>_<j> names are computable pre-bind
-        # (widths are static), so the sampler-scope clash check runs here
-        # rather than at bind. Names are unique across bases by
-        # construction (right-parse _<j> then the fixed block tag is
-        # unambiguous, and ids are unique), so no pairwise check.
-        wantcols = reduce(vcat, (last(b) for b in
-            _spline_basis_columns(sb.id, sb.kind, sb.k)); init=Symbol[])
-        union = _union_names(plan)
-        clash = filter(c -> c in union, wantcols)
-        isempty(clash) || _fail(:plan,
-            "spline :$(sb.id): materialized basis columns $clash collide " *
-            "with parameter/assignment names — rename the spline id")
-    end
-    idset = Set{Symbol}(ids)
-    for v in plan.spline_vectors
-        v.basis in idset ||
-            _fail(:plan, "spline vector :$(v.name) addresses unknown " *
-                  "basis :$(v.basis)")
-    end
-    # Basis linkage: every summand names an existing basis; every basis
-    # feeds exactly one summand (SB: a smooth has one target; a dangling
-    # basis would sample dead parameters, a double use double-counts).
-    uses = Dict{Symbol,Int}(id => 0 for id in ids)
-    for pred in plan.predictors, t in pred.terms
-        t.kind === SplineSummandTerm || continue
-        sid = t.options.spline_id
-        haskey(uses, sid) ||
-            _fail(t.label, "spline summand addresses unknown basis :$sid")
-        uses[sid] += 1
-    end
-    for (id, n) in uses
-        n == 1 || _fail(:plan,
-            "spline :$id is used by $n summands — exactly one " *
-            "(one target per smooth)")
-    end
-    return nothing
-end
-
-function _validate_splines_data(plan::StructuralPlan)
-    for sb in plan.spline_bases
-        for c in sb.axes
-            haskey(plan.columns, c) ||
-                _fail(sb.label, "spline :$(sb.id): axis column $c is " *
-                      "not bound")
-            _is_derived(plan, c) &&
-                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
-                      "be raw data (the bind-time fit needs bound values)")
-            axiscol =
-                _vector_column(plan.columns, c, sb.label, "spline axis column")
-            eltype(axiscol) <: Real ||
-                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
-                      "be numeric, got $(eltype(axiscol))")
-        end
-        for b in sb.blocks, c in b.columns
-            haskey(plan.columns, c) ||
-                _fail(sb.label, "spline :$(sb.id): materialized basis " *
-                      "column $c (block :$(b.name)) is not bound")
-        end
-    end
-    return nothing
-end
-
-function _validate_hsgp(plan::StructuralPlan)
-    ids = [hb.id for hb in plan.hsgp_bases]
-    length(unique(ids)) == length(ids) ||
-        _fail(:plan, "duplicate hsgp basis ids")
-    labels = [hb.label for hb in plan.hsgp_bases]
-    length(unique(labels)) == length(labels) ||
-        _fail(:plan, "duplicate hsgp basis labels")
-    for hb in plan.hsgp_bases
-        hb.rho_prior isa HyperPrior && _validate_hyper_prior(hb.rho_prior,
-            :plan, "hsgp :$(hb.id) length-scale")
-        hb.sigma_prior isa HyperPrior && _validate_hyper_prior(
-            hb.sigma_prior, :plan, "hsgp :$(hb.id) sd")
-        for (spec, what) in ((hb.rho_prior, "length-scale"),
-                             (hb.sigma_prior, "sd"))
-            spec isa HSGPHyperLP || continue
-            hb.by === nothing && _fail(:plan, "hsgp :$(hb.id): a $what " *
-                "hyper-predictor needs a grouped basis (`by = ...`)")
-            spec.group === hb.by.column || _fail(:plan, "hsgp :$(hb.id): " *
-                "the $what hyper-predictor groups by $(spec.group) but " *
-                "the basis groups by $(hb.by.column) — one hyper level " *
-                "per term group")
-        end
-        if hb.by !== nothing
-            (hb.cov === :exp_quad && hb.iso && length(hb.axes) == 1) ||
-                _fail(:plan, "hsgp :$(hb.id): `by` grouping takes one " *
-                    "isotropic exp-quad axis in v1 (aniso / periodic " *
-                    "grouped bases are planned)")
-            lv = hb.by.levels
-            lv === nothing || (!isempty(lv) && allunique(lv)) ||
-                _fail(:plan, "hsgp :$(hb.id): `by` levels must be " *
-                    "non-empty and distinct, got $(repr(lv))")
-        end
-        if hb.domain !== nothing
-            hb.cov === :periodic && _fail(:plan, "hsgp :$(hb.id): a " *
-                "periodic basis has no domain (drop `domain=`)")
-            length(hb.domain) == length(hb.axes) || _fail(:plan,
-                "hsgp :$(hb.id): domain has $(length(hb.domain)) pairs " *
-                "for $(length(hb.axes)) axes (one `(lower, upper)` per axis)")
-            all(p -> isfinite(p[1]) && isfinite(p[2]) && p[1] < p[2],
-                hb.domain) || _fail(:plan, "hsgp :$(hb.id): domain pairs " *
-                "must be finite with lower < upper, got $(hb.domain)")
-        end
-        d = length(hb.axes)
-        d >= 1 ||
-            _fail(:plan, "hsgp :$(hb.id): takes at least one axis column")
-        length(hb.axes) == length(unique(hb.axes)) ||
-            _fail(:plan, "hsgp :$(hb.id): duplicate axis columns $(hb.axes)")
-        length(hb.K) == d ||
-            _fail(:plan, "hsgp :$(hb.id): K has $(length(hb.K)) entries " *
-                  "for $d axes (one mode count per axis)")
-        all(k -> k isa Int && k >= 1, hb.K) ||
-            _fail(:plan, "hsgp :$(hb.id): K must be positive integers, " *
-                  "got $(hb.K)")
-        length(hb.c) == d ||
-            _fail(:plan, "hsgp :$(hb.id): c has $(length(hb.c)) entries " *
-                  "for $d axes (one boundary factor per axis)")
-        all(c -> c isa Real && isfinite(Float64(c)) && Float64(c) > 1,
-            hb.c) ||
-            _fail(:plan, "hsgp :$(hb.id): c must be finite and exceed 1 " *
-                  "(L = c*max|x-mu| must cover the data), got $(hb.c)")
-        hb.iso isa Bool ||
-            _fail(:plan, "hsgp :$(hb.id): iso must be Bool, " *
-                  "got $(repr(hb.iso))")
-        hb.cov in (:exp_quad, :periodic) ||
-            _fail(:plan, "hsgp :$(hb.id): cov must be :exp_quad or " *
-                  ":periodic, got $(repr(hb.cov))")
-        if hb.cov === :periodic
-            # SB "periodic hsgp requires one isotropic axis" + the
-            # `_brm_gp_period` contract (required iff periodic); `c` is
-            # validated above but ignored (the SB mirror — no domain).
-            d == 1 ||
-                _fail(:plan, "hsgp :$(hb.id): periodic takes exactly " *
-                      "one axis column, got $d")
-            hb.iso ||
-                _fail(:plan, "hsgp :$(hb.id): periodic requires " *
-                      "iso=true (one isotropic axis)")
-            hb.period isa Real && isfinite(hb.period) && hb.period > 0 ||
-                _fail(:plan, "hsgp :$(hb.id): periodic requires a " *
-                      "finite positive period, got $(repr(hb.period))")
-            isempty(hb.fits) ||
-                _fail(:plan, "hsgp :$(hb.id): periodic carries no " *
-                      "fits (no domain to fit)")
-        else
-            isnan(hb.period) ||
-                _fail(:plan, "hsgp :$(hb.id): exp_quad carries no " *
-                      "period (got $(repr(hb.period)) — period is " *
-                      "meaningful only with cov=:periodic)")
-        end
-        # Fits are bind products (empty pre-bind); a hand-built bound plan
-        # carries one finite (mu, L) per axis with L > 0.
-        isempty(hb.fits) || length(hb.fits) == d ||
-            _fail(:plan, "hsgp :$(hb.id): fits has $(length(hb.fits)) " *
-                  "entries for $d axes (bind fills one (mu, L) per axis)")
-        for (mu, L) in hb.fits
-            isfinite(mu) && isfinite(L) && L > 0 ||
-                _fail(:plan, "hsgp :$(hb.id): fit (mu, L) must be finite " *
-                      "with L > 0, got ($mu, $L)")
-        end
-    end
-    # Basis linkage: every summand names an existing basis; every basis
-    # feeds exactly one summand (one target per basis — a dangling basis
-    # would sample dead parameters, a double use double-counts).
-    uses = Dict{Symbol,Int}(id => 0 for id in ids)
-    for pred in plan.predictors, t in pred.terms
-        t.kind === HSGPSummandTerm || continue
-        haskey(t.options, :hsgp_id) ||
-            _fail(t.label, "hsgp summand carries no hsgp_id option")
-        sid = t.options.hsgp_id
-        haskey(uses, sid) ||
-            _fail(t.label, "hsgp summand addresses unknown basis :$sid")
-        uses[sid] += 1
-    end
-    for (id, n) in uses
-        n == 1 || _fail(:plan,
-            "hsgp :$id is used by $n summands — exactly one " *
-            "(one target per basis)")
-    end
-    return nothing
-end
-
-function _validate_hsgp_data(plan::StructuralPlan)
-    for hb in plan.hsgp_bases
-        for c in hb.axes
-            haskey(plan.columns, c) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
-                      "not bound")
-            _is_derived(plan, c) &&
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
-                      "be raw data (the bind-time fit needs bound values)")
-            axiscol =
-                _vector_column(plan.columns, c, hb.label, "hsgp axis column")
-            eltype(axiscol) <: Real ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
-                      "be numeric, got $(eltype(axiscol))")
-            if hb.cov === :periodic
-                # SB `_brm_gp_axes`: finite values (no degeneracy gate —
-                # a constant axis is a usable periodic domain).
-                all(isfinite, axiscol) ||
-                    _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
-                          "must be finite")
-            end
-        end
-        if hb.cov === :periodic
-            isempty(hb.fits) ||
-                _fail(hb.label, "hsgp :$(hb.id): periodic carries no " *
-                      "fits (no domain to fit)")
-        else
-            length(hb.fits) == length(hb.axes) ||
-                _fail(hb.label, "hsgp :$(hb.id): fits not filled at bind " *
-                      "(one (mu, L) per axis)")
-        end
-    end
-    return nothing
-end
-
-# Compatibility representation only: old hand-built event-LP plans would
-# otherwise mint parameters without authored statements (decision 10ldrvz).
-function _validate_event_lps(plan::StructuralPlan)
-    isempty(plan.event_lps) || _fail(:plan,
-        "implicit event-LP parameters are retired; use the linear_pk_log_f library submodel")
-    return nothing
-end
-
-# 7-arg event-LP cell calls a grouped cell makes (schedule, arg2):
-# lenient collection — the cell walker owns precise rejection. Eight
-# expr args (fn + schedule + log_F + 5 LPs) is the literal event form
-# (NOT arity-relative: the AUC sibling shares the shape under its own
-# arity, and a relative rule would miss it).
-function _event_lp_calls(kp::KernelPlate)
-    calls = Tuple{Symbol,Symbol}[]
-    for (_, ex) in kp.assignments
-        _collect_event_lp_calls!(calls, ex)
-    end
-    return calls
-end
-
-function _collect_event_lp_calls!(calls::Vector{Tuple{Symbol,Symbol}}, ex)
+function _expr_names!(out::Set{Symbol}, ex)
+    ex isa Symbol && (push!(out, ex); return nothing)
     ex isa Expr || return nothing
-    if ex.head === :call && length(ex.args) == 8 &&
-            ex.args[1] isa Symbol && ex.args[1] in CELL_FNS &&
-            ex.args[2] isa Symbol && ex.args[3] isa Symbol
-        push!(calls, (ex.args[2], ex.args[3]))
-    end
     for a in ex.args
-        _collect_event_lp_calls!(calls, a)
+        _expr_names!(out, a)
     end
     return nothing
 end
 
-# Kernel (KernelPlate) structure: everything provable without data.
-# v2: N kernel plates per model (panel plates compose freely; at most
-# one grouped plate — multi-schedule grouped models are a sequenced
-# follow-up). Top-level responses retain their own axes beside the
-# kernel-managed likelihood lanes. Panel plates (no schedules) follow
-# `_validate_panel_kernel` (grouping ABSENT — implicit 1:n subjects,
-# structural, no sentinel, pinned here + tests); grouped plates follow
-# `_validate_grouped_kernel`.
-function _validate_kernels(plan::StructuralPlan)
-    plates = plan.kernel_plates
-    isempty(plates) && return nothing
-    # A predictor shared by an observation and a subject-level kernel
-    # argument still has to satisfy the predictor-level contract.
-    for kp in plates, (p, _) in kp.lp_args
-        _predictor_level(plan, p)
-    end
-    ngrouped = count(_is_grouped_kernel, plates)
-    ngrouped <= 1 ||
-        _fail(:plan, "v2 admits at most one grouped kernel plate per " *
-              "model (got $ngrouped — sequenced follow-up)")
-    # Name hygiene + collisions (result, slice params, cell locals) live in
-    # the global `_validate_name_tables` gate via `_kernel_all_names`.
-    for kp in plates
-        _check_name_hygiene(kp.label)
-        if kp.subjects isa Int
-            kp.subjects > 0 ||
-                _fail(kp.label, "subject count must be a positive integer, " *
-                      "got $(kp.subjects)")
-        end
-        if _is_grouped_kernel(kp)
-            _validate_grouped_kernel(plan, kp)
-        else
-            _validate_panel_kernel(plan, kp)
-        end
-    end
-    return nothing
-end
-
-# Panel-kernel structure (see `_validate_kernels`).
-function _validate_panel_kernel(plan::StructuralPlan, kp::KernelPlate)
-    kp.subjects === nothing &&
-        _fail(kp.label, "panel plates take a subject count (an integer " *
-              "or a dims-key name); only schedule-fed kernels derive it " *
-              "from data")
-    length(kp.obs) <= 1 ||
-        _fail(kp.label, "panel admits at most one in-cell observation " *
-              "(got $(length(kp.obs)))")
-    isempty(kp.lp_args) ||
-        _fail(kp.label, "panel plates take no LP args (LP args are the " *
-              "grouped form — declare a schedule)")
-    if kp.timepoints isa Int
-        kp.timepoints > 0 ||
-            _fail(kp.label, "timepoint count must be a positive integer, " *
-                  "got $(kp.timepoints)")
-    end
-    slices = kp.slices
-    isempty(slices) &&
-        _fail(kp.label, "kernel plate `$(kp.result)` takes at least one slice")
-    cols = [c for (c, _, _) in slices]
-    length(unique(cols)) == length(cols) ||
-        _fail(kp.label, "duplicate slice columns $(cols)")
-    params = [p for (_, p, _) in slices]
-    for (_, _, kind) in slices
-        kind in (:vector, :scalar, :unknown) ||
-            _fail(kp.label, "slice kind must be :vector, :scalar, or " *
-                  ":unknown (pre-bind), got $(repr(kind))")
-    end
-    # Cell assignments in order: each RHS sees slice params + earlier
-    # locals + model-scope scalars only (cross-cell refs fail closed).
-    known = union(Set{Symbol}(params), _union_names(plan))
-    cell_locals = Set{Symbol}()
-    for (nm, ex) in kp.assignments
-        _collect_kernel_cell_refs!(Symbol[], ex, kp, known)
-        push!(known, nm)
-        push!(cell_locals, nm)
-    end
-    for obs in kp.obs
-        _validate_kernel_obs_ref(kp, obs, params, known, false)
-    end
-    kp.collected in union(Set{Symbol}(params), cell_locals) ||
-        _fail(kp.label, "collected result `$(kp.collected)` is not a cell " *
-              "name (slice param or cell-local assignment)")
-    return nothing
-end
-
-# One in-cell observation node (panel and grouped share the shape):
-# response a slice param; panel the scalar response-space set, grouped
-# the joint families too; location/scale/params names-or-literals
-# resolving to cell/model names (literals finite; constrained-scale
-# domains per family below — bare cell args skip link inversion, so
-# the value itself must be valid. Positional-second args of the
-# multi-param JOINT families take no positivity).
-function _validate_kernel_obs_ref(kp::KernelPlate, obs::KernelObs,
-        params::Vector{Symbol}, known::Set{Symbol}, grouped::Bool)
-    obs.response in params ||
-        _fail(kp.label, "kernel obs response `$(obs.response)` is not a " *
-              "slice param (responses enter the cell as slices)")
-    if grouped
-        obs.family in (_KERNEL_SCALAR_FAMS..., CensoredAddpropnormalFam,
-                TgiCategoryFam, TgiResponseFam, TgiCensoredFam) ||
-            _fail(kp.label, "grouped kernels admit in-cell observations " *
-                  "`Normal.(...)`, `Bernoulli.(...)`, `Poisson.(...)`, " *
-                  "`NegativeBinomial2.(...)`, `Gamma.(...)`, `Beta.(...)`, " *
-                  "`StudentT.(...)`, `CensoredAddpropnormal.(...)`, " *
-                  "`TgiCategory.(...)`, `TgiResponse.(...)`, " *
-                  "`TgiCensored.(...)` only, got $(obs.family)")
-    else
-        obs.family in _KERNEL_SCALAR_FAMS ||
-            _fail(kp.label, "panel kernels admit scalar in-cell " *
-                  "observations `Normal.(...)`, `Bernoulli.(...)`, " *
-                  "`Poisson.(...)`, `NegativeBinomial2.(...)`, " *
-                  "`Gamma.(...)`, `Beta.(...)`, `StudentT.(...)` only, " *
-                  "got $(obs.family)")
-    end
-    obs.family in _KERNEL_SCALAR_FAMS &&
-        return _validate_kernel_scalar_obs(kp, obs, known, grouped)
-    # Joint families below (Gaussian rides the scalar path above).
-    for (nm, ref) in ((:location, obs.location), (:scale, obs.scale))
-        if ref isa Number && !(ref isa Bool)
-            # Joint families take no positivity (Gaussian rides the
-            # scalar path above).
-            isfinite(ref) ||
-                _fail(kp.label, "kernel obs $nm literal must be finite, got $ref")
-        elseif ref isa Symbol
-            ref in known ||
-                _fail(kp.label, "kernel obs $nm `$ref` is neither a cell " *
-                      "name nor a model-level scalar (cross-cell refs " *
-                      "fail closed)")
-            grouped && ref in _lp_cell_params(kp) &&
-                _fail(kp.label, "kernel obs $nm `$ref` is an LP cell " *
-                      "param — gather explicitly (`$ref[subj_map]` " *
-                      "with a bound subject column; bare LP cell " *
-                      "params do not lower as obs args)")
-        else
-            _fail(kp.label, "kernel obs $nm must be a cell/model name or " *
-                  "a numeric literal, got $(repr(ref))")
-        end
-    end
-    for ref in obs.params
-        if ref isa Number && !(ref isa Bool)
-            isfinite(ref) ||
-                _fail(kp.label, "kernel obs params literal must be " *
-                      "finite, got $ref")
-        elseif ref isa Symbol
-            ref in known ||
-                _fail(kp.label, "kernel obs params `$ref` is neither a " *
-                      "cell name nor a model-level scalar (cross-cell " *
-                      "refs fail closed)")
-            grouped && ref in _lp_cell_params(kp) &&
-                _fail(kp.label, "kernel obs params `$ref` is an LP cell " *
-                      "param — gather explicitly (`$ref[subj_map]` " *
-                      "with a bound subject column; bare LP cell " *
-                      "params do not lower as obs args)")
-        else
-            _fail(kp.label, "kernel obs params must be a cell/model name " *
-                  "or a numeric literal, got $(repr(ref))")
-        end
-    end
-    return nothing
-end
-
-# One scalar response-space in-cell observation (v2): shape rules per
-# family (1-arg Bernoulli/Poisson leave `scale === nothing`; StudentT
-# carries sigma in `params`), then per-slot validation. Symbol refs
-# resolve to cell/model names (LP cell params gather explicitly, the
-# grouped precedent); literals prove constrained-scale domains (the
-# mixture-literal precedent — bare cell args skip link inversion, so
-# the value itself must be valid).
-function _validate_kernel_scalar_obs(kp::KernelPlate, obs::KernelObs,
-        known::Set{Symbol}, grouped::Bool)
-    fam = obs.family
-    link = _kernel_obs_link(obs)
-    (link === IdentityLink ||
-        (fam === BernoulliLogitFam && link === LogitLink) ||
-        (fam === PoissonLogFam && link === LogLink)) ||
-        _fail(kp.label, "in-cell $fam does not take link $link")
-    one_arg = fam === BernoulliLogitFam || fam === PoissonLogFam
-    if one_arg
-        obs.scale === nothing ||
-            _fail(kp.label, "$fam in-cell observations take their " *
-                  "location only (got a scale slot)")
-    else
-        obs.scale === nothing &&
-            _fail(kp.label, "$fam in-cell observations take location + " *
-                  "scale (got location only)")
-    end
-    want_params = fam === StudentTFam ? 1 : 0
-    length(obs.params) == want_params ||
-        _fail(kp.label, "$fam in-cell observations take " *
-              (want_params == 0 ? "no `params`" :
-               "exactly one `params` entry (sigma)") *
-              " (got $(obs.params))")
-    _validate_kernel_obs_arg(kp, obs, :location, obs.location, known, grouped)
-    obs.scale === nothing ||
-        _validate_kernel_obs_arg(kp, obs, :scale, obs.scale, known, grouped)
-    for ref in obs.params
-        _validate_kernel_obs_arg(kp, obs, :params, ref, known, grouped)
-    end
-    return nothing
-end
-
-function _validate_kernel_obs_arg(kp::KernelPlate, obs::KernelObs,
-        slot::Symbol, ref, known::Set{Symbol}, grouped::Bool)
-    if ref isa Number && !(ref isa Bool)
-        _kernel_obs_literal_domain(kp, obs, slot, ref)
-        return nothing
-    elseif ref isa Symbol
-        ref in known ||
-            _fail(kp.label, "kernel obs $slot `$ref` is neither a cell " *
-                  "name nor a model-level scalar (cross-cell refs " *
-                  "fail closed)")
-        grouped && ref in _lp_cell_params(kp) &&
-            _fail(kp.label, "kernel obs $slot `$ref` is an LP cell " *
-                  "param — gather explicitly (`$ref[subj_map]` " *
-                  "with a bound subject column; bare LP cell " *
-                  "params do not lower as obs args)")
-        return nothing
-    else
-        _fail(kp.label, "kernel obs $slot must be a cell/model name or " *
-              "a numeric literal, got $(repr(ref))")
-    end
-end
-
-# Constrained-scale domain of one scalar-obs literal arg, per family
-# (slot roles: Bernoulli location = p; Poisson location = mu; NB2 =
-# (mu, phi); Gamma = Distributions (shape, scale); Beta = (a, b)
-# shapes; StudentT = (nu, mu, sigma) in (location, scale, params)).
-function _kernel_obs_literal_domain(kp::KernelPlate, obs::KernelObs,
-        slot::Symbol, v::Real)
-    fam = obs.family
-    if fam === GaussianFam || fam === CauchyFam
-        # v1 message, byte-preserved.
-        positive = slot === :scale
-        (isfinite(v) && (!positive || v > 0)) ||
-            _fail(kp.label, "kernel obs $slot literal must be finite" *
-                  (positive ? " positive" : "") * ", got $v")
-        return nothing
-    end
-    isfinite(v) ||
-        _fail(kp.label, "kernel obs $slot literal must be finite, got $v")
-    slot === :location && _kernel_obs_link(obs) !== IdentityLink && return nothing
-    ok = if fam === BinomialProbFam
-        slot === :location ? (v isa Integer && v >= 0) : 0 <= v <= 1
-    elseif fam === BernoulliLogitFam
-        0 <= v <= 1
-    elseif fam === PoissonLogFam
-        v >= 0
-    elseif fam === NegativeBinomial2Fam
-        slot === :scale ? v > 0 : v >= 0
-    elseif fam === GammaLogFam || fam === BetaLogitFam
-        v > 0
-    elseif fam === StudentTFam
-        slot === :scale ? true : v > 0
-    else
-        true
-    end
-    ok && return nothing
-    domain, role = if fam === BinomialProbFam
-        slot === :location ? ("a nonnegative integer", "n") : ("a probability in [0, 1]", "p")
-    elseif fam === BernoulliLogitFam
-        "a probability in [0, 1]", "p"
-    elseif fam === PoissonLogFam
-        "a nonnegative mean", "mu"
-    elseif fam === NegativeBinomial2Fam
-        slot === :location ? ("a nonnegative mean", "mu") :
-            ("positive", "phi")
-    elseif fam === GammaLogFam
-        slot === :location ? ("positive", "alpha") : ("positive", "scale")
-    elseif fam === BetaLogitFam
-        slot === :location ? ("positive", "a") : ("positive", "b")
-    elseif fam === StudentTFam
-        slot === :location ? ("positive degrees of freedom", "nu") :
-            ("positive", "sigma")
-    else
-        "positive", string(slot)
-    end
-    _fail(kp.label, "kernel obs $slot literal $v is not $domain " *
-          "(response-space $role)")
-end
-
-"""Term kinds a subject-level predictor may carry in grouped kernels
-(design over subject columns; summands and per-cell latents need
-row-alignment work and fail closed). `VaryingEffectTerm` is sound here:
-subject rows ARE subjects, so the draws' per-level `r` needs no gather —
-`_ppl_gidx_<group>` is positional 1:n_sub (level order must match
-subject order; the joint parity harness proves it numerically)."""
-const _SUBJECT_TERM_KINDS =
-    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, VaryingEffectTerm)
-
-# Grouped-kernel structure (see `_validate_kernels`): schedules resolve,
-# LP args name subject-exclusive identity predictors with admitted terms,
-# the cell follows the grouped vocabulary, obs is a non-empty list.
-function _validate_grouped_kernel(plan::StructuralPlan, kp::KernelPlate)
-    length(kp.schedules) == 1 ||
-        _fail(kp.label, "grouped v1 takes exactly one schedule " *
-              "(got $(length(kp.schedules)) — multi-schedule kernels " *
-              "are sequenced after the PK slice)")
-    kp.timepoints === nothing ||
-        _fail(kp.label, "grouped kernels take no timepoints (ragged axes " *
-              "have no rectangular T)")
-    sched = only(kp.schedules)
-    raw = _sched_raw_columns(sched)
-    length(unique(raw)) == length(raw) ||
-        _fail(kp.label, "schedule `$(sched.name)` reuses a raw column " *
-              "($(raw)) — obs/dose/extra axes need distinct columns)")
-    slices = kp.slices
-    cols = [c for (c, _, _) in slices]
-    length(unique(cols)) == length(cols) ||
-        _fail(kp.label, "duplicate slice columns $(cols)")
-    params = [p for (_, p, _) in slices]
-    for (_, _, kind) in slices
-        kind in (:response, :unknown) ||
-            _fail(kp.label, "grouped slice kind must be :response (bound) " *
-                  "or :unknown (pre-bind), got $(repr(kind))")
-    end
-    isempty(kp.lp_args) &&
-        _fail(kp.label, "grouped kernels take at least one LP arg " *
-              "(`kernel(resp, lp...; subjects)` — LP values gather per " *
-              "subject in-cell)")
-    pnames = [p for (p, _) in kp.lp_args]
-    length(unique(pnames)) == length(pnames) ||
-        _fail(kp.label, "duplicate LP-arg predictors $(pnames)")
-    cparams = [c for (_, c) in kp.lp_args]
-    length(unique(cparams)) == length(cparams) ||
-        _fail(kp.label, "duplicate LP-arg cell params $(cparams)")
-    for (p, _) in kp.lp_args
-        i = findfirst(q -> q.name === p, plan.predictors)
-        i === nothing &&
-            _fail(kp.label, "kernel LP arg `$p` is not a predictor (LP " *
-                  "args name subject-level predictors; model scalars " *
-                  "enter the cell as globals)")
-        pred = plan.predictors[i]
-        _predictor_level(plan, p) === :subject ||
-            _fail(kp.label, "kernel LP arg `$p` is unreachable " *
-                  "(internal: mixed-level predictors fail in " *
-                  "`_predictor_level`)")
-        for t in pred.terms
-            t.kind in _SUBJECT_TERM_KINDS ||
-                _fail(kp.label, "subject predictor `$p` carries a " *
-                      "$(t.kind) term (grouped v1 admits " *
-                      "$(_SUBJECT_TERM_KINDS) — summands and per-cell " *
-                      "latents are sequenced after the PK slice)")
-        end
-    end
-    # Cell assignments in order: slice params + LP cell params + earlier
-    # locals + model-scope values (schedule handles are compile-time and
-    # enter only as call first-args / gather roots — never as values).
-    known = union(Set{Symbol}(params),
-        Set{Symbol}(c for (_, c) in kp.lp_args), _all_names(plan))
-    schednames = Set{Symbol}(s.name for s in kp.schedules)
-    cell_locals = Set{Symbol}()
-    scalar_names = Set{Symbol}(p.name for p in plan.parameters)
-    union!(scalar_names,Set{Symbol}(a.name for a in plan.assignments))
-    for (nm, ex) in kp.assignments
-        _collect_grouped_cell_refs!(Symbol[], ex, kp, known, schednames)
-        for (source,_) in _collect_grouped_gather_uses(ex)
-            source isa Expr || continue
-            all(a -> a isa Number || a isa Symbol && a in scalar_names,source.args) ||
-                _fail(kp.label,"literal gather entries must be numeric literals or model scalar names")
-        end
-        push!(known, nm)
-        push!(cell_locals, nm)
-    end
-    for obs in kp.obs
-        _validate_kernel_obs_ref(kp, obs, params, known, true)
-    end
-    kp.collected in union(Set{Symbol}(params), cell_locals) ||
-        _fail(kp.label, "collected result `$(kp.collected)` is not a cell " *
-              "name (slice param or cell-local assignment)")
-    return nothing
-end
-
-# Kernel cell vocabulary: the derived-column elementwise walker with a
-# cell name environment (slice params + earlier locals + model scalars).
-# Dotted ops/math, undotted arithmetic (canonicalized at bind),
-# `ifelse`, bare names and numeric literals; reductions, whole-column
-# functions, indexing, loops, branches, nested observations, and unknown
-# names fail closed.
-function _collect_kernel_cell_refs!(refs, ex, kp::KernelPlate, known::Set{Symbol})
-    label = kp.label
-    ex isa Number && return nothing
-    ex isa LineNumberNode && return nothing
-    if ex isa Symbol
-        ex in known ||
-            _fail(label, "cell expression references unknown name `$ex` " *
-                  "(slices + earlier cell locals + model-level scalars only)")
-        push!(refs, ex)
-        return nothing
-    end
-    ex isa Expr ||
-        _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
-    head = ex.head
-    if head === :call
-        fn = ex.args[1]
-        if fn isa Symbol && fn in ELEMENTWISE_OPS
-            for arg in ex.args[2:end]
-                _collect_kernel_cell_refs!(refs, arg, kp, known)
-            end
-            return nothing
-        end
-        if fn isa Symbol && fn in REDUCTION_FNS
-            length(ex.args) == 2 || _fail(label, "cell reduction `$fn` takes one value")
-            _collect_kernel_cell_refs!(refs, ex.args[2], kp, known)
-            return nothing
-        end
-        if fn isa Symbol && (fn in ASSIGNMENT_FNS || fn === :logistic)
-            # Undotted arithmetic is admitted syntactically here (the
-            # emitter passes scalar-context user code verbatim — Ex1's
-            # `ke = CLi / Vci`); bind canonicalizes with slice-kind
-            # provenance (dotify over flat vectors, fail closed over 2+
-            # genuinely-vector operands). Unary +/- stay as-is (valid on
-            # vectors and scalars alike).
-            for arg in ex.args[2:end]
-                _collect_kernel_cell_refs!(refs, arg, kp, known)
-            end
-            return nothing
-        end
-        fn isa Symbol && startswith(string(fn), ".") &&
-            _fail(label, "dotted operator $fn is not in the panel-v1 " *
-                         "cell vocabulary")
-        return _fail(label, "call `$fn` is not in the panel-v1 cell " *
-                            "vocabulary (elementwise + reductions only)")
-    end
-    head === :. && return _collect_kernel_cell_dot!(refs, ex, kp, known)
-    head === :ref &&
-        _fail(label, "indexing does not lower in a cell (flat vectors " *
-                     "keep full length — no `[...]`)")
-    head === :(=) && _fail(label, "nested assignment does not lower in a cell")
-    head === :kw &&
-        _fail(label, "keyword arguments do not lower in a cell")
-    return _fail(label, "unsupported expression head $head in a cell " *
-                        "(elementwise expressions only)")
-end
-
-function _collect_kernel_cell_dot!(refs, ex, kp::KernelPlate, known::Set{Symbol})
-    label = kp.label
-    length(ex.args) == 2 && ex.args[1] isa Symbol && ex.args[2] isa Expr &&
-        ex.args[2].head === :tuple ||
-        return _fail(label, "field access does not lower in a cell " *
-                            "(dotted calls take `f.(...)`)")
-    f = ex.args[1]
-    args = ex.args[2].args
-    if f === :ifelse
-        length(args) == 3 ||
-            _fail(label, "`ifelse` takes `ifelse.(condition, x, y)`")
-        _collect_kernel_cell_condition!(refs, args[1], kp, known)
-        for arg in args[2:end]
-            _collect_kernel_cell_refs!(refs, arg, kp, known)
-        end
-        return nothing
-    end
-    f in _KERNEL_ELEMENTWISE_FNS ||
-        _fail(label, "dotted call `$f.(...)` is not in the panel-v1 cell " *
-                     "vocabulary")
-    for arg in args
-        _collect_kernel_cell_refs!(refs, arg, kp, known)
-    end
-    return nothing
-end
-
-# Bind-time cell canonicalization (slice-kind provenance): undotted
-# arithmetic over flat vectors takes dotted-canonical form (the surface
-# `_canonical_expr` precedent — the emitter passes scalar-context user
-# code verbatim, e.g. Ex1's `ke = CLi / Vci`); pure-scalar
-# (global/literal) combos stay as-is; undotted operators over 2+
-# genuinely-vector operands fail closed naming the dotted fix (vector
-# `*`/`/` is meaningless in the cell). Shapes are CELL shapes
-# (:scalar for scalar slices + scalar-shaped locals, :vector for vector
-# slices + vector-shaped locals); derivation (slice/cell vs pure scalar)
-# drives dotify. Idempotent: bind applies it for early errors, the
-# generator re-applies it for hand-bound plans.
-const _KERNEL_UNDOTTED_ARITHMETIC = (:+, :-, :*, :/, :^)
-
-function _kernel_cell_shapes(kp::KernelPlate)
-    shapes = Dict{Symbol,Symbol}()
-    for (_, p, kind) in kp.slices
-        kind in (:vector, :scalar) ||
-            _fail(kp.label, "slice `$p` kind unresolved " *
-                  "(bind_data resolves :unknown from lengths)")
-        shapes[p] = kind
-    end
-    return shapes
-end
-
-function _canonicalize_kernel_assignments(kp::KernelPlate)
-    shapes = _kernel_cell_shapes(kp)
-    out = Pair{Symbol,Any}[]
-    for (nm, ex) in kp.assignments
-        canon, shape = _canonicalize_kernel_cell(ex, kp, shapes)
-        shapes[nm] = shape
-        push!(out, nm => canon)
-    end
+function _expr_names(ex)::Set{Symbol}
+    out = Set{Symbol}()
+    _expr_names!(out, ex)
     return out
-end
-
-function _canonicalize_kernel_cell(ex, kp::KernelPlate, shapes::Dict{Symbol,Symbol})
-    label = kp.label
-    ex isa Number && return (ex, :scalar)
-    ex isa LineNumberNode && return (ex, :scalar)
-    ex isa Symbol && return (ex, get(shapes, ex, :scalar))
-    ex isa Expr || _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
-    head = ex.head
-    if head === :call
-        isempty(ex.args) && _fail(label, "operator needs operands")
-        fn = ex.args[1]
-        if fn isa Symbol && fn in ELEMENTWISE_OPS
-            cargs = Any[]
-            shape = :scalar
-            for arg in ex.args[2:end]
-                carg, ashape = _canonicalize_kernel_cell(arg, kp, shapes)
-                push!(cargs, carg)
-                ashape === :vector && (shape = :vector)
-            end
-            return (Expr(:call, fn, cargs...), shape)
-        end
-        if fn isa Symbol && fn in _KERNEL_UNDOTTED_ARITHMETIC
-            operands = ex.args[2:end]
-            isempty(operands) && _fail(label, "operator `$fn` needs operands")
-            # Unary +/- stay as-is (valid on vectors and scalars alike).
-            if length(operands) == 1
-                carg, shape = _canonicalize_kernel_cell(only(operands), kp, shapes)
-                return (Expr(:call, fn, carg), shape)
-            end
-            cargs = Any[]
-            nvec = 0
-            derived = false
-            for arg in operands
-                carg, ashape = _canonicalize_kernel_cell(arg, kp, shapes)
-                push!(cargs, carg)
-                ashape === :vector && (nvec += 1)
-                derived |= _kernel_operand_derived(arg, shapes)
-            end
-            nvec >= 2 && _fail(label, "undotted `$fn` over vector series " *
-                                      "does not lower — write the dotted " *
-                                      "form (`$(Symbol(:., fn))`)")
-            shape = nvec >= 1 ? :vector : :scalar
-            derived || return (Expr(:call, fn, cargs...), shape)
-            return (Expr(:call, Symbol(:., fn), cargs...), shape)
-        end
-        if fn isa Symbol && fn in _KERNEL_ELEMENTWISE_FNS
-            cargs = Any[]
-            shape = :scalar
-            derived = false
-            for arg in ex.args[2:end]
-                carg, ashape = _canonicalize_kernel_cell(arg, kp, shapes)
-                push!(cargs, carg)
-                ashape === :vector && (shape = :vector)
-                derived |= _kernel_operand_derived(arg, shapes)
-            end
-            derived || return (Expr(:call, fn, cargs...), shape)
-            return (Expr(:., fn, Expr(:tuple, cargs...)), shape)
-        end
-        if fn isa Symbol && fn in REDUCTION_FNS
-            length(ex.args) == 2 || _fail(label, "cell reduction `$fn` takes one value")
-            arg, _ = _canonicalize_kernel_cell(ex.args[2], kp, shapes)
-            return (Expr(:call, fn, arg), :scalar)
-        end
-        return _fail(label, "call `$fn` is not in the panel-v1 cell vocabulary")
-    end
-    if head === :.
-        length(ex.args) == 2 && ex.args[1] isa Symbol && ex.args[2] isa Expr &&
-            ex.args[2].head === :tuple ||
-            _fail(label, "field access does not lower in a cell " *
-                         "(dotted calls take `f.(...)`)")
-        f = ex.args[1]
-        (f === :ifelse || f in _KERNEL_ELEMENTWISE_FNS) ||
-            _fail(label, "dotted call `$f.(...)` is not in the panel-v1 " *
-                         "cell vocabulary")
-        f === :ifelse &&
-            length(ex.args[2].args) != 3 &&
-            _fail(label, "`ifelse` takes `ifelse.(condition, x, y)`")
-        cargs = Any[]
-        shape = :scalar
-        for arg in ex.args[2].args
-            carg, ashape = _canonicalize_kernel_cell(arg, kp, shapes)
-            push!(cargs, carg)
-            ashape === :vector && (shape = :vector)
-        end
-        return (Expr(:., f, Expr(:tuple, cargs...)), shape)
-    end
-    return _fail(label, "unsupported expression head $head in a cell " *
-                        "(elementwise expressions only)")
-end
-
-# An operand is slice/cell-derived (a flat vector at codegen) iff it
-# mentions a slice param or cell local; pure global/literal subtrees stay
-# scalar and their undotted operators are kept as-is.
-function _kernel_operand_derived(ex, shapes::Dict{Symbol,Symbol})
-    ex isa Number && return false
-    ex isa LineNumberNode && return false
-    ex isa Symbol && return haskey(shapes, ex)
-    ex isa Expr || return false
-    return any(a -> _kernel_operand_derived(a, shapes), ex.args)
-end
-
-function _collect_kernel_cell_condition!(refs, ex, kp::KernelPlate, known::Set{Symbol})
-    label = kp.label
-    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-            ex.args[1] in ELEMENTWISE_COMPARISONS
-        return _collect_kernel_cell_refs!(refs, ex, kp, known)
-    end
-    ex isa Symbol || return _fail(label, "`ifelse` condition must be a " *
-                                          "comparison (`x .< y`) or a bare " *
-                                          "cell/model boolean name")
-    ex in known ||
-        _fail(label, "`ifelse` condition `$ex` is not a cell or " *
-                     "model-level name")
-    push!(refs, ex)
-    return nothing
-end
-
-# Grouped-kernel cell vocabulary: calls to CELL_FNS (schedule first),
-# schedule-map gathers (`reads[sched.obs_map]`) and prep-map gathers
-# (`v[map]` with a bound integer column), dotted ops/math, undotted
-# arithmetic over scalars, `ifelse`, bare names and numeric literals.
-# Reductions, whole-column functions, other indexing, loops, branches,
-# nested observations, and unknown names fail closed. Shapes
-# (scalar/obs-axis/read-space) resolve at bind
-# (`_grouped_cell_shapes`); this walker checks names + call/gather
-# structure only.
-#
-# LP cell params are per-subject scalars: bare uses admit ONLY as
-# direct cell-call args (`lp_ok`, threaded below) or gather sources
-# (checked in `_collect_grouped_cell_gather!`) — every other bare use
-# fails closed (flat verbatim emission cannot resolve a per-subject
-# name, so the LP value gathers per row explicitly).
-"""LP cell params of a grouped plate (the per-subject gatherable names)."""
-_lp_cell_params(kp::KernelPlate) = Set{Symbol}(c for (_, c) in kp.lp_args)
-"""Response-slice params of a grouped plate (gather leaves, never sources)."""
-_slice_params(kp::KernelPlate) = Set{Symbol}(p for (_, p, _) in kp.slices)
-function _collect_grouped_cell_refs!(refs, ex, kp::KernelPlate,
-        known::Set{Symbol}, schednames::Set{Symbol}, lp_ok::Bool = false)
-    label = kp.label
-    ex isa Number && return nothing
-    ex isa LineNumberNode && return nothing
-    if ex isa Symbol
-        ex in schednames &&
-            _fail(label, "schedule `$ex` is a compile-time handle, not a " *
-                  "value (pass it as a cell-call first arg or a gather " *
-                  "root: `linear_pk_read_locs($ex, ...)` / " *
-                  "`reads[$ex.obs_map]`)")
-        ex in known ||
-            _fail(label, "cell expression references unknown name `$ex` " *
-                  "(slices + LP cell params + earlier cell locals + " *
-                  "model-level scalars only)")
-        !lp_ok && ex in _lp_cell_params(kp) &&
-            _fail(label, "cell expression uses bare LP cell param `$ex` " *
-                  "— gather explicitly (`$ex[subj_map]` with a bound " *
-                  "subject column) or pass `$ex` to a cell call " *
-                  "(per-subject names do not lower in flat verbatim code)")
-        push!(refs, ex)
-        return nothing
-    end
-    ex isa Expr ||
-        _fail(label, "unsupported literal $(repr(ex)) (numeric literals only)")
-    head = ex.head
-    if head === :call
-        fn = ex.args[1]
-        if fn isa Symbol && fn in ELEMENTWISE_OPS
-            for arg in ex.args[2:end]
-                _collect_grouped_cell_refs!(refs, arg, kp, known, schednames)
-            end
-            return nothing
-        end
-        if fn isa Symbol && fn in REDUCTION_FNS
-            return _fail(label, "reduction `$fn` does not lower in a cell " *
-                                "(aggregate in the obs likelihood, not " *
-                                "the cell)")
-        end
-        if fn isa Symbol && fn in CELL_FNS
-            args = ex.args[2:end]
-            want = CELL_FN_ARITY[fn]
-            # The event-LP form threads the provider's flat vector
-            # second (SB position, after the schedule): v1 takes it
-            # optionally (6 or 7 args), the AUC cell takes it
-            # mandatorily (7 args — the runtime has no LP-less form).
-            seven = length(args) == want + 1
-            admit = fn === :linear_pk_read_locs ?
-                (length(args) == want || seven) : length(args) == want
-            admit ||
-                _fail(label, "cell call `$fn` takes $want arguments " *
-                      "(a schedule plus $(want - 1) cell/model names)" *
-                      (fn === :linear_pk_read_locs ?
-                       " or $(want + 1) with an event vector second" :
-                       fn === :linear_pk_read_locs_auc ?
-                       " with an event vector second" : "") *
-                      ", got $(length(args))")
-            s = args[1]
-            s isa Symbol && s in schednames ||
-                _fail(label, "cell call `$fn` takes a declared schedule " *
-                      "first (got $(repr(s)) — admitted schedules: " *
-                      "$(sort!(collect(schednames))))")
-            rest = args[2:end]
-            if (fn === :linear_pk_read_locs && seven) || fn === :linear_pk_read_locs_auc
-                # An ordinary declared value supplies the event vector.
-                # Its axis follows this position, independent of its name.
-                args[2] isa Symbol && args[2] in known ||
-                    _fail(label, "cell call `$fn` second argument must " *
-                          "name a declared event vector (got $(repr(args[2])))")
-                push!(refs, args[2])
-                rest = args[3:end]
-            end
-            # Direct call args: the one verbatim position (besides
-            # gather sources) where bare LP cell params admit — the
-            # per-subject expansion resolves them. Nested positions
-            # keep the default (fail-early on shapes generation
-            # cannot resolve).
-            for arg in rest
-                _collect_grouped_cell_refs!(refs, arg, kp, known,
-                    schednames, true)
-            end
-            return nothing
-        end
-        if fn isa Symbol && fn in SEGMENT_CELL_FNS
-            args = ex.args[2:end]
-            want = SEGMENT_CELL_FN_ARITY[fn]
-            length(args) == want ||
-                _fail(label, "cell call `$fn` takes $want arguments " *
-                      "(a change vector + a cumulative-ends integer " *
-                      "column: `$fn(change, ends)`), got $(length(args))")
-            # The change series is an ordinary cell ref (bare LPs fail
-            # — a per-subject scalar is not a row series); the ends
-            # are a putative bind column (bind proves bound-ness +
-            # the segment contract).
-            _collect_grouped_cell_refs!(refs, args[1], kp, known,
-                schednames)
-            ends = args[2]
-            ends isa Symbol ||
-                _fail(label, "cell call `$fn` ends argument must be a " *
-                      "bound integer column name, got $(repr(ends))")
-            ends in schednames &&
-                _fail(label, "schedule `$ends` is a compile-time " *
-                      "handle, not a value (ends are a bound integer " *
-                      "column: `$fn(change, ends)`)")
-            ends in known &&
-                _collect_grouped_cell_refs!(refs, ends, kp, known,
-                    schednames)
-            return nothing
-        end
-        if fn isa Symbol && fn in ASSIGNMENT_FNS
-            for arg in ex.args[2:end]
-                _collect_grouped_cell_refs!(refs, arg, kp, known, schednames)
-            end
-            return nothing
-        end
-        fn isa Symbol && startswith(string(fn), ".") &&
-            _fail(label, "dotted operator $fn is not in the grouped-v1 " *
-                         "cell vocabulary")
-        return _fail(label, "call `$fn` is not in the grouped-v1 cell " *
-                            "vocabulary (cell calls: $(CELL_FNS))")
-    end
-    head === :. &&
-        return _collect_grouped_cell_dot!(refs, ex, kp, known, schednames)
-    if head === :ref
-        return _collect_grouped_cell_gather!(refs, ex, kp, known, schednames)
-    end
-    head === :(=) && _fail(label, "nested assignment does not lower in a cell")
-    head === :kw &&
-        _fail(label, "keyword arguments do not lower in a cell")
-    return _fail(label, "unsupported expression head $head in a cell " *
-                        "(calls + gathers + elementwise only)")
-end
-
-function _collect_grouped_cell_dot!(refs, ex, kp::KernelPlate,
-        known::Set{Symbol}, schednames::Set{Symbol})
-    label = kp.label
-    length(ex.args) == 2 && ex.args[1] isa Symbol && ex.args[2] isa Expr &&
-        ex.args[2].head === :tuple ||
-        return _fail(label, "field access does not lower in a cell " *
-                            "(dotted calls take `f.(...)`; schedule maps " *
-                            "gather as `reads[sched.obs_map]`)")
-    f = ex.args[1]
-    args = ex.args[2].args
-    if f === :ifelse
-        length(args) == 3 ||
-            _fail(label, "`ifelse` takes `ifelse.(condition, x, y)`")
-        _collect_grouped_cell_condition!(refs, args[1], kp, known, schednames)
-        for arg in args[2:end]
-            _collect_grouped_cell_refs!(refs, arg, kp, known, schednames)
-        end
-        return nothing
-    end
-    f in ELEMENTWISE_FNS ||
-        _fail(label, "dotted call `$f.(...)` is not in the grouped-v1 cell " *
-                     "vocabulary")
-    for arg in args
-        _collect_grouped_cell_refs!(refs, arg, kp, known, schednames)
-    end
-    return nothing
-end
-
-function _collect_grouped_cell_condition!(refs, ex, kp::KernelPlate,
-        known::Set{Symbol}, schednames::Set{Symbol})
-    label = kp.label
-    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-            ex.args[1] in ELEMENTWISE_COMPARISONS
-        return _collect_grouped_cell_refs!(refs, ex, kp, known, schednames)
-    end
-    ex isa Symbol || return _fail(label, "`ifelse` condition must be a " *
-                                          "comparison (`x .< y`) or a bare " *
-                                          "cell/model boolean name")
-    ex in known ||
-        _fail(label, "`ifelse` condition `$ex` is not a cell or " *
-                     "model-level name")
-    push!(refs, ex)
-    return nothing
-end
-
-# Admitted indexing shapes: `reads[sched.map]` (a cell vector
-# gathered by a schedule map, a static int vector at codegen) and
-# `v[map]` (gathered by a plain-Symbol bound integer column — prep
-# maps and subject columns). Sources are cell-call results, LP cell
-# params (the generator rewrites them to LP vectors), or cell locals;
-# slices and model scalars fail at shape (bind proves spaces).
-function _collect_grouped_cell_gather!(refs, ex, kp::KernelPlate,
-        known::Set{Symbol}, schednames::Set{Symbol})
-    label = kp.label
-    length(ex.args) == 2 || _fail(label, "indexing in a cell takes one " *
-        "index (`v[sched.map]` or `v[map]`), got $(repr(ex))")
-    vec, idx = ex.args[1], ex.args[2]
-    if vec isa Expr && vec.head === :vect
-        isempty(vec.args) && _fail(label,"literal gather source is empty")
-        for a in vec.args
-            _collect_grouped_cell_refs!(refs,a,kp,known,schednames)
-        end
-    else
-        vec isa Symbol && vec in known ||
-            _fail(label, "gather source must be a cell name or scalar vector literal, got $(repr(vec))")
-        push!(refs, vec)
-    end
-    if idx isa Symbol
-        idx in schednames &&
-            _fail(label, "schedule `$idx` is a compile-time handle, not " *
-                  "a value (gather by one of its maps: " *
-                  "`reads[$idx.obs_map]`)")
-        idx in known &&
-            _fail(label, "gather index `$idx` names a cell/model value " *
-                  "(gather indices are schedule maps like " *
-                  "`reads[sched.obs_map]` or bound integer columns — " *
-                  "typo'd column?)")
-        # A putative bind column: bind proves bound + integer-valued +
-        # range + length (shapes + prep validators).
-        return nothing
-    end
-    idx isa Expr && idx.head === :. && length(idx.args) == 2 &&
-        idx.args[1] isa Symbol && idx.args[2] isa QuoteNode ||
-        _fail(label, "gather index must be a schedule map " *
-              "(`reads[sched.obs_map]`) or a bound integer column, " *
-              "got $(repr(idx))")
-    s, m = idx.args[1], idx.args[2].value
-    s in schednames ||
-        _fail(label, "gather schedule `$s` is not declared (admitted: " *
-              "$(sort!(collect(schednames))))")
-    m in SCHEDULE_MAPS ||
-        _fail(label, "schedule `$s` has no map `$m` (admitted maps: " *
-              "$(SCHEDULE_MAPS))")
-    spec = only(sp for sp in kp.schedules if sp.name === s)
-    m in _sched_available_maps(spec, kp.assignments) ||
-        _fail(label, "schedule `$s` map `$m` is not available " *
-              "($(_sched_map_prereq(spec, m, kp.assignments)))")
-    return nothing
-end
-
-# Prerequisite guidance for an unavailable schedule map (the caller
-# proved `m` is a known map on a declared schedule — exactly one
-# condition below fires).
-function _sched_map_prereq(sched::LinearPKScheduleSpec, m::Symbol,
-        assignments::Vector{Pair{Symbol,Any}})
-    if m === :ecg_map || m === :tgi_map
-        ax = m === :ecg_map ? :ecg : :tgi
-        return "axis `$ax` is not declared (`$(sched.name) = " *
-               "linear_pk_schedule(..., $ax = (subj, time))`)"
-    end
-    if !_cell_has_auc_call(assignments)
-        return "`$m` needs an AUC cell call " *
-               "(`linear_pk_read_locs_auc`) in the cell"
-    end
-    return "`$m` needs the declared tgi axis (`$(sched.name) = " *
-           "linear_pk_schedule(..., tgi = (subj, time))`)"
-end
-
-# One declared extra read axis as builder input (`nothing` when
-# undeclared): both columns must be bound.
-function _grouped_schedule_axis(sched::LinearPKScheduleSpec,
-        columns::Dict{Symbol,ColumnData}, axis::Symbol, kp::KernelPlate)
-    spec = axis === :ecg ? sched.ecg : sched.tgi
-    spec === nothing && return nothing
-    for c in spec
-        haskey(columns, c) ||
-            _fail(kp.label, "schedule `$(sched.name)` $axis column `$c` " *
-                  "is not bound")
-    end
-    return (columns[spec[1]], columns[spec[2]])
-end
-
-# Build a grouped schedule from bound columns (shared by bind
-# resolution + exact-rebuild verification, so the two can never drift):
-# raw columns must be bound, extra axes ride when declared, builder
-# errors relabel to the kernel.
-function _build_grouped_schedule(plan::StructuralPlan, kp::KernelPlate,
-        columns::Dict{Symbol,ColumnData})
-    sched = only(kp.schedules)
-    for c in _sched_raw_columns(sched)
-        haskey(columns, c) ||
-            _fail(kp.label, "schedule `$(sched.name)` column `$c` is not bound")
-    end
-    combine = _schedule_combine_simultaneous(plan, sched.name)
-    ecg = _grouped_schedule_axis(sched, columns, :ecg, kp)
-    tgi = _grouped_schedule_axis(sched, columns, :tgi, kp)
-    return try
-        build_linear_pk_schedule(columns[sched.obs_subj],
-            columns[sched.obs_time], columns[sched.dose_subj],
-            columns[sched.dose_time], columns[sched.dose_amt];
-            combine_simultaneous = combine, ecg = ecg, tgi = tgi)
-    catch err
-        err isa ContractValidationError &&
-            _fail(kp.label, "schedule `$(sched.name)`: $(err.message)")
-        rethrow()
-    end
-end
-
-# Grouped-kernel bind checks: resolved subjects, schedule columns
-# verified by exact rebuild (hand-bound plans carry verified products,
-# never trusted ones — the scalar-expansion precedent), first-obs
-# response on the primary axis (foreign-axis responses ride later
-# observations), numeric finite slices, subject-predictor columns at
-# n_sub, proved cell shapes + per-obs axis agreement, nadir segment
-# contracts, gather-map prep contracts, TGI axis order.
-function _validate_grouped_kernel_data(plan::StructuralPlan, kp::KernelPlate)
-    kp.subjects isa Int ||
-        _fail(kp.label, "subjects dims key `$(kp.subjects)` unresolved " *
-              "(bind_data with dims first)")
-    n_sub = kp.subjects
-    length(kp.schedules) == 1 ||
-        _fail(kp.label, "grouped v1 takes exactly one schedule " *
-              "(got $(length(kp.schedules)))")
-    sched = only(kp.schedules)
-    built = _build_grouped_schedule(plan, kp, plan.columns)
-    built.n_subjects == n_sub ||
-        _fail(kp.label, "schedule `$(sched.name)` covers " *
-              "$(built.n_subjects) subjects ≠ subjects $n_sub")
-    for f in vcat(collect(_sched_materialized_fields(sched)),
-            _sched_extra_fields(sched, kp.assignments))
-        col = _sched_col_name(sched.name, f)
-        haskey(plan.columns, col) ||
-            _fail(kp.label, "schedule `$(sched.name)` product `$col` " *
-                  "missing (bind_data materializes op columns)")
-        plan.columns[col] == getfield(built, f) ||
-            _fail(kp.label, "schedule `$(sched.name)` product `$col` is " *
-                  "not the schedule build (bind_data materializes it — " *
-                  "a hand-bound plan must carry the identical product)")
-    end
-    for (col, param, kind) in kp.slices
-        kind === :response ||
-            _fail(kp.label, "slice `$param` kind unresolved " *
-                  "(bind_data resolves :unknown to :response)")
-        haskey(plan.columns, col) ||
-            _fail(kp.label, "slice column `$col` is not bound")
-        colv = plan.columns[col]
-        eltype(colv) <: Real ||
-            _fail(kp.label, "slice column `$col` must be numeric, " *
-                  "got $(eltype(colv))")
-        all(isfinite, colv) ||
-            _fail(kp.label, "slice column `$col` must be finite")
-        # Any length admits (foreign-axis responses ride their own
-        # axis); per-obs axis agreement is proved on shapes below.
-    end
-    # First-obs-on-primary (per plate): the first in-cell observation
-    # responds on the schedule obs axis; foreign-axis responses ride
-    # later observations.
-    n_axis = length(plan.columns[sched.obs_subj])
-    _kernel_plate_nlanes(kp, plan.columns) == n_axis ||
-        _fail(kp.label, "primary response length " *
-              "$(_kernel_plate_nlanes(kp, plan.columns)) ≠ schedule obs " *
-              "axis $n_axis (the first in-cell observation responds on " *
-              "the schedule obs axis; foreign-axis responses ride later " *
-              "observations)")
-    for obs in kp.obs
-        # Scalar obs validate their response column per family (the
-        # panel mirror); joint responses prove on shapes below.
-        obs.family in _KERNEL_SCALAR_FAMS || continue
-        rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
-        colv = _vector_column(plan.columns, rcol, kp.label, "obs response")
-        _validate_kernel_obs_column(kp, obs, rcol, colv)
-        _validate_kernel_bool_twin(kp, obs, rcol, plan)
-    end
-    for (p, _) in kp.lp_args
-        i = findfirst(q -> q.name === p, plan.predictors)
-        i === nothing &&
-            _fail(kp.label, "kernel LP arg `$p` is not a predictor")
-        for t in plan.predictors[i].terms
-            t.kind in _SUBJECT_TERM_KINDS ||
-                _fail(kp.label, "subject predictor `$p` carries a " *
-                      "$(t.kind) term (grouped v1 admits " *
-                      "$(_SUBJECT_TERM_KINDS))")
-            for c in t.columns
-                # In-graph deriveds compute at eval from bound sources
-                # (length-checked at their own level); no bind values exist.
-                _is_derived(plan, c) && continue
-                haskey(plan.columns, c) ||
-                    _fail(kp.label, "subject predictor `$p` column `$c` " *
-                          "is not bound")
-                colv = plan.columns[c]
-                length(colv) == n_sub ||
-                    _fail(kp.label, "subject predictor `$p` column `$c` " *
-                          "has length $(length(colv)), want n_sub $n_sub")
-                if t.kind in (ContinuousTerm, OffsetTerm)
-                    eltype(colv) <: Real ||
-                        _fail(kp.label, "subject predictor `$p` column " *
-                              "`$c` must be numeric, got $(eltype(colv))")
-                    all(isfinite, colv) ||
-                        _fail(kp.label, "subject predictor `$p` column " *
-                              "`$c` must be finite")
-                end
-            end
-        end
-    end
-    shapes = _prove_grouped_cell_shapes(kp, kp.slices, plan.columns)
-    _validate_nadir_ends(kp, shapes, plan.columns)
-    _validate_grouped_gather_maps(kp, shapes, plan.columns,
-        built.n_reads_total)
-    _validate_tgi_axis_order(kp, sched, plan.columns)
-    _validate_kernel_binomial_trials(kp, plan)
-    return nothing
-end
-
-# Kernel bind checks: resolved dims, total kinds, flat-T-blocked lengths,
-# subjects coverage. Runs on bound plans (bind resolves Symbol dims via
-# the `dims` map first; hand-bound plans carry Ints directly).
-# Likelihood lanes of one resolved plate (panel: flat length; grouped:
-# primary-response length): the bind_data `n` summand and the hand-bound
-# n_obs check share it. Per-plate bodies run first, so subjects are
-# resolved and slice columns bound whenever this is called.
-function _kernel_plate_nlanes(kp::KernelPlate, columns::AbstractDict{Symbol})
-    _is_grouped_kernel(kp) ||
-        return _kernel_flat_length(kp.subjects, kp.timepoints)
-    isempty(kp.obs) && return length(columns[only(kp.schedules).obs_subj])
-    rcol0 = only(c for (c, p, _) in kp.slices if p === first(kp.obs).response)
-    return length(columns[rcol0])
-end
-
-function _validate_kernels_data(plan::StructuralPlan)
-    isempty(plan.kernel_plates) && return nothing
-    for kp in plan.kernel_plates
-        if _is_grouped_kernel(kp)
-            _validate_grouped_kernel_data(plan, kp)
-        else
-            _validate_panel_kernel_data(plan, kp)
-        end
-    end
-    # n_obs totals kernel lanes and ordinary observation axes (bind_data
-    # sets the sum; a hand-bound plan must carry it).
-    lanes =
-        [_kernel_plate_nlanes(kp, plan.columns) for kp in plan.kernel_plates]
-    axes = _observation_axes(plan)
-    total = sum(lanes) + (axes === nothing ? 0 : axes.total)
-    plan.n_obs == total ||
-        _fail(:plan, "n_obs $(plan.n_obs) ≠ total likelihood lanes $total " *
-              "($(join(["$(kp.result)=$n"
-                           for (kp, n) in zip(plan.kernel_plates, lanes)], ", ")))")
-    return nothing
-end
-
-function _validate_panel_kernel_data(plan::StructuralPlan, kp::KernelPlate)
-    kp.subjects isa Int ||
-        _fail(kp.label, "subjects dims key `$(kp.subjects)` unresolved " *
-              "(bind_data with dims first)")
-    n_sub = kp.subjects
-    T = kp.timepoints
-    T isa Symbol &&
-        _fail(kp.label, "timepoints dims key `$T` unresolved " *
-              "(bind_data with dims first)")
-    flat = _kernel_flat_length(n_sub, T)
-    if T === nothing
-        all(s -> s[3] === :scalar, kp.slices) ||
-            _fail(kp.label, "a vector slice needs T (bind the " *
-                  "`kernel_T_$(kp.result)` dims key)")
-    elseif T > 1
-        any(s -> s[3] === :vector, kp.slices) ||
-            _fail(kp.label, "T=$T bound but no vector slice uses it " *
-                  "(scalar models omit the timepoints dims key)")
-    end
-    # T == 1 with all-scalar slices is the unobservable-kinds case
-    # (recovered scalar by scalar-first inference) — admitted.
-    for (col, param, kind) in kp.slices
-        kind in (:vector, :scalar) ||
-            _fail(kp.label, "slice `$param` kind unresolved " *
-                  "(bind_data resolves :unknown from lengths)")
-        haskey(plan.columns, col) ||
-            _fail(kp.label, "slice column `$col` is not bound")
-        colv = _vector_column(plan.columns, col, kp.label, "slice column")
-        eltype(colv) <: Real ||
-            _fail(kp.label, "slice column `$col` must be numeric, " *
-                  "got $(eltype(colv))")
-        all(isfinite, colv) ||
-            _fail(kp.label, "slice column `$col` must be finite")
-        want = kind === :vector ? flat : n_sub
-        length(colv) == want ||
-            _fail(kp.label, "slice `$param` ($kind) column `$col` has " *
-                  "length $(length(colv)), want $want " *
-                  (kind === :vector ? "(n_sub*T flat T-blocked)" :
-                   "(n_sub per-subject)"))
-        if kind === :scalar && T !== nothing
-            # Scalar slices expand to flat T-blocks at bind; a hand-bound
-            # plan must carry the same expansion (verified, not trusted).
-            exp = _kexp_name(kp.result, col)
-            haskey(plan.columns, exp) ||
-                _fail(kp.label, "scalar slice `$param` expansion `$exp` " *
-                      "missing (bind_data materializes flat T-blocks)")
-            expv =
-                _vector_column(plan.columns, exp, kp.label, "slice expansion")
-            length(expv) == flat ||
-                _fail(kp.label, "expansion `$exp` has length " *
-                      "$(length(expv)), want flat $flat")
-            expv == repeat(colv; inner = T) ||
-                _fail(kp.label, "expansion `$exp` is not the flat " *
-                      "T-block repeat of `$col`")
-        end
-    end
-    for obs in kp.obs
-        obs.family in _KERNEL_SCALAR_FAMS || continue
-        si = findfirst(s -> s[2] === obs.response, kp.slices)
-        kind = kp.slices[si][3]
-        rcol = kp.slices[si][1]
-        colv = _vector_column(plan.columns, rcol, kp.label, "obs response")
-        _validate_kernel_obs_column(kp, obs, rcol, colv)
-        flat = (kind === :scalar && T !== nothing) ?
-            _kexp_name(kp.result, rcol) : rcol
-        _validate_kernel_bool_twin(kp, obs, flat, plan)
-    end
-    _validate_kernel_binomial_trials(kp, plan)
-    return nothing
-end
-
-function _validate_kernel_binomial_trials(kp::KernelPlate, plan::StructuralPlan)
-    any(o -> o.family === BinomialProbFam, kp.obs) || return nothing
-    integers = Set{Symbol}()
-    for (column, param, _) in kp.slices
-        eltype(plan.columns[column]) <: Integer && push!(integers, param)
-    end
-    function integer_value(ex)
-        ex isa Integer && return true
-        ex isa Symbol && return ex in integers
-        ex isa Expr || return false
-        ex.head === :call && !isempty(ex.args) || return false
-        fn = ex.args[1]
-        fn === :length && return true
-        fn in (:+, :-, :*, :%, :.+, :.-, :.*, :.% , :sum, :minimum, :maximum) &&
-            return all(integer_value, ex.args[2:end])
-        return false
-    end
-    for (name, ex) in kp.assignments
-        integer_value(ex) && push!(integers, name)
-    end
-    for obs in kp.obs
-        obs.family === BinomialProbFam || continue
-        integer_value(obs.location) || _fail(kp.label,
-            "Binomial trials must be integer data or an integer-valued cell expression")
-        if obs.location isa Symbol
-            index = findfirst(s -> s[2] === obs.location, kp.slices)
-            index === nothing && continue
-            raw = plan.columns[kp.slices[index][1]]
-            all(>=(0), raw) || _fail(kp.label, "Binomial trials must be nonnegative")
-        end
-    end
-    return nothing
-end
-
-# Bernoulli in-cell Bool twin verification (bind products are verified,
-# not trusted — the kexp precedent): non-Bool flats read their twin.
-function _validate_kernel_bool_twin(kp::KernelPlate, obs::KernelObs,
-        flat::Symbol, plan::StructuralPlan)
-    obs.family === BernoulliLogitFam || return nothing
-    flatv = _vector_column(plan.columns, flat, kp.label, "obs flat")
-    eltype(flatv) === Bool && return nothing
-    twin = _kbool_name(kp.result, obs.response)
-    haskey(plan.columns, twin) ||
-        _fail(kp.label, "Bernoulli in-cell Bool twin `$twin` missing " *
-              "(bind_data materializes it for non-Bool responses)")
-    twinv = _vector_column(plan.columns, twin, kp.label, "Bool twin")
-    eltype(twinv) === Bool ||
-        _fail(kp.label, "Bool twin `$twin` must be Bool, got " *
-              "$(eltype(twinv))")
-    twinv == (flatv .!= 0) ||
-        _fail(kp.label, "Bool twin `$twin` is not `(flat .!= 0)`")
-    return nothing
-end
-
-# One scalar in-cell observation's RESPONSE column, per family (the
-# `_validate_response_column` mirror — same domains, kernel-attributed
-# messages). Validates the RAW slice column: scalar-slice expansions
-# are Float64 by construction (exact for 0/1 + counts); Bernoulli
-# non-Bool flats read their bind-materialized Bool twin.
-function _validate_kernel_obs_column(kp::KernelPlate, obs::KernelObs,
-        col::Symbol, colv::AbstractVector)
-    fam = obs.family
-    if fam === BernoulliLogitFam
-        (eltype(colv) === Bool ||
-            (eltype(colv) <: Integer && all(x -> x == 0 || x == 1, colv))) ||
-            _fail(kp.label, "Bernoulli in-cell response `$col` must be " *
-                  "Bool or 0/1 integers")
-    elseif fam === BinomialProbFam
-        _is_count_column(colv) ||
-            _fail(kp.label, "Binomial in-cell response `$col` must be non-negative integers")
-        obs.location isa Number && any(>(obs.location), colv) &&
-            _fail(kp.label, "Binomial in-cell response `$col` exceeds its trials")
-    elseif fam === PoissonLogFam || fam === NegativeBinomial2Fam
-        _is_count_column(colv) ||
-            _fail(kp.label, (fam === PoissonLogFam ? "Poisson" : "NB2") *
-                  " in-cell response `$col` must be non-negative integers")
-    elseif fam === GammaLogFam
-        (eltype(colv) <: Real && all(>(0), colv)) ||
-            _fail(kp.label, "Gamma in-cell response `$col` must be " *
-                  "strictly positive numerics")
-    elseif fam === BetaLogitFam
-        (eltype(colv) <: Real && all(x -> 0 < x < 1, colv)) ||
-            _fail(kp.label, "Beta in-cell response `$col` must be " *
-                  "numerics strictly inside (0, 1)")
-    end
-    return nothing
 end
 
 function _validate_name_tables(plan::StructuralPlan)
@@ -5561,16 +2166,8 @@ function _validate_name_tables(plan::StructuralPlan)
     deriveds = [d.name for d in plan.derived]
     plates = [p.name for p in plan.plate_parameters]
     scanstates = Symbol[st for s in plan.scans for st in s.states]
-    darstates = [s.state for s in plan.dar_paths]
     vectors = [p.name for p in plan.vector_parameters]
-    svec = [v.name for v in plan.spline_vectors]
-    vcorr = Symbol[nm for d in plan.varying_draws
-        for nm in _varying_corr_table_names(d)]
-    hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
-    kern = Symbol[nm for kp in plan.kernel_plates for nm in _kernel_all_names(kp)]
     mats = Symbol[m.name for m in plan.matrices]
-    elps = Symbol[nm for el in plan.event_lps
-        for nm in [_event_lp_all_names(el); el.name]]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
         _fail(:plan, "duplicate assignment names")
@@ -5580,22 +2177,10 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate plate-parameter names")
     length(unique(scanstates)) == length(scanstates) ||
         _fail(:plan, "duplicate scan-state names")
-    length(unique(darstates)) == length(darstates) ||
-        _fail(:plan, "duplicate dar-state names")
     length(unique(vectors)) == length(vectors) ||
         _fail(:plan, "duplicate vector-parameter names")
-    length(unique(svec)) == length(svec) ||
-        _fail(:plan, "duplicate spline-vector names")
-    length(unique(vcorr)) == length(vcorr) ||
-        _fail(:plan, "duplicate correlated varying names")
-    length(unique(hsgp)) == length(hsgp) ||
-        _fail(:plan, "duplicate hsgp names")
-    length(unique(kern)) == length(kern) ||
-        _fail(:plan, "duplicate kernel-plate names")
     length(unique(mats)) == length(mats) ||
         _fail(:plan, "duplicate design-matrix names")
-    length(unique(elps)) == length(elps) ||
-        _fail(:plan, "duplicate event-LP names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
         (params, deriveds, "parameters and derived columns"),
         (assigns, deriveds, "assignments and derived columns"),
@@ -5611,94 +2196,37 @@ function _validate_name_tables(plan::StructuralPlan)
         (vectors, deriveds, "vector parameters and derived columns"),
         (vectors, plates, "vector parameters and plate parameters"),
         (vectors, scanstates, "vector parameters and scan states"),
-        (svec, params, "spline vectors and parameters"),
-        (svec, assigns, "spline vectors and assignments"),
-        (svec, deriveds, "spline vectors and derived columns"),
-        (svec, plates, "spline vectors and plate parameters"),
-        (svec, scanstates, "spline vectors and scan states"),
-        (vectors, svec, "vector parameters and spline vectors"),
-        (vcorr, params, "correlated varying names and parameters"),
-        (vcorr, assigns, "correlated varying names and assignments"),
-        (vcorr, deriveds, "correlated varying names and derived columns"),
-        (vcorr, plates, "correlated varying names and plate parameters"),
-        (vcorr, scanstates, "correlated varying names and scan states"),
-        (vcorr, vectors, "correlated varying names and vector parameters"),
-        (vcorr, svec, "correlated varying names and spline vectors"),
-        (hsgp, params, "hsgp names and parameters"),
-        (hsgp, assigns, "hsgp names and assignments"),
-        (hsgp, deriveds, "hsgp names and derived columns"),
-        (hsgp, plates, "hsgp names and plate parameters"),
-        (hsgp, scanstates, "hsgp names and scan states"),
-        (hsgp, vectors, "hsgp names and vector parameters"),
-        (hsgp, svec, "hsgp names and spline vectors"),
-        (hsgp, vcorr, "hsgp names and correlated varying names"),
-        (kern, params, "kernel-plate names and parameters"),
-        (kern, assigns, "kernel-plate names and assignments"),
-        (kern, deriveds, "kernel-plate names and derived columns"),
-        (kern, plates, "kernel-plate names and plate parameters"),
-        (kern, scanstates, "kernel-plate names and scan states"),
-        (kern, vectors, "kernel-plate names and vector parameters"),
-        (kern, svec, "kernel-plate names and spline vectors"),
-        (kern, vcorr, "kernel-plate names and correlated varying names"),
-        (kern, hsgp, "kernel-plate names and hsgp names"),
         (mats, params, "design-matrix names and parameters"),
         (mats, assigns, "design-matrix names and assignments"),
         (mats, deriveds, "design-matrix names and derived columns"),
         (mats, plates, "design-matrix names and plate parameters"),
         (mats, scanstates, "design-matrix names and scan states"),
-        (mats, vectors, "design-matrix names and vector parameters"),
-        (mats, svec, "design-matrix names and spline vectors"),
-        (mats, vcorr, "design-matrix names and correlated varying names"),
-        (mats, hsgp, "design-matrix names and hsgp names"),
-        (mats, kern, "design-matrix names and kernel-plate names"),
-        (darstates, params, "dar states and parameters"),
-        (darstates, assigns, "dar states and assignments"),
-        (darstates, deriveds, "dar states and derived columns"),
-        (darstates, plates, "dar states and plate parameters"),
-        (darstates, scanstates, "dar states and scan states"),
-        (darstates, vectors, "dar states and vector parameters"),
-        (darstates, svec, "dar states and spline vectors"),
-        (darstates, vcorr, "dar states and correlated varying names"),
-        (darstates, hsgp, "dar states and hsgp names"),
-        (darstates, kern, "dar states and kernel-plate names"),
-        (darstates, mats, "dar states and design-matrix names"),
-        (elps, params, "event-LP names and parameters"),
-        (elps, assigns, "event-LP names and assignments"),
-        (elps, deriveds, "event-LP names and derived columns"),
-        (elps, plates, "event-LP names and plate parameters"),
-        (elps, scanstates, "event-LP names and scan states"),
-        (elps, vectors, "event-LP names and vector parameters"),
-        (elps, svec, "event-LP names and spline vectors"),
-        (elps, vcorr, "event-LP names and correlated varying names"),
-        (elps, hsgp, "event-LP names and hsgp names"),
-        (elps, kern, "event-LP names and kernel-plate names"),
-        (elps, mats, "event-LP names and design-matrix names"),
-        (elps, darstates, "event-LP names and dar states"))
+        (mats, vectors, "design-matrix names and vector parameters"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
-    allnames = union(params, assigns, deriveds, plates, scanstates, darstates,
-        vectors, svec, vcorr, hsgp, kern, mats)
+    allnames = union(params, assigns, deriveds, plates, scanstates,
+        vectors, mats)
     arrays = _array_names(plan)
     length(unique(arrays)) == length(arrays) ||
         _fail(:plan, "duplicate array-parameter names")
-    overlap = intersect(arrays, union(allnames, elps))
+    overlap = intersect(arrays, allnames)
     isempty(overlap) || _fail(:plan, "names in both array parameters and " *
-        "other parameters/assignments/derived/plate/scan/dar/vector/spline/" *
-        "varying/hsgp/kernel/matrix/event-LP names: $(join(overlap, ", "))")
+        "other parameters/assignments/derived/plate/scan/vector/" *
+        "matrix names: $(join(overlap, ", "))")
     allnames = union(allnames, arrays)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/dar/vector/spline/varying/kernel/matrix name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/matrix name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/dar/vector/spline/varying/kernel/matrix $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector/matrix $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, darstates, vectors, svec, vcorr, hsgp, kern, mats))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, mats))
         _check_name_hygiene(n)
     end
     return nothing
@@ -5789,51 +2317,6 @@ end
 # (`_ppl_dar_z_<state>`, length `n_obs - 1`). Reserved-prefix validation
 # guarantees no user name collides with it; the state name itself binds
 # the emitter's `scan(...)` reconstruction.
-_dar_innovation_name(s::DarSpec) = Symbol(:_ppl_dar_z_, s.state)
-
-# Structural invariants of each differenced-AR(1) trajectory: the
-# persistence names a `Normal` sampled parameter truncated to exactly
-# `[0, 1]` (`beta ~ truncated(Normal(0.5, 0.2), 0, 1)`; other
-# location/scale ride the same spelling) and the scale names a half-Normal
-# (`sigma ~ HalfNormal(0.2)` or `truncated(Normal(0, 0.2), 0, Inf)`).
-# Legacy normalized support overrides and general `:truncated` agree. Both keep
-# Distributions semantics — the truncation normalizers stay (user decision
-# `0m1j3iz`, prong `dar-kernel`). The `n_obs ≥ 2` length gate lives in the
-# layout (unbound surface plans carry `n_obs = 0`, like a scan's symbolic
-# `hi` — lengths resolve at bind).
-function _validate_dar_paths(plan::StructuralPlan)
-    for s in plan.dar_paths
-        s.beta === s.sigma && _fail(s.label,
-            "dar persistence and scale must be distinct sampled parameters " *
-            "(SB samples `beta` and `sigma` separately), got :$(s.beta) twice")
-        i = findfirst(p -> p.name === s.beta, plan.parameters)
-        i === nothing && _fail(s.label,
-            "dar persistence :$(s.beta) must name a scalar sampled " *
-            "parameter (`$(s.beta) ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
-        b = plan.parameters[i]
-        (b.family === :normal && b.support_override in
-            ((:interval, 0.0, 1.0), (:truncated, 0.0, 1.0))) ||
-            _fail(s.label,
-                "dar persistence :$(s.beta) must be a Normal truncated to " *
-                "exactly [0, 1] (`truncated(Normal(0.5, 0.2), 0, " *
-                "1)`), got :$(b.family) on $(repr(b.support_override))")
-        j = findfirst(p -> p.name === s.sigma, plan.parameters)
-        j === nothing && _fail(s.label,
-            "dar scale :$(s.sigma) must name a scalar sampled parameter " *
-            "(`$(s.sigma) ~ HalfNormal(0.2)`)")
-        sg = plan.parameters[j]
-        (sg.family === :normal && (sg.support_override === :positive ||
-            (sg.support_override == (:truncated, 0.0, Inf) &&
-                get(sg.args, :arg1, nothing) == 0))) ||
-            _fail(s.label,
-                "dar scale :$(s.sigma) must be a half-Normal " *
-                "(`HalfNormal(0.2)` or `truncated(Normal(0, 0.2), 0, Inf)`), " *
-                "got :$(sg.family) on " *
-                "$(repr(sg.support_override))")
-    end
-    return nothing
-end
-
 function _check_name_hygiene(n::Symbol)
     startswith(string(n), "_ppl_") && _fail(
         :plan,
@@ -6805,8 +3288,7 @@ const _JOINT_FACTOR_FAMILIES = (:positive_exponential, :cholesky_corr_lkj)
 
 # Constrained vector (cutpoint/threshold/simplex) parameters: family/arity
 # plus ordinary value arguments. Sizes resolve at bind (`nothing` = infer from the linked leveled
-# response, or from the concentration length for a monotonic-linked
-# simplex); an explicit size is bounds-checked here and linked-checked in
+# response or an explicit value shape); an explicit size is bounds-checked here and linked-checked in
 # `_validate_responses`. Vector declarations can have several readers.
 function _validate_vector_parameters(plan::StructuralPlan)
     for p in plan.vector_parameters
@@ -6890,8 +3372,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
     # Linkage: a vector parameter may be referenced by several responses
     # (as `thresholds` for ordered families, as `threshold_coefs` for
     # per-threshold Ordinal, as the simplex `predictor`, or as a joint
-    # factor piece), by monotonic terms (as their `increments`
-    # simplex), or by an R2D2 prior (as its share `phi`).
+    # factor piece).
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -6924,26 +3405,6 @@ function _validate_vector_parameters(plan::StructuralPlan)
             haskey(refs, r.mixture_weights) &&
                 push!(refs[r.mixture_weights], r.label)
         end
-    end
-    for pred in plan.predictors, t in pred.terms
-        (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) || continue
-        incr = _monotonic_options(t)
-        haskey(refs, incr) || _fail(t.label,
-            "monotonic increments $incr is not a vector parameter")
-        p = only(q for q in plan.vector_parameters if q.name === incr)
-        p.family === :simplex_dirichlet || _fail(t.label,
-            "monotonic increments $incr must be a " *
-            ":simplex_dirichlet vector parameter, got $(p.family)")
-        push!(refs[incr], t.label)
-    end
-    for rp in plan.r2d2_priors
-        haskey(refs, rp.phi) || _fail(rp.predictor,
-            "R2D2 share parameter $(rp.phi) is not a vector parameter")
-        p = only(q for q in plan.vector_parameters if q.name === rp.phi)
-        p.family === :simplex_dirichlet || _fail(rp.predictor,
-            "R2D2 share parameter $(rp.phi) must be a " *
-            ":simplex_dirichlet vector parameter, got $(p.family)")
-        push!(refs[rp.phi], rp.predictor)
     end
     # Every declaration contributes its prior, including an otherwise
     # unused latent. Its extent must resolve from the declaration at bind.
@@ -7142,32 +3603,12 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
             _term_structure_options(t),
             t.addressee, t.label)
     end
-    if t.kind === VaryingEffectTerm
-        _validate_effect_term(t, pred)
-        return nothing
-    end
-    if t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm
-        _validate_monotonic_term(t, pred)
-        return nothing
-    end
-    if t.kind === SplineSummandTerm
-        _validate_spline_term(t, pred)
-        return nothing
-    end
-    if t.kind === HSGPSummandTerm
-        _validate_hsgp_term(t, pred)
-        return nothing
-    end
     if t.kind === ScanSummandTerm
         _validate_scan_term(t, pred, plan)
         return nothing
     end
     if t.kind === MatrixTerm
         _validate_matrix_term(t, pred, plan)
-        return nothing
-    end
-    if t.kind === DarSummandTerm
-        _validate_dar_term(t, pred, plan)
         return nothing
     end
     if t.kind === ComposedTerm
@@ -7220,7 +3661,7 @@ function _validate_parameter_term(t::TermSpec, plan::StructuralPlan)
 end
 
 # A matrix term names its design matrix in `options` (`(matrix,)` — the
-# gather/spline options precedent) and carries exactly the matrix's data
+# gather options precedent) and carries exactly the matrix's data
 # columns in order (intercept positions excluded — they take no column);
 # its addressee is the matrix name. Per-element prior coverage (one
 # PopulationPrior row per element addressee) is checked in
@@ -7248,110 +3689,6 @@ function _validate_matrix_term(t::TermSpec, pred::PredictorSpec, plan::Structura
     return nothing
 end
 
-# An effect term names its draws by label in `options` (never a lossy
-# suffix parse) and carries exactly the grouping column; its addressee
-# is its own label (self-addressed: effect terms take no
-# PopulationPrior). Draws linkage (existence, slices, dangling) is
-# checked jointly in `_validate_varying_draws`, which sees predictors,
-# draws, and slices together.
-function _validate_effect_term(t::TermSpec, pred::PredictorSpec)
-    o = t.options
-    Tuple(keys(o)) == (:draws,) ||
-        _fail(t.label, "varying effect options must be exactly " *
-              "`(draws,)`, got $(Tuple(keys(o)))")
-    o.draws isa Symbol ||
-        _fail(t.label, "effect draws must be a Symbol, " *
-              "got $(repr(o.draws))")
-    length(t.columns) == 1 ||
-        _fail(t.label, "varying effect columns must be exactly the " *
-              "grouping column, got $(t.columns)")
-    t.addressee === t.label ||
-        _fail(t.label, "varying effect addressee must be its own label " *
-              "(self-addressed, no population prior), got $(t.addressee)")
-    return nothing
-end
-
-# Monotonic options precondition, shared by term validation and the
-# vector-parameter linkage (which reads `options.increments` before
-# `_validate_predictors` runs, so it must establish the shape itself).
-function _monotonic_options(t::TermSpec)
-    o = _term_structure_options(t)
-    Tuple(keys(o)) == (:increments,) ||
-        _fail(t.label, "monotonic term options must be exactly " *
-              "`(increments,)`, got $(Tuple(keys(o)))")
-    o.increments isa Symbol ||
-        _fail(t.label, "monotonic increments must name a simplex vector " *
-              "parameter, got $(repr(o.increments))")
-    return o.increments
-end
-
-# A monotonic term (SB `mo(c)` / `mo1(c)`) carries exactly the bound index
-# column (integer level codes 1..K, checked at bind) and names its
-# increment simplex in `options` (`(increments,)` — a `:simplex_dirichlet`
-# vector parameter, linked in `_validate_vector_parameters`). `mo` takes a
-# free coefficient (addressee is the column, like a continuous term, so a
-# PopulationPrior covers its beta); `mo1` is beta-free and self-addressed
-# (no population prior, like the spline summands).
-function _validate_monotonic_term(t::TermSpec, pred::PredictorSpec)
-    _monotonic_options(t)
-    length(t.columns) == 1 ||
-        _fail(t.label, "monotonic term takes exactly one index column")
-    if t.kind === MonotonicSummandTerm
-        t.addressee === t.label ||
-            _fail(t.label, "monotonic summand addressee must be its own " *
-                  "label (self-addressed, no population prior), got " *
-                  "$(t.addressee)")
-    end
-    return nothing
-end
-
-# A spline summand names its basis by id in `options` and carries no
-# columns (basis vectors materialize at bind — unnameable pre-bind); its
-# addressee is its own label (self-addressed: no population prior).
-# Basis linkage (existence, single target, no dangling) is checked jointly
-# in `_validate_splines`, which sees predictors and bases together.
-function _validate_spline_term(t::TermSpec, pred::PredictorSpec)
-    o = t.options
-    Tuple(keys(o)) == (:spline_id,) ||
-        _fail(t.label, "spline summand options must be exactly " *
-              "`(spline_id,)`, got $(Tuple(keys(o)))")
-    o.spline_id isa Symbol ||
-        _fail(t.label, "spline summand spline_id must be a Symbol, " *
-              "got $(repr(o.spline_id))")
-    isempty(t.columns) ||
-        _fail(t.label, "spline summand carries no columns (basis vectors " *
-              "materialize at bind), got $(t.columns)")
-    t.addressee === t.label ||
-        _fail(t.label, "spline summand addressee must be its own label " *
-              "(self-addressed, no population prior), got $(t.addressee)")
-    return nothing
-end
-
-function _validate_hsgp_term(t::TermSpec, pred::PredictorSpec)
-    o = t.options
-    Tuple(keys(o)) == (:hsgp_id,) ||
-        _fail(t.label, "hsgp summand options must be exactly " *
-              "`(hsgp_id,)`, got $(Tuple(keys(o)))")
-    o.hsgp_id isa Symbol ||
-        _fail(t.label, "hsgp summand hsgp_id must be a Symbol, " *
-              "got $(repr(o.hsgp_id))")
-    isempty(t.columns) ||
-        _fail(t.label, "hsgp summand carries no columns (the basis is " *
-              "evaluated in-graph in Stage B), got $(t.columns)")
-    t.addressee === t.label ||
-        _fail(t.label, "hsgp summand addressee must be its own label " *
-              "(self-addressed, no population prior), got $(t.addressee)")
-    return nothing
-end
-
-# A scan summand names its carried array (`scan_id`) and its coefficient
-# (`coef`) in `options` and carries no columns (the state is sampled or
-# reconstructed, not data); its addressee is its own label (self-addressed:
-# the coefficient's prior lives on the `SampledParameter`, not a population
-# prior). `coef` is a sampled scalar (SB's `ar` latent path with its free
-# beta; v1 admits Normal coefficients only) or `nothing` — the state spliced
-# directly, beta-free (`mu = a .+ x`, the dar/`mo1` shape). Centered and
-# non-centered states both read.
 function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
     o = t.options
     Tuple(keys(o)) == (:scan_id, :coef) ||
@@ -7379,33 +3716,6 @@ function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralP
     return nothing
 end
 
-# A dar summand names its trajectory (`dar_id`) in `options` and carries
-# no columns (the state is sampled, not data) and NO coefficient (the
-# zero-started path is beta-free — the formula intercept is the initial
-# level, the `mo1` splice shape); its addressee is its own label
-# (self-addressed: the persistence/scale priors live on the
-# `SampledParameter`s, not a population prior). Beta/sigma linkage is
-# checked on the `DarSpec` itself (`_validate_dar_paths`).
-function _validate_dar_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
-    o = t.options
-    Tuple(keys(o)) == (:dar_id,) ||
-        _fail(t.label, "dar summand options must be exactly `(dar_id,)`, " *
-              "got $(Tuple(keys(o)))")
-    o.dar_id isa Symbol ||
-        _fail(t.label, "dar summand dar_id must be a Symbol, " *
-              "got $(repr(o.dar_id))")
-    isempty(t.columns) ||
-        _fail(t.label, "dar summand carries no columns (the state is " *
-              "sampled, not data), got $(t.columns)")
-    t.addressee === t.label ||
-        _fail(t.label, "dar summand addressee must be its own label " *
-              "(self-addressed, no population prior), got $(t.addressee)")
-    any(s -> s.state === o.dar_id, plan.dar_paths) ||
-        _fail(t.label, "dar summand addresses unknown dar state " *
-              ":$(o.dar_id) (no such `dar()` trajectory)")
-    return nothing
-end
-
 const _COMPOSED_OPS = (:.*, :.+, :.-)
 # Elementwise unary maps admitted over a composed subtree (`exp.(la)` —
 # the IRT discrimination `a = exp(log_a)`; `logistic.(xi)` — sigmoid
@@ -7424,9 +3734,8 @@ _composed_map_fn(f) = f isa GlobalRef || f === :ifelse ||
     f in _COMPOSED_UNARY || f in ELEMENTWISE_FNS
 const _COMPOSED_AFFINE_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
-# Sub-predictors are affine plus varying-effect summands (per-level
-# random effects: the IRT person ability `theta ~ 0 + (1 | person)`).
-const _COMPOSED_SUB_KINDS = (_COMPOSED_AFFINE_KINDS..., VaryingEffectTerm)
+# Sub-predictors are affine.
+const _COMPOSED_SUB_KINDS = _COMPOSED_AFFINE_KINDS
 
 """Recurse a composed tree: leaves must be declared subs/scalars/data
 columns (a literal arrives as a named scalar leaf), nodes dotted
@@ -7575,20 +3884,11 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # Scan summands name a recurrence + scalar coefficient in `options`, not
     # columns; structure validation checked both names.
     t.kind === ScanSummandTerm && return nothing
-    # Dar summands name a trajectory in `options`, not columns; structure
-    # validation checked the name.
-    t.kind === DarSummandTerm && return nothing
-    # mm effect terms name the mm naming symbol (not a data column);
-    # membership binding is proven by `_validate_mm_draws_data`.
-    if t.kind === VaryingEffectTerm
-        i = findfirst(d -> d.label === t.options.draws, plan.varying_draws)
-        i !== nothing && plan.varying_draws[i].mm !== nothing && return nothing
-    end
     for c in t.columns
         # A per-cell latent enters a design only through a ContinuousTerm
         # (a free coefficient scaling the latent vector — the SB `me`
         # mirror); every other term kind over a latent fails closed.
-        if _is_plate_param(plan, c) && t.kind !== VaryingEffectTerm
+        if _is_plate_param(plan, c)
             t.kind === ContinuousTerm || _fail(t.label,
                 "term over the latent vector $c must be a ContinuousTerm " *
                 "(a free coefficient scaling the latent — got $(t.kind))")
@@ -7602,9 +3902,6 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end
-    # Effect terms name the raw grouping column (strings included — the
-    # encoder maps levels to codes); presence above is the whole check.
-    t.kind === VaryingEffectTerm && return nothing
     # FactorTerm: column presence is checked by the loop above; level
     # coverage is a LevelMap concern (_validate_levelmaps_data).
     if t.kind === ContinuousTerm || t.kind === OffsetTerm
@@ -7632,33 +3929,6 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
                 _fail(t.label, "column $c must be numeric")
         end
     end
-    if t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm
-        _validate_monotonic_columns(t, plan)
-    end
-    return nothing
-end
-
-# Monotonic index data (SB `_sb_mo`'s `<c>_idx`): the emitter binds integer
-# level codes, so the thin layer takes them as-is — a BOUND raw column of
-# integers 1..K, where K − 1 is the linked increments simplex's
-# concentration length (unobserved levels are allowed, like unobserved
-# factor levels; out-of-range codes fail closed).
-function _validate_monotonic_columns(t::TermSpec, plan::StructuralPlan)
-    c = only(t.columns)
-    _is_derived(plan, c) && _fail(t.label,
-        "monotonic index $c must be a bound raw column of level codes " *
-        "(the emitter binds integer codes 1..K, SB's `<c>_idx`)")
-    col = _vector_column(plan.columns, c, t.label, "monotonic index")
-    (eltype(col) <: Integer && eltype(col) !== Bool) ||
-        _fail(t.label, "monotonic index $c must hold integer level codes " *
-              "1..K, got eltype $(eltype(col))")
-    i = findfirst(p -> p.name === t.options.increments, plan.vector_parameters)
-    i === nothing && _fail(t.label,
-        "internal: monotonic increments $(t.options.increments) unlinked")
-    K = plan.vector_parameters[i].size + 1
-    all(v -> 1 <= v <= K, col) ||
-        _fail(t.label, "monotonic index $c holds codes outside 1..$K " *
-              "(K − 1 = $(K - 1) is the linked increments simplex size)")
     return nothing
 end
 
@@ -7819,10 +4089,6 @@ end
 function _validate_priors(plan::StructuralPlan)
     seen = Set{Tuple{Symbol,Symbol}}()
     rows = Dict{Tuple{Symbol,Symbol},PopulationPrior}()
-    r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
-    hs = Set{Tuple{Symbol,Symbol}}(
-        (h.predictor, h.addressee) for h in plan.horseshoe_priors)
-    hs_preds = Set{Symbol}(h.predictor for h in plan.horseshoe_priors)
     param_names = Set{Symbol}(p.name for p in plan.parameters)
     by_param = Dict{Symbol,SampledParameter}(p.name => p for p in plan.parameters)
     assign_names = Set{Symbol}(a.name for a in plan.assignments)
@@ -7831,14 +4097,7 @@ function _validate_priors(plan::StructuralPlan)
         any(p -> p.name === pr.predictor, plan.predictors) ||
             pr.predictor in glm_labels ||
             _fail(:plan, "prior addresses unknown predictor $(pr.predictor)")
-        pr.predictor in r2d2 && _fail(:plan,
-            "predictor $(pr.predictor) carries an R2D2Prior — its prior " *
-            "mass lives there, not in a PopulationPrior row (explicit " *
-            "Normal columns ride the overrides map)")
         key = (pr.predictor, pr.addressee)
-        key in hs && _fail(:plan,
-            "prior for $key duplicates a HorseshoePrior — a horseshoe " *
-            "addressee carries its triple, not a PopulationPrior row")
         key in seen &&
             _fail(:plan, "duplicate prior for $key")
         push!(seen, key)
@@ -7913,29 +4172,14 @@ function _validate_priors(plan::StructuralPlan)
                   "finite positive nu, got $(repr(pr.nu))")
     end
     for pred in plan.predictors
-        # R2D2 predictors are covered by _validate_r2d2, not here.
-        pred.name in r2d2 && continue
-        # Offset terms carry no coefficient; latent terms carry the per-cell
-        # PlateParameter, whose prior lives on the plate parameter itself;
-        # effect terms carry a VaryingDraws, spline summands a SplineBasis,
-        # hsgp summands an HSGPBasis, and monotonic summands (mo1) an
-        # increment simplex, whose geometries are self-priored — none needs
-        # a coefficient prior. Monotonic (mo) terms DO take a free
-        # coefficient, so they stay in the addressee set. Composed terms
-        # carry no coefficient either (theirs live in the sub-predictors).
-        # Matrix terms
-        # expand to their per-element addressees (one PopulationPrior row
-        # per matrix column).
+        # Offset, latent and scan terms carry their
+        # own priors. Composed terms read priors from their sub-predictors;
+        # matrix terms expand to one addressee per matrix column.
         addressees = Set{Symbol}()
         for t in pred.terms
             _parameter_term(t) && continue
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
-                t.kind === VaryingEffectTerm ||
-                t.kind === SplineSummandTerm ||
-                t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
-                t.kind === MonotonicSummandTerm ||
-                t.kind === DarSummandTerm ||
                 t.kind === ComposedTerm) && continue
             if t.kind === MatrixTerm
                 m = _find_matrix(plan, t.options.matrix)
@@ -7962,13 +4206,7 @@ function _validate_priors(plan::StructuralPlan)
         any(t -> t.kind === InterceptTerm && !_parameter_term(t),
             pred.terms) && push!(addressees, :Intercept)
         for a in addressees
-            # A horseshoe predictor covers an addressee by its entry or by
-            # a synthesized Normal scalar (family checked in
-            # _validate_horseshoe); every other predictor by a
-            # PopulationPrior row.
-            (pred.name, a) in seen || (pred.name, a) in hs ||
-                (pred.name in hs_preds &&
-                    horseshoe_normal_name(pred.name, a) in param_names) ||
+            (pred.name, a) in seen ||
                 _fail(:plan, "no prior for ($(pred.name), $a)")
         end
     end
@@ -7987,207 +4225,6 @@ function _validate_priors(plan::StructuralPlan)
                 "GLM-object beta prior for ($(r.label), $c) is " *
                 "Normal-only (got $(rows[(r.label, c)].family)) — write " *
                 "the decomposed predictor form for other families")
-        end
-    end
-    return nothing
-end
-
-# R2D2 structural checks: predictor linkage (one per predictor),
-# parameter families (Beta R2, simplex phi, half-Normal-or-literal tau),
-# and override addressees. Share counts need design widths, so they wait
-# for `_validate_r2d2_data`.
-function _validate_r2d2(plan::StructuralPlan)
-    seen = Set{Symbol}()
-    for rp in plan.r2d2_priors
-        pred = nothing
-        for p in plan.predictors
-            p.name === rp.predictor && (pred = p)
-        end
-        pred === nothing && _fail(:plan,
-            "R2D2 prior addresses unknown predictor $(rp.predictor)")
-        rp.predictor in seen && _fail(:plan,
-            "duplicate R2D2 prior for predictor $(rp.predictor) " *
-            "(one per predictor)")
-        push!(seen, rp.predictor)
-        r2 = nothing
-        for p in plan.parameters
-            p.name === rp.r2 && (r2 = p)
-        end
-        r2 === nothing && _fail(rp.predictor,
-            "R2D2 R2 parameter $(rp.r2) is not a sampled parameter")
-        r2.family === :beta || _fail(rp.predictor,
-            "R2D2 R2 parameter $(rp.r2) must be Beta, got $(r2.family)")
-        # phi linkage + family ride _validate_vector_parameters; tau:
-        if rp.tau isa Symbol
-            tau = nothing
-            for p in plan.parameters
-                p.name === rp.tau && (tau = p)
-            end
-            tau === nothing && _fail(rp.predictor,
-                "R2D2 tau $(rp.tau) names neither a sampled parameter " *
-                "nor a literal (data tau_bsv inlines as a literal)")
-            (tau.family === :normal && tau.support_override === :positive) ||
-                _fail(rp.predictor,
-                    "sampled R2D2 tau $(rp.tau) must be half-Normal " *
-                    "(`HalfNormal(s)`), got $(tau.family) with " *
-                    "override $(repr(tau.support_override))")
-        else
-            isfinite(rp.tau) && rp.tau > 0 || _fail(rp.predictor,
-                "literal R2D2 tau must be finite and strictly positive " *
-                "(SB `_sb_r2d2_positive`), got $(repr(rp.tau))")
-        end
-        allowed = Set{Symbol}()
-        for t in pred.terms
-            if t.kind === MatrixTerm
-                m = _find_matrix(plan, t.options.matrix)
-                m === nothing && _fail(:plan,
-                    "internal: matrix term $(t.label) addresses unknown " *
-                    "matrix (validate_predictors should have caught this)")
-                union!(allowed, _matrix_element_addressees(m))
-                continue
-            end
-            push!(allowed, t.addressee)
-        end
-        any(t -> t.kind === InterceptTerm, pred.terms) &&
-            push!(allowed, :Intercept)
-        for (addr, (loc, sca)) in rp.overrides
-            addr in allowed || _fail(rp.predictor,
-                "R2D2 override addresses $addr, not a column of " *
-                "predictor $(rp.predictor)")
-            isfinite(loc) && isfinite(sca) && sca > 0 || _fail(rp.predictor,
-                "R2D2 override for $addr must be Normal(finite, " *
-                "positive), got ($(repr(loc)), $(repr(sca)))")
-        end
-    end
-    return nothing
-end
-
-# R2D2 data checks: the share composition needs design widths + bound
-# columns. Runs at bind (after levelmaps bind, after phi size inference).
-function _validate_r2d2_data(plan::StructuralPlan)
-    isempty(plan.r2d2_priors) && return nothing
-    for rp in plan.r2d2_priors
-        pred = only(p for p in plan.predictors if p.name === rp.predictor)
-        shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
-            matrices = plan.matrices)
-        share, _, _, varx =
-            r2d2_column_scales(shape, plan.columns, rp.overrides)
-        n_shares = isempty(share) ? 0 : maximum(share)
-        n_shares == 0 && _fail(rp.predictor,
-            "R2D2 over predictor $(rp.predictor) decomposes nothing " *
-            "(intercept-only or every column overridden) — the flat " *
-            "slice has no hierarchical-lane rule to no-op for")
-        phi = only(p for p in plan.vector_parameters if p.name === rp.phi)
-        phi.size == n_shares || _fail(rp.predictor,
-            "R2D2 phi $(rp.phi) has $(phi.size) shares but predictor " *
-            "$(rp.predictor) decomposes $n_shares columns")
-        for j in eachindex(share)
-            share[j] == 0 && continue
-            isfinite(varx[j]) && varx[j] > 0 || _fail(rp.predictor,
-                "R2D2 column $j of predictor $(rp.predictor) has " *
-                "non-positive variance $(repr(varx[j])) — a constant " *
-                "column cannot join the simplex (drop it or give it " *
-                "an explicit Normal prior)")
-        end
-    end
-    return nothing
-end
-
-# Horseshoe structural checks: predictor linkage, one structured prior
-# per predictor, scalar-only addressees on scalar-only predictors, use
-# polarity, finite positive scales, and triple linkage (each entry's
-# (raw, lambda, tau) sampled parameters exist with the SB geometry:
-# standard-Normal raw and normalized half-Cauchy scales agreeing with the entry).
-function _validate_horseshoe(plan::StructuralPlan)
-    r2d2 = Set{Symbol}(rp.predictor for rp in plan.r2d2_priors)
-    seen = Set{Tuple{Symbol,Symbol}}()
-    by_name = Dict{Symbol,SampledParameter}(
-        p.name => p for p in plan.parameters)
-    for h in plan.horseshoe_priors
-        pred = nothing
-        for p in plan.predictors
-            p.name === h.predictor && (pred = p)
-        end
-        pred === nothing && _fail(:plan,
-            "horseshoe prior addresses unknown predictor $(h.predictor)")
-        h.predictor in r2d2 && _fail(:plan,
-            "predictor $(h.predictor) carries both an R2D2Prior and a " *
-            "HorseshoePrior — one structured prior per predictor")
-        key = (h.predictor, h.addressee)
-        key in seen && _fail(:plan, "duplicate horseshoe prior for $key")
-        push!(seen, key)
-        for t in pred.terms
-            (t.kind === InterceptTerm || t.kind === ContinuousTerm ||
-                t.kind === OffsetTerm) || _fail(h.predictor,
-                "horseshoe over predictor $(h.predictor) meets a " *
-                "$(t.kind) term — the flat slice covers " *
-                "intercept/continuous coefficients only")
-        end
-        addrs = Set{Symbol}()
-        for t in pred.terms
-            t.kind === InterceptTerm && push!(addrs, :Intercept)
-            t.kind === ContinuousTerm && push!(addrs, only(t.columns))
-        end
-        h.addressee in addrs || _fail(h.predictor,
-            "horseshoe prior addresses $(h.addressee), not an " *
-            "intercept/continuous column of predictor $(h.predictor)")
-        (h.sign == 1 || h.sign == -1) || _fail(h.predictor,
-            "horseshoe prior for $key has sign $(h.sign) (use polarity " *
-            "is +1/-1)")
-        isfinite(h.local_scale) && h.local_scale > 0 || _fail(h.predictor,
-            "horseshoe prior for $key has local_scale " *
-            "$(repr(h.local_scale)) (finite strictly positive)")
-        isfinite(h.global_scale) && h.global_scale > 0 || _fail(h.predictor,
-            "horseshoe prior for $key has global_scale " *
-            "$(repr(h.global_scale)) (finite strictly positive)")
-        raw = get(by_name, horseshoe_raw_name(h.predictor, h.addressee),
-            nothing)
-        raw === nothing && _fail(h.predictor,
-            "horseshoe prior for $key names no raw parameter " *
-            "($(horseshoe_raw_name(h.predictor, h.addressee)))")
-        (raw.family === :normal && raw.args == (arg1 = 0, arg2 = 1) &&
-            raw.support_override === nothing) || _fail(h.predictor,
-            "horseshoe raw $(raw.name) must be standard-Normal " *
-            "(identity support), got $(raw.family)$(raw.args) with " *
-            "override $(repr(raw.support_override))")
-        for (nm, sc, role) in (
-                (horseshoe_lambda_name(h.predictor, h.addressee),
-                    h.local_scale, "lambda"),
-                (horseshoe_tau_name(h.predictor, h.addressee),
-                    h.global_scale, "tau"))
-            q = get(by_name, nm, nothing)
-            q === nothing && _fail(h.predictor,
-                "horseshoe prior for $key names no $role parameter ($nm)")
-            (q.family === :cauchy && q.support_override === :positive &&
-                length(q.args) == 2 && q.args[1] == 0 &&
-                q.args[2] == sc) || _fail(h.predictor,
-                "horseshoe $role $nm must be normalized HalfCauchy($sc), got $(q.family)$(q.args) " *
-                "with override $(repr(q.support_override))")
-        end
-    end
-    # Non-horseshoe addressees of a horseshoe predictor ride Normal
-    # scalars (the mixed-predictor coordinate).
-    for pname in Set{Symbol}(h.predictor for h in plan.horseshoe_priors)
-        pred = only(p for p in plan.predictors if p.name === pname)
-        hs_addrs = Set{Symbol}(h.addressee
-            for h in plan.horseshoe_priors if h.predictor === pname)
-        for t in pred.terms
-            addr = t.kind === InterceptTerm ? :Intercept :
-                t.kind === ContinuousTerm ? only(t.columns) : nothing
-            addr === nothing && continue
-            addr in hs_addrs && continue
-            nm = horseshoe_normal_name(pname, addr)
-            q = get(by_name, nm, nothing)
-            q === nothing && _fail(pname,
-                "horseshoe predictor $pname addressee $addr carries " *
-                "neither an entry nor its Normal scalar ($nm)")
-            (q.family === :normal && q.support_override === nothing &&
-                length(q.args) == 2 && isfinite(q.args[1]) &&
-                isfinite(q.args[2]) && q.args[2] > 0) || _fail(pname,
-                "horseshoe Normal scalar $nm must be " *
-                "Normal(finite, positive) (identity support), got " *
-                "$(q.family)$(q.args) with override " *
-                "$(repr(q.support_override))")
         end
     end
     return nothing
@@ -9144,11 +5181,6 @@ function _validate_responses(plan::StructuralPlan)
                 "response range $(r.range) is empty")
         end
     end
-    for kp in plan.kernel_plates
-        for (p, _) in kp.lp_args
-            push!(used_predictors, p)
-        end
-    end
     # Composed sub-predictors are used by their composed predictor (the
     # tree references them, not any response slot).
     for pred in plan.predictors
@@ -9160,7 +5192,7 @@ function _validate_responses(plan::StructuralPlan)
     for pred in plan.predictors
         pred.name in used_predictors ||
             _fail(pred.label, "predictor $(pred.name) unused by any " *
-                  "response or kernel LP arg")
+                  "response")
     end
     return nothing
 end
@@ -9913,729 +5945,6 @@ const _ROLE_RANK = Dict{Symbol,Int}(
 _upgrade_role!(roles, col, role) =
     _ROLE_RANK[roles[col]] < _ROLE_RANK[role] && (roles[col] = role)
 
-# Bind-time spline fit (the Stan transformed-data mirror): fit each basis
-# from its raw axis columns (host, full LAPACK — eigen/nullspace are
-# inexpressible in-graph), assert the fitted widths equal the declared
-# static widths, and materialize one bound vector per basis column under
-# the contract's <id>_<block>_<j> names. Caller-supplied columns under a
-# materialized name are rejected (reserved-name exclusivity); the fit's
-# own errors surface as ContractValidationErrors with the [spline] tag.
-# Bind-time HSGP fit (the spline host-side transformed-data mirror):
-# fills each basis's (mu, L) per axis from the RAW bound columns (SB
-# `_brm_fit_hsgp` verbatim: `mu = mean(x)`, `L = c*max|x-mu|`).
-# Degenerate axes (L == 0 — constant columns) and non-finite data
-# fail closed here (bind owns data errors); the basis itself is
-# evaluated in-graph in Stage B from the raw columns + these frozen
-# fits (bind-then-build ordering keeps them consistent across
-# rebinds — the SB DATA-vs-literal concern).
-"""One HSGP axis fit (SB `_brm_fit_hsgp` 1-D verbatim): `mu =
-mean(col)`, `L = c*max|col-mu|`, numeric/nonempty/finite/`L > 0`
-gates. Shared by basis binds."""
-function _hsgp_axis_fit(col::AbstractVector, c::Real, label::Symbol,
-        where::String)
-    eltype(col) <: Real ||
-        _fail(label, "$where must be numeric, got $(eltype(col))")
-    isempty(col) &&
-        _fail(label, "$where is empty")
-    mu = sum(col) / length(col)
-    L = Float64(c) * maximum(abs.(col .- mu))
-    isfinite(mu) && isfinite(L) ||
-        _fail(label, "$where is non-finite (mu=$mu, L=$L)")
-    L > 0 ||
-        _fail(label, "$where is degenerate " *
-              "(L == 0 — a constant column has no usable domain)")
-    return (Float64(mu), L)
-end
-
-function _fit_hsgp_bases(plan::StructuralPlan,
-        columns::AbstractDict{Symbol})
-    isempty(plan.hsgp_bases) && return HSGPBasis[]
-    out = HSGPBasis[]
-    for hb in plan.hsgp_bases
-        if hb.cov === :periodic
-            # No domain to fit (SB `_brm_hsgp_basis_state` periodic
-            # branch): the axis still binds as a numeric finite vector
-            # (SB `_brm_gp_axes` — no degeneracy gate, a constant axis
-            # is a usable periodic domain).
-            c = only(hb.axes)
-            haskey(columns, c) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
-                      "not bound")
-            col = _vector_column(columns, c, hb.label, "hsgp axis column")
-            eltype(col) <: Real ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
-                      "be numeric, got $(eltype(col))")
-            all(isfinite, col) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
-                      "must be finite")
-            push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso,
-                Tuple{Float64,Float64}[], hb.label, hb.cov, hb.period,
-                hb.rho_prior, hb.sigma_prior, hb.domain))
-            continue
-        end
-        fits = Tuple{Float64,Float64}[]
-        for (j, (c, cj)) in enumerate(zip(hb.axes, hb.c))
-            haskey(columns, c) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
-                      "not bound")
-            col = _vector_column(columns, c, hb.label, "hsgp axis column")
-            if hb.domain === nothing
-                push!(fits, _hsgp_axis_fit(col, cj, hb.label,
-                    "hsgp :$(hb.id): axis column $c"))
-            else
-                # Fixed domain (SB `_brm_hsgp_domain_fits` /
-                # `_brm_check_hsgp_domain`): the data must lie inside.
-                lo, hi = hb.domain[j]
-                eltype(col) <: Real && all(isfinite, col) ||
-                    _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
-                          "must be finite numeric")
-                all(v -> lo <= v <= hi, col) || _fail(hb.label,
-                    "hsgp :$(hb.id): axis column $c has values outside " *
-                    "its fixed domain ($lo, $hi)")
-                push!(fits, ((lo + hi) / 2, (hi - lo) / 2))
-            end
-        end
-        by = hb.by
-        if by !== nothing && by.levels === nothing
-            haskey(columns, by.column) || _fail(hb.label, "hsgp " *
-                ":$(hb.id): grouping column $(by.column) is not bound")
-            gcol = _vector_column(columns, by.column, hb.label,
-                "hsgp grouping column")
-            levels = try
-                _grouping_levels(gcol)
-            catch err
-                _fail(hb.label, "hsgp :$(hb.id): grouping column " *
-                    "$(by.column) levels not orderable ($err)")
-            end
-            by = HSGPGrouping(by.column, collect(Any, levels))
-        end
-        push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, fits,
-            hb.label, hb.cov, hb.period, hb.rho_prior, hb.sigma_prior,
-            hb.domain, by))
-    end
-    return out
-end
-
-function _materialize_splines!(plan::StructuralPlan,
-        columns::Dict{Symbol,ColumnData})
-    isempty(plan.spline_bases) && return SplineBasis[]
-    out = SplineBasis[]
-    for sb in plan.spline_bases
-        axes = AbstractVector[]
-        for c in sb.axes
-            haskey(columns, c) ||
-                _fail(sb.label, "spline :$(sb.id): axis column $c is " *
-                      "not bound")
-            axiscol =
-                _vector_column(columns, c, sb.label, "spline axis column")
-            eltype(axiscol) <: Real ||
-                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
-                      "be numeric, got $(eltype(axiscol))")
-            push!(axes, axiscol)
-        end
-        wantcols = _spline_basis_columns(sb.id, sb.kind, sb.k)
-        for (_, cols) in wantcols, c in cols
-            haskey(columns, c) && _fail(sb.label,
-                "column $c is reserved for spline :$(sb.id)'s " *
-                "materialized basis — rename the caller-supplied column")
-        end
-        mats = sb.kind === :tps ?
-            collect(_rk_apply_spline(_rk_fit_spline(axes[1]; k=sb.k),
-                axes[1])) :
-            collect(_rk_apply_t2(_rk_fit_t2(axes[1], axes[2]; k=sb.k),
-                axes[1], axes[2]))
-        blocks = SplineBasisBlock[]
-        for (bi, (name, cols)) in enumerate(wantcols)
-            size(mats[bi], 2) == length(cols) || _fail(sb.label,
-                "spline :$(sb.id): fitted block :$name has width " *
-                "$(size(mats[bi], 2)), declared $(length(cols))")
-            for (j, c) in enumerate(cols)
-                columns[c] = Vector{Float64}(mats[bi][:, j])
-            end
-            push!(blocks, SplineBasisBlock(name, length(cols), cols))
-        end
-        push!(out, SplineBasis(sb.id, sb.kind, sb.axes, sb.k, blocks,
-            sb.label))
-    end
-    return out
-end
-
-# Result space of each CELL_FNS entry (:reads = flat read-space,
-# :obs = obs-space, :scalar). The generator lowers reads per subject
-# and vcats; gathers move reads to obs. The AUC cell returns the flat
-# per-subject `[conc; auc]` blocks (length 2R) — still read-space
-# (gathers move it to an axis first).
-const CELL_FN_RESULT_SPACE = Dict{Symbol,Symbol}(
-    :linear_pk_read_locs => :reads, :linear_pk_read_locs_auc => :reads)
-
-# Bind-time grouped cell shapes: :scalar (LP cell params, model
-# scalars, literals, scalar arithmetic), (:obs, len) (response slices
-# at column length, gathers at map length, dotted obs arithmetic at
-# the common axis length), :reads (cell-call results). Axis IS length
-# (two foreign axes with equal row counts mix silently — the accepted
-# hole: even Stan would not catch it; the fixed joint program + parity
-# tests guard the deliverable). Read-space arithmetic fails closed
-# (gather to the obs axis first — the SB shape); undotted ops over
-# obs/read operands fail closed (write the dotted form — the panel
-# precedent); dotted ops over mismatched axis lengths fail closed
-# naming the axes. Assignments pass through UNCHANGED (no flat dotify
-# — each PK call emits a subject plate containing scans); this pass only proves
-# shapes.
-function _grouped_cell_shapes(kp::KernelPlate,
-        slices::Vector{Tuple{Symbol,Symbol,Symbol}},
-        columns::Dict{Symbol,ColumnData})
-    shapes = Dict{Symbol,Any}()
-    for (col, p, _) in slices
-        shapes[p] = (:obs, length(columns[col]))
-    end
-    for (_, c) in kp.lp_args
-        shapes[c] = :scalar
-    end
-    for (nm, ex) in kp.assignments
-        shapes[nm] = _grouped_cell_shape(ex, kp, shapes, columns)
-    end
-    return shapes
-end
-
-"""Whether a grouped shape is an obs-axis shape (vs :scalar/:reads)."""
-_is_obs_shape(s) = s isa Tuple && s[1] === :obs
-
-# One dotted operation's result shape (shared by dotted-operator
-# `:call`s and dotted-math `:.`s): read-space fails closed (gather
-# first); obs operands must share one axis length (mismatch fails
-# closed naming the axes); scalars broadcast.
-function _dotted_obs_shape(label::Symbol, ex::Expr, spaces::Vector)
-    any(==(:reads), spaces) &&
-        _fail(label, "read-space arithmetic does not lower — " *
-              "gather to the obs axis first " *
-              "(`reads[sched.obs_map]`), then compute")
-    lens = sort!(unique!([s[2] for s in spaces if _is_obs_shape(s)]))
-    if length(lens) > 1
-        _fail(label, "dotted operation mixes obs axes of length " *
-              join(lens, " and ") * " (operands must share one " *
-              "axis — gather each series to its axis first; got " *
-              "$(repr(ex)))")
-    end
-    return isempty(lens) ? :scalar : (:obs, only(lens))
-end
-
-function _grouped_cell_shape(ex, kp::KernelPlate, shapes::Dict{Symbol,Any},
-        columns::Dict{Symbol,ColumnData})
-    label = kp.label
-    ex isa Number && return :scalar
-    ex isa LineNumberNode && return :scalar
-    # Model scalars (params/assignments) default scalar — structure
-    # proved every other Symbol is a cell name in `shapes`.
-    ex isa Symbol && return get(shapes, ex, :scalar)
-    head = ex.head
-    if head === :call
-        fn = ex.args[1]
-        if fn isa Symbol && fn in CELL_FNS
-            trailing = ex.args[3:end]
-            if (fn === :linear_pk_read_locs &&
-                    length(ex.args) == CELL_FN_ARITY[fn] + 2) ||
-                    fn === :linear_pk_read_locs_auc
-                # The event-LP second arg is the provider's flat
-                # event-axis vector (validated above), not a
-                # scalar — the LP scalars start one later.
-                trailing = ex.args[4:end]
-            end
-            for arg in trailing
-                aspace = _grouped_cell_shape(arg, kp, shapes, columns)
-                aspace === :scalar ||
-                    _fail(label, "cell call `$fn` argument `$(arg)` is " *
-                          "$aspace-space (call args past the schedule " *
-                          "are per-subject LP cell params or model " *
-                          "scalars)")
-            end
-            return CELL_FN_RESULT_SPACE[fn]
-        end
-        if fn isa Symbol && fn in SEGMENT_CELL_FNS
-            # The nadir runs over one obs-axis row series (one entry
-            # per row out); the ends column's segment contract is
-            # proved by the nadir validator (bound plans).
-            changeshape =
-                _grouped_cell_shape(ex.args[2], kp, shapes, columns)
-            changeshape === :reads &&
-                _fail(label, "cell call `$fn` change argument is " *
-                      "read-space — gather to the obs axis first " *
-                      "(`reads[sched.obs_map]` / `v[map]`)")
-            _is_obs_shape(changeshape) ||
-                _fail(label, "cell call `$fn` change argument is " *
-                      "scalar (the nadir runs over a row series)")
-            endscol = ex.args[3]
-            haskey(columns, endscol) ||
-                _fail(label, "cell call `$fn` ends `$endscol` is not " *
-                      "bound (bind_data columns carry it)")
-            return (:obs, changeshape[2])
-        end
-        # Dotted operators (`mu .+ e`): scalars broadcast; obs
-        # operands must share one axis length (mismatch fails closed
-        # naming the axes); read-space fails closed (gather first).
-        if fn isa Symbol && fn in ELEMENTWISE_OPS
-            spaces = [_grouped_cell_shape(a, kp, shapes, columns)
-                      for a in ex.args[2:end]]
-            return _dotted_obs_shape(label, ex, spaces)
-        end
-        # Undotted arithmetic (operator or math function): scalar-only.
-        # Grouped cells emit verbatim (no flat dotify), so an undotted
-        # obs operand fails closed (write the dotted form) and a
-        # read-space operand fails closed (gather to the obs axis
-        # first).
-        if fn isa Symbol && fn in ASSIGNMENT_FNS
-            spaces = [_grouped_cell_shape(a, kp, shapes, columns)
-                      for a in ex.args[2:end]]
-            any(==(:reads), spaces) &&
-                _fail(label, "read-space arithmetic does not lower — " *
-                      "gather to the obs axis first " *
-                      "(`reads[sched.obs_map]`), then compute")
-            any(_is_obs_shape, spaces) &&
-                _fail(label, "undotted `$fn` over obs-space series does " *
-                      "not lower — write the dotted form")
-            return :scalar
-        end
-        return _fail(label, "call `$fn` has no grouped shape rule " *
-                            "(internal: structure validation admits it " *
-                            "but bind does not)")
-    end
-    if head === :.
-        spaces = [_grouped_cell_shape(a, kp, shapes, columns)
-                  for a in ex.args[2].args]
-        return _dotted_obs_shape(label, ex, spaces)
-    end
-    if head === :ref
-        src, idx = ex.args[1], ex.args[2]
-        srcshape = if src isa Expr && src.head === :vect
-            all(a -> _grouped_cell_shape(a,kp,shapes,columns) === :scalar,src.args) ||
-                _fail(label,"literal gather entries must be scalar")
-            (:obs,length(src.args))
-        else
-            _grouped_cell_shape(src,kp,shapes,columns)
-        end
-        # Response slices are leaves (structure admits the shape;
-        # bind proves the space — the v1 pin).
-        src isa Symbol && src in _slice_params(kp) &&
-            _fail(label, "gather source `$src` is not read-space " *
-                  "(response slices are leaves — gathers read " *
-                  "cell-call results, LP cell params, or cell locals: " *
-                  "`reads[sched.obs_map]` / `v[map]`)")
-        is_lp = src isa Symbol && src in _lp_cell_params(kp)
-        (srcshape === :reads || _is_obs_shape(srcshape) || is_lp) ||
-            _fail(label, "gather source `$src` is scalar (gathers read " *
-                  "cell-call results, LP cell params, or cell locals: " *
-                  "`reads[sched.obs_map]` / `v[map]`)")
-        mapcol = idx isa Symbol ? idx :
-            _sched_col_name(idx.args[1], idx.args[2].value)
-        haskey(columns, mapcol) ||
-            _fail(label, "gather map `$mapcol` is not bound " *
-                  "(bind_data columns carry gather maps)")
-        return (:obs, length(columns[mapcol]))
-    end
-    return _fail(label, "unsupported expression head $head in a grouped " *
-                        "cell (internal)")
-end
-
-# Per-obs axis agreement: each in-cell observation's response sets the
-# axis length; location/scale/params refs that are non-scalar must
-# match it exactly (literals and model scalars broadcast). Structure
-# proved every Symbol is a cell name or a model scalar; LP cell params
-# as obs args already failed there (gather explicitly).
-function _validate_grouped_obs_axes(kp::KernelPlate,
-        shapes::Dict{Symbol,Any}, columns::Dict{Symbol,ColumnData})
-    for obs in kp.obs
-        rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
-        rlen = length(columns[rcol])
-        refs = Any[(:location, obs.location), (:scale, obs.scale)]
-        append!(refs, [(:params, pr) for pr in obs.params])
-        for (nm, ref) in refs
-            ref isa Number && continue
-            s = get(shapes, ref, :scalar)
-            s === :scalar && continue
-            s === :reads &&
-                _fail(kp.label, "kernel obs $nm `$ref` is read-space " *
-                      "(gather to the response axis first: " *
-                      "`reads[sched.obs_map]` / `v[map]`)")
-            s[2] == rlen ||
-                _fail(kp.label, "kernel obs $nm `$ref` has length " *
-                      "$(s[2]) ≠ response `$(obs.response)` length " *
-                      "$rlen (one value per response row — gather " *
-                      "each arg to the response axis)")
-        end
-    end
-    return nothing
-end
-
-# Prove grouped cell shapes + per-obs axis agreement (single site for
-# bind resolution + bound-plan validation, so hand-bound plans carry
-# proved shapes too — never trusted ones). Returns the shapes.
-function _prove_grouped_cell_shapes(kp::KernelPlate,
-        slices::Vector{Tuple{Symbol,Symbol,Symbol}},
-        columns::Dict{Symbol,ColumnData})
-    shapes = _grouped_cell_shapes(kp, slices, columns)
-    _validate_grouped_obs_axes(kp, shapes, columns)
-    return shapes
-end
-
-# Segmented-nadir ends contract (bound plans): each nadir call's ends
-# column is integer-valued with one cumulative end per subject,
-# nondecreasing from a non-negative start, last end == change length
-# (shapes proved the ends bound + the change an obs series, so the
-# lengths below are total).
-function _validate_nadir_ends(kp::KernelPlate, shapes::Dict{Symbol,Any},
-        columns::Dict{Symbol,ColumnData})
-    n_sub = kp.subjects
-    for (nm, ex) in kp.assignments
-        ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-            ex.args[1] isa Symbol && ex.args[1] in SEGMENT_CELL_FNS ||
-            continue
-        fn = ex.args[1]
-        endscol = ex.args[3]
-        ends = columns[endscol]
-        eltype(ends) <: Integer ||
-            _fail(kp.label, "cell call `$fn` ends `$endscol` must be " *
-                  "an integer column, got $(eltype(ends))")
-        length(ends) == n_sub ||
-            _fail(kp.label, "cell call `$fn` ends `$endscol` has length " *
-                  "$(length(ends)) ≠ subjects $n_sub (one cumulative " *
-                  "end per subject)")
-        issorted(ends) ||
-            _fail(kp.label, "cell call `$fn` ends `$endscol` must be " *
-                  "nondecreasing (got $ends)")
-        ends[1] >= 0 ||
-            _fail(kp.label, "cell call `$fn` ends `$endscol` must be " *
-                  "non-negative (got $ends)")
-        n_rows = shapes[nm][2]
-        ends[end] == n_rows ||
-            _fail(kp.label, "cell call `$fn` ends `$endscol` last end " *
-                  "$(ends[end]) ≠ change length $n_rows")
-    end
-    return nothing
-end
-
-# Gather-map prep contract (bound plans): every gather's map column is
-# integer-valued, with values inside the source's index range —
-# subject maps (LP-vector sources) within 1..n_sub, read-space maps
-# within the flat reads (R for v1 cells, 2R for AUC cells, from the
-# built schedule), obs-axis maps within the source axis length. Shapes
-# proved bound-ness + source spaces; this proves content.
-function _validate_grouped_gather_maps(kp::KernelPlate,
-        shapes::Dict{Symbol,Any}, columns::Dict{Symbol,ColumnData},
-        n_reads_total::Int)
-    n_sub = kp.subjects
-    for (_, ex) in kp.assignments
-        for (src, mapcol) in _collect_grouped_gather_uses(ex)
-            mapv = columns[mapcol]
-            eltype(mapv) <: Integer ||
-                _fail(kp.label, "gather map `$mapcol` must be an " *
-                      "integer column, got $(eltype(mapv))")
-            if src isa Expr
-                bound = length(src.args)
-                all(1 .<= mapv .<= bound) ||
-                    _fail(kp.label,"gather map `$mapcol` has entries outside 1..$bound (scalar vector literal)")
-            elseif src in _lp_cell_params(kp)
-                all(1 .<= mapv .<= n_sub) ||
-                    _fail(kp.label, "subject map `$mapcol` has entries " *
-                          "outside 1..$n_sub (gathered `$src` is " *
-                          "per-subject — one subject id per row)")
-            else
-                srcshape = shapes[src]
-                bound = srcshape === :reads ?
-                    _gather_reads_bound(kp, src, n_reads_total) :
-                    srcshape[2]
-                all(1 .<= mapv .<= bound) ||
-                    _fail(kp.label, "gather map `$mapcol` has entries " *
-                          "outside 1..$bound (gathered `$src` has " *
-                          "$bound rows)")
-            end
-        end
-    end
-    return nothing
-end
-
-# Flat reads length behind a read-space gather source: R for v1 cells,
-# 2R for AUC cells (per-subject `[conc; auc]` blocks). Shapes proved
-# the source is a cell-call result, so the producing call exists.
-function _gather_reads_bound(kp::KernelPlate, src::Symbol, n_reads_total::Int)
-    for (nm, ex) in kp.assignments
-        if nm === src && ex isa Expr && ex.head === :call
-            return ex.args[1] === :linear_pk_read_locs_auc ?
-                2 * n_reads_total : n_reads_total
-        end
-    end
-    _fail(kp.label, "gather source `$src` has no producing cell call " *
-          "(internal)")
-end
-
-# Every gather use `(source, map-column)` in a cell RHS (sources are
-# cell names, maps schedule maps or plain bind columns — structure
-# proved the shapes).
-function _collect_grouped_gather_uses(ex)
-    out = Tuple{Union{Symbol,Expr},Symbol}[]
-    _collect_grouped_gather_uses!(out, ex)
-    return out
-end
-
-function _collect_grouped_gather_uses!(out::Vector{Tuple{Union{Symbol,Expr},Symbol}}, ex)
-    ex isa Expr || return nothing
-    if ex.head === :ref && length(ex.args) == 2
-        src, idx = ex.args[1], ex.args[2]
-        mapcol = idx isa Symbol ? idx :
-            _sched_col_name(idx.args[1], idx.args[2].value)
-        push!(out, (src, mapcol))
-    end
-    for a in ex.args
-        _collect_grouped_gather_uses!(out, a)
-    end
-    return nothing
-end
-
-# TGI axis order (bound plans, tgi declared): rows grouped by subject
-# with nondecreasing times within each subject (SB `_joint_tgi_rows`
-# order — the bind derives cumulative ends from the subject column
-# and cannot reorder caller rows, so unordered frames fail closed).
-function _validate_tgi_axis_order(kp::KernelPlate,
-        sched::LinearPKScheduleSpec, columns::Dict{Symbol,ColumnData})
-    sched.tgi === nothing && return nothing
-    tsubj = columns[sched.tgi[1]]
-    ttime = columns[sched.tgi[2]]
-    issorted(tsubj) ||
-        _fail(kp.label, "tgi subject column `$(sched.tgi[1])` must be " *
-              "grouped by subject (sort rows by (subject, time) — SB " *
-              "`_joint_tgi_rows` order)")
-    for s in 1:kp.subjects
-        ts = [ttime[i] for i in eachindex(tsubj, ttime) if tsubj[i] == s]
-        issorted(ts) ||
-            _fail(kp.label, "tgi time column `$(sched.tgi[2])` must be " *
-                  "nondecreasing within subject $s (the nadir runs " *
-                  "over time-ordered rows)")
-    end
-    return nothing
-end
-
-# Grouped-kernel bind resolution: dims keys resolve `subjects` (no
-# timepoints — leftover keys fail closed); the schedule builds from raw
-# columns and must cover exactly n_sub subjects; op columns + maps
-# materialize (`<sched>_<field>`, caller collisions fail closed);
-# slices resolve to :response against the schedule's obs axis; cell
-# shapes resolve (scalar/obs/reads). Returns the resolved node; the
-# input plan is untouched.
-function _resolve_grouped_kernel!(plan::StructuralPlan, kp::KernelPlate,
-        columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer},
-        consumed::Set{Symbol})
-    for (k, v) in dims
-        v > 0 ||
-            _fail(kp.label, "dims key `$k` must bind a positive integer, " *
-                  "got $v")
-    end
-    # Leftovers fail once, globally, in `_resolve_kernels!` (a key for a
-    # sibling plate is not this plate's typo).
-    sched = only(kp.schedules)
-    built = _build_grouped_schedule(plan, kp, columns)
-    n_sub = if kp.subjects isa Int
-        kp.subjects
-    elseif kp.subjects === nothing
-        # Shape from named data: the schedule's subject column (subjects
-        # are 1:n, proved by the build) — no dims key.
-        built.n_subjects
-    else
-        haskey(dims, kp.subjects) ||
-            _fail(kp.label, "subjects dims key `$(kp.subjects)` is not " *
-                  "bound (bind_data `dims` carries it; admitted: an " *
-                  "integer literal or a dims-key name)")
-        push!(consumed, kp.subjects)
-        Int(dims[kp.subjects])
-    end
-    # Dose/PK coherence (v2 axis 1): dose rows must feed the model and
-    # PK calls need dose rows. Dose-free subjects alongside dosed ones
-    # stay admitted — this gates only the global emptiness.
-    ndose = length(columns[sched.dose_subj])
-    if _cell_has_pk_call(kp.assignments)
-        ndose > 0 ||
-            _fail(kp.label, "cell calls a PK recurrence but schedule " *
-                  "`$(sched.name)` binds no dose rows (bind dose data " *
-                  "or drop the call)")
-    elseif ndose > 0
-        _fail(kp.label, "schedule `$(sched.name)` binds $ndose dose " *
-              "rows but the cell makes no PK call (missing read_locs " *
-              "call? — or bind empty dose columns for a dose-free plate)")
-    end
-    built.n_subjects == n_sub ||
-        _fail(kp.label, "schedule `$(sched.name)` covers " *
-              "$(built.n_subjects) subjects ≠ subjects $n_sub")
-    for f in vcat(collect(_sched_materialized_fields(sched)),
-            _sched_extra_fields(sched, kp.assignments))
-        col = _sched_col_name(sched.name, f)
-        haskey(columns, col) &&
-            _fail(kp.label, "column `$col` is reserved for schedule " *
-                  "`$(sched.name)`'s bind product — rename the " *
-                  "caller-supplied column")
-        columns[col] = getfield(built, f)
-    end
-    slices2 = Tuple{Symbol,Symbol,Symbol}[]
-    for (col, param, _) in kp.slices
-        haskey(columns, col) ||
-            _fail(kp.label, "slice column `$col` is not bound")
-        # Any length admits (foreign-axis responses ride their own
-        # axis — the first-obs-on-primary rule is the n_obs check in
-        # bound-plan validation); per-obs axis agreement is proved on
-        # shapes below.
-        push!(slices2, (col, param, :response))
-    end
-    for obs in kp.obs
-        obs.family === BernoulliLogitFam || continue
-        rcol = only(c for (c, p, _) in slices2 if p === obs.response)
-        flatv = _vector_column(columns, rcol, kp.label, "slice column")
-        _materialize_kernel_bool_twin!(kp, obs, flatv, columns)
-    end
-    _prove_grouped_cell_shapes(kp, slices2, columns)
-    return KernelPlate(kp.result, n_sub, nothing, slices2, kp.assignments,
-        kp.obs, kp.collected, kp.label, kp.lp_args, kp.schedules)
-end
-
-# Kernel-plate bind resolution (the `_RKKernelSpec` layout contract): dims
-# keys resolve `subjects`/`timepoints` to positive ints; slice kinds infer
-# totally from lengths (`n_sub*T` → :vector, `n_sub` → :scalar — at `T ==
-# 1` the lengths coincide and kinds are unobservable, so all-scalar
-# stands); scalar slices in vector models materialize flat T-block
-# expansions (spline-blocks precedent). Each plate consumes its own keys
-# through one shared set (subjects named per plate, or derived from a
-# schedule's subject column; timepoints only via the `kernel_T_<result>`
-# key); leftovers fail once, globally (a key for plate B is not plate
-# A's typo). Returns resolved nodes; the input plan is untouched.
-function _resolve_kernels!(plan::StructuralPlan,
-        columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer})
-    if isempty(plan.kernel_plates)
-        # Nothing consumes a dims key: a key here is a typo or a shape
-        # the model never asks for (plates take their shapes from data).
-        isempty(dims) ||
-            _fail(:plan, "dims key(s) $(sort!(collect(keys(dims)))) not " *
-                  "consumed (the model has no kernel plate — `@plate` " *
-                  "ranges and schedules take their shapes from data)")
-        return KernelPlate[]
-    end
-    # One shared consumed set: each plate consumes its own dims keys;
-    # leftovers fail once, globally (a key for plate B is not plate
-    # A's typo).
-    consumed = Set{Symbol}()
-    out = KernelPlate[]
-    for kp in plan.kernel_plates
-        if _is_grouped_kernel(kp)
-            push!(out,
-                _resolve_grouped_kernel!(plan, kp, columns, dims, consumed))
-        else
-            push!(out,
-                _resolve_panel_kernel!(kp, columns, dims, consumed))
-        end
-    end
-    leftovers = setdiff(Set{Symbol}(keys(dims)), consumed)
-    isempty(leftovers) ||
-        _fail(:plan, "dims key(s) $(sort!(collect(leftovers))) not " *
-              "consumed by any kernel plate (typo'd key? — grouped " *
-              "kernels take no timepoints dims key; multi-plate " *
-              "timepoints keys spell `kernel_T_<result>`)")
-    return out
-end
-
-function _resolve_panel_kernel!(kp::KernelPlate,
-        columns::Dict{Symbol,ColumnData}, dims::AbstractDict{Symbol,<:Integer},
-        consumed::Set{Symbol})
-    for (k, v) in dims
-        v > 0 ||
-            _fail(kp.label, "dims key `$k` must bind a positive integer, " *
-                  "got $v")
-    end
-    n_sub = if kp.subjects isa Int
-        kp.subjects
-    else
-        haskey(dims, kp.subjects) ||
-            _fail(kp.label, "subjects dims key `$(kp.subjects)` is not " *
-                  "bound (bind_data `dims` carries it; admitted: an " *
-                  "integer literal or a dims-key name)")
-        push!(consumed, kp.subjects)
-        Int(dims[kp.subjects])
-    end
-    T = if kp.timepoints isa Int
-        kp.timepoints
-    elseif kp.timepoints isa Symbol
-        haskey(dims, kp.timepoints) ||
-            _fail(kp.label, "timepoints dims key `$(kp.timepoints)` is " *
-                  "not bound (bind_data `dims` carries it)")
-        push!(consumed, kp.timepoints)
-        Int(dims[kp.timepoints])
-    else
-        # Unnamed timepoints (surface always leaves `nothing`): only the
-        # `kernel_T_<result>` key names the plate's T (the slice-length
-        # errors prescribe this spelling). No other key is ever taken as
-        # T — a typo'd or stray key stays unconsumed and fails in the
-        # global leftovers gate, and a T-needing plate fails at its slice
-        # lengths naming the convention.
-        conv = Symbol("kernel_T_$(kp.result)")
-        if haskey(dims, conv)
-            push!(consumed, conv)
-            Int(dims[conv])
-        else
-            nothing
-        end
-    end
-    flat = _kernel_flat_length(n_sub, T)
-    slices2 = Tuple{Symbol,Symbol,Symbol}[]
-    for (col, param, _) in kp.slices
-        haskey(columns, col) ||
-            _fail(kp.label, "slice column `$col` is not bound")
-        colv = _vector_column(columns, col, kp.label, "slice column")
-        L = length(colv)
-        kind = if T === nothing
-            L == n_sub ||
-                _fail(kp.label, "slice `$param` column `$col` has length " *
-                      "$L ≠ n_sub $n_sub and no T dims key is bound " *
-                      "(vector slices need T: bind `kernel_T_$(kp.result)`)")
-            :scalar
-        else
-            # Scalar-first: at T == 1 the lengths coincide and kinds are
-            # unobservable — recovering scalar is numerically identical
-            # (1-element blocks; the inner-1 expansion is identity).
-            L == n_sub ? :scalar :
-                L == n_sub*T ? :vector :
-                _fail(kp.label, "slice `$param` column `$col` has length " *
-                      "$L, neither n_sub $n_sub nor n_sub*T $flat")
-        end
-        push!(slices2, (col, param, kind))
-        if kind === :scalar && T !== nothing
-            exp = _kexp_name(kp.result, col)
-            haskey(columns, exp) &&
-                _fail(kp.label, "column `$exp` is reserved for kernel " *
-                      "plate `$(kp.result)`'s flat expansion of `$col` — " *
-                      "rename the caller-supplied column")
-            # Numeric gate ahead of the T-block conversion (data
-            # validation's twin check runs after this resolve — without
-            # this, a String/Symbol column dies as a raw MethodError).
-            eltype(colv) <: Real ||
-                _fail(kp.label, "slice column `$col` must be numeric, " *
-                      "got $(eltype(colv))")
-            columns[exp] = repeat(colv; inner = T)
-        end
-    end
-    for obs in kp.obs
-        obs.family === BernoulliLogitFam || continue
-        si = findfirst(s -> s[2] === obs.response, slices2)
-        col, kind = slices2[si][1], slices2[si][3]
-        flatv = (kind === :scalar && T !== nothing) ?
-            columns[_kexp_name(kp.result, col)] :
-            _vector_column(columns, col, kp.label, "slice column")
-        _materialize_kernel_bool_twin!(kp, obs, flatv, columns)
-    end
-    resolved0 = KernelPlate(kp.result, n_sub, T, slices2,
-        kp.assignments, kp.obs, kp.collected, kp.label)
-    canon = _canonicalize_kernel_assignments(resolved0)
-    return KernelPlate(kp.result, n_sub, T, slices2,
-        canon, kp.obs, kp.collected, kp.label)
-end
-
-# n_obs derivation skips mi-managed columns (packed y_obs/Jobs), bound
-# module data values and model-level data inputs: every other column
-# crosses at length n, so the first non-managed column pins n_obs
-# order-independently. A bound hand-authored mi plan may supply its full
-# extent explicitly; an unbound plan without an anchor cannot derive it.
 function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
     for (k, v) in columns
         k in managed && continue
@@ -11025,9 +6334,9 @@ function _bound_model_level_inputs(plan::StructuralPlan)
 end
 
 _conditioned_input(name::Symbol) = Symbol("_rkppl_conditioned_", name)
-_has_observation_axis(plan) = !isempty(plan.responses) || !isempty(plan.kernel_plates) ||
+_has_observation_axis(plan) = !isempty(plan.responses) ||
     any(p -> p.range === nothing, plan.plate_parameters) ||
-    !isempty(plan.scans) || !isempty(plan.dar_paths)
+    !isempty(plan.scans)
 
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
 # inside an argument of an undotted module call into `whole`, anywhere
@@ -11519,14 +6828,9 @@ replacing columns + roles): infer column roles, merge explicit `roles` over
 them, and run data validation. Returns a NEW bound plan; the input is
 untouched. Inference precedence: response > trials > evidence > weight >
 group > predictor > data; term columns are the only `:predictor` source, so
-assignment/extra columns stay `:data`. Varying-draws grouping columns
-upgrade to `:group` (grouping dominates predictor use in the label; both
-facts stay visible in terms + draws). Draws blocks with
-`levels === nothing` gain sort-ordered observed levels (SB numbering for
-plain vectors — emitter-declared levels pass through). `dims` binds
-kernel-plate dims keys
-(`subject_count`, `timepoint_count`) to positive integers; every key must
-be consumed. Data values are numbers or arrays of any shape; observation
+assignment/extra columns stay `:data`; `:group` is an explicit role. The retired `dims`
+argument accepts only an empty dictionary; array dimensions and plate ranges
+come from authored expressions. Data values are numbers or arrays of any shape; observation
 values follow their authored broadcast axes and structured operations retain
 their own shape requirements. Data-only definitions that call a module
 function (functions as values) are evaluated here, once, and bound under
@@ -11562,6 +6866,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     observing = intersect(sampled, Set{Symbol}(_conditioned_names(conditioned)))
     plan = _with(plan; conditioned = union(plan.conditioned, observing))
     validate_structure(plan)
+    isempty(dims) || _fail(:bind, "dims keys are not consumed: use explicit array dimensions and authored @plate ranges")
     isempty(columns) && _has_observation_axis(plan) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = _checked_columns(columns)
@@ -11579,12 +6884,6 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     union!(inputs, (_conditioned_input(n) for n in plan.conditioned))
     _materialize_derived_responses!(plan, columns)
     _validate_observed_selections!(plan, columns)
-    bases = _materialize_splines!(plan, columns)
-    hbases = _fit_hsgp_bases(plan, columns)
-    kbases = _resolve_kernels!(plan, columns, dims)
-    # Schedule products now exist: fold definitions that consume them by
-    # the same data-only evaluator, once, before filling parameter shapes.
-    union!(computed, _materialize_module_data!(plan, columns; already = computed))
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))
@@ -11594,29 +6893,6 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     inferred = Dict{Symbol,Symbol}(k => :data for k in keys(columns))
     for pred in plan.predictors, t in pred.terms, c in t.columns
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
-    end
-    for d in plan.varying_draws
-        haskey(inferred, d.group) && _upgrade_role!(inferred, d.group, :group)
-        if d.mm !== nothing
-            for g in d.mm.groups
-                haskey(inferred, g) && _upgrade_role!(inferred, g, :group)
-            end
-        end
-        if d.strata !== nothing
-            by = d.strata.by
-            haskey(inferred, by) && _upgrade_role!(inferred, by, :group)
-        end
-    end
-    for sb in bases, blk in sb.blocks, c in blk.columns
-        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
-    end
-    for hb in hbases, c in hb.axes
-        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
-    end
-    for hb in hbases
-        hb.by === nothing && continue
-        haskey(inferred, hb.by.column) &&
-            _upgrade_role!(inferred, hb.by.column, :group)
     end
     for r in plan.responses
         r.weights !== nothing && haskey(inferred, r.weights) &&
@@ -11640,44 +6916,24 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
             haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
         end
     end
-    for kp in kbases
-        for obs in kp.obs
-            rcol = only(c for (c, p, _) in kp.slices if p === obs.response)
-            haskey(inferred, rcol) && (inferred[rcol] = :response)
-        end
-    end
     merged = merge(inferred, roles)
-    # Kernel plans carry two column lengths by design: n_obs is the
-    # TOTAL likelihood lanes across plates (panel: flat length — vector
-    # models — or n_sub — all-scalar; grouped: primary-response
-    # length) — never first-column. Otherwise n_obs is the first
-    # NON-managed column's ROW count (length for vectors): mi packs
-    # y_obs/Jobs short by design, and Dict order is not a crossing
-    # contract (deriving from a packed column fails every full-length
-    # column by order luck). Observation columns of several lengths are
-    # several observation axes: n_obs is their total rows.
-    axis_plan = _with(plan; columns = columns, spline_bases = bases,
-        hsgp_bases = hbases, kernel_plates = kbases)
+    # Observation statements determine their own axes; unrelated axes add
+    # their likelihood rows without sizing one value from another's extent.
+    axis_plan = _with(plan; columns = columns)
     n = if !_has_observation_axis(plan)
-        1 # There is no observation axis; conditioned declarations have their own shapes.
-    elseif isempty(kbases)
+        1
+    else
         axes = _observation_axes(axis_plan)
         axes === nothing ? _bind_nrows(columns,
             union(_mi_managed_columns(plan), computed, inputs)) : axes.total
-    else
-        axes = _observation_axes(axis_plan)
-        sum(kp -> _kernel_plate_nlanes(kp, columns), kbases) +
-            (axes === nothing ? 0 : axes.total)
     end
     maps = _eval_levelmaps(plan.levelmaps, columns)
-    draws = _eval_draws_levels(plan.varying_draws, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
-            plan.predictors, plan.r2d2_priors, _with(plan; columns = columns, n_obs = n))
+            plan.predictors, _with(plan; columns = columns, n_obs = n))
     bound = _with(plan; responses = responses2, columns = columns,
-        n_obs = n, roles = merged, levelmaps = maps, varying_draws = draws,
-        vector_parameters = vectors2, spline_bases = bases,
-        hsgp_bases = hbases, kernel_plates = kbases)
+        n_obs = n, roles = merged, levelmaps = maps,
+        vector_parameters = vectors2)
     _validate_conditioned_values(bound)
     validate_data(bound)
     return bound
@@ -11746,9 +7002,7 @@ end
 # predictor count; Multinomial: count-column count) or from the response
 # column (max(y) for OrderedLogistic/Ordinal/Categorical); vector-param
 # `size === nothing` fills from the linked response (K−1 thresholds, K
-# simplex), from its frozen concentration length for a monotonic-linked
-# increments simplex (K−1 increments for K levels) or an R2D2-linked
-# share simplex (K shares). Explicit values assert against the
+# simplex), or a declared value shape. Explicit values assert against the
 # inference. Returns new (immutable) vectors; unbound plans keep
 # `nothing`.
 function _dirichlet_size(plan, alpha, label)
@@ -11816,7 +7070,7 @@ end
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         vectors::Vector{VectorParameter}, columns::AbstractDict{Symbol},
         predictors::Vector{PredictorSpec} = PredictorSpec[],
-        r2d2::Vector{R2D2Prior} = R2D2Prior[], plan = nothing)
+        plan = nothing)
     # Explicit extents are ordinary data-only Julia expressions. Resolve
     # them before responses read the vector's declared support.
     vectors = VectorParameter[_resolve_vector_extent(p, plan, columns, responses) for p in vectors]
@@ -11866,16 +7120,6 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             mixture_link[r.mixture_weights] = r.label
         end
     end
-    monotonic_link = Dict{Symbol,Symbol}()
-    for pred in predictors, t in pred.terms
-        (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) ||
-            continue
-        monotonic_link[t.options.increments] = t.label
-    end
-    r2d2_link = Dict{Symbol,Symbol}()
-    for rp in r2d2
-        r2d2_link[rp.phi] = rp.predictor
-    end
     out_v = VectorParameter[]
     for p in vectors
         concentration_size = p.family === :simplex_dirichlet ?
@@ -11916,30 +7160,12 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "Dirichlet concentration length $(concentration_size) " *
                 "disagrees with the $K mixture components")
             push!(out_v, _with(p; size = K))
-        elseif haskey(monotonic_link, p.name)
-            want = concentration_size
-            want >= 1 || _fail(p.label,
-                "monotonic increments need ≥ 1 increment " *
-                "(K=1 degenerates emitter-side and never reaches the thin layer)")
-            p.size === nothing || p.size == want || _fail(p.label,
-                "monotonic increments size $(p.size) disagrees with its " *
-                "concentration length $want")
-            push!(out_v, _with(p; size = want))
         elseif p.family in _JOINT_FACTOR_FAMILIES
             # Joint-factor sizes are structural (concrete at construction,
             # validated against the joint width) — bind passes them through.
             p.size === nothing && _fail(p.label,
                 "internal: joint-factor size unresolved at bind")
             push!(out_v, p)
-        elseif haskey(r2d2_link, p.name)
-            want = concentration_size
-            want >= 1 || _fail(p.label,
-                "R2D2 shares need ≥ 1 share (an empty concentration " *
-                "decomposes nothing)")
-            p.size === nothing || p.size == want || _fail(p.label,
-                "R2D2 phi size $(p.size) disagrees with its " *
-                "concentration length $want")
-            push!(out_v, _with(p; size = want))
         elseif haskey(_VECTOR_ELEMENT_FAMILIES, p.family) && p.size !== nothing
             # A plain vector with a concrete structural size (read whole
             # by definitions or unused) retains its declared extent.

@@ -275,10 +275,10 @@ function _expression_cases(n)
     expr = quote
         b ~ Normal(0, 1)
         s ~ Dirichlet(2, 1)
-        m ~ monotonic(c, s)
+        m = cumsum(vcat(0.0, s))[c]
         y .~ Normal.(b .* (m .+ x), 1)
     end
-    push!(cases, (;label="nested monotonic value", expr, data=Dict(:c=>levels,:x=>x,:y=>y),
+    push!(cases, (;label="nested prefix/gather value", expr, data=Dict(:c=>levels,:x=>x,:y=>y),
         q=(b=0.3,s=[0.4,0.6]), oracle=q -> D.logpdf(D.Normal(),q.b)+
             D.logpdf(D.Dirichlet(ones(2)),q.s)+
             sum(D.logpdf.(D.Normal.(q.b.*([0.0,q.s[1],1.0][levels].+x),1),y))))

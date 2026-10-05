@@ -21,8 +21,8 @@ end
     @test Array(ru) == fx.u
 end
 
-@testset "Reactant: generative streams and per-cell predictor pins" begin
-    for kind in (:vector, :scalar, :cell, :pin)
+@testset "Reactant: generative and observed streams" begin
+    for kind in (:vector, :scalar, :cell, :observed)
         primal, reverse = Dict{String, Int}[], Dict{String, Int}[]
         for n in (0, 4, 10)
             fx = _cap_stream_fixture(kind, n)
