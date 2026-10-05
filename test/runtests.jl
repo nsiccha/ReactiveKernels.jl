@@ -46,6 +46,7 @@ const _MATRIX_CORE_TESTS = (
     "test_derivative_rule_multioutput.jl",
     "test_expm_rule.jl",
     "test_symmetric_eigen_rules.jl",
+    "test_cholesky.jl",
     "test_authoring.jl",
     "test_globalref_composition.jl",
     "test_source_world_age.jl",
