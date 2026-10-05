@@ -6129,8 +6129,9 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
         obj = Expr(:., obj.args[1], Expr(:tuple, obj.args[2:end]...))
     end
     if rkind[1] === :coloncall
-        # Literal ranges validate through the slice-A `y[a:b]` path
-        # (start-1, literal endpoints, bind-time cover check).
+        # Literal ranges take the slice-A `y[a:b]` structural checks (start 1,
+        # literal endpoints); lowering then keeps them as explicit indices
+        # (`indexed_observations`), so the loop selects its authored cells.
         return Expr[Expr(:call, :.~, Expr(:ref, col, rkind[2], lhs.args[3:end]...), obj)]
     end
     index = rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
