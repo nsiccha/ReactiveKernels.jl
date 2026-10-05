@@ -361,7 +361,7 @@ end
 # analysis with `EnzymeRuntimeActivityError`, although the arguments' activity
 # is fixed (`benchmark/repro_enzyme_mixed_activity_concat.jl` reproduces it
 # without ReactiveKernels).  The native body calls these companions instead
-# (`_kernel_native_concats`).  They return Base's result, a freshly allocated
+# (`_kernel_native_calls`).  They return Base's result, a freshly allocated
 # `Matrix{T}` or `Vector{T}` of the same shape and values, and copy each
 # operand in its own inlined call, so every copy stays tied to its tuple
 # position.  Any other operand combination, a non-isbits element type, and

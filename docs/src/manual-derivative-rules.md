@@ -217,7 +217,18 @@ callable authors the primal plus JVP/VJP branches — each an augmented-matrix
 exponential with top-right-block extraction — in one graph, and both Enzyme
 directions verify against finite differences. Its implementation and generic
 numerical tests live in RK proper; the existing `ReactiveKernelsPPL.rk_expm`
-binding imports the same callable. The native pure-Julia lower Cholesky
+binding imports the same callable. Native `@kernel` and `@traceable` source
+resolving to Base's `exp` selects this primitive for `Matrix{Float64}`,
+including calls inside lazy branches, plates and scans. Scalar and dotted
+calls, other matrix types and locally shadowed bindings retain their Julia
+behavior. Calls hidden inside an ordinary Julia helper are outside this
+source lowering; use `@traceable` or the explicit owned `rk_expm` there.
+The tensorized path still needs backend matrix-exponential support.
+The raw Enzyme boundary has a backend-only reproducer at
+`benchmark/repro_enzyme_matrix_exp.jl` and is also reported in
+[EnzymeAD/Enzyme.jl#1222](https://github.com/EnzymeAD/Enzyme.jl/issues/1222).
+
+The native pure-Julia lower Cholesky
 callable `ReactiveKernels.rk_cholesky_lower(A)` needs no custom rule: ordinary
 Enzyme differentiates its authored arithmetic. It returns
 `LowerTriangular{Float64}` over fresh owned storage, interpreting only the
