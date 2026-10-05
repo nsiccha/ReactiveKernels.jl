@@ -56,6 +56,46 @@ using ReactiveKernels, Test
             const C = PrecompiledPreparedConsumer
             @test C.WAS_PRECOMPILED
             @test ImportedPreparedConsumer.WAS_PRECOMPILED
+            # Consumer-image allocations do not advance the dependency's
+            # counter after load. Reproduce the reported alignment, where a
+            # new bound plate cache reused the loaded right-location ID.
+            const RK = ReactiveKernels
+            graph = C.pair_grid.graph
+            right_id = RK.canon_id(graph, C.pair_grid.right.id)
+            @test RK._VALUE_COUNTER[] < right_id
+            while RK._VALUE_COUNTER[] < right_id - 1
+                value(:alignment, Float64)
+            end
+            original_values = copy(graph.values)
+            original_recipes = copy(graph.recipes)
+            for x in ([-0.7, 0.2, 0.2, 1.1], collect(range(-1.3, 0.8; length=9)))
+                saved_x = copy(x)
+                bound = prepare(C.pair_grid; bound=(; x))
+                for scale in (0.6, 1.2)
+                    expected_grid = [scale * exp(-abs(a - b)) for a in x, b in x]
+                    @test C.PAIR_GRID(x, scale) ≈ expected_grid
+                    @test bound(scale) ≈ expected_grid
+                    @test bound(scale) ≈ transpose(bound(scale))
+                    @test all(i -> bound(scale)[i, i] ≈ scale, eachindex(x))
+                end
+                @test x == saved_x
+                caches = filter(r -> any(v -> startswith(string(v.name), "bound_plate_"),
+                                          r.outputs), bound.plan.recipes)
+                @test !isempty(caches)
+                @test all(r -> all(v -> !haskey(original_values, v.id), r.outputs), caches)
+            end
+            @test graph.values == original_values
+            @test graph.recipes == original_recipes
+
+            # The builder also extends loaded graphs and composed fragments
+            # without overwriting a value retained by either graph.
+            copied = RK.Graph(copy(graph.values), copy(graph.recipes),
+                              copy(graph.producers), copy(graph.aliases), graph.version)
+            fresh_value = value!(copied, :fresh, Float64)
+            @test !haskey(original_values, fresh_value.id)
+            merged_graph = compose(graph)
+            merged_value = value!(merged_graph, :fresh, Float64)
+            @test !haskey(original_values, merged_value.id)
             positions = [1.0 2.0; 0.0 0.0]
             schedule = [0.5, 1.0]
             doses = [3.0, 4.0]
