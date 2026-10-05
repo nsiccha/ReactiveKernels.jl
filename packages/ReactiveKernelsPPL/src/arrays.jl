@@ -535,8 +535,29 @@ function _value_axes(plan::StructuralPlan, ex,
         end
         i = findfirst(v -> v.name === ex, plan.vector_parameters)
         if i !== nothing
-            sz = plan.vector_parameters[i].size
+            p = plan.vector_parameters[i]
+            sz = data_axes ? _resolve_vector_extent(p, plan, plan.columns,
+                plan.responses).size : p.size
+            data_axes && sz === nothing && p.family === :simplex_dirichlet &&
+                (sz = _dirichlet_size(plan, p.args.arg1, p.label))
             return sz === nothing ? nothing : Any[sz]
+        end
+        if data_axes
+            i = findfirst(p -> p.name === ex, plan.plate_parameters)
+            if i !== nothing
+                push!(seen, ex)
+                n = _plate_rows(plan, plan.plate_parameters[i]; active = seen)
+                delete!(seen, ex)
+                return Any[n]
+            end
+            i = findfirst(s -> ex in s.states, plan.scans)
+            if i !== nothing
+                s = plan.scans[i]
+                # A trajectory owns its authored bound, not the row count
+                # of a response that happens to consume another value.
+                (s.hi isa Int || haskey(plan.columns, s.hi)) || return nothing
+                return Any[_scan_length(plan, s)]
+            end
         end
         any(p -> p.name === ex, plan.parameters) && return Any[]
         definitions = data_axes ? (plan.assignments..., plan.derived...) : plan.assignments
