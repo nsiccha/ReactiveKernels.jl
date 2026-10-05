@@ -59,9 +59,9 @@ function _missing_compiled_check(fx, name; structure=false)
     end
 end
 
-function _missing_compiled_cell_fixture(kind, n)
-    y = Union{Missing,Float64}[isodd(i) ? 0.03*i : missing for i in 1:n]
-    x = [isodd(i) ? 0.1*i : -1.0 for i in 1:n]
+function _missing_compiled_cell_fixture(kind, n; T=Float64)
+    y = Union{Missing,T}[isodd(i) ? 0.03*i : missing for i in 1:n]
+    x = T[isodd(i) ? 0.1*i : -1.0 for i in 1:n]
     data = (; y, x)
     response = kind === :local ? :(y[i] ~ Normal(a + b*sqrt(x[i]), 0.7)) :
         :(y[i] ~ Normal(a + b*x[i], sqrt(x[i])))
