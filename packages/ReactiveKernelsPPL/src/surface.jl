@@ -1516,6 +1516,9 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
     names = Dict{Any,Symbol}()
     function index_name(ex)
         ex isa Expr || return ex
+        # Literal ranges already carry their vector shape. Hoisting one as an
+        # opaque module call loses that shape before observation validation.
+        _literal_row_range(ex) && return ex
         value = resolve(ex)
         (_contains_module_call(value) || value.head === :ref) &&
             _data_only(value, data, detmap) || return ex

@@ -156,10 +156,11 @@ end
         y[1:2] .~ MixtureModel.(vcat.(Normal.(m, 0.5), Normal.(1.0, 0.5)),
             Ref([0.4, 0.6]))
     end
-    data = (; y = [0.2, -0.4, 99.0])
+    # Complete literal selection; partial coverage is refused at binding (1uhcm3b).
+    data = (; y = [0.2, -0.4])
     _rc_check(ast, data, nt -> sum(logpdf.(
         MixtureModel([Normal(nt.m, 0.5), Normal(1, 0.5)], [0.4, 0.6]),
-        data.y[1:2])))
+        data.y)))
 
     for wrapper in (:truncated, :censored)
         ast = quote
