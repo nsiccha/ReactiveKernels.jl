@@ -494,6 +494,12 @@ explicit graph composition, load RK and RKPPL and use
 `rk_model(:gp_periodic_cov)`; an assigned graph call follows the general
 composition path. The adopted owner API is available at BRM
 `1f296dac2c086347525194887500948edb213228`.
+Opaque prepared covariance callbacks with bound locations currently reach an
+Enzyme activity error on Julia 1.10.12 / Enzyme 0.13.210. Assigned owned graph
+calls pass native Reverse with bound or live locations. The generic
+`benchmark/repro_enzyme_prepared_pair_callback.jl` reproduces the callback
+boundary using a synthetic pair grid; this limitation precedes the ownership
+cleanup.
 
 A single index on a multi-axis definition is linear and positional:
 `b = (z * sd)'` makes a row, and `b[g]` reads its column-major positions.

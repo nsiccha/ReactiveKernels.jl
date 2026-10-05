@@ -154,6 +154,10 @@ folding and compiled covariance/AD cuts using BRM's owned graphs. The two plain
 PPL consumer programs in `corpus/` use BRM helpers; they no longer participate
 in the default dependency-light PPL syntax corpus. Scientific GP/HSGP acceptance
 is owned by BRM (`test/rk_gp_covariance.jl`, `test/rk_dual_hsgp.jl`).
+Opaque prepared covariance callbacks with bound locations reach an existing
+Enzyme activity error (Julia 1.10.12 / Enzyme 0.13.210); these compiler checks
+use assigned owner graphs. The synthetic RK-only reproducer is
+`../repro_enzyme_prepared_pair_callback.jl`.
 
 A final optional positional argument limits posterior points for smoke runs;
 these are never full acceptance receipts. `RK_HSGP_NATIVE=0` explicitly runs
