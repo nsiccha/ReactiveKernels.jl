@@ -229,6 +229,20 @@ end
         gradient(v)=only(Enzyme.gradient(Enzyme.Reverse,k,v))
         cg=Reactant.@compile gradient(s)
         @test _host(cg(s))≈n÷3*(1/1.3+3)
+        # Reuse the executable across both arms of the shared guard. Negative
+        # and zero scales must keep the inactive logarithm out of the value
+        # and ordinary derivative; the bound lane data remain caller-owned.
+        saved=copy(y)
+        for scale in (0.7,-0.4,0.0)
+            input=_traced(scale)
+            expected=n÷3*(scale>0 ? log(scale)+3scale : -Inf)
+            expected_gradient=n÷3*(scale>0 ? inv(scale)+3 : 3.0)
+            @test isequal(_host(c(input)),expected) || _host(c(input))≈expected
+            @test _host(cg(input))≈expected_gradient
+            @test k(scale)==expected || k(scale)≈expected
+            @test y==saved
+            @test _host(input)==scale
+        end
         ops=Dict{String,Int}()
         for m in eachmatch(r"stablehlo\.[a-z_]+",hlo)
             ops[m.match]=get(ops,m.match,0)+1

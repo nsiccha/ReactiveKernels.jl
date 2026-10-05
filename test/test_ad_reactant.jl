@@ -20,6 +20,7 @@ _trace(x) = Reactant.to_rarray(x)
 
 include("test_ad_fused_reactant.jl")
 include("test_ad_retained_count_reactant.jl")
+include("test_ad_bound_contexts_reactant.jl")
 
 @testset "Reactant-compiled AD" begin
     @testset "standalone objective: authored defaults, keywords, parity" begin
