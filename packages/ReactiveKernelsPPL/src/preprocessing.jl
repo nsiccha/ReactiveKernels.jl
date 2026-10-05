@@ -219,3 +219,10 @@ function _ordinal_stage_idx(y::AbstractVector{<:Integer}, K::Integer)
     end
     return out
 end
+
+# Gather observation values after ordinary scalar/singleton broadcasting.
+# Stage tables may repeat rows; one-entry operands still supply every lane,
+# including zero lanes for an empty response. This stays in the value graph.
+@inline _broadcast_gather(value::Number, rows) = fill(value, length(rows))
+@inline _broadcast_gather(value, rows) =
+    value[length(value) == 1 ? fill(1, length(rows)) : rows]
