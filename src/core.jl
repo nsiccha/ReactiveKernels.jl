@@ -85,7 +85,7 @@ Recipe(id, inputs, outputs, op, cost, cse_key, effectful) =
     Recipe(id, inputs, outputs, op, cost, cse_key, effectful, _NO_KERNEL_SOURCE)
 
 """
-    _KernelSourceOp{DefToken,Form,F,TF,IG}
+    _KernelSourceOp{DefToken,Form,F,TF,IG,CI}
 
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
 COMPILER-OWNED provenance (RK 07:21). Authoring wraps ONLY the anonymous-closure path of
@@ -102,18 +102,41 @@ self-derive the DESTINATION contract (a port-call with one owned buffer + one ow
 `f(dest, args…)::scalar`) from source SHAPE + typed slot roles, never from a name/Recipe id/inspection.
 `IG` holds the captured source's throw-stripped twin, selected only by an
 explicit `on_error = :ignore` preparation; older internal fixtures use `nothing`.
+`CI` retains the callable and lowering mode of an exact positional call through
+a constant binding, when present. Composition can share these calls without
+equating separately authored fused expressions or changing their definition tokens.
 The call forwards INLINE. A RAW anonymous closure inserted into a Graph carries no wrapper and is
 rejected as opaque when captured into a prepared handle.
 """
-struct _KernelSourceOp{DefToken,Form,F,TF,IG}
+struct _KernelSourceOp{DefToken,Form,F,TF,IG,CI}
     f::F
     tensor_f::TF
     ignored_throws::IG
+    call_identity::CI
 end
 
 _KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF,
-                ignored_throws::IG = nothing) where {DefToken,Form,F,TF,IG} =
-    _KernelSourceOp{DefToken,Form,F,TF,IG}(f, tensor_f, ignored_throws)
+                ignored_throws::IG = nothing, call_identity::CI = nothing) where
+                {DefToken,Form,F,TF,IG,CI} =
+    _KernelSourceOp{DefToken,Form,F,TF,IG,CI}(f, tensor_f, ignored_throws, call_identity)
+
+# A module binding can be shadowed by a lexical callable captured in either
+# execution body. Its value at construction need not identify later calls,
+# especially when Julia retains a reassigned local in a shared Core.Box.
+# The runtime callable must also match the binding resolved by lowering,
+# which can have replaced the call and removed its lexical capture entirely.
+function _KernelSourceOp(token::Val, form::Val, f, tensor_f,
+                         ignored_throws, call_identity, capture_name, resolved_callable)
+    if call_identity !== nothing &&
+       (first(call_identity) !== resolved_callable ||
+        (capture_name !== nothing &&
+         (capture_name in fieldnames(typeof(_kernel_native_source(f))) ||
+          capture_name in fieldnames(typeof(_kernel_native_source(tensor_f))))))
+        call_identity = nothing
+    end
+    _KernelSourceOp(token, form, f, tensor_f, ignored_throws, call_identity)
+end
+
 # Preserve the established internal constructor for compiler fixtures and
 # already-authored handles; without an alternate body it uses the same callable
 # in both modes.
