@@ -8,7 +8,7 @@
 using DifferentiationInterface: AutoEnzyme, gradient
 import Enzyme
 using Enzyme: Const, Duplicated, Forward
-using LinearAlgebra: dot, exp
+using LinearAlgebra: dot, exp, I
 using ReactiveKernels
 using Test
 
@@ -30,6 +30,21 @@ const _EXPM_CASES = (
 )
 _expm_direction(n) = [0.1 * sin(i + 2j) for i in 1:n, j in 1:n]
 _expm_covector(n) = [0.2 * cos(2i + j) for i in 1:n, j in 1:n]
+
+# Independent high-precision Taylor oracle for these small-norm fixtures.
+# Eighty terms put the truncation error far below 256-bit rounding here.
+function _expm_reference_sum(A)
+    setprecision(256) do
+        B = BigFloat.(A)
+        term = Matrix{BigFloat}(I, size(A)...)
+        result = copy(term)
+        for k in 1:80
+            term = term * B / k
+            result += term
+        end
+        sum(result)
+    end
+end
 
 @testset "rk_expm is a generated rule on an owned callable" begin
     @test rk_expm isa DerivativeRule
@@ -163,13 +178,19 @@ end
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     for A in _parent._EXPM_CASES
         expected = sum(exp(A))
+        reference = _parent._expm_reference_sum(A)
+        @test abs(BigFloat(expected) - reference) <= 4BigFloat(eps(expected))
         expected_gradient = _parent._expm_fd_gradient(M -> sum(exp(M)), A)
         saved = copy(A)
         for spec in (bare, qualified, aliased, helper)
             k = prepare(spec)
             ad = prepare_ad(k, backend, A; active = :A)
             value, gradient = ad_value_and_gradient(ad, A)
-            @test value == expected
+            # Ordinary AD can change a floating-point reduction's rounding.
+            # Bound that scalar loss difference to two Float64 spacings;
+            # exact matrix-primal checks and ordinary gradient checks remain.
+            @test value ≈ expected rtol = 0 atol = 2eps(expected)
+            @test abs(BigFloat(value) - reference) <= 4BigFloat(eps(expected))
             @test gradient ≈ expected_gradient rtol = 1e-7 atol = 1e-8
         end
         k = prepare(exponential)

@@ -93,6 +93,20 @@ const exp_alias = Base.exp
 mutable_exp = Base.exp
 end
 
+module AuthoringChangingCallBindingFixture
+using ReactiveKernels
+call = Base.exp
+@kernel before(x::Float64) = begin
+    a::Float64 = call(x)
+    return a
+end
+call = Base.sin
+@kernel after(x::Float64) = begin
+    b::Float64 = sin(x)
+    return b
+end
+end
+
 @testset "Declarative kernel authoring" begin
     @testset "function-shaped definitions, optional types, and exposed ports" begin
         f_calls = Ref(0)
@@ -1406,6 +1420,13 @@ end
         @test prepare(plain_merged; want = :z)(1.0) == exp(1.0) + 1
 
         @testset "lowered exact calls retain composition identity" begin
+            changed_binding = AuthoringChangingCallBindingFixture
+            @test prepare(changed_binding.before)(0.3) == exp(0.3)
+            @test prepare(changed_binding.after)(0.3) == sin(0.3)
+            combined_binding = merge(changed_binding.before, changed_binding.after)
+            @test prepare(combined_binding; want = (:a, :b))(0.3) ==
+                  (exp(0.3), sin(0.3))
+
             qualified = @kernel begin
                 x::Float64
                 y::Float64 = Base.exp(x)

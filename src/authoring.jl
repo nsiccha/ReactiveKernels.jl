@@ -211,6 +211,15 @@ struct _KernelProvenanceKey{Token} end
 
 _kernel_source_token(::_KernelSourceOp{Token}) where {Token} = Token
 
+# Inverse recognition uses the callable retained when an exact call was
+# authored. Looking up a recipe's source binding later could observe a
+# different function after a mutable global is rebound.
+function _kernel_operation_identity(recipe::Recipe)
+    op = recipe.op
+    op isa _KernelSourceOp || return op
+    op.call_identity === nothing ? op : first(op.call_identity)
+end
+
 # Provenance CSE key assigned when a child recipe is cloned into a parent
 # graph (nested-spec splice and merge/compose). An explicit `cse_key` always
 # wins and effectful recipes keep `nothing` (`add!` never CSE-merges those).
