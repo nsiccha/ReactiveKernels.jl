@@ -290,6 +290,17 @@ end
 A traced empty sequence compiles to a program with no `stablehlo.while`. A
 nonempty one keeps its single loop.
 
+Ordinary native Enzyme reverse differentiates through an empty scan, including
+one inside a plate cell; the empty steps contribute nothing. When the step's
+inferred output type is concrete, the native lowering allocates the result once,
+before testing for emptiness, so the empty and nonempty results are the same
+allocation. Separate allocations for the two cases would meet in one value,
+which Enzyme's static activity analysis rejects
+(`benchmark/repro_enzyme_branch_allocation_phi.jl`). When inference gives no
+concrete output type (`Any` for a step containing a plate, scan or embedded
+kernel), each case still allocates its own result as before; native reverse
+through such an empty scan is not covered by this lowering.
+
 A recurrence authored in its own kernel, prepared once and called from a lazy
 branch arm, still works. The arm then runs through an ordinary callable
 boundary, not transparent graph splicing. Declare that arm's result type

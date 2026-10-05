@@ -347,12 +347,12 @@ child port annotations accept the caller's declared types; declared boundaries
 keep their types. The emitted `kernel_expr` remains the source of the graph,
 so evaluating that expression retains the same child operations.
 
-Composition exposes the child's execution capabilities. Native Enzyme reverse
-currently fails for an empty child scan inside a bound `eachcol` subject plate.
-The default compiled backend expands small subject plates into copies of the
-child scan, so those shapes still lack retained-loop structural acceptance.
-The composition tests keep both gaps visible; nonempty native values and
-derivatives and larger compiled subject plates are covered separately.
+Composition exposes the child's execution capabilities. Ordinary native
+Enzyme reverse covers empty and nonempty child scans, including inside a bound
+`eachcol` subject plate. The default compiled backend expands small subject
+plates into copies of the child scan, so those shapes still lack retained-loop
+structural acceptance. The composition tests keep that gap visible; larger
+compiled subject plates are covered separately.
 
 A data-only call used only by a parameter-dependent function runs once when
 `prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or

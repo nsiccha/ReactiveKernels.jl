@@ -507,15 +507,22 @@ end
 # The native ordered loop.  `nothing` is the no-backend marker; a backend
 # extension specializes `_tensorized_scan_lowering` on its own marker type.
 # An empty sequence returns an empty result (or `[init]`) without running the
-# step.
+# step. As in the generated native lowering (`_lower_authored_scan_native!`),
+# a concrete inferred output type is the first output's type, so the result is
+# allocated once with it before the emptiness test; separate allocations in
+# the two arms meet in one value that Enzyme's static activity analysis
+# rejects when the empty arm's is never written actively. Otherwise each arm
+# allocates, typed by the first output when there is one.
 function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
                                    shared::Tuple, ::Val{false} = Val(false))
     idx = eachindex(iterated...)
-    isempty(idx) && return similar(first(iterated), _scan_step_output_type(
-        step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
+    T = _scan_step_output_type(
+        step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...)
+    result = isconcretetype(T) ? similar(first(iterated), T) : nothing
+    isempty(idx) && return result === nothing ? similar(first(iterated), T) : result
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
-    result = similar(first(iterated), typeof(out1))
+    result === nothing && (result = similar(first(iterated), typeof(out1)))
     result[i1] = out1
     for i in Iterators.drop(idx, 1)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
@@ -527,17 +534,18 @@ end
 function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
                                    shared::Tuple, ::Val{true})
     idx = eachindex(iterated...)
+    allocate(T) = similar(first(iterated), promote_type(typeof(init), T), length(idx) + 1)
+    T = _scan_step_output_type(
+        step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...)
+    result = isconcretetype(T) ? allocate(T) : nothing
     if isempty(idx)
-        T = promote_type(typeof(init), _scan_step_output_type(
-            step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
-        result = similar(first(iterated), T, 1)
+        result === nothing && (result = allocate(T))
         result[1] = init
         return result
     end
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
-    result = similar(first(iterated), promote_type(typeof(init), typeof(out1)),
-                     length(idx) + 1)
+    result === nothing && (result = allocate(typeof(out1)))
     result[1] = init
     result[2] = out1
     position = 2
