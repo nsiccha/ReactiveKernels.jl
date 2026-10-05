@@ -186,6 +186,14 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
     end
     externalized, values = _externalize_bound_arrays(
         kernel; materialize_view_copies = true, externalize_scalars = true)
+    if externalized === kernel && native_exemplars
+        # As for plated bodies above, differentiation needs only the executable
+        # and its operands. Repacking the whole PreparedKernel also stores its
+        # mutable graph/Expr metadata beside active arguments, which defeats
+        # ordinary Enzyme activity analysis through a nested prepared callback.
+        return _ADNativeKernelCall{I,typeof(kernel.f),typeof(kernel.ops)}(
+            kernel.f, kernel.ops), values
+    end
     _ADKernelCall{I,typeof(externalized)}(externalized), values
 end
 
