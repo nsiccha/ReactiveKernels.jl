@@ -3704,10 +3704,14 @@ _re_surface(R) = Expr(:block,
     # The two authored iterators have the same cells on these bound vectors.
     @test _surface_bound_density_equal(lower_rkppl(_re_surface(:(axes(y, 1))), (:y, :x); conditioned = (:y, :x)), plan,
         cols, [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2])
-    # Literal range rides on the plate parameter and the response.
+    # A literal range sizes the plate parameter; the observed response keeps
+    # the explicit index `y[1:N]`, selecting the authored cells.
     lit = lower_rkppl(_re_surface(:(1:6)), (:y, :x); conditioned = (:y, :x))
     @test lit.plate_parameters[1].range == 1:6
-    @test lit.responses[1].range == 1:6
+    @test repr(lit.responses[1].range) == repr(:(y[1:6]))
+    @test :y in lit.indexed_observations
+    @test _surface_bound_density_equal(lit, plan, cols,
+        [0.3, -0.2, 0.1, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2])
     # Values match a Distributions.jl oracle end to end.
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
