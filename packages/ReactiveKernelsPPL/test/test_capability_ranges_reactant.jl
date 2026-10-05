@@ -26,8 +26,7 @@ function _cap_range_save_ir(kind, n, name, text)
 end
 
 @testset "Reactant: response slices and retained selected cells" begin
-    for kind in (:cross_index, :cross_axis, :colon, :top_singleton, :cross_cell, :singleton, :inactive, :matrix, :singleton_latent, :free_matrix, :longer_inactive, :axis1_matrix_inactive,
-            :literal_tail, :literal_whole, :literal_single, :literal_matrix)
+    for kind in (:cross_index, :cross_axis, :colon, :cross_cell, :free_matrix, :longer_inactive)
         primal, reverse = Dict{String,Int}[], Dict{String,Int}[]
         primal_xla, reverse_xla = Dict{String,Int}[], Dict{String,Int}[]
         # Compare the optimized programs and actual executables. Raw tracing
@@ -92,7 +91,7 @@ end
     end
 end
 
-@testset "Reactant: empty literal loop skips nonempty missing data" begin
+@testset "empty authored subset cannot skip nonempty missing data" begin
     data = (; y = fill!(Vector{Union{Missing,Float64}}(undef, 6), missing),
         x = fill(-1.0, 6))
     saved = deepcopy(data)
@@ -103,18 +102,6 @@ end
             y[i] ~ Normal(a + b * sqrt(x[i]), 0.7)
         end
     end
-    bound = bind_data(lower_rkppl(ast, data; conditioned = keys(data)), data)
-    built = build_kernel(bound)
-    u = [0.25, -0.3]
-    sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
-    ru = Reactant.to_rarray(u)
-    compiled = compile_ad_value_and_gradient(sampler.ad, ru)
-    value, gradient = compiled(ru)
-    @test Float64(value) ≈ sum(logpdf.(Normal(), u))
-    @test Array(gradient) ≈ -u
-    pointwise = prepare_query(built, bound, :pointwise)
-    cpw = Reactant.@compile pointwise(ru)
-    @test isempty(Array(cpw(ru).y))
-    @test Array(ru) == u
+    @test_throws ContractValidationError bind_data(lower_rkppl(ast, data; conditioned = keys(data)), data)
     @test isequal(data, saved)
 end

@@ -1432,6 +1432,11 @@ function _axis_exempt_columns(plan::StructuralPlan)
         intersect(computed, Set{Symbol}(a.name for a in plan.assignments)),
         intersect(computed, wholedefs), inputs)
     union!(modelvals, (n for n in computed if plan.columns[n] isa Number))
+    # Binding-owned presence masks encode observations, not model dimensions.
+    union!(modelvals, (_observed_mask_name(r.response) for r in plan.responses
+        if haskey(plan.columns, _observed_mask_name(r.response))))
+    union!(modelvals, (_observed_mask_name(s.array) for s in _observed_selections(plan, plan.columns)
+        if haskey(plan.columns, _observed_mask_name(s.array))))
     return modelvals, managed
 end
 
@@ -1676,24 +1681,47 @@ end
 
 function _response_slot_column(plan, r, name, what)
     value = _observation_column(plan.columns, name, r.label, what)
-    r.range isa Expr || return value
-    name === r.response && return _selected_response_column(plan, r)
-    r.response in plan.indexed_observations || return value
-    indices = _response_range_indices(plan, r)
-    checkbounds(Bool, value, indices) || _fail(r.label,
-        "$what $name does not cover the authored response range")
-    value[indices]
+    if r.range isa Expr
+        if name === r.response
+            value = _selected_response_column(plan, r)
+        elseif r.response in plan.indexed_observations
+            indices = _response_range_indices(plan, r)
+            checkbounds(Bool, value, indices) || _fail(r.label,
+                "$what $name does not cover the authored response range")
+            value = value[indices]
+        end
+    end
+    mask = _response_observed_mask(plan, r)
+    mask === nothing && return value
+    # Validate only observation lanes. Singleton operands retain ordinary
+    # broadcasting; dimensions and parameter extents still use the full data.
+    lanes = broadcast((v, present) -> (v, present), value, mask)
+    return first.(lanes)[last.(lanes)]
 end
 
 # ── Observed selections ──────────────────────────────────────────────
-# Every supplied entry of an observed response array is observed; a
-# statement may leave out only `missing` entries (user decision `1g8uvgs`).
+# Observation statements cover their whole response. Missing entries are
+# skipped automatically (PROVISIONAL user decision `1uhcm3b`, 2026-10-05),
+# never selected manually by shortening the authored observation domain.
 # A selection is a response range (a plate's `y[2:6]` or `y[axes(y, 2)]`,
 # `y[i, 1]`, `y[eachindex(x)]`) or a statement's data-indexed left-hand
 # side (`y[rows] .~ …`, which `_indexed_observation_definitions` rewrites
 # into an observed gather). A definition the author wrote, such as a lag,
 # is ordinary data use, not a selection. Selections of one array union.
 const _OBSERVED_GATHER_PREFIX = "_rkppl_observed_"
+_observed_mask_name(name::Symbol) = Symbol(:_rkppl_present_, name)
+
+function _response_observed_mask(plan, r)
+    mask = get(plan.columns, _observed_mask_name(r.response), nothing)
+    mask === nothing && return nothing
+    r.range isa Expr || return mask
+    indices = _response_range_indices(plan, r)
+    return mask[indices, r.range.args[3:end]...]
+end
+
+_has_observed_response(plan, r) =
+    !haskey(plan.columns, _observed_mask_name(r.response)) ||
+        any(plan.columns[_observed_mask_name(r.response)])
 
 function _observed_selections(plan::StructuralPlan, columns::AbstractDict)
     gathers = Dict{Symbol,Any}(d.name => d.expr for d in plan.derived)
@@ -1736,6 +1764,11 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
         found && return nothing
         if x === name
             found = true
+        elseif x isa VectorAssignmentSpec &&
+                startswith(string(x.name), _OBSERVED_GATHER_PREFIX)
+            # The observation gather has already been checked for full
+            # coverage. It carries the same owned values and presence mask.
+            return nothing
         elseif _is_shape_read(x)
             return nothing
         elseif x isa Expr
@@ -1766,43 +1799,62 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
     return !found
 end
 
-# Checks every observed array against its selections. An in-kernel
-# selection reads its array inside the graph, so the unobserved `missing`
-# entries of an array read only there are encoded by a never-read fill
-# (NaN for floats); a selected `missing` entry fails.
+# Full coverage applies even to missing entries. Skipping is the binder's
+# responsibility, rather than an authored subset or a union of partial statements.
 function _validate_observed_selections!(plan::StructuralPlan, columns::AbstractDict)
-    masks = Dict{Symbol,BitArray}()
-    labels = Dict{Symbol,Symbol}()
-    kernel = Set{Symbol}()
     for s in _observed_selections(plan, columns)
         value = columns[s.array]
         # Out-of-range selections fail with their statement's own message.
         checkbounds(Bool, value, s.index...) || continue
-        mask = get!(() -> falses(size(value)), masks, s.array)
+        mask = falses(size(value))
         mask[s.index...] .= true
-        missed = [I for I in CartesianIndices(value) if mask[I] && ismissing(value[I])]
-        isempty(missed) || _fail(s.label, "observed entries " *
-            "$(_entry_names(s.array, missed)) are missing — a statement observes " *
-            "only supplied entries; leave missing entries out of its selection")
-        get!(labels, s.array, s.label)
-        s.kernel && push!(kernel, s.array)
+        left = [I for I in CartesianIndices(value) if !mask[I]]
+        isempty(left) || _fail(s.label, "partial observation of $(s.array) leaves " *
+            "$(_entry_names(s.array, left)) outside the statement — observe the " *
+            "whole response; missing observations are skipped automatically")
     end
-    for (name, mask) in masks
-        value = columns[name]
-        left = [I for I in CartesianIndices(value) if !mask[I] && !ismissing(value[I])]
-        isempty(left) || _fail(labels[name], "supplied entries " *
-            "$(_entry_names(name, left)) are never observed — every supplied " *
-            "response entry is observed; bind only the observed " *
-            "entries or mark the others `missing`")
-        name in kernel && Missing <: eltype(value) || continue
+    return columns
+end
+
+# Missing is a host-side representation. RK receives an owned concrete array
+# and a Bool mask, retaining every axis. The neutral stored value is never an
+# observation: the generated plate guards density evaluation with the mask.
+function _prepare_missing_responses!(plan::StructuralPlan, columns::AbstractDict)
+    names = Dict(r.response => r for r in plan.responses if r.mi_jobs === nothing)
+    for s in _observed_selections(plan, columns)
+        names[s.array] = only(r for r in plan.responses if r.label === s.label)
+    end
+    for (name, r) in names
+        value = get(columns, name, nothing)
+        value isa AbstractArray || continue
+        Missing <: eltype(value) || continue
+        present = .!ismissing.(value)
+        if !all(present)
+            isempty(r.count_columns) && isempty(r.extra_responses) || _fail(r.label,
+                "missing components of a joint response require marginalization, which is not built yet")
+            _read_only_by_selection(plan, name) || _fail(r.label,
+                "missing response $name is also read as a model value; automatic " *
+                "likelihood skipping does not define that value")
+        end
         T = Base.nonmissingtype(eltype(value))
-        T <: Real || continue
-        if !any(ismissing, value)
-            # A union element type without a missing value (an empty
-            # selection) narrows without changing any value.
-            columns[name] = T.(value)
-        elseif _read_only_by_selection(plan, name)
-            columns[name] = coalesce.(value, T <: AbstractFloat ? T(NaN) : zero(T))
+        if T === Union{}
+            # An all-Missing array carries no numeric type. Counts/categories
+            # require an integer port; continuous responses use Float64.
+            T = _is_bernoulli_family(r.family) || _is_binomial_family(r.family) ||
+                _is_ordered_family(r.family) || r.family in
+                (PoissonLogFam, NegativeBinomial2Fam, NegativeBinomialFam,
+                 HurdlePoissonFam, ZeroInflatedPoissonFam, CategoricalFam,
+                 CategoricalLogitFam, BernoulliLogitGLMFam, PoissonLogGLMFam) ? Int : Float64
+        end
+        T <: Real && isconcretetype(T) || _fail(r.label,
+            "response $name needs a concrete numeric type beside Missing, got $(eltype(value))")
+        owned = Array{T}(undef, size(value))
+        map!(x -> ismissing(x) ? one(T) : convert(T, x), owned, value)
+        columns[name] = owned
+        if !all(present)
+            maskname = _observed_mask_name(name)
+            haskey(columns, maskname) && _fail(r.label, "data name $maskname is reserved for observation presence")
+            columns[maskname] = Array(present)
         end
     end
     return columns
@@ -5236,6 +5288,8 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     end
     col = r.range isa Expr ? _selected_response_column(plan, r) :
         _observation_column(plan.columns, r.response, r.label, "response")
+    mask = _response_observed_mask(plan, r)
+    mask === nothing || (col = col[mask])
     if r.evidence.kind in (:interval_censored, :censored) ||
             (r.evidence.kind === :truncated && (_evidence_discrete(r.family) ||
             r.family in (BernoulliLogitGLMFam, PoissonLogGLMFam)))
@@ -6887,6 +6941,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     union!(inputs, (_conditioned_input(n) for n in plan.conditioned))
     _materialize_derived_responses!(plan, columns)
     _validate_observed_selections!(plan, columns)
+    _prepare_missing_responses!(plan, columns)
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))

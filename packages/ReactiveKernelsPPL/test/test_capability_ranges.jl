@@ -11,8 +11,8 @@ function _cap_range_fixture(kind, n)
     rows = kind === :literal_single ? (3:3) : (2:n)
     data = Dict{Symbol,Any}(:y => kind in (:matrix, :free_matrix, :axis1_matrix_inactive, :literal_matrix) ? hcat(y, y .+ 10) : y,
         :x => kind === :axis1_matrix_inactive ? hcat(x, fill(-1.0, n)) : x)
-    # Every supplied response entry is observed (user decision `1g8uvgs`):
-    # a selection leaves out only `missing` entries.
+    # Rejected partial-observation fixtures retain the old missing entries
+    # to verify that missing data cannot authorize an authored subset.
     observed = kind in (:top_singleton, :singleton, :inactive, :singleton_latent) ?
         (1:min(n, 1)) : literal ? rows : (1:n)
     # A matrix response observed by column (`y[i, 1]`, or `y[i]` over its
@@ -97,8 +97,7 @@ function _cap_range_fd(f, u)
 end
 
 @testset "response ranges preserve Julia indexing and selected cells" begin
-    for kind in (:cross_index, :cross_axis, :colon, :top_singleton, :cross_cell, :singleton, :inactive, :matrix, :singleton_latent, :free_matrix, :longer_inactive, :axis1_matrix_inactive,
-            :literal_tail, :literal_whole, :literal_single, :literal_matrix)
+    for kind in (:cross_index, :cross_axis, :colon, :cross_cell, :free_matrix, :longer_inactive)
         fx = _cap_range_fixture(kind, 4)
         value, gradient = sampler_value_and_gradient!(fx.sampler, similar(fx.u), fx.u)
         @test value ≈ fx.oracle(fx.u)
@@ -111,6 +110,13 @@ end
             @test pw.y ≈ fx.pointwise(fx.u)
             @test size(pw.y) == size(fx.pointwise(fx.u))
         end
+    end
+end
+
+@testset "authored response subsets are refused even with missing outside them" begin
+    for kind in (:top_singleton, :singleton, :inactive, :matrix, :singleton_latent,
+            :axis1_matrix_inactive, :literal_tail, :literal_whole, :literal_single, :literal_matrix)
+        @test_throws ContractValidationError _cap_range_fixture(kind, 4)
     end
 end
 
@@ -135,16 +141,16 @@ end
             y[i] ~ Normal(mu, 0.7)
         end
     end
-    # Nonempty bound arrays can have no observed cells. The selected values,
-    # pointwise output and reverse still follow the authored six-row indices.
-    for (R, rows) in ((:(2:6), 2:6), (:(3:3), 3:3), (:(1:0), 1:0), (:(5:4), 5:4))
+    # A literal loop covers the whole response and skips missing entries
+    # automatically, retaining the full pointwise axis.
+    for (R, rows) in ((:(1:6), 1:6),)
         data = (; x, y = Union{Missing,Float64}[
-            i in rows ? y[i] : missing for i in eachindex(y)])
+            i == 3 ? missing : y[i] for i in eachindex(y)])
         saved = deepcopy(data)
         bound = bind_data(lower_rkppl(loop(R), data; conditioned = keys(data)), data)
         built = build_kernel(bound)
         u = unconstrain(built.layout, (; a = 0.25, b = -0.3))
-        pointwise(v) = [logpdf(Normal(v[1] + v[2] * x[i], 0.7), y[i]) for i in rows]
+        pointwise(v) = [i == 3 ? 0.0 : logpdf(Normal(v[1] + v[2] * x[i], 0.7), y[i]) for i in rows]
         oracle(v) = logpdf(Normal(), v[1]) + logpdf(Normal(), v[2]) +
             sum(pointwise(v); init = 0.0)
         sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
@@ -162,9 +168,9 @@ end
         plan = lower_rkppl(loop(R), (; y, x); conditioned=(:y, :x))
         @test_throws ContractValidationError bind_data(plan, (; y, x))
     end
-    # refused: a selected entry is missing (only unselected entries may be).
+    # Missing entries do not authorize a partial authored range.
     ym = Union{Missing,Float64}[i == 3 ? missing : y[i] for i in 1:6]
-    @test_throws ContractValidationError bind_data(lower_rkppl(loop(:(1:6)),
+    @test_throws ContractValidationError bind_data(lower_rkppl(loop(:(3:3)),
         (; y = ym, x); conditioned=(:y, :x)), (; y = ym, x))
     for R in (:(2:7), :(0:3))
         plan = lower_rkppl(loop(R), (; y, x); conditioned=(:y, :x))

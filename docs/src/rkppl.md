@@ -530,13 +530,21 @@ broadcast spelling.
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
 
-Literal observation ranges select their authored indices. For example,
-`@plate for i in 2:6` reads `y[2:6]` and the corresponding indexed arguments;
-`3:3` selects one cell, and `1:0` selects none. Every supplied response entry
-must be observed, so entries outside the selection must be `missing`.
-Binding rejects a supplied entry left unobserved, a selected `missing` entry,
-or an index outside the bound array. Skipped missing entries contribute no
-likelihood or pointwise output.
+Observation statements cover their whole response. Write `y .~ Normal.(mu, sigma)`
+or a plate over the full response indices. Binding automatically skips entries
+equal to `missing`; authors do not select the present rows manually. An authored
+subset such as `@plate for i in 2:6` over a six-element response is refused,
+including when the omitted entry is missing. An empty loop covers only an empty
+response. Indexing outside the bound array still fails.
+
+This missing-observation behavior is **provisional** (user decision `1uhcm3b`,
+October 5, 2026). Binding owns concrete numeric response arrays and presence masks;
+the likelihood plate skips absent entries, leaving zero at those positions in
+pointwise output. Response axes, intermediate values and declared parameter sizes
+remain unchanged, and caller arrays are not modified. No missing-response latent
+is introduced. Missing responses read elsewhere as model values and missing
+components of joint outcomes still need richer handling; those uses fail rather
+than silently inventing values or discarding supplied joint components.
 
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
