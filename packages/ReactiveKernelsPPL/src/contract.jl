@@ -11394,11 +11394,24 @@ data input: a column every definition reads only inside an argument of an
 undotted module call (`gx_m = f(gx)`, or inlined `(b .* f(gx))[g]`) and no
 response, predictor or other slot names — it may have any length or shape
 and never sets `n_obs` (see `_model_level_inputs`).
+
+Binding resolves module values and calls in a package-owned latest-world
+scope, including definitions just evaluated in a builder.
 """
 bind_data(plan::StructuralPlan, columns::NamedTuple; kwargs...) =
     bind_data(plan, Dict{Symbol,Any}(pairs(columns)); kwargs...)
 
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
+        roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
+        dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
+        conditioned = plan.conditioned)
+    # Resolve the callee binding in the same scope as its evaluation: on
+    # Julia 1.12, a call-only invokelatest cannot see a just-created binding
+    # while evaluating its function argument in the caller's older world.
+    return Base.invokelatest(_bind_data_latest, plan, columns; roles, dims, conditioned)
+end
+
+function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
         conditioned = plan.conditioned)
