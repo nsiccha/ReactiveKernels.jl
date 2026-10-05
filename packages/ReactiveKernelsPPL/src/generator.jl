@@ -70,9 +70,7 @@ function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :
     append!(stmts, assigns)
     append!(stmts, preprocessing_recipes(plan))
     append!(stmts, _varying_statements(plan))
-    append!(stmts, _hsgp_basis_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
-    append!(stmts, _dar_reconstruction_statements(plan, layout))
     append!(stmts, _affine_coefficient_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
     append!(stmts, likelihoods)
@@ -443,40 +441,18 @@ function _predictor_statements(plan::StructuralPlan)
         lp = _lp_name(pred)
         terms = Any[]
         if _broadcast_affine(plan, pred)
-            append!(terms, _mo_block_terms(plan, shape; broadcast = true))
-        elseif any(b -> b.kind === MonotonicTerm, shape.blocks)
-            append!(terms, _mo_block_terms(plan, shape))
+            append!(terms, _affine_block_terms(plan, shape; broadcast = true))
         elseif shape.width > 0
             push!(terms, :($(design_name(pred.name)) * $(_affine_block_name(pred))))
         end
         if any(b -> b.kind === OffsetTerm, shape.blocks)
             push!(terms, offset_name(pred.name))
         end
-        # A monotonic summand (mo1) contributes its contrast directly —
-        # beta-free, the offset-arm shape with a parameter-derived column.
-        for t in pred.terms
-            t.kind === MonotonicSummandTerm &&
-                push!(terms, monotonic_name(t.options.increments))
-        end
         # A latent term contributes the per-cell latent VECTOR directly
         # (identity design): `lp = theta` on its own, or added to fixed-effect
         # design/offset terms for a random-intercept-plus-covariates predictor.
         for b in shape.blocks
             b.kind === LatentTerm && push!(terms, b.column)
-        end
-        # A spline summand contributes its basis's direct summand expression
-        # (SB's `X*b + Z*(sd*z)` shape over materialized basis columns and
-        # SplineVector layout blocks).
-        for b in shape.blocks
-            b.kind === SplineSummandTerm &&
-                push!(terms, _spline_summand_expr(plan, b.column))
-        end
-        # An HSGP summand contributes its basis's direct `PHI * w`
-        # expression (SB `_sb_hsgp`'s `PHI * (sqrt_spd .* beta_raw)`,
-        # evaluated in-graph by `_hsgp_basis_statements`).
-        for b in shape.blocks
-            b.kind === HSGPSummandTerm &&
-                push!(terms, _hsgp_summand_expr(plan, b.column))
         end
         # A varying effect contributes its draws block's direct `r`
         # expression (SB's `r_<target>_<suffix>` summand), resolved from
@@ -491,13 +467,6 @@ function _predictor_statements(plan::StructuralPlan)
         for t in pred.terms
             t.kind === ScanSummandTerm &&
                 push!(terms, _scan_summand_expr(plan, pred, t))
-        end
-        # A dar summand contributes its trajectory state directly (bare,
-        # beta-free — SB's `dar` zero-started path; the formula intercept
-        # is the initial level), resolved from the TERMS like a scan.
-        for t in pred.terms
-            t.kind === DarSummandTerm &&
-                push!(terms, _dar_summand_expr(plan, pred, t))
         end
         # A composed term evaluates its combination tree in-graph:
         # sub-predictors resolve to their LP nodes (emitted above —
@@ -521,16 +490,10 @@ end
 # vector).
 _coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
 
-# Per-block LP terms for a predictor with `mo` columns. The fused
-# `design * coef` matvec cannot cover a monotonic block — its contrast
-# column is parameter-derived, and `hcat` cannot mix data with symbolic
-# columns under the Enzyme reverse pass — so each coefficient-carrying
-# block splices against its own coefficient coordinates (positions follow
-# design order, the layout block's own order): intercept/continuous/
-# monotonic blocks scale one column by one coordinate, factor and matrix
-# blocks keep the data-matrix × coefficient-slice matvec. Predictors
-# without `mo` keep the fused form above, untouched.
-function _mo_block_terms(plan::StructuralPlan, shape::DesignShape;
+# Broadcast affine blocks against their coefficient coordinates while
+# retaining the authored axes. Factor and matrix blocks use their own
+# coefficient slices in design order.
+function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
         broadcast::Bool = false)
     pred = only(p for p in plan.predictors if p.name === shape.predictor)
     coef = _affine_block_name(pred)
@@ -555,302 +518,12 @@ function _mo_block_terms(plan::StructuralPlan, shape::DesignShape;
             push!(terms, :($(_matrix_block_expr(b, _predictor_rows(plan,shape.predictor))) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
-        elseif b.kind === MonotonicTerm
-            push!(terms,
-                :($(monotonic_name(b.column)) .* $(_coef_coord(coef, k))))
-            k += 1
         end
     end
     return terms
 end
 
-# One basis's direct summand as a scaled-column sum (SB `_sb_s_generic` /
-# `_sb_t2_generic`): fixed blocks `X[j] .* b[j]`, pen blocks
-# `Z[j] .* (sd[k] * r[j])`, all joined with `.+`. Reads the BOUND basis's
-# materialized columns (bind asserted widths) and the `_spline_block_roles`
-# vector names (the contract's single source — no re-derivation here).
-function _spline_summand_expr(plan::StructuralPlan, id::Symbol)
-    i = findfirst(b -> b.id === id, plan.spline_bases)
-    i === nothing && throw(ContractValidationError(
-        "[generator] spline summand addresses unknown basis :$id"))
-    sb = plan.spline_bases[i]
-    byblock = Dict{Symbol,SplineBasisBlock}(b.name => b for b in sb.blocks)
-    roles, sd = _spline_block_roles(sb.id, sb.kind, sb.k)
-    parts = Any[]
-    for (block, coef, sdidx) in roles
-        haskey(byblock, block) || throw(ContractValidationError(
-            "[generator] spline :$id basis is missing block :$block"))
-        cols = byblock[block].columns
-        isempty(cols) && throw(ContractValidationError(
-            "[generator] spline :$id block :$block has no materialized " *
-            "columns (bind_data fills these)"))
-        for (j, c) in enumerate(cols)
-            cel = Expr(:call, :.*, c, Expr(:ref, coef, j))
-            if sdidx !== nothing
-                scaled = Expr(:call, :*, Expr(:ref, sd, sdidx),
-                    Expr(:ref, coef, j))
-                cel = Expr(:call, :.*, c, scaled)
-            end
-            push!(parts, cel)
-        end
-    end
-    return foldl((a, b) -> :($a .+ $b), parts)
-end
 
-# `sqrt(2π)` verbatim from SB `brm_hsgp_sqrt_spd` (the spectral scale).
-const _HSGP_SQRT2PI = 2.5066282746310002
-
-# In-graph HSGP node names for one basis (all `_ppl_`-hygienic): per-axis
-# trig columns, tensor-product columns, the `hcat` basis matrix, the
-# spectral scale, per-basis `sqrt_spd` scalars, their `vect`, the
-# spectral weights, and the predictor summand.
-_hsgp_ax_name(id::Symbol, j::Int, k::Int) = Symbol(:_ppl_hsgp_, id, :_ax, j, :_k, k)
-_hsgp_phi_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_phi_, b)
-_hsgp_cos_name(id::Symbol, j::Int) = Symbol(:_ppl_hsgp_, id, :_cos_, j)
-_hsgp_sin_name(id::Symbol, j::Int) = Symbol(:_ppl_hsgp_, id, :_sin_, j)
-_hsgp_a_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_a)
-_hsgp_PHI_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_PHI)
-_hsgp_sscale_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_sscale)
-_hsgp_s_name(id::Symbol, b::Int) = Symbol(:_ppl_hsgp_, id, :_s_, b)
-_hsgp_S_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_S)
-_hsgp_w_name(id::Symbol) = Symbol(:_ppl_hsgp_, id, :_w)
-_hsgp_sum_name(id::Symbol) = Symbol(:_ppl_hsgp_, id)
-
-# One basis's in-graph evaluation (SB `_brm_apply_hsgp` /
-# `brm_hsgp_sqrt_spd` / `_sb_hsgp`, SB op order throughout): per-axis 1D
-# trig columns from the frozen bind fits (`(mu, L)` literals), their
-# tensor-product columns in `CartesianIndices(K)` order, the `hcat` basis
-# matrix, unrolled `sqrt_spd` scalars over the sampled `(rho, sigma)`,
-# and the spec-literal matmul summand `PHI * (S .* beta)`. The basis
-# columns are data-only (bound-folded, the `design_recipe` precedent);
-# the spectral weights stay symbolic. Runs before the predictors (the
-# summand node is the LP splice); the priors stay in `_prior_statements`
-# (order-free).
-function _hsgp_basis_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    for hb in plan.hsgp_bases
-        if hb.cov === :periodic
-            isempty(hb.fits) || throw(ContractValidationError(
-                "[generator] hsgp :$(hb.id): periodic carries no fits " *
-                "(no domain to fit)"))
-            append!(stmts, _hsgp_periodic_stmts(hb))
-        else
-            length(hb.fits) == length(hb.axes) || throw(ContractValidationError(
-                "[generator] hsgp :$(hb.id): fits not filled at bind " *
-                "(bind_data fills one (mu, L) per axis)"))
-            append!(stmts, hb.by === nothing ? _hsgp_basis_stmts(hb) :
-                _hsgp_grouped_stmts(hb))
-        end
-    end
-    return stmts
-end
-
-# One grouped basis (SB `_sb_hsgp_by` / `brm_hsgp_by_hyper_S`), one
-# isotropic axis: the shared basis matrix `PHI` (n x M, frozen fits), the
-# per-group length scales / marginal scales (a G-vector from the
-# hyper-predictor `exp.(beta0 .+ sd .* z)` — length scales floored per
-# group at the validity floor, SB `fmax(rho_g, rho_lower)` — or the
-# shared scalar), the per-group spectral weights `SPD` (G x M, SB
-# `brm_hsgp_sqrt_spd` per group), the per-group standardized weights
-# `W = reshape(beta_raw, G, M)`, and the row-wise summand
-# `sum(PHI .* (OH * (SPD .* W)); dims = 2)` over the data-only one-hot
-# group matrix `OH` (n x G) — SB `rows_dot_product(S, beta[group_idx, :])`
-# with its row mask, matmul-only so it traces through Reactant.
-function _hsgp_grouped_stmts(hb::HSGPBasis)
-    id = hb.id
-    stmts = Expr[]
-    axis = only(hb.axes)
-    mu, L = Float64.(only(hb.fits))
-    inv_sqrt_L = 1.0 / sqrt(L)
-    K = only(hb.K)
-    cols = Symbol[]
-    for k in 1:K
-        lam_sqrt = sqrt(_hsgp_lambda(k, L))
-        col = _hsgp_ax_name(id, 1, k)
-        push!(stmts, :($col =
-            $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
-        push!(cols, col)
-    end
-    PHI = _hsgp_PHI_name(id)
-    push!(stmts, :($PHI = hcat($(cols...))))
-    names = _hsgp_names(hb)
-    levels = hb.by.levels
-    G = length(levels)
-    gidx = Symbol(:_ppl_hsgp_, id, :_gidx)
-    lvlvec = Expr(:vect, (_level_literal(lv) for lv in levels)...)
-    push!(stmts, :($gidx = _declared_codes($(hb.by.column), $lvlvec)))
-    OH = Symbol(:_ppl_hsgp_, id, :_OH)
-    push!(stmts, :($OH = hcat($((:(Float64.($gidx .== $g)) for g in 1:G)...))))
-    floor = only(_hsgp_floors(hb.K, hb.fits, hb.iso))
-    function hyper_vec(h, floor)
-        eta = h.intercept ? :($(h.beta0) .+ $(h.sd) .* $(h.z)) :
-            :($(h.sd) .* $(h.z))
-        v = :(exp.($eta))
-        return floor > 0 ? :(max.($v, $floor)) : v
-    end
-    rho = names.rho_hyper === nothing ? only(names.rhos) :
-        hyper_vec(names.rho_hyper, hb.rho_prior isa HSGPHyperLP ? floor : 0.0)
-    sigma = names.sigma_hyper === nothing ? names.sigma :
-        hyper_vec(names.sigma_hyper, 0.0)
-    rv = Symbol(:_ppl_hsgp_, id, :_rho)
-    sv = Symbol(:_ppl_hsgp_, id, :_sigma)
-    push!(stmts, :($rv = $rho))
-    push!(stmts, :($sv = $sigma))
-    lamrow = Expr(:hcat, (_hsgp_lambda(k, L) for k in 1:K)...)
-    SPD = _hsgp_S_name(id)
-    push!(stmts, :($SPD = ($sv .* sqrt.($rv .* $_HSGP_SQRT2PI)) .*
-        exp.(-0.25 .* ($rv .* $rv) .* $lamrow)))
-    W = _hsgp_w_name(id)
-    push!(stmts, :($W = reshape($(names.beta), $G, $K)))
-    push!(stmts, :($(_hsgp_sum_name(id)) =
-        vec(sum($PHI .* ($OH * ($SPD .* $W)); dims = 2))))
-    return stmts
-end
-
-function _hsgp_basis_stmts(hb::HSGPBasis)
-    id = hb.id
-    d = length(hb.axes)
-    stmts = Expr[]
-    # Per-axis 1D columns: `PHI[i,k] = inv_sqrt_L * sin(lam_sqrt[k] *
-    # (x[i] - mu + L))` (SB `_brm_apply_hsgp`, element order verbatim).
-    # `lam[k]` is SB's `lambda` literal, `lam_sqrt[k]` its `sqrt`.
-    for (j, axis) in enumerate(hb.axes)
-        mu, L = hb.fits[j]
-        mu, L = Float64(mu), Float64(L)
-        inv_sqrt_L = 1.0 / sqrt(L)
-        for k in 1:hb.K[j]
-            lam_sqrt = sqrt(_hsgp_lambda(k, L))
-            col = _hsgp_ax_name(id, j, k)
-            push!(stmts, :($col =
-                $inv_sqrt_L .* sin.($lam_sqrt .* ($axis .- $mu .+ $L))))
-        end
-    end
-    # Tensor-product columns in `CartesianIndices(K)` order (SB's
-    # `enumerate(CartesianIndices(K))`): one axis reuses its column.
-    midcs = collect(CartesianIndices(Tuple(hb.K)))
-    phis = Symbol[]
-    for (b, I) in enumerate(midcs)
-        if d == 1
-            push!(phis, _hsgp_ax_name(id, 1, I[1]))
-        else
-            phi = _hsgp_phi_name(id, b)
-            cols = [_hsgp_ax_name(id, j, I[j]) for j in 1:d]
-            push!(stmts, :($phi = $(foldl((a, c) -> :($a .* $c), cols))))
-            push!(phis, phi)
-        end
-    end
-    push!(stmts, :($(_hsgp_PHI_name(id)) = hcat($(phis...))))
-    # Spectral weights (SB `brm_hsgp_sqrt_spd`): `scale = sigma *
-    # prod(sqrt(rho_j * sqrt(2π)))`, `s[b] = scale * exp(-0.25 *
-    # sum(rho_j^2 * omega2[b,j]))` — left-assoc folds, SB order. Iso
-    # shares one rho across axes; `omega2` is the frozen `lambda`
-    # literal above.
-    names = _hsgp_names(hb)
-    rhos = hb.iso ? fill(names.rhos[1], d) : names.rhos
-    factors = Any[names.sigma]
-    for j in 1:d
-        push!(factors, :(sqrt($(rhos[j]) * $_HSGP_SQRT2PI)))
-    end
-    sscale = _hsgp_sscale_name(id)
-    push!(stmts, :($sscale::Float64 = $(foldl((a, c) -> :($a * $c), factors))))
-    snames = Symbol[]
-    for (b, I) in enumerate(midcs)
-        terms = Any[]
-        for j in 1:d
-            lam = _hsgp_lambda(I[j], hb.fits[j][2])
-            push!(terms, :($(rhos[j]) * $(rhos[j]) * $lam))
-        end
-        expsum = foldl((a, c) -> :($a + $c), terms)
-        s = _hsgp_s_name(id, b)
-        push!(stmts, :($s::Float64 = $sscale * exp(-0.25 * $expsum)))
-        push!(snames, s)
-    end
-    S = _hsgp_S_name(id)
-    push!(stmts, :($S = $(Expr(:vect, snames...))))
-    w = _hsgp_w_name(id)
-    push!(stmts, :($w = $S .* $(names.beta)))
-    push!(stmts, :($(_hsgp_sum_name(id)) = $(_hsgp_PHI_name(id)) * $w))
-    return stmts
-end
-
-# One periodic basis's in-graph evaluation (SB
-# `_brm_apply_hsgp_periodic` / `brm_hsgp_periodic_sqrt_spd` /
-# `_sb_hsgp_periodic`): `k` harmonics of the fundamental angular
-# frequency `w0 = 2π/period` as `2k` cosine/sine columns (cosines
-# first, then sines — SB element order), unrolled `sqrt_spd` scalars
-# over the sampled `(rho, sigma)`, and the spec-literal matmul
-# summand `PHI * (S .* beta)`. The basis columns are data-only
-# (bound-folded); the spectral weights stay symbolic.
-#
-# Spectral weights (SB `brm_hsgp_periodic_sqrt_spd`): with `a =
-# 1/(rho*rho)`, `q_j = sigma*sqrt(2*exp(-a)*I_j(a))`. Stan evaluates
-# this in log space through `log_modified_bessel_first_kind`;
-# SpecialFunctions offers no log-Bessel, so the emission uses the
-# exponentially scaled `besselix` (`I_j(a) = besselix(j,a)*exp(a)`,
-# exact algebra): `q_b = exp(log(sigma) + 0.5*(log(2) +
-# log(besselix(h_b, a))))`. Never overflows (the direct
-# `sqrt(2*exp(-a)*besseli(j,a))` form throws AMOS for large `a`),
-# Enzyme-clean (probed vs findiff). The harmonic index `h_b` is the
-# frozen SB `harmonics` literal (`[1..k, 1..k]`).
-function _hsgp_periodic_stmts(hb::HSGPBasis)
-    id = hb.id
-    x = only(hb.axes)
-    k = only(hb.K)
-    period = Float64(hb.period)
-    stmts = Expr[]
-    # Trig columns: `PHI[i,j] = cos(w0*j*x[i])`,
-    # `PHI[i,k+j] = sin(w0*j*x[i])` (SB
-    # `_brm_apply_hsgp_periodic`, element order verbatim). The
-    # `w0*j` literal folds SB's `(w0*j)*x[i]` left-assoc product.
-    w0 = 2.0 * pi / period
-    coscols = Symbol[]
-    sincols = Symbol[]
-    for j in 1:k
-        wj = w0 * j
-        cc = _hsgp_cos_name(id, j)
-        sc = _hsgp_sin_name(id, j)
-        push!(stmts, :($cc = cos.($wj .* $x)))
-        push!(stmts, :($sc = sin.($wj .* $x)))
-        push!(coscols, cc)
-        push!(sincols, sc)
-    end
-    push!(stmts, :($(_hsgp_PHI_name(id)) = hcat($(coscols...), $(sincols...))))
-    # Spectral weights, one scalar per basis column over the frozen
-    # harmonic index (SB `brm_hsgp_periodic_sqrt_spd` in scaled-log
-    # space — see above).
-    names = _hsgp_names(hb)
-    rho = only(names.rhos)
-    a = _hsgp_a_name(id)
-    push!(stmts, :($a::Float64 = 1.0 / ($rho * $rho)))
-    snames = Symbol[]
-    for (b, h) in enumerate(vcat(1:k, 1:k))
-        s = _hsgp_s_name(id, b)
-        push!(stmts, :($s::Float64 = exp(log($(names.sigma)) +
-            0.5 * (0.6931471805599453 + log(besselix($h, $a))))))
-        push!(snames, s)
-    end
-    S = _hsgp_S_name(id)
-    push!(stmts, :($S = $(Expr(:vect, snames...))))
-    w = _hsgp_w_name(id)
-    push!(stmts, :($w = $S .* $(names.beta)))
-    push!(stmts, :($(_hsgp_sum_name(id)) = $(_hsgp_PHI_name(id)) * $w))
-    return stmts
-end
-
-# One HSGP summand's direct expression: the basis's precomputed
-# `_hsgp_basis_statements` node (resolved from the design block's basis
-# id; the lookup below is loud defense in depth).
-function _hsgp_summand_expr(plan::StructuralPlan, id::Symbol)
-    any(hb -> hb.id === id, plan.hsgp_bases) || throw(ContractValidationError(
-        "[generator] hsgp summand addresses unknown basis :$id"))
-    return _hsgp_sum_name(id)
-end
-
-# One scan summand's direct expression (`state .* coef`, explicit dotted
-# form): the in-graph recurrence state scaled by its sampled scalar
-# coefficient, or the bare state for a beta-free summand (`coef ===
-# nothing`). Both names resolve from the term's options (validated up
-# front; the lookups below are loud defense in depth).
 function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     o = t.options
     any(s -> o.scan_id in s.states, plan.scans) || throw(ContractValidationError(
@@ -862,22 +535,6 @@ function _scan_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSp
     return Expr(:call, :.*, o.scan_id, o.coef)
 end
 
-# One dar summand's direct expression (the bare trajectory state): the
-# in-graph `scan(...)` reconstruction is bound to the state's name by
-# `_dar_reconstruction_statements`, so the LP splices the name itself.
-# Validated up front; the lookup below is loud defense in depth.
-function _dar_summand_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
-    o = t.options
-    any(s -> s.state === o.dar_id, plan.dar_paths) || throw(ContractValidationError(
-        "[generator] dar summand in predictor $(pred.name) addresses " *
-        "unknown dar :$(o.dar_id)"))
-    return o.dar_id
-end
-
-# Composed elementwise maps → their generated-module bindings (`logistic`
-# is the distribution object there; the math function is `_ppl_logistic`).
-# Every other map keeps its head: a built-in math name resolves in the
-# generated module, a module function is its `GlobalRef`.
 const _COMPOSED_MAP_EMIT = Dict{Symbol,Symbol}(:exp => :exp,
     :logistic => :_ppl_logistic, :normcdf => :_ppl_normcdf,
     :cexpexp => :_ppl_cexpexp)
@@ -3488,20 +3145,6 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
                 p.support_override; rows = _plate_rows(plan, p))
         end
     end
-    # Spline coefficient vectors: the same plate-prior shape (broadcast the
-    # shared prior over cells). `b_fixed` is flat — a 0.0 node, mirroring a
-    # scalar flat parameter (never a plate: a vacuous cell would leave the
-    # do-var unread).
-    for v in plan.spline_vectors
-        if v.family === :flat
-            node = Symbol(:_ppl_prior_, v.name)
-            push!(stmts, :($node::Float64 = 0.0))
-            push!(terms, node)
-            continue
-        end
-        _vector_prior_stmts!(stmts, terms, v.name, v.family, v.args,
-            v.support_override)
-    end
     # Varying scales are normalized halves in every geometry.
     for d in plan.varying_draws
         if d.strata !== nothing
@@ -3516,70 +3159,10 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         _vector_prior_stmts!(stmts, terms, z, :normal,
             (arg1 = 0, arg2 = 1), nothing)
     end
-    # HSGP hyperparameters use normalized declared priors. A default
-    # length-scale prior is truncated at its actual fitted validity floor.
-    for hb in plan.hsgp_bases
-        names = _hsgp_names(hb)
-        rfam, rargs = hb.rho_prior isa HyperPrior ?
-            (hb.rho_prior.family, collect(Any, values(hb.rho_prior.args))) :
-            (:lognormal, Any[0, 1])
-        sfam, sargs = hb.sigma_prior isa HyperPrior ?
-            (hb.sigma_prior.family,
-                collect(Any, values(hb.sigma_prior.args))) :
-            (:lognormal, Any[0, 1])
-        # Grouped hyper-predictors: Normal intercept, HalfNormal sd,
-        # and standard-normal non-centered coordinates.
-        function hyper_priors!(h)
-            if h.intercept
-                bnode = Symbol(:_ppl_prior_, h.beta0)
-                push!(stmts, :($bnode::Float64 =
-                    $(_family_logpdf_expr(:normal, Any[0, 1], h.beta0))))
-                push!(terms, bnode)
-            end
-            dnode = Symbol(:_ppl_prior_, h.sd)
-            push!(stmts, :($dnode::Float64 =
-                $(_family_logpdf_expr(:normal, Any[0, 1], h.sd)) + log(2)))
-            push!(terms, dnode)
-            _vector_prior_stmts!(stmts, terms, h.z, :normal,
-                (arg1 = 0, arg2 = 1), nothing)
-        end
-        if names.rho_hyper !== nothing
-            hyper_priors!(names.rho_hyper)
-        else
-            for rho in names.rhos
-                node = Symbol(:_ppl_prior_, rho)
-                entry = only(e for e in layout.entries if e.name === rho)
-                support = hb.rho_prior isa HyperPrior ? hb.rho_prior.support_override :
-                    (:truncated, entry.transform === :floored ? entry.lo : 0.0, Inf)
-                cell = _sampled_prior_expr(SampledParameter(rho, rfam,
-                    NamedTuple{ntuple(i -> Symbol(:arg, i), length(rargs))}(Tuple(rargs)),
-                    support, rho); pre = stmts)
-                push!(stmts, :($node::Float64 = $cell))
-                push!(terms, node)
-            end
-        end
-        if names.sigma_hyper !== nothing
-            hyper_priors!(names.sigma_hyper)
-        else
-            snode = Symbol(:_ppl_prior_, names.sigma)
-            support = hb.sigma_prior isa HyperPrior ? hb.sigma_prior.support_override : nothing
-            scell = _sampled_prior_expr(SampledParameter(names.sigma, sfam,
-                NamedTuple{ntuple(i -> Symbol(:arg, i), length(sargs))}(Tuple(sargs)),
-                support, names.sigma); pre = stmts)
-            push!(stmts, :($snode::Float64 = $scell))
-            push!(terms, snode)
-        end
-        _vector_prior_stmts!(stmts, terms, names.beta, :normal,
-            (arg1 = 0, arg2 = 1), nothing)
-    end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
     scanstmts, scannodes = _scan_prior_statements(plan, layout)
     append!(stmts, scanstmts)
     append!(terms, scannodes)
-    # Differenced-AR(1) trajectories: the iid-innovation prior.
-    darstmts, darnodes = _dar_prior_statements(plan, layout)
-    append!(stmts, darstmts)
-    append!(terms, darnodes)
     # Declared array parameters (`arrays.jl`).
     _array_prior_stmts!(stmts, terms, plan, gathers; context)
     joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
@@ -3719,7 +3302,7 @@ function _sd_prior_tau_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     return nothing
 end
 
-# One plate over a latent VECTOR (a plate parameter or a spline vector),
+# One plate over a latent vector parameter,
 # summing the shared-prior log-density across cells. Every value the cell
 # reads is threaded as a plate PORT (the vector plus each scalar prior
 # arg) — captured free names are rejected by the `@kernel` plate
@@ -4320,69 +3903,6 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         total = Symbol(:_ppl_scan_, state)
         push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
         push!(nodes, total)
-    end
-    return stmts, nodes
-end
-
-# --- Differenced-AR(1) trajectory reconstruction (dar slice) ---
-
-# Reconstruction statements for every dar trajectory, in plan order — the
-# shared RK-core `scan(...)` carry-fold with a `(x, d)` NamedTuple carry
-# (level + AR(1) increment), zero-started exactly like SB's
-# `differenced_ar1_path` (`x[1] = 0`, `d[0] = 0`):
-#   `rest = scan(z, Ref(beta), Ref(sigma); init = (x = 0.0, d = 0.0)) do ... end`
-#   `state = vcat(0.0, rest)`
-# The per-step outputs are `x[2..T]`; the `vcat` heads the zero start.
-# Runs before predictors/likelihood (the LP splices the state); the
-# innovation prior stays in `_dar_prior_statements` (order-free).
-function _dar_reconstruction_statements(plan::StructuralPlan,
-        layout::LayoutTable)
-    stmts = Expr[]
-    for s in plan.dar_paths
-        any(p -> p.name === s.beta, plan.parameters) || throw(
-            ContractValidationError(
-                "[generator] dar $(s.state): persistence :$(s.beta) is " *
-                "not a sampled parameter"))
-        any(p -> p.name === s.sigma, plan.parameters) || throw(
-            ContractValidationError(
-                "[generator] dar $(s.state): scale :$(s.sigma) is not a " *
-                "sampled parameter"))
-        zname = _dar_innovation_name(s)
-        any(e -> e.kind === :scan && e.name === zname,
-            layout.entries) || throw(ContractValidationError(
-            "[generator] dar $(s.state): layout has no innovation slice " *
-            ":$zname"))
-        beta, sigma = s.beta, s.sigma
-        lambda = Expr(:->,
-            Expr(:tuple, :_ppl_carry, :_ppl_elem, beta, sigma),
-            Expr(:block,
-                :(_ppl_d = $beta * _ppl_carry.d + $sigma * _ppl_elem),
-                :(_ppl_x = _ppl_carry.x + _ppl_d),
-                :(_ppl_next = (x = _ppl_x, d = _ppl_d)),
-                :((_ppl_next, _ppl_x))))
-        kw = Expr(:parameters, Expr(:kw, :init, :((x = 0.0, d = 0.0))))
-        call = Expr(:call, :scan, kw, zname, :(Ref($beta)), :(Ref($sigma)))
-        rest = Symbol(:_ppl_dar_rest_, s.state)
-        push!(stmts, :($rest = $(Expr(:do, call, lambda))))
-        push!(stmts, :($(s.state) = vcat(0.0, $rest)))
-    end
-    return stmts
-end
-
-# The dar innovation prior: the iid `Normal(0, 1)` plate-vector prior
-# shape over the `_ppl_dar_z_<state>` slice (one cell per innovation,
-# the same `_plate_sum_stmts` reduction the non-centered-scan path
-# uses), totalled under the dar-flavored `_ppl_dar_<state>` node.
-function _dar_prior_statements(plan::StructuralPlan, layout::LayoutTable)
-    stmts = Expr[]
-    nodes = Symbol[]
-    for s in plan.dar_paths
-        zname = _dar_innovation_name(s)
-        cell = _family_logpdf_expr(:normal, Any[0, 1], _dovar(1))
-        node = Symbol(:_ppl_dar_, s.state)
-        pw = Symbol(:_ppl_dar_pw_, s.state)
-        append!(stmts, _plate_sum_stmts(pw, node, Any[zname], cell))
-        push!(nodes, node)
     end
     return stmts, nodes
 end

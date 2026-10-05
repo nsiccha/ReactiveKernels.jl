@@ -38,16 +38,14 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     ZeroInflatedBinomialFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
-    VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
-    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm,
-    DarSummandTerm, ComposedTerm
+    VaryingEffectTerm,
+    ScanSummandTerm, MatrixTerm,
+    ComposedTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export ScalePredictorRef, MixtureComplementWeights
 export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec, ArrayParameter
 export VaryingZRecipe, VaryingMargin, VaryingSdPrior, VaryingDraws, VaryingSlice
 export VaryingMultiMembership, VaryingStrata
-export SplineBasisBlock, SplineBasis, SplineVector
-export HSGPBasis, HyperPrior, HSGPHyperLP, HSGPGrouping
 export LevelMap
 export DesignMatrix
 export StructuralPlan, SubmodelScope
@@ -69,19 +67,15 @@ export lkj_logconst, lkj_corr_cholesky_logpdf
 export positive_bijector, unit_bijector, interval_bijector, floored_bijector,
     upper_bijector, BIJECTORS
 export coordinate_read, block_read, transform_statements, jacobian_term
-export design_name, offset_name, monotonic_name, design_recipe, offset_recipe,
-    monotonic_recipe
+export design_name, offset_name, design_recipe, offset_recipe
 export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
-export tps_basis, cr_basis, t2_basis, hsgp_basis, hsgp_periodic_basis, hsgp_sqrt_spd,
-    hsgp_grouped_sqrt_spd, hsgp_periodic_sqrt_spd, hsgp_rho_floors,
-    hsgp_periodic_rho_floor, hsgp_matern_sqrt_spd, hsgp_periodic_grouped_sqrt_spd
+export hsgp_basis, hsgp_sqrt_spd, hsgp_rho_floors
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
-export DarSpec
 export QT_COUPLING_SPINES, QT_OBS_FAMILIES
 export admit_qt_spine, admit_qt_obs_family
 export qt_loc_assignment, qt_obs_statement, pk_obs_statement

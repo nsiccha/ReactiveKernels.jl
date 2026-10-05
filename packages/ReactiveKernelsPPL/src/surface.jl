@@ -2255,8 +2255,14 @@ const _RETIRED_PK_HEADS = (:linear_pk_schedule, :linear_pk_read_locs,
     :transit_twocmt_unit_response, :transit_twocmt_rule,
     :prepare_transit_twocmt_rule)
 
+const _RETIRED_PREPARATION_HEADS = (:tps_basis, :cr_basis, :t2_basis,
+    :hsgp_periodic_basis, :hsgp_matern_sqrt_spd, :hsgp_grouped_sqrt_spd,
+    :hsgp_periodic_sqrt_spd, :hsgp_periodic_grouped_sqrt_spd,
+    :hsgp_periodic_rho_floor)
+
 function _module_binding(m::Module, s::Symbol, where, shown)
     if !isdefined(m, s)
+        s in _RETIRED_PREPARATION_HEADS && _sfail("$where: `$shown` is statistical preparation owned by BayesianRegressionModels.StatisticalPreparation; import the helper into the model module and call it as an ordinary function")
         s in _RETIRED_PK_HEADS && _sfail("$where: `$shown` is downstream PK code; import its replacement from RKPPLBench and call it as an ordinary function")
         haskey(_RETIRED_CONSTRUCT_MODELS, s) && _sfail("$where: the implicit `$shown` " *
             "construct is retired; write ordinary priors and values, or use " *
@@ -8684,7 +8690,7 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
             push!(uses, use)
             if name in ctx.ordinary_parameters && term.kind in
                     (InterceptTerm, ContinuousTerm, FactorTerm,
-                     MatrixTerm, MonotonicTerm)
+                     MatrixTerm)
                 # Record the exact use here: an addressee lookup loses identity
                 # when distinct parameters multiply the same column. The use
                 # sign includes both the summand and its product factors.
@@ -9280,22 +9286,11 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                 end
                 continue
             end
-            # Offsets carry no coefficient; latent terms carry a PlateParameter
-            # whose prior lives on the plate parameter, not as a coefficient;
-            # effect terms carry a VaryingDraws, whose geometry is
-            # self-priored; spline summands carry SplineVectors,
-            # self-priored likewise; hsgp summands carry an HSGPBasis,
-            # self-priored likewise; and monotonic summands (mo1) carry
-            # an increment simplex, also self-priored. Composed terms carry
-            # no coefficient at all (their coefficients live in the affine
-            # sub-predictors, priored there).
+            # Offsets and latent/varying/scan terms have their own priors;
+            # composed terms read their affine sub-predictors' coefficients.
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === VaryingEffectTerm ||
-                t.kind === SplineSummandTerm ||
-                t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
-                t.kind === MonotonicSummandTerm ||
-                t.kind === DarSummandTerm ||
                 t.kind === ComposedTerm) && continue
             if t.kind === MatrixTerm
                 append!(priors, _lower_matrix_priors(pred, t, coefuse,

@@ -82,36 +82,6 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         # its coefficients live in the PlateParameter layout block, so this
         # term contributes no design width.
         return DesignBlock(LatentTerm, only(t.columns), t.addressee, 0, Symbol[], [])
-    elseif t.kind === MonotonicTerm
-        # A monotonic (mo) column: width 1 with a free coefficient, labeled
-        # by its index column (the continuous precedent). The contrast is
-        # parameter-derived, so it never enters the data-only design
-        # matrix — the generator splices it per-block against its
-        # coefficient coordinate. `column` carries the increments key (the
-        # spline-basis-id precedent), which names the contrast recipe.
-        col = only(t.columns)
-        return DesignBlock(MonotonicTerm, t.options.increments, t.addressee,
-            1, [col], [])
-    elseif t.kind === MonotonicSummandTerm
-        # A monotonic summand (mo1): a direct beta-free contrast splice —
-        # no design-matrix width. `column` carries the increments key, as
-        # for the column shape.
-        return DesignBlock(MonotonicSummandTerm, t.options.increments,
-            t.addressee, 0, Symbol[], [])
-    elseif t.kind === SplineSummandTerm
-        # A spline summand is a direct `X*b + Z*(sd*z)` expression over
-        # materialized basis columns and SplineVector layout blocks — no
-        # design-matrix width. The basis id rides in `column` so the
-        # generator can resolve the blocks without re-reading terms.
-        return DesignBlock(SplineSummandTerm, t.options.spline_id,
-            t.addressee, 0, Symbol[], [])
-    elseif t.kind === HSGPSummandTerm
-        # An HSGP summand is a direct `PHI * (sqrt_spd .* beta)` expression
-        # over in-graph basis columns and the term's layout blocks (Stage
-        # B) — no design-matrix width. The basis id rides in `column` so
-        # the generator can resolve the basis without re-reading terms.
-        return DesignBlock(HSGPSummandTerm, t.options.hsgp_id,
-            t.addressee, 0, Symbol[], [])
     elseif t.kind === ScanSummandTerm
         # A scan summand is a direct `state .* coef` expression over the
         # in-graph recurrence state and a scalar sampled coefficient (or
@@ -120,12 +90,6 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         # the generator reads the TERMS for the full (scan_id, coef) key,
         # which does not fit one Symbol.
         return DesignBlock(ScanSummandTerm, t.options.scan_id,
-            t.addressee, 0, Symbol[], [])
-    elseif t.kind === DarSummandTerm
-        # A dar summand is a direct bare-state splice of the in-graph
-        # differenced-AR(1) trajectory — beta-free (the `mo1` shape), so
-        # no design-matrix width. The state rides in `column`.
-        return DesignBlock(DarSummandTerm, t.options.dar_id,
             t.addressee, 0, Symbol[], [])
     elseif t.kind === FactorTerm
         col = only(t.columns)

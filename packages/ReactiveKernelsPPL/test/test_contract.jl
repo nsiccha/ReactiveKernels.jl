@@ -1,4 +1,5 @@
 using ReactiveKernelsPPL
+using Distributions
 using Test
 
 # Builders for a minimal valid plan per admitted triple. Each returns a
@@ -370,9 +371,7 @@ end
         NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
         ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
-        OffsetTerm, VaryingEffectTerm, SplineSummandTerm,
-        HSGPSummandTerm, ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm,
-        MatrixTerm, DarSummandTerm, ComposedTerm)
+        OffsetTerm, VaryingEffectTerm, ScanSummandTerm, MatrixTerm, ComposedTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
     @test :tanh in admitted_functions()
@@ -381,9 +380,25 @@ end
     @test :log in fns && :exp in fns
     @test supports_term(:factor)
     @test supports_term(:scan_summand)
-    @test supports_term(:dar_summand)
+    @test !supports_term(:dar_summand)
     @test !supports_term(:zscale)
     @test !supports_term(:hsgp)
+end
+
+@testset "legacy positional plan construction preserves declared model semantics" begin
+    p = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        y .~ Normal.(a, 1)
+    end, (:y,); conditioned = (:y,))
+    legacy = StructuralPlan(p.responses, p.predictors, p.population_priors,
+        p.parameters, p.assignments, p.derived, p.columns, p.n_obs, p.roles)
+    bound = bind_data(legacy, Dict(:y => [0.2, 0.4]))
+    @test validate_plan(bound) === nothing
+    built = build_kernel(bound)
+    @test coordinate_names(built.layout) == [:a]
+    @test Base.invokelatest(prepare_query(built, bound, :sampler), [0.1]) ≈
+        Distributions.logpdf(Distributions.Normal(), 0.1) +
+        sum(Distributions.logpdf.(Distributions.Normal(0.1, 1), [0.2, 0.4]))
 end
 
 @testset "valid plans pass" begin

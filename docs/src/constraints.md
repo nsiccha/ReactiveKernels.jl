@@ -393,10 +393,9 @@ and lock the one Reactant 0.2.289 lifted:
 - Arbitrary-order `SpecialFunctions.besselix(order, x)` has no method for
   a traced scalar `x` in Reactant 0.2.289:
   `repro_reactant_besselix_order.jl` isolates the missing method without
-  ReactiveKernels. The periodic HSGP library's spectral weights require
-  this function, so that effect supports native primal and Enzyme gradients
-  but cannot compile with Reactant. Its acceptance test pins this exact
-  `MethodError`; other failures remain errors. The ordinary formula stays
+  ReactiveKernels. BRM's periodic HSGP spectral weights require this
+  function. The producer-only reproducer preserves the dependency failure
+  after statistical model tests move to BRM. The ordinary formula stays
   intact, with no foreign-function derivative rule or tracing workaround.
 - Evidence normalizers that call `SpecialFunctions.gamma_inc` or `beta_inc`
   have no traced scalar method in Reactant 0.2.290:

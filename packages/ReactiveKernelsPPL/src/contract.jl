@@ -170,23 +170,16 @@ design) — the random-effects / per-observation-latent location. `ScanSummandTe
 sequential-recurrence state into the predictor scaled by a sampled scalar
 coefficient (`u .* beta`, SB's `ar` latent path with its free `popefs` beta), or
 unscaled when its `coef` is `nothing` (`mu = a .+ x`).
-`DarSummandTerm` splices a differenced-AR(1) trajectory state into the
-predictor UNSCALED (SB's `dar` zero-started integrated path; the formula
-intercept is the initial level, so no coefficient is identified)."""
+"""
 @enum TermKind::UInt8 begin
     InterceptTerm
     ContinuousTerm
     FactorTerm
     OffsetTerm
     LatentTerm
-    SplineSummandTerm
-    HSGPSummandTerm
     ScanSummandTerm
-    MonotonicTerm
-    MonotonicSummandTerm
     VaryingEffectTerm
     MatrixTerm
-    DarSummandTerm
     ComposedTerm
 end
 
@@ -911,236 +904,8 @@ ArrayParameter(name::ParamName, family::Symbol, args::NamedTuple,
     dims::Vector{Any}, support_override::SupportOverride) =
     ArrayParameter(name, family, args, dims, support_override, name)
 
-"""
-    SplineBasisBlock(name, width, columns)
-
-One fitted basis block (`:fixed`, `:pen`, `:rr`, `:rn`, `:nr`): `width`
-is static from `k` (known at lowering); `columns` holds the materialized
-bound-vector names, filled at bind (empty pre-bind).
-"""
-struct SplineBasisBlock
-    name::Symbol
-    width::Int
-    columns::Vector{Symbol}
-end
-
-"""
-    SplineBasis(id, kind, axes, k, blocks, label)
-
-One spline term's basis recipe (SB mirror): `kind` is `:tps` (`s(x)`,
-one axis) or `:t2` (`t2(x,z)`, two axes); `k` is the basis dimension
-(`Int` for `s`, `(Int,Int)` for `t2`). `blocks` are static in
-name/width (`:fixed`/`:pen` for `s`, `:fixed`/`:rr`/`:rn`/`:nr` for
-`t2`); bind fits the basis from the raw `axes` columns (host-side
-transformed-data mirror — eigen is inexpressible in-graph) and fills
-each block's materialized `columns`. A term feeds exactly one predictor
-(the `spline(:id)` use-site).
-"""
-struct SplineBasis
-    id::Symbol
-    kind::Symbol
-    axes::Vector{Symbol}
-    k::Union{Int,Tuple{Int,Int}}
-    blocks::Vector{SplineBasisBlock}
-    label::Symbol
-end
-
-"""
-    SplineVector(name, family, args, support_override, width, basis, label)
-
-One free spline coefficient block: flat fixed coefficients, standard-normal
-raw coefficients, and normalized positive smoothing scales. `width` derives
-from structural `k`; `basis` is the owning basis id. Priors retain one plate.
-"""
-struct SplineVector
-    name::Symbol
-    family::Symbol
-    args::NamedTuple
-    support_override::SupportOverride
-    width::Int
-    basis::Symbol
-    label::Symbol
-end
-
-"""
-    HyperPrior(family, args[, support_override])
-
-A literal-argument positive hyperparameter prior with the same family,
-arguments and explicit normalized support as a sampled parameter.
-"""
-struct HyperPrior
-    family::Symbol
-    args::NamedTuple
-    support_override::SupportOverride
-end
-
-HyperPrior(family::Symbol, args::NamedTuple) = HyperPrior(family, args, nothing)
-
-# Admitted base families and their Distributions arities. Real-support
-# families require an explicit half or truncation.
-const _HYPER_PRIOR_FAMILIES = Dict{Symbol,Tuple{Vararg{Int}}}(
-    :lognormal => (2,), :inverse_gamma => (2,), :gamma => (2,),
-    :exponential => (1,), :normal => (2,), :cauchy => (2,),
-    :student_t => (3,), :uniform => (2,))
 
 # Explicit support travels with a hyper prior, just as for a sampled prior.
-_hyper_support_override(hp::HyperPrior) = hp.support_override
-function _hyper_prior_bounds(hp::HyperPrior)
-    hp.support_override === nothing && hp.family !== :uniform && return nothing
-    transform, lo, hi = _entry_transform(hp.family, hp.support_override, hp.args)
-    transform === :interval && return (lo, hi)
-    transform === :floored && return (lo, Inf)
-    transform === :exp && return nothing
-    throw(ContractValidationError("[hyper prior] use an explicit positive distribution, got $(hp.family) with support $(hp.support_override)"))
-end
-_hyper_prior_bounds(::Nothing) = nothing
-
-function _validate_hyper_prior(hp::HyperPrior, label::Symbol, what)
-    haskey(_HYPER_PRIOR_FAMILIES, hp.family) || _fail(label,
-        "$what prior family $(hp.family) is not admitted (admitted: " *
-        "$(join(sort!(collect(keys(_HYPER_PRIOR_FAMILIES))), ", ")))")
-    length(hp.args) in _HYPER_PRIOR_FAMILIES[hp.family] || _fail(label,
-        "$what prior $(hp.family) takes " *
-        "$(_HYPER_PRIOR_FAMILIES[hp.family]) arguments, got " *
-        "$(length(hp.args))")
-    keys(hp.args) == ntuple(i -> Symbol(:arg, i), length(hp.args)) ||
-        _fail(label, "$what prior args must be `(arg1, ...)`, got " *
-              "$(keys(hp.args))")
-    all(v -> v isa Real && !(v isa Bool) && isfinite(v), values(hp.args)) ||
-        _fail(label, "$what prior args must be finite numeric " *
-              "literals, got $(hp.args)")
-    _validate_support_override(label, hp.family, hp.support_override, hp.args)
-    _validate_uniform_args(label, hp.family, hp.args)
-    SAMPLED_SUPPORT[hp.family] === :real && hp.support_override === nothing &&
-        _fail(label, "$what needs an explicit positive prior: HalfNormal, HalfCauchy or truncated(D, 0, Inf)")
-    bounds = _hyper_prior_bounds(hp)
-    bounds === nothing || (0 <= bounds[1] < bounds[2]) ||
-        _fail(label, "$what prior must have positive support, got $bounds")
-    return nothing
-end
-
-"""
-    HSGPHyperLP(intercept, group)
-
-A grouped HSGP hyperparameter's log-linear hyper-predictor (SB
-`log(length_scale(hsgp(x))) ~ 1 + (1 | g)` / `~ (1 | g)`): per group
-`log h_g = beta0 + sd * z_g` (`intercept` false drops `beta0`), with the
-BRM defaults `beta0 ~ Normal(0, 1)`, `sd ~ HalfNormal(1)`, non-centered `z ~ Normal(0, 1)`. `group` must be
-the basis's `by` column (one hyper level per term group). A length scale
-is floored per group at the validity floor (SB `brm_hsgp_by_hyper_S`
-`fmax(rho_g, rho_lower)`).
-"""
-struct HSGPHyperLP
-    intercept::Bool
-    group::Symbol
-end
-
-# A hyper-predictor carries no stated bounds (its floor is applied
-# in-graph per group).
-_hyper_prior_bounds(::HSGPHyperLP) = nothing
-
-"""
-    HSGPGrouping(column, levels)
-
-A per-group HSGP (SB `hsgp(x; by = g)`): the basis weights vary by the
-levels of data column `column` (`levels` sort-ordered observed levels,
-`nothing` pre-bind — [`bind_data`](@ref) fills them).
-"""
-struct HSGPGrouping
-    column::Symbol
-    levels::Union{Nothing,Vector{Any}}
-end
-
-"""
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period[, rho_prior,
-              sigma_prior[, domain[, by]]])
-
-One Hilbert-space GP basis (SB `_sb_hsgp` / `_sb_hsgp_periodic`):
-`axes` raw data columns, `K` modes per axis, `c` boundary factors per
-axis (`L = c*max|x-mu|`, `c > 1`), `iso` length-scale sharing. `fits`
-holds the bind-time `(mu, L)` per axis (empty pre-bind); the basis
-itself is evaluated in-graph from the raw columns + frozen fits (trig
-is elementwise-expressible — unlike spline eigen, no bind-time
-materialization). `M = prod(K)` basis functions; the term owns
-`beta_raw_<id>` (M-vector), `rho_<id>` (iso scalar) or
-`rho_<id>_1..d` (aniso scalars), `sigma_<id>` (scalar).
-
-`cov` selects the kernel (`:exp_quad` or `:periodic`, SB
-``hsgp(...; cov=...)``); `period` is the periodic kernel's formula
-constant (finite and positive iff periodic, `NaN` otherwise). A
-periodic basis takes exactly one isotropic axis, carries no fits and
-no domain (`c` is validated but ignored, the SB mirror), and owns `M
-= 2k` basis functions (cosines then sines over `k` harmonics).
-
-`rho_prior` / `sigma_prior` override the default `lognormal(0, 1)`
-priors ([`HyperPrior`](@ref), SB `length_scale(:, hsgp(x)) ~ ...` /
-`sd(:, hsgp(x)) ~ ...`). An explicit length-scale prior replaces the
-whole default declaration INCLUDING the approximation-validity floor
-(BRM `_brm_hsgp_declared_rho_lower`): the length scales then ride a
-plain `exp` transform; a `Uniform(lo, hi)` prior instead BOUNDS the
-hyperparameter (`(:interval, lo, hi)`, SB prior-bound intersection).
-`nothing` keeps the default.
-
-`domain` (SB `hsgp(...; domain=...)`) fixes the eigenfunction domain
-per axis as `(lower, upper)` pairs: bind uses `(mu, L) = ((lo+hi)/2,
-(hi-lo)/2)` instead of the data-fitted `L = c*max|x-mu|` (so `c` does
-not apply), and every bound axis value must lie inside its pair.
-
-`by` ([`HSGPGrouping`](@ref), SB `hsgp(x; by = g)`) makes the basis
-weights per group (`G*M` standardized weights) over one shared basis;
-the hyperparameters stay shared unless `rho_prior` / `sigma_prior` carry
-an [`HSGPHyperLP`](@ref) (per-group log-linear hyper-predictors). v1:
-one isotropic exp-quad axis.
-"""
-struct HSGPBasis
-    id::Symbol
-    axes::Vector{Symbol}
-    K::Vector{Int}
-    c::Vector{Float64}
-    iso::Bool
-    fits::Vector{Tuple{Float64,Float64}}
-    label::Symbol
-    cov::Symbol
-    period::Float64
-    rho_prior::Union{Nothing,HyperPrior,HSGPHyperLP}
-    sigma_prior::Union{Nothing,HyperPrior,HSGPHyperLP}
-    domain::Union{Nothing,Vector{Tuple{Float64,Float64}}}
-    by::Union{Nothing,HSGPGrouping}
-end
-
-"""Default-prior construction (SB `_sb_hsgp`'s `lognormal(0, 1)`
-length scales on the validity floor + `lognormal(0, 1)` marginal
-scale)."""
-HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
-    c::Vector{Float64}, iso::Bool,
-    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
-    period::Float64) =
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, nothing,
-        nothing, nothing, nothing)
-
-"""Stated-hyper-prior construction without a fixed domain."""
-HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
-    c::Vector{Float64}, iso::Bool,
-    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
-    period::Float64, rho_prior, sigma_prior) =
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
-        sigma_prior, nothing, nothing)
-
-"""Fixed-domain construction without grouping."""
-HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
-    c::Vector{Float64}, iso::Bool,
-    fits::Vector{Tuple{Float64,Float64}}, label::Symbol, cov::Symbol,
-    period::Float64, rho_prior, sigma_prior, domain) =
-    HSGPBasis(id, axes, K, c, iso, fits, label, cov, period, rho_prior,
-        sigma_prior, domain, nothing)
-
-"""Exp-quad v1 positional construction (periodic defaults: `cov =
-:exp_quad`, `period = NaN`)."""
-HSGPBasis(id::Symbol, axes::Vector{Symbol}, K::Vector{Int},
-    c::Vector{Float64}, iso::Bool,
-    fits::Vector{Tuple{Float64,Float64}}, label::Symbol) =
-    HSGPBasis(id, axes, K, c, iso, fits, label, :exp_quad, NaN)
-
 """
     AssignmentSpec(name, expr)
 
@@ -1254,34 +1019,6 @@ struct ScanSpec
 end
 
 """
-    DarSpec(state, beta, sigma, label)
-
-One differenced-AR(1) trajectory (SB `_sb_dar1`'s `differenced_ar1_path`):
-the zero-started integrated path `x[t+1] = x[t] + d[t]` over the AR(1)
-increments `d[t] = beta*d[t-1] + sigma*z[t]` (`d[0] = 0`, `x[1] = 0`).
-`beta`/`sigma` name the persistence (`Normal` truncated to `[0, 1]`)
-and innovation-scale (half-Normal, including `truncated(Normal(0, s), 0, Inf)`)
-[`SampledParameter`](@ref)s, each with Distributions semantics (the
-truncation normalizers stay);
-the `z` innovations (one fewer than the path's rows) are owned internally
-under the reserved `_ppl_dar_z_<state>` name, like a non-centered scan's
-`_ppl_scan_z_<state>` slice. The path length follows its consuming response's
-axis, because the LP direct summand adds elementwise to that predictor.
-
-A dedicated node rather than a `ScanSpec`: the v1 scan grammar threads
-one carried array from SAMPLED seeds with full-length innovations, while
-dar starts both carries at zero deterministically, carries (level,
-increment) jointly, and innovates `T - 1` times. The generator still
-lowers through the shared RK-core `scan(...)` carry-fold tier.
-"""
-struct DarSpec
-    state::Symbol
-    beta::Symbol
-    sigma::Symbol
-    label::Symbol
-end
-
-"""
     LevelMap(predictor, column, values, source, subset)
 
 Ordered level values sizing one full-rank factor term: `values` is the
@@ -1353,9 +1090,8 @@ name table (duplicates rejected). N≥1 independent responses; shared
 predictor Symbols allowed. `levelmaps` sizes every factor term
 (binder-evaluated values); `plate_parameters` carries per-cell latents,
 `vector_parameters` leveled-response latents (cutpoints/thresholds/simplexes),
-`scans` sequential-recurrence latents, `dar_paths` differenced-AR(1)
-trajectories, `varying_draws`/`varying_slices` the generic
-varying-effect draws blocks plus their per-target applications, and
+`scans` sequential-recurrence latents, `varying_draws`/`varying_slices`
+the temporary varying-effect compatibility blocks and applications, and
 `matrices` user-bound design matrices referenced by [`MatrixTerm`](@ref)s
 (empty for a plain population-GLM plan). `array_parameters` are the
 declared array-valued parameters ([`ArrayParameter`](@ref)) the model reads
@@ -1375,13 +1111,9 @@ struct StructuralPlan
     levelmaps::Vector{LevelMap}
     plate_parameters::Vector{PlateParameter}
     scans::Vector{ScanSpec}
-    dar_paths::Vector{DarSpec}
     varying_draws::Vector{VaryingDraws}
     varying_slices::Vector{VaryingSlice}
     vector_parameters::Vector{VectorParameter}
-    spline_bases::Vector{SplineBasis}
-    spline_vectors::Vector{SplineVector}
-    hsgp_bases::Vector{HSGPBasis}
     matrices::Vector{DesignMatrix}
     array_parameters::Vector{ArrayParameter}
     submodel_scopes::Vector{SubmodelScope}
@@ -1393,69 +1125,67 @@ end
 # The former full constructor has no external observations.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, matrices,
+    scans, varying_draws, varying_slices, vector_parameters,
+    matrices,
     array_parameters, submodel_scopes,
     conditioned, indexed_observations) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, matrices,
+        scans, varying_draws, varying_slices, vector_parameters,
+        matrices,
         array_parameters, submodel_scopes,
         conditioned, indexed_observations, SampledParameter[])
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, matrices,
+    scans, varying_draws, varying_slices, vector_parameters,
+    matrices,
     array_parameters, submodel_scopes,
     conditioned) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, matrices,
+        scans, varying_draws, varying_slices, vector_parameters,
+        matrices,
         array_parameters, submodel_scopes,
         conditioned, Set{Symbol}())
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, matrices,
+    scans, varying_draws, varying_slices, vector_parameters,
+    matrices,
     array_parameters, submodel_scopes) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-        spline_bases, spline_vectors, hsgp_bases, matrices,
+        scans, varying_draws, varying_slices, vector_parameters,
+        matrices,
         array_parameters, submodel_scopes,
         Set{Symbol}())
 
 # Existing full-positional plans have no lexical submodel metadata.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, matrices, array_parameters) =
+    scans, varying_draws, varying_slices, vector_parameters,
+    matrices, array_parameters) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, dar_paths, varying_draws, varying_slices,
-        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        matrices,
+        plate_parameters, scans, varying_draws, varying_slices,
+        vector_parameters, matrices,
         array_parameters, SubmodelScope[])
 
 # Pre-array full-positional constructor: plans built before
 # `array_parameters` existed keep working with none.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, dar_paths, varying_draws, varying_slices, vector_parameters,
-    spline_bases, spline_vectors, hsgp_bases, matrices) =
+    scans, varying_draws, varying_slices, vector_parameters,
+    matrices) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, dar_paths, varying_draws, varying_slices,
-        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        matrices,
+        plate_parameters, scans, varying_draws, varying_slices,
+        vector_parameters, matrices,
         ArrayParameter[])
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
-# before `levelmaps`/`scans`/`varying_draws`/`vector_parameters`/spline/hsgp
+# before `levelmaps`/`scans`/`varying_draws`/`vector_parameters`
 # nodes existed keep working with all empty.
 StructuralPlan(
     responses::Vector{LikelihoodSpec},
@@ -1469,9 +1199,9 @@ StructuralPlan(
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, _checked_columns(columns), n_obs, roles,
-        LevelMap[], ScanSpec[], DarSpec[], VaryingDraws[], VaryingSlice[],
+        LevelMap[], PlateParameter[], ScanSpec[], VaryingDraws[], VaryingSlice[],
         VectorParameter[],
-        SplineBasis[], SplineVector[], HSGPBasis[], DesignMatrix[])
+        DesignMatrix[])
 
 """Column roles: what a bound column IS (CV travel + program transforms read
 this). Inferred at bind; explicit roles override. Unbound plans carry none."""
@@ -1494,13 +1224,9 @@ function StructuralPlan(
         levelmaps::Vector{LevelMap} = LevelMap[],
         plate_parameters::Vector{PlateParameter} = PlateParameter[],
         scans::Vector{ScanSpec} = ScanSpec[],
-        dar_paths::Vector{DarSpec} = DarSpec[],
         varying_draws::Vector{VaryingDraws} = VaryingDraws[],
         varying_slices::Vector{VaryingSlice} = VaryingSlice[],
         vector_parameters::Vector{VectorParameter} = VectorParameter[],
-        spline_bases::Vector{SplineBasis} = SplineBasis[],
-        spline_vectors::Vector{SplineVector} = SplineVector[],
-        hsgp_bases::Vector{HSGPBasis} = HSGPBasis[],
         matrices::Vector{DesignMatrix} = DesignMatrix[],
         array_parameters::Vector{ArrayParameter} = ArrayParameter[],
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
@@ -1509,10 +1235,9 @@ function StructuralPlan(
         external_observations::Vector{SampledParameter} = SampledParameter[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
-        roles, levelmaps, plate_parameters, scans, dar_paths, varying_draws,
+        roles, levelmaps, plate_parameters, scans, varying_draws,
         varying_slices,
-        vector_parameters, spline_bases, spline_vectors, hsgp_bases,
-        matrices,
+        vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations, external_observations)
 end
 
@@ -1647,196 +1372,15 @@ half at a literal-zero location renormalizes by exactly `+log(2)`."""
 const SYMMETRIC_SAMPLED_FAMILIES =
     (:normal, :cauchy, :student_t, :laplace, :logistic)
 
-# Spline block/width/vector/name rules, derived purely from (kind, k):
-# the single source of truth shared by surface lowering (which builds the
-# nodes) and contract validation (which re-derives and compares). Widths
-# are static — the fit can only confirm them at bind, never change them.
-# Block order is SB's data order (:fixed first, then pen/rr/rn/nr); the t2
-# sd index follows the pen-block position (rr→1, rn→2, nr→3). Neither
-# kind carries a constant fixed column: the author's intercept owns it
-# (tps is one column narrower than SB's, `_rk_apply_spline`).
-function _spline_blocks(kind::Symbol, k::Union{Int,Tuple{Int,Int}})
-    if kind === :tps
-        k isa Int ||
-            _fail(:plan, "tps spline k must be an Int, got $(repr(k))")
-        return [(:fixed, 1), (:pen, k - 2)]
-    elseif kind === :t2
-        k isa Tuple{Int,Int} ||
-            _fail(:plan, "t2 spline k must be an (Int, Int) tuple, got " *
-                  repr(k))
-        k1, k2 = k
-        return [(:fixed, 3), (:rr, (k1 - 2) * (k2 - 2)),
-            (:rn, (k1 - 2) * 2), (:nr, 2 * (k2 - 2))]
-    end
-    return _fail(:plan, "spline kind must be :tps or :t2, got $(repr(kind))")
-end
-
-_spline_block_names(id::Symbol, block::Symbol, width::Int) =
-    [Symbol("$(id)_$(block)_$j") for j in 1:width]
-
-function _spline_basis_columns(id::Symbol, kind::Symbol, k)
-    return [(name, _spline_block_names(id, name == :fixed ?
-        (kind === :tps ? :Xnull : :Xfixed) : Symbol(:Z, name), w))
-            for (name, w) in _spline_blocks(kind, k)]
-end
-
-# Per-block emission roles + the shared sd-vector name: `(roles, sd)`
-# with roles `(block, coefficient-vector name, sd index or nothing)`.
-# The sd index follows the pen-block position (tps: the one pen block →
-# 1; t2: rr/rn/nr → 1/2/3, SB's `vector[3]` order).
-function _spline_block_roles(id::Symbol, kind::Symbol, k)
-    roles = Tuple{Symbol,Symbol,Union{Nothing,Int}}[]
-    sdpos = 0
-    for (name, _) in _spline_blocks(kind, k)
-        if name === :fixed
-            push!(roles, (name, Symbol("b_$(id)_fixed"), nothing))
-        else
-            sdpos += 1
-            tag = kind === :tps ? :raw : Symbol("$(name)_raw")
-            push!(roles, (name, Symbol("b_$(id)_$tag"), sdpos))
-        end
-    end
-    return roles, Symbol("sd_$id")
-end
-
-# `sd_prior` is the stated smoothing-sd hyper prior (`spline_basis(...;
-# sd=...)`), `nothing` for the default `Normal(0, 1)`; its family fixes the
-# sd vector's support (`_hyper_support_override`).
-function _spline_vector_specs(id::Symbol, kind::Symbol, k,
-        sd_prior::Union{Nothing,HyperPrior} = nothing)
-    specs = Tuple{Symbol,Symbol,NamedTuple,SupportOverride,Int}[]
-    widths = Dict(first(b) => last(b) for b in _spline_blocks(kind, k))
-    roles, sd = _spline_block_roles(id, kind, k)
-    for (name, coef, sdidx) in roles
-        if sdidx === nothing
-            push!(specs, (coef, :flat, NamedTuple(), nothing, widths[name]))
-        else
-            push!(specs, (coef, :normal, (arg1=0, arg2=1), nothing,
-                widths[name]))
-        end
-    end
-    nsd = kind === :tps ? 1 : 3
-    sdfam, sdargs = sd_prior === nothing ? (:normal, (arg1=0, arg2=1)) :
-        (sd_prior.family, sd_prior.args)
-    push!(specs, (sd, sdfam, sdargs, sd_prior === nothing ? :positive : _hyper_support_override(sd_prior), nsd))
-    return specs
-end
-
-# HSGP sampled names, derived purely from the basis id (SB `_sb_hsgp`
-# vocabulary, basis-qualified): the standardized coefficients
-# (`beta_raw_<id>`, M-vector), the length scale(s) (`rho_<id>` iso
-# scalar, `rho_<id>_1..d` aniso scalars — d scalars, never a
-# floors-vector), and the marginal scale (`sigma_<id>` scalar).
-# Single source for surface claims, name tables, layout, and the
-# generator (Stage B).
-function _hsgp_names(hb::HSGPBasis)
-    id = hb.id
-    beta = Symbol("beta_raw_", id)
-    sigma = Symbol("sigma_", id)
-    rhos = hb.iso ? [Symbol("rho_", id)] :
-        [Symbol("rho_", id, :_, j) for j in 1:length(hb.axes)]
-    hyper(tag, spec) = spec isa HSGPHyperLP ?
-        (beta0 = Symbol("beta0_", tag, :_, id), sd = Symbol("sd_", tag, :_,
-            id), z = Symbol("z_", tag, :_, id), intercept = spec.intercept) :
-        nothing
-    return (beta = beta, rhos = rhos, sigma = sigma,
-        rho_hyper = hyper(:rho, hb.rho_prior),
-        sigma_hyper = hyper(:sigma, hb.sigma_prior))
-end
-
-"""Group count of an [`HSGPBasis`](@ref) (1 ungrouped; the bound
-`by` level count grouped — `nothing` levels pre-bind count as 0)."""
-_hsgp_n_groups(hb::HSGPBasis) = hb.by === nothing ? 1 :
-    hb.by.levels === nothing ? 0 : length(hb.by.levels)
-
-"""Basis-function count for an [`HSGPBasis`](@ref): `M = prod(K)`
-exp-quad, `M = 2k` periodic (cosines then sines over `k`
-harmonics — SB `2 * only(K)`)."""
-_hsgp_n_basis(hb::HSGPBasis) =
-    hb.cov === :periodic ? 2 * only(hb.K) : prod(hb.K)
-
-# Flat sampled-name list for name tables + claims (beta, rhos, sigma).
-function _hsgp_all_names(hb::HSGPBasis)
-    n = _hsgp_names(hb)
-    out = Symbol[n.beta, n.sigma, n.rhos...]
-    for h in (n.rho_hyper, n.sigma_hyper)
-        h === nothing && continue
-        h.intercept && push!(out, h.beta0)
-        push!(out, h.sd, h.z)
-    end
-    return out
-end
-
-"""
-    _hsgp_floors(K, fits, iso) -> Vector{Float64}
-
-Length-scale floors from bound fits (SB `_brm_hsgp_rho_lower[_s]`
-verbatim): `(4L/pi)*sqrt(log(100)/(K^2-1))` per axis (`K=1` →
-`0.0`, unbounded); iso takes the max. Pure function of fits — no
-storage on the IR (layout calls it on bound fits in Stage B).
-"""
-function _hsgp_floors(K::Vector{Int}, fits::Vector{Tuple{Float64,Float64}},
-        iso::Bool)
-    per = Float64[_hsgp_axis_floor(k, L) for (k, (_, L)) in zip(K, fits)]
-    return iso ? [maximum(per)] : per
-end
-
-"""One axis's length-scale validity floor for `K` basis functions on the
-half-width-`L` domain (SB `_brm_hsgp_rho_lower`): `(4L/pi) *
-sqrt(log(100)/(K^2-1))`, `0.0` (unbounded) at `K == 1`. Shared by the
-built-in layout floors and [`hsgp_rho_floors`](@ref)."""
-_hsgp_axis_floor(K::Integer, L::Real) =
-    K == 1 ? 0.0 : (4 * L / pi) * sqrt(log(100.0) / (K * K - 1))
-
-"""Exp-quad HSGP eigenvalue of basis function `k` on the half-width-`L`
-domain (SB `lambda`): `(k*pi/(2L))^2`. Shared by the in-graph built-in
-basis and the data-side [`hsgp_basis`](@ref)."""
-_hsgp_lambda(k::Integer, L::Real) = (k * pi / (2.0 * L))^2
-
-"""
-    _hsgp_periodic_rho_lower(K) -> Float64
-
-Periodic length-scale validity floor for `K` harmonics (SB
-`_brm_hsgp_periodic_rho_lower` verbatim): the `rho` at which the
-`K`-th harmonic's spectral amplitude has fallen to `1/100` of the
-first's (`I_K(a)/I_1(a) = 100^-2` with `a = 1/rho^2`), solved by
-bisection on the exponentially scaled Bessel functions. Depends on
-`K` alone — no data-derived domain. `K == 1` stays unbounded
-(`0.0`, the exp-quad degenerate-basis rule).
-"""
-function _hsgp_periodic_rho_lower(K::Integer)
-    K > 1 || return 0.0
-    target = 100.0^-2
-    ratio(loga) = let a = exp(loga)
-        SpecialFunctions.besselix(K, a) /
-            SpecialFunctions.besselix(1, a) - target
-    end
-    lo, hi = log(1e-12), log(1e7)
-    ratio(lo) < 0 < ratio(hi) || error(
-        "hsgp: internal periodic validity-floor bracket failed for k=$K")
-    for _ in 1:200
-        mid = (lo + hi) / 2
-        ratio(mid) < 0 ? (lo = mid) : (hi = mid)
-    end
-    return 1 / sqrt(exp((lo + hi) / 2))
-end
-
-"""Slice-1 term-name vocabulary (emitter-side admission keys; `:varying_effect`,
-`:spline_summand`, `:monotonic`, `:monotonic_summand`, and `:matrix` joined
-with their slices)."""
+"""Admitted emitter-side term names, including temporary varying compatibility."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
     :intercept => InterceptTerm,
     :continuous => ContinuousTerm,
     :factor => FactorTerm,
     :offset => OffsetTerm,
     :varying_effect => VaryingEffectTerm,
-    :spline_summand => SplineSummandTerm,
-    :hsgp_summand => HSGPSummandTerm,
     :scan_summand => ScanSummandTerm,
-    :monotonic => MonotonicTerm,
-    :monotonic_summand => MonotonicSummandTerm,
     :matrix => MatrixTerm,
-    :dar_summand => DarSummandTerm,
     :composed => ComposedTerm,
 )
 
@@ -1886,9 +1430,9 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
-    VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
-    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm,
-    DarSummandTerm, ComposedTerm)
+    VaryingEffectTerm,
+    ScanSummandTerm, MatrixTerm,
+    ComposedTerm)
 
 """Assignment functions the thin layer can lower (ext handshake predicate):
 scalar/reduction vocabulary plus vector-returning whole-column functions —
@@ -1936,7 +1480,6 @@ function validate_structure(plan::StructuralPlan)
     _validate_name_tables(plan)
     _validate_array_parameters(plan)
     _validate_scans(plan)
-    _validate_dar_paths(plan)
     _validate_assignments_structure(plan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
@@ -1952,8 +1495,6 @@ function validate_structure(plan::StructuralPlan)
     _validate_priors(plan)
     _validate_responses(plan)
     _validate_varying_draws(plan)
-    _validate_splines(plan)
-    _validate_hsgp(plan)
     return nothing
 end
 
@@ -1974,12 +1515,7 @@ function validate_data(plan::StructuralPlan)
     for s in plan.scans
         _scan_length(plan, s)
     end
-    for s in plan.dar_paths
-        _value_rows(plan, s.state)
-    end
     _validate_varying_draws_data(plan)
-    _validate_splines_data(plan)
-    _validate_hsgp_data(plan)
     return nothing
 end
 
@@ -2667,8 +2203,8 @@ New slots must establish the same property before joining this list."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
     :levelmaps, :vector_parameters, :submodel_scopes, :conditioned,
-    :plate_parameters, :scans, :dar_paths, :varying_draws, :varying_slices,
-    :spline_bases, :spline_vectors, :hsgp_bases, :matrices,
+    :plate_parameters, :scans, :varying_draws, :varying_slices,
+    :matrices,
     :array_parameters, :indexed_observations, :external_observations)
 
 # Observation-shaped values and their data dependencies. Parameters sized
@@ -2690,12 +2226,6 @@ function _observation_nodes(plan::StructuralPlan)
     end
     for m in plan.matrices
         nodes[m.name] = m.columns
-    end
-    for sb in plan.spline_bases
-        nodes[sb.id] = (sb.axes, [b.columns for b in sb.blocks])
-    end
-    for hb in plan.hsgp_bases
-        nodes[hb.id] = (hb.axes, hb.by)
     end
     for p in plan.plate_parameters
         # The iterator determines the latent array's extent. Prior inputs
@@ -2770,8 +2300,8 @@ function _uses_structured_observation_axes(plan::StructuralPlan)
     any(r -> r.mi_jobs !== nothing, plan.responses) && return true
     !isempty(plan.plate_parameters) && !any(r -> r.range isa Expr, plan.responses) && return true
     return any(f -> !isempty(getfield(plan, f)),
-        (:scans, :dar_paths, :varying_draws, :varying_slices,
-         :spline_bases, :spline_vectors, :hsgp_bases, :matrices))
+        (:scans, :varying_draws, :varying_slices,
+         :matrices))
 end
 
 """Observation axes of a plan whose `columns` are bound: `nothing` when
@@ -3241,291 +2771,6 @@ function _validate_columns(plan::StructuralPlan)
     return nothing
 end
 
-function _validate_splines(plan::StructuralPlan)
-    ids = [sb.id for sb in plan.spline_bases]
-    length(unique(ids)) == length(ids) ||
-        _fail(:plan, "duplicate spline basis ids")
-    labels = [sb.label for sb in plan.spline_bases]
-    length(unique(labels)) == length(labels) ||
-        _fail(:plan, "duplicate spline basis labels")
-    for sb in plan.spline_bases
-        sb.kind === :tps || sb.kind === :t2 ||
-            _fail(:plan, "spline :$(sb.id): kind must be :tps or :t2, " *
-                  "got $(repr(sb.kind))")
-        if sb.kind === :tps
-            sb.k isa Int ||
-                _fail(:plan, "tps spline :$(sb.id): k must be an Int, " *
-                      "got $(repr(sb.k))")
-            sb.k > 2 ||
-                _fail(:plan, "tps spline :$(sb.id): k must exceed 2, " *
-                      "got $(sb.k)")
-            length(sb.axes) == 1 ||
-                _fail(:plan, "tps spline :$(sb.id): takes exactly one " *
-                      "axis column, got $(sb.axes)")
-        else
-            sb.k isa Tuple{Int,Int} ||
-                _fail(:plan, "t2 spline :$(sb.id): k must be an " *
-                      "(Int, Int) tuple, got $(repr(sb.k))")
-            all(k -> k > 2, sb.k) ||
-                _fail(:plan, "t2 spline :$(sb.id): k entries must " *
-                      "exceed 2, got $(repr(sb.k))")
-            length(sb.axes) == 2 ||
-                _fail(:plan, "t2 spline :$(sb.id): takes exactly two " *
-                      "axis columns, got $(sb.axes)")
-        end
-        want = _spline_blocks(sb.kind, sb.k)
-        got = [(b.name, b.width) for b in sb.blocks]
-        got == want || _fail(:plan,
-            "spline :$(sb.id): blocks are determined by (kind, k) alone " *
-            "— expected $want, got $got")
-        wantvec = _spline_vector_specs(sb.id, sb.kind, sb.k)
-        gotvec = [v.name for v in plan.spline_vectors if v.basis === sb.id]
-        sort!(gotvec)
-        wantnames = sort!([first(s) for s in wantvec])
-        gotvec == wantnames || _fail(:plan,
-            "spline :$(sb.id): spline-vectors must be exactly " *
-            "$wantnames, got $gotvec")
-        byname = Dict{Symbol,SplineVector}(v.name => v
-            for v in plan.spline_vectors if v.basis === sb.id)
-        _, sdname = _spline_block_roles(sb.id, sb.kind, sb.k)
-        for (vname, vfamily, vargs, vsupport, vwidth) in wantvec
-            v = byname[vname]
-            # The smoothing-sd vector may carry a stated hyper prior
-            # (SB `sd(mu, s(x)) ~ ...`) — same width, family/args from
-            # the admitted set, support derived from the family.
-            if vname === sdname && !(v.family === vfamily && v.args == vargs && v.support_override == vsupport)
-                hp = HyperPrior(v.family, v.args, v.support_override)
-                _validate_hyper_prior(hp, :plan, "spline :$(sb.id) sd")
-                _, vfamily, vargs, vsupport, _ = only(s for s in
-                    _spline_vector_specs(sb.id, sb.kind, sb.k, hp)
-                    if first(s) === sdname)
-            end
-            (v.family === vfamily && v.args == vargs &&
-             v.support_override == vsupport && v.width == vwidth) ||
-                _fail(:plan, "spline :$(sb.id): vector :$vname must be " *
-                      "$vfamily$(vargs) with support $(repr(vsupport)) " *
-                      "and width $vwidth — the prior structure is part " *
-                      "of the contract, not emitter's choice")
-        end
-        # Materialized <id>_<block>_<j> names are computable pre-bind
-        # (widths are static), so the sampler-scope clash check runs here
-        # rather than at bind. Names are unique across bases by
-        # construction (right-parse _<j> then the fixed block tag is
-        # unambiguous, and ids are unique), so no pairwise check.
-        wantcols = reduce(vcat, (last(b) for b in
-            _spline_basis_columns(sb.id, sb.kind, sb.k)); init=Symbol[])
-        union = _union_names(plan)
-        clash = filter(c -> c in union, wantcols)
-        isempty(clash) || _fail(:plan,
-            "spline :$(sb.id): materialized basis columns $clash collide " *
-            "with parameter/assignment names — rename the spline id")
-    end
-    idset = Set{Symbol}(ids)
-    for v in plan.spline_vectors
-        v.basis in idset ||
-            _fail(:plan, "spline vector :$(v.name) addresses unknown " *
-                  "basis :$(v.basis)")
-    end
-    # Basis linkage: every summand names an existing basis; every basis
-    # feeds exactly one summand (SB: a smooth has one target; a dangling
-    # basis would sample dead parameters, a double use double-counts).
-    uses = Dict{Symbol,Int}(id => 0 for id in ids)
-    for pred in plan.predictors, t in pred.terms
-        t.kind === SplineSummandTerm || continue
-        sid = t.options.spline_id
-        haskey(uses, sid) ||
-            _fail(t.label, "spline summand addresses unknown basis :$sid")
-        uses[sid] += 1
-    end
-    for (id, n) in uses
-        n == 1 || _fail(:plan,
-            "spline :$id is used by $n summands — exactly one " *
-            "(one target per smooth)")
-    end
-    return nothing
-end
-
-function _validate_splines_data(plan::StructuralPlan)
-    for sb in plan.spline_bases
-        for c in sb.axes
-            haskey(plan.columns, c) ||
-                _fail(sb.label, "spline :$(sb.id): axis column $c is " *
-                      "not bound")
-            _is_derived(plan, c) &&
-                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
-                      "be raw data (the bind-time fit needs bound values)")
-            axiscol =
-                _vector_column(plan.columns, c, sb.label, "spline axis column")
-            eltype(axiscol) <: Real ||
-                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
-                      "be numeric, got $(eltype(axiscol))")
-        end
-        for b in sb.blocks, c in b.columns
-            haskey(plan.columns, c) ||
-                _fail(sb.label, "spline :$(sb.id): materialized basis " *
-                      "column $c (block :$(b.name)) is not bound")
-        end
-    end
-    return nothing
-end
-
-function _validate_hsgp(plan::StructuralPlan)
-    ids = [hb.id for hb in plan.hsgp_bases]
-    length(unique(ids)) == length(ids) ||
-        _fail(:plan, "duplicate hsgp basis ids")
-    labels = [hb.label for hb in plan.hsgp_bases]
-    length(unique(labels)) == length(labels) ||
-        _fail(:plan, "duplicate hsgp basis labels")
-    for hb in plan.hsgp_bases
-        hb.rho_prior isa HyperPrior && _validate_hyper_prior(hb.rho_prior,
-            :plan, "hsgp :$(hb.id) length-scale")
-        hb.sigma_prior isa HyperPrior && _validate_hyper_prior(
-            hb.sigma_prior, :plan, "hsgp :$(hb.id) sd")
-        for (spec, what) in ((hb.rho_prior, "length-scale"),
-                             (hb.sigma_prior, "sd"))
-            spec isa HSGPHyperLP || continue
-            hb.by === nothing && _fail(:plan, "hsgp :$(hb.id): a $what " *
-                "hyper-predictor needs a grouped basis (`by = ...`)")
-            spec.group === hb.by.column || _fail(:plan, "hsgp :$(hb.id): " *
-                "the $what hyper-predictor groups by $(spec.group) but " *
-                "the basis groups by $(hb.by.column) — one hyper level " *
-                "per term group")
-        end
-        if hb.by !== nothing
-            (hb.cov === :exp_quad && hb.iso && length(hb.axes) == 1) ||
-                _fail(:plan, "hsgp :$(hb.id): `by` grouping takes one " *
-                    "isotropic exp-quad axis in v1 (aniso / periodic " *
-                    "grouped bases are planned)")
-            lv = hb.by.levels
-            lv === nothing || (!isempty(lv) && allunique(lv)) ||
-                _fail(:plan, "hsgp :$(hb.id): `by` levels must be " *
-                    "non-empty and distinct, got $(repr(lv))")
-        end
-        if hb.domain !== nothing
-            hb.cov === :periodic && _fail(:plan, "hsgp :$(hb.id): a " *
-                "periodic basis has no domain (drop `domain=`)")
-            length(hb.domain) == length(hb.axes) || _fail(:plan,
-                "hsgp :$(hb.id): domain has $(length(hb.domain)) pairs " *
-                "for $(length(hb.axes)) axes (one `(lower, upper)` per axis)")
-            all(p -> isfinite(p[1]) && isfinite(p[2]) && p[1] < p[2],
-                hb.domain) || _fail(:plan, "hsgp :$(hb.id): domain pairs " *
-                "must be finite with lower < upper, got $(hb.domain)")
-        end
-        d = length(hb.axes)
-        d >= 1 ||
-            _fail(:plan, "hsgp :$(hb.id): takes at least one axis column")
-        length(hb.axes) == length(unique(hb.axes)) ||
-            _fail(:plan, "hsgp :$(hb.id): duplicate axis columns $(hb.axes)")
-        length(hb.K) == d ||
-            _fail(:plan, "hsgp :$(hb.id): K has $(length(hb.K)) entries " *
-                  "for $d axes (one mode count per axis)")
-        all(k -> k isa Int && k >= 1, hb.K) ||
-            _fail(:plan, "hsgp :$(hb.id): K must be positive integers, " *
-                  "got $(hb.K)")
-        length(hb.c) == d ||
-            _fail(:plan, "hsgp :$(hb.id): c has $(length(hb.c)) entries " *
-                  "for $d axes (one boundary factor per axis)")
-        all(c -> c isa Real && isfinite(Float64(c)) && Float64(c) > 1,
-            hb.c) ||
-            _fail(:plan, "hsgp :$(hb.id): c must be finite and exceed 1 " *
-                  "(L = c*max|x-mu| must cover the data), got $(hb.c)")
-        hb.iso isa Bool ||
-            _fail(:plan, "hsgp :$(hb.id): iso must be Bool, " *
-                  "got $(repr(hb.iso))")
-        hb.cov in (:exp_quad, :periodic) ||
-            _fail(:plan, "hsgp :$(hb.id): cov must be :exp_quad or " *
-                  ":periodic, got $(repr(hb.cov))")
-        if hb.cov === :periodic
-            # SB "periodic hsgp requires one isotropic axis" + the
-            # `_brm_gp_period` contract (required iff periodic); `c` is
-            # validated above but ignored (the SB mirror — no domain).
-            d == 1 ||
-                _fail(:plan, "hsgp :$(hb.id): periodic takes exactly " *
-                      "one axis column, got $d")
-            hb.iso ||
-                _fail(:plan, "hsgp :$(hb.id): periodic requires " *
-                      "iso=true (one isotropic axis)")
-            hb.period isa Real && isfinite(hb.period) && hb.period > 0 ||
-                _fail(:plan, "hsgp :$(hb.id): periodic requires a " *
-                      "finite positive period, got $(repr(hb.period))")
-            isempty(hb.fits) ||
-                _fail(:plan, "hsgp :$(hb.id): periodic carries no " *
-                      "fits (no domain to fit)")
-        else
-            isnan(hb.period) ||
-                _fail(:plan, "hsgp :$(hb.id): exp_quad carries no " *
-                      "period (got $(repr(hb.period)) — period is " *
-                      "meaningful only with cov=:periodic)")
-        end
-        # Fits are bind products (empty pre-bind); a hand-built bound plan
-        # carries one finite (mu, L) per axis with L > 0.
-        isempty(hb.fits) || length(hb.fits) == d ||
-            _fail(:plan, "hsgp :$(hb.id): fits has $(length(hb.fits)) " *
-                  "entries for $d axes (bind fills one (mu, L) per axis)")
-        for (mu, L) in hb.fits
-            isfinite(mu) && isfinite(L) && L > 0 ||
-                _fail(:plan, "hsgp :$(hb.id): fit (mu, L) must be finite " *
-                      "with L > 0, got ($mu, $L)")
-        end
-    end
-    # Basis linkage: every summand names an existing basis; every basis
-    # feeds exactly one summand (one target per basis — a dangling basis
-    # would sample dead parameters, a double use double-counts).
-    uses = Dict{Symbol,Int}(id => 0 for id in ids)
-    for pred in plan.predictors, t in pred.terms
-        t.kind === HSGPSummandTerm || continue
-        haskey(t.options, :hsgp_id) ||
-            _fail(t.label, "hsgp summand carries no hsgp_id option")
-        sid = t.options.hsgp_id
-        haskey(uses, sid) ||
-            _fail(t.label, "hsgp summand addresses unknown basis :$sid")
-        uses[sid] += 1
-    end
-    for (id, n) in uses
-        n == 1 || _fail(:plan,
-            "hsgp :$id is used by $n summands — exactly one " *
-            "(one target per basis)")
-    end
-    return nothing
-end
-
-function _validate_hsgp_data(plan::StructuralPlan)
-    for hb in plan.hsgp_bases
-        for c in hb.axes
-            haskey(plan.columns, c) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
-                      "not bound")
-            _is_derived(plan, c) &&
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
-                      "be raw data (the bind-time fit needs bound values)")
-            axiscol =
-                _vector_column(plan.columns, c, hb.label, "hsgp axis column")
-            eltype(axiscol) <: Real ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
-                      "be numeric, got $(eltype(axiscol))")
-            if hb.cov === :periodic
-                # SB `_brm_gp_axes`: finite values (no degeneracy gate —
-                # a constant axis is a usable periodic domain).
-                all(isfinite, axiscol) ||
-                    _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
-                          "must be finite")
-            end
-        end
-        if hb.cov === :periodic
-            isempty(hb.fits) ||
-                _fail(hb.label, "hsgp :$(hb.id): periodic carries no " *
-                      "fits (no domain to fit)")
-        else
-            length(hb.fits) == length(hb.axes) ||
-                _fail(hb.label, "hsgp :$(hb.id): fits not filled at bind " *
-                      "(one (mu, L) per axis)")
-        end
-    end
-    return nothing
-end
-
-# Compatibility representation only: old hand-built event-LP plans would
-# otherwise mint parameters without authored statements (decision 10ldrvz).
 function _expr_names!(out::Set{Symbol}, ex)
     ex isa Symbol && (push!(out, ex); return nothing)
     ex isa Expr || return nothing
@@ -3550,12 +2795,9 @@ function _validate_name_tables(plan::StructuralPlan)
     deriveds = [d.name for d in plan.derived]
     plates = [p.name for p in plan.plate_parameters]
     scanstates = Symbol[st for s in plan.scans for st in s.states]
-    darstates = [s.state for s in plan.dar_paths]
     vectors = [p.name for p in plan.vector_parameters]
-    svec = [v.name for v in plan.spline_vectors]
     vcorr = Symbol[nm for d in plan.varying_draws
         for nm in _varying_corr_table_names(d)]
-    hsgp = Symbol[nm for hb in plan.hsgp_bases for nm in _hsgp_all_names(hb)]
     mats = Symbol[m.name for m in plan.matrices]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
@@ -3566,16 +2808,10 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate plate-parameter names")
     length(unique(scanstates)) == length(scanstates) ||
         _fail(:plan, "duplicate scan-state names")
-    length(unique(darstates)) == length(darstates) ||
-        _fail(:plan, "duplicate dar-state names")
     length(unique(vectors)) == length(vectors) ||
         _fail(:plan, "duplicate vector-parameter names")
-    length(unique(svec)) == length(svec) ||
-        _fail(:plan, "duplicate spline-vector names")
     length(unique(vcorr)) == length(vcorr) ||
         _fail(:plan, "duplicate correlated varying names")
-    length(unique(hsgp)) == length(hsgp) ||
-        _fail(:plan, "duplicate hsgp names")
     length(unique(mats)) == length(mats) ||
         _fail(:plan, "duplicate design-matrix names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
@@ -3593,71 +2829,44 @@ function _validate_name_tables(plan::StructuralPlan)
         (vectors, deriveds, "vector parameters and derived columns"),
         (vectors, plates, "vector parameters and plate parameters"),
         (vectors, scanstates, "vector parameters and scan states"),
-        (svec, params, "spline vectors and parameters"),
-        (svec, assigns, "spline vectors and assignments"),
-        (svec, deriveds, "spline vectors and derived columns"),
-        (svec, plates, "spline vectors and plate parameters"),
-        (svec, scanstates, "spline vectors and scan states"),
-        (vectors, svec, "vector parameters and spline vectors"),
         (vcorr, params, "correlated varying names and parameters"),
         (vcorr, assigns, "correlated varying names and assignments"),
         (vcorr, deriveds, "correlated varying names and derived columns"),
         (vcorr, plates, "correlated varying names and plate parameters"),
         (vcorr, scanstates, "correlated varying names and scan states"),
         (vcorr, vectors, "correlated varying names and vector parameters"),
-        (vcorr, svec, "correlated varying names and spline vectors"),
-        (hsgp, params, "hsgp names and parameters"),
-        (hsgp, assigns, "hsgp names and assignments"),
-        (hsgp, deriveds, "hsgp names and derived columns"),
-        (hsgp, plates, "hsgp names and plate parameters"),
-        (hsgp, scanstates, "hsgp names and scan states"),
-        (hsgp, vectors, "hsgp names and vector parameters"),
-        (hsgp, svec, "hsgp names and spline vectors"),
-        (hsgp, vcorr, "hsgp names and correlated varying names"),
         (mats, params, "design-matrix names and parameters"),
         (mats, assigns, "design-matrix names and assignments"),
         (mats, deriveds, "design-matrix names and derived columns"),
         (mats, plates, "design-matrix names and plate parameters"),
         (mats, scanstates, "design-matrix names and scan states"),
         (mats, vectors, "design-matrix names and vector parameters"),
-        (mats, svec, "design-matrix names and spline vectors"),
-        (mats, vcorr, "design-matrix names and correlated varying names"),
-        (mats, hsgp, "design-matrix names and hsgp names"),
-        (darstates, params, "dar states and parameters"),
-        (darstates, assigns, "dar states and assignments"),
-        (darstates, deriveds, "dar states and derived columns"),
-        (darstates, plates, "dar states and plate parameters"),
-        (darstates, scanstates, "dar states and scan states"),
-        (darstates, vectors, "dar states and vector parameters"),
-        (darstates, svec, "dar states and spline vectors"),
-        (darstates, vcorr, "dar states and correlated varying names"),
-        (darstates, hsgp, "dar states and hsgp names"),
-        (darstates, mats, "dar states and design-matrix names"))
+        (mats, vcorr, "design-matrix names and correlated varying names"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
-    allnames = union(params, assigns, deriveds, plates, scanstates, darstates,
-        vectors, svec, vcorr, hsgp, mats)
+    allnames = union(params, assigns, deriveds, plates, scanstates,
+        vectors, vcorr, mats)
     arrays = _array_names(plan)
     length(unique(arrays)) == length(arrays) ||
         _fail(:plan, "duplicate array-parameter names")
     overlap = intersect(arrays, allnames)
     isempty(overlap) || _fail(:plan, "names in both array parameters and " *
-        "other parameters/assignments/derived/plate/scan/dar/vector/spline/" *
-        "varying/hsgp/kernel/matrix/event-LP names: $(join(overlap, ", "))")
+        "other parameters/assignments/derived/plate/scan/vector/" *
+        "varying/matrix names: $(join(overlap, ", "))")
     allnames = union(allnames, arrays)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/dar/vector/spline/varying/kernel/matrix name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/varying/matrix name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/dar/vector/spline/varying/kernel/matrix $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector/varying/matrix $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, darstates, vectors, svec, vcorr, hsgp, mats))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, vcorr, mats))
         _check_name_hygiene(n)
     end
     return nothing
@@ -3748,51 +2957,6 @@ end
 # (`_ppl_dar_z_<state>`, length `n_obs - 1`). Reserved-prefix validation
 # guarantees no user name collides with it; the state name itself binds
 # the emitter's `scan(...)` reconstruction.
-_dar_innovation_name(s::DarSpec) = Symbol(:_ppl_dar_z_, s.state)
-
-# Structural invariants of each differenced-AR(1) trajectory: the
-# persistence names a `Normal` sampled parameter truncated to exactly
-# `[0, 1]` (`beta ~ truncated(Normal(0.5, 0.2), 0, 1)`; other
-# location/scale ride the same spelling) and the scale names a half-Normal
-# (`sigma ~ HalfNormal(0.2)` or `truncated(Normal(0, 0.2), 0, Inf)`).
-# Legacy normalized support overrides and general `:truncated` agree. Both keep
-# Distributions semantics — the truncation normalizers stay (user decision
-# `0m1j3iz`, prong `dar-kernel`). The `n_obs ≥ 2` length gate lives in the
-# layout (unbound surface plans carry `n_obs = 0`, like a scan's symbolic
-# `hi` — lengths resolve at bind).
-function _validate_dar_paths(plan::StructuralPlan)
-    for s in plan.dar_paths
-        s.beta === s.sigma && _fail(s.label,
-            "dar persistence and scale must be distinct sampled parameters " *
-            "(SB samples `beta` and `sigma` separately), got :$(s.beta) twice")
-        i = findfirst(p -> p.name === s.beta, plan.parameters)
-        i === nothing && _fail(s.label,
-            "dar persistence :$(s.beta) must name a scalar sampled " *
-            "parameter (`$(s.beta) ~ truncated(Normal(0.5, 0.2), 0, 1)`)")
-        b = plan.parameters[i]
-        (b.family === :normal && b.support_override in
-            ((:interval, 0.0, 1.0), (:truncated, 0.0, 1.0))) ||
-            _fail(s.label,
-                "dar persistence :$(s.beta) must be a Normal truncated to " *
-                "exactly [0, 1] (`truncated(Normal(0.5, 0.2), 0, " *
-                "1)`), got :$(b.family) on $(repr(b.support_override))")
-        j = findfirst(p -> p.name === s.sigma, plan.parameters)
-        j === nothing && _fail(s.label,
-            "dar scale :$(s.sigma) must name a scalar sampled parameter " *
-            "(`$(s.sigma) ~ HalfNormal(0.2)`)")
-        sg = plan.parameters[j]
-        (sg.family === :normal && (sg.support_override === :positive ||
-            (sg.support_override == (:truncated, 0.0, Inf) &&
-                get(sg.args, :arg1, nothing) == 0))) ||
-            _fail(s.label,
-                "dar scale :$(s.sigma) must be a half-Normal " *
-                "(`HalfNormal(0.2)` or `truncated(Normal(0, 0.2), 0, Inf)`), " *
-                "got :$(sg.family) on " *
-                "$(repr(sg.support_override))")
-    end
-    return nothing
-end
-
 function _check_name_hygiene(n::Symbol)
     startswith(string(n), "_ppl_") && _fail(
         :plan,
@@ -4748,8 +3912,7 @@ const _JOINT_FACTOR_FAMILIES = (:positive_exponential, :cholesky_corr_lkj)
 
 # Constrained vector (cutpoint/threshold/simplex) parameters: family/arity
 # plus ordinary value arguments. Sizes resolve at bind (`nothing` = infer from the linked leveled
-# response, or from the concentration length for a monotonic-linked
-# simplex); an explicit size is bounds-checked here and linked-checked in
+# response or an explicit value shape); an explicit size is bounds-checked here and linked-checked in
 # `_validate_responses`. Vector declarations can have several readers.
 function _validate_vector_parameters(plan::StructuralPlan)
     for p in plan.vector_parameters
@@ -4833,8 +3996,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
     # Linkage: a vector parameter may be referenced by several responses
     # (as `thresholds` for ordered families, as `threshold_coefs` for
     # per-threshold Ordinal, as the simplex `predictor`, or as a joint
-    # factor piece), by monotonic terms (as their `increments`
-    # simplex).
+    # factor piece).
     refs = Dict{Symbol,Vector{Symbol}}(
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
@@ -4867,17 +4029,6 @@ function _validate_vector_parameters(plan::StructuralPlan)
             haskey(refs, r.mixture_weights) &&
                 push!(refs[r.mixture_weights], r.label)
         end
-    end
-    for pred in plan.predictors, t in pred.terms
-        (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) || continue
-        incr = _monotonic_options(t)
-        haskey(refs, incr) || _fail(t.label,
-            "monotonic increments $incr is not a vector parameter")
-        p = only(q for q in plan.vector_parameters if q.name === incr)
-        p.family === :simplex_dirichlet || _fail(t.label,
-            "monotonic increments $incr must be a " *
-            ":simplex_dirichlet vector parameter, got $(p.family)")
-        push!(refs[incr], t.label)
     end
     # Every declaration contributes its prior, including an otherwise
     # unused latent. Its extent must resolve from the declaration at bind.
@@ -5080,28 +4231,12 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
         _validate_effect_term(t, pred)
         return nothing
     end
-    if t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm
-        _validate_monotonic_term(t, pred)
-        return nothing
-    end
-    if t.kind === SplineSummandTerm
-        _validate_spline_term(t, pred)
-        return nothing
-    end
-    if t.kind === HSGPSummandTerm
-        _validate_hsgp_term(t, pred)
-        return nothing
-    end
     if t.kind === ScanSummandTerm
         _validate_scan_term(t, pred, plan)
         return nothing
     end
     if t.kind === MatrixTerm
         _validate_matrix_term(t, pred, plan)
-        return nothing
-    end
-    if t.kind === DarSummandTerm
-        _validate_dar_term(t, pred, plan)
         return nothing
     end
     if t.kind === ComposedTerm
@@ -5154,7 +4289,7 @@ function _validate_parameter_term(t::TermSpec, plan::StructuralPlan)
 end
 
 # A matrix term names its design matrix in `options` (`(matrix,)` — the
-# gather/spline options precedent) and carries exactly the matrix's data
+# gather options precedent) and carries exactly the matrix's data
 # columns in order (intercept positions excluded — they take no column);
 # its addressee is the matrix name. Per-element prior coverage (one
 # PopulationPrior row per element addressee) is checked in
@@ -5205,87 +4340,6 @@ function _validate_effect_term(t::TermSpec, pred::PredictorSpec)
     return nothing
 end
 
-# Monotonic options precondition, shared by term validation and the
-# vector-parameter linkage (which reads `options.increments` before
-# `_validate_predictors` runs, so it must establish the shape itself).
-function _monotonic_options(t::TermSpec)
-    o = _term_structure_options(t)
-    Tuple(keys(o)) == (:increments,) ||
-        _fail(t.label, "monotonic term options must be exactly " *
-              "`(increments,)`, got $(Tuple(keys(o)))")
-    o.increments isa Symbol ||
-        _fail(t.label, "monotonic increments must name a simplex vector " *
-              "parameter, got $(repr(o.increments))")
-    return o.increments
-end
-
-# A monotonic term (SB `mo(c)` / `mo1(c)`) carries exactly the bound index
-# column (integer level codes 1..K, checked at bind) and names its
-# increment simplex in `options` (`(increments,)` — a `:simplex_dirichlet`
-# vector parameter, linked in `_validate_vector_parameters`). `mo` takes a
-# free coefficient (addressee is the column, like a continuous term, so a
-# PopulationPrior covers its beta); `mo1` is beta-free and self-addressed
-# (no population prior, like the spline summands).
-function _validate_monotonic_term(t::TermSpec, pred::PredictorSpec)
-    _monotonic_options(t)
-    length(t.columns) == 1 ||
-        _fail(t.label, "monotonic term takes exactly one index column")
-    if t.kind === MonotonicSummandTerm
-        t.addressee === t.label ||
-            _fail(t.label, "monotonic summand addressee must be its own " *
-                  "label (self-addressed, no population prior), got " *
-                  "$(t.addressee)")
-    end
-    return nothing
-end
-
-# A spline summand names its basis by id in `options` and carries no
-# columns (basis vectors materialize at bind — unnameable pre-bind); its
-# addressee is its own label (self-addressed: no population prior).
-# Basis linkage (existence, single target, no dangling) is checked jointly
-# in `_validate_splines`, which sees predictors and bases together.
-function _validate_spline_term(t::TermSpec, pred::PredictorSpec)
-    o = t.options
-    Tuple(keys(o)) == (:spline_id,) ||
-        _fail(t.label, "spline summand options must be exactly " *
-              "`(spline_id,)`, got $(Tuple(keys(o)))")
-    o.spline_id isa Symbol ||
-        _fail(t.label, "spline summand spline_id must be a Symbol, " *
-              "got $(repr(o.spline_id))")
-    isempty(t.columns) ||
-        _fail(t.label, "spline summand carries no columns (basis vectors " *
-              "materialize at bind), got $(t.columns)")
-    t.addressee === t.label ||
-        _fail(t.label, "spline summand addressee must be its own label " *
-              "(self-addressed, no population prior), got $(t.addressee)")
-    return nothing
-end
-
-function _validate_hsgp_term(t::TermSpec, pred::PredictorSpec)
-    o = t.options
-    Tuple(keys(o)) == (:hsgp_id,) ||
-        _fail(t.label, "hsgp summand options must be exactly " *
-              "`(hsgp_id,)`, got $(Tuple(keys(o)))")
-    o.hsgp_id isa Symbol ||
-        _fail(t.label, "hsgp summand hsgp_id must be a Symbol, " *
-              "got $(repr(o.hsgp_id))")
-    isempty(t.columns) ||
-        _fail(t.label, "hsgp summand carries no columns (the basis is " *
-              "evaluated in-graph in Stage B), got $(t.columns)")
-    t.addressee === t.label ||
-        _fail(t.label, "hsgp summand addressee must be its own label " *
-              "(self-addressed, no population prior), got $(t.addressee)")
-    return nothing
-end
-
-# A scan summand names its carried array (`scan_id`) and its coefficient
-# (`coef`) in `options` and carries no columns (the state is sampled or
-# reconstructed, not data); its addressee is its own label (self-addressed:
-# the coefficient's prior lives on the `SampledParameter`, not a population
-# prior). `coef` is a sampled scalar (SB's `ar` latent path with its free
-# beta; v1 admits Normal coefficients only) or `nothing` — the state spliced
-# directly, beta-free (`mu = a .+ x`, the dar/`mo1` shape). Centered and
-# non-centered states both read.
 function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
     o = t.options
     Tuple(keys(o)) == (:scan_id, :coef) ||
@@ -5310,33 +4364,6 @@ function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralP
     o.coef in _union_names(plan) ||
         _fail(t.label, "scan summand coef :$(o.coef) must name a scalar " *
               "parameter or assignment")
-    return nothing
-end
-
-# A dar summand names its trajectory (`dar_id`) in `options` and carries
-# no columns (the state is sampled, not data) and NO coefficient (the
-# zero-started path is beta-free — the formula intercept is the initial
-# level, the `mo1` splice shape); its addressee is its own label
-# (self-addressed: the persistence/scale priors live on the
-# `SampledParameter`s, not a population prior). Beta/sigma linkage is
-# checked on the `DarSpec` itself (`_validate_dar_paths`).
-function _validate_dar_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
-    o = t.options
-    Tuple(keys(o)) == (:dar_id,) ||
-        _fail(t.label, "dar summand options must be exactly `(dar_id,)`, " *
-              "got $(Tuple(keys(o)))")
-    o.dar_id isa Symbol ||
-        _fail(t.label, "dar summand dar_id must be a Symbol, " *
-              "got $(repr(o.dar_id))")
-    isempty(t.columns) ||
-        _fail(t.label, "dar summand carries no columns (the state is " *
-              "sampled, not data), got $(t.columns)")
-    t.addressee === t.label ||
-        _fail(t.label, "dar summand addressee must be its own label " *
-              "(self-addressed, no population prior), got $(t.addressee)")
-    any(s -> s.state === o.dar_id, plan.dar_paths) ||
-        _fail(t.label, "dar summand addresses unknown dar state " *
-              ":$(o.dar_id) (no such `dar()` trajectory)")
     return nothing
 end
 
@@ -5511,7 +4538,6 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     t.kind === ScanSummandTerm && return nothing
     # Dar summands name a trajectory in `options`, not columns; structure
     # validation checked the name.
-    t.kind === DarSummandTerm && return nothing
     # mm effect terms name the mm naming symbol (not a data column);
     # membership binding is proven by `_validate_mm_draws_data`.
     if t.kind === VaryingEffectTerm
@@ -5566,33 +4592,6 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
                 _fail(t.label, "column $c must be numeric")
         end
     end
-    if t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm
-        _validate_monotonic_columns(t, plan)
-    end
-    return nothing
-end
-
-# Monotonic index data (SB `_sb_mo`'s `<c>_idx`): the emitter binds integer
-# level codes, so the thin layer takes them as-is — a BOUND raw column of
-# integers 1..K, where K − 1 is the linked increments simplex's
-# concentration length (unobserved levels are allowed, like unobserved
-# factor levels; out-of-range codes fail closed).
-function _validate_monotonic_columns(t::TermSpec, plan::StructuralPlan)
-    c = only(t.columns)
-    _is_derived(plan, c) && _fail(t.label,
-        "monotonic index $c must be a bound raw column of level codes " *
-        "(the emitter binds integer codes 1..K, SB's `<c>_idx`)")
-    col = _vector_column(plan.columns, c, t.label, "monotonic index")
-    (eltype(col) <: Integer && eltype(col) !== Bool) ||
-        _fail(t.label, "monotonic index $c must hold integer level codes " *
-              "1..K, got eltype $(eltype(col))")
-    i = findfirst(p -> p.name === t.options.increments, plan.vector_parameters)
-    i === nothing && _fail(t.label,
-        "internal: monotonic increments $(t.options.increments) unlinked")
-    K = plan.vector_parameters[i].size + 1
-    all(v -> 1 <= v <= K, col) ||
-        _fail(t.label, "monotonic index $c holds codes outside 1..$K " *
-              "(K − 1 = $(K - 1) is the linked increments simplex size)")
     return nothing
 end
 
@@ -5836,27 +4835,15 @@ function _validate_priors(plan::StructuralPlan)
                   "finite positive nu, got $(repr(pr.nu))")
     end
     for pred in plan.predictors
-        # Offset terms carry no coefficient; latent terms carry the per-cell
-        # PlateParameter, whose prior lives on the plate parameter itself;
-        # effect terms carry a VaryingDraws, spline summands a SplineBasis,
-        # hsgp summands an HSGPBasis, and monotonic summands (mo1) an
-        # increment simplex, whose geometries are self-priored — none needs
-        # a coefficient prior. Monotonic (mo) terms DO take a free
-        # coefficient, so they stay in the addressee set. Composed terms
-        # carry no coefficient either (theirs live in the sub-predictors).
-        # Matrix terms
-        # expand to their per-element addressees (one PopulationPrior row
-        # per matrix column).
+        # Offset, latent, varying compatibility and scan terms carry their
+        # own priors. Composed terms read priors from their sub-predictors;
+        # matrix terms expand to one addressee per matrix column.
         addressees = Set{Symbol}()
         for t in pred.terms
             _parameter_term(t) && continue
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
                 t.kind === VaryingEffectTerm ||
-                t.kind === SplineSummandTerm ||
-                t.kind === HSGPSummandTerm ||
                 t.kind === ScanSummandTerm ||
-                t.kind === MonotonicSummandTerm ||
-                t.kind === DarSummandTerm ||
                 t.kind === ComposedTerm) && continue
             if t.kind === MatrixTerm
                 m = _find_matrix(plan, t.options.matrix)
@@ -7622,158 +6609,6 @@ const _ROLE_RANK = Dict{Symbol,Int}(
 _upgrade_role!(roles, col, role) =
     _ROLE_RANK[roles[col]] < _ROLE_RANK[role] && (roles[col] = role)
 
-# Bind-time spline fit (the Stan transformed-data mirror): fit each basis
-# from its raw axis columns (host, full LAPACK — eigen/nullspace are
-# inexpressible in-graph), assert the fitted widths equal the declared
-# static widths, and materialize one bound vector per basis column under
-# the contract's <id>_<block>_<j> names. Caller-supplied columns under a
-# materialized name are rejected (reserved-name exclusivity); the fit's
-# own errors surface as ContractValidationErrors with the [spline] tag.
-# Bind-time HSGP fit (the spline host-side transformed-data mirror):
-# fills each basis's (mu, L) per axis from the RAW bound columns (SB
-# `_brm_fit_hsgp` verbatim: `mu = mean(x)`, `L = c*max|x-mu|`).
-# Degenerate axes (L == 0 — constant columns) and non-finite data
-# fail closed here (bind owns data errors); the basis itself is
-# evaluated in-graph in Stage B from the raw columns + these frozen
-# fits (bind-then-build ordering keeps them consistent across
-# rebinds — the SB DATA-vs-literal concern).
-"""One HSGP axis fit (SB `_brm_fit_hsgp` 1-D verbatim): `mu =
-mean(col)`, `L = c*max|col-mu|`, numeric/nonempty/finite/`L > 0`
-gates. Shared by basis binds."""
-function _hsgp_axis_fit(col::AbstractVector, c::Real, label::Symbol,
-        where::String)
-    eltype(col) <: Real ||
-        _fail(label, "$where must be numeric, got $(eltype(col))")
-    isempty(col) &&
-        _fail(label, "$where is empty")
-    mu = sum(col) / length(col)
-    L = Float64(c) * maximum(abs.(col .- mu))
-    isfinite(mu) && isfinite(L) ||
-        _fail(label, "$where is non-finite (mu=$mu, L=$L)")
-    L > 0 ||
-        _fail(label, "$where is degenerate " *
-              "(L == 0 — a constant column has no usable domain)")
-    return (Float64(mu), L)
-end
-
-function _fit_hsgp_bases(plan::StructuralPlan,
-        columns::AbstractDict{Symbol})
-    isempty(plan.hsgp_bases) && return HSGPBasis[]
-    out = HSGPBasis[]
-    for hb in plan.hsgp_bases
-        if hb.cov === :periodic
-            # No domain to fit (SB `_brm_hsgp_basis_state` periodic
-            # branch): the axis still binds as a numeric finite vector
-            # (SB `_brm_gp_axes` — no degeneracy gate, a constant axis
-            # is a usable periodic domain).
-            c = only(hb.axes)
-            haskey(columns, c) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
-                      "not bound")
-            col = _vector_column(columns, c, hb.label, "hsgp axis column")
-            eltype(col) <: Real ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c must " *
-                      "be numeric, got $(eltype(col))")
-            all(isfinite, col) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
-                      "must be finite")
-            push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso,
-                Tuple{Float64,Float64}[], hb.label, hb.cov, hb.period,
-                hb.rho_prior, hb.sigma_prior, hb.domain))
-            continue
-        end
-        fits = Tuple{Float64,Float64}[]
-        for (j, (c, cj)) in enumerate(zip(hb.axes, hb.c))
-            haskey(columns, c) ||
-                _fail(hb.label, "hsgp :$(hb.id): axis column $c is " *
-                      "not bound")
-            col = _vector_column(columns, c, hb.label, "hsgp axis column")
-            if hb.domain === nothing
-                push!(fits, _hsgp_axis_fit(col, cj, hb.label,
-                    "hsgp :$(hb.id): axis column $c"))
-            else
-                # Fixed domain (SB `_brm_hsgp_domain_fits` /
-                # `_brm_check_hsgp_domain`): the data must lie inside.
-                lo, hi = hb.domain[j]
-                eltype(col) <: Real && all(isfinite, col) ||
-                    _fail(hb.label, "hsgp :$(hb.id): axis column $c " *
-                          "must be finite numeric")
-                all(v -> lo <= v <= hi, col) || _fail(hb.label,
-                    "hsgp :$(hb.id): axis column $c has values outside " *
-                    "its fixed domain ($lo, $hi)")
-                push!(fits, ((lo + hi) / 2, (hi - lo) / 2))
-            end
-        end
-        by = hb.by
-        if by !== nothing && by.levels === nothing
-            haskey(columns, by.column) || _fail(hb.label, "hsgp " *
-                ":$(hb.id): grouping column $(by.column) is not bound")
-            gcol = _vector_column(columns, by.column, hb.label,
-                "hsgp grouping column")
-            levels = try
-                _grouping_levels(gcol)
-            catch err
-                _fail(hb.label, "hsgp :$(hb.id): grouping column " *
-                    "$(by.column) levels not orderable ($err)")
-            end
-            by = HSGPGrouping(by.column, collect(Any, levels))
-        end
-        push!(out, HSGPBasis(hb.id, hb.axes, hb.K, hb.c, hb.iso, fits,
-            hb.label, hb.cov, hb.period, hb.rho_prior, hb.sigma_prior,
-            hb.domain, by))
-    end
-    return out
-end
-
-function _materialize_splines!(plan::StructuralPlan,
-        columns::Dict{Symbol,ColumnData})
-    isempty(plan.spline_bases) && return SplineBasis[]
-    out = SplineBasis[]
-    for sb in plan.spline_bases
-        axes = AbstractVector[]
-        for c in sb.axes
-            haskey(columns, c) ||
-                _fail(sb.label, "spline :$(sb.id): axis column $c is " *
-                      "not bound")
-            axiscol =
-                _vector_column(columns, c, sb.label, "spline axis column")
-            eltype(axiscol) <: Real ||
-                _fail(sb.label, "spline :$(sb.id): axis column $c must " *
-                      "be numeric, got $(eltype(axiscol))")
-            push!(axes, axiscol)
-        end
-        wantcols = _spline_basis_columns(sb.id, sb.kind, sb.k)
-        for (_, cols) in wantcols, c in cols
-            haskey(columns, c) && _fail(sb.label,
-                "column $c is reserved for spline :$(sb.id)'s " *
-                "materialized basis — rename the caller-supplied column")
-        end
-        mats = sb.kind === :tps ?
-            collect(_rk_apply_spline(_rk_fit_spline(axes[1]; k=sb.k),
-                axes[1])) :
-            collect(_rk_apply_t2(_rk_fit_t2(axes[1], axes[2]; k=sb.k),
-                axes[1], axes[2]))
-        blocks = SplineBasisBlock[]
-        for (bi, (name, cols)) in enumerate(wantcols)
-            size(mats[bi], 2) == length(cols) || _fail(sb.label,
-                "spline :$(sb.id): fitted block :$name has width " *
-                "$(size(mats[bi], 2)), declared $(length(cols))")
-            for (j, c) in enumerate(cols)
-                columns[c] = Vector{Float64}(mats[bi][:, j])
-            end
-            push!(blocks, SplineBasisBlock(name, length(cols), cols))
-        end
-        push!(out, SplineBasis(sb.id, sb.kind, sb.axes, sb.k, blocks,
-            sb.label))
-    end
-    return out
-end
-
-# n_obs derivation skips mi-managed columns (packed y_obs/Jobs), bound
-# module data values and model-level data inputs: every other column
-# crosses at length n, so the first non-managed column pins n_obs
-# order-independently. A bound hand-authored mi plan may supply its full
-# extent explicitly; an unbound plan without an anchor cannot derive it.
 function _bind_nrows(columns::AbstractDict{Symbol}, managed::Set{Symbol})
     for (k, v) in columns
         k in managed && continue
@@ -8165,7 +7000,7 @@ end
 _conditioned_input(name::Symbol) = Symbol("_rkppl_conditioned_", name)
 _has_observation_axis(plan) = !isempty(plan.responses) ||
     any(p -> p.range === nothing, plan.plate_parameters) ||
-    !isempty(plan.scans) || !isempty(plan.dar_paths)
+    !isempty(plan.scans)
 
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
 # inside an argument of an undotted module call into `whole`, anywhere
@@ -8703,8 +7538,6 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     inputs, _ = _model_level_inputs(plan, raw)
     union!(inputs, (_conditioned_input(n) for n in plan.conditioned))
     _materialize_derived_responses!(plan, columns)
-    bases = _materialize_splines!(plan, columns)
-    hbases = _fit_hsgp_bases(plan, columns)
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))
@@ -8726,17 +7559,6 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
             by = d.strata.by
             haskey(inferred, by) && _upgrade_role!(inferred, by, :group)
         end
-    end
-    for sb in bases, blk in sb.blocks, c in blk.columns
-        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
-    end
-    for hb in hbases, c in hb.axes
-        haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
-    end
-    for hb in hbases
-        hb.by === nothing && continue
-        haskey(inferred, hb.by.column) &&
-            _upgrade_role!(inferred, hb.by.column, :group)
     end
     for r in plan.responses
         r.weights !== nothing && haskey(inferred, r.weights) &&
@@ -8763,8 +7585,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     merged = merge(inferred, roles)
     # Observation statements determine their own axes; unrelated axes add
     # their likelihood rows without sizing one value from another's extent.
-    axis_plan = _with(plan; columns = columns, spline_bases = bases,
-        hsgp_bases = hbases)
+    axis_plan = _with(plan; columns = columns)
     n = if !_has_observation_axis(plan)
         1
     else
@@ -8779,8 +7600,7 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
             plan.predictors, _with(plan; columns = columns, n_obs = n))
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps, varying_draws = draws,
-        vector_parameters = vectors2, spline_bases = bases,
-        hsgp_bases = hbases)
+        vector_parameters = vectors2)
     _validate_conditioned_values(bound)
     validate_data(bound)
     return bound
@@ -8849,8 +7669,7 @@ end
 # predictor count; Multinomial: count-column count) or from the response
 # column (max(y) for OrderedLogistic/Ordinal/Categorical); vector-param
 # `size === nothing` fills from the linked response (K−1 thresholds, K
-# simplex), from its frozen concentration length for a monotonic-linked
-# increments simplex (K−1 increments for K levels). Explicit values assert against the
+# simplex), or a declared value shape. Explicit values assert against the
 # inference. Returns new (immutable) vectors; unbound plans keep
 # `nothing`.
 function _dirichlet_size(plan, alpha, label)
@@ -8968,12 +7787,6 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             mixture_link[r.mixture_weights] = r.label
         end
     end
-    monotonic_link = Dict{Symbol,Symbol}()
-    for pred in predictors, t in pred.terms
-        (t.kind === MonotonicTerm || t.kind === MonotonicSummandTerm) ||
-            continue
-        monotonic_link[t.options.increments] = t.label
-    end
     out_v = VectorParameter[]
     for p in vectors
         concentration_size = p.family === :simplex_dirichlet ?
@@ -9014,15 +7827,6 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
                 "Dirichlet concentration length $(concentration_size) " *
                 "disagrees with the $K mixture components")
             push!(out_v, _with(p; size = K))
-        elseif haskey(monotonic_link, p.name)
-            want = concentration_size
-            want >= 1 || _fail(p.label,
-                "monotonic increments need ≥ 1 increment " *
-                "(K=1 degenerates emitter-side and never reaches the thin layer)")
-            p.size === nothing || p.size == want || _fail(p.label,
-                "monotonic increments size $(p.size) disagrees with its " *
-                "concentration length $want")
-            push!(out_v, _with(p; size = want))
         elseif p.family in _JOINT_FACTOR_FAMILIES
             # Joint-factor sizes are structural (concrete at construction,
             # validated against the joint width) — bind passes them through.

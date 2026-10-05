@@ -57,10 +57,37 @@ end
 monotonic(x) = x .+ 0.5
 mo(x) = x .+ 0.1
 linear_pk_read_locs(x) = x .+ 0.2
+tps_basis(x) = x .+ 0.2
 @rkppl varying_effect(x) = begin
     b ~ Normal(0, 2)
     return b .* x
 end
+end
+
+@testset "adopted statistical preparation helpers point to their owner" begin
+    for name in ReactiveKernelsPPL._RETIRED_PREPARATION_HEADS
+        err = try
+            lower_rkppl(Expr(:block, Expr(:(=), :q, Expr(:call, name))), ();
+                mod = ReactiveKernelsPPL)
+            nothing
+        catch error
+            error
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin("BayesianRegressionModels.StatisticalPreparation",
+            sprint(showerror, err))
+        @test !isdefined(ReactiveKernelsPPL, name)
+    end
+    p = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        m = tps_basis(x)
+        y .~ Normal.(a .+ m, 1)
+    end, (:x, :y); mod = RetiredCatalogueCaller, conditioned = (:y,))
+    bound = bind_data(p, Dict(:x => [0.2, 0.4], :y => [0.3, -0.1]))
+    built = build_kernel(bound)
+    @test coordinate_names(built.layout) == [:a]
+    @test Base.invokelatest(prepare_query(built, bound, :sampler), [0.1]) ≈
+        logpdf(Normal(), 0.1) + sum(logpdf.(Normal.([0.5, 0.7], 1), [0.3, -0.1]))
 end
 
 @testset "retired catalogue spellings remain caller-owned bindings" begin
