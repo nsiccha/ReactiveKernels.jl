@@ -561,6 +561,11 @@ available. This compiler repair is tracked separately from missing-response
 binding. Successful compiled checks for other shapes do not establish support
 for this affected shape.
 
+Some short guarded likelihood batches still expand into repeated scalar work
+in default compiled code. The Beta and Binomial missing-response checks retain
+their numerical and ordinary reverse results separately from this unmet
+retained-body requirement; larger batches have separate structure checks.
+
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
 agree on its rows. A latent plate follows its authored range, while a scan

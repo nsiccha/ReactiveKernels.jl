@@ -3432,7 +3432,7 @@ _plate_gauss(R) = Expr(:block,
     # including when every omitted response entry is missing.
     masked(rows) = merge(cols, Dict(:y => Union{Missing,Float64}[
         i in rows ? cols[:y][i] : missing for i in eachindex(cols[:y])]))
-    # refused: `1:4` leaves the supplied `y[5:6]` unobserved (`1g8uvgs`).
+    # refused: `1:4` is a partial observation (`1uhcm3b`, provisional).
     @test_throws ContractValidationError bind_data(lower_rkppl(
         _plate_gauss(:(1:4)), (:y, :x); conditioned = (:y, :x)), cols)
     # Literal iteration does not authorize partial observation.
