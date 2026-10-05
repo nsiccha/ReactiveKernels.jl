@@ -235,9 +235,7 @@ function _gen_ranged_plan(base::StructuralPlan, range::UnitRange{Int})
         base.predictors, base.population_priors, base.parameters,
         base.assignments, base.columns, base.n_obs; roles = base.roles,
         derived = base.derived, levelmaps = base.levelmaps,
-        plate_parameters = base.plate_parameters, scans = base.scans,
-        varying_draws = base.varying_draws,
-        varying_slices = base.varying_slices)
+        plate_parameters = base.plate_parameters, scans = base.scans)
     validate_plan(plan)
     return plan
 end

@@ -15,7 +15,7 @@ function _distributional_model(ast, data; conditioned = (:y,))
     return (; plan, built, kernel)
 end
 
-function _distributional_horseshoe_fixture(n; negative = false, normal_scale = false,
+function _distributional_product_fixture(n; negative = false, normal_scale = false,
         linked = false)
     x = repeat([-0.4, 0.1, 0.6], cld(n, 3))[1:n]
     y = repeat([0.7, 1.2, 2.3], cld(n, 3))[1:n]
@@ -24,7 +24,10 @@ function _distributional_horseshoe_fixture(n; negative = false, normal_scale = f
     scale = normal_scale ? :a : :b1
     ast = quote
         a ~ Normal(0.7, 1)
-        b1 ~ Horseshoe()
+        z ~ Normal(0, 1)
+        lambda ~ HalfCauchy(1)
+        tau ~ HalfCauchy(1)
+        b1 = z * lambda * tau
         mu = $mean
     end
     if linked
@@ -32,22 +35,22 @@ function _distributional_horseshoe_fixture(n; negative = false, normal_scale = f
     else
         push!(ast.args, :(s = $scale), :(y .~ Normal.(mu, s)))
     end
-    prior = u -> logpdf(Normal(sign * 0.7, 1), u[1]) +
+    prior = u -> logpdf(Normal(0.7, 1), u[1]) +
         logpdf(Normal(), u[2]) +
         logpdf(truncated(Cauchy(), 0, Inf), exp(u[3])) +
         logpdf(truncated(Cauchy(), 0, Inf), exp(u[4])) + u[3] + u[4]
     oracle = u -> begin
-        a = sign * u[1]
+        a = u[1]
         b1 = u[2] * exp(u[3]) * exp(u[4])
         raw_scale = normal_scale ? a : b1
         sigma = linked ? exp(raw_scale) : raw_scale
         sum(logpdf.(Normal.(sign .* (a .+ b1 .* x), sigma), y)) + prior(u)
     end
-    u = [sign * 0.4, 0.6, 0.1, -0.2]
+    u = [0.4, 0.6, 0.1, -0.2]
     invalid = copy(u)
     invalid[normal_scale ? 1 : 2] *= -1
     return (; ast, data = (; x, y), u, invalid, oracle, prior,
-        name = "Horseshoe / $negative / $normal_scale / $linked")
+        name = "Product / $negative / $normal_scale / $linked")
 end
 
 function _distributional_findiff(f, u)
@@ -170,13 +173,12 @@ end
     end
 end
 
-@testset "Horseshoe coefficient aliases share their original coordinates" begin
+@testset "Computed coefficients share their declared coordinates" begin
     for negative in (false, true), normal_scale in (false, true)
-        f = _distributional_horseshoe_fixture(3; negative, normal_scale)
+        f = _distributional_product_fixture(3; negative, normal_scale)
         model = _distributional_model(f.ast, f.data)
         @test coordinate_names(model.built.layout) == [
-            :horseshoe_mu_Intercept_normal, :horseshoe_mu_x_raw,
-            :horseshoe_mu_x_lambda, :horseshoe_mu_x_tau]
+            :a, :z, :lambda, :tau]
         _distributional_check(model, f.oracle, f.u)
         ad = Base.invokelatest(prepare_ad, model.kernel,
             AutoEnzyme(; mode = Enzyme.Reverse), f.invalid; active = :unconstrained)
@@ -201,9 +203,9 @@ end
 end
 
 
-@testset "linked Horseshoe coefficients are ordinary scalar values" begin
+@testset "linked computed coefficients are ordinary scalar values" begin
     for negative in (false, true), normal_scale in (false, true)
-        f = _distributional_horseshoe_fixture(3; negative, normal_scale, linked = true)
+        f = _distributional_product_fixture(3; negative, normal_scale, linked = true)
         model = _distributional_model(f.ast, f.data)
         @test model.built.layout.total == 4
         _distributional_check(model, f.oracle, f.u)

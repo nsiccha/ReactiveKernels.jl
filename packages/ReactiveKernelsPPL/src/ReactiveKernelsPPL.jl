@@ -29,8 +29,7 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
     BinomialCloglogFam, BinomialProbFam, BetaLogitFam, BetaShapeFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
-    MvNormalCholeskyFam, CensoredAddpropnormalFam, TgiCategoryFam,
-    TgiResponseFam, TgiCensoredFam, NormalIDGLMFam, BernoulliLogitGLMFam,
+    MvNormalCholeskyFam, CensoredAddpropnormalFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
     NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
@@ -38,18 +37,11 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     ZeroInflatedBinomialFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
-    VaryingEffectTerm, SplineSummandTerm, HSGPSummandTerm,
-    ScanSummandTerm, MonotonicTerm, MonotonicSummandTerm, MatrixTerm,
-    DarSummandTerm, ComposedTerm
+    ScanSummandTerm, MatrixTerm,
+    ComposedTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export ScalePredictorRef, MixtureComplementWeights
-export PopulationPrior, R2D2Prior, HorseshoePrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec, ArrayParameter
-export VaryingZRecipe, VaryingMargin, VaryingSdPrior, VaryingDraws, VaryingSlice
-export VaryingMultiMembership, VaryingStrata
-export SplineBasisBlock, SplineBasis, SplineVector
-export HSGPBasis, HyperPrior, HSGPHyperLP, HSGPGrouping
-export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec
-export EVENT_LP_NAME
+export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec, ArrayParameter
 export LevelMap
 export DesignMatrix
 export StructuralPlan, SubmodelScope
@@ -72,64 +64,22 @@ export lkj_logconst, lkj_corr_cholesky_logpdf
 export positive_bijector, unit_bijector, interval_bijector, floored_bijector,
     upper_bijector, BIJECTORS
 export coordinate_read, block_read, transform_statements, jacobian_term
-export design_name, offset_name, monotonic_name, design_recipe, offset_recipe,
-    monotonic_recipe
+export design_name, offset_name, design_recipe, offset_recipe
 export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
 export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
-export ordered_logistic, monotonic, differenced_ar1, r2d2_coefs,
-    horseshoe_coefs, penalized_smooth, t2_smooth, hsgp_effect,
-    hsgp_periodic_effect, hsgp_grouped_effect, linear_pk_log_f
-export varying_coefs, varying_coefs_correlated, varying_coefs_centered,
-    varying_coefs_centered_correlated, varying_stratified,
-    varying_stratified_correlated
-export tps_basis, cr_basis, t2_basis, hsgp_basis, hsgp_periodic_basis, hsgp_sqrt_spd,
-    hsgp_grouped_sqrt_spd, hsgp_periodic_sqrt_spd, hsgp_rho_floors,
-    hsgp_periodic_rho_floor, hsgp_matern_sqrt_spd, hsgp_periodic_grouped_sqrt_spd
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
-export DarSpec
-export LINEAR_EVENT_READ, LINEAR_EVENT_DOSE, LINEAR_EVENT_DOSE_SEGMENT
-export build_linear_pk_schedule, linear_pk_read_locs, linear_pk_read_locs_auc
-export linear_pk_op_log_dose, linear_pk_event_log_f
-export linear_pk_system_3, linear_pk_propagate_3, linear_pk_add_dose_3,
-    linear_pk_add_regular_doses_3
-export QT_COUPLING_SPINES, QT_OBS_FAMILIES
-export admit_qt_spine, admit_qt_obs_family
-export qt_loc_assignment, qt_obs_statement, pk_obs_statement
-export validate_qt_joint_prep
-export TGIOptions, tgi_options
-export TGI_OBSERVATIONS, TGI_STRUCTURES, TGI_THRESHOLDS, TGI_MEASURES
-export TGI_TIME_SCALE_H, TGI_LOG_PR, TGI_LOG_PD, TGI_RECIST_LOG_PR,
-    TGI_RECIST_LOG_PD
-export tgi_measure_dim, tgi_threshold_scale, tgi_fixed_cutpoints,
-    tgi_estimated_cutpoints, tgi_uses_nadir
-export tgi_ratio_loglinear, tgi_ratio_resistant, tgi_log_survival,
-    tgi_running_nadir, tgi_nadir_scan_expr, tgi_segmented_nadir,
-    tgi_inv_logit
-export tgi_normal_lcdf, tgi_log_diff_exp, tgi_interval_logprob,
-    tgi_report_logprob
-export tgi_category_lpmf, tgi_category_lpmfs,
-    tgi_response_lpmf, tgi_response_lpmfs,
-    tgi_censored_lpdf, tgi_censored_lpdfs
-export tgi_category_stmts, tgi_response_stmts, tgi_censored_stmts
-export TGI_CELL_FUNCTIONS
 export rk_expm
 export rk_symmetric_eigvals, rk_symmetric_eigvecs
-export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
-    prepare_transit_twocmt_rule
 
 include("contract.jl")
 include("sampling.jl")
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 # The general numerical callables and rule graphs are owned by RK proper;
 # existing PPL-qualified names import those same bindings for compatibility.
-include("pkcells.jl")
-include("transit_twocmt.jl")
-include("transit_twocmt_rule.jl")
-include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")
 include("mv_slices.jl")
@@ -142,18 +92,5 @@ include("display.jl")
 include("distribution_defaults.jl")
 include("surface.jl")
 include("scan.jl")
-include("qt_joint.jl")
-include("tgi.jl")
-include("smooth_bases.jl")
-include("library.jl")
-
-# Late import into the generated-models scope: `PPLGeneratedModels`
-# binds its `import`s when `generator.jl` loads, before `tgi.jl`
-# defines the per-element likelihood cells — so the joint plates'
-# cells register here, after their file (an `import` of a
-# not-yet-defined name warns and never binds).
-Core.eval(PPLGeneratedModels,
-    :(import ..tgi_category_lpmf, ..tgi_response_lpmf, ..tgi_censored_lpdf,
-        ..tgi_segmented_nadir))
 
 end # module ReactiveKernelsPPL

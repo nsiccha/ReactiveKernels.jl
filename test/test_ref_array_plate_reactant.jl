@@ -724,3 +724,5 @@ end
         @test count("\n", hlo2) == count("\n", hlo)
     end
 end
+
+include("test_compound_plate_reactant.jl")

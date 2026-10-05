@@ -39,20 +39,6 @@ Base.:(==)(a::Value, b::Value) = a.id == b.id
 Base.hash(v::Value, h::UInt) = hash(v.id, hash(:ReactiveKernelsValue, h))
 Base.show(io::IO, v::Value{T}) where {T} = print(io, v.name, "::", T)
 
-"""
-    Recipe
-
-A pure computation mapping input graph values to one or more output graph
-values via `op`. RK does not inspect `op` to prove purity: registering an
-ordinary recipe asserts this contract. Set `effectful=true` when the operation
-is known not to satisfy it; effectful operations are rejected by the stateless
-planner and therefore cannot enter a prepared kernel or plate. `cost` is a
-deterministic planning hint (not measured runtime). `cse_key`, when
-non-`nothing`, opts the operation into structural CSE (gist §8).
-`source` is optional authored-RHS metadata for cold-path readable rendering; it
-is kept on the planning recipe rather than the executable operation so it never
-enters prepared hot-state tuples.
-"""
 struct _NoKernelSource end
 const _NO_KERNEL_SOURCE = _NoKernelSource()
 
@@ -69,6 +55,21 @@ struct _RuntimeCheckCallback{E}
 end
 (check::_RuntimeCheckCallback)(valid) = _runtime_check(valid, check.error)
 
+"""
+    Recipe
+
+A pure computation mapping input graph values to one or more output graph
+values via `op`. RK does not inspect `op` to prove purity: registering an
+ordinary recipe asserts this contract. Set `effectful=true` when the operation
+is known not to satisfy it; effectful operations are rejected by the stateless
+planner and therefore cannot enter a prepared kernel or plate. `cost` is a
+deterministic planning hint (not measured runtime). `cse_key`, when
+non-`nothing`, opts the operation into structural CSE (gist §8).
+`source` is optional authored-RHS metadata for cold-path readable rendering; it
+is kept on the planning recipe rather than the executable operation so it never
+enters prepared hot-state tuples. [`recipe_kind`](@ref) classifies a recipe as an
+authored plate, an authored scan or an ordinary recipe.
+"""
 struct Recipe
     id::Int
     inputs::Tuple{Vararg{Value}}
@@ -240,6 +241,15 @@ end
 end
 kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
 kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
+# The element type of an empty plate is Julia's empty-broadcast type: inferred
+# from the authored native cell over the operands' native element types, with
+# no cell evaluated. `nothing` for any other callable, or when inference gives
+# no concrete type.
+_kernel_native_result_type(f, ::Type{<:Tuple}) = nothing
+function _kernel_native_result_type(op::_KernelSourceOp, argtypes::Type{<:Tuple})
+    T = Core.Compiler.return_type(op.f, argtypes)
+    isconcretetype(T) ? T : nothing
+end
 # Tensorized fused bodies may mix untraced constant arrays with traced operands.
 # Base's generic concatenation and broadcast paths can then allocate host
 # containers of traced scalars and copy elementwise — forbidden scalar indexing

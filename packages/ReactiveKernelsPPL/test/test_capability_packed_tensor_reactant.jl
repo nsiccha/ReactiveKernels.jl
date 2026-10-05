@@ -23,7 +23,15 @@ using Reactant
             @test fx.data == fx.saved
             @test Array(ru) == fx.u
             grad = v -> only(Enzyme.gradient(Enzyme.Reverse, Enzyme.Const(kernel), v))
-            push!(reverse, _cap_range_operations(repr(Reactant.@code_hlo optimize=:only_enzyme grad(ru))))
+            # The explicit LKJ array transform has nested loops whose reverse
+            # tapes need the full pipeline's legalization. Inspect the same
+            # pipeline used by compiled AD, retaining the row-count comparison.
+            reverse_hlo = if kind === :joint
+                repr(Reactant.@code_hlo optimize=true grad(ru))
+            else
+                repr(Reactant.@code_hlo optimize=:only_enzyme grad(ru))
+            end
+            push!(reverse, _cap_range_operations(reverse_hlo))
         end
         @test primal[1] == primal[2]
         @test reverse[1] == reverse[2]

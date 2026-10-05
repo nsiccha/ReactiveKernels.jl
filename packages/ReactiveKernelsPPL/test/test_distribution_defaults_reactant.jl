@@ -2,7 +2,7 @@ using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzym
 import SpecialFunctions
 
 # The native defaults file supplies cases and independent Distributions oracles.
-function _defaults_backends(built, bound, kernel, u, expected)
+function _defaults_backends(built, bound, kernel, u, expected; structure_body = false)
     sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
     value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
     @test value ≈ expected atol=1e-10 rtol=1e-10
@@ -25,6 +25,11 @@ function _defaults_backends(built, bound, kernel, u, expected)
     ops = Dict{String,Int}()
     for op in eachmatch(r"stablehlo\.[a-z_]+", hlo)
         ops[op.match] = get(ops, op.match, 0) + 1
+    end
+    if structure_body
+        inventory = _ppl_backend_operation_inventory(hlo)
+        println("default-scale plate complete inventory: ", sort!(collect(inventory.all_ops)))
+        return inventory.body_ops
     end
     return ops
 end

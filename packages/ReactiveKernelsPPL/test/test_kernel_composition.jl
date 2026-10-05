@@ -82,13 +82,11 @@ subject_reference(data, a) = logpdf(Normal(0, 0.7), a) +
 subject_gradient(data, a) = -a / 0.7^2 +
     sum((data.y .- a .* subject_weights(data)) .* subject_weights(data)) / 0.8^2
 
-function scan_count(recipes)
-    sum(recipes; init=0) do r
-        r.op isa ReactiveKernels._AuthoredScanOp && return 1
-        r.op isa ReactiveKernels._AuthoredPlateOp && return scan_count(plate_body(r).recipes)
-        return 0
-    end
-end
+# Structure checks read the public inspection contract: `recipe_inventory`
+# walks every plate and scan body recursively and `recipe_kind` classifies.
+scan_count(program) = count(entry -> entry.kind === :scan, recipe_inventory(program))
+structure(program) = [(entry.kind, entry.depth) for entry in recipe_inventory(program)
+                      if entry.kind !== :ordinary]
 
 @testset "PPL module kernels retain their scans and source authority" begin
     for head in (:recurrence, :alias, GlobalRef(Models, :recurrence), :(Models.recurrence))
@@ -96,14 +94,17 @@ end
         for n in (0, 1, 3, 17)
             bound, built, data = build_case(n; head)
             original = deepcopy(data)
-            @test scan_count(built.spec.graph.recipes) == 1
+            @test scan_count(built.spec) == 1
             push!(counts, length(built.spec.graph.recipes))
             # Evaluate the very expression exported by the public generator;
             # neither construction path repairs the plan after emission.
             def = kernel_expr(bound, built.layout)
             replayed = ReactiveKernelsPPL._eval_kernel_def(def)
-            @test scan_count(replayed.graph.recipes) == 1
+            @test scan_count(replayed) == 1
             replay = prepare(replayed; bound=data)
+            # Once the data are bound, the residual plan keeps the scan over a
+            # nonempty sequence; preparation folds an empty sequence's output.
+            n > 0 && @test scan_count(replay) == 1
             sampler = prepare_sampler(built, bound, [0.2]; backend=BACKEND)
             for a in (0.2, -0.4)
                 u = [a]
@@ -122,7 +123,7 @@ end
 @testset "PPL plate cells retain module kernel scans" begin
     for n in (3, 11)
         bound, built, data = build_case(n; grouped=true)
-        @test scan_count(built.spec.graph.recipes) == 1
+        @test scan_count(built.spec) == 1
         sampler = prepare_sampler(built, bound, [0.2]; backend=BACKEND)
         value, grad = sampler_value_and_gradient!(sampler, [0.0], [0.2])
         @test value ≈ reference(data, 0.2)
@@ -135,12 +136,23 @@ end
     for (n, groups) in ((0, 2), (3, 2), (11, 5))
         bound, built, data = build_subject_case(n, groups)
         original = deepcopy(data)
-        @test scan_count(built.spec.graph.recipes) == 1
-        @test any(built.spec.graph.recipes) do r
-            r.op isa ReactiveKernels._AuthoredPlateOp && scan_count(plate_body(r).recipes) == 1
-        end
+        # The subject plate holds the child scan in its body in the built
+        # graph, its printed-source replay, and once the data are bound. The
+        # second top-level plate is the observation plate.
+        subject_structure = [(:plate, 0), (:scan, 1), (:plate, 0)]
+        @test structure(built.spec) == subject_structure
+        entries = recipe_inventory(built.spec)
+        child = only(entry for entry in entries if entry.kind === :scan)
+        subject = entries[child.parent]
+        @test subject.kind === :plate && subject.depth == 0
+        @test count(recipe -> recipe_kind(recipe) === :scan,
+                    plate_body(subject.recipe).recipes) == 1
+        replayed = ReactiveKernelsPPL._eval_kernel_def(kernel_expr(bound, built.layout))
+        @test structure(replayed) == subject_structure
+        @test structure(prepare(replayed; bound=data)) == subject_structure
         push!(counts, length(built.spec.graph.recipes))
         sampler = prepare_sampler(built, bound, [0.2]; backend=BACKEND)
+        @test structure(sampler.kernel) == subject_structure
         for a in (0.2, -0.4)
             value = Base.invokelatest(sampler.kernel, [a])
             @test value ≈ subject_reference(data, a)
@@ -196,7 +208,7 @@ end
         bound, built, data = grouped_case(n)
         original = deepcopy(data)
         @test built.layout.total == n + 2
-        subject_plate = only(filter(r -> r.op isa ReactiveKernels._AuthoredPlateOp &&
+        subject_plate = only(filter(r -> recipe_kind(r) === :plate &&
             length(r.inputs) == 4, built.spec.graph.recipes))
         @test length(plate_body(subject_plate).recipes) == 3
         push!(counts, length(built.spec.graph.recipes))

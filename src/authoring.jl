@@ -1958,8 +1958,11 @@ function _kernel_authored_scan_expr(rhs, mod)
 
     # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals
     # (carry, x, shared...); an enclosing port used but not passed is out of scope
-    # (never auto-captured) — same rule as plate.
-    signature = Tuple{Symbol,Any}[(name, GlobalRef(Core, :Any)) for name in formals]
+    # (never auto-captured) — same rule as plate. Formals are unannotated, like
+    # omitted `@kernel` signature types: an endpoint argument declaration that
+    # receives a formal directly then supplies its port type, as it does for
+    # plate formals, instead of conflicting with a placeholder `Any`.
+    signature = Tuple{Symbol,Any}[(name, nothing) for name in formals]
     # The do-block ends with a 2-tuple `(new_carry, output)`.  `@kernel` return
     # values must be PORT names, so bind the two components to synthetic result
     # ports and return those, yielding a 2-`want` step spec.

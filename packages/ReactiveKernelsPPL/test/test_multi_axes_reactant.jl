@@ -4,7 +4,6 @@ function _max_fixture(kind, n, m)
     cols = Dict{Symbol,Any}(:y => collect(range(-0.3, 0.5; length=n)),
         :x => collect(range(-1.0, 2.0; length=n)),
         :other => collect(range(0.2, 0.6; length=m)))
-    dims = Dict{Symbol,Int}()
     ast = if kind === :plate
         delete!(cols, :x)
         quote
@@ -25,15 +24,6 @@ function _max_fixture(kind, n, m)
             end
             y .~ Normal.(h, 1)
         end
-    elseif kind === :dar
-        delete!(cols, :x)
-        quote
-            a ~ Normal(0, 1)
-            beta ~ truncated(Normal(0.5, 0.2), 0, 1)
-            sd ~ HalfNormal(0.2)
-            mu = a .+ dar(beta, sd)
-            y .~ Normal.(mu, 1)
-        end
     elseif kind === :array
         cols[:rows] = collect(1:n)
         quote
@@ -51,39 +41,23 @@ function _max_fixture(kind, n, m)
             mu = a .+ X * b
             y .~ Normal.(mu, 1)
         end
-    elseif kind === :hsgp
-        quote
-            hsgp_basis(:h_x, x; k=3)
-            a ~ Normal(0, 1)
-            mu = a .+ hsgp(:h_x)
-            y .~ Normal.(mu, 1)
-        end
-    elseif kind === :spline
-        quote
-            spline_basis(:s_x, x; k=4)
-            a ~ Normal(0, 1)
-            mu = a .+ spline(:s_x)
-            y .~ Normal.(mu, 1)
-        end
-    elseif kind === :kernel
+    elseif kind === :separate_plate
         cols[:kx] = collect(range(-0.5, 1.0; length=n+2))
         cols[:ky] = collect(range(-0.2, 0.4; length=n+2))
-        dims[:n_kernel] = n + 2
         quote
             a ~ Normal(0, 1)
             mu = a .* x
             y .~ Normal.(mu, 1)
-            pk ~ plate(kx, ky; subjects=n_kernel) do xx, yy
-                kmu = a .* xx
-                yy .~ Normal.(kmu, 1)
-                kmu
+            @plate for i in eachindex(ky)
+                kmu[i] = a * kx[i]
+                ky[i] ~ Normal(kmu[i], 1)
             end
         end
     else
         error("unknown fixture $kind")
     end
     push!(ast.args, :(other .~ Normal.(0, 0.7)))
-    bound = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols; dims)
+    bound = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols)
     built = build_kernel(bound)
     u = [-0.3 + 0.7 * (i-1) / max(built.layout.total-1, 1) for i in 1:built.layout.total]
     return (; bound, built, u)
@@ -118,11 +92,11 @@ function _max_compiled(fx)
 end
 
 @testset "Reactant: multiple axes preserve array and recurrence structure" begin
-    @testset "$kind" for kind in (:plate, :scan, :dar, :array, :matrix, :hsgp, :spline, :kernel)
+    @testset "$kind" for kind in (:plate, :scan, :array, :matrix, :separate_plate)
         structures = Dict{String,Int}[]
         for (n, m) in ((8, 3), (17, 6))
             fx = _max_fixture(kind, n, m)
-            @test fx.bound.n_obs == n + m + (kind === :kernel ? n + 2 : 0)
+            @test fx.bound.n_obs == n + m + (kind === :separate_plate ? n + 2 : 0)
             push!(structures, Base.invokelatest(_max_compiled, fx))
         end
         # Compare every operation, including control-flow regions. Growing

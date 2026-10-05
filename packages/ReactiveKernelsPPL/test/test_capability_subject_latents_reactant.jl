@@ -8,27 +8,25 @@ function _cap_subject_operations(hlo)
     out
 end
 
-# The original grouped-PK fixture is accepted natively in test_plates.jl.
-# This compiled prior cut prunes the known system-matrix batching boundary.
-@testset "Reactant: subject-axis latent priors retain their own range" begin
+# A latent axis and an observation axis own independent authored extents.
+@testset "Reactant: independent latent priors retain their own range" begin
     primal, reverse = Dict{String, Int}[], Dict{String, Int}[]
     for copies in (1, 3)
-        original = _pl_pk_cols()
-        cols = Dict{Symbol, AbstractVector}()
-        for (name, values) in original
-            cols[name] = name in (:subj, :dsubj) ?
-                vcat((values .+ 2*i for i in 0:copies-1)...) : repeat(values, copies)
+        cols = Dict{Symbol, AbstractVector}(:domain => zeros(2*copies),
+            :y => zeros(4*copies))
+        ast = quote
+            sigma ~ Exponential(1)
+            a ~ Normal(0, 1)
+            @plate for s in eachindex(domain)
+                eta[s] ~ Normal(0, 1)
+            end
+            y .~ Normal.(a, sigma)
         end
-        ast = _pl_pk_chain(:(dv .~ Normal.(conc, sigma)),
-            Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
-                Expr(:for, :(s = eachindex(age_s)), Expr(:block,
-                    :(eta[s] ~ Normal(0, 1))))))
-        bound, built = _pl_bind(ast, _PL_PK_DATA, cols)
+        bound, built = _pl_bind(ast, (:domain, :y), cols)
         u = [0.1cos(i) for i in 1:built.layout.total]
         q = constrain(built.layout, u)
         expected = logpdf(Exponential(), q.sigma) +
-            sum(logpdf(Normal(), getproperty(q, name)) for name in
-                (:b0_vc, :b1_vc, :b0_k10, :b0_k12, :b0_k21, :b0_ka)) +
+            logpdf(Normal(), q.a) +
             sum(logpdf.(Normal(), q.eta))
         @test length(q.eta) == 2*copies
         @test bound.n_obs == 4*copies
