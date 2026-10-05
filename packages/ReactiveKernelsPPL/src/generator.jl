@@ -816,7 +816,7 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         r.evidence.kind === :none && r.weights === nothing &&
             r.range === nothing && r.mi_jobs === nothing && r.link === LogitLink &&
             !_is_bare_param_location(r, plan) &&
-            !_broadcast_affine(plan, _predictor(plan, r.predictor)) &&
+            _wholevec_location(r, plan) &&
             return _bernoulli_wholevec_stmts(r, plan, node)
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
@@ -826,7 +826,7 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         r.evidence.kind === :none && r.weights === nothing &&
             r.range === nothing && r.mi_jobs === nothing && r.link === LogLink &&
             !_is_bare_param_location(r, plan) &&
-            !_broadcast_affine(plan, _predictor(plan, r.predictor)) &&
+            _wholevec_location(r, plan) &&
             return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
     elseif r.family === HurdlePoissonFam
@@ -1143,13 +1143,48 @@ end
 _predictor(plan::StructuralPlan, name::Symbol) =
     only(p for p in plan.predictors if p.name === name)
 
+# A scan-state or per-cell (plate) latent vector read directly as the
+# location: `r.predictor` names that vector, not a PredictorSpec.
+_is_latent_location(r::LikelihoodSpec, plan::StructuralPlan) =
+    any(s -> r.predictor in s.states, plan.scans) || _is_plate_param(plan, r.predictor)
+
 # The per-observation location node feeding a response's likelihood plate: a
-# scan-state or per-cell (plate) latent vector fed directly (its own name —
-# the layout view), or a linear predictor's `_ppl_lp_<name>` node otherwise.
+# latent vector fed directly (its own name — the layout view), or a linear
+# predictor's `_ppl_lp_<name>` node otherwise.
 function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
-    any(s -> r.predictor in s.states, plan.scans) && return r.predictor
-    _is_plate_param(plan, r.predictor) && return r.predictor
+    _is_latent_location(r, plan) && return r.predictor
     return _lp_name(_predictor(plan, r.predictor))
+end
+
+# The value shape of a response's location (see `_predictor_value_type`).
+_location_value_type(r::LikelihoodSpec, plan::StructuralPlan) =
+    _is_latent_location(r, plan) ? :AbstractVector :
+        _predictor_value_type(plan, _predictor(plan, r.predictor))
+
+# Entry count of a latent vector: a scan trajectory or a plate latent.
+function _latent_rows(plan::StructuralPlan, name::Symbol)
+    for s in plan.scans
+        name in s.states && return _scan_length(plan, s)
+    end
+    i = findfirst(p -> p.name === name, plan.plate_parameters)
+    return i === nothing ? nothing : _plate_rows(plan, plan.plate_parameters[i])
+end
+
+# The fused whole-vector likelihoods (`dot(y, η)`, `sum(exp, η)`) need one
+# location entry per response entry. A latent vector keeps its own length and
+# broadcasts as a Julia array does (one entry stretches over every row); the
+# plate path evaluates that, so fusion requires equal lengths.
+function _wholevec_location(r::LikelihoodSpec, plan::StructuralPlan)
+    y = get(plan.columns, r.response, nothing)
+    rows = y isa AbstractVector ? length(y) : nothing
+    _is_latent_location(r, plan) && return _latent_rows(plan, r.predictor) == rows
+    pred = _predictor(plan, r.predictor)
+    _broadcast_affine(plan, pred) && return false
+    return all(pred.terms) do t
+        t.kind === LatentTerm || return true
+        n = _latent_rows(plan, only(t.columns))
+        return n === nothing || n == rows
+    end
 end
 
 # A bare sampled-parameter location (constrained-scale, no link inversion):
@@ -1166,7 +1201,7 @@ function _response_value_node!(pre::Vector{Expr}, r::LikelihoodSpec,
     r.link === IdentityLink && return lp
     value = _mu_name(r.label)
     rhs = _inverse_link_expr(r.link, lp)
-    typ = _predictor_value_type(plan, _predictor(plan, r.predictor))
+    typ = _location_value_type(r, plan)
     push!(pre, :($value::$typ = $rhs))
     return value
 end
@@ -1551,7 +1586,7 @@ function _ig_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, 
     y = r.response
     lp = _location_node(r, plan)
     mu = _mu_name(r.label)
-    typ = _predictor_value_type(plan, _predictor(plan, r.predictor))
+    typ = _location_value_type(r, plan)
     pre = Expr[:($mu::$typ = $(_inverse_link_expr(r.link, lp)))]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, mu]
@@ -1588,7 +1623,7 @@ function _exponential_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
     y = r.response
     lp = _location_node(r, plan)
     mu = _mu_name(r.label)
-    typ = _predictor_value_type(plan, _predictor(plan, r.predictor))
+    typ = _location_value_type(r, plan)
     pre = Expr[:($mu::$typ = $(_inverse_link_expr(r.link, lp)))]
     inputs = Any[y, mu]
     yv, muv = _dovar(1), _dovar(2)
@@ -1747,7 +1782,7 @@ function _nb2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     y = r.response
     lp = _location_node(r, plan)
     mu = _mu_name(r.label)
-    typ = _predictor_value_type(plan, _predictor(plan, r.predictor))
+    typ = _location_value_type(r, plan)
     pre = Expr[:($mu::$typ = $(_inverse_link_expr(r.link, lp)))]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, mu]
@@ -1777,7 +1812,7 @@ function _nb1_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     y = r.response
     lp = _location_node(r, plan)
     rr = _nb1_r_name(r.label)
-    typ = _predictor_value_type(plan, _predictor(plan, r.predictor))
+    typ = _location_value_type(r, plan)
     pre = Expr[:($rr::$typ = $(_inverse_link_expr(r.link, lp)))]
     sarg = _scale_plate_arg(r, plan, pre)
     inputs = Any[y, rr]
@@ -2007,7 +2042,7 @@ end
 function _beta_shape_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         node::Symbol, pw::Symbol)
     pre = Expr[]
-    inputs = Any[r.response, _lp_name(_predictor(plan, r.predictor))]
+    inputs = Any[r.response, _location_node(r, plan)]
     y, alpha = _dovar(1), _dovar(2)
     beta_arg = _thread_ref!(inputs, _scale_plate_arg(r, plan, pre))
     valid = :(isfinite($alpha) && $alpha > 0 &&
@@ -2034,7 +2069,7 @@ function _beta_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     mu = _mu_name(r.label)
     a = _shape_a_name(r.label)
     b = _shape_b_name(r.label)
-    typ = _predictor_value_type(plan, _predictor(plan, r.predictor))
+    typ = _location_value_type(r, plan)
     pre = Expr[:($mu::$typ = $(_inverse_link_expr(r.link, lp)))]
     sarg = _scale_plate_arg(r, plan, pre)
     k = sarg isa Symbol ? sarg : Float64(sarg)
@@ -2078,7 +2113,7 @@ function _betabinomial2_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
         wv = _thread_ref!(inputs, r.weights)
         cell = _weighted_cell(wv, cell)
     end
-    typ = _predictor_value_type(plan, _predictor(plan, r.predictor))
+    typ = _location_value_type(r, plan)
     return Expr[pre...,
         :($mu::$typ = $(_inverse_link_expr(r.link, lp))),
         :($a = $mu .* $k),
@@ -2354,7 +2389,7 @@ function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     # Evidence describes the whole ordinal law, rather than individual stops.
     K == 1 && return _ordinal_single_evidence_stmts(r, plan, node, pw)
     pre = Expr[]
-    lp = _lp_name(_predictor(plan, r.predictor))
+    lp = _location_node(r, plan)
     row = _stage_lane(r.label, :evidence_row)
     push!(pre, :($row = collect(eachindex($(r.response)))))
     inputs = Any[r.response, lp, :(Ref($(r.thresholds))), row]

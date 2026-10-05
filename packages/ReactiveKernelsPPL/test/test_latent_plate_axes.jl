@@ -105,3 +105,37 @@ end
     @test_throws "column length 3 ≠ the 4 rows of y1" bind_data(
         lower_rkppl(ast, bad; conditioned=(:y1, :y2)), bad)
 end
+
+@testset "a one-cell latent location broadcasts over count observations" begin
+    # Whole-vector count reductions need one latent entry per observation;
+    # a one-cell latent stretches over every row, as Julia broadcasting does.
+    logistic(m) = 1 / (1 + exp(-m))
+    for (response, y, law) in (
+            (:(Poisson.(exp.(theta))), [1, 0, 2, 1], m -> Poisson(exp(m))),
+            (:(Bernoulli.(logistic.(theta))), [1, 0, 1, 1], m -> Bernoulli(logistic(m)))),
+        cells in (1, 4)
+        ast = quote
+            @plate for i in 1:$cells
+                theta[i] ~ Normal(0, 1)
+            end
+            y .~ $response
+        end
+        data = (; y)
+        bound = bind_data(lower_rkppl(ast, data; conditioned=(:y,)), data)
+        built = build_kernel(bound)
+        @test built.layout.total == cells
+        oracle = v -> sum(logpdf.(Normal(), v)) +
+            sum(logpdf(law(v[cells == 1 ? 1 : t]), y[t]) for t in eachindex(y))
+        u = [0.3sin(i) for i in 1:cells]
+        sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u)
+        h = cbrt(eps(Float64))
+        reference = map(eachindex(u)) do i
+            hi, lo = copy(u), copy(u)
+            hi[i] += h; lo[i] -= h
+            (oracle(hi) - oracle(lo)) / (2h)
+        end
+        @test gradient ≈ reference rtol=5e-6 atol=1e-7
+    end
+end
