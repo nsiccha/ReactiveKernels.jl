@@ -139,16 +139,15 @@ end
 
 """One packed slice: a coefficient block, a scalar latent, a scan vector
 latent, a per-cell latent block, a leveled vector latent (cutpoints,
-thresholds, simplex), a varying
-vector block (`tau`/`z_flat`), a varying LKJ
-Cholesky factor, a joint-outcomes LKJ Cholesky factor, or an elementwise array parameter
+thresholds, simplex), a joint-outcomes LKJ Cholesky factor, or an
+elementwise array parameter
 (`:array`, column-major over `dims`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
 `hi`; an `:upper` transform sets `hi` only; `NaN` otherwise). `dims` is
 the axes of a declared array, including an LKJ factor (empty for legacy
 scalar/block entries)."""
 struct LayoutEntry
-    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :varying | :varying_corr | :cholesky_corr | :glm | :array
+    kind::Symbol # :coefficient | :sampled | :scan | :plate | :vector | :cholesky_corr | :glm | :array
     predictor::Union{Nothing,Symbol}
     name::Symbol # block name (`mu_coef`), parameter name, or scan-state name
     labels::Vector{Symbol} # per-coordinate labels (length == size)
@@ -278,7 +277,7 @@ end
 
 # Legacy constructs own generated parameter blocks. Derive their displayed
 # names from the same naming helpers, using the authored local id, so private
-# identifiers cannot escape through scan innovations or varying compatibility blocks.
+# identifiers cannot escape through scan innovations.
 function _scope_layout_paths(plan::StructuralPlan)
     paths = _scope_name_paths(plan.submodel_scopes)
     isempty(paths) && return paths
@@ -419,9 +418,7 @@ function assign_layout(plan::StructuralPlan)
             "[layout] vector parameter $(p.name) has unresolved size " *
             "(bind_data infers it from a linked response or explicit declaration)"))
         # A joint-outcomes LKJ Cholesky factor packs K(K−1)/2 thetas under
-        # its own kind (K=1 packs zero, constraining to `[1.0]` — the
-        # varying `:varying_corr` shape with no tau/z_flat siblings and
-        # no derived draws, so it needs its own kind, not a shared one).
+        # its own kind (K=1 packs zero, constraining to `[1.0]`).
         if p.family === :cholesky_corr_lkj
             K = p.size
             packed = K * (K - 1) ÷ 2
@@ -446,65 +443,6 @@ function assign_layout(plan::StructuralPlan)
             LayoutEntry(:vector, nothing, p.name, labels, offset, packed,
                 transform))
         offset += packed
-    end
-    # Varying draws in plan order, at every K (SB declaration order
-    # L/tau/z): the LKJ Cholesky factor (`:varying_corr` packing
-    # K*(K-1)/2 thetas — K=1 packs zero and constrains to `[1.0]`),
-    # the marginal-scale K-vector `tau` (`:varying` with `:exp` — the
-    # the density uses a normalized half),
-    # and the standardized `z_flat` (`:varying` identity, K*G
-    # column-major; G from declared levels). Stratified draws pack
-    # one L/tau pair per stratum (SB `ranef_correlated_by` order —
-    # all L, all tau) plus the one shared `z_flat` block.
-    for d in plan.varying_draws
-        K = length(d.margins)
-        if d.strata !== nothing
-            # Stratified (SB `ranef_correlated_by` declaration
-            # order — all L, all tau, then the shared z): one LKJ
-            # entry plus one tau entry per stratum, one shared
-            # `z_flat` block (K*G column-major, as unstratified).
-            S = _strata_nlevels(d)
-            P = K * (K - 1) ÷ 2
-            for k in 1:S
-                Lk, _ = _varying_strata_names(d, k)
-                labels = [Symbol(string(Lk) * "." * string(i))
-                    for i in 1:P]
-                push!(entries,
-                    LayoutEntry(:varying_corr, nothing, Lk, labels,
-                        offset, P, :lkj))
-                offset += P
-            end
-            for k in 1:S
-                _, tauk = _varying_strata_names(d, k)
-                push!(entries,
-                    LayoutEntry(:varying, nothing, tauk, [tauk], offset,
-                        K, :exp))
-                offset += K
-            end
-            z = _varying_corr_names(d)[3]
-            G = _draws_nlevels(d)
-            push!(entries,
-                LayoutEntry(:varying, nothing, z, [z], offset, K * G,
-                    :identity))
-            offset += K * G
-            continue
-        end
-        L, tau, z = _varying_corr_names(d)
-        P = K * (K - 1) ÷ 2
-        labels = [Symbol(string(L) * "." * string(i)) for i in 1:P]
-        push!(entries,
-            LayoutEntry(:varying_corr, nothing, L, labels, offset, P,
-                :lkj))
-        offset += P
-        push!(entries,
-            LayoutEntry(:varying, nothing, tau, [tau], offset, K,
-                :exp))
-        offset += K
-        G = _draws_nlevels(d)
-        push!(entries,
-            LayoutEntry(:varying, nothing, z, [z], offset, K * G,
-                :identity))
-        offset += K * G
     end
     # Sequential-recurrence latents: one identity array slice per scan. The
     # length T is the loop bound — a literal Int, or `n_obs` when the bound is a
@@ -939,14 +877,14 @@ function coordinate_names(layout::LayoutTable)
                 push!(names, Symbol(_draw_name(layout, e.predictor) * "." * string(label)))
             end
         elseif e.kind === :plate ||
-               e.kind === :varying || e.kind === :glm
+               e.kind === :glm
             for i in 1:e.size
                 push!(names, Symbol(_draw_name(layout, e.name) * "." * string(i)))
             end
         elseif e.kind === :vector || e.kind === :array || e.kind === :external || e.kind === :external_plate
             append!(names, [_authored_coordinate(layout, e.name, label)
                 for label in e.labels])
-        elseif e.kind === :varying_corr || e.kind === :cholesky_corr
+        elseif e.kind === :cholesky_corr
             append!(names, [_authored_coordinate(layout, e.name, label)
                 for label in e.labels])
         elseif e.kind === :scan
@@ -1130,9 +1068,7 @@ end
 
 Host-side constrain of the packed vector. Parameters keep their author
 names; submodel locals are nested (`nt.z.b`, `nt.z.w.b`). Scalar, vector,
-and array leaves retain their constrained shapes. Legacy correlated varying
-entries also contribute derived `b_<suffix>` matrices, ignored by
-[`unconstrain`](@ref). Deterministic submodel locals and return values are
+and array leaves retain their constrained shapes. Deterministic submodel locals and return values are
 read in the model rather than included in this draw container. The generator
 emits the equivalent transforms inside the mathematical graph.
 """
@@ -1162,7 +1098,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(seen_coef, p)
             push!(pairs, p => _constrain_coefficient(coef_groups[p], u))
         elseif e.kind === :plate ||
-               e.kind === :varying || e.kind === :glm
+               e.kind === :glm
             v = [_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
@@ -1179,10 +1115,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             v = Float64[_constrain_elt(e, Float64(x)) for x in seg]
             push!(pairs, e.name =>
                 (length(e.dims) == 1 ? v : reshape(v, e.dims...)))
-        elseif e.kind === :varying_corr || e.kind === :cholesky_corr
-            # Both LKJ-factor kinds share the host hyperspherical edges
-            # (name/size-keyed — kind-agnostic); only `:varying_corr`
-            # grows the derived `b_` draws below.
+        elseif e.kind === :cholesky_corr
             L = lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size))
             push!(pairs, e.name => (_is_upper_lkj(e.transform) ? permutedims(L) : L))
         else
@@ -1194,68 +1127,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     end
     order = Dict(e.name => i for (i, e) in enumerate(layout.entries))
     sort!(pairs; by = p -> get(order, first(p), 0))
-    for (bname, b) in _varying_corr_draws(layout, u)
-        push!(pairs, bname => b)
-    end
     return _scoped_draw_values(layout, pairs)
-end
-
-# Derived correlated draws per `:varying_corr` entry: `b_<suffix>`
-# (G×K), SB `(diag_pre_multiply(tau,L)*z)'` with `z_flat` in SB
-# column-major order. Sibling entries are found by the canonical
-# `_varying_corr_names` spelling (`L_<s>` → `tau_<s>` /
-# `z_flat_<s>`), never by
-# adjacency, so entry-order changes cannot miswire it — and only among
-# `:varying` entries, the kind that varying-draws blocks alone pack, so
-# an author's parameter spelled like a sibling (`b_flat_g ~ ...` beside
-# a non-centered block) is never read as one. Per-stratum LKJ entries
-# (stratified draws) fail closed:
-# derived stratified draws are query scope, not built in this
-# log-density slice.
-# Specific refusal when an LKJ entry without canonical siblings is a
-# per-stratum frame (`L_<suffix>_s<k>` with the shared
-# `z_flat_<suffix>` present): derived stratified draws are query
-# scope. Anything else falls through to the generic triple error.
-function _stratified_draws_refusal(name::Symbol, sfx::String,
-        byname::Dict{Symbol,LayoutEntry})
-    m = match(r"^(.*)_s(\d+)$", sfx)
-    m === nothing && return nothing
-    haskey(byname, Symbol("z_flat_", m.captures[1])) ||
-        return nothing
-    throw(ContractValidationError(
-        "[layout] derived draws for stratified LKJ entry $name are not " *
-        "built (`constrain`/`restore_draws` do not cover `gr(g, by=b)` " *
-        "blocks — log-density-only slice)"))
-end
-
-function _varying_corr_draws(layout::LayoutTable, u::AbstractVector{<:Real})
-    out = Pair{Symbol,Matrix{Float64}}[]
-    byname = Dict{Symbol,LayoutEntry}(e.name => e for e in layout.entries
-        if e.kind === :varying)
-    for e in layout.entries
-        e.kind === :varying_corr || continue
-        sfx = string(e.name)[3:end]
-        tau_e = get(byname, Symbol("tau_", sfx), nothing)
-        z_e = get(byname, Symbol("z_flat_", sfx), nothing)
-        if tau_e === nothing || z_e === nothing
-            _stratified_draws_refusal(e.name, sfx, byname)
-            throw(ContractValidationError(
-                "[layout] LKJ entry $(e.name) has no tau/z_flat siblings " *
-                "(assign_layout always emits the triple)"))
-        end
-        K = _lkj_dim(e.size)
-        tau = [_constrain_elt(tau_e, Float64(x)) for x in
-            u[tau_e.offset:(tau_e.offset + tau_e.size - 1)]]
-        zf = [Float64(x) for x in u[z_e.offset:(z_e.offset + z_e.size - 1)]]
-        length(zf) == K * (length(zf) ÷ K) || throw(ContractValidationError(
-            "[layout] z_flat length $(length(zf)) is not a multiple of K=$K"))
-        G = length(zf) ÷ K
-        L = lkj_chol_constrain(
-            Vector{Float64}(u[e.offset:(e.offset + e.size - 1)]), K)
-        zmat = reshape(zf, K, G)
-        push!(out, Symbol("b_", sfx) => Matrix((Diagonal(tau) * L * zmat)'))
-    end
-    return out
 end
 
 """
@@ -1311,9 +1183,8 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 pos += e2.size
             end
         elseif e.kind === :plate ||
-               e.kind === :varying || e.kind === :glm
+               e.kind === :glm
             what = e.kind === :plate ? "plate parameter" :
-                e.kind === :varying ? "varying vector" :
                 "GLM coefficient vector"
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing $what $(e.name)"),
@@ -1371,7 +1242,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] vector parameter $(e.name) length mismatch"),
             )
             u[e.offset:(e.offset + e.size - 1)] .= _vector_unconstrain(e, v)
-        elseif e.kind === :varying_corr || e.kind === :cholesky_corr
+        elseif e.kind === :cholesky_corr
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing LKJ factor $(e.name)"),
             )
@@ -1441,7 +1312,7 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
             total += _array_slices_logjac(e, seg)
             continue
         end
-        if e.kind === :varying_corr || e.kind === :cholesky_corr
+        if e.kind === :cholesky_corr
             # LKJ thetas couple through the hyperspherical rows —
             # entry-level, never per-coordinate.
             total += lkj_chol_logjac(Vector{Float64}(seg), _lkj_dim(e.size))
@@ -1593,18 +1464,18 @@ function transform_statements(e::LayoutEntry)
         ]
     end
     if e.kind === :plate ||
-       e.kind === :varying || e.kind === :glm
-        # Plate, varying compatibility, and GLM vectors share this transform.
+       e.kind === :glm
+        # Plate and GLM vectors share this transform.
         return _plate_transform_statements(e)
     end
     if e.kind === :vector
         return _vector_transform_statements(e)
     end
     e.kind === :array && return _array_transform_statements(e)
-    if e.kind === :varying_corr || e.kind === :cholesky_corr
+    if e.kind === :cholesky_corr
         isempty(e.dims) || return _lkj_array_transform_statements(e)
-        # Legacy structural-margin blocks still read named scalar edges.
-        # Declared arrays above retain their triangular iteration for every K.
+        # Scalar-edge factors read named edges; declared arrays above retain
+        # their triangular iteration for every K.
         return _lkj_corr_transform_statements(e)
     end
     o = e.offset
@@ -1905,7 +1776,7 @@ function jacobian_term(e::LayoutEntry)
         return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-
                      log($bhi - $blo)))
     end
-    if e.kind === :varying_corr || e.kind === :cholesky_corr
+    if e.kind === :cholesky_corr
         isempty(e.dims) || return _lkj_array_logjac(e.name)
         return _lkj_vine_logjac(e.name, _lkj_dim(e.size))
     end
@@ -1930,12 +1801,11 @@ function jacobian_term(e::LayoutEntry)
             log.($(_vector_z(e))) .+ $(_vector_l(e))))
     end
     if e.kind === :plate ||
-       e.kind === :varying || e.kind === :glm
+       e.kind === :glm
         # Interval/upper plates hand-roll the per-cell Jacobian sum
         # (parameterized bounds, no companion `logjac` plate); every registry
         # transform sums its companion `logjac` plate from
-        # `_plate_transform_statements`. Varying compatibility vectors
-        # (`z_flat` identity, `tau` exp) and GLM vectors use the same shape.
+        # `_plate_transform_statements`. GLM vectors use the same shape.
         # Missing companion plates must fail explicitly.
         if e.transform === :interval
             blo, bhi = e.lo, e.hi

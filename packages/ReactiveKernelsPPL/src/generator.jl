@@ -67,16 +67,14 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan)
     likelihoods = _likelihood_statements(plan, layout; gathers)
-    _each_layout_unit(plan, layout) do unit
-        append!(stmts, unit isa LayoutEntry ? transform_statements(unit) :
-            _stratified_transform_statements(unit, layout))
+    for e in layout.entries
+        append!(stmts, transform_statements(e))
     end
     append!(stmts, _coef_reassembly_statements(plan, layout))
     append!(stmts, _conditioned_value_statements(plan))
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, assigns)
     append!(stmts, preprocessing_recipes(plan))
-    append!(stmts, _varying_statements(plan))
     append!(stmts, _scan_reconstruction_statements(plan, layout))
     append!(stmts, _affine_coefficient_statements(plan, layout))
     append!(stmts, _predictor_statements(plan))
@@ -461,13 +459,6 @@ function _predictor_statements(plan::StructuralPlan)
         for b in shape.blocks
             b.kind === LatentTerm && push!(terms, b.column)
         end
-        # A varying effect contributes its draws block's direct `r`
-        # expression (SB's `r_<target>_<suffix>` summand), resolved from
-        # the TERMS — the draws label does not fit a design block.
-        for t in pred.terms
-            t.kind === VaryingEffectTerm &&
-                push!(terms, _varying_effect_expr(plan, pred, t))
-        end
         # A scan summand contributes its state's direct scaled expression
         # (`state .* coef`, SB's `ar` latent path with its free beta),
         # resolved from the TERMS like any summand.
@@ -596,322 +587,7 @@ function _located_rows(plan::StructuralPlan, pred::PredictorSpec)
     return only(rows)
 end
 
-# Group-index encoder nodes, one per grouped column (`_ppl_gidx_<group>`):
-# an in-model `_declared_codes` call over the draws' DECLARED levels
-# (bind-known — filled or emitter-provided — so the order agrees with
-# validation by construction; never sorted). Data-only, hence
-# bound-folded; strings are native-only, exactly like factor contrasts.
-# K=1 and correlated draws on the same group share one encoder
-# (per-group dedup; same-group levels agreement is validated).
-function _varying_statements(plan::StructuralPlan)
-    stmts = Expr[]
-    groups = Symbol[]
-    for d in plan.varying_draws
-        if d.mm !== nothing
-            append!(stmts, _mm_preamble_stmts(d))
-            continue
-        end
-        if !(d.group in groups)
-            push!(groups, d.group)
-            d.levels === nothing && throw(ContractValidationError(
-                "[generator] internal: draws $(d.label) has no declared " *
-                "levels (validate_plan proves this)"))
-            lvlvec = Expr(:vect,
-                (_level_literal(lv) for lv in d.levels)...)
-            push!(stmts, Expr(:(=), Symbol(:_ppl_gidx_, d.group),
-                Expr(:call, :_declared_codes, d.group, lvlvec)))
-        end
-        if d.strata !== nothing
-            st = d.strata::VaryingStrata
-            st.levels === nothing && throw(ContractValidationError(
-                "[generator] internal: draws $(d.label) has no declared " *
-                "strata levels (validate_plan proves this)"))
-            slvlvec = Expr(:vect,
-                (_level_literal(lv) for lv in st.levels)...)
-            push!(stmts, Expr(:(=), _sidx_name(d),
-                Expr(:call, :_declared_codes, st.by, slvlvec)))
-        end
-    end
-    return stmts
-end
 
-# One membership slot's group-index encoder name (`_ppl_gidx_<suffix>_m<m>`).
-_mm_gidx_name(d::VaryingDraws, m::Int) =
-    Symbol(:_ppl_gidx_, d.suffix, :_m, m)
-
-# Normalized-weight vector name (`_ppl_mmw_<suffix>_m<m>`) and the shared
-# per-row weight-total name (`_ppl_mmwtot_<suffix>`).
-_mm_w_name(d::VaryingDraws, m::Int) = Symbol(:_ppl_mmw_, d.suffix, :_m, m)
-_mm_wtot_name(d::VaryingDraws) = Symbol(:_ppl_mmwtot_, d.suffix)
-
-# Per-observation stratum-code vector name (`_ppl_sidx_<suffix>`).
-_sidx_name(d::VaryingDraws) = Symbol(:_ppl_sidx_, d.suffix)
-
-# Stratified draws in-graph: the layout keeps SB's per-stratum entries
-# (all `L_<s>_s<k>`, then all `tau_<s>_s<k>` — names, coordinates and
-# parity unchanged), but the stratum count S comes from data
-# (`bind_data` fills the levels), so the graph reads them STACKED: one
-# vine edge chain whose edges are S-vectors (`_ppl_rl_<sL>_<i>_<j>`,
-# `L[1,1]` the scalar `1.0`) and one `tau` plate over the contiguous
-# K×S column-major block. Statement count is independent of S
-# (core constraint 1).
-_strata_L_name(d::VaryingDraws) = Symbol(:_ppl_sL_, d.suffix)
-_strata_tau_name(d::VaryingDraws) = Symbol(:_ppl_stau_, d.suffix)
-
-# Iteration unit of the per-entry edges and Jacobian: every layout entry
-# is its own unit, except a stratified draws block's per-stratum members,
-# which form ONE unit (the draws block, visited at its first member).
-function _each_layout_unit(f, plan::StructuralPlan, layout::LayoutTable)
-    members = Dict{Symbol,VaryingDraws}()
-    for d in plan.varying_draws
-        d.strata === nothing && continue
-        for k in 1:_strata_nlevels(d)
-            Lk, tauk = _varying_strata_names(d, k)
-            members[Lk] = d
-            members[tauk] = d
-        end
-    end
-    seen = Set{Symbol}()
-    for e in layout.entries
-        d = get(members, e.name, nothing)
-        if d === nothing
-            f(e)
-        elseif !(d.label in seen)
-            push!(seen, d.label)
-            f(d)
-        end
-    end
-    return nothing
-end
-
-# The stacked blocks' geometry, checked against the layout: S strata,
-# K margins, P = K(K-1)/2 partials per stratum, and the offsets of the
-# contiguous per-stratum `L` and `tau` runs the stacked reads stride over.
-function _strata_geometry(d::VaryingDraws, layout::LayoutTable)
-    S = _strata_nlevels(d)
-    K = length(d.margins)
-    P = K * (K - 1) ÷ 2
-    byname = Dict(e.name => e for e in layout.entries)
-    member(n) = haskey(byname, n) ? byname[n] :
-        throw(ContractValidationError("[generator] internal: stratified " *
-            "draws $(d.label) has no layout entry $n"))
-    L1, tau1 = _varying_strata_names(d, 1)
-    offL, offT = member(L1).offset, member(tau1).offset
-    for k in 1:S
-        Lk, tauk = _varying_strata_names(d, k)
-        eL, eT = member(Lk), member(tauk)
-        eL.offset == offL + (k - 1) * P && eL.size == P &&
-            eT.offset == offT + (k - 1) * K && eT.size == K &&
-            eT.transform === :exp || throw(ContractValidationError(
-            "[generator] internal: stratified draws $(d.label) layout is " *
-            "not the contiguous per-stratum L/tau runs the stacked edges read"))
-    end
-    return (; S, K, P, offL, offT)
-end
-
-# Partial p of every stratum's vine (stride P through the `L` run).
-function _strata_partial_read(g, p::Int)
-    lo = g.offL + p - 1
-    return :(view(unconstrained, $lo:$(g.P):$(lo + (g.S - 1) * g.P)))
-end
-
-# The stacked `tau` block as one `:exp` plate entry (K×S column-major).
-_strata_tau_entry(d::VaryingDraws, g) =
-    LayoutEntry(:varying, nothing, _strata_tau_name(d),
-        [_strata_tau_name(d)], g.offT, g.S * g.K, :exp)
-
-function _stratified_transform_statements(d::VaryingDraws,
-        layout::LayoutTable)
-    g = _strata_geometry(d, layout)
-    stmts = _lkj_vine_statements(_strata_L_name(d), g.K,
-        p -> _strata_partial_read(g, p); stacked = true)
-    append!(stmts, transform_statements(_strata_tau_entry(d, g)))
-    return stmts
-end
-
-function _stratified_logjac_terms(d::VaryingDraws, layout::LayoutTable)
-    g = _strata_geometry(d, layout)
-    terms = Any[]
-    lj = _lkj_vine_logjac(_strata_L_name(d), g.K; stacked = true)
-    lj === nothing || push!(terms, lj)
-    push!(terms, jacobian_term(_strata_tau_entry(d, g)))
-    return terms
-end
-
-# One mm draws block's data preamble (SB `_brm_prepare_mm`, in-graph):
-# per-slot encoders against the SHARED union levels (per-suffix names —
-# never shared with plain encoders, whose numbering differs), plus —
-# supplied weights with normalize — the per-row total (slot order, SB
-# `sum` order) and the normalized per-slot weight vectors. Raw
-# (`normalize=false`) weights read their bound columns directly (no
-# preamble); default weights are the `inv(M)` scalar in the effect.
-function _mm_preamble_stmts(d::VaryingDraws)
-    mm = d.mm::VaryingMultiMembership
-    M = length(mm.groups)
-    d.levels === nothing && throw(ContractValidationError(
-        "[generator] internal: draws $(d.label) has no declared " *
-        "levels (validate_plan proves this)"))
-    lvlvec = Expr(:vect,
-        (_level_literal(lv) for lv in d.levels)...)
-    stmts = Expr[]
-    for m in 1:M
-        push!(stmts, Expr(:(=), _mm_gidx_name(d, m),
-            Expr(:call, :_declared_codes, mm.groups[m], lvlvec)))
-    end
-    if mm.weights !== nothing && mm.normalize
-        tot = foldl((a, c) -> :($a .+ $c), mm.weights)
-        push!(stmts, Expr(:(=), _mm_wtot_name(d), tot))
-        for m in 1:M
-            push!(stmts, Expr(:(=), _mm_w_name(d, m),
-                :($(mm.weights[m]) ./ $(_mm_wtot_name(d)))))
-        end
-    end
-    return stmts
-end
-
-# One mm slot's weight factor as an rvalue: the `inv(M)` literal for
-# default weights (SB fills `inv(M)` unnormalized), the normalized
-# preamble vector, or the raw bound column.
-function _mm_weight_expr(d::VaryingDraws, m::Int)
-    mm = d.mm::VaryingMultiMembership
-    mm.weights === nothing && return inv(Float64(length(mm.groups)))
-    mm.normalize && return _mm_w_name(d, m)
-    return mm.weights[m]
-end
-
-# Term-to-draws join by label, plus the (draws, target) slice (unique
-# by validation). The term carries the draws label; the slice carries
-# the explicit column range — the generator never re-derives ranges.
-function _slice_draws(plan::StructuralPlan, pred::PredictorSpec,
-        t::TermSpec)
-    i = findfirst(d -> d.label === t.options.draws, plan.varying_draws)
-    i === nothing && throw(ContractValidationError(
-        "[generator] effect term addresses unknown draws " *
-        "($(t.options.draws))"))
-    d = plan.varying_draws[i]
-    si = findfirst(s -> s.draws === d.label && s.target === pred.name,
-        plan.varying_slices)
-    si === nothing && throw(ContractValidationError(
-        "[generator] internal: effect term of draws $(d.label) in " *
-        "predictor $(pred.name) has no slice (validate_plan proves this)"))
-    return d, plan.varying_slices[si]
-end
-
-# One varying margin's Z as an rvalue: bare columns stay bare (raw
-# ports and derived locals alike); dummies compare against the
-# bind-known level value. `:ones` never reaches emission (an intercept
-# needs no Z multiply).
-function _varying_z_expr(z::VaryingZRecipe)
-    z.kind === :column && return z.column
-    z.kind === :dummy &&
-        return Expr(:call, :.==, z.column, _level_literal(z.level))
-    throw(ContractValidationError(
-        "[generator] internal: ones-Z reached effect emission"))
-end
-
-# One varying draws block's direct `r` summand (no `b` node, the draws
-# stay implicit): the K² implicit-draws arm (this slice's columns
-# only, every K); mm draws take the weighted-gather arm (same geometry,
-# per-slot gathers).
-function _varying_effect_expr(plan::StructuralPlan, pred::PredictorSpec,
-        t::TermSpec)
-    d, s = _slice_draws(plan, pred, t)
-    d.mm !== nothing && return _varying_mm_effect_expr(plan, d, s)
-    return _varying_corr_effect_expr(plan, d, s)
-end
-
-# One mm draws block's direct `r` summand (SB `multi_membership_*`
-# math, in-graph): per slot `m`, the plain-geometry margin expr at
-# that slot's encoder, weighted by that slot's factor, summed in slot
-# order (SB's per-observation `rv[i] += w*b` association). Every slot
-# reuses the margin expr below with the shared tau/L/z.
-function _varying_mm_effect_expr(plan::StructuralPlan, d::VaryingDraws,
-        s::VaryingSlice)
-    mm = d.mm::VaryingMultiMembership
-    M = length(mm.groups)
-    L, tau, _ = _varying_corr_names(d)
-    parts = Any[]
-    for m in 1:M
-        gidx = _mm_gidx_name(d, m)
-        w = _mm_weight_expr(d, m)
-        inner = _corr_margin_expr(d, s, tau, L, gidx)
-        push!(parts, :($w .* $inner))
-    end
-    return foldl((a, c) -> :($a .+ $c), parts)
-end
-
-# One correlated draws block's direct `r` summand for one slice
-# (SB `rows_dot_product(Z, b[idx,cols])` with the draws implicit — the
-# no-`b`-node precedent); stratified draws take the per-stratum
-# indicator arm below instead.
-function _varying_corr_effect_expr(plan::StructuralPlan, d::VaryingDraws,
-        s::VaryingSlice)
-    d.strata !== nothing && return _varying_strata_effect_expr(plan, d, s)
-    L, tau, _ = _varying_corr_names(d)
-    return _corr_margin_expr(d, s, tau, L, Symbol(:_ppl_gidx_, d.group))
-end
-
-# One stratified draws block's direct `r` summand (SB
-# `ranef_correlated_by` math, in-graph): each observation's margin
-# coefficient `tau[j]*L[j,q]` is GATHERED from its own stratum's frame
-# by the per-observation stratum code — `tau` from the stacked K×S
-# column-major vector (the `z_flat` gather idiom), `L[j,q]` from the
-# stacked S-vector edge (the `xi[gidx]` idiom; `L[1,1]` is the scalar
-# `1.0`). One expression whatever the stratum count S, which `bind_data`
-# fills from data: per-stratum arms would duplicate the body S times
-# (core constraint 1). Each gathered product is the same two-operand
-# multiply the per-stratum frame performs, so values are unchanged.
-function _varying_strata_effect_expr(plan::StructuralPlan, d::VaryingDraws,
-        s::VaryingSlice)
-    K = length(d.margins)
-    sidx = _sidx_name(d)
-    stau = _strata_tau_name(d)
-    sL = _strata_L_name(d)
-    coef(j, q) = begin
-        Ljq = (j == 1 && q == 1) ? _rl_name(sL, 1, 1) :
-            Expr(:ref, _rl_name(sL, j, q), sidx)
-        :($(Expr(:ref, stau, :($j .+ ($sidx .- 1) .* $K))) .* $Ljq)
-    end
-    return _corr_margin_expr(d, s, coef, Symbol(:_ppl_gidx_, d.group))
-end
-
-# Per slice margin j, `Z_j .* sum_s (tau[j]*L[j,s]) .*
-# z_flat[s + (gidx-1)*K]` over `s in 1:j` (L lower-triangular — the
-# `s > j` terms are structural zeros, never emitted). `:ones` Z drops
-# the factor (multiply by 1). K, the slice range, and the `s` bound
-# are all static; tau reads are scalar refs (the coefficient-block
-# precedent) and L reads the named `_ppl_rl_` scalars from the layout
-# edges. Shared by the plain, mm (per-slot `gidx`), and stratified
-# (gathered `coef`) arms.
-_corr_margin_expr(d::VaryingDraws, s::VaryingSlice, tau::Symbol,
-        L::Symbol, gidx::Symbol) =
-    _corr_margin_expr(d, s,
-        (j, q) -> :($(Expr(:ref, tau, j)) * $(_rl_name(L, j, q))), gidx)
-
-# `coef(j, q)` is the margin coefficient expression `tau[j]*L[j,q]`.
-function _corr_margin_expr(d::VaryingDraws, s::VaryingSlice, coef,
-        gidx::Symbol)
-    cols = s.columns
-    K = length(d.margins)
-    z = _varying_corr_names(d)[3]
-    parts = Any[]
-    for j in cols
-        m = d.margins[j]
-        inner = Any[]
-        for q in 1:j
-            A = coef(j, q)
-            idx = :($q .+ ($gidx .- 1) .* $K)
-            push!(inner, :($A .* $(Expr(:ref, z, idx))))
-        end
-        sj = foldl((a, c) -> :($a .+ $c), inner)
-        if m.z.kind === :ones
-            push!(parts, sj)
-        else
-            push!(parts, :($(_varying_z_expr(m.z)) .* $sj))
-        end
-    end
-    return foldl((a, c) -> :($a .+ $c), parts)
-end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 
@@ -3152,20 +2828,6 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
                 p.support_override; rows = _plate_rows(plan, p))
         end
     end
-    # Varying scales are normalized halves in every geometry.
-    for d in plan.varying_draws
-        if d.strata !== nothing
-            _stratified_prior_stmts!(stmts, terms, d, layout)
-            continue
-        end
-        L, tau, z = _varying_corr_names(d)
-        lnode = Symbol(:_ppl_prior_, L)
-        push!(stmts, :($lnode::Float64 = $(_lkj_prior_expr(d))))
-        push!(terms, lnode)
-        _sd_prior_tau_stmts!(stmts, terms, d, tau)
-        _vector_prior_stmts!(stmts, terms, z, :normal,
-            (arg1 = 0, arg2 = 1), nothing)
-    end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
     scanstmts, scannodes = _scan_prior_statements(plan, layout)
     append!(stmts, scanstmts)
@@ -3229,84 +2891,6 @@ function _lkj_prior_diagonal(ld, K, i, eta)
     coefficient = i isa Int ? K - i : :($K - $i)
     return eta == 1.0 ? :($coefficient * $ld) :
         :($coefficient * $ld + $(2 * eta - 2) * $ld)
-end
-
-# One correlated draws block's LKJ prior node (names/sizes from the draws).
-function _lkj_prior_expr(d::VaryingDraws)
-    return _lkj_prior_terms(_varying_corr_names(d)[1], length(d.margins),
-        d.lkj_eta)
-end
-
-# One stratified draws block's prior nodes, stacked across its S strata
-# (S comes from data, so per-stratum nodes would replicate statements —
-# core constraint 1): ONE LKJ node over the stacked diagonal S-vectors
-# (S copies of the constant, then each diagonal term summed over the
-# strata), ONE half-normal plate over the stacked K×S `tau` (validation
-# proves no sd priors), then the shared `z_flat` plate. The strata are
-# independent, so this is the SB `ranef_correlated_by` sum regrouped.
-function _stratified_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
-        d::VaryingDraws, layout::LayoutTable)
-    g = _strata_geometry(d, layout)
-    sL = _strata_L_name(d)
-    lnode = Symbol(:_ppl_prior_, sL)
-    push!(stmts, :($lnode::Float64 =
-        $(_lkj_prior_terms(sL, g.K, d.lkj_eta; nstack = g.S))))
-    push!(terms, lnode)
-    _vector_prior_stmts!(stmts, terms, _strata_tau_name(d), :normal,
-        (arg1 = 0, arg2 = 1), :positive)
-    z = _varying_corr_names(d)[3]
-    _vector_prior_stmts!(stmts, terms, z, :normal,
-        (arg1 = 0, arg2 = 1), nothing)
-    return nothing
-end
-
-# One margin's sd prior in the shared (family, args) prior shape (SB's
-# generic-path mirror: `:std_normal` is Normal(0, 1), `:exponential`
-# carries the contract's SCALE, `:normal` is Normal(0, σ)).
-function _sd_prior_shape(p::VaryingSdPrior)
-    p.family === :std_normal && return (:normal, (arg1 = 0.0, arg2 = 1.0))
-    p.family === :exponential && return (:exponential, (arg1 = p.param,))
-    p.family === :normal && return (:normal, (arg1 = 0.0, arg2 = p.param))
-    p.family === :cauchy && return (:cauchy, (arg1 = 0.0, arg2 = p.param))
-    throw(ContractValidationError("[generator] sd prior family " *
-        "$(repr(p.family)) is not one of $(_SD_PRIOR_FAMILIES) " *
-        "(validate_plan proves this)"))
-end
-
-# A draws block's per-margin `tau` prior shapes in margin order (empty
-# `sd_priors` is all-`:std_normal`).
-function _sd_prior_shapes(d::VaryingDraws)
-    K = length(d.margins)
-    isempty(d.sd_priors) &&
-        return fill((:normal, (arg1 = 0.0, arg2 = 1.0)), K)
-    return [_sd_prior_shape(p) for p in d.sd_priors]
-end
-
-# A homogeneous prior stays one retained plate; structurally stated mixed
-# margins share the same normalized half densities.
-function _sd_prior_tau_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
-        d::VaryingDraws, tau::Symbol)
-    shapes = _sd_prior_shapes(d)
-    if all(s -> s == (:normal, (arg1 = 0.0, arg2 = 1.0)), shapes)
-        _vector_prior_stmts!(stmts, terms, tau, :normal,
-            (arg1 = 0, arg2 = 1), :positive)
-        return nothing
-    end
-    if all(s -> s == shapes[1], shapes)
-        fam, args = shapes[1]
-        _vector_prior_stmts!(stmts, terms, tau, fam, args, fam === :exponential ? nothing : :positive)
-        return nothing
-    end
-    node = Symbol(:_ppl_prior_, tau)
-    cells = Any[]
-    for k in eachindex(shapes)
-        fam, args = shapes[k]
-        cell = _family_logpdf_expr(fam, Any[values(args)...], Expr(:ref, tau, k))
-        push!(cells, fam === :exponential ? cell : :($cell + log(2)))
-    end
-    push!(stmts, :($node::Float64 = $(foldl((a, c) -> :($a + $c), cells))))
-    push!(terms, node)
-    return nothing
 end
 
 # One plate over a latent vector parameter,
@@ -3916,13 +3500,9 @@ end
 
 function _log_jacobian_statement(plan::StructuralPlan, layout::LayoutTable)
     terms = Any[]
-    _each_layout_unit(plan, layout) do unit
-        if unit isa LayoutEntry
-            t = jacobian_term(unit)
-            t === nothing || push!(terms, t)
-        else
-            append!(terms, _stratified_logjac_terms(unit, layout))
-        end
+    for e in layout.entries
+        t = jacobian_term(e)
+        t === nothing || push!(terms, t)
     end
     jac = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
     return :(log_jacobian::Float64 = $jac)

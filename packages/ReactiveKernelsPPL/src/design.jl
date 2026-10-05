@@ -105,14 +105,6 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         labels = Symbol[Symbol(string(col) * "_" * string(level)) for level in m.values]
         return DesignBlock(FactorTerm, col, t.addressee, length(labels), labels,
             collect(m.values))
-    elseif t.kind === VaryingEffectTerm
-        # A varying effect is a direct `r` expression over the group
-        # index and the draws block's draws (SB's
-        # `r_<target>_<suffix>` summand) — no design-matrix width.
-        # `column` carries the grouping column (the encoder input); the
-        # generator reads the TERMS for the draws label.
-        return DesignBlock(VaryingEffectTerm, only(t.columns), t.addressee,
-            0, Symbol[], [])
     elseif t.kind === MatrixTerm
         # A matrix term splices `X * view(coef, ...)` over its design
         # matrix: width K with per-element labels matching the affine

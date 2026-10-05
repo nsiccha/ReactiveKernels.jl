@@ -175,7 +175,6 @@ unscaled when its `coef` is `nothing` (`mu = a .+ x`).
     OffsetTerm
     LatentTerm
     ScanSummandTerm
-    VaryingEffectTerm
     MatrixTerm
     ComposedTerm
 end
@@ -636,158 +635,6 @@ PlateParameter(name::ParamName, family::Symbol, args::NamedTuple,
     range::Union{Nothing,UnitRange{Int},Symbol,Expr}) =
     PlateParameter(name, family, args, support_override, range, name)
 
-"""
-    VaryingZRecipe(kind, column, level)
-
-One varying-effect design (Z) column recipe: structure only, never a
-materialized vector pre-codegen. `kind` is `:ones` (intercept — `column`
-is `:none`, `level` is `nothing`), `:column` (continuous raw column),
-or `:dummy` (indicator over `column`: `level` is the level VALUE for
-`Int`, exact match for `AbstractString`). The thin layer performs NO
-coding inference — treatment/cell-means decisions arrive as explicit
-`dummy` recipes from the emitter.
-"""
-struct VaryingZRecipe
-    kind::Symbol
-    column::Symbol
-    level::Union{Nothing,Int,AbstractString}
-end
-
-"""
-    VaryingMargin(coefficient, z)
-
-One varying-effect margin in draws order: `coefficient` is the margin
-address (`:Intercept`, a column, or a dummy label), `z` is the
-[`VaryingZRecipe`](@ref) for its Z column. Margins live on the shared
-draws; per-target column ranges live on [`VaryingSlice`](@ref).
-"""
-struct VaryingMargin
-    coefficient::Symbol
-    z::VaryingZRecipe
-end
-
-"""
-    VaryingSdPrior(family, param)
-
-One margin's normalized positive-scale prior. `:std_normal` is HalfNormal(1),
-`:normal` is HalfNormal(param), `:cauchy` is HalfCauchy(param), and
-`:exponential` is Exponential(param) in the Distributions scale convention.
-An empty sd_priors vector gives the HalfNormal(1) default for every margin.
-"""
-struct VaryingSdPrior
-    family::Symbol
-    param::Float64
-end
-
-VaryingSdPrior(family::Symbol, param::Real) =
-    VaryingSdPrior(family, Float64(param))
-
-const _SD_PRIOR_FAMILIES = (:std_normal, :exponential, :normal, :cauchy)
-
-"""
-    VaryingMultiMembership(groups, weights, normalize)
-
-Multi-membership grouping metadata for a [`VaryingDraws`](@ref) block
-(SB `mm(...)` mirror): `groups` is the ≥2 membership columns (raw
-data — one shared draws block over their UNION levels), `weights` is
-`nothing` (equal `1/M` weights) or one raw numeric column per group,
-`normalize` row-normalizes supplied weights to sum to one (SB
-`_brm_prepare_mm`). `nothing` on the draws = plain single-column
-grouping.
-"""
-struct VaryingMultiMembership
-    groups::Vector{Symbol}
-    weights::Union{Nothing,Vector{Symbol}}
-    normalize::Bool
-end
-
-"""
-    VaryingStrata(by, levels)
-
-Stratified-grouping metadata for a [`VaryingDraws`](@ref) block (SB
-`gr(g, by=b)` mirror): `by` is the raw stratum column, `levels` the
-strata levels in numbering order (`nothing` pre-bind —
-[`bind_data`](@ref) fills sort-ordered observed levels). `nothing` on
-the draws = unstratified.
-"""
-struct VaryingStrata
-    by::Symbol
-    levels::Union{Nothing,Vector}
-end
-
-"""
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix[, levels[, sd_priors[, mm[, strata]]]])
-
-One shared varying-effect draws block over
-`K = length(margins)` margins in `G` groups of raw column `group`.
-`kind` is `:correlated` (non-centered LKJ + tau + z_flat).
-There is one geometry for every K and every margin: a single
-margin, intercept or slope, is the 1x1 case, whose LKJ factor is the
-fixed `[1]` (zero coordinates, a `0.0` prior node), so its sd is the
-same half-normal `tau` (`tau ~ Normal(0, 1)` on `tau > 0` plus the
-`exp`-layout Jacobian) as every margin of a larger block. K = 1 draws
-carry `lkj_eta == 1.0`: no other eta parameterizes anything there.
-(StanBlocks-BRMI samples a K=1 intercept's sd in log space — a
-LogNormal(0, 1) sd. That asymmetry depended on whether `eta` was
-written, so it is not mirrored.) `label` is the link identity
-(`:draws_<suffix>`); `suffix` is the in-graph naming stem (the group,
-or `group_binding` when two draws share a grouping). `levels` is the
-grouping's DECLARED levels in numbering order (`nothing` pre-bind, or
-when the emitter has no declaration — [`bind_data`](@ref) fills
-sort-ordered observed levels). `sd_priors` is the per-margin `tau`
-prior ([`VaryingSdPrior`](@ref); empty — the default — is all
-`:std_normal`), at any K. `mm` is
-[`VaryingMultiMembership`](@ref) metadata (`nothing` = plain
-grouping; `group` is then the mm naming symbol, not a data column).
-`strata` is [`VaryingStrata`](@ref) metadata (`nothing` =
-unstratified). Shared draws are consumed by value flow: each
-[`VaryingSlice`](@ref) names this draws' label plus explicit columns
-— never by label matching across statements.
-"""
-struct VaryingDraws
-    group::ColumnRef
-    kind::Symbol
-    margins::Vector{VaryingMargin}
-    lkj_eta::Float64
-    label::Symbol
-    suffix::String
-    levels::Union{Nothing,Vector}
-    sd_priors::Vector{VaryingSdPrior}
-    mm::Union{Nothing,VaryingMultiMembership}
-    strata::Union{Nothing,VaryingStrata}
-end
-
-# Pre-mm/strata 6/7/8-arg positional construction keeps working with
-# `mm`/`strata` unset (plain single-column grouping).
-VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
-    lkj_eta::Float64, label::Symbol, suffix::String) =
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, nothing,
-        VaryingSdPrior[], nothing, nothing)
-VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
-    lkj_eta::Float64, label::Symbol, suffix::String,
-    levels::Union{Nothing,Vector}) =
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, levels,
-        VaryingSdPrior[], nothing, nothing)
-VaryingDraws(group::ColumnRef, kind::Symbol, margins::Vector{VaryingMargin},
-    lkj_eta::Float64, label::Symbol, suffix::String,
-    levels::Union{Nothing,Vector}, sd_priors::Vector{VaryingSdPrior}) =
-    VaryingDraws(group, kind, margins, lkj_eta, label, suffix, levels,
-        sd_priors, nothing, nothing)
-
-"""
-    VaryingSlice(draws, columns, target)
-
-One target application of a [`VaryingDraws`](@ref) block: `draws` names
-the draws label, `columns` selects its explicit column range, `target`
-is the predictor the contribution feeds. One slice per (draws, target);
-a draws block's slices partition `1:K` exactly once, in any slice
-order (columns are explicit, never positional by body order).
-"""
-struct VaryingSlice
-    draws::Symbol
-    columns::UnitRange{Int}
-    target::Symbol
-end
 
 """
     VectorParameter(name, family, args, size[, label])
@@ -1087,8 +934,7 @@ name table (duplicates rejected). N≥1 independent responses; shared
 predictor Symbols allowed. `levelmaps` sizes every factor term
 (binder-evaluated values); `plate_parameters` carries per-cell latents,
 `vector_parameters` leveled-response latents (cutpoints/thresholds/simplexes),
-`scans` sequential-recurrence latents, `varying_draws`/`varying_slices`
-the temporary varying-effect compatibility blocks and applications, and
+`scans` sequential-recurrence latents, and
 `matrices` user-bound design matrices referenced by [`MatrixTerm`](@ref)s
 (empty for a plain population-GLM plan). `array_parameters` are the
 declared array-valued parameters ([`ArrayParameter`](@ref)) the model reads
@@ -1108,8 +954,6 @@ struct StructuralPlan
     levelmaps::Vector{LevelMap}
     plate_parameters::Vector{PlateParameter}
     scans::Vector{ScanSpec}
-    varying_draws::Vector{VaryingDraws}
-    varying_slices::Vector{VaryingSlice}
     vector_parameters::Vector{VectorParameter}
     matrices::Vector{DesignMatrix}
     array_parameters::Vector{ArrayParameter}
@@ -1122,38 +966,38 @@ end
 # The former full constructor has no external observations.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, varying_draws, varying_slices, vector_parameters,
+    scans, vector_parameters,
     matrices,
     array_parameters, submodel_scopes,
     conditioned, indexed_observations) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, varying_draws, varying_slices, vector_parameters,
+        scans, vector_parameters,
         matrices,
         array_parameters, submodel_scopes,
         conditioned, indexed_observations, SampledParameter[])
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, varying_draws, varying_slices, vector_parameters,
+    scans, vector_parameters,
     matrices,
     array_parameters, submodel_scopes,
     conditioned) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, varying_draws, varying_slices, vector_parameters,
+        scans, vector_parameters,
         matrices,
         array_parameters, submodel_scopes,
         conditioned, Set{Symbol}())
 
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, varying_draws, varying_slices, vector_parameters,
+    scans, vector_parameters,
     matrices,
     array_parameters, submodel_scopes) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-        scans, varying_draws, varying_slices, vector_parameters,
+        scans, vector_parameters,
         matrices,
         array_parameters, submodel_scopes,
         Set{Symbol}())
@@ -1161,11 +1005,11 @@ StructuralPlan(responses, predictors, population_priors, parameters,
 # Existing full-positional plans have no lexical submodel metadata.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, varying_draws, varying_slices, vector_parameters,
+    scans, vector_parameters,
     matrices, array_parameters) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, varying_draws, varying_slices,
+        plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, SubmodelScope[])
 
@@ -1173,16 +1017,16 @@ StructuralPlan(responses, predictors, population_priors, parameters,
 # `array_parameters` existed keep working with none.
 StructuralPlan(responses, predictors, population_priors, parameters,
     assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
-    scans, varying_draws, varying_slices, vector_parameters,
+    scans, vector_parameters,
     matrices) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, columns, n_obs, roles, levelmaps,
-        plate_parameters, scans, varying_draws, varying_slices,
+        plate_parameters, scans,
         vector_parameters, matrices,
         ArrayParameter[])
 
 # Pre-extension full-positional constructor (9-arg): callers that built a plan
-# before `levelmaps`/`scans`/`varying_draws`/`vector_parameters`
+# before `levelmaps`/`scans`/`vector_parameters`
 # nodes existed keep working with all empty.
 StructuralPlan(
     responses::Vector{LikelihoodSpec},
@@ -1196,7 +1040,7 @@ StructuralPlan(
     roles::Dict{Symbol,Symbol}) =
     StructuralPlan(responses, predictors, population_priors, parameters,
         assignments, derived, _checked_columns(columns), n_obs, roles,
-        LevelMap[], PlateParameter[], ScanSpec[], VaryingDraws[], VaryingSlice[],
+        LevelMap[], PlateParameter[], ScanSpec[],
         VectorParameter[],
         DesignMatrix[])
 
@@ -1221,8 +1065,6 @@ function StructuralPlan(
         levelmaps::Vector{LevelMap} = LevelMap[],
         plate_parameters::Vector{PlateParameter} = PlateParameter[],
         scans::Vector{ScanSpec} = ScanSpec[],
-        varying_draws::Vector{VaryingDraws} = VaryingDraws[],
-        varying_slices::Vector{VaryingSlice} = VaryingSlice[],
         vector_parameters::Vector{VectorParameter} = VectorParameter[],
         matrices::Vector{DesignMatrix} = DesignMatrix[],
         array_parameters::Vector{ArrayParameter} = ArrayParameter[],
@@ -1232,8 +1074,7 @@ function StructuralPlan(
         external_observations::Vector{SampledParameter} = SampledParameter[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
-        roles, levelmaps, plate_parameters, scans, varying_draws,
-        varying_slices,
+        roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations, external_observations)
 end
@@ -1369,13 +1210,12 @@ half at a literal-zero location renormalizes by exactly `+log(2)`."""
 const SYMMETRIC_SAMPLED_FAMILIES =
     (:normal, :cauchy, :student_t, :laplace, :logistic)
 
-"""Admitted emitter-side term names, including temporary varying compatibility."""
+"""Admitted emitter-side term names."""
 const TERM_NAMES = Dict{Symbol,TermKind}(
     :intercept => InterceptTerm,
     :continuous => ContinuousTerm,
     :factor => FactorTerm,
     :offset => OffsetTerm,
-    :varying_effect => VaryingEffectTerm,
     :scan_summand => ScanSummandTerm,
     :matrix => MatrixTerm,
     :composed => ComposedTerm,
@@ -1427,7 +1267,6 @@ admitted_families() = (GaussianFam, BernoulliLogitFam, PoissonLogFam,
 
 """Term kinds the thin layer can lower (ext handshake predicate)."""
 admitted_terms() = (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm,
-    VaryingEffectTerm,
     ScanSummandTerm, MatrixTerm,
     ComposedTerm)
 
@@ -1491,7 +1330,6 @@ function validate_structure(plan::StructuralPlan)
     _validate_levelmaps(plan)
     _validate_priors(plan)
     _validate_responses(plan)
-    _validate_varying_draws(plan)
     return nothing
 end
 
@@ -1511,304 +1349,6 @@ function validate_data(plan::StructuralPlan)
     _validate_plate_parameters_data(plan)
     for s in plan.scans
         _scan_length(plan, s)
-    end
-    _validate_varying_draws_data(plan)
-    return nothing
-end
-
-function _validate_margin(m::VaryingMargin, label::Symbol)
-    z = m.z
-    z.kind in (:ones, :column, :dummy) ||
-        _fail(label, "margin $(m.coefficient): Z recipe kind must be " *
-              ":ones, :column, or :dummy, got $(repr(z.kind))")
-    if z.kind === :ones
-        z.column === :none && z.level === nothing ||
-            _fail(label, "margin $(m.coefficient): :ones recipe carries " *
-                  "no column/level")
-        m.coefficient === :Intercept ||
-            _fail(label, "margin $(m.coefficient): :ones recipe addresses " *
-                  ":Intercept")
-    elseif z.kind === :column
-        z.level === nothing ||
-            _fail(label, "margin $(m.coefficient): :column recipe carries " *
-                  "no level")
-        m.coefficient === z.column ||
-            _fail(label, "margin $(m.coefficient): :column recipe " *
-                  "addresses its column $(z.column)")
-    else
-        z.level !== nothing ||
-            _fail(label, "margin $(m.coefficient): :dummy recipe needs " *
-                  "a level value")
-    end
-    return nothing
-end
-
-# Sampled names, derived purely from the draws suffix: the LKJ
-# Cholesky factor (`L_<s>`, KxK), the marginal-scale vector
-# (`tau_<s>`, K), and the standardized draws (`z_flat_<s>`, K*G
-# column-major). Single source for surface
-# claims, name tables, layout, and the generator. K=1 draws own the
-# same three names (`L` packs zero coords).
-function _varying_corr_names(d::VaryingDraws)
-    s = d.suffix
-    return (Symbol("L_", s), Symbol("tau_", s),
-        Symbol("z_flat_", s))
-end
-
-_is_correlated_kind(kind) = kind === :correlated
-
-# Stratified sampled names, derived from the draws suffix + stratum
-# position: per-stratum LKJ factor (`L_<s>_s<k>`, KxK) and
-# marginal-scale vector (`tau_<s>_s<k>`, K). The standardized draws
-# (`z_flat_<s>`, K*G column-major) are shared — the third of
-# `_varying_corr_names(d)`. Single source for name tables, layout,
-# and the generator.
-function _varying_strata_names(d::VaryingDraws, k::Int)
-    d.strata !== nothing ||
-        _fail(d.label, "draws block is not stratified (per-stratum " *
-              "names need a `gr(g, by=b)` grouping)")
-    s = d.suffix
-    return (Symbol("L_", s, "_s", k), Symbol("tau_", s, "_s", k))
-end
-
-# Sampled names one `:correlated` draws block contributes to the name
-# tables: the shared triple, or — stratified with known strata levels
-# (bound plans) — the per-stratum frames plus the shared `z_flat`.
-# Unbound stratified draws contribute only the shared `z_flat` (the
-# per-stratum names need S, unknown pre-bind — the bound pass checks
-# the real names, so no placeholder can falsely collide).
-function _varying_corr_table_names(d::VaryingDraws)
-    st = d.strata
-    st === nothing && return collect(_varying_corr_names(d))
-    if st.levels === nothing
-        return [_varying_corr_names(d)[3]]
-    end
-    z = _varying_corr_names(d)[3]
-    out = Symbol[z]
-    for k in 1:length(st.levels)
-        append!(out, _varying_strata_names(d, k))
-    end
-    return out
-end
-
-# Draws labels/suffixes, kinds, margins, slices, and effect-term
-# linkage: everything provable without data. A draws block's slice
-# ranges partition 1:K exactly once, in any slice order (columns are
-# explicit); every slice is consumed by exactly one effect term (a
-# dangling slice samples dead parameters).
-function _validate_varying_draws(plan::StructuralPlan)
-    draws = plan.varying_draws
-    slices = plan.varying_slices
-    labels = [d.label for d in draws]
-    length(unique(labels)) == length(labels) ||
-        _fail(:plan, "duplicate varying draws labels (one label per draws block)")
-    suffixes = [d.suffix for d in draws]
-    length(unique(suffixes)) == length(suffixes) ||
-        _fail(:plan, "duplicate varying draws suffixes (in-graph names " *
-              "derive from the suffix)")
-    prednames = Set{Symbol}(p.name for p in plan.predictors)
-    bylabel = Dict{Symbol,VaryingDraws}(d.label => d for d in draws)
-    for d in draws
-        _validate_draws_shape(d, prednames, slices)
-    end
-    for s in slices
-        haskey(bylabel, s.draws) ||
-            _fail(:plan, "varying slice for $(s.target) names unknown " *
-                  "draws $(s.draws)")
-        s.target in prednames ||
-            _fail(bylabel[s.draws].label, "varying slice names unknown " *
-                  "predictor $(s.target)")
-    end
-    # Slice ranges partition 1:K exactly once per draws (sorted: slice
-    # order is free, columns are explicit), one slice per
-    # (draws, target), and no range is empty. mm draws feed exactly
-    # one target (SB rejects `mm(...)` with a shared `|ID|` — defense
-    # in depth against emitter bugs; stratified multi-slice stays
-    # legal for `|ID|+gr`, which SB supports).
-    for d in draws
-        K = length(d.margins)
-        own = [s for s in slices if s.draws === d.label]
-        if d.mm !== nothing
-            length(own) <= 1 ||
-                _fail(d.label, "multi-membership draws feed " *
-                      "$(length(own)) targets (SB rejects `mm(...)` with " *
-                      "a shared `|ID|` — one slice per mm draws block)")
-        end
-        targets = [s.target for s in own]
-        length(unique(targets)) == length(targets) ||
-            _fail(d.label, "draws lists a target twice (one slice per " *
-                  "(draws, target))")
-        for s in own
-            r = s.columns
-            first(r) <= last(r) ||
-                _fail(d.label, "slice for $(s.target) is empty (each " *
-                      "slice carries at least one margin)")
-            (first(r) >= 1 && last(r) <= K) ||
-                _fail(d.label, "slice for $(s.target) selects $r outside " *
-                      "1:$K")
-        end
-        lo = 1
-        for s in sort!(own; by = s -> first(s.columns))
-            first(s.columns) == lo ||
-                _fail(d.label, "slice for $(s.target) starts at " *
-                      "$(first(s.columns)), want $lo (slices partition " *
-                      "1:$K exactly once)")
-            lo = last(s.columns) + 1
-        end
-        lo - 1 == K ||
-            _fail(d.label, "slices cover $(lo - 1) margins but the draws " *
-                  "block carries $K")
-    end
-    # Effect-term linkage, jointly over predictors + draws + slices.
-    for pred in plan.predictors
-        for t in pred.terms
-            t.kind === VaryingEffectTerm || continue
-            o = t.options
-            haskey(bylabel, o.draws) ||
-                _fail(t.label, "effect term in predictor $(pred.name) " *
-                      "references unknown draws $(o.draws)")
-            any(s -> s.draws === o.draws && s.target === pred.name,
-                slices) ||
-                _fail(t.label, "draws $(o.draws) carries no slice for " *
-                      "predictor $(pred.name)")
-        end
-    end
-    used = Set{Tuple{Symbol,Symbol}}()
-    for pred in plan.predictors
-        for t in pred.terms
-            t.kind === VaryingEffectTerm || continue
-            key = (t.options.draws, pred.name)
-            key in used &&
-                _fail(t.label, "duplicate effect term for draws " *
-                      "$(key[1]) in predictor $(pred.name) (one term per " *
-                      "draws per predictor)")
-            push!(used, key)
-        end
-    end
-    for s in slices
-        (s.draws, s.target) in used ||
-            _fail(bylabel[s.draws].label, "draws $(s.draws) slice for " *
-                  "predictor $(s.target) is never consumed (dangling " *
-                  "slice samples dead parameters — use it or drop it)")
-    end
-    return nothing
-end
-
-function _validate_draws_shape(d::VaryingDraws, prednames::Set{Symbol},
-        slices::Vector{VaryingSlice})
-    _is_correlated_kind(d.kind) ||
-        _fail(d.label, "draws kind must be :correlated " *
-              "(one geometry for every K — a single " *
-              "margin is the 1x1 case), got $(repr(d.kind))")
-    K = length(d.margins)
-    K >= 1 || _fail(d.label, "draws block has zero margins")
-    for m in d.margins
-        _validate_margin(m, d.label)
-    end
-    for s in slices
-        s.draws === d.label || continue
-        s.target in prednames ||
-            _fail(d.label, "draws slice for unknown predictor $(s.target)")
-    end
-    isfinite(d.lkj_eta) && d.lkj_eta > 0 ||
-        _fail(d.label, "draws need a positive LKJ eta, got $(d.lkj_eta)")
-    K == 1 && d.lkj_eta != 1.0 &&
-        _fail(d.label, "K=1 draws carry LKJ eta 1.0 (the 1x1 factor is " *
-              "the fixed `[1]`, so no other eta parameterizes anything), " *
-              "got $(d.lkj_eta)")
-    _validate_sd_priors(d, K)
-    _validate_draws_grouping(d, K)
-    _validate_varying_levels_shape(d)
-    return nothing
-end
-
-# Multi-membership / stratified grouping shape (provable without
-# data). Both are `:correlated` with eta exactly 1.0 (SB hardcodes
-# `lkj_corr_cholesky(1.)` on both paths). Neither path has an SB
-# generic-prior sibling, so both reject non-default `sd_priors`; SB
-# has no mm × stratified shape.
-function _validate_draws_grouping(d::VaryingDraws, K::Int)
-    mm = d.mm
-    st = d.strata
-    mm === nothing && st === nothing && return nothing
-    mm !== nothing && st !== nothing &&
-        _fail(d.label, "draws block is both multi-membership and " *
-              "stratified (SB has no `mm(...)` × `gr(g, by=b)` shape — " *
-              "pick one)")
-    if mm !== nothing
-        M = length(mm.groups)
-        M >= 2 ||
-            _fail(d.label, "multi-membership draws need at least two " *
-                  "grouping columns, got $M")
-        # Repeated groups/weights are degenerate but well-defined
-        # (slots are positional) and SB accepts them — no check.
-        if mm.weights !== nothing
-            W = length(mm.weights)
-            W == M ||
-                _fail(d.label, "multi-membership draws list $W weight " *
-                      "columns for $M groups (one per group, or omit all)")
-        end
-        d.lkj_eta == 1.0 ||
-            _fail(d.label, "multi-membership draws need eta 1.0 (SB " *
-                  "hardcodes `lkj_corr_cholesky(1.)`), got $(d.lkj_eta)")
-        isempty(d.sd_priors) ||
-            _fail(d.label, "multi-membership draws take no sd priors " *
-                  "(SB has no generic-prior mm sibling)")
-    end
-    if st !== nothing
-        d.lkj_eta == 1.0 ||
-            _fail(d.label, "stratified draws need eta 1.0 (SB hardcodes " *
-                  "`lkj_corr_cholesky(1.)`), got $(d.lkj_eta)")
-        isempty(d.sd_priors) ||
-            _fail(d.label, "stratified draws take no sd priors (SB " *
-                  "supports no configured priors on `gr(g, by=b)` blocks)")
-        st.by !== d.group ||
-            _fail(d.label, "stratified draws need distinct group and " *
-                  "stratum columns, got `gr($(d.group), by=$(d.group))`")
-    end
-    return nothing
-end
-
-# Per-margin `tau` priors: empty (the default) is all-`:std_normal`,
-# otherwise one entry per margin in margin order. `:exponential` takes
-# a finite positive SCALE, `:normal` a finite positive sd;
-# `:std_normal` ignores its param (finite, conventionally 1.0). Every
-# K takes them (one geometry for every K).
-function _validate_sd_priors(d::VaryingDraws, K::Int)
-    sds = d.sd_priors
-    (isempty(sds) || length(sds) == K) ||
-        _fail(d.label, "draws list $(length(sds)) sd priors for $K " *
-              "margins (empty for all-default, else exactly one per margin)")
-    for (j, p) in enumerate(sds)
-        p.family in _SD_PRIOR_FAMILIES ||
-            _fail(d.label, "margin $j sd prior family must be one of " *
-                  "$(_SD_PRIOR_FAMILIES), got $(repr(p.family))")
-        isfinite(p.param) ||
-            _fail(d.label, "margin $j sd prior param is not finite " *
-                  "(got $(p.param))")
-        p.family === :std_normal || p.param > 0 ||
-            _fail(d.label, "margin $j sd prior needs a positive " *
-                  "param, got $(p.param)")
-    end
-    return nothing
-end
-
-# Declared-levels checks provable without data (coverage needs the bound
-# column — `_validate_varying_draws_data`). Emitter-provided levels must
-# be non-empty, duplicate-free, and literal-embeddable (the admission
-# mirrors `_level_literal` in preprocessing.jl — the generator embeds
-# these values into the `_declared_codes` call).
-function _validate_varying_levels_shape(d::VaryingDraws)
-    d.levels === nothing && return nothing
-    !isempty(d.levels) ||
-        _fail(d.label, "draws block declares zero grouping levels")
-    length(unique(d.levels)) == length(d.levels) ||
-        _fail(d.label, "draws block declares duplicate grouping levels " *
-              "($(repr(d.levels)))")
-    for lv in d.levels
-        lv isa Union{Number,String,Bool,Char,Symbol} ||
-            _fail(d.label, "declared level $(repr(lv)) is not " *
-                  "literal-embeddable (numeric/string/symbol only)")
     end
     return nothing
 end
@@ -1856,295 +1396,6 @@ function _validate_plate_parameters_data(plan::StructuralPlan)
         end
     end
     return nothing
-end
-
-function _validate_margin_data(m::VaryingMargin, label::Symbol,
-        plan::StructuralPlan)
-    z = m.z
-    z.kind === :ones && return nothing
-    haskey(plan.columns, z.column) || _is_derived(plan, z.column) ||
-        _fail(label, "margin $(m.coefficient): Z column $(z.column) is " *
-              "not bound")
-    if z.kind === :column
-        _is_derived(plan, z.column) && return nothing
-        zcol = _vector_column(plan.columns, z.column, label, "Z column")
-        eltype(zcol) <: Real ||
-            _fail(label, "margin $(m.coefficient): Z column $(z.column) " *
-                  "must be numeric (a categorical slope needs explicit " *
-                  "`dummy($(z.column), k)` recipes)")
-    else
-        _is_derived(plan, z.column) &&
-            _fail(label, "margin $(m.coefficient): :dummy needs a raw " *
-                  "column (level membership needs bound values)")
-        zcol = _vector_column(plan.columns, z.column, label, "grouping column")
-        z.level in _grouping_levels(zcol) ||
-            _fail(label, "margin $(m.coefficient): dummy level " *
-                  "$(repr(z.level)) is not a level of $(z.column)")
-    end
-    return nothing
-end
-
-# Grouping columns are raw (level knowledge needs values), Z continuous
-# columns mirror the population rule (raw numeric or derived, whose eltype
-# is unknown statically), and dummy levels must be members of the column's
-# grouping levels (Int value / string exact match).
-function _validate_varying_draws_data(plan::StructuralPlan)
-    for d in plan.varying_draws
-        if d.mm !== nothing
-            _validate_mm_draws_data(d, plan)
-        else
-            haskey(plan.columns, d.group) ||
-                _fail(d.label, "grouping column $(d.group) is not bound")
-            _is_derived(plan, d.group) &&
-                _fail(d.label, "grouping column $(d.group) must be raw data " *
-                      "(level knowledge needs bound values)")
-            d.levels === nothing &&
-                _fail(d.label, "draws block has no declared grouping levels " *
-                      "(bind_data fills these — hand-built bound plans must too)")
-            # Coverage: every observed value needs a declared code (an
-            # uncovered value would encode 0 and gather out of bounds).
-            levels = d.levels::Vector
-            groupcol = _vector_column(plan.columns, d.group, d.label,
-                "grouping column")
-            for v in groupcol
-                v in levels ||
-                    _fail(d.label, "grouping value $(repr(v)) of $(d.group) " *
-                          "is not a declared level (declared: $(repr(levels)))")
-            end
-        end
-        if d.strata !== nothing
-            _validate_strata_draws_data(d, plan)
-        end
-        for m in d.margins
-            _validate_margin_data(m, d.label, plan)
-        end
-    end
-    # One grouping, one numbering: same-group draws share the per-group
-    # `_ppl_gidx_` encoder, so their declared levels must agree exactly
-    # (order included — codes are positions). mm draws carry per-suffix
-    # encoders (never shared), so they sit out the agreement.
-    for i in eachindex(plan.varying_draws)
-        for j in (i + 1):length(plan.varying_draws)
-            di, dj = plan.varying_draws[i], plan.varying_draws[j]
-            di.group === dj.group || continue
-            di.mm === nothing && dj.mm === nothing || continue
-            di.levels == dj.levels ||
-                _fail(:plan, "draws $(di.label) and $(dj.label) share " *
-                      "grouping $(di.group) but declare different levels " *
-                      "($(repr(di.levels)) vs $(repr(dj.levels)))")
-        end
-    end
-    return nothing
-end
-
-# Multi-membership data checks (SB `_brm_prepare_mm` mirror): every
-# membership column bound, raw, n_obs-long, and covered by the UNION
-# levels; every weight column bound, vector, real non-Bool, finite,
-# nonnegative, n_obs-long, with a positive finite row total (SB
-# validates totals whenever weights are supplied, normalized or not).
-function _validate_mm_draws_data(d::VaryingDraws, plan::StructuralPlan)
-    mm = d.mm::VaryingMultiMembership
-    M = length(mm.groups)
-    d.levels === nothing &&
-        _fail(d.label, "draws block has no declared grouping levels " *
-              "(bind_data fills the union — hand-built bound plans must too)")
-    levels = d.levels::Vector
-    n_obs = _value_rows(plan, first(mm.groups))
-    for (mi, gcol) in enumerate(mm.groups)
-        haskey(plan.columns, gcol) ||
-            _fail(d.label, "membership column $gcol (slot $mi of $M) " *
-                  "is not bound")
-        _is_derived(plan, gcol) &&
-            _fail(d.label, "membership column $gcol must be raw data " *
-                  "(level knowledge needs bound values)")
-        col = _vector_column(plan.columns, gcol, d.label, "membership column")
-        length(col) == n_obs ||
-            _fail(d.label, "membership column $gcol has $(length(col)) " *
-                  "rows; expected $n_obs")
-        for v in col
-            v in levels ||
-                _fail(d.label, "grouping value $(repr(v)) of $gcol " *
-                      "is not a declared union level (declared: " *
-                      "$(repr(levels)))")
-        end
-    end
-    mm.weights === nothing && return nothing
-    for (mi, wcol) in enumerate(mm.weights)
-        haskey(plan.columns, wcol) ||
-            _fail(d.label, "weight column $wcol (slot $mi of $M) " *
-                  "is not bound")
-        w = _vector_column(plan.columns, wcol, d.label, "weight column")
-        eltype(w) <: Real && !(eltype(w) <: Bool) ||
-            _fail(d.label, "weight column $wcol must be real-valued, got " *
-                  "eltype $(eltype(w))")
-        length(w) == n_obs ||
-            _fail(d.label, "weight column $wcol has $(length(w)) rows; " *
-                  "expected $n_obs")
-        for (i, v) in enumerate(w)
-            isfinite(v) ||
-                _fail(d.label, "weight column $wcol at row $i must be " *
-                      "finite, got $(repr(v))")
-            v >= 0 ||
-                _fail(d.label, "weight column $wcol at row $i must be " *
-                      "nonnegative, got $(repr(v))")
-        end
-    end
-    wcols = [plan.columns[w] for w in mm.weights]
-    for i in 1:n_obs
-        total = sum(Float64(w[i]) for w in wcols)
-        isfinite(total) ||
-            _fail(d.label, "weights have a non-finite total at row $i")
-        total > 0 ||
-            _fail(d.label, "weights must have a positive total at row $i")
-    end
-    return nothing
-end
-
-# Stratified data checks: the `by` column bound, raw, n_obs-long, and
-# covered by the strata levels; every group level sits in exactly one
-# stratum (SB `_brm_group_strata` — a straddling group is loud).
-function _validate_strata_draws_data(d::VaryingDraws, plan::StructuralPlan)
-    st = d.strata::VaryingStrata
-    haskey(plan.columns, st.by) ||
-        _fail(d.label, "stratum column $(st.by) is not bound")
-    _is_derived(plan, st.by) &&
-        _fail(d.label, "stratum column $(st.by) must be raw data " *
-              "(level knowledge needs bound values)")
-    st.levels === nothing &&
-        _fail(d.label, "draws block has no declared strata levels " *
-              "(bind_data fills these — hand-built bound plans must too)")
-    slevels = st.levels::Vector
-    bycol = _vector_column(plan.columns, st.by, d.label, "stratum column")
-    n = _value_rows(plan, d.group)
-    length(bycol) == n ||
-        _fail(d.label, "stratum column $(st.by) has $(length(bycol)) " *
-              "rows; expected $n")
-    for v in bycol
-        v in slevels ||
-            _fail(d.label, "stratum value $(repr(v)) of $(st.by) " *
-                  "is not a declared stratum (declared: $(repr(slevels)))")
-    end
-    gcol = _vector_column(plan.columns, d.group, d.label, "grouping column")
-    smap = Dict{Any,Any}()
-    for (g, b) in zip(gcol, bycol)
-        if haskey(smap, g)
-            smap[g] == b ||
-                _fail(d.label, "gr($(d.group), by=$(st.by)): group level " *
-                      "$(repr(g)) straddles multiple strata " *
-                      "($(repr(smap[g])) vs $(repr(b)))")
-        else
-            smap[g] = b
-        end
-    end
-    return nothing
-end
-
-# Group count for a draws block: the DECLARED level count (unobserved
-# declared levels keep prior-only coefficients). Loud defense in
-# depth — validate_data proves levels non-nothing on every bound plan.
-function _draws_nlevels(d::VaryingDraws)
-    d.levels === nothing && throw(ContractValidationError(
-        "[layout] draws $(d.label) has no declared grouping levels " *
-        "(bind_data fills these — hand-built bound plans must too)"))
-    return length(d.levels)
-end
-
-# Stratum count for a stratified draws block: the DECLARED strata
-# level count. Loud defense in depth — validate_data proves strata
-# levels non-nothing on every bound stratified plan.
-function _strata_nlevels(d::VaryingDraws)
-    st = d.strata
-    st === nothing && throw(ContractValidationError(
-        "[layout] draws $(d.label) is not stratified (stratum count " *
-        "needs a `gr(g, by=b)` grouping)"))
-    st.levels === nothing && throw(ContractValidationError(
-        "[layout] draws $(d.label) has no declared strata levels " *
-        "(bind_data fills these — hand-built bound plans must too)"))
-    return length(st.levels)
-end
-
-# Binder evaluation for draws levels (the LevelMap precedent):
-# `nothing` fills sort-ordered observed levels; emitter-provided levels
-# pass through (validated by `_validate_varying_levels_shape` +
-# `_validate_varying_draws_data`). mm draws fit the UNION across
-# membership columns (SB `_brm_mm_fit_levels`); stratified draws also
-# fill strata levels from the `by` column.
-function _eval_draws_levels(draws::Vector{VaryingDraws},
-        columns::AbstractDict{Symbol})
-    out = VaryingDraws[]
-    for d in draws
-        if d.mm !== nothing
-            push!(out, _bind_mm_draws(d, columns))
-            continue
-        end
-        if d.levels !== nothing
-            push!(out, _maybe_fill_strata(d, columns))
-            continue
-        end
-        haskey(columns, d.group) ||
-            _fail(d.label, "grouping column $(d.group) is not bound")
-        groupcol = _vector_column(columns, d.group, d.label, "grouping column")
-        levels =
-            try
-                _grouping_levels(groupcol)
-            catch err
-                _fail(d.label, "grouping column $(d.group) levels not " *
-                             "orderable ($err)")
-            end
-        d2 = VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
-            d.label, d.suffix, collect(levels), d.sd_priors, d.mm, d.strata)
-        push!(out, _maybe_fill_strata(d2, columns))
-    end
-    return out
-end
-
-# Union-level fit for one mm draws block (SB `_brm_mm_fit_levels`:
-# pool per-column levels, dedup, sort). Emitter-provided union levels
-# (the categorical escape hatch — same policy as plain groupings)
-# pass through untouched.
-function _bind_mm_draws(d::VaryingDraws, columns::AbstractDict{Symbol})
-    mm = d.mm::VaryingMultiMembership
-    d.levels !== nothing && return _maybe_fill_strata(d, columns)
-    pooled = Any[]
-    for g in mm.groups
-        haskey(columns, g) ||
-            _fail(d.label, "membership column $g is not bound")
-        col = _vector_column(columns, g, d.label, "membership column")
-        append!(pooled, _grouping_levels(col))
-    end
-    unique!(pooled)
-    levels =
-        try
-            sort!(pooled)
-        catch err
-            _fail(d.label, "membership columns have levels that are not " *
-                         "mutually orderable ($err)")
-        end
-    d2 = VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
-        d.label, d.suffix, collect(levels), d.sd_priors, d.mm, d.strata)
-    return _maybe_fill_strata(d2, columns)
-end
-
-# Strata-level fill for one stratified draws block (sort-ordered
-# observed levels of the `by` column — the group-level precedent).
-# Anything unstratified (or already-filled) passes through untouched.
-function _maybe_fill_strata(d::VaryingDraws, columns::AbstractDict{Symbol})
-    st = d.strata
-    st === nothing && return d
-    st.levels !== nothing && return d
-    haskey(columns, st.by) ||
-        _fail(d.label, "stratum column $(st.by) is not bound")
-    bycol = _vector_column(columns, st.by, d.label, "stratum column")
-    slevels =
-        try
-            _grouping_levels(bycol)
-        catch err
-            _fail(d.label, "stratum column $(st.by) levels not " *
-                         "orderable ($err)")
-        end
-    return VaryingDraws(d.group, d.kind, d.margins, d.lkj_eta,
-        d.label, d.suffix, d.levels, d.sd_priors, d.mm,
-        VaryingStrata(st.by, collect(slevels)))
 end
 
 function _response_uses_predictor(r::LikelihoodSpec, pname::Symbol)
@@ -2200,20 +1451,18 @@ New slots must establish the same property before joining this list."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
     :levelmaps, :vector_parameters, :submodel_scopes, :conditioned,
-    :plate_parameters, :scans, :varying_draws, :varying_slices,
+    :plate_parameters, :scans,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
-# join observation axes. A draws application, basis or matrix does carry
-# rows and must expose its inputs through the same dependency walk.
+# join observation axes. A basis or matrix does carry rows and must expose
+# its inputs through the same dependency walk.
 function _observation_nodes(plan::StructuralPlan)
     nodes = Dict{Symbol,Any}()
     for p in plan.predictors
-        draws = [d for sl in plan.varying_slices if sl.target === p.name
-            for d in plan.varying_draws if d.label === sl.draws]
-        nodes[p.name] = (p, draws)
+        nodes[p.name] = p
     end
     for d in plan.derived
         nodes[d.name] = d.expr
@@ -2297,8 +1546,7 @@ function _uses_structured_observation_axes(plan::StructuralPlan)
     any(r -> r.mi_jobs !== nothing, plan.responses) && return true
     !isempty(plan.plate_parameters) && !any(r -> r.range isa Expr, plan.responses) && return true
     return any(f -> !isempty(getfield(plan, f)),
-        (:scans, :varying_draws, :varying_slices,
-         :matrices))
+        (:scans, :matrices))
 end
 
 """Observation axes of a plan whose `columns` are bound: `nothing` when
@@ -2793,8 +2041,6 @@ function _validate_name_tables(plan::StructuralPlan)
     plates = [p.name for p in plan.plate_parameters]
     scanstates = Symbol[st for s in plan.scans for st in s.states]
     vectors = [p.name for p in plan.vector_parameters]
-    vcorr = Symbol[nm for d in plan.varying_draws
-        for nm in _varying_corr_table_names(d)]
     mats = Symbol[m.name for m in plan.matrices]
     length(unique(params)) == length(params) || _fail(:plan, "duplicate parameter names")
     length(unique(assigns)) == length(assigns) ||
@@ -2807,8 +2053,6 @@ function _validate_name_tables(plan::StructuralPlan)
         _fail(:plan, "duplicate scan-state names")
     length(unique(vectors)) == length(vectors) ||
         _fail(:plan, "duplicate vector-parameter names")
-    length(unique(vcorr)) == length(vcorr) ||
-        _fail(:plan, "duplicate correlated varying names")
     length(unique(mats)) == length(mats) ||
         _fail(:plan, "duplicate design-matrix names")
     for (l, r, what) in ((params, assigns, "parameters and assignments"),
@@ -2826,44 +2070,37 @@ function _validate_name_tables(plan::StructuralPlan)
         (vectors, deriveds, "vector parameters and derived columns"),
         (vectors, plates, "vector parameters and plate parameters"),
         (vectors, scanstates, "vector parameters and scan states"),
-        (vcorr, params, "correlated varying names and parameters"),
-        (vcorr, assigns, "correlated varying names and assignments"),
-        (vcorr, deriveds, "correlated varying names and derived columns"),
-        (vcorr, plates, "correlated varying names and plate parameters"),
-        (vcorr, scanstates, "correlated varying names and scan states"),
-        (vcorr, vectors, "correlated varying names and vector parameters"),
         (mats, params, "design-matrix names and parameters"),
         (mats, assigns, "design-matrix names and assignments"),
         (mats, deriveds, "design-matrix names and derived columns"),
         (mats, plates, "design-matrix names and plate parameters"),
         (mats, scanstates, "design-matrix names and scan states"),
-        (mats, vectors, "design-matrix names and vector parameters"),
-        (mats, vcorr, "design-matrix names and correlated varying names"))
+        (mats, vectors, "design-matrix names and vector parameters"))
         overlap = intersect(l, r)
         isempty(overlap) ||
             _fail(:plan, "names in both $what: $(join(overlap, ", "))")
     end
     allnames = union(params, assigns, deriveds, plates, scanstates,
-        vectors, vcorr, mats)
+        vectors, mats)
     arrays = _array_names(plan)
     length(unique(arrays)) == length(arrays) ||
         _fail(:plan, "duplicate array-parameter names")
     overlap = intersect(arrays, allnames)
     isempty(overlap) || _fail(:plan, "names in both array parameters and " *
         "other parameters/assignments/derived/plate/scan/vector/" *
-        "varying/matrix names: $(join(overlap, ", "))")
+        "matrix names: $(join(overlap, ", "))")
     allnames = union(allnames, arrays)
     for pn in pnames
         pn in allnames && _fail(
             :plan,
-            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/varying/matrix name",
+            "predictor $pn collides with a parameter/assignment/derived/plate/scan/vector/matrix name",
         )
         block_name(pn) in allnames && _fail(
             :plan,
-            "parameter/assignment/derived/plate/scan/vector/varying/matrix $(block_name(pn)) collides with predictor $pn block name",
+            "parameter/assignment/derived/plate/scan/vector/matrix $(block_name(pn)) collides with predictor $pn block name",
         )
     end
-    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, vcorr, mats))
+    for n in Iterators.flatten((pnames, params, assigns, deriveds, plates, scanstates, vectors, mats))
         _check_name_hygiene(n)
     end
     return nothing
@@ -4224,10 +3461,6 @@ function _validate_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
             _term_structure_options(t),
             t.addressee, t.label)
     end
-    if t.kind === VaryingEffectTerm
-        _validate_effect_term(t, pred)
-        return nothing
-    end
     if t.kind === ScanSummandTerm
         _validate_scan_term(t, pred, plan)
         return nothing
@@ -4314,29 +3547,6 @@ function _validate_matrix_term(t::TermSpec, pred::PredictorSpec, plan::Structura
     return nothing
 end
 
-# An effect term names its draws by label in `options` (never a lossy
-# suffix parse) and carries exactly the grouping column; its addressee
-# is its own label (self-addressed: effect terms take no
-# PopulationPrior). Draws linkage (existence, slices, dangling) is
-# checked jointly in `_validate_varying_draws`, which sees predictors,
-# draws, and slices together.
-function _validate_effect_term(t::TermSpec, pred::PredictorSpec)
-    o = t.options
-    Tuple(keys(o)) == (:draws,) ||
-        _fail(t.label, "varying effect options must be exactly " *
-              "`(draws,)`, got $(Tuple(keys(o)))")
-    o.draws isa Symbol ||
-        _fail(t.label, "effect draws must be a Symbol, " *
-              "got $(repr(o.draws))")
-    length(t.columns) == 1 ||
-        _fail(t.label, "varying effect columns must be exactly the " *
-              "grouping column, got $(t.columns)")
-    t.addressee === t.label ||
-        _fail(t.label, "varying effect addressee must be its own label " *
-              "(self-addressed, no population prior), got $(t.addressee)")
-    return nothing
-end
-
 function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralPlan)
     o = t.options
     Tuple(keys(o)) == (:scan_id, :coef) ||
@@ -4382,9 +3592,8 @@ _composed_map_fn(f) = f isa GlobalRef || f === :ifelse ||
     f in _COMPOSED_UNARY || f in ELEMENTWISE_FNS
 const _COMPOSED_AFFINE_KINDS =
     (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
-# Sub-predictors are affine plus varying-effect summands (per-level
-# random effects: the IRT person ability `theta ~ 0 + (1 | person)`).
-const _COMPOSED_SUB_KINDS = (_COMPOSED_AFFINE_KINDS..., VaryingEffectTerm)
+# Sub-predictors are affine.
+const _COMPOSED_SUB_KINDS = _COMPOSED_AFFINE_KINDS
 
 """Recurse a composed tree: leaves must be declared subs/scalars/data
 columns (a literal arrives as a named scalar leaf), nodes dotted
@@ -4533,19 +3742,11 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
     # Scan summands name a recurrence + scalar coefficient in `options`, not
     # columns; structure validation checked both names.
     t.kind === ScanSummandTerm && return nothing
-    # Dar summands name a trajectory in `options`, not columns; structure
-    # validation checked the name.
-    # mm effect terms name the mm naming symbol (not a data column);
-    # membership binding is proven by `_validate_mm_draws_data`.
-    if t.kind === VaryingEffectTerm
-        i = findfirst(d -> d.label === t.options.draws, plan.varying_draws)
-        i !== nothing && plan.varying_draws[i].mm !== nothing && return nothing
-    end
     for c in t.columns
         # A per-cell latent enters a design only through a ContinuousTerm
         # (a free coefficient scaling the latent vector — the SB `me`
         # mirror); every other term kind over a latent fails closed.
-        if _is_plate_param(plan, c) && t.kind !== VaryingEffectTerm
+        if _is_plate_param(plan, c)
             t.kind === ContinuousTerm || _fail(t.label,
                 "term over the latent vector $c must be a ContinuousTerm " *
                 "(a free coefficient scaling the latent — got $(t.kind))")
@@ -4559,9 +3760,6 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end
-    # Effect terms name the raw grouping column (strings included — the
-    # encoder maps levels to codes); presence above is the whole check.
-    t.kind === VaryingEffectTerm && return nothing
     # FactorTerm: column presence is checked by the loop above; level
     # coverage is a LevelMap concern (_validate_levelmaps_data).
     if t.kind === ContinuousTerm || t.kind === OffsetTerm
@@ -4832,14 +4030,13 @@ function _validate_priors(plan::StructuralPlan)
                   "finite positive nu, got $(repr(pr.nu))")
     end
     for pred in plan.predictors
-        # Offset, latent, varying compatibility and scan terms carry their
+        # Offset, latent and scan terms carry their
         # own priors. Composed terms read priors from their sub-predictors;
         # matrix terms expand to one addressee per matrix column.
         addressees = Set{Symbol}()
         for t in pred.terms
             _parameter_term(t) && continue
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
-                t.kind === VaryingEffectTerm ||
                 t.kind === ScanSummandTerm ||
                 t.kind === ComposedTerm) && continue
             if t.kind === MatrixTerm
@@ -7489,11 +6686,7 @@ replacing columns + roles): infer column roles, merge explicit `roles` over
 them, and run data validation. Returns a NEW bound plan; the input is
 untouched. Inference precedence: response > trials > evidence > weight >
 group > predictor > data; term columns are the only `:predictor` source, so
-assignment/extra columns stay `:data`. Varying-draws grouping columns
-upgrade to `:group` (grouping dominates predictor use in the label; both
-facts stay visible in terms + draws). Draws blocks with
-`levels === nothing` gain sort-ordered observed levels (SB numbering for
-plain vectors — emitter-declared levels pass through). The retired `dims`
+assignment/extra columns stay `:data`; `:group` is an explicit role. The retired `dims`
 argument accepts only an empty dictionary; array dimensions and plate ranges
 come from authored expressions. Data values are numbers or arrays of any shape; observation
 values follow their authored broadcast axes and structured operations retain
@@ -7558,18 +6751,6 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     for pred in plan.predictors, t in pred.terms, c in t.columns
         haskey(inferred, c) && _upgrade_role!(inferred, c, :predictor)
     end
-    for d in plan.varying_draws
-        haskey(inferred, d.group) && _upgrade_role!(inferred, d.group, :group)
-        if d.mm !== nothing
-            for g in d.mm.groups
-                haskey(inferred, g) && _upgrade_role!(inferred, g, :group)
-            end
-        end
-        if d.strata !== nothing
-            by = d.strata.by
-            haskey(inferred, by) && _upgrade_role!(inferred, by, :group)
-        end
-    end
     for r in plan.responses
         r.weights !== nothing && haskey(inferred, r.weights) &&
             _upgrade_role!(inferred, r.weights, :weight)
@@ -7604,12 +6785,11 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
             union(_mi_managed_columns(plan), computed, inputs)) : axes.total
     end
     maps = _eval_levelmaps(plan.levelmaps, columns)
-    draws = _eval_draws_levels(plan.varying_draws, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
             plan.predictors, _with(plan; columns = columns, n_obs = n))
     bound = _with(plan; responses = responses2, columns = columns,
-        n_obs = n, roles = merged, levelmaps = maps, varying_draws = draws,
+        n_obs = n, roles = merged, levelmaps = maps,
         vector_parameters = vectors2)
     _validate_conditioned_values(bound)
     validate_data(bound)

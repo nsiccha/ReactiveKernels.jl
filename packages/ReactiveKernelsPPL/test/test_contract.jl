@@ -371,7 +371,7 @@ end
         NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
         ZeroInflatedBinomialFam, GammaValueFam, WeibullValueFam, BetaShapeFam)
     @test admitted_terms() == (InterceptTerm, ContinuousTerm, FactorTerm,
-        OffsetTerm, VaryingEffectTerm, ScanSummandTerm, MatrixTerm, ComposedTerm)
+        OffsetTerm, ScanSummandTerm, MatrixTerm, ComposedTerm)
     @test :log in admitted_functions()
     @test :sum in admitted_functions()
     @test :tanh in admitted_functions()

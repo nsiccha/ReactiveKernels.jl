@@ -37,14 +37,11 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     ZeroInflatedBinomialFam
 export LinkFunction, IdentityLink, LogitLink, LogLink, ProbitLink, CloglogLink
 export TermKind, InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, LatentTerm,
-    VaryingEffectTerm,
     ScanSummandTerm, MatrixTerm,
     ComposedTerm
 export ResponseEvidence, LikelihoodSpec, TermSpec, PredictorSpec
 export ScalePredictorRef, MixtureComplementWeights
 export PopulationPrior, SampledParameter, PlateParameter, VectorParameter, AssignmentSpec, VectorAssignmentSpec, ArrayParameter
-export VaryingZRecipe, VaryingMargin, VaryingSdPrior, VaryingDraws, VaryingSlice
-export VaryingMultiMembership, VaryingStrata
 export LevelMap
 export DesignMatrix
 export StructuralPlan, SubmodelScope

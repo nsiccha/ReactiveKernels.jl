@@ -2607,11 +2607,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     seen_doc = false
     line = 0
     args, plate_ctx, plate_params = _expand_plates(ast.args, data)
-    # Defined names for the varying partition-time gate: draws blocks
-    # lower in statement order, before shapes exist, so margins admit
-    # data-or-defined names here (forward references work) and prove
-    # vector shape after lowering (`_validate_varying_margins`). The
-    # scan never throws — the main loop below owns every rejection.
+    # Defined names, collected before lowering so the checks below admit
+    # forward references. The scan never throws — the main loop below owns
+    # every rejection.
     detnames = Set{Symbol}()
     valueaxisnames = Set{Symbol}()
     for arg in args
@@ -8500,7 +8498,7 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             return node
         elseif haskey(ctx.detmap, node)
             return _sfail("$where combines $node, which is neither an " *
-                "affine sub-predictor nor a scalar (latent/scan/varying " *
+                "affine sub-predictor nor a scalar (latent/scan " *
                 "parts stay out of v1 compositions)")
         else
             return _sfail("$where combines $node, which names nothing — " *
@@ -8630,9 +8628,8 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
         if haskey(pred_idx, s)
             pred = predictors[pred_idx[s]]
             all(t -> t.kind in _COMPOSED_SUB_KINDS, pred.terms) || _sfail(
-                "predictor $pname: sub-predictor $s must be affine plus " *
-                "varying effects (no nested compositions, latents, or " *
-                "other summands)")
+                "predictor $pname: sub-predictor $s must be affine " *
+                "(no nested compositions, latents, or other summands)")
             push!(ctx.absorbed, s)
             continue
         end
@@ -8640,9 +8637,8 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
         terms, uses = _analyze_predictor(s, srhs, ctx, lhs;
             composed_sub = true)
         all(t -> t.kind in _COMPOSED_SUB_KINDS, terms) || _sfail(
-            "predictor $pname: sub-predictor $s must be affine plus " *
-            "varying effects (no nested compositions, latents, or " *
-            "other summands)")
+            "predictor $pname: sub-predictor $s must be affine " *
+            "(no nested compositions, latents, or other summands)")
         _record_coefuses!(coefuse, s, uses, lhs)
         push!(predictors, PredictorSpec(s, IdentityLink, terms, s))
         pred_idx[s] = length(predictors)
@@ -9314,10 +9310,9 @@ function _lower_coefficient_priors(sample, coefuse, predictors,
                 end
                 continue
             end
-            # Offsets and latent/varying/scan terms have their own priors;
+            # Offsets and latent/scan terms have their own priors;
             # composed terms read their affine sub-predictors' coefficients.
             (t.kind === OffsetTerm || t.kind === LatentTerm ||
-                t.kind === VaryingEffectTerm ||
                 t.kind === ScanSummandTerm ||
                 t.kind === ComposedTerm) && continue
             if t.kind === MatrixTerm

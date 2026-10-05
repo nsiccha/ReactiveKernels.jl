@@ -12,11 +12,10 @@ The [RK-PPL guide](rkppl.md) describes these general language capabilities.
 
 Model-specific bases, spectral weights, defaults and scientific acceptance
 belong with the BRM implementation. PK-specific models and helpers belong to
-downstream RKPPLBench. Producer compatibility for a still-used historical API
-is temporary and does not make that implementation a generic compiler primitive.
+downstream RKPPLBench.
 
 Import preparation helpers from
 `BayesianRegressionModels.StatisticalPreparation` into the model module.
-The compiler no longer carries spline, HSGP, monotonic, or DAR model IR.
-Manual varying-effect IR temporarily retains its existing behavior for a
-published consumer that still imports it.
+The compiler no longer carries spline, HSGP, monotonic, DAR or varying-effect
+model IR. Varying effects are ordinary declared arrays and level gathers, or a
+BRM-owned `rkppl_model` body.

@@ -97,7 +97,6 @@ end
 
 @testset "centered row prior IR, layout, emitted prior and likelihood" begin
     plan = _centered_test_plan()
-    @test isempty(plan.varying_draws)
     @test validate_structure(plan) === nothing
     columns = Dict{Symbol,AbstractVector}(:group=>[3,1,2,3,1],
         :x=>[.2,1.,-.5,.3,.1],:y=>[.5,.2,-.1,.4,.3])

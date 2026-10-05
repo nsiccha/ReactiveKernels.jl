@@ -89,9 +89,7 @@ _plans_equal_flat(a::StructuralPlan, b::StructuralPlan) =
     all(_maps_equal.(a.levelmaps, b.levelmaps)) &&
     length(a.plate_parameters) == length(b.plate_parameters) &&
     all(_pparams_equal.(a.plate_parameters, b.plate_parameters)) &&
-    a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles &&
-    _draws_equal(a.varying_draws, b.varying_draws) &&
-    _slices_equal(a.varying_slices, b.varying_slices)
+    a.columns == b.columns && a.n_obs === b.n_obs && a.roles == b.roles
 
 _pparams_equal(a::PlateParameter, b::PlateParameter) =
     a.name === b.name && a.family === b.family &&
@@ -99,30 +97,6 @@ _pparams_equal(a::PlateParameter, b::PlateParameter) =
     all(air -> air[1] === air[2], zip(values(a.args), values(b.args))) &&
     a.support_override === b.support_override && a.range == b.range &&
     a.label === b.label
-
-_draws_equal(a::Vector{VaryingDraws}, b::Vector{VaryingDraws}) =
-    length(a) == length(b) && all(_draw_equal.(a, b))
-
-_draw_equal(a::VaryingDraws, b::VaryingDraws) =
-    a.group === b.group && a.kind === b.kind &&
-    _vmargins_equal(a.margins, b.margins) &&
-    (a.lkj_eta == b.lkj_eta || (isnan(a.lkj_eta) && isnan(b.lkj_eta))) &&
-    a.label === b.label && a.suffix == b.suffix
-
-_slices_equal(a::Vector{VaryingSlice}, b::Vector{VaryingSlice}) =
-    length(a) == length(b) && all(_slice_equal.(a, b))
-
-_slice_equal(a::VaryingSlice, b::VaryingSlice) =
-    a.draws === b.draws && a.columns == b.columns && a.target === b.target
-
-_vmargins_equal(a::Vector{VaryingMargin}, b::Vector{VaryingMargin}) =
-    length(a) == length(b) && all(_vmargin_equal.(a, b))
-
-_vmargin_equal(a::VaryingMargin, b::VaryingMargin) =
-    a.coefficient === b.coefficient && _vrecipe_equal(a.z, b.z)
-
-_vrecipe_equal(a::VaryingZRecipe, b::VaryingZRecipe) =
-    a.kind === b.kind && a.column === b.column && a.level == b.level
 
 _maps_equal(a::LevelMap, b::LevelMap) =
     a.predictor === b.predictor && a.column === b.column &&
@@ -3236,6 +3210,15 @@ end
         end, Dn; conditioned = Dn)))
 end
 
+# Caller-owned per-level values: the producer statistical catalogue is
+# retired (BRM owns `rkppl_model(:varying_coefs)`), so the location-supplying
+# library value is an ordinary submodel defined here.
+@rkppl _surface_level_values(g) = begin
+    sd ~ Exponential(1.0)
+    z[levels(g)] .~ Normal.(0, 1)
+    return sd .* z
+end
+
 @testset "surface offset-only predictors" begin
     # Bare-data affines lower to all-offset, zero-coefficient predictors
     # (SBBRMI admits offset-only models; the RK path diverged until now).
@@ -3293,7 +3276,7 @@ end
     @test _query(dbuilt.spec, dbound, :likelihood, u) ≈ dll
     # A library value can supply the whole location without a coefficient.
     varying = lower_rkppl(quote
-            r ~ varying_coefs(g)
+            r ~ _surface_level_values(g)
             mu = r[g]
             y .~ Normal.(mu, 1.0)
         end, (:y, :g); conditioned = (:y, :g))
