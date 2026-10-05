@@ -57,12 +57,15 @@ end
 @testset "retained plate response values: default compiled math and structure" begin
     # Warm once at the same dimensions before comparing complete modules.
     Base.invokelatest(_prv_compiled, _prv_fixture(:direct, 3))
-    for kind in (:direct, :alias, :selected, :bare, :bare_broadcast)
+    for kind in (:direct, :alias, :alias_literal, :alias_axes, :alias_local,
+            :alias_scale, :selected, :bare, :bare_broadcast)
         bare = kind in (:bare, :bare_broadcast)
         indexed = kind !== :bare_broadcast
         small = bare ? _prv_bare(3; indexed) : _prv_fixture(kind, 3)
+        # A literal `1:n` states its own extent, so each size lowers anew.
         large = bare ? _prv_bare(9; unbound = small.unbound, indexed) :
-            _prv_fixture(kind, 9; unbound = small.unbound)
+            _prv_fixture(kind, 9;
+                unbound = kind === :alias_literal ? nothing : small.unbound)
         sop = Base.invokelatest(_prv_compiled, small)
         lop = Base.invokelatest(_prv_compiled, large)
         @test sop[1] == lop[1]
@@ -74,6 +77,18 @@ end
             # limitation. Keep both default gates explicit and unresolved.
             @test_broken sop[2] == lop[2]
             @test_broken sop[4] == lop[4]
+        elseif kind === :alias_scale
+            # A row-varying scale guards each row's log density. Released
+            # Reactant/XLA expands that guarded loop at 3 rows and retains
+            # one body from 9 rows; the same scale written inline, without
+            # reading `mu`, expands identically (backend-only reproducer
+            # benchmark/repro_reactant_lazy_batch_growth.jl). Keep the
+            # small-size gate explicit and require retention above it.
+            @test_broken sop[2] == lop[2]
+            @test_broken sop[4] == lop[4]
+            xop = Base.invokelatest(_prv_compiled,
+                _prv_fixture(kind, 17; unbound = small.unbound))
+            @test lop == xop
         else
             @test sop[2] == lop[2]
             @test sop[4] == lop[4]

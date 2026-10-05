@@ -3710,11 +3710,14 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
                   "offset/varying-effect terms only — no nested " *
                   "compositions, latents, or other summands)")
     end
-    known = _union_names(plan)
+    # Value leaves are scalars or whole model-level arrays (`z .+ w .* z`
+    # with `z[1:K] .~ …`): their values combine with Julia broadcasting.
+    known = union(_union_names(plan), _array_names(plan),
+        _vector_value_names(plan))
     for c in o.scalars
         c in known ||
-            _fail(t.label, "composed scalar $c is neither a sampled " *
-                  "parameter nor a scalar assignment")
+            _fail(t.label, "composed value leaf $c is neither a sampled " *
+                  "parameter, a declared array nor an assignment")
     end
     leaves = _validate_composed_tree(o.tree, o.subs, o.scalars, t.label,
         datas)

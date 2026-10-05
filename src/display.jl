@@ -105,7 +105,78 @@ function _display_line(x)
 end
 
 _has_source(recipe::Recipe) = !(recipe.source isa _NoKernelSource)
-_is_body_op(op) = op isa _AuthoredPlateOp || op isa _AuthoredScanOp
+
+# --- structural inventory ----------------------------------------------------------
+
+"""
+    recipe_kind(recipe::Recipe) -> Symbol
+
+The structural kind of `recipe`: `:plate` for an authored `plate(...) do`
+recipe, `:scan` for an authored `scan(...) do` recipe, and `:ordinary` for
+every other recipe. It never throws. The body of a `:plate` recipe is
+[`plate_body`](@ref)`(recipe)` and the body of a `:scan` recipe is
+[`scan_body`](@ref)`(recipe)`; an `:ordinary` recipe has no body. These
+symbols are the supported classification; the operation types behind them are
+internal.
+"""
+recipe_kind(recipe::Recipe) = _recipe_kind(recipe.op)
+_recipe_kind(::_AuthoredPlateOp) = :plate
+_recipe_kind(::_AuthoredScanOp) = :scan
+_recipe_kind(op) = :ordinary
+
+_is_body_op(op) = _recipe_kind(op) !== :ordinary
+# The body plan `plate_body`/`scan_body` return for a plate or scan recipe.
+_body_plan(op::_AuthoredPlateOp) = op.kernel.plan
+_body_plan(op::_AuthoredScanOp) = op.kernel.plan
+
+"""
+    recipe_inventory(spec::KernelSpec)
+    recipe_inventory(graph::Graph)
+    recipe_inventory(plan::Plan)
+    recipe_inventory(kernel::PreparedKernel)
+
+Every recipe of a program and, recursively, of each plate and scan body, as a
+`Vector` of `(; kind, depth, parent, recipe)` entries in depth-first order: a
+plate or scan entry is followed by the entries of its body. `kind` is
+[`recipe_kind`](@ref)`(recipe)`; `depth` is `0` for a top-level recipe and one
+more for each enclosing plate or scan; `parent` is the index in the returned
+vector of the enclosing plate or scan entry, or `0` at top level.
+
+A `KernelSpec` is inventoried through its graph ([`kernel_graph`](@ref)), so
+every registered recipe is listed. A `Plan` lists the recipes it selected. A
+`PreparedKernel` lists the recipes of the plan it was prepared from; with
+`bound=` data that is the residual plan, in which each folded value is an
+ordinary recipe. A body is always its plate's [`plate_body`](@ref) or its
+scan's [`scan_body`](@ref) plan. The inventory only reads its argument; nothing
+is planned, prepared or evaluated.
+
+For example, the plate and scan structure of a program as `(kind, depth)` pairs:
+
+```julia
+[(entry.kind, entry.depth) for entry in recipe_inventory(spec) if entry.kind !== :ordinary]
+```
+"""
+recipe_inventory(spec::KernelSpec) = recipe_inventory(kernel_graph(spec))
+recipe_inventory(g::Graph) = _recipe_inventory(g.recipes)
+recipe_inventory(p::Plan) = _recipe_inventory(p.recipes)
+recipe_inventory(k::PreparedKernel) = recipe_inventory(k.plan)
+
+const _InventoryEntry = NamedTuple{(:kind, :depth, :parent, :recipe),
+                                   Tuple{Symbol,Int,Int,Recipe}}
+
+_recipe_inventory(recipes) = _recipe_inventory!(_InventoryEntry[], recipes, 0, 0)
+
+function _recipe_inventory!(entries::Vector{_InventoryEntry}, recipes, depth::Int,
+                            parent::Int)
+    for recipe in recipes
+        kind = recipe_kind(recipe)
+        push!(entries, (; kind, depth, parent, recipe))
+        kind === :ordinary && continue
+        _recipe_inventory!(entries, _body_plan(recipe.op).recipes, depth + 1,
+                           length(entries))
+    end
+    entries
+end
 
 # The label of a recipe in `explain`, the graph listing and DAG node labels. A
 # recipe synthesized from captured `@kernel` source shows that source as a
@@ -125,17 +196,11 @@ _source_module(branch::_KernelBranch) = _source_module(branch.call)
 _source_module(f::Function) = parentmodule(f)
 _source_module(::Any) = nothing
 
-_body_plan(op::_AuthoredPlateOp) = op.kernel.plan
-_body_plan(op::_AuthoredScanOp) = op.kernel.plan
-
 function _collect_source_modules!(modules::Vector{Module}, recipes)
-    for recipe in recipes
-        if _is_body_op(recipe.op)
-            _collect_source_modules!(modules, _body_plan(recipe.op).recipes)
-        elseif recipe.op isa _KernelSourceOp
-            mod = _source_module(recipe.op)
-            mod isa Module && !(mod in modules) && push!(modules, mod)
-        end
+    for (; recipe) in _recipe_inventory(recipes)
+        recipe.op isa _KernelSourceOp || continue
+        mod = _source_module(recipe.op)
+        mod isa Module && !(mod in modules) && push!(modules, mod)
     end
     modules
 end
@@ -252,14 +317,14 @@ function _graph_value_lines(g::Graph)
 end
 
 function _write_recipe_listing(io::IO, recipes, indent::String)
-    for recipe in recipes
-        println(io, indent, "[", recipe.id, "] ", _recipe_line(recipe))
-        _is_body_op(recipe.op) || continue
+    for (; kind, depth, recipe) in _recipe_inventory(recipes)
+        nested = indent * "      "^depth
+        println(io, nested, "[", recipe.id, "] ", _recipe_line(recipe))
+        kind === :ordinary && continue
         body = _body_plan(recipe.op)
-        println(io, indent, "    ", _opname(recipe.op), " body: have (",
+        println(io, nested, "    ", _opname(recipe.op), " body: have (",
                 join((string(v.name) for v in body.have), ", "), ") → want (",
                 join((string(v.name) for v in body.want), ", "), ")")
-        _write_recipe_listing(io, body.recipes, indent * "      ")
     end
 end
 

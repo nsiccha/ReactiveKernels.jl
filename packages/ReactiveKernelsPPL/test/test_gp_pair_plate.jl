@@ -105,7 +105,7 @@ function model_oracle(bound, built, u; periodic, live_locations)
         logpdf(LogNormal(), nt.sigma) + logpdf(LogNormal(), nt.rho) + jac
 end
 
-plates(p) = filter(r -> r.op isa ReactiveKernels._AuthoredPlateOp, p.recipes)
+plates(p) = filter(r -> recipe_kind(r) === :plate, p.recipes)
 names(p) = [only(r.outputs).name for r in p.recipes]
 end
 
