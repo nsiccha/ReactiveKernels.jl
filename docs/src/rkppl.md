@@ -325,6 +325,12 @@ from parameter geometry, without adding generated values to sampler coordinates.
   density branch. Mixture components may use independent links.
   A computed coefficient such as `b = z * lambda * tau` reads its
   declared parameters, so using it as a scale retains the same priors.
+  Native value and reverse checks cover this form. With Reactant 0.2.290,
+  some shared scalar density guards fail during tracing with
+  `isless(::Int64, ::Reactant.EnsureReturnType{Any})`, before the compiled
+  primal runs. The generic RK reproducer is
+  `benchmark/repro_reactant_shared_scale_guard.jl`; this also reproduces
+  outside the PPL and predates the construct removal.
 - Plate cells accept `BernoulliLogit.(eta)` and `PoissonLog.(eta)` directly
   on the logit and log-rate scales. A bare modeled `VonMises.(kappa)` uses
   zero mean. Live concentration supports native density and AD; compiled
@@ -528,12 +534,13 @@ Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
 agree on its rows. A latent plate follows its authored range, while a scan
 with a symbolic length follows its consuming response.
-Varying effects, smooth bases, and design matrices follow their input rows.
+Design matrices follow their input rows.
 Declared `axes(X, 1)` arrays have X's rows; `axes(X, 2)` coefficient vectors
 have X's width. The total `n_obs` does not size these values. A trajectory used
 by responses of different lengths fails binding because its axis is ambiguous.
-Kernel plates may also contribute likelihoods beside ordinary responses;
-their subject/time or schedule dimensions retain their own rows.
+The legacy panel sampling do-block and `@plate result for ...` forms are
+retired. Write indexed observations and explicit array dimensions; binding
+no longer infers panel shapes from `dims` keys.
 
 Per-level and per-observation cells compose through declared arrays. `L[k] ~ LKJCholesky(K, eta)` inside a plate over `levels(s)` declares
 one factor per stratum. An observation cell can then read `sd[s[i], :]`,

@@ -120,9 +120,7 @@ ChainRules adapters (`ext/ReactiveKernelsEnzymeExt.jl`,
 derive every direction from the activity-selected cuts of that graph. The rules in package source are
 ReactiveKernels' `rk_expm`, `rk_symmetric_eigvals` and `rk_symmetric_eigvecs`,
 plus DistributionKernels' `loggamma` and `logbeta`. The generic matrix rules
-are also imported by existing PPL/distribution consumers. The PK-specific
-transit two-compartment response rule (`prepare_transit_twocmt_rule`) remains
-in the existing PPL source pending its downstream migration; the ODE backsolve
+are also imported by existing PPL/distribution consumers. The ODE backsolve
 adjoint consumes a caller's `DerivativeRule` right-hand side. Reverse-mode adapters
 stage each rule in two cuts whose residuals come from cross-stage liveness, so
 a shared intermediate is retained rather than recomputed. Rule cuts already

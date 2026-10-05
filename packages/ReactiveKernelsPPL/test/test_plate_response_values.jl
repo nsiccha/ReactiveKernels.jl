@@ -8,35 +8,33 @@ function _prv_fixture(kind, n; unbound = nothing)
     ast = quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 2)
-        r ~ varying_effect(g, [1])
+        r[levels(g)] .~ Normal.(0, 1)
     end
     if kind === :alias
-        push!(ast.args, :(mu = a .+ r))
+        push!(ast.args, :(mu = a .+ r[g]))
     end
     selected = kind === :selected
     selected && n > 1 && (x[2:end] .= -1.0)
     iterator = selected ? :(axes(y, 2)) : :(eachindex(y))
-    value = selected ? :(a + r[i] + b * sqrt(x[i])) :
-        kind === :alias ? :(mu[i] + b * x[i]) : :(a + r[i] + b * x[i])
+    value = selected ? :(a + r[g[i]] + b * sqrt(x[i])) :
+        kind === :alias ? :(mu[i] + b * x[i]) : :(a + r[g[i]] + b * x[i])
     push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
         Expr(:for, :(i = $iterator), Expr(:block, :(y[i] ~ Normal($value, 0.7))))))
     data = Dict(:x => x, :y => y, :g => g)
     unbound === nothing && (unbound = lower_rkppl(ast, data; conditioned = keys(data)))
     bound = bind_data(unbound, data)
     built = build_kernel(bound)
-    u = unconstrain(built.layout, (; a = 0.25, b = -0.3, L_g = [1.0;;],
-        tau_g = [1.1], z_flat_g = [-0.2, 0.4]))
+    u = unconstrain(built.layout, (; a = 0.25, b = -0.3, r = [-0.2, 0.4]))
     function pointwise(v)
         q = constrain(built.layout, v)
         indices = selected ? axes(y, 2) : eachindex(y)
-        [logpdf(Normal(q.a + only(q.tau_g) * q.z_flat_g[g[i]] +
+        [logpdf(Normal(q.a + q.r[g[i]] +
             q.b * (selected ? sqrt(x[i]) : x[i]), 0.7), y[i]) for i in indices]
     end
     function oracle(v)
         q = constrain(built.layout, v)
         logpdf(Normal(), q.a) + logpdf(Normal(0, 2), q.b) +
-            logpdf(truncated(Normal(), 0, Inf), only(q.tau_g)) +
-            sum(logpdf.(Normal(), q.z_flat_g)) + log(only(q.tau_g)) +
+            sum(logpdf.(Normal(), q.r)) +
             sum(pointwise(v))
     end
     return (; kind, data, unbound, bound, built, u, oracle, pointwise)

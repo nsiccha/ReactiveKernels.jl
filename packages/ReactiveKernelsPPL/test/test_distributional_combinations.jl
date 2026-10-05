@@ -26,10 +26,9 @@ function _distributional_fused_cell_fixture(n, family)
     ast = quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
-        pred ~ plate(x, y; subjects = $n) do xs, yy
-            mu = a .+ b .* xs
-            yy .~ $family.(mu)
-            mu
+        @plate for i in eachindex(y)
+            mu[i] = a + b * x[i]
+            y[i] ~ $family(mu[i])
         end
     end
     oracle = u -> begin

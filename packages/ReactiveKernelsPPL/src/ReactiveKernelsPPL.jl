@@ -48,8 +48,6 @@ export VaryingZRecipe, VaryingMargin, VaryingSdPrior, VaryingDraws, VaryingSlice
 export VaryingMultiMembership, VaryingStrata
 export SplineBasisBlock, SplineBasis, SplineVector
 export HSGPBasis, HyperPrior, HSGPHyperLP, HSGPGrouping
-export KernelPlate, LinearPKScheduleSpec, LinearPKEventLPSpec
-export EVENT_LP_NAME
 export LevelMap
 export DesignMatrix
 export StructuralPlan, SubmodelScope
@@ -84,11 +82,6 @@ export tps_basis, cr_basis, t2_basis, hsgp_basis, hsgp_periodic_basis, hsgp_sqrt
     hsgp_periodic_rho_floor, hsgp_matern_sqrt_spd, hsgp_periodic_grouped_sqrt_spd
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
 export DarSpec
-export LINEAR_EVENT_READ, LINEAR_EVENT_DOSE, LINEAR_EVENT_DOSE_SEGMENT
-export build_linear_pk_schedule, linear_pk_read_locs, linear_pk_read_locs_auc
-export linear_pk_op_log_dose, linear_pk_event_log_f
-export linear_pk_system_3, linear_pk_propagate_3, linear_pk_add_dose_3,
-    linear_pk_add_regular_doses_3
 export QT_COUPLING_SPINES, QT_OBS_FAMILIES
 export admit_qt_spine, admit_qt_obs_family
 export qt_loc_assignment, qt_obs_statement, pk_obs_statement
@@ -111,18 +104,12 @@ export tgi_category_stmts, tgi_response_stmts, tgi_censored_stmts
 export TGI_CELL_FUNCTIONS
 export rk_expm
 export rk_symmetric_eigvals, rk_symmetric_eigvecs
-export transit_twocmt_unit, transit_twocmt_unit_response, transit_twocmt_rule,
-    prepare_transit_twocmt_rule
 
 include("contract.jl")
 include("sampling.jl")
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 # The general numerical callables and rule graphs are owned by RK proper;
 # existing PPL-qualified names import those same bindings for compatibility.
-include("pkcells.jl")
-include("transit_twocmt.jl")
-include("transit_twocmt_rule.jl")
-include("pk_rectangular.jl")
 include("design.jl")
 include("bijectors.jl")
 include("mv_slices.jl")

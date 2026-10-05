@@ -1,4 +1,4 @@
-using ReactiveKernelsPPL, Test
+using Distributions, ReactiveKernelsPPL, Test
 
 @testset "retired implicit shrinkage declarations explain the replacement" begin
     # USER ownership mapping 15rhwoy/1f0k9oz: BRM owns these models;
@@ -56,6 +56,7 @@ using ReactiveKernelsPPL
 end
 monotonic(x) = x .+ 0.5
 mo(x) = x .+ 0.1
+linear_pk_read_locs(x) = x .+ 0.2
 @rkppl varying_effect(x) = begin
     b ~ Normal(0, 2)
     return b .* x
@@ -70,6 +71,16 @@ end
     end, (:x, :y); mod = RetiredCatalogueCaller, conditioned = (:y,))
     bound = bind_data(p, Dict(:x => [0.2, 0.4], :y => [0.3, -0.1]))
     @test coordinate_names(build_kernel(bound).layout) == [Symbol("q.b")]
+    p = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        m = linear_pk_read_locs(x)
+        y .~ Normal.(a .+ m, 1)
+    end, (:x, :y); mod = RetiredCatalogueCaller, conditioned = (:y,))
+    bound = bind_data(p, Dict(:x => [0.2, 0.4], :y => [0.3, -0.1]))
+    built = build_kernel(bound)
+    @test coordinate_names(built.layout) == [:a]
+    @test Base.invokelatest(prepare_query(built, bound, :sampler), [0.1]) ≈
+        logpdf(Normal(), 0.1) + sum(logpdf.(Normal.([0.5, 0.7], 1), [0.3, -0.1]))
     p = lower_rkppl(quote
         q ~ varying_effect(x)
         m = mo(q)
@@ -105,5 +116,42 @@ end
         end
         @test err isa SurfaceLoweringError
         @test occursin("explicit priors", sprint(showerror, err))
+    end
+end
+
+@testset "adopted PK helpers and legacy panel syntax name replacements" begin
+    for name in ReactiveKernelsPPL._RETIRED_PK_HEADS
+        err = try
+            lower_rkppl(Expr(:block, Expr(:(=), :q, Expr(:call, name))), ();
+                mod = ReactiveKernelsPPL)
+            nothing
+        catch error
+            error
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin("RKPPLBench", sprint(showerror, err))
+        @test !isdefined(ReactiveKernelsPPL, name)
+    end
+    for ast in (quote
+            q ~ plate(x, y; subjects = N) do xx, yy
+                yy .~ Normal.(xx, 1)
+                xx
+            end
+        end, quote
+            @plate q for i in 1:N
+                y .~ Normal.(x, 1)
+                x
+            end
+        end)
+        err = try
+            lower_rkppl(ast, (:x, :y); mod = ReactiveKernelsPPL,
+                conditioned = (:y,))
+            nothing
+        catch error
+            error
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin("retired", sprint(showerror, err))
+        @test occursin("@plate for", sprint(showerror, err))
     end
 end

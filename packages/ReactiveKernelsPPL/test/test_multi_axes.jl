@@ -180,25 +180,21 @@ end
     @test_throws "1:n_obs (4)" validate_data(bad)
 end
 
-@testset "multiple observation axes: kernel lanes and retired metadata" begin
+@testset "multiple observation axes: independent indexed observations" begin
     cols = Dict{Symbol,Any}(:x1 => [0.5, 1.0, 1.5, 2.0], :y1 => [0.4, 1.1, 1.4, 2.2],
         :x2 => [0.5, 1.0, 1.5], :y2 => [1, 2, 3])
     ast = quote
         b ~ Normal(0, 1)
-        p1 ~ plate(x1, y1; subjects=n1) do xx1, yy1
-            mu1 = b .* xx1
-            yy1 .~ Normal.(mu1, 1)
-            mu1
+        @plate for i in eachindex(y1)
+            mu1[i] = b * x1[i]
+            y1[i] ~ Normal(mu1[i], 1)
         end
-        p2 ~ plate(x2, y2; subjects=n2) do xx2, yy2
-            mu2 = exp.(b .* xx2)
-            yy2 .~ Poisson.(mu2)
-            mu2
+        @plate for j in eachindex(y2)
+            mu2[j] = exp(b * x2[j])
+            y2[j] ~ Poisson(mu2[j])
         end
     end
-    p = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols;
-        dims=Dict(:n1 => 4, :n2 => 3))
-    @test length(p.kernel_plates) == 2
+    p = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols)
     @test p.n_obs == 7
     built = build_kernel(p)
     q = prepare_query(built, p, :sampler)
@@ -208,8 +204,7 @@ end
     cols[:y] = [0.1, 0.3, 0.2, -0.2, 0.4]
     cols[:other] = [-0.1, 0.5]
     push!(ast.args, :(y .~ Normal.(b, 1)), :(other .~ Normal.(b, 1)))
-    mixed = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols;
-        dims=Dict(:n1 => 4, :n2 => 3))
+    mixed = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols)
     @test mixed.n_obs == 14
     mbuilt = build_kernel(mixed)
     mq = prepare_query(mbuilt, mixed, :sampler)
@@ -221,15 +216,11 @@ end
         sum(cols[:x2] .* (cols[:y2] .- exp.(0.2 .* cols[:x2]))) +
         sum(cols[:y] .- 0.2) + sum(cols[:other] .- 0.2) - 0.2
     @test only(g) ≈ dg
-    # Sharing a kernel input does not waive ordinary broadcasting checks.
+    # A shared input must still cover the authored observation axis.
     mismatch = deepcopy(ast)
     mismatch.args[end-1] = :(y .~ Normal.(b .* x1, 1))
     @test_throws "column length 4 ≠ the 5 rows of y" bind_data(
-        lower_rkppl(mismatch, cols; conditioned=keys(cols)), cols;
-        dims=Dict(:n1 => 4, :n2 => 3))
-    retired = ReactiveKernelsPPL._with(p;
-        event_lps=[LinearPKEventLPSpec(:retired, :s, 5, 1.5, nothing, :legacy)])
-    @test_throws "implicit event-LP parameters are retired" validate_structure(retired)
+        lower_rkppl(mismatch, cols; conditioned=keys(cols)), cols)
 end
 
 @testset "multiple observation axes: shared coefficients and ambiguous trajectories" begin

@@ -439,7 +439,6 @@ end
 # generated hcat. Data-only derived columns are already present in columns.
 function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     _uses_structured_observation_axes(plan) && return false
-    _predictor_level(plan, pred.name) === :obs || return false
     for t in pred.terms
         t.kind in (ContinuousTerm, OffsetTerm, FactorTerm, ComposedTerm) || continue
         for c in t.columns
@@ -458,27 +457,8 @@ function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
         values(observations.domains))
 end
 
-"""Design row count of a predictor (obs-level: its observation axis; subject-level:
-the using kernel plate's subject count — bound plans only)."""
-function _predictor_rows(plan::StructuralPlan, pname::Symbol)
-    _predictor_level(plan, pname) === :obs && return _value_rows(plan, pname)
-    users = KernelPlate[kp for kp in plan.kernel_plates
-        if any(pr -> pr[1] === pname, kp.lp_args)]
-    isempty(users) &&
-        throw(ContractValidationError("[preprocessing] subject predictor " *
-              "`$pname` is used by no kernel plate (internal: level " *
-              "says subject)"))
-    for kp in users
-        kp.subjects isa Int ||
-            throw(ContractValidationError("[preprocessing] subject predictor " *
-                  "`$pname` needs resolved kernel subjects (bind_data first)"))
-    end
-    ns = unique!([kp.subjects for kp in users])
-    length(ns) == 1 && return ns[1]
-    throw(ContractValidationError("[preprocessing] subject predictor " *
-          "`$pname` feeds kernel plates with different subject counts " *
-          "$ns (sequenced follow-up — split the predictor per plate)"))
-end
+"""Design row count of a predictor, resolved from its authored inputs."""
+_predictor_rows(plan::StructuralPlan, pname::Symbol) = _value_rows(plan, pname)
 
 # Level count K for a monotonic term: one more than its linked increments
 # simplex's bound size (K−1 increments). The plan is bound here, so the
