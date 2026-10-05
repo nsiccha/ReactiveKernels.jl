@@ -1200,21 +1200,18 @@ end
         callee isa Core.MethodInstance || return false
         # The specialized signature names the concrete closure type (a cell
         # closure over local helpers is parametric; the method's own `sig` is not).
-        callee.specTypes isa DataType && callee.specTypes.parameters[1] === typeof(op.f)
+        callee.specTypes isa DataType && callee.specTypes.parameters[1] in
+            (typeof(op.f), typeof(ReactiveKernels._kernel_native_source(op.f)))
     end
     @test !invokes_closure(ReactiveKernels._kernel_source_call,
                            (Val{:native}, typeof(op), argtypes...))
-    # Negative control: the same call without the annotation keeps the closure
-    # as an `invoke` wherever the heuristic refuses to inline it (Julia 1.10).
+    # Negative control: explicitly keep the same source callable as an invoke,
+    # independently of the Julia version's ordinary inlining heuristic.
     # Fixed arity on purpose: a forwarded `args...` splat is left unspecialized
     # and lowers to a dynamic apply, which the `invoke` scan cannot see.
-    plain_call(op, a, b, c, d) = op.f(a, b, c, d)
+    retained_call(op, a, b, c, d) = Base.@noinline op.f(a, b, c, d)
     @test length(argtypes) == 4
-    if VERSION < v"1.11"
-        @test invokes_closure(plain_call, (typeof(op), argtypes...))
-    else
-        @info "plain-call control skipped: this Julia inlines the loop-carrying closure itself" VERSION
-    end
+    @test invokes_closure(retained_call, (typeof(op), argtypes...))
 end
 
 # --- per-cell reductions over a few host indices (snag plate-cell-gathe-94d4a929)
