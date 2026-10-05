@@ -2969,7 +2969,7 @@ end
 end
 
 @inline _batched_call(f::_ArrayFunctionPair, ops, args, marker) =
-    f.native(ops, args...)
+    _native_array_body_call(f.native, ops, args)
 
 """
     PreparedKernel
@@ -3032,6 +3032,14 @@ function _native_body_call_expr(::Type{F}, f, ops, args) where {F}
                  $direct : $f($ops, $(args...)))
     end
     :($f($ops, $(args...)))
+end
+
+# Enter the existing generated body with positional operands. Together with
+# the inline prepared call, this keeps captured readonly operations out of a
+# temporary aggregate that ordinary Reverse otherwise treats as writable.
+@inline @generated function _native_array_body_call(f::F, ops, args::A) where {F,A<:Tuple}
+    forwarded = [:(getfield(args, $index)) for index in 1:fieldcount(A)]
+    _native_body_call_expr(F, :f, :ops, forwarded)
 end
 
 @generated function (call::_ExternalizedBoundArrayCall{F,O,I,H})(
@@ -3687,9 +3695,9 @@ end
 # `args` tuple into some RGF call shapes allocates even though the emitted
 # function itself is allocation-free. Keep the public call nongenerated so
 # reflection over it continues to accept abstract argument types.
-@generated function _prepared_call(k::PreparedKernel, args::A, ::Val{N}) where {A<:Tuple,N}
+@inline @generated function _prepared_call(k::PreparedKernel, args::A, ::Val{N}) where {A<:Tuple,N}
     positional = [:(getfield(args, $index)) for index in 1:N]
-    :(k.f(k.ops, $(positional...)))
+    :(Base.@inline k.f(k.ops, $(positional...)))
 end
 
 @inline function (k::PreparedKernel{F,O,IN,OUT})(

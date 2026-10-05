@@ -1,8 +1,9 @@
 using Reactant
 
 @testset "Reactant: selected prior values and ordinary reverse" begin
-    for prior in (:data, :active, :mapped), (n, nobs) in ((0, 4), (1, 4), (6, 4), (18, 11))
-        fx = _prior_selection_fixture(n, nobs; prior)
+    for prior in (:data, :active, :mapped), (n, nobs) in ((0, 4), (1, 4), (6, 4), (18, 11)),
+            iterator in (:eachindex, :value)
+        fx = _prior_selection_fixture(n, nobs; prior, iterator)
         saved = deepcopy(fx.inputs)
         sampler = prepare_sampler(fx.built, fx.bound, fx.u;
             backend=AutoEnzyme(; mode=Enzyme.Reverse))
@@ -24,13 +25,13 @@ using Reactant
                 end
                 @test Array(input) == u
             end
-            println("PRIOR_SELECTION_IR prior=", prior, " n=", n, " nobs=", nobs,
-                " direction=", direction)
+            println("PRIOR_SELECTION_IR prior=", prior, " iterator=", iterator,
+                " n=", n, " nobs=", nobs, " direction=", direction)
             if haskey(ENV, "RKPPL_PRIOR_SELECTION_IR_DIR")
                 dir = ENV["RKPPL_PRIOR_SELECTION_IR_DIR"]
                 mkpath(dir)
-                write(joinpath(dir, "$prior-$n-$nobs-$direction.mlir"), mlir)
-                write(joinpath(dir, "$prior-$n-$nobs-$direction.hlo"), hlo)
+                write(joinpath(dir, "$prior-$iterator-$n-$nobs-$direction.mlir"), mlir)
+                write(joinpath(dir, "$prior-$iterator-$n-$nobs-$direction.hlo"), hlo)
             end
         end
         @test Array(ru) == fx.u
