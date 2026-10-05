@@ -584,8 +584,20 @@ executable HLO alongside values and ordinary reverse results.
 
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
-agree on its rows. A latent plate follows its authored range, while a scan
-with a symbolic length follows its consuming response.
+agree on its rows. A latent plate follows its authored iterator's own extent,
+including an iterator over a definition, a scan trajectory or a declared
+parameter. Binding resolves declared axes and data-only call results; a scan
+trajectory uses its authored bound. These extents do not come from an unrelated
+response. Indexed prior arguments select those authored cells, and rebinding
+recomputes their sizes from the new data.
+
+An opaque parameter-dependent iterator whose shape cannot be inferred from
+bound data remains a sizing capability gap. Binding names the iterator and
+unavailable extent, rather than silently borrowing response rows or evaluating
+sampled values on the host. The historical scan form with an unsupplied length
+name still uses its direct response consumers; a latent iterator over that scan
+needs an established bound.
+
 Design matrices follow their input rows.
 Declared `axes(X, 1)` arrays have X's rows; `axes(X, 2)` coefficient vectors
 have X's width. The total `n_obs` does not size these values. A trajectory used
