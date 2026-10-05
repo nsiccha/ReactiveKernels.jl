@@ -129,9 +129,6 @@ univariate components, SB `MixtureModel` mirror)."""
     CategoricalFam
     MvNormalCholeskyFam
     CensoredAddpropnormalFam
-    TgiCategoryFam
-    TgiResponseFam
-    TgiCensoredFam
     NormalIDGLMFam
     BernoulliLogitGLMFam
     PoissonLogGLMFam

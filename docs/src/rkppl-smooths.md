@@ -18,6 +18,5 @@ is temporary and does not make that implementation a generic compiler primitive.
 Import preparation helpers from
 `BayesianRegressionModels.StatisticalPreparation` into the model module.
 The compiler no longer carries spline, HSGP, monotonic, or DAR model IR.
-Three HSGP helpers (`hsgp_basis`, `hsgp_sqrt_spd`, `hsgp_rho_floors`) and
-manual varying-effect IR temporarily retain their existing behavior for a
-published consumer that still imports them.
+Manual varying-effect IR temporarily retains its existing behavior for a
+published consumer that still imports it.

@@ -29,8 +29,7 @@ export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
     BernoulliProbitFam, BernoulliCloglogFam, BinomialProbitFam,
     BinomialCloglogFam, BinomialProbFam, BetaLogitFam, BetaShapeFam, CategoricalLogitFam,
     OrderedLogisticFam, OrdinalFam, MultinomialFam, CategoricalFam,
-    MvNormalCholeskyFam, CensoredAddpropnormalFam, TgiCategoryFam,
-    TgiResponseFam, TgiCensoredFam, NormalIDGLMFam, BernoulliLogitGLMFam,
+    MvNormalCholeskyFam, CensoredAddpropnormalFam, NormalIDGLMFam, BernoulliLogitGLMFam,
     PoissonLogGLMFam, MixtureFam, StudentTFam, HurdlePoissonFam,
     ZeroInflatedPoissonFam, InverseGaussianFam, BetaBinomial2Fam, VonMisesFam,
     NegativeBinomialFam, ExponentialLogFam, LogNormalFam, WeibullFam,
@@ -74,28 +73,7 @@ export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export restore_draws
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
-export hsgp_basis, hsgp_sqrt_spd, hsgp_rho_floors
 export ScanSpec, ScanStep, ScanSetup, parse_scan_block
-export QT_COUPLING_SPINES, QT_OBS_FAMILIES
-export admit_qt_spine, admit_qt_obs_family
-export qt_loc_assignment, qt_obs_statement, pk_obs_statement
-export validate_qt_joint_prep
-export TGIOptions, tgi_options
-export TGI_OBSERVATIONS, TGI_STRUCTURES, TGI_THRESHOLDS, TGI_MEASURES
-export TGI_TIME_SCALE_H, TGI_LOG_PR, TGI_LOG_PD, TGI_RECIST_LOG_PR,
-    TGI_RECIST_LOG_PD
-export tgi_measure_dim, tgi_threshold_scale, tgi_fixed_cutpoints,
-    tgi_estimated_cutpoints, tgi_uses_nadir
-export tgi_ratio_loglinear, tgi_ratio_resistant, tgi_log_survival,
-    tgi_running_nadir, tgi_nadir_scan_expr, tgi_segmented_nadir,
-    tgi_inv_logit
-export tgi_normal_lcdf, tgi_log_diff_exp, tgi_interval_logprob,
-    tgi_report_logprob
-export tgi_category_lpmf, tgi_category_lpmfs,
-    tgi_response_lpmf, tgi_response_lpmfs,
-    tgi_censored_lpdf, tgi_censored_lpdfs
-export tgi_category_stmts, tgi_response_stmts, tgi_censored_stmts
-export TGI_CELL_FUNCTIONS
 export rk_expm
 export rk_symmetric_eigvals, rk_symmetric_eigvecs
 
@@ -115,17 +93,5 @@ include("query.jl")
 include("distribution_defaults.jl")
 include("surface.jl")
 include("scan.jl")
-include("qt_joint.jl")
-include("tgi.jl")
-include("smooth_bases.jl")
-
-# Late import into the generated-models scope: `PPLGeneratedModels`
-# binds its `import`s when `generator.jl` loads, before `tgi.jl`
-# defines the per-element likelihood cells — so the joint plates'
-# cells register here, after their file (an `import` of a
-# not-yet-defined name warns and never binds).
-Core.eval(PPLGeneratedModels,
-    :(import ..tgi_category_lpmf, ..tgi_response_lpmf, ..tgi_censored_lpdf,
-        ..tgi_segmented_nadir))
 
 end # module ReactiveKernelsPPL
