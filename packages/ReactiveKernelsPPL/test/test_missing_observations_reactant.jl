@@ -50,12 +50,75 @@ function _missing_compiled_check(fx, name; structure=false)
     end
 end
 
+function _missing_compiled_cell_fixture(kind, n)
+    y = Union{Missing,Float64}[isodd(i) ? 0.03*i : missing for i in 1:n]
+    x = [isodd(i) ? 0.1*i : -1.0 for i in 1:n]
+    data = (; y, x)
+    response = kind === :local ? :(y[i] ~ Normal(a + b*sqrt(x[i]), 0.7)) :
+        :(y[i] ~ Normal(a + b*x[i], sqrt(x[i])))
+    ast = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            $response
+        end
+    end
+    bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
+    built = build_kernel(bound)
+    u = unconstrain(built.layout, (; a=0.2, b=-0.3))
+    sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+    oracle(v) = logpdf(Normal(), v[1]) + logpdf(Normal(), v[2]) +
+        sum(logpdf(Normal(v[1] + v[2]*(kind === :local ? sqrt(x[i]) : x[i]),
+            kind === :local ? 0.7 : sqrt(x[i])), y[i]) for i in eachindex(y) if !ismissing(y[i]))
+    (; data, bound, built, u, sampler, oracle)
+end
+
+function _missing_compiled_glm_fixture(head, n)
+    y = head === :NormalIDGLM ?
+        Union{Missing,Float64}[isodd(i) ? 0.03*i : missing for i in 1:n] :
+        Union{Missing,Int}[isodd(i) ? i%3 == 0 : missing for i in 1:n]
+    x1 = [isodd(i) ? 0.1*i : 10000.0 for i in 1:n]
+    x2 = fill(0.2, n)
+    data = (; y, x1, x2)
+    rhs = Expr(:call, head, :X, :alpha, :beta)
+    head === :NormalIDGLM && push!(rhs.args, 0.7)
+    ast = quote
+        X = hcat(x1, x2)
+        alpha ~ Normal(0, 1)
+        beta[axes(X, 2)] .~ Normal.(0, 1)
+        y ~ $rhs
+    end
+    bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
+    built = build_kernel(bound)
+    u = unconstrain(built.layout, (; alpha=0.2, beta=[0.3, -0.1]))
+    sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+    function oracle(v)
+        p = constrain(built.layout, v)
+        eta = p.alpha .+ hcat(x1, x2) * p.beta
+        out = logpdf(Normal(), p.alpha) + sum(logpdf.(Normal(), p.beta))
+        for i in eachindex(y)
+            ismissing(y[i]) && continue
+            family = head === :NormalIDGLM ? Normal(eta[i], 0.7) :
+                head === :BernoulliLogitGLM ? Bernoulli(1/(1 + exp(-eta[i]))) : Poisson(exp(eta[i]))
+            out += logpdf(family, y[i])
+        end
+        out
+    end
+    (; data, bound, built, u, sampler, oracle)
+end
+
 @testset "Reactant: automatic missing observations, ordinary AD and retained batching" begin
     for kind in (:vector, :computed_plate, :matrix), n in (5, 9)
         y = Union{Missing,Float64}[isodd(i) ? 0.03*i : missing for i in 1:n]
         kind === :matrix && (y = hcat(y, reverse(y)))
         fx = _missing_fixture(y; computed=kind === :computed_plate)
         _missing_compiled_check(fx, "$kind-$n"; structure=true)
+    end
+    for kind in (:local, :scale), n in (5, 9)
+        _missing_compiled_check(_missing_compiled_cell_fixture(kind, n), "$kind-$n"; structure=true)
+    end
+    for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM), n in (5, 9)
+        _missing_compiled_check(_missing_compiled_glm_fixture(head, n), "$head-$n"; structure=true)
     end
     for y in (Union{Missing,Float64}[], fill(missing, 5))
         _missing_compiled_check(_missing_fixture(y), "empty-or-all-$(length(y))")
