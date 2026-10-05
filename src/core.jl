@@ -240,6 +240,15 @@ end
 end
 kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
 kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
+# The element type of an empty plate is Julia's empty-broadcast type: inferred
+# from the authored native cell over the operands' native element types, with
+# no cell evaluated. `nothing` for any other callable, or when inference gives
+# no concrete type.
+_kernel_native_result_type(f, ::Type{<:Tuple}) = nothing
+function _kernel_native_result_type(op::_KernelSourceOp, argtypes::Type{<:Tuple})
+    T = Core.Compiler.return_type(op.f, argtypes)
+    isconcretetype(T) ? T : nothing
+end
 # Tensorized fused bodies may mix untraced constant arrays with traced operands.
 # Base's generic concatenation and broadcast paths can then allocate host
 # containers of traced scalars and copy elementwise — forbidden scalar indexing
