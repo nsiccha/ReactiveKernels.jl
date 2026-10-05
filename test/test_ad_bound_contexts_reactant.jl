@@ -12,6 +12,37 @@ end
     density::Float64 = scale * x^2 + offset
 end
 
+@kernel bound_context_record(x::Vector{Float64}, scale::Float64,
+        shift::Float64, data) = begin
+    density::Float64 = scale * sum(data.weights .* (x .- shift)) + data.offset
+end
+
+@testset "staged AD counts structured bound leaves independently of slots" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for n in (3, 9), extra_count in (0, 4)
+        x = collect(range(-0.3, 0.5; length = n))
+        weights = collect(range(0.4, 1.1; length = n))
+        data = (; weights, offset = 0.6,
+            nested = ntuple(i -> fill(Float64(i), n), extra_count))
+        snapshot = deepcopy(data)
+        scale, shift = -0.4, 0.35
+        prepared = prepare_ad(bound_context_record, backend, x;
+            active = :x, want = :density, bound = (; scale, shift, data))
+        staged = let prepared = prepared
+            v -> ad_value_and_gradient(prepared, v)
+        end
+        compiled = Reactant.compile(staged, (Reactant.to_rarray(x),))
+        for v in (x, x .+ 0.2)
+            rv = Reactant.to_rarray(v)
+            value, gradient = compiled(rv)
+            @test Float64(value) ≈ scale * sum(weights .* (v .- shift)) + data.offset
+            @test Array(gradient) ≈ scale .* weights
+            @test Array(rv) == v
+            @test data == snapshot
+        end
+    end
+end
+
 @kernel bound_context_tuple(alpha::Vector{Float64}, beta::Vector{Float64},
         shift::Float64, scale::Float64, data::Vector{Float64}) = begin
     density::Float64 = sum(data .* (alpha .- shift)) + scale * sum(abs2, beta)

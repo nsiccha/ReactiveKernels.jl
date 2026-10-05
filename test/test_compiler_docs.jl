@@ -195,12 +195,11 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
         @test occursin(contract, page)
     end
 
-    # The compiler specification is deliberately algorithmic prose plus four
-    # build-executed result/API panels, including the nested-plate panel.
-    # Source-code examples remain on the
-    # focused example pages.
+    # The compiler specification keeps its four build-executed result/API
+    # panels and allows ordinary source examples for its inspection APIs.
+    # Every opening fence still needs a closing fence.
     @test count(==("```@eval"), split(page, '\n')) == 4
-    @test count(==("```"), split(page, '\n')) == 4
-    @test !occursin("```julia", page)
+    @test count(==("```"), split(page, '\n')) ==
+          count(line -> startswith(line, "```") && line != "```", split(page, '\n'))
     @test !occursin("~~~", page)
 end

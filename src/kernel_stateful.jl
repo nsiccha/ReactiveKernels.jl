@@ -249,7 +249,9 @@ end
 # Tuple lengths describe graph metadata, not numerical execution types. Keep
 # them out of the snapshot type so reconstruction does not compile afresh for
 # each graph topology; the frozen contents and operation identities stay exact.
-struct _ChildSnapshot
+# The call signature describes the argument ABI. Retain its type so stateful
+# construction can infer the signature binder's resolved argument tuple.
+struct _ChildSnapshot{S}
     name::Symbol
     values::Tuple{Vararg{Value}}
     recipes::Tuple{Vararg{Recipe}}
@@ -260,7 +262,7 @@ struct _ChildSnapshot
     port_order::Tuple{Vararg{Symbol}}
     have_names::Tuple{Vararg{Symbol}}
     want_names::Tuple{Vararg{Symbol}}
-    call_signature::Any
+    call_signature::S
 end
 
 "Capture a frozen, detached immutable snapshot of a child `KernelSpec` value."

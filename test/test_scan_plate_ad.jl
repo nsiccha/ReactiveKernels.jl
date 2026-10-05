@@ -84,12 +84,18 @@ end
             @test gradient ≈ derivative atol=1e-12
         end
         # The runtime scan op that tensorized bodies call.
-        op = only(r.op for r in summed.graph.recipes
-                  if r.op isa ReactiveKernels._AuthoredScanOp)
-        @test op(0.0, xs, gain) ≈ gain .* prefix
-        runtime = Enzyme.autodiff(Enzyme.Reverse, g -> sum(op(0.0, xs, g)),
-                                  Enzyme.Active, Enzyme.Active(gain))
-        @test only(only(runtime)) ≈ sum(prefix) atol=1e-12
+        for (spec, includes_seed) in ((summed, false), (trajectory, true))
+            op = only(r.op for r in spec.graph.recipes
+                      if r.op isa ReactiveKernels._AuthoredScanOp)
+            seed = includes_seed ? gain : 0.0
+            expected = includes_seed ? vcat(gain, gain .* (prefix .+ 1)) : gain .* prefix
+            derivative = includes_seed ? 1 + sum(prefix .+ 1) : sum(prefix)
+            @test op(seed, xs, gain) ≈ expected
+            runtime = Enzyme.autodiff(Enzyme.Reverse,
+                g -> sum(op(includes_seed ? g : 0.0, xs, g)),
+                Enzyme.Active, Enzyme.Active(gain))
+            @test only(only(runtime)) ≈ derivative atol=1e-12
+        end
         @test xs == original
     end
 end
