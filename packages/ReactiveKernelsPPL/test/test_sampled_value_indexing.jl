@@ -61,11 +61,12 @@ end
     for n in (nothing, 0, 3, 9), alpha in (nothing, [1.2, 1.5, 0.8])
         bound, built, data = simplex_case(; n, alpha)
         original = deepcopy(data)
-        # The transparent function spelling is a supported control with the
-        # same density and addressable derived value, not a scientific change.
+        # The transparent function spelling is a supported density control.
+        # The reported scalar-response form also exposes the same tau port.
         other, composed, _ = simplex_case(; n, alpha, composed=true)
         @test coordinate_names(built.layout) == coordinate_names(composed.layout)
         tau = node(built, data, :tau)
+        control_tau = n === nothing ? node(composed, data, :tau) : nothing
         sampler = prepare_sampler(built, bound, zeros(built.layout.total); backend=BACKEND)
         control = prepare_sampler(composed, other, zeros(composed.layout.total); backend=BACKEND)
         replayed = ReactiveKernelsPPL._eval_kernel_def(kernel_expr(bound, built.layout))
@@ -75,6 +76,9 @@ end
             saved = copy(u)
             expected = reference(built.layout, data, u)
             @test Base.invokelatest(tau, u) ≈ expected.tau
+            if control_tau !== nothing
+                @test Base.invokelatest(control_tau, u) ≈ expected.tau
+            end
             @test Base.invokelatest(node(built, data, :prior), u) ≈ expected.prior
             @test Base.invokelatest(node(built, data, :likelihood), u) ≈ expected.likelihood
             @test Base.invokelatest(replay, u) ≈ expected.posterior
@@ -96,7 +100,7 @@ end
     ast = quote
         c ~ Ordered(Normal(0, 1), 3)
         a ~ Normal(0, 1)
-        alias = c
+        alias = c[:]
         values = [c[1], alias[3], [a, c[2]][1]]
         y ~ Normal(sum(values), 1.0)
     end
