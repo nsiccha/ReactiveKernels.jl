@@ -12,7 +12,9 @@ fragments coalesce.
 function compose(gs::Graph...)
     out = Graph()
     for g in gs
-        merge!(out.values, g.values)
+        for value in values(g.values)
+            _register!(out, value)
+        end
         merge!(out.aliases, g.aliases)
     end
     for g in gs

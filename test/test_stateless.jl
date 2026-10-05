@@ -2,6 +2,25 @@
 using ReactiveKernels
 using Test
 
+@testset "extending restored graph identities" begin
+    RK = ReactiveKernels
+    # Restored metadata can contain IDs not yet seen by this process. Use
+    # disjoint high IDs to exercise each builder path without resetting the
+    # allocator or depending on the order of other tests.
+    for build in (identity, compose)
+        id = RK._VALUE_COUNTER[] + 100
+        retained = Value{Float64}(id, :retained)
+        g = Graph(Dict(id => retained), Recipe[], Dict{Int,Vector{Int}}(),
+                  Dict{Int,Int}(), 0)
+        extended = build(g)
+        fresh = value!(extended, :fresh, Float64)
+        @test fresh.id > id
+        @test extended.values[id] === retained
+        @test length(extended.values) == 2
+        @test value(:standalone, Float64).id > fresh.id
+    end
+end
+
 # Positional operations deliberately have no global names in lowered code.
 # Inspect the Expr structurally so generated-code assertions prove exactly
 # which operation slots are called instead of searching for absent op names.
