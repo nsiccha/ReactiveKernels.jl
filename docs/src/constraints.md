@@ -35,6 +35,14 @@ Fixed structural algebra, such as the scalar entries of an intrinsically
 three-compartment operator, is distinct
 from data-derived iteration and may be expanded.
 
+This requirement governs RK emission, including tracing controlled by RK,
+not the final backend optimizer. The user clarified this scope on October 5
+(`ReactiveKernels:scan-optimizer.0rsi83j`, reply to brief
+`2026-10-05T16-53-50-538-9c52e1`, message
+`2026-10-05T16:54:59+02:00`). Subsequent backend unrolling or other
+semantics-preserving optimization is permitted. Inspect the emitted trace to
+verify the lowering rule; optimized loop counts are diagnostics.
+
 A surviving loop alone does not establish that it implements the intended
 work. Inspect its reachable body and callees, and any equivalent array work,
 alongside selected values, ordinary derivatives and growth across data sizes.
@@ -146,9 +154,9 @@ and ordinary reverse-mode derivatives. The backend-only reproducer is
 simplex acceptance is in `test_capability_scan_priors_reactant.jl`.
 
 A lowering change must demonstrate that increasing relevant data lengths or
-capacities does not replicate loop bodies or control-flow regions. Check the
-generated backend structure as well as primal and AD parity with native Julia,
-including inactive branches and empty or ragged cases where supported. A small
+capacities does not replicate loop bodies or control-flow regions in RK
+emission, including its trace. Check that emitted structure as well as primal
+and AD parity with native Julia, including inactive branches and empty or ragged cases where supported. A small
 Julia statement count alone does not establish this: tracing can still expand
 a host loop.
 
@@ -157,7 +165,7 @@ Interpret acceptance evidence according to what it establishes:
 | Evidence | Required interpretation |
 | --- | --- |
 | Changed-input values, ordinary derivatives, observable effects, ownership and invalid-access safety | Semantic correctness checks; do not relax them to accommodate a compiler. |
-| Retained data-derived iteration and bounded body growth | Separately requested structural invariants; pure-branch speculation does not waive them. |
+| Retained data-derived iteration and bounded body growth in RK emission | Required lowering structure; subsequent backend optimization is outside this structural requirement. |
 | Complete inventories and missing HLO conditionals in pure-arithmetic guards | Structural diagnostics; a missing conditional alone is not a correctness failure without a relevant requirement or observable impact. |
 | Runtime, allocations and data movement | Workload-specific performance or resource evidence; state the workload, direction, comparison and measurement conditions. |
 
@@ -176,10 +184,11 @@ scalar simplifications separately. Pure branch simplification is subject to
 the semantic requirements above, rather than a blanket conditional-instruction
 count.
 
-For compiled acceptance inspect both optimized MLIR and the HLO of the actual
-default executable. XLA may remove singleton loops, simplify pure branches or
-move invariant work after MLIR checks pass. Verify the separate retained
-data-derived iteration requirement and operation-growth diagnostics. For
+For compiled acceptance inspect the emitted trace for the RK iteration
+requirement. Optimized MLIR and the HLO of the actual default executable help
+diagnose semantics and performance; their loop counts and operation growth
+are not structural acceptance gates. XLA may unroll loops, simplify pure
+branches or move invariant work while preserving semantics. For
 branches, check selected values, ordinary derivatives, effects and safety at
 changed valid and invalid inputs; pure speculation with preserved semantics is
 not a failing branch check merely because the executable uses a selection.
@@ -197,8 +206,11 @@ through the retained control program, and host-drained observational records
 travel in its loop carry as structure-of-arrays storage written by one dynamic
 slot write per call site (the [compiler](compiler.md) page describes it), so
 no stateful path replicates a body per admitted iteration. The
-Reactant [scan](scan.md) lowering retains one `while` loop for every
-iterated-sequence shape, including bound host sequences.
+Reactant [scan](scan.md) lowering emits a `while` loop for supported nonempty
+sequences, including bound host sequences. Its default optimizer can expand
+short scans after tracing; the [scan optimization diagnostics](scan.md) record
+that behavior with correct values, ordinary reverse mode and caller ownership.
+It does not violate the RK emission requirement.
 
 Grouped PK recurrences expose a subject plate containing retained event scans.
 Their fixed-size matrix and named carry intermediates batch as typed leaves,
@@ -265,9 +277,9 @@ and lock the one Reactant 0.2.289 lifted:
   Default optimized reverse expands those small lazy batches into one branch
   region per lane instead of retaining the batch loop:
   `repro_reactant_lazy_batch_growth.jl` has correct values and gradients at
-  two and five lanes, but different operation inventories. The fixed-structure
-  requirement remains unmet for that shape; changing optimizer flags is not
-  acceptance of the ordinary path.
+  two and five lanes, but different operation inventories. The emitted cell
+  body satisfies the RK structure requirement; the optimizer expansion is
+  diagnostic rather than an unsupported shape.
 - Reverse compilation through a retained `while` loop whose exit is data
   dependent (the adaptive ODE solver's `(n < maxiters) & (t < t1)`) fails
   because the loop has no statically known iteration count:
@@ -299,9 +311,9 @@ and lock the one Reactant 0.2.289 lifted:
   invalid inactive logarithms. Its emitted transform and prior retain loops;
   default optimized primal and reverse have identical operation inventories
   at K = 8 and 16 as observation and group counts grow. The backend still
-  expands small data-derived K = 2 and 4, so full fixed-structure acceptance
-  remains unmet. `repro_reactant_guarded_diagonal_growth.jl` isolates this
-  optimizer boundary with the backend alone. No flag change is acceptance.
+  expands small data-derived K = 2 and 4 after emission, which satisfies the
+  RK iteration requirement. `repro_reactant_guarded_diagonal_growth.jl`
+  records this backend optimization without treating it as a capability gap.
   A declared literal two-dimensional factor keeps its one scalar diagonal
   prior equation.
 - Native Enzyme reverse mode aborts the process (an LLVM assertion in its

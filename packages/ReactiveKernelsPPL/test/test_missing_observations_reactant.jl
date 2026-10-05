@@ -32,7 +32,8 @@ function _missing_compiled_check(fx, name; structure=false, oracle_rtol=1e-9)
     @test size(Array(actual.y)) == size(fx.data.y)
     @test isequal(fx.data, saved)
     if structure
-        texts = ("primal.mlir" => repr(Reactant.@code_hlo kernel(ru)),
+        texts = ("emitted.mlir" => repr(Reactant.@code_hlo optimize=false kernel(ru)),
+            "primal.mlir" => repr(Reactant.@code_hlo kernel(ru)),
             "reverse.mlir" => repr(Reactant.@code_hlo reverse.f(ru)),
             "primal.hlo" => repr(only(Reactant.XLA.get_hlo_modules(primal.exec))),
             "reverse.hlo" => repr(only(Reactant.XLA.get_hlo_modules(reverse.exec))))

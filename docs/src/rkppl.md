@@ -561,10 +561,12 @@ available. This compiler repair is tracked separately from missing-response
 binding. Successful compiled checks for other shapes do not establish support
 for this affected shape.
 
-Some short guarded likelihood batches still expand into repeated scalar work
-in default compiled code. The Beta and Binomial missing-response checks retain
-their numerical and ordinary reverse results separately from this unmet
-retained-body requirement; larger batches have separate structure checks.
+Some short guarded likelihood batches expand into repeated scalar work during
+backend optimization. RK must emit retained loops or batched array structure;
+subsequent semantics-preserving backend unrolling is diagnostic, following the
+user's October 5 scope clarification in [Core constraints](constraints.md).
+The Beta and Binomial checks record emitted traces, optimized MLIR and actual
+executable HLO alongside values and ordinary reverse results.
 
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
