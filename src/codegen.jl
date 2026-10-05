@@ -3968,6 +3968,9 @@ catch
 end
 _opname(::_AuthoredPlateOp) = "plate"
 _opname(::_AuthoredScanOp) = "scan"
+# Captured `@kernel` source is shown through its recipe's retained source
+# (`_recipe_label`, display.jl); the operation object itself is only "source".
+_opname(::_KernelSourceOp) = "source"
 
 function _readable_callee(op)
     name = try
@@ -4077,6 +4080,7 @@ function _recipe_line(r::Recipe)
         suffix = _unpack_access_suffix(r.op)
         suffix !== nothing && return "$outs = $(only(r.inputs).name)$suffix"
     end
+    r.op isa _KernelSourceOp && _has_source(r) && return "$outs = $(_recipe_label(r))"
     "$outs = $(_opname(r.op))($ins)"
 end
 

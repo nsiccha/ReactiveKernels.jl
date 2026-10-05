@@ -863,10 +863,7 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
         return nothing
     end
     if head === :ref
-        _collect_array_ref!(refs, ex, plan, label, bound;
-            allow_gather = false) || _fail(label, "indexing `$(repr(ex))` " *
-            "reads array parameters only")
-        return nothing
+        return _collect_model_value_ref!(refs, ex, plan, label, bound)
     end
     if head === Symbol("'")
         for a in ex.args

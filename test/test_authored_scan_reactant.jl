@@ -2,6 +2,7 @@ using ReactiveKernels, Reactant, Test
 include("test_scan_plate_reactant.jl")
 import Enzyme
 using DifferentiationInterface: AutoEnzyme
+include("test_scan_endpoint_scope_reactant.jl")
 
 if !isdefined(@__MODULE__, :AuthoredScanFixtures)
     include(joinpath(@__DIR__, "fixtures", "authored_scan.jl"))
