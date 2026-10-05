@@ -197,8 +197,10 @@ through the retained control program, and host-drained observational records
 travel in its loop carry as structure-of-arrays storage written by one dynamic
 slot write per call site (the [compiler](compiler.md) page describes it), so
 no stateful path replicates a body per admitted iteration. The
-Reactant [scan](scan.md) lowering retains one `while` loop for every
-iterated-sequence shape, including bound host sequences.
+Reactant [scan](scan.md) lowering emits a `while` loop for supported nonempty
+sequences, including bound host sequences. Its default optimizer can expand
+short scans after tracing; the [scan limitations](scan.md) distinguish correct
+values and ordinary reverse mode from the unmet retained-iteration requirement.
 
 Grouped PK recurrences expose a subject plate containing retained event scans.
 Their fixed-size matrix and named carry intermediates batch as typed leaves,
