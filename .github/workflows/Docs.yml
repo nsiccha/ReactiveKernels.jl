@@ -50,9 +50,10 @@ jobs:
           clone_pin https://github.com/nsiccha/HTMXObjects.jl.git     aaffb38fa1e430becd8ba1e9199b55c659d2418c "$DEPS/HTMXObjects.jl"    # devibe
           clone_pin https://github.com/nsiccha/Treebars.jl.git        e502929e702b5bf6bf92512bde678c152eac320f "$DEPS/Treebars.jl"        # default HEAD
           clone_pin https://github.com/nsiccha/BayesianRegressionModels.jl.git 1f296dac2c086347525194887500948edb213228 "$DEPS/BayesianRegressionModels.jl" # ns/devibe; GP/HSGP adoption
-          # Julia 1.10 needs explicit paths for BRM's unregistered dependencies.
+          # Supply BRM's unregistered deps and its published StanBlocks API floor.
           clone_pin https://github.com/nsiccha/MutatingFunctions.jl.git 12b953dc4ac494fabca5e145f3470bca468235ff "$DEPS/MutatingFunctions.jl"
           clone_pin https://github.com/nsiccha/OutputSignatures.jl.git c86bd6088beaf14f4dfd3c38329d7b44e6657288 "$DEPS/OutputSignatures.jl"
+          clone_pin https://github.com/nsiccha/StanBlocks.jl.git 8580826e492aa8681e833f87e8d215b06407bfa1 "$DEPS/StanBlocks.jl" # devibe; ValueFamily
           julia --project=docs -e '
             using Pkg
             deps = ENV["RUNNER_TEMP"] * "/rk-docs-deps"
@@ -76,6 +77,7 @@ jobs:
               PackageSpec(path=joinpath(deps, "BayesianRegressionModels.jl")),
               PackageSpec(path=joinpath(deps, "MutatingFunctions.jl")),
               PackageSpec(path=joinpath(deps, "OutputSignatures.jl")),
+              PackageSpec(path=joinpath(deps, "StanBlocks.jl")),
             ])
             Pkg.instantiate()
           '
