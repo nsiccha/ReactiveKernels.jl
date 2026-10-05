@@ -125,7 +125,7 @@ function _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, n
 end
 
 function _kernel_with_ignored_throws(op::_KernelSourceOp{Token,Form}, ignored) where {Token,Form}
-    _KernelSourceOp(Val(Token), Val(Form), op.f, op.tensor_f, ignored)
+    _KernelSourceOp(Val(Token), Val(Form), op.f, op.tensor_f, ignored, op.call_identity)
 end
 
 _kernel_ignore_throw_op(op) = _IgnoredThrowFunction(op)

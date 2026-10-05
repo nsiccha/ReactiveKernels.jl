@@ -88,6 +88,11 @@ end
 end
 end
 
+module AuthoringLoweredCallFixture
+const exp_alias = Base.exp
+mutable_exp = Base.exp
+end
+
 @testset "Declarative kernel authoring" begin
     @testset "function-shaped definitions, optional types, and exposed ports" begin
         f_calls = Ref(0)
@@ -421,7 +426,10 @@ end
             return s
         end
         plain_graph = kernel_graph(nested_plain_twice)
-        @test count(r -> r.op === exp, plain_graph.recipes) == 1
+        # Native lowering can wrap exp; the shared value still has one producer.
+        @test length(ReactiveKernels.producers_of(
+            plain_graph, nested_plain_twice[:a].id,
+        )) == 1
         @test ReactiveKernels.canon_id(plain_graph, nested_plain_twice[:a].id) ==
               ReactiveKernels.canon_id(plain_graph, nested_plain_twice[:b].id)
         @test @inferred(prepare(plan(nested_plain_twice; want = :s))(1.0)) ==
@@ -1392,10 +1400,133 @@ end
             return z
         end
         plain_merged = merge(plain_merge_base, plain_merge_fragment)
-        @test count(
-            r -> r.op === exp, kernel_graph(plain_merged).recipes,
-        ) == 1
+        @test length(ReactiveKernels.producers_of(
+            kernel_graph(plain_merged), plain_merged[:y].id,
+        )) == 1
         @test prepare(plain_merged; want = :z)(1.0) == exp(1.0) + 1
+
+        @testset "lowered exact calls retain composition identity" begin
+            qualified = @kernel begin
+                x::Float64
+                y::Float64 = Base.exp(x)
+                return y
+            end
+            aliased = @kernel begin
+                x::Float64
+                y::Float64 = AuthoringLoweredCallFixture.exp_alias(x)
+                return y
+            end
+            generated = @eval @kernel begin
+                x::Float64
+                y::Float64 = $(GlobalRef(Base, :exp))(x)
+                return y
+            end
+            for fragment in (qualified, aliased, generated)
+                shared = merge(plain_merge_base, fragment)
+                @test length(ReactiveKernels.producers_of(
+                    kernel_graph(shared), shared.y.id,
+                )) == 1
+                @test prepare(shared)(0.4) == exp(0.4)
+            end
+
+            cats = @kernel begin
+                left::Vector{Float64}
+                right::Vector{Float64}
+                result::Matrix{Float64} = hcat(left, right)
+                return result
+            end
+            same_cat = @kernel begin
+                left::Vector{Float64}
+                right::Vector{Float64}
+                result::Matrix{Float64} = Base.hcat(left, right)
+                return result
+            end
+            reversed_cat = @kernel begin
+                left::Vector{Float64}
+                right::Vector{Float64}
+                result::Matrix{Float64} = hcat(right, left)
+                return result
+            end
+            shared_cat = merge(cats, same_cat)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(shared_cat), shared_cat.result.id,
+            )) == 1
+            @test prepare(shared_cat)([1.0, 2.0], [3.0, 4.0]) == [1.0 3.0; 2.0 4.0]
+            ordered_cat = merge(cats, reversed_cat)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(ordered_cat), ordered_cat.result.id,
+            )) == 2
+
+            cheaper = @kernel begin
+                x::Float64
+                @recipe (cost = 0.25) y::Float64 = exp(x)
+                return y
+            end
+            alternatives = merge(plain_merge_base, cheaper)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(alternatives), alternatives.y.id,
+            )) == 2
+            @test plan(alternatives).cost == 0.25
+
+            wider = @kernel begin
+                x::Float64
+                other::Any = exp(x)
+                return other
+            end
+            typed = merge(plain_merge_base, wider)
+            @test ReactiveKernels.canon_id(kernel_graph(typed), typed.y.id) !=
+                  ReactiveKernels.canon_id(kernel_graph(typed), typed.other.id)
+            @test prepare(typed; want = (:y, :other))(0.4) == (exp(0.4), exp(0.4))
+
+            # Formula definitions and dynamic callees still have separate
+            # provenance. An explicit key or effectful flag keeps its meaning.
+            fused_a = @kernel begin
+                x::Float64
+                y::Float64 = exp(x) + 1
+                return y
+            end
+            fused_b = @kernel begin
+                x::Float64
+                y::Float64 = exp(x) + 1
+                return y
+            end
+            fused = merge(fused_a, fused_b)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(fused), fused.y.id,
+            )) == 2
+            mutable_a = @kernel begin
+                x::Float64
+                y::Float64 = AuthoringLoweredCallFixture.mutable_exp(x)
+                return y
+            end
+            mutable_b = @kernel begin
+                x::Float64
+                y::Float64 = AuthoringLoweredCallFixture.mutable_exp(x)
+                return y
+            end
+            dynamic = merge(mutable_a, mutable_b)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(dynamic), dynamic.y.id,
+            )) == 2
+            keyed = @kernel begin
+                x::Float64
+                @recipe (cse_key = :distinct_exp) y::Float64 = exp(x)
+                return y
+            end
+            explicit = merge(plain_merge_base, keyed)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(explicit), explicit.y.id,
+            )) == 2
+            effectful = @kernel begin
+                x::Float64
+                @recipe (effectful = true) y::Float64 = exp(x)
+                return y
+            end
+            effects = merge(effectful, effectful)
+            @test length(ReactiveKernels.producers_of(
+                kernel_graph(effects), effects.y.id,
+            )) == 2
+        end
 
         single_alias = @kernel begin
             x::Int

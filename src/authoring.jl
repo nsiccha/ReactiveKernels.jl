@@ -215,7 +215,10 @@ _kernel_source_token(::_KernelSourceOp{Token}) where {Token} = Token
 # graph (nested-spec splice and merge/compose). An explicit `cse_key` always
 # wins and effectful recipes keep `nothing` (`add!` never CSE-merges those).
 # Otherwise the key names the computation: compiler-owned source operations
-# reuse their definition Token, while every other operation keys on
+# reuse their definition Token, except exact calls retained through lowering.
+# Those calls, like raw operations, key on callable identity, cost and output
+# types; the lowering mode also distinguishes their native/tensorized bodies.
+# Every other operation keys on
 # `(op, cost, output types)` so that repeated splices of the same pure call
 # merge instead of manufacturing one alternative producer per call site (the
 # planner's exact search is exponential in the number of such producers).
@@ -226,7 +229,12 @@ function _kernel_provenance_key(recipe::Recipe)
     recipe.cse_key !== nothing && return recipe.cse_key
     recipe.effectful && return nothing
     op = recipe.op
-    op isa _KernelSourceOp && return _KernelProvenanceKey{_kernel_source_token(op)}()
+    if op isa _KernelSourceOp
+        op.call_identity === nothing &&
+            return _KernelProvenanceKey{_kernel_source_token(op)}()
+        return (:kernel_lowered_call, op.call_identity, recipe.cost,
+                map(valtype, recipe.outputs))
+    end
     (:kernel_plain_op, op, recipe.cost, map(valtype, recipe.outputs))
 end
 
@@ -3131,11 +3139,35 @@ function _kernel_source_native_scope(ex)
     any(_kernel_source_native_scope, ex.args)
 end
 
+# Only a stable callable binding establishes the same lowered call across
+# definitions. Computed callees, graph-port calls and mutable globals retain
+# their definition-specific provenance.
+function _kernel_constant_callable(mod, callee)
+    if callee isa GlobalRef
+        return isdefined(callee.mod, callee.name) && isconst(callee.mod, callee.name) &&
+               getglobal(callee.mod, callee.name) isa Function
+    end
+    mod isa Module || return false
+    if callee isa Symbol
+        return isdefined(mod, callee) && isconst(mod, callee) &&
+               getglobal(mod, callee) isa Function
+    elseif callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
+           callee.args[1] isa Symbol && callee.args[2] isa QuoteNode
+        outer, inner = callee.args[1], callee.args[2].value
+        isdefined(mod, outer) && isconst(mod, outer) || return false
+        owner = getglobal(mod, outer)
+        return owner isa Module && isdefined(owner, inner) && isconst(owner, inner) &&
+               getglobal(owner, inner) isa Function
+    end
+    false
+end
+
 function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
                            nested_specs = Dict{Symbol,Any}())
     form = :fused
+    call_identity = nothing
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
         args = rhs.args[2:end]
@@ -3157,6 +3189,12 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
             return callee                                   # BARE exact identity — stays raw (validated)
+        end
+        if !_native_callee_shadowed(callee, known) &&
+           _kernel_constant_callable(mod, callee) &&
+           length(args) == length(deps) &&
+           all(i -> args[i] === deps[i], eachindex(args))
+            call_identity = Expr(:tuple, callee, tensorize)
         end
         # a call THROUGH A PORT — `callable(args…)` where the callee itself is a port (RK 07:24): the
         # first dep is the callable source, the rest are ordered args. Tagged `:portcall` so a prepared
@@ -3193,7 +3231,8 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
          Expr(:->, Expr(:tuple, deps...), _kernel_native_body(rhs, mod, known)),
          Expr(:->, Expr(:tuple, deps...),
-              tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs))
+              tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs),
+         nothing, call_identity)
 end
 
 # `(condition, then, else)` of a value-producing top-level lazy branch —
