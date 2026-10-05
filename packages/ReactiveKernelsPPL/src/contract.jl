@@ -5957,20 +5957,7 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
         "derived `name = ...` first",
     )
     if head === :ref
-        # Indexing a model-level value, or one element of a column.
-        # Opaque result shapes do not permit a parameter-derived gather
-        # index to escape the same data-only check as a vector definition.
-        length(ex.args) == 2 && _check_gather_index(ex, plan, label, false)
-        _collect_array_ref!(refs, ex, plan, label, bound;
-            allow_gather=false) && return nothing
-        obj = ex.args[1]
-        if !(bound && obj isa Symbol && haskey(plan.columns, obj))
-            _collect_assignment_refs!(refs, obj, plan, label, bound)
-        end
-        for i in ex.args[2:end]
-            _collect_assignment_refs!(refs, i, plan, label, bound)
-        end
-        return nothing
+        return _collect_model_value_ref!(refs, ex, plan, label, bound)
     end
     if head === :vect || head === :tuple
         for a in ex.args
@@ -5980,6 +5967,25 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
         return nothing
     end
     return _fail(label, "unsupported expression head $head (pure calls only)")
+end
+
+# Indexing a model-level value, or one element of a column, has the same
+# meaning inside a scalar assignment and an array expression. Declared
+# arrays keep their axis validation; other values keep ordinary Julia reads.
+function _collect_model_value_ref!(refs, ex::Expr, plan, label, bound::Bool)
+    # Opaque result shapes cannot bypass the existing data-only index check.
+    length(ex.args) == 2 && _check_gather_index(ex, plan, label, false)
+    _collect_array_ref!(refs, ex, plan, label, bound;
+        allow_gather=false) && return nothing
+    obj = ex.args[1]
+    if !(bound && obj isa Symbol && haskey(plan.columns, obj))
+        _collect_assignment_refs!(refs, obj, plan, label, bound)
+    end
+    for i in ex.args[2:end]
+        i === :(:) && continue
+        _collect_assignment_refs!(refs, i, plan, label, bound)
+    end
+    return nothing
 end
 
 # Arguments of a module function call (functions as values) are whole
