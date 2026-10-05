@@ -3177,6 +3177,8 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            nested_specs = Dict{Symbol,Any}())
     form = :fused
     call_identity = nothing
+    call_capture_name = nothing
+    resolved_callable = nothing
     if rhs isa Expr && rhs.head === :call && !isempty(rhs.args)
         callee = rhs.args[1]
         args = rhs.args[2:end]
@@ -3204,6 +3206,10 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
            length(args) == length(deps) &&
            all(i -> args[i] === deps[i], eachindex(args))
             call_identity = Expr(:tuple, callee, tensorize)
+            call_capture_name = callee isa Symbol ? QuoteNode(callee) :
+                callee isa Expr ? QuoteNode(first(callee.args)) : nothing
+            resolved_callable = QuoteNode(callee isa GlobalRef ?
+                getglobal(callee.mod, callee.name) : _kernel_resolve_binding(mod, callee))
         end
         # a call THROUGH A PORT — `callable(args…)` where the callee itself is a port (RK 07:24): the
         # first dep is the callable source, the rest are ordered args. Tagged `:portcall` so a prepared
@@ -3241,7 +3247,7 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
          Expr(:->, Expr(:tuple, deps...), _kernel_native_body(rhs, mod, known)),
          Expr(:->, Expr(:tuple, deps...),
               tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs),
-         nothing, call_identity)
+         nothing, call_identity, call_capture_name, resolved_callable)
 end
 
 # `(condition, then, else)` of a value-producing top-level lazy branch —

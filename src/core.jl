@@ -119,6 +119,24 @@ _KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF,
                 ignored_throws::IG = nothing, call_identity::CI = nothing) where
                 {DefToken,Form,F,TF,IG,CI} =
     _KernelSourceOp{DefToken,Form,F,TF,IG,CI}(f, tensor_f, ignored_throws, call_identity)
+
+# A module binding can be shadowed by a lexical callable captured in either
+# execution body. Its value at construction need not identify later calls,
+# especially when Julia retains a reassigned local in a shared Core.Box.
+# The runtime callable must also match the binding resolved by lowering,
+# which can have replaced the call and removed its lexical capture entirely.
+function _KernelSourceOp(token::Val, form::Val, f, tensor_f,
+                         ignored_throws, call_identity, capture_name, resolved_callable)
+    if call_identity !== nothing &&
+       (first(call_identity) !== resolved_callable ||
+        (capture_name !== nothing &&
+         (capture_name in fieldnames(typeof(_kernel_native_source(f))) ||
+          capture_name in fieldnames(typeof(_kernel_native_source(tensor_f))))))
+        call_identity = nothing
+    end
+    _KernelSourceOp(token, form, f, tensor_f, ignored_throws, call_identity)
+end
+
 # Preserve the established internal constructor for compiler fixtures and
 # already-authored handles; without an alternate body it uses the same callable
 # in both modes.
