@@ -77,8 +77,6 @@ const _MATRIX_CORE_TESTS = (
     "test_kernel_control.jl",
     "test_kernel_control_regressions.jl",
     "test_kernel_nuts.jl",
-    "test_kernel_nuts_native.jl",
-    "test_mutation_profile_b.jl",
     "test_nuts_docs_fixture.jl",
     "test_reactivehmc_algorithm_corpus.jl",
     "test_reactivehmc_corpus_docs.jl",
@@ -112,7 +110,12 @@ const _MATRIX_ACCEPTANCE_RUNTIME_TESTS = (
     "test_reactive_sampler_baseline.jl",
 )
 
+# On Julia 1/pre the native-NUTS file takes 7-29 minutes and the mutation-profile
+# file 25 to over 40 (LTS: 3-4 and 8-10), which pushed those core cells to or
+# past the 90-minute job ceiling, so they run once here instead of on nine cells.
 const _MATRIX_ACCEPTANCE_SAMPLERS_TESTS = (
+    "test_kernel_nuts_native.jl",
+    "test_mutation_profile_b.jl",
     "test_reactive_nuts.jl",
     "test_reactive_adaptation.jl",
     "test_benchmark_smoke.jl",

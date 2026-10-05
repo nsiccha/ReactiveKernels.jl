@@ -469,7 +469,7 @@ Main.ReactiveKernelsDocs.render_nested_plate_example(@__MODULE__)
 
 `plate_body` exposes the nested scalar plans, and `recipe_inventory` lists a
 program's plates and scans recursively (see [Inspecting
-structure](#inspecting-structure)). `prepare` supports bound group
+structure](#Inspecting-structure)). `prepare` supports bound group
 data with a live scalar scale, and `prepare_ad` with ordinary native Enzyme
 Reverse differentiates the scale through both loops. No custom derivative
 rule is required. The native acceptance suite also replays the displayed
