@@ -739,6 +739,20 @@ side.
   `bound = plan` to add the generated pre-build `@kernel` program and
   `query = prepare_query(...)` to add that prepared program. The view only
   reads these values; nothing is lowered, bound, built or evaluated again.
+- `recipe_inventory` lists a program's plates and scans with their nesting, so a
+  structure check reads the public contract rather than internal operation
+  types. For a model whose subject plate holds a child scan, beside its
+  observation plate:
+
+  ```julia
+  structure(program) = [(e.kind, e.depth) for e in recipe_inventory(program)
+                        if e.kind !== :ordinary]
+  structure(built.spec)                         # [(:plate, 0), (:scan, 1), (:plate, 0)]
+  structure(prepare_sampler(built, plan, u; backend).kernel)   # the same, data bound
+  ```
+
+  `recipe_kind(recipe)` classifies one recipe, and `plate_body`/`scan_body`
+  return a body plan; see the ReactiveKernels compiler page.
 - `kernel_expr(plan, built.layout)` returns the generated `@kernel` program
   shown above.
 - `packages/ReactiveKernelsPPL/report/transpile_report.jl --surface model.jl

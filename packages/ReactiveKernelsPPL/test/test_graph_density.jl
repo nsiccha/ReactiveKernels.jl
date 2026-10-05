@@ -24,7 +24,7 @@ function independent_gradient(fx, u)
 end
 function prepared_cell_sources(spec)
     [join((string(cell.source) for cell in plate_body(r).recipes), "\n") for r in spec.graph.recipes
-        if r.op isa ReactiveKernels._AuthoredPlateOp]
+        if recipe_kind(r) === :plate]
 end
 
 @testset "caller graph densities compose in the observation plate" begin
