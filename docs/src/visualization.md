@@ -83,7 +83,7 @@ under its recipe. A recipe captured from `@kernel` source reads as
 The same walk is available as data: `recipe_inventory` returns one `(; kind,
 depth, parent, recipe)` entry per listed recipe, and `recipe_kind` classifies a
 single recipe as `:plate`, `:scan` or `:ordinary` (see [Inspecting
-structure](compiler.md#inspecting-structure)).
+structure](compiler.md#Inspecting-structure)).
 
 `readable_code(spec_or_plan)` shows the planned program as ordinary Julia,
 with every operation slot replaced by its authored source or name and no
