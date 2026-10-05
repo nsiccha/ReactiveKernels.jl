@@ -3010,7 +3010,7 @@ ReactantCore.is_traced(::PreparedKernel, ::Base.IdSet) = false
 # residual ABI.
 struct _ExternalBoundArraySlot{I} end
 
-struct _ExternalizedBoundArrayCall{F,O,I,H}
+struct _ExternalizedBoundArrayCall{F,O,I,H,C}
     f::F
     ops::O
 end
@@ -3042,9 +3042,11 @@ end
     _native_body_call_expr(F, :f, :ops, forwarded)
 end
 
-@generated function (call::_ExternalizedBoundArrayCall{F,O,I,H})(
-        args::Vararg{Any,N}) where {F,O,I,H,N}
-    external_count = length(I)
+@generated function (call::_ExternalizedBoundArrayCall{F,O,I,H,C})(
+        args::Vararg{Any,N}) where {F,O,I,H,C,N}
+    # Replaced slots and trailing operands differ in a rewritten body:
+    # records contribute each array leaf, while numeric slots become literals.
+    external_count = C
     public_count = N - external_count
     public_count >= 0 || return :(throw(ArgumentError(
         "externalized bound-array call is missing hidden operands")))
@@ -3129,10 +3131,11 @@ function _externalize_bound_array_call(f, ops;
         _externalize_bound_array_body(f, positions, values) : nothing
     callable = external_body === nothing ? f :
         RuntimeGeneratedFunctions.drop_expr(external_body)
+    external_values = external_body === nothing ? values : _bound_array_leaves(values)
     call = _ExternalizedBoundArrayCall{
         typeof(callable),typeof(stripped),positions,
-        external_body !== nothing}(callable, stripped)
-    call, external_body === nothing ? values : _bound_array_leaves(values)
+        external_body !== nothing,length(external_values)}(callable, stripped)
+    call, external_values
 end
 
 # A rewritten body takes every array leaf of a structured bound value as its
