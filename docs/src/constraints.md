@@ -380,6 +380,27 @@ and lock the one Reactant 0.2.289 lifted:
   [Enzyme issue #2386](https://github.com/EnzymeAD/Enzyme.jl/issues/2386)
   tracks comprehension activity analysis. This evidence and boundary note are
   interim tracking, not completion of that capability.
+- Native Enzyme reverse rejects Base's dense concatenation methods when
+  constant and active arrays of one element type meet
+  (`EnzymeRuntimeActivityError`): `vcat`/`hcat` of `Vector{T}`s, the
+  `typed_hcat`/`typed_vcat`/`typed_hvcat` loops behind `hcat`, `vcat` and
+  `hvcat` of `Vector{T}`/`Matrix{T}` operands, and `stack`. These methods
+  read each operand from their vararg tuple at a runtime index, which joins
+  the operands' activities. `repro_enzyme_mixed_activity_concat.jl`
+  reproduces it with Enzyme only on Julia 1.10.12 / Enzyme 0.13.209 and
+  Julia 1.12.7 / Enzyme 0.13.210; there, generic `cat(...; dims)` fails as
+  well. A design matrix of data columns and a parameter-dependent column,
+  `hcat(ones(n), x, exp.(a .* x))`, is this shape. The native kernel body
+  therefore lowers calls of Base's `hcat`, `vcat` and `hvcat`, and the
+  bracket syntax Julia lowers to them, to RK-owned companions. For
+  same-element-type isbits `Vector`/`Matrix` operands, they allocate Base's
+  result and copy each operand in its own inlined call; every other operand
+  combination and every shape Base rejects call Base, which keeps its value
+  and error. Ordinary reverse then differentiates the authored graph, with
+  no activity annotation or derivative rule. The tensorized body keeps its
+  own concatenation lowering. Concatenation inside an opaque helper the
+  kernel calls, `cat`, `stack` and non-dense operands (views, adjoints)
+  keep Base's methods and remain the backend's limitation.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later

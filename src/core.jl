@@ -352,6 +352,155 @@ end
 @inline _native_broadcast_copyto!(dest::Array, bc) =
     copyto!(dest, Base.Broadcast.preprocess(nothing, bc))
 
+# Native concatenation.  Base's methods for dense arrays of one element type,
+# `hcat`/`vcat` of `Vector{T}`s and the `typed_hcat`/`typed_vcat`/
+# `typed_hvcat` loops behind `hcat`, `vcat` and `hvcat` of `Vector{T}` and
+# `Matrix{T}` operands, read each operand from their vararg tuple at a runtime
+# index.  When the operands mix constant data with active arrays, native
+# Enzyme reverse joins their activities at that load and fails static activity
+# analysis with `EnzymeRuntimeActivityError`, although the arguments' activity
+# is fixed (`benchmark/repro_enzyme_mixed_activity_concat.jl` reproduces it
+# without ReactiveKernels).  The native body calls these companions instead
+# (`_kernel_native_concats`).  They return Base's result, a freshly allocated
+# `Matrix{T}` or `Vector{T}` of the same shape and values, and copy each
+# operand in its own inlined call, so every copy stays tied to its tuple
+# position.  Any other operand combination, a non-isbits element type, and
+# every shape Base rejects call Base itself, which keeps its result and error.
+const _NativeDenseVecOrMat{T} = Union{Vector{T},Matrix{T}}
+
+@inline _native_cat_width(a::Vector) = 1
+@inline _native_cat_width(a::Matrix) = size(a, 2)
+
+# Sizes over an operand tuple, one inlined call per operand.
+@inline _native_cat_width_sum(::Tuple{}) = 0
+@inline _native_cat_width_sum(args::Tuple) =
+    _native_cat_width(first(args)) + _native_cat_width_sum(Base.tail(args))
+@inline _native_cat_height_sum(::Tuple{}) = 0
+@inline _native_cat_height_sum(args::Tuple) =
+    size(first(args), 1) + _native_cat_height_sum(Base.tail(args))
+@inline _native_cat_heights_equal(height, ::Tuple{}) = true
+@inline _native_cat_heights_equal(height, args::Tuple) =
+    size(first(args), 1) == height &&
+    _native_cat_heights_equal(height, Base.tail(args))
+@inline _native_cat_widths_equal(width, ::Tuple{}) = true
+@inline _native_cat_widths_equal(width, args::Tuple) =
+    _native_cat_width(first(args)) == width &&
+    _native_cat_widths_equal(width, Base.tail(args))
+@inline _native_cat_heights(::Tuple{}) = ()
+@inline _native_cat_heights(args::Tuple) =
+    (size(first(args), 1), _native_cat_heights(Base.tail(args))...)
+@inline _native_cat_widths(::Tuple{}) = ()
+@inline _native_cat_widths(args::Tuple) =
+    (_native_cat_width(first(args)), _native_cat_widths(Base.tail(args))...)
+
+# Copy the dense `a` into `out` (column-major, `stride` rows) with its first
+# element at row `row + 1`, column `column + 1`.  Callers allocate `out` from
+# the operands' validated shapes, so every copy is in bounds.
+@inline function _native_cat_block!(out, stride, row, column, a)
+    height = size(a, 1)
+    if height == stride
+        # Whole columns of `out` (then `row == 0`): one contiguous block.
+        Base.unsafe_copyto!(out, column * stride + 1, a, 1, length(a))
+    else
+        for j in 1:_native_cat_width(a)
+            Base.unsafe_copyto!(out, (column + j - 1) * stride + row + 1,
+                                a, (j - 1) * height + 1, height)
+        end
+    end
+    out
+end
+
+@inline _native_hcat(args...) = hcat(args...)
+@inline function _native_hcat(a::_NativeDenseVecOrMat{T},
+                              rest::_NativeDenseVecOrMat{T}...) where {T}
+    height = size(a, 1)
+    (isbitstype(T) && _native_cat_heights_equal(height, rest)) ||
+        return hcat(a, rest...)
+    out = Matrix{T}(undef, height,
+                    _native_cat_width(a) + _native_cat_width_sum(rest))
+    _native_hcat_copy!(out, height, 0, (a, rest...))
+end
+@inline _native_hcat_copy!(out, height, column, ::Tuple{}) = out
+@inline function _native_hcat_copy!(out, height, column, args::Tuple)
+    a = first(args)
+    _native_cat_block!(out, height, 0, column, a)
+    _native_hcat_copy!(out, height, column + _native_cat_width(a),
+                       Base.tail(args))
+end
+
+@inline _native_vcat(args...) = vcat(args...)
+@inline function _native_vcat(a::Vector{T}, rest::Vector{T}...) where {T}
+    isbitstype(T) || return vcat(a, rest...)
+    out = Vector{T}(undef, length(a) + _native_cat_height_sum(rest))
+    _native_vcat_copy!(out, length(out), 0, (a, rest...))
+end
+@inline function _native_vcat(a::_NativeDenseVecOrMat{T},
+                              rest::_NativeDenseVecOrMat{T}...) where {T}
+    width = _native_cat_width(a)
+    (isbitstype(T) && _native_cat_widths_equal(width, rest)) ||
+        return vcat(a, rest...)
+    height = size(a, 1) + _native_cat_height_sum(rest)
+    out = Matrix{T}(undef, height, width)
+    _native_vcat_copy!(out, height, 0, (a, rest...))
+end
+@inline _native_vcat_copy!(out, height, row, ::Tuple{}) = out
+@inline function _native_vcat_copy!(out, height, row, args::Tuple)
+    a = first(args)
+    _native_cat_block!(out, height, row, 0, a)
+    _native_vcat_copy!(out, height, row + size(a, 1), Base.tail(args))
+end
+
+# `hvcat(rows, blocks...)`: block row `i` holds the next `rows[i]` blocks.
+# Base requires equal heights within a block row and equal total widths across
+# block rows; `(height, width)` of the result, or `nothing` for Base to decide.
+function _native_hvcat_shape(rows::Tuple{Vararg{Int}}, heights::Tuple,
+                             widths::Tuple)
+    k = 0
+    height = 0
+    width = -1
+    for n in rows
+        (n >= 1 && k + n <= length(heights)) || return nothing
+        h = heights[k + 1]
+        w = 0
+        for _ in 1:n
+            k += 1
+            heights[k] == h || return nothing
+            w += widths[k]
+        end
+        width < 0 && (width = w)
+        w == width || return nothing
+        height += h
+    end
+    k == length(heights) ? (height, width) : nothing
+end
+
+@inline _native_hvcat(rows, args...) = hvcat(rows, args...)
+@inline function _native_hvcat(rows::Tuple{Vararg{Int}},
+                               a::_NativeDenseVecOrMat{T},
+                               rest::_NativeDenseVecOrMat{T}...) where {T}
+    args = (a, rest...)
+    shape = _native_hvcat_shape(rows, _native_cat_heights(args),
+                                _native_cat_widths(args))
+    (isbitstype(T) && shape !== nothing) || return hvcat(rows, args...)
+    out = Matrix{T}(undef, shape[1], shape[2])
+    _native_hvcat_copy!(out, shape[1], rows, 1, 1, 0, 0, args)
+end
+@inline _native_hvcat_copy!(out, height, rows, i, j, row, column, ::Tuple{}) =
+    out
+@inline function _native_hvcat_copy!(out, height, rows, i, j, row, column,
+                                     args::Tuple)
+    a = first(args)
+    _native_cat_block!(out, height, row, column, a)
+    # One recursive call per operand: the next block starts a new block row
+    # after the last block of row `i`.
+    last = j == rows[i]
+    _native_hvcat_copy!(out, height, rows,
+                        last ? i + 1 : i, last ? 1 : j + 1,
+                        last ? row + size(a, 1) : row,
+                        last ? 0 : column + _native_cat_width(a),
+                        Base.tail(args))
+end
+
 # Nested dotted calls stay lazy so Julia's broadcast fusion survives the
 # tensorized lowering: only the OUTERMOST dotted call of a nest materializes
 # (via `_tensorized_broadcast` above) — with one exception
