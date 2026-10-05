@@ -192,7 +192,12 @@ function _kernel_push_unique!(names::Vector{Symbol}, name::Symbol)
     names
 end
 
-function _kernel_add!(graph::Graph, ins, outs, op, cost, cse_key, effectful,
+# Graph assembly stores the operation as a value; it does not execute it.
+# Avoid inferring this construction path again for every authored closure and
+# every input/output tuple arity. Numerical preparation still sees the exact op.
+Base.@nospecializeinfer function _kernel_add!(graph::Graph,
+                      @nospecialize(ins), @nospecialize(outs), @nospecialize(op),
+                      cost, cse_key, effectful,
                       source = _NO_KERNEL_SOURCE)
     add!(graph; inputs = ins, outputs = outs, op = op,
          cost = cost, cse_key = cse_key, effectful = effectful, source = source)
@@ -3078,7 +3083,10 @@ function _kernel_source_functions(ex, mod)
     Expr(ex.head, map(arg -> _kernel_source_functions(arg, mod), ex.args)...)
 end
 
-function _kernel_source_function(f, source::Expr, mod::Module)
+# Captures and the generated callable retain their concrete runtime types.
+# Inferring this source-construction helper for every fresh closure type only
+# repeats compiler work before the callable is prepared.
+Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), source::Expr, mod::Module)
     # Local functions, generators and exception scopes are lowered by Julia
     # itself. Do not reinterpret those scopes through RGF's closure converter.
     # The native closure remains the ordinary path in its visible world.
