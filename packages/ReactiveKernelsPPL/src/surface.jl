@@ -10991,6 +10991,12 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             # readers, such as a reduction of a library contrast.
             node in datas || push!(datas, node)
             return node
+        elseif _is_array_def(node, ctx)
+            # A model-level array definition (`r = d[:, 1]`, a column of a
+            # collected row matrix) is one value leaf, as its inline
+            # spelling is: naming a subexpression never changes legality.
+            node in scalars || push!(scalars, node)
+            return node
         elseif haskey(ctx.detmap, node)
             return _sfail("$where combines $node, which is neither an " *
                 "affine sub-predictor nor a scalar (latent/scan/varying " *
