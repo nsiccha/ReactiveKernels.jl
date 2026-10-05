@@ -1959,19 +1959,12 @@ function _kernel_authored_scan_expr(rhs, mod)
     # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals
     # (carry, x, shared...); an enclosing port used but not passed is out of scope
     # (never auto-captured) — same rule as plate.
-    nested_specs = Dict{Symbol,Any}()
-    local_types = Dict{Symbol,Any}()
-    materialized = Tuple{Symbol,Any,Any}[]
-    rewritten, _ = _kernel_constructed_endpoint(
-        scalar_body, mod, Set(formals), nested_specs, local_types;
-        context = "inside scan", materialized = materialized)
-    signature = Tuple{Symbol,Any}[
-        (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
+    signature = Tuple{Symbol,Any}[(name, GlobalRef(Core, :Any)) for name in formals]
     # The do-block ends with a 2-tuple `(new_carry, output)`.  `@kernel` return
     # values must be PORT names, so bind the two components to synthetic result
     # ports and return those, yielding a 2-`want` step spec.
-    stmts = rewritten isa Expr && rewritten.head === :block ?
-        filter(s -> !_kernel_is_line(s), rewritten.args) : Any[rewritten]
+    stmts = scalar_body isa Expr && scalar_body.head === :block ?
+        filter(s -> !_kernel_is_line(s), scalar_body.args) : Any[scalar_body]
     isempty(stmts) && throw(ArgumentError("scan do-block body is empty"))
     result = last(stmts)
     result isa Expr && result.head === :return && (result = result.args[1])
@@ -1980,16 +1973,16 @@ function _kernel_authored_scan_expr(rhs, mod)
             "scan do-block must end with a 2-tuple `(new_carry, output)`"))
     carry_expr, output_expr = result.args
     step_stmts = Any[]
-    for (name, T, mrhs) in materialized
-        push!(step_stmts, Expr(:(=), Expr(:(::), name, T), mrhs))
-    end
     append!(step_stmts, stmts[1:(end - 1)])
     push!(step_stmts, Expr(:(=), :__scan_carry__, carry_expr))
     push!(step_stmts, Expr(:(=), :__scan_output__, output_expr))
     push!(step_stmts, Expr(:return, Expr(:tuple, :__scan_carry__, :__scan_output__)))
     step_body = Expr(:block, step_stmts...)
-    step_spec = _kernel_expand(
-        step_body, signature, nothing, mod; nested_specs = nested_specs)
+    # The ordinary graph builder first collects every step-local port, then
+    # lowers object endpoints and computed arguments at their recipe positions.
+    # Rewriting the whole body first would miss assigned locals and could lift
+    # arguments out of the recipe/lexical scope that defines them.
+    step_spec = _kernel_expand(step_body, signature, nothing, mod)
     operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_scan),
                      step_spec,
                      Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))),
