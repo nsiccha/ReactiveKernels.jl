@@ -2139,33 +2139,29 @@ function _value_rows(plan::StructuralPlan, name::Symbol)
     _fail(name, "value $name reads or feeds different row counts $ns")
 end
 
-function _plate_rows(plan::StructuralPlan, p::PlateParameter)
+function _plate_rows(plan::StructuralPlan, p::PlateParameter;
+        active = Set{Symbol}())
     p.range isa UnitRange && return length(p.range)
     if p.range isa Expr
-        iterator = p.range
-        source = iterator.args[2]
-        if haskey(plan.columns, source)
-            value = plan.columns[source]
-            value isa AbstractArray || _fail(p.label, "plate index source $source must be an array")
-            return iterator.args[1] === :eachindex ? length(eachindex(value)) :
-                length(axes(value, iterator.args[3]))
-        end
-        # A value iterates its own axes when its definition states them,
-        # as Julia's `eachindex(v)` / `axes(v, d)` would; otherwise the rows
-        # its observation reads establish.
-        n = _value_iterator_length(plan, p, iterator)
-        n === nothing || return n
-        iterator.args[1] === :eachindex && return _value_rows(plan, source)
-        iterator.args[3] === 1 && return _value_rows(plan, source)
-        _fail(p.label, "plate axis $(repr(iterator)) needs its bound source array")
+        return _value_iterator_length(plan, p, p.range, active)
     end
-    return _value_rows(plan, p.range isa Symbol ? p.range : p.name)
+    p.range isa Symbol && return _value_iterator_length(plan, p,
+        Expr(:call, :eachindex, p.range), active)
+    return _value_rows(plan, p.name)
 end
 
-function _value_iterator_length(plan::StructuralPlan, p::PlateParameter, iterator)
+function _value_iterator_length(plan::StructuralPlan, p::PlateParameter,
+        iterator, active = Set{Symbol}())
     source = iterator.args[2]
-    shape = _value_axes(plan, source; data_axes = true)
-    (shape === nothing || isempty(shape)) && return nothing
+    shape = _value_axes(plan, source, active; data_axes = true)
+    # A response cannot determine an unrelated value's extent. Resolve
+    # data and declared axes without running sampled values; an opaque
+    # live result whose shape is unavailable remains a capability gap.
+    shape === nothing && _fail(p.label, "latent plate iterator " *
+        "$(repr(iterator)) has no extent established by bound data; " *
+        "the shape of $source cannot be inferred without evaluating " *
+        "sampled values")
+    # Julia numbers and zero-dimensional arrays have one index too.
     sizes = Int[d isa Integer ? d : _array_dim_size(plan, source, p.label, d)
         for d in shape]
     iterator.args[1] === :eachindex && return prod(sizes)
@@ -6164,6 +6160,13 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     for p in plan.vector_parameters
         p.extent_expr === nothing || union!(required, _expr_value_symbols(p.extent_expr))
     end
+    for p in plan.plate_parameters
+        p.range isa Symbol && push!(required, p.range)
+        p.range isa Expr && push!(required, p.range.args[2])
+    end
+    for s in plan.scans
+        s.hi isa Symbol && push!(required, s.hi)
+    end
     nodes = Dict{Symbol,Any}()
     for a in plan.assignments
         # Literal definitions can be dependencies of a module call, such
@@ -7196,7 +7199,9 @@ function _dirichlet_size(plan, alpha, label)
 end
 
 function _resolve_vector_extent(p::VectorParameter, plan, columns, responses)
-    extent = p.size
+    # A bound plan retains the authored expression for rebinding. Its
+    # previous concrete size belongs to the previous data.
+    extent = p.extent_expr === nothing ? p.size : p.extent_expr
     if extent === nothing && haskey(_VECTOR_ELEMENT_FAMILIES, p.family)
         reader = findfirst(r -> r.thresholds === p.name, responses)
         reader === nothing && return p
@@ -7288,6 +7293,11 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     end
     out_v = VectorParameter[]
     for p in vectors
+        if p.family === :simplex_dirichlet && p.size === nothing && p.extent_expr === nothing
+            # Preserve inferred concentration sizing just like an authored
+            # data expression, without changing the linked-width checks.
+            p = _with(p; extent_expr = Expr(:call, :length, p.args.arg1))
+        end
         concentration_size = p.family === :simplex_dirichlet ?
             _dirichlet_size(plan, p.args.arg1, p.label) : nothing
         if haskey(thresh_link, p.name)
@@ -7348,7 +7358,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             p.size === nothing || p.size == want || _fail(p.label,
                 "simplex size $(p.size) disagrees with its concentration " *
                 "length $want")
-            push!(out_v, VectorParameter(p.name, p.family, p.args, want, p.label))
+            push!(out_v, _with(p; size = want))
         else
             _fail(p.label, "vector parameter $(p.name) needs a declared extent " *
                 "or a linked response from which to infer it")

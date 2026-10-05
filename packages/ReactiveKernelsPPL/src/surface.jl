@@ -1811,7 +1811,8 @@ end
 _is_gather(ex::Expr, data, detmap, env::_ShapeEnv) =
     ex.head === :ref && length(ex.args) == 2 &&
     (ex.args[1] isa Expr || ex.args[1] in data ||
-        haskey(detmap, ex.args[1]) || ex.args[1] in env.values)
+        haskey(detmap, ex.args[1]) || ex.args[1] in env.values ||
+        ex.args[1] in env.aligned)
 
 # Does `ex` carry the observation axis? Undotted module calls and
 # reductions take whole values and return model-level ones; a gather
