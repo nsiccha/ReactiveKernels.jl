@@ -267,6 +267,7 @@ import .._declared_codes
 # Stopping-ratio stage-lane tables (data-only recipes over the bound
 # response; `preprocessing.jl`).
 import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
+import .._broadcast_gather
 # Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
 # arguments, simplex / ordered slice transforms and the slice densities.
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
@@ -2219,7 +2220,7 @@ function _ordinal_lane_ref!(inputs::Vector{Any}, prests::Vector{Expr}, ref,
     ref === nothing && return absent
     ref isa Symbol || return Float64(ref)
     rows === nothing && return _thread_ref!(inputs, ref)
-    push!(prests, :($lane = $ref[$rows]))
+    push!(prests, :($lane = _broadcast_gather($ref, $rows)))
     return _thread_ref!(inputs, lane)
 end
 
@@ -2362,7 +2363,7 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     level = _stage_lane(r.label, :y)
     eta = _stage_lane(r.label, :eta)
     thr = _stage_lane(r.label, :t)
-    push!(prests, :($level = $y[$obs]), :($eta = $lp[$obs]),
+    push!(prests, :($level = $y[$obs]), :($eta = _broadcast_gather($lp, $obs)),
         :($thr = $(r.thresholds)[$stage]))
     inputs = Any[stage, level, eta, thr]
     sv, yv, etav, tv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)

@@ -6052,11 +6052,10 @@ function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
     # predictor. Every other family
     # routes through `_lower_location`, which admits a value location
     # here (a scalar parameter or data column under the written link).
-    pname = family === BetaShapeFam ? _argument_location!(lhs, loc, ctx,
-        predictors, pred_idx) : family === BinomialProbFam ?
+    pname = family === BinomialProbFam ?
         _lower_prob_location(lhs, loc, ctx, predictors, pred_idx,
             family === BinomialProbFam ? "Binomial" : "ZeroInflatedBinomial") :
-        family in (GammaValueFam, WeibullValueFam) ?
+        family in (BetaShapeFam, GammaValueFam, WeibullValueFam) ?
         _lower_argument_predictor!(lhs, loc, ctx, predictors, pred_idx,
             coefuse, Symbol(lhs, "_value")) :
         _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
@@ -7347,19 +7346,6 @@ function _lower_beta_args(lhs, args, ctx)
         end
     end
     return BetaShapeFam, IdentityLink, IdentityLink, args[1], args[2]
-end
-
-function _argument_location!(lhs, raw, ctx, predictors, pred_idx)
-    value = _lower_argument_value(lhs, :alpha, raw, ctx)
-    if value isa Symbol && (value in ctx.data || value in ctx.vecdefs ||
-            value in ctx.plate_names || any(d -> d.name === value, ctx.synth_derived))
-        name = Symbol(lhs, :_alpha)
-        term = TermSpec(OffsetTerm, [value], NamedTuple(), value, Symbol(name, :_off))
-        push!(predictors, PredictorSpec(name, IdentityLink, [term], name))
-        pred_idx[name] = length(predictors)
-        return name
-    end
-    return _value_location!(lhs, value, IdentityLink, ctx, predictors, pred_idx)
 end
 
 function _lower_response_base_error(lhs, rhs, fam)

@@ -1833,8 +1833,12 @@ function _observation_axes(plan::StructuralPlan)
     domains = Dict{Symbol,Tuple}()
     for (r, rd) in zip(plan.responses, reads)
         responseaxes = r.range isa Expr ? axes(_selected_response_column(plan, r)) : colaxes[r.response]
+        # `eachrow(E)` supplies one threshold-effect vector per response
+        # cell. Its stage axis belongs to the ordinal law, not the broadcast
+        # domain. Keep that role local to this reader of the ordinary matrix.
+        axesread(c) = c === r.threshold_effects ? (axes(plan.columns[c], 1),) : colaxes[c]
         operandaxes(c) = r.range isa Expr && r.response in plan.indexed_observations ?
-            _indexed_operand_axes(plan, r, c, c in designs) : colaxes[c]
+            _indexed_operand_axes(plan, r, c, c in designs || c === r.threshold_effects) : axesread(c)
         valuesread = r.range isa Expr ? _response_reads(plan, _with(r; range=nothing), perobs) : rd
         if r.response in plan.indexed_observations
             domain = responseaxes
@@ -4292,11 +4296,11 @@ function _validate_unleveled_fields(r::LikelihoodSpec)
     return nothing
 end
 
-# Leveled-field rules for predictor-addressing families (CategoricalLogit,
-# OrderedLogistic, Ordinal); non-leveled families must leave every leveled
+# Leveled-field rules follow the response family, independently of whether
+# its location is a predictor or a latent value. Non-leveled families leave every leveled
 # field at its default. `used_predictors` gains categorical tail predictors.
 function _validate_leveled_fields(r::LikelihoodSpec, plan::StructuralPlan,
-        pred::PredictorSpec, used_predictors::Set{Symbol})
+        used_predictors::Set{Symbol})
     _is_leveled_family(r.family) || return _validate_unleveled_fields(r)
     r.family === CategoricalLogitFam &&
         return _validate_categorical_fields(r, plan, used_predictors)
@@ -5070,7 +5074,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_zi(r, plan)
             _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
-            _validate_unleveled_fields(r)
+            _validate_leveled_fields(r, plan, used_predictors)
             continue
         end
         # A per-cell latent feeds the ordinary scalar-family location path.
@@ -5082,7 +5086,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_zi(r, plan)
             _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
-            _validate_unleveled_fields(r)
+            _validate_leveled_fields(r, plan, used_predictors)
             continue
         end
         # A bare sampled-parameter location (constrained-scale, no link
@@ -5198,7 +5202,7 @@ function _validate_responses(plan::StructuralPlan)
         _validate_zi(r, plan)
         _validate_interval(r, plan)
         _validate_evidence_structure(r, plan)
-        _validate_leveled_fields(r, plan, pred, used_predictors)
+        _validate_leveled_fields(r, plan, used_predictors)
         if r.range isa UnitRange
             (r.mi_jobs === nothing ? first(r.range) == 1 : first(r.range) >= 1) ||
                 _fail(r.label, "response range must use valid one-based indices")
