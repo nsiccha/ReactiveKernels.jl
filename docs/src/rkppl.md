@@ -376,12 +376,12 @@ child port annotations accept the caller's declared types; declared boundaries
 keep their types. The emitted `kernel_expr` remains the source of the graph,
 so evaluating that expression retains the same child operations.
 
-Composition exposes the child's execution capabilities. Native Enzyme reverse
-currently fails for an empty child scan inside a bound `eachcol` subject plate.
-The default compiled backend expands small subject plates into copies of the
-child scan, so those shapes still lack retained-loop structural acceptance.
-The composition tests keep both gaps visible; nonempty native values and
-derivatives and larger compiled subject plates are covered separately.
+Composition exposes the child's execution capabilities. Ordinary native
+Enzyme reverse covers empty and nonempty child scans, including inside a bound
+`eachcol` subject plate. The default compiled backend expands small subject
+plates into copies of the child scan, so those shapes still lack retained-loop
+structural acceptance. The composition tests keep that gap visible; larger
+compiled subject plates are covered separately.
 
 A data-only call used only by a parameter-dependent function runs once when
 `prepare_query` or `prepare_sampler` prepares the graph. It may return a tuple or
@@ -692,6 +692,13 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.
+- `constrain`, `unconstrain` and `logjac` follow the number type of their
+  input: `BigFloat` input gives `BigFloat` values, and other number types,
+  such as dual numbers, pass through the transforms unchanged. Plain reals
+  give `Float64` values, as before. Caller-owned parameter geometry receives
+  the same numbers in its endpoints. Generic number support does not establish
+  native Enzyme support for these layout-based calls; use `prepare_sampler`
+  for posterior gradients through the model graph.
 - Explicit parameter declarations keep their authored names. For
   `a ~ Normal(0, 1); b ~ Normal(0, 2); mu = a .+ b .* x`, the coordinates
   are `a`, `b` and the constrained values are `nt.a`, `nt.b`.

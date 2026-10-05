@@ -485,3 +485,91 @@ const _CMP_XR_COLS = merge(_CMP_AP_COLS, Dict{Symbol,AbstractVector}(
     end, (a = 0.7, b = 0.4, s1 = 0.5, s2 = 0.3), want;
         cols = _CMP_XR_COLS)
 end
+
+# Named model-level arrays are composition leaves, like their inline
+# spelling (naming never changes legality): the columns of a collected
+# row matrix and an elementwise expression over a declared array, beside
+# an affine sub-predictor `w`.
+const _CMP_MA_COLS = Dict{Symbol,Any}(
+    :X => [0.5 -1.0; 1.5 0.0; -0.5 1.0; 0.25 -0.75; 2.0 0.3],
+    :z => [0.4, -0.2, 1.1, 0.6, -0.9],
+    :y => [0.3, -1.2, 0.8, 1.9, -0.4])
+
+@testset "composed leaves read named model-level arrays" begin
+    want(q) = begin
+        X = _CMP_MA_COLS[:X]
+        rows = q.a .+ q.b .* X
+        mu = rows[:, 1] .+ (q.s .* _CMP_MA_COLS[:z]) .* rows[:, 2] .+
+            0.5 .* q.zz
+        sum(logpdf.(Normal.(mu, 0.7), _CMP_MA_COLS[:y])) +
+            logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+            logpdf(Normal(0, 1), q.s) + sum(logpdf.(Normal(0, 1), q.zz))
+    end
+    q = (a = 0.4, b = -0.3, s = 0.7, zz = [0.2, -0.5, 0.9, 0.1, -0.3])
+    head = quote
+        a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Normal(0, 1)
+        zz[axes(X, 1)] .~ Normal.(0, 1)
+        @plate for i in axes(X, 1)
+            row = a .+ b .* X[i, :]
+            rows[i, 1:2] = row
+        end
+        w = s .* z
+        e = 0.5 .* zz
+    end
+    for location in (
+            quote
+                c1 = rows[:, 1]
+                c2 = rows[:, 2]
+                mu = c1 .+ w .* c2 .+ e
+            end,
+            :(mu = rows[:, 1] .+ w .* rows[:, 2] .+ e))
+        prog = Expr(:block, head.args...,
+            (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+            :(y .~ Normal.(mu, 0.7)))
+        plan, _, _ = _cmp_ap_check(prog, q, want; cols = _CMP_MA_COLS)
+        @test only(plan.predictors[end].terms).kind === ComposedTerm
+    end
+end
+
+# The other leaf spellings beside an affine sub-predictor `w`: a whole
+# declared array read inline (`z`, `sd .* z`), and a data-only vector or
+# a module call read by name or inline. Each named and inline spelling
+# has the same density and gradient.
+_cmp_leaf_f(x) = 2 .* x .- 1
+_cmp_leaf_g(s, x) = s .* x .+ 1
+const _CMP_LEAF_COLS = Dict{Symbol,Any}(
+    :x => [0.5, -1.0, 1.5], :y => [0.3, -1.2, 0.8])
+
+@testset "composed leaves: named and inline spellings agree" begin
+    x, y = _CMP_LEAF_COLS[:x], _CMP_LEAF_COLS[:y]
+    q = (a = 0.4, s = 0.7, sd = [0.9, 1.3, 0.6], z = [0.2, -0.5, 0.8])
+    priors(q) = logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.s) +
+        sum(logpdf.(Exponential(1), q.sd)) + sum(logpdf.(Normal(0, 1), q.z))
+    head = quote
+        a ~ Normal(0, 1); s ~ Normal(0, 1)
+        sd[1:3] .~ Exponential.(1); z[1:3] .~ Normal.(0, 1)
+        w = a .* x
+    end
+    for (leaf, value) in (
+            (:(z), q -> q.z),
+            (:(sd .* z), q -> q.sd .* q.z),
+            (:(log.(x .+ 2)), q -> log.(x .+ 2)),
+            (:(_cmp_leaf_f(x)), q -> 2 .* x .- 1),
+            (:(_cmp_leaf_g(s, x)), q -> q.s .* x .+ 1))
+        want = q -> begin
+            v = value(q)
+            mu = v .+ (q.a .* x) .* v
+            sum(logpdf.(Normal.(mu, 0.7), y)) + priors(q)
+        end
+        for location in (quote
+                    v = $leaf
+                    mu = v .+ w .* v
+                end, :(mu = $leaf .+ w .* $leaf))
+            prog = Expr(:block, head.args...,
+                (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+                :(y .~ Normal.(mu, 0.7)))
+            plan, _, _ = _cmp_ap_check(prog, q, want; cols = _CMP_LEAF_COLS)
+            @test only(plan.predictors[end].terms).kind === ComposedTerm
+        end
+    end
+end

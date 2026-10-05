@@ -143,7 +143,9 @@ thresholds, simplex), a joint-outcomes LKJ Cholesky factor, or an
 elementwise array parameter
 (`:array`, column-major over `dims`). `lo` is the constrained lower
 bound of an `:interval`/`:floored` transform (`:interval` also sets
-`hi`; an `:upper` transform sets `hi` only; `NaN` otherwise). `dims` is
+`hi`; an `:upper` transform sets `hi` only; `NaN` otherwise). A real
+bound is stored as `Float64`, or in the number type of the sampled values it
+was resolved from (an AD dual while differentiating `constrain`). `dims` is
 the axes of a declared array, including an LKJ factor (empty for legacy
 scalar/block entries)."""
 struct LayoutEntry
@@ -154,12 +156,33 @@ struct LayoutEntry
     offset::Int # 1-based packed offset
     size::Int
     transform::Symbol # :identity | :exp | :logistic | :interval | :floored | :upper | :ordered | :simplex | :lkj
-    lo::Union{Float64,Symbol,Expr} # constrained lower bound (else NaN)
-    hi::Union{Float64,Symbol,Expr} # constrained upper bound (else NaN)
+    lo::Union{Real,Symbol,Expr} # constrained lower bound (else NaN)
+    hi::Union{Real,Symbol,Expr} # constrained upper bound (else NaN)
     dims::Vector{Int} # declared-array axes, including :cholesky_corr (else empty)
     scan_blocks::Vector{LayoutEntry} # structural latent-family blocks (else empty)
     sampling::Union{Nothing,NamedTuple} # external RHS and its geometry
+    LayoutEntry(kind, predictor, name, labels, offset, size, transform, lo, hi,
+            dims, scan_blocks, sampling) =
+        new(kind, predictor, name, labels, offset, size, transform,
+            _layout_bound(lo), _layout_bound(hi), dims, scan_blocks, sampling)
 end
+
+# Host transforms (`constrain`, `unconstrain`, `logjac` and the exported
+# vector/LKJ helpers) follow the number type of their input, so dual numbers,
+# `BigFloat` and other reals pass through. Plain reals keep at least `Float64`
+# precision, so `Float64`, `Float32` and integer inputs give the same
+# `Float64` results as before.
+_host_type(::Type{T}) where {T} = promote_type(Float64, T)
+_host_eltype(x) = _host_type(eltype(x))
+_host_real(x::Real) = convert(_host_type(typeof(x)), x)
+_layout_bound(x::Real) = _host_real(x)
+_layout_bound(x) = x
+_bound_type(x::Real) = typeof(x)
+_bound_type(x) = Float64
+# Element type of an entry's constrained values for input type `T`: a bound
+# resolved from sampled values can carry a dual of its own.
+_entry_eltype(e::LayoutEntry, ::Type{T}) where {T} =
+    promote_type(T, _bound_type(e.lo), _bound_type(e.hi))
 LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     labels::Vector{Symbol}, offset::Int, size::Int, transform::Symbol,
     lo, hi, dims::Vector{Int}, blocks::Vector{LayoutEntry}) =
@@ -487,45 +510,50 @@ _vector_constrained_size(e::LayoutEntry) =
     e.transform === :simplex ? e.size + 1 : e.size
 
 # Scalar logit, the host simplex inverse's break-fraction map.
-_simplex_logit(z::Float64) = log(z) - log1p(-z)
+_simplex_logit(z::Real) = log(z) - log1p(-z)
 
 """
-    ordered_constrain(u) -> Vector{Float64}
+    ordered_constrain(u) -> Vector
 
 Host-side ordered transform (Stan `ordered`): `y[1] = u[1]`,
 `y[i] = y[i-1] + exp(u[i])` — the running sum `cumsum` computes in the
 same order, which is what the in-graph twin emits (bit-identical).
+Like every host transform, it follows the input's number type and returns
+`Float64` values for plain reals.
 """
 function ordered_constrain(u::AbstractVector{<:Real})
-    y = Vector{Float64}(undef, length(u))
+    T = _host_eltype(u)
+    y = Vector{T}(undef, length(u))
     for (i, x) in enumerate(u)
-        y[i] = i == 1 ? Float64(x) : y[i-1] + exp(Float64(x))
+        y[i] = i == 1 ? convert(T, x) : y[i-1] + exp(convert(T, x))
     end
     return y
 end
 
 """Inverse of [`ordered_constrain`](@ref)."""
 function ordered_unconstrain(y::AbstractVector{<:Real})
-    u = Vector{Float64}(undef, length(y))
-    prev = 0.0
+    T = _host_eltype(y)
+    u = Vector{T}(undef, length(y))
+    prev = zero(T)
     for (i, v) in enumerate(y)
-        u[i] = i == 1 ? Float64(v) : log(Float64(v) - prev)
-        prev = Float64(v)
+        u[i] = i == 1 ? convert(T, v) : log(convert(T, v) - prev)
+        prev = convert(T, v)
     end
     return u
 end
 
 """Log-Jacobian of [`ordered_constrain`](@ref): `Σ u[2:end]`."""
 function ordered_logjac(u::AbstractVector{<:Real})
-    total = 0.0
+    T = _host_eltype(u)
+    total = zero(T)
     for (i, x) in enumerate(u)
-        i > 1 && (total += Float64(x))
+        i > 1 && (total += convert(T, x))
     end
     return total
 end
 
 """
-    simplex_constrain(u) -> Vector{Float64}
+    simplex_constrain(u) -> Vector
 
 Host-side stick-breaking simplex transform (thin-layer-owned
 parameterization — NOT Stan's isometric-log-ratio `simplex_constrain`;
@@ -538,7 +566,7 @@ to `[1.0]` (the deterministic 1-simplex, as in Stan). The in-graph twin
 so host and graph agree bit-for-bit.
 """
 function simplex_constrain(u::AbstractVector{<:Real})
-    length(u) == 0 && return [1.0]
+    length(u) == 0 && return [one(_host_eltype(u))]
     z, _, lr = _simplex_breaks(u)
     return exp.(lr) .* vcat(z, ones(1))
 end
@@ -548,7 +576,7 @@ end
 # the in-graph twin emits statement by statement.
 function _simplex_breaks(u::AbstractVector{<:Real})
     K = length(u) + 1
-    z = 1.0 ./ (1.0 .+ exp.(-(Float64.(u) .+ log.(K .- (1:(K - 1))))))
+    z = 1.0 ./ (1.0 .+ exp.(-(_host_real.(u) .+ log.(K .- (1:(K - 1))))))
     l = log1p.(-z)
     lr = cumsum(vcat(0.0, l))
     return z, l, lr
@@ -558,14 +586,15 @@ end
 `simplex_free`)."""
 function simplex_unconstrain(s::AbstractVector{<:Real})
     K = length(s)
-    u = Vector{Float64}(undef, max(K - 1, 0))
+    T = _host_eltype(s)
+    u = Vector{T}(undef, max(K - 1, 0))
     K <= 1 && return u
-    remaining = 1.0
+    remaining = one(T)
     for (j, v) in enumerate(s)
         j >= K && break
-        z = Float64(v) / remaining
+        z = convert(T, v) / remaining
         u[j] = _simplex_logit(z) - log(K - j)
-        remaining -= Float64(v)
+        remaining -= convert(T, v)
     end
     return u
 end
@@ -573,7 +602,7 @@ end
 """Log-Jacobian of [`simplex_constrain`](@ref):
 `Σ [log(r) + log(z) + log1p(-z)]` over the K−1 breaks."""
 function simplex_logjac(u::AbstractVector{<:Real})
-    length(u) == 0 && return 0.0
+    length(u) == 0 && return zero(_host_eltype(u))
     z, l, lr = _simplex_breaks(u)
     return sum(view(lr, 1:length(u)) .+ log.(z) .+ l)
 end
@@ -596,7 +625,7 @@ function _lkj_dim(packed::Int)
 end
 
 """
-    lkj_chol_constrain(u, K) -> Matrix{Float64}
+    lkj_chol_constrain(u, K) -> Matrix
 
 Host-side LKJ Cholesky-factor transform: Stan's partial-correlation
 C-vine VERBATIM (user direction — follow Stan where possible; the
@@ -614,14 +643,15 @@ function lkj_chol_constrain(u::AbstractVector{<:Real}, K::Int)
         "[layout] LKJ margin count K=$K < 1"))
     length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
         "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
-    z = zeros(Float64, K, K)
+    T = _host_eltype(u)
+    z = zeros(T, K, K)
     p = 0
     for j in 2:K, i in 1:(j - 1)
         p += 1
-        z[i, j] = tanh(Float64(u[p]))
+        z[i, j] = tanh(convert(T, u[p]))
     end
-    w = zeros(Float64, K, K)
-    w[1, 1] = 1.0
+    w = zeros(T, K, K)
+    w[1, 1] = one(T)
     for j in 2:K
         w[1, j] = z[1, j]
     end
@@ -633,7 +663,7 @@ function lkj_chol_constrain(u::AbstractVector{<:Real}, K::Int)
             end
             w[i, j] = v
         end
-        d = 1.0
+        d = one(T)
         for ip in 1:(i - 1)
             d *= sqrt(1 - z[ip, i]^2)
         end
@@ -649,23 +679,24 @@ diagonals, and out-of-`(-1,1)` partials (not a Cholesky factor)."""
 function lkj_chol_unconstrain(L::AbstractMatrix{<:Real}, K::Int)
     size(L) == (K, K) || throw(ContractValidationError(
         "[layout] LKJ factor size $(size(L)) ≠ ($K, $K)"))
+    T = _host_eltype(L)
     for i in 1:K
-        Float64(L[i, i]) > 0 || throw(ContractValidationError(
+        convert(T, L[i, i]) > 0 || throw(ContractValidationError(
             "[layout] LKJ factor has a non-positive diagonal " *
             "(not a Cholesky factor)"))
     end
-    z = zeros(Float64, K, K)
+    z = zeros(T, K, K)
     for j in 2:K
-        z[1, j] = Float64(L[j, 1])
+        z[1, j] = convert(T, L[j, 1])
     end
     for i in 2:K, j in (i + 1):K
-        d = 1.0
+        d = one(T)
         for ip in 1:(i - 1)
             d *= sqrt(1 - z[ip, j]^2)
         end
-        z[i, j] = Float64(L[j, i]) / d
+        z[i, j] = convert(T, L[j, i]) / d
     end
-    u = Vector{Float64}(undef, K * (K - 1) ÷ 2)
+    u = Vector{T}(undef, K * (K - 1) ÷ 2)
     p = 0
     for j in 2:K, i in 1:(j - 1)
         p += 1
@@ -686,18 +717,19 @@ agree bit-for-bit. K=2: `log(1-tanh(u)²)`."""
 function lkj_chol_logjac(u::AbstractVector{<:Real}, K::Int)
     length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
         "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
-    total = 0.0
+    T = _host_eltype(u)
+    total = zero(T)
     p = 0
     for j in 2:K, i in 1:(j - 1)
         p += 1
-        z = tanh(Float64(u[p]))
+        z = tanh(convert(T, u[p]))
         total += ((j - i + 1) / 2) * log(1 - z^2)
     end
     return total
 end
 
 """
-    lkj_chol_constrain_hyperspherical(u, K) -> Matrix{Float64}
+    lkj_chol_constrain_hyperspherical(u, K) -> Matrix
 
 RETAINED alternative to [`lkj_chol_constrain`](@ref) (the pre-vine
 thin-layer-owned parameterization): row `i >= 2` is a unit vector
@@ -711,14 +743,15 @@ function lkj_chol_constrain_hyperspherical(u::AbstractVector{<:Real}, K::Int)
         "[layout] LKJ margin count K=$K < 1"))
     length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
         "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
-    L = zeros(Float64, K, K)
-    L[1, 1] = 1.0
+    T = _host_eltype(u)
+    L = zeros(T, K, K)
+    L[1, 1] = one(T)
     p = 0
     for i in 2:K
-        th = Vector{Float64}(undef, i - 1)
+        th = Vector{T}(undef, i - 1)
         for j in 1:i-1
             p += 1
-            s = 1.0 / (1.0 + exp(-Float64(u[p])))
+            s = 1.0 / (1.0 + exp(-convert(T, u[p])))
             th[j] = pi * s
         end
         for j in 1:i-1
@@ -728,7 +761,7 @@ function lkj_chol_constrain_hyperspherical(u::AbstractVector{<:Real}, K::Int)
             end
             L[i, j] = v
         end
-        d = 1.0
+        d = one(T)
         for m in 1:i-1
             d *= sin(th[m])
         end
@@ -744,16 +777,17 @@ hyperspherical inversion per row
 function lkj_chol_unconstrain_hyperspherical(L::AbstractMatrix{<:Real}, K::Int)
     size(L) == (K, K) || throw(ContractValidationError(
         "[layout] LKJ factor size $(size(L)) ≠ ($K, $K)"))
-    u = Vector{Float64}(undef, K * (K - 1) ÷ 2)
+    T = _host_eltype(L)
+    u = Vector{T}(undef, K * (K - 1) ÷ 2)
     p = 0
     for i in 2:K
-        Float64(L[i, i]) > 0 || throw(ContractValidationError(
+        convert(T, L[i, i]) > 0 || throw(ContractValidationError(
             "[layout] LKJ factor row $i leaves the hemisphere " *
             "(non-positive diagonal — not a Cholesky factor)"))
         for j in 1:i-1
             p += 1
-            rest = sqrt(sum(Float64(L[i, m])^2 for m in j+1:i))
-            th = atan(rest, Float64(L[i, j]))
+            rest = sqrt(sum(convert(T, L[i, m])^2 for m in j+1:i))
+            th = atan(rest, convert(T, L[i, j]))
             u[p] = log(th) - log(pi - th)
         end
     end
@@ -766,11 +800,12 @@ per-angle `(i-j)*log(sin theta)` + logistic
 function lkj_chol_logjac_hyperspherical(u::AbstractVector{<:Real}, K::Int)
     length(u) == K * (K - 1) ÷ 2 || throw(ContractValidationError(
         "[layout] LKJ packed length $(length(u)) ≠ $K*$(K-1)/2"))
-    total = 0.0
+    T = _host_eltype(u)
+    total = zero(T)
     p = 0
     for i in 2:K, j in 1:i-1
         p += 1
-        x = Float64(u[p])
+        x = convert(T, u[p])
         s = 1.0 / (1.0 + exp(-x))
         th = pi * s
         total += (i - j) * log(sin(th)) + log(pi) + log(s) + log1p(-s)
@@ -916,17 +951,18 @@ end
 # One predictor's constrained coefficient vector from its entries:
 # identity runs copy through, interval runs constrain per element.
 function _constrain_coefficient(entries::Vector{LayoutEntry}, u)
+    T = _host_eltype(u)
     if length(entries) == 1 && entries[1].transform === :identity
         e = entries[1]
-        return Vector{Float64}(u[e.offset:(e.offset + e.size - 1)])
+        return Vector{T}(u[e.offset:(e.offset + e.size - 1)])
     end
-    out = Float64[]
+    out = Vector{mapreduce(e -> _entry_eltype(e, T), promote_type, entries; init = T)}()
     for e in entries
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.transform === :identity
-            append!(out, Float64.(seg))
+            append!(out, convert.(T, seg))
         else
-            append!(out, [_constrain_elt(e, Float64(x)) for x in seg])
+            append!(out, [_constrain_elt(e, convert(T, x)) for x in seg])
         end
     end
     return out
@@ -1012,8 +1048,7 @@ end
 function _resolved_entry(layout::LayoutTable, e::LayoutEntry, values)
     (_dynamic_bounds(e) && e.sampling === nothing) || return e
     lookup = _layout_lookup(layout, values)
-    resolve(x) = x isa Real ? Float64(x) :
-        _eval_value_expr(x, lookup, e.name)
+    resolve(x) = x isa Real ? x : _eval_value_expr(x, lookup, e.name)
     lo, hi = resolve(e.lo), resolve(e.hi)
     lo isa Real && hi isa Real ||
         throw(ContractValidationError("[layout] bounds for $(e.name) must be real scalars"))
@@ -1026,7 +1061,7 @@ function _resolved_entry(layout::LayoutTable, e::LayoutEntry, values)
         isfinite(hi) || throw(ContractValidationError("[layout] upper bound for $(e.name) must be finite"))
     end
     return LayoutEntry(e.kind, e.predictor, e.name, e.labels, e.offset,
-        e.size, e.transform, Float64(lo), Float64(hi), e.dims,
+        e.size, e.transform, lo, hi, e.dims,
         [_resolved_entry(layout, b, values) for b in e.scan_blocks])
 end
 function _bound_entry_order(layout::LayoutTable)
@@ -1068,9 +1103,11 @@ end
 
 Host-side constrain of the packed vector. Parameters keep their author
 names; submodel locals are nested (`nt.z.b`, `nt.z.w.b`). Scalar, vector,
-and array leaves retain their constrained shapes. Deterministic submodel locals and return values are
-read in the model rather than included in this draw container. The generator
-emits the equivalent transforms inside the mathematical graph.
+and array leaves retain their constrained shapes. Values follow the number
+type of `unconstrained` (`Float64` for plain reals). Deterministic submodel
+locals and return values are read in the model rather than included in this
+draw container. The generator emits the equivalent transforms inside the
+mathematical graph.
 """
 function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
@@ -1079,6 +1116,7 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     coef_groups = _coefficient_groups(layout)
     seen_coef = Set{Symbol}()
     values = Dict{Symbol,Any}()
+    T = _host_eltype(u)
     for entry in _bound_entry_order(layout)
         e = _resolved_entry(layout, entry, values)
         seg = u[e.offset:(e.offset + e.size - 1)]
@@ -1099,11 +1137,12 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, p => _constrain_coefficient(coef_groups[p], u))
         elseif e.kind === :plate ||
                e.kind === :glm
-            v = [_constrain_elt(e, Float64(x)) for x in seg]
+            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x)) for x in seg]
             push!(pairs, e.name => v)
         elseif e.kind === :scan
-            push!(pairs, e.name => (isempty(e.scan_blocks) ? Vector{Float64}(seg) :
-                vcat([[_constrain_elt(b, Float64(u[i])) for i in b.offset:(b.offset + b.size - 1)]
+            push!(pairs, e.name => (isempty(e.scan_blocks) ? Vector{T}(seg) :
+                vcat([_entry_eltype(b, T)[_constrain_elt(b, convert(T, u[i]))
+                    for i in b.offset:(b.offset + b.size - 1)]
                     for b in e.scan_blocks]...)))
         elseif e.kind === :vector
             push!(pairs, e.name => _vector_constrain(e, seg))
@@ -1112,14 +1151,14 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
         elseif e.kind === :array
-            v = Float64[_constrain_elt(e, Float64(x)) for x in seg]
+            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x)) for x in seg]
             push!(pairs, e.name =>
                 (length(e.dims) == 1 ? v : reshape(v, e.dims...)))
         elseif e.kind === :cholesky_corr
-            L = lkj_chol_constrain(Vector{Float64}(seg), _lkj_dim(e.size))
+            L = lkj_chol_constrain(seg, _lkj_dim(e.size))
             push!(pairs, e.name => (_is_upper_lkj(e.transform) ? permutedims(L) : L))
         else
-            v = _constrain_elt(e, Float64(only(seg)))
+            v = _constrain_elt(e, convert(T, only(seg)))
             push!(pairs, e.name => v)
         end
         lastpair = last(pairs)
@@ -1131,13 +1170,15 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
 end
 
 """
-    unconstrain(layout, constrained) -> Vector{Float64}
+    unconstrain(layout, constrained) -> Vector
 
 Inverse of [`constrain`](@ref): named values → packed unconstrained vector.
+Its element type promotes the values' number types with `Float64`.
 """
 function unconstrain(layout::LayoutTable, nt::NamedTuple)
     nt = _flat_draw_values(layout, nt)
-    u = Vector{Float64}(undef, layout.total)
+    T = _host_value_type(nt)
+    u = Vector{T}(undef, layout.total)
     coef_groups = _coefficient_groups(layout)
     seen_coef = Set{Symbol}()
     for entry in layout.entries
@@ -1173,11 +1214,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             for e2 in entries
                 seg = v[pos:(pos + e2.size - 1)]
                 if e2.transform === :identity
-                    u[e2.offset:(e2.offset + e2.size - 1)] .= Float64.(seg)
+                    u[e2.offset:(e2.offset + e2.size - 1)] .= convert.(T, seg)
                 else
                     for (k, x) in enumerate(seg)
                         u[e2.offset + k - 1] =
-                            _unconstrain_elt(e2, Float64(x))
+                            _unconstrain_elt(e2, convert(T, x))
                     end
                 end
                 pos += e2.size
@@ -1194,7 +1235,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] $what $(e.name) length mismatch"),
             )
             for (k, x) in enumerate(v)
-                u[e.offset + k - 1] = _unconstrain_elt(e, Float64(x))
+                u[e.offset + k - 1] = _unconstrain_elt(e, convert(T, x))
             end
         elseif e.kind === :scan
             haskey(nt, e.name) || throw(
@@ -1205,10 +1246,10 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 ContractValidationError("[layout] scan state $(e.name) length mismatch"),
             )
             if isempty(e.scan_blocks)
-                u[e.offset:(e.offset + e.size - 1)] .= Float64.(v)
+                u[e.offset:(e.offset + e.size - 1)] .= convert.(T, v)
             else
                 for b in e.scan_blocks, i in b.offset:(b.offset + b.size - 1)
-                    u[i] = _unconstrain_elt(b, Float64(v[i - e.offset + 1]))
+                    u[i] = _unconstrain_elt(b, convert(T, v[i - e.offset + 1]))
                 end
             end
         elseif e.kind === :array
@@ -1230,7 +1271,7 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
                 continue
             end
             for (k, x) in enumerate(vec(v))
-                u[e.offset + k - 1] = _unconstrain_elt(e, Float64(x))
+                u[e.offset + k - 1] = _unconstrain_elt(e, convert(T, x))
             end
         elseif e.kind === :vector
             haskey(nt, e.name) || throw(
@@ -1258,14 +1299,24 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
             haskey(nt, e.name) || throw(
                 ContractValidationError("[layout] missing parameter $(e.name)"),
             )
-            u[e.offset] = _unconstrain_elt(e, Float64(nt[e.name]))
+            u[e.offset] = _unconstrain_elt(e, convert(T, nt[e.name]))
         end
     end
     return u
 end
 
+# Packed element type of constrained values: their number types promoted with
+# `Float64`, so plain reals pack as `Float64` and AD numbers pass through.
+_host_value_type(x::Number) = _host_type(typeof(x))
+_host_value_type(x::AbstractArray) =
+    eltype(x) <: Number && isconcretetype(eltype(x)) ? _host_type(eltype(x)) :
+    mapreduce(_host_value_type, promote_type, x; init = Float64)
+_host_value_type(x::Union{Tuple,NamedTuple}) =
+    mapreduce(_host_value_type, promote_type, values(x); init = Float64)
+_host_value_type(x) = Float64
+
 """
-    logjac(layout, unconstrained) -> Float64
+    logjac(layout, unconstrained) -> Real
 
 Host-side total log-Jacobian, using the identical operations as the
 in-graph terms (positive: the unconstrained value; unit:
@@ -1274,7 +1325,8 @@ in-graph terms (positive: the unconstrained value; unit:
 function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
         throw(ContractValidationError("[layout] unconstrained length $(length(u)) ≠ $(layout.total)"))
-    total = 0.0
+    T = _host_eltype(u)
+    total = zero(T)
     values = any(_dynamic_bounds, layout.entries) ?
         _flat_draw_values(layout, constrain(layout, u)) : NamedTuple()
     for entry in layout.entries
@@ -1292,7 +1344,7 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
         end
         if e.kind === :scan && !isempty(e.scan_blocks)
             for b in e.scan_blocks, i in b.offset:(b.offset + b.size - 1)
-                total += _logjac_elt(b, Float64(u[i]))
+                total += _logjac_elt(b, convert(T, u[i]))
             end
             continue
         end
@@ -1315,11 +1367,11 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
         if e.kind === :cholesky_corr
             # LKJ thetas couple through the hyperspherical rows —
             # entry-level, never per-coordinate.
-            total += lkj_chol_logjac(Vector{Float64}(seg), _lkj_dim(e.size))
+            total += lkj_chol_logjac(seg, _lkj_dim(e.size))
             continue
         end
         for v in seg
-            total += _logjac_elt(e, Float64(v))
+            total += _logjac_elt(e, convert(T, v))
         end
     end
     return total
@@ -1330,18 +1382,18 @@ end
 # operations (vector statements for thresholds/simplexes, per-element
 # edges for `:exp`), so host and graph agree bit-for-bit.
 _vector_constrain(e::LayoutEntry, seg) =
-    e.transform === :identity ? Vector{Float64}(seg) :
+    e.transform === :identity ? Vector{_host_eltype(seg)}(seg) :
     e.transform === :ordered ? ordered_constrain(seg) :
-    e.transform === :exp ? [_constrain_value(:exp, Float64(x)) for x in seg] :
+    e.transform === :exp ? _host_eltype(seg)[_constrain_value(:exp, _host_real(x)) for x in seg] :
     simplex_constrain(seg)
 _vector_unconstrain(e::LayoutEntry, v) =
-    e.transform === :identity ? Vector{Float64}(v) :
+    e.transform === :identity ? Vector{_host_eltype(v)}(v) :
     e.transform === :ordered ? ordered_unconstrain(v) :
-    e.transform === :exp ? [_unconstrain_value(:exp, Float64(x)) for x in v] :
+    e.transform === :exp ? _host_eltype(v)[_unconstrain_value(:exp, _host_real(x)) for x in v] :
     simplex_unconstrain(v)
 _vector_logjac(e::LayoutEntry, seg) =
     e.transform === :ordered ? ordered_logjac(seg) :
-    e.transform === :exp ? sum(_logjac_value(:exp, Float64(x)) for x in seg) :
+    e.transform === :exp ? sum(_logjac_value(:exp, _host_real(x)) for x in seg) :
     simplex_logjac(seg)
 
 # Host transform values route through the bijector library (the single source
@@ -1384,7 +1436,9 @@ function _logjac_elt(e::LayoutEntry, u)
     e.transform === :floored && return u
     e.transform === :upper && return u
     x = e.lo + (e.hi - e.lo) / (1 + exp(-u))
-    return log(x - e.lo) + log(e.hi - x) - log(e.hi - e.lo)
+    # The width takes the value's number type, so a wide input keeps its
+    # precision; for Float64 this is the identity.
+    return log(x - e.lo) + log(e.hi - x) - log(oftype(x, e.hi - e.lo))
 end
 
 """
