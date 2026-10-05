@@ -692,6 +692,12 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.
+- `constrain`, `unconstrain` and `logjac` follow the number type of their
+  input: `BigFloat` input gives `BigFloat` values, and other number types,
+  such as dual numbers, pass through the transforms unchanged. Plain reals
+  give `Float64` values, as before. Caller-owned parameter geometry receives
+  the same numbers in its endpoints. These host functions are not
+  differentiable with Enzyme: they evaluate lazily prepared transform kernels.
 - Explicit parameter declarations keep their authored names. For
   `a ~ Normal(0, 1); b ~ Normal(0, 2); mu = a .+ b .* x`, the coordinates
   are `a`, `b` and the constrained values are `nt.a`, `nt.b`.

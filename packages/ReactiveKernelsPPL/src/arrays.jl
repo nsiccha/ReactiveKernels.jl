@@ -1076,15 +1076,15 @@ _slice_function_names(t::Symbol) = startswith(String(t), "simplex") ?
 # Host edges of a slice-transformed array entry (the same functions the
 # graph calls, so host and graph agree bit-for-bit).
 function _array_slices_constrain(e::LayoutEntry, seg)
-    U = reshape(Vector{Float64}(seg), _slice_packed_dims(e.transform, e.dims)...)
+    U = reshape(Vector{_host_eltype(seg)}(seg), _slice_packed_dims(e.transform, e.dims)...)
     return _slice_constrain(e.transform,
         _slice_transform_orientation(e.transform), U)
 end
 _array_slices_unconstrain(e::LayoutEntry, X) =
     vec(_slice_unconstrain(e.transform,
-        _slice_transform_orientation(e.transform), Matrix{Float64}(X)))
+        _slice_transform_orientation(e.transform), Matrix{_host_eltype(X)}(X)))
 function _array_slices_logjac(e::LayoutEntry, seg)
-    U = reshape(Vector{Float64}(seg), _slice_packed_dims(e.transform, e.dims)...)
+    U = reshape(Vector{_host_eltype(seg)}(seg), _slice_packed_dims(e.transform, e.dims)...)
     return _slice_logjac(e.transform,
         _slice_transform_orientation(e.transform), U)
 end
@@ -1164,8 +1164,9 @@ end
 function _lkj_stack_constrain(e::LayoutEntry, seg)
     K, S = e.dims[1], e.dims[3]
     P = K * (K - 1) ÷ 2
-    U = reshape(Vector{Float64}(seg), P, S)
-    out = Array{Float64,3}(undef, K, K, S)
+    T = _host_eltype(seg)
+    U = reshape(Vector{T}(seg), P, S)
+    out = Array{T,3}(undef, K, K, S)
     for k in 1:S
         L = lkj_chol_constrain(U[:, k], K)
         out[:, :, k] = _is_upper_lkj(e.transform) ? permutedims(L) : L
@@ -1181,7 +1182,7 @@ end
 function _lkj_stack_logjac(e::LayoutEntry, seg)
     K, S = e.dims[1], e.dims[3]
     P = K * (K - 1) ÷ 2
-    U = reshape(Vector{Float64}(seg), P, S)
+    U = reshape(Vector{_host_eltype(seg)}(seg), P, S)
     return sum(lkj_chol_logjac(U[:, k], K) for k in 1:S)
 end
 

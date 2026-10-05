@@ -25,6 +25,7 @@ DataAPI = "1"
 DifferentiationInterface = "0.7"
 Distributions = "0.25"
 Enzyme = "0.13"
+ForwardDiff = "0.10, 1"
 LinearAlgebra = "1"
 LogExpFunctions = "0.3"
 ReactiveKernels = "0.1"
@@ -41,6 +42,7 @@ CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 InteractiveUtils = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
@@ -51,4 +53,4 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["CategoricalArrays", "DifferentiationInterface", "Distributions", "Enzyme", "InteractiveUtils", "Random", "Reactant", "SHA", "Serialization", "StatsFuns", "Test", "TOML"]
+test = ["CategoricalArrays", "DifferentiationInterface", "Distributions", "Enzyme", "ForwardDiff", "InteractiveUtils", "Random", "Reactant", "SHA", "Serialization", "StatsFuns", "Test", "TOML"]
