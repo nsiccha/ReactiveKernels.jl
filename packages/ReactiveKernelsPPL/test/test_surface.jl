@@ -3428,25 +3428,18 @@ _plate_gauss(R) = Expr(:block,
             Expr(:call, :.~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x); conditioned = (:y, :x))
     @test ranged.responses[1].range == 1:6
     @test _surface_bound_density_equal(lit, ranged, cols, [0.5, -0.25, 0.1])
-    # Every supplied response entry is observed (user decision `1g8uvgs`):
-    # a loop over part of `y` needs the entries it leaves out `missing`.
+    # PROVISIONAL user decision `1uhcm3b`: authored subsets are refused,
+    # including when every omitted response entry is missing.
     masked(rows) = merge(cols, Dict(:y => Union{Missing,Float64}[
         i in rows ? cols[:y][i] : missing for i in eachindex(cols[:y])]))
-    # refused: `1:4` leaves the supplied `y[5:6]` unobserved (`1g8uvgs`).
+    # refused: `1:4` is a partial observation (`1uhcm3b`, provisional).
     @test_throws ContractValidationError bind_data(lower_rkppl(
         _plate_gauss(:(1:4)), (:y, :x); conditioned = (:y, :x)), cols)
-    # Any literal loop selects its authored cells, including a prefix, an
-    # offset or an empty range, as a Julia loop does.
+    # Literal iteration does not authorize partial observation.
     for (R, rows) in ((:(1:4), 1:4), (:(2:6), 2:6), (:(3:3), 3:3), (:(1:0), 1:0), (:(5:4), 5:4))
         plan = lower_rkppl(_plate_gauss(R), (:y, :x); conditioned = (:y, :x))
         @test repr(plan.responses[1].range) == repr(:(y[$(first(rows)):$(last(rows))]))
-        bound = bind_data(plan, masked(rows))
-        built = build_kernel(bound)
-        nt = constrain(built.layout, [0.5, -0.25, 0.1])
-        @test Base.invokelatest(prepare_query(built, bound, :likelihood),
-                [0.5, -0.25, 0.1]) ≈
-            sum(logpdf(Normal(nt.a + nt.b * cols[:x][i], nt.s), cols[:y][i])
-                for i in rows; init = 0.0)
+        @test_throws ContractValidationError bind_data(plan, masked(rows))
     end
     # refused: the loop reads `y[7]` or `y[0]` outside the six bound rows
     # (standing @rkppl language principle 3: Julia indexing safety).
@@ -3555,12 +3548,10 @@ end
             @test isempty(empty_plan.plate_parameters)
         elseif i == 5
             admitted = lower_rkppl(program, Dn; conditioned=Dn)
-            # `axes(y, 2)` of a vector selects `y[1]`; the entries it leaves
-            # out are `missing` (every supplied entry is observed, `1g8uvgs`).
+            # `axes(y, 2)` of a vector observes only y[1], an authored
+            # subset, including when all other entries are missing.
             cols = Dict(:y => [0.2, missing, missing], :x => [0.3, 0.5, 0.8])
-            bound = bind_data(admitted, cols)
-            @test bound.n_obs == 1
-            @test length(Base.invokelatest(prepare_query(build_kernel(bound), bound, :pointwise), [0.2, -0.1, 0.0]).y) == 1
+            @test_throws ContractValidationError bind_data(admitted, cols)
         else
             # refused: non-for macro syntax, undeclared range names,
             # repeated observations in nested loops or parameter-dependent if (P3/P6; 05oe96l, 10gzbm9).

@@ -8,7 +8,8 @@
 # its name or of any particular graph. Identity must not depend solely on the
 # name (gist §5), so two values may share a name yet remain distinct.
 const _VALUE_COUNTER = Ref(0)
-_next_value_id() = (_VALUE_COUNTER[] += 1)
+_next_value_id(floor::Int = 0) =
+    (_VALUE_COUNTER[] = max(_VALUE_COUNTER[], floor) + 1)
 
 """
     Value{T}
@@ -1291,13 +1292,24 @@ mutable struct Graph
     # `prepare(…; bound)` (`_graph_preparations`, graphops.jl); `nothing` until
     # the first one. Not part of the graph's meaning.
     preparations::Any
+    # This graph's identity high-water mark travels with a package image.
+    # A dependency's process-local counter does not retain allocations made
+    # while precompiling a consumer, so it alone cannot extend a loaded graph.
+    value_id_floor::Int
 end
 Graph(values, recipes, producers, aliases, version) =
     Graph(values, recipes, producers, aliases, version, nothing)
+Graph(values, recipes, producers, aliases, version, preparations) =
+    Graph(values, recipes, producers, aliases, version, preparations,
+          maximum(keys(values); init = 0))
 Graph() = Graph(Dict{Int,Value}(), Recipe[], Dict{Int,Vector{Int}}(),
                 Dict{Int,Int}(), 0)
 
-_register!(g::Graph, v::Value) = (g.values[v.id] = v; v)
+function _register!(g::Graph, v::Value)
+    g.values[v.id] = v
+    g.value_id_floor = max(g.value_id_floor, v.id)
+    v
+end
 
 """
     canon_id(g, id) -> Int
@@ -1313,7 +1325,7 @@ canon_id(g::Graph, id::Int) = haskey(g.aliases, id) ? canon_id(g, g.aliases[id])
 Create a `Value{T}` and register it into graph `g`.
 """
 function value!(g::Graph, name::Symbol, ::Type{T}) where {T}
-    v = Value(name, T)
+    v = Value{T}(_next_value_id(g.value_id_floor), name)
     _register!(g, v)
     g.version += 1
     v

@@ -692,16 +692,6 @@ function setup_sir!(mod::Module)
     nothing
 end
 
-function setup_one_comp_mm_elim_abs!(mod::Module)
-    if !isdefined(mod, :OneCompMMElimAbsExample)
-        Core.eval(mod, :(using ReactiveKernelsPPLExamples: OneCompMMElimAbsExample))
-    end
-    Core.eval(mod, :(using .OneCompMMElimAbsExample:
-        ONECOMP_T0, ONECOMP_D, ONECOMP_V, ONECOMP_TIMES, ONECOMP_C0,
-        ONECOMP_C_HAT))
-    nothing
-end
-
 function setup_soil_incubation!(mod::Module)
     if !isdefined(mod, :SoilIncubationExample)
         Core.eval(mod, :(using ReactiveKernelsPPLExamples: SoilIncubationExample))
@@ -1253,7 +1243,6 @@ const EXPECTED_PPL_EXAMPLES = (
     :multi_occupancy_posterior,
     :lotka_volterra_posterior,
     :sir_posterior,
-    :one_comp_mm_elim_abs_posterior,
     :soil_incubation_posterior,
     :hmm_drive_1_density,
 )

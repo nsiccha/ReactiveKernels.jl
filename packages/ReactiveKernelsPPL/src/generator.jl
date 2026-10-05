@@ -319,7 +319,10 @@ function _assignment_statements(plan::StructuralPlan;
     stmts = Expr[]
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
-        ex = _value_math_rewrite(_array_gather_rewrite(by_name[name].expr, plan, gathers))
+        ex = _guard_missing_observation_argument(name, by_name[name].expr, plan, plan.columns)
+        ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
+            (ex = _concrete_guarded_argument(ex))
+        ex = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
         ex = _split_gp_cov_calls!(stmts, name, ex, plan)
         if _expr_value_symbols(ex) ⊆ dataonly
             push!(dataonly, name)
@@ -545,9 +548,13 @@ _composed_map_emit(f) = f
 function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
         pred::Symbol)
     if _is_plate_column_expr(node)
+        original = node
+        node = _guard_missing_observation_argument(pred, node, plan, plan.columns)
         aliases = Dict{Symbol,Symbol}(s => _lp_name(_predictor(plan, s)) for s in subs)
         inputs = [_hsubst(a, aliases) for a in node.args[1].args[2:end]]
-        return Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
+        value = Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
+        return node !== original && _guarded_argument_is_bound(node, plan.columns) ?
+            _concrete_guarded_argument(value) : value
     end
     if node isa Symbol
         node in subs || return node
@@ -601,7 +608,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
         if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.evidence.kind === :none &&
-                r.n_levels > 1 && _response_rows(plan, r) > 0
+                r.n_levels > 1 && _response_rows(plan, r) > 0 && _has_observed_response(plan, r)
             # Stopping-ratio emits one lane per visited stage. Gather the
             # prefix sum at each observation's last stage, then difference.
             ends = Symbol(pw, :_ends)
@@ -729,11 +736,20 @@ _mixture_normal_cdf(x, mu, sigma) = 0.5 * erfc((mu - x) / (sqrt(2.0) * sigma))
 function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
     # No cell is evaluated on an empty bound observation domain. Its sum is
     # the additive identity, independently of the response family.
-    _response_rows(plan, r) == 0 && return Expr[
-        :($(_pw_name(r.label)) = zeros($(r.range isa Expr ? size(_selected_response_column(plan, r)) : size(plan.columns[r.response])))),
+    if _response_rows(plan, r) == 0 || !_has_observed_response(plan, r)
+        obs = _observation_axes(plan)
+        shape = obs !== nothing && hasproperty(obs, :domains) ?
+            length.(obs.domains[r.label]) :
+            r.range isa Expr ? size(_selected_response_column(plan, r)) : size(plan.columns[r.response])
+        return Expr[
+        :($(_pw_name(r.label)) = zeros($shape)),
         :($(_lik_name(r.label))::Float64 = 0.0)]
+    end
     stmts = _response_likelihood_stmts_full(r, plan)
-    r.range isa Expr && return _ranged_response_stmts(r, plan, stmts)
+    if r.range isa Expr
+        return _mask_response_stmts(r, plan, _ranged_response_stmts(r, plan, stmts))
+    end
+    stmts = _mask_response_stmts(r, plan, stmts)
     r.mi_jobs === nothing && return stmts
     if r.family === OrdinalFam && r.ordinal_structure === :stopping
         return _mi_stopping_response_stmts(r, plan, stmts)
@@ -770,6 +786,44 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         end
     end
     return Expr[stmts[1:obsidx-1]..., pre..., stmts[obsidx:end]...]
+end
+
+# Presence is bound data. RK's ordinary plate branch lowering partitions the
+# lanes before density evaluation, so Missing/union values never enter RK or AD.
+# Full response axes and all model declarations remain intact.
+function _mask_response_stmts(r, plan, stmts)
+    mask = _observed_mask_name(r.response)
+    haskey(plan.columns, mask) || return stmts
+    pre = Expr[]
+    if r.range isa Expr
+        selected = Symbol(:_ppl_present_range_, r.label)
+        idx = Symbol(:_ppl_range_indices_, r.label)
+        push!(pre, Expr(:(=), selected, Expr(:ref, mask, idx, r.range.args[3:end]...)))
+        mask = selected
+    end
+    if r.family === OrdinalFam && r.ordinal_structure === :stopping &&
+            r.evidence.kind === :none && r.n_levels > 1
+        stages = Symbol(:_ppl_present_stages_, r.label)
+        obs = _stage_lane(r.label, :obs)
+        push!(pre, :($stages = $mask[$obs]))
+        mask = stages
+    end
+    pw = _pw_name(r.label)
+    i = findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)
+    i === nothing && throw(ContractValidationError("[generator] response $(r.label) has no pointwise observation"))
+    st = deepcopy(stmts[i])
+    rhs = st.args[2]
+    if Meta.isexpr(rhs, :do) && rhs.args[1].args[1] === :plate
+        inputs, lambda = rhs.args[1], rhs.args[2]
+        present = _dovar(length(inputs.args))
+        push!(inputs.args, mask)
+        push!(lambda.args[1].args, present)
+        lambda.args[2] = Expr(:block, LineNumberNode(0, :generator),
+            Expr(:if, present, lambda.args[2], 0.0))
+        return Expr[stmts[1:i-1]..., pre..., st, stmts[i+1:end]...]
+    end
+    throw(ContractValidationError(
+        "[generator] response $(r.label) needs an observation plate for presence guards"))
 end
 
 # Stopping-ratio inputs must be packed before stage expansion. Selecting
@@ -830,6 +884,7 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         # must never silently outgrow a future partial range).
         r.evidence.kind === :none && r.weights === nothing &&
             r.range === nothing && r.mi_jobs === nothing && r.link === LogitLink &&
+            !haskey(plan.columns, _observed_mask_name(r.response)) &&
             !_is_bare_param_location(r, plan) &&
             _wholevec_location(r, plan) &&
             return _bernoulli_wholevec_stmts(r, plan, node)
@@ -840,6 +895,7 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         # plate handles evidence/weights/ranges).
         r.evidence.kind === :none && r.weights === nothing &&
             r.range === nothing && r.mi_jobs === nothing && r.link === LogLink &&
+            !haskey(plan.columns, _observed_mask_name(r.response)) &&
             !_is_bare_param_location(r, plan) &&
             _wholevec_location(r, plan) &&
             return _poisson_wholevec_stmts(r, plan, node)
@@ -1116,7 +1172,7 @@ end
 # rejoin as `beta_full = [alpha; beta]` (the validated P2 spelling).
 function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
         pw::Symbol)
-    if r.evidence.kind !== :none
+    if r.evidence.kind !== :none || haskey(plan.columns, _observed_mask_name(r.response))
         lp = Symbol(:_ppl_glm_eta_, r.label)
         pre = Expr[:($lp = $(r.glm_alpha) .+ $(r.predictor) * $(r.glm_beta))]
         inputs = Any[r.response, lp]
