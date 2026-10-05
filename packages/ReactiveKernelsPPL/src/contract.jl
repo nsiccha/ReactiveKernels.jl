@@ -1624,11 +1624,11 @@ function _validate_response_range_expr(r::LikelihoodSpec)
     index = ex.args[2]
     valid = index === :(:) ||
         (Meta.isexpr(index, :call, 3) && index.args[1] === :(:) &&
-            index.args[2] === 1 && index.args[3] isa Int && index.args[3] >= 1) ||
+            index.args[2] isa Int && index.args[3] isa Int) ||
         (Meta.isexpr(index, :call, 2) && index.args[1] === :eachindex && index.args[2] isa Symbol) ||
         (Meta.isexpr(index, :call, 3) && index.args[1] === :axes && index.args[2] isa Symbol &&
             index.args[3] isa Integer && !(index.args[3] isa Bool) && index.args[3] >= 1)
-    valid || _fail(r.label, "response range uses eachindex(v), axes(v, d), or :")
+    valid || _fail(r.label, "response range uses a literal a:b, eachindex(v), axes(v, d), or :")
     all(i -> i isa Integer && !(i isa Bool) && i >= 1, ex.args[3:end]) ||
         _fail(r.label, "response trailing indices must be positive literal integers")
     r.mi_jobs === nothing || _fail(r.label, "dynamic index ranges beside packed mi rows are not built yet")
@@ -1638,14 +1638,17 @@ end
 _response_range_source(r::LikelihoodSpec) = r.range.args[2] === :(:) ?
     r.response : r.range.args[2].args[1] === :(:) ? r.response : r.range.args[2].args[2]
 
-function _response_range_indices(plan::StructuralPlan, r::LikelihoodSpec)
+_response_range_indices(plan::StructuralPlan, r::LikelihoodSpec) =
+    _response_range_indices(plan.columns, r)
+
+function _response_range_indices(columns::AbstractDict, r::LikelihoodSpec)
     _validate_response_range_expr(r)
     source = _response_range_source(r)
-    haskey(plan.columns, source) || _fail(r.label, "response index source $source is not bound")
-    value = plan.columns[source]
+    haskey(columns, source) || _fail(r.label, "response index source $source is not bound")
+    value = columns[source]
     value isa AbstractArray || _fail(r.label, "response index source $source must be an array")
     index = r.range.args[2]
-    index isa Expr && index.args[1] === :(:) && return 1:index.args[3]
+    index isa Expr && index.args[1] === :(:) && return index.args[2]:index.args[3]
     return index === :(:) || index.args[1] === :eachindex ? eachindex(value) :
         axes(value, index.args[3])
 end
@@ -1680,6 +1683,129 @@ function _response_slot_column(plan, r, name, what)
     checkbounds(Bool, value, indices) || _fail(r.label,
         "$what $name does not cover the authored response range")
     value[indices]
+end
+
+# ── Observed selections ──────────────────────────────────────────────
+# Every supplied entry of an observed response array is observed; a
+# statement may leave out only `missing` entries (user decision `1g8uvgs`).
+# A selection is a response range (a plate's `y[2:6]` or `y[axes(y, 2)]`,
+# `y[i, 1]`, `y[eachindex(x)]`) or a statement's data-indexed left-hand
+# side (`y[rows] .~ …`, which `_indexed_observation_definitions` rewrites
+# into an observed gather). A definition the author wrote, such as a lag,
+# is ordinary data use, not a selection. Selections of one array union.
+const _OBSERVED_GATHER_PREFIX = "_rkppl_observed_"
+
+function _observed_selections(plan::StructuralPlan, columns::AbstractDict)
+    gathers = Dict{Symbol,Any}(d.name => d.expr for d in plan.derived)
+    out = NamedTuple{(:array, :label, :index, :kernel),Tuple{Symbol,Symbol,Tuple,Bool}}[]
+    for r in plan.responses
+        r.mi_jobs === nothing || continue
+        if r.range isa Expr
+            get(columns, r.response, nothing) isa AbstractArray || continue
+            index = (_response_range_indices(columns, r), r.range.args[3:end]...)
+            push!(out, (; array = r.response, label = r.label, index, kernel = true))
+        elseif startswith(string(r.response), _OBSERVED_GATHER_PREFIX)
+            ex = get(gathers, r.response, nothing)
+            Meta.isexpr(ex, :ref, 2) && get(columns, ex.args[1], nothing) isa AbstractArray ||
+                continue
+            i = ex.args[2]
+            index = i isa Symbol ? get(columns, i, nothing) :
+                _literal_row_range(i) ? (i.args[2]:i.args[3]) : nothing
+            index isa AbstractArray || continue
+            push!(out, (; array = ex.args[1], label = r.label, index = (index,), kernel = false))
+        end
+    end
+    return out
+end
+
+_entry_name(name, I::CartesianIndex) = "$name[$(join(Tuple(I), ", "))]"
+_entry_names(name, entries) = join((_entry_name(name, I) for I in first(entries, 3)), ", ") *
+    (length(entries) > 3 ? " and $(length(entries) - 3) more" : "")
+
+const _SHAPE_READS = (:axes, :eachindex, :size, :length)
+_is_shape_read(ex) = Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+    (ex.args[1] in _SHAPE_READS || (ex.args[1] isa GlobalRef &&
+        ex.args[1].mod === Base && ex.args[1].name in _SHAPE_READS))
+
+# A column read only through its own selections: no other plan value
+# names it. Shape reads (`axes(y, 1)` iterators, index sources) contribute
+# axes, not values.
+function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
+    found = false
+    function visit(x)
+        found && return nothing
+        if x === name
+            found = true
+        elseif _is_shape_read(x)
+            return nothing
+        elseif x isa Expr
+            foreach(visit, x.args)
+        elseif x isa QuoteNode
+            visit(x.value)
+        elseif x isa Union{AbstractArray,Tuple,NamedTuple,AbstractSet,Pair}
+            foreach(visit, x)
+        elseif x isa AbstractDict
+            foreach(p -> (visit(first(p)); visit(last(p))), x)
+        elseif isstructtype(typeof(x)) && parentmodule(typeof(x)) === @__MODULE__
+            for f in fieldnames(typeof(x))
+                isdefined(x, f) && visit(getfield(x, f))
+            end
+        end
+        return nothing
+    end
+    for f in fieldnames(StructuralPlan)
+        f in (:columns, :roles, :n_obs, :submodel_scopes, :responses,
+            :indexed_observations) && continue
+        visit(getfield(plan, f))
+    end
+    for r in plan.responses, f in fieldnames(LikelihoodSpec)
+        f === :range && continue
+        r.response === name && f in (:response, :label) && continue
+        visit(getfield(r, f))
+    end
+    return !found
+end
+
+# Checks every observed array against its selections. An in-kernel
+# selection reads its array inside the graph, so the unobserved `missing`
+# entries of an array read only there are encoded by a never-read fill
+# (NaN for floats); a selected `missing` entry fails.
+function _validate_observed_selections!(plan::StructuralPlan, columns::AbstractDict)
+    masks = Dict{Symbol,BitArray}()
+    labels = Dict{Symbol,Symbol}()
+    kernel = Set{Symbol}()
+    for s in _observed_selections(plan, columns)
+        value = columns[s.array]
+        # Out-of-range selections fail with their statement's own message.
+        checkbounds(Bool, value, s.index...) || continue
+        mask = get!(() -> falses(size(value)), masks, s.array)
+        mask[s.index...] .= true
+        missed = [I for I in CartesianIndices(value) if mask[I] && ismissing(value[I])]
+        isempty(missed) || _fail(s.label, "observed entries " *
+            "$(_entry_names(s.array, missed)) are missing — a statement observes " *
+            "only supplied entries; leave missing entries out of its selection")
+        get!(labels, s.array, s.label)
+        s.kernel && push!(kernel, s.array)
+    end
+    for (name, mask) in masks
+        value = columns[name]
+        left = [I for I in CartesianIndices(value) if !mask[I] && !ismissing(value[I])]
+        isempty(left) || _fail(labels[name], "supplied entries " *
+            "$(_entry_names(name, left)) are never observed — every supplied " *
+            "response entry is observed; bind only the observed " *
+            "entries or mark the others `missing`")
+        name in kernel && Missing <: eltype(value) || continue
+        T = Base.nonmissingtype(eltype(value))
+        T <: Real || continue
+        if !any(ismissing, value)
+            # A union element type without a missing value (an empty
+            # selection) narrows without changing any value.
+            columns[name] = T.(value)
+        elseif _read_only_by_selection(plan, name)
+            columns[name] = coalesce.(value, T <: AbstractFloat ? T(NaN) : zero(T))
+        end
+    end
+    return columns
 end
 
 """Broadcast domains of bound observation statements: `(; rows, total,
@@ -2567,6 +2693,16 @@ function _level_plate_axis(ex)
     inp = ex.args[1].args[2]
     return inp isa Expr && inp.head === :call && length(inp.args) == 2 &&
         inp.args[1] === :_ppl_level_indices ? inp.args[2] : nothing
+end
+
+# A selected observation plate (`_desugar_selected_plate`) iterates
+# `Base.collect(indices)`: its column holds one value per authored index, in
+# loop order. Keep that provenance in the first input, like a level axis.
+function _selected_plate_indices(ex)
+    _is_plate_column_expr(ex) || return nothing
+    inp = ex.args[1].args[2]
+    return Meta.isexpr(inp, :call, 2) && inp.args[1] == GlobalRef(Base, :collect) ?
+        inp.args[2] : nothing
 end
 
 function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
@@ -3712,11 +3848,14 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
                   "offset/varying-effect terms only — no nested " *
                   "compositions, latents, or other summands)")
     end
-    known = _union_names(plan)
+    # Value leaves are scalars or whole model-level arrays (`z .+ w .* z`
+    # with `z[1:K] .~ …`): their values combine with Julia broadcasting.
+    known = union(_union_names(plan), _array_names(plan),
+        _vector_value_names(plan))
     for c in o.scalars
         c in known ||
-            _fail(t.label, "composed scalar $c is neither a sampled " *
-                  "parameter nor a scalar assignment")
+            _fail(t.label, "composed value leaf $c is neither a sampled " *
+                  "parameter, a declared array nor an assignment")
     end
     leaves = _validate_composed_tree(o.tree, o.subs, o.scalars, t.label,
         datas)
@@ -6749,6 +6888,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     inputs, _ = _model_level_inputs(plan, raw)
     union!(inputs, (_conditioned_input(n) for n in plan.conditioned))
     _materialize_derived_responses!(plan, columns)
+    _validate_observed_selections!(plan, columns)
     for (k, v) in roles
         haskey(columns, k) || throw(ContractValidationError(
             "[bind] role for unknown column $k"))

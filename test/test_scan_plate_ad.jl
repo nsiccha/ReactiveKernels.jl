@@ -93,4 +93,25 @@ end
         @test xs == original
     end
 end
+
+# A declared scan output converts every assignment to its type, so the
+# lowering must never bind it to a placeholder when the step's inferred output
+# type is not concrete (here `Union{Float64, Int}`).
+@kernel declared_unstable(xs, gain) = begin
+    history::Vector{Float64} = scan(xs, Ref(gain); init=0.0) do carry, x, g
+        next = x > 0 ? carry + x*g : 0
+        (next, next)
+    end
+    total = sum(history)
+    return total
+end
+
+@testset "declared scan outputs accept a non-concrete step type" begin
+    k = prepare(declared_unstable; want=:total)
+    for (xs, expected) in ((Float64[], 0.0), ([0.5, -1.0, 2.0], 0.35 + 0.0 + 1.4))
+        original = copy(xs)
+        @test k(xs, 0.7) ≈ expected
+        @test xs == original
+    end
+end
 end

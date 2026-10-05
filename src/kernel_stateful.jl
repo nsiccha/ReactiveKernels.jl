@@ -246,18 +246,21 @@ end
 # structurally immutable. It preserves ALL graph, port, boundary, and signature
 # metadata and reconstructs a fresh `KernelSpec` for planning, so the owner never
 # re-reads (nor can it mutate) the child.
-struct _ChildSnapshot{VS,RS,PS,AS,PT,PO,HN,WN,CS}
+# Tuple lengths describe graph metadata, not numerical execution types. Keep
+# them out of the snapshot type so reconstruction does not compile afresh for
+# each graph topology; the frozen contents and operation identities stay exact.
+struct _ChildSnapshot
     name::Symbol
-    values::VS               # Tuple of Value (immutable)
-    recipes::RS              # Tuple of Recipe (immutable)
-    producers::PS            # Tuple of (id::Int, Tuple of recipe indices)
-    aliases::AS              # Tuple of Pair{Int,Int}
+    values::Tuple{Vararg{Value}}
+    recipes::Tuple{Vararg{Recipe}}
+    producers::Tuple{Vararg{Tuple{Int,Tuple{Vararg{Int}}}}}
+    aliases::Tuple{Vararg{Pair{Int,Int}}}
     version::Int
-    ports::PT                # Tuple of Pair{Symbol,Int} (port name => value id)
-    port_order::PO           # Tuple{Vararg{Symbol}}
-    have_names::HN           # Tuple{Vararg{Symbol}}
-    want_names::WN           # Tuple{Vararg{Symbol}}
-    call_signature::CS
+    ports::Tuple{Vararg{Pair{Symbol,Int}}}
+    port_order::Tuple{Vararg{Symbol}}
+    have_names::Tuple{Vararg{Symbol}}
+    want_names::Tuple{Vararg{Symbol}}
+    call_signature::Any
 end
 
 "Capture a frozen, detached immutable snapshot of a child `KernelSpec` value."

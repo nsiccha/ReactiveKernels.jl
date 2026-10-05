@@ -3,6 +3,9 @@ using DifferentiationInterface, Distributions, Enzyme, LinearAlgebra, ReactiveKe
 function _cap_ranged_ordinal(kind, n, singleton)
     data = Dict(:x => collect(range(-0.4, 0.7; length=n)),
         :y => [mod1(i, 3)+1 for i in 1:n])
+    # Every supplied response entry must be observed (USER `1g8uvgs`).
+    singleton && (data[:y] = Union{Missing,Int}[i == 1 ? data[:y][i] : missing
+        for i in 1:n])
     ast = quote b ~ Normal(0, 2) end
     push!(ast.args, kind === :stopping ? :(c[1:3] .~ Normal.(0, 1)) : :(c ~ Ordered(Normal(0, 1), 3)))
     obj = kind === :ordered ? :(OrderedLogistic(b*x[i], Ref(c))) :
@@ -58,7 +61,8 @@ end
 end
 
 @testset "indexed scale support is checked only in selected cells" begin
-    data = Dict(:y => [0.2, 0.4, 0.1], :s => [0.7, -1.0, -2.0])
+    data = Dict(:y => Union{Missing,Float64}[0.2, missing, missing],
+        :s => [0.7, -1.0, -2.0])
     ast = quote
         a ~ Normal(0, 1)
         @plate for i in axes(y, 2)
