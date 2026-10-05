@@ -29,10 +29,10 @@ executable_inventory(call::ReactantExt._ExternalizedADExecutable) =
 
 # The named and submodel-returned spellings compile exactly like the inline
 # one: matching values and ordinary gradients, and the inline spelling's
-# MLIR and default-executable inventories at every size. Optimized MLIR is
-# fixed across sizes. At 8 rows XLA reduces in a single stage; from 40 rows
-# it adds one `reduce-window` stage and then plateaus (measured identical at
-# 40, 200 and 1000 rows), so the complete executables are compared there.
+# MLIR and default-executable inventories at every tested size. Optimized
+# MLIR is fixed at 8, 40 and 200 rows. At 8 rows XLA reduces in a single
+# stage; at 40 and 200 rows it adds one `reduce-window` stage, so the
+# complete executables are compared at those two sizes.
 @testset "named matrix products compile with fixed structure" begin
     u = [0.3, -0.7]
     sizes = (0, 1, 8, 40, 200)
