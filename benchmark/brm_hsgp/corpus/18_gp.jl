@@ -6,8 +6,8 @@ begin
     @plate for i in eachindex(y)
         z_gp[i] ~ Normal(0, 1)
     end
-    f_gp = ReactiveKernelsDistributionKernels.DistributionKernelSources.gp_chol_latent(
-        ReactiveKernelsDistributionKernels.DistributionKernelSources.gp_exp_quad_cov(
+    f_gp = BayesianRegressionModels.StatisticalPreparation.gp_chol_latent(
+        BayesianRegressionModels.StatisticalPreparation.gp_exp_quad_cov(
             x, sigma_gp, rho_gp, 1e-9), z_gp)
     mu = a .+ f_gp[oi]
     y .~ Normal.(mu, 0.5)

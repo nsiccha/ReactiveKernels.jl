@@ -479,7 +479,8 @@ For paired crossed effects, index each axis by one observation's label
 inside a plate: `mu[i] = a + b[g[i], h[i]]`. Julia's `b[g, h]` with two
 vectors selects a Cartesian matrix.
 
-The library's `gp_exp_quad_cov` and `gp_periodic_cov` functions build covariance
+BRM's `StatisticalPreparation.gp_exp_quad_cov` and `gp_periodic_cov` functions
+build covariance
 with an RK plate over two location axes. Data-only locations cache pair
 distances during preparation; locations derived from parameters retain live
 distance calculations. The covariance matrix remains dense and diagonal jitter
@@ -487,6 +488,12 @@ depends on position, including when two locations are equal. Dense Cholesky in
 `gp_chol_latent` delegates its factorization to the general RK-proper
 `rk_cholesky_lower` callable, preserving native gradient support;
 compiled covariance support does not imply compiled Cholesky gradients.
+Import these helpers into the model module as ordinary Julia functions. For
+explicit graph composition, load RK and RKPPL and use
+`BayesianRegressionModels.rk_model(:gp_exp_quad_cov)` or
+`rk_model(:gp_periodic_cov)`; an assigned graph call follows the general
+composition path. The adopted owner API is available at BRM
+`1f296dac2c086347525194887500948edb213228`.
 
 A single index on a multi-axis definition is linear and positional:
 `b = (z * sd)'` makes a row, and `b[g]` reads its column-major positions.

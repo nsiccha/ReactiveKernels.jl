@@ -29,7 +29,6 @@ using Test
 include("reactant_suite_selector.jl")
 
 const _MATRIX_CORE_TESTS = (
-    "test_brm_hsgp.jl",
     "test_runtests_selector.jl",
     "test_reactant_selector.jl",
     "test_stateless.jl",
