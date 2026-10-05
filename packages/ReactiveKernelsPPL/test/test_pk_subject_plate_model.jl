@@ -16,13 +16,10 @@ end
 
 # Include nested plans: counting only the outer recipe would miss hidden
 # subject or event replication. The count must be independent of data sizes.
-function structure(plan, counts=Dict{Symbol,Int}())
-    for recipe in plan.recipes
-        op = recipe.op
-        kind = op isa ReactiveKernels._AuthoredPlateOp ? :plate :
-            op isa ReactiveKernels._AuthoredScanOp ? :scan : :leaf
+function structure(program)
+    counts = Dict{Symbol,Int}()
+    for (; kind) in recipe_inventory(program)
         counts[kind] = get(counts, kind, 0)+1
-        kind in (:plate, :scan) && structure(op.kernel.plan, counts)
     end
     counts
 end
@@ -66,7 +63,7 @@ end
             value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
             @test value ≈ density(u) rtol=2e-11
             @test grad ≈ finite_gradient(density, u) rtol=2e-6 atol=2e-7
-            inventory = structure(query.plan)
+            inventory = structure(query)
             @test inventory[:plate] >= 1
             @test inventory[:scan] == 1
             push!(inventories, inventory)

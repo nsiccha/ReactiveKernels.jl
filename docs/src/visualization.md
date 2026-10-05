@@ -80,6 +80,10 @@ interactive buttons.
 joined by `≡`) and its recipes, with each authored plate or scan body nested
 under its recipe. A recipe captured from `@kernel` source reads as
 `(inputs) -> source`, as it does in `explain(plan)` and in the diagram labels.
+The same walk is available as data: `recipe_inventory` returns one `(; kind,
+depth, parent, recipe)` entry per listed recipe, and `recipe_kind` classifies a
+single recipe as `:plate`, `:scan` or `:ordinary` (see [Inspecting
+structure](compiler.md#inspecting-structure)).
 
 `readable_code(spec_or_plan)` shows the planned program as ordinary Julia,
 with every operation slot replaced by its authored source or name and no
