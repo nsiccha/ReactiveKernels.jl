@@ -168,8 +168,8 @@ struct LayoutEntry
 end
 
 # Host transforms (`constrain`, `unconstrain`, `logjac` and the exported
-# vector/LKJ helpers) follow the number type of their input, so AD numbers
-# such as ForwardDiff duals pass through. Plain reals keep at least `Float64`
+# vector/LKJ helpers) follow the number type of their input, so dual numbers,
+# `BigFloat` and other reals pass through. Plain reals keep at least `Float64`
 # precision, so `Float64`, `Float32` and integer inputs give the same
 # `Float64` results as before.
 _host_type(::Type{T}) where {T} = promote_type(Float64, T)
@@ -1103,11 +1103,11 @@ end
 
 Host-side constrain of the packed vector. Parameters keep their author
 names; submodel locals are nested (`nt.z.b`, `nt.z.w.b`). Scalar, vector,
-and array leaves retain their constrained shapes. Values follow the number type
-of `unconstrained` (`Float64` for plain reals), so the transform can be
-differentiated with forward-mode AD such as ForwardDiff. Deterministic submodel locals and return values are
-read in the model rather than included in this draw container. The generator
-emits the equivalent transforms inside the mathematical graph.
+and array leaves retain their constrained shapes. Values follow the number
+type of `unconstrained` (`Float64` for plain reals). Deterministic submodel
+locals and return values are read in the model rather than included in this
+draw container. The generator emits the equivalent transforms inside the
+mathematical graph.
 """
 function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
