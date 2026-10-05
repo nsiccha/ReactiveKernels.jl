@@ -696,8 +696,9 @@ restore_draws(built.layout, U)           # U: layout.total × draws
   input: `BigFloat` input gives `BigFloat` values, and other number types,
   such as dual numbers, pass through the transforms unchanged. Plain reals
   give `Float64` values, as before. Caller-owned parameter geometry receives
-  the same numbers in its endpoints. These host functions are not
-  differentiable with Enzyme: they evaluate lazily prepared transform kernels.
+  the same numbers in its endpoints. Generic number support does not establish
+  native Enzyme support for these layout-based calls; use `prepare_sampler`
+  for posterior gradients through the model graph.
 - Explicit parameter declarations keep their authored names. For
   `a ~ Normal(0, 1); b ~ Normal(0, 2); mu = a .+ b .* x`, the coordinates
   are `a`, `b` and the constrained values are `nt.a`, `nt.b`.
