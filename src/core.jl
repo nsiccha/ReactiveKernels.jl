@@ -39,20 +39,6 @@ Base.:(==)(a::Value, b::Value) = a.id == b.id
 Base.hash(v::Value, h::UInt) = hash(v.id, hash(:ReactiveKernelsValue, h))
 Base.show(io::IO, v::Value{T}) where {T} = print(io, v.name, "::", T)
 
-"""
-    Recipe
-
-A pure computation mapping input graph values to one or more output graph
-values via `op`. RK does not inspect `op` to prove purity: registering an
-ordinary recipe asserts this contract. Set `effectful=true` when the operation
-is known not to satisfy it; effectful operations are rejected by the stateless
-planner and therefore cannot enter a prepared kernel or plate. `cost` is a
-deterministic planning hint (not measured runtime). `cse_key`, when
-non-`nothing`, opts the operation into structural CSE (gist §8).
-`source` is optional authored-RHS metadata for cold-path readable rendering; it
-is kept on the planning recipe rather than the executable operation so it never
-enters prepared hot-state tuples.
-"""
 struct _NoKernelSource end
 const _NO_KERNEL_SOURCE = _NoKernelSource()
 
@@ -69,6 +55,21 @@ struct _RuntimeCheckCallback{E}
 end
 (check::_RuntimeCheckCallback)(valid) = _runtime_check(valid, check.error)
 
+"""
+    Recipe
+
+A pure computation mapping input graph values to one or more output graph
+values via `op`. RK does not inspect `op` to prove purity: registering an
+ordinary recipe asserts this contract. Set `effectful=true` when the operation
+is known not to satisfy it; effectful operations are rejected by the stateless
+planner and therefore cannot enter a prepared kernel or plate. `cost` is a
+deterministic planning hint (not measured runtime). `cse_key`, when
+non-`nothing`, opts the operation into structural CSE (gist §8).
+`source` is optional authored-RHS metadata for cold-path readable rendering; it
+is kept on the planning recipe rather than the executable operation so it never
+enters prepared hot-state tuples. [`recipe_kind`](@ref) classifies a recipe as an
+authored plate, an authored scan or an ordinary recipe.
+"""
 struct Recipe
     id::Int
     inputs::Tuple{Vararg{Value}}
@@ -351,6 +352,155 @@ end
 @inline _native_broadcast_copyto!(dest::Array, bc) =
     copyto!(dest, Base.Broadcast.preprocess(nothing, bc))
 
+# Native concatenation.  Base's methods for dense arrays of one element type,
+# `hcat`/`vcat` of `Vector{T}`s and the `typed_hcat`/`typed_vcat`/
+# `typed_hvcat` loops behind `hcat`, `vcat` and `hvcat` of `Vector{T}` and
+# `Matrix{T}` operands, read each operand from their vararg tuple at a runtime
+# index.  When the operands mix constant data with active arrays, native
+# Enzyme reverse joins their activities at that load and fails static activity
+# analysis with `EnzymeRuntimeActivityError`, although the arguments' activity
+# is fixed (`benchmark/repro_enzyme_mixed_activity_concat.jl` reproduces it
+# without ReactiveKernels).  The native body calls these companions instead
+# (`_kernel_native_concats`).  They return Base's result, a freshly allocated
+# `Matrix{T}` or `Vector{T}` of the same shape and values, and copy each
+# operand in its own inlined call, so every copy stays tied to its tuple
+# position.  Any other operand combination, a non-isbits element type, and
+# every shape Base rejects call Base itself, which keeps its result and error.
+const _NativeDenseVecOrMat{T} = Union{Vector{T},Matrix{T}}
+
+@inline _native_cat_width(a::Vector) = 1
+@inline _native_cat_width(a::Matrix) = size(a, 2)
+
+# Sizes over an operand tuple, one inlined call per operand.
+@inline _native_cat_width_sum(::Tuple{}) = 0
+@inline _native_cat_width_sum(args::Tuple) =
+    _native_cat_width(first(args)) + _native_cat_width_sum(Base.tail(args))
+@inline _native_cat_height_sum(::Tuple{}) = 0
+@inline _native_cat_height_sum(args::Tuple) =
+    size(first(args), 1) + _native_cat_height_sum(Base.tail(args))
+@inline _native_cat_heights_equal(height, ::Tuple{}) = true
+@inline _native_cat_heights_equal(height, args::Tuple) =
+    size(first(args), 1) == height &&
+    _native_cat_heights_equal(height, Base.tail(args))
+@inline _native_cat_widths_equal(width, ::Tuple{}) = true
+@inline _native_cat_widths_equal(width, args::Tuple) =
+    _native_cat_width(first(args)) == width &&
+    _native_cat_widths_equal(width, Base.tail(args))
+@inline _native_cat_heights(::Tuple{}) = ()
+@inline _native_cat_heights(args::Tuple) =
+    (size(first(args), 1), _native_cat_heights(Base.tail(args))...)
+@inline _native_cat_widths(::Tuple{}) = ()
+@inline _native_cat_widths(args::Tuple) =
+    (_native_cat_width(first(args)), _native_cat_widths(Base.tail(args))...)
+
+# Copy the dense `a` into `out` (column-major, `stride` rows) with its first
+# element at row `row + 1`, column `column + 1`.  Callers allocate `out` from
+# the operands' validated shapes, so every copy is in bounds.
+@inline function _native_cat_block!(out, stride, row, column, a)
+    height = size(a, 1)
+    if height == stride
+        # Whole columns of `out` (then `row == 0`): one contiguous block.
+        Base.unsafe_copyto!(out, column * stride + 1, a, 1, length(a))
+    else
+        for j in 1:_native_cat_width(a)
+            Base.unsafe_copyto!(out, (column + j - 1) * stride + row + 1,
+                                a, (j - 1) * height + 1, height)
+        end
+    end
+    out
+end
+
+@inline _native_hcat(args...) = hcat(args...)
+@inline function _native_hcat(a::_NativeDenseVecOrMat{T},
+                              rest::_NativeDenseVecOrMat{T}...) where {T}
+    height = size(a, 1)
+    (isbitstype(T) && _native_cat_heights_equal(height, rest)) ||
+        return hcat(a, rest...)
+    out = Matrix{T}(undef, height,
+                    _native_cat_width(a) + _native_cat_width_sum(rest))
+    _native_hcat_copy!(out, height, 0, (a, rest...))
+end
+@inline _native_hcat_copy!(out, height, column, ::Tuple{}) = out
+@inline function _native_hcat_copy!(out, height, column, args::Tuple)
+    a = first(args)
+    _native_cat_block!(out, height, 0, column, a)
+    _native_hcat_copy!(out, height, column + _native_cat_width(a),
+                       Base.tail(args))
+end
+
+@inline _native_vcat(args...) = vcat(args...)
+@inline function _native_vcat(a::Vector{T}, rest::Vector{T}...) where {T}
+    isbitstype(T) || return vcat(a, rest...)
+    out = Vector{T}(undef, length(a) + _native_cat_height_sum(rest))
+    _native_vcat_copy!(out, length(out), 0, (a, rest...))
+end
+@inline function _native_vcat(a::_NativeDenseVecOrMat{T},
+                              rest::_NativeDenseVecOrMat{T}...) where {T}
+    width = _native_cat_width(a)
+    (isbitstype(T) && _native_cat_widths_equal(width, rest)) ||
+        return vcat(a, rest...)
+    height = size(a, 1) + _native_cat_height_sum(rest)
+    out = Matrix{T}(undef, height, width)
+    _native_vcat_copy!(out, height, 0, (a, rest...))
+end
+@inline _native_vcat_copy!(out, height, row, ::Tuple{}) = out
+@inline function _native_vcat_copy!(out, height, row, args::Tuple)
+    a = first(args)
+    _native_cat_block!(out, height, row, 0, a)
+    _native_vcat_copy!(out, height, row + size(a, 1), Base.tail(args))
+end
+
+# `hvcat(rows, blocks...)`: block row `i` holds the next `rows[i]` blocks.
+# Base requires equal heights within a block row and equal total widths across
+# block rows; `(height, width)` of the result, or `nothing` for Base to decide.
+function _native_hvcat_shape(rows::Tuple{Vararg{Int}}, heights::Tuple,
+                             widths::Tuple)
+    k = 0
+    height = 0
+    width = -1
+    for n in rows
+        (n >= 1 && k + n <= length(heights)) || return nothing
+        h = heights[k + 1]
+        w = 0
+        for _ in 1:n
+            k += 1
+            heights[k] == h || return nothing
+            w += widths[k]
+        end
+        width < 0 && (width = w)
+        w == width || return nothing
+        height += h
+    end
+    k == length(heights) ? (height, width) : nothing
+end
+
+@inline _native_hvcat(rows, args...) = hvcat(rows, args...)
+@inline function _native_hvcat(rows::Tuple{Vararg{Int}},
+                               a::_NativeDenseVecOrMat{T},
+                               rest::_NativeDenseVecOrMat{T}...) where {T}
+    args = (a, rest...)
+    shape = _native_hvcat_shape(rows, _native_cat_heights(args),
+                                _native_cat_widths(args))
+    (isbitstype(T) && shape !== nothing) || return hvcat(rows, args...)
+    out = Matrix{T}(undef, shape[1], shape[2])
+    _native_hvcat_copy!(out, shape[1], rows, 1, 1, 0, 0, args)
+end
+@inline _native_hvcat_copy!(out, height, rows, i, j, row, column, ::Tuple{}) =
+    out
+@inline function _native_hvcat_copy!(out, height, rows, i, j, row, column,
+                                     args::Tuple)
+    a = first(args)
+    _native_cat_block!(out, height, row, column, a)
+    # One recursive call per operand: the next block starts a new block row
+    # after the last block of row `i`.
+    last = j == rows[i]
+    _native_hvcat_copy!(out, height, rows,
+                        last ? i + 1 : i, last ? 1 : j + 1,
+                        last ? row + size(a, 1) : row,
+                        last ? 0 : column + _native_cat_width(a),
+                        Base.tail(args))
+end
+
 # Nested dotted calls stay lazy so Julia's broadcast fusion survives the
 # tensorized lowering: only the OUTERMOST dotted call of a nest materializes
 # (via `_tensorized_broadcast` above) — with one exception
@@ -516,15 +666,22 @@ end
 # The native ordered loop.  `nothing` is the no-backend marker; a backend
 # extension specializes `_tensorized_scan_lowering` on its own marker type.
 # An empty sequence returns an empty result (or `[init]`) without running the
-# step.
+# step. As in the generated native lowering (`_lower_authored_scan_native!`),
+# a concrete inferred output type is the first output's type, so the result is
+# allocated once with it before the emptiness test; separate allocations in
+# the two arms meet in one value that Enzyme's static activity analysis
+# rejects when the empty arm's is never written actively. Otherwise each arm
+# allocates, typed by the first output when there is one.
 function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
                                    shared::Tuple, ::Val{false} = Val(false))
     idx = eachindex(iterated...)
-    isempty(idx) && return similar(first(iterated), _scan_step_output_type(
-        step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
+    T = _scan_step_output_type(
+        step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...)
+    result = isconcretetype(T) ? similar(first(iterated), T) : nothing
+    isempty(idx) && return result === nothing ? similar(first(iterated), T) : result
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
-    result = similar(first(iterated), typeof(out1))
+    result === nothing && (result = similar(first(iterated), typeof(out1)))
     result[i1] = out1
     for i in Iterators.drop(idx, 1)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
@@ -536,17 +693,18 @@ end
 function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
                                    shared::Tuple, ::Val{true})
     idx = eachindex(iterated...)
+    allocate(T) = similar(first(iterated), promote_type(typeof(init), T), length(idx) + 1)
+    T = _scan_step_output_type(
+        step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...)
+    result = isconcretetype(T) ? allocate(T) : nothing
     if isempty(idx)
-        T = promote_type(typeof(init), _scan_step_output_type(
-            step, typeof(init), map(eltype, iterated)..., map(typeof, shared)...))
-        result = similar(first(iterated), T, 1)
+        result === nothing && (result = allocate(T))
         result[1] = init
         return result
     end
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
-    result = similar(first(iterated), promote_type(typeof(init), typeof(out1)),
-                     length(idx) + 1)
+    result === nothing && (result = allocate(typeof(out1)))
     result[1] = init
     result[2] = out1
     position = 2

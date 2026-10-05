@@ -65,14 +65,34 @@ end
     end
 end
 
-function _scan_cap_values(n, form; response = :normal)
+# Response spelling, response data and oracle law for each location family.
+_scan_cap_logistic(m) = 1 / (1 + exp(-m))
+const _SCAN_CAP_RESPONSES = Dict(
+    :normal => (:(y .~ Normal.(mu, 1.0)), t -> 0.3sin(t), m -> Normal(m, 1)),
+    :poisson => (:(y .~ Poisson.(exp.(mu))), t -> t % 3, m -> Poisson(exp(m))),
+    :bernoulli => (:(y .~ Bernoulli.(logistic.(mu))), t -> t % 2,
+        m -> Bernoulli(_scan_cap_logistic(m))),
+    :exponential => (:(y .~ Exponential.(exp.(mu))), t -> 0.4 + 0.2t,
+        m -> Exponential(exp(m))),
+    :inverse_gaussian => (:(y .~ InverseGaussian.(exp.(mu))), t -> 0.4 + 0.2t,
+        m -> InverseGaussian(exp(m), 1)),
+    :gamma => (:(y .~ Gamma.(2.0, exp.(mu) ./ 2.0)), t -> 0.4 + 0.2t,
+        m -> Gamma(2, exp(m) / 2)),
+    :negative_binomial => (:(y .~ NegativeBinomial2.(exp.(mu), 2.0)), t -> t % 3,
+        m -> NegativeBinomial(2, 2 / (2 + exp(m)))),
+    :beta => (:(y .~ Beta.(logistic.(mu) .* 5.0, (1 .- logistic.(mu)) .* 5.0)),
+        t -> 0.1 + 0.15t,
+        m -> Beta(5 * _scan_cap_logistic(m), 5 * (1 - _scan_cap_logistic(m)))))
+
+# `steps` supplies the trajectory length `T`; otherwise it is the response's
+# rows. A one-entry trajectory broadcasts over every observation.
+function _scan_cap_values(n, form; response = :normal, steps = nothing)
     expression = Dict(
         :bare => :(h), :literal => :(2.0 .* h), :data => :(x .* h),
         :computed => :(c .* h), :coefficient => :(b .* h),
         :negative => :(-b .* h), :nested => :(b .* (h .+ x)),
         :product => :(h .* h), :alias => :(v))
-    likelihood = response === :normal ? :(y .~ Normal.(mu, 1.0)) :
-        :(y .~ Poisson.(exp.(mu)))
+    likelihood, ydata, law = _SCAN_CAP_RESPONSES[response]
     program = quote
         b ~ Cauchy(0, 1)
         phi ~ Normal(0, 1)
@@ -88,25 +108,26 @@ function _scan_cap_values(n, form; response = :normal)
         mu = $(expression[form])
         $likelihood
     end
-    y = response === :normal ? [0.3sin(t) for t in 1:n] : [t % 3 for t in 1:n]
+    y = [ydata(t) for t in 1:n]
     x = [0.2cos(t) for t in 1:n]
-    f = _scan_cap_sampler(program, Dict{Symbol,Any}(:x => x, :y => y))
+    data = Dict{Symbol,Any}(:x => x, :y => y)
+    steps === nothing || (data[:T] = steps)
+    f = _scan_cap_sampler(program, data)
     parameter(u, name) = u[only(e for e in f.built.layout.entries
         if e.name === name).offset]
     zentry = only(e for e in f.built.layout.entries if e.kind === :scan)
     function oracle(u)
         b, phi = parameter(u, :b), parameter(u, :phi)
         z = u[zentry.offset:(zentry.offset + zentry.size - 1)]
-        h = z[1]
+        trajectory = accumulate((h, e) -> phi * h + e, z)
         lp = logpdf(Cauchy(), b) + logpdf(Normal(), phi) + sum(logpdf.(Normal(), z))
         for t in eachindex(y)
-            t == 1 || (h = phi * h + z[t])
+            h = trajectory[length(trajectory) == 1 ? 1 : t]
             mu = form === :literal || form === :alias ? 2h :
                 form === :data ? x[t] * h : form === :computed ? b^2 * h :
                 form === :coefficient ? b * h : form === :negative ? -b * h :
                 form === :nested ? b * (h + x[t]) : form === :product ? h^2 : h
-            dist = response === :normal ? Normal(mu, 1) : Poisson(exp(mu))
-            lp += logpdf(dist, y[t])
+            lp += logpdf(law(mu), y[t])
         end
         return lp
     end
@@ -121,4 +142,20 @@ end
     end
     f, oracle = _scan_cap_values(4, :bare; response = :poisson)
     _scan_cap_check(f, oracle)
+end
+
+@testset "scan capabilities: trajectory locations of every response family" begin
+    # The trajectory is the location vector itself: no linear predictor
+    # carries it, under any family or link.
+    for response in (:bernoulli, :exponential, :inverse_gaussian, :gamma,
+            :negative_binomial, :beta)
+        f, oracle = _scan_cap_values(4, :bare; response)
+        _scan_cap_check(f, oracle)
+    end
+    # A one-entry trajectory broadcasts over four observations, as in Julia.
+    for response in (:normal, :poisson, :bernoulli)
+        f, oracle = _scan_cap_values(4, :bare; response, steps = 1)
+        @test f.built.layout.total == 3
+        _scan_cap_check(f, oracle)
+    end
 end
