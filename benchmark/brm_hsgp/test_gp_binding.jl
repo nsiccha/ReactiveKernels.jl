@@ -3,9 +3,12 @@ import BayesianRegressionModels
 include(joinpath(@__DIR__, "..", "..", "packages", "ReactiveKernelsPPL", "test", "test_gp_binding.jl"))
 
 module GPBindingLibrary
-import BayesianRegressionModels.StatisticalPreparation as DK
-using BayesianRegressionModels.StatisticalPreparation:
-    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
+using ReactiveKernels, ReactiveKernelsPPL
+import BayesianRegressionModels
+const gp_exp_quad_cov = BayesianRegressionModels.rk_model(:gp_exp_quad_cov)
+const gp_periodic_cov = BayesianRegressionModels.rk_model(:gp_periodic_cov)
+const gp_chol_latent = BayesianRegressionModels.StatisticalPreparation.gp_chol_latent
+const DK = @__MODULE__
 const covariance = gp_exp_quad_cov
 const periodic_covariance = gp_periodic_cov
 const latent = gp_chol_latent
@@ -17,7 +20,8 @@ function _gpb_library(kind, spelling, declaration)
     lathead = _gpb_head(:gp_chol_latent, spelling; library = true)
     K = 3
     covargs = kind === :exp_quad ? Any[:x, :amp, :rho, 1e-6] : Any[:x, :amp, :rho, 1.2, 1e-6]
-    value = Expr(:call, lathead, Expr(:call, covhead, covargs...), :z)
+    covariance = Expr(:call, covhead, covargs...)
+    value = Expr(:call, lathead, :covariance, :z)
     decl = declaration === :array ? :(z[1:$K] .~ Normal.(0, 1)) : quote
         @plate for i in eachindex(y)
             z[i] ~ Normal(0, 1)
@@ -29,6 +33,7 @@ function _gpb_library(kind, spelling, declaration)
         amp ~ LogNormal(0, 1)
         rho ~ LogNormal(0, 1)
         $decl
+        covariance = $covariance
         f = $value
         y .~ Normal.(f[oi], 0.7)
     end
@@ -50,7 +55,7 @@ function _gpb_library(kind, spelling, declaration)
     return (; plan, bound, built, u, oracle)
 end
 
-@testset "real GP functions use the same binding and gather route" begin
+@testset "BRM covariance graphs use ordinary binding and gather routes" begin
     for kind in (:exp_quad, :periodic), declaration in (:array, :plate)
         results = []
         for spelling in (:bare, :qualified, :alias)
