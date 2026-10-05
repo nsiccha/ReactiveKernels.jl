@@ -124,7 +124,7 @@ end
     for y in (Union{Missing,Float64}[], fill(missing, 5))
         _missing_compiled_check(_missing_fixture(y), "empty-or-all-$(length(y))")
     end
-    for kind in (:binomial, :bernoulli, :beta, :stopping, :invalid_missing_scale)
-        _missing_compiled_check(_missing_family_fixture(kind), "family-$kind")
+    for kind in (:binomial, :bernoulli, :beta, :stopping, :invalid_missing_scale), n in (4, 8, 16)
+        _missing_compiled_check(_missing_family_fixture(kind; n), "family-$kind-$n"; structure=true)
     end
 end

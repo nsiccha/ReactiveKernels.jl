@@ -36,11 +36,13 @@ function _missing_fixture(y; x=collect(range(-0.4, 0.6; length=size(y, 1))), pla
     return (; data, plan, bound, built, u, sampler, oracle)
 end
 
-function _missing_family_fixture(kind)
-    y = kind in (:binomial, :bernoulli, :stopping) ?
+function _missing_family_fixture(kind; n=4)
+    response = kind in (:binomial, :bernoulli, :stopping) ?
         Union{Missing,Int}[1, missing, kind === :stopping ? 3 : 0, 1] :
         Union{Missing,Float64}[0.2, missing, 0.4, 0.7]
-    data = (; y, x=[0.1, 0.2, -0.3, 0.4], sigma=[0.7, -1.0, 0.7, 0.7])
+    indices = mod1.(1:n, 4)
+    y = response[indices]
+    data = (; y, x=[0.1, 0.2, -0.3, 0.4][indices], sigma=[0.7, -1.0, 0.7, 0.7][indices])
     ast = quote
         a ~ Normal(0, 1)
         eta = a .+ 0.2 .* x
