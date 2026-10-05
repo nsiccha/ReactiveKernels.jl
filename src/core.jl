@@ -1402,6 +1402,14 @@ Returns the `Recipe`.
 function add!(g::Graph; inputs, outputs, op,
               cost::Real = 1.0, cse_key = nothing, effectful::Bool = false,
               source = _NO_KERNEL_SOURCE)
+    _add_recipe!(g, inputs, outputs, op, cost, cse_key, effectful, source)
+end
+
+# Registration stores callable and provenance values as graph metadata. Its body
+# does not need a new inferred executable for every numerical operation type.
+Base.@nospecializeinfer function _add_recipe!(g::Graph,
+        inputs, outputs, @nospecialize(op),
+        cost::Real, @nospecialize(cse_key), effectful::Bool, @nospecialize(source))
     ins = _astuple(inputs)
     outs = _astuple(outputs)
     recipe_cost = Float64(cost)
