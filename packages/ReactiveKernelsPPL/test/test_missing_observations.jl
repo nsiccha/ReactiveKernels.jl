@@ -103,7 +103,9 @@ end
             end
         end
         bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
-        scale = bound.columns[only(bound.responses).scale]
+        ref = only(bound.responses).scale
+        predictor = only(p for p in bound.predictors if p.name === ref.predictor)
+        scale = bound.columns[only(only(predictor.terms).columns)]
         @test eltype(scale) === T
         @test length(scale) == 3
         @test scale[1] == sqrt(data.x[1])
