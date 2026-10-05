@@ -3421,14 +3421,31 @@ _plate_gauss(R) = Expr(:block,
     for R in (:(eachindex(y)), :(axes(y, 1)))
         @test _surface_bound_density_equal(lower_rkppl(_plate_gauss(R), (:y, :x); conditioned = (:y, :x)), bare, cols, [0.5, -0.25, 0.1])
     end
-    # Literal-range plates carry the range like `y[1:N]`.
+    # A literal-range plate selects its authored cells, like `eachindex` /
+    # `axes`: the response keeps the explicit index `y[1:N]`. The top-level
+    # `y[1:N] .~` broadcast instead checks that the range covers `y`.
     lit = lower_rkppl(_plate_gauss(:(1:6)), (:y, :x); conditioned = (:y, :x))
-    @test lit.responses[1].range == 1:6
+    @test repr(lit.responses[1].range) == repr(:(y[1:6]))
+    @test :y in lit.indexed_observations
     ranged = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
             :(mu = a .+ b .* x),
             Expr(:call, :.~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x); conditioned = (:y, :x))
-    @test _plans_equal(lit, ranged)
+    @test ranged.responses[1].range == 1:6
+    @test _surface_bound_density_equal(lit, ranged, cols, [0.5, -0.25, 0.1])
+    # A shorter loop observes only its own cells.
+    short = bind_data(lower_rkppl(_plate_gauss(:(1:4)), (:y, :x);
+        conditioned = (:y, :x)), cols)
+    sbuilt = build_kernel(short)
+    snt = constrain(sbuilt.layout, [0.5, -0.25, 0.1])
+    @test Base.invokelatest(prepare_query(sbuilt, short, :likelihood),
+            [0.5, -0.25, 0.1]) ≈
+        sum(logpdf(Normal(snt.a + snt.b * cols[:x][i], snt.s), cols[:y][i])
+            for i in 1:4)
+    # refused: the loop reads `y[7]` beyond the six bound rows (standing
+    # @rkppl language principle 3: Julia indexing safety).
+    @test_throws ContractValidationError bind_data(lower_rkppl(
+        _plate_gauss(:(1:7)), (:y, :x); conditioned = (:y, :x)), cols)
     # Deterministic cells: predictor-via-cell ≡ top-level predictor.
     cell = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
