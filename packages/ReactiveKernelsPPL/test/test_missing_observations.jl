@@ -93,6 +93,25 @@ function _missing_fd(f, u)
     [(f(u + h*e) - f(u - h*e))/(2h) for e in eachcol(Matrix{Float64}(I, length(u), length(u)))]
 end
 
+@testset "guarded bound observation arguments retain concrete numeric storage" begin
+    for T in (Float32, Float64, BigFloat)
+        data = (; y=Union{Missing,T}[T(0.2), missing, T(0.4)], x=T[T(0.1), -1, T(0.3)])
+        ast = quote
+            a ~ Normal(0, 1)
+            @plate for i in eachindex(y)
+                y[i] ~ Normal(a, sqrt(x[i]))
+            end
+        end
+        bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
+        scale = bound.columns[only(bound.responses).scale]
+        @test eltype(scale) === T
+        @test length(scale) == 3
+        @test scale[1] == sqrt(data.x[1])
+        @test scale[3] == sqrt(data.x[3])
+        @test all(v -> !(v isa AbstractArray{<:Real}) || isconcretetype(eltype(v)), values(bound.columns))
+    end
+end
+
 @testset "missing GLM rows guard density values and ordinary reverse" begin
     for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM)
         y = head === :NormalIDGLM ? Union{Missing,Float64}[0.2, missing, 0.5, missing] :
