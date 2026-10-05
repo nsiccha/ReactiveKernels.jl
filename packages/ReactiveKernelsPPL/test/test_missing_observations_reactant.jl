@@ -1,4 +1,5 @@
 using Reactant
+using ReactiveKernels: compile_ad_value_and_gradient
 
 function _missing_save_ir(name, kind, text)
     haskey(ENV, "RK_PPL_MISSING_IR_DIR") || return
