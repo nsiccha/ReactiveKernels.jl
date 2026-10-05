@@ -81,10 +81,10 @@ end
 function _oos_observed(; n = 4, p = 2)
     m = 2n
     data = Dict{Symbol,Any}(
-        # Every supplied entry is observed (user decision `1g8uvgs`): the
-        # rows repeat entries 1 and m - 1, and every other entry is missing.
-        :y => Union{Missing,Float64}[i in (1, m - 1) ? 0.1 * i : missing for i in 1:m],
-        :rows => [isodd(i) ? m - 1 : 1 for i in 1:n],
+        # A whole-response permutation is ordinary indexing, rather than
+        # a manual missing-response selection (provisional `1uhcm3b`).
+        :y => [0.1 * i for i in 1:m],
+        :rows => collect(m:-1:1),
         :B => [0.1 * cos(i + j) for i in 1:m, j in 1:p])
     ast = quote
         a ~ Normal(0, 1)
@@ -154,6 +154,5 @@ end
     @test only(fx.bound.responses).mi_jobs === nothing
     @test only(fx.bound.array_parameters).name === :w
     _oos_native(fx, _oos_observed_reference)
-    # The rows are an ordinary Julia gather: neither sorted nor deduplicated.
-    @test fx.data[:rows] == [7, 1, 7, 1]
+    @test fx.data[:rows] == collect(8:-1:1)
 end
