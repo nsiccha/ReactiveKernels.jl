@@ -14,7 +14,6 @@ include("evidence.jl")
 # The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
 # (counter-suffixed binding per build).
 
-import ReactiveKernelsDistributionKernels.DistributionKernelSources as _GPDistributionSources
 
 """
     build_kernel(plan) -> (; spec, layout)
@@ -240,9 +239,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
     rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
-import ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    gp_exp_quad_cov_graph as _ppl_gp_exp_quad_cov,
-    gp_periodic_cov_graph as _ppl_gp_periodic_cov
 using SpecialFunctions: besseli, besselix, erfc, loggamma
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: logbeta
 # Selective (explicit imports win over any re-export chain, so no `using`
@@ -323,7 +319,6 @@ function _assignment_statements(plan::StructuralPlan;
         ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
             (ex = _concrete_guarded_argument(ex))
         ex = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
-        ex = _split_gp_cov_calls!(stmts, name, ex, plan)
         if _expr_value_symbols(ex) ⊆ dataonly
             push!(dataonly, name)
         else
@@ -343,64 +338,6 @@ function _value_math_rewrite(ex::Expr)
         args[1] = :_ppl_logistic
     end
     return Expr(ex.head, args...)
-end
-
-# Resolve the callable, rather than its spelling: module-qualified calls and
-# aliases share the library graph, while a model's own GP-named function keeps
-# its ordinary Julia implementation and shape semantics.
-function _gp_covariance_graph(callee)
-    callee isa GlobalRef || return nothing
-    fn = getfield(callee.mod, callee.name)
-    fn === _GPDistributionSources.gp_exp_quad_cov &&
-        return :_ppl_gp_exp_quad_cov
-    fn === _GPDistributionSources.gp_periodic_cov &&
-        return :_ppl_gp_periodic_cov
-    nothing
-end
-
-# Lift a covariance nested in a value call before the ordinary KernelSpec
-# splicer attaches its pair plate. Untyped aliases match the graph's ports.
-# Lazy branches, closures and generators keep their local evaluation.
-function _split_gp_cov_calls!(stmts::Vector{Expr}, name::Symbol, ex,
-        plan::StructuralPlan)
-    count = 0
-    function walk(node)
-        node isa Expr || return node
-        if node.head in (:ref, :tuple, :vect)
-            return Expr(node.head, map(walk, node.args)...)
-        elseif node.head === :kw && length(node.args) == 2
-            return Expr(:kw, node.args[1], walk(node.args[2]))
-        elseif node.head === :. && length(node.args) == 2 &&
-                Meta.isexpr(node.args[2], :tuple)
-            return Expr(:., node.args[1], Expr(:tuple, map(walk, node.args[2].args)...))
-        end
-        node.head === :call || return node
-        callee = node.args[1]
-        args = map(walk, node.args[2:end])
-        graph = _gp_covariance_graph(callee)
-        graph === nothing && return Expr(:call, callee, args...)
-        nargs = graph === :_ppl_gp_exp_quad_cov ? 4 : 5
-        length(args) == nargs && all(a -> !Meta.isexpr(a, :parameters) &&
-            !Meta.isexpr(a, :(...)), args) || return Expr(:call, callee, args...)
-        # The registered pair graphs implement vector locations. A bound
-        # matrix selects the ordinary Julia matrix method instead; routing
-        # it through a vector graph would change the location semantics.
-        locations = first(args)
-        locations isa Symbol && haskey(plan.columns, locations) &&
-            plan.columns[locations] isa AbstractMatrix &&
-            return Expr(:call, callee, args...)
-        count += 1
-        prefix = Symbol(:_ppl_gp_, name, :_, count)
-        inputs = Symbol[]
-        for (i, arg) in enumerate(args)
-            input = Symbol(prefix, :_arg_, i)
-            push!(stmts, :($input = $arg))
-            push!(inputs, input)
-        end
-        push!(stmts, :($prefix = $graph($(inputs...))))
-        prefix
-    end
-    walk(ex)
 end
 
 # Functions as values: a data-only module call nested in a parameter-

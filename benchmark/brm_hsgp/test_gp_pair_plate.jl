@@ -1,14 +1,20 @@
 using ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Test
 import Enzyme
-using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent, gp_exp_quad_cov_graph, gp_periodic_cov_graph
+import BayesianRegressionModels
+using BayesianRegressionModels.StatisticalPreparation:
+    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
+const gp_exp_quad_cov_graph = BayesianRegressionModels.rk_model(:gp_exp_quad_cov)
+const gp_periodic_cov_graph = BayesianRegressionModels.rk_model(:gp_periodic_cov)
 
 module GPPairPlateFixtures
 using ReactiveKernels, ReactiveKernelsPPL
 using Distributions: Normal, LogNormal, logpdf
 using LinearAlgebra: Symmetric, cholesky
-using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent, gp_exp_quad_cov_graph, gp_periodic_cov_graph
+import BayesianRegressionModels
+using BayesianRegressionModels.StatisticalPreparation:
+    gp_exp_quad_cov, gp_periodic_cov, gp_chol_latent
+const gp_exp_quad_cov_graph = BayesianRegressionModels.rk_model(:gp_exp_quad_cov)
+const gp_periodic_cov_graph = BayesianRegressionModels.rk_model(:gp_periodic_cov)
 
 # Independent scalar formulas; jitter is positional, including duplicate x.
 exp_quad(x, s, r, j) = [s^2 * exp(-(a-b)^2 / (2r^2)) + (i == k ? j : 0.0)
@@ -73,8 +79,8 @@ end
 function model(n; periodic = false, live_locations = false)
     x = collect(range(-0.7, 1.1; length = n))
     locations = live_locations ? :(x .* stretch) : :x
-    covariance = periodic ? :(gp_periodic_cov($locations, sigma, rho, 1.3, 1e-5)) :
-        :(gp_exp_quad_cov($locations, sigma, rho, 1e-5))
+    covariance = periodic ? :(gp_periodic_cov_graph($locations, sigma, rho, 1.3, 1e-5)) :
+        :(gp_exp_quad_cov_graph($locations, sigma, rho, 1e-5))
     ast = quote
         sigma ~ LogNormal(0, 1)
         rho ~ LogNormal(0, 1)
@@ -82,7 +88,8 @@ function model(n; periodic = false, live_locations = false)
         @plate for i in eachindex(y)
             z[i] ~ Normal(0, 1)
         end
-        f = gp_chol_latent($covariance, z)
+        covariance = $covariance
+        f = gp_chol_latent(covariance, z)
         y .~ Normal.(f[oi], 0.5)
     end
     data = Dict{Symbol,Any}(:x => x, :y => sin.(x), :oi => collect(1:n))

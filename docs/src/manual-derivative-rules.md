@@ -237,9 +237,9 @@ inputs throw `ArgumentError`; non-positive or NaN pivots throw
 `LinearAlgebra.PosDefException` with the failing index in `info`. Its source
 and generic value/ordinary-reverse tests are `src/cholesky.jl` and
 `test/test_cholesky.jl`. This extraction preserves the native factorization
-used by the temporary `gp_chol_latent` wrapper, which translates the pivot
+used by BRM's `StatisticalPreparation.gp_chol_latent` wrapper, which translates the pivot
 failure to its existing GP `ArgumentError` and jitter message. Statistical
-wrappers belong in BRM. This callable provides no compiled lowering; native
+wrappers are owned by BRM. This callable provides no compiled lowering; native
 factorization evidence does not certify compiled Cholesky gradients.
 
 The second linear-algebra consumer is the symmetric-eigendecomposition pair

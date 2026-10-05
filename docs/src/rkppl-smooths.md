@@ -25,3 +25,13 @@ Import preparation helpers from
 The compiler no longer carries spline, HSGP, monotonic, DAR or varying-effect
 model IR. Varying effects are ordinary declared arrays and level gathers, or a
 BRM-owned `rkppl_model` body.
+
+GP covariance functions and the native dual-HSGP motorcycle body are also
+owned by BRM, available at `1f296dac2c086347525194887500948edb213228`. Import
+`StatisticalPreparation.gp_exp_quad_cov`, `gp_periodic_cov` and `gp_chol_latent`
+as ordinary functions, or compose an assigned call to
+`BayesianRegressionModels.rk_model(:gp_exp_quad_cov)` / `rk_model(:gp_periodic_cov)`.
+The compiler uses its general module-binding and graph-composition paths. The
+[dual-HSGP consumer](brm-hsgp.md) delegates preparation and reads BRM's fixture;
+its statistical acceptance belongs to BRM. Dense lower Cholesky remains the
+general numerical callable `ReactiveKernels.rk_cholesky_lower`.

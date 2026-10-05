@@ -49,7 +49,7 @@ end
 function main(bundle, output)
     mkpath(output)
     BLAS.set_num_threads(1)
-    data = BRMHSGPExample.motorcycle_data(joinpath(@__DIR__, "..", "..", "examples", "data", "mcycle.csv"))
+    data = BRMHSGPExample.motorcycle_data()
     source = deserialize(joinpath(bundle, "noncentered.jls")).posterior_position
     q, c = copy(source[:,5000]), zeros(40)
     kernel = BRMHSGPExample.prepare_model(data)
@@ -66,6 +66,8 @@ function main(bundle, output)
     affinity = match(r"Cpus_allowed_list:\s*([^\n]+)", read("/proc/self/status", String)).captures[1]
     result = Dict{String,Any}("julia_version"=>string(VERSION), "cpu_affinity"=>affinity,
         "source_sha256"=>bytes2hex(sha256(read(@__FILE__))),
+        "rk_statistical_model_owner"=>"BayesianRegressionModels.rk_model(:dual_hsgp)",
+        "rk_statistical_model_source_sha256"=>bytes2hex(sha256(read(BRMHSGPExample.MODEL_SOURCE))),
         "kernel_sha256"=>bytes2hex(sha256(read(joinpath(@__DIR__, "..", "..", "examples", "brm_hsgp.jl")))),
         "posterior_column"=>5000, "blas_threads"=>BLAS.get_num_threads())
     result["dynamic_centeredness"] = Dict(

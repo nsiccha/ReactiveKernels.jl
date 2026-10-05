@@ -244,8 +244,8 @@ end
                 y .~ truncated.(MixtureModel.(vcat.(Normal.(mu1, s),
                     Normal.(mu1, s)), Ref([0.5, 0.5])), 0, 10)
             end), SurfaceLoweringError),
-        # capability: a partial observation range (todo `1nb43fj`).
-        ("partial range rejected",
+        # Literal selections lower before their coverage is checked at binding.
+        ("literal response range",
             :(begin
                 mu1 ~ Normal(0.0, 5.0)
                 s ~ Exponential(1.0)
@@ -389,7 +389,7 @@ end
             end), SurfaceLoweringError),
     ]
     supported = Set(["frequency weights rejected", "evidence rejected",
-        "partial range rejected", "fully fixed", "assignment location",
+        "literal response range", "fully fixed", "assignment location",
         "data-column location", "split Binomial trials", "stated scalar loc alias",
         "uniform default weights", "wrapped param"])
     capabilities = Set(["heterogeneous links, same base", "probit outside v1", "boolean weights", "bare predictor"])
@@ -479,6 +479,43 @@ end
         # And the valid programmatic shape passes.
         @test (validate_structure(_mixplan(_mixresp())); true)
     end
+end
+
+@testset "mixture observation ranges cover the whole response" begin
+    # Refused: authored partial observations, including omitted missing entries
+    # (USER ReactiveKernels:rkppl decision 1uhcm3b, provisional).
+    ast = quote
+        mu1 ~ Normal(0.0, 5.0)
+        s ~ Exponential(1.0)
+        y[1:2] .~ MixtureModel.(vcat.(Normal.(mu1, s),
+            Normal.(mu1, s)), Ref([0.5, 0.5]))
+    end
+    for y in ([0.2, -0.4, 0.6], Union{Missing,Float64}[0.2, -0.4, missing])
+        data = (; y)
+        for inputs in ((:y, :x, :n1, :n2, :wt), data)
+            plan = lower_rkppl(ast, inputs; conditioned=(:y,))
+            @test plan isa StructuralPlan
+            @test_throws "partial observation of y leaves y[3] outside the statement" bind_data(plan, data)
+        end
+    end
+    # The identical range is valid when it covers the whole bound response.
+    y = [0.2, -0.4]
+    original = copy(y)
+    data = (; y)
+    plan = bind_data(lower_rkppl(ast, data; conditioned=(:y,)), data)
+    built = build_kernel(plan)
+    u = unconstrain(built.layout, (; mu1=0.3, s=0.7))
+    sampler = prepare_sampler(built, plan, u; backend=_GEN_BACKEND)
+    oracle = v -> begin
+        nt = constrain(built.layout, v)
+        # Identical components reduce independently to one Normal density.
+        sum(logpdf.(Normal(nt.mu1, nt.s), y)) +
+            logpdf(Normal(0, 5), nt.mu1) + logpdf(Exponential(1), nt.s) + log(nt.s)
+    end
+    value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+    @test value ≈ oracle(u)
+    @test grad ≈ _findiff_grad(oracle, u) rtol=2e-5 atol=2e-7
+    @test y == original
 end
 
 @testset "mixture value parity" begin

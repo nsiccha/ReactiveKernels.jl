@@ -1516,6 +1516,9 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
     names = Dict{Any,Symbol}()
     function index_name(ex)
         ex isa Expr || return ex
+        # Literal ranges already carry their vector shape. Hoisting one as an
+        # opaque module call loses that shape before observation validation.
+        _literal_row_range(ex) && return ex
         value = resolve(ex)
         (_contains_module_call(value) || value.head === :ref) &&
             _data_only(value, data, detmap) || return ex
@@ -2311,7 +2314,7 @@ const _RETIRED_PREPARATION_HEADS = (:tps_basis, :cr_basis, :t2_basis,
     :hsgp_basis, :hsgp_sqrt_spd, :hsgp_rho_floors,
     :hsgp_periodic_basis, :hsgp_matern_sqrt_spd, :hsgp_grouped_sqrt_spd,
     :hsgp_periodic_sqrt_spd, :hsgp_periodic_grouped_sqrt_spd,
-    :hsgp_periodic_rho_floor)
+    :hsgp_periodic_rho_floor, :gp_exp_quad_cov, :gp_periodic_cov, :gp_chol_latent)
 
 function _module_binding(m::Module, s::Symbol, where, shown)
     if !isdefined(m, s)

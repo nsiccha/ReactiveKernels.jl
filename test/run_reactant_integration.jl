@@ -76,7 +76,6 @@ mktempdir() do env
     selector = get(ENV, "RK_REACTANT_TESTSET", "all")
     if selector == "all"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $position_batching_testfile`)
-        run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $inner_partial_evaluation_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $plate_consumer_layout_testfile`)
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $authored_scan_testfile`)
@@ -106,7 +105,7 @@ mktempdir() do env
         # test/run_reactant_integration.jl core pathfinder`.
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $testfile $ARGS`)
     elseif selector == "brm-hsgp"
-        run(`$julia --startup-file=no --check-bounds=yes --project=$env $(joinpath(root, "test", "test_brm_hsgp_reactant.jl"))`)
+        error("The dual-HSGP scientific test is owned by BayesianRegressionModels test/rk_dual_hsgp.jl; optional RK consumer checks are in benchmark/brm_hsgp/.")
     elseif selector == "position-batching"
         run(`$julia --startup-file=no --check-bounds=yes --project=$env $position_batching_testfile`)
     elseif selector == "inner-partial-evaluation"

@@ -1,21 +1,27 @@
 # BRM motorcycle: two HSGPs with partial centering
 
-This executable example translates BRM's motorcycle case study into one ordinary
-ReactiveKernel. All 133 `MASS::mcycle` observations are retained. Time is scaled
+This executable example consumes BRM's motorcycle ReactiveKernel through
+`BayesianRegressionModels.rk_model(:dual_hsgp)` and
+`BayesianRegressionModels.StatisticalPreparation.prepare_dual_hsgp`. All 133 `MASS::mcycle` observations are retained. Time is scaled
 to `[-1,1]`, acceleration is divided by its sample standard deviation, and the
 mean and log standard deviation each use 20 squared-exponential HSGP basis
 functions on `(-1.5,1.5)`. There are no population intercepts. The four positive
 hyperparameters have `LogNormal(0,4)` priors.
 
-The authored kernel below is read directly from
-[`examples/brm_hsgp.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/brm_hsgp.jl).
-The data checksum and source provenance are recorded with the benchmark.
+The statistical body and preparation are owned by
+[BayesianRegressionModels](https://github.com/nsiccha/BayesianRegressionModels.jl/blob/ns/devibe/ext/rk_statistical_gp.jl),
+with the adopted API available at `1f296dac2c086347525194887500948edb213228`.
+[`examples/brm_hsgp.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/examples/brm_hsgp.jl)
+is a thin consumer that reads BRM's exact fixture and preserves the benchmark's
+loader and call boundary. The body below is read from the installed owner.
 
 ```@eval
-using Markdown
-source = read(joinpath(@__DIR__, "..", "..", "examples", "brm_hsgp.jl"), String)
-body = split(split(source, "# BEGIN MOTORCYCLE KERNEL\n")[2], "# END MOTORCYCLE KERNEL")[1]
-Markdown.parse("```julia\n" * body * "```\n")
+using Markdown, ReactiveKernels, ReactiveKernelsPPL
+import BayesianRegressionModels
+source = read(joinpath(pkgdir(BayesianRegressionModels), "ext", "rk_statistical_gp.jl"), String)
+body = "@kernel dual_hsgp" * split(split(source, "@kernel dual_hsgp"; limit=2)[2],
+    "const _RK_STATISTICAL_GRAPHS"; limit=2)[1]
+Markdown.parse("```julia\n" * strip(body) * "\n```\n")
 ```
 
 For basis frequency `ωⱼ = jπ/3`, the spectral log standard deviation is
@@ -43,11 +49,8 @@ centeredness vector reuses the same executable.
 ```@example brm_hsgp
 using ReactiveKernels
 Base.include(@__MODULE__, joinpath(@__DIR__, "..", "..", "examples", "brm_hsgp.jl")) # hide
-data = BRMHSGPExample.motorcycle_data(
-    joinpath(@__DIR__, "..", "..", "examples", "data", "mcycle.csv"))
-kernel = prepare(BRMHSGPExample.model;
-    have=(:q, :c, :x, :y, :modes, :half_width), want=:posterior,
-    bound=(; data..., modes=collect(1.0:20.0), half_width=1.5))
+data = BRMHSGPExample.motorcycle_data()
+kernel = BRMHSGPExample.prepare_model(data)
 q = zeros(44)
 q[[1,23]] .= -2
 c = zeros(40)
@@ -57,8 +60,8 @@ kernel(q, c)
 ## Compile the value and gradient
 
 The following uses the same graph and the public prepared AD boundary. The
-focused Reactant test executes this path; the documentation build executes
-the native interaction above.
+historical benchmark receipts below exercised this path before ownership
+transfer; the documentation build executes the native interaction above.
 
 ```julia
 using Reactant, Enzyme
@@ -79,6 +82,11 @@ multiply each working coefficient by `exp((c_new-c_old)*ℓ)`. Merely changing
 `c` at a fixed `q` evaluates a different physical point.
 
 ## Measured performance
+
+These retained receipts describe the original pinned RK/BRM sources before the
+statistical body moved to BRM. The ownership cleanup does not rerun or extend
+their scientific or performance qualification. New benchmark receipts record
+the owned body source as well as this repository's consumer wrapper.
 
 On the CPU benchmark, native Julia is faster for the primal. Native Enzyme
 value-and-gradient evaluation is 1.02–1.20× StanBlocks in the longer measurement,
