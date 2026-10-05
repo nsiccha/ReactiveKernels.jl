@@ -1,6 +1,7 @@
 using ReactiveKernels, ReactiveKernelsPPL
 import BayesianRegressionModels
-include(joinpath(@__DIR__, "..", "..", "packages", "ReactiveKernelsPPL", "test", "gp_binding_fixtures.jl"))
+isdefined(@__MODULE__, :GPBindingModels) ||
+    include(joinpath(@__DIR__, "..", "..", "packages", "ReactiveKernelsPPL", "test", "gp_binding_fixtures.jl"))
 
 module GPBindingLibrary
 using ReactiveKernels, ReactiveKernelsPPL
