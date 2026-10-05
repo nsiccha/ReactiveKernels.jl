@@ -901,7 +901,12 @@ end
         # unchanged by the stateful routing guard. Compare the macro's expansion to
         # the stateless helper's output built from the SAME parsed definition parts,
         # with line numbers stripped and per-expansion gensym counters normalized.
-        norm(ex) = replace(string(Base.remove_linenums!(deepcopy(ex))), r"#\d+" => "#N")
+        # Generated source retains its lexical Module as an identity-bearing
+        # quoted leaf. Copy only AST nodes before stripping their line numbers.
+        copy_ast(ex) = ex
+        copy_ast(ex::Expr) = Expr(ex.head, map(copy_ast, ex.args)...)
+        copy_ast(ex::QuoteNode) = QuoteNode(copy_ast(ex.value))
+        norm(ex) = replace(string(Base.remove_linenums!(copy_ast(ex))), r"#\d+" => "#N")
         def = :(plain(f, x) = begin
             y = f(x)
         end)
@@ -909,7 +914,7 @@ end
             y = f(x)
         end
         nm, inp, sig, posn, rawsig, blk = RKS._kernel_definition_parts(def)
-        ref = Expr(:(=), nm, RKS._kernel_expand(blk, inp, sig))
+        ref = Expr(:(=), nm, RKS._kernel_expand(blk, inp, sig, @__MODULE__))
         @test norm(actual) == norm(ref)
         # and no stateful codegen leaked into the methodless expansion
         @test !occursin("_StatefulKernelSkeleton", string(actual))
