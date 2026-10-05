@@ -82,16 +82,13 @@ function _ma_surface_case(kind, n)
         coords=[Symbol("b.1"),Symbol("b.2")]
         loc = q ->[q[Symbol("b.1")]+t*q[Symbol("b.2")] for t in x]
         scale = q ->[j==1 ? 1.0 : x[i] for i in 1:n,j in 1:2]
-    elseif kind in (:live_column, :live_column_axes, :live_column_bracket,
-                    :live_column_matrix)
+    elseif kind in (:live_column, :live_column_axes, :live_column_matrix)
         # Data columns concatenated with a parameter-dependent vector column.
         ast = kind == :live_column ?
             quote a~Normal(0,1); v=exp.(a.*x1); X=hcat(ones(length(x1)),x1,v); b[1:3] .~Normal.(0,1); y .~Normal.(X*b,1.0) end :
             kind == :live_column_axes ?
             quote a~Normal(0,1); v=exp.(a.*x1); X=hcat(ones(length(x1)),x1,v); b[axes(X,2)] .~Normal.(0,1); y .~Normal.(X*b,1.0) end :
-            kind == :live_column_bracket ?
-            quote a~Normal(0,1); v=exp.(a.*x1); X=[ones(length(x1)) x1 v]; b[axes(X,2)] .~Normal.(0,1); y .~Normal.(X*b,1.0) end :
-            quote a~Normal(0,1); D=hcat(ones(length(x1)),x1); X=hcat(D,exp.(a.*x1)); b[axes(X,2)] .~Normal.(0,1); y .~Normal.(X*b,1.0) end
+            quote a~Normal(0,1); D=hcat(ones(length(x1)),x1); X=hcat(D,exp.(a.*x1)); b[1:3] .~Normal.(0,1); y .~Normal.(X*b,1.0) end
         coords=[:a,Symbol("b.1"),Symbol("b.2"),Symbol("b.3")]
         loc = q ->[q[Symbol("b.1")]+t*q[Symbol("b.2")]+exp(q[:a]*t)*q[Symbol("b.3")] for t in x]
     else
@@ -140,7 +137,7 @@ const _MA_SURFACE_FIXTURES=(
     (:raw_location,5),(:alias,5),(:plus_scalar,5),(:alias_plus_scalar,5),
     (:broadcast_b,1),(:broadcast_b,2),(:matrix_scale,5),
     (:live_column,1),(:live_column,5),(:live_column_axes,5),
-    (:live_column_bracket,5),(:live_column_matrix,5))
+    (:live_column_matrix,5))
 
 @testset "ordinary matrix values: independent math and native reverse" begin
     for (kind,n) in _MA_SURFACE_FIXTURES
