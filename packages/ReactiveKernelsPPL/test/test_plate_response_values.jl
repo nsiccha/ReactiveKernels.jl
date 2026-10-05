@@ -27,7 +27,10 @@ function _prv_fixture(kind, n; unbound = nothing)
         Expr(:block, :(y[i] ~ Normal($value, 0.7)))
     push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
         Expr(:for, :(i = $iterator), cell)))
-    data = Dict(:x => x, :y => y, :g => g)
+    # Every supplied response entry must be observed (USER `1g8uvgs`).
+    observed_y = selected ? Union{Missing,Float64}[i == 1 ? y[i] : missing
+        for i in eachindex(y)] : y
+    data = Dict(:x => x, :y => observed_y, :g => g)
     unbound === nothing && (unbound = lower_rkppl(ast, data; conditioned = keys(data)))
     bound = bind_data(unbound, data)
     built = build_kernel(bound)
@@ -101,7 +104,7 @@ end
                 pw = Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), u)
                 @test pw.y ≈ fx.pointwise(u)
             end
-            @test fx.data == saved
+            @test isequal(fx.data, saved)
         end
     end
 end
