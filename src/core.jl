@@ -952,6 +952,15 @@ end
     Expr(:tuple, [:(getfield(args, $index)) for index in I]...)
 end
 
+# Keep the fixed set of shared operands as direct arguments to the authored
+# predicate. A mapped tuple followed by a splat loses its argument types when
+# tracing a generated source callable after a bound-data branch split.
+@inline @generated function _plate_branch_predicate(
+        condition, args::Tuple{Vararg{Any,N}}) where {N}
+    forwarded = [:(_plate_branch_value(getfield(args, $index))) for index in 1:N]
+    :(condition($(forwarded...)))
+end
+
 struct _PlateBranchArm{I,O}
     operation::O
 end
@@ -981,7 +990,7 @@ end
     if !all(_plate_branch_shared, condition_args) || _plate_branch_empty(args)
         return _tensorized_plate_default_call(operation, args)
     end
-    predicate = branch.condition(map(_plate_branch_value, condition_args)...)
+    predicate = _plate_branch_predicate(branch.condition, condition_args)
     args = _plate_branch_operands(predicate, args)
     yes = _KernelSourceOp(Val(D), Val(F), operation.f.then_arm,
         branch.then_arm, operation.ignored_throws)
