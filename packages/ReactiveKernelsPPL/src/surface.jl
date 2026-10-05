@@ -568,7 +568,13 @@ function Base.merge(sm::RKPPLSubmodel, part::Union{Expr,NamedTuple}, rest...)
         Dict(k => v for (k, v) in model.fixed if occursin('.', String(k))))
 end
 
-function _lower_model(m::RKPPLModel, supplied; conditioned = keys(m.conditioned))
+# Julia 1.12 also versions global bindings. A builder may eval a named
+# KernelSpec or import a submodel immediately before lowering; resolve the
+# complete program in one latest-world scope, without a caller-side barrier.
+_lower_model(m::RKPPLModel, supplied; conditioned = keys(m.conditioned)) =
+    Base.invokelatest(_lower_model_latest, m, supplied; conditioned)
+
+function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.conditioned))
     values = merge(copy(m.fixed), Dict{Symbol,ColumnData}(pairs(supplied)), m.conditioned)
     observing = Set{Symbol}(_conditioned_names(conditioned))
     scoped = Dict(k => pop!(values, k) for k in collect(keys(values))
@@ -772,6 +778,10 @@ distinct private modules never collide: one fresh `Module` per lowering,
 each holding its own `@rkppl name(args...) = ...` defs, is sufficient for
 concurrent independent lowerings with no shared lock.
 
+Lowering resolves these bindings in a package-owned latest-world scope,
+including kernels and imports just created by `Core.eval` in a builder.
+No caller-side `invokelatest` is needed for lowering on Julia 1.12 or later.
+
 Declared coefficients are ordinary named parameters. A scalar
 `b ~ Fam(...)` keeps its name, prior and transform when an affine term
 reads it as `b .* x`. A sized declaration such as `c[levels(g)]` or
@@ -808,7 +818,10 @@ end
 lower_rkppl(ast, data_names; mod::Module = Main, conditioned=()) =
     _lower_rkppl(ast, data_names, Set{Symbol}(), mod; conditioned)
 
-function _lower_rkppl(ast, data_names, scalars::Set{Symbol},
+_lower_rkppl(ast, data_names, scalars::Set{Symbol}, mod::Module; conditioned=())::StructuralPlan =
+    Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod; conditioned)
+
+function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
         mod::Module; conditioned=())::StructuralPlan
     data = Set{Symbol}()
     for n in data_names

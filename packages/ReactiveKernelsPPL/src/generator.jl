@@ -28,11 +28,15 @@ Thread safety: concurrent `build_kernel` calls over independent plans are
 supported — the counter-suffixed `PPLGeneratedModels` binding is assigned
 under a package-owned lock, so every build gets a distinct binding with no
 caller-side synchronization. The returned spec closes over build-time
-eval'd code: `prepare` it and call it through [`prepare_query`](@ref) /
+eval'd code. Construction resolves module bindings in a package-owned
+latest-world scope, including just-evaluated kernels; subsequent execution
+uses its own boundary: `prepare` it and call it through [`prepare_query`](@ref) /
 [`prepare_sampler`](@ref) (which carry the `Base.invokelatest` world-age
 barrier) or wrap those calls in `Base.invokelatest` yourself.
 """
-function build_kernel(plan::StructuralPlan)
+build_kernel(plan::StructuralPlan) = Base.invokelatest(_build_kernel_latest, plan)
+
+function _build_kernel_latest(plan::StructuralPlan)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] build_kernel requires a bound plan (bind_data first)"))
@@ -48,7 +52,10 @@ end
 The `@kernel` definition expression (`Expr(:(=), signature, body)`).
 Pure (no eval): the generator tests inspect and evaluate it.
 """
-function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
+kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model) =
+    Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+
+function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
     validate_plan(plan)
     isbound(plan) || throw(ContractValidationError(
         "[generator] kernel_expr requires a bound plan (bind_data first)"))
