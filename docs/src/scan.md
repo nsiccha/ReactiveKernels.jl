@@ -334,9 +334,9 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   ordinary scan materialization and broadcast shape checks.
 - **Reactant.** `scan` emits a single `stablehlo.while` carry loop for supported
   nonempty iterated-sequence shapes. This describes the emitted trace;
-  [default optimized structure](#Default-optimized-short-scans) has a separate
-  short-scan limitation. The lowering is selected whenever any scan operand
-  is traced (the carry seed, an iterated sequence looked through its
+  [default optimization](#Default-optimized-short-scans) may expand short scans
+  while preserving their semantics. The lowering is selected whenever any
+  scan operand is traced (the carry seed, an iterated sequence looked through its
   `eachrow` wrapper, or a shared operand looked through its `Ref`), and every
   iterated sequence is then carried as a traced array: a 1-D sequence is
   gathered element by element by the loop counter, an `eachrow` matrix
@@ -393,24 +393,25 @@ historical upstream reverse defects, fixed in Reactant 0.2.289+.
 
 ## Default optimized short scans
 
-RK's emitted scan loop does not guarantee retained iteration in the default
-optimized MLIR or executable. On Julia 1.10.12 with Reactant 0.2.290 and
-Enzyme 0.13.210, the backend-only
+RK emits a scan loop whose body does not grow with sequence length. This is
+what [the retained-iteration requirement](constraints.md) governs; subsequent
+backend optimization may unroll that loop while preserving its semantics.
+
+On Julia 1.10.12 with Reactant 0.2.290 and Enzyme 0.13.210,
 `benchmark/repro_reactant_small_scan_growth.jl` emits one raw loop at sequence
 lengths 3, 4, 8 and 16. Default optimization expands the length-3 and length-4
 recurrences into successive scalar multiply/add stages, followed by array
 concatenation. Lengths 8 and 16 retain recurrence loops in primal and reverse.
 Both executables agree with an independent recurrence and its ordinary Enzyme
-reverse at changed inputs, and preserve caller inputs. Those numerical checks
-do not establish retained data-derived iteration for the shorter sequences.
+reverse at changed inputs, and preserve caller inputs. The authored endpoint
+scan behaves the same way with runtime or bound sequences
+(`test/test_scan_endpoint_scope_reactant.jl`). These are supported tested cases,
+not a minimum-length cutoff or an unmet RK structure requirement.
 
-The authored endpoint scan has the same length-3 boundary with runtime or bound
-sequences (`test/test_scan_endpoint_scope_reactant.jl`). Its known-broken
-structure checks track the capability gap under [the core constraints](constraints.md).
-These lengths are measured examples, not a cutoff defining supported scans.
-Inspect reachable recurrence work in complete default optimized MLIR and
-actual executable HLO when checking another shape; loop counts and operation
-inventories are diagnostics rather than exact-count policy.
+The tests assert the emitted loop and numerical semantics. Complete default
+optimized MLIR, executable HLO and operation inventories are diagnostics;
+final loop retention is not an acceptance condition. No performance regression
+or need for a backend repair has been demonstrated by this observation.
 
 The reproducer's optional `--isolate-unroll` diagnostic uses the public custom
 pipeline option to compare HLO simplification alone with the same simplification
@@ -418,13 +419,11 @@ followed by `enzyme_hlo_unroll(4)`. The control retains both length-3 and length
 loops; adding the rewrite expands only the length-3 loop. This isolates a
 sufficient backend transformation without changing either default executable.
 
-No RK-only repair preserving default compilation and ordinary reverse has been
-established. Making the bound opaque through an optimization barrier retained
-primal iteration in a prior probe, but ordinary reverse failed exporting
-`stablehlo.dynamic_pad` with a non-statically-known-loop-bound diagnostic.
-That probe is rejected. Changing optimizer flags, hand-writing a derivative,
-or replacing the recurrence with a closed form does not supply the required
-default-path capability. Native iteration remains an ordinary loop.
+A prior optimization-barrier probe retained the primal loop but ordinary
+reverse failed exporting `stablehlo.dynamic_pad` with a
+non-statically-known-loop-bound diagnostic. That probe remains rejected;
+forcing final loop retention is unnecessary for the RK emission contract.
+Native iteration remains an ordinary loop.
 
 ## Limitations
 

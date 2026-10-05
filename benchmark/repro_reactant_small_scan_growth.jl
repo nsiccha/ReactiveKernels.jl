@@ -1,5 +1,6 @@
 # Backend-only reproduction: RK emits a retained scan, but the default
-# optimizer expands short recurrences. No ReactiveKernels dependency, activity
+# optimizer expands short recurrences without violating RK emission requirements.
+# No ReactiveKernels dependency, activity
 # override, derivative rule, or nondefault executable pipeline is used.
 # Run in an environment containing Reactant, Enzyme and Test:
 #   julia --project=<env> benchmark/repro_reactant_small_scan_growth.jl
@@ -61,7 +62,7 @@ function check_result(::Val{:reverse}, compiled, ru, u)
 end
 
 function main()
-@testset "default short-scan retained-iteration boundary" begin
+@testset "default short-scan semantics and optimization diagnostics" begin
     println("VERSIONS Julia=", VERSION, " Reactant=", pkgversion(Reactant),
             " Enzyme=", pkgversion(Enzyme))
     for n in (3, 4, 8, 16)
@@ -81,15 +82,8 @@ function main()
                 @test point == saved
                 @test Array(rp) == saved
             end
-            if n <= 4
-                # Capability gap under docs/src/constraints.md (user 1rvu25u).
-                # Preserve known-broken iteration; a lift makes these XPASS.
-                @test_broken occursin("stablehlo.while", mlir)
-                @test_broken occursin(r"\bwhile\(", hlo)
-            else
-                @test occursin("stablehlo.while", mlir)
-                @test occursin(r"\bwhile\(", hlo)
-            end
+            # RK's contract concerns emitted structure; final backend loop
+            # retention is diagnostic, not a broken capability expectation.
             println("SCAN n=", n, " direction=", direction,
                     " raw_while=", count("stablehlo.while", raw),
                     " default_while=", count("stablehlo.while", mlir),

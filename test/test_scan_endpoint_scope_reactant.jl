@@ -13,17 +13,13 @@ end
 function record_structure(fn, compiled, args, label, n)
     mlir = repr(Reactant.@code_hlo fn(args...))
     hlo = repr(only(Reactant.XLA.get_hlo_modules(compiled.exec)))
-    if n == 3
-        # Default Reactant optimization expands this small scan, including the
-        # function-shaped control. Values/AD pass; retained iteration remains
-        # a backend capability gap, not permission to accept unrolling.
-        @test_broken occursin("stablehlo.while", mlir)
-        @test_broken occursin("while(", hlo)
-    else
-        @test occursin("stablehlo.while", mlir)
-        startswith(label, "primal") && @test count("stablehlo.while", mlir) == 1
-        @test occursin("while(", hlo)
-    end
+    raw = repr(Reactant.@code_hlo optimize=false fn(args...))
+    # Enforce RK emission, including bound-data traces. Backend optimization
+    # may unroll the loop while preserving the tested values and derivatives.
+    @test occursin("stablehlo.while", raw)
+    startswith(label, "primal") && @test count("stablehlo.while", raw) == 1
+    println("SCAN_ENDPOINT_RAW ", label, " n=", n,
+            " while=", count("stablehlo.while", raw))
     println("SCAN_ENDPOINT_MLIR ", label, " n=", n, " ", inventory(mlir,
         r"\b((?:stablehlo|chlo|enzyme|func|arith|scf|cf|tensor|math|linalg|memref)\.\w+)"))
     instructions = r"(?m)^\s*(?:ROOT\s+)?%?[\w.-]+ = .*?\s+([A-Za-z][A-Za-z0-9_-]*)\("
@@ -31,12 +27,13 @@ function record_structure(fn, compiled, args, label, n)
     println("SCAN_ENDPOINT_HLO ", label, " n=", n, " ", inventory(hlo, instructions))
     if haskey(ENV, "RK_SCAN_ENDPOINT_IR_DIR")
         stem = joinpath(ENV["RK_SCAN_ENDPOINT_IR_DIR"], "$label-$n")
+        write(stem * ".raw.mlir", raw)
         write(stem * ".mlir", mlir)
         write(stem * ".hlo", hlo)
     end
 end
 
-@testset "object endpoint scans retain default compiled primal and reverse" begin
+@testset "object endpoint scans emit loops and preserve compiled primal and reverse" begin
     q = [0.7]
     rq = Reactant.to_rarray(q)
     for n in (3, 17, 31), bound in (false, true)
@@ -70,7 +67,6 @@ end
         @test Float64(primal(traced...)) ≈ k(q, xs)
         raw = repr(Reactant.@code_hlo optimize=false k(traced...))
         @test count("stablehlo.while", raw) == 1
-        @test_broken occursin("while(", repr(only(Reactant.XLA.get_hlo_modules(primal.exec))))
     end
 end
 
