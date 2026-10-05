@@ -672,7 +672,10 @@ end
 # the two arms meet in one value that Enzyme's static activity analysis
 # rejects when the empty arm's is never written actively. Otherwise each arm
 # allocates, typed by the first output when there is one.
-function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
+# Keep this ordinary loop visible at its caller. Julia 1.13 / Enzyme's
+# readonly analysis otherwise rejects local allocation stores across the call
+# boundary when the differentiated closure captures its constant sequence.
+@inline function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
                                    shared::Tuple, ::Val{false} = Val(false))
     idx = eachindex(iterated...)
     T = _scan_step_output_type(
@@ -690,7 +693,7 @@ function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
     result
 end
 
-function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
+@inline function _tensorized_scan_lowering(::Nothing, step, init, iterated::Tuple,
                                    shared::Tuple, ::Val{true})
     idx = eachindex(iterated...)
     allocate(T) = similar(first(iterated), promote_type(typeof(init), T), length(idx) + 1)
