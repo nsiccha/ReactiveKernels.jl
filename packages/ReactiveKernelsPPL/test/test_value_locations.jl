@@ -131,7 +131,7 @@ end
         :z => [0.5, -0.2, 0.1, 0.3], :x => [0.5, -0.2, 0.1, 0.7])
     for loc in _VL_LOCATIONS
         prog = _vl_program("a ~ Normal(0,1); m = exp(a); " *
-            "L ~ LKJCovarianceFactor(2,Exponential(1),2); " *
+            "L_scales[1:2] .~ Exponential.(1); L_L_corr ~ LKJCholesky(2,2); L = L_scales .* L_L_corr; " *
             "[y,z] ~ MvNormalCholesky([$loc,0.2],L)")
         bound, built, _, _ = _bare_query(prog, data)
         @test [p.name for p in bound.predictors] == [:y_joint_1, :z_joint_2]
@@ -166,7 +166,7 @@ end
         ("a ~ Normal(0,1); c[1:2] .~ Normal.(0,1); " *
             "y .~ Ordinal.(StoppingRatio(),LogitLink(),a,Ref(c))",
             Dict{Symbol,Any}(:y => levels), true),
-        ("a ~ Normal(0,1); L ~ LKJCovarianceFactor(2,Exponential(1),2); " *
+        ("a ~ Normal(0,1); L_scales[1:2] .~ Exponential.(1); L_L_corr ~ LKJCholesky(2,2); L = L_scales .* L_L_corr; " *
             "[y,z] ~ MvNormalCholesky([a,0.2],L)",
             Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7], :z => [0.4, 0.7, -0.2]), true),
     ]

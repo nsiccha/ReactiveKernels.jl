@@ -127,24 +127,24 @@ end
     @test !isapprox(pr(a, c), pr(a + shift, c .- shift))
 end
 
-@testset "full-cover factor in an R2D2 predictor" begin
-    # R2D2 has a separate surface-lowering path that used to apply the same
-    # identifiability refusal. Its variance decomposition remains unchanged.
+@testset "full-cover factor with declared dependent priors" begin
+    # A proper prior with an authored shared scale remains admissible.
     data = Dict{Symbol,Any}(:y => [0.2, -0.1, 0.4], :g => [1, 2, 1])
     ast = quote
         R2 ~ Beta(1, 1)
         phi ~ Dirichlet([1.0, 1.0])
         mu = a .+ c[g]
-        r2d2(mu, R2, phi, 1.0)
+        a ~ Normal(0, 1)
+        c[1:length(levels(g))] .~ Normal.(0, sqrt.(phi .* R2 ./ (1 / 3)))
         y .~ Normal.(mu, 1)
     end
     _admission_check(ast, data, q -> begin
         # Each indicator has sample variance 1/3 in this three-row data set.
         scales = sqrt.(q.phi .* q.R2 ./ (1 / 3))
-        (; ll = sum(logpdf(Normal(q.mu[1] + q.mu[1 + g], 1), y)
+        (; ll = sum(logpdf(Normal(q.a + q.c[g], 1), y)
                 for (g, y) in zip(data[:g], data[:y])),
-            pr = logpdf(Normal(), q.mu[1]) +
-                sum(logpdf.(Normal.(0, scales), q.mu[2:3])) +
+            pr = logpdf(Normal(), q.a) +
+                sum(logpdf.(Normal.(0, scales), q.c)) +
                 logpdf(Beta(1, 1), q.R2) +
                 logpdf(Dirichlet([1.0, 1.0]), q.phi),
             jac = log(q.R2 * (1 - q.R2)) + sum(log, q.phi))

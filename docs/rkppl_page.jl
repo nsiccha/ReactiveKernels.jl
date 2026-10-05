@@ -106,25 +106,6 @@ function render_rkppl_kernel_program(file::AbstractString)
     Markdown.MD(Any[Markdown.Code("julia", "@kernel " * program)])
 end
 
-"""Show the live varying-library definitions, including every prior."""
-function render_rkppl_library_definitions(names)
-    definitions = map(names) do name
-        sm = getfield(ReactiveKernelsPPL, name)
-        body = Base.remove_linenums!(deepcopy(sm.body))
-        args = Any[sm.argnames...]
-        isempty(sm.kwdefaults) || pushfirst!(args, Expr(:parameters,
-            (Expr(:kw, k, v) for (k, v) in sm.kwdefaults)...))
-        def = Expr(:(=), Expr(:call, sm.name, args...), body)
-        "@rkppl " * sprint(Base.show_unquoted, def; context = :limit => false)
-    end
-    Markdown.MD(Any[Markdown.Code("julia", join(definitions, "\n\n"))])
-end
-
-render_rkppl_varying_definitions() = render_rkppl_library_definitions(
-    (:varying_coefs, :varying_coefs_correlated,
-        :varying_coefs_centered, :varying_coefs_centered_correlated,
-        :varying_stratified, :varying_stratified_correlated))
-
 const _RKPPL_UNDECLARED = """
 model = @rkppl begin
     a ~ Normal(0, 1)

@@ -274,11 +274,11 @@ end
     @test _query(bm.spec, mixed, :posterior, um) ≈ expected_mixed
     _check_gradient(bm.spec, mixed, um)
 
-    # capability: a declared coefficient can also feed a scalar definition beside a Horseshoe coefficient (P8; todo `15lq8iu`).
+    # capability: a declared coefficient can also feed a scalar definition beside a declared array coefficient (P8; todo `15lq8iu`).
     @test (lower_rkppl(quote
         a ~ Normal(0, 1)
         X = hcat(x)
-        b ~ horseshoe_coefs(X)
+        b[axes(X, 2)] .~ Normal.(0, 1)
         mu = a .+ X * b
         y .~ Normal.(mu, 1.0)
         q = a^2

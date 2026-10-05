@@ -165,7 +165,7 @@ function _viz_model(v::DAGVisualization)
             ""
         end
         detail = status * "cost $(r.cost) · recipe $(r.id)" * plate_detail
-        push!(nodes, _VizNode(_recipe_node_id(r.id), _opname(r.op), detail,
+        push!(nodes, _VizNode(_recipe_node_id(r.id), _recipe_label(r), detail,
                              :recipe, state))
     end
 

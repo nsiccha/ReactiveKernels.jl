@@ -97,7 +97,6 @@ end
 
 @testset "centered row prior IR, layout, emitted prior and likelihood" begin
     plan = _centered_test_plan()
-    @test isempty(plan.varying_draws)
     @test validate_structure(plan) === nothing
     columns = Dict{Symbol,AbstractVector}(:group=>[3,1,2,3,1],
         :x=>[.2,1.,-.5,.3,.1],:y=>[.5,.2,-.1,.4,.3])
@@ -118,17 +117,4 @@ end
     value,_ = sampler_value_and_gradient!(sampler,g,u)
     @test value ≈ query(u) rtol=2e-13
     @test g ≈ _findiff_grad(p -> _centered_plan_oracle(p,built.layout,columns),u) rtol=2e-6 atol=3e-8
-end
-
-@testset "varying draws no longer accepts the centered keyword" begin
-    # refused: centered effects are ordinary array priors, not a built-in
-    # geometry switch (user decision lib-varying/01gqbsq, centered_builtin).
-    for centered in (true,false,1)
-        @test_throws "takes keywords `eta`/`levels`/`sd` only, got `centered`" lower_rkppl(quote
-            d ~ varying_draws(group,[1,x];centered=$centered)
-            r ~ varying_slice(d,1:2)
-            mu = r
-            y .~ Normal.(mu,1.)
-        end,(:y,:group,:x); conditioned = (:y,:group,:x))
-    end
 end

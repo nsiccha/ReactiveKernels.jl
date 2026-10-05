@@ -24,7 +24,9 @@ function _cap_packed_tensor(kind, n; selected_range=nothing)
             b ~ Normal(0, 1)
             mu1 = a .+ b .* x1
             mu2 = b .+ a .* x2
-            L ~ LKJCovarianceFactor(2, Exponential(1), 2)
+            L_scales[1:2] .~ Exponential.(1)
+            L_L_corr ~ LKJCholesky(2, 2)
+            L = L_scales .* L_L_corr
             [y1, y2] ~ MvNormalCholesky([mu1, mu2], L)
         end
     elseif kind in (:glm, :bernoulli_glm, :poisson_glm)

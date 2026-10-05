@@ -2,7 +2,7 @@
 # data-inferred level count K must not replicate emitted statements. The
 # emitted program at two level counts must be the SAME expression once
 # literal constants are abstracted (level counts, data lengths, and the
-# frozen literal payloads — Dirichlet α−1, R2D2 column variances — are
+# frozen literal payloads — Dirichlet α−1 — are
 # constants; anything else that differs is K-dependent structure).
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -41,17 +41,20 @@ function _kinv_plans(K::Int)
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 eta = a .+ b .* x
-                y .~ OrderedLogistic.(eta)
+                y_cutpoints ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
+                y .~ OrderedLogistic.(eta, Ref(y_cutpoints))
             end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "ordinal_cumulative_probit" => bind_data(lower_rkppl(quote
                 b ~ Normal(0, 1)
                 eta = b .* x
-                y .~ Ordinal.(Cumulative(), ProbitLink(), eta)
+                y_thresholds ~ Ordered(Normal(0, 1), length(levels(y)) - 1)
+                y .~ Ordinal.(Cumulative(), ProbitLink(), eta, Ref(y_thresholds))
             end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "ordinal_stopping_logit" => bind_data(lower_rkppl(quote
                 b ~ Normal(0, 1)
                 eta = b .* x
-                y .~ Ordinal.(StoppingRatio(), LogitLink(), eta)
+                y_thresholds[1:length(levels(y)) - 1] .~ Normal.(0, 1)
+                y .~ Ordinal.(StoppingRatio(), LogitLink(), eta, Ref(y_thresholds))
             end, (:y, :x); conditioned = (:y, :x)), data(:y => y, :x => x)),
         "categorical_simplex" => bind_data(lower_rkppl(quote
                 s ~ Dirichlet($K, 1.0)
@@ -61,15 +64,16 @@ function _kinv_plans(K::Int)
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 s ~ Dirichlet($alpha)
-                mu = a .+ b .* mo(c, s)
+                mu = a .+ b .* cumsum(vcat(0.0, s))[c]
                 sigma ~ Exponential(1.0)
                 yc .~ Normal.(mu, sigma)
             end, (:yc, :c); conditioned = (:yc, :c)), data(:yc => yc, :c => y)),
-        "r2d2_factor" => bind_data(lower_rkppl(quote
+        "dependent_factor_priors" => bind_data(lower_rkppl(quote
                 R2 ~ Beta(1.0, 1.0)
                 phi ~ Dirichlet($phia)
                 mu = b1 .* x1 .+ c[g]
-                r2d2(mu, R2, phi)
+                b1 ~ Normal(0, sqrt(R2 * phi[1]))
+                c[1:length(levels(g))] .~ Normal.(0, sqrt.(R2 .* phi[2:length(phi)]))
                 sigma ~ Exponential(1.0)
                 yc .~ Normal.(mu, sigma)
             end, Set([:x1, :g, :yc]); conditioned = Set([:x1, :g, :yc])), data(:x1 => x, :g => y, :yc => yc)),

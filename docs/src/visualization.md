@@ -74,6 +74,26 @@ complete, trusted JavaScript or CSS payloads. Use an ordinary layout container
 rather than a presentational `SemanticCard`, because the DAG contains
 interactive buttons.
 
+## Text views
+
+`show` of a `Graph` in plain text lists its values (structurally equal values
+joined by `≡`) and its recipes, with each authored plate or scan body nested
+under its recipe. A recipe captured from `@kernel` source reads as
+`(inputs) -> source`, as it does in `explain(plan)` and in the diagram labels.
+
+`readable_code(spec_or_plan)` shows the planned program as ordinary Julia,
+with every operation slot replaced by its authored source or name and no
+line-number annotations; `readable_code(prepared)` shows a prepared kernel,
+including data folded in by `bound=`. The result names the modules the authored
+sources were evaluated in and also displays as HTML. It is an explanation:
+`code_expr` remains the exact compiled AST.
+
+```julia
+graph = kernel_graph(spec)
+show(stdout, MIME"text/plain"(), graph)   # values and recipes
+print(readable_code(spec))                # the planned program
+```
+
 ## Reading a diagram
 
 The diagram has two kinds of node: values are ellipses and recipes are boxes,
