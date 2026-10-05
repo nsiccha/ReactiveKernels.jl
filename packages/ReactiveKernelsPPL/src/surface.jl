@@ -2311,7 +2311,7 @@ const _RETIRED_PREPARATION_HEADS = (:tps_basis, :cr_basis, :t2_basis,
     :hsgp_basis, :hsgp_sqrt_spd, :hsgp_rho_floors,
     :hsgp_periodic_basis, :hsgp_matern_sqrt_spd, :hsgp_grouped_sqrt_spd,
     :hsgp_periodic_sqrt_spd, :hsgp_periodic_grouped_sqrt_spd,
-    :hsgp_periodic_rho_floor)
+    :hsgp_periodic_rho_floor, :gp_exp_quad_cov, :gp_periodic_cov, :gp_chol_latent)
 
 function _module_binding(m::Module, s::Symbol, where, shown)
     if !isdefined(m, s)

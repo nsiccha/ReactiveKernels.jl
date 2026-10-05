@@ -1,4 +1,5 @@
 [deps]
+BayesianRegressionModels = "cdd3e328-398d-47a6-a87b-6047aaf4b4bc"
 AlgebraOfVega = "a2420894-485a-4f42-a4fc-c4323ec6fb2b"
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"

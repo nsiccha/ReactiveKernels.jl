@@ -1,4 +1,6 @@
 [deps]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+ReactiveKernelsPPL = "e266ea2a-6817-46cd-8bec-6238f0035f44"
 BayesianRegressionModels = "cdd3e328-398d-47a6-a87b-6047aaf4b4bc"
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 BridgeStan = "c88b6f0a-829e-4b0b-94b7-f06ab5908f5a"
