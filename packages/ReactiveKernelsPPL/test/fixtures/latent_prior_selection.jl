@@ -8,8 +8,10 @@ function _prior_selection_fixture(n, nobs; prior=:data, iterator=:eachindex)
     y = Float64[-0.2 + 0.03i for i in 1:nobs]
     inputs = prior === :data ? (; domain, x, y) :
         prior === :mapped ? (; domain, index, y) : (; domain, y)
+    # `:value` iterates a definition (not bound data) whose extent is n.
     range = iterator === :literal ? :(1:$n) :
-        iterator === :axes ? :(axes(domain, 2)) : :(eachindex(domain))
+        iterator === :axes ? :(axes(domain, 2)) :
+        iterator === :value ? :(eachindex(cells)) : :(eachindex(domain))
     declarations = prior === :data ? Any[] :
         prior === :mapped ? Any[:(scale[1:2] .~ Exponential.(1))] :
         Any[:(x[1:$(n+3)] .~ Normal.(0, 1))]
@@ -23,7 +25,8 @@ function _prior_selection_fixture(n, nobs; prior=:data, iterator=:eachindex)
         end
         y .~ Normal.(anchor + sum(z), 1)
     end
-    ast = Expr(:block, declarations..., definitions..., ast.args...)
+    extent = iterator === :value ? Any[:(cells = anchor .+ domain)] : Any[]
+    ast = Expr(:block, declarations..., definitions..., ast.args..., extent...)
     bound = bind_data(lower_rkppl(ast, inputs; conditioned=(:y,)), inputs)
     built = build_kernel(bound)
     z = Float64[0.04i - 0.2 for i in 1:n]

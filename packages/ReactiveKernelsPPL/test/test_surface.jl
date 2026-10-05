@@ -3834,6 +3834,16 @@ end
 # Per-cell prior args: a per-cell latent's prior mean/scale may be per-cell —
 # a raw data column (`Normal(x[i], tau)`) or a derived column — giving the
 # varying-intercept shape without a separate transform cell.
+# The value each per-cell prior argument reads: a shared name as written,
+# or the column a named cell selection (`x[i]` over the plate) indexes.
+function _plate_prior_reads(plan, pp)
+    defs = Dict(d.name => d.expr for d in (plan.assignments..., plan.derived...))
+    return map(collect(values(pp.args))) do a
+        ex = get(defs, a, a)
+        Meta.isexpr(ex, :ref) ? ex.args[1] : ex
+    end
+end
+
 @testset "surface plate per-cell prior args" begin
     cols, n = _gen_columns()
     # Raw-data per-cell mean.
@@ -3845,7 +3855,9 @@ end
                     :(y[i] ~ Normal.(theta[i], sigma))))))
     plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
     pp = only(plan.plate_parameters)
-    @test collect(values(pp.args)) == [:x, :tau]     # per-cell x, shared tau
+    # Per-cell x reads the authored cells (`x[i]`, `i in eachindex(y)`)
+    # through a named selection; tau is shared.
+    @test _plate_prior_reads(plan, pp) == [:x, :tau]
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     u = [-0.1, -0.2, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]  # logtau, logsigma, theta[1:6]
@@ -3856,15 +3868,14 @@ end
         sum(logpdf.(Normal.(cols[:x], tau), theta))
     @test _query(built.spec, bound, :posterior, u) ≈ ll + pr + u[1] + u[2]
     _check_gradient(built.spec, bound, u)
-    # An unknown per-cell prior-arg name fails at bind.
-    bad = lower_rkppl(Expr(:block,
+    # An unknown per-cell prior-arg name fails at lowering, named as written.
+    # refused: unknown name nope (P6, 05oe96l)
+    @test_throws "indexes `nope`, which is not data" lower_rkppl(Expr(:block,
         :(tau ~ Exponential(1)), :(sigma ~ Exponential(1)),
         Expr(:macrocall, Symbol("@plate"), LineNumberNode(3),
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ Normal(nope[i], tau)),
                     :(y[i] ~ Normal.(theta[i], sigma)))))), (:y, :x); conditioned = (:y, :x))
-    # refused: unknown name nope (P6, 05oe96l)
-    @test_throws ContractValidationError bind_data(bad, cols)
 end
 
 # ── Reusable submodels (StanBlocks-style) ────────────────────────────────
@@ -4397,7 +4408,7 @@ _pcs(cells...) = Expr(:block,
             Expr(:for, Expr(:(=), :i, :(eachindex(y))),
                 Expr(:block, :(theta[i] ~ pcs_centered(x[i], tau)),
                     :(y[i] ~ Normal.(theta[i], sigma)))))), (:y, :x); mod = M, conditioned = (:y, :x))
-    @test collect(values(only(subv.plate_parameters).args)) == [:x, :tau]
+    @test _plate_prior_reads(subv, only(subv.plate_parameters)) == [:x, :tau]
     bv = bind_data(subv, cols)
     builtv = build_kernel(bv)
     uv = [-0.1, -0.2, 0.5, -0.25, 0.1, 0.4, -0.1, 0.2]  # logtau, logsigma, theta[1:6]

@@ -66,6 +66,10 @@ end
 _bound_value(x) = x
 _bound_array_value(x::AbstractArray) = x
 _bound_value_input(name::Symbol) = Symbol("_rkppl_value_", name)
+# A latent plate iterating a value (not bound data) selects its prior
+# inputs at `1:n`, where `n` is the latent's own cell count. Binding
+# supplies `n` under this internal input (`_bind_plate_extents!`).
+_plate_extent_input(name::Symbol) = Symbol("_rkppl_cells_", name)
 # Messages name a data value as its author wrote it, never its internal
 # input (`ReactiveKernelsPPL._bound_value(_rkppl_value_s)` reads `s`).
 _author_names(msg::AbstractString) = replace(String(msg),
@@ -1922,8 +1926,12 @@ function _observation_axes(plan::StructuralPlan)
     domains = Dict{Symbol,Tuple}()
     for (r, rd) in zip(plan.responses, reads)
         responseaxes = r.range isa Expr ? axes(_selected_response_column(plan, r)) : colaxes[r.response]
+        # `eachrow(E)` supplies one threshold-effect vector per response
+        # cell. Its stage axis belongs to the ordinal law, not the broadcast
+        # domain. Keep that role local to this reader of the ordinary matrix.
+        axesread(c) = c === r.threshold_effects ? (axes(plan.columns[c], 1),) : colaxes[c]
         operandaxes(c) = r.range isa Expr && r.response in plan.indexed_observations ?
-            _indexed_operand_axes(plan, r, c, c in designs) : colaxes[c]
+            _indexed_operand_axes(plan, r, c, c in designs || c === r.threshold_effects) : axesread(c)
         valuesread = r.range isa Expr ? _response_reads(plan, _with(r; range=nothing), perobs) : rd
         if r.response in plan.indexed_observations
             domain = responseaxes
@@ -2124,11 +2132,27 @@ function _plate_rows(plan::StructuralPlan, p::PlateParameter)
             return iterator.args[1] === :eachindex ? length(eachindex(value)) :
                 length(axes(value, iterator.args[3]))
         end
+        # A value iterates its own axes when its definition states them,
+        # as Julia's `eachindex(v)` / `axes(v, d)` would; otherwise the rows
+        # its observation reads establish.
+        n = _value_iterator_length(plan, p, iterator)
+        n === nothing || return n
         iterator.args[1] === :eachindex && return _value_rows(plan, source)
         iterator.args[3] === 1 && return _value_rows(plan, source)
         _fail(p.label, "plate axis $(repr(iterator)) needs its bound source array")
     end
     return _value_rows(plan, p.range isa Symbol ? p.range : p.name)
+end
+
+function _value_iterator_length(plan::StructuralPlan, p::PlateParameter, iterator)
+    source = iterator.args[2]
+    shape = _value_axes(plan, source; data_axes = true)
+    (shape === nothing || isempty(shape)) && return nothing
+    sizes = Int[d isa Integer ? d : _array_dim_size(plan, source, p.label, d)
+        for d in shape]
+    iterator.args[1] === :eachindex && return prod(sizes)
+    k = iterator.args[3]
+    return k <= length(sizes) ? sizes[k] : 1
 end
 
 # Missing is a valid label, but remains invalid numeric evidence. Only
@@ -3825,8 +3849,10 @@ const _COMPOSED_MORE_OPS = Tuple(op for op in ELEMENTWISE_OPS
 # resolution — functions as values: `hypot.(s1, mu .* s2)`).
 _composed_map_fn(f) = f isa GlobalRef || f === :ifelse ||
     f in _COMPOSED_UNARY || f in ELEMENTWISE_FNS
+# A data design-matrix product is affine in its coefficient vector, just
+# as its equivalent sum of intercept and continuous terms is.
 const _COMPOSED_AFFINE_KINDS =
-    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
+    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, MatrixTerm)
 # Sub-predictors are affine.
 const _COMPOSED_SUB_KINDS = _COMPOSED_AFFINE_KINDS
 
@@ -3935,7 +3961,7 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
         sub = plan.predictors[sidx]
         all(u -> u.kind in _COMPOSED_SUB_KINDS, sub.terms) ||
             _fail(t.label, "composed sub-predictor $s must be affine " *
-                  "plus varying effects (intercept/continuous/factor/" *
+                  "plus varying effects (intercept/continuous/factor/matrix/" *
                   "offset/varying-effect terms only — no nested " *
                   "compositions, latents, or other summands)")
     end
@@ -4363,11 +4389,11 @@ function _validate_unleveled_fields(r::LikelihoodSpec)
     return nothing
 end
 
-# Leveled-field rules for predictor-addressing families (CategoricalLogit,
-# OrderedLogistic, Ordinal); non-leveled families must leave every leveled
+# Leveled-field rules follow the response family, independently of whether
+# its location is a predictor or a latent value. Non-leveled families leave every leveled
 # field at its default. `used_predictors` gains categorical tail predictors.
 function _validate_leveled_fields(r::LikelihoodSpec, plan::StructuralPlan,
-        pred::PredictorSpec, used_predictors::Set{Symbol})
+        used_predictors::Set{Symbol})
     _is_leveled_family(r.family) || return _validate_unleveled_fields(r)
     r.family === CategoricalLogitFam &&
         return _validate_categorical_fields(r, plan, used_predictors)
@@ -5141,7 +5167,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_zi(r, plan)
             _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
-            _validate_unleveled_fields(r)
+            _validate_leveled_fields(r, plan, used_predictors)
             continue
         end
         # A per-cell latent feeds the ordinary scalar-family location path.
@@ -5153,7 +5179,7 @@ function _validate_responses(plan::StructuralPlan)
             _validate_zi(r, plan)
             _validate_interval(r, plan)
             _validate_evidence_structure(r, plan)
-            _validate_unleveled_fields(r)
+            _validate_leveled_fields(r, plan, used_predictors)
             continue
         end
         # A bare sampled-parameter location (constrained-scale, no link
@@ -5269,7 +5295,7 @@ function _validate_responses(plan::StructuralPlan)
         _validate_zi(r, plan)
         _validate_interval(r, plan)
         _validate_evidence_structure(r, plan)
-        _validate_leveled_fields(r, plan, pred, used_predictors)
+        _validate_leveled_fields(r, plan, used_predictors)
         if r.range isa UnitRange
             (r.mi_jobs === nothing ? first(r.range) == 1 : first(r.range) >= 1) ||
                 _fail(r.label, "response range must use valid one-based indices")
@@ -7026,6 +7052,10 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
         axes === nothing ? _bind_nrows(columns,
             union(_mi_managed_columns(plan), computed, inputs)) : axes.total
     end
+    # Latent plates over values now know their cell counts; the data-only
+    # indices selecting their prior inputs evaluate like any other.
+    isempty(_bind_plate_extents!(_with(axis_plan; n_obs = n), columns)) ||
+        _materialize_module_data!(plan, columns; already = computed)
     maps = _eval_levelmaps(plan.levelmaps, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
@@ -7036,6 +7066,25 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     _validate_conditioned_values(bound)
     validate_data(bound)
     return bound
+end
+
+# Supply `_plate_extent_input` for each latent plate whose prior inputs
+# select through it: the same cell count that sizes the latent itself.
+function _bind_plate_extents!(plan::StructuralPlan, columns)
+    reads = Set{Symbol}()
+    for d in (plan.assignments..., plan.derived...)
+        _expr_value_symbols(d.expr, reads)
+    end
+    inputs = Set{Symbol}()
+    for p in plan.plate_parameters
+        input = _plate_extent_input(p.name)
+        input in reads || continue
+        haskey(columns, input) && _fail(p.label, "internal input $input " *
+            "is the latent's cell count — drop it from bind_data")
+        columns[input] = _plate_rows(plan, p)
+        push!(inputs, input)
+    end
+    return inputs
 end
 
 function _route_conditioned_values!(plan, columns)
