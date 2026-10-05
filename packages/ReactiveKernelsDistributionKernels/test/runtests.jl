@@ -7,7 +7,7 @@ import Enzyme
 using LinearAlgebra: Cholesky, LowerTriangular, Symmetric, cholesky, diag, norm
 using LogExpFunctions: log1pexp
 using ReactiveKernels: @kernel, KernelObjectSpec, KernelSpec, ad_gradient, code_expr,
-    explain, extract, plan, plate, prepare, prepare_ad
+    explain, extract, plan, plate, prepare, prepare_ad, rk_cholesky_lower
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     LOCATION_SCALE_SOURCE,
@@ -570,15 +570,25 @@ end
     z = [0.5, -1.0, 0.25, 1.5, -0.75, 0.0]
     Lref = cholesky(Symmetric(K)).L
     @test gp_chol_latent(K, z) ≈ Lref * z
-    # potrf factor itself matches LAPACK (white-box: only the lower
-    # triangle is valid out of _gp_potrf!).
-    L = Matrix(K)
-    DistributionKernelSources._gp_potrf!(L)
-    @test LowerTriangular(L) ≈ Lref
+    @test rk_cholesky_lower(K) ≈ Lref
+    for j in axes(K, 2), i in 1:j-1
+        K[i, j] = NaN
+    end
+    before = copy(K)
+    @test gp_chol_latent(K, z) ≈ Lref * z
+    @test isequal(K, before)
+    @test gp_chol_latent(zeros(0, 0), Float64[]) == Float64[]
     @test_throws ArgumentError gp_chol_latent(K, z[1:3])
     @test_throws ArgumentError gp_chol_latent(K[:, 1:3], z)
     # Non-PD names jitter (never a bare DomainError from sqrt).
     @test_throws ArgumentError gp_chol_latent(fill(1.0, 3, 3), ones(3))
+    err = try
+        gp_chol_latent(fill(1.0, 3, 3), ones(3))
+    catch e
+        e
+    end
+    @test err.msg == "gp_chol_latent covariance is not positive definite " *
+        "(non-positive pivot at 2 — increase jitter)"
 end
 
 @testset "poisson and binomial selected HAVE tails" begin
