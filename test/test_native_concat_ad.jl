@@ -103,9 +103,6 @@ _derivative(f, a) = (f(a + cbrt(eps(a))) - f(a - cbrt(eps(a)))) / (2cbrt(eps(a))
              a -> sum((n - k + 1) * (sum(w) + exp(a * x[k])) for k in 1:n; init = zero(a))),
         )
         for (spec, data, reference) in cases, a in T.((0.3, -0.6))
-            # Native Reverse through an empty scan fails without any
-            # concatenation (the separately tracked empty-scan boundary).
-            spec === scanned && n == 0 && continue
             k = prepare(spec; bound = data)
             ad = prepare_ad(k, backend, a; active = :a)
             value, gradient = ad_value_and_gradient(ad, a)
