@@ -252,6 +252,29 @@ end
     @test structures[1]==structures[2]
 end
 
+@testset "an empty bound split-arm domain evaluates no cell" begin
+    # Zero lanes run no cell. Before RK supplied the native element type,
+    # the compiled primal read the first element of the zero-length operand
+    # (`Create Operation 'stablehlo.dynamic_slice' failed`).
+    y=Float64[]
+    k=prepare(shared_split_arm;have=(:y,:scale),want=:total,bound=(;y))
+    c=Reactant.@compile k(_traced(1.3))
+    gradient(v)=only(Enzyme.gradient(Enzyme.Reverse,k,v))
+    cg=Reactant.@compile gradient(_traced(1.3))
+    for scale in (1.3,-0.4,0.0)
+        input=_traced(scale)
+        @test _host(c(input))==0.0
+        @test _host(cg(input))==0.0
+        @test k(scale)==0.0
+        @test gradient(scale)==0.0
+        @test _host(input)==scale
+    end
+    @test isempty(y)
+    # One lane at the same shape keeps its cell.
+    one=prepare(shared_split_arm;have=(:y,:scale),want=:total,bound=(;y=[2.0]))
+    @test _host((Reactant.@compile one(_traced(1.3)))(_traced(0.7)))≈1.4
+end
+
 @testset "typed integer conversions accept traced integer and real inputs" begin
     k = prepare(typed_count_conversion; want=:total)
     for x in (3, 3.7)

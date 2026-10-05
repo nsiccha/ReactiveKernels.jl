@@ -359,6 +359,11 @@ receives one:
   lazy-branch limitation in the [core constraints](constraints.md) does not
   arise.
 
+An empty bound domain has no lanes to group. It runs no cell and evaluates no
+condition. Its result is empty, with the element type inferred from the
+authored native cell, as in Julia's empty broadcast. Reactant compiles it
+without reading the zero-length operand.
+
 The number of arm plates is bounded by the cell's branch structure, never by
 the data. A condition that reads a live value stays an ordinary lazy branch.
 This includes the shape of a live array, such as `length(c)` of a runtime
@@ -462,7 +467,9 @@ build executes it and renders that reader's generated kernel and compute DAG.
 Main.ReactiveKernelsDocs.render_nested_plate_example(@__MODULE__)
 ```
 
-`plate_body` exposes the nested scalar plans. `prepare` supports bound group
+`plate_body` exposes the nested scalar plans, and `recipe_inventory` lists a
+program's plates and scans recursively (see [Inspecting
+structure](#inspecting-structure)). `prepare` supports bound group
 data with a live scalar scale, and `prepare_ad` with ordinary native Enzyme
 Reverse differentiates the scale through both loops. No custom derivative
 rule is required. The native acceptance suite also replays the displayed
@@ -473,6 +480,26 @@ that capability gap explicitly. Native lowering of a cell containing another
 plate currently executes the whole selected cell graph per outer coordinate;
 it does not apply the scalar-only plate scheduler's outer invariant hoisting
 across that boundary.
+
+### Inspecting structure
+
+`recipe_kind(recipe)` classifies a recipe as `:plate`, `:scan` or `:ordinary`
+without throwing; `plate_body(recipe)` and `scan_body(recipe)` return the body
+plan of a plate or scan. `recipe_inventory` walks a `KernelSpec` (its graph), a
+`Graph`, a `Plan` or a `PreparedKernel` (its plan; with `bound=` data, the
+residual plan) and every plate and scan body below it, returning `(; kind,
+depth, parent, recipe)` entries in depth-first order. `depth` counts the
+enclosing plates and scans, and `parent` is the index of the enclosing entry, or
+`0` at top level. Structural acceptance can then state the retained nesting
+without depending on internal operation types:
+
+```julia
+[(entry.kind, entry.depth) for entry in recipe_inventory(prepare(spec; bound))
+ if entry.kind !== :ordinary]   # for example [(:plate, 0), (:scan, 1)]
+```
+
+The inventory only reads its argument. The `Graph` text listing renders the
+same walk.
 
 ### Prepared-kernel composition is flattened
 

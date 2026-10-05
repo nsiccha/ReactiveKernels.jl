@@ -1231,6 +1231,41 @@ end
     checkbounds(Bool, array, index) ?
         ReactiveKernels._tensorized_getindex(array, index) : default
 
+# An empty traced broadcast evaluates no cell. When inference over traced
+# operands gives no concrete element type, Reactant's broadcast copy calls the
+# cell on the first element of each operand to learn it. A lazy-branch cell is
+# such a case (its traced body is staged control flow), and over a zero-length
+# operand that read fails with `Create Operation 'stablehlo.dynamic_slice'`.
+# Julia's empty broadcast takes its type from inference, without calling the
+# cell. Do the same here: infer the authored native cell over the operands'
+# native element types, allocate that empty result, and let Reactant's copy
+# return the empty destination. Nonempty broadcasts, concretely inferred ones
+# and callables without a concrete native result type keep Reactant's path.
+@inline function ReactiveKernels._tensorized_materialize(
+        bc::Base.Broadcast.Broadcasted{
+            <:Reactant.TracedRArrayOverrides.AbstractReactantArrayStyle})
+    any(iszero ∘ length, Base.Broadcast.combine_axes(bc.args...)) ||
+        return Base.materialize(bc)
+    isconcretetype(Base.Broadcast.combine_eltypes(bc.f, bc.args)) &&
+        return Base.materialize(bc)
+    T = _empty_broadcast_native_eltype(bc.f, bc.args)
+    T === nothing && return Base.materialize(bc)
+    ready = Base.Broadcast.instantiate(bc)
+    copyto!(similar(ready, T), ready)
+end
+function _empty_broadcast_native_eltype(f, args::Tuple)
+    argtypes = map(_empty_broadcast_native_argtype, args)
+    any(isnothing, argtypes) && return nothing
+    T = ReactiveKernels._kernel_native_result_type(f, Tuple{argtypes...})
+    T isa Type && T <: Reactant.ReactantPrimitive ? T : nothing
+end
+function _empty_broadcast_native_argtype(arg)
+    E = Base.Broadcast._broadcast_getindex_eltype(arg)
+    isconcretetype(E) || return nothing
+    T = Reactant.unwrapped_eltype(E)
+    isconcretetype(T) ? T : nothing
+end
+
 # The scalar type a vector-literal element contributes under tracing: the
 # wrapped type, so promotion abstracts nothing.  `ConcretePJRTNumber` is a
 # closed-over traced constant rather than a `TracedRNumber`, but carries

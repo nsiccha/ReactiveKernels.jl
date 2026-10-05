@@ -143,3 +143,122 @@ _has_linenumber(x) = x isa LineNumberNode ||
               "Graph with 0 values and 0 recipes\nValues:\nRecipes: (none)"
     end
 end
+
+# The public structural inspection contract: `recipe_kind` classifies a
+# recipe and `recipe_inventory` walks plate and scan bodies recursively. One
+# source authority is defined here and replayed from its printed form.
+const INVENTORY_SOURCE = raw"""
+@kernel inventory_groups(groups, scale::Float64) = begin
+    group_total = plate(groups, Ref(scale)) do observations, sigma
+        pointwise = plate(observations, Ref(sigma)) do observation, s
+            -log(s) - 0.5 * (observation / s)^2
+        end
+        sum(pointwise)
+    end
+    total = sum(group_total)
+    return total
+end
+@kernel inventory_path(xs, gain) = begin
+    updates = scan(xs, Ref(gain); init = 0.0) do carry, x, g
+        next = carry + x * g
+        (next, next)
+    end
+    return updates
+end
+@kernel inventory_panel(x, gain) = begin
+    totals = plate(eachcol(x), Ref(gain)) do xs, g
+        history = inventory_path(xs, g)
+        sum(history)
+    end
+    total = sum(totals)
+    return total
+end
+"""
+Core.eval(@__MODULE__, Meta.parseall(INVENTORY_SOURCE))
+
+_structure(program) = [(entry.kind, entry.depth) for entry in recipe_inventory(program)
+                       if entry.kind !== :ordinary]
+_body(entry) = entry.kind === :plate ? plate_body(entry.recipe) : scan_body(entry.recipe)
+
+@testset "recipe kinds and the recursive structural inventory" begin
+    groups = [[0.2, 0.7], Float64[], [-1.2]]
+    x = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    # Each column contributes the sum of its running totals of `x * gain`.
+    panel_reference(x, gain) = sum(sum(cumsum(column .* gain)) for column in eachcol(x))
+
+    @testset "recipe_kind classifies every recipe" begin
+        recipes = kernel_graph(inventory_panel).recipes
+        @test all(in((:plate, :scan, :ordinary)), recipe_kind.(recipes))
+        panel_plate = only(filter(recipe -> recipe_kind(recipe) === :plate, recipes))
+        body = plate_body(panel_plate).recipes
+        @test count(recipe -> recipe_kind(recipe) === :scan, body) == 1
+        @test recipe_kind(only(filter(recipe -> recipe.outputs[1].name === :total, recipes))) ===
+              :ordinary
+    end
+
+    @testset "entries are depth-first, with depth and parent" begin
+        for program in (inventory_groups, kernel_graph(inventory_groups),
+                        plan(inventory_groups), prepare(inventory_groups))
+            @test _structure(program) == [(:plate, 0), (:plate, 1)]
+        end
+        for program in (inventory_panel, kernel_graph(inventory_panel),
+                        plan(inventory_panel), prepare(inventory_panel))
+            @test _structure(program) == [(:plate, 0), (:scan, 1)]
+            entries = recipe_inventory(program)
+            @test entries isa Vector
+            for (index, entry) in enumerate(entries)
+                @test entry.kind === recipe_kind(entry.recipe)
+                if entry.parent == 0
+                    @test entry.depth == 0
+                else
+                    @test entry.parent < index
+                    @test entries[entry.parent].kind !== :ordinary
+                    @test entries[entry.parent].depth == entry.depth - 1
+                end
+                # A plate or scan is followed by exactly its body's recipes.
+                entry.kind === :ordinary && continue
+                @test [child.recipe for child in entries if child.parent == index] ==
+                      _body(entry).recipes
+            end
+        end
+    end
+
+    @testset "bound data and printed-source replay keep the structure" begin
+        bound_panel = prepare(inventory_panel; bound = (; x))
+        @test _structure(bound_panel) == [(:plate, 0), (:scan, 1)]
+        @test bound_panel(0.5) ≈ panel_reference(x, 0.5)
+        bound_groups = prepare(inventory_groups; bound = (; groups))
+        @test _structure(bound_groups) == [(:plate, 0), (:plate, 1)]
+
+        replay = Module(gensym(:InventoryReplay))
+        Core.eval(replay, :(using ReactiveKernels))
+        printed = join((sprint(Base.show_unquoted, definition)
+                        for definition in Meta.parseall(INVENTORY_SOURCE).args
+                        if !(definition isa LineNumberNode)), "\n")
+        Core.eval(replay, Meta.parseall(printed))
+        replayed_panel = getfield(replay, :inventory_panel)
+        replayed_groups = getfield(replay, :inventory_groups)
+        @test _structure(replayed_panel) == [(:plate, 0), (:scan, 1)]
+        @test _structure(replayed_groups) == [(:plate, 0), (:plate, 1)]
+        replayed_bound = prepare(replayed_panel; bound = (; x))
+        @test _structure(replayed_bound) == [(:plate, 0), (:scan, 1)]
+        @test replayed_bound(0.5) ≈ panel_reference(x, 0.5)
+    end
+
+    @testset "the inventory only reads its argument" begin
+        graph = kernel_graph(inventory_panel)
+        recipes = copy(graph.recipes)
+        version = graph.version
+        listing = sprint(show, MIME"text/plain"(), graph)
+        recipe_inventory(graph)
+        @test graph.recipes == recipes
+        @test graph.version == version
+        @test sprint(show, MIME"text/plain"(), graph) == listing
+        # The listing renders the same walk: one line per inventory entry plus
+        # one body header per plate or scan.
+        @test occursin("    scan body: have (", listing)
+        recipe_lines = filter(line -> occursin(r"^\s*\[-?\d+\] ", line),
+                              split(listing, '\n'))
+        @test length(recipe_lines) == length(recipe_inventory(graph))
+    end
+end
