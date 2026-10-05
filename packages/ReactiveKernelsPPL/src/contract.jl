@@ -66,6 +66,10 @@ end
 _bound_value(x) = x
 _bound_array_value(x::AbstractArray) = x
 _bound_value_input(name::Symbol) = Symbol("_rkppl_value_", name)
+# A latent plate iterating a value (not bound data) selects its prior
+# inputs at `1:n`, where `n` is the latent's own cell count. Binding
+# supplies `n` under this internal input (`_bind_plate_extents!`).
+_plate_extent_input(name::Symbol) = Symbol("_rkppl_cells_", name)
 # Messages name a data value as its author wrote it, never its internal
 # input (`ReactiveKernelsPPL._bound_value(_rkppl_value_s)` reads `s`).
 _author_names(msg::AbstractString) = replace(String(msg),
@@ -2031,11 +2035,27 @@ function _plate_rows(plan::StructuralPlan, p::PlateParameter)
             return iterator.args[1] === :eachindex ? length(eachindex(value)) :
                 length(axes(value, iterator.args[3]))
         end
+        # A value iterates its own axes when its definition states them,
+        # as Julia's `eachindex(v)` / `axes(v, d)` would; otherwise the rows
+        # its observation reads establish.
+        n = _value_iterator_length(plan, p, iterator)
+        n === nothing || return n
         iterator.args[1] === :eachindex && return _value_rows(plan, source)
         iterator.args[3] === 1 && return _value_rows(plan, source)
         _fail(p.label, "plate axis $(repr(iterator)) needs its bound source array")
     end
     return _value_rows(plan, p.range isa Symbol ? p.range : p.name)
+end
+
+function _value_iterator_length(plan::StructuralPlan, p::PlateParameter, iterator)
+    source = iterator.args[2]
+    shape = _value_axes(plan, source; data_axes = true)
+    (shape === nothing || isempty(shape)) && return nothing
+    sizes = Int[d isa Integer ? d : _array_dim_size(plan, source, p.label, d)
+        for d in shape]
+    iterator.args[1] === :eachindex && return prod(sizes)
+    k = iterator.args[3]
+    return k <= length(sizes) ? sizes[k] : 1
 end
 
 # Missing is a valid label, but remains invalid numeric evidence. Only
@@ -6932,6 +6952,10 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
         axes === nothing ? _bind_nrows(columns,
             union(_mi_managed_columns(plan), computed, inputs)) : axes.total
     end
+    # Latent plates over values now know their cell counts; the data-only
+    # indices selecting their prior inputs evaluate like any other.
+    isempty(_bind_plate_extents!(_with(axis_plan; n_obs = n), columns)) ||
+        _materialize_module_data!(plan, columns; already = computed)
     maps = _eval_levelmaps(plan.levelmaps, columns)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
@@ -6942,6 +6966,25 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     _validate_conditioned_values(bound)
     validate_data(bound)
     return bound
+end
+
+# Supply `_plate_extent_input` for each latent plate whose prior inputs
+# select through it: the same cell count that sizes the latent itself.
+function _bind_plate_extents!(plan::StructuralPlan, columns)
+    reads = Set{Symbol}()
+    for d in (plan.assignments..., plan.derived...)
+        _expr_value_symbols(d.expr, reads)
+    end
+    inputs = Set{Symbol}()
+    for p in plan.plate_parameters
+        input = _plate_extent_input(p.name)
+        input in reads || continue
+        haskey(columns, input) && _fail(p.label, "internal input $input " *
+            "is the latent's cell count — drop it from bind_data")
+        columns[input] = _plate_rows(plan, p)
+        push!(inputs, input)
+    end
+    return inputs
 end
 
 function _route_conditioned_values!(plan, columns)
