@@ -1,7 +1,5 @@
 # data: y1 y2 x
-# Correlated outcomes: joint MvNormalCholesky response over an LKJ
-# covariance factor (SB `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` with
-# `L ~ LKJCovarianceFactor(2, Exponential(1), 2)`).
+# Joint responses over explicitly declared scale and LKJCholesky priors.
 begin
     a1 ~ Normal(0, 1)
     b1 ~ Normal(0, 1)
@@ -9,6 +7,8 @@ begin
     b2 ~ Normal(0, 1)
     mu1 = a1 .+ b1 .* x
     mu2 = a2 .+ b2 .* x
-    L ~ LKJCovarianceFactor(2, Exponential(1.0), 2.0)
+    L_scales[1:2] .~ Exponential.(1.0)
+    L_L_corr ~ LKJCholesky(2, 2.0)
+    L = L_scales .* L_L_corr
     [y1, y2] ~ MvNormalCholesky([mu1, mu2], L)
 end

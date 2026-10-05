@@ -29,8 +29,8 @@ const _CSI_SHARED_MONOTONIC = quote
     b ~ Normal(0, 1)
     d ~ Normal(0, 1)
     s ~ Dirichlet([2.0, 3.0])
-    m1 ~ monotonic(c, s)
-    m2 ~ monotonic(c, s)
+    m1 = cumsum(vcat(0.0, s))[c]
+    m2 = cumsum(vcat(0.0, s))[c]
     mu = a .+ b .* m1
     nu = d .+ m2
     y .~ Normal.(mu, 1.0)
@@ -78,7 +78,7 @@ function _csi_index_oracle(layout, u, data, centered)
     return lp + sum(logpdf.(Normal.(h, 0.8), data.y))
 end
 
-@testset "standalone vector priors and shared library simplex" begin
+@testset "standalone vector priors and shared declared simplex" begin
     fx = _csi_build(_CSI_PRIOR_ONLY, NamedTuple())
     @test isempty(fx.bound.responses)
     @test fx.built.layout.total == 4

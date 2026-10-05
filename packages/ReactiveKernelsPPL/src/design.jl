@@ -82,36 +82,6 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         # its coefficients live in the PlateParameter layout block, so this
         # term contributes no design width.
         return DesignBlock(LatentTerm, only(t.columns), t.addressee, 0, Symbol[], [])
-    elseif t.kind === MonotonicTerm
-        # A monotonic (mo) column: width 1 with a free coefficient, labeled
-        # by its index column (the continuous precedent). The contrast is
-        # parameter-derived, so it never enters the data-only design
-        # matrix — the generator splices it per-block against its
-        # coefficient coordinate. `column` carries the increments key (the
-        # spline-basis-id precedent), which names the contrast recipe.
-        col = only(t.columns)
-        return DesignBlock(MonotonicTerm, t.options.increments, t.addressee,
-            1, [col], [])
-    elseif t.kind === MonotonicSummandTerm
-        # A monotonic summand (mo1): a direct beta-free contrast splice —
-        # no design-matrix width. `column` carries the increments key, as
-        # for the column shape.
-        return DesignBlock(MonotonicSummandTerm, t.options.increments,
-            t.addressee, 0, Symbol[], [])
-    elseif t.kind === SplineSummandTerm
-        # A spline summand is a direct `X*b + Z*(sd*z)` expression over
-        # materialized basis columns and SplineVector layout blocks — no
-        # design-matrix width. The basis id rides in `column` so the
-        # generator can resolve the blocks without re-reading terms.
-        return DesignBlock(SplineSummandTerm, t.options.spline_id,
-            t.addressee, 0, Symbol[], [])
-    elseif t.kind === HSGPSummandTerm
-        # An HSGP summand is a direct `PHI * (sqrt_spd .* beta)` expression
-        # over in-graph basis columns and the term's layout blocks (Stage
-        # B) — no design-matrix width. The basis id rides in `column` so
-        # the generator can resolve the basis without re-reading terms.
-        return DesignBlock(HSGPSummandTerm, t.options.hsgp_id,
-            t.addressee, 0, Symbol[], [])
     elseif t.kind === ScanSummandTerm
         # A scan summand is a direct `state .* coef` expression over the
         # in-graph recurrence state and a scalar sampled coefficient (or
@@ -120,12 +90,6 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         # the generator reads the TERMS for the full (scan_id, coef) key,
         # which does not fit one Symbol.
         return DesignBlock(ScanSummandTerm, t.options.scan_id,
-            t.addressee, 0, Symbol[], [])
-    elseif t.kind === DarSummandTerm
-        # A dar summand is a direct bare-state splice of the in-graph
-        # differenced-AR(1) trajectory — beta-free (the `mo1` shape), so
-        # no design-matrix width. The state rides in `column`.
-        return DesignBlock(DarSummandTerm, t.options.dar_id,
             t.addressee, 0, Symbol[], [])
     elseif t.kind === FactorTerm
         col = only(t.columns)
@@ -141,21 +105,13 @@ function _term_block(t::TermSpec, columns, label, pname, levelmaps, matrices)
         labels = Symbol[Symbol(string(col) * "_" * string(level)) for level in m.values]
         return DesignBlock(FactorTerm, col, t.addressee, length(labels), labels,
             collect(m.values))
-    elseif t.kind === VaryingEffectTerm
-        # A varying effect is a direct `r` expression over the group
-        # index and the draws block's draws (SB's
-        # `r_<target>_<suffix>` summand) — no design-matrix width.
-        # `column` carries the grouping column (the encoder input); the
-        # generator reads the TERMS for the draws label.
-        return DesignBlock(VaryingEffectTerm, only(t.columns), t.addressee,
-            0, Symbol[], [])
     elseif t.kind === MatrixTerm
         # A matrix term splices `X * view(coef, ...)` over its design
         # matrix: width K with per-element labels matching the affine
         # spelling (`:Intercept` at intercept positions, the column
         # otherwise — twins report identically). `column` carries the
         # matrix name (the recipe part); `elements` the matrix columns
-        # for per-element consumers (priors, R2D2).
+        # for per-element prior consumers.
         i = findfirst(m -> m.name === t.options.matrix, matrices)
         i === nothing && throw(ContractValidationError(
             "[$label] matrix term addresses :$(t.options.matrix), which " *
@@ -230,123 +186,4 @@ function coefficient_priors(shape::DesignShape, priors::Vector{PopulationPrior})
     specs = coefficient_prior_specs(shape, priors)
     return ([Float64(s.location) for s in specs],
         [Float64(s.scale) for s in specs])
-end
-
-"""
-    r2d2_column_scales(shape, columns, overrides) -> (share, fallback, loc, varx)
-
-Bound data-only R2D2 share composition (SB `_sb_emit_r2d2_popefs!`
-mirror): per-design-column `share_idx` (0 = fallback), fallback
-scales, locations, and column variances, all in design-column order.
-The intercept is always share 0 (SB default `(loc, fallback) =
-(0.0, 1.0)` unless overridden); every other data column takes the
-next share unless its addressee carries an explicit-Normal override.
-Factor blocks fan out per dummy (variances via the
-`brm_cat_variances` `m*(n-m)/(n*(n-1))` formula in level order);
-continuous columns take the sample variance (N−1, the Stan
-`variance()` normalization). Width-0 blocks (offsets, effects,
-summands) contribute nothing. Monotonic columns fail closed: their
-contrast is parameter-derived, so no data variance exists (no SB
-precedent in the flat mirror).
-"""
-function r2d2_column_scales(shape::DesignShape,
-        columns::AbstractDict{Symbol},
-        overrides::Dict{Symbol,Tuple{Float64,Float64}})
-    share = Int[]
-    fallback = Float64[]
-    loc = Float64[]
-    varx = Float64[]
-    next_share = 1
-    for b in shape.blocks
-        b.width == 0 && continue
-        if b.kind === MonotonicTerm
-            throw(ContractValidationError(
-                "[$(shape.predictor)] R2D2 over a monotonic column is " *
-                "not in the flat slice (the mo contrast is " *
-                "parameter-derived, so no data variance exists)"))
-        end
-        if b.kind === InterceptTerm
-            # Always share 0 (SB); the override, if stated, supplies
-            # loc/scale. No data variance exists (column is nothing) —
-            # unused at share 0 either way.
-            oloc, ofb = get(overrides, b.addressee, (0.0, 1.0))
-            push!(share, 0)
-            push!(fallback, ofb)
-            push!(loc, oloc)
-            push!(varx, 0.0)
-            continue
-        end
-        if b.kind === MatrixTerm
-            # Per-element composition: intercept positions take share 0
-            # (the intercept arm), other positions an explicit-Normal
-            # override by element addressee or the next share. Variances
-            # mirror the continuous rule per data column (0.0 at
-            # intercepts, unused at share 0 either way).
-            for e in b.elements
-                if e === nothing
-                    oloc, ofb = get(overrides, :Intercept, (0.0, 1.0))
-                    push!(share, 0)
-                    push!(fallback, ofb)
-                    push!(loc, oloc)
-                    push!(varx, 0.0)
-                elseif haskey(overrides, e)
-                    oloc, ofb = overrides[e]
-                    push!(share, 0)
-                    push!(fallback, ofb)
-                    push!(loc, oloc)
-                    push!(varx, _r2d2_sample_variance(columns[e]))
-                else
-                    push!(share, next_share)
-                    next_share += 1
-                    push!(fallback, 1.0)
-                    push!(loc, 0.0)
-                    push!(varx, _r2d2_sample_variance(columns[e]))
-                end
-            end
-            continue
-        end
-        if haskey(overrides, b.addressee)
-            oloc, ofb = overrides[b.addressee]
-            append!(share, fill(0, b.width))
-            append!(fallback, fill(ofb, b.width))
-            append!(loc, fill(oloc, b.width))
-            append!(varx, _r2d2_block_variances(b, columns))
-            continue
-        end
-        for _ in 1:b.width
-            push!(share, next_share)
-            next_share += 1
-        end
-        append!(fallback, fill(1.0, b.width))
-        append!(loc, fill(0.0, b.width))
-        append!(varx, _r2d2_block_variances(b, columns))
-    end
-    return (share, fallback, loc, varx)
-end
-
-function _r2d2_block_variances(b::DesignBlock, columns::AbstractDict{Symbol})
-    if b.kind === FactorTerm
-        col = columns[b.column]
-        n = length(col)
-        return Float64[
-            _r2d2_dummy_variance(col, lvl, n) for lvl in b.levels]
-    end
-    col = columns[b.column]
-    return Float64[_r2d2_sample_variance(col)]
-end
-
-# Sample variance, N−1 normalization (Stan `variance()`).
-function _r2d2_sample_variance(col::AbstractVector)
-    n = length(col)
-    n < 2 && return NaN
-    m = sum(col) / n
-    return sum((x - m)^2 for x in col) / (n - 1)
-end
-
-# Dummy variance without materializing the dummy (SB
-# `brm_cat_variances`: m*(n-m)/(n*(n-1)) over the level codes).
-function _r2d2_dummy_variance(col::AbstractVector, lvl, n::Int)
-    n < 2 && return NaN
-    m = count(==(lvl), col)
-    return Float64(m * (n - m) / (n * (n - 1)))
 end

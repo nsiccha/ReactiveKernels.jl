@@ -501,30 +501,7 @@ end
         end
         @test sizes[1] == sizes[2]
     end
-    # A dar parameter scaling a column: the posterior equals the dar-only
-    # model on `y - beta .* x` at the same unconstrained point.
-    @testset "parameter-scaled column beside a dar summand" begin
-        x, y = _fb_col(:x), _fb_col(:y)
-        dar_prog(loc) = quote
-            a ~ Normal(0, 1); b ~ Normal(0, 1)
-            beta ~ truncated(Normal(0.5, 0.2), 0, 1)
-            sigmad ~ HalfNormal(0.2); sigma ~ Exponential(1)
-            $loc
-            y .~ Normal.(mu, sigma)
-        end
-        function post(prog, ycol)
-            cols = Dict{Symbol,AbstractVector}(:x => x, :y => ycol)
-            bound = bind_data(lower_rkppl(prog, keys(cols); conditioned = keys(cols)), cols)
-            built = build_kernel(bound)
-            return built.layout, prepare_query(built, bound, :sampler)
-        end
-        layA, kA = post(dar_prog(:(mu = a .+ beta .* x .+ dar(beta, sigmad))), y)
-        u = [0.05 * k * (-1)^k for k in 1:layA.total]
-        beta = constrain(layA, u).beta
-        layC, kC = post(dar_prog(:(mu = a .+ dar(beta, sigmad))), y .- beta .* x)
-        @test coordinate_names(layC) == coordinate_names(layA)
-        @test Base.invokelatest(kA, u) ≈ Base.invokelatest(kC, u) rtol = 1e-12
-    end
+
 end
 
 @testset "fallback: full-cover factors admit fixed and hierarchical priors" begin

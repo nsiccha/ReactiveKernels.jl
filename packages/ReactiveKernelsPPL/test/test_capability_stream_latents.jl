@@ -62,12 +62,12 @@ function _cap_stream_fixture(kind, n)
         a ~ Normal(0, 1)
         s ~ Exponential(1)
     end
-    if kind in (:cell, :pin)
+    if kind in (:cell, :observed)
         cell = kind === :cell ? quote
             z[i] ~ cell_stream(a, s)
             y[i] ~ Normal(z[i], 0.7)
         end : quote
-            y[i] ~ cell_stream(a, s; predictor=qpin)
+            y[i] ~ cell_stream(a, s)
         end
         push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
             Expr(:for, :(i = eachindex(y)), cell)))
@@ -84,8 +84,8 @@ function _cap_stream_fixture(kind, n)
     u = unconstrain(built.layout, values)
     function pointwise(v)
         q = constrain(built.layout, v)
-        mu = kind === :pin ? q.a .+ q.y.b : q.z.slot
-        sigma = kind === :pin ? q.s : 0.7
+        mu = kind === :observed ? q.a .+ q.y.b : q.z.slot
+        sigma = kind === :observed ? q.s : 0.7
         logpdf.(Normal.(mu, sigma), data[:y])
     end
     function oracle(v)
@@ -116,14 +116,14 @@ function _cap_stream_fd(f, u)
 end
 
 @testset "stream submodels generate latent scalar and cell values" begin
-    for kind in (:vector, :scalar, :cell, :pin)
+    for kind in (:vector, :scalar, :cell, :observed)
         fx = _cap_stream_fixture(kind, 4)
         value, gradient = sampler_value_and_gradient!(fx.sampler, similar(fx.u), fx.u)
         @test value ≈ fx.oracle(fx.u)
         @test gradient ≈ _cap_stream_fd(fx.oracle, fx.u) rtol=6e-6
         @test Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), fx.u).y ≈ fx.pointwise(fx.u)
-        if kind === :pin
-            @test only(fx.bound.responses).predictor === :qpin
+        if kind === :observed
+            @test length(constrain(fx.built.layout, fx.u).y.b) == 4
         else
             slot = constrain(fx.built.layout, fx.u).z.slot
             @test kind === :scalar ? slot isa Float64 : length(slot) == 4
@@ -132,7 +132,7 @@ end
 end
 
 @testset "empty generative stream plates retain their scalar priors" begin
-    for kind in (:vector, :scalar, :cell, :pin)
+    for kind in (:vector, :scalar, :cell, :observed)
         fx = _cap_stream_fixture(kind, 0)
         value, gradient = sampler_value_and_gradient!(fx.sampler, similar(fx.u), fx.u)
         @test value ≈ fx.oracle(fx.u)

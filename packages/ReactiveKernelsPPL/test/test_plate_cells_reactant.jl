@@ -12,24 +12,33 @@ function _pcr_build(n, S)
     model = @rkppl begin
         a ~ Normal(0, 5)
         sigma ~ Exponential(1)
-        r ~ varying_stratified_correlated(g, s, 2)
+        weights[levels(s), 1:2] .~ Normal.(0, 1)
+        z[levels(g), 1:2] .~ Normal.(0, 1)
+        @plate for i in eachindex(y)
+            r[i, 1:2] = weights[s[i], :] .* z[g[i], :]
+        end
         mu = a .+ r[:, 1] .+ x .* r[:, 2]
         y .~ Normal.(mu, sigma)
     end
     bound = (model(; x = collect(range(-1.3, 1.7; length = n)), g = [mod1(i, 4) for i in 1:n], s = [mod1(i, S) for i in 1:n]) | (; y = [0.8 * sin(0.7i) for i in 1:n]))
     built = build_kernel(bound)
     u = [0.3 * sin(1.1i + 0.3) for i in 1:built.layout.total]
-    return Base.invokelatest(_pcr_measure, built, bound, u)
+    return Base.invokelatest(_pcr_measure, built, bound, u; structure_body = true)
 end
 
 function _pcr_measure(built, bound, u; expected = nothing, reference = nothing,
-        structure_ad = false)
+        structure_ad = false, structure_body = false)
     kern = prepare_query(built, bound, :sampler)
     ru = Reactant.to_rarray(u)
     hlo = repr(Reactant.@code_hlo optimize = false kern(ru))
     ops = Dict{String,Int}()
     for m in eachmatch(r"(?:stablehlo|enzyme)\.[a-z_]+", hlo)
         ops[m.match] = get(ops, m.match, 0) + 1
+    end
+    if structure_body
+        inventory = _ppl_backend_operation_inventory(hlo)
+        ops = inventory.body_ops
+        println("array plate complete inventory: ", sort!(collect(inventory.all_ops)))
     end
     native = kern(u)
     compiled = Reactant.@compile kern(ru)
