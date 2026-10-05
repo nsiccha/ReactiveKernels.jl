@@ -530,6 +530,14 @@ broadcast spelling.
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
 
+Literal observation ranges select their authored indices. For example,
+`@plate for i in 2:6` reads `y[2:6]` and the corresponding indexed arguments;
+`3:3` selects one cell, and `1:0` selects none. Every supplied response entry
+must be observed, so entries outside the selection must be `missing`.
+Binding rejects a supplied entry left unobserved, a selected `missing` entry,
+or an index outside the bound array. Skipped missing entries contribute no
+likelihood or pointwise output.
+
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
 agree on its rows. A latent plate follows its authored range, while a scan
