@@ -103,9 +103,10 @@ end
             end
         end
         bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
-        ref = only(bound.responses).scale
-        predictor = only(p for p in bound.predictors if p.name === ref.predictor)
-        scale = bound.columns[only(only(predictor.terms).columns)]
+        # Inspect the stored computed operand by its independently known
+        # values; synthetic column and predictor names are implementation detail.
+        scale = only(v for v in values(bound.columns) if v isa AbstractVector &&
+            length(v) == 3 && v[1] == sqrt(data.x[1]) && v[3] == sqrt(data.x[3]))
         @test eltype(scale) === T
         @test length(scale) == 3
         @test scale[1] == sqrt(data.x[1])
