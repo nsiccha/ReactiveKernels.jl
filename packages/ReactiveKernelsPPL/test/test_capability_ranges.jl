@@ -5,13 +5,40 @@ function _cap_range_fixture(kind, n)
     y = collect(range(-0.2, 0.4; length=n))
     kind === :inactive && n > 1 && (x[2:end] .= -1)
     kind === :longer_inactive && (x = [x; fill(-1.0, n)])
-    data = Dict(:y => kind in (:matrix, :free_matrix, :axis1_matrix_inactive) ? hcat(y, y .+ 10) : y,
+    # Literal loops select their authored rows: an offset tail `2:n` (empty
+    # at n = 0), a single `3:3` row, over a vector or a matrix column.
+    literal = kind in (:literal_tail, :literal_whole, :literal_single, :literal_matrix)
+    rows = kind === :literal_single ? (3:3) : (2:n)
+    data = Dict{Symbol,Any}(:y => kind in (:matrix, :free_matrix, :axis1_matrix_inactive, :literal_matrix) ? hcat(y, y .+ 10) : y,
         :x => kind === :axis1_matrix_inactive ? hcat(x, fill(-1.0, n)) : x)
+    # Every supplied response entry is observed (user decision `1g8uvgs`):
+    # a selection leaves out only `missing` entries.
+    observed = kind in (:top_singleton, :singleton, :inactive, :singleton_latent) ?
+        (1:min(n, 1)) : literal ? rows : (1:n)
+    # A matrix response observed by column (`y[i, 1]`, or `y[i]` over its
+    # first axis) leaves its second column `missing`.
+    if kind in (:matrix, :literal_matrix, :axis1_matrix_inactive)
+        data[:y] = Union{Missing,Float64}[j == 1 && i in observed ? y[i] : missing
+            for i in 1:n, j in 1:2]
+    elseif observed != 1:n
+        data[:y] = Union{Missing,Float64}[i in observed ? y[i] : missing for i in 1:n]
+    end
     ast = quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
     end
-    if kind in (:cross_index, :cross_axis, :colon, :top_singleton)
+    if kind === :literal_whole
+        # A whole value read at the loop index is gathered at those rows.
+        push!(ast.args, :(mu = a .+ b .* x))
+        push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, Expr(:call, :(:), first(rows), last(rows))),
+                Expr(:block, :(y[i] ~ Normal(mu[i], 0.7))))))
+    elseif literal
+        lhs = kind === :literal_matrix ? :(y[i, 1]) : :(y[i])
+        push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
+            Expr(:for, Expr(:(=), :i, Expr(:call, :(:), first(rows), last(rows))),
+                Expr(:block, :(mu = a + b * x[i]), Expr(:call, :~, lhs, :(Normal(mu, 0.7)))))))
+    elseif kind in (:cross_index, :cross_axis, :colon, :top_singleton)
         push!(ast.args, :(mu = a .+ b .* x))
         lhs = kind === :cross_index ? :(y[eachindex(x)]) :
             kind === :cross_axis ? :(y[axes(x, 1)]) :
@@ -42,6 +69,7 @@ function _cap_range_fixture(kind, n)
     function pointwise(v)
         p = constrain(built.layout, v)
         kind === :free_matrix && return Float64[]
+        literal && return [logpdf(Normal(p.a + p.b*x[i], 0.7), y[i]) for i in rows]
         kind === :singleton_latent && return [logpdf(Normal(p.theta[i] + p.b*x[i], 0.7), y[i]) for i in axes(y, 2)]
         if kind in (:longer_inactive, :axis1_matrix_inactive)
             return [logpdf(Normal(p.a + p.b*sqrt(x[i]), 0.7), y[i]) for i in eachindex(y)]
@@ -69,7 +97,8 @@ function _cap_range_fd(f, u)
 end
 
 @testset "response ranges preserve Julia indexing and selected cells" begin
-    for kind in (:cross_index, :cross_axis, :colon, :top_singleton, :cross_cell, :singleton, :inactive, :matrix, :singleton_latent, :free_matrix, :longer_inactive, :axis1_matrix_inactive)
+    for kind in (:cross_index, :cross_axis, :colon, :top_singleton, :cross_cell, :singleton, :inactive, :matrix, :singleton_latent, :free_matrix, :longer_inactive, :axis1_matrix_inactive,
+            :literal_tail, :literal_whole, :literal_single, :literal_matrix)
         fx = _cap_range_fixture(kind, 4)
         value, gradient = sampler_value_and_gradient!(fx.sampler, similar(fx.u), fx.u)
         @test value ≈ fx.oracle(fx.u)
@@ -86,11 +115,61 @@ end
 end
 
 @testset "empty indexed observation loops" begin
-    for kind in (:cross_index, :cross_axis, :colon, :cross_cell, :matrix, :free_matrix)
+    for kind in (:cross_index, :cross_axis, :colon, :cross_cell, :matrix, :free_matrix,
+            :literal_tail, :literal_whole, :literal_matrix)
         fx = _cap_range_fixture(kind, 0)
         value, gradient = sampler_value_and_gradient!(fx.sampler, similar(fx.u), fx.u)
         @test value ≈ fx.oracle(fx.u)
         @test gradient ≈ _cap_range_fd(fx.oracle, fx.u) rtol=5e-6
         @test Base.invokelatest(prepare_query(fx.built, fx.bound, :likelihood), fx.u) == 0
+    end
+end
+
+@testset "literal plate ranges observe Julia indexing" begin
+    x, y = collect(range(0.2, 0.8; length=6)), collect(range(-0.2, 0.4; length=6))
+    loop(R) = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        @plate for i in $R
+            mu = a + b * x[i]
+            y[i] ~ Normal(mu, 0.7)
+        end
+    end
+    # Nonempty bound arrays can have no observed cells. The selected values,
+    # pointwise output and reverse still follow the authored six-row indices.
+    for (R, rows) in ((:(2:6), 2:6), (:(3:3), 3:3), (:(1:0), 1:0), (:(5:4), 5:4))
+        data = (; x, y = Union{Missing,Float64}[
+            i in rows ? y[i] : missing for i in eachindex(y)])
+        saved = deepcopy(data)
+        bound = bind_data(lower_rkppl(loop(R), data; conditioned = keys(data)), data)
+        built = build_kernel(bound)
+        u = unconstrain(built.layout, (; a = 0.25, b = -0.3))
+        pointwise(v) = [logpdf(Normal(v[1] + v[2] * x[i], 0.7), y[i]) for i in rows]
+        oracle(v) = logpdf(Normal(), v[1]) + logpdf(Normal(), v[2]) +
+            sum(pointwise(v); init = 0.0)
+        sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u)
+        @test gradient ≈ _cap_range_fd(oracle, u) rtol = 5e-6
+        output = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        @test output.y ≈ pointwise(u)
+        @test length(output.y) == length(rows)
+        @test isequal(data, saved)
+    end
+    # refused: the loop leaves the supplied `y[1]` (or `y[5:6]`) unobserved
+    # (user decision `1g8uvgs`: every supplied response entry is observed).
+    for R in (:(2:6), :(1:4))
+        plan = lower_rkppl(loop(R), (; y, x); conditioned=(:y, :x))
+        @test_throws ContractValidationError bind_data(plan, (; y, x))
+    end
+    # refused: a selected entry is missing (only unselected entries may be).
+    ym = Union{Missing,Float64}[i == 3 ? missing : y[i] for i in 1:6]
+    @test_throws ContractValidationError bind_data(lower_rkppl(loop(:(1:6)),
+        (; y = ym, x); conditioned=(:y, :x)), (; y = ym, x))
+    for R in (:(2:7), :(0:3))
+        plan = lower_rkppl(loop(R), (; y, x); conditioned=(:y, :x))
+        # refused: the loop reads `y[7]` / `y[0]` outside the six bound rows
+        # (standing @rkppl language principle 3: Julia indexing safety).
+        @test_throws ContractValidationError bind_data(plan, (; y, x))
     end
 end

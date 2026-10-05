@@ -6,6 +6,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 include("test_authored_plate_chains_ad.jl")
 include("test_scan_plate_ad.jl")
 include("test_plate_consumer_native_ad.jl")
+include("test_native_concat_ad.jl")
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 

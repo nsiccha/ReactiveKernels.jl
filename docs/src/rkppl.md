@@ -530,6 +530,14 @@ broadcast spelling.
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
 
+Literal observation ranges select their authored indices. For example,
+`@plate for i in 2:6` reads `y[2:6]` and the corresponding indexed arguments;
+`3:3` selects one cell, and `1:0` selects none. Every supplied response entry
+must be observed, so entries outside the selection must be `missing`.
+Binding rejects a supplied entry left unobserved, a selected `missing` entry,
+or an index outside the bound array. Skipped missing entries contribute no
+likelihood or pointwise output.
+
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
 agree on its rows. A latent plate follows its authored range, while a scan
@@ -692,6 +700,13 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.
+- `constrain`, `unconstrain` and `logjac` follow the number type of their
+  input: `BigFloat` input gives `BigFloat` values, and other number types,
+  such as dual numbers, pass through the transforms unchanged. Plain reals
+  give `Float64` values, as before. Caller-owned parameter geometry receives
+  the same numbers in its endpoints. Generic number support does not establish
+  native Enzyme support for these layout-based calls; use `prepare_sampler`
+  for posterior gradients through the model graph.
 - Explicit parameter declarations keep their authored names. For
   `a ~ Normal(0, 1); b ~ Normal(0, 2); mu = a .+ b .* x`, the coordinates
   are `a`, `b` and the constrained values are `nt.a`, `nt.b`.

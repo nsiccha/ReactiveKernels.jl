@@ -10,17 +10,27 @@ function _prv_fixture(kind, n; unbound = nothing)
         b ~ Normal(0, 2)
         r[levels(g)] .~ Normal.(0, 1)
     end
-    if kind === :alias
-        push!(ast.args, :(mu = a .+ r[g]))
-    end
+    # Computed cell arguments read the top-level definition `mu` at the
+    # loop index, for every observation iterator and argument position.
+    alias = kind in (:alias, :alias_literal, :alias_axes, :alias_local, :alias_scale)
+    alias && push!(ast.args, :(mu = a .+ r[g]))
     selected = kind === :selected
     selected && n > 1 && (x[2:end] .= -1.0)
-    iterator = selected ? :(axes(y, 2)) : :(eachindex(y))
+    iterator = selected ? :(axes(y, 2)) : kind === :alias_literal ? :(1:$n) :
+        kind === :alias_axes ? :(axes(y, 1)) : :(eachindex(y))
     value = selected ? :(a + r[g[i]] + b * sqrt(x[i])) :
-        kind === :alias ? :(mu[i] + b * x[i]) : :(a + r[g[i]] + b * x[i])
+        alias ? :(mu[i] + b * x[i]) : :(a + r[g[i]] + b * x[i])
+    cell = kind === :alias_local ?
+        Expr(:block, :(m = $value), :(y[i] ~ Normal(m, 0.7))) :
+        kind === :alias_scale ?
+        Expr(:block, :(y[i] ~ Normal(b * x[i], exp(0.2 * mu[i])))) :
+        Expr(:block, :(y[i] ~ Normal($value, 0.7)))
     push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
-        Expr(:for, :(i = $iterator), Expr(:block, :(y[i] ~ Normal($value, 0.7))))))
-    data = Dict(:x => x, :y => y, :g => g)
+        Expr(:for, :(i = $iterator), cell)))
+    # Every supplied response entry must be observed (USER `1g8uvgs`).
+    observed_y = selected ? Union{Missing,Float64}[i == 1 ? y[i] : missing
+        for i in eachindex(y)] : y
+    data = Dict(:x => x, :y => observed_y, :g => g)
     unbound === nothing && (unbound = lower_rkppl(ast, data; conditioned = keys(data)))
     bound = bind_data(unbound, data)
     built = build_kernel(bound)
@@ -28,6 +38,8 @@ function _prv_fixture(kind, n; unbound = nothing)
     function pointwise(v)
         q = constrain(built.layout, v)
         indices = selected ? axes(y, 2) : eachindex(y)
+        kind === :alias_scale && return [logpdf(Normal(q.b * x[i],
+            exp(0.2 * (q.a + q.r[g[i]]))), y[i]) for i in indices]
         [logpdf(Normal(q.a + q.r[g[i]] +
             q.b * (selected ? sqrt(x[i]) : x[i]), 0.7), y[i]) for i in indices]
     end
@@ -77,7 +89,8 @@ function _prv_fd(f, u)
 end
 
 @testset "retained plate response values: native math and ownership" begin
-    for kind in (:direct, :alias, :selected, :bare)
+    for kind in (:direct, :alias, :alias_literal, :alias_axes, :alias_local,
+            :alias_scale, :selected, :bare)
         for n in (3, 9)
             fx = kind === :bare ? _prv_bare(n) : _prv_fixture(kind, n)
             saved = deepcopy(fx.data)
@@ -91,7 +104,7 @@ end
                 pw = Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), u)
                 @test pw.y ≈ fx.pointwise(u)
             end
-            @test fx.data == saved
+            @test isequal(fx.data, saved)
         end
     end
 end
