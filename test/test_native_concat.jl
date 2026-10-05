@@ -94,6 +94,14 @@ end
 @kernel shadowed_port(hcat, a, b) = begin
     result = hcat(a, b)
 end
+@kernel shadowed_module_port(Base, a, b) = begin
+    result = (Base.hcat(a, b), Base.vcat(a, b), Base.hvcat((2,), a, b))
+end
+@kernel shadowed_module_local(a, b) = begin
+    result = let Base = (; hcat = (x, y) -> x .+ y)
+        Base.hcat(a, b)
+    end
+end
 @kernel other_function(a, b) = begin
     result = OtherConcat.hcat(a, b)
 end
@@ -113,6 +121,11 @@ end
     @test prepare(recipe; bound = (; a))(b) == hcat(a, b)
     @test prepare(shadowed_local)(a, b) == a .+ b
     @test prepare(shadowed_port)((x, y) -> x .- y, a, b) == a .- b
+    alternate = (; hcat = (x, y) -> x .- y, vcat = (x, y) -> x .* y,
+                   hvcat = (rows, x, y) -> x .+ y)
+    @test prepare(shadowed_module_port)(alternate, a, b) ==
+          (a .- b, a .* b, a .+ b)
+    @test prepare(shadowed_module_local)(a, b) == a .+ b
     @test prepare(other_function)(a, b) === :other
     @test prepare(cell_vcat)([1.0, 2.0, 3.0], [0.5, 0.25]) ≈ 3 * 0.75 + 12.0
     @test_throws DimensionMismatch prepare(recipe)([1.0, 2.0], [3.0])

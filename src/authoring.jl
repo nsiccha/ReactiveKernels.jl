@@ -2589,13 +2589,19 @@ function _kernel_native_concats(ex, mod, shadowed::Set{Symbol})
     elseif ex.head === :call && !isempty(args) &&
            !any(arg -> arg isa Expr && arg.head === :parameters, args)
         callee = ex.args[1]
-        replacement = callee isa Symbol && callee in shadowed ? nothing :
+        replacement = _native_concat_shadowed(callee, shadowed) ? nothing :
             _native_concat_replacement(callee, mod)
         replacement === nothing ||
             return Expr(:call, GlobalRef(@__MODULE__, replacement), args[2:end]...)
     end
     Expr(ex.head, args...)
 end
+
+_native_concat_shadowed(callee, shadowed) = false
+_native_concat_shadowed(callee::Symbol, shadowed) = callee in shadowed
+_native_concat_shadowed(callee::Expr, shadowed) =
+    callee.head === :. && !isempty(callee.args) &&
+    _native_concat_shadowed(callee.args[1], shadowed)
 
 _native_concat_function_replacement(fn) =
     fn === Base.hcat ? :_native_hcat :
