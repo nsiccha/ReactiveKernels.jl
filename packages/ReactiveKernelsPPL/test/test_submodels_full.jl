@@ -4,7 +4,7 @@ using ReactiveKernelsPPL
 using Test
 
 # Full submodels: nested calls, indexed / sized priors, `@plate` / `@scan` /
-# construct statements and data / vector arguments inside bodies. Expansion
+# data / vector arguments inside bodies. Expansion
 # is transparent: submodels and their hand-inlined twins retain the same
 # authored math. Matching plan forms compare canonical serialization
 # (`_canon`, test_corpus.jl); retained per-cell values compare densities and
@@ -29,7 +29,7 @@ function _smf_outcome(ast, data; mod = _SMF)
 end
 
 function _smf_expand(ast, data = Set{Symbol}())
-    expanded, _, scopes = ReactiveKernelsPPL._expand_submodels(ast,
+    expanded, scopes = ReactiveKernelsPPL._expand_submodels(ast,
         Set{Symbol}(data), _SMF; with_scopes = true)
     return _test_scope_alpha(expanded, _test_scope_renames(scopes))
 end
@@ -88,21 +88,15 @@ end
     end
     return h
 end
-@rkppl smf_ranef(gg) = begin
-    r ~ varying_effect(gg, [1])
-    return r
+_smf_transform(xx; k, kind) = kind === :plain ? k .* xx : xx
+@rkppl smf_transform(xx) = begin
+    return _smf_transform(xx; k = 4, kind = :plain)
 end
-@rkppl smf_spline(xx) = begin
-    spline_basis(:s_in, xx; k = 4)
-    return spline(:s_in)
-end
-@rkppl smf_r2d2(mu, R2, phi) = begin
-    r2d2(mu, R2, phi)
-    return mu
+@rkppl smf_scale(mu, R2, phi) = begin
+    return mu .* sqrt(phi[1] * R2)
 end
 @rkppl smf_kw(xx, k) = begin
-    spline_basis(:s, xx; k, kind = :tps)
-    return spline(:s)
+    return _smf_transform(xx; k, kind = :plain)
 end
 @rkppl smf_rec_a(x) = begin
     v ~ smf_rec_b(x)
@@ -217,15 +211,14 @@ end
         [:(a_h[a_t] ~ Normal(phi * a_h[a_t - 1], s))]
     @test got[2] == :(a = a_h)
 
-    # A declared basis id is a body name (declaration and use); keyword names
-    # and other quoted symbols are untouched; a bare keyword shorthand whose
-    # name is an argument expands to `k = <argument>`.
+    # Function keywords and quoted symbols remain unchanged. A shorthand
+    # keyword whose value is an argument receives the call argument.
     got = _smf_stmts(_smf_expand(quote
         f ~ smf_kw(x, 4)
     end, (:x,)))
+    fn = GlobalRef(_SMF, :_smf_transform)
     @test got == _smf_stmts(quote
-        spline_basis(:f_s, x; k = 4, kind = :tps)
-        f = spline(:f_s)
+        f = $fn(x; k = 4, kind = :plain)
     end)
 
     # Per-cell nesting composes per cell: a direct-bound slot that is itself a
@@ -381,34 +374,18 @@ end
     end
     @test _smf_outcome(subs, (:y,)) == _smf_outcome(twins, (:y,))
 
-    # Construct statements inside bodies (probes S3, S5, S2) and probe S6
-    # (random intercept beside a population intercept): each expands to its
-    # hand-inlined twin, so it lowers — or is refused — exactly as the twin.
+    # Caller-defined functions and explicit priors inside bodies expand to
+    # their hand-inlined twins with the same lowering outcome.
     for (sub, twin) in (
         (quote
             a ~ Normal(0, 5)
-            rr ~ smf_ranef(g)
-            sigma ~ Exponential(1)
-            mu = a .+ rr
-            y .~ Normal.(mu, sigma)
-        end, quote
-            a ~ Normal(0, 5)
-            rr_r ~ varying_effect(g, [1])
-            rr = rr_r
-            sigma ~ Exponential(1)
-            mu = a .+ rr
-            y .~ Normal.(mu, sigma)
-        end),
-        (quote
-            a ~ Normal(0, 5)
-            f ~ smf_spline(x)
+            f ~ smf_transform(x)
             sigma ~ Exponential(1)
             mu = a .+ f
             y .~ Normal.(mu, sigma)
         end, quote
             a ~ Normal(0, 5)
-            spline_basis(:f_s_in, x; k = 4)
-            f = spline(:f_s_in)
+            f = _smf_transform(x; k = 4, kind = :plain)
             sigma ~ Exponential(1)
             mu = a .+ f
             y .~ Normal.(mu, sigma)
@@ -419,7 +396,7 @@ end
             R2 ~ Beta(1.0, 1.0)
             phi ~ Dirichlet([1.0])
             m0 = a .+ b1 .* x
-            m ~ smf_r2d2(m0, R2, phi)
+            m ~ smf_scale(m0, R2, phi)
             sigma ~ Exponential(1)
             y .~ Normal.(m, sigma)
         end, quote
@@ -428,8 +405,7 @@ end
             R2 ~ Beta(1.0, 1.0)
             phi ~ Dirichlet([1.0])
             m0 = a .+ b1 .* x
-            r2d2(m0, R2, phi)
-            m = m0
+            m = m0 .* sqrt(phi[1] * R2)
             sigma ~ Exponential(1)
             y .~ Normal.(m, sigma)
         end),
@@ -613,7 +589,7 @@ end
         y .~ Normal.(v, 1.0)
     end, D; mod = _SMF, conditioned = D))
     # refused: predictor= is retired by the author-name contract (1cmodra names).
-    @test !isempty(msg)
+    @test occursin("unknown keyword `predictor`", msg)
     # A per-cell body holds scalar statements only.
     msg = _smf_errmsg(() -> lower_rkppl(Expr(:block,
         :(sigma ~ Exponential(1)),

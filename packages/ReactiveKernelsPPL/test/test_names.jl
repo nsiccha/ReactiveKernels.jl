@@ -26,7 +26,6 @@ const _NM_DATA = Dict{String,Dict{Symbol,Any}}(
     "02_bernoulli_logit" => Dict{Symbol,Any}(:y => _NM_BIN),
     "73_uniform_coefs" => Dict{Symbol,Any}(:y => _NM_BIN, :z => -_NM_X),
     "20_ordered_logistic_explicit" => Dict{Symbol,Any}(:y => _NM_ORD),
-    "20_ordered_logistic_submodel" => Dict{Symbol,Any}(:y => _NM_ORD),
     "21_ordinal_explicit" => Dict{Symbol,Any}(:y => _NM_ORD))
 
 # The corpus programs written in plain statements and library submodels:
@@ -35,7 +34,7 @@ const _NM_DATA = Dict{String,Dict{Symbol,Any}}(
 # belong to their library lanes).
 const _NM_BATTERY = [
     "01_gaussian", "02_bernoulli_logit", "09_plate_loop", "10_levels_prior",
-    "20_ordered_logistic_explicit", "20_ordered_logistic_submodel",
+    "20_ordered_logistic_explicit",
     "21_ordinal_explicit", "34_me", "46_matrix_gaussian", "55_student",
     "70_lognormal", "72_centered_levels", "73_uniform_coefs",
     "74_derived_response", "95_array_lkj_cholesky",

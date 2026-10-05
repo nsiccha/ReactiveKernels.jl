@@ -1,9 +1,9 @@
 using Reactant
 
-@testset "Horseshoe scale aliases retain primal and reverse structure" begin
+@testset "computed coefficient scale aliases retain primal and reverse structure" begin
     operations = Dict{String,Tuple{Vector{String},Vector{String}}}()
     for n in (3, 7), negative in (false, true), normal_scale in (false, true), linked in (false, true)
-        f = _distributional_horseshoe_fixture(n; negative, normal_scale, linked)
+        f = _distributional_product_fixture(n; negative, normal_scale, linked)
         model = _distributional_model(f.ast, f.data)
         kernel = model.kernel
         ru = Reactant.to_rarray(f.u)

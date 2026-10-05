@@ -125,18 +125,25 @@ end
     @test sizes[3] < 3sizes[2]
 end
 
-@testset "Empty scan type queries stay in the empty arm" begin
+# The inferred output type allocates the scan's one buffer before the
+# emptiness branch (see `_lower_authored_scan_native!`), so its shared
+# queries are bound once there and neither arm repeats them.
+@testset "Scan output type queries precede the emptiness branch" begin
     F = NativeTypeQueryFixtures
     for depth in (4, 8, 16)
         reader = prepare(F.scanned(depth))
         ast = code_expr(reader)
         @test F.count_head(ast, :for) == 1
-        guard = only(ex for ex in ast.args[2].args if ex isa Expr &&
+        statements = ast.args[2].args
+        position = only(i for (i, ex) in enumerate(statements) if ex isa Expr &&
             ex.head === :if && ex.args[1] isa Expr &&
             ex.args[1].head === :call && ex.args[1].args[1] == GlobalRef(Base, :isempty))
-        @test F.count_query(guard.args[2]) > 0
+        guard = statements[position]
+        @test F.count_query(guard.args[2]) == 0
         @test F.count_query(guard.args[3]) == 0
-        @test F.count_query(ast) == F.count_query(guard.args[2])
+        @test F.count_query(Expr(:block, statements[1:(position - 1)]...)) > 0
+        @test F.count_query(ast) ==
+            F.count_query(Expr(:block, statements[1:(position - 1)]...))
         for T in (Float32, Float64), n in (0, 3, 17)
             xs, gain = T.(sin.(1.0:n)), T(1.3)
             original = copy(xs)

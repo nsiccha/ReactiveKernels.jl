@@ -482,6 +482,18 @@ end
 # step's output type and a fused plate consumer sums nothing. An
 # `include_init = true` scan writes the carry seed and then each output into
 # one buffer one element longer than the sequences (`[init]` when empty).
+#
+# When the step's inferred output type is concrete, the first output has
+# exactly that type, so each buffer is allocated once with it, before the
+# emptiness branch, and both arms return that one allocation. Two buffers
+# allocated in separate arms would meet in one SSA value, which Enzyme's
+# static activity analysis rejects once the empty arm's buffer is never
+# written with active data (`EnzymeRuntimeActivityError`;
+# `benchmark/repro_enzyme_branch_allocation_phi.jl`). Allocating after a
+# branch that peels the first step to type the buffer does not avoid it: the
+# optimizer splits that allocation back into the arms. An inferred type that
+# is not concrete (`Any` for a nested step) keeps one allocation per arm,
+# typed by the first output when there is one.
 function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                                       offset; consumer = nothing, recycled = nothing,
                                       pointwise_recycled = nothing)
@@ -524,42 +536,51 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     for i in shared_positions
         push!(step_input_types, Expr(:call, typeof_ref, callargs[i]))
     end
-    empty_output_type = something(
+    inferred_output_type = something(
         _authored_scan_step_output_type(step, step_input_types, offset), Any)
     invariant = Any[]
-    initial_output, loop_output, final_output = Expr(:block), Expr(:block), Expr(:block)
-    empty_output = Expr(:block)
-    empty_output_type = only(_bind_native_type_exprs!(empty_output, [empty_output_type]))
-    push!(empty_output.args, :($output_type = $empty_output_type))
+    # `typing` runs before the emptiness branch: it binds the inferred output
+    # type and, when that type is concrete, allocates every buffer. Each arm
+    # allocates a buffer that is still `nothing`; with a concrete type that
+    # test folds away and both arms return the one preallocated buffer.
+    typing = Expr(:block)
+    empty_output, initial_output = Expr(:block), Expr(:block)
+    loop_output, final_output = Expr(:block), Expr(:block)
+    inferred_output_type = only(_bind_native_type_exprs!(typing, [inferred_output_type]))
+    push!(typing.args, :($output_type = $inferred_output_type))
+    concrete = gensym(:scan_concrete_output)
+    push!(typing.args, :($concrete = $(GlobalRef(Base, :isconcretetype))($output_type)))
+    push!(initial_output.args, :($output_type = $typeof_ref($output)))
+    function buffer!(name, allocation)
+        push!(typing.args, :($name = $concrete ? $allocation : nothing))
+        for block in (empty_output, initial_output)
+            push!(block.args, :($name === nothing && ($name = $allocation)))
+        end
+    end
+    axes_ref = GlobalRef(Base, :axes)
     if lhs !== nothing && _scan_includes_init(op)
         seed, similar_ref = callargs[1], GlobalRef(Base, :similar)
         promote_ref, length_ref = GlobalRef(Base, :promote_type), GlobalRef(Base, :length)
-        trajectory_type = :($promote_ref($typeof_ref($seed), $typeof_ref($output)))
+        trajectory_type = :($promote_ref($typeof_ref($seed), $output_type))
         allocation = :($similar_ref($xs, $trajectory_type, $length_ref($indices) + 1))
-        push!(initial_output.args, :($lhs = $(recycled === nothing ? allocation :
-            _lane_allocation(recycled, trajectory_type,
-                :(($(GlobalRef(Base, :OneTo))($length_ref($indices) + 1),)), allocation))))
-        push!(initial_output.args, :($lhs[1] = $seed))
+        buffer!(lhs, recycled === nothing ? allocation : _lane_allocation(recycled,
+            trajectory_type, :(($(GlobalRef(Base, :OneTo))($length_ref($indices) + 1),)),
+            allocation))
+        for block in (empty_output, initial_output)
+            push!(block.args, :($lhs[1] = $seed))
+        end
         push!(initial_output.args, :($lhs[2] = $output))
         push!(initial_output.args, :($position = 2))
         push!(loop_output.args, :($position += 1))
         # `position` stays within the `length(indices) + 1` buffer.
         push!(loop_output.args, _inbounds_expr(:($lhs[$position] = $output)))
-        push!(empty_output.args, :($lhs = $similar_ref($xs,
-            $promote_ref($typeof_ref($seed), $output_type), 1)))
-        push!(empty_output.args, :($lhs[1] = $seed))
     elseif lhs !== nothing
-        allocation = :($(GlobalRef(Base, :similar))($xs, $typeof_ref($output)))
-        push!(initial_output.args, :($lhs = $(recycled === nothing ? allocation :
-            _lane_allocation(recycled, :($typeof_ref($output)),
-                :($(GlobalRef(Base, :axes))($xs)), allocation))))
+        allocation = :($(GlobalRef(Base, :similar))($xs, $output_type))
+        buffer!(lhs, recycled === nothing ? allocation :
+            _lane_allocation(recycled, output_type, :($axes_ref($xs)), allocation))
         push!(initial_output.args, :($lhs[$index] = $output))
         # The buffer shares the sequences' axes, which `index` comes from.
         push!(loop_output.args, _inbounds_expr(:($lhs[$index] = $output)))
-        empty_allocation = :($(GlobalRef(Base, :similar))($xs, $output_type))
-        push!(empty_output.args, :($lhs = $(recycled === nothing ? empty_allocation :
-            _lane_allocation(recycled, output_type,
-                :($(GlobalRef(Base, :axes))($xs)), empty_allocation))))
     end
     if consumer !== nothing
         cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
@@ -571,17 +592,14 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         # Match ordinary plate lowering's inferred result type, including
         # heterogeneous cells; the first value alone cannot type that buffer.
         plate_eltype = gensym(:scan_plate_eltype)
-        push!(initial_output.args, :($output_type = $typeof_ref($output)))
-        for block in (initial_output, empty_output)
+        for block in (typing, initial_output)
             push!(block.args, :($plate_eltype = $cell_type))
         end
         if pointwise_lhs !== nothing
             allocation = :($(GlobalRef(Base, :similar))($xs, $plate_eltype))
-            push!(initial_output.args, :($pointwise_lhs = $(
-                pointwise_recycled === nothing ? allocation :
+            buffer!(pointwise_lhs, pointwise_recycled === nothing ? allocation :
                 _lane_allocation(pointwise_recycled, plate_eltype,
-                    :($(GlobalRef(Base, :axes))($xs)), allocation))))
-            push!(empty_output.args, :($pointwise_lhs = $allocation))
+                    :($axes_ref($xs)), allocation))
             push!(initial_output.args, :($pointwise_lhs[$index] = $cell_output))
             push!(loop_output.args, :($pointwise_lhs[$index] = $cell_output))
             push!(final_output.args, :($pointwise_lhs =
@@ -597,6 +615,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     # sequence shares axes, giving the lockstep length check for free.
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
     append!(body.args, invariant)
+    append!(body.args, typing.args)
     nonempty = Expr(:block)
     push!(nonempty.args, :($carry = $(callargs[1])))
     push!(nonempty.args, :($index = $(GlobalRef(Base, :first))($indices)))
@@ -3968,6 +3987,9 @@ catch
 end
 _opname(::_AuthoredPlateOp) = "plate"
 _opname(::_AuthoredScanOp) = "scan"
+# Captured `@kernel` source is shown through its recipe's retained source
+# (`_recipe_label`, display.jl); the operation object itself is only "source".
+_opname(::_KernelSourceOp) = "source"
 
 function _readable_callee(op)
     name = try
@@ -4077,6 +4099,7 @@ function _recipe_line(r::Recipe)
         suffix = _unpack_access_suffix(r.op)
         suffix !== nothing && return "$outs = $(only(r.inputs).name)$suffix"
     end
+    r.op isa _KernelSourceOp && _has_source(r) && return "$outs = $(_recipe_label(r))"
     "$outs = $(_opname(r.op))($ins)"
 end
 

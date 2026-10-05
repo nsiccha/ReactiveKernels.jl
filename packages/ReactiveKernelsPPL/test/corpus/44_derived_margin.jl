@@ -1,9 +1,0 @@
-# data: y x z g
-begin
-    a ~ Normal(0, 5)
-    sigma ~ Exponential(1)
-    w = x .* z
-    r ~ varying_effect(g, [1, w])
-    mu = a .+ r
-    y .~ Normal.(mu, sigma)
-end

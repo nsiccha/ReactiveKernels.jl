@@ -13,10 +13,14 @@ const _CORPUS_GOLDEN_DIR = joinpath(_CORPUS_DIR, "golden")
 # Generic canonical serializer: fixed field order, sorted dict keys, no
 # line numbers, no memory addresses. New meaningful IR fields change the
 # output; empty optional metadata preserves existing snapshots.
-function _canon(io::IO, x, depth::Int = 0)
+function _canon(io::IO, x, depth::Int = 0, names = nothing)
     depth > 60 && (print(io, "<depth>"); return)
     if x === nothing || x === missing
         print(io, repr(x))
+    elseif x isa Symbol && names !== nothing && _corpus_private_selected(x, names) !== nothing
+        prefix, binder = _corpus_private_selected(x, names)
+        index = get!(names.selected, binder, length(names.selected) + 1)
+        print(io, isempty(prefix) ? "private_selected(" : "private_selected_index(", index, ")")
     elseif x isa Union{Bool, Symbol, Number, Char, String}
         print(io, repr(x))
     elseif x isa LineNumberNode
@@ -26,7 +30,7 @@ function _canon(io::IO, x, depth::Int = 0)
         for a in x.args
             a isa LineNumberNode && continue
             print(io, " ")
-            _canon(io, a, depth + 1)
+            _canon(io, a, depth + 1, names)
         end
         print(io, ")")
     elseif x isa GlobalRef
@@ -35,7 +39,7 @@ function _canon(io::IO, x, depth::Int = 0)
         print(io, "GlobalRef(", nameof(x.mod), ".", x.name, ")")
     elseif x isa QuoteNode
         print(io, "quote(")
-        _canon(io, x.value, depth + 1)
+        _canon(io, x.value, depth + 1, names)
         print(io, ")")
     elseif x isa AbstractUnitRange
         print(io, repr(first(x)), ":", repr(last(x)))
@@ -44,21 +48,21 @@ function _canon(io::IO, x, depth::Int = 0)
         for (i, k) in enumerate(keys(x))
             i > 1 && print(io, " ")
             print(io, k, "=")
-            _canon(io, x[k], depth + 1)
+            _canon(io, x[k], depth + 1, names)
         end
         print(io, ")")
     elseif x isa Tuple
         print(io, "(")
         for (i, v) in enumerate(x)
             i > 1 && print(io, " ")
-            _canon(io, v, depth + 1)
+            _canon(io, v, depth + 1, names)
         end
         print(io, ")")
     elseif x isa AbstractArray
         print(io, "[")
         for (i, v) in enumerate(x)
             i > 1 && print(io, " ")
-            _canon(io, v, depth + 1)
+            _canon(io, v, depth + 1, names)
         end
         print(io, "]")
     elseif x isa AbstractDict
@@ -66,9 +70,9 @@ function _canon(io::IO, x, depth::Int = 0)
         ks = sort!(collect(keys(x)); by = repr)
         for (i, k) in enumerate(ks)
             i > 1 && print(io, " ")
-            _canon(io, k, depth + 1)
+            _canon(io, k, depth + 1, names)
             print(io, "=>")
-            _canon(io, x[k], depth + 1)
+            _canon(io, x[k], depth + 1, names)
         end
         print(io, "}")
     elseif x isa Type
@@ -109,11 +113,40 @@ function _canon(io::IO, x, depth::Int = 0)
             for (i, f) in enumerate(fs)
                 i > 1 && print(io, " ")
                 print(io, f, "=")
-                _canon(io, getfield(x, f), depth + 1)
+                _canon(io, getfield(x, f), depth + 1, names)
             end
             print(io, ")")
         end
     end
+end
+
+# Only private selected-plate binders are alpha-equivalent. Authored symbols,
+# including quoted names with the same spelling, remain literal; numeric types
+# and every other plan field keep the generic serializer's representation.
+function _corpus_authored_names!(names, x)
+    if x isa Symbol
+        push!(names, x)
+    elseif x isa Expr
+        foreach(a -> _corpus_authored_names!(names, a), x.args)
+    elseif x isa QuoteNode
+        _corpus_authored_names!(names, x.value)
+    end
+    return names
+end
+
+function _corpus_private_selected(x::Symbol, names)
+    x in names.authored && return nothing
+    match_name = match(r"^(_ppl_pi_)?(##_rkppl_selected#\d+)$", String(x))
+    match_name === nothing && return nothing
+    binder = Symbol(match_name.captures[2])
+    binder in names.authored && return nothing
+    return something(match_name.captures[1], ""), binder
+end
+
+function _corpus_canon(io::IO, plan, ast)
+    names = (; authored = _corpus_authored_names!(Set{Symbol}(), ast),
+        selected = Dict{Symbol,Int}())
+    _canon(io, plan, 0, names)
 end
 
 function _load_corpus_case(path::String)
@@ -154,6 +187,38 @@ end
     @test sprint(_canon, trials) != sprint(_canon, other_trials)
 end
 
+@testset "corpus private binder alpha equivalence" begin
+    authored = Symbol("##_rkppl_selected#17")
+    ast = Expr(:block, QuoteNode(authored))
+    first_names = Expr(:tuple, Symbol("##_rkppl_selected#21"), authored,
+        Symbol("##_rkppl_selected#21"), Symbol("##_rkppl_selected#22"))
+    later_names = Expr(:tuple, Symbol("##_rkppl_selected#101"), authored,
+        Symbol("##_rkppl_selected#101"), Symbol("##_rkppl_selected#102"))
+    canonical = sprint(_corpus_canon, first_names, ast)
+    @test canonical == sprint(_corpus_canon, later_names, ast)
+    @test occursin(repr(authored), canonical)
+    @test count("private_selected(1)", canonical) == 2
+    @test count("private_selected(2)", canonical) == 1
+    indexed = Expr(:tuple, Symbol("##_rkppl_selected#21"),
+        Symbol("_ppl_pi_##_rkppl_selected#21"))
+    @test sprint(_corpus_canon, indexed, ast) ==
+        "Expr(:tuple private_selected(1) private_selected_index(1))"
+    @test sprint(_corpus_canon, 1, ast) != sprint(_corpus_canon, 1.0, ast)
+    @test sprint(_corpus_canon, Symbol("user21"), ast) !=
+        sprint(_corpus_canon, Symbol("user101"), ast)
+
+    selected_ast, data = _load_corpus_case(joinpath(_CORPUS_DIR,
+        "99_plate_73_beta.jl"))
+    first_plan = lower_rkppl(selected_ast, data; conditioned = data)
+    for _ in 1:7
+        gensym(:_rkppl_selected)
+    end
+    later_plan = lower_rkppl(selected_ast, data; conditioned = data)
+    @test sprint(_canon, first_plan) != sprint(_canon, later_plan)
+    @test sprint(_corpus_canon, first_plan, selected_ast) ==
+        sprint(_corpus_canon, later_plan, selected_ast)
+end
+
 @testset "corpus drift guard" begin
     cases = sort!(filter(f -> endswith(f, ".jl"),
         readdir(_CORPUS_DIR; join = true)))
@@ -164,7 +229,7 @@ end
         @testset "$name" begin
             ast, data = _load_corpus_case(path)
             plan = lower_rkppl(ast, data; conditioned = data)
-            canon = sprint(_canon, plan) * "\n"
+            canon = sprint(_corpus_canon, plan, ast) * "\n"
             golden = joinpath(_CORPUS_GOLDEN_DIR, name * ".canon")
             if rebless
                 mkpath(_CORPUS_GOLDEN_DIR)
@@ -181,46 +246,6 @@ end
                     end
                 end
             end
-        end
-    end
-end
-
-@testset "varying default keywords canonical parity" begin
-    # A varying block's plan is a function of what is written, never of
-    # whether a default-valued keyword is present: spelling each keyword
-    # at its default gives the byte-identical unbound plan omitting it
-    # gives — K=1 intercept, K=1 slope, K=2, multi-membership and
-    # stratified grouping alike.
-    data = (:y, :x, :g, :g1, :g2, :b)
-    function prog(group, margins, kws::Vector{Pair{Symbol,Any}})
-        call = Expr(:call, :varying_draws, group, Expr(:vect, margins...))
-        isempty(kws) || insert!(call.args, 2,
-            Expr(:parameters, (Expr(:kw, k, v) for (k, v) in kws)...))
-        K = length(margins)
-        return Expr(:block,
-            :(a ~ Normal(0, 5)),
-            Expr(:call, :~, :d, call),
-            :(r ~ varying_slice(d, $(K == 1 ? 1 : :(1:$K)))),
-            :(mu = a .+ r),
-            :(y .~ Normal.(mu, 1.5)))
-    end
-    canon(group, margins, kws = Pair{Symbol,Any}[]) =
-        sprint(_canon, lower_rkppl(prog(group, margins, kws), data; conditioned = data))
-    # Only supported defaults participate in parity. The removed centered
-    # keyword's refusal is checked in test_varying_centered.jl.
-    plain_defaults = Pair{Symbol,Any}[:eta => 1.0, :sd => :(HalfNormal(1))]
-    mm_group = :(mm(g1, g2))
-    mm_spelled = :(mm(g1, g2; normalize = true))
-    gr_group = :(gr(g; by = b))
-    for (group, spelled_group) in ((:g, :g), (mm_group, mm_spelled),
-            (gr_group, gr_group))
-        for margins in (Any[1], Any[:x], Any[1, :x])
-            want = canon(group, margins)
-            for kw in plain_defaults
-                @test canon(group, margins, Pair{Symbol,Any}[kw]) == want
-            end
-            @test canon(group, margins, plain_defaults) == want
-            @test canon(spelled_group, margins, plain_defaults) == want
         end
     end
 end
