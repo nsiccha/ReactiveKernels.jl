@@ -59,6 +59,7 @@ export admitted_families, admitted_terms, admitted_functions, admitted_elementwi
 export supports_term
 export block_name
 export build_kernel, kernel_expr
+export model_view, RKPPLModelView
 export DesignShape, DesignBlock, design_shape, coefficient_priors
 export LayoutTable, LayoutEntry, assign_layout, coordinate_names
 export constrain, unconstrain, logjac, support_of
@@ -137,6 +138,7 @@ include("preprocessing.jl")
 include("generator.jl")
 include("arrays.jl")
 include("query.jl")
+include("display.jl")
 include("distribution_defaults.jl")
 include("surface.jl")
 include("scan.jl")

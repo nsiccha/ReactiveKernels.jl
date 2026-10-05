@@ -782,6 +782,14 @@ side.
 
 ## Debugging
 
+- `model_view(built)` displays an existing build: its coordinates, the built
+  ReactiveKernels program (`readable_code(built.spec)`) and its structural
+  graph (`kernel_graph(built.spec)`), as labeled sections in plain text or
+  HTML. `built` is the `(; spec, layout)` returned by `build_kernel`, including
+  the built model a BRM `RKBRMI` retains as `backend.model`. Pass
+  `bound = plan` to add the generated pre-build `@kernel` program and
+  `query = prepare_query(...)` to add that prepared program. The view only
+  reads these values; nothing is lowered, bound, built or evaluated again.
 - `kernel_expr(plan, built.layout)` returns the generated `@kernel` program
   shown above.
 - `packages/ReactiveKernelsPPL/report/transpile_report.jl --surface model.jl
