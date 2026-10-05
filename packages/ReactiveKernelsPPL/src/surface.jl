@@ -917,12 +917,21 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     end
     sample, det, plate_ctx, plate_specs, scans, joints, glms = _partition_statements(ast, data)
     sample, det = _rewrite_plate_rows(sample, det)
+    # Latent plates over values read their cell count as bound data.
+    extents = Set{Symbol}(_plate_extent_input(nm) for (nm, rhs, _, _) in plate_specs
+        if _mentions_symbol(rhs, _plate_extent_input(nm)))
+    for input in extents
+        (input in data || _mentions_symbol(ast, input)) && _sfail(
+            "`@plate` needs internal input `$input`, already used by the model or its data")
+    end
+    data = union(data, extents)
     # Definitions resolve in the model module; lexical model names shadow
     # functions without any domain-specific schedule extraction.
     model_names = union(data, Set{Symbol}(nm for (nm, _) in det),
         Set{Symbol}(s.lhs for s in sample),
         Set{Symbol}(nm for (nm, _, _, _) in plate_specs),
         Set{Symbol}(st for s in scans for st in s.states))
+    _check_plate_prior_reads(plate_specs, model_names)
     det = Pair{Symbol,Any}[nm => _resolve_module_calls(rhs, mod, model_names,
         "definition `$nm = $(repr(rhs))`") for (nm, rhs) in det]
     # Prior expression arguments hoist to synthetic definitions, resolved
@@ -3915,7 +3924,13 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
         bares = _cell_bares(obj, ivar, data)
         setdiff!(bares, plate_defs)
         push!(ctx, (col, line, bares))
+        # A data or literal iterator is evaluated as written at binding. A
+        # value's iterator (`eachindex(mu)` for a definition, a sampled
+        # array or a stream's location) is its extent `1:n`, bound with the
+        # latent's own cell count (`_plate_extent_input`).
         indices = rkind[1] === :coloncall ? rkind[2] :
+            !(rkind[2] in data) ?
+                Expr(:call, :(:), 1, _plate_extent_input(col)) :
             rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
             Expr(:call, :axes, rkind[2], rkind[3])
         indices = Expr(:call, GlobalRef(Base, :collect), indices)
@@ -4066,6 +4081,29 @@ function _strip_cell(ex::Expr, ivar, indices=nothing)
         return selected === nothing ? ex.args[1] : Expr(:ref, ex.args[1], selected)
     end
     return Expr(ex.head, (_strip_cell(a, ivar, indices) for a in ex.args)...)
+end
+
+# An indexed read in a per-cell latent prior (`x[i]`, `v[g[i]]`) reads a
+# model value. Name an undeclared one as written, before its cell
+# selection becomes a generated definition (strict declarations, `05oe96l`).
+function _check_plate_prior_reads(plate_specs, names::Set{Symbol})
+    for (nm, rhs, _, line) in plate_specs
+        for v in sort!(collect(_ref_bases!(Set{Symbol}(), rhs)))
+            v in names && continue
+            at = line > 0 ? " (line $line)" : ""
+            _sfail("`@plate`$at: the prior of `$nm` indexes `$v`, which " *
+                   "is not data, a definition or a declared parameter — bind " *
+                   "it as data or declare it")
+        end
+    end
+    return nothing
+end
+
+_ref_bases!(out::Set{Symbol}, ex) = out
+function _ref_bases!(out::Set{Symbol}, ex::Expr)
+    ex.head === :ref && ex.args[1] isa Symbol && push!(out, ex.args[1])
+    foreach(a -> _ref_bases!(out, a), ex.args)
+    return out
 end
 
 # Wrappers and constructors an observation object broadcasts even over

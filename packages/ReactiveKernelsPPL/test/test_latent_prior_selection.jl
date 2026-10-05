@@ -25,7 +25,7 @@ include("fixtures/latent_prior_selection.jl")
 end
 
 @testset "indexed prior columns retain Julia bounds" begin
-    for iterator in (:eachindex, :literal, :axes)
+    for iterator in (:eachindex, :literal, :axes, :value)
         fx = _prior_selection_fixture(6, 4; iterator)
         for len in (0, 1, 5)
             inputs = merge(fx.inputs, (; x=zeros(len)))
@@ -48,7 +48,7 @@ end
 
 @testset "latent priors select their authored cells" begin
     for prior in (:mapped, :data, :active, :derived),
-            iterator in (:eachindex, :literal, :axes),
+            iterator in (:eachindex, :literal, :axes, :value),
             (n, nobs) in ((0, 4), (1, 4), (6, 4), (15, 11))
         _check_prior_selection(_prior_selection_fixture(n, nobs; prior, iterator))
     end
