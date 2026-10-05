@@ -3121,12 +3121,27 @@ function _hcat_value_reads(det, detmap, sample, data, glms,
         if s.lhs ∉ data && s.broadcast && s.matrix !== nothing)
     valued(X, w, composed) = (composed || !(w isa Symbol && w in sized_by)) &&
         (w isa Symbol || w isa Expr) && shape(w) === :array
+    # Naming a subexpression never changes its classification: a definition
+    # read inside a composition (`p = X * b; mu = f(p)`, or a submodel's
+    # returned product) is composed exactly as its inline spelling
+    # (`mu = f(X * b)`) is, so its own right-hand side is rescanned in that
+    # context until no further definition is reached.
+    composed_defs = Set{Symbol}()
     for (nm, rhs) in det
         nm in mats && continue
-        _matrix_value_reads!(out, rhs, mats, valued, true)
+        _matrix_value_reads!(out, rhs, mats, valued, true;
+            defs = detmap, composed_defs)
     end
     for s in sample
-        _matrix_value_reads!(out, s.rhs, mats, valued, false)
+        _matrix_value_reads!(out, s.rhs, mats, valued, false;
+            defs = detmap, composed_defs)
+    end
+    rescanned = Set{Symbol}()
+    while !issubset(composed_defs, rescanned)
+        nm = first(setdiff(composed_defs, rescanned))
+        push!(rescanned, nm)
+        _matrix_value_reads!(out, detmap[nm], mats, valued, true;
+            affine = false, defs = detmap, composed_defs)
     end
     for s in sample
         X = get(coefvec, s.lhs, nothing)
@@ -3141,16 +3156,23 @@ const _MATRIX_OPERAND_HEADS = (:+, :-, :*, :/, :^, :\, ELEMENTWISE_OPS...)
 
 # Value reads of the matrices `mats` in `ex`: `X * v` with `valued(X, v)`,
 # and, inside a definition (`indef`), `X` as an argument of a function call
-# (`eachcol(X)`, `size(X, 2)`), an indexed `X[...]`, or `X'`.
+# (`eachcol(X)`, `size(X, 2)`), an indexed `X[...]`, or `X'`. A definition
+# name of `defs` read in a composed (non-affine) position joins
+# `composed_defs`, for the caller to rescan its right-hand side.
 function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
-        affine::Bool = true)
+        affine::Bool = true, defs = nothing, composed_defs = nothing)
+    if ex isa Symbol
+        !affine && defs !== nothing && haskey(defs, ex) && ex ∉ mats &&
+            push!(composed_defs, ex)
+        return out
+    end
     ex isa Expr || return out
     a = ex.args
     if ex.head === :call && length(a) == 3 && a[1] === :* &&
             a[2] isa Symbol && a[2] in mats
         valued(a[2], a[3], !affine) && push!(out, a[2])
         return _matrix_value_reads!(out, a[3], mats, valued, indef;
-            affine = false)
+            affine = false, defs, composed_defs)
     end
     if indef
         isarg(x) = x isa Symbol && x in mats
@@ -3171,7 +3193,7 @@ function _matrix_value_reads!(out::Set{Symbol}, ex, mats, valued, indef::Bool;
     child_affine = affine && !(composed && fn ∉ (:+, :.+, :-, :.-))
     for x in a
         _matrix_value_reads!(out, x, mats, valued, indef;
-            affine = child_affine)
+            affine = child_affine, defs, composed_defs)
     end
     return out
 end

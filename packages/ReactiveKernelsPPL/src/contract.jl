@@ -3732,8 +3732,10 @@ const _COMPOSED_MORE_OPS = Tuple(op for op in ELEMENTWISE_OPS
 # resolution — functions as values: `hypot.(s1, mu .* s2)`).
 _composed_map_fn(f) = f isa GlobalRef || f === :ifelse ||
     f in _COMPOSED_UNARY || f in ELEMENTWISE_FNS
+# A data design-matrix product is affine in its coefficient vector, just
+# as its equivalent sum of intercept and continuous terms is.
 const _COMPOSED_AFFINE_KINDS =
-    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm)
+    (InterceptTerm, ContinuousTerm, FactorTerm, OffsetTerm, MatrixTerm)
 # Sub-predictors are affine.
 const _COMPOSED_SUB_KINDS = _COMPOSED_AFFINE_KINDS
 
@@ -3842,7 +3844,7 @@ function _validate_composed_term(t::TermSpec, pred::PredictorSpec,
         sub = plan.predictors[sidx]
         all(u -> u.kind in _COMPOSED_SUB_KINDS, sub.terms) ||
             _fail(t.label, "composed sub-predictor $s must be affine " *
-                  "plus varying effects (intercept/continuous/factor/" *
+                  "plus varying effects (intercept/continuous/factor/matrix/" *
                   "offset/varying-effect terms only — no nested " *
                   "compositions, latents, or other summands)")
     end
