@@ -554,6 +554,13 @@ is introduced. Missing responses read elsewhere as model values and missing
 components of joint outcomes still need richer handling; those uses fail rather
 than silently inventing values or discarding supplied joint components.
 
+The current default Reactant runtime can fail compilation when a matrix-vector
+predictor feeds a strided presence gather. The backend-only reproducer is
+`benchmark/repro_reactant_strided_dot_gather.jl`; native execution remains
+available. This compiler repair is tracked separately from missing-response
+binding. Successful compiled checks for other shapes do not establish support
+for this affected shape.
+
 Responses may have different row counts. Each statement reads columns on its
 own observation axis; statements that read a common observation column must
 agree on its rows. A latent plate follows its authored range, while a scan

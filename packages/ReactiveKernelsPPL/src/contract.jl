@@ -1711,7 +1711,7 @@ end
 # `y[i, 1]`, `y[eachindex(x)]`) or a statement's data-indexed left-hand
 # side (`y[rows] .~ …`, which `_indexed_observation_definitions` rewrites
 # into an observed gather). A definition the author wrote, such as a lag,
-# is ordinary data use, not a selection. Selections of one array union.
+# is ordinary data use, not a selection. Each observation covers its array.
 const _OBSERVED_GATHER_PREFIX = "_rkppl_observed_"
 _observed_mask_name(name::Symbol) = Symbol(:_rkppl_present_, name)
 
