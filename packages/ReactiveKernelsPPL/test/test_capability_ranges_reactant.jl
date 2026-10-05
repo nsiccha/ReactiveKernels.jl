@@ -9,9 +9,12 @@ function _cap_range_operations(hlo)
 end
 
 @testset "Reactant: response slices and retained selected cells" begin
-    for kind in (:cross_index, :cross_axis, :colon, :top_singleton, :cross_cell, :singleton, :inactive, :matrix, :singleton_latent, :free_matrix, :longer_inactive, :axis1_matrix_inactive)
+    for kind in (:cross_index, :cross_axis, :colon, :top_singleton, :cross_cell, :singleton, :inactive, :matrix, :singleton_latent, :free_matrix, :longer_inactive, :axis1_matrix_inactive,
+            :literal_tail, :literal_whole, :literal_single, :literal_matrix)
         primal, reverse = Dict{String,Int}[], Dict{String,Int}[]
-        for n in (3, 9)
+        # Sizes 4 and 9: no selected cell count equals the two parameters,
+        # whose shared tensor shape would otherwise let XLA share constants.
+        for n in (4, 9)
             fx = _cap_range_fixture(kind, n)
             ru = Reactant.to_rarray(fx.u)
             kernel = fx.sampler.kernel
@@ -40,7 +43,8 @@ end
 end
 
 @testset "Reactant: empty indexed observations retain prior gradients" begin
-    for kind in (:cross_index, :cross_axis, :colon, :cross_cell, :matrix, :free_matrix)
+    for kind in (:cross_index, :cross_axis, :colon, :cross_cell, :matrix, :free_matrix,
+            :literal_tail, :literal_whole, :literal_matrix)
         fx = _cap_range_fixture(kind, 0)
         ru = Reactant.to_rarray(fx.u)
         cad = compile_ad_value_and_gradient(fx.sampler.ad, ru)

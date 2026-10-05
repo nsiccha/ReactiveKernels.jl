@@ -1784,6 +1784,19 @@ _mi_row_value(x::Number, i) = x
 _ppl_range_values(x::Number, indices) = x
 _ppl_range_values(x::AbstractArray, indices) = x[indices]
 
+# A selected plate column already holds one value per selected response cell
+# (`_selected_plate_indices`); only whole operands are gathered at the
+# authored indices. Positions and indices differ for a literal `a:b`.
+function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
+    i = findfirst(p -> _lp_name(p) === value, plan.predictors)
+    i === nothing && return false
+    p = plan.predictors[i]
+    p.link === IdentityLink && length(p.terms) == 1 &&
+        p.terms[1].kind === OffsetTerm || return false
+    d = findfirst(d -> d.name === only(p.terms[1].columns), plan.derived)
+    return d !== nothing && _selected_plate_indices(plan.derived[d].expr) == r.range.args[2]
+end
+
 function _ranged_response_stmts(r, plan, stmts)
     idx = Symbol(:_ppl_range_indices_, r.label)
     selected = Symbol(:_ppl_range_response_, r.label)
@@ -1817,6 +1830,7 @@ function _ranged_response_stmts(r, plan, stmts)
         end
         for (i, value) in enumerate(sort!(collect(rows)))
             value === r.response && continue
+            _selected_cell_value(plan, r, value) && continue
             alias = Symbol(:_ppl_range_operand_, r.label, :_, i)
             getter = GlobalRef(@__MODULE__, :_ppl_range_values)
             push!(pre, :($alias = $getter($value, $idx)))

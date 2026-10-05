@@ -3360,12 +3360,24 @@ end
     end
     # refused: the explicit range disagrees with the bound response length (index dimensions, P3).
     @test err isa ContractValidationError && occursin("6 rows", err.message)
-    # Structural range violations fail at lowering.
-    for lhs in (:(y[2:6]), :(y[0:6]), :(y[1:0]), :(y[1:n]), :(y[1:2:6]),
-            :(y[axes(y)]), :(y[i]), :(y[3]))
-        # refused: length mismatch with obs-aligned likelihood (5 vs 6)
-        @test_throws SurfaceLoweringError lower_rkppl(_ranged_ast(lhs), (:y, :x); conditioned = (:y, :x))
+    # Each statement is a Julia error beside the six-row `mu`. A top-level
+    # literal range covers its whole response (the IR contract); a `@plate`
+    # loop selects a partial range instead ("surface plate").
+    for (lhs, err) in (
+            (:(y[2:6]), ContractValidationError),  # 5 vs 6 cells: DimensionMismatch
+            (:(y[0:6]), ContractValidationError),  # y[0]: BoundsError
+            (:(y[1:0]), ContractValidationError),  # 0 vs 6 cells: DimensionMismatch
+            (:(y[1:n]), SurfaceLoweringError),     # n: UndefVarError
+            (:(y[1:2:6]), SurfaceLoweringError),   # 3 vs 6 cells: DimensionMismatch
+            (:(y[axes(y)]), SurfaceLoweringError), # tuple index: ArgumentError
+            (:(y[i]), SurfaceLoweringError))       # i: UndefVarError
+        # refused: Julia rejects the statement with these operands (P3).
+        @test_throws err lower_rkppl(_ranged_ast(lhs), (:y, :x); conditioned = (:y, :x))
     end
+    # One scalar cell broadcast against six distributions is valid Julia
+    # (six observations of `y[3]`); top-level scalar cells do not lower yet
+    # (todo `04opdy6`).
+    @test_broken lower_rkppl(_ranged_ast(:(y[3])), (:y, :x); conditioned = (:y, :x)) isa StructuralPlan
     # Scalar tilde over a slice is crossed spelling; dotted LHS is out of scope.
     # refused: scalar ~ over a slice (P3)
     @test_throws SurfaceLoweringError lower_rkppl(Expr(:block,
@@ -3433,19 +3445,40 @@ _plate_gauss(R) = Expr(:block,
             Expr(:call, :.~, :(y[1:6]), :(Normal.(mu, s)))), (:y, :x); conditioned = (:y, :x))
     @test ranged.responses[1].range == 1:6
     @test _surface_bound_density_equal(lit, ranged, cols, [0.5, -0.25, 0.1])
-    # A shorter loop observes only its own cells.
-    short = bind_data(lower_rkppl(_plate_gauss(:(1:4)), (:y, :x);
-        conditioned = (:y, :x)), cols)
-    sbuilt = build_kernel(short)
-    snt = constrain(sbuilt.layout, [0.5, -0.25, 0.1])
-    @test Base.invokelatest(prepare_query(sbuilt, short, :likelihood),
-            [0.5, -0.25, 0.1]) ≈
-        sum(logpdf(Normal(snt.a + snt.b * cols[:x][i], snt.s), cols[:y][i])
-            for i in 1:4)
-    # refused: the loop reads `y[7]` beyond the six bound rows (standing
-    # @rkppl language principle 3: Julia indexing safety).
+    # Every supplied response entry is observed (user decision `1g8uvgs`):
+    # a loop over part of `y` needs the entries it leaves out `missing`.
+    masked(rows) = merge(cols, Dict(:y => Union{Missing,Float64}[
+        i in rows ? cols[:y][i] : missing for i in eachindex(cols[:y])]))
+    # refused: `1:4` leaves the supplied `y[5:6]` unobserved (`1g8uvgs`).
     @test_throws ContractValidationError bind_data(lower_rkppl(
-        _plate_gauss(:(1:7)), (:y, :x); conditioned = (:y, :x)), cols)
+        _plate_gauss(:(1:4)), (:y, :x); conditioned = (:y, :x)), cols)
+    # Any literal loop selects its authored cells, including a prefix, an
+    # offset or an empty range, as a Julia loop does.
+    for (R, rows) in ((:(1:4), 1:4), (:(2:6), 2:6), (:(3:3), 3:3), (:(1:0), 1:0), (:(5:4), 5:4))
+        plan = lower_rkppl(_plate_gauss(R), (:y, :x); conditioned = (:y, :x))
+        @test repr(plan.responses[1].range) == repr(:(y[$(first(rows)):$(last(rows))]))
+        bound = bind_data(plan, masked(rows))
+        built = build_kernel(bound)
+        nt = constrain(built.layout, [0.5, -0.25, 0.1])
+        @test Base.invokelatest(prepare_query(built, bound, :likelihood),
+                [0.5, -0.25, 0.1]) ≈
+            sum(logpdf(Normal(nt.a + nt.b * cols[:x][i], nt.s), cols[:y][i])
+                for i in rows; init = 0.0)
+    end
+    # refused: the loop reads `y[7]` or `y[0]` outside the six bound rows
+    # (standing @rkppl language principle 3: Julia indexing safety).
+    for R in (:(1:7), :(2:7), :(0:3))
+        @test_throws ContractValidationError bind_data(lower_rkppl(
+            _plate_gauss(R), (:y, :x); conditioned = (:y, :x)), cols)
+    end
+    # A per-cell latent over an offset range (cells `z[2:6]`) is not built:
+    # latent plate cells are `1:N`.
+    @test_broken lower_rkppl(Expr(:block,
+            :(s ~ Exponential(1)),
+            Expr(:macrocall, Symbol("@plate"), LineNumberNode(5),
+                Expr(:for, Expr(:(=), :i, :(2:6)), Expr(:block,
+                    :(z[i] ~ Normal(0, 1)), :(y[i] ~ Normal(z[i], s)))))),
+        (:y,); conditioned = (:y,)) isa StructuralPlan
     # Deterministic cells: predictor-via-cell ≡ top-level predictor.
     cell = lower_rkppl(Expr(:block,
             :(a ~ Normal(0, 1)), :(b ~ Normal(0, 2)), :(s ~ Exponential(1)),
@@ -3539,7 +3572,9 @@ end
             @test isempty(empty_plan.plate_parameters)
         elseif i == 5
             admitted = lower_rkppl(program, Dn; conditioned=Dn)
-            cols = Dict(:y => [0.2, 0.4, 0.1], :x => [0.3, 0.5, 0.8])
+            # `axes(y, 2)` of a vector selects `y[1]`; the entries it leaves
+            # out are `missing` (every supplied entry is observed, `1g8uvgs`).
+            cols = Dict(:y => [0.2, missing, missing], :x => [0.3, 0.5, 0.8])
             bound = bind_data(admitted, cols)
             @test bound.n_obs == 1
             @test length(Base.invokelatest(prepare_query(build_kernel(bound), bound, :pointwise), [0.2, -0.1, 0.0]).y) == 1

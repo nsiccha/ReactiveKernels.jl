@@ -81,7 +81,9 @@ end
 function _oos_observed(; n = 4, p = 2)
     m = 2n
     data = Dict{Symbol,Any}(
-        :y => Union{Missing,Float64}[isodd(i) ? 0.1 * i : missing for i in 1:m],
+        # Every supplied entry is observed (user decision `1g8uvgs`): the
+        # rows repeat entries 1 and m - 1, and every other entry is missing.
+        :y => Union{Missing,Float64}[i in (1, m - 1) ? 0.1 * i : missing for i in 1:m],
         :rows => [isodd(i) ? m - 1 : 1 for i in 1:n],
         :B => [0.1 * cos(i + j) for i in 1:m, j in 1:p])
     ast = quote
