@@ -84,40 +84,76 @@ function _rc_compiled_fixture(label, n)
 end
 
 @testset "response combinations compile without row body replication" begin
-    operations = Dict{Symbol,Vector{String}}()
-    # Each censored arm has at least two rows, keeping singleton shape
-    # simplifications out of the operation-count comparison.
+    emitted = Dict{Symbol,Any}()
+    # Each censored arm has at least two rows, keeping singleton shapes out
+    # of this same-cell growth regression. Backend optimization may expand
+    # small batches or choose loops: constraints.md scopes this check to RK
+    # emission (USER 1rvu25u / October 5 scope clarification).
     for n in (8, 16), label in (:weights, :trials, :range, :mi, :intercept, :plate, :censored)
         @testset "$label / n=$n" begin
             plan, oracle = _rc_compiled_fixture(label, n)
+            saved_columns = deepcopy(plan.columns)
             built = build_kernel(plan)
             u = [0.2sin(i) for i in 1:built.layout.total]
-            reference = oracle(constrain(built.layout,u))
             sampler = Base.invokelatest(prepare_sampler,built,plan,u;
                 backend=AutoEnzyme(;mode=Enzyme.Reverse))
-            grad = similar(u)
-            val, _ = Base.invokelatest(sampler_value_and_gradient!,sampler,grad,u)
-            @test val ≈ reference
             ru = Reactant.to_rarray(u)
             kernel = sampler.kernel
             compiled = Reactant.@compile kernel(ru)
-            @test Float64(compiled(ru)) ≈ reference
             cad = Base.invokelatest(compile_ad_value_and_gradient,sampler.ad,ru)
-            rval, rgrad = cad(ru)
-            @test Float64(rval) ≈ reference
-            @test Array(rgrad) ≈ grad rtol=2e-5 atol=2e-7
-            h = cbrt(eps(Float64))
-            fd = map(eachindex(u)) do i
-                up, down = copy(u), copy(u)
-                up[i] += h
-                down[i] -= h
-                (oracle(constrain(built.layout,up))-oracle(constrain(built.layout,down)))/(2h)
+            # The negative mean crosses the truncated-normal normalization
+            # branch in :mi and :plate, reusing the same compiled executable.
+            for probe in (u, u .- 1.6)
+                saved_probe = copy(probe)
+                reference = oracle(constrain(built.layout,probe))
+                grad = similar(probe)
+                val, _ = Base.invokelatest(sampler_value_and_gradient!,sampler,grad,probe)
+                @test val ≈ reference
+                rprobe = Reactant.to_rarray(probe)
+                @test Float64(compiled(rprobe)) ≈ reference
+                rval, rgrad = cad(rprobe)
+                @test Float64(rval) ≈ reference
+                @test Array(rgrad) ≈ grad rtol=2e-5 atol=2e-7
+                h = cbrt(eps(Float64))
+                fd = map(eachindex(probe)) do i
+                    up, down = copy(probe), copy(probe)
+                    up[i] += h
+                    down[i] -= h
+                    (oracle(constrain(built.layout,up))-oracle(constrain(built.layout,down)))/(2h)
+                end
+                @test grad ≈ fd rtol=2e-5 atol=2e-7
+                @test Array(rgrad) ≈ fd rtol=2e-5 atol=2e-7
+                @test probe == saved_probe
             end
-            @test Array(rgrad) ≈ fd rtol=2e-5 atol=2e-7
-            ops = [m.match for m in eachmatch(r"stablehlo\.[a-z_]+",
-                string(Reactant.@code_hlo kernel(ru)))]
-            @test !isempty(ops)
-            n == 8 ? (operations[label]=ops) : (@test ops == operations[label])
+            @test isequal(plan.columns, saved_columns)
+            ad = sampler.ad
+            both(v) = ad_value_and_gradient(ad, v)
+            modules = (Reactant.@code_hlo(optimize=false, kernel(ru)),
+                Reactant.@code_hlo(kernel(ru)),
+                Reactant.@code_hlo(optimize=false, both(ru)),
+                Reactant.@code_hlo(both(ru)))
+            structures = _ppl_mlir_structure.(modules)
+            raw = (structures[1], structures[3])
+            @test all(s -> !isempty(s.cells), raw)
+            # Same authored cells and call sites at 8/16 rows; sizes and bound
+            # constant payloads may change. Inspect reachable bodies too, so
+            # an empty retained batch cannot make this test pass.
+            cells = map(s -> s.cells, raw)
+            @test all(cell -> "func.return" in cell, Iterators.flatten(cells))
+            n == 8 ? (emitted[label]=cells) : (@test cells == emitted[label])
+            println("response combination ", label, " n=", n, " inventories=",
+                map(structures) do s
+                    sort!(collect(Dict(op=>count(==(op),s.operations)
+                        for op in unique(s.operations))); by=first)
+                end)
+            if haskey(ENV, "RKPPL_RESPONSE_COMBINATIONS_HLO_DIR")
+                dir = ENV["RKPPL_RESPONSE_COMBINATIONS_HLO_DIR"]
+                mkpath(dir)
+                for (phase, mod) in zip(("primal-raw", "primal-optimized",
+                        "reverse-raw", "reverse-optimized"), modules)
+                    write(joinpath(dir, "$label-$n-$phase.mlir"), String(mod))
+                end
+            end
         end
     end
 end

@@ -1,23 +1,6 @@
 using Reactant
 
-function _cgi_operations(module_text)
-    names = String[]
-    function walk(op)
-        push!(names, Reactant.MLIR.IR.name(op))
-        for region in op, block in region, child in block
-            walk(child)
-        end
-    end
-    Reactant.MLIR.IR.@dispose ctx = Reactant.ReactantContext() begin
-        mod = parse(Reactant.MLIR.IR.Module, String(module_text); context=ctx)
-        try
-            walk(Reactant.MLIR.IR.Operation(mod))
-        finally
-            Reactant.MLIR.IR.dispose(mod)
-        end
-    end
-    return names
-end
+_cgi_operations(module_text) = _ppl_mlir_structure(module_text).operations
 
 function _cgi_compiled(fx)
     q = prepare_sampler(fx.built, fx.bound, fx.u;
