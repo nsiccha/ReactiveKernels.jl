@@ -483,7 +483,8 @@ with an RK plate over two location axes. Data-only locations cache pair
 distances during preparation; locations derived from parameters retain live
 distance calculations. The covariance matrix remains dense and diagonal jitter
 depends on position, including when two locations are equal. Dense Cholesky in
-`gp_chol_latent` remains a separate numerical leaf with native gradient support;
+`gp_chol_latent` delegates its factorization to the general RK-proper
+`rk_cholesky_lower` callable, preserving native gradient support;
 compiled covariance support does not imply compiled Cholesky gradients.
 
 A single index on a multi-axis definition is linear and positional:
