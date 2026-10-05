@@ -1,6 +1,6 @@
 # Owned matrix-exponential primitive with generated AD rules.
 #
-# `LinearAlgebra.exp` on a matrix cannot reverse under Enzyme
+# Raw `LinearAlgebra.exp` on a matrix cannot reverse under Enzyme
 # (`EnzymeNoDerivativeError` on its LAPACK `ccall`). This general numerical
 # primitive lives in ReactiveKernels itself: one pure-math `@kernel` graph
 # authors the primal plus its forward (JVP) and reverse (VJP) branches, and
@@ -8,10 +8,20 @@
 # from that graph's cuts. No hand-written rule, no rule on a foreign function
 # (see `docs/src/constraints.md`).
 #
+# Native authored calls resolving to Base.exp use this owned primitive for
+# Matrix{Float64}; `_native_exp` preserves Base dispatch on all other inputs.
 # Under Reactant the cuts trace as plain graph mathematics only once the
 # backend supports `exp` on traced arrays (no release carries that yet); until
 # then compiled consumers retain that backend limitation.
 using LinearAlgebra: exp
+
+# Keep the rule graph's built-in calls distinct from the authored `exp`
+# lowering. Its primal and derivative cuts evaluate the built-in directly;
+# routing these calls back through rk_expm would recurse into this rule.
+@inline _expm_builtin(A) = exp(A)
+
+@inline _native_exp(args...) = exp(args...)
+@inline _native_exp(A::Matrix{Float64}) = rk_expm(A)
 
 # Both derivative branches are one augmented-matrix exponential plus
 # top-right-block extraction: the JVP is the Frechet derivative
@@ -19,12 +29,12 @@ using LinearAlgebra: exp
 # integral form (verified against finite differences in `test_expm_rule.jl`).
 @kernel rk_expm_rule(A::Matrix{Float64}, A_dot::Matrix{Float64},
         Y_bar::Matrix{Float64}) = begin
-    Y::Matrix{Float64} = exp(A)
+    Y::Matrix{Float64} = _expm_builtin(A)
     Zf::Matrix{Float64} = zero(A)
     Topf::Matrix{Float64} = hcat(A, A_dot)
     Botf::Matrix{Float64} = hcat(Zf, A)
     Mf::Matrix{Float64} = vcat(Topf, Botf)
-    Ef::Matrix{Float64} = exp(Mf)
+    Ef::Matrix{Float64} = _expm_builtin(Mf)
     nf::Int = size(A, 1)
     nf2::Int = 2 * nf
     nf1::Int = nf + 1
@@ -38,7 +48,7 @@ using LinearAlgebra: exp
     Topr::Matrix{Float64} = hcat(At, Y_bar)
     Botr::Matrix{Float64} = hcat(Zr, At)
     Mr::Matrix{Float64} = vcat(Topr, Botr)
-    Er::Matrix{Float64} = exp(Mr)
+    Er::Matrix{Float64} = _expm_builtin(Mr)
     A_bar::Matrix{Float64} = Er[rf1, rf2]
     return Y, Y_dot, A_bar
 end
@@ -51,7 +61,9 @@ forward- and reverse-mode rules generated from the one pure-math graph
 `rk_expm_rule` (JVP and VJP via augmented-matrix exponentials).
 Differentiating through it with Enzyme — directly or via
 `DifferentiationInterface` with `AutoEnzyme` — uses those generated cuts, so
-the LAPACK `ccall` inside is never differentiated. No Reactant custom rule is
+the LAPACK `ccall` inside is never differentiated. Native `@kernel` and
+`@traceable` source also selects this callable for resolved `exp` calls on
+`Matrix{Float64}`. No Reactant custom rule is
 emitted (see `docs/src/manual-derivative-rules.md`); tracing the primal needs
 backend `exp` support for traced arrays.
 """

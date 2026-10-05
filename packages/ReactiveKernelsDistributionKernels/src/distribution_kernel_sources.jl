@@ -1764,8 +1764,14 @@ function gp_chol_latent(K::AbstractMatrix, z::AbstractVector)
         "gp_chol_latent needs a square covariance, got $(size(K))"))
     length(z) == n || throw(ArgumentError(
         "gp_chol_latent z has length $(length(z)) for a $n×$n covariance"))
-    L = Matrix{Float64}(K)
-    _gp_potrf!(L)
+    L = try
+        rk_cholesky_lower(K)
+    catch err
+        err isa PosDefException || rethrow()
+        throw(ArgumentError(
+            "gp_chol_latent covariance is not positive definite " *
+            "(non-positive pivot at $(err.info) — increase jitter)"))
+    end
     f = Vector{Float64}(undef, n)
     @inbounds for i in 1:n
         acc = 0.0
@@ -1775,26 +1781,6 @@ function gp_chol_latent(K::AbstractMatrix, z::AbstractVector)
         f[i] = acc
     end
     return f
-end
-
-function _gp_potrf!(L::Matrix{Float64})
-    n = size(L, 1)
-    @inbounds for j_ in 1:n
-        for k in 1:j_-1
-            L[j_, j_] -= L[j_, k] * L[j_, k]
-        end
-        L[j_, j_] > 0 || throw(ArgumentError(
-            "gp_chol_latent covariance is not positive definite " *
-            "(non-positive pivot at $j_ — increase jitter)"))
-        L[j_, j_] = sqrt(L[j_, j_])
-        for i in j_+1:n
-            for k in 1:j_-1
-                L[i, j_] -= L[i, k] * L[j_, k]
-            end
-            L[i, j_] /= L[j_, j_]
-        end
-    end
-    return L
 end
 
 # GLM objects last: their sources evaluate through _evaluate_source_bindings
