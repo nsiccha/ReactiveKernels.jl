@@ -83,6 +83,12 @@ end
         @test Array(compiled(rx)) ≈ k(xs)
         @test Array(rx) == xs
     end
+    xs = [-1.0, 0.25, 0.0, 4.0, -2.0]
+    k = prepare(F.formal_argument_scan)
+    rx = Reactant.to_rarray(xs)
+    compiled = Reactant.@compile k(rx, 0.75)
+    @test Array(compiled(rx, 0.75)) ≈ k(xs, 0.75)
+    @test Array(rx) == xs
     k = prepare(F.object_scan; want=:total)
     rx = Reactant.to_rarray(Float64[])
     compiled = Reactant.@compile k(rx)

@@ -19,6 +19,9 @@ end
     slot .~ Normal.(b .* x, 0.5)
     return slot
 end
+@rkppl prefix_values(c, phi) = begin
+    return cumsum(vcat(0.0, phi))[c]
+end
 @rkppl recursive(x) = begin
     nested ~ Blocks.recursive(x)
     return nested
@@ -30,7 +33,7 @@ using ._QSLibrary.Blocks: outer, stream
 const _QSModuleAlias = _QSLibrary.Blocks
 const _QSOuterAlias = outer
 const _QSStreamAlias = stream
-const _QSMonoAlias = monotonic
+const _QSPrefixAlias = _QSLibrary.Blocks.prefix_values
 const _QS_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 const _QS_PROVIDER_CALLS = Ref(0)
 _qs_module_provider() = (_QS_PROVIDER_CALLS[] += 1; _QSLibrary.Blocks)
@@ -112,7 +115,7 @@ end
                 stream = kind === :stream,
                 cell_location = kind === :cell_sum ?
                     :(z[i] + z[i].nested.b) : :(z[i]))
-            expansion, _ = ReactiveKernelsPPL._expand_submodels(
+            expansion = ReactiveKernelsPPL._expand_submodels(
                 ast, Set((:x, :y)), @__MODULE__)
             push!(expanded, Base.remove_linenums!(deepcopy(expansion)))
             bound, built, u = _qs_build(ast, data)
@@ -129,10 +132,10 @@ end
     end
     @test data == saved
 
-    # The shipped monotonic submodel expands to its ordinary Julia body.
+    # A caller-owned pure prefix/gather submodel resolves through each head.
     data = (; c = [1, 2, 3], y = [0.1, 0.3, 0.8])
     values = Float64[]
-    for head in (:monotonic, :(ReactiveKernelsPPL.monotonic), :_QSMonoAlias)
+    for head in (:(_QSLibrary.Blocks.prefix_values), :(_QSModuleAlias.prefix_values), :_QSPrefixAlias)
         call = Expr(:call, head, :c, :phi)
         ast = quote
             phi ~ Dirichlet([1.0, 2.0])

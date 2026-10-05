@@ -359,6 +359,11 @@ receives one:
   lazy-branch limitation in the [core constraints](constraints.md) does not
   arise.
 
+An empty bound domain has no lanes to group. It runs no cell and evaluates no
+condition. Its result is empty, with the element type inferred from the
+authored native cell, as in Julia's empty broadcast. Reactant compiles it
+without reading the zero-length operand.
+
 The number of arm plates is bounded by the cell's branch structure, never by
 the data. A condition that reads a live value stays an ordinary lazy branch.
 This includes the shape of a live array, such as `length(c)` of a runtime

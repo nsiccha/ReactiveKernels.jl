@@ -1,14 +1,14 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Reactant
 
-function _pp_backend_check(expr, data, q)
+function _pp_backend_check(expr, data, q; structure_body = false)
     bound = bind_data(lower_rkppl(expr, data; conditioned = data), data)
     built = build_kernel(bound)
     u = unconstrain(built.layout, q)
     kernel = prepare_query(built, bound, :sampler)
-    return Base.invokelatest(_pp_backend_measure, built, bound, kernel, u)
+    return Base.invokelatest(_pp_backend_measure, built, bound, kernel, u; structure_body)
 end
 
-function _pp_backend_measure(built, bound, kernel, u)
+function _pp_backend_measure(built, bound, kernel, u; structure_body = false)
     native = kernel(u)
     sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
     value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
@@ -31,6 +31,11 @@ function _pp_backend_measure(built, bound, kernel, u)
     ops = Dict{String,Int}()
     for match in eachmatch(r"stablehlo\.[a-z_]+", hlo)
         ops[match.match] = get(ops, match.match, 0) + 1
+    end
+    if structure_body
+        inventory = _ppl_backend_operation_inventory(hlo)
+        println("positive prior complete inventory: ", sort!(collect(inventory.all_ops)))
+        return inventory.body_ops
     end
     return ops
 end

@@ -51,24 +51,34 @@ function _ma_check(ast, data, mean; scale = (nt -> 1.0), slots = (), gradient = 
     return (; bound = both, built, q, u)
 end
 
-@testset "multiple observation axes: legacy shrinkage slots" begin
+@rkppl _ma_declared_columns(X) = begin
+    c[axes(X, 2)] .~ Normal.(0, 1)
+    return c
+end
+
+@testset "multiple observation axes: declared prior dependencies" begin
     cols = (; y = [0.2, -0.1, 0.4, 0.8], x = [-1.0, 0.5, 2.0, 1.0])
     _ma_check(quote
         R2 ~ Beta(1, 1)
         phi ~ Dirichlet([1.0])
+        tau ~ HalfNormal(1)
+        a ~ Normal(0, 1)
+        b ~ Normal(0, sqrt(phi[1] * R2 * tau^2))
         mu = a .+ b .* x
-        r2d2(mu, R2, phi)
         y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> nt.mu[1] .+ nt.mu[2] .* cols.x;
-        slots = (:r2d2_priors, :vector_parameters))
+    end, cols, (p, l, nt, u) -> nt.a .+ nt.b .* cols.x;
+        slots = (:parameters, :vector_parameters))
     _ma_check(quote
         a ~ Normal(0, 1)
-        b ~ Horseshoe()
+        raw ~ Normal(0, 1)
+        lambda ~ HalfCauchy(1)
+        tau ~ HalfCauchy(1)
+        b = raw * lambda * tau
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> nt.horseshoe_mu_Intercept_normal .+
-        nt.horseshoe_mu_x_raw .* nt.horseshoe_mu_x_lambda .* nt.horseshoe_mu_x_tau .* cols.x;
-        slots = (:horseshoe_priors,))
+    end, cols, (p, l, nt, u) -> nt.a .+
+        nt.raw * nt.lambda * nt.tau .* cols.x;
+        slots = (:parameters,))
 end
 
 _ma_segment(lay, name) = let e = only(e for e in lay.entries if e.name === name)
@@ -123,22 +133,7 @@ end
         end
         h
     end; slots = (:scans,))
-    _ma_check(quote
-        a ~ Normal(0, 1)
-        beta ~ truncated(Normal(0.5, 0.2), 0, 1)
-        sd ~ HalfNormal(0.2)
-        mu = a .+ dar(beta, sd)
-        y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> begin
-        s = only(p.dar_paths)
-        z = u[_ma_segment(l, ReactiveKernelsPPL._dar_innovation_name(s))]
-        h, d = [0.0], 0.0
-        for e in z
-            d = nt.beta * d + nt.sd * e
-            push!(h, h[end] + d)
-        end
-        nt.a .+ h
-    end; slots = (:dar_paths,))
+
 end
 
 @testset "multiple observation axes: matrices and declared arrays" begin
@@ -159,77 +154,14 @@ end
     end, merge(cols, (; rows = collect(1:4))), (p, l, nt, u) -> nt.z;
         slots = (:array_parameters, :derived))
     @test result.bound.columns[:X] == hcat(cols.x)
-    for library in (:r2d2_coefs, :horseshoe_coefs)
-        draw = library === :r2d2_coefs ? :(r2d2_coefs(X, [1.0])) : :(horseshoe_coefs(X))
-        _ma_check(quote
-            a ~ Normal(0, 1)
-            X = hcat(x)
-            b ~ $draw
-            mu = a .+ X * b
-            y .~ Normal.(mu, 1.0)
-        end, cols, (p, l, nt, u) -> nt.a .+ cols.x .*
-            (library === :r2d2_coefs ? only(nt.b.b) : nt.b.tau * only(nt.b.lambda .* nt.b.z));
-            slots = (:matrices, :array_parameters, :submodel_scopes))
-    end
-end
-
-@testset "multiple observation axes: spline and HSGP slots" begin
-    cols = (; x = collect(range(-2.0, 3.0; length = 8)), y = collect(range(0.1, 0.8; length = 8)))
-    _ma_check(quote
-        spline_basis(:s_x, x; k = 4)
-        a ~ Normal(0, 1)
-        mu = a .+ spline(:s_x)
-        y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> begin
-        X = reshape(cols.x .- sum(cols.x) / length(cols.x), :, 1)
-        Z = hcat(p.columns[:s_x_Zpen_1], p.columns[:s_x_Zpen_2])
-        nt.a .+ X * nt.b_s_x_fixed + Z * (only(nt.sd_s_x) .* nt.b_s_x_raw)
-    end; slots = (:spline_bases, :spline_vectors))
-    _ma_check(quote
-        hsgp_basis(:h_x, x; k = 3)
-        a ~ Normal(0, 1)
-        mu = a .+ hsgp(:h_x)
-        y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> begin
-        m, L = only(only(p.hsgp_bases).fits)
-        omega = (1:3) .* (pi / (2L))
-        P = [sin(w * (x - m + L)) / sqrt(L) for x in cols.x, w in omega]
-        weights = nt.sigma_h_x .* sqrt(nt.rho_h_x * sqrt(2pi)) .*
-            exp.(-0.25 .* nt.rho_h_x^2 .* omega.^2) .* nt.beta_raw_h_x
-        nt.a .+ P * weights
-    end; slots = (:hsgp_bases,))
-end
-
-@testset "multiple observation axes: varying applications" begin
-    cols = (; y = [0.1, 0.2, 0.3, -0.1], g1 = [1, 2, 1, 3],
-        g2 = [2, 3, 1, 2], w1 = [0.7, 0.2, 0.5, 0.9], w2 = [0.3, 0.8, 0.5, 0.1])
     _ma_check(quote
         a ~ Normal(0, 1)
-        d ~ varying_draws(mm(g1, g2; weights = (w1, w2)), [1])
-        r ~ varying_slice(d, 1)
-        mu = a .+ r
+        X = hcat(x)
+        b ~ _ma_declared_columns(X)
+        mu = a .+ X * b
         y .~ Normal.(mu, 1.0)
-    end, cols, (p, l, nt, u) -> begin
-        sfx = only(p.varying_draws).suffix
-        tau = only(getproperty(nt, Symbol(:tau_, sfx)))
-        z = getproperty(nt, Symbol(:z_flat_, sfx))
-        nt.a .+ tau .* (cols.w1 .* z[cols.g1] .+ cols.w2 .* z[cols.g2])
-    end; slots = (:varying_draws, :varying_slices))
-    # Stratified constrain remains unsupported; use the declared layout
-    # slices directly, as in the existing single-axis acceptance.
-    strata_cols = (; y = cols.y, g = [1, 2, 1, 3], stratum = [1, 1, 1, 2])
-    _ma_check(quote
-        a ~ Normal(0, 1)
-        d ~ varying_draws(gr(g; by = stratum), [1])
-        r ~ varying_slice(d, 1)
-        mu = a .+ r
-        y .~ Normal.(mu, 1.0)
-    end, strata_cols, (p, l, nt, u) -> begin
-        z = u[_ma_segment(l, :z_flat_g)]
-        tau = [exp(only(u[_ma_segment(l, Symbol(:tau_g_s, k))])) for k in 1:2]
-        a = only(u[_ma_segment(l, :a)])
-        a .+ tau[strata_cols.stratum] .* z[strata_cols.g]
-    end; slots = (:varying_draws, :varying_slices), host_values = (l, u) -> nothing)
+    end, cols, (p, l, nt, u) -> nt.a .+ cols.x .* only(nt.b.c);
+        slots = (:matrices, :array_parameters, :submodel_scopes))
 end
 
 @testset "multiple observation axes: packed missing observations" begin
@@ -248,25 +180,21 @@ end
     @test_throws "1:n_obs (4)" validate_data(bad)
 end
 
-@testset "multiple observation axes: kernel lanes and retired metadata" begin
+@testset "multiple observation axes: independent indexed observations" begin
     cols = Dict{Symbol,Any}(:x1 => [0.5, 1.0, 1.5, 2.0], :y1 => [0.4, 1.1, 1.4, 2.2],
         :x2 => [0.5, 1.0, 1.5], :y2 => [1, 2, 3])
     ast = quote
         b ~ Normal(0, 1)
-        p1 ~ plate(x1, y1; subjects=n1) do xx1, yy1
-            mu1 = b .* xx1
-            yy1 .~ Normal.(mu1, 1)
-            mu1
+        @plate for i in eachindex(y1)
+            mu1[i] = b * x1[i]
+            y1[i] ~ Normal(mu1[i], 1)
         end
-        p2 ~ plate(x2, y2; subjects=n2) do xx2, yy2
-            mu2 = exp.(b .* xx2)
-            yy2 .~ Poisson.(mu2)
-            mu2
+        @plate for j in eachindex(y2)
+            mu2[j] = exp(b * x2[j])
+            y2[j] ~ Poisson(mu2[j])
         end
     end
-    p = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols;
-        dims=Dict(:n1 => 4, :n2 => 3))
-    @test length(p.kernel_plates) == 2
+    p = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols)
     @test p.n_obs == 7
     built = build_kernel(p)
     q = prepare_query(built, p, :sampler)
@@ -276,8 +204,7 @@ end
     cols[:y] = [0.1, 0.3, 0.2, -0.2, 0.4]
     cols[:other] = [-0.1, 0.5]
     push!(ast.args, :(y .~ Normal.(b, 1)), :(other .~ Normal.(b, 1)))
-    mixed = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols;
-        dims=Dict(:n1 => 4, :n2 => 3))
+    mixed = bind_data(lower_rkppl(ast, cols; conditioned=keys(cols)), cols)
     @test mixed.n_obs == 14
     mbuilt = build_kernel(mixed)
     mq = prepare_query(mbuilt, mixed, :sampler)
@@ -289,15 +216,11 @@ end
         sum(cols[:x2] .* (cols[:y2] .- exp.(0.2 .* cols[:x2]))) +
         sum(cols[:y] .- 0.2) + sum(cols[:other] .- 0.2) - 0.2
     @test only(g) ≈ dg
-    # Sharing a kernel input does not waive ordinary broadcasting checks.
+    # A shared input must still cover the authored observation axis.
     mismatch = deepcopy(ast)
     mismatch.args[end-1] = :(y .~ Normal.(b .* x1, 1))
     @test_throws "column length 4 ≠ the 5 rows of y" bind_data(
-        lower_rkppl(mismatch, cols; conditioned=keys(cols)), cols;
-        dims=Dict(:n1 => 4, :n2 => 3))
-    retired = ReactiveKernelsPPL._with(p;
-        event_lps=[LinearPKEventLPSpec(:retired, :s, 5, 1.5, nothing, :legacy)])
-    @test_throws "implicit event-LP parameters are retired" validate_structure(retired)
+        lower_rkppl(mismatch, cols; conditioned=keys(cols)), cols)
 end
 
 @testset "multiple observation axes: shared coefficients and ambiguous trajectories" begin

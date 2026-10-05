@@ -112,11 +112,11 @@ function _vc_cases(n)
             mu = a .+ x
             y .~ Normal.(mu, 1.0)
         end, data, mean = q -> q.a .+ x),
-        (label = "library contrast composition", ast = quote
+        (label = "prefix/gather value composition", ast = quote
             a ~ Normal(0, 1)
             b ~ Normal(0, 1)
             s ~ Dirichlet([1.0, 1.0])
-            m ~ monotonic(c, s)
+            m = cumsum(vcat(0.0, s))[c]
             w = 2 .* b .* m .* x
             unused = sum(m)
             mu = a .- w .+ sum(m)
