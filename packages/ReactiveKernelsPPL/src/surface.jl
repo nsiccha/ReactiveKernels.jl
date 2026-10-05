@@ -8497,6 +8497,12 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             # readers, such as a reduction of a library contrast.
             node in datas || push!(datas, node)
             return node
+        elseif get(ctx.detshape, node, :scalar) === :vector &&
+                _composed_data_only(node, ctx, Set{Symbol}())
+            # A data-only definition (`v = log.(x .+ 2)`) is a derived
+            # column, read like the data its inline spelling reads.
+            node in datas || push!(datas, node)
+            return node
         elseif _is_array_def(node, ctx)
             # A model-level array definition (`r = d[:, 1]`, a column of a
             # collected row matrix) is one value leaf, as its inline
@@ -8545,6 +8551,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         "sub-predictors and scalars)")
     isempty(node.args) && return _sfail("$where has an empty call node")
     op = node.args[1]
+    # An undotted module call over data and model values (`f(x)`,
+    # `f(s, x)`) is one model-level value leaf, as its named spelling
+    # (`v = f(x)`) and a call reading no column are.
+    op isa GlobalRef && !_composed_has_sub(node, ctx, true) &&
+        return _composed_scalar_leaf!(pname, node, ctx, scalars)
     op isa Symbol || return _sfail("$where has an anonymous call node")
     args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
     if op === :.* || op === :.+ || op ===:.-
