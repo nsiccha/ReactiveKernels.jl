@@ -43,6 +43,23 @@ const BORROWED = vectorize(borrowed_curve; batched=:position, reuse=true)
 const USED_BORROWED = copy(BORROWED)
 const BORROWED_WARMUP = USED_BORROWED([1.0, 2.0], [3.0, 4.0]; amount=2.0)
 
+@kernel pair_locations(x) = begin
+    locations = Float64.(x)
+    left = locations
+    right = reshape(locations, 1, :)
+    return left, right
+end
+
+@kernel pair_grid(x, scale) = begin
+    left, right = pair_locations(x)
+    result = plate(left, right, Ref(scale)) do a, b, s
+        distance = abs(a - b)
+        s * exp(-distance)
+    end
+    return result
+end
+const PAIR_GRID = prepare(pair_grid)
+
 module Nested
 using ReactiveKernels
 import ..PrecompiledPreparedConsumer: trajectory, HAVE

@@ -264,6 +264,22 @@ function condition(plan::StructuralPlan; kwargs...)
     union!(computed, (d.name for d in plan.derived if
         any(r -> r.response === d.name, plan.responses)))
     columns = Dict{Symbol,ColumnData}(k => v for (k,v) in plan.columns if k ∉ computed)
+    # Bound response storage is numeric. Restore its host-side missing entries
+    # before rebinding so replacement data gets a fresh presence mask, while
+    # responses left unchanged keep their original absence pattern.
+    responses = Set(r.response for r in plan.responses)
+    union!(responses, (s.array for s in _observed_selections(plan, plan.columns)))
+    for name in responses
+        maskname = _observed_mask_name(name)
+        haskey(plan.columns, maskname) || continue
+        if haskey(columns, name)
+            value, present = columns[name], plan.columns[maskname]
+            restored = Array{Union{Missing,eltype(value)}}(undef, size(value))
+            map!((v, p) -> p ? v : missing, restored, value, present)
+            columns[name] = restored
+        end
+        delete!(columns, maskname)
+    end
     observing = copy(plan.conditioned)
     for (key, value) in kwargs
         name = get(aliases, key, key)
