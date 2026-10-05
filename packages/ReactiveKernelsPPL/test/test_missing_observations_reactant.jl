@@ -39,11 +39,19 @@ function _missing_compiled_check(fx, name; structure=false)
         for (kind, text) in texts
             _missing_save_ir(name, kind, text)
             ops = Dict{String,Int}()
-            regex = endswith(kind, "mlir") ? r"stablehlo\.[a-z_]+" :
+            regex = endswith(kind, "mlir") ?
+                r"(?m)^\s*(?:%[^=\n]+ = )?\"?([a-zA-Z_][a-zA-Z_0-9]*\.[a-zA-Z_0-9]+|return)(?=[\s\"(])" :
                 r"(?m)^\s*(?:ROOT )?%[\w.\-]+ = .*? ([a-z][a-z0-9-]*)\("
             for m in eachmatch(regex, text)
-                op = endswith(kind, "mlir") ? m.match : m.captures[1]
+                op = m.captures[1]
+                op == "return" && (op = "func.return")
                 ops[op] = get(ops, op, 0) + 1
+            end
+            if endswith(kind, "mlir")
+                for m in eachmatch(r"applies ([a-zA-Z_][a-zA-Z_0-9]*\.[a-zA-Z_0-9]+)", text)
+                    op = m.captures[1]
+                    ops[op] = get(ops, op, 0) + 1
+                end
             end
             _missing_save_ir(name, "$kind.inventory", repr(sort!(collect(ops))))
             println("MISSING_STRUCTURE ", name, " ", kind, " ", sort!(collect(ops)))
