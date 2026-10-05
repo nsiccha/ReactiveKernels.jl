@@ -61,15 +61,15 @@ end
         @test ad_gradient(ad, args...) ≈ [weight]
         @test q == saved_q && xs == saved_xs
     end
-    # Empty materialized child scans have a separate native static-activity
-    # capability gap (ReactiveKernels todo 1acmh42), also in the function control.
+    # Empty materialized child scans return the seed-derived zero gradient,
+    # including the ordinary function control and data-bound calls.
     for spec in (F.scaled_scan, F.scaled_function_scan), bound in (false, true)
         xs = Float64[]
         k = bound ? prepare(spec; bound=(; xs)) : prepare(spec)
         args = bound ? (q,) : (q, xs)
         ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), args...; active=:q)
         @test k(args...) === 0.0
-        @test_broken ad_gradient(ad, args...) ≈ [0.0]
+        @test ad_gradient(ad, args...) ≈ [0.0]
         @test q == [0.7] && isempty(xs)
     end
 end

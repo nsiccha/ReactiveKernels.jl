@@ -98,7 +98,8 @@ function _array_axis_levels(plan::StructuralPlan, name::Symbol, label, d::Expr)
     return d.args[1] === :unique ? unique(values) : collect(values)
 end
 
-function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d)
+function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d;
+        active = Set{Symbol}())
     d isa Int && return d
     if _is_levels_dim(d)
         levels = _array_axis_levels(plan, name, label, d)
@@ -119,8 +120,9 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d)
         return k == 2 ? length(m.columns) : _value_rows(plan, M)
     end
     if !haskey(plan.columns, M)
-        shape = _hcat_value_axes(plan, M, label)
-        shape === nothing || return shape[k]
+        shape = _value_axes(plan, M, active; data_axes = true)
+        # Julia supplies singleton dimensions beyond an array's rank.
+        shape === nothing || return k <= length(shape) ? shape[k] : 1
     end
     haskey(plan.columns, M) || _fail(label, "array $name axis " *
         "`$fn($M, $k)` needs a bound matrix $M")
@@ -130,51 +132,8 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d)
     return size(col, k)
 end
 
-# A live hcat can size a declared coefficient vector from its operands'
-# shapes without evaluating parameters. Scalars contribute one column;
-# vectors and matrices keep their actual dimensions. Rows still obey
-# hcat's equal-row rule, including singleton and empty domains.
-function _hcat_value_axes(plan::StructuralPlan, ex, label,
-        active = Set{Symbol}())
-    ex isa Number && return (1, 1)
-    if ex isa Symbol
-        if haskey(plan.columns, ex)
-            v = plan.columns[ex]
-            v isa Number && return (1, 1)
-            v isa AbstractVector && return (length(v), 1)
-            v isa AbstractMatrix && return size(v)
-            return nothing
-        end
-        any(p -> p.name === ex, plan.parameters) && return (1, 1)
-        ex in active && return nothing
-        i = findfirst(a -> a.name === ex, plan.assignments)
-        j = findfirst(d -> d.name === ex, plan.derived)
-        rhs = i !== nothing ? plan.assignments[i].expr :
-            j !== nothing ? plan.derived[j].expr : nothing
-        rhs === nothing && return nothing
-        push!(active, ex)
-        shape = _hcat_value_axes(plan, rhs, label, active)
-        delete!(active, ex)
-        return shape
-    end
-    ex isa Expr || return nothing
-    anchor = _matrix_intercept_anchor(ex)
-    if anchor !== nothing && haskey(plan.columns, anchor)
-        return (length(plan.columns[anchor]), 1)
-    end
-    ex.head === :call && !isempty(ex.args) &&
-        ex.args[1] === GlobalRef(Base, :hcat) || return nothing
-    parts = map(a -> _hcat_value_axes(plan, a, label, active), ex.args[2:end])
-    any(isnothing, parts) && return nothing
-    isempty(parts) && return (0, 1) # Base.hcat() returns an empty vector
-    rows = first(parts)[1]
-    all(p -> p[1] == rows, parts) || _fail(label,
-        "hcat operands have different row counts: " *
-        repr([p[1] for p in parts]) * " (DimensionMismatch)")
-    return (rows, sum(p[2] for p in parts))
-end
-_array_dim_size(plan::StructuralPlan, p::ArrayParameter, d) =
-    _array_dim_size(plan, p.name, p.label, d)
+_array_dim_size(plan::StructuralPlan, p::ArrayParameter, d; kwargs...) =
+    _array_dim_size(plan, p.name, p.label, d; kwargs...)
 
 """Concrete axis lengths of an array parameter on a bound plan."""
 function _array_dims(plan::StructuralPlan, p::ArrayParameter)
@@ -551,18 +510,29 @@ _is_array_assignment(plan::StructuralPlan, name) =
 # `A * B` takes `A`'s rows and `B`'s columns, an adjoint or `transpose`
 # swaps them (a vector becomes a 1×n row), `M[:, j]` keeps the axes read
 # with `:`, and a reduction is a scalar. `Any[]` is a scalar; `nothing`
-# means not known before sampling (a module function's result, a data
-# value).
+# means the shape is unavailable (for example, an opaque module call).
+# With bound data, data_axes resolves declared dimensions to concrete
+# lengths as well, without evaluating any sampled value.
 function _value_axes(plan::StructuralPlan, ex,
         seen::Set{Symbol} = Set{Symbol}(); data_axes::Bool = false)
     ex isa Number && return Any[]
     _is_bound_value_call(ex) && !_is_bound_array_value_call(ex) && return Any[]
     if ex isa Symbol
+        ex in seen && return nothing
         if data_axes && haskey(plan.columns, ex)
             value = plan.columns[ex]
             return value isa AbstractArray ? Any[size(value)...] : Any[]
         end
-        _is_array_param(plan, ex) && return Any[_array_param(plan, ex).dims...]
+        if _is_array_param(plan, ex)
+            p = _array_param(plan, ex)
+            (data_axes && isbound(plan)) || return Any[p.dims...]
+            push!(seen, ex)
+            r = p.family === :external ?
+                Any[_sampling_extent(plan, d, p.name) for d in p.dims] :
+                Any[_array_dim_size(plan, p, d; active = seen) for d in p.dims]
+            delete!(seen, ex)
+            return r
+        end
         i = findfirst(v -> v.name === ex, plan.vector_parameters)
         if i !== nothing
             sz = plan.vector_parameters[i].size
@@ -582,6 +552,14 @@ function _value_axes(plan::StructuralPlan, ex,
     levelaxis === nothing || return Any[:(levels($levelaxis))]
     ax(a) = _value_axes(plan, a, seen; data_axes)
     head = ex.head
+    anchor = _matrix_intercept_anchor(ex)
+    if anchor !== nothing
+        a = ax(anchor)
+        a === nothing && return nothing
+        all(d -> d isa Int, a) && return Any[prod(a; init = 1)]
+        length(a) == 1 && return a
+        return nothing
+    end
     # A vector literal keeps its outer axis even when its entries are live
     # scalars. Matrix products contract that axis rather than broadcasting
     # the matrix's columns into the observation domain.
@@ -598,10 +576,15 @@ function _value_axes(plan::StructuralPlan, ex,
             !all(_is_position, idx)) && return nothing
         return Any[d for (i, d) in zip(idx, base) if i === :(:)]
     end
-    head === :call && !isempty(ex.args) && ex.args[1] isa Symbol ||
-        return nothing
+    head === :call && !isempty(ex.args) || return nothing
     fn = ex.args[1]
     args = ex.args[2:end]
+    if fn isa GlobalRef && getglobal(fn.mod, fn.name) === Base.hcat
+        return _hcat_axes(Any[ax(a) for a in args])
+    end
+    # Qualified Base calls have the same shape rules as their bare spelling.
+    fn isa GlobalRef && fn.mod === Base && (fn = fn.name)
+    fn isa Symbol || return nothing
     fn in REDUCTION_FNS && return Any[]
     fn === :transpose && length(args) == 1 &&
         return _adjoint_axes(ax(args[1]))
@@ -613,6 +596,21 @@ function _value_axes(plan::StructuralPlan, ex,
         all(a -> ax(a) == Any[], args) && return Any[]
     end
     return nothing
+end
+
+# Concatenation shares the same shape walk as broadcasts, products and
+# declared arrays. It never runs live values or their element functions.
+function _hcat_axes(parts::Vector{Any})
+    any(isnothing, parts) && return nothing
+    isempty(parts) && return Any[0] # Base.hcat() returns an empty vector.
+    any(a -> length(a) > 2, parts) && return nothing
+    rows = Any[isempty(a) ? 1 : a[1] for a in parts]
+    if all(r -> r isa Int, rows) && !all(==(first(rows)), rows)
+        throw(DimensionMismatch("hcat operands have different row counts: $(repr(rows))"))
+    end
+    cols = Any[length(a) < 2 ? 1 : a[2] for a in parts]
+    all(c -> c isa Int, cols) || return nothing
+    return Any[first(rows), sum(cols)]
 end
 
 _adjoint_axes(a) = a === nothing ? nothing :
