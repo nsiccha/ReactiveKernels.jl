@@ -6659,8 +6659,11 @@ function _materialize_module_data!(plan::StructuralPlan,
         bind_only = true), already)
     isempty(names) && return names
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
+    guarded_arguments = Set{Symbol}()
     for d in plan.derived
-        exprs[d.name] = _guard_missing_observation_argument(d.name, d.expr, plan, columns)
+        ex = _guard_missing_observation_argument(d.name, d.expr, plan, columns)
+        exprs[d.name] = ex
+        ex === d.expr || push!(guarded_arguments, d.name)
     end
     vector_defs = Set{Symbol}(d.name for d in plan.derived)
     memo = Dict{Symbol,Any}()
@@ -6672,7 +6675,16 @@ function _materialize_module_data!(plan::StructuralPlan,
         haskey(columns, nm) && return columns[nm]
         haskey(exprs, nm) || throw(ContractValidationError(
             "[bind] data definition reads $nm, which is not bound data"))
-        memo[nm] = _eval_value_expr(exprs[nm], lookup, nm; calls)
+        value = _eval_value_expr(exprs[nm], lookup, nm; calls)
+        if nm in guarded_arguments && value isa AbstractArray{<:Real} &&
+                !isconcretetype(eltype(value)) && !isempty(value)
+            # The private absent arm returns zero without evaluating the
+            # authored cell. Promote its storage with the actual numeric
+            # results, preserving Float32/wider host types and every axis.
+            T = foldl((t, v) -> promote_type(t, typeof(v)), value; init=Union{})
+            isconcretetype(T) && (value = T.(value))
+        end
+        memo[nm] = value
         return memo[nm]
     end
     for nm in sort!(collect(names))
