@@ -1860,6 +1860,47 @@ function _prepare_missing_responses!(plan::StructuralPlan, columns::AbstractDict
     return columns
 end
 
+# Selected observation arguments have private gensym producers, one per
+# argument in _desugar_selected_plate. Their cell locals belong to that
+# observation. Guard those producers at binding and generation; public value
+# definitions and latent prior arguments retain their ordinary evaluation.
+function _guard_missing_observation_argument(name, ex, plan, columns)
+    indices = _selected_plate_indices(ex)
+    indices === nothing && return ex
+    private(n) = Base.isgensym(n) && occursin("_rkppl_selected", String(n))
+    # Location extraction can retain the private argument as an OffsetTerm
+    # reading a synthetic column, instead of keeping its plate in the term.
+    private(name) || any(p -> private(p.name) &&
+        any(t -> name in t.columns, p.terms), plan.predictors) || return ex
+    readers = [r for r in plan.responses if name in
+        _response_reads(plan, r, Set{Symbol}([name]))]
+    isempty(readers) && return ex
+    present = nothing
+    for r in readers
+        r.range isa Expr || return ex
+        rows = _response_range_indices(columns, r)
+        # Resolved module calls spell Base.eachindex, while the response
+        # range retains eachindex. Compare their ordinary bound indices.
+        collect(_eval_value_expr(indices, n -> columns[n], r.label)) == rows || return ex
+        value = get(columns, r.response, nothing)
+        value isa AbstractArray || return ex
+        mask = get(columns, _observed_mask_name(r.response), nothing)
+        mask === nothing && !(Missing <: eltype(value)) && return ex
+        mask === nothing && (mask = .!ismissing.(value))
+        all(mask) && return ex
+        selected = mask[rows, r.range.args[3:end]...]
+        present = present === nothing ? Array(selected) : present .| selected
+    end
+    guarded = deepcopy(ex)
+    inputs, lambda = guarded.args
+    lane = gensym(:_rkppl_argument_present)
+    push!(inputs.args, QuoteNode(present))
+    push!(lambda.args[1].args, lane)
+    lambda.args[2] = Expr(:block, LineNumberNode(0, :rkppl_plate),
+        Expr(:if, lane, lambda.args[2], 0))
+    return guarded
+end
+
 """Broadcast domains of bound observation statements: `(; rows, total,
 domains)`, where `domains` maps response labels to Julia broadcast axes.
 Singleton operands do not join independent domains. Structured constructors
@@ -6593,7 +6634,7 @@ function _materialize_module_data!(plan::StructuralPlan,
     isempty(names) && return names
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     for d in plan.derived
-        exprs[d.name] = d.expr
+        exprs[d.name] = _guard_missing_observation_argument(d.name, d.expr, plan, columns)
     end
     vector_defs = Set{Symbol}(d.name for d in plan.derived)
     memo = Dict{Symbol,Any}()

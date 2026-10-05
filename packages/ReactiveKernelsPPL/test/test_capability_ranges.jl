@@ -131,7 +131,7 @@ end
     end
 end
 
-@testset "literal plate ranges observe Julia indexing" begin
+@testset "literal plate observations cover the whole response" begin
     x, y = collect(range(0.2, 0.8; length=6)), collect(range(-0.2, 0.4; length=6))
     loop(R) = quote
         a ~ Normal(0, 1)
@@ -162,8 +162,8 @@ end
         @test length(output.y) == length(rows)
         @test isequal(data, saved)
     end
-    # refused: the loop leaves the supplied `y[1]` (or `y[5:6]`) unobserved
-    # (user decision `1g8uvgs`: every supplied response entry is observed).
+    # Refused under provisional user decision `1uhcm3b`: observation statements
+    # cover the whole response, with missing entries skipped by binding.
     for R in (:(2:6), :(1:4))
         plan = lower_rkppl(loop(R), (; y, x); conditioned=(:y, :x))
         @test_throws ContractValidationError bind_data(plan, (; y, x))
