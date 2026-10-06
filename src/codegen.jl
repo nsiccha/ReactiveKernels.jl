@@ -1263,10 +1263,14 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     (; ast, offset, type = T, input_types = Any[types[cid] for cid in hint_ids])
 end
 
-function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
-                                       op::_AuthoredPlateOp, callargs, callvalues,
-                                       pointwise_lhs, total_lhs; recycled = nothing,
-                                       input_type_hints = nothing)
+# Each authored plate carries a generated kernel type. The lowering itself is
+# structural, so specializing this orchestration method for every plate only
+# recompiles the transpiler; it does not improve the emitted callable.
+Base.@nospecializeinfer function _lower_authored_plate_native!(
+        body, runtime_ops, runtime_recipes,
+        @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
+        pointwise_lhs, total_lhs; recycled = nothing,
+        input_type_hints = nothing)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -1637,9 +1641,11 @@ function _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
     body
 end
 
-function _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
-                                           op::_AuthoredPlateOp, callargs, callvalues,
-                                           pointwise_lhs, total_lhs)
+# Keep tensorized lowering on the same non-specializing boundary as native.
+Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
+        body, runtime_ops, runtime_recipes,
+        @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
+        pointwise_lhs, total_lhs)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(

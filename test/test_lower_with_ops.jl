@@ -42,6 +42,33 @@ const _LWO_TRIPLE = lower_with_ops(
 const _LWO_FUNCTIONAL = compile(first(_LWO_TRIPLE))
 const _LWO_OPS = _LWO_TRIPLE[2]
 
+# Public generated breadth for the construction-cost regression: a model with
+# many independent authored plates and selected sum consumers, without relying
+# on any application model or retained corpus. This is deliberately generated
+# here so increasing the breadth does not leave a hand-written wall of recipes.
+let
+    body = Expr(:block)
+    totals = Symbol[]
+    for index in 1:64
+        pointwise = Symbol(:pointwise_, index)
+        transformed = Symbol(:transformed_, index)
+        cell = Symbol(:cell_, index)
+        total = Symbol(:total_, index)
+        push!(body.args, :($pointwise = plate(data, q) do value, parameter
+            $transformed::Float64 = log(value) + $index
+            $cell::Float64 = $transformed * parameter
+            $cell
+        end))
+        push!(body.args, :($total::Float64 = sum($pointwise)))
+        push!(totals, total)
+    end
+    push!(body.args, :(return $(Expr(:call, :+, totals...))))
+    definition = :(_lower_with_ops_many_plates(
+        q::Float64, data::Vector{Float64}) = $body)
+    Core.eval(@__MODULE__, Expr(:macrocall, Symbol("@kernel"),
+                                LineNumberNode(@__LINE__, @__FILE__), definition))
+end
+
 function _lwo_looploss(x)
     u = copy(x)
     kk = _LWO_F(u, nothing, 0.0)
@@ -101,6 +128,19 @@ end
         _, tensorized_inlined_ops, _ =
             lower_with_ops(p; tensorized = true, inline_embedded = true)
         @test tensorized_inlined_ops == inlined_ops
+    end
+
+    @testset "generated breadth of authored plate consumers" begin
+        p = plan(_lower_with_ops_many_plates)
+        @test count(recipe -> recipe.op isa ReactiveKernels._AuthoredPlateOp,
+                    p.recipes) == 64
+        q, data = 2.0, [1.0, 2.0, 4.0]
+        reference = sum(sum((log.(data) .+ index) .* q) for index in 1:64)
+        prepared = prepare(p; bound = p.have[2] => data)
+        @test prepared(q) == reference
+        ast, ops, recipes = lower_with_ops(p)
+        @test compile(ast)(ops, q, data) == reference
+        @test length(ops) == length(recipes)
     end
 
     @testset "reverse-mode gradient through the functional form" begin

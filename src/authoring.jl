@@ -293,8 +293,13 @@ boundary to the assignment outputs. Consequently the outer planner sees every
 callee recipe and can prune, fuse, CSE, visualize, or prepare it normally; no
 runtime `KernelSpec` call remains.
 """
-function _kernel_add!(graph::Graph, ins, outs, spec::KernelSpec, cost, cse_key,
-                      effectful, source = _NO_KERNEL_SOURCE)
+# Generated endpoint views give this structural splicer a new concrete
+# `KernelSpec` type repeatedly. The splice only inspects and clones that value;
+# avoiding inference per view leaves the cloned recipes unchanged.
+Base.@nospecializeinfer function _kernel_add!(
+        graph::Graph, @nospecialize(ins), @nospecialize(outs),
+        @nospecialize(spec::KernelSpec), cost, cse_key, effectful,
+        source = _NO_KERNEL_SOURCE)
     cost == 1.0 && cse_key === nothing && effectful === false ||
         throw(ArgumentError(
             "nested KernelSpec calls do not accept call-site @recipe metadata; " *
@@ -1437,6 +1442,31 @@ function _kernel_called_spec(ex, mod, locals, nested_specs)
     spec isa KernelSpec ? spec : nothing
 end
 
+# Object endpoint extraction reconstructs and merges the object's frozen graph.
+# A generated model commonly uses the same distribution endpoint in many plate
+# bodies, so keep those read-only source views local to one macro expansion.
+# The nested splicer clones recipes into each caller graph; it never mutates the
+# cached source view, and a new cache preserves `extract`'s public fresh-view
+# contract across separate authoring calls.
+function _kernel_cached_object_extract!(cache, object;
+        have = _KERNEL_DEFAULT_BOUNDARY, want = _KERNEL_DEFAULT_BOUNDARY)
+    views = get!(cache, object) do
+        Dict{Any,KernelSpec}()
+    end
+    get!(views, (:extract, have, want)) do
+        extract(object; have, want)
+    end
+end
+
+function _kernel_cached_object_full!(cache, object)
+    views = get!(cache, object) do
+        Dict{Any,KernelSpec}()
+    end
+    get!(views, (:full,)) do
+        _kernel_object_full_spec(object)
+    end
+end
+
 function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       nested_specs::Dict{Symbol,Any},
                                       local_types::Dict{Symbol,Any};
@@ -1444,7 +1474,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       materialized = Tuple{Symbol,Any,Any}[],
                                       cell_locals::Set{Symbol} = Set{Symbol}(),
                                       straight::Bool = true,
-                                      lift_specs::Bool = true)
+                                      lift_specs::Bool = true,
+                                      endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}())
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
     # A nested plate/scan owns a different scalar caller scope. Its authoring
@@ -1472,7 +1503,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             name = callee.args[2].value
             if object isa Union{KernelObjectSpec,_StatefulKernelSkeleton} &&
                     name in kernel_endpoint_names(object)
-                signature = extract(object; want=name).call_signature
+                signature = _kernel_cached_object_extract!(
+                    endpoint_cache, object; want = name).call_signature
                 if signature isa _KernelEndpointCallSignature &&
                         isempty(first(typeof(signature).parameters))
                     # A zero-owner object has the same graph application with
@@ -1492,7 +1524,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             if object isa Union{_StatefulKernelSkeleton,KernelObjectSpec} &&
                endpoint_name in kernel_endpoint_names(object)
                 endpoint_actuals = ex.args[2:end]
-                default_endpoint = extract(object; want = endpoint_name)
+                default_endpoint = _kernel_cached_object_extract!(
+                    endpoint_cache, object; want = endpoint_name)
                 signature = default_endpoint.call_signature
                 signature isa _KernelEndpointCallSignature || throw(ArgumentError(
                     "constructed object endpoint :$endpoint_name has no transparent call signature"))
@@ -1535,14 +1568,14 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                         push!(owner_formals, name)
                         push!(owner_actuals, actual)
                     end
-                    full = _kernel_object_full_spec(object)
+                    full = _kernel_cached_object_full!(endpoint_cache, object)
                     available = Tuple(keys(full))
                     for name in owner_formals
                         haskey(full, name) || throw(ArgumentError(
                             "unknown kernel object binding :$name for endpoint :$endpoint_name; " *
                             "available graph ports: $(join(string.(available), ", "))"))
                     end
-                    endpoint = extract(object;
+                    endpoint = _kernel_cached_object_extract!(endpoint_cache, object;
                         have = Tuple((owner_formals..., explicit...)),
                         want = endpoint_name)
                 end
@@ -1583,7 +1616,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
-                        cell_locals = cell_locals, straight = straight)
+                        cell_locals = cell_locals, straight = straight,
+                        endpoint_cache = endpoint_cache)
                     if straight
                         generated_port = gensym(Symbol(formal, :_binding))
                         generated_type = valtype(endpoint_inputs[index])
@@ -1619,7 +1653,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
-                        straight = straight)
+                        straight = straight, endpoint_cache = endpoint_cache)
                     if straight
                         generated_port = gensym(Symbol(explicit[index], :_argument))
                         generated_type = valtype(
@@ -1680,7 +1714,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             straight = straight && _kernel_straight_child(ex, i),
             lift_specs = lift_specs && !(ex.head in
                 (:for, :while, :generator, :comprehension, :try, :->,
-                 :function, :do, :let)))
+                 :function, :do, :let)), endpoint_cache = endpoint_cache)
         # Graph splicing operates on a whole recipe RHS. Lift a numerical
         # graph used as a strict subexpression into its own caller recipe,
         # including generated object endpoints. Otherwise a module KernelSpec
@@ -1748,7 +1782,9 @@ function _kernel_plate_cell_locals(body)
 end
 
 function _kernel_authored_plate_expr(rhs, mod,
-                                     caller_locals = Set{Symbol}())
+                                     caller_locals = Set{Symbol}();
+                                     endpoint_cache =
+                                         IdDict{Any,Dict{Any,KernelSpec}}())
     rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
     call, lambda = rhs.args
     call isa Expr && call.head === :call && !isempty(call.args) || return nothing
@@ -1811,7 +1847,7 @@ function _kernel_authored_plate_expr(rhs, mod,
         scalar_body, mod, union(Set(formals), caller_locals),
         nested_specs, local_types;
         context = "inside plate", materialized = materialized,
-        cell_locals = cell_locals)
+        cell_locals = cell_locals, endpoint_cache = endpoint_cache)
     signature = Tuple{Symbol,Any}[
         (name, get(local_types, name, GlobalRef(Core, :Any))) for name in formals]
     scalar_graph_body = _kernel_expression_result_body(
@@ -1840,7 +1876,8 @@ function _kernel_authored_plate_expr(rhs, mod,
                 Expr(:(::), _KERNEL_PLATE_VALUE_PORT, inferred))
     end
     scalar_spec = _kernel_expand(
-        scalar_graph_body, signature, nothing, mod; nested_specs = nested_specs)
+        scalar_graph_body, signature, nothing, mod;
+        nested_specs = nested_specs, endpoint_cache = endpoint_cache)
     operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_plate),
                      scalar_spec,
                      Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
@@ -1872,7 +1909,9 @@ end
 # With `history = h0` the do-block takes one more, LAST formal: the read-only
 # vector of the outputs so far (`h0` at and after the current step); `h0` is
 # the op's last argument, atomic like the carry seed.
-function _kernel_authored_scan_expr(rhs, mod)
+function _kernel_authored_scan_expr(rhs, mod;
+                                    endpoint_cache =
+                                        IdDict{Any,Dict{Any,KernelSpec}}())
     rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
     call, lambda = rhs.args
     call isa Expr && call.head === :call && !isempty(call.args) || return nothing
@@ -2007,7 +2046,8 @@ function _kernel_authored_scan_expr(rhs, mod)
     # lowers object endpoints and computed arguments at their recipe positions.
     # Rewriting the whole body first would miss assigned locals and could lift
     # arguments out of the recipe/lexical scope that defines them.
-    step_spec = _kernel_expand(step_body, signature, nothing, mod)
+    step_spec = _kernel_expand(
+        step_body, signature, nothing, mod; endpoint_cache = endpoint_cache)
     operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_scan),
                      step_spec,
                      Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))),
@@ -3544,7 +3584,8 @@ end
 
 function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                         call_signature = nothing, mod::Union{Module,Nothing} = nothing;
-                        nested_specs = Dict{Symbol,Any}())
+                        nested_specs = Dict{Symbol,Any}(),
+                        endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}())
     # Promote genuine RK `@node(expr)` markers into distinct schedulable recipe nodes
     # (identity-aware, collision-free, straight-line-only). A no-op — byte-identical —
     # for bodies with no `@node` (or only foreign `@node`).
@@ -3627,9 +3668,11 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 push!(outputs, (name, type_expr))
             end
             plate_expr = _kernel_authored_plate_expr(
-                rhs, mod, Set(Symbol(name) for (name, _) in signature_inputs))
+                rhs, mod, Set(Symbol(name) for (name, _) in signature_inputs);
+                endpoint_cache = endpoint_cache)
             plate_expr === nothing &&
-                (plate_expr = _kernel_authored_scan_expr(rhs, mod))
+                (plate_expr = _kernel_authored_scan_expr(
+                    rhs, mod; endpoint_cache = endpoint_cache))
             if plate_expr !== nothing
                 length(outputs) == 1 || throw(ArgumentError(
                     "an authored plate/scan produces exactly one named output port"))
@@ -3696,7 +3739,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             materialized = Tuple{Symbol,Any,Any}[]
             rewritten, inferred = _kernel_constructed_endpoint(
                 authored_rhs, mod, known, nested_specs, local_types;
-                materialized = materialized)
+                materialized = materialized, endpoint_cache = endpoint_cache)
             materialized_names = Set{Symbol}()
             for (name, T, rhs) in materialized
                 register!(name, T)
