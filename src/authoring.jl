@@ -3826,12 +3826,14 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     else
         for lo in 1:_KERNEL_EXPAND_CHUNK:recipe_count
             hi = min(lo + _KERNEL_EXPAND_CHUNK - 1, recipe_count)
-            chunk_fn = gensym(:kernel_expand_chunk)
+            # Keep the IIFE syntactically direct. Giving it a generated local
+            # name adds that binding to the enclosing scope and changes Julia's
+            # capture lowering for caller-authored hygienic locals in the
+            # nested recipe closures.
             push!(body,
-                  Expr(:(=), chunk_fn,
+                  Expr(:call,
                        Expr(:->, Expr(:tuple,),
                             Expr(:block, recipe_statements[lo:hi]...))))
-            push!(body, :($chunk_fn()))
         end
     end
     append!(body, postlude)
