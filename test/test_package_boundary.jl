@@ -1,3 +1,4 @@
+import Pkg
 using TOML
 import ReactiveKernelsNUTSExamples
 
@@ -13,6 +14,22 @@ import ReactiveKernelsNUTSExamples
     @test !haskey(project["deps"], "Enzyme")
     @test haskey(project["extras"], "Enzyme")
     @test "Enzyme" in project["targets"]["test"]
+
+    # Enzyme_jll 0.0.302 (required by Enzyme 0.13.211) segfaults native
+    # reverse gradients through functions that return freshly allocated
+    # arrays, such as index gathers, on Julia 1.10
+    # (EnzymeAD/Enzyme.jl#3776). Core declares Enzyme_jll only so this compat
+    # entry constrains every environment that contains ReactiveKernels; the
+    # binary stays out of `[deps]` and no extension loads it.
+    @test haskey(project["weakdeps"], "Enzyme_jll")
+    @test !haskey(project["deps"], "Enzyme_jll")
+    @test all(trigger -> "Enzyme_jll" ∉ (trigger isa String ? [trigger] : trigger),
+        values(project["extensions"]))
+    enzyme_jll = Pkg.Types.semver_spec(project["compat"]["Enzyme_jll"])
+    @test v"0.0.301" in enzyme_jll
+    @test v"0.0.302" ∉ enzyme_jll
+    @test v"0.0.303" in enzyme_jll
+
     # Core must not DEPEND on Enzyme (a test/extension-only AD backend), but
     # explanatory prose may name it: a comment documenting why core code
     # sidesteps an AD failure mode (e.g. `codegen.jl` narrowing a plate
