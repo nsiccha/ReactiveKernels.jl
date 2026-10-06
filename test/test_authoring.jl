@@ -143,7 +143,56 @@ end
 end
 end
 
+function _authoring_chunk_capture_expr(recipe_count)
+    capture = :original_read_indices
+    statements = Any[:(x::Int)]
+    for index in 1:recipe_count
+        output = Symbol(:chunked_y_, index)
+        push!(statements, Expr(:(=), output,
+                               :(x + sum($capture) + $index)))
+    end
+    push!(statements, Expr(:return, Symbol(:chunked_y_, recipe_count)))
+    kernel = Expr(:macrocall,
+                  GlobalRef(ReactiveKernels, Symbol("@kernel")),
+                  LineNumberNode(0), Expr(:block, statements...))
+    Expr(:let, Expr(:(=), capture, QuoteNode((1, 2, 3))), kernel)
+end
+
+function _authoring_count_chunk_forms(ex)
+    ex isa Expr || return (named = 0, direct = 0)
+    named = ex.head === :(=) && length(ex.args) == 2 &&
+            ex.args[1] isa Symbol &&
+            occursin("kernel_expand_chunk", string(ex.args[1])) &&
+            ex.args[2] isa Expr && ex.args[2].head === :->
+    direct = ex.head === :call && length(ex.args) == 1 &&
+             ex.args[1] isa Expr && ex.args[1].head === :-> &&
+             ex.args[1].args[1] == Expr(:tuple)
+    nested = map(_authoring_count_chunk_forms, ex.args)
+    (
+        named = Int(named) + sum((part.named for part in nested); init = 0),
+        direct = Int(direct) + sum((part.direct for part in nested); init = 0),
+    )
+end
+
 @testset "Declarative kernel authoring" begin
+    @testset "large authored captures keep direct chunk scopes" begin
+        source = _authoring_chunk_capture_expr(51)
+        expanded = macroexpand(@__MODULE__, source)
+        forms = _authoring_count_chunk_forms(expanded)
+        @test forms == (named = 0, direct = 2)
+
+        captured = Core.eval(@__MODULE__, expanded)
+        @test length(kernel_graph(captured).recipes) == 51
+        @test prepare(captured)(4) == 61
+
+        operation = first(kernel_graph(captured).recipes).op
+        source_function = operation.f
+        @test source_function.runtime_f !== nothing
+        @test ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc(
+            source_function.runtime_f, source_function.captures, 4,
+        ) == 11
+    end
+
     @testset "function-shaped definitions, optional types, and exposed ports" begin
         f_calls = Ref(0)
         h_calls = Ref(0)
