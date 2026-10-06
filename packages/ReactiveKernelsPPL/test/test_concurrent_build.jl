@@ -3,9 +3,10 @@ using Test
 
 # Bounded concurrent-construction regression (snag rkppl-thread-saf-0a062a1c):
 # independent lower/bind/build pipelines over distinct ASTs must be safe to
-# run from concurrent tasks with no caller-side lock — every build lands on
-# its own `PPLGeneratedModels` binding (package-owned lock) and lowering
-# never mutates its inputs. Passes on one thread too (tasks serialize).
+# run from concurrent tasks with no caller-side lock — a build binds nothing
+# in `PPLGeneratedModels` and takes no package lock, each task gets back its
+# own spec, and lowering never mutates its inputs. Passes on one thread too
+# (tasks serialize).
 
 _ccb_cols1() = Dict{Symbol,AbstractVector}(
     :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],

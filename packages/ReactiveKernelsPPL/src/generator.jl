@@ -12,7 +12,7 @@ include("evidence.jl")
 # nothing for data-only recipes. Plates compile to allocation-free loops
 # with shared work hoisted; constraining stays hand-rolled (no bijectors).
 # The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
-# (counter-suffixed binding per build).
+# without binding a name there.
 
 
 """
@@ -23,10 +23,16 @@ program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
 [`LayoutTable`](@ref) (R10 read API for the sampler side).
 
-Thread safety: concurrent `build_kernel` calls over independent plans are
-supported — the counter-suffixed `PPLGeneratedModels` binding is assigned
-under a package-owned lock, so every build gets a distinct binding with no
-caller-side synchronization. The returned spec closes over build-time
+Concurrency: `build_kernel` is concurrency-safe. Independent plans may be
+built from concurrent tasks with no caller-side synchronization: a build
+binds nothing in a shared module and takes no package lock. Concurrent
+builds overlap in planning and Julia lowering, but most of a build is Julia
+compiling the generated construction code, which Julia 1.10 serializes
+process-wide (1.12 and 1.13: its type inference). Concurrent builds
+therefore gain little aggregate throughput over serial ones, and on 1.12
+contention on that lock can make them slower.
+
+The returned spec closes over build-time
 eval'd code. Construction resolves module bindings in a package-owned
 latest-world scope, including just-evaluated kernels; subsequent execution
 uses its own boundary: `prepare` it and call it through [`prepare_query`](@ref) /
@@ -226,8 +232,8 @@ _data_arg(name::Symbol, col::AbstractArray) =
 
 # Dedicated eval scope for generated models. The `using` lines resolve via
 # this package's own Project (by file location), so generated code loads in
-# ANY consumer session with no LOAD_PATH dependence. One counter-suffixed
-# binding per build; slice-1 scale makes interning harmless.
+# ANY consumer session with no LOAD_PATH dependence. Builds bind nothing
+# here (see `_eval_kernel_def`).
 module PPLGeneratedModels
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
@@ -275,27 +281,14 @@ import .._simplex_slices_constrain, .._simplex_slices_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 end
 
-const _MODEL_COUNTER = Ref(0)
-
-# Package-owned binding lock: the counter increment plus the two
-# `PPLGeneratedModels` evals are one critical section, so concurrent
-# `build_kernel` calls always land on distinct bindings (an unsynchronized
-# `Ref` increment drops updates under contention and two builds would
-# silently share one binding — the second model's def wins and the first
-# task reads back the wrong kernel).
-const _MODEL_EVAL_LOCK = ReentrantLock()
-
+# The stateless `@kernel name(...) = body` expands to `name = <KernelSpec>`.
+# Inside a `let` that assignment is local, so the eval's value is the spec and
+# nothing is bound in `PPLGeneratedModels`: concurrent builds share no
+# package state (no lock, no counter) and a built spec is retained only by
+# its caller.
 function _eval_kernel_def(def::Expr)
-    lock(_MODEL_EVAL_LOCK) do
-        _MODEL_COUNTER[] += 1
-        name = Symbol(:ppl_model_, _MODEL_COUNTER[])
-        sig = def.args[1]
-        renamed = Expr(:(=), Expr(:call, name, sig.args[2:end]...), def.args[2])
-        call = Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator),
-            renamed)
-        Core.eval(PPLGeneratedModels, call)
-        return Core.eval(PPLGeneratedModels, name)
-    end
+    call = Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator), def)
+    return Core.eval(PPLGeneratedModels, Expr(:let, Expr(:block), call))
 end
 
 # Scalar + derived assignments in topo order (params already constrained
