@@ -154,7 +154,11 @@ function _partial_plate_live_domain(::Type{<:AbstractArray{T,N}},
 end
 
 _partial_plate_recipe(g, recipe, known, op) = nothing
-function _partial_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A}) where {K,A}
+# Generated inner-kernel types are data to this structural pass. Specializing
+# on them recompiles the entire partial evaluator once per authored plate.
+Base.@nospecializeinfer function _partial_plate_recipe(
+        g, recipe, known, @nospecialize(op::_AuthoredPlateOp))
+    atomic_inputs = typeof(op).parameters[2]
     inner = op.kernel.plan
     length(inner.have) == length(recipe.inputs) || return nothing
     length(inner.want) == 1 || return nothing
@@ -181,11 +185,12 @@ function _partial_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A}) wher
         cid = canon_id(g, outer.id)
         haskey(known, cid) || continue
         data = known[cid]
-        index in A || _partial_plate_input(data) || return nothing
+        index in atomic_inputs || _partial_plate_input(data) || return nothing
         cid = canon_id(inner.graph, input.id)
         push!(bound, cid)
-        arguments[cid] = index in A ? Ref(data) : data
-        types[cid] = index in A || data isa Number ? typeof(data) : eltype(data)
+        arguments[cid] = index in atomic_inputs ? Ref(data) : data
+        types[cid] = index in atomic_inputs || data isa Number ?
+            typeof(data) : eltype(data)
     end
     # Nullary inner recipes can form a prefix even when this plate has no
     # bound inputs. Without a bound domain, retain its per-cell execution.
@@ -203,7 +208,7 @@ function _partial_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A}) wher
     bound_axes = Base.Broadcast.combine_axes(values(arguments)...)
     any(isempty, bound_axes) && return nothing
     fixed_domain = all(enumerate(recipe.inputs)) do (index, input)
-        index in A || haskey(known, canon_id(g, input.id)) ||
+        index in atomic_inputs || haskey(known, canon_id(g, input.id)) ||
             _partial_plate_live_domain(valtype(input), bound_axes)
     end
     fixed_domain || return nothing
@@ -252,7 +257,7 @@ function _partial_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A}) wher
 
     cache_values = Value[]
     cache_data = Any[]
-    atomic = Int[A...]
+    atomic = Int[atomic_inputs...]
     for (index, v) in enumerate(frontier)
         data = arguments[canon_id(inner.graph, v.id)]
         if data isa Ref
@@ -371,8 +376,12 @@ end
 end
 
 _partition_plate_recipe(g, recipe, known, op, pending, want, fresh) = nothing
-function _partition_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A},
-                                 pending::Vector{Recipe}, want, fresh) where {K,A}
+# Branch partitioning likewise consumes the operation metadata dynamically;
+# its residual operation still retains the precise generated kernel type.
+Base.@nospecializeinfer function _partition_plate_recipe(
+        g, recipe, known, @nospecialize(op::_AuthoredPlateOp),
+        pending::Vector{Recipe}, want, fresh)
+    atomic_inputs = typeof(op).parameters[2]
     inner = op.kernel.plan
     length(inner.have) == length(recipe.inputs) || return nothing
     length(inner.want) == 1 || return nothing
@@ -394,21 +403,23 @@ function _partition_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A},
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
         cid = canon_id(g, outer.id)
         if !haskey(known, cid)
-            index in A || valtype(outer) <: Number || (unknown_axis = true)
+            index in atomic_inputs || valtype(outer) <: Number ||
+                (unknown_axis = true)
             continue
         end
         data = known[cid]
-        if !(index in A) && data isa AbstractArray
+        if !(index in atomic_inputs) && data isa AbstractArray
             ndims(data) == 1 || return nothing
             singleton_axis |= length(data) == 1
             if length(data) != 1
                 n === nothing && (n = length(data))
                 length(data) == n || return nothing
             end
-        elseif !(index in A) && !(data isa Number)
+        elseif !(index in atomic_inputs) && !(data isa Number)
             return nothing
         end
-        bound[canon_id(inner.graph, input.id)] = index in A ? Ref(data) : data
+        bound[canon_id(inner.graph, input.id)] =
+            index in atomic_inputs ? Ref(data) : data
     end
     # A bound singleton is the complete domain when every other live
     # operand is shared/scalar. Keep broadcast expansion conservative when
@@ -450,7 +461,7 @@ function _partition_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A},
     lane_values = Set{Int}()
     anchor = nothing
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
-        index in A && continue
+        index in atomic_inputs && continue
         cid = canon_id(inner.graph, input.id)
         if haskey(bound, cid)
             bound[cid] isa AbstractArray && length(bound[cid]) == n || continue
@@ -498,14 +509,15 @@ function _partition_plate_recipe(g, recipe, known, op::_AuthoredPlateOp{K,A},
         kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs,
             kernel.outputs, kernel.plan, kernel.ast,
             Tuple(readable[r.id] for r in arm_recipes))
-        arm_plate = _AuthoredPlateOp{typeof(kernel),A}(kernel, op.axis_checks)
+        arm_plate = _AuthoredPlateOp{typeof(kernel),atomic_inputs}(
+            kernel, op.axis_checks)
 
         # The arm's plate arguments: shared/scalar arguments pass unchanged,
         # bound lane vectors are gathered now, live ones at run time.
         arguments = Value[]
         for (index, outer) in enumerate(recipe.inputs)
             cid = canon_id(g, outer.id)
-            if single || index in A
+            if single || index in atomic_inputs
                 push!(arguments, outer)
             elseif haskey(known, cid)
                 data = known[cid]
