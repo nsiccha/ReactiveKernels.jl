@@ -53,6 +53,15 @@ suite as parallel shards, because a single job cannot finish it within GitHub's
 360-minute job limit. A failing test or test file does not stop the suite: every
 later file still runs, and the run then fails, listing each recorded failure.
 
+`RKPPL_TEST_FILES=a.jl,b.jl` runs only the named ReactiveKernelsPPL test files;
+earlier files still load, with their tests removed, for the helpers later files
+use. `RKPPL_TEST_BACKENDS=native` leaves out the Reactant files (names
+containing `reactant`) and needs no Reactant: `Pkg.test` installs every test
+dependency, so to test without Reactant run
+`packages/ReactiveKernelsPPL/test/runtests.jl` with an environment that develops
+the package and adds its dependencies and test dependencies except Reactant. Native files never
+use Reactant or a Reactant file's definitions; the suite checks this.
+
 The checked-in `[sources]` entries become useful automatically on newer Julia
 versions; `setup.jl` remains the Julia-1.10-compatible source of local path
 development. CI runs the same path development explicitly rather than assuming
