@@ -9333,11 +9333,13 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
         return _extract_summand(pname,
             Expr(:call, GlobalRef(Base, :getindex), core.args...), sign, ctx)
     end
-    # Reads of a declared array value (`z[g]`, `phi[1]`) or of an
-    # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
-    # values, not factor coefficients: scalar assignments by position,
-    # per-observation columns when gathered.
+    # Reads of a declared array value (`z[g]`, `phi[1]`, `c[1]` of an
+    # `Ordered` vector) or of an array-valued definition (`b[g, 1]`,
+    # `b = z * (sd .* L)'`) are values, not factor coefficients: scalar
+    # values by position, per-observation columns when gathered.
     (core.args[1] in ctx.value_arrays ||
+        core.args[1] in ctx.dirichlet_names ||
+        core.args[1] in ctx.ordered_names ||
         _is_array_def(core.args[1], ctx) ||
         _is_model_value_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
