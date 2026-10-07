@@ -387,7 +387,7 @@ and lock the one Reactant 0.2.289 lifted:
   testset, including the gradients against central differences. Changing
   RK's lowering only moves which spellings the optimizer splits: a
   materialization loop that never reads the output's length slowed
-  small-cell plate gradients by 25 to 50 percent, and routing scalar-array
+  small-cell plate gradients by 14 to 51 percent, and routing scalar-array
   arithmetic through the native materializer still failed inside that
   materializer. Values are unaffected; the testset pins the empty-group
   gradients as broken on Julia 1.10.
