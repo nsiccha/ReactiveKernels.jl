@@ -2624,7 +2624,9 @@ end
 # (`_native_hcat`, `_native_vcat`, `_native_hvcat`).  They return Base's
 # result and send every operand combination they do not specialize back to
 # Base; they exist for native Enzyme reverse, which cannot differentiate
-# Base's dense methods when constant and active operands meet (core.jl).  A
+# Base's dense methods when constant and active operands meet, and keep
+# scalar and mixed literals off the generic methods SparseArrays substitutes
+# for Base's (core.jl).  A
 # callee that a port or local shadows keeps its own meaning, as does a
 # function that merely shares the name; bracket syntax always means Base's
 # functions, as in Julia.  The tensorized companion keeps its own lowering

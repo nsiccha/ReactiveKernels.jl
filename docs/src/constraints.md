@@ -432,15 +432,22 @@ and lock the one Reactant 0.2.289 lifted:
   well. A design matrix of data columns and a parameter-dependent column,
   `hcat(ones(n), x, exp.(a .* x))`, is this shape. The native kernel body
   therefore lowers calls of Base's `hcat`, `vcat` and `hvcat`, and the
-  bracket syntax Julia lowers to them, to RK-owned companions. For
-  same-element-type isbits `Vector`/`Matrix` operands, they allocate Base's
-  result and copy each operand in its own inlined call; every other operand
-  combination and every shape Base rejects call Base, which keeps its value
-  and error. Ordinary reverse then differentiates the authored graph, with
-  no activity annotation or derivative rule. The tensorized body keeps its
-  own concatenation lowering. Concatenation inside an opaque helper the
-  kernel calls, `cat`, `stack` and non-dense operands (views, adjoints)
-  keep Base's methods and remain the backend's limitation.
+  bracket syntax Julia lowers to them, to RK-owned companions. For `Number`,
+  `Vector` and `Matrix` operands whose promoted element type is isbits, they
+  allocate Base's result, with Base's shape, promoted element type and
+  values, and write each operand in its own inlined call; a number is a 1×1
+  block. Every other operand combination and every shape Base rejects call
+  Base, which keeps its value and error. Ordinary reverse then
+  differentiates the authored graph, with no activity annotation or
+  derivative rule. The same companions keep scalar and mixed literals such
+  as `[-a 0.0; a -b]` and `[M v; 0.0 1.0]` on a dense, inferred path:
+  SparseArrays, which Enzyme loads, otherwise claims Base's concatenation of
+  numbers and dense arrays and builds the result through slower generic
+  methods, and Base's own mixed scalar/array `hvcat` infers no concrete
+  result type. The tensorized body keeps its own concatenation lowering.
+  Concatenation inside an opaque helper the kernel calls, `cat`, `stack`
+  and non-dense operands (views, adjoints) keep Base's methods and remain
+  the backend's limitation.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later

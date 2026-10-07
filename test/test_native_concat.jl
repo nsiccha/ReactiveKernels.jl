@@ -53,24 +53,81 @@ end
         for (rows, args...) in hvcats
             @test _same_as_base(RK._native_hvcat, hvcat, rows, args...)
         end
+        # Scalars are 1×1 blocks; numbers and vectors alone stack to a vector.
+        s(o) = only(_values(T, 1, o))
+        hcats = ((s(1), s(2)), (s(1),), (m(1, 2), s(3)), (v(1), s(2), m(1, 2)),
+                 (v(3), s(1)), (s(1), m(2, 2)))
+        for args in hcats
+            @test _same_as_base(RK._native_hcat, hcat, args...)
+        end
+        vcats = ((s(1), s(2), s(3)), (s(1),), (v(2), s(1)), (s(1), v(2), s(4)),
+                 (v(0), s(1)), (m(2, 1), s(3)), (s(1), m(2, 1, 2)),
+                 (m(2, 2), s(3)), (v(2), s(1), m(1, 1)))
+        for args in vcats
+            @test _same_as_base(RK._native_vcat, vcat, args...)
+        end
+        hvcats = (((3, 3, 3), ntuple(k -> s(k), 9)...), ((1,), s(1)),
+                  ((2, 4), m(3, 3), v(3, 9), s(1), s(2), s(3), s(4)),
+                  ((2, 3), m(2, 2), v(2), s(1), s(2), s(3)),
+                  ((3, 1), s(1), s(2), m(1, 1), m(2, 3)),
+                  ((2, 2), m(2, 2), v(2), s(1), s(2)),
+                  ((2, 2), s(1), s(2), s(3)), ((2, 2), ntuple(k -> s(k), 5)...),
+                  ((3, 2), ntuple(k -> s(k), 5)...),
+                  ((1, 2), m(0, 2), s(1), s(2)))
+        for (rows, args...) in hvcats
+            @test _same_as_base(RK._native_hvcat, hvcat, rows, args...)
+        end
     end
-    # Operand combinations the companions do not specialize keep Base's call.
+    # Mixed element types promote as in Base.
     x, y = [1.0, 2.0], [3, 4]
-    for args in ((x, y), (x, 5.0), (5.0, x), (["a", "b"], ["c", "d"]),
-                 (Any[1, 2], Any[3, 4]), (view(x, 1:2), x), (x', x'), (1, 2.0), ())
+    for args in ((x, y), (x, 5.0), (5.0, x), (1, 2.0), (true, 2), (Int8(1), [2.0]),
+                 (π, 1.0), (π,), (Float32(1), [2.0f0], 3), (x, [true, false]))
+        @test _same_as_base(RK._native_hcat, hcat, args...)
+        @test _same_as_base(RK._native_vcat, vcat, args...)
+    end
+    @test _same_as_base(RK._native_hvcat, hvcat, (2, 2), 1, 2.5, true, 0)
+    @test _same_as_base(RK._native_hvcat, hvcat, (2, 3), [1 2; 3 4], x, 0, 0.5f0, 1)
+    # Operand combinations the companions do not specialize keep Base's call.
+    for args in ((["a", "b"], ["c", "d"]), (Any[1, 2], Any[3, 4]),
+                 (view(x, 1:2), x), (x', x'), (big(1.0), 2.0), (x, Real[3]), ())
         @test _same_as_base(RK._native_hcat, hcat, args...)
         @test _same_as_base(RK._native_vcat, vcat, args...)
     end
     @test _same_as_base(RK._native_hvcat, hvcat, (2, 2), 1.0, 2.0, 3.0, 4.0)
+    @test _same_as_base(RK._native_hvcat, hvcat, (2, 2), big(1.0), 2.0, 3.0, 4.0)
     @test _same_as_base(RK._native_hvcat, hvcat, 2, [1.0 2.0], [3.0 4.0])
     @test _same_as_base(RK._native_hvcat, hvcat, (1, 1), x', [3.0 4.0])
+    for rows in ((), (0,), (0, 2), (2, -1))
+        @test _same_as_base(RK._native_hvcat, hvcat, rows, x, 2.0)
+        @test _same_as_base(RK._native_hvcat, hvcat, rows, 1.0, 2.0)
+    end
     # A fresh output: writing it never reaches an operand.
     a, b, c = [1.0, 2.0], [3.0, 4.0], [5.0 6.0; 7.0 8.0]
     for out in (RK._native_hcat(a, b), RK._native_vcat(a, b),
-                RK._native_vcat(c, c), RK._native_hvcat((2, 1), a, b, c))
+                RK._native_vcat(c, c), RK._native_hvcat((2, 1), a, b, c),
+                RK._native_vcat(a, 1.0), RK._native_hvcat((2, 3), c, a, 0.0, 0.0, 1),
+                RK._native_vcat(1.0, a, 2))
         out .= -1
     end
     @test a == [1.0, 2.0] && b == [3.0, 4.0] && c == [5.0 6.0; 7.0 8.0]
+end
+
+# Scalar and mixed literals as the native body lowers them: an inferred dense
+# result, whichever generic method (SparseArrays, which Enzyme loads, claims
+# Base's) would otherwise take the call.  Base's own mixed `hvcat` infers no
+# concrete type.
+_system(a, b) = RK._native_hvcat((2, 2), -a, 0, a, -b)
+_affine(M, e) = RK._native_hvcat((2, 3), M, RK._native_vcat(e, 0.0), 0.0, 0.0, 1.0)
+_row(a, M) = RK._native_hcat(a, M[:, 1]', 1)
+_column(a, x) = RK._native_vcat(a, x, 1)
+
+@testset "native scalar and mixed literals are inferred" begin
+    M = [1.0 2.0; 3.0 4.0]
+    @test @inferred(_system(0.5, 0.25)) == [-0.5 0; 0.5 -0.25]
+    @test @inferred(_system(0.5f0, 0.25f0)) isa Matrix{Float32}
+    @test @inferred(_affine(M, 0.7)) == [M [0.7, 0.0]; 0.0 0.0 1.0]
+    @test @inferred(_column(0.5, [1.0, 2.0])) == [0.5, 1.0, 2.0, 1.0]
+    @test _row(0.5, M) == hcat(0.5, M[:, 1]', 1)
 end
 
 module OtherConcat
@@ -85,6 +142,9 @@ end
 end
 @kernel recipe(a, b) = begin
     result = hcat(a, b)
+end
+@kernel literals(a, b, M) = begin
+    result = ([-a 0; a -b], [M [a, b]; 0.0 0.0 1.0], [a; b; 1], [a b 1.0], [a M[1, :]'])
 end
 @kernel shadowed_local(a, b) = begin
     result = let hcat = (x, y) -> x .+ y
@@ -117,6 +177,12 @@ end
     @test prepare(calls)(a, b) ==
           (hcat(a, b), vcat(a, b), hcat(a, b), hvcat((2, 2), a, b, b, a))
     @test prepare(brackets)(a, b) == ([a b], [a; b], [a b; b a], [[a b]; b a], [a b b])
+    M = [5.0 6.0; 7.0 8.0]
+    literal_values = prepare(literals)(0.5, 0.25, M)
+    expected = ([-0.5 0; 0.5 -0.25], [M [0.5, 0.25]; 0.0 0.0 1.0], [0.5; 0.25; 1],
+                [0.5 0.25 1.0], [0.5 M[1, :]'])
+    @test literal_values == expected
+    @test map(typeof, literal_values) == map(typeof, expected)
     @test prepare(recipe)(a, b) == hcat(a, b)
     @test prepare(recipe; bound = (; a))(b) == hcat(a, b)
     @test prepare(shadowed_local)(a, b) == a .+ b

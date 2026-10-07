@@ -384,15 +384,28 @@ end
 # Enzyme reverse joins their activities at that load and fails static activity
 # analysis with `EnzymeRuntimeActivityError`, although the arguments' activity
 # is fixed (`benchmark/repro_enzyme_mixed_activity_concat.jl` reproduces it
-# without ReactiveKernels).  The native body calls these companions instead
-# (`_kernel_native_calls`).  They return Base's result, a freshly allocated
-# `Matrix{T}` or `Vector{T}` of the same shape and values, and copy each
-# operand in its own inlined call, so every copy stays tied to its tuple
-# position.  Any other operand combination, a non-isbits element type, and
-# every shape Base rejects call Base itself, which keeps its result and error.
-const _NativeDenseVecOrMat{T} = Union{Vector{T},Matrix{T}}
+# without ReactiveKernels).  Scalar and mixed scalar/array operands, as in
+# the literals `[-a 0.0; a -b]` and `[M v; 0.0 1.0]`, reach whichever generic
+# method claims them: SparseArrays, which Enzyme loads, extends `hcat`, `vcat`
+# and `hvcat` to every list of `Number` and `AbstractVecOrMat{<:Number}`
+# operands and sends dense ones through generic `typed_hcat`/`typed_hvcat`
+# paths, several times slower than Base's scalar fill.  The native body calls
+# these companions instead (`_kernel_native_calls`).  For `Number`, `Vector`
+# and `Matrix` operands whose promoted element type is isbits, they return
+# Base's result, a freshly allocated `Matrix` or `Vector` of Base's shape,
+# element type and values, and write each operand in its own inlined call, so
+# every write stays tied to its tuple position.  A `Number` is a 1×1 block,
+# and `vcat` of numbers and vectors alone is a vector, as in Base.  Any other
+# operand, a non-isbits element type, and every shape Base rejects call Base
+# itself, which keeps its result and error.  For these operands Base returns a
+# `Matrix` of the promoted element type whenever it does not throw (except for
+# `hvcat` with an empty or non-positive row count), so that call is asserted
+# to keep the companion's result inferred: Base's own generic `hvcat` of mixed
+# scalar and array operands infers no concrete type.
+const _NativeCatOperand = Union{Number,Vector,Matrix}
+const _NativeColumnOperand = Union{Number,Vector}
 
-@inline _native_cat_width(a::Vector) = 1
+@inline _native_cat_width(a::_NativeColumnOperand) = 1
 @inline _native_cat_width(a::Matrix) = size(a, 2)
 
 # Sizes over an operand tuple, one inlined call per operand.
@@ -417,10 +430,24 @@ const _NativeDenseVecOrMat{T} = Union{Vector{T},Matrix{T}}
 @inline _native_cat_widths(args::Tuple) =
     (_native_cat_width(first(args)), _native_cat_widths(Base.tail(args))...)
 
-# Copy the dense `a` into `out` (column-major, `stride` rows) with its first
-# element at row `row + 1`, column `column + 1`.  Callers allocate `out` from
-# the operands' validated shapes, so every copy is in bounds.
-@inline function _native_cat_block!(out, stride, row, column, a)
+# Write the operand `a` into `out` (column-major, `stride` rows) with its
+# first element at row `row + 1`, column `column + 1`, converting to the
+# output's element type as Base's `setindex!` does.  Callers allocate `out`
+# from the operands' validated shapes, so every write is in bounds.
+@inline function _native_cat_block!(out, stride, row, column, a::Number)
+    @inbounds out[column * stride + row + 1] = a
+    out
+end
+@inline function _native_cat_block!(out, stride, row, column, a::Array)
+    height = size(a, 1)
+    for j in 1:_native_cat_width(a), i in 1:height
+        @inbounds out[(column + j - 1) * stride + row + i] =
+            a[(j - 1) * height + i]
+    end
+    out
+end
+@inline function _native_cat_block!(out::Array{T}, stride, row, column,
+                                    a::Array{T}) where {T}
     height = size(a, 1)
     if height == stride
         # Whole columns of `out` (then `row == 0`): one contiguous block.
@@ -435,14 +462,14 @@ const _NativeDenseVecOrMat{T} = Union{Vector{T},Matrix{T}}
 end
 
 @inline _native_hcat(args...) = hcat(args...)
-@inline function _native_hcat(a::_NativeDenseVecOrMat{T},
-                              rest::_NativeDenseVecOrMat{T}...) where {T}
+@inline function _native_hcat(a::_NativeCatOperand, rest::_NativeCatOperand...)
+    args = (a, rest...)
+    T = Base.promote_eltypeof(args...)
+    isbitstype(T) || return hcat(args...)
     height = size(a, 1)
-    (isbitstype(T) && _native_cat_heights_equal(height, rest)) ||
-        return hcat(a, rest...)
-    out = Matrix{T}(undef, height,
-                    _native_cat_width(a) + _native_cat_width_sum(rest))
-    _native_hcat_copy!(out, height, 0, (a, rest...))
+    _native_cat_heights_equal(height, rest) || return hcat(args...)::Matrix{T}
+    out = Matrix{T}(undef, height, _native_cat_width_sum(args))
+    _native_hcat_copy!(out, height, 0, args)
 end
 @inline _native_hcat_copy!(out, height, column, ::Tuple{}) = out
 @inline function _native_hcat_copy!(out, height, column, args::Tuple)
@@ -453,19 +480,23 @@ end
 end
 
 @inline _native_vcat(args...) = vcat(args...)
-@inline function _native_vcat(a::Vector{T}, rest::Vector{T}...) where {T}
-    isbitstype(T) || return vcat(a, rest...)
-    out = Vector{T}(undef, length(a) + _native_cat_height_sum(rest))
-    _native_vcat_copy!(out, length(out), 0, (a, rest...))
+@inline function _native_vcat(a::_NativeColumnOperand,
+                              rest::_NativeColumnOperand...)
+    args = (a, rest...)
+    T = Base.promote_eltypeof(args...)
+    isbitstype(T) || return vcat(args...)
+    out = Vector{T}(undef, _native_cat_height_sum(args))
+    _native_vcat_copy!(out, length(out), 0, args)
 end
-@inline function _native_vcat(a::_NativeDenseVecOrMat{T},
-                              rest::_NativeDenseVecOrMat{T}...) where {T}
+@inline function _native_vcat(a::_NativeCatOperand, rest::_NativeCatOperand...)
+    args = (a, rest...)
+    T = Base.promote_eltypeof(args...)
+    isbitstype(T) || return vcat(args...)
     width = _native_cat_width(a)
-    (isbitstype(T) && _native_cat_widths_equal(width, rest)) ||
-        return vcat(a, rest...)
-    height = size(a, 1) + _native_cat_height_sum(rest)
+    _native_cat_widths_equal(width, rest) || return vcat(args...)::Matrix{T}
+    height = _native_cat_height_sum(args)
     out = Matrix{T}(undef, height, width)
-    _native_vcat_copy!(out, height, 0, (a, rest...))
+    _native_vcat_copy!(out, height, 0, args)
 end
 @inline _native_vcat_copy!(out, height, row, ::Tuple{}) = out
 @inline function _native_vcat_copy!(out, height, row, args::Tuple)
@@ -498,14 +529,22 @@ function _native_hvcat_shape(rows::Tuple{Vararg{Int}}, heights::Tuple,
     k == length(heights) ? (height, width) : nothing
 end
 
+# Nonempty and positive, as every bracket literal's counts are; a literal's
+# constant counts fold this check.
+@inline _native_hvcat_counts(::Tuple{}) = false
+@inline _native_hvcat_counts(rows::Tuple{Int}) = first(rows) >= 1
+@inline _native_hvcat_counts(rows::Tuple) =
+    first(rows) >= 1 && _native_hvcat_counts(Base.tail(rows))
+
 @inline _native_hvcat(rows, args...) = hvcat(rows, args...)
-@inline function _native_hvcat(rows::Tuple{Vararg{Int}},
-                               a::_NativeDenseVecOrMat{T},
-                               rest::_NativeDenseVecOrMat{T}...) where {T}
+@inline function _native_hvcat(rows::Tuple{Vararg{Int}}, a::_NativeCatOperand,
+                               rest::_NativeCatOperand...)
     args = (a, rest...)
+    T = Base.promote_eltypeof(args...)
+    (isbitstype(T) && _native_hvcat_counts(rows)) || return hvcat(rows, args...)
     shape = _native_hvcat_shape(rows, _native_cat_heights(args),
                                 _native_cat_widths(args))
-    (isbitstype(T) && shape !== nothing) || return hvcat(rows, args...)
+    shape === nothing && return hvcat(rows, args...)::Matrix{T}
     out = Matrix{T}(undef, shape[1], shape[2])
     _native_hvcat_copy!(out, shape[1], rows, 1, 1, 0, 0, args)
 end
