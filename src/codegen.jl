@@ -4352,6 +4352,7 @@ catch
 end
 _opname(::_AuthoredPlateOp) = "plate"
 _opname(::_AuthoredScanOp) = "scan"
+_opname(op::_TypeOperation) = _opname(_type_operation_type(op))
 # Captured `@kernel` source is shown through its recipe's retained source
 # (`_recipe_label`, display.jl); the operation object itself is only "source".
 _opname(::_KernelSourceOp) = "source"
@@ -4364,6 +4365,7 @@ function _readable_callee(op)
     end
     name isa Symbol && !startswith(string(name), "#") ? name : :operation
 end
+_readable_callee(op::_TypeOperation) = _readable_callee(_type_operation_type(op))
 
 function _operation_slot(node)
     node isa Expr && node.head === :ref && length(node.args) == 2 &&
