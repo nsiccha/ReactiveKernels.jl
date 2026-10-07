@@ -94,7 +94,36 @@ _fill_constructor_value(::_FillConstructorStep{typeof(ones)}) = 1.0
 mutable struct _StepProgram
     ops::Vector{Any}
     caches::Vector{Any}
+    # The extension's `cache_apply` callable; `_nonalloc_destination`
+    # dispatches on it to ask which steps fill an owned destination.
+    cache_apply::Any
 end
+
+# --- cache ownership --------------------------------------------------------
+# A cache slot holds its step's first result, and every later call offers that
+# value to `apply!!` as the destination of the new result. Only storage the
+# kernel owns may be offered: `apply!!`'s generic fallback copies the new
+# result INTO the cached value, so a first result that aliases caller data (a
+# field read such as `sched.xs`, `eachrow` slices of a caller matrix) would
+# receive the next call's input — the previous call's caller-owned arrays
+# silently overwritten — and an immutable first result (a range) would throw.
+# A step therefore keeps a slot only when its result is fresh storage that a
+# destination-passing method fills. Every other step is a plain call: its
+# result is returned as a borrowed value that may alias an input, and is never
+# written into. The generic fallback allocates the result before copying it,
+# so the plain call does no more work.
+#
+# The decomposition's own step operations produce fresh storage by
+# construction and carry destination-passing methods in the extension.
+_nonalloc_fresh_step(op) = false
+_nonalloc_fresh_step(::Union{_MaterializeStep,_GatherStep,_MatMulStep,
+                             _ConcatenateStep,_FillConstructorStep,
+                             _RowReduceStep,_LaneGather}) = true
+
+# Whether a step with operation `op`, inferred result type `T` and argument
+# types `argtypes` keeps a cache slot. The extension adds the method for its
+# `cache_apply` callable that also recognizes registered `apply!!` methods.
+_nonalloc_destination(cache_apply, op, T, argtypes) = _nonalloc_fresh_step(op)
 
 function _step!(prog::_StepProgram, op, cache)
     push!(prog.ops, op)
@@ -186,6 +215,7 @@ struct _FusedDecomposition
     ops::Vector{Any}
     caches::Vector{Any}
     offset::Int
+    cache_apply::Any
 end
 
 function _emit_step!(ctx::_FusedDecomposition, op, ::Type{T}, args...) where {T}
@@ -358,6 +388,10 @@ function _decompose_call_resolved(ctx::_FusedDecomposition, callee, f, fref,
     # destination convention; without a guarded step, keep the whole-recipe
     # fallback rather than risking a stale destination on a shape change.
     (f === Base.:\ || f === Base.:/) && return nothing
+    # A call without a destination-passing method returns its own result,
+    # which may alias an argument: run it inline, never as a cache step.
+    _nonalloc_destination(ctx.cache_apply, f, T, types) ||
+        return (Expr(:call, fref, args...), T)
     (_emit_step!(ctx, f, T, args...), T)
 end
 
@@ -496,7 +530,8 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
         argtypes[v.name] = at
     end
     ctx = _FusedDecomposition(parentmodule(typeof(source_f)), argmap, argtypes,
-                              Any[], Any[], Any[], length(prog.ops))
+                              Any[], Any[], Any[], length(prog.ops),
+                              prog.cache_apply)
     d = _decompose(ctx, r.source, false)
     d === nothing && return nothing
     append!(prog.ops, ctx.ops)
@@ -580,25 +615,49 @@ function _nonalloc_rewrite_recipe!(body, prog::_StepProgram, r::Recipe,
     lhs isa Symbol && (types[lhs] = T)
     nothing
 end
-function _nonalloc_plate_eltype(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
+# A declared array output (`y::Vector{Float64} = plate(...)`) fixes the
+# element type and rank the native kernel's typed local converts the plate's
+# result to (`_declare_typed_output!`). Filling a buffer of that element type
+# gives the same values without a conversion copy; a cell type that inference
+# cannot see through an untyped HAVE port would otherwise leave an `Array{Any}`
+# buffer. Returns `(eltype, rank)`, either `nothing` when the declaration
+# leaves it open.
+function _declared_array_layout(::Type{D}) where {D}
+    D <: AbstractArray || return (nothing, nothing)
+    E = eltype(D)
+    rank = findfirst(n -> D <: AbstractArray{<:Any,n}, 0:16)
+    (isconcretetype(E) ? E : nothing, rank === nothing ? nothing : rank - 1)
+end
+
+function _nonalloc_plate_eltype(op::_AuthoredPlateOp{K,A}, argtypes,
+                                declared::Type = Any) where {K,A}
     T = _authored_plate_result_eltype(op, argtypes)
+    E = first(_declared_array_layout(declared))
+    E === nothing || return E
     isconcretetype(T) && return T
     elements = [(i in A || argtypes[i] <: Number) ? argtypes[i] : eltype(argtypes[i])
         for i in eachindex(argtypes)]
     only(_nonalloc_plan_result_types(op.kernel, elements))
 end
-function _plate_cache_slot(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
-    T = _nonalloc_plate_eltype(op, argtypes)
+function _nonalloc_plate_rank(op::_AuthoredPlateOp{K,A}, argtypes,
+                              declared::Type) where {K,A}
     N = _plate_broadcast_rank(Val(A), argtypes)
+    N === nothing ? last(_declared_array_layout(declared)) : N
+end
+function _plate_cache_slot(op::_AuthoredPlateOp{K,A}, argtypes,
+                           declared::Type = Any) where {K,A}
+    T = _nonalloc_plate_eltype(op, argtypes, declared)
+    N = _nonalloc_plate_rank(op, argtypes, declared)
     nested = _nested_plate_cache(op, argtypes, T, N)
     nested === nothing || return nested
     N === nothing && return Ref{Array{T}}(Vector{T}())
     Ref{Array{T,N}}(Array{T,N}(undef, ntuple(_ -> 0, N)...))
 end
 
-function _plate_result_type(op::_AuthoredPlateOp{K,A}, argtypes) where {K,A}
-    T = _nonalloc_plate_eltype(op, argtypes)
-    N = _plate_broadcast_rank(Val(A), argtypes)
+function _plate_result_type(op::_AuthoredPlateOp{K,A}, argtypes,
+                            declared::Type = Any) where {K,A}
+    T = _nonalloc_plate_eltype(op, argtypes, declared)
+    N = _nonalloc_plate_rank(op, argtypes, declared)
     N === nothing ? Array{T} : Array{T,N}
 end
 
@@ -620,10 +679,11 @@ function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
             return
         end
         if op isa _AuthoredPlateOp
-            j = _step!(prog, op, _plate_cache_slot(op, argtypes))
+            declared = valtype(only(r.outputs))
+            j = _step!(prog, op, _plate_cache_slot(op, argtypes, declared))
             push!(newbody.args,
                   Expr(:(=), lhs, _step_call(j, callargs...)))
-            record!(_plate_result_type(op, argtypes))
+            record!(_plate_result_type(op, argtypes, declared))
             return
         end
         if op isa _KernelSourceOp
@@ -657,13 +717,20 @@ function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
             end
         end
     end
-    # Whole-recipe cache step (the previous behavior). The slot is typed by the
-    # inferred result when concrete, so storing a lazy wrapper result never
-    # forces a `convert` copy into the declared port type.
+    # Whole-recipe step. It keeps a cache slot only when a destination-passing
+    # method fills owned storage (see `_nonalloc_destination`); otherwise the
+    # operation is called directly and its result is never written into. The
+    # slot is typed by the inferred result when concrete, so storing a lazy
+    # wrapper result never forces a `convert` copy into the declared port type.
     T = _static_type(op, argtypes...)
     slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
-    j = _step!(prog, op, _nonalloc_slot(slot_type))
-    push!(newbody.args, Expr(:(=), lhs, _step_call(j, callargs...)))
+    if _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes)
+        j = _step!(prog, op, _nonalloc_slot(slot_type))
+        push!(newbody.args, Expr(:(=), lhs, _step_call(j, callargs...)))
+    else
+        j = _step!(prog, op, nothing)
+        push!(newbody.args, Expr(:(=), lhs, _plain_call(j, callargs...)))
+    end
     record!(T isa Type && T !== Any ? T : valtype(only(r.outputs)))
     nothing
 end
@@ -678,11 +745,52 @@ function _nonalloc_rewrite_nested(prog::_StepProgram, p::Plan, node)
         slot = _operation_slot(rewritten.args[1])
         if slot !== nothing && 1 <= slot <= length(p.recipes)
             r = p.recipes[slot]
-            j = _step!(prog, r.op, _cache_slot(only(r.outputs)))
-            return _step_call(j, rewritten.args[2:end]...)
+            out = only(r.outputs)
+            if _nonalloc_destination(prog.cache_apply, r.op, valtype(out), nothing)
+                j = _step!(prog, r.op, _cache_slot(out))
+                return _step_call(j, rewritten.args[2:end]...)
+            end
+            j = _step!(prog, r.op, nothing)
+            return _plain_call(j, rewritten.args[2:end]...)
         end
     end
     rewritten
+end
+
+# --- exemplar-typed preparation ---------------------------------------------
+# Cache slots and step selection are fixed at preparation from static types.
+# A HAVE port without a concrete declared type leaves everything computed from
+# it `Any`-typed, where the native kernel is specialized on the runtime
+# argument types instead. Exemplar arguments supply those runtime types: they
+# type the program exactly as the arguments of later calls will be typed.
+function _nonalloc_exemplar_types(p::Plan, exemplars::Tuple)
+    isempty(exemplars) && return nothing
+    length(exemplars) == length(p.have) || throw(ArgumentError(
+        "prepare_nonallocating received $(length(exemplars)) exemplar " *
+        "arguments for $(length(p.have)) HAVE ports " *
+        "($(join((v.name for v in p.have), ", "))); pass one value per " *
+        "positional HAVE port, in that order"))
+    map(Tuple(p.have), exemplars) do port, value
+        typeof(value) <: valtype(port) || throw(ArgumentError(
+            "the exemplar for HAVE port `$(port.name)` has type " *
+            "$(typeof(value)), which is not a $(valtype(port))"))
+        typeof(value)
+    end
+end
+
+# An exemplar-typed program only accepts arguments of the exemplars' types:
+# its cache slots are typed for them, so annotate the HAVE signature with them.
+function _nonalloc_exact_signature(ast::Expr, have_types::Tuple)
+    signature = ast.args[1]
+    ports = signature.args[4:end]
+    length(ports) == length(have_types) || throw(ArgumentError(
+        "non-allocating preparation produced $(length(ports)) HAVE arguments " *
+        "for $(length(have_types)) exemplar types"))
+    typed = map(ports, have_types) do port, T
+        name = port isa Expr && port.head === :(::) ? port.args[1] : port
+        Expr(:(::), name, T)
+    end
+    Expr(:function, Expr(:tuple, signature.args[1:3]..., typed...), ast.args[2])
 end
 
 """
@@ -690,10 +798,12 @@ end
 
 Rewrite the un-embedded lowering of `p` into the non-allocating step program:
 per-step operations and typed persistent caches, with fused captured sources
-decomposed into destination-passing steps where the grammar allows, and the
-previous whole-recipe cache step as the universal fallback.
+decomposed into destination-passing steps where the grammar allows, and a
+whole-recipe step as the universal fallback. Only steps with an owned,
+destination-filled result keep a cache (`_nonalloc_destination`).
 """
-function _nonallocating_program(p::Plan, ast::Expr; have_types=nothing)
+function _nonallocating_program(p::Plan, ast::Expr; have_types=nothing,
+                                cache_apply=nothing)
     ast.head === :function ||
         throw(ArgumentError("non-allocating preparation requires a function Expr"))
     signature = ast.args[1]
@@ -701,7 +811,7 @@ function _nonallocating_program(p::Plan, ast::Expr; have_types=nothing)
         !isempty(signature.args) && first(signature.args) === _OPS_ARG ||
         throw(ArgumentError("non-allocating preparation requires the lowered __ops__ signature"))
 
-    prog = _StepProgram(Any[], Any[])
+    prog = _StepProgram(Any[], Any[], cache_apply)
     types = Dict{Symbol,Any}()
     for (index, (v, argexpr)) in enumerate(zip(p.have, signature.args[2:end]))
         name = argexpr isa Expr && argexpr.head === :(::) ?
