@@ -3,7 +3,6 @@ using Distributions
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
-using Reactant
 using Test
 
 # Case-A `mi()` missingness (SB parity, log density only): a partly-missing
@@ -453,21 +452,4 @@ end
             cols[:y2]))
     @test _mi_query(built.spec, plan, :likelihood, u) ≈ ll
     _mi_check_gradient(built.spec, plan, u)
-end
-
-@testset "mi gaussian under Reactant" begin
-    plan = _mi_gaussian_plan()
-    built = build_kernel(plan)
-    u = [0.5, -0.25, 0.1]
-    post_q = Base.invokelatest(prepare_query, built, plan, :sampler)
-    native = Base.invokelatest(post_q, u)
-    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
-    @test Float64(compiled(Reactant.to_rarray(u))) ≈ native
-    q = prepare_sampler(built, plan, u; backend = _MI_BACKEND)
-    g = similar(u)
-    val, _ = sampler_value_and_gradient!(q, g, u)
-    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
-    rval, rgrad = cad(Reactant.to_rarray(u))
-    @test Float64(rval) ≈ val
-    @test Array(rgrad) ≈ g
 end

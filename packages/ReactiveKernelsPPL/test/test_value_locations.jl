@@ -59,7 +59,18 @@ _vl_probe(built) = [0.27 * sin(1.3i) for i in 1:built.layout.total]
             y[i] ~ Normal(c, 1.0)
         end
     end, (; y, c = 0.3); conditioned = (; y, c = 0.3))
-    @test _plans_equal(dot, plate)
+    # The loop keeps its authored indices (explicit-index observations,
+    # `85e2f5a1`); apart from that selection the plans agree, and both bind
+    # to the same density.
+    @test only(plate.responses).range == :(y[eachindex(y)])
+    @test plate.indexed_observations == Set([:y])
+    @test _plans_equal(dot, ReactiveKernelsPPL._with(plate; responses =
+        [ReactiveKernelsPPL._with(r; range = nothing) for r in plate.responses]))
+    for twin in (dot, plate)
+        b = bind_data(twin, (; y, c = 0.3))
+        @test _query(build_kernel(b).spec, b, :likelihood, Float64[]) ≈
+            sum(D.logpdf.(D.Normal(0.3, 1), y))
+    end
     model = @rkppl begin
         m ~ Normal(0, 1)
         y .~ Normal.(m, 1.0)
@@ -145,14 +156,10 @@ end
     end
 end
 
-@testset "value location increment 2: Reactant and data-length invariance" begin
-    # Keep every observed-level branch populated by several irregular rows:
-    # singleton lanes and arithmetic index sets take different compiler paths.
-    levels = _kinv_levels(3, 9)
-    for ys in (levels, repeat(levels, 3))
-        @test all(!_kinv_arithmetic(findall(==(k), ys)) for k in 1:3)
-    end
-    programs = [
+# Programs whose response locations are values, with the observed `levels`
+# and the `optimize` mode Reactant compiles them with.
+function _vl_increment2_programs(levels)
+    return [
         ("s ~ Exponential(1); y .~ Normal.(c,s)",
             Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7], :c => 0.3), :only_enzyme),
         ("a ~ Normal(0,1); m = exp(a); y .~ Normal.(m,1.2)",
@@ -170,20 +177,24 @@ end
             "[y,z] ~ MvNormalCholesky([a,0.2],L)",
             Dict{Symbol,Any}(:y => [0.1, -0.3, 0.7], :z => [0.4, 0.7, -0.2]), true),
     ]
-    for (body, data, optimize) in programs
-        fx = _bare_reactant(_vl_program(body), data; optimize)
-        @test fx.primal ≈ fx.native rtol = 1e-9
-        @test fx.rval ≈ fx.val rtol = 1e-9
-        @test fx.rgrad ≈ fx.g rtol = 1e-7 atol = 1e-9
-        bigger = Dict{Symbol,Any}(k => v isa AbstractVector ? repeat(v, 3) : v
-            for (k, v) in data)
+end
+
+# The same columns repeated three times; numbers stay as they are.
+_vl_bigger(data) = Dict{Symbol,Any}(k => v isa AbstractVector ? repeat(v, 3) : v
+    for (k, v) in data)
+
+@testset "value location increment 2: data-length invariance" begin
+    # Keep every observed-level branch populated by several irregular rows:
+    # singleton lanes and arithmetic index sets take different compiler paths.
+    levels = _kinv_levels(3, 9)
+    for ys in (levels, repeat(levels, 3))
+        @test all(!_kinv_arithmetic(findall(==(k), ys)) for k in 1:3)
+    end
+    for (body, data, _) in _vl_increment2_programs(levels)
+        bigger = _vl_bigger(data)
         prog = _vl_program(body)
         small_plan = bind_data(lower_rkppl(prog, data; conditioned = data), data)
         large_plan = bind_data(lower_rkppl(prog, bigger; conditioned = bigger), bigger)
         @test _kinv_program(small_plan) == _kinv_program(large_plan)
-        large = _bare_reactant(_vl_program(body), bigger; optimize)
-        @test large.lines == fx.lines
-        @test large.primal ≈ large.native rtol = 1e-9
-        @test large.rgrad ≈ large.g rtol = 1e-7 atol = 1e-9
     end
 end
