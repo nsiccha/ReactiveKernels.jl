@@ -156,6 +156,46 @@ end
     @test g ≈ [2 * sum(p .* xs .^ (k - 1)) for k in eachindex(c)]
 end
 
+# Plates that only feed a scan run strip by strip with it; plain reverse
+# Enzyme differentiates the strip loops. The tuple domain keeps the
+# materialized plates and is the control.
+module StripScanAD
+using ReactiveKernels
+using ReactiveKernels: scan
+@kernel recurrence(steps, pa::Vector{Float64}, decay::Float64) = begin
+    xs = plate(steps) do k
+        1 / (k + 0.5)
+    end
+    sa::Vector{Float64} = plate(xs, Ref(pa)) do x, c
+        evalpoly(x, c)
+    end
+    out::Vector{Float64} = scan(sa, Ref(decay); init = 0.0) do carry, s, d
+        next = muladd(d, carry, s)
+        (next, next)
+    end
+    objective::Float64 = sum(abs2, out)
+    return objective
+end
+end
+
+@testset "Strip-fused plates and scan under plain reverse Enzyme" begin
+    S = StripScanAD
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    kernel = prepare(S.recurrence)
+    @test occursin("_plate_strip_ready", string(ReactiveKernels.code_expr(kernel)))
+    pa, decay = [1.0, 0.3, -0.2, 0.05], 0.9
+    steps = 0:299
+    for active in (:pa, :decay, (:pa, :decay))
+        v, g = ad_value_and_gradient(prepare_ad(kernel, backend, steps, pa, decay; active),
+                                     steps, pa, decay)
+        v0, g0 = ad_value_and_gradient(prepare_ad(kernel, backend, Tuple(steps), pa, decay; active),
+                                       Tuple(steps), pa, decay)
+        @test isapprox(v, v0; rtol = 1e-13)
+        @test all(map((a, b) -> isapprox(a, b; rtol = 1e-10), g isa Tuple ? g : (g,),
+                      g0 isa Tuple ? g0 : (g0,)))
+    end
+end
+
 module DenseColumnDoseOuterAD
 using ReactiveKernels
 @kernel cell(observations::UnitRange{Int}, shifts::Vector{Int},

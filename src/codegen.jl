@@ -588,7 +588,7 @@ end
 function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                                       offset; consumer = nothing, recycled = nothing,
                                       pointwise_recycled = nothing,
-                                      type_offset = nothing)
+                                      type_offset = nothing, strips = nothing)
     _scan_has_history(op) && return _lower_authored_scan_history_native!(
         body, op, callargs, lhs, offset; recycled)
     step = op.kernel
@@ -600,16 +600,24 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     atomic = typeof(op).parameters[2]
     iterated_positions = [i for i in 2:length(callargs) if !(i in atomic)]
     shared_positions = [i for i in 2:length(callargs) if i in atomic]
-    seqs = Any[callargs[i] for i in iterated_positions]
+    # A strip-fused sequence (`strips`, `_lower_authored_scan_strips!`) holds
+    # only the current strip, `strips.lo:strips.hi`; the domain it spans stands
+    # in for it wherever the whole sequence is meant.
+    fused(i) = strips !== nothing && i in strips.positions
+    domain = strips === nothing ? nothing :
+        Expr(:call, GlobalRef(Base, :LinearIndices), Expr(:tuple, strips.axis))
+    seqs = Any[fused(i) ? domain : callargs[i] for i in iterated_positions]
     xs = first(seqs)                                    # the axis-defining sequence
     arguments = Any[carry]
     # One element of each sequence per step. The index comes from
     # `eachindex(seqs...)`, valid for every sequence, so the read needs no
-    # bounds check (the hand loop's `@inbounds`).
+    # bounds check (the hand loop's `@inbounds`); a strip read is offset into
+    # the strip, which always covers the step.
     elements = Any[]
     for i in iterated_positions
         element = gensym(:scan_element)
-        push!(elements, :($element = $(_inbounds_value(:($(callargs[i])[$index])))))
+        position = fused(i) ? :($index - $(strips.lo) + 1) : index
+        push!(elements, :($element = $(_inbounds_value(:($(callargs[i])[$position])))))
         push!(arguments, element)
     end
     for i in shared_positions
@@ -721,9 +729,27 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     push!(nonempty.args, :($index = $(GlobalRef(Base, :first))($indices)))
     append!(nonempty.args, step_body.args)
     append!(nonempty.args, initial_output.args)
-    push!(nonempty.args, Expr(:for,
-        :($index = $(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
-        Expr(:block, step_body.args..., loop_output.args...)))
+    if strips === nothing
+        push!(nonempty.args, Expr(:for,
+            :($index = $(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
+            Expr(:block, step_body.args..., loop_output.args...)))
+    else
+        # The rest of the first strip, then one strip at a time: refill the
+        # strip, then run its steps in a loop of their own, so the refill
+        # never sits inside the loop that carries the recurrence.
+        lo, hi, last_index = strips.lo, strips.hi, gensym(:scan_last)
+        steps(range) = Expr(:for, :($index = $range),
+            Expr(:block, copy(step_body).args..., copy(Expr(:block, loop_output.args...)).args...))
+        push!(nonempty.args, :($last_index = $(GlobalRef(Base, :last))($indices)))
+        push!(nonempty.args, steps(:(($(GlobalRef(Base, :first))($indices) + 1):$hi)))
+        push!(nonempty.args, :($lo = $hi + 1))
+        push!(nonempty.args, Expr(:while, :($lo <= $last_index), Expr(:block,
+            :($hi = $(GlobalRef(Base, :min))(
+                $lo + $(GlobalRef(@__MODULE__, :_PLATE_STRIP)) - 1, $last_index)),
+            copy(strips.refill).args...,
+            steps(:($lo:$hi)),
+            :($lo = $hi + 1))))
+    end
     push!(body.args, Expr(:if, :($(GlobalRef(Base, :isempty))($indices)),
                           empty_output, nonempty))
     append!(body.args, final_output.args)
@@ -839,6 +865,150 @@ function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
         end
     end
     consumer
+end
+
+# Plates that compute a scan's per-step sequences, and that only that scan (or
+# another such plate) consumes, run strip by strip with it: the generated loop
+# fills a strip of `_PLATE_STRIP` cells of every such plate, then advances the
+# scan over the strip, so their outputs are never stored at full length
+# (`_lower_authored_scan_strips!`). A plate qualifies when its output is no
+# WANT or HAVE, every use of it is a lane (not `Ref`) argument of a plate in
+# the region or an iterated sequence of the scan, and it has no nested plate or
+# scan. A composed chain qualifies too: every outer lane shares the strip axis
+# (`_plate_strip_ready`), so each absorbed plate's domain is that axis, and its
+# own domain checks run on every strip. Returns the region's plate recipes in
+# plan order, or `nothing`. An init-including or history scan reads its own output and
+# keeps the materialized sequences.
+function _authored_scan_strip_region(p::Plan, scan_recipe::Recipe)
+    op = scan_recipe.op
+    (_scan_includes_init(op) || _scan_has_history(op)) && return nothing
+    g = p.graph
+    cid(v) = canon_id(g, v.id)
+    outside = Set(cid(v) for v in (p.want..., p.have...))
+    producer = Dict{Int,Recipe}()
+    for r in p.recipes, output in r.outputs
+        producer[cid(output)] = r
+    end
+    lanes(r) = r.op isa _AuthoredScanOp ?
+        Set(i for i in 2:length(r.inputs) if !(i in typeof(r.op).parameters[2])) :
+        Set(i for i in eachindex(r.inputs) if !(i in typeof(r.op).parameters[2]))
+    eligible(r) = r.op isa _AuthoredPlateOp && length(r.outputs) == 1 &&
+        !(cid(only(r.outputs)) in outside) &&
+        !any(x -> x.op isa _AuthoredPlateOp || x.op isa _AuthoredScanOp,
+             r.op.kernel.plan.recipes)
+    region = Dict{Int,Recipe}()
+    frontier = Recipe[]
+    for i in lanes(scan_recipe)
+        r = get(producer, cid(scan_recipe.inputs[i]), nothing)
+        r === nothing || push!(frontier, r)
+    end
+    while !isempty(frontier)
+        r = pop!(frontier)
+        (haskey(region, r.id) || !eligible(r)) && continue
+        region[r.id] = r
+        for i in lanes(r)
+            q = get(producer, cid(r.inputs[i]), nothing)
+            q === nothing || push!(frontier, q)
+        end
+    end
+    # Keep only plates whose every use is a lane of the scan or of a kept plate.
+    changed = true
+    while changed
+        changed = false
+        for (id, r) in collect(region)
+            output = cid(only(r.outputs))
+            contained = all(p.recipes) do c
+                uses = findall(v -> cid(v) == output, c.inputs)
+                isempty(uses) && return true
+                (c === scan_recipe || haskey(region, c.id)) && issubset(uses, lanes(c))
+            end
+            contained && continue
+            delete!(region, id)
+            changed = true
+        end
+    end
+    any(i -> haskey(producer, cid(scan_recipe.inputs[i])) &&
+             haskey(region, producer[cid(scan_recipe.inputs[i])].id),
+        lanes(scan_recipe)) || return nothing
+    [r for r in p.recipes if haskey(region, r.id)]
+end
+
+# Lower a scan together with its strip region (`_authored_scan_strip_region`).
+# `plates` maps each region plate's recipe id to its emission record: the
+# recipe, its call arguments, its output local, input type hints, recycled
+# buffer and the operation-table offset its plate lowering occupies (appended
+# at the plate's own position, so both backend products keep one table). When
+# every lane the region reads from outside it, and every other scan sequence,
+# is a vector over one axis, the plates run over views of those lanes, one
+# strip at a time: the first strip allocates each plate's buffer and every
+# later strip, never longer, refills it in place (one allocation, so native
+# reverse AD sees no allocate-or-reuse merge); otherwise the
+# plates materialize and the scan runs as usual. Values are the same either
+# way: every cell and step is computed as authored, in order.
+function _lower_authored_scan_strips!(body, scan_recipe::Recipe, region, plates,
+                                      callargs, lhs, offset, runtime_ops,
+                                      runtime_recipes; type_offset = nothing,
+                                      recycled = nothing)
+    op = scan_recipe.op
+    region_outputs = Dict{Symbol,Nothing}()
+    for r in region
+        region_outputs[plates[r.id].lhs] = nothing
+    end
+    outer = Any[]
+    for r in region
+        record = plates[r.id]
+        atomic = typeof(r.op).parameters[2]
+        for (i, arg) in enumerate(record.callargs)
+            (i in atomic || valtype(r.inputs[i]) <: Number ||
+             haskey(region_outputs, arg) || arg in outer) && continue
+            push!(outer, arg)
+        end
+    end
+    scan_atomic = typeof(op).parameters[2]
+    positions = Set(i for i in 2:length(callargs)
+                    if !(i in scan_atomic) && haskey(region_outputs, callargs[i]))
+    others = Any[callargs[i] for i in 2:length(callargs)
+                 if !(i in scan_atomic) && !(i in positions)]
+    lo, hi, axis = gensym(:strip_lo), gensym(:strip_hi), gensym(:strip_axis)
+    views = Dict(arg => gensym(:strip_lane) for arg in outer)
+    function emit_plates!(block, strip::Bool, reuse::Bool)
+        strip && for arg in outer
+            push!(block.args, :($(views[arg]) =
+                $(GlobalRef(Base, :view))($arg, $lo:$hi)))
+        end
+        for r in region
+            record = plates[r.id]
+            args = Any[strip && haskey(views, arg) ? views[arg] : arg
+                       for arg in record.callargs]
+            _lower_authored_plate_native!(block,
+                runtime_ops[1:record.offset], runtime_recipes[1:record.offset],
+                r.op, args, r.inputs, record.lhs, nothing;
+                recycled = strip ? nothing : record.recycled,
+                input_type_hints = record.hints, into = strip && reuse)
+        end
+        block
+    end
+    if isempty(outer)
+        emit_plates!(body, false, false)
+        return _lower_authored_scan_native!(body, op, callargs, lhs, offset;
+                                            type_offset, recycled)
+    end
+    refill = emit_plates!(Expr(:block), true, true)
+    fused = Expr(:block,
+        :($axis = $(GlobalRef(Base, :axes))($(first(outer)), 1)),
+        :($lo = $(GlobalRef(Base, :first))($axis)),
+        :($hi = $(GlobalRef(Base, :min))(
+            $lo + $(GlobalRef(@__MODULE__, :_PLATE_STRIP)) - 1,
+            $(GlobalRef(Base, :last))($axis))))
+    emit_plates!(fused, true, false)
+    _lower_authored_scan_native!(fused, op, callargs, lhs, offset; type_offset,
+        recycled, strips = (; positions, lo, hi, axis, refill))
+    ordinary = emit_plates!(Expr(:block), false, false)
+    _lower_authored_scan_native!(ordinary, op, callargs, lhs, offset; type_offset,
+                                 recycled)
+    ready = Expr(:call, GlobalRef(@__MODULE__, :_plate_strip_ready), outer..., others...)
+    push!(body.args, Expr(:if, ready, fused, ordinary))
+    body
 end
 
 # Compose selected scalar DAGs only at code generation. The public graph and
@@ -1500,7 +1670,10 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
         pointwise_lhs, total_lhs; recycled = nothing,
-        input_type_hints = nothing, element_type = nothing)
+        input_type_hints = nothing, element_type = nothing, into::Bool = false)
+    # `into`: `pointwise_lhs` already holds a buffer at least as long as the
+    # plate, of its element type; the cells are written into it in place and
+    # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -1768,7 +1941,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
             Expr(:call, GlobalRef(Base, :!), condition), assignments))
     end
 
-    if pointwise_lhs !== nothing
+    if pointwise_lhs !== nothing && !into
         allocation = :($(GlobalRef(@__MODULE__, :_plate_similar_output))(
             $marker, $plate_eltype, $output_axes))
         push!(body.args, Expr(:(=), pointwise_lhs, recycled === nothing ? allocation :
@@ -1847,7 +2020,12 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         push!(loopbody.args, :($previous = $index))
         push!(loopbody.args, :($first_coordinate = false))
     end
-    iteration = Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)
+    # A one-axis domain iterates its range directly (`_plate_cells`):
+    # `CartesianIndices` iteration carries an overflow test into the exit
+    # condition that keeps LLVM from computing the trip count, so the cell
+    # loop would not vectorize.
+    iteration = Expr(:call, GlobalRef(@__MODULE__, :_plate_cells),
+                     Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes))
     if has_scheduled_groups
         push!(body.args, :($previous = nothing))
         push!(body.args, :($first_coordinate = true))
@@ -1872,7 +2050,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # transformed-data plate over bound data stays promotable at the Reactant
     # host-operand boundary. The total is seeded by `_plate_total_seed`, so this
     # touches only the pointwise materialization.
-    if pointwise_lhs !== nothing
+    if pointwise_lhs !== nothing && !into
         push!(body.args, :($pointwise_lhs =
             $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
     end
@@ -2059,6 +2237,19 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     # collateral multi-output; execute the recipe but discard the duplicate so
     # neither authoritative inputs nor earlier logical values are overwritten.
     assigned = Set(canon_id(g, v.id) for v in p.have)
+    # Plates strip-fused with the scan they feed (native only): each keeps its
+    # operation-table slots at its own position and is emitted at the scan.
+    strip_regions = Dict{Int,Vector{Recipe}}()
+    strip_plates = Dict{Int,Any}()
+    if !tensorized && inline_embedded
+        for r in p.recipes
+            r.op isa _AuthoredScanOp && _authored_scan_sum_consumer(p, r) === nothing ||
+                continue
+            region = _authored_scan_strip_region(p, r)
+            region === nothing || (strip_regions[r.id] = region)
+        end
+    end
+    strip_members = Set(x.id for region in values(strip_regions) for x in region)
     for r in p.recipes
         r.id in skipped_recipes && continue
         callargs = Any[nm(inp) for inp in r.inputs]
@@ -2105,6 +2296,17 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
                     pointwise_lhs, total_lhs)
+            elseif r.id in strip_members
+                hints = type_hints === nothing ? nothing :
+                    Any[type_hints[canon_id(g, v.id)] for v in r.inputs]
+                strip_plates[r.id] = (; callargs, lhs = pointwise_lhs, hints,
+                    recycled = recycled(pointwise_id), offset = length(runtime_ops))
+                # Reserve this plate's table slots here; its code is emitted
+                # with the scan (`_lower_authored_scan_strips!`).
+                _lower_authored_plate_native!(
+                    Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
+                    r.inputs, pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    input_type_hints = hints)
             else
                 _lower_authored_plate_native!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
@@ -2143,7 +2345,13 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 push!(body.args, Expr(:(=), lhs, call))
             else
                 consumer = _authored_scan_sum_consumer(p, r)
-                if consumer === nothing
+                if haskey(strip_regions, r.id)
+                    output = only(r.outputs)
+                    _lower_authored_scan_strips!(body, r, strip_regions[r.id],
+                        strip_plates, callargs, lhs, scan_index, runtime_ops,
+                        runtime_recipes; type_offset, recycled = lhs === nm(output) ?
+                            recycled(canon_id(g, output.id)) : nothing)
+                elseif consumer === nothing
                     output = only(r.outputs)
                     _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index;
                         type_offset, recycled = lhs === nm(output) ?

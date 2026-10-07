@@ -1741,6 +1741,124 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     end
 end
 
+# Plates that only feed a lockstep scan run strip by strip with it (snag
+# native-lowering-948c4ab6): `_PLATE_STRIP` cells of every such plate, then the
+# scan's steps over them, so no plate output is stored at full length. A
+# domain that is not a vector (here a tuple) keeps the materialized plates.
+# `muladd` leaves contraction to the compiler, so the two lowerings agree to
+# rounding.
+using ReactiveKernels: scan
+@kernel strip_recurrence(steps, pa, pb, q, ea, eb, ca, cb, g0, a0, b0) = begin
+    xs = plate(steps) do k
+        1 / (k + 0.5)
+    end
+    sa = plate(xs, Ref(pa)) do x, c
+        evalpoly(x, c)
+    end
+    sb = plate(xs, Ref(pb)) do x, c
+        evalpoly(x, c)
+    end
+    ratio = plate(xs, Ref(q)) do x, c
+        evalpoly(x, c)
+    end
+    out = scan(sa, sb, ratio, Ref(ea), Ref(eb), Ref(ca), Ref(cb);
+               init = (g = g0, a = a0, b = b0)) do carry, pa_k, pb_k, q_k, ea, eb, ca, cb
+        a = muladd(ea, carry.a, carry.g * pa_k)
+        b = muladd(eb, carry.b, carry.g * pb_k)
+        ((g = carry.g * q_k, a = a, b = b), ca * a + cb * b)
+    end
+    return out
+end
+# The same recurrence with a second, ordinary sequence in lockstep.
+@kernel strip_lockstep(steps, weights, pa) = begin
+    xs = plate(steps) do k
+        1 / (k + 0.5)
+    end
+    sa = plate(xs, Ref(pa)) do x, c
+        evalpoly(x, c)
+    end
+    out = scan(sa, weights; init = 0.0) do carry, s, w
+        next = muladd(w, carry, s)
+        (next, next)
+    end
+    return out
+end
+# Not strip-fused: an init-including scan, and a plate whose output is also summed.
+@kernel strip_include_init(steps, pa) = begin
+    sa = plate(steps, Ref(pa)) do k, c
+        evalpoly(1 / (k + 0.5), c)
+    end
+    out = scan(sa; init = 0.0, include_init = true) do carry, s
+        (carry + s, carry + s)
+    end
+    return out
+end
+@kernel strip_shared_output(steps, pa) = begin
+    sa = plate(steps, Ref(pa)) do k, c
+        evalpoly(1 / (k + 0.5), c)
+    end
+    total = sum(sa)
+    out = scan(sa; init = 0.0) do carry, s
+        (carry + s, carry + s)
+    end
+    return out, total
+end
+function _strip_reference(steps, pa, pb, q, ea, eb, ca, cb, g, a, b)
+    out = Float64[]
+    for k in steps
+        x = 1 / (k + 0.5)
+        a = muladd(ea, a, g * evalpoly(x, pa))
+        b = muladd(eb, b, g * evalpoly(x, pb))
+        push!(out, ca * a + cb * b)
+        g *= evalpoly(x, q)
+    end
+    out
+end
+_strip_fused(kernel) = occursin("_plate_strip_ready", string(code_expr(kernel)))
+
+@testset "authored plate block: plates that only feed a scan run strip by strip" begin
+    kernel = prepare(strip_recurrence)
+    @test _strip_fused(kernel)
+    @test _strip_fused(prepare(strip_lockstep))
+    @test !_strip_fused(prepare(strip_include_init))
+    @test !_strip_fused(prepare(strip_shared_output))
+    pa = [1.0, 0.3, -0.2, 0.05, 0.01]
+    pb = [0.8, -0.1, 0.04]
+    q = [0.99, 0.002, -0.001]
+    coefficients = (pa, pb, q, exp(-0.01), exp(-0.12), 0.3, 0.7, 1.0, 0.0, 0.0)
+    for n in (0, 1, 127, 128, 129, 257, 1000)
+        steps = 0:n-1
+        got = kernel(steps, coefficients...)
+        expected = _strip_reference(steps, coefficients...)
+        @test length(got) == n
+        @test isapprox(got, expected; rtol = 1e-13)
+        # The materialized lowering (a tuple domain) agrees.
+        # (An empty tuple is type-erased and has no reduction identity.)
+        1 <= n <= 300 && @test isapprox(got, kernel(Tuple(steps), coefficients...); rtol = 1e-13)
+        # Tuple coefficients take Base's unrolled `evalpoly` in the same strips.
+        @test isapprox(kernel(steps, Tuple(pa), Tuple(pb), Tuple(q), coefficients[4:end]...),
+                       expected; rtol = 1e-13)
+    end
+    # A second sequence in lockstep reads the same steps.
+    steps, weights = 0:299, collect(range(0.1, 0.9; length = 300))
+    lockstep = prepare(strip_lockstep)
+    expected = accumulate((c, (s, w)) -> muladd(w, c, s),
+                          zip(evalpoly.(1 ./ (steps .+ 0.5), Ref(pa)), weights); init = 0.0)
+    @test isapprox(lockstep(steps, weights, pa), expected; rtol = 1e-13)
+    @test_throws DimensionMismatch lockstep(steps, weights[1:end-1], pa)
+    # Not strip-fused, same values as authored.
+    @test prepare(strip_include_init)(0:9, pa) ==
+        [0.0; cumsum(evalpoly.(1 ./ ((0:9) .+ 0.5), Ref(pa)))]
+    shared = prepare(strip_shared_output)(0:9, pa)
+    @test shared[1] == cumsum(evalpoly.(1 ./ ((0:9) .+ 0.5), Ref(pa)))
+    # No full-length intermediates: the output plus strip buffers, against the
+    # four full-length plate outputs of the materialized lowering.
+    steps = 0:6527
+    allocated(k, steps) = @allocated k(steps, coefficients...)
+    allocated(kernel, steps)
+    @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
+end
+
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin
     # The tensorized rewrite, evaluated on host values, is Base's own fold: the
     # filter is a branch on the accumulator and `get` stays `Base.get`. Over a
