@@ -114,6 +114,48 @@ end
     @test g ≈ [2 * sum(c[t] * get(units, t - s, 0.0) for t in 1:plan.nobs) for s in plan.shifts]
 end
 
+# An `evalpoly(x, c)` cell over shared coefficients runs coefficient-outer;
+# plain reverse Enzyme differentiates that loop nest. Its gradients match the
+# same cell called through a function the lowering does not recognize.
+module EvalpolyCellAD
+using ReactiveKernels
+horner(x, c) = evalpoly(x, c)
+@kernel cell(xs::Vector{Float64}, c::Vector{Float64}) = begin
+    ys::Vector{Float64} = plate(xs, Ref(c)) do x, c
+        evalpoly(x, c)
+    end
+    objective::Float64 = sum(abs2, ys)
+    return objective
+end
+@kernel control(xs::Vector{Float64}, c::Vector{Float64}) = begin
+    ys::Vector{Float64} = plate(xs, Ref(c)) do x, c
+        horner(x, c)
+    end
+    objective::Float64 = sum(abs2, ys)
+    return objective
+end
+end
+
+@testset "Coefficient-outer evalpoly cell under plain reverse Enzyme" begin
+    E = EvalpolyCellAD
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    xs = collect(range(-1.5, 1.5; length = 300))
+    c = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011]
+    kernel, control = prepare(E.cell), prepare(E.control)
+    @test occursin("_plate_evalpoly_ready", string(ReactiveKernels.code_expr(kernel)))
+    for active in (:xs, :c, (:xs, :c))
+        v, g = ad_value_and_gradient(prepare_ad(kernel, backend, xs, c; active), xs, c)
+        v0, g0 = ad_value_and_gradient(prepare_ad(control, backend, xs, c; active), xs, c)
+        @test v == v0
+        @test all(map((a, b) -> isapprox(a, b; rtol = 1e-12), g isa Tuple ? g : (g,),
+                      g0 isa Tuple ? g0 : (g0,)))
+    end
+    # d/dc_k of Σ p(x)² is 2 Σ_t p(x_t) x_t^(k-1).
+    p = evalpoly.(xs, Ref(c))
+    _, g = ad_value_and_gradient(prepare_ad(kernel, backend, xs, c; active = :c), xs, c)
+    @test g ≈ [2 * sum(p .* xs .^ (k - 1)) for k in eachindex(c)]
+end
+
 module DenseColumnDoseOuterAD
 using ReactiveKernels
 @kernel cell(observations::UnitRange{Int}, shifts::Vector{Int},
