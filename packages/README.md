@@ -46,6 +46,12 @@ julia --startup-file=no --project=packages packages/test.jl
 julia --startup-file=no --project=docs docs/make.jl
 ```
 
+`packages/test.jl` tests every package by default. Package names restrict it to
+those packages, and `--exclude=<name>` skips one. `RKPPL_TEST_SHARD=k/N` runs
+files k, k + N, … of the ReactiveKernelsPPL suite. Hosted `Run tests` runs that
+suite as parallel shards, because a single job cannot finish it within GitHub's
+360-minute job limit.
+
 The checked-in `[sources]` entries become useful automatically on newer Julia
 versions; `setup.jl` remains the Julia-1.10-compatible source of local path
 development. CI runs the same path development explicitly rather than assuming

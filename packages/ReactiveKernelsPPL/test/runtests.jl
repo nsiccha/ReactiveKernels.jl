@@ -1,237 +1,275 @@
 using ReactiveKernelsPPL
 using Test
 
-include("backend_inventory.jl")
-include("test_parse_hygiene.jl")
-include("test_contract.jl")
-include("test_layout.jl")
-include("test_host_transform_numbers.jl")
-include("test_preprocessing.jl")
-include("test_generator.jl")
-include("test_identifiability_admission.jl")
-include("test_empty_domains.jl")
-include("test_empty_domains_reactant.jl")
-include("test_semantics.jl")
-include("test_semantics_reactant.jl")
-include("test_ordinal_scale.jl")
-include("test_vscale.jl")
-include("test_distributional_links.jl")
-include("test_auxiliary_data.jl")
-include("test_auxiliary_data_reactant.jl")
-include("test_probability_values.jl")
-include("test_probability_values_reactant.jl")
-include("test_distributional_links_reactant.jl")
-include("test_distributional_primary.jl")
-include("test_distributional_boundaries.jl")
-include("test_distributional_combinations.jl")
-include("test_distributional_primary_reactant.jl")
-include("test_distributional_means.jl")
-include("test_distributional_means_reactant.jl")
-include("test_distributional_count_tails.jl")
-include("test_distributional_broadcasts.jl")
-include("test_query.jl")
-include("test_model_view.jl")
-include("test_native_generator_capture.jl")
-include("test_concurrent_build.jl")
-include("test_fresh_module.jl")
-include("test_surface.jl")
-include("test_affine_parameters.jl")
-include("test_affine_parameters_reactant.jl")
-include("test_affine_signs.jl")
-include("test_affine_signs_reactant.jl")
-include("test_strict_declarations.jl")
-include("test_matrix_data.jl")
-include("test_lkj_jacobian.jl")
-include("test_correlated.jl")
-include("test_joint_evidence.jl")
-include("test_submodel_keywords.jl")
-include("test_catalogue_names.jl")
-include("test_retired_constructs.jl")
-include("test_gp_binding.jl")
-include("test_gp_binding_reactant.jl")
-include("test_me.jl")
-include("test_mi.jl")
-include("test_scalar_mi_families.jl")
-include("test_scalar_mi_families_reactant.jl")
-include("test_mixture.jl")
-include("test_response_combinations.jl")
-include("test_response_combinations_reactant.jl")
-include("test_bare_location.jl")
-include("test_student_evidence.jl")
-include("test_mixture_complement.jl")
-include("test_occupancy.jl")
-include("test_composed.jl")
-include("test_values_compose.jl")
-include("test_fallback.jl")
-include("test_combos.jl")
-include("test_sb_parity.jl")
-include("test_hurdle.jl")
-include("test_zip.jl")
-include("test_zib.jl")
-include("test_inversegaussian.jl")
-include("test_bernoulli_links.jl")
-include("test_vonmises.jl")
-include("test_betabinomial2.jl")
-include("test_betakappa.jl")
-include("test_nb1.jl")
-include("test_exponential.jl")
-include("test_weibull.jl")
-include("test_interval.jl")
-include("test_varying_values.jl")
-include("test_evidence_families.jl")
-include("test_evidence_compositions.jl")
-include("test_evidence_packed_plate.jl")
-include("test_evidence_edgecases.jl")
-include("test_owned_evidence_tails.jl")
-include("test_evidence_backend_limits.jl")
-include("test_evidence_native_ad.jl")
-include("test_evidence_reactant.jl")
-include("test_lognormal.jl")
-include("test_leveled_k_invariance.jl")
-include("test_corpus.jl")
-include("test_submodels_full.jl")
-include("test_scoped_submodels.jl")
-include("test_qualified_submodels.jl")
-include("test_external_sampling.jl")
-include("test_graph_density.jl")
-include("test_graph_density_reactant.jl")
-include("test_names.jl")
-include("test_scoped_submodels_reactant.jl")
-include("test_qualified_submodels_reactant.jl")
-include("test_plates.jl")
-include("test_indexed_response_families.jl")
-include("test_multi_axes.jl")
-include("test_latent_plate_axes.jl")
-include("test_latent_plate_axes_reactant.jl")
-include("test_response_value_contracts.jl")
-include("test_response_value_contracts_reactant.jl")
-include("test_latent_prior_inputs.jl")
-include("test_latent_prior_inputs_reactant.jl")
-include("test_latent_prior_selection.jl")
-include("test_latent_prior_selection_reactant.jl")
-include("test_multi_axes_reactant.jl")
-include("test_matrix_ir.jl")
-include("test_array_values.jl")
-include("test_sampled_value_indexing.jl")
-include("test_computed_gather_indices.jl")
-include("test_computed_gather_indices_reactant.jl")
-include("test_lkj_values.jl")
-include("test_covariance_values.jl")
-include("test_grouping_values.jl")
+# Every test file, in execution order. Later files reuse helper functions,
+# constants and modules that earlier files define at top level.
+const _PPL_TEST_FILES = (
+    "backend_inventory.jl",
+    "test_parse_hygiene.jl",
+    "test_contract.jl",
+    "test_layout.jl",
+    "test_host_transform_numbers.jl",
+    "test_preprocessing.jl",
+    "test_generator.jl",
+    "test_identifiability_admission.jl",
+    "test_empty_domains.jl",
+    "test_empty_domains_reactant.jl",
+    "test_semantics.jl",
+    "test_semantics_reactant.jl",
+    "test_ordinal_scale.jl",
+    "test_vscale.jl",
+    "test_distributional_links.jl",
+    "test_auxiliary_data.jl",
+    "test_auxiliary_data_reactant.jl",
+    "test_probability_values.jl",
+    "test_probability_values_reactant.jl",
+    "test_distributional_links_reactant.jl",
+    "test_distributional_primary.jl",
+    "test_distributional_boundaries.jl",
+    "test_distributional_combinations.jl",
+    "test_distributional_primary_reactant.jl",
+    "test_distributional_means.jl",
+    "test_distributional_means_reactant.jl",
+    "test_distributional_count_tails.jl",
+    "test_distributional_broadcasts.jl",
+    "test_query.jl",
+    "test_model_view.jl",
+    "test_native_generator_capture.jl",
+    "test_concurrent_build.jl",
+    "test_fresh_module.jl",
+    "test_surface.jl",
+    "test_affine_parameters.jl",
+    "test_affine_parameters_reactant.jl",
+    "test_affine_signs.jl",
+    "test_affine_signs_reactant.jl",
+    "test_strict_declarations.jl",
+    "test_matrix_data.jl",
+    "test_lkj_jacobian.jl",
+    "test_correlated.jl",
+    "test_joint_evidence.jl",
+    "test_submodel_keywords.jl",
+    "test_catalogue_names.jl",
+    "test_retired_constructs.jl",
+    "test_gp_binding.jl",
+    "test_gp_binding_reactant.jl",
+    "test_me.jl",
+    "test_mi.jl",
+    "test_scalar_mi_families.jl",
+    "test_scalar_mi_families_reactant.jl",
+    "test_mixture.jl",
+    "test_response_combinations.jl",
+    "test_response_combinations_reactant.jl",
+    "test_bare_location.jl",
+    "test_student_evidence.jl",
+    "test_mixture_complement.jl",
+    "test_occupancy.jl",
+    "test_composed.jl",
+    "test_values_compose.jl",
+    "test_fallback.jl",
+    "test_combos.jl",
+    "test_sb_parity.jl",
+    "test_hurdle.jl",
+    "test_zip.jl",
+    "test_zib.jl",
+    "test_inversegaussian.jl",
+    "test_bernoulli_links.jl",
+    "test_vonmises.jl",
+    "test_betabinomial2.jl",
+    "test_betakappa.jl",
+    "test_nb1.jl",
+    "test_exponential.jl",
+    "test_weibull.jl",
+    "test_interval.jl",
+    "test_varying_values.jl",
+    "test_evidence_families.jl",
+    "test_evidence_compositions.jl",
+    "test_evidence_packed_plate.jl",
+    "test_evidence_edgecases.jl",
+    "test_owned_evidence_tails.jl",
+    "test_evidence_backend_limits.jl",
+    "test_evidence_native_ad.jl",
+    "test_evidence_reactant.jl",
+    "test_lognormal.jl",
+    "test_leveled_k_invariance.jl",
+    "test_corpus.jl",
+    "test_submodels_full.jl",
+    "test_scoped_submodels.jl",
+    "test_qualified_submodels.jl",
+    "test_external_sampling.jl",
+    "test_graph_density.jl",
+    "test_graph_density_reactant.jl",
+    "test_names.jl",
+    "test_scoped_submodels_reactant.jl",
+    "test_qualified_submodels_reactant.jl",
+    "test_plates.jl",
+    "test_indexed_response_families.jl",
+    "test_multi_axes.jl",
+    "test_latent_plate_axes.jl",
+    "test_latent_plate_axes_reactant.jl",
+    "test_response_value_contracts.jl",
+    "test_response_value_contracts_reactant.jl",
+    "test_latent_prior_inputs.jl",
+    "test_latent_prior_inputs_reactant.jl",
+    "test_latent_prior_selection.jl",
+    "test_latent_prior_selection_reactant.jl",
+    "test_multi_axes_reactant.jl",
+    "test_matrix_ir.jl",
+    "test_array_values.jl",
+    "test_sampled_value_indexing.jl",
+    "test_computed_gather_indices.jl",
+    "test_computed_gather_indices_reactant.jl",
+    "test_lkj_values.jl",
+    "test_covariance_values.jl",
+    "test_grouping_values.jl",
 
-include("test_retained_lkj.jl")
-include("test_retained_lkj_reactant.jl")
-include("test_array_slices.jl")
-include("test_array_axis_gathers.jl")
-include("test_array_axis_gathers_reactant.jl")
-include("test_array_data_values.jl")
-include("test_whole_value_audit.jl")
-include("test_array_prior_data.jl")
-include("test_shared_array_location.jl")
-include("test_ordinal_explicit.jl")
-include("test_capability_shapes.jl")
-include("test_capability_shapes_reactant.jl")
-include("test_capability_scan_priors.jl")
-include("test_capability_scan_priors_reactant.jl")
-include("test_capability_arguments.jl")
-include("test_capability_arguments_reactant.jl")
-include("test_capability_binomial_edges.jl")
-include("test_capability_binomial_edges_reactant.jl")
-include("test_capability_pointwise_boundaries.jl")
-include("test_capability_pointwise_boundaries_reactant.jl")
-include("test_capability_cells.jl")
-include("test_capability_cells_reactant.jl")
-include("test_capability_ordinal_levels.jl")
-include("test_capability_ordinal_levels_reactant.jl")
-include("test_capability_subject_latents_reactant.jl")
-include("test_capability_stream_latents.jl")
-include("test_capability_stream_latents_reactant.jl")
-include("test_capability_ranges.jl")
-include("test_capability_ranges_reactant.jl")
-include("test_missing_observations.jl")
-include("test_missing_observations_reactant.jl")
-include("test_plate_response_values.jl")
-include("test_latent_reductions.jl")
-include("test_latent_reductions_reactant.jl")
-include("test_plate_response_values_reactant.jl")
-include("test_capability_ranged_ordinals.jl")
-include("test_capability_ranged_ordinals_reactant.jl")
-include("test_capability_repeated_pd.jl")
-include("test_capability_repeated_pd_reactant.jl")
-include("test_capability_packed_tensor.jl")
-include("test_capability_packed_tensor_reactant.jl")
-include("test_ordinal_observed_surface.jl")
-include("test_value_locations.jl")
-include("test_matrix_values.jl")
-include("test_live_matrix_axes.jl")
-include("test_live_matrix_axes_reactant.jl")
-include("test_computed_matrix_values.jl")
-include("test_named_matrix_products.jl")
-include("test_named_matrix_discrimination.jl")
-include("test_named_matrix_addition.jl")
-include("test_report.jl")
-include("test_sweep_appends.jl")
-include("test_scan.jl")
-include("test_scan_capabilities.jl")
-include("test_scan_recurrence_capabilities.jl")
-include("test_scan_capabilities_reactant.jl")
-include("test_scan_recurrence_capabilities_reactant.jl")
-include("test_merge.jl")
-include("test_rewrites.jl")
-include("test_rewrites_reactant.jl")
-include("test_varying_centered.jl")
-include("test_reactant_joint.jl")
-include("test_array_data_reactant.jl")
-include("test_values_compose_reactant.jl")
-include("test_sampled_value_indexing_reactant.jl")
-include("test_matrix_values_reactant.jl")
-include("test_whole_value_audit_reactant.jl")
-include("test_computed_matrix_values_reactant.jl")
-include("test_named_matrix_products_reactant.jl")
-include("test_named_matrix_discrimination_reactant.jl")
-include("test_named_matrix_addition_reactant.jl")
-include("test_array_prior_data_reactant.jl")
-include("test_shared_array_location_reactant.jl")
-include("test_ordinal_observed_surface_reactant.jl")
-include("test_leveled_reactant.jl")
-include("test_prior_vocab.jl")
-include("test_distribution_defaults.jl")
-include("test_distribution_defaults_reactant.jl")
-include("test_distribution_defaults_plate.jl")
-include("test_boolean_response_values.jl")
-include("test_boolean_response_values_reactant.jl")
-include("test_parameter_priors.jl")
-include("test_restricted_priors.jl")
-include("test_expression_arguments.jl")
-include("test_prior_observation_audit.jl")
-include("test_positive_priors.jl")
-include("test_parameter_priors_reactant.jl")
-include("test_restricted_priors_reactant.jl")
-include("test_expression_arguments_reactant.jl")
-include("test_prior_observation_audit_reactant.jl")
-include("test_positive_priors_reactant.jl")
-include("test_derived_response.jl")
-include("test_sweep_replicate.jl")
-include("test_sweep_failclosed.jl")
-include("test_functions_as_values.jl")
-include("test_kernel_composition.jl")
-include("test_completed_covariate_kernel.jl")
-include("test_kernel_composition_reactant.jl")
-include("test_functions_as_values_reactant.jl")
-include("test_data_values.jl")
-include("test_observation_shapes.jl")
-include("test_observation_shapes_reactant.jl")
-include("test_array_definition_gathers.jl")
-include("test_array_definition_gathers_reactant.jl")
-include("test_plate_cells.jl")
-include("test_array_cell_rows.jl")
-include("test_array_cell_rows_reactant.jl")
-include("test_plate_cells_reactant.jl")
-include("test_lkj_values_reactant.jl")
-include("test_covariance_values_reactant.jl")
-include("test_varying_values_reactant.jl")
+    "test_retained_lkj.jl",
+    "test_retained_lkj_reactant.jl",
+    "test_array_slices.jl",
+    "test_array_axis_gathers.jl",
+    "test_array_axis_gathers_reactant.jl",
+    "test_array_data_values.jl",
+    "test_whole_value_audit.jl",
+    "test_array_prior_data.jl",
+    "test_shared_array_location.jl",
+    "test_ordinal_explicit.jl",
+    "test_capability_shapes.jl",
+    "test_capability_shapes_reactant.jl",
+    "test_capability_scan_priors.jl",
+    "test_capability_scan_priors_reactant.jl",
+    "test_capability_arguments.jl",
+    "test_capability_arguments_reactant.jl",
+    "test_capability_binomial_edges.jl",
+    "test_capability_binomial_edges_reactant.jl",
+    "test_capability_pointwise_boundaries.jl",
+    "test_capability_pointwise_boundaries_reactant.jl",
+    "test_capability_cells.jl",
+    "test_capability_cells_reactant.jl",
+    "test_capability_ordinal_levels.jl",
+    "test_capability_ordinal_levels_reactant.jl",
+    "test_capability_subject_latents_reactant.jl",
+    "test_capability_stream_latents.jl",
+    "test_capability_stream_latents_reactant.jl",
+    "test_capability_ranges.jl",
+    "test_capability_ranges_reactant.jl",
+    "test_missing_observations.jl",
+    "test_missing_observations_reactant.jl",
+    "test_plate_response_values.jl",
+    "test_latent_reductions.jl",
+    "test_latent_reductions_reactant.jl",
+    "test_plate_response_values_reactant.jl",
+    "test_capability_ranged_ordinals.jl",
+    "test_capability_ranged_ordinals_reactant.jl",
+    "test_capability_repeated_pd.jl",
+    "test_capability_repeated_pd_reactant.jl",
+    "test_capability_packed_tensor.jl",
+    "test_capability_packed_tensor_reactant.jl",
+    "test_ordinal_observed_surface.jl",
+    "test_value_locations.jl",
+    "test_matrix_values.jl",
+    "test_live_matrix_axes.jl",
+    "test_live_matrix_axes_reactant.jl",
+    "test_computed_matrix_values.jl",
+    "test_named_matrix_products.jl",
+    "test_named_matrix_discrimination.jl",
+    "test_named_matrix_addition.jl",
+    "test_report.jl",
+    "test_sweep_appends.jl",
+    "test_scan.jl",
+    "test_scan_capabilities.jl",
+    "test_scan_recurrence_capabilities.jl",
+    "test_scan_capabilities_reactant.jl",
+    "test_scan_recurrence_capabilities_reactant.jl",
+    "test_merge.jl",
+    "test_rewrites.jl",
+    "test_rewrites_reactant.jl",
+    "test_varying_centered.jl",
+    "test_reactant_joint.jl",
+    "test_array_data_reactant.jl",
+    "test_values_compose_reactant.jl",
+    "test_sampled_value_indexing_reactant.jl",
+    "test_matrix_values_reactant.jl",
+    "test_whole_value_audit_reactant.jl",
+    "test_computed_matrix_values_reactant.jl",
+    "test_named_matrix_products_reactant.jl",
+    "test_named_matrix_discrimination_reactant.jl",
+    "test_named_matrix_addition_reactant.jl",
+    "test_array_prior_data_reactant.jl",
+    "test_shared_array_location_reactant.jl",
+    "test_ordinal_observed_surface_reactant.jl",
+    "test_leveled_reactant.jl",
+    "test_prior_vocab.jl",
+    "test_distribution_defaults.jl",
+    "test_distribution_defaults_reactant.jl",
+    "test_distribution_defaults_plate.jl",
+    "test_boolean_response_values.jl",
+    "test_boolean_response_values_reactant.jl",
+    "test_parameter_priors.jl",
+    "test_restricted_priors.jl",
+    "test_expression_arguments.jl",
+    "test_prior_observation_audit.jl",
+    "test_positive_priors.jl",
+    "test_parameter_priors_reactant.jl",
+    "test_restricted_priors_reactant.jl",
+    "test_expression_arguments_reactant.jl",
+    "test_prior_observation_audit_reactant.jl",
+    "test_positive_priors_reactant.jl",
+    "test_derived_response.jl",
+    "test_sweep_replicate.jl",
+    "test_sweep_failclosed.jl",
+    "test_functions_as_values.jl",
+    "test_kernel_composition.jl",
+    "test_completed_covariate_kernel.jl",
+    "test_kernel_composition_reactant.jl",
+    "test_functions_as_values_reactant.jl",
+    "test_data_values.jl",
+    "test_observation_shapes.jl",
+    "test_observation_shapes_reactant.jl",
+    "test_array_definition_gathers.jl",
+    "test_array_definition_gathers_reactant.jl",
+    "test_plate_cells.jl",
+    "test_array_cell_rows.jl",
+    "test_array_cell_rows_reactant.jl",
+    "test_plate_cells_reactant.jl",
+    "test_lkj_values_reactant.jl",
+    "test_covariance_values_reactant.jl",
+    "test_varying_values_reactant.jl",
+)
+
+include("sharding.jl")
+_run_ppl_test_files(_PPL_TEST_FILES, get(ENV, "RKPPL_TEST_SHARD", ""))
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)
     @test pkgversion(ReactiveKernelsPPL) == v"0.1.0"
+end
+
+@testset "test-file shards" begin
+    # Each file belongs to exactly one shard for every shard count.
+    for n in 1:8
+        @test all(i -> count(k -> _ppl_shard_selects(i, (k, n)), 1:n) == 1,
+                  eachindex(_PPL_TEST_FILES))
+    end
+    @test _ppl_test_shard("") === nothing
+    @test _ppl_test_shard("3/8") == (3, 8)
+    # refused: a malformed or out-of-range spec selects no partition of the files
+    @test_throws ErrorException _ppl_test_shard("9/8")
+    @test_throws ErrorException _ppl_test_shard("3")
+
+    stripped = _without_tests(Meta.parseall("""
+        f() = 1
+        @testset "dropped" begin end
+        module StrippedModule
+        g() = 2
+        Test.@test false
+        end
+        isdefined(@__MODULE__, :StrippedModule) || include("nested.jl")
+        """))
+    code(exs) = filter(ex -> !(ex isa LineNumberNode), exs)
+    body = code(stripped.args)
+    @test Meta.isexpr(body[1], :(=)) && body[1].args[1] == :(f())
+    @test body[2] === nothing
+    module_body = code(body[3].args[3].args)
+    @test Meta.isexpr(module_body[1], :(=)) && module_body[1].args[1] == :(g())
+    @test module_body[2] === nothing
+    @test body[4].args[2].args[1:2] == [:include, _without_tests]
 end
