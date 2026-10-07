@@ -418,10 +418,9 @@ function _predictor_statements(plan::StructuralPlan)
     return stmts
 end
 
-# Scalar coefficient-coordinate read (`sum(view(coef, k:k))`, the
-# `coordinate_read` shape over a coefficient block rather than the packed
-# vector).
-_coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
+# Scalar coefficient-coordinate read (`coef[k]`, the `coordinate_read` shape
+# over a coefficient block rather than the packed vector).
+_coef_coord(coef::Symbol, k::Int) = :($coef[$k])
 
 # Broadcast affine blocks against their coefficient coordinates while
 # retaining the authored axes. Factor and matrix blocks use their own

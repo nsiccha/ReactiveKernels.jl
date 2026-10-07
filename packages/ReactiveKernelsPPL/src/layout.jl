@@ -1444,10 +1444,11 @@ end
 """
     coordinate_read(offset) -> Expr
 
-Scalar packed-coordinate read (`sum(view(unconstrained, o:o))`,
-allocation-free, `@ppl` shape).
+Scalar packed-coordinate read (`unconstrained[o]`). Compiled tracing lowers
+the kernel's integer read of a traced vector to the value-identical
+one-element reduction (`ReactiveKernels._tensorized_getindex`).
 """
-coordinate_read(offset::Int) = :(sum(view(unconstrained, $offset:$offset)))
+coordinate_read(offset::Int) = :(unconstrained[$offset])
 
 """
     block_read(offset, width) -> Expr

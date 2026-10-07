@@ -6,9 +6,9 @@
 # Call shape (the one thing that decides traceability): compile the RAW
 # prepared kernel / `q.ad` directly (top level, or `invokelatest` AROUND
 # `Reactant.compile` from an older world). A traced `invokelatest`
-# WRAPPER is opaque to Reactant's overlay, so `sum(view(unconstrained,
-# i:i))` falls through to Base's scalar `mapreduce` and dies with
-# `Scalar indexing is disallowed` — see the `prepare_query` docstring.
+# WRAPPER is opaque to Reactant's overlay and RK's tensorized lowering, so
+# the packed scalar reads `unconstrained[i]` die with `Scalar indexing is
+# disallowed` — see the `prepare_query` docstring.
 using DifferentiationInterface
 using Enzyme
 using ReactiveKernels

@@ -1137,8 +1137,9 @@ function _array_transform_statements(e::LayoutEntry)
         e.transform, e.lo, e.hi)
     stmts = _plate_transform_statements(fe)
     length(e.dims) == 1 && return stmts
-    push!(stmts, :($(e.name)::Matrix{Float64} =
-        reshape(Float64.($flat), $(e.dims...))))
+    # The flat block is already a fresh Float64 vector (a packed slice or the
+    # transform's output), so the column-major reshape shares its storage.
+    push!(stmts, :($(e.name)::Matrix{Float64} = reshape($flat, $(e.dims...))))
     return stmts
 end
 

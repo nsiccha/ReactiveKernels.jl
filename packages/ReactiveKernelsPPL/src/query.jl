@@ -86,10 +86,12 @@ Under Reactant the barrier goes AROUND the compile, never inside the traced
 call: `Reactant.@compile kernel(Reactant.to_rarray(u))` at top level, or
 `Base.invokelatest(Reactant.compile, kernel, (Reactant.to_rarray(u),))` from
 an older world. A traced wrapper `u -> Base.invokelatest(kernel, u)` is
-opaque to Reactant's tracing overlay, so the packed reads
-`sum(view(unconstrained, i:i))` fall through to Base's scalar `mapreduce`
-and fail with `Scalar indexing is disallowed` (measured on Reactant
-0.2.285; `test_reactant_joint.jl` pins the working shape).
+opaque to Reactant's tracing overlay and to RK's tensorized lowering, so the
+packed scalar reads `unconstrained[i]` reach Reactant's scalar-indexing ban
+and fail with `Scalar indexing is disallowed` (measured on Reactant 0.2.285
+with the earlier `sum(view(unconstrained, i:i))` spelling, which fell through
+to Base's scalar `mapreduce`; `test_reactant_joint.jl` pins the working
+shape).
 """
 function prepare_query(built, plan::StructuralPlan, preset::Symbol; on_error = nothing)
     isbound(plan) || throw(ContractValidationError(

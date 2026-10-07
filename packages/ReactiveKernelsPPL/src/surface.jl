@@ -415,7 +415,12 @@ function Base.merge(m::RKPPLModel, override::Expr)
     return RKPPLModel(Expr(:block, out...), m.mod, fixed, rewrites, copy(m.conditioned))
 end
 
-function Base.merge(m::RKPPLModel, fix::NamedTuple)
+Base.merge(m::RKPPLModel, fix::NamedTuple) = _merge_fixes(m, fix)
+
+# An author's dotted key names a scoped declaration (`var"z.w.tau"`) and waits
+# for expansion. Expansion pins a local by its plan identifier, which is
+# spelled with the same dots, so it passes `scoped_keys = false`.
+function _merge_fixes(m::RKPPLModel, fix::NamedTuple; scoped_keys::Bool = true)
     isempty(fix) && _sfail("merge with an empty NamedTuple fixes nothing")
     out = Any[a for a in m.ast.args]
     idx, dups, blocked = _merge_base_index(out)
@@ -424,7 +429,7 @@ function Base.merge(m::RKPPLModel, fix::NamedTuple)
     drop = Set{Int}()
     for (nm, val) in pairs(fix)
         delete!(observations, nm)
-        if occursin('.', String(nm))
+        if scoped_keys && occursin('.', String(nm))
             new_fixed[nm] = _check_col(nm, val)
             continue
         end
@@ -606,7 +611,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     used = Set{Symbol}()
     _all_symbols!(used, ast)
     ctx = _ScopeExpansion(scopes, Dict(s.binding => s for s in scopes),
-        _scope_name_paths(scopes), used, 0)
+        _scope_name_paths(scopes), used)
     expanded = RKPPLModel(ast, m.mod)
     for (path, value) in scoped_observed
         parts = Symbol.(split(String(path), '.'))
@@ -5114,14 +5119,13 @@ mutable struct _ScopeExpansion
     by_binding::Dict{Symbol,SubmodelScope}
     name_paths::Dict{Symbol,Tuple{Vararg{Symbol}}}
     used::Set{Symbol}
-    next_identifier::Int
     rewrites::Vector{Tuple{Expr,Module}}
     fixes::Dict{Symbol,ColumnData}
     bound_values::Union{Nothing,Dict{Symbol,ColumnData}}
     declared::Set{Symbol}
 end
-_ScopeExpansion(scopes, bindings, paths, used, next) =
-    _ScopeExpansion(scopes, bindings, paths, used, next,
+_ScopeExpansion(scopes, bindings, paths, used) =
+    _ScopeExpansion(scopes, bindings, paths, used,
         Tuple{Expr,Module}[], Dict{Symbol,ColumnData}(), nothing, Set{Symbol}())
 
 function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
@@ -5136,18 +5140,26 @@ function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
     return scope
 end
 
+# A local's plan identifier is spelled as its authored path (`var"z.w.b"`),
+# so generated programs read the names coordinates and draws already use.
+# A spelling that occurs in a name in use (an author's literal `var"z.b"`, a
+# name reserved from a callee body, or an earlier identifier) takes the next
+# free `#k` suffix instead; the path itself stays in `name_paths`.
 function _scope_private_name!(ctx::_ScopeExpansion, scope::SubmodelScope,
         name::Symbol)
     haskey(scope.locals, name) && return scope.locals[name]
-    while true
-        ctx.next_identifier += 1
-        identifier = Symbol("##rkppl_scope#", lpad(ctx.next_identifier, 8, '0'))
-        any(nm -> occursin(string(identifier), string(nm)), ctx.used) && continue
-        push!(ctx.used, identifier)
-        scope.locals[name] = identifier
-        ctx.name_paths[identifier] = (scope.path..., name)
-        return identifier
+    path = (scope.path..., name)
+    spelling = join(string.(path), '.')
+    identifier = Symbol(spelling)
+    suffix = 1
+    while any(nm -> occursin(string(identifier), string(nm)), ctx.used)
+        suffix += 1
+        identifier = Symbol(spelling, '#', suffix)
     end
+    push!(ctx.used, identifier)
+    scope.locals[name] = identifier
+    ctx.name_paths[identifier] = path
+    return identifier
 end
 
 # Property reads of a call resolve lexically before mathematical lowering.
@@ -5215,7 +5227,7 @@ function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
     end
     out = Any[]
     ctx = _ScopeExpansion(SubmodelScope[], Dict{Symbol,SubmodelScope}(),
-        Dict{Symbol,Tuple{Vararg{Symbol}}}(), used, 0)
+        Dict{Symbol,Tuple{Vararg{Symbol}}}(), used)
     union!(ctx.declared, data)
     for a in ast.args
         _collect_binders!(ctx.declared, a)
@@ -5315,7 +5327,7 @@ function _scope_program_edits(sm, gen, call, ctx, data)
         direct(path) || continue
         haskey(scope.locals, last(path)) || _sfail("merge pin $key matches no scoped statement")
         name, value = scope.locals[last(path)], pop!(ctx.fixes, key)
-        program = Base.merge(program, NamedTuple{(name,)}((value,)))
+        program = _merge_fixes(program, NamedTuple{(name,)}((value,)); scoped_keys = false)
         if ctx.bound_values === nothing
             helper = value isa AbstractArray ? :_bound_array_value : :_bound_value
             push!(program.ast.args, Expr(:(=), name,
