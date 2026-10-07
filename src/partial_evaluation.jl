@@ -273,7 +273,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         _lower_with_ops(scalar_plan; inline_embedded = false)...)
     readable = Dict(r.id => source for (r, source) in
                     zip(inner.recipes, op.kernel.lowered_recipes))
-    kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
         kernel.plan, kernel.ast, Tuple(readable[r.id] for r in residual))
     replacement = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(
         kernel, op.axis_checks)
@@ -506,7 +506,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
             _lower_with_ops(arm_plan; inline_embedded = false)...)
         readable = Dict(r.id => source for (r, source) in
                         zip(inner.recipes, op.kernel.lowered_recipes))
-        kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs,
+        kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs,
             kernel.outputs, kernel.plan, kernel.ast,
             Tuple(readable[r.id] for r in arm_recipes))
         arm_plate = _AuthoredPlateOp{typeof(kernel),atomic_inputs}(
@@ -901,8 +901,8 @@ function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
     plan = _bound_residual_plan(entry, residual, hoisted)
     recipes = plan.recipes[1:length(entry.boundary.constants)]
     ops = (Any[recipe.op for recipe in recipes]..., template.ops...)
-    PreparedKernel(template.f, ops, template.inputs, template.outputs, plan,
-                   template.ast, (recipes..., template.lowered...))
+    _prepared_kernel(template.f, ops, template.inputs, template.outputs, plan,
+                     template.ast, (recipes..., template.lowered...))
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an
