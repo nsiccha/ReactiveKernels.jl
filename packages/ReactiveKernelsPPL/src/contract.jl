@@ -6762,7 +6762,9 @@ end
 # values): module calls through their `GlobalRef`s, built-in vocabulary
 # heads through the generated-model scope — the bindings the kernel uses.
 function _eval_value_expr(ex, lookup, label; calls = nothing)
-    ex isa Union{Number,String} && return ex
+    # An array is a value lowering already folded (a literal concentration
+    # in `length([1.0, 1.0])`); like any Julia constant it evaluates to itself.
+    ex isa Union{Number,String,AbstractArray} && return ex
     ex isa QuoteNode && return ex.value
     ex isa GlobalRef && return getglobal(ex.mod, ex.name)
     ex isa Symbol && return lookup(ex)
