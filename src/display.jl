@@ -42,6 +42,7 @@ _display_quoted(node::QuoteNode, value) = node
 _display_quoted(::QuoteNode,
                 op::Union{Function,_KernelSourceOp,_KernelSourceFunction,_KernelBranch}) =
     _display_object(op)
+_display_quoted(::QuoteNode, child::_KernelPreparedChild) = child.name
 
 # A global the reader knows by its bare Base name is shown by that name when
 # the binding is the same object; any other global keeps its module path.
