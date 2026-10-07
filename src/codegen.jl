@@ -695,7 +695,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     append!(nonempty.args, step_body.args)
     append!(nonempty.args, initial_output.args)
     push!(nonempty.args, Expr(:for,
-        :($index = $(GlobalRef(Base.Iterators, :drop))($indices, 1)),
+        :($index = $(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
         Expr(:block, step_body.args..., loop_output.args...)))
     push!(body.args, Expr(:if, :($(GlobalRef(Base, :isempty))($indices)),
                           empty_output, nonempty))
@@ -742,7 +742,7 @@ function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callarg
         :($carry = $(callargs[1])),
         :($index = $(GlobalRef(Base, :first))($indices)),
         step_body..., record...,
-        Expr(:for, :($index = $(GlobalRef(Base.Iterators, :drop))($indices, 1)),
+        Expr(:for, :($index = $(GlobalRef(@__MODULE__, :_scan_rest))($indices)),
              Expr(:block, step_body..., record...)))
     push!(body.args, Expr(:if,
         :(!$(GlobalRef(Base, :isempty))($indices)), nonempty))
