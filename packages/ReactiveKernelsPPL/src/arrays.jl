@@ -1561,7 +1561,8 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         end
         _vector_prior_stmts!(stmts, terms, flat, p.family,
             NamedTuple{Tuple(arg_names)}(Tuple(arg_values)),
-            p.support_override; conditioned = p.name in context.conditioned)
+            p.support_override; conditioned = p.name in context.conditioned,
+            float64_variate = p.name ∉ context.conditioned)
         push!(pointwise, p.name => :(reshape($(Symbol(:_ppl_pw_prior_, flat)), size($(p.name)))))
     end
     return nothing

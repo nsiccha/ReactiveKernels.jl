@@ -2977,7 +2977,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             push!(terms, Symbol(:_ppl_prior_, p.name))
         else
             _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-                p.support_override; rows = _plate_rows(plan, p))
+                p.support_override; rows = _plate_rows(plan, p),
+                float64_variate = p.name ∉ plan.conditioned)
         end
     end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
@@ -3052,7 +3053,8 @@ end
 # expander, exactly as the Gaussian-likelihood scale is threaded.
 function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         name::Symbol, family::Symbol, args::NamedTuple,
-        support::SupportOverride; conditioned = false, rows = nothing)
+        support::SupportOverride; conditioned = false, rows = nothing,
+        float64_variate::Bool = false)
     node = Symbol(:_ppl_prior_, name)
     pw = Symbol(:_ppl_pw_prior_, name)
     if family === :flat
@@ -3072,7 +3074,7 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     inputs = Any[name]
     tv = _dovar(1)
     argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
-    cell = _family_logpdf_expr(family, argvals, tv)
+    cell = _family_logpdf_expr(family, argvals, tv; float64_variate)
     thread(x) = x isa Expr ? Expr(x.head,
         (i == 1 && x.head === :call ? a : thread(a) for (i, a) in enumerate(x.args))...) :
         _thread_ref!(inputs, x)
@@ -3114,23 +3116,32 @@ const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
 # must retain their original numeric types. The same boundary applies to
 # density and truncation endpoints, including threaded plate arguments.
 # Multiplication by a floating unit preserves the value (and signed zero)
-# through ordinary Julia numeric promotion and backend arithmetic.
-function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x)
+# through ordinary Julia numeric promotion and backend arithmetic. A numeric
+# literal takes the same promotion (and Gamma's reciprocal) at emission. A
+# variate the caller knows is a Float64 parameter (`float64_variate`) is read
+# as is.
+_float64_port(v) = :(1.0 * $v)
+_float64_port(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1.0 * v
+_gamma_rate(v) = :(1 / $v)
+_gamma_rate(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1 / v
+
+function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x;
+        float64_variate::Bool = false)
     ep = get(_PRIOR_ENDPOINTS, family, nothing)
     ep === nothing && throw(ContractValidationError(
         "[generator] prior family $family has no endpoint object"))
-    args = family === :gamma ? (a[1], :(1 / $(a[2]))) : Tuple(a)
-    args = map(v -> :(1.0 * $v), args)
+    args = family === :gamma ? (a[1], _gamma_rate(a[2])) : Tuple(a)
+    args = map(_float64_port, args)
     return Expr(:call, Expr(:., Expr(:call, ep, args...), QuoteNode(method)),
-        :(1.0 * $x))
+        float64_variate ? x : _float64_port(x))
 end
 
-function _family_logpdf_expr(family::Symbol, a, x)
+function _family_logpdf_expr(family::Symbol, a, x; float64_variate::Bool = false)
     family === :flat && return :(0.0)
     family === :binomial && return :((isfinite($x) && floor($x) == $x &&
         isfinite($(a[2])) && 0 <= $(a[2]) && $(a[2]) <= 1) ?
-        binomial(Int($(a[1])), 1.0 * $(a[2])).logpdf(Int($x)) : -Inf)
-    return _prior_endpoint_expr(family, a, :logpdf, x)
+        binomial(Int($(a[1])), $(_float64_port(a[2]))).logpdf(Int($x)) : -Inf)
+    return _prior_endpoint_expr(family, a, :logpdf, x; float64_variate)
 end
 
 # Normalize the base density over the declared support. Symmetric halves
@@ -3191,7 +3202,7 @@ end
 # One normalized scalar prior body, shared by parameter and hyper-prior slots.
 function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false)
     argvals = Any[v for v in values(p.args)]
-    base = _family_logpdf_expr(p.family, argvals, p.name)
+    base = _family_logpdf_expr(p.family, argvals, p.name; float64_variate = !conditioned)
     local_pre = conditioned ? Expr[] : pre
     corr = _support_correction(p.family, p.support_override, argvals; pre = local_pre, stem = p.name)
     rhs = corr === nothing ? base : :($base + $corr)
