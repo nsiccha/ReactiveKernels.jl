@@ -1544,20 +1544,22 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             continue
         end
         flat = _array_flat_name(p.name, length(dims))
-        args = Pair{Symbol,Any}[]
+        arg_names = Symbol[]
+        arg_values = Any[]
         for (i, (k, a)) in enumerate(pairs(p.args))
+            push!(arg_names, k)
             if a isa Real || a isa Symbol
-                push!(args, k => a)
+                push!(arg_values, a)
                 continue
             end
             local_name = Symbol(:_ppl_parg_, p.name, :_, i)
             val = a.head === :vect ? :(Float64[$(a.args...)]) :
                 _array_gather_rewrite(a, context, needed)
             push!(stmts, :($local_name = $val))
-            push!(args, k => local_name)
+            push!(arg_values, local_name)
         end
         _vector_prior_stmts!(stmts, terms, flat, p.family,
-            NamedTuple{Tuple(first.(args))}(Tuple(last.(args))),
+            NamedTuple{Tuple(arg_names)}(Tuple(arg_values)),
             p.support_override; conditioned = p.name in context.conditioned)
         push!(pointwise, p.name => :(reshape($(Symbol(:_ppl_pw_prior_, flat)), size($(p.name)))))
     end

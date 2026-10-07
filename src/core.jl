@@ -115,18 +115,42 @@ struct _KernelSourceOp{DefToken,Form,F,TF,IG,CI}
     call_identity::CI
 end
 
-_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF,
-                ignored_throws::IG = nothing, call_identity::CI = nothing) where
-                {DefToken,Form,F,TF,IG,CI} =
-    _KernelSourceOp{DefToken,Form,F,TF,IG,CI}(f, tensor_f, ignored_throws, call_identity)
+# Every authored recipe creates source operations of new concrete types, and
+# a constructor call compiles once per concrete type. Graph assembly only stores
+# the operation, so build it from its parameters without specializing. The
+# prepared kernel still sees the exact concrete operation type.
+Base.@nospecializeinfer function _KernelSourceOp(
+        @nospecialize(token::Val), @nospecialize(form::Val),
+        @nospecialize(f), @nospecialize(tensor_f),
+        @nospecialize(ignored_throws = nothing), @nospecialize(call_identity = nothing))
+    T = _KernelSourceOp{_val_parameter(token), _val_parameter(form),
+                        typeof(f), typeof(tensor_f), typeof(ignored_throws),
+                        typeof(call_identity)}
+    _kernel_new_instance(T, (f, tensor_f, ignored_throws, call_identity))::_KernelSourceOp
+end
+
+Base.@nospecializeinfer _val_parameter(@nospecialize(value::Val)) =
+    (typeof(value)::DataType).parameters[1]
+
+# Allocate an instance of a concrete struct type from field values of exactly
+# the field types, as its default inner constructor would, without compiling
+# that constructor for `T`. `jl_new_structv` is the runtime's own struct
+# allocator (also used by the Serialization stdlib); it type-checks each field.
+Base.@nospecializeinfer function _kernel_new_instance(@nospecialize(T::DataType),
+                                                     @nospecialize(fields::Tuple))
+    values = Any[fields...]
+    ccall(:jl_new_structv, Any, (Any, Ptr{Any}, UInt32), T, values, length(values))
+end
 
 # A module binding can be shadowed by a lexical callable captured in either
 # execution body. Its value at construction need not identify later calls,
 # especially when Julia retains a reassigned local in a shared Core.Box.
 # The runtime callable must also match the binding resolved by lowering,
 # which can have replaced the call and removed its lexical capture entirely.
-function _KernelSourceOp(token::Val, form::Val, f, tensor_f,
-                         ignored_throws, call_identity, capture_name, resolved_callable)
+Base.@nospecializeinfer function _KernelSourceOp(
+        @nospecialize(token::Val), @nospecialize(form::Val), @nospecialize(f),
+        @nospecialize(tensor_f), @nospecialize(ignored_throws), @nospecialize(call_identity),
+        @nospecialize(capture_name), @nospecialize(resolved_callable))
     if call_identity !== nothing &&
        (first(call_identity) !== resolved_callable ||
         (capture_name !== nothing &&
@@ -1544,6 +1568,16 @@ function add!(g::Graph; inputs, outputs, op,
     _add_recipe!(g, inputs, outputs, op, cost, cse_key, effectful, source)
 end
 
+# Compare canonical value ids elementwise. `==` on tuples of unknown length is an
+# abstract call that any package method on tuples invalidates.
+function _canonical_ids_equal(g::Graph, values::Tuple{Vararg{Value}}, ids::Vector{Int})
+    length(values) == length(ids) || return false
+    for (value, id) in zip(values, ids)
+        canon_id(g, value.id) == id || return false
+    end
+    true
+end
+
 # Registration stores callable and provenance values as graph metadata. Its body
 # does not need a new inferred executable for every numerical operation type.
 Base.@nospecializeinfer function _add_recipe!(g::Graph,
@@ -1560,13 +1594,13 @@ Base.@nospecializeinfer function _add_recipe!(g::Graph,
     # arity, it computes the same thing. Alias the new outputs onto the existing
     # producer's outputs instead of adding a duplicate recipe.
     if cse_key !== nothing && !effectful
-        canon_ins = Tuple(canon_id(g, v.id) for v in ins)
+        canon_ins = Int[canon_id(g, v.id) for v in ins]
         for r in g.recipes
             r.effectful && continue
             r.cse_key === nothing && continue
             isequal(r.cse_key, cse_key) || continue
             length(r.outputs) == length(outs) || continue
-            Tuple(canon_id(g, v.id) for v in r.inputs) == canon_ins || continue
+            _canonical_ids_equal(g, r.inputs, canon_ins) || continue
             alias_plan = _cse_alias_plan(g, outs, r.outputs, cse_key)
             for v in ins; _register!(g, v); end
             for v in outs; _register!(g, v); end
