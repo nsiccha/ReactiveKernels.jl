@@ -42,8 +42,11 @@ steady_bytes(k, args...) = (k(args...); k(args...); @allocated k(args...))
         @test small <= 512
     end
 
+    # No recipe runs its fused source as one operation. A plate step lowers its
+    # cells natively, so the table also holds the cells' scalar operations.
     kernel = prepare_nonallocating(g; have, want = :density)
-    @test !any(op -> op isa ReactiveKernels._KernelSourceOp, kernel.ops)
+    @test !any(op -> op isa ReactiveKernels._KernelSourceOp &&
+                     any(r -> r.op === op, kernel.plan.recipes), kernel.ops)
 end
 
 @testset "MNIST graph non-allocating acceptance" begin
@@ -87,10 +90,12 @@ end
     args = mnist_inputs(96)
     @test k_lik(args...) == sum(plain_pointwise(args...))
 
-    # Every fused captured source in this graph decomposes: no opaque fused
-    # closure remains in the step table (plates stay as plate operations).
+    # Every fused captured source in this graph decomposes: no recipe runs its
+    # fused closure as one operation. A plate step lowers its cells natively,
+    # so the table also holds the cells' scalar operations.
     k_joint = prepare_nonallocating(g; have = have, want = :density)
-    @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k_joint.ops)
+    @test !any(op -> op isa ReactiveKernels._KernelSourceOp &&
+                     any(r -> r.op === op, k_joint.plan.recipes), k_joint.ops)
 
     # The natural consumer entry: wrap an already-prepared kernel.
     prepared = prepare(g; have = have, want = :density)

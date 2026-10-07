@@ -6,6 +6,7 @@ using ReactiveKernels
 const calls = Ref(0)
 counted_log(x) = (calls[] += 1; log(x))
 counted_findall(f, x) = (calls[] += 1; findall(f, x))
+counted_ones(n) = (calls[] += 1; ones(n))
 
 @kernel unbound_plate(q::Vector{Float64}, data::Vector{Float64}) = begin
     data_sum::Float64 = sum(data)
@@ -260,6 +261,27 @@ end
         result
     end
     total::Float64 = sum(pointwise)
+end
+
+# A cell result that reads only bound data, beside an unread live operand
+# passed atomically, as a reader plate that receives its whole boundary does.
+@kernel data_only_result(live::Vector{Float64}, limits, rows, subjects) = begin
+    weights = plate(subjects, Ref(limits), Ref(rows), Ref(live)) do s, limits_all, rows_all, live_all
+        selected = limits_all[rows_all[s]]
+        counted_ones(length(selected)) .* selected
+    end
+    flat = convert(Vector{Float64}, reduce(vcat, weights; init = Float64[]))
+    total = sum(flat .* live)
+end
+
+# The same data-only array result beside a live non-atomic input.
+@kernel data_only_result_live_axis(live::Vector{Float64}, limits, rows) = begin
+    weights = plate(rows, Ref(limits), live) do r, limits_all, x
+        selected = limits_all[r]
+        counted_ones(length(selected)) .* selected
+    end
+    flat = convert(Vector{Float64}, reduce(vcat, weights; init = Float64[]))
+    total = sum(flat) * sum(live)
 end
 
 end

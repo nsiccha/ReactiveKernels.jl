@@ -149,4 +149,55 @@ end
     end
     @test calls[] == scan_columns.subject_count
 end
+
+# Regression: a reader plate whose cell result reads only bound data (a
+# per-subject vector of observation limits) while it receives the live rates
+# atomically. Its whole result is prepared once, so native Reverse never sees
+# cached per-subject arrays stored into a plate's output (snag
+# native-reverse-r-79fb001d).
+ReactiveKernels.@kernel subject_limits(subject_count, limits, read_idx, rates) = begin
+    cell_values = ReactiveKernels.plate(
+            1:subject_count, Ref(limits), Ref(read_idx), Ref(rates)
+        ) do subject, limits, read_idx, rates
+        selected = limits[read_idx[subject]]
+        ones(length(selected)) .* selected
+    end
+    result = convert(Vector{Float64}, reduce(vcat, cell_values; init=Float64[]))
+    return result
+end
+limit_columns = (
+    subject_count = 3,
+    limits = [0.5, 1.0, 2.0, 0.25, 1.5, 4.0],
+    read_idx = [[1, 4], [3, 6], [2, 5]],
+    y = [0.9, 1.4, 2.2, 0.3, 1.1, 0.7],
+)
+limit_model = @rkppl begin
+    log_rate[1:6] .~ Normal.(0.0, 1.0)
+    rates = exp.(log_rate)
+    weights = subject_limits(subject_count, limits, read_idx, rates)
+    y .~ Normal.(weights .* rates, 0.5)
+end
+
+@testset "bound data-only reader result under native Reverse" begin
+    bound = bind_data(lower_rkppl(limit_model, limit_columns; conditioned=(:y,)),
+                      limit_columns)
+    built = build_kernel(bound)
+    u = collect(range(-0.3, 0.4; length=6))
+    q = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+    weights = reduce(vcat, [limit_columns.limits[r] for r in limit_columns.read_idx])
+    normal_logpdf(x, m, s) = -0.5 * ((x - m) / s)^2 - log(s) - 0.5 * log(2pi)
+    for point in (u, reverse(u))
+        rates = exp.(point)
+        locations = weights .* rates
+        expected = sum(normal_logpdf.(point, 0.0, 1.0)) +
+                   sum(normal_logpdf.(limit_columns.y, locations, 0.5))
+        expected_gradient = -point .+
+            (limit_columns.y .- locations) ./ 0.25 .* locations
+        g = similar(point)
+        @test Base.invokelatest(q, point) ≈ expected
+        value, _ = Base.invokelatest(sampler_value_and_gradient!, q, g, point)
+        @test value ≈ expected
+        @test g ≈ expected_gradient
+    end
+end
 end
