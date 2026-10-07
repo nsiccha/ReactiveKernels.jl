@@ -66,6 +66,8 @@ end
     return total
 end
 
+call_allocations(kernel, a, b) = (kernel(a, b); @allocations kernel(a, b))
+
 running_reference(xs, gain) =
     (sum(gain * sum(@view xs[1:i]) for i in eachindex(xs); init = 0.0),
      sum(sum(@view xs[1:i]) for i in eachindex(xs); init = 0.0))
@@ -121,6 +123,12 @@ end
     end
     @test Base.invokelatest(ad_value_and_gradient, ad, groups, -0.5) == (0.0, 0.0)
     @test groups == saved
+
+    # Calling the child adds nothing per cell: a cell allocates only what the
+    # child allocates on its own (boxed forwarded arguments would add more).
+    filled = [[1.0, 2.0, 0.5], [2.0], [3.0, 4.0]]
+    alone = sum(Base.invokelatest(F.call_allocations, child, xs, 0.5) for xs in filled)
+    @test Base.invokelatest(F.call_allocations, kernel, filled, 0.5) == alone
 end
 
 @testset "Source-call recursion relation" begin

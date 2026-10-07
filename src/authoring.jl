@@ -1492,7 +1492,11 @@ end
 # reverse on Julia 1.10 fails on the caller once the child's body is inlined
 # there: `EnzymeRuntimeActivityError`, or a crash, for a scan child in a plate
 # cell. As a call, the child is differentiated like any other callee.
-@noinline (child::_KernelPreparedChild)(args...) = child.kernel(args...)
+# `Vararg{Any,N}` specializes the forwarding on the argument count: an
+# unspecialized `args...` would box the arguments and dispatch at run time,
+# which made a three-cell plate over a scan child five times slower.
+@noinline (child::_KernelPreparedChild)(args::Vararg{Any,N}) where {N} =
+    child.kernel(args...)
 
 _kernel_inline_callee_name(callee::Symbol) = callee
 _kernel_inline_callee_name(callee::GlobalRef) = callee.name
