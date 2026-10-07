@@ -59,6 +59,11 @@ end
 
 _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
 
+# Sampling RHS calls resolve in the lowering module (open RHS protocol,
+# `cb0b3228`). Spelling refusals lower in a module without kernel-source
+# bindings, independent of what earlier test files import into `Main`.
+const _PV_UNBOUND = Module(:PriorVocabUnbound)
+
 @testset "prior vocab sampled admission" begin
     plan = lower_rkppl(quote
             a ~ Normal(0, 1)
@@ -92,15 +97,16 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 y .~ Normal.(mu, s)
                 nu ~ Exponential(1)
                 t ~ StudentT(nu, 0, 1)
+                s ~ Exponential(1)
             end, (:y, :x); conditioned = (:y, :x))
         t = _pv_param(plan, :t)
         @test t.family === :student_t
         @test t.args == (arg1 = :nu, arg2 = 0, arg3 = 1)
     end
     @testset "constructor spellings" begin
-        for (rhs, msg) in ((:(student_t(3, 0, 1)), "Normal"),
-                (:(laplace(0, 1)), "Normal"),
-                (:(TDist(3)), "unknown distribution"))
+        for (rhs, msg) in ((:(student_t(3, 0, 1)), "`student_t`, which is not defined"),
+                (:(laplace(0, 1)), "`laplace`, which is not defined"),
+                (:(TDist(3)), nothing))
             err = try
                 lower_rkppl(quote
                         a ~ Normal(0, 1)
@@ -109,7 +115,7 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                         y .~ Normal.(mu, s)
                         t ~ $rhs
                         s ~ Exponential(1)
-                    end, (:y, :x); conditioned = (:y, :x))
+                    end, (:y, :x); conditioned = (:y, :x), mod = _PV_UNBOUND)
                 nothing
             catch e
                 e
@@ -118,8 +124,9 @@ _pv_param(plan, nm::Symbol) = only(p for p in plan.parameters if p.name === nm)
                 # admitted: standard TDist prior constructor (P3; todo `139j2uo`).
                 @test (err === nothing || throw(err))
             else
-                # refused: remaining entries violate constructor signature,
-                # strict declarations or distribution domains (P3/P6, 05oe96l).
+                # refused: a lowercase Stan spelling is no Distributions.jl
+                # constructor; unbound, it names an undefined function in the
+                # model module (P3, open RHS `cb0b3228`).
                 @test err isa SurfaceLoweringError
                 @test occursin(msg, sprint(showerror, err))
             end
@@ -182,7 +189,13 @@ end
     theta = only(p for p in vcat(indexed.plate_parameters, indexed.array_parameters)
         if p.name === :theta)
     @test theta.family === :uniform
-    @test theta.args == (arg1 = :lo, arg2 = :hi)
+    # Each bound is the column selected at the authored loop cells (`4333b93b`).
+    selections = Dict(d.name => d.expr for d in indexed.derived)
+    bounds = [selections[a] for a in values(theta.args)]
+    @test all(b -> Meta.isexpr(b, :ref, 2), bounds)
+    @test [b.args[1] for b in bounds] == [:lo, :hi]
+    @test allequal(b.args[2] for b in bounds)
+    @test haskey(selections, first(bounds).args[2])
     @test theta.support_override === nothing
 end
 
@@ -326,13 +339,16 @@ end
                     y .~ Normal.(mu, s)
                     b ~ student_t(3, 0, 1)
                     s ~ Exponential(1)
-                end, (:y, :x); conditioned = (:y, :x))
+                end, (:y, :x); conditioned = (:y, :x), mod = _PV_UNBOUND)
             nothing
         catch e
             e
         end
-        # refused: lowercase student_t is a kernel constructor, not the Julia distribution constructor (P3).
+        # refused: lowercase student_t is no Distributions.jl constructor;
+        # unbound, it names an undefined function in the model module (P3,
+        # open RHS `cb0b3228`).
         @test err isa SurfaceLoweringError
+        @test occursin("`student_t`, which is not defined", sprint(showerror, err))
     end
 end
 
