@@ -196,6 +196,46 @@ end
     end
 end
 
+# Hoisted carry-independent step statements under plain reverse Enzyme.
+module FissionScanAD
+using ReactiveKernels
+using ReactiveKernels: scan
+@kernel recurrence(steps, pa::Vector{Float64}, decay::Float64) = begin
+    out::Vector{Float64} = scan(steps, Ref(pa), Ref(decay); init = 0.0) do carry, k, pa, d
+        x = 1 / (k + 0.5)
+        s = evalpoly(x, pa)
+        next = muladd(d, carry, s)
+        (next, next)
+    end
+    objective::Float64 = sum(abs2, out)
+    return objective
+end
+end
+
+@testset "Hoisted scan-step statements under plain reverse Enzyme" begin
+    F = FissionScanAD
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    kernel = prepare(F.recurrence)
+    @test occursin("scan_hoisted", string(ReactiveKernels.code_expr(kernel)))
+    pa, decay = [1.0, 0.3, -0.2, 0.05], 0.9
+    steps = 0:299
+    function reference(pa, decay)
+        carry, total = 0.0, 0.0
+        for k in steps
+            carry = muladd(decay, carry, evalpoly(1 / (k + 0.5), pa))
+            total += abs2(carry)
+        end
+        total
+    end
+    v0, gp = value_and_gradient(p -> reference(p, decay), backend, pa)
+    _, gd = value_and_gradient(d -> reference(pa, d), backend, decay)
+    v, g = ad_value_and_gradient(prepare_ad(kernel, backend, steps, pa, decay;
+                                            active = (:pa, :decay)), steps, pa, decay)
+    @test isapprox(v, v0; rtol = 1e-13)
+    @test isapprox(g[1], gp; rtol = 1e-10)
+    @test isapprox(g[2], gd; rtol = 1e-10)
+end
+
 module DenseColumnDoseOuterAD
 using ReactiveKernels
 @kernel cell(observations::UnitRange{Int}, shifts::Vector{Int},

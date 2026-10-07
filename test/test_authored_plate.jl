@@ -1859,6 +1859,64 @@ _strip_fused(kernel) = occursin("_plate_strip_ready", string(code_expr(kernel)))
     @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
 end
 
+# A plain scan step's carry-independent statements that read the step's
+# elements run as one-cell plates in the scan's strip region (snag
+# native-lowering-948c4ab6): the step reads their values from the strip.
+# Statements that read the carry, and values that are not concrete numbers,
+# stay in the step.
+@kernel fission_recurrence(steps, pa, pb, q, ea, eb, ca, cb, g0, a0, b0) = begin
+    out = scan(steps, Ref(pa), Ref(pb), Ref(q), Ref(ea), Ref(eb), Ref(ca), Ref(cb);
+               init = (g = g0, a = a0, b = b0)) do carry, k, pa, pb, q, ea, eb, ca, cb
+        x = 1 / (k + 0.5)
+        pa_k = evalpoly(x, pa)
+        pb_k = evalpoly(x, pb)
+        q_k = evalpoly(x, q)
+        a = muladd(ea, carry.a, carry.g * pa_k)
+        b = muladd(eb, carry.b, carry.g * pb_k)
+        ((g = carry.g * q_k, a = a, b = b), ca * a + cb * b)
+    end
+    return out
+end
+# A hoisted value that is a tuple keeps the step as authored.
+@kernel fission_tuple_value(steps, w) = begin
+    out = scan(steps, Ref(w); init = 0.0) do carry, k, w
+        pair = (k * w, k + w)
+        (carry + pair[1] * pair[2], carry)
+    end
+    return out
+end
+_fission_hoisted(kernel) = occursin("scan_hoisted", string(code_expr(kernel)))
+
+@testset "authored scan: carry-independent step statements run in the strip region" begin
+    kernel = prepare(fission_recurrence)
+    @test _fission_hoisted(kernel)
+    @test _strip_fused(kernel)
+    pa = [1.0, 0.3, -0.2, 0.05, 0.01]
+    pb = [0.8, -0.1, 0.04]
+    q = [0.99, 0.002, -0.001]
+    coefficients = (pa, pb, q, exp(-0.01), exp(-0.12), 0.3, 0.7, 1.0, 0.0, 0.0)
+    for n in (0, 1, 127, 128, 129, 257, 1000)
+        steps = 0:n-1
+        expected = _strip_reference(steps, coefficients...)
+        got = kernel(steps, coefficients...)
+        @test length(got) == n
+        @test isapprox(got, expected; rtol = 1e-13)
+        @test isapprox(kernel(steps, Tuple(pa), Tuple(pb), Tuple(q), coefficients[4:end]...),
+                       expected; rtol = 1e-13)
+    end
+    # Without a fold, the step stays as authored (cheap carry-independent work
+    # already runs beside the carry chain).
+    @test !_fission_hoisted(prepare(fission_tuple_value))
+    tuple_kernel = prepare(fission_tuple_value)
+    @test tuple_kernel(0:9, 0.5) ==
+          [sum((k * 0.5) * (k + 0.5) for k in 0:j-1; init = 0.0) for j in 0:9]
+    # The output plus strip buffers only.
+    steps = 0:6527
+    allocated(k, steps) = @allocated k(steps, coefficients...)
+    allocated(kernel, steps)
+    @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
+end
+
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin
     # The tensorized rewrite, evaluated on host values, is Base's own fold: the
     # filter is a branch on the accumulator and `get` stays `Base.get`. Over a
