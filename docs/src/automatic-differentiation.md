@@ -151,11 +151,15 @@ when their elements are no longer read by the residual. Empty bound domains
 and live inputs that could introduce an empty dimension keep their original
 execution. A live array needs a declared rank and bound axes longer than one
 in every dimension it can supply; scalar and explicit atomic inputs add no
-dimensions. Mutable or non-concrete intermediate results and nested plate/scan
-bodies also keep their original execution. Cached elements are limited to
-`Bool`, standard 8–64-bit integers, and `Float16`/`Float32`/`Float64`; tuple and
-struct frontiers keep their original execution. Recipes still follow the
-pure-operation contract.
+dimensions. Non-concrete intermediate results and nested plate/scan bodies
+also keep their original execution. Cached cell values are `Bool`, standard
+8–64-bit integers, and `Float16`/`Float32`/`Float64`, or dense `Array`s of
+those element types: a per-cell index list such as `findall(isone, kinds)` is
+cached as an array of arrays, read-only and shared by later calls like any
+bound value. Tuple, struct, view and range frontiers keep their original
+execution. Under Reactant a tensorized plate still needs rectangular per-lane
+arrays; ragged lanes are refused there with or without the cache. Recipes still
+follow the pure-operation contract.
 An inline expression such as `theta * log(d)` is one mixed-input recipe and is
 not split by this pass.
 

@@ -58,4 +58,25 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
             @test Array(derivative) ≈ expected_gradient
         end
     end
+
+    # Per-lane arrays must be rectangular to tensorize; ragged lanes are
+    # refused under Reactant with or without the cache (native covers them).
+    @testset "array-valued cache: per-cell index reads" begin
+        kinds = [[1, 2, 1, 1, 3], [2, 1, 1, 3, 1, 1], [1, 1]]
+        read_idx = [[1, 3], [2, 4], [2, 1]]
+        live = [0.5, -1.0, 2.0, 3.0, 0.0, 7.0]
+        rl = Reactant.to_rarray(live)
+        kernel = prepare(C.ragged_reads;
+            bound=(; kinds_by_subject=kinds, read_idx, subjects=1:3))
+        @test only(filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+            startswith(String(only(r.outputs).name), "bound_plate_"),
+            kernel.plan.recipes)).op.value == [[1, 4], [3, 6], [2, 1]]
+        primal = Reactant.compile(kernel, (rl,); sync=true)
+        @test Float64(primal(rl)) == kernel(live) == 12.0
+        prepared = prepare_ad(kernel, backend, live; active=:live)
+        value, gradient = ad_value_and_gradient(prepared, live)
+        result, derivative = compile_ad_value_and_gradient(prepared, rl; sync=true)(rl)
+        @test Float64(result) ≈ value
+        @test Array(derivative) ≈ gradient == [2.0, 1.0, 1.0, 1.0, 0.0, 1.0]
+    end
 end

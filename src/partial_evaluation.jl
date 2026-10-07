@@ -134,11 +134,17 @@ _partial_plate_input(value) = false
 _partial_plate_input(::Number) = true
 _partial_plate_input(::AbstractArray) = true
 
-# Keep the first cache boundary on ordinary primitive numeric array elements.
-# An isbits tuple/struct is safe to hold natively, but an array of those values
-# would introduce a new operand representation at the tensor backend boundary.
+# Keep the cache boundary on ordinary primitive numeric values and dense arrays
+# of them. A per-cell array (a ragged index list, say) is cached as an array of
+# arrays, the same operand representation as bound ragged data the cell could
+# already receive. An isbits tuple/struct is safe to hold natively, but an array
+# of those values would introduce a new operand representation at the tensor
+# backend boundary.
 const _PartialPlateScalar = Union{Bool,Int8,Int16,Int32,Int64,
     UInt8,UInt16,UInt32,UInt64,Float16,Float32,Float64}
+_partial_plate_cacheable(::Type) = false
+_partial_plate_cacheable(::Type{<:_PartialPlateScalar}) = true
+_partial_plate_cacheable(::Type{<:Array{<:_PartialPlateScalar}}) = true
 
 # A live array can make a singleton or previously absent dimension empty.
 # Such a domain must keep the original lazy per-cell execution: eager prefix
@@ -226,16 +232,19 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     end
     reverse!(selected)
 
-    # Establish the complete eligible prefix before executing any of it. Only
-    # concrete scalar isbits values cross this new cache boundary. In particular
-    # no mutable per-cell object gains shared identity through specialization.
+    # Establish the complete eligible prefix before executing any of it.
+    # Intermediates only need a concrete type: they are bind-time temporaries,
+    # as they were per-evaluation ones. Only frontier values cross the cache
+    # boundary. A cached array is a bind-time constant shared by every later
+    # evaluation, read-only to the pure residual like any top-level hoisted
+    # value or bound array.
     for r in selected
         T = Base.promote_op(r.op,
             (types[canon_id(inner.graph, v.id)] for v in r.inputs)...)
-        isconcretetype(T) && isbitstype(T) || return nothing
+        isconcretetype(T) || return nothing
         types[canon_id(inner.graph, only(r.outputs).id)] = T
     end
-    all(v -> types[canon_id(inner.graph, v.id)] <: _PartialPlateScalar,
+    all(v -> _partial_plate_cacheable(types[canon_id(inner.graph, v.id)]),
         frontier) || return nothing
     for r in selected
         args = Tuple(arguments[canon_id(inner.graph, v.id)] for v in r.inputs)
@@ -658,8 +667,11 @@ For a residual authored `plate(...) do` with a transparent scalar plan, named
 bound-only inner recipes are also evaluated at preparation. Each recipe uses
 only its bound inputs' broadcast coordinates, so a prefix with singleton axes
 is not expanded to a larger live domain. Boolean, standard 8–64-bit integer,
-and Float16/32/64 results needed by the residual enter as additional ordinary
-plate inputs. The original arguments
+and Float16/32/64 results needed by the residual, and dense `Array`s of those
+element types (a per-cell index list, for example), enter as additional
+ordinary plate inputs; per-cell arrays are cached as an array of arrays and,
+like every bound or hoisted value, are shared read-only by later calls.
+Intermediate prefix values need only a concrete type. The original arguments
 remain available for shape and marker validation: their storage is retained
 even if the scalar residual no longer reads their elements. This trades setup
 and cache storage for repeated computation; inexpensive recipes need not run
@@ -671,8 +683,9 @@ A live array is eligible only when its declared rank is known and each of its
 dimensions is fixed by a bound axis of length greater than one; live numeric
 scalars and explicit atomic inputs do not contribute dimensions.
 Other exclusions are non-array/non-numeric batched bound inputs, non-concrete
-or mutable prefix results, nonnumeric cache frontiers, nested plate/scan
-bodies, and overlapping inner producers.
+prefix results, cache frontiers that are neither such numbers nor dense
+`Array`s of them (tuples, structs, views, ranges), nested plate/scan bodies,
+and overlapping inner producers.
 Ordinary recipe purity remains required. Like top-level partial evaluation,
 eligible computations execute eagerly at preparation over their bound domain.
 Mixed-input recipes remain indivisible: inline data-only subexpressions inside
