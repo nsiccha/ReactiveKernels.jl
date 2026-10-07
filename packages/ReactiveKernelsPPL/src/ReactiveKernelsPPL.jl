@@ -22,6 +22,7 @@ using SpecialFunctions: erfc, loggamma
 using LogExpFunctions: logaddexp
 using StaticArrays: SMatrix, SVector
 using Statistics: mean, std, var
+using PrecompileTools: @setup_workload, @compile_workload
 
 export ColumnRef, ParamName, ColumnData
 export LikelihoodFamily, GaussianFam, BernoulliLogitFam, PoissonLogFam,
@@ -92,5 +93,7 @@ include("display.jl")
 include("distribution_defaults.jl")
 include("surface.jl")
 include("scan.jl")
+
+include("precompile.jl")
 
 end # module ReactiveKernelsPPL

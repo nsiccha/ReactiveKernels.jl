@@ -159,9 +159,10 @@ function Base.propertynames(spec::KernelSpec, private::Bool = false)
     Tuple(unique(names))
 end
 
-function Base.getindex(spec::KernelSpec, name::Symbol)
-    haskey(spec.ports, name) && return spec.ports[name]
-    available = join(string.(spec.port_order), ", ")
+Base.@nospecializeinfer function Base.getindex(@nospecialize(spec::KernelSpec), name::Symbol)
+    ports = getfield(spec, :ports)
+    haskey(ports, name) && return ports[name]
+    available = join(string.(getfield(spec, :port_order)), ", ")
     throw(KeyError("kernel has no port :$name; available ports: $available"))
 end
 
@@ -195,12 +196,14 @@ end
 # Graph assembly stores the operation as a value; it does not execute it.
 # Avoid inferring this construction path again for every authored closure and
 # every input/output tuple arity. Numerical preparation still sees the exact op.
+# Construction calls the positional `_add_recipe!` rather than the keyword
+# `add!`: a keyword call's argument type names the op's concrete type, so it
+# would compile a fresh keyword-call specialization for every authored op.
 Base.@nospecializeinfer function _kernel_add!(graph::Graph,
                       @nospecialize(ins), @nospecialize(outs), @nospecialize(op),
                       cost, cse_key, effectful,
                       source = _NO_KERNEL_SOURCE)
-    add!(graph; inputs = ins, outputs = outs, op = op,
-         cost = cost, cse_key = cse_key, effectful = effectful, source = source)
+    _add_recipe!(graph, ins, outs, op, cost, cse_key, effectful, source)
 end
 
 # A definition-stable structural key for compiler-owned source operations.  It
@@ -209,7 +212,11 @@ end
 # key, while separately authored formulas have different Token parameters.
 struct _KernelProvenanceKey{Token} end
 
-_kernel_source_token(::_KernelSourceOp{Token}) where {Token} = Token
+# Graph assembly reads `recipe.op` as an unknown subtype of `_KernelSourceOp`.
+# The token comes from the op's type and fields are read with the `getfield`
+# builtin, so no reader is compiled again for every authored op type.
+Base.@nospecializeinfer _kernel_source_token(@nospecialize(op::_KernelSourceOp)) =
+    (typeof(op)::DataType).parameters[1]
 
 # Inverse recognition uses the callable retained when an exact call was
 # authored. Looking up a recipe's source binding later could observe a
@@ -217,7 +224,8 @@ _kernel_source_token(::_KernelSourceOp{Token}) where {Token} = Token
 function _kernel_operation_identity(recipe::Recipe)
     op = recipe.op
     op isa _KernelSourceOp || return op
-    op.call_identity === nothing ? op : first(op.call_identity)
+    call_identity = getfield(op, :call_identity)
+    call_identity === nothing ? op : getfield(call_identity, 1)
 end
 
 # Provenance CSE key assigned when a child recipe is cloned into a parent
@@ -239,24 +247,28 @@ function _kernel_provenance_key(recipe::Recipe)
     recipe.effectful && return nothing
     op = recipe.op
     if op isa _KernelSourceOp
-        op.call_identity === nothing &&
+        call_identity = getfield(op, :call_identity)
+        call_identity === nothing &&
             return _KernelProvenanceKey{_kernel_source_token(op)}()
-        return (:kernel_lowered_call, op.call_identity, recipe.cost,
+        return (:kernel_lowered_call, call_identity, recipe.cost,
                 map(valtype, recipe.outputs))
     end
     (:kernel_plain_op, op, recipe.cost, map(valtype, recipe.outputs))
 end
 
-_kernel_inline_signature_supported(::Any) = false
+# Endpoint signature types are unique per generated endpoint view; these
+# checks need only the signature's kind.
+_kernel_inline_signature_supported(@nospecialize(::Any)) = false
 _kernel_inline_signature_supported(::Nothing) = true
-_kernel_inline_signature_supported(::_KernelEndpointCallSignature) = true
+_kernel_inline_signature_supported(@nospecialize(::_KernelEndpointCallSignature)) = true
 function _kernel_inline_signature_supported(
     ::_KernelCallSignature{P,K,M},
 ) where {P,K,M}
     isempty(K)
 end
 
-function _kernel_inline_call_inputs(ins, source, signature = nothing)
+Base.@nospecializeinfer function _kernel_inline_call_inputs(ins, source,
+                                                          @nospecialize(signature = nothing))
     signature isa _KernelEndpointCallSignature && return Tuple(ins)
     source isa Expr && source.head === :call || return Tuple(ins)
     available = Dict(value.name => value for value in ins)
@@ -304,13 +316,13 @@ Base.@nospecializeinfer function _kernel_add!(
         throw(ArgumentError(
             "nested KernelSpec calls do not accept call-site @recipe metadata; " *
             "put cost, cse_key, or effectful metadata on the nested kernel's recipes"))
-    _kernel_inline_signature_supported(spec.call_signature) || throw(ArgumentError(
+    _kernel_inline_signature_supported(getfield(spec, :call_signature)) || throw(ArgumentError(
         "nested KernelSpec calls currently require a positional-only boundary; " *
         "prepare kernels with keyword inputs separately"))
 
     child_inputs = inputs(spec)
     child_outputs = outputs(spec)
-    call_inputs = _kernel_inline_call_inputs(ins, source, spec.call_signature)
+    call_inputs = _kernel_inline_call_inputs(ins, source, getfield(spec, :call_signature))
     length(call_inputs) == length(child_inputs) || throw(ArgumentError(
         "nested KernelSpec call has $(length(call_inputs)) argument(s), but its default HAVE " *
         "boundary has $(length(child_inputs)) port(s)"))
@@ -318,7 +330,7 @@ Base.@nospecializeinfer function _kernel_add!(
         "nested KernelSpec call assigns $(length(outs)) output(s), but its default WANT " *
         "boundary has $(length(child_outputs)) port(s); destructure that boundary exactly"))
 
-    child_graph = spec.graph
+    child_graph = getfield(spec, :graph)
     child_have = Set{Int}(canon_id(child_graph, v.id) for v in child_inputs)
     cloned = Dict{Int,Value}()
     for id in sort!(collect(keys(child_graph.values)))
@@ -356,12 +368,11 @@ Base.@nospecializeinfer function _kernel_add!(
                 o -> canon_id(child_graph, o.id) in child_have, recipe.outputs)
             continue
         end
-        add!(graph;
-             inputs = Tuple(cloned[value.id] for value in recipe.inputs),
-             outputs = Tuple(cloned[value.id] for value in recipe.outputs),
-             op = recipe.op, cost = recipe.cost,
-             cse_key = _kernel_provenance_key(recipe),
-             effectful = recipe.effectful, source = recipe.source)
+        _add_recipe!(graph,
+             Tuple(cloned[value.id] for value in recipe.inputs),
+             Tuple(cloned[value.id] for value in recipe.outputs),
+             recipe.op, recipe.cost, _kernel_provenance_key(recipe),
+             recipe.effectful, recipe.source)
     end
     _reindex_producers!(graph)
 end
@@ -377,8 +388,8 @@ end
 # conversion (`b::T = a::U`, T≠U) is uncertain, so the ordinary identity Recipe is kept instead.
 # The caller hard-aliases only outputs with EXACTLY ONE authored definition (`b=a; b=c` are
 # alternative producers, not a proof `a===c`).
-function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost,
-                        source = _NO_KERNEL_SOURCE)
+function _kernel_alias!(graph::Graph, from::Value, to::Value, @nospecialize(op), cost,
+                        @nospecialize(source = _NO_KERNEL_SOURCE))
     src = canon_id(graph, from.id)
     dst = canon_id(graph, to.id)
     src == dst && return graph                       # already one class (reverse/transitive)
@@ -386,8 +397,7 @@ function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost,
         graph.aliases[src] = dst
         graph.version += 1                           # a real canonical mutation (like CSE/merge)
     else                                             # typed conversion → keep the ordinary recipe
-        add!(graph; inputs = (to,), outputs = (from,), op = op,
-             cost = cost, cse_key = nothing, effectful = false, source = source)
+        _add_recipe!(graph, (to,), (from,), op, cost, nothing, false, source)
     end
     graph
 end
@@ -1717,9 +1727,12 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     generated = gensym(Symbol(endpoint_name, :_endpoint))
                     retargeted = _kernel_endpoint_call_signature(
                         Val(Tuple(owner_ports)), Val(explicit))
-                    nested_specs[generated] = KernelSpec(
-                        endpoint.graph, endpoint.ports, endpoint.port_order,
-                        endpoint.have_names, endpoint.want_names, retargeted)
+                    # The retargeted signature type is new for every endpoint
+                    # view; allocate the spec without compiling a constructor.
+                    nested_specs[generated] = _kernel_new_instance(
+                        KernelSpec{typeof(retargeted)},
+                        (endpoint.graph, endpoint.ports, endpoint.port_order,
+                         endpoint.have_names, endpoint.want_names, retargeted))::KernelSpec
                     return Expr(:call, generated, endpoint_ports...),
                            valtype(only(outputs(endpoint)))
                 end
@@ -1944,13 +1957,15 @@ function _kernel_authored_plate_expr(rhs, mod,
        materialized_arguments)
 end
 
-function _kernel_authored_plate(spec::KernelSpec, ::Val{A}) where {A}
+Base.@nospecializeinfer function _kernel_authored_plate(
+        @nospecialize(spec::KernelSpec), @nospecialize(atomic::Val))
     # Store the graph's operation boundary explicitly: an expanded nested
     # region can coincidentally have the same table length as its parent DAG.
     # Length equality alone does not establish one operation per recipe.
     p = plan(spec)
     kernel = _prepare(p, _lower_with_ops(p; inline_embedded = false)...)
-    _AuthoredPlateOp{typeof(kernel),A}(kernel)
+    T = _AuthoredPlateOp{typeof(kernel),_val_parameter(atomic)}
+    _kernel_new_instance(T, (kernel, ()))::_AuthoredPlateOp
 end
 
 # `scan(xs, Ref(shared)...; init = c0) do carry, x, shared...  …; (new_carry, output)  end`
@@ -2683,7 +2698,9 @@ end
 # (`_native_hcat`, `_native_vcat`, `_native_hvcat`).  They return Base's
 # result and send every operand combination they do not specialize back to
 # Base; they exist for native Enzyme reverse, which cannot differentiate
-# Base's dense methods when constant and active operands meet (core.jl).  A
+# Base's dense methods when constant and active operands meet, and keep
+# scalar and mixed literals off the generic methods SparseArrays substitutes
+# for Base's (core.jl).  A
 # callee that a port or local shadows keeps its own meaning, as does a
 # function that merely shares the name; bracket syntax always means Base's
 # functions, as in Julia.  The tensorized companion keeps its own lowering
@@ -2759,12 +2776,12 @@ function _kernel_native_broadcasts(ex; in_dotted::Bool = false)
     elseif ex.head === :. && length(ex.args) == 2 &&
            ex.args[2] isa Expr && ex.args[2].head === :tuple
         callee = ex.args[1]
-        arguments = ex.args[2].args
+        arguments = (ex.args[2]::Expr).args
     elseif ex.head in (Symbol(".&&"), Symbol(".||"))
         callee = GlobalRef(Base, ex.head === Symbol(".&&") ? :andand : :oror)
         arguments = ex.args
     else
-        return Expr(ex.head, map(_kernel_native_broadcasts, ex.args)...)
+        return Expr(ex.head, Any[_kernel_native_broadcasts(arg) for arg in ex.args]...)
     end
     any(arg -> arg isa Expr && arg.head === :parameters, arguments) && return ex
     # Match Julia's fusion boundary: a non-dotted parent materializes its
@@ -2912,11 +2929,11 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                     _kernel_tensorized_rhs(ex.args[2], known, mod, scope))
     elseif ex.head === :ref
         array = _kernel_tensorized_rhs(ex.args[1], known, mod, scope)
-        indices = ex.args[2:end]
+        ref_indices = ex.args[2:end]
         getindex_call = a -> Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex), a,
             (_kernel_tensorized_rhs(index, known, mod, scope)
-             for index in _kernel_ref_indices(a, indices))...)
-        (array isa Symbol || !any(_kernel_ref_has_endpoint, indices)) &&
+             for index in _kernel_ref_indices(a, ref_indices))...)
+        (array isa Symbol || !any(_kernel_ref_has_endpoint, ref_indices)) &&
             return getindex_call(array)
         # A computed array is evaluated once and its endpoints read from it.
         indexed = gensym(:indexed)
@@ -3200,7 +3217,7 @@ function _kernel_source_functions(ex, mod)
     ex.head in (:quote, :inert) && return ex
     ex.head === :-> && return Expr(:call,
         GlobalRef(@__MODULE__, :_kernel_source_function), ex, QuoteNode(ex), QuoteNode(mod))
-    Expr(ex.head, map(arg -> _kernel_source_functions(arg, mod), ex.args)...)
+    Expr(ex.head, Any[_kernel_source_functions(arg, mod) for arg in ex.args]...)
 end
 
 # Captures and the generated callable retain their concrete runtime types.
@@ -3213,7 +3230,7 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     _kernel_source_native_scope(source.args[2]) &&
         return _KernelSourceFunction(f, nothing, nothing)
     names = fieldnames(typeof(f))
-    captures = NamedTuple{names}(ntuple(i -> getfield(f, i), length(names)))
+    captures = NamedTuple{names}(Tuple(Any[getfield(f, i) for i in 1:length(names)]))
     # Julia owns shared lexical cells too: retain their exact read/write and
     # undefined-binding behavior rather than reconstructing Box operations.
     any(value -> value isa Core.Box, values(captures)) &&
@@ -3230,7 +3247,8 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     # leaf would add GC roots to the prepared callable's captured operation
     # table, obstructing ordinary reverse's read-only function analysis.
     runtime_f = RuntimeGeneratedFunctions.drop_expr(compile(qualified))
-    _KernelSourceFunction(f, runtime_f, captures)
+    T = _KernelSourceFunction{typeof(f),typeof(runtime_f),typeof(captures)}
+    _kernel_new_instance(T, (f, runtime_f, captures))::_KernelSourceFunction
 end
 
 function _kernel_source_native_scope(ex)
@@ -3496,7 +3514,7 @@ function _kernel_nested_endpoint_deps(rhs, deps::Vector{Symbol}, known::Set{Symb
     spec = generated isa KernelSpec ? generated :
            (mod isa Module ? _kernel_resolve_binding(mod, callee) : nothing)
     spec isa KernelSpec || return deps
-    signature = spec.call_signature
+    signature = getfield(spec, :call_signature)
     signature isa _KernelEndpointCallSignature || return deps
     implicit, explicit = typeof(signature).parameters
     args = rhs.args[2:end]
@@ -3880,7 +3898,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
         rhs = _kernel_hygienic_catches(authored_rhs, known)
         deps = plate_expr === nothing ? _kernel_free_ports(rhs, known) :
-               collect(plate_expr.arguments)
+               collect(plate_expr.arguments)::Vector{Symbol}
         deps = plate_expr === nothing ? _kernel_nested_endpoint_deps(
             rhs, deps, known, mod, nested_specs) : deps
         all(name -> name in known, deps) || throw(ArgumentError(
@@ -4218,6 +4236,102 @@ macro kernel(ex)
              _kernel_expand(stateless_body, inputs, call_signature, __module__)))
 end
 
+"""
+    _kernel_eval_definition(mod::Module, definition::Expr) -> KernelSpec
+
+Evaluate the stateless `@kernel` definition `definition` (`name(args...) = body`)
+at top level in `mod` and return its `KernelSpec`, binding nothing. This is the
+entry point for program generators that emit kernel definitions as data, such
+as ReactiveKernelsPPL's `build_kernel`.
+
+It builds the spec `@kernel` builds, but evaluates each recipe closure as its own
+top-level expression in `mod` instead of lowering all of them with the
+construction code. Julia's lowering is quadratic in the number of closures in
+one scope, which the macro bounds by grouping recipes into immediately invoked
+closures, and every such group is then compiled although it runs once. Here
+lowering stays linear and the construction code runs in the top-level
+interpreter, so construction compiles no per-model code. Because closures are
+evaluated in `mod`'s global scope, `definition` cannot capture local variables.
+"""
+function _kernel_eval_definition(mod::Module, definition::Expr)
+    expanded = macroexpand(mod, Expr(:macrocall, Symbol("@kernel"),
+                                     LineNumberNode(@__LINE__, Symbol(@__FILE__)),
+                                     definition))
+    expanded isa Expr && expanded.head === :(=) && length(expanded.args) == 2 &&
+        expanded.args[1] isa Symbol || throw(ArgumentError(
+            "_kernel_eval_definition requires a stateless `name(args...) = body` " *
+            "@kernel definition"))
+    construction = expanded.args[2]
+    locals = Set{Symbol}()
+    _kernel_construction_locals!(locals, construction)
+    Core.eval(mod, Expr(:let, Expr(:block),
+                        _kernel_toplevel_construction(construction, mod, locals)))
+end
+
+# Zero-argument closures invoked in place: `_kernel_expand`'s recipe groups.
+_kernel_is_group_call(@nospecialize(ex)) =
+    ex isa Expr && ex.head === :call && length(ex.args) == 1 &&
+    ex.args[1] isa Expr && ex.args[1].head === :-> &&
+    ex.args[1].args[1] == Expr(:tuple)
+
+# The expansion embeds values of new types (nested specs, operations), so these
+# walkers take every node unspecialized and loop instead of mapping closures,
+# which would compile once per embedded value type.
+
+# Names the construction code itself assigns (its gensym'd graph-building
+# locals), outside any recipe closure.
+function _kernel_construction_locals!(locals::Set{Symbol}, @nospecialize(ex))
+    ex isa Expr || return locals
+    ex.head in (:quote, :inert) && return locals
+    if _kernel_is_group_call(ex)
+        return _kernel_construction_locals!(locals, ex.args[1].args[2])
+    end
+    ex.head === :-> && return locals
+    if ex.head === :(=) && ex.args[1] isa Symbol
+        push!(locals, ex.args[1])
+    elseif ex.head === :let
+        bindings = ex.args[1]
+        for binding in (Meta.isexpr(bindings, :block) ? bindings.args : (bindings,))
+            binding isa Symbol && push!(locals, binding)
+            Meta.isexpr(binding, :(=)) && binding.args[1] isa Symbol &&
+                push!(locals, binding.args[1])
+        end
+    end
+    for arg in ex.args
+        _kernel_construction_locals!(locals, arg)
+    end
+    locals
+end
+
+function _kernel_mentions_any(@nospecialize(ex), names::Set{Symbol})
+    ex isa Symbol && return ex in names
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return false
+    for arg in ex.args
+        _kernel_mentions_any(arg, names) && return true
+    end
+    false
+end
+
+# Inline the recipe groups and evaluate every closure the construction code
+# creates as its own top-level expression in `mod`.
+function _kernel_toplevel_construction(@nospecialize(ex), mod::Module, locals::Set{Symbol})
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    _kernel_is_group_call(ex) &&
+        return _kernel_toplevel_construction(ex.args[1].args[2], mod, locals)
+    if ex.head === :->
+        _kernel_mentions_any(ex, locals) && throw(ArgumentError(
+            "internal error: a @kernel recipe closure refers to a construction local; " *
+            "it cannot be evaluated separately"))
+        return Expr(:call, GlobalRef(Core, :eval), mod, QuoteNode(ex))
+    end
+    args = Vector{Any}(undef, length(ex.args))
+    for (index, arg) in enumerate(ex.args)
+        args[index] = _kernel_toplevel_construction(arg, mod, locals)
+    end
+    Expr(ex.head, args...)
+end
+
 # --- named boundaries ------------------------------------------------------
 
 struct _KernelDefaultBoundary end
@@ -4227,10 +4341,14 @@ const _KERNEL_DEFAULT_BOUNDARY = _KernelDefaultBoundary()
 # are grouped into immediately-invoked closures to avoid O(N²) lowering of a
 # single giant scope (each inline lambda contributes a nested function scope
 # whose lowering cost grows with the enclosing scope size).
-const _KERNEL_EXPAND_CHUNK = 50
+# Smaller groups lower faster (lowering is quadratic in the lambdas per scope)
+# and compile no slower: measured on 8- and 16-regression RKPPL models, 10
+# cut lowering 2.5-3x versus 50 and slightly reduced construction time,
+# while 3 made construction slower again.
+const _KERNEL_EXPAND_CHUNK = 10
 
-function _kernel_selection(spec::KernelSpec, selection, defaults::Vector{Symbol},
-                           label::Symbol)
+Base.@nospecializeinfer function _kernel_selection(@nospecialize(spec::KernelSpec),
+                           selection, defaults::Vector{Symbol}, label::Symbol)
     chosen = selection === _KERNEL_DEFAULT_BOUNDARY ? Tuple(defaults) : selection
     items = chosen isa Tuple || chosen isa AbstractVector ? chosen : (chosen,)
     values = Value[]
@@ -4238,7 +4356,7 @@ function _kernel_selection(spec::KernelSpec, selection, defaults::Vector{Symbol}
         if item isa Symbol
             push!(values, spec[item])
         elseif item isa Value
-            owned = get(spec.graph.values, item.id, nothing)
+            owned = get(getfield(spec, :graph).values, item.id, nothing)
             if owned === nothing || typeof(owned) !== typeof(item) ||
                owned.id != item.id || owned.name !== item.name
                 throw(ArgumentError(
@@ -4456,8 +4574,9 @@ Keyword/default signatures are preserved. Bound data and computation metadata
 remain shared and read-only; previous outputs are neither shared nor copied.
 One instance can serve sequential batches; it is not reentrant. Shape/type changes
 reseed buffers, and buffers aliasing this call's inputs detach. This reuses final
-outputs and the native lane buffers (batched dense array inputs, plate and
-scan results); other scalar recipes may still allocate intermediates. Reactant
+outputs and the native lane buffers: batched dense array inputs and the
+position values produced by authored plates and scans, top-level dotted calls
+and array slices. Other scalar recipes may still allocate intermediates. Reactant
 uses the owning surface (`reuse=false`).
 
 To bind shared values, lift `prepare(spec; have, want, bound=(; shared...))` with
@@ -4594,10 +4713,12 @@ function scan(args...; kwargs...)
         "kernel body."))
 end
 
-inputs(spec::KernelSpec) = _kernel_selection(
-    spec, _KERNEL_DEFAULT_BOUNDARY, spec.have_names, :have)
-outputs(spec::KernelSpec) = _kernel_selection(
-    spec, _KERNEL_DEFAULT_BOUNDARY, spec.want_names, :want)
+# Boundary reads never use the call-signature parameter `S`, which is unique
+# per authored kernel; specializing on it would compile these once per spec.
+Base.@nospecializeinfer inputs(@nospecialize(spec::KernelSpec)) = _kernel_selection(
+    spec, _KERNEL_DEFAULT_BOUNDARY, getfield(spec, :have_names), :have)
+Base.@nospecializeinfer outputs(@nospecialize(spec::KernelSpec)) = _kernel_selection(
+    spec, _KERNEL_DEFAULT_BOUNDARY, getfield(spec, :want_names), :want)
 
 # --- pure named-port composition ------------------------------------------
 
@@ -4622,9 +4743,8 @@ function _kernel_clone_recipes!(graph::Graph, mapped::Dict{Int,Value},
     for recipe in spec.graph.recipes
         ins = Tuple(mapped[value.id] for value in recipe.inputs)
         outs = Tuple(mapped[value.id] for value in recipe.outputs)
-        add!(graph; inputs = ins, outputs = outs, op = recipe.op,
-             cost = recipe.cost, cse_key = _kernel_provenance_key(recipe),
-             effectful = recipe.effectful, source = recipe.source)
+        _add_recipe!(graph, ins, outs, recipe.op, recipe.cost,
+             _kernel_provenance_key(recipe), recipe.effectful, recipe.source)
     end
     graph
 end

@@ -33,13 +33,15 @@ using Test
         # distribution objects only. (m0 itself replicates via the
         # ZeroInflatedBinomial head; this pins the branch spelling's
         # rejection, not the item.)
-        # refused: `.~` right-hand side must be a distribution; `ifelse.(…, a, b)` yields reals (P3)
+        # refused: `.~` right-hand side must be a distribution; `ifelse.(…, a, b)` yields reals (P3).
+        # The open sampling right-hand side (USER 2026-10-04) lowers it as an
+        # ordinary value, so evaluation finds no sampling density for a Float64.
         ("m0", "response-position branch",
             :(begin
                 a ~ Normal(0, 1)
                 b ~ Normal(0, 1)
                 s .~ ifelse.(s .> 0, a, b)
-            end), (:s,), SurfaceLoweringError),
+            end), (:s,), ArgumentError),
         # survey_model: discrete-n marginal needs data-sized mixture
         # support; mixture weights are literal vectors or simplex names.
         # capability: data-supplied mixture weights (P10a 0dejlw1) (todo `1qlbn5b`).
@@ -55,13 +57,15 @@ using Test
         # a data-only call evaluated once at bind — test_functions_as_values.jl.)
         # bym2_offset_only: ICAR pairwise-difference prior needs
         # sampled-vector gathers plus a custom edge reduction.
-        # refused: indexes scalar-declared `phi` with data index vectors (Julia BoundsError, P3); declared-array gathers are admitted
+        # refused: indexes scalar-declared `phi` with data index vectors (P3); declared-array gathers are admitted.
+        # The read lowers as ordinary Julia and fails as Julia does when it runs:
+        # no `getindex(::Float64, ::Vector{Int})` method.
         ("bym2_offset_only", "sampled-vector gather",
             :(begin
                 phi ~ Normal(0, 1)
                 mu = phi[node1] .- phi[node2]
                 y .~ Normal.(mu, 1.0)
-            end), (:y, :node1, :node2), SurfaceLoweringError),
+            end), (:y, :node1, :node2), MethodError),
         # losscurve_sislob: the ordinary Weibull shape parameter and literal
         # scale are admitted by constructor-value lowering (`1qlbn5b`).
         ("losscurve_sislob", "Weibull response",
@@ -143,6 +147,11 @@ using Test
             end), (:y,), SurfaceLoweringError),
     ]
     capabilities = Set(["literal prob rejected"])
+    # Programs refused when they are evaluated, with the data they bind.
+    evaluated = Dict(
+        "response-position branch" => Dict{Symbol,Any}(:s => [0.5, -0.2, 1.1]),
+        "sampled-vector gather" => Dict{Symbol,Any}(:y => [0.1, 0.2],
+            :node1 => [1, 2], :node2 => [2, 1]))
     for (item, label, prog, datanames, E) in cases
         @testset "$item: $label" begin
             if label == "data-varying scan recurrence"
@@ -153,6 +162,12 @@ using Test
                 @test build_kernel(plan).spec isa KernelSpec
             elseif label in ("scalar-data likelihood", "literal prob rejected", "data-column mixture weights", "Weibull response")
                 @test lower_rkppl(prog, datanames; conditioned=datanames) isa StructuralPlan
+            elseif haskey(evaluated, label)
+                bound = bind_data(lower_rkppl(prog, datanames; conditioned = datanames),
+                    evaluated[label])
+                built = build_kernel(bound)
+                @test_throws E Base.invokelatest(prepare_query(built, bound, :likelihood),
+                    zeros(built.layout.total))
             elseif label in capabilities
                 # capability: each entry above names a valid model shape (todo `1qlbn5b`).
                 @test_broken (lower_rkppl(prog, datanames; conditioned = datanames); true)

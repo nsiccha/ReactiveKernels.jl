@@ -23,8 +23,8 @@ function _have(plan::StructuralPlan)
     return (:unconstrained, _sorted_cols(plan)...)
 end
 
-# World-age barrier (Julia 1.12+): `build_kernel` eval's a fresh
-# `PPLGeneratedModels` binding per build, and 1.12 Test pins the testset
+# World-age barrier (Julia 1.12+): `build_kernel` evals fresh recipe
+# closures (new methods) per build, and 1.12 Test pins the testset
 # body's world, so raw `prepare` / kernel calls from these helpers throw
 # "method too new" (1.10 runs them at latest world and stays green).
 # Same remedy as `prepare_query`/`prepare_sampler` (src/query.jl) and the

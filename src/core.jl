@@ -115,18 +115,42 @@ struct _KernelSourceOp{DefToken,Form,F,TF,IG,CI}
     call_identity::CI
 end
 
-_KernelSourceOp(::Val{DefToken}, ::Val{Form}, f::F, tensor_f::TF,
-                ignored_throws::IG = nothing, call_identity::CI = nothing) where
-                {DefToken,Form,F,TF,IG,CI} =
-    _KernelSourceOp{DefToken,Form,F,TF,IG,CI}(f, tensor_f, ignored_throws, call_identity)
+# Every authored recipe creates source operations of new concrete types, and
+# a constructor call compiles once per concrete type. Graph assembly only stores
+# the operation, so build it from its parameters without specializing. The
+# prepared kernel still sees the exact concrete operation type.
+Base.@nospecializeinfer function _KernelSourceOp(
+        @nospecialize(token::Val), @nospecialize(form::Val),
+        @nospecialize(f), @nospecialize(tensor_f),
+        @nospecialize(ignored_throws = nothing), @nospecialize(call_identity = nothing))
+    T = _KernelSourceOp{_val_parameter(token), _val_parameter(form),
+                        typeof(f), typeof(tensor_f), typeof(ignored_throws),
+                        typeof(call_identity)}
+    _kernel_new_instance(T, (f, tensor_f, ignored_throws, call_identity))::_KernelSourceOp
+end
+
+Base.@nospecializeinfer _val_parameter(@nospecialize(value::Val)) =
+    (typeof(value)::DataType).parameters[1]
+
+# Allocate an instance of a concrete struct type from field values of exactly
+# the field types, as its default inner constructor would, without compiling
+# that constructor for `T`. `jl_new_structv` is the runtime's own struct
+# allocator (also used by the Serialization stdlib); it type-checks each field.
+Base.@nospecializeinfer function _kernel_new_instance(@nospecialize(T::DataType),
+                                                     @nospecialize(fields::Tuple))
+    values = Any[fields...]
+    ccall(:jl_new_structv, Any, (Any, Ptr{Any}, UInt32), T, values, length(values))
+end
 
 # A module binding can be shadowed by a lexical callable captured in either
 # execution body. Its value at construction need not identify later calls,
 # especially when Julia retains a reassigned local in a shared Core.Box.
 # The runtime callable must also match the binding resolved by lowering,
 # which can have replaced the call and removed its lexical capture entirely.
-function _KernelSourceOp(token::Val, form::Val, f, tensor_f,
-                         ignored_throws, call_identity, capture_name, resolved_callable)
+Base.@nospecializeinfer function _KernelSourceOp(
+        @nospecialize(token::Val), @nospecialize(form::Val), @nospecialize(f),
+        @nospecialize(tensor_f), @nospecialize(ignored_throws), @nospecialize(call_identity),
+        @nospecialize(capture_name), @nospecialize(resolved_callable))
     if call_identity !== nothing &&
        (first(call_identity) !== resolved_callable ||
         (capture_name !== nothing &&
@@ -384,15 +408,34 @@ end
 # Enzyme reverse joins their activities at that load and fails static activity
 # analysis with `EnzymeRuntimeActivityError`, although the arguments' activity
 # is fixed (`benchmark/repro_enzyme_mixed_activity_concat.jl` reproduces it
-# without ReactiveKernels).  The native body calls these companions instead
-# (`_kernel_native_calls`).  They return Base's result, a freshly allocated
-# `Matrix{T}` or `Vector{T}` of the same shape and values, and copy each
-# operand in its own inlined call, so every copy stays tied to its tuple
-# position.  Any other operand combination, a non-isbits element type, and
-# every shape Base rejects call Base itself, which keeps its result and error.
-const _NativeDenseVecOrMat{T} = Union{Vector{T},Matrix{T}}
+# without ReactiveKernels).  Scalar and mixed scalar/array operands, as in
+# the literals `[-a 0.0; a -b]` and `[M v; 0.0 1.0]`, reach whichever generic
+# method claims them: SparseArrays, which Enzyme loads, extends `hcat`, `vcat`
+# and `hvcat` to every list of `Number` and `AbstractVecOrMat{<:Number}`
+# operands and sends dense ones through generic `typed_hcat`/`typed_hvcat`
+# paths, several times slower than Base's scalar fill.  The native body calls
+# these companions instead (`_kernel_native_calls`).  For `Number`, `Vector`
+# and `Matrix` operands whose promoted element type is isbits, they return
+# Base's result, a freshly allocated `Matrix` or `Vector` of Base's shape,
+# element type and values, and write each operand in its own inlined call, so
+# every write stays tied to its tuple position.  A `Number` is a 1×1 block,
+# and `vcat` of numbers and vectors alone is a vector, as in Base.  Any other
+# operand, a non-isbits element type, and every `hcat`/`vcat` layout the
+# companions do not lay out call Base itself, which keeps its result and error
+# (including `vcat`'s fill of leading numbers across a wider matrix); for these
+# operands Base returns a `Matrix` of the promoted element type or throws, so
+# that call is asserted to keep the result inferred.  A layout `hvcat`
+# rejects (unequal heights or widths, or block-row counts that do not
+# describe the operands) throws the companion's own `DimensionMismatch` or
+# `ArgumentError`, worded as Base's, and never calls Base: native Enzyme
+# reverse on Julia 1.12 cannot compile Base's `hvcat` of mixed scalar and
+# array operands even on a path that never runs
+# (`benchmark/repro_enzyme_mixed_scalar_hvcat.jl`), and Julia 1.10's `hvcat`
+# silently drops operands beyond its block-row counts.
+const _NativeCatOperand = Union{Number,Vector,Matrix}
+const _NativeColumnOperand = Union{Number,Vector}
 
-@inline _native_cat_width(a::Vector) = 1
+@inline _native_cat_width(a::_NativeColumnOperand) = 1
 @inline _native_cat_width(a::Matrix) = size(a, 2)
 
 # Sizes over an operand tuple, one inlined call per operand.
@@ -417,10 +460,24 @@ const _NativeDenseVecOrMat{T} = Union{Vector{T},Matrix{T}}
 @inline _native_cat_widths(args::Tuple) =
     (_native_cat_width(first(args)), _native_cat_widths(Base.tail(args))...)
 
-# Copy the dense `a` into `out` (column-major, `stride` rows) with its first
-# element at row `row + 1`, column `column + 1`.  Callers allocate `out` from
-# the operands' validated shapes, so every copy is in bounds.
-@inline function _native_cat_block!(out, stride, row, column, a)
+# Write the operand `a` into `out` (column-major, `stride` rows) with its
+# first element at row `row + 1`, column `column + 1`, converting to the
+# output's element type as Base's `setindex!` does.  Callers allocate `out`
+# from the operands' validated shapes, so every write is in bounds.
+@inline function _native_cat_block!(out, stride, row, column, a::Number)
+    @inbounds out[column * stride + row + 1] = a
+    out
+end
+@inline function _native_cat_block!(out, stride, row, column, a::Array)
+    height = size(a, 1)
+    for j in 1:_native_cat_width(a), i in 1:height
+        @inbounds out[(column + j - 1) * stride + row + i] =
+            a[(j - 1) * height + i]
+    end
+    out
+end
+@inline function _native_cat_block!(out::Array{T}, stride, row, column,
+                                    a::Array{T}) where {T}
     height = size(a, 1)
     if height == stride
         # Whole columns of `out` (then `row == 0`): one contiguous block.
@@ -435,14 +492,14 @@ const _NativeDenseVecOrMat{T} = Union{Vector{T},Matrix{T}}
 end
 
 @inline _native_hcat(args...) = hcat(args...)
-@inline function _native_hcat(a::_NativeDenseVecOrMat{T},
-                              rest::_NativeDenseVecOrMat{T}...) where {T}
+@inline function _native_hcat(a::_NativeCatOperand, rest::_NativeCatOperand...)
+    args = (a, rest...)
+    T = Base.promote_eltypeof(args...)
+    isbitstype(T) || return hcat(args...)
     height = size(a, 1)
-    (isbitstype(T) && _native_cat_heights_equal(height, rest)) ||
-        return hcat(a, rest...)
-    out = Matrix{T}(undef, height,
-                    _native_cat_width(a) + _native_cat_width_sum(rest))
-    _native_hcat_copy!(out, height, 0, (a, rest...))
+    _native_cat_heights_equal(height, rest) || return hcat(args...)::Matrix{T}
+    out = Matrix{T}(undef, height, _native_cat_width_sum(args))
+    _native_hcat_copy!(out, height, 0, args)
 end
 @inline _native_hcat_copy!(out, height, column, ::Tuple{}) = out
 @inline function _native_hcat_copy!(out, height, column, args::Tuple)
@@ -453,19 +510,23 @@ end
 end
 
 @inline _native_vcat(args...) = vcat(args...)
-@inline function _native_vcat(a::Vector{T}, rest::Vector{T}...) where {T}
-    isbitstype(T) || return vcat(a, rest...)
-    out = Vector{T}(undef, length(a) + _native_cat_height_sum(rest))
-    _native_vcat_copy!(out, length(out), 0, (a, rest...))
+@inline function _native_vcat(a::_NativeColumnOperand,
+                              rest::_NativeColumnOperand...)
+    args = (a, rest...)
+    T = Base.promote_eltypeof(args...)
+    isbitstype(T) || return vcat(args...)
+    out = Vector{T}(undef, _native_cat_height_sum(args))
+    _native_vcat_copy!(out, length(out), 0, args)
 end
-@inline function _native_vcat(a::_NativeDenseVecOrMat{T},
-                              rest::_NativeDenseVecOrMat{T}...) where {T}
+@inline function _native_vcat(a::_NativeCatOperand, rest::_NativeCatOperand...)
+    args = (a, rest...)
+    T = Base.promote_eltypeof(args...)
+    isbitstype(T) || return vcat(args...)
     width = _native_cat_width(a)
-    (isbitstype(T) && _native_cat_widths_equal(width, rest)) ||
-        return vcat(a, rest...)
-    height = size(a, 1) + _native_cat_height_sum(rest)
+    _native_cat_widths_equal(width, rest) || return vcat(args...)::Matrix{T}
+    height = _native_cat_height_sum(args)
     out = Matrix{T}(undef, height, width)
-    _native_vcat_copy!(out, height, 0, (a, rest...))
+    _native_vcat_copy!(out, height, 0, args)
 end
 @inline _native_vcat_copy!(out, height, row, ::Tuple{}) = out
 @inline function _native_vcat_copy!(out, height, row, args::Tuple)
@@ -474,40 +535,51 @@ end
     _native_vcat_copy!(out, height, row + size(a, 1), Base.tail(args))
 end
 
-# `hvcat(rows, blocks...)`: block row `i` holds the next `rows[i]` blocks.
-# Base requires equal heights within a block row and equal total widths across
-# block rows; `(height, width)` of the result, or `nothing` for Base to decide.
+# The errors of layouts `hvcat` rejects, built out of line from sizes only.
+@noinline _native_hvcat_count_mismatch(rows, n) = ArgumentError(
+    "block-row counts $rows do not describe $n blocks")
+@noinline _native_hvcat_height_mismatch(i, expected, got) = DimensionMismatch(
+    "mismatched height in block row $i (expected $expected, got $got)")
+@noinline _native_hvcat_width_mismatch(i, expected, got) = DimensionMismatch(
+    "block row $i has mismatched number of columns (expected $expected, got $got)")
+
+# `hvcat(rows, blocks...)`: block row `i` holds the next `rows[i]` blocks,
+# with equal heights within a block row and equal total widths across block
+# rows.  `(height, width)` of the result; any other layout throws.
 function _native_hvcat_shape(rows::Tuple{Vararg{Int}}, heights::Tuple,
                              widths::Tuple)
+    n = length(heights)
+    (!isempty(rows) && all(>=(1), rows) && sum(rows) == n) ||
+        throw(_native_hvcat_count_mismatch(rows, n))
     k = 0
     height = 0
     width = -1
-    for n in rows
-        (n >= 1 && k + n <= length(heights)) || return nothing
+    for (i, count) in enumerate(rows)
         h = heights[k + 1]
         w = 0
-        for _ in 1:n
+        for _ in 1:count
             k += 1
-            heights[k] == h || return nothing
+            heights[k] == h ||
+                throw(_native_hvcat_height_mismatch(i, h, heights[k]))
             w += widths[k]
         end
         width < 0 && (width = w)
-        w == width || return nothing
+        w == width || throw(_native_hvcat_width_mismatch(i, width, w))
         height += h
     end
-    k == length(heights) ? (height, width) : nothing
+    (height, width)
 end
 
 @inline _native_hvcat(rows, args...) = hvcat(rows, args...)
-@inline function _native_hvcat(rows::Tuple{Vararg{Int}},
-                               a::_NativeDenseVecOrMat{T},
-                               rest::_NativeDenseVecOrMat{T}...) where {T}
+@inline function _native_hvcat(rows::Tuple{Vararg{Int}}, a::_NativeCatOperand,
+                               rest::_NativeCatOperand...)
     args = (a, rest...)
-    shape = _native_hvcat_shape(rows, _native_cat_heights(args),
-                                _native_cat_widths(args))
-    (isbitstype(T) && shape !== nothing) || return hvcat(rows, args...)
-    out = Matrix{T}(undef, shape[1], shape[2])
-    _native_hvcat_copy!(out, shape[1], rows, 1, 1, 0, 0, args)
+    T = Base.promote_eltypeof(args...)
+    isbitstype(T) || return hvcat(rows, args...)
+    height, width = _native_hvcat_shape(rows, _native_cat_heights(args),
+                                        _native_cat_widths(args))
+    out = Matrix{T}(undef, height, width)
+    _native_hvcat_copy!(out, height, rows, 1, 1, 0, 0, args)
 end
 @inline _native_hvcat_copy!(out, height, rows, i, j, row, column, ::Tuple{}) =
     out
@@ -806,9 +878,64 @@ _replicated_column_admitted(::Type{Array{T,N}}, ::Type{V}) where {T,N,V} =
     end
 end
 
+# A position intermediate's lane slot (`_lower_replicated_with_ops`): a
+# `Ref{Any}` that keeps the dense buffer its producer allocated at an earlier
+# position, or an earlier call of a borrowed reader. The slot is reused only
+# when element type and axes match; any other value allocates afresh and
+# replaces it. Intermediates never leave the call, and every WANT is copied
+# into the stacked result before the next position runs, so no live value is
+# overwritten (as for the input lanes, `_replicated_lane`).
+@inline function _lane_reuse(slot::Base.RefValue{Any}, ::Type{T},
+                             output_axes::NTuple{N,Any}) where {T,N}
+    buffer = slot[]
+    buffer isa Array{T,N} && axes(buffer) == output_axes ? buffer : nothing
+end
+# Record a freshly allocated buffer in a slot; other recycled values (WANT
+# scratch, destination columns, `nothing`) are owned by the position driver.
+@inline _lane_keep!(recycled, value) = value
+@inline _lane_keep!(slot::Base.RefValue{Any}, value) = (slot[] = value; value)
+
+# Destination forms of a top-level dotted call and an array slice in a
+# position residual (`_lane_source_expr`). Each returns exactly the value its
+# source would (`_native_broadcast_materialize`, `getindex`): a matching
+# recycled buffer is overwritten in full, and otherwise the ordinary result is
+# allocated and kept. Every other shape takes the ordinary path.
+@inline _lane_broadcast(recycled, value) = _native_broadcast_materialize(value)
+@inline _lane_broadcast(recycled,
+    bc::Base.Broadcast.Broadcasted{Base.Broadcast.DefaultArrayStyle{0}}) =
+    _native_broadcast_materialize(bc)
+@inline function _lane_broadcast(recycled,
+        bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle})
+    bc.axes === nothing || return _native_broadcast_materialize(bc)
+    ax = Base.@inline Base.Broadcast.combine_axes(bc.args...)
+    ready = Base.Broadcast.instantiate(
+        Base.Broadcast.Broadcasted(bc.style, bc.f, bc.args, ax))
+    T = Base.Broadcast.combine_eltypes(ready.f, ready.args)
+    isconcretetype(T) || return Base.materialize(ready)
+    buffer = _lane_reuse(recycled, T, ax)
+    buffer === nothing && return _lane_keep!(recycled,
+        _native_broadcast_copyto!(similar(ready, T), ready))
+    copyto!(buffer, ready)
+end
+
+const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<:Integer}}
+@inline _lane_getindex(recycled, A, I...) = A[I...]
+# A dense array or a view of one: its non-scalar `getindex` is a fresh
+# `Array{T}` of the index shape, which a copy into a matching buffer equals.
+@inline function _lane_getindex(recycled,
+        A::Union{Array{T},SubArray{T,<:Any,<:Array}}, I::Vararg{_LaneIndex}) where {T}
+    all(index -> index isa Integer, I) && return A[I...]
+    checkbounds(A, I...)
+    J = to_indices(A, I)
+    buffer = _lane_reuse(recycled, T, Base.index_shape(J...))
+    buffer === nothing && return _lane_keep!(recycled, A[I...])
+    copyto!(buffer, view(A, J...))
+end
+
 function _scan_history_buffer(recycled, xs, fill::Number)
     buffer = _lane_reuse(recycled, typeof(fill), axes(xs))
-    buffer === nothing ? _scan_history_buffer(xs, fill) : fill!(buffer, fill)
+    buffer === nothing ?
+        _lane_keep!(recycled, _scan_history_buffer(xs, fill)) : fill!(buffer, fill)
 end
 _scan_history_buffer(recycled, xs, fill) = _scan_history_buffer(xs, fill)
 _scan_history_buffer(xs, fill) = throw(ArgumentError(
@@ -1441,6 +1568,16 @@ function add!(g::Graph; inputs, outputs, op,
     _add_recipe!(g, inputs, outputs, op, cost, cse_key, effectful, source)
 end
 
+# Compare canonical value ids elementwise. `==` on tuples of unknown length is an
+# abstract call that any package method on tuples invalidates.
+function _canonical_ids_equal(g::Graph, values::Tuple{Vararg{Value}}, ids::Vector{Int})
+    length(values) == length(ids) || return false
+    for (value, id) in zip(values, ids)
+        canon_id(g, value.id) == id || return false
+    end
+    true
+end
+
 # Registration stores callable and provenance values as graph metadata. Its body
 # does not need a new inferred executable for every numerical operation type.
 Base.@nospecializeinfer function _add_recipe!(g::Graph,
@@ -1457,13 +1594,13 @@ Base.@nospecializeinfer function _add_recipe!(g::Graph,
     # arity, it computes the same thing. Alias the new outputs onto the existing
     # producer's outputs instead of adding a duplicate recipe.
     if cse_key !== nothing && !effectful
-        canon_ins = Tuple(canon_id(g, v.id) for v in ins)
+        canon_ins = Int[canon_id(g, v.id) for v in ins]
         for r in g.recipes
             r.effectful && continue
             r.cse_key === nothing && continue
             isequal(r.cse_key, cse_key) || continue
             length(r.outputs) == length(outs) || continue
-            Tuple(canon_id(g, v.id) for v in r.inputs) == canon_ins || continue
+            _canonical_ids_equal(g, r.inputs, canon_ins) || continue
             alias_plan = _cse_alias_plan(g, outs, r.outputs, cse_key)
             for v in ins; _register!(g, v); end
             for v in outs; _register!(g, v); end

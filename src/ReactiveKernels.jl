@@ -23,6 +23,7 @@ using LinearAlgebra
 using LogExpFunctions
 using Random
 import DifferentiationInterface
+using PrecompileTools: @setup_workload, @compile_workload
 RuntimeGeneratedFunctions.init(@__MODULE__)
 
 include("core.jl")
@@ -34,6 +35,7 @@ include("partial_evaluation.jl")
 include("nonallocating.jl")
 include("graphops.jl")
 include("authoring.jl")
+include("lane_sources.jl")
 include("error_policy.jl")
 include("ad.jl")
 include("derivative_rules.jl")
@@ -100,5 +102,7 @@ export drain_observations!
 export ValidatedCompiledTransition, validated_compiled_transition
 export StatefulControlBounds, stateful_control_bounds
 export functionalize_stateful, stateful_snapshot
+
+include("precompile.jl")
 
 end # module ReactiveKernels
