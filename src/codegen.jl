@@ -1411,7 +1411,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
         pointwise_lhs, total_lhs; recycled = nothing,
-        input_type_hints = nothing)
+        input_type_hints = nothing, element_type = nothing)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -1637,7 +1637,11 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
             GlobalRef(Core, :Any)) : nested.type
     inferred_eltype = only(_bind_native_type_exprs!(body, [inferred_eltype]))
-    push!(body.args, Expr(:(=), plate_eltype,
+    # A caller that already fixes the element type (the non-allocating step of
+    # a declared `Array{T}` plate output, whose cache is an `Array{T}`) passes
+    # it as `element_type`: each cell then converts on store, as the declared
+    # typed local converts the whole result in the ordinary native kernel.
+    push!(body.args, Expr(:(=), plate_eltype, element_type !== nothing ? element_type :
         Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
              inferred_eltype, valtype(only(inner.want)))))
     groups = _authored_plate_recipe_groups(
