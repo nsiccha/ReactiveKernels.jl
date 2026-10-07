@@ -9,6 +9,7 @@ include("test_plate_consumer_native_ad.jl")
 include("test_native_concat_ad.jl")
 include("test_ad_bound_operand_counts.jl")
 include("test_prepared_callback_ad.jl")
+include("test_lazy_arm_child_ad.jl")
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 

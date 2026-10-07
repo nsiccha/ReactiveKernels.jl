@@ -116,7 +116,35 @@ jobs:
       - name: Resolve nested example packages
         run: julia --startup-file=no --project=packages packages/setup.jl
       - name: Test nested example packages
-        run: julia --startup-file=no --project=packages packages/test.jl
+        run: julia --startup-file=no --project=packages packages/test.jl --exclude=ReactiveKernelsPPL
+
+  rkppl:
+    name: rkppl (${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    # One job cannot finish the ReactiveKernelsPPL suite inside GitHub's
+    # 360-minute job limit: run 37575292025 spent 141 minutes on its first 51
+    # of 228 test files. Each shard runs every N-th file (see
+    # packages/ReactiveKernelsPPL/test/sharding.jl); N is the matrix length.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - uses: julia-actions/cache@v2
+        with:
+          # The shards share one environment; one cache entry serves them all.
+          include-matrix: false
+      - name: Resolve nested example packages
+        run: julia --startup-file=no --project=packages packages/setup.jl
+      - name: Test ReactiveKernelsPPL shard
+        env:
+          RKPPL_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+        run: julia --startup-file=no --project=packages packages/test.jl ReactiveKernelsPPL
 
   reactant-integration:
     runs-on: ubuntu-latest

@@ -239,4 +239,72 @@ _loops(ex) = ex isa Expr ? Int(ex.head === :for) + sum(_loops, ex.args; init=0) 
         @test xs == original
     end
 end
+
+# The inner scan reads the same, possibly empty, sequence at every outer step,
+# and its loop is nested in the outer scan's loop in one generated body.
+@kernel seeded_inner(xs::Vector{Float64}, us::Vector{Vector{Float64}},
+                     w::Vector{Float64}) = begin
+    trajectory = scan(xs, Ref(us), Ref(w); init=zeros(2)) do previous, x, uu, ww
+        pending = scan(eachindex(uu), Ref(uu), Ref(x); init=previous .* ww[1],
+                       include_init=true) do state, i, u, xx
+            n = state .+ xx .* u[i]
+            (n, n)
+        end
+        next = pending[end]
+        (next, sum(next))
+    end
+    total::Float64 = sum(trajectory) + sum(w)
+    return total
+end
+@kernel summed_inner(xs::Vector{Float64}, us::Vector{Vector{Float64}},
+                     w::Vector{Float64}) = begin
+    trajectory = scan(xs, Ref(us), Ref(w); init=zeros(2)) do previous, x, uu, ww
+        seed = previous .* ww[1]
+        partial = scan(eachindex(uu), Ref(uu), Ref(x); init=seed) do state, i, u, xx
+            n = state .+ xx .* u[i]
+            (n, sum(n))
+        end
+        next = seed .+ sum(partial; init=0.0)
+        (next, sum(next))
+    end
+    total::Float64 = sum(trajectory) + sum(w)
+    return total
+end
+
+# Both carries' entry sums follow σ = α*w1*σ + β*x from σ = 0; the total adds
+# every σ. Returns the total and its derivative with respect to w1.
+function _carry_recurrence(xs, w1, α, β)
+    σ = dσ = total = dtotal = 0.0
+    for x in xs
+        σ, dσ = α*w1*σ + β*x, α*σ + α*w1*dσ
+        total += σ
+        dtotal += dσ
+    end
+    total, dtotal
+end
+
+@testset "scans nested over an outer-invariant empty sequence keep ordinary reverse AD" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    w = [1.3, 2.0, 0.5]
+    for us in (Vector{Float64}[], [[1.0, 2.0]], [[1.0, 2.0], [0.5, -1.0], [0.0, 3.0]]),
+            xs in (Float64[], [0.3], [0.3, -0.2, 0.5])
+        original = (deepcopy(us), copy(xs))
+        m = length(us)
+        mass = sum(sum, us; init=0.0)
+        prefixes = sum(i -> sum(sum, us[1:i]), 1:m; init=0.0)
+        for (spec, α, β) in ((seeded_inner, 1, mass),
+                             (summed_inner, 1 + 2m, 2prefixes)), bound in (false, true)
+            total, dtotal = _carry_recurrence(xs, w[1], α, β)
+            value, derivative = total + sum(w), [dtotal + 1, 1.0, 1.0]
+            k = bound ? prepare(spec; bound=(; us)) : prepare(spec)
+            args = bound ? (xs, w) : (xs, us, w)
+            ad = prepare_ad(k, backend, args...; active=:w)
+            got, gradient = ad_value_and_gradient(ad, args...)
+            @test k(args...) ≈ value atol=1e-12
+            @test got ≈ value atol=1e-12
+            @test gradient ≈ derivative atol=1e-12
+        end
+        @test isequal((us, xs), original)
+    end
+end
 end

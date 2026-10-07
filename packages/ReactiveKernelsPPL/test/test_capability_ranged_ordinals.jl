@@ -3,7 +3,8 @@ using DifferentiationInterface, Distributions, Enzyme, LinearAlgebra, ReactiveKe
 function _cap_ranged_ordinal(kind, n, singleton)
     data = Dict(:x => collect(range(-0.4, 0.7; length=n)),
         :y => [mod1(i, 3)+1 for i in 1:n])
-    # Every supplied response entry must be observed (USER `1g8uvgs`).
+    # Observations cover the whole response and binding skips missing
+    # entries (provisional USER `1uhcm3b`): `singleton` keeps only y[1].
     singleton && (data[:y] = Union{Missing,Int}[i == 1 ? data[:y][i] : missing
         for i in 1:n])
     ast = quote b ~ Normal(0, 2) end
@@ -11,9 +12,8 @@ function _cap_ranged_ordinal(kind, n, singleton)
     obj = kind === :ordered ? :(OrderedLogistic(b*x[i], Ref(c))) :
         kind === :cumulative ? :(Ordinal(Cumulative(), LogitLink(), b*x[i], Ref(c))) :
         :(Ordinal(StoppingRatio(), LogitLink(), b*x[i], Ref(c)))
-    iterator = singleton ? :(axes(y, 2)) : :(eachindex(y))
     push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
-        Expr(:for, Expr(:(=), :i, iterator), Expr(:block, Expr(:call, :~, :(y[i]), obj)))))
+        Expr(:for, Expr(:(=), :i, :(eachindex(y))), Expr(:block, Expr(:call, :~, :(y[i]), obj)))))
     bound = bind_data(lower_rkppl(ast, data; conditioned=keys(data)), data)
     built = build_kernel(bound)
     u = unconstrain(built.layout, (; b=0.35, c=[-0.7, 0.1, 0.8]))
@@ -26,9 +26,10 @@ function _cap_ranged_ordinal(kind, n, singleton)
     end
     function pointwise(v)
         b, c = values(v)
-        indices = singleton ? axes(data[:y], 2) : eachindex(data[:y])
-        map(indices) do i
+        map(eachindex(data[:y])) do i
             y, eta = data[:y][i], b*data[:x][i]
+            # A skipped entry leaves zero in pointwise output.
+            ismissing(y) && return 0.0
             if kind === :stopping
                 lp = sum((log(ccdf(Logistic(), c[j]-eta)) for j in 1:y-1); init=0.0)
                 y == 4 ? lp : lp + log(cdf(Logistic(), c[y]-eta))
@@ -56,16 +57,17 @@ end
         @test gradient ≈ _cap_range_fd(fx.oracle, fx.u) rtol=5e-6
         pw = Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), fx.u).y
         @test pw ≈ fx.pointwise(fx.u)
-        @test size(pw) == (singleton ? 1 : 6,)
+        @test size(pw) == (6,)
     end
 end
 
 @testset "indexed scale support is checked only in selected cells" begin
+    # Binding skips the missing cells, so only y[1]'s scale is checked.
     data = Dict(:y => Union{Missing,Float64}[0.2, missing, missing],
         :s => [0.7, -1.0, -2.0])
     ast = quote
         a ~ Normal(0, 1)
-        @plate for i in axes(y, 2)
+        @plate for i in eachindex(y)
             y[i] ~ Normal(a, s[i])
         end
     end
@@ -73,7 +75,7 @@ end
     built = build_kernel(bound)
     u = unconstrain(built.layout, (; a=0.3))
     @test Base.invokelatest(prepare_query(built, bound, :likelihood), u) ≈ logpdf(Normal(0.3, 0.7), 0.2)
-    @test Base.invokelatest(prepare_query(built, bound, :pointwise), u).y ≈ [logpdf(Normal(0.3, 0.7), 0.2)]
+    @test Base.invokelatest(prepare_query(built, bound, :pointwise), u).y ≈ [logpdf(Normal(0.3, 0.7), 0.2), 0, 0]
     bad = merge(data, Dict(:s => [-0.7, 1.0, 2.0]))
     @test_throws ContractValidationError bind_data(lower_rkppl(ast, bad; conditioned=keys(bad)), bad)
 end

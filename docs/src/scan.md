@@ -312,9 +312,11 @@ rejects it (`EnzymeRuntimeActivityError`;
 `benchmark/repro_enzyme_branch_kept_seed_carry.jl`). The inner scan's
 `include_init = true` result starts with its seed, so `inner[end]` is that seed
 when the inner sequence is empty: the same value without the branch, and it
-differentiates while the inner sequences are nonempty. An inner sequence that
-is empty after the first outer step is a separate, unresolved native reverse
-failure (`OutOfMemoryError`) in either spelling.
+differentiates whether the inner sequences are empty or not. Native scans
+iterate the indices after their peeled first step as a unit range. Iterating
+them with `Iterators.drop` made Enzyme raise `OutOfMemoryError` from the
+second outer step on whenever the inner sequence was empty and the same at
+every outer step (`benchmark/repro_enzyme_guarded_inner_loop_cache.jl`).
 
 A recurrence authored in its own kernel, prepared once and called from a lazy
 branch arm, still works. The arm then runs through an ordinary callable

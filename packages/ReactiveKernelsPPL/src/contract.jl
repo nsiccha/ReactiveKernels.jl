@@ -943,7 +943,10 @@ predictor Symbols allowed. `levelmaps` sizes every factor term
 (empty for a plain population-GLM plan). `array_parameters` are the
 declared array-valued parameters ([`ArrayParameter`](@ref)) the model reads
 by name. `submodel_scopes` records lexical author paths separately from
-the private identifiers used by the mathematical plan.
+the private identifiers used by the mathematical plan. `cell_broadcasts`
+maps each response observed by a dotted `@plate` cell (`y[i] .~ D.(…)`) to
+the names that cell reads per index; when the bound response holds one
+array per index, each cell broadcasts over its own entries.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -965,7 +968,23 @@ struct StructuralPlan
     conditioned::Set{Symbol}
     indexed_observations::Set{Symbol}
     external_observations::Vector{SampledParameter}
+    cell_broadcasts::Dict{Symbol,Vector{Symbol}}
 end
+
+# The former full constructor has no dotted-cell observations.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters,
+    matrices,
+    array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters,
+        matrices,
+        array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        Dict{Symbol,Vector{Symbol}}())
 
 # The former full constructor has no external observations.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1075,12 +1094,14 @@ function StructuralPlan(
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
         indexed_observations::Set{Symbol} = Set{Symbol}(),
-        external_observations::Vector{SampledParameter} = SampledParameter[])
+        external_observations::Vector{SampledParameter} = SampledParameter[],
+        cell_broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
-        array_parameters, submodel_scopes, conditioned, indexed_observations, external_observations)
+        array_parameters, submodel_scopes, conditioned, indexed_observations,
+        external_observations, cell_broadcasts)
 end
 
 """Find a design matrix by name, or `nothing`."""
@@ -1462,7 +1483,8 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :levelmaps, :vector_parameters, :submodel_scopes, :conditioned,
     :plate_parameters, :scans,
     :matrices,
-    :array_parameters, :indexed_observations, :external_observations)
+    :array_parameters, :indexed_observations, :external_observations,
+    :cell_broadcasts)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -1799,7 +1821,7 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :responses,
-            :indexed_observations) && continue
+            :indexed_observations, :cell_broadcasts) && continue
         visit(getfield(plan, f))
     end
     for r in plan.responses, f in fieldnames(LikelihoodSpec)
@@ -2236,7 +2258,7 @@ function _label_only_columns(plan::StructuralPlan)
         return nothing
     end
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :roles, :n_obs, :submodel_scopes) && continue
+        f in (:columns, :roles, :n_obs, :submodel_scopes, :cell_broadcasts) && continue
         visit(getfield(plan, f))
     end
     return setdiff!(labels, numeric)
@@ -4057,6 +4079,14 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         # unknown statically (in-graph Julia errors are loud).
         _is_derived(plan, c) && return nothing
         col = _observation_column(plan.columns, c, t.label, "term column")
+        if _cell_broadcast_operand(plan, c)
+            col = _array_entries(col)
+        elseif _holds_arrays(col)
+            _fail(t.label, "column $c holds one array per entry, which an " *
+                "observation reads as Julia broadcasting does: elementwise " *
+                "over those arrays; read `$c[i]` in a dotted `@plate` cell " *
+                "(`y[i] .~ D.(…)`) to broadcast over each entry's values")
+        end
         eltype(col) <: Real ||
             _fail(t.label, "column $c must be numeric")
     end
@@ -5343,23 +5373,95 @@ end
 
 function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
-        if r.family === MixtureFam && r.mixture_weights isa Symbol &&
-                !any(p -> p.name === r.mixture_weights, plan.vector_parameters)
-            w = r.mixture_weights
-            haskey(plan.columns, w) || _fail(r.label, "mixture weights $w are not bound")
-            _validate_mixture_weights(r, plan.columns[w], length(r.mixture_locs))
-        end
-        _validate_mi_data(r, plan)
-        _validate_response_column(r, plan)
-        _validate_scale_data(r, plan)
-        _validate_auxiliary_data(r, plan, r.nu, :nu)
-        _validate_auxiliary_data(r, plan, r.zi, :zi)
-        _validate_weights(r, plan)
-        _validate_trials(r, plan)
-        _validate_evidence_data(r, plan)
-        _validate_ordinal_data(r, plan)
+        _validate_response_data(r, _cell_broadcast_response(plan, r) ?
+            _cell_broadcast_entries(plan, r) : plan)
     end
     return nothing
+end
+
+function _validate_response_data(r::LikelihoodSpec, plan::StructuralPlan)
+    if r.family === MixtureFam && r.mixture_weights isa Symbol &&
+            !any(p -> p.name === r.mixture_weights, plan.vector_parameters)
+        w = r.mixture_weights
+        haskey(plan.columns, w) || _fail(r.label, "mixture weights $w are not bound")
+        _validate_mixture_weights(r, plan.columns[w], length(r.mixture_locs))
+    end
+    _validate_mi_data(r, plan)
+    _validate_response_column(r, plan)
+    _validate_scale_data(r, plan)
+    _validate_auxiliary_data(r, plan, r.nu, :nu)
+    _validate_auxiliary_data(r, plan, r.zi, :zi)
+    _validate_weights(r, plan)
+    _validate_trials(r, plan)
+    _validate_evidence_data(r, plan)
+    _validate_ordinal_data(r, plan)
+    return nothing
+end
+
+# A response value holding one array per index (`y = [[0.7, 0.3], [1.4]]`).
+_holds_arrays(col) = col isa AbstractArray && !(eltype(col) <: Number) &&
+    (isempty(col) ? eltype(col) <: AbstractArray : all(x -> x isa AbstractArray, col))
+
+# Data a cell-broadcast response reads per index hold that index's array.
+_cell_broadcast_operand(plan::StructuralPlan, c::Symbol) =
+    _holds_arrays(get(plan.columns, c, nothing)) &&
+        any(((y, reads),) -> c in reads && _holds_arrays(get(plan.columns, y, nothing)),
+            plan.cell_broadcasts)
+_array_entries(col) = isempty(col) || all(isempty, col) ?
+    eltype(eltype(col))[] : identity.(collect(Iterators.flatten(col)))
+
+"""A dotted `@plate` cell (`y[i] .~ D.(…)`) whose bound response holds one
+array per index: each cell broadcasts over its own index's entries."""
+_cell_broadcast_response(plan::StructuralPlan, r::LikelihoodSpec) =
+    haskey(plan.cell_broadcasts, r.response) &&
+        _holds_arrays(get(plan.columns, r.response, nothing))
+
+# Observing one array per index otherwise broadcasts a univariate
+# distribution over arrays, which Julia refuses: it takes no array argument.
+function _refuse_array_response(r::LikelihoodSpec, plan::StructuralPlan)
+    y = r.response
+    y in plan.indexed_observations && _fail(r.label, "each `$y[i]` holds an " *
+        "array, which a univariate distribution does not observe; broadcast " *
+        "the cell over its entries, `$y[i] .~ D.(…)`, as Julia does")
+    _fail(r.label, "`$y` holds one array per entry, and `$y .~ D.(…)` " *
+        "broadcasts the distribution over those arrays as Julia does (a " *
+        "univariate distribution takes no array argument); observe each " *
+        "entry's values in a dotted `@plate` cell: `@plate for i in " *
+        "eachindex($y); $y[i] .~ D.(…); end`")
+end
+
+# Data validators check observation entries. A cell-broadcast response is
+# checked on the entries its cells observe: each data array the response
+# reads is broadcast against each index's response array, as the cell does
+# (an operand read per index supplies that index's value; any other is
+# shared by every index), and the results are concatenated.
+function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
+    r.mi_jobs === nothing || _fail(r.label,
+        "mi() missingness over a response holding arrays is not built yet")
+    y = plan.columns[r.response]
+    perindex = plan.cell_broadcasts[r.response]
+    arrays = Set{Symbol}(k for (k, v) in plan.columns if v isa AbstractArray)
+    columns = copy(plan.columns)
+    for c in _response_reads(plan, r, arrays)
+        c === r.response && continue
+        v = plan.columns[c]
+        cells = try
+            broadcast(y, c in perindex ? v : Ref(v)) do yi, vi
+                broadcast((_, x) -> x, yi, vi)
+            end
+        catch e
+            e isa DimensionMismatch || rethrow()
+            _fail(r.label, "`$c` does not broadcast with the arrays of " *
+                "`$(r.response)`, as each `$(r.response)[i] .~ …` cell requires: " *
+                sprint(showerror, e))
+        end
+        columns[c] = _array_entries(cells)
+    end
+    entries = _array_entries(y)
+    any(ismissing, entries) && _fail(r.label, "missing entries inside the " *
+        "arrays of `$(r.response)` are not built yet; drop them from their array")
+    columns[r.response] = entries
+    return _with(plan; columns = Dict{Symbol,ColumnData}(columns))
 end
 
 function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
@@ -5379,6 +5481,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         _observation_column(plan.columns, r.response, r.label, "response")
     mask = _response_observed_mask(plan, r)
     mask === nothing || (col = col[mask])
+    _holds_arrays(col) && _refuse_array_response(r, plan)
     if r.evidence.kind in (:interval_censored, :censored) ||
             (r.evidence.kind === :truncated && (_evidence_discrete(r.family) ||
             r.family in (BernoulliLogitGLMFam, PoissonLogGLMFam)))
@@ -6267,7 +6370,8 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names)
     # a shared helper is never evaluated both at bind and at preparation.
     free = Set{Symbol}(keys(nodes))
     for f in fieldnames(StructuralPlan)
-        f in (:assignments, :derived, :columns, :submodel_scopes) && continue
+        f in (:assignments, :derived, :columns, :submodel_scopes,
+            :cell_broadcasts) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     # Whole-value classification exempts `axes(M, d)` from observation
@@ -6315,7 +6419,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     # represented too, rather than from an intermediate definition table.
     unused = Set{Symbol}(raw)
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :n_obs, :roles, :submodel_scopes) && continue
+        f in (:columns, :n_obs, :roles, :submodel_scopes, :cell_broadcasts) && continue
         _drop_held_names!(unused, getfield(plan, f))
     end
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
@@ -6399,7 +6503,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
                 p.family === :external && p.name in plan.conditioned && continue
                 delete!(free, p.name)
             end
-        elseif f === :external_observations
+        elseif f in (:external_observations, :cell_broadcasts)
             continue
         elseif f === :vector_parameters
             for p in plan.vector_parameters
@@ -6770,7 +6874,9 @@ end
 # values): module calls through their `GlobalRef`s, built-in vocabulary
 # heads through the generated-model scope — the bindings the kernel uses.
 function _eval_value_expr(ex, lookup, label; calls = nothing)
-    ex isa Union{Number,String} && return ex
+    # An array is a value lowering already folded (a literal concentration
+    # in `length([1.0, 1.0])`); like any Julia constant it evaluates to itself.
+    ex isa Union{Number,String,AbstractArray} && return ex
     ex isa QuoteNode && return ex.value
     ex isa GlobalRef && return getglobal(ex.mod, ex.name)
     ex isa Symbol && return lookup(ex)
