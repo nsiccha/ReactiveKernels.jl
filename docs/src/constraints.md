@@ -380,6 +380,21 @@ and lock the one Reactant 0.2.289 lifted:
   authored. The same value written as the inner scan's `include_init = true`
   result's last element differentiates, as does the branch whose keep arm is
   unreachable; runtime activity is not used.
+- Native Enzyme 0.13.209 and 0.13.210 reverse mode raise `OutOfMemoryError`
+  for a loop over `Iterators.drop(indices, 1)` behind an emptiness test inside
+  another loop's body, both in one function, when its sequence is empty and the
+  same at every outer iteration. The outer loop must run at least twice; the
+  primal values are correct, and runtime activity does not help.
+  `repro_enzyme_guarded_inner_loop_cache.jl` reproduces it with Enzyme only,
+  together with a generator over `2:length(indices)` that fails the same way.
+  This was the shape of a scan inside a scan step over a possibly empty
+  sequence, such as a subject's dose list, because each native scan peels its
+  first step. For unit-range indices the native scan loops now iterate the
+  unit range that starts after the first index. It holds the same indices and
+  keeps the loop, and ordinary reverse differentiates both `include_init` and
+  ordinary inner scans over empty sequences. Other index collections keep
+  `Iterators.drop` and remain the backend's limitation. No activity
+  configuration or derivative rule is involved.
 - Native Enzyme 0.13.209 on Julia 1.10.12 also rejects an ordinary untyped
   comprehension whose generator captures both an active array and a constant
   floating-point array: `repro_enzyme_generator_const_array_capture.jl`

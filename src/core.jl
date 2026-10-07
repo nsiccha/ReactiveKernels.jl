@@ -687,6 +687,19 @@ function _scan_step_output_type(step, argument_types...)
         fieldtype(R, 2) : Any
 end
 
+# The indices after a scan's peeled first step, which every native scan loop
+# iterates, here and in the generated lowering. For a unit range they are the
+# unit range that starts one later; other index collections drop the first.
+# Both give the same indices. Native Enzyme reverse can fail on the
+# `Iterators.drop` loop of a scan nested in another scan's step, both in one
+# body: with an inner sequence that is empty and the same at every outer step,
+# it raises `OutOfMemoryError` from the second outer step on. The unit-range
+# loop differentiates. `benchmark/repro_enzyme_guarded_inner_loop_cache.jl`
+# reproduces both with Enzyme only.
+@inline _scan_rest(indices::AbstractUnitRange{<:Integer}) =
+    (first(indices) + oneunit(eltype(indices))):last(indices)
+@inline _scan_rest(indices) = Iterators.drop(indices, 1)
+
 # The native ordered loop.  `nothing` is the no-backend marker; a backend
 # extension specializes `_tensorized_scan_lowering` on its own marker type.
 # An empty sequence returns an empty result (or `[init]`) without running the
@@ -710,7 +723,7 @@ end
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared...)
     result === nothing && (result = similar(first(iterated), typeof(out1)))
     result[i1] = out1
-    for i in Iterators.drop(idx, 1)
+    for i in _scan_rest(idx)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
         result[i] = out
     end
@@ -735,7 +748,7 @@ end
     result[1] = init
     result[2] = out1
     position = 2
-    for i in Iterators.drop(idx, 1)
+    for i in _scan_rest(idx)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared...)
         position += 1
         result[position] = out
@@ -829,7 +842,7 @@ function _tensorized_scan_history_lowering(::Nothing, step, init, fill,
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared..., earlier)
     carry = _scan_history_carry(carry)
     result[i1] = out1
-    for i in Iterators.drop(idx, 1)
+    for i in _scan_rest(idx)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared..., earlier)
         carry = _scan_history_carry(carry)
         result[i] = out
