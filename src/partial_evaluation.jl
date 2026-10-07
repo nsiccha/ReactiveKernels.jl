@@ -40,7 +40,7 @@ Base.show(io::IO, c::_BoundConstant) = print(io, "bound_constant(",
 _opname(::_BoundConstant) = "bound_constant"
 
 """
-    _partial_split(p::Plan, bound::Set{Int}) -> (prefix, residual, prefix_owned)
+    _partial_split(p::Plan, bound::Set{Int}, excluded = Set{Int}()) -> (prefix, residual, prefix_owned)
 
 Partition `p.recipes` (kept in execution order) into the data-only `prefix` —
 recipes whose every input is a bound HAVE port or a value owned by an earlier
@@ -51,16 +51,18 @@ un-hoists the authoritative producer. `prefix_owned` is the canonical id set
 available at bind time: the bound ports plus every prefix-owned output.
 
 Zero-input recipes are data-only by definition and hoist under any bound set,
-including an empty one.
+including an empty one. Recipes whose ids are in `excluded` stay in the
+residual whatever their inputs, and so do their data-only consumers.
 """
-function _partial_split(p::Plan, bound::Set{Int})
+function _partial_split(p::Plan, bound::Set{Int}, excluded::Set{Int} = Set{Int}())
     g = p.graph
     prefix_owned = copy(bound)
     assigned = Set(canon_id(g, v.id) for v in p.have)
     prefix = Recipe[]
     residual = Recipe[]
     for r in p.recipes
-        if all(inp -> canon_id(g, inp.id) in prefix_owned, r.inputs)
+        if !(r.id in excluded) &&
+           all(inp -> canon_id(g, inp.id) in prefix_owned, r.inputs)
             push!(prefix, r)
             for o in r.outputs
                 cid = canon_id(g, o.id)
@@ -171,14 +173,20 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     length(op.kernel.ops) == length(inner.recipes) || return nothing
 
     # Native scalar plate lowering expects one output per recipe. Do not turn
-    # overlapping producer bindings, effects, or nested batching into a new
-    # specialization boundary; the ordinary lowering remains authoritative.
+    # overlapping producer bindings or effects into a new specialization
+    # boundary; the ordinary lowering remains authoritative. A nested plate,
+    # scan or embedded kernel is never evaluated here: it stays in the residual
+    # cell, lowered exactly as before, and only the cell's other bound-only
+    # recipes are cached.
     assigned = Set(canon_id(inner.graph, v.id) for v in inner.have)
+    excluded = Set{Int}()
     for r in inner.recipes
         r.effectful && return nothing
         length(r.outputs) == 1 || return nothing
-        r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} && return nothing
-        _embedded_kernel(r.op) === nothing || return nothing
+        if r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+           _embedded_kernel(r.op) !== nothing
+            push!(excluded, r.id)
+        end
         cid = canon_id(inner.graph, only(r.outputs).id)
         cid in assigned && return nothing
         push!(assigned, cid)
@@ -201,13 +209,6 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     # Nullary inner recipes can form a prefix even when this plate has no
     # bound inputs. Without a bound domain, retain its per-cell execution.
     isempty(arguments) && return nothing
-    prefix, residual, owned = _partial_split(inner, bound)
-    isempty(prefix) && return nothing
-    have_ids = Set(canon_id(inner.graph, v.id) for v in inner.have)
-    frontier = filter(_partial_constants(inner, owned, residual)) do v
-        !(canon_id(inner.graph, v.id) in have_ids)
-    end
-    isempty(frontier) && return nothing
 
     # A known empty domain has no data-dependent cells to evaluate. Keeping the
     # original plate also preserves its empty-result typing and error behavior.
@@ -221,31 +222,56 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     # No possible batched axis: preserve the ordinary rejection.
     isempty(bound_axes) && return nothing
 
-    # Keep only the selected prefix producers needed by the cut. Never re-plan:
-    # doing so could select a different producer from the public graph.
-    needed = Set(canon_id(inner.graph, v.id) for v in frontier)
-    selected = Recipe[]
-    for r in Iterators.reverse(prefix)
-        canon_id(inner.graph, only(r.outputs).id) in needed || continue
-        push!(selected, r)
-        union!(needed, (canon_id(inner.graph, v.id) for v in r.inputs))
-    end
-    reverse!(selected)
+    have_ids = Set(canon_id(inner.graph, v.id) for v in inner.have)
+    bound_types = types
+    local residual, frontier, selected
+    while true
+        prefix, residual, owned = _partial_split(inner, bound, excluded)
+        isempty(prefix) && return nothing
+        frontier = filter(_partial_constants(inner, owned, residual)) do v
+            !(canon_id(inner.graph, v.id) in have_ids)
+        end
+        isempty(frontier) && return nothing
 
-    # Establish the complete eligible prefix before executing any of it.
-    # Intermediates only need a concrete type: they are bind-time temporaries,
-    # as they were per-evaluation ones. Only frontier values cross the cache
-    # boundary. A cached array is a bind-time constant shared by every later
-    # evaluation, read-only to the pure residual like any top-level hoisted
-    # value or bound array.
-    for r in selected
-        T = Base.promote_op(r.op,
-            (types[canon_id(inner.graph, v.id)] for v in r.inputs)...)
-        isconcretetype(T) || return nothing
-        types[canon_id(inner.graph, only(r.outputs).id)] = T
+        # Keep only the selected prefix producers needed by the cut. Never
+        # re-plan: doing so could select a different producer from the public
+        # graph.
+        needed = Set(canon_id(inner.graph, v.id) for v in frontier)
+        selected = Recipe[]
+        for r in Iterators.reverse(prefix)
+            canon_id(inner.graph, only(r.outputs).id) in needed || continue
+            push!(selected, r)
+            union!(needed, (canon_id(inner.graph, v.id) for v in r.inputs))
+        end
+        reverse!(selected)
+
+        # Establish the complete eligible prefix before executing any of it.
+        # Intermediates only need a concrete type: they are bind-time
+        # temporaries, as they were per-evaluation ones. Only frontier values
+        # cross the cache boundary. A cached array is a bind-time constant
+        # shared by every later evaluation, read-only to the pure residual like
+        # any top-level hoisted value or bound array.
+        types = copy(bound_types)
+        for r in selected
+            T = Base.promote_op(r.op,
+                (types[canon_id(inner.graph, v.id)] for v in r.inputs)...)
+            isconcretetype(T) || return nothing
+            types[canon_id(inner.graph, only(r.outputs).id)] = T
+        end
+        # A frontier value the cache cannot hold (a tuple, struct, view or
+        # range, such as a static-vector scan seed) keeps its producer in the
+        # residual cell, evaluated per cell as before; the values that producer
+        # reads become the frontier instead.
+        frontier_ids = Set(canon_id(inner.graph, v.id) for v in frontier)
+        uncached = Int[]
+        for r in selected
+            cid = canon_id(inner.graph, only(r.outputs).id)
+            cid in frontier_ids && !_partial_plate_cacheable(types[cid]) &&
+                push!(uncached, r.id)
+        end
+        isempty(uncached) && break
+        union!(excluded, uncached)
     end
-    all(v -> _partial_plate_cacheable(types[canon_id(inner.graph, v.id)]),
-        frontier) || return nothing
     for r in selected
         args = Tuple(arguments[canon_id(inner.graph, v.id)] for v in r.inputs)
         batch = Base.Broadcast.instantiate(Base.broadcasted(r.op, args...))
@@ -683,9 +709,11 @@ A live array is eligible only when its declared rank is known and each of its
 dimensions is fixed by a bound axis of length greater than one; live numeric
 scalars and explicit atomic inputs do not contribute dimensions.
 Other exclusions are non-array/non-numeric batched bound inputs, non-concrete
-prefix results, cache frontiers that are neither such numbers nor dense
-`Array`s of them (tuples, structs, views, ranges), nested plate/scan bodies,
-and overlapping inner producers.
+prefix results and overlapping inner producers. A nested plate, scan or
+embedded prepared kernel is never evaluated here: it stays in the residual
+cell, as does the producer of any data-only value that is neither such a
+number nor a dense `Array` of them (a tuple, struct, view or range); the
+cell's other eligible values are still cached.
 Ordinary recipe purity remains required. Like top-level partial evaluation,
 eligible computations execute eagerly at preparation over their bound domain.
 Mixed-input recipes remain indivisible: inline data-only subexpressions inside
