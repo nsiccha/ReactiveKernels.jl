@@ -1273,6 +1273,82 @@ end
     @test invokes_closure(retained_call, (typeof(op), argtypes...))
 end
 
+# --- RK's own plate reads and stores carry no bounds checks (snag native-lowering-948c4ab6)
+# The native plate loop reads each cell argument at a coordinate of
+# `CartesianIndices(combine_axes(arguments))` and stores the cell value at the
+# same coordinate of a buffer with those axes: both are in bounds by
+# construction, as in Base's broadcast `copyto!`. Checked, they kept LLVM from
+# vectorizing even an arithmetic cell; a fixed-degree polynomial cell with tuple
+# coefficients ran 2.6x its hand loop. The cell body keeps its own checks.
+import InteractiveUtils
+@kernel _unchecked_affine_plate(xs::Vector{Float64}) = begin
+    ys::Vector{Float64} = plate(xs) do x
+        muladd(x, 2.0, 1.0)
+    end
+    return ys
+end
+@kernel _unchecked_poly_plate(xs::Vector{Float64}, c) = begin
+    ys::Vector{Float64} = plate(xs, Ref(c)) do x, c
+        evalpoly(x, c)
+    end
+    return ys
+end
+@kernel _unchecked_broadcast_plate(a::Matrix{Float64}, b::Matrix{Float64}) = begin
+    ys = plate(a, b) do x, y
+        x - 2y
+    end
+    return ys
+end
+@kernel _checked_cell_plate(xs::Vector{Float64}, idx::Vector{Int}, table::Vector{Float64}) = begin
+    ys::Vector{Float64} = plate(xs, idx, Ref(table)) do x, i, t
+        x * t[i]
+    end
+    return ys
+end
+
+function _plate_entry_llvm(kernel, args...)
+    kernel(args...)
+    sprint(io -> InteractiveUtils.code_llvm(io,
+        ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc,
+        Tuple{typeof(kernel.f.native), typeof(kernel.ops), map(typeof, args)...};
+        debuginfo = :none))
+end
+
+@testset "authored plate native: RK's own cell reads and stores are unchecked" begin
+    xs = [1 / (k + 0.5) for k in 0:999]
+    coefficients = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011]
+    affine = prepare(_unchecked_affine_plate)
+    poly = prepare(_unchecked_poly_plate)
+    @test affine(xs) == muladd.(xs, 2.0, 1.0)
+    # `muladd` leaves contraction to the compiler, so compare to rounding.
+    @test poly(xs, Tuple(coefficients)) ≈ evalpoly.(xs, Ref(Tuple(coefficients))) rtol = 1e-14
+    @test poly(xs, coefficients) ≈ evalpoly.(xs, Ref(coefficients)) rtol = 1e-14
+    @test affine(Float64[]) == Float64[]
+
+    # Singleton expansion reads through Base's extruded projection unchanged.
+    broadcast_plate = prepare(_unchecked_broadcast_plate)
+    a, b = reshape([0.5, 1.5, -2.0], 3, 1), reshape([1.0, 2.0, 3.0, 4.0], 1, 4)
+    @test broadcast_plate(a, b) == a .- 2 .* b
+    @test broadcast_plate(a, repeat(b, 3)) == a .- 2 .* b
+
+    # Neither the plate's projection nor its store is checked, so the cell loop
+    # vectorizes like the hand loop.
+    for (kernel, args) in ((affine, (xs,)), (poly, (xs, Tuple(coefficients))))
+        llvm = _plate_entry_llvm(kernel, args...)
+        @test !occursin("bounds_error", llvm)
+        if Sys.ARCH in (:x86_64, :aarch64)
+            @test occursin(r"<\d+ x double>", llvm)
+        end
+    end
+
+    # Control: the cell body's own indexing keeps its bounds check.
+    checked = prepare(_checked_cell_plate)
+    table = [2.0, 3.0, 5.0]
+    @test checked([1.0, 2.0, 3.0], [3, 1, 2], table) == [5.0, 4.0, 9.0]
+    @test occursin("bounds_error", _plate_entry_llvm(checked, [1.0], [1], table))
+    @test_throws BoundsError checked([1.0, 2.0], [1, 4], table)
+end
+
 # --- per-cell reductions over a few host indices (snag plate-cell-gathe-94d4a929)
 # A plate cell that superposes a few dose responses per observation. The
 # reporter authored it as vector temporaries (`observation .- shifts`,
