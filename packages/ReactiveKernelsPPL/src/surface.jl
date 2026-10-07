@@ -786,13 +786,14 @@ or predictor operand. Julia checks its concrete shape when evaluated.
 A data column read only inside whole-value calls, with no per-observation
 consumer, is a model-level data input of any length at bind.
 
-Input ownership and concurrency: neither `ast` nor the submodel bodies
-reachable through `mod` is mutated, so one AST may be lowered repeatedly
-and shared across tasks. Submodel and function resolution only READ `mod`
-bindings (`isdefined` / `getfield` — no eval, no registration), so definitions in
-distinct private modules never collide: one fresh `Module` per lowering,
-each holding its own `@rkppl name(args...) = ...` defs, is sufficient for
-concurrent independent lowerings with no shared lock.
+Input ownership and concurrency: `lower_rkppl` is concurrency-safe and
+takes no lock, so independent lowerings run concurrently. Neither `ast` nor
+the submodel bodies reachable through `mod` is mutated, so one AST may be
+lowered repeatedly and shared across tasks. Submodel and function resolution
+only READ `mod` bindings (`isdefined` / `getfield` — no eval, no
+registration), so definitions in distinct private modules never collide: one
+fresh `Module` per lowering, each holding its own `@rkppl name(args...) = ...`
+defs, is sufficient for concurrent independent lowerings.
 
 Lowering resolves these bindings in a package-owned latest-world scope,
 including kernels and imports just created by `Core.eval` in a builder.
@@ -931,7 +932,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         (input in data || _mentions_symbol(ast, input)) &&
             _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
     end
-    sample, det, plate_ctx, plate_specs, scans, joints, glms = _partition_statements(ast, data)
+    sample, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
+        _partition_statements(ast, data)
     sample, det = _rewrite_plate_rows(sample, det)
     # Latent plates over values read their cell count as bound data.
     extents = Set{Symbol}(_plate_extent_input(nm) for (nm, rhs, _, _) in plate_specs
@@ -1426,7 +1428,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         vector_parameters = dirichlets,
         matrices = vcat(matrices, value_matrices),
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
-        indexed_observations)
+        indexed_observations,
+        cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
+            if k in indexed_observations))
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -1542,14 +1546,15 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
             return Expr(:ref, walk(ex.args[1]),
                 (index_name(walk(a)) for a in ex.args[2:end])...)
         elseif ex.head === :call
-            return Expr(:call, ex.args[1], map(walk, ex.args[2:end])...)
+            return Expr(:call, ex.args[1], Any[walk(a) for a in ex.args[2:end]]...)
         elseif ex.head === :. && length(ex.args) == 2 &&
                 Meta.isexpr(ex.args[2], :tuple)
-            return Expr(:., ex.args[1], Expr(:tuple, map(walk, ex.args[2].args)...))
+            return Expr(:., ex.args[1],
+                Expr(:tuple, Any[walk(a) for a in (ex.args[2]::Expr).args]...))
         elseif ex.head === :kw && length(ex.args) == 2
             return Expr(:kw, ex.args[1], walk(ex.args[2]))
         elseif ex.head in (:parameters, :tuple, :vect)
-            return Expr(ex.head, map(walk, ex.args)...)
+            return Expr(ex.head, Any[walk(a) for a in ex.args]...)
         end
         return ex
     end
@@ -1871,7 +1876,11 @@ function _model_valued(ex, detmap, env, active::Set{Symbol})
     ex isa Expr || return false
     # Walk every dependency even when the callable head already proves
     # this is a value, so retaining names still rejects cyclic definitions.
-    return any(map(a -> _model_valued(a, detmap, env, active), ex.args))
+    valued = false
+    for a in ex.args
+        valued |= _model_valued(a, detmap, env, active)::Bool
+    end
+    return valued
 end
 
 # Single rule table for undotted `:call` shapes over argument shapes.
@@ -1977,7 +1986,7 @@ function _canonical_expr(ex, data, detmap, detshape, env, where)
     fn isa Symbol || return ex
     fn in REDUCTION_FNS && return ex  # args validated downstream
     fn === :_ppl_plate_column && return ex  # an RK plate (array cells)
-    args = [_canonical_expr(a, data, detmap, detshape, env, where)
+    args = Any[_canonical_expr(a, data, detmap, detshape, env, where)
         for a in ex.args[2:end]]
     argshapes = [_canon_shape(a, data, detmap, detshape, env) for a in args]
     if :invalid in argshapes
@@ -2635,7 +2644,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     derived_observed = Set{Symbol}()
     seen_doc = false
     line = 0
-    args, plate_ctx, plate_params = _expand_plates(ast.args, data)
+    cell_broadcasts = Dict{Symbol,Vector{Symbol}}()
+    args, plate_ctx, plate_params = _expand_plates(ast.args, data;
+        broadcasts = cell_broadcasts)
     # Defined names, collected before lowering so the checks below admit
     # forward references. The scan never throws — the main loop below owns
     # every rejection.
@@ -2810,7 +2821,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
-    return sample, det, plate_ctx, plate_params, scans, joints, glms
+    return sample, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
@@ -3082,11 +3093,11 @@ function _resolve_hcat_values(ex; keep = false, resolve = identity)
     ex.head === :quote && return ex
     if _is_hcat_def(ex)
         head = keep ? :hcat : GlobalRef(Base, :hcat)
-        value = Expr(:call, head, map(a -> _resolve_hcat_values(a;
-            resolve), ex.args[2:end])...)
+        value = Expr(:call, head, Any[_resolve_hcat_values(a; resolve)
+            for a in ex.args[2:end]]...)
         return keep ? value : resolve(value)
     end
-    return Expr(ex.head, map(a -> _resolve_hcat_values(a; resolve), ex.args)...)
+    return Expr(ex.head, Any[_resolve_hcat_values(a; resolve) for a in ex.args]...)
 end
 
 function _route_hcat_values(sample, det, data, glms; resolve = identity)
@@ -3271,7 +3282,8 @@ end
 # statements carry the plate's line for claim messages. Also returns the
 # plate context: `(lhs, line, bare-symbols)` per spliced statement for
 # the post-analysis whole-vector check.
-function _expand_plates(args, data::Set{Symbol})
+function _expand_plates(args, data::Set{Symbol};
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
     definitions = Dict{Symbol,Any}(arg.args[1] => arg.args[2] for arg in args
         if arg isa Expr && arg.head === :(=) && length(arg.args) == 2 &&
             arg.args[1] isa Symbol)
@@ -3294,7 +3306,7 @@ function _expand_plates(args, data::Set{Symbol})
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
-            stmts, stx, prm = _desugar_plate(arg, pl, plate_data)
+            stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
                 push!(expanded, st)
@@ -3308,7 +3320,8 @@ function _expand_plates(args, data::Set{Symbol})
     return expanded, ctx, params
 end
 
-function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
+function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
     (length(st.args) == 3 && st.args[3] isa Expr &&
         st.args[3].head === :for) ||
         _sfail("`@plate` takes `@plate for i in R ... end` exactly")
@@ -3352,7 +3365,8 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
         (_is_sample(c) || _is_broadcast_sample(c)) &&
         Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
     selected &&
-        return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
+        return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
+            broadcasts)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
@@ -3380,7 +3394,8 @@ end
 
 # Partial observation loops compute their arguments inside retained RK cells.
 # Slicing a fully computed vector would evaluate arithmetic in unselected cells.
-function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
+function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
     iterator = rkind[1] === :coloncall ? rkind[2] :
         rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
         Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
@@ -3448,10 +3463,30 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
             return ex
         end
         obj = arg(localread(c.args[3]); object=true)
+        # A dotted cell broadcasts over its own iteration's values, as in
+        # Julia. Record the operands it reads per index: when the bound
+        # response holds one array per index, each of these supplies that
+        # index's value and every other operand is shared by all indices.
+        lhs = c.args[2]
+        if _is_broadcast_sample(c) && Meta.isexpr(lhs, :ref, 2) &&
+                lhs.args[1] isa Symbol && lhs.args[1] in data && lhs.args[2] === ivar
+            broadcasts[lhs.args[1]] = sort!(collect(_cell_index_reads(obj, ivar)))
+        end
         append!(out, _desugar_cell_sample(Expr(:call, c.args[1], c.args[2], obj),
             ivar, rkind, line, data, plate_defs, ctx, params, pidx))
     end
     return out, ctx, params
+end
+
+# Bases of the `v[i]` reads in a cell expression, i.e. its per-index operands.
+function _cell_index_reads(ex, ivar, out::Set{Symbol} = Set{Symbol}())
+    ex isa Expr || return out
+    if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol && ex.args[2] === ivar
+        push!(out, ex.args[1])
+        return out
+    end
+    foreach(a -> _cell_index_reads(a, ivar, out), ex.args)
+    return out
 end
 
 # Numeric index values become one data-only index column. Indexed reads
@@ -7293,7 +7328,7 @@ end
 function _lower_trials(lhs, t, ctx)
     t isa Bool && _sfail("response $lhs trials must be an Int data " *
                          "column or Int literal, got Bool")
-    t isa Integer && return Int(t)
+    t isa Base.BitInteger && return Int(t)
     t isa Real && _sfail("response $lhs trials must be an Int data " *
                          "column or Int literal, got $(repr(t))")
     if t isa Symbol
@@ -9747,11 +9782,14 @@ end
 
 # Preserve Julia's integer result when folding a structural count; the
 # prior arithmetic folder deliberately returns floating-point values.
+# Source integer literals are Base bit integers. Testing that concrete union,
+# rather than `Integer`, keeps `Int(x)` concretely inferred: a package that adds
+# a constructor for its own `Integer` subtype then cannot invalidate lowering.
 function _static_count(ex)
-    ex isa Integer && !(ex isa Bool) && return Int(ex)
+    ex isa Base.BitInteger && return Int(ex)
     _fold_literal(ex) === nothing && return nothing
     value = _eval_value_expr(ex, s -> _sfail("unbound count $s"), :count)
-    return value isa Integer && !(value isa Bool) ? Int(value) : nothing
+    return value isa Base.BitInteger ? Int(value) : nothing
 end
 
 """Prior-argument hoisting: an expression in a prior's argument position
@@ -9998,7 +10036,7 @@ function _lower_lkj_cholesky(lhs, rhs)
     uplo = length(args) == 3 ? args[3] : 'L'
     uplo in ('L', 'U') || _sfail("parameter $lhs: `LKJCholesky` uplo " *
         "is 'L' or 'U', got $(repr(uplo))")
-    dim = if K isa Integer && !(K isa Bool)
+    dim = if K isa Base.BitInteger
         K >= 1 || _sfail("parameter $lhs: `LKJCholesky` dimension must be " *
             "≥ 1, got $K")
         Int(K)
@@ -10328,7 +10366,7 @@ end
 # default retains `nothing` in the unbound IR; binding evaluates DataAPI
 # levels before the response reads its support.
 function _threshold_size(lhs::Symbol, n, response::Union{Nothing,Symbol})
-    n isa Integer && !(n isa Bool) && n >= 0 && return Int(n)
+    n isa Base.BitInteger && n >= 0 && return Int(n)
     # Retain the historical inferred representation for the exact linked
     # default; bind resolves it from DataAPI levels, including unused levels.
     response !== nothing && _levels_count(n) == (response, 1) && return nothing

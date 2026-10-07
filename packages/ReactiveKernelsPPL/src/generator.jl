@@ -12,7 +12,7 @@ include("evidence.jl")
 # nothing for data-only recipes. Plates compile to allocation-free loops
 # with shared work hoisted; constraining stays hand-rolled (no bijectors).
 # The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
-# (counter-suffixed binding per build).
+# without binding a name there.
 
 
 """
@@ -23,10 +23,14 @@ program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
 [`LayoutTable`](@ref) (R10 read API for the sampler side).
 
-Thread safety: concurrent `build_kernel` calls over independent plans are
-supported — the counter-suffixed `PPLGeneratedModels` binding is assigned
-under a package-owned lock, so every build gets a distinct binding with no
-caller-side synchronization. The returned spec closes over build-time
+Concurrency: `build_kernel` is concurrency-safe. Independent plans may be
+built from concurrent tasks with no caller-side synchronization: a build
+binds nothing in a shared module and takes no package lock. Construction
+compiles little per-model code, so concurrent builds largely run in
+parallel; Julia serializes only the compilation that remains (1.10: all
+compilation; 1.12 and 1.13: type inference).
+
+The returned spec closes over build-time
 eval'd code. Construction resolves module bindings in a package-owned
 latest-world scope, including just-evaluated kernels; subsequent execution
 uses its own boundary: `prepare` it and call it through [`prepare_query`](@ref) /
@@ -65,18 +69,23 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     assigns = _assignment_statements(plan; gathers)
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan)
-    likelihoods = _likelihood_statements(plan, layout; gathers)
+    transforms = Expr[]
     for e in layout.entries
-        append!(stmts, transform_statements(e))
+        append!(transforms, transform_statements(e))
     end
-    append!(stmts, _coef_reassembly_statements(plan, layout))
-    append!(stmts, _conditioned_value_statements(plan))
+    coefs = _coef_reassembly_statements(plan, layout)
+    conditioned = _conditioned_value_statements(plan)
+    values = Expr[assigns..., preprocessing_recipes(plan)...,
+        _scan_reconstruction_statements(plan, layout)...,
+        _affine_coefficient_statements(plan, layout)...,
+        _predictor_statements(plan)...]
+    likelihoods = _likelihood_statements(plan, layout; gathers,
+        upstream = Expr[transforms..., coefs..., conditioned..., values...])
+    append!(stmts, transforms)
+    append!(stmts, coefs)
+    append!(stmts, conditioned)
     append!(stmts, _array_level_index_statements(plan, gathers))
-    append!(stmts, assigns)
-    append!(stmts, preprocessing_recipes(plan))
-    append!(stmts, _scan_reconstruction_statements(plan, layout))
-    append!(stmts, _affine_coefficient_statements(plan, layout))
-    append!(stmts, _predictor_statements(plan))
+    append!(stmts, values)
     append!(stmts, likelihoods)
     append!(stmts, priors)
     push!(stmts, _log_jacobian_statement(plan, layout))
@@ -216,18 +225,18 @@ end
 _ordered_columns(plan::StructuralPlan) =
     sort!(collect(plan.columns); by = first)
 
-_data_arg(name::Symbol, col::AbstractVector) =
-    Expr(:(::), name, Vector{eltype(col)})
-_data_arg(name::Symbol, col::AbstractMatrix) =
-    Expr(:(::), name, Matrix{eltype(col)})
+# The element type and rank come from the column's type parameters, so this
+# compiles no generic `eltype`/`ndims` call that other packages' array methods
+# could invalidate.
+_data_arg(name::Symbol, ::AbstractVector{T}) where {T} = Expr(:(::), name, Vector{T})
+_data_arg(name::Symbol, ::AbstractMatrix{T}) where {T} = Expr(:(::), name, Matrix{T})
 _data_arg(name::Symbol, v::Number) = Expr(:(::), name, typeof(v))
-_data_arg(name::Symbol, col::AbstractArray) =
-    Expr(:(::), name, Array{eltype(col),ndims(col)})
+_data_arg(name::Symbol, ::AbstractArray{T,N}) where {T,N} = Expr(:(::), name, Array{T,N})
 
 # Dedicated eval scope for generated models. The `using` lines resolve via
 # this package's own Project (by file location), so generated code loads in
-# ANY consumer session with no LOAD_PATH dependence. One counter-suffixed
-# binding per build; slice-1 scale makes interning harmless.
+# ANY consumer session with no LOAD_PATH dependence. Builds bind nothing
+# here (see `_eval_kernel_def`).
 module PPLGeneratedModels
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
@@ -275,28 +284,13 @@ import .._simplex_slices_constrain, .._simplex_slices_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 end
 
-const _MODEL_COUNTER = Ref(0)
-
-# Package-owned binding lock: the counter increment plus the two
-# `PPLGeneratedModels` evals are one critical section, so concurrent
-# `build_kernel` calls always land on distinct bindings (an unsynchronized
-# `Ref` increment drops updates under contention and two builds would
-# silently share one binding — the second model's def wins and the first
-# task reads back the wrong kernel).
-const _MODEL_EVAL_LOCK = ReentrantLock()
-
-function _eval_kernel_def(def::Expr)
-    lock(_MODEL_EVAL_LOCK) do
-        _MODEL_COUNTER[] += 1
-        name = Symbol(:ppl_model_, _MODEL_COUNTER[])
-        sig = def.args[1]
-        renamed = Expr(:(=), Expr(:call, name, sig.args[2:end]...), def.args[2])
-        call = Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator),
-            renamed)
-        Core.eval(PPLGeneratedModels, call)
-        return Core.eval(PPLGeneratedModels, name)
-    end
-end
+# Evaluate the generated `@kernel` definition and return its spec. Nothing is
+# bound in `PPLGeneratedModels`: concurrent builds share no package state (no
+# lock, no counter) and a built spec is retained only by its caller. RK
+# evaluates the recipe closures separately so construction compiles no
+# per-model code (`ReactiveKernels._kernel_eval_definition`).
+_eval_kernel_def(def::Expr) =
+    ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def)
 
 # Scalar + derived assignments in topo order (params already constrained
 # above, so every scalar name resolves; derived columns resolve as locals
@@ -333,7 +327,7 @@ end
 # use the inverse-logit function, including inside reductions.
 _value_math_rewrite(ex) = ex
 function _value_math_rewrite(ex::Expr)
-    args = map(_value_math_rewrite, ex.args)
+    args = Any[_value_math_rewrite(a) for a in ex.args]
     if ex.head in (:call, :.) && !isempty(args) && args[1] === :logistic
         args[1] = :_ppl_logistic
     end
@@ -536,12 +530,19 @@ end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 
-function _likelihood_statements(plan::StructuralPlan, layout; gathers)
+function _likelihood_statements(plan::StructuralPlan, layout; gathers,
+        upstream::Vector{Expr} = Expr[])
     stmts = Expr[]
     terms = Any[]
     points = Pair{Symbol,Any}[]
     for r in plan.responses
-        append!(stmts, _response_likelihood_stmts(r, plan))
+        # A plate loop covers its whole response, so a cell-broadcast
+        # response observes every entry of each index's array.
+        rs = _cell_broadcast_response(plan, r) ?
+            _cell_broadcast_stmts(r, plan,
+                _response_likelihood_stmts(_with(r; range = nothing), plan), upstream) :
+            _response_likelihood_stmts(r, plan)
+        append!(stmts, rs)
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
         if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.evidence.kind === :none &&
@@ -599,6 +600,111 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers)
         Expr(:tuple, (Expr(:(=), name, value) for (name, value) in points)...)
     push!(stmts, Expr(:(=), :pointwise, values))
     return stmts
+end
+
+# A dotted `@plate` cell (`y[i] .~ D.(v[i], s)`) broadcasts over its own
+# iteration's values, as Julia does. When the bound response holds one array
+# per index, the response's ordinary statements run once per index inside an
+# outer RK plate, giving RK's nested group and observation plates
+# (`reactivekernels-use` §4e1). Values the cell reads per index, and values
+# computed from them, supply that index's array or number; every other value
+# is shared with all indices (`Ref`). The pointwise result keeps the
+# response's shape: one array of observation densities per index.
+function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
+        stmts::Vector{Expr}, upstream::Vector{Expr})
+    # No index: the ordinary empty-domain statements already sum to zero.
+    _response_rows(plan, r) == 0 && return stmts
+    node, pw = _lik_name(r.label), _pw_name(r.label)
+    k = findall(st -> Meta.isexpr(st, :(=), 2) && st.args[1] == :($node::Float64), stmts)
+    (length(k) == 1 && stmts[only(k)].args[2] == :(sum($pw))) ||
+        throw(ContractValidationError("[generator] response $(r.label) observes " *
+            "one array per index, and its $(r.family) statements have no summed " *
+            "pointwise plate to run per index"))
+    body = Expr[st for (i, st) in enumerate(stmts) if i != only(k)]
+    defined = Set{Symbol}(something.(_assigned_name.(body), :_))
+    known = Set{Symbol}(keys(plan.columns))
+    for st in upstream
+        name = _assigned_name(st)
+        name === nothing || push!(known, name)
+    end
+    reads = Set{Symbol}()
+    foreach(st -> _statement_value_reads!(reads,
+        Meta.isexpr(st, :(=), 2) ? st.args[2] : st), body)
+    inputs = sort!(collect(intersect(setdiff!(reads, defined), known)))
+    # Per-index values: the response, the cell's indexed reads, the
+    # response's predictor nodes (on its observation axis, here the indices)
+    # and every upstream definition computed from them.
+    pergroup = Set{Symbol}([r.response; plan.cell_broadcasts[r.response];
+        [_lp_name(p) for p in plan.predictors]])
+    for st in upstream
+        name = _assigned_name(st)
+        name === nothing && continue
+        used = _statement_value_reads!(Set{Symbol}(), st.args[2])
+        isempty(intersect(used, pergroup)) || push!(pergroup, name)
+    end
+    aliases = Dict{Symbol,Symbol}(v => Symbol(:_ppl_group_, v) for v in inputs)
+    group = Symbol(pw, :_group)
+    aliases[pw] = group
+    cell = Expr[_hsubst(st, aliases) for st in body]
+    # Densities are Float64; declaring the observation cell's result also
+    # types an empty index's densities (RK's empty-domain result evidence).
+    for st in cell
+        Meta.isexpr(st, :(=), 2) && st.args[1] === group &&
+            Meta.isexpr(st.args[2], :do) && _declare_cell_result!(st.args[2].args[2])
+    end
+    outer = Any[v in pergroup ? v : :(Ref($v)) for v in inputs]
+    # The pointwise query reads each index's densities and the likelihood
+    # its per-index totals; RK evaluates only the plate a query selects. The
+    # declared total type also seeds RK's summed plate when the operands'
+    # element types are known only at run time (a composed child's output).
+    groupplate(result...) = Expr(:do, Expr(:call, :plate, outer...),
+        Expr(:(->), Expr(:tuple, (aliases[v] for v in inputs)...),
+            Expr(:block, LineNumberNode(0, :generator), deepcopy(cell)..., result...)))
+    totals = Symbol(pw, :_totals)
+    return Expr[
+        :($pw = $(groupplate(Expr(:call, GlobalRef(Base, :identity), group)))),
+        :($totals = $(groupplate(:(_ppl_group_total::Float64 = sum($group)),
+            :_ppl_group_total))),
+        :($node::Float64 = sum($totals))]
+end
+
+function _declare_cell_result!(lambda::Expr)
+    body = lambda.args[2]
+    k = findlast(a -> !(a isa LineNumberNode), body.args)
+    body.args[k] = Expr(:(=), :(_ppl_density::Float64), body.args[k])
+    push!(body.args, :_ppl_density)
+    return lambda
+end
+
+_assigned_name(st) = nothing
+function _assigned_name(st::Expr)
+    Meta.isexpr(st, :(=), 2) || return nothing
+    lhs = st.args[1]
+    Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
+    return lhs isa Symbol ? lhs : nothing
+end
+
+# Value names a generated statement reads: call heads, keyword names and
+# plate cell bodies (which read only their own arguments) are skipped.
+_statement_value_reads!(out, ex) = out
+_statement_value_reads!(out, ex::Symbol) = push!(out, ex)
+function _statement_value_reads!(out, ex::Expr)
+    if ex.head === :do
+        _statement_value_reads!(out, ex.args[1])
+    elseif ex.head === :call && !isempty(ex.args)
+        foreach(a -> _statement_value_reads!(out, a), ex.args[2:end])
+    elseif ex.head === :. && length(ex.args) == 2
+        ex.args[2] isa QuoteNode && _statement_value_reads!(out, ex.args[1])
+        ex.args[2] isa Expr && foreach(a -> _statement_value_reads!(out, a),
+            ex.args[2].args)
+    elseif ex.head === :kw
+        _statement_value_reads!(out, ex.args[2])
+    elseif ex.head === :(->)
+        nothing
+    else
+        foreach(a -> _statement_value_reads!(out, a), ex.args)
+    end
+    return out
 end
 
 # Packed observations keep their own axis. Every other observation input
@@ -1366,12 +1472,16 @@ end
 # the recipe. Returns the plate input symbol and the cell lane ref.
 _ybool_name(label::Symbol) = Symbol(:_ppl_yb_, label)
 
+# A column whose element type is exactly Bool. Type tests rather than an
+# `eltype` call keep this check concretely inferred.
+_is_bool_column(col) = col isa Bool || col isa AbstractArray{Bool}
+
 # Count endpoints take integer values. Keep the caller's Bool column available
 # to every other reader and form a separate zero/one integer value for the
 # density. This data-only recipe is shared by native and compiled execution.
 function _count_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
         y::Symbol, label::Symbol)
-    eltype(plan.columns[y]) === Bool || return y
+    _is_bool_column(plan.columns[y]) || return y
     yi = Symbol(:_ppl_yi_, label)
     push!(pre, :($yi = Int.($y)))
     return yi
@@ -1380,7 +1490,7 @@ end
 function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
         y::Symbol, label::Symbol, yv::Symbol)
     col = plan.columns[y]
-    eltype(col) === Bool && return y, yv
+    _is_bool_column(col) && return y, yv
     yb = _ybool_name(label)
     push!(pre, :($yb = Array{Bool}($y .!= 0)))
     return yb, yv
@@ -3081,7 +3191,7 @@ end
 
 # One normalized scalar prior body, shared by parameter and hyper-prior slots.
 function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false)
-    argvals = [v for v in values(p.args)]
+    argvals = Any[v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)
     local_pre = conditioned ? Expr[] : pre
     corr = _support_correction(p.family, p.support_override, argvals; pre = local_pre, stem = p.name)

@@ -129,8 +129,33 @@ end
     end
     body
 end
-@inline _authored_plate_zero(::Type{T}, marker) where {T} = zero(T)
-@inline _authored_plate_zero(::Type{Any}, marker) = zero(eltype(marker))
+# The running total of a fused summed plate. It starts at `zero(T)` for the
+# cells' inferred element type `T` when that type is concrete or numeric. A
+# non-numeric abstract `T` (usually `Any`, which Julia's inference can produce
+# for a cell that calls a nested prepared kernel; see `_declare_typed_output!`)
+# has no zero, so `_PlateTotalSeed` holds the place and the first cell starts
+# the total, which is `sum`'s value for a nonempty plate. An empty plate still
+# needs a zero without any cell: the seed carries the fallback element type `F`
+# (the axis marker's, or a scan consumer's output type), whose zero the total
+# then takes, and a non-numeric `F` asks for the cell type to be declared.
+struct _PlateTotalSeed{F} end
+
+@inline _plate_total_seed(::Type{T}, ::Type{F}) where {T<:Number,F} = zero(T)
+@inline _plate_total_seed(::Type{T}, ::Type{F}) where {T,F} =
+    isconcretetype(T) ? zero(T) : _PlateTotalSeed{F}()
+
+@inline _plate_total_add(total, cell) = total + cell
+@inline _plate_total_add(::_PlateTotalSeed, cell) = cell
+
+@inline _plate_total_value(total) = total
+@inline _plate_total_value(::_PlateTotalSeed{F}) where {F} = _plate_empty_total(F)
+
+_plate_empty_total(::Type{F}) where {F<:Number} = zero(F)
+_plate_empty_total(::Type{F}) where {F} = throw(ArgumentError(
+    "an empty summed plate has no total: its cell result type was not " *
+    "inferred to a concrete type, and the fallback element type $F has no " *
+    "zero. Declare the cell's result type, for example " *
+    "`cell::Float64 = ...`, so that the empty total is its zero."))
 
 # The pointwise buffer's container type and shape come from the axis marker. For
 # an array marker `similar(marker, T, output_axes)` is the single-allocation fast
@@ -678,10 +703,12 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
             push!(final_output.args, :($pointwise_lhs =
                 $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
         end
-        total_zero = :($(GlobalRef(Base, :zero))(
-            $plate_eltype === Any ? $output_type : $plate_eltype))
-        push!(initial_output.args, :($total_lhs = $total_zero + $cell_output))
-        push!(empty_output.args, :($total_lhs = $total_zero))
+        total_seed = :($(GlobalRef(@__MODULE__, :_plate_total_seed))(
+            $plate_eltype, $output_type))
+        push!(initial_output.args, :($total_lhs =
+            $(GlobalRef(@__MODULE__, :_plate_total_add))($total_seed, $cell_output)))
+        push!(empty_output.args, :($total_lhs =
+            $(GlobalRef(@__MODULE__, :_plate_total_value))($total_seed)))
         push!(loop_output.args, :($total_lhs = $total_lhs + $cell_output))
     end
     # `eachindex(seqs...)` throws `DimensionMismatch` unless every iterated
@@ -880,7 +907,7 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
     # Source RHSs use the original scalar formal names. Keep their original
     # recipe metadata in operation-table order so readable code binds those
     # names to the newly projected scalar arguments, including across chains.
-    kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
         kernel.plan, kernel.ast,
         Tuple(readable_recipes[r.id] for r in scalar_plan.recipes))
     op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, Tuple(unique(checks)))
@@ -1210,7 +1237,9 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
     end
     if accumulator !== nothing
         # The total adds the cells in coordinate order, as the cell loop does.
-        push!(interchanged.args, every(:($accumulator += $(_inbounds_value(entry)))))
+        push!(interchanged.args, every(:($accumulator =
+            $(GlobalRef(@__MODULE__, :_plate_total_add))(
+                $accumulator, $(_inbounds_value(entry))))))
     end
     Expr(:if, ready, interchanged, cell_loop)
 end
@@ -1392,8 +1421,9 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # `Vector{Int}` axis then seeds `zero(eltype(marker)) = zero(Int)` against
     # `Float64` cells, producing a `Union` accumulator Enzyme rejects). Recover the
     # concrete element type by inferring the scalar body kernel over the actual
-    # per-coordinate argument types (`plate_eltype`, bound below), deferring to the
-    # runtime `eltype(marker)` seed only when the body is genuinely uninferrable.
+    # per-coordinate argument types (`plate_eltype`, bound below). When the body
+    # is genuinely uninferrable the first cell starts the total, and only an
+    # empty plate falls back to `zero(eltype(marker))` (`_plate_total_seed`).
     # (`_narrow_plate_output` after the loop still recovers a homogeneous element
     # type at runtime in that residual `Any` case.)
     plate_eltype = gensym(:plate_eltype)
@@ -1550,9 +1580,9 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # kernel instead does NOT fold (nested-RGF inference is opaque) and would
     # inject a runtime inference call. This is a compile-time expression, so it
     # also covers an empty axis with no representative element. A genuinely
-    # uninferrable recipe yields `Any`, reproducing the previous `Vector{Any}` /
-    # `_authored_plate_zero(Any, marker)` behavior (then narrowed at runtime by
-    # `_narrow_plate_output`) rather than regressing.
+    # uninferrable recipe yields `Any`: the pointwise buffer is a `Vector{Any}`
+    # narrowed at runtime by `_narrow_plate_output`, and a total starts from its
+    # first cell (`_plate_total_seed`).
     plate_type_exprs = Dict{Int,Any}()
     for (position, input) in enumerate(inner.have)
         cid = canon_id(inner.graph, input.id)
@@ -1644,13 +1674,13 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     end
     accumulator = total_lhs === nothing ? nothing : gensym(:plate_total)
     if accumulator !== nothing
-        # `_authored_plate_zero(::Type{T}, marker) = zero(T)` for the inferred
-        # concrete `T`, and falls back to `zero(eltype(marker))` only when
-        # inference yielded `Any` — never a `zero(Int)` seed against `Float64`
-        # cells.
+        # `zero(T)` for the inferred concrete `T` — never a `zero(Int)` seed
+        # against `Float64` cells. Without a concrete or numeric `T`, the first
+        # cell starts the total, and only an empty plate falls back to
+        # `zero(eltype(marker))`.
         push!(body.args, Expr(:(=), accumulator,
-            Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_zero),
-                 plate_eltype, marker)))
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_total_seed),
+                 plate_eltype, Expr(:call, GlobalRef(Base, :eltype), marker))))
     end
 
     loopbody = Expr(:block)
@@ -1706,7 +1736,8 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     pointwise_lhs === nothing ||
         push!(loopbody.args, :($pointwise_lhs[$index] = $scalar_result))
     accumulator === nothing ||
-        push!(loopbody.args, :($accumulator += $scalar_result))
+        push!(loopbody.args, :($accumulator =
+            $(GlobalRef(@__MODULE__, :_plate_total_add))($accumulator, $scalar_result)))
     if has_scheduled_groups
         push!(loopbody.args, :($previous = $index))
         push!(loopbody.args, :($first_coordinate = false))
@@ -1734,13 +1765,14 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # does work in the residual case where inference yielded `Any` and the buffer
     # is a boxed `Vector{Any}`, recovering a homogeneous element type so a
     # transformed-data plate over bound data stays promotable at the Reactant
-    # host-operand boundary. The total accumulator is already typed via
-    # `_authored_plate_zero`, so this touches only the pointwise materialization.
+    # host-operand boundary. The total is seeded by `_plate_total_seed`, so this
+    # touches only the pointwise materialization.
     if pointwise_lhs !== nothing
         push!(body.args, :($pointwise_lhs =
             $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
     end
-    total_lhs === nothing || push!(body.args, :($total_lhs = $accumulator))
+    total_lhs === nothing || push!(body.args, :($total_lhs =
+        $(GlobalRef(@__MODULE__, :_plate_total_value))($accumulator)))
     body
 end
 
@@ -3100,6 +3132,20 @@ struct PreparedKernel{F,O,IN,OUT,RR}
     lowered_recipes::RR
 end
 
+# Nearly every preparation or rebinding assembles a `PreparedKernel` of a new
+# concrete type (its compiled body is new). Assemble it without compiling the
+# struct's constructor for that type; calls on the prepared kernel still
+# dispatch on its exact type.
+Base.@nospecializeinfer function _prepared_kernel(
+        @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
+        @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
+        @nospecialize(lowered_recipes::Tuple))
+    T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
+                       typeof(lowered_recipes)}
+    _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
+                             lowered_recipes))::PreparedKernel
+end
+
 # A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
 # carry output `Type`s as data (authoring.jl `_kernel_provenance_key`), and
 # ReactantCore's `::Type` `is_traced` early-out covers only the 1-arg call
@@ -3821,9 +3867,12 @@ end
     _prepared_call(k, args, Val(N))
 end
 
-function _prepare(p::Plan, ast::Expr, ops::Tuple, recipes::Tuple)
-    f = compile(ast)
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
+# The compiled body's type is new for every prepared kernel, so specializing
+# this assembly step on it would compile code that is never reused.
+Base.@nospecializeinfer function _prepare(p::Plan, ast::Expr,
+                                          @nospecialize(ops::Tuple),
+                                          @nospecialize(recipes::Tuple))
+    _prepared_kernel(compile(ast), ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
 end
 
 """
@@ -3849,8 +3898,8 @@ function _prepare_batched(p::Plan; batched, reduce = :+)
         input_index,batched_ports,reduce,typeof(native),typeof(tensorized)}(
             native, tensorized)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
-                   Tuple(p.recipes))
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
+                     Tuple(p.recipes))
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
@@ -4033,7 +4082,7 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
             input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
                 native, tensorized, tensorized_ast)
     end
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (), on_error = nothing)
