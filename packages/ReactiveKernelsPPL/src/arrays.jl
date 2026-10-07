@@ -1211,10 +1211,11 @@ end
 # K and the packed slice; neither a literal nor a data-derived K replicates
 # the body. The partials follow Stan's column-block order. Each entry retains
 # the original left-associated product (starting at z for an off-diagonal
-# entry, at 1 for a diagonal), including its floating-point operation order.
-# Inner loops have preparation-fixed bounds and lazy triangular guards. This
-# keeps nested reverse tapes statically sized without evaluating an unused
-# partial or replacing a product with a reassociated prefix recurrence.
+# entry, at 1 for a diagonal), including its floating-point operation order,
+# so it agrees bit for bit with the host `lkj_chol_constrain`. Every loop
+# iterates exactly the strictly lower triangle: column block j holds j - 1
+# partials, and entry i multiplies its i - 1 predecessors. No iteration is
+# spent on a masked-out entry.
 _lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
 _lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
 _lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
@@ -1234,12 +1235,8 @@ function _lkj_array_transform_statements(e::LayoutEntry)
             for j in 2:$K
                 base = (j - 1) * (j - 2) ÷ 2
                 d = 1.0
-                for ip in 1:$(K - 1)
-                    d = if ip < j
-                        d * sqrt(1 - $z[base + ip]^2)
-                    else
-                        d
-                    end
+                for ip in 1:(j - 1)
+                    d = d * sqrt(1 - $z[base + ip]^2)
                 end
                 out[j] = d
             end
@@ -1248,25 +1245,14 @@ function _lkj_array_transform_statements(e::LayoutEntry)
         :($L::Matrix{Float64} = let
             out = zeros(Float64, $K, $K)
             out[1, 1] = 1.0
-            entry_value = 0.0
             for j in 2:$K
                 base = (j - 1) * (j - 2) ÷ 2
-                for i in 1:$(K - 1)
-                    entry_value = if i < j
-                        let v = $z[base + i]
-                            for ip in 1:$(K - 1)
-                                v = if ip < i
-                                    v * sqrt(1 - $z[base + ip]^2)
-                                else
-                                    v
-                                end
-                            end
-                            v
-                        end
-                    else
-                        0.0
+                for i in 1:(j - 1)
+                    v = $z[base + i]
+                    for ip in 1:(i - 1)
+                        v = v * sqrt(1 - $z[base + ip]^2)
                     end
-                    out[$row, $col] = entry_value
+                    out[$row, $col] = v
                 end
                 out[j, j] = $diagonal[j]
             end
@@ -1276,12 +1262,9 @@ function _lkj_array_transform_statements(e::LayoutEntry)
             total = 0.0
             p = 0
             for j in 2:$K
-                for i in 1:$(K - 1)
-                    p, total = if i < j
-                        p + 1, total + ((j - i + 1) / 2) * log(1 - $z[p + 1]^2)
-                    else
-                        p, total
-                    end
+                for i in 1:(j - 1)
+                    p = p + 1
+                    total = total + ((j - i + 1) / 2) * log(1 - $z[p]^2)
                 end
             end
             total
