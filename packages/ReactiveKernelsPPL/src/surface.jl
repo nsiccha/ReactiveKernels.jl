@@ -931,7 +931,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         (input in data || _mentions_symbol(ast, input)) &&
             _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
     end
-    sample, det, plate_ctx, plate_specs, scans, joints, glms = _partition_statements(ast, data)
+    sample, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
+        _partition_statements(ast, data)
     sample, det = _rewrite_plate_rows(sample, det)
     # Latent plates over values read their cell count as bound data.
     extents = Set{Symbol}(_plate_extent_input(nm) for (nm, rhs, _, _) in plate_specs
@@ -1426,7 +1427,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         vector_parameters = dirichlets,
         matrices = vcat(matrices, value_matrices),
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
-        indexed_observations)
+        indexed_observations,
+        cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
+            if k in indexed_observations))
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -2635,7 +2638,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     derived_observed = Set{Symbol}()
     seen_doc = false
     line = 0
-    args, plate_ctx, plate_params = _expand_plates(ast.args, data)
+    cell_broadcasts = Dict{Symbol,Vector{Symbol}}()
+    args, plate_ctx, plate_params = _expand_plates(ast.args, data;
+        broadcasts = cell_broadcasts)
     # Defined names, collected before lowering so the checks below admit
     # forward references. The scan never throws — the main loop below owns
     # every rejection.
@@ -2810,7 +2815,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
             _reject_statement(st)
         end
     end
-    return sample, det, plate_ctx, plate_params, scans, joints, glms
+    return sample, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
@@ -3271,7 +3276,8 @@ end
 # statements carry the plate's line for claim messages. Also returns the
 # plate context: `(lhs, line, bare-symbols)` per spliced statement for
 # the post-analysis whole-vector check.
-function _expand_plates(args, data::Set{Symbol})
+function _expand_plates(args, data::Set{Symbol};
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
     definitions = Dict{Symbol,Any}(arg.args[1] => arg.args[2] for arg in args
         if arg isa Expr && arg.head === :(=) && length(arg.args) == 2 &&
             arg.args[1] isa Symbol)
@@ -3294,7 +3300,7 @@ function _expand_plates(args, data::Set{Symbol})
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
-            stmts, stx, prm = _desugar_plate(arg, pl, plate_data)
+            stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
                 push!(expanded, st)
@@ -3308,7 +3314,8 @@ function _expand_plates(args, data::Set{Symbol})
     return expanded, ctx, params
 end
 
-function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
+function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
     (length(st.args) == 3 && st.args[3] isa Expr &&
         st.args[3].head === :for) ||
         _sfail("`@plate` takes `@plate for i in R ... end` exactly")
@@ -3352,7 +3359,8 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol})
         (_is_sample(c) || _is_broadcast_sample(c)) &&
         Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
     selected &&
-        return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
+        return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
+            broadcasts)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
@@ -3380,7 +3388,8 @@ end
 
 # Partial observation loops compute their arguments inside retained RK cells.
 # Slicing a fully computed vector would evaluate arithmetic in unselected cells.
-function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
+function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
     iterator = rkind[1] === :coloncall ? rkind[2] :
         rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
         Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
@@ -3448,10 +3457,30 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs)
             return ex
         end
         obj = arg(localread(c.args[3]); object=true)
+        # A dotted cell broadcasts over its own iteration's values, as in
+        # Julia. Record the operands it reads per index: when the bound
+        # response holds one array per index, each of these supplies that
+        # index's value and every other operand is shared by all indices.
+        lhs = c.args[2]
+        if _is_broadcast_sample(c) && Meta.isexpr(lhs, :ref, 2) &&
+                lhs.args[1] isa Symbol && lhs.args[1] in data && lhs.args[2] === ivar
+            broadcasts[lhs.args[1]] = sort!(collect(_cell_index_reads(obj, ivar)))
+        end
         append!(out, _desugar_cell_sample(Expr(:call, c.args[1], c.args[2], obj),
             ivar, rkind, line, data, plate_defs, ctx, params, pidx))
     end
     return out, ctx, params
+end
+
+# Bases of the `v[i]` reads in a cell expression, i.e. its per-index operands.
+function _cell_index_reads(ex, ivar, out::Set{Symbol} = Set{Symbol}())
+    ex isa Expr || return out
+    if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol && ex.args[2] === ivar
+        push!(out, ex.args[1])
+        return out
+    end
+    foreach(a -> _cell_index_reads(a, ivar, out), ex.args)
+    return out
 end
 
 # Numeric index values become one data-only index column. Indexed reads
