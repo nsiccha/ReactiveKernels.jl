@@ -364,9 +364,22 @@ and lock the one Reactant 0.2.289 lifted:
   the step's inferred output type is concrete, the native scan lowering now
   allocates each buffer once, before its emptiness branch; values, element
   types and the retained loop are unchanged, and ordinary reverse passes for
-  empty and nonempty sequences. A step without a concrete inferred output type
-  keeps per-arm allocation. No activity configuration or derivative rule is
+  empty and nonempty sequences. A step that contains a plate, a scan or an
+  embedded kernel is typed from that nested body's leaf operations, as a
+  nested plate body is; a step without a concrete inferred output type keeps
+  per-arm allocation. No activity configuration or derivative rule is
   involved.
+- Native Enzyme 0.13.209 reverse mode also fails static activity analysis
+  (`EnzymeRuntimeActivityError`) when a recurrence's carry starts as a
+  constant array and a reachable lazy branch can keep it while other paths
+  replace it with active memory: `repro_enzyme_branch_kept_seed_carry.jl`
+  reproduces the emitted outer/inner scan shape with Enzyme only. This is the
+  shape of a scan step `isempty(us) ? previous : inner[end]` after an inner
+  scan over `us`. The derivative is defined on every path; only the carried
+  array's activity depends on the data. The branch and its seed stay as
+  authored. The same value written as the inner scan's `include_init = true`
+  result's last element differentiates, as does the branch whose keep arm is
+  unreachable; runtime activity is not used.
 - Native Enzyme 0.13.209 on Julia 1.10.12 also rejects an ordinary untyped
   comprehension whose generator captures both an active array and a constant
   floating-point array: `repro_enzyme_generator_const_array_capture.jl`

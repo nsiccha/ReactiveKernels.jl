@@ -292,15 +292,29 @@ A traced empty sequence compiles to a program with no `stablehlo.while`. A
 nonempty one keeps its single loop.
 
 Ordinary native Enzyme reverse differentiates through an empty scan, including
-one inside a plate cell; the empty steps contribute nothing. When the step's
-inferred output type is concrete, the native lowering allocates the result once,
-before testing for emptiness, so the empty and nonempty results are the same
-allocation. Separate allocations for the two cases would meet in one value,
-which Enzyme's static activity analysis rejects
-(`benchmark/repro_enzyme_branch_allocation_phi.jl`). When inference gives no
-concrete output type (`Any` for a step containing a plate, scan or embedded
-kernel), each case still allocates its own result as before; native reverse
-through such an empty scan is not covered by this lowering.
+one inside a plate cell; the empty steps contribute nothing. The native
+lowering infers the step's output type from the step's own operations without
+running it. A step containing a plate, a scan or an embedded kernel is inferred
+from that nested body's operations in the same way, never by querying the
+nested prepared kernel as a whole. When the inferred type is concrete, the
+native lowering allocates the result once, before testing for emptiness, so the
+empty and nonempty results are the same allocation. Separate allocations for
+the two cases would meet in one value, which Enzyme's static activity analysis
+rejects (`benchmark/repro_enzyme_branch_allocation_phi.jl`). When inference
+gives no concrete output type, each case still allocates its own result, and
+native reverse through such an empty scan is not covered by this lowering.
+
+A step can keep its carry through a lazy branch, for example
+`isempty(us) ? previous : inner[end]` after an inner scan over `us`. When the
+seed is a constant array, the carry is then constant memory on the paths that
+keep it and active memory on the others, and Enzyme's static activity analysis
+rejects it (`EnzymeRuntimeActivityError`;
+`benchmark/repro_enzyme_branch_kept_seed_carry.jl`). The inner scan's
+`include_init = true` result starts with its seed, so `inner[end]` is that seed
+when the inner sequence is empty: the same value without the branch, and it
+differentiates while the inner sequences are nonempty. An inner sequence that
+is empty after the first outer step is a separate, unresolved native reverse
+failure (`OutOfMemoryError`) in either spelling.
 
 A recurrence authored in its own kernel, prepared once and called from a lazy
 branch arm, still works. The arm then runs through an ordinary callable
