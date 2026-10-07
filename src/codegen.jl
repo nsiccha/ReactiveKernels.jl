@@ -1059,9 +1059,16 @@ function _authored_plate_scalar_ref(inner::Plan, locals, callargs,
         # broadcast wrapper and indexed projection on every coordinate.
         statically_scalar = have_index in atomic ||
                             valtype(callvalues[have_index]) <: Number
+        # Every looped coordinate comes from `CartesianIndices(output_axes)`,
+        # with `output_axes` the `combine_axes` of these same preprocessed
+        # arguments, so the read is in bounds by construction — Base's own
+        # broadcast `copyto!` reads `bc[I]` under `@inbounds` on the same
+        # contract. Only this projection is unchecked; the cell body keeps
+        # its own bounds checks. A checked read keeps LLVM from vectorizing
+        # the cell loop.
         return looped && !statically_scalar ?
-            Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
-                 prepared_arguments[have_index], index) : arg
+            _inbounds_value(Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
+                                 prepared_arguments[have_index], index)) : arg
     end
     locals[cid]
 end
@@ -1735,8 +1742,11 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     scalar_result = nested === nothing ? _authored_plate_scalar_ref(
         inner, locals, callargs, callvalues, prepared_arguments, atomic,
         only(inner.want), index, true) : nested_result
+    # The pointwise buffer has the plate's axes (allocated or recycled for
+    # `output_axes`), so this store is in bounds, as the dose-outer passes
+    # (`_lower_plate_reduction_native`) already assume.
     pointwise_lhs === nothing ||
-        push!(loopbody.args, :($pointwise_lhs[$index] = $scalar_result))
+        push!(loopbody.args, _inbounds_expr(:($pointwise_lhs[$index] = $scalar_result)))
     accumulator === nothing ||
         push!(loopbody.args, :($accumulator =
             $(GlobalRef(@__MODULE__, :_plate_total_add))($accumulator, $scalar_result)))
