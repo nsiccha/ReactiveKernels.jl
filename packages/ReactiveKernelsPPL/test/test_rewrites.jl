@@ -253,6 +253,43 @@ end
     bad = condition(good; c = [0.7, 3.5])
     @test _rewrite_node(bad, :likelihood, Float64[]) == -Inf
 end
+
+@testset "conditioned truncated priors keep their normalizer and gradients" begin
+    y = [0.1, 0.3]
+    for (prior, D, inside, outside) in (
+            (:(truncated(Normal(0, 1), -1, 1)), truncated(Normal(), -1, 1), 0.2, -2.0),
+            (:(truncated(Normal(0, 1), -Inf, 1)), truncated(Normal(), -Inf, 1), 0.2, 2.0),
+            (:(truncated(LogNormal(0, 1), 0.5, Inf)), truncated(LogNormal(0, 1), 0.5, Inf), 0.8, 0.2),
+            (:(truncated(Gamma(2, 1), 0.5, 3)), truncated(Gamma(2, 1), 0.5, 3), 0.8, 4.0))
+        model = ReactiveKernelsPPL.RKPPLModel(quote
+            a ~ $prior
+            y .~ Normal.(a, 1)
+        end, @__MODULE__)
+        plan = model() | (; a = inside, y)
+        @test _rewrite_node(plan, :likelihood, Float64[]) ≈
+            logpdf(D, inside) + sum(logpdf.(Normal(inside, 1), y))
+        @test _rewrite_node(condition(plan; a = outside), :likelihood, Float64[]) == -Inf
+    end
+    # The truncation normalizer depends on a sampled location; mu = -1.7 takes
+    # the upper-tail difference, mu = 0.3 the lower one.
+    hierarchical = @rkppl begin
+        mu ~ Normal(0, 1)
+        a ~ truncated(Normal(mu, 1), -1, 1)
+        b[axes(X, 2)] .~ truncated.(Normal.(mu, 1), -1, 1)
+        y .~ Normal.(mu, 1)
+    end
+    X = zeros(length(y), 2)
+    b = [0.2, -0.1]
+    plan = hierarchical(; X) | (; a = 0.4, b, y)
+    built = build_kernel(plan)
+    oracle(u) = logpdf(Normal(), u[1]) +
+        logpdf(truncated(Normal(u[1], 1), -1, 1), 0.4) +
+        sum(logpdf.(truncated(Normal(u[1], 1), -1, 1), b)) +
+        sum(logpdf.(Normal(u[1], 1), y))
+    for u in ([0.3], [-1.7])
+        _check_model_math(built, plan, u, oracle)
+    end
+end
 @rkppl _rewrite_nested() = begin
     s ~ _rewrite_scale()
     s
