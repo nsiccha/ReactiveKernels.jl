@@ -256,6 +256,15 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test [bound(live) for live in lives] == expected
         @test C.calls[] == length(subjects)
         @test hoisted.op.value == [limits[r] for r in rows]
+        # More subjects change only the hoisted value, not the emitted residual.
+        more = prepare(C.data_only_result; bound = (; limits = repeat(limits, 2),
+            rows = vcat(rows, [r .+ 6 for r in rows]), subjects = 1:6))
+        @test isempty(plates(more.plan))
+        @test [typeof(r.op) for r in more.plan.recipes] ==
+              [typeof(r.op) for r in bound.plan.recipes]
+        @test more(repeat(first(lives), 2)) ==
+              plain(repeat(first(lives), 2), repeat(limits, 2),
+                    vcat(rows, [r .+ 6 for r in rows]), 1:6)
 
         # A live non-atomic input keeps the plate, its runtime domain check
         # and a result allocated per evaluation.
