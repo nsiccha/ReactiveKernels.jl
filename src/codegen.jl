@@ -3689,8 +3689,8 @@ function replica_graph(kernel::PreparedKernel; batched)
     _replica_graph(kernel, batched)
 end
 
-# Reuse only the final stacked buffers. Intermediate allocation remains the
-# scalar recipe's responsibility, and the owning surface has no mutable cache.
+# Reuse only the final stacked buffers; the owning surface has no mutable
+# cache. Position intermediates use lane slots (`_lower_replicated_with_ops`).
 _replicated_reuse(cache, value, count) = _replicated_output(value, count)
 @inline function _replicated_reuse(cache::AbstractArray, value::Number, count)
     cache isa Vector{typeof(value)} && length(cache) == count ?
