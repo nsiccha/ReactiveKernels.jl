@@ -1209,13 +1209,13 @@ end
 
 # One triangular transform graph for every declared factor. Preparation fixes
 # K and the packed slice; neither a literal nor a data-derived K replicates
-# the body. The partials follow Stan's column-block order. Each entry retains
-# the original left-associated product (starting at z for an off-diagonal
-# entry, at 1 for a diagonal), including its floating-point operation order,
-# so it agrees bit for bit with the host `lkj_chol_constrain`. Every loop
-# iterates exactly the strictly lower triangle: column block j holds j - 1
-# partials, and entry i multiplies its i - 1 predecessors. No iteration is
-# spent on a masked-out entry.
+# the body. The partials follow Stan's column-block order. Column block j
+# carries the running product of √(1 - z²) over its j - 1 partials, starting
+# at 1: entry i is its partial times the product so far, and the diagonal is
+# the final product. This is the left-associated order of the host
+# `lkj_chol_constrain`, so the two agree bit for bit. Every loop iterates
+# exactly the strictly lower triangle; no iteration is spent on a masked-out
+# entry, and each partial costs one square root per pass.
 _lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
 _lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
 _lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
@@ -1247,12 +1247,10 @@ function _lkj_array_transform_statements(e::LayoutEntry)
             out[1, 1] = 1.0
             for j in 2:$K
                 base = (j - 1) * (j - 2) ÷ 2
+                w = 1.0
                 for i in 1:(j - 1)
-                    v = $z[base + i]
-                    for ip in 1:(i - 1)
-                        v = v * sqrt(1 - $z[base + ip]^2)
-                    end
-                    out[$row, $col] = v
+                    out[$row, $col] = $z[base + i] * w
+                    w = w * sqrt(1 - $z[base + i]^2)
                 end
                 out[j, j] = $diagonal[j]
             end
