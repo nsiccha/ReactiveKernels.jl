@@ -170,6 +170,14 @@ end
             y .~ Normal.(b .* x .+ c[g] .+ c[1], 1)
         end, p -> p.b .* x .+ [k == 1 ? 0.0 : p.c[k-1] for k in g] .+ p.c[1],
             p -> normals(p.c) + logpdf(Normal(), p.b)),
+        (quote
+            b[axes(X, 2)] .~ Normal.(0, 1)
+            y .~ Normal.(X * b .- b[2], 1)
+        end, p -> X * p.b .- p.b[2], p -> normals(p.b)),
+        (quote
+            b ~ Normal(0, 1)
+            y .~ Normal.(b .* x .+ x[1], 1)
+        end, p -> p.b .* x .+ x[1], p -> logpdf(Normal(), p.b)),
     ]
     for (ast, location, prior) in cases
         original = deepcopy(data)

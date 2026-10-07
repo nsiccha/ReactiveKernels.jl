@@ -9351,8 +9351,9 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
             idx !== ctx.factor_axes[base][1]
         return _extract_summand(pname, core, sign, ctx)
     end
-    # A literal element (`phi[1]`) is one scalar, not a per-level column.
-    idx isa Integer && return _scalar_summand_error(pname, core)
+    # A literal element (`b[1]`, `x[1]`) is one scalar value, broadcast
+    # onto the predictor as Julia does, not a per-level column.
+    idx isa Integer && return _extract_summand(pname, core, sign, ctx)
     base isa Symbol || _sfail("predictor $pname: factor base must be a " *
                               "bare coefficient vector, got $(repr(base))")
     base in ctx.data && _sfail("predictor $pname: $base is data — " *
