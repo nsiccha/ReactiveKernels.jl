@@ -3,7 +3,7 @@ module ReactiveKernelsBDFExt
 import ReactiveKernels: rk_ode_bdf_tol
 using OrdinaryDiffEqBDF: FBDF
 using SciMLBase
-using SciMLSensitivity: GaussAdjoint, EnzymeVJP
+using SciMLSensitivity: ForwardDiffSensitivity
 
 # Owned solver adapter: the numerical integration and its history remain FBDF's.
 # Stepping explicitly keeps each output budget in local scalar state, instead
@@ -13,28 +13,27 @@ struct OutputBudgetBDF{T} <: SciMLBase.AbstractODEAlgorithm
     limit::Int
 end
 SciMLBase.forwarddiffs_model(::OutputBudgetBDF) = SciMLBase.forwarddiffs_model(FBDF())
+# Forward sensitivities integrate dual-number states and parameters with the
+# same solver, so the wrapper accepts the number types FBDF accepts.
+SciMLBase.isautodifferentiable(::OutputBudgetBDF) = SciMLBase.isautodifferentiable(FBDF())
+SciMLBase.allows_arbitrary_number_types(::OutputBudgetBDF) =
+    SciMLBase.allows_arbitrary_number_types(FBDF())
 
 function SciMLBase.__solve(prob::ODEProblem, alg::OutputBudgetBDF; kwargs...)
-    if prob.tspan[2] > prob.tspan[1]
-        integrator = SciMLBase.__init(prob, FBDF(); tstops = alg.times, kwargs...)
-        for output in alg.times
-            previous = integrator.stats.naccept
-            while integrator.t < output
-                step!(integrator)
-                integrator.stats.naccept - previous <= alg.limit ||
-                    error("native BDF exceeded maxsteps between requested outputs")
-                code = integrator.sol.retcode
-                (SciMLBase.successful_retcode(code) || code == ReturnCode.Default) ||
-                    error("native BDF failed: ", code)
-            end
+    integrator = SciMLBase.__init(prob, FBDF(); tstops = alg.times, kwargs...)
+    for output in alg.times
+        previous = integrator.stats.naccept
+        while integrator.t < output
+            step!(integrator)
+            integrator.stats.naccept - previous <= alg.limit ||
+                error("native BDF exceeded maxsteps between requested outputs")
+            code = integrator.sol.retcode
+            (SciMLBase.successful_retcode(code) || code == ReturnCode.Default) ||
+                error("native BDF failed: ", code)
         end
-        solve!(integrator)
-        integrator.sol
-    else
-        # The library's adjoint integrates backwards using the same BDF solver.
-        # The caller's forward output budget does not apply to that solve.
-        SciMLBase.__solve(prob, FBDF(); kwargs...)
     end
+    solve!(integrator)
+    integrator.sol
 end
 SciMLBase.__init(prob::ODEProblem, ::OutputBudgetBDF; kwargs...) =
     SciMLBase.__init(prob, FBDF(); kwargs...)
@@ -136,10 +135,14 @@ function rk_ode_bdf_tol(f, y0::AbstractVector{<:Real}, t0::Real,
     # then exposes every observation time to ordinary Reverse as well.
     prob = ODEProblem{true,SciMLBase.FullSpecialize}(rhs, Float64.(y0), (0.0, 1.0), p)
     times = (Float64.(ts) .- t0) ./ (last(ts) - t0)
+    # Forward sensitivities solve dual-number states, so the solver's error
+    # test covers the sensitivities as well as the states, like CVODES with
+    # sensitivity error control. Saving only the requested outputs keeps the
+    # primal and dual solves on the same saved times.
     sol = solve(prob, OutputBudgetBDF(times, Int(mx));
-        save_start = true, save_everystep = true, dense = true,
+        saveat = times, save_start = true, save_everystep = false,
         maxiters = typemax(Int), reltol = rt, abstol = at,
-        sensealg = GaussAdjoint(autojacvec = EnzymeVJP()))
+        sensealg = ForwardDiffSensitivity())
     SciMLBase.successful_retcode(sol) || error("native BDF failed: ", sol.retcode)
     result = Matrix{Float64}(undef, length(ts), length(y0))
     for i in eachindex(ts)
