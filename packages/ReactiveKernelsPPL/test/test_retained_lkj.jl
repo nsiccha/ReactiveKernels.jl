@@ -93,3 +93,50 @@ end
         @test fx.data == original
     end
 end
+
+function _rlkj_stack_case(K, S)
+    ast = quote
+        e ~ Exponential(1)
+        @plate for k in levels(s)
+            L[k] ~ LKJCholesky($K, e)
+        end
+        z[levels(s), 1:$K] .~ Normal.(0, 1)
+        @plate for i in eachindex(s)
+            r[i, 1:$K] = L[s[i]] * z[s[i], :]
+        end
+        y .~ Normal.(r[:, $K], 0.7)
+    end
+    data = Dict(:y => [0.2 * cos(i) for i in 1:11], :s => [mod1(i, S) for i in 1:11])
+    bound = bind_data(lower_rkppl(ast, data; conditioned = (:y,)), data)
+    (; bound, built = build_kernel(bound))
+end
+
+# From K = 4 on, an entry multiplies at least two square roots, so a
+# different product order would change its last bits.
+@testset "LKJ vine twins agree exactly with the host transform" begin
+    for K in (3, 4, 6), S in (1, 3)
+        fx = _rlkj_stack_case(K, S)
+        u = [0.4 * sin(1.7i) for i in 1:fx.built.layout.total]
+        factor = Base.invokelatest(prepare, fx.built.spec;
+            have = :unconstrained, want = :L)
+        G = Base.invokelatest(factor, u)
+        entry = only(e for e in fx.built.layout.entries if e.name === :L)
+        P = K * (K - 1) ÷ 2
+        U = reshape(u[entry.offset:(entry.offset + P * S - 1)], P, S)
+        @test size(G) == (K, K, S)
+        @test all(k -> G[:, :, k] == lkj_chol_constrain(U[:, k], K), 1:S)
+        @test G == constrain(fx.built.layout, u).L
+    end
+    # The scalar twin of a hand-built `:cholesky_corr_lkj` vector parameter.
+    for K in (3, 4, 6)
+        u = [0.4 * sin(1.7i) for i in 1:(K * (K - 1) ÷ 2)]
+        stmts = ReactiveKernelsPPL._lkj_vine_statements(:F, K, p -> :(u[$p]))
+        entries = (j >= i ? ReactiveKernelsPPL._rl_name(:F, j, i) : 0.0
+            for j in 1:K, i in 1:K)
+        G = Core.eval(@__MODULE__, :(let u = $u
+            $(stmts...)
+            [$(entries...)]
+        end))
+        @test reshape(G, K, K) == lkj_chol_constrain(u, K)
+    end
+end
