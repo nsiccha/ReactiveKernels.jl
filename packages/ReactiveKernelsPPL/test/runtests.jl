@@ -265,7 +265,7 @@ const _PPL_TEST_FILES = (
 )
 
 include("sharding.jl")
-const _PPL_TEST_FAILURES = _run_ppl_test_files(_PPL_TEST_FILES, get(ENV, "RKPPL_TEST_SHARD", ""))
+const _PPL_TEST_FAILURES = _run_ppl_test_files(_PPL_TEST_FILES, ENV)
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)
@@ -284,6 +284,22 @@ end
     @test_throws ErrorException _ppl_test_shard("9/8")
     @test_throws ErrorException _ppl_test_shard("3")
 
+    files = ("a.jl", "b_reactant.jl", "c.jl", "d.jl")
+    plan(env...) = _ppl_test_plan(files, Dict{String,String}(env...))
+    @test plan() == (collect(files), [1, 2, 3, 4])
+    @test plan("RKPPL_TEST_BACKENDS" => "native") == (["a.jl", "c.jl", "d.jl"], [1, 2, 3])
+    @test plan("RKPPL_TEST_BACKENDS" => "native", "RKPPL_TEST_SHARD" => "2/2") ==
+        (["a.jl", "c.jl", "d.jl"], [2])
+    @test plan("RKPPL_TEST_FILES" => "d.jl, a.jl") == (collect(files), [1, 4])
+    @test plan("RKPPL_TEST_BACKENDS" => "native", "RKPPL_TEST_FILES" => "d.jl") ==
+        (["a.jl", "c.jl", "d.jl"], [3])
+    # refused: each setting names files that cannot be run as asked
+    @test_throws ErrorException plan("RKPPL_TEST_BACKENDS" => "native",
+        "RKPPL_TEST_FILES" => "b_reactant.jl")
+    @test_throws ErrorException plan("RKPPL_TEST_FILES" => "e.jl")
+    @test_throws ErrorException plan("RKPPL_TEST_FILES" => "a.jl,")
+    @test_throws ErrorException plan("RKPPL_TEST_FILES" => "a.jl", "RKPPL_TEST_SHARD" => "1/2")
+    @test_throws ErrorException plan("RKPPL_TEST_BACKENDS" => "xla")
 
     stripped = _without_tests(Meta.parseall("""
         f() = 1
@@ -318,6 +334,21 @@ end
     @test m.after == 1
     @test _throw_ppl_test_failures(Pair{String,Any}[]) === nothing
     @test_throws ErrorException redirect_stdout(() -> _throw_ppl_test_failures(failures), devnull)
+end
+
+@testset "native test files do not use Reactant" begin
+    # `RKPPL_TEST_BACKENDS=native` evaluates them without Reactant installed.
+    @test _ppl_native_reactant_uses(@__DIR__, _PPL_TEST_FILES) == Pair{String,Symbol}[]
+    dir = mktempdir()
+    write(joinpath(dir, "x_reactant.jl"), "using Reactant\nhelper() = 1\nshared() = 2\n")
+    write(joinpath(dir, "fixture.jl"), "g() = Reactant.to_rarray([1.0])\n")
+    write(joinpath(dir, "native.jl"), """
+        shared() = 3
+        f() = helper() + shared()
+        include("fixture.jl")
+        """)
+    @test _ppl_native_reactant_uses(dir, ("x_reactant.jl", "native.jl")) ==
+        ["native.jl" => :Reactant, "native.jl" => :helper]
 end
 
 _throw_ppl_test_failures(_PPL_TEST_FAILURES)
