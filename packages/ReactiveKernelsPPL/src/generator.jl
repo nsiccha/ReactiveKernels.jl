@@ -3216,7 +3216,9 @@ function _conditioned_endpoint_calls(ex::Expr)
             object = first(endpoint.args)
             if object isa Expr && object.head === :call &&
                     first(object.args) in values(_PRIOR_ENDPOINTS)
-                family = getfield(@__MODULE__, first(object.args))
+                # The generated module imports every endpoint family from
+                # DistributionKernelSources; resolve the same binding there.
+                family = getfield(DistributionKernelSources, first(object.args))
                 callable = prepare(getproperty(family, endpoint.args[2].value))
                 return Expr(:call, QuoteNode(callable), object.args[2:end]..., ex.args[2:end]...)
             end
