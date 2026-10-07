@@ -1769,12 +1769,13 @@ uuid = "0192cb87-2b54-54ad-80e0-3be72ad8a3c0"
 version = "0.0.413+0"
 
 [[deps.ReactiveKernels]]
-deps = ["DifferentiationInterface", "InverseFunctions", "LinearAlgebra", "LogExpFunctions", "Random", "ReactantCore", "RuntimeGeneratedFunctions"]
+deps = ["DifferentiationInterface", "InverseFunctions", "LinearAlgebra", "LogExpFunctions", "PrecompileTools", "Random", "ReactantCore", "RuntimeGeneratedFunctions"]
 path = "../.."
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 version = "0.1.0"
 
     [deps.ReactiveKernels.extensions]
+    ReactiveKernelsBDFExt = ["OrdinaryDiffEqBDF", "SciMLBase", "SciMLSensitivity"]
     ReactiveKernelsChainRulesCoreExt = "ChainRulesCore"
     ReactiveKernelsEnzymeExt = "Enzyme"
     ReactiveKernelsMutatingFunctionsExt = "MutatingFunctions"
@@ -1783,8 +1784,12 @@ version = "0.1.0"
     [deps.ReactiveKernels.weakdeps]
     ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
     Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+    Enzyme_jll = "7cc45869-7501-5eee-bdea-0790c847d4ef"
     MutatingFunctions = "8a4c2d94-4b3b-4f9e-be63-a3c0cd816e3a"
+    OrdinaryDiffEqBDF = "6ad6398a-0878-4a85-9266-38940aa047c8"
     Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+    SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+    SciMLSensitivity = "1ed8b502-d754-442c-8d5d-10ac956f44a1"
 
 [[deps.ReactiveKernelsDistributionKernels]]
 deps = ["LinearAlgebra", "LogExpFunctions", "ReactantCore", "ReactiveKernels", "SpecialFunctions"]

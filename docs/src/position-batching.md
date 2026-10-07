@@ -170,7 +170,7 @@ copy compatible dense numeric stacks directly, including tuple and named-tuple
 trees, without creating scalar slices first. Vectors of scalar records and
 custom array layouts retain projection and stacking. These internal reductions
 leave the ownership, empty-batch, validation, and scalar dispatch contracts
-in place; allocating scalar recipes still allocate their intermediate arrays.
+in place. Position intermediates are described below.
 
 For a batched dense numeric array port (`Array{T,N}` with `N > 1`), the native
 driver passes a contiguous trailing-axis view when the scalar port's declared
@@ -190,7 +190,25 @@ retaining destination views in its scratch cache. Pure recipes reading that
 WANT can observe a dense scratch array at the first position and a `SubArray`
 at later positions. Declare a concrete array type when recipe dispatch requires
 that container. Declared types keep their ordinary Julia conversion semantics.
-Other recipes allocate as they do in the scalar kernel.
+
+Position intermediates use the same destination protocol. A residual value
+produced by an authored plate or scan, or by a recipe whose source is a
+top-level dotted call (including `@.`) or an array slice such as `y[2:2:end]`
+or `m[:, j]`, keeps its dense buffer in a lane slot. Later positions overwrite
+that buffer when its element type and axes match, and allocate afresh
+otherwise. An owning call keeps its slots for that call; a borrowed reader and
+each scheduled worker keep them between calls. A WANT produced by a dotted call
+or slice reuses first-position scratch and remains a dense array at every
+position. Slots never leave the call, and every WANT is copied into the stacked
+result before the next position runs, so values, container types and errors
+are those of the scalar kernel. For example, a superposition plate whose output
+is sliced, scanned, mapped with `@.` and reduced with `minimum` allocates no
+per-position storage in a borrowed reader. A source recipe of any other shape,
+one whose source captures a local variable, or one prepared with
+`on_error = :ignore` keeps its ordinary call; such recipes, opaque functions,
+concatenations and matrix products allocate as they do in the scalar kernel.
+A reduction such as `minimum(rel)` reads its argument's buffer; it is not fused
+into the producing loop.
 
 By default every call owns fresh stacked output arrays, including record
 leaves. Later calls cannot change retained results. To consume bounded batches
@@ -214,10 +232,10 @@ callback, or kept in reactive state. A function return alone does not require
 copying. Use a separate instance per concurrent caller; the cache is not reentrant.
 Changing shapes or element types reseeds storage. Feeding a retained output back
 as an input detaches its buffer so the input is not overwritten. Reuse avoids
-allocation of compatible final stacked buffers and of the lane buffers above;
-other projections and scalar intermediate arrays may still allocate. It does
-not make an allocating scalar kernel allocation-free, and it does not cache
-positions or unit solves.
+allocation of compatible final stacked buffers and of the lane buffers and
+slots above; other projections and intermediates of other recipes may still
+allocate. It does not make an allocating scalar recipe allocation-free, and it
+does not cache positions or unit solves.
 
 Prepare one native borrowed template, then use `copy(template)` to create an
 independent reader for each request or concurrent caller:
@@ -286,8 +304,9 @@ downstream recipe dispatch depends on that container type.
 
 There is no automatic cost model or speedup guarantee. Measure the whole
 operation, including reader construction, and account for worker storage plus
-the final result. Scheduling does not remove scalar intermediate allocations.
-Small or allocation-heavy work can run slower with extra workers.
+the final result. Each worker keeps its own intermediate lane slots; scheduling
+does not remove the allocations of other recipes. Small or allocation-heavy work
+can run slower with extra workers.
 
 The schedule applies to native primal calls. An owning scheduled kernel compiled
 with Reactant keeps the existing retained position loop; `reuse=true` keeps its

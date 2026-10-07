@@ -907,7 +907,7 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
     # Source RHSs use the original scalar formal names. Keep their original
     # recipe metadata in operation-table order so readable code binds those
     # names to the newly projected scalar arguments, including across chains.
-    kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
         kernel.plan, kernel.ast,
         Tuple(readable_recipes[r.id] for r in scalar_plan.recipes))
     op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, Tuple(unique(checks)))
@@ -1126,13 +1126,15 @@ end
 
 # Fill a recycled lane buffer (`_lane_reuse`) instead of evaluating
 # `allocation` when it fits; `recycled` is a recycle argument of
-# `_lower_with_ops`.
+# `_lower_with_ops`. A lane slot keeps a fresh allocation (`_lane_keep!`).
 function _lane_allocation(recycled, eltype, output_axes, allocation)
     buffer = gensym(:lane_buffer)
     Expr(:block,
         :($buffer = $(GlobalRef(@__MODULE__, :_lane_reuse))(
             $recycled, $eltype, $output_axes)),
-        :($buffer === nothing ? $allocation : $buffer))
+        :($buffer === nothing ?
+            $(GlobalRef(@__MODULE__, :_lane_keep!))($recycled, $allocation) :
+            $buffer))
 end
 
 # `@inbounds` for generated code, which carries no macro calls.
@@ -2065,8 +2067,16 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         if embedded === nothing
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
-            call = Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)),
-                        callargs...)
+            # A recycled dotted-call or slice result fills its lane buffer
+            # (`_lane_source_expr`); the table keeps the operation either way.
+            destination = !tensorized && length(r.outputs) == 1 &&
+                lhs === nm(only(r.outputs)) ?
+                recycled(canon_id(g, only(r.outputs).id)) : nothing
+            destination === nothing ||
+                (destination = _lane_source_expr(r, callargs, destination))
+            call = destination === nothing ?
+                Expr(:call, Expr(:ref, _OPS_ARG, length(runtime_ops)), callargs...) :
+                destination
             push!(body.args, Expr(:(=), lhs, call))
         else
             inner_ast = _embedded_ast(embedded, tensorized)
@@ -2464,25 +2474,46 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
         ast, ops, _ = _replicated_part_ast(parts.prefix)
         ast, ops
     end
-    # A WANT whose residual producer is an authored plate or scan receives the
-    # first position's value as scratch (`recycle`, see `_lower_with_ops`).
-    # Later positions write into the owned destination column when its type
-    # admits a view, or reuse the scratch. A borrowed reader keeps that scratch
-    # between calls, with its producer checking element type and axes.
+    # A WANT whose residual producer has a destination form (an authored plate
+    # or scan, a top-level dotted call or slice) receives the first position's
+    # value as scratch (`recycle`, see `_lower_with_ops`). Later positions
+    # reuse the scratch; a plate or scan writes into the owned destination
+    # column instead when its type admits a view. A dotted call or slice keeps
+    # a dense array, as its consumers always saw. A borrowed reader keeps that
+    # scratch between calls, with its producer checking element type and axes.
     nout, nhave = length(p.want), length(p.have)
     recycle = Pair{Int,Symbol}[]
     recycle_wants = Int[]
+    column_wants = Set{Int}()
     for (output_index, v) in enumerate(p.want)
         cid = canon_id(g, v.id)
         cid in have_ids && continue
         any(pair -> first(pair) == cid, recycle) && continue
         producer = get(parts.residual.producer, cid, nothing)
-        producer isa Recipe &&
-            producer.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} || continue
+        producer isa Recipe && _replicated_lane_producer(producer) || continue
         push!(recycle, cid => gensym(Symbol(v.name, :_recycled)))
         push!(recycle_wants, output_index)
+        producer.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} &&
+            push!(column_wants, output_index)
     end
     recycle_vars = Any[gensym(Symbol(p.want[k].name, :_lane)) for k in recycle_wants]
+    # Every other residual value with a destination form keeps its buffer in a
+    # lane slot (`_lane_reuse(::Base.RefValue{Any}, ...)`) across positions and,
+    # for a borrowed reader, across calls. A value the residual lowering fuses
+    # away (a summed plate, a scan feeding a plate) never touches its slot.
+    want_ids = Set(canon_id(g, v.id) for v in p.want)
+    residual_have_ids = Set(canon_id(g, v.id) for v in parts.residual.have)
+    scratch_vars = Any[]
+    for r in parts.residual.recipes
+        length(r.outputs) == 1 || continue
+        cid = canon_id(g, only(r.outputs).id)
+        (cid in want_ids || cid in residual_have_ids) && continue
+        get(parts.residual.producer, cid, nothing) === r || continue
+        any(pair -> first(pair) == cid, recycle) && continue
+        _replicated_lane_producer(r) || continue
+        push!(recycle, cid => gensym(Symbol(only(r.outputs).name, :_recycled)))
+        push!(scratch_vars, gensym(Symbol(only(r.outputs).name, :_scratch)))
+    end
     residual_ast, residual_ops, _ = _replicated_part_ast(parts.residual; recycle)
     residual_offset = length(prefix_ops)
     lane_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_lane))
@@ -2507,6 +2538,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             end
         end
         append!(callargs, recycled)
+        append!(callargs, scratch_vars)
         for (v, variable) in zip(p.want, want_vars)
             canon_id(g, v.id) in have_ids && continue
             _replicated_declares(p, v) &&
@@ -2570,7 +2602,9 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     end
 
     # Borrowed cache slots: the stacked outputs, then one lane per HAVE port,
-    # then one recycled buffer per WANT (`_borrowed_batch_slot_count`).
+    # then one recycled buffer per WANT, then one slot per intermediate
+    # (`_borrowed_batch`). An owning call keeps its intermediate
+    # slots for that call only.
     slot(index) = Expr(:ref, :__output_caches__, index)
     for (position, v) in enumerate(p.have)
         lane = get(lane_vars, canon_id(g, v.id), nothing)
@@ -2580,6 +2614,11 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
                  slot(nout + position), nm(v), valtype(v)) :
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane), nm(v), valtype(v))
         push!(body.args, Expr(:(=), lane, allocation))
+    end
+    for (index, scratch) in enumerate(scratch_vars)
+        push!(body.args, Expr(:(=), scratch, reuse ? slot(2 * nout + nhave + index) :
+            Expr(:call, Expr(:curly, GlobalRef(Base, :RefValue), GlobalRef(Core, :Any)),
+                 GlobalRef(Core, :nothing))))
     end
     first_recycled = Any[reuse ?
         :($(GlobalRef(@__MODULE__, :_replicated_recycled))(
@@ -2610,10 +2649,11 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
 
     rest_body = Expr(:block)
     rest_vars = Any[gensym(Symbol(v.name, :_position)) for v in p.want]
-    rest_recycled = Any[:(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
-        $(output_vars[canon_id(g, p.want[k].id)]), $(valtype(p.want[k])), replica_index)
-        column === nothing ? $lane : column
-    end) for (lane, k) in zip(recycle_vars, recycle_wants)]
+    rest_recycled = Any[k in column_wants ?
+        :(let column = $(GlobalRef(@__MODULE__, :_replicated_output_lane))(
+            $(output_vars[canon_id(g, p.want[k].id)]), $(valtype(p.want[k])), replica_index)
+            column === nothing ? $lane : column
+        end) : lane for (lane, k) in zip(recycle_vars, recycle_wants)]
     position_block!(rest_body, :replica_index, rest_vars, rest_recycled)
     for (output_index, v) in enumerate(p.want)
         push!(rest_body.args,
@@ -2637,8 +2677,14 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
              Expr(:tuple, (output_vars[canon_id(g, v.id)] for v in p.want)...)
     push!(body.args, Expr(:return, retval))
     Expr(:function, Expr(:tuple, argexprs...), body),
-    (prefix_ops..., residual_ops...)
+    (prefix_ops..., residual_ops...),
+    2 * nout + nhave + length(scratch_vars)
 end
+
+# Destination-form producers of a position value: authored plates and scans,
+# and source recipes whose result is a top-level dotted call or array slice.
+_replicated_lane_producer(r::Recipe) =
+    r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} || _lane_source_eligible(r)
 
 """
     lower_batched(p::Plan; batched, reduce = :+) -> Expr
@@ -3140,6 +3186,20 @@ struct PreparedKernel{F,O,IN,OUT,RR}
     plan::Plan
     ast::Expr
     lowered_recipes::RR
+end
+
+# Nearly every preparation or rebinding assembles a `PreparedKernel` of a new
+# concrete type (its compiled body is new). Assemble it without compiling the
+# struct's constructor for that type; calls on the prepared kernel still
+# dispatch on its exact type.
+Base.@nospecializeinfer function _prepared_kernel(
+        @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
+        @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
+        @nospecialize(lowered_recipes::Tuple))
+    T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
+                       typeof(lowered_recipes)}
+    _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
+                             lowered_recipes))::PreparedKernel
 end
 
 # A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
@@ -3685,8 +3745,8 @@ function replica_graph(kernel::PreparedKernel; batched)
     _replica_graph(kernel, batched)
 end
 
-# Reuse only the final stacked buffers. Intermediate allocation remains the
-# scalar recipe's responsibility, and the owning surface has no mutable cache.
+# Reuse only the final stacked buffers; the owning surface has no mutable
+# cache. Position intermediates use lane slots (`_lower_replicated_with_ops`).
 _replicated_reuse(cache, value, count) = _replicated_output(value, count)
 @inline function _replicated_reuse(cache::AbstractArray, value::Number, count)
     cache isa Vector{typeof(value)} && length(cache) == count ?
@@ -3757,16 +3817,15 @@ struct BorrowedBatchedKernel{K,F,O,C}
     caches::C
     ast::Expr
 end
-# One slot per stacked output, then one input lane per HAVE port and one
-# recycled lane buffer per WANT (`_lower_replicated_with_ops`).
-_borrowed_batch_slot_count(target) =
-    2 * length(outputs(target)) + length(inputs(target))
+# One slot per stacked output, then one input lane per HAVE port, one recycled
+# lane buffer per WANT and one slot per position intermediate with a
+# destination form; `_lower_replicated_with_ops` returns the count.
 _borrowed_batch_caches(count::Int) = ntuple(_ -> Ref{Any}(nothing), count)
 function _borrowed_batch(target::GraphReplicatedKernel)
-    ast, ops = _lower_replicated_with_ops(
+    ast, ops, slot_count = _lower_replicated_with_ops(
         target.plan; batched=batched_ports(target), reuse=true)
     BorrowedBatchedKernel(target, compile(ast), ops,
-        _borrowed_batch_caches(_borrowed_batch_slot_count(target)), ast)
+        _borrowed_batch_caches(slot_count), ast)
 end
 
 # A new native execution instance shares the read-only computation, not the
@@ -3863,9 +3922,12 @@ end
     _prepared_call(k, args, Val(N))
 end
 
-function _prepare(p::Plan, ast::Expr, ops::Tuple, recipes::Tuple)
-    f = compile(ast)
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
+# The compiled body's type is new for every prepared kernel, so specializing
+# this assembly step on it would compile code that is never reused.
+Base.@nospecializeinfer function _prepare(p::Plan, ast::Expr,
+                                          @nospecialize(ops::Tuple),
+                                          @nospecialize(recipes::Tuple))
+    _prepared_kernel(compile(ast), ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
 end
 
 """
@@ -3891,8 +3953,8 @@ function _prepare_batched(p::Plan; batched, reduce = :+)
         input_index,batched_ports,reduce,typeof(native),typeof(tensorized)}(
             native, tensorized)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
-                   Tuple(p.recipes))
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
+                     Tuple(p.recipes))
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
@@ -4075,7 +4137,7 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
             input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
                 native, tensorized, tensorized_ast)
     end
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (), on_error = nothing)

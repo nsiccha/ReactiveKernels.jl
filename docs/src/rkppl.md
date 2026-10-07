@@ -645,6 +645,35 @@ In an array cell, an observation must read a named per-index output
 `@scan begin … end` writes a sequential recurrence, such as an AR(1) state
 (corpus `38_scan_ar.jl`).
 
+### One array per index
+
+A dotted cell broadcasts over its own iteration's values, as the loop it
+writes does in Julia. When the response holds one array per index, such as
+ragged groups including empty ones, each cell observes that index's entries:
+
+```julia
+# y = [[0.7, 0.3, 0.1], [1.4, 0.6], Float64[]]; x has the same shape
+@plate for i in eachindex(y)
+    y[i] .~ Normal.(a .+ b .* x[i], sigma)
+end
+```
+
+Values the cell reads per index supply that index's array or number. Examples
+are `x[i]`, a per-group scalar `mu[i]`, or the per-group result `loc[i]` of a
+function-shaped kernel. Every other value is shared by all indices, and each
+per-index value broadcasts against its response array as Julia requires. The
+observation lowers to RK's nested group and observation plates: one retained
+observation plate runs inside the group plate, with no copy per group. The
+`:pointwise` query returns one array of densities per index, and empty arrays
+contribute zero. Native values and ordinary Enzyme reverse gradients are
+supported; RK does not implement compiled nested plate regions.
+
+Outside a dotted cell, Julia refuses this shape, and so does binding.
+`y .~ Normal.(loc, sigma)` broadcasts `Normal` over the arrays of `y`, and an
+undotted cell `y[i] ~ Normal(…)` observes the array `y[i]` with a univariate
+distribution; the error names the dotted cell. Missing entries inside the
+arrays and `mi()` packing are not built yet.
+
 ## Submodels
 
 `@rkppl name(args...) = begin … end` defines a reusable block. Using it,
