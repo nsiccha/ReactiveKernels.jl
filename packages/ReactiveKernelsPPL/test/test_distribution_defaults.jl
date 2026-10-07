@@ -1,4 +1,4 @@
-using Test, Distributions, ReactiveKernels, ReactiveKernelsPPL
+using Test, Distributions, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme
 
 function _defaults_response_case(name, n)
     rhs, explicit, distribution = if name === :normal
@@ -76,6 +76,22 @@ function _defaults_build(ast, data, q)
     kernel = prepare_query(built, bound, :sampler)
     @test data == before
     return built, bound, kernel, u
+end
+
+# Native reverse value and gradient against the oracle and central differences.
+function _defaults_native_reverse(built, bound, kernel, u, expected)
+    sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+    value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+    @test value ≈ expected atol=1e-10 rtol=1e-10
+    finite = similar(u)
+    for i in eachindex(u)
+        up, down = copy(u), copy(u)
+        up[i] += 1e-5
+        down[i] -= 1e-5
+        finite[i] = (kernel(up) - kernel(down)) / 2e-5
+    end
+    @test grad ≈ finite atol=1e-7 rtol=1e-6
+    return sampler, value, grad
 end
 
 @testset "Distributions positional defaults and argument order" begin
