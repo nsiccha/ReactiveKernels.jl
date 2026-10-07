@@ -237,7 +237,7 @@ const _PPL_TEST_FILES = (
 )
 
 include("sharding.jl")
-_run_ppl_test_files(_PPL_TEST_FILES, get(ENV, "RKPPL_TEST_SHARD", ""))
+const _PPL_TEST_FAILURES = _run_ppl_test_files(_PPL_TEST_FILES, get(ENV, "RKPPL_TEST_SHARD", ""))
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)
@@ -273,4 +273,22 @@ end
     @test Meta.isexpr(module_body[1], :(=)) && module_body[1].args[1] == :(g())
     @test module_body[2] === nothing
     @test body[4].args[2].args[1:2] == [:include, _without_tests]
+
+    # A thrown top-level test is recorded and the include continues.
+    failures = Pair{String,Any}[]
+    m = Module()
+    Core.eval(m, :(macro test_boom() :(throw(ErrorException("boom"))) end))
+    continuing = _continuing_tests(failures, "fixture")
+    for ex in code(Meta.parseall("""
+            @test_boom
+            after = 1
+            """).args)
+        Core.eval(m, continuing(ex))
+    end
+    @test failures == ["fixture" => ErrorException("boom")]
+    @test m.after == 1
+    @test _throw_ppl_test_failures(Pair{String,Any}[]) === nothing
+    @test_throws ErrorException redirect_stdout(() -> _throw_ppl_test_failures(failures), devnull)
 end
+
+_throw_ppl_test_failures(_PPL_TEST_FAILURES)
