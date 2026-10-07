@@ -1043,6 +1043,65 @@ end
     @test result ≈ reference
 end
 
+module UninferredPlateCells
+using ReactiveKernels
+
+# Hides the cell's result type from inference, as Julia's inference can for a
+# nested prepared kernel called in a lazy arm (`_declare_typed_output!`).
+opaque(x) = Base.inferencebarrier(x)
+
+@kernel group_total(groups) = begin
+    cells = plate(groups) do xs
+        opaque(2.0 * sum(xs))
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel indexed_total(idx, values) = begin
+    cells = plate(idx, Ref(values)) do i, v
+        opaque(v[i])
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel scan_total(xs) = begin
+    trajectory = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    cells = plate(trajectory) do t
+        opaque(2.0 * t)
+    end
+    total = sum(cells)
+    return total
+end
+end
+
+@testset "authored plate total: cells whose result type does not infer" begin
+    # Regression (todo `1a2te8d`): the fused total of a cell inferred as `Any`
+    # was seeded with `zero(eltype(axis))`, which fails for an axis of vectors
+    # with `zero(::Type{Vector{Float64}})`. The first cell now starts the total.
+    U = UninferredPlateCells
+    groups = prepare(U.group_total)
+    @test groups([[1.0, 2.0], [0.5], Float64[]]) === 7.0
+    # refused: like Base's `sum(Any[])`, an empty sum of cells without an
+    # inferred element type has no zero; the error names the declaration.
+    @test_throws "Declare the cell's result type" groups(Vector{Float64}[])
+
+    # An empty numeric axis keeps its element type's zero.
+    indexed = prepare(U.indexed_total)
+    @test indexed([1, 3], [0.5, 1.0, 2.0]) === 2.5
+    @test indexed(Int[], [0.5]) === 0
+
+    # The same seed when a summed plate consumes a scan in its loop.
+    scanned = prepare(U.scan_total)
+    @test !occursin("trajectory", sprint(show, readable_code(scanned)))
+    @test scanned([1.0, 2.0]) === 8.0
+    @test scanned(Float64[]) === 0.0
+end
+
 @testset "authored plate chain: redundant axis-check elision + preserved domain guards" begin
     # snag composed-authore: a fused authored plate chain absorbed one axis-check
     # group per sub-plate, so it emitted redundant pre-loop

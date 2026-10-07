@@ -139,8 +139,9 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test isempty(caches(inline.plan))
         inline(2.0)
         @test C.calls[] == 3 # the mixed recipe is deliberately indivisible
+        # A dense primitive array per cell is cached as an array of arrays.
         mutable_result = prepare(C.mutable_result; bound = (; data))
-        @test isempty(caches(mutable_result.plan))
+        @test only(caches(mutable_result.plan)).op.value == [fill(d, 2) for d in data]
         @test mutable_result(2.0) == prepare(C.mutable_result)(2.0, data)
         tuple_result = prepare(C.tuple_result; bound = (; data))
         @test isempty(caches(tuple_result.plan))
@@ -151,6 +152,46 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test only(caches(boolean.plan)).op.value == Bool[false, true, true]
         @test boolean([2.0]) == prepare(C.boolean)([2.0], bool_data)
         @test_throws ArgumentError prepare(C.counted; bound = (; data=2.0))(3.0)
+    end
+
+    @testset "array-valued cell values: ragged index lists" begin
+        kinds = [[1, 2, 1, 1, 3], [2, 1, 1, 3, 1, 1], [3, 3]]
+        read_idx = [[1, 3], [2, 4], Int[]]
+        subjects = 1:3
+        for spec in (C.ragged_reads, C.composed_reads)
+            plain = prepare(spec)
+            C.calls[] = 0
+            bound = prepare(spec; bound = (; kinds_by_subject = kinds, read_idx, subjects))
+            @test C.calls[] == length(subjects)
+            cache = only(caches(bound.plan))
+            @test cache.op.value isa Vector{Vector{Int}}
+            @test cache.op.value == [[1, 4], [3, 6], Int[]]
+            @test !occursin("counted_findall", string(code_expr(bound)))
+            lives = (collect(1.0:6.0), [0.5, -1.0, 2.0, 3.0, 0.0, 7.0])
+            results = [bound(live) for live in lives]
+            @test C.calls[] == length(subjects)
+            @test results == [plain(live, kinds, read_idx, subjects) for live in lives]
+            @test first(results) == 14.0
+            rebound = prepare(spec; bound = (; kinds_by_subject = [[1, 1]],
+                                             read_idx = [[2]], subjects = 1:1))
+            @test only(caches(rebound.plan)).op.value == [[2]]
+            @test rebound(first(lives)) == 2.0
+            @test bound(first(lives)) == 14.0
+            external, values = RK._externalize_bound_arrays(bound)
+            @test external(first(lives), values...) == 14.0
+        end
+        # A condition on the cached array partitions the plate by lane.
+        guard_kinds = [[1, 2, 1], [3, 3], [1]]
+        C.calls[] = 0
+        guarded = prepare(C.guarded_reads;
+                          bound = (; kinds_by_subject = guard_kinds, subjects))
+        @test C.calls[] == length(subjects)
+        @test count(r -> r.op isa RK._AuthoredPlateOp, guarded.plan.recipes) == 2
+        for q in ([0.5, 0.25], [-1.0, 2.0])
+            @test guarded(q) == prepare(C.guarded_reads)(q, guard_kinds, subjects) ==
+                  sum(q) * 5
+        end
+        @test C.calls[] == length(subjects) + 2length(subjects)
     end
 
     @testset "demanded intermediates and composed consumers" begin
@@ -180,4 +221,14 @@ import Enzyme
     @test ad_value_and_gradient(bound, q) == ad_value_and_gradient(plain, q, data)
     @test ad_gradient(bound, q) ≈ fill(sum(log, data), length(q))
     @test ad_gradient(bound, 2q) == ad_gradient(bound, q)
+
+    xs = [[1.0, 2.0], [4.0], Float64[]]
+    plain = prepare_ad(C.array_weights, backend, q, xs; active=:q, want=:total)
+    bound = prepare_ad(C.array_weights, backend, q; active=:q, want=:total,
+                       bound=(; xs))
+    cached = filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+        startswith(String(only(r.outputs).name), "bound_plate_"), bound.kernel.plan.recipes)
+    @test only(cached).op.value == [log.(x) for x in xs]
+    @test ad_value_and_gradient(bound, q) == ad_value_and_gradient(plain, q, xs)
+    @test ad_gradient(bound, q) ≈ fill(sum(sum(log, x; init = 0.0) for x in xs), length(q))
 end

@@ -369,6 +369,28 @@ and lock the one Reactant 0.2.289 lifted:
   nested plate body is; a step without a concrete inferred output type keeps
   per-arm allocation. No activity configuration or derivative rule is
   involved.
+- On Julia 1.10, native Enzyme 0.13.210 reverse mode fails static activity
+  analysis (`EnzymeRuntimeActivityError`) for an empty array when a function
+  branches on the array's length and then allocates over it, for example
+  Base's `s * t`, `t * s`, `-t` or `0.5 * s * t`, which broadcast into a
+  fresh array. The optimizer splits that allocation into an empty arm whose
+  array is never written, and it meets the written array in one value:
+  `repro_enzyme_length_branch_allocation_split.jl` reproduces it with Enzyme
+  only. The earlier branch can be authored (`isempty(t)`, a loop over `t`) or
+  be the dimension check of a native dotted call's materialization, so a plate
+  cell such as `base .+ slope * (level[idx] ./ 2.0)` fails for a group with an
+  empty `idx`, and so can a fully dotted cell. Julia 1.12 with the same
+  Enzyme passes. The repair belongs in Enzyme's mixed-activity handler,
+  which can give a fresh allocation that no active data reaches a zero
+  shadow; an Enzyme build that does so passes this reproducer,
+  `repro_enzyme_branch_allocation_phi.jl` and the pinned plate-consumer
+  testset, including the gradients against central differences. Changing
+  RK's lowering only moves which spellings the optimizer splits: a
+  materialization loop that never reads the output's length slowed
+  small-cell plate gradients by 14 to 51 percent, and routing scalar-array
+  arithmetic through the native materializer still failed inside that
+  materializer. Values are unaffected; the testset pins the empty-group
+  gradients as broken on Julia 1.10.
 - Native Enzyme 0.13.209 reverse mode also fails static activity analysis
   (`EnzymeRuntimeActivityError`) when a recurrence's carry starts as a
   constant array and a reachable lazy branch can keep it while other paths
@@ -432,15 +454,37 @@ and lock the one Reactant 0.2.289 lifted:
   well. A design matrix of data columns and a parameter-dependent column,
   `hcat(ones(n), x, exp.(a .* x))`, is this shape. The native kernel body
   therefore lowers calls of Base's `hcat`, `vcat` and `hvcat`, and the
-  bracket syntax Julia lowers to them, to RK-owned companions. For
-  same-element-type isbits `Vector`/`Matrix` operands, they allocate Base's
-  result and copy each operand in its own inlined call; every other operand
-  combination and every shape Base rejects call Base, which keeps its value
-  and error. Ordinary reverse then differentiates the authored graph, with
-  no activity annotation or derivative rule. The tensorized body keeps its
-  own concatenation lowering. Concatenation inside an opaque helper the
-  kernel calls, `cat`, `stack` and non-dense operands (views, adjoints)
-  keep Base's methods and remain the backend's limitation.
+  bracket syntax Julia lowers to them, to RK-owned companions. For `Number`,
+  `Vector` and `Matrix` operands whose promoted element type is isbits, they
+  allocate Base's result, with Base's shape, promoted element type and
+  values, and write each operand in its own inlined call; a number is a 1×1
+  block. Every other operand combination, and every `hcat`/`vcat` layout
+  they do not lay out, calls Base, which keeps its value and error
+  (including `vcat`'s fill of leading numbers across a wider matrix). A
+  layout `hvcat` rejects throws the companion's own `DimensionMismatch`
+  (unequal heights or widths) or `ArgumentError` (block-row counts that do
+  not describe the operands), worded as Base's. Ordinary reverse then
+  differentiates the authored graph, with no
+  activity annotation or derivative rule. The same companions keep scalar
+  and mixed literals such as `[-a 0.0; a -b]` and `[M v; 0.0 1.0]` on a
+  dense, inferred path: SparseArrays, which Enzyme loads, otherwise claims
+  Base's concatenation of numbers and dense arrays and builds the result
+  through slower generic methods, and Base's own mixed scalar/array `hvcat`
+  infers no concrete result type. The tensorized body keeps its own
+  concatenation lowering. Concatenation inside an opaque helper the kernel
+  calls, `cat`, `stack` and non-dense operands (views, adjoints) keep Base's
+  methods and remain the backend's limitation.
+- Native Enzyme 0.13.210 reverse on Julia 1.12.7 cannot compile Base's
+  `hvcat` of a block literal that mixes scalars with arrays, such as
+  `[A v; 0 0 1]` (`IllegalTypeAnalysisException` in `hvncat_fill!`), even
+  when the literal sits on a branch that never runs; scalar-only and
+  array-only literals differentiate, and Julia 1.10.12 differentiates all of
+  them. `repro_enzyme_mixed_scalar_hvcat.jl` reproduces it with Enzyme only.
+  The native `hvcat` companion therefore never calls Base for a layout it
+  rejects, which also keeps Julia 1.10's `hvcat` from silently dropping
+  operands beyond its block-row counts; Base's `hcat` and `vcat` of the same
+  operands compile. An opaque helper that builds such a literal keeps the
+  backend's limitation.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later
