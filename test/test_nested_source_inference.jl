@@ -149,9 +149,12 @@ end
                     Tuple{RK._IgnoredThrowFunction,Vararg{Any}})
             @test which(sig).recursion_relation === relation
         end
-        @test all(method -> method.recursion_relation === relation,
-                  methods(RK._kernel_source_call))
-        @test all(method -> method.recursion_relation === relation,
-                  methods(RK._ignored_throw_call))
+        # `@traceable` adds `_ignored_throw_call` methods for the caller's own
+        # functions; only the package's methods carry source callables.
+        for f in (RK._kernel_source_call, RK._ignored_throw_call)
+            own = filter(method -> method.module === RK, collect(methods(f)))
+            @test !isempty(own)
+            @test all(method -> method.recursion_relation === relation, own)
+        end
     end
 end
