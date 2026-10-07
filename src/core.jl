@@ -878,9 +878,64 @@ _replicated_column_admitted(::Type{Array{T,N}}, ::Type{V}) where {T,N,V} =
     end
 end
 
+# A position intermediate's lane slot (`_lower_replicated_with_ops`): a
+# `Ref{Any}` that keeps the dense buffer its producer allocated at an earlier
+# position, or an earlier call of a borrowed reader. The slot is reused only
+# when element type and axes match; any other value allocates afresh and
+# replaces it. Intermediates never leave the call, and every WANT is copied
+# into the stacked result before the next position runs, so no live value is
+# overwritten (as for the input lanes, `_replicated_lane`).
+@inline function _lane_reuse(slot::Base.RefValue{Any}, ::Type{T},
+                             output_axes::NTuple{N,Any}) where {T,N}
+    buffer = slot[]
+    buffer isa Array{T,N} && axes(buffer) == output_axes ? buffer : nothing
+end
+# Record a freshly allocated buffer in a slot; other recycled values (WANT
+# scratch, destination columns, `nothing`) are owned by the position driver.
+@inline _lane_keep!(recycled, value) = value
+@inline _lane_keep!(slot::Base.RefValue{Any}, value) = (slot[] = value; value)
+
+# Destination forms of a top-level dotted call and an array slice in a
+# position residual (`_lane_source_expr`). Each returns exactly the value its
+# source would (`_native_broadcast_materialize`, `getindex`): a matching
+# recycled buffer is overwritten in full, and otherwise the ordinary result is
+# allocated and kept. Every other shape takes the ordinary path.
+@inline _lane_broadcast(recycled, value) = _native_broadcast_materialize(value)
+@inline _lane_broadcast(recycled,
+    bc::Base.Broadcast.Broadcasted{Base.Broadcast.DefaultArrayStyle{0}}) =
+    _native_broadcast_materialize(bc)
+@inline function _lane_broadcast(recycled,
+        bc::Base.Broadcast.Broadcasted{<:Base.Broadcast.DefaultArrayStyle})
+    bc.axes === nothing || return _native_broadcast_materialize(bc)
+    ax = Base.@inline Base.Broadcast.combine_axes(bc.args...)
+    ready = Base.Broadcast.instantiate(
+        Base.Broadcast.Broadcasted(bc.style, bc.f, bc.args, ax))
+    T = Base.Broadcast.combine_eltypes(ready.f, ready.args)
+    isconcretetype(T) || return Base.materialize(ready)
+    buffer = _lane_reuse(recycled, T, ax)
+    buffer === nothing && return _lane_keep!(recycled,
+        _native_broadcast_copyto!(similar(ready, T), ready))
+    copyto!(buffer, ready)
+end
+
+const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<:Integer}}
+@inline _lane_getindex(recycled, A, I...) = A[I...]
+# A dense array or a view of one: its non-scalar `getindex` is a fresh
+# `Array{T}` of the index shape, which a copy into a matching buffer equals.
+@inline function _lane_getindex(recycled,
+        A::Union{Array{T},SubArray{T,<:Any,<:Array}}, I::Vararg{_LaneIndex}) where {T}
+    all(index -> index isa Integer, I) && return A[I...]
+    checkbounds(A, I...)
+    J = to_indices(A, I)
+    buffer = _lane_reuse(recycled, T, Base.index_shape(J...))
+    buffer === nothing && return _lane_keep!(recycled, A[I...])
+    copyto!(buffer, view(A, J...))
+end
+
 function _scan_history_buffer(recycled, xs, fill::Number)
     buffer = _lane_reuse(recycled, typeof(fill), axes(xs))
-    buffer === nothing ? _scan_history_buffer(xs, fill) : fill!(buffer, fill)
+    buffer === nothing ?
+        _lane_keep!(recycled, _scan_history_buffer(xs, fill)) : fill!(buffer, fill)
 end
 _scan_history_buffer(recycled, xs, fill) = _scan_history_buffer(xs, fill)
 _scan_history_buffer(xs, fill) = throw(ArgumentError(
