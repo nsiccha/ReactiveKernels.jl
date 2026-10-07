@@ -1360,10 +1360,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             shared_defs)
     end
     # Each predictor location inlines the model-level definitions it reads,
-    # so one read by several locations, or beside a reader of its name,
-    # would be evaluated once per copy. Replan it as one named value that
-    # every reader shares; this set only grows too.
-    shared = _shared_inline_defs(ctx, canonmap, kept,
+    # so one read by several locations, or beside a runtime reader of its
+    # name, would be evaluated once per copy. Replan it as one named value
+    # that every reader shares; this set only grows too.
+    shared = _shared_inline_defs(ctx, canonmap,
+        _runtime_reads(ctx, canonmap, skip, predictors, responses, paramsyms,
+            (params..., dirichlets..., arrays..., plate_parameters...),
+            external_observations, scans),
         Set{Symbol}(p.name for p in predictors), data)
     if !isempty(shared)
         return _lower_rkppl_once(ast, input_data, mod;
@@ -8945,17 +8948,64 @@ end
 # predictor plans. The outermost candidates are returned: a definition
 # read only through another candidate is no longer inlined once that
 # candidate stays named.
-function _shared_inline_defs(ctx, canonmap, kept, predictor_names, data)
+function _shared_inline_defs(ctx, canonmap, runtime, predictor_names, data)
     candidates = Set{Symbol}()
     for (nm, sites) in ctx.inline_uses
         haskey(canonmap, nm) && nm ∉ ctx.shared_defs || continue
         copies = sum(values(sites))
         copies >= 2 || (copies == 1 &&
-            (nm in kept || nm in predictor_names)) || continue
+            (nm in runtime || nm in predictor_names)) || continue
         _shared_value_def(nm, ctx, canonmap, data) && push!(candidates, nm)
     end
     return Set{Symbol}(nm for nm in candidates if !any(other -> other !== nm &&
         nm in _definition_reads(other, canonmap), candidates))
+end
+
+# Names the generated program reads by name at evaluation time: predictor
+# terms and extracted leaves/columns, response arguments, prior arguments,
+# observations and scans, followed through the definitions they emit.
+# Declared dimensions and level axes are bind-time shape reads, so a
+# definition only they need is not evaluated by the program.
+function _runtime_reads(ctx, canonmap, skip, predictors, responses,
+        paramsyms, parameters, external_observations, scans)
+    roots = Set{Symbol}(paramsyms)
+    for p in predictors, t in p.terms
+        union!(roots, (c for c in t.columns if c isa Symbol))
+        if t.kind === ComposedTerm
+            union!(roots, t.options.scalars)
+            union!(roots, _value_symbols(t.options.tree))
+        end
+    end
+    for r in responses
+        r.scale isa Symbol && push!(roots, r.scale)
+        r.nu isa Symbol && push!(roots, r.nu)
+        r.threshold_effects isa Symbol && push!(roots, r.threshold_effects)
+        foreach(s -> s isa Symbol && push!(roots, s), r.mixture_scales)
+    end
+    for p in parameters, arg in values(p.args)
+        union!(roots, _value_symbols(arg))
+    end
+    for observation in external_observations
+        union!(roots, _value_symbols(observation.args.rhs))
+    end
+    for a in (ctx.synth_assigns..., ctx.synth_derived...)
+        union!(roots, _value_symbols(a.expr))
+    end
+    for s in scans, st in (s.setup..., s.step...)
+        for ex in (st.kind === :sample ? st.args : (st.expr,))
+            union!(roots, _value_symbols(ex))
+        end
+    end
+    reads = Set{Symbol}()
+    pending = collect(roots)
+    while !isempty(pending)
+        nm = pop!(pending)
+        nm in reads && continue
+        push!(reads, nm)
+        haskey(canonmap, nm) && nm ∉ skip &&
+            append!(pending, _value_symbols(canonmap[nm]))
+    end
+    return reads
 end
 
 # A module call's model-level result, written inline or read through a

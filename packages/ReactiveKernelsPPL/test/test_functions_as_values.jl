@@ -100,6 +100,12 @@ function group_index(g, gg)
     return Int[findfirst(isequal(v), lv) for v in g]
 end
 read_rows(values, rows) = values[rows]
+# A function-shaped kernel value and a gather helper, read by several
+# response locations (shared model-level value check).
+ReactiveKernels.@kernel exp_value(x_) = begin
+    x = exp.(x_)
+end
+column_gather(draws, index, margin) = draws[index, margin]
 end
 const _FV = FunctionsAsValuesModels
 
@@ -534,6 +540,66 @@ end
         ll = sum(logpdf(Normal(a + b * x[i] / nrm, th.sigma), y[i])
             for i in eachindex(y))
         @test _fv_value(built, bound, :likelihood, u) ≈ ll
+    end
+end
+
+# Calls to the module function `name` in a generated or prepared program.
+function _fv_calls(ex, name::Symbol)
+    ex isa Expr || return 0
+    n = sum(a -> _fv_calls(a, name), ex.args; init = 0)
+    if ex.head in (:call, :.) && !isempty(ex.args)
+        f = ex.args[1]
+        f isa QuoteNode && (f = f.value)
+        fname = f isa GlobalRef ? f.name : f isa Function ? nameof(f) : f
+        fname === name && (n += 1)
+    end
+    return n
+end
+
+@testset "functions as values: a shared model-level value is evaluated once" begin
+    # An intercept plus a gathered column is a model-level value. Read
+    # through a kernel or dotted value by two response locations, each
+    # location used to inline its own copy of the whole chain, so the gather
+    # and the value ran once per reader (snag `rkppl-scalar-int-acf7b8cf`).
+    # The value is now one named definition that both locations read.
+    g = [1, 1, 2, 2, 3, 3, 3]
+    x = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0, 0.25]
+    c = [1.1, 0.7, 1.3, 2.0, 0.9, 0.95, 1.4]
+    y = [0.5, 1.0, 1.5, 2.0, 0.8, 1.2, 1.9]
+    cols = Dict{Symbol,ColumnData}(:g => g, :x => x, :c => c, :y => y)
+    u = [0.2, -0.3, 0.4, 0.1, -0.2, 0.3]
+    for (value, kernels) in ((:(exp_value(x_)), 1), (:(exp.(x_)), 0))
+        ast = quote
+            s ~ Exponential(1.0)
+            b ~ Normal(0, 1)
+            a ~ Normal(0, 1)
+            z[levels(g), 1:1] .~ Normal.(0, 1)
+            r = column_gather(z, g, 1)
+            x_ = a .+ r
+            v = $value
+            c .~ LogNormal.(log.(v), s)
+            y .~ Normal.(b .* v .+ x, s)
+        end
+        _, bound, built = _fv_build(ast, cols)
+        src = kernel_expr(bound, assign_layout(bound))
+        @test _fv_calls(src, :column_gather) == 1
+        @test _fv_calls(src, :exp_value) == kernels
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        vv = exp.(th.a .+ vec(th.z)[g])
+        ll = sum(logpdf.(LogNormal.(log.(vv), th.s), c)) +
+            sum(logpdf.(Normal.(th.b .* vv .+ x, th.s), y))
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+        kern = prepare_query(built, bound, :sampler)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        # The prepared program evaluates the gather and the value once too.
+        prepared = sprint(print, model_view(built; bound, query = q).prepared)
+        @test count("column_gather(", prepared) == 1
+        @test count("exp.(", prepared) == 1
+        val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test val ≈ Base.invokelatest(kern, u)
+        @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
     end
 end
 
