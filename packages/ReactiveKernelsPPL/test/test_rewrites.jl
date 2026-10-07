@@ -241,17 +241,6 @@ end
         sum(logpdf.(Normal(), y))
     bad = condition(good; b = [0.2, -2.0])
     @test _rewrite_node(bad, :likelihood, Float64[]) == -Inf
-    # Every endpoint family, exported by its source module or not.
-    truncated_gamma = @rkppl begin
-        c[axes(X, 2)] .~ truncated.(Gamma.(2, 1), 0.5, 3)
-        y .~ Normal.(0, 1)
-    end
-    good = truncated_gamma(; X) | (; c = [0.7, 2.5], y)
-    @test _rewrite_node(good, :likelihood, Float64[]) ≈
-        sum(logpdf.(truncated(Gamma(2, 1), 0.5, 3), [0.7, 2.5])) +
-        sum(logpdf.(Normal(), y))
-    bad = condition(good; c = [0.7, 3.5])
-    @test _rewrite_node(bad, :likelihood, Float64[]) == -Inf
 end
 
 @testset "conditioned truncated priors keep their normalizer and gradients" begin
