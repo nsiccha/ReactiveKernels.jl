@@ -79,6 +79,57 @@ end
     return total
 end
 
+# A function-shaped child under an arm is inlined as source in that arm
+# (native reverse needs no runtime child preparation); the compiled program
+# keeps the arm lazy and does not grow with the lane count.
+@kernel arm_softplus(z) = begin
+    value = if z > 0.0
+        z + log1p(exp(-z))
+    else
+        log1p(exp(z))
+    end
+    return value
+end
+
+@kernel child_arm_cells(x::Vector{Float64}) = begin
+    pointwise = plate(x) do xi
+        cell = if xi > 0.0
+            arm_softplus(xi)
+        elseif xi < 0.0
+            -arm_softplus(-xi)
+        else
+            0.0
+        end
+        cell
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
+# A child holding a scan or plate is prepared once and applied in the arm;
+# traced arguments reach its own tensorized product.
+@kernel arm_cumulative(xs, gain) = begin
+    updates = scan(xs, Ref(gain); init = 0.0) do carry, x, g
+        next = carry + x * g
+        (next, next)
+    end
+    total = sum(updates)
+    return total
+end
+
+@kernel arm_scaled_sum(xs, gain) = begin
+    cells = plate(xs, Ref(gain)) do x, g
+        x * g + log1p(exp(x * g))
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel region_child_arms(xs::Vector{Float64}, gain::Float64) = begin
+    v::Float64 = gain > 0.0 ? arm_cumulative(xs, gain) + arm_scaled_sum(xs, gain) : 0.0
+    return v
+end
+
 _traced(v) = v isa AbstractArray ? Reactant.to_rarray(v) :
              Reactant.to_rarray(v; track_numbers = true)
 _host(v) = v isa Reactant.AbstractConcreteArray ? Array(v) : Reactant.to_number(v)
@@ -285,4 +336,39 @@ end
         cg = Reactant.@compile gradient(rx, rs)
         @test _host(cg(rx, rs)) ≈ 3.0
     end
+end
+
+@testset "a function-shaped child under a plate arm compiles lazily" begin
+    k = prepare(child_arm_cells; want = :total)
+    @test !occursin("arm_softplus(", sprint(show, readable_code(k)))
+    x = [2.0, -1.0, 0.5, 0.0, -3.0]
+    hlo = repr(Reactant.@code_hlo optimize = false k(_traced(x)))
+    @test occursin("stablehlo.if", hlo)
+    compiled = Reactant.@compile k(_traced(x))
+    @test _host(compiled(_traced(x))) ≈ k(x)
+    logistic(z) = inv(1 + exp(-z))
+    gradient(v) = Enzyme.gradient(Enzyme.Reverse, k, v)
+    compiled_gradient = Reactant.@compile gradient(_traced(x))
+    @test _host(only(compiled_gradient(_traced(x)))) ≈
+          [xi > 0 ? logistic(xi) : xi < 0 ? logistic(-xi) : 0.0 for xi in x]
+    sizes = [count("\n", repr(Reactant.@code_hlo optimize = false k(
+        _traced(collect(range(-1.0, 1.0; length = n)))))) for n in (8, 32)]
+    @test sizes[1] == sizes[2]
+end
+
+@testset "plate- and scan-bearing children under an arm compile through their own lowering" begin
+    k = prepare(region_child_arms; want = :v)
+    xs = [1.0, 2.0, 0.5]
+    logistic(z) = inv(1 + exp(-z))
+    expected(g) = g * sum(cumsum(xs)) + sum(x * g + log1p(exp(x * g)) for x in xs)
+    dexpected(g) = sum(cumsum(xs)) + sum(x * (1 + logistic(x * g)) for x in xs)
+    compiled = Reactant.@compile k(_traced(xs), _traced(0.5))
+    for g in (0.5, 1.3)
+        @test _host(compiled(_traced(xs), _traced(g))) ≈ expected(g)
+    end
+    @test _host(compiled(_traced(xs), _traced(-0.5))) == 0.0
+    gradient(x, g) = Enzyme.gradient(Enzyme.Reverse, Enzyme.Const(k), Enzyme.Const(x), g)
+    compiled_gradient = Reactant.@compile gradient(_traced(xs), _traced(0.5))
+    @test _host(last(compiled_gradient(_traced(xs), _traced(0.5)))) ≈ dexpected(0.5)
+    @test _host(last(compiled_gradient(_traced(xs), _traced(-0.5)))) == 0.0
 end

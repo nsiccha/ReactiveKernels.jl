@@ -1442,6 +1442,47 @@ function _kernel_called_spec(ex, mod, locals, nested_specs)
     spec isa KernelSpec ? spec : nothing
 end
 
+# How a resolved graph call that the splicer will not reach is lowered.
+# `:inline` renders the child's planned recipes as source through
+# `_kernel_inline_endpoint_call`: a positional-only child applied to its whole
+# default HAVE boundary with one output, whose recipes are all authored source
+# without a plate or scan region. `:prepared` applies the child as before but
+# prepares it once, when the caller is defined (`_KernelPreparedChild`).
+# `nothing` keeps the runtime `KernelSpec` application: a generated endpoint,
+# keyword or splatted arguments, or `child()`, which is a graph view.
+function _kernel_unspliced_call_lowering(call::Expr, spec::KernelSpec,
+                                         nested_specs)
+    callee = call.args[1]
+    callee isa Symbol && haskey(nested_specs, callee) && return nothing
+    signature = spec.call_signature
+    signature isa _KernelEndpointCallSignature && return nothing
+    args = call.args[2:end]
+    isempty(args) && return nothing
+    any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :(...)), args) &&
+        return nothing
+    inlinable = _kernel_inline_signature_supported(signature) &&
+        length(args) == length(inputs(spec)) && length(outputs(spec)) == 1 &&
+        all(plan(spec).recipes) do r
+            !(r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp}) &&
+                r.source !== _NO_KERNEL_SOURCE
+        end
+    inlinable ? :inline : :prepared
+end
+
+# A child kernel prepared once when its caller is defined and applied where
+# the splicer cannot reach (a lazy arm or a closure), in place of the runtime
+# `(spec::KernelSpec)(args...)` that prepares it on every call. `name` is the
+# authored callee, shown by `readable_code`.
+struct _KernelPreparedChild{K}
+    name::Symbol
+    kernel::K
+end
+@inline (child::_KernelPreparedChild)(args...) = child.kernel(args...)
+
+_kernel_inline_callee_name(callee::Symbol) = callee
+_kernel_inline_callee_name(callee::GlobalRef) = callee.name
+_kernel_inline_callee_name(callee) = Symbol(string(callee))
+
 # Object endpoint extraction reconstructs and merges the object's frozen graph.
 # A generated model commonly uses the same distribution endpoint in many plate
 # bodies, so keep those read-only source views local to one macro expansion.
@@ -1750,6 +1791,24 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             rewritten[i] = argument_port
         end
         rewritten_ex = Expr(ex.head, rewritten...)
+    elseif spec !== nothing &&
+           (lowering = _kernel_unspliced_call_lowering(
+                rewritten_ex, spec, nested_specs)) !== nothing
+        # The splicer cannot reach a lazy arm or a deferred lexical scope, so
+        # the call would stay a runtime `(spec::KernelSpec)(args...)`, which
+        # plans and prepares the child on every evaluation; inside a
+        # differentiated kernel that planning reaches Enzyme. Render the
+        # child's planned recipes as source at the call position instead, as
+        # for an object endpoint under an arm: the arm still evaluates the
+        # child only when taken, and the backend differentiates its math.
+        # A child holding a plate or scan region is prepared once here and
+        # applied in place, so it keeps its own native and traced lowering.
+        name = _kernel_inline_callee_name(rewritten_ex.args[1])
+        rewritten_ex = lowering === :inline ?
+            _kernel_inline_endpoint_call(
+                spec, name, Any[rewritten_ex.args[2:end]...], context) :
+            Expr(:call, QuoteNode(_KernelPreparedChild(name, prepare(spec))),
+                 rewritten_ex.args[2:end]...)
     end
     inferred = if ex.head === :block
         index = findlast(i -> !_kernel_is_line(ex.args[i]), eachindex(ex.args))
