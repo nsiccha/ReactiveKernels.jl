@@ -59,7 +59,18 @@ _vl_probe(built) = [0.27 * sin(1.3i) for i in 1:built.layout.total]
             y[i] ~ Normal(c, 1.0)
         end
     end, (; y, c = 0.3); conditioned = (; y, c = 0.3))
-    @test _plans_equal(dot, plate)
+    # The loop keeps its authored indices (explicit-index observations,
+    # `85e2f5a1`); apart from that selection the plans agree, and both bind
+    # to the same density.
+    @test only(plate.responses).range == :(y[eachindex(y)])
+    @test plate.indexed_observations == Set([:y])
+    @test _plans_equal(dot, ReactiveKernelsPPL._with(plate; responses =
+        [ReactiveKernelsPPL._with(r; range = nothing) for r in plate.responses]))
+    for twin in (dot, plate)
+        b = bind_data(twin, (; y, c = 0.3))
+        @test _query(build_kernel(b).spec, b, :likelihood, Float64[]) ≈
+            sum(D.logpdf.(D.Normal(0.3, 1), y))
+    end
     model = @rkppl begin
         m ~ Normal(0, 1)
         y .~ Normal.(m, 1.0)
