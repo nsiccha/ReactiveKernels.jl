@@ -136,13 +136,20 @@ end
 # has no zero, so `_PlateTotalSeed` holds the place and the first cell starts
 # the total, which is `sum`'s value for a nonempty plate. An empty plate still
 # needs a zero without any cell: the seed carries the fallback element type `F`
-# (the axis marker's, or a scan consumer's output type), whose zero the total
-# then takes, and a non-numeric `F` asks for the cell type to be declared.
+# (the axis marker's element type, or a scan consumer's output type), whose
+# zero the total then takes, and a non-numeric `F` asks for the cell type to be
+# declared. The fallback is passed as the marker itself (or the type) and its
+# element type is taken only for a non-concrete `T`: an unconditional
+# `eltype(marker)` in the lowered code is a runtime call under native Enzyme
+# when the marker is not an array (Julia 1.12 fails to compile it).
 struct _PlateTotalSeed{F} end
 
-@inline _plate_total_seed(::Type{T}, ::Type{F}) where {T<:Number,F} = zero(T)
-@inline _plate_total_seed(::Type{T}, ::Type{F}) where {T,F} =
-    isconcretetype(T) ? zero(T) : _PlateTotalSeed{F}()
+@inline _plate_fallback_eltype(::Type{F}) where {F} = F
+@inline _plate_fallback_eltype(marker) = eltype(marker)
+
+@inline _plate_total_seed(::Type{T}, fallback) where {T<:Number} = zero(T)
+@inline _plate_total_seed(::Type{T}, fallback) where {T} =
+    isconcretetype(T) ? zero(T) : _PlateTotalSeed{_plate_fallback_eltype(fallback)}()
 
 @inline _plate_total_add(total, cell) = total + cell
 @inline _plate_total_add(::_PlateTotalSeed, cell) = cell
@@ -1110,18 +1117,35 @@ function _plate_reduction_plan(inner::Plan, inner_kernel, dependencies,
         end
     end
     recipe_index === nothing && return nothing
-    op = inner_kernel.ops[recipe_index]
-    op isa _KernelSourceOp && op.f isa _KernelReduction || return nothing
     recipe = inner.recipes[recipe_index]
     roots = dynamic(want)
     isempty(roots) && return nothing
+    _plate_reduction_kind(inner_kernel.ops[recipe_index], recipe, recipe_index,
+                          roots, input -> dynamic(canon_id(graph, input.id)))
+end
+
+# Which fold-outer lowering the plate's value recipe admits, from its
+# operation, or `nothing`. `dynamic(input)` names the plate roots an input
+# varies with; the fold's iterator and coefficients must vary with none.
+_plate_reduction_kind(op, recipe, recipe_index, roots, dynamic) = nothing
+function _plate_reduction_kind(op::_KernelSourceOp, recipe, recipe_index, roots,
+                               dynamic)
+    op.f isa _KernelReduction || return nothing
     II, XI, KI, AI = typeof(op.f).parameters
     for position in (II..., AI...)
-        isempty(dynamic(canon_id(graph, recipe.inputs[position].id))) ||
-            return nothing
+        isempty(dynamic(recipe.inputs[position])) || return nothing
     end
-    (; recipe_index, recipe, roots, iterator = II, init = XI, index = KI,
-       source = AI)
+    (; kind = Val(:gather), recipe_index, recipe, roots, iterator = II,
+       init = XI, index = KI, source = AI)
+end
+# A cell that is exactly Base's `evalpoly(x, c)` (an authored `evalpoly(x, c)`
+# over two ports is stored as the bare function, inputs in argument order)
+# with coefficients `c` shared by every cell.
+function _plate_reduction_kind(::typeof(evalpoly), recipe, recipe_index, roots,
+                               dynamic)
+    length(recipe.inputs) == 2 || return nothing
+    isempty(dynamic(recipe.inputs[2])) || return nothing
+    (; kind = Val(:evalpoly), recipe_index, recipe, roots)
 end
 
 # Fill a recycled lane buffer (`_lane_reuse`) instead of evaluating
@@ -1145,7 +1169,8 @@ function _inbounds_value(ex)
          Expr(:inbounds, :pop), value)
 end
 
-function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
+function _lower_plate_reduction_native(::Val{:gather}, reduction, inner::Plan,
+                                       locals, callargs,
                                        callvalues, raw_arguments, prepared_arguments,
                                        atomic, root_positions, plate_type_exprs, op_offset,
                                        plate_eltype, output_axes, pointwise_lhs,
@@ -1249,6 +1274,77 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
         push!(interchanged.args, every(:($accumulator =
             $(GlobalRef(@__MODULE__, :_plate_total_add))(
                 $accumulator, $(_inbounds_value(entry))))))
+    end
+    Expr(:if, ready, interchanged, cell_loop)
+end
+
+# Coefficient-outer lowering of an `evalpoly(x, c)` cell over coefficients
+# shared by every cell. Per cell, Base's `evalpoly(x, c::AbstractVector)` is a
+# runtime Horner loop, `ex = c[end]`, then `ex = muladd(x, ex, c[i])` for
+# `i = length(c)-1:-1:1`: a chain of dependent multiply-adds that cannot run
+# across cells. Here the cells of one tile take the seed, then each
+# coefficient in turn: one contiguous pass `acc = muladd(x, acc, c[i])` over
+# the tile per coefficient, which vectorizes across cells. Every cell performs
+# Base's operations in Base's order. The tile (`_PLATE_FOLD_TILE` cells) keeps
+# the accumulators and the cell's `x` in cache across the coefficient passes.
+# The types are checked when the body is compiled (`_plate_evalpoly_ready`);
+# coefficients with offset axes, which Base's `evalpoly` rejects, and domains
+# with more than one axis keep the cell loop.
+function _lower_plate_reduction_native(::Val{:evalpoly}, reduction, inner::Plan,
+                                       locals, callargs, callvalues, raw_arguments,
+                                       prepared_arguments, atomic, root_positions,
+                                       plate_type_exprs, op_offset, plate_eltype,
+                                       output_axes, pointwise_lhs, accumulator,
+                                       cell_loop)
+    graph = inner.graph
+    x_input, c_input = reduction.recipe.inputs
+    argument(input, cell) = _authored_plate_scalar_ref(
+        inner, locals, callargs, callvalues, prepared_arguments, atomic,
+        input, cell, true)
+    type_of(input) = let cid = canon_id(graph, input.id)
+        haskey(root_positions, cid) ? plate_type_exprs[cid] :
+            Expr(:call, GlobalRef(Base, :typeof), locals[cid])
+    end
+    coefficients = argument(c_input, nothing)
+    ready = Expr(:&&,
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_evalpoly_ready), plate_eltype,
+             type_of(x_input), type_of(c_input), output_axes),
+        Expr(:call, GlobalRef(Base, :!),
+             Expr(:call, GlobalRef(Base, :has_offset_axes), coefficients)))
+    if !_authored_plate_unconditional_group(
+            reduction.roots, root_positions, atomic, callvalues)
+        ready = Expr(:&&, _authored_plate_runtime_unconditional(
+            callargs, reduction.roots, root_positions, atomic), ready)
+    end
+    c, cells, count, lo, hi, position, cell, seed, j, cj = gensym.((
+        :plate_coefficients, :plate_cells, :plate_count, :plate_tile_lo,
+        :plate_tile_hi, :plate_position, :plate_cell, :plate_seed,
+        :plate_coefficient_index, :plate_coefficient))
+    entry = :($pointwise_lhs[$cell])
+    x = argument(x_input, cell)
+    base(name) = GlobalRef(Base, name)
+    tile_cells(body) = Expr(:for, :($position = $lo:$hi),
+        Expr(:block, :($cell = $(_inbounds_value(:($cells[$position])))), body))
+    interchanged = quote
+        $c = $coefficients
+        $cells = $(base(:CartesianIndices))($output_axes)
+        $count = $(base(:length))($cells)
+        for $lo in 1:$(GlobalRef(@__MODULE__, :_PLATE_FOLD_TILE)):$count
+            $hi = $(base(:min))($lo + $(GlobalRef(@__MODULE__, :_PLATE_FOLD_TILE)) - 1, $count)
+            $seed = $c[$(base(:lastindex))($c)]
+            $(tile_cells(_inbounds_expr(:($entry = $seed))))
+            for $j in ($(base(:length))($c) - 1):-1:1
+                $cj = $c[$j]
+                $(tile_cells(_inbounds_expr(:($entry = $(base(:muladd))($x, $entry, $cj)))))
+            end
+        end
+    end
+    if accumulator !== nothing
+        # The total adds the cells in coordinate order, as the cell loop does.
+        push!(interchanged.args, Expr(:for, :($position = 1:$count), Expr(:block,
+            :($cell = $(_inbounds_value(:($cells[$position])))),
+            :($accumulator = $(GlobalRef(@__MODULE__, :_plate_total_add))(
+                $accumulator, $(_inbounds_value(entry)))))))
     end
     Expr(:if, ready, interchanged, cell_loop)
 end
@@ -1411,7 +1507,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
         pointwise_lhs, total_lhs; recycled = nothing,
-        input_type_hints = nothing)
+        input_type_hints = nothing, element_type = nothing)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -1637,7 +1733,11 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
             GlobalRef(Core, :Any)) : nested.type
     inferred_eltype = only(_bind_native_type_exprs!(body, [inferred_eltype]))
-    push!(body.args, Expr(:(=), plate_eltype,
+    # A caller that already fixes the element type (the non-allocating step of
+    # a declared `Array{T}` plate output, whose cache is an `Array{T}`) passes
+    # it as `element_type`: each cell then converts on store, as the declared
+    # typed local converts the whole result in the ordinary native kernel.
+    push!(body.args, Expr(:(=), plate_eltype, element_type !== nothing ? element_type :
         Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
              inferred_eltype, valtype(only(inner.want)))))
     groups = _authored_plate_recipe_groups(
@@ -1689,7 +1789,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         # `zero(eltype(marker))`.
         push!(body.args, Expr(:(=), accumulator,
             Expr(:call, GlobalRef(@__MODULE__, :_plate_total_seed),
-                 plate_eltype, Expr(:call, GlobalRef(Base, :eltype), marker))))
+                 plate_eltype, marker)))
     end
 
     loopbody = Expr(:block)
@@ -1766,7 +1866,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     if reduction === nothing
         push!(body.args, cell_loop)
     else
-        push!(body.args, _lower_plate_reduction_native(
+        push!(body.args, _lower_plate_reduction_native(reduction.kind,
             reduction, inner, locals, callargs, callvalues, raw_arguments,
             prepared_arguments, atomic, root_positions, plate_type_exprs, op_offset, plate_eltype,
             output_axes, pointwise_lhs, accumulator, cell_loop))

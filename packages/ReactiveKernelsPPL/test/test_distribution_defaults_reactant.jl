@@ -1,19 +1,10 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Reactant
 import SpecialFunctions
 
-# The native defaults file supplies cases and independent Distributions oracles.
+# The native defaults file supplies cases, independent Distributions oracles
+# and the native reverse checks (`_defaults_native_reverse`).
 function _defaults_backends(built, bound, kernel, u, expected; structure_body = false)
-    sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
-    value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
-    @test value ≈ expected atol=1e-10 rtol=1e-10
-    finite = similar(u)
-    for i in eachindex(u)
-        up, down = copy(u), copy(u)
-        up[i] += 1e-5
-        down[i] -= 1e-5
-        finite[i] = (kernel(up) - kernel(down)) / 2e-5
-    end
-    @test grad ≈ finite atol=1e-7 rtol=1e-6
+    sampler, value, grad = _defaults_native_reverse(built, bound, kernel, u, expected)
     ru = Reactant.to_rarray(u)
     hlo = repr(Reactant.@code_hlo optimize=false kernel(ru))
     compiled = Reactant.@compile kernel(ru)

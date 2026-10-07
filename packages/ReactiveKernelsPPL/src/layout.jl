@@ -628,15 +628,16 @@ end
     lkj_chol_constrain(u, K) -> Matrix
 
 Host-side LKJ Cholesky-factor transform: Stan's partial-correlation
-C-vine VERBATIM (user direction — follow Stan where possible; the
+C-vine (user direction — follow Stan where possible; the
 hyperspherical form survives as `lkj_chol_constrain_hyperspherical`).
 Packed column-block order `for j in 2:K, i in 1:(j-1)` (Stan's
 unconstrained order): `z[i,j] = tanh(u)`, upper factor
-`w[1,j] = z[1,j]`, `w[i,j] = z[i,j]*Π_{ip<i}√(1-z[ip,j]²)`,
-`w[i,i] = Π_{ip<i}√(1-z[ip,i]²)`, `L = w'`. The in-graph twin unrolls
-the identical scalar chain (left-assoc products, explicit loops —
-NOT `prod`, whose association is not left-assoc), so host and graph
-agree bit-for-bit. K=1 constrains `[]` to `[1.0]`.
+`w[i,j] = z[i,j]*d[i-1,j]` and `w[j,j] = d[j-1,j]`, where the running
+product `d[i,j] = d[i-1,j]*√(1-z[i,j]²)` starts at `d[0,j] = 1`, and
+`L = w'`. Like Stan's running sum of squares, each column costs one
+square root per partial. The in-graph twins carry the identical
+left-associated running product, so host and graph agree bit-for-bit.
+K=1 constrains `[]` to `[1.0]`.
 """
 function lkj_chol_constrain(u::AbstractVector{<:Real}, K::Int)
     K >= 1 || throw(ContractValidationError(
@@ -653,21 +654,12 @@ function lkj_chol_constrain(u::AbstractVector{<:Real}, K::Int)
     w = zeros(T, K, K)
     w[1, 1] = one(T)
     for j in 2:K
-        w[1, j] = z[1, j]
-    end
-    for i in 2:K
-        for j in (i + 1):K
-            v = z[i, j]
-            for ip in 1:(i - 1)
-                v *= sqrt(1 - z[ip, j]^2)
-            end
-            w[i, j] = v
-        end
         d = one(T)
-        for ip in 1:(i - 1)
-            d *= sqrt(1 - z[ip, i]^2)
+        for i in 1:(j - 1)
+            w[i, j] = z[i, j] * d
+            d *= sqrt(1 - z[i, j]^2)
         end
-        w[i, i] = d
+        w[j, j] = d
     end
     return Matrix(w')
 end
@@ -1729,11 +1721,12 @@ end
 # All `_ppl_`-hygienic.
 _rl_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rl_, L, :_, i, :_, j)
 _rzb_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rzb_, L, :_, i, :_, j)
+_rd_name(L::Symbol, i::Int, j::Int) = Symbol(:_ppl_rd_, L, :_, i, :_, j)
 
 # LKJ Cholesky edges: scalar-unrolled twin of the host vine
 # `lkj_chol_constrain` (IDENTICAL scalar ops in the IDENTICAL order —
-# `tanh`/`sqrt` calls, `^2`, left-assoc products — so in-graph and
-# host agree bit-for-bit). No matrix ever materializes: the effect
+# `tanh`/`sqrt` calls, `^2`, the left-associated running product — so
+# in-graph and host agree bit-for-bit). No matrix ever materializes: the effect
 # reads the `_ppl_rl_` scalars directly (fully transparent to the
 # planner and the reverse pass — no new Enzyme surface). The `_ppl_rzb_`
 # partial temps are shared with the log-Jacobian twin. K=1 emits its
@@ -1762,25 +1755,17 @@ function _lkj_vine_statements(L::Symbol, K::Int, coord; stacked::Bool = false)
         z = _rzb_name(L, i, j)
         push!(stmts, :($z::$T = $(call(:tanh, coord(p)))))
     end
-    # L[j,1] = z[1,j]; L[j,i] = z[i,j]*Π√(1-z²); L[i,i] = Π√(1-z²).
+    # Row j: L[j,1] = z[1,j], L[j,i] = z[i,j]*d[i-1,j], L[j,j] = d[j-1,j],
+    # with the running product d[i,j] = d[i-1,j]*√(1-z[i,j]²) from 1.0.
     for j in 2:K
-        push!(stmts, :($(_rl_name(L, j, 1))::$T = $(_rzb_name(L, 1, j))))
-    end
-    for i in 2:K
-        for j in (i + 1):K
-            factors = Any[_rzb_name(L, i, j)]
-            for ip in 1:(i - 1)
-                push!(factors, comp(_rzb_name(L, ip, j)))
-            end
-            prod = foldl(mul, factors)
-            push!(stmts, :($(_rl_name(L, j, i))::$T = $prod))
+        d = 1.0
+        for i in 1:(j - 1)
+            z = _rzb_name(L, i, j)
+            push!(stmts, :($(_rl_name(L, j, i))::$T = $(i == 1 ? z : mul(z, d))))
+            next = i == j - 1 ? _rl_name(L, j, j) : _rd_name(L, i, j)
+            push!(stmts, :($next::$T = $(mul(d, comp(z)))))
+            d = next
         end
-        dfactors = Any[1.0]
-        for ip in 1:(i - 1)
-            push!(dfactors, comp(_rzb_name(L, ip, i)))
-        end
-        dprod = foldl(mul, dfactors)
-        push!(stmts, :($(_rl_name(L, i, i))::$T = $dprod))
     end
     return stmts
 end

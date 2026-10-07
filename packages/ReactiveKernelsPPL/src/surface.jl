@@ -1113,7 +1113,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             "definition `$nm = $(repr(rhs))`")
     end
     declaration_dependencies = _declaration_dependencies(sample, plate_specs,
-        data, canonmap)
+        union(data, derived_response_names), canonmap)
     declaration_data = Set{Symbol}(nm for nm in declaration_dependencies
         if haskey(canonmap, nm) && _data_only(canonmap[nm], data, canonmap))
     # Design matrices leave `det` for the plan-level table (validated
@@ -2472,11 +2472,13 @@ end
 
 # Declarations keep named dimensions, prior arguments and support bounds.
 # Follow their definitions before predictor inlining, so shared data values
-# still bind once and are consumed by name everywhere else.
-function _declaration_dependencies(sample, plate_specs, data, detmap)
+# still bind once and are consumed by name everywhere else. `observed` holds
+# the data and derived-response names: their statements are observations
+# whose locations lower as predictors, not declarations.
+function _declaration_dependencies(sample, plate_specs, observed, detmap)
     needed = Set{Symbol}()
     for s in sample
-        s.lhs in data && continue
+        s.lhs in observed && continue
         for ex in (s.rhs, s.range, s.matrix)
             union!(needed, _value_symbols(ex))
         end

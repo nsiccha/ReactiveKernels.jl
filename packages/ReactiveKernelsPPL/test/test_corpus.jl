@@ -99,6 +99,8 @@ function _canon(io::IO, x, depth::Int = 0, names = nothing)
             (fs = filter(!=(:conditioned), fs))
         x isa StructuralPlan && isempty(x.external_observations) &&
             (fs = filter(!=(:external_observations), fs))
+        x isa StructuralPlan && isempty(x.cell_broadcasts) &&
+            (fs = filter(!=(:cell_broadcasts), fs))
         x isa VectorParameter && x.extent_expr === nothing &&
             (fs = filter(!=(:extent_expr), fs))
         # Canonical mathematical plans compare loop/broadcast spellings.
@@ -185,6 +187,21 @@ end
     other_trials = ReactiveKernelsPPL._with(response; mixture_trials = Any[2, 4])
     @test occursin("mixture_trials=[2 3]", sprint(_canon, trials))
     @test sprint(_canon, trials) != sprint(_canon, other_trials)
+end
+
+@testset "optional plan metadata serialization" begin
+    cell(rhs) = quote
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            $rhs
+        end
+    end
+    plain = lower_rkppl(cell(:(y[i] ~ Normal(x[i], sigma))), (:y, :x); conditioned = (:y,))
+    nested = lower_rkppl(cell(:(y[i] .~ Normal.(x[i], sigma))), (:y, :x); conditioned = (:y,))
+    @test isempty(plain.cell_broadcasts)
+    @test !occursin("cell_broadcasts=", sprint(_canon, plain))
+    @test !isempty(nested.cell_broadcasts)
+    @test occursin("cell_broadcasts={:y=>[:x]}", sprint(_canon, nested))
 end
 
 @testset "corpus private binder alpha equivalence" begin
