@@ -812,7 +812,7 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
     # Source RHSs use the original scalar formal names. Keep their original
     # recipe metadata in operation-table order so readable code binds those
     # names to the newly projected scalar arguments, including across chains.
-    kernel = PreparedKernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
         kernel.plan, kernel.ast,
         Tuple(readable_recipes[r.id] for r in scalar_plan.recipes))
     op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, Tuple(unique(checks)))
@@ -2994,6 +2994,20 @@ struct PreparedKernel{F,O,IN,OUT,RR}
     lowered_recipes::RR
 end
 
+# Nearly every preparation or rebinding assembles a `PreparedKernel` of a new
+# concrete type (its compiled body is new). Assemble it without compiling the
+# struct's constructor for that type; calls on the prepared kernel still
+# dispatch on its exact type.
+Base.@nospecializeinfer function _prepared_kernel(
+        @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
+        @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
+        @nospecialize(lowered_recipes::Tuple))
+    T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
+                       typeof(lowered_recipes)}
+    _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
+                             lowered_recipes))::PreparedKernel
+end
+
 # A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
 # carry output `Type`s as data (authoring.jl `_kernel_provenance_key`), and
 # ReactantCore's `::Type` `is_traced` early-out covers only the 1-arg call
@@ -3715,9 +3729,12 @@ end
     _prepared_call(k, args, Val(N))
 end
 
-function _prepare(p::Plan, ast::Expr, ops::Tuple, recipes::Tuple)
-    f = compile(ast)
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
+# The compiled body's type is new for every prepared kernel, so specializing
+# this assembly step on it would compile code that is never reused.
+Base.@nospecializeinfer function _prepare(p::Plan, ast::Expr,
+                                          @nospecialize(ops::Tuple),
+                                          @nospecialize(recipes::Tuple))
+    _prepared_kernel(compile(ast), ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
 end
 
 """
@@ -3743,8 +3760,8 @@ function _prepare_batched(p::Plan; batched, reduce = :+)
         input_index,batched_ports,reduce,typeof(native),typeof(tensorized)}(
             native, tensorized)
     ops = ntuple(i -> p.recipes[i].op, length(p.recipes))
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
-                   Tuple(p.recipes))
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
+                     Tuple(p.recipes))
 end
 
 # The optional MutatingFunctions extension uses one typed cache cell per
@@ -3927,7 +3944,7 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
             input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
                 native, tensorized, tensorized_ast)
     end
-    PreparedKernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
 end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (), on_error = nothing)

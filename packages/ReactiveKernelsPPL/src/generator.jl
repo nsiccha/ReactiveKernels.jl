@@ -25,12 +25,10 @@ with `have=(:unconstrained, data…)`); `layout` is its
 
 Concurrency: `build_kernel` is concurrency-safe. Independent plans may be
 built from concurrent tasks with no caller-side synchronization: a build
-binds nothing in a shared module and takes no package lock. Concurrent
-builds overlap in planning and Julia lowering, but most of a build is Julia
-compiling the generated construction code, which Julia 1.10 serializes
-process-wide (1.12 and 1.13: its type inference). Concurrent builds
-therefore gain little aggregate throughput over serial ones, and on 1.12
-contention on that lock can make them slower.
+binds nothing in a shared module and takes no package lock. Construction
+compiles little per-model code, so concurrent builds largely run in
+parallel; Julia serializes only the compilation that remains (1.10: all
+compilation; 1.12 and 1.13: type inference).
 
 The returned spec closes over build-time
 eval'd code. Construction resolves module bindings in a package-owned
@@ -281,15 +279,13 @@ import .._simplex_slices_constrain, .._simplex_slices_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 end
 
-# The stateless `@kernel name(...) = body` expands to `name = <KernelSpec>`.
-# Inside a `let` that assignment is local, so the eval's value is the spec and
-# nothing is bound in `PPLGeneratedModels`: concurrent builds share no
-# package state (no lock, no counter) and a built spec is retained only by
-# its caller.
-function _eval_kernel_def(def::Expr)
-    call = Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator), def)
-    return Core.eval(PPLGeneratedModels, Expr(:let, Expr(:block), call))
-end
+# Evaluate the generated `@kernel` definition and return its spec. Nothing is
+# bound in `PPLGeneratedModels`: concurrent builds share no package state (no
+# lock, no counter) and a built spec is retained only by its caller. RK
+# evaluates the recipe closures separately so construction compiles no
+# per-model code (`ReactiveKernels._kernel_eval_definition`).
+_eval_kernel_def(def::Expr) =
+    ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def)
 
 # Scalar + derived assignments in topo order (params already constrained
 # above, so every scalar name resolves; derived columns resolve as locals

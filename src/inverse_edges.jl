@@ -55,14 +55,14 @@ function _kernel_synthesize_recipe_edges!(graph::Graph, recipe::Recipe)
     out_id = canon_id(graph, forward_input.id)
     _kernel_has_equivalent_recipe(graph, in_id, out_id, reversed_op) &&
         return nothing
-    add!(graph; inputs = (forward_output,), outputs = (forward_input,),
-         op = reversed_op, cost = recipe.cost,
-         source = _kernel_inverse_source(reversed_op, forward_output.name))
+    _add_recipe!(graph, (forward_output,), (forward_input,), reversed_op,
+         recipe.cost, nothing, false,
+         _kernel_inverse_source(reversed_op, forward_output.name))
     nothing
 end
 
-function _kernel_has_equivalent_recipe(
-        graph::Graph, input_id::Int, output_id::Int, op)
+Base.@nospecializeinfer function _kernel_has_equivalent_recipe(
+        graph::Graph, input_id::Int, output_id::Int, @nospecialize(op))
     for candidate in graph.recipes
         length(candidate.inputs) == 1 || continue
         canon_id(graph, only(candidate.inputs).id) == input_id || continue
@@ -192,8 +192,8 @@ function _kernel_synthesize_pack_edges!(graph::Graph, recipe::Recipe)
             graph, packed_id, canon_id(graph, target.id), op) && continue
         source = kind === :named ? Expr(:., packed.name, QuoteNode(key)) :
                  Expr(:ref, packed.name, key)
-        add!(graph; inputs = (packed,), outputs = (target,),
-             op = op, cost = recipe.cost, source = source)
+        _add_recipe!(graph, (packed,), (target,), op, recipe.cost,
+             nothing, false, source)
     end
     true
 end

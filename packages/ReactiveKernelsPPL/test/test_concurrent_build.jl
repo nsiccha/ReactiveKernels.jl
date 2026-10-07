@@ -127,3 +127,40 @@ end
     end
     @test length(Set(oid for (_, oid) in results)) == length(results)
 end
+
+# Concurrency progress: concurrent builds must not serialize each other. A
+# build takes no package lock, and construction compiles little per-model
+# code, because Julia 1.10-1.13 serialize compilation process-wide (1.12/1.13:
+# type inference). Before both held, eight concurrent builds took as long as
+# eight serial ones.
+include("concurrent_progress.jl")
+
+@testset "concurrent build: construction compiles little per model" begin
+    build_kernel(_ccb_wide(6, 0))   # compile this shape's construction path
+    Base.cumulative_compile_timing(true)
+    compile0 = Base.cumulative_compile_time_ns()[1]
+    start = time_ns()
+    build_kernel(_ccb_wide(6, 1))
+    wall = time_ns() - start
+    compile = Base.cumulative_compile_time_ns()[1] - compile0
+    Base.cumulative_compile_timing(false)
+    # Measured 0.20-0.35 on Julia 1.10.12 and 1.12.7; about 0.95 before
+    # construction stopped compiling per-model code.
+    @test compile < 0.6 * wall
+end
+
+@testset "concurrent build: independent builds overlap" begin
+    # Tasks interleave only on several threads; on one thread, measure in a
+    # two-thread child process.
+    ratio = if Threads.nthreads() >= 2
+        _ccb_progress()
+    else
+        fixture = "include($(repr(joinpath(@__DIR__, "concurrent_progress.jl")))); " *
+                  "print(_ccb_progress())"
+        parse(Float64, read(`$(Base.julia_cmd()) --startup-file=no --threads=2
+                             --project=$(Base.active_project()) -e $fixture`, String))
+    end
+    # Measured on two threads: 0.69-0.73 on Julia 1.10.12 and 0.48-0.51 on 1.12.7;
+    # with a lock around construction, 0.99-1.0 and 0.90.
+    @test ratio < 0.8
+end
