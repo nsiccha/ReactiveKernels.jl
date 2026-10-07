@@ -1442,6 +1442,33 @@ function _kernel_called_spec(ex, mod, locals, nested_specs)
     spec isa KernelSpec ? spec : nothing
 end
 
+# Whether a resolved graph call that the splicer will not reach can be inlined
+# as source by `_kernel_inline_endpoint_call`: a module-bound positional-only
+# child applied to its whole default HAVE boundary with one output, whose
+# planned recipes are all authored source without a plate or scan region.
+# Other calls keep their runtime `KernelSpec` application.
+function _kernel_unspliced_call_inlinable(call::Expr, spec::KernelSpec,
+                                          nested_specs)
+    callee = call.args[1]
+    callee isa Symbol && haskey(nested_specs, callee) && return false
+    signature = spec.call_signature
+    signature isa _KernelEndpointCallSignature && return false
+    _kernel_inline_signature_supported(signature) || return false
+    args = call.args[2:end]
+    any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :(...)), args) &&
+        return false
+    length(args) == length(inputs(spec)) && length(outputs(spec)) == 1 ||
+        return false
+    all(plan(spec).recipes) do r
+        !(r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp}) &&
+            r.source !== _NO_KERNEL_SOURCE
+    end
+end
+
+_kernel_inline_callee_name(callee::Symbol) = callee
+_kernel_inline_callee_name(callee::GlobalRef) = callee.name
+_kernel_inline_callee_name(callee) = Symbol(string(callee))
+
 # Object endpoint extraction reconstructs and merges the object's frozen graph.
 # A generated model commonly uses the same distribution endpoint in many plate
 # bodies, so keep those read-only source views local to one macro expansion.
@@ -1750,6 +1777,18 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             rewritten[i] = argument_port
         end
         rewritten_ex = Expr(ex.head, rewritten...)
+    elseif spec !== nothing &&
+           _kernel_unspliced_call_inlinable(rewritten_ex, spec, nested_specs)
+        # The splicer cannot reach a lazy arm or a deferred lexical scope, so
+        # the call would stay a runtime `(spec::KernelSpec)(args...)`, which
+        # plans and prepares the child on every evaluation; inside a
+        # differentiated kernel that planning reaches Enzyme. Render the
+        # child's planned recipes as source at the call position instead, as
+        # for an object endpoint under an arm: the arm still evaluates the
+        # child only when taken, and the backend differentiates its math.
+        rewritten_ex = _kernel_inline_endpoint_call(
+            spec, _kernel_inline_callee_name(rewritten_ex.args[1]),
+            Any[rewritten_ex.args[2:end]...], context)
     end
     inferred = if ex.head === :block
         index = findlast(i -> !_kernel_is_line(ex.args[i]), eachindex(ex.args))
