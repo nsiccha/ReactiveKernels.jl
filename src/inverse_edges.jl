@@ -45,8 +45,13 @@ function _kernel_synthesize_recipe_edges!(graph::Graph, recipe::Recipe)
     forward_output = only(recipe.outputs)
     canon_id(graph, forward_input.id) == canon_id(graph, forward_output.id) &&
         return nothing
+    identity = _kernel_operation_identity(recipe)
+    # Compiler-owned operations have no `inverse` method, so asking would only
+    # compile InverseFunctions' fallback for each new operation type.
+    identity isa Union{_KernelSourceOp,_AuthoredPlateOp,_AuthoredScanOp} &&
+        return nothing
     reversed_op = try
-        inverse(_kernel_operation_identity(recipe))
+        inverse(identity)
     catch
         return nothing
     end

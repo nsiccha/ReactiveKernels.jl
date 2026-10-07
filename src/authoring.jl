@@ -388,8 +388,8 @@ end
 # conversion (`b::T = a::U`, T≠U) is uncertain, so the ordinary identity Recipe is kept instead.
 # The caller hard-aliases only outputs with EXACTLY ONE authored definition (`b=a; b=c` are
 # alternative producers, not a proof `a===c`).
-function _kernel_alias!(graph::Graph, from::Value, to::Value, op, cost,
-                        source = _NO_KERNEL_SOURCE)
+function _kernel_alias!(graph::Graph, from::Value, to::Value, @nospecialize(op), cost,
+                        @nospecialize(source = _NO_KERNEL_SOURCE))
     src = canon_id(graph, from.id)
     dst = canon_id(graph, to.id)
     src == dst && return graph                       # already one class (reverse/transitive)
@@ -1686,9 +1686,12 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     generated = gensym(Symbol(endpoint_name, :_endpoint))
                     retargeted = _kernel_endpoint_call_signature(
                         Val(Tuple(owner_ports)), Val(explicit))
-                    nested_specs[generated] = KernelSpec(
-                        endpoint.graph, endpoint.ports, endpoint.port_order,
-                        endpoint.have_names, endpoint.want_names, retargeted)
+                    # The retargeted signature type is new for every endpoint
+                    # view; allocate the spec without compiling a constructor.
+                    nested_specs[generated] = _kernel_new_instance(
+                        KernelSpec{typeof(retargeted)},
+                        (endpoint.graph, endpoint.ports, endpoint.port_order,
+                         endpoint.have_names, endpoint.want_names, retargeted))::KernelSpec
                     return Expr(:call, generated, endpoint_ports...),
                            valtype(only(outputs(endpoint)))
                 end
@@ -4205,14 +4208,18 @@ function _kernel_eval_definition(mod::Module, definition::Expr)
 end
 
 # Zero-argument closures invoked in place: `_kernel_expand`'s recipe groups.
-_kernel_is_group_call(ex) =
+_kernel_is_group_call(@nospecialize(ex)) =
     ex isa Expr && ex.head === :call && length(ex.args) == 1 &&
     ex.args[1] isa Expr && ex.args[1].head === :-> &&
     ex.args[1].args[1] == Expr(:tuple)
 
+# The expansion embeds values of new types (nested specs, operations), so these
+# walkers take every node unspecialized and loop instead of mapping closures,
+# which would compile once per embedded value type.
+
 # Names the construction code itself assigns (its gensym'd graph-building
 # locals), outside any recipe closure.
-function _kernel_construction_locals!(locals::Set{Symbol}, ex)
+function _kernel_construction_locals!(locals::Set{Symbol}, @nospecialize(ex))
     ex isa Expr || return locals
     ex.head in (:quote, :inert) && return locals
     if _kernel_is_group_call(ex)
@@ -4229,18 +4236,24 @@ function _kernel_construction_locals!(locals::Set{Symbol}, ex)
                 push!(locals, binding.args[1])
         end
     end
-    foreach(arg -> _kernel_construction_locals!(locals, arg), ex.args)
+    for arg in ex.args
+        _kernel_construction_locals!(locals, arg)
+    end
     locals
 end
 
-_kernel_mentions_any(ex::Symbol, names::Set{Symbol}) = ex in names
-_kernel_mentions_any(ex::Expr, names::Set{Symbol}) =
-    !(ex.head in (:quote, :inert)) && any(arg -> _kernel_mentions_any(arg, names), ex.args)
-_kernel_mentions_any(ex, names::Set{Symbol}) = false
+function _kernel_mentions_any(@nospecialize(ex), names::Set{Symbol})
+    ex isa Symbol && return ex in names
+    ex isa Expr && !(ex.head in (:quote, :inert)) || return false
+    for arg in ex.args
+        _kernel_mentions_any(arg, names) && return true
+    end
+    false
+end
 
 # Inline the recipe groups and evaluate every closure the construction code
 # creates as its own top-level expression in `mod`.
-function _kernel_toplevel_construction(ex, mod::Module, locals::Set{Symbol})
+function _kernel_toplevel_construction(@nospecialize(ex), mod::Module, locals::Set{Symbol})
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     _kernel_is_group_call(ex) &&
@@ -4251,7 +4264,11 @@ function _kernel_toplevel_construction(ex, mod::Module, locals::Set{Symbol})
             "it cannot be evaluated separately"))
         return Expr(:call, GlobalRef(Core, :eval), mod, QuoteNode(ex))
     end
-    Expr(ex.head, (_kernel_toplevel_construction(arg, mod, locals) for arg in ex.args)...)
+    args = Vector{Any}(undef, length(ex.args))
+    for (index, arg) in enumerate(ex.args)
+        args[index] = _kernel_toplevel_construction(arg, mod, locals)
+    end
+    Expr(ex.head, args...)
 end
 
 # --- named boundaries ------------------------------------------------------
