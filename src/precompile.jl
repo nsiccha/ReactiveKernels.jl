@@ -4,7 +4,9 @@
 # (`_kernel_eval_definition`); without a workload a fresh process still
 # compiled this package code once, and Julia serializes that compilation
 # across threads. The workload authors, prepares and calls a small kernel
-# with an authored plate, the shape generated programs use.
+# with an authored plate, the shape generated programs use, and authored
+# `for`/`while` loops, whose tensorized companions are expanded with
+# ReactantCore's `@trace` when a kernel is defined.
 @setup_workload begin
     workload_definition = :(_precompile_workload(
             x::Vector{Float64}, a::Float64, b::Float64) = begin
@@ -12,7 +14,23 @@
             cell::Float64 = intercept + slope * log(value)
             cell
         end
-        total::Float64 = sum(cells)
+        prefix::Vector{Float64} = let
+            out = zero(cells)
+            acc = 0.0
+            for i in eachindex(cells)
+                acc = acc + cells[i]
+                out[i] = acc
+            end
+            out
+        end
+        steps::Int = let
+            k = 0
+            while k < length(x)
+                k = k + 1
+            end
+            k
+        end
+        total::Float64 = sum(prefix) + steps
         return total
     end)
     @compile_workload begin

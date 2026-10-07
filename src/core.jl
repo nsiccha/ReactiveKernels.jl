@@ -1513,6 +1513,16 @@ function add!(g::Graph; inputs, outputs, op,
     _add_recipe!(g, inputs, outputs, op, cost, cse_key, effectful, source)
 end
 
+# Compare canonical value ids elementwise. `==` on tuples of unknown length is an
+# abstract call that any package method on tuples invalidates.
+function _canonical_ids_equal(g::Graph, values::Tuple{Vararg{Value}}, ids::Vector{Int})
+    length(values) == length(ids) || return false
+    for (value, id) in zip(values, ids)
+        canon_id(g, value.id) == id || return false
+    end
+    true
+end
+
 # Registration stores callable and provenance values as graph metadata. Its body
 # does not need a new inferred executable for every numerical operation type.
 Base.@nospecializeinfer function _add_recipe!(g::Graph,
@@ -1529,13 +1539,13 @@ Base.@nospecializeinfer function _add_recipe!(g::Graph,
     # arity, it computes the same thing. Alias the new outputs onto the existing
     # producer's outputs instead of adding a duplicate recipe.
     if cse_key !== nothing && !effectful
-        canon_ins = Tuple(canon_id(g, v.id) for v in ins)
+        canon_ins = Int[canon_id(g, v.id) for v in ins]
         for r in g.recipes
             r.effectful && continue
             r.cse_key === nothing && continue
             isequal(r.cse_key, cse_key) || continue
             length(r.outputs) == length(outs) || continue
-            Tuple(canon_id(g, v.id) for v in r.inputs) == canon_ins || continue
+            _canonical_ids_equal(g, r.inputs, canon_ins) || continue
             alias_plan = _cse_alias_plan(g, outs, r.outputs, cse_key)
             for v in ins; _register!(g, v); end
             for v in outs; _register!(g, v); end

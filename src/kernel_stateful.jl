@@ -1055,7 +1055,10 @@ function _kernel_object_owner_spec(object)
     skel = _kernel_object_skeleton(object)
     spec = kernel_spec(skel)
     bindings = _kernel_object_bindings(object)
-    bound = Set(Symbol.(keys(bindings)))
+    bound = Set{Symbol}()
+    for name in keys(bindings)
+        push!(bound, name)
+    end
     isempty(bound) && return spec
 
     for recipe in spec.graph.recipes
