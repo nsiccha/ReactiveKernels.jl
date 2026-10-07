@@ -2715,12 +2715,12 @@ function _kernel_native_broadcasts(ex; in_dotted::Bool = false)
     elseif ex.head === :. && length(ex.args) == 2 &&
            ex.args[2] isa Expr && ex.args[2].head === :tuple
         callee = ex.args[1]
-        arguments = ex.args[2].args
+        arguments = (ex.args[2]::Expr).args
     elseif ex.head in (Symbol(".&&"), Symbol(".||"))
         callee = GlobalRef(Base, ex.head === Symbol(".&&") ? :andand : :oror)
         arguments = ex.args
     else
-        return Expr(ex.head, map(_kernel_native_broadcasts, ex.args)...)
+        return Expr(ex.head, Any[_kernel_native_broadcasts(arg) for arg in ex.args]...)
     end
     any(arg -> arg isa Expr && arg.head === :parameters, arguments) && return ex
     # Match Julia's fusion boundary: a non-dotted parent materializes its
@@ -2868,11 +2868,11 @@ function _kernel_tensorized_rhs(ex, known::Set{Symbol} = Set{Symbol}(),
                     _kernel_tensorized_rhs(ex.args[2], known, mod, scope))
     elseif ex.head === :ref
         array = _kernel_tensorized_rhs(ex.args[1], known, mod, scope)
-        indices = ex.args[2:end]
+        ref_indices = ex.args[2:end]
         getindex_call = a -> Expr(:call, GlobalRef(@__MODULE__, :_tensorized_getindex), a,
             (_kernel_tensorized_rhs(index, known, mod, scope)
-             for index in _kernel_ref_indices(a, indices))...)
-        (array isa Symbol || !any(_kernel_ref_has_endpoint, indices)) &&
+             for index in _kernel_ref_indices(a, ref_indices))...)
+        (array isa Symbol || !any(_kernel_ref_has_endpoint, ref_indices)) &&
             return getindex_call(array)
         # A computed array is evaluated once and its endpoints read from it.
         indexed = gensym(:indexed)
@@ -3156,7 +3156,7 @@ function _kernel_source_functions(ex, mod)
     ex.head in (:quote, :inert) && return ex
     ex.head === :-> && return Expr(:call,
         GlobalRef(@__MODULE__, :_kernel_source_function), ex, QuoteNode(ex), QuoteNode(mod))
-    Expr(ex.head, map(arg -> _kernel_source_functions(arg, mod), ex.args)...)
+    Expr(ex.head, Any[_kernel_source_functions(arg, mod) for arg in ex.args]...)
 end
 
 # Captures and the generated callable retain their concrete runtime types.
@@ -3169,7 +3169,7 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     _kernel_source_native_scope(source.args[2]) &&
         return _KernelSourceFunction(f, nothing, nothing)
     names = fieldnames(typeof(f))
-    captures = NamedTuple{names}(ntuple(i -> getfield(f, i), length(names)))
+    captures = NamedTuple{names}(Tuple(Any[getfield(f, i) for i in 1:length(names)]))
     # Julia owns shared lexical cells too: retain their exact read/write and
     # undefined-binding behavior rather than reconstructing Box operations.
     any(value -> value isa Core.Box, values(captures)) &&
@@ -3837,7 +3837,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
         rhs = _kernel_hygienic_catches(authored_rhs, known)
         deps = plate_expr === nothing ? _kernel_free_ports(rhs, known) :
-               collect(plate_expr.arguments)
+               collect(plate_expr.arguments)::Vector{Symbol}
         deps = plate_expr === nothing ? _kernel_nested_endpoint_deps(
             rhs, deps, known, mod, nested_specs) : deps
         all(name -> name in known, deps) || throw(ArgumentError(

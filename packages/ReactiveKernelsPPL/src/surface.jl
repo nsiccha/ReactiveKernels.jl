@@ -1543,14 +1543,15 @@ function _hoist_data_gather_indices!(sample, det, data, taken; resolve = identit
             return Expr(:ref, walk(ex.args[1]),
                 (index_name(walk(a)) for a in ex.args[2:end])...)
         elseif ex.head === :call
-            return Expr(:call, ex.args[1], map(walk, ex.args[2:end])...)
+            return Expr(:call, ex.args[1], Any[walk(a) for a in ex.args[2:end]]...)
         elseif ex.head === :. && length(ex.args) == 2 &&
                 Meta.isexpr(ex.args[2], :tuple)
-            return Expr(:., ex.args[1], Expr(:tuple, map(walk, ex.args[2].args)...))
+            return Expr(:., ex.args[1],
+                Expr(:tuple, Any[walk(a) for a in (ex.args[2]::Expr).args]...))
         elseif ex.head === :kw && length(ex.args) == 2
             return Expr(:kw, ex.args[1], walk(ex.args[2]))
         elseif ex.head in (:parameters, :tuple, :vect)
-            return Expr(ex.head, map(walk, ex.args)...)
+            return Expr(ex.head, Any[walk(a) for a in ex.args]...)
         end
         return ex
     end
@@ -1872,7 +1873,11 @@ function _model_valued(ex, detmap, env, active::Set{Symbol})
     ex isa Expr || return false
     # Walk every dependency even when the callable head already proves
     # this is a value, so retaining names still rejects cyclic definitions.
-    return any(map(a -> _model_valued(a, detmap, env, active), ex.args))
+    valued = false
+    for a in ex.args
+        valued |= _model_valued(a, detmap, env, active)::Bool
+    end
+    return valued
 end
 
 # Single rule table for undotted `:call` shapes over argument shapes.
@@ -1978,7 +1983,7 @@ function _canonical_expr(ex, data, detmap, detshape, env, where)
     fn isa Symbol || return ex
     fn in REDUCTION_FNS && return ex  # args validated downstream
     fn === :_ppl_plate_column && return ex  # an RK plate (array cells)
-    args = [_canonical_expr(a, data, detmap, detshape, env, where)
+    args = Any[_canonical_expr(a, data, detmap, detshape, env, where)
         for a in ex.args[2:end]]
     argshapes = [_canon_shape(a, data, detmap, detshape, env) for a in args]
     if :invalid in argshapes
@@ -3083,11 +3088,11 @@ function _resolve_hcat_values(ex; keep = false, resolve = identity)
     ex.head === :quote && return ex
     if _is_hcat_def(ex)
         head = keep ? :hcat : GlobalRef(Base, :hcat)
-        value = Expr(:call, head, map(a -> _resolve_hcat_values(a;
-            resolve), ex.args[2:end])...)
+        value = Expr(:call, head, Any[_resolve_hcat_values(a; resolve)
+            for a in ex.args[2:end]]...)
         return keep ? value : resolve(value)
     end
-    return Expr(ex.head, map(a -> _resolve_hcat_values(a; resolve), ex.args)...)
+    return Expr(ex.head, Any[_resolve_hcat_values(a; resolve) for a in ex.args]...)
 end
 
 function _route_hcat_values(sample, det, data, glms; resolve = identity)
@@ -7294,7 +7299,7 @@ end
 function _lower_trials(lhs, t, ctx)
     t isa Bool && _sfail("response $lhs trials must be an Int data " *
                          "column or Int literal, got Bool")
-    t isa Integer && return Int(t)
+    t isa Base.BitInteger && return Int(t)
     t isa Real && _sfail("response $lhs trials must be an Int data " *
                          "column or Int literal, got $(repr(t))")
     if t isa Symbol
@@ -9748,11 +9753,14 @@ end
 
 # Preserve Julia's integer result when folding a structural count; the
 # prior arithmetic folder deliberately returns floating-point values.
+# Source integer literals are Base bit integers. Testing that concrete union,
+# rather than `Integer`, keeps `Int(x)` concretely inferred: a package that adds
+# a constructor for its own `Integer` subtype then cannot invalidate lowering.
 function _static_count(ex)
-    ex isa Integer && !(ex isa Bool) && return Int(ex)
+    ex isa Base.BitInteger && return Int(ex)
     _fold_literal(ex) === nothing && return nothing
     value = _eval_value_expr(ex, s -> _sfail("unbound count $s"), :count)
-    return value isa Integer && !(value isa Bool) ? Int(value) : nothing
+    return value isa Base.BitInteger ? Int(value) : nothing
 end
 
 """Prior-argument hoisting: an expression in a prior's argument position
@@ -9999,7 +10007,7 @@ function _lower_lkj_cholesky(lhs, rhs)
     uplo = length(args) == 3 ? args[3] : 'L'
     uplo in ('L', 'U') || _sfail("parameter $lhs: `LKJCholesky` uplo " *
         "is 'L' or 'U', got $(repr(uplo))")
-    dim = if K isa Integer && !(K isa Bool)
+    dim = if K isa Base.BitInteger
         K >= 1 || _sfail("parameter $lhs: `LKJCholesky` dimension must be " *
             "≥ 1, got $K")
         Int(K)
@@ -10329,7 +10337,7 @@ end
 # default retains `nothing` in the unbound IR; binding evaluates DataAPI
 # levels before the response reads its support.
 function _threshold_size(lhs::Symbol, n, response::Union{Nothing,Symbol})
-    n isa Integer && !(n isa Bool) && n >= 0 && return Int(n)
+    n isa Base.BitInteger && n >= 0 && return Int(n)
     # Retain the historical inferred representation for the exact linked
     # default; bind resolves it from DataAPI levels, including unused levels.
     response !== nothing && _levels_count(n) == (response, 1) && return nothing
