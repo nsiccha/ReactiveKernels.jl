@@ -1680,9 +1680,16 @@ function _response_range_indices(columns::AbstractDict, r::LikelihoodSpec)
     value isa AbstractArray || _fail(r.label, "response index source $source must be an array")
     index = r.range.args[2]
     index isa Expr && index.args[1] === :(:) && return index.args[2]:index.args[3]
-    return index === :(:) || index.args[1] === :eachindex ? eachindex(value) :
-        axes(value, index.args[3])
+    return _response_column_axis(value, index)
 end
+
+# Bound columns have arbitrary array types. Inferring this query once for any
+# value keeps their generic `eachindex`/`axes` methods out of the lowering
+# code's compiled dependencies, which other packages' array methods would
+# otherwise invalidate.
+Base.@nospecializeinfer _response_column_axis(@nospecialize(value), @nospecialize(index)) =
+    index === :(:) || index.args[1] === :eachindex ? eachindex(value) :
+        axes(value, index.args[3])
 
 function _selected_response_column(plan::StructuralPlan, r::LikelihoodSpec)
     indices = _response_range_indices(plan, r)
@@ -2459,9 +2466,6 @@ function _validate_scans(plan::StructuralPlan)
                 "scan step writes $(st.target)[$(s.loopvar)], which is not a " *
                 "carried array of the scan $(s.states)")
         end
-        (s.hi isa Int || s.hi isa Symbol) || _fail(s.label,
-            "scan loop bound must be a literal Int or a data length Symbol, " *
-            "got $(repr(s.hi))")
     end
     return nothing
 end
@@ -3099,13 +3103,17 @@ function _collect_vector_condition!(refs, ex, plan, label, bound::Bool)
     return nothing
 end
 
+# A column's elements are real numbers. Type tests rather than an `eltype`
+# call keep this check concretely inferred.
+_is_real_column(col) = col isa Real || col isa AbstractArray{<:Real}
+
 # Direct column references in math positions must be numeric (derived and
 # nested references are validated where they resolve).
 function _check_numeric_position!(args, plan, label, bound::Bool)
     bound || return nothing
     for arg in args
         arg isa Symbol && haskey(plan.columns, arg) &&
-            !(eltype(plan.columns[arg]) <: Real) &&
+            !_is_real_column(plan.columns[arg]) &&
             _fail(label, "column $arg is not numeric (elementwise math " *
                          "needs numeric columns)")
     end
@@ -7022,7 +7030,7 @@ function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
             det_exprs, columns, memo, root), root)
     end
     if ex.head === :ref
-        vals = [_eval_derived_node(a, plan, det_exprs, columns, memo, root)
+        vals = Any[_eval_derived_node(a, plan, det_exprs, columns, memo, root)
             for a in ex.args]
         return getindex(vals...)
     end
@@ -7030,13 +7038,13 @@ function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
         fn = ex.args[1]
         if fn isa Symbol && haskey(_DERIVED_DOTTED_OPS, fn)
             f = _DERIVED_DOTTED_OPS[fn]
-            vals = [_eval_derived_node(a, plan, det_exprs, columns, memo, root)
+            vals = Any[_eval_derived_node(a, plan, det_exprs, columns, memo, root)
                 for a in ex.args[2:end]]
             return broadcast(f, vals...)
         end
         if fn isa Symbol && haskey(_DERIVED_SCALAR_FNS, fn)
             f = _DERIVED_SCALAR_FNS[fn]
-            vals = [_eval_derived_node(a, plan, det_exprs, columns, memo, root)
+            vals = Any[_eval_derived_node(a, plan, det_exprs, columns, memo, root)
                 for a in ex.args[2:end]]
             return f(vals...)
         end
@@ -7051,7 +7059,7 @@ function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
         f = ex.args[1]
         args = ex.args[2].args
         if f === :ifelse
-            vals = [_eval_derived_node(a, plan, det_exprs, columns, memo, root)
+            vals = Any[_eval_derived_node(a, plan, det_exprs, columns, memo, root)
                 for a in args]
             return ifelse.(vals...)
         end

@@ -194,6 +194,46 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test C.calls[] == length(subjects) + 2length(subjects)
     end
 
+    @testset "nested plates, scans and prepared kernels stay in the cell" begin
+        kinds = [[1, 2, 1, 1, 2, 1], [2, 2, 1, 2, 1], Int[], [1, 1]]
+        steps = [[0.5, 1.0, 0.25, 2.0, 1.5, 0.75], [0.0, 1.5, 0.5, 1.0, 2.0],
+                 Float64[], [0.5, 0.5]]
+        read_idx = [[3, 1, 4], [2, 1, 2], Int[], Int[]]
+        subjects = 1:4
+        selection = [[4, 1, 6], [5, 3, 5], Int[], Int[]]
+        cache_names(p) = sort([only(r.outputs).name for r in caches(p)])
+        structure(k) = [(e.kind, e.depth) for e in recipe_inventory(k) if e.kind !== :ordinary]
+        cases = (
+            (C.scan_reads, (; kinds_by_subject = kinds, steps_by_subject = steps,
+                            read_idx, subjects),
+             [:bound_plate_kinds, :bound_plate_observation_operations, :bound_plate_steps],
+             [(:plate, 0), (:scan, 1)]),
+            (C.nested_reads, (; kinds_by_subject = kinds, read_idx, subjects),
+             [:bound_plate_observation_operations], [(:plate, 0), (:plate, 1)]),
+            (C.embedded_reads, (; kinds_by_subject = kinds, read_idx, subjects),
+             [:bound_plate_kinds, :bound_plate_observation_operations], [(:plate, 0)]))
+        for (spec, data, names, nesting) in cases
+            plain = prepare(spec)
+            C.calls[] = 0
+            bound = prepare(spec; bound = data)
+            @test C.calls[] == length(subjects)
+            @test cache_names(bound.plan) == names
+            @test only(filter(r -> only(r.outputs).name === :bound_plate_observation_operations,
+                              caches(bound.plan))).op.value == selection
+            @test structure(bound) == nesting
+            body = plate_body(only(plates(bound.plan)))
+            @test any(r -> r.op isa Union{RK._AuthoredPlateOp,RK._AuthoredScanOp} ||
+                           RK._embedded_kernel(r.op) !== nothing, body.recipes)
+            @test !occursin("counted_findall", string(code_expr(bound)))
+            for live in ([0.3, 0.7, 1.1, 0.2, -0.4, 0.9], [1.2, -0.4, 0.0, 2.0, 0.5, 0.1])
+                expected = plain(live, data...)
+                C.calls[] = 0
+                @test bound(live) == expected
+                @test C.calls[] == 0
+            end
+        end
+    end
+
     @testset "demanded intermediates and composed consumers" begin
         data, observations = [1.0, 2.0, 4.0], [0.1, 0.2, 0.3]
         for want in (:total, :means, :pointwise,
@@ -231,4 +271,31 @@ import Enzyme
     @test only(cached).op.value == [log.(x) for x in xs]
     @test ad_value_and_gradient(bound, q) == ad_value_and_gradient(plain, q, xs)
     @test ad_gradient(bound, q) ≈ fill(sum(sum(log, x; init = 0.0) for x in xs), length(q))
+
+    # A scan beside the cached index chain differentiates in the residual cell.
+    data = (; kinds_by_subject = [[1, 2, 1, 1, 2, 1], [2, 2, 1, 2, 1], Int[]],
+            steps_by_subject = [[0.5, 1.0, 0.25, 2.0, 1.5, 0.75], [0.0, 1.5, 0.5, 1.0, 2.0],
+                                Float64[]],
+            read_idx = [[3, 1, 4], [2, 1, 2], Int[]], subjects = 1:3)
+    rates = [0.3, 0.7, 1.1]
+    plain = prepare_ad(C.scan_reads, backend, rates, data...; active=:rates, want=:total)
+    bound = prepare_ad(C.scan_reads, backend, rates; active=:rates, want=:total,
+                       bound=data)
+    @test length(filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+        startswith(String(only(r.outputs).name), "bound_plate_"),
+        bound.kernel.plan.recipes)) == 3
+    for point in (rates, [1.2, -0.4, 0.5])
+        value, gradient = ad_value_and_gradient(bound, point)
+        expected_value, expected_gradient = ad_value_and_gradient(plain, point, data...)
+        @test value == expected_value
+        @test gradient ≈ expected_gradient
+        primal = prepare(C.scan_reads; bound=data)
+        h = 1e-6
+        central = [(primal(point .+ h .* (1:3 .== i)) -
+                    primal(point .- h .* (1:3 .== i))) / 2h for i in 1:3]
+        @test isapprox(gradient, central; rtol=1e-6, atol=1e-8)
+        C.calls[] = 0
+        ad_value_and_gradient(bound, point)
+        @test C.calls[] == 0
+    end
 end

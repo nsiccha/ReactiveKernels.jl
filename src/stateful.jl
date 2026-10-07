@@ -293,6 +293,15 @@ specific recipes in-place while sharing the same getter codegen.
 """
 _default_is_mutating(recipe::Recipe) = _mutable_like(valtype(only(recipe.outputs)))
 
+# Whether the injected `cache_apply` may be handed this recipe's slot value as
+# a destination. A hand-written hook owns that decision under its documented
+# contract. The MutatingFunctions extension narrows it to recipes whose seeded
+# value is fresh storage a destination-passing method fills: the slot is seeded
+# with the recipe's first result, which may alias caller data (a field read),
+# and `apply!!`'s generic fallback copies later results into it
+# (`_nonalloc_destination`).
+_reactive_inplace_destination(cache_apply, recipe::Recipe) = true
+
 # The slot indices whose single-output, owned producer recipe is selected for
 # in-place evaluation. Empty (so the AST is byte-identical to the pure program)
 # whenever no `cache_apply` was injected.
@@ -304,6 +313,7 @@ function _mutating_slots(plan::Plan, graph::Graph, index, cache_apply, is_mutati
         output_id = canon_id(graph, only(recipe.outputs).id)
         _owned_output(plan, recipe, output_id) || continue
         is_mutating(recipe) || continue
+        _reactive_inplace_destination(cache_apply, recipe) || continue
         push!(slots, index[output_id])
     end
     slots
@@ -325,7 +335,11 @@ their per-instance slot buffer in place through `MutatingFunctions.apply!!`
 instead of allocating a fresh recipe return on every recomputation.
 
 Selection is per recipe via `is_mutating(recipe)::Bool` (default: mutable/
-array-like outputs). The injected core hook is a single MF-agnostic callable
+array-like outputs). With the MutatingFunctions hook a selected recipe is
+reused in place only when a registered `apply!!` method fills its slot for its
+declared port types; any other recipe recomputes on the pure path, because its
+first result may alias caller data that the generic fallback would overwrite.
+The injected core hook is a single MF-agnostic callable
 `cache_apply(cache, op, args...) -> newcache`; `MutatingFunctions.apply!!`
 supplies it, and any conforming hand-written mutating op (including a
 non-MutatingFunctions one) fits the same codegen. **Contract on `cache_apply`:**

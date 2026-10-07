@@ -57,10 +57,13 @@ _position_output_copy(kernel, position, data) = copy(kernel(position, data))
         @test buffer_bytes >= payload
         @test owned_bytes - borrowed_bytes >= buffer_bytes - accounting_slack
         @test borrowed_bytes <= scalar_bytes + accounting_slack
+        # The dotted WANT fills its lane or output column at every position,
+        # so a borrowed read allocates less than one output payload.
+        @test borrowed_bytes < payload - accounting_slack
         # Negative control: an otherwise identical reader copying its final
         # output must fail both allocation bounds, even at the smaller size.
         @test owned_bytes - copying_bytes < buffer_bytes - accounting_slack
-        @test copying_bytes > scalar_bytes + accounting_slack
+        @test !(copying_bytes < payload - accounting_slack)
         println("BATCH_OUTPUT_ALLOC n=", n, " owned=", owned_bytes,
                 " borrowed=", borrowed_bytes, " scalar=", scalar_bytes,
                 " buffer=", buffer_bytes, " copying=", copying_bytes,
@@ -73,9 +76,12 @@ _position_output_copy(kernel, position, data) = copy(kernel(position, data))
     owned_growth = large.owned_bytes - small.owned_bytes
     borrowed_growth = large.borrowed_bytes - small.borrowed_bytes
     copying_growth = large.copying_bytes - small.copying_bytes
-    @test abs(borrowed_growth - scalar_growth) <= 2 * accounting_slack
-    @test abs(owned_growth - scalar_growth - buffer_growth) <= 2 * accounting_slack
-    @test abs(copying_growth - scalar_growth) > 2 * accounting_slack
+    # Borrowed reads do not grow with the payload. An owning read allocates
+    # its output and one position's scratch (the first position's value).
+    @test abs(borrowed_growth) <= 2 * accounting_slack
+    @test abs(owned_growth - buffer_growth - scalar_growth ÷ length(position)) <=
+          2 * accounting_slack
+    @test abs(copying_growth) > 2 * accounting_slack
 
     changed_shape = borrowed(position[1:1], data[1:3])
     @test size(changed_shape) == (3, 1)

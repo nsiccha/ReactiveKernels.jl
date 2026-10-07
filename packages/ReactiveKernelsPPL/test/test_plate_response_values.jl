@@ -14,9 +14,11 @@ function _prv_fixture(kind, n; unbound = nothing)
     # loop index, for every observation iterator and argument position.
     alias = kind in (:alias, :alias_literal, :alias_axes, :alias_local, :alias_scale)
     alias && push!(ast.args, :(mu = a .+ r[g]))
+    # `:selected` observes the whole response; binding selects its single
+    # present entry y[1]. The skipped cells' `sqrt` operands are invalid.
     selected = kind === :selected
     selected && n > 1 && (x[2:end] .= -1.0)
-    iterator = selected ? :(axes(y, 2)) : kind === :alias_literal ? :(1:$n) :
+    iterator = kind === :alias_literal ? :(1:$n) :
         kind === :alias_axes ? :(axes(y, 1)) : :(eachindex(y))
     value = selected ? :(a + r[g[i]] + b * sqrt(x[i])) :
         alias ? :(mu[i] + b * x[i]) : :(a + r[g[i]] + b * x[i])
@@ -27,7 +29,8 @@ function _prv_fixture(kind, n; unbound = nothing)
         Expr(:block, :(y[i] ~ Normal($value, 0.7)))
     push!(ast.args, Expr(:macrocall, Symbol("@plate"), LineNumberNode(1),
         Expr(:for, :(i = $iterator), cell)))
-    # Every supplied response entry must be observed (USER `1g8uvgs`).
+    # Observations cover the whole response and binding skips missing
+    # entries (provisional USER `1uhcm3b`).
     observed_y = selected ? Union{Missing,Float64}[i == 1 ? y[i] : missing
         for i in eachindex(y)] : y
     data = Dict(:x => x, :y => observed_y, :g => g)
@@ -37,11 +40,11 @@ function _prv_fixture(kind, n; unbound = nothing)
     u = unconstrain(built.layout, (; a = 0.25, b = -0.3, r = [-0.2, 0.4]))
     function pointwise(v)
         q = constrain(built.layout, v)
-        indices = selected ? axes(y, 2) : eachindex(y)
         kind === :alias_scale && return [logpdf(Normal(q.b * x[i],
-            exp(0.2 * (q.a + q.r[g[i]]))), y[i]) for i in indices]
-        [logpdf(Normal(q.a + q.r[g[i]] +
-            q.b * (selected ? sqrt(x[i]) : x[i]), 0.7), y[i]) for i in indices]
+            exp(0.2 * (q.a + q.r[g[i]]))), y[i]) for i in eachindex(y)]
+        # A skipped entry leaves zero in pointwise output.
+        [ismissing(observed_y[i]) ? 0.0 : logpdf(Normal(q.a + q.r[g[i]] +
+            q.b * (selected ? sqrt(x[i]) : x[i]), 0.7), y[i]) for i in eachindex(y)]
     end
     function oracle(v)
         q = constrain(built.layout, v)

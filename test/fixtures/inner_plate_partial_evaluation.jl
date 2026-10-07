@@ -180,6 +180,66 @@ end
     total = sum(out)
 end
 
+# The selection beside a recurrence over the same subject's operations. The
+# scan reads a live rate, so it stays in the cell; the index chain and the
+# per-subject sequences it reads are cached. The named-tuple seed is data-only
+# but not cacheable, so it stays in the cell as well.
+@kernel scan_reads(rates, kinds_by_subject, steps_by_subject, read_idx, subjects) = begin
+    out = plate(subjects, Ref(kinds_by_subject), Ref(steps_by_subject), Ref(read_idx),
+                Ref(rates)) do s, kinds_all, steps_all, idx_all, rates_all
+        kinds = kinds_all[s]
+        steps = steps_all[s]
+        rate = rates_all[s]
+        read_positions = counted_findall(isone, kinds)
+        observation_operations = read_positions[idx_all[s]]
+        operations = scan(kinds, steps, Ref(rate);
+                          init = (; level = 0.0, count = 0.0)) do carry, kind, step, r
+            level = carry.level * exp(-r * step)
+            next = kind == 2 ? (; level = level + 1.0, count = carry.count + 1.0) :
+                               (; level, count = carry.count)
+            (next, next.level + next.count)
+        end
+        observed = operations[observation_operations]
+        sum(observed; init = 0.0)
+    end
+    total = sum(out)
+end
+
+# A nested plate over the cached selection stays in the cell.
+@kernel nested_reads(live, kinds_by_subject, read_idx, subjects) = begin
+    out = plate(subjects, Ref(kinds_by_subject), Ref(read_idx), Ref(live)) do s, kinds_all, idx_all, live_all
+        kinds = kinds_all[s]
+        observation_operations = counted_findall(isone, kinds)[idx_all[s]]
+        squares = plate(observation_operations, Ref(live_all)) do j, l
+            l[j]^2
+        end
+        sum(squares; init = 0.0)
+    end
+    total = sum(out)
+end
+
+# A prepared kernel called in the cell is an embedded operation; it stays in
+# the cell beside the cached selection.
+@kernel decay_path(kinds::Vector{Int}, rate::Float64) = begin
+    path = scan(kinds, Ref(rate); init = 1.0) do carry, kind, r
+        next = carry * exp(-r * kind)
+        (next, next)
+    end
+    out::Float64 = sum(path)
+    return out
+end
+const DECAY_PATH = prepare(decay_path)
+@kernel embedded_reads(live, kinds_by_subject, read_idx, subjects) = begin
+    out = plate(subjects, Ref(kinds_by_subject), Ref(read_idx), Ref(live)) do s, kinds_all, idx_all, live_all
+        kinds = kinds_all[s]
+        observation_operations = counted_findall(isone, kinds)[idx_all[s]]
+        rate = live_all[s]
+        decayed::Float64 = DECAY_PATH(kinds, rate)
+        decayed + sum(live_all[observation_operations]; init = 0.0)
+    end
+    total = sum(out)
+end
+
 # A lazy branch whose condition reads a cached per-cell array.
 @kernel guarded_reads(q::Vector{Float64}, kinds_by_subject, subjects) = begin
     theta::Float64 = sum(q)
