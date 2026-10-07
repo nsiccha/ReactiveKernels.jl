@@ -418,18 +418,82 @@ function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
     isempty(matches) ? nothing : only(matches)
 end
 
+# A scan step whose own operation table holds one plain operation per recipe.
+# Preparing a step lowers a nested plate, scan or embedded kernel into the
+# step's table, whose slots then no longer line up with the step's recipes.
+_scan_step_is_plain(step) =
+    length(step.ops) == length(step.plan.recipes) &&
+    !any(op -> op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(op) !== nothing, step.ops)
+
+# The step operands of a scan from its argument types `(init, operand...)`:
+# the carry seed, one element of each iterated sequence, then the shared
+# operands. A `history = h0` scan's last argument is the fill value.
+function _scan_step_input_types(op::_AuthoredScanOp, input_types)
+    atomic = typeof(op).parameters[2]
+    last_shared = length(input_types) - _scan_has_history(op)
+    Any[input_types[1],
+        (Expr(:call, GlobalRef(Base, :eltype), input_types[i])
+         for i in 2:last_shared if !(i in atomic))...,
+        (input_types[i] for i in 2:last_shared if i in atomic)...]
+end
+
+# The type of a scan's result vector from its argument types and the step's
+# output type `element`: the seed promoted in for `include_init = true`, or
+# the fill value's type for `history = h0` (then without `element`).
+function _scan_result_type_expr(op::_AuthoredScanOp, input_types, element)
+    element = _scan_has_history(op) ? input_types[end] :
+        _scan_includes_init(op) ?
+            Expr(:call, GlobalRef(Base, :promote_type), input_types[1], element) :
+            element
+    Expr(:curly, GlobalRef(Base, :Vector), element)
+end
+
+# The leaf-operation type of a scan step's per-step output (its second WANT).
+# Each recipe of the step's plan gets a cold type-only slot, nested plates and
+# scans recursing (`_body_types!`). A step that owns a plate, scan or embedded
+# kernel declares its typed locals (`_lower_with_ops`), so a concrete declared
+# type is the value's type there.
+function _scan_step_output_type!(runtime_ops, runtime_recipes, step, input_types,
+                                 base)
+    p = step.plan
+    types = _body_types!(runtime_ops, runtime_recipes, p,
+        Any[recipe.op for recipe in p.recipes], p.recipes, input_types, base;
+        declared = _needs_embedded_tensorization(p))
+    types[canon_id(p.graph, p.want[2].id)]
+end
+
+# Cold type-only slots for a scan step that is not plain, appended by both
+# backend products right after the step's own operations so their tables stay
+# equal. Only the native product reads them: they type a nested step's output
+# from its leaf operations. Querying the scan operation itself instead would
+# pass its complete step PreparedKernel, with the graph and `Expr` metadata, to
+# a runtime type query that ordinary Reverse cannot prove readonly
+# (`EnzymeMutabilityException`), and an empty sequence would have no output
+# type. Returns the slots' table offset, or `nothing` when the step needs none.
+function _scan_type_slots!(runtime_ops, runtime_recipes, op::_AuthoredScanOp)
+    (_scan_has_history(op) || _scan_step_is_plain(op.kernel)) && return nothing
+    offset = length(runtime_ops)
+    _scan_step_output_type!(runtime_ops, runtime_recipes, op.kernel,
+        Any[GlobalRef(Core, :Any) for _ in op.kernel.plan.have], 0)
+    offset
+end
+
 # The static type of an inlined scan step's per-step output, as a chain of
 # `Base.promote_op` over the step's own operations: the type the first step's
 # output would have, without running it. The authored-plate element type uses
 # the same chain; unlike inferring the nested PreparedKernel as a whole, each
-# operation infers exactly inside the enclosing generated body. `nothing` when
-# the step is not one plain operation per recipe (a nested plate, scan or
-# embedded kernel inside the step).
-function _authored_scan_step_output_type(step, input_types, offset)
+# operation infers exactly inside the enclosing generated body. A step that is
+# not plain is typed from the cold slots `_scan_type_slots!` placed at
+# `type_offset`, re-deriving the same layout; `nothing` without them.
+function _authored_scan_step_output_type(step, input_types, offset;
+                                         type_offset = nothing)
     p = step.plan
-    length(step.ops) == length(p.recipes) || return nothing
-    any(op -> op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
-        _embedded_kernel(op) !== nothing, step.ops) && return nothing
+    if !_scan_step_is_plain(step)
+        type_offset === nothing && return nothing
+        return _scan_step_output_type!(Any[], Recipe[], step, input_types,
+                                       type_offset)
+    end
     types = Dict{Int,Any}(canon_id(p.graph, v.id) => T
                           for (v, T) in zip(p.have, input_types))
     for (i, recipe) in enumerate(p.recipes)
@@ -492,11 +556,14 @@ end
 # `benchmark/repro_enzyme_branch_allocation_phi.jl`). Allocating after a
 # branch that peels the first step to type the buffer does not avoid it: the
 # optimizer splits that allocation back into the arms. An inferred type that
-# is not concrete (`Any` for a nested step) keeps one allocation per arm,
-# typed by the first output when there is one.
+# is not concrete keeps one allocation per arm, typed by the first output when
+# there is one. A step with a nested plate, scan or embedded kernel is typed
+# from the cold slots at `type_offset` (`_scan_type_slots!`); without them its
+# type is `Any`.
 function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                                       offset; consumer = nothing, recycled = nothing,
-                                      pointwise_recycled = nothing)
+                                      pointwise_recycled = nothing,
+                                      type_offset = nothing)
     _scan_has_history(op) && return _lower_authored_scan_history_native!(
         body, op, callargs, lhs, offset; recycled)
     step = op.kernel
@@ -537,7 +604,8 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         push!(step_input_types, Expr(:call, typeof_ref, callargs[i]))
     end
     inferred_output_type = something(
-        _authored_scan_step_output_type(step, step_input_types, offset), Any)
+        _authored_scan_step_output_type(step, step_input_types, offset;
+                                        type_offset), Any)
     invariant = Any[]
     # `typing` runs before the emptiness branch: it binds the inferred output
     # type and, when that type is concrete, preallocates every buffer into its
@@ -1147,21 +1215,28 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
     Expr(:if, ready, interchanged, cell_loop)
 end
 
+# Each authored scan of a plate body: its step operations, then any cold
+# type-only slots of a step that is not plain (`_scan_type_slots!`). Both
+# backend products append them in this order.
 function _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
-    offsets = Dict{Int,Int}()
+    offsets = Dict{Int,NamedTuple{(:offset, :type_offset),
+                                  Tuple{Int,Union{Nothing,Int}}}}()
     for (index, recipe) in enumerate(inner.recipes)
         recipe.op isa _AuthoredScanOp || continue
         step = recipe.op.kernel
-        offsets[index] = length(runtime_ops)
+        offset = length(runtime_ops)
         append!(runtime_ops, step.ops)
         append!(runtime_recipes, step.lowered_recipes)
+        offsets[index] = (; offset,
+            type_offset = _scan_type_slots!(runtime_ops, runtime_recipes, recipe.op))
     end
     offsets
 end
 
-function _lower_plate_recipe_native!(body, recipe, args, out, operation, offset)
+function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots)
     if recipe.op isa _AuthoredScanOp
-        _lower_authored_scan_native!(body, recipe.op, args, out, offset)
+        _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
+                                     slots.type_offset)
     else
         push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
     end
@@ -1170,12 +1245,25 @@ end
 
 # Infer nested regions from their leaf operations, never from a recursive
 # PreparedKernel call. Keep these cold type-only slots in the same order in
-# both products; ordinary reverse AD removes slots unused by execution.
-function _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
-    p = kernel.plan
-    offset = length(runtime_ops)
-    append!(runtime_ops, kernel.ops)
-    append!(runtime_recipes, kernel.lowered_recipes)
+# both products; ordinary reverse AD removes slots unused by execution. `base`
+# is the table length before `runtime_ops`, so the same layout can be
+# re-derived over slots that are already in the table.
+function _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types;
+                            base = 0)
+    _body_types!(runtime_ops, runtime_recipes, kernel.plan, kernel.ops,
+                 kernel.lowered_recipes, input_types, base)
+end
+
+# One slot per recipe of `p` (`ops`, `recipes`). A nested plate or scan is typed
+# from its own body's leaf operations; a scan operation, like a plate, carries
+# its body's whole PreparedKernel and is never itself the subject of a type
+# query. Where the lowering declares typed locals (`declared`), a concrete
+# declared type is the value's type.
+function _body_types!(runtime_ops, runtime_recipes, p, ops, recipes, input_types,
+                      base; declared = false)
+    offset = base + length(runtime_ops)
+    append!(runtime_ops, ops)
+    append!(runtime_recipes, recipes)
     types = Dict{Int,Any}(canon_id(p.graph, v.id) => T
                          for (v, T) in zip(p.have, input_types))
     for (i, recipe) in enumerate(p.recipes)
@@ -1185,29 +1273,44 @@ function _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
             elements = Any[Expr(:call, GlobalRef(@__MODULE__, :_plate_argument_type),
                 arg, position in atomic) for (position, arg) in enumerate(args)]
             element = only(_plate_body_type!(runtime_ops, runtime_recipes,
-                                            recipe.op.kernel, elements))
+                                            recipe.op.kernel, elements; base))
             element = Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
                 element, valtype(only(recipe.op.kernel.plan.want)))
             Expr(:call, GlobalRef(@__MODULE__, :_plate_array_type), element,
                 Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic)), args...)
+        elseif recipe.op isa _AuthoredScanOp
+            element = _scan_has_history(recipe.op) ? nothing :
+                _scan_step_output_type!(runtime_ops, runtime_recipes,
+                    recipe.op.kernel, _scan_step_input_types(recipe.op, args), base)
+            _scan_result_type_expr(recipe.op, args, element)
         else
             Expr(:call, GlobalRef(Base, :promote_op),
                  Expr(:ref, _OPS_ARG, offset + i), args...)
         end
         if length(recipe.outputs) == 1
-            types[canon_id(p.graph, only(recipe.outputs).id)] = T
+            types[canon_id(p.graph, only(recipe.outputs).id)] =
+                _declared_body_type(declared, recipe, only(recipe.outputs), T)
         else
             for (j, output) in enumerate(recipe.outputs)
-                types[canon_id(p.graph, output.id)] =
-                    Expr(:call, GlobalRef(Base, :fieldtype), T, j)
+                types[canon_id(p.graph, output.id)] = _declared_body_type(
+                    declared, recipe, output,
+                    Expr(:call, GlobalRef(Base, :fieldtype), T, j))
             end
         end
     end
     types
 end
 
-function _plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types)
-    types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
+# `_declare_typed_output!` converts every assignment to a declared local, so a
+# concrete declaration fixes the value's type; a bound constant is exempt.
+_declared_body_type(declared, recipe, output, T) =
+    declared && !(recipe.op isa _BoundConstant) &&
+    isconcretetype(valtype(output)) ? valtype(output) : T
+
+function _plate_body_type!(runtime_ops, runtime_recipes, kernel, input_types;
+                           base = 0)
+    types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types;
+                               base)
     Any[types[canon_id(kernel.plan.graph, v.id)] for v in kernel.plan.want]
 end
 
@@ -1476,16 +1579,16 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         output_cid = canon_id(inner.graph, only(recipe.outputs).id)
         scan_type = nothing
         if recipe.op isa _AuthoredScanOp
-            scan_atomic = typeof(recipe.op).parameters[2]
-            iterated = [i for i in 2:length(input_type_exprs) if !(i in scan_atomic)]
-            shared = [i for i in 2:length(input_type_exprs) if i in scan_atomic]
-            step_types = Any[input_type_exprs[1],
-                [Expr(:call, GlobalRef(Base, :eltype), input_type_exprs[i])
-                    for i in iterated]..., input_type_exprs[shared]...]
-            element = _authored_scan_step_output_type(recipe.op.kernel,
-                step_types, scan_offsets[recipe_index])
-            element === nothing || (scan_type = Expr(:curly,
-                GlobalRef(Base, :Vector), element))
+            # Never query the scan operation itself: it carries the step's
+            # whole PreparedKernel (`_scan_type_slots!`).
+            slots = scan_offsets[recipe_index]
+            element = _scan_has_history(recipe.op) ? nothing :
+                _authored_scan_step_output_type(recipe.op.kernel,
+                    _scan_step_input_types(recipe.op, input_type_exprs),
+                    slots.offset; slots.type_offset)
+            if _scan_has_history(recipe.op) || element !== nothing
+                scan_type = _scan_result_type_expr(recipe.op, input_type_exprs, element)
+            end
         end
         plate_type_exprs[output_cid] = scan_type === nothing ?
             Expr(:call, GlobalRef(Base, :promote_op),
@@ -1525,7 +1628,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
                 input, index, false) for input in recipe.inputs]
             _lower_plate_recipe_native!(assignments, recipe, args, out,
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index),
-                get(scan_offsets, recipe_index, 0))
+                get(scan_offsets, recipe_index, nothing))
         end
         condition = _authored_plate_condition(
             callargs, roots, root_positions, atomic)
@@ -1575,7 +1678,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
                 input, index, true) for input in recipe.inputs]
             _lower_plate_recipe_native!(assignments, recipe, args, out,
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index),
-                get(scan_offsets, recipe_index, 0))
+                get(scan_offsets, recipe_index, nothing))
         end
         if _authored_plate_unconditional_group(
                 roots, root_positions, atomic, callvalues)
@@ -1847,7 +1950,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     body, only(sum_recipe.outputs), total_lhs, declared)
             end
             if !tensorized && haskey(pending_scans, r.id)
-                scan_recipe, scan_args, scan_offset = pending_scans[r.id]
+                scan_recipe, scan_args, scan_offset, scan_type_offset =
+                    pending_scans[r.id]
                 output_id = canon_id(g, only(scan_recipe.outputs).id)
                 positions = findall(
                     v -> canon_id(g, v.id) == output_id, r.inputs)
@@ -1858,7 +1962,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                             pointwise_lhs, total_lhs)
                 _lower_authored_scan_native!(
                     body, scan_recipe.op, scan_args, nothing, scan_offset; consumer,
-                    pointwise_recycled = recycled(pointwise_id))
+                    pointwise_recycled = recycled(pointwise_id),
+                    type_offset = scan_type_offset)
             elseif tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
@@ -1894,6 +1999,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             scan_index = length(runtime_ops)
             append!(runtime_ops, r.op.kernel.ops)
             append!(runtime_recipes, r.op.kernel.lowered_recipes)
+            type_offset = _scan_type_slots!(runtime_ops, runtime_recipes, r.op)
             if tensorized
                 call = Expr(:call, Expr(:ref, _OPS_ARG, scan_index),
                             callargs...)
@@ -1903,12 +2009,12 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 if consumer === nothing
                     output = only(r.outputs)
                     _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index;
-                        recycled = lhs === nm(output) ?
+                        type_offset, recycled = lhs === nm(output) ?
                             recycled(canon_id(g, output.id)) : nothing)
                 else
                     # Emit at the plate, where all its scalar inputs are ready.
                     # The reserved table slots keep both backend products equal.
-                    pending_scans[consumer.id] = (r, callargs, scan_index)
+                    pending_scans[consumer.id] = (r, callargs, scan_index, type_offset)
                 end
             end
             continue
