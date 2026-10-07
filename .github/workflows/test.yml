@@ -123,8 +123,9 @@ jobs:
     runs-on: ubuntu-latest
     # One job cannot finish the ReactiveKernelsPPL suite inside GitHub's
     # 360-minute job limit: run 37575292025 spent 141 minutes on its first 51
-    # of 228 test files. Each shard runs every N-th file (see
-    # packages/ReactiveKernelsPPL/test/sharding.jl); N is the matrix length.
+    # of 228 test files. The shards split the files into N groups of about
+    # equal measured minutes (packages/ReactiveKernelsPPL/test/sharding.jl,
+    # shard_minutes.toml); N is the matrix length.
     timeout-minutes: 180
     strategy:
       fail-fast: false
