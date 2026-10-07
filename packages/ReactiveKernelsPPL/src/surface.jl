@@ -786,13 +786,14 @@ or predictor operand. Julia checks its concrete shape when evaluated.
 A data column read only inside whole-value calls, with no per-observation
 consumer, is a model-level data input of any length at bind.
 
-Input ownership and concurrency: neither `ast` nor the submodel bodies
-reachable through `mod` is mutated, so one AST may be lowered repeatedly
-and shared across tasks. Submodel and function resolution only READ `mod`
-bindings (`isdefined` / `getfield` — no eval, no registration), so definitions in
-distinct private modules never collide: one fresh `Module` per lowering,
-each holding its own `@rkppl name(args...) = ...` defs, is sufficient for
-concurrent independent lowerings with no shared lock.
+Input ownership and concurrency: `lower_rkppl` is concurrency-safe and
+takes no lock, so independent lowerings run concurrently. Neither `ast` nor
+the submodel bodies reachable through `mod` is mutated, so one AST may be
+lowered repeatedly and shared across tasks. Submodel and function resolution
+only READ `mod` bindings (`isdefined` / `getfield` — no eval, no
+registration), so definitions in distinct private modules never collide: one
+fresh `Module` per lowering, each holding its own `@rkppl name(args...) = ...`
+defs, is sufficient for concurrent independent lowerings.
 
 Lowering resolves these bindings in a package-owned latest-world scope,
 including kernels and imports just created by `Core.eval` in a builder.
