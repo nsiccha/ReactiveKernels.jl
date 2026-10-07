@@ -369,6 +369,28 @@ and lock the one Reactant 0.2.289 lifted:
   nested plate body is; a step without a concrete inferred output type keeps
   per-arm allocation. No activity configuration or derivative rule is
   involved.
+- On Julia 1.10, native Enzyme 0.13.210 reverse mode fails static activity
+  analysis (`EnzymeRuntimeActivityError`) for an empty array when a function
+  branches on the array's length and then allocates over it, for example
+  Base's `s * t`, `t * s`, `-t` or `0.5 * s * t`, which broadcast into a
+  fresh array. The optimizer splits that allocation into an empty arm whose
+  array is never written, and it meets the written array in one value:
+  `repro_enzyme_length_branch_allocation_split.jl` reproduces it with Enzyme
+  only. The earlier branch can be authored (`isempty(t)`, a loop over `t`) or
+  be the dimension check of a native dotted call's materialization, so a plate
+  cell such as `base .+ slope * (level[idx] ./ 2.0)` fails for a group with an
+  empty `idx`, and so can a fully dotted cell. Julia 1.12 with the same
+  Enzyme passes. The repair belongs in Enzyme's mixed-activity handler,
+  which can give a fresh allocation that no active data reaches a zero
+  shadow; an Enzyme build that does so passes this reproducer,
+  `repro_enzyme_branch_allocation_phi.jl` and the pinned plate-consumer
+  testset, including the gradients against central differences. Changing
+  RK's lowering only moves which spellings the optimizer splits: a
+  materialization loop that never reads the output's length slowed
+  small-cell plate gradients by 25 to 50 percent, and routing scalar-array
+  arithmetic through the native materializer still failed inside that
+  materializer. Values are unaffected; the testset pins the empty-group
+  gradients as broken on Julia 1.10.
 - Native Enzyme 0.13.209 reverse mode also fails static activity analysis
   (`EnzymeRuntimeActivityError`) when a recurrence's carry starts as a
   constant array and a reachable lazy branch can keep it while other paths
