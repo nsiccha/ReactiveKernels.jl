@@ -162,7 +162,11 @@ dense `Array`s of those element types: a per-cell index list such as
 by later calls like any bound value. A tuple, struct, view or range value
 (a named-tuple or static-vector scan seed, for example) is not cached: the
 recipe producing it stays in the cell, and the bound-only values it reads
-are cached instead. Under Reactant a tensorized plate still needs rectangular
+are cached instead. A plate whose cell result reads only bound data, and whose
+other inputs are all atomic, is evaluated whole at preparation and replaced by
+its result. Such an array result beside a live non-atomic input keeps its
+original execution, so a plate's output never stores the shared cached arrays.
+Under Reactant a tensorized plate still needs rectangular
 per-lane arrays; ragged lanes are refused there with or without the cache.
 Recipes still follow the pure-operation contract.
 An inline expression such as `theta * log(d)` is one mixed-input recipe and is

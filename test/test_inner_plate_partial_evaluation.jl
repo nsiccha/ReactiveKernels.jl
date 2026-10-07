@@ -234,6 +234,43 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         end
     end
 
+    @testset "data-only cell results" begin
+        limits = [0.5, 1.0, 1.0, 0.5, 1.0, 1.0]
+        rows = [[1, 2, 3], [4], [5, 6]]
+        subjects = 1:3
+        lives = ([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], [1.2, -0.4, 0.0, 2.0, 0.5, 0.1])
+        plain = prepare(C.data_only_result)
+        expected = [plain(live, limits, rows, subjects) for live in lives]
+        C.calls[] = 0
+        bound = prepare(C.data_only_result; bound = (; limits, rows, subjects))
+        @test C.calls[] == length(subjects)
+        # Bound inputs alone fix the domain, so the whole plate result is one
+        # hoisted value: no plate and no per-cell cache remain.
+        @test isempty(plates(bound.plan))
+        @test isempty(caches(bound.plan))
+        hoisted = only(r for r in bound.plan.recipes
+                       if r.op isa RK._BoundConstant &&
+                          only(r.outputs).name === :weights)
+        @test hoisted.op.value isa Vector{Vector{Float64}}
+        @test hoisted.op.value == [limits[r] for r in rows]
+        @test [bound(live) for live in lives] == expected
+        @test C.calls[] == length(subjects)
+        @test hoisted.op.value == [limits[r] for r in rows]
+
+        # A live non-atomic input keeps the plate, its runtime domain check
+        # and a result allocated per evaluation.
+        axis_plain = prepare(C.data_only_result_live_axis)
+        axis = prepare(C.data_only_result_live_axis; bound = (; limits, rows))
+        @test length(plates(axis.plan)) == 1
+        @test isempty(caches(axis.plan))
+        x = [1.0, 2.0, 3.0]
+        axis_expected = axis_plain(x, limits, rows)
+        C.calls[] = 0
+        @test axis(x) == axis_expected
+        @test C.calls[] == length(rows)
+        @test_throws DimensionMismatch axis([1.0, 2.0])
+    end
+
     @testset "demanded intermediates and composed consumers" begin
         data, observations = [1.0, 2.0, 4.0], [0.1, 0.2, 0.3]
         for want in (:total, :means, :pointwise,
@@ -271,6 +308,28 @@ import Enzyme
     @test only(cached).op.value == [log.(x) for x in xs]
     @test ad_value_and_gradient(bound, q) == ad_value_and_gradient(plain, q, xs)
     @test ad_gradient(bound, q) ≈ fill(sum(sum(log, x; init = 0.0) for x in xs), length(q))
+
+    # A data-only cell result must not reach native reverse mode as cached
+    # arrays stored into the plate's output (snag native-reverse-r-79fb001d).
+    limits = [0.5, 1.0, 1.0, 0.5, 1.0, 1.0]
+    rows = [[1, 2, 3], [4], [5, 6]]
+    subjects = 1:3
+    live = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    plain = prepare_ad(C.data_only_result, backend, live, limits, rows, subjects;
+                       active=:live, want=:total)
+    bound = prepare_ad(C.data_only_result, backend, live; active=:live,
+                       want=:total, bound=(; limits, rows, subjects))
+    @test ad_value_and_gradient(bound, live) ==
+          ad_value_and_gradient(plain, live, limits, rows, subjects)
+    @test ad_gradient(bound, live) == reduce(vcat, [limits[r] for r in rows])
+    x = [1.0, 2.0, 3.0]
+    plain = prepare_ad(C.data_only_result_live_axis, backend, x, limits, rows;
+                       active=:live, want=:total)
+    bound = prepare_ad(C.data_only_result_live_axis, backend, x; active=:live,
+                       want=:total, bound=(; limits, rows))
+    @test ad_value_and_gradient(bound, x) ==
+          ad_value_and_gradient(plain, x, limits, rows)
+    @test ad_gradient(bound, x) == fill(sum(limits), length(x))
 
     # A scan beside the cached index chain differentiates in the residual cell.
     data = (; kinds_by_subject = [[1, 2, 1, 1, 2, 1], [2, 2, 1, 2, 1], Int[]],
