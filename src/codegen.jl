@@ -4004,8 +4004,13 @@ inputs, and a no-recipe plan returns its `have` value directly. Treat mutable
 results as borrowed values that may alias inputs or be overwritten by later
 calls. A kernel instance is therefore neither reentrant nor safe for concurrent
 calls; prepare one instance per independent caller.
+
+A kernel prepared from exemplar arguments (`prepare_nonallocating(spec,
+args...)`) is typed for exactly those argument types (`S`, a `Tuple` type);
+calling it with arguments of other types is an `ArgumentError`. `S` is
+`Nothing` for a kernel typed by its declared HAVE port types.
 """
-struct NonAllocatingKernel{F,O,C,A,IN,OUT}
+struct NonAllocatingKernel{F,O,C,A,IN,OUT,S}
     f::F
     ops::O
     caches::C
@@ -4015,6 +4020,11 @@ struct NonAllocatingKernel{F,O,C,A,IN,OUT}
     plan::Plan
     ast::Expr
 end
+
+NonAllocatingKernel{S}(f::F, ops::O, caches::C, cache_apply::A, inputs::IN,
+                       outputs::OUT, plan::Plan, ast::Expr) where {F,O,C,A,IN,OUT,S} =
+    NonAllocatingKernel{F,O,C,A,IN,OUT,S}(f, ops, caches, cache_apply, inputs,
+                                          outputs, plan, ast)
 
 # Emit positional arguments explicitly: splatting the captured `args` tuple
 # into the RGF call allocates (one tuple box per call) even though the emitted
@@ -4026,18 +4036,30 @@ end
     :(k.f($(positional...)))
 end
 
-@inline function (k::NonAllocatingKernel{F,O,C,A,IN,OUT})(
-        args::Vararg{Any,N}) where {F,O,C,A,IN,OUT,N}
+@inline function (k::NonAllocatingKernel{F,O,C,A,IN,OUT,S})(
+        args::Vararg{Any,N}) where {F,O,C,A,IN,OUT,S,N}
     N == fieldcount(IN) || throw(MethodError(k, args))
+    S === Nothing || args isa S || _nonallocating_argument_types_error(k, S, args)
     _nonallocating_call(k, args, Val(N))
 end
 
-function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=nothing)
+@noinline _nonallocating_argument_types_error(k, ::Type{S}, args) where {S} =
+    throw(ArgumentError(
+        "this NonAllocatingKernel was prepared from exemplar arguments of types " *
+        "$(Tuple(fieldtypes(S))) and is typed for exactly those; it was called " *
+        "with $(map(typeof, args)). Prepare another kernel from exemplars of " *
+        "the new types"))
+
+function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=nothing,
+                                exact_signature::Bool=false)
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    rewritten, ops, caches = _nonallocating_program(p, ast; have_types)
+    rewritten, ops, caches = _nonallocating_program(p, ast; have_types,
+                                                    cache_apply)
+    exact_signature &&
+        (rewritten = _nonalloc_exact_signature(rewritten, have_types))
     # Compile with the operation and cache tuples bound as constants inside the
     # body. Passing them as call arguments re-tuples the non-isbits operation
     # table on every invocation at the runtime-generated call boundary — a
@@ -4046,8 +4068,9 @@ function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=noth
     # cheap and the compiled body sees them as constants.
     f = compile(_bind_nonallocating_constants(rewritten, ops, caches,
                                               cache_apply))
-    NonAllocatingKernel(f, ops, caches, cache_apply, Tuple(p.have),
-                        Tuple(p.want), p, rewritten)
+    S = exact_signature ? Tuple{have_types...} : Nothing
+    NonAllocatingKernel{S}(f, ops, caches, cache_apply, Tuple(p.have),
+                           Tuple(p.want), p, rewritten)
 end
 
 function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
@@ -4148,38 +4171,55 @@ function prepare(g::Graph; have = (), want = (), passes = (), bound = (), on_err
 end
 
 """
-    prepare_nonallocating(p::Plan; passes=()) -> NonAllocatingKernel
-    prepare_nonallocating(g::Graph; have, want, passes=()) -> NonAllocatingKernel
+    prepare_nonallocating(p::Plan, exemplars...; passes=()) -> NonAllocatingKernel
+    prepare_nonallocating(g::Graph, exemplars...; have, want, passes=()) -> NonAllocatingKernel
 
 Optional MutatingFunctions-backed preparation interface. Install and load
 `MutatingFunctions` alongside `ReactiveKernels` to activate the package
-extension that supplies these methods (for a `Plan`, a `Graph`, or an
-already-prepared `PreparedKernel`'s plan). The extension prepares the same
-straight-line plan as [`prepare`](@ref), then applies a final AST transform
-that routes every selected operation through `MutatingFunctions.apply!!` and a
-persistent per-step cache. User `passes` run before this final transform.
+extension that supplies these methods (for a `Plan`, a `Graph`, an authored
+`KernelSpec`, or an already-prepared `PreparedKernel`'s plan). The extension
+prepares the same straight-line plan as [`prepare`](@ref), then applies a final
+AST transform that routes operations with a destination-passing form through
+`MutatingFunctions.apply!!` and a persistent per-step cache. User `passes` run
+before this final transform.
+
+A step keeps a cache only when its result is fresh storage that a
+destination-passing method fills: the decomposition's own steps below, or an
+operation with a registered `apply!!` method for its concrete cache and
+argument types. Every other operation is called directly, and its result is
+never written into: a cached value may alias caller data (a field read, row
+slices of a caller matrix), and `apply!!`'s generic fallback would copy the
+next call's result into it.
 
 Operations synthesized from captured `@kernel` source are decomposed into
 destination-passing steps where the captured expression allows: lazy wrappers
 and isbits-valued calls run inline, broadcast materializations, `vcat`, range
 `getindex`, and `zeros`/`ones` reuse typed destination buffers, and every
-other resolved call becomes its own cache step so registered `apply!!`
-coverage (e.g. `mul!`-backed `*`) applies per step. Source shapes outside
-that grammar keep the whole-recipe cache step.
+other resolved call with a registered `apply!!` method (e.g. `mul!`-backed
+`*`) becomes its own cache step. Source shapes outside that grammar run as one
+operation.
+
+Cache types and step selection are fixed at preparation from static types. A
+HAVE port without a concrete declared type leaves everything computed from it
+untyped. Pass `exemplars`, one value per positional HAVE port in `inputs`
+order, to type the program from those values' types instead; the returned
+kernel then accepts exactly those argument types (any other is an
+`ArgumentError`). A declared array output of an authored plate
+(`y::Vector{Float64} = plate(...)`) fixes the element type of its buffer, as
+the native kernel's typed local does.
 
 The first invocation populates the caches and may allocate. Later invocations
 reuse them when the selected operations provide allocation-free `apply!!`
-methods for the runtime argument and cache types. MutatingFunctions' generic
-fallback preserves semantics but may still allocate, so allocation freedom is
-a property of the complete lowered operation set rather than a planner
+methods for the runtime argument and cache types. Operations without one
+allocate their result as the ordinary kernel does, so allocation freedom is a
+property of the complete lowered operation set rather than a planner
 guarantee.
 
-Every selected recipe must have exactly one output. Each slot retains the first
-object returned by its operation: that is fresh kernel-retained storage for
-ordinary allocating/registered operations, but it may be a caller-owned input
-for aliasing operations. A no-recipe plan returns its input directly. Treat
-mutable results as borrowed values that may alias inputs or be overwritten by
-the next call; a prepared instance is not reentrant or thread-safe.
+Every selected recipe must have exactly one output. A no-recipe plan returns
+its input directly, and a directly called operation's result may alias an
+input. Treat mutable results as borrowed values that may alias inputs or be
+overwritten by the next call; a prepared instance is not reentrant or
+thread-safe.
 """
 function prepare_nonallocating(args...; kwargs...)
     throw(ArgumentError(

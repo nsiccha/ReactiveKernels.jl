@@ -59,13 +59,26 @@ end
     qalt = [0.5, -0.2, 0.1, 0.3]
     kb = prepare(naad_spec; have = (:unconstrained, :X, :Cf, :cterm),
                  want = :posterior, bound = (; X = X, Cf = Cf, cterm = cterm))
-    kbna = prepare_nonallocating(kb)
+    # The HAVE ports are untyped, so only an exemplar-typed kernel keeps owned
+    # cache slots (a step without a destination-passing method for concrete
+    # types is a plain call); those slots are what the AD object threads.
+    kbna = prepare_nonallocating(kb, q)
     prep = prepare_ad(kb, NA_AD_BACKEND, q; active = :unconstrained)
     prepna = prepare_ad(kbna, NA_AD_BACKEND, q; active = :unconstrained)
 
     @testset "owned Cache threading" begin
         @test length(prepna.external_values) == 1
         @test only(prepna.external_values) isa Cache
+        untyped = prepare_nonallocating(kb)
+        @test all(isnothing, untyped.caches)
+        prepu = prepare_ad(untyped, NA_AD_BACKEND, q; active = :unconstrained)
+        @test only(prepu.external_values) isa DifferentiationInterface.Constant
+        gu = similar(q)
+        g = similar(q)
+        vu, _ = ad_value_and_gradient!(prepu, gu, q)
+        v, _ = ad_value_and_gradient!(prep, g, q)
+        @test vu == v
+        @test gu ≈ g
     end
 
     @testset "repeat calls and fresh points match dataflow" begin

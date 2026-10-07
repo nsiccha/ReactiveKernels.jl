@@ -613,20 +613,27 @@ The optional MutatingFunctions extension changes call lowering, not graph
 semantics or producer selection.
 
 `prepare_nonallocating` requires every selected recipe to have one output. It
-gives each recipe a persistent typed cache. The first invocation seeds the
-cache; later invocations offer it to `MutatingFunctions.apply!!`. The generic
-fallback may still allocate, so zero allocation is a property of the complete
-selected operation set and runtime types, never a planner theorem.
+gives a step a persistent typed cache only where a destination-passing method
+fills storage the kernel owns: its own decomposed steps, authored plates and
+scans, and operations with a registered `apply!!` method for their concrete
+types. The first invocation seeds the cache; later invocations offer it to
+`MutatingFunctions.apply!!`. Every other operation is called directly, because
+its first result may be caller-owned storage that the generic fallback would
+overwrite. Zero allocation is a property of the complete selected operation
+set and runtime types, never a planner theorem. Exemplar arguments
+(`prepare_nonallocating(spec, args...)`) type the step program from runtime
+argument types where HAVE ports are undeclared.
 
-The cached result is borrowed. An aliasing operation may retain caller-owned
-input storage, and the next call may overwrite the prior returned object. A
-`NonAllocatingKernel` instance is not reentrant, thread-safe, or suitable for
-concurrent callers.
+The returned result is borrowed. A directly called operation may return
+caller-owned input storage, and the next call may overwrite the prior returned
+object. A `NonAllocatingKernel` instance is not reentrant, thread-safe, or
+suitable for concurrent callers.
 
 `prepare_reactive_nonallocating` instead uses each compiled-state output slot as
-the per-instance cache for selected mutable single-output recipes. Invalidation
-clears validity without clearing storage, allowing a later recomputation to
-reuse the buffer. Multi-output and immutable-output recipes remain on the pure
+the per-instance cache for selected mutable single-output recipes that have a
+registered `apply!!` method for their declared port types. Invalidation clears
+validity without clearing storage, allowing a later recomputation to reuse the
+buffer. Multi-output, immutable-output and other recipes remain on the pure
 path. Independent state instances own independent buffers, but a returned
 mutable value is still borrowed from its state.
 
