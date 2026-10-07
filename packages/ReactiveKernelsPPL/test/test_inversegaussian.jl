@@ -1,7 +1,8 @@
 # Inverse-Gaussian / Wald response (SB `brm_inverse_gaussian_lpdf`
 # mirror): surface admission, value parity vs a Distributions.jl oracle
 # (literal / LogNormal-sampled / per-observation / modeled lambda),
-# Enzyme-vs-findiff gradients, Reactant/XLA value+grad, O(1) emission,
+# Enzyme-vs-findiff gradients, Reactant/XLA value+grad (in
+# test_inversegaussian_reactant.jl), O(1) emission,
 # W1/W2 SB parity vs the peer lane's BridgeStan numbers (brief
 # 2026-09-26T12-20-17-431-1qwuws0), and I1 modeled-lam SB parity vs the
 # term-nuisance SB pins (brief 2026-09-27T14-14-33-651-1mcop44).
@@ -12,7 +13,6 @@ using Distributions: InverseGaussian, Normal, LogNormal, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
-using Reactant
 using Test
 
 # Lower + bind + build + query an IG program; return
@@ -244,73 +244,6 @@ end
     @test h6 == h12
 end
 
-# Reactant/XLA value+grad parity at an unconstrained probe (no oracle —
-# native vs compiled), plus the traced program size.
-function _ig_reactant(prog::Expr, cols::Dict{Symbol,AbstractVector})
-    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
-    bound = bind_data(plan, cols)
-    built = build_kernel(bound)
-    post_q = prepare_query(built, bound, :sampler)
-    u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
-    return Base.invokelatest(_ig_reactant_measure, built, bound, post_q, u)
-end
-
-function _ig_reactant_measure(built, bound, post_q, u)
-    hlo = repr(Reactant.@code_hlo optimize = false post_q(Reactant.to_rarray(u)))
-    native = post_q(u)
-    compiled = Reactant.@compile post_q(Reactant.to_rarray(u))
-    primal = Float64(compiled(Reactant.to_rarray(u)))
-    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
-    g = similar(u)
-    val, _ = sampler_value_and_gradient!(q, g, u)
-    cad = compile_ad_value_and_gradient(q.ad, Reactant.to_rarray(u))
-    rval, rgrad = cad(Reactant.to_rarray(u))
-    return (; lines = count(==('\n'), hlo), native, primal, val, g,
-        rval = Float64(rval), rgrad = Array(rgrad))
-end
-
-@testset "ig under Reactant" begin
-    progs = [
-        ("literal lambda", quote
-            a ~ Normal(0, 1)
-            b ~ Normal(0, 1)
-            eta = a .+ b .* x
-            y .~ InverseGaussian.(exp.(eta), 1.5)
-        end, _ig_cols()),
-        ("LogNormal-sampled lambda", quote
-            a ~ Normal(0, 1)
-            b ~ Normal(0, 1)
-            lam ~ LogNormal(-0.3, 1.0)
-            eta = a .+ b .* x
-            y .~ InverseGaussian.(exp.(eta), lam)
-        end, _ig_cols()),
-        ("modeled lambda", quote
-            a ~ Normal(0, 1)
-            b ~ Normal(0, 1)
-            c ~ Normal(0, 1)
-            d ~ Normal(0, 1)
-            eta = a .+ b .* x
-            ls = c .+ d .* z
-            y .~ InverseGaussian.(exp.(eta), exp.(ls))
-        end, _ig_i1_cols()),
-    ]
-    for (name, prog, cols) in progs
-        @testset "$name" begin
-            fx = _ig_reactant(prog, cols)
-            @test fx.primal ≈ fx.native rtol = 1e-9
-            @test fx.val ≈ fx.native rtol = 1e-12
-            @test fx.rval ≈ fx.native rtol = 1e-9
-            @test fx.rgrad ≈ fx.g rtol = 1e-8
-        end
-    end
-    @testset "traced program is O(1) in n_obs" begin
-        _, prog, _ = progs[2]
-        small = _ig_reactant(prog, _ig_cols())
-        large = _ig_reactant(prog, Dict{Symbol,AbstractVector}(
-            :y => vcat(_IG_Y, _IG_Y), :x => vcat(_IG_X, _IG_X)))
-        @test small.lines == large.lines
-    end
-end
 # W1/W2 parity probes (N=80, x = randn(Xoshiro(20260926), 80),
 # y = [rand(yrng, InverseGaussian(exp(0.5 - 0.25 * t), 2.0)) for t in x]
 # with yrng = Xoshiro(20260927) advanced across the comprehension;

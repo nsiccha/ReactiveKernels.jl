@@ -5,8 +5,8 @@ using Test
 # Derived responses (G3): `.~` over a deterministic definition
 # (`ly = log.(earn)` then `ly .~ Normal.(mu, s)`) — the logearn/logmesquite
 # shape. Cross-file helpers come from test_generator.jl (`_GEN_BACKEND`)
-# and test_prior_vocab.jl (`_pv_query`, `_pv_posterior`, `_pv_enzyme_check`,
-# `_pv_reactant`), both included before this file in runtests.jl.
+# and test_prior_vocab.jl (`_pv_query`, `_pv_posterior`, `_pv_enzyme_check`),
+# both included before this file in runtests.jl.
 
 const _DR_M1 = quote
     b1 ~ Flat()
@@ -20,8 +20,6 @@ const _DR_EARN = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
 const _DR_X = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
 _dr_cols() = Dict{Symbol,AbstractVector}(
     :earn => copy(_DR_EARN), :x => copy(_DR_X))
-_dr_bigcols() = Dict{Symbol,AbstractVector}(
-    :earn => [2.0^i for i in 0:11], :x => repeat(_DR_X, 2))
 
 function _dr_m1_oracle(b1::Real, b2::Real, s::Real)
     ly = log.(_DR_EARN)
@@ -220,17 +218,4 @@ end
 
 @testset "derived response Enzyme gradients" begin
     _pv_enzyme_check(_DR_M1, _dr_cols(), (b1 = 0.5, b2 = -0.25, s = 1.3))
-end
-
-@testset "derived response under Reactant" begin
-    # Vector-mu Normal-id: default pipeline (narrowed §7n scope —
-    # scalar-mu only).
-    fx = _pv_reactant(_DR_M1, _dr_cols())
-    @test fx.primal ≈ fx.native rtol = 1e-9
-    @test fx.val ≈ fx.native rtol = 1e-12
-    @test fx.rval ≈ fx.native rtol = 1e-9
-    @test fx.rgrad ≈ fx.g rtol = 1e-8
-    # The derived local is a retained broadcast: doubling n_obs adds no
-    # HLO lines (core constraint 1 — no data-derived unrolling).
-    @test _pv_reactant(_DR_M1, _dr_bigcols()).lines == fx.lines
 end

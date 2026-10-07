@@ -384,6 +384,39 @@ end
 @inline _rk_rowreduce_inplace!(::typeof(minimum), r, A) = Base.minimum!(r, A)
 @inline _rk_rowreduce_inplace!(::typeof(maximum), r, A) = Base.maximum!(r, A)
 
+# --- cache ownership ---------------------------------------------------------
+# A step keeps a cache slot only when a destination-passing method fills owned
+# storage (`ReactiveKernels._nonalloc_destination`). Besides the core's own
+# fresh-storage steps, that is a registered `apply!!` method selected for the
+# step's concrete cache and argument types: its first result is the operation's
+# own fresh result, and later calls fill it in place. MutatingFunctions' generic
+# fallback is not one: it allocates the result and copies it into whatever the
+# slot holds, which may be caller data.
+const _GENERIC_APPLY = which(MutatingFunctions.apply!!, Tuple{Any,Any,Vararg{Any}})
+
+function ReactiveKernels._nonalloc_destination(::typeof(cache_apply!), op,
+                                               T, argtypes)
+    ReactiveKernels._nonalloc_fresh_step(op) && return true
+    argtypes === nothing && return false
+    T isa Type && isconcretetype(T) &&
+        all(t -> t isa Type && isconcretetype(t), argtypes) || return false
+    method = try
+        which(MutatingFunctions.apply!!, Tuple{T,typeof(op),argtypes...})
+    catch
+        return false
+    end
+    method !== _GENERIC_APPLY
+end
+
+# The reactive layer seeds a slot with its recipe's first result in the same
+# way, so it reuses a slot in place under the same rule, typed by the recipe's
+# declared port types.
+ReactiveKernels._reactive_inplace_destination(::typeof(reactive_cache_apply),
+                                              recipe::ReactiveKernels.Recipe) =
+    ReactiveKernels._nonalloc_destination(cache_apply!, recipe.op,
+        ReactiveKernels.valtype(only(recipe.outputs)),
+        map(ReactiveKernels.valtype, Tuple(recipe.inputs)))
+
 # --- public entry points ----------------------------------------------------
 
 function ReactiveKernels.prepare_reactive_nonallocating(graph::ReactiveKernels.Graph;
@@ -400,29 +433,34 @@ function ReactiveKernels.prepare_reactive_nonallocating(spec::ReactiveKernels.Ke
         cache_apply = reactive_cache_apply, is_mutating = is_mutating, kwargs...)
 end
 
-function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan;
+function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan,
+                                               exemplars...;
                                                passes = (), bound = ())
     p = ReactiveKernels._partial_apply(p, bound)
+    have_types = ReactiveKernels._nonalloc_exemplar_types(p, exemplars)
     # Embedded prepared recipes are already allocation-free executable kernels.
     # Keep them as one cache operation here; ordinary `prepare` is the boundary
     # that splices their generated bodies into a flat operation table.
     ast = ReactiveKernels._lower_unembedded(p)
     isempty(passes) || (ast = ReactiveKernels.transform(ast, passes...))
-    ReactiveKernels._prepare_nonallocating(p, ast, cache_apply!)
+    ReactiveKernels._prepare_nonallocating(p, ast, cache_apply!; have_types,
+        exact_signature = have_types !== nothing)
 end
 
-function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph;
+function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph,
+                                                exemplars...;
                                                 have = (), want = (), passes = (),
                                                 bound = ())
     p = ReactiveKernels.plan(g; have = have, want = want)
-    ReactiveKernels.prepare_nonallocating(p; passes = passes, bound = bound)
+    ReactiveKernels.prepare_nonallocating(p, exemplars...; passes = passes,
+                                          bound = bound)
 end
 
 # The natural consumer call after benchmarking an ordinary prepared kernel:
 # reuse its already-selected plan.
-function ReactiveKernels.prepare_nonallocating(k::ReactiveKernels.PreparedKernel;
-                                                passes = ())
-    ReactiveKernels.prepare_nonallocating(k.plan; passes = passes)
+function ReactiveKernels.prepare_nonallocating(k::ReactiveKernels.PreparedKernel,
+                                                exemplars...; passes = ())
+    ReactiveKernels.prepare_nonallocating(k.plan, exemplars...; passes = passes)
 end
 
 end # module ReactiveKernelsMutatingFunctionsExt

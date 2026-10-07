@@ -1110,18 +1110,35 @@ function _plate_reduction_plan(inner::Plan, inner_kernel, dependencies,
         end
     end
     recipe_index === nothing && return nothing
-    op = inner_kernel.ops[recipe_index]
-    op isa _KernelSourceOp && op.f isa _KernelReduction || return nothing
     recipe = inner.recipes[recipe_index]
     roots = dynamic(want)
     isempty(roots) && return nothing
+    _plate_reduction_kind(inner_kernel.ops[recipe_index], recipe, recipe_index,
+                          roots, input -> dynamic(canon_id(graph, input.id)))
+end
+
+# Which fold-outer lowering the plate's value recipe admits, from its
+# operation, or `nothing`. `dynamic(input)` names the plate roots an input
+# varies with; the fold's iterator and coefficients must vary with none.
+_plate_reduction_kind(op, recipe, recipe_index, roots, dynamic) = nothing
+function _plate_reduction_kind(op::_KernelSourceOp, recipe, recipe_index, roots,
+                               dynamic)
+    op.f isa _KernelReduction || return nothing
     II, XI, KI, AI = typeof(op.f).parameters
     for position in (II..., AI...)
-        isempty(dynamic(canon_id(graph, recipe.inputs[position].id))) ||
-            return nothing
+        isempty(dynamic(recipe.inputs[position])) || return nothing
     end
-    (; recipe_index, recipe, roots, iterator = II, init = XI, index = KI,
-       source = AI)
+    (; kind = Val(:gather), recipe_index, recipe, roots, iterator = II,
+       init = XI, index = KI, source = AI)
+end
+# A cell that is exactly Base's `evalpoly(x, c)` (an authored `evalpoly(x, c)`
+# over two ports is stored as the bare function, inputs in argument order)
+# with coefficients `c` shared by every cell.
+function _plate_reduction_kind(::typeof(evalpoly), recipe, recipe_index, roots,
+                               dynamic)
+    length(recipe.inputs) == 2 || return nothing
+    isempty(dynamic(recipe.inputs[2])) || return nothing
+    (; kind = Val(:evalpoly), recipe_index, recipe, roots)
 end
 
 # Fill a recycled lane buffer (`_lane_reuse`) instead of evaluating
@@ -1145,7 +1162,8 @@ function _inbounds_value(ex)
          Expr(:inbounds, :pop), value)
 end
 
-function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
+function _lower_plate_reduction_native(::Val{:gather}, reduction, inner::Plan,
+                                       locals, callargs,
                                        callvalues, raw_arguments, prepared_arguments,
                                        atomic, root_positions, plate_type_exprs, op_offset,
                                        plate_eltype, output_axes, pointwise_lhs,
@@ -1249,6 +1267,77 @@ function _lower_plate_reduction_native(reduction, inner::Plan, locals, callargs,
         push!(interchanged.args, every(:($accumulator =
             $(GlobalRef(@__MODULE__, :_plate_total_add))(
                 $accumulator, $(_inbounds_value(entry))))))
+    end
+    Expr(:if, ready, interchanged, cell_loop)
+end
+
+# Coefficient-outer lowering of an `evalpoly(x, c)` cell over coefficients
+# shared by every cell. Per cell, Base's `evalpoly(x, c::AbstractVector)` is a
+# runtime Horner loop, `ex = c[end]`, then `ex = muladd(x, ex, c[i])` for
+# `i = length(c)-1:-1:1`: a chain of dependent multiply-adds that cannot run
+# across cells. Here the cells of one tile take the seed, then each
+# coefficient in turn: one contiguous pass `acc = muladd(x, acc, c[i])` over
+# the tile per coefficient, which vectorizes across cells. Every cell performs
+# Base's operations in Base's order. The tile (`_PLATE_FOLD_TILE` cells) keeps
+# the accumulators and the cell's `x` in cache across the coefficient passes.
+# The types are checked when the body is compiled (`_plate_evalpoly_ready`);
+# coefficients with offset axes, which Base's `evalpoly` rejects, and domains
+# with more than one axis keep the cell loop.
+function _lower_plate_reduction_native(::Val{:evalpoly}, reduction, inner::Plan,
+                                       locals, callargs, callvalues, raw_arguments,
+                                       prepared_arguments, atomic, root_positions,
+                                       plate_type_exprs, op_offset, plate_eltype,
+                                       output_axes, pointwise_lhs, accumulator,
+                                       cell_loop)
+    graph = inner.graph
+    x_input, c_input = reduction.recipe.inputs
+    argument(input, cell) = _authored_plate_scalar_ref(
+        inner, locals, callargs, callvalues, prepared_arguments, atomic,
+        input, cell, true)
+    type_of(input) = let cid = canon_id(graph, input.id)
+        haskey(root_positions, cid) ? plate_type_exprs[cid] :
+            Expr(:call, GlobalRef(Base, :typeof), locals[cid])
+    end
+    coefficients = argument(c_input, nothing)
+    ready = Expr(:&&,
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_evalpoly_ready), plate_eltype,
+             type_of(x_input), type_of(c_input), output_axes),
+        Expr(:call, GlobalRef(Base, :!),
+             Expr(:call, GlobalRef(Base, :has_offset_axes), coefficients)))
+    if !_authored_plate_unconditional_group(
+            reduction.roots, root_positions, atomic, callvalues)
+        ready = Expr(:&&, _authored_plate_runtime_unconditional(
+            callargs, reduction.roots, root_positions, atomic), ready)
+    end
+    c, cells, count, lo, hi, position, cell, seed, j, cj = gensym.((
+        :plate_coefficients, :plate_cells, :plate_count, :plate_tile_lo,
+        :plate_tile_hi, :plate_position, :plate_cell, :plate_seed,
+        :plate_coefficient_index, :plate_coefficient))
+    entry = :($pointwise_lhs[$cell])
+    x = argument(x_input, cell)
+    base(name) = GlobalRef(Base, name)
+    tile_cells(body) = Expr(:for, :($position = $lo:$hi),
+        Expr(:block, :($cell = $(_inbounds_value(:($cells[$position])))), body))
+    interchanged = quote
+        $c = $coefficients
+        $cells = $(base(:CartesianIndices))($output_axes)
+        $count = $(base(:length))($cells)
+        for $lo in 1:$(GlobalRef(@__MODULE__, :_PLATE_FOLD_TILE)):$count
+            $hi = $(base(:min))($lo + $(GlobalRef(@__MODULE__, :_PLATE_FOLD_TILE)) - 1, $count)
+            $seed = $c[$(base(:lastindex))($c)]
+            $(tile_cells(_inbounds_expr(:($entry = $seed))))
+            for $j in ($(base(:length))($c) - 1):-1:1
+                $cj = $c[$j]
+                $(tile_cells(_inbounds_expr(:($entry = $(base(:muladd))($x, $entry, $cj)))))
+            end
+        end
+    end
+    if accumulator !== nothing
+        # The total adds the cells in coordinate order, as the cell loop does.
+        push!(interchanged.args, Expr(:for, :($position = 1:$count), Expr(:block,
+            :($cell = $(_inbounds_value(:($cells[$position])))),
+            :($accumulator = $(GlobalRef(@__MODULE__, :_plate_total_add))(
+                $accumulator, $(_inbounds_value(entry)))))))
     end
     Expr(:if, ready, interchanged, cell_loop)
 end
@@ -1411,7 +1500,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
         pointwise_lhs, total_lhs; recycled = nothing,
-        input_type_hints = nothing)
+        input_type_hints = nothing, element_type = nothing)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -1637,7 +1726,11 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
             GlobalRef(Core, :Any)) : nested.type
     inferred_eltype = only(_bind_native_type_exprs!(body, [inferred_eltype]))
-    push!(body.args, Expr(:(=), plate_eltype,
+    # A caller that already fixes the element type (the non-allocating step of
+    # a declared `Array{T}` plate output, whose cache is an `Array{T}`) passes
+    # it as `element_type`: each cell then converts on store, as the declared
+    # typed local converts the whole result in the ordinary native kernel.
+    push!(body.args, Expr(:(=), plate_eltype, element_type !== nothing ? element_type :
         Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
              inferred_eltype, valtype(only(inner.want)))))
     groups = _authored_plate_recipe_groups(
@@ -1766,7 +1859,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     if reduction === nothing
         push!(body.args, cell_loop)
     else
-        push!(body.args, _lower_plate_reduction_native(
+        push!(body.args, _lower_plate_reduction_native(reduction.kind,
             reduction, inner, locals, callargs, callvalues, raw_arguments,
             prepared_arguments, atomic, root_positions, plate_type_exprs, op_offset, plate_eltype,
             output_axes, pointwise_lhs, accumulator, cell_loop))
@@ -4004,8 +4097,13 @@ inputs, and a no-recipe plan returns its `have` value directly. Treat mutable
 results as borrowed values that may alias inputs or be overwritten by later
 calls. A kernel instance is therefore neither reentrant nor safe for concurrent
 calls; prepare one instance per independent caller.
+
+A kernel prepared from exemplar arguments (`prepare_nonallocating(spec,
+args...)`) is typed for exactly those argument types (`S`, a `Tuple` type);
+calling it with arguments of other types is an `ArgumentError`. `S` is
+`Nothing` for a kernel typed by its declared HAVE port types.
 """
-struct NonAllocatingKernel{F,O,C,A,IN,OUT}
+struct NonAllocatingKernel{F,O,C,A,IN,OUT,S}
     f::F
     ops::O
     caches::C
@@ -4015,6 +4113,11 @@ struct NonAllocatingKernel{F,O,C,A,IN,OUT}
     plan::Plan
     ast::Expr
 end
+
+NonAllocatingKernel{S}(f::F, ops::O, caches::C, cache_apply::A, inputs::IN,
+                       outputs::OUT, plan::Plan, ast::Expr) where {F,O,C,A,IN,OUT,S} =
+    NonAllocatingKernel{F,O,C,A,IN,OUT,S}(f, ops, caches, cache_apply, inputs,
+                                          outputs, plan, ast)
 
 # Emit positional arguments explicitly: splatting the captured `args` tuple
 # into the RGF call allocates (one tuple box per call) even though the emitted
@@ -4026,18 +4129,30 @@ end
     :(k.f($(positional...)))
 end
 
-@inline function (k::NonAllocatingKernel{F,O,C,A,IN,OUT})(
-        args::Vararg{Any,N}) where {F,O,C,A,IN,OUT,N}
+@inline function (k::NonAllocatingKernel{F,O,C,A,IN,OUT,S})(
+        args::Vararg{Any,N}) where {F,O,C,A,IN,OUT,S,N}
     N == fieldcount(IN) || throw(MethodError(k, args))
+    S === Nothing || args isa S || _nonallocating_argument_types_error(k, S, args)
     _nonallocating_call(k, args, Val(N))
 end
 
-function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=nothing)
+@noinline _nonallocating_argument_types_error(k, ::Type{S}, args) where {S} =
+    throw(ArgumentError(
+        "this NonAllocatingKernel was prepared from exemplar arguments of types " *
+        "$(Tuple(fieldtypes(S))) and is typed for exactly those; it was called " *
+        "with $(map(typeof, args)). Prepare another kernel from exemplars of " *
+        "the new types"))
+
+function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=nothing,
+                                exact_signature::Bool=false)
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    rewritten, ops, caches = _nonallocating_program(p, ast; have_types)
+    rewritten, ops, caches = _nonallocating_program(p, ast; have_types,
+                                                    cache_apply)
+    exact_signature &&
+        (rewritten = _nonalloc_exact_signature(rewritten, have_types))
     # Compile with the operation and cache tuples bound as constants inside the
     # body. Passing them as call arguments re-tuples the non-isbits operation
     # table on every invocation at the runtime-generated call boundary — a
@@ -4046,8 +4161,9 @@ function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=noth
     # cheap and the compiled body sees them as constants.
     f = compile(_bind_nonallocating_constants(rewritten, ops, caches,
                                               cache_apply))
-    NonAllocatingKernel(f, ops, caches, cache_apply, Tuple(p.have),
-                        Tuple(p.want), p, rewritten)
+    S = exact_signature ? Tuple{have_types...} : Nothing
+    NonAllocatingKernel{S}(f, ops, caches, cache_apply, Tuple(p.have),
+                           Tuple(p.want), p, rewritten)
 end
 
 function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
@@ -4148,38 +4264,55 @@ function prepare(g::Graph; have = (), want = (), passes = (), bound = (), on_err
 end
 
 """
-    prepare_nonallocating(p::Plan; passes=()) -> NonAllocatingKernel
-    prepare_nonallocating(g::Graph; have, want, passes=()) -> NonAllocatingKernel
+    prepare_nonallocating(p::Plan, exemplars...; passes=()) -> NonAllocatingKernel
+    prepare_nonallocating(g::Graph, exemplars...; have, want, passes=()) -> NonAllocatingKernel
 
 Optional MutatingFunctions-backed preparation interface. Install and load
 `MutatingFunctions` alongside `ReactiveKernels` to activate the package
-extension that supplies these methods (for a `Plan`, a `Graph`, or an
-already-prepared `PreparedKernel`'s plan). The extension prepares the same
-straight-line plan as [`prepare`](@ref), then applies a final AST transform
-that routes every selected operation through `MutatingFunctions.apply!!` and a
-persistent per-step cache. User `passes` run before this final transform.
+extension that supplies these methods (for a `Plan`, a `Graph`, an authored
+`KernelSpec`, or an already-prepared `PreparedKernel`'s plan). The extension
+prepares the same straight-line plan as [`prepare`](@ref), then applies a final
+AST transform that routes operations with a destination-passing form through
+`MutatingFunctions.apply!!` and a persistent per-step cache. User `passes` run
+before this final transform.
+
+A step keeps a cache only when its result is fresh storage that a
+destination-passing method fills: the decomposition's own steps below, or an
+operation with a registered `apply!!` method for its concrete cache and
+argument types. Every other operation is called directly, and its result is
+never written into: a cached value may alias caller data (a field read, row
+slices of a caller matrix), and `apply!!`'s generic fallback would copy the
+next call's result into it.
 
 Operations synthesized from captured `@kernel` source are decomposed into
 destination-passing steps where the captured expression allows: lazy wrappers
 and isbits-valued calls run inline, broadcast materializations, `vcat`, range
 `getindex`, and `zeros`/`ones` reuse typed destination buffers, and every
-other resolved call becomes its own cache step so registered `apply!!`
-coverage (e.g. `mul!`-backed `*`) applies per step. Source shapes outside
-that grammar keep the whole-recipe cache step.
+other resolved call with a registered `apply!!` method (e.g. `mul!`-backed
+`*`) becomes its own cache step. Source shapes outside that grammar run as one
+operation.
+
+Cache types and step selection are fixed at preparation from static types. A
+HAVE port without a concrete declared type leaves everything computed from it
+untyped. Pass `exemplars`, one value per positional HAVE port in `inputs`
+order, to type the program from those values' types instead; the returned
+kernel then accepts exactly those argument types (any other is an
+`ArgumentError`). A declared array output of an authored plate
+(`y::Vector{Float64} = plate(...)`) fixes the element type of its buffer, as
+the native kernel's typed local does.
 
 The first invocation populates the caches and may allocate. Later invocations
 reuse them when the selected operations provide allocation-free `apply!!`
-methods for the runtime argument and cache types. MutatingFunctions' generic
-fallback preserves semantics but may still allocate, so allocation freedom is
-a property of the complete lowered operation set rather than a planner
+methods for the runtime argument and cache types. Operations without one
+allocate their result as the ordinary kernel does, so allocation freedom is a
+property of the complete lowered operation set rather than a planner
 guarantee.
 
-Every selected recipe must have exactly one output. Each slot retains the first
-object returned by its operation: that is fresh kernel-retained storage for
-ordinary allocating/registered operations, but it may be a caller-owned input
-for aliasing operations. A no-recipe plan returns its input directly. Treat
-mutable results as borrowed values that may alias inputs or be overwritten by
-the next call; a prepared instance is not reentrant or thread-safe.
+Every selected recipe must have exactly one output. A no-recipe plan returns
+its input directly, and a directly called operation's result may alias an
+input. Treat mutable results as borrowed values that may alias inputs or be
+overwritten by the next call; a prepared instance is not reentrant or
+thread-safe.
 """
 function prepare_nonallocating(args...; kwargs...)
     throw(ArgumentError(

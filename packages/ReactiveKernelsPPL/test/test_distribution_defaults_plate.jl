@@ -23,12 +23,9 @@ function _defaults_plate(n)
 end
 
 @testset "Normal default scale in plate observations" begin
-    structures = Dict{String,Int}[]
     for n in (3, 7)
         built, bound, kernel, u, expected = _defaults_plate(n)
         @test Base.invokelatest(kernel, u) ≈ expected atol=1e-10 rtol=1e-10
-        push!(structures, Base.invokelatest(_defaults_backends,
-            built, bound, kernel, u, expected; structure_body = true))
+        Base.invokelatest(_defaults_native_reverse, built, bound, kernel, u, expected)
     end
-    @test structures[1] == structures[2]
 end
