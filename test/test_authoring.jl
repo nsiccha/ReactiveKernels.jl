@@ -179,7 +179,8 @@ end
         source = _authoring_chunk_capture_expr(51)
         expanded = macroexpand(@__MODULE__, source)
         forms = _authoring_count_chunk_forms(expanded)
-        @test forms == (named = 0, direct = 2)
+        @test forms == (named = 0,
+                        direct = cld(51, ReactiveKernels._KERNEL_EXPAND_CHUNK))
 
         captured = Core.eval(@__MODULE__, expanded)
         @test length(kernel_graph(captured).recipes) == 51
@@ -191,6 +192,34 @@ end
         @test ReactiveKernels.RuntimeGeneratedFunctions.generated_callfunc(
             source_function.runtime_f, source_function.captures, 4,
         ) == 11
+    end
+
+    @testset "generator definitions evaluate without binding a name" begin
+        # Program generators (RKPPL `build_kernel`) evaluate a definition at
+        # top level; recipe closures are evaluated one by one, so the spec must
+        # match what `@kernel` builds, across several recipe groups.
+        count = 3 * ReactiveKernels._KERNEL_EXPAND_CHUNK + 1
+        statements = Any[Expr(:(=), Symbol(:gen_y_, index),
+                              :(x + sum(gen_offsets) + $index)) for index in 1:count]
+        definition = :(gen_model(x::Int) = begin
+            $(statements...)
+            return $(Symbol(:gen_y_, count))
+        end)
+        generated = Module(gensym(:GeneratedDefinition))
+        Core.eval(generated, :(using ReactiveKernels; const gen_offsets = (1, 2, 3)))
+        spec = ReactiveKernels._kernel_eval_definition(generated, definition)
+        @test spec isa KernelSpec
+        @test !isdefined(generated, :gen_model)
+        @test length(kernel_graph(spec).recipes) == count
+        @test Base.invokelatest(prepare(spec), 4) == 4 + 6 + count
+
+        authored = Module(gensym(:AuthoredDefinition))
+        Core.eval(authored, :(using ReactiveKernels; const gen_offsets = (1, 2, 3)))
+        macro_spec = Core.eval(authored, Expr(:macrocall, Symbol("@kernel"),
+                                              LineNumberNode(0), definition))
+        @test keys(spec) == keys(macro_spec)
+        @test Base.invokelatest(prepare(spec; want = :gen_y_7), 2) ==
+              Base.invokelatest(prepare(macro_spec; want = :gen_y_7), 2) == 2 + 6 + 7
     end
 
     @testset "function-shaped definitions, optional types, and exposed ports" begin

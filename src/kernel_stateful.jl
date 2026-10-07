@@ -727,11 +727,11 @@ function _kernel_scope_spec(spec::KernelSpec, scope::Symbol)
             mapped[canon_id(spec.graph, id)], "scoped child alias")
     end
     for recipe in spec.graph.recipes
-        add!(graph;
-            inputs = Tuple(mapped[value.id] for value in recipe.inputs),
-            outputs = Tuple(mapped[value.id] for value in recipe.outputs),
-            op = recipe.op, cost = recipe.cost, cse_key = recipe.cse_key,
-            effectful = recipe.effectful, source = recipe.source)
+        _add_recipe!(graph,
+            Tuple(mapped[value.id] for value in recipe.inputs),
+            Tuple(mapped[value.id] for value in recipe.outputs),
+            recipe.op, recipe.cost, recipe.cse_key,
+            recipe.effectful, recipe.source)
     end
     _reindex_producers!(graph)
     scoped(name) = _kernel_scoped_port(scope, name)
@@ -1055,7 +1055,10 @@ function _kernel_object_owner_spec(object)
     skel = _kernel_object_skeleton(object)
     spec = kernel_spec(skel)
     bindings = _kernel_object_bindings(object)
-    bound = Set(Symbol.(keys(bindings)))
+    bound = Set{Symbol}()
+    for name in keys(bindings)
+        push!(bound, name)
+    end
     isempty(bound) && return spec
 
     for recipe in spec.graph.recipes

@@ -12,7 +12,7 @@ include("evidence.jl")
 # nothing for data-only recipes. Plates compile to allocation-free loops
 # with shared work hoisted; constraining stays hand-rolled (no bijectors).
 # The `@kernel` def is evaluated in the dedicated `PPLGeneratedModels` scope
-# (counter-suffixed binding per build).
+# without binding a name there.
 
 
 """
@@ -23,10 +23,14 @@ program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
 [`LayoutTable`](@ref) (R10 read API for the sampler side).
 
-Thread safety: concurrent `build_kernel` calls over independent plans are
-supported — the counter-suffixed `PPLGeneratedModels` binding is assigned
-under a package-owned lock, so every build gets a distinct binding with no
-caller-side synchronization. The returned spec closes over build-time
+Concurrency: `build_kernel` is concurrency-safe. Independent plans may be
+built from concurrent tasks with no caller-side synchronization: a build
+binds nothing in a shared module and takes no package lock. Construction
+compiles little per-model code, so concurrent builds largely run in
+parallel; Julia serializes only the compilation that remains (1.10: all
+compilation; 1.12 and 1.13: type inference).
+
+The returned spec closes over build-time
 eval'd code. Construction resolves module bindings in a package-owned
 latest-world scope, including just-evaluated kernels; subsequent execution
 uses its own boundary: `prepare` it and call it through [`prepare_query`](@ref) /
@@ -221,18 +225,18 @@ end
 _ordered_columns(plan::StructuralPlan) =
     sort!(collect(plan.columns); by = first)
 
-_data_arg(name::Symbol, col::AbstractVector) =
-    Expr(:(::), name, Vector{eltype(col)})
-_data_arg(name::Symbol, col::AbstractMatrix) =
-    Expr(:(::), name, Matrix{eltype(col)})
+# The element type and rank come from the column's type parameters, so this
+# compiles no generic `eltype`/`ndims` call that other packages' array methods
+# could invalidate.
+_data_arg(name::Symbol, ::AbstractVector{T}) where {T} = Expr(:(::), name, Vector{T})
+_data_arg(name::Symbol, ::AbstractMatrix{T}) where {T} = Expr(:(::), name, Matrix{T})
 _data_arg(name::Symbol, v::Number) = Expr(:(::), name, typeof(v))
-_data_arg(name::Symbol, col::AbstractArray) =
-    Expr(:(::), name, Array{eltype(col),ndims(col)})
+_data_arg(name::Symbol, ::AbstractArray{T,N}) where {T,N} = Expr(:(::), name, Array{T,N})
 
 # Dedicated eval scope for generated models. The `using` lines resolve via
 # this package's own Project (by file location), so generated code loads in
-# ANY consumer session with no LOAD_PATH dependence. One counter-suffixed
-# binding per build; slice-1 scale makes interning harmless.
+# ANY consumer session with no LOAD_PATH dependence. Builds bind nothing
+# here (see `_eval_kernel_def`).
 module PPLGeneratedModels
 using ReactiveKernels
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
@@ -280,28 +284,13 @@ import .._simplex_slices_constrain, .._simplex_slices_logjac
 import .._ordered_slices_constrain, .._ordered_slices_logjac
 end
 
-const _MODEL_COUNTER = Ref(0)
-
-# Package-owned binding lock: the counter increment plus the two
-# `PPLGeneratedModels` evals are one critical section, so concurrent
-# `build_kernel` calls always land on distinct bindings (an unsynchronized
-# `Ref` increment drops updates under contention and two builds would
-# silently share one binding — the second model's def wins and the first
-# task reads back the wrong kernel).
-const _MODEL_EVAL_LOCK = ReentrantLock()
-
-function _eval_kernel_def(def::Expr)
-    lock(_MODEL_EVAL_LOCK) do
-        _MODEL_COUNTER[] += 1
-        name = Symbol(:ppl_model_, _MODEL_COUNTER[])
-        sig = def.args[1]
-        renamed = Expr(:(=), Expr(:call, name, sig.args[2:end]...), def.args[2])
-        call = Expr(:macrocall, Symbol("@kernel"), LineNumberNode(1, :generator),
-            renamed)
-        Core.eval(PPLGeneratedModels, call)
-        return Core.eval(PPLGeneratedModels, name)
-    end
-end
+# Evaluate the generated `@kernel` definition and return its spec. Nothing is
+# bound in `PPLGeneratedModels`: concurrent builds share no package state (no
+# lock, no counter) and a built spec is retained only by its caller. RK
+# evaluates the recipe closures separately so construction compiles no
+# per-model code (`ReactiveKernels._kernel_eval_definition`).
+_eval_kernel_def(def::Expr) =
+    ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def)
 
 # Scalar + derived assignments in topo order (params already constrained
 # above, so every scalar name resolves; derived columns resolve as locals
@@ -338,7 +327,7 @@ end
 # use the inverse-logit function, including inside reductions.
 _value_math_rewrite(ex) = ex
 function _value_math_rewrite(ex::Expr)
-    args = map(_value_math_rewrite, ex.args)
+    args = Any[_value_math_rewrite(a) for a in ex.args]
     if ex.head in (:call, :.) && !isempty(args) && args[1] === :logistic
         args[1] = :_ppl_logistic
     end
@@ -1483,12 +1472,16 @@ end
 # the recipe. Returns the plate input symbol and the cell lane ref.
 _ybool_name(label::Symbol) = Symbol(:_ppl_yb_, label)
 
+# A column whose element type is exactly Bool. Type tests rather than an
+# `eltype` call keep this check concretely inferred.
+_is_bool_column(col) = col isa Bool || col isa AbstractArray{Bool}
+
 # Count endpoints take integer values. Keep the caller's Bool column available
 # to every other reader and form a separate zero/one integer value for the
 # density. This data-only recipe is shared by native and compiled execution.
 function _count_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
         y::Symbol, label::Symbol)
-    eltype(plan.columns[y]) === Bool || return y
+    _is_bool_column(plan.columns[y]) || return y
     yi = Symbol(:_ppl_yi_, label)
     push!(pre, :($yi = Int.($y)))
     return yi
@@ -1497,7 +1490,7 @@ end
 function _bernoulli_yplate!(pre::Vector{Expr}, plan::StructuralPlan,
         y::Symbol, label::Symbol, yv::Symbol)
     col = plan.columns[y]
-    eltype(col) === Bool && return y, yv
+    _is_bool_column(col) && return y, yv
     yb = _ybool_name(label)
     push!(pre, :($yb = Array{Bool}($y .!= 0)))
     return yb, yv
@@ -3198,7 +3191,7 @@ end
 
 # One normalized scalar prior body, shared by parameter and hyper-prior slots.
 function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false)
-    argvals = [v for v in values(p.args)]
+    argvals = Any[v for v in values(p.args)]
     base = _family_logpdf_expr(p.family, argvals, p.name)
     local_pre = conditioned ? Expr[] : pre
     corr = _support_correction(p.family, p.support_override, argvals; pre = local_pre, stem = p.name)

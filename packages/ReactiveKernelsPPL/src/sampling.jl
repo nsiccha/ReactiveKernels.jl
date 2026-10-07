@@ -122,13 +122,12 @@ function _external_parameter(name, rhs, shape, mod, names; observed=false,
         Expr(:call, resolved.args[1], resolved.args[2].args...) : resolved
     (bare || call isa Expr && call.head === :call) || _sfail("sampling RHS $name needs a callable or RHS value")
     arguments = bare ? Any[] : call.args[2:end]
-    args = Tuple(arguments)
     geometry = if observed
         nothing
     else
         head = bare ? call : call.args[1]
         head isa GlobalRef || _sfail("external RHS $name needs a module-visible constructor")
-        g = sampling_geometry(getglobal(head.mod, head.name), deepcopy(args), Tuple(shape))
+        g = sampling_geometry(getglobal(head.mod, head.name), Tuple(deepcopy(arguments)), Tuple(shape))
         g isa ParameterGeometry || _sfail("sampling_geometry for $name must return ParameterGeometry")
         Tuple(shape) == g.shape || _sfail("sampling geometry for $name has shape $(g.shape), " *
             "but its declaration has shape $(Tuple(shape)); declare its constrained dimensions")
