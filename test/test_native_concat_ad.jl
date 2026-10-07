@@ -51,6 +51,22 @@ end
     end
     total = sum(trajectory)
 end
+# Scalar and mixed bracket literals of constant and active entries.
+@kernel literal_cells(a, x, c) = begin
+    pointwise = plate(x, Ref(c), Ref(a)) do xi, cc, s
+        system = [-s 0; s -cc]
+        affine = [system [exp(s * xi), 0]; 0 0 1]
+        sum(affine * [1, 2, 3])
+    end
+    total = sum(pointwise)
+end
+@kernel literal_scanned(a, x, c) = begin
+    trajectory = scan(x, Ref(c), Ref(a); init = zero(a)) do carry, xi, cc, s
+        next = first([carry 1; 0 1] * [exp(s * xi), cc])
+        (next, next)
+    end
+    total = sum(trajectory)
+end
 @traceable with_column(D, v) = hcat(D, v)
 @kernel helper(a, D, x, w) = begin
     total = sum(with_column(D, exp.(a .* x)) * w)
@@ -71,6 +87,14 @@ function blocks_ref(a, C, x, R)
     for half in (0, n), i in 1:n
         total += C[i, 1] * R[half + i, 1] + C[i, 2] * R[half + i, 2] +
                  exp(a * x[i]) * R[half + i, 3]
+    end
+    total
+end
+function literal_scanned_ref(a, x, c)
+    carry, total = zero(a), zero(a)
+    for xi in x
+        carry = carry * exp(a * xi) + c
+        total += carry
     end
     total
 end
@@ -101,6 +125,9 @@ _derivative(f, a) = (f(a + cbrt(eps(a))) - f(a - cbrt(eps(a)))) / (2cbrt(eps(a))
             (cells, (; x, c = w), a -> n * sum(w) + sum(exp.(a .* x); init = zero(a))),
             (scanned, (; x, c = w),
              a -> sum((n - k + 1) * (sum(w) + exp(a * x[k])) for k in 1:n; init = zero(a))),
+            (literal_cells, (; x, c = T(0.25)),
+             a -> sum(3exp(a * xi) - 2 * T(0.25) + 3 for xi in x; init = zero(a))),
+            (literal_scanned, (; x, c = T(0.25)), a -> literal_scanned_ref(a, x, T(0.25))),
         )
         for (spec, data, reference) in cases, a in T.((0.3, -0.6))
             k = prepare(spec; bound = data)

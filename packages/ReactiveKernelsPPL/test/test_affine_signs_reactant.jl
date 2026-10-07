@@ -17,10 +17,13 @@ using Reactant
             @test Float64(rval) ≈ val
             @test Array(rgrad) ≈ grad
             @test Array(rgrad) ≈ _findiff_grad(f.oracle, f.u) rtol=1e-5 atol=1e-7
-            # More observations must not replicate backend operations or
-            # control-flow regions (docs/src/constraints.md).
+            # More observations must not replicate operations or control-flow
+            # regions in RK emission, so compare the emitted trace
+            # (docs/src/constraints.md). The optimizer may legitimately order
+            # it by shape: it moves the monotonic column's negation ahead of
+            # its gather only once there are more observations than levels.
             ops = [m.match for m in eachmatch(r"stablehlo\.[a-z_]+",
-                string(Reactant.@code_hlo sampler.kernel(ru)))]
+                string(Reactant.@code_hlo optimize=false sampler.kernel(ru)))]
             @test !isempty(ops)
             if n == 3
                 operations[f.label] = ops

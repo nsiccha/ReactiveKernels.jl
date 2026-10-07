@@ -19,14 +19,23 @@ The RHS returns a state-length vector and reads its arguments without mutating
 them. Extra arguments may be floating scalars or arrays, integer scalars or
 arrays, and tuples or named tuples of these. Inputs remain read-only, including
 on failure. Numeric states, times, and floating arguments are packed as Float64.
+The RHS must also accept dual-number states and floating arguments, because
+the solver's Newton Jacobian and the forward sensitivities below evaluate it
+with ForwardDiff numbers.
 The current adapter differentiates floating parameters packed through `args`.
 Active parameters captured only in `f` are unsupported: the scalar-decay
 reproducer `benchmark/repro_native_bdf_captured_rhs.jl` yields a zero gradient
 instead of its nonzero analytic derivative. A closure is valid for primal
 evaluation; move its active parameters into `args` for this adapter's Reverse.
-Ordinary native Enzyme Reverse uses SciMLSensitivity's existing
-`GaussAdjoint(autojacvec = EnzymeVJP())`; no consumer AD rule or activity setting
-is required. Initial and output times participate in differentiation.
+Ordinary native Enzyme Reverse uses SciMLSensitivity's
+`ForwardDiffSensitivity()`: the solver integrates the sensitivities with respect
+to the initial state and every packed floating value as dual numbers, and its
+error test covers them as well as the states. Gradient accuracy therefore
+follows the caller tolerances, comparably to CVODES with sensitivity error
+control. A gradient costs one dual solve per chunk of at most 12 packed
+floating values, data included, plus one per chunk of at most 12 states. No
+consumer AD rule or activity setting is required. Initial and output times
+participate in differentiation.
 
 This is the generic numerical callable. Source/transpilation layers can bind
 an ODE call to it or restructure equivalent helpers and parameter layouts;

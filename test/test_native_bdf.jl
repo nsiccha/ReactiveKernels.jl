@@ -14,6 +14,22 @@ _bdf_loss(u, p, ts) = sum(rk_ode_bdf_tol(_bdf_decay, u, p[1], ts,
     1e-9, 1e-9, 10000, p[2]))
 _bdf_time_loss(u, p, ts) = sum(rk_ode_bdf_tol(_bdf_time_rhs, u, p[1], ts,
     1e-9, 1e-9, 10000, p[2]))
+# Two-compartment amounts with gamma-shaped (shape 3) input pulses at dose times.
+function _bdf_two_compartment(t, y, lp, dose_times, amounts)
+    cl, v1, q, v2, ktr = exp(lp[1]), exp(lp[2]), exp(lp[3]), exp(lp[4]), exp(lp[5])
+    input = zero(t * ktr)
+    for j in eachindex(dose_times)
+        s = t - dose_times[j]
+        if s > 0
+            input += amounts[j] * ktr^3 * s^2 * exp(-ktr * s) / 2
+        end
+    end
+    k10, k12, k21 = cl / v1, q / v1, q / v2
+    [input - (k10 + k12) * y[1] + k21 * y[2], k12 * y[1] - k21 * y[2]]
+end
+_bdf_two_compartment_loss(lp, rt, at) = sum(log.(rk_ode_bdf_tol(_bdf_two_compartment,
+    [0.0, 0.0], 0.0, [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 13.0, 14.0, 16.0, 20.0, 24.0],
+    rt, at, 10000, lp, [0.0, 12.0], [100.0, 50.0])[:, 1]))
 function _bdf_nested_loss(u, rates, gain)
     cfg = (rates = rates, order = [2, 1])
     out = rk_ode_bdf_tol(_bdf_nested_rhs, u, 0.0, [0.2, 1.4],
@@ -82,6 +98,24 @@ end
         @test dg ≈ oracle_dg rtol=3e-6
         @test u == [1.4, 0.5]
         @test rates == [0.3, 1.2]
+    end
+    @testset "parameter gradients follow the caller tolerance" begin
+        # Independent reference: fourth-order central differences of a tight primal.
+        lp = log.([5.0, 20.0, 10.0, 50.0, 1.5])
+        h = 1e-4
+        reference = map(eachindex(lp)) do j
+            e = zeros(length(lp))
+            e[j] = h
+            f(x) = _bdf_two_compartment_loss(x, 1e-12, 1e-12)
+            (-f(lp .+ 2e) + 8f(lp .+ e) - 8f(lp .- e) + f(lp .- 2e)) / (12h)
+        end
+        for tol in (1e-6, 1e-8)
+            gradient = zeros(length(lp))
+            Enzyme.autodiff(Enzyme.Reverse, _bdf_two_compartment_loss, Enzyme.Active,
+                Enzyme.Duplicated(copy(lp), gradient), Enzyme.Const(tol), Enzyme.Const(tol))
+            relative = sqrt(sum(abs2, gradient .- reference) / sum(abs2, reference))
+            @test relative < 20tol
+        end
     end
     @testset "prepared native kernel Reverse" begin
         graph = Graph()
