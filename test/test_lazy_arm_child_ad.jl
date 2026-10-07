@@ -111,6 +111,26 @@ end
     return total
 end
 
+# The same shape undeclared, with a child nothing else in this module calls:
+# inferring the cell then widens the nested call to `Any`, and the summed plate
+# must still add its cells (todo `1a2te8d`).
+@kernel running_total(xs, gain) = begin
+    updates = scan(xs, Ref(gain); init = 0.0) do carry, x, g
+        next = carry + x * g
+        (next, next)
+    end
+    total = sum(updates)
+    return total
+end
+
+@kernel undeclared_cell_scan_child(groups, gain) = begin
+    cells = plate(groups, Ref(gain)) do xs, g
+        g > 0.0 ? running_total(xs, g) : 0.0
+    end
+    total = sum(cells)
+    return total
+end
+
 @kernel guarded_region_child(xs, flag) = begin
     v = flag > 0 ? first_partial(xs) : 0.0
     return v
@@ -223,5 +243,21 @@ scaled_reference(xs, g) = (sum(x * g + softplus(x * g) for x in xs),
     @test guarded(Float64[], 0) == 0.0
     @test guarded([2.0, 3.0], 1) == 2.0
     @test_throws BoundsError guarded(Float64[], 1)
+end
+
+@testset "an undeclared plate cell from a lazy-arm child is summed" begin
+    groups = [[1.0, 2.0, 0.5], [2.0], Float64[]]
+    kernel = prepare(undeclared_cell_scan_child)
+    ad = prepare_ad(kernel, AutoEnzyme(; mode = Enzyme.Reverse), groups, 0.5;
+                    active = :gain)
+    for g in (0.5, 1.3)
+        expected = sum(first(cumulative_reference(xs, g)) for xs in groups)
+        dexpected = sum(last(cumulative_reference(xs, g)) for xs in groups)
+        @test kernel(groups, g) ≈ expected
+        value, gradient = ad_value_and_gradient(ad, groups, g)
+        @test value ≈ expected
+        @test gradient ≈ dexpected
+    end
+    @test ad_value_and_gradient(ad, groups, -0.5) == (0.0, 0.0)
 end
 end
