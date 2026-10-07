@@ -1674,6 +1674,73 @@ end
     end
 end
 
+# Coefficient-outer lowering of an `evalpoly(x, c)` cell over shared
+# coefficients (snag native-lowering-948c4ab6). Base's `evalpoly` over a vector
+# is a per-cell runtime Horner loop; the lowering runs each coefficient as one
+# pass over a tile of cells, with Base's operations in Base's order. The
+# control calls the same `evalpoly` through a function the lowering does not
+# recognize, so it keeps the cell loop.
+_plate_horner(x, c) = evalpoly(x, c)
+@kernel evalpoly_cell(xs, c) = begin
+    ys = plate(xs, Ref(c)) do x, c
+        evalpoly(x, c)
+    end
+    total = sum(ys)
+    return ys, total
+end
+@kernel evalpoly_cell_reordered(xs, c) = begin
+    ys = plate(Ref(c), xs) do c, x
+        evalpoly(x, c)
+    end
+    return ys
+end
+@kernel evalpoly_control(xs, c) = begin
+    ys = plate(xs, Ref(c)) do x, c
+        _plate_horner(x, c)
+    end
+    total = sum(ys)
+    return ys, total
+end
+_evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(kernel)))
+
+@testset "authored plate block: an evalpoly cell over shared coefficients runs coefficient-outer" begin
+    cell, control = prepare(evalpoly_cell), prepare(evalpoly_control)
+    @test _evalpoly_lowered(cell)
+    @test !_evalpoly_lowered(control)
+    @test _evalpoly_lowered(prepare(evalpoly_cell_reordered))
+    coefficients = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011, 2.5e-3, -4.0e-4, 1.0e-5, 3.0e-6, -7.0e-7]
+    # Lengths around the tile, and degrees down to a constant.
+    for n in (0, 1, 255, 256, 257, 513, 1000), c in (coefficients, coefficients[1:2], [2.5])
+        xs = [1 / (k + 0.5) for k in 0:n-1]
+        got, expected = cell(xs, c), control(xs, c)
+        @test got[1] == expected[1] == evalpoly.(xs, Ref(c))
+        @test got[2] === expected[2]
+        @test prepare(evalpoly_cell_reordered)(xs, c) == expected[1]
+    end
+    xs = collect(range(-2.0, 2.0; length = 300))
+    # Not lowered, same values: integer coefficients (the seed's type is not
+    # the cell's), a tuple (Base's unrolled method), a two-axis domain.
+    @test cell(xs, [1, 2, 3])[1] == evalpoly.(xs, Ref([1, 2, 3]))
+    @test cell(xs, Tuple(coefficients))[1] == evalpoly.(xs, Ref(Tuple(coefficients)))
+    grid = reshape(xs, 15, 20)
+    @test cell(grid, coefficients)[1] == evalpoly.(grid, Ref(coefficients))
+    # A one-based view is lowered like a vector.
+    @test cell(xs, view(coefficients, 2:6))[1] == evalpoly.(xs, Ref(view(coefficients, 2:6)))
+    # Base's errors: empty coefficients have no `c[end]`.
+    @test_throws BoundsError cell(xs, Float64[])
+    @test cell(Float64[], Float64[]) == (Float64[], 0.0)
+    # The output is the only allocation, as for the cell loop.
+    allocated(k, xs, c) = @allocated k(xs, c)
+    allocated(cell, xs, coefficients)
+    allocated(control, xs, coefficients)
+    @test allocated(cell, xs, coefficients) <= allocated(control, xs, coefficients) +
+                                                _natural_sup_parity_margin
+    # The coefficient passes vectorize across cells.
+    if Sys.ARCH in (:x86_64, :aarch64)
+        @test occursin(r"<\d+ x double>", _plate_entry_llvm(cell, xs, coefficients))
+    end
+end
+
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin
     # The tensorized rewrite, evaluated on host values, is Base's own fold: the
     # filter is a branch on the accumulator and `get` stays `Base.get`. Over a

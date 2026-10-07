@@ -680,7 +680,26 @@ function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
         end
         if op isa _AuthoredPlateOp
             declared = valtype(only(r.outputs))
-            j = _step!(prog, op, _plate_cache_slot(op, argtypes, declared))
+            slot = _plate_cache_slot(op, argtypes, declared)
+            if slot isa Base.RefValue{<:Array}
+                # Lower the cells natively, as ordinary `prepare` does, into the
+                # cached buffer (`recycled`), like the scan step. Broadcasting
+                # the cell's prepared kernel instead boxed a descriptor holding
+                # it on every call (240 B with one `Ref` operand, 352 B with
+                # three, Julia 1.10.12): inside this program its `copyto!` is
+                # not inlined, and the operation it carries is a constant.
+                j = _step!(prog, identity, slot)
+                cache = Expr(:ref, Expr(:ref, _CACHES_ARG, j))
+                _lower_authored_plate_native!(newbody, prog.ops, Recipe[], op,
+                    callargs, r.inputs, lhs, nothing; recycled=cache,
+                    element_type=first(_declared_array_layout(declared)))
+                # The cell operations the lowering appended keep no cache.
+                append!(prog.caches, fill(nothing, length(prog.ops) - length(prog.caches)))
+                push!(newbody.args, Expr(:(=), cache, lhs))
+                record!(_plate_result_type(op, argtypes, declared))
+                return
+            end
+            j = _step!(prog, op, slot)
             push!(newbody.args,
                   Expr(:(=), lhs, _step_call(j, callargs...)))
             record!(_plate_result_type(op, argtypes, declared))

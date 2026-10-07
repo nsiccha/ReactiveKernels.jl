@@ -1096,6 +1096,23 @@ _KernelReduction(::Val{II}, ::Val{XI}, ::Val{KI}, ::Val{AI}, call::F,
         $promote(reduction.step_out, $T, element, $(types...)) === $T
     end
 end
+# Whether the coefficient-outer lowering of an `evalpoly(x, c)` cell keeps
+# Base's semantics for these types: a concrete cell type `T` that the seed
+# `c[end]` already has and every `muladd(x, acc, c[i])` keeps, coefficients in
+# an `AbstractVector` (a tuple keeps Base's unrolled method), and a one-axis
+# domain. Folded when the plate body is compiled.
+@generated function _plate_evalpoly_ready(::Type{T}, ::Type{X}, ::Type{C},
+                                          output_axes) where {T,X,C}
+    output_axes <: Tuple{Any} && C <: AbstractVector || return false
+    quote
+        isconcretetype($T) && eltype($C) === $T &&
+            $(GlobalRef(Base, :promote_op))($(GlobalRef(Base, :muladd)), $X, $T, $T) === $T
+    end
+end
+# Cells per tile of a coefficient-outer pass: the accumulators and the cell
+# values of one tile stay in the first-level cache across the passes.
+const _PLATE_FOLD_TILE = 256
+
 _plate_dense_source(::Type) = false
 _plate_dense_source(::Type{<:Vector}) = true
 _plate_dense_source(::Type{S}) where {T,P<:Matrix,S<:SubArray{T,1,P}} =
