@@ -43,6 +43,32 @@ function gradient_allocations(prepared, gradient, xs, m)
     ad_value_and_gradient!(prepared, gradient, xs, m)
     @allocated ad_value_and_gradient!(prepared, gradient, xs, m)
 end
+
+# A scan child in a lazy arm of an undeclared plate cell is prepared once and
+# applied through `_KernelPreparedChild`. Native reverse of the caller used to
+# depend on whether the child had been compiled before the caller: cold, the
+# cell's call stayed uninferred and differentiated; warm, it inferred and
+# failed with `EnzymeRuntimeActivityError` (Julia 1.10).
+@kernel running_total(xs, gain) = begin
+    updates = scan(xs, Ref(gain); init = 0.0) do carry, x, g
+        next = carry + x * g
+        (next, next)
+    end
+    total = sum(updates)
+    return total
+end
+
+@kernel group_totals(groups, gain) = begin
+    cells = plate(groups, Ref(gain)) do xs, g
+        g > 0.0 ? running_total(xs, g) : 0.0
+    end
+    total = sum(cells)
+    return total
+end
+
+running_reference(xs, gain) =
+    (sum(gain * sum(@view xs[1:i]) for i in eachindex(xs); init = 0.0),
+     sum(sum(@view xs[1:i]) for i in eachindex(xs); init = 0.0))
 end
 
 @testset "Nested source operations infer in the first compiled kernel" begin
@@ -69,6 +95,32 @@ end
     @test gradients[2] == gradients[1]
     @test reverse_allocations[1] == reverse_allocations[2]
     @test (xs, m) == original
+end
+
+@testset "A prepared child compiled first keeps its caller's reverse" begin
+    F = NestedSourceInferenceFixtures
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    child = prepare(F.running_total)
+    xs = [1.0, 2.0]
+    child_ad = prepare_ad(child, backend, xs, 0.5; active=:gain)
+    @test Base.invokelatest(child, xs, 0.5) ≈ first(F.running_reference(xs, 0.5))
+    @test collect(Base.invokelatest(ad_value_and_gradient, child_ad, xs, 0.5)) ≈
+        collect(F.running_reference(xs, 0.5))
+
+    groups = [[1.0, 2.0, 0.5], [2.0], Float64[]]
+    saved = deepcopy(groups)
+    kernel = prepare(F.group_totals)
+    ad = prepare_ad(kernel, backend, groups, 0.5; active=:gain)
+    for gain in (0.5, 1.3)
+        expected = sum(first(F.running_reference(xs, gain)) for xs in groups)
+        derivative = sum(last(F.running_reference(xs, gain)) for xs in groups)
+        @test Base.invokelatest(kernel, groups, gain) ≈ expected
+        value, gradient = Base.invokelatest(ad_value_and_gradient, ad, groups, gain)
+        @test value ≈ expected
+        @test gradient ≈ derivative
+    end
+    @test Base.invokelatest(ad_value_and_gradient, ad, groups, -0.5) == (0.0, 0.0)
+    @test groups == saved
 end
 
 @testset "Source-call recursion relation" begin
