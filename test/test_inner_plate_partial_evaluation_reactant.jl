@@ -79,4 +79,24 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test Float64(result) ≈ value
         @test Array(derivative) ≈ gradient == [2.0, 1.0, 1.0, 1.0, 0.0, 1.0]
     end
+
+    # A prepared kernel in the cell stays there beside the cached selection.
+    @testset "array-valued cache beside an embedded prepared kernel" begin
+        kinds = [[1, 2, 1, 1, 2, 1], [2, 1, 1, 2, 1, 1], [1, 1, 2, 1, 2, 1]]
+        read_idx = [[3, 1], [2, 4], [1, 3]]
+        live = [0.3, 0.7, 1.1, 0.2, -0.4, 0.9]
+        rl = Reactant.to_rarray(live)
+        kernel = prepare(C.embedded_reads;
+            bound=(; kinds_by_subject=kinds, read_idx, subjects=1:3))
+        @test count(r -> r.op isa ReactiveKernels._BoundConstant &&
+            startswith(String(only(r.outputs).name), "bound_plate_"),
+            kernel.plan.recipes) == 2
+        primal = Reactant.compile(kernel, (rl,); sync=true)
+        @test Float64(primal(rl)) ≈ kernel(live)
+        prepared = prepare_ad(kernel, backend, live; active=:live)
+        value, gradient = ad_value_and_gradient(prepared, live)
+        result, derivative = compile_ad_value_and_gradient(prepared, rl; sync=true)(rl)
+        @test Float64(result) ≈ value
+        @test Array(derivative) ≈ gradient
+    end
 end
