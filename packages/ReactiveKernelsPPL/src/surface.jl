@@ -925,7 +925,8 @@ end
 function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
-        value_defs::Set{Symbol} = Set{Symbol}())
+        value_defs::Set{Symbol} = Set{Symbol}(),
+        shared_defs::Set{Symbol} = Set{Symbol}())
     input_data = data
     for name in conditioned
         input = _conditioned_input(name)
@@ -1137,7 +1138,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # Interned predictors by name (shared with `ctx`: a composition over a
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
-    ctx = (; data, mod, conditioned, value_defs, detmap = canonmap,
+    ctx = (; data, mod, conditioned, value_defs, shared_defs,
+        detmap = canonmap,
         prior_names, coef_priors,
         ordinary_parameters,
         detshape, shape_env, declaration_data,
@@ -1148,6 +1150,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         synth_assigns = AssignmentSpec[],
         negated = Dict{Symbol,Symbol}(),
         leaf_exprs = Dict{Any,Symbol}(),
+        # Definition => predictor site => copies `_inline_structure`
+        # expanded there (`_shared_inline_defs`).
+        inline_uses = Dict{Symbol,Dict{Symbol,Int}}(),
         # Inline factor references inside compositions (`sg .* z[g]`)
         # intern as synthetic sub-predictors, one per `(base, index)`,
         # exactly like the named alias `zg = z[g]`.
@@ -1351,7 +1356,19 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         value_defs)
     if !isempty(retained)
         return _lower_rkppl_once(ast, input_data, mod;
-            submodel_scopes, conditioned, value_defs = union(value_defs, retained))
+            submodel_scopes, conditioned, value_defs = union(value_defs, retained),
+            shared_defs)
+    end
+    # Each predictor location inlines the model-level definitions it reads,
+    # so one read by several locations, or beside a reader of its name,
+    # would be evaluated once per copy. Replan it as one named value that
+    # every reader shares; this set only grows too.
+    shared = _shared_inline_defs(ctx, canonmap, kept,
+        Set{Symbol}(p.name for p in predictors), data)
+    if !isempty(shared)
+        return _lower_rkppl_once(ast, input_data, mod;
+            submodel_scopes, conditioned, value_defs,
+            shared_defs = union(shared_defs, shared))
     end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
@@ -8870,10 +8887,26 @@ function _analyze_predictor(pname, rhs, ctx, lhs; composed_sub::Bool = false)
     return terms, uses
 end
 
+# `visited` starts as the one predictor site being expanded. Each call
+# records how many copies of every definition it inlined at that site;
+# repeating an expansion for the same site (a probe) records nothing new.
 function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
-    ex isa Symbol || return _inline_structure_expr(ex, ctx, visited, where)
+    site = only(visited)
+    copies = Dict{Symbol,Int}()
+    out = _inline_structure!(copies, ex, ctx, visited, where)
+    for (nm, k) in copies
+        sites = get!(Dict{Symbol,Int}, ctx.inline_uses, nm)
+        sites[site] = max(get(sites, site, 0), k)
+    end
+    return out
+end
+function _inline_structure!(copies, ex, ctx, visited::Set{Symbol}, where)
+    ex isa Symbol || return _inline_structure_expr!(copies, ex, ctx, visited,
+        where)
     haskey(ctx.detmap, ex) || return ex
     ex in ctx.declaration_data && return ex
+    # A definition several readers share stays one named value.
+    ex in ctx.shared_defs && return ex
     # Array-valued definitions (`M = (sd .* L)'`) stay named values.
     ctx.detshape[ex] === :array && return ex
     if ex in ctx.structural || ctx.detshape[ex] ∉ (:vector, :array) ||
@@ -8881,13 +8914,14 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         ex in visited && _sfail("$where: cyclic definition through $ex")
         push!(ctx.absorbed, ex)
         push!(visited, ex)
-        out = _inline_structure(ctx.detmap[ex], ctx, visited, where)
+        copies[ex] = get(copies, ex, 0) + 1
+        out = _inline_structure!(copies, ctx.detmap[ex], ctx, visited, where)
         delete!(visited, ex)
         return out
     end
     return ex
 end
-function _inline_structure_expr(ex, ctx, visited, where)
+function _inline_structure_expr!(copies, ex, ctx, visited, where)
     ex isa Expr || return ex
     # The quoted cell body reads the named dependencies carried beside it.
     # Keep both together: substituting only the dependency arguments would
@@ -8895,10 +8929,66 @@ function _inline_structure_expr(ex, ctx, visited, where)
     _is_plate_column_call(ex) && return ex
     if ex.head === :ref && _is_model_value_def(ex.args[1], ctx)
         return Expr(:ref, ex.args[1],
-            (_inline_structure(a, ctx, visited, where) for a in ex.args[2:end])...)
+            (_inline_structure!(copies, a, ctx, visited, where)
+             for a in ex.args[2:end])...)
     end
-    return Expr(ex.head, (_inline_structure(a, ctx, visited, where)
+    return Expr(ex.head, (_inline_structure!(copies, a, ctx, visited, where)
                           for a in ex.args)...)
+end
+
+# Model-level definitions that inlining would evaluate more than once:
+# copies at two or more sites (or two in one), or one copy beside a reader
+# of the name or an interned predictor of that name. Only computations
+# qualify. Aliases, signed aliases and factor-coefficient aliases carry the
+# coefficient roles affine analysis recovers; data-only definitions fold
+# once at preparation; per-observation and array definitions keep their
+# predictor plans. The outermost candidates are returned: a definition
+# read only through another candidate is no longer inlined once that
+# candidate stays named.
+function _shared_inline_defs(ctx, canonmap, kept, predictor_names, data)
+    candidates = Set{Symbol}()
+    for (nm, sites) in ctx.inline_uses
+        haskey(canonmap, nm) && nm ∉ ctx.shared_defs || continue
+        copies = sum(values(sites))
+        copies >= 2 || (copies == 1 &&
+            (nm in kept || nm in predictor_names)) || continue
+        _shared_value_def(nm, ctx, canonmap, data) && push!(candidates, nm)
+    end
+    return Set{Symbol}(nm for nm in candidates if !any(other -> other !== nm &&
+        nm in _definition_reads(other, canonmap), candidates))
+end
+
+# A module call's model-level result, written inline or read through a
+# shared definition that stays named for its readers (the definitions
+# below it are no longer inlined either).
+_reads_module_value(ex, ctx) = _contains_module_call(ex) ||
+    any(s -> s in ctx.shared_defs && _def_reads_module(s, ctx),
+        _value_symbols(ex))
+_def_reads_module(s, ctx) = _contains_module_call(ctx.detmap[s]) ||
+    any(t -> haskey(ctx.detmap, t) && _def_reads_module(t, ctx),
+        _value_symbols(ctx.detmap[s]))
+
+function _shared_value_def(nm, ctx, canonmap, data)
+    rhs = canonmap[nm]
+    rhs isa Expr || return false
+    _is_signed_alias(rhs) && return false
+    get(ctx.detshape, nm, :scalar) in (:vector, :array, :matrix) && return false
+    _is_factor_coefficient_alias(nm, ctx) && return false
+    return !_data_only(rhs, data, canonmap)
+end
+
+_is_signed_alias(rhs) = Meta.isexpr(rhs, :call) && length(rhs.args) == 2 &&
+    rhs.args[1] in (:-, :.-, :+, :.+) &&
+    (rhs.args[2] isa Symbol || _is_signed_alias(rhs.args[2]))
+
+# Every definition `nm` reads, transitively.
+function _definition_reads(nm, canonmap, out::Set{Symbol} = Set{Symbol}())
+    for s in _value_symbols(canonmap[nm])
+        haskey(canonmap, s) && s ∉ out || continue
+        push!(out, s)
+        _definition_reads(s, canonmap, out)
+    end
+    return out
 end
 
 function _collect_signed!(out, ex, sign::Int, pname)
@@ -9201,7 +9291,7 @@ function _extract_summand(pname, core, sign::Int, ctx)
         e = sign < 0 ? Expr(:call, :-, core) : core
         nm = _composed_scalar_leaf!(pname, e, ctx, Symbol[])
         if shape === :array ||
-                (_contains_module_call(core) && !_is_bound_value_call(core))
+                (_reads_module_value(core, ctx) && !_is_bound_value_call(core))
             return TermSpec(ComposedTerm, ColumnRef[],
                 (tree = nm, subs = Symbol[], scalars = [nm]), nm, nm), nothing
         end
