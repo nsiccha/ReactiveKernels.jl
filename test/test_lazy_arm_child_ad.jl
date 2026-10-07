@@ -104,7 +104,8 @@ end
 
 @kernel cell_scan_child(groups, gain) = begin
     cells = plate(groups, Ref(gain)) do xs, g
-        g > 0.0 ? cumulative(xs, g) : 0.0
+        cell::Float64 = g > 0.0 ? cumulative(xs, g) : 0.0
+        cell
     end
     total = sum(cells)
     return total
