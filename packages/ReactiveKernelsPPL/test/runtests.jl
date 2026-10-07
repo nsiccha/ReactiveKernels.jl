@@ -219,6 +219,7 @@ const _PPL_TEST_FILES = (
     "test_functions_as_values.jl",
     "test_kernel_composition.jl",
     "test_completed_covariate_kernel.jl",
+    "test_bound_reader_index_cache.jl",
     "test_kernel_composition_reactant.jl",
     "test_functions_as_values_reactant.jl",
     "test_data_values.jl",
