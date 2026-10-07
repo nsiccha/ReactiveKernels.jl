@@ -396,12 +396,18 @@ end
 # element type and values, and write each operand in its own inlined call, so
 # every write stays tied to its tuple position.  A `Number` is a 1×1 block,
 # and `vcat` of numbers and vectors alone is a vector, as in Base.  Any other
-# operand, a non-isbits element type, and every shape Base rejects call Base
-# itself, which keeps its result and error.  For these operands Base returns a
-# `Matrix` of the promoted element type whenever it does not throw (except for
-# `hvcat` with an empty or non-positive row count), so that call is asserted
-# to keep the companion's result inferred: Base's own generic `hvcat` of mixed
-# scalar and array operands infers no concrete type.
+# operand, a non-isbits element type, and every `hcat`/`vcat` layout the
+# companions do not lay out call Base itself, which keeps its result and error
+# (including `vcat`'s fill of leading numbers across a wider matrix); for these
+# operands Base returns a `Matrix` of the promoted element type or throws, so
+# that call is asserted to keep the result inferred.  A layout `hvcat`
+# rejects (unequal heights or widths, or block-row counts that do not
+# describe the operands) throws the companion's own `DimensionMismatch` or
+# `ArgumentError`, worded as Base's, and never calls Base: native Enzyme
+# reverse on Julia 1.12 cannot compile Base's `hvcat` of mixed scalar and
+# array operands even on a path that never runs
+# (`benchmark/repro_enzyme_mixed_scalar_hvcat.jl`), and Julia 1.10's `hvcat`
+# silently drops operands beyond its block-row counts.
 const _NativeCatOperand = Union{Number,Vector,Matrix}
 const _NativeColumnOperand = Union{Number,Vector}
 
@@ -505,48 +511,51 @@ end
     _native_vcat_copy!(out, height, row + size(a, 1), Base.tail(args))
 end
 
-# `hvcat(rows, blocks...)`: block row `i` holds the next `rows[i]` blocks.
-# Base requires equal heights within a block row and equal total widths across
-# block rows; `(height, width)` of the result, or `nothing` for Base to decide.
+# The errors of layouts `hvcat` rejects, built out of line from sizes only.
+@noinline _native_hvcat_count_mismatch(rows, n) = ArgumentError(
+    "block-row counts $rows do not describe $n blocks")
+@noinline _native_hvcat_height_mismatch(i, expected, got) = DimensionMismatch(
+    "mismatched height in block row $i (expected $expected, got $got)")
+@noinline _native_hvcat_width_mismatch(i, expected, got) = DimensionMismatch(
+    "block row $i has mismatched number of columns (expected $expected, got $got)")
+
+# `hvcat(rows, blocks...)`: block row `i` holds the next `rows[i]` blocks,
+# with equal heights within a block row and equal total widths across block
+# rows.  `(height, width)` of the result; any other layout throws.
 function _native_hvcat_shape(rows::Tuple{Vararg{Int}}, heights::Tuple,
                              widths::Tuple)
+    n = length(heights)
+    (!isempty(rows) && all(>=(1), rows) && sum(rows) == n) ||
+        throw(_native_hvcat_count_mismatch(rows, n))
     k = 0
     height = 0
     width = -1
-    for n in rows
-        (n >= 1 && k + n <= length(heights)) || return nothing
+    for (i, count) in enumerate(rows)
         h = heights[k + 1]
         w = 0
-        for _ in 1:n
+        for _ in 1:count
             k += 1
-            heights[k] == h || return nothing
+            heights[k] == h ||
+                throw(_native_hvcat_height_mismatch(i, h, heights[k]))
             w += widths[k]
         end
         width < 0 && (width = w)
-        w == width || return nothing
+        w == width || throw(_native_hvcat_width_mismatch(i, width, w))
         height += h
     end
-    k == length(heights) ? (height, width) : nothing
+    (height, width)
 end
-
-# Nonempty and positive, as every bracket literal's counts are; a literal's
-# constant counts fold this check.
-@inline _native_hvcat_counts(::Tuple{}) = false
-@inline _native_hvcat_counts(rows::Tuple{Int}) = first(rows) >= 1
-@inline _native_hvcat_counts(rows::Tuple) =
-    first(rows) >= 1 && _native_hvcat_counts(Base.tail(rows))
 
 @inline _native_hvcat(rows, args...) = hvcat(rows, args...)
 @inline function _native_hvcat(rows::Tuple{Vararg{Int}}, a::_NativeCatOperand,
                                rest::_NativeCatOperand...)
     args = (a, rest...)
     T = Base.promote_eltypeof(args...)
-    (isbitstype(T) && _native_hvcat_counts(rows)) || return hvcat(rows, args...)
-    shape = _native_hvcat_shape(rows, _native_cat_heights(args),
-                                _native_cat_widths(args))
-    shape === nothing && return hvcat(rows, args...)::Matrix{T}
-    out = Matrix{T}(undef, shape[1], shape[2])
-    _native_hvcat_copy!(out, shape[1], rows, 1, 1, 0, 0, args)
+    isbitstype(T) || return hvcat(rows, args...)
+    height, width = _native_hvcat_shape(rows, _native_cat_heights(args),
+                                        _native_cat_widths(args))
+    out = Matrix{T}(undef, height, width)
+    _native_hvcat_copy!(out, height, rows, 1, 1, 0, 0, args)
 end
 @inline _native_hvcat_copy!(out, height, rows, i, j, row, column, ::Tuple{}) =
     out

@@ -436,18 +436,33 @@ and lock the one Reactant 0.2.289 lifted:
   `Vector` and `Matrix` operands whose promoted element type is isbits, they
   allocate Base's result, with Base's shape, promoted element type and
   values, and write each operand in its own inlined call; a number is a 1×1
-  block. Every other operand combination and every shape Base rejects call
-  Base, which keeps its value and error. Ordinary reverse then
-  differentiates the authored graph, with no activity annotation or
-  derivative rule. The same companions keep scalar and mixed literals such
-  as `[-a 0.0; a -b]` and `[M v; 0.0 1.0]` on a dense, inferred path:
-  SparseArrays, which Enzyme loads, otherwise claims Base's concatenation of
-  numbers and dense arrays and builds the result through slower generic
-  methods, and Base's own mixed scalar/array `hvcat` infers no concrete
-  result type. The tensorized body keeps its own concatenation lowering.
-  Concatenation inside an opaque helper the kernel calls, `cat`, `stack`
-  and non-dense operands (views, adjoints) keep Base's methods and remain
-  the backend's limitation.
+  block. Every other operand combination, and every `hcat`/`vcat` layout
+  they do not lay out, calls Base, which keeps its value and error
+  (including `vcat`'s fill of leading numbers across a wider matrix). A
+  layout `hvcat` rejects throws the companion's own `DimensionMismatch`
+  (unequal heights or widths) or `ArgumentError` (block-row counts that do
+  not describe the operands), worded as Base's. Ordinary reverse then
+  differentiates the authored graph, with no
+  activity annotation or derivative rule. The same companions keep scalar
+  and mixed literals such as `[-a 0.0; a -b]` and `[M v; 0.0 1.0]` on a
+  dense, inferred path: SparseArrays, which Enzyme loads, otherwise claims
+  Base's concatenation of numbers and dense arrays and builds the result
+  through slower generic methods, and Base's own mixed scalar/array `hvcat`
+  infers no concrete result type. The tensorized body keeps its own
+  concatenation lowering. Concatenation inside an opaque helper the kernel
+  calls, `cat`, `stack` and non-dense operands (views, adjoints) keep Base's
+  methods and remain the backend's limitation.
+- Native Enzyme 0.13.210 reverse on Julia 1.12.7 cannot compile Base's
+  `hvcat` of a block literal that mixes scalars with arrays, such as
+  `[A v; 0 0 1]` (`IllegalTypeAnalysisException` in `hvncat_fill!`), even
+  when the literal sits on a branch that never runs; scalar-only and
+  array-only literals differentiate, and Julia 1.10.12 differentiates all of
+  them. `repro_enzyme_mixed_scalar_hvcat.jl` reproduces it with Enzyme only.
+  The native `hvcat` companion therefore never calls Base for a layout it
+  rejects, which also keeps Julia 1.10's `hvcat` from silently dropping
+  operands beyond its block-row counts; Base's `hcat` and `vcat` of the same
+  operands compile. An opaque helper that builds such a literal keeps the
+  backend's limitation.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later

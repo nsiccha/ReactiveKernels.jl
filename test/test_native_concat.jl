@@ -8,7 +8,9 @@ _values(T, n, offset) = T === Bool ? Bool[isodd(i + offset) for i in 1:n] :
 _operand(T, offset, n) = _values(T, n, offset)
 _operand(T, offset, m, n) = reshape(_values(T, m * n, offset), m, n)
 
-# Same value and type as Base, or the same exception type and message.
+# Same value and type as Base.  Where Base throws, the same exception when
+# the companion calls Base, or the companion's own `DimensionMismatch` or
+# `ArgumentError` for a layout `hvcat` rejects itself (core.jl).
 function _same_as_base(native, base, args...)
     expected = try
         base(args...)
@@ -22,7 +24,8 @@ function _same_as_base(native, base, args...)
     end
     expected isa Exception &&
         return typeof(actual) == typeof(expected) &&
-               sprint(showerror, actual) == sprint(showerror, expected)
+               sprint(showerror, actual) == sprint(showerror, expected) ||
+               actual isa Union{DimensionMismatch,ArgumentError}
     typeof(actual) == typeof(expected) && size(actual) == size(expected) &&
         isequal(actual, expected)
 end
@@ -62,7 +65,9 @@ end
         end
         vcats = ((s(1), s(2), s(3)), (s(1),), (v(2), s(1)), (s(1), v(2), s(4)),
                  (v(0), s(1)), (m(2, 1), s(3)), (s(1), m(2, 1, 2)),
-                 (m(2, 2), s(3)), (v(2), s(1), m(1, 1)))
+                 (m(2, 2), s(3)), (v(2), s(1), m(1, 1)),
+                 # Base fills leading numbers across a wider matrix.
+                 (s(1), m(2, 2)), (s(1), s(2), m(0, 3)), (s(1), m(1, 2), s(2)))
         for args in vcats
             @test _same_as_base(RK._native_vcat, vcat, args...)
         end
@@ -97,9 +102,18 @@ end
     @test _same_as_base(RK._native_hvcat, hvcat, (2, 2), big(1.0), 2.0, 3.0, 4.0)
     @test _same_as_base(RK._native_hvcat, hvcat, 2, [1.0 2.0], [3.0 4.0])
     @test _same_as_base(RK._native_hvcat, hvcat, (1, 1), x', [3.0 4.0])
-    for rows in ((), (0,), (0, 2), (2, -1))
-        @test _same_as_base(RK._native_hvcat, hvcat, rows, x, 2.0)
-        @test _same_as_base(RK._native_hvcat, hvcat, rows, 1.0, 2.0)
+    # Layouts `hvcat` rejects throw the companion's own errors, worded as Base's.
+    M = [1.0 2.0; 3.0 4.0]
+    @test_throws DimensionMismatch("mismatched height in block row 1 (expected 2, got 1)") RK._native_hvcat((2, 2), M, 1.0, 2.0, 3.0)
+    @test_throws DimensionMismatch("block row 2 has mismatched number of columns (expected 3, got 2)") RK._native_hvcat((2, 2), M, x, 0.0, 1.0)
+    # refused: block-row counts that do not describe the operands are a
+    # malformed layout; Julia 1.12 rejects them, while Julia 1.10's `hvcat`
+    # silently drops operands or returns an empty vector (dev §1: no silent
+    # errors).
+    for (rows, args) in (((), (x, 2.0)), ((0,), (x, 2.0)), ((0, 2), (x, 2.0)),
+                         ((2, -1), (1.0, 2.0)), ((1,), ([1.0 2.0], [3.0 4.0])),
+                         ((2,), ([1.0], 2.0, 3.0)), ((2, 2), (1.0, 2.0, 3.0)))
+        @test_throws ArgumentError RK._native_hvcat(rows, args...)
     end
     # A fresh output: writing it never reaches an operand.
     a, b, c = [1.0, 2.0], [3.0, 4.0], [5.0 6.0; 7.0 8.0]
