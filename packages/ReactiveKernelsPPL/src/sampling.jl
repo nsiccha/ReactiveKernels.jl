@@ -96,7 +96,12 @@ function _external_rhs(rhs)
         _is_dotted_call(rhs) ? first(rhs.args) : nothing
     head === nothing && return false
     head isa Symbol || return true
-    return !(head in union(keys(_PARAM_FAMILIES), _GLM_HEADS,
+    return !_builtin_rhs_head(head)
+end
+
+# The built-in sampling spellings: families, GLM objects and wrappers.
+_builtin_rhs_head(head::Symbol) =
+    head in union(keys(_PARAM_FAMILIES), _GLM_HEADS,
         (:BernoulliLogit, :PoissonLog, :BinomialLogit,
          :NegativeBinomial2Log, :GammaLog, :BetaLogit,
          :HalfNormal, :HalfCauchy, :Flat, :flat, :positive, :truncated, :restricted,
@@ -108,8 +113,8 @@ function _external_rhs(rhs)
          :Multinomial, :MvNormal, :MvNormalCholesky, :VonMises,
          :InverseGaussian, :HurdlePoisson, :ZeroInflatedPoisson,
          :ZeroInflatedBinomial, :normal_id_glm, :bernoulli_logit_glm,
-         :poisson_log_glm)))
-end
+         :poisson_log_glm))
+_builtin_rhs_head(head) = false
 
 function _external_parameter(name, rhs, shape, mod, names; observed=false,
         broadcast=false)

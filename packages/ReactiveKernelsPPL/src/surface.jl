@@ -932,6 +932,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         conditioned::Set{Symbol} = Set{Symbol}(),
         value_defs::Set{Symbol} = Set{Symbol}())
     input_data = data
+    ast = _observation_call_definitions(ast, data, mod)
     for name in conditioned
         input = _conditioned_input(name)
         (input in data || _mentions_symbol(ast, input)) &&
@@ -2243,10 +2244,10 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
             fn in _DIST_VALUE_FNS && _sfail(
                 "$where calls `$fn`, which lowers only under `~`/`.~`, " *
                 "not as a value")
-            _sfail("$where calls `$fn`, which is not in the slice-1 " *
-                   "value vocabulary — arbitrary Julia functions are " *
-                   "planned (no-@deffun-ceremony direction) but need " *
-                   "IR/contract growth")
+            _sfail("$where calls `$fn`, which is neither a built-in " *
+                   "value function nor defined in the model module — " *
+                   "define the function there (or import it) before " *
+                   "lowering")
         end
     elseif rhs.head === :.
         if _is_dotted_call(rhs) && rhs.args[1] isa GlobalRef
@@ -2260,11 +2261,14 @@ function _reject_unknown_calls(where, rhs; composed_maps::Bool = false)
             rhs.args[2] isa Expr && rhs.args[2].head === :tuple ||
             return nothing  # malformed dotted: downstream rejects
         f = rhs.args[1]
-        f === :ifelse || f in ELEMENTWISE_FNS ||
-            (composed_maps && f in _COMPOSED_UNARY) || _sfail(
-            "$where calls `$f.`, which is not in the slice-1 value " *
-            "vocabulary — arbitrary Julia functions are planned " *
-            "(no-@deffun-ceremony direction) but need IR/contract growth")
+        if !(f === :ifelse || f in ELEMENTWISE_FNS ||
+                (composed_maps && f in _COMPOSED_UNARY))
+            f in _COMPOSED_UNARY && _sfail("$where calls `$f.`, which " *
+                "is not in the slice-1 value vocabulary")
+            _sfail("$where calls `$f.`, which is neither a built-in " *
+                "value function nor defined in the model module — " *
+                "define the function there (or import it) before lowering")
+        end
     end
     for a in rhs.args
         _reject_unknown_calls(where, a; composed_maps)
@@ -2393,18 +2397,25 @@ function _module_binding(m::Module, s::Symbol, where, shown)
     return GlobalRef(m, s)
 end
 
+# A built-in call head's meaning: the head itself, or the vocabulary
+# binding a dotted built-in broadcasts; `nothing` for any other name.
+function _builtin_call_head(fn::Symbol; dotted::Bool = false)
+    if dotted
+        _builtin_dotted_head(fn) && return fn
+        (fn in ASSIGNMENT_FNS && !(fn in ELEMENTWISE_OPS)) &&
+            return _vocabulary_ref(fn)
+        return nothing
+    end
+    return _builtin_value_head(fn) ? fn : nothing
+end
+
 # Resolve a call head; built-in heads come back unchanged.
 function _resolve_call_head(fn, mod::Module, names::Set{Symbol}, where;
         dotted::Bool = false)
     fn isa GlobalRef && return fn
     if fn isa Symbol
-        if dotted
-            _builtin_dotted_head(fn) && return fn
-            (fn in ASSIGNMENT_FNS && !(fn in ELEMENTWISE_OPS)) &&
-                return _vocabulary_ref(fn)
-        else
-            _builtin_value_head(fn) && return fn
-        end
+        builtin = _builtin_call_head(fn; dotted)
+        builtin === nothing || return builtin
         fn in names && _sfail("$where calls `$fn`, which is a model value, " *
                               "not a function")
         return _module_binding(mod, fn, where, fn)
@@ -2498,6 +2509,134 @@ end
 _contains_module_call(ex) =
     ex isa GlobalRef ||
     (ex isa Expr && any(_contains_module_call, ex.args))
+
+# ── Module calls inside sampling arguments ────────────────────────────
+# A built-in sampling RHS spells a distribution — families, wrappers,
+# `Ref`/`eachrow`/`eachcol` sharing, a mixture's `vcat.` component list,
+# probability links (and their legacy misspellings), ordinal structure
+# and link tags — around ordinary Julia values. A module call written
+# inline among those values means what its named definition means:
+# naming a subexpression never changes legality or the density
+# (rkppl-use §2, §9).
+const _RHS_SPELLING_HEADS = (:Ref, :eachrow, :eachcol, :Cumulative,
+    :StoppingRatio)
+
+_rhs_spelling_head(fn, dotted::Bool) = _builtin_rhs_head(fn) ||
+    (fn isa Symbol && (haskey(_BERNOULLI_LINKS, fn) ||
+        haskey(_LEGACY_INVERSE_LINKS, fn) || haskey(_ORDINAL_LINKS, fn))) ||
+    (dotted ? fn === :vcat : fn in _RHS_SPELLING_HEADS)
+
+# Apply `f` to each value argument of a built-in sampling RHS.
+function _map_rhs_values(f, ex)
+    if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
+            _rhs_spelling_head(ex.args[1], false)
+        return Expr(:call, ex.args[1],
+            Any[_map_rhs_values(f, a) for a in ex.args[2:end]]...)
+    elseif _is_dotted_call(ex) && _rhs_spelling_head(ex.args[1], true)
+        return Expr(:., ex.args[1], Expr(:tuple,
+            Any[_map_rhs_values(f, a) for a in ex.args[2].args]...))
+    elseif ex isa Expr && ex.head === :parameters
+        return Expr(:parameters, Any[_map_rhs_values(f, a) for a in ex.args]...)
+    elseif ex isa Expr && ex.head === :kw && length(ex.args) == 2
+        return Expr(:kw, ex.args[1], _map_rhs_values(f, ex.args[2]))
+    end
+    return f(ex)
+end
+
+# A call `_resolve_call_head` resolves in the model module rather than
+# keeping as a built-in: resolution names an undefined function or a
+# model value used as one exactly as for the named definition.
+function _module_call(ex)
+    dotted = _is_dotted_call(ex)
+    dotted || Meta.isexpr(ex, :call) && !isempty(ex.args) || return false
+    return _module_call_head(ex.args[1], dotted)
+end
+_module_call_head(fn::GlobalRef, dotted) = fn.mod !== PPLGeneratedModels
+# A range keeps its literal shape in place (`_literal_row_range`).
+_module_call_head(fn::Symbol, dotted) =
+    fn !== :(:) && _builtin_call_head(fn; dotted) === nothing
+_module_call_head(fn::Expr, dotted) =
+    fn.head === :. && length(fn.args) == 2 && fn.args[2] isa QuoteNode
+_module_call_head(fn, dotted) = false
+
+_has_module_call(ex) = ex isa Expr && ex.head !== :quote &&
+    (_module_call(ex) || any(_has_module_call, ex.args))
+
+# Heads whose operands Julia evaluates conditionally or repeatedly: a
+# module call inside one stays inside, so `bind` takes the whole node.
+const _DEFERRED_VALUE_HEADS = (:if, :elseif, :&&, :||, :comprehension,
+    :generator, :->, :do, :let, :block)
+
+# Replace each module call in the value `ex` by `bind(call)`. An index
+# endpoint (`end`, `begin`) belongs to its enclosing reference, so a call
+# reading one stays there.
+function _bind_module_calls(bind, ex)
+    _has_module_call(ex) || return ex
+    if !_mentions_symbol(ex, :end) && !_mentions_symbol(ex, :begin)
+        _module_call(ex) && return bind(ex)
+        ex.head in _DEFERRED_VALUE_HEADS && return bind(ex)
+    end
+    return Expr(ex.head, Any[_bind_module_calls(bind, a) for a in ex.args]...)
+end
+
+# The names a statement's left-hand side observes or declares, including
+# the count columns of `eachrow(hcat(c1, c2))`.
+function _sampled_lhs_names!(out::Set{Symbol}, lhs)
+    Meta.isexpr(lhs, :call) && !isempty(lhs.args) &&
+        lhs.args[1] in (:eachrow, :eachcol, :hcat) ||
+        return _lhs_base_names!(out, lhs)
+    foreach(a -> _sampled_lhs_names!(out, a), lhs.args[2:end])
+    return out
+end
+
+# An observation's inline module call is the value its named definition
+# holds (`w = f(b .* x)` then `y .~ Normal.(w, s)`), so name it: the
+# definition then takes exactly the named spelling's path — bind-time
+# evaluation when it reads only data, whole-value data inputs, predictor
+# and value analysis. Identical calls share one name. Prior arguments
+# have their own hoist (`_hoist_prior_args!`); external RHSs resolve their
+# arguments themselves.
+function _observation_call_definitions(ast::Expr, data::Set{Symbol},
+        mod::Module)
+    defined = Set{Symbol}(st.args[1] for st in ast.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
+    names = _statement_lhs_names!(union(data, defined), ast)
+    taken = union(data, _expr_names(ast))
+    named = Dict{Any,Symbol}()
+    out = Any[]
+    function name!(call, stem::Symbol)
+        get!(named, call) do
+            value = _resolve_module_calls(call, mod, names,
+                "response $stem argument `$(repr(call))`")
+            nm = Symbol(:_rkppl_, stem, :_call)
+            k = 1
+            while nm in taken
+                k += 1
+                nm = Symbol(:_rkppl_, stem, :_call_, k)
+            end
+            push!(taken, nm)
+            push!(out, Expr(:(=), nm, value))
+            nm
+        end
+    end
+    for st in ast.args
+        if st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
+                !_external_rhs(st.args[3])
+            observed = _sampled_lhs_names!(Set{Symbol}(), st.args[2])
+            if any(in(data), observed) ||
+                    (_is_broadcast_sample(st) && any(in(defined), observed))
+                stem = first(sort!(collect(observed)))
+                rhs = _map_rhs_values(st.args[3]) do value
+                    _bind_module_calls(call -> name!(call, stem), value)
+                end
+                rhs == st.args[3] ||
+                    (st = Expr(:call, st.args[1], st.args[2], rhs))
+            end
+        end
+        push!(out, st)
+    end
+    return Expr(:block, out...)
+end
 
 # Data-only: every value the expression reads is data or a data-only
 # definition (literals and function values aside).
@@ -5806,8 +5945,12 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     union!(bodynames, _submodel_args(sm))
     functions = Dict(k => v for (k, v) in submap if v isa GlobalRef &&
         getglobal(v.mod, v.name) isa Function)
+    # Observations: arguments bound to data columns, and an observed slot.
+    observes = Set{Symbol}(a for a in _submodel_args(sm)
+        if get(submap, a, nothing) isa Symbol && submap[a] in data)
+    observed && ret isa Symbol && push!(observes, ret)
     out = Any[_hsubst(_resolve_submodel_stmt(_hsubst(st, functions),
-        sm, bodynames), submap)
+        sm, bodynames; observes), submap)
         for st in stmts]
     stream && !observed && (out = _generative_stream_stmts(out, submap[ret], data))
     # Every latent call binds its return value. An observed stream already
@@ -5819,21 +5962,22 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     return sm, out
 end
 
-function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol})
+function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol};
+        observes::Set{Symbol} = Set{Symbol}())
     st isa Expr || return st
     # Plate cell definitions execute in the submodel's defining module too.
     # Visit statement positions only: sampling heads and loop binders retain
     # their DSL spelling until the ordinary surface passes lower them.
     if st.head === :block
-        return Expr(:block, (_resolve_submodel_stmt(a, sm, names)
+        return Expr(:block, (_resolve_submodel_stmt(a, sm, names; observes)
             for a in st.args)...)
     elseif st.head === :macrocall && !isempty(st.args) &&
             st.args[1] === Symbol("@plate")
         return Expr(:macrocall, st.args[1:end-1]...,
-            _resolve_submodel_stmt(st.args[end], sm, names))
+            _resolve_submodel_stmt(st.args[end], sm, names; observes))
     elseif st.head === :for && length(st.args) == 2
         return Expr(:for, st.args[1],
-            _resolve_submodel_stmt(st.args[2], sm, names))
+            _resolve_submodel_stmt(st.args[2], sm, names; observes))
     end
     if (_is_sample(st) || _is_broadcast_sample(st)) && _external_rhs(last(st.args)) &&
             _resolve_submodel(last(st.args), sm.mod) === nothing
@@ -5843,6 +5987,20 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol})
             _resolve_module_calls(rhs, sm.mod, names, "submodel sampling RHS")
         return Expr(:call, st.args[1], st.args[2],
             resolved)
+    end
+    if (_is_sample(st) || _is_broadcast_sample(st)) &&
+            !_external_rhs(st.args[3]) &&
+            any(in(observes), _sampled_lhs_names!(Set{Symbol}(), st.args[2]))
+        # A module call among an observation's values resolves here, like
+        # the definition naming it would (`_observation_call_definitions`
+        # then names it).
+        where = "submodel `$(sm.name)` sampling RHS `$(repr(st.args[3]))`"
+        rhs = _map_rhs_values(st.args[3]) do value
+            _bind_module_calls(value) do call
+                _resolve_module_calls(call, sm.mod, names, where)
+            end
+        end
+        return rhs == st.args[3] ? st : Expr(:call, st.args[1], st.args[2], rhs)
     end
     (st.head === :(=) && length(st.args) == 2 &&
         (st.args[1] isa Symbol || Meta.isexpr(st.args[1], :ref))) || return st
