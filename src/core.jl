@@ -1049,22 +1049,26 @@ _KernelBranch(::Val{CI}, ::Val{TI}, ::Val{EI}, call::F, condition::C,
                                    step_in, step_out)
 
 A recipe whose authored right-hand side is a top-level unfiltered generator
-sum with `init` whose term reads one shared vector through Base's total
-gather, `sum(… get(A, K, D) … for j in iterator; init = x)`, keeps its parts
-as metadata beside its ordinary body. Calling it runs `call`, the authored
-expression over every recipe argument, so every lowering that treats the
-enclosing `_KernelSourceOp` as opaque is unchanged.
+sum with `init`, `sum(term for j in iterator; init = x)`, whose term either
+reads one shared vector through Base's total gather (`get(A, K, D)`) or is
+plain arithmetic (`_kernel_fold_arithmetic`), keeps its parts as metadata
+beside its ordinary body. Calling it runs `call`, the authored expression over
+every recipe argument, so every lowering that treats the enclosing
+`_KernelSourceOp` as opaque is unchanged.
 
 The native plate lowering reads the parts (`_lower_authored_plate_native!`):
-when the iterator and `A` are plate invariants it runs the sum dose-outer —
+when the iterator (and `A`) are plate invariants it runs the sum fold-outer —
 one pass over the cells per element `j`, each cell accumulating
-`Base.add_sum(acc, term)` in the authored order — and, when the gather index
-advances by exactly one per cell, splits each pass at the window where `K` is
-in range, reading `A` there without the bounds test and using `D` outside it.
+`Base.add_sum(acc, term)` in the authored order. For a gathered sum
+(dose-outer) whose gather index advances by exactly one per cell, each pass
+splits at the window where `K` is in range, reading `A` there without the
+bounds test and using `D` outside it.
 `iterator`/`init`/`array` are closures over their OWN ports, selected from
 the recipe's ordered arguments by the position tuples `II`/`XI`/`AI`;
 `index` takes `j` and the ports `KI`; the steps take the accumulator, `j`
-(and `step_in` the gathered value) followed by every recipe argument.
+(and `step_in` the gathered value) followed by every recipe argument. A
+gather-free sum has empty `KI`/`AI` and `nothing` for `index`, `array`,
+`step_in` and `step_out`.
 """
 struct _KernelReduction{II,XI,KI,AI,F,IT,IN,ST,IX,AR,SI,SO}
     call::F
@@ -1168,25 +1172,32 @@ function _mark_source_call_recursion!()
     return nothing
 end
 
-# Whether a plate's dose-outer lowering of `reduction` keeps the authored
+# Whether a plate's fold-outer lowering of `reduction` keeps the authored
 # semantics for these types: a concrete accumulator type `T` that the seed and
-# every step return unchanged, an `Int` gather index and a `Vector` gather
-# source (or a contiguous column of a dense matrix). `S` is the tuple of the
-# recipe's per-cell argument types. Everything
-# here is a type computation, folded when the plate body is compiled.
+# every step return unchanged and, for a gathered sum, an `Int` gather index
+# and a `Vector` gather source (or a contiguous column of a dense matrix). `S`
+# is the tuple of the recipe's per-cell argument types. Everything here is a
+# type computation, folded when the plate body is compiled.
 @generated function _plate_reduction_ready(
-        reduction::_KernelReduction{II,XI,KI,AI}, ::Type{T},
-        ::Type{S}) where {II,XI,KI,AI,T,S<:Tuple}
+        reduction::_KernelReduction{II,XI,KI,AI,F,IT,IN,ST,IX}, ::Type{T},
+        ::Type{S}) where {II,XI,KI,AI,F,IT,IN,ST,IX,T,S<:Tuple}
     types = Any[fieldtype(S, i) for i in 1:fieldcount(S)]
     select(positions) = Any[types[i] for i in positions]
     promote = GlobalRef(Base, :promote_op)
-    quote
+    fold = quote
         isconcretetype($T) || return false
         iterator_type = $promote(reduction.iterator, $(select(II)...))
         element = eltype(iterator_type)
         isconcretetype(element) || return false
         $promote(reduction.init, $(select(XI)...)) === $T || return false
         $promote(reduction.step, $T, element, $(types...)) === $T || return false
+    end
+    IX === Nothing && return quote
+        $fold
+        true
+    end
+    quote
+        $fold
         $promote(reduction.index, element, $(select(KI)...)) === Int || return false
         source = $promote(reduction.array, $(select(AI)...))
         _plate_dense_source(source) || return false
@@ -1222,9 +1233,12 @@ end
 # in the first-level cache between the plate cells and the steps that read them.
 const _PLATE_STRIP = 128
 
-# Cells per tile of a coefficient-outer pass: the accumulators and the cell
-# values of one tile stay in the first-level cache across the passes.
+# Cells per tile of a fold-outer pass: the accumulators and the cell values of
+# one tile stay in the first-level cache across the passes.
 const _PLATE_FOLD_TILE = 256
+# Whether a plate's output has one axis, which a fold-outer tile walks directly.
+@inline _plate_one_axis(::Tuple{Any}) = true
+@inline _plate_one_axis(output_axes) = false
 
 _plate_dense_source(::Type) = false
 _plate_dense_source(::Type{<:Vector}) = true
