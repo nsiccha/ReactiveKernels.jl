@@ -500,7 +500,7 @@ and lock the one Reactant 0.2.289 lifted:
   captures data around a prepared scan kernel or RK's runtime scan op is this
   shape. Whether a given loop trips the proof depends on its optimized IR:
   the runtime op passed only while an opaque per-call method query in the
-  step kept its loop from being optimized. Reshaping RK's result allocation
+  step changed how its loop was optimized. Reshaping RK's result allocation
   is not a repair. A fresh fixed-length buffer avoids the error in one loop
   spelling and silently zeroes the result in another. `prepare_ad` passes
   data as `Constant` contexts and is unaffected, and `Const(f)` or a `Const`
