@@ -273,6 +273,8 @@ import .._declared_codes
 # response; `preprocessing.jl`).
 import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
 import .._broadcast_gather
+# Observation row counts over bound data (`preprocessing.jl`).
+import .._observation_rows
 # Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
 # arguments, simplex / ordered slice transforms and the slice densities.
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
@@ -511,7 +513,7 @@ function _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
     # ordinary full-length vector plans keep their established lowering.
     isempty(o.subs) && isempty(t.columns) || return ex
     _broadcast_affine(plan, pred) && return ex
-    return Expr(:call, :.*, Expr(:call, :ones, _located_rows(plan, pred)), ex)
+    return Expr(:call, :.*, Expr(:call, :ones, _located_rows_source(plan, pred)), ex)
 end
 
 # Rows of the responses a predictor locates — their own observation axis,
@@ -523,6 +525,65 @@ function _located_rows(plan::StructuralPlan, pred::PredictorSpec)
         "predictor $(pred.name) locates responses with rows $rows " *
         "(one row count per scalar-valued predictor)"))
     return only(rows)
+end
+
+# Row counts as graph source. A row count the lowering resolved from the
+# bound data is emitted as `_observation_rows(anchors...)` over those same
+# bound values, never as the build's number, so a built graph evaluates any
+# binding of its program (snag rkppl-opaque-loc-37de7b80). The anchors
+# mirror the row resolvers (`_located_rows`, `_response_rows`,
+# `_value_rows`), which keep validating and measuring; `_rows_source`
+# checks that the call reproduces their count on this binding. A count no
+# bound value carries (no data anchor) stays a literal.
+function _rows_source(n::Int, anchors::Vector)
+    isempty(anchors) && return n
+    values = Any[last(a) for a in anchors]
+    _observation_rows_compatible(values) && _observation_rows(values...) == n ||
+        return n
+    return Expr(:call, :_observation_rows, Any[first(a) for a in anchors]...)
+end
+
+_located_rows_source(plan::StructuralPlan, pred::PredictorSpec) =
+    _rows_source(_located_rows(plan, pred), _response_rows_anchors(plan,
+        first(r for r in plan.responses if _response_uses_predictor(r, pred.name))))
+
+_response_rows_source(plan::StructuralPlan, r::LikelihoodSpec) =
+    _rows_source(_response_rows(plan, r), _response_rows_anchors(plan, r))
+
+_column_anchor(plan::StructuralPlan, c::Symbol) = c => plan.columns[c]
+
+# A ranged response's selection, as its likelihood statements index it.
+_selection_anchor(plan::StructuralPlan, r::LikelihoodSpec) =
+    Expr(:ref, r.response, _range_index_expr(r), r.range.args[3:end]...) =>
+        _selected_response_column(plan, r)
+
+_range_index_expr(r::LikelihoodSpec) = r.range.args[2] === :(:) ?
+    Expr(:call, :eachindex, r.response) : r.range.args[2]
+
+# The bound values whose broadcast rows `_response_rows` measures: the
+# response (or its selection) and the per-observation columns its
+# broadcast domain reads; structured responses keep their row contract.
+function _response_rows_anchors(plan::StructuralPlan, r::LikelihoodSpec)
+    if !_uses_structured_observation_axes(plan) && haskey(plan.columns, r.response) &&
+            _observation_axes(plan) !== nothing
+        modelvals, managed = _axis_exempt_columns(plan)
+        perobs = Set{Symbol}(k for (k, v) in plan.columns
+            if k ∉ modelvals && k ∉ managed && v isa AbstractArray)
+        head = r.range isa Expr ? _selection_anchor(plan, r) :
+            _column_anchor(plan, r.response)
+        # Indexed operands are validated to the selection's own axis.
+        r.range isa Expr && r.response in plan.indexed_observations && return Any[head]
+        reads = _response_reads(plan, r, perobs)
+        values = r.range isa Expr ?
+            _response_reads(plan, _with(r; range = nothing), perobs) : reads
+        return Any[head; [_column_anchor(plan, c)
+            for c in sort!(collect(setdiff(reads, (r.response,)))) if c in values]]
+    end
+    r.range isa Expr && return Any[_selection_anchor(plan, r)]
+    r.mi_jobs === nothing && haskey(plan.columns, r.response) &&
+        return Any[_column_anchor(plan, r.response)]
+    reads = _response_reads(plan, r, _row_columns(plan))
+    return Any[_column_anchor(plan, c) for c in sort!(collect(reads))]
 end
 
 
@@ -730,9 +791,7 @@ end
 function _ranged_response_stmts(r, plan, stmts)
     idx = Symbol(:_ppl_range_indices_, r.label)
     selected = Symbol(:_ppl_range_response_, r.label)
-    index = r.range.args[2]
-    index === :(:) && (index = Expr(:call, :eachindex, r.response))
-    pre = Expr[:($idx = collect($index))]
+    pre = Expr[:($idx = collect($(_range_index_expr(r))))]
     if _response_rows(plan, r) == 0 && r.response in plan.indexed_observations
         push!(pre, :($selected = zeros(0)))
     else

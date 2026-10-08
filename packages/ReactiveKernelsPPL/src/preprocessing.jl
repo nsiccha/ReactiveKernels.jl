@@ -8,6 +8,22 @@ design_name(predictor::Symbol) = Symbol(:_ppl_design_, predictor)
 offset_name(predictor::Symbol) = Symbol(:_ppl_offset_, predictor)
 
 """
+    _observation_rows(values...) -> Int
+
+Rows of the broadcast of `values` along their first axis (a number has one
+row). Generated programs read observation row counts through this call over
+bound data, so a built graph takes them from the binding it is prepared with.
+"""
+_observation_rows(values...) =
+    length(only(Base.Broadcast.broadcast_shape(map(v -> (axes(v, 1),), values)...)))
+
+# First-axis lengths broadcast when each is one or a common length.
+function _observation_rows_compatible(values)
+    lengths = unique!([size(v, 1) for v in values])
+    return length(filter(!=(1), lengths)) <= 1
+end
+
+"""
     design_recipe(shape, n_rows; plates) -> Union{Nothing,Expr}
 
 `_ppl_design_<pred> = Float64.(hcat(<blocks…>))`, or `nothing` for a

@@ -2130,15 +2130,20 @@ function _structured_response_rows(plan::StructuralPlan, r::LikelihoodSpec)
     r.range isa Expr && return length(_selected_response_column(plan, r))
     r.mi_jobs === nothing && haskey(plan.columns, r.response) &&
         return _column_nrows(plan.columns[r.response])
-    modelvals, _ = _axis_exempt_columns(plan)
-    managed = _mi_managed_columns(plan)
-    perobs = Set{Symbol}(k for (k, v) in plan.columns
-        if k ∉ modelvals && k ∉ managed && v isa Union{AbstractVector,AbstractMatrix})
-    reads = _response_reads(plan, r, perobs)
+    reads = _response_reads(plan, r, _row_columns(plan))
     ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
     length(ns) == 1 && return only(ns)
     isempty(ns) && return plan.n_obs
     _fail(r.label, "mi() location reads columns with different rows $ns")
+end
+
+"""Bound vector and matrix columns that carry observation rows: every
+column except model-level values and mi()-managed columns."""
+function _row_columns(plan::StructuralPlan)
+    modelvals, _ = _axis_exempt_columns(plan)
+    managed = _mi_managed_columns(plan)
+    return Set{Symbol}(k for (k, v) in plan.columns
+        if k ∉ modelvals && k ∉ managed && v isa Union{AbstractVector,AbstractMatrix})
 end
 
 """Rows of an observation-shaped value, resolved from its bound inputs.
@@ -2146,12 +2151,7 @@ Values with no data anchor (an intercept or dar path) use their response
 consumers. No dimension is inferred from the total of unrelated axes."""
 function _value_rows(plan::StructuralPlan, name::Symbol)
     haskey(plan.columns, name) && return _column_nrows(plan.columns[name])
-    modelvals, _ = _axis_exempt_columns(plan)
-    managed = _mi_managed_columns(plan)
-    perobs = Set{Symbol}(k for (k, v) in plan.columns
-        if v isa Union{AbstractVector,AbstractMatrix} &&
-            k ∉ modelvals && k ∉ managed)
-    reads = _response_reads(plan, name, perobs)
+    reads = _response_reads(plan, name, _row_columns(plan))
     ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
     if isempty(ns)
         names = Set{Symbol}([name])
