@@ -2748,7 +2748,7 @@ function _collect_model_value_ref!(refs, ex::Expr, plan, label, bound::Bool)
         _collect_assignment_refs!(refs, obj, plan, label, bound)
     end
     for i in ex.args[2:end]
-        i === :(:) && continue
+        (i === :(:) || _is_endpoint_position(i)) && continue
         _collect_assignment_refs!(refs, i, plan, label, bound)
     end
     return nothing
@@ -2763,8 +2763,9 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
         return nothing
     if ex isa Symbol
-        # `:` in a positional read (`Z[:, 1]`) is a whole axis, not a name.
-        ex === :(:) && return nothing
+        # `:` in a positional read (`Z[:, 1]`) is a whole axis, and `end`
+        # / `begin` a position (`Z[end, 1]`), not a name.
+        (ex === :(:) || _is_endpoint(ex)) && return nothing
         bound && haskey(plan.columns, ex) && return nothing
         push!(refs, ex)
         return nothing
@@ -3132,7 +3133,8 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         (_is_array_param(plan, ex.args[1]) ||
             _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
-            all(i -> i isa Int || _is_row_index(plan, i), ex.args[2:end])
+            all(i -> i isa Int || _is_endpoint_position(i) ||
+                _is_row_index(plan, i), ex.args[2:end])
     ex isa Number && return false
     ex isa LineNumberNode && return false
     ex isa Expr || return false
