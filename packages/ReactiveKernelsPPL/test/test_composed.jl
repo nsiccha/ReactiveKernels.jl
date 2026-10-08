@@ -135,8 +135,9 @@ end
     @test [p.name for p in plan.predictors] == [:th, :eta]
     @test only(plan.predictors[2].terms).options.tree == :(ga .* (be .* th))
     @test isempty(plan.derived)
-    # ... including through a shared composed root that is also a
-    # response location (the root interns; the use site inlines it).
+    # A composed root that is also a response location is evaluated once,
+    # as in Julia: the other use reads it by name rather than inlining a
+    # second copy of `be .* th` (user direction on decision `1jrw655`).
     shared = lower_rkppl(quote
         a_th ~ Normal(0, 1)
         b_th ~ Normal(0, 1)
@@ -148,9 +149,10 @@ end
         eta2 = ga .* mid
         y2 .~ Bernoulli.(logistic.(eta2))
     end, (:y1, :y2, :xs); conditioned = (:y1, :y2, :xs))
-    @test [p.name for p in shared.predictors] == [:th, :mid, :eta2]
-    @test only(shared.predictors[3].terms).options.tree ==
-        :(ga .* (be .* th))
+    @test [p.name for p in shared.predictors] == [:y1_eta, :eta2]
+    @test [(d.name, d.expr) for d in shared.derived if d.name in (:th, :mid)] ==
+        [(:th, :(a_th .+ b_th .* xs)), (:mid, :(be .* th))]
+    @test any(d -> d.expr == :(ga .* mid), shared.derived)
 end
 
 @testset "composed data leaves + logistic maps (v3)" begin
