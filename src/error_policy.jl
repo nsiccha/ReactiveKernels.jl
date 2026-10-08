@@ -17,6 +17,8 @@ struct _IgnoredThrowFunction{F}
 end
 @inline (f::_IgnoredThrowFunction)(args::Vararg{Any,N}) where {N} =
     _ignored_throw_call(f.f, args...)
+# Nested ignored-throw twins recur through these methods too (`core.jl`).
+_source_callable_type(::Type{<:_IgnoredThrowFunction}) = true
 
 function _kernel_visible_throw(ex, mod, names)
     ex isa Expr && ex.head === :call && length(ex.args) == 2 || return false
