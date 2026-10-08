@@ -9332,8 +9332,11 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     if core.args[1] in ctx.prior_names && core.args[1] ∉ ctx.sized_decls
         # Base owns scalar indexing too: index 1 returns the value; other
         # integer or vector indices keep their ordinary Julia failures.
+        # Out of index syntax, `end` / `begin` take Julia's lowering.
         return _extract_summand(pname,
-            Expr(:call, GlobalRef(Base, :getindex), core.args...), sign, ctx)
+            Expr(:call, GlobalRef(Base, :getindex), core.args[1],
+                ReactiveKernels._kernel_ref_indices(core.args[1],
+                    core.args[2:end])...), sign, ctx)
     end
     # Reads of a declared array value (`z[g]`, `phi[1]`, `c[1]` of an
     # `Ordered` vector) or of an array-valued definition (`b[g, 1]`,
@@ -9349,6 +9352,9 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
                                      "takes `coefficients[group]` exactly, " *
                                      "got $(repr(core))")
     base, idx = core.args
+    # An endpoint (`s[end]`) is one literal position: a value, as in Julia.
+    _is_endpoint_position(idx) &&
+        return _extract_summand(pname, core, sign, ctx)
     if haskey(ctx.factor_axes, base) &&
             idx !== ctx.factor_axes[base][1]
         return _extract_summand(pname, core, sign, ctx)
