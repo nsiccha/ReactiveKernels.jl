@@ -708,7 +708,8 @@ _fv_assigns(ex, sym::Symbol) = ex isa Expr && (
     g = [1, 2, 1, 3, 2]
     x = [0.1, 0.5, -0.3, 1.2, 0.7]
     y = [0.2, 0.9, 0.1, 1.5, 0.8]
-    cols = Dict{Symbol,ColumnData}(:g => g, :x => x, :y => y)
+    rows = [5, 4, 3, 2, 1]
+    cols = Dict{Symbol,ColumnData}(:g => g, :x => x, :y => y, :rows => rows)
     cases = (
         # A model-level scalar.
         (quote
@@ -731,6 +732,16 @@ _fv_assigns(ex, sym::Symbol) = ex isa Expr && (
             w = exp.(eta) .* x
             y .~ Normal.(2 .* w, s)
         end, (:eta, :w), th -> sum(logpdf.(Normal.(2 .* exp.(th.a .+ th.b .* x) .* x, th.s), y))),
+        # A gather whose index is a data-only definition, read whole by a
+        # module call: the index binds as data and `v` is one value.
+        (quote
+            s ~ Exponential(1.0)
+            z[1:3, 1:1] .~ Normal.(0, 1)
+            i = group_index(g, g)
+            v = z[i, 1]
+            reads = read_rows(v, rows)
+            y .~ Normal.(reads, s)
+        end, (:v,), th -> sum(logpdf.(Normal.(vec(th.z)[g][rows], th.s), y))),
     )
     for (ast, names, loglik) in cases
         _, bound, built = _fv_build(ast, cols)

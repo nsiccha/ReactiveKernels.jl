@@ -812,9 +812,10 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
         "$(base) by literal positions (`$(base)[1]`, `$(base)[2, 1]`, " *
         "`$(base)[:, 1]`) or, in a per-observation expression, by one " *
         "data column (`$(base)[g]`)")
-    kind === :gather && !allow_gather && _fail(label, "`$(repr(ex))` " *
-        "gathers per observation — write it in a vector (per-observation) " *
-        "definition, not a scalar one")
+    kind === :gather && !allow_gather &&
+        !_is_data_only_assignment(plan, ex.args[1 + _gather_index_axis(plan, ex)]) &&
+        _fail(label, "`$(repr(ex))` gathers per observation — write it in " *
+            "a vector (per-observation) definition, not a scalar one")
     push!(refs, base)
     if kind === :gather
         length(ex.args) - 1 == length(p.dims) || _fail(label,
