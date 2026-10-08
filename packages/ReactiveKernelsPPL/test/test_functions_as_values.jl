@@ -100,6 +100,12 @@ function group_index(g, gg)
     return Int[findfirst(isequal(v), lv) for v in g]
 end
 read_rows(values, rows) = values[rows]
+# A function-shaped kernel value and a gather helper, read by several
+# response locations (shared model-level value check).
+ReactiveKernels.@kernel exp_value(x_) = begin
+    x = exp.(x_)
+end
+column_gather(draws, index, margin) = draws[index, margin]
 end
 const _FV = FunctionsAsValuesModels
 
@@ -534,6 +540,233 @@ end
         ll = sum(logpdf(Normal(a + b * x[i] / nrm, th.sigma), y[i])
             for i in eachindex(y))
         @test _fv_value(built, bound, :likelihood, u) ≈ ll
+    end
+end
+
+# Calls to the module function `name` in a generated or prepared program.
+function _fv_calls(ex, name::Symbol)
+    ex isa Expr || return 0
+    n = sum(a -> _fv_calls(a, name), ex.args; init = 0)
+    if ex.head in (:call, :.) && !isempty(ex.args)
+        f = ex.args[1]
+        f isa QuoteNode && (f = f.value)
+        fname = f isa GlobalRef ? f.name : f isa Function ? nameof(f) : f
+        fname === name && (n += 1)
+    end
+    return n
+end
+
+@testset "functions as values: a shared model-level value is evaluated once" begin
+    # An intercept plus a gathered column is a model-level value. Read
+    # through a kernel or dotted value by two response locations, each
+    # location used to inline its own copy of the whole chain, so the gather
+    # and the value ran once per reader (snag `rkppl-scalar-int-acf7b8cf`).
+    # The value is now one named definition that both locations read.
+    g = [1, 1, 2, 2, 3, 3, 3]
+    x = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0, 0.25]
+    c = [1.1, 0.7, 1.3, 2.0, 0.9, 0.95, 1.4]
+    y = [0.5, 1.0, 1.5, 2.0, 0.8, 1.2, 1.9]
+    cols = Dict{Symbol,ColumnData}(:g => g, :x => x, :c => c, :y => y)
+    u = [0.2, -0.3, 0.4, 0.1, -0.2, 0.3]
+    for (value, kernels) in ((:(exp_value(x_)), 1), (:(exp.(x_)), 0))
+        ast = quote
+            s ~ Exponential(1.0)
+            b ~ Normal(0, 1)
+            a ~ Normal(0, 1)
+            z[levels(g), 1:1] .~ Normal.(0, 1)
+            r = column_gather(z, g, 1)
+            x_ = a .+ r
+            v = $value
+            c .~ LogNormal.(log.(v), s)
+            y .~ Normal.(b .* v .+ x, s)
+        end
+        _, bound, built = _fv_build(ast, cols)
+        src = kernel_expr(bound, assign_layout(bound))
+        @test _fv_calls(src, :column_gather) == 1
+        @test _fv_calls(src, :exp_value) == kernels
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        vv = exp.(th.a .+ vec(th.z)[g])
+        ll = sum(logpdf.(LogNormal.(log.(vv), th.s), c)) +
+            sum(logpdf.(Normal.(th.b .* vv .+ x, th.s), y))
+        @test _fv_value(built, bound, :likelihood, u) ≈ ll
+        kern = prepare_query(built, bound, :sampler)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        # The prepared program evaluates the gather and the value once too.
+        prepared = sprint(print, model_view(built; bound, query = q).prepared)
+        @test count("column_gather(", prepared) == 1
+        @test count("exp.(", prepared) == 1
+        val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test val ≈ Base.invokelatest(kern, u)
+        @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
+    end
+end
+
+# Value reads of the name `sym` in the body of a generated `@kernel`
+# program; a bound row count (`_observation_rows(...)`) reads shapes only.
+function _fv_reads(ex, sym::Symbol)
+    ex === sym && return 1
+    ex isa Expr || return 0
+    if ex.head === :call && !isempty(ex.args)
+        f = ex.args[1]
+        name = f isa GlobalRef ? f.name :
+            Meta.isexpr(f, :.) && f.args[end] isa QuoteNode ? f.args[end].value : f
+        name === :_observation_rows && return 0
+    end
+    return sum(a -> _fv_reads(a, sym), ex.args; init = 0)
+end
+
+@testset "functions as values: a shared per-observation value is evaluated once" begin
+    # A per-observation definition read by several locations is evaluated
+    # once and read by name, as in Julia. Each location used to inline its
+    # own copy of the definition (or the definition also stayed an affine
+    # predictor beside an inlined copy), so it ran once per reader.
+    g = [1, 2, 1, 3, 2]
+    x = [0.1, 0.5, -0.3, 1.2, 0.7]
+    c = [1.1, 0.4, 0.9, 2.0, 1.3]
+    y = [0.2, 0.9, 0.1, 1.5, 0.8]
+    cols = Dict{Symbol,ColumnData}(:g => g, :x => x, :c => c, :y => y)
+    cases = (
+        # A log-scale location and a scaled location read one value.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            v = exp.(a .+ b .* x)
+            c .~ LogNormal.(log.(v), s)
+            y .~ Normal.(2 .* v, s)
+        end, src -> _fv_calls(src, :exp) == 1, function (th)
+            v = exp.(th.a .+ th.b .* x)
+            sum(logpdf.(LogNormal.(log.(v), th.s), c)) +
+                sum(logpdf.(Normal.(2 .* v, th.s), y))
+        end),
+        # An affine predictor read by name and inlined into another
+        # definition: computed once, so the data column is read once.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            eta = a .+ b .* x
+            theta = 0.8 .+ abs.(eta)
+            y .~ Normal.(theta, s)
+            c .~ Normal.(0.8 .+ abs.(eta), s)
+        end, src -> _fv_reads(src.args[2], :x) == 1, function (th)
+            theta = 0.8 .+ abs.(th.a .+ th.b .* x)
+            sum(logpdf.(Normal.(theta, th.s), y)) +
+                sum(logpdf.(Normal.(theta, th.s), c))
+        end),
+        # A factor-coefficient alias read by two predictors: one gather.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            z[levels(g)] .~ Normal.(0, 1)
+            zg = z[g]
+            mu1 = a .+ zg
+            mu2 = b .* zg
+            y .~ Normal.(mu1, s)
+            c .~ Normal.(mu2, s)
+        end, src -> _fv_reads(src.args[2], :g) == 1, function (th)
+            zg = th.z[g]
+            sum(logpdf.(Normal.(th.a .+ zg, th.s), y)) +
+                sum(logpdf.(Normal.(th.b .* zg, th.s), c))
+        end),
+        # A location inlines the value while the scale reads its name.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1)
+            v = exp.(a .+ b .* x)
+            y .~ Normal.(log.(v), v)
+        end, src -> _fv_calls(src, :exp) == 1, function (th)
+            v = exp.(th.a .+ th.b .* x)
+            sum(logpdf.(Normal.(log.(v), v), y))
+        end),
+        # A composition read by two composed locations.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            eta = a .+ b .* x
+            w = exp.(eta) .* x
+            y .~ Normal.(2 .* w, s)
+            c .~ Normal.(3 .* w, s)
+        end, src -> _fv_calls(src, :exp) == 1, function (th)
+            w = exp.(th.a .+ th.b .* x) .* x
+            sum(logpdf.(Normal.(2 .* w, th.s), y)) +
+                sum(logpdf.(Normal.(3 .* w, th.s), c))
+        end),
+    )
+    for (ast, once, loglik) in cases
+        _, bound, built = _fv_build(ast, cols)
+        src = kernel_expr(bound, assign_layout(bound))
+        @test once(src)
+        u = collect(range(-0.3, 0.4; length = built.layout.total))
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        @test _fv_value(built, bound, :likelihood, u) ≈ loglik(th)
+        kern = prepare_query(built, bound, :sampler)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test val ≈ Base.invokelatest(kern, u)
+        @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
+    end
+end
+
+# Whether the body of a generated `@kernel` program assigns `sym`.
+_fv_assigns(ex, sym::Symbol) = ex isa Expr && (
+    (ex.head === :(=) && (ex.args[1] === sym ||
+        Meta.isexpr(ex.args[1], :(::)) && ex.args[1].args[1] === sym)) ||
+    any(a -> _fv_assigns(a, sym), ex.args))
+
+@testset "functions as values: a definition read by one location stays a named value" begin
+    # As in Julia, a computed definition is one named value even when a
+    # single location reads it; the location no longer folds it into its
+    # own expression (user decision `0fbe312`). Densities are unchanged.
+    g = [1, 2, 1, 3, 2]
+    x = [0.1, 0.5, -0.3, 1.2, 0.7]
+    y = [0.2, 0.9, 0.1, 1.5, 0.8]
+    rows = [5, 4, 3, 2, 1]
+    cols = Dict{Symbol,ColumnData}(:g => g, :x => x, :y => y, :rows => rows)
+    cases = (
+        # A model-level scalar.
+        (quote
+            a ~ Normal(0, 1); s ~ Exponential(1.0)
+            t = exp(a) + 1
+            y .~ Normal.(t .* x, s)
+        end, (:t,), th -> sum(logpdf.(Normal.((exp(th.a) + 1) .* x, th.s), y))),
+        # An affine part beside a factor term.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            z[levels(g)] .~ Normal.(0, 1)
+            eta = a .+ b .* x
+            mu = eta .+ z[g]
+            y .~ Normal.(mu, s)
+        end, (:eta,), th -> sum(logpdf.(Normal.(th.a .+ th.b .* x .+ th.z[g], th.s), y))),
+        # A chain of compositions.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            eta = a .+ b .* x
+            w = exp.(eta) .* x
+            y .~ Normal.(2 .* w, s)
+        end, (:eta, :w), th -> sum(logpdf.(Normal.(2 .* exp.(th.a .+ th.b .* x) .* x, th.s), y))),
+        # A gather whose index is a data-only definition, read whole by a
+        # module call: the index binds as data and `v` is one value.
+        (quote
+            s ~ Exponential(1.0)
+            z[1:3, 1:1] .~ Normal.(0, 1)
+            i = group_index(g, g)
+            v = z[i, 1]
+            reads = read_rows(v, rows)
+            y .~ Normal.(reads, s)
+        end, (:v,), th -> sum(logpdf.(Normal.(vec(th.z)[g][rows], th.s), y))),
+    )
+    for (ast, names, loglik) in cases
+        _, bound, built = _fv_build(ast, cols)
+        src = kernel_expr(bound, assign_layout(bound))
+        @test all(nm -> _fv_assigns(src.args[2], nm), names)
+        u = collect(range(-0.3, 0.4; length = built.layout.total))
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        @test _fv_value(built, bound, :likelihood, u) ≈ loglik(th)
+        kern = prepare_query(built, bound, :sampler)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test val ≈ Base.invokelatest(kern, u)
+        @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
     end
 end
 
