@@ -302,10 +302,17 @@ data — bound-only cell recipes evaluated at preparation, data-bound branch
 partitions — is still specialized and compiled per binding and reuses only
 the plan and prefix. For a residual containing authored plates the pass runs
 on every binding (it declines before evaluating anything when a plate has
-nothing bound to specialize), and every binding it leaves alone shares the one
-compiled residual, whatever the bound values' types or array lengths: an
-inline plate over a bound domain rebinds to a new domain length at the cost of
-the prefix, exactly as the same plate in a separately prepared child does.
+nothing bound to specialize), and every binding it leaves alone shares the
+compiled residual of its class, whatever the bound values' element types or
+array lengths: an inline plate over a bound domain rebinds to a new domain
+length at the cost of the prefix, exactly as the same plate in a separately
+prepared child does. A plate that reads a bound argument lowers for that
+argument's class — scalar, vector or range, rank-N array, or tuple — as a
+port declaring that class would, even when the port is untyped: a bound
+`1:n` domain has no runtime axis guard or per-coordinate bookkeeping, and a
+recipe that reads only a bound scalar runs once above the loop. So each class
+has its own compiled residual; a rank-0 array or any other bound value keeps
+the undeclared port's runtime guard.
 (Before, such a residual was templated per bound-value type and array-shape
 signature, so each new bound array length lowered the residual again and kept
 another template: 2.6 ms and 1.16 MB more per new schedule length on the

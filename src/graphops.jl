@@ -46,9 +46,11 @@ different plan struct, an `Int` vector for a `Float64` one) reuses the entry
 and its compiled bodies, which are generic over those types and specialize
 per concrete type on first use like any other Julia call; a lazy branch on a
 hoisted constant stays a per-call branch and follows each binding's value.
-Only a residual containing authored plates is templated per bound-value type
-and shape signature, because that decides whether its plates specialize. The
-cache is caller-owned and grows with the distinct boundaries (and those
+An authored plate that reads a bound argument lowers for that argument's
+class — scalar, vector, rank-N array or tuple — as if its port declared it, so
+its residual is kept per class: a bound `1:n` and a bound `Vector` domain share
+one, a bound scalar operand has another. Element types and extents never split
+it. The cache is caller-owned and grows with the distinct boundaries (and those
 shapes) prepared through it; it never observes the bound values afterwards and
 retains none of them. Rebinding is not specialized on the graph's kernel
 types, so a graph's first rebinding in a process compiles nothing once any
@@ -159,11 +161,15 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     residual, specialized = _bound_residual(entry, hoisted)
     # A residual the inner-plate pass rewrote bakes this binding's values in.
     specialized === residual || return prepare(specialized; passes = passes)
+    # Bindings whose plates read bound arguments of the same classes share a
+    # compiled residual; a new class lowers its own.
+    classes = _partial_plate_classes(entry.boundary, hoisted)
     fresh = nothing
     template = lock(cache.lock) do
-        entry.template isa _UnbuiltTemplate || return entry.template
+        current = get(entry.templates, classes, _UnbuiltTemplate())
+        current isa _UnbuiltTemplate || return current
         template, kernel = _bound_build(entry, residual, hoisted, passes)
-        entry.template = template
+        entry.templates[classes] = template
         fresh = kernel
         template
     end
@@ -193,6 +199,12 @@ end
 for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, Tuple)),
                    (_bound_residual, (_BoundEntry, Any)),
                    (_bound_build, (_BoundEntry, Any, Any, Any)),
-                   (_partial_residual, (Plan, _PartialBoundary, Any)))
+                   (_partial_residual, (Plan, _PartialBoundary, Any)),
+                   (_partial_plate_classes, (_PartialBoundary, Any)),
+                   (_partial_narrow_plate_inputs, (Graph, _PartialBoundary, Tuple)))
     precompile(f, types) || error("no $f method for $types")
+end
+for value in (Any, Number, Tuple, AbstractArray)
+    precompile(_bound_plate_class, (value,)) ||
+        error("no _bound_plate_class method for $value")
 end
