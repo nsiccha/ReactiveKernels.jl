@@ -1208,6 +1208,20 @@ end
             $(GlobalRef(Base, :promote_op))($(GlobalRef(Base, :muladd)), $X, $T, $T) === $T
     end
 end
+# Whether a scan's strip region can run over views of its outer lanes: every
+# lane and every other scan sequence is a vector over one common axis.
+@inline _plate_strip_ready() = false
+@inline _plate_strip_ready(first::AbstractVector, rest...) =
+    _plate_strip_same_axis(axes(first, 1), rest...)
+@inline _plate_strip_ready(first, rest...) = false
+@inline _plate_strip_same_axis(axis) = true
+@inline _plate_strip_same_axis(axis, lane::AbstractVector, rest...) =
+    axes(lane, 1) == axis && _plate_strip_same_axis(axis, rest...)
+@inline _plate_strip_same_axis(axis, lane, rest...) = false
+# Steps per strip of a strip-fused scan: the strip buffers of its plates stay
+# in the first-level cache between the plate cells and the steps that read them.
+const _PLATE_STRIP = 128
+
 # Cells per tile of a coefficient-outer pass: the accumulators and the cell
 # values of one tile stay in the first-level cache across the passes.
 const _PLATE_FOLD_TILE = 256
