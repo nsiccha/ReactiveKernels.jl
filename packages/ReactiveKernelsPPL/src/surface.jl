@@ -9338,11 +9338,13 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
                 ReactiveKernels._kernel_ref_indices(core.args[1],
                     core.args[2:end])...), sign, ctx)
     end
-    # Reads of a declared array value (`z[g]`, `phi[1]`) or of an
-    # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
-    # values, not factor coefficients: scalar assignments by position,
-    # per-observation columns when gathered.
+    # Reads of a declared array value (`z[g]`, `phi[1]`, `c[1]` of an
+    # `Ordered` vector) or of an array-valued definition (`b[g, 1]`,
+    # `b = z * (sd .* L)'`) are values, not factor coefficients: scalar
+    # values by position, per-observation columns when gathered.
     (core.args[1] in ctx.value_arrays ||
+        core.args[1] in ctx.dirichlet_names ||
+        core.args[1] in ctx.ordered_names ||
         _is_array_def(core.args[1], ctx) ||
         _is_model_value_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
@@ -9357,8 +9359,9 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
             idx !== ctx.factor_axes[base][1]
         return _extract_summand(pname, core, sign, ctx)
     end
-    # A literal element (`phi[1]`) is one scalar, not a per-level column.
-    idx isa Integer && return _scalar_summand_error(pname, core)
+    # A literal element (`b[1]`, `x[1]`) is one scalar value, broadcast
+    # onto the predictor as Julia does, not a per-level column.
+    idx isa Integer && return _extract_summand(pname, core, sign, ctx)
     base isa Symbol || _sfail("predictor $pname: factor base must be a " *
                               "bare coefficient vector, got $(repr(base))")
     base in ctx.data && _sfail("predictor $pname: $base is data — " *

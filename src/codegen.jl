@@ -136,13 +136,20 @@ end
 # has no zero, so `_PlateTotalSeed` holds the place and the first cell starts
 # the total, which is `sum`'s value for a nonempty plate. An empty plate still
 # needs a zero without any cell: the seed carries the fallback element type `F`
-# (the axis marker's, or a scan consumer's output type), whose zero the total
-# then takes, and a non-numeric `F` asks for the cell type to be declared.
+# (the axis marker's element type, or a scan consumer's output type), whose
+# zero the total then takes, and a non-numeric `F` asks for the cell type to be
+# declared. The fallback is passed as the marker itself (or the type) and its
+# element type is taken only for a non-concrete `T`: an unconditional
+# `eltype(marker)` in the lowered code is a runtime call under native Enzyme
+# when the marker is not an array (Julia 1.12 fails to compile it).
 struct _PlateTotalSeed{F} end
 
-@inline _plate_total_seed(::Type{T}, ::Type{F}) where {T<:Number,F} = zero(T)
-@inline _plate_total_seed(::Type{T}, ::Type{F}) where {T,F} =
-    isconcretetype(T) ? zero(T) : _PlateTotalSeed{F}()
+@inline _plate_fallback_eltype(::Type{F}) where {F} = F
+@inline _plate_fallback_eltype(marker) = eltype(marker)
+
+@inline _plate_total_seed(::Type{T}, fallback) where {T<:Number} = zero(T)
+@inline _plate_total_seed(::Type{T}, fallback) where {T} =
+    isconcretetype(T) ? zero(T) : _PlateTotalSeed{_plate_fallback_eltype(fallback)}()
 
 @inline _plate_total_add(total, cell) = total + cell
 @inline _plate_total_add(::_PlateTotalSeed, cell) = cell
@@ -1782,7 +1789,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         # `zero(eltype(marker))`.
         push!(body.args, Expr(:(=), accumulator,
             Expr(:call, GlobalRef(@__MODULE__, :_plate_total_seed),
-                 plate_eltype, Expr(:call, GlobalRef(Base, :eltype), marker))))
+                 plate_eltype, marker)))
     end
 
     loopbody = Expr(:block)

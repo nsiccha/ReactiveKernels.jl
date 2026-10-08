@@ -1241,18 +1241,23 @@ end
 
 # One triangular transform graph for every declared factor. Preparation fixes
 # K and the packed slice; neither a literal nor a data-derived K replicates
-# the body. The partials follow Stan's column-block order. Each entry retains
-# the original left-associated product (starting at z for an off-diagonal
-# entry, at 1 for a diagonal), including its floating-point operation order.
-# Inner loops have preparation-fixed bounds and lazy triangular guards. This
-# keeps nested reverse tapes statically sized without evaluating an unused
-# partial or replacing a product with a reassociated prefix recurrence.
+# the body. The partials follow Stan's column-block order. Column block j
+# carries the running product of √(1 - z²) over its j - 1 partials, starting
+# at 1: entry i is its partial times the product so far, and the diagonal is
+# the final product. This is the left-associated order of the host
+# `lkj_chol_constrain`, so the two agree bit for bit. Each pass is one loop
+# over the K(K-1)/2 packed partials, carrying the entry's position (i, j);
+# the last partial of a column moves it to the next column. No iteration is
+# spent on a masked-out entry. The trip count is fixed at preparation, so a
+# compiled reverse pass keeps a statically sized tape, which a column loop
+# with an inner `1:(j - 1)` range does not.
 _lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
 _lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
 _lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
 
 function _lkj_array_transform_statements(e::LayoutEntry)
     L, K = e.name, e.dims[1]
+    P = K * (K - 1) ÷ 2
     row, col = _is_upper_lkj(e.transform) ? (:i, :j) : (:j, :i)
     z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
     diagonal = _lkj_array_diagonal(L)
@@ -1263,58 +1268,40 @@ function _lkj_array_transform_statements(e::LayoutEntry)
         # response products. Each diagonal entry is still computed once.
         :($diagonal::Vector{Float64} = let
             out = ones(Float64, $K)
-            for j in 2:$K
-                base = (j - 1) * (j - 2) ÷ 2
-                d = 1.0
-                for ip in 1:$(K - 1)
-                    d = if ip < j
-                        d * sqrt(1 - $z[base + ip]^2)
-                    else
-                        d
-                    end
+            i, j, d = 1, 2, 1.0
+            for p in 1:$P
+                d = d * sqrt(1 - $z[p]^2)
+                if i + 1 < j
+                    i = i + 1
+                else
+                    out[j] = d
+                    i, j, d = 1, j + 1, 1.0
                 end
-                out[j] = d
             end
             out
         end),
         :($L::Matrix{Float64} = let
             out = zeros(Float64, $K, $K)
             out[1, 1] = 1.0
-            entry_value = 0.0
-            for j in 2:$K
-                base = (j - 1) * (j - 2) ÷ 2
-                for i in 1:$(K - 1)
-                    entry_value = if i < j
-                        let v = $z[base + i]
-                            for ip in 1:$(K - 1)
-                                v = if ip < i
-                                    v * sqrt(1 - $z[base + ip]^2)
-                                else
-                                    v
-                                end
-                            end
-                            v
-                        end
-                    else
-                        0.0
-                    end
-                    out[$row, $col] = entry_value
+            i, j, w = 1, 2, 1.0
+            for p in 1:$P
+                out[$row, $col] = $z[p] * w
+                w = w * sqrt(1 - $z[p]^2)
+                if i + 1 < j
+                    i = i + 1
+                else
+                    out[j, j] = $diagonal[j]
+                    i, j, w = 1, j + 1, 1.0
                 end
-                out[j, j] = $diagonal[j]
             end
             out
         end),
         :($lj::Float64 = let
             total = 0.0
-            p = 0
-            for j in 2:$K
-                for i in 1:$(K - 1)
-                    p, total = if i < j
-                        p + 1, total + ((j - i + 1) / 2) * log(1 - $z[p + 1]^2)
-                    else
-                        p, total
-                    end
-                end
+            i, j = 1, 2
+            for p in 1:$P
+                total = total + ((j - i + 1) / 2) * log(1 - $z[p]^2)
+                i, j = i + 1 < j ? (i + 1, j) : (1, j + 1)
             end
             total
         end),
