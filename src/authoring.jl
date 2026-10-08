@@ -1487,7 +1487,16 @@ struct _KernelPreparedChild{K}
     name::Symbol
     kernel::K
 end
-@inline (child::_KernelPreparedChild)(args...) = child.kernel(args...)
+# The child stays its own compiled call. Its source operations infer concretely
+# inside the caller (`_source_call_recursion_well_founded`), and native Enzyme
+# reverse on Julia 1.10 fails on the caller once the child's body is inlined
+# there: `EnzymeRuntimeActivityError`, or a crash, for a scan child in a plate
+# cell. As a call, the child is differentiated like any other callee.
+# `Vararg{Any,N}` specializes the forwarding on the argument count: an
+# unspecialized `args...` would box the arguments and dispatch at run time,
+# which made a three-cell plate over a scan child five times slower.
+@noinline (child::_KernelPreparedChild)(args::Vararg{Any,N}) where {N} =
+    child.kernel(args...)
 
 _kernel_inline_callee_name(callee::Symbol) = callee
 _kernel_inline_callee_name(callee::GlobalRef) = callee.name
