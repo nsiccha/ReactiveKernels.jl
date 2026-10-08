@@ -2421,8 +2421,17 @@ _is_dotted_call(ex) =
     ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
     ex.args[2] isa Expr && ex.args[2].head === :tuple
 
+# `nothing` and `missing` keep Julia's meaning: Base's values, whether
+# written as names or interpolated by an AST emitter. A model name shadows
+# the name, as any Julia binding would.
+_resolve_module_calls(::Nothing, ::Module, ::Set{Symbol}, where) =
+    GlobalRef(Base, :nothing)
+_resolve_module_calls(::Missing, ::Module, ::Set{Symbol}, where) =
+    GlobalRef(Base, :missing)
+
 function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
     ex in (:pi, :π) && ex ∉ names && return Float64(pi)
+    ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
     ex isa Expr || return ex
     ex.head === :quote && return ex
     # The quoted cell becomes executable in the generated kernel's module.
