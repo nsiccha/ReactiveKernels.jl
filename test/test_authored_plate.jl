@@ -1775,11 +1775,12 @@ end
 end
 
 # Coefficient-outer lowering of an `evalpoly(x, c)` cell over shared
-# coefficients (snag native-lowering-948c4ab6). Base's `evalpoly` over a vector
-# is a per-cell runtime Horner loop; the lowering runs each coefficient as one
-# pass over a tile of cells, with Base's operations in Base's order. The
-# control calls the same `evalpoly` through a function the lowering does not
-# recognize, so it keeps the cell loop.
+# coefficients (snags native-lowering-948c4ab6, evalpoly-per-cel-cea5fcf5).
+# Base's `evalpoly` over a vector is a per-cell runtime Horner loop; the
+# lowering runs chunks of cells side by side, their accumulators in registers
+# across the coefficients (`_plate_evalpoly_chunks!`), with Base's operations
+# in Base's order. The control calls the same `evalpoly` through a function
+# the lowering does not recognize, so it keeps the cell loop.
 _plate_horner(x, c) = evalpoly(x, c)
 @kernel evalpoly_cell(xs, c) = begin
     ys = plate(xs, Ref(c)) do x, c
@@ -1801,6 +1802,13 @@ end
     total = sum(ys)
     return ys, total
 end
+# `x` read beside a second lane: a one-element `xs` expands to `ws`'s axes.
+@kernel evalpoly_cell_expanded(xs, ws, c) = begin
+    ys = plate(xs, ws, Ref(c)) do x, w, c
+        evalpoly(x, c) + 0 * w
+    end
+    return ys
+end
 _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(kernel)))
 
 @testset "authored plate block: an evalpoly cell over shared coefficients runs coefficient-outer" begin
@@ -1809,8 +1817,10 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     @test !_evalpoly_lowered(control)
     @test _evalpoly_lowered(prepare(evalpoly_cell_reordered))
     coefficients = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011, 2.5e-3, -4.0e-4, 1.0e-5, 3.0e-6, -7.0e-7]
-    # Lengths around the tile, and degrees down to a constant.
-    for n in (0, 1, 255, 256, 257, 513, 1000), c in (coefficients, coefficients[1:2], [2.5])
+    # Lengths around the chunk, and degrees down to a constant.
+    chunk = ReactiveKernels._PLATE_HORNER_CHUNK
+    lengths = (0, 1, chunk - 1, chunk, chunk + 1, 2chunk - 1, 2chunk + 1, 255, 1000)
+    for n in lengths, c in (coefficients, coefficients[1:2], [2.5])
         xs = [1 / (k + 0.5) for k in 0:n-1]
         got, expected = cell(xs, c), control(xs, c)
         @test got[1] == expected[1] == evalpoly.(xs, Ref(c))
@@ -1826,6 +1836,16 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     @test cell(grid, coefficients)[1] == evalpoly.(grid, Ref(coefficients))
     # A one-based view is lowered like a vector.
     @test cell(xs, view(coefficients, 2:6))[1] == evalpoly.(xs, Ref(view(coefficients, 2:6)))
+    # Base evaluates a complex `x` with its own recurrence, so it keeps the
+    # cell loop; a real `x` over complex coefficients is Horner's and lowered.
+    zs = complex.(xs, reverse(xs) ./ 3)
+    zc = complex.(coefficients, 0.1 .* reverse(coefficients))
+    @test cell(zs, zc)[1] == evalpoly.(zs, Ref(zc))
+    @test cell(xs, zc)[1] == evalpoly.(xs, Ref(zc))
+    # An `x` expanded from one element is not read directly; same values.
+    expanded = prepare(evalpoly_cell_expanded)
+    @test expanded([0.3], xs, coefficients) == fill(evalpoly(0.3, coefficients), length(xs))
+    @test expanded(xs, [1.0], coefficients) == evalpoly.(xs, Ref(coefficients))
     # Base's errors: empty coefficients have no `c[end]`.
     @test_throws BoundsError cell(xs, Float64[])
     @test cell(Float64[], Float64[]) == (Float64[], 0.0)
@@ -1835,9 +1855,15 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     allocated(control, xs, coefficients)
     @test allocated(cell, xs, coefficients) <= allocated(control, xs, coefficients) +
                                                 _natural_sup_parity_margin
-    # The coefficient passes vectorize across cells.
+    # The kernel calls the chunked helper, whose chunk runs as vector
+    # operations across its cells.
+    @test occursin("_plate_evalpoly_chunks!", _plate_entry_llvm(cell, xs, coefficients))
     if Sys.ARCH in (:x86_64, :aarch64)
-        @test occursin(r"<\d+ x double>", _plate_entry_llvm(cell, xs, coefficients))
+        chunk_llvm = sprint(io -> InteractiveUtils.code_llvm(io,
+            ReactiveKernels._plate_evalpoly_chunk!,
+            Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}, Int, Float64, Int,
+                  Val{chunk}}; debuginfo = :none))
+        @test occursin(r"<\d+ x double>", chunk_llvm)
     end
 end
 
@@ -2015,6 +2041,137 @@ _fission_hoisted(kernel) = occursin("scan_hoisted", string(code_expr(kernel)))
     allocated(k, steps) = @allocated k(steps, coefficients...)
     allocated(kernel, steps)
     @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
+end
+
+# A gather-free generator sum whose term is plain arithmetic runs fold-outer
+# over tiles of cells (snag native-lowering-948c4ab6, todo 16mekxc): one pass
+# over a tile per element, each cell accumulating `add_sum` in the authored
+# order. The control calls a function the lowering does not recognize, so it
+# keeps the cell loop; every value must match it bitwise. A term that calls
+# anything but Base's arithmetic (`exp` here) keeps the cell loop.
+_fold_sum_div(a, b) = a / b
+@kernel fold_sum_cell(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(out)
+    return out, total
+end
+@kernel fold_sum_control(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(_fold_sum_div(w[j], t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(out)
+    return out, total
+end
+# A tuple or two-axis domain keeps the cell loop.
+@kernel fold_sum_any(ts, w, s) = begin
+    out = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+@kernel fold_sum_exp(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] * exp(-(t - s[j])^2) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# The guarded gather of §4e's traceable spelling: arithmetic, comparisons,
+# `ifelse`, `max` and indexing.
+@kernel fold_sum_guard(ti, w, s, u) = begin
+    out::Vector{Float64} = plate(ti, Ref(w), Ref(s), Ref(u)) do t, w, s, u
+        sum(ifelse(t - s[j] > 0, u[max(t - s[j], 1)] * w[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# An `Int` seed against `Float64` terms changes the accumulator type after the
+# first element, and a range that reads the cell is not shared by every cell:
+# both keep the cell loop.
+@kernel fold_sum_int_seed(ts, w, s) = begin
+    out = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0)
+    end
+    return out
+end
+@kernel fold_sum_cell_range(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in 1:min(round(Int, t), length(w)); init = 0.0)
+    end
+    return out
+end
+@kernel fold_sum_range(n, w, s) = begin
+    out::Vector{Float64} = plate(1:n, Ref(w), Ref(s)) do k, w, s
+        sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# An arithmetic sum in a plain scan step is a fold the strip region runs.
+@kernel fold_sum_scan(steps, w, s, decay) = begin
+    out = scan(steps, Ref(w), Ref(s), Ref(decay); init = 0.0) do carry, k, w, s, d
+        r = sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
+        next = muladd(d, carry, r)
+        (next, next)
+    end
+    return out
+end
+_fold_sum_passes(kernel) = occursin("_plate_one_axis", string(code_expr(kernel)))
+
+@testset "authored plate: an arithmetic generator sum runs fold-outer, bitwise" begin
+    cell, control = prepare(fold_sum_cell), prepare(fold_sum_control)
+    @test _dose_outer_reductions(cell) == 1
+    @test _fold_sum_passes(cell)
+    @test _dose_outer_reductions(control) == 0
+    @test _dose_outer_reductions(prepare(fold_sum_exp)) == 0
+    for n in (0, 1, 255, 256, 257, 1000), m in (0, 1, 3, 12)
+        ts = n == 1 ? [0.1] : collect(range(0.1, 50.0; length = n))
+        w, s = [0.5 + 0.1j for j in 1:m], [1.0 + 2.5j for j in 1:m]
+        got, expected = cell(ts, w, s), control(ts, w, s)
+        @test _dose_outer_same(got[1], expected[1])
+        @test got[2] === expected[2]
+    end
+    w, s = [0.5, -0.25, 2.0], [1.0, 3.5, 6.0]
+    ts = collect(range(0.1, 50.0; length = 300))
+    expected = control(ts, w, s)[1]
+    any_domain = prepare(fold_sum_any)
+    @test _dose_outer_same(any_domain(ts, w, s), expected)
+    @test _dose_outer_same(collect(any_domain(Tuple(ts[1:20]), w, s)), expected[1:20])
+    @test _dose_outer_same(vec(any_domain(reshape(ts, 20, 15), w, s)), expected)
+    @test _dose_outer_same(prepare(fold_sum_exp)(ts, w, s),
+        [sum(w[j] * exp(-(t - s[j])^2) for j in eachindex(w); init = 0.0) for t in ts])
+    int_seed = prepare(fold_sum_int_seed)
+    @test _dose_outer_reductions(int_seed) == 1
+    @test _dose_outer_same(int_seed(ts, w, s), expected)
+    cell_range = prepare(fold_sum_cell_range)
+    @test _dose_outer_same(cell_range(ts, w, s),
+        [sum(w[j] / (t + s[j]) for j in 1:min(round(Int, t), length(w)); init = 0.0) for t in ts])
+    ranged = prepare(fold_sum_range)
+    @test _dose_outer_reductions(ranged) == 1
+    @test _dose_outer_same(ranged(1000, w, s),
+        [sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0) for k in 1:1000])
+    guard = prepare(fold_sum_guard)
+    @test _dose_outer_reductions(guard) == 1
+    ti, si, wi = collect(1:300), [1, 50, 120], [0.5, 0.25, 2.0]
+    u = [exp(-0.01i) for i in 1:300]
+    @test _dose_outer_same(guard(ti, wi, si, u),
+        [sum(ifelse(t - si[j] > 0, u[max(t - si[j], 1)] * wi[j], 0.0) for j in eachindex(wi); init = 0.0)
+         for t in ti])
+end
+
+@testset "authored scan: an arithmetic step sum runs in the strip region" begin
+    kernel = prepare(fold_sum_scan)
+    @test _fission_hoisted(kernel)
+    w, s, decay = [0.5, -0.25, 2.0], [1.0, 3.5, 6.0], 0.9
+    for n in (0, 1, 127, 128, 129, 1000)
+        steps = 0:n-1
+        carry = 0.0
+        expected = Float64[]
+        for k in steps
+            carry = muladd(decay, carry, sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0))
+            push!(expected, carry)
+        end
+        @test isapprox(kernel(steps, w, s, decay), expected; rtol = 1e-13)
+    end
 end
 
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin
