@@ -85,6 +85,24 @@ Recipe(id, inputs, outputs, op, cost, cse_key, effectful) =
     Recipe(id, inputs, outputs, op, cost, cse_key, effectful, _NO_KERNEL_SOURCE)
 
 """
+    _TypeOperation{T}
+
+A type used as a recipe's operation, such as the bare constructor call
+`y = SVector{2,Float64}(a, b)` in a `@kernel` or `add!(g, x => y, Float64)`.
+Calling it calls `T` with the same arguments. Every type has the one Julia
+type `DataType` (or `UnionAll`), so a type stored in an operation table leaves
+its identity to the runtime value: a call through it, and every result type
+derived from it, is uninferred, and the generated body falls back to dynamic
+dispatch. Native Enzyme reverse then fails static activity analysis on the
+boxed arguments. As a singleton the type travels in the operation's own type.
+Recipe registration (`_add_recipe!`) applies it, so every operation table and
+type query sees it.
+"""
+struct _TypeOperation{T} end
+@inline (::_TypeOperation{T})(args...) where {T} = T(args...)
+_type_operation_type(::_TypeOperation{T}) where {T} = T
+
+"""
     _KernelSourceOp{DefToken,Form,F,TF,IG,CI}
 
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
@@ -1687,6 +1705,7 @@ Base.@nospecializeinfer function _add_recipe!(g::Graph,
     if !isfinite(recipe_cost) || recipe_cost < 0
         throw(ArgumentError("recipe cost must be finite and non-negative, got $cost"))
     end
+    op isa Type && (op = _TypeOperation{op}())
     # Opt-in structural CSE (gist §8): if a prior recipe carries the same
     # non-`nothing` cse_key, the same canonical inputs, and the same output
     # arity, it computes the same thing. Alias the new outputs onto the existing

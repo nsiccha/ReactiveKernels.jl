@@ -284,4 +284,15 @@ end
     total = sum(flat) * sum(live)
 end
 
+# `data_only_result` with Base's `ones`, which inlines, in place of the
+# counting helper.
+@kernel data_only_result_inline(live::Vector{Float64}, limits, rows, subjects) = begin
+    weights = plate(subjects, Ref(limits), Ref(rows), Ref(live)) do s, limits_all, rows_all, live_all
+        selected = limits_all[rows_all[s]]
+        ones(length(selected)) .* selected
+    end
+    flat = convert(Vector{Float64}, reduce(vcat, weights; init = Float64[]))
+    total = sum(flat .* live)
+end
+
 end
