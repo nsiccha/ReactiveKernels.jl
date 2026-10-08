@@ -24,7 +24,8 @@ with `have=(:unconstrained, data…)`); `layout` is its
 [`LayoutTable`](@ref) (R10 read API for the sampler side). `program` is the
 generated program the graph evaluates: [`prepare_query`](@ref) accepts any
 bound plan that generates the same program, with other row counts and data
-values, and refuses one that generates another.
+values or an equivalent lowering in another gensym-created isolation module,
+and refuses one that generates another.
 
 Concurrency: `build_kernel` is concurrency-safe. Independent plans may be
 built from concurrent tasks with no caller-side synchronization: a build
@@ -100,12 +101,19 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
 end
 
 # A generated definition with its private names (`gensym`s, which differ
-# between lowerings) renamed in order of first appearance. Two bindings
-# generate the same program exactly when these are equal.
+# between lowerings) renamed in order of first appearance. References owned
+# by a gensym-created lowering module get the same treatment: the module is an
+# isolation namespace, not part of the emitted program. Stable named modules
+# remain part of the identity. Two bindings generate the same program exactly
+# when these are equal.
 function _program_identity(def)
     names = Dict{Symbol,Symbol}()
+    modules = IdDict{Module,Symbol}()
     rename(x::Symbol) = Base.isgensym(x) ?
         get!(() -> Symbol("##", length(names) + 1), names, x) : x
+    rename(x::GlobalRef) = Base.isgensym(nameof(x.mod)) ?
+        Expr(:., get!(() -> Symbol("_rkppl_generated_module_", length(modules) + 1),
+            modules, x.mod), QuoteNode(x.name)) : x
     rename(x::Expr) = Expr(x.head, Any[rename(a) for a in x.args]...)
     rename(x) = x
     return rename(def)
