@@ -603,9 +603,19 @@ end
     end
 end
 
-# Reads of the name `sym` in the body of a generated `@kernel` program.
-_fv_reads(ex, sym::Symbol) = ex === sym ? 1 : ex isa Expr ?
-    sum(a -> _fv_reads(a, sym), ex.args; init = 0) : 0
+# Value reads of the name `sym` in the body of a generated `@kernel`
+# program; a bound row count (`_observation_rows(...)`) reads shapes only.
+function _fv_reads(ex, sym::Symbol)
+    ex === sym && return 1
+    ex isa Expr || return 0
+    if ex.head === :call && !isempty(ex.args)
+        f = ex.args[1]
+        name = f isa GlobalRef ? f.name :
+            Meta.isexpr(f, :.) && f.args[end] isa QuoteNode ? f.args[end].value : f
+        name === :_observation_rows && return 0
+    end
+    return sum(a -> _fv_reads(a, sym), ex.args; init = 0)
+end
 
 @testset "functions as values: a shared per-observation value is evaluated once" begin
     # A per-observation definition read by several locations is evaluated
