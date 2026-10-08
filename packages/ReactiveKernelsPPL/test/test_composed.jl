@@ -80,8 +80,8 @@ end
     @test t.options.subs == [:th]
     @test isempty(plan.population_priors)
     @test only(plan.array_parameters).name === :c
-    # Under `.+` the same alias keeps the affine merge (with
-    # unstated-coefficient defaults) — never reroutes into a composition.
+    # Under `.+` the alias is a named gather read as an offset beside the
+    # affine slope (user decision `0fbe312`) — never a composition.
     aff = lower_rkppl(quote
         b ~ Normal(0, 1)
         c[levels(g)] .~ Normal.(0, 2)
@@ -91,7 +91,8 @@ end
     end, (:y, :g, :x); conditioned = (:y, :g, :x))
     @test [p.name for p in aff.predictors] == [:mu]
     @test [t.kind for t in only(aff.predictors).terms] ==
-        [FactorTerm, ContinuousTerm]
+        [OffsetTerm, ContinuousTerm]
+    @test [(d.name, d.expr) for d in aff.derived] == [(:th, :(c[g]))]
 end
 
 @testset "composed inline and scale locations" begin
@@ -120,8 +121,9 @@ end
 end
 
 @testset "composed named nesting (v2)" begin
-    # A name bound to a composition inlines at its use (naming a
-    # subexpression never changes legality; v1 failed these closed).
+    # A name bound to a composition stays one named value that its reader
+    # reads (naming a subexpression never changes legality; v1 failed these
+    # closed; user decision `0fbe312`).
     plan = lower_rkppl(quote
         a_th ~ Normal(0, 1)
         b_th ~ Normal(0, 1)
@@ -132,9 +134,10 @@ end
         eta = ga .* mid
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs); conditioned = (:y, :xs))
-    @test [p.name for p in plan.predictors] == [:th, :eta]
-    @test only(plan.predictors[2].terms).options.tree == :(ga .* (be .* th))
-    @test isempty(plan.derived)
+    @test [p.name for p in plan.predictors] == [:eta]
+    @test [(d.name, d.expr) for d in plan.derived if d.name in (:th, :mid)] ==
+        [(:th, :(a_th .+ b_th .* xs)), (:mid, :(be .* th))]
+    @test any(d -> d.expr == :(ga .* mid), plan.derived)
     # A composed root that is also a response location is evaluated once,
     # as in Julia: the other use reads it by name rather than inlining a
     # second copy of `be .* th` (user direction on decision `1jrw655`).
@@ -170,7 +173,7 @@ end
     @test t.kind === ComposedTerm
     @test t.options.tree == :(be .* (th .+ xs))
     @test t.columns == [:xs]
-    # `logistic.` maps (and a name bound to a map composition) inline.
+    # `logistic.` maps compose; each named step stays a named value.
     curve = lower_rkppl(quote
         a_l ~ Normal(0, 1)
         b_l ~ Normal(0, 1)
@@ -184,12 +187,12 @@ end
         mu = m0 .+ resp
         y .~ Normal.(mu, 1.0)
     end, (:y, :xs, :g); conditioned = (:y, :xs, :g))
-    mt = only(curve.predictors[end].terms)
-    @test mt.kind === ComposedTerm
-    @test mt.options.tree ==
-        :(m0 .+ logistic.((xs .- loc) .* exp.(ls)))
-    @test mt.options.subs == [:loc, :ls]
-    @test isempty(curve.derived)
+    @test [t.kind for t in only(curve.predictors).terms] ==
+        [InterceptTerm, OffsetTerm]
+    @test [(d.name, d.expr) for d in curve.derived[1:3]] ==
+        [(:loc, :(a_l .+ b_l .* g)), (:ls, :(a_s .+ b_s .* g)),
+            (:xi, :((xs .- loc) .* exp.(ls)))]
+    @test curve.derived[4].name === :resp
 end
 
 @testset "composed bare maps stay link spellings" begin
@@ -219,7 +222,7 @@ end
         y .~ Poisson.(exp.(mu))
     end, D; conditioned = D)
     @test only(pois.predictors).link === LogLink
-    # A named map inside a real combination still inlines.
+    # A named map inside a real combination stays a named value.
     plan = lower_rkppl(quote
         a_la ~ Normal(0, 1)
         b_la ~ Normal(0, 1)
@@ -233,7 +236,9 @@ end
     end, (:y, :xs); conditioned = (:y, :xs))
     t = only(plan.predictors[end].terms)
     @test t.kind === ComposedTerm
-    @test t.options.tree == :(exp.(la) .* th)
+    @test t.options.tree == :(al .* th)
+    @test [(d.name, d.expr) for d in plan.derived] ==
+        [(:la, :(a_la .+ b_la .* xs)), (:al, :(exp.(la)))]
 end
 
 @testset "composed fail-closed" begin
@@ -399,8 +404,9 @@ _cmp_ap_want(q) = _cmp_ap_loglik(q.a .* _cmp_ap_x(), q.s1, q.s2) +
         sd = hypot.(s1, prop)
         y .~ Normal.(mu, sd)
     end, _CMP_AP_Q, _cmp_ap_want)
-    @test only(named.predictors[end].terms).options.tree ==
-        Expr(:., GlobalRef(Main, :hypot), Expr(:tuple, :s1, :(mu .* s2)))
+    # Each named step is one value (user decision `0fbe312`).
+    @test [(d.name, d.expr) for d in named.derived if d.name in (:mu, :prop)] ==
+        [(:mu, :(a .* x)), (:prop, :(mu .* s2))]
     # Intercept plus slope: the block is `[Intercept, x]`.
     _cmp_ap_check(quote
         b0 ~ Normal(0.0, 5.0); a ~ Normal(0.0, 1.0)

@@ -611,8 +611,7 @@ _fv_reads(ex, sym::Symbol) = ex === sym ? 1 : ex isa Expr ?
     # A per-observation definition read by several locations is evaluated
     # once and read by name, as in Julia. Each location used to inline its
     # own copy of the definition (or the definition also stayed an affine
-    # predictor beside an inlined copy), so it ran once per reader. A
-    # definition read by one location keeps its inlined plan.
+    # predictor beside an inlined copy), so it ran once per reader.
     g = [1, 2, 1, 3, 2]
     x = [0.1, 0.5, -0.3, 1.2, 0.7]
     c = [1.1, 0.4, 0.9, 2.0, 1.3]
@@ -694,16 +693,60 @@ _fv_reads(ex, sym::Symbol) = ex === sym ? 1 : ex isa Expr ?
         @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
             rtol = 1e-5, atol = 1e-7)
     end
-    # Read by one location, a definition keeps its inlined affine plan.
-    _, bound, _ = _fv_build(quote
-        a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
-        z[levels(g)] .~ Normal.(0, 1)
-        eta = a .+ b .* x
-        mu = eta .+ z[g]
-        y .~ Normal.(mu, s)
-    end, cols)
-    @test [p.name for p in bound.predictors] == [:mu]
-    @test isempty(bound.derived)
+end
+
+# Whether the body of a generated `@kernel` program assigns `sym`.
+_fv_assigns(ex, sym::Symbol) = ex isa Expr && (
+    (ex.head === :(=) && (ex.args[1] === sym ||
+        Meta.isexpr(ex.args[1], :(::)) && ex.args[1].args[1] === sym)) ||
+    any(a -> _fv_assigns(a, sym), ex.args))
+
+@testset "functions as values: a definition read by one location stays a named value" begin
+    # As in Julia, a computed definition is one named value even when a
+    # single location reads it; the location no longer folds it into its
+    # own expression (user decision `0fbe312`). Densities are unchanged.
+    g = [1, 2, 1, 3, 2]
+    x = [0.1, 0.5, -0.3, 1.2, 0.7]
+    y = [0.2, 0.9, 0.1, 1.5, 0.8]
+    cols = Dict{Symbol,ColumnData}(:g => g, :x => x, :y => y)
+    cases = (
+        # A model-level scalar.
+        (quote
+            a ~ Normal(0, 1); s ~ Exponential(1.0)
+            t = exp(a) + 1
+            y .~ Normal.(t .* x, s)
+        end, (:t,), th -> sum(logpdf.(Normal.((exp(th.a) + 1) .* x, th.s), y))),
+        # An affine part beside a factor term.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            z[levels(g)] .~ Normal.(0, 1)
+            eta = a .+ b .* x
+            mu = eta .+ z[g]
+            y .~ Normal.(mu, s)
+        end, (:eta,), th -> sum(logpdf.(Normal.(th.a .+ th.b .* x .+ th.z[g], th.s), y))),
+        # A chain of compositions.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            eta = a .+ b .* x
+            w = exp.(eta) .* x
+            y .~ Normal.(2 .* w, s)
+        end, (:eta, :w), th -> sum(logpdf.(Normal.(2 .* exp.(th.a .+ th.b .* x) .* x, th.s), y))),
+    )
+    for (ast, names, loglik) in cases
+        _, bound, built = _fv_build(ast, cols)
+        src = kernel_expr(bound, assign_layout(bound))
+        @test all(nm -> _fv_assigns(src.args[2], nm), names)
+        u = collect(range(-0.3, 0.4; length = built.layout.total))
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        @test _fv_value(built, bound, :likelihood, u) ≈ loglik(th)
+        kern = prepare_query(built, bound, :sampler)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test val ≈ Base.invokelatest(kern, u)
+        @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
+    end
 end
 
 @testset "functions as values: parameter-dependent gradient (Enzyme vs FD)" begin
