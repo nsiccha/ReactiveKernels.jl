@@ -1087,6 +1087,87 @@ _KernelReduction(::Val{II}, ::Val{XI}, ::Val{KI}, ::Val{AI}, call::F,
 @inline (reduction::_KernelReduction)(args::Vararg{Any,N}) where {N} =
     @inline reduction.call(args...)
 
+# Inference of nested source operations. A recipe whose source inlines another
+# kernel's endpoint (a plate cell `normal(mu, s).logpdf(y)`) embeds that
+# kernel's source operations, so one call runs `(op::_KernelSourceOp)(...)`,
+# `_kernel_source_call`, the source function and the authored closure, which
+# calls the embedded operation through the same methods again. Julia's
+# inference treats a caller-to-callee method edge that recurs on its stack as
+# possible unbounded recursion: Julia 1.10 compares the inner call with the
+# callee's declared `Vararg` signature, which every concrete multi-argument call
+# exceeds, and widens it. The inner result, the cell, and a fused plate total
+# then infer as `Any`, with a boxed value and an uninlined call per cell, and
+# the enclosing kernel's code is cached that way. Only after the inner operation
+# was compiled at top level, as a dynamic call from that first kernel does, did
+# a later identical kernel infer concretely, so whichever kernel a process
+# compiled first stayed slow (snag `first-prepared-s-e848620b`: 5 µs and 87
+# allocations against 0.3 µs and 6 per sampler gradient, primal and Enzyme
+# alike, on Julia 1.10 and, for other cells, 1.12).
+#
+# Nesting distinct source operations terminates: an operation embeds only
+# operations that already exist, so each level holds a different callable
+# type. `recursion_relation` tells inference that such an edge is well founded.
+# The same callable again, or one whose type contains its caller's, keeps
+# Julia's default limiting.
+_source_callable_type(@nospecialize(T)) = false
+_source_callable_type(::Type{<:Union{_KernelSourceOp,_KernelSourceFunction,
+                                     _KernelBranch,_KernelReduction}}) = true
+
+# The callee a source-call signature runs: its first source-callable parameter
+# (the called object, or the operation `_kernel_source_call` forwards).
+function _source_call_identity(@nospecialize(sig))
+    tuple = Base.unwrap_unionall(sig)
+    tuple isa DataType || return nothing
+    for parameter in tuple.parameters
+        parameter isa DataType && _source_callable_type(parameter) &&
+            return parameter
+    end
+    return nothing
+end
+
+function _type_mentions(@nospecialize(T), @nospecialize(target),
+                        seen::Base.IdSet{Any} = Base.IdSet{Any}())
+    T === target && return true
+    T isa DataType || return false
+    T in seen && return false
+    push!(seen, T)
+    for parameter in T.parameters
+        _type_mentions(parameter, target, seen) && return true
+    end
+    return false
+end
+
+# Called by inference with the recurring method, the callee method used for
+# its limit heuristics, the new call signature, and the signature of the
+# earlier frame of the same method; `true` means the recursion is well founded.
+function _source_call_recursion_well_founded(
+        @nospecialize(method), @nospecialize(callee),
+        @nospecialize(sig), @nospecialize(parent_sig))
+    inner = _source_call_identity(sig)
+    outer = _source_call_identity(parent_sig)
+    (inner === nothing || outer === nothing) && return false
+    return inner !== outer && !_type_mentions(inner, outer)
+end
+
+# Every method a nested source operation re-enters. Run once all of them are
+# defined (`ReactiveKernels.jl`, before the precompile workload).
+function _mark_source_call_recursion!()
+    hasfield(Method, :recursion_relation) || return nothing
+    methods_to_mark = Method[
+        which(Tuple{_KernelSourceOp,Vararg{Any}}),
+        which(Tuple{_KernelSourceFunction,Vararg{Any}}),
+        which(Tuple{_KernelBranch,Vararg{Any}}),
+        which(Tuple{_KernelReduction,Vararg{Any}}),
+        which(Tuple{_IgnoredThrowFunction,Vararg{Any}}),
+        methods(_kernel_source_call)...,
+        methods(_ignored_throw_call)...,
+    ]
+    for method in methods_to_mark
+        method.recursion_relation = _source_call_recursion_well_founded
+    end
+    return nothing
+end
+
 # Whether a plate's dose-outer lowering of `reduction` keeps the authored
 # semantics for these types: a concrete accumulator type `T` that the seed and
 # every step return unchanged, an `Int` gather index and a `Vector` gather

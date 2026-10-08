@@ -120,4 +120,84 @@ end
     @test value ≈ oracle(u)
     @test grad ≈ differences(oracle, u) rtol=1e-5 atol=1e-7
 end
+
+@testset "positional reads are scalar location summands" begin
+    # `s[3]` is one scalar, broadcast onto the location exactly as a sampled
+    # scalar `c` or a literal offset is. Naming the sum (`off`, `mu`) and
+    # adding an intercept keep the same density.
+    X = [1.0 -0.4; 1.0 0.1; 1.0 0.3; 1.0 0.6; 1.0 -0.2]
+    x = X[:, 2]
+    g = [1, 2, 1, 3, 2]
+    data = (; X, x, g, y=[0.2, -0.1, 0.4, 0.3, 0.0])
+    simplex(p) = logpdf(Dirichlet([1.0, 2.0, 1.5]), p.s)
+    normals(v) = sum(logpdf.(Normal(), v))
+    cases = [
+        (quote
+            s ~ Dirichlet([1.0, 2.0, 1.5]); b[axes(X, 2)] .~ Normal.(0, 1)
+            loc = X * b .+ 0.8 .* s[1] .- s[3]
+            y .~ Normal.(loc, 1)
+        end, p -> X * p.b .+ 0.8 * p.s[1] .- p.s[3], p -> simplex(p) + normals(p.b)),
+        (quote
+            s ~ Dirichlet([1.0, 2.0, 1.5]); b[axes(X, 2)] .~ Normal.(0, 1)
+            off = 0.8 * s[1] - s[3]
+            mu = X * b
+            loc = mu .+ off
+            y .~ Normal.(loc, 1)
+        end, p -> X * p.b .+ 0.8 * p.s[1] .- p.s[3], p -> simplex(p) + normals(p.b)),
+        (quote
+            a ~ Normal(0, 1); s ~ Dirichlet([1.0, 2.0, 1.5])
+            b[axes(X, 2)] .~ Normal.(0, 1)
+            y .~ Normal.(a .+ X * b .+ s[3], 1)
+        end, p -> p.a .+ X * p.b .+ p.s[3],
+            p -> logpdf(Normal(), p.a) + simplex(p) + normals(p.b)),
+        (quote
+            s ~ Dirichlet([1.0, 2.0, 1.5]); b ~ Normal(0, 1)
+            y .~ Normal.(b .* x .+ s[3], 1)
+        end, p -> p.b .* x .+ p.s[3], p -> simplex(p) + logpdf(Normal(), p.b)),
+        (quote
+            s ~ Dirichlet([1.0, 2.0, 1.5])
+            y .~ Normal.(s[3] .+ x, 1)
+        end, p -> p.s[3] .+ x, simplex),
+        (quote
+            c ~ Ordered(Normal(0, 1), 2); b ~ Normal(0, 1)
+            y .~ Normal.(b .* x .+ c[1] .- 2 .* c[2], 1)
+        end, p -> p.b .* x .+ p.c[1] .- 2 * p.c[2],
+            p -> normals(p.c) + logpdf(Normal(), p.b)),
+        # A coefficient-capable array keeps its affine read beside its
+        # positional read; both read the one declaration.
+        (quote
+            c[levels(g)[2:end]] .~ Normal.(0, 1); b ~ Normal(0, 1)
+            y .~ Normal.(b .* x .+ c[g] .+ c[1], 1)
+        end, p -> p.b .* x .+ [k == 1 ? 0.0 : p.c[k-1] for k in g] .+ p.c[1],
+            p -> normals(p.c) + logpdf(Normal(), p.b)),
+        (quote
+            b[axes(X, 2)] .~ Normal.(0, 1)
+            y .~ Normal.(X * b .- b[2], 1)
+        end, p -> X * p.b .- p.b[2], p -> normals(p.b)),
+        (quote
+            b ~ Normal(0, 1)
+            y .~ Normal.(b .* x .+ x[1], 1)
+        end, p -> p.b .* x .+ x[1], p -> logpdf(Normal(), p.b)),
+    ]
+    for (ast, location, prior) in cases
+        original = deepcopy(data)
+        bound = bind_data(lower_rkppl(ast, data; mod=@__MODULE__, conditioned=(:y,)), data)
+        built = build_kernel(bound)
+        oracle = v -> begin
+            p = constrain(built.layout, v)
+            prior(p) + sum(logpdf.(Normal.(location(p), 1), data.y)) +
+                logjac(built.layout, v)
+        end
+        sampler = prepare_sampler(built, bound, zeros(built.layout.total); backend=BACKEND)
+        for shift in (0.0, -0.3)
+            u = [0.2sin(i)+shift for i in 1:built.layout.total]
+            saved = copy(u)
+            value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test value ≈ oracle(u)
+            @test grad ≈ differences(oracle, u) rtol=1e-5 atol=1e-7
+            @test u == saved
+        end
+        @test data == original
+    end
+end
 end

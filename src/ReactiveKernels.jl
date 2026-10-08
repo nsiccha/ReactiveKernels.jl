@@ -103,6 +103,8 @@ export ValidatedCompiledTransition, validated_compiled_transition
 export StatefulControlBounds, stateful_control_bounds
 export functionalize_stateful, stateful_snapshot
 
+_mark_source_call_recursion!()
+
 include("precompile.jl")
 
 end # module ReactiveKernels
