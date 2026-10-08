@@ -603,6 +603,100 @@ end
     end
 end
 
+# Reads of the name `sym` in the body of a generated `@kernel` program.
+_fv_reads(ex, sym::Symbol) = ex === sym ? 1 : ex isa Expr ?
+    sum(a -> _fv_reads(a, sym), ex.args; init = 0) : 0
+
+@testset "functions as values: a shared per-observation value is evaluated once" begin
+    # A per-observation definition read by several locations is evaluated
+    # once and read by name, as in Julia. Each location used to inline its
+    # own copy of the definition (or the definition also stayed an affine
+    # predictor beside an inlined copy), so it ran once per reader. A
+    # definition read by one location keeps its inlined plan.
+    g = [1, 2, 1, 3, 2]
+    x = [0.1, 0.5, -0.3, 1.2, 0.7]
+    c = [1.1, 0.4, 0.9, 2.0, 1.3]
+    y = [0.2, 0.9, 0.1, 1.5, 0.8]
+    cols = Dict{Symbol,ColumnData}(:g => g, :x => x, :c => c, :y => y)
+    cases = (
+        # A log-scale location and a scaled location read one value.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            v = exp.(a .+ b .* x)
+            c .~ LogNormal.(log.(v), s)
+            y .~ Normal.(2 .* v, s)
+        end, src -> _fv_calls(src, :exp) == 1, function (th)
+            v = exp.(th.a .+ th.b .* x)
+            sum(logpdf.(LogNormal.(log.(v), th.s), c)) +
+                sum(logpdf.(Normal.(2 .* v, th.s), y))
+        end),
+        # An affine predictor read by name and inlined into another
+        # definition: computed once, so the data column is read once.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1)
+            eta = a .+ b .* x
+            theta = 0.8 .+ abs.(eta)
+            y .~ Weibull.(1.4, theta)
+            c .~ Weibull.(1.4, 0.8 .+ abs.(eta))
+        end, src -> _fv_reads(src.args[2], :x) == 1, function (th)
+            theta = 0.8 .+ abs.(th.a .+ th.b .* x)
+            sum(logpdf.(Weibull.(1.4, theta), y)) +
+                sum(logpdf.(Weibull.(1.4, theta), c))
+        end),
+        # A factor-coefficient alias read by two predictors: one gather.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            z[levels(g)] .~ Normal.(0, 1)
+            zg = z[g]
+            mu1 = a .+ zg
+            mu2 = b .* zg
+            y .~ Normal.(mu1, s)
+            c .~ Normal.(mu2, s)
+        end, src -> _fv_reads(src.args[2], :g) == 1, function (th)
+            zg = th.z[g]
+            sum(logpdf.(Normal.(th.a .+ zg, th.s), y)) +
+                sum(logpdf.(Normal.(th.b .* zg, th.s), c))
+        end),
+        # A composition read by two composed locations.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+            eta = a .+ b .* x
+            w = exp.(eta) .* x
+            y .~ Normal.(2 .* w, s)
+            c .~ Normal.(3 .* w, s)
+        end, src -> _fv_calls(src, :exp) == 1, function (th)
+            w = exp.(th.a .+ th.b .* x) .* x
+            sum(logpdf.(Normal.(2 .* w, th.s), y)) +
+                sum(logpdf.(Normal.(3 .* w, th.s), c))
+        end),
+    )
+    for (ast, once, loglik) in cases
+        _, bound, built = _fv_build(ast, cols)
+        src = kernel_expr(bound, assign_layout(bound))
+        @test once(src)
+        u = collect(range(-0.3, 0.4; length = built.layout.total))
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        @test _fv_value(built, bound, :likelihood, u) ≈ loglik(th)
+        kern = prepare_query(built, bound, :sampler)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test val ≈ Base.invokelatest(kern, u)
+        @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
+    end
+    # Read by one location, a definition keeps its inlined affine plan.
+    _, bound, _ = _fv_build(quote
+        a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
+        z[levels(g)] .~ Normal.(0, 1)
+        eta = a .+ b .* x
+        mu = eta .+ z[g]
+        y .~ Normal.(mu, s)
+    end, cols)
+    @test [p.name for p in bound.predictors] == [:mu]
+    @test isempty(bound.derived)
+end
+
 @testset "functions as values: parameter-dependent gradient (Enzyme vs FD)" begin
     cols = _fv_cols()
     ast = quote

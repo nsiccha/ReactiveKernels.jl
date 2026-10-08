@@ -1359,19 +1359,24 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             submodel_scopes, conditioned, value_defs = union(value_defs, retained),
             shared_defs)
     end
-    # Each predictor location inlines the model-level definitions it reads,
-    # so one read by several locations, or beside a runtime reader of its
-    # name, would be evaluated once per copy. Replan it as one named value
-    # that every reader shares; this set only grows too.
+    # Each predictor location inlines the definitions it reads, so one read
+    # by several locations, or beside a runtime reader of its name, would
+    # be evaluated once per copy. As in Julia, it is evaluated once: a
+    # per-observation definition replans as a retained value (every reader
+    # reads the named column), a model-level one as a shared computation.
+    # Both sets only grow too.
     shared = _shared_inline_defs(ctx, canonmap,
         _runtime_reads(ctx, canonmap, skip, predictors, responses, paramsyms,
             (params..., dirichlets..., arrays..., plate_parameters...),
             external_observations, scans),
         Set{Symbol}(p.name for p in predictors), data)
     if !isempty(shared)
+        columns = Set{Symbol}(nm for nm in shared
+            if get(ctx.detshape, nm, :scalar) === :vector)
         return _lower_rkppl_once(ast, input_data, mod;
-            submodel_scopes, conditioned, value_defs,
-            shared_defs = union(shared_defs, shared))
+            submodel_scopes, conditioned,
+            value_defs = union(value_defs, columns),
+            shared_defs = union(shared_defs, setdiff(shared, columns)))
     end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
@@ -8594,7 +8599,8 @@ scalar definitions) and sub-free scalar subexpressions, a literal
 included (`hypot.(1.0, mu)`, `mu .^ 2`), each one scalar leaf.
 Everything else fails closed with guidance."""
 function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
-        scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[])
+        scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[];
+        copies::Dict{Symbol,Int} = Dict{Symbol,Int}())
     where = "predictor $pname"
     if node isa Symbol
         if node in ctx.value_defs
@@ -8605,8 +8611,9 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         # is absorbed — it never also emits as a derived column).
         if haskey(ctx.detmap, node) && _composed_trigger(node, ctx)
             push!(ctx.absorbed, node)
+            copies[node] = get(copies, node, 0) + 1
             return _extract_composed_tree(pname, ctx.detmap[node], ctx,
-                subs, scalars, datas)
+                subs, scalars, datas; copies)
         end
         if _is_composed_sub(node, ctx, true)
             node in subs || push!(subs, node)
@@ -8678,7 +8685,7 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         isempty(fargs) && return _sfail("$where $(repr(f)). takes at " *
             "least one operand")
         return Expr(:., f, Expr(:tuple, (_extract_composed_tree(pname, a,
-            ctx, subs, scalars, datas) for a in fargs)...))
+            ctx, subs, scalars, datas; copies) for a in fargs)...))
     end
     node.head === :call || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
@@ -8695,18 +8702,18 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     if op === :.* || op === :.+ || op ===:.-
         if op === :.+ && length(args) == 1
             return _extract_composed_tree(pname, only(args), ctx, subs,
-                scalars, datas)
+                scalars, datas; copies)
         end
         ok = op === :.- ? length(args) in (1, 2) : length(args) == 2
         ok || return _sfail("$where `$op` takes " *
             (op === :.- ? "one or two operands" : "two operands"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
-            subs, scalars, datas) for a in args)...)
+            subs, scalars, datas; copies) for a in args)...)
     elseif op in _COMPOSED_MORE_OPS
         length(args) == 2 || return _sfail("$where `$op` takes two " *
             "operands")
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
-            subs, scalars, datas) for a in args)...)
+            subs, scalars, datas; copies) for a in args)...)
     elseif op === :* && length(args) >= 2
         # Julia-valid scalar `*` normalizes to dotted (Base broadcasts —
         # behavior-preserving, the canonicalization doctrine); an n-ary
@@ -8714,12 +8721,12 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         lhs = length(args) == 2 ? args[1] :
             Expr(:call, :*, args[1:end-1]...)
         return _extract_composed_tree(pname, Expr(:call, :.*, lhs,
-            args[end]), ctx, subs, scalars, datas)
+            args[end]), ctx, subs, scalars, datas; copies)
     elseif op === :- && length(args) == 1
         # Unary negation is ordinary Julia array arithmetic. Its
         # elementwise canonical form preserves the authored value.
         return Expr(:call, :.-, _extract_composed_tree(pname, only(args),
-            ctx, subs, scalars, datas))
+            ctx, subs, scalars, datas; copies))
     elseif op === :+ || op === :- || op === :/ || op === :^
         return _sfail("$where combines vectors without dots: " *
             "$(repr(node)) — as in Julia, write the dotted form " *
@@ -8775,7 +8782,10 @@ function _lower_composed_predictor(pname, rhs, ctx, lhs, pred_link,
     subs = Symbol[]
     scalars = Symbol[]
     datas = Symbol[]
-    tree = _extract_composed_tree(pname, rhs, ctx, subs, scalars, datas)
+    copies = Dict{Symbol,Int}()
+    tree = _extract_composed_tree(pname, rhs, ctx, subs, scalars, datas;
+        copies)
+    _record_inline_copies!(ctx, pname, copies)
     for s in subs
         if haskey(pred_idx, s)
             pred = predictors[pred_idx[s]]
@@ -8897,11 +8907,15 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
     site = only(visited)
     copies = Dict{Symbol,Int}()
     out = _inline_structure!(copies, ex, ctx, visited, where)
+    _record_inline_copies!(ctx, site, copies)
+    return out
+end
+function _record_inline_copies!(ctx, site, copies)
     for (nm, k) in copies
         sites = get!(Dict{Symbol,Int}, ctx.inline_uses, nm)
         sites[site] = max(get(sites, site, 0), k)
     end
-    return out
+    return nothing
 end
 function _inline_structure!(copies, ex, ctx, visited::Set{Symbol}, where)
     ex isa Symbol || return _inline_structure_expr!(copies, ex, ctx, visited,
@@ -8909,7 +8923,7 @@ function _inline_structure!(copies, ex, ctx, visited::Set{Symbol}, where)
     haskey(ctx.detmap, ex) || return ex
     ex in ctx.declaration_data && return ex
     # A definition several readers share stays one named value.
-    ex in ctx.shared_defs && return ex
+    (ex in ctx.shared_defs || ex in ctx.value_defs) && return ex
     # Array-valued definitions (`M = (sd .* L)'`) stay named values.
     ctx.detshape[ex] === :array && return ex
     if ex in ctx.structural || ctx.detshape[ex] ∉ (:vector, :array) ||
@@ -8939,19 +8953,19 @@ function _inline_structure_expr!(copies, ex, ctx, visited, where)
                           for a in ex.args)...)
 end
 
-# Model-level definitions that inlining would evaluate more than once:
-# copies at two or more sites (or two in one), or one copy beside a reader
-# of the name or an interned predictor of that name. Only computations
-# qualify. Aliases, signed aliases and factor-coefficient aliases carry the
-# coefficient roles affine analysis recovers; data-only definitions fold
-# once at preparation; per-observation and array definitions keep their
-# predictor plans. The outermost candidates are returned: a definition
-# read only through another candidate is no longer inlined once that
-# candidate stays named.
+# Definitions that inlining would evaluate more than once: copies at two
+# or more sites (or two in one), or one copy beside a reader of the name
+# or an interned predictor of that name. Only computations qualify: an
+# alias or a signed alias computes nothing of its own, and a data-only
+# definition folds once at preparation. Array and matrix definitions are
+# never inlined. The outermost candidates are returned: a definition read
+# only through another candidate is no longer inlined once that candidate
+# stays named.
 function _shared_inline_defs(ctx, canonmap, runtime, predictor_names, data)
     candidates = Set{Symbol}()
     for (nm, sites) in ctx.inline_uses
-        haskey(canonmap, nm) && nm ∉ ctx.shared_defs || continue
+        haskey(canonmap, nm) && nm ∉ ctx.shared_defs &&
+            nm ∉ ctx.value_defs || continue
         copies = sum(values(sites))
         copies >= 2 || (copies == 1 &&
             (nm in runtime || nm in predictor_names)) || continue
@@ -9022,8 +9036,7 @@ function _shared_value_def(nm, ctx, canonmap, data)
     rhs = canonmap[nm]
     rhs isa Expr || return false
     _is_signed_alias(rhs) && return false
-    get(ctx.detshape, nm, :scalar) in (:vector, :array, :matrix) && return false
-    _is_factor_coefficient_alias(nm, ctx) && return false
+    get(ctx.detshape, nm, :scalar) in (:array, :matrix) && return false
     return !_data_only(rhs, data, canonmap)
 end
 
