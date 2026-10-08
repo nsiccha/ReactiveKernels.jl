@@ -51,6 +51,10 @@ end
     c ~ Normal(0, 1)
     return c .* xx .+ var"##rkppl_scope#00000001"
 end
+@rkppl _sc_future_path_free(xx) = begin
+    c ~ Normal(0, 1)
+    return c .* xx .+ var"z.b"
+end
 @rkppl _sc_nested_future_free(xx) = begin
     b ~ Normal(0, 1)
     w ~ _sc_future_free(xx)
@@ -294,6 +298,47 @@ end
     value, _ = sampler_value_and_gradient!(sampler, g, u)
     @test value ≈ reference(u) rtol = 1e-12
     @test g ≈ _sc_fd(reference, u) rtol = 1e-5 atol = 1e-7
+end
+
+@testset "scoped submodels: generated locals are spelled as authored paths" begin
+    data = (; x = [-0.5, 0.2, 1.0], y = [0.1, -0.2, 0.3])
+    bound, built, u = _sc_build(quote
+        z ~ _sc_outer(x)
+        y .~ Normal.(z, 1)
+    end, data)
+    locals = Dict(s.path => s.locals for s in bound.submodel_scopes)
+    @test locals[(:z,)][:q] == Symbol("z.q")
+    @test locals[(:z, :q)][:b] == Symbol("z.q.b")
+    @test occursin("var\"z.q.b\"", string(kernel_expr(bound, built.layout)))
+    @test coordinate_names(built.layout) == [Symbol("z.q.b")]
+    # An author's literal `var"z.b"` keeps its spelling; the scoped local
+    # takes the next free one and both keep their own coordinate labels.
+    bound, built, u = _sc_build(quote
+        var"z.b" ~ Normal(0, 1)
+        z ~ _sc_inner(x)
+        y .~ Normal.(z .+ var"z.b", 1)
+    end, data)
+    @test only(s.locals[:b] for s in bound.submodel_scopes) == Symbol("z.b#2")
+    @test Set(coordinate_names(built.layout)) ==
+        Set([Symbol("var\"z.b\""), Symbol("z.b")])
+    function reference(v)
+        nt = constrain(built.layout, v)
+        literal = nt[Symbol("z.b")]
+        return _sc_prior([literal, nt.z.b]) +
+            _sc_ll(nt.z.b .* data.x .+ literal, data.y)
+    end
+    sampler = prepare_sampler(built, bound, u; backend = _SC_BACKEND)
+    g = similar(u)
+    value, _ = sampler_value_and_gradient!(sampler, g, u)
+    @test value ≈ reference(u) rtol = 1e-12
+    @test g ≈ _sc_fd(reference, u) rtol = 1e-5 atol = 1e-7
+    # refused: a later callee's free name spelled as a scoped path cannot
+    # capture that generated local (`1f0p0fx`, strict `16yyy0t`).
+    @test_throws "`z.b` is not a data column" lower_rkppl(quote
+        z ~ _sc_inner(x)
+        w ~ _sc_future_path_free(x)
+        y .~ Normal.(z .+ w, 1)
+    end, (:x, :y); mod = @__MODULE__, conditioned = (:x, :y))
 end
 
 @testset "scoped submodels: generated draw aliases preserve author names" begin
