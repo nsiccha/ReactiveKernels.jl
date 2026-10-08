@@ -106,6 +106,26 @@ end
         submodel = true)
 end
 
+@testset "same source prepares across fresh lowering namespaces" begin
+    ast = quote
+        intercept ~ Normal(0.0, 1.0)
+        mean = basis(intercept .+ x)
+        y .~ Normal.(mean, 1.0)
+    end
+    lower(mod, data) = bind_data(lower_rkppl(ast, keys(data);
+        mod, conditioned = (:y,)), data)
+    other_data = (; x = [-0.25, 0.25], y = [-0.4, 0.7])
+    built_plan = lower(fresh_namespace(), DATA)
+    other_plan = lower(fresh_namespace(), other_data)
+    built = build_kernel(built_plan)
+    own = build_kernel(other_plan)
+    reused = prepare_query(built, other_plan, :sampler)
+    direct = prepare_query(own, other_plan, :sampler)
+    for u in ([-0.3], [0.0], [0.6])
+        @test Base.invokelatest(reused, u) == Base.invokelatest(direct, u)
+    end
+end
+
 @testset "undefined names still fail at lowering" begin
     mod = fresh_namespace()
     ast = :(begin

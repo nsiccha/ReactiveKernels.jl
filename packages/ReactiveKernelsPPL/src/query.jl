@@ -77,7 +77,8 @@ via `bound=`). Thin wrapper over `ReactiveKernels.prepare` with
 `want = workflow_wants(preset)` and the supplied `on_error` policy. The
 returned kernel maps an unconstrained `Vector{Float64}` to the preset node's
 value. `plan` may be any binding that generates the same program as `built`
-(other row counts and data values); one that generates another program
+(other row counts and data values, or the same source lowered in another
+gensym-created isolation module); one that generates another program
 (other levels or parameter sizes, data element types, missing entries, an
 empty response, another broadcast shape) is refused with a
 `ContractValidationError` naming the first difference, since the graph would
@@ -110,8 +111,9 @@ function prepare_query(built, plan::StructuralPlan, preset::Symbol; on_error = n
 end
 
 # A built graph evaluates the program its build generated. A binding that
-# generates the same program (other row counts and data values) evaluates on
-# it exactly as on its own build. A binding that generates another program
+# generates the same program (other row counts and data values, or another
+# gensym-created lowering namespace) evaluates on it exactly as on its own
+# build. A binding that generates another program
 # (other level labels or parameter sizes, data element types, missing
 # entries, an empty response, another broadcast shape) needs its own build;
 # evaluating the old graph on it can be silently wrong, so it is refused.
