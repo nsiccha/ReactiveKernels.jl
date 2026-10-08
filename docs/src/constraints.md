@@ -498,7 +498,8 @@ and lock the one Reactant 0.2.289 lifted:
   `repro_enzyme_closure_float_store_readonly.jl` reproduces it with Enzyme
   only, including `g -> sum(xs .* g)`; Julia 1.10.12 passes. A closure that
   captures data around a prepared scan kernel or RK's runtime scan op is this
-  shape. Whether a given loop trips the proof depends on its optimized IR:
+  shape, and so was `test_ad.jl`'s `let`-captured twin-column reference,
+  which passes its matrix as a `Constant` argument since `5ff6d6e8`. Whether a given loop trips the proof depends on its optimized IR:
   the runtime op passed only while an opaque per-call method query in the
   step changed how its loop was optimized. Reshaping RK's result allocation
   is not a repair. A fresh fixed-length buffer avoids the error in one loop
