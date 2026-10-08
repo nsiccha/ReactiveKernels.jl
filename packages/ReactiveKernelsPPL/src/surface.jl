@@ -7820,6 +7820,9 @@ function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
         coefuse, base::Symbol)
     pname = _argument_name!(base, ctx)
     if ex isa Expr && (_canon_shape(ex, ctx) !== :scalar || _is_composed_map(ex))
+        _reads_latent_elementwise(ex, ctx) &&
+            return _latent_value_predictor!(lhs, pname, ex, :value,
+                IdentityLink, ctx, predictors, pred_idx)
         return _lower_composed_predictor(pname, ex, ctx, lhs, IdentityLink,
             predictors, pred_idx, coefuse)
     end
@@ -7919,6 +7922,11 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         haskey(pred_idx, pname) && return pname
         if _composed_root(ctx.detmap[loc], ctx) ||
                 (value && _is_bare_sub_map(ctx.detmap[loc], ctx))
+            # A composition reading a latent elementwise is a latent
+            # transform (`w = exp.(eta) .* abs.(th)`), read as one column.
+            _reads_latent_elementwise(ctx.detmap[loc], ctx) &&
+                return _latent_predictor!(lhs, loc, pred_link, ctx,
+                    predictors, pred_idx)
             return _lower_composed_predictor(pname, ctx.detmap[loc], ctx,
                 lhs, pred_link, predictors, pred_idx, coefuse)
         end
@@ -7943,6 +7951,9 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             "derived predictor name $pname collides with your definition — " *
             "rename yours")
         if _composed_root(loc, ctx) || (value && _is_bare_sub_map(loc, ctx))
+            _reads_latent_elementwise(loc, ctx) &&
+                return _latent_value_predictor!(lhs, pname, loc, :location,
+                    pred_link, ctx, predictors, pred_idx)
             return _lower_composed_predictor(pname, loc, ctx, lhs,
                 pred_link, predictors, pred_idx, coefuse)
         end
@@ -7954,10 +7965,45 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     return pname
 end
 
+# Whether `ex` reads a per-cell latent elementwise: a plate latent, or a
+# per-observation definition that reads one. Scalar subtrees read a latent
+# only whole (`sum(th)`, `th[1]`) and stay composition scalar leaves, as do
+# the leaves `_extract_composed_tree` already reads as columns (retained
+# values, array-cell plate columns and declared-array gathers).
+function _reads_latent_elementwise(ex, ctx)
+    if ex isa Symbol
+        ex in ctx.plate_names && return true
+        ex in ctx.value_defs && return false
+        _is_plate_column_call(get(ctx.detmap, ex, nothing)) && return false
+        return haskey(ctx.detmap, ex) &&
+            get(ctx.detshape, ex, :scalar) !== :scalar &&
+            _derived_reads_latent(ex, ctx)
+    end
+    ex isa Expr || return false
+    _canon_shape(ex, ctx) === :scalar && return false
+    ex.head === :ref && _reads_array_value(ex, ctx; follow = false) &&
+        return false
+    args = ex.head === :call ? ex.args[2:end] :
+        _is_dotted_call(ex) ? ex.args[2].args : ex.args
+    return any(a -> _reads_latent_elementwise(a, ctx), args)
+end
+
+# An inline value reading a per-cell latent lowers as its named twin
+# (`w = exp.(eta) .* th`, then `Normal.(w, s)`): one derived column holding
+# the whole value, read by a LatentTerm. Composition leaves are
+# sub-predictors, scalars and data columns, never a latent.
+function _latent_value_predictor!(lhs, pname, ex, slot, pred_link, ctx,
+        predictors, pred_idx)
+    col = _lower_argument_value(lhs, slot, ex, ctx)
+    return _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
+        pname)
+end
+
 # Build the LatentTerm location predictor over `col` (a plate parameter or a
 # derived column that reads one); the generator emits `lp = col`.
 # Latent predictors stay per-response (no interning here).
-function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
+function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
+        pname::Symbol = Symbol(lhs, "_loc"))
     # A nested per-cell call can return a sampled local unchanged. The
     # outer binding aliases that vector; it does not create another latent.
     source = col
@@ -7971,7 +8017,6 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
         union!(ctx.absorbed, seen)
         col = source
     end
-    pname = Symbol(lhs, "_loc")
     (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
         "latent-location predictor name $pname collides with your " *
         "definition — rename it")

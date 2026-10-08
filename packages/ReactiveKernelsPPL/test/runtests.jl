@@ -231,6 +231,7 @@ const _PPL_TEST_FILES = (
     "test_parameter_priors.jl",
     "test_restricted_priors.jl",
     "test_expression_arguments.jl",
+    "test_inline_latent_values.jl",
     "test_prior_observation_audit.jl",
     "test_positive_priors.jl",
     "test_parameter_priors_reactant.jl",
