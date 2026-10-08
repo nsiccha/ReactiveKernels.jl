@@ -125,7 +125,9 @@ end
     plan = lower_rkppl(_FB_COMPUTED, (:y, :x); conditioned = (:y, :x))
     mu = only(plan.predictors)
     @test [t.kind for t in mu.terms] == [InterceptTerm, OffsetTerm]
-    @test only(plan.derived).expr == :((z * lam * tau) .* x)
+    # `b` is one named value that the column reads (user decision `0fbe312`).
+    @test only(plan.derived).expr == :(b .* x)
+    @test only(plan.assignments).expr == :(z * lam * tau)
     @test Set(p.name for p in plan.parameters) == Set([:a, :lam, :tau, :z, :sigma])
     # The `./ 1.0` spelling that used to be the only door is the same plan
     # up to the extracted expression.
@@ -256,8 +258,9 @@ end
                     sum(logpdf.(Normal(0, q.r_sg), c)) +
                     logpdf(Exponential(1), q.sigma)
             end)
+            # The gather is one named value (user decision `0fbe312`).
             @test [t.kind for t in only(plan.predictors).terms] ==
-                [InterceptTerm, FactorTerm]
+                [InterceptTerm, OffsetTerm]
             @test only(plan.array_parameters).name === :r_c
         end
     end

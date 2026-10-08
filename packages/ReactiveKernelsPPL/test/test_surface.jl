@@ -2527,8 +2527,8 @@ end
         mu = a .+ b .* x
         y .~ Normal.(mu, 1.0)
     end, (:y, :x); conditioned = (:y, :x))
-    # Chaining inlines: the factored and un-factored forms lower to the
-    # SAME plan (naming a subexpression never changes legality).
+    # Naming a subexpression never changes legality or the density; the
+    # named `mu` stays one value that `t` reads (user decision `0fbe312`).
     chained = lower_rkppl(quote
         a ~ Normal(0, 1)
         d ~ Normal(0, 1)
@@ -2546,13 +2546,19 @@ end
         t = a .+ d .* z .+ c .* x
         y .~ Normal.(t, 1.0)
     end, (:y, :x); conditioned = (:y, :x))
-    @test _plans_equal(chained, flat)
     @test length(chained.predictors) == 1
     @test chained.predictors[1].name === :t
     @test Set(t.addressee for t in chained.predictors[1].terms) ==
-        Set([:Intercept, :z, :x])
+        Set([:mu, :x])
     @test isempty(chained.assignments)
-    @test length(chained.derived) == 1 && chained.derived[1].name === :z
+    @test Set(d.name for d in chained.derived) == Set([:z, :mu])
+    chain_data = Dict(:y => [0.3, -0.2, 0.8, 0.1], :x => [0.5, 1.5, -1.0, 2.0])
+    function chain_density(plan)
+        bound = bind_data(plan, chain_data)
+        built = build_kernel(bound)
+        Base.invokelatest(prepare_query(built, bound, :sampler), [0.2, -0.4, 0.7])
+    end
+    @test chain_density(chained) == chain_density(flat)
     # Julia-valid undotted scalar-array ops normalize to the dotted form.
     dotted = lower_rkppl(quote
         a ~ Normal(0, 1)

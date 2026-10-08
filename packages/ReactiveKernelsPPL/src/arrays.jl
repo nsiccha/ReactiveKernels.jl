@@ -731,10 +731,21 @@ _is_scalar_position(i) = (i isa Int && i >= 1) || _is_endpoint_position(i)
 # A literal position or a whole axis.
 _is_position(i) = _is_scalar_position(i) || i === :(:)
 
-# A per-observation index: a column name (data or derived).
+# A per-observation index: a column name (data or derived), including a
+# definition computed from data only (`i = positions(g)`), which binding
+# evaluates into a column.
 _is_row_index(plan::StructuralPlan, i) =
     i isa Symbol && i !== :(:) && !_is_endpoint(i) &&
-    !_is_array_param(plan, i) && !(i in _union_names(plan))
+    !_is_array_param(plan, i) &&
+    (!(i in _union_names(plan)) || _is_data_only_assignment(plan, i))
+_is_data_only_assignment(plan::StructuralPlan, i::Symbol) =
+    any(a -> a.name === i, plan.assignments) &&
+    _reads_data_only(plan, i, Set{Symbol}(_all_names(plan)), Set{Symbol}())
+# In a model-level definition, a gather by a data index is ordinary Julia
+# indexing with a model-level result, so naming the definition never
+# changes its legality.
+_model_level_gather(plan::StructuralPlan, g) = g isa Symbol &&
+    _reads_data_only(plan, g, Set{Symbol}(_all_names(plan)), Set{Symbol}())
 
 # Index forms of `A[...]` over an array parameter `A`:
 # `:scalar` (every index a literal Int), `:slice` (literal Ints and `:`),
@@ -770,16 +781,16 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "positions or `:` (`$base[1]`, `$base[:, 1]`) or, in a " *
             "per-observation expression, by one data column " *
             "(`$base[g]`, `$base[g, 1]`)")
-        allow_gather || _fail(label, "`$(repr(ex))` gathers per " *
-            "observation — write it in a vector (per-observation) " *
-            "definition, not a scalar one")
+        g = ex.args[1 + _gather_index_axis(plan, ex)]
+        allow_gather || _model_level_gather(plan, g) || _fail(label,
+            "`$(repr(ex))` gathers per observation — write it in a vector " *
+            "(per-observation) definition, not a scalar one")
         axs = _value_axes(plan, base)
         axs === nothing || length(idx) == 1 ||
             length(idx) == length(axs) || _fail(label, "`$(repr(ex))` " *
             "gathers from the $(length(axs))-axis array value $base with " *
             "$(length(idx)) indices. Give one index per axis or one " *
             "linear index")
-        g = ex.args[1 + _gather_index_axis(plan, ex)]
         _reads_data_only(plan, g, Set{Symbol}(_all_names(plan)), Set{Symbol}()) ||
             _fail(label, "`$(repr(ex))` gather index $g must be data")
         push!(refs, base)
@@ -804,9 +815,10 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
         "$(base) by literal positions (`$(base)[1]`, `$(base)[2, 1]`, " *
         "`$(base)[:, 1]`) or, in a per-observation expression, by one " *
         "data column (`$(base)[g]`)")
-    kind === :gather && !allow_gather && _fail(label, "`$(repr(ex))` " *
-        "gathers per observation — write it in a vector (per-observation) " *
-        "definition, not a scalar one")
+    kind === :gather && !allow_gather &&
+        !_model_level_gather(plan, ex.args[1 + _gather_index_axis(plan, ex)]) &&
+        _fail(label, "`$(repr(ex))` gathers per observation — write it in " *
+            "a vector (per-observation) definition, not a scalar one")
     push!(refs, base)
     if kind === :gather
         length(ex.args) - 1 == length(p.dims) || _fail(label,

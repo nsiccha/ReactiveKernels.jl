@@ -6346,7 +6346,8 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     bind_only || return names
     onlydata = union(raw, Set{Symbol}(nm for nm in keys(nodes)
         if dataonly(nm, Set{Symbol}())))
-    return setdiff(names, _preparation_data_names(plan, nodes, raw, onlydata, names))
+    return setdiff(names, _preparation_data_names(plan, nodes, raw, onlydata,
+        names; bind_roots = axes))
 end
 
 # Whole-value data definitions consumed by a parameter-dependent module
@@ -6354,7 +6355,8 @@ end
 # them as assignments (notably beside declared arrays). They may return
 # arbitrary Julia values; the generated data-only statements fold once.
 # Keep every dependency needed by bind-time consumers at bind instead.
-function _preparation_data_names(plan, nodes, raw, onlydata, names)
+function _preparation_data_names(plan, nodes, raw, onlydata, names;
+        bind_roots = Set{Symbol}())
     isempty(names) && return Set{Symbol}()
     _, wholedefs = _model_level_inputs(plan, raw)
     function dependencies!(found, nm; data_only = false)
@@ -6390,6 +6392,8 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names)
     for p in plan.array_parameters, d in p.dims
         _drop_held_names!(free, d)
     end
+    # Binding validates every gather index against the array it reads.
+    setdiff!(free, bind_roots)
     needed = Set{Symbol}()
     for nm in union(setdiff(Set{Symbol}(keys(nodes)), free), setdiff(names, prepared))
         dependencies!(needed, nm; data_only = true)

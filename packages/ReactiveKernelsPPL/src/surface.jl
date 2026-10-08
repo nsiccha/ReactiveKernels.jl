@@ -930,7 +930,8 @@ end
 function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
-        value_defs::Set{Symbol} = Set{Symbol}())
+        value_defs::Set{Symbol} = Set{Symbol}(),
+        shared_defs::Set{Symbol} = Set{Symbol}())
     input_data = data
     ast = _observation_call_definitions(ast, data, mod)
     for name in conditioned
@@ -1155,7 +1156,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # Interned predictors by name (shared with `ctx`: a composition over a
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
-    ctx = (; data, mod, conditioned, value_defs, detmap = canonmap,
+    ctx = (; data, mod, conditioned, value_defs, shared_defs,
+        detmap = canonmap,
         prior_names, coef_priors,
         ordinary_parameters,
         detshape, shape_env, declaration_data,
@@ -1166,6 +1168,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         synth_assigns = AssignmentSpec[],
         negated = Dict{Symbol,Symbol}(),
         leaf_exprs = Dict{Any,Symbol}(),
+        # Definitions a reader folded into itself (`_inlined_computed_defs`).
+        inlined = Set{Symbol}(),
         # Inline factor references inside compositions (`sg .* z[g]`)
         # intern as synthetic sub-predictors, one per `(base, index)`,
         # exactly like the named alias `zg = z[g]`.
@@ -1369,7 +1373,23 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         value_defs)
     if !isempty(retained)
         return _lower_rkppl_once(ast, input_data, mod;
-            submodel_scopes, conditioned, value_defs = union(value_defs, retained))
+            submodel_scopes, conditioned, value_defs = union(value_defs, retained),
+            shared_defs)
+    end
+    # A predictor location inlines the definitions it reads. As in Julia,
+    # a computed definition is instead one named value that its readers
+    # read, however many there are (user decision `0fbe312`): a
+    # per-observation definition replans as a retained value (every reader
+    # reads the named column), a model-level one as a shared computation.
+    # Both sets only grow too.
+    shared = _inlined_computed_defs(ctx, canonmap, data)
+    if !isempty(shared)
+        columns = Set{Symbol}(nm for nm in shared
+            if get(ctx.detshape, nm, :scalar) === :vector)
+        return _lower_rkppl_once(ast, input_data, mod;
+            submodel_scopes, conditioned,
+            value_defs = union(value_defs, columns),
+            shared_defs = union(shared_defs, setdiff(shared, columns)))
     end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
@@ -7919,8 +7939,9 @@ end
 # admits stated-Normal coefficients through the ordinary value path,
 # while a bare use
 # keeps them scalar — naming a stated name must not re-bucket it.
+# A retained value keeps its name for every reader, so a scale reads it.
 _is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
-    haskey(ctx.detmap, s) && !(s in ctx.plate_names) &&
+    haskey(ctx.detmap, s) && !(s in ctx.plate_names) && s ∉ ctx.value_defs &&
     !_derived_reads_latent(s, ctx) &&
     (get(ctx.detshape, s, :scalar) === :vector ||
         _is_factor_index_def(ctx.detmap[s], ctx) ||
@@ -8854,14 +8875,18 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[])
     where = "predictor $pname"
     if node isa Symbol
-        if node in ctx.value_defs
-            node in datas || push!(datas, node)
-            return node
+        # A retained value is read by name, also through a pure alias
+        # (a submodel returning another call's value).
+        target = _alias_target(node, ctx)
+        if target in ctx.value_defs
+            target in datas || push!(datas, target)
+            return target
         end
         # A name bound to a composition inlines its tree (the definition
         # is absorbed — it never also emits as a derived column).
         if haskey(ctx.detmap, node) && _composed_trigger(node, ctx)
             push!(ctx.absorbed, node)
+            push!(ctx.inlined, node)
             return _extract_composed_tree(pname, ctx.detmap[node], ctx,
                 subs, scalars, datas)
         end
@@ -9154,6 +9179,8 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
     ex isa Symbol || return _inline_structure_expr(ex, ctx, visited, where)
     haskey(ctx.detmap, ex) || return ex
     ex in ctx.declaration_data && return ex
+    # A computed definition stays one named value for its readers.
+    (ex in ctx.shared_defs || ex in ctx.value_defs) && return ex
     # Array-valued definitions (`M = (sd .* L)'`) stay named values.
     ctx.detshape[ex] === :array && return ex
     if ex in ctx.structural || ctx.detshape[ex] ∉ (:vector, :array) ||
@@ -9161,6 +9188,7 @@ function _inline_structure(ex, ctx, visited::Set{Symbol}, where)
         ex in visited && _sfail("$where: cyclic definition through $ex")
         push!(ctx.absorbed, ex)
         push!(visited, ex)
+        push!(ctx.inlined, ex)
         out = _inline_structure(ctx.detmap[ex], ctx, visited, where)
         delete!(visited, ex)
         return out
@@ -9180,6 +9208,47 @@ function _inline_structure_expr(ex, ctx, visited, where)
     return Expr(ex.head, (_inline_structure(a, ctx, visited, where)
                           for a in ex.args)...)
 end
+
+# The definition a pure alias chain (`z = q`, `q = v`) names.
+function _alias_target(node::Symbol, ctx)
+    seen = Set{Symbol}()
+    while haskey(ctx.detmap, node) && ctx.detmap[node] isa Symbol && node ∉ seen
+        push!(seen, node)
+        node = ctx.detmap[node]
+    end
+    return node
+end
+
+# Computed definitions an inlining reader folded into itself. Each stays
+# one named value (`_computed_value_def` says which qualify).
+_inlined_computed_defs(ctx, canonmap, data) = Set{Symbol}(nm for nm in ctx.inlined
+    if haskey(canonmap, nm) && nm ∉ ctx.shared_defs && nm ∉ ctx.value_defs &&
+        _computed_value_def(nm, ctx, canonmap, data))
+
+# A module call's model-level result, written inline or read through a
+# shared definition that stays named for its readers (the definitions
+# below it are no longer inlined either).
+_reads_module_value(ex, ctx) = _contains_module_call(ex) ||
+    any(s -> s in ctx.shared_defs && _def_reads_module(s, ctx),
+        _value_symbols(ex))
+_def_reads_module(s, ctx) = _contains_module_call(ctx.detmap[s]) ||
+    any(t -> haskey(ctx.detmap, t) && _def_reads_module(t, ctx),
+        _value_symbols(ctx.detmap[s]))
+
+# An alias or a signed alias computes nothing of its own and still reads
+# through; a data-only definition folds once at binding; array and matrix
+# definitions are never inlined.
+function _computed_value_def(nm, ctx, canonmap, data)
+    rhs = canonmap[nm]
+    rhs isa Expr || return false
+    _is_signed_alias(rhs) && return false
+    get(ctx.detshape, nm, :scalar) in (:array, :matrix) && return false
+    return !_data_only(rhs, data, canonmap)
+end
+
+_is_signed_alias(rhs) = Meta.isexpr(rhs, :call) && length(rhs.args) == 2 &&
+    rhs.args[1] in (:-, :.-, :+, :.+) &&
+    (rhs.args[2] isa Symbol || _is_signed_alias(rhs.args[2]))
 
 function _collect_signed!(out, ex, sign::Int, pname)
     if ex isa Expr && ex.head === :call && !isempty(ex.args)
@@ -9481,7 +9550,7 @@ function _extract_summand(pname, core, sign::Int, ctx)
         e = sign < 0 ? Expr(:call, :-, core) : core
         nm = _composed_scalar_leaf!(pname, e, ctx, Symbol[])
         if shape === :array ||
-                (_contains_module_call(core) && !_is_bound_value_call(core))
+                (_reads_module_value(core, ctx) && !_is_bound_value_call(core))
             return TermSpec(ComposedTerm, ColumnRef[],
                 (tree = nm, subs = Symbol[], scalars = [nm]), nm, nm), nothing
         end
