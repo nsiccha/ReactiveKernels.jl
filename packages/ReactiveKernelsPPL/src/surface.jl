@@ -1433,6 +1433,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     end
     indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
         Set{Symbol}(r.response for r in responses))
+    # A caller-owned sampling RHS observed in a dotted `@plate` cell
+    # (`y[i] .~ LogDensity.(f, loc[i], s)`).
+    indexed_external = intersect(Set{Symbol}(first(c) for c in plate_ctx),
+        Set{Symbol}(p.name for p in external_observations))
     # Explicit loops select each operand at the authored indices. Keep a
     # literal response iterator on that same gather path as eachindex/axes;
     # the older UnitRange response contract only checked full-column cover.
@@ -1447,7 +1451,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
-            if k in indexed_observations))
+            if k in indexed_observations || k in indexed_external))
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -1753,12 +1757,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         base = ex.args[1]
         base in data && length(ex.args) == 2 &&
             _literal_row_range(ex.args[2]) && return :vector
-        if base isa Symbol && (shape(base) === :array ||
-                _model_valued(base, detmap, env, Set{Symbol}()))
-            indices = Set{Symbol}(i for i in ex.args[2:end]
-                if i isa Symbol && _obs_axis(i, data, detmap, memo, active, env))
-            return _ref_shape(ex, union(data, indices))
-        end
+        _is_array_value_ref(ex, data, detmap, memo, active, env) &&
+            return _array_ref_shape(ex, data, detmap, memo, active, env)
         _is_gather(ex, data, detmap, env) || return :scalar
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
@@ -1807,13 +1807,30 @@ function _elementwise_shape(argshapes)
     return :scalar
 end
 
+# A read `A[...]` of an array value: a declared array, an array-valued
+# definition (`b = z * M`) or a module call's result.
+_is_array_value_ref(ex::Expr, data, detmap, memo, active, env) =
+    ex.args[1] isa Symbol && length(ex.args) >= 2 &&
+    (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
+        _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
+
+# The shape of a read of an array value. A data index gathers per
+# observation on either axis, also when the data are otherwise read only
+# whole; so does an index carrying the observation axis. A definition's
+# shape and the axis an enclosing broadcast inherits both read this one
+# rule, so naming a gather never changes its shape: `rg = b[g, 1]` and
+# `(b[g, 1] .+ b[h, 1]) ./ 2` are per observation alike.
+_array_ref_shape(ex::Expr, data, detmap, memo, active, env) =
+    _ref_shape(ex, i -> (i isa Symbol && i in data) ||
+        _obs_axis(i, data, detmap, memo, active, env))
+
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
 # array); every other ref keeps the slice-1 scalar shape. Predictor
 # coefficient roles classify by use site, independently of this shape.
-function _ref_shape(ex, data)
+function _ref_shape(ex, gathers)
     idx = ex.args[2:end]
     isempty(idx) && return :scalar
-    if any(i -> i isa Symbol && i in data, idx)
+    if any(gathers, idx)
         # Per-observation gather: scalar selection or an oriented matrix.
         any(i -> i === :(:), idx) && return :matrix
         return :vector
@@ -1864,11 +1881,11 @@ function _obs_axis(ex, data, detmap, memo, active, env)
     elseif ex.head === :ref
         # A gather from an array value follows its observation index on
         # either axis, including definitions such as `b = z * M`.
-        array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
-            (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
-                _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
+        array_base = _is_array_value_ref(ex, data, detmap, memo, active, env)
         array_base || _is_gather(ex, data, detmap, env) || return false
         any(_literal_row_range, ex.args[2:end]) && return true
+        array_base && return _array_ref_shape(ex, data, detmap, memo,
+            active, env) in (:vector, :matrix)
         return any(i -> _obs_axis(i, data, detmap, memo, active, env),
             ex.args[2:end])
     elseif ex.head === Symbol("'")
@@ -2680,6 +2697,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     # every rejection.
     detnames = Set{Symbol}()
     valueaxisnames = Set{Symbol}()
+    definitions = Dict{Symbol,Any}()
     for arg in args
         arg isa Expr || continue
         st = try
@@ -2690,8 +2708,13 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         if st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             push!(detnames, st.args[1])
             _is_levels_binding_rhs(st.args[2]) || push!(valueaxisnames, st.args[1])
+            definitions[st.args[1]] = st.args[2]
         end
     end
+    # Definitions a response may observe: those reading only data (a
+    # literal-only definition is not built yet as a response).
+    response_defs = Set{Symbol}(name for (name, rhs) in definitions
+        if !isempty(_value_symbols(rhs)) && _data_only(rhs, data, definitions))
     for arg in args
         if arg isa LineNumberNode
             line = arg.line
@@ -2791,20 +2814,27 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                     nothing, nothing, rdims, slices))
                 continue
             end
-            _reject_derived_ref_lhs(st.args[2], detnames)
-            arr = _external_array_lhs(st.args[2], st.args[3], data, valueaxisnames)
-            arr === nothing && (arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames))
-            if arr !== nothing
-                alhs, adims = arr
-                _claim!(seen, seelines, alhs, line)
-                _reject_target(st.args[3], alhs)
-                push!(sample, SampleStmt(alhs, st.args[3], bc, nothing,
-                    nothing, nothing, adims))
-                continue
+            # A data-only definition observed at selected entries
+            # (`y[eachindex(y)] .~ …`, which a `@plate` loop over `y` writes)
+            # is a derived response, read like the same value bound as data.
+            derived_range = _derived_response_range(st.args[2], bc, response_defs)
+            if !derived_range
+                _reject_derived_ref_lhs(st.args[2], detnames)
+                arr = _external_array_lhs(st.args[2], st.args[3], data, valueaxisnames)
+                arr === nothing && (arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames))
+                if arr !== nothing
+                    alhs, adims = arr
+                    _claim!(seen, seelines, alhs, line)
+                    _reject_target(st.args[3], alhs)
+                    push!(sample, SampleStmt(alhs, st.args[3], bc, nothing,
+                        nothing, nothing, adims))
+                    continue
+                end
             end
-            lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data,
+            lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde,
+                derived_range ? union(data, (st.args[2].args[1],)) : data,
                 level_bindings)
-            if bc && st.args[2] isa Symbol
+            if bc && (st.args[2] isa Symbol || derived_range)
                 # A derived response observes an existing deterministic
                 # definition (`ly = log.(earn)` then `ly .~ ...`) instead
                 # of claiming a fresh name; either order lowers (the
@@ -4348,10 +4378,21 @@ _is_sample(st::Expr) =
 _is_broadcast_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :.~
 
+# A `.~` range over a definition reading only data observes that derived
+# response at the selected entries, as a range over the same value bound as
+# data does. Levels, matrix and subset indices size coefficient priors.
+function _derived_response_range(lhs, bc::Bool, response_defs::Set{Symbol})
+    bc && Meta.isexpr(lhs, :ref) && length(lhs.args) >= 2 &&
+        lhs.args[1] isa Symbol && lhs.args[1] in response_defs || return false
+    index = lhs.args[2]
+    return !(_is_levels_call(index) || _is_axes2_call(index) || Meta.isexpr(index, :ref))
+end
+
 # A ref LHS over a deterministic definition: ranges cover raw data
 # columns and levels/matrix sizings size coefficient priors — neither
-# observes a derived column (broadcast bare: `ly .~ ...`). Runs before
-# `_sample_lhs` so the message names the position, not the fallout.
+# observes a derived column that reads parameters (broadcast bare:
+# `ly .~ ...`). Runs before `_sample_lhs` so the message names the
+# position, not the fallout.
 function _reject_derived_ref_lhs(lhs, detnames::Set{Symbol})
     lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
         lhs.args[1] isa Symbol && lhs.args[1] in detnames || return nothing
