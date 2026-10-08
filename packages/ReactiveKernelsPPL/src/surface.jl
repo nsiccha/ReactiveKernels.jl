@@ -8659,9 +8659,12 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         scalars::Vector{Symbol}, datas::Vector{Symbol} = Symbol[])
     where = "predictor $pname"
     if node isa Symbol
-        if node in ctx.value_defs
-            node in datas || push!(datas, node)
-            return node
+        # A retained value is read by name, also through a pure alias
+        # (a submodel returning another call's value).
+        target = _alias_target(node, ctx)
+        if target in ctx.value_defs
+            target in datas || push!(datas, target)
+            return target
         end
         # A name bound to a composition inlines its tree (the definition
         # is absorbed — it never also emits as a derived column).
@@ -8985,6 +8988,16 @@ function _inline_structure_expr(ex, ctx, visited, where)
     end
     return Expr(ex.head, (_inline_structure(a, ctx, visited, where)
                           for a in ex.args)...)
+end
+
+# The definition a pure alias chain (`z = q`, `q = v`) names.
+function _alias_target(node::Symbol, ctx)
+    seen = Set{Symbol}()
+    while haskey(ctx.detmap, node) && ctx.detmap[node] isa Symbol && node ∉ seen
+        push!(seen, node)
+        node = ctx.detmap[node]
+    end
+    return node
 end
 
 # Computed definitions an inlining reader folded into itself. Each stays

@@ -45,7 +45,9 @@ _av_node(built, bound, node, u) = _query(built.spec, bound, node, u)
         filter!(!isnothing, ast.args)
         plan = lower_rkppl(ast, (:y, :x); conditioned = (:y, :x))
         @test isempty(plan.derived)
-        @test length(plan.assignments) == 1
+        # A named read is one assignment of its own (user decision `0fbe312`).
+        @test length(plan.assignments) == (named ? 2 : 1)
+        @test !named || any(a -> a.name === :r && a.expr == read, plan.assignments)
         @test only(plan.predictors).terms[2].kind === OffsetTerm
         for n in (3, 8)
             y, x = _av_y()[1:n], _av_x()[1:n]

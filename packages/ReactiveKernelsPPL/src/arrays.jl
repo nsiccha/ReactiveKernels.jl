@@ -741,6 +741,11 @@ _is_row_index(plan::StructuralPlan, i) =
 _is_data_only_assignment(plan::StructuralPlan, i::Symbol) =
     any(a -> a.name === i, plan.assignments) &&
     _reads_data_only(plan, i, Set{Symbol}(_all_names(plan)), Set{Symbol}())
+# In a model-level definition, a gather by a data index is ordinary Julia
+# indexing with a model-level result, so naming the definition never
+# changes its legality.
+_model_level_gather(plan::StructuralPlan, g) = g isa Symbol &&
+    _reads_data_only(plan, g, Set{Symbol}(_all_names(plan)), Set{Symbol}())
 
 # Index forms of `A[...]` over an array parameter `A`:
 # `:scalar` (every index a literal Int), `:slice` (literal Ints and `:`),
@@ -777,9 +782,7 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "per-observation expression, by one data column " *
             "(`$base[g]`, `$base[g, 1]`)")
         g = ex.args[1 + _gather_index_axis(plan, ex)]
-        # An index computed from data only is a model-level value, so its
-        # gather is ordinary Julia indexing in a model-level definition too.
-        allow_gather || _is_data_only_assignment(plan, g) || _fail(label,
+        allow_gather || _model_level_gather(plan, g) || _fail(label,
             "`$(repr(ex))` gathers per observation — write it in a vector " *
             "(per-observation) definition, not a scalar one")
         axs = _value_axes(plan, base)
@@ -813,7 +816,7 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
         "`$(base)[:, 1]`) or, in a per-observation expression, by one " *
         "data column (`$(base)[g]`)")
     kind === :gather && !allow_gather &&
-        !_is_data_only_assignment(plan, ex.args[1 + _gather_index_axis(plan, ex)]) &&
+        !_model_level_gather(plan, ex.args[1 + _gather_index_axis(plan, ex)]) &&
         _fail(label, "`$(repr(ex))` gathers per observation — write it in " *
             "a vector (per-observation) definition, not a scalar one")
     push!(refs, base)
