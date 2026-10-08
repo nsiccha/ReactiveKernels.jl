@@ -1306,6 +1306,10 @@ end
     return ys
 end
 
+# A bounds check's throw: `ijl_bounds_error_*` on Julia 1.10, a call to
+# `throw_boundserror` from 1.12.
+const _BOUNDS_THROW = r"bounds_?error"
+
 function _plate_entry_llvm(kernel, args...)
     kernel(args...)
     sprint(io -> InteractiveUtils.code_llvm(io,
@@ -1335,7 +1339,7 @@ end
     # vectorizes like the hand loop.
     for (kernel, args) in ((affine, (xs,)), (poly, (xs, Tuple(coefficients))))
         llvm = _plate_entry_llvm(kernel, args...)
-        @test !occursin("bounds_error", llvm)
+        @test !occursin(_BOUNDS_THROW, llvm)
         if Sys.ARCH in (:x86_64, :aarch64)
             @test occursin(r"<\d+ x double>", llvm)
         end
@@ -1345,7 +1349,7 @@ end
     checked = prepare(_checked_cell_plate)
     table = [2.0, 3.0, 5.0]
     @test checked([1.0, 2.0, 3.0], [3, 1, 2], table) == [5.0, 4.0, 9.0]
-    @test occursin("bounds_error", _plate_entry_llvm(checked, [1.0], [1], table))
+    @test occursin(_BOUNDS_THROW, _plate_entry_llvm(checked, [1.0], [1], table))
     @test_throws BoundsError checked([1.0, 2.0], [1, 4], table)
 end
 
