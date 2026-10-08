@@ -1109,6 +1109,18 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         matrix_values)
     detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
         env = shape_env)
+    # A `.~` response is observed data. A definition reading only data that
+    # it observes is that observation value, whatever shape lowering can
+    # prove: an undotted module call's result is model-level here
+    # (`y = f(raw)`). `bind_data` evaluates the definition once and
+    # validates its value as the response; a number is one observation, as
+    # when bound as data.
+    for nm in derived_response_names
+        get(detshape, nm, nothing) === :scalar || continue
+        rhs = detmap[nm]
+        !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
+            (detshape[nm] = :vector)
+    end
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
         rhs = detmap[nm]
@@ -1118,7 +1130,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             "definition `$nm = $(repr(rhs))`")
     end
     declaration_dependencies = _declaration_dependencies(sample, plate_specs,
-        data, canonmap)
+        union(data, derived_response_names), canonmap)
     declaration_data = Set{Symbol}(nm for nm in declaration_dependencies
         if haskey(canonmap, nm) && _data_only(canonmap[nm], data, canonmap))
     # Design matrices leave `det` for the plan-level table (validated
@@ -2414,8 +2426,17 @@ _is_dotted_call(ex) =
     ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
     ex.args[2] isa Expr && ex.args[2].head === :tuple
 
+# `nothing` and `missing` keep Julia's meaning: Base's values, whether
+# written as names or interpolated by an AST emitter. A model name shadows
+# the name, as any Julia binding would.
+_resolve_module_calls(::Nothing, ::Module, ::Set{Symbol}, where) =
+    GlobalRef(Base, :nothing)
+_resolve_module_calls(::Missing, ::Module, ::Set{Symbol}, where) =
+    GlobalRef(Base, :missing)
+
 function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
     ex in (:pi, :π) && ex ∉ names && return Float64(pi)
+    ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
     ex isa Expr || return ex
     ex.head === :quote && return ex
     # The quoted cell becomes executable in the generated kernel's module.
@@ -2477,11 +2498,13 @@ end
 
 # Declarations keep named dimensions, prior arguments and support bounds.
 # Follow their definitions before predictor inlining, so shared data values
-# still bind once and are consumed by name everywhere else.
-function _declaration_dependencies(sample, plate_specs, data, detmap)
+# still bind once and are consumed by name everywhere else. `observed` holds
+# the data and derived-response names: their statements are observations
+# whose locations lower as predictors, not declarations.
+function _declaration_dependencies(sample, plate_specs, observed, detmap)
     needed = Set{Symbol}()
     for s in sample
-        s.lhs in data && continue
+        s.lhs in observed && continue
         for ex in (s.rhs, s.range, s.matrix)
             union!(needed, _value_symbols(ex))
         end
@@ -9342,14 +9365,19 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     if core.args[1] in ctx.prior_names && core.args[1] ∉ ctx.sized_decls
         # Base owns scalar indexing too: index 1 returns the value; other
         # integer or vector indices keep their ordinary Julia failures.
+        # Out of index syntax, `end` / `begin` take Julia's lowering.
         return _extract_summand(pname,
-            Expr(:call, GlobalRef(Base, :getindex), core.args...), sign, ctx)
+            Expr(:call, GlobalRef(Base, :getindex), core.args[1],
+                ReactiveKernels._kernel_ref_indices(core.args[1],
+                    core.args[2:end])...), sign, ctx)
     end
-    # Reads of a declared array value (`z[g]`, `phi[1]`) or of an
-    # array-valued definition (`b[g, 1]`, `b = z * (sd .* L)'`) are
-    # values, not factor coefficients: scalar assignments by position,
-    # per-observation columns when gathered.
+    # Reads of a declared array value (`z[g]`, `phi[1]`, `c[1]` of an
+    # `Ordered` vector) or of an array-valued definition (`b[g, 1]`,
+    # `b = z * (sd .* L)'`) are values, not factor coefficients: scalar
+    # values by position, per-observation columns when gathered.
     (core.args[1] in ctx.value_arrays ||
+        core.args[1] in ctx.dirichlet_names ||
+        core.args[1] in ctx.ordered_names ||
         _is_array_def(core.args[1], ctx) ||
         _is_model_value_def(core.args[1], ctx)) &&
         return _extract_summand(pname, core, sign, ctx)
@@ -9357,12 +9385,16 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
                                      "takes `coefficients[group]` exactly, " *
                                      "got $(repr(core))")
     base, idx = core.args
+    # An endpoint (`s[end]`) is one literal position: a value, as in Julia.
+    _is_endpoint_position(idx) &&
+        return _extract_summand(pname, core, sign, ctx)
     if haskey(ctx.factor_axes, base) &&
             idx !== ctx.factor_axes[base][1]
         return _extract_summand(pname, core, sign, ctx)
     end
-    # A literal element (`phi[1]`) is one scalar, not a per-level column.
-    idx isa Integer && return _scalar_summand_error(pname, core)
+    # A literal element (`b[1]`, `x[1]`) is one scalar value, broadcast
+    # onto the predictor as Julia does, not a per-level column.
+    idx isa Integer && return _extract_summand(pname, core, sign, ctx)
     base isa Symbol || _sfail("predictor $pname: factor base must be a " *
                               "bare coefficient vector, got $(repr(base))")
     base in ctx.data && _sfail("predictor $pname: $base is data — " *

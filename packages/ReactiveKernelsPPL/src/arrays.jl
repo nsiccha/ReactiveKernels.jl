@@ -699,13 +699,42 @@ _is_gather_ref(plan::StructuralPlan, ex) =
         _is_array_assignment(plan, ex.args[1])) &&
     _array_index_kind(plan, ex) === :gather
 
+# `end` / `begin` in an index, alone or in integer arithmetic (`end - 1`),
+# is one literal position of the indexed array, as in Julia. The parser
+# produces these symbols only inside an index, so they are never names.
+# RK lowers them to `lastindex` / `firstindex` of the array they index.
+_is_endpoint(i) = i === :end || i === :begin
+
+const _ENDPOINT_OPS = (:+, :-, :*, :÷)
+
+function _is_endpoint_position(i)
+    _is_endpoint(i) && return true
+    Meta.isexpr(i, :call) && length(i.args) >= 2 &&
+        i.args[1] in _ENDPOINT_OPS || return false
+    args = i.args[2:end]
+    return all(a -> a isa Int || _is_endpoint_position(a), args) &&
+        any(_is_endpoint_position, args)
+end
+
+# The position an endpoint index denotes on an axis `first:last`.
+_endpoint_value(i::Int, first::Int, last::Int) = i
+_endpoint_value(i::Symbol, first::Int, last::Int) =
+    i === :end ? last : i === :begin ? first :
+    throw(ArgumentError("not an index endpoint: $i"))
+_endpoint_value(i::Expr, first::Int, last::Int) =
+    getfield(Base, i.args[1])(
+        (_endpoint_value(a, first, last) for a in i.args[2:end])...)
+
+# A literal position of one element.
+_is_scalar_position(i) = (i isa Int && i >= 1) || _is_endpoint_position(i)
+
 # A literal position or a whole axis.
-_is_position(i) = (i isa Int && i >= 1) || i === :(:)
+_is_position(i) = _is_scalar_position(i) || i === :(:)
 
 # A per-observation index: a column name (data or derived).
 _is_row_index(plan::StructuralPlan, i) =
-    i isa Symbol && i !== :(:) && !_is_array_param(plan, i) &&
-    !(i in _union_names(plan))
+    i isa Symbol && i !== :(:) && !_is_endpoint(i) &&
+    !_is_array_param(plan, i) && !(i in _union_names(plan))
 
 # Index forms of `A[...]` over an array parameter `A`:
 # `:scalar` (every index a literal Int), `:slice` (literal Ints and `:`),
@@ -717,7 +746,7 @@ _gather_index_axis(plan::StructuralPlan, ex::Expr) =
 function _array_index_kind(plan::StructuralPlan, ex::Expr)
     idx = ex.args[2:end]
     isempty(idx) && return :invalid
-    all(i -> i isa Int && i >= 1, idx) && return :scalar
+    all(_is_scalar_position, idx) && return :scalar
     all(_is_position, idx) && return :slice
     count(i -> _is_row_index(plan, i), idx) == 1 &&
         all(i -> _is_position(i) || _is_row_index(plan, i), idx) &&
@@ -793,12 +822,15 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
     elseif bound
         dims = _array_dims(plan, p)
         idx = ex.args[2:end]
+        inbounds(i, d) = !_is_scalar_position(i) ||
+            1 <= _endpoint_value(i, 1, d) <= d
         if length(idx) == length(dims)
             for (i, d) in zip(idx, dims)
-                i isa Int && i > d && _fail(label, "`$(repr(ex))` is out of " *
+                inbounds(i, d) || _fail(label, "`$(repr(ex))` is out of " *
                     "bounds: $(base) has size $(repr(Tuple(dims)))")
             end
-        elseif !(length(idx) == 1 && idx[1] isa Int && idx[1] <= prod(dims))
+        elseif !(length(idx) == 1 && _is_scalar_position(idx[1]) &&
+                inbounds(idx[1], prod(dims)))
             _fail(label, "`$(repr(ex))` indexes $(length(idx)) axes of the " *
                 "$(length(dims))-axis array $(base)")
         end
@@ -1210,18 +1242,23 @@ end
 
 # One triangular transform graph for every declared factor. Preparation fixes
 # K and the packed slice; neither a literal nor a data-derived K replicates
-# the body. The partials follow Stan's column-block order. Each entry retains
-# the original left-associated product (starting at z for an off-diagonal
-# entry, at 1 for a diagonal), including its floating-point operation order.
-# Inner loops have preparation-fixed bounds and lazy triangular guards. This
-# keeps nested reverse tapes statically sized without evaluating an unused
-# partial or replacing a product with a reassociated prefix recurrence.
+# the body. The partials follow Stan's column-block order. Column block j
+# carries the running product of √(1 - z²) over its j - 1 partials, starting
+# at 1: entry i is its partial times the product so far, and the diagonal is
+# the final product. This is the left-associated order of the host
+# `lkj_chol_constrain`, so the two agree bit for bit. Each pass is one loop
+# over the K(K-1)/2 packed partials, carrying the entry's position (i, j);
+# the last partial of a column moves it to the next column. No iteration is
+# spent on a masked-out entry. The trip count is fixed at preparation, so a
+# compiled reverse pass keeps a statically sized tape, which a column loop
+# with an inner `1:(j - 1)` range does not.
 _lkj_array_partials(L::Symbol) = Symbol(:_ppl_lkj_partials_, L)
 _lkj_array_logjac(L::Symbol) = Symbol(:_ppl_lkj_logjac_, L)
 _lkj_array_diagonal(L::Symbol) = Symbol(:_ppl_lkj_diagonal_, L)
 
 function _lkj_array_transform_statements(e::LayoutEntry)
     L, K = e.name, e.dims[1]
+    P = K * (K - 1) ÷ 2
     row, col = _is_upper_lkj(e.transform) ? (:i, :j) : (:j, :i)
     z, lj = _lkj_array_partials(L), _lkj_array_logjac(L)
     diagonal = _lkj_array_diagonal(L)
@@ -1232,58 +1269,40 @@ function _lkj_array_transform_statements(e::LayoutEntry)
         # response products. Each diagonal entry is still computed once.
         :($diagonal::Vector{Float64} = let
             out = ones(Float64, $K)
-            for j in 2:$K
-                base = (j - 1) * (j - 2) ÷ 2
-                d = 1.0
-                for ip in 1:$(K - 1)
-                    d = if ip < j
-                        d * sqrt(1 - $z[base + ip]^2)
-                    else
-                        d
-                    end
+            i, j, d = 1, 2, 1.0
+            for p in 1:$P
+                d = d * sqrt(1 - $z[p]^2)
+                if i + 1 < j
+                    i = i + 1
+                else
+                    out[j] = d
+                    i, j, d = 1, j + 1, 1.0
                 end
-                out[j] = d
             end
             out
         end),
         :($L::Matrix{Float64} = let
             out = zeros(Float64, $K, $K)
             out[1, 1] = 1.0
-            entry_value = 0.0
-            for j in 2:$K
-                base = (j - 1) * (j - 2) ÷ 2
-                for i in 1:$(K - 1)
-                    entry_value = if i < j
-                        let v = $z[base + i]
-                            for ip in 1:$(K - 1)
-                                v = if ip < i
-                                    v * sqrt(1 - $z[base + ip]^2)
-                                else
-                                    v
-                                end
-                            end
-                            v
-                        end
-                    else
-                        0.0
-                    end
-                    out[$row, $col] = entry_value
+            i, j, w = 1, 2, 1.0
+            for p in 1:$P
+                out[$row, $col] = $z[p] * w
+                w = w * sqrt(1 - $z[p]^2)
+                if i + 1 < j
+                    i = i + 1
+                else
+                    out[j, j] = $diagonal[j]
+                    i, j, w = 1, j + 1, 1.0
                 end
-                out[j, j] = $diagonal[j]
             end
             out
         end),
         :($lj::Float64 = let
             total = 0.0
-            p = 0
-            for j in 2:$K
-                for i in 1:$(K - 1)
-                    p, total = if i < j
-                        p + 1, total + ((j - i + 1) / 2) * log(1 - $z[p + 1]^2)
-                    else
-                        p, total
-                    end
-                end
+            i, j = 1, 2
+            for p in 1:$P
+                total = total + ((j - i + 1) / 2) * log(1 - $z[p]^2)
+                i, j = i + 1 < j ? (i + 1, j) : (1, j + 1)
             end
             total
         end),

@@ -5,8 +5,8 @@ using Test
 # Derived responses (G3): `.~` over a deterministic definition
 # (`ly = log.(earn)` then `ly .~ Normal.(mu, s)`) — the logearn/logmesquite
 # shape. Cross-file helpers come from test_generator.jl (`_GEN_BACKEND`)
-# and test_prior_vocab.jl (`_pv_query`, `_pv_posterior`, `_pv_enzyme_check`,
-# `_pv_reactant`), both included before this file in runtests.jl.
+# and test_prior_vocab.jl (`_pv_query`, `_pv_posterior`, `_pv_enzyme_check`),
+# both included before this file in runtests.jl.
 
 const _DR_M1 = quote
     b1 ~ Flat()
@@ -20,8 +20,6 @@ const _DR_EARN = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
 const _DR_X = [0.5, -1.0, 1.5, 0.0, -0.5, 1.0]
 _dr_cols() = Dict{Symbol,AbstractVector}(
     :earn => copy(_DR_EARN), :x => copy(_DR_X))
-_dr_bigcols() = Dict{Symbol,AbstractVector}(
-    :earn => [2.0^i for i in 0:11], :x => repeat(_DR_X, 2))
 
 function _dr_m1_oracle(b1::Real, b2::Real, s::Real)
     ly = log.(_DR_EARN)
@@ -222,15 +220,150 @@ end
     _pv_enzyme_check(_DR_M1, _dr_cols(), (b1 = 0.5, b2 = -0.25, s = 1.3))
 end
 
-@testset "derived response under Reactant" begin
-    # Vector-mu Normal-id: default pipeline (narrowed §7n scope —
-    # scalar-mu only).
-    fx = _pv_reactant(_DR_M1, _dr_cols())
-    @test fx.primal ≈ fx.native rtol = 1e-9
-    @test fx.val ≈ fx.native rtol = 1e-12
-    @test fx.rval ≈ fx.native rtol = 1e-9
-    @test fx.rgrad ≈ fx.g rtol = 1e-8
-    # The derived local is a retained broadcast: doubling n_obs adds no
-    # HLO lines (core constraint 1 — no data-derived unrolling).
-    @test _pv_reactant(_DR_M1, _dr_bigcols()).lines == fx.lines
+# A definition reading only data that a `.~` response observes is that
+# observation value, whatever shape lowering can prove: an undotted module
+# call's result, an elementwise use of one, or a reduction. `bind_data`
+# evaluates the definition once and validates its value as the response,
+# exactly like the same value bound as data under that name; a number is one
+# observation (snag rkppl-derived-re-e4466bad). A literal-only definition
+# (`t = 2.0`) remains the separate capability case in the battery above.
+module _DRCells
+flatten_cells(cells) = reduce(vcat, cells; init = Float64[])
+const calls = Ref(0)
+counted_flatten(cells) = (calls[] += 1; reduce(vcat, cells; init = Float64[]))
+label_of(cells) = "one label"
+end
+
+const _DRC_RAW = [[0.6, 0.2], Float64[], [1.0, 0.8, 0.3]]
+const _DRC_FLAT = [0.6, 0.2, 1.0, 0.8, 0.3]
+const _DRC_CALL = quote
+    a ~ Normal(0, 1)
+    s ~ Exponential(1)
+    y = flatten_cells(raw)
+    y .~ Normal.(a, s)
+end
+# The identity gather a consumer wrote while the call above was refused.
+const _DRC_GATHER = quote
+    a ~ Normal(0, 1)
+    s ~ Exponential(1)
+    values = flatten_cells(raw)
+    rows = Base.collect(Base.eachindex(values))
+    y = getindex.(Ref(values), rows)
+    y .~ Normal.(a, s)
+end
+_drc_prior(a, s) = logpdf(Normal(0, 1), a) + logpdf(Exponential(1), s) + log(s)
+_drc_oracle(a, s, y) = _drc_prior(a, s) + sum(logpdf.(Normal(a, s), y); init = 0.0)
+
+function _drc_kernel(prog, data; conditioned = (:y,))
+    plan = lower_rkppl(prog, data; mod = _DRCells, conditioned)
+    bound = bind_data(plan, data isa NamedTuple ? data : (; raw = deepcopy(_DRC_RAW)))
+    built = build_kernel(bound)
+    return plan, bound, built, prepare_query(built, bound, :sampler)
+end
+_drc_at(kern, built, q) = Base.invokelatest(kern, unconstrain(built.layout, q))
+
+@testset "derived response from a data-only module call" begin
+    raw = deepcopy(_DRC_RAW)
+    for data in ((; raw), (:raw,))
+        plan, bound, built, kern = _drc_kernel(_DRC_CALL, data)
+        @test [r.response for r in plan.responses] == [:y]
+        @test :y in [d.name for d in plan.derived]
+        @test bound.columns[:y] == _DRC_FLAT
+        @test bound.roles[:y] === :response
+        @test bound.n_obs == 5
+        @test coordinate_names(built.layout) == [:a, :s]
+        for q in ((a = 0.3, s = 0.7), (a = -0.4, s = 1.6))
+            @test _drc_at(kern, built, q) ≈ _drc_oracle(q.a, q.s, _DRC_FLAT) rtol = 1e-12
+        end
+    end
+    @test raw == _DRC_RAW
+    # Same density as the identity-gather spelling at the same points.
+    _, _, gbuilt, gkern = _drc_kernel(_DRC_GATHER, (; raw = deepcopy(_DRC_RAW)))
+    _, _, cbuilt, ckern = _drc_kernel(_DRC_CALL, (; raw = deepcopy(_DRC_RAW)))
+    for q in ((a = 0.3, s = 0.7), (a = 1.1, s = 0.4))
+        @test _drc_at(ckern, cbuilt, q) ≈ _drc_at(gkern, gbuilt, q) rtol = 1e-14
+    end
+    # Evaluated once, at bind; the kernel never calls it again.
+    _DRCells.calls[] = 0
+    _, _, kbuilt, kkern = _drc_kernel(quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            y = counted_flatten(raw)
+            y .~ Normal.(a, s)
+        end, (:raw,))
+    @test _DRCells.calls[] == 1
+    for q in ((a = 0.3, s = 0.7), (a = -0.2, s = 1.2))
+        @test _drc_at(kkern, kbuilt, q) ≈ _drc_oracle(q.a, q.s, _DRC_FLAT) rtol = 1e-12
+    end
+    @test _DRCells.calls[] == 1
+    # Empty cells give zero observations; the priors remain.
+    _, ebound, ebuilt, ekern = _drc_kernel(_DRC_CALL,
+        (; raw = [Float64[], Float64[]]))
+    @test ebound.columns[:y] == Float64[]
+    @test _drc_at(ekern, ebuilt, (a = 0.3, s = 0.7)) ≈ _drc_prior(0.3, 0.7) rtol = 1e-12
+end
+
+@testset "derived response: elementwise and reduction values" begin
+    # An elementwise function of a module call's result.
+    _, _, lbuilt, lkern = _drc_kernel(quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            y = log.(flatten_cells(raw))
+            y .~ Normal.(a, s)
+        end, (:raw,))
+    @test _drc_at(lkern, lbuilt, (a = -0.5, s = 0.9)) ≈
+        _drc_oracle(-0.5, 0.9, log.(_DRC_FLAT)) rtol = 1e-12
+    # A reduction is one observation, as the same number bound as data.
+    _, rbound, rbuilt, rkern = _drc_kernel(quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            y = sum(flatten_cells(raw))
+            y .~ Normal.(a, s)
+        end, (:raw,))
+    @test rbound.columns[:y] == [sum(_DRC_FLAT)]
+    @test _drc_at(rkern, rbuilt, (a = 0.3, s = 0.7)) ≈
+        _drc_oracle(0.3, 0.7, [sum(_DRC_FLAT)]) rtol = 1e-12
+end
+
+@testset "derived response from a module call: bind contract" begin
+    plan = lower_rkppl(_DRC_CALL, (:raw,); mod = _DRCells, conditioned = (:y,))
+    # refused: caller data shadows a value the model derives (single assignment, P3).
+    err = try
+        bind_data(plan, (; raw = deepcopy(_DRC_RAW), y = copy(_DRC_FLAT)))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ContractValidationError
+    @test occursin("drop it from bind_data", sprint(showerror, err))
+    # refused: a String is not an observation value (a response observes a number or an array, P10a).
+    lplan = lower_rkppl(quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            y = label_of(raw)
+            y .~ Normal.(a, s)
+        end, (:raw,); mod = _DRCells, conditioned = (:y,))
+    lerr = try
+        bind_data(lplan, (; raw = deepcopy(_DRC_RAW)))
+        nothing
+    catch e
+        e
+    end
+    @test lerr isa ContractValidationError
+    @test occursin(r"derived response y evaluated to .*String; a response observes a number or an array",
+        sprint(showerror, lerr))
+end
+
+@testset "derived response from a module call: Enzyme gradients" begin
+    plan = lower_rkppl(_DRC_CALL, (:raw,); mod = _DRCells, conditioned = (:y,))
+    bound = bind_data(plan, (; raw = deepcopy(_DRC_RAW)))
+    built = build_kernel(bound)
+    kern = prepare_query(built, bound, :sampler)
+    u = unconstrain(built.layout, (a = 0.3, s = 0.7))
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    v, _ = sampler_value_and_gradient!(prep, g, u)
+    @test v ≈ _drc_oracle(0.3, 0.7, _DRC_FLAT) rtol = 1e-12
+    @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
+        rtol = 1e-5, atol = 1e-7)
 end

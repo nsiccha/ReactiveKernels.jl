@@ -3211,30 +3211,19 @@ function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], co
 end
 
 # Sampling transforms enforce support; observations use a lazy density guard.
-function _conditioned_endpoint_calls(ex::Expr)
+function _untyped_branch_locals(ex::Expr)
     # Branch locals are ordinary Julia assignments. Their annotations would
     # convert traced numbers to Float64 during compiled execution; the enclosing
-    # kernel node already supplies the result type.
+    # kernel node already supplies the result type. Endpoint calls such as
+    # `normal(m, s).cdf(x)` stay source: ReactiveKernels lowers an object
+    # endpoint under a branch arm inside that arm.
     if ex.head === :(=) && first(ex.args) isa Expr && first(ex.args).head === :(::)
         return Expr(:(=), first(first(ex.args).args),
-            _conditioned_endpoint_calls(ex.args[2]))
+            _untyped_branch_locals(ex.args[2]))
     end
-    if ex.head === :call && first(ex.args) isa Expr
-        endpoint = first(ex.args)
-        if endpoint.head === :. && endpoint.args[2] isa QuoteNode &&
-                endpoint.args[2].value in (:cdf, :ccdf)
-            object = first(endpoint.args)
-            if object isa Expr && object.head === :call &&
-                    first(object.args) in values(_PRIOR_ENDPOINTS)
-                family = getfield(@__MODULE__, first(object.args))
-                callable = prepare(getproperty(family, endpoint.args[2].value))
-                return Expr(:call, QuoteNode(callable), object.args[2:end]..., ex.args[2:end]...)
-            end
-        end
-    end
-    return Expr(ex.head, map(_conditioned_endpoint_calls, ex.args)...)
+    return Expr(ex.head, map(_untyped_branch_locals, ex.args)...)
 end
-_conditioned_endpoint_calls(ex) = ex
+_untyped_branch_locals(ex) = ex
 
 function _conditioned_support_guard(value, support, density)
     support === nothing && return density
@@ -3247,7 +3236,7 @@ function _conditioned_support_guard(value, support, density)
     else
         :($(support[2]) <= $value && $value <= $(support[3]))
     end
-    density = _conditioned_endpoint_calls(density)
+    density = _untyped_branch_locals(density)
     return :(if $valid
         $density
     else

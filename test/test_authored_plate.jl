@@ -1306,6 +1306,10 @@ end
     return ys
 end
 
+# A bounds check's throw: `ijl_bounds_error_*` on Julia 1.10, a call to
+# `throw_boundserror` from 1.12.
+const _BOUNDS_THROW = r"bounds_?error"
+
 function _plate_entry_llvm(kernel, args...)
     kernel(args...)
     sprint(io -> InteractiveUtils.code_llvm(io,
@@ -1335,7 +1339,7 @@ end
     # vectorizes like the hand loop.
     for (kernel, args) in ((affine, (xs,)), (poly, (xs, Tuple(coefficients))))
         llvm = _plate_entry_llvm(kernel, args...)
-        @test !occursin("bounds_error", llvm)
+        @test !occursin(_BOUNDS_THROW, llvm)
         if Sys.ARCH in (:x86_64, :aarch64)
             @test occursin(r"<\d+ x double>", llvm)
         end
@@ -1345,8 +1349,104 @@ end
     checked = prepare(_checked_cell_plate)
     table = [2.0, 3.0, 5.0]
     @test checked([1.0, 2.0, 3.0], [3, 1, 2], table) == [5.0, 4.0, 9.0]
-    @test occursin("bounds_error", _plate_entry_llvm(checked, [1.0], [1], table))
+    @test occursin(_BOUNDS_THROW, _plate_entry_llvm(checked, [1.0], [1], table))
     @test_throws BoundsError checked([1.0, 2.0], [1, 4], table)
+end
+
+# --- each cell recipe is emitted once (snag prepared-kernel-ae180d1a)
+# A plate argument whose declared type does not say it is one-dimensional (an
+# untyped port, bound or live) used to emit every cell recipe it reaches twice:
+# above the loop for a value that holds no axis, and inside the loop for one
+# that does. A scan in such a cell appeared four times. Each recipe is now
+# emitted once, inside the loop; a group whose roots hold no axis runs at the
+# first coordinate and is reused.
+@kernel _emitted_once_untyped(xs, scale::Float64) = begin
+    pointwise = plate(xs, Ref(scale)) do x, s
+        shifted = x * s + 0.75
+        shifted * shifted
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_typed(xs::Vector{Float64}, scale::Float64) = begin
+    pointwise = plate(xs, Ref(scale)) do x, s
+        shifted = x * s + 0.75
+        shifted * shifted
+    end
+    return sum(pointwise)
+end
+const _EMITTED_ONCE_CALLS = Ref(0)
+_emitted_once_log(s) = (_EMITTED_ONCE_CALLS[] += 1; log(s))
+@kernel _emitted_once_invariant(xs::Vector{Float64}, s) = begin
+    pointwise = plate(xs, s) do x, si
+        ls = _emitted_once_log(si)
+        x * ls
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_scan_cell(groups, scale::Float64) = begin
+    pointwise = plate(groups, Ref(scale)) do g, s
+        path = scan(g, Ref(s); init = 0.0) do carry, y, sc
+            next = carry * 0.125 + y * sc
+            (next, next)
+        end
+        sum(path)
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_scan_alone(g, s::Float64) = begin
+    path = scan(g, Ref(s); init = 0.0) do carry, y, sc
+        next = carry * 0.125 + y * sc
+        (next, next)
+    end
+    return sum(path)
+end
+_emitted_count(kernel, literal) =
+    count(_ -> true, eachmatch(literal, string(readable_code(kernel))))
+
+@testset "authored plate native: each cell recipe is emitted once" begin
+    xs = collect(range(-1.0, 2.0; length = 7))
+    reference = sum((xs .* 0.5 .+ 0.75) .^ 2)
+    typed = prepare(_emitted_once_typed)
+    @test _emitted_count(typed, r"0\.75") == 1
+    for kernel in (prepare(_emitted_once_untyped),
+                   prepare(_emitted_once_untyped; bound = (; xs)),
+                   prepare(_emitted_once_untyped; bound = (; xs = 1:4)))
+        @test _emitted_count(kernel, r"0\.75") == 1
+    end
+    untyped = prepare(_emitted_once_untyped)
+    @test untyped(xs, 0.5) == typed(xs, 0.5) ≈ reference
+    @test untyped(1:4, 0.5) == typed(collect(1.0:4.0), 0.5)
+    @test untyped(Tuple(xs), 0.5) == typed(xs, 0.5)
+    @test untyped(Float64[], 0.5) == 0.0
+    @test prepare(_emitted_once_untyped; bound = (; xs = 1:4))(0.5) ==
+          typed(collect(1.0:4.0), 0.5)
+
+    # A group whose only root is a scalar in an untyped port is a plate
+    # invariant: it runs once per call. A value that holds no axis reaches it
+    # as its broadcast element, as it reaches every other cell recipe.
+    invariant = prepare(_emitted_once_invariant)
+    @test _emitted_count(invariant, r"_emitted_once_log\(") == 1
+    expected = sum(xs .* log(1.7))
+    for s in (1.7, fill(1.7), Ref(1.7))
+        _EMITTED_ONCE_CALLS[] = 0
+        @test invariant(xs, s) ≈ expected
+        @test _EMITTED_ONCE_CALLS[] == 1
+    end
+    # An axis-valued operand runs it at every coordinate.
+    scales = collect(range(0.5, 2.0; length = length(xs)))
+    _EMITTED_ONCE_CALLS[] = 0
+    @test invariant(xs, scales) ≈ sum(xs .* log.(scales))
+    @test _EMITTED_ONCE_CALLS[] == length(xs)
+
+    # A scan in such a cell keeps only its own emission.
+    groups = [[1.0, 2.0], [3.0], [0.5, 0.25, 4.0]]
+    alone = prepare(_emitted_once_scan_alone)
+    for kernel in (prepare(_emitted_once_scan_cell),
+                   prepare(_emitted_once_scan_cell; bound = (; groups)))
+        @test _emitted_count(kernel, r"0\.125") == _emitted_count(alone, r"0\.125")
+    end
+    @test prepare(_emitted_once_scan_cell)(groups, 0.5) ≈
+          sum(alone(g, 0.5) for g in groups)
 end
 
 # --- per-cell reductions over a few host indices (snag plate-cell-gathe-94d4a929)
@@ -1672,6 +1772,249 @@ end
         @test _dose_outer_same(vec(got[1]), vec(expected[1]))
         @test got[2] === expected[2]
     end
+end
+
+# Coefficient-outer lowering of an `evalpoly(x, c)` cell over shared
+# coefficients (snag native-lowering-948c4ab6). Base's `evalpoly` over a vector
+# is a per-cell runtime Horner loop; the lowering runs each coefficient as one
+# pass over a tile of cells, with Base's operations in Base's order. The
+# control calls the same `evalpoly` through a function the lowering does not
+# recognize, so it keeps the cell loop.
+_plate_horner(x, c) = evalpoly(x, c)
+@kernel evalpoly_cell(xs, c) = begin
+    ys = plate(xs, Ref(c)) do x, c
+        evalpoly(x, c)
+    end
+    total = sum(ys)
+    return ys, total
+end
+@kernel evalpoly_cell_reordered(xs, c) = begin
+    ys = plate(Ref(c), xs) do c, x
+        evalpoly(x, c)
+    end
+    return ys
+end
+@kernel evalpoly_control(xs, c) = begin
+    ys = plate(xs, Ref(c)) do x, c
+        _plate_horner(x, c)
+    end
+    total = sum(ys)
+    return ys, total
+end
+_evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(kernel)))
+
+@testset "authored plate block: an evalpoly cell over shared coefficients runs coefficient-outer" begin
+    cell, control = prepare(evalpoly_cell), prepare(evalpoly_control)
+    @test _evalpoly_lowered(cell)
+    @test !_evalpoly_lowered(control)
+    @test _evalpoly_lowered(prepare(evalpoly_cell_reordered))
+    coefficients = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011, 2.5e-3, -4.0e-4, 1.0e-5, 3.0e-6, -7.0e-7]
+    # Lengths around the tile, and degrees down to a constant.
+    for n in (0, 1, 255, 256, 257, 513, 1000), c in (coefficients, coefficients[1:2], [2.5])
+        xs = [1 / (k + 0.5) for k in 0:n-1]
+        got, expected = cell(xs, c), control(xs, c)
+        @test got[1] == expected[1] == evalpoly.(xs, Ref(c))
+        @test got[2] === expected[2]
+        @test prepare(evalpoly_cell_reordered)(xs, c) == expected[1]
+    end
+    xs = collect(range(-2.0, 2.0; length = 300))
+    # Not lowered, same values: integer coefficients (the seed's type is not
+    # the cell's), a tuple (Base's unrolled method), a two-axis domain.
+    @test cell(xs, [1, 2, 3])[1] == evalpoly.(xs, Ref([1, 2, 3]))
+    @test cell(xs, Tuple(coefficients))[1] == evalpoly.(xs, Ref(Tuple(coefficients)))
+    grid = reshape(xs, 15, 20)
+    @test cell(grid, coefficients)[1] == evalpoly.(grid, Ref(coefficients))
+    # A one-based view is lowered like a vector.
+    @test cell(xs, view(coefficients, 2:6))[1] == evalpoly.(xs, Ref(view(coefficients, 2:6)))
+    # Base's errors: empty coefficients have no `c[end]`.
+    @test_throws BoundsError cell(xs, Float64[])
+    @test cell(Float64[], Float64[]) == (Float64[], 0.0)
+    # The output is the only allocation, as for the cell loop.
+    allocated(k, xs, c) = @allocated k(xs, c)
+    allocated(cell, xs, coefficients)
+    allocated(control, xs, coefficients)
+    @test allocated(cell, xs, coefficients) <= allocated(control, xs, coefficients) +
+                                                _natural_sup_parity_margin
+    # The coefficient passes vectorize across cells.
+    if Sys.ARCH in (:x86_64, :aarch64)
+        @test occursin(r"<\d+ x double>", _plate_entry_llvm(cell, xs, coefficients))
+    end
+end
+
+# Plates that only feed a lockstep scan run strip by strip with it (snag
+# native-lowering-948c4ab6): `_PLATE_STRIP` cells of every such plate, then the
+# scan's steps over them, so no plate output is stored at full length. A
+# domain that is not a vector (here a tuple) keeps the materialized plates.
+# `muladd` leaves contraction to the compiler, so the two lowerings agree to
+# rounding.
+using ReactiveKernels: scan
+@kernel strip_recurrence(steps, pa, pb, q, ea, eb, ca, cb, g0, a0, b0) = begin
+    xs = plate(steps) do k
+        1 / (k + 0.5)
+    end
+    sa = plate(xs, Ref(pa)) do x, c
+        evalpoly(x, c)
+    end
+    sb = plate(xs, Ref(pb)) do x, c
+        evalpoly(x, c)
+    end
+    ratio = plate(xs, Ref(q)) do x, c
+        evalpoly(x, c)
+    end
+    out = scan(sa, sb, ratio, Ref(ea), Ref(eb), Ref(ca), Ref(cb);
+               init = (g = g0, a = a0, b = b0)) do carry, pa_k, pb_k, q_k, ea, eb, ca, cb
+        a = muladd(ea, carry.a, carry.g * pa_k)
+        b = muladd(eb, carry.b, carry.g * pb_k)
+        ((g = carry.g * q_k, a = a, b = b), ca * a + cb * b)
+    end
+    return out
+end
+# The same recurrence with a second, ordinary sequence in lockstep.
+@kernel strip_lockstep(steps, weights, pa) = begin
+    xs = plate(steps) do k
+        1 / (k + 0.5)
+    end
+    sa = plate(xs, Ref(pa)) do x, c
+        evalpoly(x, c)
+    end
+    out = scan(sa, weights; init = 0.0) do carry, s, w
+        next = muladd(w, carry, s)
+        (next, next)
+    end
+    return out
+end
+# Not strip-fused: an init-including scan, and a plate whose output is also summed.
+@kernel strip_include_init(steps, pa) = begin
+    sa = plate(steps, Ref(pa)) do k, c
+        evalpoly(1 / (k + 0.5), c)
+    end
+    out = scan(sa; init = 0.0, include_init = true) do carry, s
+        (carry + s, carry + s)
+    end
+    return out
+end
+@kernel strip_shared_output(steps, pa) = begin
+    sa = plate(steps, Ref(pa)) do k, c
+        evalpoly(1 / (k + 0.5), c)
+    end
+    total = sum(sa)
+    out = scan(sa; init = 0.0) do carry, s
+        (carry + s, carry + s)
+    end
+    return out, total
+end
+function _strip_reference(steps, pa, pb, q, ea, eb, ca, cb, g, a, b)
+    out = Float64[]
+    for k in steps
+        x = 1 / (k + 0.5)
+        a = muladd(ea, a, g * evalpoly(x, pa))
+        b = muladd(eb, b, g * evalpoly(x, pb))
+        push!(out, ca * a + cb * b)
+        g *= evalpoly(x, q)
+    end
+    out
+end
+_strip_fused(kernel) = occursin("_plate_strip_ready", string(code_expr(kernel)))
+
+@testset "authored plate block: plates that only feed a scan run strip by strip" begin
+    kernel = prepare(strip_recurrence)
+    @test _strip_fused(kernel)
+    @test _strip_fused(prepare(strip_lockstep))
+    @test !_strip_fused(prepare(strip_include_init))
+    @test !_strip_fused(prepare(strip_shared_output))
+    pa = [1.0, 0.3, -0.2, 0.05, 0.01]
+    pb = [0.8, -0.1, 0.04]
+    q = [0.99, 0.002, -0.001]
+    coefficients = (pa, pb, q, exp(-0.01), exp(-0.12), 0.3, 0.7, 1.0, 0.0, 0.0)
+    for n in (0, 1, 127, 128, 129, 257, 1000)
+        steps = 0:n-1
+        got = kernel(steps, coefficients...)
+        expected = _strip_reference(steps, coefficients...)
+        @test length(got) == n
+        @test isapprox(got, expected; rtol = 1e-13)
+        # The materialized lowering (a tuple domain) agrees.
+        # (An empty tuple is type-erased and has no reduction identity.)
+        1 <= n <= 300 && @test isapprox(got, kernel(Tuple(steps), coefficients...); rtol = 1e-13)
+        # Tuple coefficients take Base's unrolled `evalpoly` in the same strips.
+        @test isapprox(kernel(steps, Tuple(pa), Tuple(pb), Tuple(q), coefficients[4:end]...),
+                       expected; rtol = 1e-13)
+    end
+    # A second sequence in lockstep reads the same steps.
+    steps, weights = 0:299, collect(range(0.1, 0.9; length = 300))
+    lockstep = prepare(strip_lockstep)
+    expected = accumulate((c, (s, w)) -> muladd(w, c, s),
+                          zip(evalpoly.(1 ./ (steps .+ 0.5), Ref(pa)), weights); init = 0.0)
+    @test isapprox(lockstep(steps, weights, pa), expected; rtol = 1e-13)
+    @test_throws DimensionMismatch lockstep(steps, weights[1:end-1], pa)
+    # Not strip-fused, same values as authored.
+    @test prepare(strip_include_init)(0:9, pa) ==
+        [0.0; cumsum(evalpoly.(1 ./ ((0:9) .+ 0.5), Ref(pa)))]
+    shared = prepare(strip_shared_output)(0:9, pa)
+    @test shared[1] == cumsum(evalpoly.(1 ./ ((0:9) .+ 0.5), Ref(pa)))
+    # No full-length intermediates: the output plus strip buffers, against the
+    # four full-length plate outputs of the materialized lowering.
+    steps = 0:6527
+    allocated(k, steps) = @allocated k(steps, coefficients...)
+    allocated(kernel, steps)
+    @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
+end
+
+# A plain scan step's carry-independent statements that read the step's
+# elements run as one-cell plates in the scan's strip region (snag
+# native-lowering-948c4ab6): the step reads their values from the strip.
+# Statements that read the carry, and values that are not concrete numbers,
+# stay in the step.
+@kernel fission_recurrence(steps, pa, pb, q, ea, eb, ca, cb, g0, a0, b0) = begin
+    out = scan(steps, Ref(pa), Ref(pb), Ref(q), Ref(ea), Ref(eb), Ref(ca), Ref(cb);
+               init = (g = g0, a = a0, b = b0)) do carry, k, pa, pb, q, ea, eb, ca, cb
+        x = 1 / (k + 0.5)
+        pa_k = evalpoly(x, pa)
+        pb_k = evalpoly(x, pb)
+        q_k = evalpoly(x, q)
+        a = muladd(ea, carry.a, carry.g * pa_k)
+        b = muladd(eb, carry.b, carry.g * pb_k)
+        ((g = carry.g * q_k, a = a, b = b), ca * a + cb * b)
+    end
+    return out
+end
+# A hoisted value that is a tuple keeps the step as authored.
+@kernel fission_tuple_value(steps, w) = begin
+    out = scan(steps, Ref(w); init = 0.0) do carry, k, w
+        pair = (k * w, k + w)
+        (carry + pair[1] * pair[2], carry)
+    end
+    return out
+end
+_fission_hoisted(kernel) = occursin("scan_hoisted", string(code_expr(kernel)))
+
+@testset "authored scan: carry-independent step statements run in the strip region" begin
+    kernel = prepare(fission_recurrence)
+    @test _fission_hoisted(kernel)
+    @test _strip_fused(kernel)
+    pa = [1.0, 0.3, -0.2, 0.05, 0.01]
+    pb = [0.8, -0.1, 0.04]
+    q = [0.99, 0.002, -0.001]
+    coefficients = (pa, pb, q, exp(-0.01), exp(-0.12), 0.3, 0.7, 1.0, 0.0, 0.0)
+    for n in (0, 1, 127, 128, 129, 257, 1000)
+        steps = 0:n-1
+        expected = _strip_reference(steps, coefficients...)
+        got = kernel(steps, coefficients...)
+        @test length(got) == n
+        @test isapprox(got, expected; rtol = 1e-13)
+        @test isapprox(kernel(steps, Tuple(pa), Tuple(pb), Tuple(q), coefficients[4:end]...),
+                       expected; rtol = 1e-13)
+    end
+    # Without a fold, the step stays as authored (cheap carry-independent work
+    # already runs beside the carry chain).
+    @test !_fission_hoisted(prepare(fission_tuple_value))
+    tuple_kernel = prepare(fission_tuple_value)
+    @test tuple_kernel(0:9, 0.5) ==
+          [sum((k * 0.5) * (k + 0.5) for k in 0:j-1; init = 0.0) for j in 0:9]
+    # The output plus strip buffers only.
+    steps = 0:6527
+    allocated(k, steps) = @allocated k(steps, coefficients...)
+    allocated(kernel, steps)
+    @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
 end
 
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin

@@ -272,6 +272,26 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         isempty(uncached) && break
         union!(excluded, uncached)
     end
+
+    # A cell result that reads only bound data is itself a cache frontier, and
+    # a residual cell would merely copy the shared cached values into the
+    # plate's output. When every other input is atomic, so that bound inputs
+    # alone fix the domain and its checks, the whole plate result is a
+    # bind-time value and replaces the plate. Otherwise a cached array result
+    # would be stored, shared, into every evaluation's output: it would alias
+    # bind-time storage, and native reverse mode cannot treat constant memory
+    # stored into a differentiable container statically (snag
+    # native-reverse-r-79fb001d). A live non-atomic input therefore keeps the
+    # authored cell, its runtime domain check and a result allocated per
+    # evaluation.
+    want_id = canon_id(inner.graph, only(inner.want).id)
+    want_cached = any(v -> canon_id(inner.graph, v.id) == want_id, frontier)
+    whole = want_cached && isempty(residual) && length(recipe.outputs) == 1 &&
+        all(!isempty, op.axis_checks) &&
+        all(enumerate(recipe.inputs)) do (index, input)
+            index in atomic_inputs || haskey(known, canon_id(g, input.id))
+        end
+    want_cached && !whole && types[want_id] <: AbstractArray && return nothing
     for r in selected
         args = Tuple(arguments[canon_id(inner.graph, v.id)] for v in r.inputs)
         batch = Base.Broadcast.instantiate(Base.broadcasted(r.op, args...))
@@ -290,19 +310,25 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         end
     end
 
-    cache_values = Value[]
+    # A whole-plate value is computed by the same plate over its bound inputs
+    # alone; its unread live atomic inputs are dropped.
+    keep = whole ?
+        [index for (index, input) in enumerate(recipe.inputs)
+         if haskey(known, canon_id(g, input.id))] :
+        collect(eachindex(recipe.inputs))
+    position = Dict(index => p for (p, index) in enumerate(keep))
+    atomic = Int[position[index] for index in atomic_inputs
+                 if haskey(position, index)]
     cache_data = Any[]
-    atomic = Int[atomic_inputs...]
     for (index, v) in enumerate(frontier)
         data = arguments[canon_id(inner.graph, v.id)]
         if data isa Ref
             data = data[]
-            push!(atomic, length(recipe.inputs) + index)
+            push!(atomic, length(keep) + index)
         end
-        push!(cache_values, value!(g, Symbol(:bound_plate_, v.name), typeof(data)))
         push!(cache_data, data)
     end
-    scalar_plan = _partial_subplan(inner, vcat(inner.have, frontier),
+    scalar_plan = _partial_subplan(inner, vcat(inner.have[keep], frontier),
                                   inner.want, residual)
     kernel = _prepare(scalar_plan,
         _lower_with_ops(scalar_plan; inline_embedded = false)...)
@@ -310,8 +336,22 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                     zip(inner.recipes, op.kernel.lowered_recipes))
     kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
         kernel.plan, kernel.ast, Tuple(readable[r.id] for r in residual))
+    axis_checks = Tuple(Tuple(position[index] for index in group)
+                        for group in op.axis_checks)
     replacement = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(
-        kernel, op.axis_checks)
+        kernel, axis_checks)
+    if whole
+        args = (Any[known[canon_id(g, recipe.inputs[index].id)]
+                    for index in keep]..., cache_data...)
+        for group in axis_checks
+            _plate_require_axes(Base.Broadcast.combine_axes(
+                (args[p] for p in group)...))
+        end
+        return (; recipe = nothing, cache_values = Value[only(recipe.outputs)],
+                cache_data = Any[replacement(args...)])
+    end
+    cache_values = Value[value!(g, Symbol(:bound_plate_, v.name), typeof(data))
+                         for (v, data) in zip(frontier, cache_data)]
     updated = Recipe(recipe.id, (recipe.inputs..., cache_values...),
         recipe.outputs, replacement, recipe.cost, nothing,
         recipe.effectful, recipe.source)
@@ -642,6 +682,7 @@ function _partial_inner_plates(p::Plan, known)
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     changed = false
+    whole = false
     # A worklist: an arm plate emitted by the branch partition is examined
     # again (a nested arm or a further branch in its cell), and a rewritten
     # `sum` consumer replaces the original later in the queue.
@@ -656,6 +697,8 @@ function _partial_inner_plates(p::Plan, known)
                                       0.0, nothing, false))
                 known[canon_id(copied, value.id)] = data
             end
+            # A whole-plate value replaces its plate.
+            specialized.recipe === nothing && (whole = true; continue)
             r = specialized.recipe
         end
         partitioned = _partition_plate_recipe(copied, r, known, r.op, pending,
@@ -674,7 +717,28 @@ function _partial_inner_plates(p::Plan, known)
     changed || return p
     template = Plan(copied, p.have, p.want, p.recipes, p.producer,
                     p.cost, p.candidates)
-    _partial_subplan(template, p.have, p.want, recipes)
+    specialized = _partial_subplan(template, p.have, p.want, recipes)
+    whole ? _partial_fold_bound(specialized) : specialized
+end
+
+# A plate whose whole result became a bind-time value can leave consumers that
+# read only bind-time values, such as `reduce(vcat, cells; init = Float64[])`
+# over its cells. Top-level partial evaluation ran before the plate was
+# hoisted, so they would still run on every evaluation over the shared hoisted
+# storage, where native Enzyme Reverse rejects Base's concatenation of that
+# constant data (snag native-reverse-a-8009a109). They form a data-only prefix
+# of the specialized plan, which is run once here as the top-level prefix is.
+function _partial_fold_bound(p::Plan)
+    boundary = _partial_boundary(p, Value[])
+    all(r -> isempty(r.inputs), boundary.prefix) && return p
+    hoisted = _partial_hoisted(p, boundary, ())
+    # Fresh ids below every id in the plan, as the inner-plate pass assigns.
+    base = minimum((r.id for r in p.recipes); init = 0) - 1
+    recipes = Recipe[Recipe(base - index + 1, (), (value,), _BoundConstant(data),
+                            0.0, nothing, false)
+                     for (index, (value, data)) in
+                         enumerate(zip(boundary.constants, hoisted))]
+    _partial_subplan(p, boundary.remaining, p.want, vcat(recipes, boundary.residual))
 end
 
 """
@@ -702,6 +766,15 @@ remain available for shape and marker validation: their storage is retained
 even if the scalar residual no longer reads their elements. This trades setup
 and cache storage for repeated computation; inexpensive recipes need not run
 faster. Rebinding rebuilds these caches.
+
+When the cell result itself reads only bound data and every other plate input
+is atomic (`Ref`), the plate's whole result is computed at preparation and
+replaces the plate. Its consumers that then read only bind-time values, such as
+`reduce(vcat, cells; init = Float64[])`, are computed at preparation as well,
+so no evaluation reads the shared hoisted storage. A cell result
+that is such an array but sits beside a live non-atomic input keeps its
+original per-cell execution: caching it would store the same shared arrays in
+every evaluation's output.
 
 The inner pass conservatively retains the original plate for known empty
 domains or live inputs that could introduce an empty broadcast dimension.

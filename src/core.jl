@@ -85,6 +85,24 @@ Recipe(id, inputs, outputs, op, cost, cse_key, effectful) =
     Recipe(id, inputs, outputs, op, cost, cse_key, effectful, _NO_KERNEL_SOURCE)
 
 """
+    _TypeOperation{T}
+
+A type used as a recipe's operation, such as the bare constructor call
+`y = SVector{2,Float64}(a, b)` in a `@kernel` or `add!(g, x => y, Float64)`.
+Calling it calls `T` with the same arguments. Every type has the one Julia
+type `DataType` (or `UnionAll`), so a type stored in an operation table leaves
+its identity to the runtime value: a call through it, and every result type
+derived from it, is uninferred, and the generated body falls back to dynamic
+dispatch. Native Enzyme reverse then fails static activity analysis on the
+boxed arguments. As a singleton the type travels in the operation's own type.
+Recipe registration (`_add_recipe!`) applies it, so every operation table and
+type query sees it.
+"""
+struct _TypeOperation{T} end
+@inline (::_TypeOperation{T})(args...) where {T} = T(args...)
+_type_operation_type(::_TypeOperation{T}) where {T} = T
+
+"""
     _KernelSourceOp{DefToken,Form,F,TF,IG,CI}
 
 An immutable wrapper marking a recipe operation SYNTHESIZED from captured `@kernel` source as
@@ -1069,6 +1087,87 @@ _KernelReduction(::Val{II}, ::Val{XI}, ::Val{KI}, ::Val{AI}, call::F,
 @inline (reduction::_KernelReduction)(args::Vararg{Any,N}) where {N} =
     @inline reduction.call(args...)
 
+# Inference of nested source operations. A recipe whose source inlines another
+# kernel's endpoint (a plate cell `normal(mu, s).logpdf(y)`) embeds that
+# kernel's source operations, so one call runs `(op::_KernelSourceOp)(...)`,
+# `_kernel_source_call`, the source function and the authored closure, which
+# calls the embedded operation through the same methods again. Julia's
+# inference treats a caller-to-callee method edge that recurs on its stack as
+# possible unbounded recursion: Julia 1.10 compares the inner call with the
+# callee's declared `Vararg` signature, which every concrete multi-argument call
+# exceeds, and widens it. The inner result, the cell, and a fused plate total
+# then infer as `Any`, with a boxed value and an uninlined call per cell, and
+# the enclosing kernel's code is cached that way. Only after the inner operation
+# was compiled at top level, as a dynamic call from that first kernel does, did
+# a later identical kernel infer concretely, so whichever kernel a process
+# compiled first stayed slow (snag `first-prepared-s-e848620b`: 5 µs and 87
+# allocations against 0.3 µs and 6 per sampler gradient, primal and Enzyme
+# alike, on Julia 1.10 and, for other cells, 1.12).
+#
+# Nesting distinct source operations terminates: an operation embeds only
+# operations that already exist, so each level holds a different callable
+# type. `recursion_relation` tells inference that such an edge is well founded.
+# The same callable again, or one whose type contains its caller's, keeps
+# Julia's default limiting.
+_source_callable_type(@nospecialize(T)) = false
+_source_callable_type(::Type{<:Union{_KernelSourceOp,_KernelSourceFunction,
+                                     _KernelBranch,_KernelReduction}}) = true
+
+# The callee a source-call signature runs: its first source-callable parameter
+# (the called object, or the operation `_kernel_source_call` forwards).
+function _source_call_identity(@nospecialize(sig))
+    tuple = Base.unwrap_unionall(sig)
+    tuple isa DataType || return nothing
+    for parameter in tuple.parameters
+        parameter isa DataType && _source_callable_type(parameter) &&
+            return parameter
+    end
+    return nothing
+end
+
+function _type_mentions(@nospecialize(T), @nospecialize(target),
+                        seen::Base.IdSet{Any} = Base.IdSet{Any}())
+    T === target && return true
+    T isa DataType || return false
+    T in seen && return false
+    push!(seen, T)
+    for parameter in T.parameters
+        _type_mentions(parameter, target, seen) && return true
+    end
+    return false
+end
+
+# Called by inference with the recurring method, the callee method used for
+# its limit heuristics, the new call signature, and the signature of the
+# earlier frame of the same method; `true` means the recursion is well founded.
+function _source_call_recursion_well_founded(
+        @nospecialize(method), @nospecialize(callee),
+        @nospecialize(sig), @nospecialize(parent_sig))
+    inner = _source_call_identity(sig)
+    outer = _source_call_identity(parent_sig)
+    (inner === nothing || outer === nothing) && return false
+    return inner !== outer && !_type_mentions(inner, outer)
+end
+
+# Every method a nested source operation re-enters. Run once all of them are
+# defined (`ReactiveKernels.jl`, before the precompile workload).
+function _mark_source_call_recursion!()
+    hasfield(Method, :recursion_relation) || return nothing
+    methods_to_mark = Method[
+        which(Tuple{_KernelSourceOp,Vararg{Any}}),
+        which(Tuple{_KernelSourceFunction,Vararg{Any}}),
+        which(Tuple{_KernelBranch,Vararg{Any}}),
+        which(Tuple{_KernelReduction,Vararg{Any}}),
+        which(Tuple{_IgnoredThrowFunction,Vararg{Any}}),
+        methods(_kernel_source_call)...,
+        methods(_ignored_throw_call)...,
+    ]
+    for method in methods_to_mark
+        method.recursion_relation = _source_call_recursion_well_founded
+    end
+    return nothing
+end
+
 # Whether a plate's dose-outer lowering of `reduction` keeps the authored
 # semantics for these types: a concrete accumulator type `T` that the seed and
 # every step return unchanged, an `Int` gather index and a `Vector` gather
@@ -1096,6 +1195,37 @@ _KernelReduction(::Val{II}, ::Val{XI}, ::Val{KI}, ::Val{AI}, call::F,
         $promote(reduction.step_out, $T, element, $(types...)) === $T
     end
 end
+# Whether the coefficient-outer lowering of an `evalpoly(x, c)` cell keeps
+# Base's semantics for these types: a concrete cell type `T` that the seed
+# `c[end]` already has and every `muladd(x, acc, c[i])` keeps, coefficients in
+# an `AbstractVector` (a tuple keeps Base's unrolled method), and a one-axis
+# domain. Folded when the plate body is compiled.
+@generated function _plate_evalpoly_ready(::Type{T}, ::Type{X}, ::Type{C},
+                                          output_axes) where {T,X,C}
+    output_axes <: Tuple{Any} && C <: AbstractVector || return false
+    quote
+        isconcretetype($T) && eltype($C) === $T &&
+            $(GlobalRef(Base, :promote_op))($(GlobalRef(Base, :muladd)), $X, $T, $T) === $T
+    end
+end
+# Whether a scan's strip region can run over views of its outer lanes: every
+# lane and every other scan sequence is a vector over one common axis.
+@inline _plate_strip_ready() = false
+@inline _plate_strip_ready(first::AbstractVector, rest...) =
+    _plate_strip_same_axis(axes(first, 1), rest...)
+@inline _plate_strip_ready(first, rest...) = false
+@inline _plate_strip_same_axis(axis) = true
+@inline _plate_strip_same_axis(axis, lane::AbstractVector, rest...) =
+    axes(lane, 1) == axis && _plate_strip_same_axis(axis, rest...)
+@inline _plate_strip_same_axis(axis, lane, rest...) = false
+# Steps per strip of a strip-fused scan: the strip buffers of its plates stay
+# in the first-level cache between the plate cells and the steps that read them.
+const _PLATE_STRIP = 128
+
+# Cells per tile of a coefficient-outer pass: the accumulators and the cell
+# values of one tile stay in the first-level cache across the passes.
+const _PLATE_FOLD_TILE = 256
+
 _plate_dense_source(::Type) = false
 _plate_dense_source(::Type{<:Vector}) = true
 _plate_dense_source(::Type{S}) where {T,P<:Matrix,S<:SubArray{T,1,P}} =
@@ -1589,6 +1719,7 @@ Base.@nospecializeinfer function _add_recipe!(g::Graph,
     if !isfinite(recipe_cost) || recipe_cost < 0
         throw(ArgumentError("recipe cost must be finite and non-negative, got $cost"))
     end
+    op isa Type && (op = _TypeOperation{op}())
     # Opt-in structural CSE (gist §8): if a prior recipe carries the same
     # non-`nothing` cse_key, the same canonical inputs, and the same output
     # arity, it computes the same thing. Alias the new outputs onto the existing
