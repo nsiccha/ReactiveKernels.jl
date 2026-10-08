@@ -1464,6 +1464,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     responses = [r.range isa UnitRange && r.response in indexed_observations ?
         _with(r; range=Expr(:ref, r.response,
             Expr(:call, :(:), first(r.range), last(r.range)))) : r for r in responses]
+    named_values = _absorbed_named_values(det, canonmap, skip, predictors)
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
@@ -1472,10 +1473,36 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
-            if k in indexed_observations || k in indexed_external))
+            if k in indexed_observations || k in indexed_external),
+        named_values)
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
+end
+
+# A definition optimized into a predictor (a response location or scale, a
+# composition's sub-predictor) emits no statement of its own, nor does a
+# pure alias absorbed into the value it names (`w = u` over a scan state).
+# Naming never changes what the graph exposes: each such authored name
+# reads the node computing its value, the predictor itself or the alias
+# chain's target (user decision `0fbe312`; "all intermediate quantities"
+# are part of the RK graph).
+function _absorbed_named_values(det, canonmap, skip, predictors)
+    pnames = Set{Symbol}(p.name for p in predictors)
+    absorbed(nm) = nm in skip && haskey(canonmap, nm)
+    named = Pair{Symbol,Symbol}[]
+    for (nm, _) in det
+        absorbed(nm) || continue
+        target = nm
+        seen = Set{Symbol}()
+        while target ∉ pnames && absorbed(target) && target ∉ seen &&
+                canonmap[target] isa Symbol
+            push!(seen, target)
+            target = canonmap[target]
+        end
+        (target in pnames || !absorbed(target)) && push!(named, nm => target)
+    end
+    return named
 end
 
 

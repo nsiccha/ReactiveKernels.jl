@@ -90,14 +90,45 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     append!(stmts, conditioned)
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, values)
+    args = Expr[:(unconstrained::Vector{Float64});
+        [_data_arg(colname, col) for (colname, col) in _ordered_columns(plan)]]
+    append!(stmts, _named_value_statements(plan,
+        Expr[args..., transforms..., coefs..., conditioned..., values...]))
     append!(stmts, likelihoods)
     append!(stmts, priors)
     push!(stmts, _log_jacobian_statement(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
-    sig = Expr(:call, name, :(unconstrained::Vector{Float64}),
-        (_data_arg(colname, col) for (colname, col) in _ordered_columns(plan))...)
+    sig = Expr(:call, name, args...)
     return Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# An authored definition the lowering optimized away keeps its name
+# (`plan.named_values`): a bare alias of the node computing its value. With
+# the node's declared type, RK collapses the alias onto that node, so it adds
+# no recipe and no work. `defined` holds the kernel arguments and the
+# statements the aliases may read.
+function _named_value_statements(plan::StructuralPlan, defined::Vector{Expr})
+    isempty(plan.named_values) && return Expr[]
+    types = Dict{Symbol,Any}()
+    for ex in defined
+        lhs = Meta.isexpr(ex, :(=), 2) ? ex.args[1] : ex
+        Meta.isexpr(lhs, :(::), 2) ? (types[lhs.args[1]] = lhs.args[2]) :
+            lhs isa Symbol && (types[lhs] = nothing)
+    end
+    out = Expr[]
+    for (name, target) in plan.named_values
+        i = findfirst(p -> p.name === target, plan.predictors)
+        node = i === nothing ? target : _lp_name(plan.predictors[i])
+        haskey(types, name) && throw(ContractValidationError(
+            "[generator] authored name $name is already a graph value"))
+        haskey(types, node) || throw(ContractValidationError(
+            "[generator] authored name $name reads $node, which no statement defines"))
+        T = types[node]
+        push!(out, T === nothing ? :($name = $node) : :($name::$T = $node))
+        types[name] = T
+    end
+    return out
 end
 
 # A generated definition with its private names (`gensym`s, which differ

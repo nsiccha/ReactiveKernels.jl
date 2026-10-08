@@ -947,6 +947,9 @@ the private identifiers used by the mathematical plan. `cell_broadcasts`
 maps each response observed by a dotted `@plate` cell (`y[i] .~ D.(…)`) to
 the names that cell reads per index; when the bound response holds one
 array per index, each cell broadcasts over its own entries.
+`named_values` keeps each authored definition the lowering optimized away
+addressable by its name: `name => node` binds `name` to a predictor's value
+(when `node` names a predictor) or to another graph value.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -969,7 +972,23 @@ struct StructuralPlan
     indexed_observations::Set{Symbol}
     external_observations::Vector{SampledParameter}
     cell_broadcasts::Dict{Symbol,Vector{Symbol}}
+    named_values::Vector{Pair{Symbol,Symbol}}
 end
+
+# The former full constructor has no optimized authored names.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters,
+    matrices,
+    array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations, cell_broadcasts) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters,
+        matrices,
+        array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, Pair{Symbol,Symbol}[])
 
 # The former full constructor has no dotted-cell observations.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1095,13 +1114,14 @@ function StructuralPlan(
         conditioned::Set{Symbol} = Set{Symbol}(),
         indexed_observations::Set{Symbol} = Set{Symbol}(),
         external_observations::Vector{SampledParameter} = SampledParameter[],
-        cell_broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
+        cell_broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
+        named_values::Vector{Pair{Symbol,Symbol}} = Pair{Symbol,Symbol}[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations,
-        external_observations, cell_broadcasts)
+        external_observations, cell_broadcasts, named_values)
 end
 
 """Find a design matrix by name, or `nothing`."""
