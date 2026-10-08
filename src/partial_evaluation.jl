@@ -682,6 +682,7 @@ function _partial_inner_plates(p::Plan, known)
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     changed = false
+    whole = false
     # A worklist: an arm plate emitted by the branch partition is examined
     # again (a nested arm or a further branch in its cell), and a rewritten
     # `sum` consumer replaces the original later in the queue.
@@ -697,7 +698,7 @@ function _partial_inner_plates(p::Plan, known)
                 known[canon_id(copied, value.id)] = data
             end
             # A whole-plate value replaces its plate.
-            specialized.recipe === nothing && continue
+            specialized.recipe === nothing && (whole = true; continue)
             r = specialized.recipe
         end
         partitioned = _partition_plate_recipe(copied, r, known, r.op, pending,
@@ -716,7 +717,28 @@ function _partial_inner_plates(p::Plan, known)
     changed || return p
     template = Plan(copied, p.have, p.want, p.recipes, p.producer,
                     p.cost, p.candidates)
-    _partial_subplan(template, p.have, p.want, recipes)
+    specialized = _partial_subplan(template, p.have, p.want, recipes)
+    whole ? _partial_fold_bound(specialized) : specialized
+end
+
+# A plate whose whole result became a bind-time value can leave consumers that
+# read only bind-time values, such as `reduce(vcat, cells; init = Float64[])`
+# over its cells. Top-level partial evaluation ran before the plate was
+# hoisted, so they would still run on every evaluation over the shared hoisted
+# storage, where native Enzyme Reverse rejects Base's concatenation of that
+# constant data (snag native-reverse-a-8009a109). They form a data-only prefix
+# of the specialized plan, which is run once here as the top-level prefix is.
+function _partial_fold_bound(p::Plan)
+    boundary = _partial_boundary(p, Value[])
+    all(r -> isempty(r.inputs), boundary.prefix) && return p
+    hoisted = _partial_hoisted(p, boundary, ())
+    # Fresh ids below every id in the plan, as the inner-plate pass assigns.
+    base = minimum((r.id for r in p.recipes); init = 0) - 1
+    recipes = Recipe[Recipe(base - index + 1, (), (value,), _BoundConstant(data),
+                            0.0, nothing, false)
+                     for (index, (value, data)) in
+                         enumerate(zip(boundary.constants, hoisted))]
+    _partial_subplan(p, boundary.remaining, p.want, vcat(recipes, boundary.residual))
 end
 
 """
@@ -747,7 +769,9 @@ faster. Rebinding rebuilds these caches.
 
 When the cell result itself reads only bound data and every other plate input
 is atomic (`Ref`), the plate's whole result is computed at preparation and
-replaces the plate, so its consumers read one hoisted value. A cell result
+replaces the plate. Its consumers that then read only bind-time values, such as
+`reduce(vcat, cells; init = Float64[])`, are computed at preparation as well,
+so no evaluation reads the shared hoisted storage. A cell result
 that is such an array but sits beside a live non-atomic input keeps its
 original per-cell execution: caching it would store the same shared arrays in
 every evaluation's output.

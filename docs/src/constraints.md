@@ -485,6 +485,32 @@ and lock the one Reactant 0.2.289 lifted:
   operands beyond its block-row counts; Base's `hcat` and `vcat` of the same
   operands compile. An opaque helper that builds such a literal keeps the
   backend's limitation.
+- On Julia 1.12.7 and 1.13.1, Enzyme 0.13.210 and 0.13.213 cannot prove that
+  a closure capturing an array is never written when a loop stores values
+  read from that array into a fresh result. Plain `Enzyme.autodiff` of such
+  an unannotated function argument raises `EnzymeMutabilityException`
+  ("Function argument passed to autodiff cannot be proven readonly") when the
+  store runs. In one shape, an `@inbounds` loop into a fixed-length buffer, it
+  instead returns 0.0 for the primal and for the Reverse and Forward
+  derivatives. The proof follows a Float64 read from the captured array at a
+  loop-dependent offset, which it cannot type, and calls the store of that
+  Float64 a capture of the argument.
+  `repro_enzyme_closure_float_store_readonly.jl` reproduces it with Enzyme
+  only, including `g -> sum(xs .* g)`; Julia 1.10.12 passes. A closure that
+  captures data around a prepared scan kernel or RK's runtime scan op is this
+  shape, and so was `test_ad.jl`'s `let`-captured twin-column reference,
+  which passes its matrix as a `Constant` argument since `5ff6d6e8`. Whether a given loop trips the proof depends on its optimized IR:
+  the runtime op passed only while an opaque per-call method query in the
+  step changed how its loop was optimized. Reshaping RK's result allocation
+  is not a repair. A fresh fixed-length buffer avoids the error in one loop
+  spelling and silently zeroes the result in another. `prepare_ad` passes
+  data as `Constant` contexts and is unaffected, and `Const(f)` or a `Const`
+  data argument differentiates the same calls exactly. An Enzyme whose
+  readonly proof does not treat the store of a floating-point value as a
+  capture passes the reproducer and RK's scan testsets, and still raises for
+  a store into the captured array. The repair belongs in Enzyme;
+  `test_scan_plate_ad.jl` pins the captured-closure call through a prepared
+  scan kernel as broken on Julia 1.12 and later.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later

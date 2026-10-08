@@ -83,7 +83,9 @@ end
             @test got ≈ value atol=1e-12
             @test gradient ≈ derivative atol=1e-12
         end
-        # The runtime scan op that tensorized bodies call.
+        # The runtime scan op that tensorized bodies call. The sequence is a
+        # `Const` argument, as `prepare_ad` passes data; a closure capturing it
+        # is the separate Enzyme boundary pinned in the next testset.
         for (spec, includes_seed) in ((summed, false), (trajectory, true))
             op = only(r.op for r in spec.graph.recipes
                       if r.op isa ReactiveKernels._AuthoredScanOp)
@@ -92,12 +94,43 @@ end
             derivative = includes_seed ? 1 + sum(prefix .+ 1) : sum(prefix)
             @test op(seed, xs, gain) ≈ expected
             runtime = Enzyme.autodiff(Enzyme.Reverse,
-                g -> sum(op(includes_seed ? g : 0.0, xs, g)),
-                Enzyme.Active, Enzyme.Active(gain))
-            @test only(only(runtime)) ≈ derivative atol=1e-12
+                (g, sequence) -> sum(op(includes_seed ? g : 0.0, sequence, g)),
+                Enzyme.Active, Enzyme.Active(gain), Enzyme.Const(xs))
+            @test first(only(runtime)) ≈ derivative atol=1e-12
         end
         @test xs == original
     end
+end
+
+# Plain Enzyme over a closure that captures its data must first prove the
+# closure is never written. On Julia 1.12 and 1.13 that proof follows each
+# Float64 read from the captured sequence and calls its store into the scan's
+# result a capture (`EnzymeMutabilityException`). Loops without RK, such as
+# `xs .* g`, fail the same way, and one shape returns 0.0 for the primal and
+# the derivative without an error:
+# `benchmark/repro_enzyme_closure_float_store_readonly.jl`. `prepare_ad`
+# passes data as `Constant` contexts. `Const(f)` and a `Const` data argument
+# differentiate the same call exactly.
+@testset "plain Enzyme over a closure capturing the sequence" begin
+    gain = 0.7
+    xs = sin.(1:5)
+    original = copy(xs)
+    derivative = sum(cumsum(xs))
+    k = prepare(summed; want=:total)
+    captured = g -> k(xs, g)
+    reverse_gradient(f) = only(only(Enzyme.autodiff(Enzyme.Reverse, f, Enzyme.Active,
+                                                    Enzyme.Active(gain))))
+    @test reverse_gradient(Enzyme.Const(captured)) ≈ derivative atol=1e-12
+    argument = Enzyme.autodiff(Enzyme.Reverse, (g, sequence) -> k(sequence, g),
+                               Enzyme.Active, Enzyme.Active(gain), Enzyme.Const(xs))
+    @test first(only(argument)) ≈ derivative atol=1e-12
+    if VERSION >= v"1.12"
+        # Upstream Enzyme readonly-proof gap; drop with docs/src/constraints.md.
+        @test_broken reverse_gradient(captured) ≈ derivative atol=1e-12
+    else
+        @test reverse_gradient(captured) ≈ derivative atol=1e-12
+    end
+    @test xs == original
 end
 
 # A declared scan output converts every assignment to its type, so the
