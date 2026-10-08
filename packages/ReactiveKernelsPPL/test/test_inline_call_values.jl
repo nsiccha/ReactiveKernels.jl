@@ -189,6 +189,22 @@ end
         end for i in eachindex(d.yc)))
 end
 
+@testset "ordinal locations" begin
+    sigmoid(z) = 1 / (1 + exp(-z))
+    ords = (; x, yc)
+    check(lowered(quote
+        c ~ Ordered(Normal(0, 1), 2)
+        b ~ Normal(0, 1)
+        yc .~ OrderedLogistic.(shiftp(b .* x, 0.2), Ref(c))
+    end, ords; conditioned=(:yc,)), ords, (p, d) ->
+        sum(logpdf.(Normal(0, 1), p.c)) + logpdf(Normal(0, 1), p.b) +
+        sum(begin
+            eta = p.b * d.x[i] + 0.2
+            below(k) = k == 0 ? 0.0 : k == 3 ? 1.0 : sigmoid(p.c[k] - eta)
+            log(below(d.yc[i]) - below(d.yc[i] - 1))
+        end for i in eachindex(d.yc)))
+end
+
 @testset "a submodel body's inline call resolves in its own module" begin
     @test !isdefined(@__MODULE__, :offset_by)
     data = (; x, y)
