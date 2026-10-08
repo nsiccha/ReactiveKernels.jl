@@ -1433,6 +1433,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     end
     indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
         Set{Symbol}(r.response for r in responses))
+    # A caller-owned sampling RHS observed in a dotted `@plate` cell
+    # (`y[i] .~ LogDensity.(f, loc[i], s)`).
+    indexed_external = intersect(Set{Symbol}(first(c) for c in plate_ctx),
+        Set{Symbol}(p.name for p in external_observations))
     # Explicit loops select each operand at the authored indices. Keep a
     # literal response iterator on that same gather path as eachindex/axes;
     # the older UnitRange response contract only checked full-column cover.
@@ -1447,7 +1451,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
-            if k in indexed_observations))
+            if k in indexed_observations || k in indexed_external))
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -2680,6 +2684,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     # every rejection.
     detnames = Set{Symbol}()
     valueaxisnames = Set{Symbol}()
+    definitions = Dict{Symbol,Any}()
     for arg in args
         arg isa Expr || continue
         st = try
@@ -2690,8 +2695,13 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         if st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             push!(detnames, st.args[1])
             _is_levels_binding_rhs(st.args[2]) || push!(valueaxisnames, st.args[1])
+            definitions[st.args[1]] = st.args[2]
         end
     end
+    # Definitions a response may observe: those reading only data (a
+    # literal-only definition is not built yet as a response).
+    response_defs = Set{Symbol}(name for (name, rhs) in definitions
+        if !isempty(_value_symbols(rhs)) && _data_only(rhs, data, definitions))
     for arg in args
         if arg isa LineNumberNode
             line = arg.line
@@ -2791,20 +2801,27 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                     nothing, nothing, rdims, slices))
                 continue
             end
-            _reject_derived_ref_lhs(st.args[2], detnames)
-            arr = _external_array_lhs(st.args[2], st.args[3], data, valueaxisnames)
-            arr === nothing && (arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames))
-            if arr !== nothing
-                alhs, adims = arr
-                _claim!(seen, seelines, alhs, line)
-                _reject_target(st.args[3], alhs)
-                push!(sample, SampleStmt(alhs, st.args[3], bc, nothing,
-                    nothing, nothing, adims))
-                continue
+            # A data-only definition observed at selected entries
+            # (`y[eachindex(y)] .~ …`, which a `@plate` loop over `y` writes)
+            # is a derived response, read like the same value bound as data.
+            derived_range = _derived_response_range(st.args[2], bc, response_defs)
+            if !derived_range
+                _reject_derived_ref_lhs(st.args[2], detnames)
+                arr = _external_array_lhs(st.args[2], st.args[3], data, valueaxisnames)
+                arr === nothing && (arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames))
+                if arr !== nothing
+                    alhs, adims = arr
+                    _claim!(seen, seelines, alhs, line)
+                    _reject_target(st.args[3], alhs)
+                    push!(sample, SampleStmt(alhs, st.args[3], bc, nothing,
+                        nothing, nothing, adims))
+                    continue
+                end
             end
-            lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data,
+            lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde,
+                derived_range ? union(data, (st.args[2].args[1],)) : data,
                 level_bindings)
-            if bc && st.args[2] isa Symbol
+            if bc && (st.args[2] isa Symbol || derived_range)
                 # A derived response observes an existing deterministic
                 # definition (`ly = log.(earn)` then `ly .~ ...`) instead
                 # of claiming a fresh name; either order lowers (the
@@ -4348,10 +4365,21 @@ _is_sample(st::Expr) =
 _is_broadcast_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :.~
 
+# A `.~` range over a definition reading only data observes that derived
+# response at the selected entries, as a range over the same value bound as
+# data does. Levels, matrix and subset indices size coefficient priors.
+function _derived_response_range(lhs, bc::Bool, response_defs::Set{Symbol})
+    bc && Meta.isexpr(lhs, :ref) && length(lhs.args) >= 2 &&
+        lhs.args[1] isa Symbol && lhs.args[1] in response_defs || return false
+    index = lhs.args[2]
+    return !(_is_levels_call(index) || _is_axes2_call(index) || Meta.isexpr(index, :ref))
+end
+
 # A ref LHS over a deterministic definition: ranges cover raw data
 # columns and levels/matrix sizings size coefficient priors — neither
-# observes a derived column (broadcast bare: `ly .~ ...`). Runs before
-# `_sample_lhs` so the message names the position, not the fallout.
+# observes a derived column that reads parameters (broadcast bare:
+# `ly .~ ...`). Runs before `_sample_lhs` so the message names the
+# position, not the fallout.
 function _reject_derived_ref_lhs(lhs, detnames::Set{Symbol})
     lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
         lhs.args[1] isa Symbol && lhs.args[1] in detnames || return nothing

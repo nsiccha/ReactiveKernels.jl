@@ -80,13 +80,6 @@ end
                 mu .~ Normal.(mu, s)
             end,
             "response mu is a predictor definition"),
-        ("range over derived",
-            quote
-                ly = log.(earn)
-                mu = b1 .+ b2 .* x
-                ly[1:6] .~ Normal.(mu, s)
-            end,
-            "broadcast bare"),
         ("levels over definition",
             quote
                 c = x .* 2
@@ -118,7 +111,7 @@ end
             "is a design matrix"),
     )
     for (label, prog, msg) in cases
-        if label in ("scalar definition", "range over derived", "design matrix LHS")
+        if label in ("scalar definition", "design matrix LHS")
             # capability: scalar/matrix data values and valid indexed derived observations (P10a 0dejlw1; todo `1qlbn5b`).
             declarations = label == "design matrix LHS" ? quote
                 b[axes(X, 2)] .~ Normal.(0, 1)
@@ -301,6 +294,63 @@ _drc_at(kern, built, q) = Base.invokelatest(kern, unconstrain(built.layout, q))
         (; raw = [Float64[], Float64[]]))
     @test ebound.columns[:y] == Float64[]
     @test _drc_at(ekern, ebuilt, (a = 0.3, s = 0.7)) ≈ _drc_prior(0.3, 0.7) rtol = 1e-12
+end
+
+# A range over a derived response selects entries as a range over the same
+# value bound as data does, and a `@plate` loop over it writes that range
+# (snag rkppl-nested-one-931ad60f).
+@testset "derived response: ranges and plate cells" begin
+    q = (a = 0.3, s = 0.7)
+    for lhs in (:(y[1:5]), :(y[eachindex(y)]), :(y[axes(y, 1)]), :(y[:]))
+        _, bound, built, kern = _drc_kernel(quote
+                a ~ Normal(0, 1)
+                s ~ Exponential(1)
+                y = flatten_cells(raw)
+                $lhs .~ Normal.(a, s)
+            end, (:raw,))
+        @test bound.columns[:y] == _DRC_FLAT
+        @test _drc_at(kern, built, q) ≈ _drc_oracle(q.a, q.s, _DRC_FLAT) rtol = 1e-12
+    end
+    _, cbound, cbuilt, ckern = _drc_kernel(quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            y = flatten_cells(raw)
+            @plate for i in eachindex(y)
+                y[i] ~ Normal(a, s)
+            end
+        end, (:raw,))
+    for q in ((a = 0.3, s = 0.7), (a = -0.4, s = 1.6))
+        @test _drc_at(ckern, cbuilt, q) ≈ _drc_oracle(q.a, q.s, _DRC_FLAT) rtol = 1e-12
+    end
+    u = unconstrain(cbuilt.layout, q)
+    sampler = prepare_sampler(cbuilt, cbound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    sampler_value_and_gradient!(sampler, g, u)
+    @test g ≈ _findiff_grad(w -> Base.invokelatest(ckern, w), u) rtol = 1e-5 atol = 1e-7
+    # refused: a partial range observes only some entries, exactly as it is
+    # for the same values bound as data (whole-response observations,
+    # provisional user decision 1uhcm3b).
+    partial(lhs) = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        $lhs .~ Normal.(a, s)
+    end
+    derived = try
+        _drc_kernel(Expr(:block, :(y = flatten_cells(raw)), partial(:(y[1:4])).args...), (:raw,))
+        nothing
+    catch e
+        e
+    end
+    bound = try
+        bind_data(lower_rkppl(partial(:(y[1:4])), (:y,); conditioned = (:y,)), (; y = copy(_DRC_FLAT)))
+        nothing
+    catch e
+        e
+    end
+    @test derived isa ContractValidationError
+    @test bound isa ContractValidationError
+    @test replace(sprint(showerror, derived), r"\s+" => " ") ==
+        replace(sprint(showerror, bound), r"\s+" => " ")
 end
 
 @testset "derived response: elementwise and reduction values" begin
