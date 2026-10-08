@@ -245,17 +245,20 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         bound = prepare(C.data_only_result; bound = (; limits, rows, subjects))
         @test C.calls[] == length(subjects)
         # Bound inputs alone fix the domain, so the whole plate result is one
-        # hoisted value: no plate and no per-cell cache remain.
+        # hoisted value: no plate and no per-cell cache remain. Its only
+        # consumer, `flat`, then reads only bind-time values and is hoisted
+        # too, so no evaluation concatenates the shared cells.
         @test isempty(plates(bound.plan))
         @test isempty(caches(bound.plan))
+        @test !any(r -> only(r.outputs).name === :weights, bound.plan.recipes)
         hoisted = only(r for r in bound.plan.recipes
                        if r.op isa RK._BoundConstant &&
-                          only(r.outputs).name === :weights)
-        @test hoisted.op.value isa Vector{Vector{Float64}}
-        @test hoisted.op.value == [limits[r] for r in rows]
+                          only(r.outputs).name === :flat)
+        @test hoisted.op.value isa Vector{Float64}
+        @test hoisted.op.value == reduce(vcat, [limits[r] for r in rows])
         @test [bound(live) for live in lives] == expected
         @test C.calls[] == length(subjects)
-        @test hoisted.op.value == [limits[r] for r in rows]
+        @test hoisted.op.value == reduce(vcat, [limits[r] for r in rows])
         # More subjects change only the hoisted value, not the emitted residual.
         more = prepare(C.data_only_result; bound = (; limits = repeat(limits, 2),
             rows = vcat(rows, [r .+ 6 for r in rows]), subjects = 1:6))
@@ -331,6 +334,19 @@ import Enzyme
     @test ad_value_and_gradient(bound, live) ==
           ad_value_and_gradient(plain, live, limits, rows, subjects)
     @test ad_gradient(bound, live) == reduce(vcat, [limits[r] for r in rows])
+    # The hoisted plate's consumer `reduce(vcat, …)` is hoisted too. Left in
+    # the residual, it concatenated the shared constant cells on every
+    # evaluation, which native reverse mode rejected for this inlined spelling
+    # (snag native-reverse-a-8009a109).
+    flat = reduce(vcat, [limits[r] for r in rows])
+    inline = prepare(C.data_only_result_inline; want=:total,
+                     bound=(; limits, rows, subjects))
+    for ad in (prepare_ad(C.data_only_result_inline, backend, live; active=:live,
+                          want=:total, bound=(; limits, rows, subjects)),
+               prepare_ad(inline, backend, live; active=:live))
+        @test ad_value_and_gradient(ad, live) == (sum(flat .* live), flat)
+    end
+    @test live == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
     x = [1.0, 2.0, 3.0]
     plain = prepare_ad(C.data_only_result_live_axis, backend, x, limits, rows;
                        active=:live, want=:total)

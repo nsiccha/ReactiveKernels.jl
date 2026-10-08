@@ -162,8 +162,16 @@ end
     data = Dict{Symbol,Any}(:y => [0.2, 0.3], :g => [1, missing])
     plan = lower_rkppl(ast, data; conditioned = (:y,))
     @test_throws ContractValidationError bind_data(plan, data)
+    # A missing response entry is skipped by the whole-response statement
+    # (provisional USER 1uhcm3b); the observed row keeps its density.
     observed = copy(data)
     observed[:g] = [1, 2]
     observed[:y] = [0.2, missing]
-    @test_throws ContractValidationError bind_data(plan, observed)
+    bound = bind_data(plan, observed)
+    built = build_kernel(bound)
+    u = [0.2 * sin(i) for i in 1:built.layout.total]
+    nt = constrain(built.layout, u)
+    @test _query(built.spec, bound, :likelihood, u) ≈
+        logpdf(Normal(nt.a + nt.z[1] + nt.a, 0.7), 0.2)
+    _check_gradient(built.spec, bound, u)
 end

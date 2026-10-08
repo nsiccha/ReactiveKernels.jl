@@ -48,7 +48,9 @@ julia --startup-file=no --project=docs docs/make.jl
 
 `packages/test.jl` tests every package by default. Package names restrict it to
 those packages, and `--exclude=<name>` skips one. `RKPPL_TEST_SHARD=k/N` runs
-files k, k + N, … of the ReactiveKernelsPPL suite. Hosted `Run tests` runs that
+the k-th of N groups of ReactiveKernelsPPL test files, balanced by the minutes
+each file took in hosted CI (`packages/ReactiveKernelsPPL/test/shard_minutes.toml`).
+Hosted `Run tests` runs that
 suite as parallel shards, because a single job cannot finish it within GitHub's
 360-minute job limit. A failing test or test file does not stop the suite: every
 later file still runs, and the run then fails, listing each recorded failure.

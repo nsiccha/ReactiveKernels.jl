@@ -1104,6 +1104,18 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         matrix_values)
     detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
         env = shape_env)
+    # A `.~` response is observed data. A definition reading only data that
+    # it observes is that observation value, whatever shape lowering can
+    # prove: an undotted module call's result is model-level here
+    # (`y = f(raw)`). `bind_data` evaluates the definition once and
+    # validates its value as the response; a number is one observation, as
+    # when bound as data.
+    for nm in derived_response_names
+        get(detshape, nm, nothing) === :scalar || continue
+        rhs = detmap[nm]
+        !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
+            (detshape[nm] = :vector)
+    end
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
         rhs = detmap[nm]
