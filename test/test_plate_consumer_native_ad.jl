@@ -224,4 +224,72 @@ untyped_domain_loop(xs, s) = sum(x -> (x * s + log(s))^2, xs; init = 0.0)
     @test value ≈ untyped_domain_loop(vec(M), 1.3)
     @test gradient ≈ sum(2 * (x * 1.3 + log(1.3)) * (x + inv(1.3)) for x in M)
 end
+
+# A cell whose result is an inactive argument's element, or a field of one,
+# stores pointers into constant memory in the fresh pointwise buffer, which
+# then feeds an active result. Enzyme's static activity analysis rejects that
+# buffer exactly as it rejects plain `map(identity, groups)`
+# (`benchmark/repro_enzyme_constant_element_container.jl`, docs/src/constraints.md).
+struct AliasedSubject
+    xs::Vector{Float64}
+end
+@kernel identity_cells(groups, rates) = begin
+    per = plate(groups, Ref(rates)) do g, rates
+        identity(g)
+    end
+    flat = convert(Vector{Float64}, reduce(vcat, per; init = Float64[]))
+    total = sum(flat .* rates)
+end
+@kernel bare_cells(groups, rates) = begin
+    per = plate(groups) do g
+        g
+    end
+    total = sum(reduce(vcat, per) .* rates)
+end
+@kernel field_cells(subjects, rates) = begin
+    per = plate(subjects) do s
+        s.xs
+    end
+    total = sum(reduce(vcat, per) .* rates)
+end
+@kernel copied_cells(groups, rates) = begin
+    per = plate(groups) do g
+        copy(g)
+    end
+    total = sum(reduce(vcat, per) .* rates)
+end
+
+@testset "plate cells returning inactive argument storage under native Reverse" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    groups = [[0.5, 1.0, 1.0], [0.5], [1.0, 1.0]]
+    subjects = AliasedSubject.(groups)
+    rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    flat = reduce(vcat, groups)
+    expected = sum(flat .* rates)
+    saved = deepcopy(groups)
+    gradient_of(spec, data; bound = (;)) = begin
+        k = prepare(spec; bound)
+        args = isempty(bound) ? (data, rates) : (rates,)
+        @test k(args...) ≈ expected
+        ad = prepare_ad(k, backend, args...; active=:rates)
+        ad_value_and_gradient(ad, args...)
+    end
+    # Fresh cell results differentiate; so does a data-only plate under
+    # `bound=`, which preparation hoists out of the gradient.
+    for (spec, data, bound) in ((copied_cells, groups, (;)),
+                                (identity_cells, groups, (; groups)),
+                                (bare_cells, groups, (; groups)),
+                                (field_cells, subjects, (; subjects)))
+        value, gradient = gradient_of(spec, data; bound)
+        @test value ≈ expected
+        @test gradient ≈ flat
+    end
+    # The same cells over an unbound argument: the backend boundary.
+    for (spec, data) in ((identity_cells, groups), (bare_cells, groups),
+                         (field_cells, subjects))
+        @test_broken (gradient_of(spec, data)[2] ≈ flat)
+    end
+    @test groups == saved
+    @test [s.xs for s in subjects] == saved
+end
 end
