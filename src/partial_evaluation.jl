@@ -814,9 +814,11 @@ end
 The value-independent half of a partial evaluation: the bound HAVE ports (in
 the caller's order), the remaining HAVE ports (in plan order), the data-only
 `prefix` and the `residual` recipe partition, and the hoisted `constants`
-boundary between them (in constant-slot order). Everything here is a function
-of the plan and the bound PORT set alone, so a cached bound preparation
-(`prepare!(cache, …; bound = …)`) computes it once per boundary.
+boundary between them (in constant-slot order). `plate_slots` are the indices
+of the constants an authored residual plate reads as a batched (non-`Ref`)
+argument. Everything here is a function of the plan and the bound PORT set
+alone, so a cached bound preparation (`prepare!(cache, …; bound = …)`)
+computes it once per boundary.
 """
 struct _PartialBoundary
     bound::Vector{Value}
@@ -824,6 +826,7 @@ struct _PartialBoundary
     prefix::Vector{Recipe}
     residual::Vector{Recipe}
     constants::Vector{Value}
+    plate_slots::Vector{Int}
 end
 
 function _partial_boundary(p::Plan, bound_values::Vector{Value})
@@ -841,7 +844,24 @@ function _partial_boundary(p::Plan, bound_values::Vector{Value})
     remaining = Value[v for v in p.have if !(canon_id(g, v.id) in bound_ids)]
     prefix, residual, prefix_owned = _partial_split(p, bound_ids)
     constants = _partial_constants(p, prefix_owned, residual)
-    _PartialBoundary(bound_values, remaining, prefix, residual, constants)
+    _PartialBoundary(bound_values, remaining, prefix, residual, constants,
+                     _partial_plate_slots(g, residual, constants))
+end
+
+function _partial_plate_slots(g::Graph, residual::Vector{Recipe},
+                              constants::Vector{Value})
+    slot = Dict(canon_id(g, v.id) => index for (index, v) in enumerate(constants))
+    slots = Set{Int}()
+    for r in residual
+        r.op isa _AuthoredPlateOp || continue
+        atomic = typeof(r.op).parameters[2]
+        for (position, input) in enumerate(r.inputs)
+            position in atomic && continue
+            index = get(slot, canon_id(g, input.id), 0)
+            index == 0 || push!(slots, index)
+        end
+    end
+    sort!(collect(slots))
 end
 
 # The prefix plan: bound ports in, hoisted constants out.
@@ -867,11 +887,74 @@ function _partial_constant_recipes(constants::Vector{Value}, @nospecialize(hoist
     recipes
 end
 
+# A bound plate argument is a constant, so its value's class is known at
+# preparation even when its port declares no type. The native plate lowering
+# decides from an argument's TYPE whether it is a scalar, a one-dimensional or
+# rank-N axis, or a tuple (`_static_plate_axis_class`, `<: Number`,
+# `<: AbstractVector`); an undeclared port leaves those decisions to runtime
+# guards. `_bound_plate_class` names the class as the abstract type that makes
+# the same decisions a declared port of that class makes, so a bound `1:n`
+# domain lowers like a declared `UnitRange`. It is the class and not the
+# concrete type, so bindings of one class share one compiled residual
+# whatever their element types or extents (snag inline-plate-reb-7387f072:
+# keying on extents re-lowered at every new length). `nothing` keeps the
+# declared type: a rank-0 array, a `Broadcasted` or a struct keeps its runtime
+# guard. Unspecialized, like the rest of the rebinding path, so one compilation
+# serves every bound type.
+_bound_plate_class(@nospecialize(x)) = nothing
+_bound_plate_class(@nospecialize(x::Number)) = Number
+_bound_plate_class(@nospecialize(x::Tuple)) = Tuple
+function _bound_plate_class(@nospecialize(x::AbstractArray))
+    rank = ndims(x)
+    rank == 0 ? nothing : AbstractArray{<:Any,rank}
+end
+
+# One binding's class per plate slot: the key of its compiled residual.
+function _partial_plate_classes(b::_PartialBoundary, @nospecialize(hoisted))
+    classes = Vector{Any}(undef, length(b.plate_slots))
+    for (index, slot) in enumerate(b.plate_slots)
+        classes[index] = _bound_plate_class(hoisted[slot])
+    end
+    Tuple(classes)
+end
+
+# The residual recipes with each authored plate's batched bound arguments
+# narrowed to their binding's class. Only the argument's Value TYPE changes;
+# its identity, and every other recipe, are the boundary's own.
+function _partial_narrow_plate_inputs(g::Graph, b::_PartialBoundary,
+                                      @nospecialize(classes::Tuple))
+    narrowed = Dict{Int,Any}()
+    for (slot, class) in zip(b.plate_slots, classes)
+        class === nothing || (narrowed[canon_id(g, b.constants[slot].id)] = class)
+    end
+    isempty(narrowed) && return b.residual
+    map(b.residual) do r
+        r.op isa _AuthoredPlateOp || return r
+        atomic = typeof(r.op).parameters[2]
+        inputs = collect(Value, r.inputs)
+        changed = false
+        for (position, input) in enumerate(inputs)
+            position in atomic && continue
+            class = get(narrowed, canon_id(g, input.id), nothing)
+            class === nothing && continue
+            T = typeintersect(valtype(input), class)
+            (T === valtype(input) || T === Union{}) && continue
+            inputs[position] = Value{T}(input.id, input.name)
+            changed = true
+        end
+        changed || return r
+        Recipe(r.id, Tuple(inputs), r.outputs, r.op, r.cost, r.cse_key,
+               r.effectful, r.source)
+    end
+end
+
 # The residual plan for one binding: constant slots first, then the residual
-# recipes.
+# recipes, their plates' bound arguments narrowed to this binding's classes.
 function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
-    recipes = isempty(b.constants) ? b.residual :
-        vcat(_partial_constant_recipes(b.constants, hoisted), b.residual)
+    residual = _partial_narrow_plate_inputs(p.graph, b,
+                                            _partial_plate_classes(b, hoisted))
+    recipes = isempty(b.constants) ? residual :
+        vcat(_partial_constant_recipes(b.constants, hoisted), residual)
     _partial_subplan(p, b.remaining, p.want, recipes)
 end
 
@@ -911,13 +994,17 @@ end
 # pass is the only authority on whether it changes a plan, so a residual
 # containing authored plates runs it on every binding: a binding it rewrites
 # keeps the ordinary per-binding specialization on the cached plan and prefix,
-# and every binding it leaves alone shares the one template, whatever its
-# values' types or array extents. The pass declines cheaply, before any
-# evaluation, when a plate has nothing bound to specialize. A residual without
-# authored plates skips the pass and shares the template outright. Nothing is
-# kept per binding value, type or extent (snag inline-plate-reb-7387f072:
-# keying templates on bound array sizes re-lowered the ShinyRK simulation
-# graph at every new schedule length and kept one template per length).
+# and every binding it leaves alone shares the template of its plate classes
+# (`_partial_plate_classes`), whatever its values' element types or array
+# extents. A plate lowers differently for a scalar, vector, rank-N or tuple
+# bound argument, so each class has its own template; a residual whose plates
+# read no bound argument has the one template of the empty class tuple. The
+# pass declines cheaply, before any evaluation, when a plate has nothing bound
+# to specialize. A residual without authored plates skips the pass and shares
+# the template outright. Nothing is kept per binding value, element type or
+# extent (snag inline-plate-reb-7387f072: keying templates on bound array
+# sizes re-lowered the ShinyRK simulation graph at every new schedule length
+# and kept one template per length).
 #
 # Nothing here is on a kernel's call path, and the kernel types involved are
 # as varied as the graphs prepared, so an entry and a template are untyped
@@ -937,18 +1024,19 @@ struct _BoundTemplate
     lowered::Tuple   # the readable recipes after the constant slots
 end
 
-# The template slot before the first binding the inner-plate pass left alone.
+# A class's template before its first binding the inner-plate pass left alone.
 struct _UnbuiltTemplate end
 
-mutable struct _BoundEntry
-    const plan::Plan
-    const boundary::_PartialBoundary
-    const prefix::Any          # prepared prefix kernel, or `nothing` without constants
-    const plates::Bool         # residual authored plates: the inner-plate pass runs per binding
-    # A `_BoundTemplate`; the kernel itself when it has no constant slots;
-    # `nothing` (a residual whose leading slots are not exactly its
-    # constants: the per-binding path); or `_UnbuiltTemplate()`.
-    template::Any
+struct _BoundEntry
+    plan::Plan
+    boundary::_PartialBoundary
+    prefix::Any          # prepared prefix kernel, or `nothing` without constants
+    plates::Bool         # residual authored plates: the inner-plate pass runs per binding
+    # Per plate-class tuple: a `_BoundTemplate`; the kernel itself when it
+    # has no constant slots; or `nothing` (a residual whose leading slots are
+    # not exactly its constants: the per-binding path). An absent class is
+    # unbuilt.
+    templates::Dict{Any,Any}
 end
 
 function _bound_entry(p::Plan, @nospecialize(ports))
@@ -956,7 +1044,7 @@ function _bound_entry(p::Plan, @nospecialize(ports))
     prefix = isempty(boundary.constants) ? nothing :
              prepare(_partial_prefix_plan(p, boundary))
     plates = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
-    _BoundEntry(p, boundary, prefix, plates, _UnbuiltTemplate())
+    _BoundEntry(p, boundary, prefix, plates, Dict{Any,Any}())
 end
 
 _bound_hoisted(entry::_BoundEntry, @nospecialize(data::Tuple)) =

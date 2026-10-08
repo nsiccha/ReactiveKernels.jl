@@ -255,6 +255,7 @@ const _PPL_TEST_FILES = (
     "test_observation_shapes_reactant.jl",
     "test_array_definition_gathers.jl",
     "test_array_definition_gathers_reactant.jl",
+    "test_whole_value_gathers.jl",
     "test_plate_cells.jl",
     "test_array_cell_rows.jl",
     "test_array_cell_rows_reactant.jl",

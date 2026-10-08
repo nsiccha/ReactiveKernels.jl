@@ -223,6 +223,27 @@ untyped_domain_loop(xs, s) = sum(x -> (x * s + log(s))^2, xs; init = 0.0)
     value, gradient = ad_value_and_gradient(prepare_ad(k, backend, M, 1.3; active=:s), M, 1.3)
     @test value ≈ untyped_domain_loop(vec(M), 1.3)
     @test gradient ≈ sum(2 * (x * 1.3 + log(1.3)) * (x + inv(1.3)) for x in M)
+
+    # Bound arguments lower as their class declares (todo 0hc187j): a bound
+    # domain is the static axis, with no runtime axis test of its own (the
+    # live untyped `s` keeps its guard), and a bound scalar operand is
+    # computed above the loop.
+    for xs in ([0.25, -1.0, 2.0], 1:4, (0.5, 1.5), M)
+        bound = prepare(untyped_domain_cells; bound = (; xs))
+        code = string(readable_code(bound))
+        @test !occursin("_authored_plate_is_axis(xs)", code)
+        @test !occursin("_authored_plate_marker", code)
+        value, gradient = ad_value_and_gradient(
+            prepare_ad(bound, backend, 0.7; active=:s), 0.7)
+        @test value ≈ untyped_domain_loop(vec(collect(xs)), 0.7)
+        @test gradient ≈ sum(2 * (x * 0.7 + log(0.7)) * (x + inv(0.7)) for x in xs)
+    end
+    xs = [0.25, -1.0, 2.0]
+    bound = prepare(untyped_domain_cells; bound = (; s = 0.7))
+    value, gradient = ad_value_and_gradient(prepare_ad(bound, backend, xs; active=:xs), xs)
+    @test value ≈ untyped_domain_loop(xs, 0.7)
+    @test gradient ≈ [2 * (x * 0.7 + log(0.7)) * 0.7 for x in xs]
+    @test xs == [0.25, -1.0, 2.0]
 end
 
 # A cell whose result is an inactive argument's element, or a field of one,
