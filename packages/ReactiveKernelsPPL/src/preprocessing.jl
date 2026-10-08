@@ -69,20 +69,17 @@ end
     offset_recipe(shape; scalars, n_rows, broadcast) -> Union{Nothing,Expr}
 
 `_ppl_offset_<pred> = col1 .+ col2 .+ …` over offset-term columns, or
-`nothing` when the predictor has no offset terms. Scalar assignments in
-`scalars` expand over `n_rows` (a number or an expression over bound data)
-unless `broadcast` retains their scalar shape.
+`nothing` when the predictor has no offset terms. A sum with a scalar
+assignment from `scalars` gets `n_rows` rows (`_ppl_rows`; a number or an
+expression over bound data) unless `broadcast` retains its scalar shape.
 """
 function offset_recipe(shape::DesignShape; scalars = Set{Symbol}(), n_rows = 0,
         broadcast = false)
-    cols = Any[]
-    for b in shape.blocks
-        b.kind === OffsetTerm || continue
-        push!(cols, b.column in scalars && !broadcast ?
-            :(ones($n_rows) .* $(b.column)) : b.column)
-    end
+    cols = Any[b.column for b in shape.blocks if b.kind === OffsetTerm]
     isempty(cols) && return nothing
     total = foldl((a, c) -> :($a .+ $c), cols)
+    !broadcast && any(in(scalars), cols) &&
+        (total = Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), total, n_rows))
     name = offset_name(shape.predictor)
     return :($name = $total)
 end
