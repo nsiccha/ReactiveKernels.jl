@@ -1753,12 +1753,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         base = ex.args[1]
         base in data && length(ex.args) == 2 &&
             _literal_row_range(ex.args[2]) && return :vector
-        if base isa Symbol && (shape(base) === :array ||
-                _model_valued(base, detmap, env, Set{Symbol}()))
-            indices = Set{Symbol}(i for i in ex.args[2:end]
-                if i isa Symbol && _obs_axis(i, data, detmap, memo, active, env))
-            return _ref_shape(ex, union(data, indices))
-        end
+        _is_array_value_ref(ex, data, detmap, memo, active, env) &&
+            return _array_ref_shape(ex, data, detmap, memo, active, env)
         _is_gather(ex, data, detmap, env) || return :scalar
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
@@ -1807,13 +1803,30 @@ function _elementwise_shape(argshapes)
     return :scalar
 end
 
+# A read `A[...]` of an array value: a declared array, an array-valued
+# definition (`b = z * M`) or a module call's result.
+_is_array_value_ref(ex::Expr, data, detmap, memo, active, env) =
+    ex.args[1] isa Symbol && length(ex.args) >= 2 &&
+    (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
+        _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
+
+# The shape of a read of an array value. A data index gathers per
+# observation on either axis, also when the data are otherwise read only
+# whole; so does an index carrying the observation axis. A definition's
+# shape and the axis an enclosing broadcast inherits both read this one
+# rule, so naming a gather never changes its shape: `rg = b[g, 1]` and
+# `(b[g, 1] .+ b[h, 1]) ./ 2` are per observation alike.
+_array_ref_shape(ex::Expr, data, detmap, memo, active, env) =
+    _ref_shape(ex, i -> (i isa Symbol && i in data) ||
+        _obs_axis(i, data, detmap, memo, active, env))
+
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
 # array); every other ref keeps the slice-1 scalar shape. Predictor
 # coefficient roles classify by use site, independently of this shape.
-function _ref_shape(ex, data)
+function _ref_shape(ex, gathers)
     idx = ex.args[2:end]
     isempty(idx) && return :scalar
-    if any(i -> i isa Symbol && i in data, idx)
+    if any(gathers, idx)
         # Per-observation gather: scalar selection or an oriented matrix.
         any(i -> i === :(:), idx) && return :matrix
         return :vector
@@ -1864,11 +1877,11 @@ function _obs_axis(ex, data, detmap, memo, active, env)
     elseif ex.head === :ref
         # A gather from an array value follows its observation index on
         # either axis, including definitions such as `b = z * M`.
-        array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
-            (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
-                _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
+        array_base = _is_array_value_ref(ex, data, detmap, memo, active, env)
         array_base || _is_gather(ex, data, detmap, env) || return false
         any(_literal_row_range, ex.args[2:end]) && return true
+        array_base && return _array_ref_shape(ex, data, detmap, memo,
+            active, env) in (:vector, :matrix)
         return any(i -> _obs_axis(i, data, detmap, memo, active, env),
             ex.args[2:end])
     elseif ex.head === Symbol("'")
