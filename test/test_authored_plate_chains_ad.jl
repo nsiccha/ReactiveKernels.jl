@@ -236,6 +236,85 @@ end
     @test isapprox(g[2], gd; rtol = 1e-10)
 end
 
+# An arithmetic generator-sum cell runs fold-outer; plain reverse Enzyme
+# differentiates its tile passes. Its gradients match the same cell spelled
+# through a function the lowering does not recognize.
+module FoldSumAD
+using ReactiveKernels
+using ReactiveKernels: scan
+divide(a, b) = a / b
+@kernel cell(ts::Vector{Float64}, w::Vector{Float64}, s::Vector{Float64}) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    objective::Float64 = sum(abs2, out)
+    return objective
+end
+@kernel control(ts::Vector{Float64}, w::Vector{Float64}, s::Vector{Float64}) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(divide(w[j], t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    objective::Float64 = sum(abs2, out)
+    return objective
+end
+@kernel recurrence(steps, w::Vector{Float64}, s::Vector{Float64}, decay::Float64) = begin
+    out::Vector{Float64} = scan(steps, Ref(w), Ref(s), Ref(decay); init = 0.0) do carry, k, w, s, d
+        r = sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
+        next = muladd(d, carry, r)
+        (next, next)
+    end
+    objective::Float64 = sum(abs2, out)
+    return objective
+end
+end
+
+@testset "Fold-outer arithmetic sum cell under plain reverse Enzyme" begin
+    F = FoldSumAD
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    ts = collect(range(0.1, 5.0; length = 300))
+    w, s = [0.5, -0.25, 2.0], [1.0, 3.5, 6.0]
+    kernel, control = prepare(F.cell), prepare(F.control)
+    @test occursin("_plate_one_axis", string(ReactiveKernels.code_expr(kernel)))
+    for active in (:ts, :w, :s, (:w, :s))
+        v, g = ad_value_and_gradient(prepare_ad(kernel, backend, ts, w, s; active), ts, w, s)
+        v0, g0 = ad_value_and_gradient(prepare_ad(control, backend, ts, w, s; active), ts, w, s)
+        @test v == v0
+        @test all(map((a, b) -> isapprox(a, b; rtol = 1e-12), g isa Tuple ? g : (g,),
+                      g0 isa Tuple ? g0 : (g0,)))
+    end
+    # d/dw_j of Σ_t c_t² is 2 Σ_t c_t / (t + s_j).
+    c = [sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0) for t in ts]
+    _, g = ad_value_and_gradient(prepare_ad(kernel, backend, ts, w, s; active = :w), ts, w, s)
+    @test g ≈ [2 * sum(c ./ (ts .+ s[j])) for j in eachindex(w)]
+    # The same sum in a scan step runs in the strip region.
+    recurrence = prepare(F.recurrence)
+    @test occursin("scan_hoisted", string(ReactiveKernels.code_expr(recurrence)))
+    steps, decay = 0:299, 0.9
+    # The reference spells the sum as a loop and reads `s` as a `Constant`
+    # context: a generator holding the active `w` beside the constant `s`, or
+    # a closure capturing `s`, meets Enzyme's activity checks (§7aj).
+    function reference(w, s, decay)
+        carry, total = 0.0, 0.0
+        for k in steps
+            r = 0.0
+            for j in eachindex(w)
+                r = Base.add_sum(r, w[j] / (k + s[j]))
+            end
+            carry = muladd(decay, carry, r)
+            total += abs2(carry)
+        end
+        total
+    end
+    v0, gw = value_and_gradient(reference, backend, w, Constant(s), Constant(decay))
+    _, gd = value_and_gradient((d, w, s) -> reference(w, s, d), backend, decay,
+                               Constant(w), Constant(s))
+    v, g = ad_value_and_gradient(prepare_ad(recurrence, backend, steps, w, s, decay;
+                                            active = (:w, :decay)), steps, w, s, decay)
+    @test isapprox(v, v0; rtol = 1e-13)
+    @test isapprox(g[1], gw; rtol = 1e-10)
+    @test isapprox(g[2], gd; rtol = 1e-10)
+end
+
 module DenseColumnDoseOuterAD
 using ReactiveKernels
 @kernel cell(observations::UnitRange{Int}, shifts::Vector{Int},
