@@ -649,3 +649,65 @@ end
         @test _rows_primal_bytes(q, u) < want
     end
 end
+
+# A proven scalar location (a sampled scalar, a number, a scalar definition
+# or an intercept definition) stays a scalar: the observation plate
+# broadcasts it as a shared argument, and the kernel allocates no row
+# vector for it (snag rkppl-scalar-loc-b96d576a).
+@testset "scalar locations stay scalar" begin
+    D = Distributions
+    y = [0.3, -1.2, 2.1, 0.7]
+    yc = [1, 0, 3, 2]
+    yb = [1, 0, 1, 1]
+    lg(v) = 1 / (1 + exp(-v))
+    prior = D.logpdf(D.Normal(0, 1), 0.4)
+    sterm = D.logpdf(D.Exponential(1), 1.3) + log(1.3)
+    intercept = Meta.parse("""begin
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        eta = a
+        y .~ Normal.(eta, s)
+    end""")
+    defined = Meta.parse("""begin
+        lm ~ Normal(0, 1)
+        s ~ Exponential(1)
+        m = exp(lm)
+        y .~ Normal.(m, s)
+    end""")
+    cases = [
+        (_VALUE_NORMAL, Dict{Symbol,AbstractVector}(:y => y),
+            (; mu = 0.4, s = 1.3),
+            prior + sterm + sum(D.logpdf.(D.Normal(0.4, 1.3), y))),
+        (intercept, Dict{Symbol,AbstractVector}(:y => y),
+            (; a = 0.4, s = 1.3),
+            prior + sterm + sum(D.logpdf.(D.Normal(0.4, 1.3), y))),
+        (defined, Dict{Symbol,AbstractVector}(:y => y),
+            (; lm = 0.4, s = 1.3),
+            prior + sterm + sum(D.logpdf.(D.Normal(exp(0.4), 1.3), y))),
+        (Meta.parse("""begin
+            a ~ Normal(0, 1)
+            y .~ Poisson.(exp.(a))
+        end"""), Dict{Symbol,AbstractVector}(:y => yc), (; a = 0.4),
+            prior + sum(D.logpdf.(D.Poisson(exp(0.4)), yc))),
+        (Meta.parse("""begin
+            a ~ Normal(0, 1)
+            y .~ Bernoulli.(logistic.(a))
+        end"""), Dict{Symbol,AbstractVector}(:y => yb), (; a = 0.4),
+            prior + sum(D.logpdf.(D.Bernoulli(lg(0.4)), yb))),
+    ]
+    for (prog, cols, q, want) in cases
+        bound, built, _, u = _rows_sampler(prog, cols)
+        src = string(kernel_expr(bound, built.layout))
+        @test occursin(r"_ppl_lp_\w+::Number = ", src)
+        @test !occursin("_ppl_rows", src) && !occursin("hcat(ones", src)
+        @test _value_posterior(prog, cols, q) ≈ want rtol = 1e-12
+        _check_gradient(built.spec, bound, u)
+    end
+    # No allocation proportional to the rows: less than half a row vector.
+    n = 1000
+    yl = Dict{Symbol,AbstractVector}(:y => collect(range(-1, 1; length = n)))
+    for prog in (_VALUE_NORMAL, intercept, defined)
+        _, _, q, u = _rows_sampler(prog, yl)
+        @test _rows_primal_bytes(q, u) < 4n
+    end
+end

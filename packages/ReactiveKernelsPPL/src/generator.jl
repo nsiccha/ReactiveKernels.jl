@@ -444,7 +444,11 @@ function _predictor_statements(plan::StructuralPlan)
         # against the rows would, rather than a ones vector per summand.
         rows && (rhs = Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs,
             _located_rows_source(plan, pred)))
-        push!(stmts, :($lp = $rhs))
+        # A proven scalar declares its type, so plates statically read it
+        # as a shared argument rather than through a runtime axis test.
+        push!(stmts, _predictor_value_type(plan, pred) === :Number &&
+            _scalar_valued_predictor(plan, pred) ?
+            :($lp::Number = $rhs) : :($lp = $rhs))
     end
     return stmts
 end
@@ -2204,6 +2208,7 @@ end
 # shape guard. Ordinary vector designs keep their existing annotation.
 function _predictor_value_type(plan::StructuralPlan, pred::PredictorSpec)
     _broadcast_affine(plan, pred) || return :AbstractVector
+    _scalar_valued_predictor(plan, pred) && return :Number
     scalar = all(pred.terms) do t
         t.kind === InterceptTerm && return true
         t.kind in (ContinuousTerm, OffsetTerm) &&
