@@ -169,25 +169,25 @@ end
     # over the packed coordinate (the planner inlines them, sharing the
     # coordinate read with the Jacobian term via structural CSE).
     @test transform_statements(sig) == Expr[
-        :(sigma::Float64 = positive_bijector().constrain(sum(view(unconstrained, 5:5)))),
+        :(sigma::Float64 = positive_bijector().constrain(unconstrained[5])),
     ]
     @test jacobian_term(sig) ==
-        :(positive_bijector().logjac(sum(view(unconstrained, 5:5))))
+        :(positive_bijector().logjac(unconstrained[5]))
     @test transform_statements(nu) ==
-        Expr[:(nu::Float64 = sum(view(unconstrained, 6:6)))]
+        Expr[:(nu::Float64 = unconstrained[6])]
     @test jacobian_term(nu) === nothing
     uentry = LayoutEntry(:sampled, nothing, :p, [:p], 2, 1, :logistic)
     @test transform_statements(uentry) == Expr[
-        :(p::Float64 = unit_bijector().constrain(sum(view(unconstrained, 2:2)))),
+        :(p::Float64 = unit_bijector().constrain(unconstrained[2])),
     ]
     @test jacobian_term(uentry) ==
-        :(unit_bijector().logjac(sum(view(unconstrained, 2:2))))
+        :(unit_bijector().logjac(unconstrained[2]))
     # Interval transform: parameterized bounds ⇒ hand-rolled (not a bijector
     # splice) — affine-logistic forward/inverse edges + bounded jacobian.
     blo, bhi = -2.0, 3.0
     ientry = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, blo, bhi)
     @test transform_statements(ientry) == Expr[
-        :(_ppl_int_q::Float64 = sum(view(unconstrained, 3:3))),
+        :(_ppl_int_q::Float64 = unconstrained[3]),
         :(q::Float64 = $blo + ($bhi - $blo) / (1 + exp(-_ppl_int_q))),
         :(_ppl_int_q::Float64 = log(q - $blo) - log($bhi - q)),
     ]
@@ -196,13 +196,20 @@ end
     # edges; the Jacobian is the bare unconstrained coordinate (Stan kernel).
     centry = LayoutEntry(:sampled, nothing, :c, [:c], 4, 1, :upper, NaN, bhi)
     @test transform_statements(centry) == Expr[
-        :(_ppl_up_c::Float64 = sum(view(unconstrained, 4:4))),
+        :(_ppl_up_c::Float64 = unconstrained[4]),
         :(c::Float64 = $bhi - exp(_ppl_up_c)),
         :(_ppl_up_c::Float64 = log($bhi - c)),
     ]
-    @test jacobian_term(centry) == :(sum(view(unconstrained, 4:4)))
-    @test coordinate_read(3) == :(sum(view(unconstrained, 3:3)))
+    @test jacobian_term(centry) == :(unconstrained[4])
+    @test coordinate_read(3) == :(unconstrained[3])
     @test block_read(2, 4) == :(view(unconstrained, 2:5))
+    # A two-axis array reshapes its packed Float64 slice without a copy.
+    zentry = LayoutEntry(:array, nothing, :Z, Symbol.("Z.", 1:6), 7, 6,
+        :identity, NaN, NaN, [2, 3], LayoutEntry[], nothing)
+    @test transform_statements(zentry) == Expr[
+        :(_ppl_arrflat_Z::AbstractVector{Float64} = unconstrained[7:12]),
+        :(Z::Matrix{Float64} = reshape(_ppl_arrflat_Z, 2, 3)),
+    ]
 end
 
 @testset "name hygiene" begin
