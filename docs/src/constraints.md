@@ -488,8 +488,17 @@ and lock the one Reactant 0.2.289 lifted:
   through slower generic methods, and Base's own mixed scalar/array `hvcat`
   infers no concrete result type. The tensorized body keeps its own
   concatenation lowering. Concatenation inside an opaque helper the kernel
-  calls, `cat`, `stack` and non-dense operands (views, adjoints) keep Base's
-  methods and remain the backend's limitation.
+  calls, `cat`, `stack`, folds such as `reduce(vcat, A; init)` and non-dense
+  operands (views, adjoints) keep Base's methods and remain the backend's
+  limitation. The fold reaches `vcat(acc, a)` once per element, so
+  per-element arrays that are constant data at evaluation (a non-active
+  ragged argument) fail even when only the fold's result meets an active
+  value; `reduce(vcat, A)` without `init` differentiates, and
+  `repro_enzyme_mixed_activity_concat.jl` includes both. A fold over bound
+  data, or over a plate result hoisted at preparation (BRM reader programs
+  flatten plate results with exactly this fold), runs at preparation and is
+  never differentiated. The local Enzyme `dogfood` line repairs Base's
+  concatenation inside Enzyme, so there the fold differentiates unchanged.
 - Native Enzyme 0.13.210 reverse on Julia 1.12.7 cannot compile Base's
   `hvcat` of a block literal that mixes scalars with arrays, such as
   `[A v; 0 0 1]` (`IllegalTypeAnalysisException` in `hvncat_fill!`), even
