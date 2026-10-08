@@ -7712,8 +7712,9 @@ end
 # admits stated-Normal coefficients through the ordinary value path,
 # while a bare use
 # keeps them scalar — naming a stated name must not re-bucket it.
+# A retained value keeps its name for every reader, so a scale reads it.
 _is_scale_predictor_def(s::Symbol, ctx, allow_stated::Bool) =
-    haskey(ctx.detmap, s) && !(s in ctx.plate_names) &&
+    haskey(ctx.detmap, s) && !(s in ctx.plate_names) && s ∉ ctx.value_defs &&
     !_derived_reads_latent(s, ctx) &&
     (get(ctx.detshape, s, :scalar) === :vector ||
         _is_factor_index_def(ctx.detmap[s], ctx) ||

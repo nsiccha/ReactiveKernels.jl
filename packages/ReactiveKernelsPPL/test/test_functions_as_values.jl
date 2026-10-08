@@ -657,6 +657,15 @@ _fv_reads(ex, sym::Symbol) = ex === sym ? 1 : ex isa Expr ?
             sum(logpdf.(Normal.(th.a .+ zg, th.s), y)) +
                 sum(logpdf.(Normal.(th.b .* zg, th.s), c))
         end),
+        # A location inlines the value while the scale reads its name.
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1)
+            v = exp.(a .+ b .* x)
+            y .~ Normal.(log.(v), v)
+        end, src -> _fv_calls(src, :exp) == 1, function (th)
+            v = exp.(th.a .+ th.b .* x)
+            sum(logpdf.(Normal.(log.(v), v), y))
+        end),
         # A composition read by two composed locations.
         (quote
             a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
