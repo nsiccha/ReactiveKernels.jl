@@ -268,6 +268,7 @@ const _PPL_TEST_FILES = (
     "test_base_value_names.jl",
     "test_rebinding_rows.jl",
     "test_inline_call_values.jl",
+    "test_inline_scalar_reads.jl",
 )
 
 include("sharding.jl")

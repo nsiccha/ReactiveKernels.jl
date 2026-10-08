@@ -8991,14 +8991,17 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
 end
 
 # A composition operand with no sub-predictor and no column that is not
-# itself a composition operator node (those recurse): a scalar value.
+# itself a composition operator node (those recurse): a scalar value. A
+# column read only wholly (`1 + sum(x)^2`, `sum(th) / 2`) leaves a scalar
+# too, as the named definition `m = 1 + sum(x)^2` is one scalar leaf.
 function _is_composed_scalar_expr(node, ctx)
     node isa Number && return true
     node isa Expr || return false
     Meta.isexpr(node, :call) && !isempty(node.args) &&
         node.args[1] in REDUCTION_FNS && return true
     _composed_has_sub(node, ctx, true) && return false
-    _reads_column(node, ctx) && return false
+    _reads_column(node, ctx) && _canon_shape(node, ctx) !== :scalar &&
+        return false
     _is_composed_map(node) && return false
     node.head === :call && !isempty(node.args) &&
         node.args[1] in (:.*, :.+, :.-, :*) && return false
