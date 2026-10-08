@@ -1,5 +1,6 @@
 module PlateConsumerNativeADTests
 using ReactiveKernels, DifferentiationInterface, Enzyme, Test
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: gamma
 
 pack_lanes(lanes) = vec(stack(lanes))
 @kernel weighted_columns(q, X, weights) = begin
@@ -22,6 +23,54 @@ end
         cell
     end
     total::Float64 = sum(pointwise)
+end
+
+@kernel guarded_gamma_plates(y1::Vector{Float64}, y2::Vector{Float64},
+                             scale::Float64) = begin
+    p1 = plate(y1, scale) do y, s
+        density::Float64 = s > 0 ? gamma(2.0, 1.0 / s).logpdf(y) : -Inf
+        density
+    end
+    p2 = plate(y2, scale) do y, s
+        density::Float64 = s > 0 ? gamma(2.0, 1.0 / s).logpdf(y) : -Inf
+        density
+    end
+    total::Float64 = sum(p1) + sum(p2)
+    return total
+end
+
+@testset "native Reverse keeps nested endpoint guards lazy in scalar plates" begin
+    y1 = [0.55, 0.6, 0.65, 0.7]
+    y2 = [0.5, 0.75, 0.9]
+    for bound in (false, true)
+        kernel = bound ? prepare(guarded_gamma_plates; bound=(; y1, y2)) :
+            prepare(guarded_gamma_plates)
+        arguments(s) = bound ? (s,) : (y1, y2, s)
+        for scale in (0.4, -0.5)
+            args = arguments(scale)
+            ad = prepare_ad(kernel, AutoEnzyme(; mode=Enzyme.Reverse), args...;
+                            active=:scale)
+            value, gradient = ad_value_and_gradient(ad, args...)
+            if scale > 0
+                expected = sum(2log(inv(scale)) + log(y) - y / scale
+                               for y in (y1..., y2...))
+                derivative = sum(-2 / scale + y / scale^2
+                                 for y in (y1..., y2...))
+                @test value ≈ expected
+                @test gradient ≈ derivative
+            else
+                @test value == -Inf
+                @test gradient == 0.0
+            end
+        end
+        @test kernel(arguments(0.0)...) == -Inf
+    end
+    # Both response lengths may change without duplicating either loop body.
+    small = string(readable_code(prepare(guarded_gamma_plates; bound=(; y1, y2))))
+    large = string(readable_code(prepare(guarded_gamma_plates;
+        bound=(; y1=repeat(y1, 7), y2=repeat(y2, 5)))))
+    loops(code) = length(collect(eachmatch(r"(?m)^\s*for ", code)))
+    @test loops(small) == loops(large) == 2
 end
 
 @testset "bound split-arm plates under unannotated native Reverse" begin

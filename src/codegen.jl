@@ -1818,12 +1818,35 @@ function _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
     offsets
 end
 
+# Keep an authored branch in the containing native plate loop. Calling its
+# all-in-one source closure can make Enzyme Reverse enter a composed endpoint's
+# inactive logarithm when the condition reads a shared scalar. The condition
+# and arm callables are the same branch parts used by plate partitioning and
+# tensorized execution; emitting them here retains the authored lazy choice.
+function _native_plate_branch_expr(
+        branch::_KernelBranch{CI,TI,EI}, reference, args) where {CI,TI,EI}
+    condition = Expr(:call, :(getfield($reference, :condition)),
+                     (args[i] for i in CI)...)
+    arm_expr(arm, field, indices) = begin
+        arm_reference = :(getfield($reference, $(QuoteNode(field))))
+        selected = Any[args[i] for i in indices]
+        arm isa _KernelBranch ? _native_plate_branch_expr(arm, arm_reference, selected) :
+            Expr(:call, arm_reference, selected...)
+    end
+    Expr(:if, condition,
+         arm_expr(branch.then_arm, :then_arm, TI),
+         arm_expr(branch.else_arm, :else_arm, EI))
+end
+
 function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots)
     if recipe.op isa _AuthoredScanOp
         _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
                                      slots.type_offset)
     else
-        push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
+        value = recipe.op isa _KernelSourceOp && recipe.op.f isa _KernelBranch ?
+            _native_plate_branch_expr(recipe.op.f, :(getfield($operation, :f)), args) :
+            Expr(:call, operation, args...)
+        push!(body.args, Expr(:(=), out, value))
     end
     body
 end
