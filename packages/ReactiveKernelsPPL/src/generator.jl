@@ -16,12 +16,15 @@ include("evidence.jl")
 
 
 """
-    build_kernel(plan) -> (; spec, layout)
+    build_kernel(plan) -> (; spec, layout, program)
 
 Validate, assign layout, emit, and evaluate a self-contained `@kernel`
 program for `plan`. `spec` is the `KernelSpec` (callable after `prepare`
 with `have=(:unconstrained, data…)`); `layout` is its
-[`LayoutTable`](@ref) (R10 read API for the sampler side).
+[`LayoutTable`](@ref) (R10 read API for the sampler side). `program` is the
+generated program the graph evaluates: [`prepare_query`](@ref) accepts any
+bound plan that generates the same program, with other row counts and data
+values, and refuses one that generates another.
 
 Concurrency: `build_kernel` is concurrency-safe. Independent plans may be
 built from concurrent tasks with no caller-side synchronization: a build
@@ -46,7 +49,7 @@ function _build_kernel_latest(plan::StructuralPlan)
     layout = assign_layout(plan)
     def = kernel_expr(plan, layout)
     spec = _eval_kernel_def(def)
-    return (; spec, layout)
+    return (; spec, layout, program = _program_identity(def))
 end
 
 """

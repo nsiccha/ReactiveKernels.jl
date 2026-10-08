@@ -76,7 +76,12 @@ over the sampler boundary (`:unconstrained` + data columns, data hoisted
 via `bound=`). Thin wrapper over `ReactiveKernels.prepare` with
 `want = workflow_wants(preset)` and the supplied `on_error` policy. The
 returned kernel maps an unconstrained `Vector{Float64}` to the preset node's
-value. The preparation itself is
+value. `plan` may be any binding that generates the same program as `built`
+(other row counts and data values); one that generates another program
+(other levels or parameter sizes, data element types, missing entries, an
+empty response, another broadcast shape) is refused with a
+`ContractValidationError` naming the first difference, since the graph would
+evaluate the wrong program for it. The preparation itself is
 world-age safe (callable from compiled functions), but the RAW returned
 kernel closes over build-time eval'd code: call it from top level, wrap
 the call in `Base.invokelatest`, or use [`SamplerQuery`](@ref), whose
@@ -96,11 +101,44 @@ shape).
 function prepare_query(built, plan::StructuralPlan, preset::Symbol; on_error = nothing)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_query requires a bound plan (bind_data first)"))
+    _check_built_program(built, plan)
     # World-age barrier: `built.spec` holds closures eval'd at build time
     # (newer than any already-compiled caller), so partial evaluation must
     # run at the latest world. Same barrier guards every call below.
     return Base.invokelatest(prepare, built.spec; have = _query_have(plan),
         want = workflow_wants(preset), bound = _query_bound(plan), on_error)
+end
+
+# A built graph evaluates the program its build generated. A binding that
+# generates the same program (other row counts and data values) evaluates on
+# it exactly as on its own build. A binding that generates another program
+# (other level labels or parameter sizes, data element types, missing
+# entries, an empty response, another broadcast shape) needs its own build;
+# evaluating the old graph on it can be silently wrong, so it is refused.
+# Values made outside `build_kernel` carry no `program` and are not checked.
+function _check_built_program(built, plan::StructuralPlan)
+    hasproperty(built, :program) || return nothing
+    program = _program_identity(kernel_expr(plan, assign_layout(plan)))
+    program == built.program && return nothing
+    throw(ContractValidationError("[query] this binding generates a " *
+        "different program than the one this graph was built from, so it " *
+        "needs its own `build_kernel(plan)`. First difference, " *
+        _program_difference(built.program, program)))
+end
+
+function _program_difference(built::Expr, other::Expr)
+    text(x) = x === nothing ? "(absent)" : sprint(print, readable_code(x))
+    sig(def) = def.args[1]
+    sig(built) == sig(other) || return "in the data arguments:\n  built: " *
+        text(sig(built)) * "\n  this:  " * text(sig(other))
+    body(def) = Any[x for x in def.args[2].args if !(x isa LineNumberNode)]
+    a, b = body(built), body(other)
+    for i in 1:max(length(a), length(b))
+        x, y = get(a, i, nothing), get(b, i, nothing)
+        x == y && continue
+        return "statement $i:\n  built: " * text(x) * "\n  this:  " * text(y)
+    end
+    return "in the program's layout"
 end
 
 """

@@ -232,3 +232,45 @@ end
         end
     end
 end
+
+@testset "a build refuses a binding that generates another program" begin
+    u3 = [0.1, -0.2, 0.3, 0.2, -0.1]
+    m = @rkppl begin
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        c[levels(g)] .~ Normal.(0, 1)
+        mu = a .+ c[g]
+        y .~ Normal.(mu, s)
+    end
+    y = _rr_y(6)
+    built = build_kernel(m(; g = [1, 2, 3, 1, 2, 3]) | (; y))
+    relabeled = m(; g = [2, 3, 4, 2, 3, 4]) | (; y)
+    # refused: the graph holds the build's level labels (1, 2, 3); on the
+    # labels 2, 3, 4 it would evaluate another model without an error
+    # (snag rkppl-opaque-loc-37de7b80)
+    @test_throws ContractValidationError prepare_query(built, relabeled, :likelihood)
+    @test_throws "needs its own `build_kernel(plan)`" prepare_query(built, relabeled, :likelihood)
+    own = build_kernel(relabeled)
+    nt = constrain(own.layout, u3)
+    @test Base.invokelatest(prepare_query(own, relabeled, :likelihood), u3) ≈
+        sum(logpdf.(Normal.(nt.a .+ nt.c[[1, 2, 3, 1, 2, 3]], nt.s), y)) rtol = 1e-12
+    # Same labels in another order and count: the same program.
+    regrouped = m(; g = [3, 1, 2, 2]) | (; y = y[1:4])
+    @test Base.invokelatest(prepare_query(built, regrouped, :likelihood), u3) ≈
+        sum(logpdf.(Normal.(nt.a .+ nt.c[[3, 1, 2, 2]], nt.s), y[1:4])) rtol = 1e-12
+
+    scalar = @rkppl begin
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        y .~ Normal.(a, s)
+    end
+    empty = build_kernel(scalar() | (; y = Float64[]))
+    # refused: an empty response's likelihood is the constant zero, so the
+    # empty build evaluates no observation for a binding with rows (snag
+    # rkppl-opaque-loc-37de7b80)
+    @test_throws ContractValidationError prepare_query(empty, scalar() | (; y), :likelihood)
+    # refused: the graph's data arguments are typed by the build's data
+    # (`Vector{Float64}`), so integer data generate another program
+    @test_throws "in the data arguments" prepare_query(
+        build_kernel(scalar() | (; y)), scalar() | (; y = [1, 2, 3]), :likelihood)
+end
