@@ -136,13 +136,20 @@ end
 # has no zero, so `_PlateTotalSeed` holds the place and the first cell starts
 # the total, which is `sum`'s value for a nonempty plate. An empty plate still
 # needs a zero without any cell: the seed carries the fallback element type `F`
-# (the axis marker's, or a scan consumer's output type), whose zero the total
-# then takes, and a non-numeric `F` asks for the cell type to be declared.
+# (the axis marker's element type, or a scan consumer's output type), whose
+# zero the total then takes, and a non-numeric `F` asks for the cell type to be
+# declared. The fallback is passed as the marker itself (or the type) and its
+# element type is taken only for a non-concrete `T`: an unconditional
+# `eltype(marker)` in the lowered code is a runtime call under native Enzyme
+# when the marker is not an array (Julia 1.12 fails to compile it).
 struct _PlateTotalSeed{F} end
 
-@inline _plate_total_seed(::Type{T}, ::Type{F}) where {T<:Number,F} = zero(T)
-@inline _plate_total_seed(::Type{T}, ::Type{F}) where {T,F} =
-    isconcretetype(T) ? zero(T) : _PlateTotalSeed{F}()
+@inline _plate_fallback_eltype(::Type{F}) where {F} = F
+@inline _plate_fallback_eltype(marker) = eltype(marker)
+
+@inline _plate_total_seed(::Type{T}, fallback) where {T<:Number} = zero(T)
+@inline _plate_total_seed(::Type{T}, fallback) where {T} =
+    isconcretetype(T) ? zero(T) : _PlateTotalSeed{_plate_fallback_eltype(fallback)}()
 
 @inline _plate_total_add(total, cell) = total + cell
 @inline _plate_total_add(::_PlateTotalSeed, cell) = cell
@@ -1327,6 +1334,29 @@ function _authored_plate_condition(callargs, roots, positions, atomic)
     foldl((left, right) -> Expr(:||, left, right), tests)
 end
 
+# The coordinates at which a scheduled recipe group runs. The group is emitted
+# once, inside the cell loop. A root that is one-dimensional when called runs
+# it at every coordinate. Otherwise it runs at the first coordinate and, when a
+# root holds an axis, again wherever a dimension that root keeps changes. A
+# group whose roots hold no axis (a scalar passed through an untyped port) is a
+# plate invariant: computed at the first coordinate and reused at every later
+# one. A root whose declared type is an array of rank two or more is an axis
+# and never one-dimensional, so its runtime tests are left out.
+function _authored_plate_schedule(callargs, roots, positions, atomic, callvalues,
+                                  index, previous, first_coordinate)
+    declared_axis(root) =
+        _static_plate_axis_class(valtype(callvalues[positions[root]])) === :axis
+    undeclared = Set(root for root in roots if !declared_axis(root))
+    unconditional = _authored_plate_runtime_unconditional(
+        callargs, undeclared, positions, atomic)
+    changed = _authored_plate_changed(
+        callargs, roots, positions, atomic, index, previous)
+    rerun = length(undeclared) < length(roots) ? changed : Expr(:&&,
+        _authored_plate_condition(callargs, roots, positions, atomic), changed)
+    condition = Expr(:||, first_coordinate, rerun)
+    unconditional === false ? condition : Expr(:||, unconditional, condition)
+end
+
 function _authored_plate_changed(callargs, roots, positions, atomic,
                                  index, previous)
     tests = Any[
@@ -1381,7 +1411,7 @@ end
 # compiled for the concrete argument types: this trait is a constant there, so
 # a one-dimensional domain drops the guard and its per-coordinate bookkeeping
 # exactly as a declared `UnitRange`/`Vector` domain does, while a runtime
-# scalar keeps the guard (and its value computed once above the loop).
+# scalar keeps the guard (and its value, computed at the first coordinate).
 @inline _plate_unconditional_root(::AbstractVector) = true
 @inline _plate_unconditional_root(::Tuple) = true
 @inline _plate_unconditional_root(_) = false
@@ -2092,31 +2122,34 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
             roots, root_positions, atomic, callvalues)
     end
 
-    # Recipes with the same dynamic root set share one scheduling guard. This
-    # preserves partial-dimension invariant caching. Common vector-plate groups
-    # are known to be safe to recompute at every coordinate and need no guard in
+    # Every cell recipe is emitted once. A group without dynamic roots is a
+    # plate invariant, computed here above the loop. Recipes with the same
+    # dynamic root set share one scheduling guard inside the loop
+    # (`_authored_plate_schedule`), which preserves partial-dimension invariant
+    # caching; their outputs are declared here, so a value computed at one
+    # coordinate is still bound at the next. Common vector-plate groups are
+    # known to be safe to recompute at every coordinate and need no guard in
     # either the primal or differentiated native kernel.
     for (roots, recipe_indices) in groups
         _authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues) && continue
-        assignments = Expr(:block)
         for recipe_index in recipe_indices
             recipe = inner.recipes[recipe_index]
             length(recipe.outputs) == 1 || throw(ArgumentError(
                 "an authored plate currently requires single-output scalar recipes"))
             output = only(recipe.outputs)
             out = locals[canon_id(inner.graph, output.id)]
+            if !isempty(roots)
+                push!(body.args, Expr(:local, out))
+                continue
+            end
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, false) for input in recipe.inputs]
-            _lower_plate_recipe_native!(assignments, recipe, args, out,
+            _lower_plate_recipe_native!(body, recipe, args, out,
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index),
                 get(scan_offsets, recipe_index, nothing))
         end
-        condition = _authored_plate_condition(
-            callargs, roots, root_positions, atomic)
-        push!(body.args, Expr(:if,
-            Expr(:call, GlobalRef(Base, :!), condition), assignments))
     end
 
     if pointwise_lhs !== nothing && !into
@@ -2133,7 +2166,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         # `zero(eltype(marker))`.
         push!(body.args, Expr(:(=), accumulator,
             Expr(:call, GlobalRef(@__MODULE__, :_plate_total_seed),
-                 plate_eltype, Expr(:call, GlobalRef(Base, :eltype), marker))))
+                 plate_eltype, marker)))
     end
 
     loopbody = Expr(:block)
@@ -2167,15 +2200,9 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
                 roots, root_positions, atomic, callvalues)
             append!(loopbody.args, assignments.args)
         else
-            has_axis = _authored_plate_condition(
-                callargs, roots, root_positions, atomic)
-            changed = _authored_plate_changed(
-                callargs, roots, root_positions, atomic, index, previous)
-            condition = Expr(:||,
-                _authored_plate_runtime_unconditional(
-                    callargs, roots, root_positions, atomic),
-                Expr(:&&, has_axis, Expr(:||, first_coordinate, changed)))
-            push!(loopbody.args, Expr(:if, condition, assignments))
+            push!(loopbody.args, Expr(:if, _authored_plate_schedule(
+                callargs, roots, root_positions, atomic, callvalues,
+                index, previous, first_coordinate), assignments))
         end
     end
     # The distinguished result is usually a recipe output bound in `locals`, but
@@ -4744,6 +4771,7 @@ catch
 end
 _opname(::_AuthoredPlateOp) = "plate"
 _opname(::_AuthoredScanOp) = "scan"
+_opname(op::_TypeOperation) = _opname(_type_operation_type(op))
 # Captured `@kernel` source is shown through its recipe's retained source
 # (`_recipe_label`, display.jl); the operation object itself is only "source".
 _opname(::_KernelSourceOp) = "source"
@@ -4756,6 +4784,7 @@ function _readable_callee(op)
     end
     name isa Symbol && !startswith(string(name), "#") ? name : :operation
 end
+_readable_callee(op::_TypeOperation) = _readable_callee(_type_operation_type(op))
 
 function _operation_slot(node)
     node isa Expr && node.head === :ref && length(node.args) == 2 &&

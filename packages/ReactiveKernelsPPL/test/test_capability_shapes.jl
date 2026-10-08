@@ -96,6 +96,14 @@ end
     values = Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), u)
     @test values.Z ≈ [logpdf(MvNormal(zeros(2), I), row) for row in eachrow(data.Z)]
     @test sum(values.Z) ≈ Base.invokelatest(prepare_query(fx.built, fx.bound, :likelihood), u)
+    data = (; data..., S=[2.0 0.3; 0.3 1.0])
+    fx = _cs_build(quote
+        b ~ Normal(0, 1)
+        eachrow(Z[1:3, 1:2]) .~ MvNormal([0.1, -0.2], S)
+    end, data)
+    values = Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), u)
+    @test values.Z ≈ [logpdf(MvNormal([0.1, -0.2], data.S), row) for row in eachrow(data.Z)]
+    @test sum(values.Z) ≈ Base.invokelatest(prepare_query(fx.built, fx.bound, :likelihood), u)
 
     ast = quote
         b ~ Normal(0, 1)

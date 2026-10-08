@@ -190,4 +190,38 @@ stepped_loop(base, slope, level) = base + slope * (level / 2.0)
         @test (times, idxs, ys) == saved
     end
 end
+
+# Untyped plate arguments emit each cell recipe once, inside the loop (snag
+# prepared-kernel-ae180d1a): a cell value cached across coordinates, and a
+# scalar invariant computed at the first coordinate, under native Reverse.
+@kernel untyped_domain_cells(xs, s) = begin
+    pointwise = plate(xs, s) do x, si
+        ls = log(si)
+        shifted = x * si + ls
+        shifted * shifted
+    end
+    total = sum(pointwise)
+    return total
+end
+untyped_domain_loop(xs, s) = sum(x -> (x * s + log(s))^2, xs; init = 0.0)
+
+@testset "untyped plate arguments under native Reverse" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    k = prepare(untyped_domain_cells)
+    for xs in ([0.25, -1.0, 2.0], 1:4, (0.5, 1.5)), s in (0.7, 1.9)
+        saved = copy(collect(xs))
+        @test k(xs, s) ≈ untyped_domain_loop(xs, s)
+        value, gradient = ad_value_and_gradient(
+            prepare_ad(k, backend, xs, s; active=:s), xs, s)
+        @test value ≈ untyped_domain_loop(xs, s)
+        @test gradient ≈ sum(2 * (x * s + log(s)) * (x + inv(s)) for x in xs)
+        @test collect(xs) == saved
+    end
+    # A matrix domain is not one-dimensional: its cells run through the
+    # coordinate-change test instead.
+    M = [0.25 -1.0; 2.0 0.5; 1.5 3.0]
+    value, gradient = ad_value_and_gradient(prepare_ad(k, backend, M, 1.3; active=:s), M, 1.3)
+    @test value ≈ untyped_domain_loop(vec(M), 1.3)
+    @test gradient ≈ sum(2 * (x * 1.3 + log(1.3)) * (x + inv(1.3)) for x in M)
+end
 end

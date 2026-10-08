@@ -1349,6 +1349,102 @@ end
     @test_throws BoundsError checked([1.0, 2.0], [1, 4], table)
 end
 
+# --- each cell recipe is emitted once (snag prepared-kernel-ae180d1a)
+# A plate argument whose declared type does not say it is one-dimensional (an
+# untyped port, bound or live) used to emit every cell recipe it reaches twice:
+# above the loop for a value that holds no axis, and inside the loop for one
+# that does. A scan in such a cell appeared four times. Each recipe is now
+# emitted once, inside the loop; a group whose roots hold no axis runs at the
+# first coordinate and is reused.
+@kernel _emitted_once_untyped(xs, scale::Float64) = begin
+    pointwise = plate(xs, Ref(scale)) do x, s
+        shifted = x * s + 0.75
+        shifted * shifted
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_typed(xs::Vector{Float64}, scale::Float64) = begin
+    pointwise = plate(xs, Ref(scale)) do x, s
+        shifted = x * s + 0.75
+        shifted * shifted
+    end
+    return sum(pointwise)
+end
+const _EMITTED_ONCE_CALLS = Ref(0)
+_emitted_once_log(s) = (_EMITTED_ONCE_CALLS[] += 1; log(s))
+@kernel _emitted_once_invariant(xs::Vector{Float64}, s) = begin
+    pointwise = plate(xs, s) do x, si
+        ls = _emitted_once_log(si)
+        x * ls
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_scan_cell(groups, scale::Float64) = begin
+    pointwise = plate(groups, Ref(scale)) do g, s
+        path = scan(g, Ref(s); init = 0.0) do carry, y, sc
+            next = carry * 0.125 + y * sc
+            (next, next)
+        end
+        sum(path)
+    end
+    return sum(pointwise)
+end
+@kernel _emitted_once_scan_alone(g, s::Float64) = begin
+    path = scan(g, Ref(s); init = 0.0) do carry, y, sc
+        next = carry * 0.125 + y * sc
+        (next, next)
+    end
+    return sum(path)
+end
+_emitted_count(kernel, literal) =
+    count(_ -> true, eachmatch(literal, string(readable_code(kernel))))
+
+@testset "authored plate native: each cell recipe is emitted once" begin
+    xs = collect(range(-1.0, 2.0; length = 7))
+    reference = sum((xs .* 0.5 .+ 0.75) .^ 2)
+    typed = prepare(_emitted_once_typed)
+    @test _emitted_count(typed, r"0\.75") == 1
+    for kernel in (prepare(_emitted_once_untyped),
+                   prepare(_emitted_once_untyped; bound = (; xs)),
+                   prepare(_emitted_once_untyped; bound = (; xs = 1:4)))
+        @test _emitted_count(kernel, r"0\.75") == 1
+    end
+    untyped = prepare(_emitted_once_untyped)
+    @test untyped(xs, 0.5) == typed(xs, 0.5) ≈ reference
+    @test untyped(1:4, 0.5) == typed(collect(1.0:4.0), 0.5)
+    @test untyped(Tuple(xs), 0.5) == typed(xs, 0.5)
+    @test untyped(Float64[], 0.5) == 0.0
+    @test prepare(_emitted_once_untyped; bound = (; xs = 1:4))(0.5) ==
+          typed(collect(1.0:4.0), 0.5)
+
+    # A group whose only root is a scalar in an untyped port is a plate
+    # invariant: it runs once per call. A value that holds no axis reaches it
+    # as its broadcast element, as it reaches every other cell recipe.
+    invariant = prepare(_emitted_once_invariant)
+    @test _emitted_count(invariant, r"_emitted_once_log\(") == 1
+    expected = sum(xs .* log(1.7))
+    for s in (1.7, fill(1.7), Ref(1.7))
+        _EMITTED_ONCE_CALLS[] = 0
+        @test invariant(xs, s) ≈ expected
+        @test _EMITTED_ONCE_CALLS[] == 1
+    end
+    # An axis-valued operand runs it at every coordinate.
+    scales = collect(range(0.5, 2.0; length = length(xs)))
+    _EMITTED_ONCE_CALLS[] = 0
+    @test invariant(xs, scales) ≈ sum(xs .* log.(scales))
+    @test _EMITTED_ONCE_CALLS[] == length(xs)
+
+    # A scan in such a cell keeps only its own emission.
+    groups = [[1.0, 2.0], [3.0], [0.5, 0.25, 4.0]]
+    alone = prepare(_emitted_once_scan_alone)
+    for kernel in (prepare(_emitted_once_scan_cell),
+                   prepare(_emitted_once_scan_cell; bound = (; groups)))
+        @test _emitted_count(kernel, r"0\.125") == _emitted_count(alone, r"0\.125")
+    end
+    @test prepare(_emitted_once_scan_cell)(groups, 0.5) ≈
+          sum(alone(g, 0.5) for g in groups)
+end
+
 # --- per-cell reductions over a few host indices (snag plate-cell-gathe-94d4a929)
 # A plate cell that superposes a few dose responses per observation. The
 # reporter authored it as vector temporaries (`observation .- shifts`,

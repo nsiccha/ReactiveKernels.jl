@@ -109,12 +109,14 @@ Main.ReactiveKernelsDocs.execute_example(
 ```
 
 Dependency-aware lowering also hoists complete invariants out of the broadcast
-loop. When `location` and `scale` are shared across the batch, the scale-only
-`log_scale` term is emitted once in the loop preamble, while the
+loop. When `location` and `scale` are declared scalars shared across the batch,
+the scale-only `log_scale` term is emitted once in the loop preamble, while the
 observation-dependent standardization stays in the loop at the shallowest
-boundary that binds it. The generated-kernel pane below is the exact plan built
-during this docs build; the source asserts the hoisted `log_scale` op precedes
-the loop:
+boundary that binds it. Through a port without a declared type, whose value can
+be a scalar or an axis, the term is still emitted once, inside the loop: it runs
+at the first coordinate when the value holds no axis and is reused after that.
+The generated-kernel pane below is the exact plan built during this docs build;
+the source asserts the hoisted `log_scale` op precedes the loop:
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(

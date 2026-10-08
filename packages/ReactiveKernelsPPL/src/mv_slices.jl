@@ -255,11 +255,11 @@ function _mvnormal_cholesky_slices_pointwise(o, B, mu, F)
     groups, k = _slice_count(o, B), _slice_length(o, B)
     _check_slice_vector_arg("the MvNormalCholesky mean", mu, groups, k)
     logdet = _cholesky_factor_logdet(F, k)
-    out = zeros(Float64, groups)
+    X = _slice_rows(o, B) .- _arg_rows(mu)
+    out = zeros(promote_type(eltype(X), eltype(F)), groups)
     for g in 1:groups
-        out[g] = _lower_solve_rows_logpdf(
-            (_, i) -> _slice_entry(o, B, g, i) - _arg_entry(mu, g, i),
-            (i, j) -> F[i, j], logdet, k, 1)
+        # Each slice is the shared core's one-row case.
+        out[g] = _lower_solve_rows_logpdf(X[g:g, :], F, logdet)
     end
     return out
 end
