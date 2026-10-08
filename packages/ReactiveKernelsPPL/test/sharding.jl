@@ -2,7 +2,8 @@
 # job cannot finish it within GitHub's 360-minute job limit (decision
 # `ReactiveKernels:hosted-acceptance.02l6qzp/decisions/2026-10-07T12-17-13-677-1i4nqqs`).
 #
-# `RKPPL_TEST_SHARD=k/N` runs files k, k + N, k + 2N, … of `_PPL_TEST_FILES`.
+# `RKPPL_TEST_SHARD=k/N` runs the k-th of N groups of `_PPL_TEST_FILES` with
+# about equal measured minutes (`shard_minutes.toml`, `_ppl_shard_assignment`).
 # `RKPPL_TEST_FILES=a.jl,b.jl` runs only the named files. Either way, every
 # file before the last selected one is still evaluated, with its tests
 # removed, because later files reuse its helper functions, constants and
@@ -23,6 +24,8 @@
 # continues, so one failure does not hide the results of every later file.
 # `_throw_ppl_test_failures` then fails the run and lists every recorded failure.
 
+using TOML
+
 function _ppl_test_shard(spec::AbstractString)
     isempty(spec) && return nothing
     m = match(r"^([0-9]+)/([0-9]+)$", spec)
@@ -32,8 +35,27 @@ function _ppl_test_shard(spec::AbstractString)
     return (k, n)
 end
 
-_ppl_shard_selects(::Int, ::Nothing) = true
-_ppl_shard_selects(i::Int, (k, n)::Tuple{Int,Int}) = mod1(i, n) == k
+# Measured minutes per test file, from `shard_minutes.toml`.
+_ppl_file_minutes(path = joinpath(@__DIR__, "shard_minutes.toml")) =
+    Dict{String,Float64}(file => minutes for (file, minutes) in TOML.parsefile(path))
+
+# The shard (1..n) of each file: the longest file first, each to the shard
+# with the fewest minutes so far (the lowest such shard on ties). A file
+# without a measurement weighs the median of its kind (Reactant or native).
+function _ppl_shard_assignment(files, n::Int, minutes::AbstractDict)
+    function median_minutes(reactant)
+        known = sort!([m for (file, m) in minutes if _ppl_reactant_file(file) == reactant])
+        return isempty(known) ? 1.0 : known[cld(length(known), 2)]
+    end
+    unlisted = Dict(kind => median_minutes(kind) for kind in (false, true))
+    weight(i) = get(minutes, files[i], unlisted[_ppl_reactant_file(files[i])])
+    load, shard = zeros(n), zeros(Int, length(files))
+    for i in sort!(collect(eachindex(files)); by = i -> (-weight(i), i))
+        shard[i] = argmin(load)
+        load[shard[i]] += weight(i)
+    end
+    return shard
+end
 
 function _ppl_test_names(spec::AbstractString)
     isempty(spec) && return nothing
@@ -52,15 +74,18 @@ _ppl_reactant_file(name::AbstractString) = occursin("reactant", name)
 
 # The files to evaluate and the indices of those that run their tests, for
 # the RKPPL_TEST_* settings in `env`.
-function _ppl_test_plan(files, env)
+function _ppl_test_plan(files, env; minutes = _ppl_file_minutes())
     backends = _ppl_test_backends(get(env, "RKPPL_TEST_BACKENDS", ""))
     shard = _ppl_test_shard(get(env, "RKPPL_TEST_SHARD", ""))
     names = _ppl_test_names(get(env, "RKPPL_TEST_FILES", ""))
     shard === nothing || names === nothing ||
         error("set RKPPL_TEST_SHARD or RKPPL_TEST_FILES, not both")
     kept = String[f for f in files if backends === :all || !_ppl_reactant_file(f)]
-    names === nothing &&
-        return kept, findall(i -> _ppl_shard_selects(i, shard), eachindex(kept))
+    if names === nothing
+        shard === nothing && return kept, collect(eachindex(kept))
+        k, n = shard
+        return kept, findall(==(k), _ppl_shard_assignment(kept, n, minutes))
+    end
     selected = map(names) do name
         i = findfirst(==(name), kept)
         i === nothing || return i
@@ -124,7 +149,9 @@ function _run_ppl_test_files(all_files, env)
         try
             if i in selected
                 println("RKPPL ", label)
+                started = time()
                 include(_continuing_tests(failures, label), path)
+                println("RKPPL ", label, " took ", round(time() - started; digits = 1), " s")
             else
                 include(_without_tests, path)
             end

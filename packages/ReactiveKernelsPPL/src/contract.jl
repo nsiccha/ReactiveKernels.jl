@@ -7409,9 +7409,14 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     end
     out_v = VectorParameter[]
     for p in vectors
-        if p.family === :simplex_dirichlet && p.size === nothing && p.extent_expr === nothing
+        if p.family === :simplex_dirichlet && p.size === nothing && p.extent_expr === nothing &&
+                (plan === nothing || all(s -> _reads_data_only(plan, s,
+                    Set{Symbol}(_all_names(plan)), Set{Symbol}()),
+                    _expr_value_symbols(p.args.arg1)))
             # Preserve inferred concentration sizing just like an authored
             # data expression, without changing the linked-width checks.
+            # A live concentration (`Dirichlet(3, a)`, `a .+ 0.5`) is not
+            # data; its structural length comes from `_dirichlet_size`.
             p = _with(p; extent_expr = Expr(:call, :length, p.args.arg1))
         end
         concentration_size = p.family === :simplex_dirichlet ?
