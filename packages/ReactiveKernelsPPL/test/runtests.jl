@@ -262,6 +262,7 @@ const _PPL_TEST_FILES = (
     "test_covariance_values_reactant.jl",
     "test_varying_values_reactant.jl",
     "test_cell_broadcast_arrays.jl",
+    "test_index_endpoints.jl",
 )
 
 include("sharding.jl")
@@ -274,10 +275,21 @@ end
 
 @testset "test-file shards" begin
     # Each file belongs to exactly one shard for every shard count.
-    for n in 1:8
-        @test all(i -> count(k -> _ppl_shard_selects(i, (k, n)), 1:n) == 1,
-                  eachindex(_PPL_TEST_FILES))
+    minutes = _ppl_file_minutes()
+    for n in 1:8, backends in ("all", "native")
+        kept, = _ppl_test_plan(_PPL_TEST_FILES, Dict("RKPPL_TEST_BACKENDS" => backends))
+        shards = [last(_ppl_test_plan(_PPL_TEST_FILES, Dict("RKPPL_TEST_BACKENDS" => backends,
+            "RKPPL_TEST_SHARD" => "$k/$n"); minutes)) for k in 1:n]
+        @test sort!(reduce(vcat, shards)) == collect(eachindex(kept))
     end
+    @test all(v -> v isa Float64 && v >= 0, values(minutes))
+    @test issubset(keys(minutes), _PPL_TEST_FILES)
+    # Longest first, each to the least-loaded shard; an unlisted file weighs
+    # the median of its kind.
+    @test _ppl_shard_assignment(("a.jl", "b.jl", "c.jl", "d.jl"), 2,
+        Dict("a.jl" => 5.0, "b.jl" => 3.0, "c.jl" => 2.0, "d.jl" => 2.0)) == [1, 2, 2, 1]
+    @test _ppl_shard_assignment(("a.jl", "b.jl", "c_reactant.jl"), 2,
+        Dict("a.jl" => 5.0, "x_reactant.jl" => 4.0)) == [1, 2, 1]
     @test _ppl_test_shard("") === nothing
     @test _ppl_test_shard("3/8") == (3, 8)
     # refused: a malformed or out-of-range spec selects no partition of the files
