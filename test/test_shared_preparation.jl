@@ -286,7 +286,7 @@ end
     @test all(k -> k.f === first(kernels).f && k.ast === first(kernels).ast, kernels)
     entries = collect(values(F.simulation.graph.preparations.cache.bound))
     @test length(entries) == 1
-    @test only(entries).template isa ReactiveKernels._BoundTemplate
+    @test only(values(only(entries).templates)) isa ReactiveKernels._BoundTemplate
     # The same through a caller-owned cache, and across a kernel's type.
     cache = PreparationCache()
     k1 = prepare!(cache, F.simulation; bound = (; kernel, plan = F.schedule(30, 2)))

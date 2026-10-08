@@ -668,6 +668,15 @@ observation plate runs inside the group plate, with no copy per group. The
 contribute zero. Native values and ordinary Enzyme reverse gradients are
 supported; RK does not implement compiled nested plate regions.
 
+Every observation a flat response admits runs on each index's entries the
+same way. This includes link families such as `BernoulliLogit.(eta[i])` and
+caller-owned sampling laws such as `LogDensity.(score, loc[i], sigma)`, where
+a visible `KernelSpec` law runs inside the inner observation plate. A
+per-index value may combine with shared values in any distribution argument,
+as in `Normal.(loc[i], dose[i] * sigma)`. The response may also be a
+definition that reads only data, such as `y = group_cells(raw, rows)`;
+binding evaluates it once and validates its arrays as the response.
+
 Outside a dotted cell, Julia refuses this shape, and so does binding.
 `y .~ Normal.(loc, sigma)` broadcasts `Normal` over the arrays of `y`, and an
 undotted cell `y[i] ~ Normal(…)` observes the array `y[i]` with a univariate

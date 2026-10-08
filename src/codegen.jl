@@ -1009,7 +1009,7 @@ function _authored_scan_hoistable(op::_AuthoredScanOp)
 end
 
 # A step operation that folds over a shared operand, which the strip region
-# runs across steps: Base's `evalpoly` (the coefficient-outer passes) or a
+# runs across steps: Base's `evalpoly` (the coefficient-outer chunks) or a
 # gathered generator sum (the dose-outer passes).
 _scan_step_fold(op) = false
 _scan_step_fold(::typeof(evalpoly)) = true
@@ -1499,6 +1499,7 @@ end
 # operation, or `nothing`. `dynamic(input)` names the plate roots an input
 # varies with; the fold's iterator and coefficients must vary with none.
 _plate_reduction_kind(op, recipe, recipe_index, roots, dynamic) = nothing
+# A generator sum: gathered (`get(A, K, D)`, dose-outer) or gather-free.
 function _plate_reduction_kind(op::_KernelSourceOp, recipe, recipe_index, roots,
                                dynamic)
     op.f isa _KernelReduction || return nothing
@@ -1506,8 +1507,8 @@ function _plate_reduction_kind(op::_KernelSourceOp, recipe, recipe_index, roots,
     for position in (II..., AI...)
         isempty(dynamic(recipe.inputs[position])) || return nothing
     end
-    (; kind = Val(:gather), recipe_index, recipe, roots, iterator = II,
-       init = XI, index = KI, source = AI)
+    (; kind = Val(op.f.index === nothing ? :sum : :gather), recipe_index, recipe,
+       roots, iterator = II, init = XI, index = KI, source = AI)
 end
 # A cell that is exactly Base's `evalpoly(x, c)` (an authored `evalpoly(x, c)`
 # over two ports is stored as the bare function, inputs in argument order)
@@ -1540,6 +1541,51 @@ function _inbounds_value(ex)
          Expr(:inbounds, :pop), value)
 end
 
+# The compile-time check of a generator-sum reduction (`_plate_reduction_ready`)
+# over the recipe's argument types: a HAVE port's per-cell element (or atomic
+# value) type, an invariant local's own type.
+function _plate_reduction_ready_call(reduction, inner::Plan, locals, root_positions,
+                                     plate_type_exprs, op_offset, plate_eltype)
+    graph = inner.graph
+    types = Any[haskey(root_positions, canon_id(graph, input.id)) ?
+                plate_type_exprs[canon_id(graph, input.id)] :
+                Expr(:call, GlobalRef(Base, :typeof), locals[canon_id(graph, input.id)])
+                for input in reduction.recipe.inputs]
+    Expr(:call, GlobalRef(@__MODULE__, :_plate_reduction_ready),
+         :($(Expr(:ref, _OPS_ARG, op_offset + reduction.recipe_index)).f),
+         plate_eltype, Expr(:curly, GlobalRef(Core, :Tuple), types...))
+end
+
+# A fold-outer pass computes the cell at every coordinate, so the plate's value
+# recipe must run at every coordinate, as it does for a domain value that is a
+# vector or tuple when called.
+function _plate_reduction_every_cell(ready, reduction, callargs, root_positions,
+                                     atomic, callvalues)
+    _authored_plate_unconditional_group(
+        reduction.roots, root_positions, atomic, callvalues) && return ready
+    Expr(:&&, _authored_plate_runtime_unconditional(
+        callargs, reduction.roots, root_positions, atomic), ready)
+end
+
+# The tiles of a fold-outer pass over a one-axis plate: `body` runs per tile
+# with `lo:hi` its positions in `cells`; `tile_cells(body)` runs `body` per cell
+# of the tile. A tile of `_PLATE_FOLD_TILE` cells keeps its accumulators and
+# cell values in the first-level cache across the passes.
+function _plate_fold_tiles(count, lo, hi, body)
+    tile = GlobalRef(@__MODULE__, :_PLATE_FOLD_TILE)
+    Expr(:for, :($lo = 1:$tile:$count), Expr(:block,
+        :($hi = $(GlobalRef(Base, :min))($lo + $tile - 1, $count)), body))
+end
+_plate_tile_cells(cells, position, lo, hi, cell, body) =
+    Expr(:for, :($position = $lo:$hi),
+        Expr(:block, :($cell = $(_inbounds_value(:($cells[$position])))), body))
+# The plate total adds the cells in coordinate order, as the cell loop does.
+_plate_fold_total(accumulator, cells, count, position, cell, entry) =
+    Expr(:for, :($position = 1:$count), Expr(:block,
+        :($cell = $(_inbounds_value(:($cells[$position])))),
+        :($accumulator = $(GlobalRef(@__MODULE__, :_plate_total_add))(
+            $accumulator, $(_inbounds_value(entry))))))
+
 function _lower_plate_reduction_native(::Val{:gather}, reduction, inner::Plan,
                                        locals, callargs,
                                        callvalues, raw_arguments, prepared_arguments,
@@ -1552,22 +1598,10 @@ function _lower_plate_reduction_native(::Val{:gather}, reduction, inner::Plan,
         inner, locals, callargs, callvalues, prepared_arguments, atomic,
         input, cell, true) for input in recipe.inputs]
     select(positions, cell) = arguments(cell)[collect(Int, positions)]
-    # Argument types for the compile-time check: a HAVE port's per-cell
-    # element (or atomic value) type, an invariant local's own type.
-    types = Any[haskey(root_positions, canon_id(graph, input.id)) ?
-                plate_type_exprs[canon_id(graph, input.id)] :
-                Expr(:call, GlobalRef(Base, :typeof), locals[canon_id(graph, input.id)])
-                for input in recipe.inputs]
-    ready = Expr(:call, GlobalRef(@__MODULE__, :_plate_reduction_ready),
-                 :($(Expr(:ref, _OPS_ARG, op_offset + reduction.recipe_index)).f),
-                 plate_eltype, Expr(:curly, GlobalRef(Core, :Tuple), types...))
-    if !_authored_plate_unconditional_group(
-            reduction.roots, root_positions, atomic, callvalues)
-        # The cell must run at every coordinate, as it does for a domain value
-        # that is a vector or tuple when called.
-        ready = Expr(:&&, _authored_plate_runtime_unconditional(
-            callargs, reduction.roots, root_positions, atomic), ready)
-    end
+    ready = _plate_reduction_every_cell(
+        _plate_reduction_ready_call(reduction, inner, locals, root_positions,
+                                    plate_type_exprs, op_offset, plate_eltype),
+        reduction, callargs, root_positions, atomic, callvalues)
 
     parts = gensym(:plate_reduction)
     cells = gensym(:plate_cells)
@@ -1653,14 +1687,13 @@ end
 # shared by every cell. Per cell, Base's `evalpoly(x, c::AbstractVector)` is a
 # runtime Horner loop, `ex = c[end]`, then `ex = muladd(x, ex, c[i])` for
 # `i = length(c)-1:-1:1`: a chain of dependent multiply-adds that cannot run
-# across cells. Here the cells of one tile take the seed, then each
-# coefficient in turn: one contiguous pass `acc = muladd(x, acc, c[i])` over
-# the tile per coefficient, which vectorizes across cells. Every cell performs
-# Base's operations in Base's order. The tile (`_PLATE_FOLD_TILE` cells) keeps
-# the accumulators and the cell's `x` in cache across the coefficient passes.
-# The types are checked when the body is compiled (`_plate_evalpoly_ready`);
-# coefficients with offset axes, which Base's `evalpoly` rejects, and domains
-# with more than one axis keep the cell loop.
+# across cells. Here the cells run side by side, a chunk of them at a time,
+# with their accumulators held in registers across the coefficients
+# (`_plate_evalpoly_chunks!`). Every cell performs Base's operations in
+# Base's order. The types are checked when the body is compiled
+# (`_plate_evalpoly_ready`); coefficients with offset axes, which Base's
+# `evalpoly` rejects, domains with more than one axis, and an `x` whose axes
+# are not the plate's keep the cell loop.
 function _lower_plate_reduction_native(::Val{:evalpoly}, reduction, inner::Plan,
                                        locals, callargs, callvalues, raw_arguments,
                                        prepared_arguments, atomic, root_positions,
@@ -1682,41 +1715,88 @@ function _lower_plate_reduction_native(::Val{:evalpoly}, reduction, inner::Plan,
              type_of(x_input), type_of(c_input), output_axes),
         Expr(:call, GlobalRef(Base, :!),
              Expr(:call, GlobalRef(Base, :has_offset_axes), coefficients)))
-    if !_authored_plate_unconditional_group(
-            reduction.roots, root_positions, atomic, callvalues)
-        ready = Expr(:&&, _authored_plate_runtime_unconditional(
-            callargs, reduction.roots, root_positions, atomic), ready)
-    end
-    c, cells, count, lo, hi, position, cell, seed, j, cj = gensym.((
-        :plate_coefficients, :plate_cells, :plate_count, :plate_tile_lo,
-        :plate_tile_hi, :plate_position, :plate_cell, :plate_seed,
-        :plate_coefficient_index, :plate_coefficient))
-    entry = :($pointwise_lhs[$cell])
-    x = argument(x_input, cell)
+    ready = _plate_reduction_every_cell(ready, reduction, callargs, root_positions,
+                                        atomic, callvalues)
+    # `x` varies per cell, so it is a plate argument (an invariant `x` would
+    # make the cell invariant). When its axes are the plate's, the chunks read
+    # it directly: the broadcast projection selects its index per read.
+    x_have = root_positions[canon_id(graph, x_input.id)]
+    raw_x = raw_arguments[x_have]
+    raw_x === nothing && return cell_loop
+    ready = Expr(:&&, ready, Expr(:call,
+        GlobalRef(@__MODULE__, :_plate_spans), output_axes, raw_x))
+    c, axis, position = gensym.((:plate_coefficients, :plate_axis_range, :plate_position))
     base(name) = GlobalRef(Base, name)
-    tile_cells(body) = Expr(:for, :($position = $lo:$hi),
-        Expr(:block, :($cell = $(_inbounds_value(:($cells[$position])))), body))
     interchanged = quote
         $c = $coefficients
-        $cells = $(base(:CartesianIndices))($output_axes)
-        $count = $(base(:length))($cells)
-        for $lo in 1:$(GlobalRef(@__MODULE__, :_PLATE_FOLD_TILE)):$count
-            $hi = $(base(:min))($lo + $(GlobalRef(@__MODULE__, :_PLATE_FOLD_TILE)) - 1, $count)
-            $seed = $c[$(base(:lastindex))($c)]
-            $(tile_cells(_inbounds_expr(:($entry = $seed))))
-            for $j in ($(base(:length))($c) - 1):-1:1
-                $cj = $c[$j]
-                $(tile_cells(_inbounds_expr(:($entry = $(base(:muladd))($x, $entry, $cj)))))
-            end
-        end
+        $axis = $(base(:only))($output_axes)
+        $(base(:isempty))($axis) ||
+            $(GlobalRef(@__MODULE__, :_plate_evalpoly_chunks!))($pointwise_lhs, $raw_x, $c, $axis)
     end
     if accumulator !== nothing
         # The total adds the cells in coordinate order, as the cell loop does.
-        push!(interchanged.args, Expr(:for, :($position = 1:$count), Expr(:block,
-            :($cell = $(_inbounds_value(:($cells[$position])))),
+        push!(interchanged.args, Expr(:for, :($position = $axis), Expr(:block,
             :($accumulator = $(GlobalRef(@__MODULE__, :_plate_total_add))(
-                $accumulator, $(_inbounds_value(entry)))))))
+                $accumulator, $(_inbounds_value(:($pointwise_lhs[$position]))))))))
     end
+    Expr(:if, ready, interchanged, cell_loop)
+end
+
+# Fold-outer lowering of a gather-free generator-sum cell whose term is plain
+# arithmetic (`_kernel_fold_arithmetic`), `sum(term for j in iterator; init)`
+# over an iterator shared by every cell. Per cell, the sum is a chain of
+# dependent `add_sum`s, which cannot run across cells; across cells, the terms
+# of one element are independent. Here the cells of one tile take their seed,
+# then each element in turn: one contiguous pass `acc = add_sum(acc, term)`
+# over the tile per element, which vectorizes across cells. Every cell's value
+# is the authored fold in the authored order, bitwise. Measured on gordito
+# (Julia 1.10.12, 16321 cells): `w[j] / (t + s[j])` 3.2-3.5 -> 0.32-0.35
+# ns/cell over 3 elements and 8.9-9.3 -> 1.16-1.24 over 12; a term calling
+# `exp` gains nothing and loses up to 13 % over 12 elements, which is why only
+# arithmetic terms are recognized. The types are checked when the body is
+# compiled (`_plate_reduction_ready`); a domain with more than one axis keeps
+# the cell loop.
+function _lower_plate_reduction_native(::Val{:sum}, reduction, inner::Plan,
+                                       locals, callargs, callvalues, raw_arguments,
+                                       prepared_arguments, atomic, root_positions,
+                                       plate_type_exprs, op_offset, plate_eltype,
+                                       output_axes, pointwise_lhs, accumulator,
+                                       cell_loop)
+    arguments(cell) = Any[_authored_plate_scalar_ref(
+        inner, locals, callargs, callvalues, prepared_arguments, atomic,
+        input, cell, true) for input in reduction.recipe.inputs]
+    select(positions, cell) = arguments(cell)[collect(Int, positions)]
+    ready = _plate_reduction_every_cell(
+        Expr(:&&,
+             Expr(:call, GlobalRef(@__MODULE__, :_plate_one_axis), output_axes),
+             _plate_reduction_ready_call(reduction, inner, locals, root_positions,
+                                         plate_type_exprs, op_offset, plate_eltype)),
+        reduction, callargs, root_positions, atomic, callvalues)
+    parts, cells, count, iterator, element, lo, hi, position, cell = gensym.((
+        :plate_reduction, :plate_cells, :plate_count, :plate_iterator,
+        :plate_element, :plate_tile_lo, :plate_tile_hi, :plate_position,
+        :plate_cell))
+    entry = :($pointwise_lhs[$cell])
+    tile_cells(body) = _plate_tile_cells(cells, position, lo, hi, cell, body)
+    passes = quote
+        $iterator = $parts.iterator($(select(reduction.iterator, nothing)...))
+        $(_plate_fold_tiles(count, lo, hi, quote
+            $(tile_cells(_inbounds_expr(
+                :($entry = $parts.init($(select(reduction.init, cell)...))))))
+            for $element in $iterator
+                $(tile_cells(_inbounds_expr(
+                    :($entry = $parts.step($entry, $element, $(arguments(cell)...))))))
+            end
+        end))
+    end
+    interchanged = quote
+        $parts = $(Expr(:ref, _OPS_ARG, op_offset + reduction.recipe_index)).f
+        $cells = $(GlobalRef(Base, :CartesianIndices))($output_axes)
+        $count = $(GlobalRef(Base, :length))($cells)
+        $count > 0 && $passes
+    end
+    accumulator === nothing || push!(interchanged.args,
+        _plate_fold_total(accumulator, cells, count, position, cell, entry))
     Expr(:if, ready, interchanged, cell_loop)
 end
 

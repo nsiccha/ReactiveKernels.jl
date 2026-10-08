@@ -1449,6 +1449,104 @@ _emitted_count(kernel, literal) =
           sum(alone(g, 0.5) for g in groups)
 end
 
+# --- bound plate arguments lower as their class declares (todo 0hc187j,
+# follow-up to snag prepared-kernel-ae180d1a)
+# A bound plate argument is a constant, so preparation knows its value's class
+# even when its port declares no type. A bound `1:n` domain lowers exactly like
+# a declared `UnitRange` (no runtime axis guard, no per-coordinate bookkeeping),
+# a bound scalar operand like a declared `Float64` (computed once, above the
+# loop). The compiled residual is kept per class: another element type or
+# extent of the same class reuses it, another class lowers its own.
+@kernel _bound_class_matrix(x, scale) = begin
+    pointwise = plate(x, scale) do xi, si
+        log_scale = log(si) + 0.0625
+        xi * log_scale
+    end
+    return sum(pointwise)
+end
+@kernel _declared_class_matrix(x, scale::Matrix{Float64}) = begin
+    pointwise = plate(x, scale) do xi, si
+        log_scale = log(si) + 0.0625
+        xi * log_scale
+    end
+    return sum(pointwise)
+end
+_unguarded(kernel) = (code = string(readable_code(kernel));
+    !occursin("_authored_plate_is_axis", code) && !occursin("plate_first", code) &&
+    !occursin("plate_previous", code))
+# The generated body with gensym counters and the argument line removed: a
+# bound port is a constant line instead of an argument.
+_lowered_body(kernel) = [replace(line, r"#\d+" => "#")
+    for line in split(string(readable_code(kernel)), '\n')
+    if !startswith(line, "function") && !occursin(r"^\s*xs = ", line)]
+
+@testset "authored plate native: bound plate arguments lower as their class" begin
+    typed = prepare(_emitted_once_typed)
+    for xs in (1:4, collect(1.0:4.0), (1.0, 2.0, 3.0, 4.0))
+        kernel = prepare(_emitted_once_untyped; bound = (; xs))
+        @test _unguarded(kernel)
+        @test _emitted_count(kernel, r"0\.75") == 1
+        @test kernel(0.5) == typed(collect(Float64, xs), 0.5)
+    end
+    # Identical to the declared-type lowering, line for line.
+    @test _lowered_body(prepare(_emitted_once_untyped; bound = (; xs = collect(1.0:4.0)))) ==
+          _lowered_body(typed)
+    # A live untyped domain keeps its runtime guard.
+    @test !_unguarded(prepare(_emitted_once_untyped))
+
+    # A bound scalar operand is a plate invariant computed above the loop.
+    xs = collect(range(-1.0, 2.0; length = 7))
+    scalar = prepare(_emitted_once_invariant; bound = (; s = 1.7))
+    @test _unguarded(scalar)
+    @test _emitted_count(scalar, r"_emitted_once_log\(") == 1
+    _EMITTED_ONCE_CALLS[] = 0
+    @test scalar(xs) ≈ sum(xs .* log(1.7))
+    @test _EMITTED_ONCE_CALLS[] == 1
+    # A rank-0 array holds no axis but is not a scalar: it keeps the guard and
+    # is still computed once per call.
+    zerodim = prepare(_emitted_once_invariant; bound = (; s = fill(1.7)))
+    @test !_unguarded(zerodim)
+    _EMITTED_ONCE_CALLS[] = 0
+    @test zerodim(xs) ≈ sum(xs .* log(1.7))
+    @test _EMITTED_ONCE_CALLS[] == 1
+
+    # A bound matrix operand lowers like a declared `Matrix`: a rank-2 axis
+    # with no runtime axis test of its own, where the live untyped port keeps
+    # one. (`x` is live and untyped, so the inner-plate pass leaves the
+    # scale-only recipe in the cell.)
+    x = [0.5, 1.5, 2.5]
+    scale = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    scale_guard = "_authored_plate_is_axis(scale)"
+    matrix = prepare(_bound_class_matrix; bound = (; scale))
+    declared = prepare(_declared_class_matrix)
+    @test !occursin(scale_guard, string(readable_code(matrix)))
+    @test !occursin(scale_guard, string(readable_code(declared)))
+    @test occursin(scale_guard, string(readable_code(prepare(_bound_class_matrix))))
+    @test matrix(x) ≈ declared(x, scale) ≈ sum(x .* (log.(scale) .+ 0.0625))
+
+    # One compiled residual per class through a cache.
+    cache = PreparationCache()
+    range_kernel = prepare!(cache, _emitted_once_untyped; bound = (; xs = 1:4))
+    vector_kernel = prepare!(cache, _emitted_once_untyped; bound = (; xs = [0.25, 3.0]))
+    tuple_kernel = prepare!(cache, _emitted_once_untyped; bound = (; xs = (0.25, 3.0)))
+    @test vector_kernel.f === range_kernel.f && vector_kernel.ast === range_kernel.ast
+    @test tuple_kernel.ast !== range_kernel.ast
+    @test range_kernel(0.5) == typed(collect(1.0:4.0), 0.5)
+    @test vector_kernel(0.5) == tuple_kernel(0.5) == typed([0.25, 3.0], 0.5)
+    @test length(only(values(cache.bound)).templates) == 2
+
+    cache = PreparationCache()
+    first_scalar = prepare!(cache, _emitted_once_invariant; bound = (; s = 1.7))
+    narrow_scalar = prepare!(cache, _emitted_once_invariant; bound = (; s = 2.5f0))
+    rank0 = prepare!(cache, _emitted_once_invariant; bound = (; s = fill(1.7)))
+    @test narrow_scalar.ast === first_scalar.ast
+    @test rank0.ast !== first_scalar.ast
+    @test first_scalar(xs) ≈ rank0(xs) ≈ sum(xs .* log(1.7))
+    @test narrow_scalar(xs) ≈ sum(xs .* log(2.5f0))
+    # Rebinding a class seen earlier reuses its residual.
+    @test prepare!(cache, _emitted_once_invariant; bound = (; s = 0.3)).ast === first_scalar.ast
+end
+
 # --- per-cell reductions over a few host indices (snag plate-cell-gathe-94d4a929)
 # A plate cell that superposes a few dose responses per observation. The
 # reporter authored it as vector temporaries (`observation .- shifts`,
@@ -1775,11 +1873,12 @@ end
 end
 
 # Coefficient-outer lowering of an `evalpoly(x, c)` cell over shared
-# coefficients (snag native-lowering-948c4ab6). Base's `evalpoly` over a vector
-# is a per-cell runtime Horner loop; the lowering runs each coefficient as one
-# pass over a tile of cells, with Base's operations in Base's order. The
-# control calls the same `evalpoly` through a function the lowering does not
-# recognize, so it keeps the cell loop.
+# coefficients (snags native-lowering-948c4ab6, evalpoly-per-cel-cea5fcf5).
+# Base's `evalpoly` over a vector is a per-cell runtime Horner loop; the
+# lowering runs chunks of cells side by side, their accumulators in registers
+# across the coefficients (`_plate_evalpoly_chunks!`), with Base's operations
+# in Base's order. The control calls the same `evalpoly` through a function
+# the lowering does not recognize, so it keeps the cell loop.
 _plate_horner(x, c) = evalpoly(x, c)
 @kernel evalpoly_cell(xs, c) = begin
     ys = plate(xs, Ref(c)) do x, c
@@ -1801,6 +1900,13 @@ end
     total = sum(ys)
     return ys, total
 end
+# `x` read beside a second lane: a one-element `xs` expands to `ws`'s axes.
+@kernel evalpoly_cell_expanded(xs, ws, c) = begin
+    ys = plate(xs, ws, Ref(c)) do x, w, c
+        evalpoly(x, c) + 0 * w
+    end
+    return ys
+end
 _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(kernel)))
 
 @testset "authored plate block: an evalpoly cell over shared coefficients runs coefficient-outer" begin
@@ -1809,8 +1915,10 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     @test !_evalpoly_lowered(control)
     @test _evalpoly_lowered(prepare(evalpoly_cell_reordered))
     coefficients = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011, 2.5e-3, -4.0e-4, 1.0e-5, 3.0e-6, -7.0e-7]
-    # Lengths around the tile, and degrees down to a constant.
-    for n in (0, 1, 255, 256, 257, 513, 1000), c in (coefficients, coefficients[1:2], [2.5])
+    # Lengths around the chunk, and degrees down to a constant.
+    chunk = ReactiveKernels._PLATE_HORNER_CHUNK
+    lengths = (0, 1, chunk - 1, chunk, chunk + 1, 2chunk - 1, 2chunk + 1, 255, 1000)
+    for n in lengths, c in (coefficients, coefficients[1:2], [2.5])
         xs = [1 / (k + 0.5) for k in 0:n-1]
         got, expected = cell(xs, c), control(xs, c)
         @test got[1] == expected[1] == evalpoly.(xs, Ref(c))
@@ -1826,6 +1934,16 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     @test cell(grid, coefficients)[1] == evalpoly.(grid, Ref(coefficients))
     # A one-based view is lowered like a vector.
     @test cell(xs, view(coefficients, 2:6))[1] == evalpoly.(xs, Ref(view(coefficients, 2:6)))
+    # Base evaluates a complex `x` with its own recurrence, so it keeps the
+    # cell loop; a real `x` over complex coefficients is Horner's and lowered.
+    zs = complex.(xs, reverse(xs) ./ 3)
+    zc = complex.(coefficients, 0.1 .* reverse(coefficients))
+    @test cell(zs, zc)[1] == evalpoly.(zs, Ref(zc))
+    @test cell(xs, zc)[1] == evalpoly.(xs, Ref(zc))
+    # An `x` expanded from one element is not read directly; same values.
+    expanded = prepare(evalpoly_cell_expanded)
+    @test expanded([0.3], xs, coefficients) == fill(evalpoly(0.3, coefficients), length(xs))
+    @test expanded(xs, [1.0], coefficients) == evalpoly.(xs, Ref(coefficients))
     # Base's errors: empty coefficients have no `c[end]`.
     @test_throws BoundsError cell(xs, Float64[])
     @test cell(Float64[], Float64[]) == (Float64[], 0.0)
@@ -1835,9 +1953,15 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     allocated(control, xs, coefficients)
     @test allocated(cell, xs, coefficients) <= allocated(control, xs, coefficients) +
                                                 _natural_sup_parity_margin
-    # The coefficient passes vectorize across cells.
+    # The kernel calls the chunked helper, whose chunk runs as vector
+    # operations across its cells.
+    @test occursin("_plate_evalpoly_chunks!", _plate_entry_llvm(cell, xs, coefficients))
     if Sys.ARCH in (:x86_64, :aarch64)
-        @test occursin(r"<\d+ x double>", _plate_entry_llvm(cell, xs, coefficients))
+        chunk_llvm = sprint(io -> InteractiveUtils.code_llvm(io,
+            ReactiveKernels._plate_evalpoly_chunk!,
+            Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}, Int, Float64, Int,
+                  Val{chunk}}; debuginfo = :none))
+        @test occursin(r"<\d+ x double>", chunk_llvm)
     end
 end
 
@@ -2015,6 +2139,137 @@ _fission_hoisted(kernel) = occursin("scan_hoisted", string(code_expr(kernel)))
     allocated(k, steps) = @allocated k(steps, coefficients...)
     allocated(kernel, steps)
     @test allocated(kernel, steps) < 2 * sizeof(Float64) * length(steps)
+end
+
+# A gather-free generator sum whose term is plain arithmetic runs fold-outer
+# over tiles of cells (snag native-lowering-948c4ab6, todo 16mekxc): one pass
+# over a tile per element, each cell accumulating `add_sum` in the authored
+# order. The control calls a function the lowering does not recognize, so it
+# keeps the cell loop; every value must match it bitwise. A term that calls
+# anything but Base's arithmetic (`exp` here) keeps the cell loop.
+_fold_sum_div(a, b) = a / b
+@kernel fold_sum_cell(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(out)
+    return out, total
+end
+@kernel fold_sum_control(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(_fold_sum_div(w[j], t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    total = sum(out)
+    return out, total
+end
+# A tuple or two-axis domain keeps the cell loop.
+@kernel fold_sum_any(ts, w, s) = begin
+    out = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+@kernel fold_sum_exp(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] * exp(-(t - s[j])^2) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# The guarded gather of §4e's traceable spelling: arithmetic, comparisons,
+# `ifelse`, `max` and indexing.
+@kernel fold_sum_guard(ti, w, s, u) = begin
+    out::Vector{Float64} = plate(ti, Ref(w), Ref(s), Ref(u)) do t, w, s, u
+        sum(ifelse(t - s[j] > 0, u[max(t - s[j], 1)] * w[j], 0.0) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# An `Int` seed against `Float64` terms changes the accumulator type after the
+# first element, and a range that reads the cell is not shared by every cell:
+# both keep the cell loop.
+@kernel fold_sum_int_seed(ts, w, s) = begin
+    out = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0)
+    end
+    return out
+end
+@kernel fold_sum_cell_range(ts, w, s) = begin
+    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+        sum(w[j] / (t + s[j]) for j in 1:min(round(Int, t), length(w)); init = 0.0)
+    end
+    return out
+end
+@kernel fold_sum_range(n, w, s) = begin
+    out::Vector{Float64} = plate(1:n, Ref(w), Ref(s)) do k, w, s
+        sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
+    end
+    return out
+end
+# An arithmetic sum in a plain scan step is a fold the strip region runs.
+@kernel fold_sum_scan(steps, w, s, decay) = begin
+    out = scan(steps, Ref(w), Ref(s), Ref(decay); init = 0.0) do carry, k, w, s, d
+        r = sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
+        next = muladd(d, carry, r)
+        (next, next)
+    end
+    return out
+end
+_fold_sum_passes(kernel) = occursin("_plate_one_axis", string(code_expr(kernel)))
+
+@testset "authored plate: an arithmetic generator sum runs fold-outer, bitwise" begin
+    cell, control = prepare(fold_sum_cell), prepare(fold_sum_control)
+    @test _dose_outer_reductions(cell) == 1
+    @test _fold_sum_passes(cell)
+    @test _dose_outer_reductions(control) == 0
+    @test _dose_outer_reductions(prepare(fold_sum_exp)) == 0
+    for n in (0, 1, 255, 256, 257, 1000), m in (0, 1, 3, 12)
+        ts = n == 1 ? [0.1] : collect(range(0.1, 50.0; length = n))
+        w, s = [0.5 + 0.1j for j in 1:m], [1.0 + 2.5j for j in 1:m]
+        got, expected = cell(ts, w, s), control(ts, w, s)
+        @test _dose_outer_same(got[1], expected[1])
+        @test got[2] === expected[2]
+    end
+    w, s = [0.5, -0.25, 2.0], [1.0, 3.5, 6.0]
+    ts = collect(range(0.1, 50.0; length = 300))
+    expected = control(ts, w, s)[1]
+    any_domain = prepare(fold_sum_any)
+    @test _dose_outer_same(any_domain(ts, w, s), expected)
+    @test _dose_outer_same(collect(any_domain(Tuple(ts[1:20]), w, s)), expected[1:20])
+    @test _dose_outer_same(vec(any_domain(reshape(ts, 20, 15), w, s)), expected)
+    @test _dose_outer_same(prepare(fold_sum_exp)(ts, w, s),
+        [sum(w[j] * exp(-(t - s[j])^2) for j in eachindex(w); init = 0.0) for t in ts])
+    int_seed = prepare(fold_sum_int_seed)
+    @test _dose_outer_reductions(int_seed) == 1
+    @test _dose_outer_same(int_seed(ts, w, s), expected)
+    cell_range = prepare(fold_sum_cell_range)
+    @test _dose_outer_same(cell_range(ts, w, s),
+        [sum(w[j] / (t + s[j]) for j in 1:min(round(Int, t), length(w)); init = 0.0) for t in ts])
+    ranged = prepare(fold_sum_range)
+    @test _dose_outer_reductions(ranged) == 1
+    @test _dose_outer_same(ranged(1000, w, s),
+        [sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0) for k in 1:1000])
+    guard = prepare(fold_sum_guard)
+    @test _dose_outer_reductions(guard) == 1
+    ti, si, wi = collect(1:300), [1, 50, 120], [0.5, 0.25, 2.0]
+    u = [exp(-0.01i) for i in 1:300]
+    @test _dose_outer_same(guard(ti, wi, si, u),
+        [sum(ifelse(t - si[j] > 0, u[max(t - si[j], 1)] * wi[j], 0.0) for j in eachindex(wi); init = 0.0)
+         for t in ti])
+end
+
+@testset "authored scan: an arithmetic step sum runs in the strip region" begin
+    kernel = prepare(fold_sum_scan)
+    @test _fission_hoisted(kernel)
+    w, s, decay = [0.5, -0.25, 2.0], [1.0, 3.5, 6.0], 0.9
+    for n in (0, 1, 127, 128, 129, 1000)
+        steps = 0:n-1
+        carry = 0.0
+        expected = Float64[]
+        for k in steps
+            carry = muladd(decay, carry, sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0))
+            push!(expected, carry)
+        end
+        @test isapprox(kernel(steps, w, s, decay), expected; rtol = 1e-13)
+    end
 end
 
 @testset "tensorized companion: filtered sums and get keep their branches lazy" begin

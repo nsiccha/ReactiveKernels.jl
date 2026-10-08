@@ -1529,7 +1529,8 @@ column and definition among them holds. `whole_values=true` follows composed
 expressions and treats reductions as whole-array reads for latent-domain
 validation, without changing the default observation-axis classification."""
 function _response_reads(plan::StructuralPlan, r,
-        perobs::Set{Symbol}; whole_values::Bool=false)
+        perobs::Set{Symbol}; whole_values::Bool=false,
+        stop::Set{Symbol}=Set{Symbol}())
     nodes = _observation_nodes(plan)
     cands = union(perobs, keys(nodes))
     function record_reads(x)
@@ -1566,7 +1567,7 @@ function _response_reads(plan::StructuralPlan, r,
         s in seen && continue
         push!(seen, s)
         s in perobs && push!(reads, s)
-        haskey(nodes, s) && append!(queue, held(nodes[s]))
+        haskey(nodes, s) && !(s in stop) && append!(queue, held(nodes[s]))
     end
     return reads
 end
@@ -5419,8 +5420,9 @@ _array_entries(col) = isempty(col) || all(isempty, col) ?
 """A dotted `@plate` cell (`y[i] .~ D.(…)`) whose bound response holds one
 array per index: each cell broadcasts over its own index's entries."""
 _cell_broadcast_response(plan::StructuralPlan, r::LikelihoodSpec) =
-    haskey(plan.cell_broadcasts, r.response) &&
-        _holds_arrays(get(plan.columns, r.response, nothing))
+    _cell_broadcast_observation(plan, r.response)
+_cell_broadcast_observation(plan::StructuralPlan, name::Symbol) =
+    haskey(plan.cell_broadcasts, name) && _holds_arrays(get(plan.columns, name, nothing))
 
 # Observing one array per index otherwise broadcasts a univariate
 # distribution over arrays, which Julia refuses: it takes no array argument.
@@ -5448,7 +5450,10 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
     perindex = plan.cell_broadcasts[r.response]
     arrays = Set{Symbol}(k for (k, v) in plan.columns if v isa AbstractArray)
     columns = copy(plan.columns)
-    for c in _response_reads(plan, r, arrays)
+    # A definition the cell reads per index (`sc[i]` with `sc = dose .* s`)
+    # supplies that index's value; the data it reads are whole inputs of
+    # that value, not observation operands.
+    for c in _response_reads(plan, r, arrays; stop = Set{Symbol}(perindex))
         c === r.response && continue
         v = plan.columns[c]
         cells = try
