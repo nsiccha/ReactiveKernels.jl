@@ -225,11 +225,13 @@ end
     @test shape.blocks[2].kind === ContinuousTerm
     @test shape.blocks[2].column === :x_true
     # The design recipe materializes the latent view so the hcat stays
-    # homogeneous (Enzyme), while data columns stay bare.
+    # homogeneous (Enzyme), while data columns stay bare. The intercept's
+    # rows are read from the observed column the latent is measured by.
     recs = preprocessing_recipes(plan)
     drec = only(r for r in recs if r.args[1] === design_name(:mu))
+    rows = Expr(:call, GlobalRef(ReactiveKernelsPPL, :_observation_rows), :x_obs)
     @test drec == :(_ppl_design_mu =
-        Float64.(hcat(ones(6), Float64.(x_true))))
+        Float64.(hcat(ones($rows), Float64.(x_true))))
 end
 
 @testset "contract me: latent offsets and invalid factor terms" begin
