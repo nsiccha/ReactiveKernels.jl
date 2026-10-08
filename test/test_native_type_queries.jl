@@ -159,3 +159,110 @@ end
         end
     end
 end
+
+module TypeOperationFixtures
+using ReactiveKernels
+# A type called directly on graph ports is the recipe's operation itself.
+const Pair2 = ComplexF64
+
+@kernel pair_product(a::Float64, b::Float64) = begin
+    pair = Pair2(a, b)
+    product = real(pair) * imag(pair)
+    return product
+end
+
+# The child's scan step outputs a bare constructor call; its result feeds a
+# plate cell whose values a second plate reads beside fixed data vectors.
+@kernel trace_reads(xs, ws, idx, rate) = begin
+    path = scan(xs, ws, Ref(rate); init = 0.0) do previous, x, w, r
+        level = previous * exp(-r) + w * x
+        area = previous + level
+        (level, Pair2(level, area))
+    end
+    selected = path[idx]
+    return vcat(real.(selected), imag.(selected))
+end
+
+@kernel grouped_trace(xs, ws, idx, first_idx, second_idx, times, obs, sd, theta) = begin
+    rates = exp.(theta[1] .+ 0.1 .* collect(1:length(xs)))
+    slopes = theta[2] .+ 0.05 .* collect(1:length(xs))
+    cells = plate(1:length(xs), rates, slopes, Ref(xs), Ref(ws), Ref(idx),
+            Ref(first_idx), Ref(second_idx), Ref(times)) do s, rate, slope, x, w, id, fi, si, t
+        reads = trace_reads(x[s], w[s], id[s], rate)
+        level = reads[fi[s]]
+        scaled = reads[si[s]] ./ 3.0
+        slope * t[s] + -slope * scaled .+ level
+    end
+    location = convert(Vector{Float64}, reduce(vcat, cells; init = Float64[]))
+    terms = plate(location, obs, sd, Ref(theta)) do m, y, s, th
+        -0.5 * abs2((y - m) / (s * exp(th[3])))
+    end
+    return sum(terms)
+end
+
+function grouped_reference(xs, ws, idx, first_idx, second_idx, times, obs, sd, theta)
+    location = Float64[]
+    for s in eachindex(xs)
+        rate, slope = exp(theta[1] + 0.1 * s), theta[2] + 0.05 * s
+        previous, levels, areas = 0.0, Float64[], Float64[]
+        for (x, w) in zip(xs[s], ws[s])
+            level = previous * exp(-rate) + w * x
+            push!(levels, level)
+            push!(areas, previous + level)
+            previous = level
+        end
+        reads = vcat(levels[idx[s]], areas[idx[s]])
+        append!(location, slope .* times[s] .- slope .* (reads[second_idx[s]] ./ 3.0) .+
+                          reads[first_idx[s]])
+    end
+    sum(-0.5 * abs2((y - m) / (σ * exp(theta[3]))) for (m, y, σ) in zip(location, obs, sd))
+end
+end
+
+# A type in a heterogeneous operation table is only a `DataType`, so calls
+# through it and every result type derived from it were uninferred. In this
+# grouped graph that left the plate result-type queries unfolded and the body
+# in dynamic dispatch, where native Reverse raised EnzymeRuntimeActivityError
+# on a boxed constant-data broadcast operand.
+@testset "Type-constructor operations keep native result types" begin
+    F = TypeOperationFixtures
+    reader = prepare(F.pair_product)
+    @test reader(1.5, 2.0) == 3.0
+    @test Base.return_types(reader, (Float64, Float64)) == Any[Float64]
+    @test occursin("Complex(a, b)", sprint(show, MIME"text/plain"(), kernel_graph(F.pair_product)))
+
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    grouped = prepare(F.grouped_trace)
+    cases = (
+        (xs = [[1.0, 0.5, 2.0], [0.3, 1.2, 0.7, 0.9]],
+         ws = [[1.0, 1.0, 0.5], [0.2, 1.0, 1.0, 0.4]],
+         idx = [[2, 1, 3], [4, 3, 2, 1]], first_idx = [[1, 2], [2, 4]],
+         second_idx = [[4, 6], [5, 7]], times = [[0.1, 0.4], [0.2, 0.9]],
+         obs = [1.0, 0.7, 0.4, 1.3], sd = [0.5, 0.6, 0.7, 0.8]),
+        (xs = [[0.4, 1.1], [2.0], [0.3, 0.8, 1.5]],
+         ws = [[1.0, 0.7], [0.9], [0.4, 1.0, 0.6]],
+         idx = [[1, 2], [1], [3, 1, 2]], first_idx = [[2], [1], [1, 3]],
+         second_idx = [[3], [2], [4, 6]], times = [[0.5], [0.3], [0.1, 0.7]],
+         obs = [0.2, 0.9, 1.1, 0.6], sd = [0.4, 0.5, 0.9, 0.3]),
+    )
+    for case in cases, theta in ([0.3, 0.8, -0.2], [-0.4, 1.3, 0.1])
+        args = (values(case)[1:6]..., case.obs, case.sd, theta)
+        original = deepcopy(args)
+        @test Base.return_types(grouped, map(typeof, args)) == Any[Float64]
+        expected = F.grouped_reference(args...)
+        @test grouped(args...) ≈ expected rtol = 1e-12
+        ad = prepare_ad(grouped, backend, args...; active = :theta)
+        value, gradient = ad_value_and_gradient(ad, args...)
+        @test value ≈ expected rtol = 1e-12
+        central = map(eachindex(theta)) do i
+            h = 1e-6
+            up, down = copy(theta), copy(theta)
+            up[i] += h
+            down[i] -= h
+            (F.grouped_reference(args[1:8]..., up) -
+             F.grouped_reference(args[1:8]..., down)) / 2h
+        end
+        @test gradient ≈ central rtol = 1e-6
+        @test isequal(args, original)
+    end
+end

@@ -318,6 +318,15 @@ them with `Iterators.drop` made Enzyme raise `OutOfMemoryError` from the
 second outer step on whenever the inner sequence was empty and the same at
 every outer step (`benchmark/repro_enzyme_guarded_inner_loop_cache.jl`).
 
+Plain `Enzyme.autodiff` of a closure that captures the sequence meets a
+separate Enzyme boundary on Julia 1.12 and later. Enzyme must prove the
+closure is never written, and that proof rejects the scan's result stores
+with `EnzymeMutabilityException`; in one loop shape without RK it silently
+returns 0.0 instead (`benchmark/repro_enzyme_closure_float_store_readonly.jl`).
+Pass the data as a `Const` argument, annotate the closure `Const(f)`, or use
+`prepare_ad`, which passes data as `Constant` contexts
+([constraints](constraints.md)).
+
 A recurrence authored in its own kernel, prepared once and called from a lazy
 branch arm, still works. The arm then runs through an ordinary callable
 boundary, not transparent graph splicing. Declare that arm's result type

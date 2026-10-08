@@ -1529,7 +1529,8 @@ column and definition among them holds. `whole_values=true` follows composed
 expressions and treats reductions as whole-array reads for latent-domain
 validation, without changing the default observation-axis classification."""
 function _response_reads(plan::StructuralPlan, r,
-        perobs::Set{Symbol}; whole_values::Bool=false)
+        perobs::Set{Symbol}; whole_values::Bool=false,
+        stop::Set{Symbol}=Set{Symbol}())
     nodes = _observation_nodes(plan)
     cands = union(perobs, keys(nodes))
     function record_reads(x)
@@ -1566,7 +1567,7 @@ function _response_reads(plan::StructuralPlan, r,
         s in seen && continue
         push!(seen, s)
         s in perobs && push!(reads, s)
-        haskey(nodes, s) && append!(queue, held(nodes[s]))
+        haskey(nodes, s) && !(s in stop) && append!(queue, held(nodes[s]))
     end
     return reads
 end
@@ -2531,15 +2532,21 @@ function _validate_assignments_data(plan::StructuralPlan)
     return nothing
 end
 
+# A derived column whose value `bind_data` checks rather than its
+# expression's shape: a data-only module value read per observation (its
+# length or row count), or a derived response, which binding evaluates
+# and validates as the response (`_materialize_derived_responses!`).
+_bind_checked_derived(plan::StructuralPlan, name::Symbol) =
+    _is_bind_data_derived(plan, name) ||
+        any(r -> r.response === name, plan.responses)
+
 function _validate_vector_structure(plan::StructuralPlan)
     for d in plan.derived
         _validate_vector_alias(d, plan, false)
         d.expr isa Symbol && continue
         refs = Symbol[]
         _collect_vector_refs!(refs, d.expr, plan, d.label, false)
-        # A data-only module value read per observation is checked at
-        # bind (its length or row count), not by its expression's shape.
-        _is_vector_valued(d.expr, plan) || _is_bind_data_derived(plan, d.name) ||
+        _is_vector_valued(d.expr, plan) || _bind_checked_derived(plan, d.name) ||
             _fail(d.label, "derived column is scalar-valued — write it as " *
                 "a scalar assignment instead")
     end
@@ -2556,9 +2563,7 @@ function _validate_vector_data(plan::StructuralPlan)
             r in _all_names(plan) ||
                 _fail(d.label, "derived column references unknown name $r")
         end
-        # A data-only module value read per observation is checked at
-        # bind (its length or row count), not by its expression's shape.
-        _is_vector_valued(d.expr, plan) || _is_bind_data_derived(plan, d.name) ||
+        _is_vector_valued(d.expr, plan) || _bind_checked_derived(plan, d.name) ||
             _fail(d.label, "derived column is scalar-valued — write it as " *
                 "a scalar assignment instead")
     end
@@ -2748,7 +2753,7 @@ function _collect_model_value_ref!(refs, ex::Expr, plan, label, bound::Bool)
         _collect_assignment_refs!(refs, obj, plan, label, bound)
     end
     for i in ex.args[2:end]
-        i === :(:) && continue
+        (i === :(:) || _is_endpoint_position(i)) && continue
         _collect_assignment_refs!(refs, i, plan, label, bound)
     end
     return nothing
@@ -2763,8 +2768,9 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
         return nothing
     if ex isa Symbol
-        # `:` in a positional read (`Z[:, 1]`) is a whole axis, not a name.
-        ex === :(:) && return nothing
+        # `:` in a positional read (`Z[:, 1]`) is a whole axis, and `end`
+        # / `begin` a position (`Z[end, 1]`), not a name.
+        (ex === :(:) || _is_endpoint(ex)) && return nothing
         bound && haskey(plan.columns, ex) && return nothing
         push!(refs, ex)
         return nothing
@@ -3132,7 +3138,8 @@ function _is_vector_valued(ex, plan::StructuralPlan)
         (_is_array_param(plan, ex.args[1]) ||
             _is_array_assignment(plan, ex.args[1])) &&
         return _array_index_kind(plan, ex) === :gather &&
-            all(i -> i isa Int || _is_row_index(plan, i), ex.args[2:end])
+            all(i -> i isa Int || _is_endpoint_position(i) ||
+                _is_row_index(plan, i), ex.args[2:end])
     ex isa Number && return false
     ex isa LineNumberNode && return false
     ex isa Expr || return false
@@ -5413,8 +5420,9 @@ _array_entries(col) = isempty(col) || all(isempty, col) ?
 """A dotted `@plate` cell (`y[i] .~ D.(…)`) whose bound response holds one
 array per index: each cell broadcasts over its own index's entries."""
 _cell_broadcast_response(plan::StructuralPlan, r::LikelihoodSpec) =
-    haskey(plan.cell_broadcasts, r.response) &&
-        _holds_arrays(get(plan.columns, r.response, nothing))
+    _cell_broadcast_observation(plan, r.response)
+_cell_broadcast_observation(plan::StructuralPlan, name::Symbol) =
+    haskey(plan.cell_broadcasts, name) && _holds_arrays(get(plan.columns, name, nothing))
 
 # Observing one array per index otherwise broadcasts a univariate
 # distribution over arrays, which Julia refuses: it takes no array argument.
@@ -5442,7 +5450,10 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
     perindex = plan.cell_broadcasts[r.response]
     arrays = Set{Symbol}(k for (k, v) in plan.columns if v isa AbstractArray)
     columns = copy(plan.columns)
-    for c in _response_reads(plan, r, arrays)
+    # A definition the cell reads per index (`sc[i]` with `sc = dose .* s`)
+    # supplies that index's value; the data it reads are whole inputs of
+    # that value, not observation operands.
+    for c in _response_reads(plan, r, arrays; stop = Set{Symbol}(perindex))
         c === r.response && continue
         v = plan.columns[c]
         cells = try
@@ -6973,6 +6984,10 @@ function _materialize_derived_responses!(plan::StructuralPlan,
                     !any(ismissing, value)
                 value = Base.nonmissingtype(eltype(value)).(value)
             end
+            value isa Number || value isa AbstractArray ||
+                throw(ContractValidationError("[bind] derived response " *
+                    "$name evaluated to $(summary(value)); a response " *
+                    "observes a number or an array"))
             columns[name] = value
         catch e
             e isa ContractValidationError && rethrow()
@@ -7142,6 +7157,9 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     inputs, _ = _model_level_inputs(plan, raw)
     union!(inputs, (_conditioned_input(n) for n in plan.conditioned))
     _materialize_derived_responses!(plan, columns)
+    # A derived response that evaluates to a number is one observation,
+    # exactly like the same number bound as data.
+    _scalar_responses_as_observations!(plan, columns)
     _validate_observed_selections!(plan, columns)
     _prepare_missing_responses!(plan, columns)
     for (k, v) in roles
@@ -7407,9 +7425,14 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     end
     out_v = VectorParameter[]
     for p in vectors
-        if p.family === :simplex_dirichlet && p.size === nothing && p.extent_expr === nothing
+        if p.family === :simplex_dirichlet && p.size === nothing && p.extent_expr === nothing &&
+                (plan === nothing || all(s -> _reads_data_only(plan, s,
+                    Set{Symbol}(_all_names(plan)), Set{Symbol}()),
+                    _expr_value_symbols(p.args.arg1)))
             # Preserve inferred concentration sizing just like an authored
             # data expression, without changing the linked-width checks.
+            # A live concentration (`Dirichlet(3, a)`, `a .+ 0.5`) is not
+            # data; its structural length comes from `_dirichlet_size`.
             p = _with(p; extent_expr = Expr(:call, :length, p.args.arg1))
         end
         concentration_size = p.family === :simplex_dirichlet ?

@@ -418,10 +418,9 @@ function _predictor_statements(plan::StructuralPlan)
     return stmts
 end
 
-# Scalar coefficient-coordinate read (`sum(view(coef, k:k))`, the
-# `coordinate_read` shape over a coefficient block rather than the packed
-# vector).
-_coef_coord(coef::Symbol, k::Int) = :(sum(view($coef, $k:$k)))
+# Scalar coefficient-coordinate read (`coef[k]`, the `coordinate_read` shape
+# over a coefficient block rather than the packed vector).
+_coef_coord(coef::Symbol, k::Int) = :($coef[$k])
 
 # Broadcast affine blocks against their coefficient coordinates while
 # retaining the authored axes. Factor and matrix blocks use their own
@@ -562,7 +561,9 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         push!(points, r.response => pw)
     end
     for p in plan.external_observations
-        append!(stmts, _external_density_statements(p))
+        ps = _external_density_statements(p)
+        append!(stmts, _cell_broadcast_observation(plan, p.name) ?
+            _cell_broadcast_stmts(p, plan, ps, upstream) : ps)
         push!(terms, Symbol(:_ppl_prior_, p.name))
         push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
@@ -614,11 +615,31 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         stmts::Vector{Expr}, upstream::Vector{Expr})
     # No index: the ordinary empty-domain statements already sum to zero.
     _response_rows(plan, r) == 0 && return stmts
-    node, pw = _lik_name(r.label), _pw_name(r.label)
+    # The response's predictor nodes lie on its observation axis, here the
+    # indices.
+    return _cell_broadcast_group(plan, r.response, _lik_name(r.label), _pw_name(r.label),
+        stmts, upstream, [_lp_name(p) for p in plan.predictors],
+        "response $(r.label) observes one array per index, and its $(r.family) statements")
+end
+
+# A caller-owned sampling RHS (`y[i] .~ LogDensity.(f, loc[i], s)`) in the
+# same cell: its law, including a visible `KernelSpec` density, runs on each
+# index's entries exactly as the flat observation plate runs on the entries
+# of a numeric response.
+function _cell_broadcast_stmts(p::SampledParameter, plan::StructuralPlan,
+        stmts::Vector{Expr}, upstream::Vector{Expr})
+    isempty(plan.columns[p.name]) && return stmts
+    return _cell_broadcast_group(plan, p.name, Symbol(:_ppl_prior_, p.name),
+        Symbol(:_ppl_pw_prior_, p.name), stmts, upstream, Symbol[],
+        "observation $(p.name) holds one array per index, and its sampling-RHS statements")
+end
+
+function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Symbol,
+        pw::Symbol, stmts::Vector{Expr}, upstream::Vector{Expr},
+        axisnodes::Vector{Symbol}, what::String)
     k = findall(st -> Meta.isexpr(st, :(=), 2) && st.args[1] == :($node::Float64), stmts)
     (length(k) == 1 && stmts[only(k)].args[2] == :(sum($pw))) ||
-        throw(ContractValidationError("[generator] response $(r.label) observes " *
-            "one array per index, and its $(r.family) statements have no summed " *
+        throw(ContractValidationError("[generator] $what have no summed " *
             "pointwise plate to run per index"))
     body = Expr[st for (i, st) in enumerate(stmts) if i != only(k)]
     defined = Set{Symbol}(something.(_assigned_name.(body), :_))
@@ -631,11 +652,10 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     foreach(st -> _statement_value_reads!(reads,
         Meta.isexpr(st, :(=), 2) ? st.args[2] : st), body)
     inputs = sort!(collect(intersect(setdiff!(reads, defined), known)))
-    # Per-index values: the response, the cell's indexed reads, the
-    # response's predictor nodes (on its observation axis, here the indices)
-    # and every upstream definition computed from them.
-    pergroup = Set{Symbol}([r.response; plan.cell_broadcasts[r.response];
-        [_lp_name(p) for p in plan.predictors]])
+    # Per-index values: the response, the cell's indexed reads, nodes on the
+    # response's observation axis and every upstream definition computed
+    # from them.
+    pergroup = Set{Symbol}([response; plan.cell_broadcasts[response]; axisnodes])
     for st in upstream
         name = _assigned_name(st)
         name === nothing && continue
@@ -646,6 +666,7 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     group = Symbol(pw, :_group)
     aliases[pw] = group
     cell = Expr[_hsubst(st, aliases) for st in body]
+    _cell_value_types!(cell, Set{Symbol}(aliases[v] for v in inputs if v in pergroup))
     # Densities are Float64; declaring the observation cell's result also
     # types an empty index's densities (RK's empty-domain result evidence).
     for st in cell
@@ -667,6 +688,34 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
             :_ppl_group_total))),
         :($node::Float64 = sum($totals))]
 end
+
+# The ordinary statements declare array types for values on the response's
+# observation axis (`_ppl_sc_y::AbstractVector = …`). In a group cell such a
+# value holds one index's value: an array, or a number when the cell reads a
+# per-group scalar (`dose[i] * sigma`). Those statements keep their values
+# and drop the axis declaration; scalar declarations and statements reading
+# only shared values are unchanged.
+function _cell_value_types!(cell::Vector{Expr}, pervalue::Set{Symbol})
+    for st in cell
+        Meta.isexpr(st, :(=), 2) || continue
+        reads = _statement_value_reads!(Set{Symbol}(), st.args[2])
+        isempty(intersect(reads, pervalue)) && continue
+        lhs = st.args[1]
+        if Meta.isexpr(lhs, :(::), 2) && _array_type_annotation(lhs.args[2])
+            st.args[1] = lhs = lhs.args[1]
+        end
+        name = _assigned_name(st)
+        name === nothing || push!(pervalue, name)
+    end
+    return cell
+end
+
+_array_type_annotation(T) = false
+_array_type_annotation(T::Type) = T <: AbstractArray
+_array_type_annotation(T::Symbol) =
+    T in (:AbstractArray, :AbstractVector, :AbstractMatrix, :Array, :Vector, :Matrix)
+_array_type_annotation(T::Expr) =
+    Meta.isexpr(T, :curly) && _array_type_annotation(T.args[1])
 
 function _declare_cell_result!(lambda::Expr)
     body = lambda.args[2]
@@ -924,11 +973,13 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
         # Base GLM case (no evidence, no weights, no literal range): fused
         # whole-vector reduction. Ranged responses stay on the plate path
         # (the cover rule makes them whole-column today, but the fused sum
-        # must never silently outgrow a future partial range).
+        # must never silently outgrow a future partial range). A response
+        # holding one array per index runs its pointwise plate per index.
         r.evidence.kind === :none && r.weights === nothing &&
             r.range === nothing && r.mi_jobs === nothing && r.link === LogitLink &&
             !haskey(plan.columns, _observed_mask_name(r.response)) &&
             !_is_bare_param_location(r, plan) &&
+            !_cell_broadcast_response(plan, r) &&
             _wholevec_location(r, plan) &&
             return _bernoulli_wholevec_stmts(r, plan, node)
         return _bernoulli_plate_stmts(r, plan, node, pw)
@@ -940,6 +991,7 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
             r.range === nothing && r.mi_jobs === nothing && r.link === LogLink &&
             !haskey(plan.columns, _observed_mask_name(r.response)) &&
             !_is_bare_param_location(r, plan) &&
+            !_cell_broadcast_response(plan, r) &&
             _wholevec_location(r, plan) &&
             return _poisson_wholevec_stmts(r, plan, node)
         return _poisson_plate_stmts(r, plan, node, pw)
@@ -2978,7 +3030,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
             push!(terms, Symbol(:_ppl_prior_, p.name))
         else
             _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-                p.support_override; rows = _plate_rows(plan, p))
+                p.support_override; rows = _plate_rows(plan, p),
+                float64_variate = p.name ∉ plan.conditioned)
         end
     end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
@@ -3053,7 +3106,8 @@ end
 # expander, exactly as the Gaussian-likelihood scale is threaded.
 function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         name::Symbol, family::Symbol, args::NamedTuple,
-        support::SupportOverride; conditioned = false, rows = nothing)
+        support::SupportOverride; conditioned = false, rows = nothing,
+        float64_variate::Bool = false)
     node = Symbol(:_ppl_prior_, name)
     pw = Symbol(:_ppl_pw_prior_, name)
     if family === :flat
@@ -3073,7 +3127,7 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     inputs = Any[name]
     tv = _dovar(1)
     argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
-    cell = _family_logpdf_expr(family, argvals, tv)
+    cell = _family_logpdf_expr(family, argvals, tv; float64_variate)
     thread(x) = x isa Expr ? Expr(x.head,
         (i == 1 && x.head === :call ? a : thread(a) for (i, a) in enumerate(x.args))...) :
         _thread_ref!(inputs, x)
@@ -3115,23 +3169,32 @@ const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
 # must retain their original numeric types. The same boundary applies to
 # density and truncation endpoints, including threaded plate arguments.
 # Multiplication by a floating unit preserves the value (and signed zero)
-# through ordinary Julia numeric promotion and backend arithmetic.
-function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x)
+# through ordinary Julia numeric promotion and backend arithmetic. A numeric
+# literal takes the same promotion (and Gamma's reciprocal) at emission. A
+# variate the caller knows is a Float64 parameter (`float64_variate`) is read
+# as is.
+_float64_port(v) = :(1.0 * $v)
+_float64_port(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1.0 * v
+_gamma_rate(v) = :(1 / $v)
+_gamma_rate(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1 / v
+
+function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x;
+        float64_variate::Bool = false)
     ep = get(_PRIOR_ENDPOINTS, family, nothing)
     ep === nothing && throw(ContractValidationError(
         "[generator] prior family $family has no endpoint object"))
-    args = family === :gamma ? (a[1], :(1 / $(a[2]))) : Tuple(a)
-    args = map(v -> :(1.0 * $v), args)
+    args = family === :gamma ? (a[1], _gamma_rate(a[2])) : Tuple(a)
+    args = map(_float64_port, args)
     return Expr(:call, Expr(:., Expr(:call, ep, args...), QuoteNode(method)),
-        :(1.0 * $x))
+        float64_variate ? x : _float64_port(x))
 end
 
-function _family_logpdf_expr(family::Symbol, a, x)
+function _family_logpdf_expr(family::Symbol, a, x; float64_variate::Bool = false)
     family === :flat && return :(0.0)
     family === :binomial && return :((isfinite($x) && floor($x) == $x &&
         isfinite($(a[2])) && 0 <= $(a[2]) && $(a[2]) <= 1) ?
-        binomial(Int($(a[1])), 1.0 * $(a[2])).logpdf(Int($x)) : -Inf)
-    return _prior_endpoint_expr(family, a, :logpdf, x)
+        binomial(Int($(a[1])), $(_float64_port(a[2]))).logpdf(Int($x)) : -Inf)
+    return _prior_endpoint_expr(family, a, :logpdf, x; float64_variate)
 end
 
 # Normalize the base density over the declared support. Symmetric halves
@@ -3192,7 +3255,7 @@ end
 # One normalized scalar prior body, shared by parameter and hyper-prior slots.
 function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false)
     argvals = Any[v for v in values(p.args)]
-    base = _family_logpdf_expr(p.family, argvals, p.name)
+    base = _family_logpdf_expr(p.family, argvals, p.name; float64_variate = !conditioned)
     local_pre = conditioned ? Expr[] : pre
     corr = _support_correction(p.family, p.support_override, argvals; pre = local_pre, stem = p.name)
     rhs = corr === nothing ? base : :($base + $corr)

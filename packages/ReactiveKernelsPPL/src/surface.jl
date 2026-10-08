@@ -415,7 +415,12 @@ function Base.merge(m::RKPPLModel, override::Expr)
     return RKPPLModel(Expr(:block, out...), m.mod, fixed, rewrites, copy(m.conditioned))
 end
 
-function Base.merge(m::RKPPLModel, fix::NamedTuple)
+Base.merge(m::RKPPLModel, fix::NamedTuple) = _merge_fixes(m, fix)
+
+# An author's dotted key names a scoped declaration (`var"z.w.tau"`) and waits
+# for expansion. Expansion pins a local by its plan identifier, which is
+# spelled with the same dots, so it passes `scoped_keys = false`.
+function _merge_fixes(m::RKPPLModel, fix::NamedTuple; scoped_keys::Bool = true)
     isempty(fix) && _sfail("merge with an empty NamedTuple fixes nothing")
     out = Any[a for a in m.ast.args]
     idx, dups, blocked = _merge_base_index(out)
@@ -424,7 +429,7 @@ function Base.merge(m::RKPPLModel, fix::NamedTuple)
     drop = Set{Int}()
     for (nm, val) in pairs(fix)
         delete!(observations, nm)
-        if occursin('.', String(nm))
+        if scoped_keys && occursin('.', String(nm))
             new_fixed[nm] = _check_col(nm, val)
             continue
         end
@@ -606,7 +611,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     used = Set{Symbol}()
     _all_symbols!(used, ast)
     ctx = _ScopeExpansion(scopes, Dict(s.binding => s for s in scopes),
-        _scope_name_paths(scopes), used, 0)
+        _scope_name_paths(scopes), used)
     expanded = RKPPLModel(ast, m.mod)
     for (path, value) in scoped_observed
         parts = Symbol.(split(String(path), '.'))
@@ -1105,6 +1110,18 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         matrix_values)
     detshape = _def_shapes(det, data, detmap; arrays = sized_decls,
         env = shape_env)
+    # A `.~` response is observed data. A definition reading only data that
+    # it observes is that observation value, whatever shape lowering can
+    # prove: an undotted module call's result is model-level here
+    # (`y = f(raw)`). `bind_data` evaluates the definition once and
+    # validates its value as the response; a number is one observation, as
+    # when bound as data.
+    for nm in derived_response_names
+        get(detshape, nm, nothing) === :scalar || continue
+        rhs = detmap[nm]
+        !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
+            (detshape[nm] = :vector)
+    end
     canonmap = Dict{Symbol,Any}()
     for nm in _det_topo_order(det, detmap)
         rhs = detmap[nm]
@@ -1441,6 +1458,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     end
     indexed_observations = intersect(Set{Symbol}(first(c) for c in plate_ctx),
         Set{Symbol}(r.response for r in responses))
+    # A caller-owned sampling RHS observed in a dotted `@plate` cell
+    # (`y[i] .~ LogDensity.(f, loc[i], s)`).
+    indexed_external = intersect(Set{Symbol}(first(c) for c in plate_ctx),
+        Set{Symbol}(p.name for p in external_observations))
     # Explicit loops select each operand at the authored indices. Keep a
     # literal response iterator on that same gather path as eachindex/axes;
     # the older UnitRange response contract only checked full-column cover.
@@ -1455,7 +1476,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
-            if k in indexed_observations))
+            if k in indexed_observations || k in indexed_external))
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -2434,8 +2455,17 @@ _is_dotted_call(ex) =
     ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
     ex.args[2] isa Expr && ex.args[2].head === :tuple
 
+# `nothing` and `missing` keep Julia's meaning: Base's values, whether
+# written as names or interpolated by an AST emitter. A model name shadows
+# the name, as any Julia binding would.
+_resolve_module_calls(::Nothing, ::Module, ::Set{Symbol}, where) =
+    GlobalRef(Base, :nothing)
+_resolve_module_calls(::Missing, ::Module, ::Set{Symbol}, where) =
+    GlobalRef(Base, :missing)
+
 function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
     ex in (:pi, :π) && ex ∉ names && return Float64(pi)
+    ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
     ex isa Expr || return ex
     ex.head === :quote && return ex
     # The quoted cell becomes executable in the generated kernel's module.
@@ -2679,6 +2709,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     # every rejection.
     detnames = Set{Symbol}()
     valueaxisnames = Set{Symbol}()
+    definitions = Dict{Symbol,Any}()
     for arg in args
         arg isa Expr || continue
         st = try
@@ -2689,8 +2720,13 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
         if st.head === :(=) && length(st.args) == 2 && st.args[1] isa Symbol
             push!(detnames, st.args[1])
             _is_levels_binding_rhs(st.args[2]) || push!(valueaxisnames, st.args[1])
+            definitions[st.args[1]] = st.args[2]
         end
     end
+    # Definitions a response may observe: those reading only data (a
+    # literal-only definition is not built yet as a response).
+    response_defs = Set{Symbol}(name for (name, rhs) in definitions
+        if !isempty(_value_symbols(rhs)) && _data_only(rhs, data, definitions))
     for arg in args
         if arg isa LineNumberNode
             line = arg.line
@@ -2790,20 +2826,27 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
                     nothing, nothing, rdims, slices))
                 continue
             end
-            _reject_derived_ref_lhs(st.args[2], detnames)
-            arr = _external_array_lhs(st.args[2], st.args[3], data, valueaxisnames)
-            arr === nothing && (arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames))
-            if arr !== nothing
-                alhs, adims = arr
-                _claim!(seen, seelines, alhs, line)
-                _reject_target(st.args[3], alhs)
-                push!(sample, SampleStmt(alhs, st.args[3], bc, nothing,
-                    nothing, nothing, adims))
-                continue
+            # A data-only definition observed at selected entries
+            # (`y[eachindex(y)] .~ …`, which a `@plate` loop over `y` writes)
+            # is a derived response, read like the same value bound as data.
+            derived_range = _derived_response_range(st.args[2], bc, response_defs)
+            if !derived_range
+                _reject_derived_ref_lhs(st.args[2], detnames)
+                arr = _external_array_lhs(st.args[2], st.args[3], data, valueaxisnames)
+                arr === nothing && (arr = _array_sample_lhs(st.args[2], bc, tilde, data, valueaxisnames))
+                if arr !== nothing
+                    alhs, adims = arr
+                    _claim!(seen, seelines, alhs, line)
+                    _reject_target(st.args[3], alhs)
+                    push!(sample, SampleStmt(alhs, st.args[3], bc, nothing,
+                        nothing, nothing, adims))
+                    continue
+                end
             end
-            lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde, data,
+            lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde,
+                derived_range ? union(data, (st.args[2].args[1],)) : data,
                 level_bindings)
-            if bc && st.args[2] isa Symbol
+            if bc && (st.args[2] isa Symbol || derived_range)
                 # A derived response observes an existing deterministic
                 # definition (`ly = log.(earn)` then `ly .~ ...`) instead
                 # of claiming a fresh name; either order lowers (the
@@ -4347,10 +4390,21 @@ _is_sample(st::Expr) =
 _is_broadcast_sample(st::Expr) =
     st.head === :call && length(st.args) == 3 && st.args[1] === :.~
 
+# A `.~` range over a definition reading only data observes that derived
+# response at the selected entries, as a range over the same value bound as
+# data does. Levels, matrix and subset indices size coefficient priors.
+function _derived_response_range(lhs, bc::Bool, response_defs::Set{Symbol})
+    bc && Meta.isexpr(lhs, :ref) && length(lhs.args) >= 2 &&
+        lhs.args[1] isa Symbol && lhs.args[1] in response_defs || return false
+    index = lhs.args[2]
+    return !(_is_levels_call(index) || _is_axes2_call(index) || Meta.isexpr(index, :ref))
+end
+
 # A ref LHS over a deterministic definition: ranges cover raw data
 # columns and levels/matrix sizings size coefficient priors — neither
-# observes a derived column (broadcast bare: `ly .~ ...`). Runs before
-# `_sample_lhs` so the message names the position, not the fallout.
+# observes a derived column that reads parameters (broadcast bare:
+# `ly .~ ...`). Runs before `_sample_lhs` so the message names the
+# position, not the fallout.
 function _reject_derived_ref_lhs(lhs, detnames::Set{Symbol})
     lhs isa Expr && lhs.head === :ref && length(lhs.args) == 2 &&
         lhs.args[1] isa Symbol && lhs.args[1] in detnames || return nothing
@@ -5141,14 +5195,13 @@ mutable struct _ScopeExpansion
     by_binding::Dict{Symbol,SubmodelScope}
     name_paths::Dict{Symbol,Tuple{Vararg{Symbol}}}
     used::Set{Symbol}
-    next_identifier::Int
     rewrites::Vector{Tuple{Expr,Module}}
     fixes::Dict{Symbol,ColumnData}
     bound_values::Union{Nothing,Dict{Symbol,ColumnData}}
     declared::Set{Symbol}
 end
-_ScopeExpansion(scopes, bindings, paths, used, next) =
-    _ScopeExpansion(scopes, bindings, paths, used, next,
+_ScopeExpansion(scopes, bindings, paths, used) =
+    _ScopeExpansion(scopes, bindings, paths, used,
         Tuple{Expr,Module}[], Dict{Symbol,ColumnData}(), nothing, Set{Symbol}())
 
 function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
@@ -5163,18 +5216,26 @@ function _new_submodel_scope!(ctx::_ScopeExpansion, binding::Symbol;
     return scope
 end
 
+# A local's plan identifier is spelled as its authored path (`var"z.w.b"`),
+# so generated programs read the names coordinates and draws already use.
+# A spelling that occurs in a name in use (an author's literal `var"z.b"`, a
+# name reserved from a callee body, or an earlier identifier) takes the next
+# free `#k` suffix instead; the path itself stays in `name_paths`.
 function _scope_private_name!(ctx::_ScopeExpansion, scope::SubmodelScope,
         name::Symbol)
     haskey(scope.locals, name) && return scope.locals[name]
-    while true
-        ctx.next_identifier += 1
-        identifier = Symbol("##rkppl_scope#", lpad(ctx.next_identifier, 8, '0'))
-        any(nm -> occursin(string(identifier), string(nm)), ctx.used) && continue
-        push!(ctx.used, identifier)
-        scope.locals[name] = identifier
-        ctx.name_paths[identifier] = (scope.path..., name)
-        return identifier
+    path = (scope.path..., name)
+    spelling = join(string.(path), '.')
+    identifier = Symbol(spelling)
+    suffix = 1
+    while any(nm -> occursin(string(identifier), string(nm)), ctx.used)
+        suffix += 1
+        identifier = Symbol(spelling, '#', suffix)
     end
+    push!(ctx.used, identifier)
+    scope.locals[name] = identifier
+    ctx.name_paths[identifier] = path
+    return identifier
 end
 
 # Property reads of a call resolve lexically before mathematical lowering.
@@ -5242,7 +5303,7 @@ function _expand_submodels(ast::Expr, data::Set{Symbol}, mod::Module;
     end
     out = Any[]
     ctx = _ScopeExpansion(SubmodelScope[], Dict{Symbol,SubmodelScope}(),
-        Dict{Symbol,Tuple{Vararg{Symbol}}}(), used, 0)
+        Dict{Symbol,Tuple{Vararg{Symbol}}}(), used)
     union!(ctx.declared, data)
     for a in ast.args
         _collect_binders!(ctx.declared, a)
@@ -5342,7 +5403,7 @@ function _scope_program_edits(sm, gen, call, ctx, data)
         direct(path) || continue
         haskey(scope.locals, last(path)) || _sfail("merge pin $key matches no scoped statement")
         name, value = scope.locals[last(path)], pop!(ctx.fixes, key)
-        program = Base.merge(program, NamedTuple{(name,)}((value,)))
+        program = _merge_fixes(program, NamedTuple{(name,)}((value,)); scoped_keys = false)
         if ctx.bound_values === nothing
             helper = value isa AbstractArray ? :_bound_array_value : :_bound_value
             push!(program.ast.args, Expr(:(=), name,
@@ -9486,8 +9547,11 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
     if core.args[1] in ctx.prior_names && core.args[1] ∉ ctx.sized_decls
         # Base owns scalar indexing too: index 1 returns the value; other
         # integer or vector indices keep their ordinary Julia failures.
+        # Out of index syntax, `end` / `begin` take Julia's lowering.
         return _extract_summand(pname,
-            Expr(:call, GlobalRef(Base, :getindex), core.args...), sign, ctx)
+            Expr(:call, GlobalRef(Base, :getindex), core.args[1],
+                ReactiveKernels._kernel_ref_indices(core.args[1],
+                    core.args[2:end])...), sign, ctx)
     end
     # Reads of a declared array value (`z[g]`, `phi[1]`, `c[1]` of an
     # `Ordered` vector) or of an array-valued definition (`b[g, 1]`,
@@ -9503,6 +9567,9 @@ function _classify_ref(pname, core::Expr, sign::Int, ctx)
                                      "takes `coefficients[group]` exactly, " *
                                      "got $(repr(core))")
     base, idx = core.args
+    # An endpoint (`s[end]`) is one literal position: a value, as in Julia.
+    _is_endpoint_position(idx) &&
+        return _extract_summand(pname, core, sign, ctx)
     if haskey(ctx.factor_axes, base) &&
             idx !== ctx.factor_axes[base][1]
         return _extract_summand(pname, core, sign, ctx)
