@@ -1049,22 +1049,26 @@ _KernelBranch(::Val{CI}, ::Val{TI}, ::Val{EI}, call::F, condition::C,
                                    step_in, step_out)
 
 A recipe whose authored right-hand side is a top-level unfiltered generator
-sum with `init` whose term reads one shared vector through Base's total
-gather, `sum(… get(A, K, D) … for j in iterator; init = x)`, keeps its parts
-as metadata beside its ordinary body. Calling it runs `call`, the authored
-expression over every recipe argument, so every lowering that treats the
-enclosing `_KernelSourceOp` as opaque is unchanged.
+sum with `init`, `sum(term for j in iterator; init = x)`, whose term either
+reads one shared vector through Base's total gather (`get(A, K, D)`) or is
+plain arithmetic (`_kernel_fold_arithmetic`), keeps its parts as metadata
+beside its ordinary body. Calling it runs `call`, the authored expression over
+every recipe argument, so every lowering that treats the enclosing
+`_KernelSourceOp` as opaque is unchanged.
 
 The native plate lowering reads the parts (`_lower_authored_plate_native!`):
-when the iterator and `A` are plate invariants it runs the sum dose-outer —
+when the iterator (and `A`) are plate invariants it runs the sum fold-outer —
 one pass over the cells per element `j`, each cell accumulating
-`Base.add_sum(acc, term)` in the authored order — and, when the gather index
-advances by exactly one per cell, splits each pass at the window where `K` is
-in range, reading `A` there without the bounds test and using `D` outside it.
+`Base.add_sum(acc, term)` in the authored order. For a gathered sum
+(dose-outer) whose gather index advances by exactly one per cell, each pass
+splits at the window where `K` is in range, reading `A` there without the
+bounds test and using `D` outside it.
 `iterator`/`init`/`array` are closures over their OWN ports, selected from
 the recipe's ordered arguments by the position tuples `II`/`XI`/`AI`;
 `index` takes `j` and the ports `KI`; the steps take the accumulator, `j`
-(and `step_in` the gathered value) followed by every recipe argument.
+(and `step_in` the gathered value) followed by every recipe argument. A
+gather-free sum has empty `KI`/`AI` and `nothing` for `index`, `array`,
+`step_in` and `step_out`.
 """
 struct _KernelReduction{II,XI,KI,AI,F,IT,IN,ST,IX,AR,SI,SO}
     call::F
@@ -1168,25 +1172,32 @@ function _mark_source_call_recursion!()
     return nothing
 end
 
-# Whether a plate's dose-outer lowering of `reduction` keeps the authored
+# Whether a plate's fold-outer lowering of `reduction` keeps the authored
 # semantics for these types: a concrete accumulator type `T` that the seed and
-# every step return unchanged, an `Int` gather index and a `Vector` gather
-# source (or a contiguous column of a dense matrix). `S` is the tuple of the
-# recipe's per-cell argument types. Everything
-# here is a type computation, folded when the plate body is compiled.
+# every step return unchanged and, for a gathered sum, an `Int` gather index
+# and a `Vector` gather source (or a contiguous column of a dense matrix). `S`
+# is the tuple of the recipe's per-cell argument types. Everything here is a
+# type computation, folded when the plate body is compiled.
 @generated function _plate_reduction_ready(
-        reduction::_KernelReduction{II,XI,KI,AI}, ::Type{T},
-        ::Type{S}) where {II,XI,KI,AI,T,S<:Tuple}
+        reduction::_KernelReduction{II,XI,KI,AI,F,IT,IN,ST,IX}, ::Type{T},
+        ::Type{S}) where {II,XI,KI,AI,F,IT,IN,ST,IX,T,S<:Tuple}
     types = Any[fieldtype(S, i) for i in 1:fieldcount(S)]
     select(positions) = Any[types[i] for i in positions]
     promote = GlobalRef(Base, :promote_op)
-    quote
+    fold = quote
         isconcretetype($T) || return false
         iterator_type = $promote(reduction.iterator, $(select(II)...))
         element = eltype(iterator_type)
         isconcretetype(element) || return false
         $promote(reduction.init, $(select(XI)...)) === $T || return false
         $promote(reduction.step, $T, element, $(types...)) === $T || return false
+    end
+    IX === Nothing && return quote
+        $fold
+        true
+    end
+    quote
+        $fold
         $promote(reduction.index, element, $(select(KI)...)) === Int || return false
         source = $promote(reduction.array, $(select(AI)...))
         _plate_dense_source(source) || return false
@@ -1198,11 +1209,14 @@ end
 # Whether the coefficient-outer lowering of an `evalpoly(x, c)` cell keeps
 # Base's semantics for these types: a concrete cell type `T` that the seed
 # `c[end]` already has and every `muladd(x, acc, c[i])` keeps, coefficients in
-# an `AbstractVector` (a tuple keeps Base's unrolled method), and a one-axis
-# domain. Folded when the plate body is compiled.
+# an `AbstractVector` (a tuple keeps Base's unrolled method), a one-axis
+# domain, and an `x` that is not `Complex` (Base evaluates a complex `x` with
+# a different recurrence, `_evalpoly(z::Complex, p)`). Folded when the plate
+# body is compiled.
 @generated function _plate_evalpoly_ready(::Type{T}, ::Type{X}, ::Type{C},
                                           output_axes) where {T,X,C}
-    output_axes <: Tuple{Any} && C <: AbstractVector || return false
+    output_axes <: Tuple{Any} && C <: AbstractVector && !(X <: Complex) ||
+        return false
     quote
         isconcretetype($T) && eltype($C) === $T &&
             $(GlobalRef(Base, :promote_op))($(GlobalRef(Base, :muladd)), $X, $T, $T) === $T
@@ -1222,9 +1236,63 @@ end
 # in the first-level cache between the plate cells and the steps that read them.
 const _PLATE_STRIP = 128
 
-# Cells per tile of a coefficient-outer pass: the accumulators and the cell
-# values of one tile stay in the first-level cache across the passes.
+# Cells per tile of a fold-outer pass: the accumulators and the cell values of
+# one tile stay in the first-level cache across the passes.
 const _PLATE_FOLD_TILE = 256
+# Whether a plate's output has one axis, which a fold-outer tile walks directly.
+@inline _plate_one_axis(::Tuple{Any}) = true
+@inline _plate_one_axis(output_axes) = false
+
+# Cells per chunk of a coefficient-outer `evalpoly` cell: independent Horner
+# chains whose accumulators and `x` values stay in vector registers across the
+# coefficients, enough of them to cover the multiply-add latency.
+const _PLATE_HORNER_CHUNK = 32
+
+# `dest[i] = evalpoly(x[i], c)` for every `i` in `cells`, as Base computes it
+# for a vector `c`: the seed `c[end]`, then `muladd(x[i], acc, c[j])` for
+# `j = length(c)-1:-1:1`. A chunk of `_PLATE_HORNER_CHUNK` consecutive cells
+# runs its chains side by side, its accumulators and `x` values in registers
+# across the coefficients; the cells after the last full chunk run one at a
+# time. The callers guarantee a one-based `c` and `x` and `dest` indexable at
+# every cell; an empty `c` raises Base's `BoundsError` at the seed, as Base's
+# `p[end]` does. Its own function: inlined into a large kernel body, the
+# chunk's consecutive reads lose their adjacency to LLVM and its registers to
+# the rest of the body.
+@noinline function _plate_evalpoly_chunks!(dest, x, c, cells::AbstractUnitRange{Int})
+    seed = c[lastindex(c)]
+    degree = length(c) - 1
+    cell = first(cells)
+    stop = last(cells)
+    while cell <= stop - (_PLATE_HORNER_CHUNK - 1)
+        _plate_evalpoly_chunk!(dest, x, c, cell, seed, degree, Val(_PLATE_HORNER_CHUNK))
+        cell += _PLATE_HORNER_CHUNK
+    end
+    while cell <= stop
+        xi = @inbounds x[cell]
+        acc = seed
+        for j in degree:-1:1
+            acc = muladd(xi, acc, @inbounds c[j])
+        end
+        @inbounds dest[cell] = acc
+        cell += 1
+    end
+    dest
+end
+@generated function _plate_evalpoly_chunk!(dest, x, c, start::Int, seed, degree::Int,
+                                           ::Val{W}) where {W}
+    xs = [Symbol(:x_, k) for k in 1:W]
+    accs = [Symbol(:acc_, k) for k in 1:W]
+    quote
+        $((:($(xs[k]) = @inbounds x[start + $(k - 1)]) for k in 1:W)...)
+        $((:($(accs[k]) = seed) for k in 1:W)...)
+        for j in degree:-1:1
+            cj = @inbounds c[j]
+            $((:($(accs[k]) = muladd($(xs[k]), $(accs[k]), cj)) for k in 1:W)...)
+        end
+        $((:(@inbounds dest[start + $(k - 1)] = $(accs[k])) for k in 1:W)...)
+        nothing
+    end
+end
 
 _plate_dense_source(::Type) = false
 _plate_dense_source(::Type{<:Vector}) = true

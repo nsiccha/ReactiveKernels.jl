@@ -3430,12 +3430,14 @@ function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
          val(cports), val(tports), val(eports), call, cex, tex, eex), deps
 end
 
-# The parts of a gathered generator sum as a `_KernelReduction` construction
+# The parts of a generator sum as a `_KernelReduction` construction
 # expression, or `nothing`: a top-level `sum(term for j in iterator; init = x)`
 # without a filter (a filter can skip the term, and with it the gather index,
-# which the dose-outer check evaluates at every cell) whose term evaluates a
-# call `get(A, K, D)` of Base's `get` unconditionally — reached through eager
-# call arguments only — with an `A` that does not read `j`.
+# which the dose-outer check evaluates at every cell) whose term either
+# evaluates a call `get(A, K, D)` of Base's `get` unconditionally — reached
+# through eager call arguments only — with an `A` that does not read `j` (a
+# gathered sum), or is plain arithmetic (`_kernel_fold_arithmetic`, a
+# gather-free sum, which has no gather parts).
 function _kernel_reduction_callable(rhs, deps::Vector{Symbol}, mod,
                                     known::Set{Symbol} = Set{Symbol}(deps))
     mod isa Module || return nothing
@@ -3444,39 +3446,80 @@ function _kernel_reduction_callable(rhs, deps::Vector{Symbol}, mod,
     parts.condition === nothing || return nothing
     variable = parts.variable
     gather = _kernel_reduction_gather(parts.term, variable, mod)
-    gather === nothing && return nothing
-    path, source, index, default = gather
+    gather === nothing && !_kernel_fold_arithmetic(parts.term, mod, known) &&
+        return nothing
     portset = Set{Symbol}(deps)
     function own(ex, known)
         read = Set(_kernel_free_ports(ex, known))
         Symbol[d for d in deps if d in read]
     end
-    iterator_ports = own(parts.iterator, portset)
-    init_ports = own(parts.init, portset)
-    source_ports = own(source, portset)
-    index_ports = own(index, setdiff(portset, (variable,)))
     positions(ports) = Expr(:call, GlobalRef(Base, :Val),
                             Tuple(findfirst(==(p), deps) for p in ports))
     accumulator = gensym(:reduction_sum)
     element = gensym(:reduction_element)
-    gathered = gensym(:reduction_gathered)
     bind(body) = Expr(:let, Expr(:(=), variable, element), body)
     add(term) = Expr(:call, GlobalRef(Base, :add_sum), accumulator, term)
     closure(formals, body) = Expr(:->, Expr(:tuple, formals...),
                                   _kernel_native_body(body, mod, known))
-    Expr(:call, GlobalRef(@__MODULE__, :_KernelReduction),
-         positions(iterator_ports), positions(init_ports),
-         positions(index_ports), positions(source_ports),
-         closure(deps, rhs),
-         closure(iterator_ports, parts.iterator),
-         closure(init_ports, parts.init),
-         closure(Any[accumulator, element, deps...], bind(add(parts.term))),
+    iterator_ports = own(parts.iterator, portset)
+    init_ports = own(parts.init, portset)
+    fold = (positions(iterator_ports), positions(init_ports))
+    calls = (closure(deps, rhs),
+             closure(iterator_ports, parts.iterator),
+             closure(init_ports, parts.init),
+             closure(Any[accumulator, element, deps...], bind(add(parts.term))))
+    if gather === nothing
+        return Expr(:call, GlobalRef(@__MODULE__, :_KernelReduction), fold...,
+                    Expr(:call, GlobalRef(Base, :Val), ()),
+                    Expr(:call, GlobalRef(Base, :Val), ()),
+                    calls..., nothing, nothing, nothing, nothing)
+    end
+    path, source, index, default = gather
+    source_ports = own(source, portset)
+    index_ports = own(index, setdiff(portset, (variable,)))
+    gathered = gensym(:reduction_gathered)
+    Expr(:call, GlobalRef(@__MODULE__, :_KernelReduction), fold...,
+         positions(index_ports), positions(source_ports), calls...,
          closure(Any[element, index_ports...], bind(index)),
          closure(source_ports, source),
          closure(Any[accumulator, element, gathered, deps...],
                  bind(add(_kernel_replace_at(parts.term, path, gathered)))),
          closure(Any[accumulator, element, deps...],
                  bind(add(_kernel_replace_at(parts.term, path, default)))))
+end
+
+# Whether a generator sum's term is plain arithmetic that a loop across cells
+# vectorizes: literals, names, field reads, indexing, and calls of Base's
+# arithmetic, comparison, `min`/`max`/`abs`/`ifelse` and small literal powers,
+# which Julia lowers to multiplications. A cell of such terms runs fold-outer
+# (`_lower_plate_reduction_native(::Val{:sum}, ...)`). Any other call, such as
+# `exp`, `sqrt` (whose domain check stays scalar) or a helper, costs the same
+# or more per cell fold-outer, so it keeps the cell loop. A callee that is a
+# port or an authored local is not Base's function.
+const _KERNEL_FOLD_ARITHMETIC = (+, -, *, /, muladd, fma, min, max, abs, abs2,
+                                 inv, ifelse, <, <=, >, >=, ==, !=)
+_kernel_fold_arithmetic(ex, mod::Module, known::Set{Symbol}) =
+    ex isa Union{Symbol,Number}
+function _kernel_fold_arithmetic(ex::Expr, mod::Module, known::Set{Symbol})
+    if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        return _kernel_fold_arithmetic(ex.args[1], mod, known)
+    end
+    operands = ex.head === :ref ? ex.args :
+               ex.head === :call ? ex.args[2:end] : return false
+    any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :...), operands) &&
+        return false
+    if ex.head === :call
+        callee = ex.args[1]
+        _native_callee_shadowed(callee, known) && return false
+        f = _kernel_resolve_binding(mod, callee)
+        if f === (^)
+            length(operands) == 2 && operands[2] isa Int && -2 <= operands[2] <= 3 ||
+                return false
+        else
+            any(g -> f === g, _KERNEL_FOLD_ARITHMETIC) || return false
+        end
+    end
+    all(arg -> _kernel_fold_arithmetic(arg, mod, known), operands)
 end
 
 # The first `get(A, K, D)` call of Base's `get` in `term` that every evaluation

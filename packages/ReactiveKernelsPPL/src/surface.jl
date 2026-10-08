@@ -1777,12 +1777,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         base = ex.args[1]
         base in data && length(ex.args) == 2 &&
             _literal_row_range(ex.args[2]) && return :vector
-        if base isa Symbol && (shape(base) === :array ||
-                _model_valued(base, detmap, env, Set{Symbol}()))
-            indices = Set{Symbol}(i for i in ex.args[2:end]
-                if i isa Symbol && _obs_axis(i, data, detmap, memo, active, env))
-            return _ref_shape(ex, union(data, indices))
-        end
+        _is_array_value_ref(ex, data, detmap, memo, active, env) &&
+            return _array_ref_shape(ex, data, detmap, memo, active, env)
         _is_gather(ex, data, detmap, env) || return :scalar
         return _obs_axis(ex, data, detmap, memo, active, env) ?
             :vector : :scalar
@@ -1831,13 +1827,30 @@ function _elementwise_shape(argshapes)
     return :scalar
 end
 
+# A read `A[...]` of an array value: a declared array, an array-valued
+# definition (`b = z * M`) or a module call's result.
+_is_array_value_ref(ex::Expr, data, detmap, memo, active, env) =
+    ex.args[1] isa Symbol && length(ex.args) >= 2 &&
+    (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
+        _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
+
+# The shape of a read of an array value. A data index gathers per
+# observation on either axis, also when the data are otherwise read only
+# whole; so does an index carrying the observation axis. A definition's
+# shape and the axis an enclosing broadcast inherits both read this one
+# rule, so naming a gather never changes its shape: `rg = b[g, 1]` and
+# `(b[g, 1] .+ b[h, 1]) ./ 2` are per observation alike.
+_array_ref_shape(ex::Expr, data, detmap, memo, active, env) =
+    _ref_shape(ex, i -> (i isa Symbol && i in data) ||
+        _obs_axis(i, data, detmap, memo, active, env))
+
 # Reads of an array (`z[g]` per observation, `phi[1]` scalar, `L[:, 1]`
 # array); every other ref keeps the slice-1 scalar shape. Predictor
 # coefficient roles classify by use site, independently of this shape.
-function _ref_shape(ex, data)
+function _ref_shape(ex, gathers)
     idx = ex.args[2:end]
     isempty(idx) && return :scalar
-    if any(i -> i isa Symbol && i in data, idx)
+    if any(gathers, idx)
         # Per-observation gather: scalar selection or an oriented matrix.
         any(i -> i === :(:), idx) && return :matrix
         return :vector
@@ -1888,11 +1901,11 @@ function _obs_axis(ex, data, detmap, memo, active, env)
     elseif ex.head === :ref
         # A gather from an array value follows its observation index on
         # either axis, including definitions such as `b = z * M`.
-        array_base = ex.args[1] isa Symbol && length(ex.args) >= 2 &&
-            (_shape_of(ex.args[1], data, detmap, memo, active, env) === :array ||
-                _model_valued(ex.args[1], detmap, env, Set{Symbol}()))
+        array_base = _is_array_value_ref(ex, data, detmap, memo, active, env)
         array_base || _is_gather(ex, data, detmap, env) || return false
         any(_literal_row_range, ex.args[2:end]) && return true
+        array_base && return _array_ref_shape(ex, data, detmap, memo,
+            active, env) in (:vector, :matrix)
         return any(i -> _obs_axis(i, data, detmap, memo, active, env),
             ex.args[2:end])
     elseif ex.head === Symbol("'")
@@ -7869,6 +7882,9 @@ function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
         coefuse, base::Symbol)
     pname = _argument_name!(base, ctx)
     if ex isa Expr && (_canon_shape(ex, ctx) !== :scalar || _is_composed_map(ex))
+        _reads_latent_elementwise(ex, ctx) &&
+            return _latent_value_predictor!(lhs, pname, ex, :value,
+                IdentityLink, ctx, predictors, pred_idx)
         return _lower_composed_predictor(pname, ex, ctx, lhs, IdentityLink,
             predictors, pred_idx, coefuse)
     end
@@ -7968,6 +7984,11 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         haskey(pred_idx, pname) && return pname
         if _composed_root(ctx.detmap[loc], ctx) ||
                 (value && _is_bare_sub_map(ctx.detmap[loc], ctx))
+            # A composition reading a latent elementwise is a latent
+            # transform (`w = exp.(eta) .* abs.(th)`), read as one column.
+            _reads_latent_elementwise(ctx.detmap[loc], ctx) &&
+                return _latent_predictor!(lhs, loc, pred_link, ctx,
+                    predictors, pred_idx)
             return _lower_composed_predictor(pname, ctx.detmap[loc], ctx,
                 lhs, pred_link, predictors, pred_idx, coefuse)
         end
@@ -7992,6 +8013,9 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             "derived predictor name $pname collides with your definition — " *
             "rename yours")
         if _composed_root(loc, ctx) || (value && _is_bare_sub_map(loc, ctx))
+            _reads_latent_elementwise(loc, ctx) &&
+                return _latent_value_predictor!(lhs, pname, loc, :location,
+                    pred_link, ctx, predictors, pred_idx)
             return _lower_composed_predictor(pname, loc, ctx, lhs,
                 pred_link, predictors, pred_idx, coefuse)
         end
@@ -8003,10 +8027,45 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
     return pname
 end
 
+# Whether `ex` reads a per-cell latent elementwise: a plate latent, or a
+# per-observation definition that reads one. Scalar subtrees read a latent
+# only whole (`sum(th)`, `th[1]`) and stay composition scalar leaves, as do
+# the leaves `_extract_composed_tree` already reads as columns (retained
+# values, array-cell plate columns and declared-array gathers).
+function _reads_latent_elementwise(ex, ctx)
+    if ex isa Symbol
+        ex in ctx.plate_names && return true
+        ex in ctx.value_defs && return false
+        _is_plate_column_call(get(ctx.detmap, ex, nothing)) && return false
+        return haskey(ctx.detmap, ex) &&
+            get(ctx.detshape, ex, :scalar) !== :scalar &&
+            _derived_reads_latent(ex, ctx)
+    end
+    ex isa Expr || return false
+    _canon_shape(ex, ctx) === :scalar && return false
+    ex.head === :ref && _reads_array_value(ex, ctx; follow = false) &&
+        return false
+    args = ex.head === :call ? ex.args[2:end] :
+        _is_dotted_call(ex) ? ex.args[2].args : ex.args
+    return any(a -> _reads_latent_elementwise(a, ctx), args)
+end
+
+# An inline value reading a per-cell latent lowers as its named twin
+# (`w = exp.(eta) .* th`, then `Normal.(w, s)`): one derived column holding
+# the whole value, read by a LatentTerm. Composition leaves are
+# sub-predictors, scalars and data columns, never a latent.
+function _latent_value_predictor!(lhs, pname, ex, slot, pred_link, ctx,
+        predictors, pred_idx)
+    col = _lower_argument_value(lhs, slot, ex, ctx)
+    return _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
+        pname)
+end
+
 # Build the LatentTerm location predictor over `col` (a plate parameter or a
 # derived column that reads one); the generator emits `lp = col`.
 # Latent predictors stay per-response (no interning here).
-function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
+function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
+        pname::Symbol = Symbol(lhs, "_loc"))
     # A nested per-cell call can return a sampled local unchanged. The
     # outer binding aliases that vector; it does not create another latent.
     source = col
@@ -8020,7 +8079,6 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx)
         union!(ctx.absorbed, seen)
         col = source
     end
-    pname = Symbol(lhs, "_loc")
     (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
         "latent-location predictor name $pname collides with your " *
         "definition — rename it")

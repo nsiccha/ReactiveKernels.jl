@@ -8,11 +8,28 @@ design_name(predictor::Symbol) = Symbol(:_ppl_design_, predictor)
 offset_name(predictor::Symbol) = Symbol(:_ppl_offset_, predictor)
 
 """
+    _observation_rows(values...) -> Int
+
+Rows of the broadcast of `values` along their first axis (a number has one
+row). Generated programs read observation row counts through this call over
+bound data, so a built graph takes them from the binding it is prepared with.
+"""
+_observation_rows(values...) =
+    length(only(Base.Broadcast.broadcast_shape(map(v -> (axes(v, 1),), values)...)))
+
+# First-axis lengths broadcast when each is one or a common length.
+function _observation_rows_compatible(values)
+    lengths = unique!([size(v, 1) for v in values])
+    return length(filter(!=(1), lengths)) <= 1
+end
+
+"""
     design_recipe(shape, n_rows; plates) -> Union{Nothing,Expr}
 
 `_ppl_design_<pred> = Float64.(hcat(<blocks…>))`, or `nothing` for a
 width-0 (offset-only) predictor or a predictor with no static (data-only) blocks. `n_rows` is the design row count
-(obs-level: `n_obs`; subject-level: `n_sub`). Blocks: intercept → `ones(n)`, continuous
+(obs-level: `n_obs`; subject-level: `n_sub`), as a number or as an expression
+over bound data (`_predictor_rows_source`). Blocks: intercept → `ones(n)`, continuous
 → the bare column, factor → full-rank dummies over mapped levels,
 matrix → one part per element (`ones(n)` at intercept positions, the
 bare column otherwise — matrices hold data/derived columns only, so no
@@ -23,7 +40,7 @@ materializes the layout's packed-slice `view` to a dense vector so the
 `hcat` stays homogeneous — a mixed `Vector`/`SubArray` `hcat` lowers
 through a Union-typed path Enzyme cannot differentiate.
 """
-function design_recipe(shape::DesignShape, n_rows::Int;
+function design_recipe(shape::DesignShape, n_rows;
         plates::AbstractSet{Symbol} = Set{Symbol}())
     shape.width == 0 && return nothing
     # Continuous blocks contribute their bare column (a bound port), not a
@@ -53,7 +70,8 @@ end
 
 `_ppl_offset_<pred> = col1 .+ col2 .+ …` over offset-term columns, or
 `nothing` when the predictor has no offset terms. Scalar assignments in
-`scalars` expand over `n_rows` unless `broadcast` retains their scalar shape.
+`scalars` expand over `n_rows` (a number or an expression over bound data)
+unless `broadcast` retains their scalar shape.
 """
 function offset_recipe(shape::DesignShape; scalars = Set{Symbol}(), n_rows = 0,
         broadcast = false)
@@ -83,13 +101,13 @@ function preprocessing_recipes(plan::StructuralPlan)
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         if !_broadcast_affine(plan, pred)
-            rows = _predictor_rows(plan, pred.name)
+            rows = _predictor_rows_source(plan, pred.name)
             recipe = design_recipe(shape, rows; plates)
             recipe !== nothing && push!(stmts, recipe)
         end
         scalars = Set{Symbol}(only(t.columns) for t in pred.terms
             if _is_scalar_offset(t, plan))
-        rows = isempty(scalars) ? 0 : _located_rows(plan, pred)
+        rows = isempty(scalars) ? 0 : _located_rows_source(plan, pred)
         off = offset_recipe(shape; scalars, n_rows = rows,
             broadcast = _broadcast_affine(plan, pred))
         off !== nothing && push!(stmts, off)
@@ -149,7 +167,7 @@ end
 # `Float64.(hcat(ones(n), col, …))` over bound columns (the
 # `_contrast_expr` precedent — pure data, so the Enzyme reverse pass
 # sees a constant). The generator applies the block's coefficient slice.
-function _matrix_block_expr(b::DesignBlock, n_obs::Int)
+function _matrix_block_expr(b::DesignBlock, n_obs)
     @assert b.kind === MatrixTerm
     parts = Any[e === nothing ? :(ones($n_obs)) : e for e in b.elements]
     return :(Float64.($(Expr(:call, :hcat, parts...))))

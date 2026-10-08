@@ -231,6 +231,7 @@ const _PPL_TEST_FILES = (
     "test_parameter_priors.jl",
     "test_restricted_priors.jl",
     "test_expression_arguments.jl",
+    "test_inline_latent_values.jl",
     "test_prior_observation_audit.jl",
     "test_positive_priors.jl",
     "test_parameter_priors_reactant.jl",
@@ -254,6 +255,7 @@ const _PPL_TEST_FILES = (
     "test_observation_shapes_reactant.jl",
     "test_array_definition_gathers.jl",
     "test_array_definition_gathers_reactant.jl",
+    "test_whole_value_gathers.jl",
     "test_plate_cells.jl",
     "test_array_cell_rows.jl",
     "test_array_cell_rows_reactant.jl",
@@ -264,6 +266,7 @@ const _PPL_TEST_FILES = (
     "test_cell_broadcast_arrays.jl",
     "test_index_endpoints.jl",
     "test_base_value_names.jl",
+    "test_rebinding_rows.jl",
 )
 
 include("sharding.jl")
