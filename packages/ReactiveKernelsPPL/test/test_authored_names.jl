@@ -131,6 +131,26 @@ const CASES = [
     end
 end
 
+@testset "authored names beside several observation axes" begin
+    # Two responses with their own rows: each location keeps its name and
+    # its own response's rows.
+    m = @rkppl begin
+        b0 ~ Normal(0, 1); s ~ Exponential(1)
+        mu1 = b0 .* x1
+        eta2 = b0 .* x2
+        y1 .~ Normal.(mu1, s)
+        y2 .~ Poisson.(exp.(eta2))
+    end
+    x1 = [0.1, -0.3, 0.5, 1.2]; x2 = [0.4, -0.2, 0.9]
+    bound = m(; x1, x2) | (; y1 = Y, y2 = [1, 0, 2])
+    built = build_kernel(bound)
+    u = [0.3, 0.1]
+    @test query(built, bound, :mu1, u) ≈ 0.3 .* x1
+    @test query(built, bound, :eta2, u) ≈ 0.3 .* x2
+    plain = ReactiveKernelsPPL._with(bound; named_values = Pair{Symbol,Symbol}[])
+    @test density(built, bound, u) == density(build_kernel(plain), plain, u)
+end
+
 @testset "an inline location has no authored name to keep" begin
     m = @rkppl begin
         a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1)

@@ -1497,14 +1497,15 @@ end
 # kernel-plate precedent: total likelihood lanes).
 
 """Plan slots whose dimensions resolve from their authored inputs or uses.
-New slots must establish the same property before joining this list."""
+New slots must establish the same property before joining this list.
+`named_values` only names existing nodes, so it has their dimensions."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :parameters, :assignments, :derived, :columns, :n_obs, :roles,
     :levelmaps, :vector_parameters, :submodel_scopes, :conditioned,
     :plate_parameters, :scans,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
-    :cell_broadcasts)
+    :cell_broadcasts, :named_values)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
