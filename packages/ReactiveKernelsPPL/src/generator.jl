@@ -96,6 +96,18 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     return Expr(:(=), sig, Expr(:block, stmts...))
 end
 
+# A generated definition with its private names (`gensym`s, which differ
+# between lowerings) renamed in order of first appearance. Two bindings
+# generate the same program exactly when these are equal.
+function _program_identity(def)
+    names = Dict{Symbol,Symbol}()
+    rename(x::Symbol) = Base.isgensym(x) ?
+        get!(() -> Symbol("##", length(names) + 1), names, x) : x
+    rename(x::Expr) = Expr(x.head, Any[rename(a) for a in x.args]...)
+    rename(x) = x
+    return rename(def)
+end
+
 # Conditioning selects the same declaration-density graph as a prior. Its
 # constrained value is a read-only input, with no layout entry or Jacobian.
 function _density_selection(plan, selected)
@@ -273,8 +285,6 @@ import .._declared_codes
 # response; `preprocessing.jl`).
 import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
 import .._broadcast_gather
-# Observation row counts over bound data (`preprocessing.jl`).
-import .._observation_rows
 # Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
 # arguments, simplex / ordered slice transforms and the slice densities.
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
@@ -436,7 +446,7 @@ function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
     for b in shape.blocks
         if b.kind === InterceptTerm
             push!(terms, broadcast ? _coef_coord(coef, k) :
-                Expr(:call, :.*, Expr(:call, :ones, _predictor_rows(plan,shape.predictor)),
+                Expr(:call, :.*, Expr(:call, :ones, _predictor_rows_source(plan, shape.predictor)),
                     _coef_coord(coef, k)))
             k += 1
         elseif b.kind === ContinuousTerm
@@ -449,7 +459,7 @@ function _affine_block_terms(plan::StructuralPlan, shape::DesignShape;
             k += w
         elseif b.kind === MatrixTerm
             w = b.width
-            push!(terms, :($(_matrix_block_expr(b, _predictor_rows(plan,shape.predictor))) *
+            push!(terms, :($(_matrix_block_expr(b, _predictor_rows_source(plan, shape.predictor))) *
                 $(:(view($coef, $k:$(k + w - 1))))))
             k += w
         end
@@ -540,7 +550,8 @@ function _rows_source(n::Int, anchors::Vector)
     values = Any[last(a) for a in anchors]
     _observation_rows_compatible(values) && _observation_rows(values...) == n ||
         return n
-    return Expr(:call, :_observation_rows, Any[first(a) for a in anchors]...)
+    return Expr(:call, GlobalRef(@__MODULE__, :_observation_rows),
+        Any[first(a) for a in anchors]...)
 end
 
 _located_rows_source(plan::StructuralPlan, pred::PredictorSpec) =
@@ -549,6 +560,23 @@ _located_rows_source(plan::StructuralPlan, pred::PredictorSpec) =
 
 _response_rows_source(plan::StructuralPlan, r::LikelihoodSpec) =
     _rows_source(_response_rows(plan, r), _response_rows_anchors(plan, r))
+
+_predictor_rows_source(plan::StructuralPlan, name::Symbol) =
+    _rows_source(_predictor_rows(plan, name), _value_rows_anchors(plan, name))
+
+# The bound values `_value_rows` measures: the value itself when bound, else
+# the per-observation columns it reads, else the rows of the responses that
+# read it (of every response, when none does).
+function _value_rows_anchors(plan::StructuralPlan, name::Symbol)
+    haskey(plan.columns, name) && return Any[_column_anchor(plan, name)]
+    reads = _response_reads(plan, name, _row_columns(plan))
+    isempty(reads) || return Any[_column_anchor(plan, c) for c in sort!(collect(reads))]
+    names = Set{Symbol}([name])
+    users = [r for r in plan.responses if name in _response_reads(plan, r, names)]
+    isempty(users) && (users = plan.responses)
+    isempty(users) && return Any[]
+    return _response_rows_anchors(plan, first(users))
+end
 
 _column_anchor(plan::StructuralPlan, c::Symbol) = c => plan.columns[c]
 
@@ -1302,7 +1330,7 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         :($obj($xaug, $bfull, $s).pointwise($yf)) :
         :($obj($xaug, $bfull).pointwise($yf))
     design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
-    n = r.mi_jobs === nothing ? _response_rows(plan, r) : Expr(:call, :length, r.mi_jobs)
+    n = r.mi_jobs === nothing ? _response_rows_source(plan, r) : Expr(:call, :length, r.mi_jobs)
     return Expr[
         :($yf = $yconv.($y)),
         :($xaug = hcat(ones($n), $design)),
@@ -1588,8 +1616,10 @@ end
 # Fused whole-vector Poisson-log likelihood (base case: no evidence, no
 # weights). Value-identical to `Σ poisson(; log_rate=ηᵢ).logpdf(yᵢ)` for the
 # contract's nonnegative-integer `y`: `Σ yᵢ·ηᵢ − Σ exp(ηᵢ) − C`, with
-# `C = Σ loggamma(yᵢ+1)` baked at generation from the bound response (data-only,
-# never on the gradient tape). `_ppl_yf_<label> = Float64.(y)` is a NAMED
+# `C = Σ loggamma(yᵢ+1)` a NAMED data-only recipe over the bound response
+# (`_ppl_lfact_<label>`), never on the gradient tape. `bound=` folds it to a
+# constant, and a binding with other counts computes its own (it is not a
+# build-time literal). `_ppl_yf_<label> = Float64.(y)` is a NAMED
 # recipe so `bound=` folds it to a constant Float vector (no per-eval alloc)
 # AND gives the fused `dot` a Float operand (Reactant `dot_general` type match).
 # `sum(exp, η)` reduces without materialising the intermediate. Gradient stays
@@ -1614,12 +1644,12 @@ end
 function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
     lp = _location_node(r, plan)
-    ycol = plan.columns[y]
-    cterm = sum(SpecialFunctions.loggamma(Float64(v) + 1.0) for v in ycol)
     yf = _yfloat_name(r.label)
+    cterm = Symbol(:_ppl_lfact_, r.label)
     return Expr[
         _poisson_plate_stmts(r, plan, node, _pw_name(r.label))[1:end-1]...,
         :($yf = Float64.($y)),
+        :($cterm = sum(loggamma.($yf .+ 1.0))),
         :($node::Float64 = dot($yf, $lp) - sum(exp, $lp) - $cterm),
     ]
 end
