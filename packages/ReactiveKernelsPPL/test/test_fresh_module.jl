@@ -126,6 +126,76 @@ end
     end
 end
 
+# A nested cell's per-index argument (`reference[i] .* sigma`) lowers to a
+# private gensym-named producer. Every lowering names it anew, so its place
+# among the other definitions must not follow name hashes.
+module SelectedArgumentHelpers
+level_codes(labels, source) = Int[findfirst(isequal(l), sort(unique(source))) for l in labels]
+column(draws, codes, margin) = draws[codes, margin]
+end
+
+function selected_argument_namespace()
+    mod = Module(gensym(:FreshSelected))
+    Core.eval(mod, :(using ReactiveKernelsPPL, Distributions))
+    Core.eval(mod, :(import ReactiveKernels))
+    Core.eval(mod, :(const Helpers = $SelectedArgumentHelpers))
+    Core.eval(mod, :(using .Helpers: level_codes, column))
+    Core.eval(mod, quote
+        @rkppl group_effects(g) = begin
+            tau[1:1] .~ Exponential.(0.9)
+            z[levels(g), 1:1] .~ Normal.(0, 1)
+            return z .* tau[1]
+        end
+        @rkppl population_effects(X, ncoef, loc, scale) = begin
+            beta[1:ncoef] .~ Normal.(loc, scale)
+            return X * beta
+        end
+        ReactiveKernels.@kernel cell_reader(xs, alpha) = begin
+            cells = ReactiveKernels.plate(xs, alpha) do x, a
+                x * a
+            end
+            return cells
+        end
+        ReactiveKernels.@kernel shifted_normal(value, location, reference, scale) = begin
+            r = ((value - location) + reference) / scale
+            logdensity = (-0.5 * log(2pi) - log(scale)) - 0.5 * r * r
+            return logdensity
+        end
+    end)
+    mod
+end
+
+@testset "per-index cell arguments keep their place across fresh lowerings" begin
+    ast = quote
+        b ~ group_effects(subject)
+        codes = level_codes(subject, subject)
+        effect = column(b, codes, 1)
+        X = hcat(ones(length(subject)))
+        pop ~ population_effects(X, 1, 0.0, 0.7)
+        alpha = pop .+ effect
+        sigma ~ Exponential(0.9)
+        cells = cell_reader(x, alpha)
+        @plate for i = eachindex(y)
+            y[i] .~ LogDensity.(shifted_normal, cells[i], reference[i] .* sigma, sigma)
+        end
+    end
+    data = Dict{Symbol,Any}(:subject => ["b", "empty", "a"],
+        :x => [[0.0, 0.5, 1.0], Float64[], [0.0, 0.3, 0.8, 1.4]],
+        :reference => [[0.01, 0.02, 0.03], Float64[], [0.01, 0.02, 0.03, 0.04]],
+        :y => [[0.1, 0.2, 0.4], Float64[], [0.0, 0.1, 0.3, 0.4]])
+    lower() = bind_data(lower_rkppl(ast, data;
+        mod = selected_argument_namespace(), conditioned = (:y,)), data)
+    first_plan = lower()
+    built = build_kernel(first_plan)
+    u = collect(range(-0.4, 0.5; length = built.layout.total))
+    expected = Base.invokelatest(prepare_query(built, first_plan, :sampler), u)
+    @test isfinite(expected)
+    for _ in 1:4
+        density = prepare_query(built, lower(), :sampler)
+        @test Base.invokelatest(density, u) == expected
+    end
+end
+
 @testset "undefined names still fail at lowering" begin
     mod = fresh_namespace()
     ast = :(begin
