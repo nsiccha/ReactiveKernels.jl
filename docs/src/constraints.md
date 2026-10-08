@@ -442,6 +442,22 @@ and lock the one Reactant 0.2.289 lifted:
   [Enzyme issue #2386](https://github.com/EnzymeAD/Enzyme.jl/issues/2386)
   tracks comprehension activity analysis. This evidence and boundary note are
   interim tracking, not completion of that capability.
+- Native Enzyme reverse mode fails static activity analysis
+  (`EnzymeRuntimeActivityError`) when a fresh container holds arrays loaded
+  from a constant argument and its contents reach an active result. The
+  rejected store writes the constant element's pointer into the container;
+  every element is constant and the derivative is defined.
+  `repro_enzyme_constant_element_container.jl` reproduces it with Enzyme
+  only, including `map(identity, groups)` and field reads of constant
+  records, on Julia 1.10.12 and 1.12.7 with Enzyme 0.13.210 and with Enzyme
+  `dogfood` 07ebfe22. Fresh copies of the elements, or reading the constant
+  argument without the intermediate container, differentiate. A plate whose
+  cell returns its unbound argument's element (`plate(groups) do g; g end`,
+  `identity(g)`, `s.xs`) builds this container: its pointwise buffer is the
+  plate's output. Under `bound=` such a data-only plate is hoisted out of the
+  gradient and differentiates. RK's lowering stores the authored cell result
+  unchanged, and `test_plate_consumer_native_ad.jl` pins the unbound
+  gradients as broken. The repair belongs in Enzyme's activity analysis.
 - Native Enzyme reverse rejects Base's dense concatenation methods when
   constant and active arrays of one element type meet
   (`EnzymeRuntimeActivityError`): `vcat`/`hcat` of `Vector{T}`s, the
