@@ -1775,11 +1775,12 @@ end
 end
 
 # Coefficient-outer lowering of an `evalpoly(x, c)` cell over shared
-# coefficients (snag native-lowering-948c4ab6). Base's `evalpoly` over a vector
-# is a per-cell runtime Horner loop; the lowering runs each coefficient as one
-# pass over a tile of cells, with Base's operations in Base's order. The
-# control calls the same `evalpoly` through a function the lowering does not
-# recognize, so it keeps the cell loop.
+# coefficients (snags native-lowering-948c4ab6, evalpoly-per-cel-cea5fcf5).
+# Base's `evalpoly` over a vector is a per-cell runtime Horner loop; the
+# lowering runs chunks of cells side by side, their accumulators in registers
+# across the coefficients (`_plate_evalpoly_chunks!`), with Base's operations
+# in Base's order. The control calls the same `evalpoly` through a function
+# the lowering does not recognize, so it keeps the cell loop.
 _plate_horner(x, c) = evalpoly(x, c)
 @kernel evalpoly_cell(xs, c) = begin
     ys = plate(xs, Ref(c)) do x, c
@@ -1801,6 +1802,13 @@ end
     total = sum(ys)
     return ys, total
 end
+# `x` read beside a second lane: a one-element `xs` expands to `ws`'s axes.
+@kernel evalpoly_cell_expanded(xs, ws, c) = begin
+    ys = plate(xs, ws, Ref(c)) do x, w, c
+        evalpoly(x, c) + 0 * w
+    end
+    return ys
+end
 _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(kernel)))
 
 @testset "authored plate block: an evalpoly cell over shared coefficients runs coefficient-outer" begin
@@ -1809,8 +1817,10 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     @test !_evalpoly_lowered(control)
     @test _evalpoly_lowered(prepare(evalpoly_cell_reordered))
     coefficients = [1.0, -0.25, 0.125, 0.3, -0.07, 0.011, 2.5e-3, -4.0e-4, 1.0e-5, 3.0e-6, -7.0e-7]
-    # Lengths around the tile, and degrees down to a constant.
-    for n in (0, 1, 255, 256, 257, 513, 1000), c in (coefficients, coefficients[1:2], [2.5])
+    # Lengths around the chunk, and degrees down to a constant.
+    chunk = ReactiveKernels._PLATE_HORNER_CHUNK
+    lengths = (0, 1, chunk - 1, chunk, chunk + 1, 2chunk - 1, 2chunk + 1, 255, 1000)
+    for n in lengths, c in (coefficients, coefficients[1:2], [2.5])
         xs = [1 / (k + 0.5) for k in 0:n-1]
         got, expected = cell(xs, c), control(xs, c)
         @test got[1] == expected[1] == evalpoly.(xs, Ref(c))
@@ -1826,6 +1836,16 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     @test cell(grid, coefficients)[1] == evalpoly.(grid, Ref(coefficients))
     # A one-based view is lowered like a vector.
     @test cell(xs, view(coefficients, 2:6))[1] == evalpoly.(xs, Ref(view(coefficients, 2:6)))
+    # Base evaluates a complex `x` with its own recurrence, so it keeps the
+    # cell loop; a real `x` over complex coefficients is Horner's and lowered.
+    zs = complex.(xs, reverse(xs) ./ 3)
+    zc = complex.(coefficients, 0.1 .* reverse(coefficients))
+    @test cell(zs, zc)[1] == evalpoly.(zs, Ref(zc))
+    @test cell(xs, zc)[1] == evalpoly.(xs, Ref(zc))
+    # An `x` expanded from one element is not read directly; same values.
+    expanded = prepare(evalpoly_cell_expanded)
+    @test expanded([0.3], xs, coefficients) == fill(evalpoly(0.3, coefficients), length(xs))
+    @test expanded(xs, [1.0], coefficients) == evalpoly.(xs, Ref(coefficients))
     # Base's errors: empty coefficients have no `c[end]`.
     @test_throws BoundsError cell(xs, Float64[])
     @test cell(Float64[], Float64[]) == (Float64[], 0.0)
@@ -1835,9 +1855,15 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
     allocated(control, xs, coefficients)
     @test allocated(cell, xs, coefficients) <= allocated(control, xs, coefficients) +
                                                 _natural_sup_parity_margin
-    # The coefficient passes vectorize across cells.
+    # The kernel calls the chunked helper, whose chunk runs as vector
+    # operations across its cells.
+    @test occursin("_plate_evalpoly_chunks!", _plate_entry_llvm(cell, xs, coefficients))
     if Sys.ARCH in (:x86_64, :aarch64)
-        @test occursin(r"<\d+ x double>", _plate_entry_llvm(cell, xs, coefficients))
+        chunk_llvm = sprint(io -> InteractiveUtils.code_llvm(io,
+            ReactiveKernels._plate_evalpoly_chunk!,
+            Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}, Int, Float64, Int,
+                  Val{chunk}}; debuginfo = :none))
+        @test occursin(r"<\d+ x double>", chunk_llvm)
     end
 end
 

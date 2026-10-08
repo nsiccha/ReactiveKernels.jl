@@ -1009,7 +1009,7 @@ function _authored_scan_hoistable(op::_AuthoredScanOp)
 end
 
 # A step operation that folds over a shared operand, which the strip region
-# runs across steps: Base's `evalpoly` (the coefficient-outer passes) or a
+# runs across steps: Base's `evalpoly` (the coefficient-outer chunks) or a
 # gathered generator sum (the dose-outer passes).
 _scan_step_fold(op) = false
 _scan_step_fold(::typeof(evalpoly)) = true
@@ -1687,14 +1687,13 @@ end
 # shared by every cell. Per cell, Base's `evalpoly(x, c::AbstractVector)` is a
 # runtime Horner loop, `ex = c[end]`, then `ex = muladd(x, ex, c[i])` for
 # `i = length(c)-1:-1:1`: a chain of dependent multiply-adds that cannot run
-# across cells. Here the cells of one tile take the seed, then each
-# coefficient in turn: one contiguous pass `acc = muladd(x, acc, c[i])` over
-# the tile per coefficient, which vectorizes across cells. Every cell performs
-# Base's operations in Base's order. The tile (`_PLATE_FOLD_TILE` cells) keeps
-# the accumulators and the cell's `x` in cache across the coefficient passes.
-# The types are checked when the body is compiled (`_plate_evalpoly_ready`);
-# coefficients with offset axes, which Base's `evalpoly` rejects, and domains
-# with more than one axis keep the cell loop.
+# across cells. Here the cells run side by side, a chunk of them at a time,
+# with their accumulators held in registers across the coefficients
+# (`_plate_evalpoly_chunks!`). Every cell performs Base's operations in
+# Base's order. The types are checked when the body is compiled
+# (`_plate_evalpoly_ready`); coefficients with offset axes, which Base's
+# `evalpoly` rejects, domains with more than one axis, and an `x` whose axes
+# are not the plate's keep the cell loop.
 function _lower_plate_reduction_native(::Val{:evalpoly}, reduction, inner::Plan,
                                        locals, callargs, callvalues, raw_arguments,
                                        prepared_arguments, atomic, root_positions,
@@ -1718,29 +1717,28 @@ function _lower_plate_reduction_native(::Val{:evalpoly}, reduction, inner::Plan,
              Expr(:call, GlobalRef(Base, :has_offset_axes), coefficients)))
     ready = _plate_reduction_every_cell(ready, reduction, callargs, root_positions,
                                         atomic, callvalues)
-    c, cells, count, lo, hi, position, cell, seed, j, cj = gensym.((
-        :plate_coefficients, :plate_cells, :plate_count, :plate_tile_lo,
-        :plate_tile_hi, :plate_position, :plate_cell, :plate_seed,
-        :plate_coefficient_index, :plate_coefficient))
-    entry = :($pointwise_lhs[$cell])
-    x = argument(x_input, cell)
+    # `x` varies per cell, so it is a plate argument (an invariant `x` would
+    # make the cell invariant). When its axes are the plate's, the chunks read
+    # it directly: the broadcast projection selects its index per read.
+    x_have = root_positions[canon_id(graph, x_input.id)]
+    raw_x = raw_arguments[x_have]
+    raw_x === nothing && return cell_loop
+    ready = Expr(:&&, ready, Expr(:call,
+        GlobalRef(@__MODULE__, :_plate_spans), output_axes, raw_x))
+    c, axis, position = gensym.((:plate_coefficients, :plate_axis_range, :plate_position))
     base(name) = GlobalRef(Base, name)
-    tile_cells(body) = _plate_tile_cells(cells, position, lo, hi, cell, body)
     interchanged = quote
         $c = $coefficients
-        $cells = $(base(:CartesianIndices))($output_axes)
-        $count = $(base(:length))($cells)
-        $(_plate_fold_tiles(count, lo, hi, quote
-            $seed = $c[$(base(:lastindex))($c)]
-            $(tile_cells(_inbounds_expr(:($entry = $seed))))
-            for $j in ($(base(:length))($c) - 1):-1:1
-                $cj = $c[$j]
-                $(tile_cells(_inbounds_expr(:($entry = $(base(:muladd))($x, $entry, $cj)))))
-            end
-        end))
+        $axis = $(base(:only))($output_axes)
+        $(base(:isempty))($axis) ||
+            $(GlobalRef(@__MODULE__, :_plate_evalpoly_chunks!))($pointwise_lhs, $raw_x, $c, $axis)
     end
-    accumulator === nothing || push!(interchanged.args,
-        _plate_fold_total(accumulator, cells, count, position, cell, entry))
+    if accumulator !== nothing
+        # The total adds the cells in coordinate order, as the cell loop does.
+        push!(interchanged.args, Expr(:for, :($position = $axis), Expr(:block,
+            :($accumulator = $(GlobalRef(@__MODULE__, :_plate_total_add))(
+                $accumulator, $(_inbounds_value(:($pointwise_lhs[$position]))))))))
+    end
     Expr(:if, ready, interchanged, cell_loop)
 end
 
