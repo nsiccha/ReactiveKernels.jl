@@ -262,6 +262,7 @@ const _PPL_TEST_FILES = (
     "test_covariance_values_reactant.jl",
     "test_varying_values_reactant.jl",
     "test_cell_broadcast_arrays.jl",
+    "test_index_endpoints.jl",
 )
 
 include("sharding.jl")
