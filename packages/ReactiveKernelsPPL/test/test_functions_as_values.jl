@@ -633,15 +633,15 @@ _fv_reads(ex, sym::Symbol) = ex === sym ? 1 : ex isa Expr ?
         # An affine predictor read by name and inlined into another
         # definition: computed once, so the data column is read once.
         (quote
-            a ~ Normal(0, 1); b ~ Normal(0, 1)
+            a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1.0)
             eta = a .+ b .* x
             theta = 0.8 .+ abs.(eta)
-            y .~ Weibull.(1.4, theta)
-            c .~ Weibull.(1.4, 0.8 .+ abs.(eta))
+            y .~ Normal.(theta, s)
+            c .~ Normal.(0.8 .+ abs.(eta), s)
         end, src -> _fv_reads(src.args[2], :x) == 1, function (th)
             theta = 0.8 .+ abs.(th.a .+ th.b .* x)
-            sum(logpdf.(Weibull.(1.4, theta), y)) +
-                sum(logpdf.(Weibull.(1.4, theta), c))
+            sum(logpdf.(Normal.(theta, th.s), y)) +
+                sum(logpdf.(Normal.(theta, th.s), c))
         end),
         # A factor-coefficient alias read by two predictors: one gather.
         (quote
