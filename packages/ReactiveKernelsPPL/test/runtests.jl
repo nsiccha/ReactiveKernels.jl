@@ -263,6 +263,7 @@ const _PPL_TEST_FILES = (
     "test_varying_values_reactant.jl",
     "test_cell_broadcast_arrays.jl",
     "test_index_endpoints.jl",
+    "test_base_value_names.jl",
 )
 
 include("sharding.jl")
