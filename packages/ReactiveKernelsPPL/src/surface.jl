@@ -9328,10 +9328,12 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     isempty(node.args) && return _sfail("$where has an empty call node")
     op = node.args[1]
     # An undotted module call over data and model values (`f(x)`,
-    # `f(s, x)`) is one model-level value leaf, as its named spelling
-    # (`v = f(x)`) and a call reading no column are.
-    op isa GlobalRef && !_composed_has_sub(node, ctx, true) &&
-        return _composed_scalar_leaf!(pname, node, ctx, scalars)
+    # `f(s, x)`, `f(base)` with `base` a sub-predictor) is one model-level
+    # value leaf, as its named spelling (`v = f(base)`) and a call reading
+    # no column are. A sub-predictor it reads is then read by an ordinary
+    # value, so lowering replans it as a retained value, as for the named
+    # spelling.
+    op isa GlobalRef && return _composed_scalar_leaf!(pname, node, ctx, scalars)
     op isa Symbol || return _sfail("$where has an anonymous call node")
     args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
     if op === :.* || op === :.+ || op ===:.-
