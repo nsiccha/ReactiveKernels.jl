@@ -40,16 +40,14 @@ loop: each pointwise value is stored and immediately added to the return.
 ## Broadcasting is the batching contract
 
 `plate` follows Julia broadcasting semantics. Equal array dimensions align and
-zip; singleton dimensions expand; scalars repeat. `Ref(value)` marks an
-array-valued argument as one atomic value rather than a batch axis; a cell that
-reads an enclosing value without passing it gets the same atomic value (see
-[Plate-cell scope](#Plate-cell-scope)). Incompatible shapes raise
-`DimensionMismatch`.
+zip; singleton dimensions expand; scalars repeat. Incompatible shapes raise
+`DimensionMismatch`. A value every cell reads whole is not a plate argument:
+the cell closes over it (see [Plate-cell scope](#Plate-cell-scope)).
 
 Whole parameter arrays can remain atomic when observation data is bound. A
 kernel prepared with `bound = (; x, y)` may keep `q` as its only input and read
-`q` in each plate cell as a closure, or pass it as `Ref(q)`. The same prepared
-kernel accepts Reactant-traced `q`:
+`q` in each plate cell as a closure. The same prepared kernel accepts
+Reactant-traced `q`:
 every cell receives the complete parameter array, while the observation
 operands determine the broadcast axes and singleton expansion.
 
@@ -65,31 +63,37 @@ same broadcast rules.
 
 ### Plate-cell scope
 
-A `plate(... do` cell reads enclosing names the way a Julia closure does. The
-plate's explicit non-`Ref` arguments are the only zipped axes. Any other
-enclosing name the cell reads is captured whole as an atomic operand, exactly
-as if it had been passed as `Ref(name)`. This covers `@kernel` signature ports,
-names assigned earlier in the kernel body and, inside a nested plate, the outer
-cell's arguments and locals. A captured scalar is shared by every cell. A
-captured array, tuple or struct is the whole value, never its per-cell element.
-Closures are the preferred way to read a whole value in every cell. An explicit
-`Ref` operand stays supported and prepares the same kernel, including under
-`bound=` partial evaluation and native reverse differentiation:
+A `plate(... do` cell reads enclosing names the way a Julia closure does, and
+closing over a value is how every cell shares it. The plate's explicit
+arguments are the only zipped axes. Any other enclosing name the cell reads is
+captured whole: a `@kernel` signature port, a name assigned anywhere in the
+kernel body or, inside a nested plate, an outer cell's argument or local. A
+captured scalar is shared by every cell. A captured array, tuple or struct is
+the whole value, never its per-cell element. The capture is one shared operand
+of the plate: work that reads only captures runs once, outside the cell loop,
+and `bound=` partial evaluation and native reverse differentiation treat it as
+shared data.
 
 ```julia
-@kernel shifted_sum(x, d) = begin
-    shifted = x .+ 1.0
-    cells = plate(eachindex(d), d) do s, dd
-        shifted[s] + dd          # same as plate(eachindex(d), Ref(shifted), d)
+@kernel normalized_poly(x, c) = begin
+    total = sum(x)
+    cells = plate(x) do xi
+        evalpoly(xi / total, c)          # `total` and `c` are read whole
     end
     return cells
 end
 ```
 
-Pass an array as an explicit plate argument when its axis should zip, as in
-`plate(y, mu) do observed, mean ... end`. Names assigned inside the cell are
+An array with one element per cell is an explicit plate argument, zipped with
+the others, as in `plate(y, mu) do observed, mean ... end`. Do not close over
+it and index it by the cell's own index. Names assigned inside the cell are
 cell-local. An authored `scan` step captures enclosing names the same way; see
 [Sequential recurrences with `scan`](scan.md).
+
+Do not wrap a shared value in `Ref` as a plate argument; close over it. Older
+kernels pass shared values as `Ref(value)` arguments. Such an argument prepares
+the same kernel as the closure, and how that spelling is retired is open (user
+decision `0kvm2ip`).
 
 Subkernel and endpoint calls accept ordinary `f(name = value)` and
 `f(; name = value)` spellings. They normalize to the same graph.
@@ -125,8 +129,9 @@ is never read. A filtered sum needs its `init`, because a traced condition
 cannot choose which element starts the sum.
 
 Natively the `get` spelling runs dose-outer. When the doses and the response
-`u` are plate invariants (captured enclosing values, `Ref` operands, scalars,
-or cell values computed from them only), the native loop makes one pass over the observations per dose, and
+`u` are plate invariants (captured enclosing values, scalars, or cell values
+computed from them only), the native loop makes one pass over the observations
+per dose, and
 each observation adds that dose's term to its running sum, so every value is
 the authored fold in the authored dose order, bitwise. Where the lag advances
 by exactly one per observation, as `t - s[j]` does over `1:n`, each pass
