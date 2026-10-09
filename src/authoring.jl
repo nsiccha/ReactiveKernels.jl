@@ -301,16 +301,11 @@ function _kernel_inline_alias!(graph::Graph, from::Value, to::Value, context)
         "nested kernel $context type mismatch: :$(from.name) has type $from_type, " *
         "but :$(to.name) has type $to_type; declare the caller boundary with the " *
         "exact nested boundary type"))
-    # An omitted annotation is no type contract. Keep a differing declaration
-    # as the same identity/conversion recipe used by an ordinary assignment,
-    # so neither the caller nor the child loses its declared boundary type.
-    from_type == to_type || return _kernel_alias!(graph, from, to, identity, 1.0)
-    source = canon_id(graph, from.id)
-    target = canon_id(graph, to.id)
-    source == target && return graph
-    graph.aliases[source] = target
-    graph.version += 1
-    graph
+    # An omitted annotation is no type contract: an unannotated side reads the
+    # other side's value directly (`_kernel_alias!`). A differing declaration
+    # keeps the identity/conversion recipe of an ordinary typed assignment, so
+    # neither the caller nor the child loses its declared boundary type.
+    _kernel_alias!(graph, from, to, identity, 1.0)
 end
 
 """
@@ -381,10 +376,23 @@ Base.@nospecializeinfer function _kernel_add!(
 
     child_graph = getfield(spec, :graph)
     child_have = Set{Int}(canon_id(child_graph, v.id) for v in child_inputs)
+    # The call owns a lexical namespace under the caller's name for its result:
+    # the child's values are named `result.name`, as a bound child endpoint's
+    # are `standard.name`, so an argument RK passes through a hygienic port
+    # reads as `result.formal`. The child's results keep their own names: they
+    # join the caller's result classes below and are shown by the caller's
+    # names. A generated result name (a lifted subexpression) or several
+    # results scope nothing.
+    scope = length(outs) == 1 && !_generated_value_name(first(outs).name) ?
+        first(outs).name : nothing
+    results = Set{Int}(canon_id(child_graph, v.id) for v in child_outputs)
     cloned = Dict{Int,Value}()
     for id in sort!(collect(keys(child_graph.values)))
         value = child_graph.values[id]
-        cloned[id] = value!(graph, value.name, valtype(value))
+        name = scope === nothing || canon_id(child_graph, id) in results ||
+               _generated_value_name(value.name) ? value.name :
+            _kernel_scoped_port(scope, value.name)
+        cloned[id] = value!(graph, name, valtype(value))
     end
 
     # Preserve all proven aliases before attaching the cloned boundary. Alias
@@ -401,8 +409,25 @@ Base.@nospecializeinfer function _kernel_add!(
     for (actual, formal) in zip(call_inputs, child_inputs)
         _kernel_inline_alias!(graph, cloned[formal.id], actual, "input")
     end
+    child_read = Set{Int}(canon_id(child_graph, value.id)
+                          for recipe in child_graph.recipes for value in recipe.inputs)
+    cloned_ids = Set{Int}(value.id for value in values(cloned))
     for (actual, formal) in zip(outs, child_outputs)
-        _kernel_inline_alias!(graph, actual, cloned[formal.id], "output")
+        result = cloned[formal.id]
+        root = canon_id(graph, result.id)
+        result_type = valtype(graph.values[root])
+        if root in cloned_ids &&
+           (result_type == valtype(graph.values[canon_id(graph, actual.id)]) ||
+            result_type === Any && !(canon_id(child_graph, formal.id) in child_read))
+            # The child's result is the caller's assigned value: the caller's
+            # value stays canonical, so a port keeps its own name (plans name
+            # HAVE values by their canonical value). An unannotated result that
+            # no child recipe reads takes a caller declaration, which converts
+            # it where the child computes it, exactly as `actual = identity(result)`.
+            _kernel_alias!(graph, result, actual, identity, 1.0)
+        else
+            _kernel_inline_alias!(graph, actual, result, "output")
+        end
     end
 
     for recipe in child_graph.recipes
@@ -433,8 +458,11 @@ end
 #
 # SOUNDNESS: it merges canonical CLASSES (`src=canon_id(from)`, `dst=canon_id(to)`) and is a
 # NO-OP when they already coincide, so a reverse/transitive `a=b; b=a` cannot build a cycle or
-# reparent incorrectly. It collapses ONLY a PROVEN same-declared-type identity; a typed
-# conversion (`b::T = a::U`, T≠U) is uncertain, so the ordinary identity Recipe is kept instead.
+# reparent incorrectly. It collapses ONLY a PROVEN identity: both classes declare the same type,
+# or `from`'s class declares none (an omitted annotation is no type contract, so `b = a` with an
+# unannotated `b` reads `a` itself, declared type included). A typed conversion (`b::T = a::U`,
+# T≠U, or `b::T` from an unannotated `a`) is uncertain, so the ordinary identity Recipe is kept.
+# A class's root carries the class's declared type (`Any` when no member declares one).
 # The caller hard-aliases only outputs with EXACTLY ONE authored definition (`b=a; b=c` are
 # alternative producers, not a proof `a===c`).
 function _kernel_alias!(graph::Graph, from::Value, to::Value, @nospecialize(op), cost,
@@ -442,7 +470,8 @@ function _kernel_alias!(graph::Graph, from::Value, to::Value, @nospecialize(op),
     src = canon_id(graph, from.id)
     dst = canon_id(graph, to.id)
     src == dst && return graph                       # already one class (reverse/transitive)
-    if valtype(from) == valtype(to)                  # proven same-type identity → collapse
+    from_type = valtype(graph.values[src])
+    if from_type == valtype(graph.values[dst]) || from_type === Any  # proven identity → collapse
         graph.aliases[src] = dst
         graph.version += 1                           # a real canonical mutation (like CSE/merge)
     else                                             # typed conversion → keep the ordinary recipe
@@ -5101,12 +5130,17 @@ function _kernel_clone_aliases!(graph::Graph, mapped::Dict{Int,Value},
         canonical_id = canon_id(graph, canonical.id)
         source_id = canon_id(graph, alias_id)
         source_id == canonical_id && continue
-        valtype(graph.values[source_id]) == valtype(graph.values[canonical_id]) ||
-            throw(ArgumentError(
+        source_type = valtype(graph.values[source_id])
+        canonical_type = valtype(graph.values[canonical_id])
+        if source_type != canonical_type
+            # An unannotated class joins a typed one under the typed root
+            # (`_kernel_alias!`); two different declarations do not merge.
+            source_type === Any || canonical_type === Any || throw(ArgumentError(
                 "cannot merge structural aliases for value :$(alias.name): " *
-                "$(valtype(graph.values[source_id])) does not match " *
-                "$(valtype(graph.values[canonical_id]))"))
-        if source_id != alias_id
+                "$source_type does not match $canonical_type"))
+            source_type === Any ? (graph.aliases[source_id] = canonical_id) :
+                                  (graph.aliases[canonical_id] = source_id)
+        elseif source_id != alias_id
             # A repeated transparent inclusion can attach the same public
             # boundary to another fresh internal child value.  Union that new
             # root into the already-established canonical class instead of

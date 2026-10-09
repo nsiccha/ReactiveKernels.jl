@@ -128,9 +128,9 @@ end
         if dependent
             scale = only(p for p in fx.plan.predictors if p.name === :sd)
             @test :mu in only(scale.terms).options.subs
-            @test occursin("_ppl_lp_mu", string(only(
+            @test occursin(r"\bmu\b", string(only(
                 s for s in ReactiveKernelsPPL._predictor_statements(fx.bound)
-                if s.args[1] === :_ppl_lp_sd)))
+                if s.args[1] === :sd).args[2]))
         end
     end
     for dependent in (false, true)
