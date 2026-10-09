@@ -610,14 +610,18 @@ let ports = [Symbol(:xs, k) for k in 1:WIDE_NA_PORTS],
     end
 end
 
-# Calls `kernel` with the tuple's elements as explicit arguments, so the
-# measurement does not include a caller-side splat of 34 arguments.
-@generated function wide_naad_call_bytes(kernel, args::Tuple)
-    call = Expr(:call, :kernel,
-                (:(getfield(args, $index)) for index in 1:fieldcount(args))...)
-    quote
-        $call
-        @allocated $call
+# Fixed-arity measurements: `kernel` is called with explicit arguments, so the
+# measured call has no splat of its own. The call sits in a `begin … end`
+# block: from Julia 1.12, `@allocated f(args...)` runs
+# `Base.allocated(f, args...)`, whose own `f(args...)` splat dispatches
+# dynamically past 32 arguments and would be measured too.
+for count in (1, WIDE_NA_PORTS + 1)
+    arguments = [Symbol(:argument_, index) for index in 1:count]
+    @eval function wide_naad_call_bytes(kernel, $(arguments...))
+        kernel($(arguments...))
+        @allocated begin
+            kernel($(arguments...))
+        end
     end
 end
 
@@ -647,8 +651,8 @@ end
     noplate = prepare_nonallocating(wide_noplate_naad; have, want = :total)
     narrow = prepare_nonallocating(wide_noplate_naad; have = (:live,),
                                    want = :total)
-    @test wide_naad_call_bytes(noplate, (live, data...)) ==
-          wide_naad_call_bytes(narrow, (live,))
+    @test wide_naad_call_bytes(noplate, live, data...) ==
+          wide_naad_call_bytes(narrow, live)
     noplate_ad = prepare_ad(noplate, NA_AD_BACKEND, live, data...;
                             active = :live)
     value, g = ad_value_and_gradient(noplate_ad, live, data...)
