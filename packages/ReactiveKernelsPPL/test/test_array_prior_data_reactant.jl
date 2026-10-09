@@ -17,10 +17,24 @@ using Reactant
         eachrow(P[levels(k), 1:3]) .~ Dirichlet(alpha)
         y .~ Normal.(P[k, 1], 0.7)
     end)
+    # Two-axis arrays read per-element arguments of their own size.
+    elementwise = :(begin
+        B[levels(k), 1:2] .~ Normal.(LOC, SC)
+        y .~ Normal.(B[k, 1], 0.7)
+    end)
+    live = :(begin
+        a ~ Normal(0, 1)
+        M = LOC .+ a
+        B[levels(k), 1:2] .~ Normal.(M, SC)
+        y .~ Normal.(B[k, 2], 0.7)
+    end)
     means(K) = Dict(:mu0 => [0.2 * sin(i) for i in 1:K])
+    matrices(K) = Dict(:LOC => [0.2 * sin(i + j) for i in 1:K, j in 1:2],
+        :SC => [1.0 + 0.1 * (i + j) for i in 1:K, j in 1:2])
     for (ast, extra, coordinates) in ((direct, means, identity),
             (composed, means, K -> K + 1),
-            (concentration, K -> Dict(:alpha => [1.2, 2.1, 0.8]), K -> 2K))
+            (concentration, K -> Dict(:alpha => [1.2, 2.1, 0.8]), K -> 2K),
+            (elementwise, matrices, K -> 2K), (live, matrices, K -> 2K + 1))
         structures = Dict{String,Int}[]
         recipes = Int[]
         for (K, n) in ((3, 8), (5, 17))

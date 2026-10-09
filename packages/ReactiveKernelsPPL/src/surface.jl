@@ -10864,10 +10864,12 @@ function _slice_prior_arg(what, head, a, dotted::Bool)
         _is_ref_call(a) && return a.args[2]
         _is_slice_iterator(a) && return a
         a isa Real && !(a isa Bool) && return a
+        per = _slice_elements_arg(a)
+        per === nothing || return per
         _sfail("$what: in the dotted `$head.(…)` every argument is shared " *
-            "(`Ref(x)`) or iterates slices (`eachrow(M)` / `eachcol(M)`), " *
-            "got $(repr(a)) — a bare array would broadcast over its " *
-            "elements, as in Julia")
+            "(`Ref(x)`), iterates slices (`eachrow(M)` / `eachcol(M)`) or " *
+            "lists one vector per slice (`[v1, v2, …]`), got $(repr(a)) — " *
+            "a bare array would broadcast over its elements, as in Julia")
     end
     _is_slice_iterator(a) && _sfail("$what: `$(repr(a))` gives one " *
         "argument per slice, which pairs slices only in a broadcast — " *
@@ -10876,6 +10878,24 @@ function _slice_prior_arg(what, head, a, dotted::Bool)
         "of a broadcast `$head.(…)`; an undotted `$head(…)` shares every " *
         "argument already")
     return a
+end
+
+# A vector literal of vector values in a dotted slice prior,
+# `D.([v1, v2, …])`: broadcasting iterates its elements, so slice `g` takes
+# `v_g`, exactly as `D.(eachcol(hcat(v1, v2, …)))` pairs them. Literal
+# vectors of numbers become that matrix's literal columns; other entries are
+# values whose lengths Julia checks. Numbers are not vectors (`nothing`).
+function _slice_elements_arg(a)
+    a isa Expr && a.head === :vect && !isempty(a.args) &&
+        !any(x -> x isa Real, a.args) || return nothing
+    lits = all(x -> x isa Expr && x.head === :vect &&
+        all(y -> y isa Real, x.args), a.args)
+    if lits && length(unique!([length(x.args) for x in a.args])) == 1
+        K = length(first(a.args).args)
+        return Expr(:call, :eachcol, Expr(:vcat,
+            (Expr(:row, (x.args[i] for x in a.args)...) for i in 1:K)...))
+    end
+    return Expr(:call, :eachcol, Expr(:call, GlobalRef(Base, :hcat), a.args...))
 end
 
 # A vector-valued argument (a mean, a concentration): never a scalar.
