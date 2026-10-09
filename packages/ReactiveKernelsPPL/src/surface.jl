@@ -4264,7 +4264,8 @@ end
 #   storage (`c[i] = t[i]`, `c[i] = a`) stays its own plate as well: a live
 #   tuple holding a constant element is the constant-storage boundary of
 #   native Enzyme Reverse (`reactivekernels-use` §7ak).
-# - A cell with fewer than two live values emits exactly its former plates.
+# - A value that does not share a plate runs only the cell statements it
+#   reads (`_needed_cell_locals`).
 struct _CellValues
     ivar::Symbol
     axis::Any
@@ -4295,7 +4296,8 @@ function _emit_cell_values!(out, values::_CellValues, plate_defs)
     (; ivar, axis, indices, entries) = values
     column(name, locals, rhs; reads = ()) =
         Expr(:(=), name, _plate_column_call(ivar, locals, rhs, axis; indices, reads))
-    lowered = Dict{Int,Vector{Any}}(k => Any[column(e.name, e.locals, e.rhs)]
+    lowered = Dict{Int,Vector{Any}}(k =>
+        Any[column(e.name, _needed_cell_locals(e.locals, e.rhs), e.rhs)]
         for (k, e) in enumerate(entries))
     for fused in _shared_cell_groups(values)
         named = [e for e in entries[fused] if !Base.isgensym(e.name)]
@@ -4362,6 +4364,22 @@ function _shared_cell_groups(values::_CellValues)
         push!(get!(groups, root(k), Int[]), k)
     end
     return sort!([g for g in Base.values(groups) if length(g) >= 2]; by = first)
+end
+
+# The cell statements a value is computed from, in cell order. A value's own
+# plate runs only these: a statement it does not read (another output's work)
+# would make it read that work's inputs too, so a value reading only data
+# would read a parameter and stop being data-only.
+function _needed_cell_locals(locals, rhs)
+    needed = _cell_free_syms!(Set{Symbol}(), rhs)
+    keep = falses(length(locals))
+    for k in reverse(eachindex(locals))
+        name, ex = locals[k]
+        name in needed || continue
+        keep[k] = true
+        _cell_free_syms!(needed, ex)
+    end
+    return locals[keep]
 end
 
 # The names a value reads through the cell locals it is computed from, and

@@ -255,3 +255,45 @@ end
         end
     end
 end
+
+# A data-only output of a cell whose other outputs read parameters is a
+# data-only definition: it reads only data, so `weighted` accepts it as
+# weights (co-report on snag rkppl-plate-for-5f5a19db, BRM's in-cell
+# weighted observations).
+@testset "a data-only output of a shared @plate cell stays data-only" begin
+    x = [[0.5, 1.0], [0.7], [0.4, 0.9, 1.3]]
+    w = [[1.0, 2.0], [0.5], [1.5, 1.0, 2.5]]
+    y = [[0.6, 1.4], [0.9], [0.5, 1.2, 1.9]]
+    data = Dict{Symbol,Any}(:x => x, :w => w, :y => y)
+    ast = quote
+        s ~ Normal(0, 1)
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(x)
+            m = s .* x[i]
+            v = 0.5 .* w[i]
+            c[i] = m
+            r[i] = 2 .* m
+            wt[i] = v .+ 0.25
+        end
+        @plate for i in eachindex(y)
+            y[i] .~ weighted.(Normal.(c[i] .+ r[i], sigma), wt[i])
+        end
+    end
+    bound = bind_data(lower_rkppl(ast, data; conditioned = (:y,), mod = @__MODULE__), data)
+    built = build_kernel(bound)
+    saved = deepcopy(data)
+    function oracle(v)
+        q = constrain(built.layout, v)
+        logpdf(Normal(), q.s) + logpdf(Exponential(1.0), q.sigma) + logjac(built.layout, v) +
+            sum(sum((0.5 .* wi .+ 0.25) .* logpdf.(Normal.(3 .* q.s .* xi, q.sigma), yi))
+                for (xi, wi, yi) in zip(x, w, y))
+    end
+    sampler = prepare_sampler(built, bound, [0.2, 0.1];
+        backend = AutoEnzyme(; mode = Enzyme.Reverse))
+    for u in ([0.2, 0.1], [-0.3, 0.4])
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u) rtol = 1e-10
+        @test gradient ≈ _pco_fd(oracle, u) rtol = 1e-6 atol = 1e-8
+    end
+    @test isequal(data, saved)
+end
