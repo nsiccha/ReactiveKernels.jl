@@ -2561,24 +2561,29 @@ function ReactiveKernels._ad_prepared_value_and_gradient(
         prepared::ReactiveKernels.PreparedADKernel{I},
         point::Union{Reactant.TracedRArray,Reactant.TracedRNumber},
         contexts) where {I}
+    ReactiveKernels._ad_refuse_staged_retention(prepared)
     # These contexts were built from `prepared.external_values`, which the
     # native preparation externalizes as owning view copies (not prebuilt
-    # views) and numeric constants; preserve that complete hidden ABI.
+    # views) and numeric constants, packed by type; restore their original
+    # order and preserve that complete hidden ABI.
     kernel, _ = ReactiveKernels._externalize_bound_arrays(
         prepared.kernel; materialize_view_copies = true, externalize_scalars = true)
     call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     DifferentiationInterface.value_and_gradient(
-        call, prepared.backend, point, contexts...)
+        call, prepared.backend, point,
+        ReactiveKernels._ad_unpack_hidden_contexts(prepared, contexts)...)
 end
 
 function ReactiveKernels._ad_prepared_value_and_gradient(
         prepared::ReactiveKernels.PreparedADKernel{I},
         point::_RKReactantADTuple, contexts) where {I}
+    ReactiveKernels._ad_refuse_staged_retention(prepared)
     kernel, _ = ReactiveKernels._externalize_bound_arrays(
         prepared.kernel; materialize_view_copies = true, externalize_scalars = true)
     call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     DifferentiationInterface.value_and_gradient(
-        call, prepared.backend, point, contexts...)
+        call, prepared.backend, point,
+        ReactiveKernels._ad_unpack_hidden_contexts(prepared, contexts)...)
 end
 
 function ReactiveKernels._ad_prepared_value_and_gradient!(
@@ -2644,6 +2649,7 @@ end
 function _rk_reactant_compile_ad_call(
         mode::Val, prepared::ReactiveKernels.PreparedADKernel{I}, kernel,
         args::Tuple; sync::Bool, optimize = nothing) where {I}
+    ReactiveKernels._ad_refuse_staged_retention(prepared)
     op = _rk_reactant_ad_op(mode)
     call = ReactiveKernels._ADKernelCall{I,typeof(kernel)}(kernel)
     backend = prepared.backend

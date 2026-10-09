@@ -130,6 +130,32 @@ _has_linenumber(x) = x isa LineNumberNode ||
         @test occursin("@inline f(z) = z + y", string(code))
     end
 
+    @testset "a global shows by its bare name unless the program spells it otherwise" begin
+        first_mod, second_mod = Module(:DisplayGlobalsA), Module(:DisplayGlobalsB)
+        f1, f2 = GlobalRef(first_mod, :f), GlobalRef(second_mod, :f)
+        g2 = GlobalRef(second_mod, :g)
+        source = :(y = $f1(x) + $g2(x))
+        original = deepcopy(source)
+        code = readable_code(source)
+        @test source == original
+        @test string(code.expr) == "y = f(x) + g(x)"
+        @test code.modules == [first_mod, second_mod]
+        @test startswith(string(code), "# authored sources evaluated in: ")
+        @test readable_code(source; modules = (Base,)).modules == [Base, first_mod, second_mod]
+        # Two modules' globals of one name, or a local spelled like a global,
+        # keep their module paths.
+        clash = readable_code(:(y = $f1(x) + $f2(x)))
+        @test occursin("DisplayGlobalsA.f(x)", string(clash.expr))
+        @test occursin("DisplayGlobalsB.f(x)", string(clash.expr))
+        @test isempty(clash.modules)
+        shadowed = readable_code(:(f = x; y = $f1(f)))
+        @test occursin("DisplayGlobalsA.f(f)", string(shadowed.expr))
+        # A Base name keeps its Base display.
+        based = readable_code(:(y = $(GlobalRef(Base, :sum))(x)))
+        @test string(based.expr) == "y = sum(x)"
+        @test isempty(based.modules)
+    end
+
     @testset "rich display of readable code escapes HTML" begin
         code = readable_code(:(x < y && y > z))
         html = sprint(show, MIME"text/html"(), code)

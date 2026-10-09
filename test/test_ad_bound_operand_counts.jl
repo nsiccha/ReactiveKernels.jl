@@ -67,3 +67,63 @@ end
     @test values == (data, 0.5)
     @test external([0.1, 0.2], values...) == body(ops, [0.1, 0.2])
 end
+
+# Kernels whose bound data leave many hidden operands, evaluated once at file
+# scope: `width` bound vectors plus `width` bound scalars, read by a scalar
+# objective chained through binary `+`.
+const _MANY_BOUND_OPERANDS = Dict(map((4, 40)) do width
+    vectors = [Symbol(:v, i) for i in 1:width]
+    scalars = [Symbol(:s, i) for i in 1:width]
+    terms = [:(q[1] * $v[1] + q[2] * $v[2] + $s)
+             for (v, s) in zip(vectors, scalars)]
+    total = foldl((left, right) -> Expr(:call, :+, left, right), terms)
+    spec = @eval @kernel $(Symbol(:many_bound_operands_, width))(
+            q::Vector{Float64}, $(vectors...), $(scalars...)) = begin
+        density::Float64 = $total
+    end
+    bound = NamedTuple{(vectors..., scalars...)}(
+        ((([0.1i, -0.2i] for i in 1:width)...),
+         ((0.01i for i in 1:width)...)))
+    width => (spec, bound)
+end)
+
+@testset "the AD call's arity does not grow with the bound operands" begin
+    # Every hidden operand used to cross as its own `Constant` context. From
+    # 32 annotated arguments Enzyme's reverse `autodiff` re-splats past Julia's
+    # 32-element limit, and from 32 contexts DifferentiationInterface maps
+    # them with Base's unspecialized `map`, so each call dispatched
+    # dynamically and boxed every operand: a BRM reader paid 13 KB per
+    # gradient for one more bound operand, its plate's `eachindex` domain
+    # (snag `rk-ref-indexed-p-5d0a952e`). Operands now cross as one named
+    # tuple.
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    q = [0.3, -0.7]
+    bytes = Dict{Int,Int}()
+    for width in (4, 40)
+        spec, bound = _MANY_BOUND_OPERANDS[width]
+        kernel = prepare(spec; want = :density, bound)
+        prepared = prepare_ad(kernel, backend, q; active = :q)
+        hidden = ReactiveKernels._ad_hidden_operands(prepared)
+        @test length(hidden) == 2width
+        # One `Constant` named tuple, keyed by the bound ports.
+        @test length(prepared.external_values) == 1
+        pack = only(prepared.external_values)
+        @test sort!(collect(keys(pack))) == sort!(collect(keys(bound)))
+        @test all(pack[name] == bound[name] for name in keys(pack))
+        expected = sum(q[1] * 0.1i - q[2] * 0.2i + 0.01i for i in 1:width)
+        derivative = [sum(0.1i for i in 1:width), -sum(0.2i for i in 1:width)]
+        gradient = zeros(2)
+        value, returned = ad_value_and_gradient!(prepared, gradient, q)
+        @test value ≈ expected
+        @test returned === gradient
+        @test gradient ≈ derivative
+        @test ad_gradient(prepared, q) ≈ derivative
+        pullback = prepare_ad_pullback(kernel, backend, 1.5, q; active = :q)
+        @test ad_pullback(pullback, 1.5, q) ≈ 1.5 .* derivative
+        call() = ad_value_and_gradient!(prepared, gradient, q)
+        call(); call()
+        bytes[width] = @allocated call()
+    end
+    # A wide boundary costs what a narrow one does.
+    @test bytes[40] <= bytes[4]
+end

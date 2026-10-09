@@ -3007,7 +3007,7 @@ end
         y .~ Normal.(mu, 1.0)
     end, Dn; conditioned = Dn)
     @test only(p for p in expr.parameters if p.name === :s).args.arg2 ===
-        :_rkppl_s_arg2
+        :s_scale
     # Explicit prior-only declarations do not require an observation response.
     @test (lower_rkppl(quote
         b ~ Normal(0, 1)

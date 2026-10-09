@@ -100,6 +100,12 @@ to Base's scalar `mapreduce`; `test_reactant_joint.jl` pins the working
 shape).
 """
 function prepare_query(built, plan::StructuralPlan, preset::Symbol; on_error = nothing)
+    return _prepare_wants(built, plan, workflow_wants(preset); on_error)
+end
+
+# Prepare the built graph over the sampler boundary for one WANT node or a
+# tuple of them (a tuple-WANT kernel returns a tuple in that order).
+function _prepare_wants(built, plan::StructuralPlan, want; on_error = nothing)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -107,7 +113,7 @@ function prepare_query(built, plan::StructuralPlan, preset::Symbol; on_error = n
     # (newer than any already-compiled caller), so partial evaluation must
     # run at the latest world. Same barrier guards every call below.
     return Base.invokelatest(prepare, built.spec; have = _query_have(plan),
-        want = workflow_wants(preset), bound = _query_bound(plan), on_error)
+        want, bound = _query_bound(plan), on_error)
 end
 
 # A built graph evaluates the program its build generated. A binding that
@@ -162,7 +168,7 @@ struct SamplerQuery{K,P,L}
 end
 
 """
-    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing) -> SamplerQuery
+    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = ()) -> SamplerQuery
 
 Prepare a reusable [`SamplerQuery`](@ref): the `:sampler`-cut value kernel
 plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
@@ -174,16 +180,44 @@ must be loaded in the calling session (`using Enzyme` for `AutoEnzyme`);
 the backend value alone does not load
 DifferentiationInterface's backend extension, and preparation without it
 fails loudly naming the missing `using`.
+
+`retain` names further query presets (`:pointwise`, `:likelihood`, `:prior`,
+`:log_jacobian`) whose values the gradient's own primal sweep returns through
+[`sampler_value_gradient_and_retained!`](@ref), with no second primal pass.
+It needs a backend that keeps that sweep's values (reverse-mode
+`AutoEnzyme`; see `ReactiveKernels.ad_retains_primal_sweep`).
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
-        backend, on_error = nothing)
+        backend, on_error = nothing, retain::Tuple = ())
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
     kern = prepare_query(built, plan, :sampler; on_error)
-    prep = Base.invokelatest(prepare_ad, kern, backend, Vector{Float64}(u0);
-        active = :unconstrained)
+    gradient_kernel, wants = if isempty(retain)
+        kern, ()
+    else
+        wants = _retained_wants(retain)
+        _prepare_wants(built, plan,
+            (workflow_wants(:sampler), wants...); on_error), wants
+    end
+    prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
+        Vector{Float64}(u0); active = :unconstrained, retain = wants)
     return SamplerQuery(kern, prep, layout)
+end
+
+# The WANT nodes for retained presets. The sampler density is the gradient's
+# own value, so it is not a retained output.
+function _retained_wants(retain::Tuple)
+    allunique(retain) || throw(ArgumentError(
+        "[query] retain names the same preset more than once: $retain"))
+    map(retain) do preset
+        preset isa Symbol || throw(ArgumentError(
+            "[query] retain entries are query preset names; got $(repr(preset))"))
+        preset === :sampler && throw(ArgumentError(
+            "[query] the sampler density is the gradient's value; retain " *
+            "only other presets $(filter(!=(:sampler), keys(WORKFLOW_WANTS)))"))
+        workflow_wants(preset)
+    end
 end
 
 """
@@ -210,6 +244,22 @@ function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Vect
 end
 function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVector)
     return Base.invokelatest(ad_value_and_gradient!, q.ad, g, Vector{Float64}(u))
+end
+
+"""
+    sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector, u)
+
+Posterior value and gradient at unconstrained `u` as
+[`sampler_value_and_gradient!`](@ref) computes them, plus the presets named
+by `prepare_sampler(...; retain)` evaluated by the same primal sweep. Returns
+`(value, g, retained)`, where `retained` is a `NamedTuple` keyed by those
+preset names (`retained.pointwise` has the shape `prepare_query(…, :pointwise)`
+returns). Each call returns freshly computed retained values.
+"""
+function sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector,
+        u::AbstractVector)
+    v = u isa Vector{Float64} ? u : Vector{Float64}(u)
+    return Base.invokelatest(ad_value_gradient_and_retained!, q.ad, g, v)
 end
 
 function _stack_restored_draws(values)
