@@ -41,9 +41,10 @@ end
   step reads is captured whole: a `@kernel` signature port, a name the kernel
   body assigns, or a name of an enclosing plate cell or scan step. Only the
   positionals are iterated. Do not pass a shared value as a `Ref(...)`
-  positional. Older kernels do, after the iterated sequences; such an operand
-  prepares the same kernel as the closure, and how that spelling is retired is
-  open (user decision `0kvm2ip`).
+  positional. Older kernels do, after the iterated sequences. Such an operand
+  prepares the same kernel as the closure, and it is deprecated (user
+  decision `0kvm2ip`): each site warns once at definition under
+  `--depwarn=yes`, and it will become an error.
 - **The do-block** receives `(carry, x₁, x₂, …)` and must end with the 2-tuple
   `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]` (one
   entry per step); the final carry is internal.
@@ -68,6 +69,35 @@ callable runtime function outside one (calling it directly throws with a pointer
 to this page). Like an authored `plate`, a scan is an ordinary recipe of the
 graph it is written in: write it as the right-hand side of a named port, next to
 any other recipes, plates and scans of that graph. It needs no kernel of its own.
+
+## Loop syntax: `@scan`
+
+A scan can also be written as a loop over its trajectory:
+
+```julia
+@kernel ar1(x, phi, s) = begin
+    @scan begin
+        a[1] = s
+        for t in 2:length(x)
+            a[t] = phi * a[t - 1] + x[t]
+        end
+    end
+    return a
+end
+```
+
+- **Carried arrays.** Every array the loop writes at `t` is carried. Seed it
+  at `1..m` before the loop, at the same depth `m` for every carried array. A
+  seed may read earlier seeds by literal index.
+- **Reads in a step.** A step reads earlier values through literal lags
+  `a[t - k]` with `1 ≤ k ≤ m`, and the current `a[t]` after its write. Other
+  values are closures, including `x[t]` and `t` itself.
+- **The result.** `a` is the whole trajectory `[a[1], …, a[T]]`.
+
+One carried array with one seed prepares exactly `a = scan(2:length(x);
+init = s, include_init = true) do a_prev, t … end`. Several carried arrays
+(a `level` driven by an `increment`, say) are folded by one scan each, with
+their seeds prepended.
 
 ## Example: an ARMA(1,1) error recursion
 
