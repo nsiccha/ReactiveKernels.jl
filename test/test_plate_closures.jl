@@ -480,3 +480,117 @@ end
     @test occursin("`Ref(scale)` as a `plate(...) do` operand", text)
     @test occursin("`Ref(w)` as a `scan(...) do` operand", text)
 end
+
+# A subexpression of a cell that reads only shared values runs once per call,
+# above the cell loop, as if the author had named it (snag
+# `plate-body-evalu-4235a1ca`). The counter only shows where a value is
+# computed; nothing else in these cells has an effect.
+const _SHARED_CALLS = Ref(0)
+_counted_exp(x) = (_SHARED_CALLS[] += 1; exp(x))
+_shared_decay(t, dose, k) = dose .* exp.(-k .* t)
+
+@kernel _shared_inline(t, dose, log_k) = begin
+    cells = plate(t, dose) do t, dose
+        _shared_decay(t, dose, _counted_exp(log_k))
+    end
+    return cells
+end
+@kernel _shared_named(t, dose, log_k) = begin
+    cells = plate(t, dose) do t, dose
+        k = _counted_exp(log_k)
+        _shared_decay(t, dose, k)
+    end
+    return cells
+end
+@kernel _shared_loop(t, dose, log_k) = begin
+    @plate for i in eachindex(t, dose)
+        loc[i] = _shared_decay(t[i], dose[i], _counted_exp(log_k))
+    end
+    return loc
+end
+@kernel _shared_density(y, mu, log_sigma) = begin
+    cells = plate(y) do yi
+        -0.5 * ((yi - mu) / exp(log_sigma))^2 - log_sigma
+    end
+    total = sum(cells)
+    return total
+end
+# A lazy arm, a generator reading the cell, a mutating call's arguments and an
+# index reading `end` keep their own evaluation.
+@kernel _shared_lazy(x, k) = begin
+    cells = plate(x) do xi
+        xi > 0 ? xi * _counted_exp(k) : -xi
+    end
+    return cells
+end
+@kernel _shared_generator(x, w, k) = begin
+    cells = plate(x) do xi
+        sum(wj * xi * _counted_exp(k) for wj in w; init = 0.0) +
+            sum(wj * _counted_exp(k) for wj in w; init = 0.0)
+    end
+    return cells
+end
+@kernel _shared_mutating(x, k) = begin
+    cells = plate(x) do xi
+        sum(push!(Float64[k], xi))
+    end
+    return cells
+end
+@kernel _shared_field_evalpoly(xs, p) = begin
+    ys = plate(xs) do x
+        evalpoly(x, p.coefficients)
+    end
+    return ys
+end
+@kernel _shared_index_bound(x, m, n) = begin
+    cells = plate(x) do xi
+        m[xi, end - n]
+    end
+    return cells
+end
+
+@testset "shared subexpressions of a plate cell run once per call" begin
+    t = [[0.5, 1.5], Float64[], [0.7, 1.1, 2.0]]
+    dose = [1.0, 2.0, 1.5]
+    expected = [_shared_decay(ti, d, exp(0.3)) for (ti, d) in zip(t, dose)]
+    for spec in (_shared_inline, _shared_named, _shared_loop)
+        k = prepare(spec)
+        _SHARED_CALLS[] = 0
+        @test k(t, dose, 0.3) == expected
+        @test _SHARED_CALLS[] == 1
+        program = _closure_program(k)
+        @test findfirst("_counted_exp(", program).start < findfirst("for ", program).start
+    end
+    # The lifted value is one more invariant recipe of the cell.
+    cell(spec) = only(r for r in plan(spec).recipes if recipe_kind(r) === :plate)
+    @test length(plate_body(cell(_shared_inline)).recipes) ==
+          length(plate_body(cell(_shared_named)).recipes) == 2
+
+    x = [1.0, -2.0, 3.0]
+    _SHARED_CALLS[] = 0
+    @test prepare(_shared_lazy)(x, 0.5) == [1.0, 2.0, 3.0] .* [exp(0.5), 1.0, exp(0.5)]
+    @test _SHARED_CALLS[] == 2
+    w = [0.25, 0.5]
+    _SHARED_CALLS[] = 0
+    @test prepare(_shared_generator)(x, w, 0.5) ≈
+          [sum(w) * xi * exp(0.5) + sum(w) * exp(0.5) for xi in x]
+    @test _SHARED_CALLS[] == length(x) * length(w) + length(w)
+    @test prepare(_shared_mutating)(x, 0.5) == x .+ 0.5
+    # A field read of a shared value is lifted as well, so an `evalpoly` cell
+    # over it runs coefficient-outer like `c = p.coefficients; evalpoly(x, c)`.
+    p = (; coefficients = [1.0, -0.25, 0.125, 0.3])
+    field = prepare(_shared_field_evalpoly)
+    @test occursin("_plate_evalpoly_ready", string(ReactiveKernels.code_expr(field)))
+    @test field(x, p) == evalpoly.(x, Ref(p.coefficients))
+    m = reshape(collect(1.0:12.0), 3, 4)
+    @test prepare(_shared_index_bound)([1, 3], m, 1) == [m[1, 3], m[3, 3]]
+
+    # Native Reverse through the lifted value.
+    y, mu, log_sigma = [0.5, -1.0, 2.0, 0.25], 0.2, 0.3
+    prepared = prepare_ad(prepare(_shared_density), AutoEnzyme(; mode = Enzyme.Reverse),
+                          y, mu, log_sigma; active = :log_sigma)
+    value, gradient = ad_value_and_gradient(prepared, y, mu, log_sigma)
+    z = (y .- mu) ./ exp(log_sigma)
+    @test value ≈ sum(-0.5 .* z .^ 2 .- log_sigma)
+    @test gradient ≈ sum(z .^ 2 .- 1)
+end

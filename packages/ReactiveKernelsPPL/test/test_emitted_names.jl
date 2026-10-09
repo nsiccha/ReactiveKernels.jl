@@ -60,8 +60,8 @@ end
     text = _text(bound)
 
     @testset "plate cells name their arguments after their values" begin
-        @test occursin("plate(y, _ppl_lp_y_eta, y_scale) do y, _ppl_lp_y_eta, y_scale", text)
-        @test occursin("(normal(_ppl_lp_y_eta, y_scale)).logpdf(y)", text)
+        @test occursin("plate(y, y_eta, y_scale) do y, y_eta, y_scale", text)
+        @test occursin("(normal(y_eta, y_scale)).logpdf(y)", text)
         @test !occursin(r"_ppl_c\d", text)
     end
 
@@ -158,6 +158,53 @@ end
         y .~ Normal.(a .+ shiftby(x .* a, 0.5), 1.0)
     end
     @test occursin("y_shiftby = shiftby(x .* a, 0.5)", _text(_bound(nested, (; x, y))))
+end
+
+@testset "a literal zero bound contributes nothing to its transform" begin
+    model = quote
+        s ~ restricted(Normal(0, 1), 0.0, Inf)
+        d[1:2] .~ restricted.(Exponential.(0.125), 0.0, 0.5)
+        n ~ restricted(Normal(0, 1), -Inf, 0)
+        p ~ Uniform(0, 1)
+        h ~ Uniform(-1, 2)
+        y .~ Normal.(p .+ n .* x .+ h, s + d[1] + d[2])
+    end
+    bound = _bound(model, (; x, y))
+    text = _text(bound)
+    @test occursin("s::Float64 = exp(_ppl_fl_s)", text)
+    @test occursin("_ppl_fl_s::Float64 = log(s)", text)
+    @test occursin("d::AbstractVector{Float64} = 0.5 ./ (1 .+ exp.(-_ppl_int_d))", text)
+    @test occursin("_ppl_int_d::AbstractVector{Float64} = log.(d) .- log.(0.5 .- d)", text)
+    @test occursin("n::Float64 = -(exp(_ppl_up_n))", text)
+    @test occursin("p::Float64 = 1.0 / (1 + exp(-_ppl_int_p))", text)
+    @test occursin("h::Float64 = -1.0 + 3.0 / (1 + exp(-_ppl_int_h))", text)
+    @test occursin("log(h + 1.0)", text)
+    for gratuitous in ("0.0 +", "0.0 .+", "- 0.0", ".- 0.0", "0.0 -", "0.0 .-",
+            "- -", ".- -", "log(1.0)")
+        @test !occursin(gratuitous, text)
+    end
+    built = build_kernel(bound)
+    layout = built.layout
+    for shift in (0.0, 0.4)
+        u = collect(range(-0.3 + shift, 0.5 - shift; length = layout.total))
+        nt = constrain(layout, u)
+        sd = nt.s + nt.d[1] + nt.d[2]
+        lik = sum(logpdf.(Normal.(nt.p .+ nt.n .* x .+ nt.h, sd), y))
+        prior = logpdf(Normal(0, 1), nt.s) + sum(logpdf.(Exponential(0.125), nt.d)) +
+            logpdf(Normal(0, 1), nt.n) + logpdf(Uniform(0, 1), nt.p) +
+            logpdf(Uniform(-1, 2), nt.h)
+        sq = prepare_sampler(built, bound, u; backend = BACKEND)
+        grad = similar(u)
+        value, _ = sampler_value_and_gradient!(sq, grad, u)
+        @test value ≈ lik + prior + logjac(layout, u) rtol = 1e-12
+        h = 1e-6
+        fd = map(eachindex(u)) do i
+            up = copy(u); up[i] += h
+            dn = copy(u); dn[i] -= h
+            (sq(up) - sq(dn)) / 2h
+        end
+        @test grad ≈ fd rtol = 1e-5 atol = 1e-7
+    end
 end
 
 @testset "promotion stays for values that may not be Float64" begin

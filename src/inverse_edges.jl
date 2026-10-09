@@ -187,7 +187,9 @@ function _kernel_synthesize_pack_edges!(graph::Graph, recipe::Recipe)
     fields === nothing && return false
     packed = only(recipe.outputs)
     packed_id = canon_id(graph, packed.id)
-    by_name = Dict{Symbol,Value}(v.name => v for v in recipe.inputs)
+    # The source reads its inputs by their authored names, which a composed
+    # child's scoped values no longer carry (`_recipe_source_names`).
+    by_name = Dict{Symbol,Value}(zip(_recipe_source_names(recipe), recipe.inputs))
     for (kind, key, port) in fields
         target = get(by_name, port, nothing)
         target === nothing && continue

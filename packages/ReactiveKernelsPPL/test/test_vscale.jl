@@ -893,12 +893,12 @@ end
     end
     _walk(def)
     # One readable precompute per response: `_ppl_sc_y_resp::AbstractVector
-    # = exp.(_ppl_lp_sigma)` in dotted broadcast form.
+    # = exp.(sigma)` in dotted broadcast form.
     @test haskey(found, :_ppl_sc_y_resp)
     annot, rhs = found[:_ppl_sc_y_resp]
     @test annot === :AbstractVector
     @test rhs isa Expr && rhs.head === :. && rhs.args[1] === :exp
-    @test rhs.args[2] == Expr(:tuple, :_ppl_lp_sigma)
+    @test rhs.args[2] == Expr(:tuple, :sigma)
 end
 
 # Predictor-fed StudentT degrees of freedom (modeled nu): the vscale

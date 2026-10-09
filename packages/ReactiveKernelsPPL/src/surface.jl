@@ -933,6 +933,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         shared_defs::Set{Symbol} = Set{Symbol}())
     input_data = data
     ast = _observation_call_definitions(ast, data, mod)
+    ast = _gathered_value_definitions(ast, data)
     for name in conditioned
         input = _conditioned_input(name)
         (input in data || _mentions_symbol(ast, input)) &&
@@ -1463,6 +1464,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     responses = [r.range isa UnitRange && r.response in indexed_observations ?
         _with(r; range=Expr(:ref, r.response,
             Expr(:call, :(:), first(r.range), last(r.range)))) : r for r in responses]
+    named_values = _absorbed_named_values(det, canonmap, skip, predictors)
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
@@ -1471,10 +1473,35 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
-            if k in indexed_observations || k in indexed_external))
+            if k in indexed_observations || k in indexed_external),
+        named_values)
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
+end
+
+# A definition optimized into a predictor (a response location or scale, a
+# composition's sub-predictor) is that predictor's node, under its own name
+# (user decision `1c0jiwz`). A pure alias absorbed into the value it names
+# (`w = th` over a plate latent, `w = u` over a scan state) emits no
+# statement of its own, so it reads the alias chain's target (user decision
+# `0fbe312`; "all intermediate quantities" are part of the RK graph).
+function _absorbed_named_values(det, canonmap, skip, predictors)
+    pnames = Set{Symbol}(p.name for p in predictors)
+    absorbed(nm) = nm in skip && haskey(canonmap, nm)
+    named = Pair{Symbol,Symbol}[]
+    for (nm, _) in det
+        absorbed(nm) && nm ∉ pnames || continue
+        target = nm
+        seen = Set{Symbol}()
+        while target ∉ pnames && absorbed(target) && target ∉ seen &&
+                canonmap[target] isa Symbol
+            push!(seen, target)
+            target = canonmap[target]
+        end
+        (target in pnames || !absorbed(target)) && push!(named, nm => target)
+    end
+    return named
 end
 
 
@@ -2756,6 +2783,70 @@ end
 _synthesized_response_names(stem::Symbol) =
     (Symbol(stem, :_eta), Symbol(stem, :_loc), Symbol(stem, :_value),
      Symbol(stem, :_resp), Symbol(stem, :_disc))
+
+# A gather from an inline value is the gather from its named definition:
+# `loc = a .+ (z .* tau)[1, g]` reads as `r = z .* tau; loc = a .+ r[1, g]`
+# (naming a subexpression never changes legality or the density). So name
+# the gathered value: its definition then takes the named spelling's path —
+# the axes it inherits from declared arrays, level lookup on a `levels(g)`
+# axis, one value per observation. A data-only value already folds with its
+# gather at binding. Lazy arms and `@plate` / `@scan` bodies keep their
+# evaluation context. Identical values share one name. Runs after
+# `_observation_call_definitions`, so a module call in a response argument
+# is already a name here.
+function _gathered_value_definitions(ast::Expr, data::Set{Symbol})
+    detmap = Dict{Symbol,Any}(st.args[1] => st.args[2] for st in ast.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
+    taken = union(data, _expr_names(ast))
+    named = Dict{Any,Symbol}()
+    out = Any[]
+    function name!(value)
+        get!(named, value) do
+            k = 1
+            nm = Symbol(:_rkppl_gathered_, k)
+            while nm in taken
+                k += 1
+                nm = Symbol(:_rkppl_gathered_, k)
+            end
+            push!(taken, nm)
+            push!(out, Expr(:(=), nm, value))
+            nm
+        end
+    end
+    function walk(ex)
+        ex isa Expr || return ex
+        ex.head in (:macrocall, :quote) && return ex
+        ex.head in _DEFERRED_VALUE_HEADS && return ex
+        args = Any[walk(a) for a in ex.args]
+        if ex.head === :ref && length(args) >= 2 &&
+                _gathered_value(args[1]) && !_data_only(args[1], data, detmap)
+            args[1] = name!(args[1])
+        end
+        return Expr(ex.head, args...)
+    end
+    defined = Set{Symbol}(keys(detmap))
+    for st in ast.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+            st = Expr(:(=), st.args[1], walk(st.args[2]))
+        elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
+                !_external_rhs(st.args[3])
+            observed = _sampled_lhs_names!(Set{Symbol}(), st.args[2])
+            if any(in(data), observed) ||
+                    (_is_broadcast_sample(st) && any(in(defined), observed))
+                rhs = _map_rhs_values(walk, st.args[3])
+                rhs == st.args[3] ||
+                    (st = Expr(:call, st.args[1], st.args[2], rhs))
+            end
+        end
+        push!(out, st)
+    end
+    return Expr(:block, out...)
+end
+
+# A computed value that a gather may read: a call, a broadcast or an
+# adjoint. Names, literals, property paths and chained reads stay as written.
+_gathered_value(ex) = ex isa Expr &&
+    (ex.head === :call || ex.head === Symbol("'") || _is_dotted_call(ex))
 
 # Data-only: every value the expression reads is data or a data-only
 # definition (literals and function values aside).
@@ -8127,7 +8218,11 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
     return name
 end
 
-function _argument_name!(base::Symbol, ctx)
+# A name the lowering synthesizes for a graph value: `base`, or `base_k`
+# for the first `k` no other name of the model takes. Synthesized predictors
+# are graph values under their own names, like authored ones, so they never
+# shadow a user's name (user decision `1c0jiwz`).
+function _predictor_name!(base::Symbol, ctx)
     nm, k = base, 0
     while nm in ctx.taken
         k += 1
@@ -8142,8 +8237,8 @@ end
 # data and scalar declarations without inventing a new coefficient prior.
 function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
         coefuse, base::Symbol)
-    pname = _argument_name!(base, ctx)
     if ex isa Expr && (_canon_shape(ex, ctx) !== :scalar || _is_composed_map(ex))
+        pname = _predictor_name!(base, ctx)
         _reads_latent_elementwise(ex, ctx) &&
             return _latent_value_predictor!(lhs, pname, ex, :value,
                 IdentityLink, ctx, predictors, pred_idx)
@@ -8151,7 +8246,7 @@ function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
             predictors, pred_idx, coefuse)
     end
     return _lower_location(lhs, ex, IdentityLink, ctx, predictors, pred_idx,
-        coefuse; value = true, synth = pname)
+        coefuse; value = true, synth = base)
 end
 
 function _lower_scale_predictor_error(lhs, name, ctx)
@@ -8270,10 +8365,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # LatentTerm, just as when the whole location names that latent.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
-        pname = synth === nothing ? Symbol(lhs, "_eta") : synth
-        (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
-            "derived predictor name $pname collides with your definition — " *
-            "rename yours")
+        pname = _predictor_name!(something(synth, Symbol(lhs, "_eta")), ctx)
         if _composed_root(loc, ctx) || (value && _is_bare_sub_map(loc, ctx))
             _reads_latent_elementwise(loc, ctx) &&
                 return _latent_value_predictor!(lhs, pname, loc, :location,
@@ -8327,7 +8419,7 @@ end
 # derived column that reads one); the generator emits `lp = col`.
 # Latent predictors stay per-response (no interning here).
 function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
-        pname::Symbol = Symbol(lhs, "_loc"))
+        pname::Symbol = _predictor_name!(Symbol(lhs, "_loc"), ctx))
     # A nested per-cell call can return a sampled local unchanged. The
     # outer binding aliases that vector; it does not create another latent.
     source = col
@@ -8341,9 +8433,6 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
         union!(ctx.absorbed, seen)
         col = source
     end
-    (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
-        "latent-location predictor name $pname collides with your " *
-        "definition — rename it")
     term = TermSpec(LatentTerm, [col], NamedTuple(), col, Symbol(col, "_lat"))
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
     pred_idx[pname] = length(predictors)
@@ -8449,10 +8538,7 @@ function _value_location!(lhs, loc, pred_link, ctx, predictors,
         ctx.detshape[source] = :scalar
         source = ctx.detmap[source]
     end
-    pname = synth === nothing ? Symbol(lhs, "_eta") : synth
-    (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
-        "derived predictor name $pname collides with your definition — " *
-        "rename yours")
+    pname = _predictor_name!(something(synth, Symbol(lhs, "_eta")), ctx)
     term = if loc isa Symbol && loc in ctx.data
         TermSpec(OffsetTerm, ColumnRef[loc], NamedTuple(), loc,
             Symbol(loc, "_off"))

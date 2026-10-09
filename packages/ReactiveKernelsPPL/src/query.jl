@@ -19,6 +19,7 @@ const PPL_NODES = (
     log_jacobian = :log_jacobian,
     posterior = :posterior,
     pointwise = :pointwise,
+    observations = :_ppl_observations,
 )
 
 """
@@ -35,6 +36,15 @@ density per slice. In-cell observations use their caller's data-column
 name and flat data shape. Conditioned declarations contribute here as
 observations. Summing every field gives `:likelihood`; prior-only models
 return an empty `NamedTuple`.
+
+`:observations` returns, under the same keys, the arguments each
+observation's distribution receives: `(location = …, scale = …)` for
+responses of the Normal, Student t and LogNormal families, where entry `i`
+belongs to entry `i` of the response's `:pointwise` densities and a value
+shared by every observation stays a scalar. Prior-only models return an empty
+`NamedTuple`. Preparing it for a program with any other observation (another
+family, a response holding one array per index, a sampling-RHS observation or
+a conditioned declaration) throws a `ContractValidationError` naming them.
 """
 const WORKFLOW_WANTS = (
     sampler = :posterior,
@@ -42,6 +52,7 @@ const WORKFLOW_WANTS = (
     prior = :prior,
     log_jacobian = :log_jacobian,
     pointwise = :pointwise,
+    observations = :_ppl_observations,
 )
 
 """
@@ -100,6 +111,12 @@ to Base's scalar `mapreduce`; `test_reactant_joint.jl` pins the working
 shape).
 """
 function prepare_query(built, plan::StructuralPlan, preset::Symbol; on_error = nothing)
+    return _prepare_wants(built, plan, workflow_wants(preset); on_error)
+end
+
+# Prepare the built graph over the sampler boundary for one WANT node or a
+# tuple of them (a tuple-WANT kernel returns a tuple in that order).
+function _prepare_wants(built, plan::StructuralPlan, want; on_error = nothing)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -107,7 +124,7 @@ function prepare_query(built, plan::StructuralPlan, preset::Symbol; on_error = n
     # (newer than any already-compiled caller), so partial evaluation must
     # run at the latest world. Same barrier guards every call below.
     return Base.invokelatest(prepare, built.spec; have = _query_have(plan),
-        want = workflow_wants(preset), bound = _query_bound(plan), on_error)
+        want, bound = _query_bound(plan), on_error)
 end
 
 # A built graph evaluates the program its build generated. A binding that
@@ -162,7 +179,7 @@ struct SamplerQuery{K,P,L}
 end
 
 """
-    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing) -> SamplerQuery
+    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = ()) -> SamplerQuery
 
 Prepare a reusable [`SamplerQuery`](@ref): the `:sampler`-cut value kernel
 plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
@@ -174,16 +191,44 @@ must be loaded in the calling session (`using Enzyme` for `AutoEnzyme`);
 the backend value alone does not load
 DifferentiationInterface's backend extension, and preparation without it
 fails loudly naming the missing `using`.
+
+`retain` names further query presets (`:pointwise`, `:likelihood`, `:prior`,
+`:log_jacobian`) whose values the gradient's own primal sweep returns through
+[`sampler_value_gradient_and_retained!`](@ref), with no second primal pass.
+It needs a backend that keeps that sweep's values (reverse-mode
+`AutoEnzyme`; see `ReactiveKernels.ad_retains_primal_sweep`).
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
-        backend, on_error = nothing)
+        backend, on_error = nothing, retain::Tuple = ())
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
     kern = prepare_query(built, plan, :sampler; on_error)
-    prep = Base.invokelatest(prepare_ad, kern, backend, Vector{Float64}(u0);
-        active = :unconstrained)
+    gradient_kernel, wants = if isempty(retain)
+        kern, ()
+    else
+        wants = _retained_wants(retain)
+        _prepare_wants(built, plan,
+            (workflow_wants(:sampler), wants...); on_error), wants
+    end
+    prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
+        Vector{Float64}(u0); active = :unconstrained, retain = wants)
     return SamplerQuery(kern, prep, layout)
+end
+
+# The WANT nodes for retained presets. The sampler density is the gradient's
+# own value, so it is not a retained output.
+function _retained_wants(retain::Tuple)
+    allunique(retain) || throw(ArgumentError(
+        "[query] retain names the same preset more than once: $retain"))
+    map(retain) do preset
+        preset isa Symbol || throw(ArgumentError(
+            "[query] retain entries are query preset names; got $(repr(preset))"))
+        preset === :sampler && throw(ArgumentError(
+            "[query] the sampler density is the gradient's value; retain " *
+            "only other presets $(filter(!=(:sampler), keys(WORKFLOW_WANTS)))"))
+        workflow_wants(preset)
+    end
 end
 
 """
@@ -210,6 +255,95 @@ function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Vect
 end
 function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVector)
     return Base.invokelatest(ad_value_and_gradient!, q.ad, g, Vector{Float64}(u))
+end
+
+"""
+    sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector, u)
+
+Posterior value and gradient at unconstrained `u` as
+[`sampler_value_and_gradient!`](@ref) computes them, plus the presets named
+by `prepare_sampler(...; retain)` evaluated by the same primal sweep. Returns
+`(value, g, retained)`, where `retained` is a `NamedTuple` keyed by those
+preset names (`retained.pointwise` has the shape `prepare_query(…, :pointwise)`
+returns). Each call returns freshly computed retained values.
+"""
+function sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector,
+        u::AbstractVector)
+    v = u isa Vector{Float64} ? u : Vector{Float64}(u)
+    return Base.invokelatest(ad_value_gradient_and_retained!, q.ad, g, v)
+end
+
+"""
+    QueryAD
+
+A prepared ReactiveKernels derivative operator over one query of a built
+program, plus the program's [`LayoutTable`](@ref). Construct one with
+[`prepare_query_ad`](@ref). The ReactiveKernels derivative calls accept it in
+place of the prepared operator, with the unconstrained vector as the one
+argument: `ad_gradient(q, u)`, `ad_value_and_gradient!(q, g, u)`,
+`ad_pullback(q, seed, u)`, `ad_pushforward(q, tangents, u)`,
+`ad_hvp(q, tangents, u)`, `ad_gradient_and_hvp(q, tangents, u)` and their
+other value/in-place forms. Each call carries the `Base.invokelatest` barrier
+the query's build-time code needs, so they are safe from compiled callers.
+Not thread-safe (one per caller); not traceable by Reactant.
+"""
+struct QueryAD{P,L}
+    prepared::P
+    layout::L
+end
+
+"""
+    prepare_query_ad(prepare_operator, built, plan, preset, backend, exemplars...;
+                     on_error = nothing) -> QueryAD
+
+Prepare a ReactiveKernels derivative operator over the query
+[`prepare_query`](@ref)`(built, plan, preset)`, differentiating with respect
+to the whole unconstrained vector. `prepare_operator` is the ReactiveKernels
+preparation to apply — `prepare_ad`, `prepare_ad_pullback`,
+`prepare_ad_pushforward` or `prepare_ad_hvp` — and `exemplars` are that
+function's arguments after its backend, ending with an unconstrained exemplar
+`u0` of length `layout.total`:
+
+```julia
+second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+                           AutoEnzyme(; mode = Enzyme.Forward))
+q = prepare_query_ad(prepare_ad_hvp, built, plan, :sampler, second_order, (v,), u0)
+gradient, (hv,) = ad_gradient_and_hvp(q, (v,), u)
+
+j = prepare_query_ad(prepare_ad_pushforward, built, plan, :observations,
+                     AutoEnzyme(; mode = Enzyme.Forward), (v,), u0)
+observations, (jv,) = ad_value_and_pushforward(j, (v,), u)
+```
+
+Gradients and Hessian-vector products need a scalar preset (`:sampler`,
+`:likelihood`, `:prior`, `:log_jacobian`); pullbacks and pushforwards also
+accept `:pointwise` and `:observations`. Directions with disjoint supports
+over `coordinate_names(built.layout)` compress block-structured Jacobians and
+Hessians (see `ReactiveKernels.prepare_ad_hvp`). The backend's packages must be
+loaded in the calling session.
+"""
+function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
+        preset::Symbol, backend, exemplars...; on_error = nothing)
+    layout = built.layout::LayoutTable
+    isempty(exemplars) && throw(ContractValidationError(
+        "[query] prepare_query_ad needs an unconstrained exemplar u0 as its last argument"))
+    u0 = last(exemplars)
+    u0 isa AbstractVector{<:Real} && length(u0) == layout.total ||
+        throw(ContractValidationError(
+            "[query] the last exemplar must be an unconstrained vector of length " *
+            "$(layout.total); got $(summary(u0))"))
+    kernel = prepare_query(built, plan, preset; on_error)
+    prepared = Base.invokelatest(prepare_operator, kernel, backend,
+        Base.front(exemplars)..., Vector{Float64}(u0); active = :unconstrained)
+    return QueryAD(prepared, layout)
+end
+
+for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
+        :ad_pullback, :ad_value_and_pullback, :ad_value_and_pullback!,
+        :ad_pushforward, :ad_value_and_pushforward,
+        :ad_hvp, :ad_hvp!, :ad_gradient_and_hvp, :ad_gradient_and_hvp!)
+    @eval ReactiveKernels.$verb(q::QueryAD, args...) =
+        Base.invokelatest(ReactiveKernels.$verb, q.prepared, args...)
 end
 
 function _stack_restored_draws(values)
