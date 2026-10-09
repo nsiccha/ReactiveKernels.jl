@@ -182,6 +182,76 @@ end
     return out
 end
 
+# A scan in a scan step captures the outer step's element and a kernel port.
+@kernel _closure_scan_in_scan(groups, w::Float64) = begin
+    out = scan(groups; init = 0.0) do carry, g
+        inner = scan(g; init = 0.0) do c, x
+            next = c + x * w + length(g)
+            (next, next)
+        end
+        total = carry + sum(inner; init = 0.0)
+        (total, total)
+    end
+    return out
+end
+@kernel _closure_scan_in_scan_ref(groups, w::Float64) = begin
+    out = scan(groups, Ref(w); init = 0.0) do carry, g, w
+        inner = scan(g, Ref(w), Ref(g); init = 0.0) do c, x, w, g
+            next = c + x * w + length(g)
+            (next, next)
+        end
+        total = carry + sum(inner; init = 0.0)
+        (total, total)
+    end
+    return out
+end
+
+# A scan feeding one reducing plate streams the plate's cells inside the carry
+# loop; the captured scale is a shared operand there, as `Ref(scale)` is.
+@kernel _closure_scan_plate_sum(xs::Vector{Float64}, scale) = begin
+    cumulative = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    pointwise = plate(cumulative) do value
+        -0.5 * (value / scale)^2
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+@kernel _closure_scan_plate_sum_ref(xs::Vector{Float64}, scale) = begin
+    cumulative = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    pointwise = plate(cumulative, Ref(scale)) do value, scale
+        -0.5 * (value / scale)^2
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
+# A fold written as its own statement of a plain scan step runs in the scan's
+# strip region; the captured coefficients and decay are shared operands there.
+@kernel _closure_scan_strip(steps, pa, decay) = begin
+    out = scan(steps; init = 0.0) do carry, k
+        x = 1 / (k + 0.5)
+        s = evalpoly(x, pa)
+        next = muladd(decay, carry, s)
+        (next, next)
+    end
+    return out
+end
+@kernel _closure_scan_strip_ref(steps, pa, decay) = begin
+    out = scan(steps, Ref(pa), Ref(decay); init = 0.0) do carry, k, pa, decay
+        x = 1 / (k + 0.5)
+        s = evalpoly(x, pa)
+        next = muladd(decay, carry, s)
+        (next, next)
+    end
+    return out
+end
+
 # The dose-superposition `get` cell (dose-outer native lowering) and an
 # `evalpoly` cell over shared coefficients (coefficient-outer lowering).
 @kernel _closure_superposition(observations, shifts, units, weights) = begin
@@ -262,6 +332,13 @@ end
     end
     @test prepare(_closure_scan_in_plate)(sgroups, w) ≈ expected_scan
     @test prepare(_closure_plate_in_scan)([1.0, 2.0], w) ≈ cumsum([1.0, 2.0] .* sum(w))
+    @test prepare(_closure_scan_in_scan)(sgroups, 0.5) ≈ cumsum(map(sgroups) do g
+        sum(accumulate((c, x) -> c + 0.5x + length(g), g; init = 0.0); init = 0.0)
+    end)
+    @test prepare(_closure_scan_plate_sum)(series, 1.5) ≈
+          sum(v -> -0.5 * (v / 1.5)^2, cumsum(series))
+    # The streamed plate stores no scan vector, closure or not.
+    @test !occursin("similar", _closure_program(prepare(_closure_scan_plate_sum)))
 
     # Live and bound captures give the same values.
     @test prepare(_closure_indexed; bound = (; x))(d) == [11.0, 22.0, 33.0]
@@ -285,6 +362,10 @@ end
         (_closure_scan, _closure_scan_ref, (q, series)),
         (_closure_scan_in_plate, _closure_scan_in_plate_ref, (sgroups, w)),
         (_closure_plate_in_scan, _closure_plate_in_scan_ref, ([1.0, 2.0], w)),
+        (_closure_scan_in_scan, _closure_scan_in_scan_ref, (sgroups, 0.5)),
+        (_closure_scan_plate_sum, _closure_scan_plate_sum_ref, (series, 1.5)),
+        (_closure_scan_strip, _closure_scan_strip_ref,
+         (0:299, coefficients, 0.75)),
         (_closure_superposition, _closure_superposition_ref,
          (1:8, shifts, units, weights)),
         (_closure_evalpoly, _closure_evalpoly_ref,
