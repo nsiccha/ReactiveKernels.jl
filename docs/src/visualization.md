@@ -89,7 +89,9 @@ structure](compiler.md#Inspecting-structure)).
 with every operation slot replaced by its authored source or name and no
 line-number annotations; `readable_code(prepared)` shows a prepared kernel,
 including data folded in by `bound=`. The result names the modules the authored
-sources were evaluated in and also displays as HTML. It is an explanation:
+sources were evaluated in and also displays as HTML. A global reference (`M.f`)
+shows by its bare name, as source spells it, unless the program also spells
+that name another way; the result then names `M` too. It is an explanation:
 `code_expr` remains the exact compiled AST.
 
 ```julia
