@@ -9141,13 +9141,21 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     op isa Symbol || return _sfail("$where has an anonymous call node")
     args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
     if op === :.* || op === :.+ || op ===:.-
-        if op === :.+ && length(args) == 1
+        if (op === :.+ || op === :.*) && length(args) == 1
             return _extract_composed_tree(pname, only(args), ctx, subs,
+                scalars, datas)
+        end
+        if (op === :.+ || op === :.*) && length(args) > 2
+            # `.+(a, b, c)` broadcasts Julia's n-ary `+`, which folds
+            # left: `(a .+ b) .+ c` elementwise (likewise `.*`). BRM
+            # emits Julia's n-ary `a + b + c` this way.
+            return _extract_composed_tree(pname, Expr(:call, op,
+                Expr(:call, op, args[1:end-1]...), args[end]), ctx, subs,
                 scalars, datas)
         end
         ok = op === :.- ? length(args) in (1, 2) : length(args) == 2
         ok || return _sfail("$where `$op` takes " *
-            (op === :.- ? "one or two operands" : "two operands"))
+            (op === :.- ? "one or two operands" : "at least one operand"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
             subs, scalars, datas) for a in args)...)
     elseif op in _COMPOSED_MORE_OPS
