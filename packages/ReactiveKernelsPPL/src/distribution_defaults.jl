@@ -43,6 +43,48 @@ function _distribution_args(::Val{:TDist}, args)
     return Any[args[1], 0.0, 1.0]
 end
 
+# Each constructor argument's role, by position, in the distribution
+# kernels' vocabulary (`normal(location, scale)`). A value the lowering
+# computes for one argument is named after its owner and that role
+# (`y .~ Normal.(mu, f(x))` names `y_scale`). One row per family; a family
+# without a row names a computed argument after its function.
+const _DISTRIBUTION_ROLES = Dict{Symbol,Tuple{Vararg{Symbol}}}(
+    :Normal => (:location, :scale), :Cauchy => (:location, :scale),
+    :Laplace => (:location, :scale), :Logistic => (:location, :scale),
+    :LogNormal => (:location, :scale), :StudentT => (:nu, :location, :scale),
+    :TDist => (:nu,), :Exponential => (:scale,),
+    :HalfNormal => (:scale,), :HalfCauchy => (:scale,),
+    :Gamma => (:shape, :scale), :InverseGamma => (:shape, :scale),
+    :Weibull => (:shape, :scale), :Beta => (:alpha, :beta),
+    :Uniform => (:lower, :upper), :Poisson => (:rate,), :Bernoulli => (:p,),
+    :Binomial => (:n, :p), :NegativeBinomial => (:r, :p),
+    :InverseGaussian => (:location, :shape),
+    :VonMises => (:location, :concentration),
+    :ZeroInflatedPoisson => (:rate, :zi), :ZeroInflatedBinomial => (:n, :p, :zi),
+)
+
+# The role of argument `position` of `head(args...)` with `nargs` authored
+# arguments, or `nothing`. One-argument forms keep `_distribution_args`'
+# meaning: `VonMises(k)` is a concentration and `Beta(k)` both shapes.
+function _distribution_role(head::Symbol, position::Int, nargs::Int)
+    head === :VonMises && nargs == 1 && return :concentration
+    head === :Beta && nargs == 1 && return :shape
+    roles = get(_DISTRIBUTION_ROLES, head, ())
+    return position in eachindex(roles) ? roles[position] : nothing
+end
+_distribution_role(head, position, nargs) = nothing
+
+# The role of argument `position` of a prior family (`:normal`) with all
+# `nargs` arguments, through its constructor head (`_PARAM_FAMILIES`,
+# `_COEF_FAMILIES`).
+function _family_role(family::Symbol, position::Int, nargs::Int)
+    for table in (_PARAM_FAMILIES, _COEF_FAMILIES), (head, f) in table
+        f === family && head !== :TDist &&
+            return _distribution_role(head, position, nargs)
+    end
+    return nothing
+end
+
 # A literal in a log-linked response slot is a constrained value. Preserve
 # its value through the existing link-space location representation.
 _exp_response_location(lhs, arg::Real) = log(arg)

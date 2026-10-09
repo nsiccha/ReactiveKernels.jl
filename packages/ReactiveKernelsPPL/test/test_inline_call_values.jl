@@ -75,8 +75,8 @@ program(bound, layout) =
     string(Base.remove_linenums!(deepcopy(kernel_expr(bound, layout))))
 
 @testset "an inline call lowers exactly like its named definition" begin
-    # The inline call takes the name `_rkppl_y_call`; spelled with that
-    # name, the named program is the same generated program.
+    # The inline call takes the name of the argument it fills, `y_location`;
+    # spelled with that name, the named program is the same generated program.
     data = (; x, y)
     inline = quote
         b ~ Normal(0, 1)
@@ -84,8 +84,8 @@ program(bound, layout) =
     end
     named = quote
         b ~ Normal(0, 1)
-        _rkppl_y_call = shiftp(b .* x, 0.3)
-        y .~ Normal.(_rkppl_y_call, 1)
+        y_location = shiftp(b .* x, 0.3)
+        y .~ Normal.(y_location, 1)
     end
     bi = bind_data(lowered(inline, data), data)
     bn = bind_data(lowered(named, data), data)
