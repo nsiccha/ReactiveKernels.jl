@@ -417,3 +417,126 @@ end
     @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
         rtol = 1e-5, atol = 1e-7)
 end
+
+# A derived response binds the same whichever law observes it: a built-in
+# family or a caller-owned sampling law (`LogDensity`, rkppl-use §2). Module
+# calls, inline and named index gathers and reductions lower, bind and
+# evaluate as their `Normal` twins, exactly like the same values bound as
+# data (snag rkppl-derived-re-3096acdf).
+module _DRLaws
+using ReactiveKernelsPPL: LogDensity
+flatten_cells(cells) = reduce(vcat, cells; init = Float64[])
+positions(rows) = reduce(vcat, rows; init = Int[])
+const calls = Ref(0)
+counted_positions(rows) = (calls[] += 1; reduce(vcat, rows; init = Int[]))
+normal_lpdf(y, mu, s) = -log(2pi) / 2 - log(s) - ((y - mu) / s)^2 / 2
+end
+
+const _DRL_FLAT = [0.6, 0.2, 1.0, 0.8, 0.3]
+const _DRL_ROWS = [[3, 1], Int[], [5, 2, 4]]
+const _DRL_JOINED = _DRL_FLAT[reduce(vcat, _DRL_ROWS)]
+_drl_data() = (; raw = deepcopy(_DRC_RAW), flat = copy(_DRL_FLAT),
+    rows = deepcopy(_DRL_ROWS), order = reduce(vcat, _DRL_ROWS))
+const _DRL_LAWS = (normal = :(Normal.(a, s)),
+    logdensity = :(LogDensity.(normal_lpdf, a, s)))
+# Each definition with the value it binds as the response.
+const _DRL_DEFS = (
+    call = (quote y = flatten_cells(raw) end, _DRC_FLAT),
+    inline_index = (quote y = flat[positions(rows)] end, _DRL_JOINED),
+    named_index = (quote idx = positions(rows); y = flat[idx] end, _DRL_JOINED),
+    data_index = (quote y = flat[order] end, _DRL_JOINED),
+    reduction = (quote y = sum(flatten_cells(raw)) end, [sum(_DRC_FLAT)]),
+)
+_drl_program(def, law) = Expr(:block, :(a ~ Normal(0, 1)), :(s ~ Exponential(1)),
+    def.args..., :(y .~ $law))
+
+function _drl_kernel(prog, data = _drl_data(); lowered = data)
+    plan = lower_rkppl(prog, lowered; mod = _DRLaws, conditioned = (:y,))
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    return plan, bound, built, prepare_query(built, bound, :sampler)
+end
+
+@testset "derived response observed by a caller-owned law" begin
+    data = _drl_data()
+    for (name, (def, value)) in pairs(_DRL_DEFS), lowered in (data, keys(data))
+        at = map(_DRL_LAWS) do law
+            _, bound, built, kern = _drl_kernel(_drl_program(def, law); lowered)
+            @test bound.columns[:y] == value
+            @test coordinate_names(built.layout) == [:a, :s]
+            [_drc_at(kern, built, q) for q in ((a = 0.3, s = 0.7), (a = -0.4, s = 1.6))]
+        end
+        @test at.normal ≈ [_drc_oracle(0.3, 0.7, value), _drc_oracle(-0.4, 1.6, value)] rtol = 1e-12
+        # Choosing the law changes neither legality nor the density.
+        @test at.logdensity ≈ at.normal rtol = 1e-12
+    end
+    @test data == _drl_data()
+    # Evaluated once, at bind; the kernel never calls it again.
+    _DRLaws.calls[] = 0
+    _, cbound, cbuilt, ckern = _drl_kernel(_drl_program(
+        quote y = flat[counted_positions(rows)] end, _DRL_LAWS.logdensity))
+    @test _DRLaws.calls[] == 1
+    @test _drc_at(ckern, cbuilt, (a = 0.3, s = 0.7)) ≈ _drc_oracle(0.3, 0.7, _DRL_JOINED) rtol = 1e-12
+    @test _DRLaws.calls[] == 1
+    # Pointwise densities follow the bound response.
+    u = unconstrain(cbuilt.layout, (a = 0.3, s = 0.7))
+    pw = Base.invokelatest(prepare_query(cbuilt, cbound, :pointwise), u).y
+    @test pw ≈ _DRLaws.normal_lpdf.(_DRL_JOINED, 0.3, 0.7) rtol = 1e-12
+    # Rebinding evaluates the definition over the new data.
+    rows2 = [[2], [1, 3]]
+    rebound = bind_data(cbound, (; data..., rows = rows2))
+    @test rebound.columns[:y] == _DRL_FLAT[[2, 1, 3]]
+    # refused: caller data shadows a value the model derives (single
+    # assignment, P3), with the same message under either law.
+    messages = map(_DRL_LAWS) do law
+        plan = lower_rkppl(_drl_program(_DRL_DEFS.inline_index[1], law), keys(data);
+            mod = _DRLaws, conditioned = (:y,))
+        err = try
+            bind_data(plan, (; data..., y = copy(_DRL_JOINED)))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ContractValidationError
+        sprint(showerror, err)
+    end
+    @test occursin("drop it from bind_data", messages.logdensity)
+    @test messages.logdensity == messages.normal
+    # A number observed through a caller-owned law is one observation, as
+    # the same number is through a built-in family.
+    for law in _DRL_LAWS
+        prog = Expr(:block, :(a ~ Normal(0, 1)), :(s ~ Exponential(1)), :(y .~ $law))
+        _, nbound, nbuilt, nkern = _drl_kernel(prog, (; y = 0.6))
+        @test nbound.columns[:y] == [0.6]
+        @test _drc_at(nkern, nbuilt, (a = 0.3, s = 0.7)) ≈ _drc_oracle(0.3, 0.7, [0.6]) rtol = 1e-12
+    end
+    # A gathered response holding one array per index observes each index's
+    # entries in a dotted `@plate` cell; the gather's inputs are not
+    # observation operands.
+    for law in _DRL_LAWS
+        cells = [[0.6, 0.2], [1.0], Float64[]]
+        _, gbound, gbuilt, gkern = _drl_kernel(quote
+                a ~ Normal(0, 1)
+                s ~ Exponential(1)
+                y = cells[perm]
+                @plate for i in eachindex(y)
+                    y[i] .~ $law
+                end
+            end, (; cells, perm = [3, 1, 2]))
+        @test gbound.columns[:y] == cells[[3, 1, 2]]
+        @test _drc_at(gkern, gbuilt, (a = 0.3, s = 0.7)) ≈
+            _drc_oracle(0.3, 0.7, [0.6, 0.2, 1.0]) rtol = 1e-12
+    end
+end
+
+@testset "derived response observed by a caller-owned law: Enzyme gradients" begin
+    _, bound, built, kern = _drl_kernel(_drl_program(_DRL_DEFS.inline_index[1],
+        _DRL_LAWS.logdensity))
+    u = unconstrain(built.layout, (a = 0.3, s = 0.7))
+    prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    g = similar(u)
+    v, _ = sampler_value_and_gradient!(prep, g, u)
+    @test v ≈ _drc_oracle(0.3, 0.7, _DRL_JOINED) rtol = 1e-12
+    @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
+        rtol = 1e-5, atol = 1e-7)
+end
