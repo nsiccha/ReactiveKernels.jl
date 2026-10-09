@@ -1582,6 +1582,10 @@ function _plate_map(view_read, cell::Symbol, body)
     return Expr(:do, Expr(:call, :plate, view_read), lambda)
 end
 
+# A floored block's values: `lo .+ exp.(u)`, or `exp.(u)` itself over a
+# literal zero floor.
+_floored_value(lo, values) = lo isa Real && iszero(lo) ? values : :($lo .+ $values)
+
 # Per-cell latent (plate) block: map the SCALAR bijector endpoints over the
 # block view via the `plate` primitive — the same library the scalar and host
 # paths use, so in-graph and host agree by construction rather than by a
@@ -1618,7 +1622,7 @@ function _plate_transform_statements(e::LayoutEntry)
         u = Symbol(:_ppl_floor_, e.name)
         return Expr[
             :($u::AbstractVector{Float64} = $view_read),
-            :($(e.name)::AbstractVector{Float64} = $(e.lo) .+ exp.($u)),
+            :($(e.name)::AbstractVector{Float64} = $(_floored_value(e.lo, :(exp.($u))))),
         ]
     end
     if e.transform === :upper
@@ -1803,7 +1807,7 @@ function jacobian_term(e::LayoutEntry)
     e.transform === :identity && return nothing
     if e.kind === :scan && !isempty(e.scan_blocks)
         terms = Any[jacobian_term(b) for b in e.scan_blocks if b.transform !== :identity]
-        return foldl((a, b) -> :($a + $b), terms; init = 0.0)
+        return _sum_terms(terms)
     end
     if e.kind === :coefficient
         # Interval runs (uniform coefficients) hand-roll the per-cell

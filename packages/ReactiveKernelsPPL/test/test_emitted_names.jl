@@ -1,0 +1,174 @@
+module EmittedNameTests
+using ReactiveKernels, ReactiveKernelsPPL, Distributions, DifferentiationInterface, Enzyme, Test
+
+# The generated program reads with the model's own names (rkppl-use §16):
+# plate cells name their arguments after the values they iterate, a value
+# the lowering computes for a distribution argument is named after its
+# owner and role, a declared array's prior is named after the array, sums
+# carry no `0.0` seed, `Float64` values need no `1.0 *` port and the
+# display spells the model module's functions as written. Every density,
+# gradient and coordinate stays the same.
+
+const BACKEND = AutoEnzyme(; mode=Enzyme.Reverse)
+
+module Fns
+spread(loc, a, p) = sqrt.(a^2 .+ (loc .* p) .^ 2)
+shiftby(v, by) = v .+ by
+end
+using .Fns: spread, shiftby
+
+const x = [0.3, -0.5, 1.2, 0.8]
+const y = [0.1, -0.4, 1.1, 0.6]
+const g = [1, 2, 1, 2]
+
+_text(bound) = string(readable_code(kernel_expr(bound, assign_layout(bound))))
+_bound(ast, data; mod = Fns) =
+    bind_data(lower_rkppl(ast, data; conditioned = (:y,), mod), data)
+
+const MODEL = quote
+    a ~ Normal(0, 1)
+    sa ~ Exponential(4.0)
+    sp ~ Exponential(4.0)
+    s ~ Exponential(1.0)
+    b ~ Normal(0, 2 * s)
+    tau[1:2] .~ truncated.(Normal.(0, 1), 0, Inf)
+    z[1:2, levels(g)] .~ Normal.(0, 1)
+    X = hcat(ones(length(x)), x)
+    c[axes(X, 2)] .~ Normal.([1.0, 0.0], [0.8, 1.0])
+    r = z .* tau
+    loc = a .+ b .* x .+ X * c .+ r[1, g]
+    y .~ Normal.(loc, spread(loc, sa, sp))
+end
+
+function _oracle(nt)
+    loc = nt.a .+ nt.b .* x .+ hcat(ones(length(x)), x) * nt.c .+
+        (nt.z .* nt.tau)[1, g]
+    sd = Fns.spread(loc, nt.sa, nt.sp)
+    lik = sum(logpdf.(Normal.(loc, sd), y))
+    prior = logpdf(Normal(0, 1), nt.a) + logpdf(Exponential(4.0), nt.sa) +
+        logpdf(Exponential(4.0), nt.sp) + logpdf(Exponential(1.0), nt.s) +
+        logpdf(Normal(0, 2 * nt.s), nt.b) +
+        sum(logpdf.(truncated(Normal(0, 1), 0, Inf), nt.tau)) +
+        sum(logpdf.(Normal(0, 1), nt.z)) +
+        sum(logpdf.(Normal.([1.0, 0.0], [0.8, 1.0]), nt.c))
+    return lik, prior
+end
+
+@testset "generated programs read with the model's own names" begin
+    data = (; x, y, g)
+    bound = _bound(MODEL, data)
+    text = _text(bound)
+
+    @testset "plate cells name their arguments after their values" begin
+        @test occursin("plate(y, _ppl_lp_y_eta, y_scale) do y, _ppl_lp_y_eta, y_scale", text)
+        @test occursin("(normal(_ppl_lp_y_eta, y_scale)).logpdf(y)", text)
+        @test !occursin(r"_ppl_c\d", text)
+    end
+
+    @testset "a computed distribution argument is named after its role" begin
+        @test occursin("y_scale = spread(loc, sa, sp)", text)
+        @test occursin("b_scale = 2s", text)
+        @test !occursin("_rkppl_", text)
+    end
+
+    @testset "a prior cell reads a generated argument by its role" begin
+        @test occursin("plate(c, _ppl_parg_c_1, _ppl_parg_c_2) do c, location, scale", text)
+        @test occursin("(normal(location, scale)).logpdf(c)", text)
+    end
+
+    @testset "a two-axis array's prior is named after the array" begin
+        @test occursin("var\"_ppl_prior_z\"", text) || occursin("_ppl_prior_z::", text)
+        @test occursin("plate(_ppl_arrflat_z) do z", text)
+        @test !occursin("_ppl_prior__ppl_arrflat", text)
+    end
+
+    @testset "sums carry no zero seed; a zero floor is exp alone" begin
+        @test occursin("likelihood::Float64 = _ppl_lik_y_resp\n", text)
+        @test occursin("prior::Float64 = ((((((", text) || occursin("prior::Float64 = (", text)
+        @test !occursin("0.0 +", text)
+        @test !occursin("0.0 .+", text)
+        @test occursin("tau::AbstractVector{Float64} = exp.(_ppl_floor_tau)", text)
+    end
+
+    @testset "Float64 prior arguments need no port promotion" begin
+        @test occursin("(exponential(1.0)).logpdf(s)", text)
+        @test !occursin("1.0location", text) && !occursin("1.0scale", text)
+        # A computed value's type is not proven, so it keeps its promotion.
+        @test occursin("(normal(0.0, 1.0b_scale)).logpdf(b)", text)
+    end
+
+    @testset "the display spells the model module's functions as written" begin
+        code = readable_code(kernel_expr(bound, assign_layout(bound)))
+        @test Fns in code.modules
+        @test startswith(string(code), "# authored sources evaluated in: ")
+        @test !occursin("Fns.spread", text)
+        # `kernel_expr` itself keeps the exact global reference.
+        @test occursin("Fns.spread", sprint(print, kernel_expr(bound, assign_layout(bound))))
+    end
+
+    @testset "values and native gradients are the model's" begin
+        built = build_kernel(bound)
+        layout = built.layout
+        for shift in (0.0, 0.4)
+            u = collect(range(-0.3 + shift, 0.5 - shift; length = layout.total))
+            nt = constrain(layout, u)
+            lik, prior = _oracle(nt)
+            q = Base.invokelatest(prepare_query, built, bound, :likelihood)
+            @test Base.invokelatest(q, u) ≈ lik rtol = 1e-12
+            q = Base.invokelatest(prepare_query, built, bound, :prior)
+            @test Base.invokelatest(q, u) ≈ prior rtol = 1e-12
+            sq = prepare_sampler(built, bound, u; backend = BACKEND)
+            grad = similar(u)
+            value, _ = sampler_value_and_gradient!(sq, grad, u)
+            @test value ≈ lik + prior + logjac(layout, u) rtol = 1e-12
+            h = 1e-6
+            fd = map(eachindex(u)) do i
+                up = copy(u); up[i] += h
+                dn = copy(u); dn[i] -= h
+                (sq(up) - sq(dn)) / 2h
+            end
+            @test grad ≈ fd rtol = 1e-5 atol = 1e-7
+        end
+    end
+end
+
+@testset "generated names never take a name the model uses" begin
+    taken = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        y_scale = shiftby(x, 1.0)
+        b_scale = 0.25
+        b ~ Normal(0, 2 * s)
+        y .~ Normal.(a .+ b .* y_scale .+ b_scale, shiftby(s, 0.5))
+    end
+    text = _text(_bound(taken, (; x, y)))
+    @test occursin("y_scale_2 = shiftby(s, 0.5)", text)
+    @test occursin("b_scale_2 = 2s", text)
+    # A data column takes the name first too.
+    data = (; x, y, y_scale = x)
+    model = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        y .~ Normal.(a .+ y_scale, shiftby(s, 0.5))
+    end
+    @test occursin("y_scale_2 = shiftby(s, 0.5)", _text(_bound(model, data)))
+    # A synthesized response name (`y_eta`) is never a computed argument's.
+    nested = quote
+        a ~ Normal(0, 1)
+        y .~ Normal.(a .+ shiftby(x .* a, 0.5), 1.0)
+    end
+    @test occursin("y_shiftby = shiftby(x .* a, 0.5)", _text(_bound(nested, (; x, y))))
+end
+
+@testset "promotion stays for values that may not be Float64" begin
+    m = [1, 0]
+    model = quote
+        b[1:2] .~ Normal.(m, 1)
+        y .~ Normal.(b[1] .+ b[2] .* x, 1.0)
+    end
+    text = _text(_bound(model, (; x, y, m)))
+    @test occursin("plate(b, m) do b, m", text)
+    @test occursin("(normal(1.0m, 1.0)).logpdf(b)", text)
+end
+
+end

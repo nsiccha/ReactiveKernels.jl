@@ -2598,21 +2598,47 @@ _rhs_spelling_head(fn, dotted::Bool) = _builtin_rhs_head(fn) ||
     (dotted ? fn === :vcat : fn in _RHS_SPELLING_HEADS)
 
 # Apply `f` to each value argument of a built-in sampling RHS.
-function _map_rhs_values(f, ex)
+_map_rhs_values(f, ex) = _map_rhs_arguments((value, _, _, _) -> f(value), ex)
+
+# Apply `f(value, head, position, nargs)` to each value argument of a
+# built-in sampling RHS: positional argument `position` of the `nargs` that
+# `head` spells (`Normal.(mu, s)`: `s` is 2 of 2 of `:Normal`), or the
+# keyword's name as `position`.
+function _map_rhs_arguments(f, ex, head = nothing, position = 0, nargs = 0)
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             _rhs_spelling_head(ex.args[1], false)
         return Expr(:call, ex.args[1],
-            Any[_map_rhs_values(f, a) for a in ex.args[2:end]]...)
+            _map_rhs_positions(f, ex.args[2:end], _rhs_head_symbol(ex.args[1]))...)
     elseif _is_dotted_call(ex) && _rhs_spelling_head(ex.args[1], true)
         return Expr(:., ex.args[1], Expr(:tuple,
-            Any[_map_rhs_values(f, a) for a in ex.args[2].args]...))
+            _map_rhs_positions(f, ex.args[2].args, _rhs_head_symbol(ex.args[1]))...))
     elseif ex isa Expr && ex.head === :parameters
-        return Expr(:parameters, Any[_map_rhs_values(f, a) for a in ex.args]...)
+        return Expr(:parameters,
+            Any[_map_rhs_arguments(f, a, head, position, nargs) for a in ex.args]...)
     elseif ex isa Expr && ex.head === :kw && length(ex.args) == 2
-        return Expr(:kw, ex.args[1], _map_rhs_values(f, ex.args[2]))
+        return Expr(:kw, ex.args[1],
+            _map_rhs_arguments(f, ex.args[2], head, ex.args[1], nargs))
     end
-    return f(ex)
+    return f(ex, head, position, nargs)
 end
+
+function _map_rhs_positions(f, args, head)
+    nargs = count(a -> !Meta.isexpr(a, :parameters), args)
+    out, position = Any[], 0
+    for a in args
+        Meta.isexpr(a, :parameters) ||
+            (position += 1)
+        push!(out, _map_rhs_arguments(f, a, head,
+            Meta.isexpr(a, :parameters) ? 0 : position, nargs))
+    end
+    return out
+end
+
+_rhs_head_symbol(fn::Symbol) = fn
+_rhs_head_symbol(fn::GlobalRef) = fn.name
+_rhs_head_symbol(fn::Expr) =
+    Meta.isexpr(fn, :., 2) && fn.args[2] isa QuoteNode ? fn.args[2].value : nothing
+_rhs_head_symbol(fn) = nothing
 
 # A call `_resolve_call_head` resolves in the model module rather than
 # keeping as a built-in: resolution names an undefined function or a
@@ -2664,9 +2690,12 @@ end
 # holds (`w = f(b .* x)` then `y .~ Normal.(w, s)`), so name it: the
 # definition then takes exactly the named spelling's path — bind-time
 # evaluation when it reads only data, whole-value data inputs, predictor
-# and value analysis. Identical calls share one name. Prior arguments
-# have their own hoist (`_hoist_prior_args!`); external RHSs resolve their
-# arguments themselves.
+# and value analysis. A call that is a whole distribution argument is named
+# after the response and that argument's role (`y .~ Normal.(mu, f(x))`
+# names `y_scale`); any other after the response and its function
+# (`y_f`). Identical calls share one name. Prior arguments have their own
+# hoist (`_hoist_prior_args!`); external RHSs resolve their arguments
+# themselves.
 function _observation_call_definitions(ast::Expr, data::Set{Symbol},
         mod::Module)
     defined = Set{Symbol}(st.args[1] for st in ast.args
@@ -2675,15 +2704,15 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
     taken = union(data, _expr_names(ast))
     named = Dict{Any,Symbol}()
     out = Any[]
-    function name!(call, stem::Symbol)
+    function name!(call, stem::Symbol, role)
         get!(named, call) do
             value = _resolve_module_calls(call, mod, names,
                 "response $stem argument `$(repr(call))`")
-            nm = Symbol(:_rkppl_, stem, :_call)
-            k = 1
-            while nm in taken
+            base = Symbol(stem, :_, something(role, _call_label(call)))
+            nm, k = base, 1
+            while nm in taken || nm in _synthesized_response_names(stem)
                 k += 1
-                nm = Symbol(:_rkppl_, stem, :_call_, k)
+                nm = Symbol(base, :_, k)
             end
             push!(taken, nm)
             push!(out, Expr(:(=), nm, value))
@@ -2697,8 +2726,12 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
             if any(in(data), observed) ||
                     (_is_broadcast_sample(st) && any(in(defined), observed))
                 stem = first(sort!(collect(observed)))
-                rhs = _map_rhs_values(st.args[3]) do value
-                    _bind_module_calls(call -> name!(call, stem), value)
+                rhs = _map_rhs_arguments(st.args[3]) do value, head, position, nargs
+                    _bind_module_calls(value) do call
+                        role = call === value ?
+                            _argument_role(head, position, nargs) : nothing
+                        name!(call, stem, role)
+                    end
                 end
                 rhs == st.args[3] ||
                     (st = Expr(:call, st.args[1], st.args[2], rhs))
@@ -2708,6 +2741,28 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
     end
     return Expr(:block, out...)
 end
+
+# A whole argument's role: its keyword's name, or its positional role.
+_argument_role(head, position::Symbol, nargs) = position
+_argument_role(head, position::Int, nargs) =
+    _distribution_role(head, position, nargs)
+
+# A computed argument's label when its position has no role: its function's
+# name (`f` for `f(x)`, `M.f(x)` or `f.(x)`), or `call` for a deferred
+# expression holding one (`if`, a comprehension, ...).
+function _call_label(ex)
+    fn = Meta.isexpr(ex, :call) ? ex.args[1] :
+        _is_dotted_call(ex) ? ex.args[1] : nothing
+    return something(_rhs_head_symbol(fn), :call)
+end
+
+# The names the response lowering synthesizes for response `stem`
+# (`y_eta`, `y_loc`, ...; `_lower_location`, `_latent_predictor!`,
+# `_lower_argument_predictor!`, the `_resp` likelihood label). A computed
+# argument never takes one.
+_synthesized_response_names(stem::Symbol) =
+    (Symbol(stem, :_eta), Symbol(stem, :_loc), Symbol(stem, :_value),
+     Symbol(stem, :_resp), Symbol(stem, :_disc))
 
 # Data-only: every value the expression reads is data or a data-only
 # definition (literals and function values aside).
@@ -10201,7 +10256,9 @@ end
 """Prior-argument hoisting: an expression in a prior's argument position
 (`b ~ Normal(0, 2 * s)`, `c[levels(g)] .~ Normal.(0, sqrt(v))`,
 `b[axes(X, 2)] .~ Normal.(0, [s1, 2 * s2])`) binds to a synthetic scalar
-definition named after its statement (`_rkppl_b_arg2`), so every prior
+definition named after its statement and the argument's role (`b_scale`,
+`b_scale_2` for a vector's second entry; `b_arg2` where the family names no
+role, `_distribution_role`), so every prior
 position downstream sees a literal or a name — naming a subexpression
 never changes legality. Pure-literal arithmetic folds to its value instead
 (`Normal(0, 1 / 2)` keeps a literal scale). Response arguments are
@@ -10231,11 +10288,10 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         _reject_unknown_calls("the prior of $lhs (argument " *
                               "`$(repr(a))`)", r)
         a = r
-        nm = Symbol(:_rkppl_, stem)
-        k = 1
+        nm, k = stem, 1
         while nm in taken
             k += 1
-            nm = Symbol(:_rkppl_, stem, :_, k)
+            nm = Symbol(stem, :_, k)
         end
         push!(taken, nm)
         push!(out, nm => a)
@@ -10245,8 +10301,9 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
     # Positional arguments only (a `:parameters` keyword block keeps its
     # place and is never an argument position); unchanged input returns
     # itself, so untouched statements keep their exact AST.
-    function hoist_args(lhs, args; scalar_only=true)
+    function hoist_args(lhs, args; scalar_only=true, role = (i, n) -> nothing)
         local res = Any[]
+        nargs = count(a -> !(a isa Expr && a.head === :parameters), args)
         i = 0
         for a in args
             if a isa Expr && a.head === :parameters
@@ -10254,19 +10311,22 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
                 continue
             end
             i += 1
+            r = role(i, nargs)
+            stem = r === nothing ? Symbol(lhs, :_arg, i) : Symbol(lhs, :_, r)
             push!(res, a isa Expr && a.head === :vect ?
-                Expr(:vect, (bind(lhs, Symbol(lhs, :_arg, i, :_, j), x; scalar_only)
+                Expr(:vect, (bind(lhs, Symbol(stem, :_, j), x; scalar_only)
                     for (j, x) in enumerate(a.args))...) :
-                bind(lhs, Symbol(lhs, :_arg, i), a; scalar_only))
+                bind(lhs, stem, a; scalar_only))
         end
         return res == args ? args : res
     end
+    family_role(head) = (i, n) -> _distribution_role(head, i, n)
     function hoist_call(lhs, rhs; scalar_only=true)
         rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol || return rhs
         if rhs.args[1] === :LKJCholesky && length(rhs.args) in (3, 4)
             # Shape and orientation are structural; only eta is a prior value.
-            eta = bind(lhs, Symbol(lhs, :_arg2), rhs.args[3])
+            eta = bind(lhs, Symbol(lhs, :_eta), rhs.args[3])
             eta === rhs.args[3] && return rhs
             return Expr(:call, rhs.args[1], rhs.args[2], eta, rhs.args[4:end]...)
         end
@@ -10276,13 +10336,14 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         end
         if rhs.args[1] in (:truncated, :restricted) && length(rhs.args) == 4
             inner = hoist_call(lhs, rhs.args[2]; scalar_only)
-            bounds = hoist_args(lhs, rhs.args[3:end]; scalar_only)
+            bounds = hoist_args(lhs, rhs.args[3:end]; scalar_only,
+                role = (i, n) -> (:lower, :upper)[i])
             inner === rhs.args[2] && bounds == rhs.args[3:end] && return rhs
             return Expr(:call, rhs.args[1], inner, bounds...)
         end
         rhs.args[1] in _HOIST_FAMILIES || return rhs
         args = rhs.args[2:end]
-        new = hoist_args(lhs, args; scalar_only)
+        new = hoist_args(lhs, args; scalar_only, role = family_role(rhs.args[1]))
         new === args && return rhs
         return Expr(:call, rhs.args[1], new...)
     end
@@ -10297,7 +10358,7 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
                 rhs.args[2] isa Expr && rhs.args[2].head === :tuple &&
                 rhs.args[1] in _HOIST_FAMILIES || continue
             args = rhs.args[2].args
-            new = hoist_args(s.lhs, args)
+            new = hoist_args(s.lhs, args; role = family_role(rhs.args[1]))
             new === args && continue
             rhs = Expr(:., rhs.args[1], Expr(:tuple, new...))
         else
