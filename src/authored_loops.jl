@@ -47,6 +47,8 @@ _kernel_is_plate_loop(mod, ex) =
 # loop's cells or in a `plate(...) do` / `scan(...) do` body, before any cell
 # computes its captures.
 function _kernel_desugar_loops(statements, mod)
+    # Bodies without loop syntax are returned as they are.
+    any(st -> _kernel_has_loop_macro(st, mod), statements) || return statements
     result = Any[]
     line = nothing
     for statement in statements
@@ -64,8 +66,13 @@ function _kernel_desugar_loops(statements, mod)
     result
 end
 
+_kernel_has_loop_macro(ex, mod) =
+    ex isa Expr && ex.head !== :quote &&
+    (_kernel_is_plate_loop(mod, ex) || _kernel_is_scan_loop(mod, ex) ||
+     any(arg -> _kernel_has_loop_macro(arg, mod), ex.args))
+
 function _kernel_desugar_nested_loops(ex, mod)
-    ex isa Expr || return ex
+    _kernel_has_loop_macro(ex, mod) || return ex
     ex.head === :quote && return ex
     if ex.head === :do && length(ex.args) == 2 &&
        ex.args[2] isa Expr && ex.args[2].head === :(->)
