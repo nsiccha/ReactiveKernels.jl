@@ -639,7 +639,10 @@ end
         projection_plan = plan(qualified_tuple_projection; want = :lead)
         @test @inferred(prepare(projection_plan)(2.0)) == 4.0
         @test produces(projection_plan, :squared)
-        @test !occursin("qualified_pair", sprint(show, code_expr(projection_plan)))
+        # No runtime call remains; the lifted value is named for the call.
+        projection_code = sprint(show, code_expr(projection_plan))
+        @test !occursin("qualified_pair(", projection_code)
+        @test occursin("var\"lead.qualified_pair\" =", projection_code)
         @kernel qualified_tuple_cells(xs) = begin
             ys = plate(xs) do x
                 AuthoringNestedKernelFixture.qualified_pair(x)[1] *

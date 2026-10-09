@@ -12,6 +12,8 @@
 # mutated. Leaves are shared, never written.
 _display_expr(x) = x
 function _display_expr(ex::Expr)
+    applied = _display_applied_source(ex)
+    applied === nothing || return applied
     args = Any[]
     if ex.head === :macrocall
         for (i, arg) in enumerate(ex.args)
@@ -132,6 +134,34 @@ function _display_object(f::_KernelSourceFunction)
             Expr(:let, Expr(:block, bindings...), body.args[2])
     end
     Expr(:->, Expr(:tuple, (get(names, p, p) for p in params)...), _display_expr(body))
+end
+
+# An operation spliced into a source and called in place (an object endpoint
+# evaluated inside a branch arm) shows as its authored body with the call's
+# arguments in place of its parameters, `(x - 0.0) / s` rather than
+# `((x, location, scale) -> (x - location) / scale)(x, 0.0, s)`. An argument
+# that is not a name or literal and is read more than once, or one a
+# substitution could capture, stays a `let` binding (`_readable_inline_values`).
+function _display_applied_source(ex::Expr)
+    ex.head === :call && !isempty(ex.args) && ex.args[1] isa QuoteNode ||
+        return nothing
+    lambda = _display_expr(ex.args[1])
+    lambda isa Expr && lambda.head === :-> && lambda.args[1] isa Expr &&
+        lambda.args[1].head === :tuple || return nothing
+    params = lambda.args[1].args
+    length(params) == length(ex.args) - 1 && all(p -> p isa Symbol, params) ||
+        return nothing
+    body = lambda.args[2]
+    body isa Expr && body.head === :block && length(body.args) == 1 &&
+        (body = only(body.args))
+    pairs = Pair{Symbol,Any}[param => _display_expr(arg)
+                             for (param, arg) in zip(params, ex.args[2:end])
+                             if param !== arg]
+    rhs, kept = _readable_inline_values(body, pairs)
+    isempty(kept) && return rhs
+    bindings = Any[Expr(:(=), name, value) for (name, value) in kept]
+    Expr(:let, length(bindings) == 1 ? only(bindings) : Expr(:block, bindings...),
+         Expr(:block, rhs))
 end
 
 _display_text(x) = sprint(print, _display_expr(x); context = :limit => false)

@@ -5293,11 +5293,20 @@ end
 # Any other operation (a plate, a scan) reads a scoped input by the part of its
 # name after a scope prefix that its source spells.
 function _recipe_source_names(recipe::Recipe)
-    names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
-    names === nothing || return names
     spelled = Set{Symbol}()
     _source_symbols!(spelled, recipe.source)
+    names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
+    names === nothing ||
+        return Symbol[_spelled_parameter_name(name, spelled) for name in names]
     Symbol[_unscoped_source_name(value.name, spelled) for value in recipe.inputs]
+end
+# Julia's lowering reports a gensym parameter (`##endpoint_value#7`) without
+# its leading `##` (`endpoint_value#7`), while the source still spells the
+# gensym; an unmapped name would leave that gensym in the display.
+function _spelled_parameter_name(name::Symbol, spelled)
+    name in spelled && return name
+    gensym_name = Symbol("##", name)
+    gensym_name in spelled ? gensym_name : name
 end
 _source_symbols!(names, x::Symbol) = push!(names, x)
 _source_symbols!(names, x) = names
