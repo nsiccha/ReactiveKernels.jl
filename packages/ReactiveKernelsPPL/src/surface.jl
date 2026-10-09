@@ -8962,8 +8962,7 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     # `th = c[g]` over a coefficient-capable `c[levels(g)]`, which keeps
     # its composed factor-sub meaning.
     rhs = ctx.detmap[s]
-    (_reads_array_value(rhs, ctx) || _reads_value_array(rhs, ctx)) &&
-        !factor_alias && return false
+    _reads_declared_array(rhs, ctx) && !factor_alias && return false
     # Likewise a parameter offset: data and non-coefficient scalar
     # parameters combined by sums only (`w = s .+ x`, `s ~ Exponential(1)`).
     # It has no coefficient to compose, so it stays an offset local. Under
@@ -9056,6 +9055,13 @@ function _reads_value_array(ex, ctx, seen::Set{Symbol} = Set{Symbol}())
     ex.head === :ref && isval(ex.args[1]) && return true
     return any(a -> _reads_value_array(a, ctx, seen), ex.args)
 end
+
+# Whether a definition reads a declared array, gathered (`a0 .+ z[g]`)
+# or whole (`sd .* z`). Such a definition is one named value: never an
+# affine sub-predictor of a composition (`_is_composed_sub`), always one
+# of its value leaves (`_extract_composed_tree`).
+_reads_declared_array(ex, ctx) =
+    _reads_array_value(ex, ctx) || _reads_value_array(ex, ctx)
 
 # Whether `ex` reads a declared array value — a bare array name
 # (`B * w`), or an indexed read of any array-capable declaration
@@ -9264,10 +9270,12 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             node in datas || push!(datas, node)
             return node
         elseif get(ctx.detshape, node, :scalar) === :vector &&
-                _reads_value_array(ctx.detmap[node], ctx)
-            # Array-derived values remain graph values. Interning one
-            # as an LP would consume the definition needed by other
-            # readers, such as a reduction of a library contrast.
+                _reads_declared_array(ctx.detmap[node], ctx)
+            # Array-derived values remain graph values, including a
+            # gather (`mu_base = a0 .+ z[g]`), which its inline spelling
+            # reads as a column too. Interning one as an LP would consume
+            # the definition needed by other readers, such as a
+            # reduction of a library contrast.
             node in datas || push!(datas, node)
             return node
         elseif get(ctx.detshape, node, :scalar) === :vector &&
@@ -9332,13 +9340,21 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     op isa Symbol || return _sfail("$where has an anonymous call node")
     args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
     if op === :.* || op === :.+ || op ===:.-
-        if op === :.+ && length(args) == 1
+        if (op === :.+ || op === :.*) && length(args) == 1
             return _extract_composed_tree(pname, only(args), ctx, subs,
+                scalars, datas)
+        end
+        if (op === :.+ || op === :.*) && length(args) > 2
+            # `.+(a, b, c)` broadcasts Julia's n-ary `+`, which folds
+            # left: `(a .+ b) .+ c` elementwise (likewise `.*`). BRM
+            # emits Julia's n-ary `a + b + c` this way.
+            return _extract_composed_tree(pname, Expr(:call, op,
+                Expr(:call, op, args[1:end-1]...), args[end]), ctx, subs,
                 scalars, datas)
         end
         ok = op === :.- ? length(args) in (1, 2) : length(args) == 2
         ok || return _sfail("$where `$op` takes " *
-            (op === :.- ? "one or two operands" : "two operands"))
+            (op === :.- ? "one or two operands" : "at least one operand"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
             subs, scalars, datas) for a in args)...)
     elseif op in _COMPOSED_MORE_OPS
@@ -9583,11 +9599,20 @@ _inlined_computed_defs(ctx, canonmap, data) = Set{Symbol}(nm for nm in ctx.inlin
         _computed_value_def(nm, ctx, canonmap, data))
 
 # A module call's model-level result, written inline or read through a
-# shared definition that stays named for its readers (the definitions
-# below it are no longer inlined either).
+# definition that stays named for its readers: a shared definition (the
+# definitions below it are no longer inlined either), or the value a
+# positional read indexes, which `_inline_structure_expr` keeps named.
 _reads_module_value(ex, ctx) = _contains_module_call(ex) ||
     any(s -> s in ctx.shared_defs && _def_reads_module(s, ctx),
-        _value_symbols(ex))
+        _value_symbols(ex)) ||
+    _indexes_module_value(ex, ctx)
+# `bt = f(x, a); bt[1]` indexes the call's result exactly as the inline
+# `f(x, a)[1]` does. The element has the function's own shape (a tuple
+# element may be a vector), so it is never a proven scalar offset.
+_indexes_module_value(ex, ctx) = ex isa Expr &&
+    ((ex.head === :ref && _is_model_value_def(ex.args[1], ctx) &&
+        _def_reads_module(ex.args[1], ctx)) ||
+     any(a -> _indexes_module_value(a, ctx), ex.args))
 _def_reads_module(s, ctx) = _contains_module_call(ctx.detmap[s]) ||
     any(t -> haskey(ctx.detmap, t) && _def_reads_module(t, ctx),
         _value_symbols(ctx.detmap[s]))
