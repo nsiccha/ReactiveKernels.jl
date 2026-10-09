@@ -689,6 +689,42 @@ end
         src = string(kernel_expr(bound, built.layout))
         :sv in columns && @test occursin(r"\bsv = ", src)
     end
+    # Naming a trajectory value never changes legality: each named spelling
+    # has its inline twin's density (`b .* (level .+ x)` is rkppl-use §5's).
+    ahead = quote
+        k ~ Normal(0, 1); a ~ Normal(0, 1); b ~ Normal(0, 1)
+        m = exp.(k) .* x
+        @scan begin
+            lev[1] ~ Normal(0, 1)
+            for t in 2:T
+                lev[t] ~ Normal(lev[t - 1], 1)
+            end
+        end
+    end
+    qa = (k = -0.3, a = 0.2, b = 0.6, lev = q.lev)
+    for (named, inline, value) in (
+            (quote
+                sv = lev .+ x
+                mu = b .* sv
+            end, :(mu = b .* (lev .+ x)), q -> q.b .* (q.lev .+ x)),
+            (quote
+                sv = b .* lev
+                mu = a .+ sv
+            end, :(mu = a .+ b .* lev), q -> q.a .+ q.b .* q.lev),
+            (quote
+                sv = lev .+ x
+                mu = sv .+ m
+            end, :(mu = (lev .+ x) .+ m), q -> (q.lev .+ x) .+ m(q)))
+        want = q -> sum(logpdf.(Normal.(value(q), 0.7), y)) +
+            logpdf(Normal(0, 1), q.k) + logpdf(Normal(0, 1), q.a) +
+            logpdf(Normal(0, 1), q.b) + walk(q.lev)
+        for location in (named, inline)
+            prog = Expr(:block, ahead.args...,
+                (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+                :(y .~ Normal.(mu, 0.7)))
+            _cmp_ap_check(prog, qa, want)
+        end
+    end
     # A deterministic recurrence reads the same way, named or inline.
     dhead = quote
         k ~ Normal(0, 1)
