@@ -383,7 +383,10 @@ so evaluating that expression retains the same child operations.
 A kernel with several outputs (`return PHI, omega2`) composes through Julia's
 destructuring: `(P, om) = basis(x)` stays one statement in the generated
 program and splices the child at its whole output boundary. Destructuring an
-ordinary function likewise calls it once per evaluation.
+ordinary function likewise calls it once per evaluation. Binding the call to
+one name, `bt = basis(x)`, or indexing it in place, `P = basis(x)[1]`, splices
+the same child and binds the tuple the call returns, so every output is
+computed even when one element is read.
 
 Composition exposes the child's execution capabilities. Ordinary native
 Enzyme reverse covers empty and nonempty child scans, including inside a bound
@@ -470,7 +473,8 @@ positive support and the factor width matches the outcome count.
 Array-valued definitions retain known axes: `b = z * (sd .* L)'` is groups ×
 K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
 `L[2, 1]` and `M[:, 1]` remain ordinary Julia reads. A submodel's returned
-array follows the same rule. A data-only definition can size a declared array
+array follows the same rule, and so does the expression written inline:
+`(z * (sd .* L)')[g, 1]` gathers exactly as `b[g, 1]`, level lookup included. A data-only definition can size a declared array
 through `levels(gg)`, as in the multi-membership example above.
 
 Level axes preserve the order of their source. `z[levels(g)]` uses the

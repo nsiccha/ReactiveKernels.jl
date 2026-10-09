@@ -3,12 +3,14 @@
 # activity pattern of the call selects the graph cut, and the cut's partials
 # are combined with Enzyme's directions or covectors by the scalar chain rule.
 # No derivative mathematics is authored in this file, and nothing attaches to a
-# function ReactiveKernels does not own.
+# function ReactiveKernels does not own. It also declares which Enzyme modes
+# keep WANT values retained during a prepared gradient's primal sweep.
 module ReactiveKernelsEnzymeExt
 
 using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule, forward_cut,
     has_forward_branch, has_reverse_branch, stage_primal, stage_reverse
 using ReactiveKernels: _activity_mask, _stage_residual_sources
+import ReactiveKernels
 import Enzyme
 using Enzyme: Const, Active, Duplicated, DuplicatedNoNeed, BatchDuplicated,
     BatchDuplicatedNoNeed
@@ -259,5 +261,14 @@ function EnzymeRules.forward(
     tangents = map(last, lanes)
     needs_primal(config) ? BatchDuplicated(first(lanes)[1], tangents) : tangents
 end
+
+# ------------------------------------------------- retained WANT outputs ----
+
+# A reverse-mode Enzyme gradient runs the differentiated target once, at the
+# requested point, and keeps the target's writes, so WANT values retained in
+# that sweep (`prepare_ad(...; retain)`) are its primal values.
+ReactiveKernels.ad_retains_primal_sweep(
+    ::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
+        <:Union{Nothing,Enzyme.ReverseMode}}) = true
 
 end # module

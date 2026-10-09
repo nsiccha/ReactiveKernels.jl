@@ -918,23 +918,53 @@ _ad_differentiable_value(value::NamedTuple) =
     !isempty(value) && all(_ad_differentiable_value, values(value))
 _ad_differentiable_value(::Any) = false
 
+# Positions, among a prepared kernel's WANT outputs, of the one differentiated
+# objective and of the retained outputs named by `retain` (in that order).
+# Without `retain` the kernel must have exactly one WANT, the objective.
+function _ad_output_positions(kernel::_ADKernel, retain::Tuple)
+    names = Tuple(output.name for output in outputs(kernel))
+    if isempty(retain)
+        length(names) == 1 || throw(ArgumentError(
+            "AD preparation requires exactly one selected WANT port; got " *
+            string(names)))
+        return 1, ()
+    end
+    retained = map(retain) do name
+        name isa Symbol || throw(ArgumentError(
+            "retain entries must be WANT port names; got $(repr(name))"))
+        position = findfirst(==(name), names)
+        position === nothing && throw(ArgumentError(
+            "retained port :$name is not a selected WANT port $names"))
+        position
+    end
+    allunique(retained) || throw(ArgumentError(
+        "retain names the same WANT port more than once: $retain"))
+    objective = Tuple(i for i in eachindex(names) if !(i in retained))
+    length(objective) == 1 || throw(ArgumentError(
+        "AD preparation with retained outputs requires exactly one other " *
+        "selected WANT port, the differentiated objective; got " *
+        string(Tuple(names[i] for i in objective))))
+    only(objective), retained
+end
+
 function _ad_validate_kernel(kernel::_ADKernel, active_selector,
-                             args::Tuple; scalar_output::Bool = true)
+                             args::Tuple; scalar_output::Bool = true,
+                             retain::Tuple = ())
     length(args) == length(inputs(kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(kernel))) values " *
         "$(Tuple(input.name for input in inputs(kernel))); got $(length(args))"))
 
-    length(outputs(kernel)) == 1 || throw(ArgumentError(
-        "AD preparation requires exactly one selected WANT port; got " *
-        string(Tuple(output.name for output in outputs(kernel)))))
+    objective, _ = _ad_output_positions(kernel, retain)
     if scalar_output
-        output = only(outputs(kernel))
+        output = outputs(kernel)[objective]
         output_type = valtype(output)
         if !(output_type <: Number)
             observed_type = if isconcretetype(output_type)
                 output_type
-            else
+            elseif isempty(retain)
                 typeof(kernel(args...))
+            else
+                typeof(kernel(args...)[objective])
             end
             observed_type <: Number || throw(ArgumentError(
                 "AD gradient preparation requires a scalar Number objective; " *
@@ -989,24 +1019,122 @@ function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
 end
 
 function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
-                  scalar_output::Bool = true)
+                  scalar_output::Bool = true, retain::Tuple = ())
     active_selector = _ad_active_selector(kernel, active)
-    _ad_validate_kernel(kernel, active_selector, resolved; scalar_output)
+    _ad_validate_kernel(kernel, active_selector, resolved;
+                        scalar_output, retain)
     call, external_values =
         _ad_kernel_call(kernel, resolved, Val(active_selector))
+    if !isempty(retain)
+        call, external_values = _ad_retaining_call(
+            kernel, call, external_values, resolved, retain)
+    end
     point, contexts = _ad_arguments(
         Val(active_selector), (resolved..., external_values...))
     call, point, contexts, active_selector, external_values
 end
 
-function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple())
+# Retained WANT outputs. The kernel computes the objective and every retained
+# WANT in one primal sweep. The differentiated target returns the objective to
+# the backend and stores the retained values of that same sweep in an AD-owned
+# box, threaded as the trailing `DifferentiationInterface.Cache` context, so a
+# reverse gradient yields them without a second primal pass. `J` is the
+# objective's output position, `R` the retained positions and `N` their names.
+struct _ADRetainingCall{J,R,N,F}
+    call::F
+end
+
+@generated function (retaining::_ADRetainingCall{J,R,N})(
+        active, contexts::Vararg{Any,C}) where {J,R,N,C}
+    inner = [:(getfield(contexts, $index)) for index in 1:(C - 1)]
+    retained = Expr(:tuple, (:(getfield(values, $index)) for index in R)...)
+    # Inline the wrapped adapter, as `_ADKernelCall` inlines its kernel, so
+    # the hidden readonly operands reach the generated body unrepacked.
+    quote
+        values = Base.@inline retaining.call(active, $(inner...))
+        getfield(contexts, $C)[] = NamedTuple{$N}($retained)
+        getfield(values, $J)
+    end
+end
+
+# The retained box rides after the wrapped call's own hidden operands.
+_ad_hidden_operands(retaining::_ADRetainingCall, values) =
+    _ad_hidden_operands(retaining.call, Base.front(values))
+
+function _ad_retaining_call(kernel::PreparedKernel, call, external_values,
+                            resolved::Tuple, retain::Tuple)
+    objective, retained = _ad_output_positions(kernel, retain)
+    # The exemplar sweep fixes the box's concrete type, so the stored values
+    # stay type-stable inside the differentiated call.
+    values = kernel(resolved...)
+    box = Ref(NamedTuple{retain}(map(index -> values[index], retained)))
+    _ADRetainingCall{objective,retained,retain,typeof(call)}(call),
+        (external_values..., DifferentiationInterface.Cache(box))
+end
+
+function _ad_retaining_call(kernel::NonAllocatingKernel, call, external_values,
+                            resolved::Tuple, retain::Tuple)
+    # Its WANT values live in cache slots the next call overwrites, so a
+    # retained value would need an owned copy inside the differentiated call.
+    throw(ArgumentError(
+        "retained WANT outputs are not built yet for a NonAllocatingKernel; " *
+        "prepare them from the dataflow kernel (`prepare`)"))
+end
+
+"""
+    ad_retains_primal_sweep(backend) -> Bool
+
+Whether `backend`'s gradient evaluates the differentiated target once at the
+requested point and keeps the target's writes, so WANT values retained during
+that sweep (`prepare_ad(...; retain)`) are the primal values at the point.
+Core RK knows no AD engine, so the default is `false`; the engine's package
+extension declares its supporting modes (ReactiveKernels' Enzyme extension:
+reverse-mode `AutoEnzyme`). A backend that perturbs the point (finite
+differences), carries dual numbers, or restores mutated memory in its reverse
+pass (Mooncake) must stay `false`.
+"""
+ad_retains_primal_sweep(::DifferentiationInterface.AbstractADType) = false
+
+function _ad_require_retaining_backend(
+        backend::DifferentiationInterface.AbstractADType, retain::Tuple)
+    isempty(retain) || ad_retains_primal_sweep(backend) || throw(ArgumentError(
+        "retained WANT outputs $retain need a backend whose gradient " *
+        "evaluates the objective once at the point and keeps its writes " *
+        "(reverse-mode `AutoEnzyme`, its backend package loaded); " *
+        "`$backend` is not declared to. Evaluate the retained WANT with a " *
+        "separate primal call for this backend"))
+    nothing
+end
+
+# Compiled staging rebuilds the differentiated call from the kernel alone, so
+# a retaining preparation would lose its box there; refuse it by name.
+function _ad_refuse_staged_retention(prepared)
+    prepared.call isa _ADRetainingCall && throw(ArgumentError(
+        "retained WANT outputs are not built yet for compiled (Reactant) " *
+        "staging; use the native prepared gradient, or prepare the compiled " *
+        "gradient without `retain`"))
+    nothing
+end
+
+_ad_retained_box(prepared) = _ad_retained_box(prepared.call, prepared)
+_ad_retained_box(::_ADRetainingCall, prepared) =
+    DifferentiationInterface.unwrap(last(prepared.external_values))
+_ad_retained_box(call, prepared) = throw(ArgumentError(
+    "this AD preparation retains no WANT outputs; prepare it with " *
+    "`prepare_ad(...; retain = (names...))`"))
+
+function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple();
+                         retain::Tuple = ())
     _ad_validate_unique_haves(spec)
     selected_wants = _kernel_selection(spec, want, spec.want_names, :want)
     length(selected_wants) == 1 || throw(ArgumentError(
         "AD preparation requires exactly one explicit WANT port; got " *
         string(Tuple(output.name for output in selected_wants))))
-    isempty(bound) && return prepare(plan(spec; want = only(selected_wants)))
-    prepare(plan(spec; want = only(selected_wants));
+    wants = (only(selected_wants),
+             _kernel_selection(spec, retain, spec.want_names, :retain)...)
+    selected = isempty(retain) ? only(wants) : wants
+    isempty(bound) && return prepare(plan(spec; want = selected))
+    prepare(plan(spec; want = selected);
             bound = _kernel_bound_pairs(spec, bound))
 end
 
@@ -1081,11 +1209,13 @@ end
 
 function _prepare_ad(kernel::_ADKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
-                     args::Tuple, kwargs::NamedTuple, active)
+                     args::Tuple, kwargs::NamedTuple, active;
+                     retain::Tuple = ())
     _ad_require_backend_packages(backend)
+    _ad_require_retaining_backend(backend, retain)
     resolved = _ad_resolve(resolver, args, kwargs)
     call, point, contexts, active_selector, external_values =
-        _ad_call(kernel, resolved, active)
+        _ad_call(kernel, resolved, active; retain)
     preparation = DifferentiationInterface.prepare_gradient(
         call, backend, point, contexts...)
     PreparedADKernel{active_selector,typeof(kernel),typeof(resolver),typeof(call),
@@ -1110,7 +1240,7 @@ function _prepare_ad_pullback(kernel::_ADKernel, resolver,
 end
 
 """
-    prepare_ad(spec, backend, args...; active, want, bound=(;), kwargs...) -> PreparedADKernel
+    prepare_ad(spec, backend, args...; active, want, bound=(;), retain=(), kwargs...) -> PreparedADKernel
 
 Prepare a reusable DifferentiationInterface gradient of the explicit scalar
 `want` port in a [`KernelSpec`](@ref). `active` names one selected HAVE port or
@@ -1118,6 +1248,14 @@ an ordered tuple of ports that remain differentiable; all other selected HAVE
 values are rebound on every call and passed as `Constant` contexts. A tuple
 selector is differentiated as one structured point, and gradients are returned
 in the same order.
+
+`retain = (:name, ...)` names further WANT ports whose values the gradient's
+own primal sweep also returns: [`ad_value_gradient_and_retained!`](@ref)
+yields `(value, gradient, retained)` with `retained` a `NamedTuple` of those
+values at the same point, with no second primal pass. Only the scalar `want`
+is differentiated. Retention needs a backend that evaluates the objective
+once at the point and keeps its writes ([`ad_retains_primal_sweep`](@ref);
+reverse-mode `AutoEnzyme`); other backends are refused at preparation.
 
 The ordinary authored call surface is preserved: positional defaults and
 keyword HAVE ports are resolved exactly as they are by `prepare(spec)`. The
@@ -1141,23 +1279,27 @@ prebuilt view operand defeats reverse-mode static activity analysis.
 """
 function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
-                    args...; active, want, bound = NamedTuple(), kwargs...)
-    kernel = _ad_spec_kernel(spec, want, bound)
+                    args...; active, want, bound = NamedTuple(),
+                    retain::Tuple = (), kwargs...)
+    kernel = _ad_spec_kernel(spec, want, bound; retain)
     if !isempty(bound)
         _ad_reject_bound_keywords(NamedTuple(kwargs))
-        return _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active)
+        return _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active;
+                           retain)
     end
     _prepare_ad(kernel, _ad_resolver(spec), backend, args,
-                NamedTuple(kwargs), active)
+                NamedTuple(kwargs), active; retain)
 end
 
 """
-    prepare_ad(kernel, backend, args...; active) -> PreparedADKernel
+    prepare_ad(kernel, backend, args...; active, retain=()) -> PreparedADKernel
 
 Prepare a reusable gradient for a low-level [`PreparedKernel`](@ref) whose
 boundary is already fully selected. Such kernels accept only their positional
 HAVE values and must expose exactly one scalar WANT. `active` may be one port
-identifier or an ordered tuple of identifiers.
+identifier or an ordered tuple of identifiers. With `retain`, the kernel's
+WANT ports are the scalar objective plus the retained ports named there, whose
+values the gradient's primal sweep returns (see the `KernelSpec` method).
 
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
@@ -1166,11 +1308,11 @@ fails loudly naming the missing `using`.
 """
 function prepare_ad(kernel::PreparedKernel,
                     backend::DifferentiationInterface.AbstractADType,
-                    args...; active, kwargs...)
+                    args...; active, retain::Tuple = (), kwargs...)
     isempty(kwargs) || throw(ArgumentError(
         "a low-level PreparedKernel has a positional HAVE boundary and does " *
         "not accept keywords; use a KernelSpec to preserve authored keywords"))
-    _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active)
+    _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active; retain)
 end
 
 """
@@ -1208,12 +1350,12 @@ fails loudly naming the missing `using`.
 """
 function prepare_ad(kernel::NonAllocatingKernel,
                     backend::DifferentiationInterface.AbstractADType,
-                    args...; active, kwargs...)
+                    args...; active, retain::Tuple = (), kwargs...)
     isempty(kwargs) || throw(ArgumentError(
         "a low-level NonAllocatingKernel has a positional HAVE boundary and " *
         "does not accept keywords; use a KernelSpec to preserve authored " *
         "keywords"))
-    _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active)
+    _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active; retain)
 end
 
 # A batched gradient callable owns the scalar AD preparation plus the same
@@ -1682,6 +1824,37 @@ function _ad_prepared_value_and_gradient!(prepared, gradient, point, contexts)
     DifferentiationInterface.value_and_gradient!(
         prepared.call, gradient, prepared.preparation, prepared.backend,
         point, contexts...)
+end
+
+"""
+    ad_value_gradient_and_retained!(prepared, gradient, args...; kwargs...)
+
+Like [`ad_value_and_gradient!`](@ref), for a [`PreparedADKernel`](@ref)
+prepared with `retain`: returns `(value, gradient, retained)`, where
+`retained` is a `NamedTuple` of the retained WANT values computed by the same
+primal sweep as `value`. No separate primal call runs. Each call stores fresh
+retained values; a previously returned `retained` is not modified.
+"""
+function ad_value_gradient_and_retained!(
+        prepared::PreparedADKernel, gradient, args...; kwargs...)
+    box = _ad_retained_box(prepared)
+    value, gradient = ad_value_and_gradient!(
+        prepared, gradient, args...; kwargs...)
+    value, gradient, box[]
+end
+
+"""
+    ad_value_gradient_and_retained(prepared, args...; kwargs...)
+
+Out-of-place counterpart of [`ad_value_gradient_and_retained!`](@ref):
+returns `(value, gradient, retained)` from one reverse pass, preserving the
+structured gradient as [`ad_value_and_gradient`](@ref) does.
+"""
+function ad_value_gradient_and_retained(
+        prepared::PreparedADKernel, args...; kwargs...)
+    box = _ad_retained_box(prepared)
+    value, gradient = ad_value_and_gradient(prepared, args...; kwargs...)
+    value, gradient, box[]
 end
 
 function _ad_prepared_value_and_gradient!(
