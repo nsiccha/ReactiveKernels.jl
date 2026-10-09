@@ -668,8 +668,8 @@ _pv_m8_q() = (c = [0.3, -0.4, 0.1], b = 0.75, mu_alpha = 0.5,
         end
         computed = lower_rkppl(mk(:(Normal.(mu_alpha + 0, 2))), (:y, :x, :g); conditioned = (:y, :x, :g))
         row = _pv_prior(computed, :mu, :g)
-        @test row.location === :_rkppl_c_arg1
-        @test any(a -> a.name === :_rkppl_c_arg1, computed.assignments)
+        @test row.location === :c_location
+        @test any(a -> a.name === :c_location, computed.assignments)
         flipped = lower_rkppl(mk(:(Normal.(mu_alpha, sigma_alpha)),
             :(-c[g])), (:y, :x, :g); conditioned = (:y, :x, :g))
         row = _pv_prior(flipped, :mu, :g)
