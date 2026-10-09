@@ -1,4 +1,30 @@
 """
+    PreparedADOperator{I,K,R,F,B,P,E,O}
+
+One prepared DifferentiationInterface operator over a ReactiveKernels
+boundary. The last parameter `O` names the operator: `:gradient`
+([`PreparedADKernel`](@ref)),
+`:pullback` ([`PreparedADPullback`](@ref)), `:pushforward`
+([`PreparedADPushforward`](@ref)) or `:hvp` ([`PreparedADHVP`](@ref)). Every
+operator shares the same boundary: one selected HAVE port or ordered tuple of
+ports is active, every other selected HAVE is rebound on each call as a
+`DifferentiationInterface.Constant` context, and the differentiated callable
+is the exact primal kernel body. Only the DifferentiationInterface preparation
+stored in the object differs.
+
+The stored preparation is mutable and not thread-safe. Prepare one object per
+concurrent caller.
+"""
+struct PreparedADOperator{I,K,R,F,B,P,E,O}
+    kernel::K
+    resolver::R
+    call::F
+    backend::B
+    preparation::P
+    external_values::E
+end
+
+"""
     PreparedADKernel
 
 A prepared DifferentiationInterface gradient for a ReactiveKernels scalar
@@ -12,20 +38,7 @@ the selector's order.
 The stored differentiation preparation is mutable and not thread-safe. Prepare
 one `PreparedADKernel` per concurrent caller.
 """
-struct PreparedADKernel{I,K,R,F,B,P,E}
-    kernel::K
-    resolver::R
-    call::F
-    backend::B
-    preparation::P
-    external_values::E
-end
-
-# Same statically-untraced contract as `PreparedKernel` (codegen.jl): this
-# object is captured by the `@trace` loop in `_replica_ad_call`, and its
-# kernel reaches the same `Type`-carrying recipe metadata.
-ReactantCore.is_traced(::PreparedADKernel) = false
-ReactantCore.is_traced(::PreparedADKernel, ::Base.IdSet) = false
+const PreparedADKernel{I,K,R,F,B,P,E} = PreparedADOperator{I,K,R,F,B,P,E,:gradient}
 
 """
     PreparedADPullback
@@ -38,14 +51,42 @@ products with [`ad_pullback`](@ref) or [`ad_value_and_pullback`](@ref).
 Like [`PreparedADKernel`](@ref), the stored differentiation preparation is
 mutable and not thread-safe. Prepare one object per concurrent caller.
 """
-struct PreparedADPullback{I,K,R,F,B,P,E}
-    kernel::K
-    resolver::R
-    call::F
-    backend::B
-    preparation::P
-    external_values::E
-end
+const PreparedADPullback{I,K,R,F,B,P,E} = PreparedADOperator{I,K,R,F,B,P,E,:pullback}
+
+"""
+    PreparedADPushforward
+
+A prepared DifferentiationInterface pushforward (Jacobian-vector product) for
+one selected ReactiveKernels WANT port, which may be non-scalar. Construct one
+with [`prepare_ad_pushforward`](@ref), providing a tuple of input tangent
+exemplars. Calls evaluate one Jacobian-vector product per tangent with
+[`ad_pushforward`](@ref) or [`ad_value_and_pushforward`](@ref).
+
+Like [`PreparedADKernel`](@ref), the stored differentiation preparation is
+mutable and not thread-safe. Prepare one object per concurrent caller.
+"""
+const PreparedADPushforward{I,K,R,F,B,P,E} =
+    PreparedADOperator{I,K,R,F,B,P,E,:pushforward}
+
+"""
+    PreparedADHVP
+
+A prepared DifferentiationInterface Hessian-vector product for one explicit
+scalar ReactiveKernels WANT port. Construct one with
+[`prepare_ad_hvp`](@ref), providing a tuple of input tangent exemplars. Calls
+evaluate one Hessian-vector product per tangent with [`ad_hvp`](@ref),
+[`ad_hvp!`](@ref) or [`ad_gradient_and_hvp`](@ref).
+
+Like [`PreparedADKernel`](@ref), the stored differentiation preparation is
+mutable and not thread-safe. Prepare one object per concurrent caller.
+"""
+const PreparedADHVP{I,K,R,F,B,P,E} = PreparedADOperator{I,K,R,F,B,P,E,:hvp}
+
+# Same statically-untraced contract as `PreparedKernel` (codegen.jl): this
+# object is captured by the `@trace` loop in `_replica_ad_call`, and its
+# kernel reaches the same `Type`-carrying recipe metadata.
+ReactantCore.is_traced(::PreparedADOperator) = false
+ReactantCore.is_traced(::PreparedADOperator, ::Base.IdSet) = false
 
 # Low-level prepared kernels AD accepts: the allocating dataflow kernel and
 # the non-allocating step-program kernel. Both expose the same positional
@@ -1207,36 +1248,117 @@ function _ad_require_backend_packages(
         "backend extension, which provides the preparation methods"))
 end
 
-function _prepare_ad(kernel::_ADKernel, resolver,
-                     backend::DifferentiationInterface.AbstractADType,
-                     args::Tuple, kwargs::NamedTuple, active;
-                     retain::Tuple = ())
+# The DifferentiationInterface preparation each operator stores. Gradients and
+# Hessian-vector products need a scalar WANT; pullbacks and pushforwards accept
+# any WANT. `seeds` is DI's direction tuple (empty for a gradient).
+_ad_operator_scalar_output(::Val{:gradient}) = true
+_ad_operator_scalar_output(::Val{:hvp}) = true
+_ad_operator_scalar_output(::Val{:pullback}) = false
+_ad_operator_scalar_output(::Val{:pushforward}) = false
+
+_ad_operator_preparation(::Val{:gradient}, call, backend, point, ::Tuple{}, contexts) =
+    DifferentiationInterface.prepare_gradient(call, backend, point, contexts...)
+_ad_operator_preparation(::Val{:pullback}, call, backend, point, seeds, contexts) =
+    DifferentiationInterface.prepare_pullback(call, backend, point, seeds, contexts...)
+_ad_operator_preparation(::Val{:pushforward}, call, backend, point, seeds, contexts) =
+    DifferentiationInterface.prepare_pushforward(call, backend, point, seeds, contexts...)
+_ad_operator_preparation(::Val{:hvp}, call, backend, point, seeds, contexts) =
+    DifferentiationInterface.prepare_hvp(call, backend, point, seeds, contexts...)
+
+# Input tangents of a pushforward or Hessian-vector product are DI's direction
+# tuple: one entry per direction, each shaped like the active point (a tuple of
+# components for a tuple selector). Several directions run as one batched
+# derivative call where the backend supports it.
+function _ad_check_tangents(tangents)
+    tangents isa Tuple && !isempty(tangents) || throw(ArgumentError(
+        "input tangents are a nonempty tuple of directions, one entry per " *
+        "direction (`(v,)` for one direction); got $(typeof(tangents))"))
+    tangents
+end
+
+function _ad_check_tangents(point, tangents)
+    _ad_check_tangents(tangents)
+    for tangent in tangents
+        _ad_tangent_matches(point, tangent) || throw(ArgumentError(
+            "each input tangent must have the active point's structure " *
+            "($(_ad_tangent_shape(point))); got $(_ad_tangent_shape(tangent))"))
+    end
+    tangents
+end
+
+_ad_tangent_matches(point::AbstractArray, tangent::AbstractArray) =
+    size(point) == size(tangent)
+_ad_tangent_matches(point::Number, tangent::Number) = true
+_ad_tangent_matches(point::Base.RefValue, tangent) =
+    _ad_tangent_matches(point[], _ad_active_value(tangent))
+_ad_tangent_matches(point::Tuple, tangent::Tuple) =
+    length(point) == length(tangent) &&
+    all(map(_ad_tangent_matches, point, tangent))
+_ad_tangent_matches(point::NamedTuple, tangent::NamedTuple) =
+    keys(point) == keys(tangent) &&
+    all(map(_ad_tangent_matches, values(point), values(tangent)))
+_ad_tangent_matches(point, tangent) = false
+
+_ad_tangent_shape(value::AbstractArray) = "$(typeof(value)) of size $(size(value))"
+_ad_tangent_shape(value::Base.RefValue) = _ad_tangent_shape(value[])
+_ad_tangent_shape(value::Tuple) = "(" * join(map(_ad_tangent_shape, value), ", ") * ")"
+_ad_tangent_shape(value) = string(typeof(value))
+
+# A tuple selector's scalar components cross DI as mutable `Ref` storage
+# (`_ad_active_point_component`); tangents follow the same representation.
+_ad_tangent_point(point::Tuple, tangent::Tuple) =
+    map(_ad_tangent_point, point, tangent)
+_ad_tangent_point(::Base.RefValue, tangent::Number) = Ref(tangent)
+_ad_tangent_point(point, tangent) = tangent
+
+_ad_tangents_point(point, tangents::Tuple) =
+    map(tangent -> _ad_tangent_point(point, tangent), tangents)
+
+function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
+                              backend::DifferentiationInterface.AbstractADType,
+                              seeds::Tuple, args::Tuple, kwargs::NamedTuple,
+                              active; retain::Tuple = ()) where {O}
     _ad_require_backend_packages(backend)
     _ad_require_retaining_backend(backend, retain)
     resolved = _ad_resolve(resolver, args, kwargs)
-    call, point, contexts, active_selector, external_values =
-        _ad_call(kernel, resolved, active; retain)
-    preparation = DifferentiationInterface.prepare_gradient(
-        call, backend, point, contexts...)
-    PreparedADKernel{active_selector,typeof(kernel),typeof(resolver),typeof(call),
-                     typeof(backend),typeof(preparation),
-                     typeof(external_values)}(
-        kernel, resolver, call, backend, preparation, external_values)
+    call, point, contexts, active_selector, external_values = _ad_call(
+        kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
+        retain)
+    preparation = _ad_operator_preparation(
+        op, call, backend, point, seeds, contexts)
+    PreparedADOperator{
+        active_selector,typeof(kernel),typeof(resolver),typeof(call),
+        typeof(backend),typeof(preparation),typeof(external_values),O,
+    }(kernel, resolver, call, backend, preparation, external_values)
 end
 
-function _prepare_ad_pullback(kernel::_ADKernel, resolver,
-                              backend::DifferentiationInterface.AbstractADType,
-                              seed, args::Tuple, kwargs::NamedTuple, active)
-    _ad_require_backend_packages(backend)
+# Only a gradient retains further WANT values from its primal sweep.
+_prepare_ad(kernel::_ADKernel, resolver,
+            backend::DifferentiationInterface.AbstractADType,
+            args::Tuple, kwargs::NamedTuple, active; retain::Tuple = ()) =
+    _prepare_ad_operator(Val(:gradient), kernel, resolver, backend, (),
+                         args, kwargs, active; retain)
+
+_prepare_ad_pullback(kernel::_ADKernel, resolver,
+                     backend::DifferentiationInterface.AbstractADType,
+                     seed, args::Tuple, kwargs::NamedTuple, active) =
+    _prepare_ad_operator(Val(:pullback), kernel, resolver, backend, (seed,),
+                         args, kwargs, active)
+
+# Tangent operators validate the exemplar directions against the resolved
+# active point before DI sees them, so a direction count/shape mistake names
+# the boundary instead of failing inside the backend.
+function _prepare_ad_tangent_operator(op::Val, kernel::_ADKernel, resolver,
+                                      backend::DifferentiationInterface.AbstractADType,
+                                      tangents, args::Tuple, kwargs::NamedTuple,
+                                      active)
+    _ad_check_tangents(tangents)
     resolved = _ad_resolve(resolver, args, kwargs)
-    call, point, contexts, active_selector, external_values =
-        _ad_call(kernel, resolved, active; scalar_output = false)
-    preparation = DifferentiationInterface.prepare_pullback(
-        call, backend, point, (seed,), contexts...)
-    PreparedADPullback{
-        active_selector,typeof(kernel),typeof(resolver),typeof(call),
-        typeof(backend),typeof(preparation),typeof(external_values),
-    }(kernel, resolver, call, backend, preparation, external_values)
+    active_selector = _ad_active_selector(kernel, active)
+    point, _ = _ad_arguments(Val(active_selector), resolved)
+    _ad_check_tangents(point, tangents)
+    _prepare_ad_operator(op, kernel, resolver, backend,
+                         _ad_tangents_point(point, tangents), args, kwargs, active)
 end
 
 """
@@ -1281,14 +1403,9 @@ function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, want, bound = NamedTuple(),
                     retain::Tuple = (), kwargs...)
-    kernel = _ad_spec_kernel(spec, want, bound; retain)
-    if !isempty(bound)
-        _ad_reject_bound_keywords(NamedTuple(kwargs))
-        return _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active;
-                           retain)
-    end
-    _prepare_ad(kernel, _ad_resolver(spec), backend, args,
-                NamedTuple(kwargs), active; retain)
+    kernel, resolver, keywords =
+        _ad_spec_boundary(spec, want, bound, kwargs; retain)
+    _prepare_ad(kernel, resolver, backend, args, keywords, active; retain)
 end
 
 """
@@ -1309,10 +1426,8 @@ fails loudly naming the missing `using`.
 function prepare_ad(kernel::PreparedKernel,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, retain::Tuple = (), kwargs...)
-    isempty(kwargs) || throw(ArgumentError(
-        "a low-level PreparedKernel has a positional HAVE boundary and does " *
-        "not accept keywords; use a KernelSpec to preserve authored keywords"))
-    _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active; retain)
+    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+    _prepare_ad(kernel, tuple, backend, args, keywords, active; retain)
 end
 
 """
@@ -1351,11 +1466,8 @@ fails loudly naming the missing `using`.
 function prepare_ad(kernel::NonAllocatingKernel,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, retain::Tuple = (), kwargs...)
-    isempty(kwargs) || throw(ArgumentError(
-        "a low-level NonAllocatingKernel has a positional HAVE boundary and " *
-        "does not accept keywords; use a KernelSpec to preserve authored " *
-        "keywords"))
-    _prepare_ad(kernel, tuple, backend, args, NamedTuple(), active; retain)
+    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+    _prepare_ad(kernel, tuple, backend, args, keywords, active; retain)
 end
 
 # A batched gradient callable owns the scalar AD preparation plus the same
@@ -1487,26 +1599,11 @@ function prepare_ad_pullback(
 end
 
 function prepare_ad_pullback(
-        kernel::PreparedKernel,
+        kernel::_ADKernel,
         backend::DifferentiationInterface.AbstractADType,
         seed, args...; active, kwargs...)
-    isempty(kwargs) || throw(ArgumentError(
-        "a low-level PreparedKernel has a positional HAVE boundary and does " *
-        "not accept keywords; use a KernelSpec to preserve authored keywords"))
-    _prepare_ad_pullback(
-        kernel, tuple, backend, seed, args, NamedTuple(), active)
-end
-
-function prepare_ad_pullback(
-        kernel::NonAllocatingKernel,
-        backend::DifferentiationInterface.AbstractADType,
-        seed, args...; active, kwargs...)
-    isempty(kwargs) || throw(ArgumentError(
-        "a low-level NonAllocatingKernel has a positional HAVE boundary and " *
-        "does not accept keywords; use a KernelSpec to preserve authored " *
-        "keywords"))
-    _prepare_ad_pullback(
-        kernel, tuple, backend, seed, args, NamedTuple(), active)
+    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+    _prepare_ad_pullback(kernel, tuple, backend, seed, args, keywords, active)
 end
 
 """
@@ -1578,7 +1675,7 @@ function ad_gradient(kernel::NonAllocatingKernel,
 end
 
 function _ad_prepared_arguments(
-        prepared::PreparedADKernel{I}, args, kwargs::NamedTuple) where {I}
+        prepared::PreparedADOperator{I}, args, kwargs::NamedTuple) where {I}
     resolved = _ad_resolve(prepared.resolver, args, NamedTuple(kwargs))
     length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
         "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
@@ -1684,18 +1781,6 @@ function ad_pullback(kernel::NonAllocatingKernel,
     _ad_restore_cotangent(point, cotangent)
 end
 
-function _ad_prepared_arguments(
-        prepared::PreparedADPullback{I}, args, kwargs::NamedTuple) where {I}
-    resolved = _ad_resolve(prepared.resolver, args, NamedTuple(kwargs))
-    length(resolved) == length(inputs(prepared.kernel)) || throw(ArgumentError(
-        "selected HAVE boundary expects $(length(inputs(prepared.kernel))) " *
-        "values; got $(length(resolved))"))
-    point, contexts =
-        _ad_arguments(Val(I), (resolved..., prepared.external_values...))
-    _ad_trace_sanity(point, contexts)
-    point, contexts
-end
-
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
@@ -1758,6 +1843,209 @@ function _ad_prepared_value_and_pullback!(
         prepared.call, (cotangent,), prepared.preparation, prepared.backend,
         point, (seed,), contexts...)
     value, only(pullbacks)
+end
+
+# The authored-boundary resolution shared by every `KernelSpec` preparation:
+# a bound preparation is positional over the remaining ports, otherwise the
+# authored defaults and keywords resolve as `prepare(spec)` does.
+function _ad_spec_boundary(spec::KernelSpec, want, bound, kwargs;
+                           retain::Tuple = ())
+    kernel = _ad_spec_kernel(spec, want, bound; retain)
+    isempty(bound) && return kernel, _ad_resolver(spec), NamedTuple(kwargs)
+    kernel, tuple, _ad_reject_bound_keywords(NamedTuple(kwargs))
+end
+
+function _ad_reject_low_level_keywords(kernel::_ADKernel, kwargs)
+    isempty(kwargs) || throw(ArgumentError(
+        "a low-level $(nameof(typeof(kernel))) has a positional HAVE boundary " *
+        "and does not accept keywords; use a KernelSpec to preserve authored " *
+        "keywords"))
+    NamedTuple()
+end
+
+"""
+    prepare_ad_pushforward(spec, backend, tangents, args...;
+                           active, want, bound=(;), kwargs...) -> PreparedADPushforward
+    prepare_ad_pushforward(kernel, backend, tangents, args...;
+                           active) -> PreparedADPushforward
+
+Prepare a reusable forward pushforward (Jacobian-vector product) of one
+explicit `want` port, which may be non-scalar (a vector, a `NamedTuple` of
+arrays, …). `tangents` is a nonempty tuple of input-tangent exemplars, one per
+direction, each shaped like the active point: `(v,)` for one direction,
+`(v1, v2, v3)` for three directions evaluated together. A tuple `active`
+selector takes one tuple of component tangents per direction. One HAVE port or
+an ordered tuple of HAVE ports is active, and all other current HAVE values
+are rebound as `Constant` contexts on every call, exactly as for
+[`prepare_ad`](@ref). `bound` runs the same partial-evaluation pre-pass.
+
+Several directions with disjoint supports give a compressed Jacobian: for a
+WANT whose entries each depend on one group of active coordinates, one
+direction per coordinate within a group, summed across groups, recovers every
+group's Jacobian block.
+
+The backend's package must be loaded in the calling session (`using Enzyme`
+for `AutoEnzyme(; mode = Enzyme.Forward)`); preparation without it fails
+loudly naming the missing `using`.
+"""
+function prepare_ad_pushforward(
+        spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
+        tangents, args...; active, want, bound = NamedTuple(), kwargs...)
+    kernel, resolver, keywords = _ad_spec_boundary(spec, want, bound, kwargs)
+    _prepare_ad_tangent_operator(Val(:pushforward), kernel, resolver, backend,
+                                 tangents, args, keywords, active)
+end
+
+function prepare_ad_pushforward(
+        kernel::_ADKernel, backend::DifferentiationInterface.AbstractADType,
+        tangents, args...; active, kwargs...)
+    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+    _prepare_ad_tangent_operator(Val(:pushforward), kernel, tuple, backend,
+                                 tangents, args, keywords, active)
+end
+
+# Call-time tangents are checked against the current active point and take
+# the point's representation (scalar tuple components cross as `Ref`).
+_ad_prepared_tangents(point, tangents) =
+    _ad_tangents_point(point, _ad_check_tangents(point, tangents))
+
+"""
+    ad_pushforward(prepared, tangents, args...; kwargs...) -> Tuple
+
+Evaluate one Jacobian-vector product of the prepared WANT per input tangent in
+`tangents`, returning a tuple of output tangents in the same order. Each output
+tangent has the WANT's structure. `tangents` must hold as many directions as
+the preparation exemplar.
+"""
+function ad_pushforward(prepared::PreparedADPushforward, tangents, args...;
+                        kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    DifferentiationInterface.pushforward(
+        prepared.call, prepared.preparation, prepared.backend,
+        point, _ad_prepared_tangents(point, tangents), contexts...)
+end
+
+"""
+    ad_value_and_pushforward(prepared, tangents, args...; kwargs...)
+
+Evaluate the prepared WANT and one Jacobian-vector product per input tangent
+together. Returns `(value, output_tangents)`; see [`ad_pushforward`](@ref).
+"""
+function ad_value_and_pushforward(
+        prepared::PreparedADPushforward, tangents, args...; kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    DifferentiationInterface.value_and_pushforward(
+        prepared.call, prepared.preparation, prepared.backend,
+        point, _ad_prepared_tangents(point, tangents), contexts...)
+end
+
+"""
+    prepare_ad_hvp(spec, backend, tangents, args...;
+                   active, want, bound=(;), kwargs...) -> PreparedADHVP
+    prepare_ad_hvp(kernel, backend, tangents, args...; active) -> PreparedADHVP
+
+Prepare reusable Hessian-vector products of one explicit scalar `want` port
+with respect to the active HAVE port. `tangents` is a nonempty tuple of
+input-tangent exemplars, one per direction (`(v,)` for one direction); each
+call then returns `H * v` for every direction. All other current HAVE values
+are rebound as `Constant` contexts on every call, exactly as for
+[`prepare_ad`](@ref), and `bound` runs the same partial-evaluation pre-pass.
+
+Pass a second-order backend, typically forward over reverse:
+`DifferentiationInterface.SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
+AutoEnzyme(; mode = Enzyme.Reverse))`. Directions with disjoint supports give a
+compressed Hessian: when active coordinates fall into groups that never
+interact (per-subject effects of a population model, say), one direction per
+coordinate within a group, summed across groups, recovers every group's
+diagonal Hessian block.
+
+The backend's packages must be loaded in the calling session (`using Enzyme`
+for `AutoEnzyme`); preparation without them fails loudly naming the missing
+`using`.
+"""
+function prepare_ad_hvp(
+        spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
+        tangents, args...; active, want, bound = NamedTuple(), kwargs...)
+    kernel, resolver, keywords = _ad_spec_boundary(spec, want, bound, kwargs)
+    _prepare_ad_tangent_operator(Val(:hvp), kernel, resolver, backend,
+                                 tangents, args, keywords, active)
+end
+
+function prepare_ad_hvp(
+        kernel::_ADKernel, backend::DifferentiationInterface.AbstractADType,
+        tangents, args...; active, kwargs...)
+    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+    _prepare_ad_tangent_operator(Val(:hvp), kernel, tuple, backend,
+                                 tangents, args, keywords, active)
+end
+
+_ad_restore_tangents(point, results::Tuple) =
+    map(result -> _ad_restore_cotangent(point, result), results)
+
+"""
+    ad_hvp(prepared, tangents, args...; kwargs...) -> Tuple
+
+Evaluate one Hessian-vector product of the prepared scalar WANT per input
+tangent in `tangents`, returning a tuple of results in the same order.
+`tangents` must hold as many directions as the preparation exemplar.
+"""
+function ad_hvp(prepared::PreparedADHVP, tangents, args...; kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    _ad_restore_tangents(point, DifferentiationInterface.hvp(
+        prepared.call, prepared.preparation, prepared.backend,
+        point, _ad_prepared_tangents(point, tangents), contexts...))
+end
+
+"""
+    ad_hvp!(prepared, results, tangents, args...; kwargs...) -> results
+
+Evaluate the Hessian-vector products of [`ad_hvp`](@ref) into caller-owned
+`results`, a tuple holding one destination array per direction.
+"""
+function ad_hvp!(prepared::PreparedADHVP, results::Tuple, tangents, args...;
+                 kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    DifferentiationInterface.hvp!(
+        prepared.call, results, prepared.preparation, prepared.backend,
+        point, _ad_prepared_tangents(point, tangents), contexts...)
+end
+
+"""
+    ad_gradient_and_hvp(prepared, tangents, args...; kwargs...)
+
+Evaluate the gradient of the prepared scalar WANT and one Hessian-vector
+product per input tangent from the same differentiation pass. Returns
+`(gradient, hvps)`.
+"""
+function ad_gradient_and_hvp(prepared::PreparedADHVP, tangents, args...;
+                             kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    gradient, results = DifferentiationInterface.gradient_and_hvp(
+        prepared.call, prepared.preparation, prepared.backend,
+        point, _ad_prepared_tangents(point, tangents), contexts...)
+    _ad_restore_cotangent(point, gradient), _ad_restore_tangents(point, results)
+end
+
+"""
+    ad_gradient_and_hvp!(prepared, gradient, results, tangents, args...; kwargs...)
+
+In-place form of [`ad_gradient_and_hvp`](@ref): writes the gradient into
+`gradient` and the Hessian-vector products into `results`, a tuple holding one
+destination array per direction. Returns `(gradient, results)`.
+"""
+function ad_gradient_and_hvp!(prepared::PreparedADHVP, gradient,
+                              results::Tuple, tangents, args...; kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    DifferentiationInterface.gradient_and_hvp!(
+        prepared.call, gradient, results, prepared.preparation,
+        prepared.backend, point, _ad_prepared_tangents(point, tangents),
+        contexts...)
 end
 
 """
@@ -1901,12 +2189,9 @@ function _ad_copy_cotangent!(destination, source)
         "out-of-place structured gradient."))
 end
 
-inputs(prepared::PreparedADKernel) = inputs(prepared.kernel)
-outputs(prepared::PreparedADKernel) = outputs(prepared.kernel)
-code_expr(prepared::PreparedADKernel) = code_expr(prepared.kernel)
-inputs(prepared::PreparedADPullback) = inputs(prepared.kernel)
-outputs(prepared::PreparedADPullback) = outputs(prepared.kernel)
-code_expr(prepared::PreparedADPullback) = code_expr(prepared.kernel)
+inputs(prepared::PreparedADOperator) = inputs(prepared.kernel)
+outputs(prepared::PreparedADOperator) = outputs(prepared.kernel)
+code_expr(prepared::PreparedADOperator) = code_expr(prepared.kernel)
 
 function _show_ad_active(io::IO, boundary, index::Int)
     print(io, ":", boundary[index].name)
@@ -1916,17 +2201,15 @@ function _show_ad_active(io::IO, boundary, indices::Tuple)
     show(io, Tuple(boundary[index].name for index in indices))
 end
 
-function Base.show(io::IO, prepared::PreparedADKernel{I}) where {I}
-    print(io, "PreparedADKernel(active=")
-    _show_ad_active(io, inputs(prepared.kernel), I)
-    print(io, ", want=:", only(outputs(prepared.kernel)).name, ", kernel=")
-    show(io, prepared.kernel)
-    print(io, ")")
-end
+_ad_operator_type_name(::Val{:gradient}) = "PreparedADKernel"
+_ad_operator_type_name(::Val{:pullback}) = "PreparedADPullback"
+_ad_operator_type_name(::Val{:pushforward}) = "PreparedADPushforward"
+_ad_operator_type_name(::Val{:hvp}) = "PreparedADHVP"
 
+_ad_operator(::PreparedADOperator{I,K,R,F,B,P,E,O}) where {I,K,R,F,B,P,E,O} = O
 
-function Base.show(io::IO, prepared::PreparedADPullback{I}) where {I}
-    print(io, "PreparedADPullback(active=")
+function Base.show(io::IO, prepared::PreparedADOperator{I}) where {I}
+    print(io, _ad_operator_type_name(Val(_ad_operator(prepared))), "(active=")
     _show_ad_active(io, inputs(prepared.kernel), I)
     print(io, ", want=:", only(outputs(prepared.kernel)).name, ", kernel=")
     show(io, prepared.kernel)
