@@ -373,6 +373,61 @@ function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     _narrow_plate_output(result)
 end
 
+# One cell of an authored plate at a runtime index (`plate_cell`, cells.jl):
+# the recipe's first input is the index, the rest are the plate's arguments.
+# Lowering slices every batched argument to that cell and lowers the plate over
+# the one-cell domain, so the cell runs exactly the plate's own scalar body. A
+# single-consumer plate upstream composes into it (`_fuse_authored_plate_chains`)
+# and so runs at that cell only as well.
+struct _AuthoredPlateCellOp{K,A}
+    plate::_AuthoredPlateOp{K,A}
+end
+
+function (op::_AuthoredPlateCellOp{K,A})(index, args...) where {K,A}
+    only(op.plate(_plate_cell_slices(Val(A), index, args...)...))
+end
+
+# The plate's batched arguments restricted to the cell at `index` (a linear or
+# Cartesian position in the plate's broadcast domain), shared arguments
+# unchanged. The domain is Base's `combine_axes` of the batched arguments, as
+# the plate's own loop computes it (`_plate_combined_axes_expr`), and indexing
+# its `CartesianIndices` keeps Julia's bounds check. An argument extruded along
+# a dimension keeps that singleton dimension, so the one-cell broadcast reads
+# exactly the elements the cell reads in the plate. Only axes are combined: a
+# tuple wrapping the shared arguments beside the batched ones would put
+# constant and active arrays in one value, which native Enzyme Reverse rejects.
+# Lowered cells emit the same steps per argument (`_lower_authored_plate_cell!`);
+# this is the operation's ordinary call.
+@generated function _plate_cell_slices(::Val{A}, index, args::Vararg{Any,N}) where {A,N}
+    batched = [position for position in 1:N if !(position in A)]
+    raw(position) = :($(GlobalRef(Base, :broadcastable))(getfield(args, $position)))
+    shape = _plate_combined_axes_expr(Any[raw(position) for position in batched])
+    slices = Any[position in A ? :(getfield(args, $position)) :
+                 :(_plate_cell_slice($(raw(position)), cell)) for position in 1:N]
+    quote
+        cell = _plate_cell_position(_plate_require_axes($shape), index)
+        ($(slices...),)
+    end
+end
+
+@inline _plate_cell_position(shape, index) = CartesianIndices(shape)[index]
+
+@inline _plate_cell_slice(arg, cell) = arg
+@inline _plate_cell_slice(arg::Tuple, cell) =
+    length(arg) == 1 ? arg : (arg[cell[1]],)
+# A view, never a copy: a fresh container holding the caller's element arrays
+# (one array per cell) gives native Reverse a shadow that aliases them, and the
+# gradient then accumulates into the caller's data.
+@inline function _plate_cell_slice(arg::AbstractArray{<:Any,N}, cell) where {N}
+    N == 0 && return arg
+    ranges = ntuple(N) do dimension
+        axis = axes(arg, dimension)
+        position = length(axis) == 1 ? first(axis) : cell[dimension]
+        position:position
+    end
+    view(arg, ranges...)
+end
+
 # A first-class authored SEQUENTIAL scan.  Unlike `plate` (a pure broadcast map),
 # it threads a carry through an ordered loop; its scalar step is a 2-`want` kernel
 # `(carry, x, shared...) -> (new_carry, output)`. Native lowering inlines that
@@ -1359,12 +1414,23 @@ function _fuse_authored_plate_chains(p::Plan)
         consumer_index = only(consumers)
         consumer_index > index || continue
         consumer = recipes[consumer_index]
+        # A plate cell composes its producer as its plate does; its first
+        # input is the cell index, which the producer never is.
+        cell = consumer.op isa _AuthoredPlateCellOp
+        cell && canon_id(p.graph, first(consumer.inputs).id) == cid && continue
+        cell && (consumer = Recipe(consumer.id, consumer.inputs[2:end],
+            consumer.outputs, consumer.op.plate, consumer.cost, nothing, false,
+            consumer.source))
         consumer.op isa _AuthoredPlateOp || continue
         consumer_atomic = typeof(consumer.op).parameters[2]
         any(position -> position in consumer_atomic &&
             canon_id(p.graph, consumer.inputs[position].id) == cid,
             eachindex(consumer.inputs)) && continue
-        recipes[consumer_index] = _compose_authored_plates(p.graph, producer, consumer)
+        composed = _compose_authored_plates(p.graph, producer, consumer)
+        recipes[consumer_index] = cell ?
+            Recipe(composed.id, (first(recipes[consumer_index].inputs), composed.inputs...),
+                   composed.outputs, _AuthoredPlateCellOp(composed.op), composed.cost,
+                   nothing, false, composed.source) : composed
         recipes[index] = nothing
         changed = true
     end
@@ -2438,6 +2504,64 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
 end
 
 # Keep tensorized lowering on the same non-specializing boundary as native.
+# A plate cell lowers as its plate over the one-cell slices of the plate's
+# arguments (`_plate_cell_slices`), with the same native or tensorized plate
+# lowering and the same operation-table entries as the plate itself.
+Base.@nospecializeinfer function _lower_authored_plate_cell!(
+        body, runtime_ops, runtime_recipes, @nospecialize(recipe::Recipe),
+        callargs, lhs, tensorized::Bool; windows = nothing)
+    op = recipe.op::_AuthoredPlateCellOp
+    plate = op.plate
+    atomic = typeof(plate).parameters[2]
+    index_arg = first(callargs)
+    plate_args = callargs[2:end]
+    plate_values = recipe.inputs[2:end]
+    # The steps of `_plate_cell_slices`, one argument at a time.
+    raw = Dict{Int,Symbol}()
+    for (position, arg) in enumerate(plate_args)
+        position in atomic && continue
+        raw[position] = gensym(:cell_raw)
+        push!(body.args, Expr(:(=), raw[position],
+            Expr(:call, GlobalRef(Base, :broadcastable), arg)))
+    end
+    cell = gensym(:cell_position)
+    shape = _plate_combined_axes_expr(Any[raw[position] for position in sort!(collect(keys(raw)))])
+    push!(body.args, Expr(:(=), cell,
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_position),
+             Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), shape), index_arg)))
+    slices = Any[]
+    for (position, arg) in enumerate(plate_args)
+        if position in atomic
+            push!(slices, arg)
+            continue
+        end
+        slice = gensym(:cell_argument)
+        push!(body.args, Expr(:(=), slice,
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
+        push!(slices, slice)
+    end
+    # A shared array read only at the cell's own row whose producer computes
+    # it row by row is computed at that row (`_CellEmitter`, cell_windows.jl).
+    if windows !== nothing
+        d = windows.pushdowns
+        for (position, batched) in sort!(collect(d.captures[recipe.id]))
+            value = canon_id(d.graph, plate_values[position].id)
+            value in d.pushed || continue
+            slices[position] = _cell_capture!(windows, value, slices[batched])
+        end
+    end
+    pointwise = gensym(:cell_pointwise)
+    if tensorized
+        _lower_authored_plate_tensorized!(body, runtime_ops, runtime_recipes,
+            plate, slices, plate_values, pointwise, nothing)
+    else
+        _lower_authored_plate_native!(body, runtime_ops, runtime_recipes,
+            plate, slices, plate_values, pointwise, nothing)
+    end
+    push!(body.args, Expr(:(=), lhs, Expr(:call, GlobalRef(Base, :only), pointwise)))
+    body
+end
+
 Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
@@ -2628,9 +2752,22 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         end
     end
     strip_members = Set(x.id for region in values(strip_regions) for x in region)
+    # Values plate cells read only at their own row, computed there
+    # (`_cell_pushdowns`, cell_windows.jl). Native only: the tensorized product
+    # computes them whole, and both keep the same operation table.
+    cells = !tensorized && inline_embedded && isempty(recycle) &&
+        type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
         callargs = Any[nm(inp) for inp in r.inputs]
+        if cells !== nothing && r.id in cells.recipes
+            # Its table slot stays here; its consumer cell calls it per row.
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            cells.slots[r.id] = length(runtime_ops)
+            foreach(output -> push!(assigned, canon_id(g, output.id)), r.outputs)
+            continue
+        end
 
         if inline_embedded && r.op isa _AuthoredPlateOp
             length(r.outputs) == 1 || throw(ArgumentError(
@@ -2709,6 +2846,13 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             end
         end
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
+        if inline_embedded && r.op isa _AuthoredPlateCellOp
+            _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
+                callargs, lhs, tensorized;
+                windows = cells === nothing || !haskey(cells.captures, r.id) ? nothing :
+                    _CellEmitter(body, cells, names))
+            continue
+        end
         if inline_embedded && r.op isa _AuthoredScanOp
             # Both products keep the same table: the traced path calls the scan
             # op, while the native path calls its inlined scalar operations.
@@ -5174,11 +5318,20 @@ end
 # Any other operation (a plate, a scan) reads a scoped input by the part of its
 # name after a scope prefix that its source spells.
 function _recipe_source_names(recipe::Recipe)
-    names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
-    names === nothing || return names
     spelled = Set{Symbol}()
     _source_symbols!(spelled, recipe.source)
+    names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
+    names === nothing ||
+        return Symbol[_spelled_parameter_name(name, spelled) for name in names]
     Symbol[_unscoped_source_name(value.name, spelled) for value in recipe.inputs]
+end
+# Julia's lowering reports a gensym parameter (`##endpoint_value#7`) without
+# its leading `##` (`endpoint_value#7`), while the source still spells the
+# gensym; an unmapped name would leave that gensym in the display.
+function _spelled_parameter_name(name::Symbol, spelled)
+    name in spelled && return name
+    gensym_name = Symbol("##", name)
+    gensym_name in spelled ? gensym_name : name
 end
 _source_symbols!(names, x::Symbol) = push!(names, x)
 _source_symbols!(names, x) = names

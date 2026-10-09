@@ -160,6 +160,53 @@ end
     @test occursin("y_shiftby = shiftby(x .* a, 0.5)", _text(_bound(nested, (; x, y))))
 end
 
+@testset "a literal zero bound contributes nothing to its transform" begin
+    model = quote
+        s ~ restricted(Normal(0, 1), 0.0, Inf)
+        d[1:2] .~ restricted.(Exponential.(0.125), 0.0, 0.5)
+        n ~ restricted(Normal(0, 1), -Inf, 0)
+        p ~ Uniform(0, 1)
+        h ~ Uniform(-1, 2)
+        y .~ Normal.(p .+ n .* x .+ h, s + d[1] + d[2])
+    end
+    bound = _bound(model, (; x, y))
+    text = _text(bound)
+    @test occursin("s::Float64 = exp(_ppl_fl_s)", text)
+    @test occursin("_ppl_fl_s::Float64 = log(s)", text)
+    @test occursin("d::AbstractVector{Float64} = 0.5 ./ (1 .+ exp.(-_ppl_int_d))", text)
+    @test occursin("_ppl_int_d::AbstractVector{Float64} = log.(d) .- log.(0.5 .- d)", text)
+    @test occursin("n::Float64 = -(exp(_ppl_up_n))", text)
+    @test occursin("p::Float64 = 1.0 / (1 + exp(-_ppl_int_p))", text)
+    @test occursin("h::Float64 = -1.0 + 3.0 / (1 + exp(-_ppl_int_h))", text)
+    @test occursin("log(h + 1.0)", text)
+    for gratuitous in ("0.0 +", "0.0 .+", "- 0.0", ".- 0.0", "0.0 -", "0.0 .-",
+            "- -", ".- -", "log(1.0)")
+        @test !occursin(gratuitous, text)
+    end
+    built = build_kernel(bound)
+    layout = built.layout
+    for shift in (0.0, 0.4)
+        u = collect(range(-0.3 + shift, 0.5 - shift; length = layout.total))
+        nt = constrain(layout, u)
+        sd = nt.s + nt.d[1] + nt.d[2]
+        lik = sum(logpdf.(Normal.(nt.p .+ nt.n .* x .+ nt.h, sd), y))
+        prior = logpdf(Normal(0, 1), nt.s) + sum(logpdf.(Exponential(0.125), nt.d)) +
+            logpdf(Normal(0, 1), nt.n) + logpdf(Uniform(0, 1), nt.p) +
+            logpdf(Uniform(-1, 2), nt.h)
+        sq = prepare_sampler(built, bound, u; backend = BACKEND)
+        grad = similar(u)
+        value, _ = sampler_value_and_gradient!(sq, grad, u)
+        @test value ≈ lik + prior + logjac(layout, u) rtol = 1e-12
+        h = 1e-6
+        fd = map(eachindex(u)) do i
+            up = copy(u); up[i] += h
+            dn = copy(u); dn[i] -= h
+            (sq(up) - sq(dn)) / 2h
+        end
+        @test grad ≈ fd rtol = 1e-5 atol = 1e-7
+    end
+end
+
 @testset "promotion stays for values that may not be Float64" begin
     m = [1, 0]
     model = quote
@@ -169,6 +216,95 @@ end
     text = _text(_bound(model, (; x, y, m)))
     @test occursin("plate(b, m) do b, m", text)
     @test occursin("(normal(1.0m, 1.0)).logpdf(b)", text)
+end
+
+# Module kernels composed into a model: the built program shows each call's
+# values under the model's names, with no `identity` alias for a typed formal
+# and no generated names.
+module ComposedFns
+using ReactiveKernels
+@kernel rise(v) = begin
+    xi = v .* 2.0
+    value = xi .+ 1.0
+    return value
+end
+@kernel fall(v, vm) = begin
+    xi = v .- 3.0
+    xi_max = vm .- 3.0
+    value = xi .- xi_max
+    return value
+end
+@kernel scaled_total(v::AbstractVector{Float64}, s) = begin
+    total = sum(v) * s
+    return total
+end
+end
+
+@testset "composed kernels in the built program read under the model's names" begin
+    model = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        sa ~ Exponential(4.0)
+        sp ~ Exponential(4.0)
+        base = a .+ b .* x
+        mu = base .* ComposedFns.rise(x) .* exp.(ComposedFns.fall(x, 0.5))
+        shift = ComposedFns.scaled_total(base, 0.1)
+        y .~ Normal.(mu .+ shift, sa + sp)
+    end
+    data = (; x, y)
+    bound = _bound(model, data; mod = @__MODULE__)
+    built = build_kernel(bound)
+    code = string(readable_code(built.spec))
+    # A call inside an expression is named under its assignment; a typed
+    # formal reads the model's value with no `identity` alias.
+    @test occursin(r"var\"[^\"]+\.fall\.xi_max\" = 0\.5 \.- 3\.0", code)
+    @test occursin("shift = sum(base) * 0.1", code)
+    @test !occursin("identity(", code)
+    @test !occursin("##", code)
+    @test !occursin(r"\b(xi|value)_\d+\b", code)
+
+    oracle(nt) = begin
+        base = nt.a .+ nt.b .* x
+        mu = base .* (x .* 2.0 .+ 1.0) .* exp.((x .- 3.0) .- (0.5 - 3.0))
+        sum(logpdf.(Normal.(mu .+ sum(base) * 0.1, nt.sa + nt.sp), y)) +
+            logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
+            logpdf(Exponential(4.0), nt.sa) + logpdf(Exponential(4.0), nt.sp)
+    end
+    layout = built.layout
+    u = [0.2, -0.3, 0.1, -0.4]
+    sq = prepare_sampler(built, bound, u; backend = BACKEND)
+    grad = similar(u)
+    value, _ = sampler_value_and_gradient!(sq, grad, u)
+    @test value ≈ oracle(constrain(layout, u)) + logjac(layout, u) rtol = 1e-12
+    h = 1e-6
+    fd = map(eachindex(u)) do i
+        up = copy(u); up[i] += h
+        dn = copy(u); dn[i] -= h
+        (sq(up) - sq(dn)) / 2h
+    end
+    @test grad ≈ fd rtol = 1e-5 atol = 1e-7
+end
+
+@testset "a scalar parameter's log-Jacobian term is named after it" begin
+    model = quote
+        p ~ Beta(2.0, 2.0)
+        q ~ Beta(2.0, 3.0)
+        sigma ~ Exponential(1.0)
+        y .~ Normal.(p + q, sigma)
+    end
+    bound = _bound(model, (; y); mod = @__MODULE__)
+    built = build_kernel(bound)
+    code = string(readable_code(built.spec))
+    @test occursin("var\"p.logjac\" = log(var\"p.logjac.logjac__x\")", code)
+    # The exp transform's term is the coordinate itself, read in place.
+    @test occursin("log_jacobian = (var\"p.logjac\" + var\"q.logjac\") + unconstrained[3]",
+                   code)
+    @test !occursin("##", code)
+    @test !occursin("let ", code)
+    layout = built.layout
+    u = [0.3, -0.2, 0.1]
+    query = prepare_query(built, bound, :log_jacobian)
+    @test Base.invokelatest(query, u) ≈ logjac(layout, u) rtol = 1e-12
 end
 
 end

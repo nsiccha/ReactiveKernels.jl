@@ -36,6 +36,8 @@ include("nonallocating.jl")
 include("graphops.jl")
 include("authored_loops.jl")
 include("authoring.jl")
+include("cells.jl")
+include("cell_windows.jl")
 include("lane_sources.jl")
 include("error_policy.jl")
 include("ad.jl")
@@ -62,6 +64,7 @@ include("cholesky.jl")
 include("native_bdf.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
+export PreparedADOperator, PreparedADPushforward, PreparedADHVP
 export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @plate, @scan
 export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
@@ -76,8 +79,10 @@ export rk_ode_bdf_tol
 export has_forward_branch, has_reverse_branch, rule_inputs
 export stage_primal, stage_reverse, stage_residuals
 export ad_value_and_pullback, ad_value_and_pullback!
+export prepare_ad_pushforward, ad_pushforward, ad_value_and_pushforward
+export prepare_ad_hvp, ad_hvp, ad_hvp!, ad_gradient_and_hvp, ad_gradient_and_hvp!
 export compile_ad_gradient, compile_ad_value_and_gradient
-export lower, lower_with_ops, lower_batched, replica, plate_body, scan_body, transform, compile
+export lower, lower_with_ops, lower_batched, replica, plate_body, plate_cell, scan_body, transform, compile
 export prepare_batched, vectorize
 export NativeScheduling
 export batched_ports, scalar_kernel

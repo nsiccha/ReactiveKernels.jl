@@ -306,6 +306,76 @@ end
     @test lik ≈ sum(sum(p; init = 0.0) for p in other.pointwise(other.u)) rtol = 1e-10
 end
 
+# The loop may iterate another array's indices (`eachindex(t)`, `axes(t, 1)`).
+# That array supplies indices, not values: its arrays need not broadcast with
+# the response's, here `t[i]` is longer than `y[i]` and a cell local selects
+# `y[i]`'s entries from it.
+_cba_pick(t, picks, rate) = t[picks] .* exp(rate)
+
+@testset "dotted plate cells over arrays iterate another array's indices" begin
+    sizes = (3, 2, 0, 1)
+    d = _cba_data(sizes)
+    t = [[0.2 .* xi; 0.9 + 0.1 * i; 1.1] for (i, xi) in enumerate(d.x)]
+    picks = [collect(k + 1:-1:2) for k in sizes]
+    data = Dict{Symbol,Any}(:t => t, :picks => picks, :x => d.x, :y => d.y)
+    picked(q, i) = logpdf.(Normal.(_cba_pick(t[i], picks[i], q.a), q.sigma), d.y[i])
+    cells = (
+        # A cell local, an indexed output of it, and the inline call.
+        (Expr(:block, :(m = _cba_pick(t[i], picks[i], a)), :(y[i] .~ Normal.(m, sigma))), picked),
+        (Expr(:block, :(m = _cba_pick(t[i], picks[i], a)), :(c[i] = m),
+            :(y[i] .~ Normal.(c[i], sigma))), picked),
+        (:(y[i] .~ Normal.(_cba_pick(t[i], picks[i], a), sigma)), picked),
+        # Data read per index still supplies that index's array.
+        (:(y[i] .~ Normal.(a .+ b .* x[i], sigma)),
+            (q, i) -> logpdf.(Normal.(q.a .+ q.b .* d.x[i], q.sigma), d.y[i])),
+        (:(y[i] .~ Normal.(a, sigma)), (q, i) -> logpdf.(Normal(q.a, q.sigma), d.y[i])))
+    declarations = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        sigma ~ Exponential(1.0)
+    end
+    program(iterator, cell) = Expr(:block, declarations.args...,
+        Expr(:macrocall, Symbol("@plate"), LineNumberNode(1), Expr(:for, :(i = $iterator),
+            Meta.isexpr(cell, :block) ? cell : Expr(:block, cell))))
+    for iterator in (:(eachindex(t)), :(axes(t, 1)), :(eachindex(y))), (cell, entry) in cells
+        saved = deepcopy(data)
+        bound = bind_data(lower_rkppl(program(iterator, cell), data; conditioned = (:y,),
+            mod = @__MODULE__), data)
+        built = build_kernel(bound)
+        function oracle(v)
+            q = constrain(built.layout, v)
+            logpdf(Normal(), q.a) + logpdf(Normal(), q.b) + logpdf(Exponential(1.0), q.sigma) +
+                logjac(built.layout, v) +
+                sum(sum(entry(q, i); init = 0.0) for i in eachindex(sizes); init = 0.0)
+        end
+        u = unconstrain(built.layout, (; a = 0.25, b = -0.3, sigma = 0.8))
+        sampler = prepare_sampler(built, bound, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u) rtol = 1e-10
+        @test gradient ≈ _cba_fd(oracle, u) rtol = 1e-5 atol = 1e-7
+        pw = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        q = constrain(built.layout, u)
+        @test length.(pw.y) == collect(sizes)
+        @test all(pw.y .≈ [entry(q, i) for i in eachindex(sizes)])
+        @test isequal(data, saved)
+    end
+    local_cell = program(:(eachindex(t)), first(first(cells)))
+    bindwith(ast, data) = bind_data(lower_rkppl(ast, data; conditioned = (:y,),
+        mod = @__MODULE__), data)
+    # refused: the loop indexes `y` outside its entries (Julia's BoundsError),
+    # or leaves entries unobserved (whole-response observation, USER `1uhcm3b`)
+    @test_throws "indexes outside" bindwith(local_cell,
+        merge(data, Dict(:t => [t; [[1.0]]], :picks => [picks; [Int[]]])))
+    @test_throws "partial observation" bindwith(local_cell,
+        merge(data, Dict(:t => t[1:3], :picks => picks[1:3])))
+    # refused: data read per index must broadcast with each index's response
+    # array, as Julia requires (DimensionMismatch)
+    @test_throws "`x` does not broadcast" bindwith(
+        program(:(eachindex(t)), :(y[i] .~ Normal.(x[i], sigma))),
+        merge(data, Dict(:x => t)))
+end
+
 @testset "observing arrays per index outside a dotted cell follows Julia" begin
     y = [[0.7, 0.3, 0.1], [1.4, 0.6], Float64[]]
     whole = @rkppl begin

@@ -199,13 +199,32 @@ end
 # Construction calls the positional `_add_recipe!` rather than the keyword
 # `add!`: a keyword call's argument type names the op's concrete type, so it
 # would compile a fresh keyword-call specialization for every authored op.
-# `destructured` records an authored tuple left side, `(a, b) = rhs`; only a
-# nested `KernelSpec` call distinguishes `(a,) = f(x)` from `a = f(x)`.
+# `destructured` records an authored tuple left side, `(a, b) = rhs`. Several
+# names bind the elements of the operation's result through the multi-output
+# recipe's own destructuring; one name, `(a,) = rhs`, binds its first element.
 Base.@nospecializeinfer function _kernel_add!(graph::Graph,
                       @nospecialize(ins), @nospecialize(outs), @nospecialize(op),
                       cost, cse_key, effectful,
                       source = _NO_KERNEL_SOURCE, destructured::Bool = false)
-    _add_recipe!(graph, ins, outs, op, cost, cse_key, effectful, source)
+    destructured && length(outs) == 1 || return _add_recipe!(
+        graph, ins, outs, op, cost, cse_key, effectful, source)
+    whole = value!(graph, gensym(:destructured_value), Any)
+    _add_recipe!(graph, ins, (whole,), op, cost, cse_key, effectful, source)
+    _kernel_add_first!(graph, whole, only(outs))
+end
+
+# Julia lowers `(a,) = value` to `a = getfield(Base.indexed_iterate(value, 1), 1)`:
+# the first iterated element, not `value` itself.
+@inline _kernel_destructure_first(value) = getfield(Base.indexed_iterate(value, 1), 1)
+
+# The first-element read of a one-name destructuring, as its own recipe from
+# the whole right-side value (an existing port, or a hidden value holding the
+# right side's result).
+Base.@nospecializeinfer function _kernel_add_first!(graph::Graph, whole::Value,
+                                                    target::Value)
+    source = Expr(:call, GlobalRef(@__MODULE__, :_kernel_destructure_first), whole.name)
+    _add_recipe!(graph, (whole,), (target,), _kernel_destructure_first,
+                 1.0, nothing, false, source)
 end
 
 # A multi-output nested call bound to one name is the tuple a runtime
@@ -360,6 +379,14 @@ Base.@nospecializeinfer function _kernel_add!(
         pack_source = Expr(:tuple, (value.name for value in hidden)...)
         _add_recipe!(graph, hidden, (packed,), _kernel_tuple_pack,
                      cost, nothing, false, pack_source)
+        return _reindex_producers!(graph)
+    end
+    # A single-output child returns its one value, so `(a,) = child(x)` binds
+    # that value's first element, as for any other right side.
+    if destructured && length(outs) == 1 && length(child_outputs) == 1
+        whole = value!(graph, gensym(:nested_output), valtype(only(child_outputs)))
+        _kernel_add!(graph, call_inputs, (whole,), spec, cost, cse_key, effectful, source)
+        _kernel_add_first!(graph, whole, only(outs))
         return _reindex_producers!(graph)
     end
     # Julia's `(a,) = t` binds the leading elements and ignores the rest. The
@@ -1371,12 +1398,16 @@ _kernel_endpoint_source_module(op::_KernelBranch) =
 
 # Render a constructed-endpoint call as source for a branch-arm position.
 # `actuals` are the call-site binding sources in the endpoint HAVE order
-# (owner actuals, then explicit arguments). Each planned recipe becomes one
-# hygienic assignment in a nested-`let` block over the used HAVE sources, so
-# the arm evaluates the endpoint exactly when taken. Recipe inputs map to
-# their sources positionally — the same order `_kernel_expand` used when the
-# endpoint was built — matched here by recomputing each recipe's free ports
-# and checking the count (see below).
+# (owner actuals, then explicit arguments). The used HAVE sources and each
+# planned recipe's outputs become one sequential `let` whose body is the
+# endpoint's value, so the arm evaluates the endpoint exactly when taken. A
+# source that is a name or a literal is read in place; every other binding
+# takes the endpoint's own name for its value (`let log_scale = log(s), …`),
+# or a hygienic one when the arm already spells that name, so no binding can
+# capture a name the arm reads. Recipe inputs map to their sources
+# positionally — the same order `_kernel_expand` used when the endpoint was
+# built — matched here by recomputing each recipe's free ports and checking
+# the count (see below).
 function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
                                       actuals::Vector, context)
     p = plan(endpoint)
@@ -1402,16 +1433,34 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
     for r in p.recipes, v in r.inputs
         push!(used, canon_id(g, v.id))
     end
+    taken = Set{Symbol}()
+    foreach(actual -> _kernel_symbol_leaves!(taken, actual), actuals)
+    function bind_name(value)
+        name = value.name
+        if _generated_value_name(name) || name in taken
+            scoped = endpoint_name isa Symbol ?
+                _kernel_scoped_port(endpoint_name, name) : nothing
+            name = scoped === nothing || _generated_value_name(name) ||
+                scoped in taken ? gensym(name) : scoped
+        end
+        push!(taken, name)
+        name
+    end
     bindings = Any[]
     expr_of = Dict{Int,Any}()
     for v in p.have
         cid = canon_id(g, v.id)
         cid in used || continue
-        temp = gensym(:endpoint_have)
+        source = have_source[cid]
+        if source isa Union{Symbol,Number,AbstractString,Char,Nothing}
+            expr_of[cid] = source
+            continue
+        end
+        temp = bind_name(v)
         expr_of[cid] = temp
-        push!(bindings, Expr(:(=), temp, have_source[cid]))
+        push!(bindings, Expr(:(=), temp, source))
     end
-    statements = Any[]
+    statements = bindings
     for r in p.recipes
         r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} &&
             _kernel_inline_reject(endpoint_name, context,
@@ -1426,7 +1475,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
             # validated bare function operation also keeps its defining module.
             actual_inputs = Any[expr_of[canon_id(g, v.id)] for v in r.inputs]
             inlined = Expr(:call, QuoteNode(r.op), actual_inputs...)
-            outs = Symbol[gensym(:endpoint_value) for _ in r.outputs]
+            outs = Symbol[bind_name(v) for v in r.outputs]
             for (v, temp) in zip(r.outputs, outs)
                 expr_of[canon_id(g, v.id)] = temp
             end
@@ -1482,7 +1531,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
         end
         inlined = _kernel_substitute_endpoint_source(
             r.source, subst, endpoint_name, context)
-        outs = Symbol[gensym(:endpoint_value) for _ in r.outputs]
+        outs = Symbol[bind_name(v) for v in r.outputs]
         for (v, temp) in zip(r.outputs, outs)
             cid = canon_id(g, v.id)
             haskey(expr_of, cid) && _kernel_inline_reject(
@@ -1497,12 +1546,12 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
     want_cid = canon_id(g, only(p.want).id)
     haskey(expr_of, want_cid) || _kernel_inline_reject(
         endpoint_name, context, "its output is not available")
-    body = isempty(statements) ? expr_of[want_cid] :
-        Expr(:block, statements..., expr_of[want_cid])
-    for binding in reverse(bindings)
-        body = Expr(:let, binding, body)
+    result = expr_of[want_cid]
+    # The last recipe's value is the endpoint's value: it is the body itself.
+    if !isempty(statements) && last(statements).args[1] === result
+        result = pop!(statements).args[2]
     end
-    body
+    isempty(statements) ? result : Expr(:let, Expr(:block, statements...), result)
 end
 
 # Every bare name in a recipe source, including quoted and label positions.
@@ -1580,6 +1629,46 @@ _kernel_inline_callee_name(callee::Symbol) = callee
 _kernel_inline_callee_name(callee::GlobalRef) = callee.name
 _kernel_inline_callee_name(callee) = Symbol(string(callee))
 
+# A composed graph called as a strict subexpression is lifted into its own
+# caller port. The port is named for the call under the assignment it occurs
+# in (`mu.bump` for `mu = a .* bump(a)`), so the spliced child's values read
+# as `mu.bump.xi`, as a directly assigned call's read as `mu.xi`, instead of
+# colliding with another call's `xi`. A repeated call within one assignment
+# counts up (`mu.bump_2`). A call outside a named assignment, or a callee
+# without a name, keeps a hygienic port.
+_kernel_lift_scope(lhs::Symbol) = _generated_value_name(lhs) ? nothing : lhs
+_kernel_lift_scope(lhs::Expr) =
+    lhs.head === :(::) && length(lhs.args) == 2 ? _kernel_lift_scope(lhs.args[1]) :
+    nothing
+_kernel_lift_scope(lhs) = nothing
+
+# A generated object-endpoint view is named by its endpoint (`logjac`); any
+# other callee by the name it is called by.
+function _kernel_lifted_call_name(callee, spec::KernelSpec, nested_specs)
+    if callee isa Symbol && haskey(nested_specs, callee)
+        names = getfield(spec, :want_names)
+        return length(names) == 1 && !_generated_value_name(only(names)) ?
+            only(names) : nothing
+    end
+    callee isa Symbol && return _generated_value_name(callee) ? nothing : callee
+    callee isa GlobalRef && return callee.name
+    callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
+        callee.args[2] isa QuoteNode && callee.args[2].value isa Symbol &&
+        return callee.args[2].value
+    nothing
+end
+
+function _kernel_lifted_port(locals, scope, name)
+    (scope === nothing || name === nothing) && return gensym(:endpoint_value)
+    base = _kernel_scoped_port(scope, name)
+    port, count = base, 1
+    while port in locals
+        count += 1
+        port = Symbol(base, :_, count)
+    end
+    port
+end
+
 # Object endpoint extraction reconstructs and merges the object's frozen graph.
 # A generated model commonly uses the same distribution endpoint in many plate
 # bodies, so keep those read-only source views local to one macro expansion.
@@ -1613,7 +1702,9 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       cell_locals::Set{Symbol} = Set{Symbol}(),
                                       straight::Bool = true,
                                       lift_specs::Bool = true,
-                                      endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}())
+                                      endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}(),
+                                      lift_scope::Union{Nothing,Symbol} = nothing,
+                                      boundary_types = Dict{Symbol,Vector{Any}}())
     ex isa Expr || return ex, nothing
     ex.head in (:quote, :inert) && return ex, nothing
     # A nested plate/scan owns a different scalar caller scope. Its authoring
@@ -1755,7 +1846,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
                         cell_locals = cell_locals, straight = straight,
-                        endpoint_cache = endpoint_cache)
+                        endpoint_cache = endpoint_cache, lift_scope = lift_scope,
+                        boundary_types = boundary_types)
                     if straight
                         generated_port = gensym(Symbol(formal, :_binding))
                         generated_type = valtype(endpoint_inputs[index])
@@ -1791,7 +1883,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
-                        straight = straight, endpoint_cache = endpoint_cache)
+                        straight = straight, endpoint_cache = endpoint_cache,
+                        lift_scope = lift_scope, boundary_types = boundary_types)
                     if straight
                         generated_port = gensym(Symbol(explicit[index], :_argument))
                         generated_type = valtype(
@@ -1855,7 +1948,10 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
             straight = straight && _kernel_straight_child(ex, i),
             lift_specs = lift_specs && !(ex.head in
                 (:for, :while, :generator, :comprehension, :try, :->,
-                 :function, :do, :let)), endpoint_cache = endpoint_cache)
+                 :function, :do, :let)), endpoint_cache = endpoint_cache,
+            lift_scope = ex.head === :(=) && i == 2 ?
+                _kernel_lift_scope(ex.args[1]) : lift_scope,
+            boundary_types = boundary_types)
         # Graph splicing operates on a whole recipe RHS. Lift a numerical
         # graph used as a strict subexpression into its own caller recipe,
         # including generated object endpoints. Otherwise a module KernelSpec
@@ -1866,7 +1962,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         child_spec = _kernel_called_spec(child, mod, locals, nested_specs)
         if lift_specs && straight && _kernel_straight_child(ex, i) &&
            child_spec !== nothing
-            endpoint_port = gensym(:endpoint_value)
+            endpoint_port = _kernel_lifted_port(locals, lift_scope,
+                _kernel_lifted_call_name(child.args[1], child_spec, nested_specs))
             push!(materialized, (endpoint_port, child_type, child))
             push!(locals, endpoint_port)
             child = endpoint_port
@@ -1883,11 +1980,21 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         # computed/submodel-return expressions. Give each non-port argument
         # its own ordinary recipe before splicing the child. No model-sized
         # work is hidden in a PreparedKernel or expanded according to data.
+        # A typed child formal is the call's declared contract for its
+        # argument. A computed argument's port takes that type, and a bare
+        # caller port records it for the caller's declaration pass
+        # (`boundary_types`), so the boundary needs no `identity` recipe.
+        formals = inputs(spec)
+        typed = length(formals) == length(rewritten) - 1
         for i in 2:length(rewritten)
             arg = rewritten[i]
-            arg isa Symbol && arg in locals && continue
+            T = typed ? valtype(formals[i - 1]) : Any
+            if arg isa Symbol && arg in locals
+                T === Any || push!(get!(Vector{Any}, boundary_types, arg), T)
+                continue
+            end
             argument_port = gensym(:kernel_argument)
-            push!(materialized, (argument_port, nothing, arg))
+            push!(materialized, (argument_port, T === Any ? nothing : T, arg))
             push!(locals, argument_port)
             rewritten[i] = argument_port
         end
@@ -4049,6 +4156,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     declare_ref = GlobalRef(@__MODULE__, :_kernel_declare!)
     push_unique_ref = GlobalRef(@__MODULE__, :_kernel_push_unique!)
     add_ref = GlobalRef(@__MODULE__, :_kernel_add!)
+    first_ref = GlobalRef(@__MODULE__, :_kernel_add_first!)
     alias_ref = GlobalRef(@__MODULE__, :_kernel_alias!)
     synthesize_ref = GlobalRef(@__MODULE__, :_kernel_synthesize_inverse_edges!)
     spec_ref = GlobalRef(@__MODULE__, :KernelSpec)
@@ -4098,7 +4206,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
            !(assignment.args[1] isa Symbol &&
              assignment.args[2] isa Expr && assignment.args[2].head === :function)
             lhs, rhs = assignment.args
-            lhs_items = lhs isa Expr && lhs.head === :tuple ? lhs.args : Any[lhs]
+            destructured = lhs isa Expr && lhs.head === :tuple
+            lhs_items = destructured ? lhs.args : Any[lhs]
             outputs = Tuple{Symbol,Any}[]
             for item in lhs_items
                 name, type_expr = _kernel_port_decl(item)
@@ -4124,7 +4233,9 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                           (:recipe, Tuple{Symbol,Any}[(name, nothing)], expression,
                            Dict{Symbol,Any}(), nothing, false))
                 end
-                if outputs[1][2] === nothing && plate_expr.inferred !== nothing
+                # `(a,) = plate(...)` binds the first cell, not the array.
+                if !destructured && outputs[1][2] === nothing &&
+                   plate_expr.inferred !== nothing
                     push!(annotations[outputs[1][1]],
                           :(Array{$(plate_expr.inferred)}))
                     inferred_port_types[outputs[1][1]] = plate_expr.inferred
@@ -4136,7 +4247,6 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                    rhs.args[2] isa Symbol && haskey(inferred_port_types, rhs.args[2])
                 push!(annotations[outputs[1][1]], inferred_port_types[rhs.args[2]])
             end
-            destructured = lhs isa Expr && lhs.head === :tuple
             push!(entries, (:recipe, outputs, rhs, metadata, plate_expr, destructured))
             continue
         end
@@ -4170,6 +4280,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # a bare `object.endpoint(args...)` call, so no KernelObjectSpec survives to
     # runtime.
     rewritten_entries = Any[]
+    boundary_types = Dict{Symbol,Vector{Any}}()
     for entry in entries
         if entry[1] === :recipe && entry[5] === nothing
             _, outputs, authored_rhs, metadata, plate_expr, destructured = entry
@@ -4177,7 +4288,10 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
             materialized = Tuple{Symbol,Any,Any}[]
             rewritten, inferred = _kernel_constructed_endpoint(
                 authored_rhs, mod, known, nested_specs, local_types;
-                materialized = materialized, endpoint_cache = endpoint_cache)
+                materialized = materialized, endpoint_cache = endpoint_cache,
+                lift_scope = length(outputs) == 1 && !destructured ?
+                    _kernel_lift_scope(outputs[1][1]) : nothing,
+                boundary_types = boundary_types)
             materialized_names = Set{Symbol}()
             for (name, T, rhs) in materialized
                 register!(name, T)
@@ -4204,6 +4318,26 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         end
     end
     entries = rewritten_entries
+
+    # An unannotated internal value passed to a typed child formal takes that
+    # formal's declared type, as a value passed to an object endpoint's typed
+    # argument does (`_kernel_note_endpoint_port_type!`) and an unannotated
+    # call result takes the child's declared output type. The formal then reads
+    # the caller's value with no `identity` recipe, and a typed-local body
+    # converts where the caller computes the value. A port that declares its
+    # own type, a HAVE or WANT port (the kernel's public boundary), a bare
+    # alias, and a value passed to differently typed formals keep the
+    # boundary's conversion recipe.
+    aliased = Set{Symbol}()
+    for entry in entries
+        entry[1] === :recipe && length(entry[2]) == 1 && entry[3] isa Symbol &&
+            entry[3] in known && push!(aliased, entry[2][1][1])
+    end
+    for (name, types) in boundary_types
+        (name in have_names || name in want_names || name in aliased) && continue
+        isempty(annotations[name]) && allequal(types) || continue
+        push!(annotations[name], first(types))
+    end
 
     for (index, name) in enumerate(port_order)
         port_indices[name] = index
@@ -4241,13 +4375,24 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     for entry in entries
         entry[1] === :recipe || continue
         _, outputs, authored_rhs, metadata, plate_expr, destructured = entry
+        # `(b,) = a` over a declared port reads `a`'s first element: one recipe
+        # from `a` itself, never an alias of the whole value.
+        if destructured && length(outputs) == 1 && authored_rhs isa Symbol &&
+           authored_rhs in known && authored_rhs != outputs[1][1] && isempty(metadata)
+            push!(recipe_statements, :($first_ref($graph_var,
+                                     $port_values_var[$(port_indices[authored_rhs])],
+                                     $port_values_var[$(port_indices[outputs[1][1]])])))
+            _kernel_push_unique!(produced_names, outputs[1][1])
+            push!(consumed_names, authored_rhs)
+            continue
+        end
         # ALIAS-AT-EXPANSION (RK 2026-08-27): a bare-identity `b = a` — single output, RHS a bare
         # DECLARED port (`known` is the full predeclared port namespace, forward refs included),
         # not `b` itself, no `@recipe` metadata, and `b` has exactly ONE authored definition — is
         # emitted as a canonical alias (proven same-type; typed conversions keep their recipe).
         # No identity recipe is emitted for the collapsed pair; both labels stay for reporting.
-        if length(outputs) == 1 && authored_rhs isa Symbol && authored_rhs in known &&
-           authored_rhs != outputs[1][1] && isempty(metadata) &&
+        if !destructured && length(outputs) == 1 && authored_rhs isa Symbol &&
+           authored_rhs in known && authored_rhs != outputs[1][1] && isempty(metadata) &&
            def_count[outputs[1][1]] == 1
             op = _kernel_operation(authored_rhs, Symbol[authored_rhs], known; mod = mod)
             cost = 1.0
