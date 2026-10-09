@@ -275,6 +275,7 @@ const _PPL_TEST_FILES = (
     "test_inline_call_values.jl",
     "test_inline_scalar_reads.jl",
     "test_authored_names.jl",
+    "test_cell_query.jl",
 )
 
 include("sharding.jl")

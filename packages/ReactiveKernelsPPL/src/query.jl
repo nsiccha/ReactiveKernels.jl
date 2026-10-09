@@ -346,6 +346,157 @@ for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
         Base.invokelatest(ReactiveKernels.$verb, q.prepared, args...)
 end
 
+"""
+    CellQuery
+
+The log density of one cell of the plates that observe the selected
+observations: for an `@plate for i in …` loop, the densities its iteration `i`
+observes; for an elementwise observation (`y .~ …`), the density of entry `i`.
+Construct with [`prepare_cell_query`](@ref) and call `q(u, i)`. The call paths
+carry the `Base.invokelatest` barrier, as `SamplerQuery`'s do. Not thread-safe:
+prepare one per thread.
+"""
+struct CellQuery{K,L}
+    kernel::K
+    layout::L
+    observations::Tuple{Vararg{Symbol}}
+end
+
+(q::CellQuery)(u::Vector{Float64}, cell) = Base.invokelatest(q.kernel, u, cell)
+(q::CellQuery)(u::AbstractVector{<:Real}, cell) =
+    Base.invokelatest(q.kernel, Vector{Float64}(u), cell)
+
+"""
+    prepare_cell_query(built, plan, observations; on_error = nothing) -> CellQuery
+
+Prepare the summed log density of ONE cell of the observations named in
+`observations` (a name or a collection of names), evaluated at an
+unconstrained point `u` and a position `i`: `q(u, i)`. Each observation's
+pointwise values come from a plate (`:pointwise`'s array for that name); cell
+`i` is that plate's entry `i`, so
+
+    sum(q(u, i) for i in eachindex(pointwise.y)) == pointwise likelihood of y
+
+For an `@plate for i in eachindex(y)` loop holding one array per index
+(`y[i] .~ …`), entry `i` is the sum of iteration `i`'s densities. Several
+observations of one loop share the position: `q(u, i)` adds their cells.
+
+Only cell `i` of each plate runs, through the plate's own body (RK
+`plate_cell`): an `@plate for` loop's location plate is composed into it, so
+the cell's own observations cost what one iteration costs. Values the cell
+reads whole, such as a predictor vector `log_k` indexed by `log_k[i]`, are
+computed whole. Observations without a pointwise plate (a scalar `~`
+observation, a joint multivariate response) are refused naming the
+observation. `plan` must generate the program `built` was built from, as for
+[`prepare_query`](@ref).
+"""
+function prepare_cell_query(built, plan::StructuralPlan, observations;
+        on_error = nothing)
+    isbound(plan) || throw(ContractValidationError(
+        "[query] prepare_cell_query requires a bound plan (bind_data first)"))
+    _check_built_program(built, plan)
+    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    isempty(names) && throw(ContractValidationError(
+        "[query] prepare_cell_query needs at least one observation name"))
+    spec, want = _cell_query_spec(built, plan, names)
+    kernel = Base.invokelatest(prepare, spec; have = (_query_have(plan)..., _CELL_PORT),
+        want, bound = _query_bound(plan), on_error)
+    return CellQuery(kernel, built.layout, names)
+end
+
+const _CELL_PORT = :_ppl_cell
+
+# Each observation's cell plate (its per-index totals when the loop observes
+# one array per index), one `plate_cell` value per plate at the shared position
+# port, and their sum when there are several.
+function _cell_query_spec(built, plan::StructuralPlan, names)
+    body = kernel_expr(plan, built.layout).args[2].args
+    statement = findfirst(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === :pointwise, body)
+    pointwise = Dict{Symbol,Any}()
+    if statement !== nothing && Meta.isexpr(body[statement].args[2], :tuple)
+        for field in body[statement].args[2].args
+            pointwise[field.args[1]] = field.args[2]
+        end
+    end
+    assigned = Set{Symbol}()
+    for st in body
+        Meta.isexpr(st, :(=), 2) || continue
+        lhs = st.args[1]
+        Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
+        lhs isa Symbol && push!(assigned, lhs)
+    end
+    spec = built.spec
+    cells = Symbol[]
+    for name in names
+        haskey(pointwise, name) || throw(ContractValidationError(
+            "[query] `$name` is not an observation of this model; its " *
+            "observations are $(join(sort!(collect(keys(pointwise))), ", "))"))
+        node = pointwise[name]
+        node isa Symbol || throw(ContractValidationError(
+            "[query] observation `$name` has no pointwise plate, so it has no cells"))
+        totals = Symbol(node, :_totals)
+        node = totals in assigned ? totals : node
+        cell = Symbol(:_ppl_cell_, node)
+        spec = try
+            plate_cell(spec, node; index = _CELL_PORT, name = cell)
+        catch err
+            err isa ArgumentError || rethrow()
+            throw(ContractValidationError("[query] observation `$name` has no " *
+                "pointwise plate, so it has no cells ($(err.msg))"))
+        end
+        push!(cells, cell)
+    end
+    length(cells) == 1 && return spec, only(cells)
+    graph = kernel_graph(spec)
+    total = value!(graph, :_ppl_cell_total, Float64)
+    add!(graph, Tuple(spec[c] for c in cells) => total, +)
+    return spec, total
+end
+
+"""
+    CellSampler
+
+A [`CellQuery`](@ref) with its `prepare_ad` gradient over the packed
+unconstrained vector. Construct with [`prepare_cell_sampler`](@ref); use
+[`cell_value_and_gradient!`](@ref). Not thread-safe: prepare one per thread.
+"""
+struct CellSampler{K,P,L}
+    kernel::K
+    ad::P
+    layout::L
+    observations::Tuple{Vararg{Symbol}}
+end
+
+"""
+    prepare_cell_sampler(built, plan, observations, u0; backend, on_error = nothing) -> CellSampler
+
+[`prepare_cell_query`](@ref) plus a `prepare_ad` gradient with
+`active = :unconstrained`; the position stays a constant (an `Int`). `u0` is a
+length-consistent exemplar and `backend` a DifferentiationInterface backend,
+as for [`prepare_sampler`](@ref).
+"""
+function prepare_cell_sampler(built, plan::StructuralPlan, observations,
+        u0::AbstractVector{<:Real}; backend, on_error = nothing)
+    layout = built.layout::LayoutTable
+    length(u0) == layout.total || throw(ContractValidationError(
+        "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
+    q = prepare_cell_query(built, plan, observations; on_error)
+    ad = Base.invokelatest(prepare_ad, q.kernel, backend, Vector{Float64}(u0), 1;
+        active = :unconstrained)
+    return CellSampler(q.kernel, ad, layout, q.observations)
+end
+
+"""
+    cell_value_and_gradient!(s::CellSampler, g, u, i)
+
+Cell `i`'s log density and its gradient with respect to the packed
+unconstrained vector, written into `g`. Returns `(value, gradient)`.
+"""
+cell_value_and_gradient!(s::CellSampler, g::AbstractVector, u::Vector{Float64}, cell::Int) =
+    Base.invokelatest(ad_value_and_gradient!, s.ad, g, u, cell)
+cell_value_and_gradient!(s::CellSampler, g::AbstractVector, u::AbstractVector, cell::Int) =
+    Base.invokelatest(ad_value_and_gradient!, s.ad, g, Vector{Float64}(u), cell)
+
 function _stack_restored_draws(values)
     value = first(values)
     if value isa NamedTuple
