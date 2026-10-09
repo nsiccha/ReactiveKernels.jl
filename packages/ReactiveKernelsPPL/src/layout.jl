@@ -1592,16 +1592,15 @@ _floored_value(lo, values) = lo isa Real && iszero(lo) ? values : :($lo .+ $valu
 # hand-kept broadcast. `constrain` yields the constrained cell vector; a
 # companion `logjac` plate supplies the per-cell Jacobian this block's
 # `jacobian_term` sums (pruned by have→want when the Jacobian is not wanted).
-# Real per-cell latents use an ordinary packed slice, so an indexed RK
-# cell receives an array it can gather from. No transform or Jacobian.
+# A real-support block (per-cell latents, elementwise arrays, GLM vectors) is
+# its packed coordinates, read in place with no transform or Jacobian. Compiled
+# tracing reads the same block as a slice (`ReactiveKernels._tensorized_view`).
 function _plate_transform_statements(e::LayoutEntry)
     lo = e.offset
     hi = e.offset + e.size - 1
     view_read = :(view(unconstrained, $lo:$hi))
-    if e.transform === :identity
-        read = e.kind === :plate ? :(unconstrained[$lo:$hi]) : view_read
-        return Expr[:($(e.name)::AbstractVector{Float64} = $read)]
-    end
+    e.transform === :identity && return Expr[:($(e.name)::AbstractVector{Float64} =
+        ReactiveKernels._tensorized_view(unconstrained, $lo:$hi))]
     if e.transform === :interval
         # Parameterized bounds ⇒ not in the (parameterless) bijector registry;
         # hand-rolled broadcast edges over the block view, identical math to the
