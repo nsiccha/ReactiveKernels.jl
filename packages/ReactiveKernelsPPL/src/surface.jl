@@ -9586,11 +9586,20 @@ _inlined_computed_defs(ctx, canonmap, data) = Set{Symbol}(nm for nm in ctx.inlin
         _computed_value_def(nm, ctx, canonmap, data))
 
 # A module call's model-level result, written inline or read through a
-# shared definition that stays named for its readers (the definitions
-# below it are no longer inlined either).
+# definition that stays named for its readers: a shared definition (the
+# definitions below it are no longer inlined either), or the value a
+# positional read indexes, which `_inline_structure_expr` keeps named.
 _reads_module_value(ex, ctx) = _contains_module_call(ex) ||
     any(s -> s in ctx.shared_defs && _def_reads_module(s, ctx),
-        _value_symbols(ex))
+        _value_symbols(ex)) ||
+    _indexes_module_value(ex, ctx)
+# `bt = f(x, a); bt[1]` indexes the call's result exactly as the inline
+# `f(x, a)[1]` does. The element has the function's own shape (a tuple
+# element may be a vector), so it is never a proven scalar offset.
+_indexes_module_value(ex, ctx) = ex isa Expr &&
+    ((ex.head === :ref && _is_model_value_def(ex.args[1], ctx) &&
+        _def_reads_module(ex.args[1], ctx)) ||
+     any(a -> _indexes_module_value(a, ctx), ex.args))
 _def_reads_module(s, ctx) = _contains_module_call(ctx.detmap[s]) ||
     any(t -> haskey(ctx.detmap, t) && _def_reads_module(t, ctx),
         _value_symbols(ctx.detmap[s]))
