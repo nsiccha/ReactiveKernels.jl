@@ -72,7 +72,10 @@ captured scalar is shared by every cell. A captured array, tuple or struct is
 the whole value, never its per-cell element. The capture is one shared operand
 of the plate: work that reads only captures runs once, outside the cell loop,
 and `bound=` partial evaluation and native reverse differentiation treat it as
-shared data.
+shared data. That includes work written inline: in
+`cell_decay(t, dose, exp(log_k))`, `exp(log_k)` runs once per call, as if it
+were named (see the [compiler](compiler.md) plate section for which positions
+are split off).
 
 ```julia
 @kernel normalized_poly(x, c) = begin

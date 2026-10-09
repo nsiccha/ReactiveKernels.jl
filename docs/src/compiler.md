@@ -434,7 +434,20 @@ kept by one of those roots changes. This is the dynamic equivalent of placing
 the recipe at its narrowest valid nested-loop boundary: work depending only on
 an outer scale dimension runs once per scale coordinate, with its last scalar
 result reused through inner dimensions and no axis-sized cache. Recipes with no
-plated dependency are emitted once above the traversal. The per-element WANT is
+plated dependency are emitted once above the traversal.
+
+An authored cell is split into recipes before planning. Besides its
+statements, each maximal subexpression that reads only shared values (closure
+captures, `Ref` operands and cell locals computed from them) becomes a recipe
+of its own. In `f(t, exp(log_k))`, `exp(log_k)` therefore runs once, above the
+traversal, exactly as in `k = exp(log_k); f(t, k)`. Only positions that Julia
+evaluates whenever the cell runs are split: call and broadcast arguments, field
+reads, indexing and tuple elements. A branch arm, loop, generator term,
+closure or macro call keeps its own evaluation, as do the arguments of a
+mutating (`!`) call and an index expression reading `end`. Like a named
+invariant, a split-off one runs once per call even when the plate has no
+cells. A `scan` step is not split: its native lowering evaluates every step
+statement at every step, named or not. The per-element WANT is
 either accumulated with a reducer (sum by default) or collected in the one
 requested broadcast-shaped output.
 

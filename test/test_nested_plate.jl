@@ -10,8 +10,10 @@ isdefined(@__MODULE__, :NestedPlates) || include("fixtures/nested_plates.jl")
     outer = only(filter(r -> r.op isa ReactiveKernels._AuthoredPlateOp, k.plan.recipes))
     inner = only(filter(r -> r.op isa ReactiveKernels._AuthoredPlateOp,
                         plate_body(outer).recipes))
-    @test length(plate_body(inner).recipes) > 0
-    @test occursin("log(scale)", string(only(plate_body(inner).recipes).source))
+    # `log(scale)` reads only the captured scale, so it is the inner cell's own
+    # invariant recipe, computed above the observation loop.
+    @test length(plate_body(inner).recipes) == 2
+    @test any(r -> occursin("log(scale)", string(r.source)), plate_body(inner).recipes)
     @test N.head_count(code_expr(k), :for) == 2
     @test !occursin("similar", string(code_expr(k)))
 
