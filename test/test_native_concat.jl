@@ -92,9 +92,27 @@ end
     end
     @test _same_as_base(RK._native_hvcat, hvcat, (2, 2), 1, 2.5, true, 0)
     @test _same_as_base(RK._native_hvcat, hvcat, (2, 3), [1 2; 3 4], x, 0, 0.5f0, 1)
+    # A contiguous range view of a vector, and its reshape to a matrix, are
+    # dense operands written like arrays, with Base's result.
+    for T in (Float64, Float32, Int, Bool, ComplexF64)
+        u = _values(T, 12, 0)
+        vv, mv = view(u, 2:4), reshape(view(u, 5:10), 3, 2)
+        @test (vv, mv) isa Tuple{RK._NativeColumnOperand,RK._NativeCatOperand}
+        for args in ((vv, _operand(T, 1, 3)), (_operand(T, 1, 3), vv), (mv, vv),
+                     (vv, mv, mv), (mv, _operand(T, 2, 3, 2)))
+            @test _same_as_base(RK._native_hcat, hcat, args...)
+        end
+        for args in ((vv, _operand(T, 1, 2)), (_operand(T, 1, 2, 2), mv), (mv, mv),
+                     (only(_values(T, 1, 3)), vv), (vv, mv))
+            @test _same_as_base(RK._native_vcat, vcat, args...)
+        end
+        @test _same_as_base(RK._native_hvcat, hvcat, (2, 2), mv, vv, mv, vv)
+        @test u == _values(T, 12, 0)
+    end
     # Operand combinations the companions do not specialize keep Base's call.
     for args in ((["a", "b"], ["c", "d"]), (Any[1, 2], Any[3, 4]),
-                 (view(x, 1:2), x), (x', x'), (big(1.0), 2.0), (x, Real[3]), ())
+                 (view(x, 1:2:2), x), (view(x', :, 1:2), x'), (x', x'),
+                 (big(1.0), 2.0), (x, Real[3]), ())
         @test _same_as_base(RK._native_hcat, hcat, args...)
         @test _same_as_base(RK._native_vcat, vcat, args...)
     end
