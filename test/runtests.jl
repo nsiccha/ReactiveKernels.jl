@@ -63,6 +63,7 @@ const _MATRIX_CORE_TESTS = (
     "test_native_type_queries.jl",
     "test_nested_source_inference.jl",
     "test_authored_scan.jl",
+    "test_plate_closures.jl",
     "test_scan_endpoint_scope.jl",
     "test_replica.jl",
     "test_precompiled_prepared.jl",
