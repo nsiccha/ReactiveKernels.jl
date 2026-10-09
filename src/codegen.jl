@@ -1471,6 +1471,23 @@ function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
         _AuthoredPlateCellOp(composed.op), composed.cost, nothing, false, composed.source)
 end
 
+# Is a plate's pointwise value read only by other plates, each zipping it, and
+# returned by no WANT? Its tensorized lanes then pass to them as they are
+# (`_tensorized_plate_lanes`).
+function _plate_read_by_plates(p::Plan, pointwise_id, sum_recipe)
+    g = p.graph
+    any(w -> canon_id(g, w.id) == pointwise_id, p.want) && return false
+    readers = [r for r in p.recipes if r !== sum_recipe &&
+        any(input -> canon_id(g, input.id) == pointwise_id, r.inputs)]
+    isempty(readers) && return false
+    all(readers) do r
+        r.op isa _AuthoredPlateOp || return false
+        atomic = typeof(r.op).parameters[2]
+        all(k -> !(k in atomic) || canon_id(g, r.inputs[k].id) != pointwise_id,
+            eachindex(r.inputs))
+    end
+end
+
 function _plate_dependencies(plan::Plan, root_ids::Set{Int})
     graph = plan.graph
     dependencies = Dict{Int,Set{Int}}()
@@ -2596,7 +2613,7 @@ end
 Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
-        pointwise_lhs, total_lhs)
+        pointwise_lhs, total_lhs; lanes::Bool = false)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -2687,8 +2704,8 @@ Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         locals[output_cid] = out
     end
     scalar_result = locals[result_cid]
-    pointwise = Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_pointwise), scalar_result)
+    pointwise = Expr(:call, GlobalRef(@__MODULE__,
+        lanes ? :_tensorized_plate_lanes : :_tensorized_plate_pointwise), scalar_result)
     pointwise_lhs === nothing ||
         push!(body.args, :($pointwise_lhs = $pointwise))
     total = Expr(:call,
@@ -2841,7 +2858,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             elseif tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
-                    pointwise_lhs, total_lhs)
+                    pointwise_lhs, total_lhs; lanes = pointwise_lhs !== nothing &&
+                        _plate_read_by_plates(p, pointwise_id, sum_recipe))
             elseif r.id in strip_members
                 hints = type_hints === nothing ? nothing :
                     Any[type_hints[canon_id(g, v.id)] for v in r.inputs]

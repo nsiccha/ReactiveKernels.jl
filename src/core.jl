@@ -1437,6 +1437,14 @@ end
     ndims(value.values) > 1 ? value : value.values
 @inline _tensorized_plate_pointwise(
     value::_TensorizedPlateBatch{<:Tuple,<:AbstractArray}) = value
+# A plate whose pointwise value only other plates read hands its lanes to
+# them as they are. A compound (tuple or named-tuple) lane then stays one batch,
+# which each reading cell restores lane by lane, as it restores an array lane;
+# materializing it would turn its lanes into one tuple of arrays, whose
+# elements a reading plate would take for its lanes.
+@inline _tensorized_plate_lanes(value) = _tensorized_plate_pointwise(value)
+@inline _tensorized_plate_lanes(
+    value::_TensorizedPlateBatch{<:Tuple,<:Union{Tuple,NamedTuple}}) = value
 
 # The marker is owned by RK, so ordinary helpers can use Base.stack without a
 # backend-specific helper method. Only the fixed tensor rank determines this
