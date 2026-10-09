@@ -189,8 +189,8 @@ end
     k = prepare(cells; have = (:x, :y, :z, :s, :i), want = (:dy_cell, :dz_cell))
     full = prepare(_cell_fork; have = (:x, :y, :z, :s), want = (:dy, :dz))
     function data(n)
-        x = collect(range(-1.0, 1.0; length = n))
-        (x, 2 .* sin.(x), cos.(x), 0.8)
+        xs = collect(range(-1.0, 1.0; length = n))
+        (xs, 2 .* sin.(xs), cos.(xs), 0.8)
     end
     x, y, z, s = data(9)
     dy, dz = full(x, y, z, s)
