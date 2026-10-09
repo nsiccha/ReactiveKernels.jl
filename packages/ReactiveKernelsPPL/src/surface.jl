@@ -1830,6 +1830,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         base = ex.args[1]
         base in data && length(ex.args) == 2 &&
             _literal_row_range(ex.args[2]) && return :vector
+        slice = _observation_slice_shape(ex, data, detmap, memo, active, env)
+        slice === nothing || return slice
         _is_array_value_ref(ex, data, detmap, memo, active, env) &&
             return _array_ref_shape(ex, data, detmap, memo, active, env)
         _is_gather(ex, data, detmap, env) || return :scalar
@@ -1878,6 +1880,23 @@ function _elementwise_shape(argshapes)
     :vector in argshapes && return :vector
     :array in argshapes && return :array
     return :scalar
+end
+
+# `A[:, j]` over a value whose rows are the observations (a bound data
+# matrix, a product `X * B` of a data matrix and a declared or returned
+# coefficient matrix) keeps that axis, as in Julia: the leading `:`
+# selects every row. The other indices are literal positions or `:`, so
+# `P[:, 1]` is one value per observation and `P[:, :]` stays a matrix.
+function _observation_slice_shape(ex::Expr, data, detmap, memo, active, env)
+    base = ex.args[1]
+    base isa Union{Symbol,Expr} && length(ex.args) >= 3 &&
+        ex.args[2] === :(:) || return nothing
+    rest = ex.args[3:end]
+    all(_is_position, rest) || return nothing
+    _shape_of(base, data, detmap, memo, active, env) === :vector ||
+        return nothing
+    _obs_axis(base, data, detmap, memo, active, env) || return nothing
+    return any(i -> i === :(:), rest) ? :matrix : :vector
 end
 
 # A read `A[...]` of an array value: a declared array, an array-valued
@@ -1952,6 +1971,8 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
+        _observation_slice_shape(ex, data, detmap, memo, active, env) ===
+            nothing || return true
         # A gather from an array value follows its observation index on
         # either axis, including definitions such as `b = z * M`.
         array_base = _is_array_value_ref(ex, data, detmap, memo, active, env)
@@ -6555,6 +6576,15 @@ function _value_symbols!(out::Set{Symbol}, ex)
         end
         return nothing
     end
+    if ex.head === :ref && !isempty(ex.args)
+        # A whole axis (`P[:, 1]`) or an endpoint (`P[:, end]`) is a
+        # position of the indexed value, not a name.
+        _value_symbols!(out, ex.args[1])
+        for i in ex.args[2:end]
+            i === :(:) || _is_endpoint_position(i) || _value_symbols!(out, i)
+        end
+        return nothing
+    end
     for a in ex.args
         ex.head === :tuple && (a = _tuple_field_value(a))
         _value_symbols!(out, a)
@@ -9638,6 +9668,11 @@ function _classify_summand(pname, core, sign::Int, ctx)
         # its group (`c[g]`) stays a factor below.
         return _extract_summand(pname, core, sign, ctx)
     end
+    # A slice keeping every row of a per-observation value (`P[:, 1]`,
+    # `(X * B)[:, 1]`) is an observation column, as its named form is.
+    head === :ref && length(core.args) >= 3 && core.args[2] === :(:) &&
+        _canon_shape(core, ctx) === :vector &&
+        return _extract_summand(pname, core, sign, ctx)
     head === :ref && return _classify_ref(pname, core, sign, ctx)
     head === :macrocall && _sfail("predictor $pname: macros do not lower " *
         "inside predictor expressions")

@@ -3041,6 +3041,11 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
                             "IR/contract growth")
     end
     head === :. && return _collect_vector_dot!(refs, ex, plan, label, bound)
+    if _is_observation_slice(plan, ex)
+        # `P[:, 1]` keeps every row of a per-observation value: n_obs.
+        _collect_vector_refs!(refs, ex.args[1], plan, label, bound)
+        return nothing
+    end
     _is_row_gather(plan, ex) && _fail(label, "`$(repr(ex))` is one row " *
         "per observation (a matrix) — multiply it by a vector " *
         "(`$(repr(ex)) * v`) or read one column (`$(ex.args[1])[$(ex.args[2]), 1]`)")
@@ -3181,6 +3186,7 @@ function _is_vector_valued(ex, plan::StructuralPlan)
     _is_plate_column_expr(ex) && return true
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
+    _is_observation_slice(plan, ex) && return true
     ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
         (_is_array_param(plan, ex.args[1]) ||
             _is_array_assignment(plan, ex.args[1])) &&
@@ -3249,6 +3255,17 @@ end
 _is_matrix_math(ex, plan) = ex isa Expr && ex.head === :call &&
     !isempty(ex.args) && ex.args[1] in (:+, :-, :*, :/) &&
     any(a -> _is_matrix_value(a, plan), ex.args[2:end])
+
+# `A[:, j]`: every row of a per-observation value (a derived column such
+# as `P = X * B`, or a bound data matrix) at literal positions or `:` on
+# its other axes. As in Julia, the leading `:` keeps the row axis.
+function _is_observation_slice(plan::StructuralPlan, ex)
+    ex isa Expr && ex.head === :ref && length(ex.args) >= 3 || return false
+    base = ex.args[1]
+    base isa Union{Symbol,Expr} && ex.args[2] === :(:) &&
+        all(_is_position, ex.args[3:end]) || return false
+    return _is_vector_valued(base, plan)
+end
 
 function _observation_matrix_gather(ex, plan)
     return _is_row_gather(plan, ex)
