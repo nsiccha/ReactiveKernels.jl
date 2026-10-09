@@ -698,7 +698,7 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
             kernel;min_elements=4)
         @test unchanged === kernel && isempty(none)
         prepared = prepare_ad(kernel,TEST_AD_BACKEND,q;active=:q)
-        weights, rows, nested = prepared.external_values
+        weights, rows, nested = ReactiveKernels._ad_hidden_operands(prepared)
         @test weights isa Vector && nested isa Vector
         @test weights == y[:,1] && rows == [2,1,2] && nested == y[:,2]
         g = zeros(length(q))
@@ -727,7 +727,7 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
                          have = (:u, :s), want = :objective, bound = (; s))
         u = [0.3, 0.1]
         prepared = prepare_ad(kernel, TEST_AD_BACKEND, u; active = :u)
-        @test prepared.external_values == (s[1].a, s[1].k)
+        @test ReactiveKernels._ad_hidden_operands(prepared) == (s[1].a, s[1].k)
         g = zeros(2)
         value, _ = ad_value_and_gradient!(prepared, g, u)
         @test value ≈ kernel(u)
@@ -771,8 +771,9 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
                          have = (:x, :y), want = :objective,
                          bound = (; y = y))
         prepared = prepare_ad(kernel, TEST_AD_BACKEND, x; active = :x)
-        @test all(value -> value isa Array, prepared.external_values)
-        @test prepared.external_values == (y[:, 1], y[:, 2])
+        hidden = ReactiveKernels._ad_hidden_operands(prepared)
+        @test all(value -> value isa Array, hidden)
+        @test hidden == (y[:, 1], y[:, 2])
 
         gradient = similar(x)
         value, returned = ad_value_and_gradient!(prepared, gradient, x)

@@ -34,6 +34,7 @@ include("inverse_edges.jl")
 include("partial_evaluation.jl")
 include("nonallocating.jl")
 include("graphops.jl")
+include("authored_loops.jl")
 include("authoring.jl")
 include("lane_sources.jl")
 include("error_policy.jl")
@@ -61,7 +62,7 @@ include("cholesky.jl")
 include("native_bdf.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
-export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan
+export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @plate, @scan
 export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
 export prepare_ad_pullback, ad_pullback

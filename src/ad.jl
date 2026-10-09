@@ -126,7 +126,7 @@ _ad_restore_cotangent(point, cotangent) = cotangent
     end
     # Share the primal call boundary with externalized bound arrays: pass the
     # original operands directly to the existing generated model body.
-    _native_body_call_expr(F, :(call.native), :(call.ops), positional)
+    _native_body_call_expr(F, :(call.native), Any[:(call.ops), positional...])
 end
 
 function _ad_operation_slots!(used, node)
@@ -182,7 +182,9 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
                 kernel.f.native, ops),
             (),
         )
-        return _ADKernelCall{I,typeof(externalized)}(externalized), values
+        packed, pack = _pack_hidden_operands(
+            externalized, values, kernel.lowered_recipes, ops)
+        return _ADKernelCall{I,typeof(packed)}(packed), pack
     end
     externalized, values = _externalize_bound_arrays(
         kernel; materialize_view_copies = true, externalize_scalars = true)
@@ -194,7 +196,116 @@ function _ad_kernel_call(kernel::PreparedKernel, args::Tuple, ::Val{I}) where {I
         return _ADNativeKernelCall{I,typeof(kernel.f),typeof(kernel.ops)}(
             kernel.f, kernel.ops), values
     end
-    _ADKernelCall{I,typeof(externalized)}(externalized), values
+    isempty(values) &&
+        return _ADKernelCall{I,typeof(externalized)}(externalized), values
+    packed, pack = _pack_hidden_operands(
+        externalized, values, kernel.lowered_recipes, kernel.ops)
+    _ADKernelCall{I,typeof(packed)}(packed), pack
+end
+
+# Every hidden bound operand used to cross the backend as its own `Constant`
+# context, so the differentiated call's arity grew with the model's bound
+# arrays and scalars. Past Julia's 32-element tuple-splat limit that call stops
+# inferring: Enzyme's reverse `autodiff` appends its return seed and re-splats
+# 33 annotations at 32 arguments, and DifferentiationInterface's Enzyme
+# extension maps over its contexts with Base's unspecialized `map` from 32
+# contexts, so every call dispatches dynamically and boxes each annotation
+# (snag `rk-ref-indexed-p-5d0a952e`: one more bound operand, a plate's
+# `eachindex` domain, cost a BRM reader 13 KB per gradient). The backend now
+# receives all of them as one `Constant` named tuple, keyed by the bound value
+# each operand comes from, so the arity no longer depends on the model. The
+# packed call reads each operand back by a literal field and passes the exact
+# original operands to the unchanged externalized call: the generated model
+# body and its hidden-operand ABI are untouched. (Homogeneous `Vector{T}`
+# packs per type were tried first: a ragged operand loaded from such a heap
+# vector inside the inlined body failed native Reverse with "Illegal cached
+# pointer"; read from the immutable named tuple it differentiates cleanly.)
+struct _PackedOperandCall{K}
+    call::K
+end
+
+function _pack_hidden_operands(call, values::Tuple, recipes, ops)
+    names = _hidden_operand_names(recipes, ops, call)
+    length(names) == length(values) || throw(ArgumentError(
+        "internal: $(length(values)) hidden operand(s) but $(length(names)) " *
+        "name(s) derived from the bound slots"))
+    _PackedOperandCall(call), (NamedTuple{names}(values),)
+end
+
+# Each operand is named after the bound value it comes from (the output of its
+# `_BoundConstant` recipe: a bound port, a cached `bound_plate_<name>`, a
+# folded intermediate), with the field path appended for an array leaf of a
+# structured bound value. The leaf order mirrors `_bound_array_leaves`.
+# `recipes` is the kernel's flattened `lowered_recipes`, which matches its
+# operation slots one to one, nested plate and scan bodies included (the plan's
+# own recipes cover only the top level).
+function _hidden_operand_names(
+        recipes, ops, ::_ExternalizedBoundArrayCall{F,O,P,H}) where {F,O,P,H}
+    length(recipes) == length(ops) || throw(ArgumentError(
+        "internal: $(length(ops)) operation slots but $(length(recipes)) " *
+        "lowered recipes"))
+    names = Symbol[]
+    for slot in P
+        recipe = recipes[slot]
+        recipe.op isa _BoundConstant && ops[slot] isa _BoundConstant ||
+            throw(ArgumentError("internal: operation slot $slot is not the " *
+                                "bound constant of lowered recipe $slot"))
+        name = only(recipe.outputs).name
+        for path in (H ? _bound_leaf_paths(recipe.op.value) : ((),))
+            push!(names, isempty(path) ? name : Symbol(join((name, path...), "_")))
+        end
+    end
+    _unique_symbols(names)
+end
+
+_bound_leaf_paths(value::NamedTuple) = Tuple(
+    (key, path...) for (key, field) in pairs(value)
+    for path in _bound_leaf_paths(field))
+_bound_leaf_paths(value::Tuple) = Tuple(
+    (index, path...) for (index, field) in enumerate(value)
+    for path in _bound_leaf_paths(field))
+_bound_leaf_paths(::AbstractArray) = ((),)
+_bound_leaf_paths(value) = ()
+
+function _unique_symbols(names)
+    seen = Set{Symbol}()
+    Tuple(map(names) do name
+        unique, suffix = name, 1
+        while unique in seen
+            suffix += 1
+            unique = Symbol(name, "_", suffix)
+        end
+        push!(seen, unique)
+        unique
+    end)
+end
+
+@generated function (call::_PackedOperandCall)(args::Vararg{Any,N}) where {N}
+    forwarded = Any[[:(getfield(args, $index)) for index in 1:N-1];
+                    [:(getfield(getfield(args, $N), $field))
+                     for field in 1:fieldcount(args[N])]]
+    :(Base.@inline getfield(call, :call)($(forwarded...)))
+end
+
+# The hidden operands in their original order, as the unpacked externalized
+# call takes them.
+_ad_hidden_operands(prepared) =
+    _ad_hidden_operands(prepared.call, prepared.external_values)
+_ad_hidden_operands(call, values) = values
+_ad_hidden_operands(::_ADKernelCall{I,<:_PackedOperandCall}, pack) where {I} =
+    Tuple(only(pack))
+
+# A caller that rebuilds the unpacked call itself (the in-trace Reactant path)
+# passes the prepared contexts with the pack replaced by those operands.
+_ad_unpack_hidden_contexts(prepared, contexts::Tuple) =
+    _ad_unpack_hidden_contexts(prepared.call, prepared, contexts)
+_ad_unpack_hidden_contexts(call, prepared, contexts::Tuple) = contexts
+function _ad_unpack_hidden_contexts(
+        ::_ADKernelCall{I,<:_PackedOperandCall}, prepared,
+        contexts::Tuple) where {I}
+    public = length(contexts) - 1
+    (contexts[1:public]...,
+     map(DifferentiationInterface.Constant, _ad_hidden_operands(prepared))...)
 end
 
 # Match one non-allocating cache step,
@@ -660,8 +771,8 @@ end
 
 # The trailing context is the owned AD cache tuple; the leading N - 1 restore
 # the inactive HAVE arguments around the active one, exactly as above.
-@generated function (call::_ADNonAllocatingKernelCall{I})(
-        active, contexts::Vararg{Any,N}) where {I,N}
+@generated function (call::_ADNonAllocatingKernelCall{I,F})(
+        active, contexts::Vararg{Any,N}) where {I,F,N}
     indices = _ad_selector_indices(I)
     input_count = N + length(indices) - 1
     all(index -> 1 <= index <= input_count, indices) || return :(throw(
@@ -679,8 +790,14 @@ end
             context_index += 1
         end
     end
-    :(call.f(call.ops, getfield(contexts, $N), call.cache_apply,
-             $(arguments...)))
+    # Enter the program without the RGF vararg wrapper: once its operands (the
+    # operation table, caches and driver plus every HAVE port) pass 32, the
+    # wrapper's one-tuple splat stays a dynamic `Core._apply_iterate`, and
+    # native Reverse rejects the constant HAVE arrays stored there beside the
+    # shadowed caches (`_native_body_call_expr`).
+    _native_body_call_expr(F, :(call.f),
+        Any[:(call.ops), :(getfield(contexts, $N)), :(call.cache_apply),
+            arguments...])
 end
 
 function _ad_active_index(kernel::_ADKernel, active::Symbol)

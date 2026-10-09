@@ -423,9 +423,8 @@ recipes are excluded by the planner and cannot form a plate plan.
 
 Plated HAVE values follow Julia broadcasting. Compatible dimensions zip,
 singleton dimensions expand, scalars repeat, and `Ref(value)` makes an
-array-valued input atomic. An authored `plate(...) do` cell that reads an
-enclosing name without passing it captures that value whole, exactly as an
-explicit `Ref(name)` operand would
+array-valued input atomic. An authored `plate(...) do` cell shares a value
+across cells by closing over it, never through a `Ref` argument
 ([Plate-cell scope](batched.md#Plate-cell-scope)). The complete broadcast shape
 is instantiated before any recipe executes or output is mutated.
 
@@ -467,9 +466,7 @@ retains each axis as a runtime loop and fuses a selected `sum` into its plate;
 a total-only reader needs no intermediate pointwise arrays. Ragged groups,
 empty groups, and array views use the same graph and generated loop structure.
 A cell reads an enclosing value whole, as a Julia closure does: the observation
-cells below read the kernel's `scale` directly. An explicit `Ref(value)` operand
-is the same atomic value, so either spelling prepares the same kernel; prefer
-the closure.
+cells below read the kernel's `scale` directly, with no `Ref` argument.
 
 The example below keeps the complete normalized scalar Normal law visible in
 the inner graph. Its source is shared with native acceptance; the documentation

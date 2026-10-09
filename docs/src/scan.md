@@ -27,32 +27,27 @@ result = scan(xs₁, xs₂, …; init = c₀) do carry, x₁, x₂, …
 end
 # optional: `include_init = true` returns [c₀, output₁, output₂, …]
 # optional: `history = h₀` appends one do-block argument, the outputs so far
-# explicit form: scan(xs₁, …, Ref(shared₁), …; init = c₀) do carry, x₁, …, s₁, …
 ```
 
-- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the leading non-`Ref`
-  positionals. They are advanced together in **lockstep**: step `t` receives
+- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the positional
+  arguments. They are advanced together in **lockstep**: step `t` receives
   `xs₁[t], xs₂[t], …`. With a single sequence this is the ordinary
   `scan(xs; …) do carry, x`. Every iterated sequence must share axes; a length
   mismatch throws `DimensionMismatch`. The sequences may be empty: no step
   runs and `scan` returns an empty vector (see [Empty sequences](#Empty-sequences)).
 - **`init`** — seeds the threaded `carry`. Required keyword.
 - **Shared values** — the step reads enclosing names as a Julia closure does,
-  and this is the preferred way to give every step a whole value. An enclosing
-  name it reads without passing it is captured whole, exactly like one more
-  trailing `Ref(name)` operand, and prepares the same kernel. That name can be a
-  `@kernel` signature port, a name the kernel body assigns, or a name of an
-  enclosing plate cell or scan step. Only the explicit non-`Ref` positionals are
-  iterated.
-- **`Ref(shared)` operands** — the explicit spelling of a shared value, still
-  supported: passed unchanged to every step, exactly like
-  [`plate`](compiler.md)'s atomic `Ref` arguments. Every `Ref(...)` operand must
-  follow the iterated sequences; a bare (non-`Ref`) positional after a
-  `Ref(...)` is rejected.
-- **The do-block** receives `(carry, x₁, x₂, …)`, then one argument per explicit
-  `Ref` operand, and must end with the 2-tuple `(new_carry, output)`. `scan`
-  returns the vector `[output₁, output₂, …]` (one entry per step); the final
-  carry is internal.
+  and closing over a value is how every step shares it. An enclosing name the
+  step reads is captured whole: a `@kernel` signature port, a name the kernel
+  body assigns, or a name of an enclosing plate cell or scan step. Only the
+  positionals are iterated. Do not pass a shared value as a `Ref(...)`
+  positional. Older kernels do, after the iterated sequences. Such an operand
+  prepares the same kernel as the closure, and it is deprecated (user
+  decision `0kvm2ip`): each site warns once at definition under
+  `--depwarn=yes`, and it will become an error.
+- **The do-block** receives `(carry, x₁, x₂, …)` and must end with the 2-tuple
+  `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]` (one
+  entry per step); the final carry is internal.
 - **`include_init = true`** (a literal; default `false`) returns
   `[init, output₁, output₂, …]` instead: one element longer than the sequences,
   in one buffer. See [The initial value in the result](#The-initial-value-in-the-result).
@@ -74,6 +69,35 @@ callable runtime function outside one (calling it directly throws with a pointer
 to this page). Like an authored `plate`, a scan is an ordinary recipe of the
 graph it is written in: write it as the right-hand side of a named port, next to
 any other recipes, plates and scans of that graph. It needs no kernel of its own.
+
+## Loop syntax: `@scan`
+
+A scan can also be written as a loop over its trajectory:
+
+```julia
+@kernel ar1(x, phi, s) = begin
+    @scan begin
+        a[1] = s
+        for t in 2:length(x)
+            a[t] = phi * a[t - 1] + x[t]
+        end
+    end
+    return a
+end
+```
+
+- **Carried arrays.** Every array the loop writes at `t` is carried. Seed it
+  at `1..m` before the loop, at the same depth `m` for every carried array. A
+  seed may read earlier seeds by literal index.
+- **Reads in a step.** A step reads earlier values through literal lags
+  `a[t - k]` with `1 ≤ k ≤ m`, and the current `a[t]` after its write. Other
+  values are closures, including `x[t]` and `t` itself.
+- **The result.** `a` is the whole trajectory `[a[1], …, a[T]]`.
+
+One carried array with one seed prepares exactly `a = scan(2:length(x);
+init = s, include_init = true) do a_prev, t … end`. Several carried arrays
+(a `level` driven by an `increment`, say) are folded by one scan each, with
+their seeds prepended.
 
 ## Example: an ARMA(1,1) error recursion
 
@@ -138,8 +162,7 @@ end
 ```
 
 A shared value such as a `gain` port is read directly in the step:
-`scan(a, b; init = 0.0) do carry, aₜ, bₜ … gain … end`. The explicit
-`scan(a, b, Ref(gain); init = 0.0) do carry, aₜ, bₜ, g … end` is equivalent.
+`scan(a, b; init = 0.0) do carry, aₜ, bₜ … gain … end`.
 
 Pass the sequences a step reads as separate positionals rather than packing
 them into matrix rows. A piecewise-exact turnover recurrence
@@ -362,8 +385,7 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   outputs in a vector. When that port feeds only one authored `plate` with a
   selected `sum`, native preparation can run the plate cell inside the same
   carry loop and omit the intermediate scan vector. The plate's other inputs
-  must be declared numeric scalars, captured enclosing values or explicit
-  `Ref` operands. Its shared
+  must be declared numeric scalars or captured enclosing values. Its shared
   computations run once outside the loop. Requesting the pointwise plate port
   still returns its vector; requesting the scan port, adding another consumer,
   supplying another broadcast array, or composing multiple plates preserves
@@ -373,8 +395,7 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   [default optimization](#Default-optimized-short-scans) may expand short scans
   while preserving their semantics. The lowering is selected whenever any
   scan operand is traced (the carry seed, an iterated sequence looked through its
-  `eachrow` wrapper, or a shared operand: a capture or one looked through its
-  `Ref`), and every
+  `eachrow` wrapper, or a captured shared value), and every
   iterated sequence is then carried as a traced array: a 1-D sequence is
   gathered element by element by the loop counter, an `eachrow` matrix
   contributes its parent and row `i` is one traced dynamic slice (so the
@@ -382,8 +403,8 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   host (`bound=`) sequence is lifted into the traced program as a constant
   exactly as bound plate data is. Sequences of different kinds may be
   iterated together, and several lockstep sequences share the one loop.
-  Shared operands (captures and `Ref(...)` operands) are read the way an
-  authored loop reads its captures:
+  Captured shared values are read the way an authored loop reads its
+  captures:
   traced values enter the loop as fresh tracers and host values cross it
   unchanged, field by field for a tuple or named tuple. So a host schedule
   plan (a struct holding a `Vector{Int}`) reaches the step as itself, and a
@@ -468,9 +489,9 @@ Native iteration remains an ordinary loop.
 - **The iterated sequences must share axes.** A length mismatch between
   sequences throws `DimensionMismatch`. Empty sequences are supported (see
   [Empty sequences](#Empty-sequences)).
-- **Iterated sequences precede shared operands.** All bare (iterated) positionals
-  come first; every `Ref(...)` shared operand follows. A non-`Ref` positional
-  after a `Ref(...)` is rejected. Captured names need no position.
+- **Every positional is iterated.** Shared values are captured, not passed. In
+  older kernels that pass them as `Ref(...)` operands, those must follow the
+  iterated sequences: a bare positional after a `Ref(...)` is rejected.
 - **Per-step output is a scalar** on the Reactant `while` path. A non-scalar
   per-step output there is a loud, reported error, never a silent mis-lowering;
   author the output as a scalar (or open an issue for the shape you need).
