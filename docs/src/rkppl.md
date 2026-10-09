@@ -701,7 +701,11 @@ Values the cell reads per index supply that index's array or number. Examples
 are `x[i]`, a per-group scalar `mu[i]`, or the per-group result `loc[i]` of a
 function-shaped kernel. Every other value is shared by all indices, and each
 per-index value broadcasts against its response array as Julia requires. The
-observation lowers to RK's nested group and observation plates: one retained
+loop may iterate another array's indices, such as `eachindex(t)` or
+`axes(t, 1)` for a `t` holding one longer array per index. That array supplies
+the indices only, so its arrays need not broadcast with the response's; a cell
+local computed from it, such as `m = f(t[i], picks[i], a)`, supplies that
+index's value. The observation lowers to RK's nested group and observation plates: one retained
 observation plate runs inside the group plate, with no copy per group. The
 `:pointwise` query returns one array of densities per index, and empty arrays
 contribute zero. Native values and ordinary Enzyme reverse gradients are
