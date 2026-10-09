@@ -1147,6 +1147,13 @@ const _RKScalarIndex = Union{Integer,Reactant.TracedRNumber{<:Integer}}
 @inline ReactiveKernels._tensorized_trunc(
     ::Type{T}, x::Reactant.TracedRNumber{<:Integer}) where {T<:Integer} =
     convert(Reactant.TracedRNumber{T}, x)
+# A traced array is a value, so its slice is the block itself.  A view of it
+# would reach reads Reactant cannot trace yet: a gather at a traced index
+# (`Base.reindex`), a nested broadcast (`benchmark/reactant_subarray_broadcast_reindex.jl`)
+# and concatenation by scalar indexing.
+@inline ReactiveKernels._tensorized_view(
+    array::Reactant.TracedRArray{T,1}, range::AbstractUnitRange) where {T} =
+    array[range]
 @inline _rk_gather(array::Reactant.TracedRArray, indices) =
     Reactant.@allowscalar array[map(_rk_int_index, indices)...]
 
