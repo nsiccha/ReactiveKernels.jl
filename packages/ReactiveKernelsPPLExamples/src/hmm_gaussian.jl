@@ -101,10 +101,9 @@ using LogExpFunctions: logsumexp
     gamma1::Vector{Float64} = logpi1 .+ sum(emit1)
     T::Int = length(y)
     lls::Vector{Float64} =
-        scan(y[2:T], Ref(logA), Ref(mu), Ref(sigma), Ref(c0);
-             init = gamma1) do carry, yt, lA, m, s, c
-            emit = c .- log.(s) .- 0.5 .* ((yt .- m) ./ s) .^ 2
-            M = carry .+ lA                                   # M[i,j] = γ[i] + logA[i,j]
+        scan(y[2:T]; init = gamma1) do carry, yt
+            emit = c0 .- log.(sigma) .- 0.5 .* ((yt .- mu) ./ sigma) .^ 2
+            M = carry .+ logA                                 # M[i,j] = γ[i] + logA[i,j]
             newg = vec(mapslices(logsumexp, M; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end

@@ -16,8 +16,8 @@ using Test
 const _DOT_RGF = ReactiveKernels.RuntimeGeneratedFunctions
 
 @kernel _dot_child_scan(xs::Vector{Float64}, scale::Float64) = begin
-    weights::Vector{Float64} = scan(xs, Ref(scale); init = 0.0) do carry, x, s
-        next = carry + s * x
+    weights::Vector{Float64} = scan(xs; init = 0.0) do carry, x
+        next = carry + scale * x
         (next, next)
     end
     return weights
@@ -25,8 +25,8 @@ end
 const _DOT_CHILD = prepare(_dot_child_scan)
 
 @kernel _dot_cell_plate(idx, units, weights) = begin
-    values::Vector{Float64} = plate(idx, Ref(units), Ref(weights)) do i, u, w
-        sum((u[max(i - j, 1)] * w[j] for j in eachindex(w)); init = 0.0)
+    values::Vector{Float64} = plate(idx) do i
+        sum((units[max(i - j, 1)] * weights[j] for j in eachindex(weights)); init = 0.0)
     end
     return values
 end
@@ -48,8 +48,8 @@ end
 @kernel _dot_convert(n::Int, xs::Vector{Float64}, w::Vector{Float64}) = begin
     y::Vector{Float64} = fill(n, 3)
     z::Float64 = 2 * n
-    scaled::Vector{Float64} = plate(xs, Ref(z), Ref(w)) do x, s, shift
-        x * s + shift[1]
+    scaled::Vector{Float64} = plate(xs) do x
+        x * z + w[1]
     end
     return (y, z, scaled)
 end

@@ -22,9 +22,9 @@ end
 # `length(c)`, is not bound data and would stay a lazy branch.)
 @kernel leveled(eta::Vector{Float64}, level::Vector{Int}, cuts::Vector{Float64},
                 w::Vector{Float64}, nlev::Int) = begin
-    pointwise = plate(level, eta, Ref(cuts), w, nlev) do l, e, c, wi, k
-        arm::Float64 = l == 1 ? c[1] - e :
-            (l == k ? e - c[k - 1] : c[l] * e - c[l - 1])
+    pointwise = plate(level, eta, w, nlev) do l, e, wi, k
+        arm::Float64 = l == 1 ? cuts[1] - e :
+            (l == k ? e - cuts[k - 1] : cuts[l] * e - cuts[l - 1])
         wi * arm
     end
     total::Float64 = sum(pointwise)

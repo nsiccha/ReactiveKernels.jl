@@ -987,8 +987,8 @@ module TupleAxisNative
 using ReactiveKernels
 
 @kernel broadcast_axes(q::Vector{Float64}, x, y) = begin
-    pointwise = plate(x, Ref(q), y) do xi, whole, yi
-        xi + sum(whole) * yi
+    pointwise = plate(x, y) do xi, yi
+        xi + sum(q) * yi
     end
     total::Float64 = sum(pointwise)
     return total
@@ -996,8 +996,8 @@ end
 
 # A plate whose ONLY batched axis is a tuple (no array co-operand).
 @kernel tuple_only(q::Vector{Float64}, x) = begin
-    pointwise = plate(x, Ref(q)) do xi, whole
-        xi + sum(whole)
+    pointwise = plate(x) do xi
+        xi + sum(q)
     end
     total::Float64 = sum(pointwise)
     return total
@@ -1059,8 +1059,8 @@ opaque(x) = Base.inferencebarrier(x)
 end
 
 @kernel indexed_total(idx, values) = begin
-    cells = plate(idx, Ref(values)) do i, v
-        opaque(v[i])
+    cells = plate(idx) do i
+        opaque(values[i])
     end
     total = sum(cells)
     return total
@@ -1303,12 +1303,11 @@ end
     _lookup(observation, plan, i) = observation - plan.shifts[i]
     @kernel _generator_cell(plan, units, weights) = begin
         observations::UnitRange{Int} = 1:plan.nobs
-        concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units),
-                                               Ref(weights)) do observation, schedule_plan, response, amounts
-            sum((ifelse(_lookup(observation, schedule_plan, i) > 0,
-                        response[max(_lookup(observation, schedule_plan, i), 1)] * amounts[i],
+        concentration::Vector{Float64} = plate(observations) do observation
+            sum((ifelse(_lookup(observation, plan, i) > 0,
+                        units[max(_lookup(observation, plan, i), 1)] * weights[i],
                         0.0)
-                 for i in _slots(schedule_plan)); init = 0.0)
+                 for i in _slots(plan)); init = 0.0)
         end
         return concentration
     end
@@ -1329,8 +1328,8 @@ end
                       if [v.name for v in recipe.outputs] == [:__plate_value__])
     op = kernel.ops[cell_index]
     @test op isa ReactiveKernels._KernelSourceOp
-    formal_types = Dict(:schedule_plan => typeof(plan), :observation => Int,
-                        :response => typeof(units), :amounts => typeof(weights))
+    formal_types = Dict(:plan => typeof(plan), :observation => Int,
+                        :units => typeof(units), :weights => typeof(weights))
     argtypes = Tuple(formal_types[v.name] for v in kernel.lowered_recipes[cell_index].inputs)
     invokes_closure(f, types) = any(only(Base.code_typed(f, types; optimize = true))[1].code) do stmt
         stmt isa Expr && stmt.head === :invoke || return false
@@ -1368,7 +1367,7 @@ import InteractiveUtils
     return ys
 end
 @kernel _unchecked_poly_plate(xs::Vector{Float64}, c) = begin
-    ys::Vector{Float64} = plate(xs, Ref(c)) do x, c
+    ys::Vector{Float64} = plate(xs) do x
         evalpoly(x, c)
     end
     return ys
@@ -1380,8 +1379,8 @@ end
     return ys
 end
 @kernel _checked_cell_plate(xs::Vector{Float64}, idx::Vector{Int}, table::Vector{Float64}) = begin
-    ys::Vector{Float64} = plate(xs, idx, Ref(table)) do x, i, t
-        x * t[i]
+    ys::Vector{Float64} = plate(xs, idx) do x, i
+        x * table[i]
     end
     return ys
 end
@@ -1441,15 +1440,15 @@ end
 # emitted once, inside the loop; a group whose roots hold no axis runs at the
 # first coordinate and is reused.
 @kernel _emitted_once_untyped(xs, scale::Float64) = begin
-    pointwise = plate(xs, Ref(scale)) do x, s
-        shifted = x * s + 0.75
+    pointwise = plate(xs) do x
+        shifted = x * scale + 0.75
         shifted * shifted
     end
     return sum(pointwise)
 end
 @kernel _emitted_once_typed(xs::Vector{Float64}, scale::Float64) = begin
-    pointwise = plate(xs, Ref(scale)) do x, s
-        shifted = x * s + 0.75
+    pointwise = plate(xs) do x
+        shifted = x * scale + 0.75
         shifted * shifted
     end
     return sum(pointwise)
@@ -1464,9 +1463,9 @@ _emitted_once_log(s) = (_EMITTED_ONCE_CALLS[] += 1; log(s))
     return sum(pointwise)
 end
 @kernel _emitted_once_scan_cell(groups, scale::Float64) = begin
-    pointwise = plate(groups, Ref(scale)) do g, s
-        path = scan(g, Ref(s); init = 0.0) do carry, y, sc
-            next = carry * 0.125 + y * sc
+    pointwise = plate(groups) do g
+        path = scan(g; init = 0.0) do carry, y
+            next = carry * 0.125 + y * scale
             (next, next)
         end
         sum(path)
@@ -1474,8 +1473,8 @@ end
     return sum(pointwise)
 end
 @kernel _emitted_once_scan_alone(g, s::Float64) = begin
-    path = scan(g, Ref(s); init = 0.0) do carry, y, sc
-        next = carry * 0.125 + y * sc
+    path = scan(g; init = 0.0) do carry, y
+        next = carry * 0.125 + y * s
         (next, next)
     end
     return sum(path)
@@ -1656,11 +1655,11 @@ _plate_gather_index(row, ::_PlateGatherExact, i) = sum(view(row, i:i))
 
 @kernel authored_gather_generator_plate(plan, units, weights) = begin
     observations = _plate_gather_domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do observation, schedule_plan, response, amounts
-        sum(ifelse(_plate_gather_index(observation, schedule_plan, i) > 0,
-                   response[max(_plate_gather_index(observation, schedule_plan, i), 1)] *
-                       amounts[i], 0.0)
-            for i in _plate_gather_slots(schedule_plan))
+    concentration::Vector{Float64} = plate(observations) do observation
+        sum(ifelse(_plate_gather_index(observation, plan, i) > 0,
+                   units[max(_plate_gather_index(observation, plan, i), 1)] *
+                       weights[i], 0.0)
+            for i in _plate_gather_slots(plan))
     end
     return concentration
 end
@@ -1671,9 +1670,9 @@ _plate_gather_row(row, response, amounts) =
     sum(response[max.(row, 1)] .* (row .> 0) .* amounts)
 @kernel authored_gather_broadcast_plate(plan, units, weights) = begin
     observations = collect(1:plan.nobs)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do observation, schedule_plan, response, amounts
-        row = observation .- schedule_plan.shifts
-        _plate_gather_row(row, response, amounts)
+    concentration::Vector{Float64} = plate(observations) do observation
+        row = observation .- plan.shifts
+        _plate_gather_row(row, units, weights)
     end
     return concentration
 end
@@ -1742,22 +1741,22 @@ _natural_sup_lag(row, ::_NaturalSupExact, j) = row[j]
 
 @kernel natural_sup_get(plan, units, weights) = begin
     observations::UnitRange{Int} = 1:plan.nobs
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * get(u, t - p.shifts[j], 0.0) for j in eachindex(p.shifts); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, t - plan.shifts[j], 0.0) for j in eachindex(plan.shifts); init = 0.0)
     end
     return concentration
 end
 @kernel natural_sup_filter(plan, units, weights) = begin
     observations::UnitRange{Int} = 1:plan.nobs
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * u[t - p.shifts[j]] for j in eachindex(p.shifts) if t > p.shifts[j]; init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * units[t - plan.shifts[j]] for j in eachindex(plan.shifts) if t > plan.shifts[j]; init = 0.0)
     end
     return concentration
 end
 @kernel natural_sup_one_graph(plan, units, weights) = begin
     observations = _natural_sup_domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in _natural_sup_doses(p); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in _natural_sup_doses(plan); init = 0.0)
     end
     return concentration
 end
@@ -1765,8 +1764,8 @@ end
 # split this graph replaces; the allocation control below.
 @kernel natural_sup_lattice_typed(plan, units, weights) = begin
     observations::UnitRange{Int} = 1:plan.nobs
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in _natural_sup_doses(p); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in _natural_sup_doses(plan); init = 0.0)
     end
     return concentration
 end
@@ -1830,16 +1829,16 @@ end
 const _dose_outer_fetch = Base.get
 @kernel dose_outer_cell(plan, units, weights) = begin
     observations = _natural_sup_domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in eachindex(weights); init = 0.0)
     end
     total = sum(concentration)
     return concentration, total
 end
 @kernel dose_outer_control(plan, units, weights) = begin
     observations = _natural_sup_domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * _dose_outer_fetch(u, _natural_sup_lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * _dose_outer_fetch(units, _natural_sup_lag(t, plan, j), 0.0) for j in eachindex(weights); init = 0.0)
     end
     total = sum(concentration)
     return concentration, total
@@ -1848,16 +1847,16 @@ end
 # first dose: the lowering keeps the cell loop.
 @kernel dose_outer_int_seed(plan, units, weights) = begin
     observations = _natural_sup_domain(plan)
-    concentration = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in eachindex(w); init = 0)
+    concentration = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in eachindex(weights); init = 0)
     end
     return concentration
 end
 # A dose loop whose range reads the cell is not a plate invariant.
 @kernel dose_outer_cell_range(plan, units, weights) = begin
     observations = _natural_sup_domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * get(u, _natural_sup_lag(t, p, j), 0.0) for j in 1:min(t, length(w)); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, _natural_sup_lag(t, plan, j), 0.0) for j in 1:min(t, length(weights)); init = 0.0)
     end
     return concentration
 end
@@ -1924,15 +1923,15 @@ end
 # A domain with two axes runs the same passes over its Cartesian cells
 # (`_plate_cells`), in coordinate order.
 @kernel dose_outer_grid(observations, shifts, units, weights) = begin
-    concentration = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
-        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init = 0.0)
+    concentration = plate(observations) do t
+        sum(weights[j] * get(units, t - shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
     end
     total = sum(concentration)
     return concentration, total
 end
 @kernel dose_outer_grid_control(observations, shifts, units, weights) = begin
-    concentration = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
-        sum(w[j] * _dose_outer_fetch(u, t - s[j], 0.0) for j in eachindex(w); init = 0.0)
+    concentration = plate(observations) do t
+        sum(weights[j] * _dose_outer_fetch(units, t - shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
     end
     total = sum(concentration)
     return concentration, total
@@ -1961,7 +1960,7 @@ end
 # the lowering does not recognize, so it keeps the cell loop.
 _plate_horner(x, c) = evalpoly(x, c)
 @kernel evalpoly_cell(xs, c) = begin
-    ys = plate(xs, Ref(c)) do x, c
+    ys = plate(xs) do x
         evalpoly(x, c)
     end
     total = sum(ys)
@@ -1974,7 +1973,7 @@ end
     return ys
 end
 @kernel evalpoly_control(xs, c) = begin
-    ys = plate(xs, Ref(c)) do x, c
+    ys = plate(xs) do x
         _plate_horner(x, c)
     end
     total = sum(ys)
@@ -1982,7 +1981,7 @@ end
 end
 # `x` read beside a second lane: a one-element `xs` expands to `ws`'s axes.
 @kernel evalpoly_cell_expanded(xs, ws, c) = begin
-    ys = plate(xs, ws, Ref(c)) do x, w, c
+    ys = plate(xs, ws) do x, w
         evalpoly(x, c) + 0 * w
     end
     return ys
@@ -2056,17 +2055,17 @@ using ReactiveKernels: scan
     xs = plate(steps) do k
         1 / (k + 0.5)
     end
-    sa = plate(xs, Ref(pa)) do x, c
-        evalpoly(x, c)
+    sa = plate(xs) do x
+        evalpoly(x, pa)
     end
-    sb = plate(xs, Ref(pb)) do x, c
-        evalpoly(x, c)
+    sb = plate(xs) do x
+        evalpoly(x, pb)
     end
-    ratio = plate(xs, Ref(q)) do x, c
-        evalpoly(x, c)
+    ratio = plate(xs) do x
+        evalpoly(x, q)
     end
-    out = scan(sa, sb, ratio, Ref(ea), Ref(eb), Ref(ca), Ref(cb);
-               init = (g = g0, a = a0, b = b0)) do carry, pa_k, pb_k, q_k, ea, eb, ca, cb
+    out = scan(sa, sb, ratio;
+               init = (g = g0, a = a0, b = b0)) do carry, pa_k, pb_k, q_k
         a = muladd(ea, carry.a, carry.g * pa_k)
         b = muladd(eb, carry.b, carry.g * pb_k)
         ((g = carry.g * q_k, a = a, b = b), ca * a + cb * b)
@@ -2078,8 +2077,8 @@ end
     xs = plate(steps) do k
         1 / (k + 0.5)
     end
-    sa = plate(xs, Ref(pa)) do x, c
-        evalpoly(x, c)
+    sa = plate(xs) do x
+        evalpoly(x, pa)
     end
     out = scan(sa, weights; init = 0.0) do carry, s, w
         next = muladd(w, carry, s)
@@ -2089,8 +2088,8 @@ end
 end
 # Not strip-fused: an init-including scan, and a plate whose output is also summed.
 @kernel strip_include_init(steps, pa) = begin
-    sa = plate(steps, Ref(pa)) do k, c
-        evalpoly(1 / (k + 0.5), c)
+    sa = plate(steps) do k
+        evalpoly(1 / (k + 0.5), pa)
     end
     out = scan(sa; init = 0.0, include_init = true) do carry, s
         (carry + s, carry + s)
@@ -2098,8 +2097,8 @@ end
     return out
 end
 @kernel strip_shared_output(steps, pa) = begin
-    sa = plate(steps, Ref(pa)) do k, c
-        evalpoly(1 / (k + 0.5), c)
+    sa = plate(steps) do k
+        evalpoly(1 / (k + 0.5), pa)
     end
     total = sum(sa)
     out = scan(sa; init = 0.0) do carry, s
@@ -2169,8 +2168,8 @@ end
 # Statements that read the carry, and values that are not concrete numbers,
 # stay in the step.
 @kernel fission_recurrence(steps, pa, pb, q, ea, eb, ca, cb, g0, a0, b0) = begin
-    out = scan(steps, Ref(pa), Ref(pb), Ref(q), Ref(ea), Ref(eb), Ref(ca), Ref(cb);
-               init = (g = g0, a = a0, b = b0)) do carry, k, pa, pb, q, ea, eb, ca, cb
+    out = scan(steps;
+               init = (g = g0, a = a0, b = b0)) do carry, k
         x = 1 / (k + 0.5)
         pa_k = evalpoly(x, pa)
         pb_k = evalpoly(x, pb)
@@ -2183,7 +2182,7 @@ end
 end
 # A hoisted value that is a tuple keeps the step as authored.
 @kernel fission_tuple_value(steps, w) = begin
-    out = scan(steps, Ref(w); init = 0.0) do carry, k, w
+    out = scan(steps; init = 0.0) do carry, k
         pair = (k * w, k + w)
         (carry + pair[1] * pair[2], carry)
     end
@@ -2229,14 +2228,14 @@ end
 # anything but Base's arithmetic (`exp` here) keeps the cell loop.
 _fold_sum_div(a, b) = a / b
 @kernel fold_sum_cell(ts, w, s) = begin
-    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+    out::Vector{Float64} = plate(ts) do t
         sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
     end
     total = sum(out)
     return out, total
 end
 @kernel fold_sum_control(ts, w, s) = begin
-    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+    out::Vector{Float64} = plate(ts) do t
         sum(_fold_sum_div(w[j], t + s[j]) for j in eachindex(w); init = 0.0)
     end
     total = sum(out)
@@ -2244,13 +2243,13 @@ end
 end
 # A tuple or two-axis domain keeps the cell loop.
 @kernel fold_sum_any(ts, w, s) = begin
-    out = plate(ts, Ref(w), Ref(s)) do t, w, s
+    out = plate(ts) do t
         sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
     end
     return out
 end
 @kernel fold_sum_exp(ts, w, s) = begin
-    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+    out::Vector{Float64} = plate(ts) do t
         sum(w[j] * exp(-(t - s[j])^2) for j in eachindex(w); init = 0.0)
     end
     return out
@@ -2258,7 +2257,7 @@ end
 # The guarded gather of §4e's traceable spelling: arithmetic, comparisons,
 # `ifelse`, `max` and indexing.
 @kernel fold_sum_guard(ti, w, s, u) = begin
-    out::Vector{Float64} = plate(ti, Ref(w), Ref(s), Ref(u)) do t, w, s, u
+    out::Vector{Float64} = plate(ti) do t
         sum(ifelse(t - s[j] > 0, u[max(t - s[j], 1)] * w[j], 0.0) for j in eachindex(w); init = 0.0)
     end
     return out
@@ -2267,28 +2266,28 @@ end
 # first element, and a range that reads the cell is not shared by every cell:
 # both keep the cell loop.
 @kernel fold_sum_int_seed(ts, w, s) = begin
-    out = plate(ts, Ref(w), Ref(s)) do t, w, s
+    out = plate(ts) do t
         sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0)
     end
     return out
 end
 @kernel fold_sum_cell_range(ts, w, s) = begin
-    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+    out::Vector{Float64} = plate(ts) do t
         sum(w[j] / (t + s[j]) for j in 1:min(round(Int, t), length(w)); init = 0.0)
     end
     return out
 end
 @kernel fold_sum_range(n, w, s) = begin
-    out::Vector{Float64} = plate(1:n, Ref(w), Ref(s)) do k, w, s
+    out::Vector{Float64} = plate(1:n) do k
         sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
     end
     return out
 end
 # An arithmetic sum in a plain scan step is a fold the strip region runs.
 @kernel fold_sum_scan(steps, w, s, decay) = begin
-    out = scan(steps, Ref(w), Ref(s), Ref(decay); init = 0.0) do carry, k, w, s, d
+    out = scan(steps; init = 0.0) do carry, k
         r = sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
-        next = muladd(d, carry, r)
+        next = muladd(decay, carry, r)
         (next, next)
     end
     return out

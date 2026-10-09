@@ -73,16 +73,16 @@ lag(t, plan::Lattice, j) = t - plan.shifts[j]
 const fetch = Base.get
 @kernel cell(plan, units::Vector{Float64}, weights::Vector{Float64}) = begin
     observations = domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * get(u, lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, lag(t, plan, j), 0.0) for j in eachindex(weights); init = 0.0)
     end
     objective::Float64 = sum(abs2, concentration)
     return objective
 end
 @kernel control(plan, units::Vector{Float64}, weights::Vector{Float64}) = begin
     observations = domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * fetch(u, lag(t, p, j), 0.0) for j in eachindex(w); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * fetch(units, lag(t, plan, j), 0.0) for j in eachindex(weights); init = 0.0)
     end
     objective::Float64 = sum(abs2, concentration)
     return objective
@@ -121,14 +121,14 @@ module EvalpolyCellAD
 using ReactiveKernels
 horner(x, c) = evalpoly(x, c)
 @kernel cell(xs::Vector{Float64}, c::Vector{Float64}) = begin
-    ys::Vector{Float64} = plate(xs, Ref(c)) do x, c
+    ys::Vector{Float64} = plate(xs) do x
         evalpoly(x, c)
     end
     objective::Float64 = sum(abs2, ys)
     return objective
 end
 @kernel control(xs::Vector{Float64}, c::Vector{Float64}) = begin
-    ys::Vector{Float64} = plate(xs, Ref(c)) do x, c
+    ys::Vector{Float64} = plate(xs) do x
         horner(x, c)
     end
     objective::Float64 = sum(abs2, ys)
@@ -166,11 +166,11 @@ using ReactiveKernels: scan
     xs = plate(steps) do k
         1 / (k + 0.5)
     end
-    sa::Vector{Float64} = plate(xs, Ref(pa)) do x, c
-        evalpoly(x, c)
+    sa::Vector{Float64} = plate(xs) do x
+        evalpoly(x, pa)
     end
-    out::Vector{Float64} = scan(sa, Ref(decay); init = 0.0) do carry, s, d
-        next = muladd(d, carry, s)
+    out::Vector{Float64} = scan(sa; init = 0.0) do carry, s
+        next = muladd(decay, carry, s)
         (next, next)
     end
     objective::Float64 = sum(abs2, out)
@@ -201,10 +201,10 @@ module FissionScanAD
 using ReactiveKernels
 using ReactiveKernels: scan
 @kernel recurrence(steps, pa::Vector{Float64}, decay::Float64) = begin
-    out::Vector{Float64} = scan(steps, Ref(pa), Ref(decay); init = 0.0) do carry, k, pa, d
+    out::Vector{Float64} = scan(steps; init = 0.0) do carry, k
         x = 1 / (k + 0.5)
         s = evalpoly(x, pa)
-        next = muladd(d, carry, s)
+        next = muladd(decay, carry, s)
         (next, next)
     end
     objective::Float64 = sum(abs2, out)
@@ -244,23 +244,23 @@ using ReactiveKernels
 using ReactiveKernels: scan
 divide(a, b) = a / b
 @kernel cell(ts::Vector{Float64}, w::Vector{Float64}, s::Vector{Float64}) = begin
-    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+    out::Vector{Float64} = plate(ts) do t
         sum(w[j] / (t + s[j]) for j in eachindex(w); init = 0.0)
     end
     objective::Float64 = sum(abs2, out)
     return objective
 end
 @kernel control(ts::Vector{Float64}, w::Vector{Float64}, s::Vector{Float64}) = begin
-    out::Vector{Float64} = plate(ts, Ref(w), Ref(s)) do t, w, s
+    out::Vector{Float64} = plate(ts) do t
         sum(divide(w[j], t + s[j]) for j in eachindex(w); init = 0.0)
     end
     objective::Float64 = sum(abs2, out)
     return objective
 end
 @kernel recurrence(steps, w::Vector{Float64}, s::Vector{Float64}, decay::Float64) = begin
-    out::Vector{Float64} = scan(steps, Ref(w), Ref(s), Ref(decay); init = 0.0) do carry, k, w, s, d
+    out::Vector{Float64} = scan(steps; init = 0.0) do carry, k
         r = sum(w[j] / (k + s[j]) for j in eachindex(w); init = 0.0)
-        next = muladd(d, carry, r)
+        next = muladd(decay, carry, r)
         (next, next)
     end
     objective::Float64 = sum(abs2, out)
@@ -319,8 +319,8 @@ module DenseColumnDoseOuterAD
 using ReactiveKernels
 @kernel cell(observations::UnitRange{Int}, shifts::Vector{Int},
              units::AbstractVector{Float64}, weights::Vector{Float64}) = begin
-    response::Vector{Float64} = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
-        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init=0.0)
+    response::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, t - shifts[j], 0.0) for j in eachindex(weights); init=0.0)
     end
     loss::Float64 = sum(abs2, response)
 end

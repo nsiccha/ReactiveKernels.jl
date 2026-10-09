@@ -115,8 +115,8 @@ end
     forcing = plate(data) do x
         abs(sin(x)) + 0.125
     end
-    trajectory = scan(forcing, Ref(position); init=position.initial, include_init=true) do previous, x, p
-        next = (previous - p.offset) * exp(-abs(p.rate) * x) + p.offset
+    trajectory = scan(forcing; init=position.initial, include_init=true) do previous, x
+        next = (previous - position.offset) * exp(-abs(position.rate) * x) + position.offset
         (next, next)
     end
     lowest::Float64 = minimum(trajectory)

@@ -12,7 +12,7 @@ read_column(values, index) = values[index, 1]
     return xs * gain
 end
 @kernel ragged_reader(n, xs, gains) = begin
-    cells = plate(1:n, Ref(n), Ref(xs), Ref(gains)) do i, n, xs, gains
+    cells = plate(1:n) do i
         cell_input = xs[i]
         cell_gain = gains[i]
         ragged_cell(cell_input, cell_gain)
@@ -21,16 +21,16 @@ end
     return result
 end
 @kernel recurrence(xs, gain) = begin
-    updates = scan(xs, Ref(gain); init=0.0) do carry, x, g
-        next = carry + x * g
+    updates = scan(xs; init=0.0) do carry, x
+        next = carry + x * gain
         (next, next)
     end
     return updates
 end
 const alias = recurrence
 @kernel panel(x, gain) = begin
-    totals = plate(eachcol(x), Ref(gain)) do xs, g
-        history = recurrence(xs, g)
+    totals = plate(eachcol(x)) do xs
+        history = recurrence(xs, gain)
         sum(history)
     end
     return totals
@@ -208,8 +208,9 @@ end
         bound, built, data = grouped_case(n)
         original = deepcopy(data)
         @test built.layout.total == n + 2
+        # The subject plate: its domain and the two vectors its cells read.
         subject_plate = only(filter(r -> recipe_kind(r) === :plate &&
-            length(r.inputs) == 4, built.spec.graph.recipes))
+            length(r.inputs) == 3, built.spec.graph.recipes))
         @test length(plate_body(subject_plate).recipes) == 3
         push!(counts, length(built.spec.graph.recipes))
         # The public pre-build diagnostic needs no successfully built spec.

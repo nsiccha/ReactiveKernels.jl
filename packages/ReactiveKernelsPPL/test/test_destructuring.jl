@@ -9,7 +9,7 @@ using Distributions: Normal, logpdf
 module Models
 using ReactiveKernels, ReactiveKernelsPPL
 @kernel moments(x, g) = begin
-    scaled = plate(x, Ref(g)) do xi, g
+    scaled = plate(x) do xi
         return xi * g
     end
     path = scan(scaled; init=0.0) do carry, s

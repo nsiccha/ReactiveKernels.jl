@@ -198,8 +198,8 @@ end
     result = OtherConcat.hcat(a, b)
 end
 @kernel cell_vcat(x, c) = begin
-    pointwise = plate(x, Ref(c)) do xi, cc
-        sum(vcat(cc, [2xi]))
+    pointwise = plate(x) do xi
+        sum(vcat(c, [2xi]))
     end
     total = sum(pointwise)
 end

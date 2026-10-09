@@ -52,8 +52,8 @@ end
     mu = plate(x) do a
         a^2
     end
-    pointwise = plate(y, Ref(mu)) do a, b
-        a + sum(b)
+    pointwise = plate(y) do a
+        a + sum(mu)
     end
     total = sum(pointwise)
     return total

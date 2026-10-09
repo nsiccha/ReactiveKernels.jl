@@ -75,9 +75,8 @@ using LogExpFunctions: logistic, log1pexp
     T::Int = length(y)
     y_lag::Vector{Float64} = y[1:(T - 1)]                 # y_{t−1}, in-graph shape prep
     sigma_tail::Vector{Float64} =
-        scan(y_lag, Ref(mu), Ref(alpha0), Ref(alpha1), Ref(beta1);
-             init = sigma1) do sprev, yprev, m, a0, a1, b1
-            st = sqrt(a0 + a1 * (yprev - m)^2 + b1 * sprev^2)
+        scan(y_lag; init = sigma1) do sprev, yprev
+            st = sqrt(alpha0 + alpha1 * (yprev - mu)^2 + beta1 * sprev^2)
             (st, st)
         end
     sigma::Vector{Float64} = vcat(sigma1, sigma_tail)      # σ₁ .. σ_T

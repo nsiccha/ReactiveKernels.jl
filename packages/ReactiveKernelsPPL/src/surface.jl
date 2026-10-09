@@ -4433,16 +4433,16 @@ function _mv_slice_len(obj)
     return nothing
 end
 
-# The RK plate an array-cell plate column runs: `plate(lanes...,
-# Ref(shared)...) do lane..., shared...; cell; end`, one cell per index.
+# The RK plate an array-cell plate column runs: `plate(lanes...) do
+# lane...; cell; end`, one cell per index.
 # Lanes are the per-index inputs: a data column read at the loop index
 # (`x[i]`), or the level codes of a column that indexes an array's levels
 # axis (`sd[s[i], :]`, `z[g[i], :]`, a per-level factor `L[s[i]]` —
 # `_ppl_codes(s, h)`, the codes of `s` on `levels(h)`). Level cells align
 # selected or different declared axes through `_ppl_level_gather` inputs.
-# Every other name
-# the cell reads (arrays, parameters, definitions) is passed whole with
-# `Ref`. Inside the cell those reads are ordinary integer indexing
+# The cell reads
+# every other name (arrays, parameters, definitions) whole, by closing over
+# it. Inside the cell those reads are ordinary integer indexing
 # (`sd[c, :]`, `L[:, :, c]`); RK generates the loop.
 function _plate_column_expr(nm::Symbol, call::Expr,
         dims::Dict{Symbol,Vector{Any}}, data::Set{Symbol})
@@ -4547,21 +4547,48 @@ function _plate_column_expr(nm::Symbol, call::Expr,
     outx = rw(out)
     isempty(lanevars) && _sfail("$where reads no per-index input " *
         "(`x[$ivar]`, `z[g[$ivar], :]`): it does not vary with $ivar")
-    locals = Set{Symbol}(a.args[1] for a in stmts
-        if a isa Expr && a.head === :(=) && a.args[1] isa Symbol)
-    free = Set{Symbol}()
-    foreach(a -> _cell_free_syms!(free, a), stmts)
-    _cell_free_syms!(free, outx)
-    setdiff!(free, locals)
-    setdiff!(free, Set(lanevars))
-    ivar in free && _sfail("$where reads the loop index $ivar other than " *
-        "through a data column (`x[$ivar]`) or a levels gather " *
-        "(`z[g[$ivar], :]`)")
-    shared = sort!(collect(free))
-    append!(inputs, (Expr(:call, :Ref, get(sharedsources, nm2, nm2)) for nm2 in shared))
-    lam = Expr(:->, Expr(:tuple, lanevars..., shared...),
-        Expr(:block, LineNumberNode(0, :rkppl_plate), stmts..., outx))
+    ivar in _plate_cell_captures(stmts, outx, lanevars) && _sfail("$where " *
+        "reads the loop index $ivar other than through a data column " *
+        "(`x[$ivar]`) or a levels gather (`z[g[$ivar], :]`)")
+    # A shared source is a cell statement over shared names only, which RK
+    # evaluates once, outside the loop.
+    sources = Any[Expr(:(=), nm2, sharedsources[nm2])
+        for nm2 in sort!(collect(keys(sharedsources)))]
+    lam = Expr(:->, Expr(:tuple, lanevars...),
+        Expr(:block, LineNumberNode(0, :rkppl_plate), sources..., stmts..., outx))
     return Expr(:do, Expr(:call, :plate, inputs...), lam)
+end
+
+# The names an array plate cell reads from the model: what its statements
+# and result read, less its lanes and the locals it assigns (also under a
+# presence guard's `if`). RK passes each one to the cell whole, as a Julia
+# closure captures it.
+function _plate_cell_captures(stmts, out, lanes)
+    free, locals = Set{Symbol}(), Set{Symbol}()
+    for a in (stmts..., out)
+        _cell_free_syms!(free, a)
+        _cell_locals!(locals, a)
+    end
+    return setdiff!(setdiff!(free, locals), lanes)
+end
+_cell_locals!(out, ex) = out
+function _cell_locals!(out, ex::Expr)
+    ex.head === :(=) && ex.args[1] isa Symbol && push!(out, ex.args[1])
+    for a in ex.args
+        # `(name = value,)` stores a NamedTuple key, not a local.
+        ex.head in (:tuple, :parameters) && Meta.isexpr(a, :(=), 2) && (a = a.args[2])
+        _cell_locals!(out, a)
+    end
+    return out
+end
+
+# The captures of an array plate column `plate(lanes...) do lanes...; cell; end`.
+function _plate_column_captures(ex::Expr)
+    lam = ex.args[2]
+    params = lam.args[1]
+    lanes = Meta.isexpr(params, :tuple) ? params.args : Any[params]
+    body = Any[a for a in lam.args[2].args if !(a isa LineNumberNode)]
+    return _plate_cell_captures(body[1:end-1], body[end], lanes)
 end
 
 _literal_range_len(r) = (r isa Expr && r.head === :call && length(r.args) == 3 &&

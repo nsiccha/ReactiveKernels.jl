@@ -52,9 +52,9 @@ end
 
 @kernel pair_grid(x, scale) = begin
     left, right = pair_locations(x)
-    result = plate(left, right, Ref(scale)) do a, b, s
+    result = plate(left, right) do a, b
         distance = abs(a - b)
-        s * exp(-distance)
+        scale * exp(-distance)
     end
     return result
 end

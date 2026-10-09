@@ -4,8 +4,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: gamma
 
 pack_lanes(lanes) = vec(stack(lanes))
 @kernel weighted_columns(q, X, weights) = begin
-    lanes = plate(eachcol(X), Ref(q)) do xs, p
-        p[1] .* xs
+    lanes = plate(eachcol(X)) do xs
+        q[1] .* xs
     end
     packed = pack_lanes(lanes)
     total = sum(packed .* weights)
@@ -184,7 +184,7 @@ end
 for (name, location) in ((:gathered_groups, :gathered_location),
                          (:stepped_groups, :stepped_location))
     @eval @kernel $name(q::Vector{Float64}, groups::Int, times, idxs, ys) = begin
-        cells = plate(1:groups, Ref(q), Ref(times), Ref(idxs), Ref(ys)) do g, q, times, idxs, ys
+        cells = plate(1:groups) do g
             location = $location(q[g], q[groups + g], exp(q[2groups + g]),
                                  times[g], idxs[g])
             sum(-0.5 .* (ys[g] .- location) .^ 2)
@@ -304,7 +304,7 @@ struct AliasedSubject
     xs::Vector{Float64}
 end
 @kernel identity_cells(groups, rates) = begin
-    per = plate(groups, Ref(rates)) do g, rates
+    per = plate(groups) do g
         identity(g)
     end
     flat = convert(Vector{Float64}, reduce(vcat, per; init = Float64[]))
