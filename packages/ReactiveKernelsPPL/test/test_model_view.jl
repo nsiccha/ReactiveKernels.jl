@@ -87,8 +87,12 @@ _has_linenumber(x) = x isa LineNumberNode ||
     @testset "pre-build source and prepared query when supplied" begin
         view = model_view(built; bound, query)
         source = string(view.source)
+        # A global prints by its bare name; the comment names its module.
         @test startswith(source, "# authored sources evaluated in: " *
-                         "ReactiveKernelsPPL.PPLGeneratedModels\n@kernel ppl_model(" )
+                         "ReactiveKernelsPPL.PPLGeneratedModels, ReactiveKernelsPPL\n" *
+                         "@kernel ppl_model(" )
+        @test occursin(" = _ppl_range_values(", source)
+        @test !occursin("ReactiveKernelsPPL._ppl_range_values", source)
         @test occursin(") = begin\n    a::Float64 = ", source)
         @test endswith(source, "\nend")
         @test !occursin("#=", source)
