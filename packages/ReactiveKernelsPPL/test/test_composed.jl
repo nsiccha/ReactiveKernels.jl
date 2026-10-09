@@ -386,9 +386,9 @@ _cmp_ap_want(q) = _cmp_ap_loglik(q.a .* _cmp_ap_x(), q.s1, q.s2) +
         Expr(:tuple, :s1, :(mu .* s2)))
     @test isempty(plan.derived)
     @test isempty(plan.population_priors)
-    # The scale reads the location's LP node; nothing re-evaluates it.
+    # The scale reads the location's node; nothing re-evaluates it.
     src = string(kernel_expr(bound, built.layout))
-    @test occursin("_ppl_lp_sd = Main.hypot.(s1, _ppl_lp_mu .* s2)", src)
+    @test occursin(r"\bsd = Main\.hypot\.\(s1, mu \.\* s2\)", src)
     # A built-in map with literal exponents, and a named intermediate
     # (naming never changes legality): the same density.
     _cmp_ap_check(quote

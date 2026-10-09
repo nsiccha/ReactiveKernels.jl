@@ -36,6 +36,7 @@ const _PPL_TEST_FILES = (
     "test_distributional_broadcasts_reactant.jl",
     "test_query.jl",
     "test_model_view.jl",
+    "test_emitted_names.jl",
     "test_native_generator_capture.jl",
     "test_concurrent_build.jl",
     "test_fresh_module.jl",
@@ -246,6 +247,7 @@ const _PPL_TEST_FILES = (
     "test_sweep_failclosed.jl",
     "test_functions_as_values.jl",
     "test_kernel_composition.jl",
+    "test_destructuring.jl",
     "test_completed_covariate_kernel.jl",
     "test_bound_reader_index_cache.jl",
     "test_kernel_composition_reactant.jl",
@@ -256,6 +258,7 @@ const _PPL_TEST_FILES = (
     "test_array_definition_gathers.jl",
     "test_array_definition_gathers_reactant.jl",
     "test_whole_value_gathers.jl",
+    "test_inline_gathered_values.jl",
     "test_plate_cells.jl",
     "test_array_cell_rows.jl",
     "test_array_cell_rows_reactant.jl",
@@ -267,9 +270,11 @@ const _PPL_TEST_FILES = (
     "test_index_endpoints.jl",
     "test_base_value_names.jl",
     "test_rebinding_rows.jl",
+    "test_sampler_retained.jl",
     "test_shared_value_closures.jl",
     "test_inline_call_values.jl",
     "test_inline_scalar_reads.jl",
+    "test_authored_names.jl",
 )
 
 include("sharding.jl")

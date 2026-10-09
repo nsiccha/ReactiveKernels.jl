@@ -329,7 +329,7 @@ end
             q.sigma) + logpdf(Normal(0, 5), q.a) +
             logpdf(Normal(0, 1 / sqrt(sum(abs2, x .- sum(x) / length(x)) /
                 (length(x) - 1))), q.b) + logpdf(Exponential(1), q.sigma))
-        @test only(p for p in plan.parameters if p.name === :b).args.arg2 === :_rkppl_b_arg2
+        @test only(p for p in plan.parameters if p.name === :b).args.arg2 === :b_scale
         @test only(plan.assignments).expr == :(1 / sqrt(var(x)))
         # Literal arithmetic folds to a literal.
         lit = lower_rkppl(quote

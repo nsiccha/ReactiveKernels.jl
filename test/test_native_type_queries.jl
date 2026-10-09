@@ -80,7 +80,8 @@ end
 count_head(ex, head) = ex isa Expr ? Int(ex.head === head) +
     sum(x -> count_head(x, head), ex.args; init=0) : 0
 count_query(ex) = ex isa Expr ?
-    Int(ex.head === :call && ex.args[1] == GlobalRef(Base, :promote_op)) +
+    Int(ex.head === :call &&
+        ex.args[1] == GlobalRef(ReactiveKernels, :_promote_op)) +
     sum(count_query, ex.args; init=0) : 0
 end
 

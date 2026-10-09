@@ -60,7 +60,7 @@ The `@kernel` definition expression (`Expr(:(=), signature, body)`).
 Pure (no eval): the generator tests inspect and evaluate it.
 """
 kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model) =
-    Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+    _name_plate_cells(Base.invokelatest(_kernel_expr_latest, plan, layout; name))
 
 function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
     validate_plan(plan)
@@ -90,14 +90,43 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     append!(stmts, conditioned)
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, values)
+    args = Expr[:(unconstrained::Vector{Float64});
+        [_data_arg(colname, col) for (colname, col) in _ordered_columns(plan)]]
+    append!(stmts, _named_value_statements(plan,
+        Expr[args..., transforms..., coefs..., conditioned..., values...]))
     append!(stmts, likelihoods)
     append!(stmts, priors)
     push!(stmts, _log_jacobian_statement(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
-    sig = Expr(:call, name, :(unconstrained::Vector{Float64}),
-        (_data_arg(colname, col) for (colname, col) in _ordered_columns(plan))...)
+    sig = Expr(:call, name, args...)
     return Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# An authored alias the lowering absorbed into the value it names keeps its
+# name (`plan.named_values`): a bare alias of that node. With the node's
+# declared type, RK collapses the alias onto it, so it adds no recipe and no
+# work. `defined` holds the kernel arguments and the statements the aliases
+# may read.
+function _named_value_statements(plan::StructuralPlan, defined::Vector{Expr})
+    isempty(plan.named_values) && return Expr[]
+    types = Dict{Symbol,Any}()
+    for ex in defined
+        lhs = Meta.isexpr(ex, :(=), 2) ? ex.args[1] : ex
+        Meta.isexpr(lhs, :(::), 2) ? (types[lhs.args[1]] = lhs.args[2]) :
+            lhs isa Symbol && (types[lhs] = nothing)
+    end
+    out = Expr[]
+    for (name, node) in plan.named_values
+        haskey(types, name) && throw(ContractValidationError(
+            "[generator] authored name $name is already a graph value"))
+        haskey(types, node) || throw(ContractValidationError(
+            "[generator] authored name $name reads $node, which no statement defines"))
+        T = types[node]
+        push!(out, T === nothing ? :($name = $node) : :($name::$T = $node))
+        types[name] = T
+    end
+    return out
 end
 
 # A generated definition with its private names (`gensym`s, which differ
@@ -329,21 +358,94 @@ function _assignment_statements(plan::StructuralPlan;
     # evaluated once and arrive as data arguments; the kernel never recomputes them.
     computed = _bound_module_data_names(plan)
     dataonly = Set{Symbol}(keys(plan.columns))
-    stmts = Expr[]
+    order = Symbol[]
+    rewritten = Dict{Symbol,Any}()
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
         ex = _guard_missing_observation_argument(name, by_name[name].expr, plan, plan.columns)
         ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
             (ex = _concrete_guarded_argument(ex))
-        ex = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
+        push!(order, name)
+        rewritten[name] = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
+    end
+    destructured = _destructuring_statements(order, rewritten)
+    stmts = Expr[]
+    for name in order
+        targets, ex = get(destructured, name, ((name,), rewritten[name]))
+        isempty(targets) && continue
         if _expr_value_symbols(ex) ⊆ dataonly
-            push!(dataonly, name)
+            union!(dataonly, targets)
         else
             ex = _split_data_calls!(stmts, name, ex, dataonly)
         end
-        push!(stmts, :($(name) = $(ex)))
+        lhs = length(targets) == 1 && targets[1] === name ? name : Expr(:tuple, targets...)
+        push!(stmts, :($(lhs) = $(ex)))
     end
     return stmts
+end
+
+# Destructuring `(a, b) = rhs` reaches the plan as one element read per name
+# (`_desugar_destructuring`). Emit the reads of one `rhs` as Julia's single
+# statement, at the first read's place in the topological order (every read
+# has the same dependencies), so `rhs` runs once per evaluation. A
+# function-shaped `KernelSpec` with several WANT ports is destructured at
+# that whole boundary, which RK splices into the generated graph; a
+# single-output `KernelSpec` returns its one value, so its element reads stay
+# ordinary reads of that value. An element bound as data at bind takes a
+# private name. Returns `name => (targets, rhs)`; the other reads of a
+# reassembled statement map to `(), nothing`.
+function _destructuring_statements(order::Vector{Symbol}, rewritten::Dict{Symbol,Any})
+    groups = Dict{Any,Vector{Dict{Int,Symbol}}}()
+    leaders = Dict{Symbol,Dict{Int,Symbol}}()
+    for name in order
+        read = _destructured_read(rewritten[name])
+        read === nothing && continue
+        rhs, i = read
+        rhs isa Expr && rhs.head === :call || continue
+        candidates = get!(() -> Dict{Int,Symbol}[], groups, rhs)
+        k = findfirst(g -> !haskey(g, i), candidates)
+        if k === nothing
+            push!(candidates, Dict{Int,Symbol}())
+            k = length(candidates)
+            leaders[name] = candidates[k]
+        end
+        candidates[k][i] = name
+    end
+    out = Dict{Symbol,Tuple{Tuple,Any}}()
+    for (leader, members) in leaders
+        rhs, _ = _destructured_read(rewritten[leader])
+        width = _destructured_width(rhs, maximum(keys(members)))
+        width === nothing && continue
+        targets = Tuple(get(members, i, Symbol(:_rkppl_, leader, :_unused_, i))
+            for i in 1:width)
+        out[leader] = (targets, rhs)
+        for name in values(members)
+            name === leader || (out[name] = ((), nothing))
+        end
+    end
+    return out
+end
+
+# How many names a reassembled destructuring statement binds, or `nothing`
+# to keep its element reads: a multi-output `KernelSpec` binds its whole WANT
+# boundary (more reads than ports keep Julia's `BoundsError` at the read); any
+# other call binds up to its last read, when that is past the first.
+function _destructured_width(rhs::Expr, last::Int)
+    spec = _called_kernel_spec(rhs)
+    if spec !== nothing
+        any(a -> Meta.isexpr(a, (:parameters, :kw, Symbol("..."))), rhs.args[2:end]) &&
+            return nothing
+        width = length(ReactiveKernels.outputs(spec))
+        return width > 1 && last <= width ? width : nothing
+    end
+    return last > 1 ? last : nothing
+end
+
+function _called_kernel_spec(rhs::Expr)
+    head = rhs.args[1]
+    head isa GlobalRef && isdefined(head.mod, head.name) || return nothing
+    value = getglobal(head.mod, head.name)
+    return value isa KernelSpec ? value : nothing
 end
 
 # The generated scope's `logistic` names a distribution kernel. Values
@@ -394,14 +496,15 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
     return walk(ex)
 end
 
-_lp_name(pred::PredictorSpec) = Symbol(:_ppl_lp_, pred.name)
-
+# Each predictor's value is the graph node named after the predictor: the
+# authored definition it lowers (`mu = a .+ b .* x` emits `mu`), or the
+# fresh name the lowering gave an inline one (`y_eta`).
 function _predictor_statements(plan::StructuralPlan)
     stmts = Expr[]
     for pred in plan.predictors
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
-        lp = _lp_name(pred)
+        lp = pred.name
         terms = Any[]
         if _broadcast_affine(plan, pred)
             append!(terms, _affine_block_terms(plan, shape; broadcast = true))
@@ -515,21 +618,17 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
     if _is_plate_column_expr(node)
         original = node
         node = _guard_missing_observation_argument(pred, node, plan, plan.columns)
-        aliases = Dict{Symbol,Symbol}(s => _lp_name(_predictor(plan, s)) for s in subs)
-        inputs = [_hsubst(a, aliases) for a in node.args[1].args[2:end]]
-        # The cell reads a shared sub-predictor by closing over it.
-        captured = filter(p -> first(p) in _plate_column_captures(node), aliases)
-        value = Expr(:do, Expr(:call, :plate, inputs...), _hsubst(node.args[2], captured))
+        value = Expr(:do, Expr(:call, :plate, node.args[1].args[2:end]...),
+            node.args[2])
         return node !== original && _guarded_argument_is_bound(node, plan.columns) ?
             _concrete_guarded_argument(value) : value
     end
     if node isa Symbol
         node in subs || return node
-        i = findfirst(p -> p.name === node, plan.predictors)
-        i === nothing && throw(ContractValidationError(
+        any(p -> p.name === node, plan.predictors) || throw(ContractValidationError(
             "[generator] composed term in predictor $pred addresses " *
             "unknown sub-predictor $node"))
-        return _lp_name(plan.predictors[i])
+        return node
     end
     # Dotted map `f.(x, ...)`: `Expr(:., f, Expr(:tuple, x, ...))`, the
     # map renamed to its generated-module math binding.
@@ -700,13 +799,13 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
             push!(terms, Symbol(:_ppl_prior_, p.name))
         else
             _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
-                p.support_override; conditioned = true, rows = _plate_rows(plan, p))
+                p.support_override; conditioned = true, rows = _plate_rows(plan, p),
+                float64_inputs = _float64_inputs(plan, values(p.args)))
         end
         push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
     _array_prior_stmts!(stmts, terms, observed, gathers; context = plan, pointwise = points)
-    joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
-    push!(stmts, :(likelihood::Float64 = $joint))
+    push!(stmts, :(likelihood::Float64 = $(_sum_terms(terms))))
     names = first.(points)
     length(unique(names)) == length(names) || throw(ContractValidationError(
         "[query] pointwise observation names must be unique, got $names"))
@@ -731,7 +830,7 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     # The response's predictor nodes lie on its observation axis, here the
     # indices.
     return _cell_broadcast_group(plan, r.response, _lik_name(r.label), _pw_name(r.label),
-        stmts, upstream, [_lp_name(p) for p in plan.predictors],
+        stmts, upstream, [p.name for p in plan.predictors],
         "response $(r.label) observes one array per index, and its $(r.family) statements")
 end
 
@@ -758,8 +857,7 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     defined = Set{Symbol}(something.(_assigned_name.(body), :_))
     known = Set{Symbol}(keys(plan.columns))
     for st in upstream
-        name = _assigned_name(st)
-        name === nothing || push!(known, name)
+        union!(known, _assigned_names(st))
     end
     reads = Set{Symbol}()
     foreach(st -> _statement_value_reads!(reads,
@@ -770,10 +868,10 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     # from them.
     pergroup = Set{Symbol}([response; plan.cell_broadcasts[response]; axisnodes])
     for st in upstream
-        name = _assigned_name(st)
-        name === nothing && continue
+        names = _assigned_names(st)
+        isempty(names) && continue
         used = _statement_value_reads!(Set{Symbol}(), st.args[2])
-        isempty(intersect(used, pergroup)) || push!(pergroup, name)
+        isempty(intersect(used, pergroup)) || union!(pergroup, names)
     end
     # The plate zips the per-index values; the cell reads every other input
     # whole by closing over it.
@@ -848,6 +946,15 @@ function _assigned_name(st::Expr)
     return lhs isa Symbol ? lhs : nothing
 end
 
+# Every name a statement binds, including each name of a destructuring
+# statement (`(a, b) = f(x)`).
+function _assigned_names(st)
+    Meta.isexpr(st, :(=), 2) && Meta.isexpr(st.args[1], :tuple) &&
+        return Symbol[t for t in st.args[1].args if t isa Symbol]
+    name = _assigned_name(st)
+    return name === nothing ? Symbol[] : Symbol[name]
+end
+
 # Value names a generated statement reads: call heads and keyword names are
 # skipped. A plate cell or scan step reads the enclosing names it closes
 # over (`_closure_reads`).
@@ -920,7 +1027,7 @@ _ppl_range_values(x::AbstractArray, indices) = x[indices]
 # (`_selected_plate_indices`); only whole operands are gathered at the
 # authored indices. Positions and indices differ for a literal `a:b`.
 function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
-    i = findfirst(p -> _lp_name(p) === value, plan.predictors)
+    i = findfirst(p -> p.name === value, plan.predictors)
     i === nothing && return false
     p = plan.predictors[i]
     p.link === IdentityLink && length(p.terms) == 1 &&
@@ -944,18 +1051,16 @@ function _ranged_response_stmts(r, plan, stmts)
         # Select ordinary row values before family-specific conversions or
         # ordinal stage expansion. Simplexes and covariance factors stay whole.
         if r.family ∉ (CategoricalFam, MultinomialFam)
-            push!(rows, _is_bare_param_location(r, plan) ? r.predictor :
-                _location_node(r, plan))
-            foreach(p -> push!(rows, _lp_name(_predictor(plan, p))), r.extra_predictors)
+            push!(rows, _location_node(r, plan))
+            union!(rows, r.extra_predictors)
         end
         for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
                 r.evidence.lower, r.evidence.upper, r.threshold_columns...,
                 r.count_columns..., r.extra_responses...)
             if slot isa ScalePredictorRef
-                push!(rows, _lp_name(_predictor(plan, slot.predictor)))
+                push!(rows, slot.predictor)
             elseif slot isa Symbol
-                pred = findfirst(p -> p.name === slot, plan.predictors)
-                push!(rows, pred === nothing ? slot : _lp_name(plan.predictors[pred]))
+                push!(rows, slot)
             end
         end
         for (i, value) in enumerate(sort!(collect(rows)))
@@ -1097,10 +1202,9 @@ function _mi_stopping_response_stmts(r, plan, stmts)
     for ref in (r.weights, r.discrimination, r.evidence.lower, r.evidence.upper,
             r.threshold_columns...)
         if ref isa ScalePredictorRef
-            push!(rows, _lp_name(_predictor(plan, ref.predictor)))
+            push!(rows, ref.predictor)
         elseif ref isa Symbol
-            pred = findfirst(p -> p.name === ref, plan.predictors)
-            push!(rows, pred === nothing ? ref : _lp_name(plan.predictors[pred]))
+            push!(rows, ref)
         end
     end
     for ref in sort!(collect(rows))
@@ -1334,7 +1438,7 @@ function _shared_mixture_guard(valid, inputs, plan, pre)
         input isa Symbol || return nothing
         scalar = any(p -> p.name === input, plan.parameters) ||
             get(plan.columns, input, nothing) isa Number ||
-            any(p -> _lp_name(p) === input &&
+            any(p -> p.name === input &&
                 _predictor_value_type(plan, p) === :Number, plan.predictors) ||
             any(pre) do st
                 st.head === :(=) && st.args[1] isa Expr &&
@@ -1355,10 +1459,7 @@ end
 function _mixture_loc_ref(r::LikelihoodSpec, plan::StructuralPlan, k::Int)
     loc = r.mixture_locs[k]
     loc isa Real && return Float64(loc), false
-    if any(p -> p.name === loc, plan.predictors)
-        return _lp_name(_predictor(plan, loc)), true
-    end
-    return loc, false
+    return loc, any(p -> p.name === loc, plan.predictors)
 end
 
 # One mixture component's scalar log-density: the single-family endpoint
@@ -1472,12 +1573,9 @@ _is_latent_location(r::LikelihoodSpec, plan::StructuralPlan) =
     any(s -> r.predictor in s.states, plan.scans) || _is_plate_param(plan, r.predictor)
 
 # The per-observation location node feeding a response's likelihood plate: a
-# latent vector fed directly (its own name — the layout view), or a linear
-# predictor's `_ppl_lp_<name>` node otherwise.
-function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
-    _is_latent_location(r, plan) && return r.predictor
-    return _lp_name(_predictor(plan, r.predictor))
-end
+# latent vector fed directly (its own name — the layout view), or the
+# predictor's node, which carries the predictor's name.
+_location_node(r::LikelihoodSpec, plan::StructuralPlan) = r.predictor
 
 # The value shape of a response's location (see `_predictor_value_type`).
 _location_value_type(r::LikelihoodSpec, plan::StructuralPlan) =
@@ -1532,6 +1630,76 @@ end
 _dovar(i::Int) = Symbol(:_ppl_c, i)
 _pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
 
+# A plate cell's arguments are named after the values the plate iterates,
+# as a broadcast reads them: `y .~ Normal.(loc, s)` observes
+# `plate(y, loc, s) do y, loc, s ... normal(loc, s).logpdf(y) ... end`.
+# Emitters number the arguments (`_dovar`); `kernel_expr` names them here,
+# once. An emitter may name an argument over a value it generated by the
+# role it fills instead (`_plate_sum_stmts`' `names`: a prior's
+# `normal(location, scale)`). An argument may shadow the array it iterates;
+# a name the cell body already spells (a function, a captured value, a
+# nested cell's argument) takes the first free `name_k` instead. An argument
+# over an unnamed input (`view(...)`, a literal) keeps its number.
+_is_dovar(x) = x isa Symbol && match(r"^_ppl_c\d+$", String(x)) !== nothing
+_cell_argument_name(input::Symbol) = something(_array_flat_source(input), input)
+_cell_argument_name(input::Expr) =
+    Meta.isexpr(input, :call, 2) && input.args[1] === :Ref ?
+        _cell_argument_name(input.args[2]) : nothing
+_cell_argument_name(input) = nothing
+
+_is_plate_do(ex) = Meta.isexpr(ex, :do, 2) && Meta.isexpr(ex.args[1], :call) &&
+    ex.args[1].args[1] === :plate && Meta.isexpr(ex.args[2], :->) &&
+    Meta.isexpr(ex.args[2].args[1], :tuple)
+
+_name_plate_cells(x) = x
+function _name_plate_cells(ex::Expr)
+    ex = Expr(ex.head, Any[_name_plate_cells(a) for a in ex.args]...)
+    _is_plate_do(ex) || return ex
+    return _name_plate_cell(ex, (p, input) -> _cell_argument_name(input))
+end
+
+# Name the numbered arguments of one `plate(...) do` cell: `choose(p, input)`
+# gives the name for argument `p` over `input`, or `nothing` to keep it.
+function _name_plate_cell(ex::Expr, choose)
+    call, (params, body) = ex.args[1], ex.args[2].args
+    inputs = call.args[2:end]
+    length(params.args) == length(inputs) || return ex
+    used = union!(setdiff!(_all_symbols!(Set{Symbol}(), body), params.args),
+        filter(!_is_dovar, params.args))
+    names = Dict{Symbol,Symbol}()
+    for (p, input) in zip(params.args, inputs)
+        _is_dovar(p) || continue
+        base = choose(p, input)
+        base === nothing && continue
+        nm, k = base, 1
+        while nm in used
+            k += 1
+            nm = Symbol(base, :_, k)
+        end
+        push!(used, nm)
+        names[p] = nm
+    end
+    isempty(names) && return ex
+    named = Expr(:tuple, Any[get(names, p, p) for p in params.args]...)
+    return Expr(:do, call, Expr(:->, named, _rename_cell_arguments(body, names)))
+end
+
+# Rename cell arguments in a cell body; a nested cell that rebinds a name
+# keeps its own argument.
+_rename_cell_arguments(x::Symbol, names) = get(names, x, x)
+_rename_cell_arguments(x, names) = x
+function _rename_cell_arguments(ex::Expr, names)
+    if ex.head === :->
+        params = Meta.isexpr(ex.args[1], :tuple) ? ex.args[1].args : Any[ex.args[1]]
+        inner = filter(kv -> !(first(kv) in params), names)
+        return Expr(:->, ex.args[1], _rename_cell_arguments(ex.args[2], inner))
+    end
+    return Expr(ex.head, Any[_rename_cell_arguments(a, names) for a in ex.args]...)
+end
+
+# The sum of density terms as written, `a + b + c`; no terms is `0.0`.
+_sum_terms(terms) = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
+
 # `pointwise = plate(inputs...) do dovars...; cell; end` + scalar sum node.
 # A plate must be a whole recipe RHS (never nested under `sum`), and the
 # do-block body carries a LineNumberNode or the cell types as Any. Response
@@ -1539,8 +1707,9 @@ _pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
 # builder marks a value every cell shares as a `Ref(value)` input; the cell
 # reads it whole by closing over it (`_plate_closure`).
 function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any},
-        cell::Union{Expr,Vector{Expr}})
+        cell::Union{Expr,Vector{Expr}}; names = Dict{Symbol,Symbol}())
     doex = _plate_closure(inputs, cell isa Expr ? Expr[cell] : cell)
+    isempty(names) || (doex = _name_plate_cell(doex, (p, _) -> get(names, p, nothing)))
     return Expr[:($pointwise = $doex), :($node::Float64 = sum($pointwise))]
 end
 
@@ -2130,8 +2299,7 @@ function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
     inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
-    pref = _thread_ref!(inputs, any(p -> p.name === r.predictor, plan.predictors) ?
-        _lp_name(_predictor(plan, r.predictor)) : r.predictor)
+    pref = _thread_ref!(inputs, r.predictor)
     cell = :(binomial($nref, $pref).logpdf($yv))
     cell = _wrap_evidence!(r, plan, pre, inputs, cell)
     if r.weights !== nothing
@@ -2167,7 +2335,7 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
-# Mean/rate vectors are precomputed statements (like `_ppl_lp_*`): plate
+# Mean/rate vectors are precomputed statements (like predictor nodes): plate
 # cells take plain do-vars — a computed `exp` constructor arg miscompiles
 # the Enzyme pullback (NB2 eta-gradient, found by test).
 _mu_name(label::Symbol) = Symbol(:_ppl_mu_, label)
@@ -2293,7 +2461,7 @@ function _scale_use_plate_arg(r::LikelihoodSpec, plan::StructuralPlan,
         pre::Vector{Expr}, s, label::Symbol)
     s isa ScalePredictorRef || return s
     pred = _predictor(plan, s.predictor)
-    lp = _lp_name(pred)
+    lp = pred.name
     sc = _sc_name(label)
     rhs = _inverse_link_expr(s.link, lp)
     # The annotation is load-bearing for AD, not decoration: it proves the
@@ -2528,8 +2696,7 @@ end
 function _categorical_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     pre = Expr[]
     preds = [r.predictor; r.extra_predictors...]
-    lps = [_lp_name(_predictor(plan, q)) for q in preds]
-    inputs = Any[r.response, lps...]
+    inputs = Any[r.response, preds...]
     yv = _dovar(1)
     etas = [_dovar(i) for i in 2:length(inputs)]
     K = length(preds) + 1
@@ -2627,7 +2794,7 @@ end
 function _disc_pre!(prests::Vector{Expr}, r::LikelihoodSpec,
         plan::StructuralPlan, sname::Symbol)
     pred = _predictor(plan, sname)
-    lp = _lp_name(pred)
+    lp = pred.name
     name = _disc_name(r.label)
     typ = _predictor_value_type(plan, pred)
     push!(prests, :($name::$typ = $(_inverse_link_expr(pred.link, lp))))
@@ -2928,8 +3095,7 @@ function _mvn_cholesky_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         corr = ap === nothing ? _rl_name(cr.name, i, j) : :($(cr.name)[$i, $j])
         push!(stmts, :($(_mvn_L_entry(r.label, i, j))::Float64 = $scale * $corr))
     end
-    lps = [_lp_name(_predictor(plan, q)) for q in preds]
-    inputs = Any[outcomes...; lps...]
+    inputs = Any[outcomes...; preds...]
     yvs = [_dovar(i) for i in 1:K]
     mvs = [_dovar(K + i) for i in 1:K]
     Ld = Dict{Tuple{Int,Int},Symbol}()
@@ -2961,8 +3127,8 @@ function _mvn_row_cell(K::Int, yvs::Vector{Symbol}, mvs::Vector{Symbol},
         end
         push!(zs, :( ($num) / $(Ld[(i, i)]) ))
     end
-    quad = foldl((a, z) -> :( $a + $z * $z ), zs; init = :(0.0))
-    logdet = foldl((a, i) -> :( $a + log($(Ld[(i, i)])) ), 1:K; init = :(0.0))
+    quad = _sum_terms([:($z * $z) for z in zs])
+    logdet = _sum_terms([:(log($(Ld[(i, i)]))) for i in 1:K])
     row_const = -0.5 * K * log(2 * pi)
     return :( $row_const - $logdet - 0.5 * $quad )
 end
@@ -3011,18 +3177,26 @@ function _append_coef_plate!(stmts::Vector{Expr}, coefaccess::Any,
         "[generator] internal: flat coefficients contribute no plate"))
     _bind_plate_prior_arg!(stmts, mut, loc)
     _bind_plate_prior_arg!(stmts, sdt, sca)
+    # The coefficients are sampled `Float64` coordinates, and a literal lane
+    # is a `Float64[...]` vector; a cell reads both by their roles.
+    float64_args = Set{Symbol}()
     if fam === :student_t
         push!(stmts, :($nut = Float64[$(nus...)]))
         cv, nuv, mv, sv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
-        cell = _family_logpdf_expr(fam, Any[nuv, mv, sv], cv)
-        append!(stmts, _plate_sum_stmts(pw, node,
-            Any[coefaccess, nut, mut, sdt], cell))
+        push!(float64_args, nuv)
+        inputs = Any[coefaccess, nut, mut, sdt]
+        args = Any[nuv, mv, sv]
     else
         cv, mv, sv = _dovar(1), _dovar(2), _dovar(3)
-        cell = _family_logpdf_expr(fam, Any[mv, sv], cv)
-        append!(stmts, _plate_sum_stmts(pw, node,
-            Any[coefaccess, mut, sdt], cell))
+        inputs = Any[coefaccess, mut, sdt]
+        args = Any[mv, sv]
     end
+    loc isa Vector{Float64} && push!(float64_args, mv)
+    sca isa Vector{Float64} && push!(float64_args, sv)
+    cell = _family_logpdf_expr(fam, args, cv; float64_variate = true, float64_args)
+    names = Dict{Symbol,Symbol}(cv => :value, mv => :location, sv => :scale)
+    fam === :student_t && (names[nuv] = :nu)
+    append!(stmts, _plate_sum_stmts(pw, node, inputs, cell; names))
     return nothing
 end
 
@@ -3161,7 +3335,8 @@ function _parameter_prior_statements!(stmts, terms, plan, layout;
             push!(terms, node)
             continue
         end
-        prior = _sampled_prior_expr(p; pre = stmts, conditioned = p.name in plan.conditioned)
+        prior = _sampled_prior_expr(p; pre = stmts, conditioned = p.name in plan.conditioned,
+            float64_args = _float64_inputs(plan, values(p.args)))
         push!(stmts, :($node::Float64 = $prior))
         push!(terms, node)
     end
@@ -3257,7 +3432,8 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         else
             _vector_prior_stmts!(stmts, terms, p.name, p.family, p.args,
                 p.support_override; rows = _plate_rows(plan, p),
-                float64_variate = p.name ∉ plan.conditioned)
+                float64_variate = p.name ∉ plan.conditioned,
+                float64_inputs = _float64_inputs(plan, values(p.args)))
         end
     end
     # Sequential-recurrence (scan) latents: setup + recurrence density.
@@ -3266,8 +3442,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
     append!(terms, scannodes)
     # Declared array parameters (`arrays.jl`).
     _array_prior_stmts!(stmts, terms, plan, gathers; context)
-    joint = foldl((a, b) -> :($a + $b), terms; init = :(0.0))
-    push!(stmts, :(prior::Float64 = $joint))
+    push!(stmts, :(prior::Float64 = $(_sum_terms(terms))))
     return stmts
 end
 
@@ -3326,16 +3501,16 @@ function _lkj_prior_diagonal(ld, K, i, eta)
 end
 
 # One plate over a latent vector parameter,
-# summing the shared-prior log-density across cells. Every value the cell
-# reads is threaded as a plate PORT (the vector plus each scalar prior
-# arg) — captured free names are rejected by the `@kernel` plate
-# expander, exactly as the Gaussian-likelihood scale is threaded.
+# summing the shared-prior log-density across cells. The vector and each
+# named scalar prior arg are plate arguments (a scalar repeats across
+# cells), exactly as the Gaussian-likelihood scale is threaded.
 function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         name::Symbol, family::Symbol, args::NamedTuple,
         support::SupportOverride; conditioned = false, rows = nothing,
-        float64_variate::Bool = false)
-    node = Symbol(:_ppl_prior_, name)
-    pw = Symbol(:_ppl_pw_prior_, name)
+        float64_variate::Bool = false, label::Symbol = name,
+        float64_inputs = (), cell_names = Dict{Symbol,Symbol}())
+    node = Symbol(:_ppl_prior_, label)
+    pw = Symbol(:_ppl_pw_prior_, label)
     if family === :flat
         # An improper density contributes zero; evaluating a posterior does
         # not request a draw from the unnormalizable prior.
@@ -3353,7 +3528,9 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     inputs = Any[name]
     tv = _dovar(1)
     argvals = Any[_thread_ref!(inputs, v) for v in values(args)]
-    cell = _family_logpdf_expr(family, argvals, tv; float64_variate)
+    float64_args = Set{Symbol}(t for (v, t) in zip(values(args), argvals)
+        if v isa Symbol && v in float64_inputs)
+    cell = _family_logpdf_expr(family, argvals, tv; float64_variate, float64_args)
     thread(x) = x isa Expr ? Expr(x.head,
         (i == 1 && x.head === :call ? a : thread(a) for (i, a) in enumerate(x.args))...) :
         _thread_ref!(inputs, x)
@@ -3367,7 +3544,9 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
             isempty(pre) ? cell : Expr(:block, pre..., cell))
         empty!(pre)
     end
-    append!(stmts, _plate_sum_stmts(pw, node, inputs, Expr[pre..., cell]))
+    names = Dict{Symbol,Symbol}(t => cell_names[v] for (v, t) in zip(values(args), argvals)
+        if v isa Symbol && haskey(cell_names, v))
+    append!(stmts, _plate_sum_stmts(pw, node, inputs, Expr[pre..., cell]; names))
     push!(terms, node)
     return nothing
 end
@@ -3397,30 +3576,43 @@ const _PRIOR_ENDPOINTS = Dict{Symbol,Symbol}(
 # Multiplication by a floating unit preserves the value (and signed zero)
 # through ordinary Julia numeric promotion and backend arithmetic. A numeric
 # literal takes the same promotion (and Gamma's reciprocal) at emission. A
-# variate the caller knows is a Float64 parameter (`float64_variate`) is read
-# as is.
+# variate the caller knows is a Float64 parameter (`float64_variate`), and an
+# argument it knows is `Float64` (`float64_args`: a literal `Float64[...]`
+# prior argument, `Float64` data, a sampled scalar), are read as they are.
 _float64_port(v) = :(1.0 * $v)
 _float64_port(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1.0 * v
+
+# The names among `values` the kernel reads as `Float64`: a sampled scalar
+# with a built-in transform (its constrained value) or bound `Float64` data.
+# A caller-owned geometry (`:external`) constrains through caller code.
+_float64_inputs(plan::StructuralPlan, values) = Set{Symbol}(v for v in values
+    if v isa Symbol && _reads_float64(plan, v))
+_reads_float64(plan::StructuralPlan, x::Symbol) =
+    (x ∉ plan.conditioned &&
+        any(p -> p.name === x && p.family !== :external, plan.parameters)) ||
+    get(plan.columns, x, nothing) isa Union{Float64,AbstractArray{Float64}}
 _gamma_rate(v) = :(1 / $v)
 _gamma_rate(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1 / v
 
 function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x;
-        float64_variate::Bool = false)
+        float64_variate::Bool = false, float64_args = ())
     ep = get(_PRIOR_ENDPOINTS, family, nothing)
     ep === nothing && throw(ContractValidationError(
         "[generator] prior family $family has no endpoint object"))
     args = family === :gamma ? (a[1], _gamma_rate(a[2])) : Tuple(a)
-    args = map(_float64_port, args)
+    known = map(v -> v in float64_args, Tuple(a))
+    args = map((v, k) -> k ? v : _float64_port(v), args, known)
     return Expr(:call, Expr(:., Expr(:call, ep, args...), QuoteNode(method)),
         float64_variate ? x : _float64_port(x))
 end
 
-function _family_logpdf_expr(family::Symbol, a, x; float64_variate::Bool = false)
+function _family_logpdf_expr(family::Symbol, a, x; float64_variate::Bool = false,
+        float64_args = ())
     family === :flat && return :(0.0)
     family === :binomial && return :((isfinite($x) && floor($x) == $x &&
         isfinite($(a[2])) && 0 <= $(a[2]) && $(a[2]) <= 1) ?
-        binomial(Int($(a[1])), $(_float64_port(a[2]))).logpdf(Int($x)) : -Inf)
-    return _prior_endpoint_expr(family, a, :logpdf, x; float64_variate)
+        binomial(Int($(a[1])), $(a[2] in float64_args ? a[2] : _float64_port(a[2]))).logpdf(Int($x)) : -Inf)
+    return _prior_endpoint_expr(family, a, :logpdf, x; float64_variate, float64_args)
 end
 
 # Normalize the base density over the declared support. Symmetric halves
@@ -3479,9 +3671,11 @@ function _support_correction(family::Symbol, ov::SupportOverride, argvals;
 end
 
 # One normalized scalar prior body, shared by parameter and hyper-prior slots.
-function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false)
+function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false,
+        float64_args = ())
     argvals = Any[v for v in values(p.args)]
-    base = _family_logpdf_expr(p.family, argvals, p.name; float64_variate = !conditioned)
+    base = _family_logpdf_expr(p.family, argvals, p.name; float64_variate = !conditioned,
+        float64_args)
     local_pre = conditioned ? Expr[] : pre
     corr = _support_correction(p.family, p.support_override, argvals; pre = local_pre, stem = p.name)
     rhs = corr === nothing ? base : :($base + $corr)
@@ -3561,9 +3755,8 @@ function _vector_parameter_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     elseif p.family === :positive_exponential
         th = p.args.arg1
         theta = th isa Symbol ? th : Float64(th)
-        foldl((x, y) -> :($x + $y),
-            Any[:(exponential($theta).logpdf($(_vector_elt_name(p.name, i))))
-                for i in 1:m]; init = :(0.0))
+        _sum_terms(Any[:(exponential($theta).logpdf($(_vector_elt_name(p.name, i))))
+            for i in 1:m])
     else
         throw(ContractValidationError(
             "[generator] vector parameter $(p.name) family $(p.family) " *
@@ -3750,7 +3943,7 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
         push!(fields, Expr(:(=), _scan_lag_field(a, k), val))
     end
     push!(body, :(_ppl_next = $(Expr(:tuple, fields...))))
-    result = output === nothing ? foldl((a, b) -> :($a + $b), logps; init = 0.0) : env.current[output]
+    result = output === nothing ? _sum_terms(logps) : env.current[output]
     push!(body, :((_ppl_next, $result)))
     return body
 end
@@ -3847,7 +4040,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
         push!(terms, node)
     end
     total = Symbol(:_ppl_scan_, head)
-    push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms; init = 0.0))))
+    push!(stmts, :($total::Float64 = $(_sum_terms(terms))))
     push!(nodes, total)
     return nothing
 end

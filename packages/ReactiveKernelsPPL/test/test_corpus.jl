@@ -107,6 +107,10 @@ function _canon(io::IO, x, depth::Int = 0, names = nothing)
         # Their indexing admission metadata is tested independently.
         x isa StructuralPlan &&
             (fs = filter(!=(:indexed_observations), fs))
+        # The authored names of optimized definitions are queryability
+        # metadata, pinned by `test_authored_names.jl`.
+        x isa StructuralPlan &&
+            (fs = filter(!=(:named_values), fs))
 
         if isempty(fs)
             print(io, repr(x))

@@ -261,8 +261,7 @@ function condition(plan::StructuralPlan; kwargs...)
     names = Set(p.name for ps in (plan.parameters, plan.array_parameters,
         plan.vector_parameters, plan.plate_parameters) for p in ps)
     computed = _bound_module_data_names(plan)
-    union!(computed, (d.name for d in plan.derived if
-        any(r -> r.response === d.name, plan.responses)))
+    union!(computed, _derived_response_names(plan))
     columns = Dict{Symbol,ColumnData}(k => v for (k,v) in plan.columns if k ∉ computed)
     # Bound response storage is numeric. Restore its host-side missing entries
     # before rebinding so replacement data gets a fresh presence mask, while
@@ -934,6 +933,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         shared_defs::Set{Symbol} = Set{Symbol}())
     input_data = data
     ast = _observation_call_definitions(ast, data, mod)
+    ast = _gathered_value_definitions(ast, data)
     for name in conditioned
         input = _conditioned_input(name)
         (input in data || _mentions_symbol(ast, input)) &&
@@ -1464,6 +1464,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     responses = [r.range isa UnitRange && r.response in indexed_observations ?
         _with(r; range=Expr(:ref, r.response,
             Expr(:call, :(:), first(r.range), last(r.range)))) : r for r in responses]
+    named_values = _absorbed_named_values(det, canonmap, skip, predictors)
     plan = StructuralPlan(responses, predictors, priors, params, assigns,
         Dict{Symbol,AbstractVector}(), 0; derived = derived,
         levelmaps = levelmaps, plate_parameters = plate_parameters, scans = scans,
@@ -1472,20 +1473,48 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         array_parameters = arrays, submodel_scopes = submodel_scopes, conditioned, external_observations,
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
-            if k in indexed_observations || k in indexed_external))
+            if k in indexed_observations || k in indexed_external),
+        named_values)
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
 end
 
+# A definition optimized into a predictor (a response location or scale, a
+# composition's sub-predictor) is that predictor's node, under its own name
+# (user decision `1c0jiwz`). A pure alias absorbed into the value it names
+# (`w = th` over a plate latent, `w = u` over a scan state) emits no
+# statement of its own, so it reads the alias chain's target (user decision
+# `0fbe312`; "all intermediate quantities" are part of the RK graph).
+function _absorbed_named_values(det, canonmap, skip, predictors)
+    pnames = Set{Symbol}(p.name for p in predictors)
+    absorbed(nm) = nm in skip && haskey(canonmap, nm)
+    named = Pair{Symbol,Symbol}[]
+    for (nm, _) in det
+        absorbed(nm) && nm ∉ pnames || continue
+        target = nm
+        seen = Set{Symbol}()
+        while target ∉ pnames && absorbed(target) && target ∉ seen &&
+                canonmap[target] isa Symbol
+            push!(seen, target)
+            target = canonmap[target]
+        end
+        (target in pnames || !absorbed(target)) && push!(named, nm => target)
+    end
+    return named
+end
+
 
 # ── Destructuring and in-model data values ───────────────────────────
 # `(a, b) = rhs` (standard Julia destructuring): each name binds its
-# element, `a = Base.getindex(rhs, 1)`, `b = Base.getindex(rhs, 2)`, Julia's
-# tuple semantics (an extra element is dropped, a missing one is a
-# `BoundsError`). A data-only `rhs` is evaluated once by `bind_data`
+# element, `a = _destructure_element(rhs, 1)`, `b = _destructure_element(rhs, 2)`,
+# Julia's iteration semantics (an extra element is dropped, a missing one is
+# a `BoundsError`). A data-only `rhs` is evaluated once by `bind_data`
 # (identical calls share one evaluation), so `(Xf, Zp) = tps_basis(x; k = 4)`
-# fits the basis once.
+# fits the basis once. The generated kernel reassembles the element reads of
+# one `rhs` into a single destructuring statement (`_assignment_statements`),
+# so a parameter-dependent `rhs` also runs once, and a function-shaped
+# `KernelSpec` call is destructured at its WANT boundary, as RK splices it.
 _is_destructuring(st) =
     st isa Expr && st.head === :(=) && length(st.args) == 2 &&
     Meta.isexpr(st.args[1], :tuple) && !isempty(st.args[1].args) &&
@@ -1498,7 +1527,7 @@ function _desugar_destructuring(stmts)
             lhs, rhs = st.args
             for (i, nm) in enumerate(lhs.args)
                 push!(out, Expr(:(=), nm, Expr(:call,
-                    Expr(:., :Base, QuoteNode(:getindex)),
+                    GlobalRef(@__MODULE__, :_destructure_element),
                     rhs isa Expr ? copy(rhs) : rhs, i)))
             end
         else
@@ -1506,6 +1535,29 @@ function _desugar_destructuring(stmts)
         end
     end
     return out
+end
+
+# Element `i` of `(a, b, …) = value`: what Julia's lowering binds through
+# `Base.indexed_iterate`. Tuples, named tuples and arrays read it directly.
+@inline _destructure_element(value::Union{Tuple,NamedTuple}, i::Int) =
+    getfield(value, i)
+@inline _destructure_element(value::AbstractArray, i::Int) =
+    value[firstindex(value) + i - 1]
+function _destructure_element(value, i::Int)
+    item, state = Base.indexed_iterate(value, 1)
+    for k in 2:i
+        item, state = Base.indexed_iterate(value, k, state)
+    end
+    return item
+end
+
+# The `(rhs, i)` of a destructured element read, or `nothing`.
+_destructured_read(ex) = nothing
+function _destructured_read(ex::Expr)
+    ex.head === :call && length(ex.args) == 3 &&
+        ex.args[1] == GlobalRef(@__MODULE__, :_destructure_element) &&
+        ex.args[3] isa Int || return nothing
+    return (ex.args[2], ex.args[3])
 end
 
 # Data-only module values (`B = tps_basis(x; k = 4)`, `z = f(x)`: an
@@ -2547,21 +2599,47 @@ _rhs_spelling_head(fn, dotted::Bool) = _builtin_rhs_head(fn) ||
     (dotted ? fn === :vcat : fn in _RHS_SPELLING_HEADS)
 
 # Apply `f` to each value argument of a built-in sampling RHS.
-function _map_rhs_values(f, ex)
+_map_rhs_values(f, ex) = _map_rhs_arguments((value, _, _, _) -> f(value), ex)
+
+# Apply `f(value, head, position, nargs)` to each value argument of a
+# built-in sampling RHS: positional argument `position` of the `nargs` that
+# `head` spells (`Normal.(mu, s)`: `s` is 2 of 2 of `:Normal`), or the
+# keyword's name as `position`.
+function _map_rhs_arguments(f, ex, head = nothing, position = 0, nargs = 0)
     if ex isa Expr && ex.head === :call && !isempty(ex.args) &&
             _rhs_spelling_head(ex.args[1], false)
         return Expr(:call, ex.args[1],
-            Any[_map_rhs_values(f, a) for a in ex.args[2:end]]...)
+            _map_rhs_positions(f, ex.args[2:end], _rhs_head_symbol(ex.args[1]))...)
     elseif _is_dotted_call(ex) && _rhs_spelling_head(ex.args[1], true)
         return Expr(:., ex.args[1], Expr(:tuple,
-            Any[_map_rhs_values(f, a) for a in ex.args[2].args]...))
+            _map_rhs_positions(f, ex.args[2].args, _rhs_head_symbol(ex.args[1]))...))
     elseif ex isa Expr && ex.head === :parameters
-        return Expr(:parameters, Any[_map_rhs_values(f, a) for a in ex.args]...)
+        return Expr(:parameters,
+            Any[_map_rhs_arguments(f, a, head, position, nargs) for a in ex.args]...)
     elseif ex isa Expr && ex.head === :kw && length(ex.args) == 2
-        return Expr(:kw, ex.args[1], _map_rhs_values(f, ex.args[2]))
+        return Expr(:kw, ex.args[1],
+            _map_rhs_arguments(f, ex.args[2], head, ex.args[1], nargs))
     end
-    return f(ex)
+    return f(ex, head, position, nargs)
 end
+
+function _map_rhs_positions(f, args, head)
+    nargs = count(a -> !Meta.isexpr(a, :parameters), args)
+    out, position = Any[], 0
+    for a in args
+        Meta.isexpr(a, :parameters) ||
+            (position += 1)
+        push!(out, _map_rhs_arguments(f, a, head,
+            Meta.isexpr(a, :parameters) ? 0 : position, nargs))
+    end
+    return out
+end
+
+_rhs_head_symbol(fn::Symbol) = fn
+_rhs_head_symbol(fn::GlobalRef) = fn.name
+_rhs_head_symbol(fn::Expr) =
+    Meta.isexpr(fn, :., 2) && fn.args[2] isa QuoteNode ? fn.args[2].value : nothing
+_rhs_head_symbol(fn) = nothing
 
 # A call `_resolve_call_head` resolves in the model module rather than
 # keeping as a built-in: resolution names an undefined function or a
@@ -2613,9 +2691,12 @@ end
 # holds (`w = f(b .* x)` then `y .~ Normal.(w, s)`), so name it: the
 # definition then takes exactly the named spelling's path — bind-time
 # evaluation when it reads only data, whole-value data inputs, predictor
-# and value analysis. Identical calls share one name. Prior arguments
-# have their own hoist (`_hoist_prior_args!`); external RHSs resolve their
-# arguments themselves.
+# and value analysis. A call that is a whole distribution argument is named
+# after the response and that argument's role (`y .~ Normal.(mu, f(x))`
+# names `y_scale`); any other after the response and its function
+# (`y_f`). Identical calls share one name. Prior arguments have their own
+# hoist (`_hoist_prior_args!`); external RHSs resolve their arguments
+# themselves.
 function _observation_call_definitions(ast::Expr, data::Set{Symbol},
         mod::Module)
     defined = Set{Symbol}(st.args[1] for st in ast.args
@@ -2624,15 +2705,15 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
     taken = union(data, _expr_names(ast))
     named = Dict{Any,Symbol}()
     out = Any[]
-    function name!(call, stem::Symbol)
+    function name!(call, stem::Symbol, role)
         get!(named, call) do
             value = _resolve_module_calls(call, mod, names,
                 "response $stem argument `$(repr(call))`")
-            nm = Symbol(:_rkppl_, stem, :_call)
-            k = 1
-            while nm in taken
+            base = Symbol(stem, :_, something(role, _call_label(call)))
+            nm, k = base, 1
+            while nm in taken || nm in _synthesized_response_names(stem)
                 k += 1
-                nm = Symbol(:_rkppl_, stem, :_call_, k)
+                nm = Symbol(base, :_, k)
             end
             push!(taken, nm)
             push!(out, Expr(:(=), nm, value))
@@ -2646,8 +2727,12 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
             if any(in(data), observed) ||
                     (_is_broadcast_sample(st) && any(in(defined), observed))
                 stem = first(sort!(collect(observed)))
-                rhs = _map_rhs_values(st.args[3]) do value
-                    _bind_module_calls(call -> name!(call, stem), value)
+                rhs = _map_rhs_arguments(st.args[3]) do value, head, position, nargs
+                    _bind_module_calls(value) do call
+                        role = call === value ?
+                            _argument_role(head, position, nargs) : nothing
+                        name!(call, stem, role)
+                    end
                 end
                 rhs == st.args[3] ||
                     (st = Expr(:call, st.args[1], st.args[2], rhs))
@@ -2657,6 +2742,92 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
     end
     return Expr(:block, out...)
 end
+
+# A whole argument's role: its keyword's name, or its positional role.
+_argument_role(head, position::Symbol, nargs) = position
+_argument_role(head, position::Int, nargs) =
+    _distribution_role(head, position, nargs)
+
+# A computed argument's label when its position has no role: its function's
+# name (`f` for `f(x)`, `M.f(x)` or `f.(x)`), or `call` for a deferred
+# expression holding one (`if`, a comprehension, ...).
+function _call_label(ex)
+    fn = Meta.isexpr(ex, :call) ? ex.args[1] :
+        _is_dotted_call(ex) ? ex.args[1] : nothing
+    return something(_rhs_head_symbol(fn), :call)
+end
+
+# The names the response lowering synthesizes for response `stem`
+# (`y_eta`, `y_loc`, ...; `_lower_location`, `_latent_predictor!`,
+# `_lower_argument_predictor!`, the `_resp` likelihood label). A computed
+# argument never takes one.
+_synthesized_response_names(stem::Symbol) =
+    (Symbol(stem, :_eta), Symbol(stem, :_loc), Symbol(stem, :_value),
+     Symbol(stem, :_resp), Symbol(stem, :_disc))
+
+# A gather from an inline value is the gather from its named definition:
+# `loc = a .+ (z .* tau)[1, g]` reads as `r = z .* tau; loc = a .+ r[1, g]`
+# (naming a subexpression never changes legality or the density). So name
+# the gathered value: its definition then takes the named spelling's path —
+# the axes it inherits from declared arrays, level lookup on a `levels(g)`
+# axis, one value per observation. A data-only value already folds with its
+# gather at binding. Lazy arms and `@plate` / `@scan` bodies keep their
+# evaluation context. Identical values share one name. Runs after
+# `_observation_call_definitions`, so a module call in a response argument
+# is already a name here.
+function _gathered_value_definitions(ast::Expr, data::Set{Symbol})
+    detmap = Dict{Symbol,Any}(st.args[1] => st.args[2] for st in ast.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
+    taken = union(data, _expr_names(ast))
+    named = Dict{Any,Symbol}()
+    out = Any[]
+    function name!(value)
+        get!(named, value) do
+            k = 1
+            nm = Symbol(:_rkppl_gathered_, k)
+            while nm in taken
+                k += 1
+                nm = Symbol(:_rkppl_gathered_, k)
+            end
+            push!(taken, nm)
+            push!(out, Expr(:(=), nm, value))
+            nm
+        end
+    end
+    function walk(ex)
+        ex isa Expr || return ex
+        ex.head in (:macrocall, :quote) && return ex
+        ex.head in _DEFERRED_VALUE_HEADS && return ex
+        args = Any[walk(a) for a in ex.args]
+        if ex.head === :ref && length(args) >= 2 &&
+                _gathered_value(args[1]) && !_data_only(args[1], data, detmap)
+            args[1] = name!(args[1])
+        end
+        return Expr(ex.head, args...)
+    end
+    defined = Set{Symbol}(keys(detmap))
+    for st in ast.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+            st = Expr(:(=), st.args[1], walk(st.args[2]))
+        elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
+                !_external_rhs(st.args[3])
+            observed = _sampled_lhs_names!(Set{Symbol}(), st.args[2])
+            if any(in(data), observed) ||
+                    (_is_broadcast_sample(st) && any(in(defined), observed))
+                rhs = _map_rhs_values(walk, st.args[3])
+                rhs == st.args[3] ||
+                    (st = Expr(:call, st.args[1], st.args[2], rhs))
+            end
+        end
+        push!(out, st)
+    end
+    return Expr(:block, out...)
+end
+
+# A computed value that a gather may read: a call, a broadcast or an
+# adjoint. Names, literals, property paths and chained reads stay as written.
+_gathered_value(ex) = ex isa Expr &&
+    (ex.head === :call || ex.head === Symbol("'") || _is_dotted_call(ex))
 
 # Data-only: every value the expression reads is data or a data-only
 # definition (literals and function values aside).
@@ -8050,7 +8221,11 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
     return name
 end
 
-function _argument_name!(base::Symbol, ctx)
+# A name the lowering synthesizes for a graph value: `base`, or `base_k`
+# for the first `k` no other name of the model takes. Synthesized predictors
+# are graph values under their own names, like authored ones, so they never
+# shadow a user's name (user decision `1c0jiwz`).
+function _predictor_name!(base::Symbol, ctx)
     nm, k = base, 0
     while nm in ctx.taken
         k += 1
@@ -8065,8 +8240,8 @@ end
 # data and scalar declarations without inventing a new coefficient prior.
 function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
         coefuse, base::Symbol)
-    pname = _argument_name!(base, ctx)
     if ex isa Expr && (_canon_shape(ex, ctx) !== :scalar || _is_composed_map(ex))
+        pname = _predictor_name!(base, ctx)
         _reads_latent_elementwise(ex, ctx) &&
             return _latent_value_predictor!(lhs, pname, ex, :value,
                 IdentityLink, ctx, predictors, pred_idx)
@@ -8074,7 +8249,7 @@ function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
             predictors, pred_idx, coefuse)
     end
     return _lower_location(lhs, ex, IdentityLink, ctx, predictors, pred_idx,
-        coefuse; value = true, synth = pname)
+        coefuse; value = true, synth = base)
 end
 
 function _lower_scale_predictor_error(lhs, name, ctx)
@@ -8193,10 +8368,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # LatentTerm, just as when the whole location names that latent.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
-        pname = synth === nothing ? Symbol(lhs, "_eta") : synth
-        (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
-            "derived predictor name $pname collides with your definition — " *
-            "rename yours")
+        pname = _predictor_name!(something(synth, Symbol(lhs, "_eta")), ctx)
         if _composed_root(loc, ctx) || (value && _is_bare_sub_map(loc, ctx))
             _reads_latent_elementwise(loc, ctx) &&
                 return _latent_value_predictor!(lhs, pname, loc, :location,
@@ -8250,7 +8422,7 @@ end
 # derived column that reads one); the generator emits `lp = col`.
 # Latent predictors stay per-response (no interning here).
 function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
-        pname::Symbol = Symbol(lhs, "_loc"))
+        pname::Symbol = _predictor_name!(Symbol(lhs, "_loc"), ctx))
     # A nested per-cell call can return a sampled local unchanged. The
     # outer binding aliases that vector; it does not create another latent.
     source = col
@@ -8264,9 +8436,6 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
         union!(ctx.absorbed, seen)
         col = source
     end
-    (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
-        "latent-location predictor name $pname collides with your " *
-        "definition — rename it")
     term = TermSpec(LatentTerm, [col], NamedTuple(), col, Symbol(col, "_lat"))
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
     pred_idx[pname] = length(predictors)
@@ -8372,10 +8541,7 @@ function _value_location!(lhs, loc, pred_link, ctx, predictors,
         ctx.detshape[source] = :scalar
         source = ctx.detmap[source]
     end
-    pname = synth === nothing ? Symbol(lhs, "_eta") : synth
-    (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
-        "derived predictor name $pname collides with your definition — " *
-        "rename yours")
+    pname = _predictor_name!(something(synth, Symbol(lhs, "_eta")), ctx)
     term = if loc isa Symbol && loc in ctx.data
         TermSpec(OffsetTerm, ColumnRef[loc], NamedTuple(), loc,
             Symbol(loc, "_off"))
@@ -10182,7 +10348,9 @@ end
 """Prior-argument hoisting: an expression in a prior's argument position
 (`b ~ Normal(0, 2 * s)`, `c[levels(g)] .~ Normal.(0, sqrt(v))`,
 `b[axes(X, 2)] .~ Normal.(0, [s1, 2 * s2])`) binds to a synthetic scalar
-definition named after its statement (`_rkppl_b_arg2`), so every prior
+definition named after its statement and the argument's role (`b_scale`,
+`b_scale_2` for a vector's second entry; `b_arg2` where the family names no
+role, `_distribution_role`), so every prior
 position downstream sees a literal or a name — naming a subexpression
 never changes legality. Pure-literal arithmetic folds to its value instead
 (`Normal(0, 1 / 2)` keeps a literal scale). Response arguments are
@@ -10212,11 +10380,10 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         _reject_unknown_calls("the prior of $lhs (argument " *
                               "`$(repr(a))`)", r)
         a = r
-        nm = Symbol(:_rkppl_, stem)
-        k = 1
+        nm, k = stem, 1
         while nm in taken
             k += 1
-            nm = Symbol(:_rkppl_, stem, :_, k)
+            nm = Symbol(stem, :_, k)
         end
         push!(taken, nm)
         push!(out, nm => a)
@@ -10226,8 +10393,9 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
     # Positional arguments only (a `:parameters` keyword block keeps its
     # place and is never an argument position); unchanged input returns
     # itself, so untouched statements keep their exact AST.
-    function hoist_args(lhs, args; scalar_only=true)
+    function hoist_args(lhs, args; scalar_only=true, role = (i, n) -> nothing)
         local res = Any[]
+        nargs = count(a -> !(a isa Expr && a.head === :parameters), args)
         i = 0
         for a in args
             if a isa Expr && a.head === :parameters
@@ -10235,19 +10403,22 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
                 continue
             end
             i += 1
+            r = role(i, nargs)
+            stem = r === nothing ? Symbol(lhs, :_arg, i) : Symbol(lhs, :_, r)
             push!(res, a isa Expr && a.head === :vect ?
-                Expr(:vect, (bind(lhs, Symbol(lhs, :_arg, i, :_, j), x; scalar_only)
+                Expr(:vect, (bind(lhs, Symbol(stem, :_, j), x; scalar_only)
                     for (j, x) in enumerate(a.args))...) :
-                bind(lhs, Symbol(lhs, :_arg, i), a; scalar_only))
+                bind(lhs, stem, a; scalar_only))
         end
         return res == args ? args : res
     end
+    family_role(head) = (i, n) -> _distribution_role(head, i, n)
     function hoist_call(lhs, rhs; scalar_only=true)
         rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol || return rhs
         if rhs.args[1] === :LKJCholesky && length(rhs.args) in (3, 4)
             # Shape and orientation are structural; only eta is a prior value.
-            eta = bind(lhs, Symbol(lhs, :_arg2), rhs.args[3])
+            eta = bind(lhs, Symbol(lhs, :_eta), rhs.args[3])
             eta === rhs.args[3] && return rhs
             return Expr(:call, rhs.args[1], rhs.args[2], eta, rhs.args[4:end]...)
         end
@@ -10257,13 +10428,14 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         end
         if rhs.args[1] in (:truncated, :restricted) && length(rhs.args) == 4
             inner = hoist_call(lhs, rhs.args[2]; scalar_only)
-            bounds = hoist_args(lhs, rhs.args[3:end]; scalar_only)
+            bounds = hoist_args(lhs, rhs.args[3:end]; scalar_only,
+                role = (i, n) -> (:lower, :upper)[i])
             inner === rhs.args[2] && bounds == rhs.args[3:end] && return rhs
             return Expr(:call, rhs.args[1], inner, bounds...)
         end
         rhs.args[1] in _HOIST_FAMILIES || return rhs
         args = rhs.args[2:end]
-        new = hoist_args(lhs, args; scalar_only)
+        new = hoist_args(lhs, args; scalar_only, role = family_role(rhs.args[1]))
         new === args && return rhs
         return Expr(:call, rhs.args[1], new...)
     end
@@ -10278,7 +10450,7 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
                 rhs.args[2] isa Expr && rhs.args[2].head === :tuple &&
                 rhs.args[1] in _HOIST_FAMILIES || continue
             args = rhs.args[2].args
-            new = hoist_args(s.lhs, args)
+            new = hoist_args(s.lhs, args; role = family_role(rhs.args[1]))
             new === args && continue
             rhs = Expr(:., rhs.args[1], Expr(:tuple, new...))
         else

@@ -65,6 +65,8 @@ export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADP
 export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @plate, @scan
 export partial_evaluation
 export prepare_ad, ad_gradient, ad_value_and_gradient, ad_value_and_gradient!
+export ad_value_gradient_and_retained, ad_value_gradient_and_retained!,
+    ad_retains_primal_sweep
 export prepare_ad_pullback, ad_pullback
 export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
 export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residuals

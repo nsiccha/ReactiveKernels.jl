@@ -416,4 +416,54 @@ end
     @test data == saved
     @test live == [0.1, 0.2, 0.3]
 end
+
+# The same width with operands the kernel derives itself. The lowered body
+# types each cell value with `_promote_op` over the cell's argument types;
+# through Base's `promote_op`, whose `S...` and `TupleOrBottom(tt...)` splats
+# stay runtime `Core._apply_iterate` calls past 32 types, a plate of 33 or
+# more operands derived its element type on every call: about 900 B per
+# primal call, and native Reverse failed with `Illegal cached pointer` once
+# the operands were loaded from a container before that opaque call.
+for width in (1, WIDE_PORTS)
+    cells = [Symbol(:c, k) for k in 1:width]
+    ports = [Symbol(:xs, k) for k in 1:width]
+    reads = (:($p = data[$k]) for (k, p) in enumerate(ports))
+    terms = (:(l * sum($c; init = 0.0)) for c in cells)
+    name = width == 1 ? :derived_narrow_plate : :derived_wide_plate
+    @eval @kernel $name(live::Vector{Float64},
+                        data::Vector{Vector{Vector{Float64}}}) = begin
+        $(reads...)
+        out = plate(live, $(ports...)) do l, $(cells...)
+            $(foldl((a, t) -> :($a + $t), terms; init = :(l * l)))
+        end
+        total::Float64 = sum(out)
+    end
+end
+
+function derived_wide_bytes(kernel, live, data)
+    kernel(live, data)
+    @allocated kernel(live, data)
+end
+
+@testset "a plate wider than Julia's splat limit over derived operands" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    live = [0.1, 0.2, 0.3]
+    data = [[[Float64(k + i + j) for j in 1:mod(i, 3)] for i in 1:3]
+            for k in 1:WIDE_PORTS]
+    saved = deepcopy(data)
+    shifted(i) = sum(sum(d[i]; init = 0.0) for d in data)
+    expected = sum(l^2 + l * shifted(i) for (i, l) in enumerate(live))
+    gradient = [2l + shifted(i) for (i, l) in enumerate(live)]
+    wide = prepare(derived_wide_plate)
+    @test wide(live, data) ≈ expected
+    @test derived_wide_bytes(wide, live, data) ==
+          derived_wide_bytes(prepare(derived_narrow_plate), live, data[1:1])
+    prepared = prepare_ad(derived_wide_plate, backend, live, data;
+                          active=:live, want=:total)
+    value, g = ad_value_and_gradient(prepared, live, data)
+    @test value ≈ expected
+    @test g ≈ gradient
+    @test data == saved
+    @test live == [0.1, 0.2, 0.3]
+end
 end

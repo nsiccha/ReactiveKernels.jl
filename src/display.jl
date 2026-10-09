@@ -55,6 +55,45 @@ function _display_expr(ref::GlobalRef)
     ref
 end
 
+# Any other global prints by its bare name, as its source spelled it, when the
+# displayed program spells that name no other way: no global of another module
+# and no local, argument or field. The display then names the global's module
+# among the modules it was evaluated in (`ReadableCode.modules`).
+function _display_globals(ex, modules::Vector{Module})
+    refs = _display_global_refs!(Tuple{Module,Symbol}[], ex)
+    isempty(refs) && return ex, modules
+    spelled = _display_plain_symbols!(Set{Symbol}(), ex)
+    owners = Dict{Symbol,Set{Module}}()
+    for (mod, name) in refs
+        push!(get!(Set{Module}, owners, name), mod)
+    end
+    bare = Set{Tuple{Module,Symbol}}(r for r in refs
+        if length(owners[r[2]]) == 1 && !(r[2] in spelled))
+    isempty(bare) && return ex, modules
+    out = copy(modules)
+    for (mod, name) in refs
+        (mod, name) in bare && !(mod in out) && push!(out, mod)
+    end
+    return _display_bare_globals(ex, bare), out
+end
+
+_display_global_refs!(out, x) = out
+_display_global_refs!(out, ref::GlobalRef) =
+    ((ref.mod, ref.name) in out || push!(out, (ref.mod, ref.name)); out)
+_display_global_refs!(out, ex::Expr) =
+    (foreach(a -> _display_global_refs!(out, a), ex.args); out)
+
+_display_plain_symbols!(out, x) = out
+_display_plain_symbols!(out, s::Symbol) = push!(out, s)
+_display_plain_symbols!(out, ex::Expr) =
+    (foreach(a -> _display_plain_symbols!(out, a), ex.args); out)
+
+_display_bare_globals(x, bare) = x
+_display_bare_globals(ref::GlobalRef, bare) =
+    (ref.mod, ref.name) in bare ? ref.name : ref
+_display_bare_globals(ex::Expr, bare) =
+    Expr(ex.head, Any[_display_bare_globals(a, bare) for a in ex.args]...)
+
 # Captured values in a displayed source binding: literals as themselves,
 # functions and sources as above, anything else by its type name in brackets.
 _display_object(x::Union{Number,AbstractString,Char,Symbol,Nothing}) = x isa Symbol ? QuoteNode(x) : x
@@ -185,7 +224,7 @@ end
 function _recipe_label(recipe::Recipe)
     _is_body_op(recipe.op) && return _opname(recipe.op)
     recipe.op isa _KernelSourceOp && _has_source(recipe) || return _opname(recipe.op)
-    ins = join((string(v.name) for v in recipe.inputs), ", ")
+    ins = join((string(name) for name in _recipe_source_names(recipe)), ", ")
     "($ins) -> " * _display_line(recipe.source)
 end
 
@@ -215,8 +254,9 @@ Display-only Julia source for a ReactiveKernels program, returned by
 [`readable_code`](@ref). It prints as ordinary indented Julia without
 line-number annotations; `string(code)` returns that text and `code.expr` the
 displayed expression. `code.modules` lists the modules whose bindings the
-authored `@kernel` sources were evaluated in, in order of first use; the text
-starts with a comment naming them.
+authored `@kernel` sources were evaluated in, in order of first use, and the
+module of each global the program shows by its bare name; the text starts
+with a comment naming them.
 
 The displayed program is an explanation, not executable authority:
 [`code_expr`](@ref) remains the exact compiled AST.
@@ -241,22 +281,26 @@ unless `have`/`want` are given, and nothing is prepared or evaluated. A
 `PreparedKernel` shows its prepared program, including any `bound=` data folded
 into it as literal constants. An `Expr`, such as a generated `@kernel`
 definition, is shown as written. Line-number annotations are removed from a
-copy; the argument is never mutated.
+copy; the argument is never mutated. A global reference (`M.f`) shows by its
+bare name, as source spells it, unless the program also spells that name
+another way; the comment then names `M`.
 """
 function readable_code(p::Plan)
     modules = _collect_source_modules!(Module[], p.recipes)
-    ReadableCode(_display_expr(_readable_expr(code_expr(p), p)), modules)
+    ReadableCode(_display_globals(_display_expr(
+        _readable_inline_generated(_readable_expr(code_expr(p), p), p)), modules)...)
 end
 
 function readable_code(k::PreparedKernel)
     modules = _collect_source_modules!(Module[], k.lowered_recipes)
-    ReadableCode(_display_expr(_readable_expr(code_expr(k), k)), modules)
+    ReadableCode(_display_globals(_display_expr(_readable_expr(code_expr(k), k)),
+        modules)...)
 end
 
 readable_code(spec::KernelSpec; kwargs...) = readable_code(plan(spec; kwargs...))
 readable_code(g::Graph; kwargs...) = readable_code(plan(g; kwargs...))
 readable_code(ex::Expr; modules = Module[]) =
-    ReadableCode(_display_expr(ex), collect(Module, modules))
+    ReadableCode(_display_globals(_display_expr(ex), collect(Module, modules))...)
 
 # A definition with a block body (`function (args…) … end`, `f(args…) = begin
 # … end`, optionally under a macro such as `@kernel`) prints its statements
