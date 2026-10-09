@@ -128,9 +128,10 @@ end
         if dependent
             # Neither definition has coefficient structure, so both are
             # retained values: `sd` reads the location's value by name.
-            @test any(d -> d.name === :sd && d.expr == :(hypot.(add, mu .* prop)),
-                fx.plan.derived)
-            @test occursin("sd = hypot.(add, mu .* prop)", src)
+            sd = only(d for d in fx.plan.derived if d.name === :sd)
+            @test :mu in ReactiveKernelsPPL._expr_names(sd.expr)
+            @test occursin("sd = hypot.(add, mu .* prop)",
+                string(readable_code(kernel_expr(fx.bound, fx.built.layout))))
         end
     end
     for dependent in (false, true)

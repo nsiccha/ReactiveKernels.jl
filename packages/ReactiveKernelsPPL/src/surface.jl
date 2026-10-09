@@ -1403,7 +1403,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     if !isempty(whole)
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, whole),
-            shared_defs)
+            shared_defs, array_entries)
     end
     # A predictor location inlines the definitions it reads. As in Julia,
     # a computed definition is instead one named value that its readers
