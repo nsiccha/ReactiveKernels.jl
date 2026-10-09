@@ -1,5 +1,6 @@
 module InlineGatheredValueTests
 using ReactiveKernels, ReactiveKernelsPPL, Distributions, DifferentiationInterface, Enzyme, Test
+using LinearAlgebra: Cholesky, LowerTriangular
 
 # A gather from an inline array value means what the gather from its named
 # definition means: naming a subexpression never changes legality or the
@@ -24,11 +25,16 @@ const PRIORS = (
     :(tau[1:2] .~ Exponential.(1.0)),
     :(z[1:2, levels(g)] .~ Normal.(0, 1)),
     :(w[levels(g)] .~ Normal.(0, 1)),
+    :(Z[levels(g), 1:2] .~ Normal.(0, 1)),
+    :(L ~ LKJCholesky(2, 2.0)),
+    :(v[unique(gi)] .~ Normal.(0, 1)),
 )
 
 prior(p) = logpdf(Normal(0, 1), p.a) + logpdf(Exponential(1), p.s) +
     sum(logpdf.(Exponential(1.0), p.tau)) + sum(logpdf.(Normal(0, 1), p.z)) +
-    sum(logpdf.(Normal(0, 1), p.w))
+    sum(logpdf.(Normal(0, 1), p.w)) + sum(logpdf.(Normal(0, 1), p.Z)) +
+    logpdf(LKJCholesky(2, 2.0), Cholesky(LowerTriangular(p.L))) +
+    sum(logpdf.(Normal(0, 1), p.v))
 
 # Independent level lookup: the position of each label in `levels(g)`.
 code(d) = indexin(d.g, sort(unique(d.g)))
@@ -48,6 +54,19 @@ const SHAPES = (
         (:(_rkppl_gathered_1 = w .* s),
             :(loc = a .+ _rkppl_gathered_1[g]), :(y .~ Normal.(loc, 1.0))),
         (p, d) -> p.a .+ (p.w .* p.s)[code(d)]),
+    # Levels on the first axis of a matrix product with an adjoint factor.
+    matmul = (
+        (:(loc = a .+ (Z * (tau .* L)')[g, 1]), :(y .~ Normal.(loc, 1.0))),
+        (:(_rkppl_gathered_1 = Z * (tau .* L)'),
+            :(loc = a .+ _rkppl_gathered_1[g, 1]), :(y .~ Normal.(loc, 1.0))),
+        (p, d) -> p.a .+ (p.Z * (p.tau .* p.L)')[code(d), 1]),
+    # First-occurrence order: label 3 sits at position 1 of `unique(gi)`, so
+    # a positional read would silently take another level's value.
+    unique_axis = (
+        (:(loc = a .+ (v .* s)[gi]), :(y .~ Normal.(loc, 1.0))),
+        (:(_rkppl_gathered_1 = v .* s),
+            :(loc = a .+ _rkppl_gathered_1[gi]), :(y .~ Normal.(loc, 1.0))),
+        (p, d) -> p.a .+ (p.v .* p.s)[indexin(d.gi, unique(d.gi))]),
     adjoint = (
         (:(loc = a .+ (z' .* tau')[g, 2]), :(y .~ Normal.(loc, 1.0))),
         (:(_rkppl_gathered_1 = z' .* tau'),
