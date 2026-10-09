@@ -45,6 +45,32 @@ function _vc_cases(n)
             mu = be * th - al
             y .~ Normal.(mu, 1.0)
         end, data, mean = q -> q.be * (q.a .+ q.b .* x) - q.d .* x),
+        # Julia evaluates a broadcast argument whole, so an undotted
+        # Julia-valid vector operation inside `exp.(…)` means what its
+        # named definition (`nc = -cl`) means (snag rkppl-unary-minu).
+        (label = "undotted negation inside a broadcast", ast = quote
+            a ~ Normal(0, 1)
+            lv ~ Normal(0, 1)
+            z[levels(g)] .~ Normal.(0, 1)
+            cl = exp.(a .+ 0.3 .* z[g])
+            mu = x .* exp.(-cl .* x) ./ exp(lv)
+            y .~ Normal.(mu, 1.0)
+        end, data = merge(data, (; g = [mod1(i, 2) for i in 1:n])),
+        mean = q -> x .* exp.(-exp.(q.a .+ 0.3 .* q.z[[mod1(i, 2)
+            for i in 1:n]]) .* x) ./ exp(q.lv)),
+        (label = "undotted data negation inside a broadcast", ast = quote
+            a ~ Normal(0, 1)
+            mu = a .* exp.(-x)
+            y .~ Normal.(mu, 1.0)
+        end, data, mean = q -> q.a .* exp.(-x)),
+        (label = "undotted vector scaling inside a broadcast", ast = quote
+            a ~ Normal(0, 1)
+            lv ~ Normal(0, 1)
+            cl = exp.(a .+ 0.1 .* x)
+            mu = x .* exp.((cl - x) / 4) ./ exp(lv)
+            y .~ Normal.(mu, 1.0)
+        end, data,
+        mean = q -> x .* exp.((exp.(q.a .+ 0.1 .* x) - x) / 4) ./ exp(q.lv)),
         (label = "nary scalar product", ast = quote
             a ~ Normal(0, 1)
             mu = a .+ 2 * 3 * x
@@ -183,6 +209,36 @@ _vc_empty_cases() = filter(c -> c.label in
             gradient = _check_gradient(built.spec, plan, u)
             @test gradient ≈ _findiff_grad(oracle, u) rtol=1e-5 atol=1e-7
             @test case.data == before
+        end
+    end
+end
+
+# A truncation bound reads like the definition it could be named
+# (`lo = -(x .+ 1)`): the undotted negation and its dotted spelling lower
+# to one density (snag rkppl-unary-minu).
+@testset "undotted vector math in a truncation bound" begin
+    x = [0.4 + i / 4 for i in 1:4]
+    y = [0.3 * cos(i) for i in 1:4]
+    data = (; x, y)
+    oracle = (layout, u) -> begin
+        q = constrain(layout, u)
+        logpdf(Normal(), q.a) + sum(logpdf.(truncated.(
+            Normal.(q.a .+ 0.5 .* x, 1.0), -(x .+ 1), Inf), y))
+    end
+    for lo in (:(-(x .+ 1)), :(.-(x .+ 1)))
+        @testset "$lo" begin
+            before = deepcopy(data)
+            plan, built = _vc_model(quote
+                a ~ Normal(0, 1)
+                mu = a .+ 0.5 .* x
+                y .~ truncated.(Normal.(mu, 1.0), $lo, Inf)
+            end, data)
+            u = [0.2 * sin(i) for i in 1:built.layout.total]
+            @test _query(built.spec, plan, :posterior, u) ≈
+                oracle(built.layout, u) rtol=1e-12
+            @test _check_gradient(built.spec, plan, u) ≈
+                _findiff_grad(w -> oracle(built.layout, w), u) rtol=1e-5 atol=1e-7
+            @test data == before
         end
     end
 end

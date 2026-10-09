@@ -2082,32 +2082,51 @@ _is_plain_comparison(fn::Symbol) =
     fn === :< || fn === :> || fn === :(==) || fn === :(!=) ||
     fn === :(<=) || fn === :(>=)
 
-function _canonical_expr(ex, data, detmap, detshape, env, where)
+# `strict = false` (broadcast arguments, response bounds) only performs the
+# Julia-valid dotted rewrites below: a shape this analysis cannot admit is
+# left exactly as written for its own downstream check, never refused here.
+function _canonical_expr(ex, data, detmap, detshape, env, where;
+        strict::Bool = true)
     ex isa Symbol && return ex
     ex isa Expr || return ex
-    ex.head === :parameters && _sfail("$where takes positional " *
-                                      "arguments only (no keywords)")
+    if ex.head === :parameters
+        strict || return ex
+        _sfail("$where takes positional arguments only (no keywords)")
+    end
+    if _is_dotted_call(ex)
+        # Julia evaluates each broadcast argument whole before
+        # broadcasting, so `exp.(-cl .* t)` reads `-cl` exactly as the
+        # definition `nc = -cl` does: its arguments take the same dotted
+        # rewrites. Keywords pass through untouched.
+        args = Any[Meta.isexpr(a, (:parameters, :kw)) ? a :
+            _canonical_expr(a, data, detmap, detshape, env, where;
+                strict = false)
+            for a in ex.args[2].args]
+        return Expr(:., ex.args[1], Expr(:tuple, args...))
+    end
     ex.head === :call || return ex
     isempty(ex.args) && return ex
     fn = ex.args[1]
     fn isa Symbol || return ex
     fn in REDUCTION_FNS && return ex  # args validated downstream
     fn === :_ppl_plate_column && return ex  # an RK plate (array cells)
-    args = Any[_canonical_expr(a, data, detmap, detshape, env, where)
+    args = Any[_canonical_expr(a, data, detmap, detshape, env, where; strict)
         for a in ex.args[2:end]]
     argshapes = [_canon_shape(a, data, detmap, detshape, env) for a in args]
     if :invalid in argshapes
         return Expr(ex.head, ex.args[1], args...)  # broken ref: raises at its own def
     end
-    _shape_of_call(fn, argshapes) === :invalid &&
+    if _shape_of_call(fn, argshapes) === :invalid
+        strict || return Expr(ex.head, ex.args[1], args...)
         _sfail(_julia_mismatch_msg(fn, where, ex, argshapes))
+    end
     if fn === :* && length(args) > 2 && :matrix ∉ argshapes &&
             :array ∉ argshapes && :vector in argshapes
         # Keep the scalar products in Julia order, then normalize only
         # the scalar-vector multiplication to its broadcast equivalent.
         return _canonical_expr(Expr(:call, :*,
             Expr(:call, :*, args[1:end-1]...), args[end]), data, detmap,
-            detshape, env, where)
+            detshape, env, where; strict)
     end
     if fn in (:+, :-) && length(args) >= 2 && all(==(:vector), argshapes)
         return Expr(:call, fn === :+ ? :.+ : :.-, args...)
@@ -7518,6 +7537,11 @@ function _bound(lhs, b, side::Symbol, ctx)
     b isa Symbol && (b in ctx.data || b in ctx.prior_names ||
         haskey(ctx.detmap, b)) && return b
     if b isa Expr
+        # A bound expression reads like the definition it could be named
+        # (`lo = -(t .+ 1)`): Julia-valid undotted vector math takes the
+        # same canonical dotted form.
+        b = _canonical_expr(b, ctx.data, ctx.detmap, ctx.detshape,
+            ctx.shape_env, "response $lhs $side bound"; strict = false)
         shape = _shape_of(b, ctx.data, ctx.detmap, copy(ctx.detshape),
             Set{Symbol}(), ctx.shape_env)
         return shape === :scalar ? _composed_scalar_leaf!(lhs, b, ctx, Symbol[]) :
