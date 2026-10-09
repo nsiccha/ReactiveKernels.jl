@@ -488,6 +488,17 @@ and array values. A column read only as labels may contain `missing`;
 numeric responses follow the provisional automatic missing-observation
 handling described under Plates.
 
+A level axis is keyed by its labels, so a data index gathering along it
+holds labels, integer labels included. To read a data-sized block at
+positions the model computes, declare that axis positionally with the same
+extent: `z[1:length(levels(g)), 1:K] .~ Normal.(0, 1)` has one row per level
+of `g`, which may be data or a definition computed from data such as
+`gg = vcat(g1, g2)`. With `i` holding integer positions, `b[i, 1]` is then
+plain Julia indexing, whether `b` is the declaration, a definition such as
+`b = z .* tau` or a submodel's return. A level axis indexed by integers that
+are not its labels fails binding, and the message names the positional
+declaration.
+
 For paired crossed effects, index each axis by one observation's label
 inside a plate: `mu[i] = a + b[g[i], h[i]]`. Julia's `b[g, h]` with two
 vectors selects a Cartesian matrix.
