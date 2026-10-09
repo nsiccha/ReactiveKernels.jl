@@ -48,6 +48,20 @@ end
     return total
 end
 
+# A plate cell whose parameters shadow the child's formals.
+@kernel names_cell_child(values, scale) = begin
+    pointwise = plate(values, scale) do values, scale
+        values / scale
+    end
+    return pointwise
+end
+
+@kernel names_cell_parent(x::Vector{Float64}, s::Float64) = begin
+    p = names_cell_child(x, s)
+    total = sum(p)
+    return total
+end
+
 _names_exponential(x, scale) = x >= 0 ? -log(scale) - x / scale : -Inf
 _names_normal(x, location, scale) =
     -0.5 * log(2π) - 0.5 * ((x - location) / scale)^2 - log(scale)
@@ -119,6 +133,13 @@ _names_identity_recipes(spec) =
         @test !occursin("##", text)
         @test prepare(names_lifted)(0.4, -1.2) ≈
               _names_normal(0.4, 0.0, 1.0) + _names_normal(-1.2, 0.0, 1.0)
+    end
+
+    @testset "a do-block parameter shadows only inside the block" begin
+        text = _names_text(names_cell_parent)
+        @test occursin("p = plate(x, s) do values, scale", text)
+        @test !occursin("let ", text)
+        @test prepare(names_cell_parent)([1.0, 2.0, 4.0], 2.0) == 3.5
     end
 
     @testset "structural views read authored source names" begin

@@ -5008,11 +5008,15 @@ function _readable_symbols!(names, ex::Expr)
     names
 end
 
-# Every name `ex` binds: assignment, `let` and `local` targets, function and
-# do-block parameters, loop and generator variables.
+# Every name `ex` binds where a substitution can reach: assignment, `let` and
+# `local` targets, function parameters, loop and generator variables. A
+# do-block's body is never substituted into, so its parameters and locals bind
+# nothing a substitution could be captured by.
 function _readable_bound_names!(names, ex)
     ex isa Expr || return names
     ex.head in (:quote, :inert) && return names
+    ex.head === :do && length(ex.args) == 2 &&
+        return _readable_bound_names!(names, ex.args[1])
     if ex.head === :kw
         return _readable_bound_names!(names, ex.args[end])
     elseif ex.head in (:(=), :->, :function) && !isempty(ex.args)
@@ -5030,7 +5034,8 @@ end
 
 # The number of free reads of `name` in `ex`, or `nothing` when one sits in a
 # scope this display rewrite does not analyze. An assignment target, keyword
-# or named-field label is not a read; a do-block's call arguments are.
+# or named-field label is not a read; a do-block's call arguments are, and
+# its body reads `name` only when no parameter of the block shadows it.
 function _readable_free_uses(ex, name::Symbol)
     ex === name && return 1
     ex isa Expr || return 0
@@ -5038,7 +5043,10 @@ function _readable_free_uses(ex, name::Symbol)
     if ex.head in _READABLE_SCOPE_HEADS
         return _readable_mentions(ex, name) ? nothing : 0
     elseif ex.head === :do && length(ex.args) == 2
-        _readable_mentions(ex.args[2], name) && return nothing
+        block = ex.args[2]
+        shadowed = block isa Expr && block.head === :-> && !isempty(block.args) &&
+            name in _readable_symbols!(Set{Symbol}(), block.args[1])
+        !shadowed && _readable_mentions(block, name) && return nothing
         return _readable_free_uses(ex.args[1], name)
     end
     args = ex.head in (:(=), :kw) && length(ex.args) == 2 ? ex.args[2:2] : ex.args
