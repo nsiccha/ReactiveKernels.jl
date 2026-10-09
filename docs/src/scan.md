@@ -20,28 +20,33 @@ The natural sequential form needs no manual reformulation into a closed form.
 ## Syntax
 
 ```julia
-result = scan(xs₁, xs₂, …, Ref(shared₁), Ref(shared₂), …; init = c₀) do carry, x₁, x₂, …, s₁, s₂, …
-    # … compute with carry, the per-step elements x₁, x₂, …, and the shared operands …
+result = scan(xs₁, xs₂, …; init = c₀) do carry, x₁, x₂, …
+    # … compute with carry, the per-step elements x₁, x₂, …, and any enclosing
+    #   value (a parameter, bound data, another port), read whole as a closure …
     (new_carry, output)          # the do-block must END with this 2-tuple
 end
 # optional: `include_init = true` returns [c₀, output₁, output₂, …]
 # optional: `history = h₀` appends one do-block argument, the outputs so far
 ```
 
-- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the leading non-`Ref`
-  positionals. They are advanced together in **lockstep**: step `t` receives
+- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the positional
+  arguments. They are advanced together in **lockstep**: step `t` receives
   `xs₁[t], xs₂[t], …`. With a single sequence this is the ordinary
   `scan(xs; …) do carry, x`. Every iterated sequence must share axes; a length
   mismatch throws `DimensionMismatch`. The sequences may be empty: no step
   runs and `scan` returns an empty vector (see [Empty sequences](#Empty-sequences)).
 - **`init`** — seeds the threaded `carry`. Required keyword.
-- **`Ref(shared)` operands** — broadcast-invariant scalars passed unchanged to
-  every step, exactly like [`plate`](compiler.md)'s atomic `Ref`
-  arguments. Every `Ref(...)` operand must follow the iterated sequences; a bare
-  (non-`Ref`) positional after a `Ref(...)` is rejected.
-- **The do-block** receives `(carry, x₁, x₂, …, shared...)` and must end with the
-  2-tuple `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]`
-  (one entry per step); the final carry is internal.
+- **Shared values** — the step reads enclosing names as a Julia closure does,
+  and closing over a value is how every step shares it. An enclosing name the
+  step reads is captured whole: a `@kernel` signature port, a name the kernel
+  body assigns, or a name of an enclosing plate cell or scan step. Only the
+  positionals are iterated. Do not pass a shared value as a `Ref(...)`
+  positional. Older kernels do, after the iterated sequences; such an operand
+  prepares the same kernel as the closure, and how that spelling is retired is
+  open (user decision `0kvm2ip`).
+- **The do-block** receives `(carry, x₁, x₂, …)` and must end with the 2-tuple
+  `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]` (one
+  entry per step); the final carry is internal.
 - **`include_init = true`** (a literal; default `false`) returns
   `[init, output₁, output₂, …]` instead: one element longer than the sequences,
   in one buffer. See [The initial value in the result](#The-initial-value-in-the-result).
@@ -78,9 +83,8 @@ which threads the previous observation and the previous error. Carry both in a
 `ν₁ = μ + φ·μ` at `t = 1`:
 
 ```julia
-errors = scan(series, Ref(μ), Ref(φ), Ref(θ);
-              init = (; y_prev = μ, err_prev = 0.0)) do carry, y, m, f, t
-    ν = m + f * carry.y_prev + t * carry.err_prev
+errors = scan(series; init = (; y_prev = μ, err_prev = 0.0)) do carry, y
+    ν = μ + φ * carry.y_prev + θ * carry.err_prev
     e = y - ν
     ((; y_prev = y, err_prev = e), e)
 end
@@ -127,8 +131,8 @@ m = scan(tchange, r; init = m0) do carry, tc, rr
 end
 ```
 
-Shared broadcast-invariant scalars still ride along as trailing `Ref`s:
-`scan(a, b, Ref(gain); init = 0.0) do carry, aₜ, bₜ, g … end`.
+A shared value such as a `gain` port is read directly in the step:
+`scan(a, b; init = 0.0) do carry, aₜ, bₜ … gain … end`.
 
 Pass the sequences a step reads as separate positionals rather than packing
 them into matrix rows. A piecewise-exact turnover recurrence
@@ -136,11 +140,10 @@ them into matrix rows. A piecewise-exact turnover recurrence
 step sizes reads both directly:
 
 ```julia
-trajectory = scan(conc_mid, dts, Ref(pd), Ref(kin);
-                  init = pd.baseline, include_init = true) do previous, concentration, dt, parameters, input_rate
-    c2 = parameters.kout * (1 + concentration /
-        (parameters.theta1 * concentration + parameters.theta2))
-    steady = input_rate / c2
+trajectory = scan(conc_mid, dts;
+                  init = pd.baseline, include_init = true) do previous, concentration, dt
+    c2 = pd.kout * (1 + concentration / (pd.theta1 * concentration + pd.theta2))
+    steady = kin / c2
     next = (previous - steady) * exp(-c2 * dt) + steady
     (next, next)
 end
@@ -194,8 +197,8 @@ A scan over matrix rows iterates `eachrow` of the matrix — one row per step �
 with whatever carry the recurrence threads (here a 2-vector belief state):
 
 ```julia
-forward = scan(eachrow(scan_rows), Ref(gain); init = seed) do carry, row, g
-    newg = g .* (row[1] .+ carry .* row[2]) .+ row[3]
+forward = scan(eachrow(scan_rows); init = seed) do carry, row
+    newg = gain .* (row[1] .+ carry .* row[2]) .+ row[3]
     (newg, sum(newg))
 end
 ```
@@ -209,9 +212,9 @@ doses produce, `w[j] = f(mg[j], Σ_{i<j} w[i] · u[lag(j, i)])`. With
 the scan is writing:
 
 ```julia
-weights = scan(dose_mgs, eachindex(dose_mgs), Ref(plan), Ref(units);
-               init = 0, history = 0.0) do carry, mg, j, p, u, earlier
-    exposure = sum(earlier[i] * get(u, lag(p, j, i), 0.0) for i in 1:j-1; init = 0.0)
+weights = scan(dose_mgs, eachindex(dose_mgs);
+               init = 0, history = 0.0) do carry, mg, j, earlier
+    exposure = sum(earlier[i] * get(units, lag(plan, j, i), 0.0) for i in 1:j-1; init = 0.0)
     (carry, mg == 0 ? 0.0 : effective_amount(mg, exposure))
 end
 ```
@@ -277,10 +280,10 @@ using ReactiveKernels: scan
 
 @kernel dose_weights(mgs::Vector{Float64}, units::Matrix{Float64}, n::Int) = begin
     slots = collect(1:n)
-    weights = scan(mgs, eachrow(units), Ref(slots);
-            init = (; prior = zeros(Float64, n), index = 1)) do carry, mg, u, positions
+    weights = scan(mgs, eachrow(units);
+            init = (; prior = zeros(Float64, n), index = 1)) do carry, mg, u
         weight = mg / (1 + sum(carry.prior .* u))
-        next = ifelse.(positions .== carry.index, weight, carry.prior)
+        next = ifelse.(slots .== carry.index, weight, carry.prior)
         ((; prior = next, index = carry.index + 1), weight)
     end
     total::Float64 = 1.0 + sum(weights)
@@ -352,7 +355,7 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   outputs in a vector. When that port feeds only one authored `plate` with a
   selected `sum`, native preparation can run the plate cell inside the same
   carry loop and omit the intermediate scan vector. The plate's other inputs
-  must be declared numeric scalars or explicit `Ref` operands. Its shared
+  must be declared numeric scalars or captured enclosing values. Its shared
   computations run once outside the loop. Requesting the pointwise plate port
   still returns its vector; requesting the scan port, adding another consumer,
   supplying another broadcast array, or composing multiple plates preserves
@@ -362,7 +365,7 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   [default optimization](#Default-optimized-short-scans) may expand short scans
   while preserving their semantics. The lowering is selected whenever any
   scan operand is traced (the carry seed, an iterated sequence looked through its
-  `eachrow` wrapper, or a shared operand looked through its `Ref`), and every
+  `eachrow` wrapper, or a captured shared value), and every
   iterated sequence is then carried as a traced array: a 1-D sequence is
   gathered element by element by the loop counter, an `eachrow` matrix
   contributes its parent and row `i` is one traced dynamic slice (so the
@@ -370,7 +373,8 @@ using bare `scan`. A bare, unbound `scan` remains an ordinary call and raises
   host (`bound=`) sequence is lifted into the traced program as a constant
   exactly as bound plate data is. Sequences of different kinds may be
   iterated together, and several lockstep sequences share the one loop.
-  `Ref(...)` operands are read the way an authored loop reads its captures:
+  Captured shared values are read the way an authored loop reads its
+  captures:
   traced values enter the loop as fresh tracers and host values cross it
   unchanged, field by field for a tuple or named tuple. So a host schedule
   plan (a struct holding a `Vector{Int}`) reaches the step as itself, and a
@@ -455,9 +459,9 @@ Native iteration remains an ordinary loop.
 - **The iterated sequences must share axes.** A length mismatch between
   sequences throws `DimensionMismatch`. Empty sequences are supported (see
   [Empty sequences](#Empty-sequences)).
-- **Iterated sequences precede shared operands.** All bare (iterated) positionals
-  come first; every `Ref(...)` shared operand follows. A non-`Ref` positional
-  after a `Ref(...)` is rejected.
+- **Every positional is iterated.** Shared values are captured, not passed. In
+  older kernels that pass them as `Ref(...)` operands, those must follow the
+  iterated sequences: a bare positional after a `Ref(...)` is rejected.
 - **Per-step output is a scalar** on the Reactant `while` path. A non-scalar
   per-step output there is a loud, reported error, never a silent mis-lowering;
   author the output as a scalar (or open an issue for the shape you need).

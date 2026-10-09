@@ -240,7 +240,11 @@ used directly; a definition can also construct an RHS value. Undotted `~`
 evaluates one whole-event density; `.~` applies it over Julia broadcast cells,
 retains the broadcast axes in `:pointwise`, and sums those cells. Independent
 custom broadcasts need not share another response's row count. Observations
-acquire no packed coordinates and need no transform or random generator.
+acquire no packed coordinates and need no transform or random generator. As
+under a built-in family, an observed number is one observation, and an
+observed definition reading only data (`y = v[positions(rows)]`,
+`y = sum(f(raw))`) is evaluated once by `bind_data` and validated as the
+response, exactly like the same value bound as data.
 
 A parameter declaration additionally needs structural geometry. The method
 receives the constructor binding, authored argument expressions and declared
@@ -674,8 +678,10 @@ caller-owned sampling laws such as `LogDensity.(score, loc[i], sigma)`, where
 a visible `KernelSpec` law runs inside the inner observation plate. A
 per-index value may combine with shared values in any distribution argument,
 as in `Normal.(loc[i], dose[i] * sigma)`. The response may also be a
-definition that reads only data, such as `y = group_cells(raw, rows)`;
-binding evaluates it once and validates its arrays as the response.
+definition that reads only data, such as `y = group_cells(raw, rows)` or a
+gather `y = cells[perm]`; binding evaluates it once and validates its arrays
+as the response. The data the definition reads are its inputs, not
+observation operands.
 
 Outside a dotted cell, Julia refuses this shape, and so does binding.
 `y .~ Normal.(loc, sigma)` broadcasts `Normal` over the arrays of `y`, and an

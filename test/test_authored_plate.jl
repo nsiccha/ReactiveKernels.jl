@@ -1192,6 +1192,86 @@ end
                                    for (obs, m) in zip(y, mu))
 end
 
+# A module global that a kernel-local below shadows: the cell must read the
+# kernel-local, as a Julia closure would, never this binding.
+const _captured_shadowed = [100.0, 200.0, 300.0]
+
+@testset "authored plate block: a captured enclosing name is the whole value" begin
+    # A cell reads an enclosing name as a Julia closure does. Only the plate's
+    # explicit non-`Ref` arguments are zipped; a capture enters whole, like an
+    # explicit `Ref(name)` (snag rk-plate-body-ca-091ef037).
+    @kernel _captured_vector_plate(x, d) = begin
+        cells = plate(eachindex(d), d) do s, dd
+            x[s] + dd
+        end
+        return cells
+    end
+    @kernel _reffed_vector_plate(x, d) = begin
+        cells = plate(eachindex(d), Ref(x), d) do s, xs, dd
+            xs[s] + dd
+        end
+        return cells
+    end
+    @kernel _captured_whole_plate(x, d) = begin
+        cells = plate(d) do dd
+            x[1] + length(x) + dd
+        end
+        return cells
+    end
+    @kernel _captured_derived_plate(x, d) = begin
+        _captured_shadowed = x .+ 1.0
+        cells = plate(eachindex(d), d) do s, dd
+            _captured_shadowed[s] + dd
+        end
+        return cells
+    end
+    @kernel _captured_container_plate(t, p, d) = begin
+        cells = plate(d) do dd
+            t[2] + p.a + dd
+        end
+        return cells
+    end
+    @kernel _captured_nested_plate(groups, w) = begin
+        group_totals = plate(groups) do observations
+            scaled = observations .* 2.0
+            inner = plate(eachindex(observations)) do i
+                scaled[i] + w[i]
+            end
+            sum(inner)
+        end
+        return group_totals
+    end
+
+    x, d = [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
+    captured = prepare(_captured_vector_plate)
+    @test captured(x, d) == map((s, dd) -> x[s] + dd, eachindex(d), d)
+    @test captured(x, d) == prepare(_reffed_vector_plate)(x, d)
+    plate_ops = [r.op for r in plan(_captured_vector_plate).recipes
+                 if r.op isa ReactiveKernels._AuthoredPlateOp]
+    @test length(plate_ops) == 1
+    # Arguments: the materialized `eachindex(d)`, `d`, then the capture `x`.
+    @test typeof(only(plate_ops)).parameters[2] == (3,)
+
+    whole = prepare(_captured_whole_plate)
+    @test whole(x, d) == map(dd -> x[1] + length(x) + dd, d)
+    # A capture shorter than the plate axis is not broadcast against it.
+    y = [1.0, 2.0]
+    @test whole(y, d) == map(dd -> y[1] + length(y) + dd, d)
+
+    # A kernel-local the cell reads is captured too; a same-named module
+    # global does not leak in.
+    @test prepare(_captured_derived_plate)(x, d) ==
+          map((s, dd) -> x[s] + 1.0 + dd, eachindex(d), d)
+    @test prepare(_captured_container_plate)((1.0, 2.0, 3.0), (; a = 5.0), d) ==
+          d .+ 7.0
+
+    # An inner cell captures an outer cell's local and a kernel port.
+    groups = [[1.0, 2.0], [4.0]]
+    w = [0.5, 0.25]
+    @test prepare(_captured_nested_plate)(groups, w) ==
+          [sum(2.0 .* g .+ w[eachindex(g)]) for g in groups]
+end
+
 @testset "authored plate block: keyword-call authoring without semicolon" begin
     scale_logpdf(; logit) = -log1pexp(-logit)
     @kernel _kw_call_plate(e::Vector{Float64}) = begin
