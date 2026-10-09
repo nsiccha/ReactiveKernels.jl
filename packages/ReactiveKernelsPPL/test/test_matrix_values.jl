@@ -446,3 +446,39 @@ end
     code = string(kernel_expr(models[1].bound, models[1].built.layout))
     @test count("X * B", code) == 1
 end
+
+@testset "matrix values: column reads read the product in place" begin
+    # A column read of a parameter-dependent value is a view of it, so native
+    # reverse mode neither copies the column nor adds the copy's adjoint back
+    # (todo `0twouk0`). Values and gradients are pinned by the testsets above.
+    for kind in (:named, :alias, :inline, :submodel, :data_matrix, :scale)
+        case = _ma_column_case(kind, 6)
+        plan = lower_rkppl(case.ast, Set(keys(case.data));
+            conditioned = (:y1, :y2), mod = @__MODULE__)
+        bound = bind_data(plan, case.data)
+        built = build_kernel(bound)
+        code = string(kernel_expr(bound, built.layout))
+        @test occursin("_tensorized_view", code) && !occursin(r"\w\[:, ", code)
+        observations = prepare_query(built, bound, :observations)
+        u = [0.1i for i in 1:built.layout.total]
+        first = Base.invokelatest(observations, u)
+        @test first.y1.location isa SubArray
+        before = deepcopy(first)
+        Base.invokelatest(observations, -u)
+        @test isequal(first, before)
+    end
+    # Fewer bytes than separate products under native Enzyme reverse.
+    bytes = map((:named, :separate)) do kind
+        case = _ma_column_case(kind, 200)
+        plan = lower_rkppl(case.ast, Set(keys(case.data));
+            conditioned = (:y1, :y2), mod = @__MODULE__)
+        bound = bind_data(plan, case.data)
+        built = build_kernel(bound)
+        u = [0.1sin(i) for i in 1:built.layout.total]
+        q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(q, g, u)
+        @allocated sampler_value_and_gradient!(q, g, u)
+    end
+    @test bytes[1] < bytes[2]
+end
