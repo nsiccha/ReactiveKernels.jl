@@ -512,8 +512,10 @@ position held by the new HAVE port `i` (a linear position or a
 slices of the plate's arguments, through the same native plate lowering, so it
 equals the plate's element at that position and differentiates with ordinary
 native Enzyme Reverse. A plate whose only consumer is this one composes into
-the cell, as plate chains compose, and runs at that cell only; any other value
-the cell reads is computed as usual. A position outside the domain throws
+the cell, as plate chains compose, and runs at that cell only. So does a plate
+read only by cells at one position (several `plate_cell` values sharing an
+index port): each of those cells runs it at that position. Any other value the
+cell reads is computed as usual. A position outside the domain throws
 `BoundsError`. Several plates can share one index port by passing the same
 `index` to successive `plate_cell` calls.
 

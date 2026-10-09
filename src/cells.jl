@@ -15,7 +15,9 @@ Planning a WANT of `name` runs only that cell, through the plate's own scalar
 body and the same native plate lowering, so the value is the plate's element at
 that position. An authored plate whose only consumer is this one is composed
 into the cell, as plate chains are composed (see [`prepare`](@ref)), and so
-also runs at that cell only. Every other value the cell reads is planned as
+also runs at that cell only. So is a plate read only by cells at the same
+position (several `plate_cell` values sharing `index`): each of those cells
+runs it at that position. Every other value the cell reads is planned as
 usual. A cell outside the plate's domain throws `BoundsError`; the plate's
 broadcast-domain checks are kept.
 
