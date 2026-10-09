@@ -184,3 +184,138 @@ end
         @test dx[i] ≈ _cell_central(h -> k(x .+ h .* e, y, 0.8, i), 0.0) rtol = 1e-6
     end
 end
+
+# Upstream arrays the cell reads only at its own row (`log_k[i]`, `shift[i]`):
+# a dotted predictor over a gather of a matrix product's rows, and gathers on
+# their own. Each is computed at the cell's row only (increment 1b).
+@kernel _cell_upstream(positions::Vector{Int}, y, w, codes::Vector{Int},
+                       Z::Matrix{Float64}, F::Matrix{Float64}, a::Float64) = begin
+    R = Z * F'
+    eta = R[codes, 1]
+    log_k = a .+ 0.5 .* w .+ eta
+    shift = R[codes, 2]
+    loc = plate(positions) do i
+        exp(log_k[i]) + shift[i]
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+function _cell_upstream_data(n; levels = max(1, n ÷ 2))
+    (; positions = collect(1:n), y = sin.(1:n),
+       w = collect(range(-1.0, 1.0; length = n)),
+       codes = [mod1(3j, levels) for j in 1:n],
+       Z = reshape(collect(range(-0.5, 0.7; length = 2levels)), levels, 2))
+end
+
+const _CELL_F = [0.8 0.0; 0.3 0.5]
+const _CELL_HAVE = (:positions, :y, :w, :codes, :Z, :F, :a)
+
+@testset "plate_cell: upstream arrays computed at the cell's row" begin
+    spec = plate_cell(_cell_upstream, :dens; index = :i)
+    k = prepare(spec; have = (_CELL_HAVE..., :i), want = :dens_cell)
+    full = prepare(_cell_upstream; have = _CELL_HAVE, want = :dens)
+    d = _cell_upstream_data(9)
+    reference = full(d..., _CELL_F, 0.3)
+    @test [k(d..., _CELL_F, 0.3, i) for i in d.positions] ≈ reference
+    # Neither the predictors nor the product are computed for the domain.
+    allocated(d) = (k(d..., _CELL_F, 0.3, 2); @allocated k(d..., _CELL_F, 0.3, 2))
+    small, large = allocated(_cell_upstream_data(10)), allocated(_cell_upstream_data(100_000))
+    @test large == small
+    @test large < 8 * 1000
+    bound = prepare(spec; have = (_CELL_HAVE..., :i), want = :dens_cell,
+        bound = (; d.positions, d.y, d.w, d.codes))
+    @test [bound(d.Z, _CELL_F, 0.3, i) for i in d.positions] ≈ reference
+    # An operand extruded by broadcasting, and a value also wanted whole.
+    one_w = (; d..., w = [0.2])
+    @test [k(one_w..., _CELL_F, 0.3, i) for i in d.positions] ≈ full(one_w..., _CELL_F, 0.3)
+    both = prepare(spec; have = (_CELL_HAVE..., :i), want = (:dens_cell, :log_k))
+    log_k = prepare(_cell_upstream; have = _CELL_HAVE, want = :log_k)(d..., _CELL_F, 0.3)
+    @test all(both(d..., _CELL_F, 0.3, i) == (k(d..., _CELL_F, 0.3, i), log_k)
+              for i in d.positions)
+    # The cell's own reads are checked, and operand shapes as a whole.
+    @test_throws BoundsError k(d..., _CELL_F, 0.3, 10)
+    bad_code = (; d..., codes = [d.codes[1], size(d.Z, 1) + 1, d.codes[3:end]...])
+    @test_throws BoundsError k(bad_code..., _CELL_F, 0.3, 2)
+    @test_throws DimensionMismatch k((; d..., w = [d.w; 0.0])..., _CELL_F, 0.3, 2)
+end
+
+@testset "plate_cell: native Enzyme Reverse through upstream rows" begin
+    k = prepare(plate_cell(_cell_upstream, :dens; index = :i);
+        have = (_CELL_HAVE..., :i), want = :dens_cell)
+    d = _cell_upstream_data(9)
+    original = deepcopy(d)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for i in (1, 6)
+        value = k(d..., _CELL_F, 0.3, i)
+        matrix = prepare_ad(k, backend, d..., _CELL_F, 0.3, i; active = :Z)
+        v, dZ = ad_value_and_gradient(matrix, d..., _CELL_F, 0.3, i)
+        @test v ≈ value
+        # Only the row of Z the cell gathers has a derivative.
+        @test findall(vec(any(!iszero, dZ; dims = 2))) == [d.codes[i]]
+        for column in 1:2
+            e = zero(d.Z); e[d.codes[i], column] = 1.0
+            @test dZ[d.codes[i], column] ≈ _cell_central(
+                h -> k((; d..., Z = d.Z .+ h .* e)..., _CELL_F, 0.3, i), 0.0) rtol = 1e-6
+        end
+        scalar = prepare_ad(k, backend, d..., _CELL_F, 0.3, i; active = :a)
+        _, da = ad_value_and_gradient(scalar, d..., _CELL_F, 0.3, i)
+        @test da ≈ _cell_central(a -> k(d..., _CELL_F, a, i), 0.3) rtol = 1e-6
+        factor = prepare_ad(k, backend, d..., _CELL_F, 0.3, i; active = :F)
+        _, dF = ad_value_and_gradient(factor, d..., _CELL_F, 0.3, i)
+        e = zero(_CELL_F); e[2, 1] = 1.0
+        @test dF[2, 1] ≈ _cell_central(h -> k(d..., _CELL_F .+ h .* e, 0.3, i), 0.0) rtol = 1e-6
+    end
+    @test d == original
+end
+
+# A population predictor `X * beta` read as an operand of the dotted
+# predictor: a matrix-vector product, computed at the cell's row as well.
+@kernel _cell_population(positions::Vector{Int}, y, X::Matrix{Float64},
+                         beta::Vector{Float64}, codes::Vector{Int}, Z) = begin
+    pop = X * beta
+    log_k = pop .+ Z[codes, 1]
+    loc = plate(positions) do i
+        exp(log_k[i])
+    end
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "plate_cell: a matrix-vector product read by a dotted predictor" begin
+    have = (:positions, :y, :X, :beta, :codes, :Z)
+    k = prepare(plate_cell(_cell_population, :dens; index = :i);
+        have = (have..., :i), want = :dens_cell)
+    full = prepare(_cell_population; have, want = :dens)
+    function data(n)
+        x = collect(range(-1.0, 1.0; length = n))
+        (; positions = collect(1:n), y = cos.(1:n), X = hcat(ones(n), x, x .^ 2),
+           beta = [0.1, -0.4, 0.3], codes = [mod1(j, 3) for j in 1:n],
+           Z = [0.2 -0.1; 0.5 0.3; -0.3 0.0])
+    end
+    d = data(7)
+    @test [k(d..., i) for i in d.positions] ≈ full(d...)
+    allocated(d) = (k(d..., 2); @allocated k(d..., 2))
+    @test allocated(data(10)) == allocated(data(100_000))
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for i in (2, 5)
+        ad = prepare_ad(k, backend, d..., i; active = :beta)
+        value, dbeta = ad_value_and_gradient(ad, d..., i)
+        @test value ≈ k(d..., i)
+        for j in 1:3
+            e = zeros(3); e[j] = 1.0
+            @test dbeta[j] ≈ _cell_central(h -> k((; d..., beta = d.beta .+ h .* e)..., i),
+                0.0) rtol = 1e-6
+        end
+        design = prepare_ad(k, backend, d..., i; active = :X)
+        _, dX = ad_value_and_gradient(design, d..., i)
+        @test findall(vec(any(!iszero, dX; dims = 2))) == [i]
+    end
+    @test d == data(7)
+end

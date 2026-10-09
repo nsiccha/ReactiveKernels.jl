@@ -539,6 +539,66 @@ const _CMP_MA_COLS = Dict{Symbol,Any}(
     end
 end
 
+# A named definition reading a declared-array gather (`mu_base = a0 .+
+# z[g]`) is one value leaf of a composition, read like the column its
+# inline spelling `(a0 .+ z[g])` reads (snag `rkppl-named-gath-bf3760cd`;
+# naming never changes legality or the density). It stays one named
+# value, evaluated once under its authored name.
+const _CMP_NG_COLS = Dict{Symbol,Any}(
+    :x => [0.5, 1.0, 1.5, 0.25, 2.0, 0.75], :g => [1, 2, 3, 1, 2, 3],
+    :y => [0.3, -1.2, 0.8, 1.9, -0.4, 0.6])
+
+@testset "composed leaves: named declared-array gathers" begin
+    x, g, y = _CMP_NG_COLS[:x], _CMP_NG_COLS[:g], _CMP_NG_COLS[:y]
+    q = (a0 = 0.4, s0 = 0.7, k = -0.2,
+        z = [0.2, -0.5, 0.8], w = [-0.3, 0.6, 0.1])
+    priors(q) = logpdf(Normal(0, 1), q.a0) + logpdf(Normal(0, 1), q.s0) +
+        logpdf(Normal(0, 1), q.k) + sum(logpdf.(Normal(0, 1), q.z)) +
+        sum(logpdf.(Normal(0, 1), q.w))
+    head = quote
+        a0 ~ Normal(0, 1); z[levels(g)] .~ Normal.(0, 1)
+        s0 ~ Normal(0, 1); w[levels(g)] .~ Normal.(0, 1)
+        k ~ Normal(0, 1)
+        m = exp.(k) .* x
+    end
+    m(q) = exp(q.k) .* x
+    for (named, inline, value, leaves) in (
+            (quote
+                mu_base = a0 .+ z[g]
+                slope = s0 .+ w[g]
+                mu = mu_base .+ slope .* m
+            end, :(mu = (a0 .+ z[g]) .+ (s0 .+ w[g]) .* m),
+                q -> (q.a0 .+ q.z[g]) .+ (q.s0 .+ q.w[g]) .* m(q),
+                [:mu_base => :(a0 .+ z[g]), :slope => :(s0 .+ w[g])]),
+            (quote
+                slope = s0 .+ w[g]
+                mu = slope .* m
+            end, :(mu = (s0 .+ w[g]) .* m),
+                q -> (q.s0 .+ q.w[g]) .* m(q),
+                [:slope => :(s0 .+ w[g])]),
+            (quote
+                zs = s0 .* z[g]
+                mu = a0 .+ zs .* m
+            end, :(mu = a0 .+ (s0 .* z[g]) .* m),
+                q -> q.a0 .+ (q.s0 .* q.z[g]) .* m(q),
+                [:zs => :(s0 .* z[g])]))
+        want = q -> sum(logpdf.(Normal.(value(q), 0.7), y)) + priors(q)
+        for location in (named, inline)
+            prog = Expr(:block, head.args...,
+                (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+                :(y .~ Normal.(mu, 0.7)))
+            plan, _, _ = _cmp_ap_check(prog, q, want; cols = _CMP_NG_COLS)
+            t = only(only(p for p in plan.predictors if p.name === :mu).terms)
+            @test t.kind === ComposedTerm
+            location === named || continue
+            # Each named gather is a value leaf and one named definition.
+            @test t.columns == first.(leaves)
+            @test [d.name => d.expr for d in plan.derived
+                if d.name in first.(leaves)] == leaves
+        end
+    end
+end
+
 # The other leaf spellings beside an affine sub-predictor `w`: a whole
 # declared array read inline (`z`, `sd .* z`), and a data-only vector or
 # a module call read by name or inline. Each named and inline spelling
@@ -580,4 +640,52 @@ const _CMP_LEAF_COLS = Dict{Symbol,Any}(
             @test only(plan.predictors[end].terms).kind === ComposedTerm
         end
     end
+end
+
+# Julia's `.+(a, b, c)` and `.*(a, b, c)` broadcast the n-ary `+` and `*`,
+# which fold left: `(a .+ b) .+ c` elementwise. BRM emits Julia's n-ary
+# `a + b + c` this way (snag `composed-predict-64339857`). The composition
+# keeps that order, so its density equals the nested spelling's.
+@testset "composed n-ary dotted sums and products fold like Julia's" begin
+    x, y = _cmp_ap_x(), Vector{Float64}(_CMP_AP_COLS[:y])
+    q = (a_th = 0.3, b_th = -0.4, a_al = 0.6, b_al = 0.2, k = -0.3, s = 0.5)
+    priors(q) = sum(logpdf(Normal(0, 1), v) for v in values(q))
+    th(q) = q.a_th .+ q.b_th .* x
+    al(q) = q.a_al .+ q.b_al .* x
+    m(q) = exp(q.k) .* x
+    prog(location) = quote
+        a_th ~ Normal(0, 1); b_th ~ Normal(0, 1)
+        a_al ~ Normal(0, 1); b_al ~ Normal(0, 1)
+        k ~ Normal(0, 1); s ~ Normal(0, 1)
+        th = a_th .+ b_th .* x
+        al = a_al .+ b_al .* x
+        m = exp.(k) .* x
+        $location
+        y .~ Normal.(mu, 1.5)
+    end
+    for (location, tree, value) in (
+            (:(mu = .+(th, al .* m, s)), :((th .+ al .* m) .+ s),
+                q -> (th(q) .+ al(q) .* m(q)) .+ q.s),
+            (:(mu = .+(th, al .* m, s, 0.25)),
+                :(((th .+ al .* m) .+ s) .+ _rkppl_leaf_1),
+                q -> ((th(q) .+ al(q) .* m(q)) .+ q.s) .+ 0.25),
+            (:(mu = th .+ .*(al, m, s)), :(th .+ (al .* m) .* s),
+                q -> th(q) .+ (al(q) .* m(q)) .* q.s))
+        want = q -> sum(logpdf.(Normal.(value(q), 1.5), y)) + priors(q)
+        plan, _, _ = _cmp_ap_check(prog(location), q, want)
+        t = only(only(p for p in plan.predictors if p.name === :mu).terms)
+        @test t.kind === ComposedTerm
+        @test t.options.tree == tree
+    end
+    # refused: Julia's `-` takes one or two operands, so `.-(a, b, c)` is a
+    # MethodError in Julia too (P3, standard Julia semantics).
+    err = try
+        lower_rkppl(prog(:(mu = .-(th, al .* m, s))), keys(_CMP_AP_COLS);
+            conditioned = keys(_CMP_AP_COLS))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("one or two operands", sprint(showerror, err))
 end

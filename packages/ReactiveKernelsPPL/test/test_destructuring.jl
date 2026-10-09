@@ -190,6 +190,24 @@ end
     check_sampler(bound, built, data; total=false)
 end
 
+# The named spelling of the read above: `bt` stays the one tuple value and
+# its first element is the location (snag rkppl-indexed-mu-0f0ed295).
+@testset "a multi-output KernelSpec result read once by position" begin
+    ast = quote
+        a ~ Normal(0, 0.7)
+        bt = moments(x, a)
+        path = bt[1]
+        y .~ Normal.(path, 0.8)
+    end
+    data = case(5)
+    original = deepcopy(data)
+    bound, built = build(ast, data)
+    @test call_count(kernel_expr(bound, built.layout), :moments) == 1
+    @test scan_count(built.spec) == 1
+    check_sampler(bound, built, data; total=false)
+    @test data == original
+end
+
 @testset "destructuring in a submodel body splices the same boundary" begin
     ast = quote
         a ~ Normal(0, 0.7)
