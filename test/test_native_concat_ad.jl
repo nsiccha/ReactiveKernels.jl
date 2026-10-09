@@ -67,6 +67,14 @@ end
     end
     total = sum(trajectory)
 end
+# A parameter block read in place: a contiguous view of the active vector and
+# its matrix reshape, each concatenated with constant data.
+@kernel padded_block(u, C, R, r) = begin
+    B = reshape(view(u, 2:5), 2, 2)
+    total = sum(vcat(C, B) .* R) + sum(vcat(r, view(u, 1:2)) .* vcat(r, r)) +
+            sum(hcat(B, R[1:2, 1:1]) .* hcat(R[2:3, :], R[1:2, 1:1]))
+    return total
+end
 @traceable with_column(D, v) = hcat(D, v)
 @kernel helper(a, D, x, w) = begin
     total = sum(with_column(D, exp.(a .* x)) * w)
@@ -149,6 +157,27 @@ _derivative(f, a) = (f(a + cbrt(eps(a))) - f(a - cbrt(eps(a)))) / (2cbrt(eps(a))
             @test gw ≈ [n, sum(x), sum(exp.(T(0.3) .* x))]
         end
         @test (x, w, r, D, C, Cr, R, Rb) == saved
+    end
+    # Views of the active vector, concatenated beside constant arrays.
+    for T in (Float64, Float32)
+        u = T[0.3, -0.2, 0.5, 0.9, -0.4]
+        C = T[0.1 0.2]
+        R = T[cos(i + 2j) for i in 1:3, j in 1:2]
+        r = T[0.7, -1.1]
+        saved = deepcopy((u, C, R, r))
+        B(u) = reshape(u[2:5], 2, 2)
+        reference(u) = sum(vcat(C, B(u)) .* R) + sum(vcat(r, u[1:2]) .* vcat(r, r)) +
+            sum(hcat(B(u), R[1:2, 1:1]) .* hcat(R[2:3, :], R[1:2, 1:1]))
+        expected = zeros(T, 5)
+        expected[1:2] .+= r
+        expected[2:5] .+= 2 .* vec(R[2:3, :])
+        k = prepare(padded_block; bound = (; C, R, r))
+        ad = prepare_ad(k, backend, u; active = :u)
+        value, gradient = ad_value_and_gradient(ad, u)
+        @test k(u) ≈ reference(u)
+        @test value ≈ reference(u)
+        @test gradient ≈ expected
+        @test (u, C, R, r) == saved
     end
 end
 end

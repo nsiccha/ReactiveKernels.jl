@@ -503,6 +503,20 @@ plate currently executes the whole selected cell graph per outer coordinate;
 it does not apply the scalar-only plate scheduler's outer invariant hoisting
 across that boundary.
 
+### One cell of a plate
+
+`plate_cell(spec, :pointwise; index = :i)` returns a kernel whose value
+`pointwise_cell` is ONE cell of the authored plate producing `pointwise`, at the
+position held by the new HAVE port `i` (a linear position or a
+`CartesianIndex`). The cell runs the plate's own scalar body over the one-cell
+slices of the plate's arguments, through the same native plate lowering, so it
+equals the plate's element at that position and differentiates with ordinary
+native Enzyme Reverse. A plate whose only consumer is this one composes into
+the cell, as plate chains compose, and runs at that cell only; any other value
+the cell reads is computed as usual. A position outside the domain throws
+`BoundsError`. Several plates can share one index port by passing the same
+`index` to successive `plate_cell` calls.
+
 ### Inspecting structure
 
 `recipe_kind(recipe)` classifies a recipe as `:plate`, `:scan` or `:ordinary`

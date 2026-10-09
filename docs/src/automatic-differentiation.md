@@ -7,7 +7,9 @@ dependency, and core package source never imports it.
 
 `prepare_ad` resolves one active HAVE port and one scalar WANT once.
 `prepare_ad_pullback` applies the same boundary to a scalar or non-scalar WANT
-and prepares one reverse output-cotangent direction. Every other selected HAVE
+and prepares one reverse output-cotangent direction; `prepare_ad_pushforward`
+and `prepare_ad_hvp` prepare Jacobian-vector and Hessian-vector products on it
+(see below). Every other selected HAVE
 is supplied to the backend as a freshly rebound `Constant`, so preparation
 fixes types and shapes without freezing values used by later calls. Both paths
 differentiate the exact primal callable, operation table, and inspectable AST;
@@ -130,6 +132,67 @@ restore mutated memory in the reverse pass. Retention is native: a
 yet. `test/test_ad_retained_outputs.jl` checks the values, gradients and
 refusals.
 
+## Jacobian-vector and Hessian-vector products
+
+`prepare_ad_pushforward` and `prepare_ad_hvp` prepare the forward and
+second-order operators on the same boundary: one active HAVE, every other HAVE
+rebound as a `Constant` per call, `bound` partial evaluation, and the exact
+primal body. Both take input tangents as a tuple of directions, one entry per
+direction, so `(v,)` is one direction and `(v1, v2, v3)` evaluates three
+together. Results come back as a tuple in the same order.
+
+```julia
+second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+                           AutoEnzyme(; mode = Enzyme.Forward))
+
+@kernel tangent_density(q::Vector{Float64}, s::Float64;
+                        data::Vector{Float64}) = begin
+    density::Float64 = sum(data .* exp.(s .* q)) - 0.5 * sum(abs2, q) - s^2
+end
+
+v = [1.0, 0.5, -2.0]
+hvp = prepare_ad_hvp(tangent_density, second_order, (v,), parameters, 0.7;
+                     data, active = :q, want = :density)
+(hv,) = ad_hvp(hvp, (v,), parameters, 0.7; data)
+gradient, (hv,) = ad_gradient_and_hvp(hvp, (v,), parameters, 0.7; data)
+
+@kernel tangent_mean(q::Vector{Float64}, s::Float64;
+                     data::Vector{Float64}) = begin
+    mean = data .* exp.(s .* q)
+end
+
+jvp = prepare_ad_pushforward(tangent_mean, AutoEnzyme(; mode = Enzyme.Forward),
+                             (v,), parameters, 0.7;
+                             data, active = :q, want = :mean)
+value, (jv,) = ad_value_and_pushforward(jvp, (v,), parameters, 0.7; data)
+```
+
+A Hessian-vector product needs a scalar WANT and a second-order backend.
+Use reverse over forward, as above. Native Enzyme forward over reverse fails
+static activity analysis when the objective multiplies a constant matrix by an
+active vector, as a design-matrix linear predictor does
+(`benchmark/repro_enzyme_forward_over_reverse_const_array.jl`); it works on
+objectives without such a product. A pushforward accepts any WANT,
+including arrays and `NamedTuple`s of arrays. `ad_hvp!` and
+`ad_gradient_and_hvp!` write into caller-owned destinations, one array per
+direction.
+
+Several directions with disjoint supports compress a structured Jacobian or
+Hessian. When active coordinates fall into groups that never interact, such as
+the per-subject effects of a population model, one direction per coordinate
+within a group, summed across all groups, recovers every group's block. A
+population with `K` effects per subject needs `K` directions, whatever the
+number of subjects. The focused authority is
+[`test_ad_tangent_operators.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/test/test_ad_tangent_operators.jl).
+
+A tuple `active` selector works for pushforwards (each direction is a tuple of
+component tangents). DifferentiationInterface 0.7.21 cannot yet take a
+Hessian-vector product at such a structured point, so tuple-selector HVPs are
+not supported. A `NonAllocatingKernel` supports pushforwards; its
+Hessian-vector products fail Enzyme's static activity analysis, so take them
+from the dataflow kernel. Reactant-compiled pushforwards and Hessian-vector
+products are not provided; these operators run natively.
+
 ## Freeze data-only work during preparation
 
 When data stay fixed across many derivative calls, pass them in the named
@@ -222,9 +285,11 @@ not split by this pass.
 
 ## Accepted boundary
 
-- Gradient preparation requires a scalar WANT. Pullback preparation accepts one
-  scalar or non-scalar WANT and an output-cotangent exemplar. Further WANT
-  ports may be retained, not differentiated, with `retain`.
+- Gradient and Hessian-vector-product preparation require a scalar WANT.
+  Pullback preparation accepts one scalar or non-scalar WANT and an
+  output-cotangent exemplar; pushforward preparation accepts one scalar or
+  non-scalar WANT and a tuple of input-tangent exemplars. Further WANT ports
+  may be retained, not differentiated, with a gradient's `retain`.
 - Exactly one HAVE port is active.
 - Integer active ports and aliased active boundaries reject.
 - An inactive HAVE downstream of the active port rejects rather than cutting a

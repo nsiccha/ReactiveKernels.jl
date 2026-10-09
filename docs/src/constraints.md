@@ -369,6 +369,18 @@ and lock the one Reactant 0.2.289 lifted:
   nested plate body is; a step without a concrete inferred output type keeps
   per-arm allocation. No activity configuration or derivative rule is
   involved.
+- Native Enzyme 0.13.210 forward mode over a reverse-mode gradient (a
+  forward-over-reverse Hessian-vector product) fails static activity analysis
+  (`EnzymeRuntimeActivityError`) when the objective multiplies a constant
+  matrix by the active vector, as an RKPPL design-matrix linear predictor
+  does: `repro_enzyme_forward_over_reverse_const_array.jl` reproduces it with
+  Enzyme only. Reverse over forward differentiates the same objectives, so
+  `prepare_ad_hvp` documents that composition and its tests use it; the
+  forward-over-reverse case is pinned as broken. A `NonAllocatingKernel`'s
+  Hessian-vector products fail static activity analysis in both orders and
+  are pinned as broken; its pushforwards and the dataflow kernel's
+  Hessian-vector products work. No activity configuration or derivative rule
+  is involved.
 - On Julia 1.10, native Enzyme 0.13.210 reverse mode fails static activity
   analysis (`EnzymeRuntimeActivityError`) for an empty array when a function
   branches on the array's length and then allocates over it, for example

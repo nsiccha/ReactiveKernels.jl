@@ -35,6 +35,7 @@ const _PPL_TEST_FILES = (
     "test_distributional_broadcasts.jl",
     "test_distributional_broadcasts_reactant.jl",
     "test_query.jl",
+    "test_query_derivatives.jl",
     "test_model_view.jl",
     "test_emitted_names.jl",
     "test_native_generator_capture.jl",
@@ -275,6 +276,7 @@ const _PPL_TEST_FILES = (
     "test_inline_call_values.jl",
     "test_inline_scalar_reads.jl",
     "test_authored_names.jl",
+    "test_cell_query.jl",
 )
 
 include("sharding.jl")

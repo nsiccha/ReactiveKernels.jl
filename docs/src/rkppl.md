@@ -530,6 +530,15 @@ whole to a model-level Julia function when it needs the full value; a bare
 array combined directly with observation data must first be indexed to the
 observation axis.
 
+A declared array with a real-support prior, such as `Normal`, `StudentT` or
+`Flat`, and a real-support plate latent read the sampler's packed
+coordinates in place, so no native evaluation copies them. Such a value is a
+read-only `AbstractVector{Float64}` view; a two-axis array is a reshaped view
+(`AbstractMatrix{Float64}`). Compiled execution traces the same block as a
+slice. An array with a constrained prior is its transform's fresh output. A
+function that receives one whole should accept `AbstractVector` or
+`AbstractMatrix`, and must not write into it.
+
 ## Design matrices
 
 Bind the matrix once with `hcat` and size the coefficients with an axes prior.
@@ -857,6 +866,30 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 - A kernel returned by `prepare_query` closes over code generated at build time.
   Call it from top level or through `Base.invokelatest`; `SamplerQuery` calls
   already carry that barrier.
+
+### One cell of an observation
+
+`prepare_cell_query` evaluates ONE cell of the plates that observe the named
+observations: one iteration of an `@plate for` loop, such as one group's or one
+subject's observations, or one entry of an elementwise observation `y .~ …`.
+Only that cell runs, so its cost is what one iteration costs, plus any value
+the cell reads whole (such as a predictor vector indexed `log_k[i]`).
+
+```julia
+q = prepare_cell_query(built, plan, :y)          # or (:y, :z): one loop's observations
+q(u, i)                                          # Σ of iteration i's densities
+s = prepare_cell_sampler(built, plan, :y, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+value, g = cell_value_and_gradient!(s, similar(u), u, i)
+```
+
+- Cell `i` is entry `i` of the observation's `:pointwise` array: summing the
+  cells gives that observation's likelihood. For an `@plate for` loop holding
+  one array per index, entry `i` is the sum of iteration `i`'s densities.
+- The gradient is with respect to the whole packed vector; it is nonzero only
+  on the coordinates cell `i` reads.
+- Observations without a pointwise plate (a scalar `~` observation, a joint
+  multivariate response) are refused, naming the observation.
+- Queries are not thread-safe: prepare one per thread.
 
 ## Programs emitted by BRM
 

@@ -663,6 +663,17 @@ end
             return lead
         end
         @test @inferred(prepare(nested_partial_untyped)(2.0)) == 3.0
+        # A single-output child returns its one value, so `(a,) = child(x)`
+        # binds that value's first element.
+        @kernel nested_pair_value(x::Float64) = begin
+            pair = (x + 1, x * x)
+            return pair
+        end
+        @kernel nested_single_partial(x::Float64) = begin
+            (lead,) = nested_pair_value(x)
+            return lead
+        end
+        @test @inferred(prepare(nested_single_partial)(2.0)) == 3.0
 
         # refused: a Float64 port cannot hold the two-output tuple; Julia's
         # `s::Float64 = (3.0, 9.0)` fails the same conversion.
@@ -704,6 +715,72 @@ end
                 return y
             end
         end
+    end
+
+    @testset "a one-name tuple left side binds the first element" begin
+        # Julia lowers `(a,) = value` to `getfield(Base.indexed_iterate(value, 1), 1)`.
+        pair_of(x) = (x, 2x)
+        @kernel short_port(x::Float64) = begin
+            t = (x, 2x)
+            (a,) = t
+            return a
+        end
+        @test @inferred(prepare(short_port)(2.0)) == 2.0
+        # The element read is its own recipe, never an alias of the whole `t`.
+        short_graph = kernel_graph(short_port)
+        @test ReactiveKernels.canon_id(short_graph, short_port[:a].id) !=
+              ReactiveKernels.canon_id(short_graph, short_port[:t].id)
+        @test occursin("a = _kernel_destructure_first(t)", explain(plan(short_port)))
+
+        @kernel short_literal(x::Float64) = begin
+            (a,) = (x, 2x)
+            return a
+        end
+        @test @inferred(prepare(short_literal)(2.0)) == 2.0
+        @kernel short_call(x::Float64) = begin
+            (a::Float64,) = pair_of(x)
+            b = a + 1
+            return b
+        end
+        @test @inferred(prepare(short_call)(2.0)) == 3.0
+        @kernel short_trailing_comma(x::Float64) = begin
+            a, = pair_of(x)
+            return a
+        end
+        @test @inferred(prepare(short_trailing_comma)(2.0)) == 2.0
+        @kernel short_containers(x::Float64) = begin
+            (v,) = [x, 2x]
+            (n,) = (p = 3x, q = 4x)
+            (s,) = x
+            total = v + n + s
+            return total
+        end
+        @test @inferred(prepare(short_containers)(2.0)) == 2.0 + 6.0 + 2.0
+        # Several names keep the multi-output recipe's own destructuring.
+        @kernel short_mixed(x::Float64) = begin
+            t = (x, 2x, 3x)
+            (a,) = t
+            (b, c) = t
+            total = a + b + c
+            return total
+        end
+        @test @inferred(prepare(short_mixed)(2.0)) == 2.0 + 2.0 + 4.0
+        @kernel short_in_cell(xs) = begin
+            ys = plate(xs) do x
+                (a,) = (x, 2x)
+                a + 1
+            end
+            return ys
+        end
+        @test prepare(short_in_cell)([1.0, 2.0]) == [2.0, 3.0]
+        # A destructured plate binds its first cell, not the array.
+        @kernel short_plate(xs) = begin
+            (lead,) = plate(xs) do x
+                2x
+            end
+            return lead
+        end
+        @test prepare(short_plate)([1.0, 2.0]) == 2.0
     end
 
     @testset "typed ports, zero-execution construction, and metadata" begin
