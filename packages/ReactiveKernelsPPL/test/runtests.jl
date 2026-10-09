@@ -259,6 +259,7 @@ const _PPL_TEST_FILES = (
     "test_array_definition_gathers.jl",
     "test_array_definition_gathers_reactant.jl",
     "test_whole_value_gathers.jl",
+    "test_inline_gathered_values.jl",
     "test_plate_cells.jl",
     "test_array_cell_rows.jl",
     "test_array_cell_rows_reactant.jl",
@@ -273,6 +274,7 @@ const _PPL_TEST_FILES = (
     "test_sampler_retained.jl",
     "test_inline_call_values.jl",
     "test_inline_scalar_reads.jl",
+    "test_authored_names.jl",
 )
 
 include("sharding.jl")

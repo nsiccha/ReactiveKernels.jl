@@ -473,7 +473,8 @@ positive support and the factor width matches the outcome count.
 Array-valued definitions retain known axes: `b = z * (sd .* L)'` is groups ×
 K, so `b[g, 1]` gathers one margin per observation. Positional reads such as
 `L[2, 1]` and `M[:, 1]` remain ordinary Julia reads. A submodel's returned
-array follows the same rule. A data-only definition can size a declared array
+array follows the same rule, and so does the expression written inline:
+`(z * (sd .* L)')[g, 1]` gathers exactly as `b[g, 1]`, level lookup included. A data-only definition can size a declared array
 through `levels(gg)`, as in the multi-membership example above.
 
 Level axes preserve the order of their source. `z[levels(g)]` uses the

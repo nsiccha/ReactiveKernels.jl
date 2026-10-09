@@ -90,14 +90,43 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     append!(stmts, conditioned)
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, values)
+    args = Expr[:(unconstrained::Vector{Float64});
+        [_data_arg(colname, col) for (colname, col) in _ordered_columns(plan)]]
+    append!(stmts, _named_value_statements(plan,
+        Expr[args..., transforms..., coefs..., conditioned..., values...]))
     append!(stmts, likelihoods)
     append!(stmts, priors)
     push!(stmts, _log_jacobian_statement(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
-    sig = Expr(:call, name, :(unconstrained::Vector{Float64}),
-        (_data_arg(colname, col) for (colname, col) in _ordered_columns(plan))...)
+    sig = Expr(:call, name, args...)
     return Expr(:(=), sig, Expr(:block, stmts...))
+end
+
+# An authored alias the lowering absorbed into the value it names keeps its
+# name (`plan.named_values`): a bare alias of that node. With the node's
+# declared type, RK collapses the alias onto it, so it adds no recipe and no
+# work. `defined` holds the kernel arguments and the statements the aliases
+# may read.
+function _named_value_statements(plan::StructuralPlan, defined::Vector{Expr})
+    isempty(plan.named_values) && return Expr[]
+    types = Dict{Symbol,Any}()
+    for ex in defined
+        lhs = Meta.isexpr(ex, :(=), 2) ? ex.args[1] : ex
+        Meta.isexpr(lhs, :(::), 2) ? (types[lhs.args[1]] = lhs.args[2]) :
+            lhs isa Symbol && (types[lhs] = nothing)
+    end
+    out = Expr[]
+    for (name, node) in plan.named_values
+        haskey(types, name) && throw(ContractValidationError(
+            "[generator] authored name $name is already a graph value"))
+        haskey(types, node) || throw(ContractValidationError(
+            "[generator] authored name $name reads $node, which no statement defines"))
+        T = types[node]
+        push!(out, T === nothing ? :($name = $node) : :($name::$T = $node))
+        types[name] = T
+    end
+    return out
 end
 
 # A generated definition with its private names (`gensym`s, which differ
@@ -467,14 +496,15 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
     return walk(ex)
 end
 
-_lp_name(pred::PredictorSpec) = Symbol(:_ppl_lp_, pred.name)
-
+# Each predictor's value is the graph node named after the predictor: the
+# authored definition it lowers (`mu = a .+ b .* x` emits `mu`), or the
+# fresh name the lowering gave an inline one (`y_eta`).
 function _predictor_statements(plan::StructuralPlan)
     stmts = Expr[]
     for pred in plan.predictors
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
-        lp = _lp_name(pred)
+        lp = pred.name
         terms = Any[]
         if _broadcast_affine(plan, pred)
             append!(terms, _affine_block_terms(plan, shape; broadcast = true))
@@ -588,19 +618,17 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
     if _is_plate_column_expr(node)
         original = node
         node = _guard_missing_observation_argument(pred, node, plan, plan.columns)
-        aliases = Dict{Symbol,Symbol}(s => _lp_name(_predictor(plan, s)) for s in subs)
-        inputs = [_hsubst(a, aliases) for a in node.args[1].args[2:end]]
-        value = Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
+        value = Expr(:do, Expr(:call, :plate, node.args[1].args[2:end]...),
+            node.args[2])
         return node !== original && _guarded_argument_is_bound(node, plan.columns) ?
             _concrete_guarded_argument(value) : value
     end
     if node isa Symbol
         node in subs || return node
-        i = findfirst(p -> p.name === node, plan.predictors)
-        i === nothing && throw(ContractValidationError(
+        any(p -> p.name === node, plan.predictors) || throw(ContractValidationError(
             "[generator] composed term in predictor $pred addresses " *
             "unknown sub-predictor $node"))
-        return _lp_name(plan.predictors[i])
+        return node
     end
     # Dotted map `f.(x, ...)`: `Expr(:., f, Expr(:tuple, x, ...))`, the
     # map renamed to its generated-module math binding.
@@ -848,7 +876,7 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     # The response's predictor nodes lie on its observation axis, here the
     # indices.
     return _cell_broadcast_group(plan, r.response, _lik_name(r.label), _pw_name(r.label),
-        stmts, upstream, [_lp_name(p) for p in plan.predictors],
+        stmts, upstream, [p.name for p in plan.predictors],
         "response $(r.label) observes one array per index, and its $(r.family) statements")
 end
 
@@ -1014,7 +1042,7 @@ _ppl_range_values(x::AbstractArray, indices) = x[indices]
 # (`_selected_plate_indices`); only whole operands are gathered at the
 # authored indices. Positions and indices differ for a literal `a:b`.
 function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
-    i = findfirst(p -> _lp_name(p) === value, plan.predictors)
+    i = findfirst(p -> p.name === value, plan.predictors)
     i === nothing && return false
     p = plan.predictors[i]
     p.link === IdentityLink && length(p.terms) == 1 &&
@@ -1038,18 +1066,16 @@ function _ranged_response_stmts(r, plan, stmts)
         # Select ordinary row values before family-specific conversions or
         # ordinal stage expansion. Simplexes and covariance factors stay whole.
         if r.family ∉ (CategoricalFam, MultinomialFam)
-            push!(rows, _is_bare_param_location(r, plan) ? r.predictor :
-                _location_node(r, plan))
-            foreach(p -> push!(rows, _lp_name(_predictor(plan, p))), r.extra_predictors)
+            push!(rows, _location_node(r, plan))
+            union!(rows, r.extra_predictors)
         end
         for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,
                 r.evidence.lower, r.evidence.upper, r.threshold_columns...,
                 r.count_columns..., r.extra_responses...)
             if slot isa ScalePredictorRef
-                push!(rows, _lp_name(_predictor(plan, slot.predictor)))
+                push!(rows, slot.predictor)
             elseif slot isa Symbol
-                pred = findfirst(p -> p.name === slot, plan.predictors)
-                push!(rows, pred === nothing ? slot : _lp_name(plan.predictors[pred]))
+                push!(rows, slot)
             end
         end
         for (i, value) in enumerate(sort!(collect(rows)))
@@ -1183,10 +1209,9 @@ function _mi_stopping_response_stmts(r, plan, stmts)
     for ref in (r.weights, r.discrimination, r.evidence.lower, r.evidence.upper,
             r.threshold_columns...)
         if ref isa ScalePredictorRef
-            push!(rows, _lp_name(_predictor(plan, ref.predictor)))
+            push!(rows, ref.predictor)
         elseif ref isa Symbol
-            pred = findfirst(p -> p.name === ref, plan.predictors)
-            push!(rows, pred === nothing ? ref : _lp_name(plan.predictors[pred]))
+            push!(rows, ref)
         end
     end
     for ref in sort!(collect(rows))
@@ -1421,7 +1446,7 @@ function _shared_mixture_guard(valid, inputs, plan, pre)
         input isa Symbol || return nothing
         scalar = any(p -> p.name === input, plan.parameters) ||
             get(plan.columns, input, nothing) isa Number ||
-            any(p -> _lp_name(p) === input &&
+            any(p -> p.name === input &&
                 _predictor_value_type(plan, p) === :Number, plan.predictors) ||
             any(pre) do st
                 st.head === :(=) && st.args[1] isa Expr &&
@@ -1442,10 +1467,7 @@ end
 function _mixture_loc_ref(r::LikelihoodSpec, plan::StructuralPlan, k::Int)
     loc = r.mixture_locs[k]
     loc isa Real && return Float64(loc), false
-    if any(p -> p.name === loc, plan.predictors)
-        return _lp_name(_predictor(plan, loc)), true
-    end
-    return loc, false
+    return loc, any(p -> p.name === loc, plan.predictors)
 end
 
 # One mixture component's scalar log-density: the single-family endpoint
@@ -1559,12 +1581,9 @@ _is_latent_location(r::LikelihoodSpec, plan::StructuralPlan) =
     any(s -> r.predictor in s.states, plan.scans) || _is_plate_param(plan, r.predictor)
 
 # The per-observation location node feeding a response's likelihood plate: a
-# latent vector fed directly (its own name — the layout view), or a linear
-# predictor's `_ppl_lp_<name>` node otherwise.
-function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
-    _is_latent_location(r, plan) && return r.predictor
-    return _lp_name(_predictor(plan, r.predictor))
-end
+# latent vector fed directly (its own name — the layout view), or the
+# predictor's node, which carries the predictor's name.
+_location_node(r::LikelihoodSpec, plan::StructuralPlan) = r.predictor
 
 # The value shape of a response's location (see `_predictor_value_type`).
 _location_value_type(r::LikelihoodSpec, plan::StructuralPlan) =
@@ -2222,8 +2241,7 @@ function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
     inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
-    pref = _thread_ref!(inputs, any(p -> p.name === r.predictor, plan.predictors) ?
-        _lp_name(_predictor(plan, r.predictor)) : r.predictor)
+    pref = _thread_ref!(inputs, r.predictor)
     cell = :(binomial($nref, $pref).logpdf($yv))
     cell = _wrap_evidence!(r, plan, pre, inputs, cell)
     if r.weights !== nothing
@@ -2259,7 +2277,7 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
 end
 
-# Mean/rate vectors are precomputed statements (like `_ppl_lp_*`): plate
+# Mean/rate vectors are precomputed statements (like predictor nodes): plate
 # cells take plain do-vars — a computed `exp` constructor arg miscompiles
 # the Enzyme pullback (NB2 eta-gradient, found by test).
 _mu_name(label::Symbol) = Symbol(:_ppl_mu_, label)
@@ -2385,7 +2403,7 @@ function _scale_use_plate_arg(r::LikelihoodSpec, plan::StructuralPlan,
         pre::Vector{Expr}, s, label::Symbol)
     s isa ScalePredictorRef || return s
     pred = _predictor(plan, s.predictor)
-    lp = _lp_name(pred)
+    lp = pred.name
     sc = _sc_name(label)
     rhs = _inverse_link_expr(s.link, lp)
     # The annotation is load-bearing for AD, not decoration: it proves the
@@ -2620,8 +2638,7 @@ end
 function _categorical_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
     pre = Expr[]
     preds = [r.predictor; r.extra_predictors...]
-    lps = [_lp_name(_predictor(plan, q)) for q in preds]
-    inputs = Any[r.response, lps...]
+    inputs = Any[r.response, preds...]
     yv = _dovar(1)
     etas = [_dovar(i) for i in 2:length(inputs)]
     K = length(preds) + 1
@@ -2719,7 +2736,7 @@ end
 function _disc_pre!(prests::Vector{Expr}, r::LikelihoodSpec,
         plan::StructuralPlan, sname::Symbol)
     pred = _predictor(plan, sname)
-    lp = _lp_name(pred)
+    lp = pred.name
     name = _disc_name(r.label)
     typ = _predictor_value_type(plan, pred)
     push!(prests, :($name::$typ = $(_inverse_link_expr(pred.link, lp))))
@@ -3020,8 +3037,7 @@ function _mvn_cholesky_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         corr = ap === nothing ? _rl_name(cr.name, i, j) : :($(cr.name)[$i, $j])
         push!(stmts, :($(_mvn_L_entry(r.label, i, j))::Float64 = $scale * $corr))
     end
-    lps = [_lp_name(_predictor(plan, q)) for q in preds]
-    inputs = Any[outcomes...; lps...]
+    inputs = Any[outcomes...; preds...]
     yvs = [_dovar(i) for i in 1:K]
     mvs = [_dovar(K + i) for i in 1:K]
     Ld = Dict{Tuple{Int,Int},Symbol}()
