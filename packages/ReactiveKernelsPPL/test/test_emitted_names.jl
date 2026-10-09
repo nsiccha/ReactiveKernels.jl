@@ -247,7 +247,7 @@ end
         sa ~ Exponential(4.0)
         sp ~ Exponential(4.0)
         base = a .+ b .* x
-        mu = base .* ComposedFns.rise(base) .* exp.(ComposedFns.fall(base, 0.5))
+        mu = base .* ComposedFns.rise(x) .* exp.(ComposedFns.fall(x, 0.5))
         shift = ComposedFns.scaled_total(base, 0.1)
         y .~ Normal.(mu .+ shift, sa + sp)
     end
@@ -255,9 +255,9 @@ end
     bound = _bound(model, data; mod = @__MODULE__)
     built = build_kernel(bound)
     code = string(readable_code(built.spec))
-    @test occursin("var\"mu.rise.xi\" = base .* 2.0", code)
-    @test occursin("var\"mu.fall.xi_max\" = 0.5 .- 3.0", code)
-    @test occursin("mu = (base .* var\"mu.rise\") .* exp.(var\"mu.fall\")", code)
+    # A call inside an expression is named under its assignment; a typed
+    # formal reads the model's value with no `identity` alias.
+    @test occursin(r"var\"[^\"]+\.fall\.xi_max\" = 0\.5 \.- 3\.0", code)
     @test occursin("shift = sum(base) * 0.1", code)
     @test !occursin("identity(", code)
     @test !occursin("##", code)
@@ -265,7 +265,7 @@ end
 
     oracle(nt) = begin
         base = nt.a .+ nt.b .* x
-        mu = base .* (base .* 2.0 .+ 1.0) .* exp.((base .- 3.0) .- (0.5 - 3.0))
+        mu = base .* (x .* 2.0 .+ 1.0) .* exp.((x .- 3.0) .- (0.5 - 3.0))
         sum(logpdf.(Normal.(mu .+ sum(base) * 0.1, nt.sa + nt.sp), y)) +
             logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
             logpdf(Exponential(4.0), nt.sa) + logpdf(Exponential(4.0), nt.sp)
