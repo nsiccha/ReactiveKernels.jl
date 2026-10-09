@@ -4218,20 +4218,25 @@ end
 
 function _emit_cell_values!(out, values::_CellValues, plate_defs)
     (; ivar, axis, indices, entries) = values
-    column(name, locals, rhs) =
-        Expr(:(=), name, _plate_column_call(ivar, locals, rhs, axis; indices))
+    column(name, locals, rhs; reads = ()) =
+        Expr(:(=), name, _plate_column_call(ivar, locals, rhs, axis; indices, reads))
     lowered = Dict{Int,Vector{Any}}(k => Any[column(e.name, e.locals, e.rhs)]
         for (k, e) in enumerate(entries))
     for fused in _shared_cell_groups(values)
         named = [e for e in entries[fused] if !Base.isgensym(e.name)]
-        cell = isempty(named) ? gensym(:_rkppl_cell) :
+        cell = isempty(named) ? gensym(:_rkppl_selected) :
             Symbol(:_rkppl_cell_, something(first(named).part_of, first(named).name))
         push!(plate_defs, cell)
         shared = column(cell, _fused_cell_statements(values, fused),
             Expr(:tuple, (e.name for e in entries[fused])...))
         for (k, index) in enumerate(fused)
-            entry = column(entries[index].name, Pair{Symbol,Any}[],
-                Expr(:_ppl_cell_entry, cell, k))
+            # A projection reads, besides the shared plate, what its value's
+            # own plate read, so analyses of its dependencies (a per-cell
+            # latent it transforms, a parameter) see the same value.
+            e = entries[index]
+            own = lowered[index][1].args[2]
+            entry = column(e.name, Pair{Symbol,Any}[],
+                Expr(:_ppl_cell_entry, cell, k); reads = own.args[3:end])
             lowered[index] = k == 1 ? Any[shared, entry] : Any[entry]
         end
     end
@@ -4351,13 +4356,14 @@ end
 # Shared cell construction for observation and level axes. The fourth
 # field records a level axis, so constant outputs still have one value
 # per level and subsequent gathers preserve that axis.
-function _plate_column_call(ivar, locals, rhs, axis; indices=nothing)
+function _plate_column_call(ivar, locals, rhs, axis; indices=nothing, reads=())
     body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...)
     deps = Set{Symbol}()
     for (_, v) in locals
         _cell_free_syms!(deps, v)
     end
     _cell_free_syms!(deps, rhs)
+    union!(deps, reads)
     setdiff!(deps, Set{Symbol}(first.(locals)))
     delete!(deps, ivar)
     spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body), QuoteNode(rhs))
