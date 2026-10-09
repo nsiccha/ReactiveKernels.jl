@@ -261,8 +261,7 @@ function condition(plan::StructuralPlan; kwargs...)
     names = Set(p.name for ps in (plan.parameters, plan.array_parameters,
         plan.vector_parameters, plan.plate_parameters) for p in ps)
     computed = _bound_module_data_names(plan)
-    union!(computed, (d.name for d in plan.derived if
-        any(r -> r.response === d.name, plan.responses)))
+    union!(computed, _derived_response_names(plan))
     columns = Dict{Symbol,ColumnData}(k => v for (k,v) in plan.columns if k ∉ computed)
     # Bound response storage is numeric. Restore its host-side missing entries
     # before rebinding so replacement data gets a fresh presence mask, while
@@ -1507,11 +1506,14 @@ end
 
 # ── Destructuring and in-model data values ───────────────────────────
 # `(a, b) = rhs` (standard Julia destructuring): each name binds its
-# element, `a = Base.getindex(rhs, 1)`, `b = Base.getindex(rhs, 2)`, Julia's
-# tuple semantics (an extra element is dropped, a missing one is a
-# `BoundsError`). A data-only `rhs` is evaluated once by `bind_data`
+# element, `a = _destructure_element(rhs, 1)`, `b = _destructure_element(rhs, 2)`,
+# Julia's iteration semantics (an extra element is dropped, a missing one is
+# a `BoundsError`). A data-only `rhs` is evaluated once by `bind_data`
 # (identical calls share one evaluation), so `(Xf, Zp) = tps_basis(x; k = 4)`
-# fits the basis once.
+# fits the basis once. The generated kernel reassembles the element reads of
+# one `rhs` into a single destructuring statement (`_assignment_statements`),
+# so a parameter-dependent `rhs` also runs once, and a function-shaped
+# `KernelSpec` call is destructured at its WANT boundary, as RK splices it.
 _is_destructuring(st) =
     st isa Expr && st.head === :(=) && length(st.args) == 2 &&
     Meta.isexpr(st.args[1], :tuple) && !isempty(st.args[1].args) &&
@@ -1524,7 +1526,7 @@ function _desugar_destructuring(stmts)
             lhs, rhs = st.args
             for (i, nm) in enumerate(lhs.args)
                 push!(out, Expr(:(=), nm, Expr(:call,
-                    Expr(:., :Base, QuoteNode(:getindex)),
+                    GlobalRef(@__MODULE__, :_destructure_element),
                     rhs isa Expr ? copy(rhs) : rhs, i)))
             end
         else
@@ -1532,6 +1534,29 @@ function _desugar_destructuring(stmts)
         end
     end
     return out
+end
+
+# Element `i` of `(a, b, …) = value`: what Julia's lowering binds through
+# `Base.indexed_iterate`. Tuples, named tuples and arrays read it directly.
+@inline _destructure_element(value::Union{Tuple,NamedTuple}, i::Int) =
+    getfield(value, i)
+@inline _destructure_element(value::AbstractArray, i::Int) =
+    value[firstindex(value) + i - 1]
+function _destructure_element(value, i::Int)
+    item, state = Base.indexed_iterate(value, 1)
+    for k in 2:i
+        item, state = Base.indexed_iterate(value, k, state)
+    end
+    return item
+end
+
+# The `(rhs, i)` of a destructured element read, or `nothing`.
+_destructured_read(ex) = nothing
+function _destructured_read(ex::Expr)
+    ex.head === :call && length(ex.args) == 3 &&
+        ex.args[1] == GlobalRef(@__MODULE__, :_destructure_element) &&
+        ex.args[3] isa Int || return nothing
+    return (ex.args[2], ex.args[3])
 end
 
 # Data-only module values (`B = tps_basis(x; k = 4)`, `z = f(x)`: an

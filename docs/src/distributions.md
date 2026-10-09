@@ -88,8 +88,8 @@ fills `pointwise` and accumulates the total in that same traversal.
 
 Plate arguments use Julia broadcast semantics: scalars repeat, compatible array
 dimensions zip or expand, and incompatible shapes fail before endpoint
-execution. Wrap an array-valued atom in `Ref(x)` so the complete array is passed
-to each scalar body invocation.
+execution. A whole array that every scalar body invocation reads is not a plate
+argument: the cell closes over it.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
@@ -99,12 +99,12 @@ Main.ReactiveKernelsDocs.execute_example(
 
 The broadcast rules are worth making concrete. In the panel below one plate zips
 the observation vector with a per-observation location, repeats the scalar scale,
-and receives a whole vector atomically through `Ref`. The build checks the result
+and reads a whole vector by closing over it. The build checks the result
 against the equivalent hand-written broadcast:
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
-    @__MODULE__, Main.DistributionExamples.BROADCAST_REF_SOURCE,
+    @__MODULE__, Main.DistributionExamples.BROADCAST_CLOSURE_SOURCE,
 )
 ```
 

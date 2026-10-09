@@ -1862,6 +1862,68 @@ function _kernel_plate_cell_locals(body)
     names
 end
 
+# Every name an `@kernel` block binds: its signature inputs, declared inputs and
+# recipe outputs. Statement order does not matter, because forward intermediates
+# are ordinary graph edges. These are the enclosing locals an authored plate cell
+# may capture. Pass 1 of `_kernel_expand` still validates each statement; this
+# scan only collects names and stops at `return`, as pass 1 does.
+function _kernel_enclosing_ports(statements, signature_inputs)
+    names = Set{Symbol}(Symbol(name) for (name, _) in signature_inputs)
+    for raw in statements
+        _kernel_is_line(raw) && continue
+        raw isa Expr && raw.head === :return && break
+        if raw isa Expr && raw.head === :macrocall && !isempty(raw.args) &&
+           raw.args[1] === Symbol("@recipe")
+            parts = Any[a for a in raw.args[3:end] if !_kernel_is_line(a)]
+            isempty(parts) && continue
+            raw = last(parts)
+        end
+        target = raw isa Expr && raw.head === :(=) ? raw.args[1] : raw
+        items = target isa Expr && target.head === :tuple ? target.args : Any[target]
+        for item in items
+            item isa Expr && item.head === :(::) && length(item.args) == 2 &&
+                (item = item.args[1])
+            item isa Symbol && push!(names, item)
+        end
+    end
+    names
+end
+
+# A `Ref(value)` operand of an authored `plate(...) do` or `scan(...) do` is
+# deprecated: the do-block reads a shared value as a closure instead (user
+# decision `0kvm2ip`). It warns under `--depwarn=yes` and throws under
+# `--depwarn=error`, like `Base.depwarn`, but is keyed by the do-block's source
+# line: `Base.depwarn` keys by its caller frame, which is the same macro
+# expansion frame for every kernel, so it would report only the first site.
+function _kernel_ref_operand_depwarn(kind::Symbol, value, formal, body;
+                                     level::Integer = Base.JLOptions().depwarn)
+    level == 0 && return nothing
+    line = _kernel_first_line(body)
+    file = line === nothing ? "" : string(line.file)
+    lineno = line === nothing ? 0 : line.line
+    rewrite = value isa Symbol ?
+        "drop the operand and its `$formal` argument and read `$value` in the do-block" :
+        "assign `$value` to a name before the `$kind`, drop the operand and its " *
+        "`$formal` argument, and read that name in the do-block"
+    message = "`Ref($value)` as a `$kind(...) do` operand is deprecated: a do-block " *
+              "reads a shared value as a closure. $(uppercasefirst(rewrite)) " *
+              "(user decision 0kvm2ip)."
+    level == 2 && throw(ErrorException(message))
+    @warn message _group = :depwarn _file = file _line = lineno maxlog = 1 _id =
+        Symbol(kind, ':', file, ':', lineno, ':', value)
+    nothing
+end
+
+_kernel_first_line(ex::LineNumberNode) = ex
+_kernel_first_line(ex::Expr) = begin
+    for arg in ex.args
+        line = _kernel_first_line(arg)
+        line === nothing || return line
+    end
+    nothing
+end
+_kernel_first_line(ex) = nothing
+
 function _kernel_authored_plate_expr(rhs, mod,
                                      caller_locals = Set{Symbol}();
                                      endpoint_cache =
@@ -1892,6 +1954,7 @@ function _kernel_authored_plate_expr(rhs, mod,
                length(argument.args) == 2 &&
                _kernel_resolve_binding(mod, argument.args[1]) === Ref
             value = argument.args[2]
+            _kernel_ref_operand_depwarn(:plate, value, formals[index], scalar_body)
             name = if value isa Symbol
                 value
             else
@@ -1910,15 +1973,20 @@ function _kernel_authored_plate_expr(rhs, mod,
     length(unique(formals)) == length(formals) || throw(ArgumentError(
         "plate do-block argument names must be unique"))
 
-    # Explicit caller locals that the scalar cell reads are automatically threaded
-    # as scalar plate arguments. This matches the broadcast model: a caller vector
-    # port named directly is a batched axis, while an unthreaded scalar is shared.
+    # A caller name the cell reads without threading it is a closure capture: the
+    # cell sees the whole value, exactly as a Julia closure does. It enters as an
+    # atomic operand, like an explicit `Ref(name)`, so only the plate's explicit
+    # non-`Ref` arguments define the zipped axes. A captured scalar is shared, as
+    # before; a captured array, tuple or struct is no longer broadcast per cell.
     caller_free = filter!(
         name -> name in caller_locals && !(name in formals),
         _kernel_free_ports(scalar_body, Set(caller_locals)),
     )
-    append!(formals, caller_free)
-    append!(arguments, caller_free)
+    for name in caller_free
+        push!(formals, name)
+        push!(arguments, name)
+        push!(atomic, length(arguments))
+    end
 
     nested_specs = Dict{Symbol,Any}()
     local_types = Dict{Symbol,Any}()
@@ -1977,7 +2045,8 @@ Base.@nospecializeinfer function _kernel_authored_plate(
     _kernel_new_instance(T, (kernel, ()))::_AuthoredPlateOp
 end
 
-# `scan(xs, Ref(shared)...; init = c0) do carry, x, shared...  …; (new_carry, output)  end`
+# `scan(xs...; init = c0) do carry, x...  …; (new_carry, output)  end`, reading shared
+# values as closures (deprecated: trailing `Ref(shared)...` operands and formals)
 # authors a bounded SEQUENTIAL recurrence.  Unlike `plate` (a pure per-element
 # broadcast map), `scan` threads a `carry` value: the do-block's FIRST formal is
 # the carry (seeded by `init`, never a positional argument), the SECOND is the
@@ -1992,7 +2061,8 @@ end
 # With `history = h0` the do-block takes one more, LAST formal: the read-only
 # vector of the outputs so far (`h0` at and after the current step); `h0` is
 # the op's last argument, atomic like the carry seed.
-function _kernel_authored_scan_expr(rhs, mod;
+function _kernel_authored_scan_expr(rhs, mod,
+                                    caller_locals = Set{Symbol}();
                                     endpoint_cache =
                                         IdDict{Any,Dict{Any,KernelSpec}}())
     rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
@@ -2087,9 +2157,11 @@ function _kernel_authored_scan_expr(rhs, mod;
     # lets one step read several co-varying per-step sequences — e.g. a first-order
     # recurrence carry_i = a[i] * carry_{i-1} + b[i] over two per-step sequences.
     seen_shared = false
-    for operand in positional
+    for (position, operand) in enumerate(positional)
         if _is_ref(operand)
             seen_shared = true
+            _kernel_ref_operand_depwarn(:scan, operand.args[2], formals[position + 1],
+                                        scalar_body)
             _push_operand!(operand.args[2], true)       # shared (atomic)
         else
             seen_shared && throw(ArgumentError(
@@ -2098,11 +2170,21 @@ function _kernel_authored_scan_expr(rhs, mod;
             _push_operand!(operand, false)              # iterated sequence (non-atomic)
         end
     end
+    # A caller name the step reads without passing it is a closure capture, as
+    # in a plate cell: it enters whole as one more shared (atomic) operand, after
+    # the explicit `Ref(...)` operands and before the history fill, so the
+    # iterated sequences stay the only per-step operands.
+    captured = filter!(
+        name -> name in caller_locals && !(name in formals),
+        _kernel_free_ports(scalar_body, Set(caller_locals)),
+    )
+    foreach(name -> _push_operand!(name, true), captured)
+    formals = history ? Symbol[formals[1:(end - 1)]..., captured..., formals[end]] :
+              Symbol[formals..., captured...]
     history && _push_operand!(history_expr, true)       # last: the history fill (atomic)
 
     # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals
-    # (carry, x, shared...); an enclosing port used but not passed is out of scope
-    # (never auto-captured) — same rule as plate. Formals are unannotated, like
+    # (carry, x, shared...) plus the captures above. Formals are unannotated, like
     # omitted `@kernel` signature types: an endpoint argument declaration that
     # receives a formal directly then supplies its port type, as it does for
     # plate formals, instead of conflicting with a placeholder `Any`.
@@ -3099,8 +3181,9 @@ loop:
 
 @kernel cell(plan, units, weights) = begin
     observations = domain(plan)
-    c::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[i] * get(u, row_index(t, p, i), 0.0) for i in eachindex(w); init = 0.0)
+    c::Vector{Float64} = plate(observations) do t
+        sum(weights[i] * get(units, row_index(t, plan, i), 0.0)
+            for i in eachindex(weights); init = 0.0)
     end
 end
 ```
@@ -3720,8 +3803,10 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # for bodies with no `@node` (or only foreign `@node`).
     block = _kernel_normalize_call_kwargs(_kernel_lift_nodes(block, mod))
     raw_statements = block isa Expr && block.head === :block ? block.args : Any[block]
+    raw_statements = _kernel_desugar_loops(raw_statements, mod)
     statements = _kernel_lift_plate_expressions(
         _kernel_normalize_return_expressions(raw_statements), mod)
+    enclosing_ports = _kernel_enclosing_ports(statements, signature_inputs)
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
     order_var = gensym(:kernel_port_order)
@@ -3797,11 +3882,10 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 push!(outputs, (name, type_expr))
             end
             plate_expr = _kernel_authored_plate_expr(
-                rhs, mod, Set(Symbol(name) for (name, _) in signature_inputs);
-                endpoint_cache = endpoint_cache)
+                rhs, mod, enclosing_ports; endpoint_cache = endpoint_cache)
             plate_expr === nothing &&
                 (plate_expr = _kernel_authored_scan_expr(
-                    rhs, mod; endpoint_cache = endpoint_cache))
+                    rhs, mod, enclosing_ports; endpoint_cache = endpoint_cache))
             if plate_expr !== nothing
                 length(outputs) == 1 || throw(ArgumentError(
                     "an authored plate/scan produces exactly one named output port"))
@@ -4719,20 +4803,21 @@ function plate(spec::KernelSpec; have, want, batched, reduce = :+)
 end
 
 """
-    scan(xs, ys..., Ref(shared)...; init, include_init = false) do carry, x, y..., shared...
+    scan(xs, ys...; init, include_init = false) do carry, x, y...
         …
         (new_carry, output)
     end
-    scan(xs, ys..., Ref(shared)...; init, history = h0) do carry, x, y..., shared..., earlier
+    scan(xs, ys...; init, history = h0) do carry, x, y..., earlier
         …
         (new_carry, output)
     end
 
 Author a bounded SEQUENTIAL recurrence inside a `@kernel` / `@ppl` body. The
-leading non-`Ref` positionals are the sequences to scan over, advanced in
-lockstep (they must share axes); `init` seeds the threaded `carry`; any trailing
-`Ref(shared)` operands are passed whole to every step. The do-block receives
-`(carry, x, y..., shared...)` and must end with the 2-tuple `(new_carry,
+positionals are the sequences to scan over, advanced in lockstep (they must
+share axes); `init` seeds the threaded `carry`. The step reads any other
+enclosing value whole, as a closure. A trailing `Ref(shared)` operand passes a
+value whole too but is deprecated (user decision `0kvm2ip`). The do-block
+receives `(carry, x, y...)` and must end with the 2-tuple `(new_carry,
 output)`; `scan` returns the vector `[output…]`. A compound carry may be carried
 as a `NamedTuple` (`init = (; a, b)`, read `carry.a`). Empty sequences run no
 step and return an empty vector of the step's inferred output type.

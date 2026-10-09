@@ -358,21 +358,94 @@ function _assignment_statements(plan::StructuralPlan;
     # evaluated once and arrive as data arguments; the kernel never recomputes them.
     computed = _bound_module_data_names(plan)
     dataonly = Set{Symbol}(keys(plan.columns))
-    stmts = Expr[]
+    order = Symbol[]
+    rewritten = Dict{Symbol,Any}()
     for name in topological_order(plan)
         (haskey(by_name, name) && name ∉ computed) || continue
         ex = _guard_missing_observation_argument(name, by_name[name].expr, plan, plan.columns)
         ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
             (ex = _concrete_guarded_argument(ex))
-        ex = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
+        push!(order, name)
+        rewritten[name] = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
+    end
+    destructured = _destructuring_statements(order, rewritten)
+    stmts = Expr[]
+    for name in order
+        targets, ex = get(destructured, name, ((name,), rewritten[name]))
+        isempty(targets) && continue
         if _expr_value_symbols(ex) ⊆ dataonly
-            push!(dataonly, name)
+            union!(dataonly, targets)
         else
             ex = _split_data_calls!(stmts, name, ex, dataonly)
         end
-        push!(stmts, :($(name) = $(ex)))
+        lhs = length(targets) == 1 && targets[1] === name ? name : Expr(:tuple, targets...)
+        push!(stmts, :($(lhs) = $(ex)))
     end
     return stmts
+end
+
+# Destructuring `(a, b) = rhs` reaches the plan as one element read per name
+# (`_desugar_destructuring`). Emit the reads of one `rhs` as Julia's single
+# statement, at the first read's place in the topological order (every read
+# has the same dependencies), so `rhs` runs once per evaluation. A
+# function-shaped `KernelSpec` with several WANT ports is destructured at
+# that whole boundary, which RK splices into the generated graph; a
+# single-output `KernelSpec` returns its one value, so its element reads stay
+# ordinary reads of that value. An element bound as data at bind takes a
+# private name. Returns `name => (targets, rhs)`; the other reads of a
+# reassembled statement map to `(), nothing`.
+function _destructuring_statements(order::Vector{Symbol}, rewritten::Dict{Symbol,Any})
+    groups = Dict{Any,Vector{Dict{Int,Symbol}}}()
+    leaders = Dict{Symbol,Dict{Int,Symbol}}()
+    for name in order
+        read = _destructured_read(rewritten[name])
+        read === nothing && continue
+        rhs, i = read
+        rhs isa Expr && rhs.head === :call || continue
+        candidates = get!(() -> Dict{Int,Symbol}[], groups, rhs)
+        k = findfirst(g -> !haskey(g, i), candidates)
+        if k === nothing
+            push!(candidates, Dict{Int,Symbol}())
+            k = length(candidates)
+            leaders[name] = candidates[k]
+        end
+        candidates[k][i] = name
+    end
+    out = Dict{Symbol,Tuple{Tuple,Any}}()
+    for (leader, members) in leaders
+        rhs, _ = _destructured_read(rewritten[leader])
+        width = _destructured_width(rhs, maximum(keys(members)))
+        width === nothing && continue
+        targets = Tuple(get(members, i, Symbol(:_rkppl_, leader, :_unused_, i))
+            for i in 1:width)
+        out[leader] = (targets, rhs)
+        for name in values(members)
+            name === leader || (out[name] = ((), nothing))
+        end
+    end
+    return out
+end
+
+# How many names a reassembled destructuring statement binds, or `nothing`
+# to keep its element reads: a multi-output `KernelSpec` binds its whole WANT
+# boundary (more reads than ports keep Julia's `BoundsError` at the read); any
+# other call binds up to its last read, when that is past the first.
+function _destructured_width(rhs::Expr, last::Int)
+    spec = _called_kernel_spec(rhs)
+    if spec !== nothing
+        any(a -> Meta.isexpr(a, (:parameters, :kw, Symbol("..."))), rhs.args[2:end]) &&
+            return nothing
+        width = length(ReactiveKernels.outputs(spec))
+        return width > 1 && last <= width ? width : nothing
+    end
+    return last > 1 ? last : nothing
+end
+
+function _called_kernel_spec(rhs::Expr)
+    head = rhs.args[1]
+    head isa GlobalRef && isdefined(head.mod, head.name) || return nothing
+    value = getglobal(head.mod, head.name)
+    return value isa KernelSpec ? value : nothing
 end
 
 # The generated scope's `logistic` names a distribution kernel. Values
@@ -784,8 +857,7 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     defined = Set{Symbol}(something.(_assigned_name.(body), :_))
     known = Set{Symbol}(keys(plan.columns))
     for st in upstream
-        name = _assigned_name(st)
-        name === nothing || push!(known, name)
+        union!(known, _assigned_names(st))
     end
     reads = Set{Symbol}()
     foreach(st -> _statement_value_reads!(reads,
@@ -796,10 +868,10 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     # from them.
     pergroup = Set{Symbol}([response; plan.cell_broadcasts[response]; axisnodes])
     for st in upstream
-        name = _assigned_name(st)
-        name === nothing && continue
+        names = _assigned_names(st)
+        isempty(names) && continue
         used = _statement_value_reads!(Set{Symbol}(), st.args[2])
-        isempty(intersect(used, pergroup)) || push!(pergroup, name)
+        isempty(intersect(used, pergroup)) || union!(pergroup, names)
     end
     aliases = Dict{Symbol,Symbol}(v => Symbol(:_ppl_group_, v) for v in inputs)
     group = Symbol(pw, :_group)
@@ -870,6 +942,15 @@ function _assigned_name(st::Expr)
     lhs = st.args[1]
     Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
     return lhs isa Symbol ? lhs : nothing
+end
+
+# Every name a statement binds, including each name of a destructuring
+# statement (`(a, b) = f(x)`).
+function _assigned_names(st)
+    Meta.isexpr(st, :(=), 2) && Meta.isexpr(st.args[1], :tuple) &&
+        return Symbol[t for t in st.args[1].args if t isa Symbol]
+    name = _assigned_name(st)
+    return name === nothing ? Symbol[] : Symbol[name]
 end
 
 # Value names a generated statement reads: call heads, keyword names and

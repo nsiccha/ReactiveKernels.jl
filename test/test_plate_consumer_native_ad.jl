@@ -362,4 +362,108 @@ end
     @test groups == saved
     @test [s.xs for s in subjects] == saved
 end
+
+# A plate with more batched operands than Julia's 32-element splat limit. Base's
+# `combine_axes(A, B...)` then recurses through `Core._apply_iterate` over one
+# tuple of the remaining operands, and native Reverse rejected the constant
+# ragged arrays stored there beside the live vector. Under `bound=` each
+# per-cell array the cell reads from bound data becomes a cached plate operand
+# (the declared live rank makes the cell eligible), which is how wide consumer
+# reader plates crossed the limit (snag `rk-cached-bound-aa544610`).
+const WIDE_PORTS = 33
+let ports = [Symbol(:xs, k) for k in 1:WIDE_PORTS],
+    cells = [Symbol(:c, k) for k in 1:WIDE_PORTS],
+    shifted = [Symbol(:w, k) for k in 1:WIDE_PORTS]
+    reads = (:($w = $c .+ 1.0) for (w, c) in zip(shifted, cells))
+    terms = (:(sum(l .* $w; init = 0.0)) for w in shifted)
+    @eval @kernel wide_plate(live::Vector{Float64}, $(ports...)) = begin
+        out = plate(live, $(ports...)) do l, $(cells...)
+            $(reads...)
+            $(Expr(:call, :+, :(l * l), terms...))
+        end
+        total = sum(out)
+    end
+end
+
+@testset "a plate wider than Julia's splat limit under native Reverse" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    live = [0.1, 0.2, 0.3]
+    data = Tuple([[Float64(k + i + j) for j in 1:mod(i, 3)] for i in 1:3]
+                 for k in 1:WIDE_PORTS)
+    names = Tuple(Symbol(:xs, k) for k in 1:WIDE_PORTS)
+    saved = deepcopy(data)
+    shifted(i) = sum(sum(d[i] .+ 1.0; init = 0.0) for d in data)
+    expected = sum(l^2 + l * shifted(i) for (i, l) in enumerate(live))
+    gradient = [2l + shifted(i) for (i, l) in enumerate(live)]
+    @test prepare(wide_plate)(live, data...) ≈ expected
+    plain = prepare_ad(wide_plate, backend, live, data...;
+                       active=:live, want=:total)
+    value, g = ad_value_and_gradient(plain, live, data...)
+    @test value ≈ expected
+    @test g ≈ gradient
+    bound = prepare_ad(wide_plate, backend, live; active=:live, want=:total,
+                       bound=NamedTuple{names}(data))
+    cached = filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+        startswith(String(only(r.outputs).name), "bound_plate_"),
+        bound.kernel.plan.recipes)
+    @test length(cached) == WIDE_PORTS
+    @test all(r -> r.op.value isa Vector{Vector{Float64}}, cached)
+    value, g = ad_value_and_gradient(bound, live)
+    @test value ≈ expected
+    @test g ≈ gradient
+    @test_throws DimensionMismatch prepare(wide_plate)(
+        live, data[1:end-1]..., [[1.0], [2.0]])
+    @test data == saved
+    @test live == [0.1, 0.2, 0.3]
+end
+
+# The same width with operands the kernel derives itself. The lowered body
+# types each cell value with `_promote_op` over the cell's argument types;
+# through Base's `promote_op`, whose `S...` and `TupleOrBottom(tt...)` splats
+# stay runtime `Core._apply_iterate` calls past 32 types, a plate of 33 or
+# more operands derived its element type on every call: about 900 B per
+# primal call, and native Reverse failed with `Illegal cached pointer` once
+# the operands were loaded from a container before that opaque call.
+for width in (1, WIDE_PORTS)
+    cells = [Symbol(:c, k) for k in 1:width]
+    ports = [Symbol(:xs, k) for k in 1:width]
+    reads = (:($p = data[$k]) for (k, p) in enumerate(ports))
+    terms = (:(l * sum($c; init = 0.0)) for c in cells)
+    name = width == 1 ? :derived_narrow_plate : :derived_wide_plate
+    @eval @kernel $name(live::Vector{Float64},
+                        data::Vector{Vector{Vector{Float64}}}) = begin
+        $(reads...)
+        out = plate(live, $(ports...)) do l, $(cells...)
+            $(foldl((a, t) -> :($a + $t), terms; init = :(l * l)))
+        end
+        total::Float64 = sum(out)
+    end
+end
+
+function derived_wide_bytes(kernel, live, data)
+    kernel(live, data)
+    @allocated kernel(live, data)
+end
+
+@testset "a plate wider than Julia's splat limit over derived operands" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    live = [0.1, 0.2, 0.3]
+    data = [[[Float64(k + i + j) for j in 1:mod(i, 3)] for i in 1:3]
+            for k in 1:WIDE_PORTS]
+    saved = deepcopy(data)
+    shifted(i) = sum(sum(d[i]; init = 0.0) for d in data)
+    expected = sum(l^2 + l * shifted(i) for (i, l) in enumerate(live))
+    gradient = [2l + shifted(i) for (i, l) in enumerate(live)]
+    wide = prepare(derived_wide_plate)
+    @test wide(live, data) ≈ expected
+    @test derived_wide_bytes(wide, live, data) ==
+          derived_wide_bytes(prepare(derived_narrow_plate), live, data[1:1])
+    prepared = prepare_ad(derived_wide_plate, backend, live, data;
+                          active=:live, want=:total)
+    value, g = ad_value_and_gradient(prepared, live, data)
+    @test value ≈ expected
+    @test g ≈ gradient
+    @test data == saved
+    @test live == [0.1, 0.2, 0.3]
+end
 end

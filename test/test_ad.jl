@@ -567,6 +567,43 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test rk_allocated <= backend_allocated
     end
 
+    @testset "authored plate AD: captured enclosing parameters" begin
+        # A cell's captured names enter whole as atomic operands (snag
+        # rk-plate-body-ca-091ef037). Reverse mode differentiates a captured
+        # active vector and a captured derived scalar exactly as the explicit
+        # `Ref`/threaded spelling.
+        @kernel captured_objective(q::Vector{Float64},
+                                   data::Vector{Float64}) = begin
+            scale::Float64 = q[1]
+            pointwise = plate(eachindex(data), data) do i, di
+                q[i + 1] * di * scale
+            end
+            objective::Float64 = sum(pointwise)
+        end
+        @kernel threaded_objective(q::Vector{Float64},
+                                   data::Vector{Float64}) = begin
+            scale::Float64 = q[1]
+            pointwise = plate(eachindex(data), Ref(q), data,
+                              scale) do i, qq, di, sc
+                qq[i + 1] * di * sc
+            end
+            objective::Float64 = sum(pointwise)
+        end
+
+        q = [0.5, 0.2, -0.4, 0.7]
+        data = [1.5, -0.5, 0.25]
+        expected = vcat(sum(q[2:end] .* data), q[1] .* data)
+        for spec in (captured_objective, threaded_objective)
+            kernel = prepare(spec; have = (:q, :data), want = :objective)
+            prepared = prepare_ad(
+                kernel, TEST_AD_BACKEND, q, data; active = :q)
+            gradient = similar(q)
+            value, _ = ad_value_and_gradient!(prepared, gradient, q, data)
+            @test value ≈ q[1] * sum(q[2:end] .* data)
+            @test gradient ≈ expected
+        end
+    end
+
     @testset "authored plate AD: Int data-axis in a capture-recapture plate" begin
         # A likelihood plate whose axis is a data-only `Vector{Int}` sitting
         # beside a `Vector{Float64}` data array and several parameter-derived
@@ -661,7 +698,7 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
             kernel;min_elements=4)
         @test unchanged === kernel && isempty(none)
         prepared = prepare_ad(kernel,TEST_AD_BACKEND,q;active=:q)
-        weights, rows, nested = prepared.external_values
+        weights, rows, nested = ReactiveKernels._ad_hidden_operands(prepared)
         @test weights isa Vector && nested isa Vector
         @test weights == y[:,1] && rows == [2,1,2] && nested == y[:,2]
         g = zeros(length(q))
@@ -690,7 +727,7 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
                          have = (:u, :s), want = :objective, bound = (; s))
         u = [0.3, 0.1]
         prepared = prepare_ad(kernel, TEST_AD_BACKEND, u; active = :u)
-        @test prepared.external_values == (s[1].a, s[1].k)
+        @test ReactiveKernels._ad_hidden_operands(prepared) == (s[1].a, s[1].k)
         g = zeros(2)
         value, _ = ad_value_and_gradient!(prepared, g, u)
         @test value ≈ kernel(u)
@@ -734,8 +771,9 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
                          have = (:x, :y), want = :objective,
                          bound = (; y = y))
         prepared = prepare_ad(kernel, TEST_AD_BACKEND, x; active = :x)
-        @test all(value -> value isa Array, prepared.external_values)
-        @test prepared.external_values == (y[:, 1], y[:, 2])
+        hidden = ReactiveKernels._ad_hidden_operands(prepared)
+        @test all(value -> value isa Array, hidden)
+        @test hidden == (y[:, 1], y[:, 2])
 
         gradient = similar(x)
         value, returned = ad_value_and_gradient!(prepared, gradient, x)
@@ -772,6 +810,49 @@ end
             (reference(right, series) - reference(left, series)) / 2e-5
         end
         @test gradient ≈ sign .* expected rtol = 1e-8 atol = 1e-8
+    end
+end
+
+@testset "authored scan reverse AD through captured parameters" begin
+    # A step's captured names enter whole as shared operands (snag
+    # rk-plate-body-ca-091ef037); Reverse differentiates them exactly as the
+    # explicit `Ref` spelling.
+    @kernel captured_scan_objective(q::Vector{Float64},
+                                    series::Vector{Float64}) = begin
+        decay::Float64 = q[1]
+        trajectory = scan(series; init = 0.0) do carry, x
+            next = decay * carry + q[2] * x
+            (next, next)
+        end
+        total::Float64 = sum(trajectory)
+    end
+    @kernel reffed_scan_objective(q::Vector{Float64},
+                                  series::Vector{Float64}) = begin
+        decay::Float64 = q[1]
+        trajectory = scan(series, Ref(q), Ref(decay);
+                          init = 0.0) do carry, x, qq, d
+            next = d * carry + qq[2] * x
+            (next, next)
+        end
+        total::Float64 = sum(trajectory)
+    end
+    reference(q, series) = sum(accumulate(
+        (carry, x) -> q[1] * carry + q[2] * x, series; init = 0.0))
+    q = [0.6, 1.5]
+    series = [0.5, -1.0, 2.0, 0.25]
+    expected = map(eachindex(q)) do i
+        left, right = copy(q), copy(q)
+        left[i] -= 1e-6
+        right[i] += 1e-6
+        (reference(right, series) - reference(left, series)) / 2e-6
+    end
+    for spec in (captured_scan_objective, reffed_scan_objective)
+        k = prepare(spec; want = :total)
+        prepared = prepare_ad(k, TEST_AD_BACKEND, q, series; active = :q)
+        gradient = zeros(2)
+        value, _ = ad_value_and_gradient!(prepared, gradient, q, series)
+        @test value ≈ reference(q, series)
+        @test gradient ≈ expected rtol = 1e-6
     end
 end
 

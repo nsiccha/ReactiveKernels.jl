@@ -91,7 +91,7 @@ end
         @test artifact.dirichlet_object === dirichlet
         # authored on the intended surface: log-space transform, in-graph basis
         @test occursin("logsumexp(", LDA_SOURCE)
-        @test occursin("dirichlet(a).logpdf", LDA_SOURCE)
+        @test occursin("dirichlet(alpha).logpdf", LDA_SOURCE)
         @test occursin("sum_to_zero_constrain", LDA_SOURCE)     # documented in-graph
         @test !occursin("struct ", LDA_SOURCE)
     end
