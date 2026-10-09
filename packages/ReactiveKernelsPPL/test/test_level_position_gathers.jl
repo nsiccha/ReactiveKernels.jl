@@ -338,6 +338,39 @@ end
             @test Base.invokelatest(prepare_query(built, bound, :sampler), u) ≈ oracle rtol = 1e-12
         end
     end
+    @testset "two observation axes, the source read by neither response" begin
+        # `x_obs` and `y` have their own rows; `g` sizes the block and feeds
+        # only the data-only position call, so it belongs to no response axis.
+        d = data(:strings, 3, 6)
+        x_obs = [0.2, -0.4, 0.7, 0.1]
+        ast = quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            b ~ effects(g)
+            i = level_positions(g, g)
+            mu = a .+ b[i, 1] .* x
+            x_obs .~ Normal.(0, 1)
+            y .~ Normal.(mu, s)
+        end
+        plan = lower_rkppl(ast, (:g, :x, :x_obs, :y); mod = @__MODULE__,
+            conditioned = (:x_obs, :y))
+        bound = bind_data(plan, (; g = d.g, x = d.x, x_obs, y = d.y))
+        fx = (; plan, bound, built = build_kernel(bound))
+        function two_axis_oracle(u)
+            p = constrain(fx.built.layout, u)
+            b = p.b.z .* only(p.b.tau)
+            mu = p.a .+ b[indexin(d.g, sort(unique(d.g))), 1] .* d.x
+            return sum(logpdf.(Normal.(mu, p.s), d.y)) + sum(logpdf.(Normal(0, 1), x_obs)) +
+                logpdf(Normal(0, 1), p.a) + logpdf(Exponential(1), p.s) +
+                logpdf(LogNormal(0, 1), only(p.b.tau)) + sum(logpdf.(Normal(0, 1), p.b.z)) +
+                logjac(fx.built.layout, u)
+        end
+        u = [0.3 * sin(1.7k) - 0.1 for k in 1:fx.built.layout.total]
+        r = evaluate(fx, u)
+        @test r.value ≈ two_axis_oracle(u) rtol = 1e-12
+        @test r.grad ≈ findiff(two_axis_oracle, u) rtol = 1e-5 atol = 1e-7
+        @test (length(r.pointwise.x_obs), length(r.pointwise.y)) == (4, 6)
+    end
 end
 
 end
