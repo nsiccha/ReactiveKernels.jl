@@ -1889,6 +1889,41 @@ function _kernel_enclosing_ports(statements, signature_inputs)
     names
 end
 
+# A `Ref(value)` operand of an authored `plate(...) do` or `scan(...) do` is
+# deprecated: the do-block reads a shared value as a closure instead (user
+# decision `0kvm2ip`). It warns under `--depwarn=yes` and throws under
+# `--depwarn=error`, like `Base.depwarn`, but is keyed by the do-block's source
+# line: `Base.depwarn` keys by its caller frame, which is the same macro
+# expansion frame for every kernel, so it would report only the first site.
+function _kernel_ref_operand_depwarn(kind::Symbol, value, formal, body;
+                                     level::Integer = Base.JLOptions().depwarn)
+    level == 0 && return nothing
+    line = _kernel_first_line(body)
+    file = line === nothing ? "" : string(line.file)
+    lineno = line === nothing ? 0 : line.line
+    rewrite = value isa Symbol ?
+        "drop the operand and its `$formal` argument and read `$value` in the do-block" :
+        "assign `$value` to a name before the `$kind`, drop the operand and its " *
+        "`$formal` argument, and read that name in the do-block"
+    message = "`Ref($value)` as a `$kind(...) do` operand is deprecated: a do-block " *
+              "reads a shared value as a closure. $(uppercasefirst(rewrite)) " *
+              "(user decision 0kvm2ip)."
+    level == 2 && throw(ErrorException(message))
+    @warn message _group = :depwarn _file = file _line = lineno maxlog = 1 _id =
+        Symbol(kind, ':', file, ':', lineno, ':', value)
+    nothing
+end
+
+_kernel_first_line(ex::LineNumberNode) = ex
+_kernel_first_line(ex::Expr) = begin
+    for arg in ex.args
+        line = _kernel_first_line(arg)
+        line === nothing || return line
+    end
+    nothing
+end
+_kernel_first_line(ex) = nothing
+
 function _kernel_authored_plate_expr(rhs, mod,
                                      caller_locals = Set{Symbol}();
                                      endpoint_cache =
@@ -1919,6 +1954,7 @@ function _kernel_authored_plate_expr(rhs, mod,
                length(argument.args) == 2 &&
                _kernel_resolve_binding(mod, argument.args[1]) === Ref
             value = argument.args[2]
+            _kernel_ref_operand_depwarn(:plate, value, formals[index], scalar_body)
             name = if value isa Symbol
                 value
             else
@@ -2120,9 +2156,11 @@ function _kernel_authored_scan_expr(rhs, mod,
     # lets one step read several co-varying per-step sequences — e.g. a first-order
     # recurrence carry_i = a[i] * carry_{i-1} + b[i] over two per-step sequences.
     seen_shared = false
-    for operand in positional
+    for (position, operand) in enumerate(positional)
         if _is_ref(operand)
             seen_shared = true
+            _kernel_ref_operand_depwarn(:scan, operand.args[2], formals[position + 1],
+                                        scalar_body)
             _push_operand!(operand.args[2], true)       # shared (atomic)
         else
             seen_shared && throw(ArgumentError(

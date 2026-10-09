@@ -434,3 +434,49 @@ end
     @test value_gradient(_closure_reader, :live, live; bound) ==
           value_gradient(_closure_reader_ref, :live, live; bound)
 end
+
+@testset "Ref operands of plate and scan do-blocks are deprecated (decision 0kvm2ip)" begin
+    # A do-block reads a shared value as a closure; a `Ref(value)` operand warns
+    # under `--depwarn=yes`, once per authored site, and throws under
+    # `--depwarn=error` (user decision `0kvm2ip`: deprecate now, refuse once BRM
+    # and RKPPLBench have moved).
+    body = Expr(:block, LineNumberNode(7, Symbol("closure_depwarn_probe.jl")), :(x * s))
+    depwarn = ReactiveKernels._kernel_ref_operand_depwarn
+    @test depwarn(:plate, :scale, :s, body; level = 0) === nothing
+    @test_logs (:warn, r"`Ref\(scale\)` as a `plate\(...\) do` operand is deprecated.*`s` argument and read `scale`") depwarn(
+        :plate, :scale, :s, body; level = 1)
+    @test_throws ErrorException depwarn(:scan, :(a .+ b), :ab, body; level = 2)
+
+    # Defined in a `--depwarn=yes` process, each `Ref` site warns once and a
+    # closure does not warn.
+    script = """
+    using ReactiveKernels
+    @kernel _dep_plate(xs, scale) = begin
+        out = plate(xs, Ref(scale)) do x, s
+            x * s
+        end
+        return out
+    end
+    @kernel _dep_scan(xs, w) = begin
+        out = scan(xs, Ref(w); init = 0.0) do c, x, ww
+            (c + x * ww, c)
+        end
+        return out
+    end
+    @kernel _dep_closure(xs, scale) = begin
+        out = plate(xs) do x
+            x * scale
+        end
+        return out
+    end
+    println(prepare(_dep_plate)([1.0, 2.0], 3.0) == prepare(_dep_closure)([1.0, 2.0], 3.0))
+    """
+    err = IOBuffer()
+    out = read(pipeline(`$(Base.julia_cmd()) --startup-file=no --depwarn=yes
+                         --project=$(Base.active_project()) -e $script`; stderr = err), String)
+    text = String(take!(err))
+    @test strip(out) == "true"
+    @test count("is deprecated", text) == 2
+    @test occursin("`Ref(scale)` as a `plate(...) do` operand", text)
+    @test occursin("`Ref(w)` as a `scan(...) do` operand", text)
+end
