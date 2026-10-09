@@ -3873,23 +3873,27 @@ struct _ExternalizedBoundArrayCall{F,O,I,H,C}
     ops::O
 end
 
-# Build a call to the existing body without the RGF vararg wrapper, which
-# packs all operands into one tuple. Keeping readonly structured operands
-# beside live storage in that temporary obscures their activity. This changes
-# only the call boundary, not the generated model body or its operands.
-function _native_body_call_expr(::Type{F}, f, ops, args) where {F}
+# Build a call to the existing body, with `args` its complete positional
+# operands, without the RGF vararg wrapper, which packs all operands into one
+# tuple. Keeping readonly structured operands beside live storage in that
+# temporary obscures their activity. Past 32 operands (`max_tuple_splat`) the
+# wrapper's splat also stays a dynamic `Core._apply_iterate` over a heap tuple,
+# which allocates on every call and which native Reverse rejects when constant
+# arrays share it with active storage. This changes only the call boundary, not
+# the generated model body or its operands.
+function _native_body_call_expr(::Type{F}, f, args) where {F}
     if F <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction
         return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-            $f, $ops, $(args...)))
+            $f, $(args...)))
     elseif F <: _PrecompileWarmFunction
         # Preserve latest-world execution while building a consumer image;
         # after loading it, enter the wrapped generated body directly.
         direct = :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-            getfield($f, :f), $ops, $(args...)))
+            getfield($f, :f), $(args...)))
         return :(ccall(:jl_generating_output, Cint, ()) == 0 ?
-                 $direct : $f($ops, $(args...)))
+                 $direct : $f($(args...)))
     end
-    :($f($ops, $(args...)))
+    :($f($(args...)))
 end
 
 # Enter the existing generated body with positional operands. Together with
@@ -3897,7 +3901,7 @@ end
 # temporary aggregate that ordinary Reverse otherwise treats as writable.
 @inline @generated function _native_array_body_call(f::F, ops, args::A) where {F,A<:Tuple}
     forwarded = [:(getfield(args, $index)) for index in 1:fieldcount(A)]
-    _native_body_call_expr(F, :f, :ops, forwarded)
+    _native_body_call_expr(F, :f, Any[:ops, forwarded...])
 end
 
 @generated function (call::_ExternalizedBoundArrayCall{F,O,I,H,C})(
@@ -3911,7 +3915,7 @@ end
     if H
         forwarded = Any[:(getfield(args,$index)) for index in 1:N]
         return _native_body_call_expr(
-            F, :(getfield(call,:f)), :(getfield(call,:ops)), forwarded)
+            F, :(getfield(call,:f)), Any[:(getfield(call,:ops)), forwarded...])
     end
     replacements = Dict(index => slot for (slot, index) in enumerate(I))
     operations = Any[]
@@ -3928,7 +3932,7 @@ end
     public_args = Any[
         :(getfield(args, $index)) for index in 1:public_count]
     _native_body_call_expr(
-        F, :(getfield(call, :f)), Expr(:tuple, operations...), public_args)
+        F, :(getfield(call, :f)), Any[Expr(:tuple, operations...), public_args...])
 end
 
 """
@@ -4675,12 +4679,14 @@ NonAllocatingKernel{S}(f::F, ops::O, caches::C, cache_apply::A, inputs::IN,
 
 # Emit positional arguments explicitly: splatting the captured `args` tuple
 # into the RGF call allocates (one tuple box per call) even though the emitted
-# program itself is allocation-free. Keep the public call nongenerated so
-# reflection over it continues to accept abstract argument types.
+# program itself is allocation-free. The body is entered without the RGF vararg
+# wrapper, whose own splat allocates per call past 32 HAVE ports
+# (`_native_body_call_expr`). Keep the public call nongenerated so reflection
+# over it continues to accept abstract argument types.
 @generated function _nonallocating_call(
-        k::NonAllocatingKernel, args::A, ::Val{N}) where {A<:Tuple,N}
-    positional = [:(getfield(args, $index)) for index in 1:N]
-    :(k.f($(positional...)))
+        k::NonAllocatingKernel{F}, args::A, ::Val{N}) where {F,A<:Tuple,N}
+    positional = Any[:(getfield(args, $index)) for index in 1:N]
+    _native_body_call_expr(F, :(k.f), positional)
 end
 
 @inline function (k::NonAllocatingKernel{F,O,C,A,IN,OUT,S})(

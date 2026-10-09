@@ -585,3 +585,76 @@ end
     @test vdotna == vdot
     @test gdotna == gdot == ones(size(A0))
 end
+
+# A non-allocating program takes its operation table, cache tuple and cache
+# driver ahead of the HAVE ports. Called through the RGF vararg wrapper, whose
+# one-tuple splat of every operand stays a dynamic `Core._apply_iterate` past
+# 32 operands, the primal allocated per call from 33 HAVE ports, and native
+# Reverse rejected the constant HAVE arrays stored in that tuple beside the
+# shadowed caches from 30 HAVE ports, plate or no plate. Both calls now enter
+# the generated body directly (`_native_body_call_expr`). The plate here has
+# 34 batched operands, one per HAVE port.
+const WIDE_NA_PORTS = 33
+let ports = [Symbol(:xs, k) for k in 1:WIDE_NA_PORTS],
+    cells = [Symbol(:c, k) for k in 1:WIDE_NA_PORTS]
+    declared = (:($p::Vector{Vector{Float64}}) for p in ports)
+    terms = (:(l * sum($c; init = 0.0)) for c in cells)
+    @eval @kernel wide_plate_naad(live::Vector{Float64}, $(declared...)) = begin
+        out = plate(live, $(ports...)) do l, $(cells...)
+            $(foldl((a, t) -> :($a + $t), terms; init = :(l * l)))
+        end
+        total::Float64 = sum(out)
+    end
+    @eval @kernel wide_noplate_naad(live::Vector{Float64}, $(declared...)) = begin
+        total::Float64 = sum(abs2, live)
+    end
+end
+
+# Calls `kernel` with the tuple's elements as explicit arguments, so the
+# measurement does not include a caller-side splat of 34 arguments.
+@generated function wide_naad_call_bytes(kernel, args::Tuple)
+    call = Expr(:call, :kernel,
+                (:(getfield(args, $index)) for index in 1:fieldcount(args))...)
+    quote
+        $call
+        @allocated $call
+    end
+end
+
+@testset "non-allocating programs with more than 32 operands" begin
+    live = [0.1, 0.2, 0.3]
+    data = Tuple([[Float64(k + i + j) for j in 1:mod(i, 3)] for i in 1:3]
+                 for k in 1:WIDE_NA_PORTS)
+    saved = deepcopy(data)
+    have = (:live, (Symbol(:xs, k) for k in 1:WIDE_NA_PORTS)...)
+    shifted(i) = sum(sum(d[i]; init = 0.0) for d in data)
+    expected = sum(l^2 + l * shifted(i) for (i, l) in enumerate(live))
+    gradient = [2l + shifted(i) for (i, l) in enumerate(live)]
+
+    kbna = prepare_nonallocating(wide_plate_naad; have, want = :total)
+    @test kbna(live, data...) ≈ expected
+    prepared = prepare_ad(kbna, NA_AD_BACKEND, live, data...; active = :live)
+    value, g = ad_value_and_gradient(prepared, live, data...)
+    @test value ≈ expected
+    @test g ≈ gradient
+    destination = similar(live)
+    inplace, returned = ad_value_and_gradient!(prepared, destination,
+                                               live, data...)
+    @test returned === destination
+    @test inplace ≈ expected
+    @test destination ≈ gradient
+
+    noplate = prepare_nonallocating(wide_noplate_naad; have, want = :total)
+    narrow = prepare_nonallocating(wide_noplate_naad; have = (:live,),
+                                   want = :total)
+    @test wide_naad_call_bytes(noplate, (live, data...)) ==
+          wide_naad_call_bytes(narrow, (live,))
+    noplate_ad = prepare_ad(noplate, NA_AD_BACKEND, live, data...;
+                            active = :live)
+    value, g = ad_value_and_gradient(noplate_ad, live, data...)
+    @test value ≈ sum(abs2, live)
+    @test g ≈ 2 .* live
+
+    @test data == saved
+    @test live == [0.1, 0.2, 0.3]
+end
