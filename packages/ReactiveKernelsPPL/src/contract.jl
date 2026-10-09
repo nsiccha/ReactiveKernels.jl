@@ -3586,14 +3586,22 @@ const RESERVED_NODES = (:prior, :likelihood, :log_jacobian, :posterior, :pointwi
     topological_order(plan) -> Vector{Symbol}
 
 Evaluation order over parameters ∪ assignments ∪ derived columns (Kahn's
-algorithm). Loud on cycles (and, on bound plans, unknown references —
-unbound plans defer name resolution to bind). Shared by validation and the
-generator.
+algorithm). Among names whose dependencies are met, the earliest declared
+comes first, so the same plan always gives the same order. Loud on cycles
+(and, on bound plans, unknown references — unbound plans defer name
+resolution to bind). Shared by validation and the generator.
 """
 function topological_order(plan::StructuralPlan)
     names = _union_names(plan)
     allnames = _all_names(plan)
     deps = Dict{Symbol,Set{Symbol}}()
+    # Names in declaration order: the order of the plan's tables, each name
+    # at its first entry.
+    declared = Symbol[]
+    function depend!(name, refs)
+        haskey(deps, name) || push!(declared, name)
+        deps[name] = refs
+    end
     for s in plan.scans
         refs = Set{Symbol}()
         locals = Set(st.target for st in s.step if !st.indexed)
@@ -3604,7 +3612,7 @@ function topological_order(plan::StructuralPlan)
         end
         filter!(r -> r in allnames && r ∉ s.states && r ∉ locals, refs)
         for state in s.states
-            deps[state] = copy(refs)
+            depend!(state, copy(refs))
         end
     end
     for p in plan.parameters
@@ -3617,17 +3625,17 @@ function topological_order(plan::StructuralPlan)
                 ref in names && push!(refs, ref)
             end
         end
-        deps[p.name] = refs
+        depend!(p.name, refs)
     end
     # Vector parameters are constrained in the layout transforms, ahead of
     # every definition that reads them (functions as values).
     for v in _vector_value_names(plan)
-        haskey(deps, v) || (deps[v] = Set{Symbol}())
+        haskey(deps, v) || depend!(v, Set{Symbol}())
     end
     for p in plan.vector_parameters
         p.family === :simplex_dirichlet || continue
-        deps[p.name] = Set(ref for ref in _value_symbols(p.args.arg1)
-            if ref in allnames)
+        depend!(p.name, Set(ref for ref in _value_symbols(p.args.arg1)
+            if ref in allnames))
     end
     # Per-cell latent (plate) parameters: prior args are shared scalars,
     # per-cell derived columns, or raw data columns (never another latent).
@@ -3641,7 +3649,7 @@ function topological_order(plan::StructuralPlan)
             v isa Symbol || continue
             v in allnames && push!(refs, v)
         end
-        deps[p.name] = refs
+        depend!(p.name, refs)
     end
     # Declared array parameters constrain in the layout transforms; a
     # name their prior arguments read is a dependency (expressions
@@ -3654,7 +3662,7 @@ function topological_order(plan::StructuralPlan)
                 r in allnames && push!(refs, r)
             end
         end
-        deps[p.name] = refs
+        depend!(p.name, refs)
     end
     for a in plan.assignments
         refs = Symbol[]
@@ -3664,7 +3672,7 @@ function topological_order(plan::StructuralPlan)
                 r in allnames || _fail(a.label, "assignment references unknown name $r")
             end
         end
-        deps[a.name] = Set{Symbol}(r for r in refs if r in allnames)
+        depend!(a.name, Set{Symbol}(r for r in refs if r in allnames))
     end
     for d in plan.derived
         refs = Symbol[]
@@ -3679,21 +3687,31 @@ function topological_order(plan::StructuralPlan)
                 r in allnames || _fail(d.label, "derived column references unknown name $r")
             end
         end
-        deps[d.name] = Set{Symbol}(r for r in refs if r in allnames)
+        depend!(d.name, Set{Symbol}(r for r in refs if r in allnames))
     end
+    # Take ready names by declaration rank, never by Dict/Set iteration:
+    # that orders independent names by their hashes, and a gensym name (a
+    # private producer hoisted out of a cell, such as a selected observation
+    # argument) hashes differently in every lowering, so one source would
+    # generate programs whose statements differ in order.
+    rank = Dict{Symbol,Int}(name => i for (i, name) in enumerate(declared))
     remaining = Dict{Symbol,Int}(name => length(d) for (name, d) in deps)
-    dependents = Dict{Symbol,Vector{Symbol}}(name => Symbol[] for name in keys(deps))
-    for (name, ds) in deps, d in ds
+    dependents = Dict{Symbol,Vector{Symbol}}(name => Symbol[] for name in declared)
+    for name in declared, d in deps[name]
         push!(dependents[d], name)
     end
     order = Symbol[]
-    ready = [name for (name, n) in remaining if n == 0]
+    # Ready ranks, latest first, so `pop!` takes the earliest declared.
+    ready = Int[rank[name] for name in Iterators.reverse(declared)
+        if remaining[name] == 0]
     while !isempty(ready)
-        name = pop!(ready)
+        name = declared[pop!(ready)]
         push!(order, name)
         for m in dependents[name]
             remaining[m] -= 1
-            remaining[m] == 0 && push!(ready, m)
+            remaining[m] == 0 || continue
+            r = rank[m]
+            insert!(ready, searchsortedfirst(ready, r; rev = true), r)
         end
     end
     cyclic = sort!([name for (name, n) in remaining if n > 0])
