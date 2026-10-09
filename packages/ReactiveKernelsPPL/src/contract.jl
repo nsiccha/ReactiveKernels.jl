@@ -6441,8 +6441,8 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     end
     foreach(gather_indices, values(nodes))
     for p in plan.array_parameters, dim in p.dims
-        dim isa Expr && dim.head === :call && dim.args[1] === :levels &&
-            dim.args[2] isa Symbol && push!(axes, dim.args[2])
+        g = _level_pool_source(dim)
+        g === nothing || push!(axes, g)
     end
     union!(required, axes)
     names = Set{Symbol}(nm for (nm, ex) in nodes
