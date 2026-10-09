@@ -157,6 +157,27 @@ end
     batch = vectorize(typed_positions; batched=:position)
     @test_throws DimensionMismatch batch([1.0, 2.0])
     @test batch(zeros(2, 0)) == Float64[]
+    # A declaration fixing only the rank is checked the same way; it used to
+    # accept any stack and run the scalar graph on matrix slices (snag
+    # rk-declared-rank-317aa725). One leaving the rank open stays unchecked.
+    @kernel rank_positions(position::AbstractVector) = begin
+        result::Float64 = sum(position)
+    end
+    @kernel real_positions(position::AbstractVector{<:Real}) = begin
+        result::Float64 = sum(position)
+    end
+    for graph in (rank_positions, real_positions)
+        rank_batch = vectorize(graph; batched=:position)
+        @test rank_batch([1.0 2.0; 3.0 4.0]) == [4.0, 6.0]
+        @test rank_batch([1 2; 3 4]) == [4.0, 6.0]
+        @test_throws DimensionMismatch rank_batch([1.0, 2.0])
+        @test_throws DimensionMismatch rank_batch(ones(2, 2, 2))
+    end
+    @kernel rankless_positions(position::AbstractArray{Float64}) = begin
+        result::Float64 = sum(position)
+    end
+    @test vectorize(rankless_positions; batched=:position)(ones(2, 2, 2)) ==
+          [4.0, 4.0]
     identity_batch = vectorize(typed_positions;
         have=:position, want=:position, batched=:position)
     positions = reshape(collect(1.0:6.0), 2, 3)

@@ -74,6 +74,56 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# Declarations that fix only the rank: the element type plays no part in the
+# domain proof (snag rk-declared-rank-317aa725).
+@kernel vector_live_rank(q::AbstractVector, data) = begin
+    pointwise = plate(data, q) do d, parameter
+        transformed::Float64 = counted_log(d)
+        result::Float64 = transformed * parameter
+        result
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel vector_live_real(q::AbstractVector{<:Real}, data) = begin
+    pointwise = plate(data, q) do d, parameter
+        transformed::Float64 = counted_log(d)
+        result::Float64 = transformed * parameter
+        result
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel vector_live_local(q, data) = begin
+    q_live::AbstractVector = q
+    pointwise = plate(data, q_live) do d, parameter
+        transformed::Float64 = counted_log(d)
+        result::Float64 = transformed * parameter
+        result
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel matrix_live_rank(q::AbstractMatrix, data, shift) = begin
+    pointwise = plate(data, shift, q) do d, s, parameter
+        transformed::Float64 = counted_log(d)
+        shifted::Float64 = transformed + s
+        result::Float64 = shifted * parameter
+        result
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# A declaration that leaves the rank open still declines.
+@kernel vector_live_rankless(q::AbstractArray{Float64}, data) = begin
+    pointwise = plate(data, q) do d, parameter
+        transformed::Float64 = counted_log(d)
+        result::Float64 = transformed * parameter
+        result
+    end
+    total::Float64 = sum(pointwise)
+end
+
 @kernel atomic(q::Float64, data, coefficients) = begin
     pointwise = plate(data, Ref(coefficients), q) do d, coefs, parameter
         transformed::Float64 = counted_log(d) + sum(coefs)

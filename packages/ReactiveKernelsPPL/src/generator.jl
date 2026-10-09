@@ -429,14 +429,26 @@ function _predictor_statements(plan::StructuralPlan)
         # contract orders subs first), scalars to their constrained
         # locals (params constrained above, assignments emitted above).
         # Plain broadcast math: ordinary reverse mode on every backend.
+        rows = false
         for t in pred.terms
-            t.kind === ComposedTerm &&
-                push!(terms, _composed_expr(plan, pred, t))
+            t.kind === ComposedTerm || continue
+            ex = _composed_expr(plan, pred, t)
+            rows |= _composed_needs_rows(plan, pred, t, ex)
+            push!(terms, ex)
         end
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a .+ $b), terms)
-        push!(stmts, :($lp = $rhs))
+        # Full-length vector plans read one location entry per row. A value
+        # of unknown shape gets those rows once, as Julia broadcasting
+        # against the rows would, rather than a ones vector per summand.
+        rows && (rhs = Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs,
+            _located_rows_source(plan, pred)))
+        # A proven scalar declares its type, so plates statically read it
+        # as a shared argument rather than through a runtime axis test.
+        push!(stmts, _predictor_value_type(plan, pred) === :Number &&
+            _scalar_valued_predictor(plan, pred) ?
+            :($lp::Number = $rhs) : :($lp = $rhs))
     end
     return stmts
 end
@@ -526,16 +538,15 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
         (_composed_rewrite(a, subs, plan, pred) for a in node.args[2:end])...)
 end
 
-function _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec)
-    o = t.options
-    ex = _composed_rewrite(o.tree, o.subs, plan, pred.name)
-    _is_plate_column_expr(ex) && return ex
-    # Retain scalar shape when observation operands need broadcasting;
-    # ordinary full-length vector plans keep their established lowering.
-    isempty(o.subs) && isempty(t.columns) || return ex
-    _broadcast_affine(plan, pred) && return ex
-    return Expr(:call, :.*, Expr(:call, :ones, _located_rows_source(plan, pred)), ex)
-end
+_composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec) =
+    _composed_rewrite(t.options.tree, t.options.subs, plan, pred.name)
+
+# A composition reading no sub-predictor and no column has no row axis of
+# its own. Scalar shape is retained when observation operands need
+# broadcasting; ordinary full-length vector plans give it the location's rows.
+_composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec, ex) =
+    !_is_plate_column_expr(ex) && isempty(t.options.subs) &&
+        isempty(t.columns) && !_broadcast_affine(plan, pred)
 
 # Rows of the responses a predictor locates — their own observation axis,
 # which is not `n_obs` when responses observe different rows.
@@ -863,6 +874,14 @@ _mi_row_value(x::Number, i) = x
 
 _ppl_range_values(x::Number, indices) = x
 _ppl_range_values(x::AbstractArray, indices) = x[indices]
+
+# `ones(n) .* x` without the ones operand: a number fills the rows, and a
+# vector already holding one Float64 per row is that location value itself.
+# Other values (traced, integer, singleton or mismatched) keep Julia's
+# broadcast against the rows, including its dimension errors.
+@inline _ppl_rows(x::Float64, n::Int) = fill(x, n)
+@inline _ppl_rows(x::Vector{Float64}, n::Int) = length(x) == n ? x : ones(n) .* x
+@inline _ppl_rows(x, n::Int) = ones(n) .* x
 
 # A selected plate column already holds one value per selected response cell
 # (`_selected_plate_indices`); only whole operands are gathered at the
@@ -2189,6 +2208,7 @@ end
 # shape guard. Ordinary vector designs keep their existing annotation.
 function _predictor_value_type(plan::StructuralPlan, pred::PredictorSpec)
     _broadcast_affine(plan, pred) || return :AbstractVector
+    _scalar_valued_predictor(plan, pred) && return :Number
     scalar = all(pred.terms) do t
         t.kind === InterceptTerm && return true
         t.kind in (ContinuousTerm, OffsetTerm) &&

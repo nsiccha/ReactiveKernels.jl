@@ -4232,9 +4232,12 @@ _replica_rank(::Type{T}) where {T} = throw(ArgumentError(
 
 # Known numeric ranks retain their validation. Untyped and record boundaries
 # derive their layout from the runtime container, without narrowing the scalar
-# graph's HAVE types or inventing a second mathematical graph.
+# graph's HAVE types or inventing a second mathematical graph. A declared rank
+# is known whatever the element type: `AbstractVector` checks like
+# `Vector{Float64}` (an element type bound outside the `<:` skipped the check
+# for it; snag rk-declared-rank-317aa725).
 _replica_expected_rank(::Type{T}) where {T<:Number} = 1
-_replica_expected_rank(::Type{<:AbstractArray{T,N}}) where {T,N} = N + 1
+_replica_expected_rank(::Type{<:AbstractArray{<:Any,N}}) where {N} = N + 1
 _replica_expected_rank(::Type{<:AbstractArray}) = nothing
 _replica_expected_rank(::Type{Any}) = nothing
 _replica_expected_rank(::Type{T}) where {T<:Union{Tuple,NamedTuple}} = nothing

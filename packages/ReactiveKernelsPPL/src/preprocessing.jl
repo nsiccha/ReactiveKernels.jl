@@ -69,20 +69,17 @@ end
     offset_recipe(shape; scalars, n_rows, broadcast) -> Union{Nothing,Expr}
 
 `_ppl_offset_<pred> = col1 .+ col2 .+ …` over offset-term columns, or
-`nothing` when the predictor has no offset terms. Scalar assignments in
-`scalars` expand over `n_rows` (a number or an expression over bound data)
-unless `broadcast` retains their scalar shape.
+`nothing` when the predictor has no offset terms. A sum with a scalar
+assignment from `scalars` gets `n_rows` rows (`_ppl_rows`; a number or an
+expression over bound data) unless `broadcast` retains its scalar shape.
 """
 function offset_recipe(shape::DesignShape; scalars = Set{Symbol}(), n_rows = 0,
         broadcast = false)
-    cols = Any[]
-    for b in shape.blocks
-        b.kind === OffsetTerm || continue
-        push!(cols, b.column in scalars && !broadcast ?
-            :(ones($n_rows) .* $(b.column)) : b.column)
-    end
+    cols = Any[b.column for b in shape.blocks if b.kind === OffsetTerm]
     isempty(cols) && return nothing
     total = foldl((a, c) -> :($a .+ $c), cols)
+    !broadcast && any(in(scalars), cols) &&
+        (total = Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), total, n_rows))
     name = offset_name(shape.predictor)
     return :($name = $total)
 end
@@ -131,8 +128,11 @@ end
 # use per-block coefficient expressions. This retains
 # Julia's broadcast axes and avoids mixing bound and active columns in a
 # generated hcat. Data-only derived columns are already present in columns.
+# A proven scalar location keeps its scalar shape too: the observation
+# plate broadcasts it as a shared argument, with no row vector.
 function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     _uses_structured_observation_axes(plan) && return false
+    _scalar_valued_predictor(plan, pred) && return true
     for t in pred.terms
         t.kind in (ContinuousTerm, OffsetTerm, FactorTerm, ComposedTerm) || continue
         for c in t.columns
@@ -149,6 +149,42 @@ function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     # array response or several independent observation domains.
     return any(a -> length(a) != 1 || length(only(a)) != plan.n_obs,
         values(observations.domains))
+end
+
+# Every summand is a proven scalar (`_value_axes` is `Any[]`): an intercept
+# coefficient, a scalar offset or covariate, or a composition of sampled
+# scalars, numbers and scalar definitions. An opaque call result has an
+# unknown shape and keeps the location's rows.
+function _scalar_valued_predictor(plan::StructuralPlan, pred::PredictorSpec)
+    isempty(pred.terms) && return false
+    scalar(ex) = _value_axes(plan, ex; data_axes = true) == Any[] &&
+        !_reads_rank0_data(plan, ex)
+    return all(pred.terms) do t
+        t.kind === InterceptTerm && return true
+        t.kind in (ContinuousTerm, OffsetTerm) && return all(scalar, t.columns)
+        t.kind === ComposedTerm || return false
+        isempty(t.columns) && isempty(t.options.subs) || return false
+        return scalar(t.options.tree)
+    end
+end
+
+# A rank-0 array has no axes (`_value_axes` gives `Any[]`) yet stays an
+# array (`fill(0.5)`), so a value reading one is not a proven `Number`.
+function _reads_rank0_data(plan::StructuralPlan, ex,
+        seen::Set{Symbol} = Set{Symbol}())
+    if ex isa Symbol
+        value = get(plan.columns, ex, nothing)
+        value isa AbstractArray && return ndims(value) == 0
+        ex in seen && return false
+        push!(seen, ex)
+        for defs in (plan.assignments, plan.derived)
+            i = findfirst(a -> a.name === ex, defs)
+            i === nothing || return _reads_rank0_data(plan, defs[i].expr, seen)
+        end
+        return false
+    end
+    ex isa Expr || return false
+    return any(a -> _reads_rank0_data(plan, a, seen), ex.args)
 end
 
 """Design row count of a predictor, resolved from its authored inputs."""
