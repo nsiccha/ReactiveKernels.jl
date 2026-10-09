@@ -59,8 +59,10 @@ end
 The `@kernel` definition expression (`Expr(:(=), signature, body)`).
 Pure (no eval): the generator tests inspect and evaluate it.
 """
-kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model) =
-    _name_plate_cells(Base.invokelatest(_kernel_expr_latest, plan, layout; name))
+function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
+    def = Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+    return _name_plate_cells(def, _location_value_aliases(plan, def))
+end
 
 function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
     validate_plan(plan)
@@ -1719,11 +1721,35 @@ _is_plate_do(ex) = Meta.isexpr(ex, :do, 2) && Meta.isexpr(ex.args[1], :call) &&
     ex.args[1].args[1] === :plate && Meta.isexpr(ex.args[2], :->) &&
     Meta.isexpr(ex.args[2].args[1], :tuple)
 
-_name_plate_cells(x) = x
-function _name_plate_cells(ex::Expr)
-    ex = Expr(ex.head, Any[_name_plate_cells(a) for a in ex.args]...)
+_name_plate_cells(x, aliases) = x
+function _name_plate_cells(ex::Expr, aliases)
+    ex = Expr(ex.head, Any[_name_plate_cells(a, aliases) for a in ex.args]...)
     _is_plate_do(ex) || return ex
-    return _name_plate_cell(ex, (p, input) -> _cell_argument_name(input))
+    return _name_plate_cell(ex, (p, input) ->
+        _cell_argument_name(input isa Symbol ? get(aliases, input, input) : input))
+end
+
+# A value location's predictor is a pure alias of the graph value it reads
+# (`y_eta = mu`, `_value_location!`), and RK reads that value in its place:
+# `y .~ Normal.(mu, s)` observes `plate(y, mu, s) do y, mu, s`. So a cell
+# argument over the alias is named after the value.
+function _location_value_aliases(plan::StructuralPlan, def::Expr)
+    values = Dict{Symbol,Symbol}()
+    for p in plan.predictors
+        length(p.terms) == 1 || continue
+        t = only(p.terms)
+        t.kind === ComposedTerm && t.options.tree isa Symbol &&
+            t.options.tree in t.columns && (values[p.name] = t.options.tree)
+    end
+    aliases = Dict{Symbol,Symbol}()
+    !isempty(values) && Meta.isexpr(def, :(=), 2) &&
+        Meta.isexpr(def.args[2], :block) || return aliases
+    for st in def.args[2].args
+        Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol &&
+            get(values, st.args[1], nothing) === st.args[2] &&
+            (aliases[st.args[1]] = st.args[2])
+    end
+    return aliases
 end
 
 # Name the numbered arguments of one `plate(...) do` cell: `choose(p, input)`
