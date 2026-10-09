@@ -285,4 +285,26 @@ end
     @test grad ≈ fd rtol = 1e-5 atol = 1e-7
 end
 
+@testset "a scalar parameter's log-Jacobian term is named after it" begin
+    model = quote
+        p ~ Beta(2.0, 2.0)
+        q ~ Beta(2.0, 3.0)
+        sigma ~ Exponential(1.0)
+        y .~ Normal.(p + q, sigma)
+    end
+    bound = _bound(model, (; y); mod = @__MODULE__)
+    built = build_kernel(bound)
+    code = string(readable_code(built.spec))
+    @test occursin("var\"p.logjac\" = log(var\"p.logjac.logjac__x\")", code)
+    # The exp transform's term is the coordinate itself, read in place.
+    @test occursin("log_jacobian = (var\"p.logjac\" + var\"q.logjac\") + unconstrained[3]",
+                   code)
+    @test !occursin("##", code)
+    @test !occursin("let ", code)
+    layout = built.layout
+    u = [0.3, -0.2, 0.1]
+    query = prepare_query(built, bound, :log_jacobian)
+    @test Base.invokelatest(query, u) ≈ logjac(layout, u) rtol = 1e-12
+end
+
 end
