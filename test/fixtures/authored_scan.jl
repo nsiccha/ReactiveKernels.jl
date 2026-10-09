@@ -6,9 +6,9 @@ using ReactiveKernels
     mu::Float64 = sum(view(q, 1:1))
     phi::Float64 = sum(view(q, 2:2))
     theta::Float64 = sum(view(q, 3:3))
-    errors::Vector{Float64} = scan(series, Ref(mu), Ref(phi), Ref(theta);
-            init = (; previous = mu, error = 0.0)) do carry, y, m, f, t
-        e = y - (m + f * carry.previous + t * carry.error)
+    errors::Vector{Float64} = scan(series;
+            init = (; previous = mu, error = 0.0)) do carry, y
+        e = y - (mu + phi * carry.previous + theta * carry.error)
         ((; previous = y, error = e), e)
     end
     pointwise = plate(errors) do e
@@ -66,8 +66,8 @@ end
 # loop body after the eager first step.
 @kernel authored_scan_eachrow(mat::Matrix{Float64}, gain::Float64) = begin
     seed::Vector{Float64} = [-0.6931471805599453, -0.6931471805599453]
-    seq::Vector{Float64} = scan(eachrow(mat), Ref(gain); init = seed) do carry, row, g
-        emit = g .* (row[1] .+ carry .* row[2])
+    seq::Vector{Float64} = scan(eachrow(mat); init = seed) do carry, row
+        emit = gain .* (row[1] .+ carry .* row[2])
         newg = emit .+ row[3]
         (newg, sum(newg))
     end
@@ -90,10 +90,10 @@ end
 # kernel only from the live arm of a separate graph. This preserves a genuine
 # empty schedule without asking scan to infer an output type from zero steps.
 @kernel authored_scan_nonempty(mat::Matrix{Float64}, positions::Vector{Int}) = begin
-    weights::Vector{Float64} = scan(eachrow(mat), Ref(positions);
-            init = (; prior = zeros(Float64, length(positions)), index = 1)) do carry, row, slots
+    weights::Vector{Float64} = scan(eachrow(mat);
+            init = (; prior = zeros(Float64, length(positions)), index = 1)) do carry, row
         weight = row[1] + sum(carry.prior)
-        next = ifelse.(slots .== carry.index, weight, carry.prior)
+        next = ifelse.(positions .== carry.index, weight, carry.prior)
         ((; prior = next, index = carry.index + 1), weight)
     end
     return weights
@@ -112,9 +112,9 @@ ReactiveKernels.@traceable _history_lag(p::HistoryLattice, j, i) =
     p.shifts[j] - p.shifts[i] + 1
 
 @kernel authored_scan_history(amounts::Vector{Float64}, plan, units::Vector{Float64}) = begin
-    weights::Vector{Float64} = scan(amounts, eachindex(amounts), Ref(plan), Ref(units);
-            init = 0, history = 0.0) do carry, amount, j, p, u, earlier
-        exposure = sum(earlier[i] * get(u, _history_lag(p, j, i), 0.0)
+    weights::Vector{Float64} = scan(amounts, eachindex(amounts);
+            init = 0, history = 0.0) do carry, amount, j, earlier
+        exposure = sum(earlier[i] * get(units, _history_lag(plan, j, i), 0.0)
                        for i in 1:j-1; init = 0.0)
         weight = amount == 0 ? 0.0 : amount / (1 + exposure)
         (carry + 1, weight)
@@ -158,8 +158,8 @@ ReactiveKernels.@traceable _scan_surface(k, a, b) =
 
 @kernel authored_scan_surface(W, scale::Float64, xs::Vector{Float64}) = begin
     model = (; W, scale)
-    ys::Vector{Float64} = scan(xs, Ref(model); init = 0.0) do carry, x, k
-        value = k.scale * _scan_surface(k, x, x + 0.5)
+    ys::Vector{Float64} = scan(xs; init = 0.0) do carry, x
+        value = model.scale * _scan_surface(model, x, x + 0.5)
         (carry + value, value)
     end
     total::Float64 = sum(ys)
@@ -178,9 +178,9 @@ _scan_surface_base(k, a, b) =
 # The dose-feedback shape whose effective amount reads the nested-sum surface.
 @kernel authored_scan_history_surface(amounts::Vector{Float64}, plan,
                                       units::Vector{Float64}, k) = begin
-    weights::Vector{Float64} = scan(amounts, eachindex(amounts), Ref(plan), Ref(units), Ref(k);
-            init = 0, history = 0.0) do carry, amount, j, p, u, k, earlier
-        exposure = sum(earlier[i] * get(u, _history_lag(p, j, i), 0.0)
+    weights::Vector{Float64} = scan(amounts, eachindex(amounts);
+            init = 0, history = 0.0) do carry, amount, j, earlier
+        exposure = sum(earlier[i] * get(units, _history_lag(plan, j, i), 0.0)
                        for i in 1:j-1; init = 0.0)
         weight = amount == 0 ? 0.0 :
             amount / (1 + exposure * (1 + _scan_surface(k, amount, exposure)^2))
@@ -205,7 +205,7 @@ end
 
 # The same nest written inline in a scan step and in a plate cell.
 @kernel authored_scan_nested_inline(xs::Vector{Float64}, k) = begin
-    ys::Vector{Float64} = scan(xs, Ref(k); init = 0.0) do carry, x, k
+    ys::Vector{Float64} = scan(xs; init = 0.0) do carry, x
         value = sum((sum((sin(x * i) * k.W[i, j] for i in axes(k.W, 1)); init = 0.0) *
                      sin((x + 0.5) * j) for j in axes(k.W, 2)); init = 0.0)
         (carry + value, value)
@@ -214,7 +214,7 @@ end
 end
 
 @kernel authored_plate_nested_inline(xs::Vector{Float64}, k) = begin
-    ys::Vector{Float64} = plate(xs, Ref(k)) do x, k
+    ys::Vector{Float64} = plate(xs) do x
         sum((sum((sin(x * i) * k.W[i, j] for i in axes(k.W, 1)); init = 0.0) *
              sin((x + 0.5) * j) for j in axes(k.W, 2)); init = 0.0)
     end
@@ -249,8 +249,8 @@ function _history_scale(cfg, x)
 end
 
 @kernel authored_scan_host_shared(xs::Vector{Float64}, plan, cfg) = begin
-    ys::Vector{Float64} = scan(xs, eachindex(xs), Ref(plan), Ref(cfg); init = 0.0) do carry, x, j, p, c
-        next = carry + x * _history_shift(p, j) + _history_scale(c, x)
+    ys::Vector{Float64} = scan(xs, eachindex(xs); init = 0.0) do carry, x, j
+        next = carry + x * _history_shift(plan, j) + _history_scale(cfg, x)
         (next, next)
     end
     return ys

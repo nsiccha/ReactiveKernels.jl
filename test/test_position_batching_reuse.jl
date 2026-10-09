@@ -90,15 +90,15 @@ _position_output_copy(kernel, position, data) = copy(kernel(position, data))
 end
 
 @kernel view_superpose(observations, shifts, units, weights) = begin
-    total = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
-        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init = 0.0)
+    total = plate(observations) do t
+        sum(weights[j] * get(units, t - shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
     end
     return total
 end
 @kernel view_relax(drive, dts, q) = begin
-    trajectory = scan(drive, dts, Ref(q); init=q.r0, include_init=true) do previous, c, dt, p
-        steady = p.r * c
-        next = (previous - steady) * exp(-p.k * dt) + steady
+    trajectory = scan(drive, dts; init=q.r0, include_init=true) do previous, c, dt
+        steady = q.r * c
+        next = (previous - steady) * exp(-q.k * dt) + steady
         (next, next)
     end
     return trajectory
@@ -388,16 +388,16 @@ end
 # position used to allocate a projected input copy and a fresh lane output.
 @kernel lane_superpose(observations, shifts::Vector{Int}, units::Vector{Float64},
                        weights::Vector{Float64}) = begin
-    total::Vector{Float64} = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
-        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init = 0.0)
+    total::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * get(units, t - shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
     end
     return total
 end
 @kernel lane_relax(drive::Vector{Float64}, dts::Vector{Float64}, q) = begin
-    trajectory::Vector{Float64} = scan(drive, dts, Ref(q); init = q.r0,
-                                       include_init = true) do previous, c, dt, p
-        steady = p.r * c
-        next = (previous - steady) * exp(-p.k * dt) + steady
+    trajectory::Vector{Float64} = scan(drive, dts; init = q.r0,
+                                       include_init = true) do previous, c, dt
+        steady = q.r * c
+        next = (previous - steady) * exp(-q.k * dt) + steady
         (next, next)
     end
     return trajectory

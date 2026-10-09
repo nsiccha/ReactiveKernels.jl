@@ -12,8 +12,8 @@ using DifferentiationInterface: AutoEnzyme
 end
 @kernel pair_grid(x, scale) = begin
     left, right = coordinates(x)
-    matrix = plate(left, right, Ref(scale)) do a, b, s
-        (a + 2b) * s
+    matrix = plate(left, right) do a, b
+        (a + 2b) * scale
     end
     return matrix
 end

@@ -121,8 +121,8 @@ end
             next = carry + x
             (next, next)
         end
-        pointwise = plate(xs, Ref(cumulative)) do x, all_values
-            x + sum(all_values)
+        pointwise = plate(xs) do x
+            x + sum(cumulative)
         end
         return sum(pointwise)
     end
@@ -147,9 +147,9 @@ end
     @test _authored_scan_allocated(scalar, xs, 0.5) == 0
 
     @kernel scan_inside_plate(xs::Vector{Float64}, shifts::Vector{Float64}) = begin
-        totals = plate(Ref(xs), shifts) do data, m
-            values = scan(data, Ref(m); init = 0.0) do carry, x, shift
-                next = carry + x + shift
+        totals = plate(shifts) do m
+            values = scan(xs; init = 0.0) do carry, x
+                next = carry + x + m
                 (next, next)
             end
             sum(values)
@@ -235,8 +235,8 @@ end
 
     # Two iterated sequences PLUS a Ref-shared scalar gain.
     @kernel linrec(a::Vector{Float64}, b::Vector{Float64}, g::Float64) = begin
-        s = scan(a, b, Ref(g); init = 0.0) do carry, ai, bi, gain
-            next = gain * (ai * carry + bi)
+        s = scan(a, b; init = 0.0) do carry, ai, bi
+            next = g * (ai * carry + bi)
             (next, next)
         end
         return s
@@ -304,8 +304,8 @@ end
 
     # Position batching runs the scan through its operation, not the inlined loop.
     @kernel positioned_scan(xs::Vector{Float64}, position::Float64) = begin
-        values = scan(xs, Ref(position); init = 0.0) do carry, x, p
-            next = carry + p * x
+        values = scan(xs; init = 0.0) do carry, x
+            next = carry + position * x
             (next, next)
         end
         total::Float64 = sum(values)
@@ -321,11 +321,11 @@ end
 # arm, and the lockstep form matches the packed `eachrow(hcat(...))` spelling.
 @kernel authored_scan_turnover(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
     kin = pd.baseline * pd.kout
-    updated = scan(conc_mid, dts, Ref(pd), Ref(kin);
-            init = pd.baseline) do previous, concentration, dt, parameters, input_rate
-        c2 = parameters.kout * (1 + concentration /
-            (parameters.theta1 * concentration + parameters.theta2))
-        steady = input_rate / c2
+    updated = scan(conc_mid, dts;
+            init = pd.baseline) do previous, concentration, dt
+        c2 = pd.kout * (1 + concentration /
+            (pd.theta1 * concentration + pd.theta2))
+        steady = kin / c2
         next = (previous - steady) * exp(-c2 * dt) + steady
         (next, next)
     end
@@ -336,13 +336,13 @@ end
 @kernel authored_scan_turnover_packed(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
     kin = pd.baseline * pd.kout
     steps = hcat(conc_mid, dts)
-    updated = scan(eachrow(steps), Ref(pd), Ref(kin);
-            init = pd.baseline) do previous, row, parameters, input_rate
+    updated = scan(eachrow(steps);
+            init = pd.baseline) do previous, row
         concentration = row[1]
         dt = row[2]
-        c2 = parameters.kout * (1 + concentration /
-            (parameters.theta1 * concentration + parameters.theta2))
-        steady = input_rate / c2
+        c2 = pd.kout * (1 + concentration /
+            (pd.theta1 * concentration + pd.theta2))
+        steady = kin / c2
         next = (previous - steady) * exp(-c2 * dt) + steady
         (next, next)
     end
@@ -370,11 +370,11 @@ end
 # `[pd.baseline, R₁, …, Rₙ]`, instead of the per-step vector plus a `vcat` copy.
 @kernel authored_scan_turnover_init(pd, conc_mid::Vector{Float64}, dts::Vector{Float64}) = begin
     kin = pd.baseline * pd.kout
-    trajectory = scan(conc_mid, dts, Ref(pd), Ref(kin);
-            init = pd.baseline, include_init = true) do previous, concentration, dt, parameters, input_rate
-        c2 = parameters.kout * (1 + concentration /
-            (parameters.theta1 * concentration + parameters.theta2))
-        steady = input_rate / c2
+    trajectory = scan(conc_mid, dts;
+            init = pd.baseline, include_init = true) do previous, concentration, dt
+        c2 = pd.kout * (1 + concentration /
+            (pd.theta1 * concentration + pd.theta2))
+        steady = kin / c2
         next = (previous - steady) * exp(-c2 * dt) + steady
         (next, next)
     end
@@ -456,8 +456,8 @@ end
 
     # Position batching runs the scan operation rather than the inlined loop.
     @kernel positioned_included_scan(xs::Vector{Float64}, position::Float64) = begin
-        values = scan(xs, Ref(position); init = position, include_init = true) do carry, x, p
-            next = carry + p * x
+        values = scan(xs; init = position, include_init = true) do carry, x
+            next = carry + position * x
             (next, next)
         end
         total::Float64 = sum(values)
@@ -500,10 +500,12 @@ end
     _authored_scan_allocated(similar, amounts)
     @test _authored_scan_allocated(weights, amounts, plan, units) ==
         _authored_scan_allocated(similar, amounts)
-    # The op called outside a generated body (the host lowering) agrees.
+    # The op called outside a generated body (the host lowering) agrees. Its
+    # shared operands are the step's captures in first-read order (`units`, then
+    # `plan`), before the history fill.
     recipe = only(r for r in weights.plan.recipes
                   if r.op isa ReactiveKernels._AuthoredScanOp)
-    @test recipe.op(0, amounts, eachindex(amounts), plan, units, 0.0) == expected
+    @test recipe.op(0, amounts, eachindex(amounts), units, plan, 0.0) == expected
 
     # No step runs on an empty sequence: an empty vector of the history's type.
     empty = weights(Float64[], F.HistoryLattice(Int[]), units)
@@ -656,8 +658,8 @@ const _scan_captured_shadowed = [100.0]
     end
     @kernel _scan_captured_derived(xs, a) = begin
         _scan_captured_shadowed = a .* 2.0
-        out = scan(xs, Ref(a); init = 0.0) do carry, x, aa
-            next = carry + x * _scan_captured_shadowed[1] + aa[2]
+        out = scan(xs; init = 0.0) do carry, x
+            next = carry + x * _scan_captured_shadowed[1] + a[2]
             (next, next)
         end
         return out

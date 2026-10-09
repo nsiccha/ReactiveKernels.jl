@@ -2,10 +2,10 @@ module ScanPlateADTests
 using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 
 @kernel subject_scans(q::Vector{Float64}, X::Matrix{Float64}) = begin
-    cells = plate(eachcol(X), Ref(q)) do xs, p
-        seed = (value=p[1],)
-        history = scan(xs, Ref(p); init=seed) do carry, x, params
-            next = carry.value + params[2]*x
+    cells = plate(eachcol(X)) do xs
+        seed = (value=q[1],)
+        history = scan(xs; init=seed) do carry, x
+            next = carry.value + q[2]*x
             ((value=next,), next)
         end
         sum(history)
@@ -32,16 +32,16 @@ end
 # differentiate under ordinary Reverse like a nonempty one (see
 # `benchmark/repro_enzyme_branch_allocation_phi.jl`).
 @kernel summed(xs, gain) = begin
-    history = scan(xs, Ref(gain); init=0.0) do carry, x, g
-        next = carry + x*g
+    history = scan(xs; init=0.0) do carry, x
+        next = carry + x*gain
         (next, next)
     end
     total = sum(history)
     return total
 end
 @kernel trajectory(xs, gain) = begin
-    path = scan(xs, Ref(gain); init=gain, include_init=true) do carry, x, g
-        next = carry + x*g
+    path = scan(xs; init=gain, include_init=true) do carry, x
+        next = carry + x*gain
         (next, next)
     end
     total = sum(path)
@@ -50,12 +50,12 @@ end
 # The plate fuses into the scan loop; the second reader keeps its pointwise
 # vector materialized.
 @kernel fused(xs, gain) = begin
-    history = scan(xs, Ref(gain); init=0.0) do carry, x, g
-        next = carry + x*g
+    history = scan(xs; init=0.0) do carry, x
+        next = carry + x*gain
         (next, next)
     end
-    pointwise = plate(history, Ref(gain)) do h, s
-        h*s
+    pointwise = plate(history) do h
+        h*gain
     end
     total = sum(pointwise)
     squares = sum(abs2, pointwise)
@@ -137,8 +137,8 @@ end
 # lowering must never bind it to a placeholder when the step's inferred output
 # type is not concrete (here `Union{Float64, Int}`).
 @kernel declared_unstable(xs, gain) = begin
-    history::Vector{Float64} = scan(xs, Ref(gain); init=0.0) do carry, x, g
-        next = x > 0 ? carry + x*g : 0
+    history::Vector{Float64} = scan(xs; init=0.0) do carry, x
+        next = x > 0 ? carry + x*gain : 0
         (next, next)
     end
     total = sum(history)
@@ -160,26 +160,26 @@ end
 # the differentiated call (`EnzymeMutabilityException` under ordinary Reverse
 # from a plate cell), and typed an empty sequence's result `Any`.
 @kernel subject_update(xs, w) = begin
-    trajectory = scan(xs, Ref(w); init=zeros(length(w))) do previous, x, weights
-        next = plate(previous, weights, Ref(x)) do p, wi, xx
-            p + xx*wi
+    trajectory = scan(xs; init=zeros(length(w))) do previous, x
+        next = plate(previous, w) do p, wi
+            p + x*wi
         end
         (next, sum(next))
     end
     total()::Float64 = sum(trajectory)
 end
 @kernel endpoint_cells(groups::Vector{Vector{Float64}}, w::Vector{Float64}) = begin
-    totals = plate(groups, Ref(w)) do xs, weights
-        subject_update(xs, weights).total()
+    totals = plate(groups) do xs
+        subject_update(xs, w).total()
     end
     t::Float64 = sum(totals)
     return t
 end
 @kernel scan_cells(groups::Vector{Vector{Float64}}, w::Vector{Float64}) = begin
-    totals = plate(groups, Ref(w)) do xs, weights
-        trajectory = scan(xs, Ref(weights); init=0.0) do previous, x, ws
-            partial = scan(ws, Ref(x); init=previous) do acc, wi, xx
-                next_acc = acc + xx*wi
+    totals = plate(groups) do xs
+        trajectory = scan(xs; init=0.0) do previous, x
+            partial = scan(w; init=previous) do acc, wi
+                next_acc = acc + x*wi
                 (next_acc, next_acc)
             end
             next = partial[end]
@@ -191,11 +191,11 @@ end
     return t
 end
 @kernel nested_cells(groups::Vector{Vector{Float64}}, w::Vector{Float64}) = begin
-    totals = plate(groups, Ref(w)) do xs, weights
-        inner = plate(xs, Ref(weights)) do x, ws
-            path = scan(ws, Ref(x), Ref(ws); init=0.0) do a, wi, xx, wv
-                cells = plate(wv, Ref(xx)) do v, b
-                    v*b
+    totals = plate(groups) do xs
+        inner = plate(xs) do x
+            path = scan(w; init=0.0) do a, wi
+                cells = plate(w) do v
+                    v*x
                 end
                 n = a + wi*sum(cells)
                 (n, n)
@@ -208,9 +208,9 @@ end
     return t
 end
 @kernel stepped(xs::Vector{Float64}, w::Vector{Float64}) = begin
-    trajectory = scan(xs, Ref(w); init=zeros(length(w))) do previous, x, weights
-        next = plate(previous, weights, Ref(x)) do p, wi, xx
-            p + xx*wi
+    trajectory = scan(xs; init=zeros(length(w))) do previous, x
+        next = plate(previous, w) do p, wi
+            p + x*wi
         end
         (next, sum(next))
     end
@@ -277,10 +277,10 @@ end
 # and its loop is nested in the outer scan's loop in one generated body.
 @kernel seeded_inner(xs::Vector{Float64}, us::Vector{Vector{Float64}},
                      w::Vector{Float64}) = begin
-    trajectory = scan(xs, Ref(us), Ref(w); init=zeros(2)) do previous, x, uu, ww
-        pending = scan(eachindex(uu), Ref(uu), Ref(x); init=previous .* ww[1],
-                       include_init=true) do state, i, u, xx
-            n = state .+ xx .* u[i]
+    trajectory = scan(xs; init=zeros(2)) do previous, x
+        pending = scan(eachindex(us); init=previous .* w[1],
+                       include_init=true) do state, i
+            n = state .+ x .* us[i]
             (n, n)
         end
         next = pending[end]
@@ -291,10 +291,10 @@ end
 end
 @kernel summed_inner(xs::Vector{Float64}, us::Vector{Vector{Float64}},
                      w::Vector{Float64}) = begin
-    trajectory = scan(xs, Ref(us), Ref(w); init=zeros(2)) do previous, x, uu, ww
-        seed = previous .* ww[1]
-        partial = scan(eachindex(uu), Ref(uu), Ref(x); init=seed) do state, i, u, xx
-            n = state .+ xx .* u[i]
+    trajectory = scan(xs; init=zeros(2)) do previous, x
+        seed = previous .* w[1]
+        partial = scan(eachindex(us); init=seed) do state, i
+            n = state .+ x .* us[i]
             (n, sum(n))
         end
         next = seed .+ sum(partial; init=0.0)

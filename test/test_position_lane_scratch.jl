@@ -17,14 +17,14 @@ lane_domain(g::LaneGrid) = 1:g.n
 
 @kernel lane_response(position, u::Vector{Float64}, sched, amounts::Vector{Float64}) = begin
     g = sched.grid
-    y::Vector{Float64} = plate(lane_domain(g), Ref(g), Ref(u), Ref(amounts)) do o, gg, uu, aa
-        sum((aa[i] * get(uu, o - gg.shifts[i], 0.0) for i in eachindex(aa)); init = 0.0)
+    y::Vector{Float64} = plate(lane_domain(g)) do o
+        sum((amounts[i] * get(u, o - g.shifts[i], 0.0) for i in eachindex(amounts)); init = 0.0)
     end
     mid = y[2:2:end]
     level::Vector{Float64} = y[1:2:end]
     k = position.k
-    r::AbstractVector{Float64} = scan(mid, sched.dts, Ref(k); init = position.r0, include_init = true) do c, v, dt, kk
-        rate = kk * (1 + v / (v + 1))
+    r::AbstractVector{Float64} = scan(mid, sched.dts; init = position.r0, include_init = true) do c, v, dt
+        rate = k * (1 + v / (v + 1))
         n = (c - 1 / rate) * exp(-rate * dt) + 1 / rate
         (n, n)
     end

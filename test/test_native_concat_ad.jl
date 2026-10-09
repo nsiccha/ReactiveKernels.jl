@@ -39,30 +39,30 @@ end
     return total
 end
 @kernel cells(a, x, c) = begin
-    pointwise = plate(x, Ref(c), a) do xi, cc, s
-        sum(vcat(cc, [exp(s * xi)]))
+    pointwise = plate(x, a) do xi, s
+        sum(vcat(c, [exp(s * xi)]))
     end
     total = sum(pointwise)
 end
 @kernel scanned(a, x, c) = begin
-    trajectory = scan(x, Ref(c), Ref(a); init = zero(a)) do carry, xi, cc, s
-        next = carry + sum(vcat(cc, [exp(s * xi)]))
+    trajectory = scan(x; init = zero(a)) do carry, xi
+        next = carry + sum(vcat(c, [exp(a * xi)]))
         (next, next)
     end
     total = sum(trajectory)
 end
 # Scalar and mixed bracket literals of constant and active entries.
 @kernel literal_cells(a, x, c) = begin
-    pointwise = plate(x, Ref(c), Ref(a)) do xi, cc, s
-        system = [-s 0; s -cc]
-        affine = [system [exp(s * xi), 0]; 0 0 1]
+    pointwise = plate(x) do xi
+        system = [-a 0; a -c]
+        affine = [system [exp(a * xi), 0]; 0 0 1]
         sum(affine * [1, 2, 3])
     end
     total = sum(pointwise)
 end
 @kernel literal_scanned(a, x, c) = begin
-    trajectory = scan(x, Ref(c), Ref(a); init = zero(a)) do carry, xi, cc, s
-        next = first([carry 1; 0 1] * [exp(s * xi), cc])
+    trajectory = scan(x; init = zero(a)) do carry, xi
+        next = first([carry 1; 0 1] * [exp(a * xi), c])
         (next, next)
     end
     total = sum(trajectory)

@@ -33,24 +33,24 @@ const fetch = Base.get
 
 @kernel get_cell(plan, units::Vector{Float64}, weights::Vector{Float64}) = begin
     observations = domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum((w[i] * get(u, dose_row(t, p, dose_table(t, p)[i]), 0.0) for i in eachindex(w));
+    concentration::Vector{Float64} = plate(observations) do t
+        sum((weights[i] * get(units, dose_row(t, plan, dose_table(t, plan)[i]), 0.0) for i in eachindex(weights));
             init = 0.0)
     end
     return concentration
 end
 @kernel cell_loop(plan, units::Vector{Float64}, weights::Vector{Float64}) = begin
     observations = domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum((w[i] * fetch(u, dose_row(t, p, dose_table(t, p)[i]), 0.0) for i in eachindex(w));
+    concentration::Vector{Float64} = plate(observations) do t
+        sum((weights[i] * fetch(units, dose_row(t, plan, dose_table(t, plan)[i]), 0.0) for i in eachindex(weights));
             init = 0.0)
     end
     return concentration
 end
 @kernel filtered_cell(plan, units::Vector{Float64}, weights::Vector{Float64}) = begin
     observations = 1:plan.nobs
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[j] * u[t - p.shifts[j]] for j in eachindex(w) if t > p.shifts[j]; init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do t
+        sum(weights[j] * units[t - plan.shifts[j]] for j in eachindex(weights) if t > plan.shifts[j]; init = 0.0)
     end
     return concentration
 end
@@ -119,8 +119,8 @@ end
 @kernel batched_get(scale::Float64, units::Vector{Float64}, plan, doses::Vector{Float64}) = begin
     weights::Vector{Float64} = scale .* doses
     observations = domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum((w[i] * get(u, dose_row(t, p, dose_table(t, p)[i]), 0.0) for i in eachindex(w));
+    concentration::Vector{Float64} = plate(observations) do t
+        sum((weights[i] * get(units, dose_row(t, plan, dose_table(t, plan)[i]), 0.0) for i in eachindex(weights));
             init = 0.0)
     end
     return concentration
@@ -128,8 +128,8 @@ end
 @kernel batched_loop(scale::Float64, units::Vector{Float64}, plan, doses::Vector{Float64}) = begin
     weights::Vector{Float64} = scale .* doses
     observations = domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum((w[i] * fetch(u, dose_row(t, p, dose_table(t, p)[i]), 0.0) for i in eachindex(w));
+    concentration::Vector{Float64} = plate(observations) do t
+        sum((weights[i] * fetch(units, dose_row(t, plan, dose_table(t, plan)[i]), 0.0) for i in eachindex(weights));
             init = 0.0)
     end
     return concentration

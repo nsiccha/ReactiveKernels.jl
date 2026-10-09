@@ -2,10 +2,10 @@ module ScanPlateNonallocatingTests
 using ReactiveKernels, MutatingFunctions, Test
 
 @kernel collected_paths(q::Vector{Float64}, X::Matrix{Float64}) = begin
-    paths = plate(eachcol(X), Ref(q)) do xs, p
-        seed = (value=p[1],)
-        history = scan(xs, Ref(p); init=seed) do carry, x, params
-            next = carry.value + params[2]*x
+    paths = plate(eachcol(X)) do xs
+        seed = (value=q[1],)
+        history = scan(xs; init=seed) do carry, x
+            next = carry.value + q[2]*x
             ((value=next,), next)
         end
         history

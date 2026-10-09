@@ -50,8 +50,8 @@ end
 # cell's call stayed uninferred and differentiated; warm, it inferred and
 # failed with `EnzymeRuntimeActivityError` (Julia 1.10).
 @kernel running_total(xs, gain) = begin
-    updates = scan(xs, Ref(gain); init = 0.0) do carry, x, g
-        next = carry + x * g
+    updates = scan(xs; init = 0.0) do carry, x
+        next = carry + x * gain
         (next, next)
     end
     total = sum(updates)
@@ -59,8 +59,8 @@ end
 end
 
 @kernel group_totals(groups, gain) = begin
-    cells = plate(groups, Ref(gain)) do xs, g
-        g > 0.0 ? running_total(xs, g) : 0.0
+    cells = plate(groups) do xs
+        gain > 0.0 ? running_total(xs, gain) : 0.0
     end
     total = sum(cells)
     return total

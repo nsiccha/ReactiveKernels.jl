@@ -155,8 +155,8 @@ end
     return E
 end
 @kernel recurrence(a, steps, A) = begin
-    trajectory = scan(steps, Ref(a), Ref(A); init = 0.0) do carry, dt, scale, system
-        next = dt > 0 ? carry + sum(exp(system * (scale * dt))) : carry
+    trajectory = scan(steps; init = 0.0) do carry, dt
+        next = dt > 0 ? carry + sum(exp(A * (a * dt))) : carry
         (next, next)
     end
     total = sum(trajectory)
@@ -167,8 +167,8 @@ end
     return total
 end
 @kernel batches(a, systems) = begin
-    values = plate(systems, Ref(a)) do A, scale
-        sum(exp(scale * A))
+    values = plate(systems) do A
+        sum(exp(a * A))
     end
     total = sum(values)
     return total

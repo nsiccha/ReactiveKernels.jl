@@ -112,9 +112,9 @@ docs_example = (; name = :nested_observation_plate,
 """
 
 @kernel cross_product(xs, ys) = begin
-    out = plate(xs, Ref(ys)) do x, shared
-        inner = plate(shared, Ref(x)) do y, xi
-            xi * y
+    out = plate(xs) do x
+        inner = plate(ys) do y
+            x * y
         end
         sum(inner)
     end
@@ -127,10 +127,8 @@ end
     scale = parameters[1]
     decay = parameters[2]
     coefficients = reshape(parameters[4:end], 2, size(matrix, 2))
-    projected = plate(axes(matrix, 1), groups, Ref(matrix), Ref(rates),
-                      Ref(scale), Ref(decay), Ref(coefficients)) do i, g, matrix, rates, scale, decay, coefficients
-        terms = plate(axes(matrix, 2), Ref(i), Ref(g), Ref(matrix), Ref(rates),
-                      Ref(scale), Ref(decay), Ref(coefficients)) do j, i, g, matrix, rates, scale, decay, coefficients
+    projected = plate(axes(matrix, 1), groups) do i, g
+        terms = plate(axes(matrix, 2)) do j
             weight = scale * exp(-decay * rates[j])
             matrix[i, j] * weight * coefficients[g, j]
         end
@@ -150,34 +148,34 @@ end
 end
 
 @kernel inline_product(xs, ys) = begin
-    out = plate(xs, Ref(ys)) do x, shared
-        sum(plate(shared, Ref(x)) do y, xi
-            xi * y
+    out = plate(xs) do x
+        sum(plate(ys) do y
+            x * y
         end)
     end
     return out
 end
 
 @kernel inner_product(ys, x) = begin
-    cells = plate(ys, Ref(x)) do y, xi
-        xi * y
+    cells = plate(ys) do y
+        x * y
     end
     total = sum(cells)
     return total
 end
 
 @kernel composed_product(xs, ys) = begin
-    out = plate(xs, Ref(ys)) do x, shared
-        inner_product(shared, x)
+    out = plate(xs) do x
+        inner_product(ys, x)
     end
     return out
 end
 
 @kernel three_levels(groups, scale) = begin
-    values = plate(groups, Ref(scale)) do group, s
-        middle = plate(group, Ref(s)) do observations, sigma
-            inner = plate(observations, Ref(sigma)) do x, t
-                t * x
+    values = plate(groups) do group
+        middle = plate(group) do observations
+            inner = plate(observations) do x
+                scale * x
             end
             sum(inner)
         end
@@ -188,9 +186,9 @@ end
 end
 
 @kernel rectangular(X, scale) = begin
-    values = plate(eachcol(X), Ref(scale)) do observations, s
-        pointwise = plate(observations, Ref(s)) do x, sigma
-            sigma * x
+    values = plate(eachcol(X)) do observations
+        pointwise = plate(observations) do x
+            scale * x
         end
         sum(pointwise)
     end
@@ -199,8 +197,8 @@ end
 end
 
 @kernel nested_axes(groups, scales) = begin
-    values = plate(groups, Ref(scales)) do observations, sigma
-        cells = plate(observations, sigma) do x, s
+    values = plate(groups) do observations
+        cells = plate(observations, scales) do x, s
             x * s
         end
         sum(cells)
@@ -209,9 +207,9 @@ end
 end
 
 @kernel guarded(groups, scale) = begin
-    values = plate(groups, Ref(scale)) do observations, sigma
-        pointwise = plate(observations, Ref(sigma)) do x, s
-            x >= 0 ? log(x + s) : -s * x
+    values = plate(groups) do observations
+        pointwise = plate(observations) do x
+            x >= 0 ? log(x + scale) : -scale * x
         end
         sum(pointwise)
     end

@@ -21,10 +21,10 @@ function nested(depth)
     statements, left, right = diamonds(depth, :left_0, :right_0)
     source = quote
         @kernel function diamond_plates(groups, gain)
-            rows = plate(groups, Ref(gain)) do xs, scale
-                cells = plate(xs, Ref(scale)) do x, s
-                    left_0 = x * s
-                    right_0 = x / s
+            rows = plate(groups) do xs
+                cells = plate(xs) do x
+                    left_0 = x * gain
+                    right_0 = x / gain
                     $(statements...)
                     $left + $right
                 end
@@ -40,9 +40,9 @@ function scanned(depth)
     statements, left, right = diamonds(depth, :left_0, :right_0)
     source = quote
         @kernel function diamond_scan(xs, gain)
-            values = scan(xs, Ref(gain); init=zero(gain)) do previous, x, s
-                left_0 = previous + x * s
-                right_0 = previous - x / s
+            values = scan(xs; init=zero(gain)) do previous, x
+                left_0 = previous + x * gain
+                right_0 = previous - x / gain
                 $(statements...)
                 next = $left + $right
                 (next, next)
@@ -174,8 +174,8 @@ end
 # The child's scan step outputs a bare constructor call; its result feeds a
 # plate cell whose values a second plate reads beside fixed data vectors.
 @kernel trace_reads(xs, ws, idx, rate) = begin
-    path = scan(xs, ws, Ref(rate); init = 0.0) do previous, x, w, r
-        level = previous * exp(-r) + w * x
+    path = scan(xs, ws; init = 0.0) do previous, x, w
+        level = previous * exp(-rate) + w * x
         area = previous + level
         (level, Pair2(level, area))
     end
@@ -186,16 +186,15 @@ end
 @kernel grouped_trace(xs, ws, idx, first_idx, second_idx, times, obs, sd, theta) = begin
     rates = exp.(theta[1] .+ 0.1 .* collect(1:length(xs)))
     slopes = theta[2] .+ 0.05 .* collect(1:length(xs))
-    cells = plate(1:length(xs), rates, slopes, Ref(xs), Ref(ws), Ref(idx),
-            Ref(first_idx), Ref(second_idx), Ref(times)) do s, rate, slope, x, w, id, fi, si, t
-        reads = trace_reads(x[s], w[s], id[s], rate)
-        level = reads[fi[s]]
-        scaled = reads[si[s]] ./ 3.0
-        slope * t[s] + -slope * scaled .+ level
+    cells = plate(1:length(xs), rates, slopes) do s, rate, slope
+        reads = trace_reads(xs[s], ws[s], idx[s], rate)
+        level = reads[first_idx[s]]
+        scaled = reads[second_idx[s]] ./ 3.0
+        slope * times[s] + -slope * scaled .+ level
     end
     location = convert(Vector{Float64}, reduce(vcat, cells; init = Float64[]))
-    terms = plate(location, obs, sd, Ref(theta)) do m, y, s, th
-        -0.5 * abs2((y - m) / (s * exp(th[3])))
+    terms = plate(location, obs, sd) do m, y, s
+        -0.5 * abs2((y - m) / (s * exp(theta[3])))
     end
     return sum(terms)
 end

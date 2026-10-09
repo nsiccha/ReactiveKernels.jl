@@ -7,9 +7,9 @@ _scheduled_raw(k) = k isa ReactiveKernels._KernelSignatureCallable ? k.target : 
 
 @kernel scheduled_response(position, data) = begin
     forcing = log1p.(abs.(data))
-    trajectory = scan(forcing, Ref(position); init=position.initial,
-                      include_init=true) do previous, value, p
-        next = previous * exp(-p.rate) + p.scale * value
+    trajectory = scan(forcing; init=position.initial,
+                      include_init=true) do previous, value
+        next = previous * exp(-position.rate) + position.scale * value
         (next, next)
     end
     result = (; trajectory, total=sum(trajectory))
