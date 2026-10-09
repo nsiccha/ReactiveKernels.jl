@@ -1407,8 +1407,9 @@ _logjac_value(transform::Symbol, u) =
 # value. `:floored` is likewise parameterized (ℝ → (lo, ∞), `lo + exp(u)`,
 # log-Jacobian `u`), as is `:upper` (ℝ → (-∞, hi), `hi - exp(u)`,
 # log-Jacobian `u`). Prior density normalizers are emitted separately.
-# The in-graph interval/floored/upper edges (below) use the IDENTICAL
-# operations, so host and graph agree bit-for-bit.
+# The in-graph interval/floored/upper edges (below) use the same operations
+# with literal bounds folded (`_bound_add`), so host and graph agree
+# bit-for-bit up to the sign of an exact zero.
 function _constrain_elt(e::LayoutEntry, u)
     e.transform === :interval &&
         return e.lo + (e.hi - e.lo) / (1 + exp(-u))
@@ -1450,6 +1451,55 @@ Packed-slice read (`view(unconstrained, lo:hi)`, `@ppl` vector shape).
 block_read(offset::Int, width::Int) =
     :(view(unconstrained, $offset:$(offset + width - 1)))
 
+# Bound arithmetic of the parameterized (`:interval`/`:floored`/`:upper`)
+# edges, spelled as the model states it. Literal operands fold
+# (`(0.5 - 0.0)` is `0.5`, `x - -1.0` is `x + 1.0`) and a literal zero
+# drops out (`0.0 + exp(u)` is `exp(u)`, `log(x - 0.0)` is `log(x)`,
+# `0.0 - exp(u)` is `-exp(u)`, `- log(1.0)` vanishes). No fold changes an
+# IEEE result (a literal difference is computed once at emission; `x - -1.0`
+# and `x + 1.0` round identically), so values and derivatives are the host
+# `_*_elt` path's. Only an exact zero's sign can differ (`0.0 - 0.0` is
+# `+0.0`, `-0.0` is not): a zero ceiling's value shows it when `exp(u)`
+# underflows, and a logarithm absorbs it everywhere else. Sampled and data
+# bounds stay as authored. `dot` spells the elementwise form.
+_literal_bound(b) = b isa Real
+_zero_bound(b) = _literal_bound(b) && iszero(b)
+function _bound_add(a, b; dot::Bool = false)
+    _literal_bound(a) && _literal_bound(b) && return a + b
+    _zero_bound(a) && return b
+    _zero_bound(b) && return a
+    return dot ? :($a .+ $b) : :($a + $b)
+end
+function _bound_sub(a, b; dot::Bool = false)
+    _literal_bound(a) && _literal_bound(b) && return a - b
+    _zero_bound(b) && return a
+    _literal_bound(b) && b < 0 && return _bound_add(a, -b; dot)
+    _zero_bound(a) && return dot ? :(.-$b) : :(-$b)
+    return dot ? :($a .- $b) : :($a - $b)
+end
+
+# Interval edges ℝ → (lo, hi): `lo + (hi - lo) / (1 + exp(-u))`, its
+# inverse `log(x - lo) - log(hi - x)`, and the log-Jacobian
+# `log(x - lo) + log(hi - x) - log(hi - lo)` (summed over the block when
+# `dot`).
+function _interval_constrain(lo, hi, u; dot::Bool = false)
+    w = _bound_sub(hi, lo)
+    return _bound_add(lo,
+        dot ? :($w ./ (1 .+ exp.(-$u))) : :($w / (1 + exp(-$u))); dot)
+end
+_interval_unconstrain(lo, hi, x; dot::Bool = false) = dot ?
+    :(log.($(_bound_sub(x, lo; dot))) .- log.($(_bound_sub(hi, x; dot)))) :
+    :(log($(_bound_sub(x, lo))) - log($(_bound_sub(hi, x))))
+function _interval_logjac(lo, hi, x; dot::Bool = false)
+    w = _bound_sub(hi, lo)
+    logw = _literal_bound(w) && isone(w) ? 0.0 : :(log($w))
+    dot || return _bound_sub(
+        :(log($(_bound_sub(x, lo))) + log($(_bound_sub(hi, x)))), logw)
+    return :(sum($(_bound_sub(
+        :(log.($(_bound_sub(x, lo; dot))) .+ log.($(_bound_sub(hi, x; dot)))),
+        logw; dot))))
+end
+
 """
     transform_statements(entry) -> Vector{Expr}
 
@@ -1490,8 +1540,8 @@ function transform_statements(e::LayoutEntry)
     if e.kind === :coefficient
         # Coefficient runs: identity runs read a view; interval runs
         # (uniform coefficients) hand-roll the broadcast constrain edge
-        # with the IDENTICAL math to the host `_*_elt` path (mirroring
-        # the plate `:interval` arm below).
+        # with the host `_*_elt` path's math (mirroring the plate
+        # `:interval` arm below).
         lo = e.offset
         hi = e.offset + e.size - 1
         view_read = :(view(unconstrained, $lo:$hi))
@@ -1501,13 +1551,12 @@ function transform_statements(e::LayoutEntry)
             "[layout] coefficient block $(e.name) has no transform rule " *
             "for $(e.transform) (admitted: :identity, :interval)"))
         u = Symbol(:_ppl_int_, e.name)
-        blo, bhi = e.lo, e.hi
         return Expr[
             :($u::AbstractVector{Float64} = $view_read),
             :($(e.name)::AbstractVector{Float64} =
-                $blo .+ ($bhi - $blo) ./ (1 .+ exp.(-$u))),
+                $(_interval_constrain(e.lo, e.hi, u; dot = true))),
             :($u::AbstractVector{Float64} =
-                log.($(e.name) .- $blo) .- log.($bhi .- $(e.name))),
+                $(_interval_unconstrain(e.lo, e.hi, e.name; dot = true))),
         ]
     end
     if e.kind === :plate ||
@@ -1531,38 +1580,35 @@ function transform_statements(e::LayoutEntry)
     if e.transform === :interval
         # An :interval transform is parameterized by per-entry bounds, so it is
         # not in the Symbol-keyed (parameterless) bijector registry — its
-        # forward + inverse edges are hand-rolled here, with the IDENTICAL math
-        # to the host `_*_elt` path so in-graph and host agree bit-for-bit.
+        # forward + inverse edges are hand-rolled here, with the host `_*_elt`
+        # path's math (`_bound_add` notes the folded literal bounds).
         u = Symbol(:_ppl_int_, e.name)
-        blo, bhi = e.lo, e.hi
         return Expr[
             :($u::Float64 = $coord),
-            :($(e.name)::Float64 = $blo + ($bhi - $blo) / (1 + exp(-$u))),
-            :($u::Float64 = log($(e.name) - $blo) - log($bhi - $(e.name))),
+            :($(e.name)::Float64 = $(_interval_constrain(e.lo, e.hi, u))),
+            :($u::Float64 = $(_interval_unconstrain(e.lo, e.hi, e.name))),
         ]
     end
     if e.transform === :floored
         # Parameterized like :interval (the per-entry floor is not in the
-        # registry): forward + inverse edges hand-rolled with the IDENTICAL
-        # math to the host `_*_elt` path (`lo + exp(u)` / `log(x - lo)`).
+        # registry): forward + inverse edges hand-rolled with the host
+        # `_*_elt` path's math (`lo + exp(u)` / `log(x - lo)`).
         u = Symbol(:_ppl_fl_, e.name)
-        blo = e.lo
         return Expr[
             :($u::Float64 = $coord),
-            :($(e.name)::Float64 = $blo + exp($u)),
-            :($u::Float64 = log($(e.name) - $blo)),
+            :($(e.name)::Float64 = $(_bound_add(e.lo, :(exp($u))))),
+            :($u::Float64 = log($(_bound_sub(e.name, e.lo)))),
         ]
     end
     if e.transform === :upper
         # Parameterized like :interval (the per-entry ceiling is not in the
-        # registry): forward + inverse edges hand-rolled with the IDENTICAL
-        # math to the host `_*_elt` path (`hi - exp(u)` / `log(hi - x)`).
+        # registry): forward + inverse edges hand-rolled with the host
+        # `_*_elt` path's math (`hi - exp(u)` / `log(hi - x)`).
         u = Symbol(:_ppl_up_, e.name)
-        bhi = e.hi
         return Expr[
             :($u::Float64 = $coord),
-            :($(e.name)::Float64 = $bhi - exp($u)),
-            :($u::Float64 = log($bhi - $(e.name))),
+            :($(e.name)::Float64 = $(_bound_sub(e.hi, :(exp($u))))),
+            :($u::Float64 = log($(_bound_sub(e.hi, e.name)))),
         ]
     end
     # Constrained supports splice the bijector's `constrain` endpoint; the
@@ -1582,10 +1628,6 @@ function _plate_map(view_read, cell::Symbol, body)
     return Expr(:do, Expr(:call, :plate, view_read), lambda)
 end
 
-# A floored block's values: `lo .+ exp.(u)`, or `exp.(u)` itself over a
-# literal zero floor.
-_floored_value(lo, values) = lo isa Real && iszero(lo) ? values : :($lo .+ $values)
-
 # Per-cell latent (plate) block: map the SCALAR bijector endpoints over the
 # block view via the `plate` primitive — the same library the scalar and host
 # paths use, so in-graph and host agree by construction rather than by a
@@ -1603,39 +1645,39 @@ function _plate_transform_statements(e::LayoutEntry)
         ReactiveKernels._tensorized_view(unconstrained, $lo:$hi))]
     if e.transform === :interval
         # Parameterized bounds ⇒ not in the (parameterless) bijector registry;
-        # hand-rolled broadcast edges over the block view, identical math to the
-        # host `_*_elt` path so in-graph and host agree bit-for-bit. Its
-        # `jacobian_term` sums the same expression (below), so no companion
-        # `logjac` plate is emitted.
+        # hand-rolled broadcast edges over the block view, with the host
+        # `_*_elt` path's math (`_bound_add` notes the folded literal bounds).
+        # Its `jacobian_term` sums the same expression (below), so no
+        # companion `logjac` plate is emitted.
         u = Symbol(:_ppl_int_, e.name)
-        blo, bhi = e.lo, e.hi
         return Expr[
             :($u::AbstractVector{Float64} = $view_read),
             :($(e.name)::AbstractVector{Float64} =
-                $blo .+ ($bhi - $blo) ./ (1 .+ exp.(-$u))),
+                $(_interval_constrain(e.lo, e.hi, u; dot = true))),
             :($u::AbstractVector{Float64} =
-                log.($(e.name) .- $blo) .- log.($bhi .- $(e.name))),
+                $(_interval_unconstrain(e.lo, e.hi, e.name; dot = true))),
         ]
     end
     if e.transform === :floored
         u = Symbol(:_ppl_floor_, e.name)
         return Expr[
             :($u::AbstractVector{Float64} = $view_read),
-            :($(e.name)::AbstractVector{Float64} = $(_floored_value(e.lo, :(exp.($u))))),
+            :($(e.name)::AbstractVector{Float64} =
+                $(_bound_add(e.lo, :(exp.($u)); dot = true))),
         ]
     end
     if e.transform === :upper
         # Parameterized bound ⇒ not in the (parameterless) bijector registry;
-        # hand-rolled broadcast edges over the block view, identical math to the
-        # host `_*_elt` path so in-graph and host agree bit-for-bit. Its
-        # `jacobian_term` sums the unconstrained view (below), so no companion
-        # `logjac` plate is emitted.
+        # hand-rolled broadcast edges over the block view, with the host
+        # `_*_elt` path's math. Its `jacobian_term` sums the unconstrained
+        # view (below), so no companion `logjac` plate is emitted.
         u = Symbol(:_ppl_up_, e.name)
-        bhi = e.hi
         return Expr[
             :($u::AbstractVector{Float64} = $view_read),
-            :($(e.name)::AbstractVector{Float64} = $bhi .- exp.($u)),
-            :($u::AbstractVector{Float64} = log.($bhi .- $(e.name))),
+            :($(e.name)::AbstractVector{Float64} =
+                $(_bound_sub(e.hi, :(exp.($u)); dot = true))),
+            :($u::AbstractVector{Float64} =
+                log.($(_bound_sub(e.hi, e.name; dot = true)))),
         ]
     end
     bij = _bijector_name(e.transform)
@@ -1815,9 +1857,7 @@ function jacobian_term(e::LayoutEntry)
         e.transform === :interval || throw(ContractValidationError(
             "[layout] coefficient block $(e.name) has no Jacobian rule " *
             "for $(e.transform) (admitted: :identity, :interval)"))
-        blo, bhi = e.lo, e.hi
-        return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-
-                     log($bhi - $blo)))
+        return _interval_logjac(e.lo, e.hi, e.name; dot = true)
     end
     if e.kind === :cholesky_corr
         isempty(e.dims) || return _lkj_array_logjac(e.name)
@@ -1850,11 +1890,8 @@ function jacobian_term(e::LayoutEntry)
         # transform sums its companion `logjac` plate from
         # `_plate_transform_statements`. GLM vectors use the same shape.
         # Missing companion plates must fail explicitly.
-        if e.transform === :interval
-            blo, bhi = e.lo, e.hi
-            return :(sum(log.($(e.name) .- $blo) .+ log.($bhi .- $(e.name)) .-
-                         log($bhi - $blo)))
-        end
+        e.transform === :interval &&
+            return _interval_logjac(e.lo, e.hi, e.name; dot = true)
         if e.transform === :upper || e.transform === :floored
             # Both one-sided exp transforms have the bare-coordinate Jacobian.
             return :(sum($(block_read(e.offset, e.size))))
@@ -1868,8 +1905,7 @@ function jacobian_term(e::LayoutEntry)
     if e.transform === :interval
         # Parameterized bounds ⇒ hand-rolled (not in the bijector registry);
         # uses the constrained `e.name` from the interval constrain edge.
-        blo, bhi = e.lo, e.hi
-        return :(log($(e.name) - $blo) + log($bhi - $(e.name)) - log($bhi - $blo))
+        return _interval_logjac(e.lo, e.hi, e.name)
     end
     if e.transform === :floored
         # Stan's lower-bound kernel: the bare unconstrained coordinate

@@ -199,13 +199,32 @@ end
 # Construction calls the positional `_add_recipe!` rather than the keyword
 # `add!`: a keyword call's argument type names the op's concrete type, so it
 # would compile a fresh keyword-call specialization for every authored op.
-# `destructured` records an authored tuple left side, `(a, b) = rhs`; only a
-# nested `KernelSpec` call distinguishes `(a,) = f(x)` from `a = f(x)`.
+# `destructured` records an authored tuple left side, `(a, b) = rhs`. Several
+# names bind the elements of the operation's result through the multi-output
+# recipe's own destructuring; one name, `(a,) = rhs`, binds its first element.
 Base.@nospecializeinfer function _kernel_add!(graph::Graph,
                       @nospecialize(ins), @nospecialize(outs), @nospecialize(op),
                       cost, cse_key, effectful,
                       source = _NO_KERNEL_SOURCE, destructured::Bool = false)
-    _add_recipe!(graph, ins, outs, op, cost, cse_key, effectful, source)
+    destructured && length(outs) == 1 || return _add_recipe!(
+        graph, ins, outs, op, cost, cse_key, effectful, source)
+    whole = value!(graph, gensym(:destructured_value), Any)
+    _add_recipe!(graph, ins, (whole,), op, cost, cse_key, effectful, source)
+    _kernel_add_first!(graph, whole, only(outs))
+end
+
+# Julia lowers `(a,) = value` to `a = getfield(Base.indexed_iterate(value, 1), 1)`:
+# the first iterated element, not `value` itself.
+@inline _kernel_destructure_first(value) = getfield(Base.indexed_iterate(value, 1), 1)
+
+# The first-element read of a one-name destructuring, as its own recipe from
+# the whole right-side value (an existing port, or a hidden value holding the
+# right side's result).
+Base.@nospecializeinfer function _kernel_add_first!(graph::Graph, whole::Value,
+                                                    target::Value)
+    source = Expr(:call, GlobalRef(@__MODULE__, :_kernel_destructure_first), whole.name)
+    _add_recipe!(graph, (whole,), (target,), _kernel_destructure_first,
+                 1.0, nothing, false, source)
 end
 
 # A multi-output nested call bound to one name is the tuple a runtime
@@ -360,6 +379,14 @@ Base.@nospecializeinfer function _kernel_add!(
         pack_source = Expr(:tuple, (value.name for value in hidden)...)
         _add_recipe!(graph, hidden, (packed,), _kernel_tuple_pack,
                      cost, nothing, false, pack_source)
+        return _reindex_producers!(graph)
+    end
+    # A single-output child returns its one value, so `(a,) = child(x)` binds
+    # that value's first element, as for any other right side.
+    if destructured && length(outs) == 1 && length(child_outputs) == 1
+        whole = value!(graph, gensym(:nested_output), valtype(only(child_outputs)))
+        _kernel_add!(graph, call_inputs, (whole,), spec, cost, cse_key, effectful, source)
+        _kernel_add_first!(graph, whole, only(outs))
         return _reindex_producers!(graph)
     end
     # Julia's `(a,) = t` binds the leading elements and ignores the rest. The
@@ -4049,6 +4076,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     declare_ref = GlobalRef(@__MODULE__, :_kernel_declare!)
     push_unique_ref = GlobalRef(@__MODULE__, :_kernel_push_unique!)
     add_ref = GlobalRef(@__MODULE__, :_kernel_add!)
+    first_ref = GlobalRef(@__MODULE__, :_kernel_add_first!)
     alias_ref = GlobalRef(@__MODULE__, :_kernel_alias!)
     synthesize_ref = GlobalRef(@__MODULE__, :_kernel_synthesize_inverse_edges!)
     spec_ref = GlobalRef(@__MODULE__, :KernelSpec)
@@ -4098,7 +4126,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
            !(assignment.args[1] isa Symbol &&
              assignment.args[2] isa Expr && assignment.args[2].head === :function)
             lhs, rhs = assignment.args
-            lhs_items = lhs isa Expr && lhs.head === :tuple ? lhs.args : Any[lhs]
+            destructured = lhs isa Expr && lhs.head === :tuple
+            lhs_items = destructured ? lhs.args : Any[lhs]
             outputs = Tuple{Symbol,Any}[]
             for item in lhs_items
                 name, type_expr = _kernel_port_decl(item)
@@ -4124,7 +4153,9 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                           (:recipe, Tuple{Symbol,Any}[(name, nothing)], expression,
                            Dict{Symbol,Any}(), nothing, false))
                 end
-                if outputs[1][2] === nothing && plate_expr.inferred !== nothing
+                # `(a,) = plate(...)` binds the first cell, not the array.
+                if !destructured && outputs[1][2] === nothing &&
+                   plate_expr.inferred !== nothing
                     push!(annotations[outputs[1][1]],
                           :(Array{$(plate_expr.inferred)}))
                     inferred_port_types[outputs[1][1]] = plate_expr.inferred
@@ -4136,7 +4167,6 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                    rhs.args[2] isa Symbol && haskey(inferred_port_types, rhs.args[2])
                 push!(annotations[outputs[1][1]], inferred_port_types[rhs.args[2]])
             end
-            destructured = lhs isa Expr && lhs.head === :tuple
             push!(entries, (:recipe, outputs, rhs, metadata, plate_expr, destructured))
             continue
         end
@@ -4241,13 +4271,24 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     for entry in entries
         entry[1] === :recipe || continue
         _, outputs, authored_rhs, metadata, plate_expr, destructured = entry
+        # `(b,) = a` over a declared port reads `a`'s first element: one recipe
+        # from `a` itself, never an alias of the whole value.
+        if destructured && length(outputs) == 1 && authored_rhs isa Symbol &&
+           authored_rhs in known && authored_rhs != outputs[1][1] && isempty(metadata)
+            push!(recipe_statements, :($first_ref($graph_var,
+                                     $port_values_var[$(port_indices[authored_rhs])],
+                                     $port_values_var[$(port_indices[outputs[1][1]])])))
+            _kernel_push_unique!(produced_names, outputs[1][1])
+            push!(consumed_names, authored_rhs)
+            continue
+        end
         # ALIAS-AT-EXPANSION (RK 2026-08-27): a bare-identity `b = a` — single output, RHS a bare
         # DECLARED port (`known` is the full predeclared port namespace, forward refs included),
         # not `b` itself, no `@recipe` metadata, and `b` has exactly ONE authored definition — is
         # emitted as a canonical alias (proven same-type; typed conversions keep their recipe).
         # No identity recipe is emitted for the collapsed pair; both labels stay for reporting.
-        if length(outputs) == 1 && authored_rhs isa Symbol && authored_rhs in known &&
-           authored_rhs != outputs[1][1] && isempty(metadata) &&
+        if !destructured && length(outputs) == 1 && authored_rhs isa Symbol &&
+           authored_rhs in known && authored_rhs != outputs[1][1] && isempty(metadata) &&
            def_count[outputs[1][1]] == 1
             op = _kernel_operation(authored_rhs, Symbol[authored_rhs], known; mod = mod)
             cost = 1.0
