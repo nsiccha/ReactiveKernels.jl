@@ -933,6 +933,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         shared_defs::Set{Symbol} = Set{Symbol}())
     input_data = data
     ast = _observation_call_definitions(ast, data, mod)
+    ast = _gathered_value_definitions(ast, data)
     for name in conditioned
         input = _conditioned_input(name)
         (input in data || _mentions_symbol(ast, input)) &&
@@ -2763,6 +2764,70 @@ end
 _synthesized_response_names(stem::Symbol) =
     (Symbol(stem, :_eta), Symbol(stem, :_loc), Symbol(stem, :_value),
      Symbol(stem, :_resp), Symbol(stem, :_disc))
+
+# A gather from an inline value is the gather from its named definition:
+# `loc = a .+ (z .* tau)[1, g]` reads as `r = z .* tau; loc = a .+ r[1, g]`
+# (naming a subexpression never changes legality or the density). So name
+# the gathered value: its definition then takes the named spelling's path —
+# the axes it inherits from declared arrays, level lookup on a `levels(g)`
+# axis, one value per observation. A data-only value already folds with its
+# gather at binding. Lazy arms and `@plate` / `@scan` bodies keep their
+# evaluation context. Identical values share one name. Runs after
+# `_observation_call_definitions`, so a module call in a response argument
+# is already a name here.
+function _gathered_value_definitions(ast::Expr, data::Set{Symbol})
+    detmap = Dict{Symbol,Any}(st.args[1] => st.args[2] for st in ast.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
+    taken = union(data, _expr_names(ast))
+    named = Dict{Any,Symbol}()
+    out = Any[]
+    function name!(value)
+        get!(named, value) do
+            k = 1
+            nm = Symbol(:_rkppl_gathered_, k)
+            while nm in taken
+                k += 1
+                nm = Symbol(:_rkppl_gathered_, k)
+            end
+            push!(taken, nm)
+            push!(out, Expr(:(=), nm, value))
+            nm
+        end
+    end
+    function walk(ex)
+        ex isa Expr || return ex
+        ex.head in (:macrocall, :quote) && return ex
+        ex.head in _DEFERRED_VALUE_HEADS && return ex
+        args = Any[walk(a) for a in ex.args]
+        if ex.head === :ref && length(args) >= 2 &&
+                _gathered_value(args[1]) && !_data_only(args[1], data, detmap)
+            args[1] = name!(args[1])
+        end
+        return Expr(ex.head, args...)
+    end
+    defined = Set{Symbol}(keys(detmap))
+    for st in ast.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+            st = Expr(:(=), st.args[1], walk(st.args[2]))
+        elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
+                !_external_rhs(st.args[3])
+            observed = _sampled_lhs_names!(Set{Symbol}(), st.args[2])
+            if any(in(data), observed) ||
+                    (_is_broadcast_sample(st) && any(in(defined), observed))
+                rhs = _map_rhs_values(walk, st.args[3])
+                rhs == st.args[3] ||
+                    (st = Expr(:call, st.args[1], st.args[2], rhs))
+            end
+        end
+        push!(out, st)
+    end
+    return Expr(:block, out...)
+end
+
+# A computed value that a gather may read: a call, a broadcast or an
+# adjoint. Names, literals, property paths and chained reads stay as written.
+_gathered_value(ex) = ex isa Expr &&
+    (ex.head === :call || ex.head === Symbol("'") || _is_dotted_call(ex))
 
 # Data-only: every value the expression reads is data or a data-only
 # definition (literals and function values aside).
