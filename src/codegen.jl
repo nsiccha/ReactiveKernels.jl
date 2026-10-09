@@ -283,6 +283,36 @@ end
     output_axes
 end
 
+# Base's `combine_axes(a1, a2, …)` for a lowered plate's batched operands. The
+# lowered body reads each operand's `axes` and passes only those integer axis
+# tuples to `_plate_broadcast_shape`, which folds them exactly as Base does.
+# Base's own `combine_axes(A, B...)` recursion splats the operands themselves:
+# past 33 operands Julia lowers its inner step to a dynamic `_apply_iterate`
+# over one tuple holding every remaining operand, and native Reverse rejects
+# the constant arrays of arrays stored there beside live vectors (snag
+# `rk-cached-bound-aa544610`). With no operand this stays `combine_axes()`,
+# which rejects the axis-less plate.
+function _plate_combined_axes_expr(arguments)
+    isempty(arguments) &&
+        return Expr(:call, GlobalRef(Base.Broadcast, :combine_axes))
+    shapes = Expr(:tuple, Any[Expr(:call, GlobalRef(Base, :axes), argument)
+                              for argument in arguments]...)
+    Expr(:call, GlobalRef(@__MODULE__, :_plate_broadcast_shape), shapes)
+end
+
+# The right fold `broadcast_shape(s1, broadcast_shape(s2, …))` of Base's
+# `combine_axes`, so results and `DimensionMismatch` messages are unchanged.
+# Kept out of line: inlined, one 50-operand reader plate's fold kept a large
+# model's native Reverse gradient compiling for over 33 minutes; out of line
+# the same gradient compiled in about a minute.
+@generated function _plate_broadcast_shape(shapes::Tuple)
+    fold = foldr(Any[:(getfield(shapes, $index))
+                     for index in 1:fieldcount(shapes)]) do shape, rest
+        Expr(:call, GlobalRef(Base.Broadcast, :broadcast_shape), shape, rest)
+    end
+    Expr(:block, Expr(:meta, :noinline), fold)
+end
+
 function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     batch = _authored_plate_broadcast(Val(A), args...)
     marker = _authored_plate_marker(Val(A), args...)
@@ -2125,13 +2155,13 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
                group_positions)
             continue
         end
-        group_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
-            (raw_arguments[position] for position in group_positions)...)
+        group_axes = _plate_combined_axes_expr(
+            [raw_arguments[position] for position in group_positions])
         push!(body.args, Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
                               group_axes))
     end
-    combined_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
-                         (arg for arg in raw_arguments if arg !== nothing)...)
+    combined_axes = _plate_combined_axes_expr(
+        [arg for arg in raw_arguments if arg !== nothing])
     push!(body.args, Expr(:(=), output_axes,
         Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), combined_axes)))
 
@@ -3380,9 +3410,8 @@ function lower_batched(p::Plan; batched, reduce = :+)
         :tuple, (raw_arguments[canon_id(g, value.id)]
                  for value in analysis.mapped)...)
     output_axes = gensym(:plate_axes)
-    combined_axes = Expr(:call, GlobalRef(Base.Broadcast, :combine_axes),
-        (raw_arguments[canon_id(g, value.id)]
-         for value in analysis.mapped)...)
+    combined_axes = _plate_combined_axes_expr(
+        [raw_arguments[canon_id(g, value.id)] for value in analysis.mapped])
     push!(body.args, Expr(:(=), output_axes,
         Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes),
              combined_axes)))
