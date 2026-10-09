@@ -5062,9 +5062,11 @@ function _check_definition_levels_axes(sample, det, data::Set{Symbol})
     for s in sample
         s.dims === nothing && continue
         for d in s.dims
-            _is_levels_dim(d) &&
-                d.args[2] ∉ data || continue
-            gg = d.args[2]
+            # `levels(gg)` and its positional twin `length(levels(gg)) - k`
+            cnt = _levels_count(d)
+            gg = _is_levels_dim(d) ? d.args[2] :
+                cnt === nothing ? nothing : first(cnt)
+            (gg === nothing || gg in data) && continue
             _is_bind_data_definition(gg, detmap, data, Set{Symbol}()) ||
                 _sfail("array $(s.lhs) axis `levels($gg)`: $gg must be " *
                     "data — a raw column, or a definition that calls a " *
@@ -5191,10 +5193,13 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
         if cnt !== nothing
             # `1:length(levels(g)) - k`: a positional axis whose length is
             # the number of distinct values of `g`, less k (resolved at
-            # bind).
+            # bind). `g` is a level source exactly as for a `levels(g)`
+            # axis: data, or a definition computed at bind
+            # (`_check_definition_levels_axes`).
             g, k = cnt
-            g in data || _sfail("array $target axis $(repr(a)): " *
-                "`levels($g)` needs a data grouping column — $g is not data")
+            g in union(data, detnames) || _sfail("array $target axis " *
+                "$(repr(a)): `levels($g)` needs a data grouping column " *
+                "or a definition computed from data — $g is neither")
             n = Expr(:call, :length, Expr(:call, :levels, g))
             return k == 0 ? n : Expr(:call, :-, n, k)
         end
@@ -9328,10 +9333,12 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     isempty(node.args) && return _sfail("$where has an empty call node")
     op = node.args[1]
     # An undotted module call over data and model values (`f(x)`,
-    # `f(s, x)`) is one model-level value leaf, as its named spelling
-    # (`v = f(x)`) and a call reading no column are.
-    op isa GlobalRef && !_composed_has_sub(node, ctx, true) &&
-        return _composed_scalar_leaf!(pname, node, ctx, scalars)
+    # `f(s, x)`, `f(base)` with `base` a sub-predictor) is one model-level
+    # value leaf, as its named spelling (`v = f(base)`) and a call reading
+    # no column are. A sub-predictor it reads is then read by an ordinary
+    # value, so lowering replans it as a retained value, as for the named
+    # spelling.
+    op isa GlobalRef && return _composed_scalar_leaf!(pname, node, ctx, scalars)
     op isa Symbol || return _sfail("$where has an anonymous call node")
     args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
     if op === :.* || op === :.+ || op ===:.-

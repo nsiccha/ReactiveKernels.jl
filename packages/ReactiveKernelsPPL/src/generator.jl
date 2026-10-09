@@ -96,7 +96,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
         Expr[args..., transforms..., coefs..., conditioned..., values...]))
     append!(stmts, likelihoods)
     append!(stmts, priors)
-    push!(stmts, _log_jacobian_statement(plan, layout))
+    append!(stmts, _log_jacobian_statements(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
     sig = Expr(:call, name, args...)
@@ -4087,12 +4087,28 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
     return stmts, nodes
 end
 
-function _log_jacobian_statement(plan::StructuralPlan, layout::LayoutTable)
+# A scalar constrained parameter's bijector `logjac` term is its own value
+# named after the parameter (`var"sigma.logjac"`), so the built program reads
+# `log_jacobian = var"sigma.logjac" + …` with that term's definition shown,
+# not a value named after the sum.
+function _log_jacobian_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
     terms = Any[]
     for e in layout.entries
         t = jacobian_term(e)
-        t === nothing || push!(terms, t)
+        t === nothing && continue
+        if _bijector_logjac_call(t)
+            name = Symbol(e.name, ".logjac")
+            push!(stmts, :($name::Float64 = $t))
+            t = name
+        end
+        push!(terms, t)
     end
     jac = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
-    return :(log_jacobian::Float64 = $jac)
+    push!(stmts, :(log_jacobian::Float64 = $jac))
+    return stmts
 end
+
+_bijector_logjac_call(t) = t isa Expr && t.head === :call && !isempty(t.args) &&
+    t.args[1] isa Expr && t.args[1].head === :. &&
+    t.args[1].args[2] == QuoteNode(:logjac)

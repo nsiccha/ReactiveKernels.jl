@@ -689,3 +689,81 @@ end
     @test err isa SurfaceLoweringError
     @test occursin("one or two operands", sprint(showerror, err))
 end
+
+# An undotted module call reading a sub-predictor (`rise(base)` with
+# `base = a .+ b .* x`) inside a composition is one value leaf, as its
+# named spelling `r = rise(base)` is (snag `rkppl-definition-63f43cdb`;
+# naming never changes legality or the density). `base` is then read by an
+# ordinary value, so it stays one named value, exactly as when named.
+module _CmpCallKernels
+using ReactiveKernels
+@kernel _cmp_call_rise(v) = begin
+    xi = v .* 2.0
+    value = xi .+ 1.0
+    return value
+end
+@kernel _cmp_call_fall(v, vm) = begin
+    xi = v .- 3.0
+    xi_max = vm .- 3.0
+    value = xi .- xi_max
+    return value
+end
+_cmp_call_shift(v; by = 1.0) = v .* by .+ 0.5
+end
+using ._CmpCallKernels: _cmp_call_rise, _cmp_call_fall
+_cmp_call_sq(v) = v .^ 2
+
+const _CMP_CALL_COLS = Dict{Symbol,AbstractVector}(
+    :x => [0.5, -1.0, 1.5, 0.0, -0.5, 1.0],
+    :y => [0.3, -1.2, 0.8, 1.9, -0.4, 0.6])
+
+@testset "composed leaves: a module call reading a sub-predictor" begin
+    x, y = _CMP_CALL_COLS[:x], _CMP_CALL_COLS[:y]
+    q = (a = 0.3, b = -0.4, c0 = 0.2, c1 = 0.5, s = 0.8)
+    priors(q) = logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+        logpdf(Normal(0, 1), q.c0) + logpdf(Normal(0, 1), q.c1) +
+        logpdf(Exponential(1.0), q.s)
+    head = quote
+        a ~ Normal(0, 1); b ~ Normal(0, 1)
+        c0 ~ Normal(0, 1); c1 ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        base = a .+ b .* x
+        th = c0 .+ c1 .* x
+    end
+    base(q) = q.a .+ q.b .* x
+    th(q) = q.c0 .+ q.c1 .* x
+    for (named, inline, value) in (
+            # The reported shape: `@kernel` calls under a product and a map.
+            (quote
+                r = _cmp_call_rise(base)
+                f = _cmp_call_fall(base, 0.5)
+                mu = base .* r .* exp.(f)
+            end, :(mu = base .* _cmp_call_rise(base) .*
+                exp.(_cmp_call_fall(base, 0.5))),
+                q -> base(q) .* (2 .* base(q) .+ 1) .* exp.(base(q) .- 0.5)),
+            # A plain function beside a sub-predictor that stays one.
+            (quote
+                r = _cmp_call_sq(base)
+                mu = th .* base .+ r
+            end, :(mu = th .* base .+ _cmp_call_sq(base)),
+                q -> th(q) .* base(q) .+ base(q) .^ 2),
+            # A qualified head, a keyword and a computed argument.
+            (quote
+                r = _CmpCallKernels._cmp_call_shift(base .* 2.0; by = s)
+                mu = th .* r
+            end, :(mu = th .* _CmpCallKernels._cmp_call_shift(base .* 2.0;
+                by = s)),
+                q -> th(q) .* (base(q) .* 2 .* q.s .+ 0.5)))
+        want = q -> sum(logpdf.(Normal.(value(q), 0.7), y)) + priors(q)
+        for location in (named, inline)
+            prog = Expr(:block, head.args...,
+                (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+                :(y .~ Normal.(mu, 0.7)))
+            plan, _, _ = _cmp_ap_check(prog, q, want; cols = _CMP_CALL_COLS)
+            # `base` is one named value, never an interned sub-predictor.
+            @test :base ∉ [p.name for p in plan.predictors]
+            @test [d.expr for d in plan.derived if d.name === :base] ==
+                [:(a .+ b .* x)]
+        end
+    end
+end
