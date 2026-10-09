@@ -11,7 +11,7 @@ isdefined(@__MODULE__, :NestedPlates) || include("fixtures/nested_plates.jl")
     inner = only(filter(r -> r.op isa ReactiveKernels._AuthoredPlateOp,
                         plate_body(outer).recipes))
     @test length(plate_body(inner).recipes) > 0
-    @test occursin("log(s)", string(only(plate_body(inner).recipes).source))
+    @test occursin("log(scale)", string(only(plate_body(inner).recipes).source))
     @test N.head_count(code_expr(k), :for) == 2
     @test !occursin("similar", string(code_expr(k)))
 
@@ -25,7 +25,7 @@ isdefined(@__MODULE__, :NestedPlates) || include("fixtures/nested_plates.jl")
     generated = sprint(Base.show_unquoted,
         ReactiveKernels._readable_expr(code_expr(k), k); context=:limit => false)
     @test !occursin("__ops__[", generated)
-    @test occursin("log(s)", generated)
+    @test occursin("log(scale)", generated)
 
     for data in (groups, [Float64[]], Vector{Float64}[], [[1.1], [0.3, -0.4, 0.8]],
                  [(0.25, 0.9), (), (0.7,)], [(), (0.25, 0.9), (0.7,)],

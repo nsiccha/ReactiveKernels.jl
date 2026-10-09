@@ -4,9 +4,9 @@ using ReactiveKernels
 # One public source authority, also replayed by acceptance and shown in docs.
 const NORMAL_SOURCE = raw"""
 @kernel visible_observations(observation_groups, scale::Float64) = begin
-    group_logdensity = plate(observation_groups, Ref(scale)) do observations, sigma
-        pointwise = plate(observations, Ref(sigma)) do observation, s
-            -0.5 * log(2 * pi) - log(s) - 0.5 * (observation / s)^2
+    group_logdensity = plate(observation_groups) do observations
+        pointwise = plate(observations) do observation
+            -0.5 * log(2 * pi) - log(scale) - 0.5 * (observation / scale)^2
         end
         sum(pointwise)
     end
