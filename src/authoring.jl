@@ -1889,6 +1889,41 @@ function _kernel_enclosing_ports(statements, signature_inputs)
     names
 end
 
+# A `Ref(value)` operand of an authored `plate(...) do` or `scan(...) do` is
+# deprecated: the do-block reads a shared value as a closure instead (user
+# decision `0kvm2ip`). It warns under `--depwarn=yes` and throws under
+# `--depwarn=error`, like `Base.depwarn`, but is keyed by the do-block's source
+# line: `Base.depwarn` keys by its caller frame, which is the same macro
+# expansion frame for every kernel, so it would report only the first site.
+function _kernel_ref_operand_depwarn(kind::Symbol, value, formal, body;
+                                     level::Integer = Base.JLOptions().depwarn)
+    level == 0 && return nothing
+    line = _kernel_first_line(body)
+    file = line === nothing ? "" : string(line.file)
+    lineno = line === nothing ? 0 : line.line
+    rewrite = value isa Symbol ?
+        "drop the operand and its `$formal` argument and read `$value` in the do-block" :
+        "assign `$value` to a name before the `$kind`, drop the operand and its " *
+        "`$formal` argument, and read that name in the do-block"
+    message = "`Ref($value)` as a `$kind(...) do` operand is deprecated: a do-block " *
+              "reads a shared value as a closure. $(uppercasefirst(rewrite)) " *
+              "(user decision 0kvm2ip)."
+    level == 2 && throw(ErrorException(message))
+    @warn message _group = :depwarn _file = file _line = lineno maxlog = 1 _id =
+        Symbol(kind, ':', file, ':', lineno, ':', value)
+    nothing
+end
+
+_kernel_first_line(ex::LineNumberNode) = ex
+_kernel_first_line(ex::Expr) = begin
+    for arg in ex.args
+        line = _kernel_first_line(arg)
+        line === nothing || return line
+    end
+    nothing
+end
+_kernel_first_line(ex) = nothing
+
 function _kernel_authored_plate_expr(rhs, mod,
                                      caller_locals = Set{Symbol}();
                                      endpoint_cache =
@@ -1919,6 +1954,7 @@ function _kernel_authored_plate_expr(rhs, mod,
                length(argument.args) == 2 &&
                _kernel_resolve_binding(mod, argument.args[1]) === Ref
             value = argument.args[2]
+            _kernel_ref_operand_depwarn(:plate, value, formals[index], scalar_body)
             name = if value isa Symbol
                 value
             else
@@ -2009,7 +2045,8 @@ Base.@nospecializeinfer function _kernel_authored_plate(
     _kernel_new_instance(T, (kernel, ()))::_AuthoredPlateOp
 end
 
-# `scan(xs, Ref(shared)...; init = c0) do carry, x, shared...  …; (new_carry, output)  end`
+# `scan(xs...; init = c0) do carry, x...  …; (new_carry, output)  end`, reading shared
+# values as closures (deprecated: trailing `Ref(shared)...` operands and formals)
 # authors a bounded SEQUENTIAL recurrence.  Unlike `plate` (a pure per-element
 # broadcast map), `scan` threads a `carry` value: the do-block's FIRST formal is
 # the carry (seeded by `init`, never a positional argument), the SECOND is the
@@ -2120,9 +2157,11 @@ function _kernel_authored_scan_expr(rhs, mod,
     # lets one step read several co-varying per-step sequences — e.g. a first-order
     # recurrence carry_i = a[i] * carry_{i-1} + b[i] over two per-step sequences.
     seen_shared = false
-    for operand in positional
+    for (position, operand) in enumerate(positional)
         if _is_ref(operand)
             seen_shared = true
+            _kernel_ref_operand_depwarn(:scan, operand.args[2], formals[position + 1],
+                                        scalar_body)
             _push_operand!(operand.args[2], true)       # shared (atomic)
         else
             seen_shared && throw(ArgumentError(
@@ -3142,8 +3181,9 @@ loop:
 
 @kernel cell(plan, units, weights) = begin
     observations = domain(plan)
-    c::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[i] * get(u, row_index(t, p, i), 0.0) for i in eachindex(w); init = 0.0)
+    c::Vector{Float64} = plate(observations) do t
+        sum(weights[i] * get(units, row_index(t, plan, i), 0.0)
+            for i in eachindex(weights); init = 0.0)
     end
 end
 ```
@@ -3763,6 +3803,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # for bodies with no `@node` (or only foreign `@node`).
     block = _kernel_normalize_call_kwargs(_kernel_lift_nodes(block, mod))
     raw_statements = block isa Expr && block.head === :block ? block.args : Any[block]
+    raw_statements = _kernel_desugar_loops(raw_statements, mod)
     statements = _kernel_lift_plate_expressions(
         _kernel_normalize_return_expressions(raw_statements), mod)
     enclosing_ports = _kernel_enclosing_ports(statements, signature_inputs)
@@ -4762,20 +4803,21 @@ function plate(spec::KernelSpec; have, want, batched, reduce = :+)
 end
 
 """
-    scan(xs, ys..., Ref(shared)...; init, include_init = false) do carry, x, y..., shared...
+    scan(xs, ys...; init, include_init = false) do carry, x, y...
         …
         (new_carry, output)
     end
-    scan(xs, ys..., Ref(shared)...; init, history = h0) do carry, x, y..., shared..., earlier
+    scan(xs, ys...; init, history = h0) do carry, x, y..., earlier
         …
         (new_carry, output)
     end
 
 Author a bounded SEQUENTIAL recurrence inside a `@kernel` / `@ppl` body. The
-leading non-`Ref` positionals are the sequences to scan over, advanced in
-lockstep (they must share axes); `init` seeds the threaded `carry`; any trailing
-`Ref(shared)` operands are passed whole to every step. The do-block receives
-`(carry, x, y..., shared...)` and must end with the 2-tuple `(new_carry,
+positionals are the sequences to scan over, advanced in lockstep (they must
+share axes); `init` seeds the threaded `carry`. The step reads any other
+enclosing value whole, as a closure. A trailing `Ref(shared)` operand passes a
+value whole too but is deprecated (user decision `0kvm2ip`). The do-block
+receives `(carry, x, y...)` and must end with the 2-tuple `(new_carry,
 output)`; `scan` returns the vector `[output…]`. A compound carry may be carried
 as a `NamedTuple` (`init = (; a, b)`, read `carry.a`). Empty sequences run no
 step and return an empty vector of the step's inferred output type.

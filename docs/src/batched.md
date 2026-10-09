@@ -92,11 +92,41 @@ cell-local. An authored `scan` step captures enclosing names the same way; see
 
 Do not wrap a shared value in `Ref` as a plate argument; close over it. Older
 kernels pass shared values as `Ref(value)` arguments. Such an argument prepares
-the same kernel as the closure, and how that spelling is retired is open (user
-decision `0kvm2ip`).
+the same kernel as the closure, and it is deprecated (user decision `0kvm2ip`):
+each site warns once at definition under `--depwarn=yes`, and it will become
+an error.
 
 Subkernel and endpoint calls accept ordinary `f(name = value)` and
 `f(; name = value)` spellings. They normalize to the same graph.
+
+### Loop syntax: `@plate for`
+
+A plate can also be written as a loop. Each iteration is one cell:
+
+```julia
+@kernel standardized(y, mu, sigma) = begin
+    @plate for i in eachindex(y, mu)
+        z[i] = (y[i] - mu[i]) / sigma
+    end
+    return z
+end
+```
+
+- A read at the loop index (`y[i]`, `mu[i]`) zips that array, as a
+  `plate(y, mu) do` argument would.
+- Every other value is read as a closure: `sigma`, an index chain
+  `x[idx[i]]`, a lag `x[i - 1]`. An array the cell also reads whole stays a
+  closure, read at `i` by a gather.
+- `z[i] = …` (optionally `z[i]::T = …`) names an output. Several outputs give
+  one plate each over the same cells. Names assigned inside the loop are
+  cell-local, and loops nest.
+- An array read at the loop index has exactly the loop's indices. A mismatch,
+  a singleton included, is a `DimensionMismatch`; a singleton is never repeated
+  across the domain.
+
+The loop prepares the same kernel as the call form. `@plate for t in
+eachindex(c)` reading only `c[t]` is exactly `plate(c) do`, so a scan
+feeding it still streams. `plate(...) do` keeps working.
 
 ## A plate is a pure RK subgraph
 

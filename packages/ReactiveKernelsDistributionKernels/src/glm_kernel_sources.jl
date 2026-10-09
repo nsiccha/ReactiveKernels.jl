@@ -432,12 +432,12 @@ using LogExpFunctions: logistic as _rk_logistic
     # specified, and the score stays ideal-exact.
     logpdf(y::Vector{Int})::Float64 = sum(pointwise(y))
     pointwise(y::Vector{Int})::Vector{Float64} =
-        plate(y, eta, Ref(cuts)) do observed, e, c
-            cell::Float64 = observed == 1 ? log(_rk_logistic(c[1] - e)) :
-                (observed == length(c) + 1 ?
-                    log(1.0 - _rk_logistic(c[length(c)] - e)) :
-                    log(_rk_logistic(c[observed] - e) -
-                        _rk_logistic(c[observed - 1] - e)))
+        plate(y, eta) do observed, e
+            cell::Float64 = observed == 1 ? log(_rk_logistic(cuts[1] - e)) :
+                (observed == length(cuts) + 1 ?
+                    log(1.0 - _rk_logistic(cuts[length(cuts)] - e)) :
+                    log(_rk_logistic(cuts[observed] - e) -
+                        _rk_logistic(cuts[observed - 1] - e)))
             cell
         end
     # The eta adjoint collapses exactly: (a(1-a)-b(1-b))/(b-a) =
