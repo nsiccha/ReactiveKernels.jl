@@ -8957,8 +8957,7 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     # `th = c[g]` over a coefficient-capable `c[levels(g)]`, which keeps
     # its composed factor-sub meaning.
     rhs = ctx.detmap[s]
-    (_reads_array_value(rhs, ctx) || _reads_value_array(rhs, ctx)) &&
-        !factor_alias && return false
+    _reads_declared_array(rhs, ctx) && !factor_alias && return false
     # Likewise a parameter offset: data and non-coefficient scalar
     # parameters combined by sums only (`w = s .+ x`, `s ~ Exponential(1)`).
     # It has no coefficient to compose, so it stays an offset local. Under
@@ -9051,6 +9050,13 @@ function _reads_value_array(ex, ctx, seen::Set{Symbol} = Set{Symbol}())
     ex.head === :ref && isval(ex.args[1]) && return true
     return any(a -> _reads_value_array(a, ctx, seen), ex.args)
 end
+
+# Whether a definition reads a declared array, gathered (`a0 .+ z[g]`)
+# or whole (`sd .* z`). Such a definition is one named value: never an
+# affine sub-predictor of a composition (`_is_composed_sub`), always one
+# of its value leaves (`_extract_composed_tree`).
+_reads_declared_array(ex, ctx) =
+    _reads_array_value(ex, ctx) || _reads_value_array(ex, ctx)
 
 # Whether `ex` reads a declared array value — a bare array name
 # (`B * w`), or an indexed read of any array-capable declaration
@@ -9259,10 +9265,12 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
             node in datas || push!(datas, node)
             return node
         elseif get(ctx.detshape, node, :scalar) === :vector &&
-                _reads_value_array(ctx.detmap[node], ctx)
-            # Array-derived values remain graph values. Interning one
-            # as an LP would consume the definition needed by other
-            # readers, such as a reduction of a library contrast.
+                _reads_declared_array(ctx.detmap[node], ctx)
+            # Array-derived values remain graph values, including a
+            # gather (`mu_base = a0 .+ z[g]`), which its inline spelling
+            # reads as a column too. Interning one as an LP would consume
+            # the definition needed by other readers, such as a
+            # reduction of a library contrast.
             node in datas || push!(datas, node)
             return node
         elseif get(ctx.detshape, node, :scalar) === :vector &&

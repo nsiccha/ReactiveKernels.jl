@@ -539,6 +539,66 @@ const _CMP_MA_COLS = Dict{Symbol,Any}(
     end
 end
 
+# A named definition reading a declared-array gather (`mu_base = a0 .+
+# z[g]`) is one value leaf of a composition, read like the column its
+# inline spelling `(a0 .+ z[g])` reads (snag `rkppl-named-gath-bf3760cd`;
+# naming never changes legality or the density). It stays one named
+# value, evaluated once under its authored name.
+const _CMP_NG_COLS = Dict{Symbol,Any}(
+    :x => [0.5, 1.0, 1.5, 0.25, 2.0, 0.75], :g => [1, 2, 3, 1, 2, 3],
+    :y => [0.3, -1.2, 0.8, 1.9, -0.4, 0.6])
+
+@testset "composed leaves: named declared-array gathers" begin
+    x, g, y = _CMP_NG_COLS[:x], _CMP_NG_COLS[:g], _CMP_NG_COLS[:y]
+    q = (a0 = 0.4, s0 = 0.7, k = -0.2,
+        z = [0.2, -0.5, 0.8], w = [-0.3, 0.6, 0.1])
+    priors(q) = logpdf(Normal(0, 1), q.a0) + logpdf(Normal(0, 1), q.s0) +
+        logpdf(Normal(0, 1), q.k) + sum(logpdf.(Normal(0, 1), q.z)) +
+        sum(logpdf.(Normal(0, 1), q.w))
+    head = quote
+        a0 ~ Normal(0, 1); z[levels(g)] .~ Normal.(0, 1)
+        s0 ~ Normal(0, 1); w[levels(g)] .~ Normal.(0, 1)
+        k ~ Normal(0, 1)
+        m = exp.(k) .* x
+    end
+    m(q) = exp(q.k) .* x
+    for (named, inline, value, leaves) in (
+            (quote
+                mu_base = a0 .+ z[g]
+                slope = s0 .+ w[g]
+                mu = mu_base .+ slope .* m
+            end, :(mu = (a0 .+ z[g]) .+ (s0 .+ w[g]) .* m),
+                q -> (q.a0 .+ q.z[g]) .+ (q.s0 .+ q.w[g]) .* m(q),
+                [:mu_base => :(a0 .+ z[g]), :slope => :(s0 .+ w[g])]),
+            (quote
+                slope = s0 .+ w[g]
+                mu = slope .* m
+            end, :(mu = (s0 .+ w[g]) .* m),
+                q -> (q.s0 .+ q.w[g]) .* m(q),
+                [:slope => :(s0 .+ w[g])]),
+            (quote
+                zs = s0 .* z[g]
+                mu = a0 .+ zs .* m
+            end, :(mu = a0 .+ (s0 .* z[g]) .* m),
+                q -> q.a0 .+ (q.s0 .* q.z[g]) .* m(q),
+                [:zs => :(s0 .* z[g])]))
+        want = q -> sum(logpdf.(Normal.(value(q), 0.7), y)) + priors(q)
+        for location in (named, inline)
+            prog = Expr(:block, head.args...,
+                (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+                :(y .~ Normal.(mu, 0.7)))
+            plan, _, _ = _cmp_ap_check(prog, q, want; cols = _CMP_NG_COLS)
+            t = only(only(p for p in plan.predictors if p.name === :mu).terms)
+            @test t.kind === ComposedTerm
+            location === named || continue
+            # Each named gather is a value leaf and one named definition.
+            @test t.columns == first.(leaves)
+            @test [d.name => d.expr for d in plan.derived
+                if d.name in first.(leaves)] == leaves
+        end
+    end
+end
+
 # The other leaf spellings beside an affine sub-predictor `w`: a whole
 # declared array read inline (`z`, `sd .* z`), and a data-only vector or
 # a module call read by name or inline. Each named and inline spelling
