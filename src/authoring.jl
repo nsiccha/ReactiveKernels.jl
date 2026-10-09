@@ -3803,6 +3803,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     # for bodies with no `@node` (or only foreign `@node`).
     block = _kernel_normalize_call_kwargs(_kernel_lift_nodes(block, mod))
     raw_statements = block isa Expr && block.head === :block ? block.args : Any[block]
+    raw_statements = _kernel_desugar_loops(raw_statements, mod)
     statements = _kernel_lift_plate_expressions(
         _kernel_normalize_return_expressions(raw_statements), mod)
     enclosing_ports = _kernel_enclosing_ports(statements, signature_inputs)
