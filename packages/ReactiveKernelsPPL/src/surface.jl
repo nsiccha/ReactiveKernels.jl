@@ -630,7 +630,8 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
             (haskey(m.fixed, k) || haskey(scoped_values, k))))
     ast = _indexed_observation_definitions(ast, data)
     plan = _lower_rkppl_once(ast, data, m.mod;
-        submodel_scopes = scopes, conditioned = observed_parameters)
+        submodel_scopes = scopes, conditioned = observed_parameters,
+        array_entries = Set{Symbol}(k for k in data if _holds_arrays(get(values, k, nothing))))
     for name in observed_parameters
         values[_conditioned_input(name)] = pop!(values, name)
     end
@@ -820,7 +821,11 @@ scalar argument (`y .~ Normal.(mu, s)` broadcasts it, as Julia does).
 Every `@rkppl` entry point (the model call, `@rkppl data`, `merge` pins)
 lowers with the values. Given names only, binding a number to an ordinary
 broadcast argument also keeps Julia's scalar broadcasting. A number bound
-to a response is one observation.
+to a response is one observation. A value holding one array per index
+(`t = [[0.1, 0.7], [0.2]]`) makes every `@plate` cell that reads it at the
+loop index, directly or through values computed from it, one iteration of
+its Julia loop whatever operators the cell applies (`t[i] * a`, `-t[i]`);
+names alone cannot show this, so such a plan refuses those arrays at binding.
 """
 lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=()) =
     lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned)
@@ -828,22 +833,27 @@ lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=()) =
 function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=())
     names = Symbol[]
     scalars = Set{Symbol}()
+    array_entries = Set{Symbol}()
     for (k, v) in data
         k isa Symbol || _sfail("data names must be Symbols, got $(repr(k))")
         push!(names, k)
         v isa Number && push!(scalars, k)
+        _holds_arrays(v) && push!(array_entries, k)
     end
-    return _lower_rkppl(ast, names, scalars, mod; conditioned)
+    return _lower_rkppl(ast, names, scalars, mod; conditioned, array_entries)
 end
 
 lower_rkppl(ast, data_names; mod::Module = Main, conditioned=()) =
     _lower_rkppl(ast, data_names, Set{Symbol}(), mod; conditioned)
 
-_lower_rkppl(ast, data_names, scalars::Set{Symbol}, mod::Module; conditioned=())::StructuralPlan =
-    Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod; conditioned)
+# `array_entries`: data whose value holds one array per index (`_holds_arrays`).
+# Lowering from values knows them; lowering from names alone cannot.
+_lower_rkppl(ast, data_names, scalars::Set{Symbol}, mod::Module; conditioned=(),
+        array_entries::Set{Symbol} = Set{Symbol}())::StructuralPlan =
+    Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod; conditioned, array_entries)
 
 function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
-        mod::Module; conditioned=())::StructuralPlan
+        mod::Module; conditioned=(), array_entries::Set{Symbol} = Set{Symbol}())::StructuralPlan
     data = Set{Symbol}()
     for n in data_names
         n isa Symbol || _sfail("data names must be Symbols, got $(repr(n))")
@@ -865,7 +875,8 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
     ast, data = _scalar_value_definitions(ast, data, setdiff(scalars, observed_parameters))
     ast = _indexed_observation_definitions(ast, data)
     return _lower_rkppl_once(ast, data, mod;
-        submodel_scopes = scopes, conditioned = observed_parameters)
+        submodel_scopes = scopes, conditioned = observed_parameters,
+        array_entries = intersect(array_entries, data))
 
 end
 
@@ -930,7 +941,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         submodel_scopes::Vector{SubmodelScope} = SubmodelScope[],
         conditioned::Set{Symbol} = Set{Symbol}(),
         value_defs::Set{Symbol} = Set{Symbol}(),
-        shared_defs::Set{Symbol} = Set{Symbol}())
+        shared_defs::Set{Symbol} = Set{Symbol}(),
+        array_entries::Set{Symbol} = Set{Symbol}())
     input_data = data
     ast = _observation_call_definitions(ast, data, mod)
     ast = _gathered_value_definitions(ast, data)
@@ -940,7 +952,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
             _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
     end
     sample, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
-        _partition_statements(ast, data)
+        _partition_statements(ast, data; array_entries)
     sample, det = _rewrite_plate_rows(sample, det)
     # Latent plates over values read their cell count as bound data.
     extents = Set{Symbol}(_plate_extent_input(nm) for (nm, rhs, _, _) in plate_specs
@@ -1374,7 +1386,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     if !isempty(retained)
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, retained),
-            shared_defs)
+            shared_defs, array_entries)
     end
     # A predictor location inlines the definitions it reads. As in Julia,
     # a computed definition is instead one named value that its readers
@@ -1389,7 +1401,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned,
             value_defs = union(value_defs, columns),
-            shared_defs = union(shared_defs, setdiff(shared, columns)))
+            shared_defs = union(shared_defs, setdiff(shared, columns)), array_entries)
     end
     assigns = AssignmentSpec[]
     derived = VectorAssignmentSpec[]
@@ -3045,7 +3057,8 @@ function _is_retired_panel_sample(st::Expr)
     return Meta.isexpr(call, :call) && !isempty(call.args) && first(call.args) === :plate
 end
 
-function _partition_statements(ast::Expr, data::Set{Symbol})
+function _partition_statements(ast::Expr, data::Set{Symbol};
+        array_entries::Set{Symbol} = Set{Symbol}())
     sample = SampleStmt[]
     det = Pair{Symbol,Any}[]
     scans = ScanSpec[]
@@ -3061,7 +3074,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol})
     line = 0
     cell_broadcasts = Dict{Symbol,Vector{Symbol}}()
     args, plate_ctx, plate_params = _expand_plates(ast.args, data;
-        broadcasts = cell_broadcasts)
+        broadcasts = cell_broadcasts, array_entries)
     # Defined names, collected before lowering so the checks below admit
     # forward references. The scan never throws — the main loop below owns
     # every rejection.
@@ -3711,12 +3724,14 @@ end
 # plate context: `(lhs, line, bare-symbols)` per spliced statement for
 # the post-analysis whole-vector check.
 function _expand_plates(args, data::Set{Symbol};
-        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
+        array_entries::Set{Symbol} = Set{Symbol}())
     definitions = Dict{Symbol,Any}(arg.args[1] => arg.args[2] for arg in args
         if arg isa Expr && arg.head === :(=) && length(arg.args) == 2 &&
             arg.args[1] isa Symbol)
     plate_data = union(data, Set{Symbol}(name for (name, rhs) in definitions
         if _data_only(rhs, data, definitions)))
+    arrays = _array_entry_values!(copy(array_entries), definitions)
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
@@ -3742,7 +3757,8 @@ function _expand_plates(args, data::Set{Symbol};
                 pl = arg.args[2].line
             end
             arg, locals = _scope_plate_locals(arg, plate_locals, taken)
-            stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts)
+            stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts, arrays)
+            _array_entry_values!(arrays, definitions)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
                 push!(expanded, st)
@@ -3823,7 +3839,8 @@ function _respell_value(ex::Expr, from::Symbol, to::Symbol)
 end
 
 function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
-        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
+        arrays::Set{Symbol} = Set{Symbol}())
     (length(st.args) == 3 && st.args[3] isa Expr &&
         st.args[3].head === :for) ||
         _sfail("`@plate` takes `@plate for i in R ... end` exactly")
@@ -3860,6 +3877,11 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
             push!(plate_defs, lc.args[1])
         end
     end
+    # A cell reading a value that holds one array per index computes an
+    # array per index too: its outputs and locals are such values for
+    # later plates and definitions.
+    reads_arrays = _plate_reads_array_entries(cells, ivar, arrays)
+    reads_arrays && union!(arrays, plate_defs)
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
@@ -3872,7 +3894,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
-    _plate_needs_retained_cells(cells, ivar) &&
+    (reads_arrays || _plate_needs_retained_cells(cells, ivar)) &&
         return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             broadcasts)
     # Cell locals bound from a per-index value (they vary with the loop
@@ -3990,10 +4012,12 @@ end
 
 # Whole-column evaluation (`_desugar_cell`) strips `[i]` and broadcasts each
 # cell over whole columns. That equals the Julia loop only while every
-# per-index value is a scalar. A definition cell that may hold an array per
-# index is evaluated as retained RK plate cells instead, as plates with
-# observations are: an authored broadcast, indexing or a reduction applied
-# to a per-index value, or a module function or kernel called on one.
+# per-index value is a scalar. A definition plate is evaluated as retained
+# RK plate cells instead, as plates with observations are, when a cell reads
+# a value that holds one array per index (`_plate_reads_array_entries`,
+# whatever operators the cell applies to it), or when it applies an
+# authored broadcast, indexing or a reduction to a per-index value, or
+# calls a module function or kernel on one.
 function _plate_needs_retained_cells(cells, ivar::Symbol)
     perlocals = Set{Symbol}()
     for c in cells
@@ -4004,6 +4028,36 @@ function _plate_needs_retained_cells(cells, ivar::Symbol)
         _retained_cell_expr(rhs, ivar, perlocals) && return true
     end
     return false
+end
+
+# Values that hold one array per index: data bound that way
+# (`array_entries`, known when lowering from values) and every definition
+# computed from one, up to a fixpoint. Plate outputs join in `_desugar_plate`.
+function _array_entry_values!(arrays::Set{Symbol}, definitions)
+    isempty(arrays) && return arrays
+    changed = true
+    while changed
+        changed = false
+        for (name, rhs) in definitions
+            name in arrays && continue
+            any(s -> s in arrays, _value_symbols(rhs)) || continue
+            push!(arrays, name)
+            changed = true
+        end
+    end
+    return arrays
+end
+
+# A definition cell reads such a value at the loop index (`t[i]`,
+# `t[g[i]]`, `t[i][k]`), directly or through a cell local bound from one.
+_plate_reads_array_entries(cells, ivar::Symbol, arrays::Set{Symbol}) =
+    !isempty(arrays) && any(c -> Meta.isexpr(c, :(=), 2) &&
+        _reads_array_entry(c.args[2], ivar, arrays), cells)
+_reads_array_entry(ex, ivar, arrays) = false
+function _reads_array_entry(ex::Expr, ivar, arrays)
+    ex.head === :ref && ex.args[1] isa Symbol && ex.args[1] in arrays &&
+        any(a -> _expr_has_sym(a, ivar), ex.args[2:end]) && return true
+    return any(a -> _reads_array_entry(a, ivar, arrays), ex.args)
 end
 
 # A per-index value: a read at the loop index (`x[i]`, `v[g[i]]`, `t[i][k]`)

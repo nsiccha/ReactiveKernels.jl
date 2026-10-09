@@ -3170,13 +3170,24 @@ _is_real_column(col) = col isa Real || col isa AbstractArray{<:Real}
 function _check_numeric_position!(args, plan, label, bound::Bool)
     bound || return nothing
     for arg in args
-        arg isa Symbol && haskey(plan.columns, arg) &&
-            !_is_real_column(plan.columns[arg]) &&
+        arg isa Symbol && haskey(plan.columns, arg) || continue
+        col = plan.columns[arg]
+        _holds_arrays(col) && _fail(label, "column $arg holds one array per " *
+            "entry, which whole-column elementwise math cannot read. " *
+            _array_entry_lowering_hint(arg))
+        _is_real_column(col) ||
             _fail(label, "column $arg is not numeric (elementwise math " *
                          "needs numeric columns)")
     end
     return nothing
 end
+
+# A `@plate` cell reading data that holds one array per index runs once per
+# index only when lowering saw the values: names alone carry no shape.
+_array_entry_lowering_hint(c) = "A `@plate` cell that reads `$c[i]` means " *
+    "one iteration of its loop when the model is lowered with the data " *
+    "values (`lower_rkppl(ast, data)` or the model call); lowering from data " *
+    "names alone cannot see that `$c` holds arrays"
 
 # A derived column must be row-varying by value: some column-or-derived
 # reference in a length-propagating position. Dotted forms propagate,
@@ -4177,7 +4188,8 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
             _fail(t.label, "column $c holds one array per entry, which an " *
                 "observation reads as Julia broadcasting does: elementwise " *
                 "over those arrays; read `$c[i]` in a dotted `@plate` cell " *
-                "(`y[i] .~ D.(…)`) to broadcast over each entry's values")
+                "(`y[i] .~ D.(…)`) to broadcast over each entry's values. " *
+                _array_entry_lowering_hint(c))
         end
         eltype(col) <: Real ||
             _fail(t.label, "column $c must be numeric")
