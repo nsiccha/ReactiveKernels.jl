@@ -187,12 +187,12 @@ end
     @test isapprox(_os_gradient(b1.spec, lit, u), g0; rtol = 1e-9, atol = 1e-9)
     @test isapprox(_os_gradient(b2.spec, col, u), g0; rtol = 1e-9, atol = 1e-9)
     # Absent emits no scale precompute; modeled emits one explicit dotted
-    # `exp.` over the scale predictor's lp node (human-readable, Enzyme-safe).
+    # `exp.` over the scale predictor's node (human-readable, Enzyme-safe).
     src0 = sprint(show, kernel_expr(base, b0.layout))
     @test !occursin("_ppl_disc_", src0)
     scaled = _os_plan()
     srcs = sprint(show, kernel_expr(scaled, build_kernel(scaled).layout))
-    @test occursin("exp.(_ppl_lp_disc)", srcs)
+    @test occursin("exp.(disc)", srcs)
 end
 
 @testset "ordinal modeled-scale parity" begin
