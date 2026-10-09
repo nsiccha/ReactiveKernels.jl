@@ -2024,7 +2024,8 @@ end
 # With `history = h0` the do-block takes one more, LAST formal: the read-only
 # vector of the outputs so far (`h0` at and after the current step); `h0` is
 # the op's last argument, atomic like the carry seed.
-function _kernel_authored_scan_expr(rhs, mod;
+function _kernel_authored_scan_expr(rhs, mod,
+                                    caller_locals = Set{Symbol}();
                                     endpoint_cache =
                                         IdDict{Any,Dict{Any,KernelSpec}}())
     rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
@@ -2130,11 +2131,21 @@ function _kernel_authored_scan_expr(rhs, mod;
             _push_operand!(operand, false)              # iterated sequence (non-atomic)
         end
     end
+    # A caller name the step reads without passing it is a closure capture, as
+    # in a plate cell: it enters whole as one more shared (atomic) operand, after
+    # the explicit `Ref(...)` operands and before the history fill, so the
+    # iterated sequences stay the only per-step operands.
+    captured = filter!(
+        name -> name in caller_locals && !(name in formals),
+        _kernel_free_ports(scalar_body, Set(caller_locals)),
+    )
+    foreach(name -> _push_operand!(name, true), captured)
+    formals = history ? Symbol[formals[1:(end - 1)]..., captured..., formals[end]] :
+              Symbol[formals..., captured...]
     history && _push_operand!(history_expr, true)       # last: the history fill (atomic)
 
     # Build the step body's 2-want spec. Its HAVE boundary is the do-block formals
-    # (carry, x, shared...); an enclosing port used but not passed is out of scope
-    # (never auto-captured) — same rule as plate. Formals are unannotated, like
+    # (carry, x, shared...) plus the captures above. Formals are unannotated, like
     # omitted `@kernel` signature types: an endpoint argument declaration that
     # receives a formal directly then supplies its port type, as it does for
     # plate formals, instead of conflicting with a placeholder `Any`.
@@ -3833,7 +3844,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 rhs, mod, enclosing_ports; endpoint_cache = endpoint_cache)
             plate_expr === nothing &&
                 (plate_expr = _kernel_authored_scan_expr(
-                    rhs, mod; endpoint_cache = endpoint_cache))
+                    rhs, mod, enclosing_ports; endpoint_cache = endpoint_cache))
             if plate_expr !== nothing
                 length(outputs) == 1 || throw(ArgumentError(
                     "an authored plate/scan produces exactly one named output port"))

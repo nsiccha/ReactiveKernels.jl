@@ -812,6 +812,49 @@ end
     end
 end
 
+@testset "authored scan reverse AD through captured parameters" begin
+    # A step's captured names enter whole as shared operands (snag
+    # rk-plate-body-ca-091ef037); Reverse differentiates them exactly as the
+    # explicit `Ref` spelling.
+    @kernel captured_scan_objective(q::Vector{Float64},
+                                    series::Vector{Float64}) = begin
+        decay::Float64 = q[1]
+        trajectory = scan(series; init = 0.0) do carry, x
+            next = decay * carry + q[2] * x
+            (next, next)
+        end
+        total::Float64 = sum(trajectory)
+    end
+    @kernel reffed_scan_objective(q::Vector{Float64},
+                                  series::Vector{Float64}) = begin
+        decay::Float64 = q[1]
+        trajectory = scan(series, Ref(q), Ref(decay);
+                          init = 0.0) do carry, x, qq, d
+            next = d * carry + qq[2] * x
+            (next, next)
+        end
+        total::Float64 = sum(trajectory)
+    end
+    reference(q, series) = sum(accumulate(
+        (carry, x) -> q[1] * carry + q[2] * x, series; init = 0.0))
+    q = [0.6, 1.5]
+    series = [0.5, -1.0, 2.0, 0.25]
+    expected = map(eachindex(q)) do i
+        left, right = copy(q), copy(q)
+        left[i] -= 1e-6
+        right[i] += 1e-6
+        (reference(right, series) - reference(left, series)) / 2e-6
+    end
+    for spec in (captured_scan_objective, reffed_scan_objective)
+        k = prepare(spec; want = :total)
+        prepared = prepare_ad(k, TEST_AD_BACKEND, q, series; active = :q)
+        gradient = zeros(2)
+        value, _ = ad_value_and_gradient!(prepared, gradient, q, series)
+        @test value ≈ reference(q, series)
+        @test gradient ≈ expected rtol = 1e-6
+    end
+end
+
 @testset "authored scan lockstep reverse AD" begin
     spec = AuthoredScanFixtures.authored_scan_lockstep
     reference(a, b) = -0.5 * sum(abs2,

@@ -637,3 +637,59 @@ end
     expected = cumsum([xs[j] * plan.shifts[j] + 5.0 * xs[j] for j in eachindex(xs)])
     @test prepare(F.authored_scan_host_shared)(xs, plan, cfg) == expected
 end
+
+# A module global that a kernel-local below shadows: the step must read the
+# kernel-local, as a Julia closure would, never this binding.
+const _scan_captured_shadowed = [100.0]
+
+@testset "a scan step captures enclosing names whole, as a closure does" begin
+    # An enclosing name the step reads without passing it enters whole as one
+    # more shared (atomic) operand, like an explicit `Ref(name)` (snag
+    # rk-plate-body-ca-091ef037). Only the explicit non-`Ref` positionals are
+    # iterated.
+    @kernel _scan_captured_ports(xs, w, v) = begin
+        out = scan(xs; init = 0.0) do carry, x
+            next = carry + x * w + v[1] + length(v)
+            (next, next)
+        end
+        return out
+    end
+    @kernel _scan_captured_derived(xs, a) = begin
+        _scan_captured_shadowed = a .* 2.0
+        out = scan(xs, Ref(a); init = 0.0) do carry, x, aa
+            next = carry + x * _scan_captured_shadowed[1] + aa[2]
+            (next, next)
+        end
+        return out
+    end
+    @kernel _scan_captured_history(xs, w) = begin
+        out = scan(xs; init = 0.0, history = 0.0) do carry, x, h
+            next = carry + x * w
+            (next, next)
+        end
+        return out
+    end
+    @kernel _scan_captured_in_plate(groups, w) = begin
+        totals = plate(groups) do g
+            trajectory = scan(g; init = 0.0) do carry, x
+                next = carry + x * w[1]
+                (next, next)
+            end
+            sum(trajectory)
+        end
+        return totals
+    end
+
+    xs = [1.0, 2.0, 3.0]
+    @test prepare(_scan_captured_ports)(xs, 2.0, [0.5, 9.0]) ==
+          cumsum(xs .* 2.0 .+ 0.5 .+ 2)
+    scans = [r.op for r in plan(_scan_captured_ports).recipes
+             if r.op isa ReactiveKernels._AuthoredScanOp]
+    # Arguments: the carry seed, `xs`, then the captures `w` and `v`.
+    @test typeof(only(scans)).parameters[2] == (1, 3, 4)
+    @test prepare(_scan_captured_derived)(xs, [1.0, 1.0]) ==
+          cumsum(xs .* 2.0 .+ 1.0)
+    @test prepare(_scan_captured_history)(xs, 2.0) == cumsum(xs .* 2.0)
+    @test prepare(_scan_captured_in_plate)([[1.0, 2.0], [2.0]], [2.0, 9.0]) ==
+          [sum(cumsum([1.0, 2.0] .* 2.0)), sum(cumsum([2.0] .* 2.0))]
+end

@@ -39,6 +39,11 @@ end
   every step, exactly like [`plate`](compiler.md)'s atomic `Ref`
   arguments. Every `Ref(...)` operand must follow the iterated sequences; a bare
   (non-`Ref`) positional after a `Ref(...)` is rejected.
+- **Captured names** — the step reads enclosing names as a Julia closure does.
+  An enclosing name it reads without passing it is captured whole, exactly like
+  one more trailing `Ref(name)` operand. That name can be a `@kernel` signature
+  port, a name the kernel body assigns, or the name of an enclosing plate cell.
+  Only the explicit non-`Ref` positionals are iterated.
 - **The do-block** receives `(carry, x₁, x₂, …, shared...)` and must end with the
   2-tuple `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]`
   (one entry per step); the final carry is internal.

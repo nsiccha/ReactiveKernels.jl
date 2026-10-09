@@ -82,7 +82,8 @@ end
 
 Pass an array as an explicit plate argument when its axis should zip, as in
 `plate(y, mu) do observed, mean ... end`. Names assigned inside the cell are
-cell-local.
+cell-local. An authored `scan` step captures enclosing names the same way; see
+[Sequential recurrences with `scan`](scan.md).
 
 Subkernel and endpoint calls accept ordinary `f(name = value)` and
 `f(; name = value)` spellings. They normalize to the same graph.
