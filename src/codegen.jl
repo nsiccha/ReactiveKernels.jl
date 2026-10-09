@@ -11,6 +11,27 @@ const _OPS_ARG = :__ops__
 const _CACHES_ARG = :__caches__
 const _CACHE_APPLY_ARG = :__cache_apply__
 
+# Names a `@kernel` generates rather than authors: gensyms and the synthesized
+# result ports of a computed `return` and of a plate cell's final expression.
+_generated_value_name(name::Symbol) =
+    name === _KERNEL_RETURN_PORT || name === _KERNEL_PLATE_VALUE_PORT ||
+    startswith(String(name), '#')
+
+# The value whose name each alias class is shown by: its first-declared member
+# with an authored name. A kernel declares its ports before it clones a
+# composed child, so the caller's name for a child boundary (the argument it
+# passes, the name it assigns the result to) precedes the child's own formal
+# and result names. A class with no authored name keeps its canonical value's.
+function _class_name_values(g::Graph)
+    chosen = Dict{Int,Int}()
+    for (id, value) in g.values
+        _generated_value_name(value.name) && continue
+        root = canon_id(g, id)
+        id < get(chosen, root, typemax(Int)) && (chosen[root] = id)
+    end
+    chosen
+end
+
 # Assign a globally unique source-variable Symbol to every canonical value in
 # the plan. User names are diagnostic hints, not binding authority: they may
 # collide with one another, with a generated disambiguation such as `a_12`, or
@@ -24,8 +45,9 @@ function _varnames(p::Plan)
     unique!(ids)
     used = Set{Symbol}((_OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG))
     out = Dict{Int,Symbol}()
+    named = _class_name_values(g)
     for id in ids
-        base = p.graph.values[id].name
+        base = g.values[get(named, id, id)].name
         candidate = base
         suffix = 0
         while candidate in used
@@ -4961,17 +4983,249 @@ end
 # `code_expr` still lowers the constant through the executable `__ops__` slot.
 _readable_bound_constant(value) = value
 
+# --- display-only value inlining ---------------------------------------------------
+#
+# `readable_code` shows a recipe's source with each authored name it reads in
+# place of the program variable that holds it, as a human writes an inlined
+# call: `exp(unconstrained[2])`, not `let u = unconstrained[2]; exp(u) end`. A
+# name, literal or once-read value takes the name's place. A computed value
+# read more than once, a name read inside a function, loop, comprehension or
+# macro body, and anything a substitution could capture (a name the source
+# itself binds) stay `let` bindings. Display only: `code_expr` keeps the ports.
+_readable_literal(x) = x isa Union{Number,AbstractString,Char,Nothing,QuoteNode}
+
+const _READABLE_SCOPE_HEADS = (:->, :function, :for, :while, :generator,
+    :comprehension, :typed_comprehension, :macrocall, :struct, :module)
+
+_readable_let_bindings(header) =
+    header isa Expr && header.head === :block ? header.args : Any[header]
+
+_readable_symbols!(names, x::Symbol) = push!(names, x)
+_readable_symbols!(names, x) = names
+function _readable_symbols!(names, ex::Expr)
+    ex.head in (:quote, :inert) && return names
+    foreach(arg -> _readable_symbols!(names, arg), ex.args)
+    names
+end
+
+# Every name `ex` binds where a substitution can reach: assignment, `let` and
+# `local` targets, function parameters, loop and generator variables. A
+# do-block's body is never substituted into, so its parameters and locals bind
+# nothing a substitution could be captured by.
+function _readable_bound_names!(names, ex)
+    ex isa Expr || return names
+    ex.head in (:quote, :inert) && return names
+    ex.head === :do && length(ex.args) == 2 &&
+        return _readable_bound_names!(names, ex.args[1])
+    if ex.head === :kw
+        return _readable_bound_names!(names, ex.args[end])
+    elseif ex.head in (:(=), :->, :function) && !isempty(ex.args)
+        _readable_symbols!(names, ex.args[1])
+    elseif ex.head in (:local, :global)
+        _readable_symbols!(names, ex)
+    elseif ex.head === :let
+        for binding in _readable_let_bindings(ex.args[1])
+            binding isa Symbol && push!(names, binding)
+        end
+    end
+    foreach(arg -> _readable_bound_names!(names, arg), ex.args)
+    names
+end
+
+# The number of free reads of `name` in `ex`, or `nothing` when one sits in a
+# scope this display rewrite does not analyze. An assignment target, keyword
+# or named-field label is not a read; a do-block's call arguments are, and
+# its body reads `name` only when no parameter of the block shadows it.
+function _readable_free_uses(ex, name::Symbol)
+    ex === name && return 1
+    ex isa Expr || return 0
+    ex.head in (:quote, :inert) && return 0
+    if ex.head in _READABLE_SCOPE_HEADS
+        return _readable_mentions(ex, name) ? nothing : 0
+    elseif ex.head === :do && length(ex.args) == 2
+        block = ex.args[2]
+        shadowed = block isa Expr && block.head === :-> && !isempty(block.args) &&
+            name in _readable_symbols!(Set{Symbol}(), block.args[1])
+        !shadowed && _readable_mentions(block, name) && return nothing
+        return _readable_free_uses(ex.args[1], name)
+    end
+    args = ex.head in (:(=), :kw) && length(ex.args) == 2 ? ex.args[2:2] : ex.args
+    uses = 0
+    for arg in args
+        n = _readable_free_uses(arg, name)
+        n === nothing && return nothing
+        uses += n
+    end
+    uses
+end
+
+_readable_mentions(ex, name::Symbol) =
+    ex === name || ex isa Expr && any(arg -> _readable_mentions(arg, name), ex.args)
+
+# Simultaneous substitution of the free names in `subst`, at the positions
+# `_readable_free_uses` counts.
+function _readable_substitute(ex, subst::AbstractDict)
+    ex isa Symbol && return get(subst, ex, ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    ex.head in _READABLE_SCOPE_HEADS && return ex
+    ex.head === :do && length(ex.args) == 2 &&
+        return Expr(:do, _readable_substitute(ex.args[1], subst), ex.args[2])
+    ex.head in (:(=), :kw) && length(ex.args) == 2 &&
+        return Expr(ex.head, ex.args[1], _readable_substitute(ex.args[2], subst))
+    Expr(ex.head, Any[_readable_substitute(arg, subst) for arg in ex.args]...)
+end
+
+# Whether `value` is the program variable codegen made of the authored `name`
+# to avoid a collision (`_varnames`: `name_<id>` or `name_<id>_<k>`). Such a
+# name stays an explicit binding, so the authored spelling remains visible.
+_readable_collision_rename(name::Symbol, value) =
+    value isa Symbol &&
+    occursin(Regex("^\\Q" * String(name) * "\\E_\\d+(_\\d+)?\$"), String(value))
+
+# `ex` with as many of the `name => value` pairs substituted as is safe, and
+# the pairs that stay bindings, in their given order.
+function _readable_inline_values(ex, pairs)
+    bound = _readable_bound_names!(Set{Symbol}(), ex)
+    inline = falses(length(pairs))
+    for (index, (name, value)) in enumerate(pairs)
+        name in bound && continue
+        _readable_collision_rename(name, value) && continue
+        uses = _readable_free_uses(ex, name)
+        inline[index] = uses !== nothing &&
+            (uses <= 1 || value isa Symbol || _readable_literal(value))
+    end
+    # A substituted value must not read a name the source binds or a name that
+    # stays a binding: it would then read that binding instead.
+    changed = true
+    while changed
+        changed = false
+        blocked = copy(bound)
+        for (index, (name, _)) in enumerate(pairs)
+            inline[index] || push!(blocked, name)
+        end
+        for (index, (_, value)) in enumerate(pairs)
+            inline[index] || continue
+            isdisjoint(_readable_symbols!(Set{Symbol}(), value), blocked) && continue
+            inline[index] = false
+            changed = true
+        end
+    end
+    subst = Dict{Symbol,Any}(pairs[index] for index in eachindex(pairs) if inline[index])
+    (isempty(subst) ? ex : _readable_substitute(ex, subst)), pairs[.!inline]
+end
+
+# Show, in place, the values RK materialized into ports it named: an argument
+# of a composed call (`exponential(4.0).logpdf(x)` passes `4.0` through a
+# hygienic port) or a value with no authored name at all. A literal or name is
+# shown at every use, another value read once at its use, and one read nowhere
+# in the shown program (a plate argument its authored source already spells)
+# not at all.
+function _readable_inline_generated(ex::Expr, p::Plan)
+    ex.head === :function && length(ex.args) == 2 && ex.args[2] isa Expr &&
+        ex.args[2].head === :block || return ex
+    g = p.graph
+    names = _varnames(p)
+    candidates = Set{Symbol}()
+    for r in p.recipes, o in r.outputs
+        r.source isa _NoKernelSource && continue
+        name = names[canon_id(g, o.id)]
+        # A hygienic port (a gensym) or a class with no authored name at all.
+        (startswith(String(o.name), '#') || _generated_value_name(name)) &&
+            push!(candidates, name)
+    end
+    for w in p.want
+        delete!(candidates, names[canon_id(g, w.id)])
+    end
+    statements = Any[ex.args[2].args...]
+    index = 1
+    while index <= length(statements)
+        statement = statements[index]
+        if statement isa Expr && statement.head === :(=) &&
+           statement.args[1] isa Symbol && statement.args[1] in candidates
+            name, value = statement.args
+            later = statements[(index + 1):end]
+            bound = foldl(_readable_bound_names!, later; init = Set{Symbol}())
+            counts = [_readable_free_uses(statement, name) for statement in later]
+            safe = !(name in bound) && all(!isnothing, counts) &&
+                isdisjoint(_readable_symbols!(Set{Symbol}(), value), bound)
+            if safe && (sum(counts; init = 0) <= 1 || value isa Symbol ||
+                        _readable_literal(value))
+                subst = Dict{Symbol,Any}(name => value)
+                for later_index in (index + 1):length(statements)
+                    statements[later_index] =
+                        _readable_substitute(statements[later_index], subst)
+                end
+                deleteat!(statements, index)
+                continue
+            end
+        end
+        index += 1
+    end
+    Expr(:function, ex.args[1], Expr(:block, statements...))
+end
+
+# The names a recipe's authored source reads its inputs by. They are its input
+# values' names except where the graph renamed those values: a bound child
+# endpoint scoped under its owner port (`standard.z`), or a composed child's
+# value scoped under the caller's result (`lp.scale`), keeps its source, which
+# still reads `z` or `scale`. The operation keeps the authored names as the
+# parameters of its source closure, or as the arguments of an exact bare call.
+# Any other operation (a plate, a scan) reads a scoped input by the part of its
+# name after a scope prefix that its source spells.
+function _recipe_source_names(recipe::Recipe)
+    names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
+    names === nothing || return names
+    spelled = Set{Symbol}()
+    _source_symbols!(spelled, recipe.source)
+    Symbol[_unscoped_source_name(value.name, spelled) for value in recipe.inputs]
+end
+_source_symbols!(names, x::Symbol) = push!(names, x)
+_source_symbols!(names, x) = names
+function _source_symbols!(names, ex::Expr)
+    ex.head in (:quote, :inert) && return names
+    foreach(arg -> _source_symbols!(names, arg), ex.args)
+    names
+end
+function _unscoped_source_name(name::Symbol, spelled)
+    name in spelled && return name
+    text = String(name)
+    for index in findall(==('.'), text)
+        suffix = Symbol(text[(index + 1):end])
+        suffix in spelled && return suffix
+    end
+    name
+end
+_source_parameter_names(op::_KernelSourceOp, source, n) =
+    _closure_parameter_names(_source_closure(op.f), n)
+_source_closure(f) = f
+_source_closure(f::_KernelSourceFunction) = _source_closure(f.f)
+_source_closure(branch::_KernelBranch) = _source_closure(branch.call)
+_source_closure(reduction::_KernelReduction) = _source_closure(reduction.call)
+_source_parameter_names(op::Function, source::Expr, n) =
+    source.head === :call && length(source.args) == n + 1 &&
+        all(arg -> arg isa Symbol, source.args[2:end]) ?
+        Symbol[source.args[2:end]...] : nothing
+_source_parameter_names(op, source, n) = nothing
+function _closure_parameter_names(f, n)
+    f isa Function || return nothing
+    candidates = methods(f)
+    length(candidates) == 1 || return nothing
+    method = only(candidates)
+    method.isva && return nothing
+    names = Base.method_argnames(method)[2:end]
+    length(names) == n ? names : nothing
+end
+
 function _readable_recipe_call(recipe::Recipe, args)
     op = recipe.op
     op isa _BoundConstant && return _readable_bound_constant(op.value)
     source = recipe.source
     if !(source isa _NoKernelSource)
-        rhs = deepcopy(source)
-        bindings = Any[]
-        for (input, arg) in zip(recipe.inputs, args)
-            input.name === arg && continue
-            push!(bindings, Expr(:(=), input.name, arg))
-        end
+        pairs = Pair{Symbol,Any}[name => arg for (name, arg) in
+                                 zip(_recipe_source_names(recipe), args) if name !== arg]
+        rhs, kept = _readable_inline_values(deepcopy(source), pairs)
+        bindings = Any[Expr(:(=), name, arg) for (name, arg) in kept]
         isempty(bindings) && return rhs
         header = length(bindings) == 1 ? only(bindings) : Expr(:block, bindings...)
         return Expr(:let, header, Expr(:block, rhs))
