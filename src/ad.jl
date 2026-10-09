@@ -1057,6 +1057,10 @@ end
     end
 end
 
+# The retained box rides after the wrapped call's own hidden operands.
+_ad_hidden_operands(retaining::_ADRetainingCall, values) =
+    _ad_hidden_operands(retaining.call, Base.front(values))
+
 function _ad_retaining_call(kernel::PreparedKernel, call, external_values,
                             resolved::Tuple, retain::Tuple)
     objective, retained = _ad_output_positions(kernel, retain)

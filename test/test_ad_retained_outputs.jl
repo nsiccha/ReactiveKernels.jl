@@ -75,6 +75,27 @@ struct UndeclaredBackend <: DifferentiationInterface.AbstractADType end
         @test retained.terms == kernel(q0, data)[1]
     end
 
+    @testset "bound data stays among the packed hidden operands" begin
+        plain = prepare_ad(scored, BACKEND, q0; active = :q, want = :density,
+                           bound = (; data))
+        retaining = prepare_ad(scored, BACKEND, q0; active = :q,
+                               want = :density, bound = (; data),
+                               retain = (:terms,))
+        @test ReactiveKernels._ad_hidden_operands(retaining) ==
+              ReactiveKernels._ad_hidden_operands(plain)
+        gradient = similar(q0)
+        for q in (q0, [0.4, 0.1, -0.2, 0.3])
+            value, _, retained = ad_value_gradient_and_retained!(
+                retaining, gradient, q)
+            @test value ≈ expected_density(q, data)
+            @test gradient ≈ expected_gradient(q, data)
+            @test retained.terms ≈ expected_terms(q, data)
+            plain_value, plain_gradient = ad_value_and_gradient(plain, q)
+            @test value == plain_value
+            @test gradient ≈ plain_gradient
+        end
+    end
+
     @testset "invalid retention fails loudly" begin
         # refused: the retained name must be a WANT port of the kernel, or the
         # objective would be ambiguous.
