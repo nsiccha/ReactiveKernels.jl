@@ -300,3 +300,149 @@ end
     case=merge(case,(;ast,coords=[Symbol("b.1"),Symbol("b.2")]))
     _ma_surface_check(case)
 end
+
+# Columns of one per-observation product are ordinary observation values:
+# `P = X * B` keeps X's rows on its first axis, so `P[:, j]` reads every row,
+# as in Julia (snag `rkppl-column-rea-6a185dd3`).
+@rkppl _ma_joint(X, K, T) = begin
+    beta[1:K, 1:T] .~ Normal.(0.0, 1.0)
+    return X * beta
+end
+
+function _ma_column_case(kind, n)
+    x1 = [0.3 + 0.13i for i in 1:n]
+    x2 = [0.7 + 0.2sin(i) for i in 1:n]
+    data = Dict{Symbol,Any}(:x1 => x1, :x2 => x2,
+        :y1 => [0.2 + 0.05cos(i) for i in 1:n],
+        :y2 => [-0.1 + 0.07sin(2i) for i in 1:n])
+    X = hcat(ones(n), x1, x2)
+    B(q, pre = "B.") = [q[Symbol(pre, i, ".", j)] for i in 1:3, j in 1:2]
+    coords = [Symbol("B.", i, ".", j) for i in 1:3 for j in 1:2]
+    loc1, loc2 = q -> (X * B(q))[:, 1], q -> (X * B(q))[:, 2]
+    scale1 = q -> 1.0
+    if kind == :named
+        ast = quote
+            X = hcat(ones(length(x1)), x1, x2)
+            B[axes(X, 2), 1:2] .~ Normal.(0, 1)
+            P = X * B
+            y1 .~ Normal.(P[:, 1], 1)
+            y2 .~ Normal.(P[:, end], 1)
+        end
+    elseif kind == :alias
+        ast = quote
+            X = hcat(ones(length(x1)), x1, x2)
+            B[axes(X, 2), 1:2] .~ Normal.(0, 1)
+            P = X * B
+            p1 = P[:, 1]
+            Q = P
+            y1 .~ Normal.(p1, 1)
+            y2 .~ Normal.(Q[:, 2], 1)
+        end
+    elseif kind == :inline
+        ast = quote
+            X = hcat(ones(length(x1)), x1, x2)
+            B[axes(X, 2), 1:2] .~ Normal.(0, 1)
+            y1 .~ Normal.((X * B)[:, 1], 1)
+            y2 .~ Normal.((X * B)[:, 2], 1)
+        end
+    elseif kind == :submodel
+        ast = quote
+            X = hcat(ones(length(x1)), x1, x2)
+            P ~ _ma_joint(X, 3, 2)
+            p1 = P[:, 1]
+            y1 .~ Normal.(p1, 1)
+            y2 .~ Normal.(P[:, 2], 1)
+        end
+        coords = [Symbol("P.beta.", i, ".", j) for i in 1:3 for j in 1:2]
+        loc1 = q -> (X * B(q, "P.beta."))[:, 1]
+        loc2 = q -> (X * B(q, "P.beta."))[:, 2]
+    elseif kind == :data_matrix
+        data[:Xd] = X
+        ast = quote
+            B[axes(Xd, 2), 1:2] .~ Normal.(0, 1)
+            P = Xd * B
+            y1 .~ Normal.(P[:, 1], 1)
+            y2 .~ Normal.(P[:, 2], 1)
+        end
+    elseif kind == :data_column
+        data[:Xd] = X
+        ast = quote
+            c ~ Normal(0, 1)
+            y1 .~ Normal.(c .* Xd[:, 2], 1)
+            y2 .~ Normal.(Xd[:, 3], 1)
+        end
+        coords = [:c]
+        loc1, loc2 = q -> q[:c] .* x1, q -> x2
+    elseif kind == :scale
+        ast = quote
+            X = hcat(ones(length(x1)), x1, x2)
+            B[axes(X, 2), 1:2] .~ Normal.(0, 1)
+            P = X * B
+            y1 .~ Normal.(P[:, 1], exp.(P[:, 2]))
+            y2 .~ Normal.(P[:, 2], 1)
+        end
+        scale1 = q -> exp.((X * B(q))[:, 2])
+    elseif kind == :separate
+        ast = quote
+            X = hcat(ones(length(x1)), x1, x2)
+            b1[axes(X, 2)] .~ Normal.(0, 1)
+            b2[axes(X, 2)] .~ Normal.(0, 1)
+            y1 .~ Normal.(X * b1, 1)
+            y2 .~ Normal.(X * b2, 1)
+        end
+        coords = [Symbol("b", j, ".", i) for i in 1:3 for j in 1:2]
+        sep(q) = [q[Symbol("b", j, ".", i)] for i in 1:3, j in 1:2]
+        loc1, loc2 = q -> X * sep(q)[:, 1], q -> X * sep(q)[:, 2]
+    else
+        error("unknown column fixture $kind")
+    end
+    oracle = (layout, u) -> begin
+        q = _ma_q(layout, u)
+        sum(logpdf(Normal(0, 1), v) for v in u; init = 0.0) +
+            sum(logpdf.(Normal.(loc1(q), scale1(q)), data[:y1])) +
+            sum(logpdf.(Normal.(loc2(q), 1.0), data[:y2]))
+    end
+    return (; kind, data, ast, coords, oracle)
+end
+
+@testset "matrix values: column reads of a per-observation product" begin
+    for n in (1, 6), kind in (:named, :alias, :inline, :submodel,
+            :data_matrix, :data_column, :scale, :separate)
+        @testset "$kind / $n" begin
+            case = _ma_column_case(kind, n)
+            original = deepcopy(case.data)
+            plan = lower_rkppl(case.ast, Set(keys(case.data));
+                conditioned = (:y1, :y2), mod = @__MODULE__)
+            bound = bind_data(plan, case.data)
+            built = build_kernel(bound)
+            @test Set(coordinate_names(built.layout)) == Set(case.coords)
+            for shift in (0.0, 0.17)
+                u = [0.2sin(i) + shift for i in 1:built.layout.total]
+                _check_model_math(built, bound, u,
+                    w -> case.oracle(built.layout, w))
+            end
+            @test isequal(case.data, original)
+        end
+    end
+end
+
+@testset "matrix values: one product read by column equals separate products" begin
+    # Same coefficients, same density bit for bit; the product runs once.
+    named, separate = _ma_column_case(:named, 6), _ma_column_case(:separate, 6)
+    models = map((named, separate)) do case
+        plan = lower_rkppl(case.ast, Set(keys(case.data));
+            conditioned = (:y1, :y2), mod = @__MODULE__)
+        bound = bind_data(plan, case.data)
+        (; bound, built = build_kernel(bound))
+    end
+    canonical(nm) = (m = match(r"^b(\d)\.(\d+)$", string(nm));
+        m === nothing ? string(nm) : "B.$(m[2]).$(m[1])")
+    point = Dict("B.$i.$j" => 0.1i - 0.2j for i in 1:3 for j in 1:2)
+    values = map(models) do m
+        u = [point[canonical(nm)] for nm in coordinate_names(m.built.layout)]
+        _query(m.built.spec, m.bound, :posterior, u)
+    end
+    @test values[1] == values[2]
+    code = string(kernel_expr(models[1].bound, models[1].built.layout))
+    @test count("X * B", code) == 1
+end

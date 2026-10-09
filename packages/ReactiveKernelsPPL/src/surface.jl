@@ -1830,6 +1830,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         base = ex.args[1]
         base in data && length(ex.args) == 2 &&
             _literal_row_range(ex.args[2]) && return :vector
+        slice = _observation_slice_shape(ex, data, detmap, memo, active, env)
+        slice === nothing || return slice
         _is_array_value_ref(ex, data, detmap, memo, active, env) &&
             return _array_ref_shape(ex, data, detmap, memo, active, env)
         _is_gather(ex, data, detmap, env) || return :scalar
@@ -1878,6 +1880,23 @@ function _elementwise_shape(argshapes)
     :vector in argshapes && return :vector
     :array in argshapes && return :array
     return :scalar
+end
+
+# `A[:, j]` over a value whose rows are the observations (a bound data
+# matrix, a product `X * B` of a data matrix and a declared or returned
+# coefficient matrix) keeps that axis, as in Julia: the leading `:`
+# selects every row. The other indices are literal positions or `:`, so
+# `P[:, 1]` is one value per observation and `P[:, :]` stays a matrix.
+function _observation_slice_shape(ex::Expr, data, detmap, memo, active, env)
+    base = ex.args[1]
+    base isa Union{Symbol,Expr} && length(ex.args) >= 3 &&
+        ex.args[2] === :(:) || return nothing
+    rest = ex.args[3:end]
+    all(_is_position, rest) || return nothing
+    _shape_of(base, data, detmap, memo, active, env) === :vector ||
+        return nothing
+    _obs_axis(base, data, detmap, memo, active, env) || return nothing
+    return any(i -> i === :(:), rest) ? :matrix : :vector
 end
 
 # A read `A[...]` of an array value: a declared array, an array-valued
@@ -1952,6 +1971,8 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
+        _observation_slice_shape(ex, data, detmap, memo, active, env) ===
+            nothing || return true
         # A gather from an array value follows its observation index on
         # either axis, including definitions such as `b = z * M`.
         array_base = _is_array_value_ref(ex, data, detmap, memo, active, env)
@@ -6555,6 +6576,15 @@ function _value_symbols!(out::Set{Symbol}, ex)
         end
         return nothing
     end
+    if ex.head === :ref && !isempty(ex.args)
+        # A whole axis (`P[:, 1]`) or an endpoint (`P[:, end]`) is a
+        # position of the indexed value, not a name.
+        _value_symbols!(out, ex.args[1])
+        for i in ex.args[2:end]
+            i === :(:) || _is_endpoint_position(i) || _value_symbols!(out, i)
+        end
+        return nothing
+    end
     for a in ex.args
         ex.head === :tuple && (a = _tuple_field_value(a))
         _value_symbols!(out, a)
@@ -9297,13 +9327,21 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     op isa Symbol || return _sfail("$where has an anonymous call node")
     args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
     if op === :.* || op === :.+ || op ===:.-
-        if op === :.+ && length(args) == 1
+        if (op === :.+ || op === :.*) && length(args) == 1
             return _extract_composed_tree(pname, only(args), ctx, subs,
+                scalars, datas)
+        end
+        if (op === :.+ || op === :.*) && length(args) > 2
+            # `.+(a, b, c)` broadcasts Julia's n-ary `+`, which folds
+            # left: `(a .+ b) .+ c` elementwise (likewise `.*`). BRM
+            # emits Julia's n-ary `a + b + c` this way.
+            return _extract_composed_tree(pname, Expr(:call, op,
+                Expr(:call, op, args[1:end-1]...), args[end]), ctx, subs,
                 scalars, datas)
         end
         ok = op === :.- ? length(args) in (1, 2) : length(args) == 2
         ok || return _sfail("$where `$op` takes " *
-            (op === :.- ? "one or two operands" : "two operands"))
+            (op === :.- ? "one or two operands" : "at least one operand"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
             subs, scalars, datas) for a in args)...)
     elseif op in _COMPOSED_MORE_OPS
@@ -9647,6 +9685,11 @@ function _classify_summand(pname, core, sign::Int, ctx)
         # its group (`c[g]`) stays a factor below.
         return _extract_summand(pname, core, sign, ctx)
     end
+    # A slice keeping every row of a per-observation value (`P[:, 1]`,
+    # `(X * B)[:, 1]`) is an observation column, as its named form is.
+    head === :ref && length(core.args) >= 3 && core.args[2] === :(:) &&
+        _canon_shape(core, ctx) === :vector &&
+        return _extract_summand(pname, core, sign, ctx)
     head === :ref && return _classify_ref(pname, core, sign, ctx)
     head === :macrocall && _sfail("predictor $pname: macros do not lower " *
         "inside predictor expressions")
@@ -10838,10 +10881,12 @@ function _slice_prior_arg(what, head, a, dotted::Bool)
         _is_ref_call(a) && return a.args[2]
         _is_slice_iterator(a) && return a
         a isa Real && !(a isa Bool) && return a
+        per = _slice_elements_arg(a)
+        per === nothing || return per
         _sfail("$what: in the dotted `$head.(…)` every argument is shared " *
-            "(`Ref(x)`) or iterates slices (`eachrow(M)` / `eachcol(M)`), " *
-            "got $(repr(a)) — a bare array would broadcast over its " *
-            "elements, as in Julia")
+            "(`Ref(x)`), iterates slices (`eachrow(M)` / `eachcol(M)`) or " *
+            "lists one vector per slice (`[v1, v2, …]`), got $(repr(a)) — " *
+            "a bare array would broadcast over its elements, as in Julia")
     end
     _is_slice_iterator(a) && _sfail("$what: `$(repr(a))` gives one " *
         "argument per slice, which pairs slices only in a broadcast — " *
@@ -10850,6 +10895,24 @@ function _slice_prior_arg(what, head, a, dotted::Bool)
         "of a broadcast `$head.(…)`; an undotted `$head(…)` shares every " *
         "argument already")
     return a
+end
+
+# A vector literal of vector values in a dotted slice prior,
+# `D.([v1, v2, …])`: broadcasting iterates its elements, so slice `g` takes
+# `v_g`, exactly as `D.(eachcol(hcat(v1, v2, …)))` pairs them. Literal
+# vectors of numbers become that matrix's literal columns; other entries are
+# values whose lengths Julia checks. Numbers are not vectors (`nothing`).
+function _slice_elements_arg(a)
+    a isa Expr && a.head === :vect && !isempty(a.args) &&
+        !any(x -> x isa Real, a.args) || return nothing
+    lits = all(x -> x isa Expr && x.head === :vect &&
+        all(y -> y isa Real, x.args), a.args)
+    if lits && length(unique!([length(x.args) for x in a.args])) == 1
+        K = length(first(a.args).args)
+        return Expr(:call, :eachcol, Expr(:vcat,
+            (Expr(:row, (x.args[i] for x in a.args)...) for i in 1:K)...))
+    end
+    return Expr(:call, :eachcol, Expr(:call, GlobalRef(Base, :hcat), a.args...))
 end
 
 # A vector-valued argument (a mean, a concentration): never a scalar.

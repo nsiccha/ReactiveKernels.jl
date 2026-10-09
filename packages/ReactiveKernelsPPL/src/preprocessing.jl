@@ -274,6 +274,22 @@ function _ordinal_stage_idx(y::AbstractVector{<:Integer}, K::Integer)
     return out
 end
 
+# The values a prior argument of a two-axis elementwise array gives its
+# packed cells: a number is shared by every element, and an array of the
+# declared size gives each element its own value, read column-major as the
+# array packs (`B[a, b] .~ Normal.(M, s)` draws `B[i, j]` from
+# `Normal(M[i, j], s)`). A size known at binding is checked there; this
+# check covers values computed in the graph. The message is built out of
+# line, so the reshape itself stays inlinable.
+_array_prior_cells(a::Number, dims::Dims) = a
+@traceable function _array_prior_cells(a::AbstractArray, dims::Dims)
+    size(a) == dims || _array_prior_cells_mismatch(size(a), dims)
+    return vec(a)
+end
+@noinline _array_prior_cells_mismatch(size, dims) = throw(DimensionMismatch(
+    "a per-element prior argument of size $size does not match its array " *
+    "of size $dims"))
+
 # Gather observation values after ordinary scalar/singleton broadcasting.
 # Stage tables may repeat rows; one-entry operands still supply every lane,
 # including zero lanes for an empty response. This stays in the value graph.
