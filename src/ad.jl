@@ -126,7 +126,7 @@ _ad_restore_cotangent(point, cotangent) = cotangent
     end
     # Share the primal call boundary with externalized bound arrays: pass the
     # original operands directly to the existing generated model body.
-    _native_body_call_expr(F, :(call.native), :(call.ops), positional)
+    _native_body_call_expr(F, :(call.native), Any[:(call.ops), positional...])
 end
 
 function _ad_operation_slots!(used, node)
@@ -660,8 +660,8 @@ end
 
 # The trailing context is the owned AD cache tuple; the leading N - 1 restore
 # the inactive HAVE arguments around the active one, exactly as above.
-@generated function (call::_ADNonAllocatingKernelCall{I})(
-        active, contexts::Vararg{Any,N}) where {I,N}
+@generated function (call::_ADNonAllocatingKernelCall{I,F})(
+        active, contexts::Vararg{Any,N}) where {I,F,N}
     indices = _ad_selector_indices(I)
     input_count = N + length(indices) - 1
     all(index -> 1 <= index <= input_count, indices) || return :(throw(
@@ -679,8 +679,14 @@ end
             context_index += 1
         end
     end
-    :(call.f(call.ops, getfield(contexts, $N), call.cache_apply,
-             $(arguments...)))
+    # Enter the program without the RGF vararg wrapper: once its operands (the
+    # operation table, caches and driver plus every HAVE port) pass 32, the
+    # wrapper's one-tuple splat stays a dynamic `Core._apply_iterate`, and
+    # native Reverse rejects the constant HAVE arrays stored there beside the
+    # shadowed caches (`_native_body_call_expr`).
+    _native_body_call_expr(F, :(call.f),
+        Any[:(call.ops), :(getfield(contexts, $N)), :(call.cache_apply),
+            arguments...])
 end
 
 function _ad_active_index(kernel::_ADKernel, active::Symbol)

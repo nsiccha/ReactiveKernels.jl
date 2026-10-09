@@ -313,6 +313,24 @@ end
     Expr(:block, Expr(:meta, :noinline), fold)
 end
 
+# `Base.promote_op(f, T1, …, Tn)` for the types an emitted body computes: the
+# same result (`Union{}` when an argument type is `Union{}`, otherwise the
+# inferred return type over `Tuple{T1, …, Tn}`). Base forms that tuple type
+# through two splats (`promote_op(f, S...)`, `TupleOrBottom(tt...)`), which past
+# 32 types (`max_tuple_splat`) stay runtime `Core._apply_iterate` calls: a plate
+# cell with 33 or more operands then computed its element type on every call,
+# allocating about 900 B per plate call. Spelled out positionally, the tuple
+# type folds at compile time for any number of types.
+@inline @generated function _promote_op(f, types::Vararg{Type,N}) where {N}
+    arguments = Any[:(getfield(types, $index)) for index in 1:N]
+    bottom = foldr((argument, rest) -> :($argument === Union{} || $rest),
+                   arguments; init = false)
+    quote
+        $bottom && return Union{}
+        Base._return_type(f, Core.apply_type(Tuple, $(arguments...)))
+    end
+end
+
 function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     batch = _authored_plate_broadcast(Val(A), args...)
     marker = _authored_plate_marker(Val(A), args...)
@@ -542,7 +560,7 @@ function _scan_type_slots!(runtime_ops, runtime_recipes, op::_AuthoredScanOp)
 end
 
 # The static type of an inlined scan step's per-step output, as a chain of
-# `Base.promote_op` over the step's own operations: the type the first step's
+# `_promote_op` over the step's own operations: the type the first step's
 # output would have, without running it. The authored-plate element type uses
 # the same chain; unlike inferring the nested PreparedKernel as a whole, each
 # operation infers exactly inside the enclosing generated body. A step that is
@@ -561,7 +579,7 @@ function _authored_scan_step_output_type(step, input_types, offset;
     for (i, recipe) in enumerate(p.recipes)
         all(v -> haskey(types, canon_id(p.graph, v.id)), recipe.inputs) ||
             return nothing
-        T = Expr(:call, GlobalRef(Base, :promote_op), Expr(:ref, _OPS_ARG, offset + i),
+        T = Expr(:call, GlobalRef(@__MODULE__, :_promote_op), Expr(:ref, _OPS_ARG, offset + i),
                  (types[canon_id(p.graph, v.id)] for v in recipe.inputs)...)
         if length(recipe.outputs) == 1
             types[canon_id(p.graph, only(recipe.outputs).id)] = T
@@ -887,7 +905,7 @@ function _authored_scan_cell_statements(cell, args, positions, output, offset;
         locals[canon_id(inner.graph, value.id)] = result
         input_types = Any[types[canon_id(inner.graph, v.id)] for v in recipe.inputs]
         types[canon_id(inner.graph, value.id)] = Expr(:call,
-            GlobalRef(Base, :promote_op), Expr(:ref, _OPS_ARG, offset + i), input_types...)
+            GlobalRef(@__MODULE__, :_promote_op), Expr(:ref, _OPS_ARG, offset + i), input_types...)
     end
     push!(dynamic, :($output = $(locals[canon_id(inner.graph, only(inner.want).id)])))
     invariant, dynamic, types[canon_id(inner.graph, only(inner.want).id)]
@@ -1129,7 +1147,7 @@ function _scan_hoisted_records!(records, scan_recipe::Recipe, callargs, hoisted,
                           offset = offset + index - 1, hoisted = true))
         hoisted_of[cid(output)] = buffer
         slots[offset + index] = buffer
-        types[cid(output)] = Expr(:call, GlobalRef(Base, :promote_op),
+        types[cid(output)] = Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
             Expr(:ref, _OPS_ARG, offset + index),
             (types[cid(v)] for v in sp.recipes[index].inputs)...)
         push!(hoisted_types, types[cid(output)])
@@ -1922,7 +1940,7 @@ function _body_types!(runtime_ops, runtime_recipes, p, ops, recipes, input_types
                     recipe.op.kernel, _scan_step_input_types(recipe.op, args), base)
             _scan_result_type_expr(recipe.op, args, element)
         else
-            Expr(:call, GlobalRef(Base, :promote_op),
+            Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
                  Expr(:ref, _OPS_ARG, offset + i), args...)
         end
         if length(recipe.outputs) == 1
@@ -2185,7 +2203,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # Bind the concrete pointwise element type by propagating inferred types
     # through the plate body's scalar recipe DAG. Each individual `__ops__`
     # recipe op is an ordinary callable (a `_KernelSourceOp`, not the opaque
-    # nested `PreparedKernel`), so `Base.promote_op` over it const-folds inside
+    # nested `PreparedKernel`), so `_promote_op` over it const-folds inside
     # the generated function from the actual per-coordinate argument types Julia
     # infers here — the `Vector{Int}`-axis element / atomic scalar types — rather
     # than the plan-level `Any`. Seeding `promote_op` over the whole plate body
@@ -2233,7 +2251,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
             end
         end
         plate_type_exprs[output_cid] = scan_type === nothing ?
-            Expr(:call, GlobalRef(Base, :promote_op),
+            Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...) : scan_type
     end
     inferred_eltype = nested === nothing ?
@@ -3873,23 +3891,27 @@ struct _ExternalizedBoundArrayCall{F,O,I,H,C}
     ops::O
 end
 
-# Build a call to the existing body without the RGF vararg wrapper, which
-# packs all operands into one tuple. Keeping readonly structured operands
-# beside live storage in that temporary obscures their activity. This changes
-# only the call boundary, not the generated model body or its operands.
-function _native_body_call_expr(::Type{F}, f, ops, args) where {F}
+# Build a call to the existing body, with `args` its complete positional
+# operands, without the RGF vararg wrapper, which packs all operands into one
+# tuple. Keeping readonly structured operands beside live storage in that
+# temporary obscures their activity. Past 32 operands (`max_tuple_splat`) the
+# wrapper's splat also stays a dynamic `Core._apply_iterate` over a heap tuple,
+# which allocates on every call and which native Reverse rejects when constant
+# arrays share it with active storage. This changes only the call boundary, not
+# the generated model body or its operands.
+function _native_body_call_expr(::Type{F}, f, args) where {F}
     if F <: RuntimeGeneratedFunctions.RuntimeGeneratedFunction
         return :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-            $f, $ops, $(args...)))
+            $f, $(args...)))
     elseif F <: _PrecompileWarmFunction
         # Preserve latest-world execution while building a consumer image;
         # after loading it, enter the wrapped generated body directly.
         direct = :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
-            getfield($f, :f), $ops, $(args...)))
+            getfield($f, :f), $(args...)))
         return :(ccall(:jl_generating_output, Cint, ()) == 0 ?
-                 $direct : $f($ops, $(args...)))
+                 $direct : $f($(args...)))
     end
-    :($f($ops, $(args...)))
+    :($f($(args...)))
 end
 
 # Enter the existing generated body with positional operands. Together with
@@ -3897,7 +3919,7 @@ end
 # temporary aggregate that ordinary Reverse otherwise treats as writable.
 @inline @generated function _native_array_body_call(f::F, ops, args::A) where {F,A<:Tuple}
     forwarded = [:(getfield(args, $index)) for index in 1:fieldcount(A)]
-    _native_body_call_expr(F, :f, :ops, forwarded)
+    _native_body_call_expr(F, :f, Any[:ops, forwarded...])
 end
 
 @generated function (call::_ExternalizedBoundArrayCall{F,O,I,H,C})(
@@ -3911,7 +3933,7 @@ end
     if H
         forwarded = Any[:(getfield(args,$index)) for index in 1:N]
         return _native_body_call_expr(
-            F, :(getfield(call,:f)), :(getfield(call,:ops)), forwarded)
+            F, :(getfield(call,:f)), Any[:(getfield(call,:ops)), forwarded...])
     end
     replacements = Dict(index => slot for (slot, index) in enumerate(I))
     operations = Any[]
@@ -3928,7 +3950,7 @@ end
     public_args = Any[
         :(getfield(args, $index)) for index in 1:public_count]
     _native_body_call_expr(
-        F, :(getfield(call, :f)), Expr(:tuple, operations...), public_args)
+        F, :(getfield(call, :f)), Any[Expr(:tuple, operations...), public_args...])
 end
 
 """
@@ -4675,12 +4697,14 @@ NonAllocatingKernel{S}(f::F, ops::O, caches::C, cache_apply::A, inputs::IN,
 
 # Emit positional arguments explicitly: splatting the captured `args` tuple
 # into the RGF call allocates (one tuple box per call) even though the emitted
-# program itself is allocation-free. Keep the public call nongenerated so
-# reflection over it continues to accept abstract argument types.
+# program itself is allocation-free. The body is entered without the RGF vararg
+# wrapper, whose own splat allocates per call past 32 HAVE ports
+# (`_native_body_call_expr`). Keep the public call nongenerated so reflection
+# over it continues to accept abstract argument types.
 @generated function _nonallocating_call(
-        k::NonAllocatingKernel, args::A, ::Val{N}) where {A<:Tuple,N}
-    positional = [:(getfield(args, $index)) for index in 1:N]
-    :(k.f($(positional...)))
+        k::NonAllocatingKernel{F}, args::A, ::Val{N}) where {F,A<:Tuple,N}
+    positional = Any[:(getfield(args, $index)) for index in 1:N]
+    _native_body_call_expr(F, :(k.f), positional)
 end
 
 @inline function (k::NonAllocatingKernel{F,O,C,A,IN,OUT,S})(
@@ -4961,7 +4985,7 @@ function _readable_expr(node, recipes)
     # A BARE operation slot — `__ops__[k]` passed as a value rather than invoked
     # — renders as its readable operation name, not the raw index. The authored
     # plate lowering does this when it seeds the pointwise element type with
-    # `Base.promote_op(__ops__[k], …)`; without this branch the reference would
+    # `_promote_op(__ops__[k], …)`; without this branch the reference would
     # survive the readable rewrite as `__ops__[\d+]`.
     let slot = _operation_slot(node)
         slot !== nothing && 1 <= slot <= length(recipes) &&
