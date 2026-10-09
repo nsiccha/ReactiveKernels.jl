@@ -9548,10 +9548,13 @@ _inlined_computed_defs(ctx, canonmap, data) = Set{Symbol}(nm for nm in ctx.inlin
         _computed_value_def(nm, ctx, canonmap, data))
 
 # A module call's model-level result, written inline or read through a
-# shared definition that stays named for its readers (the definitions
-# below it are no longer inlined either).
+# definition that stays named for its readers (the definitions below it
+# are no longer inlined either). A definition still named in an inlined
+# expression stayed named: shared (`_inlined_computed_defs`) or indexed in
+# place (`bt = f(x, a); path = bt[1]`, `_inline_structure_expr`). Either
+# way `bt[1]` is an element of an opaque result, of unknown shape.
 _reads_module_value(ex, ctx) = _contains_module_call(ex) ||
-    any(s -> s in ctx.shared_defs && _def_reads_module(s, ctx),
+    any(s -> haskey(ctx.detmap, s) && _def_reads_module(s, ctx),
         _value_symbols(ex))
 _def_reads_module(s, ctx) = _contains_module_call(ctx.detmap[s]) ||
     any(t -> haskey(ctx.detmap, t) && _def_reads_module(t, ctx),

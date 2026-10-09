@@ -106,6 +106,10 @@ ReactiveKernels.@kernel exp_value(x_) = begin
     x = exp.(x_)
 end
 column_gather(draws, index, margin) = draws[index, margin]
+# Tuple results read by position: a per-observation path beside its total,
+# parameter-dependent and data-only.
+path_and_total(x, b) = (cumsum(b .* x), sum(b .* x))
+total_and_double(x) = (sum(x), 2 .* x)
 end
 const _FV = FunctionsAsValuesModels
 
@@ -767,6 +771,76 @@ _fv_assigns(ex, sym::Symbol) = ex isa Expr && (
         @test val ≈ Base.invokelatest(kern, u)
         @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
             rtol = 1e-5, atol = 1e-7)
+    end
+end
+
+@testset "functions as values: a positional read of a call's result keeps its shape" begin
+    # `pr[1]` of `pr = f(x, b)` is whatever `f` returns at that position —
+    # here a per-observation vector or a scalar total — so it is a
+    # model-level value of unknown shape, never a proven scalar offset.
+    # Named, inline and in-response spellings lower alike (snag
+    # `inline-gather-br-28d41671`: every one failed `bind_data` with
+    # "term references missing column _rkppl_leaf_1").
+    cols = _fv_cols()
+    x = cols[:x]
+    y = cols[:y]
+    path(b) = cumsum(b .* x)
+    total(b) = sum(b .* x)
+    cases = (
+        (quote
+            b ~ Normal(0, 1); s ~ Exponential(1.0)
+            pr = path_and_total(x, b)
+            loc = pr[1]
+            y .~ Normal.(loc, s)
+        end, th -> sum(logpdf.(Normal.(path(th.b), th.s), y))),
+        (quote
+            b ~ Normal(0, 1); s ~ Exponential(1.0)
+            loc = path_and_total(x, b)[1]
+            y .~ Normal.(loc, s)
+        end, th -> sum(logpdf.(Normal.(path(th.b), th.s), y))),
+        (quote
+            b ~ Normal(0, 1); s ~ Exponential(1.0)
+            y .~ Normal.(path_and_total(x, b)[1], s)
+        end, th -> sum(logpdf.(Normal.(path(th.b), th.s), y))),
+        (quote
+            b ~ Normal(0, 1); s ~ Exponential(1.0)
+            pr = path_and_total(x, b)
+            m = pr[2]
+            y .~ Normal.(m, s)
+        end, th -> sum(logpdf.(Normal.(total(th.b), th.s), y))),
+        (quote
+            a ~ Normal(0, 1); b ~ Normal(0, 1)
+            pr = path_and_total(x, b)
+            mu = a .+ pr[1]
+            y .~ Normal.(mu, exp(pr[2]))
+        end, th -> sum(logpdf.(Normal.(th.a .+ path(th.b), exp(total(th.b))), y))),
+        (quote
+            a ~ Normal(0, 1); s ~ Exponential(1.0)
+            d = total_and_double(x)
+            mu = a .+ d[2]
+            y .~ Normal.(mu, s)
+        end, th -> sum(logpdf.(Normal.(th.a .+ 2 .* x, th.s), y))),
+        (quote
+            a ~ Normal(0, 1); s ~ Exponential(1.0)
+            d = total_and_double(x)
+            mu = d[1] .* a
+            y .~ Normal.(mu, s)
+        end, th -> sum(logpdf.(Normal.(sum(x) * th.a, th.s), y))),
+    )
+    for (ast, loglik) in cases
+        original = deepcopy(cols)
+        _, bound, built = _fv_build(ast, cols)
+        u = collect(range(-0.3, 0.4; length = built.layout.total))
+        th = ReactiveKernelsPPL.constrain(built.layout, u)
+        @test _fv_value(built, bound, :likelihood, u) ≈ loglik(th)
+        kern = prepare_query(built, bound, :sampler)
+        q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
+        val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+            q.ad, similar(u), u)
+        @test val ≈ Base.invokelatest(kern, u)
+        @test isapprox(grad, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
+        @test cols == original
     end
 end
 
