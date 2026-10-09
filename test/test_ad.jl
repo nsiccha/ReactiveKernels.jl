@@ -567,6 +567,43 @@ _test_ad_backend_value_gradient_allocated(prepared, gradient, q, data) =
         @test rk_allocated <= backend_allocated
     end
 
+    @testset "authored plate AD: captured enclosing parameters" begin
+        # A cell's captured names enter whole as atomic operands (snag
+        # rk-plate-body-ca-091ef037). Reverse mode differentiates a captured
+        # active vector and a captured derived scalar exactly as the explicit
+        # `Ref`/threaded spelling.
+        @kernel captured_objective(q::Vector{Float64},
+                                   data::Vector{Float64}) = begin
+            scale::Float64 = q[1]
+            pointwise = plate(eachindex(data), data) do i, di
+                q[i + 1] * di * scale
+            end
+            objective::Float64 = sum(pointwise)
+        end
+        @kernel threaded_objective(q::Vector{Float64},
+                                   data::Vector{Float64}) = begin
+            scale::Float64 = q[1]
+            pointwise = plate(eachindex(data), Ref(q), data,
+                              scale) do i, qq, di, sc
+                qq[i + 1] * di * sc
+            end
+            objective::Float64 = sum(pointwise)
+        end
+
+        q = [0.5, 0.2, -0.4, 0.7]
+        data = [1.5, -0.5, 0.25]
+        expected = vcat(sum(q[2:end] .* data), q[1] .* data)
+        for spec in (captured_objective, threaded_objective)
+            kernel = prepare(spec; have = (:q, :data), want = :objective)
+            prepared = prepare_ad(
+                kernel, TEST_AD_BACKEND, q, data; active = :q)
+            gradient = similar(q)
+            value, _ = ad_value_and_gradient!(prepared, gradient, q, data)
+            @test value ≈ q[1] * sum(q[2:end] .* data)
+            @test gradient ≈ expected
+        end
+    end
+
     @testset "authored plate AD: Int data-axis in a capture-recapture plate" begin
         # A likelihood plate whose axis is a data-only `Vector{Int}` sitting
         # beside a `Vector{Float64}` data array and several parameter-derived

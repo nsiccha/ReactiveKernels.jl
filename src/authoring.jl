@@ -1862,6 +1862,33 @@ function _kernel_plate_cell_locals(body)
     names
 end
 
+# Every name an `@kernel` block binds: its signature inputs, declared inputs and
+# recipe outputs. Statement order does not matter, because forward intermediates
+# are ordinary graph edges. These are the enclosing locals an authored plate cell
+# may capture. Pass 1 of `_kernel_expand` still validates each statement; this
+# scan only collects names and stops at `return`, as pass 1 does.
+function _kernel_enclosing_ports(statements, signature_inputs)
+    names = Set{Symbol}(Symbol(name) for (name, _) in signature_inputs)
+    for raw in statements
+        _kernel_is_line(raw) && continue
+        raw isa Expr && raw.head === :return && break
+        if raw isa Expr && raw.head === :macrocall && !isempty(raw.args) &&
+           raw.args[1] === Symbol("@recipe")
+            parts = Any[a for a in raw.args[3:end] if !_kernel_is_line(a)]
+            isempty(parts) && continue
+            raw = last(parts)
+        end
+        target = raw isa Expr && raw.head === :(=) ? raw.args[1] : raw
+        items = target isa Expr && target.head === :tuple ? target.args : Any[target]
+        for item in items
+            item isa Expr && item.head === :(::) && length(item.args) == 2 &&
+                (item = item.args[1])
+            item isa Symbol && push!(names, item)
+        end
+    end
+    names
+end
+
 function _kernel_authored_plate_expr(rhs, mod,
                                      caller_locals = Set{Symbol}();
                                      endpoint_cache =
@@ -1910,15 +1937,20 @@ function _kernel_authored_plate_expr(rhs, mod,
     length(unique(formals)) == length(formals) || throw(ArgumentError(
         "plate do-block argument names must be unique"))
 
-    # Explicit caller locals that the scalar cell reads are automatically threaded
-    # as scalar plate arguments. This matches the broadcast model: a caller vector
-    # port named directly is a batched axis, while an unthreaded scalar is shared.
+    # A caller name the cell reads without threading it is a closure capture: the
+    # cell sees the whole value, exactly as a Julia closure does. It enters as an
+    # atomic operand, like an explicit `Ref(name)`, so only the plate's explicit
+    # non-`Ref` arguments define the zipped axes. A captured scalar is shared, as
+    # before; a captured array, tuple or struct is no longer broadcast per cell.
     caller_free = filter!(
         name -> name in caller_locals && !(name in formals),
         _kernel_free_ports(scalar_body, Set(caller_locals)),
     )
-    append!(formals, caller_free)
-    append!(arguments, caller_free)
+    for name in caller_free
+        push!(formals, name)
+        push!(arguments, name)
+        push!(atomic, length(arguments))
+    end
 
     nested_specs = Dict{Symbol,Any}()
     local_types = Dict{Symbol,Any}()
@@ -3722,6 +3754,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     raw_statements = block isa Expr && block.head === :block ? block.args : Any[block]
     statements = _kernel_lift_plate_expressions(
         _kernel_normalize_return_expressions(raw_statements), mod)
+    enclosing_ports = _kernel_enclosing_ports(statements, signature_inputs)
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
     order_var = gensym(:kernel_port_order)
@@ -3797,8 +3830,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 push!(outputs, (name, type_expr))
             end
             plate_expr = _kernel_authored_plate_expr(
-                rhs, mod, Set(Symbol(name) for (name, _) in signature_inputs);
-                endpoint_cache = endpoint_cache)
+                rhs, mod, enclosing_ports; endpoint_cache = endpoint_cache)
             plate_expr === nothing &&
                 (plate_expr = _kernel_authored_scan_expr(
                     rhs, mod; endpoint_cache = endpoint_cache))

@@ -62,14 +62,27 @@ same broadcast rules.
 
 ### Plate-cell scope
 
-Inside a `plate(... do` cell, the threaded arguments and names assigned in the
-cell are local. Other `@kernel` signature ports are intentionally not implicit
-globals: thread an explicit scalar through the plate when every cell needs it
-(that scalar is shared), or an array when its axis should zip. For example,
-`plate(y, mu, scale) do observed, mean, scale ... end` is the supported spelling
-for an unthreaded `scale` caller port. RK now detects an unthreaded signature
-scalar used by the cell and threads it automatically; local names assigned
-outside the plate remain outside its scope.
+A `plate(... do` cell reads enclosing names the way a Julia closure does. The
+plate's explicit non-`Ref` arguments are the only zipped axes. Any other
+enclosing name the cell reads is captured whole as an atomic operand, exactly
+as if it had been passed as `Ref(name)`. This covers `@kernel` signature ports,
+names assigned earlier in the kernel body and, inside a nested plate, the outer
+cell's arguments and locals. A captured scalar is shared by every cell. A
+captured array, tuple or struct is the whole value, never its per-cell element:
+
+```julia
+@kernel shifted_sum(x, d) = begin
+    shifted = x .+ 1.0
+    cells = plate(eachindex(d), d) do s, dd
+        shifted[s] + dd          # same as plate(eachindex(d), Ref(shifted), d)
+    end
+    return cells
+end
+```
+
+Pass an array as an explicit plate argument when its axis should zip, as in
+`plate(y, mu) do observed, mean ... end`. Names assigned inside the cell are
+cell-local.
 
 Subkernel and endpoint calls accept ordinary `f(name = value)` and
 `f(; name = value)` spellings. They normalize to the same graph.
