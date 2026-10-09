@@ -1830,6 +1830,8 @@ function _shape_of_expr(ex, data, detmap, memo, active,
         base = ex.args[1]
         base in data && length(ex.args) == 2 &&
             _literal_row_range(ex.args[2]) && return :vector
+        slice = _observation_slice_shape(ex, data, detmap, memo, active, env)
+        slice === nothing || return slice
         _is_array_value_ref(ex, data, detmap, memo, active, env) &&
             return _array_ref_shape(ex, data, detmap, memo, active, env)
         _is_gather(ex, data, detmap, env) || return :scalar
@@ -1878,6 +1880,23 @@ function _elementwise_shape(argshapes)
     :vector in argshapes && return :vector
     :array in argshapes && return :array
     return :scalar
+end
+
+# `A[:, j]` over a value whose rows are the observations (a bound data
+# matrix, a product `X * B` of a data matrix and a declared or returned
+# coefficient matrix) keeps that axis, as in Julia: the leading `:`
+# selects every row. The other indices are literal positions or `:`, so
+# `P[:, 1]` is one value per observation and `P[:, :]` stays a matrix.
+function _observation_slice_shape(ex::Expr, data, detmap, memo, active, env)
+    base = ex.args[1]
+    base isa Union{Symbol,Expr} && length(ex.args) >= 3 &&
+        ex.args[2] === :(:) || return nothing
+    rest = ex.args[3:end]
+    all(_is_position, rest) || return nothing
+    _shape_of(base, data, detmap, memo, active, env) === :vector ||
+        return nothing
+    _obs_axis(base, data, detmap, memo, active, env) || return nothing
+    return any(i -> i === :(:), rest) ? :matrix : :vector
 end
 
 # A read `A[...]` of an array value: a declared array, an array-valued
@@ -1952,6 +1971,8 @@ function _obs_axis(ex, data, detmap, memo, active, env)
         return any(a -> _obs_axis(a, data, detmap, memo, active, env),
             ex.args[2].args)
     elseif ex.head === :ref
+        _observation_slice_shape(ex, data, detmap, memo, active, env) ===
+            nothing || return true
         # A gather from an array value follows its observation index on
         # either axis, including definitions such as `b = z * M`.
         array_base = _is_array_value_ref(ex, data, detmap, memo, active, env)
@@ -2082,32 +2103,51 @@ _is_plain_comparison(fn::Symbol) =
     fn === :< || fn === :> || fn === :(==) || fn === :(!=) ||
     fn === :(<=) || fn === :(>=)
 
-function _canonical_expr(ex, data, detmap, detshape, env, where)
+# `strict = false` (broadcast arguments, response bounds) only performs the
+# Julia-valid dotted rewrites below: a shape this analysis cannot admit is
+# left exactly as written for its own downstream check, never refused here.
+function _canonical_expr(ex, data, detmap, detshape, env, where;
+        strict::Bool = true)
     ex isa Symbol && return ex
     ex isa Expr || return ex
-    ex.head === :parameters && _sfail("$where takes positional " *
-                                      "arguments only (no keywords)")
+    if ex.head === :parameters
+        strict || return ex
+        _sfail("$where takes positional arguments only (no keywords)")
+    end
+    if _is_dotted_call(ex)
+        # Julia evaluates each broadcast argument whole before
+        # broadcasting, so `exp.(-cl .* t)` reads `-cl` exactly as the
+        # definition `nc = -cl` does: its arguments take the same dotted
+        # rewrites. Keywords pass through untouched.
+        args = Any[Meta.isexpr(a, (:parameters, :kw)) ? a :
+            _canonical_expr(a, data, detmap, detshape, env, where;
+                strict = false)
+            for a in ex.args[2].args]
+        return Expr(:., ex.args[1], Expr(:tuple, args...))
+    end
     ex.head === :call || return ex
     isempty(ex.args) && return ex
     fn = ex.args[1]
     fn isa Symbol || return ex
     fn in REDUCTION_FNS && return ex  # args validated downstream
     fn === :_ppl_plate_column && return ex  # an RK plate (array cells)
-    args = Any[_canonical_expr(a, data, detmap, detshape, env, where)
+    args = Any[_canonical_expr(a, data, detmap, detshape, env, where; strict)
         for a in ex.args[2:end]]
     argshapes = [_canon_shape(a, data, detmap, detshape, env) for a in args]
     if :invalid in argshapes
         return Expr(ex.head, ex.args[1], args...)  # broken ref: raises at its own def
     end
-    _shape_of_call(fn, argshapes) === :invalid &&
+    if _shape_of_call(fn, argshapes) === :invalid
+        strict || return Expr(ex.head, ex.args[1], args...)
         _sfail(_julia_mismatch_msg(fn, where, ex, argshapes))
+    end
     if fn === :* && length(args) > 2 && :matrix ∉ argshapes &&
             :array ∉ argshapes && :vector in argshapes
         # Keep the scalar products in Julia order, then normalize only
         # the scalar-vector multiplication to its broadcast equivalent.
         return _canonical_expr(Expr(:call, :*,
             Expr(:call, :*, args[1:end-1]...), args[end]), data, detmap,
-            detshape, env, where)
+            detshape, env, where; strict)
     end
     if fn in (:+, :-) && length(args) >= 2 && all(==(:vector), argshapes)
         return Expr(:call, fn === :+ ? :.+ : :.-, args...)
@@ -3680,6 +3720,13 @@ function _expand_plates(args, data::Set{Symbol};
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
+    # Cell locals belong to their plate, as a loop body's locals do in
+    # Julia. A local name another plate already used is respelled `m#k`;
+    # whole-column evaluation splices its locals at model level, so a
+    # model statement reading one is refused instead of reading the cell.
+    taken = union(data, _expr_names(Expr(:block, args...)))
+    plate_locals = Set{Symbol}()
+    spliced = Dict{Symbol,Tuple{Symbol,Int}}()
     line = 0
     for arg in args
         if arg isa LineNumberNode
@@ -3694,10 +3741,13 @@ function _expand_plates(args, data::Set{Symbol};
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
+            arg, locals = _scope_plate_locals(arg, plate_locals, taken)
             stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
                 push!(expanded, st)
+                Meta.isexpr(st, :(=), 2) && haskey(locals, st.args[1]) &&
+                    (spliced[st.args[1]] = (locals[st.args[1]], pl))
             end
             append!(ctx, stx)
             append!(params, prm)
@@ -3705,7 +3755,71 @@ function _expand_plates(args, data::Set{Symbol};
         end
         push!(expanded, arg)
     end
+    isempty(spliced) && return expanded, ctx, params
+    for arg in args
+        arg isa Expr || continue
+        Meta.isexpr(arg, :macrocall) && !isempty(arg.args) &&
+            arg.args[1] === Symbol("@plate") && continue
+        defined = Meta.isexpr(arg, :(=), 2) ? arg.args[1] : nothing
+        for name in _value_symbols(arg)
+            name === defined && continue
+            haskey(spliced, name) || continue
+            authored, pl = spliced[name]
+            at = pl > 0 ? " at line $pl" : ""
+            _sfail("`$authored` is a cell local of the `@plate`$at; cell " *
+                   "locals stay in their cell — assign it to an indexed " *
+                   "output of the plate to read its values outside")
+        end
+    end
     return expanded, ctx, params
+end
+
+# Bare cell locals (`m = ...` inside the loop) of one plate, respelled
+# `m#k` when an earlier plate already used the name. Returns the plate
+# and its locals' current spelling => authored name.
+function _scope_plate_locals(st::Expr, plate_locals::Set{Symbol}, taken::Set{Symbol})
+    loop = st.args[3]
+    Meta.isexpr(loop, :for) && Meta.isexpr(loop.args[2], :block) ||
+        return st, Dict{Symbol,Symbol}()
+    names = Symbol[]
+    for c in loop.args[2].args
+        Meta.isexpr(c, :(=), 2) && c.args[1] isa Symbol &&
+            !(c.args[1] in names) && push!(names, c.args[1])
+    end
+    locals = Dict{Symbol,Symbol}()
+    body = loop.args[2]
+    for name in names
+        spelling = name
+        if name in plate_locals
+            k = 2
+            while Symbol(name, "#", k) in taken
+                k += 1
+            end
+            spelling = Symbol(name, "#", k)
+            body = _respell_value(body, name, spelling)
+        end
+        push!(taken, spelling)
+        push!(plate_locals, name)
+        locals[spelling] = name
+    end
+    body === loop.args[2] && return st, locals
+    return Expr(st.head, st.args[1:2]..., Expr(:for, loop.args[1], body)), locals
+end
+
+# Rename a value symbol (never a call head, keyword name or field name).
+_respell_value(ex, from::Symbol, to::Symbol) = ex === from ? to : ex
+function _respell_value(ex::Expr, from::Symbol, to::Symbol)
+    if ex.head === :call && !isempty(ex.args)
+        return Expr(:call, ex.args[1],
+            (_respell_value(a, from, to) for a in ex.args[2:end])...)
+    elseif ex.head === :kw && length(ex.args) == 2
+        return Expr(:kw, ex.args[1], _respell_value(ex.args[2], from, to))
+    elseif ex.head === :. && length(ex.args) == 2 && !(Meta.isexpr(ex.args[2], :tuple))
+        return Expr(:., _respell_value(ex.args[1], from, to), ex.args[2])
+    elseif ex.head === :. && length(ex.args) == 2
+        return Expr(:., ex.args[1], _respell_value(ex.args[2], from, to))
+    end
+    return Expr(ex.head, (_respell_value(a, from, to) for a in ex.args)...)
 end
 
 function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
@@ -3758,6 +3872,9 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
+    _plate_needs_retained_cells(cells, ivar) &&
+        return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
+            broadcasts)
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
@@ -3799,9 +3916,14 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             ex.args[2] === ivar && return ex.args[1]
         ex isa Expr ? Expr(ex.head, map(localread, ex.args)...) : ex
     end
+    # Gathers from data and declared arrays index at `i` or through an
+    # integer data column. Indexing into a per-index value or a cell local
+    # (`t[i][k[i]]`, `p[sel]`) is ordinary Julia inside the retained cell.
     function checkrefs(ex)
         ex isa Expr || return
-        if ex.head === :ref && _expr_has_sym(ex, ivar)
+        base = ex.head === :ref ? ex.args[1] : nothing
+        if ex.head === :ref && _expr_has_sym(ex, ivar) && !(base isa Expr) &&
+                !any(l -> first(l) === base, locals)
             for index in ex.args[2:end]
                 index === ivar && continue
                 if Meta.isexpr(index, :ref, 2) && index.args[2] === ivar
@@ -3864,6 +3986,56 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             ivar, rkind, line, data, plate_defs, ctx, params, pidx))
     end
     return out, ctx, params
+end
+
+# Whole-column evaluation (`_desugar_cell`) strips `[i]` and broadcasts each
+# cell over whole columns. That equals the Julia loop only while every
+# per-index value is a scalar. A definition cell that may hold an array per
+# index is evaluated as retained RK plate cells instead, as plates with
+# observations are: an authored broadcast, indexing or a reduction applied
+# to a per-index value, or a module function or kernel called on one.
+function _plate_needs_retained_cells(cells, ivar::Symbol)
+    perlocals = Set{Symbol}()
+    for c in cells
+        Meta.isexpr(c, :(=), 2) || continue
+        lhs, rhs = c.args
+        _cell_reads_index(rhs, ivar, perlocals) || continue
+        lhs isa Symbol && push!(perlocals, lhs)
+        _retained_cell_expr(rhs, ivar, perlocals) && return true
+    end
+    return false
+end
+
+# A per-index value: a read at the loop index (`x[i]`, `v[g[i]]`, `t[i][k]`)
+# or a cell local computed from one.
+_cell_reads_index(ex, ivar, perlocals) = ex isa Symbol && ex in perlocals
+function _cell_reads_index(ex::Expr, ivar, perlocals)
+    ex.head === :ref && _expr_has_sym(ex, ivar) && return true
+    start = ex.head === :call || (ex.head === :. && length(ex.args) == 2) ? 2 : 1
+    ex.head === :kw && (start = 2)
+    return any(a -> _cell_reads_index(a, ivar, perlocals), ex.args[start:end])
+end
+
+_retained_cell_expr(ex, ivar, perlocals) = false
+function _retained_cell_expr(ex::Expr, ivar, perlocals)
+    per(a) = _cell_reads_index(a, ivar, perlocals)
+    if ex.head === :ref
+        base = ex.args[1]
+        (base isa Symbol ? base in perlocals : per(base)) && return true
+    elseif ex.head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        any(per, ex.args[2].args) && return true
+    elseif ex.head === :call && !isempty(ex.args)
+        f = ex.args[1]
+        args = ex.args[2:end]
+        if any(per, args)
+            f isa Symbol && startswith(string(f), ".") && return true
+            f isa Symbol && f in REDUCTION_FNS && return true
+            f isa Symbol && (_builtin_value_head(f) || Base.isoperator(f) ||
+                _cell_object_call(f)) || return true
+        end
+    end
+    return any(a -> _retained_cell_expr(a, ivar, perlocals), ex.args)
 end
 
 # Bases of the `v[i]` reads in a cell expression, i.e. its per-index operands.
@@ -6404,6 +6576,15 @@ function _value_symbols!(out::Set{Symbol}, ex)
         end
         return nothing
     end
+    if ex.head === :ref && !isempty(ex.args)
+        # A whole axis (`P[:, 1]`) or an endpoint (`P[:, end]`) is a
+        # position of the indexed value, not a name.
+        _value_symbols!(out, ex.args[1])
+        for i in ex.args[2:end]
+            i === :(:) || _is_endpoint_position(i) || _value_symbols!(out, i)
+        end
+        return nothing
+    end
     for a in ex.args
         ex.head === :tuple && (a = _tuple_field_value(a))
         _value_symbols!(out, a)
@@ -7518,6 +7699,11 @@ function _bound(lhs, b, side::Symbol, ctx)
     b isa Symbol && (b in ctx.data || b in ctx.prior_names ||
         haskey(ctx.detmap, b)) && return b
     if b isa Expr
+        # A bound expression reads like the definition it could be named
+        # (`lo = -(t .+ 1)`): Julia-valid undotted vector math takes the
+        # same canonical dotted form.
+        b = _canonical_expr(b, ctx.data, ctx.detmap, ctx.detshape,
+            ctx.shape_env, "response $lhs $side bound"; strict = false)
         shape = _shape_of(b, ctx.data, ctx.detmap, copy(ctx.detshape),
             Set{Symbol}(), ctx.shape_env)
         return shape === :scalar ? _composed_scalar_leaf!(lhs, b, ctx, Symbol[]) :
@@ -9482,6 +9668,11 @@ function _classify_summand(pname, core, sign::Int, ctx)
         # its group (`c[g]`) stays a factor below.
         return _extract_summand(pname, core, sign, ctx)
     end
+    # A slice keeping every row of a per-observation value (`P[:, 1]`,
+    # `(X * B)[:, 1]`) is an observation column, as its named form is.
+    head === :ref && length(core.args) >= 3 && core.args[2] === :(:) &&
+        _canon_shape(core, ctx) === :vector &&
+        return _extract_summand(pname, core, sign, ctx)
     head === :ref && return _classify_ref(pname, core, sign, ctx)
     head === :macrocall && _sfail("predictor $pname: macros do not lower " *
         "inside predictor expressions")

@@ -81,7 +81,9 @@ a port (`model.f`, `model.x`, `model.a`, `model.out`). With no explicit
 can pick different defaults without hiding any port. You may refer to a value
 before the line that defines it, a tuple assignment is one recipe with several
 outputs, and `@recipe (cost = ..., cse_key = ...)` sets a recipe's cost and
-reuse hints without dropping to the lower-level graph API.
+reuse hints without dropping to the lower-level graph API. Tuple assignments
+destructure as in Julia: `(a, b) = t` binds the leading elements of a longer
+`t`, and `(a,) = t` (or `a, = t`) binds the first element, not `t` itself.
 
 Trailing positional defaults and fixed keyword arguments follow ordinary Julia
 call syntax. A default is evaluated only when you omit that argument, may refer
@@ -161,8 +163,11 @@ shares `magnitude` and `tail`. The generated kernel contains no nested call.
 
 Nested graph calls currently take all default HAVE boundary ports positionally
 (supply optional positional values explicitly) and require exact declared types
-at the outer input and output ports. A destructuring assignment names the nested
-output boundary exactly: `(a, b) = child(x)`, never a shorter `(a,) = child(x)`.
+at the outer input and output ports. A destructuring assignment binds the nested
+outputs in order, `(a, b) = child(x)`; as in Julia, a shorter `(a,) = child(x)`
+binds the leading outputs and leaves the rest prunable, and a longer one is
+refused. A single-output child returns its one value, so `(a,) = child(x)` binds
+that value's first element.
 A child with several outputs may instead be bound to one name, `t = child(x)`,
 or used inside a larger expression, `child(x)[1]`; that value is the tuple the
 runtime call `child(x)` returns, spliced the same way and packed by one recipe.

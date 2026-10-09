@@ -35,6 +35,7 @@ const _PPL_TEST_FILES = (
     "test_distributional_broadcasts.jl",
     "test_distributional_broadcasts_reactant.jl",
     "test_query.jl",
+    "test_query_derivatives.jl",
     "test_model_view.jl",
     "test_emitted_names.jl",
     "test_native_generator_capture.jl",
@@ -267,6 +268,7 @@ const _PPL_TEST_FILES = (
     "test_covariance_values_reactant.jl",
     "test_varying_values_reactant.jl",
     "test_cell_broadcast_arrays.jl",
+    "test_plate_cell_arrays.jl",
     "test_index_endpoints.jl",
     "test_base_value_names.jl",
     "test_rebinding_rows.jl",
@@ -274,6 +276,7 @@ const _PPL_TEST_FILES = (
     "test_inline_call_values.jl",
     "test_inline_scalar_reads.jl",
     "test_authored_names.jl",
+    "test_cell_query.jl",
 )
 
 include("sharding.jl")

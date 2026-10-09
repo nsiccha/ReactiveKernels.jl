@@ -368,7 +368,8 @@ function _assignment_statements(plan::StructuralPlan;
         ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
             (ex = _concrete_guarded_argument(ex))
         push!(order, name)
-        rewritten[name] = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
+        rewritten[name] = _bound_extent_indices(name,
+            _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers)), plan)
     end
     destructured = _destructuring_statements(order, rewritten)
     stmts = Expr[]
@@ -448,6 +449,19 @@ function _called_kernel_spec(rhs::Expr)
     head isa GlobalRef && isdefined(head.mod, head.name) || return nothing
     value = getglobal(head.mod, head.name)
     return value isa KernelSpec ? value : nothing
+end
+
+# A retained plate column over a value whose extent binding supplied
+# (`_bind_plate_extents!`) iterates `1:extent`, a data lane, instead of the
+# live value's indices.
+function _bound_extent_indices(name::Symbol, ex, plan::StructuralPlan)
+    it = _value_plate_iterator(name, ex)
+    it === nothing && return ex
+    input = _value_extent_input(it)
+    haskey(plan.columns, input) && !haskey(plan.columns, it.args[2]) || return ex
+    call = ex.args[1]
+    indices = Expr(:call, GlobalRef(Base, :collect), Expr(:call, :(:), 1, input))
+    return Expr(:do, Expr(:call, call.args[1], indices, call.args[3:end]...), ex.args[2])
 end
 
 # The generated scope's `logistic` names a distribution kernel. Values
@@ -748,6 +762,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     stmts = Expr[]
     terms = Any[]
     points = Pair{Symbol,Any}[]
+    arguments = Pair{Symbol,Any}[]
     for r in plan.responses
         # A plate loop covers its whole response, so a cell-broadcast
         # response observes every entry of each index's array.
@@ -756,6 +771,8 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
                 _response_likelihood_stmts(_with(r; range = nothing), plan), upstream) :
             _response_likelihood_stmts(r, plan)
         append!(stmts, rs)
+        args = _observation_arguments(r, plan, rs)
+        args === nothing || push!(arguments, r.response => args)
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
         if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.evidence.kind === :none &&
@@ -814,8 +831,51 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     values = isempty(points) ? :(NamedTuple()) :
         Expr(:tuple, (Expr(:(=), name, value) for (name, value) in points)...)
     push!(stmts, Expr(:(=), :pointwise, values))
+    push!(stmts, _observations_statement(points, arguments))
     return stmts
 end
+
+# The `:observations` query: per observation, the arguments its distribution
+# receives, for every response of a location-scale family. They are read off
+# the response's final pointwise plate, whose inputs 1-2 are always the
+# response and its location (`_plate_sum_stmts`); these families thread a
+# non-literal scale as input 3 (`_scale_plate_arg`). Range selection, presence
+# masks, evidence and weights rewrite or append inputs without moving these,
+# so entry `i` of each argument belongs to entry `i` of the response's
+# `:pointwise` densities. A location or scale shared by every observation stays
+# a scalar.
+const _OBSERVATION_LOCATION_SCALE_FAMILIES = (GaussianFam, StudentTFam, LogNormalFam)
+
+function _observation_arguments(r::LikelihoodSpec, plan::StructuralPlan,
+        rs::Vector{Expr})
+    r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return nothing
+    _cell_broadcast_response(plan, r) && return nothing
+    pw = _pw_name(r.label)
+    i = findlast(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === pw, rs)
+    i === nothing && return nothing
+    rhs = rs[i].args[2]
+    (Meta.isexpr(rhs, :do) && Meta.isexpr(rhs.args[1], :call) &&
+        rhs.args[1].args[1] === :plate) || return nothing
+    inputs = rhs.args[1].args[2:end]
+    scale = r.scale isa Real ? Float64(r.scale) : deepcopy(inputs[3])
+    return :((location = $(deepcopy(inputs[2])), scale = $scale))
+end
+
+function _observations_statement(points::Vector{Pair{Symbol,Any}},
+        arguments::Vector{Pair{Symbol,Any}})
+    covered = Set(first.(arguments))
+    missing = Tuple(name for (name, _) in points if !(name in covered))
+    isempty(missing) || return Expr(:(=), :_ppl_observations, Expr(:call,
+        GlobalRef(@__MODULE__, :_ppl_observations_unsupported), QuoteNode(missing)))
+    values = isempty(arguments) ? :(NamedTuple()) :
+        Expr(:tuple, (Expr(:(=), name, value) for (name, value) in arguments)...)
+    return Expr(:(=), :_ppl_observations, values)
+end
+
+_ppl_observations_unsupported(names::Tuple) = throw(ContractValidationError(
+    "[query] :observations covers responses of the Normal, Student t and " *
+    "LogNormal families observed through a flat, ranged or in-cell plate; " *
+    "this program has no location/scale arguments for " * join(names, ", ")))
 
 # A dotted `@plate` cell (`y[i] .~ D.(v[i], s)`) broadcasts over its own
 # iteration's values, as Julia does. When the bound response holds one array

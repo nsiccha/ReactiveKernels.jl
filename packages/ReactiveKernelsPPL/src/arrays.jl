@@ -3,9 +3,10 @@
 # gather and prior statements.
 #
 # An array parameter is a VALUE the model reads by name, with standard
-# Julia semantics: `z` is a `Vector{Float64}` (or a `Matrix{Float64}` for a
-# two-axis declaration), `L` is the lower-triangular `Matrix{Float64}`
-# Cholesky factor. Expressions over them are ordinary Julia (`z[1]`,
+# Julia semantics: `z` is an `AbstractVector{Float64}` (an
+# `AbstractMatrix{Float64}` for a two-axis declaration; a real-support array
+# is a read-only view of its packed coordinates), `L` is the lower-triangular
+# `Matrix{Float64}` Cholesky factor. Expressions over them are ordinary Julia (`z[1]`,
 # `L[2, 1]`, `sd .* z`, `B * w` with a bound data matrix
 # `B`). The one non-positional read is the level lookup: an axis declared
 # as `levels(g)` is indexed by the grouping column's VALUES, so `z[g]`
@@ -1213,9 +1214,10 @@ function _array_transform_statements(e::LayoutEntry)
         e.transform, e.lo, e.hi)
     stmts = _plate_transform_statements(fe)
     length(e.dims) == 1 && return stmts
-    # The flat block is already a fresh Float64 vector (a packed slice or the
-    # transform's output), so the column-major reshape shares its storage.
-    push!(stmts, :($(e.name)::Matrix{Float64} = reshape($flat, $(e.dims...))))
+    # The column-major reshape shares the flat block's storage: the packed
+    # coordinates themselves, or the transform's fresh output. A `Matrix`
+    # declaration would copy the former on every evaluation.
+    push!(stmts, :($(e.name)::AbstractMatrix{Float64} = reshape($flat, $(e.dims...))))
     return stmts
 end
 
