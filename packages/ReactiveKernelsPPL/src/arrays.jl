@@ -1667,11 +1667,17 @@ function _slice_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
         roles[k] === :count && continue
         local_name = Symbol(:_ppl_parg_, p.name, :_, i)
         if _is_slice_iterator(a)
+            # The density call wraps the value itself: a data-only value
+            # then reaches AD as an ordinary constant array operand, never
+            # folded inside a wrapper whose fields AD cannot prove readonly.
             o = _orientation_expr(a.args[1] === :eachrow ? _SliceRows() :
                 _SliceCols())
-            push!(stmts, :($local_name = _PerSlice($o,
-                $(_slice_value_expr(a.args[2])))))
-            push!(vals, local_name)
+            v = a.args[2]
+            if !(v isa Symbol)
+                push!(stmts, :($local_name = $(_slice_value_expr(v))))
+                v = local_name
+            end
+            push!(vals, :(_PerSlice($o, $v)))
         elseif a isa Symbol
             push!(vals, a)
         elseif a isa Real

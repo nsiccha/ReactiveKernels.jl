@@ -265,15 +265,23 @@ end
     @test err isa ContractValidationError
     @test occursin("has size (3, 2) but its prior arg1 has size (2, 2)",
         sprint(showerror, err))
-    # Refused: a computed 2×3 value cannot broadcast over the 3×2 array
-    # either; its size is checked where the graph computes it.
-    computed = :(begin
-        M = LOC'
+    # Refused: a 2×3 value cannot broadcast over the 3×2 array either
+    # (principle 3). A data-only definition is checked at binding; a value
+    # the graph computes is checked where it is computed.
+    data = merge(_apd_data(), Dict(:LOC => _APD_LOC))
+    @test_throws ContractValidationError _apd_build(:(begin
+        M = permutedims(LOC)
         B[1:3, 1:2] .~ Normal.(M, 1)
         y .~ Normal.(B[k, 1], 0.7)
-    end)
-    fx = _apd_build(computed, merge(_apd_data(), Dict(:LOC => _APD_LOC)))
-    @test_throws DimensionMismatch prepare_query(fx.built, fx.bound, :prior)
+    end), data)
+    fx = _apd_build(:(begin
+        a ~ Normal(0, 1)
+        M = permutedims(LOC) .+ a
+        B[1:3, 1:2] .~ Normal.(M, 1)
+        y .~ Normal.(B[k, 1], 0.7)
+    end), data)
+    q = prepare_query(fx.built, fx.bound, :prior)
+    @test_throws DimensionMismatch Base.invokelatest(q, zeros(fx.built.layout.total))
     # Not built yet: Julia broadcasts a 3-vector over the rows of a 3×2
     # array (one value per row); per-element arguments currently have the
     # array's own size. Capability gap, not a refusal.
@@ -285,14 +293,29 @@ end
     end
 end
 
-@testset "per-slice concentrations from a data matrix" begin
+@testset "per-slice concentrations and means from data matrices" begin
     A = [1.0 2.0 1.0; 1.0 1.0 3.0]
+    M = [0.1 -0.2 0.3; 0.4 0.0 -0.1]
+    L = [1.0 0.0; 0.3 0.8]
+    data = merge(_apd_data(), Dict(:A => A, :At => permutedims(A), :M => M, :L => L))
     for values in (false, true)
         _apd_check(:(begin
             eachcol(S[1:2, levels(k)]) .~ Dirichlet.(eachcol(A))
             y .~ Normal.(S[1, k], 0.7)
-        end), merge(_apd_data(), Dict(:A => A)),
+        end), data,
             th -> sum(logpdf(Dirichlet(A[:, j]), th.S[:, j]) for j in 1:3),
             th -> th.S[1, :]; values)
+        _apd_check(:(begin
+            eachrow(S[levels(k), 1:2]) .~ Dirichlet.(eachrow(At))
+            y .~ Normal.(S[k, 1], 0.7)
+        end), data,
+            th -> sum(logpdf(Dirichlet(A[:, j]), th.S[j, :]) for j in 1:3),
+            th -> th.S[:, 1]; values)
+        _apd_check(:(begin
+            eachcol(B[1:2, levels(k)]) .~ MvNormalCholesky.(eachcol(M), Ref(L))
+            y .~ Normal.(B[2, k], 0.7)
+        end), data,
+            th -> sum(logpdf(MvNormal(M[:, j], L * L'), th.B[:, j]) for j in 1:3),
+            th -> th.B[2, :]; values)
     end
 end
