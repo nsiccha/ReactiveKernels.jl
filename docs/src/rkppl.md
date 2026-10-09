@@ -530,6 +530,15 @@ whole to a model-level Julia function when it needs the full value; a bare
 array combined directly with observation data must first be indexed to the
 observation axis.
 
+A declared array with a real-support prior, such as `Normal`, `StudentT` or
+`Flat`, and a real-support plate latent read the sampler's packed
+coordinates in place, so no native evaluation copies them. Such a value is a
+read-only `AbstractVector{Float64}` view; a two-axis array is a reshaped view
+(`AbstractMatrix{Float64}`). Compiled execution traces the same block as a
+slice. An array with a constrained prior is its transform's fresh output. A
+function that receives one whole should accept `AbstractVector` or
+`AbstractMatrix`, and must not write into it.
+
 ## Design matrices
 
 Bind the matrix once with `hcat` and size the coefficients with an axes prior.

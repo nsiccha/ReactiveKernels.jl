@@ -334,6 +334,11 @@ end
 # Typed conversion at the compiler boundary keeps Base.trunc semantics in
 # native execution. Tracing extensions can preserve already-integer values.
 @inline _tensorized_trunc(::Type{T}, x) where {T<:Integer} = trunc(T, x)
+# A read-only block of a packed vector (a generated model's parameter block):
+# native execution reads the coordinates in place.  A tracing extension may
+# return the slice instead, the same values, where its views do not trace.
+@inline _tensorized_view(array::AbstractVector, range::AbstractUnitRange) =
+    view(array, range)
 @inline function _tensorized_setindex(array, value, indices...)
     setindex!(array, value, indices...)
     array
@@ -433,7 +438,8 @@ end
 # operands and sends dense ones through generic `typed_hcat`/`typed_hvcat`
 # paths, several times slower than Base's scalar fill.  The native body calls
 # these companions instead (`_kernel_native_calls`).  For `Number`, `Vector`
-# and `Matrix` operands whose promoted element type is isbits, they return
+# and `Matrix` operands, and contiguous range views of a `Vector` with their
+# matrix reshapes, whose promoted element type is isbits, they return
 # Base's result, a freshly allocated `Matrix` or `Vector` of Base's shape,
 # element type and values, and write each operand in its own inlined call, so
 # every write stays tied to its tuple position.  A `Number` is a 1×1 block,
@@ -450,11 +456,29 @@ end
 # array operands even on a path that never runs
 # (`benchmark/repro_enzyme_mixed_scalar_hvcat.jl`), and Julia 1.10's `hvcat`
 # silently drops operands beyond its block-row counts.
-const _NativeCatOperand = Union{Number,Vector,Matrix}
-const _NativeColumnOperand = Union{Number,Vector}
+# A contiguous range view of a `Vector` (such as a parameter block read in
+# place from a packed vector) stores its elements as the vector does, and so
+# does that view reshaped to a matrix: both are dense column-major operands.
+# Base concatenates them beside arrays through a loop over a `Union` of
+# operand types, which native Enzyme reverse rejects
+# (`IllegalTypeAnalysisException` in `_typed_vcat`).
+const _NativeVectorView = Base.FastContiguousSubArray{<:Any,1,<:Vector}
+const _NativeVector = Union{Vector,_NativeVectorView}
+const _NativeMatrix = Union{Matrix,Base.ReshapedArray{<:Any,2,<:_NativeVectorView}}
+const _NativeCatOperand = Union{Number,_NativeVector,_NativeMatrix}
+const _NativeColumnOperand = Union{Number,_NativeVector}
 
 @inline _native_cat_width(a::_NativeColumnOperand) = 1
-@inline _native_cat_width(a::Matrix) = size(a, 2)
+@inline _native_cat_width(a::_NativeMatrix) = size(a, 2)
+
+# A layout `hcat`/`vcat` does not lay out calls Base for its error (or `vcat`'s
+# fill of leading numbers).  Native Enzyme compiles that call even where it
+# never runs, so a view operand reaches it as a copy: Base's values and errors,
+# over the operand types it already differentiates.
+@inline _native_cat_base_operand(a) = a
+@inline _native_cat_base_operand(a::_NativeVectorView) = copy(a)
+@inline _native_cat_base_operand(
+    a::Base.ReshapedArray{<:Any,2,<:_NativeVectorView}) = copy(a)
 
 # Sizes over an operand tuple, one inlined call per operand.
 @inline _native_cat_width_sum(::Tuple{}) = 0
@@ -486,7 +510,7 @@ const _NativeColumnOperand = Union{Number,Vector}
     @inbounds out[column * stride + row + 1] = a
     out
 end
-@inline function _native_cat_block!(out, stride, row, column, a::Array)
+@inline function _native_cat_block!(out, stride, row, column, a::AbstractArray)
     height = size(a, 1)
     for j in 1:_native_cat_width(a), i in 1:height
         @inbounds out[(column + j - 1) * stride + row + i] =
@@ -515,7 +539,8 @@ end
     T = Base.promote_eltypeof(args...)
     isbitstype(T) || return hcat(args...)
     height = size(a, 1)
-    _native_cat_heights_equal(height, rest) || return hcat(args...)::Matrix{T}
+    _native_cat_heights_equal(height, rest) ||
+        return hcat(map(_native_cat_base_operand, args)...)::Matrix{T}
     out = Matrix{T}(undef, height, _native_cat_width_sum(args))
     _native_hcat_copy!(out, height, 0, args)
 end
@@ -541,7 +566,8 @@ end
     T = Base.promote_eltypeof(args...)
     isbitstype(T) || return vcat(args...)
     width = _native_cat_width(a)
-    _native_cat_widths_equal(width, rest) || return vcat(args...)::Matrix{T}
+    _native_cat_widths_equal(width, rest) ||
+        return vcat(map(_native_cat_base_operand, args)...)::Matrix{T}
     height = _native_cat_height_sum(args)
     out = Matrix{T}(undef, height, width)
     _native_vcat_copy!(out, height, 0, args)
