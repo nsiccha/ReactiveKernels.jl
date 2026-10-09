@@ -262,6 +262,79 @@ function sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector
     return Base.invokelatest(ad_value_gradient_and_retained!, q.ad, g, v)
 end
 
+"""
+    QueryAD
+
+A prepared ReactiveKernels derivative operator over one query of a built
+program, plus the program's [`LayoutTable`](@ref). Construct one with
+[`prepare_query_ad`](@ref). The ReactiveKernels derivative calls accept it in
+place of the prepared operator, with the unconstrained vector as the one
+argument: `ad_gradient(q, u)`, `ad_value_and_gradient!(q, g, u)`,
+`ad_pullback(q, seed, u)`, `ad_pushforward(q, tangents, u)`,
+`ad_hvp(q, tangents, u)`, `ad_gradient_and_hvp(q, tangents, u)` and their
+other value/in-place forms. Each call carries the `Base.invokelatest` barrier
+the query's build-time code needs, so they are safe from compiled callers.
+Not thread-safe (one per caller); not traceable by Reactant.
+"""
+struct QueryAD{P,L}
+    prepared::P
+    layout::L
+end
+
+"""
+    prepare_query_ad(prepare_operator, built, plan, preset, backend, exemplars...;
+                     on_error = nothing) -> QueryAD
+
+Prepare a ReactiveKernels derivative operator over the query
+[`prepare_query`](@ref)`(built, plan, preset)`, differentiating with respect
+to the whole unconstrained vector. `prepare_operator` is the ReactiveKernels
+preparation to apply — `prepare_ad`, `prepare_ad_pullback`,
+`prepare_ad_pushforward` or `prepare_ad_hvp` — and `exemplars` are that
+function's arguments after its backend, ending with an unconstrained exemplar
+`u0` of length `layout.total`:
+
+```julia
+second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+                           AutoEnzyme(; mode = Enzyme.Forward))
+q = prepare_query_ad(prepare_ad_hvp, built, plan, :sampler, second_order, (v,), u0)
+gradient, (hv,) = ad_gradient_and_hvp(q, (v,), u)
+
+j = prepare_query_ad(prepare_ad_pushforward, built, plan, :pointwise,
+                     AutoEnzyme(; mode = Enzyme.Forward), (v,), u0)
+pointwise, (jv,) = ad_value_and_pushforward(j, (v,), u)
+```
+
+Gradients and Hessian-vector products need a scalar preset (`:sampler`,
+`:likelihood`, `:prior`, `:log_jacobian`); pullbacks and pushforwards also
+accept `:pointwise`. Directions with disjoint supports
+over `coordinate_names(built.layout)` compress block-structured Jacobians and
+Hessians (see `ReactiveKernels.prepare_ad_hvp`). The backend's packages must be
+loaded in the calling session.
+"""
+function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
+        preset::Symbol, backend, exemplars...; on_error = nothing)
+    layout = built.layout::LayoutTable
+    isempty(exemplars) && throw(ContractValidationError(
+        "[query] prepare_query_ad needs an unconstrained exemplar u0 as its last argument"))
+    u0 = last(exemplars)
+    u0 isa AbstractVector{<:Real} && length(u0) == layout.total ||
+        throw(ContractValidationError(
+            "[query] the last exemplar must be an unconstrained vector of length " *
+            "$(layout.total); got $(summary(u0))"))
+    kernel = prepare_query(built, plan, preset; on_error)
+    prepared = Base.invokelatest(prepare_operator, kernel, backend,
+        Base.front(exemplars)..., Vector{Float64}(u0); active = :unconstrained)
+    return QueryAD(prepared, layout)
+end
+
+for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
+        :ad_pullback, :ad_value_and_pullback, :ad_value_and_pullback!,
+        :ad_pushforward, :ad_value_and_pushforward,
+        :ad_hvp, :ad_hvp!, :ad_gradient_and_hvp, :ad_gradient_and_hvp!)
+    @eval ReactiveKernels.$verb(q::QueryAD, args...) =
+        Base.invokelatest(ReactiveKernels.$verb, q.prepared, args...)
+end
+
 function _stack_restored_draws(values)
     value = first(values)
     if value isa NamedTuple
