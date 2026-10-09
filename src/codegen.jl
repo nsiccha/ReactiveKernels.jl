@@ -2509,7 +2509,7 @@ end
 # lowering and the same operation-table entries as the plate itself.
 Base.@nospecializeinfer function _lower_authored_plate_cell!(
         body, runtime_ops, runtime_recipes, @nospecialize(recipe::Recipe),
-        callargs, lhs, tensorized::Bool)
+        callargs, lhs, tensorized::Bool; windows = nothing)
     op = recipe.op::_AuthoredPlateCellOp
     plate = op.plate
     atomic = typeof(plate).parameters[2]
@@ -2539,6 +2539,16 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
         push!(body.args, Expr(:(=), slice,
             Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
         push!(slices, slice)
+    end
+    # A shared array read only at the cell's own row whose producer computes
+    # it row by row is computed at that row (`_CellEmitter`, cell_windows.jl).
+    if windows !== nothing
+        d = windows.pushdowns
+        for (position, batched) in sort!(collect(d.captures[recipe.id]))
+            value = canon_id(d.graph, plate_values[position].id)
+            value in d.pushed || continue
+            slices[position] = _cell_capture!(windows, value, slices[batched])
+        end
     end
     pointwise = gensym(:cell_pointwise)
     if tensorized
@@ -2742,9 +2752,22 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         end
     end
     strip_members = Set(x.id for region in values(strip_regions) for x in region)
+    # Values plate cells read only at their own row, computed there
+    # (`_cell_pushdowns`, cell_windows.jl). Native only: the tensorized product
+    # computes them whole, and both keep the same operation table.
+    cells = !tensorized && inline_embedded && isempty(recycle) &&
+        type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
         callargs = Any[nm(inp) for inp in r.inputs]
+        if cells !== nothing && r.id in cells.recipes
+            # Its table slot stays here; its consumer cell calls it per row.
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            cells.slots[r.id] = length(runtime_ops)
+            foreach(output -> push!(assigned, canon_id(g, output.id)), r.outputs)
+            continue
+        end
 
         if inline_embedded && r.op isa _AuthoredPlateOp
             length(r.outputs) == 1 || throw(ArgumentError(
@@ -2825,7 +2848,9 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
         if inline_embedded && r.op isa _AuthoredPlateCellOp
             _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
-                callargs, lhs, tensorized)
+                callargs, lhs, tensorized;
+                windows = cells === nothing || !haskey(cells.captures, r.id) ? nothing :
+                    _CellEmitter(body, cells, names))
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp
@@ -5293,11 +5318,20 @@ end
 # Any other operation (a plate, a scan) reads a scoped input by the part of its
 # name after a scope prefix that its source spells.
 function _recipe_source_names(recipe::Recipe)
-    names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
-    names === nothing || return names
     spelled = Set{Symbol}()
     _source_symbols!(spelled, recipe.source)
+    names = _source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
+    names === nothing ||
+        return Symbol[_spelled_parameter_name(name, spelled) for name in names]
     Symbol[_unscoped_source_name(value.name, spelled) for value in recipe.inputs]
+end
+# Julia's lowering reports a gensym parameter (`##endpoint_value#7`) without
+# its leading `##` (`endpoint_value#7`), while the source still spells the
+# gensym; an unmapped name would leave that gensym in the display.
+function _spelled_parameter_name(name::Symbol, spelled)
+    name in spelled && return name
+    gensym_name = Symbol("##", name)
+    gensym_name in spelled ? gensym_name : name
 end
 _source_symbols!(names, x::Symbol) = push!(names, x)
 _source_symbols!(names, x) = names
