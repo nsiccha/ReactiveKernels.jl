@@ -2045,7 +2045,8 @@ Base.@nospecializeinfer function _kernel_authored_plate(
     _kernel_new_instance(T, (kernel, ()))::_AuthoredPlateOp
 end
 
-# `scan(xs, Ref(shared)...; init = c0) do carry, x, shared...  …; (new_carry, output)  end`
+# `scan(xs...; init = c0) do carry, x...  …; (new_carry, output)  end`, reading shared
+# values as closures (deprecated: trailing `Ref(shared)...` operands and formals)
 # authors a bounded SEQUENTIAL recurrence.  Unlike `plate` (a pure per-element
 # broadcast map), `scan` threads a `carry` value: the do-block's FIRST formal is
 # the carry (seeded by `init`, never a positional argument), the SECOND is the
@@ -3180,8 +3181,9 @@ loop:
 
 @kernel cell(plan, units, weights) = begin
     observations = domain(plan)
-    c::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-        sum(w[i] * get(u, row_index(t, p, i), 0.0) for i in eachindex(w); init = 0.0)
+    c::Vector{Float64} = plate(observations) do t
+        sum(weights[i] * get(units, row_index(t, plan, i), 0.0)
+            for i in eachindex(weights); init = 0.0)
     end
 end
 ```
@@ -4800,20 +4802,21 @@ function plate(spec::KernelSpec; have, want, batched, reduce = :+)
 end
 
 """
-    scan(xs, ys..., Ref(shared)...; init, include_init = false) do carry, x, y..., shared...
+    scan(xs, ys...; init, include_init = false) do carry, x, y...
         …
         (new_carry, output)
     end
-    scan(xs, ys..., Ref(shared)...; init, history = h0) do carry, x, y..., shared..., earlier
+    scan(xs, ys...; init, history = h0) do carry, x, y..., earlier
         …
         (new_carry, output)
     end
 
 Author a bounded SEQUENTIAL recurrence inside a `@kernel` / `@ppl` body. The
-leading non-`Ref` positionals are the sequences to scan over, advanced in
-lockstep (they must share axes); `init` seeds the threaded `carry`; any trailing
-`Ref(shared)` operands are passed whole to every step. The do-block receives
-`(carry, x, y..., shared...)` and must end with the 2-tuple `(new_carry,
+positionals are the sequences to scan over, advanced in lockstep (they must
+share axes); `init` seeds the threaded `carry`. The step reads any other
+enclosing value whole, as a closure. A trailing `Ref(shared)` operand passes a
+value whole too but is deprecated (user decision `0kvm2ip`). The do-block
+receives `(carry, x, y...)` and must end with the 2-tuple `(new_carry,
 output)`; `scan` returns the vector `[output…]`. A compound carry may be carried
 as a `NamedTuple` (`init = (; a, b)`, read `carry.a`). Empty sequences run no
 step and return an empty vector of the step's inferred output type.
