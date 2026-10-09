@@ -582,14 +582,22 @@ submodel calls and cell locals. A loop of scalar arithmetic lowers at once,
 exactly like its broadcast spelling.
 
 A per-index value may itself be an array, such as `t[i]` holding one vector
-per subject. The cell still means one iteration of the loop. An authored
-broadcast over a per-index value (`exp(la[i]) .* t[i]`), indexing into one or
-into a cell local (`t[i][picks[i]]`, `ti = t[i]; ti[sel]`), a gather with an
-index vector per subject (`v[rows[i]]`), a reduction (`sum(v[rows[i]])`) and
-an ordinary function or function-shaped `@kernel` called on per-index values
-all make the plate a retained RK plate whose body is the cell, as an explicit
-`plate(...) do` reader would be. RK composes a `@kernel` callee into that
-body. Data-only cell work runs once, when the query or sampler is prepared,
+per subject. The cell still means one iteration of the loop, whatever
+ordinary Julia it applies: undotted vector-scalar arithmetic (`t[i] * a`,
+`t[i] / exp(a)`, `-t[i]`), vector sums (`t[i] * a - b * t[i]`) and matrix
+products (`M[i] * w`) mean what they mean in Julia. When the model is lowered
+with its data values (the model call, `lower_rkppl(ast, data)`), a cell that
+reads such a value at the loop index, directly or through a definition, a
+cell local or an earlier plate's output computed from one, runs as a retained
+RK plate whose body is the cell, as an explicit `plate(...) do` reader would
+be. So do an authored broadcast over a per-index value
+(`exp(la[i]) .* t[i]`), indexing into one or into a cell local
+(`t[i][picks[i]]`, `ti = t[i]; ti[sel]`), a gather with an index vector per
+subject (`v[rows[i]]`), a reduction (`sum(v[rows[i]])`) and an ordinary
+function or function-shaped `@kernel` called on per-index values. RK composes
+a `@kernel` callee into that body. A plan lowered from data names alone
+cannot see that a value holds arrays; binding it refuses the arrays and names
+the value-aware lowering. Data-only cell work runs once, when the query or sampler is prepared,
 if the plate iterates data or a value whose shape bound data establish
 (`eachindex(la)` with `la = a .+ x`); over an opaque module-call result the
 plate reads its live iterator.
