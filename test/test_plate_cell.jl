@@ -132,6 +132,18 @@ end
     full = prepare(_cell_grouped; have = (:groups, :scale), want = :group_density)
     @test [k(groups, 1.3, i) for i in eachindex(groups)] ≈ full(groups, 1.3)
     @test k(groups, 1.3, 2) == 0.0
+    # Reverse through a cell over one array per index leaves the caller's
+    # arrays untouched: the slice must not be a fresh container of them.
+    original = deepcopy(groups)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for i in (1, 4)
+        ad = prepare_ad(k, backend, groups, 1.3, i; active = :scale)
+        value, dscale = ad_value_and_gradient(ad, groups, 1.3, i)
+        @test value ≈ k(groups, 1.3, i)
+        @test dscale ≈ _cell_central(s -> k(groups, s, i), 1.3) rtol = 1e-6
+        @test groups == original
+    end
+    @test [k(groups, 1.3, i) for i in eachindex(groups)] ≈ full(groups, 1.3)
 end
 
 @testset "plate_cell: Cartesian and linear positions, extruded arguments" begin

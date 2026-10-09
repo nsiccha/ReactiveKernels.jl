@@ -415,6 +415,9 @@ end
 @inline _plate_cell_slice(arg, cell) = arg
 @inline _plate_cell_slice(arg::Tuple, cell) =
     length(arg) == 1 ? arg : (arg[cell[1]],)
+# A view, never a copy: a fresh container holding the caller's element arrays
+# (one array per cell) gives native Reverse a shadow that aliases them, and the
+# gradient then accumulates into the caller's data.
 @inline function _plate_cell_slice(arg::AbstractArray{<:Any,N}, cell) where {N}
     N == 0 && return arg
     ranges = ntuple(N) do dimension
@@ -422,7 +425,7 @@ end
         position = length(axis) == 1 ? first(axis) : cell[dimension]
         position:position
     end
-    arg[ranges...]
+    view(arg, ranges...)
 end
 
 # A first-class authored SEQUENTIAL scan.  Unlike `plate` (a pure broadcast map),
