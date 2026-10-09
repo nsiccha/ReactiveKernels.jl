@@ -246,13 +246,25 @@ end
     @test jacobian_term(centry) == :(unconstrained[4])
     @test coordinate_read(3) == :(unconstrained[3])
     @test block_read(2, 4) == :(view(unconstrained, 2:5))
-    # A two-axis array reshapes its packed Float64 slice without a copy.
+    # Real-support arrays and per-cell latents read their packed coordinates
+    # in place; a two-axis array reshapes that view, so no evaluation copies.
     zentry = LayoutEntry(:array, nothing, :Z, Symbol.("Z.", 1:6), 7, 6,
         :identity, NaN, NaN, [2, 3], LayoutEntry[], nothing)
     @test transform_statements(zentry) == Expr[
-        :(_ppl_arrflat_Z::AbstractVector{Float64} = unconstrained[7:12]),
-        :(Z::Matrix{Float64} = reshape(_ppl_arrflat_Z, 2, 3)),
+        :(_ppl_arrflat_Z::AbstractVector{Float64} =
+            ReactiveKernels._tensorized_view(unconstrained, 7:12)),
+        :(Z::AbstractMatrix{Float64} = reshape(_ppl_arrflat_Z, 2, 3)),
     ]
+    ventry = LayoutEntry(:array, nothing, :v, Symbol.("v.", 1:3), 2, 3,
+        :identity, NaN, NaN, [3], LayoutEntry[], nothing)
+    @test transform_statements(ventry) ==
+        Expr[:(v::AbstractVector{Float64} =
+            ReactiveKernels._tensorized_view(unconstrained, 2:4))]
+    pentry = LayoutEntry(:plate, nothing, :theta, Symbol.("theta.", 1:4), 5, 4,
+        :identity)
+    @test transform_statements(pentry) ==
+        Expr[:(theta::AbstractVector{Float64} =
+            ReactiveKernels._tensorized_view(unconstrained, 5:8))]
 end
 
 @testset "name hygiene" begin

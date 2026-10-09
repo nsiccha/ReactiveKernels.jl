@@ -2196,26 +2196,31 @@ function _plate_rows(plan::StructuralPlan, p::PlateParameter;
         active = Set{Symbol}())
     p.range isa UnitRange && return length(p.range)
     if p.range isa Expr
-        return _value_iterator_length(plan, p, p.range, active)
+        return _value_iterator_length(plan, p.label, p.range, active)
     end
-    p.range isa Symbol && return _value_iterator_length(plan, p,
+    p.range isa Symbol && return _value_iterator_length(plan, p.label,
         Expr(:call, :eachindex, p.range), active)
     return _value_rows(plan, p.name)
 end
 
-function _value_iterator_length(plan::StructuralPlan, p::PlateParameter,
-        iterator, active = Set{Symbol}())
+# The length of `eachindex(v)` / `axes(v, d)` from bound data and declared
+# axes, without evaluating sampled values. A latent plate requires it; a
+# retained cell plate reads its live iterator when it is unavailable
+# (`required = false` returns `nothing`).
+function _value_iterator_length(plan::StructuralPlan, label,
+        iterator, active = Set{Symbol}(); required::Bool = true)
     source = iterator.args[2]
     shape = _value_axes(plan, source, active; data_axes = true)
     # A response cannot determine an unrelated value's extent. Resolve
     # data and declared axes without running sampled values; an opaque
     # live result whose shape is unavailable remains a capability gap.
-    shape === nothing && _fail(p.label, "latent plate iterator " *
+    shape === nothing && !required && return nothing
+    shape === nothing && _fail(label, "latent plate iterator " *
         "$(repr(iterator)) has no extent established by bound data; " *
         "the shape of $source cannot be inferred without evaluating " *
         "sampled values")
     # Julia numbers and zero-dimensional arrays have one index too.
-    sizes = Int[d isa Integer ? d : _array_dim_size(plan, source, p.label, d)
+    sizes = Int[d isa Integer ? d : _array_dim_size(plan, source, label, d)
         for d in shape]
     iterator.args[1] === :eachindex && return prod(sizes)
     k = iterator.args[3]
@@ -3036,6 +3041,11 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
                             "IR/contract growth")
     end
     head === :. && return _collect_vector_dot!(refs, ex, plan, label, bound)
+    if _is_observation_slice(plan, ex)
+        # `P[:, 1]` keeps every row of a per-observation value: n_obs.
+        _collect_vector_refs!(refs, ex.args[1], plan, label, bound)
+        return nothing
+    end
     _is_row_gather(plan, ex) && _fail(label, "`$(repr(ex))` is one row " *
         "per observation (a matrix) — multiply it by a vector " *
         "(`$(repr(ex)) * v`) or read one column (`$(ex.args[1])[$(ex.args[2]), 1]`)")
@@ -3176,6 +3186,7 @@ function _is_vector_valued(ex, plan::StructuralPlan)
     _is_plate_column_expr(ex) && return true
     ex isa Symbol && return !(ex in _union_names(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
+    _is_observation_slice(plan, ex) && return true
     ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
         (_is_array_param(plan, ex.args[1]) ||
             _is_array_assignment(plan, ex.args[1])) &&
@@ -3244,6 +3255,17 @@ end
 _is_matrix_math(ex, plan) = ex isa Expr && ex.head === :call &&
     !isempty(ex.args) && ex.args[1] in (:+, :-, :*, :/) &&
     any(a -> _is_matrix_value(a, plan), ex.args[2:end])
+
+# `A[:, j]`: every row of a per-observation value (a derived column such
+# as `P = X * B`, or a bound data matrix) at literal positions or `:` on
+# its other axes. As in Julia, the leading `:` keeps the row axis.
+function _is_observation_slice(plan::StructuralPlan, ex)
+    ex isa Expr && ex.head === :ref && length(ex.args) >= 3 || return false
+    base = ex.args[1]
+    base isa Union{Symbol,Expr} && ex.args[2] === :(:) &&
+        all(_is_position, ex.args[3:end]) || return false
+    return _is_vector_valued(base, plan)
+end
 
 function _observation_matrix_gather(ex, plan)
     return _is_row_gather(plan, ex)
@@ -7307,8 +7329,45 @@ function _bind_plate_extents!(plan::StructuralPlan, columns)
         columns[input] = _plate_rows(plan, p)
         push!(inputs, input)
     end
+    # Retained plate columns over a value (`@plate for i in eachindex(la)`
+    # with `la` computed): bound data that establish the value's shape also
+    # establish the cell indices, so the plate's index lane is data and RK
+    # caches the cells' data-only work at preparation.
+    extents = Set{Symbol}()
+    for d in (plan.assignments..., plan.derived...)
+        it = _value_plate_iterator(d.name, d.expr)
+        it === nothing && continue
+        haskey(columns, it.args[2]) && continue
+        input = _value_extent_input(it)
+        input in extents && continue
+        haskey(columns, input) && _fail(d.name, "internal input $input " *
+            "is the plate's cell count — drop it from bind_data")
+        source = it.args[1] == GlobalRef(Base, :eachindex) ?
+            Expr(:call, :eachindex, it.args[2]) :
+            Expr(:call, :axes, it.args[2], it.args[3])
+        n = _value_iterator_length(plan, d.name, source; required = false)
+        n === nothing && continue
+        columns[input] = n
+        push!(extents, input)
+    end
     return inputs
 end
+
+# The value iterator (`Base.eachindex(v)` / `Base.axes(v, d)`) of an
+# authored retained plate column (`_desugar_selected_plate`), or `nothing`.
+function _value_plate_iterator(name::Symbol, ex)
+    Base.isgensym(name) && return nothing
+    it = _selected_plate_indices(ex)
+    Meta.isexpr(it, :call) && it.args[2] isa Symbol || return nothing
+    it.args[1] == GlobalRef(Base, :eachindex) && length(it.args) == 2 && return it
+    it.args[1] == GlobalRef(Base, :axes) && length(it.args) == 3 &&
+        it.args[3] isa Int && return it
+    return nothing
+end
+
+_value_extent_input(it::Expr) = length(it.args) == 2 ?
+    Symbol("_rkppl_extent_", it.args[2]) :
+    Symbol("_rkppl_extent_", it.args[2], "_", it.args[3])
 
 function _route_conditioned_values!(plan, columns)
     for name in plan.conditioned
