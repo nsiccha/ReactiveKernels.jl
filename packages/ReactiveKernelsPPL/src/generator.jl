@@ -366,7 +366,8 @@ function _assignment_statements(plan::StructuralPlan;
         ex === by_name[name].expr || !_guarded_argument_is_bound(ex, plan.columns) ||
             (ex = _concrete_guarded_argument(ex))
         push!(order, name)
-        rewritten[name] = _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers))
+        rewritten[name] = _bound_extent_indices(name,
+            _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers)), plan)
     end
     destructured = _destructuring_statements(order, rewritten)
     stmts = Expr[]
@@ -446,6 +447,19 @@ function _called_kernel_spec(rhs::Expr)
     head isa GlobalRef && isdefined(head.mod, head.name) || return nothing
     value = getglobal(head.mod, head.name)
     return value isa KernelSpec ? value : nothing
+end
+
+# A retained plate column over a value whose extent binding supplied
+# (`_bind_plate_extents!`) iterates `1:extent`, a data lane, instead of the
+# live value's indices.
+function _bound_extent_indices(name::Symbol, ex, plan::StructuralPlan)
+    it = _value_plate_iterator(name, ex)
+    it === nothing && return ex
+    input = _value_extent_input(it)
+    haskey(plan.columns, input) && !haskey(plan.columns, it.args[2]) || return ex
+    call = ex.args[1]
+    indices = Expr(:call, GlobalRef(Base, :collect), Expr(:call, :(:), 1, input))
+    return Expr(:do, Expr(:call, call.args[1], indices, call.args[3:end]...), ex.args[2])
 end
 
 # The generated scope's `logistic` names a distribution kernel. Values

@@ -3699,6 +3699,13 @@ function _expand_plates(args, data::Set{Symbol};
     expanded = Any[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
+    # Cell locals belong to their plate, as a loop body's locals do in
+    # Julia. A local name another plate already used is respelled `m#k`;
+    # whole-column evaluation splices its locals at model level, so a
+    # model statement reading one is refused instead of reading the cell.
+    taken = union(data, _expr_names(Expr(:block, args...)))
+    plate_locals = Set{Symbol}()
+    spliced = Dict{Symbol,Tuple{Symbol,Int}}()
     line = 0
     for arg in args
         if arg isa LineNumberNode
@@ -3713,10 +3720,13 @@ function _expand_plates(args, data::Set{Symbol};
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
+            arg, locals = _scope_plate_locals(arg, plate_locals, taken)
             stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts)
             for st in stmts
                 pl > 0 && push!(expanded, LineNumberNode(pl))
                 push!(expanded, st)
+                Meta.isexpr(st, :(=), 2) && haskey(locals, st.args[1]) &&
+                    (spliced[st.args[1]] = (locals[st.args[1]], pl))
             end
             append!(ctx, stx)
             append!(params, prm)
@@ -3724,7 +3734,71 @@ function _expand_plates(args, data::Set{Symbol};
         end
         push!(expanded, arg)
     end
+    isempty(spliced) && return expanded, ctx, params
+    for arg in args
+        arg isa Expr || continue
+        Meta.isexpr(arg, :macrocall) && !isempty(arg.args) &&
+            arg.args[1] === Symbol("@plate") && continue
+        defined = Meta.isexpr(arg, :(=), 2) ? arg.args[1] : nothing
+        for name in _value_symbols(arg)
+            name === defined && continue
+            haskey(spliced, name) || continue
+            authored, pl = spliced[name]
+            at = pl > 0 ? " at line $pl" : ""
+            _sfail("`$authored` is a cell local of the `@plate`$at; cell " *
+                   "locals stay in their cell — assign it to an indexed " *
+                   "output of the plate to read its values outside")
+        end
+    end
     return expanded, ctx, params
+end
+
+# Bare cell locals (`m = ...` inside the loop) of one plate, respelled
+# `m#k` when an earlier plate already used the name. Returns the plate
+# and its locals' current spelling => authored name.
+function _scope_plate_locals(st::Expr, plate_locals::Set{Symbol}, taken::Set{Symbol})
+    loop = st.args[3]
+    Meta.isexpr(loop, :for) && Meta.isexpr(loop.args[2], :block) ||
+        return st, Dict{Symbol,Symbol}()
+    names = Symbol[]
+    for c in loop.args[2].args
+        Meta.isexpr(c, :(=), 2) && c.args[1] isa Symbol &&
+            !(c.args[1] in names) && push!(names, c.args[1])
+    end
+    locals = Dict{Symbol,Symbol}()
+    body = loop.args[2]
+    for name in names
+        spelling = name
+        if name in plate_locals
+            k = 2
+            while Symbol(name, "#", k) in taken
+                k += 1
+            end
+            spelling = Symbol(name, "#", k)
+            body = _respell_value(body, name, spelling)
+        end
+        push!(taken, spelling)
+        push!(plate_locals, name)
+        locals[spelling] = name
+    end
+    body === loop.args[2] && return st, locals
+    return Expr(st.head, st.args[1:2]..., Expr(:for, loop.args[1], body)), locals
+end
+
+# Rename a value symbol (never a call head, keyword name or field name).
+_respell_value(ex, from::Symbol, to::Symbol) = ex === from ? to : ex
+function _respell_value(ex::Expr, from::Symbol, to::Symbol)
+    if ex.head === :call && !isempty(ex.args)
+        return Expr(:call, ex.args[1],
+            (_respell_value(a, from, to) for a in ex.args[2:end])...)
+    elseif ex.head === :kw && length(ex.args) == 2
+        return Expr(:kw, ex.args[1], _respell_value(ex.args[2], from, to))
+    elseif ex.head === :. && length(ex.args) == 2 && !(Meta.isexpr(ex.args[2], :tuple))
+        return Expr(:., _respell_value(ex.args[1], from, to), ex.args[2])
+    elseif ex.head === :. && length(ex.args) == 2
+        return Expr(:., ex.args[1], _respell_value(ex.args[2], from, to))
+    end
+    return Expr(ex.head, (_respell_value(a, from, to) for a in ex.args)...)
 end
 
 function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
@@ -3777,6 +3851,9 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
+    _plate_needs_retained_cells(cells, ivar) &&
+        return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
+            broadcasts)
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
@@ -3818,9 +3895,14 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             ex.args[2] === ivar && return ex.args[1]
         ex isa Expr ? Expr(ex.head, map(localread, ex.args)...) : ex
     end
+    # Gathers from data and declared arrays index at `i` or through an
+    # integer data column. Indexing into a per-index value or a cell local
+    # (`t[i][k[i]]`, `p[sel]`) is ordinary Julia inside the retained cell.
     function checkrefs(ex)
         ex isa Expr || return
-        if ex.head === :ref && _expr_has_sym(ex, ivar)
+        base = ex.head === :ref ? ex.args[1] : nothing
+        if ex.head === :ref && _expr_has_sym(ex, ivar) && !(base isa Expr) &&
+                !any(l -> first(l) === base, locals)
             for index in ex.args[2:end]
                 index === ivar && continue
                 if Meta.isexpr(index, :ref, 2) && index.args[2] === ivar
@@ -3883,6 +3965,56 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             ivar, rkind, line, data, plate_defs, ctx, params, pidx))
     end
     return out, ctx, params
+end
+
+# Whole-column evaluation (`_desugar_cell`) strips `[i]` and broadcasts each
+# cell over whole columns. That equals the Julia loop only while every
+# per-index value is a scalar. A definition cell that may hold an array per
+# index is evaluated as retained RK plate cells instead, as plates with
+# observations are: an authored broadcast, indexing or a reduction applied
+# to a per-index value, or a module function or kernel called on one.
+function _plate_needs_retained_cells(cells, ivar::Symbol)
+    perlocals = Set{Symbol}()
+    for c in cells
+        Meta.isexpr(c, :(=), 2) || continue
+        lhs, rhs = c.args
+        _cell_reads_index(rhs, ivar, perlocals) || continue
+        lhs isa Symbol && push!(perlocals, lhs)
+        _retained_cell_expr(rhs, ivar, perlocals) && return true
+    end
+    return false
+end
+
+# A per-index value: a read at the loop index (`x[i]`, `v[g[i]]`, `t[i][k]`)
+# or a cell local computed from one.
+_cell_reads_index(ex, ivar, perlocals) = ex isa Symbol && ex in perlocals
+function _cell_reads_index(ex::Expr, ivar, perlocals)
+    ex.head === :ref && _expr_has_sym(ex, ivar) && return true
+    start = ex.head === :call || (ex.head === :. && length(ex.args) == 2) ? 2 : 1
+    ex.head === :kw && (start = 2)
+    return any(a -> _cell_reads_index(a, ivar, perlocals), ex.args[start:end])
+end
+
+_retained_cell_expr(ex, ivar, perlocals) = false
+function _retained_cell_expr(ex::Expr, ivar, perlocals)
+    per(a) = _cell_reads_index(a, ivar, perlocals)
+    if ex.head === :ref
+        base = ex.args[1]
+        (base isa Symbol ? base in perlocals : per(base)) && return true
+    elseif ex.head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        any(per, ex.args[2].args) && return true
+    elseif ex.head === :call && !isempty(ex.args)
+        f = ex.args[1]
+        args = ex.args[2:end]
+        if any(per, args)
+            f isa Symbol && startswith(string(f), ".") && return true
+            f isa Symbol && f in REDUCTION_FNS && return true
+            f isa Symbol && (_builtin_value_head(f) || Base.isoperator(f) ||
+                _cell_object_call(f)) || return true
+        end
+    end
+    return any(a -> _retained_cell_expr(a, ivar, perlocals), ex.args)
 end
 
 # Bases of the `v[i]` reads in a cell expression, i.e. its per-index operands.

@@ -2196,26 +2196,31 @@ function _plate_rows(plan::StructuralPlan, p::PlateParameter;
         active = Set{Symbol}())
     p.range isa UnitRange && return length(p.range)
     if p.range isa Expr
-        return _value_iterator_length(plan, p, p.range, active)
+        return _value_iterator_length(plan, p.label, p.range, active)
     end
-    p.range isa Symbol && return _value_iterator_length(plan, p,
+    p.range isa Symbol && return _value_iterator_length(plan, p.label,
         Expr(:call, :eachindex, p.range), active)
     return _value_rows(plan, p.name)
 end
 
-function _value_iterator_length(plan::StructuralPlan, p::PlateParameter,
-        iterator, active = Set{Symbol}())
+# The length of `eachindex(v)` / `axes(v, d)` from bound data and declared
+# axes, without evaluating sampled values. A latent plate requires it; a
+# retained cell plate reads its live iterator when it is unavailable
+# (`required = false` returns `nothing`).
+function _value_iterator_length(plan::StructuralPlan, label,
+        iterator, active = Set{Symbol}(); required::Bool = true)
     source = iterator.args[2]
     shape = _value_axes(plan, source, active; data_axes = true)
     # A response cannot determine an unrelated value's extent. Resolve
     # data and declared axes without running sampled values; an opaque
     # live result whose shape is unavailable remains a capability gap.
-    shape === nothing && _fail(p.label, "latent plate iterator " *
+    shape === nothing && !required && return nothing
+    shape === nothing && _fail(label, "latent plate iterator " *
         "$(repr(iterator)) has no extent established by bound data; " *
         "the shape of $source cannot be inferred without evaluating " *
         "sampled values")
     # Julia numbers and zero-dimensional arrays have one index too.
-    sizes = Int[d isa Integer ? d : _array_dim_size(plan, source, p.label, d)
+    sizes = Int[d isa Integer ? d : _array_dim_size(plan, source, label, d)
         for d in shape]
     iterator.args[1] === :eachindex && return prod(sizes)
     k = iterator.args[3]
@@ -7307,8 +7312,45 @@ function _bind_plate_extents!(plan::StructuralPlan, columns)
         columns[input] = _plate_rows(plan, p)
         push!(inputs, input)
     end
+    # Retained plate columns over a value (`@plate for i in eachindex(la)`
+    # with `la` computed): bound data that establish the value's shape also
+    # establish the cell indices, so the plate's index lane is data and RK
+    # caches the cells' data-only work at preparation.
+    extents = Set{Symbol}()
+    for d in (plan.assignments..., plan.derived...)
+        it = _value_plate_iterator(d.name, d.expr)
+        it === nothing && continue
+        haskey(columns, it.args[2]) && continue
+        input = _value_extent_input(it)
+        input in extents && continue
+        haskey(columns, input) && _fail(d.name, "internal input $input " *
+            "is the plate's cell count — drop it from bind_data")
+        source = it.args[1] == GlobalRef(Base, :eachindex) ?
+            Expr(:call, :eachindex, it.args[2]) :
+            Expr(:call, :axes, it.args[2], it.args[3])
+        n = _value_iterator_length(plan, d.name, source; required = false)
+        n === nothing && continue
+        columns[input] = n
+        push!(extents, input)
+    end
     return inputs
 end
+
+# The value iterator (`Base.eachindex(v)` / `Base.axes(v, d)`) of an
+# authored retained plate column (`_desugar_selected_plate`), or `nothing`.
+function _value_plate_iterator(name::Symbol, ex)
+    Base.isgensym(name) && return nothing
+    it = _selected_plate_indices(ex)
+    Meta.isexpr(it, :call) && it.args[2] isa Symbol || return nothing
+    it.args[1] == GlobalRef(Base, :eachindex) && length(it.args) == 2 && return it
+    it.args[1] == GlobalRef(Base, :axes) && length(it.args) == 3 &&
+        it.args[3] isa Int && return it
+    return nothing
+end
+
+_value_extent_input(it::Expr) = length(it.args) == 2 ?
+    Symbol("_rkppl_extent_", it.args[2]) :
+    Symbol("_rkppl_extent_", it.args[2], "_", it.args[3])
 
 function _route_conditioned_values!(plan, columns)
     for name in plan.conditioned
