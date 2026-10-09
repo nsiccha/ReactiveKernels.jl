@@ -611,7 +611,10 @@ that share cell locals (`m = f(t[i], a); c[i] = m; r[i] = 2 .* m`), the
 components of a row output and computed observation arguments come from one
 RK plate whose cell runs those statements once and returns the values
 together; each output reads its own entry. A value reading only data keeps
-its own plate, which runs once when the query or sampler is prepared.
+its own plate, which runs once when the query or sampler is prepared, and
+reads only the cell statements it needs: an output such as
+`wt[i] = 0.5 .* w[i]` beside outputs that read parameters is a data-only
+definition, usable as `weighted` weights.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
