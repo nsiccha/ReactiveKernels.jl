@@ -6,15 +6,18 @@ using ReactiveKernels
 using ReactiveKernelsPPL
 using Test
 
-# Second-order derivatives of prepared queries (`prepare_query_ad`):
-# Hessian-vector products of scalar presets. Oracles are analytic. Every population model has one effect per group, and groups never
+# Second-order and forward derivatives of prepared queries
+# (`prepare_query_ad`): Hessian-vector products of scalar presets, and
+# Jacobian-vector products of the `:observations` arguments. Oracles are
+# analytic. Every population model has one effect per group, and groups never
 # interact, so one direction colored over all groups recovers each group's
-# Hessian entries at once.
+# Hessian/Jacobian entries at once.
 
 # Reverse over forward (`reactivekernels-use` §7a2): forward over reverse
 # fails on the design-matrix product the linear model lowers to.
 const _QD_SECOND_ORDER = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
     AutoEnzyme(; mode = Enzyme.Forward))
+const _QD_FORWARD = AutoEnzyme(; mode = Enzyme.Forward)
 const _QD_REVERSE = AutoEnzyme(; mode = Enzyme.Reverse)
 
 const _QD_GROUPS = 5
@@ -51,6 +54,17 @@ const _QD_PLATE = quote
         c = exp(mu + eta[g[i]]) * exp(-exp(rate) * t[i])
         y[i] ~ Normal(c, sigma)
     end
+end
+
+# The same mean with a combined (additive + proportional) per-observation scale.
+const _QD_COMBINED = quote
+    mu ~ Normal(0, 1)
+    rate ~ Normal(-1, 0.5)
+    sigma ~ Exponential(1)
+    eta[levels(g)] .~ Normal.(0, 1)
+    c = exp.(mu .+ eta[g]) .* exp.(-exp(rate) .* t)
+    s = sigma .* (1 .+ 0.1 .* c)
+    y .~ Normal.(c, s)
 end
 
 _qd_mean(u, layout) = exp.(u[_qd_index(layout, :mu)] .+ u[_qd_effects(layout)][_QD_G]) .*
@@ -137,4 +151,69 @@ end
     @test nested ≈ H * v
     sampler = prepare_sampler(fx.built, fx.bound, u; backend = _QD_REVERSE)
     @test nested_gradient ≈ last(sampler_value_and_gradient!(sampler, similar(u), u))
+end
+
+@testset "observation arguments and their Jacobian-vector products" begin
+    data = Dict(:y => _QD_Y, :g => _QD_G, :t => _QD_T)
+    @test workflow_wants(:observations) === :_ppl_observations
+
+    fx = _qd_build(_QD_COMBINED, data)
+    layout = fx.built.layout
+    d = layout.total
+    u = [0.1 * cos(i) for i in 1:d]
+    imu, irate, isigma = (_qd_index(layout, n) for n in (:mu, :rate, :sigma))
+    ieta = _qd_effects(layout)
+    sigma, rate = exp(u[isigma]), u[irate]
+    c = _qd_mean(u, layout)
+    s = sigma .* (1 .+ 0.1 .* c)
+
+    observations = Base.invokelatest(prepare_query(fx.built, fx.bound, :observations), u)
+    @test keys(observations) == (:y,)
+    @test observations.y.location ≈ c
+    @test observations.y.scale ≈ s
+    pointwise = Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), u)
+    @test pointwise.y ≈ logpdf.(Normal.(c, s), _QD_Y)
+
+    colored = zeros(d)
+    colored[ieta] .= 1.0
+    directions = (colored, _qd_unit(d, imu), _qd_unit(d, irate), _qd_unit(d, isigma))
+    j = prepare_query_ad(prepare_ad_pushforward, fx.built, fx.bound, :observations,
+        _QD_FORWARD, directions, u)
+    value, (deta, dmu, drate, dsigma) = ad_value_and_pushforward(j, directions, u)
+    @test value.y.location ≈ c
+    @test deta.y.location ≈ c
+    @test deta.y.scale ≈ 0.1 .* sigma .* c
+    @test dmu.y.location ≈ c
+    @test drate.y.location ≈ -c .* exp(rate) .* _QD_T
+    @test dsigma.y.location ≈ zero(c) atol = 1e-12
+    @test dsigma.y.scale ≈ s
+
+    # A plate cell with one shared scale: the location is per observation,
+    # the scale stays the shared scalar.
+    plate = _qd_build(_QD_PLATE, data)
+    pu = [0.1 * cos(i) for i in 1:plate.built.layout.total]
+    pobs = Base.invokelatest(prepare_query(plate.built, plate.bound, :observations), pu)
+    @test pobs.y.location ≈ _qd_mean(pu, plate.built.layout)
+    @test pobs.y.scale ≈ exp(pu[_qd_index(plate.built.layout, :sigma)])
+end
+
+@testset "observation arguments beyond location-scale families" begin
+    data = Dict(:y => [isodd(i) for i in 1:8], :x => [0.3i - 1 for i in 1:8])
+    plan = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        y .~ BernoulliLogit.(a .+ b .* x)
+    end, keys(data); conditioned = (:y,))
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    u = [0.1, -0.2]
+    # Other queries never evaluate the observation arguments.
+    @test Base.invokelatest(prepare_query(built, bound, :sampler), u) isa Float64
+    # Not built yet: Bernoulli responses expose no observation arguments.
+    @test_broken try
+        Base.invokelatest(prepare_query(built, bound, :observations), u) isa NamedTuple
+    catch error
+        error isa ContractValidationError || rethrow()
+        false
+    end
 end

@@ -19,6 +19,7 @@ const PPL_NODES = (
     log_jacobian = :log_jacobian,
     posterior = :posterior,
     pointwise = :pointwise,
+    observations = :_ppl_observations,
 )
 
 """
@@ -35,6 +36,15 @@ density per slice. In-cell observations use their caller's data-column
 name and flat data shape. Conditioned declarations contribute here as
 observations. Summing every field gives `:likelihood`; prior-only models
 return an empty `NamedTuple`.
+
+`:observations` returns, under the same keys, the arguments each
+observation's distribution receives: `(location = …, scale = …)` for
+responses of the Normal, Student t and LogNormal families, where entry `i`
+belongs to entry `i` of the response's `:pointwise` densities and a value
+shared by every observation stays a scalar. Prior-only models return an empty
+`NamedTuple`. Preparing it for a program with any other observation (another
+family, a response holding one array per index, a sampling-RHS observation or
+a conditioned declaration) throws a `ContractValidationError` naming them.
 """
 const WORKFLOW_WANTS = (
     sampler = :posterior,
@@ -42,6 +52,7 @@ const WORKFLOW_WANTS = (
     prior = :prior,
     log_jacobian = :log_jacobian,
     pointwise = :pointwise,
+    observations = :_ppl_observations,
 )
 
 """
@@ -299,14 +310,14 @@ second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
 q = prepare_query_ad(prepare_ad_hvp, built, plan, :sampler, second_order, (v,), u0)
 gradient, (hv,) = ad_gradient_and_hvp(q, (v,), u)
 
-j = prepare_query_ad(prepare_ad_pushforward, built, plan, :pointwise,
+j = prepare_query_ad(prepare_ad_pushforward, built, plan, :observations,
                      AutoEnzyme(; mode = Enzyme.Forward), (v,), u0)
-pointwise, (jv,) = ad_value_and_pushforward(j, (v,), u)
+observations, (jv,) = ad_value_and_pushforward(j, (v,), u)
 ```
 
 Gradients and Hessian-vector products need a scalar preset (`:sampler`,
 `:likelihood`, `:prior`, `:log_jacobian`); pullbacks and pushforwards also
-accept `:pointwise`. Directions with disjoint supports
+accept `:pointwise` and `:observations`. Directions with disjoint supports
 over `coordinate_names(built.layout)` compress block-structured Jacobians and
 Hessians (see `ReactiveKernels.prepare_ad_hvp`). The backend's packages must be
 loaded in the calling session.
