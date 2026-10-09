@@ -895,14 +895,27 @@ function _validate_gather_axis(plan::StructuralPlan, name::Symbol, label,
     return _validate_level_gather(plan, name, label, d, g, col)
 end
 
+# A `levels(h)` / `unique(h)` / data-vector axis is keyed by its labels:
+# a gather looks each index value up among them. Integer positions on a
+# label axis are a different reading, so the refusal names the positional
+# declaration of the same extent (`1:length(levels(h))`).
 function _validate_level_gather(plan::StructuralPlan, name::Symbol, label,
         d, g::Symbol, col::AbstractVector)
     lv = _array_axis_levels(plan, name, label, d)
     codes = _declared_codes(col, lv)
-    any(==(0), codes) && _fail(label, "`$name[$g]` looks values of " *
-        "$g up on the axis `levels($(d.args[2]))` of $name, but " *
-        "$g holds values not on that axis")
-    return nothing
+    i = findfirst(==(0), codes)
+    i === nothing && return nothing
+    axis = d.args[1] === :_ppl_axis_values ? string(d.args[2]) :
+        string(d.args[1], "(", d.args[2], ")")
+    positions = d.args[1] === :levels && length(d.args) == 2 &&
+        eltype(col) <: Integer && !(eltype(col) <: Bool) &&
+        all(c -> 1 <= c <= length(lv), col)
+    _fail(label, "gather index $g of $name looks its values up among " *
+        "the labels of the axis `$axis` of $name, but $g holds " *
+        "$(repr(col[i])), which is not a label on that axis" *
+        (positions ? ". $g holds positions 1:$(length(lv)): to gather " *
+            "by position, declare that axis `1:length($axis)` instead " *
+            "of `$axis`" : ""))
 end
 
 function _gather_index_column(plan::StructuralPlan, name::Symbol, label,
