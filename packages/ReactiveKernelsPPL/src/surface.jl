@@ -9335,13 +9335,21 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     op isa Symbol || return _sfail("$where has an anonymous call node")
     args = [a for a in node.args[2:end] if !(a isa LineNumberNode)]
     if op === :.* || op === :.+ || op ===:.-
-        if op === :.+ && length(args) == 1
+        if (op === :.+ || op === :.*) && length(args) == 1
             return _extract_composed_tree(pname, only(args), ctx, subs,
+                scalars, datas)
+        end
+        if (op === :.+ || op === :.*) && length(args) > 2
+            # `.+(a, b, c)` broadcasts Julia's n-ary `+`, which folds
+            # left: `(a .+ b) .+ c` elementwise (likewise `.*`). BRM
+            # emits Julia's n-ary `a + b + c` this way.
+            return _extract_composed_tree(pname, Expr(:call, op,
+                Expr(:call, op, args[1:end-1]...), args[end]), ctx, subs,
                 scalars, datas)
         end
         ok = op === :.- ? length(args) in (1, 2) : length(args) == 2
         ok || return _sfail("$where `$op` takes " *
-            (op === :.- ? "one or two operands" : "two operands"))
+            (op === :.- ? "one or two operands" : "at least one operand"))
         return Expr(:call, op, (_extract_composed_tree(pname, a, ctx,
             subs, scalars, datas) for a in args)...)
     elseif op in _COMPOSED_MORE_OPS
@@ -9586,11 +9594,20 @@ _inlined_computed_defs(ctx, canonmap, data) = Set{Symbol}(nm for nm in ctx.inlin
         _computed_value_def(nm, ctx, canonmap, data))
 
 # A module call's model-level result, written inline or read through a
-# shared definition that stays named for its readers (the definitions
-# below it are no longer inlined either).
+# definition that stays named for its readers: a shared definition (the
+# definitions below it are no longer inlined either), or the value a
+# positional read indexes, which `_inline_structure_expr` keeps named.
 _reads_module_value(ex, ctx) = _contains_module_call(ex) ||
     any(s -> s in ctx.shared_defs && _def_reads_module(s, ctx),
-        _value_symbols(ex))
+        _value_symbols(ex)) ||
+    _indexes_module_value(ex, ctx)
+# `bt = f(x, a); bt[1]` indexes the call's result exactly as the inline
+# `f(x, a)[1]` does. The element has the function's own shape (a tuple
+# element may be a vector), so it is never a proven scalar offset.
+_indexes_module_value(ex, ctx) = ex isa Expr &&
+    ((ex.head === :ref && _is_model_value_def(ex.args[1], ctx) &&
+        _def_reads_module(ex.args[1], ctx)) ||
+     any(a -> _indexes_module_value(a, ctx), ex.args))
 _def_reads_module(s, ctx) = _contains_module_call(ctx.detmap[s]) ||
     any(t -> haskey(ctx.detmap, t) && _def_reads_module(t, ctx),
         _value_symbols(ctx.detmap[s]))

@@ -641,3 +641,51 @@ const _CMP_LEAF_COLS = Dict{Symbol,Any}(
         end
     end
 end
+
+# Julia's `.+(a, b, c)` and `.*(a, b, c)` broadcast the n-ary `+` and `*`,
+# which fold left: `(a .+ b) .+ c` elementwise. BRM emits Julia's n-ary
+# `a + b + c` this way (snag `composed-predict-64339857`). The composition
+# keeps that order, so its density equals the nested spelling's.
+@testset "composed n-ary dotted sums and products fold like Julia's" begin
+    x, y = _cmp_ap_x(), Vector{Float64}(_CMP_AP_COLS[:y])
+    q = (a_th = 0.3, b_th = -0.4, a_al = 0.6, b_al = 0.2, k = -0.3, s = 0.5)
+    priors(q) = sum(logpdf(Normal(0, 1), v) for v in values(q))
+    th(q) = q.a_th .+ q.b_th .* x
+    al(q) = q.a_al .+ q.b_al .* x
+    m(q) = exp(q.k) .* x
+    prog(location) = quote
+        a_th ~ Normal(0, 1); b_th ~ Normal(0, 1)
+        a_al ~ Normal(0, 1); b_al ~ Normal(0, 1)
+        k ~ Normal(0, 1); s ~ Normal(0, 1)
+        th = a_th .+ b_th .* x
+        al = a_al .+ b_al .* x
+        m = exp.(k) .* x
+        $location
+        y .~ Normal.(mu, 1.5)
+    end
+    for (location, tree, value) in (
+            (:(mu = .+(th, al .* m, s)), :((th .+ al .* m) .+ s),
+                q -> (th(q) .+ al(q) .* m(q)) .+ q.s),
+            (:(mu = .+(th, al .* m, s, 0.25)),
+                :(((th .+ al .* m) .+ s) .+ _rkppl_leaf_1),
+                q -> ((th(q) .+ al(q) .* m(q)) .+ q.s) .+ 0.25),
+            (:(mu = th .+ .*(al, m, s)), :(th .+ (al .* m) .* s),
+                q -> th(q) .+ (al(q) .* m(q)) .* q.s))
+        want = q -> sum(logpdf.(Normal.(value(q), 1.5), y)) + priors(q)
+        plan, _, _ = _cmp_ap_check(prog(location), q, want)
+        t = only(only(p for p in plan.predictors if p.name === :mu).terms)
+        @test t.kind === ComposedTerm
+        @test t.options.tree == tree
+    end
+    # refused: Julia's `-` takes one or two operands, so `.-(a, b, c)` is a
+    # MethodError in Julia too (P3, standard Julia semantics).
+    err = try
+        lower_rkppl(prog(:(mu = .-(th, al .* m, s))), keys(_CMP_AP_COLS);
+            conditioned = keys(_CMP_AP_COLS))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("one or two operands", sprint(showerror, err))
+end
