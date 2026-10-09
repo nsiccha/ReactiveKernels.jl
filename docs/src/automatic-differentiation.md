@@ -86,6 +86,50 @@ The returned sensitivity is `J' * output_cotangent`, computed in one reverse
 pass. It is not a full Jacobian. `ad_value_and_pullback!` accepts caller-owned
 array cotangent storage when the backend supports it.
 
+## Retain other WANT values from the gradient sweep
+
+A caller that needs both a gradient and other values of the same point, such
+as per-observation densities beside the gradient of their sum, can name those
+WANT ports in `retain`. The prepared kernel then computes the objective and
+every retained WANT in one primal sweep. Only the objective is differentiated,
+and the retained values of that sweep come back with the gradient, with no
+second primal call:
+
+```julia
+@kernel scored(q::Vector{Float64}; data::Vector{Float64}) = begin
+    terms = plate(q, data) do qi, di
+        term::Float64 = -(di - qi)^2 / 2
+        return term
+    end
+    density::Float64 = sum(terms)
+end
+
+retaining = prepare_ad(
+    scored, backend, parameters;
+    data, active = :q, want = :density, retain = (:terms,),
+)
+value, gradient, retained = ad_value_gradient_and_retained!(
+    retaining, similar(parameters), parameters; data,
+)
+retained.terms   # the plate values the density summed
+```
+
+`retained` is a `NamedTuple` keyed by the retained ports. Each call returns
+freshly computed values. A low-level `PreparedKernel` prepared with several
+WANT ports takes the same `retain`; its one other WANT is the objective.
+`ad_value_gradient_and_retained` is the out-of-place form.
+
+The retained values are those of the gradient's own primal sweep, so
+retention needs a backend that evaluates the objective once at the point and
+keeps that sweep's writes. `ad_retains_primal_sweep(backend)` states it: core
+RK knows no engine and answers `false`, and the Enzyme extension declares
+reverse-mode `AutoEnzyme`. Preparation refuses other backends, which may
+evaluate perturbed points (finite differences), carry dual numbers, or
+restore mutated memory in the reverse pass. Retention is native: a
+`NonAllocatingKernel` and compiled (Reactant) staging do not retain values
+yet. `test/test_ad_retained_outputs.jl` checks the values, gradients and
+refusals.
+
 ## Freeze data-only work during preparation
 
 When data stay fixed across many derivative calls, pass them in the named
@@ -179,7 +223,8 @@ not split by this pass.
 ## Accepted boundary
 
 - Gradient preparation requires a scalar WANT. Pullback preparation accepts one
-  scalar or non-scalar WANT and an output-cotangent exemplar.
+  scalar or non-scalar WANT and an output-cotangent exemplar. Further WANT
+  ports may be retained, not differentiated, with `retain`.
 - Exactly one HAVE port is active.
 - Integer active ports and aliased active boundaries reject.
 - An inactive HAVE downstream of the active port rejects rather than cutting a
