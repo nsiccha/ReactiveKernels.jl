@@ -106,6 +106,10 @@ ReactiveKernels.@kernel exp_value(x_) = begin
     x = exp.(x_)
 end
 column_gather(draws, index, margin) = draws[index, margin]
+# A call returning a tuple whose elements have different shapes, live in
+# its second argument, and a data-only one.
+pair_reads(x, b) = (cumsum(b .* x), sum(b .* x))
+data_pair(x) = (sum(x), 2 .* x)
 end
 const _FV = FunctionsAsValuesModels
 
@@ -1445,4 +1449,79 @@ end
         @test isapprox(g, _fv_findiff(w -> Base.invokelatest(kern, w), u);
             rtol = 1e-5, atol = 1e-7)
     end
+end
+
+# `f(x, b)[k]` reads element k of the call's result, exactly as the named
+# `r = f(x, b); r[k]` does; the element has the function's own shape, so a
+# vector element is one value per observation and a number broadcasts.
+# Read once, inline or named, live or data-only (snag rkppl-indexed-mu-0f0ed295).
+@testset "functions as values: a positional read of a call's result" begin
+    cols = _fv_cols()
+    x, y = cols[:x], cols[:y]
+    x0, y0 = copy(x), copy(y)
+    cases = (
+        (quote
+            b ~ Normal(0, 2)
+            sigma ~ Exponential(1.0)
+            mu = pair_reads(x, b)[1]
+            y .~ Normal.(mu, sigma)
+        end, quote
+            b ~ Normal(0, 2)
+            sigma ~ Exponential(1.0)
+            r = pair_reads(x, b)
+            mu = r[1]
+            y .~ Normal.(mu, sigma)
+        end, th -> th.b .* cumsum(x)),
+        (quote
+            a ~ Normal(0, 5)
+            b ~ Normal(0, 2)
+            sigma ~ Exponential(1.0)
+            mu = a .* x .+ pair_reads(x, b)[2]
+            y .~ Normal.(mu, sigma)
+        end, quote
+            a ~ Normal(0, 5)
+            b ~ Normal(0, 2)
+            sigma ~ Exponential(1.0)
+            r = pair_reads(x, b)
+            mu = a .* x .+ r[2]
+            y .~ Normal.(mu, sigma)
+        end, th -> th.a .* x .+ th.b * sum(x)),
+        (quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1.0)
+            mu = a .+ data_pair(x)[2]
+            y .~ Normal.(mu, sigma)
+        end, quote
+            a ~ Normal(0, 5)
+            sigma ~ Exponential(1.0)
+            d = data_pair(x)
+            mu = a .+ d[2]
+            y .~ Normal.(mu, sigma)
+        end, th -> th.a .+ 2 .* x),
+    )
+    for (inline_ast, named_ast, location) in cases
+        inline = _fv_build(inline_ast, cols)
+        named = _fv_build(named_ast, cols)
+        layout = inline[3].layout
+        @test coordinate_names(layout) == coordinate_names(named[3].layout)
+        n = length(coordinate_names(layout))
+        u = collect(range(-0.4, 0.3; length = n))
+        th = ReactiveKernelsPPL.constrain(layout, u)
+        # sigma = exp(u_sigma): its log Jacobian is u_sigma.
+        prior = (haskey(th, :a) ? logpdf(Normal(0, 5), th.a) : 0.0) +
+            (haskey(th, :b) ? logpdf(Normal(0, 2), th.b) : 0.0) +
+            logpdf(Exponential(1.0), th.sigma) +
+            u[findfirst(==(:sigma), coordinate_names(layout))]
+        expected = prior + sum(logpdf.(Normal.(location(th), th.sigma), y))
+        @test _fv_value(inline[3], inline[2], :sampler, u) ≈ expected rtol = 1e-12
+        @test _fv_value(named[3], named[2], :sampler, u) ≈ expected rtol = 1e-12
+        q = prepare_sampler(inline[3], inline[2], u; backend = _FV_BACKEND)
+        kern = prepare_query(inline[3], inline[2], :sampler)
+        _, g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, q.ad,
+            similar(u), u)
+        @test isapprox(g, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
+        @test u == collect(range(-0.4, 0.3; length = n))
+    end
+    @test x == x0 && y == y0
 end
