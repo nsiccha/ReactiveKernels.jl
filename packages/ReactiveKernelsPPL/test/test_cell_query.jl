@@ -76,6 +76,9 @@ _cq_central(f, u, j; h = 1e-6) =
             @test g[j] ≈ _cq_central(x -> q(x, i), u, j) rtol = 1e-5
         end
     end
+    # Gradients leave the bound per-group arrays and later values unchanged.
+    @test data == _cq_grouped_data()
+    @test [q(u, i) for i in eachindex(data.y)] ≈ cells
 end
 
 @testset "cell query: elementwise and scalar-cell observations" begin
