@@ -242,9 +242,9 @@ end
 # Structural record depth must not erase scalar types inside the retained
 # position/scan loops. The recurrence has an independent, exact prefix oracle.
 @kernel nested_position_scan(position, xs) = begin
-    trajectory = scan(xs, Ref(position.group.response);
-                      init=position.group.response.seed, include_init=true) do previous, x, p
-        next = previous + p.rate * x
+    response = position.group.response
+    trajectory = scan(xs; init=response.seed, include_init=true) do previous, x
+        next = previous + response.rate * x
         (next, next)
     end
     return trajectory

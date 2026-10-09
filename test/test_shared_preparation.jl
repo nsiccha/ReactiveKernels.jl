@@ -387,8 +387,8 @@ end
         @kernel plated(data, q) = begin
             b = square(data)
             observations::UnitRange{Int} = 1:length(b)
-            values::Vector{Float64} = plate(observations, Ref(b), Ref(q)) do t, shared, w
-                shared[t] * w[t]
+            values::Vector{Float64} = plate(observations) do t
+                b[t] * q[t]
             end
             total = sum(values)
             return total

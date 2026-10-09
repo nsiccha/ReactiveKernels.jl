@@ -30,9 +30,9 @@ end
     end
 end
 @kernel object_observations(groups, mu::Float64, sigma::Float64) = begin
-    grouped = plate(groups, Ref(mu), Ref(sigma)) do observations, location, scale
+    grouped = plate(groups) do observations
         pointwise = plate(observations) do value
-            scalar_normal(value, location, scale).logpdf()
+            scalar_normal(value, mu, sigma).logpdf()
         end
         sum(pointwise)
     end
@@ -40,20 +40,20 @@ end
     return total
 end
 @kernel method_observations(groups, mu::Float64, sigma::Float64) = begin
-    grouped = plate(groups, Ref(mu), Ref(sigma)) do observations, location, scale
-        sum(plate(observations, Ref(location), Ref(scale)) do value, location, scale
-            normal_method(; mu=location, sigma=scale).logpdf(value)
+    grouped = plate(groups) do observations
+        sum(plate(observations) do value
+            normal_method(; mu=mu, sigma=sigma).logpdf(value)
         end)
     end
     total = sum(grouped)
     return total
 end
 @kernel computed_observations(groups, mu::Float64, sigma::Float64) = begin
-    grouped = plate(groups, Ref(mu), Ref(sigma)) do observations, location, scale
-        shifted = location + 0.25
-        pointwise = plate(observations, Ref(shifted)) do value, shifted
+    grouped = plate(groups) do observations
+        shifted = mu + 0.25
+        pointwise = plate(observations) do value
             centered = value - shifted
-            normal_method(0.0, scale).logpdf(centered + 0.25) + 0.0
+            normal_method(0.0, sigma).logpdf(centered + 0.25) + 0.0
         end
         sum(pointwise)
     end
@@ -61,10 +61,10 @@ end
     return total
 end
 @kernel guarded_observations(groups, mu::Float64, sigma::Float64) = begin
-    grouped = plate(groups, Ref(mu), Ref(sigma)) do observations, location, scale
+    grouped = plate(groups) do observations
         pointwise = plate(observations) do value
-            value >= 0 ? normal_method(location, scale).logpdf(value) :
-                         normal_method(location, -scale).logpdf(value)
+            value >= 0 ? normal_method(mu, sigma).logpdf(value) :
+                         normal_method(mu, -sigma).logpdf(value)
         end
         sum(pointwise)
     end
@@ -72,10 +72,10 @@ end
     return total
 end
 @kernel deep_object_observations(groups, mu::Float64, sigma::Float64) = begin
-    grouped = plate(groups, Ref(mu), Ref(sigma)) do group, location, scale
+    grouped = plate(groups) do group
         middle = plate(group) do observations
             pointwise = plate(observations) do value
-                scalar_normal(value, location, scale).logpdf()
+                scalar_normal(value, mu, sigma).logpdf()
             end
             sum(pointwise)
         end
@@ -85,9 +85,9 @@ end
     return total
 end
 @kernel scanned_object_observations(groups, mu::Float64, sigma::Float64) = begin
-    grouped = plate(groups, Ref(mu), Ref(sigma)) do observations, location, scale
-        terms = scan(observations, Ref(location), Ref(scale); init=0.0) do carry, value, m, s
-            density = normal_method(m, s).logpdf(value)
+    grouped = plate(groups) do observations
+        terms = scan(observations; init=0.0) do carry, value
+            density = normal_method(mu, sigma).logpdf(value)
             (carry + density, density)
         end
         sum(terms)
