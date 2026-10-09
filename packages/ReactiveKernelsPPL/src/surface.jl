@@ -261,8 +261,7 @@ function condition(plan::StructuralPlan; kwargs...)
     names = Set(p.name for ps in (plan.parameters, plan.array_parameters,
         plan.vector_parameters, plan.plate_parameters) for p in ps)
     computed = _bound_module_data_names(plan)
-    union!(computed, (d.name for d in plan.derived if
-        any(r -> r.response === d.name, plan.responses)))
+    union!(computed, _derived_response_names(plan))
     columns = Dict{Symbol,ColumnData}(k => v for (k,v) in plan.columns if k ∉ computed)
     # Bound response storage is numeric. Restore its host-side missing entries
     # before rebinding so replacement data gets a fresh presence mask, while

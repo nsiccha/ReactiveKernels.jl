@@ -1453,9 +1453,12 @@ function _axis_exempt_columns(plan::StructuralPlan)
     # axis.
     computed = _bound_module_data_names(plan)
     inputs, wholedefs = _bound_model_level_inputs(plan)
+    # A derived response read only whole (a caller-owned law's observation)
+    # carries no observation axis, exactly like the same value bound as data.
+    observed = intersect(Set{Symbol}(_derived_response_names(plan)), wholedefs)
     modelvals = union(
         intersect(computed, Set{Symbol}(a.name for a in plan.assignments)),
-        intersect(computed, wholedefs), inputs)
+        intersect(computed, wholedefs), observed, inputs)
     union!(modelvals, (n for n in computed if plan.columns[n] isa Number))
     # Binding-owned presence masks encode observations, not model dimensions.
     union!(modelvals, (_observed_mask_name(r.response) for r in plan.responses
@@ -2492,7 +2495,7 @@ function _validate_column_names(plan::StructuralPlan)
     # values ARE the response data), so response-named derived columns
     # are exempt from the overlap rule; every other derived name still
     # collides (a caller column the model derives is a shadowing bug).
-    resps = Set{Symbol}(r.response for r in plan.responses)
+    resps = Set{Symbol}(_derived_response_names(plan))
     # Module data definitions bind-materialize under their own names too.
     computed = _bound_module_data_names(plan)
     col_overlap = filter(
@@ -2532,13 +2535,32 @@ function _validate_assignments_data(plan::StructuralPlan)
     return nothing
 end
 
+# The definitions `.~` statements observe as responses, whatever law
+# observes them: a built-in family (`plan.responses`, which lowering admits
+# only over definitions reading data) or a caller-owned sampling law
+# (`plan.external_observations`) over a definition reading only data.
+# Binding evaluates each once and validates it as the response
+# (`_materialize_derived_responses!`), exactly like the same value bound as
+# data. A caller-owned law observing a parameter-dependent definition
+# reads it in the graph instead.
+function _derived_response_names(plan::StructuralPlan)
+    names = Symbol[r.response for r in plan.responses
+        if _is_derived(plan, r.response)]
+    known = Set{Symbol}(_all_names(plan))
+    for p in plan.external_observations
+        _is_derived(plan, p.name) &&
+            _reads_data_only(plan, p.name, known, Set{Symbol}()) &&
+            push!(names, p.name)
+    end
+    return unique!(names)
+end
+
 # A derived column whose value `bind_data` checks rather than its
 # expression's shape: a data-only module value read per observation (its
 # length or row count), or a derived response, which binding evaluates
 # and validates as the response (`_materialize_derived_responses!`).
 _bind_checked_derived(plan::StructuralPlan, name::Symbol) =
-    _is_bind_data_derived(plan, name) ||
-        any(r -> r.response === name, plan.responses)
+    _is_bind_data_derived(plan, name) || name in _derived_response_names(plan)
 
 function _validate_vector_structure(plan::StructuralPlan)
     for d in plan.derived
@@ -5470,8 +5492,10 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
     columns = copy(plan.columns)
     # A definition the cell reads per index (`sc[i]` with `sc = dose .* s`)
     # supplies that index's value; the data it reads are whole inputs of
-    # that value, not observation operands.
-    for c in _response_reads(plan, r, arrays; stop = Set{Symbol}(perindex))
+    # that value, not observation operands. So are the inputs of a derived
+    # response (`y = cells[perm]`), which binding has already evaluated.
+    for c in _response_reads(plan, r, arrays;
+            stop = Set{Symbol}((perindex..., r.response)))
         c === r.response && continue
         v = plan.columns[c]
         cells = try
@@ -6325,7 +6349,8 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         return nothing
     end
     foreach(indices, values(nodes))
-    resps = Set{Symbol}(r.response for r in plan.responses)
+    resps = union(Set{Symbol}(r.response for r in plan.responses),
+        _derived_response_names(plan))
     known = _all_names(plan)
     memo = Dict{Symbol,Bool}()
     function dataonly(nm, active)
@@ -6801,11 +6826,15 @@ function _route_bound_values!(plan::StructuralPlan,
 end
 
 # A response bound to a number is one observation (`y .~ Normal.(mu, s)`
-# with a scalar `y`, as in Julia): it binds as a one-entry vector.
+# with a scalar `y`, as in Julia): it binds as a one-entry vector, whatever
+# law observes it (`y .~ LogDensity.(f, mu)` too).
 function _scalar_responses_as_observations!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
-    for r in plan.responses, nm in (r.response, r.count_columns...,
-            r.extra_responses...)
+    observed = Symbol[p.name for p in plan.external_observations]
+    for r in plan.responses
+        push!(observed, r.response, r.count_columns..., r.extra_responses...)
+    end
+    for nm in observed
         v = get(columns, nm, nothing)
         v isa Number && (columns[nm] = [v])
     end
@@ -6983,8 +7012,7 @@ end
 
 function _materialize_derived_responses!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
-    derived =
-        [r.response for r in plan.responses if _is_derived(plan, r.response)]
+    derived = _derived_response_names(plan)
     isempty(derived) && return columns
     det_exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     for d in plan.derived
