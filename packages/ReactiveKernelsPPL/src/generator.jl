@@ -1617,14 +1617,16 @@ end
 
 # The fused whole-vector likelihoods (`dot(y, η)`, `sum(exp, η)`) need one
 # location entry per response entry. A latent vector keeps its own length and
-# broadcasts as a Julia array does (one entry stretches over every row); the
-# plate path evaluates that, so fusion requires equal lengths.
+# broadcasts as a Julia array does (one entry stretches over every row), and so
+# does a response: a number or one-entry `y` stretches over a longer location.
+# The plate path evaluates that, so fusion requires equal lengths.
 function _wholevec_location(r::LikelihoodSpec, plan::StructuralPlan)
     y = get(plan.columns, r.response, nothing)
     rows = y isa AbstractVector ? length(y) : nothing
     _is_latent_location(r, plan) && return _latent_rows(plan, r.predictor) == rows
     pred = _predictor(plan, r.predictor)
     _broadcast_affine(plan, pred) && return false
+    _predictor_rows(plan, pred.name) == rows || return false
     return all(pred.terms) do t
         t.kind === LatentTerm || return true
         n = _latent_rows(plan, only(t.columns))
