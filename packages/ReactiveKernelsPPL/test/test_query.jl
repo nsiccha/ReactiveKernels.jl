@@ -48,12 +48,13 @@ end
     @test PPL_NODES.posterior === :posterior
     @test PPL_NODES.log_jacobian === :log_jacobian
     @test Tuple(values(PPL_NODES)) ===
-        (:likelihood, :prior, :log_jacobian, :posterior, :pointwise)
+        (:likelihood, :prior, :log_jacobian, :posterior, :pointwise, :_ppl_observations)
     @test workflow_wants(:sampler) === :posterior
     @test workflow_wants(:likelihood) === :likelihood
     @test workflow_wants(:prior) === :prior
     @test workflow_wants(:log_jacobian) === :log_jacobian
     @test workflow_wants(:pointwise) === :pointwise
+    @test workflow_wants(:observations) === :_ppl_observations
     @test_throws ArgumentError workflow_wants(:nonsense_preset)
 end
 
