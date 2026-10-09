@@ -199,11 +199,28 @@ end
 # Construction calls the positional `_add_recipe!` rather than the keyword
 # `add!`: a keyword call's argument type names the op's concrete type, so it
 # would compile a fresh keyword-call specialization for every authored op.
+# `destructured` records an authored tuple left side, `(a, b) = rhs`; only a
+# nested `KernelSpec` call distinguishes `(a,) = f(x)` from `a = f(x)`.
 Base.@nospecializeinfer function _kernel_add!(graph::Graph,
                       @nospecialize(ins), @nospecialize(outs), @nospecialize(op),
                       cost, cse_key, effectful,
-                      source = _NO_KERNEL_SOURCE)
+                      source = _NO_KERNEL_SOURCE, destructured::Bool = false)
     _add_recipe!(graph, ins, outs, op, cost, cse_key, effectful, source)
+end
+
+# A multi-output nested call bound to one name is the tuple a runtime
+# `child(args...)` returns. The child outputs stay separate hidden graph values,
+# packed by one ordinary recipe, so the planner still sees every child recipe
+# and `_kernel_synthesize_pack_edges!` adds the positional unpack edges.
+@inline _kernel_tuple_pack(values...) = values
+
+# The tuple type of a multi-output child, or `nothing` when an output boundary
+# is unannotated: like a single `Any` output, that is no type contract, and a
+# `Tuple{Any,...}` annotation would box the caller's value.
+function _kernel_output_tuple_type(spec::KernelSpec)
+    types = Any[valtype(value) for value in outputs(spec)]
+    any(T -> T === Any, types) && return nothing
+    Core.apply_type(Tuple, types...)
 end
 
 # A definition-stable structural key for compiler-owned source operations.  It
@@ -311,7 +328,7 @@ runtime `KernelSpec` call remains.
 Base.@nospecializeinfer function _kernel_add!(
         graph::Graph, @nospecialize(ins), @nospecialize(outs),
         @nospecialize(spec::KernelSpec), cost, cse_key, effectful,
-        source = _NO_KERNEL_SOURCE)
+        source = _NO_KERNEL_SOURCE, destructured::Bool = false)
     cost == 1.0 && cse_key === nothing && effectful === false ||
         throw(ArgumentError(
             "nested KernelSpec calls do not accept call-site @recipe metadata; " *
@@ -326,9 +343,41 @@ Base.@nospecializeinfer function _kernel_add!(
     length(call_inputs) == length(child_inputs) || throw(ArgumentError(
         "nested KernelSpec call has $(length(call_inputs)) argument(s), but its default HAVE " *
         "boundary has $(length(child_inputs)) port(s)"))
+
+    # A multi-output child bound to ONE name (`t = child(x)`, or a strict
+    # subexpression `child(x)[1]` lifted into a generated port) is the tuple
+    # the runtime call returns. Splice the child into hidden output values and
+    # pack them into the caller's port. The pack reads every output, so the
+    # complete child WANT boundary is computed even when a later projection
+    # reads one element; destructuring keeps per-output pruning.
+    if !destructured && length(outs) == 1 && length(child_outputs) > 1
+        packed = only(outs)
+        tuple_type = Core.apply_type(Tuple, Any[valtype(value) for value in child_outputs]...)
+        declared = valtype(packed)
+        typeintersect(tuple_type, declared) === Union{} && throw(ArgumentError(
+            "nested KernelSpec call returns a $(length(child_outputs))-output tuple " *
+            "$tuple_type, but :$(packed.name) is declared $declared; destructure the " *
+            "outputs, e.g. `(a, b) = f(x)`, or declare a tuple type"))
+        hidden = Tuple(value!(graph, gensym(:nested_output), valtype(value))
+                       for value in child_outputs)
+        _kernel_add!(graph, call_inputs, hidden, spec, cost, cse_key, effectful, source,
+                     true)
+        pack_source = Expr(:tuple, (value.name for value in hidden)...)
+        _add_recipe!(graph, hidden, (packed,), _kernel_tuple_pack,
+                     cost, nothing, false, pack_source)
+        return _reindex_producers!(graph)
+    end
+    # Julia's `(a,) = t` binds the leading elements and ignores the rest. The
+    # unnamed trailing outputs become hidden values, so the planner still
+    # prunes the child recipes only they need.
+    if destructured && length(outs) < length(child_outputs)
+        trailing = Tuple(value!(graph, gensym(:nested_output), valtype(value))
+                         for value in child_outputs[length(outs)+1:end])
+        outs = (Tuple(outs)..., trailing...)
+    end
     length(outs) == length(child_outputs) || throw(ArgumentError(
-        "nested KernelSpec call assigns $(length(outs)) output(s), but its default WANT " *
-        "boundary has $(length(child_outputs)) port(s); destructure that boundary exactly"))
+        "nested KernelSpec call destructures $(length(outs)) name(s), but its default " *
+        "WANT boundary has only $(length(child_outputs)) port(s)"))
 
     child_graph = getfield(spec, :graph)
     child_have = Set{Int}(canon_id(child_graph, v.id) for v in child_inputs)
@@ -1782,11 +1831,12 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         # graph used as a strict subexpression into its own caller recipe,
         # including generated object endpoints. Otherwise a module KernelSpec
         # becomes an opaque runtime call, or an endpoint's generated name has
-        # no callable binding. Lazy arms and deferred lexical scopes retain
-        # their evaluation position.
+        # no callable binding. A multi-output child lifts to its tuple value
+        # (`child(x)[1]`). Lazy arms and deferred lexical scopes retain their
+        # evaluation position.
         child_spec = _kernel_called_spec(child, mod, locals, nested_specs)
         if lift_specs && straight && _kernel_straight_child(ex, i) &&
-           child_spec !== nothing && length(outputs(child_spec)) == 1
+           child_spec !== nothing
             endpoint_port = gensym(:endpoint_value)
             push!(materialized, (endpoint_port, child_type, child))
             push!(locals, endpoint_port)
@@ -1835,11 +1885,15 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     inferred = if ex.head === :block
         index = findlast(i -> !_kernel_is_line(ex.args[i]), eachindex(ex.args))
         index === nothing ? nothing : child_types[index]
-    elseif spec !== nothing && length(outputs(spec)) == 1
-        output_type = valtype(only(outputs(spec)))
-        # Any is an omitted boundary annotation, not an instruction to box
-        # the caller result (notably a vector-valued plate cell).
-        output_type === Any ? nothing : output_type
+    elseif spec !== nothing
+        if length(outputs(spec)) == 1
+            output_type = valtype(only(outputs(spec)))
+            # Any is an omitted boundary annotation, not an instruction to box
+            # the caller result (notably a vector-valued plate cell).
+            output_type === Any ? nothing : output_type
+        else
+            _kernel_output_tuple_type(spec)
+        end
     else
         nothing
     end
@@ -3898,7 +3952,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                     register!(name, nothing)
                     push!(entries,
                           (:recipe, Tuple{Symbol,Any}[(name, nothing)], expression,
-                           Dict{Symbol,Any}(), nothing))
+                           Dict{Symbol,Any}(), nothing, false))
                 end
                 if outputs[1][2] === nothing && plate_expr.inferred !== nothing
                     push!(annotations[outputs[1][1]],
@@ -3912,7 +3966,8 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                    rhs.args[2] isa Symbol && haskey(inferred_port_types, rhs.args[2])
                 push!(annotations[outputs[1][1]], inferred_port_types[rhs.args[2]])
             end
-            push!(entries, (:recipe, outputs, rhs, metadata, plate_expr))
+            destructured = lhs isa Expr && lhs.head === :tuple
+            push!(entries, (:recipe, outputs, rhs, metadata, plate_expr, destructured))
             continue
         end
 
@@ -3947,7 +4002,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     rewritten_entries = Any[]
     for entry in entries
         if entry[1] === :recipe && entry[5] === nothing
-            _, outputs, authored_rhs, metadata, plate_expr = entry
+            _, outputs, authored_rhs, metadata, plate_expr, destructured = entry
             local_types = Dict{Symbol,Any}()
             materialized = Tuple{Symbol,Any,Any}[]
             rewritten, inferred = _kernel_constructed_endpoint(
@@ -3960,17 +4015,20 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 push!(materialized_names, name)
                 push!(rewritten_entries,
                       (:recipe, Tuple{Symbol,Any}[(name, T)], rhs,
-                       Dict{Symbol,Any}(), nothing))
+                       Dict{Symbol,Any}(), nothing, false))
             end
             for (name, T) in local_types
                 name in materialized_names && continue
                 push!(annotations[name], T)
             end
-            if length(outputs) == 1 && outputs[1][2] === nothing && inferred !== nothing
+            # `inferred` types the whole RHS value; a destructured `(a,)` binds
+            # an element of it, so only a plain one-name target takes it.
+            if !destructured && length(outputs) == 1 && outputs[1][2] === nothing &&
+               inferred !== nothing
                 push!(annotations[outputs[1][1]], inferred)
             end
             push!(rewritten_entries,
-                  (:recipe, outputs, rewritten, metadata, plate_expr))
+                  (:recipe, outputs, rewritten, metadata, plate_expr, destructured))
         else
             push!(rewritten_entries, entry)
         end
@@ -4012,7 +4070,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     produced_names = Symbol[]
     for entry in entries
         entry[1] === :recipe || continue
-        _, outputs, authored_rhs, metadata, plate_expr = entry
+        _, outputs, authored_rhs, metadata, plate_expr, destructured = entry
         # ALIAS-AT-EXPANSION (RK 2026-08-27): a bare-identity `b = a` — single output, RHS a bare
         # DECLARED port (`known` is the full predeclared port namespace, forward refs included),
         # not `b` itself, no `@recipe` metadata, and `b` has exactly ONE authored definition — is
@@ -4053,9 +4111,10 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         op = plate_expr === nothing ? _kernel_operation(
             rhs, deps, known; tensorize = !effectful, mod = mod,
             nested_specs = nested_specs) : plate_expr.operation
-        push!(recipe_statements, :($add_ref($graph_var, $dep_values, $out_values,
-                               $op, $cost, $cse_key, $effectful,
-                               $(QuoteNode(rhs)))))
+        add = :($add_ref($graph_var, $dep_values, $out_values,
+                         $op, $cost, $cse_key, $effectful, $(QuoteNode(rhs))))
+        destructured && push!(add.args, true)
+        push!(recipe_statements, add)
     end
     if !saw_return
         for name in produced_names
