@@ -865,8 +865,12 @@ function _observations_statement(points::Vector{Pair{Symbol,Any}},
         arguments::Vector{Pair{Symbol,Any}})
     covered = Set(first.(arguments))
     missing = Tuple(name for (name, _) in points if !(name in covered))
+    # A tuple literal of quoted names, so the printed program (`kernel_expr`)
+    # parses back to the same call; a `QuoteNode` holding the tuple prints as
+    # `$(QuoteNode(...))`, which `@kernel` cannot evaluate.
     isempty(missing) || return Expr(:(=), :_ppl_observations, Expr(:call,
-        GlobalRef(@__MODULE__, :_ppl_observations_unsupported), QuoteNode(missing)))
+        GlobalRef(@__MODULE__, :_ppl_observations_unsupported),
+        Expr(:tuple, QuoteNode.(missing)...)))
     values = isempty(arguments) ? :(NamedTuple()) :
         Expr(:tuple, (Expr(:(=), name, value) for (name, value) in arguments)...)
     return Expr(:(=), :_ppl_observations, values)
