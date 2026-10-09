@@ -81,6 +81,27 @@ _cq_central(f, u, j; h = 1e-6) =
     @test [q(u, i) for i in eachindex(data.y)] ≈ cells
 end
 
+@testset "cell query: a group's cost does not grow with the number of groups" begin
+    # The predictors `log_k`, `log_v` and the group block `R` are computed at the
+    # queried group only (increment 1b), so a cell allocates the same at 10
+    # groups as at 2,000.
+    function data(n)
+        (; group = ["g$j" for j in 1:n], w = collect(range(-0.3, 0.3; length = n)),
+           amount = fill(10.0, n), t = [[0.5, 1.0, 2.0] for _ in 1:n],
+           y = [[1.8, 1.5, 1.1] for _ in 1:n])
+    end
+    measured = map((10, 2_000)) do n
+        bound, built = _cq_bound(_CQ_GROUPED, data(n), (:y,))
+        q = prepare_cell_query(built, bound, :y)
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        q(u, 2)
+        (; value = q(u, 2), reference = sum(pointwise.y[2]), bytes = @allocated q(u, 2))
+    end
+    @test all(m -> m.value ≈ m.reference, measured)
+    @test measured[1].bytes == measured[2].bytes
+end
+
 @testset "cell query: elementwise and scalar-cell observations" begin
     x = [0.2, -0.4, 1.1, 0.7]
     y = [0.5, -0.1, 1.8, 1.0]

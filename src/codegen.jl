@@ -2540,7 +2540,7 @@ end
 # lowering and the same operation-table entries as the plate itself.
 Base.@nospecializeinfer function _lower_authored_plate_cell!(
         body, runtime_ops, runtime_recipes, @nospecialize(recipe::Recipe),
-        callargs, lhs, tensorized::Bool)
+        callargs, lhs, tensorized::Bool; windows = nothing)
     op = recipe.op::_AuthoredPlateCellOp
     plate = op.plate
     atomic = typeof(plate).parameters[2]
@@ -2570,6 +2570,16 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
         push!(body.args, Expr(:(=), slice,
             Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
         push!(slices, slice)
+    end
+    # A shared array read only at the cell's own row whose producer computes
+    # it row by row is computed at that row (`_CellEmitter`, cell_windows.jl).
+    if windows !== nothing
+        d = windows.pushdowns
+        for (position, batched) in sort!(collect(d.captures[recipe.id]))
+            value = canon_id(d.graph, plate_values[position].id)
+            value in d.pushed || continue
+            slices[position] = _cell_capture!(windows, value, slices[batched])
+        end
     end
     pointwise = gensym(:cell_pointwise)
     if tensorized
@@ -2773,9 +2783,22 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         end
     end
     strip_members = Set(x.id for region in values(strip_regions) for x in region)
+    # Values plate cells read only at their own row, computed there
+    # (`_cell_pushdowns`, cell_windows.jl). Native only: the tensorized product
+    # computes them whole, and both keep the same operation table.
+    cells = !tensorized && inline_embedded && isempty(recycle) &&
+        type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
         callargs = Any[nm(inp) for inp in r.inputs]
+        if cells !== nothing && r.id in cells.recipes
+            # Its table slot stays here; its consumer cell calls it per row.
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            cells.slots[r.id] = length(runtime_ops)
+            foreach(output -> push!(assigned, canon_id(g, output.id)), r.outputs)
+            continue
+        end
 
         if inline_embedded && r.op isa _AuthoredPlateOp
             length(r.outputs) == 1 || throw(ArgumentError(
@@ -2856,7 +2879,9 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         lhs = length(lhsnames) == 1 ? only(lhsnames) : Expr(:tuple, lhsnames...)
         if inline_embedded && r.op isa _AuthoredPlateCellOp
             _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
-                callargs, lhs, tensorized)
+                callargs, lhs, tensorized;
+                windows = cells === nothing || !haskey(cells.captures, r.id) ? nothing :
+                    _CellEmitter(body, cells, names))
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp

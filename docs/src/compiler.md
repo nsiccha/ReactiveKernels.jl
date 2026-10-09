@@ -514,10 +514,39 @@ equals the plate's element at that position and differentiates with ordinary
 native Enzyme Reverse. A plate whose only consumer is this one composes into
 the cell, as plate chains compose, and runs at that cell only. So does a plate
 read only by cells at one position (several `plate_cell` values sharing an
-index port): each of those cells runs it at that position. Any other value the
-cell reads is computed as usual. A position outside the domain throws
-`BoundsError`. Several plates can share one index port by passing the same
-`index` to successive `plate_cell` calls.
+index port): each of those cells runs it at that position. A position
+outside the domain throws `BoundsError`. Several plates can share one index
+port by passing the same `index` to successive `plate_cell` calls.
+
+A whole array the cell captures and reads only at its own position, `v[i]`
+with `i` an integer element of a batched argument, is computed at that row
+only when its producer computes it row by row. The native lowering supports
+these producers:
+
+- a dotted expression of inputs, numeric literals and gathers `A[I]` or
+  `A[I, k]` (an integer vector input `I`, integer literals `k`);
+- such a gather alone;
+- a product `A * W` with an array input as its left factor (row `r` is
+  `A[r:r, :] * W`). A matrix-vector product `X * beta` (a matrix input and a
+  vector input) can be read like any other value; other products only by
+  gathers `R[g, k]`, since their full shape is not known before they run.
+
+The producer's own operation runs on one-row views of its row-aligned
+operands; an operand that broadcasting extrudes is passed whole. A value it
+gathers from is computed at the gathered row by the same rule. So for
+`R = Z * F'` and `log_k = a .+ b .* w .+ R[g, 1]` read as `log_k[i]`, the cell
+computes `log_k` at `i` and `R` at row `g[i]`, at a cost that does not grow
+with the domain; a population term `pop = X * beta` in `log_k = pop .+ …` is
+computed at row `i` the same way. A value is computed at rows only when every reader reads it
+this way. A value read whole anywhere, wanted, or produced any other way
+(including through an opaque function call) is computed whole as before.
+
+The full broadcast shape of each such expression is still checked from its
+operands' axes (`DimensionMismatch`), and the cell's own reads and the factor
+rows are bounds-checked. An error that only another row would raise, such as
+an out-of-range gather index at another position, is not raised, just as the
+cell does not run other cells. The tensorized lowering computes these values
+whole.
 
 ### Inspecting structure
 

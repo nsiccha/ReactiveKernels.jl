@@ -150,6 +150,42 @@ end
         (; y1 = zeros(3), y2 = zeros(2)))
 end
 
+@testset "log-link responses stretch a singleton response" begin
+    # Bernoulli-logit and Poisson-log fuse a full response into whole-vector
+    # sums (`dot(y, eta)`); a number or one-entry response stretches over the
+    # location's rows, as Julia broadcasting and the Normal response do.
+    x = [-1.2, -0.4, 0.3, 0.9, 1.6]
+    u = [0.1, 0.2]
+    eta = u[1] .+ u[2] .* x
+    families = (
+        (@rkppl(begin
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            mu = a .+ b .* x
+            y .~ Bernoulli.(logistic.(mu))
+        end), y -> logpdf.(Bernoulli.(1 ./ (1 .+ exp.(-eta))), y),
+            y -> y .- 1 ./ (1 .+ exp.(-eta)),
+            (true, 0, [true], [1], fill(false), [true, false, true, true, false])),
+        (@rkppl(begin
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            mu = a .+ b .* x
+            y .~ Poisson.(exp.(mu))
+        end), y -> logpdf.(Poisson.(exp.(eta)), y),
+            y -> y .- exp.(eta),
+            (3, [2], fill(0), [0, 2, 1, 4, 3])),
+    )
+    for (model, pointwise, score, ys) in families, y in ys
+        before = deepcopy((x, y))
+        bound = model(; x) | (; y)
+        residual = score(y)
+        expected = sum(pointwise(y)) + sum(logpdf.(Normal(), u))
+        gradient = [sum(residual) - u[1], sum(residual .* x) - u[2]]
+        _os_check(bound, expected, gradient, u)
+        @test (x, y) == before
+    end
+end
+
 @testset "elementwise family operands retain observation shapes" begin
     model = @rkppl begin
         p ~ Beta(2, 3)

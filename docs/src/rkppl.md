@@ -708,7 +708,11 @@ Values the cell reads per index supply that index's array or number. Examples
 are `x[i]`, a per-group scalar `mu[i]`, or the per-group result `loc[i]` of a
 function-shaped kernel. Every other value is shared by all indices, and each
 per-index value broadcasts against its response array as Julia requires. The
-observation lowers to RK's nested group and observation plates: one retained
+loop may iterate another array's indices, such as `eachindex(t)` or
+`axes(t, 1)` for a `t` holding one longer array per index. That array supplies
+the indices only, so its arrays need not broadcast with the response's; a cell
+local computed from it, such as `m = f(t[i], picks[i], a)`, supplies that
+index's value. The observation lowers to RK's nested group and observation plates: one retained
 observation plate runs inside the group plate, with no copy per group. The
 `:pointwise` query returns one array of densities per index, and empty arrays
 contribute zero. Native values and ordinary Enzyme reverse gradients are
@@ -879,10 +883,15 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 `prepare_cell_query` evaluates ONE cell of the plates that observe the named
 observations: one iteration of an `@plate for` loop, such as one group's or one
 subject's observations, or one entry of an elementwise observation `y .~ …`.
-Only that cell runs, so its cost is what one iteration costs, plus any value
-the cell reads whole (such as a predictor vector indexed `log_k[i]`). When the
-queried observations read one shared cell (two outputs of one loop), each
-observation's cell runs that shared cell at the same index.
+Only that cell runs. Predictor vectors the cell reads at its own index are
+computed at that index only: for `log_k = a .+ b .* w .+ R[group, 1]` with
+`R = Z * F'`, read as `log_k[i]`, the cell computes `log_k[i]` from row
+`group[i]` of `R` (see "One cell of a plate" in the compiler guide for the
+supported forms). Its cost is then what one iteration costs, independent of the
+number of groups. A predictor computed through a module function call, or read
+whole elsewhere in the program, is still computed for every index.
+When the queried observations read one shared cell (two outputs of one loop),
+each observation's cell runs that shared cell at the same index.
 
 ```julia
 q = prepare_cell_query(built, plan, :y)          # or (:y, :z): one loop's observations
