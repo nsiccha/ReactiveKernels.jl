@@ -4985,56 +4985,62 @@ _readable_bound_constant(value) = value
 
 # --- display-only value inlining ---------------------------------------------------
 #
-# `ex` with `value` in place of the free name `name`, or `nothing` when that is
-# not a plain substitution: a name read inside a function, loop, comprehension
-# or macro body, or a computed `value` read more than once (it would read as
-# computed more than once). A name read nowhere leaves `ex` unchanged. Display
-# only: the executable program keeps its ports.
+# `readable_code` shows a recipe's source with each authored name it reads in
+# place of the program variable that holds it, as a human writes an inlined
+# call: `exp(unconstrained[2])`, not `let u = unconstrained[2]; exp(u) end`. A
+# name, literal or once-read value takes the name's place. A computed value
+# read more than once, a name read inside a function, loop, comprehension or
+# macro body, and anything a substitution could capture (a name the source
+# itself binds) stay `let` bindings. Display only: `code_expr` keeps the ports.
 _readable_literal(x) = x isa Union{Number,AbstractString,Char,Nothing,QuoteNode}
 
-function _readable_inline_value(ex, name::Symbol, value)
-    uses = _readable_free_uses(ex, name)
-    uses === nothing && return nothing
-    uses == 0 && return ex
-    uses == 1 || value isa Symbol || _readable_literal(value) || return nothing
-    _readable_substitute(ex, name, value)
-end
-
-const _READABLE_SCOPE_HEADS = (:->, :function, :do, :for, :while, :generator,
+const _READABLE_SCOPE_HEADS = (:->, :function, :for, :while, :generator,
     :comprehension, :typed_comprehension, :macrocall, :struct, :module)
 
 _readable_let_bindings(header) =
     header isa Expr && header.head === :block ? header.args : Any[header]
-_readable_binding_name(binding) =
-    binding isa Symbol ? binding :
-    binding isa Expr && binding.head === :(=) && binding.args[1] isa Symbol ?
-        binding.args[1] : nothing
+
+_readable_symbols!(names, x::Symbol) = push!(names, x)
+_readable_symbols!(names, x) = names
+function _readable_symbols!(names, ex::Expr)
+    ex.head in (:quote, :inert) && return names
+    foreach(arg -> _readable_symbols!(names, arg), ex.args)
+    names
+end
+
+# Every name `ex` binds: assignment, `let` and `local` targets, function and
+# do-block parameters, loop and generator variables.
+function _readable_bound_names!(names, ex)
+    ex isa Expr || return names
+    ex.head in (:quote, :inert) && return names
+    if ex.head === :kw
+        return _readable_bound_names!(names, ex.args[end])
+    elseif ex.head in (:(=), :->, :function) && !isempty(ex.args)
+        _readable_symbols!(names, ex.args[1])
+    elseif ex.head in (:local, :global)
+        _readable_symbols!(names, ex)
+    elseif ex.head === :let
+        for binding in _readable_let_bindings(ex.args[1])
+            binding isa Symbol && push!(names, binding)
+        end
+    end
+    foreach(arg -> _readable_bound_names!(names, arg), ex.args)
+    names
+end
 
 # The number of free reads of `name` in `ex`, or `nothing` when one sits in a
-# scope this display rewrite does not analyze.
+# scope this display rewrite does not analyze. An assignment target, keyword
+# or named-field label is not a read; a do-block's call arguments are.
 function _readable_free_uses(ex, name::Symbol)
     ex === name && return 1
     ex isa Expr || return 0
     ex.head in (:quote, :inert) && return 0
     if ex.head in _READABLE_SCOPE_HEADS
         return _readable_mentions(ex, name) ? nothing : 0
+    elseif ex.head === :do && length(ex.args) == 2
+        _readable_mentions(ex.args[2], name) && return nothing
+        return _readable_free_uses(ex.args[1], name)
     end
-    if ex.head === :let
-        uses = 0
-        shadowed = false
-        for binding in _readable_let_bindings(ex.args[1])
-            if binding isa Expr && binding.head === :(=)
-                n = _readable_free_uses(binding.args[2], name)
-                n === nothing && return nothing
-                uses += n
-            end
-            _readable_binding_name(binding) === name && (shadowed = true)
-        end
-        shadowed && return uses
-        n = _readable_free_uses(ex.args[2], name)
-        return n === nothing ? nothing : uses + n
-    end
-    # An assignment target, keyword or named-field label is not a read.
     args = ex.head in (:(=), :kw) && length(ex.args) == 2 ? ex.args[2:2] : ex.args
     uses = 0
     for arg in args
@@ -5048,37 +5054,65 @@ end
 _readable_mentions(ex, name::Symbol) =
     ex === name || ex isa Expr && any(arg -> _readable_mentions(arg, name), ex.args)
 
-function _readable_substitute(ex, name::Symbol, value)
-    ex === name && return value
+# Simultaneous substitution of the free names in `subst`, at the positions
+# `_readable_free_uses` counts.
+function _readable_substitute(ex, subst::AbstractDict)
+    ex isa Symbol && return get(subst, ex, ex)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
     ex.head in _READABLE_SCOPE_HEADS && return ex
-    if ex.head === :let
-        shadowed = false
-        bindings = Any[]
-        for binding in _readable_let_bindings(ex.args[1])
-            if binding isa Expr && binding.head === :(=)
-                binding = Expr(:(=), binding.args[1],
-                               _readable_substitute(binding.args[2], name, value))
-            end
-            _readable_binding_name(binding) === name && (shadowed = true)
-            push!(bindings, binding)
-        end
-        header = ex.args[1] isa Expr && ex.args[1].head === :block ?
-            Expr(:block, bindings...) : only(bindings)
-        body = shadowed ? ex.args[2] : _readable_substitute(ex.args[2], name, value)
-        return Expr(:let, header, body)
-    end
+    ex.head === :do && length(ex.args) == 2 &&
+        return Expr(:do, _readable_substitute(ex.args[1], subst), ex.args[2])
     ex.head in (:(=), :kw) && length(ex.args) == 2 &&
-        return Expr(ex.head, ex.args[1], _readable_substitute(ex.args[2], name, value))
-    Expr(ex.head, Any[_readable_substitute(arg, name, value) for arg in ex.args]...)
+        return Expr(ex.head, ex.args[1], _readable_substitute(ex.args[2], subst))
+    Expr(ex.head, Any[_readable_substitute(arg, subst) for arg in ex.args]...)
+end
+
+# Whether `value` is the program variable codegen made of the authored `name`
+# to avoid a collision (`_varnames`: `name_<id>` or `name_<id>_<k>`). Such a
+# name stays an explicit binding, so the authored spelling remains visible.
+_readable_collision_rename(name::Symbol, value) =
+    value isa Symbol &&
+    occursin(Regex("^\\Q" * String(name) * "\\E_\\d+(_\\d+)?\$"), String(value))
+
+# `ex` with as many of the `name => value` pairs substituted as is safe, and
+# the pairs that stay bindings, in their given order.
+function _readable_inline_values(ex, pairs)
+    bound = _readable_bound_names!(Set{Symbol}(), ex)
+    inline = falses(length(pairs))
+    for (index, (name, value)) in enumerate(pairs)
+        name in bound && continue
+        _readable_collision_rename(name, value) && continue
+        uses = _readable_free_uses(ex, name)
+        inline[index] = uses !== nothing &&
+            (uses <= 1 || value isa Symbol || _readable_literal(value))
+    end
+    # A substituted value must not read a name the source binds or a name that
+    # stays a binding: it would then read that binding instead.
+    changed = true
+    while changed
+        changed = false
+        blocked = copy(bound)
+        for (index, (name, _)) in enumerate(pairs)
+            inline[index] || push!(blocked, name)
+        end
+        for (index, (_, value)) in enumerate(pairs)
+            inline[index] || continue
+            isdisjoint(_readable_symbols!(Set{Symbol}(), value), blocked) && continue
+            inline[index] = false
+            changed = true
+        end
+    end
+    subst = Dict{Symbol,Any}(pairs[index] for index in eachindex(pairs) if inline[index])
+    (isempty(subst) ? ex : _readable_substitute(ex, subst)), pairs[.!inline]
 end
 
 # Show, in place, the values RK materialized into ports it named: an argument
 # of a composed call (`exponential(4.0).logpdf(x)` passes `4.0` through a
-# hygienic port) or a value with no authored name at all. A literal is shown at
-# every use, a value read once at its use, and one read nowhere in the shown
-# program (a plate argument its authored source already spells) not at all.
+# hygienic port) or a value with no authored name at all. A literal or name is
+# shown at every use, another value read once at its use, and one read nowhere
+# in the shown program (a plate argument its authored source already spells)
+# not at all.
 function _readable_inline_generated(ex::Expr, p::Plan)
     ex.head === :function && length(ex.args) == 2 && ex.args[2] isa Expr &&
         ex.args[2].head === :block || return ex
@@ -5102,22 +5136,17 @@ function _readable_inline_generated(ex::Expr, p::Plan)
         if statement isa Expr && statement.head === :(=) &&
            statement.args[1] isa Symbol && statement.args[1] in candidates
             name, value = statement.args
-            rest = Any[]
-            for later in statements[(index + 1):end]
-                uses = _readable_free_uses(later, name)
-                if uses === nothing
-                    rest = nothing
-                    break
-                end
-                push!(rest, later)
-            end
-            total = rest === nothing ? nothing :
-                sum((_readable_free_uses(later, name) for later in rest); init = 0)
-            if total !== nothing &&
-               (total <= 1 || value isa Symbol || _readable_literal(value))
+            later = statements[(index + 1):end]
+            bound = foldl(_readable_bound_names!, later; init = Set{Symbol}())
+            counts = [_readable_free_uses(statement, name) for statement in later]
+            safe = !(name in bound) && all(!isnothing, counts) &&
+                isdisjoint(_readable_symbols!(Set{Symbol}(), value), bound)
+            if safe && (sum(counts; init = 0) <= 1 || value isa Symbol ||
+                        _readable_literal(value))
+                subst = Dict{Symbol,Any}(name => value)
                 for later_index in (index + 1):length(statements)
                     statements[later_index] =
-                        _readable_substitute(statements[later_index], name, value)
+                        _readable_substitute(statements[later_index], subst)
                 end
                 deleteat!(statements, index)
                 continue
@@ -5185,19 +5214,10 @@ function _readable_recipe_call(recipe::Recipe, args)
     op isa _BoundConstant && return _readable_bound_constant(op.value)
     source = recipe.source
     if !(source isa _NoKernelSource)
-        rhs = deepcopy(source)
-        bindings = Any[]
-        for (name, arg) in zip(_recipe_source_names(recipe), args)
-            name === arg && continue
-            # A source reads a generated name only for a subexpression RK
-            # lifted into its own port (`a + child(x)`). Show its value in
-            # place, as authored, rather than as a binding of the generated name.
-            if _generated_value_name(name)
-                substituted = _readable_inline_value(rhs, name, arg)
-                substituted === nothing || (rhs = substituted; continue)
-            end
-            push!(bindings, Expr(:(=), name, arg))
-        end
+        pairs = Pair{Symbol,Any}[name => arg for (name, arg) in
+                                 zip(_recipe_source_names(recipe), args) if name !== arg]
+        rhs, kept = _readable_inline_values(deepcopy(source), pairs)
+        bindings = Any[Expr(:(=), name, arg) for (name, arg) in kept]
         isempty(bindings) && return rhs
         header = length(bindings) == 1 ? only(bindings) : Expr(:block, bindings...)
         return Expr(:let, header, Expr(:block, rhs))

@@ -62,7 +62,8 @@ _names_identity_recipes(spec) =
     @testset "unannotated child boundaries read the caller's values" begin
         @test _names_identity_recipes(names_parent) == 0
         text = _names_text(names_parent)
-        @test occursin("z = let u = x, w = y", text)
+        # The child's formals read the caller's values in place.
+        @test occursin("z = x * y + 1.0", text)
         @test !occursin("__return__", text)
         @test !occursin("identity(", text)
         @test prepare(names_parent)(1.5, 2.0) == 2 * (1.5 * 2.0 + 1.0)
@@ -88,14 +89,20 @@ _names_identity_recipes(spec) =
         @test !occursin("__return__", text)
         @test !occursin(r"\b(logpdf|log_scale|constrain)_\d+\b", text)
         # The child's own values are named under the caller's result name, so
-        # the two `exponential(4.0)` calls stay distinguishable without ids.
-        @test occursin("var\"lp_s.log_scale\" = let scale = 4.0", text)
-        @test occursin("var\"lp_t.log_scale\" = let scale = 4.0", text)
-        @test occursin("lp_s = let x = s,", text)
-        @test occursin("lp_t = let x = u[2],", text)
-        # A bound child endpoint's scoped port binds its source's own name.
-        @test occursin("var\"lp_m.standard.logpdf\" = let z = var\"lp_m.standardized\"", text)
-        @test !occursin("let var\"standard.z\"", text)
+        # the two `exponential(4.0)` calls stay distinguishable without ids,
+        # and literal arguments read as values.
+        @test occursin("var\"lp_s.log_scale\" = log(4.0)", text)
+        @test occursin("var\"lp_t.log_scale\" = log(4.0)", text)
+        @test occursin("lp_s = ifelse(s >= 0, -var\"lp_s.log_scale\" - s / 4.0, -Inf)", text)
+        # `u[2]` is read twice by the endpoint, so it stays one named value.
+        @test occursin("var\"lp_t.x\" = u[2]", text)
+        # A once-read computed argument reads in place; a bound child
+        # endpoint's scoped port reads its own value, not `var"standard.z"`.
+        @test occursin("var\"lp_m.standardized\" = (u[3] - -0.5) / 2.0", text)
+        @test occursin("var\"lp_m.standard.logpdf\" = -0.5 * log(2π) - 0.5 * " *
+                       "var\"lp_m.standardized\" ^ 2", text)
+        @test !occursin("standard.z", text)
+        @test !occursin("let ", text)
         parsed = Meta.parseall(text)
         @test !any(arg -> arg isa Expr && arg.head === :error, parsed.args)
 
