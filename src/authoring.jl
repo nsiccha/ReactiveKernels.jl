@@ -1862,6 +1862,144 @@ function _kernel_plate_cell_locals(body)
     names
 end
 
+# A recipe is the unit the plate lowerings hoist: a cell recipe that reads only
+# shared operands runs once, above the cell loop. A subexpression written
+# inline in a recipe that also reads the cell (`f(t, exp(log_k))`) was
+# recomputed in every cell. Each maximal subexpression that reads only shared
+# values (closure captures, `Ref` operands and cell locals computed from them)
+# now becomes its own cell statement, exactly as if the author had named it,
+# so it runs once per call (snag `plate-body-evalu-4235a1ca`). `varying` names
+# the zipped formals and `shared` the others. A scan step is not split: its
+# native lowering evaluates every step statement at every step, named or not.
+# Like a named invariant, a lifted one runs once per call even when the plate
+# has no cells.
+#
+# Only strict positions are entered, as for `@node`: call and broadcast
+# arguments, field reads, indexing and tuple elements. A branch, loop,
+# generator, closure or macro call keeps its own evaluation (its whole call may
+# still be lifted when it reads only shared values), a mutating (`!`) call
+# keeps its arguments, and an index expression reading `end`/`begin` stays in
+# its brackets. A subexpression that reads no shared value (`2 * pi`) is left
+# to Julia. Returns `body` itself when nothing is lifted.
+function _kernel_hoist_cell_invariants(body, varying::Set{Symbol},
+                                       shared::Set{Symbol})
+    body isa Expr && body.head === :block || return body
+    plain(statement) = statement isa Expr && statement.head === :(=) &&
+        !(statement.args[1] isa Expr && statement.args[1].head in (:call, :where))
+    locals = Set{Symbol}()
+    opaque = Set{Symbol}()
+    for statement in body.args
+        _kernel_is_line(statement) && continue
+        if plain(statement)
+            _kernel_assignment_names!(locals, statement.args[1])
+        elseif !(statement isa Expr && statement.head === :return)
+            _kernel_collect_symbols!(opaque, statement)
+        end
+    end
+    # Cell locals start per-coordinate; one computed only from shared values
+    # is shared, whatever the statement order.
+    variant = union(varying, opaque, locals)
+    changed = true
+    while changed
+        changed = false
+        for statement in body.args
+            plain(statement) || continue
+            names = _kernel_assignment_names!(Set{Symbol}(), statement.args[1])
+            any(in(variant), names) || continue
+            all(name -> !(name in varying) && !(name in opaque), names) || continue
+            isempty(_kernel_free_ports(statement.args[2], variant)) || continue
+            setdiff!(variant, names)
+            changed = true
+        end
+    end
+    invariant = union(shared, setdiff(locals, variant))
+    statements = Any[]
+    lifted_any = false
+    for statement in body.args
+        if plain(statement) && !isempty(_kernel_free_ports(statement.args[2], variant))
+            lifted = Any[]
+            rhs = _kernel_lift_invariant_operands!(
+                lifted, statement.args[2], variant, invariant, false)
+            if !isempty(lifted)
+                lifted_any = true
+                append!(statements, lifted)
+                statement = Expr(:(=), statement.args[1], rhs)
+            end
+        end
+        push!(statements, statement)
+    end
+    lifted_any ? Expr(:block, statements...) : body
+end
+
+function _kernel_lift_invariant_operands!(lifted, ex, variant, invariant,
+                                          indexing::Bool)
+    ex isa Expr || return ex
+    head = ex.head
+    liftable = (head === :call && !_kernel_mutating_callee(ex.args[1])) ||
+               (head === :. && length(ex.args) == 2 &&
+                (ex.args[2] isa QuoteNode ||
+                 (Meta.isexpr(ex.args[2], :tuple) &&
+                  !_kernel_mutating_callee(ex.args[1])))) ||
+               head === :ref
+    if liftable && isempty(_kernel_free_ports(ex, variant)) &&
+       !isempty(_kernel_free_ports(ex, invariant)) &&
+       !(indexing && _kernel_reads_index_bound(ex))
+        name = gensym(:cell_invariant)
+        push!(lifted, Expr(:(=), name, ex))
+        return name
+    end
+    lift(arg, indexing = indexing) =
+        _kernel_lift_invariant_operands!(lifted, arg, variant, invariant, indexing)
+    if head === :call
+        _kernel_mutating_callee(ex.args[1]) && return ex
+        return Expr(:call, ex.args[1], Any[lift(arg) for arg in ex.args[2:end]]...)
+    elseif head === :. && length(ex.args) == 2 && Meta.isexpr(ex.args[2], :tuple)
+        _kernel_mutating_callee(ex.args[1]) && return ex
+        return Expr(:., ex.args[1],
+                    Expr(:tuple, Any[lift(arg) for arg in ex.args[2].args]...))
+    elseif head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        return Expr(:., lift(ex.args[1]), ex.args[2])
+    elseif head === :ref && !isempty(ex.args)
+        return Expr(:ref, lift(ex.args[1]),
+                    Any[lift(arg, true) for arg in ex.args[2:end]]...)
+    elseif head in (:tuple, :vect, :parameters)
+        # `(a = value)` in a tuple is a named field, not an assignment.
+        return Expr(head, Any[
+            arg isa Expr && arg.head === :(=) && length(arg.args) == 2 ?
+                Expr(:(=), arg.args[1], lift(arg.args[2])) : lift(arg)
+            for arg in ex.args]...)
+    elseif head === :kw && length(ex.args) == 2
+        return Expr(:kw, ex.args[1], lift(ex.args[2]))
+    elseif head in (:(::), :(...)) && !isempty(ex.args)
+        return Expr(head, lift(ex.args[1]), ex.args[2:end]...)
+    end
+    ex
+end
+
+# A callee whose name ends in `!` may mutate an argument, which may be a fresh
+# buffer the cell owns; a callee that is not a plain name is not inspected.
+function _kernel_mutating_callee(callee)
+    name = callee isa Symbol ? callee :
+           callee isa GlobalRef ? callee.name :
+           callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
+               callee.args[2] isa QuoteNode && callee.args[2].value isa Symbol ?
+               callee.args[2].value : nothing
+    name === nothing && return true
+    name !== :! && endswith(String(name), "!")
+end
+
+_kernel_reads_index_bound(ex) = ex === :end || ex === :begin ||
+    ex isa Expr && any(_kernel_reads_index_bound, ex.args)
+
+function _kernel_collect_symbols!(names::Set{Symbol}, ex)
+    if ex isa Symbol
+        push!(names, ex)
+    elseif ex isa Expr
+        foreach(arg -> _kernel_collect_symbols!(names, arg), ex.args)
+    end
+    names
+end
+
 # Every name an `@kernel` block binds: its signature inputs, declared inputs and
 # recipe outputs. Statement order does not matter, because forward intermediates
 # are ordinary graph edges. These are the enclosing locals an authored plate cell
@@ -2024,6 +2162,9 @@ function _kernel_authored_plate_expr(rhs, mod,
             (scalar_graph_body.args[assignment_index].args[1] =
                 Expr(:(::), _KERNEL_PLATE_VALUE_PORT, inferred))
     end
+    scalar_graph_body = _kernel_hoist_cell_invariants(scalar_graph_body,
+        Set(formals[i] for i in eachindex(formals) if !(i in atomic)),
+        Set(formals[i] for i in atomic))
     scalar_spec = _kernel_expand(
         scalar_graph_body, signature, nothing, mod;
         nested_specs = nested_specs, endpoint_cache = endpoint_cache)
