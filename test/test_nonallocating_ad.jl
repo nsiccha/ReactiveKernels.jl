@@ -662,3 +662,35 @@ end
     @test data == saved
     @test live == [0.1, 0.2, 0.3]
 end
+
+@kernel tangent_naad(q::Vector{Float64}, s::Float64, data::Vector{Float64}) = begin
+    density::Float64 = sum(data .* exp.(s .* q)) - 0.5 * sum(abs2, q) - s^2
+end
+
+@testset "NonAllocatingKernel pushforwards and Hessian-vector products" begin
+    data, q, s, v = [2.0, -1.0, 0.5], [0.3, -0.4, 0.2], 0.7, [1.0, 0.5, -2.0]
+    kernel = prepare_nonallocating(plan(tangent_naad; want = :density))
+    pushforward = prepare_ad_pushforward(
+        kernel, AutoEnzyme(; mode = Enzyme.Forward), (v,), q, s, data;
+        active = :q)
+    @test only(ad_pushforward(pushforward, (v,), q, s, data)) ≈
+          dot(data .* s .* exp.(s .* q) .- q, v)
+    # Not built yet: second-order passes through the AD-owned `Cache`
+    # contexts fail Enzyme's static activity analysis in both orders
+    # (EnzymeRuntimeActivityError, Enzyme 0.13.210); the dataflow kernel's
+    # Hessian-vector products work.
+    hessian = Diagonal(data .* s^2 .* exp.(s .* q)) - I
+    for backend in (SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+                                AutoEnzyme(; mode = Enzyme.Forward)),
+                    SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
+                                AutoEnzyme(; mode = Enzyme.Reverse)))
+        @test_broken try
+            prepared = prepare_ad_hvp(kernel, backend, (v,), q, s, data;
+                                      active = :q)
+            only(ad_hvp(prepared, (v,), q, s, data)) ≈ hessian * v
+        catch error
+            nameof(typeof(error)) === :EnzymeRuntimeActivityError || rethrow()
+            false
+        end
+    end
+end

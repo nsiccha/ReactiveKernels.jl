@@ -15,6 +15,12 @@ end
     mean = data .* exp.(s .* q)
 end
 
+# A design-matrix product: reads its constant matrix to build an
+# intermediate array.
+@kernel tangent_design(beta::Vector{Float64}; X::Matrix{Float64}) = begin
+    density::Float64 = -0.5 * sum(abs2, X * beta)
+end
+
 # Per-group effects `z` never interact across groups, so the Hessian in `z`
 # is block diagonal and one direction per within-group coordinate, summed
 # across groups, recovers every block.
@@ -27,8 +33,11 @@ _tangent_jacobian(q, s, data) = Diagonal(data .* s .* exp.(s .* q))
 _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
 
 @testset "prepared pushforwards and Hessian-vector products" begin
-    second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
-                               AutoEnzyme(; mode = Enzyme.Reverse))
+    # Reverse over forward: the documented Hessian-vector composition.
+    second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+                               AutoEnzyme(; mode = Enzyme.Forward))
+    forward_over_reverse = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
+                                       AutoEnzyme(; mode = Enzyme.Reverse))
     forward = AutoEnzyme(; mode = Enzyme.Forward)
     data = [2.0, -1.0, 0.5]
     q = [0.3, -0.4, 0.2]
@@ -154,19 +163,50 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
             data, active = :q, want = :mean)
     end
 
-    # DifferentiationInterface's forward-over-reverse HVP allocates its inner
-    # gradient with `similar(x)`, which has no method for the structured
-    # (Vector, Ref) point a tuple selector differentiates (DI 0.7.21). The
-    # shape is valid; it waits on DI accepting tuple points.
-    @testset "tuple-selector Hessian-vector products (DI tuple points)" begin
+    @testset "forward over reverse" begin
+        prepared = prepare_ad_hvp(tangent_density, forward_over_reverse, (v,),
+                                  q, s; data, active = :q, want = :density)
+        @test only(ad_hvp(prepared, (v,), q, s; data)) ≈
+              _tangent_hessian(q, s, data) * v
+
+        X = [1.0 0.5 0.0; 1.0 0.0 0.5; 1.0 1.0 1.0; 1.0 -1.0 2.0]
+        beta = [0.1, 0.2, -0.3]
+        reverse_over_forward = prepare_ad_hvp(
+            tangent_design, second_order, (beta,), beta;
+            X, active = :beta, want = :density)
+        @test only(ad_hvp(reverse_over_forward, (beta,), beta; X)) ≈
+              -(X' * X) * beta
+        # Enzyme forward mode over a reverse pass that reads a constant array
+        # into an intermediate array fails static activity analysis
+        # (`benchmark/repro_enzyme_forward_over_reverse_const_array.jl`,
+        # Enzyme 0.13.210). Reverse over forward differentiates it.
         @test_broken try
-            prepared = prepare_ad_hvp(
-                tangent_density, second_order, ((v, 1.0),), q, s;
-                data, active = (:q, :s), want = :density)
-            ad_hvp(prepared, ((v, 1.0),), q, s; data) isa Tuple
+            prepared = prepare_ad_hvp(tangent_design, forward_over_reverse,
+                                      (beta,), beta; X, active = :beta,
+                                      want = :density)
+            only(ad_hvp(prepared, (beta,), beta; X)) ≈ -(X' * X) * beta
         catch error
-            error isa MethodError || rethrow()
+            nameof(typeof(error)) === :EnzymeRuntimeActivityError || rethrow()
             false
+        end
+    end
+
+    # DifferentiationInterface 0.7.21 cannot take a Hessian-vector product at
+    # the structured (Vector, Ref) point a tuple selector differentiates:
+    # forward over reverse calls `similar(x)` and reverse over forward
+    # `pick_batchsize`, neither defined for a tuple. The shape is valid; it
+    # waits on DI accepting tuple points.
+    @testset "tuple-selector Hessian-vector products (DI tuple points)" begin
+        for backend in (second_order, forward_over_reverse)
+            @test_broken try
+                prepared = prepare_ad_hvp(
+                    tangent_density, backend, ((v, 1.0),), q, s;
+                    data, active = (:q, :s), want = :density)
+                ad_hvp(prepared, ((v, 1.0),), q, s; data) isa Tuple
+            catch error
+                error isa MethodError || rethrow()
+                false
+            end
         end
     end
 end

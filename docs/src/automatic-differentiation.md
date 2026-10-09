@@ -142,8 +142,8 @@ direction, so `(v,)` is one direction and `(v1, v2, v3)` evaluates three
 together. Results come back as a tuple in the same order.
 
 ```julia
-second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
-                           AutoEnzyme(; mode = Enzyme.Reverse))
+second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+                           AutoEnzyme(; mode = Enzyme.Forward))
 
 @kernel tangent_density(q::Vector{Float64}, s::Float64;
                         data::Vector{Float64}) = begin
@@ -167,8 +167,12 @@ jvp = prepare_ad_pushforward(tangent_mean, AutoEnzyme(; mode = Enzyme.Forward),
 value, (jv,) = ad_value_and_pushforward(jvp, (v,), parameters, 0.7; data)
 ```
 
-A Hessian-vector product needs a scalar WANT and a second-order backend;
-forward over reverse is the usual choice. A pushforward accepts any WANT,
+A Hessian-vector product needs a scalar WANT and a second-order backend.
+Use reverse over forward, as above. Native Enzyme forward over reverse fails
+static activity analysis when the objective multiplies a constant matrix by an
+active vector, as a design-matrix linear predictor does
+(`benchmark/repro_enzyme_forward_over_reverse_const_array.jl`); it works on
+objectives without such a product. A pushforward accepts any WANT,
 including arrays and `NamedTuple`s of arrays. `ad_hvp!` and
 `ad_gradient_and_hvp!` write into caller-owned destinations, one array per
 direction.
@@ -184,8 +188,10 @@ number of subjects. The focused authority is
 A tuple `active` selector works for pushforwards (each direction is a tuple of
 component tangents). DifferentiationInterface 0.7.21 cannot yet take a
 Hessian-vector product at such a structured point, so tuple-selector HVPs are
-not supported. Reactant-compiled pushforwards and Hessian-vector products are
-not provided; these operators run natively.
+not supported. A `NonAllocatingKernel` supports pushforwards; its
+Hessian-vector products fail Enzyme's static activity analysis, so take them
+from the dataflow kernel. Reactant-compiled pushforwards and Hessian-vector
+products are not provided; these operators run natively.
 
 ## Freeze data-only work during preparation
 

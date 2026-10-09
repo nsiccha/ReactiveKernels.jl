@@ -1953,9 +1953,12 @@ call then returns `H * v` for every direction. All other current HAVE values
 are rebound as `Constant` contexts on every call, exactly as for
 [`prepare_ad`](@ref), and `bound` runs the same partial-evaluation pre-pass.
 
-Pass a second-order backend, typically forward over reverse:
-`DifferentiationInterface.SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
-AutoEnzyme(; mode = Enzyme.Reverse))`. Directions with disjoint supports give a
+Pass a second-order backend. Reverse over forward,
+`DifferentiationInterface.SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+AutoEnzyme(; mode = Enzyme.Forward))`, also differentiates objectives that
+multiply a constant matrix by the active vector (a design-matrix linear
+predictor), which native Enzyme forward over reverse cannot analyse
+statically. Directions with disjoint supports give a
 compressed Hessian: when active coordinates fall into groups that never
 interact (per-subject effects of a population model, say), one direction per
 coordinate within a group, summed across groups, recovers every group's
