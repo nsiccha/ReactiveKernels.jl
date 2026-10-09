@@ -86,6 +86,14 @@ end
     total::Float64 = x + y
     return total
 end
+
+# A two-output child bound at module scope, so a caller's macro expansion can
+# resolve it and lift `qualified_pair(x)[1]` out of a larger expression.
+@kernel qualified_pair(x::Float64) = begin
+    shifted::Float64 = x + 1
+    squared::Float64 = abs2(shifted)
+    return (shifted, squared)
+end
 end
 
 module AuthoringLoweredCallFixture
@@ -589,12 +597,90 @@ end
                 return shifted
             end
         end
+        # A multi-output call bound to one name is the tuple `nested_piece(x)`
+        # returns at runtime: the child is spliced and its outputs packed.
+        # (`nested_piece` is a testset local, so the splice happens when the
+        # recipe is added rather than while the macro expands.)
+        @kernel nested_tuple_value(x::Float64) = begin
+            packed = nested_piece(x)
+            return packed
+        end
+        @test @inferred(prepare(nested_tuple_value)(2.0)) == (3.0, 9.0)
+        @test !occursin("nested_piece",
+                        sprint(show, code_expr(plan(nested_tuple_value))))
+        @kernel nested_tuple_typed(x::Float64) = begin
+            packed::Tuple{Float64,Float64} = nested_piece(x)
+            return packed
+        end
+        @test @inferred(prepare(nested_tuple_typed)(2.0)) == (3.0, 9.0)
+        @kernel nested_tuple_read(x::Float64) = begin
+            packed = nested_piece(x)
+            total::Float64 = packed[1] + packed[2]
+            return total
+        end
+        @test @inferred(prepare(nested_tuple_read)(2.0)) == 12.0
+        produces(p, name) = any(r -> any(o -> o.name === name, r.outputs), p.recipes)
+
+        # A module binding resolves while the macro expands: the one-name port
+        # takes the child's tuple type, and a strict subexpression lifts the
+        # call to its tuple value. The pack reads every output, so the whole
+        # child boundary is computed though one element is used.
+        @kernel qualified_tuple_value(x::Float64) = begin
+            packed = AuthoringNestedKernelFixture.qualified_pair(x)
+            return packed
+        end
+        @test ReactiveKernels.valtype(qualified_tuple_value[:packed]) ==
+              Tuple{Float64,Float64}
+        @test @inferred(prepare(qualified_tuple_value)(2.0)) == (3.0, 9.0)
+        @kernel qualified_tuple_projection(x::Float64) = begin
+            lead::Float64 = AuthoringNestedKernelFixture.qualified_pair(x)[1] + 1
+            return lead
+        end
+        projection_plan = plan(qualified_tuple_projection; want = :lead)
+        @test @inferred(prepare(projection_plan)(2.0)) == 4.0
+        @test produces(projection_plan, :squared)
+        @test !occursin("qualified_pair", sprint(show, code_expr(projection_plan)))
+        @kernel qualified_tuple_cells(xs) = begin
+            ys = plate(xs) do x
+                AuthoringNestedKernelFixture.qualified_pair(x)[1] *
+                    AuthoringNestedKernelFixture.qualified_pair(x)[2]
+            end
+            return ys
+        end
+        @test prepare(qualified_tuple_cells)([1.0, 2.0]) == [8.0, 27.0]
+
+        # Julia's `(a,) = t` binds the leading element; the unnamed trailing
+        # output stays prunable.
+        @kernel nested_partial(x::Float64) = begin
+            (shifted::Float64,) = nested_piece(x)
+            return shifted
+        end
+        partial_plan = plan(nested_partial; want = :shifted)
+        @test @inferred(prepare(partial_plan)(2.0)) == 3.0
+        @test !produces(partial_plan, :squared)
+        @kernel nested_partial_untyped(x::Float64) = begin
+            (lead,) = nested_piece(x)
+            return lead
+        end
+        @test @inferred(prepare(nested_partial_untyped)(2.0)) == 3.0
+
+        # refused: a Float64 port cannot hold the two-output tuple; Julia's
+        # `s::Float64 = (3.0, 9.0)` fails the same conversion.
         @test_throws ArgumentError begin
-            @kernel nested_bad_arity(x::Float64) = begin
+            @kernel nested_scalar_target(x::Float64) = begin
                 shifted::Float64 = nested_piece(x)
                 return shifted
             end
         end
+        # refused: more names than outputs; Julia's destructuring throws a
+        # BoundsError for `(a, b, c) = (3.0, 9.0)`.
+        @test_throws ArgumentError begin
+            @kernel nested_long_destructure(x::Float64) = begin
+                (a::Float64, b::Float64, c::Float64) = nested_piece(x)
+                return a
+            end
+        end
+
         @test_throws ArgumentError begin
             @kernel nested_bad_metadata(x::Float64) = begin
                 @recipe (cost = 2) (shifted::Float64, squared::Float64) =

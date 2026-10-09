@@ -216,9 +216,11 @@ end
         @test compatibility(1.0, 0.0, 2.0, log(2.0)) ≈
               named(1.0, 0.0, 2.0, log(2.0))
 
+        # The endpoint's own values are named under the caller's result
+        # `logdensity`; its result keeps its name and joins `logdensity`.
         named_outputs = outputs_of(plan(F.named_constructed_logpdf))
-        @test named_outputs ==
-              [:standardized, Symbol("standard.logpdf"), :logpdf]
+        @test named_outputs == [Symbol("logdensity.standardized"),
+                                Symbol("logdensity.standard.logpdf"), :logpdf]
         @test length(plan(F.compatibility_factor_logpdf).recipes) == 1
         @test only(plan(F.compatibility_factor_logpdf).recipes).op isa PreparedKernel
         @test all(!(recipe.op isa PreparedKernel)

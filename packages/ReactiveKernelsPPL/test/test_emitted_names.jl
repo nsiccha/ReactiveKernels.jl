@@ -60,8 +60,8 @@ end
     text = _text(bound)
 
     @testset "plate cells name their arguments after their values" begin
-        @test occursin("plate(y, _ppl_lp_y_eta, y_scale) do y, _ppl_lp_y_eta, y_scale", text)
-        @test occursin("(normal(_ppl_lp_y_eta, y_scale)).logpdf(y)", text)
+        @test occursin("plate(y, y_eta, y_scale) do y, y_eta, y_scale", text)
+        @test occursin("(normal(y_eta, y_scale)).logpdf(y)", text)
         @test !occursin(r"_ppl_c\d", text)
     end
 

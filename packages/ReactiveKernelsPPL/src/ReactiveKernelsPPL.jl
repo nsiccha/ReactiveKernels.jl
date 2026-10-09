@@ -68,7 +68,9 @@ export coordinate_read, block_read, transform_statements, jacobian_term
 export design_name, offset_name, design_recipe, offset_recipe
 export preprocessing_recipes
 export PPL_NODES, WORKFLOW_WANTS, workflow_wants
-export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
+export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!,
+    sampler_value_gradient_and_retained!
+export QueryAD, prepare_query_ad
 export restore_draws
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
