@@ -587,6 +587,13 @@ Cell locals belong to their cell, as a Julia loop body's locals do: two
 plates may each bind `m`. A statement outside the plate cannot read a cell
 local; assign it to an indexed output (`c[i] = m`) and read `c`.
 
+A cell runs once per index however many values it defines. Indexed outputs
+that share cell locals (`m = f(t[i], a); c[i] = m; r[i] = 2 .* m`), the
+components of a row output and computed observation arguments come from one
+RK plate whose cell runs those statements once and returns the values
+together; each output reads its own entry. A value reading only data keeps
+its own plate, which runs once when the query or sampler is prepared.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
 ```
@@ -873,7 +880,9 @@ restore_draws(built.layout, U)           # U: layout.total × draws
 observations: one iteration of an `@plate for` loop, such as one group's or one
 subject's observations, or one entry of an elementwise observation `y .~ …`.
 Only that cell runs, so its cost is what one iteration costs, plus any value
-the cell reads whole (such as a predictor vector indexed `log_k[i]`).
+the cell reads whole (such as a predictor vector indexed `log_k[i]`). When the
+queried observations read one shared cell (two outputs of one loop), each
+observation's cell runs that shared cell at the same index.
 
 ```julia
 q = prepare_cell_query(built, plan, :y)          # or (:y, :z): one loop's observations
