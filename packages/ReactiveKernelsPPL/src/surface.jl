@@ -1481,18 +1481,17 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
 end
 
 # A definition optimized into a predictor (a response location or scale, a
-# composition's sub-predictor) emits no statement of its own, nor does a
-# pure alias absorbed into the value it names (`w = u` over a scan state).
-# Naming never changes what the graph exposes: each such authored name
-# reads the node computing its value, the predictor itself or the alias
-# chain's target (user decision `0fbe312`; "all intermediate quantities"
-# are part of the RK graph).
+# composition's sub-predictor) is that predictor's node, under its own name
+# (user decision `1c0jiwz`). A pure alias absorbed into the value it names
+# (`w = u` over a scan state, `w = mu` over a predictor) emits no statement
+# of its own, so it reads the alias chain's target (user decision
+# `0fbe312`; "all intermediate quantities" are part of the RK graph).
 function _absorbed_named_values(det, canonmap, skip, predictors)
     pnames = Set{Symbol}(p.name for p in predictors)
     absorbed(nm) = nm in skip && haskey(canonmap, nm)
     named = Pair{Symbol,Symbol}[]
     for (nm, _) in det
-        absorbed(nm) || continue
+        absorbed(nm) && nm ∉ pnames || continue
         target = nm
         seen = Set{Symbol}()
         while target ∉ pnames && absorbed(target) && target ∉ seen &&
@@ -8050,7 +8049,11 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
     return name
 end
 
-function _argument_name!(base::Symbol, ctx)
+# A name the lowering synthesizes for a graph value: `base`, or `base_k`
+# for the first `k` no other name of the model takes. Synthesized predictors
+# are graph values under their own names, like authored ones, so they never
+# shadow a user's name (user decision `1c0jiwz`).
+function _predictor_name!(base::Symbol, ctx)
     nm, k = base, 0
     while nm in ctx.taken
         k += 1
@@ -8065,8 +8068,8 @@ end
 # data and scalar declarations without inventing a new coefficient prior.
 function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
         coefuse, base::Symbol)
-    pname = _argument_name!(base, ctx)
     if ex isa Expr && (_canon_shape(ex, ctx) !== :scalar || _is_composed_map(ex))
+        pname = _predictor_name!(base, ctx)
         _reads_latent_elementwise(ex, ctx) &&
             return _latent_value_predictor!(lhs, pname, ex, :value,
                 IdentityLink, ctx, predictors, pred_idx)
@@ -8074,7 +8077,7 @@ function _lower_argument_predictor!(lhs, ex, ctx, predictors, pred_idx,
             predictors, pred_idx, coefuse)
     end
     return _lower_location(lhs, ex, IdentityLink, ctx, predictors, pred_idx,
-        coefuse; value = true, synth = pname)
+        coefuse; value = true, synth = base)
 end
 
 function _lower_scale_predictor_error(lhs, name, ctx)
@@ -8193,10 +8196,7 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # LatentTerm, just as when the whole location names that latent.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
-        pname = synth === nothing ? Symbol(lhs, "_eta") : synth
-        (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
-            "derived predictor name $pname collides with your definition — " *
-            "rename yours")
+        pname = _predictor_name!(something(synth, Symbol(lhs, "_eta")), ctx)
         if _composed_root(loc, ctx) || (value && _is_bare_sub_map(loc, ctx))
             _reads_latent_elementwise(loc, ctx) &&
                 return _latent_value_predictor!(lhs, pname, loc, :location,
@@ -8250,7 +8250,7 @@ end
 # derived column that reads one); the generator emits `lp = col`.
 # Latent predictors stay per-response (no interning here).
 function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
-        pname::Symbol = Symbol(lhs, "_loc"))
+        pname::Symbol = _predictor_name!(Symbol(lhs, "_loc"), ctx))
     # A nested per-cell call can return a sampled local unchanged. The
     # outer binding aliases that vector; it does not create another latent.
     source = col
@@ -8264,9 +8264,6 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
         union!(ctx.absorbed, seen)
         col = source
     end
-    (haskey(ctx.detmap, pname) || pname in ctx.plate_names) && _sfail(
-        "latent-location predictor name $pname collides with your " *
-        "definition — rename it")
     term = TermSpec(LatentTerm, [col], NamedTuple(), col, Symbol(col, "_lat"))
     push!(predictors, PredictorSpec(pname, pred_link, [term], pname))
     pred_idx[pname] = length(predictors)
@@ -8372,10 +8369,7 @@ function _value_location!(lhs, loc, pred_link, ctx, predictors,
         ctx.detshape[source] = :scalar
         source = ctx.detmap[source]
     end
-    pname = synth === nothing ? Symbol(lhs, "_eta") : synth
-    (haskey(ctx.detmap, pname) || haskey(pred_idx, pname)) && _sfail(
-        "derived predictor name $pname collides with your definition — " *
-        "rename yours")
+    pname = _predictor_name!(something(synth, Symbol(lhs, "_eta")), ctx)
     term = if loc isa Symbol && loc in ctx.data
         TermSpec(OffsetTerm, ColumnRef[loc], NamedTuple(), loc,
             Symbol(loc, "_off"))

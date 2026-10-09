@@ -947,9 +947,9 @@ the private identifiers used by the mathematical plan. `cell_broadcasts`
 maps each response observed by a dotted `@plate` cell (`y[i] .~ D.(…)`) to
 the names that cell reads per index; when the bound response holds one
 array per index, each cell broadcasts over its own entries.
-`named_values` keeps each authored definition the lowering optimized away
-addressable by its name: `name => node` binds `name` to a predictor's value
-(when `node` names a predictor) or to another graph value.
+`named_values` keeps each authored alias the lowering absorbed addressable
+by its name: `name => node` binds `name` to the graph value `node` (a
+predictor, which carries its own name, or another value).
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
