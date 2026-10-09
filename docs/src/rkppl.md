@@ -376,6 +376,11 @@ child port annotations accept the caller's declared types; declared boundaries
 keep their types. The emitted `kernel_expr` remains the source of the graph,
 so evaluating that expression retains the same child operations.
 
+A kernel with several outputs (`return PHI, omega2`) composes through Julia's
+destructuring: `(P, om) = basis(x)` stays one statement in the generated
+program and splices the child at its whole output boundary. Destructuring an
+ordinary function likewise calls it once per evaluation.
+
 Composition exposes the child's execution capabilities. Ordinary native
 Enzyme reverse covers empty and nonempty child scans, including inside a bound
 `eachcol` subject plate. The default compiled backend expands small subject
