@@ -8857,15 +8857,22 @@ end
 # Does a derived column transitively read a per-cell latent (plate parameter)?
 # If so, its value is a latent transform (e.g. non-centered `mu .+ tau .* z`),
 # not a design predictor — it stays a derived column used directly as the LP.
-function _derived_reads_latent(name::Symbol, ctx)
-    haskey(ctx.detmap, name) || return name in ctx.plate_names
+_derived_reads_latent(name::Symbol, ctx) =
+    _derived_reads_any(name, ctx, ctx.plate_names)
+
+# Likewise for a scan state (`sv = lev .+ x`): a value of the trajectory.
+_derived_reads_scan(name::Symbol, ctx) =
+    _derived_reads_any(name, ctx, ctx.scan_states)
+
+function _derived_reads_any(name::Symbol, ctx, names)
+    haskey(ctx.detmap, name) || return name in names
     seen = Set{Symbol}((name,))
     stack = collect(_value_symbols(ctx.detmap[name]))
     while !isempty(stack)
         s = pop!(stack)
         s in seen && continue
         push!(seen, s)
-        s in ctx.plate_names && return true
+        s in names && return true
         haskey(ctx.detmap, s) && append!(stack, _value_symbols(ctx.detmap[s]))
     end
     return false
@@ -9006,6 +9013,9 @@ function _is_composed_sub(s::Symbol, ctx, allow_factor::Bool = false)
     s in ctx.plate_names && return false
     s in ctx.scan_states && return false
     _derived_reads_latent(s, ctx) && return false
+    # A definition reading a scan state is a value of the trajectory
+    # (`sv = lev .+ x`), read by name like the state itself.
+    _derived_reads_scan(s, ctx) && return false
     _composed_data_only(s, ctx, Set{Symbol}()) && return false
     # An interned location already has an LP node, including an offset
     # whose definition reads array values. Consumers must use that node
@@ -9316,6 +9326,14 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
         elseif node in ctx.data
             # A bound data column read elementwise in-graph (v3:
             # `(log_time .- loc) .* exp.(ls)`); it becomes a term column.
+            node in datas || push!(datas, node)
+            return node
+        elseif node in ctx.scan_states ||
+                (get(ctx.detshape, node, :scalar) === :vector &&
+                    _derived_reads_scan(node, ctx))
+            # A scan trajectory is an ordinary vector of the scan's length,
+            # read like a data column, and so is a vector definition reading
+            # one (`sv = lev .+ x`), which emits once under its own name.
             node in datas || push!(datas, node)
             return node
         elseif _is_plate_column_call(get(ctx.detmap, node, nothing))

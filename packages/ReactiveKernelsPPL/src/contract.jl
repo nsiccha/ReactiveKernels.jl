@@ -4165,6 +4165,9 @@ function _validate_term_columns(t::TermSpec, pred::PredictorSpec, plan::Structur
         # statically known shape; it is still declared in the value graph.
         t.kind === ComposedTerm &&
             any(a -> a.name === c, plan.assignments) && continue
+        # A scan trajectory is a per-observation value the scan computes.
+        t.kind === ComposedTerm &&
+            any(s -> c in s.states, plan.scans) && continue
         haskey(plan.columns, c) || _is_derived(plan, c) ||
             _fail(t.label, "term references missing column $c")
     end

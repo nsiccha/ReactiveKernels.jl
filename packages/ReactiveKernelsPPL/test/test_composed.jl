@@ -642,6 +642,117 @@ const _CMP_LEAF_COLS = Dict{Symbol,Any}(
     end
 end
 
+# A scan trajectory is an ordinary vector of the scan's length (rkppl-use
+# §5), so a composition with a computed sub-predictor `m` reads it like a
+# data column: bare (`lev .* m`), inside an operand (`(lev .+ x) .* m`), or
+# through a named definition (`sv = lev .+ x`), which emits once under its
+# own name and is never an affine sub-predictor (snag
+# `lower-an-rkppl-c-ca461ae8`). Each spelling has the Julia expression's
+# density, with a sampled or a deterministic recurrence.
+@testset "composed leaves read scan trajectories" begin
+    x, y = _cmp_ap_x(), Vector{Float64}(_CMP_AP_COLS[:y])
+    m(q) = exp(q.k) .* x
+    walk(l) = logpdf(Normal(0, 1), l[1]) +
+        sum(logpdf.(Normal.(l[1:end-1], 1), l[2:end]))
+    head = quote
+        k ~ Normal(0, 1)
+        m = exp.(k) .* x
+        @scan begin
+            lev[1] ~ Normal(0, 1)
+            for t in 2:T
+                lev[t] ~ Normal(lev[t - 1], 1)
+            end
+        end
+    end
+    q = (k = -0.3, lev = [0.4, -0.2, 0.5, 1.1, 0.7, 0.2, -0.6, -0.1, 0.3])
+    for (location, columns, value) in (
+            (quote
+                sv = lev .+ x
+                mu = sv .* m
+            end, [:sv], q -> (q.lev .+ x) .* m(q)),
+            (:(mu = (lev .+ x) .* m), [:lev, :x], q -> (q.lev .+ x) .* m(q)),
+            (:(mu = lev .* m), [:lev], q -> q.lev .* m(q)),
+            (quote
+                sv = exp.(lev)
+                mu = sv .* m .+ sv
+            end, [:sv], q -> exp.(q.lev) .* m(q) .+ exp.(q.lev)))
+        prog = Expr(:block, head.args...,
+            (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+            :(y .~ Normal.(mu, 0.7)))
+        want = q -> sum(logpdf.(Normal.(value(q), 0.7), y)) +
+            logpdf(Normal(0, 1), q.k) + walk(q.lev)
+        plan, bound, built = _cmp_ap_check(prog, q, want)
+        t = only(only(p for p in plan.predictors if p.name === :mu).terms)
+        @test t.kind === ComposedTerm
+        @test t.columns == columns
+        @test t.options.subs == [:m]
+        src = string(kernel_expr(bound, built.layout))
+        :sv in columns && @test occursin(r"\bsv = ", src)
+    end
+    # Naming a trajectory value never changes legality: each named spelling
+    # has its inline twin's density (`b .* (level .+ x)` is rkppl-use §5's).
+    ahead = quote
+        k ~ Normal(0, 1); a ~ Normal(0, 1); b ~ Normal(0, 1)
+        m = exp.(k) .* x
+        @scan begin
+            lev[1] ~ Normal(0, 1)
+            for t in 2:T
+                lev[t] ~ Normal(lev[t - 1], 1)
+            end
+        end
+    end
+    qa = (k = -0.3, a = 0.2, b = 0.6, lev = q.lev)
+    for (named, inline, value) in (
+            (quote
+                sv = lev .+ x
+                mu = b .* sv
+            end, :(mu = b .* (lev .+ x)), q -> q.b .* (q.lev .+ x)),
+            (quote
+                sv = b .* lev
+                mu = a .+ sv
+            end, :(mu = a .+ b .* lev), q -> q.a .+ q.b .* q.lev),
+            (quote
+                sv = lev .+ x
+                mu = sv .+ m
+            end, :(mu = (lev .+ x) .+ m), q -> (q.lev .+ x) .+ m(q)))
+        want = q -> sum(logpdf.(Normal.(value(q), 0.7), y)) +
+            logpdf(Normal(0, 1), q.k) + logpdf(Normal(0, 1), q.a) +
+            logpdf(Normal(0, 1), q.b) + walk(q.lev)
+        for location in (named, inline)
+            prog = Expr(:block, ahead.args...,
+                (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+                :(y .~ Normal.(mu, 0.7)))
+            _cmp_ap_check(prog, qa, want)
+        end
+    end
+    # A deterministic recurrence reads the same way, named or inline.
+    dhead = quote
+        k ~ Normal(0, 1)
+        m = exp.(k) .* x
+        @scan begin
+            d[1] = 0.0
+            for t in 2:T
+                d[t] = 0.5 * d[t - 1] + x[t]
+            end
+        end
+    end
+    d = zeros(length(x))
+    for t in 2:length(x)
+        d[t] = 0.5 * d[t - 1] + x[t]
+    end
+    for location in (quote
+                dv = d .+ x
+                mu = dv .* m
+            end, :(mu = (d .+ x) .* m))
+        prog = Expr(:block, dhead.args...,
+            (Meta.isexpr(location, :block) ? location.args : Any[location])...,
+            :(y .~ Normal.(mu, 0.7)))
+        want = q -> sum(logpdf.(Normal.((d .+ x) .* m(q), 0.7), y)) +
+            logpdf(Normal(0, 1), q.k)
+        _cmp_ap_check(prog, (k = -0.3,), want)
+    end
+end
+
 # Julia's `.+(a, b, c)` and `.*(a, b, c)` broadcast the n-ary `+` and `*`,
 # which fold left: `(a .+ b) .+ c` elementwise. BRM emits Julia's n-ary
 # `a + b + c` this way (snag `composed-predict-64339857`). The composition
