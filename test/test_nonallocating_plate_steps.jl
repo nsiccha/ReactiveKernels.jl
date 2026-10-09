@@ -25,24 +25,24 @@ struct PlateShiftPlan
 end
 
 const ONE_REF = @kernel one_ref(rows, u::Vector{Float64}) = begin
-    y::Vector{Float64} = plate(rows, Ref(u)) do o, uu
-        sum((0.5 * get(uu, o - j, 0.0) for j in 0:2); init = 0.0)
+    y::Vector{Float64} = plate(rows) do o
+        sum((0.5 * get(u, o - j, 0.0) for j in 0:2); init = 0.0)
     end
     return y
 end
 
 const THREE_REFS = @kernel three_refs(rows, s::Vector{Int}, u::Vector{Float64},
                                       w::Vector{Float64}) = begin
-    y::Vector{Float64} = plate(rows, Ref(s), Ref(u), Ref(w)) do o, ss, uu, ww
-        sum((ww[j] * get(uu, o - ss[j], 0.0) for j in eachindex(ww)); init = 0.0)
+    y::Vector{Float64} = plate(rows) do o
+        sum((w[j] * get(u, o - s[j], 0.0) for j in eachindex(w)); init = 0.0)
     end
     return y
 end
 
 const STRUCT_REF = @kernel struct_ref(rows, plan, u::Vector{Float64},
                                       w::Vector{Float64}) = begin
-    y::Vector{Float64} = plate(rows, Ref(plan), Ref(u), Ref(w)) do o, p, uu, ww
-        sum((ww[j] * get(uu, o - p.shifts[j], 0.0) for j in eachindex(ww));
+    y::Vector{Float64} = plate(rows) do o
+        sum((w[j] * get(u, o - plan.shifts[j], 0.0) for j in eachindex(w));
             init = 0.0)
     end
     return y
@@ -51,8 +51,8 @@ end
 # Integer cells stored into the declared `Vector{Float64}`, as the ordinary
 # kernel's typed local converts the plate's result.
 const CONVERTED = @kernel converted(rows, u::Vector{Float64}) = begin
-    y::Vector{Float64} = plate(rows, Ref(u)) do o, uu
-        2o + length(uu)
+    y::Vector{Float64} = plate(rows) do o
+        2o + length(u)
     end
     return y
 end

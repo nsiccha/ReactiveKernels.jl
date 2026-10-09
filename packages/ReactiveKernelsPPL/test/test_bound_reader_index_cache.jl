@@ -1,7 +1,7 @@
 module BoundReaderIndexCacheTests
 using Test
 # Regression: a BRM-style reader whose subject plate iterates a bound `1:n`
-# with `Ref` operands derives a per-subject index list from bound data before
+# and closes over its data derives a per-subject index list from bound data before
 # one gather of a parameter-dependent vector. `prepare_sampler` binds the data,
 # so the index chain runs once at preparation, never per density or gradient
 # evaluation (snag bound-partial-ev-75827c5e).
@@ -9,9 +9,7 @@ using ReactiveKernels, ReactiveKernelsPPL, Enzyme, DifferentiationInterface
 const calls = Ref(0)
 counted_findall(f, x) = (calls[] += 1; findall(f, x))
 ReactiveKernels.@kernel subject_reader(subject_count, kinds_by_subject, read_idx, rates) = begin
-    cell_values = ReactiveKernels.plate(
-            1:subject_count, Ref(kinds_by_subject), Ref(read_idx), Ref(rates)
-        ) do subject, kinds_by_subject, read_idx, rates
+    cell_values = ReactiveKernels.plate(1:subject_count) do subject
         kinds = kinds_by_subject[subject]
         read_positions = counted_findall(isone, kinds)
         observation_operations = read_positions[read_idx[subject]]
@@ -67,18 +65,14 @@ end
 # chain beside it is still prepared once (snag inner-plate-cach-f920caca).
 ReactiveKernels.@kernel scan_reader(subject_count, kinds_by_subject, steps_by_subject,
                                     read_idx, rates) = begin
-    cell_values = ReactiveKernels.plate(
-            1:subject_count, Ref(kinds_by_subject), Ref(steps_by_subject), Ref(read_idx),
-            Ref(rates)
-        ) do subject, kinds_by_subject, steps_by_subject, read_idx, rates
+    cell_values = ReactiveKernels.plate(1:subject_count) do subject
         kinds = kinds_by_subject[subject]
         steps = steps_by_subject[subject]
         rate = rates[subject]
         read_positions = counted_findall(isone, kinds)
         observation_operations = read_positions[read_idx[subject]]
-        operations = ReactiveKernels.scan(kinds, steps, Ref(rate);
-                                          init = 0.0) do level, kind, step, r
-            decayed = level * exp(-r * step)
+        operations = ReactiveKernels.scan(kinds, steps; init = 0.0) do level, kind, step
+            decayed = level * exp(-rate * step)
             next = kind == 2 ? decayed + 1.0 : decayed
             (next, next)
         end
@@ -156,9 +150,7 @@ end
 # cached per-subject arrays stored into a plate's output (snag
 # native-reverse-r-79fb001d).
 ReactiveKernels.@kernel subject_limits(subject_count, limits, read_idx, rates) = begin
-    cell_values = ReactiveKernels.plate(
-            1:subject_count, Ref(limits), Ref(read_idx), Ref(rates)
-        ) do subject, limits, read_idx, rates
+    cell_values = ReactiveKernels.plate(1:subject_count) do subject
         selected = limits[read_idx[subject]]
         ones(length(selected)) .* selected
     end

@@ -54,8 +54,8 @@ end
 
 @kernel superpose(observations, shifts::Vector{Int}, units,
                   weights) = begin
-    total = plate(observations, Ref(shifts), Ref(units), Ref(weights)) do t, s, u, w
-        sum(w[j] * get(u, t - s[j], 0.0) for j in eachindex(w); init = 0.0)
+    total = plate(observations) do t
+        sum(weights[j] * get(units, t - shifts[j], 0.0) for j in eachindex(weights); init = 0.0)
     end
     return total
 end
@@ -108,10 +108,10 @@ end
 # ---- relaxation scan --------------------------------------------------------
 
 @kernel relax(drive, dts::Vector{Float64}, q) = begin
-    trajectory = scan(drive, dts, Ref(q); init = q.r0,
-                                       include_init = true) do previous, c, dt, p
-        rate = p.k * (1 + c / (p.a * c + p.b))
-        steady = p.r / rate
+    trajectory = scan(drive, dts; init = q.r0,
+                                       include_init = true) do previous, c, dt
+        rate = q.k * (1 + c / (q.a * c + q.b))
+        steady = q.r / rate
         next = (previous - steady) * exp(-rate * dt) + steady
         (next, next)
     end

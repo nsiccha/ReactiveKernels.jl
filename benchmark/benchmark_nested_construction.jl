@@ -47,8 +47,8 @@ result["rkppl_commit"] = readchomp(`git -C $(pkgdir(ReactiveKernelsPPL)) rev-par
 measure("author_public_kernels") do
     Core.eval(Main, quote
         @kernel public_recurrence(xs, gain) = begin
-            states = scan(xs, Ref(gain); init=0.0) do previous, x, g
-                next = previous + x * g
+            states = scan(xs; init=0.0) do previous, x
+                next = previous + x * gain
                 (next, next)
             end
             return states
@@ -58,8 +58,8 @@ measure("author_public_kernels") do
             return states
         end
         @kernel public_population(subjects, gain) = begin
-            rows = plate(subjects, Ref(gain)) do xs, g
-                states = public_adapter(xs, g)
+            rows = plate(subjects) do xs
+                states = public_adapter(xs, gain)
                 states
             end
             locations = reduce(vcat, rows)

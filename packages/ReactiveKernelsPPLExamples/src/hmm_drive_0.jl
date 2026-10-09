@@ -115,10 +115,9 @@ using LogExpFunctions: logsumexp, logaddexp
     logk::Float64 = log(2.0)
     uniform_log_mass::Vector{Float64} = [-logk, -logk]
     forward::Vector{Float64} =
-        scan(eachrow(scan_rows), Ref(logtheta), Ref(phi), Ref(lambda);
-             init = uniform_log_mass) do carry, row, lt, ph, la
-            emit = log.(ph) .- ph .* row[1] .+ log.(la) .- la .* row[2]
-            transitioned = carry .+ row[3] .* lt
+        scan(eachrow(scan_rows); init = uniform_log_mass) do carry, row
+            emit = log.(phi) .- phi .* row[1] .+ log.(lambda) .- lambda .* row[2]
+            transitioned = carry .+ row[3] .* logtheta
             newg = vec(mapslices(logsumexp, transitioned; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end

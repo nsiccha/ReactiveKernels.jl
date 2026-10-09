@@ -175,9 +175,9 @@ end
 # source authority is defined here and replayed from its printed form.
 const INVENTORY_SOURCE = raw"""
 @kernel inventory_groups(groups, scale::Float64) = begin
-    group_total = plate(groups, Ref(scale)) do observations, sigma
-        pointwise = plate(observations, Ref(sigma)) do observation, s
-            -log(s) - 0.5 * (observation / s)^2
+    group_total = plate(groups) do observations
+        pointwise = plate(observations) do observation
+            -log(scale) - 0.5 * (observation / scale)^2
         end
         sum(pointwise)
     end
@@ -185,15 +185,15 @@ const INVENTORY_SOURCE = raw"""
     return total
 end
 @kernel inventory_path(xs, gain) = begin
-    updates = scan(xs, Ref(gain); init = 0.0) do carry, x, g
-        next = carry + x * g
+    updates = scan(xs; init = 0.0) do carry, x
+        next = carry + x * gain
         (next, next)
     end
     return updates
 end
 @kernel inventory_panel(x, gain) = begin
-    totals = plate(eachcol(x), Ref(gain)) do xs, g
-        history = inventory_path(xs, g)
+    totals = plate(eachcol(x)) do xs
+        history = inventory_path(xs, gain)
         sum(history)
     end
     total = sum(totals)

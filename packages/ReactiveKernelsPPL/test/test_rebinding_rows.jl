@@ -7,7 +7,7 @@ using DifferentiationInterface, Distributions, Enzyme, ReactiveKernels, Reactive
 # read from the bound data inside the graph.
 
 ReactiveKernels.@kernel _rr_scaled_cells(cells, a) = begin
-    values = ReactiveKernels.plate(cells, Ref(a)) do c, a
+    values = ReactiveKernels.plate(cells) do c
         a .* c
     end
     flat = reduce(vcat, values)

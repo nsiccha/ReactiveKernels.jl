@@ -25,9 +25,7 @@ ReactiveKernels.@kernel locations_cell(vc, k) = begin
     return vc
 end
 ReactiveKernels.@kernel locations_reader(locations_subject_count, Vc, k10) = begin
-    cell_values = ReactiveKernels.plate(
-            1:locations_subject_count, Ref(locations_subject_count), Ref(Vc), Ref(k10)
-        ) do subject, locations_subject_count, Vc, k10
+    cell_values = ReactiveKernels.plate(1:locations_subject_count) do subject
         cell_input_1 = Vc[subject]
         cell_input_2 = k10[subject]
         locations_cell(cell_input_1, cell_input_2)

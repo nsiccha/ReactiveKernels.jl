@@ -87,16 +87,16 @@ end
 
 _det_child_plate = @kernel _det_child_plate(obs::Vector{Float64}, units::Vector{Float64},
                                             weights::Vector{Float64}) = begin
-    out::Vector{Float64} = plate(obs, Ref(units), Ref(weights)) do o, u, w
-        o * sum(u .* w)
+    out::Vector{Float64} = plate(obs) do o
+        o * sum(units .* weights)
     end
     return out
 end
 const _DET_CHILD_PLATE = prepare(_det_child_plate)
 
 _det_child_scan = @kernel _det_child_scan(xs::Vector{Float64}, gain::Float64) = begin
-    values::Vector{Float64} = scan(xs, Ref(gain); init = 0.0) do carry, x, g
-        next = carry * g + x
+    values::Vector{Float64} = scan(xs; init = 0.0) do carry, x
+        next = carry * gain + x
         (next, next)
     end
     return values

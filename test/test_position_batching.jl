@@ -128,9 +128,8 @@ _position_plate_bytes(kernel, args...) =
         response::Vector{Float64} = exp.(-position[1] .* (0:(n - 1)))
         weights::Vector{Float64} = position[2] .* (1:length(shifts))
         observations = 1:n
-        concentration::Vector{Float64} = plate(observations, Ref(shifts),
-                Ref(response), Ref(weights)) do t, s, u, w
-            sum((w[j] * get(u, t - s[j], 0.0) for j in eachindex(s)); init = 0.0)
+        concentration::Vector{Float64} = plate(observations) do t
+            sum((weights[j] * get(response, t - shifts[j], 0.0) for j in eachindex(shifts)); init = 0.0)
         end
         return concentration
     end
@@ -243,9 +242,9 @@ end
 # Structural record depth must not erase scalar types inside the retained
 # position/scan loops. The recurrence has an independent, exact prefix oracle.
 @kernel nested_position_scan(position, xs) = begin
-    trajectory = scan(xs, Ref(position.group.response);
-                      init=position.group.response.seed, include_init=true) do previous, x, p
-        next = previous + p.rate * x
+    response = position.group.response
+    trajectory = scan(xs; init=response.seed, include_init=true) do previous, x
+        next = previous + response.rate * x
         (next, next)
     end
     return trajectory

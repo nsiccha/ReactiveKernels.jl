@@ -109,7 +109,7 @@ end
         @test occursin("scan(eachrow(scan_rows)", HMM_DRIVE_0_SOURCE)
         @test occursin("mapslices(logsumexp, transitioned; dims = 1)", HMM_DRIVE_0_SOURCE)
         @test occursin("dirichlet(alpha1).logpdf(theta1)", HMM_DRIVE_0_SOURCE)
-        @test occursin("log.(ph) .- ph .* row[1]", HMM_DRIVE_0_SOURCE)
+        @test occursin("log.(phi) .- phi .* row[1]", HMM_DRIVE_0_SOURCE)
         @test occursin("logaddexp(s1a, s1b)", HMM_DRIVE_0_SOURCE)
         @test !occursin("struct ", HMM_DRIVE_0_SOURCE)
         @test artifact.normal_object === normal

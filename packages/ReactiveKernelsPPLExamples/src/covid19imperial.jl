@@ -102,11 +102,10 @@ using LogExpFunctions: xlogy
     # ---- renewal recurrence: one batched scan over days i = N0+1:N2 ----
     # carry.buffer[d, m] = prediction[i-d, m]: a shift register seeded with the
     # N0 imputed infections; carry.cumulative[m] = cumm_sum[i-1, m] = (N0-1)*y.
-    # N2 rides as an explicit Ref operand (a `scan` closure resolves free names
-    # in its enclosing module, NOT in the @kernel body), and the ACTIVE
+    # The step reads SI, fmat, pop and N2 by closing over them. The ACTIVE
     # per-country ifr_noise rides INSIDE the carry — passed through unchanged —
-    # because Ref'ing an active vector makes the step body store constant memory
-    # into differentiable state under ordinary (unannotated) Enzyme. The xs
+    # because a step sharing an active vector stores constant memory into
+    # differentiable state under ordinary (unannotated) Enzyme. The xs
     # matrix stays purely param-derived: concatenating a CONST phase column
     # into it triggers the same runtime-activity error, which the closed-form
     # early block above makes unnecessary.
@@ -117,16 +116,16 @@ using LogExpFunctions: xlogy
     buffer0 = vcat(permutedims(y) .* ones(N0, M), zeros(N2 - N0, M))
     cum0 = (N0 - 1) .* y
 
-    eds = scan(eachrow(xs), Ref(SI), Ref(fmat), Ref(pop), Ref(N2);
+    eds = scan(eachrow(xs);
                init = (; buffer = buffer0, cumulative = cum0,
-                       ifr = ifr_noise)) do carry, Rt_i, si, ff, pp, n2
-        conv = transpose(carry.buffer) * si
+                       ifr = ifr_noise)) do carry, Rt_i
+        conv = transpose(carry.buffer) * SI
         cumulative = carry.cumulative .+ carry.buffer[1, :]
-        susceptible = (pp .- cumulative) ./ pp
+        susceptible = (pop .- cumulative) ./ pop
         pred = susceptible .* Rt_i .* conv
-        conv_f = vec(sum(carry.buffer .* ff; dims = 1))
+        conv_f = vec(sum(carry.buffer .* fmat; dims = 1))
         ed = carry.ifr .* conv_f
-        newbuf = vcat(permutedims(pred), carry.buffer[1:(n2 - 1), :])
+        newbuf = vcat(permutedims(pred), carry.buffer[1:(N2 - 1), :])
         ((; buffer = newbuf, cumulative = cumulative, ifr = carry.ifr), ed)
     end
     # Full E_deaths grid: Stan's day-1 special case E_deaths[1,m] =

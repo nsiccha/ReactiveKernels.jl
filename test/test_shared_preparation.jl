@@ -11,8 +11,8 @@ normalizer(w, b) = (calls[3] += 1; sum(w) + sum(b))
     b = basis(data)
     w = weights(q, scale)
     offset = normalizer(w, b)
-    values = plate(samples, Ref(w), Ref(offset)) do x, shared_w, shared_offset
-        x * sum(shared_w) - shared_offset
+    values = plate(samples) do x
+        x * sum(w) - offset
     end
     return values
 end
@@ -242,8 +242,8 @@ observation_domain(plan::LatticePlan) = 1:plan.nobs
     units::Vector{Float64} = exp.(-kernel.k .* plan.lags)
     weights::Vector{Float64} = amounts .* kernel.F
     observations = observation_domain(plan)
-    concentration::Vector{Float64} = plate(observations, Ref(plan), Ref(units), Ref(weights)) do o, p, u, w
-        sum((w[i] * get(u, row_index(o, p, i), 0.0) for i in dose_slots(p)); init = 0.0)
+    concentration::Vector{Float64} = plate(observations) do o
+        sum((weights[i] * get(units, row_index(o, plan, i), 0.0) for i in dose_slots(plan)); init = 0.0)
     end
     total = sum(concentration)
     return total
@@ -387,8 +387,8 @@ end
         @kernel plated(data, q) = begin
             b = square(data)
             observations::UnitRange{Int} = 1:length(b)
-            values::Vector{Float64} = plate(observations, Ref(b), Ref(q)) do t, shared, w
-                shared[t] * w[t]
+            values::Vector{Float64} = plate(observations) do t
+                b[t] * q[t]
             end
             total = sum(values)
             return total
@@ -435,8 +435,8 @@ basis(data) = (calls[] += 1; data .^ 2)
 @kernel spec(samples, data, q) = begin
     b = basis(data)
     w = q .* 2
-    values = plate(samples, Ref(b), Ref(w)) do x, shared_b, shared_w
-        x * sum(shared_b) + sum(shared_w)
+    values = plate(samples) do x
+        x * sum(b) + sum(w)
     end
     return values
 end

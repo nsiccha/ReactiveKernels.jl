@@ -295,8 +295,8 @@ end
         straight = RKS._kernel_endpoint_has_nonstraight
         # A `plate(...) do` cell is lowered by the recipe pass, not an opaque
         # closure: it keeps the method a pure endpoint (lazy `?:` inside).
-        @test !straight(:(plate(y, eta, Ref(cuts)) do observed, e, c
-            cell::Float64 = observed == 1 ? log(c[1] - e) : log(c[observed] - e)
+        @test !straight(:(plate(y, eta) do observed, e
+            cell::Float64 = observed == 1 ? log(cuts[1] - e) : log(cuts[observed] - e)
             cell
         end))
         @test !straight(:(ReactiveKernels.plate(y, mu) do observed, m

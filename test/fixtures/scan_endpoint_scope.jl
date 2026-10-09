@@ -54,8 +54,8 @@ end
 # A do-block formal passed directly to a typed endpoint argument takes that
 # argument's declared type, as a plate formal does.
 @kernel formal_argument_scan(xs, offset::Float64) = begin
-    trajectory = scan(xs, Ref(offset); init = 0.0) do previous, x, o
-        next_value = step_object(o, previous).shifted(x)
+    trajectory = scan(xs; init = 0.0) do previous, x
+        next_value = step_object(offset, previous).shifted(x)
         (next_value, next_value)
     end
     return trajectory
@@ -70,8 +70,8 @@ end
 end
 
 @kernel scaled_scan(q::Vector{Float64}, xs::Vector{Float64}) = begin
-    trajectory = scan(xs, Ref(q); init = 0.0) do previous, x, params
-        dt = params[1] * x
+    trajectory = scan(xs; init = 0.0) do previous, x
+        dt = q[1] * x
         next_value = step_object(dt, previous).state()
         (next_value, next_value)
     end
@@ -80,8 +80,8 @@ end
 end
 
 @kernel scaled_function_scan(q::Vector{Float64}, xs::Vector{Float64}) = begin
-    trajectory = scan(xs, Ref(q); init = 0.0) do previous, x, params
-        dt = params[1] * x
+    trajectory = scan(xs; init = 0.0) do previous, x
+        dt = q[1] * x
         next_value = step_function(dt, previous)
         (next_value, next_value)
     end
