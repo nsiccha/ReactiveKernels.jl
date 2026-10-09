@@ -70,6 +70,11 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
             "bound = (; data)",
             "data-only prefix executes exactly once",
             "Rebind by preparing again",
+            "## Jacobian-vector and Hessian-vector products",
+            "prepare_ad_pushforward",
+            "prepare_ad_hvp",
+            "ad_gradient_and_hvp",
+            "test_ad_tangent_operators.jl",
         )
         @test occursin(marker, ad_docs)
     end
