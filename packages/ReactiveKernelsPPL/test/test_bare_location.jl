@@ -531,3 +531,183 @@ end
         _check_gradient(built.spec, bound, u)
     end
 end
+
+# A location value gets the response rows once, never through a ones vector
+# per summand: a number fills the rows, and a value already holding one
+# Float64 per row is read as it is (snag rkppl-scalar-loc-b96d576a).
+_rows_gather(z, idx, j) = z[idx, j]
+
+function _rows_sampler(prog::Expr, cols::AbstractDict{Symbol})
+    plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
+    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    return bound, built, q, u
+end
+
+function _rows_primal_bytes(q, u)
+    q(u)
+    return minimum(@allocated(q(u)) for _ in 1:5)
+end
+
+@testset "value location rows helper" begin
+    rows = ReactiveKernelsPPL._ppl_rows
+    v = [0.3, -1.2, 2.1]
+    @test rows(v, 3) === v
+    @test rows(0.4, 3) == fill(0.4, 3) && rows(0.4, 3) isa Vector{Float64}
+    # Other values keep Julia's broadcast against the rows.
+    @test rows([0.4], 3) == fill(0.4, 3)
+    @test rows([1, 2, 3], 3) == [1.0, 2.0, 3.0] &&
+        eltype(rows([1, 2, 3], 3)) === Float64
+    @test rows(2, 3) == [2.0, 2.0, 2.0]
+    @test_throws DimensionMismatch rows(v, 4)
+end
+
+@testset "value location rows" begin
+    D = Distributions
+    y = [0.3, -1.2, 2.1, 0.7]
+    x = [0.5, -0.2, 1.0, 0.1]
+    g = [1, 2, 1, 2]
+    bo = [0.4, 1.3, 2.2, 0.8]
+    sterm = D.logpdf(D.Exponential(1), 1.3) + log(1.3)
+    filled = Meta.parse("""begin
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        mu = fill(a, length(y))
+        y .~ Normal.(mu, s)
+    end""")
+    offset = Meta.parse("""begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        c ~ Normal(0, 1)
+        s ~ Exponential(1)
+        off = 2 * c
+        mu = a .+ b .* x .+ off
+        y .~ Normal.(mu, s)
+    end""")
+    # A model-level value with a scalar intercept, read by two locations
+    # whose summands are module-call results of unknown shape.
+    linked = Meta.parse("""begin
+        z[levels(g), 1:3] .~ Normal.(0, 1)
+        bi ~ Normal(0, 1)
+        w ~ Normal(0, 1)
+        b_ = bi .+ _rows_gather(z, g, 1)
+        b = exp.(b_)
+        a = w .* x .+ (_rows_gather(z, g, 2) .+ _rows_gather(z, g, 3) .* b)
+        sb ~ Exponential(1)
+        s ~ Exponential(1)
+        bo .~ LogNormal.(log.(b), sb)
+        y .~ Normal.(a, s)
+    end""")
+    Z = [0.2 -0.5 0.3; 0.7 0.1 -0.4]
+    bl = exp.(0.4 .+ Z[g, 1])
+    cases = [
+        (_VALUE_NORMAL, Dict{Symbol,AbstractVector}(:y => y),
+            (; mu = 0.4, s = 1.3), D.logpdf(D.Normal(0, 1), 0.4) + sterm +
+            sum(D.logpdf.(D.Normal(0.4, 1.3), y))),
+        (filled, Dict{Symbol,AbstractVector}(:y => y), (; a = 0.4, s = 1.3),
+            D.logpdf(D.Normal(0, 1), 0.4) + sterm +
+            sum(D.logpdf.(D.Normal(0.4, 1.3), y))),
+        (offset, Dict{Symbol,AbstractVector}(:y => y, :x => x),
+            (; a = 0.4, b = -0.3, c = 0.6, s = 1.3),
+            sum(D.logpdf.(D.Normal(0, 1), [0.4, -0.3, 0.6])) + sterm +
+            sum(D.logpdf.(D.Normal.(0.4 .- 0.3 .* x .+ 1.2, 1.3), y))),
+        (linked, Dict{Symbol,AbstractVector}(:y => y, :x => x, :g => g,
+                :bo => bo), (; z = Z, bi = 0.4, w = -0.6, sb = 0.9, s = 1.3),
+            sum(D.logpdf.(D.Normal(0, 1), Z)) +
+            sum(D.logpdf.(D.Normal(0, 1), [0.4, -0.6])) +
+            D.logpdf(D.Exponential(1), 0.9) + log(0.9) + sterm +
+            sum(D.logpdf.(D.LogNormal.(log.(bl), 0.9), bo)) +
+            sum(D.logpdf.(D.Normal.(-0.6 .* x .+ Z[g, 2] .+ Z[g, 3] .* bl,
+                1.3), y))),
+    ]
+    for (prog, cols, q, want) in cases
+        bound, built, _, u = _rows_sampler(prog, cols)
+        # The value broadcasts over the rows without a ones operand.
+        @test !occursin(r"ones\(\d+\) \.\*",
+            string(kernel_expr(bound, built.layout)))
+        @test _value_posterior(prog, cols, q) ≈ want rtol = 1e-12
+        _check_gradient(built.spec, bound, u)
+    end
+
+    # Allocation per primal call, measured in this process: a scalar
+    # location costs no more than its one-column design product; the
+    # former ones operand added a whole row vector (8n bytes).
+    n = 1000
+    yl = Dict{Symbol,AbstractVector}(:y => collect(range(-1, 1; length = n)))
+    design = Meta.parse("""begin
+        X = hcat(ones(length(y)))
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        s ~ Exponential(1)
+        y .~ Normal.(X * b, s)
+    end""")
+    _, _, qd, ud = _rows_sampler(design, yl)
+    want = _rows_primal_bytes(qd, ud) + 4n
+    for prog in (_VALUE_NORMAL, filled)
+        _, _, q, u = _rows_sampler(prog, yl)
+        @test _rows_primal_bytes(q, u) < want
+    end
+end
+
+# A proven scalar location (a sampled scalar, a number, a scalar definition
+# or an intercept definition) stays a scalar: the observation plate
+# broadcasts it as a shared argument, and the kernel allocates no row
+# vector for it (snag rkppl-scalar-loc-b96d576a).
+@testset "scalar locations stay scalar" begin
+    D = Distributions
+    y = [0.3, -1.2, 2.1, 0.7]
+    yc = [1, 0, 3, 2]
+    yb = [1, 0, 1, 1]
+    lg(v) = 1 / (1 + exp(-v))
+    prior = D.logpdf(D.Normal(0, 1), 0.4)
+    sterm = D.logpdf(D.Exponential(1), 1.3) + log(1.3)
+    intercept = Meta.parse("""begin
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        eta = a
+        y .~ Normal.(eta, s)
+    end""")
+    defined = Meta.parse("""begin
+        lm ~ Normal(0, 1)
+        s ~ Exponential(1)
+        m = exp(lm)
+        y .~ Normal.(m, s)
+    end""")
+    cases = [
+        (_VALUE_NORMAL, Dict{Symbol,AbstractVector}(:y => y),
+            (; mu = 0.4, s = 1.3),
+            prior + sterm + sum(D.logpdf.(D.Normal(0.4, 1.3), y))),
+        (intercept, Dict{Symbol,AbstractVector}(:y => y),
+            (; a = 0.4, s = 1.3),
+            prior + sterm + sum(D.logpdf.(D.Normal(0.4, 1.3), y))),
+        (defined, Dict{Symbol,AbstractVector}(:y => y),
+            (; lm = 0.4, s = 1.3),
+            prior + sterm + sum(D.logpdf.(D.Normal(exp(0.4), 1.3), y))),
+        (Meta.parse("""begin
+            a ~ Normal(0, 1)
+            y .~ Poisson.(exp.(a))
+        end"""), Dict{Symbol,AbstractVector}(:y => yc), (; a = 0.4),
+            prior + sum(D.logpdf.(D.Poisson(exp(0.4)), yc))),
+        (Meta.parse("""begin
+            a ~ Normal(0, 1)
+            y .~ Bernoulli.(logistic.(a))
+        end"""), Dict{Symbol,AbstractVector}(:y => yb), (; a = 0.4),
+            prior + sum(D.logpdf.(D.Bernoulli(lg(0.4)), yb))),
+    ]
+    for (prog, cols, q, want) in cases
+        bound, built, _, u = _rows_sampler(prog, cols)
+        src = string(kernel_expr(bound, built.layout))
+        @test occursin(r"_ppl_lp_\w+::Number = ", src)
+        @test !occursin("_ppl_rows", src) && !occursin("hcat(ones", src)
+        @test _value_posterior(prog, cols, q) ≈ want rtol = 1e-12
+        _check_gradient(built.spec, bound, u)
+    end
+    # No allocation proportional to the rows: less than half a row vector.
+    n = 1000
+    yl = Dict{Symbol,AbstractVector}(:y => collect(range(-1, 1; length = n)))
+    for prog in (_VALUE_NORMAL, intercept, defined)
+        _, _, q, u = _rows_sampler(prog, yl)
+        @test _rows_primal_bytes(q, u) < 4n
+    end
+end
