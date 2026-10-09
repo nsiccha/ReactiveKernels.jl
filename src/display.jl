@@ -224,7 +224,7 @@ end
 function _recipe_label(recipe::Recipe)
     _is_body_op(recipe.op) && return _opname(recipe.op)
     recipe.op isa _KernelSourceOp && _has_source(recipe) || return _opname(recipe.op)
-    ins = join((string(v.name) for v in recipe.inputs), ", ")
+    ins = join((string(name) for name in _recipe_source_names(recipe)), ", ")
     "($ins) -> " * _display_line(recipe.source)
 end
 
@@ -287,8 +287,8 @@ another way; the comment then names `M`.
 """
 function readable_code(p::Plan)
     modules = _collect_source_modules!(Module[], p.recipes)
-    ReadableCode(_display_globals(_display_expr(_readable_expr(code_expr(p), p)),
-        modules)...)
+    ReadableCode(_display_globals(_display_expr(
+        _readable_inline_generated(_readable_expr(code_expr(p), p), p)), modules)...)
 end
 
 function readable_code(k::PreparedKernel)
