@@ -939,8 +939,7 @@ function _ranged_response_stmts(r, plan, stmts)
         # Select ordinary row values before family-specific conversions or
         # ordinal stage expansion. Simplexes and covariance factors stay whole.
         if r.family ∉ (CategoricalFam, MultinomialFam)
-            push!(rows, _is_bare_param_location(r, plan) ? r.predictor :
-                _location_node(r, plan))
+            push!(rows, _location_node(r, plan))
             append!(rows, r.extra_predictors)
         end
         for slot in (r.scale, r.nu, r.zi, r.discrimination, r.weights, r.trials,

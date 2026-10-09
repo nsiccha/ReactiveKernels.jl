@@ -1483,8 +1483,8 @@ end
 # A definition optimized into a predictor (a response location or scale, a
 # composition's sub-predictor) is that predictor's node, under its own name
 # (user decision `1c0jiwz`). A pure alias absorbed into the value it names
-# (`w = u` over a scan state, `w = mu` over a predictor) emits no statement
-# of its own, so it reads the alias chain's target (user decision
+# (`w = th` over a plate latent, `w = u` over a scan state) emits no
+# statement of its own, so it reads the alias chain's target (user decision
 # `0fbe312`; "all intermediate quantities" are part of the RK graph).
 function _absorbed_named_values(det, canonmap, skip, predictors)
     pnames = Set{Symbol}(p.name for p in predictors)
