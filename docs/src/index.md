@@ -163,7 +163,14 @@ shares `magnitude` and `tail`. The generated kernel contains no nested call.
 
 Nested graph calls currently take all default HAVE boundary ports positionally
 (supply optional positional values explicitly) and require exact declared types
-at the outer input and output ports. A destructuring assignment binds the nested
+at the outer input and output ports. A value the kernel computes without a
+declaration takes the declared type of the formal it is passed to, so the
+formal reads that value directly. The kernel's own inputs and returned values
+keep their declarations, so an undeclared one is still converted at the formal,
+as is a value passed to formals of different types. A call
+inside a larger expression becomes its own value named for the call under the
+assignment: `mu = a .* rise(a)` computes `var"mu.rise"`, and the child's values
+are named `var"mu.rise.xi"`. A destructuring assignment binds the nested
 outputs in order, `(a, b) = child(x)`; as in Julia, a shorter `(a,) = child(x)`
 binds the leading outputs and leaves the rest prunable, and a longer one is
 refused. A single-output child returns its one value, so `(a,) = child(x)` binds
@@ -253,7 +260,9 @@ A constructed endpoint may also appear under a lazy branch arm, such as
 `mp == 0 ? normal(lpi, 1.5).logpdf(yf) : 0.0` in a plate cell. No recipe
 position exists inside the arm, so the endpoint's planned recipes are rendered
 as source in the arm itself: each arm evaluates its own endpoint copy exactly
-when taken, and a data-bound branch still splits per arm at preparation. An
+when taken, and a data-bound branch still splits per arm at preparation. The
+copy is one `let` over the endpoint's own value names,
+`let log_scale = log(s), standardized = (x - 0.0) / s; … end`. An
 endpoint whose lowered form binds locals, runs a plate or scan, or reads a
 non-`Base` global is rejected at authoring time with an action to hoist the
 call above the branch, where it splices as usual.

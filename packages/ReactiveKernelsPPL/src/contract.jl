@@ -5548,7 +5548,10 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
     # supplies that index's value; the data it reads are whole inputs of
     # that value, not observation operands. So are the inputs of a derived
     # response (`y = cells[perm]`), which binding has already evaluated.
-    for c in _response_reads(plan, r, arrays;
+    # The loop's index source (`t` in `@plate for i in eachindex(t)`, held by
+    # the response range `y[eachindex(t)]`) supplies indices, not values: the
+    # range is validated against the response, so only the values are read.
+    for c in _response_reads(plan, _with(r; range = nothing), arrays;
             stop = Set{Symbol}((perindex..., r.response)))
         c === r.response && continue
         v = plan.columns[c]

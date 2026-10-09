@@ -96,7 +96,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
         Expr[args..., transforms..., coefs..., conditioned..., values...]))
     append!(stmts, likelihoods)
     append!(stmts, priors)
-    push!(stmts, _log_jacobian_statement(plan, layout))
+    append!(stmts, _log_jacobian_statements(plan, layout))
     push!(stmts, :(posterior::Float64 = prior + likelihood + log_jacobian))
     push!(stmts, :(return posterior))
     sig = Expr(:call, name, args...)
@@ -865,8 +865,12 @@ function _observations_statement(points::Vector{Pair{Symbol,Any}},
         arguments::Vector{Pair{Symbol,Any}})
     covered = Set(first.(arguments))
     missing = Tuple(name for (name, _) in points if !(name in covered))
+    # A tuple literal of quoted names, so the printed program (`kernel_expr`)
+    # parses back to the same call; a `QuoteNode` holding the tuple prints as
+    # `$(QuoteNode(...))`, which `@kernel` cannot evaluate.
     isempty(missing) || return Expr(:(=), :_ppl_observations, Expr(:call,
-        GlobalRef(@__MODULE__, :_ppl_observations_unsupported), QuoteNode(missing)))
+        GlobalRef(@__MODULE__, :_ppl_observations_unsupported),
+        Expr(:tuple, QuoteNode.(missing)...)))
     values = isempty(arguments) ? :(NamedTuple()) :
         Expr(:tuple, (Expr(:(=), name, value) for (name, value) in arguments)...)
     return Expr(:(=), :_ppl_observations, values)
@@ -1617,14 +1621,16 @@ end
 
 # The fused whole-vector likelihoods (`dot(y, η)`, `sum(exp, η)`) need one
 # location entry per response entry. A latent vector keeps its own length and
-# broadcasts as a Julia array does (one entry stretches over every row); the
-# plate path evaluates that, so fusion requires equal lengths.
+# broadcasts as a Julia array does (one entry stretches over every row), and so
+# does a response: a number or one-entry `y` stretches over a longer location.
+# The plate path evaluates that, so fusion requires equal lengths.
 function _wholevec_location(r::LikelihoodSpec, plan::StructuralPlan)
     y = get(plan.columns, r.response, nothing)
     rows = y isa AbstractVector ? length(y) : nothing
     _is_latent_location(r, plan) && return _latent_rows(plan, r.predictor) == rows
     pred = _predictor(plan, r.predictor)
     _broadcast_affine(plan, pred) && return false
+    _predictor_rows(plan, pred.name) == rows || return false
     return all(pred.terms) do t
         t.kind === LatentTerm || return true
         n = _latent_rows(plan, only(t.columns))
@@ -4081,12 +4087,28 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
     return stmts, nodes
 end
 
-function _log_jacobian_statement(plan::StructuralPlan, layout::LayoutTable)
+# A scalar constrained parameter's bijector `logjac` term is its own value
+# named after the parameter (`var"sigma.logjac"`), so the built program reads
+# `log_jacobian = var"sigma.logjac" + …` with that term's definition shown,
+# not a value named after the sum.
+function _log_jacobian_statements(plan::StructuralPlan, layout::LayoutTable)
+    stmts = Expr[]
     terms = Any[]
     for e in layout.entries
         t = jacobian_term(e)
-        t === nothing || push!(terms, t)
+        t === nothing && continue
+        if _bijector_logjac_call(t)
+            name = Symbol(e.name, ".logjac")
+            push!(stmts, :($name::Float64 = $t))
+            t = name
+        end
+        push!(terms, t)
     end
     jac = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
-    return :(log_jacobian::Float64 = $jac)
+    push!(stmts, :(log_jacobian::Float64 = $jac))
+    return stmts
 end
+
+_bijector_logjac_call(t) = t isa Expr && t.head === :call && !isempty(t.args) &&
+    t.args[1] isa Expr && t.args[1].head === :. &&
+    t.args[1].args[2] == QuoteNode(:logjac)
