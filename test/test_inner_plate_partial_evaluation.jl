@@ -101,7 +101,7 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         # Source-identical ON/OFF controls: neither unknown rank nor a known
         # rank may turn a skipped invalid-data cell into a preparation error.
         C.calls[] = 0
-        for spec in (C.projected, C.vector_live)
+        for spec in (C.projected, C.vector_live, C.vector_live_rank)
             empty_args = spec === C.projected ? (Float64[], 1.0) : (Float64[],)
             invalid = prepare(spec; bound = (; data = [-1.0]))
             @test isempty(caches(invalid.plan))
@@ -111,7 +111,7 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         end
         # A non-singleton bound vector does not constrain a new live matrix
         # dimension. In particular, 3×0 is compatible and visits no cells.
-        for spec in (C.projected, C.projected_matrix)
+        for spec in (C.projected, C.projected_matrix, C.matrix_live_rank)
             bad_data, shift = [-1.0, -2.0, -3.0], 0.0
             extra_axis = prepare(spec; bound = (; data = bad_data, shift))
             @test isempty(caches(extra_axis.plan))
@@ -123,6 +123,35 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test length(caches(vector.plan)) == 1
         @test vector(ones(3)) == sum(log, [1.0, 2.0, 4.0])
         @test_throws DimensionMismatch vector(Float64[])
+
+        # Only the declared rank decides: an abstract element type qualifies
+        # like a concrete one, and the cache serves any element type the
+        # declaration admits (snag rk-declared-rank-317aa725).
+        rank_data = [1.0, 2.0, 4.0]
+        for spec in (C.vector_live_rank, C.vector_live_real, C.vector_live_local)
+            C.calls[] = 0
+            rank_only = prepare(spec; bound = (; data = rank_data))
+            @test C.calls[] == 3
+            @test length(caches(rank_only.plan)) == 1
+            @test rank_only([0.5, 2.0, 3.0]) == vector([0.5, 2.0, 3.0])
+            @test rank_only([1, 2, 3]) == sum(log.(rank_data) .* [1, 2, 3])
+            @test C.calls[] == 3
+            @test_throws DimensionMismatch rank_only(Float64[])
+        end
+        matrix_bound = (; data = reshape(rank_data, 3, 1),
+                          shift = reshape([0.1, 0.3], 1, 2))
+        C.calls[] = 0
+        rank_matrix = prepare(C.matrix_live_rank; bound = matrix_bound)
+        @test C.calls[] == 3
+        @test size(only(caches(rank_matrix.plan)).op.value) == (3, 2)
+        @test rank_matrix(fill(2.0, 3, 2)) ==
+              prepare(C.projected_matrix; bound = matrix_bound)(fill(2.0, 3, 2))
+        @test_throws DimensionMismatch rank_matrix(ones(2, 2))
+        C.calls[] = 0
+        rankless = prepare(C.vector_live_rankless; bound = (; data = rank_data))
+        @test C.calls[] == 0
+        @test isempty(caches(rankless.plan))
+        @test rankless([0.5, 2.0, 3.0]) == vector([0.5, 2.0, 3.0])
     end
 
     @testset "numeric scalars, atomic data and source granularity" begin
@@ -310,6 +339,20 @@ import Enzyme
     @test ad_value_and_gradient(bound, q) == ad_value_and_gradient(plain, q, data)
     @test ad_gradient(bound, q) ≈ fill(sum(log, data), length(q))
     @test ad_gradient(bound, 2q) == ad_gradient(bound, q)
+
+    # A live port declaring only its rank caches and differentiates like one
+    # declaring its element type (snag rk-declared-rank-317aa725).
+    live_q = [0.5, 2.0, 3.0]
+    rank_plain = prepare_ad(C.vector_live_rank, backend, live_q, data;
+                            active=:q, want=:total)
+    rank_bound = prepare_ad(C.vector_live_rank, backend, live_q; active=:q,
+                            want=:total, bound=(; data))
+    @test length(filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+        startswith(String(only(r.outputs).name), "bound_plate_"),
+        rank_bound.kernel.plan.recipes)) == 1
+    @test ad_value_and_gradient(rank_bound, live_q) ==
+          ad_value_and_gradient(rank_plain, live_q, data)
+    @test ad_gradient(rank_bound, live_q) == log.(data)
 
     xs = [[1.0, 2.0], [4.0], Float64[]]
     plain = prepare_ad(C.array_weights, backend, q, xs; active=:q, want=:total)

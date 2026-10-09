@@ -152,11 +152,15 @@ _partial_plate_cacheable(::Type{<:Array{<:_PartialPlateScalar}}) = true
 # Such a domain must keep the original lazy per-cell execution: eager prefix
 # evaluation could otherwise throw for a cell that is never visited. A known
 # rank is safe only when bound non-singleton axes already fix each dimension
-# it can contribute. Atomic arguments never contribute axes.
+# it can contribute. Atomic arguments never contribute axes. Only the rank
+# matters, so a declaration with an abstract element type (`AbstractVector`,
+# `AbstractVector{<:Real}`) qualifies like `Vector{Float64}` (snag
+# rk-declared-rank-317aa725: an element type bound outside the `<:` matched only
+# declarations with one element type).
 _partial_plate_live_domain(::Type, bound_axes) = false
 _partial_plate_live_domain(::Type{<:Number}, bound_axes) = true
-function _partial_plate_live_domain(::Type{<:AbstractArray{T,N}},
-                                    bound_axes) where {T,N}
+function _partial_plate_live_domain(::Type{<:AbstractArray{<:Any,N}},
+                                    bound_axes) where {N}
     N isa Int && N <= length(bound_axes) &&
         all(d -> length(bound_axes[d]) > 1, 1:N)
 end
@@ -778,7 +782,8 @@ every evaluation's output.
 
 The inner pass conservatively retains the original plate for known empty
 domains or live inputs that could introduce an empty broadcast dimension.
-A live array is eligible only when its declared rank is known and each of its
+A live array is eligible only when its declared type fixes its rank (whatever
+its element type) and each of its
 dimensions is fixed by a bound axis of length greater than one; live numeric
 scalars and explicit atomic inputs do not contribute dimensions.
 Other exclusions are non-array/non-numeric batched bound inputs, non-concrete

@@ -45,9 +45,11 @@ Batching adds one trailing axis to each named port and to each selected output:
 | rank-`r` array WANT | rank-`r + 1` array, old dimensions first |
 | tuple or named-tuple HAVE/WANT | the same tree with each leaf batched |
 
-Input and output type annotations are optional, as for a scalar kernel. A known
-numeric input type checks the scalar rank plus one; an untyped port derives its
-layout from the runtime value. Every batched array has one-based axes. For an
+Input and output type annotations are optional, as for a scalar kernel. A
+number or an array type with a known rank checks the scalar rank plus one,
+whatever its element type (`AbstractVector` checks like `Vector{Float64}`); an
+untyped port, or one that leaves the rank open such as
+`AbstractArray{Float64}`, derives its layout from the runtime value. Every batched array has one-based axes. For an
 untyped numeric port, a vector supplies scalar positions and a matrix supplies
 vector positions. Tuple and named-tuple inputs use trees of such arrays, with
 one common trailing length across all leaves. Native execution also accepts a
