@@ -558,8 +558,25 @@ of that Julia loop. Scalar arithmetic needs no dots; vector and matrix
 intermediates use ordinary Julia broadcasts and matrix products.
 Shapes come from named data (the range, a data index column), never from a
 separate size argument. A cell holds observations, per-cell latents, per-cell
-submodel calls and cell locals. The whole loop lowers at once, exactly like its
-broadcast spelling.
+submodel calls and cell locals. A loop of scalar arithmetic lowers at once,
+exactly like its broadcast spelling.
+
+A per-index value may itself be an array, such as `t[i]` holding one vector
+per subject. The cell still means one iteration of the loop. An authored
+broadcast over a per-index value (`exp(la[i]) .* t[i]`), indexing into one or
+into a cell local (`t[i][picks[i]]`, `ti = t[i]; ti[sel]`), a gather with an
+index vector per subject (`v[rows[i]]`), a reduction (`sum(v[rows[i]])`) and
+an ordinary function or function-shaped `@kernel` called on per-index values
+all make the plate a retained RK plate whose body is the cell, as an explicit
+`plate(...) do` reader would be. RK composes a `@kernel` callee into that
+body. Data-only cell work runs once, when the query or sampler is prepared,
+if the plate iterates data or a value whose shape bound data establish
+(`eachindex(la)` with `la = a .+ x`); over an opaque module-call result the
+plate reads its live iterator.
+
+Cell locals belong to their cell, as a Julia loop body's locals do: two
+plates may each bind `m`. A statement outside the plate cannot read a cell
+local; assign it to an indexed output (`c[i] = m`) and read `c`.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("99_plate_32_gaussian.jl", :rkppl_plate)
