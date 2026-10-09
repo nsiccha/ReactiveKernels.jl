@@ -3,8 +3,8 @@
 A plate cell that sums a few weighted, shifted unit responses per observation,
 
 ```julia
-plate(observations, Ref(plan), Ref(units), Ref(weights)) do t, p, u, w
-    sum((w[i] * get(u, dose_row(t, p, dose_table(t, p)[i]), 0.0) for i in eachindex(w));
+plate(observations) do t
+    sum((weights[i] * get(units, dose_row(t, plan, dose_table(t, plan)[i]), 0.0) for i in eachindex(weights));
         init = 0.0)
 end
 ```

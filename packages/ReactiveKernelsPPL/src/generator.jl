@@ -517,7 +517,9 @@ function _composed_rewrite(node, subs::Vector{Symbol}, plan::StructuralPlan,
         node = _guard_missing_observation_argument(pred, node, plan, plan.columns)
         aliases = Dict{Symbol,Symbol}(s => _lp_name(_predictor(plan, s)) for s in subs)
         inputs = [_hsubst(a, aliases) for a in node.args[1].args[2:end]]
-        value = Expr(:do, Expr(:call, :plate, inputs...), node.args[2])
+        # The cell reads a shared sub-predictor by closing over it.
+        captured = filter(p -> first(p) in _plate_column_captures(node), aliases)
+        value = Expr(:do, Expr(:call, :plate, inputs...), _hsubst(node.args[2], captured))
         return node !== original && _guarded_argument_is_bound(node, plan.columns) ?
             _concrete_guarded_argument(value) : value
     end
@@ -719,8 +721,8 @@ end
 # per index, the response's ordinary statements run once per index inside an
 # outer RK plate, giving RK's nested group and observation plates
 # (`reactivekernels-use` §4e1). Values the cell reads per index, and values
-# computed from them, supply that index's array or number; every other value
-# is shared with all indices (`Ref`). The pointwise result keeps the
+# computed from them, supply that index's array or number; the cell reads
+# every other value whole by closing over it. The pointwise result keeps the
 # response's shape: one array of observation densities per index.
 function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         stmts::Vector{Expr}, upstream::Vector{Expr})
@@ -773,24 +775,26 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
         used = _statement_value_reads!(Set{Symbol}(), st.args[2])
         isempty(intersect(used, pergroup)) || push!(pergroup, name)
     end
-    aliases = Dict{Symbol,Symbol}(v => Symbol(:_ppl_group_, v) for v in inputs)
+    # The plate zips the per-index values; the cell reads every other input
+    # whole by closing over it.
+    lanes = Symbol[v for v in inputs if v in pergroup]
+    aliases = Dict{Symbol,Symbol}(v => Symbol(:_ppl_group_, v) for v in lanes)
     group = Symbol(pw, :_group)
     aliases[pw] = group
     cell = Expr[_hsubst(st, aliases) for st in body]
-    _cell_value_types!(cell, Set{Symbol}(aliases[v] for v in inputs if v in pergroup))
+    _cell_value_types!(cell, Set{Symbol}(aliases[v] for v in lanes))
     # Densities are Float64; declaring the observation cell's result also
     # types an empty index's densities (RK's empty-domain result evidence).
     for st in cell
         Meta.isexpr(st, :(=), 2) && st.args[1] === group &&
             Meta.isexpr(st.args[2], :do) && _declare_cell_result!(st.args[2].args[2])
     end
-    outer = Any[v in pergroup ? v : :(Ref($v)) for v in inputs]
     # The pointwise query reads each index's densities and the likelihood
     # its per-index totals; RK evaluates only the plate a query selects. The
     # declared total type also seeds RK's summed plate when the operands'
     # element types are known only at run time (a composed child's output).
-    groupplate(result...) = Expr(:do, Expr(:call, :plate, outer...),
-        Expr(:(->), Expr(:tuple, (aliases[v] for v in inputs)...),
+    groupplate(result...) = Expr(:do, Expr(:call, :plate, lanes...),
+        Expr(:(->), Expr(:tuple, (aliases[v] for v in lanes)...),
             Expr(:block, LineNumberNode(0, :generator), deepcopy(cell)..., result...)))
     totals = Symbol(pw, :_totals)
     return Expr[
@@ -844,13 +848,17 @@ function _assigned_name(st::Expr)
     return lhs isa Symbol ? lhs : nothing
 end
 
-# Value names a generated statement reads: call heads, keyword names and
-# plate cell bodies (which read only their own arguments) are skipped.
+# Value names a generated statement reads: call heads and keyword names are
+# skipped. A plate cell or scan step reads the enclosing names it closes
+# over (`_closure_reads`).
 _statement_value_reads!(out, ex) = out
 _statement_value_reads!(out, ex::Symbol) = push!(out, ex)
 function _statement_value_reads!(out, ex::Expr)
     if ex.head === :do
         _statement_value_reads!(out, ex.args[1])
+        _statement_value_reads!(out, ex.args[2])
+    elseif ex.head === :(=) && length(ex.args) == 2 && _assigned_name(ex) !== nothing
+        _statement_value_reads!(out, ex.args[2])
     elseif ex.head === :call && !isempty(ex.args)
         foreach(a -> _statement_value_reads!(out, a), ex.args[2:end])
     elseif ex.head === :. && length(ex.args) == 2
@@ -860,10 +868,35 @@ function _statement_value_reads!(out, ex::Expr)
     elseif ex.head === :kw
         _statement_value_reads!(out, ex.args[2])
     elseif ex.head === :(->)
-        nothing
+        union!(out, _closure_reads(ex))
     else
         foreach(a -> _statement_value_reads!(out, a), ex.args)
     end
+    return out
+end
+
+# The enclosing names a cell or step body reads, as a Julia closure does: the
+# names it reads less its arguments and the locals it assigns.
+function _closure_reads(lambda::Expr)
+    params = lambda.args[1]
+    bound = Set{Symbol}()
+    for p in (Meta.isexpr(params, :tuple) ? params.args : Any[params])
+        Meta.isexpr(p, :(::)) && (p = p.args[1])
+        p isa Symbol && push!(bound, p)
+    end
+    _assigned_names!(bound, lambda.args[2])
+    return setdiff!(_statement_value_reads!(Set{Symbol}(), lambda.args[2]), bound)
+end
+
+# Locals a body assigns, outside its nested cells.
+function _assigned_names!(out::Set{Symbol}, ex)
+    ex isa Expr && ex.head !== :(->) || return out
+    name = _assigned_name(ex)
+    name === nothing || push!(out, name)
+    if Meta.isexpr(ex, :(=), 2) && Meta.isexpr(ex.args[1], :tuple)
+        foreach(a -> a isa Symbol && push!(out, a), ex.args[1].args)
+    end
+    foreach(a -> _assigned_names!(out, a), ex.args)
     return out
 end
 
@@ -986,7 +1019,8 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
             "[generator] mi response $(r.label) needs an observation plate"))
         for i in 2:length(call.args)
             ref = call.args[i]
-            # Ref inputs are whole model values (e.g. a simplex), never rows.
+            # Shared whole values (e.g. a simplex) are read by the cell, not
+            # zipped; only named inputs are rows.
             ref isa Symbol || continue
             ispacked = i == 2 || ref in _mi_packed_columns(r)
             ispacked && packed === nothing && continue
@@ -1024,7 +1058,14 @@ function _mask_response_stmts(r, plan, stmts)
     rhs = st.args[2]
     if Meta.isexpr(rhs, :do) && rhs.args[1].args[1] === :plate
         inputs, lambda = rhs.args[1], rhs.args[2]
-        present = _dovar(length(inputs.args))
+        # A shared input has no dovar: take the first one the cell lacks.
+        used = _statement_value_reads!(_bound_names!(Set{Symbol}(), lambda),
+            lambda.args[2])
+        k = 1
+        while _dovar(k) in used
+            k += 1
+        end
+        present = _dovar(k)
         push!(inputs.args, mask)
         push!(lambda.args[1].args, present)
         lambda.args[2] = Expr(:block, LineNumberNode(0, :generator),
@@ -1203,9 +1244,8 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         end
     end
     # Weights: literals fold at codegen; a simplex parameter binds one
-    # log-vector hoisted out of the plate, threaded by `Ref` (the
-    # multinomial-plate precedent — plate cells cannot capture body
-   # locals) — K logs, not n×K.
+    # log-vector hoisted out of the plate, which every cell reads whole
+    # (the multinomial-plate precedent) — K logs, not n×K.
     w = r.mixture_weights
     logw_lit = w isa Vector ? log.(w) : nothing
     lwv = nothing
@@ -1495,15 +1535,81 @@ _pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
 # `pointwise = plate(inputs...) do dovars...; cell; end` + scalar sum node.
 # A plate must be a whole recipe RHS (never nested under `sum`), and the
 # do-block body carries a LineNumberNode or the cell types as Any. Response
-# `y` and predictor `lp` are always inputs 1-2 (`_ppl_c1/_ppl_c2`).
+# `y` and predictor `lp` are always inputs 1-2 (`_ppl_c1/_ppl_c2`). A
+# builder marks a value every cell shares as a `Ref(value)` input; the cell
+# reads it whole by closing over it (`_plate_closure`).
 function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any},
         cell::Union{Expr,Vector{Expr}})
-    dovars = [_dovar(i) for i in eachindex(inputs)]
-    body = Expr(:block, LineNumberNode(0, :generator),
-        (cell isa Expr ? (cell,) : cell)...)
-    lambda = Expr(:(->), Expr(:tuple, dovars...), body)
-    doex = Expr(:do, Expr(:call, :plate, inputs...), lambda)
+    doex = _plate_closure(inputs, cell isa Expr ? Expr[cell] : cell)
     return Expr[:($pointwise = $doex), :($node::Float64 = sum($pointwise))]
+end
+
+_is_shared_input(x) = Meta.isexpr(x, :call, 2) &&
+    (x.args[1] === :Ref || x.args[1] == GlobalRef(Base, :Ref))
+
+# `plate(lanes...) do lane dovars...; cell; end`: the plate zips the inputs
+# other than shared `Ref(value)` ones, and the cell reads each shared value in
+# place of its dovar. A shared name is read directly; a shared expression is
+# a cell statement reading only shared names, which RK evaluates once,
+# outside the loop.
+function _plate_closure(inputs::Vector{Any}, cell::Vector{Expr})
+    lanes, dovars = Any[], Symbol[]
+    names, prefix = Dict{Symbol,Any}(), Expr[]
+    body = Expr(:block, cell...)
+    bound = _bound_names!(Set{Symbol}(), body)
+    for (i, x) in enumerate(inputs)
+        if !_is_shared_input(x)
+            push!(lanes, x)
+            push!(dovars, _dovar(i))
+            continue
+        end
+        value = x.args[2]
+        reads = _statement_value_reads!(Set{Symbol}(), value)
+        isempty(intersect(reads, bound)) || throw(ContractValidationError(
+            "[generator] a plate cell rebinds $(join(intersect(reads, bound), ", ")), " *
+            "which it reads as a shared value"))
+        value isa Expr ? push!(prefix, :($(_dovar(i)) = $value)) :
+            (names[_dovar(i)] = value)
+    end
+    lambda = Expr(:(->), Expr(:tuple, dovars...),
+        Expr(:block, LineNumberNode(0, :generator), prefix...,
+            _replace_dovars(body, names).args...))
+    return Expr(:do, Expr(:call, :plate, lanes...), lambda)
+end
+
+# Every name a cell binds: the locals it assigns and the arguments of the
+# cells nested in it.
+function _bound_names!(out::Set{Symbol}, ex)
+    ex isa Expr || return out
+    name = _assigned_name(ex)
+    name === nothing || push!(out, name)
+    if ex.head === :(->)
+        params = ex.args[1]
+        for p in (Meta.isexpr(params, :tuple) ? params.args : Any[params])
+            Meta.isexpr(p, :(::)) && (p = p.args[1])
+            p isa Symbol && push!(out, p)
+        end
+    end
+    foreach(a -> _bound_names!(out, a), ex.args)
+    return out
+end
+
+# Replace each dovar by its shared value, except under a nested cell that
+# takes an argument of the same name.
+_replace_dovars(ex, names) = ex
+_replace_dovars(ex::Symbol, names) = get(names, ex, ex)
+function _replace_dovars(ex::Expr, names)
+    isempty(names) && return ex
+    if ex.head === :(->)
+        inner = copy(names)
+        params = ex.args[1]
+        for p in (Meta.isexpr(params, :tuple) ? params.args : Any[params])
+            Meta.isexpr(p, :(::)) && (p = p.args[1])
+            p isa Symbol && delete!(inner, p)
+        end
+        return Expr(:(->), ex.args[1], _replace_dovars(ex.args[2], inner))
+    end
+    return Expr(ex.head, Any[_replace_dovars(a, names) for a in ex.args]...)
 end
 
 # Case-A `mi()` gather naming, per response (`_ppl_mi_<label>_<ref>`):
@@ -1512,18 +1618,18 @@ _mi_gather_name(label::Symbol, ref::Symbol) = Symbol(:_ppl_mi_, label, :_, ref)
 
 # Gather a computed full-length node by `Jobs` (an lp/rate/shape/scale
 # node the emitter created), returning the short node. Scalars broadcast.
-# The gather is its own short plate over `Jobs` with the source `Ref`'d
-# (the ordinal `c[yv]` per-lane-gather precedent): a caller-level fancy
-# `node[Jobs]` does not trace under Reactant (`TracedRArray[Vector{Int}]`
+# The gather is its own short plate over `Jobs` whose cell closes over the
+# source (the ordinal `c[yv]` per-lane-gather precedent): a caller-level
+# fancy `node[Jobs]` does not trace under Reactant (`TracedRArray[Vector{Int}]`
 # shape-inference failure), while per-lane scalar gathers do.
 function _mi_gather_node!(pre::Vector{Expr}, jobs::Symbol, node::Symbol,
         label::Symbol)
     g = _mi_gather_name(label, node)
-    jv, rf = _dovar(1), _dovar(2)
+    jv = _dovar(1)
     getter = GlobalRef(@__MODULE__, :_mi_row_value)
-    body = Expr(:block, LineNumberNode(0, :generator), :($getter($rf, $jv)))
-    lambda = Expr(:(->), Expr(:tuple, jv, rf), body)
-    doex = Expr(:do, Expr(:call, :plate, jobs, :(Ref($node))), lambda)
+    body = Expr(:block, LineNumberNode(0, :generator), :($getter($node, $jv)))
+    lambda = Expr(:(->), Expr(:tuple, jv), body)
+    doex = Expr(:do, Expr(:call, :plate, jobs), lambda)
     push!(pre, :($g = $doex))
     return g
 end
@@ -2530,7 +2636,7 @@ end
 
 # Ordered response plate (OrderedLogistic + Ordinal; OrderedLogistic is
 # cumulative-logit with d = 1 and no threshold effects). The thresholds
-# thread as ONE shared vector (`Ref(t)`) that each cell gathers by its own
+# are ONE shared vector that each cell reads whole and gathers by its own
 # level, so nothing in the emitted program — statements or cell — grows
 # with the level count K. K=1 lowers to a zero cell (SB's
 # zero-information likelihood).
@@ -3573,10 +3679,10 @@ end
 # Translate a step expression into the reconstruction's do-block: a lag read
 # `a[t - k]` becomes its carry field, a current read `a[t]` the value written
 # earlier this step, a local its in-step binding, and every other leaf must be
-# a scalar parameter or definition (threaded as a `Ref` and collected into
-# `refs`). The contract never inspects step expressions, so these leaves are
+# a scalar parameter or definition, which the step reads by closing over it.
+# The contract never inspects step expressions, so these leaves are
 # the only screen for hand-built plans — everything else fails closed.
-function _scan_translate_step(ex, s::ScanSpec, env, refs::Set{Symbol}, scalars)
+function _scan_translate_step(ex, s::ScanSpec, env, scalars)
     where = _scan_where(s)
     if ex isa Symbol
         haskey(env.locals, ex) && return env.locals[ex]
@@ -3586,7 +3692,6 @@ function _scan_translate_step(ex, s::ScanSpec, env, refs::Set{Symbol}, scalars)
         ex in scalars || throw(ContractValidationError(
             "$where: step leaf `$(ex)` is not a scalar parameter or " *
             "definition or supplied data value"))
-        push!(refs, ex)
         return ex
     end
     ex isa Expr || return ex
@@ -3602,15 +3707,15 @@ function _scan_translate_step(ex, s::ScanSpec, env, refs::Set{Symbol}, scalars)
         return Expr(:., :_ppl_carry, QuoteNode(_scan_lag_field(a, k)))
     end
     args = ex.head === :call ? ex.args[2:end] : ex.args
-    newargs = Any[_scan_translate_step(a, s, env, refs, scalars) for a in args]
+    newargs = Any[_scan_translate_step(a, s, env, scalars) for a in args]
     return ex.head === :call ?
         Expr(:call, ex.args[1], newargs...) : Expr(ex.head, newargs...)
 end
 
 # The do-block body of one reconstruction: the steps in order, the next carry
-# window, and `(next, <output>)`. Returns (body statements, sorted refs).
+# window, and `(next, <output>)`. The step reads parameters and data values
+# by closing over them.
 function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, scalars)
-    refs = Set{Symbol}()
     env = (; locals = Dict{Symbol,Any}(s.loopvar => :_ppl_scan_index),
         current = Dict{Symbol,Symbol}())
     samples = Dict(st.target => Symbol(:_ppl_e, j) for (j, st) in enumerate(innov))
@@ -3619,14 +3724,14 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
         rhs = if st.kind === :sample
             value = samples[st.target]
             if output === nothing
-                args = [_scan_translate_step(a, s, env, refs, scalars) for a in st.args]
+                args = [_scan_translate_step(a, s, env, scalars) for a in st.args]
                 lp = Symbol(:_ppl_scan_lp_, st.target)
                 push!(body, :($lp::Float64 = $(_family_logpdf_expr(st.family, args, value))))
                 push!(logps, lp)
             end
             value
         else
-            _scan_translate_step(st.expr, s, env, refs, scalars)
+            _scan_translate_step(st.expr, s, env, scalars)
         end
         if st.indexed
             nm = Symbol(:_ppl_scan_n_, st.target)
@@ -3647,7 +3752,7 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
     push!(body, :(_ppl_next = $(Expr(:tuple, fields...))))
     result = output === nothing ? foldl((a, b) -> :($a + $b), logps; init = 0.0) : env.current[output]
     push!(body, :((_ppl_next, $result)))
-    return body, sort!(collect(refs))
+    return body
 end
 
 function _scan_fold(s, innov, ranges, zname, T, output, scalars)
@@ -3656,10 +3761,10 @@ function _scan_fold(s, innov, ranges, zname, T, output, scalars)
         for (a, L) in _scan_windows(s) for k in 1:L]
     seqs = Any[:($(s.lo):$T), [:(view($zname, $(first(r)):$(last(r)))) for r in ranges]...]
     elems = Symbol[:_ppl_scan_index, [Symbol(:_ppl_e, j) for j in eachindex(innov)]...]
-    body, refs = _scan_step_block(s, innov, output, scalars)
-    lambda = Expr(:->, Expr(:tuple, :_ppl_carry, elems..., refs...), Expr(:block, body...))
+    body = _scan_step_block(s, innov, output, scalars)
+    lambda = Expr(:->, Expr(:tuple, :_ppl_carry, elems...), Expr(:block, body...))
     kw = Expr(:parameters, Expr(:kw, :init, Expr(:tuple, init...)))
-    call = Expr(:call, :scan, kw, seqs..., (:(Ref($r)) for r in refs)...)
+    call = Expr(:call, :scan, kw, seqs...)
     return Expr(:do, call, lambda)
 end
 
@@ -3667,8 +3772,8 @@ end
 # seeds bind first (`_ppl_scan_init_<a>_<k>`: a sampled seed reads its slice
 # coordinate, a deterministic one evaluates its expression). Each carried
 # array then folds its own RK-core `scan(...)` over the innovation blocks:
-#   `rest = scan(view(z, r₁), …, Ref(params)…; init = (a_lag1 = …, …)) do
-#        _ppl_carry, _ppl_e1, …, params…   # the steps, in order
+#   `rest = scan(view(z, r₁), …; init = (a_lag1 = …, …)) do
+#        _ppl_carry, _ppl_e1, …   # the steps, in order, reading params…
 #        (next, <a's new value>) end`
 #   `a = vcat(<a's seeds>…, rest)`
 # The carry is the tuple of every carried array's lag window, seeded from the
@@ -3791,9 +3896,8 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
             push!(inputs, :(view($(state), $(m + 1 - j):$(T - j))))
             dovar[j] = _dovar(i + 1)
         end
-        # Substitute the lag reads, then thread the recurrence's captured scalars
-        # (params/assignments) as explicit plate inputs — RK requires a plate
-        # cell's distribution args to be caller ports, not lexical captures.
+        # Substitute the lag reads; the cell reads the recurrence's other
+        # scalars (params/assignments) by closing over them.
         lagargs = [_subst_scan_lags(a, state, sc.loopvar, dovar) for a in step.args]
         push!(inputs, :($(sc.lo):$T))
         lagargs = [_subst_syms(a, Dict(sc.loopvar => _dovar(length(inputs)))) for a in lagargs]
@@ -3804,14 +3908,10 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         sc.loopvar in caps && throw(ContractValidationError(
             "[generator] scan $(state): the recurrence uses the loop index " *
             "`$(sc.loopvar)` directly — not supported in slice 1"))
-        capmap = Dict{Symbol,Symbol}()
         for c in caps
             c in scalars || throw(ContractValidationError("$(_scan_where(sc)): unknown captured value $c"))
-            push!(inputs, :(Ref($c)))
-            capmap[c] = _dovar(length(inputs))
         end
-        cellargs = [_subst_syms(a, capmap) for a in lagargs]
-        cell = _family_logpdf_expr(step.family, cellargs, _dovar(1))
+        cell = _family_logpdf_expr(step.family, lagargs, _dovar(1))
         recnode = Symbol(:_ppl_scan_rec_, state)
         recpw = Symbol(:_ppl_scan_pw_, state)
         append!(stmts, _plate_sum_stmts(recpw, recnode, inputs, cell))

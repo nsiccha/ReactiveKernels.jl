@@ -1936,7 +1936,8 @@ function _guard_missing_observation_argument(name, ex, plan, columns)
 end
 
 _guarded_argument_is_bound(ex, columns) =
-    all(inp -> _expr_value_symbols(inp) ⊆ Set{Symbol}(keys(columns)), ex.args[1].args[2:end])
+    all(inp -> _expr_value_symbols(inp) ⊆ Set{Symbol}(keys(columns)), ex.args[1].args[2:end]) &&
+    _plate_column_captures(ex) ⊆ Set{Symbol}(keys(columns))
 
 # A guarded data-only cell can return a numeric value or its integer neutral
 # arm. Its ordinary preparation-time result needs promoted concrete storage
@@ -2917,19 +2918,15 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
                 bound && !haskey(plan.columns, c) && _fail(label,
                     "array plate column codes read unknown column $c")
             end
-        elseif inp isa Expr && inp.head === :call && length(inp.args) == 2 &&
-                inp.args[1] === :Ref && inp.args[2] isa Symbol
-            nm = inp.args[2]
-            bound && !haskey(plan.columns, nm) && !(nm in known) &&
-                _fail(label, "array plate column reads unknown name $nm")
-        elseif Meta.isexpr(inp, :call, 2) && inp.args[1] === :Ref &&
-                Meta.isexpr(inp.args[2], :call, 2) &&
-                inp.args[2].args[1] === GlobalRef(Base, :vec)
-            _collect_opaque_refs!(refs, inp.args[2], plan, label, bound)
         else
             _fail(label, "array plate column input $(repr(inp)) is not a " *
-                "column, aligned level values, level codes or `Ref(name)`")
+                "column, aligned level values or level codes")
         end
+    end
+    # The cell reads every other model value whole, by closing over it.
+    for nm in _plate_column_captures(ex)
+        bound && !haskey(plan.columns, nm) && !(nm in known) &&
+            _fail(label, "array plate column reads unknown name $nm")
     end
     return nothing
 end
@@ -3935,14 +3932,18 @@ function _validate_composed_tree(tree, subs::Vector{Symbol},
     allowed = union(subs, scalars, datas)
     leaves = Symbol[]
     if _is_plate_column_expr(tree)
-        # The lambda owns its cell locals; only the plate inputs reference
-        # model values. Its body remains the ordinary retained RK cell.
+        # The lambda owns its cell locals; the plate inputs and the values
+        # the cell closes over reference model values. Its body remains the
+        # ordinary retained RK cell.
+        names = Symbol[]
         for input in tree.args[1].args[2:end]
-            for name in _expr_value_symbols(input)
-                name in allowed || _fail(label,
-                    "composed plate input $name is not a declared value")
-                push!(leaves, name)
-            end
+            append!(names, _expr_value_symbols(input))
+        end
+        append!(names, sort!(collect(_plate_column_captures(tree))))
+        for name in names
+            name in allowed || _fail(label,
+                "composed plate input $name is not a declared value")
+            push!(leaves, name)
         end
         return leaves
     end
@@ -6648,10 +6649,9 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
             visit(ex.args[2], inside)
             visit(ex.args[3], true)
         elseif _is_plate_column_expr(ex)
-            for a in ex.args[1].args[2:end]
-                shared = _is_ref_call(a)
-                visit(shared ? a.args[2] : a, inside || shared)
-            end
+            foreach(a -> visit(a, inside), ex.args[1].args[2:end])
+            # The cell reads each value it closes over whole.
+            foreach(a -> visit(a, true), _plate_column_captures(ex))
         elseif ex.head === :kw && length(ex.args) == 2
             visit(ex.args[2], inside)
         elseif ex.head === :call
