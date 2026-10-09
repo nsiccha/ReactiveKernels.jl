@@ -287,6 +287,11 @@ end
     _sl_refuses(SurfaceLoweringError, () -> lowerm(prog(:(eachrow(B[levels(k),
         1:2]) .~ MvNormalCholesky.(zeros(2), Ref(F))))),
         "every argument is shared (`Ref(x)`)")
+    # refused: a literal vector of numbers iterates its NUMBERS in a
+    # broadcast (principle 3); one vector per slice is a vector of vectors.
+    _sl_refuses(SurfaceLoweringError, () -> lowerm(prog(:(eachrow(B[levels(k),
+        1:2]) .~ MvNormalCholesky.([0.0, 0.0], Ref(F))))),
+        "every argument is shared (`Ref(x)`)")
     # refused: `eachrow(M)` gives one value per slice, which only a
     # broadcast pairs with the slices (principle 3).
     _sl_refuses(SurfaceLoweringError, () -> lowerm(prog(:(eachrow(B[levels(k),
