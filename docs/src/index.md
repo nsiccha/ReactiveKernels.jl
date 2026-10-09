@@ -160,12 +160,18 @@ preparing only `:log_jacobian` omits the probability recipe; requesting both
 shares `magnitude` and `tail`. The generated kernel contains no nested call.
 
 Nested graph calls currently take all default HAVE boundary ports positionally
-(supply optional positional values explicitly), must destructure the nested
-output boundary exactly, and require exact declared types at the outer input
-and output ports. Arguments are existing graph ports; assign a larger expression
-to its own recipe first. Put `@recipe` metadata inside the reusable kernel rather
-than on the call site. Each restriction is checked while the outer graph is
-constructed.
+(supply optional positional values explicitly) and require exact declared types
+at the outer input and output ports. A destructuring assignment names the nested
+output boundary exactly: `(a, b) = child(x)`, never a shorter `(a,) = child(x)`.
+A child with several outputs may instead be bound to one name, `t = child(x)`,
+or used inside a larger expression, `child(x)[1]`; that value is the tuple the
+runtime call `child(x)` returns, spliced the same way and packed by one recipe.
+The pack reads every output, so the tuple form computes the whole output
+boundary even when one element is used; destructure when you need only some of
+the outputs. A declared one-name target must admit that tuple type. Arguments
+are existing graph ports; assign a larger expression to its own recipe first.
+Put `@recipe` metadata inside the reusable kernel rather than on the call site.
+Each restriction is checked while the outer graph is constructed.
 
 The dedicated [Bijectors and constrained parameters](bijectors.md) page applies
 this composition rule to reusable support transforms, shows parameters-only and
