@@ -122,3 +122,177 @@ end
     @test_throws ContractValidationError bind_data(aligned,
         merge(_apd_data(), Dict(:mu0 => [0.2, -0.3, 0.5])))
 end
+
+# Two-axis elementwise priors read a per-element argument of the declared
+# array's size, one value per element, as one-axis declarations read a
+# vector (rkppl-use §3).
+const _APD_LOC = [0.2 -0.4; -0.3 0.1; 0.5 0.0]
+const _APD_SC = [1.0 0.5; 0.8 1.2; 0.6 0.9]
+
+@testset "per-element arguments of two-axis array priors" begin
+    prior(loc, sc) = th -> sum(logpdf.(Normal.(loc, sc), th.B))
+    column(j) = th -> th.B[:, j]
+    data = merge(_apd_data(), Dict(:LOC => _APD_LOC, :SC => _APD_SC))
+    for values in (false, true)
+        _apd_check(:(begin
+            B[1:3, 1:2] .~ Normal.(LOC, SC)
+            y .~ Normal.(B[k, 1], 0.7)
+        end), data, prior(_APD_LOC, _APD_SC), column(1); values)
+        # A per-element matrix beside a shared number.
+        _apd_check(:(begin
+            B[1:3, 1:2] .~ Normal.(LOC, 0.5)
+            y .~ Normal.(B[k, 2], 0.7)
+        end), data, prior(_APD_LOC, 0.5), column(2); values)
+    end
+    # Literal matrices, `hcat` of literal columns, integer entries and a
+    # levels axis.
+    _apd_check(:(begin
+        B[1:3, 1:2] .~ Normal.([0.2 -0.4; -0.3 0.1; 0.5 0.0],
+            [1.0 0.5; 0.8 1.2; 0.6 0.9])
+        y .~ Normal.(B[k, 1], 0.7)
+    end), _apd_data(), prior(_APD_LOC, _APD_SC), column(1))
+    _apd_check(:(begin
+        B[1:3, 1:2] .~ Normal.(hcat([0.2, -0.3, 0.5], [-0.4, 0.1, 0.0]), SC)
+        y .~ Normal.(B[k, 1], 0.7)
+    end), data, prior(_APD_LOC, _APD_SC), column(1))
+    _apd_check(:(begin
+        B[levels(k), 1:2] .~ Normal.([0 1; 2 0; 1 1], 1)
+        y .~ Normal.(B[k, 2], 0.7)
+    end), _apd_data(), prior([0 1; 2 0; 1 1], 1), column(2))
+    # A positive family keeps its transform and Jacobian.
+    _apd_check(:(begin
+        B[1:3, 1:2] .~ Gamma.(SC .+ 1, LOC .+ 1)
+        y .~ Normal.(B[k, 1], 0.7)
+    end), data, th -> sum(logpdf.(Gamma.(_APD_SC .+ 1, _APD_LOC .+ 1), th.B)),
+        column(1))
+    # Live arguments: a computed matrix and a declared two-axis array.
+    _apd_check(:(begin
+        a ~ Normal(0, 1)
+        M = LOC .+ a
+        B[1:3, 1:2] .~ Normal.(M, SC)
+        y .~ Normal.(B[k, 1], 0.7)
+    end), data, th -> logpdf(Normal(0, 1), th.a) +
+        sum(logpdf.(Normal.(_APD_LOC .+ th.a, _APD_SC), th.B)), column(1))
+    _apd_check(:(begin
+        Z[1:3, 1:2] .~ Normal.(0, 1)
+        B[1:3, 1:2] .~ Normal.(Z, SC)
+        y .~ Normal.(B[k, 1], 0.7)
+    end), data, th -> sum(logpdf.(Normal(0, 1), th.Z)) +
+        sum(logpdf.(Normal.(th.Z, _APD_SC), th.B)), column(1))
+end
+
+@testset "two-axis per-element priors equal per-column declarations" begin
+    data = merge(_apd_data(), Dict(:LOC => _APD_LOC, :SC => _APD_SC,
+        :l1 => _APD_LOC[:, 1], :l2 => _APD_LOC[:, 2],
+        :s1 => _APD_SC[:, 1], :s2 => _APD_SC[:, 2]))
+    joint = _apd_build(:(begin
+        B[1:3, 1:2] .~ Normal.(LOC, SC)
+        y .~ Normal.(B[k, 1] .- B[k, 2], 0.7)
+    end), data)
+    cols = _apd_build(:(begin
+        b1[1:3] .~ Normal.(l1, s1)
+        b2[1:3] .~ Normal.(l2, s2)
+        y .~ Normal.(b1[k] .- b2[k], 0.7)
+    end), data)
+    # Column-major packing: B.i.j runs down column 1, then column 2, exactly
+    # as b1 then b2.
+    @test coordinate_names(joint.built.layout) ==
+        Symbol.(["B.$i.$j" for j in 1:2 for i in 1:3])
+    u = [0.3 * sin(i) for i in 1:6]
+    for preset in (:prior, :likelihood, :sampler)
+        qj = prepare_query(joint.built, joint.bound, preset)
+        qc = prepare_query(cols.built, cols.bound, preset)
+        @test Base.invokelatest(qj, u) ≈ Base.invokelatest(qc, u)
+    end
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    gj = sampler_value_and_gradient!(prepare_sampler(joint.built, joint.bound,
+        u; backend), similar(u), u)[2]
+    gc = sampler_value_and_gradient!(prepare_sampler(cols.built, cols.bound,
+        u; backend), similar(u), u)[2]
+    @test gj ≈ gc
+end
+
+@testset "per-target coefficient priors of a joint design product" begin
+    n = 12
+    x1 = [0.4 * sin(i) for i in 1:n]
+    x2 = [0.3 * cos(2i) for i in 1:n]
+    X = hcat(ones(n), x1, x2)
+    Y = [0.1 * sin(i + j) + 0.2j for i in 1:n, j in 1:3]
+    LOC = [2.3 -1.41 0.0; 0.0 0.0 0.5; 0.0 0.0 0.0]
+    SCALE = [1.0 2.0 1.0; 0.5 0.5 1.0; 0.5 0.5 1.0]
+    data = Dict(:x1 => x1, :x2 => x2, :Y => Y, :LOC => LOC, :SCALE => SCALE)
+    function oracle(th)
+        sum(logpdf.(Normal.(LOC, SCALE), th.B)) +
+            logpdf(Exponential(1.0), th.sigma) +
+            sum(logpdf.(Normal.(X * th.B, th.sigma), Y))
+    end
+    for loc in (:LOC, :([2.3 -1.41 0.0; 0.0 0.0 0.5; 0.0 0.0 0.0]))
+        ast = :(begin
+            X = hcat(ones(length(x1)), x1, x2)
+            B[axes(X, 2), 1:3] .~ Normal.($loc, SCALE)
+            sigma ~ Exponential(1.0)
+            Y .~ Normal.(X * B, sigma)
+        end)
+        bound = bind_data(lower_rkppl(ast, data; conditioned = (:Y,)), data)
+        built = build_kernel(bound)
+        @test built.layout.total == 10
+        u = [0.2 * cos(i) for i in 1:built.layout.total]
+        th = constrain(built.layout, u)
+        full(u) = (t = constrain(built.layout, u); oracle(t) + logjac(built.layout, u))
+        q = prepare_sampler(built, bound, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        value, grad = sampler_value_and_gradient!(q, similar(u), u)
+        @test value ≈ full(u)
+        @test grad ≈ _apd_difference(full, u) rtol = 1e-5 atol = 1e-7
+        @test data[:LOC] == LOC
+    end
+end
+
+@testset "two-axis per-element prior shapes follow Julia" begin
+    ast = :(begin
+        B[1:3, 1:2] .~ Normal.(M, 1)
+        y .~ Normal.(B[k, 1], 0.7)
+    end)
+    plan = lower_rkppl(ast, (:y, :k, :M); conditioned = (:y,))
+    # Refused: Julia cannot broadcast a 2×2 argument over a 3×2 array
+    # (principle 3, standard-Julia semantics).
+    err = try
+        bind_data(plan, merge(_apd_data(), Dict(:M => ones(2, 2))))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ContractValidationError
+    @test occursin("has size (3, 2) but its prior arg1 has size (2, 2)",
+        sprint(showerror, err))
+    # Refused: a computed 2×3 value cannot broadcast over the 3×2 array
+    # either; its size is checked where the graph computes it.
+    computed = :(begin
+        M = LOC'
+        B[1:3, 1:2] .~ Normal.(M, 1)
+        y .~ Normal.(B[k, 1], 0.7)
+    end)
+    fx = _apd_build(computed, merge(_apd_data(), Dict(:LOC => _APD_LOC)))
+    @test_throws DimensionMismatch prepare_query(fx.built, fx.bound, :prior)
+    # Not built yet: Julia broadcasts a 3-vector over the rows of a 3×2
+    # array (one value per row); per-element arguments currently have the
+    # array's own size. Capability gap, not a refusal.
+    @test_broken try
+        bind_data(plan, merge(_apd_data(), Dict(:M => [0.1, 0.2, 0.3])))
+        true
+    catch
+        false
+    end
+end
+
+@testset "per-slice concentrations from a data matrix" begin
+    A = [1.0 2.0 1.0; 1.0 1.0 3.0]
+    for values in (false, true)
+        _apd_check(:(begin
+            eachcol(S[1:2, levels(k)]) .~ Dirichlet.(eachcol(A))
+            y .~ Normal.(S[1, k], 0.7)
+        end), merge(_apd_data(), Dict(:A => A)),
+            th -> sum(logpdf(Dirichlet(A[:, j]), th.S[:, j]) for j in 1:3),
+            th -> th.S[1, :]; values)
+    end
+end

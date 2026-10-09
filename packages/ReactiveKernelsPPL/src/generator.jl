@@ -296,6 +296,8 @@ import .._declared_codes
 # response; `preprocessing.jl`).
 import .._ordinal_stage_obs, .._ordinal_stage_idx, .._ordinal_effects_matrix
 import .._broadcast_gather
+# Per-element prior arguments of a two-axis array, in packed order.
+import .._array_prior_cells
 # Multivariate slice priors (`mv_slices.jl`): orientations, per-slice
 # arguments, simplex / ordered slice transforms and the slice densities.
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice

@@ -148,8 +148,39 @@ end
 
 # ── structure validation ─────────────────────────────────────────────
 
+# Julia's literal array syntax: a vector `[a, b]`, a matrix
+# `[a b; c d]` (`vcat` of `row`s), a one-row `[a b]` (`hcat`) and its
+# rows. Entries are values; the literal's shape is Julia's.
+_is_array_literal(a) = a isa Expr && a.head in (:vect, :vcat, :hcat, :row)
+
+# The statically known size of an array literal: a vector literal has one
+# entry per element, whatever they hold; a concatenation's size is known
+# when every entry is a number (`nothing` otherwise: entries that are
+# arrays concatenate by their own shapes, and Julia checks them).
+function _array_literal_size(a::Expr)
+    a.head === :vect && return (length(a.args),)
+    isrow(r) = r isa Expr && r.head === :row
+    all(x -> x isa Real, _array_literal_entries(a)) || return nothing
+    a.head in (:hcat, :row) && return (1, length(a.args))
+    all(isrow, a.args) || return any(isrow, a.args) ? nothing : (length(a.args),)
+    widths = unique!([length(r.args) for r in a.args])
+    return length(widths) == 1 ? (length(a.args), only(widths)) : nothing
+end
+
+# The entries of an array literal, row by row.
+_array_literal_entries(a::Expr) = Any[x for r in a.args
+    for x in (r isa Expr && r.head === :row ? r.args : (r,))]
+
+# The same literal with `Float64` element type (`Float64[a b; c d]`), so
+# integer entries promote at emission, as a literal vector's do.
+function _float64_array_literal(a::Expr)
+    a.head === :vect && return :(Float64[$(a.args...)])
+    a.head === :hcat && return Expr(:typed_hcat, :Float64, a.args...)
+    return Expr(:typed_vcat, :Float64, a.args...)
+end
+
 # Value-expression arguments of an elementwise prior (per element):
-# literals, names, literal vectors, or expressions over values.
+# literals, names, literal arrays, or expressions over values.
 function _validate_array_arg(p::ArrayParameter, key::Symbol, a)
     if a isa Real
         isfinite(a) || _fail(p.label, "array $(p.name) prior $key must " *
@@ -157,7 +188,7 @@ function _validate_array_arg(p::ArrayParameter, key::Symbol, a)
         return nothing
     end
     a isa Symbol && return nothing
-    if a isa Expr && a.head === :vect
+    if _is_array_literal(a)
         for x in a.args
             _validate_array_arg(p, key, x)
         end
@@ -169,7 +200,6 @@ function _validate_array_arg(p::ArrayParameter, key::Symbol, a)
 end
 
 function _validate_array_parameters(plan::StructuralPlan)
-    names = _union_names(plan)
     for p in plan.array_parameters
         _check_name_hygiene(p.name)
         if p.family === :external
@@ -234,16 +264,6 @@ function _validate_array_parameters(plan::StructuralPlan)
                         "Uniform bounds need lo < hi")
                 end
             end
-            if nd == 2
-                # Two-axis arrays take shared (scalar) prior arguments:
-                # per-element arguments would need a matching matrix.
-                for (k, a) in pairs(p.args)
-                    a isa Real || (a isa Symbol && a in names) || _fail(
-                        p.label, "array $(p.name) has two axes; its prior " *
-                        "$k must be a literal or a scalar parameter/" *
-                        "assignment name, got $(repr(a))")
-                end
-            end
         end
     end
     return nothing
@@ -303,33 +323,40 @@ function _validate_array_parameters_data(plan::StructuralPlan)
             name in known || _fail(p.label,
                 "array $(p.name) prior $key references unknown name $name")
         end
-        length(dims) == 1 || continue
-        K = dims[1]
         for (k, a) in pairs(p.args)
-            n = _array_arg_length(plan, a)
-            n === nothing && continue
-            n == K || _fail(p.label, "array $(p.name) has $K elements but " *
-                "its prior $k has $n (per-element arguments match the " *
-                "array; shared ones are scalars)")
+            n = _array_arg_size(plan, a)
+            n === nothing || n == Tuple(dims) || _fail(p.label,
+                _array_arg_mismatch(p.name, k, Tuple(dims), n))
         end
     end
     return nothing
 end
 
-# Statically known element count of a per-element prior argument
-# (`nothing` = scalar or only known at run time).
-function _array_arg_length(plan::StructuralPlan, a)
-    a isa Expr && a.head === :vect && return length(a.args)
+# Per-element arguments have the declared array's own shape (an argument
+# of a two-axis `B[a, b]` is a matrix of `B`'s size); shared ones are
+# numbers.
+_array_arg_mismatch(name, k, dims::Tuple{Int}, n) = "array $name has " *
+    "$(only(dims)) elements but its prior $k has " *
+    (length(n) == 1 ? "$(only(n))" : "size $n") * " (per-element " *
+    "arguments match the array; shared ones are scalars)"
+_array_arg_mismatch(name, k, dims::Tuple, n) = "array $name has size " *
+    "$dims but its prior $k has size $n (per-element arguments have the " *
+    "array's size, one value per element; shared ones are scalars)"
+
+# Statically known size of a per-element prior argument (`nothing` = a
+# number, or only known at run time, where the prior checks it).
+function _array_arg_size(plan::StructuralPlan, a)
+    _is_array_literal(a) && return _array_literal_size(a)
     a isa Symbol || return nothing
     _is_array_param(plan, a) &&
-        return prod(_array_dims(plan, _array_param(plan, a)))
-    _is_derived(plan, a) && return _value_rows(plan, a)
+        return Tuple(_array_dims(plan, _array_param(plan, a)))
+    _is_derived(plan, a) && return (_value_rows(plan, a),)
     if haskey(plan.columns, a)
         col = plan.columns[a]
         col isa Real && return nothing
-        col isa AbstractVector || _fail(:plan, "prior argument $a is a " *
-            "matrix column (per-element arguments are vectors)")
-        return length(col)
+        col isa AbstractArray || _fail(:plan, "prior argument $a is " *
+            "neither a number nor an array")
+        return size(col)
     end
     return nothing
 end
@@ -413,11 +440,13 @@ function _validate_array_slices(plan::StructuralPlan, p::ArrayParameter)
     end
     if _slice_stem(p) === :dirichlet
         alpha = p.args.arg1
-        lits = alpha isa Expr && alpha.head === :vect ? alpha.args :
+        _is_slice_iterator(alpha) && (alpha = alpha.args[2])
+        lits = _is_array_literal(alpha) ?
+            filter(x -> x isa Real, _array_literal_entries(alpha)) :
             _is_fill_call(alpha) && alpha.args[2] isa Real ? [alpha.args[2]] :
             Any[]
         all(x -> x > 0, lits) || _fail(p.label, "array $(p.name): Dirichlet " *
-            "concentrations are positive, got $(repr(alpha))")
+            "concentrations are positive, got $(repr(p.args.arg1))")
     end
     if _slice_stem(p) === :ordered_normal
         sd = p.args.arg2
@@ -431,7 +460,7 @@ end
 # at run time): literal vectors, `zeros(K)` / `fill(a, K)`, declared
 # arrays, bound data values.
 function _slice_arg_size(plan::StructuralPlan, a)
-    a isa Expr && a.head === :vect && return (length(a.args),)
+    _is_array_literal(a) && return _array_literal_size(a)
     _is_zeros_call(a) && return (a.args[2],)
     _is_fill_call(a) && return (a.args[3],)
     _is_array_param(plan, a) &&
@@ -921,7 +950,7 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
     _is_plate_column_expr(ex) &&
         return _collect_plate_column_refs!(refs, ex, plan, label, bound)
     head = ex.head
-    if head === :tuple || head === :vect
+    if head === :tuple || _is_array_literal(ex)
         for a in ex.args
             head === :tuple && (a = _tuple_field_value(a))
             _collect_array_value_refs!(refs, a, plan, label, bound)
@@ -1585,21 +1614,29 @@ function _array_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
         # A cell reads an argument value it generated by its role
         # (`normal(location, scale)`).
         cell_names = Dict{Symbol,Symbol}()
+        # A two-axis array reads a per-element argument in its packed
+        # column-major order (`_array_prior_cells`); a number stays shared.
+        cells = length(dims) == 2
         for (i, (k, a)) in enumerate(pairs(p.args))
             push!(arg_names, k)
-            if a isa Real || a isa Symbol
+            if a isa Real || a isa Symbol && !(cells &&
+                    _value_axes(context, a; data_axes = true) != Any[])
                 push!(arg_values, a)
                 continue
             end
             local_name = Symbol(:_ppl_parg_, p.name, :_, i)
             role = _family_role(p.family, i, length(p.args))
             role === nothing || (cell_names[local_name] = role)
-            val = if a.head === :vect
+            val = if a isa Symbol
+                a in float64_inputs && push!(float64_inputs, local_name)
+                a
+            elseif _is_array_literal(a)
                 push!(float64_inputs, local_name)
-                :(Float64[$(a.args...)])
+                _float64_array_literal(a)
             else
                 _array_gather_rewrite(a, context, needed)
             end
+            cells && (val = :(_array_prior_cells($val, $(Tuple(dims)))))
             push!(stmts, :($local_name = $val))
             push!(arg_values, local_name)
         end
@@ -1648,7 +1685,7 @@ function _slice_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
     return :($(_slice_density(Val(_slice_stem(p))))($o, $(p.name), $(vals...)))
 end
 
-_slice_value_expr(a) = a isa Expr && a.head === :vect ? :(Float64[$(a.args...)]) :
+_slice_value_expr(a) = _is_array_literal(a) ? _float64_array_literal(a) :
     _is_zeros_call(a) ? :(zeros(Float64, $(a.args[2]))) :
     _is_fill_call(a) ? :(fill($(a.args[2] isa Real ? Float64(a.args[2]) :
         a.args[2]), $(a.args[3]))) : a

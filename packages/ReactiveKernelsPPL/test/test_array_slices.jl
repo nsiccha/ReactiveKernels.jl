@@ -175,6 +175,42 @@ end
         sum(logpdf(Dirichlet(nt.A[j, :]), nt.P[j, :]) for j in 1:3))
 end
 
+@testset "array slices: per-slice literal concentrations" begin
+    # Column g of the 2 × 3 literal is slice g's concentration.
+    A = [1.0 2.0 1.0; 1.0 1.0 3.0]
+    ref(nt) = logpdf(Exponential(1), nt.s) +
+        sum(logpdf(Dirichlet(A[:, j]), nt.S[:, j]) for j in 1:3)
+    # `D.([v1, v2, v3])` iterates its elements, as Julia broadcasting does,
+    # and pairs slice g with v_g, exactly as `eachcol` of their matrix.
+    for spelling in (:(Dirichlet.(eachcol([1.0 2.0 1.0; 1.0 1.0 3.0]))),
+            :(Dirichlet.(eachcol([1 2 1; 1 1 3]))),
+            :(Dirichlet.([[1.0, 1.0], [2.0, 1.0], [1.0, 3.0]])))
+        r = _sl_check(:(begin
+            s ~ Exponential(1)
+            eachcol(S[1:2, levels(k)]) .~ $spelling
+            y .~ Normal.(S[1, k], s)
+        end), ref)
+        @test r.built.layout.total == 1 + 3
+    end
+    _sl_check(:(begin
+        s ~ Exponential(1)
+        eachrow(P[levels(k), 1:2]) .~ Dirichlet.(eachrow([1.0 1.0; 2.0 1.0; 1.0 3.0]))
+        y .~ Normal.(P[k, 1], s)
+    end), nt -> logpdf(Exponential(1), nt.s) +
+        sum(logpdf(Dirichlet(A[:, j]), nt.P[j, :]) for j in 1:3))
+    # Per-slice means listed as vectors, with a shared factor.
+    means = [[0.1, -0.2], [0.3, 0.0], [-0.1, 0.4]]
+    _sl_check(:(begin
+        s ~ Exponential(1)
+        L ~ LKJCholesky(2, 2.0)
+        eachrow(B[levels(k), 1:2]) .~ MvNormalCholesky.(
+            [[0.1, -0.2], [0.3, 0.0], [-0.1, 0.4]], Ref(L))
+        y .~ Normal.(B[k, 1], s)
+    end), nt -> logpdf(Exponential(1), nt.s) +
+        logpdf(LKJCholesky(2, 2.0), Cholesky(LowerTriangular(nt.L))) +
+        sum(logpdf(MvNormal(means[j], nt.L * nt.L'), nt.B[j, :]) for j in 1:3))
+end
+
 @testset "array slices: ordered rows and columns" begin
     r = _sl_check(:(begin
         s ~ Exponential(1)
