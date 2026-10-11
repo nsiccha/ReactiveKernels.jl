@@ -3,7 +3,8 @@
 #
 # A cell that captures a whole array and reads it at its batched element,
 # `log_k[i]` in `plate(i, ...) do i ... exp(log_k[i]) end`, needs one row of
-# it. When that array's producer computes it row by row, the native lowering
+# it. The same is true when `log_k` is itself a batched input to the cell's
+# plate. When that array's producer computes it row by row, the native lowering
 # runs the producer's own operation on the one row instead: the producer is
 # given views of its row-aligned operands at that row, and the cell is given a
 # `_CellWindow` holding the result, which answers reads of that row and throws
@@ -115,6 +116,16 @@ end
 @inline _cell_leaf_row(shape::Tuple{}, row) = 1
 @inline _cell_leaf_row(shape::Tuple, row) =
     length(first(shape)) == 1 ? Int(first(first(shape))) : row
+
+# A row window still spans a plate's trailing axes. A multidimensional cell
+# selects its remaining coordinates from that window; a vector row is already
+# exactly the one-cell slice needed by the plate.
+@inline _cell_batched_slice(value, cell) = value
+@inline function _cell_batched_slice(value::AbstractArray{<:Any,N}, cell) where {N}
+    N <= 1 && return value
+    local_cell = CartesianIndex(Base.setindex(Tuple(cell), 1, 1))
+    _plate_cell_slice(value, local_cell)
+end
 
 # The row holding linear position `q` of a value with full axes `shape`.
 @inline function _cell_linear_row(shape::Tuple{}, q::Integer)
@@ -334,9 +345,10 @@ end
 
 The plan-wide pushdown decision for `_lower_with_ops`: `recipes` are the
 producers computed only at their readers' rows (their table slots are kept and
-recorded in `slots` as lowering reaches them), and `captures[cell recipe id]`
+recorded in `slots` as lowering reaches them). `captures[cell recipe id]`
 maps each shared argument position read at the cell's own row to the batched
-argument holding that row.
+argument holding that row; `batched[cell recipe id]` names the cell's ordinary
+batched argument positions.
 """
 struct _CellPushdowns
     graph::Graph
@@ -345,6 +357,7 @@ struct _CellPushdowns
     producer::Dict{Int,Recipe}
     forms::Dict{Int,_CellForm}
     captures::Dict{Int,Dict{Int,Int}}
+    batched::Dict{Int,Set{Int}}
     slots::Dict{Int,Int}
 end
 
@@ -394,6 +407,7 @@ function _cell_pushdowns(p::Plan)
         end
     end
     captures = Dict{Int,Dict{Int,Int}}()
+    batched = Dict{Int,Set{Int}}()
     pushed = Set{Int}()
     work = Int[]
     function reach!(cid, role)
@@ -405,9 +419,12 @@ function _cell_pushdowns(p::Plan)
     for r in p.recipes
         r.op isa _AuthoredPlateCellOp || continue
         positions = _cell_capture_positions(r, static_type)
-        isempty(positions) && continue
-        captures[r.id] = positions
+        isempty(positions) || (captures[r.id] = positions)
         foreach(k -> reach!(cidof(r.inputs[1 + k]), :linear_gather), keys(positions))
+        atomic = typeof(r.op.plate).parameters[2]
+        lanes = Set(k for k in 1:length(r.inputs)-1 if !(k in atomic))
+        batched[r.id] = lanes
+        foreach(k -> reach!(cidof(r.inputs[1 + k]), :leaf), lanes)
     end
     while !isempty(work)
         cid = pop!(work)
@@ -426,8 +443,12 @@ function _cell_pushdowns(p::Plan)
                 slots = findall(v -> cidof(v) == cid, collect(reader.inputs))
                 if reader.op isa _AuthoredPlateCellOp
                     positions = get(captures, reader.id, Dict{Int,Int}())
-                    return fits(cid, :linear_gather) &&
-                        all(s -> s > 1 && haskey(positions, s - 1), slots)
+                    lanes = get(batched, reader.id, Set{Int}())
+                    return all(slots) do s
+                        s > 1 && ((haskey(positions, s - 1) &&
+                            fits(cid, :linear_gather)) ||
+                            (s - 1 in lanes && fits(cid, :leaf)))
+                    end
                 end
                 length(reader.outputs) == 1 && cidof(only(reader.outputs)) in pushed ||
                     return false
@@ -443,7 +464,7 @@ function _cell_pushdowns(p::Plan)
     isempty(pushed) && return nothing
     recipes = Set(only(producers[cid]).id for cid in pushed)
     _CellPushdowns(g, pushed, recipes,
-        Dict(cid => only(producers[cid]) for cid in pushed), forms, captures,
+        Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
         Dict{Int,Int}())
 end
 

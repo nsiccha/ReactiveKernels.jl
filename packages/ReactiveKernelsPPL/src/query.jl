@@ -367,6 +367,7 @@ struct CellQuery{K,L}
 end
 
 (q::CellQuery)(u::Vector{Float64}, cell) = Base.invokelatest(q.kernel, u, cell)
+(q::CellQuery)(u::AbstractVector{Float64}, cell) = Base.invokelatest(q.kernel, u, cell)
 (q::CellQuery)(u::AbstractVector{<:Real}, cell) =
     Base.invokelatest(q.kernel, Vector{Float64}(u), cell)
 

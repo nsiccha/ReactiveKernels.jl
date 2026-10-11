@@ -94,12 +94,17 @@ end
         bound, built = _cq_bound(_CQ_GROUPED, data(n), (:y,))
         q = prepare_cell_query(built, bound, :y)
         u = collect(range(-0.4, 0.5; length = built.layout.total))
+        uview = view(u, :)
         pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
-        q(u, 2)
-        (; value = q(u, 2), reference = sum(pointwise.y[2]), bytes = @allocated q(u, 2))
+        q(u, 2); q(uview, 2)
+        (; value = q(u, 2), viewed = q(uview, 2),
+           reference = sum(pointwise.y[2]), bytes = (@allocated q(u, 2)),
+           view_bytes = (@allocated q(uview, 2)))
     end
     @test all(m -> m.value ≈ m.reference, measured)
+    @test all(m -> m.viewed ≈ m.reference, measured)
     @test measured[1].bytes == measured[2].bytes
+    @test measured[1].view_bytes == measured[2].view_bytes
 end
 
 @testset "cell query: elementwise and scalar-cell observations" begin
