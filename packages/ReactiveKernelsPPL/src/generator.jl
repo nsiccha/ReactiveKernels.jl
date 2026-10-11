@@ -723,9 +723,35 @@ _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec) =
 # A composition reading no sub-predictor and no column has no row axis of
 # its own. Scalar shape is retained when observation operands need
 # broadcasting; ordinary full-length vector plans give it the location's rows.
-_composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec, ex) =
+function _composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec,
+        t::TermSpec, ex)
     !_is_plate_column_expr(ex) && isempty(t.options.subs) &&
-        isempty(t.columns) && !_broadcast_affine(plan, pred)
+        isempty(t.columns) && !_broadcast_affine(plan, pred) || return false
+    # A composed scalar leaf can be a full-row view of an observation matrix.
+    # Its derived column already has the response row axis; normalizing it again
+    # adds a runtime union of the view and broadcast fallback to every plate.
+    if ex isa Symbol
+        i = findfirst(a -> a.name === ex, plan.assignments)
+        i !== nothing && _full_observation_view(plan, plan.assignments[i].expr) &&
+            return false
+    end
+    return true
+end
+
+function _full_observation_view(plan::StructuralPlan, ex)
+    Meta.isexpr(ex, :call, 4) || return false
+    f = ex.args[1]
+    (f isa GlobalRef && f.name === :view && isdefined(f.mod, f.name) &&
+        getfield(f.mod, f.name) === Base.view) ||
+        return false
+    axis = ex.args[3]
+    (axis === :(:) || axis isa GlobalRef && axis.name === Symbol(":")) ||
+        return false
+    base = ex.args[2]
+    base isa Symbol && any(d -> d.name === base, plan.derived) &&
+        _is_matrix_value(base, plan) || return false
+    return _is_observation_slice(plan, Expr(:ref, base, :(:), ex.args[4]))
+end
 
 # Rows of the responses a predictor locates — their own observation axis,
 # which is not `n_obs` when responses observe different rows.
@@ -1144,11 +1170,12 @@ _ppl_range_values(x::Number, indices) = x
 _ppl_range_values(x::AbstractArray, indices) = x[indices]
 
 # `ones(n) .* x` without the ones operand: a number fills the rows, and a
-# vector already holding one Float64 per row is that location value itself.
-# Other values (traced, integer, singleton or mismatched) keep Julia's
-# broadcast against the rows, including its dimension errors.
+# vector already holding one Float64 per row is that location value itself,
+# including a view. Other values (traced, integer, singleton or mismatched)
+# keep Julia's broadcast against the rows, including its dimension errors.
 @inline _ppl_rows(x::Float64, n::Int) = fill(x, n)
-@inline _ppl_rows(x::Vector{Float64}, n::Int) = length(x) == n ? x : ones(n) .* x
+@inline _ppl_rows(x::AbstractVector{Float64}, n::Int) =
+    axes(x, 1) == Base.OneTo(n) ? x : ones(n) .* x
 @inline _ppl_rows(x, n::Int) = ones(n) .* x
 
 # A selected plate column already holds one value per selected response cell

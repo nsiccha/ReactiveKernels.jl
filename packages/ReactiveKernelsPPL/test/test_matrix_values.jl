@@ -328,6 +328,14 @@ function _ma_column_case(kind, n)
             y1 .~ Normal.(P[:, 1], 1)
             y2 .~ Normal.(P[:, end], 1)
         end
+    elseif kind == :view
+        ast = quote
+            X = hcat(ones(length(x1)), x1, x2)
+            B[axes(X, 2), 1:2] .~ Normal.(0, 1)
+            P = X * B
+            y1 .~ Normal.(view(P, :, 1), 1)
+            y2 .~ Normal.(view(P, :, 2), 1)
+        end
     elseif kind == :alias
         ast = quote
             X = hcat(ones(length(x1)), x1, x2)
@@ -406,7 +414,7 @@ function _ma_column_case(kind, n)
 end
 
 @testset "matrix values: column reads of a per-observation product" begin
-    for n in (1, 6), kind in (:named, :alias, :inline, :submodel,
+    for n in (1, 6), kind in (:named, :view, :alias, :inline, :submodel,
             :data_matrix, :data_column, :scale, :separate)
         @testset "$kind / $n" begin
             case = _ma_column_case(kind, n)
@@ -424,6 +432,19 @@ end
             @test isequal(case.data, original)
         end
     end
+end
+
+@testset "matrix values: authored column views remain views" begin
+    case = _ma_column_case(:view, 6)
+    plan = lower_rkppl(case.ast, Set(keys(case.data));
+        conditioned = (:y1, :y2), mod = @__MODULE__)
+    bound = bind_data(plan, case.data)
+    built = build_kernel(bound)
+    observations = prepare_query(built, bound, :observations)
+    u = [0.1i for i in 1:built.layout.total]
+    first = Base.invokelatest(observations, u)
+    @test first.y1.location isa SubArray
+    @test first.y2.location isa SubArray
 end
 
 @testset "matrix values: one product read by column equals separate products" begin
