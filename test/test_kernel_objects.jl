@@ -77,6 +77,20 @@ end
     return logdensity
 end
 
+@kernel basis_methods(t) = begin
+    basis_matrix()::Vector{Float64} = t
+end
+
+@kernel untyped_data_owner(t) = begin
+    P = basis_methods(t).basis_matrix()
+    return P
+end
+
+@kernel typed_data_owner(t::Vector{Float64}) = begin
+    P = basis_methods(t).basis_matrix()
+    return P
+end
+
 @kernel compatibility_factor_logpdf(
         x::Float64, μ::Float64, σ::Float64, log_σ::Float64) = begin
     logdensity::Float64 = normal_factor(x, μ, σ, log_σ)
@@ -216,6 +230,12 @@ end
         @test compatibility(1.0, 0.0, 2.0, log(2.0)) ≈
               named(1.0, 0.0, 2.0, log(2.0))
 
+        data = [1.0, 2.0]
+        @test ReactiveKernels.valtype(F.untyped_data_owner[:t]) === Any
+        @test ReactiveKernels.valtype(F.typed_data_owner[:t]) === Vector{Float64}
+        @test prepare(F.untyped_data_owner)(data) == data
+        @test prepare(F.typed_data_owner)(data) == data
+
         # The endpoint's own values are named under the caller's result
         # `logdensity`; its result keeps its name and joins `logdensity`.
         named_outputs = outputs_of(plan(F.named_constructed_logpdf))
@@ -240,6 +260,11 @@ end
     end
 
     @testset "constructed endpoint diagnostics" begin
+        @test_throws ArgumentError @eval @kernel incompatible_constructed_owner(
+                x::Float64, location::String, scale::Float64) = begin
+            y = KernelObjectAuthoringFixture.normal(location, scale).logpdf(x)
+            return y
+        end
         @test_throws ArgumentError @macroexpand @kernel unknown_object_binding(
                 x::Float64) = begin
             y::Float64 = KernelObjectAuthoringFixture.normal(;
