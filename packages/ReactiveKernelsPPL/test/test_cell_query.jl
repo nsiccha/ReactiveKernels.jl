@@ -204,6 +204,65 @@ _cq_scaled(w, rate) = (_CQ_CALLS[] += 1; w * exp(rate))
     @test data.y1 == data.w .+ 0.1
 end
 
+@testset "cell query: computed scale and missing observation cells" begin
+    n = 9
+    w = collect(range(0.3, 1.1; length = n))
+    x = collect(range(-0.4, 0.6; length = n))
+    u = [0.2]
+    scale_model = quote
+        a ~ Normal(0, 1)
+        la = a .+ x
+        @plate for i in eachindex(y)
+            s = _cq_scaled(w[i], la[i])
+            y[i] ~ Normal(x[i], s)
+        end
+    end
+    complete = (; w, x, y = w .+ 0.1)
+    bound, built = _cq_bound(scale_model, complete, (:y,))
+    q = prepare_cell_query(built, bound, :y)
+    for i in (1, 5, 9)
+        _CQ_CALLS[] = 0
+        @test q(u, i) ≈ logpdf(Normal(x[i], w[i] * exp(u[1] + x[i])), complete.y[i])
+        @test _CQ_CALLS[] == 1
+    end
+    sampler = prepare_cell_sampler(built, bound, :y, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse))
+    g = similar(u)
+    value, _ = cell_value_and_gradient!(sampler, g, u, 5)
+    @test value ≈ q(u, 5)
+    @test g[1] ≈ _cq_central(v -> q(v, 5), u, 1) rtol = 1e-6
+
+    missing_y = Union{Missing,Float64}[complete.y...]
+    missing_y[3] = missing
+    incomplete = (; w, x, y = missing_y)
+    location_model = quote
+        a ~ Normal(0, 1)
+        la = a .+ x
+        @plate for i in eachindex(y)
+            m = _cq_scaled(w[i], la[i])
+            y[i] ~ Normal(m, 1.3)
+        end
+    end
+    bound, built = _cq_bound(location_model, incomplete, (:y,))
+    q = prepare_cell_query(built, bound, :y)
+    for i in (1, 3, 5, 9)
+        _CQ_CALLS[] = 0
+        expected = ismissing(incomplete.y[i]) ? 0.0 :
+            logpdf(Normal(w[i] * exp(u[1] + x[i]), 1.3), incomplete.y[i])
+        @test q(u, i) ≈ expected
+        @test _CQ_CALLS[] == (ismissing(incomplete.y[i]) ? 0 : 1)
+    end
+    sampler = prepare_cell_sampler(built, bound, :y, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse))
+    for i in (3, 5)
+        g = similar(u)
+        value, _ = cell_value_and_gradient!(sampler, g, u, i)
+        @test value ≈ q(u, i)
+        @test g[1] ≈ _cq_central(v -> q(v, i), u, 1) atol = 1e-10 rtol = 1e-6
+    end
+    @test ismissing(incomplete.y[3])
+end
+
 @testset "cell query: refusals" begin
     data = _cq_grouped_data()
     bound, built = _cq_bound(_CQ_GROUPED, data, (:y,))
