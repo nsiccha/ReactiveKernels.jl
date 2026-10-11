@@ -757,7 +757,7 @@ end
 @inline _tensorized_factorization(factorization) = factorization
 
 # The sequential-scan primitive `scan(xs...; init) do carry, x… end` (shared values
-# captured by the step, or deprecated `Ref(shared)` operands)
+# captured by the step, or `Ref(shared)` operands)
 # lowers to this.  `step` is the prepared 2-`want` step kernel
 # `(carry, x..., shared...) -> (new_carry, output)`; the scan threads `carry`
 # (seeded by `init`) over the `iterated` sequences in lockstep, one element of
@@ -1437,6 +1437,14 @@ end
     ndims(value.values) > 1 ? value : value.values
 @inline _tensorized_plate_pointwise(
     value::_TensorizedPlateBatch{<:Tuple,<:AbstractArray}) = value
+# A plate whose pointwise value only other plates read hands its lanes to
+# them as they are. A compound (tuple or named-tuple) lane then stays one batch,
+# which each reading cell restores lane by lane, as it restores an array lane;
+# materializing it would turn its lanes into one tuple of arrays, whose
+# elements a reading plate would take for its lanes.
+@inline _tensorized_plate_lanes(value) = _tensorized_plate_pointwise(value)
+@inline _tensorized_plate_lanes(
+    value::_TensorizedPlateBatch{<:Tuple,<:Union{Tuple,NamedTuple}}) = value
 
 # The marker is owned by RK, so ordinary helpers can use Base.stack without a
 # backend-specific helper method. Only the fixed tensor rank determines this

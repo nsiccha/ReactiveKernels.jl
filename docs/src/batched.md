@@ -41,8 +41,8 @@ loop: each pointwise value is stored and immediately added to the return.
 
 `plate` follows Julia broadcasting semantics. Equal array dimensions align and
 zip; singleton dimensions expand; scalars repeat. Incompatible shapes raise
-`DimensionMismatch`. A value every cell reads whole is not a plate argument:
-the cell closes over it (see [Plate-cell scope](#Plate-cell-scope)).
+`DimensionMismatch`. A value every cell reads whole can be captured by the cell
+or passed as a `Ref` operand (see [Plate-cell scope](#Plate-cell-scope)).
 
 Whole parameter arrays can remain atomic when observation data is bound. A
 kernel prepared with `bound = (; x, y)` may keep `q` as its only input and read
@@ -64,8 +64,9 @@ same broadcast rules.
 ### Plate-cell scope
 
 A `plate(... do` cell reads enclosing names the way a Julia closure does, and
-closing over a value is how every cell shares it. The plate's explicit
-arguments are the only zipped axes. Any other enclosing name the cell reads is
+closing over a value is how every cell shares it. Bare explicit plate
+arguments define the zipped axes; `Ref` arguments are shared. Any other
+enclosing name the cell reads is
 captured whole: a `@kernel` signature port, a name assigned anywhere in the
 kernel body or, inside a nested plate, an outer cell's argument or local. A
 captured scalar is shared by every cell. A captured array, tuple or struct is
@@ -93,11 +94,9 @@ it and index it by the cell's own index. Names assigned inside the cell are
 cell-local. An authored `scan` step captures enclosing names the same way; see
 [Sequential recurrences with `scan`](scan.md).
 
-Do not wrap a shared value in `Ref` as a plate argument; close over it. Older
-kernels pass shared values as `Ref(value)` arguments. Such an argument prepares
-the same kernel as the closure, and it is deprecated (user decision `0kvm2ip`):
-each site warns once at definition under `--depwarn=yes`, and it will become
-an error.
+An explicit `Ref(value)` plate argument is also a shared atomic operand. Give
+the cell a matching formal to read it whole. It prepares the same kernel as
+reading `value` as a closure; neither form changes the plate's zipped axes.
 
 Subkernel and endpoint calls accept ordinary `f(name = value)` and
 `f(; name = value)` spellings. They normalize to the same graph.

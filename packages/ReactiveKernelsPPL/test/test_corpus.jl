@@ -20,7 +20,8 @@ function _canon(io::IO, x, depth::Int = 0, names = nothing)
     elseif x isa Symbol && names !== nothing && _corpus_private_selected(x, names) !== nothing
         prefix, binder = _corpus_private_selected(x, names)
         index = get!(names.selected, binder, length(names.selected) + 1)
-        print(io, isempty(prefix) ? "private_selected(" : "private_selected_index(", index, ")")
+        print(io, isempty(prefix) ? "private_selected(" :
+            prefix == "_ppl_pi_" ? "private_selected_index(" : "private_selected_value(", index, ")")
     elseif x isa Union{Bool, Symbol, Number, Char, String}
         print(io, repr(x))
     elseif x isa LineNumberNode
@@ -142,7 +143,7 @@ end
 
 function _corpus_private_selected(x::Symbol, names)
     x in names.authored && return nothing
-    match_name = match(r"^(_ppl_pi_)?(##_rkppl_selected#\d+)$", String(x))
+    match_name = match(r"^(_ppl_pi_|_ppl_pv_)?(##_rkppl_selected#\d+)$", String(x))
     match_name === nothing && return nothing
     binder = Symbol(match_name.captures[2])
     binder in names.authored && return nothing

@@ -154,3 +154,25 @@ end
             q, similar(u), u)
     end
 end
+
+# `prepare_sampler(...; warm)` forwards to `prepare_ad`'s `warm`: the gradient
+# compiles during preparation, and its evaluations are unchanged.
+@testset "prepare_sampler warm forwards to prepare_ad" begin
+    d = _retained_data()
+    plan = _retained_normal(; g = d.g, nt = d.nt, dose = d.dose) | (; y = d.y)
+    built = build_kernel(plan)
+    n = built.layout.total
+    u = [0.1 * sin(k) for k in 1:n]
+    exemplar = copy(u)
+    q = prepare_sampler(built, plan, u; backend = _RETAINED_BACKEND)
+    qw = prepare_sampler(built, plan, u; backend = _RETAINED_BACKEND, warm = true)
+    qwr = prepare_sampler(built, plan, u; backend = _RETAINED_BACKEND,
+        warm = true, retain = (:pointwise,))
+    @test u == exemplar
+    for point in (u, u .+ 0.05)
+        expected = sampler_value_and_gradient!(q, zeros(n), point)
+        @test sampler_value_and_gradient!(qw, zeros(n), point) == expected
+        value, gradient, _ = sampler_value_gradient_and_retained!(qwr, zeros(n), point)
+        @test (value, gradient) == expected
+    end
+end

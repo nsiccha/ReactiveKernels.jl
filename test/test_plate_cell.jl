@@ -166,6 +166,49 @@ end
     @test all(k(x, y, 0.9, i) == (loc[i], dens[i]) for i in 1:3)
 end
 
+# A location plate read by two density plates, the shape RKPPL emits for an
+# `@plate for` cell whose shared work feeds two observations.
+const _CELL_FORK_CALLS = Ref(0)
+_cell_fork_exp(v) = (_CELL_FORK_CALLS[] += 1; exp(v))
+@kernel _cell_fork(x, y, z, s::Float64) = begin
+    loc = plate(x) do xi
+        _cell_fork_exp(xi * s)
+    end
+    dy = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    dz = plate(loc, z) do li, zi
+        -(zi - 2li)^2 / 2
+    end
+    total = sum(dy) + sum(dz)
+    return total
+end
+
+@testset "plate_cell: a plate read only by cells at one position runs at that cell" begin
+    cells = plate_cell(plate_cell(_cell_fork, :dy; index = :i), :dz; index = :i)
+    k = prepare(cells; have = (:x, :y, :z, :s, :i), want = (:dy_cell, :dz_cell))
+    full = prepare(_cell_fork; have = (:x, :y, :z, :s), want = (:dy, :dz))
+    function data(n)
+        xs = collect(range(-1.0, 1.0; length = n))
+        (xs, 2 .* sin.(xs), cos.(xs), 0.8)
+    end
+    x, y, z, s = data(9)
+    dy, dz = full(x, y, z, s)
+    @test all(k(x, y, z, s, i) == (dy[i], dz[i]) for i in eachindex(x))
+    # Each cell runs the location at its position: not the whole plate.
+    _CELL_FORK_CALLS[] = 0
+    k(x, y, z, s, 4)
+    @test _CELL_FORK_CALLS[] == 2
+    allocated(args...) = (k(args..., 3); @allocated k(args..., 3))
+    small, large = allocated(data(10)...), allocated(data(100_000)...)
+    @test large == small
+    # The whole kernel still evaluates the location once per cell.
+    total = prepare(_cell_fork; have = (:x, :y, :z, :s), want = :total)
+    _CELL_FORK_CALLS[] = 0
+    total(x, y, z, s)
+    @test _CELL_FORK_CALLS[] == length(x)
+end
+
 @testset "plate_cell: native Enzyme Reverse through a composed cell" begin
     k = prepare(plate_cell(_cell_chain, :dens; index = :i);
         have = (:x, :y, :s, :i), want = :dens_cell)

@@ -6351,6 +6351,63 @@ end
 
 # Plan names an expression reads (call heads, keyword names and function
 # values are not reads).
+# The names a definition reads. A plate column reads its inputs and the
+# values its cell captures, not its cell's own arguments and locals.
+_definition_reads(ex) = _is_plate_column_expr(ex) ? _plate_column_reads(ex) :
+    _expr_value_symbols(ex)
+function _plate_column_reads(ex)
+    call, lam = ex.args
+    reads = Set{Symbol}()
+    foreach(a -> _expr_value_symbols(a, reads), call.args[2:end])
+    formals = Meta.isexpr(lam.args[1], :tuple) ? lam.args[1].args : Any[lam.args[1]]
+    cell = Set{Symbol}(f for f in formals if f isa Symbol)
+    body = Meta.isexpr(lam.args[2], :block) ? lam.args[2].args : Any[lam.args[2]]
+    for st in body
+        st isa LineNumberNode && continue
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+            union!(reads, setdiff(_expr_value_symbols(st.args[2]), cell))
+            push!(cell, st.args[1])
+        else
+            union!(reads, setdiff(_expr_value_symbols(st), cell))
+        end
+    end
+    return reads
+end
+
+# One lane value of a plate input at cell `k`: a `Ref` is shared by every cell.
+_plate_lane_value(lane::Base.RefValue, k) = lane[]
+_plate_lane_value(lane, k) = lane[k]
+
+# A data-only plate column at binding: the cell, once per index, over the
+# zipped inputs (`plate(lanes...) do args...; cell; end`).
+function _eval_plate_column(ex, lookup, label)
+    call, lam = ex.args
+    lanes = Any[_eval_value_expr(a, lookup, label) for a in call.args[2:end]]
+    zipped = filter(l -> !(l isa Base.RefValue), lanes)
+    isempty(zipped) && throw(ContractValidationError(
+        "[bind] $label: a plate column needs a per-index input"))
+    n = length(first(zipped))
+    all(l -> length(l) == n, zipped) || throw(ContractValidationError(
+        "[bind] $label: plate inputs differ in length"))
+    formals = Meta.isexpr(lam.args[1], :tuple) ? lam.args[1].args : Any[lam.args[1]]
+    body = Meta.isexpr(lam.args[2], :block) ? lam.args[2].args : Any[lam.args[2]]
+    return [begin
+        cell = Dict{Symbol,Any}(f => _plate_lane_value(lane, k)
+            for (f, lane) in zip(formals, lanes))
+        read(nm) = haskey(cell, nm) ? cell[nm] : lookup(nm)
+        value = nothing
+        for st in body
+            st isa LineNumberNode && continue
+            if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+                cell[st.args[1]] = _eval_value_expr(st.args[2], read, label)
+            else
+                value = _eval_value_expr(st, read, label)
+            end
+        end
+        value
+    end for k in 1:n]
+end
+
 function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
     if ex isa Symbol
         push!(out, ex)
@@ -6431,7 +6488,7 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         push!(active, nm)
         ok = all(s -> s in raw || (unbound && s ∉ known) ||
                 (haskey(nodes, s) && dataonly(s, active)),
-            _expr_value_symbols(nodes[nm]))
+            _definition_reads(nodes[nm]))
         delete!(active, nm)
         memo[nm] = ok
         return ok
@@ -6455,9 +6512,11 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         g === nothing || push!(axes, g)
     end
     union!(required, axes)
+    # A data-only plate column binds only for a bind-time slot (weights, a
+    # scale, a dimension or index); otherwise preparation folds it.
     names = Set{Symbol}(nm for (nm, ex) in nodes
-        if nm ∉ resps && (_contains_module_call(ex) || nm in required) &&
-            dataonly(nm, Set{Symbol}()))
+        if nm ∉ resps && ((_contains_module_call(ex) && !_is_plate_column_expr(ex)) ||
+            nm in required) && dataonly(nm, Set{Symbol}()))
     bind_only || return names
     onlydata = union(raw, Set{Symbol}(nm for nm in keys(nodes)
         if dataonly(nm, Set{Symbol}())))
@@ -7021,6 +7080,7 @@ function _eval_value_expr(ex, lookup, label; calls = nothing)
     ex isa Symbol && return lookup(ex)
     ex isa Expr || throw(ContractValidationError(
         "[bind] $label: unsupported literal $(repr(ex))"))
+    _is_plate_column_expr(ex) && return _eval_plate_column(ex, lookup, label)
     ev(a) = _eval_value_expr(a, lookup, label; calls)
     h = ex.head
     cached = h === :call && calls !== nothing && ex.args[1] isa GlobalRef
