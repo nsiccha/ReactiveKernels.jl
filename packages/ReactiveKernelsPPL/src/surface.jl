@@ -2848,42 +2848,51 @@ function _gathered_value_definitions(ast::Expr, data::Set{Symbol})
     detmap = Dict{Symbol,Any}(st.args[1] => st.args[2] for st in ast.args
         if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
     taken = union(data, _expr_names(ast))
+    reserved = Set{Symbol}()
+    for st in ast.args
+        if st isa Expr && (_is_sample(st) || _is_broadcast_sample(st))
+            for stem in _sampled_lhs_names!(Set{Symbol}(), st.args[2])
+                union!(reserved, _synthesized_response_names(stem))
+            end
+        end
+    end
     named = Dict{Any,Symbol}()
     out = Any[]
-    function name!(value)
+    function name!(value, stem::Symbol)
         get!(named, value) do
-            k = 1
-            nm = Symbol(:_rkppl_gathered_, k)
-            while nm in taken
+            base = Symbol(stem, :_gathered)
+            nm, k = base, 1
+            while nm in taken || nm in reserved
                 k += 1
-                nm = Symbol(:_rkppl_gathered_, k)
+                nm = Symbol(base, :_, k)
             end
             push!(taken, nm)
             push!(out, Expr(:(=), nm, value))
             nm
         end
     end
-    function walk(ex)
+    function walk(ex, stem::Symbol)
         ex isa Expr || return ex
         ex.head in (:macrocall, :quote) && return ex
         ex.head in _DEFERRED_VALUE_HEADS && return ex
-        args = Any[walk(a) for a in ex.args]
+        args = Any[walk(a, stem) for a in ex.args]
         if ex.head === :ref && length(args) >= 2 &&
                 _gathered_value(args[1]) && !_data_only(args[1], data, detmap)
-            args[1] = name!(args[1])
+            args[1] = name!(args[1], stem)
         end
         return Expr(ex.head, args...)
     end
     defined = Set{Symbol}(keys(detmap))
     for st in ast.args
         if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
-            st = Expr(:(=), st.args[1], walk(st.args[2]))
+            st = Expr(:(=), st.args[1], walk(st.args[2], st.args[1]))
         elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
                 !_external_rhs(st.args[3])
             observed = _sampled_lhs_names!(Set{Symbol}(), st.args[2])
             if any(in(data), observed) ||
                     (_is_broadcast_sample(st) && any(in(defined), observed))
-                rhs = _map_rhs_values(walk, st.args[3])
+                stem = first(sort!(collect(observed)))
+                rhs = _map_rhs_values(ex -> walk(ex, stem), st.args[3])
                 rhs == st.args[3] ||
                     (st = Expr(:call, st.args[1], st.args[2], rhs))
             end
