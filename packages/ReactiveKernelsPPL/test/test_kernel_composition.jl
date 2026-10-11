@@ -133,7 +133,10 @@ structure(program) = [(entry.kind, entry.depth) for entry in recipe_inventory(pr
             end
             @test data == original
         end
-        @test all(==(first(counts)), counts)
+        # An empty observation plate can fold into an ordinary recipe after
+        # tracing. Nonempty row counts must retain one fixed recipe structure;
+        # the module-owned scan is checked above for every row count.
+        @test all(==(counts[2]), counts[2:end])
     end
 end
 
