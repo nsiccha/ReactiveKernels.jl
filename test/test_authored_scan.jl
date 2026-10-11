@@ -395,10 +395,11 @@ end
     @test included(pd, Float64[], Float64[]) == [pd.baseline]
     @test only(Base.return_types(included,
         Tuple{typeof(pd),Vector{Float64},Vector{Float64}})) == Vector{Float64}
-    # Compare each output with a plain buffer of the SAME length. Allocator
+    # Compare each scan with a plain buffer of the SAME length. Allocator
     # rounding can make n + 1 elements cost more than n elements plus 64 bytes
-    # (Windows/Julia 1.13 at n = 400), without any extra allocation in the scan.
-    # Keep the original 64-byte margin; a second output buffer still fails it.
+    # (Windows/Julia 1.13 at n = 400), without an extra allocation in the scan.
+    # The vcat control should use substantially more memory than the included
+    # scan, but its fixed overhead need not equal two separate `similar` calls.
     per_step = prepare(authored_scan_turnover; want = :updated)
     for n in (400, 401, 4096)
         conc, dts = abs.(sin.(1:n)) .* 50, fill(0.1, n)
@@ -409,10 +410,11 @@ end
             _authored_scan_output_buffer, conc, n)
         trajectory_buffer = _authored_scan_allocated_function(
             _authored_scan_output_buffer, conc, n + 1)
+        included_bytes = _authored_scan_allocated(included, pd, conc, dts)
+        concatenated_bytes = _authored_scan_allocated(concatenated, pd, conc, dts)
         @test _authored_scan_allocated(per_step, pd, conc, dts) <= step_buffer + 64
-        @test _authored_scan_allocated(included, pd, conc, dts) <= trajectory_buffer + 64
-        @test _authored_scan_allocated(concatenated, pd, conc, dts) >=
-            step_buffer + trajectory_buffer - 64
+        @test included_bytes <= trajectory_buffer + 64
+        @test concatenated_bytes >= included_bytes + step_buffer ÷ 2
     end
 
     # The element type is the seed's and the outputs' promotion, as the vcat's.

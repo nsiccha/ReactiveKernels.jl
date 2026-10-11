@@ -42,9 +42,12 @@ observation's distribution receives: `(location = …, scale = …)` for
 responses of the Normal, Student t and LogNormal families, where entry `i`
 belongs to entry `i` of the response's `:pointwise` densities and a value
 shared by every observation stays a scalar. Prior-only models return an empty
-`NamedTuple`. Preparing it for a program with any other observation (another
-family, a response holding one array per index, a sampling-RHS observation or
-a conditioned declaration) throws a `ContractValidationError` naming them.
+`NamedTuple`. For a response holding one array per `@plate` index, locations
+and scales follow the nested `:pointwise` order: a per-entry value holds one
+array per index, a per-index scalar holds one number per index, and a shared
+scalar stays scalar. Preparing it for a program with any other observation
+(another family, a sampling-RHS observation or a conditioned declaration)
+throws a `ContractValidationError` naming them.
 """
 const WORKFLOW_WANTS = (
     sampler = :posterior,
