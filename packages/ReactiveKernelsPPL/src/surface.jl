@@ -5161,9 +5161,7 @@ function _check_definition_levels_axes(sample, det, data::Set{Symbol})
         s.dims === nothing && continue
         for d in s.dims
             # `levels(gg)` and its positional twin `length(levels(gg)) - k`
-            cnt = _levels_count(d)
-            gg = _is_levels_dim(d) ? d.args[2] :
-                cnt === nothing ? nothing : first(cnt)
+            gg = _level_pool_source(d)
             (gg === nothing || gg in data) && continue
             _is_bind_data_definition(gg, detmap, data, Set{Symbol}()) ||
                 _sfail("array $(s.lhs) axis `levels($gg)`: $gg must be " *

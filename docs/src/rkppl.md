@@ -493,7 +493,9 @@ holds labels, integer labels included. To read a data-sized block at
 positions the model computes, declare that axis positionally with the same
 extent: `z[1:length(levels(g)), 1:K] .~ Normal.(0, 1)` has one row per level
 of `g`, which may be data or a definition computed from data such as
-`gg = vcat(g1, g2)`. With `i` holding integer positions, `b[i, 1]` is then
+`gg = vcat(g1, g2)`. Like a level axis, it reads `g` as one pool of values,
+so `g` may be a per-group table of its own length beside the observations.
+With `i` holding integer positions, `b[i, 1]` is then
 plain Julia indexing, whether `b` is the declaration, a definition such as
 `b = z .* tau` or a submodel's return. A level axis indexed by integers that
 are not its labels fails binding, and the message names the positional

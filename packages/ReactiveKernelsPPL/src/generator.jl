@@ -381,13 +381,46 @@ function _assignment_statements(plan::StructuralPlan;
         if _expr_value_symbols(ex) ⊆ dataonly
             union!(dataonly, targets)
         else
-            ex = _split_data_calls!(stmts, name, ex, dataonly)
+            ex = _observation_slice_views(
+                _split_data_calls!(stmts, name, ex, dataonly), plan, dataonly)
         end
         lhs = length(targets) == 1 && targets[1] === name ? name : Expr(:tuple, targets...)
         push!(stmts, :($(lhs) = $(ex)))
     end
     return stmts
 end
+
+# A column read `P[:, j]` of a per-observation value (`_is_observation_slice`)
+# reads that value in place. Julia's `getindex` copies every row of the slice,
+# and native reverse mode then adds the copy's adjoint back into the value's,
+# so separate reads of one product cost more than separate products. The
+# value is never written after it is made, so the view reads the same numbers.
+# Compiled tracing reads the same slice (`ReactiveKernels._tensorized_view`).
+# A data-only value keeps Julia's copy: `bound=` folds the read once at
+# preparation, outside the evaluated program, and a view would hold the
+# caller's data.
+function _observation_slice_views(ex, plan::StructuralPlan, dataonly::Set{Symbol})
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    _is_plate_column_expr(ex) && return ex
+    if ex.head === :ref && ex.args[1] isa Symbol && ex.args[1] ∉ dataonly &&
+            _is_observation_slice(plan, ex)
+        base = ex.args[1]
+        indices = (_slice_view_index(i, base, k) for (k, i) in enumerate(ex.args[2:end]))
+        return :(ReactiveKernels._tensorized_view($base, $(indices...)))
+    end
+    return Expr(ex.head, (_observation_slice_views(a, plan, dataonly) for a in ex.args)...)
+end
+
+# One index of a slice read as a call argument: `:` is the whole axis, and
+# `end`/`begin` (alone or in integer arithmetic) resolve against axis `k` of
+# the sliced value, as Julia's indexing syntax resolves them.
+_slice_view_index(i, base::Symbol, k::Int) =
+    i === :(:) ? Expr(:call, GlobalRef(Base, :Colon)) : _slice_view_endpoint(i, base, k)
+_slice_view_endpoint(i, base::Symbol, k::Int) =
+    i === :end ? Expr(:call, GlobalRef(Base, :lastindex), base, k) :
+    i === :begin ? Expr(:call, GlobalRef(Base, :firstindex), base, k) :
+    i isa Expr ? Expr(i.head, (_slice_view_endpoint(a, base, k) for a in i.args)...) : i
 
 # Destructuring `(a, b) = rhs` reaches the plan as one element read per name
 # (`_desugar_destructuring`). Emit the reads of one `rhs` as Julia's single
@@ -1093,7 +1126,9 @@ _ppl_range_values(x::AbstractArray, indices) = x[indices]
 
 # A selected plate column already holds one value per selected response cell
 # (`_selected_plate_indices`); only whole operands are gathered at the
-# authored indices. Positions and indices differ for a literal `a:b`.
+# authored indices. Positions and indices differ for a literal `a:b`. Read
+# without a gather, the observation plate consumes the column's plate
+# directly, so a cell query composes it and runs only that cell.
 function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
     i = findfirst(p -> p.name === value, plan.predictors)
     i === nothing && return false
@@ -1101,7 +1136,8 @@ function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Sy
     p.link === IdentityLink && length(p.terms) == 1 &&
         p.terms[1].kind === OffsetTerm || return false
     d = findfirst(d -> d.name === only(p.terms[1].columns), plan.derived)
-    return d !== nothing && _selected_plate_indices(plan.derived[d].expr) == r.range.args[2]
+    return d !== nothing && _authored_spelling(
+        _selected_plate_indices(plan.derived[d].expr)) == r.range.args[2]
 end
 
 function _ranged_response_stmts(r, plan, stmts)

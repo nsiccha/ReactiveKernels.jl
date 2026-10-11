@@ -217,4 +217,160 @@ end
     @test occursin("declare that axis `1:length(levels(g))`", msg)
 end
 
+# A level axis reads its source as one pool of values, keyed by label or by
+# position, so the source may be a per-group table of its own length beside
+# the observations (rkppl-use §2 "Data off the observation axis"). Here `g`
+# has one row per group, the group terms are per `g` row, and an ordinary
+# reader maps them onto the observations (snag rkppl-positional-c71dda6c).
+offaxis_reader(u, row) = u[row]
+offaxis_reader(u, v, row) = u[row] .+ v[row]
+
+function offaxis_program(kind)
+    block = kind === :labeled ? :(b ~ labeled_effects(g)) :
+        kind === :k1 ? :(b ~ effects(g)) : :(b ~ correlated_effects(g, 2))
+    index = kind === :labeled ? :g : :(level_positions(g, g))
+    reader = kind === :k2 ? :(offaxis_reader(u, b[i, 2], row)) : :(offaxis_reader(u, row))
+    ast = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        $block
+        i = $index
+        u = a .+ b[i, 1]
+        reads = $reader
+        y .~ Normal.(reads, s)
+    end
+    return ast
+end
+
+function offaxis_data(labels, G, n)
+    d = data(labels, G, G)
+    row = [mod1(3t + 1, G) for t in 1:n]
+    return (; g = d.g, row, y = [0.4 * sin(2.1t) + 0.5 for t in 1:n])
+end
+
+function offaxis_build(kind, d)
+    names = (:g, :row, :y)
+    plan = lower_rkppl(offaxis_program(kind), names; mod = @__MODULE__,
+        conditioned = (:y,))
+    bound = bind_data(plan, (; g = d.g, row = d.row, y = d.y))
+    return (; plan, bound, built = build_kernel(bound))
+end
+
+function offaxis_oracle(kind, d, built, u)
+    p = constrain(built.layout, u)
+    i = indexin(d.g, sort(unique(d.g)))
+    if kind === :k2
+        b = p.b.z * transpose(p.b.tau .* p.b.L)
+        block = sum(logpdf.(Exponential(1), p.b.tau)) +
+            logpdf(LKJCholesky(2, 2.0), Cholesky(LowerTriangular(p.b.L)))
+        v = b[i, 2][d.row]
+    else
+        b = p.b.z .* only(p.b.tau)
+        block = logpdf(LogNormal(0, 1), only(p.b.tau))
+        v = 0.0
+    end
+    reads = (p.a .+ b[i, 1])[d.row] .+ v
+    likelihood = sum(logpdf.(Normal.(reads, p.s), d.y))
+    prior = logpdf(Normal(0, 1), p.a) + logpdf(Exponential(1), p.s) + block +
+        sum(logpdf.(Normal(0, 1), p.b.z))
+    return likelihood + prior + logjac(built.layout, u)
+end
+
+@testset "level position gathers: the level source has its own length" begin
+    @testset "$kind $labels" for kind in (:k1, :k2), labels in (:strings, :integers)
+        structures = Int[]
+        for (G, n) in ((3, 7), (6, 20))
+            d = offaxis_data(labels, G, n)
+            before = deepcopy(d)
+            fx = offaxis_build(kind, d)
+            u = [0.3 * sin(1.7k) - 0.1 for k in 1:fx.built.layout.total]
+            r = evaluate(fx, u)
+            @test r.value ≈ offaxis_oracle(kind, d, fx.built, u) rtol = 1e-12
+            @test r.grad ≈ findiff(w -> offaxis_oracle(kind, d, fx.built, w), u) rtol = 1e-5 atol = 1e-7
+            @test length(r.pointwise.y) == n
+            @test d == before
+            push!(structures, length(fx.built.spec.graph.recipes))
+        end
+        @test structures[1] == structures[2]
+    end
+    @testset "same density as the levels(g) axis gathered by label" begin
+        d = offaxis_data(:strings, 4, 9)
+        positional, labeled = offaxis_build(:k1, d), offaxis_build(:labeled, d)
+        @test coordinate_names(labeled.built.layout) == coordinate_names(positional.built.layout)
+        u = [0.25 * sin(k) for k in 1:positional.built.layout.total]
+        @test isequal(evaluate(labeled, u).value, evaluate(positional, u).value)
+    end
+    @testset "one plan, group tables of other lengths" begin
+        plan = offaxis_build(:k1, offaxis_data(:strings, 3, 7)).plan
+        for (labels, G, n) in ((:strings, 5, 4), (:integers, 2, 11))
+            d = offaxis_data(labels, G, n)
+            bound = bind_data(plan, (; g = d.g, row = d.row, y = d.y))
+            built = build_kernel(bound)
+            u = [0.2 * cos(1.1k) for k in 1:built.layout.total]
+            @test built.layout.total == 3 + G
+            @test Base.invokelatest(prepare_query(built, bound, :sampler), u) ≈
+                offaxis_oracle(:k1, d, built, u) rtol = 1e-12
+        end
+    end
+    @testset "$(repr(ax)) over $what" for (what, ax) in (
+            ("data", :(1:length(levels(g)) - 1)),
+            ("a definition computed at bind", :(1:length(levels(gg)))))
+        # `gg = g .* 10` calls no function: binding still computes it once
+        # for the axis, as for a `levels(gg)` axis.
+        for (G, n) in ((3, 7), (4, 2))
+            g = [10 + 3k for k in 1:G]
+            i = [mod1(2t, G - (what == "data")) for t in 1:n]
+            y = [0.3 * cos(1.3t) for t in 1:n]
+            ast = quote
+                a ~ Normal(0, 1)
+                gg = g .* 10
+                z[$ax] .~ Normal.(0, 1)
+                y .~ Normal.(a .+ z[i], 1.0)
+            end
+            plan = lower_rkppl(ast, (:g, :i, :y); mod = @__MODULE__, conditioned = (:y,))
+            bound = bind_data(plan, (; g, i, y))
+            built = build_kernel(bound)
+            @test built.layout.total == 1 + G - (what == "data")
+            u = [0.3 * sin(1.7k) - 0.1 for k in 1:built.layout.total]
+            p = constrain(built.layout, u)
+            oracle = logpdf(Normal(0, 1), p.a) + sum(logpdf.(Normal(0, 1), p.z)) +
+                sum(logpdf.(Normal.(p.a .+ p.z[i], 1.0), y))
+            @test Base.invokelatest(prepare_query(built, bound, :sampler), u) ≈ oracle rtol = 1e-12
+        end
+    end
+    @testset "two observation axes, the source read by neither response" begin
+        # `x_obs` and `y` have their own rows; `g` sizes the block and feeds
+        # only the data-only position call, so it belongs to no response axis.
+        d = data(:strings, 3, 6)
+        x_obs = [0.2, -0.4, 0.7, 0.1]
+        ast = quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1)
+            b ~ effects(g)
+            i = level_positions(g, g)
+            mu = a .+ b[i, 1] .* x
+            x_obs .~ Normal.(0, 1)
+            y .~ Normal.(mu, s)
+        end
+        plan = lower_rkppl(ast, (:g, :x, :x_obs, :y); mod = @__MODULE__,
+            conditioned = (:x_obs, :y))
+        bound = bind_data(plan, (; g = d.g, x = d.x, x_obs, y = d.y))
+        fx = (; plan, bound, built = build_kernel(bound))
+        function two_axis_oracle(u)
+            p = constrain(fx.built.layout, u)
+            b = p.b.z .* only(p.b.tau)
+            mu = p.a .+ b[indexin(d.g, sort(unique(d.g))), 1] .* d.x
+            return sum(logpdf.(Normal.(mu, p.s), d.y)) + sum(logpdf.(Normal(0, 1), x_obs)) +
+                logpdf(Normal(0, 1), p.a) + logpdf(Exponential(1), p.s) +
+                logpdf(LogNormal(0, 1), only(p.b.tau)) + sum(logpdf.(Normal(0, 1), p.b.z)) +
+                logjac(fx.built.layout, u)
+        end
+        u = [0.3 * sin(1.7k) - 0.1 for k in 1:fx.built.layout.total]
+        r = evaluate(fx, u)
+        @test r.value ≈ two_axis_oracle(u) rtol = 1e-12
+        @test r.grad ≈ findiff(two_axis_oracle, u) rtol = 1e-5 atol = 1e-7
+        @test (length(r.pointwise.x_obs), length(r.pointwise.y)) == (4, 6)
+    end
+end
+
 end
