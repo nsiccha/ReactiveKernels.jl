@@ -1308,6 +1308,9 @@ end
 
 function _kernel_note_endpoint_port_type!(local_types, actual::Symbol, formal)
     T = valtype(formal)
+    # An untyped child formal places no type constraint on the caller port.
+    # In particular, it must not redeclare an explicitly typed owner input.
+    T === Any && return
     if haskey(local_types, actual) && local_types[actual] != T
         throw(ArgumentError(
             "plate do-block argument :$actual is used with incompatible " *

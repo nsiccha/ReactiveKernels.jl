@@ -555,6 +555,11 @@ end
     rows = ReactiveKernelsPPL._ppl_rows
     v = [0.3, -1.2, 2.1]
     @test rows(v, 3) === v
+    m = reshape(collect(1.0:6.0), 3, 2)
+    col = view(m, :, 2)
+    @test rows(col, 3) === col
+    @test rows(view(m, 1:1, 2), 3) == fill(4.0, 3)
+    @test_throws DimensionMismatch rows(col, 4)
     @test rows(0.4, 3) == fill(0.4, 3) && rows(0.4, 3) isa Vector{Float64}
     # Other values keep Julia's broadcast against the rows.
     @test rows([0.4], 3) == fill(0.4, 3)
