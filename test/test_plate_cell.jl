@@ -363,6 +363,63 @@ end
     @test d == data(7)
 end
 
+# A composed reader can zip the predictor itself as a plate argument, instead
+# of reading it through `log_k[i]` inside the cell. Its producer still needs
+# only the selected row.
+@kernel _cell_batched_population(y, X::Matrix{Float64}, beta::Vector{Float64},
+                                 codes::Vector{Int}, Z) = begin
+    pop = X * beta
+    log_k = pop .+ Z[codes, 1]
+    dens = plate(log_k, y) do li, yi
+        -(yi - exp(li))^2 / 2
+    end
+    return sum(dens)
+end
+
+@testset "plate_cell: batched predictor inputs run at the selected row" begin
+    have = (:y, :X, :beta, :codes, :Z)
+    k = prepare(plate_cell(_cell_batched_population, :dens; index = :i);
+        have = (have..., :i), want = :dens_cell)
+    full = prepare(_cell_batched_population; have, want = :dens)
+    function data(n)
+        x = collect(range(-1.0, 1.0; length = max(n, 2)))[1:n]
+        (; y = cos.(1:n), X = hcat(ones(n), x), beta = [0.1, -0.4],
+           codes = [mod1(j, 3) for j in 1:n], Z = [0.2 -0.1; 0.5 0.3; -0.3 0.0])
+    end
+    d = data(7)
+    @test [k(d..., i) for i in eachindex(d.y)] ≈ full(d...)
+    singleton = (; data(1)..., y = d.y)
+    @test [k(singleton..., i) for i in eachindex(singleton.y)] ≈ full(singleton...)
+    allocated(d) = (k(d..., 2); @allocated k(d..., 2))
+    @test allocated(data(10)) == allocated(data(100_000))
+    @test_throws BoundsError k(d..., length(d.y) + 1)
+    @test_throws DimensionMismatch k((; d..., y = [d.y; 0.0])..., 2)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    ad = prepare_ad(k, backend, d..., 2; active = :Z)
+    value, dZ = ad_value_and_gradient(ad, d..., 2)
+    @test value ≈ k(d..., 2)
+    @test findall(vec(any(!iszero, dZ; dims = 2))) == [d.codes[2]]
+end
+
+@kernel _cell_batched_matrix(x::Matrix{Float64}, y::Matrix{Float64}, a::Float64) = begin
+    loc = x .+ a
+    dens = plate(loc, y) do li, yi
+        -(yi - li)^2 / 2
+    end
+    return dens
+end
+
+@testset "plate_cell: a batched matrix keeps its trailing cell coordinate" begin
+    k = prepare(plate_cell(_cell_batched_matrix, :dens; index = :i);
+        have = (:x, :y, :a, :i), want = :dens_cell)
+    full = prepare(_cell_batched_matrix; have = (:x, :y, :a), want = :dens)
+    x = reshape(collect(range(-0.5, 0.5; length = 12)), 4, 3)
+    y = cos.(x)
+    @test [k(x, y, 0.2, I) for I in CartesianIndices(x)] ≈ full(x, y, 0.2)
+    @test k(x, y, 0.2, CartesianIndex(2, 3)) ≈ full(x, y, 0.2)[2, 3]
+    @test_throws BoundsError k(x, y, 0.2, CartesianIndex(5, 1))
+end
+
 const _CELL_GUARD_CALLS = Ref(0)
 _cell_guard_value(x, scale) = (_CELL_GUARD_CALLS[] += 1; x * scale)
 

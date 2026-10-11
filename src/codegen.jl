@@ -2565,23 +2565,48 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
     index_arg = first(callargs)
     plate_args = callargs[2:end]
     plate_values = recipe.inputs[2:end]
+    pushed_lanes = Dict{Int,Int}()
+    if windows !== nothing
+        d = windows.pushdowns
+        for position in get(d.batched, recipe.id, Set{Int}())
+            value = canon_id(d.graph, plate_values[position].id)
+            value in d.pushed && (pushed_lanes[position] = value)
+        end
+    end
     # The steps of `_plate_cell_slices`, one argument at a time.
     raw = Dict{Int,Symbol}()
     for (position, arg) in enumerate(plate_args)
-        position in atomic && continue
+        (position in atomic || haskey(pushed_lanes, position)) && continue
         raw[position] = gensym(:cell_raw)
         push!(body.args, Expr(:(=), raw[position],
             Expr(:call, GlobalRef(Base, :broadcastable), arg)))
     end
     cell = gensym(:cell_position)
-    shape = _plate_combined_axes_expr(Any[raw[position] for position in sort!(collect(keys(raw)))])
+    axes = Any[haskey(pushed_lanes, position) ?
+        _cell_shape!(windows, pushed_lanes[position]) :
+        Expr(:call, GlobalRef(Base, :axes), raw[position])
+        for position in eachindex(plate_args) if !(position in atomic)]
+    shape = Expr(:call, GlobalRef(@__MODULE__, :_plate_broadcast_shape),
+        Expr(:tuple, axes...))
     push!(body.args, Expr(:(=), cell,
         Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_position),
              Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), shape), index_arg)))
+    row = isempty(pushed_lanes) ? nothing : _cell_bind!(windows, :cell_row,
+        Expr(:call, GlobalRef(Base, :getindex), cell, 1))
     slices = Any[]
     for (position, arg) in enumerate(plate_args)
         if position in atomic
             push!(slices, arg)
+            continue
+        end
+        if haskey(pushed_lanes, position)
+            value = pushed_lanes[position]
+            lane_row = _cell_bind!(windows, :cell_row,
+                Expr(:call, GlobalRef(@__MODULE__, :_cell_leaf_row),
+                    _cell_shape!(windows, value), row))
+            window = _cell_window!(windows, value, lane_row)
+            push!(slices, Expr(:call, GlobalRef(@__MODULE__, :_cell_batched_slice),
+                window, cell))
             continue
         end
         slice = gensym(:cell_argument)
@@ -2593,7 +2618,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
     # it row by row is computed at that row (`_CellEmitter`, cell_windows.jl).
     if windows !== nothing
         d = windows.pushdowns
-        for (position, batched) in sort!(collect(d.captures[recipe.id]))
+        for (position, batched) in sort!(collect(get(d.captures, recipe.id,
+                Dict{Int,Int}())))
             value = canon_id(d.graph, plate_values[position].id)
             value in d.pushed || continue
             slices[position] = _cell_capture!(windows, value, slices[batched])
@@ -2899,8 +2925,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         if inline_embedded && r.op isa _AuthoredPlateCellOp
             _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
                 callargs, lhs, tensorized;
-                windows = cells === nothing || !haskey(cells.captures, r.id) ? nothing :
-                    _CellEmitter(body, cells, names))
+                windows = cells === nothing ? nothing : _CellEmitter(body, cells, names))
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp

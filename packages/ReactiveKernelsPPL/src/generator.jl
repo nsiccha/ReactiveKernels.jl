@@ -93,7 +93,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     append!(stmts, conditioned)
     append!(stmts, _array_level_index_statements(plan, gathers))
     append!(stmts, values)
-    args = Expr[:(unconstrained::Vector{Float64});
+    args = Expr[:(unconstrained::AbstractVector{Float64});
         [_data_arg(colname, col) for (colname, col) in _ordered_columns(plan)]]
     append!(stmts, _named_value_statements(plan,
         Expr[args..., transforms..., coefs..., conditioned..., values...]))
@@ -734,8 +734,34 @@ function _composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec,
         i = findfirst(a -> a.name === ex, plan.assignments)
         i !== nothing && _full_observation_view(plan, plan.assignments[i].expr) &&
             return false
+        i !== nothing && _authored_plate_result(plan.assignments[i].expr) &&
+            return false
     end
     return true
+end
+
+# A called @kernel whose single result is an authored plate already has an
+# array axis. Keeping that result directly in the observation lets RK compose
+# its plate into a queried cell; wrapping it in `_ppl_rows` would make the
+# entire plate an input to a separate recipe and force every row to run.
+function _authored_plate_result(ex)
+    Meta.isexpr(ex, :call) || return false
+    fn = ex.args[1]
+    fn isa GlobalRef && isdefined(fn.mod, fn.name) || return false
+    spec = getfield(fn.mod, fn.name)
+    spec isa KernelSpec || return false
+    wants = outputs(spec)
+    length(wants) == 1 || return false
+    graph = kernel_graph(spec)
+    producers = ReactiveKernels.producers_of(graph, only(wants).id)
+    length(producers) == 1 || return false
+    try
+        plate_body(graph.recipes[only(producers)])
+        return true
+    catch err
+        err isa ArgumentError || rethrow()
+        return false
+    end
 end
 
 function _full_observation_view(plan::StructuralPlan, ex)
@@ -1045,6 +1071,15 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     # response's observation axis and every upstream definition computed
     # from them.
     pergroup = Set{Symbol}([response; plan.cell_broadcasts[response]; axisnodes])
+    # A named identity location may be elided below, leaving its authored
+    # plate result as the actual argument of the observation cell.
+    for node in axisnodes
+        value = _identity_location_value(plan, node)
+        value === nothing && continue
+        i = findfirst(a -> a.name === value, plan.assignments)
+        i !== nothing && _authored_plate_result(plan.assignments[i].expr) &&
+            push!(pergroup, value)
+    end
     for st in upstream
         names = _assigned_names(st)
         isempty(names) && continue
