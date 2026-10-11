@@ -937,7 +937,18 @@ const _OBSERVATION_LOCATION_SCALE_FAMILIES = (GaussianFam, StudentTFam, LogNorma
 function _observation_arguments(r::LikelihoodSpec, plan::StructuralPlan,
         rs::Vector{Expr})
     r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return nothing
-    _cell_broadcast_response(plan, r) && return nothing
+    if _cell_broadcast_response(plan, r)
+        name = Symbol(:_ppl_obsargs_, r.label)
+        return any(st -> _assigned_name(st) === name, rs) ? name : nothing
+    end
+    inputs = _observation_argument_inputs(r, rs)
+    inputs === nothing && return nothing
+    location, scale = inputs
+    return :((location = $location, scale = $scale))
+end
+
+function _observation_argument_inputs(r::LikelihoodSpec, rs::Vector{Expr})
+    r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return nothing
     pw = _pw_name(r.label)
     i = findlast(st -> Meta.isexpr(st, :(=), 2) && st.args[1] === pw, rs)
     i === nothing && return nothing
@@ -946,7 +957,7 @@ function _observation_arguments(r::LikelihoodSpec, plan::StructuralPlan,
         rhs.args[1].args[1] === :plate) || return nothing
     inputs = rhs.args[1].args[2:end]
     scale = r.scale isa Real ? Float64(r.scale) : deepcopy(inputs[3])
-    return :((location = $(deepcopy(inputs[2])), scale = $scale))
+    return deepcopy(inputs[2]), scale
 end
 
 function _observations_statement(points::Vector{Pair{Symbol,Any}},
@@ -980,12 +991,24 @@ _ppl_observations_unsupported(names::Tuple) = throw(ContractValidationError(
 function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         stmts::Vector{Expr}, upstream::Vector{Expr})
     # No index: the ordinary empty-domain statements already sum to zero.
-    _response_rows(plan, r) == 0 && return stmts
+    if _response_rows(plan, r) == 0
+        r.family in _OBSERVATION_LOCATION_SCALE_FAMILIES || return stmts
+        full = _response_likelihood_stmts_full(_with(r; range = nothing), plan)
+        arguments = _observation_argument_inputs(r, full)
+        arguments === nothing && return stmts
+        generated = _cell_broadcast_group(plan, r.response, _lik_name(r.label),
+            _pw_name(r.label), full, upstream, [p.name for p in plan.predictors],
+            "response $(r.label) observes one array per index, and its $(r.family) statements";
+            arguments, argument_node = Symbol(:_ppl_obsargs_, r.label))
+        return Expr[stmts..., generated[4:end]...]
+    end
     # The response's predictor nodes lie on its observation axis, here the
     # indices.
     return _cell_broadcast_group(plan, r.response, _lik_name(r.label), _pw_name(r.label),
         stmts, upstream, [p.name for p in plan.predictors],
-        "response $(r.label) observes one array per index, and its $(r.family) statements")
+        "response $(r.label) observes one array per index, and its $(r.family) statements";
+        arguments = _observation_argument_inputs(r, stmts),
+        argument_node = Symbol(:_ppl_obsargs_, r.label))
 end
 
 # A caller-owned sampling RHS (`y[i] .~ LogDensity.(f, loc[i], s)`) in the
@@ -1002,7 +1025,8 @@ end
 
 function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Symbol,
         pw::Symbol, stmts::Vector{Expr}, upstream::Vector{Expr},
-        axisnodes::Vector{Symbol}, what::String)
+        axisnodes::Vector{Symbol}, what::String; arguments = nothing,
+        argument_node::Symbol = :_ppl_unused_observation_arguments)
     k = findall(st -> Meta.isexpr(st, :(=), 2) && st.args[1] == :($node::Float64), stmts)
     (length(k) == 1 && stmts[only(k)].args[2] == :(sum($pw))) ||
         throw(ContractValidationError("[generator] $what have no summed " *
@@ -1027,6 +1051,43 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
         used = _statement_value_reads!(Set{Symbol}(), st.args[2])
         isempty(intersect(used, pergroup)) || union!(pergroup, names)
     end
+    # The ordinary response statements compute their location/scale before
+    # the inner pointwise plate. Carry that dependency classification through
+    # those statements as well, so a scale shared by all groups remains a
+    # scalar while an indexed scale keeps its group/entry shape.
+    shared_argument_pre = Expr[]
+    group_argument_pre = Expr[]
+    argument_pergroup = copy(pergroup)
+    if arguments !== nothing
+        # A predictor proven scalar may be shared even though the density
+        # cell treats every response predictor as an index-axis input.
+        # Its upstream dependencies still make it per-group when it reads
+        # an indexed cell value.
+        for pred in plan.predictors
+            _predictor_value_type(plan, pred) === :Number &&
+                _scalar_valued_predictor(plan, pred) &&
+                delete!(argument_pergroup, pred.name)
+        end
+        for st in upstream
+            names = _assigned_names(st)
+            isempty(names) && continue
+            used = _statement_value_reads!(Set{Symbol}(), st.args[2])
+            isempty(intersect(used, argument_pergroup)) ||
+                union!(argument_pergroup, names)
+        end
+        for st in body[1:end-1]
+            name = _assigned_name(st)
+            name === nothing && throw(ContractValidationError(
+                "[generator] $what have an unrecognized argument statement"))
+            used = _statement_value_reads!(Set{Symbol}(), st.args[2])
+            if !isempty(intersect(used, argument_pergroup))
+                push!(argument_pergroup, name)
+                push!(group_argument_pre, deepcopy(st))
+            else
+                push!(shared_argument_pre, deepcopy(st))
+            end
+        end
+    end
     # The plate zips the per-index values; the cell reads every other input
     # whole by closing over it.
     lanes = Symbol[v for v in inputs if v in pergroup]
@@ -1045,15 +1106,40 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     # its per-index totals; RK evaluates only the plate a query selects. The
     # declared total type also seeds RK's summed plate when the operands'
     # element types are known only at run time (a composed child's output).
-    groupplate(result...) = Expr(:do, Expr(:call, :plate, lanes...),
+    groupplate(statements, result...) = Expr(:do, Expr(:call, :plate, lanes...),
         Expr(:(->), Expr(:tuple, (aliases[v] for v in lanes)...),
-            Expr(:block, LineNumberNode(0, :generator), deepcopy(cell)..., result...)))
+            Expr(:block, LineNumberNode(0, :generator), deepcopy(statements)..., result...)))
     totals = Symbol(pw, :_totals)
-    return Expr[
-        :($pw = $(groupplate(Expr(:call, GlobalRef(Base, :identity), group)))),
-        :($totals = $(groupplate(:(_ppl_group_total::Float64 = sum($group)),
+    result = Expr[
+        :($pw = $(groupplate(cell, Expr(:call, GlobalRef(Base, :identity), group)))),
+        :($totals = $(groupplate(cell, :(_ppl_group_total::Float64 = sum($group)),
             :_ppl_group_total))),
         :($node::Float64 = sum($totals))]
+    if arguments !== nothing
+        location, scale = arguments
+        grouped(x) = x isa Symbol && x in argument_pergroup
+        append!(result, shared_argument_pre)
+        location_grouped, scale_grouped = grouped(location), grouped(scale)
+        if location_grouped || scale_grouped
+            argument_cell = Expr[_hsubst(st, aliases) for st in group_argument_pre]
+            _cell_value_types!(argument_cell, Set{Symbol}(aliases[v] for v in lanes))
+            loc = _hsubst(location, aliases)
+            sc = _hsubst(scale, aliases)
+            value = location_grouped && scale_grouped ?
+                :((location = $loc, scale = $sc)) : location_grouped ? loc : sc
+            grouped_node = Symbol(argument_node, :_groups)
+            push!(result, :($grouped_node = $(groupplate(argument_cell, value))))
+            project(field) = :(plate($grouped_node) do argument
+                getproperty(argument, $(QuoteNode(field)))
+            end)
+            location_grouped && (location = scale_grouped ?
+                project(:location) : grouped_node)
+            scale_grouped && (scale = location_grouped ?
+                project(:scale) : grouped_node)
+        end
+        push!(result, :($argument_node = (location = $location, scale = $scale)))
+    end
+    return result
 end
 
 # The ordinary statements declare array types for values on the response's
