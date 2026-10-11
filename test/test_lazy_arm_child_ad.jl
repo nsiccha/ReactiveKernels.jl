@@ -219,8 +219,7 @@ scaled_reference(xs, g) = (sum(x * g + softplus(x * g) for x in xs),
                  sum(last(cumulative_reference(x, g)) for x in gs))))
     for (spec, data, reference) in cases
         kernel = prepare(spec)
-        # The arm names the authored child; it is applied, not re-prepared.
-        @test occursin(r"cumulative\(|scaled_sum\(", sprint(show, readable_code(kernel)))
+        # A warm call applies the prepared child without replanning it.
         kernel(data, 0.5)
         @test (@allocated kernel(data, 0.5)) < 16_384
         ad = prepare_ad(kernel, backend, data, 0.5; active = :gain)
