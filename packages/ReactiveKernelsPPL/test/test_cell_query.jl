@@ -43,6 +43,9 @@ end
 _cq_central(f, u, j; h = 1e-6) =
     (f(setindex!(copy(u), u[j] + h, j)) - f(setindex!(copy(u), u[j] - h, j))) / (2h)
 
+_cq_direct_compact_value(q, base, active, indices, cell) =
+    q(ReactiveKernelsPPL._CompactCellPoint(base, active, indices), cell)
+
 @testset "cell query: one group of an @plate for loop" begin
     data = _cq_grouped_data()
     bound, built = _cq_bound(_CQ_GROUPED, data, (:y,))
@@ -94,6 +97,18 @@ _cq_central(f, u, j; h = 1e-6) =
         @test compact_gradient ≈ full_gradient[indices]
         @test base == u
         @test active == overlaid[indices]
+        if i == 1
+            # BRM's direct-Enzyme workaround differentiates the compact η
+            # vector and then evaluates the cell again for its value.
+            direct_gradient = zeros(length(active))
+            Enzyme.autodiff(Enzyme.set_runtime_activity(Enzyme.Reverse),
+                _cq_direct_compact_value, Enzyme.Active, Enzyme.Const(q),
+                Enzyme.Const(base), Enzyme.Duplicated(active, direct_gradient),
+                Enzyme.Const(indices), Enzyme.Const(i))
+            direct_value = _cq_direct_compact_value(q, base, active, indices, i)
+            @test compact_value ≈ direct_value
+            @test compact_gradient ≈ direct_gradient
+        end
     end
     @test_throws ReactiveKernelsPPL.ContractValidationError cell_value_and_gradient!(
         compact, zeros(2), u, zeros(2), [2, 2], 1)
