@@ -235,15 +235,9 @@ end
         for i in (1, 5, 9)
             _PCO_LIVE[] = 0
             value = q(fx.u, i)
-            if kind === :cell_observations
-                # An in-cell observation's computed argument reaches its cell
-                # through a range selection, so the query runs the argument's
-                # plate at every index on main 1169aec3, shared or not
-                # (snag prepare-cell-que-30f4f1bf).
-                @test_broken _PCO_LIVE[] == 2
-            else
-                @test _PCO_LIVE[] == 2
-            end
+            # The selected argument now composes into the observation cell
+            # after its range spelling is normalized (d612f24c).
+            @test _PCO_LIVE[] == 2
             @test value ≈ sum(pointwise.y1[i]) + sum(pointwise.y2[i]) rtol = 1e-12
         end
         sampler = prepare_cell_sampler(fx.built, fx.bound, (:y1, :y2), fx.u;
