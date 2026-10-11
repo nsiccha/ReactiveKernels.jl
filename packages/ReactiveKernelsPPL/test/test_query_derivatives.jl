@@ -197,6 +197,122 @@ end
     @test pobs.y.scale ≈ exp(pu[_qd_index(plate.built.layout, :sigma)])
 end
 
+@testset "ragged plate observation arguments and colored pushforwards" begin
+    data = Dict(:y => [[0.4, 0.7], Float64[], [1.1]],
+        :x => [[0.5, 1.5], Float64[], [2.0]], :dose => [1.0, 0.8, 1.2])
+    ast = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        @plate for i in eachindex(y)
+            m = a .+ b .* x[i]
+            y[i] .~ Normal.(m, sigma)
+        end
+    end
+    fx = _qd_build(ast, data)
+    u = unconstrain(fx.built.layout, (; a = 0.2, b = -0.3, sigma = 0.8))
+    obs = Base.invokelatest(prepare_query(fx.built, fx.bound, :observations), u)
+    expected_location = [0.2 .- 0.3 .* x for x in data[:x]]
+    @test keys(obs) == (:y,)
+    @test all(isapprox.(obs.y.location, expected_location))
+    @test obs.y.scale ≈ 0.8
+    pw = Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), u)
+    @test all(isapprox.(pw.y, [logpdf.(Normal.(m, 0.8), y)
+        for (m, y) in zip(expected_location, data[:y])]))
+
+    db = _qd_unit(length(u), _qd_index(fx.built.layout, :b))
+    ds = _qd_unit(length(u), _qd_index(fx.built.layout, :sigma))
+    j = prepare_query_ad(prepare_ad_pushforward, fx.built, fx.bound, :observations,
+        _QD_FORWARD, (db, ds), u)
+    value, (by_b, by_sigma) = ad_value_and_pushforward(j, (db, ds), u)
+    @test all(isapprox.(value.y.location, expected_location))
+    @test all(isapprox.(by_b.y.location, data[:x]))
+    @test by_b.y.scale ≈ 0.0
+    @test all(isapprox.(by_sigma.y.location, [zeros(length(x)) for x in data[:x]]))
+    @test by_sigma.y.scale ≈ 0.8
+
+    # An indexed number stays one scale per group; an indexed array keeps
+    # each group's observation order and shape.
+    for (scale, expected) in (
+            (:(dose[i] * sigma), [0.8 * d for d in data[:dose]]),
+            (:(sigma .* exp.(b .* x[i])), [0.8 .* exp.(-0.3 .* x) for x in data[:x]]))
+        group_ast = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            sigma ~ Exponential(1)
+            @plate for i in eachindex(y)
+                y[i] .~ Normal.(a .+ b .* x[i], $scale)
+            end
+        end
+        group = _qd_build(group_ast, data)
+        v = unconstrain(group.built.layout, (; a = 0.2, b = -0.3, sigma = 0.8))
+        got = Base.invokelatest(prepare_query(group.built, group.bound, :observations), v)
+        @test all(isapprox.(got.y.location, expected_location))
+        @test all(isapprox.(got.y.scale, expected))
+        direction = _qd_unit(length(v), _qd_index(group.built.layout, :sigma))
+        qj = prepare_query_ad(prepare_ad_pushforward, group.built, group.bound,
+            :observations, _QD_FORWARD, (direction,), v)
+        _, (pushforward,) = ad_value_and_pushforward(qj, (direction,), v)
+        @test all(isapprox.(pushforward.y.scale, expected))
+        empty_group = _qd_build(group_ast,
+            Dict(:y => Vector{Float64}[], :x => Vector{Float64}[], :dose => Float64[]))
+        empty_v = unconstrain(empty_group.built.layout,
+            (; a = 0.2, b = -0.3, sigma = 0.8))
+        empty_got = Base.invokelatest(
+            prepare_query(empty_group.built, empty_group.bound, :observations), empty_v)
+        @test isempty(empty_got.y.location)
+        @test isempty(empty_got.y.scale)
+    end
+
+    for law in (:(StudentT.(4.0, m, sigma)), :(LogNormal.(m, sigma)))
+        family_ast = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            sigma ~ Exponential(1)
+            @plate for i in eachindex(y)
+                m = a .+ b .* x[i]
+                y[i] .~ $law
+            end
+        end
+        family = _qd_build(family_ast, data)
+        v = unconstrain(family.built.layout, (; a = 0.2, b = -0.3, sigma = 0.8))
+        got = Base.invokelatest(prepare_query(family.built, family.bound, :observations), v)
+        @test all(isapprox.(got.y.location, expected_location))
+        @test got.y.scale ≈ 0.8
+    end
+
+    shared_ast = quote
+        a ~ Normal(0, 1)
+        sigma ~ Exponential(1)
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(a, sigma)
+        end
+    end
+    shared = _qd_build(shared_ast, Dict(:y => data[:y]))
+    shared_u = unconstrain(shared.built.layout, (; a = 0.2, sigma = 0.8))
+    shared_obs = Base.invokelatest(
+        prepare_query(shared.built, shared.bound, :observations), shared_u)
+    @test shared_obs.y.location ≈ 0.2
+    @test shared_obs.y.scale ≈ 0.8
+
+    # More groups retain the same RK plate structure in the argument query.
+    larger_data = Dict(k => vcat(v, v, v) for (k, v) in data)
+    larger = _qd_build(ast, larger_data)
+    argument_structure(f) = [(e.kind, e.depth) for e in recipe_inventory(
+        prepare_query(f.built, f.bound, :observations)) if e.kind !== :ordinary]
+    @test (:plate, 0) in argument_structure(fx)
+    @test argument_structure(fx) == argument_structure(larger)
+
+    empty_data = Dict(:y => Vector{Float64}[], :x => Vector{Float64}[],
+        :dose => Float64[])
+    empty = _qd_build(ast, empty_data)
+    empty_u = unconstrain(empty.built.layout, (; a = 0.2, b = -0.3, sigma = 0.8))
+    empty_obs = Base.invokelatest(
+        prepare_query(empty.built, empty.bound, :observations), empty_u)
+    @test isempty(empty_obs.y.location)
+    @test empty_obs.y.scale ≈ 0.8
+end
+
 @testset "observation arguments beyond location-scale families" begin
     data = Dict(:y => [isodd(i) for i in 1:8], :x => [0.3i - 1 for i in 1:8])
     plan = lower_rkppl(quote
