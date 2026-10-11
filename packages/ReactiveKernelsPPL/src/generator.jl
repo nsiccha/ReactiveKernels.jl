@@ -358,6 +358,18 @@ function _assignment_statements(plan::StructuralPlan;
     for d in plan.derived
         by_name[d.name] = d
     end
+    # A selected argument plate always produces a vector, even when its
+    # private name has no declared type. Give a directly used scale column
+    # the same axis declaration as its scale use below, so the latter is an
+    # alias and a cell query can compose the producer into its observation.
+    selected_scales = Dict{Symbol,Symbol}()
+    for r in plan.responses
+        s = r.scale
+        s isa ScalePredictorRef && s.link === IdentityLink || continue
+        pred = _predictor(plan, s.predictor)
+        _selected_cell_value(plan, r, pred.name) || continue
+        selected_scales[only(only(pred.terms).columns)] = _predictor_value_type(plan, pred)
+    end
     # Data definitions needed at bind (including reduced scales) were
     # evaluated once and arrive as data arguments; the kernel never recomputes them.
     computed = _bound_module_data_names(plan)
@@ -385,6 +397,9 @@ function _assignment_statements(plan::StructuralPlan;
                 _split_data_calls!(stmts, name, ex, dataonly), plan, dataonly)
         end
         lhs = length(targets) == 1 && targets[1] === name ? name : Expr(:tuple, targets...)
+        if lhs isa Symbol && haskey(selected_scales, lhs)
+            lhs = Expr(:(::), lhs, selected_scales[lhs])
+        end
         push!(stmts, :($(lhs) = $(ex)))
     end
     return stmts

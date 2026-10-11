@@ -1045,6 +1045,9 @@ struct _BoundEntry
 end
 
 function _bound_entry(p::Plan, @nospecialize(ports))
+    # Keep a cell's single-use argument producer inside the cell before bound
+    # specialization can split a guarded producer into materialized arms.
+    p = _fuse_authored_plate_chains(p; cells_only = true)
     boundary = _partial_boundary(p, collect(Value, _astuple(ports)))
     prefix = isempty(boundary.constants) ? nothing :
              prepare(_partial_prefix_plan(p, boundary))

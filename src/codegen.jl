@@ -1395,7 +1395,7 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
            producer.cost + consumer.cost, nothing, false, consumer.source)
 end
 
-function _fuse_authored_plate_chains(p::Plan)
+function _fuse_authored_plate_chains(p::Plan; cells_only = false)
     recipes = Union{Nothing,Recipe}[p.recipes...]
     boundary = Set(canon_id(p.graph, v.id) for v in (p.have..., p.want...))
     changed = false
@@ -1420,6 +1420,7 @@ function _fuse_authored_plate_chains(p::Plan)
         found === nothing && continue
         cid, consumers = found
         length(consumers) == 1 || continue
+        cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellOp) && continue
         composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
         composed === nothing && continue
         recipes[only(consumers)] = composed
@@ -5012,6 +5013,10 @@ also retain their materialization boundary.
 """
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
     p = _kernel_error_policy(p, on_error)
+    # Compose cell-only producers before bound specialization can partition a
+    # guarded plate into arms and materialize its other cells. Other plate
+    # chains keep their usual post-specialization fusion.
+    bound === () || (p = _fuse_authored_plate_chains(p; cells_only = true))
     p = _partial_apply(p, bound)
     lowered_plan = _fuse_authored_plate_chains(p)
     native_ast, ops, recipes = _lower_with_ops(lowered_plan)

@@ -362,3 +362,31 @@ end
     end
     @test d == data(7)
 end
+
+const _CELL_GUARD_CALLS = Ref(0)
+_cell_guard_value(x, scale) = (_CELL_GUARD_CALLS[] += 1; x * scale)
+
+@kernel _cell_guarded_chain(x, present, y, scale::Float64) = begin
+    loc = plate(x, present) do xi, keep
+        keep ? _cell_guard_value(xi, scale) : 0.0
+    end
+    density = plate(loc, y, present) do li, yi, keep
+        keep ? -(yi - li)^2 / 2 : 0.0
+    end
+    return sum(density)
+end
+
+@testset "plate_cell: a bound presence guard stays inside the queried cell" begin
+    x = collect(range(0.2, 1.0; length = 9))
+    y = x .+ 0.1
+    present = trues(length(x))
+    present[3] = false
+    spec = plate_cell(_cell_guarded_chain, :density; index = :i)
+    p = plan(spec; have = (:x, :present, :y, :scale, :i), want = :density_cell)
+    k = prepare(p; bound = (p.have[1] => x, p.have[2] => present, p.have[3] => y))
+    for i in (1, 3, 5, 9)
+        _CELL_GUARD_CALLS[] = 0
+        @test k(0.7, i) ≈ (present[i] ? -(y[i] - 0.7x[i])^2 / 2 : 0.0)
+        @test _CELL_GUARD_CALLS[] == (present[i] ? 1 : 0)
+    end
+end
