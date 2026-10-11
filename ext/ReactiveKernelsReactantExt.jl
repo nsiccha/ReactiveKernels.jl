@@ -1151,9 +1151,8 @@ const _RKScalarIndex = Union{Integer,Reactant.TracedRNumber{<:Integer}}
 # would reach reads Reactant cannot trace yet: a gather at a traced index
 # (`Base.reindex`), a nested broadcast (`benchmark/reactant_subarray_broadcast_reindex.jl`)
 # and concatenation by scalar indexing.
-@inline ReactiveKernels._tensorized_view(
-    array::Reactant.TracedRArray{T,1}, range::AbstractUnitRange) where {T} =
-    array[range]
+@inline ReactiveKernels._tensorized_view(array::Reactant.TracedRArray, indices...) =
+    array[indices...]
 @inline _rk_gather(array::Reactant.TracedRArray, indices) =
     Reactant.@allowscalar array[map(_rk_int_index, indices)...]
 
