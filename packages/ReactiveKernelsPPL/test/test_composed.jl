@@ -134,10 +134,10 @@ end
         eta = ga .* mid
         y .~ Bernoulli.(logistic.(eta))
     end, (:y, :xs); conditioned = (:y, :xs))
-    @test [p.name for p in plan.predictors] == [:eta]
-    @test [(d.name, d.expr) for d in plan.derived if d.name in (:th, :mid)] ==
-        [(:th, :(a_th .+ b_th .* xs)), (:mid, :(be .* th))]
-    @test any(d -> d.expr == :(ga .* mid), plan.derived)
+    # `eta` reads only values, so it is one too, read by the location.
+    @test [p.name for p in plan.predictors] == [:y_eta]
+    @test [(d.name, d.expr) for d in plan.derived if d.name in (:th, :mid, :eta)] ==
+        [(:th, :(a_th .+ b_th .* xs)), (:mid, :(be .* th)), (:eta, :(ga .* mid))]
     # A composed root that is also a response location is evaluated once,
     # as in Julia: the other use reads it by name rather than inlining a
     # second copy of `be .* th` (user direction on decision `1jrw655`).
@@ -152,10 +152,9 @@ end
         eta2 = ga .* mid
         y2 .~ Bernoulli.(logistic.(eta2))
     end, (:y1, :y2, :xs); conditioned = (:y1, :y2, :xs))
-    @test [p.name for p in shared.predictors] == [:y1_eta, :eta2]
-    @test [(d.name, d.expr) for d in shared.derived if d.name in (:th, :mid)] ==
-        [(:th, :(a_th .+ b_th .* xs)), (:mid, :(be .* th))]
-    @test any(d -> d.expr == :(ga .* mid), shared.derived)
+    @test [p.name for p in shared.predictors] == [:y1_eta, :y2_eta]
+    @test [(d.name, d.expr) for d in shared.derived if d.name in (:th, :mid, :eta2)] ==
+        [(:th, :(a_th .+ b_th .* xs)), (:mid, :(be .* th)), (:eta2, :(ga .* mid))]
 end
 
 @testset "composed data leaves + logistic maps (v3)" begin

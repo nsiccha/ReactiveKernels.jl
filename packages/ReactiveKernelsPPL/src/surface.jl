@@ -1178,6 +1178,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         plate_names, absorbed = Set{Symbol}(),
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
         synth_assigns = AssignmentSpec[],
+        # Definitions whose whole value one extracted column holds
+        # (`_whole_value_terms`); lowering replans them as values.
+        whole_values = Set{Symbol}(),
         negated = Dict{Symbol,Symbol}(),
         leaf_exprs = Dict{Any,Symbol}(),
         # Definitions a reader folded into itself (`_inlined_computed_defs`).
@@ -1386,6 +1389,20 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     if !isempty(retained)
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, retained),
+            shared_defs, array_entries)
+    end
+    # A definition with no coefficient structure (`mu = base .* rise(base)`
+    # over a retained `base`) is one value, not a predictor over a column
+    # extracted from it. Replanned as a retained value, it keeps its
+    # authored name for every reader, as in Julia; the extracted column's
+    # synthesized name never reaches the program. Only names the model's
+    # statements spell replan: a binder the `@plate` desugar generates is
+    # fresh on every lowering.
+    whole = Set{Symbol}(nm for nm in ctx.whole_values
+        if nm ∉ value_defs && _mentions_symbol(ast, nm))
+    if !isempty(whole)
+        return _lower_rkppl_once(ast, input_data, mod;
+            submodel_scopes, conditioned, value_defs = union(value_defs, whole),
             shared_defs, array_entries)
     end
     # A predictor location inlines the definitions it reads. As in Julia,
@@ -8458,6 +8475,7 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
             link, predictors, pred_idx, coefuse)
     end
     terms, uses = _analyze_predictor(name, ctx.detmap[name], ctx, lhs)
+    _whole_value_terms(terms, ctx) && push!(ctx.whole_values, name)
     _record_coefuses!(coefuse, name, uses, lhs)
     push!(predictors, PredictorSpec(name, link, terms, name))
     pred_idx[name] = length(predictors)
@@ -8596,6 +8614,8 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                 lhs, pred_link, predictors, pred_idx, coefuse)
         end
         terms, uses = _analyze_predictor(pname, ctx.detmap[loc], ctx, lhs)
+        value && !bare && _whole_value_terms(terms, ctx) &&
+            push!(ctx.whole_values, loc)
     elseif loc isa Number
         value && !bare && return _value_location!(lhs, loc, pred_link, ctx,
             predictors, pred_idx; synth)
@@ -10047,6 +10067,16 @@ function _extract_summand(pname, core, sign::Int, ctx)
     nm = _extract_column(pname, e, ctx)
     return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
         Symbol(nm, "_off")), nothing
+end
+
+# Whether a predictor analysis found no coefficient structure: its only
+# term is one column `_extract_column` extracted whole, so the analyzed
+# definition's value is that column.
+function _whole_value_terms(terms, ctx)
+    length(terms) == 1 && only(terms).kind === OffsetTerm || return false
+    columns = only(terms).columns
+    length(columns) == 1 || return false
+    return any(d -> d.name === only(columns), ctx.synth_derived)
 end
 
 function _extract_column(pname, e::Expr, ctx)
