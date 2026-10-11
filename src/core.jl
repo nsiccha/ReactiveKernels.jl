@@ -334,11 +334,11 @@ end
 # Typed conversion at the compiler boundary keeps Base.trunc semantics in
 # native execution. Tracing extensions can preserve already-integer values.
 @inline _tensorized_trunc(::Type{T}, x) where {T<:Integer} = trunc(T, x)
-# A read-only block of a packed vector (a generated model's parameter block):
-# native execution reads the coordinates in place.  A tracing extension may
-# return the slice instead, the same values, where its views do not trace.
-@inline _tensorized_view(array::AbstractVector, range::AbstractUnitRange) =
-    view(array, range)
+# A read-only block of an array (a generated model's parameter block of the
+# packed vector, a column of a product): native execution reads the entries in
+# place.  A tracing extension may return the slice instead, the same values,
+# where its views do not trace.
+@inline _tensorized_view(array::AbstractArray, indices...) = view(array, indices...)
 @inline function _tensorized_setindex(array, value, indices...)
     setindex!(array, value, indices...)
     array
