@@ -12,6 +12,7 @@ include("test_ad_tangent_operators.jl")
 include("test_prepared_callback_ad.jl")
 include("test_lazy_arm_child_ad.jl")
 include("test_ad_retained_outputs.jl")
+include("test_ad_warm.jl")
 
 const TEST_AD_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 

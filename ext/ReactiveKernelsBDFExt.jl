@@ -108,24 +108,35 @@ Base.@noinline function _check(y0, t0, ts, rt, at, mx)
 end
 
 # Ordinary cubic Hermite interpolation is evaluated even at saved endpoints.
-# An equality fast path returning only sol.u would lose an active query time's
-# derivative. This is primal sampling mathematics, not a derivative adapter.
-function _sample(sol, s, rhs, p)
-    left = min(searchsortedlast(sol.t, s), length(sol.t) - 1)
+# An equality fast path returning only the saved states would lose an active
+# query time's derivative. This is primal sampling mathematics, not a
+# derivative adapter. It takes the solution's saved times and states rather
+# than the solution: Julia dispatches a call whose argument is the deeply
+# nested solution type dynamically, which Enzyme differentiates by a separate
+# runtime compile.
+function _sample(saved_t, saved_u, s, rhs, p)
+    left = min(searchsortedlast(saved_t, s), length(saved_t) - 1)
     right = left + 1
-    h = sol.t[right] - sol.t[left]
-    q = (s - sol.t[left]) / h
-    u0, u1 = sol.u[left], sol.u[right]
+    h = saved_t[right] - saved_t[left]
+    q = (s - saved_t[left]) / h
+    u0, u1 = saved_u[left], saved_u[right]
     d0, d1 = similar(u0), similar(u1)
-    rhs(d0, u0, p, sol.t[left])
-    rhs(d1, u1, p, sol.t[right])
+    rhs(d0, u0, p, saved_t[left])
+    rhs(d1, u1, p, saved_t[right])
     h00, h10 = 2q^3 - 3q^2 + 1, q^3 - 2q^2 + q
     h01, h11 = -2q^3 + 3q^2, q^3 - q^2
     h00 .* u0 .+ (h10 * h) .* d0 .+ h01 .* u1 .+ (h11 * h) .* d1
 end
 
-function rk_ode_bdf_tol(f, y0::AbstractVector{<:Real}, t0::Real,
-        ts::AbstractVector{<:Real}, rt::Real, at::Real, mx::Integer, args...)
+# Julia does not specialize on a function or vararg argument that the body only
+# forwards, so without the type parameters `f` and `args` compile as `Function`
+# and `Vararg{Any}`. A caller then reaches this method through a boxed
+# `jl_invoke`, which Enzyme differentiates by its runtime generic path: a
+# separate derivative compile at the first gradient evaluation for every RHS
+# function. Specialized, the call stays static and compiles with its caller.
+function rk_ode_bdf_tol(f::F, y0::AbstractVector{<:Real}, t0::Real,
+        ts::AbstractVector{<:Real}, rt::Real, at::Real, mx::Integer,
+        args::Vararg{Any,N}) where {F,N}
     _check(y0, t0, ts, rt, at, mx)
     p = Float64[t0, last(ts)]
     layout = _pack!(p, args)
@@ -144,10 +155,11 @@ function rk_ode_bdf_tol(f, y0::AbstractVector{<:Real}, t0::Real,
         maxiters = typemax(Int), reltol = rt, abstol = at,
         sensealg = ForwardDiffSensitivity())
     SciMLBase.successful_retcode(sol) || error("native BDF failed: ", sol.retcode)
+    saved_t, saved_u = sol.t, sol.u
     result = Matrix{Float64}(undef, length(ts), length(y0))
     for i in eachindex(ts)
         s = (ts[i] - t0) / (last(ts) - t0)
-        u = _sample(sol, s, rhs, p)
+        u = _sample(saved_t, saved_u, s, rhs, p)
         for j in eachindex(u)
             result[i, j] = u[j]
         end

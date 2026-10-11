@@ -1317,7 +1317,7 @@ _ad_tangents_point(point, tangents::Tuple) =
 function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
                               backend::DifferentiationInterface.AbstractADType,
                               seeds::Tuple, args::Tuple, kwargs::NamedTuple,
-                              active; retain::Tuple = ()) where {O}
+                              active; retain::Tuple = (), warm::Bool = false) where {O}
     _ad_require_backend_packages(backend)
     _ad_require_retaining_backend(backend, retain)
     resolved = _ad_resolve(resolver, args, kwargs)
@@ -1326,18 +1326,48 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
         retain)
     preparation = _ad_operator_preparation(
         op, call, backend, point, seeds, contexts)
-    PreparedADOperator{
+    prepared = PreparedADOperator{
         active_selector,typeof(kernel),typeof(resolver),typeof(call),
         typeof(backend),typeof(preparation),typeof(external_values),O,
     }(kernel, resolver, call, backend, preparation, external_values)
+    warm && _ad_warm!(prepared, point, contexts)
+    prepared
+end
+
+# `warm = true` compiles the prepared gradient for the exemplar's argument
+# types during preparation rather than at its first evaluation. Inferring the
+# call runs a derivative that the backend builds during type inference
+# (Enzyme's, from a generated function) outside the JIT codegen lock a first
+# call holds while it compiles, so other threads keep compiling meanwhile
+# (snag nested-enzyme-co-3b60d53e). One evaluation at a copy of the exemplar
+# then compiles the remaining native callees. It is called through
+# `invokelatest`: a direct call would be inferred, derivative included, while
+# the caller of `prepare_ad` itself compiles, holding that lock. An array
+# point warms the in-place call, any other point the out-of-place one.
+function _ad_warm!(prepared::PreparedADKernel, point::AbstractArray, contexts)
+    gradient = similar(point)
+    Base.code_typed(_ad_prepared_value_and_gradient!, Tuple{
+        typeof(prepared),typeof(gradient),typeof(point),typeof(contexts)})
+    Base.invokelatest(_ad_prepared_value_and_gradient!,
+        prepared, gradient, copy(point), contexts)
+    nothing
+end
+
+function _ad_warm!(prepared::PreparedADKernel, point, contexts)
+    Base.code_typed(_ad_prepared_value_and_gradient,
+        Tuple{typeof(prepared),typeof(point),typeof(contexts)})
+    Base.invokelatest(_ad_prepared_value_and_gradient,
+        prepared, deepcopy(point), contexts)
+    nothing
 end
 
 # Only a gradient retains further WANT values from its primal sweep.
 _prepare_ad(kernel::_ADKernel, resolver,
             backend::DifferentiationInterface.AbstractADType,
-            args::Tuple, kwargs::NamedTuple, active; retain::Tuple = ()) =
+            args::Tuple, kwargs::NamedTuple, active; retain::Tuple = (),
+            warm::Bool = false) =
     _prepare_ad_operator(Val(:gradient), kernel, resolver, backend, (),
-                         args, kwargs, active; retain)
+                         args, kwargs, active; retain, warm)
 
 _prepare_ad_pullback(kernel::_ADKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
@@ -1362,7 +1392,7 @@ function _prepare_ad_tangent_operator(op::Val, kernel::_ADKernel, resolver,
 end
 
 """
-    prepare_ad(spec, backend, args...; active, want, bound=(;), retain=(), kwargs...) -> PreparedADKernel
+    prepare_ad(spec, backend, args...; active, want, bound=(;), retain=(), warm=false, kwargs...) -> PreparedADKernel
 
 Prepare a reusable DifferentiationInterface gradient of the explicit scalar
 `want` port in a [`KernelSpec`](@ref). `active` names one selected HAVE port or
@@ -1398,18 +1428,26 @@ are passed to the backend as hidden `Constant` contexts rather than captured in
 the differentiated callable; this does not change the public HAVE boundary.
 Bound views cross as owning copies with identical contents, since a
 prebuilt view operand defeats reverse-mode static activity analysis.
+
+`warm = true` compiles the gradient during preparation for the exemplar's
+argument types, so evaluations with those types run compiled code. It infers
+the prepared call, which builds a backend derivative compiled during type
+inference (`AutoEnzyme`) without stalling JIT compilation on other threads,
+then evaluates the gradient once at a copy of the exemplar. An array active
+input warms [`ad_value_and_gradient!`](@ref); any other warms
+[`ad_value_and_gradient`](@ref). The default compiles at the first evaluation.
 """
 function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, want, bound = NamedTuple(),
-                    retain::Tuple = (), kwargs...)
+                    retain::Tuple = (), warm::Bool = false, kwargs...)
     kernel, resolver, keywords =
         _ad_spec_boundary(spec, want, bound, kwargs; retain)
-    _prepare_ad(kernel, resolver, backend, args, keywords, active; retain)
+    _prepare_ad(kernel, resolver, backend, args, keywords, active; retain, warm)
 end
 
 """
-    prepare_ad(kernel, backend, args...; active, retain=()) -> PreparedADKernel
+    prepare_ad(kernel, backend, args...; active, retain=(), warm=false) -> PreparedADKernel
 
 Prepare a reusable gradient for a low-level [`PreparedKernel`](@ref) whose
 boundary is already fully selected. Such kernels accept only their positional
@@ -1417,6 +1455,8 @@ HAVE values and must expose exactly one scalar WANT. `active` may be one port
 identifier or an ordered tuple of identifiers. With `retain`, the kernel's
 WANT ports are the scalar objective plus the retained ports named there, whose
 values the gradient's primal sweep returns (see the `KernelSpec` method).
+`warm = true` compiles the gradient during preparation, as for the `KernelSpec`
+method.
 
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
@@ -1425,13 +1465,14 @@ fails loudly naming the missing `using`.
 """
 function prepare_ad(kernel::PreparedKernel,
                     backend::DifferentiationInterface.AbstractADType,
-                    args...; active, retain::Tuple = (), kwargs...)
+                    args...; active, retain::Tuple = (), warm::Bool = false,
+                    kwargs...)
     keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    _prepare_ad(kernel, tuple, backend, args, keywords, active; retain)
+    _prepare_ad(kernel, tuple, backend, args, keywords, active; retain, warm)
 end
 
 """
-    prepare_ad(kernel, backend, args...; active) -> PreparedADKernel
+    prepare_ad(kernel, backend, args...; active, warm=false) -> PreparedADKernel
 
 Prepare a reusable gradient for a low-level [`NonAllocatingKernel`](@ref)
 whose boundary is already fully selected. Such kernels accept only their
@@ -1457,6 +1498,8 @@ Forward-mode backends that push dual numbers through the differentiated
 arguments (e.g. `AutoForwardDiff`) are not supported: the cache slots cannot
 carry duals, and preparation fails loudly inside the backend. Reverse-mode
 (`AutoEnzyme`) and primal-call-based (finite-difference) backends work.
+`warm = true` compiles the gradient during preparation, as for the `KernelSpec`
+method.
 
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
@@ -1465,9 +1508,10 @@ fails loudly naming the missing `using`.
 """
 function prepare_ad(kernel::NonAllocatingKernel,
                     backend::DifferentiationInterface.AbstractADType,
-                    args...; active, retain::Tuple = (), kwargs...)
+                    args...; active, retain::Tuple = (), warm::Bool = false,
+                    kwargs...)
     keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    _prepare_ad(kernel, tuple, backend, args, keywords, active; retain)
+    _prepare_ad(kernel, tuple, backend, args, keywords, active; retain, warm)
 end
 
 # A batched gradient callable owns the scalar AD preparation plus the same

@@ -179,7 +179,7 @@ struct SamplerQuery{K,P,L}
 end
 
 """
-    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = ()) -> SamplerQuery
+    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false) -> SamplerQuery
 
 Prepare a reusable [`SamplerQuery`](@ref): the `:sampler`-cut value kernel
 plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
@@ -197,9 +197,13 @@ fails loudly naming the missing `using`.
 [`sampler_value_gradient_and_retained!`](@ref), with no second primal pass.
 It needs a backend that keeps that sweep's values (reverse-mode
 `AutoEnzyme`; see `ReactiveKernels.ad_retains_primal_sweep`).
+
+`warm = true` compiles the gradient during preparation (`prepare_ad`'s `warm`),
+so [`sampler_value_and_gradient!`](@ref) with a `Vector{Float64}` point runs
+compiled code from its first call.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
-        backend, on_error = nothing, retain::Tuple = ())
+        backend, on_error = nothing, retain::Tuple = (), warm::Bool = false)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
@@ -212,7 +216,7 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
             (workflow_wants(:sampler), wants...); on_error), wants
     end
     prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
-        Vector{Float64}(u0); active = :unconstrained, retain = wants)
+        Vector{Float64}(u0); active = :unconstrained, retain = wants, warm)
     return SamplerQuery(kern, prep, layout)
 end
 
