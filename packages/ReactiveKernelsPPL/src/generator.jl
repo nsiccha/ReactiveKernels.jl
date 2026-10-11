@@ -1124,7 +1124,9 @@ _ppl_range_values(x::AbstractArray, indices) = x[indices]
 
 # A selected plate column already holds one value per selected response cell
 # (`_selected_plate_indices`); only whole operands are gathered at the
-# authored indices. Positions and indices differ for a literal `a:b`.
+# authored indices. Positions and indices differ for a literal `a:b`. Read
+# without a gather, the observation plate consumes the column's plate
+# directly, so a cell query composes it and runs only that cell.
 function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
     i = findfirst(p -> p.name === value, plan.predictors)
     i === nothing && return false
@@ -1132,7 +1134,8 @@ function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Sy
     p.link === IdentityLink && length(p.terms) == 1 &&
         p.terms[1].kind === OffsetTerm || return false
     d = findfirst(d -> d.name === only(p.terms[1].columns), plan.derived)
-    return d !== nothing && _selected_plate_indices(plan.derived[d].expr) == r.range.args[2]
+    return d !== nothing && _authored_spelling(
+        _selected_plate_indices(plan.derived[d].expr)) == r.range.args[2]
 end
 
 function _ranged_response_stmts(r, plan, stmts)

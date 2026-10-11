@@ -135,6 +135,75 @@ end
     @test [only_z(u, i) for i in eachindex(z)] ≈ pointwise.z
 end
 
+# An observation in an `@plate for` cell whose argument the cell computes
+# (`m = f(w[i], la[i])`) reads that argument's plate at the cell's own index,
+# so a cell query composes the plate and calls `f` once per observation (snag
+# `prepare-cell-que-30f4f1bf`: the plate iterated the resolved
+# `Base.eachindex(y1)`, the response range kept `eachindex(y1)`, and a whole
+# gather between them ran the plate at every index).
+const _CQ_CALLS = Ref(0)
+_cq_scaled(w, rate) = (_CQ_CALLS[] += 1; w * exp(rate))
+
+@testset "cell query: an in-cell observation's computed argument runs at that cell" begin
+    n = 9
+    w = collect(range(0.3, 1.1; length = n))
+    x = collect(range(-0.4, 0.6; length = n))
+    data = (; w, x, y1 = w .+ 0.1, y2 = 2 .* w)
+    u = [0.2, 0.1]
+    m = w .* exp.(u[1] .+ x)
+    s = exp(u[2])
+    one_observation(iterator) = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        la = a .+ x
+        @plate for i in $iterator
+            m = _cq_scaled(w[i], la[i])
+            y1[i] ~ Normal(m, s)
+        end
+        y2 .~ Normal.(2 .* w, s)
+    end
+    two_observations = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1.0)
+        la = a .+ x
+        @plate for i in eachindex(y1)
+            m = _cq_scaled(w[i], la[i])
+            y1[i] ~ Normal(m, s)
+            y2[i] ~ Normal(2 * m, s)
+        end
+    end
+    y1_density(i) = logpdf(Normal(m[i], s), data.y1[i])
+    y2_density(i) = logpdf(Normal(2 * m[i], s), data.y2[i])
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for (ast, observations, calls, density) in (
+            (one_observation(:(eachindex(y1))), (:y1,), 1, y1_density),
+            (one_observation(:(axes(y1, 1))), (:y1,), 1, y1_density),
+            (two_observations, (:y1,), 1, y1_density),
+            # Each observation's argument has its own plate: one call each.
+            (two_observations, (:y1, :y2), 2, i -> y1_density(i) + y2_density(i)))
+        bound, built = _cq_bound(ast, data, (:y1, :y2))
+        pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        q = prepare_cell_query(built, bound, observations)
+        cells = [q(u, i) for i in 1:n]
+        @test cells ≈ [density(i) for i in 1:n] rtol = 1e-12
+        @test cells ≈ sum(vec(getfield(pointwise, o)) for o in observations) rtol = 1e-12
+        for i in (1, 5, 9)
+            _CQ_CALLS[] = 0
+            q(u, i)
+            @test _CQ_CALLS[] == calls
+        end
+        sampler = prepare_cell_sampler(built, bound, observations, u; backend)
+        for i in (2, 7)
+            g = similar(u)
+            value, _ = cell_value_and_gradient!(sampler, g, u, i)
+            @test value ≈ cells[i] rtol = 1e-12
+            @test g ≈ [_cq_central(v -> q(v, i), u, j) for j in eachindex(u)] rtol = 1e-6
+        end
+    end
+    @test data.w == collect(range(0.3, 1.1; length = n))
+    @test data.y1 == data.w .+ 0.1
+end
+
 @testset "cell query: refusals" begin
     data = _cq_grouped_data()
     bound, built = _cq_bound(_CQ_GROUPED, data, (:y,))

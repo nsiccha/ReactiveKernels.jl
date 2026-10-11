@@ -2916,6 +2916,15 @@ function _selected_plate_indices(ex)
         inp.args[2] : nothing
 end
 
+# The authored spelling of resolved indices: lowering resolves a plate's
+# iterator in the model module (`Base.eachindex(y)`), while a response range
+# keeps the authored `eachindex(y)`. Base's own names read back bare, so the
+# two spellings of one iterator compare equal.
+_authored_spelling(ex) = ex
+_authored_spelling(ex::GlobalRef) = ex.mod === Base ? ex.name : ex
+_authored_spelling(ex::Expr) =
+    Expr(ex.head, Any[_authored_spelling(a) for a in ex.args]...)
+
 function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
     known = union(_union_names(plan), _vector_value_names(plan),
         Set{Symbol}(d.name for d in plan.derived),
@@ -7360,10 +7369,7 @@ function _bind_plate_extents!(plan::StructuralPlan, columns)
         input in extents && continue
         haskey(columns, input) && _fail(d.name, "internal input $input " *
             "is the plate's cell count — drop it from bind_data")
-        source = it.args[1] == GlobalRef(Base, :eachindex) ?
-            Expr(:call, :eachindex, it.args[2]) :
-            Expr(:call, :axes, it.args[2], it.args[3])
-        n = _value_iterator_length(plan, d.name, source; required = false)
+        n = _value_iterator_length(plan, d.name, _authored_spelling(it); required = false)
         n === nothing && continue
         columns[input] = n
         push!(extents, input)
