@@ -37,6 +37,19 @@ function _bdf_nested_loss(u, rates, gain)
     out[1, 1] + 2out[1, 2] + 3out[2, 1] + 4out[2, 2]
 end
 
+# Method instances a concretely typed call to `name` invokes in the typed IR
+# of `f(types...)`, and how many of its calls dispatch dynamically instead.
+_bdf_target(target::Core.MethodInstance) = target
+_bdf_target(target) = _bdf_target(target.def)
+function _bdf_calls(f, types, name)
+    code = first(only(code_typed(f, types))).code
+    invoked = [_bdf_target(stmt.args[1]).specTypes for stmt in code
+        if Meta.isexpr(stmt, :invoke) && _bdf_target(stmt.args[1]).def.name === name]
+    dynamic = count(stmt -> Meta.isexpr(stmt, :call) &&
+        stmt.args[1] isa GlobalRef && stmt.args[1].name === name, code)
+    invoked, dynamic
+end
+
 @testset "native standard Julia BDF bridge" begin
     @test Base.get_extension(ReactiveKernels, :ReactiveKernelsBDFExt) !== nothing
     @testset "original call shape and independent values" begin
@@ -116,6 +129,20 @@ end
             relative = sqrt(sum(abs2, gradient .- reference) / sum(abs2, reference))
             @test relative < 20tol
         end
+    end
+    @testset "statically dispatched bridge" begin
+        # Enzyme differentiates a boxed `jl_invoke` of a despecialized method,
+        # or a dynamic call, through a separate runtime derivative compile at
+        # the first gradient evaluation (snag nested-enzyme-co-3b60d53e).
+        invoked, dynamic = _bdf_calls(_bdf_nested_loss,
+            (Vector{Float64}, Vector{Float64}, Float64), :rk_ode_bdf_tol)
+        @test dynamic == 0
+        @test !isempty(invoked) && all(Base.isdispatchtuple, invoked)
+        invoked, dynamic = _bdf_calls(rk_ode_bdf_tol, (typeof(_bdf_nested_rhs),
+            Vector{Float64}, Float64, Vector{Float64}, Float64, Float64, Int,
+            Float64, @NamedTuple{rates::Vector{Float64}, order::Vector{Int}}), :_sample)
+        @test dynamic == 0
+        @test all(Base.isdispatchtuple, invoked)
     end
     @testset "prepared native kernel Reverse" begin
         graph = Graph()
