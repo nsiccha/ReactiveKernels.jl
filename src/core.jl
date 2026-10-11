@@ -757,7 +757,7 @@ end
 @inline _tensorized_factorization(factorization) = factorization
 
 # The sequential-scan primitive `scan(xs...; init) do carry, x… end` (shared values
-# captured by the step, or deprecated `Ref(shared)` operands)
+# captured by the step, or `Ref(shared)` operands)
 # lowers to this.  `step` is the prepared 2-`want` step kernel
 # `(carry, x..., shared...) -> (new_carry, output)`; the scan threads `carry`
 # (seeded by `init`) over the `iterated` sequences in lockstep, one element of

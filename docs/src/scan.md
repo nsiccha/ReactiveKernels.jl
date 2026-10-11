@@ -29,22 +29,21 @@ end
 # optional: `history = h₀` appends one do-block argument, the outputs so far
 ```
 
-- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the positional
-  arguments. They are advanced together in **lockstep**: step `t` receives
+- **`xs₁, xs₂, …`** — one or more **iterated sequences**, the bare positional
+  arguments before any trailing `Ref` operands. They are advanced together in
+  **lockstep**: step `t` receives
   `xs₁[t], xs₂[t], …`. With a single sequence this is the ordinary
   `scan(xs; …) do carry, x`. Every iterated sequence must share axes; a length
   mismatch throws `DimensionMismatch`. The sequences may be empty: no step
   runs and `scan` returns an empty vector (see [Empty sequences](#Empty-sequences)).
 - **`init`** — seeds the threaded `carry`. Required keyword.
-- **Shared values** — the step reads enclosing names as a Julia closure does,
-  and closing over a value is how every step shares it. An enclosing name the
-  step reads is captured whole: a `@kernel` signature port, a name the kernel
-  body assigns, or a name of an enclosing plate cell or scan step. Only the
-  positionals are iterated. Do not pass a shared value as a `Ref(...)`
-  positional. Older kernels do, after the iterated sequences. Such an operand
-  prepares the same kernel as the closure, and it is deprecated (user
-  decision `0kvm2ip`): each site warns once at definition under
-  `--depwarn=yes`, and it will become an error.
+- **Shared values** — the step reads enclosing names as a Julia closure does.
+  An enclosing name the step reads is captured whole: a `@kernel` signature
+  port, a name the kernel body assigns, or a name of an enclosing plate cell
+  or scan step. A trailing `Ref(value)` positional with a matching do-block
+  formal also passes the value whole. Bare positionals before it are the
+  iterated sequences; the first positional must be one of those sequences.
+  A `Ref` operand prepares the same kernel as the corresponding capture.
 - **The do-block** receives `(carry, x₁, x₂, …)` and must end with the 2-tuple
   `(new_carry, output)`. `scan` returns the vector `[output₁, output₂, …]` (one
   entry per step); the final carry is internal.
@@ -489,9 +488,9 @@ Native iteration remains an ordinary loop.
 - **The iterated sequences must share axes.** A length mismatch between
   sequences throws `DimensionMismatch`. Empty sequences are supported (see
   [Empty sequences](#Empty-sequences)).
-- **Every positional is iterated.** Shared values are captured, not passed. In
-  older kernels that pass them as `Ref(...)` operands, those must follow the
-  iterated sequences: a bare positional after a `Ref(...)` is rejected.
+- **Bare positionals are iterated.** A shared value may instead be captured or
+  passed as a trailing `Ref(...)` operand. A bare positional after a `Ref(...)`
+  is rejected.
 - **Per-step output is a scalar** on the Reactant `while` path. A non-scalar
   per-step output there is a loud, reported error, never a silent mis-lowering;
   author the output as a scalar (or open an issue for the shape you need).
