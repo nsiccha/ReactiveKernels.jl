@@ -505,6 +505,115 @@ cell_value_and_gradient!(s::CellSampler, g::AbstractVector, u::Vector{Float64}, 
 cell_value_and_gradient!(s::CellSampler, g::AbstractVector, u::AbstractVector, cell::Int) =
     Base.invokelatest(ad_value_and_gradient!, s.ad, g, Vector{Float64}(u), cell)
 
+# A packed point whose selected coordinates come from a compact active vector.
+# The packed base and coordinate selection cross the AD boundary as constants;
+# the graph still contains every model calculation after this selection.
+struct _CompactCellPoint{B<:AbstractVector{Float64},A<:AbstractVector{Float64},I<:AbstractVector{Int}} <: AbstractVector{Float64}
+    base::B
+    active::A
+    indices::I
+end
+
+Base.size(point::_CompactCellPoint) = size(point.base)
+Base.IndexStyle(::Type{<:_CompactCellPoint}) = IndexLinear()
+@inline function Base.getindex(point::_CompactCellPoint, index::Int)
+    @boundscheck checkbounds(point.base, index)
+    slot = searchsortedfirst(point.indices, index)
+    slot <= length(point.indices) && @inbounds(point.indices[slot] == index) ?
+        @inbounds(point.active[slot]) : @inbounds(point.base[index])
+end
+
+@inline _compact_cell_point(base, active, indices) =
+    _CompactCellPoint(base, active, indices)
+
+function _check_compact_cell_indices(base, active, indices, total)
+    length(base) == total || throw(ContractValidationError(
+        "[query] packed base length $(length(base)) ≠ layout total $total"))
+    length(active) == length(indices) || throw(ContractValidationError(
+        "[query] active length $(length(active)) ≠ selection length $(length(indices))"))
+    previous = 0
+    for index in indices
+        previous < index <= total || throw(ContractValidationError(
+            "[query] compact cell indices must be unique, sorted, and within 1:$total"))
+        previous = index
+    end
+    nothing
+end
+
+"""
+    CompactCellSampler
+
+A prepared cell gradient over selected packed coordinates. The packed base point
+is read-only, and the derivative is returned only in the order of `indices`.
+Prepare one sampler per concurrent caller.
+"""
+struct CompactCellSampler{P,L,O}
+    ad::P
+    layout::L
+    observations::O
+end
+
+"""
+    prepare_compact_cell_sampler(built, plan, observations, base0, indices0; backend)
+
+Prepare a cell value and gradient over the sorted, unique packed positions
+`indices0`. At evaluation, the selected positions may change, provided the
+active vector and selection retain the exemplar's type and length. The packed
+base is passed read-only; selected coordinates are supplied separately. This
+keeps the active AD point and gradient proportional to the selected cell's
+coordinates rather than the full layout. With native `AutoEnzyme` Reverse, use
+`Enzyme.set_runtime_activity(Enzyme.Reverse)`: packed reads can select either an
+active coordinate or a constant base coordinate.
+"""
+function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
+        base0::AbstractVector{Float64}, indices0::AbstractVector{Int};
+        backend, on_error = nothing)
+    layout = built.layout::LayoutTable
+    _check_compact_cell_indices(base0, indices0, indices0, layout.total)
+    active0 = base0[indices0]
+    isbound(plan) || throw(ContractValidationError(
+        "[query] prepare_compact_cell_sampler requires a bound plan (bind_data first)"))
+    _check_built_program(built, plan)
+    names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
+    isempty(names) && throw(ContractValidationError(
+        "[query] prepare_compact_cell_sampler needs at least one observation name"))
+    spec, want = _cell_query_spec(built, plan, names)
+    for (name, type) in ((:_ppl_cell_base, AbstractVector{Float64}),
+            (:_ppl_cell_active, AbstractVector{Float64}),
+            (:_ppl_cell_indices, AbstractVector{Int}))
+        haskey(spec.ports, name) && throw(ContractValidationError(
+            "[query] compact cell port `$name` collides with a model port"))
+        spec.ports[name] = value!(spec.graph, name, type)
+        push!(spec.port_order, name)
+    end
+    add!(spec.graph, (spec[:_ppl_cell_base], spec[:_ppl_cell_active],
+        spec[:_ppl_cell_indices]) => spec[:unconstrained], _compact_cell_point)
+    filter!(!=(:unconstrained), spec.have_names)
+    prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_indices])
+    kernel = Base.invokelatest(prepare, spec; have = Tuple(spec.have_names),
+        want, bound = _query_bound(plan), on_error)
+    ad = Base.invokelatest(prepare_ad, kernel, backend, base0, active0, indices0, 1;
+        active = :_ppl_cell_active)
+    CompactCellSampler(ad, layout, names)
+end
+
+"""
+    cell_value_and_gradient!(sampler::CompactCellSampler, gradient, base, active, indices, cell)
+
+Return one cell's density and write only the selected-coordinate gradient.
+`base` and `indices` are not mutated. The active values overlay `base` at the
+sorted positions in `indices`.
+"""
+function cell_value_and_gradient!(sampler::CompactCellSampler, gradient::AbstractVector,
+        base::AbstractVector{Float64}, active::AbstractVector{Float64},
+        indices::AbstractVector{Int}, cell::Int)
+    _check_compact_cell_indices(base, active, indices, sampler.layout.total)
+    length(gradient) == length(active) || throw(ContractValidationError(
+        "[query] compact gradient length $(length(gradient)) ≠ active length $(length(active))"))
+    Base.invokelatest(ad_value_and_gradient!, sampler.ad, gradient,
+        base, active, indices, cell)
+end
+
 function _stack_restored_draws(values)
     value = first(values)
     if value isa NamedTuple

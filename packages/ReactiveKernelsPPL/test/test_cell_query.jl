@@ -66,6 +66,9 @@ _cq_central(f, u, j; h = 1e-6) =
     _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
     names = coordinate_names(built.layout)
     block(i) = findall(n -> startswith(String(n), "Z.$i."), names)
+    compact = prepare_compact_cell_sampler(built, bound, :y, u,
+        sort!([2; block(1)]);
+        backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
     for i in (1, 4)
         g = similar(u)
         value, _ = cell_value_and_gradient!(s, g, u, i)
@@ -75,7 +78,25 @@ _cq_central(f, u, j; h = 1e-6) =
         for j in (2, first(block(i)))
             @test g[j] ≈ _cq_central(x -> q(x, i), u, j) rtol = 1e-5
         end
+        indices = sort!([2; block(i)])
+        base = copy(u)
+        active = u[indices]
+        active[1] += 0.1
+        overlaid = copy(u)
+        overlaid[indices] = active
+        compact_gradient = similar(active)
+        compact_value, returned = cell_value_and_gradient!(
+            compact, compact_gradient, base, active, indices, i)
+        full_gradient = similar(u)
+        full_value, _ = cell_value_and_gradient!(s, full_gradient, overlaid, i)
+        @test compact_value ≈ full_value ≈ q(overlaid, i)
+        @test returned === compact_gradient
+        @test compact_gradient ≈ full_gradient[indices]
+        @test base == u
+        @test active == overlaid[indices]
     end
+    @test_throws ReactiveKernelsPPL.ContractValidationError cell_value_and_gradient!(
+        compact, zeros(2), u, zeros(2), [2, 2], 1)
     # Gradients leave the bound per-group arrays and later values unchanged.
     @test data == _cq_grouped_data()
     @test [q(u, i) for i in eachindex(data.y)] ≈ cells
@@ -97,14 +118,26 @@ end
         uview = view(u, :)
         pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
         q(u, 2); q(uview, 2)
+        names = coordinate_names(built.layout)
+        indices = sort!([2; findall(name -> startswith(String(name), "Z.2."), names)])
+        active = u[indices]
+        compact = prepare_compact_cell_sampler(built, bound, :y, u, indices;
+            backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
+        compact_gradient = similar(active)
+        compact_value, _ = cell_value_and_gradient!(
+            compact, compact_gradient, u, active, indices, 2)
         (; value = q(u, 2), viewed = q(uview, 2),
-           reference = sum(pointwise.y[2]), bytes = (@allocated q(u, 2)),
-           view_bytes = (@allocated q(uview, 2)))
+           reference = sum(pointwise.y[2]), compact_value,
+           bytes = (@allocated q(u, 2)), view_bytes = (@allocated q(uview, 2)),
+           compact_bytes = (@allocated cell_value_and_gradient!(
+               compact, compact_gradient, u, active, indices, 2)))
     end
     @test all(m -> m.value ≈ m.reference, measured)
     @test all(m -> m.viewed ≈ m.reference, measured)
     @test measured[1].bytes == measured[2].bytes
     @test measured[1].view_bytes == measured[2].view_bytes
+    @test all(m -> m.compact_value ≈ m.reference, measured)
+    @test measured[2].compact_bytes <= measured[1].compact_bytes + 1024
 end
 
 @testset "cell query: elementwise and scalar-cell observations" begin
