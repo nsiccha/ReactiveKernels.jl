@@ -540,7 +540,8 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
     function walk(node)
         node isa Expr || return node
         _is_plate_column_expr(node) && return node
-        if node.head in (:call, :ref, :.) && _contains_module_call(node) &&
+        if node.head in (:call, :ref, :.) && !_constructed_endpoint_call(node) &&
+                _contains_module_call(node) &&
                 _expr_value_symbols(node) ⊆ dataonly
             count += 1
             tmp = Symbol(:_ppl_data_, name, :_, count)
@@ -548,7 +549,17 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
             return tmp
         end
         if node.head === :call
-            return Expr(:call, node.args[1], map(walk, node.args[2:end])...)
+            head = node.args[1]
+            if _constructed_endpoint_head(head)
+                constructor = head.args[1]
+                # Owner arguments are value positions. Keep the constructor
+                # itself for RK's endpoint splicer, while folding data-only
+                # helper calls inside its arguments at preparation.
+                owner = Expr(:call, constructor.args[1],
+                    map(walk, constructor.args[2:end])...)
+                head = Expr(:., owner, head.args[2])
+            end
+            return Expr(:call, head, map(walk, node.args[2:end])...)
         elseif node.head === :. && length(node.args) == 2 &&
                 Meta.isexpr(node.args[2], :tuple)
             return Expr(:., node.args[1],

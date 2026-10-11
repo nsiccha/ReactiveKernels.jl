@@ -2712,8 +2712,8 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     head = ex.head
     if head === :call
         fn = ex.args[1]
-        if fn isa GlobalRef
-            # A module function takes whole values (functions as values).
+        if fn isa GlobalRef || _constructed_endpoint_head(fn)
+            # Module functions and constructed endpoints take whole values.
             _collect_opaque_refs!(refs, ex, plan, label, bound)
             return nothing
         end
@@ -2828,6 +2828,11 @@ function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
                                 "module function call")
     if ex.head === :kw && length(ex.args) == 2
         return _collect_opaque_refs!(refs, ex.args[2], plan, label, bound)
+    end
+    if _constructed_endpoint_call(ex)
+        for a in ex.args[1].args[1].args[2:end]
+            _collect_opaque_refs!(refs, a, plan, label, bound)
+        end
     end
     args = ex.head === :call ? ex.args[2:end] : ex.args
     if ex.head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
@@ -6408,6 +6413,15 @@ function _eval_plate_column(ex, lookup, label)
     end for k in 1:n]
 end
 
+_constructed_endpoint_head(ex) =
+    ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
+    Meta.isexpr(ex.args[1], :call) && ex.args[2] isa QuoteNode &&
+    ex.args[2].value isa Symbol
+
+_constructed_endpoint_call(ex) =
+    Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+    _constructed_endpoint_head(ex.args[1])
+
 function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
     if ex isa Symbol
         push!(out, ex)
@@ -6415,6 +6429,11 @@ function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
         if ex.head === :kw && length(ex.args) == 2
             _expr_value_symbols(ex.args[2], out)
         elseif ex.head === :call
+            if !isempty(ex.args) && _constructed_endpoint_head(ex.args[1])
+                for a in ex.args[1].args[1].args[2:end]
+                    _expr_value_symbols(a, out)
+                end
+            end
             for a in ex.args[2:end]
                 _expr_value_symbols(a, out)
             end
@@ -6515,8 +6534,9 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     # A data-only plate column binds only for a bind-time slot (weights, a
     # scale, a dimension or index); otherwise preparation folds it.
     names = Set{Symbol}(nm for (nm, ex) in nodes
-        if nm ∉ resps && ((_contains_module_call(ex) && !_is_plate_column_expr(ex)) ||
-            nm in required) && dataonly(nm, Set{Symbol}()))
+        if nm ∉ resps && !_constructed_endpoint_call(ex) &&
+            ((_contains_module_call(ex) && !_is_plate_column_expr(ex)) ||
+             nm in required) && dataonly(nm, Set{Symbol}()))
     bind_only || return names
     onlydata = union(raw, Set{Symbol}(nm for nm in keys(nodes)
         if dataonly(nm, Set{Symbol}())))
@@ -6815,8 +6835,15 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
         elseif ex.head === :kw && length(ex.args) == 2
             visit(ex.args[2], inside)
         elseif ex.head === :call
+            constructed = _constructed_endpoint_call(ex)
             inner = inside || (!isempty(ex.args) && (ex.args[1] isa GlobalRef ||
-                reductions_whole && ex.args[1] in REDUCTION_FNS))
+                constructed ||
+                (reductions_whole && ex.args[1] in REDUCTION_FNS)))
+            if constructed
+                for a in ex.args[1].args[1].args[2:end]
+                    visit(a, true)
+                end
+            end
             for a in ex.args[2:end]
                 visit(a, inner)
             end
