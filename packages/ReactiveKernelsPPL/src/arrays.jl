@@ -61,6 +61,15 @@ _is_levels_dim(d) = d isa Expr && d.head === :call &&
     length(d.args) in (2, 3) && d.args[1] in (:levels, :unique, :_ppl_axis_values) &&
     d.args[2] isa Symbol && (length(d.args) == 2 || d.args[3] isa QuoteNode)
 _levels_subset(d) = length(d.args) == 2 ? Colon() : d.args[3].value
+# The level source `g` an axis enumerates whole: a label axis
+# (`levels(g)`, `unique(g)`, a data vector) or its positional twin
+# `length(levels(g)) - k`; `nothing` for any other dim. Both read `g` as one
+# pool of values, never one value per observation, so `g` may have any length.
+function _level_pool_source(d)
+    _is_levels_dim(d) && return d.args[2]
+    cnt = _levels_count(d)
+    return cnt === nothing ? nothing : first(cnt)
+end
 _is_axis_dim(d) = d isa Expr && d.head === :call && length(d.args) == 3 &&
     (d.args[1] === :axes || d.args[1] === :size) && d.args[2] isa Symbol &&
     (d.args[3] === 1 || d.args[3] === 2)

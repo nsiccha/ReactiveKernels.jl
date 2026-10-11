@@ -176,3 +176,21 @@ end
         end
     end
 end
+
+@testset "matrix values: column reads of a per-observation product compile" begin
+    # Native column reads are views of the product; compiled tracing reads the
+    # same slices (`ReactiveKernels._tensorized_view`).
+    for n in (1,6), kind in (:named,:alias,:inline,:submodel,:data_matrix,:data_column,:scale)
+        @testset "$kind / $n" begin
+            case=_ma_column_case(kind,n)
+            original=deepcopy(case.data)
+            plan=lower_rkppl(case.ast,Set(keys(case.data));
+                conditioned=(:y1,:y2),mod=@__MODULE__)
+            bound=bind_data(plan,case.data)
+            built=build_kernel(bound)
+            u=[0.2sin(i) for i in 1:built.layout.total]
+            _ma_compiled_check(bound,built,u,w->case.oracle(built.layout,w))
+            @test isequal(case.data,original)
+        end
+    end
+end

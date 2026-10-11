@@ -2241,7 +2241,8 @@ function _label_only_columns(plan::StructuralPlan)
             for f in fieldnames(ArrayParameter)
                 if f === :dims
                     for d in x.dims
-                        _is_levels_dim(d) ? push!(labels, d.args[2]) : visit(d)
+                        g = _level_pool_source(d)
+                        g === nothing ? visit(d) : push!(labels, g)
                     end
                 else
                     visit(getfield(x, f))
@@ -2915,6 +2916,15 @@ function _selected_plate_indices(ex)
     return Meta.isexpr(inp, :call, 2) && inp.args[1] == GlobalRef(Base, :collect) ?
         inp.args[2] : nothing
 end
+
+# The authored spelling of resolved indices: lowering resolves a plate's
+# iterator in the model module (`Base.eachindex(y)`), while a response range
+# keeps the authored `eachindex(y)`. Base's own names read back bare, so the
+# two spellings of one iterator compare equal.
+_authored_spelling(ex) = ex
+_authored_spelling(ex::GlobalRef) = ex.mod === Base ? ex.name : ex
+_authored_spelling(ex::Expr) =
+    Expr(ex.head, Any[_authored_spelling(a) for a in ex.args]...)
 
 function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
     known = union(_union_names(plan), _vector_value_names(plan),
@@ -6341,6 +6351,63 @@ end
 
 # Plan names an expression reads (call heads, keyword names and function
 # values are not reads).
+# The names a definition reads. A plate column reads its inputs and the
+# values its cell captures, not its cell's own arguments and locals.
+_definition_reads(ex) = _is_plate_column_expr(ex) ? _plate_column_reads(ex) :
+    _expr_value_symbols(ex)
+function _plate_column_reads(ex)
+    call, lam = ex.args
+    reads = Set{Symbol}()
+    foreach(a -> _expr_value_symbols(a, reads), call.args[2:end])
+    formals = Meta.isexpr(lam.args[1], :tuple) ? lam.args[1].args : Any[lam.args[1]]
+    cell = Set{Symbol}(f for f in formals if f isa Symbol)
+    body = Meta.isexpr(lam.args[2], :block) ? lam.args[2].args : Any[lam.args[2]]
+    for st in body
+        st isa LineNumberNode && continue
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+            union!(reads, setdiff(_expr_value_symbols(st.args[2]), cell))
+            push!(cell, st.args[1])
+        else
+            union!(reads, setdiff(_expr_value_symbols(st), cell))
+        end
+    end
+    return reads
+end
+
+# One lane value of a plate input at cell `k`: a `Ref` is shared by every cell.
+_plate_lane_value(lane::Base.RefValue, k) = lane[]
+_plate_lane_value(lane, k) = lane[k]
+
+# A data-only plate column at binding: the cell, once per index, over the
+# zipped inputs (`plate(lanes...) do args...; cell; end`).
+function _eval_plate_column(ex, lookup, label)
+    call, lam = ex.args
+    lanes = Any[_eval_value_expr(a, lookup, label) for a in call.args[2:end]]
+    zipped = filter(l -> !(l isa Base.RefValue), lanes)
+    isempty(zipped) && throw(ContractValidationError(
+        "[bind] $label: a plate column needs a per-index input"))
+    n = length(first(zipped))
+    all(l -> length(l) == n, zipped) || throw(ContractValidationError(
+        "[bind] $label: plate inputs differ in length"))
+    formals = Meta.isexpr(lam.args[1], :tuple) ? lam.args[1].args : Any[lam.args[1]]
+    body = Meta.isexpr(lam.args[2], :block) ? lam.args[2].args : Any[lam.args[2]]
+    return [begin
+        cell = Dict{Symbol,Any}(f => _plate_lane_value(lane, k)
+            for (f, lane) in zip(formals, lanes))
+        read(nm) = haskey(cell, nm) ? cell[nm] : lookup(nm)
+        value = nothing
+        for st in body
+            st isa LineNumberNode && continue
+            if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+                cell[st.args[1]] = _eval_value_expr(st.args[2], read, label)
+            else
+                value = _eval_value_expr(st, read, label)
+            end
+        end
+        value
+    end for k in 1:n]
+end
+
 function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
     if ex isa Symbol
         push!(out, ex)
@@ -6380,7 +6447,8 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         scale isa Symbol && push!(required, scale)
     end
     for p in plan.array_parameters, d in p.dims
-        _is_levels_dim(d) && push!(required, d.args[2])
+        g = _level_pool_source(d)
+        g === nothing || push!(required, g)
     end
     for p in plan.vector_parameters
         p.extent_expr === nothing || union!(required, _expr_value_symbols(p.extent_expr))
@@ -6420,7 +6488,7 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         push!(active, nm)
         ok = all(s -> s in raw || (unbound && s ∉ known) ||
                 (haskey(nodes, s) && dataonly(s, active)),
-            _expr_value_symbols(nodes[nm]))
+            _definition_reads(nodes[nm]))
         delete!(active, nm)
         memo[nm] = ok
         return ok
@@ -6440,13 +6508,15 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     end
     foreach(gather_indices, values(nodes))
     for p in plan.array_parameters, dim in p.dims
-        dim isa Expr && dim.head === :call && dim.args[1] === :levels &&
-            dim.args[2] isa Symbol && push!(axes, dim.args[2])
+        g = _level_pool_source(dim)
+        g === nothing || push!(axes, g)
     end
     union!(required, axes)
+    # A data-only plate column binds only for a bind-time slot (weights, a
+    # scale, a dimension or index); otherwise preparation folds it.
     names = Set{Symbol}(nm for (nm, ex) in nodes
-        if nm ∉ resps && (_contains_module_call(ex) || nm in required) &&
-            dataonly(nm, Set{Symbol}()))
+        if nm ∉ resps && ((_contains_module_call(ex) && !_is_plate_column_expr(ex)) ||
+            nm in required) && dataonly(nm, Set{Symbol}()))
     bind_only || return names
     onlydata = union(raw, Set{Symbol}(nm for nm in keys(nodes)
         if dataonly(nm, Set{Symbol}())))
@@ -6584,10 +6654,14 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         p.range isa Union{Symbol,Expr} || continue
         push!(defs, Symbol(:_ppl_axis_input_, p.name) => p.range)
     end
+    # A level axis reads its source as one pool of values, whether keyed by
+    # label (`levels(g)`) or by position (`1:length(levels(g)) - k`): `g`
+    # may have any length, such as a per-group table beside the observations.
     for p in plan.array_parameters, (i, d) in enumerate(p.dims)
-        _is_levels_dim(d) || continue
+        g = _level_pool_source(d)
+        g === nothing && continue
         push!(defs, Symbol(:_ppl_axis_input_, p.name, :_, i) =>
-            Expr(:call, GlobalRef(Base, :identity), d.args[2]))
+            Expr(:call, GlobalRef(Base, :identity), g))
     end
     for p in plan.vector_parameters
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
@@ -6642,7 +6716,8 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         elseif f === :array_parameters
             for p in plan.array_parameters
                 delete!(free, p.name)
-                _drop_held_names!(free, filter(d -> !_is_axis_dim(d) && !_is_levels_dim(d), p.dims))
+                _drop_held_names!(free, filter(d -> !_is_axis_dim(d) &&
+                    _level_pool_source(d) === nothing, p.dims))
             end
         elseif f === :responses
             for r in plan.responses
@@ -6808,7 +6883,8 @@ function _drop_held_names!(out::Set{Symbol}, p::ArrayParameter)
     for f in fieldnames(ArrayParameter)
         if f === :dims
             for d in p.dims
-                (_is_axis_dim(d) || _is_levels_dim(d)) || _drop_held_names!(out, d)
+                (_is_axis_dim(d) || _level_pool_source(d) !== nothing) ||
+                    _drop_held_names!(out, d)
             end
         else
             _drop_held_names!(out, getfield(p, f))
@@ -7004,6 +7080,7 @@ function _eval_value_expr(ex, lookup, label; calls = nothing)
     ex isa Symbol && return lookup(ex)
     ex isa Expr || throw(ContractValidationError(
         "[bind] $label: unsupported literal $(repr(ex))"))
+    _is_plate_column_expr(ex) && return _eval_plate_column(ex, lookup, label)
     ev(a) = _eval_value_expr(a, lookup, label; calls)
     h = ex.head
     cached = h === :call && calls !== nothing && ex.args[1] isa GlobalRef
@@ -7360,10 +7437,7 @@ function _bind_plate_extents!(plan::StructuralPlan, columns)
         input in extents && continue
         haskey(columns, input) && _fail(d.name, "internal input $input " *
             "is the plate's cell count — drop it from bind_data")
-        source = it.args[1] == GlobalRef(Base, :eachindex) ?
-            Expr(:call, :eachindex, it.args[2]) :
-            Expr(:call, :axes, it.args[2], it.args[3])
-        n = _value_iterator_length(plan, d.name, source; required = false)
+        n = _value_iterator_length(plan, d.name, _authored_spelling(it); required = false)
         n === nothing && continue
         columns[input] = n
         push!(extents, input)
