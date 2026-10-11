@@ -60,8 +60,12 @@ end
     text = _text(bound)
 
     @testset "plate cells name their arguments after their values" begin
-        @test occursin("plate(y, y_eta, y_scale) do y, y_eta, y_scale", text)
-        @test occursin("(normal(y_eta, y_scale)).logpdf(y)", text)
+        # `loc` is a retained value (`spread` reads it too); the location
+        # `y_eta = loc` aliases it, and the cell argument takes its name.
+        @test occursin("plate(y, y_eta, y_scale) do y, loc, y_scale", text)
+        @test occursin("(normal(loc, y_scale)).logpdf(y)", text)
+        @test occursin("plate(y, loc, y_scale) do y, loc, y_scale",
+            string(readable_code(build_kernel(bound).spec)))
         @test !occursin(r"_ppl_c\d", text)
     end
 
@@ -283,6 +287,93 @@ end
         (sq(up) - sq(dn)) / 2h
     end
     @test grad ≈ fd rtol = 1e-5 atol = 1e-7
+end
+
+# A definition with no coefficient structure is one value, read under its
+# own name like any retained definition: the built program shows `mu`, and
+# the calls lifted out of it are scoped under `mu`, never under a column
+# the lowering extracted and named itself (snag `read-the-built-p-bd95fad7`).
+@testset "a definition without coefficient structure keeps its name" begin
+    rise(v) = v .* 2.0 .+ 1.0
+    fall(v) = (v .- 3.0) .- (0.5 - 3.0)
+    head = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        sa ~ Exponential(1.0)
+        base = a .+ b .* x
+    end
+    head_lp(nt) = logpdf(Normal(0, 1), nt.a) + logpdf(Normal(0, 1), nt.b) +
+        logpdf(Exponential(1.0), nt.sa)
+    base(nt) = nt.a .+ nt.b .* x
+    yc = [1, 0, 2, 1]
+    for (body, wants, oracle) in (
+            # The reported spelling: module calls inline in the location.
+            (quote
+                mu = base .* ComposedFns.rise(base) .* exp.(ComposedFns.fall(base, 0.5))
+                y .~ Normal.(mu, sa)
+            end, ["var\"mu.rise.xi\" = base .* 2.0",
+                  "mu = (base .* var\"mu.rise\") .* exp.(var\"mu.fall\")",
+                  "plate(y, mu, sa) do y, mu, sa"],
+                nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)) .*
+                    exp.(fall(base(nt))), nt.sa), y))),
+            # Its named twin.
+            (quote
+                r = ComposedFns.rise(base)
+                f = ComposedFns.fall(base, 0.5)
+                mu = base .* r .* exp.(f)
+                y .~ Normal.(mu, sa)
+            end, ["mu = (base .* r) .* exp.(f)", "plate(y, mu, sa) do y, mu, sa"],
+                nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)) .*
+                    exp.(fall(base(nt))), nt.sa), y))),
+            # A scale, a log-link location and a location two responses read.
+            (quote
+                r = ComposedFns.rise(base)
+                sd = exp.(0.1 .* base .* r)
+                y .~ Normal.(a, sd)
+            end, ["sd = exp.((0.1 .* base) .* r)", ", sd) do y, "],
+                nt -> sum(logpdf.(Normal.(nt.a,
+                    exp.(0.1 .* base(nt) .* rise(base(nt)))), y))),
+            (quote
+                r = ComposedFns.rise(base)
+                eta = 0.1 .* base .* r
+                yc .~ Poisson.(exp.(eta))
+            end, ["eta = (0.1 .* base) .* r", "dot(_ppl_yf_yc_resp, eta)"],
+                nt -> sum(logpdf.(Poisson.(exp.(0.1 .* base(nt) .*
+                    rise(base(nt)))), yc))),
+            (quote
+                r = ComposedFns.rise(base)
+                mu = base .* r
+                y .~ Normal.(mu, sa)
+                yc .~ Normal.(mu, 1.0)
+            end, ["mu = base .* r", "plate(y, mu, sa) do y, mu, sa",
+                  "plate(yc, mu) do yc, mu"],
+                nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)), nt.sa), y)) +
+                    sum(logpdf.(Normal.(base(nt) .* rise(base(nt)), 1.0), yc))))
+        model = Expr(:block, head.args..., body.args...)
+        data = (; x, y, yc)
+        bound = bind_data(lower_rkppl(model, data; conditioned = (:y, :yc),
+            mod = @__MODULE__), data)
+        built = build_kernel(bound)
+        code = string(readable_code(built.spec))
+        for want in wants
+            @test occursin(want, code)
+        end
+        @test !occursin("_rkppl_", code)
+        layout = built.layout
+        u = collect(range(-0.3, 0.4; length = layout.total))
+        sq = prepare_sampler(built, bound, u; backend = BACKEND)
+        grad = similar(u)
+        value, _ = sampler_value_and_gradient!(sq, grad, u)
+        nt = constrain(layout, u)
+        @test value ≈ oracle(nt) + head_lp(nt) + logjac(layout, u) rtol = 1e-12
+        h = 1e-6
+        fd = map(eachindex(u)) do i
+            up = copy(u); up[i] += h
+            dn = copy(u); dn[i] -= h
+            (sq(up) - sq(dn)) / 2h
+        end
+        @test grad ≈ fd rtol = 1e-5 atol = 1e-7
+    end
 end
 
 @testset "a scalar parameter's log-Jacobian term is named after it" begin

@@ -1399,38 +1399,49 @@ function _fuse_authored_plate_chains(p::Plan)
     recipes = Union{Nothing,Recipe}[p.recipes...]
     boundary = Set(canon_id(p.graph, v.id) for v in (p.have..., p.want...))
     changed = false
-    for index in eachindex(recipes)
+    # A plate's output, unless it is a boundary value, and the recipes that
+    # read it.
+    function consumers_of(index)
         producer = recipes[index]
-        producer === nothing && continue
-        producer.op isa _AuthoredPlateOp || continue
-        length(producer.outputs) == 1 || continue
+        producer === nothing && return nothing
+        producer.op isa _AuthoredPlateOp || return nothing
+        length(producer.outputs) == 1 || return nothing
         cid = canon_id(p.graph, only(producer.outputs).id)
-        cid in boundary && continue
+        cid in boundary && return nothing
         consumers = findall(recipes) do candidate
             candidate === nothing && return false
             any(input -> canon_id(p.graph, input.id) == cid, candidate.inputs)
         end
+        all(>(index), consumers) || return nothing
+        return cid, consumers
+    end
+    for index in eachindex(recipes)
+        found = consumers_of(index)
+        found === nothing && continue
+        cid, consumers = found
         length(consumers) == 1 || continue
-        consumer_index = only(consumers)
-        consumer_index > index || continue
-        consumer = recipes[consumer_index]
-        # A plate cell composes its producer as its plate does; its first
-        # input is the cell index, which the producer never is.
-        cell = consumer.op isa _AuthoredPlateCellOp
-        cell && canon_id(p.graph, first(consumer.inputs).id) == cid && continue
-        cell && (consumer = Recipe(consumer.id, consumer.inputs[2:end],
-            consumer.outputs, consumer.op.plate, consumer.cost, nothing, false,
-            consumer.source))
-        consumer.op isa _AuthoredPlateOp || continue
-        consumer_atomic = typeof(consumer.op).parameters[2]
-        any(position -> position in consumer_atomic &&
-            canon_id(p.graph, consumer.inputs[position].id) == cid,
-            eachindex(consumer.inputs)) && continue
-        composed = _compose_authored_plates(p.graph, producer, consumer)
-        recipes[consumer_index] = cell ?
-            Recipe(composed.id, (first(recipes[consumer_index].inputs), composed.inputs...),
-                   composed.outputs, _AuthoredPlateCellOp(composed.op), composed.cost,
-                   nothing, false, composed.source) : composed
+        composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
+        composed === nothing && continue
+        recipes[only(consumers)] = composed
+        recipes[index] = nothing
+        changed = true
+    end
+    # A plate read only by cells of other plates at one position (`plate_cell`
+    # values sharing an index port: one cell of several observations) composes
+    # into each of those cells, so each runs the plate's cell at that position
+    # instead of the whole plate.
+    for index in eachindex(recipes)
+        found = consumers_of(index)
+        found === nothing && continue
+        cid, consumers = found
+        length(consumers) >= 2 || continue
+        all(c -> recipes[c].op isa _AuthoredPlateCellOp, consumers) || continue
+        length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
+            for c in consumers)) == 1 || continue
+        composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
+            for c in consumers]
+        any(isnothing, composed) && continue
+        recipes[consumers] = composed
         recipes[index] = nothing
         changed = true
     end
@@ -1438,6 +1449,43 @@ function _fuse_authored_plate_chains(p::Plan)
     selected = Recipe[r for r in recipes if r !== nothing]
     producer = Dict(canon_id(p.graph, v.id) => r for r in selected for v in r.outputs)
     Plan(p.graph, p.have, p.want, selected, producer, p.cost, p.candidates)
+end
+
+# `producer` (an authored plate with output `cid`) composed into `consumer`, an
+# authored plate or one cell of one, or `nothing` when the consumer reads that
+# output other than per cell.
+function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
+    # A plate cell composes its producer as its plate does; its first input is
+    # the cell index, which the producer never is.
+    cell = consumer.op isa _AuthoredPlateCellOp
+    cell && canon_id(g, first(consumer.inputs).id) == cid && return nothing
+    plate = cell ? Recipe(consumer.id, consumer.inputs[2:end], consumer.outputs,
+        consumer.op.plate, consumer.cost, nothing, false, consumer.source) : consumer
+    plate.op isa _AuthoredPlateOp || return nothing
+    atomic = typeof(plate.op).parameters[2]
+    any(position -> position in atomic && canon_id(g, plate.inputs[position].id) == cid,
+        eachindex(plate.inputs)) && return nothing
+    composed = _compose_authored_plates(g, producer, plate)
+    cell || return composed
+    Recipe(composed.id, (first(consumer.inputs), composed.inputs...), composed.outputs,
+        _AuthoredPlateCellOp(composed.op), composed.cost, nothing, false, composed.source)
+end
+
+# Is a plate's pointwise value read only by other plates, each zipping it, and
+# returned by no WANT? Its tensorized lanes then pass to them as they are
+# (`_tensorized_plate_lanes`).
+function _plate_read_by_plates(p::Plan, pointwise_id, sum_recipe)
+    g = p.graph
+    any(w -> canon_id(g, w.id) == pointwise_id, p.want) && return false
+    readers = [r for r in p.recipes if r !== sum_recipe &&
+        any(input -> canon_id(g, input.id) == pointwise_id, r.inputs)]
+    isempty(readers) && return false
+    all(readers) do r
+        r.op isa _AuthoredPlateOp || return false
+        atomic = typeof(r.op).parameters[2]
+        all(k -> !(k in atomic) || canon_id(g, r.inputs[k].id) != pointwise_id,
+            eachindex(r.inputs))
+    end
 end
 
 function _plate_dependencies(plan::Plan, root_ids::Set{Int})
@@ -2565,7 +2613,7 @@ end
 Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
-        pointwise_lhs, total_lhs)
+        pointwise_lhs, total_lhs; lanes::Bool = false)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -2656,8 +2704,8 @@ Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         locals[output_cid] = out
     end
     scalar_result = locals[result_cid]
-    pointwise = Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_pointwise), scalar_result)
+    pointwise = Expr(:call, GlobalRef(@__MODULE__,
+        lanes ? :_tensorized_plate_lanes : :_tensorized_plate_pointwise), scalar_result)
     pointwise_lhs === nothing ||
         push!(body.args, :($pointwise_lhs = $pointwise))
     total = Expr(:call,
@@ -2810,7 +2858,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             elseif tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
-                    pointwise_lhs, total_lhs)
+                    pointwise_lhs, total_lhs; lanes = pointwise_lhs !== nothing &&
+                        _plate_read_by_plates(p, pointwise_id, sum_recipe))
             elseif r.id in strip_members
                 hints = type_hints === nothing ? nothing :
                     Any[type_hints[canon_id(g, v.id)] for v in r.inputs]

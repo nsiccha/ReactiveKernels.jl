@@ -126,11 +126,12 @@ end
         src = string(kernel_expr(fx.bound, fx.built.layout))
         @test count("counted_signal", src) == 1
         if dependent
-            scale = only(p for p in fx.plan.predictors if p.name === :sd)
-            @test :mu in only(scale.terms).options.subs
-            @test occursin(r"\bmu\b", string(only(
-                s for s in ReactiveKernelsPPL._predictor_statements(fx.bound)
-                if s.args[1] === :sd).args[2]))
+            # Neither definition has coefficient structure, so both are
+            # retained values: `sd` reads the location's value by name.
+            sd = only(d for d in fx.plan.derived if d.name === :sd)
+            @test :mu in ReactiveKernelsPPL._expr_names(sd.expr)
+            @test occursin("sd = hypot.(add, mu .* prop)",
+                string(readable_code(kernel_expr(fx.bound, fx.built.layout))))
         end
     end
     for dependent in (false, true)

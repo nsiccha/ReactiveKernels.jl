@@ -1178,6 +1178,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         plate_names, absorbed = Set{Symbol}(),
         synth = Ref(0), synth_derived = VectorAssignmentSpec[], taken,
         synth_assigns = AssignmentSpec[],
+        # Definitions whose whole value one extracted column holds
+        # (`_whole_value_terms`); lowering replans them as values.
+        whole_values = Set{Symbol}(),
         negated = Dict{Symbol,Symbol}(),
         leaf_exprs = Dict{Any,Symbol}(),
         # Definitions a reader folded into itself (`_inlined_computed_defs`).
@@ -1386,6 +1389,20 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     if !isempty(retained)
         return _lower_rkppl_once(ast, input_data, mod;
             submodel_scopes, conditioned, value_defs = union(value_defs, retained),
+            shared_defs, array_entries)
+    end
+    # A definition with no coefficient structure (`mu = base .* rise(base)`
+    # over a retained `base`) is one value, not a predictor over a column
+    # extracted from it. Replanned as a retained value, it keeps its
+    # authored name for every reader, as in Julia; the extracted column's
+    # synthesized name never reaches the program. Only names the model's
+    # statements spell replan: a binder the `@plate` desugar generates is
+    # fresh on every lowering.
+    whole = Set{Symbol}(nm for nm in ctx.whole_values
+        if nm ∉ value_defs && _mentions_symbol(ast, nm))
+    if !isempty(whole)
+        return _lower_rkppl_once(ast, input_data, mod;
+            submodel_scopes, conditioned, value_defs = union(value_defs, whole),
             shared_defs, array_entries)
     end
     # A predictor location inlines the definitions it reads. As in Julia,
@@ -3957,6 +3974,7 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         end
         foreach(checkrefs, ex.args)
     end
+    values = _CellValues(ivar, nothing, indices, data)
     for c in cells
         checkrefs(c)
         if Meta.isexpr(c, :(=), 2)
@@ -3967,10 +3985,11 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             col in data && _sfail("cell assignment `$col = ...` redefines bound data")
             rhs = localread(rhs)
             if lhs isa Expr
-                push!(out, Expr(:(=), col, _plate_column_call(ivar, locals, rhs, nothing; indices)))
+                _cell_value!(out, values, col, locals, rhs; holds = true)
                 push!(indexedlocals, col)
             end
             push!(locals, col => rhs)
+            _cell_statement!(values, col => rhs)
             continue
         end
         (_is_sample(c) || _is_broadcast_sample(c)) ||
@@ -3986,8 +4005,7 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             end
             if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames)
                 nm = gensym(:_rkppl_selected)
-                push!(out, Expr(:(=), nm,
-                    _plate_column_call(ivar, locals, ex, nothing; indices)))
+                _cell_value!(out, values, nm, locals, ex)
                 push!(plate_defs, nm)
                 push!(pidx, nm)
                 return Expr(:ref, nm, ivar)
@@ -4007,6 +4025,7 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         append!(out, _desugar_cell_sample(Expr(:call, c.args[1], c.args[2], obj),
             ivar, rkind, line, data, plate_defs, ctx, params, pidx))
     end
+    _emit_cell_values!(out, values, plate_defs)
     return out, ctx, params
 end
 
@@ -4156,6 +4175,7 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     samples = Any[]
+    values = _CellValues(ivar, axis, indices, data)
     for c in cells
         c isa Expr || _sfail("cells hold `~` observations and `=` " *
             "assignments only")
@@ -4170,13 +4190,13 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
             lc in data && _sfail("cell assignment `$lc = ...` redefines " *
                 "bound data")
             push!(locals, lc => rhs)
+            _cell_statement!(values, lc => rhs)
         elseif lc isa Expr && lc.head === :ref && length(lc.args) == 2 &&
                 lc.args[1] isa Symbol && lc.args[2] === ivar
             col = lc.args[1]
             col in data && _sfail("cell assignment `$col[$ivar] = ...` " *
                 "redefines bound data")
-            push!(out, Expr(:(=), col,
-                _plate_column_call(ivar, locals, rhs, axis; indices)))
+            _cell_value!(out, values, col, locals, rhs; output = true)
         elseif lc isa Expr && lc.head === :ref && length(lc.args) == 3 &&
                 lc.args[1] isa Symbol && lc.args[2] === ivar
             # A row per index (`b[i, 1:K] = row`): one plate column per
@@ -4189,12 +4209,12 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
                 "states its length, `$col[$ivar, 1:K] = ...` with a literal K")
             rowv = Symbol(:_rkppl_rowv_, col)
             rowlocals = [locals; rowv => rhs]
+            _cell_statement!(values, rowv => rhs)
             parts = Symbol[]
             for k in 1:K
                 pk = Symbol(:_rkppl_row_, col, :_, k)
                 push!(parts, pk)
-                push!(out, Expr(:(=), pk,
-                    _plate_column_call(ivar, rowlocals, :($rowv[$k]), axis; indices)))
+                _cell_value!(out, values, pk, rowlocals, :($rowv[$k]); part_of = col)
             end
             push!(out, Expr(:(=), col, Expr(:call, :_ppl_rows, parts...)))
         elseif lc isa Expr && lc.head === :ref
@@ -4222,8 +4242,7 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
                 for (i, arg) in enumerate(obj.args[2:end])
                     if _expr_has_sym(arg, ivar) || any(nm -> _expr_has_sym(arg, nm), lnames)
                         nm = Symbol(:_rkppl_level_, c.args[2].args[1], :_arg_, i)
-                        push!(out, Expr(:(=), nm,
-                            _plate_column_call(ivar, locals, arg, axis)))
+                        _cell_value!(out, values, nm, locals, arg)
                         push!(args, nm)
                     else
                         push!(args, arg)
@@ -4240,19 +4259,221 @@ function _desugar_array_plate(cells, ivar::Symbol, rkind, line, data,
         append!(out, _desugar_cell_sample(c, ivar, rkind, line, data,
             plate_defs, ctx, params, pidx))
     end
+    _emit_cell_values!(out, values, plate_defs)
     return out, ctx, params
+end
+
+# A cell states one iteration of its Julia loop, so it runs once per index
+# however many per-index values it defines: indexed outputs (`c[i] = …`),
+# the components of a row output, and computed observation or prior
+# arguments. The retained-cell routes record each value in cell order
+# (`_cell_value!`, with every cell statement through `_cell_statement!`);
+# `_emit_cell_values!` lowers them once the whole cell is known.
+#
+# - Two or more live values come from ONE RK plate (`_rkppl_cell_<c>`) whose
+#   cell runs the cell's statements once and returns those values as a
+#   tuple. Each value keeps its name as the positional projection of that
+#   plate (`_ppl_cell_entry`), so its consumers read the column they read
+#   before.
+# - A value reading only data stays its own plate: RK runs a data-only
+#   plate once, at preparation, and moving it into a live plate would
+#   repeat its work in every evaluation. A value that re-reads existing
+#   storage (`c[i] = t[i]`, `c[i] = a`) stays its own plate as well: a live
+#   tuple holding a constant element is the constant-storage boundary of
+#   native Enzyme Reverse (`reactivekernels-use` §7ak).
+# - A value that does not share a plate runs only the cell statements it
+#   reads (`_needed_cell_locals`).
+struct _CellValues
+    ivar::Symbol
+    axis::Any
+    indices::Any
+    data::Set{Symbol}
+    statements::Vector{Pair{Symbol,Any}}
+    entries::Vector{Any}
+end
+_CellValues(ivar, axis, indices, data) =
+    _CellValues(ivar, axis, indices, data, Pair{Symbol,Any}[], Any[])
+
+_cell_statement!(values::_CellValues, st::Pair) = push!(values.statements, st)
+
+# Record a per-index value at its place in `out`. `locals` are the
+# statements its own plate would run; `holds` marks a value the cell also
+# binds as the local `name` (its next statement); `output` an indexed output
+# that later cells read as `name[i]`; `part_of` the row output a component
+# belongs to.
+function _cell_value!(out, values::_CellValues, name::Symbol, locals, rhs;
+        holds::Bool = false, output::Bool = false, part_of = nothing)
+    push!(values.entries, (; name, locals = copy(locals), rhs, holds, output,
+        part_of, position = length(values.statements)))
+    push!(out, Expr(:_rkppl_cell_value, length(values.entries)))
+    return name
+end
+
+function _emit_cell_values!(out, values::_CellValues, plate_defs)
+    (; ivar, axis, indices, entries) = values
+    column(name, locals, rhs; reads = ()) =
+        Expr(:(=), name, _plate_column_call(ivar, locals, rhs, axis; indices, reads))
+    lowered = Dict{Int,Vector{Any}}(k =>
+        Any[column(e.name, _needed_cell_locals(e.locals, e.rhs), e.rhs)]
+        for (k, e) in enumerate(entries))
+    for fused in _shared_cell_groups(values)
+        named = [e for e in entries[fused] if !Base.isgensym(e.name)]
+        cell = isempty(named) ? gensym(:_rkppl_selected) :
+            Symbol(:_rkppl_cell_, something(first(named).part_of, first(named).name))
+        push!(plate_defs, cell)
+        shared = column(cell, _fused_cell_statements(values, fused),
+            Expr(:tuple, (e.name for e in entries[fused])...))
+        for (k, index) in enumerate(fused)
+            # A projection reads, besides the shared plate, what its value's
+            # own plate read, so analyses of its dependencies (a per-cell
+            # latent it transforms, a parameter) see the same value.
+            e = entries[index]
+            own = lowered[index][1].args[2]
+            entry = column(e.name, Pair{Symbol,Any}[],
+                Expr(:_ppl_cell_entry, cell, k); reads = own.args[3:end])
+            lowered[index] = k == 1 ? Any[shared, entry] : Any[entry]
+        end
+    end
+    result = Any[]
+    for st in out
+        Meta.isexpr(st, :_rkppl_cell_value, 1) ? append!(result, lowered[st.args[1]]) :
+            push!(result, st)
+    end
+    copyto!(resize!(out, length(result)), result)
+    return out
+end
+
+# The groups of entries that share one plate, each in cell order. A
+# candidate is a live value (not data-only, not a bare re-read of existing
+# storage) whose expression a shared cell can state: it reads an earlier
+# output only as `c[i]`, which becomes a cell local there. Candidates share a
+# plate when they share cell work: a cell local both compute from, or one
+# reading the other. A value computed from no shared work keeps its plate,
+# as a shared one would gain nothing.
+function _shared_cell_groups(values::_CellValues)
+    (; ivar, data, statements, entries) = values
+    names = first.(statements)
+    allunique(names) && isempty(intersect(Set(names),
+        Set(e.name for e in entries if !e.holds))) || return Vector{Int}[]
+    outputs = Set{Symbol}()
+    for e in entries
+        e.output && push!(outputs, e.name)
+        e.part_of === nothing || push!(outputs, e.part_of)
+    end
+    candidates = Int[]
+    work = Dict{Int,Set{Symbol}}()
+    for (k, e) in enumerate(entries)
+        reads, used = _cell_value_reads(e.rhs, e.locals, ivar)
+        issubset(reads, data) && continue
+        _cell_value_aliases(e.rhs, e.locals) && continue
+        _cell_reads_output(e.rhs, e.locals, outputs, ivar) && continue
+        push!(candidates, k)
+        work[k] = union(used, intersect(reads, outputs))
+    end
+    group = Dict(k => k for k in candidates)
+    root(k) = group[k] == k ? k : root(group[k])
+    for (j, a) in enumerate(candidates), b in candidates[j+1:end]
+        shares = !isempty(intersect(work[a], work[b])) || entries[a].name in work[b]
+        shares && (group[root(b)] = root(a))
+    end
+    groups = Dict{Int,Vector{Int}}()
+    for k in candidates
+        push!(get!(groups, root(k), Int[]), k)
+    end
+    return sort!([g for g in Base.values(groups) if length(g) >= 2]; by = first)
+end
+
+# The cell statements a value is computed from, in cell order. A value's own
+# plate runs only these: a statement it does not read (another output's work)
+# would make it read that work's inputs too, so a value reading only data
+# would read a parameter and stop being data-only.
+function _needed_cell_locals(locals, rhs)
+    needed = _cell_free_syms!(Set{Symbol}(), rhs)
+    keep = falses(length(locals))
+    for k in reverse(eachindex(locals))
+        name, ex = locals[k]
+        name in needed || continue
+        keep[k] = true
+        _cell_free_syms!(needed, ex)
+    end
+    return locals[keep]
+end
+
+# The names a value reads through the cell locals it is computed from, and
+# those cell locals.
+function _cell_value_reads(rhs, locals, ivar)
+    reads = _cell_free_syms!(Set{Symbol}(), rhs)
+    used = Set{Symbol}()
+    for (name, ex) in Iterators.reverse(locals)
+        name in reads || continue
+        delete!(reads, name)
+        push!(used, name)
+        _cell_free_syms!(reads, ex)
+    end
+    delete!(reads, ivar)
+    return reads, used
+end
+
+# Does the value re-read existing storage (a value or an element of one)
+# rather than compute a new one?
+function _cell_value_aliases(ex, locals)
+    if ex isa Symbol
+        k = findlast(l -> first(l) === ex, locals)
+        return k === nothing || _cell_value_aliases(last(locals[k]), locals[1:k-1])
+    end
+    ex isa Expr || return false
+    ex.head === :ref && return _cell_value_aliases(ex.args[1], locals)
+    ex.head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode &&
+        return _cell_value_aliases(ex.args[1], locals)
+    return false
+end
+
+# Does the value read an output of the cell other than as `c[i]`, or a row
+# matrix the cell assembles?
+function _cell_reads_output(rhs, locals, outputs, ivar)
+    isempty(outputs) && return false
+    bad(ex) = ex isa Symbol ? ex in outputs :
+        ex isa Expr ? (Meta.isexpr(ex, :ref, 2) && ex.args[1] in outputs &&
+            ex.args[2] === ivar ? false : any(bad, ex.args)) : false
+    return bad(rhs) || any(l -> bad(last(l)), locals)
+end
+
+# The shared cell: every cell statement up to the last fused value, with each
+# fused value bound to a local of its own name (a holding local already is);
+# reads `c[i]` of a fused output become that local.
+function _fused_cell_statements(values::_CellValues, fused)
+    (; ivar, statements, entries) = values
+    outputs = Set{Symbol}()
+    readlocal(ex) = Meta.isexpr(ex, :ref, 2) && ex.args[1] in outputs &&
+        ex.args[2] === ivar ? ex.args[1] :
+        ex isa Expr ? Expr(ex.head, map(readlocal, ex.args)...) : ex
+    last_needed = maximum(entries[k].position + entries[k].holds for k in fused)
+    stmts = Pair{Symbol,Any}[]
+    for position in 0:last_needed
+        for k in fused
+            e = entries[k]
+            e.position == position && !e.holds || continue
+            push!(stmts, e.name => readlocal(e.rhs))
+            e.output && push!(outputs, e.name)
+        end
+        position < last_needed &&
+            push!(stmts, first(statements[position+1]) =>
+                readlocal(last(statements[position+1])))
+    end
+    return stmts
 end
 
 # Shared cell construction for observation and level axes. The fourth
 # field records a level axis, so constant outputs still have one value
 # per level and subsequent gathers preserve that axis.
-function _plate_column_call(ivar, locals, rhs, axis; indices=nothing)
+function _plate_column_call(ivar, locals, rhs, axis; indices=nothing, reads=())
     body = Expr(:block, (Expr(:(=), k, v) for (k, v) in locals)...)
     deps = Set{Symbol}()
     for (_, v) in locals
         _cell_free_syms!(deps, v)
     end
     _cell_free_syms!(deps, rhs)
+    union!(deps, reads)
     setdiff!(deps, Set{Symbol}(first.(locals)))
     delete!(deps, ivar)
     spec = Expr(:tuple, QuoteNode(ivar), QuoteNode(body), QuoteNode(rhs))
@@ -4486,6 +4707,11 @@ function _plate_column_expr(nm::Symbol, call::Expr,
         indices !== nothing && ex === ivar && return pos
         axis !== nothing && ex === ivar && return level()
         ex isa Expr || return ex
+        # One value of a shared cell (`_emit_cell_values!`): its column
+        # holds one tuple per index, in this plate's order, so it is zipped.
+        Meta.isexpr(ex, :_ppl_cell_entry, 2) &&
+            return Expr(:ref, lane(ex.args[1], Symbol(:_ppl_pv_, ex.args[1])),
+                ex.args[2])
         if ex.head === :ref && ex.args[1] isa Symbol
             X, idx = ex.args[1], ex.args[2:end]
             if indices !== nothing && X in data && length(idx) == 1
@@ -5144,9 +5370,7 @@ function _check_definition_levels_axes(sample, det, data::Set{Symbol})
         s.dims === nothing && continue
         for d in s.dims
             # `levels(gg)` and its positional twin `length(levels(gg)) - k`
-            cnt = _levels_count(d)
-            gg = _is_levels_dim(d) ? d.args[2] :
-                cnt === nothing ? nothing : first(cnt)
+            gg = _level_pool_source(d)
             (gg === nothing || gg in data) && continue
             _is_bind_data_definition(gg, detmap, data, Set{Symbol}()) ||
                 _sfail("array $(s.lhs) axis `levels($gg)`: $gg must be " *
@@ -8460,6 +8684,7 @@ function _lower_scale_predictor(lhs, name::Symbol, link, ctx, predictors,
             link, predictors, pred_idx, coefuse)
     end
     terms, uses = _analyze_predictor(name, ctx.detmap[name], ctx, lhs)
+    _whole_value_terms(terms, ctx) && push!(ctx.whole_values, name)
     _record_coefuses!(coefuse, name, uses, lhs)
     push!(predictors, PredictorSpec(name, link, terms, name))
     pred_idx[name] = length(predictors)
@@ -8598,6 +8823,8 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
                 lhs, pred_link, predictors, pred_idx, coefuse)
         end
         terms, uses = _analyze_predictor(pname, ctx.detmap[loc], ctx, lhs)
+        value && !bare && _whole_value_terms(terms, ctx) &&
+            push!(ctx.whole_values, loc)
     elseif loc isa Number
         value && !bare && return _value_location!(lhs, loc, pred_link, ctx,
             predictors, pred_idx; synth)
@@ -10049,6 +10276,16 @@ function _extract_summand(pname, core, sign::Int, ctx)
     nm = _extract_column(pname, e, ctx)
     return TermSpec(OffsetTerm, [nm], NamedTuple(), nm,
         Symbol(nm, "_off")), nothing
+end
+
+# Whether a predictor analysis found no coefficient structure: its only
+# term is one column `_extract_column` extracted whole, so the analyzed
+# definition's value is that column.
+function _whole_value_terms(terms, ctx)
+    length(terms) == 1 && only(terms).kind === OffsetTerm || return false
+    columns = only(terms).columns
+    length(columns) == 1 || return false
+    return any(d -> d.name === only(columns), ctx.synth_derived)
 end
 
 function _extract_column(pname, e::Expr, ctx)
