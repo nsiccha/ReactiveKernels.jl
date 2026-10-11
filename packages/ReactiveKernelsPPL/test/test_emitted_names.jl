@@ -60,10 +60,12 @@ end
     text = _text(bound)
 
     @testset "plate cells name their arguments after their values" begin
-        # `loc` is a retained value (`spread` reads it too); the location
-        # `y_eta = loc` aliases it, and the cell argument takes its name.
-        @test occursin("plate(y, y_eta, y_scale) do y, loc, y_scale", text)
+        # `loc` is a retained value (`spread` reads it too), and the
+        # response reads that graph value without a synthetic alias.
+        @test occursin("plate(y, loc, y_scale) do y, loc, y_scale", text)
         @test occursin("(normal(loc, y_scale)).logpdf(y)", text)
+        @test !occursin("y_eta = loc", text)
+        @test !occursin("_ppl_lp_y_eta", text)
         @test occursin("plate(y, loc, y_scale) do y, loc, y_scale",
             string(readable_code(build_kernel(bound).spec)))
         @test !occursin(r"_ppl_c\d", text)
@@ -113,6 +115,14 @@ end
     @testset "values and native gradients are the model's" begin
         built = build_kernel(bound)
         layout = built.layout
+        # Compare the emitted graph with the unelided `y_eta = loc` graph.
+        prior_def = Base.invokelatest(ReactiveKernelsPPL._kernel_expr_latest,
+            bound, layout)
+        prior_def = ReactiveKernelsPPL._name_plate_cells(prior_def,
+            ReactiveKernelsPPL._location_value_aliases(bound, prior_def))
+        prior_built = (; spec = Base.invokelatest(
+            ReactiveKernelsPPL._eval_kernel_def, prior_def), layout,
+            program = built.program)
         for shift in (0.0, 0.4)
             u = collect(range(-0.3 + shift, 0.5 - shift; length = layout.total))
             nt = constrain(layout, u)
@@ -124,6 +134,11 @@ end
             sq = prepare_sampler(built, bound, u; backend = BACKEND)
             grad = similar(u)
             value, _ = sampler_value_and_gradient!(sq, grad, u)
+            prior_sq = prepare_sampler(prior_built, bound, u; backend = BACKEND)
+            prior_grad = similar(u)
+            prior_value, _ = sampler_value_and_gradient!(prior_sq, prior_grad, u)
+            @test isequal(value, prior_value)
+            @test isequal(grad, prior_grad)
             @test value ≈ lik + prior + logjac(layout, u) rtol = 1e-12
             h = 1e-6
             fd = map(eachindex(u)) do i
@@ -134,6 +149,45 @@ end
             @test grad ≈ fd rtol = 1e-5 atol = 1e-7
         end
     end
+end
+
+@testset "a bare named opaque location reads its definition" begin
+    model = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        loc = shiftby(x, a)
+        y .~ Normal.(loc, s)
+    end
+    plate_counts = Int[]
+    for n in (1, 2)
+        bound = _bound(model, (; x = repeat(x, n), y = repeat(y, n)))
+        text = _text(bound)
+        @test occursin("loc = shiftby(x, a)", text)
+        @test occursin("plate(y, _ppl_rows(loc, _observation_rows(y)), s) do y, loc, s", text)
+        @test !occursin("y_eta =", text)
+        @test !occursin("_ppl_lp_y_eta", text)
+        built = build_kernel(bound)
+        push!(plate_counts, count(item -> item.kind === :plate,
+            recipe_inventory(built.spec)))
+        if n == 1
+            layout = built.layout
+            prior_def = Base.invokelatest(ReactiveKernelsPPL._kernel_expr_latest,
+                bound, layout)
+            prior_built = (; spec = Base.invokelatest(
+                ReactiveKernelsPPL._eval_kernel_def, prior_def), layout,
+                program = built.program)
+            u = [0.2, 0.1]
+            current = prepare_sampler(built, bound, u; backend = BACKEND)
+            prior = prepare_sampler(prior_built, bound, u; backend = BACKEND)
+            current_grad, prior_grad = similar(u), similar(u)
+            current_value, _ = sampler_value_and_gradient!(current, current_grad, u)
+            prior_value, _ = sampler_value_and_gradient!(prior, prior_grad, u)
+            @test isequal(current_value, prior_value)
+            @test isequal(current_grad, prior_grad)
+        end
+    end
+    @test plate_counts[1] >= 1
+    @test plate_counts[1] == plate_counts[2]
 end
 
 @testset "generated names never take a name the model uses" begin
