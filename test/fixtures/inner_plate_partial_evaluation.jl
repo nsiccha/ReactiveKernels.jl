@@ -125,8 +125,8 @@ end
 end
 
 @kernel atomic(q::Float64, data, coefficients) = begin
-    pointwise = plate(data, Ref(coefficients), q) do d, coefs, parameter
-        transformed::Float64 = counted_log(d) + sum(coefs)
+    pointwise = plate(data, q) do d, parameter
+        transformed::Float64 = counted_log(d) + sum(coefficients)
         result::Float64 = transformed * parameter
         result
     end
@@ -164,9 +164,9 @@ end
 end
 
 @kernel ref_live(q::Vector{Float64}, data::Vector{Float64}) = begin
-    pointwise = plate(data, Ref(q)) do d, whole
+    pointwise = plate(data) do d
         transformed::Float64 = log(d)
-        result::Float64 = transformed * sum(whole)
+        result::Float64 = transformed * sum(q)
         result
     end
     total::Float64 = sum(pointwise)
@@ -204,11 +204,11 @@ end
 # Per-cell ragged index lists over a bound subject domain with `Ref` operands:
 # the selection is data-only, the final gather reads a live vector.
 @kernel ragged_reads(live, kinds_by_subject, read_idx, subjects) = begin
-    out = plate(subjects, Ref(kinds_by_subject), Ref(read_idx), Ref(live)) do s, kinds_all, idx_all, live_all
-        kinds = kinds_all[s]
+    out = plate(subjects) do s
+        kinds = kinds_by_subject[s]
         read_positions = counted_findall(isone, kinds)
-        observation_operations = read_positions[idx_all[s]]
-        observed = live_all[observation_operations]
+        observation_operations = read_positions[read_idx[s]]
+        observed = live[observation_operations]
         sum(observed)
     end
     total = sum(out)
@@ -221,11 +221,11 @@ end
 
 # The same selection authored as a composed child kernel inside the cell.
 @kernel composed_reads(live, kinds_by_subject, read_idx, subjects) = begin
-    out = plate(subjects, Ref(kinds_by_subject), Ref(read_idx), Ref(live)) do s, kinds_all, idx_all, live_all
-        kinds = kinds_all[s]
+    out = plate(subjects) do s
+        kinds = kinds_by_subject[s]
         read_positions = position_reader(kinds).positions()
-        observation_operations = read_positions[idx_all[s]]
-        observed = live_all[observation_operations]
+        observation_operations = read_positions[read_idx[s]]
+        observed = live[observation_operations]
         sum(observed)
     end
     total = sum(out)
@@ -236,16 +236,15 @@ end
 # per-subject sequences it reads are cached. The named-tuple seed is data-only
 # but not cacheable, so it stays in the cell as well.
 @kernel scan_reads(rates, kinds_by_subject, steps_by_subject, read_idx, subjects) = begin
-    out = plate(subjects, Ref(kinds_by_subject), Ref(steps_by_subject), Ref(read_idx),
-                Ref(rates)) do s, kinds_all, steps_all, idx_all, rates_all
-        kinds = kinds_all[s]
-        steps = steps_all[s]
-        rate = rates_all[s]
+    out = plate(subjects) do s
+        kinds = kinds_by_subject[s]
+        steps = steps_by_subject[s]
+        rate = rates[s]
         read_positions = counted_findall(isone, kinds)
-        observation_operations = read_positions[idx_all[s]]
-        operations = scan(kinds, steps, Ref(rate);
-                          init = (; level = 0.0, count = 0.0)) do carry, kind, step, r
-            level = carry.level * exp(-r * step)
+        observation_operations = read_positions[read_idx[s]]
+        operations = scan(kinds, steps;
+                          init = (; level = 0.0, count = 0.0)) do carry, kind, step
+            level = carry.level * exp(-rate * step)
             next = kind == 2 ? (; level = level + 1.0, count = carry.count + 1.0) :
                                (; level, count = carry.count)
             (next, next.level + next.count)
@@ -258,11 +257,11 @@ end
 
 # A nested plate over the cached selection stays in the cell.
 @kernel nested_reads(live, kinds_by_subject, read_idx, subjects) = begin
-    out = plate(subjects, Ref(kinds_by_subject), Ref(read_idx), Ref(live)) do s, kinds_all, idx_all, live_all
-        kinds = kinds_all[s]
-        observation_operations = counted_findall(isone, kinds)[idx_all[s]]
-        squares = plate(observation_operations, Ref(live_all)) do j, l
-            l[j]^2
+    out = plate(subjects) do s
+        kinds = kinds_by_subject[s]
+        observation_operations = counted_findall(isone, kinds)[read_idx[s]]
+        squares = plate(observation_operations) do j
+            live[j]^2
         end
         sum(squares; init = 0.0)
     end
@@ -272,8 +271,8 @@ end
 # A prepared kernel called in the cell is an embedded operation; it stays in
 # the cell beside the cached selection.
 @kernel decay_path(kinds::Vector{Int}, rate::Float64) = begin
-    path = scan(kinds, Ref(rate); init = 1.0) do carry, kind, r
-        next = carry * exp(-r * kind)
+    path = scan(kinds; init = 1.0) do carry, kind
+        next = carry * exp(-rate * kind)
         (next, next)
     end
     out::Float64 = sum(path)
@@ -281,12 +280,12 @@ end
 end
 const DECAY_PATH = prepare(decay_path)
 @kernel embedded_reads(live, kinds_by_subject, read_idx, subjects) = begin
-    out = plate(subjects, Ref(kinds_by_subject), Ref(read_idx), Ref(live)) do s, kinds_all, idx_all, live_all
-        kinds = kinds_all[s]
-        observation_operations = counted_findall(isone, kinds)[idx_all[s]]
-        rate = live_all[s]
+    out = plate(subjects) do s
+        kinds = kinds_by_subject[s]
+        observation_operations = counted_findall(isone, kinds)[read_idx[s]]
+        rate = live[s]
         decayed::Float64 = DECAY_PATH(kinds, rate)
-        decayed + sum(live_all[observation_operations]; init = 0.0)
+        decayed + sum(live[observation_operations]; init = 0.0)
     end
     total = sum(out)
 end
@@ -294,8 +293,8 @@ end
 # A lazy branch whose condition reads a cached per-cell array.
 @kernel guarded_reads(q::Vector{Float64}, kinds_by_subject, subjects) = begin
     theta::Float64 = sum(q)
-    out = plate(subjects, Ref(kinds_by_subject), theta) do s, kinds_all, t
-        read_positions = counted_findall(isone, kinds_all[s])
+    out = plate(subjects, theta) do s, t
+        read_positions = counted_findall(isone, kinds_by_subject[s])
         result = isempty(read_positions) ? 0.0 : t * sum(read_positions)
         result
     end
@@ -316,8 +315,8 @@ end
 # A cell result that reads only bound data, beside an unread live operand
 # passed atomically, as a reader plate that receives its whole boundary does.
 @kernel data_only_result(live::Vector{Float64}, limits, rows, subjects) = begin
-    weights = plate(subjects, Ref(limits), Ref(rows), Ref(live)) do s, limits_all, rows_all, live_all
-        selected = limits_all[rows_all[s]]
+    weights = plate(subjects) do s
+        selected = limits[rows[s]]
         counted_ones(length(selected)) .* selected
     end
     flat = convert(Vector{Float64}, reduce(vcat, weights; init = Float64[]))
@@ -326,8 +325,8 @@ end
 
 # The same data-only array result beside a live non-atomic input.
 @kernel data_only_result_live_axis(live::Vector{Float64}, limits, rows) = begin
-    weights = plate(rows, Ref(limits), live) do r, limits_all, x
-        selected = limits_all[r]
+    weights = plate(rows, live) do r, x
+        selected = limits[r]
         counted_ones(length(selected)) .* selected
     end
     flat = convert(Vector{Float64}, reduce(vcat, weights; init = Float64[]))
@@ -337,8 +336,8 @@ end
 # `data_only_result` with Base's `ones`, which inlines, in place of the
 # counting helper.
 @kernel data_only_result_inline(live::Vector{Float64}, limits, rows, subjects) = begin
-    weights = plate(subjects, Ref(limits), Ref(rows), Ref(live)) do s, limits_all, rows_all, live_all
-        selected = limits_all[rows_all[s]]
+    weights = plate(subjects) do s
+        selected = limits[rows[s]]
         ones(length(selected)) .* selected
     end
     flat = convert(Vector{Float64}, reduce(vcat, weights; init = Float64[]))

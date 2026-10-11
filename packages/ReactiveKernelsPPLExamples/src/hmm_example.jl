@@ -95,10 +95,9 @@ using LogExpFunctions: logsumexp
     gamma1::Vector{Float64} = c0 .- 0.5 .* (y[1] .- mu) .^ 2
     T::Int = length(y)
     lls::Vector{Float64} =
-        scan(y[2:T], Ref(logtheta), Ref(mu), Ref(c0);
-             init = gamma1) do carry, yt, lA, m, c
-            emit = c .- 0.5 .* (yt .- m) .^ 2
-            M = carry .+ lA                                   # M[j,k] = γ[j] + logθ[j,k]
+        scan(y[2:T]; init = gamma1) do carry, yt
+            emit = c0 .- 0.5 .* (yt .- mu) .^ 2
+            M = carry .+ logtheta                             # M[j,k] = γ[j] + logθ[j,k]
             newg = vec(mapslices(logsumexp, M; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end

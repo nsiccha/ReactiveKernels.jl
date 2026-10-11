@@ -5,8 +5,8 @@ using DifferentiationInterface, Distributions, Enzyme, ReactiveKernels, Reactive
 # possibly empty) is observed entry by entry inside a retained group plate.
 
 ReactiveKernels.@kernel _cba_reader(t, dose, log_k) = begin
-    cells = ReactiveKernels.plate(t, dose, Ref(log_k)) do ti, di, lk
-        di .* exp.(-exp(lk) .* ti)
+    cells = ReactiveKernels.plate(t, dose) do ti, di
+        di .* exp.(-exp(log_k) .* ti)
     end
     return cells
 end

@@ -31,8 +31,8 @@ ownership_lag(row, ::RowIndexPlan, j) = row[j]
 const LAZY_DOMAIN = @kernel lazy_domain(plan, w::Vector{Float64},
                                         u::Vector{Float64}) = begin
     observations = ownership_domain(plan)
-    y::Vector{Float64} = plate(observations, Ref(plan), Ref(u), Ref(w)) do t, p, uu, ww
-        sum(ww[j] * get(uu, ownership_lag(t, p, j), 0.0) for j in eachindex(ww);
+    y::Vector{Float64} = plate(observations) do t
+        sum(w[j] * get(u, ownership_lag(t, plan, j), 0.0) for j in eachindex(w);
             init = 0.0)
     end
     odd::Vector{Float64} = y[1:2:end]

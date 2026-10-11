@@ -3,9 +3,9 @@ using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 
 @kernel pair_terms(x, scale, rate) = begin
     right = reshape(x, 1, :)
-    terms = plate(x, right, Ref(scale), Ref(rate)) do a, b, s, r
+    terms = plate(x, right) do a, b
         delta = a - b
-        s * exp(-r * delta * delta)
+        scale * exp(-rate * delta * delta)
     end
     return terms
 end

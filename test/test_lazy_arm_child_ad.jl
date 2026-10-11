@@ -20,8 +20,8 @@ end
 end
 
 @kernel cumulative(xs, gain) = begin
-    updates = scan(xs, Ref(gain); init = 0.0) do carry, x, g
-        next = carry + x * g
+    updates = scan(xs; init = 0.0) do carry, x
+        next = carry + x * gain
         (next, next)
     end
     total = sum(updates)
@@ -38,11 +38,11 @@ end
 end
 
 @kernel plate_arms(xs, s) = begin
-    values = plate(xs, Ref(s)) do x, ss
+    values = plate(xs) do x
         v = if x > 0.0
-            stable_softplus(x * ss)
+            stable_softplus(x * s)
         elseif x < 0.0
-            -LazyArmChildADTests.stable_softplus(-x * ss)
+            -LazyArmChildADTests.stable_softplus(-x * s)
         else
             0.0
         end
@@ -53,8 +53,8 @@ end
 end
 
 @kernel scan_arm(xs, s) = begin
-    trajectory = scan(xs, Ref(s); init = 0.0) do c, x, ss
-        n = x > 0.0 ? c + stable_softplus(x * ss) : c
+    trajectory = scan(xs; init = 0.0) do c, x
+        n = x > 0.0 ? c + stable_softplus(x * s) : c
         (n, n)
     end
     total = sum(trajectory)
@@ -67,15 +67,15 @@ end
 end
 
 @kernel guarded_cells(xs, values) = begin
-    cells = plate(xs, Ref(values)) do x, v
-        x > 0.0 ? first_plus(x, v) : 0.0
+    cells = plate(xs) do x
+        x > 0.0 ? first_plus(x, values) : 0.0
     end
     return cells
 end
 
 @kernel scaled_sum(xs, gain) = begin
-    cells = plate(xs, Ref(gain)) do x, g
-        x * g + log1p(exp(x * g))
+    cells = plate(xs) do x
+        x * gain + log1p(exp(x * gain))
     end
     total = sum(cells)
     return total
@@ -103,8 +103,8 @@ end
 end
 
 @kernel cell_scan_child(groups, gain) = begin
-    cells = plate(groups, Ref(gain)) do xs, g
-        cell::Float64 = g > 0.0 ? cumulative(xs, g) : 0.0
+    cells = plate(groups) do xs
+        cell::Float64 = gain > 0.0 ? cumulative(xs, gain) : 0.0
         cell
     end
     total = sum(cells)
@@ -115,8 +115,8 @@ end
 # inferring the cell then widens the nested call to `Any`, and the summed plate
 # must still add its cells (todo `1a2te8d`).
 @kernel running_total(xs, gain) = begin
-    updates = scan(xs, Ref(gain); init = 0.0) do carry, x, g
-        next = carry + x * g
+    updates = scan(xs; init = 0.0) do carry, x
+        next = carry + x * gain
         (next, next)
     end
     total = sum(updates)
@@ -124,8 +124,8 @@ end
 end
 
 @kernel undeclared_cell_scan_child(groups, gain) = begin
-    cells = plate(groups, Ref(gain)) do xs, g
-        g > 0.0 ? running_total(xs, g) : 0.0
+    cells = plate(groups) do xs
+        gain > 0.0 ? running_total(xs, gain) : 0.0
     end
     total = sum(cells)
     return total

@@ -15,8 +15,8 @@ const pair_alias = pair
 end
 
 @kernel recurrence(xs, gain) = begin
-    updates = scan(xs, Ref(gain); init=0.0) do carry, x, g
-        next = carry + x * g
+    updates = scan(xs; init=0.0) do carry, x
+        next = carry + x * gain
         (next, next)
     end
     return updates
