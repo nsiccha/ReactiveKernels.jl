@@ -39,6 +39,10 @@ code is not executed by the docs build.
   lane consecutively. An authored `sum(lanes)` adds arrays across lanes, preserving
   their per-lane shape. A directly returned compiled plate still materializes
   to its dense storage with the lane axis first.
+- A plate whose cells return a tuple or named tuple, and whose lanes only
+  other plates read, hands those lanes on unchanged: each reading cell gets its
+  own lane's tuple, as natively (`plate(pair) do t; t[1] end`). A tuple plate
+  returned as a WANT materializes as one tuple of lane arrays.
 - Authored `if`, `?:`, `&&` and `||` lower to lazy `stablehlo.if` regions
   (also inside a batched plate cell), retained through ordinary MLIR AD.
   Default CPU XLA on Reactant 0.2.290 can subsequently replace pure live
