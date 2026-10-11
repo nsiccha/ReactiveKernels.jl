@@ -3287,6 +3287,12 @@ function _is_observation_slice(plan::StructuralPlan, ex)
     base = ex.args[1]
     base isa Union{Symbol,Expr} && ex.args[2] === :(:) &&
         all(_is_position, ex.args[3:end]) || return false
+    if base isa Symbol
+        # A named `P = table[c, :]` has one row per observation too.
+        i = findfirst(a -> a.name === base, plan.assignments)
+        i !== nothing && _is_row_gather(plan, plan.assignments[i].expr) &&
+            return true
+    end
     return _is_vector_valued(base, plan)
 end
 
