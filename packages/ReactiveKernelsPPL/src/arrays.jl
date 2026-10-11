@@ -993,7 +993,7 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
         fn = ex.args[1]
         # A module call takes and returns whole values, just as it does
         # inside scalar and observation expressions (functions as values).
-        fn isa GlobalRef &&
+        (fn isa GlobalRef || _constructed_endpoint_head(fn)) &&
             return _collect_opaque_refs!(refs, ex, plan, label, bound)
         # A reduction over a data column inside an array expression is a
         # scalar subterm (`mean(x) .* z`).

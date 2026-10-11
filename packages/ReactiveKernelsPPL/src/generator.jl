@@ -61,6 +61,7 @@ Pure (no eval): the generator tests inspect and evaluate it.
 """
 function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
     def = Base.invokelatest(_kernel_expr_latest, plan, layout; name)
+    def = _elide_named_location_aliases(plan, def)
     return _name_plate_cells(def, _location_value_aliases(plan, def))
 end
 
@@ -539,7 +540,8 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
     function walk(node)
         node isa Expr || return node
         _is_plate_column_expr(node) && return node
-        if node.head in (:call, :ref, :.) && _contains_module_call(node) &&
+        if node.head in (:call, :ref, :.) && !_constructed_endpoint_call(node) &&
+                _contains_module_call(node) &&
                 _expr_value_symbols(node) ⊆ dataonly
             count += 1
             tmp = Symbol(:_ppl_data_, name, :_, count)
@@ -547,7 +549,17 @@ function _split_data_calls!(stmts::Vector{Expr}, name::Symbol, ex,
             return tmp
         end
         if node.head === :call
-            return Expr(:call, node.args[1], map(walk, node.args[2:end])...)
+            head = node.args[1]
+            if _constructed_endpoint_head(head)
+                constructor = head.args[1]
+                # Owner arguments are value positions. Keep the constructor
+                # itself for RK's endpoint splicer, while folding data-only
+                # helper calls inside its arguments at preparation.
+                owner = Expr(:call, constructor.args[1],
+                    map(walk, constructor.args[2:end])...)
+                head = Expr(:., owner, head.args[2])
+            end
+            return Expr(:call, head, map(walk, node.args[2:end])...)
         elseif node.head === :. && length(node.args) == 2 &&
                 Meta.isexpr(node.args[2], :tuple)
             return Expr(:., node.args[1],
@@ -1691,10 +1703,35 @@ _predictor(plan::StructuralPlan, name::Symbol) =
 _is_latent_location(r::LikelihoodSpec, plan::StructuralPlan) =
     any(s -> r.predictor in s.states, plan.scans) || _is_plate_param(plan, r.predictor)
 
-# The per-observation location node feeding a response's likelihood plate: a
-# latent vector fed directly (its own name — the layout view), or the
-# predictor's node, which carries the predictor's name.
-_location_node(r::LikelihoodSpec, plan::StructuralPlan) = r.predictor
+# A pure identity predictor over an authored value has no computation of its
+# own. The value is available before predictors, so its graph node is the
+# response location. Other predictors, including unnamed inline
+# locations, keep their own nodes.
+function _identity_location_value(plan::StructuralPlan, name::Symbol)
+    any(r -> r.predictor === name || name in r.extra_predictors,
+        plan.responses) || return nothing
+    i = findfirst(p -> p.name === name, plan.predictors)
+    i === nothing && return nothing
+    pred = plan.predictors[i]
+    length(pred.terms) == 1 || return nothing
+    term = only(pred.terms)
+    term.kind === ComposedTerm && term.options.tree isa Symbol || return nothing
+    value = term.options.tree
+    any(a -> a.name === value, plan.assignments) ||
+        any(d -> d.name === value, plan.derived) || return nothing
+    return value
+end
+
+function _location_node(r::LikelihoodSpec, plan::StructuralPlan)
+    value = _identity_location_value(plan, r.predictor)
+    value === nothing && return r.predictor
+    pred = _predictor(plan, r.predictor)
+    term = only(pred.terms)
+    # Unknown-shape values still need the existing row normalization before
+    # the plate; the generator will inline it at the read, under `value`.
+    _composed_needs_rows(plan, pred, term, value) && return r.predictor
+    return value
+end
 
 # The value shape of a response's location (see `_predictor_value_type`).
 _location_value_type(r::LikelihoodSpec, plan::StructuralPlan) =
@@ -1763,9 +1800,17 @@ _pw_name(label::Symbol) = Symbol(:_ppl_pw_, label)
 # over an unnamed input (`view(...)`, a literal) keeps its number.
 _is_dovar(x) = x isa Symbol && match(r"^_ppl_c\d+$", String(x)) !== nothing
 _cell_argument_name(input::Symbol) = something(_array_flat_source(input), input)
-_cell_argument_name(input::Expr) =
-    Meta.isexpr(input, :call, 2) && input.args[1] === :Ref ?
-        _cell_argument_name(input.args[2]) : nothing
+function _cell_argument_name(input::Expr)
+    if Meta.isexpr(input, :call, 2) && input.args[1] === :Ref
+        return _cell_argument_name(input.args[2])
+    end
+    if Meta.isexpr(input, :call, 3) && input.args[1] isa GlobalRef &&
+            input.args[1].mod === (@__MODULE__) &&
+            input.args[1].name === :_ppl_rows
+        return _cell_argument_name(input.args[2])
+    end
+    return nothing
+end
 _cell_argument_name(input) = nothing
 
 _is_plate_do(ex) = Meta.isexpr(ex, :do, 2) && Meta.isexpr(ex.args[1], :call) &&
@@ -1780,10 +1825,51 @@ function _name_plate_cells(ex::Expr, aliases)
         _cell_argument_name(input isa Symbol ? get(aliases, input, input) : input))
 end
 
-# A value location's predictor is a pure alias of the graph value it reads
-# (`y_eta = mu`, `_value_location!`), and RK reads that value in its place:
-# `y .~ Normal.(mu, s)` observes `plate(y, mu, s) do y, mu, s`. So a cell
-# argument over the alias is named after the value.
+# A response location that merely names an already emitted definition reads
+# that definition directly. Keep the predictor in the structural plan (its
+# shape and layout still describe the response), but omit the generated
+# `y_eta = loc` statement and use `loc` at every later read. The synthesized
+# predictor for an inline expression, and aliases of sampled parameters, keep
+# their own graph names.
+function _elide_named_location_aliases(plan::StructuralPlan, def::Expr)
+    aliases = Dict{Symbol,Symbol}()
+    for pred in plan.predictors
+        value = _identity_location_value(plan, pred.name)
+        value === nothing || (aliases[pred.name] = value)
+    end
+    isempty(aliases) && return def
+    defined = Set{Symbol}(keys(plan.columns))
+    active = Dict{Symbol,Any}()
+    stmts = Any[]
+    for st in def.args[2].args
+        lhs = _location_assignment_name(st)
+        value = lhs === nothing ? nothing : get(aliases, lhs, nothing)
+        if value !== nothing && value in defined &&
+                _location_alias_rhs(st.args[2], value)
+            active[lhs] = st.args[2]
+            continue
+        end
+        push!(stmts, isempty(active) ? st : _hsubst(st, active))
+        lhs === nothing || push!(defined, lhs)
+    end
+    return Expr(:(=), def.args[1], Expr(:block, stmts...))
+end
+
+_location_alias_rhs(rhs, value::Symbol) = rhs === value ||
+    (Meta.isexpr(rhs, :call, 3) && rhs.args[1] isa GlobalRef &&
+        rhs.args[1].mod === (@__MODULE__) &&
+        rhs.args[1].name === :_ppl_rows && rhs.args[2] === value)
+
+_location_assignment_name(st) = nothing
+function _location_assignment_name(st::Expr)
+    Meta.isexpr(st, :(=), 2) || return nothing
+    lhs = st.args[1]
+    Meta.isexpr(lhs, :(::), 2) && (lhs = lhs.args[1])
+    return lhs isa Symbol ? lhs : nothing
+end
+
+# Remaining pure location aliases (such as a sampled scalar's `y_eta = mu`)
+# give a plate cell argument the name of the value it reads.
 function _location_value_aliases(plan::StructuralPlan, def::Expr)
     values = Dict{Symbol,Symbol}()
     for p in plan.predictors
@@ -1796,9 +1882,9 @@ function _location_value_aliases(plan::StructuralPlan, def::Expr)
     !isempty(values) && Meta.isexpr(def, :(=), 2) &&
         Meta.isexpr(def.args[2], :block) || return aliases
     for st in def.args[2].args
-        Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol &&
-            get(values, st.args[1], nothing) === st.args[2] &&
-            (aliases[st.args[1]] = st.args[2])
+        lhs = _location_assignment_name(st)
+        lhs !== nothing && get(values, lhs, nothing) === st.args[2] &&
+            (aliases[lhs] = st.args[2])
     end
     return aliases
 end

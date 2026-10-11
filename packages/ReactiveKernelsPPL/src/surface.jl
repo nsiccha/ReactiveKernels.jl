@@ -1605,7 +1605,8 @@ end
 function _aligned_module_data(sample, det, data)
     detmap = Dict{Symbol,Any}(det)
     cands = Set{Symbol}(nm for (nm, rhs) in det
-        if _is_module_value_call(rhs) && !_is_bound_value_call(rhs) &&
+        if _is_module_value_call(rhs) && !_constructed_endpoint_call(rhs) &&
+            !_is_bound_value_call(rhs) &&
             _data_only(rhs, data, detmap))
     aligned = Set{Symbol}()
     isempty(cands) && return aligned
@@ -1627,7 +1628,7 @@ end
 
 _is_module_value_call(ex) =
     ex isa Expr && ex.head === :call && !isempty(ex.args) &&
-    ex.args[1] isa GlobalRef
+    (ex.args[1] isa GlobalRef || _constructed_endpoint_head(ex.args[1]))
 
 const _WHOLE_READ_FNS = (:size, :axes, :levels, :eachindex, :Ref)
 const _ADDITIVE_OPS = (:+, :-, :.+, :.-)
@@ -2554,6 +2555,21 @@ end
 function _resolve_call_head(fn, mod::Module, names::Set{Symbol}, where;
         dotted::Bool = false)
     fn isa GlobalRef && return fn
+    if _constructed_endpoint_head(fn)
+        constructor = _resolve_module_calls(fn.args[1], mod, names, where)
+        binding = constructor.args[1]
+        binding isa GlobalRef || _sfail("$where constructs an endpoint from " *
+            "`$(repr(fn.args[1]))`, which is not a module-visible kernel object")
+        object = getglobal(binding.mod, binding.name)
+        object isa Union{KernelObjectSpec,ReactiveKernels._StatefulKernelSkeleton} ||
+            _sfail("$where constructs an endpoint from `$(repr(fn.args[1]))`, " *
+                   "which is not a method-bearing kernel object")
+        endpoint = fn.args[2].value
+        endpoint in ReactiveKernels.kernel_endpoint_names(object) ||
+            _sfail("$where calls `.$endpoint`, which is not an endpoint of " *
+                   "`$(repr(fn.args[1]))`")
+        return Expr(:., constructor, fn.args[2])
+    end
     if fn isa Symbol
         builtin = _builtin_call_head(fn; dotted)
         builtin === nothing || return builtin
@@ -2627,7 +2643,7 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
         head = _resolve_call_head(ex.args[1], mod, names, where)
         args = Any[_resolve_module_calls(a, mod, names, where)
             for a in ex.args[2:end]]
-        if head isa GlobalRef
+        if head isa GlobalRef || _constructed_endpoint_head(head)
             args = Any[_resolve_function_arg(a, mod, names, where)
                 for a in args]
         end
@@ -2848,42 +2864,51 @@ function _gathered_value_definitions(ast::Expr, data::Set{Symbol})
     detmap = Dict{Symbol,Any}(st.args[1] => st.args[2] for st in ast.args
         if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
     taken = union(data, _expr_names(ast))
+    reserved = Set{Symbol}()
+    for st in ast.args
+        if st isa Expr && (_is_sample(st) || _is_broadcast_sample(st))
+            for stem in _sampled_lhs_names!(Set{Symbol}(), st.args[2])
+                union!(reserved, _synthesized_response_names(stem))
+            end
+        end
+    end
     named = Dict{Any,Symbol}()
     out = Any[]
-    function name!(value)
+    function name!(value, stem::Symbol)
         get!(named, value) do
-            k = 1
-            nm = Symbol(:_rkppl_gathered_, k)
-            while nm in taken
+            base = Symbol(stem, :_gathered)
+            nm, k = base, 1
+            while nm in taken || nm in reserved
                 k += 1
-                nm = Symbol(:_rkppl_gathered_, k)
+                nm = Symbol(base, :_, k)
             end
             push!(taken, nm)
             push!(out, Expr(:(=), nm, value))
             nm
         end
     end
-    function walk(ex)
+    function walk(ex, stem::Symbol)
         ex isa Expr || return ex
         ex.head in (:macrocall, :quote) && return ex
         ex.head in _DEFERRED_VALUE_HEADS && return ex
-        args = Any[walk(a) for a in ex.args]
+        args = Any[walk(a, stem) for a in ex.args]
         if ex.head === :ref && length(args) >= 2 &&
                 _gathered_value(args[1]) && !_data_only(args[1], data, detmap)
-            args[1] = name!(args[1])
+            args[1] = name!(args[1], stem)
         end
         return Expr(ex.head, args...)
     end
     defined = Set{Symbol}(keys(detmap))
     for st in ast.args
         if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
-            st = Expr(:(=), st.args[1], walk(st.args[2]))
+            st = Expr(:(=), st.args[1], walk(st.args[2], st.args[1]))
         elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
                 !_external_rhs(st.args[3])
             observed = _sampled_lhs_names!(Set{Symbol}(), st.args[2])
             if any(in(data), observed) ||
                     (_is_broadcast_sample(st) && any(in(defined), observed))
-                rhs = _map_rhs_values(walk, st.args[3])
+                stem = first(sort!(collect(observed)))
+                rhs = _map_rhs_values(ex -> walk(ex, stem), st.args[3])
                 rhs == st.args[3] ||
                     (st = Expr(:call, st.args[1], st.args[2], rhs))
             end
@@ -6873,6 +6898,8 @@ function _value_symbols!(out::Set{Symbol}, ex)
     ex.head === :kw && length(ex.args) == 2 &&
         return _value_symbols!(out, ex.args[2])
     if ex.head === :call && !isempty(ex.args)
+        _constructed_endpoint_head(ex.args[1]) &&
+            _value_symbols!(out, ex.args[1].args[1])
         for a in ex.args[2:end]
             _value_symbols!(out, a)
         end
@@ -10238,6 +10265,8 @@ function _whole_value_symbols!(out::Set{Symbol}, ex)
         # `_value_symbols` visits, one argument at a time so nested refs
         # keep their exemption.
         if ex.head === :call && !isempty(ex.args)
+            _constructed_endpoint_head(ex.args[1]) &&
+                _whole_value_symbols!(out, ex.args[1].args[1])
             foreach(a -> _whole_value_symbols!(out, a), ex.args[2:end])
             return nothing
         elseif ex.head === :. && length(ex.args) == 2 &&
