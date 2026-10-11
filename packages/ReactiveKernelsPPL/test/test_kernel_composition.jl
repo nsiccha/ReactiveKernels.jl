@@ -35,6 +35,23 @@ const alias = recurrence
     end
     return totals
 end
+@kernel basis_methods(axis::Vector{Float64}) = begin
+    center = sum(axis) / length(axis)
+    width = 1.5 * maximum(abs.(axis .- center))
+    omega2 = plate(1:3, Ref(width)) do mode, width
+        (mode * pi / (2width))^2
+    end
+    rows = plate(axis, Ref(omega2), Ref(width), Ref(center)) do x, omega2, width, center
+        values = plate(1:3, Ref(x), Ref(omega2), Ref(width), Ref(center)) do b, x, omega2, width, center
+            sin(sqrt(omega2[b]) * (x - center + width)) / sqrt(width)
+        end
+        values
+    end
+    PHI = stack(rows; dims=1)
+    basis_matrix() = PHI
+    squared_frequencies() = omega2
+end
+const basis_alias = basis_methods
 
 end
 
@@ -232,6 +249,73 @@ end
         @test data == original
     end
     @test all(==(first(counts)), counts)
+end
+
+function method_case(data; head=:basis_methods, live=true)
+    axis = live ? :(exp.(a .+ t)) : :t
+    matrix_call = Expr(:call, Expr(:., Expr(:call, head, :x),
+        QuoteNode(:basis_matrix)))
+    frequency_call = Expr(:call, Expr(:., Expr(:call, head, :x),
+        QuoteNode(:squared_frequencies)))
+    ast = quote
+        a ~ Normal(0, 1)
+        x = $axis
+        P = $matrix_call
+        omega2 = $frequency_call
+        z[1:3] .~ Normal.(0, 1)
+        mu = P * (omega2 .* z)
+        y .~ Normal.(mu, 0.7)
+    end
+    plan = lower_rkppl(ast, data; conditioned=(:y,), mod=Models)
+    bound = bind_data(plan, data)
+    return plan, bound, build_kernel(bound)
+end
+
+function method_reference(data, u; live=true)
+    a, z = u[1], u[2:4]
+    axis = live ? exp.(a .+ data.t) : data.t
+    center = sum(axis) / length(axis)
+    width = 1.5 * maximum(abs.(axis .- center))
+    omega2 = [(mode * pi / (2width))^2 for mode in 1:3]
+    P = [sin(sqrt(omega2[b]) * (x - center + width)) / sqrt(width)
+         for x in axis, b in 1:3]
+    mu = P * (omega2 .* z)
+    return logpdf(Normal(), a) + sum(logpdf.(Normal(), z)) +
+        sum(logpdf.(Normal.(mu, 0.7), data.y))
+end
+
+@testset "PPL composes constructed object endpoints" begin
+    data = (; t=[0.5, 0.9, 1.4, 2.1], y=[0.2, -0.1, 0.4, 0.3])
+    original = deepcopy(data)
+    u = [0.1, -0.2, 0.3, 0.15]
+    for head in (:basis_methods, :basis_alias, :(Models.basis_methods)),
+        live in (true, false)
+        plan, bound, built = method_case(data; head, live)
+        @test any(entry -> entry.kind === :plate && entry.depth == 1,
+            recipe_inventory(built.spec))
+        sampler = prepare_sampler(built, bound, u; backend=BACKEND)
+        value, grad = sampler_value_and_gradient!(sampler, similar(u), u)
+        oracle = v -> method_reference(data, v; live)
+        @test value ≈ oracle(u) rtol=1e-11
+        for j in eachindex(u)
+            step = 1e-6
+            lo, hi = copy(u), copy(u)
+            lo[j] -= step
+            hi[j] += step
+            @test grad[j] ≈ (oracle(hi) - oracle(lo)) / (2step) rtol=1e-5 atol=1e-7
+        end
+        @test data == original
+        if head === :basis_methods && !live
+            changed = (; t=data.t .+ [0.1, 0.0, -0.1, 0.2], y=data.y)
+            rebound = bind_data(plan, changed)
+            resampled = prepare_sampler(build_kernel(rebound), rebound, u;
+                backend=BACKEND)
+            rebound_value, _ = sampler_value_and_gradient!(resampled,
+                similar(u), u)
+            @test rebound_value ≈ method_reference(changed, u; live=false) rtol=1e-11
+            @test rebound_value != value
+        end
+    end
 end
 
 end
