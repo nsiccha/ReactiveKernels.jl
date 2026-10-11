@@ -29,7 +29,16 @@ _chain_gradient_allocated(ad::A, gradient, q, x, y) where {A} =
               _chain_gradient_allocated(flat_ad, flat_gradient, q, x, y) + 64
         bound = prepare(C.chain; bound = (; x, y))
         bound_ad = prepare_ad(bound, backend, q; active = :q)
-        @test ad_gradient(bound_ad, q) == gradient
+        # The bound kernel runs the same authored arithmetic, but it is a
+        # different compiled program. Enzyme generates derivatives with fast
+        # math by default (`Enzyme.API.fast_math!`), so LLVM may reassociate and
+        # FMA-contract the n-term adjoint sum of `q` differently in the two
+        # programs (hosted CI: 1 ulp at n = 32). Each evaluation lies within
+        # (n + 2) * eps / 2 * magnitude of the exact sum, so two lie within the
+        # bound below.
+        magnitude = sum(abs.(x) .* (abs.(only(q) .* x) .+ abs.(y)))
+        @test isapprox(ad_gradient(bound_ad, q), gradient;
+                       rtol = 0, atol = 2 * n * eps() * magnitude)
     end
 end
 
