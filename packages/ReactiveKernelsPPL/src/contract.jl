@@ -2241,7 +2241,8 @@ function _label_only_columns(plan::StructuralPlan)
             for f in fieldnames(ArrayParameter)
                 if f === :dims
                     for d in x.dims
-                        _is_levels_dim(d) ? push!(labels, d.args[2]) : visit(d)
+                        g = _level_pool_source(d)
+                        g === nothing ? visit(d) : push!(labels, g)
                     end
                 else
                     visit(getfield(x, f))
@@ -6389,7 +6390,8 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         scale isa Symbol && push!(required, scale)
     end
     for p in plan.array_parameters, d in p.dims
-        _is_levels_dim(d) && push!(required, d.args[2])
+        g = _level_pool_source(d)
+        g === nothing || push!(required, g)
     end
     for p in plan.vector_parameters
         p.extent_expr === nothing || union!(required, _expr_value_symbols(p.extent_expr))
@@ -6449,8 +6451,8 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     end
     foreach(gather_indices, values(nodes))
     for p in plan.array_parameters, dim in p.dims
-        dim isa Expr && dim.head === :call && dim.args[1] === :levels &&
-            dim.args[2] isa Symbol && push!(axes, dim.args[2])
+        g = _level_pool_source(dim)
+        g === nothing || push!(axes, g)
     end
     union!(required, axes)
     names = Set{Symbol}(nm for (nm, ex) in nodes
@@ -6593,10 +6595,14 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         p.range isa Union{Symbol,Expr} || continue
         push!(defs, Symbol(:_ppl_axis_input_, p.name) => p.range)
     end
+    # A level axis reads its source as one pool of values, whether keyed by
+    # label (`levels(g)`) or by position (`1:length(levels(g)) - k`): `g`
+    # may have any length, such as a per-group table beside the observations.
     for p in plan.array_parameters, (i, d) in enumerate(p.dims)
-        _is_levels_dim(d) || continue
+        g = _level_pool_source(d)
+        g === nothing && continue
         push!(defs, Symbol(:_ppl_axis_input_, p.name, :_, i) =>
-            Expr(:call, GlobalRef(Base, :identity), d.args[2]))
+            Expr(:call, GlobalRef(Base, :identity), g))
     end
     for p in plan.vector_parameters
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
@@ -6651,7 +6657,8 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         elseif f === :array_parameters
             for p in plan.array_parameters
                 delete!(free, p.name)
-                _drop_held_names!(free, filter(d -> !_is_axis_dim(d) && !_is_levels_dim(d), p.dims))
+                _drop_held_names!(free, filter(d -> !_is_axis_dim(d) &&
+                    _level_pool_source(d) === nothing, p.dims))
             end
         elseif f === :responses
             for r in plan.responses
@@ -6817,7 +6824,8 @@ function _drop_held_names!(out::Set{Symbol}, p::ArrayParameter)
     for f in fieldnames(ArrayParameter)
         if f === :dims
             for d in p.dims
-                (_is_axis_dim(d) || _is_levels_dim(d)) || _drop_held_names!(out, d)
+                (_is_axis_dim(d) || _level_pool_source(d) !== nothing) ||
+                    _drop_held_names!(out, d)
             end
         else
             _drop_held_names!(out, getfield(p, f))
