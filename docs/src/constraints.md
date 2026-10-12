@@ -117,9 +117,11 @@ is RK lowering and preparation, enforced by an audit. The gate is
 Client code that is not concretely typed is discouraged, not refused. The user
 chose a warning-only check (decision `2026-10-12T20-13-15-811-1hui2qi`,
 following their 20:14 feedback on decision
-`2026-10-12T20-12-23-260-0027dq6`: "We don't need to fail.... but we should
-at the very least strongly discourage and probably warn when this happens"):
-preparation names the value and its recipe and continues.
+`2026-10-12T20-12-23-260-0027dq6`, message `2026-10-12T20:14:38`: "We don't
+need to fail.... but we should at the very least strongly discourage and
+probably warn when this happens", recorded as principle review
+`2026-10-12T20-19-25-395-1dvac2l`): preparation names the value and its
+recipe and continues.
 
 ## Derivative rules come from one mathematical graph, never by hand
 
