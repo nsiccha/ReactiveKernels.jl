@@ -198,13 +198,19 @@ end
 _kernel_native_source(f) = f
 _kernel_native_source(f::_KernelSourceFunction) = f.f
 
+# The method query is `Core._hasmethod` on the complete signature, which
+# inference folds on every supported Julia. `hasmethod(f.f, argtypes)` folds
+# the query too, but from Julia 1.12 it first validates its argument tuple type
+# with `Base.to_tuple_type`, a loop over the signature's parameters that the
+# optimizer cannot remove: it stayed in the compiled body, dynamically typed,
+# on every call of every captured source operation, plate cells included.
 @inline @generated function (f::_KernelSourceFunction)(args::Vararg{Any,N}) where {N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
-    argtypes = Tuple{args...}
+    signature = Tuple{f.parameters[1], args...}
     quote
         # The type-only query uses the caller's world without boxing active
         # argument values into a method-lookup array during ordinary AD.
-        if hasmethod(f.f, $argtypes)
+        if Core._hasmethod($signature)
             Base.@inline f.f($(forwarded...))
         else
             Base.@inline _kernel_runtime_source_call(

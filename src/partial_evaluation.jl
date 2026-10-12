@@ -415,7 +415,11 @@ Reassembles arm pointwise vectors into lane order: `vcat(parts...)[order]`
 struct _LaneAssemble
     order::Vector{Int}
 end
-(assemble::_LaneAssemble)(parts...) = vcat(parts...)[assemble.order]
+# `Vararg{Any,N}` specializes on the arm count; an unspecialized `parts...`
+# left `vcat(parts...)` a run-time `Core._apply_iterate` call in every
+# evaluation of a partitioned plate.
+(assemble::_LaneAssemble)(parts::Vararg{Any,N}) where {N} =
+    vcat(parts...)[assemble.order]
 _readable_callee(::_LaneAssemble) = :lane_assemble
 _opname(::_LaneAssemble) = "lane_assemble"
 

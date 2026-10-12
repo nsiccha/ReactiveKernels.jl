@@ -4029,7 +4029,15 @@ end
 @inline _embedded_marker_values(x) = ()
 @inline _embedded_marker_values(x::NamedTuple) = values(x)
 # A view or other array wrapper must not hide its traced storage from dispatch.
-@inline _embedded_marker_values(x::AbstractArray) = parent(x) === x ? () : (parent(x),)
+# An array whose parent has its own type is unwrapped storage. Deciding that by
+# type keeps the marker search inferable: a runtime `parent(x) === x` left the
+# array's own type in the result, so the search re-entered itself with the
+# same signature, and from Julia 1.12 inference gave up and dispatched every
+# kernel call's marker search at run time. Traced-ness is a property of the
+# type (`_requires_tensorized_marker`), so a same-typed parent adds nothing.
+@inline _embedded_marker_values(x::AbstractArray) = _embedded_parent_values(x, parent(x))
+@inline _embedded_parent_values(::A, ::A) where {A<:AbstractArray} = ()
+@inline _embedded_parent_values(x, parent) = (parent,)
 
 @inline function _embedded_axis_marker(value)
     _authored_plate_is_axis(value) && return value
