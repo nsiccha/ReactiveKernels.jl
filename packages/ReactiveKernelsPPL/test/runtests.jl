@@ -77,6 +77,7 @@ const _PPL_TEST_FILES = (
     "test_values_compose.jl",
     "test_fallback.jl",
     "test_combos.jl",
+    "test_type_stability.jl",
     "test_sb_parity.jl",
     "test_hurdle.jl",
     "test_hurdle_reactant.jl",
