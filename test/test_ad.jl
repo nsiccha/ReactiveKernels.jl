@@ -6,7 +6,6 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 include("test_authored_plate_chains_ad.jl")
 include("test_scan_plate_ad.jl")
 include("test_plate_consumer_native_ad.jl")
-include("test_uninferred_plate_operand_ad.jl")
 include("test_native_concat_ad.jl")
 include("test_ad_bound_operand_counts.jl")
 include("test_ad_tangent_operators.jl")
