@@ -2283,13 +2283,34 @@ function _kernel_authored_plate_expr(rhs, mod,
         push!(atomic, length(arguments))
     end
 
+    scope = union(Set(formals), caller_locals)
+    varying = Set(formals[i] for i in eachindex(formals) if !(i in atomic))
+    shared = Set(formals[i] for i in atomic)
+    branch_arm_specs = _kernel_plate_branch_arms(
+        scalar_body, formals, shared, mod, scope; endpoint_cache)
+    cell = _kernel_plate_cell_spec(scalar_body, formals, varying, shared, mod,
+        scope; endpoint_cache, branch_arm_specs)
+    operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_plate),
+                     cell.spec,
+                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
+    (; arguments, operation, inferred = cell.inferred, atomic = Tuple(atomic),
+       materialized_arguments)
+end
+
+# The `KernelSpec` construction expression of one plate cell body over
+# `formals`, and the inferred type of its value. `varying` names the zipped
+# formals and `shared` the atomic ones (`_kernel_hoist_cell_invariants`);
+# `scope` is every caller-side name the body may read as a port.
+function _kernel_plate_cell_spec(scalar_body, formals::Vector{Symbol},
+                                 varying::Set{Symbol}, shared::Set{Symbol},
+                                 mod, scope::Set{Symbol};
+                                 endpoint_cache, branch_arm_specs = nothing)
     nested_specs = Dict{Symbol,Any}()
     local_types = Dict{Symbol,Any}()
     materialized = Tuple{Symbol,Any,Any}[]
     cell_locals = _kernel_plate_cell_locals(scalar_body)
     rewritten, inferred = _kernel_constructed_endpoint(
-        scalar_body, mod, union(Set(formals), caller_locals),
-        nested_specs, local_types;
+        scalar_body, mod, scope, nested_specs, local_types;
         context = "inside plate", materialized = materialized,
         cell_locals = cell_locals, endpoint_cache = endpoint_cache)
     signature = Tuple{Symbol,Any}[
@@ -2320,16 +2341,91 @@ function _kernel_authored_plate_expr(rhs, mod,
                 Expr(:(::), _KERNEL_PLATE_VALUE_PORT, inferred))
     end
     scalar_graph_body = _kernel_hoist_cell_invariants(scalar_graph_body,
-        Set(formals[i] for i in eachindex(formals) if !(i in atomic)),
-        Set(formals[i] for i in atomic))
-    scalar_spec = _kernel_expand(
+                                                      varying, shared)
+    spec = _kernel_expand(
         scalar_graph_body, signature, nothing, mod;
-        nested_specs = nested_specs, endpoint_cache = endpoint_cache)
-    operation = Expr(:call, GlobalRef(@__MODULE__, :_kernel_authored_plate),
-                     scalar_spec,
-                     Expr(:call, GlobalRef(Base, :Val), QuoteNode(Tuple(atomic))))
-    (; arguments, operation, inferred, atomic = Tuple(atomic),
-       materialized_arguments)
+        nested_specs = nested_specs, endpoint_cache = endpoint_cache,
+        branch_arm_specs = branch_arm_specs)
+    (; spec, inferred)
+end
+
+# Each top-level lazy branch of a plate cell, keyed by the cell value it
+# assigns (the last value expression assigns `__plate_value__`, as
+# `_kernel_expression_result_body` and `_kernel_implicit_plate_result_body`
+# name it), mapped to the graphs of its leaf arms: `(; then_arm, else_arm)`
+# per branch level (`_kernel_branch_callable`). A leaf arm's graph is authored
+# exactly as a cell whose whole body is that arm, so its constructed endpoints
+# splice as recipes, and the native lowering can hoist the shared ones when
+# the condition reads only shared values (`_plate_shared_branch`). `nothing`
+# when the cell has no such branch.
+function _kernel_plate_branch_arms(scalar_body, formals::Vector{Symbol},
+                                   shared::Set{Symbol}, mod, scope::Set{Symbol};
+                                   endpoint_cache)
+    statements = scalar_body isa Expr && scalar_body.head === :block ?
+        Any[s for s in scalar_body.args if !_kernel_is_line(s)] : Any[scalar_body]
+    names = union(Set(formals), _kernel_plate_cell_locals(scalar_body))
+    arm_scope = union(scope, names)
+    table = Dict{Symbol,Any}()
+    for (index, statement) in enumerate(statements)
+        name, rhs = if statement isa Expr && statement.head === :(=)
+            lhs = statement.args[1]
+            (lhs isa Symbol ? lhs :
+             lhs isa Expr && lhs.head === :(::) && lhs.args[1] isa Symbol ?
+                lhs.args[1] : nothing, statement.args[2])
+        elseif index == length(statements) && !(statement isa Symbol) &&
+               !(statement isa Expr && statement.head === :return)
+            (_KERNEL_PLATE_VALUE_PORT, statement)
+        else
+            (nothing, nothing)
+        end
+        name === nothing && continue
+        arms = _kernel_plate_arm_entries(rhs, names, shared, mod, arm_scope;
+                                         endpoint_cache)
+        arms === nothing || (table[name] = arms)
+    end
+    isempty(table) ? nothing : table
+end
+
+function _kernel_plate_arm_entries(rhs, names, shared, mod, scope; endpoint_cache)
+    parts = _kernel_branch_parts(rhs)
+    parts === nothing && return nothing
+    _, then_side, else_side = parts
+    entry(side) = _kernel_branch_parts(side) === nothing ?
+        _kernel_plate_arm_spec(side, names, shared, mod, scope; endpoint_cache) :
+        _kernel_plate_arm_entries(side, names, shared, mod, scope; endpoint_cache)
+    then_entry, else_entry = entry(then_side), entry(else_side)
+    then_entry === nothing && else_entry === nothing && return nothing
+    (; then_arm = then_entry, else_arm = else_entry)
+end
+
+# A leaf arm's graph over the cell names it reads, or `nothing` for an arm that
+# is not one plain value expression: a bare name (there is nothing to lift),
+# statements, loops, closures, macro calls, or a call of a function-shaped
+# graph, which a cell splices only over ports. Those arms keep their closure.
+function _kernel_plate_arm_spec(side, names, shared, mod, scope; endpoint_cache)
+    arm = _kernel_branch_unwrap(side)
+    arm isa Symbol && return nothing
+    _kernel_plate_arm_value(arm, mod) || return nothing
+    ports = _kernel_free_ports(arm, names)
+    body = Expr(:block, LineNumberNode(0, :plate_branch_arm), deepcopy(arm))
+    _kernel_plate_cell_spec(body, ports,
+        Set(port for port in ports if !(port in shared)),
+        Set(port for port in ports if port in shared), mod, scope;
+        endpoint_cache).spec
+end
+
+function _kernel_plate_arm_value(ex, mod)
+    ex isa Expr || return true
+    if ex.head === :block
+        statements = Any[arg for arg in ex.args if !_kernel_is_line(arg)]
+        return length(statements) == 1 && _kernel_plate_arm_value(only(statements), mod)
+    end
+    ex.head in (:call, :., :ref, :tuple, :vect, :hcat, :vcat, :row, :comparison,
+                :&&, :||, :if, :elseif, :kw, :parameters, :(::), :..., :curly,
+                :string) || return false
+    ex.head === :call && _kernel_called_spec(
+        ex, mod, Set{Symbol}(), Dict{Symbol,Any}()) !== nothing && return false
+    all(arg -> _kernel_plate_arm_value(arg, mod), ex.args)
 end
 
 Base.@nospecializeinfer function _kernel_authored_plate(
@@ -3592,7 +3688,10 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
         normal.args[1] == GlobalRef(@__MODULE__, :_KernelSourceOp) || return normal
     mod = get(kwargs, :mod, nothing)
     ignored_rhs = _kernel_ignore_throw_source(rhs, mod, known)
-    ignored = _kernel_operation_body(ignored_rhs, deps, known; kwargs...)
+    # Branch arm graphs belong to the authored source only; the throw-stripped
+    # twin keeps its arms as closures.
+    ignored = _kernel_operation_body(ignored_rhs, deps, known;
+        (key => value for (key, value) in kwargs if key !== :branch_arms)...)
     Expr(:call, GlobalRef(@__MODULE__, :_kernel_with_ignored_throws),
          _kernel_source_functions(normal, mod), _kernel_source_functions(ignored, mod))
 end
@@ -3679,7 +3778,8 @@ end
 function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
-                           nested_specs = Dict{Symbol,Any}())
+                           nested_specs = Dict{Symbol,Any}(),
+                           branch_arms = nothing)
     form = :fused
     call_identity = nothing
     call_capture_name = nothing
@@ -3728,8 +3828,10 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     if _kernel_branch_parts(rhs) !== nothing
         # A top-level lazy branch keeps its parts as `_KernelBranch` metadata
         # (same lazy call semantics) so plate partial evaluation can split
-        # lanes on a data-bound condition.
-        native, _ = _kernel_branch_callable(rhs, deps, known, mod, false)
+        # lanes on a data-bound condition. In a plate cell its leaf arms also
+        # carry their graphs (`branch_arms`, `_kernel_plate_branch_arms`).
+        native, _ = _kernel_branch_callable(rhs, deps, known, mod, false;
+                                            arms = branch_arms)
         tensor, _ = _kernel_branch_callable(rhs, deps, known, mod, tensorize)
         return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
@@ -3783,9 +3885,12 @@ end
 # arguments it consumes: a leaf is a closure over its own free ports (in
 # recipe-argument order); a nested branch is a `_KernelBranch` consuming every
 # argument. The condition is always a leaf (any branch inside it stays an
-# inline lazy branch of that closure).
+# inline lazy branch of that closure). `arms` mirrors the branch's nesting
+# (`(; then_arm, else_arm)`, `_kernel_plate_branch_arms`): a leaf arm's entry
+# is its graph's construction expression or `nothing`.
 function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
-                                 mod, tensorize::Bool; leaf::Bool = false)
+                                 mod, tensorize::Bool; leaf::Bool = false,
+                                 arms = nothing)
     parts = leaf ? nothing : _kernel_branch_parts(part)
     if parts === nothing
         read = Set(_kernel_free_ports(part, Set{Symbol}(deps)))
@@ -3802,11 +3907,17 @@ function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
         _kernel_native_body(part, mod, known))
     cex, cports = _kernel_branch_callable(condition, deps, known, mod, tensorize;
                                           leaf = true)
-    tex, tports = _kernel_branch_callable(then_side, deps, known, mod, tensorize)
-    eex, eports = _kernel_branch_callable(else_side, deps, known, mod, tensorize)
+    then_arms = arms === nothing ? nothing : arms.then_arm
+    else_arms = arms === nothing ? nothing : arms.else_arm
+    tex, tports = _kernel_branch_callable(then_side, deps, known, mod, tensorize;
+        arms = then_arms isa NamedTuple ? then_arms : nothing)
+    eex, eports = _kernel_branch_callable(else_side, deps, known, mod, tensorize;
+        arms = else_arms isa NamedTuple ? else_arms : nothing)
     val(ports) = Expr(:call, GlobalRef(Base, :Val), positions(ports))
+    leaf_spec(entry) = entry isa NamedTuple ? nothing : entry
     Expr(:call, GlobalRef(@__MODULE__, :_KernelBranch),
-         val(cports), val(tports), val(eports), call, cex, tex, eex), deps
+         val(cports), val(tports), val(eports), call, cex, tex, eex,
+         leaf_spec(then_arms), leaf_spec(else_arms)), deps
 end
 
 # The parts of a generator sum as a `_KernelReduction` construction
@@ -4093,7 +4204,8 @@ end
 function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                         call_signature = nothing, mod::Union{Module,Nothing} = nothing;
                         nested_specs = Dict{Symbol,Any}(),
-                        endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}())
+                        endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}(),
+                        branch_arm_specs = nothing)
     # Promote genuine RK `@node(expr)` markers into distinct schedulable recipe nodes
     # (identity-aware, collision-free, straight-line-only). A no-op — byte-identical —
     # for bodies with no `@node` (or only foreign `@node`).
@@ -4388,9 +4500,12 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
         cost = get(metadata, :cost, 1.0)
         cse_key = get(metadata, :cse_key, nothing)
         effectful = get(metadata, :effectful, false)
+        branch_arms = branch_arm_specs === nothing || length(outputs) != 1 ?
+            nothing : get(branch_arm_specs, outputs[1][1], nothing)
         op = plate_expr === nothing ? _kernel_operation(
             rhs, deps, known; tensorize = !effectful, mod = mod,
-            nested_specs = nested_specs) : plate_expr.operation
+            nested_specs = nested_specs, branch_arms = branch_arms) :
+            plate_expr.operation
         add = :($add_ref($graph_var, $dep_values, $out_values,
                          $op, $cost, $cse_key, $effectful, $(QuoteNode(rhs))))
         destructured && push!(add.args, true)

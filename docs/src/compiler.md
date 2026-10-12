@@ -509,7 +509,23 @@ closure or macro call keeps its own evaluation, as do the arguments of a
 mutating (`!`) call and an index expression reading `end`. Like a named
 invariant, a split-off one runs once per call even when the plate has no
 cells. A `scan` step is not split: its native lowering evaluates every step
-statement at every step, named or not. The per-element WANT is
+statement at every step, named or not.
+
+A cell statement whose right-hand side is a lazy branch keeps each arm's own
+evaluation, but a branch whose condition reads only shared values (closure
+captures, `Ref` operands and `Number` plate arguments) takes the same arm at
+every cell. The native lowering decides such a condition once per call, above
+the traversal, and then runs the cells of the taken arm alone. Each plain arm
+expression is also authored as a cell of its own, so its shared work is
+lifted like any other invariant: the support guard
+`sigma > 0 ? normal(mu, sigma).logpdf(y) : -Inf` computes `log(sigma)` once
+per call, and only when `sigma > 0`. An empty domain evaluates neither the
+condition nor an arm. A condition that reads the cell, including a combined
+one such as `s > 0 && x > 0`, keeps its branch in every cell. The graph keeps
+the authored branch; the tensorized body decides a shared condition in its own
+batch dispatch.
+
+The per-element WANT is
 either accumulated with a reducer (sum by default) or collected in the one
 requested broadcast-shaped output.
 

@@ -446,7 +446,8 @@ end
 function _plate_branch_anchor_metadata(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
     shift(indices) = map(index -> index + 1, indices)
     _KernelBranch(Val(shift(CI)), Val(shift(TI)), Val(shift(EI)),
-        _LaneAnchored(branch.call), branch.condition, branch.then_arm, branch.else_arm)
+        _LaneAnchored(branch.call), branch.condition, branch.then_arm, branch.else_arm,
+        branch.then_spec, branch.else_spec)
 end
 function _plate_branch_anchor(operation::_LaneAnchored)
     inner = _plate_branch_anchor(operation.f)

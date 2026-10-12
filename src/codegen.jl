@@ -2023,6 +2023,243 @@ function _native_plate_branch_expr(
          arm_expr(branch.else_arm, :else_arm, EI))
 end
 
+# A cell whose top-level lazy branch reads only shared operands takes the same
+# arm at every cell. The native lowering then decides it once per call, above
+# the loop, and runs the cells of the taken arm alone: a variant of the cell
+# kernel whose branch recipe is replaced by that arm. An arm with its own graph
+# (`_KernelBranch` `then_spec`/`else_spec`) is spliced as recipes, so its
+# shared work (the `log(scale)` of a density, say) is hoisted above the loop
+# like any other cell invariant, and evaluated only when that arm is taken.
+# Each lane still evaluates only its own arm, and an empty domain evaluates no
+# condition and no arm, so the authored lazy semantics are unchanged. This is
+# the native counterpart of the tensorized shared-condition dispatch
+# (`_tensorized_plate_dispatch`, docs/src/constraints.md "Preserve lazy
+# branches").
+#
+# The condition must read plate arguments that are statically shared: an
+# atomic operand or a `Number`. A cell holding a nested plate or scan, an
+# embedded kernel or an effectful recipe keeps its per-cell branch, as does a
+# branch none of whose arms has a graph (nothing would be hoisted).
+Base.@nospecializeinfer function _plate_shared_branch(
+        @nospecialize(inner_kernel), atomic, callargs, callvalues)
+    inner = inner_kernel.plan
+    for r in inner.recipes
+        (r.effectful || length(r.outputs) != 1 ||
+         r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(r.op) !== nothing) && return nothing
+    end
+    g = inner.graph
+    positions = Dict(canon_id(g, v.id) => position
+                     for (position, v) in enumerate(inner.have))
+    for (index, r) in enumerate(inner.recipes)
+        r.op isa _KernelSourceOp && r.op.f isa _KernelBranch &&
+            r.op.tensor_f isa _KernelBranch || continue
+        branch = r.op.f
+        _plate_branch_has_graph(branch) || continue
+        condition_positions = Int[]
+        for i in typeof(branch).parameters[1]
+            position = get(positions, canon_id(g, r.inputs[i].id), nothing)
+            position !== nothing && (position in atomic ||
+                valtype(callvalues[position]) <: Number) || break
+            push!(condition_positions, position)
+        end
+        length(condition_positions) == length(typeof(branch).parameters[1]) ||
+            continue
+        then_kernel = _plate_branch_arm_kernel(inner, index, :then)
+        else_kernel = _plate_branch_arm_kernel(inner, index, :else)
+        (then_kernel === nothing || else_kernel === nothing) && continue
+        return (; recipe = r,
+                condition_args = Any[callargs[p] for p in condition_positions],
+                then_kernel, else_kernel)
+    end
+    nothing
+end
+
+_plate_branch_has_graph(arm) = false
+_plate_branch_has_graph(branch::_KernelBranch) =
+    branch.then_spec !== nothing || branch.else_spec !== nothing ||
+    _plate_branch_has_graph(branch.then_arm) ||
+    _plate_branch_has_graph(branch.else_arm)
+
+# The cell kernel with branch recipe `index` replaced by one arm, as
+# `(; plan, ops, lowered_recipes)`, or `nothing` when that arm's graph does not
+# fit the recipe. An arm with a graph becomes its recipes; any other arm is its
+# closure over its own ports (a nested branch stays a branch over every
+# argument, and is examined again), as in `_partition_plate_recipe`.
+Base.@nospecializeinfer function _plate_branch_arm_kernel(
+        inner::Plan, index::Int, side::Symbol)
+    r = inner.recipes[index]
+    native, tensor = r.op.f, r.op.tensor_f
+    then = side === :then
+    positions = typeof(native).parameters[then ? 2 : 3]
+    spec = getfield(native, then ? :then_spec : :else_spec)
+    g = inner.graph
+    # A shallow structural copy keeps the cell's values and operations; only its
+    # registry gains the arm's values.
+    copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
+                   copy(g.aliases), g.version)
+    next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
+    replacement = if spec === nothing
+        arm_op = _KernelSourceOp(
+            Val(Symbol(kernel_sourceop_token(r.op), :_, side)),
+            Val(kernel_sourceop_form(r.op)),
+            getfield(native, then ? :then_arm : :else_arm),
+            getfield(tensor, then ? :then_arm : :else_arm))
+        Recipe[Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
+                      arm_op, r.cost, nothing, false, r.source)]
+    else
+        _plate_branch_arm_recipes!(copied, spec, r, fresh)
+    end
+    replacement === nothing && return nothing
+    recipes = Recipe[]
+    for (i, q) in enumerate(inner.recipes)
+        i == index ? append!(recipes, replacement) : push!(recipes, q)
+    end
+    template = Plan(copied, inner.have, inner.want, inner.recipes,
+                    inner.producer, inner.cost, inner.candidates)
+    variant = _partial_subplan(template, inner.have, inner.want, recipes)
+    _, ops, lowered = _lower_with_ops(variant; inline_embedded = false)
+    length(ops) == length(variant.recipes) || return nothing
+    (; plan = variant, ops = Tuple(ops), lowered_recipes = Tuple(lowered))
+end
+
+# The recipes of an arm's graph over the branch recipe `r`: the arm's ports
+# read the branch inputs of the same name and its value is the branch output.
+Base.@nospecializeinfer function _plate_branch_arm_recipes!(
+        copied::Graph, @nospecialize(spec), r::Recipe, fresh)
+    arm = plan(spec)
+    ag = arm.graph
+    inputs = Dict{Symbol,Value}()
+    for v in r.inputs
+        get(inputs, v.name, v) == v || return nothing
+        inputs[v.name] = v
+    end
+    mapping = Dict{Int,Value}()
+    for port in arm.have
+        target = get(inputs, port.name, nothing)
+        target === nothing && return nothing
+        mapping[canon_id(ag, port.id)] = target
+    end
+    value = canon_id(ag, only(arm.want).id)
+    haskey(mapping, value) && return nothing
+    mapping[value] = only(r.outputs)
+    for (id, v) in ag.values
+        existing = get(copied.values, id, nothing)
+        existing === nothing || existing === v || return nothing
+        _register!(copied, v)
+    end
+    for (id, target) in ag.aliases
+        get(copied.aliases, id, target) == target || return nothing
+        copied.aliases[id] = target
+    end
+    mapped(v) = get(mapping, canon_id(ag, v.id), v)
+    recipes = Recipe[]
+    for q in arm.recipes
+        (q.effectful || length(q.outputs) != 1 ||
+         q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(q.op) !== nothing) && return nothing
+        push!(recipes, Recipe(fresh(), Tuple(mapped(v) for v in q.inputs),
+            (mapped(only(q.outputs)),), q.op, q.cost, nothing, false, q.source))
+    end
+    recipes
+end
+
+Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
+        body, runtime_ops, runtime_recipes, @nospecialize(inner_kernel), branch,
+        atomic, callargs, callvalues, raw_arguments, prepared_arguments, marker,
+        output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
+        element_type, into, nonempty::Bool)
+    if !nonempty
+        # The cell's own operations come first, where the tensorized lowering
+        # places them (`_lower_authored_plate_tensorized!`). Every arm stores
+        # into one container type and seeds one total: the element type the
+        # cell's branch gives.
+        (; plate_type_exprs) = _plate_cell_types!(
+            runtime_ops, runtime_recipes, inner_kernel, atomic, callargs,
+            callvalues, raw_arguments, input_type_hints)
+        if element_type === nothing
+            inner = inner_kernel.plan
+            inferred = only(_bind_native_type_exprs!(body, Any[get(plate_type_exprs,
+                canon_id(inner.graph, only(inner.want).id), GlobalRef(Core, :Any))]))
+            element_type = gensym(:plate_eltype)
+            push!(body.args, Expr(:(=), element_type,
+                Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
+                     inferred, valtype(only(inner.want)))))
+        end
+    end
+    # One pointwise buffer for every arm, which each arm fills in place: an
+    # arm-local buffer would leave native Reverse a value that is active in
+    # one arm and constant in another (a constant fallback such as `-Inf`),
+    # which its static activity analysis rejects.
+    allocate = !nonempty && pointwise_lhs !== nothing && !into
+    if allocate
+        allocation = :($(GlobalRef(@__MODULE__, :_plate_similar_output))(
+            $marker, $element_type, $output_axes))
+        push!(body.args, Expr(:(=), pointwise_lhs, recycled === nothing ? allocation :
+            _lane_allocation(recycled, element_type, output_axes, allocation)))
+    end
+    _lower_plate_shared_branch_arms!(body, runtime_ops, runtime_recipes,
+        inner_kernel, branch, atomic, callargs, callvalues, raw_arguments,
+        prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
+        recycled, input_type_hints, element_type, into = into || allocate,
+        nonempty)
+    allocate && push!(body.args, :($pointwise_lhs =
+        $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
+    body
+end
+
+# The tensorized lowering keeps the shared condition in its batch dispatch,
+# but both lowerings share one operation table: reserve the slots the native
+# arms take, in the same order.
+Base.@nospecializeinfer function _plate_shared_branch_reserve!(
+        runtime_ops, runtime_recipes, @nospecialize(inner_kernel), atomic,
+        callargs, callvalues, pointwise_lhs, total_lhs)
+    branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
+    branch === nothing && return nothing
+    placeholders = Any[gensym(:plate_argument) for _ in callargs]
+    _lower_plate_shared_branch_arms!(Expr(:block), runtime_ops, runtime_recipes,
+        inner_kernel, branch, atomic, callargs, callvalues, placeholders,
+        placeholders, gensym(:plate_axis), gensym(:plate_axes), pointwise_lhs,
+        total_lhs; recycled = nothing, input_type_hints = nothing,
+        element_type = gensym(:plate_eltype), into = false, nonempty = false)
+    nothing
+end
+
+Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
+        body, runtime_ops, runtime_recipes, @nospecialize(inner_kernel), branch,
+        atomic, callargs, callvalues, raw_arguments, prepared_arguments, marker,
+        output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
+        element_type, into, nonempty::Bool)
+    push!(runtime_ops, branch.recipe.op)
+    push!(runtime_recipes, branch.recipe)
+    operation = Expr(:ref, _OPS_ARG, length(runtime_ops))
+    condition = Expr(:call, :(getfield(getfield($operation, :f), :condition)),
+                     branch.condition_args...)
+    arm(kernel) = _lower_authored_plate_cells_native!(Expr(:block), runtime_ops,
+        runtime_recipes, kernel, atomic, callargs, callvalues, raw_arguments,
+        prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
+        recycled, input_type_hints, element_type, into, nonempty = true)
+    then_block = arm(branch.then_kernel)
+    else_block = arm(branch.else_kernel)
+    selected = Expr(:if, condition, then_block, else_block)
+    if nonempty
+        push!(body.args, selected)
+        return body
+    end
+    # An empty domain evaluates neither the condition nor an arm: only the
+    # cell's invariants, as its per-cell branch would.
+    empty_block = _lower_authored_plate_cells_native!(Expr(:block), runtime_ops,
+        runtime_recipes, inner_kernel, atomic, callargs, callvalues,
+        raw_arguments, prepared_arguments, marker, output_axes, pointwise_lhs,
+        total_lhs; recycled, input_type_hints, element_type, into,
+        unswitch = false, cells = false)
+    has_cells = Expr(:call, GlobalRef(Base, :!), Expr(:call, GlobalRef(Base, :isempty),
+        Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)))
+    push!(body.args, Expr(:if, has_cells, selected, empty_block))
+    body
+end
+
 function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots)
     if recipe.op isa _AuthoredScanOp
         _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
@@ -2193,12 +2430,8 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # empty plate falls back to `zero(eltype(marker))` (`_plate_total_seed`).
     # (`_narrow_plate_output` after the loop still recovers a homogeneous element
     # type at runtime in that residual `Any` case.)
-    plate_eltype = gensym(:plate_eltype)
     needs_marker = pointwise_lhs !== nothing || total_lhs !== nothing
     marker = gensym(:plate_axis)
-    index = gensym(:plate_index)
-    previous = gensym(:plate_previous)
-    first_coordinate = gensym(:plate_first)
     atomic_val = Expr(:call, GlobalRef(Base, :Val), QuoteNode(atomic))
     if needs_marker
         # The marker supplies only the pointwise buffer's container type/shape and
@@ -2319,7 +2552,36 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         [arg for arg in raw_arguments if arg !== nothing])
     push!(body.args, Expr(:(=), output_axes,
         Expr(:call, GlobalRef(@__MODULE__, :_plate_require_axes), combined_axes)))
+    _lower_authored_plate_cells_native!(body, runtime_ops, runtime_recipes,
+        inner_kernel, atomic, callargs, callvalues, raw_arguments,
+        prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
+        recycled, input_type_hints, element_type, into)
+end
 
+# The cells of an authored plate, once its arguments, axes and marker are
+# bound: the invariants above the loop, the cell loop, the pointwise buffer and
+# the total. `inner_kernel` is the plate's cell kernel or a branch-arm variant
+# of it (`plan`, `ops`, `lowered_recipes`). With `cells = false` the domain is
+# known to be empty: the invariants and the empty result are emitted, no loop.
+Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
+        body, runtime_ops, runtime_recipes, @nospecialize(inner_kernel), atomic,
+        callargs, callvalues, raw_arguments, prepared_arguments, marker,
+        output_axes, pointwise_lhs, total_lhs; recycled = nothing,
+        input_type_hints = nothing, element_type = nothing, into::Bool = false,
+        unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false)
+    inner = inner_kernel.plan
+    if unswitch
+        branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
+        branch === nothing || return _lower_plate_shared_branch_native!(
+            body, runtime_ops, runtime_recipes, inner_kernel, branch, atomic,
+            callargs, callvalues, raw_arguments, prepared_arguments, marker,
+            output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
+            element_type, into, nonempty)
+    end
+    plate_eltype = gensym(:plate_eltype)
+    index = gensym(:plate_index)
+    previous = gensym(:plate_previous)
+    first_coordinate = gensym(:plate_first)
     root_positions = Dict(
         canon_id(inner.graph, input.id) => position
         for (position, input) in enumerate(inner.have)
@@ -2333,6 +2595,33 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
             gensym(Symbol(:plate_, output.name))
         end
     end
+    (; op_offset, scan_offsets, plate_type_exprs, nested) = _plate_cell_types!(
+        runtime_ops, runtime_recipes, inner_kernel, atomic, callargs, callvalues,
+        raw_arguments, input_type_hints)
+    inferred_eltype = nested === nothing ?
+        get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
+            GlobalRef(Core, :Any)) : nested.type
+    inferred_eltype = only(_bind_native_type_exprs!(body, [inferred_eltype]))
+    # A caller that already fixes the element type (the non-allocating step of
+    # a declared `Array{T}` plate output, whose cache is an `Array{T}`) passes
+    # it as `element_type`: each cell then converts on store, as the declared
+    # typed local converts the whole result in the ordinary native kernel.
+    push!(body.args, Expr(:(=), plate_eltype, element_type !== nothing ? element_type :
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
+             inferred_eltype, valtype(only(inner.want)))))
+    _lower_authored_plate_loop_native!(body, inner, inner_kernel, atomic,
+        callargs, callvalues, raw_arguments, prepared_arguments, marker,
+        output_axes, pointwise_lhs, total_lhs, recycled, into, cells,
+        plate_eltype, index, previous, first_coordinate, root_positions,
+        dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested)
+end
+
+# Append a cell kernel's operations to the table and build the type expression
+# of every cell value from the argument types.
+Base.@nospecializeinfer function _plate_cell_types!(
+        runtime_ops, runtime_recipes, @nospecialize(inner_kernel), atomic,
+        callargs, callvalues, raw_arguments, input_type_hints)
+    inner = inner_kernel.plan
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
@@ -2391,17 +2680,15 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
             Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...) : scan_type
     end
-    inferred_eltype = nested === nothing ?
-        get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
-            GlobalRef(Core, :Any)) : nested.type
-    inferred_eltype = only(_bind_native_type_exprs!(body, [inferred_eltype]))
-    # A caller that already fixes the element type (the non-allocating step of
-    # a declared `Array{T}` plate output, whose cache is an `Array{T}`) passes
-    # it as `element_type`: each cell then converts on store, as the declared
-    # typed local converts the whole result in the ordinary native kernel.
-    push!(body.args, Expr(:(=), plate_eltype, element_type !== nothing ? element_type :
-        Expr(:call, GlobalRef(@__MODULE__, :_plate_result_eltype),
-             inferred_eltype, valtype(only(inner.want)))))
+    (; op_offset, scan_offsets, plate_type_exprs, nested)
+end
+
+Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
+        body, inner::Plan, @nospecialize(inner_kernel), atomic, callargs,
+        callvalues, raw_arguments, prepared_arguments, marker, output_axes,
+        pointwise_lhs, total_lhs, recycled, into::Bool, cells::Bool,
+        plate_eltype, index, previous, first_coordinate, root_positions,
+        dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested)
     groups = _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues)
     nested === nothing || (groups = [])
@@ -2519,15 +2806,17 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # loop would not vectorize.
     iteration = Expr(:call, GlobalRef(@__MODULE__, :_plate_cells),
                      Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes))
-    if has_scheduled_groups
+    if has_scheduled_groups && cells
         push!(body.args, :($previous = nothing))
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
-    reduction = nested === nothing ? _plate_reduction_plan(
+    reduction = cells && nested === nothing ? _plate_reduction_plan(
         inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
         pointwise_lhs) : nothing
-    if reduction === nothing
+    if !cells
+        # A domain known to be empty runs no cell.
+    elseif reduction === nothing
         push!(body.args, cell_loop)
     else
         push!(body.args, _lower_plate_reduction_native(reduction.kind,
@@ -2685,6 +2974,8 @@ Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
     _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
+    _plate_shared_branch_reserve!(runtime_ops, runtime_recipes, inner_kernel,
+        atomic, callargs, callvalues, pointwise_lhs, total_lhs)
     if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)
         _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
             Any[GlobalRef(Core, :Any) for _ in inner.have])
