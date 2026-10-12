@@ -12,7 +12,8 @@
 # Statements on a path that cannot return (throw paths) are skipped, and so is
 # an unused call's result, whose inferred type Julia widens to `Any`. A
 # non-concrete value whose arguments are all concrete is the source of the
-# instability and is reported as `:root`.
+# instability and is reported as `:root`. Statements inlined from a call chain
+# in `JUSTIFIED` are exempt; each entry carries its justification.
 module TypeStabilityAudit
 
 export findings, ad_call_findings, rk_or_generated
@@ -32,6 +33,24 @@ Base.show(io::IO, f::Finding) = print(io, f.kind, " in ", f.method, " %", f.inde
     " :: ", f.type, "  ", f.statement)
 
 const MAX_UNION = 4
+
+# RK-introduced residue that stays, with the reason it stays (decision
+# `1hui2qi`: fix every site or justify it explicitly). Each entry is a call
+# chain; a statement whose inlining chain contains all of its names, in any
+# order, is exempt.
+#
+# - `_KernelSourceFunction` → `hasmethod` → `to_tuple_type`: from Julia 1.12,
+#   the `hasmethod(f.f, argtypes)` query of `_KernelSourceFunction` folds, but
+#   `Base.to_tuple_type`'s validation loop over the argument tuple type's
+#   parameters stays in every captured-source call. It is dynamically typed and runs per plate cell, but
+#   it makes no dynamic call. The fold, `Core._hasmethod` on the complete
+#   signature, is held on todo `0itft6t` (`ReactiveKernels:snag.native-lowering-948c4ab6`).
+#   With the fold, Julia 1.12/1.13 native Reverse in `test_scan_plate_ad.jl`
+#   ("scans nested over an outer-invariant empty sequence keep ordinary reverse
+#   AD") hits Enzyme's negative loop-cache count (`OutOfMemoryError`; reproduced
+#   with Enzyme 0.13.216 on Julia 1.12.7; EnzymeAD/Enzyme.jl#3787). Remove this
+#   entry when that todo lands the fold.
+const JUSTIFIED = ((:_KernelSourceFunction, :hasmethod, :to_tuple_type),)
 
 widen(@nospecialize(T)) = Core.Compiler.widenconst(T)
 
@@ -142,6 +161,42 @@ end
 
 label(m::Method) = string(m.module, ".", m.name, " @ ", m.file, ":", m.line)
 
+frame_name(m::Core.MethodInstance) = frame_name(m.def)
+frame_name(m::Method) = m.name
+frame_name(m) = m
+
+frame_name(m::Core.CodeInstance) = frame_name(m.def)
+
+# The names of the methods statement `i` was inlined from, outermost first
+# (needs the code inferred with `debuginfo = :source`). From Julia 1.12 each
+# inlined frame is an edge of the caller's `DebugInfo`; `buildLineInfoNode`
+# returns nothing for a statement whose own line is unknown, as in a body
+# RuntimeGeneratedFunctions generates, so the edges are walked directly.
+function inlining_chain(ci::Core.CodeInfo, i)
+    chain = Any[]
+    if isdefined(ci, :debuginfo)
+        info, pc = ci.debuginfo, i
+        while true
+            _, edge, edge_pc = Base.IRShow.getdebugidx(info, pc)
+            (edge == 0 || edge_pc <= 0) && break
+            info, pc = info.edges[Int(edge)], Int(edge_pc)
+            push!(chain, frame_name(info.def))
+        end
+        return chain
+    end
+    location = ci.codelocs[i]
+    while location != 0
+        node = ci.linetable[location]
+        push!(chain, frame_name(node.method))
+        location = node.inlined_at
+    end
+    chain
+end
+
+justified(ci, i) = let chain = inlining_chain(ci, i)
+    any(entry -> all(in(chain), entry), JUSTIFIED)
+end
+
 """
     findings(f, argtypes; recurse = rk_or_generated) -> Vector{Finding}
 
@@ -154,11 +209,12 @@ findings(@nospecialize(f), @nospecialize(argtypes); recurse = rk_or_generated) =
 function audit!(found, seen, @nospecialize(tt), where, recurse)
     tt in seen && return found
     push!(seen, tt)
-    for (ci, _) in Base.code_typed_by_type(tt; optimize = true)
+    for (ci, _) in Base.code_typed_by_type(tt; optimize = true, debuginfo = :source)
         ci isa Core.CodeInfo || continue
         live, reads = returning(ci), used(ci)
         for (i, statement) in enumerate(ci.code)
             live[i] || continue
+            justified(ci, i) && continue
             T = widen(ci.ssavaluetypes[i])
             if reads[i] && valued(statement) && !stable(T)
                 root = statement isa Expr && statement.head in (:call, :invoke) &&
