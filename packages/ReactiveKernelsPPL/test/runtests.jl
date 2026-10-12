@@ -277,6 +277,8 @@ const _PPL_TEST_FILES = (
     "test_index_endpoints.jl",
     "test_base_value_names.jl",
     "test_rebinding_rows.jl",
+    "test_glm_object_values.jl",
+    "test_glm_object_values_reactant.jl",
     "test_sampler_retained.jl",
     "test_shared_value_closures.jl",
     "test_inline_call_values.jl",

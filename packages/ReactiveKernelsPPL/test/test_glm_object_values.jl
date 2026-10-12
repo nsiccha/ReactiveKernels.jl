@@ -1,0 +1,262 @@
+using DifferentiationInterface, Distributions, Enzyme, ReactiveKernels, ReactiveKernelsPPL, Test
+
+# Whole-data GLM objects read their arguments as values, like the ordinary
+# `X * b` predictor path: the design matrix may be bound data, a definition
+# or an inline matrix (an intercept column or a parameter column included);
+# the intercept a literal, scalar data, a sampled value or an expression; the
+# coefficients any vector value; the Normal scale any positive scalar value.
+
+const _GV_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
+
+_gv_rows(n) = collect(range(-1.0, 1.0; length = n))
+_gv_X(n) = hcat(_gv_rows(n), cos.(1:n), 0.3 .* sin.(2 .* (1:n)))
+_gv_y(n) = _gv_X(n) * [0.4, -0.2, 0.1] .+ 0.3 .+ 0.05 .* sin.(3 .* (1:n))
+_gv_counts(n) = [mod(3i, 4) for i in 1:n]
+_gv_flags(n) = [isodd(i ÷ 2) ? 1 : 0 for i in 1:n]
+_gv_u(built) = [0.15sin(i + 0.3) for i in 1:built.layout.total]
+
+function _gv_fd(f, u; h = 1e-6)
+    return [(f(u .+ h .* (eachindex(u) .== i)) - f(u .- h .* (eachindex(u) .== i))) / 2h
+        for i in eachindex(u)]
+end
+
+# Likelihood against the independent oracle `lik(constrained values)`, the
+# native Enzyme gradient against central differences, and the caller's data
+# left unchanged.
+function _gv_check(plan, data, lik)
+    saved = deepcopy(data)
+    built = build_kernel(plan)
+    u = _gv_u(built)
+    likelihood = prepare_query(built, plan, :likelihood)
+    @test Base.invokelatest(likelihood, u) ≈ lik(constrain(built.layout, u)) rtol = 1e-10
+    q = prepare_sampler(built, plan, u; backend = _GV_BACKEND)
+    g = similar(u)
+    value, _ = sampler_value_and_gradient!(q, g, u)
+    @test value ≈ q(u)
+    @test g ≈ _gv_fd(v -> q(v), u) rtol = 1e-5 atol = 1e-6
+    @test data == saved
+    return built
+end
+
+@testset "GLM objects over bound data matrices and literal intercepts" begin
+    n = 7
+    X, y, counts, flags = _gv_X(n), _gv_y(n), _gv_counts(n), _gv_flags(n)
+    m = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        y ~ NormalIDGLM(X, 0.0, beta, sigma)
+    end
+    built = _gv_check(m(; X) | (; y), (; X, y),
+        nt -> sum(logpdf.(Normal.(X * nt.beta, nt.sigma), y)))
+    @test coordinate_names(built.layout) == [:sigma, Symbol("beta.1"),
+        Symbol("beta.2"), Symbol("beta.3")]
+    # A literal zero intercept adds no ones column.
+    code = sprint(print, kernel_expr(m(; X) | (; y), built.layout))
+    @test !occursin("ones(", code)
+    @test occursin("normal_id_glm", code)
+
+    m = @rkppl begin
+        alpha ~ Normal(0, 10)
+        beta[axes(lags, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        y ~ NormalIDGLM(lags, alpha, beta, sigma)
+    end
+    _gv_check(m(; lags = X) | (; y), (; X, y),
+        nt -> sum(logpdf.(Normal.(nt.alpha .+ X * nt.beta, nt.sigma), y)))
+
+    m = @rkppl begin
+        alpha ~ Normal(0, 10)
+        beta1 ~ Normal(0, 1)
+        beta2 ~ Normal(0, 1)
+        beta3 ~ Normal(0, 1)
+        b = [beta1, beta2, beta3]
+        counts ~ PoissonLogGLM(X, alpha, b)
+    end
+    built = _gv_check(m(; X) | (; counts), (; X, counts),
+        nt -> sum(logpdf.(Poisson.(exp.(nt.alpha .+ X * [nt.beta1, nt.beta2, nt.beta3])),
+            counts)))
+    @test coordinate_names(built.layout) == [:alpha, :beta1, :beta2, :beta3]
+
+    m = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        flags ~ BernoulliLogitGLM(X, 0, beta)
+    end
+    _gv_check(m(; X) | (; flags), (; X, flags),
+        nt -> sum(logpdf.(Bernoulli.(1 ./ (1 .+ exp.(.-(X * nt.beta)))), flags)))
+end
+
+@testset "GLM object arguments are values: scalar data, expressions, inline matrices" begin
+    n = 6
+    X, y = _gv_X(n), _gv_y(n)
+    x1, x2, x3 = X[:, 1], X[:, 2], X[:, 3]
+    m = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        y ~ NormalIDGLM(X, off, beta, sigma)
+    end
+    _gv_check(m(; X, off = 0.7) | (; y), (; X, y),
+        nt -> sum(logpdf.(Normal.(0.7 .+ X * nt.beta, nt.sigma), y)))
+
+    inline = @rkppl begin
+        a ~ Normal(0, 1)
+        s ~ Normal(0, 1)
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        y ~ NormalIDGLM(X, 2 * a + 1, beta, exp(s))
+    end
+    named = @rkppl begin
+        a ~ Normal(0, 1)
+        s ~ Normal(0, 1)
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        intercept = 2 * a + 1
+        scale = exp(s)
+        y ~ NormalIDGLM(X, intercept, beta, scale)
+    end
+    oracle = nt -> sum(logpdf.(Normal.(2nt.a + 1 .+ X * nt.beta, exp(nt.s)), y))
+    bi = _gv_check(inline(; X) | (; y), (; X, y), oracle)
+    bn = _gv_check(named(; X) | (; y), (; X, y), oracle)
+    # Naming a subexpression changes neither the density nor the coordinates.
+    @test coordinate_names(bi.layout) == coordinate_names(bn.layout)
+
+    m = @rkppl begin
+        alpha ~ Normal(0, 10)
+        beta[1:4] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        y ~ NormalIDGLM(hcat(ones(length(x1)), x1, x2, x3), alpha, beta, sigma)
+    end
+    _gv_check(m(; x1, x2, x3) | (; y), (; x1, x2, x3, y),
+        nt -> sum(logpdf.(Normal.(nt.alpha .+ hcat(ones(n), X) * nt.beta, nt.sigma), y)))
+
+    m = @rkppl begin
+        a ~ Normal(0, 1)
+        alpha ~ Normal(0, 10)
+        Z = hcat(x1, exp.(a .* x2))
+        beta[axes(Z, 2)] .~ Normal.(0, 10)
+        y ~ NormalIDGLM(Z, alpha, beta, 0.8)
+    end
+    _gv_check(m(; x1, x2) | (; y), (; x1, x2, y),
+        nt -> sum(logpdf.(Normal.(nt.alpha .+ hcat(x1, exp.(nt.a .* x2)) * nt.beta, 0.8), y)))
+
+    # Coefficients bound as data are read whole: their length is the
+    # matrix's column count, not the observation count.
+    m = @rkppl begin
+        alpha ~ Normal(0, 10)
+        sigma ~ Exponential(1)
+        y ~ NormalIDGLM(X, alpha, b, sigma)
+    end
+    b = [0.4, -0.2, 0.1]
+    _gv_check(m(; X, b) | (; y), (; X, b, y),
+        nt -> sum(logpdf.(Normal.(nt.alpha .+ X * b, nt.sigma), y)))
+end
+
+@testset "GLM objects over matrix values keep their row contract" begin
+    m = @rkppl begin
+        alpha ~ Normal(0, 1)
+        beta[axes(X, 2)] .~ Normal.(0, 1)
+        y ~ NormalIDGLM(X, alpha, beta, 0.7)
+    end
+    # A build evaluates another binding with other rows.
+    plan5 = m(; X = _gv_X(5)) | (; y = _gv_y(5))
+    plan9 = m(; X = _gv_X(9)) | (; y = _gv_y(9))
+    built = build_kernel(plan5)
+    u = _gv_u(built)
+    nt = constrain(built.layout, u)
+    q = prepare_query(built, plan9, :likelihood)
+    @test Base.invokelatest(q, u) ≈
+        sum(logpdf.(Normal.(nt.alpha .+ _gv_X(9) * nt.beta, 0.7), _gv_y(9)))
+    pointwise = Base.invokelatest(prepare_query(built, plan9, :pointwise), u)
+    @test length(pointwise.y) == 9
+    # The design matrix's rows are the observation axis.
+    @test_throws ContractValidationError m(; X = _gv_X(5)) | (; y = _gv_y(6))
+end
+
+@testset "GLM objects over matrix values compose with evidence" begin
+    n = 6
+    X, y = _gv_X(n), _gv_y(n)
+    lo, hi = 0.0, 0.6
+    yc = clamp.(y, lo, hi)
+    m = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        y ~ censored(NormalIDGLM(X, 0.0, beta, sigma), lo, hi)
+    end
+    _gv_check(m(; X, lo, hi) | (; y = yc), (; X, y = yc),
+        nt -> sum(logpdf.(censored.(Normal.(X * nt.beta, nt.sigma), lo, hi), yc)))
+end
+
+@testset "GLM object per-observation intercept" begin
+    n = 5
+    X, y = _gv_X(n), _gv_y(n)
+    m = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        y ~ NormalIDGLM(X, offset, beta, 0.7)
+    end
+    # Not built yet: the object takes one scalar intercept. A per-observation
+    # offset belongs in the location of the ordinary predictor path.
+    @test_broken try
+        built = build_kernel(m(; X, offset = 0.1 .* (1:n)) | (; y))
+        Base.invokelatest(prepare_query(built, m(; X, offset = 0.1 .* (1:n)) | (; y),
+            :likelihood), _gv_u(built)) isa Float64
+    catch
+        false
+    end
+end
+
+_gv_family(head, eta) = head === :NormalIDGLM ? Normal(eta, 0.7) :
+    head === :BernoulliLogitGLM ? Bernoulli(1 / (1 + exp(-eta))) : Poisson(exp(eta))
+
+_gv_glm_ast(head, alpha) = (rhs = Expr(:call, head, :X, alpha, :beta);
+    head === :NormalIDGLM && push!(rhs.args, 0.7);
+    quote
+        a ~ Normal(0, 1)
+        beta[axes(X, 2)] .~ Normal.(0, 1)
+        y ~ $rhs
+    end)
+
+@testset "GLM objects over bound matrices skip missing rows" begin
+    X = [0.1 0.2; 10000.0 0.2; -0.3 0.4; 10000.0 -0.2]
+    for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM), alpha in (0.0, :a)
+        y = head === :NormalIDGLM ? Union{Missing,Float64}[0.2, missing, 0.5, missing] :
+            Union{Missing,Int}[1, missing, 0, missing]
+        data = (; y, X)
+        saved = deepcopy(data)
+        bound = bind_data(lower_rkppl(_gv_glm_ast(head, alpha), data;
+            conditioned = (:y,)), data)
+        built = build_kernel(bound)
+        u = unconstrain(built.layout, (; a = 0.2, beta = [0.3, -0.1]))
+        sampler = prepare_sampler(built, bound, u; backend = _GV_BACKEND)
+        function oracle(v)
+            p = constrain(built.layout, v)
+            eta = (alpha === :a ? p.a : 0.0) .+ X * p.beta
+            logpdf(Normal(), p.a) + sum(logpdf.(Normal(), p.beta)) +
+                sum(logpdf(_gv_family(head, eta[i]), y[i]) for i in eachindex(y)
+                    if !ismissing(y[i]))
+        end
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        @test value ≈ oracle(u)
+        @test gradient ≈ _gv_fd(oracle, u) rtol = 1e-5 atol = 1e-8
+        pw = Base.invokelatest(prepare_query(built, bound, :pointwise), u).y
+        @test length(pw) == 4
+        @test all(iszero, pw[[2, 4]])
+        @test isequal(data, saved)
+    end
+end
+
+@testset "GLM objects over bound matrices read packed rows" begin
+    X = hcat(collect(range(-1.0, 1.0; length = 8)), cos.(1:8))
+    jobs = [1, 3, 4, 7]
+    for head in (:NormalIDGLM, :BernoulliLogitGLM, :PoissonLogGLM), alpha in (0.0, :a)
+        y = head === :NormalIDGLM ? [0.2, -0.1, 0.4, 0.3] : [1, 0, 1, 1]
+        data = Dict{Symbol,Any}(:y => y, :X => X, :Jobs => jobs)
+        plan = lower_rkppl(_gv_glm_ast(head, alpha), collect(keys(data));
+            conditioned = (:y,))
+        r = ReactiveKernelsPPL._with(only(plan.responses); mi_jobs = :Jobs)
+        plan = ReactiveKernelsPPL._with(plan; responses = [r])
+        bound = bind_data(plan, data)
+        built = build_kernel(bound)
+        u = _gv_u(built)
+        p = constrain(built.layout, u)
+        eta = (alpha === :a ? p.a : 0.0) .+ X[jobs, :] * p.beta
+        pw = Base.invokelatest(prepare_query(built, bound, :pointwise), u).y
+        @test pw ≈ [logpdf(_gv_family(head, eta[k]), y[k]) for k in eachindex(jobs)]
+    end
+end
