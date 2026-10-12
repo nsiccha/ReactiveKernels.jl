@@ -141,15 +141,43 @@ end
 # folds to one argument when the generated body is compiled for concrete types;
 # a `findfirst` closure over the argument tuple instead allocated per call
 # (304 bytes for a three-port plate whose domain port carries no declared type).
-@generated function _authored_plate_marker(::Val{A}, args...) where {A}
+function _authored_plate_marker_chain(atomic, count, arm)
     body = :(throw(ArgumentError(
         "an authored plate requires at least one batched argument")))
-    for position in reverse(eachindex(args))
-        position in A && continue
+    for position in reverse(1:count)
+        position in atomic && continue
         body = :(_authored_plate_is_axis(getfield(args, $position)) ?
-            getfield(args, $position) : $body)
+            $(arm(:(getfield(args, $position)))) : $body)
     end
     body
+end
+@generated function _authored_plate_marker(::Val{A}, args...) where {A}
+    _authored_plate_marker_chain(A, length(args), identity)
+end
+
+# The runtime-selected marker's two consumers in the lowered plate, applied
+# inside each arm of the same chain, so the marker is never a call's result.
+# When an argument is not inferred, a call returning the selected argument is
+# dynamically dispatched and hands an existing bound array back as its result,
+# which native Enzyme Reverse rejects ("Constant memory is stored (or returned)
+# to a differentiable variable"; snag `joint-nlme-enzym-f8d3cb5f`). Each arm
+# returns the new pointwise buffer or the total's seed instead. With inferred
+# arguments the chain folds to one arm, the code of a bound marker.
+@generated function _authored_plate_similar_output(
+        ::Type{T}, output_axes, ::Val{A}, args...) where {T,A}
+    Expr(:block, Expr(:meta, :inline), _authored_plate_marker_chain(
+        A, length(args), marker -> :(_plate_similar_output($marker, T, output_axes))))
+end
+@generated function _authored_plate_total_seed(::Type{T}, ::Val{A},
+                                               args...) where {T,A}
+    Expr(:block, Expr(:meta, :inline), _authored_plate_marker_chain(
+        A, length(args), marker -> :(_plate_total_seed(T, $marker))))
+end
+# The chain's own argument check, run where a bound marker would be selected,
+# so a plate without a batched axis still fails first with its `ArgumentError`.
+@generated function _authored_plate_require_marker(::Val{A}, args...) where {A}
+    Expr(:block, Expr(:meta, :inline), _authored_plate_marker_chain(
+        A, length(args), marker -> :nothing))
 end
 # The running total of a fused summed plate. It starts at `zero(T)` for the
 # cells' inferred element type `T` when that type is concrete or numeric. A
@@ -274,15 +302,6 @@ end
 @inline _plate_dependency_changed(index, previous,
                                   arg::Union{Number,Ref}) = false
 
-@inline function _plate_dependency_changed(
-        index, previous, arg::Base.Broadcast.Extruded)
-    @inbounds for dimension in eachindex(arg.keeps)
-        arg.keeps[dimension] && index[dimension] != previous[dimension] &&
-            return true
-    end
-    false
-end
-
 @inline function _plate_dependency_changed(index, previous, arg)
     argument_axes = axes(arg)
     @inbounds for dimension in eachindex(argument_axes)
@@ -291,6 +310,41 @@ end
     end
     false
 end
+
+# Per-cell reads of a plate operand. A preprocessed array operand is an
+# `Extruded` that holds the array itself. When an operand of the same plate is
+# not inferred (a consumer function whose result infers `Any`), the plate's
+# axes, and so its Cartesian index, are not inferred either, and every per-cell
+# read becomes a dynamically dispatched call. Passing the `Extruded` to that
+# call boxes it: a freshly allocated object holding the array. When the array
+# is bound data, native Enzyme Reverse cannot prove that box inactive and
+# rejects it ("Constant memory is stored (or returned) to a differentiable
+# variable"; snag `joint-nlme-enzym-f8d3cb5f`). The read therefore takes the
+# array and its isbits index map as separate operands, so a dynamic read passes
+# the existing array and allocates no box around it. With an inferred index the
+# read inlines to `_broadcast_getindex`'s own `x[newindex(i, keeps, defaults)]`.
+@inline _plate_operand_source(prepared::Base.Broadcast.Extruded) = prepared.x
+@inline _plate_operand_source(prepared) = prepared
+@inline _plate_operand_indexer(prepared::Base.Broadcast.Extruded) =
+    (prepared.keeps, prepared.defaults)
+@inline _plate_operand_indexer(prepared) = nothing
+Base.@propagate_inbounds _plate_operand_read(source, indexer::Tuple, index) =
+    source[Base.Broadcast.newindex(index, indexer[1], indexer[2])]
+Base.@propagate_inbounds _plate_operand_read(source, ::Nothing, index) =
+    Base.Broadcast._broadcast_getindex(source, index)
+
+# `_plate_dependency_changed` over the same separated operand: a preprocessed
+# array changes with the dimensions its index map keeps.
+@inline function _plate_dependency_changed(index, previous, source, indexer::Tuple)
+    keeps = indexer[1]
+    @inbounds for dimension in eachindex(keeps)
+        keeps[dimension] && index[dimension] != previous[dimension] &&
+            return true
+    end
+    false
+end
+@inline _plate_dependency_changed(index, previous, source, ::Nothing) =
+    _plate_dependency_changed(index, previous, source)
 
 function _plate_similar(arguments::Tuple, ::Type{T}, output_axes) where {T}
     style = Base.Broadcast.combine_styles(arguments...)
@@ -1629,9 +1683,10 @@ function _authored_plate_scalar_ref(inner::Plan, locals, callargs,
         # contract. Only this projection is unchecked; the cell body keeps
         # its own bounds checks. A checked read keeps LLVM from vectorizing
         # the cell loop.
-        return looped && !statically_scalar ?
-            _inbounds_value(Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
-                                 prepared_arguments[have_index], index)) : arg
+        looped && !statically_scalar || return arg
+        source, indexer = prepared_arguments[have_index]
+        return _inbounds_value(Expr(:call,
+            GlobalRef(@__MODULE__, :_plate_operand_read), source, indexer, index))
     end
     locals[cid]
 end
@@ -2196,6 +2251,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     plate_eltype = gensym(:plate_eltype)
     needs_marker = pointwise_lhs !== nothing || total_lhs !== nothing
     marker = gensym(:plate_axis)
+    marker_args = nothing
     index = gensym(:plate_index)
     previous = gensym(:plate_previous)
     first_coordinate = gensym(:plate_first)
@@ -2227,11 +2283,15 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
             class === :axis && (axis_position = position)
             break
         end
-        marker_source = axis_position === nothing ?
-            :($(GlobalRef(@__MODULE__, :_authored_plate_marker))(
-                $atomic_val, $(callargs...))) :
-            callargs[axis_position]
-        push!(body.args, :($marker = $marker_source))
+        if axis_position === nothing
+            # Selected at run time inside each consumer call
+            # (`_authored_plate_similar_output`, `_authored_plate_total_seed`).
+            marker_args = Any[atomic_val, callargs...]
+            push!(body.args, :($(GlobalRef(@__MODULE__, :_authored_plate_require_marker))(
+                $(marker_args...))))
+        else
+            push!(body.args, :($marker = $(callargs[axis_position])))
+        end
     end
 
     # Reuse Base's ordinary broadcast preparation one argument at a time. A
@@ -2240,8 +2300,10 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     # much larger derivative loop. `broadcastable` + `preprocess` preserves
     # scalar, Ref, singleton-expansion, and custom-axis semantics while letting
     # the lowered scalar recipes consume only the projected values they need.
+    # Each preprocessed operand is read per cell through its source and index
+    # map (`_plate_operand_read`).
     raw_arguments = Union{Nothing,Symbol}[]
-    prepared_arguments = Union{Nothing,Symbol}[]
+    prepared_arguments = Union{Nothing,Tuple{Symbol,Symbol}}[]
     for (position, arg) in enumerate(callargs)
         statically_scalar = position in atomic ||
                             valtype(callvalues[position]) <: Number
@@ -2252,12 +2314,18 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         end
         raw = gensym(:plate_argument)
         prepared = gensym(:plate_prepared)
+        source = gensym(:plate_source)
+        indexer = gensym(:plate_indexer)
         wrapped = Expr(:call, GlobalRef(Base, :broadcastable), arg)
         push!(body.args, Expr(:(=), raw, wrapped))
         push!(body.args, Expr(:(=), prepared,
             Expr(:call, GlobalRef(Base.Broadcast, :preprocess), nothing, raw)))
+        push!(body.args, Expr(:(=), source,
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_operand_source), prepared)))
+        push!(body.args, Expr(:(=), indexer,
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_operand_indexer), prepared)))
         push!(raw_arguments, raw)
-        push!(prepared_arguments, prepared)
+        push!(prepared_arguments, (source, indexer))
     end
     output_axes = gensym(:plate_axes)
     # A fused plate chain absorbs one axis-check group per sub-plate
@@ -2441,8 +2509,11 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     end
 
     if pointwise_lhs !== nothing && !into
-        allocation = :($(GlobalRef(@__MODULE__, :_plate_similar_output))(
-            $marker, $plate_eltype, $output_axes))
+        allocation = marker_args === nothing ?
+            :($(GlobalRef(@__MODULE__, :_plate_similar_output))(
+                $marker, $plate_eltype, $output_axes)) :
+            :($(GlobalRef(@__MODULE__, :_authored_plate_similar_output))(
+                $plate_eltype, $output_axes, $(marker_args...)))
         push!(body.args, Expr(:(=), pointwise_lhs, recycled === nothing ? allocation :
             _lane_allocation(recycled, plate_eltype, output_axes, allocation)))
     end
@@ -2452,9 +2523,11 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         # against `Float64` cells. Without a concrete or numeric `T`, the first
         # cell starts the total, and only an empty plate falls back to
         # `zero(eltype(marker))`.
-        push!(body.args, Expr(:(=), accumulator,
+        push!(body.args, Expr(:(=), accumulator, marker_args === nothing ?
             Expr(:call, GlobalRef(@__MODULE__, :_plate_total_seed),
-                 plate_eltype, marker)))
+                 plate_eltype, marker) :
+            Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_total_seed),
+                 plate_eltype, marker_args...)))
     end
 
     loopbody = Expr(:block)
@@ -3633,19 +3706,24 @@ function lower_batched(p::Plan; batched, reduce = :+)
     first_coordinate = gensym(:plate_first)
     raw_arguments = Dict{Int,Symbol}()
     prepared_arguments = Dict{Int,Symbol}()
+    source_arguments = Dict{Int,Symbol}()
+    indexer_arguments = Dict{Int,Symbol}()
     for value in analysis.mapped
         cid = canon_id(g, value.id)
         raw_arguments[cid] = gensym(Symbol(:plate_argument_, value.name))
         prepared_arguments[cid] = gensym(Symbol(:plate_prepared_, value.name))
+        source_arguments[cid] = gensym(Symbol(:plate_source_, value.name))
+        indexer_arguments[cid] = gensym(Symbol(:plate_indexer_, value.name))
     end
 
-    # `_broadcast_getindex` implements Julia's scalar, Ref, and singleton
-    # projection at the current Cartesian coordinate.
+    # `_plate_operand_read` implements Julia's scalar, Ref, and singleton
+    # projection at the current Cartesian coordinate, as `_broadcast_getindex`
+    # does, with the operand's array and index map as separate operands.
     function argref(input)
         cid = canon_id(g, input.id)
         haskey(prepared_arguments, cid) || return nm(input)
-        Expr(:call, GlobalRef(Base.Broadcast, :_broadcast_getindex),
-             prepared_arguments[cid], index)
+        Expr(:call, GlobalRef(@__MODULE__, :_plate_operand_read),
+             source_arguments[cid], indexer_arguments[cid], index)
     end
     callexpr(k, r) = Expr(:call, Expr(:ref, _OPS_ARG, k),
                           (argref(inp) for inp in r.inputs)...)
@@ -3664,6 +3742,10 @@ function lower_batched(p::Plan; batched, reduce = :+)
             Expr(:call, GlobalRef(Base, :broadcastable), nm(value))))
         push!(body.args, Expr(:(=), prepared,
             Expr(:call, GlobalRef(Base.Broadcast, :preprocess), nothing, raw)))
+        push!(body.args, Expr(:(=), source_arguments[cid],
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_operand_source), prepared)))
+        push!(body.args, Expr(:(=), indexer_arguments[cid],
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_operand_indexer), prepared)))
     end
     broadcast_arguments = Expr(
         :tuple, (raw_arguments[canon_id(g, value.id)]
@@ -3699,7 +3781,8 @@ function lower_batched(p::Plan; batched, reduce = :+)
         push!(body.args, Expr(:local, Expr(:(::), nm(out), valtype(out))))
         changed = foldl((left, right) -> Expr(:||, left, right),
             (Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
-                  index, previous, prepared_arguments[root])
+                  index, previous, source_arguments[root],
+                  indexer_arguments[root])
              for root in sort!(collect(roots))))
         condition = Expr(:||, first_coordinate, changed)
         push!(loopbody.args,

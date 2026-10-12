@@ -53,6 +53,21 @@ _retained_prior_only = @rkppl begin
     s ~ Exponential(1)
 end
 
+# A consumer helper whose result Julia infers as `Any`, read per subject in a
+# @plate cell beside the subject's observed vector: native Reverse retains
+# and differentiates through the dynamically dispatched plates downstream
+# (snag `joint-nlme-enzym-f8d3cb5f`).
+_retained_uninferred_curve(t, a) = Base.inferencebarrier(t .* exp(a))
+_retained_uninferred = @rkppl begin
+    a ~ Normal(0, 1)
+    s ~ Exponential(1)
+    z[axes(ys, 1)] .~ Normal.(0, 1)
+    @plate for i in eachindex(ys)
+        m = _retained_uninferred_curve(ts[i], a + 0.3 * z[i])
+        ys[i] .~ Normal.(m, s)
+    end
+end
+
 function _retained_data()
     g = repeat(1:5, inner = 4)
     t = repeat([0.5, 2.0, 6.0, 12.0], 5)
@@ -121,6 +136,13 @@ end
         _, _, retained = sampler_value_gradient_and_retained!(qr, zeros(n), zeros(n))
         @test length(retained.pointwise.ys) == 5
         @test all(k -> length(retained.pointwise.ys[k]) == length(rows[k]), 1:5)
+    end
+
+    @testset "uninferred consumer helper in a subject cell" begin
+        rows = [findall(==(i), d.g) for i in 1:5]
+        plan = _retained_uninferred(; ts = [d.t[r] for r in rows]) |
+               (; ys = [d.y[r] for r in rows])
+        _check_retained(plan, (:pointwise,))
     end
 
     @testset "Poisson whole-vector likelihood" begin
