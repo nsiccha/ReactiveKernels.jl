@@ -500,8 +500,9 @@ end
     total = sum(cells)
     return total
 end
-# A lazy arm, a generator reading the cell, a mutating call's arguments and an
-# index reading `end` keep their own evaluation.
+# A generator reading the cell, a mutating call's arguments and an index
+# reading `end` keep their own evaluation. A lazy arm's shared value runs at the
+# first cell that takes the arm (`test_plate_shared_branch.jl`).
 @kernel _shared_lazy(x, k) = begin
     cells = plate(x) do xi
         xi > 0 ? xi * _counted_exp(k) : -xi
@@ -554,7 +555,7 @@ end
     x = [1.0, -2.0, 3.0]
     _SHARED_CALLS[] = 0
     @test prepare(_shared_lazy)(x, 0.5) == [1.0, 2.0, 3.0] .* [exp(0.5), 1.0, exp(0.5)]
-    @test _SHARED_CALLS[] == 2
+    @test _SHARED_CALLS[] == 1
     w = [0.25, 0.5]
     _SHARED_CALLS[] = 0
     @test prepare(_shared_generator)(x, w, 0.5) ≈

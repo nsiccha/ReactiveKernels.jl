@@ -2075,6 +2075,125 @@ Base.@nospecializeinfer function _plate_shared_branch(
     nothing
 end
 
+# A branch whose condition reads the cell takes its arm per cell, but an arm
+# with its own graph is inlined into the cell loop. Its recipes that read only
+# shared values run at the first cell that takes the arm and are reused by the
+# later ones: an arm nobody takes evaluates nothing, and a shared value that
+# throws does so at the same cell as before. The arm recipes take operation
+# table slots after the cell's own, in recipe order, in both lowerings. The
+# result maps a branch recipe's index to its arms: `(; then_arm, else_arm)`,
+# each `nothing` (the arm's closure), `(; offset, plan)` (an inlined graph) or
+# a nested branch's own pair.
+Base.@nospecializeinfer function _plate_lane_arm_slots!(
+        runtime_ops, runtime_recipes, inner::Plan, atomic, callvalues)
+    arms = Dict{Int,Any}()
+    for r in inner.recipes
+        (r.effectful || length(r.outputs) != 1 ||
+         r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(r.op) !== nothing) && return arms
+    end
+    for (index, r) in enumerate(inner.recipes)
+        r.op isa _KernelSourceOp && r.op.f isa _KernelBranch || continue
+        _plate_branch_has_graph(r.op.f) || continue
+        names = Set{Symbol}()
+        all(v -> !(v.name in names) && (push!(names, v.name); true), r.inputs) ||
+            continue
+        arms[index] = _plate_lane_branch_slots!(runtime_ops, runtime_recipes,
+                                                r.op.f, names)
+    end
+    arms
+end
+
+function _plate_lane_branch_slots!(runtime_ops, runtime_recipes,
+                                   branch::_KernelBranch, names)
+    side(arm, spec) = if arm isa _KernelBranch
+        _plate_lane_branch_slots!(runtime_ops, runtime_recipes, arm, names)
+    elseif spec === nothing
+        nothing
+    else
+        armplan = plan(spec)
+        fits = all(port -> port.name in names, armplan.have) &&
+            !any(port -> canon_id(armplan.graph, port.id) ==
+                         canon_id(armplan.graph, only(armplan.want).id),
+                 armplan.have) &&
+            all(q -> !q.effectful && length(q.outputs) == 1 &&
+                     !(q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp}) &&
+                     _embedded_kernel(q.op) === nothing, armplan.recipes)
+        fits || return nothing
+        offset = length(runtime_ops)
+        for q in armplan.recipes
+            push!(runtime_ops, q.op)
+            push!(runtime_recipes, q)
+        end
+        (; offset, plan = armplan)
+    end
+    (; then_arm = side(branch.then_arm, branch.then_spec),
+       else_arm = side(branch.else_arm, branch.else_spec))
+end
+
+# The cell-loop expression of a lane branch with inlined arms (above). `args`
+# are the branch recipe's per-cell argument expressions and `inputs` its
+# values; `shared(v)` says whether a branch input reads only shared values.
+# First-use flags and the arms' shared locals are declared in `declarations`,
+# above the loop.
+function _native_plate_lane_branch_expr(branch::_KernelBranch{CI,TI,EI},
+        reference, args, inputs, slots, shared, declarations) where {CI,TI,EI}
+    by_name = Dict(v.name => (arg, shared(v)) for (arg, v) in zip(args, inputs))
+    condition = Expr(:call, :(getfield($reference, :condition)),
+                     (args[i] for i in CI)...)
+    arm_expr(arm, field, indices, entry) = begin
+        arm_reference = :(getfield($reference, $(QuoteNode(field))))
+        if arm isa _KernelBranch
+            _native_plate_lane_branch_expr(arm, arm_reference, args, inputs,
+                                           entry, shared, declarations)
+        elseif entry === nothing
+            Expr(:call, arm_reference, (args[i] for i in indices)...)
+        else
+            _native_plate_inline_arm(entry, by_name, declarations)
+        end
+    end
+    Expr(:if, condition,
+         arm_expr(branch.then_arm, :then_arm, TI, slots.then_arm),
+         arm_expr(branch.else_arm, :else_arm, EI, slots.else_arm))
+end
+
+function _native_plate_inline_arm(entry, by_name, declarations)
+    armplan = entry.plan
+    g = armplan.graph
+    values = Dict{Int,Any}()
+    invariant = Set{Int}()
+    for port in armplan.have
+        arg, is_shared = by_name[port.name]
+        cid = canon_id(g, port.id)
+        values[cid] = arg
+        is_shared && push!(invariant, cid)
+    end
+    ready = gensym(:arm_ready)
+    once = Expr(:block)
+    cell = Expr(:block)
+    for (k, q) in enumerate(armplan.recipes)
+        output = canon_id(g, only(q.outputs).id)
+        local_name = gensym(Symbol(:arm_, only(q.outputs).name))
+        call = Expr(:call, Expr(:ref, _OPS_ARG, entry.offset + k),
+                    Any[values[canon_id(g, v.id)] for v in q.inputs]...)
+        if all(v -> canon_id(g, v.id) in invariant, q.inputs)
+            push!(invariant, output)
+            push!(declarations, Expr(:local, local_name))
+            push!(once.args, Expr(:(=), local_name, call))
+        else
+            push!(cell.args, Expr(:(=), local_name, call))
+        end
+        values[output] = local_name
+    end
+    if !isempty(once.args)
+        push!(declarations, Expr(:(=), ready, false))
+        push!(once.args, Expr(:(=), ready, true))
+        pushfirst!(cell.args, Expr(:if, Expr(:call, GlobalRef(Base, :!), ready), once))
+    end
+    push!(cell.args, values[canon_id(g, only(armplan.want).id)])
+    cell
+end
+
 _plate_branch_has_graph(arm) = false
 _plate_branch_has_graph(branch::_KernelBranch) =
     branch.then_spec !== nothing || branch.else_spec !== nothing ||
@@ -2595,9 +2714,9 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
             gensym(Symbol(:plate_, output.name))
         end
     end
-    (; op_offset, scan_offsets, plate_type_exprs, nested) = _plate_cell_types!(
-        runtime_ops, runtime_recipes, inner_kernel, atomic, callargs, callvalues,
-        raw_arguments, input_type_hints)
+    (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms) =
+        _plate_cell_types!(runtime_ops, runtime_recipes, inner_kernel, atomic,
+                           callargs, callvalues, raw_arguments, input_type_hints)
     inferred_eltype = nested === nothing ?
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
             GlobalRef(Core, :Any)) : nested.type
@@ -2613,7 +2732,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         callargs, callvalues, raw_arguments, prepared_arguments, marker,
         output_axes, pointwise_lhs, total_lhs, recycled, into, cells,
         plate_eltype, index, previous, first_coordinate, root_positions,
-        dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested)
+        dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
+        lane_arms)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -2626,6 +2746,8 @@ Base.@nospecializeinfer function _plate_cell_types!(
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
     scan_offsets = _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
+    lane_arms = _plate_lane_arm_slots!(runtime_ops, runtime_recipes, inner,
+                                       atomic, callvalues)
     # Bind the concrete pointwise element type by propagating inferred types
     # through the plate body's scalar recipe DAG. Each individual `__ops__`
     # recipe op is an ordinary callable (a `_KernelSourceOp`, not the opaque
@@ -2680,7 +2802,7 @@ Base.@nospecializeinfer function _plate_cell_types!(
             Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...) : scan_type
     end
-    (; op_offset, scan_offsets, plate_type_exprs, nested)
+    (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms)
 end
 
 Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
@@ -2688,7 +2810,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         callvalues, raw_arguments, prepared_arguments, marker, output_axes,
         pointwise_lhs, total_lhs, recycled, into::Bool, cells::Bool,
         plate_eltype, index, previous, first_coordinate, root_positions,
-        dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested)
+        dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
+        lane_arms)
     groups = _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues)
     nested === nothing || (groups = [])
@@ -2757,6 +2880,14 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             _embedded_statements(nested.ast, [args; input_types],
                                  nested_result, nested.offset))
     end
+    # A lane branch with arm graphs is inlined with first-use shared work
+    # (`_plate_lane_arm_slots!`); its flags and shared locals are declared
+    # above the loop.
+    declarations = Any[]
+    shared(v) = all(get(dependencies, canon_id(inner.graph, v.id), Set{Int}())) do root
+        root_positions[root] in atomic ||
+            valtype(callvalues[root_positions[root]]) <: Number
+    end
     for (roots, recipe_indices) in groups
         isempty(roots) && continue
         assignments = Expr(:block)
@@ -2767,9 +2898,16 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, true) for input in recipe.inputs]
-            _lower_plate_recipe_native!(assignments, recipe, args, out,
-                Expr(:ref, _OPS_ARG, op_offset + recipe_index),
-                get(scan_offsets, recipe_index, nothing))
+            operation = Expr(:ref, _OPS_ARG, op_offset + recipe_index)
+            if haskey(lane_arms, recipe_index)
+                push!(assignments.args, Expr(:(=), out,
+                    _native_plate_lane_branch_expr(recipe.op.f,
+                        :(getfield($operation, :f)), args, recipe.inputs,
+                        lane_arms[recipe_index], shared, declarations)))
+            else
+                _lower_plate_recipe_native!(assignments, recipe, args, out,
+                    operation, get(scan_offsets, recipe_index, nothing))
+            end
         end
         if _authored_plate_unconditional_group(
                 roots, root_positions, atomic, callvalues)
@@ -2814,6 +2952,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     reduction = cells && nested === nothing ? _plate_reduction_plan(
         inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
         pointwise_lhs) : nothing
+    cells && append!(body.args, declarations)
     if !cells
         # A domain known to be empty runs no cell.
     elseif reduction === nothing
@@ -2974,6 +3113,7 @@ Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
     append!(runtime_ops, inner_kernel.ops)
     append!(runtime_recipes, inner_kernel.lowered_recipes)
     _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
+    _plate_lane_arm_slots!(runtime_ops, runtime_recipes, inner, atomic, callvalues)
     _plate_shared_branch_reserve!(runtime_ops, runtime_recipes, inner_kernel,
         atomic, callargs, callvalues, pointwise_lhs, total_lhs)
     if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)

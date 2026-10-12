@@ -58,12 +58,28 @@ end
     total = sum(cells)
     return total
 end
-# A condition that reads the cell keeps its branch in every cell.
+# A condition that reads the cell keeps its branch in every cell; the arm's
+# shared work runs at the first cell that takes the arm.
 @kernel _lane_guard(x, s) = begin
     cells = plate(x) do xi
         xi > 0 ? xi * _counted_log(s) : -xi
     end
     return cells
+end
+@kernel _lane_guard_total(x, s) = begin
+    cells = plate(x) do xi
+        xi > 0 ? xi * _counted_log(s) : -xi
+    end
+    total = sum(cells)
+    return total
+end
+# The throwing shared value runs only once a cell takes its arm.
+@kernel _lane_throwing(x, s) = begin
+    cells = plate(x) do xi
+        xi > 0 ? xi * sqrt(s) : -xi
+    end
+    total = sum(cells)
+    return total
 end
 
 _reference_normal(y, mu, sigma) =
@@ -126,10 +142,33 @@ end
     @test throwing(x, 4.0) ≈ sum(x) * log(4.0)
     @test _ARM_CALLS[] == 1
 
+    lane = prepare(_lane_guard)
     _ARM_CALLS[] = 0
-    @test prepare(_lane_guard)([1.0, -2.0, 3.0], 0.5) ≈
-          [log(0.5), 2.0, 3.0 * log(0.5)]
-    @test _ARM_CALLS[] == 2
+    @test lane([1.0, -2.0, 3.0], 0.5) ≈ [log(0.5), 2.0, 3.0 * log(0.5)]
+    @test _ARM_CALLS[] == 1
+    _ARM_CALLS[] = 0
+    @test lane([-1.0, -2.0], 0.5) == [1.0, 2.0]
+    @test _ARM_CALLS[] == 0
+    lane_throwing = prepare(_lane_throwing)
+    @test lane_throwing([-1.0, -2.0], -1.0) == 3.0
+    @test_throws DomainError lane_throwing([-1.0, 2.0], -1.0)
+    @test lane_throwing([-1.0, 4.0, 9.0], 4.0) == 1.0 + 26.0
+end
+
+@testset "a lane branch runs its arm's shared work at the first taking cell" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    x = [1.0, -2.0, 3.0, 0.5]
+    k = prepare(_lane_guard_total)
+    for s in (0.5, 2.0)
+        prepared = prepare_ad(k, backend, x, s; active = :s)
+        value, gradient = ad_value_and_gradient(prepared, x, s)
+        positive = filter(>(0), x)
+        @test value ≈ sum(positive) * log(s) + 2.0
+        @test gradient ≈ sum(positive) / s
+        prepared = prepare_ad(k, backend, x, s; active = :x)
+        value, gradient = ad_value_and_gradient(prepared, x, s)
+        @test gradient ≈ [xi > 0 ? log(s) : -1.0 for xi in x]
+    end
 end
 
 @testset "bound data and native Reverse through a shared plate branch" begin
