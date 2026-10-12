@@ -579,26 +579,17 @@ end
 _nested_plate_cache(op, argtypes, T, N) = nothing
 function _nonalloc_plan_result_types(kernel, argument_types)
     p = kernel.plan
-    types = Dict(canon_id(p.graph, v.id) => T for (v, T) in zip(p.have, argument_types))
-    for recipe in p.recipes
-        inputs = [get(types, canon_id(p.graph, v.id), Any) for v in recipe.inputs]
-        T = _nonalloc_recipe_type(recipe.op, inputs)
-        for (index, output) in enumerate(recipe.outputs)
-            types[canon_id(p.graph, output.id)] = length(recipe.outputs) == 1 ? T :
-                T isa DataType && T <: Tuple ? fieldtype(T, index) : Any
-        end
+    types = _plan_value_types(p, argument_types) do recipe, inputs
+        _recipe_output_types(recipe, _nonalloc_recipe_type(recipe.op, inputs))
     end
     Tuple(get(types, canon_id(p.graph, v.id), Any) for v in p.want)
 end
 _nonalloc_recipe_type(op, types) = _static_type(op, types...)
 function _nonalloc_recipe_type(op::_AuthoredScanOp{K,A,I,H}, types) where {K,A,I,H}
     H && return _static_type(op, types...)
-    iterated = [i for i in 2:length(types) if !(i in A)]
-    shared = [i for i in 2:length(types) if i in A]
-    step_types = Any[types[1], [eltype(types[i]) for i in iterated]..., types[shared]...]
-    output = last(_nonalloc_plan_result_types(op.kernel, step_types))
-    I && (output = promote_type(types[1], output))
-    Vector{output}
+    output = last(_nonalloc_plan_result_types(op.kernel,
+                                              _scan_step_argument_types(op, types)))
+    _scan_result_type(op, types, output)
 end
 
 function _nonalloc_rewrite_recipe!(body, prog::_StepProgram, r::Recipe,

@@ -1321,6 +1321,11 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
     _ad_require_backend_packages(backend)
     _ad_require_retaining_backend(backend, retain)
     resolved = _ad_resolve(resolver, args, kwargs)
+    # The exemplars type the program exactly as the derivative will see it.
+    # Traced exemplars run the tensorized product, which this check does not
+    # type.
+    _kernel_source_style(resolved) === Val(:native) &&
+        _warn_uninferred_values(kernel, map(Core.Typeof, resolved))
     call, point, contexts, active_selector, external_values = _ad_call(
         kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
         retain)
@@ -1428,6 +1433,12 @@ are passed to the backend as hidden `Constant` contexts rather than captured in
 the differentiated callable; this does not change the public HAVE boundary.
 Bound views cross as owning copies with identical contents, since a
 prebuilt view operand defeats reverse-mode static activity analysis.
+
+Like [`prepare`](@ref), preparation warns, once per process, about each value
+of the kernel whose type Julia does not infer concretely from the exemplar
+argument types, naming the value and the recipe that computes it, and then
+continues. Such a value makes every recipe and plate cell that reads it
+dispatch dynamically, and native reverse mode may refuse the derivative.
 
 `warm = true` compiles the gradient during preparation for the exemplar's
 argument types, so evaluations with those types run compiled code. It infers

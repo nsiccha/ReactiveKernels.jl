@@ -299,6 +299,10 @@ not split by this pass.
 - Plain `AutoEnzyme(mode = Enzyme.Reverse)` is the supported example
   configuration. Runtime-activity mode and function annotations are outside the
   ReactiveKernels boundary.
+- Preparation warns about each value whose type does not infer concretely
+  from the exemplar arguments, and continues. Make such a value inferable
+  before differentiating natively; see
+  [Concretely typed programs](compiler.md#concretely-typed-programs).
 
 ## Ownership and reusable storage
 

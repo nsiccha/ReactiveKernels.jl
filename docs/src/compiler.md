@@ -234,6 +234,68 @@ This first policy simply continues execution after a removed throw. It does
 not map failure to a fallback value, provide exception recovery, or make
 invalid mathematical inputs valid. Further policies are not implemented yet.
 
+### Concretely typed programs
+
+RK tries to prepare programs in which every value infers a concrete type.
+When one value is not concretely typed, every recipe and plate cell that reads
+it dispatches dynamically on each evaluation, and native reverse-mode AD can
+refuse the program after a long derivative compilation.
+
+RK's own lowering is held to this by a gate test, `test/test_type_stability.jl`.
+Its corpus covers plates, nested and chained plates, scans, embedded kernels
+and endpoints, design matrices, concatenation and bound data, all with
+concretely typed client code. For each kernel the test infers the prepared
+native body and the prepared gradient call for concrete arguments, follows
+every statically invoked RK callee, and requires that no used value is
+non-concrete and that no call is dispatched at run time, outside paths that
+only throw. A small union of concrete types, such as the `Union{Nothing,Tuple}`
+of Julia's iteration protocol, is accepted. A kernel calling a function whose
+result is uninferred is the test's negative control.
+
+One RK-introduced residue is exempted, with its reason in
+`test/type_stability_audit.jl`. From Julia 1.12, the method query of a
+captured source operation, `hasmethod`, folds but leaves
+`Base.to_tuple_type`'s validation loop in every call. The loop is dynamically
+typed but makes no dynamic call. Folding it with `Core._hasmethod` is held
+until a registered Enzyme repairs the native reverse-mode failure it exposes
+in nested empty scans.
+
+Client code is checked when it is prepared. A recipe whose inputs are
+concretely typed but whose result Julia does not infer concretely (`Any`, an
+abstract type, a `Union`, or an array of such elements) is reported with a
+warning that names the value and its recipe. `prepare` checks from the
+declared types of the HAVE ports where they are concrete and from bound data;
+`prepare_ad`, and so `prepare_sampler`, checks from the exemplar arguments.
+Values computed from such a value, or from a HAVE port whose type is not
+known, are not reported again. Preparation still succeeds, so the primal of
+such a kernel keeps working.
+
+```julia
+uninferred_curve(t, a) = Base.inferencebarrier(t .* exp(a))
+
+@kernel location(a::Float64, s::Float64, t::Vector{Float64},
+                 y::Vector{Float64}) = begin
+    mu = uninferred_curve(t, a)
+    pointwise = plate(y, mu) do yi, mi
+        -0.5 * ((yi - mi) / s)^2 - log(s)
+    end
+    total::Float64 = sum(pointwise)
+end
+
+prepare(location)
+# ┌ Warning: ReactiveKernels: `mu` is not concretely typed. Its recipe
+# │ `mu = uninferred_curve(t, a)` infers `Any` from input types
+# │ (Vector{Float64}, Float64). …
+```
+
+The remedy is in the client function: make its result inferable, or assert it
+inside the function (`f(x) = (...)::Vector{Float64}`). In a kernel that
+contains a plate, a scan or an embedded kernel, a concrete declaration on the
+assignment (`mu::Vector{Float64} = uninferred_curve(t, a)`) also asserts the
+value, because those kernels declare their typed locals. Each warning is
+issued once per process. It is logged in the group `:type_stability`, so a
+logger can filter it.
+
 ### Preparation-time partial evaluation
 
 When some HAVE values stay fixed across many calls, `bound` opts into a

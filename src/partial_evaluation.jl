@@ -415,7 +415,11 @@ Reassembles arm pointwise vectors into lane order: `vcat(parts...)[order]`
 struct _LaneAssemble
     order::Vector{Int}
 end
-(assemble::_LaneAssemble)(parts...) = vcat(parts...)[assemble.order]
+# `Vararg{Any,N}` specializes on the arm count; an unspecialized `parts...`
+# left `vcat(parts...)` a run-time `Core._apply_iterate` call in every
+# evaluation of a partitioned plate.
+(assemble::_LaneAssemble)(parts::Vararg{Any,N}) where {N} =
+    vcat(parts...)[assemble.order]
 _readable_callee(::_LaneAssemble) = :lane_assemble
 _opname(::_LaneAssemble) = "lane_assemble"
 
@@ -877,7 +881,7 @@ _partial_prefix_plan(p::Plan, b::_PartialBoundary) =
 # the residual reads is bind-time.
 _partial_hoisted(p::Plan, b::_PartialBoundary, values::Tuple) =
     isempty(b.constants) ? () :
-    _partial_prefix_values(b.constants, prepare(_partial_prefix_plan(p, b))(values...))
+    _partial_prefix_values(b.constants, _prepare_plan(_partial_prefix_plan(p, b))(values...))
 
 # The zero-input constant recipes carrying one binding's hoisted values into
 # the residual plan, under negative ids that cannot collide with graph recipes.
@@ -1050,7 +1054,7 @@ function _bound_entry(p::Plan, @nospecialize(ports))
     p = _fuse_authored_plate_chains(p; cells_only = true)
     boundary = _partial_boundary(p, collect(Value, _astuple(ports)))
     prefix = isempty(boundary.constants) ? nothing :
-             prepare(_partial_prefix_plan(p, boundary))
+             _prepare_plan(_partial_prefix_plan(p, boundary))
     plates = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
     _BoundEntry(p, boundary, prefix, plates, Dict{Any,Any}())
 end
