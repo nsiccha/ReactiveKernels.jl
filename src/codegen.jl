@@ -5043,8 +5043,27 @@ lowering, eliminating the intermediate array. Named ports remain in `p`: asking
 for an intermediate, supplying it as HAVE, or selecting another consumer keeps
 that boundary. Whole-array (`Ref`) consumers and opaque intervening recipes
 also retain their materialization boundary.
+
+Preparation checks that the values of the program infer concrete types, from
+the declared types of the HAVE ports where those are concrete and from the
+bound data. A recipe whose inputs are concretely typed but whose result Julia
+does not infer concretely (`Any`, an abstract type, a `Union`, or an array of
+such elements), such as a call to a function whose result is not inferable,
+is reported with a warning naming the value and its recipe, once per process.
+Every recipe and plate cell that reads such a value dispatches dynamically, and
+native reverse-mode AD may refuse the program. Preparation still succeeds.
+[`prepare_ad`](@ref) repeats the check with the types of its exemplar
+arguments.
 """
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
+    _warn_uninferred_values(
+        _prepare_plan(p; passes = passes, bound = bound, on_error = on_error))
+end
+
+# `prepare` without the type-stability check, for a program RK runs once while
+# it prepares another (the data-only prefix of a bound preparation): its values
+# feed the checked program as bound data of their runtime types.
+function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing)
     p = _kernel_error_policy(p, on_error)
     # Compose cell-only producers before bound specialization can partition a
     # guarded plate into arms and materialize its other cells. Other plate

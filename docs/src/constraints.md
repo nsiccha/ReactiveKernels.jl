@@ -99,6 +99,28 @@ independent authority for an expanded policy. A new execution-policy requirement
 needs its own user direction or demonstrated semantic or technical necessity
 with a clear scope; a diagnostic finding alone does not supply it.
 
+## Prepare concretely typed programs
+
+**RK's lowering must not introduce a non-concrete value or a run-time
+dispatched call into a prepared program whose client code is concretely
+typed.** The primary instruction is the user's October 12 feedback on snag
+`joint-nlme-enzym-f8d3cb5f` (messages `2026-10-12T20:07:23` and
+`2026-10-12T20:08:17` under `ReactiveKernels:snag.joint-nlme-enzym-f8d3cb5f`),
+recorded as point `type-stability` of principle review
+`2026-10-12T20-09-11-062-114x8kz`: RK "should try to guarantee type stability
+and concreteness, though of course it may also require clients to improve
+their kernels where their kernels 'can't' be type stable/concrete." Its scope
+is RK lowering and preparation, enforced by an audit. The gate is
+`test/test_type_stability.jl`, described under
+[Concretely typed programs](compiler.md#concretely-typed-programs).
+
+Client code that is not concretely typed is discouraged, not refused. The user
+chose a warning-only check (decision `2026-10-12T20-13-15-811-1hui2qi`,
+following their 20:14 feedback on decision
+`2026-10-12T20-12-23-260-0027dq6`: "We don't need to fail.... but we should
+at the very least strongly discourage and probably warn when this happens"):
+preparation names the value and its recipe and continues.
+
 ## Derivative rules come from one mathematical graph, never by hand
 
 **Do not write backend-specific derivative rules as durable code, and never
