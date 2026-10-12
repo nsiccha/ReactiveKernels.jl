@@ -158,10 +158,17 @@ Main.ReactiveKernelsDocs.execute_example(
 `poisson` and `binomial` are the count families. `poisson.logpdf` accepts the
 rate or its log—the canonical log link—and `binomial.logpdf` accepts a fixed
 trial count `n` with either the success probability or its logit. Both guard the
-observation domain to `-Inf` with a branch-free `ifelse` and expose `logpdf` and
-`cdf`; neither exposes a `quantile`, because a discrete quantile needs an
+observation domain to `-Inf` with a lazy branch and expose `logpdf`, `cdf` and
+`ccdf`; neither exposes a `quantile`, because a discrete quantile needs an
 iterative search rather than a pure straight-line endpoint. The generic `plate`
 API lifts each `.logpdf` over independent counts without family-specific code.
+
+Their `logpdf` is the sum of two endpoints: `lognormalizer(y)`, the data-only
+term (the log binomial coefficient, or `-log(y!)`), and `logkernel(y)`, the
+terms that read the parameters. `zero_inflated_binomial` has the same pair. A
+plate of `lognormalizer` cells over bound counts and trials is a bind-time
+value, so a likelihood that sums `logkernel` cells and adds that plate evaluates
+no `loggamma` per call.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(

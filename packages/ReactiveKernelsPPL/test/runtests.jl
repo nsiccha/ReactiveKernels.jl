@@ -85,6 +85,7 @@ const _PPL_TEST_FILES = (
     "test_zip_reactant.jl",
     "test_zib.jl",
     "test_zib_reactant.jl",
+    "test_count_normalizers.jl",
     "test_inversegaussian.jl",
     "test_inversegaussian_reactant.jl",
     "test_bernoulli_links.jl",
