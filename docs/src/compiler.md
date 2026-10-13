@@ -317,9 +317,10 @@ path performs no graph traversal or data-only recomputation.
 
 Binding freezes values for that preparation; changing or mutating the data is
 not an invalidation signal. Rebind by preparing again from the original graph
-or plan. The pass does not symbolically inspect recipe bodies, rewrite
-mathematics, or mutate the shared graph. The default `bound = ()`/`bound = (;)`
-path is unchanged.
+or plan. The pass does not rewrite mathematics or mutate the shared graph; it
+splits a recipe only along the structure its author wrote (see
+[Data-only subexpressions](#data-only-subexpressions)). The default
+`bound = ()`/`bound = (;)` path is unchanged.
 
 The same named `bound` contract is available on `prepare_nonallocating`, whose
 lowering rewrites only the residual work. Optional downstream preparation
@@ -449,6 +450,55 @@ recipes are rendered as source inside the arm, so each arm plate evaluates its
 own endpoint copy and no backend receives the branch.
 
 Without a binding, the cell runs its authored lazy branch unchanged.
+
+#### Data-only subexpressions
+
+A recipe that reads bound data and a live value runs whole on every call, and
+in a plate cell, in every cell. Authoring therefore records, beside each
+recipe's ordinary body, the strict subexpressions that some binding could make
+data-only while the expression around them is not: calls, field reads and
+indexing that read fewer of the recipe's arguments than the subexpression
+enclosing them, and that call more than cheap arithmetic (comparison,
+`+`/`-`/`*`/`/`, `min`/`max`/`abs`, conversions and literal integer powers).
+Under `bound=`, each maximal one whose arguments are all bound becomes a recipe
+of its own. At top level it joins the data-only prefix and runs once per
+binding; in a plate cell it is cached per lane like any bound-only cell value.
+The rest of the recipe reads its value.
+
+```julia
+@kernel binomial_loglik(logit, y, n) = begin
+    pointwise = plate(y, n, logit) do yi, ni, li
+        loggamma(ni + 1.0) - loggamma(yi + 1.0) - loggamma(ni - yi + 1.0) +
+            yi * li - ni * log1pexp(li)
+    end
+    total::Float64 = sum(pointwise)
+end
+```
+
+With `bound = (; y, n)` the log binomial coefficient is one cached value per
+lane. Each cell computes only `yi * li - ni * log1pexp(li)` and adds it. With
+`y` alone bound, `loggamma(yi + 1.0)` is the cached value instead.
+
+- Only strict positions are entered: call and broadcast arguments, field reads,
+  indexing and tuple elements. Branch arms, short-circuit operands,
+  generators, closures and macro calls keep their own evaluation, although
+  the whole call that holds one can be a cached node. A dotted call is cached
+  only whole, which keeps Base's broadcast fusion.
+- A data-bound branch arm is split after the plate partitions its lanes, so
+  each lane caches only what its own arm computes.
+- An arm of a branch whose condition reads a live value — a validity check
+  such as `(y >= 0) & (phi > 0)` around a count likelihood — runs only where
+  the condition holds on that call. Its data-only nodes are computed for every
+  lane at preparation all the same; the branch stays lazy, and the arm reads
+  the cached value where it is taken. A node whose computation throws on any
+  lane stays in its arm, so preparation never raises an error the original
+  program would not.
+- The parts apply the authored operations to the same operands in the same
+  order, so values and derivatives are unchanged; nothing is reassociated or
+  simplified.
+
+`readable_code` shows a cached part as `bound_plate_<name>` in a cell, or as a
+hoisted constant at top level, and the remaining recipe reading it by name.
 
 ### 5. Composition
 

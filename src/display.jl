@@ -117,6 +117,8 @@ _display_bare_globals(ex::Expr, bare) =
 _display_object(x::Union{Number,AbstractString,Char,Symbol,Nothing}) = x isa Symbol ? QuoteNode(x) : x
 _display_object(op::_KernelSourceOp) = _display_object(op.f)
 _display_object(branch::_KernelBranch) = _display_object(branch.call)
+_display_object(split::_KernelSplit) = _display_object(split.call)
+_display_object(apply::_KernelSplitApply) = _display_object(apply.split)
 function _display_object(f::Function)
     name = _readable_callee(f)
     name === :operation ? _opaque_object(f) : name
@@ -295,6 +297,9 @@ end
 _source_module(op::_KernelSourceOp) = _source_module(op.f)
 _source_module(f::_KernelSourceFunction) = _source_module(f.f)
 _source_module(branch::_KernelBranch) = _source_module(branch.call)
+_source_module(split::_KernelSplit) = _source_module(split.call)
+_source_module(apply::_KernelSplitApply) = _source_module(apply.split)
+_source_module(call::_KernelBranchCall) = _source_module(call.then_arm)
 _source_module(f::Function) = parentmodule(f)
 _source_module(::Any) = nothing
 

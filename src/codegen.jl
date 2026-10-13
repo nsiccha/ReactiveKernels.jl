@@ -6091,11 +6091,17 @@ function _unscoped_source_name(name::Symbol, spelled)
     end
     name
 end
-_source_parameter_names(op::_KernelSourceOp, source, n) =
+function _source_parameter_names(op::_KernelSourceOp, source, n)
+    # A branch preparation rebuilt names its arguments itself.
+    names = _branch_call_names(op.f)
+    names === nothing || return length(names) == n ? names : nothing
     _closure_parameter_names(_source_closure(op.f), n)
+end
 _source_closure(f) = f
 _source_closure(f::_KernelSourceFunction) = _source_closure(f.f)
 _source_closure(branch::_KernelBranch) = _source_closure(branch.call)
+_source_closure(split::_KernelSplit) = _source_closure(split.call)
+_source_closure(apply::_KernelSplitApply) = _source_closure(apply.split)
 _source_closure(reduction::_KernelReduction) = _source_closure(reduction.call)
 _source_parameter_names(op::Function, source::Expr, n) =
     source.head === :call && length(source.args) == n + 1 &&

@@ -294,15 +294,18 @@ end
     @test k2.ast === k1.ast
     @test k2([1.0, 2.0]) ≈ F.reference((; k = 1, F = 2), F.schedule(31, 2), [1.0, 2.0])
 
-    # Specialized (a domain longer than one lane) and unspecialized (one lane)
-    # bindings interleaved: each follows the pass's verdict for its own values.
+    # Specialized (array data) and unspecialized (tuple data, which the pass
+    # does not cache) bindings interleaved: each follows the pass's verdict for
+    # its own values. A one-lane array binding is specialized too: the cached
+    # value serves every cell the live argument expands it to.
     declined = []
-    for (x, data) in (([1.0, 2.0, 3.0], [0.1, 0.2, 0.3]), ([1.0, 2.0, 3.0, 4.0], [0.5]),
-                      ([1.0, 2.0], [0.0, 1.0]), ([2.0, 5.0], [0.25]))
+    for (x, data) in (([1.0, 2.0, 3.0], [0.1, 0.2, 0.3]), ([1.0, 2.0, 3.0, 4.0], (0.5,)),
+                      ([1.0, 2.0], [0.0, 1.0]), ([2.0, 5.0], (0.25,)),
+                      ([1.0, 2.0, 3.0, 4.0], [0.5]))
         k = prepare(F.scaled; bound = (; data))
         @test k(x) == x .* exp.(data)
         @test k(x) == fresh(F.scaled, (; data))(x)
-        length(data) == 1 ? push!(declined, k) :
+        data isa Tuple ? push!(declined, k) :
             @test any(r -> r.op isa ReactiveKernels._AuthoredPlateOp &&
                            length(r.inputs) > 2, k.plan.recipes)
     end
