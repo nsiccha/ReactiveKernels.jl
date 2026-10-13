@@ -2626,11 +2626,68 @@ _resolve_module_calls(::Nothing, ::Module, ::Set{Symbol}, where) =
 _resolve_module_calls(::Missing, ::Module, ::Set{Symbol}, where) =
     GlobalRef(Base, :missing)
 
-function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
+# A free value name that no model name spells (data, definitions,
+# declarations and binders shadow it) reads its constant binding in the
+# model module, as a free name in a Julia function body reads its module's
+# global: with `using LinearAlgebra: I`, `sigma * I` is
+# `sigma * LinearAlgebra.I`. A free name whose constant is a number or an
+# array stays an input name, as data of that name would bind it; functions
+# resolve as call heads and arguments, and modules as paths.
+function _resolve_value_name(ex::Symbol, mod::Module, names::Set{Symbol})
+    ex in names && return ex
+    isdefined(mod, ex) && isconst(mod, ex) || return ex
+    getfield(mod, ex) isa Union{Number,AbstractArray,Function,Module,Type} &&
+        return ex
+    return GlobalRef(mod, ex)
+end
+
+# The module a value path names (`LinearAlgebra` in `LinearAlgebra.I`), or
+# `nothing` when the path starts at a model name or names no module.
+function _value_path_module(ex, mod::Module, names::Set{Symbol})
+    m = if ex isa Symbol
+        ex ∉ names && isdefined(mod, ex) ? getfield(mod, ex) : nothing
+    elseif Meta.isexpr(ex, :., 2) && ex.args[2] isa QuoteNode &&
+            ex.args[2].value isa Symbol
+        parent = _value_path_module(ex.args[1], mod, names)
+        s = ex.args[2].value
+        parent !== nothing && isdefined(parent, s) ? getfield(parent, s) :
+            nothing
+    else
+        nothing
+    end
+    return m isa Module ? m : nothing
+end
+
+# Names a binder introduces inside these heads are local to them.
+const _BINDING_VALUE_HEADS = (:comprehension, :generator, :->, :do, :let)
+
+function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
+        values::Bool = true)
     ex in (:pi, :π) && ex ∉ names && return Float64(pi)
     ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
+    ex isa Symbol && return values ? _resolve_value_name(ex, mod, names) : ex
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    recur(a) = _resolve_module_calls(a, mod, names, where;
+        values = values && !(ex.head in _BINDING_VALUE_HEADS))
+    # A keyword's name, and the shorthand `f(x; s)` for `s = s`, stay names.
+    ex.head === :kw && length(ex.args) == 2 &&
+        return Expr(:kw, ex.args[1], recur(ex.args[2]))
+    ex.head === :parameters &&
+        return Expr(:parameters, Any[a isa Symbol ? a : recur(a)
+            for a in ex.args]...)
+    # `a.b` is Julia's `getproperty(a, :b)`, a value of whatever the
+    # property holds (`cholesky(K).L`); a path through modules names that
+    # module's binding (`LinearAlgebra.I`). A submodel body keeps its
+    # property reads (`values = false`) until the expansion has resolved
+    # its scoped locals (`_resolve_scope_properties`).
+    if values && ex.head === :. && length(ex.args) == 2 &&
+            ex.args[2] isa QuoteNode && ex.args[2].value isa Symbol
+        m = _value_path_module(ex.args[1], mod, names)
+        m === nothing || return GlobalRef(m, ex.args[2].value)
+        return Expr(:call, GlobalRef(Base, :getproperty), recur(ex.args[1]),
+            ex.args[2])
+    end
     # The quoted cell becomes executable in the generated kernel's module.
     # Resolve its callable heads here, retaining lexical cell-local names.
     if _is_plate_column_call(ex)
@@ -2648,8 +2705,7 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
     end
     if ex.head === :call && !isempty(ex.args)
         head = _resolve_call_head(ex.args[1], mod, names, where)
-        args = Any[_resolve_module_calls(a, mod, names, where)
-            for a in ex.args[2:end]]
+        args = Any[recur(a) for a in ex.args[2:end]]
         if head isa GlobalRef || _constructed_endpoint_head(head)
             args = Any[_resolve_function_arg(a, mod, names, where)
                 for a in args]
@@ -2658,16 +2714,14 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where)
     elseif _is_dotted_call(ex)
         head = _resolve_call_head(ex.args[1], mod, names, where;
             dotted = true)
-        args = Any[_resolve_module_calls(a, mod, names, where)
-            for a in ex.args[2].args]
+        args = Any[recur(a) for a in ex.args[2].args]
         if head isa GlobalRef
             args = Any[_resolve_function_arg(a, mod, names, where)
                 for a in args]
         end
         return Expr(:., head, Expr(:tuple, args...))
     end
-    return Expr(ex.head, Any[_resolve_module_calls(a, mod, names, where)
-        for a in ex.args]...)
+    return Expr(ex.head, Any[recur(a) for a in ex.args]...)
 end
 
 _contains_module_call(ex) =
@@ -3043,7 +3097,11 @@ function _statement_names(ast::Expr, known::Set{Symbol};
             _all_symbols!(out, st)
         elseif st isa Expr && (_is_sample(st) || _is_broadcast_sample(st)) &&
                 _merge_stem(_stmt_lhs(st)) in whole_priors
-            _classify_reads!(whole, out, _stmt_lhs(st), known, false)
+            # A declaration's axes (`axes(M, 1)`, `levels(g)`, a data
+            # vector) read their sources whole, as the finished plan's
+            # model-level input rule does (`_model_level_inputs`): an array
+            # read only for an axis has no observation axis of its own.
+            _classify_reads!(whole, out, _stmt_lhs(st), known, true)
             _classify_reads!(whole, out, last(st.args), known, true)
         else
             _classify_reads!(whole, out, st, known, false)
@@ -6740,8 +6798,8 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     # binds the response column, so it has no trailing assignment.
     observed || push!(out, Expr(:(=), lhs, _hsubst(_resolve_module_calls(
         _hsubst(ret, functions),
-        sm.mod, bodynames, "submodel `$(sm.name)` return `$(repr(ret))`"),
-        submap)))
+        sm.mod, bodynames, "submodel `$(sm.name)` return `$(repr(ret))`";
+        values = false), submap)))
     return sm, out
 end
 
@@ -6767,7 +6825,8 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol};
         rhs = st.args[3]
         resolved = rhs isa Symbol && rhs ∉ names ?
             _resolve_call_head(rhs, sm.mod, names, "submodel sampling RHS") :
-            _resolve_module_calls(rhs, sm.mod, names, "submodel sampling RHS")
+            _resolve_module_calls(rhs, sm.mod, names, "submodel sampling RHS";
+                values = false)
         return Expr(:call, st.args[1], st.args[2],
             resolved)
     end
@@ -6780,7 +6839,8 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol};
         where = "submodel `$(sm.name)` sampling RHS `$(repr(st.args[3]))`"
         rhs = _map_rhs_values(st.args[3]) do value
             _bind_module_calls(value) do call
-                _resolve_module_calls(call, sm.mod, names, where)
+                _resolve_module_calls(call, sm.mod, names, where;
+                    values = false)
             end
         end
         return rhs == st.args[3] ? st : Expr(:call, st.args[1], st.args[2], rhs)
@@ -6789,8 +6849,11 @@ function _resolve_submodel_stmt(st, sm::RKPPLSubmodel, names::Set{Symbol};
         (st.args[1] isa Symbol || Meta.isexpr(st.args[1], :ref))) || return st
     rhs = st.args[2]
     _is_levels_binding_rhs(rhs) && return st
+    # Free value names refer to the calling program (§12): the caller's
+    # lowering resolves them once the expansion has scoped the locals.
     return Expr(:(=), st.args[1], _resolve_module_calls(rhs, sm.mod, names,
-        "submodel `$(sm.name)` definition `$(st.args[1]) = $(repr(rhs))`"))
+        "submodel `$(sm.name)` definition `$(st.args[1]) = $(repr(rhs))`";
+        values = false))
 end
 
 # ── Per-cell submodel promotion inside `@plate` ──────────────────────────
@@ -11122,6 +11185,61 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
         return res == args ? args : res
     end
     family_role(head) = (i, n) -> _distribution_role(head, i, n)
+    # A multivariate prior reads each argument whole, so a computed mean,
+    # covariance, factor or concentration is its named definition
+    # (`b_mean`, `b_covariance`, `b_factor`, `b_concentration`), exactly as
+    # a scalar prior's computed argument is. Numeric literal arrays and
+    # literal-length `zeros(K)` / `fill(a, K)` keep their spelling, and so
+    # do the `Ref` / `eachrow` / `eachcol` broadcast wrappers, around the
+    # value they hold; a dotted prior's list of per-slice vectors
+    # (`D.([v1, v2])`) stays a list.
+    function whole_value(lhs, stem, a, dotted::Bool, dims)
+        a isa Expr && !_is_signed_inf(a) &&
+            !(a.head in (:parameters, :kw)) || return a
+        if _is_ref_call(a) || _is_slice_iterator(a)
+            inner = whole_value(lhs, stem, a.args[2], false, dims)
+            return inner === a.args[2] ? a :
+                Expr(:call, a.args[1], inner)
+        end
+        (_is_zeros_call(a) || _is_fill_call(a)) && return a
+        _is_array_literal(a) && (dotted ||
+            all(x -> x isa Real, _array_literal_entries(a))) && return a
+        f = _fold_literal(a)
+        f === nothing || return f
+        r = resolve(_own_shape_reads(a, lhs, dims))
+        _reject_unknown_calls("the prior of $lhs (argument `$(repr(a))`)", r)
+        nm, k = stem, 1
+        while nm in taken
+            k += 1
+            nm = Symbol(stem, :_, k)
+        end
+        push!(taken, nm)
+        push!(out, nm => r)
+        detmap[nm] = r
+        return nm
+    end
+    function hoist_multivariate(lhs, rhs, dims)
+        head = _mv_head(rhs)
+        head === nothing && return rhs
+        # `Ordered`'s arguments are an element distribution and a length.
+        head === :Ordered && return hoist_call(lhs, rhs)
+        dotted = rhs.head === :.
+        dotted && !Meta.isexpr(rhs.args[2], :tuple) && return rhs
+        args = dotted ? rhs.args[2].args : rhs.args[2:end]
+        nargs = count(a -> !Meta.isexpr(a, :parameters), args)
+        new = Any[]
+        i = 0
+        for a in args
+            Meta.isexpr(a, :parameters) && (push!(new, a); continue)
+            i += 1
+            r = _distribution_role(head, i, nargs)
+            stem = r === nothing ? Symbol(lhs, :_arg, i) : Symbol(lhs, :_, r)
+            push!(new, whole_value(lhs, stem, a, dotted, dims))
+        end
+        new == args && return rhs
+        return dotted ? Expr(:., rhs.args[1], Expr(:tuple, new...)) :
+            Expr(:call, rhs.args[1], new...)
+    end
     function hoist_call(lhs, rhs; scalar_only=true)
         rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
             rhs.args[1] isa Symbol || return rhs
@@ -11151,7 +11269,9 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
     for (i, s) in enumerate(sample)
         s.lhs in data && continue
         rhs = s.rhs
-        if s.broadcast
+        if s.slices in (:rows, :cols, :vector)
+            rhs = hoist_multivariate(s.lhs, rhs, s.dims)
+        elseif s.broadcast
             # Only sized coefficient-vector priors; other `.~` are
             # responses (data or derived) whose arguments are locations.
             s.levels === nothing && s.matrix === nothing && continue
@@ -11178,6 +11298,36 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
     end
     return out
 end
+
+# A shape read of a declaration's own array in its prior (`length(y)`,
+# `size(y, 1)`) reads the declared axes, never the value the statement
+# draws or observes: with `y[axes(D, 1)] ~ MvNormal(zeros(length(y)), K)`
+# the declared axis fixes `length(y)` as `size(D, 1)`. Axes whose extent is
+# only known from a level pool keep the read (a dependency of the prior on
+# its own value, refused as a cycle).
+function _own_shape_reads(ex, lhs::Symbol, dims)
+    ex isa Expr || return ex
+    if ex.head === :call && length(ex.args) in (2, 3) && ex.args[2] === lhs &&
+            dims !== nothing
+        extents = Any[_axis_extent(d) for d in dims]
+        if !any(isnothing, extents)
+            f = ex.args[1]
+            f === :length && length(ex.args) == 2 && return length(extents) == 1 ?
+                only(extents) : Expr(:call, :*, extents...)
+            f === :size && length(ex.args) == 2 &&
+                return Expr(:tuple, extents...)
+            f === :size && ex.args[3] isa Int && 1 <= ex.args[3] <= length(extents) &&
+                return extents[ex.args[3]]
+        end
+    end
+    return Expr(ex.head, Any[_own_shape_reads(a, lhs, dims) for a in ex.args]...)
+end
+
+# The extent of a declared axis as a value expression, or `nothing`.
+_axis_extent(d::Int) = d
+_axis_extent(d) = _is_axis_dim(d) ? Expr(:call, :size, d.args[2], d.args[3]) :
+    Meta.isexpr(d, :call, 2) && d.args[1] === :_ppl_axis_values ?
+        Expr(:call, :length, d.args[2]) : nothing
 
 const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Normal => :normal, :Cauchy => :cauchy,
