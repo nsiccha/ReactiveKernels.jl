@@ -1707,9 +1707,10 @@ _vector_lr(e::LayoutEntry) = Symbol(:_ppl_vlr_, e.name)
 # Consumers gather from the vector (`Ref(v)` plate inputs, `v[idx]`).
 # Every leading/pivot slice is materialized: a
 # `vcat` mixing a `SubArray` and a `Vector` lowers through a Union-typed
-# path the native Enzyme reverse pass rejects. Simplex slices use ordinary
-# range indexing to materialize an array before fused broadcasts; their
-# packed coordinates already have Float64 elements. Size specializations
+# path the native Enzyme reverse pass rejects. Simplex packed coordinates
+# use a native view; traced arrays use an array slice through
+# `_tensorized_view`, avoiding Reactant's nested SubArray reindexing.
+# Size specializations
 # (empty packs emit nothing — their consumers never read them; a one-element
 # ordered vector is its coordinate; a 1-simplex is the constant `[1.0]`)
 # are finite shape cases, never per-level expansion.
@@ -1745,11 +1746,12 @@ function _vector_transform_statements(e::LayoutEntry)
     K = e.size + 1
     K == 1 && return Expr[:($(e.name)::AbstractVector{Float64} = ones(1))]
     z, l, lr = _vector_z(e), _vector_l(e), _vector_lr(e)
-    # The packed port is already Float64. Materialize its slice once;
-    # a nested Float64 broadcast over a SubArray fails Reactant reindexing.
+    # The packed port is already Float64. Native execution reads a view;
+    # compiled tracing materializes the slice to avoid SubArray reindexing.
     return Expr[
         :($z::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(
-            unconstrained[$lo:$hi] .+ log.($K .- (1:$(K - 1))))))),
+            ReactiveKernels._tensorized_view(unconstrained, $lo:$hi) .+
+                log.($K .- (1:$(K - 1))))))),
         :($l::AbstractVector{Float64} = log1p.(-$z)),
         :($lr::AbstractVector{Float64} = cumsum(vcat(0.0, $l))),
         :($(e.name)::AbstractVector{Float64} = exp.($lr) .* vcat($z, ones(1))),
