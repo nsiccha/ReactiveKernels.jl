@@ -145,6 +145,7 @@ const _PPL_TEST_FILES = (
     "test_multi_axes_reactant.jl",
     "test_matrix_ir.jl",
     "test_array_values.jl",
+    "test_bound_array_extents.jl",
     "test_sampled_value_indexing.jl",
     "test_computed_gather_indices.jl",
     "test_computed_gather_indices_reactant.jl",

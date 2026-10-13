@@ -139,6 +139,7 @@
 "test_multi_axes_reactant.jl" = 2.9
 "test_matrix_ir.jl" = 0.5
 "test_array_values.jl" = 4.2
+"test_bound_array_extents.jl" = 0.6
 "test_sampled_value_indexing.jl" = 2.9
 "test_computed_gather_indices.jl" = 1.6
 "test_computed_gather_indices_reactant.jl" = 4.3
