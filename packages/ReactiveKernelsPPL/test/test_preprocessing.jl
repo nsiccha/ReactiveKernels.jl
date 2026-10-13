@@ -94,21 +94,45 @@ end
     _, cols, n = _prep_plan()
     intercept = TermSpec(InterceptTerm, ColumnRef[], NamedTuple(), :Intercept,
         :intercept)
-    plan_for(terms, priors) = StructuralPlan(
+    plan_for(terms, priors; columns = cols) = StructuralPlan(
         LikelihoodSpec[LikelihoodSpec(GaussianFam, IdentityLink, :y, :mu, 1.0,
             nothing, ResponseEvidence(:none, nothing, nothing), :y_resp)],
         PredictorSpec[PredictorSpec(:mu, IdentityLink, terms, :mu)],
-        priors, SampledParameter[], AssignmentSpec[], cols, n)
-    # A predictor with a per-observation column binds its design matrix once.
+        priors, SampledParameter[], AssignmentSpec[], columns, n)
+    # Pure scalar-coefficient columns are read inside the observation plate.
     plan = plan_for([intercept, TermSpec(ContinuousTerm, [:x], NamedTuple(),
             :x, :x_term)],
         PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
             PopulationPrior(:mu, :x, 0.0, 1.0)])
     validate_plan(plan)
     stmts = preprocessing_recipes(plan)
-    @test length(stmts) == 1
-    @test stmts[1].args[1] === :_ppl_design_mu
-    @test _eval_recipe(stmts[1], cols) == hcat(ones(n), cols[:x])
+    @test isempty(stmts)
+    # Keep the design path at four coordinates: the measured native
+    # gradient crossover is near this width.
+    wide_columns = copy(cols)
+    wide_columns[:z] = collect(0.1 .* (1:n))
+    two_columns = plan_for([intercept,
+            TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term),
+            TermSpec(ContinuousTerm, [:z], NamedTuple(), :z, :z_term)],
+        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+            PopulationPrior(:mu, :x, 0.0, 1.0),
+            PopulationPrior(:mu, :z, 0.0, 1.0)]; columns = wide_columns)
+    validate_plan(two_columns)
+    @test isempty(preprocessing_recipes(two_columns))
+    wide = plan_for([intercept,
+            TermSpec(ContinuousTerm, [:x], NamedTuple(), :x, :x_term),
+            TermSpec(ContinuousTerm, [:z], NamedTuple(), :z, :z_term),
+            TermSpec(ContinuousTerm, [:w], NamedTuple(), :w, :w_term)],
+        PopulationPrior[PopulationPrior(:mu, :Intercept, 0.0, 1.0),
+            PopulationPrior(:mu, :x, 0.0, 1.0),
+            PopulationPrior(:mu, :z, 0.0, 1.0),
+            PopulationPrior(:mu, :w, 0.0, 1.0)]; columns = wide_columns)
+    validate_plan(wide)
+    wide_stmts = preprocessing_recipes(wide)
+    @test length(wide_stmts) == 1
+    @test wide_stmts[1].args[1] === :_ppl_design_mu
+    @test _eval_recipe(wide_stmts[1], wide_columns) ==
+        hcat(ones(n), cols[:x], wide_columns[:z], cols[:w])
     # An intercept-only location is a scalar the observation plate
     # broadcasts: no design matrix of ones (snag rkppl-scalar-loc-b96d576a).
     plan = plan_for([intercept],

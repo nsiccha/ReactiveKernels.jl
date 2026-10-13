@@ -97,7 +97,8 @@ function preprocessing_recipes(plan::StructuralPlan)
     for pred in plan.predictors
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
-        if !_broadcast_affine(plan, pred)
+        if !_broadcast_affine(plan, pred) &&
+                !_scalar_column_plate_eligible(plan, pred, shape)
             rows = _predictor_rows_source(plan, pred.name)
             recipe = design_recipe(shape, rows; plates)
             recipe !== nothing && push!(stmts, recipe)
@@ -124,6 +125,27 @@ function preprocessing_recipes(plan::StructuralPlan)
         push!(stmts, :($(m.name) = Float64.(hcat($(m.columns...)))))
     end
     return stmts
+end
+
+# A pure affine predictor can read its data columns in the observation cell.
+# Only bound, one-based vectors with the observation extent qualify. Keep
+# wider designs on the matrix path: their BLAS product can beat a scalar
+# reverse pass through a long plate cell. The coefficient block still owns
+# every scalar coordinate and its prior.
+function _scalar_column_plate_eligible(plan::StructuralPlan, pred::PredictorSpec,
+        shape::DesignShape)
+    _uses_structured_observation_axes(plan) && return false
+    shape.width <= 3 || return false
+    any(r -> _response_uses_predictor(r, pred.name), plan.responses) || return false
+    all(t -> t.kind in (InterceptTerm, ContinuousTerm), pred.terms) || return false
+    any(t -> t.kind === ContinuousTerm, pred.terms) || return false
+    length(shape.blocks) == length(pred.terms) || return false
+    return all(shape.blocks) do b
+        b.kind === InterceptTerm && return true
+        b.kind === ContinuousTerm || return false
+        col = get(plan.columns, b.column, nothing)
+        return col isa Vector{<:Number} && axes(col) == (Base.OneTo(plan.n_obs),)
+    end
 end
 
 # Affine predictors with singleton, non-vector or live derived operands

@@ -664,6 +664,32 @@ function _predictor_statements(plan::StructuralPlan)
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         lp = pred.name
+        if _scalar_column_plate_eligible(plan, pred, shape)
+            coef = _affine_block_name(pred)
+            inputs = Any[]
+            formals = Symbol[]
+            cell_terms = Any[]
+            k = 1
+            for b in shape.blocks
+                c = gensym(:coefficient)
+                push!(inputs, _coef_coord(coef, k))
+                push!(formals, c)
+                k += 1
+                if b.kind === InterceptTerm
+                    push!(cell_terms, c)
+                else
+                    x = gensym(:column)
+                    push!(inputs, b.column)
+                    push!(formals, x)
+                    push!(cell_terms, :($c * $x))
+                end
+            end
+            cell = foldl((a, b) -> :($a + $b), cell_terms)
+            rhs = Expr(:do, Expr(:call, :plate, inputs...),
+                Expr(:->, Expr(:tuple, formals...), Expr(:block, cell)))
+            push!(stmts, :($lp = $rhs))
+            continue
+        end
         terms = Any[]
         if _broadcast_affine(plan, pred)
             append!(terms, _affine_block_terms(plan, shape; broadcast = true))
