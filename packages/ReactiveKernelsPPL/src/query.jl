@@ -174,11 +174,35 @@ traceable by Reactant; compile the fields directly instead —
 `Reactant.@compile q.kernel(traced_u)` for the value and
 `compile_ad_value_and_gradient(q.ad, traced_u)` for value + gradient (see
 [`prepare_query`](@ref)).
+
+The barrier copies nothing: a gradient call allocates only what the prepared
+gradient itself allocates, and a value call adds one boxed `Float64`.
 """
-struct SamplerQuery{K,P,L}
-    kernel::K
-    ad::P
-    layout::L
+mutable struct SamplerQuery{K,P,L}
+    const kernel::K
+    const ad::P
+    const layout::L
+    value::Float64
+end
+SamplerQuery(kernel, ad, layout) = SamplerQuery(kernel, ad, layout, NaN)
+
+# Per-evaluation calls cross the world-age barrier with references only.
+# `Base.invokelatest` passes each argument as a boxed reference, so a prepared
+# kernel or AD operator stored inline in an immutable query was copied to the
+# heap on every call (1.1-2.5 KB per sampler gradient of a small model). The
+# query types are mutable: the query itself crosses uncopied. A value call
+# returns its value through the barrier, which keeps it differentiable through
+# the query (callers differentiate `q(u, i)`). A gradient call instead stores
+# its value in the query's `value` field rather than returning a boxed
+# `(value, gradient)` tuple; queries are one per caller, so the field is never
+# shared. The helpers specialize on their function and argument count; an
+# unspecialized vararg method called dynamically would allocate and dispatch
+# again inside.
+_store_value!(f::F, query, args::Vararg{Any,N}) where {F,N} =
+    (query.value = f(query, args...); nothing)
+function _latest_value(f::F, query, args::Vararg{Any,N}) where {F,N}
+    Base.invokelatest(_store_value!, f, query, args...)
+    return query.value
 end
 
 """
@@ -245,24 +269,23 @@ Posterior value at unconstrained `u`. Zero-copy for `Vector{Float64}` (the
 HMC-loop case); any other real vector is converted. `u` must have
 `q.layout.total` entries.
 """
-(q::SamplerQuery)(u::Vector{Float64}) = Base.invokelatest(q.kernel, u)
-(q::SamplerQuery)(u::AbstractVector{<:Real}) =
-    Base.invokelatest(q.kernel, Vector{Float64}(u))
+(q::SamplerQuery)(u::Vector{Float64}) = Base.invokelatest(_sampler_density, q, u)
+(q::SamplerQuery)(u::AbstractVector{<:Real}) = q(Vector{Float64}(u))
+_sampler_density(q::SamplerQuery, u) = q.kernel(u)
 
 """
     sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u)
 
 Posterior value and gradient at unconstrained `u`, writing the gradient
-into `g` in place. Returns the `(value, gradient)` pair. `g` must be a
+into `g` in place. Returns the `(value, g)` pair. `g` must be a
 valid gradient destination for `u`; `u` is converted to `Vector{Float64}`
 unless it already is one.
 """
-function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Vector{Float64})
-    return Base.invokelatest(ad_value_and_gradient!, q.ad, g, u)
-end
-function sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVector)
-    return Base.invokelatest(ad_value_and_gradient!, q.ad, g, Vector{Float64}(u))
-end
+sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::Vector{Float64}) =
+    (_latest_value(_sampler_gradient!, q, g, u), g)
+sampler_value_and_gradient!(q::SamplerQuery, g::AbstractVector, u::AbstractVector) =
+    sampler_value_and_gradient!(q, g, Vector{Float64}(u))
+_sampler_gradient!(q::SamplerQuery, g, u) = first(ad_value_and_gradient!(q.ad, g, u))
 
 """
     sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector, u)
@@ -277,8 +300,9 @@ returns). Each call returns freshly computed retained values.
 function sampler_value_gradient_and_retained!(q::SamplerQuery, g::AbstractVector,
         u::AbstractVector)
     v = u isa Vector{Float64} ? u : Vector{Float64}(u)
-    return Base.invokelatest(ad_value_gradient_and_retained!, q.ad, g, v)
+    return Base.invokelatest(_sampler_retained!, q, g, v)
 end
+_sampler_retained!(q::SamplerQuery, g, u) = ad_value_gradient_and_retained!(q.ad, g, u)
 
 """
     QueryAD
@@ -294,9 +318,9 @@ other value/in-place forms. Each call carries the `Base.invokelatest` barrier
 the query's build-time code needs, so they are safe from compiled callers.
 Not thread-safe (one per caller); not traceable by Reactant.
 """
-struct QueryAD{P,L}
-    prepared::P
-    layout::L
+mutable struct QueryAD{P,L}
+    const prepared::P
+    const layout::L
 end
 
 """
@@ -350,8 +374,10 @@ for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
         :ad_pushforward, :ad_value_and_pushforward,
         :ad_hvp, :ad_hvp!, :ad_gradient_and_hvp, :ad_gradient_and_hvp!)
     @eval ReactiveKernels.$verb(q::QueryAD, args...) =
-        Base.invokelatest(ReactiveKernels.$verb, q.prepared, args...)
+        Base.invokelatest(_query_ad_call, ReactiveKernels.$verb, q, args...)
 end
+_query_ad_call(verb::F, q::QueryAD, args::Vararg{Any,N}) where {F,N} =
+    verb(q.prepared, args...)
 
 """
     CellQuery
@@ -363,16 +389,16 @@ Construct with [`prepare_cell_query`](@ref) and call `q(u, i)`. The call paths
 carry the `Base.invokelatest` barrier, as `SamplerQuery`'s do. Not thread-safe:
 prepare one per thread.
 """
-struct CellQuery{K,L}
-    kernel::K
-    layout::L
-    observations::Tuple{Vararg{Symbol}}
+mutable struct CellQuery{K,L}
+    const kernel::K
+    const layout::L
+    const observations::Tuple{Vararg{Symbol}}
 end
 
-(q::CellQuery)(u::Vector{Float64}, cell) = Base.invokelatest(q.kernel, u, cell)
-(q::CellQuery)(u::AbstractVector{Float64}, cell) = Base.invokelatest(q.kernel, u, cell)
-(q::CellQuery)(u::AbstractVector{<:Real}, cell) =
-    Base.invokelatest(q.kernel, Vector{Float64}(u), cell)
+(q::CellQuery)(u::AbstractVector{Float64}, cell) =
+    Base.invokelatest(_cell_density, q, u, cell)
+(q::CellQuery)(u::AbstractVector{<:Real}, cell) = q(Vector{Float64}(u), cell)
+_cell_density(q::CellQuery, u, cell) = q.kernel(u, cell)
 
 """
     prepare_cell_query(built, plan, observations; on_error = nothing) -> CellQuery
@@ -468,12 +494,15 @@ A [`CellQuery`](@ref) with its `prepare_ad` gradient over the packed
 unconstrained vector. Construct with [`prepare_cell_sampler`](@ref); use
 [`cell_value_and_gradient!`](@ref). Not thread-safe: prepare one per thread.
 """
-struct CellSampler{K,P,L}
-    kernel::K
-    ad::P
-    layout::L
-    observations::Tuple{Vararg{Symbol}}
+mutable struct CellSampler{K,P,L}
+    const kernel::K
+    const ad::P
+    const layout::L
+    const observations::Tuple{Vararg{Symbol}}
+    value::Float64
 end
+CellSampler(kernel, ad, layout, observations) =
+    CellSampler(kernel, ad, layout, observations, NaN)
 
 """
     prepare_cell_sampler(built, plan, observations, u0; backend, on_error = nothing) -> CellSampler
@@ -501,9 +530,11 @@ Cell `i`'s log density and its gradient with respect to the packed
 unconstrained vector, written into `g`. Returns `(value, gradient)`.
 """
 cell_value_and_gradient!(s::CellSampler, g::AbstractVector, u::Vector{Float64}, cell::Int) =
-    Base.invokelatest(ad_value_and_gradient!, s.ad, g, u, cell)
+    (_latest_value(_cell_gradient!, s, g, u, cell), g)
 cell_value_and_gradient!(s::CellSampler, g::AbstractVector, u::AbstractVector, cell::Int) =
-    Base.invokelatest(ad_value_and_gradient!, s.ad, g, Vector{Float64}(u), cell)
+    cell_value_and_gradient!(s, g, Vector{Float64}(u), cell)
+_cell_gradient!(s, g, args::Vararg{Any,N}) where {N} =
+    first(ad_value_and_gradient!(s.ad, g, args...))
 
 # A packed point whose selected coordinates come from a compact active vector.
 # The packed base and coordinate selection cross the AD boundary as constants;
@@ -547,11 +578,14 @@ A prepared cell gradient over selected packed coordinates. The packed base point
 is read-only, and the derivative is returned only in the order of `indices`.
 Prepare one sampler per concurrent caller.
 """
-struct CompactCellSampler{P,L,O}
-    ad::P
-    layout::L
-    observations::O
+mutable struct CompactCellSampler{P,L,O}
+    const ad::P
+    const layout::L
+    const observations::O
+    value::Float64
 end
+CompactCellSampler(ad, layout, observations) =
+    CompactCellSampler(ad, layout, observations, NaN)
 
 """
     prepare_compact_cell_sampler(built, plan, observations, base0, indices0; backend)
@@ -610,8 +644,8 @@ function cell_value_and_gradient!(sampler::CompactCellSampler, gradient::Abstrac
     _check_compact_cell_indices(base, active, indices, sampler.layout.total)
     length(gradient) == length(active) || throw(ContractValidationError(
         "[query] compact gradient length $(length(gradient)) ≠ active length $(length(active))"))
-    Base.invokelatest(ad_value_and_gradient!, sampler.ad, gradient,
-        base, active, indices, cell)
+    return _latest_value(_cell_gradient!, sampler, gradient, base, active, indices, cell),
+        gradient
 end
 
 function _stack_restored_draws(values)

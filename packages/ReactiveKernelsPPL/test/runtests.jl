@@ -36,6 +36,7 @@ const _PPL_TEST_FILES = (
     "test_distributional_broadcasts_reactant.jl",
     "test_query.jl",
     "test_query_derivatives.jl",
+    "test_query_barrier.jl",
     "test_model_view.jl",
     "test_emitted_names.jl",
     "test_native_generator_capture.jl",
