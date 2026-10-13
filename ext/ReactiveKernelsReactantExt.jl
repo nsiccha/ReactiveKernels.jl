@@ -152,6 +152,24 @@ function Reactant.traced_type_inner(
     T
 end
 
+# A plate cell's lazy branch carries each leaf arm's graph (`_KernelBranch`
+# `then_spec`/`else_spec`) as untyped lowering metadata. A traced call reaches
+# that `KernelSpec`, and its `Graph` holds `Recipe`s whose `Tuple{Vararg{Value}}`
+# fields the generic tracer cannot type. Both are host-built program structure
+# that never holds a traced operand.
+function Reactant.make_tracer(
+        seen, previous::Union{ReactiveKernels.KernelSpec,ReactiveKernels.Graph},
+        path, mode; kwargs...)
+    previous
+end
+
+function Reactant.traced_type_inner(
+        ::Type{T}, seen, mode::Reactant.TraceMode, track_numbers::Type,
+        ndevices, runtime) where
+        {T<:Union{ReactiveKernels.KernelSpec,ReactiveKernels.Graph}}
+    T
+end
+
 # The step of a retained transition loop: its compiled body program and the
 # ensure tuple the body receives (which also holds that program).  Both are
 # static program structure — a runtime-generated function's `body` is an
