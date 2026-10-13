@@ -5102,7 +5102,8 @@ macro kernel(ex)
 end
 
 """
-    _kernel_eval_definition(mod::Module, definition::Expr) -> KernelSpec
+    _kernel_eval_definition(mod::Module, definition::Expr;
+                            latest_world_native_sources=false) -> KernelSpec
 
 Evaluate the stateless `@kernel` definition `definition` (`name(args...) = body`)
 at top level in `mod` and return its `KernelSpec`, binding nothing. This is the
@@ -5117,8 +5118,14 @@ closures, and every such group is then compiled although it runs once. Here
 lowering stays linear and the construction code runs in the top-level
 interpreter, so construction compiles no per-model code. Because closures are
 evaluated in `mod`'s global scope, `definition` cannot capture local variables.
+
+`latest_world_native_sources=true` is for a generated program whose callers
+guarantee a latest-world execution barrier. It propagates that guarantee to
+source operations embedded inside native recipe bodies, avoiding a per-call
+method query. Ordinary `@kernel` construction keeps its guarded source calls.
 """
-function _kernel_eval_definition(mod::Module, definition::Expr)
+function _kernel_eval_definition(mod::Module, definition::Expr;
+                                 latest_world_native_sources::Bool = false)
     expanded = macroexpand(mod, Expr(:macrocall, Symbol("@kernel"),
                                      LineNumberNode(@__LINE__, Symbol(@__FILE__)),
                                      definition))
@@ -5126,6 +5133,8 @@ function _kernel_eval_definition(mod::Module, definition::Expr)
         expanded.args[1] isa Symbol || throw(ArgumentError(
             "_kernel_eval_definition requires a stateless `name(args...) = body` " *
             "@kernel definition"))
+    latest_world_native_sources &&
+        (expanded = _kernel_latest_native_source_literals(expanded))
     _kernel_eval_construction(mod, expanded.args[2])
 end
 

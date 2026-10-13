@@ -355,7 +355,8 @@ end
 # evaluates the recipe closures separately so construction compiles no
 # per-model code (`ReactiveKernels._kernel_eval_definition`).
 _eval_kernel_def(def::Expr) =
-    ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def)
+    ReactiveKernels._kernel_eval_definition(PPLGeneratedModels, def;
+        latest_world_native_sources = true)
 
 # Scalar + derived assignments in topo order (params already constrained
 # above, so every scalar name resolves; derived columns resolve as locals
