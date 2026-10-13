@@ -955,6 +955,7 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
         bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
+    ex isa GlobalRef && return nothing  # a module constant
     if ex isa Symbol
         (_is_array_param(plan, ex) || ex in _union_names(plan)) &&
             return push!(refs, ex)
