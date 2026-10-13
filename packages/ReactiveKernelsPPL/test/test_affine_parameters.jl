@@ -42,6 +42,30 @@ function _affine_model(ast; data...)
     return plan, built
 end
 
+@testset "scalar data columns fuse into a native observation plate" begin
+    ast = quote
+        a ~ Normal(0, 2)
+        b ~ Normal(0, 3)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, 1.0)
+    end
+    u = [0.2, -0.3]
+    for n in (0, 1, 5)
+        x = collect(0.3 .* (1:n) .- 0.7)
+        y = collect(0.15 .* (1:n) .- 0.3)
+        plan, built = _affine_model(ast; x, y)
+        @test isempty(preprocessing_recipes(plan))
+        @test coordinate_names(built.layout) == [:a, :b]
+        mu = u[1] .+ u[2] .* x
+        want = logpdf(Normal(0, 2), u[1]) +
+            logpdf(Normal(0, 3), u[2]) +
+            sum(logpdf.(Normal.(mu, 1.0), y))
+        @test _query(built.spec, plan, :posterior, u) ≈ want
+        @test _query(built.spec, plan, :mu, u) ≈ mu
+        _check_gradient(built.spec, plan, u)
+    end
+end
+
 @testset "affine uses preserve parameter semantics" begin
     x = [-1.0, 0.5, 2.0]
     z = [0.2, -0.4, 1.0]
