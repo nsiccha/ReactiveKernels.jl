@@ -5,7 +5,9 @@
 # `design_recipe` output flows in unchanged), plus family params — and
 # exposes:
 #   - `logpdf(y)` — the summed log-density (the HMC objective;
-#     differentiated by generic AD, never a per-function rule);
+#     differentiated by generic AD, never a hand-written per-function rule;
+#     `normal_id_glm` reads an owned rule generated from one pure-math graph
+#     that authors its derivative branches, see `normal_id_glm_lpdf`);
 #   - `pointwise(y)` — per-observation log-densities (LOO etc.);
 #   - `logkernel(y)` / `lognormalizer(y)` (Poisson-log only) — the
 #     per-observation density split into the terms that read eta and the
@@ -163,19 +165,68 @@ docs_example = (;
 )
 """
 
+# The summed Normal identity-link GLM log density (Stan's
+# `normal_id_glm_lpdf`) as an owned numerical primitive whose derivatives are
+# authored once in this graph (docs/src/constraints.md, "Derivative rules come
+# from one mathematical graph, never by hand"); the Enzyme adapter is generated
+# from its activity-selected cuts. With r = y - X*beta and ss = r'r:
+#   lp = -ss/2σ² - n(log σ + log(2π)/2)
+#   reverse: beta_bar = X'r lp_bar/σ², sigma_bar = lp_bar (ss/σ³ - n/σ),
+#            X_bar = r beta' lp_bar/σ², y_bar = -r lp_bar/σ²
+#   forward: lp_dot = -r'r_dot/σ² + (ss/σ³ - n/σ) sigma_dot,
+#            r_dot = y_dot - X_dot*beta - X*beta_dot
+# Reverse staging computes X'r in the primal stage, so a coefficient gradient
+# costs one X*beta and one X'r product over a residual it already holds and
+# never retains X. Generic reverse mode through the elementwise `pointwise`
+# spelling instead differentiated an n-cell broadcast: about 4x the cost at
+# n = 434 (snag rkppl-normalidgl-8f11e80f).
+@kernel normal_id_glm_lpdf_graph(
+        X::Matrix{Float64}, beta::Vector{Float64}, sigma::Float64,
+        y::Vector{Float64},
+        X_dot::Matrix{Float64}, beta_dot::Vector{Float64}, sigma_dot::Float64,
+        y_dot::Vector{Float64}, lp_bar::Float64) = begin
+    r::Vector{Float64} = y .- X * beta
+    ss::Float64 = dot(r, r)
+    n::Float64 = length(y) * 1.0
+    prec::Float64 = 1.0 / (sigma * sigma)
+    lp::Float64 = -0.5 * ss * prec - n * (log(sigma) + 0.5 * log(2 * π))
+
+    r_dot::Vector{Float64} = y_dot .- (X_dot * beta .+ X * beta_dot)
+    lp_dot::Float64 = (ss * prec / sigma - n / sigma) * sigma_dot -
+        dot(r, r_dot) * prec
+
+    # Named, so reverse staging computes it in the primal stage.
+    Xr::Vector{Float64} = transpose(X) * r
+    w::Float64 = lp_bar * prec
+    beta_bar::Vector{Float64} = Xr .* w
+    sigma_bar::Float64 = lp_bar * (ss * prec / sigma - n / sigma)
+    X_bar::Matrix{Float64} = (r .* w) * transpose(beta)
+    y_bar::Vector{Float64} = r .* (0.0 - w)
+    return lp, lp_dot, beta_bar, sigma_bar, X_bar, y_bar
+end
+const normal_id_glm_lpdf = derivative_rule(normal_id_glm_lpdf_graph;
+    primal = :lp,
+    directions = (X = :X_dot, beta = :beta_dot, sigma = :sigma_dot, y = :y_dot),
+    tangent = :lp_dot, covector = :lp_bar,
+    cotangents = (X = :X_bar, beta = :beta_bar, sigma = :sigma_bar, y = :y_bar),
+    name = :normal_id_glm_lpdf)
+
 # No `working_weights` here: under the identity link they are the constant
 # 1/sigma^2, carrying no per-observation information (see the header policy).
 const NORMAL_ID_GLM_KERNEL_SOURCE = raw"""
+using ReactiveKernelsDistributionKernels.DistributionKernelSources: normal_id_glm_lpdf
+
 @kernel normal_id_glm(
         X::Matrix{Float64}, beta::Vector{Float64},
         sigma::Float64) = begin
     eta::Vector{Float64} = X * beta
     mu::Vector{Float64} = eta
 
-    # Identity link through the shared `eta` node: -r^2/2σ^2 plus the
-    # per-cell -log σ - log2π/2 (no observation count enters). Port-only
-    # leaves (see bernoulli NOTE); `logpdf` sums `pointwise`.
-    logpdf(y::Vector{Float64})::Float64 = sum(pointwise(y))
+    # `logpdf` is the owned rule above (its value equals `sum(pointwise(y))`).
+    # `pointwise` keeps the identity link through the shared `eta` node:
+    # -r^2/2σ^2 plus the per-cell -log σ - log2π/2 (no observation count
+    # enters). Port-only leaves (see bernoulli NOTE).
+    logpdf(y::Vector{Float64})::Float64 = normal_id_glm_lpdf(X, beta, sigma, y)
     pointwise(y::Vector{Float64})::Vector{Float64} =
         -0.5 .* (y .- eta) .* (y .- eta) .* (1.0 / (sigma * sigma)) .+
             (-log(sigma) - 0.5 * log(2 * π))

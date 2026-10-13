@@ -555,3 +555,55 @@ end
     @test derivative_cut(named, (true,), 3.0) == (9.0, 6.0)
     @test only(Enzyme.gradient(Reverse, Const(t -> named(t)), 3.0)) ≈ 6.0
 end
+
+@testset "vector derivative rule: scalar result, Active scalar input, four inputs" begin
+    # A rule's type carries every activity-mask cut, so with four inputs it is
+    # large enough that inference skips constant propagation through the
+    # adapter. The adapter reads the activity mask off the annotation types;
+    # a value-level mask left `augmented_primal` returning a Union of tapes,
+    # and Enzyme compiled `reverse` against the `nothing` tape (an
+    # Active-return mismatch, or `Unreachable reached` at the call).
+    @kernel lsq_graph(A::Matrix{Float64}, x::Vector{Float64}, s::Float64,
+            b::Vector{Float64}, v_bar::Float64) = begin
+        r::Vector{Float64} = b .- A * x
+        ss::Float64 = dot(r, r)
+        v::Float64 = ss / (s * s)
+        w::Float64 = 2.0 * v_bar / (s * s)
+        A_bar::Matrix{Float64} = (r .* (0.0 - w)) * transpose(x)
+        x_bar::Vector{Float64} = (transpose(A) * r) .* (0.0 - w)
+        s_bar::Float64 = v_bar * (-2.0 * ss / (s * s * s))
+        b_bar::Vector{Float64} = r .* w
+        return v, A_bar, x_bar, s_bar, b_bar
+    end
+    lsq = derivative_rule(lsq_graph; primal = :v, covector = :v_bar,
+        cotangents = (A = :A_bar, x = :x_bar, s = :s_bar, b = :b_bar), name = :lsq)
+    oracle(A, x, s, b) = sum(abs2, b - A * x) / s^2
+    fd(f, z; h = 1e-6) = [(f(z .+ h .* (eachindex(z) .== i)) -
+        f(z .- h .* (eachindex(z) .== i))) / 2h for i in eachindex(z)]
+    A = [1.0 0.5; -0.3 2.0; 0.7 -1.1]
+    x = [0.8, -0.6]
+    s = 1.3
+    b = [0.2, -0.4, 1.3]
+    @test lsq(A, x, s, b) ≈ oracle(A, x, s, b)
+
+    # Nested in a larger function: Duplicated array and Active scalar inputs.
+    u = [0.3, 0.8, -0.6]
+    f(u, A, b) = lsq(A, [view(u, 2:3);], exp(u[1]), b) + u[1]
+    g = zero(u)
+    Enzyme.autodiff(Reverse, Const(f), Active, Duplicated(u, g), Const(A), Const(b))
+    @test g ≈ fd(z -> oracle(A, z[2:3], exp(z[1]), b) + z[1], u) rtol = 1e-6
+
+    # Every input active, called directly.
+    dA, dx, db = zero(A), zero(x), zero(b)
+    ((_, _, ds, _),) = Enzyme.autodiff(Reverse, Const(lsq), Active,
+        Duplicated(A, dA), Duplicated(x, dx), Active(s), Duplicated(b, db))
+    @test vec(dA) ≈ fd(z -> oracle(reshape(z, size(A)), x, s, b), vec(A)) rtol = 1e-6
+    @test dx ≈ fd(z -> oracle(A, z, s, b), x) rtol = 1e-6
+    @test ds ≈ only(fd(z -> oracle(A, x, only(z), b), [s])) rtol = 1e-6
+    @test db ≈ fd(z -> oracle(A, x, s, z), b) rtol = 1e-6
+
+    # A constant result still returns a numeric zero for an Active input.
+    ((_, _, ds0, _),) = Enzyme.autodiff(Reverse, Const(lsq), Const,
+        Const(A), Const(x), Active(s), Const(b))
+    @test ds0 == 0.0
+end

@@ -300,7 +300,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     negative_binomial, weibull,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
-    normal_id_glm, bernoulli_logit_glm, poisson_log_glm,
+    normal_id_glm, bernoulli_logit_glm, poisson_log_glm, normal_id_glm_lpdf,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
     rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
 using SpecialFunctions: besseli, besselix, erfc, loggamma
@@ -1543,6 +1543,19 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
     if r.family === GaussianFam
+        # Base case (no evidence, weights, ranges, packed rows or missing
+        # entries; one shared scalar scale) whose location is a data-matrix
+        # product `M * v`, optionally plus a sampled intercept: the
+        # NormalIDGLM density. The per-cell plate keeps `:pointwise`.
+        if r.evidence.kind === :none && r.weights === nothing &&
+                r.range === nothing && r.mi_jobs === nothing && r.link === IdentityLink &&
+                !haskey(plan.columns, _observed_mask_name(r.response)) &&
+                !_is_bare_param_location(r, plan) &&
+                !_cell_broadcast_response(plan, r) &&
+                _wholevec_location(r, plan) && _wholevec_scalar_scale(r, plan)
+            glm = _gaussian_glm_location(r, plan)
+            glm === nothing || return _gaussian_glm_stmts(r, plan, node, glm...)
+        end
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
         return _student_plate_stmts(r, plan, node, pw)
@@ -1879,11 +1892,7 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     o = r.family === NormalIDGLMFam ? :($obj($xaug, $bfull, $s)) : :($obj($xaug, $bfull))
     design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
     n = r.mi_jobs === nothing ? _response_rows_source(plan, r) : Expr(:call, :length, r.mi_jobs)
-    # A literal zero intercept adds nothing: the object reads X and beta as
-    # they are, with no ones column.
-    xaug_expr, bfull_expr = r.glm_alpha isa Real && iszero(r.glm_alpha) ?
-        (:(Float64.($design)), :([$(r.glm_beta);])) :
-        (:(hcat(ones($n), $design)), :([$(r.glm_alpha); $(r.glm_beta)]))
+    xaug_expr, bfull_expr = _glm_design_args(design, r.glm_alpha, r.glm_beta, n)
     head = Expr[
         :($yf = $yconv.($y)),
         :($xaug = $xaug_expr),
@@ -1891,8 +1900,22 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     ]
     r.family === PoissonLogGLMFam &&
         return Expr[head..., _poisson_glm_split_stmts(r, o, yf, pw, node)...]
-    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = sum($pw))]
+    # The Normal-identity density reads the object's `logpdf`, an owned rule
+    # whose reverse branch is one X'r product (DK `normal_id_glm_lpdf`), so
+    # neither the sampler nor its gradient materializes or differentiates the
+    # per-observation vector that only the `:pointwise` query reads. The
+    # Bernoulli object's `logpdf` is `sum(pointwise)`, so it sums that vector.
+    density = r.family === NormalIDGLMFam ? :($o.logpdf($yf)) : :(sum($pw))
+    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = $density)]
 end
+
+# The GLM design and coefficients over `n` rows. A literal zero intercept adds
+# nothing: the object reads X and beta as they are, with no ones column; any
+# other intercept prepends a ones column (data-only, folded at preparation)
+# and its coefficient.
+_glm_design_args(design, alpha, beta, n) = alpha isa Real && iszero(alpha) ?
+    (:(Float64.($design)), :([$beta;])) :
+    (:(hcat(ones($n), $design)), :([$alpha; $beta]))
 
 # The Poisson-log object's density in its two endpoint parts, as a count plate
 # sums them (`_count_plate_stmts!`): `logkernel` reads eta, and
@@ -2485,6 +2508,80 @@ _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
 function _through_pointwise(stmts::Vector{Expr}, r::LikelihoodSpec)
     pw = _pw_name(r.label)
     return stmts[1:findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)]
+end
+
+# A Gaussian response located at `M * v` or `alpha .+ M * v` (bound data
+# matrix `M`, any vector value `v`, a sampled scalar `alpha`) has the
+# NormalIDGLM density, so its likelihood reads the same owned rule (DK
+# `normal_id_glm_lpdf`): one `M'r` product in reverse, where the plate
+# differentiated `M * v` and every cell. `sigma > 0` keeps the plate cell's
+# guard; the plate (`_through_pointwise`) keeps the `:pointwise` densities,
+# and the location node stays available to its other readers.
+# Returns `(M, alpha, v)` (`alpha = 0.0` without an intercept) or `nothing`.
+function _gaussian_glm_location(r::LikelihoodSpec, plan::StructuralPlan)
+    _is_latent_location(r, plan) && return nothing
+    i = findfirst(p -> p.name === r.predictor, plan.predictors)
+    i === nothing && return nothing
+    pred = plan.predictors[i]
+    pred.link === IdentityLink || return nothing
+    alpha, product = 0.0, nothing
+    for t in pred.terms
+        if t.kind === InterceptTerm && alpha isa Real &&
+                get(t.options, :sign, 1) == 1 && get(t.options, :parameter, nothing) isa Symbol
+            alpha = t.options.parameter
+        elseif t.kind === OffsetTerm && product === nothing && length(t.columns) == 1
+            product = only(t.columns)
+        else
+            return nothing
+        end
+    end
+    product === nothing && return nothing
+    j = findfirst(d -> d.name === product, plan.derived)
+    j === nothing && return nothing
+    ex = plan.derived[j].expr
+    Meta.isexpr(ex, :call, 3) && ex.args[1] === :* || return nothing
+    M, v = ex.args[2], ex.args[3]
+    M isa Symbol && v isa Symbol || return nothing
+    get(plan.columns, M, nothing) isa AbstractMatrix{<:Real} || return nothing
+    get(plan.columns, r.response, nothing) isa AbstractVector{<:Real} || return nothing
+    scalar(a) = any(q -> q.name === a, plan.parameters) || get(plan.columns, a, nothing) isa Real
+    alpha isa Symbol && !scalar(alpha) && return nothing
+    vector = any(q -> q.name === v && length(q.dims) == 1, plan.array_parameters) ||
+        get(plan.columns, v, nothing) isa AbstractVector{<:Real}
+    vector || return nothing
+    return (M, alpha, v)
+end
+
+function _gaussian_glm_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
+        M::Symbol, alpha, v::Symbol)
+    stmts = _gaussian_plate_stmts(r, plan, node, _pw_name(r.label))
+    s = _scale_plate_arg(r, plan, Expr[])
+    sf = s isa Real ? Float64(s) :
+        s isa Symbol && haskey(plan.columns, s) ? :(Float64($s)) : s
+    yf = _yfloat_name(r.label)
+    xaug = Symbol(:_ppl_glm_X_, r.label)
+    bfull = Symbol(:_ppl_glm_b_, r.label)
+    xaug_expr, bfull_expr = _glm_design_args(M, alpha, v, _response_rows_source(plan, r))
+    return Expr[
+        _through_pointwise(stmts, r)...,
+        :($yf = Float64.($(r.response))),
+        :($xaug = $xaug_expr),
+        :($bfull = $bfull_expr),
+        :($node::Float64 = $sf > 0 ? normal_id_glm_lpdf($xaug, $bfull, $sf, $yf) : -Inf),
+    ]
+end
+
+# One scale shared by every observation: a literal, a sampled scalar, scalar
+# data, or a scale predictor proven scalar. Per-observation scales keep the
+# plate.
+function _wholevec_scalar_scale(r::LikelihoodSpec, plan::StructuralPlan)
+    s = r.scale
+    s isa Real && return true
+    s isa Symbol && return any(p -> p.name === s, plan.parameters) ||
+        get(plan.columns, s, nothing) isa Real
+    s isa ScalePredictorRef &&
+        return _predictor_value_type(plan, _predictor(plan, s.predictor)) === :Number
+    return false
 end
 
 # Fused whole-vector Bernoulli-logit likelihood (base case). Logit-form log-mass
