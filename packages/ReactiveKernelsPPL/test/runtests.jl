@@ -192,6 +192,7 @@ const _PPL_TEST_FILES = (
     "test_capability_packed_tensor_reactant.jl",
     "test_ordinal_observed_surface.jl",
     "test_value_locations.jl",
+    "test_declared_array_locations.jl",
     "test_value_locations_reactant.jl",
     "test_matrix_values.jl",
     "test_row_gather_columns.jl",
