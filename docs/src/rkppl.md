@@ -192,6 +192,21 @@ an array) or a definition that reads only data. A bound number such as
 evaluated once at binding. Trials computed from a sampled value fail at
 lowering.
 
+A sampled scalar on `(0, 1)` retains its unconstrained coordinate for a
+direct `logit(q)` call and for `1 - q` when that complement is the
+zero-inflation input of `ZeroInflatedBinomial`. For example:
+
+```julia
+q ~ Uniform(0, 1)
+eta = logit(q) .+ x
+y .~ ZeroInflatedBinomial.(n, logistic.(eta), 1 - q)
+```
+
+The transform Jacobian and count likelihood use the source logit at finite
+tails even when the constrained `Float64` probability rounds to an endpoint.
+Other sampled priors must also have finite density at that rounded value.
+Other probability expressions retain their authored arithmetic.
+
 An ordered vector may use Normal, Cauchy, Laplace, Logistic or StudentT
 element priors with live scalar arguments, for example
 `c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log

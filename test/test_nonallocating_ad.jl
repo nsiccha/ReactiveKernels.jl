@@ -14,6 +14,27 @@ using Test
 # callable holds no data a plain backend must prove readonly.
 const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
+# Known Julia 1.12+ reverse-mode triggers that keep some NA gradients from
+# being size-invariant, absent on Julia 1.10. Each plate trigger produces
+# about 16 B per element. They overlap: with both present, measured plate
+# growth is still about 16 B per element, not 32.
+# - Each plate cell's source callable still runs `hasmethod`'s argument-type
+#   loop (`_KernelSourceFunction`, the type-stability audit's `JUSTIFIED`
+#   entry), and reverse-mode Enzyme tapes it per element. The fold that removes
+#   the query waits on todo `0itft6t` (a registered Enzyme release fixing
+#   EnzymeAD/Enzyme.jl#3787); drop `NA_CELL_QUERY` when it lands.
+# - With bounds checks forced on (`--check-bounds=yes`, the integration lane's
+#   flag), Enzyme tapes the shadow of a cached buffer's `Memory` pointer once
+#   per element when a loop stores into the buffer and the buffer is then
+#   stored back into its `Ref` slot: the AD plate loop's reuse-or-`similar`
+#   result and a cache step's `broadcast!` both hit it (the cache step grows
+#   by about 16 B per element on Julia 1.12, 24 B on Julia 1.13)
+#   (`repro_enzyme_reuse_or_similar_shadow_tape.jl`, Enzyme snag
+#   `julia-1-12-rever-30566488`).
+const NA_CELL_QUERY = VERSION >= v"1.12"
+const NA_SHADOW_TAPE = VERSION >= v"1.12" && Base.JLOptions().check_bounds == 1
+const NA_PLATE_ELEMENT_COST = NA_CELL_QUERY || NA_SHADOW_TAPE
+
 nlp_naad(x, m, s) = -0.5 * log(2π) - log(s) - 0.5 * ((x - m) / s)^2
 g_prior_naad(q) = nlp_naad(q[1], 0.0, 5.0) + nlp_naad(q[2], 0.0, 5.0) +
                   nlp_naad(q[3], 0.0, 5.0) + nlp_naad(q[4], 0.0, 5.0)
@@ -234,7 +255,8 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
 # cell kernel hoisted to a direct literal (`_ad_na_plate_loop!`): calling the
 # closure-held nested kernel trips Enzyme static activity analysis. Single
 # (`flat`) and chained (`chain`) plates agree with dataflow, the analytic
-# gradient, and central differences, with size-invariant allocations.
+# gradient, and central differences, with size-invariant allocations on
+# Julia 1.10 (Julia 1.12+: `NA_PLATE_ELEMENT_COST` at the top of this file).
 @testset "prepare_ad over NonAllocatingKernel with authored plates" begin
     C = AuthoredPlateChains
     q = [0.7]
@@ -265,7 +287,7 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
         ad_value_and_gradient!(prepna, gna, q)
         @allocated ad_value_and_gradient!(prepna, gna, q)
     end
-    @test alloc_bytes[1] == alloc_bytes[2]
+    @test alloc_bytes[1] == alloc_bytes[2] broken = NA_PLATE_ELEMENT_COST
 end
 
 # Partitioned plates gather live lane arguments at run time (`_LaneGather`).
@@ -273,7 +295,9 @@ end
 #gradient's only per-lane work is gathers plus arithmetic: on Julia 1.12 the
 #gather loop's per-element bounds checks allocated ~17.6 bytes/lane under
 #reverse-mode Enzyme (the same class as the plate-loop `checkbounds`
-#regression above), and the NA gradient must stay size-invariant there too.
+#regression), and the NA gradient must stay size-invariant there too. Each
+#partition is a plate, so the Julia 1.12+ plate costs
+#(`NA_PLATE_ELEMENT_COST`, top of this file) apply to it as well.
 @kernel arith_partition_naad(x::Vector{Float64}, y::Vector{Float64}) = begin
     pointwise = plate(x, y) do xi, yi
         cell::Float64 = yi > 0 ? xi * yi : 2.0 * xi + 1.0
@@ -320,7 +344,7 @@ end
         na_bytes
     end
     println("NONALLOCATING_AD_ALLOC\tpartition_arith\t", alloc_bytes)
-    @test alloc_bytes[1] == alloc_bytes[2]
+    @test alloc_bytes[1] == alloc_bytes[2] broken = NA_PLATE_ELEMENT_COST
 end
 
 fscale_naad(a, b) = a * b
@@ -351,8 +375,10 @@ fscale_naad(a, b) = a * b
     println("NONALLOCATING_AD_ALLOC\tdataflow\t", dataflow_bytes)
     println("NONALLOCATING_AD_ALLOC\tnonalloc\t", na_bytes)
     @test dataflow_bytes > 0
-    @test na_bytes <= 64
-    @test na_bytes < dataflow_bytes
+    # The cache step's `broadcast!` writes back into its slot
+    # (`NA_SHADOW_TAPE`, top of this file).
+    @test na_bytes <= 64 broken = NA_SHADOW_TAPE
+    @test na_bytes < dataflow_bytes broken = NA_SHADOW_TAPE
 end
 
 @testset "bound-only steps fold once per preparation" begin
@@ -698,22 +724,23 @@ end
         active = :q)
     @test only(ad_pushforward(pushforward, (v,), q, s, data)) ≈
           dot(data .* s .* exp.(s .* q) .- q, v)
-    # Not built yet: second-order passes through the AD-owned `Cache`
+    # On Julia 1.10, second-order passes through the AD-owned `Cache`
     # contexts fail Enzyme's static activity analysis in both orders
-    # (EnzymeRuntimeActivityError, Enzyme 0.13.210); the dataflow kernel's
-    # Hessian-vector products work.
+    # (EnzymeRuntimeActivityError, Enzyme 0.13.210 through 0.13.216); the
+    # dataflow kernel's Hessian-vector products work. Julia 1.12 and 1.13
+    # differentiate both orders (Enzyme 0.13.216).
     hessian = Diagonal(data .* s^2 .* exp.(s .* q)) - I
     for backend in (SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
                                 AutoEnzyme(; mode = Enzyme.Forward)),
                     SecondOrder(AutoEnzyme(; mode = Enzyme.Forward),
                                 AutoEnzyme(; mode = Enzyme.Reverse)))
-        @test_broken try
+        @test try
             prepared = prepare_ad_hvp(kernel, backend, (v,), q, s, data;
                                       active = :q)
             only(ad_hvp(prepared, (v,), q, s, data)) ≈ hessian * v
         catch error
             nameof(typeof(error)) === :EnzymeRuntimeActivityError || rethrow()
             false
-        end
+        end broken = VERSION < v"1.12"
     end
 end
