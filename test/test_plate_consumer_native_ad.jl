@@ -66,11 +66,13 @@ end
         @test kernel(arguments(0.0)...) == -Inf
     end
     # Both response lengths may change without duplicating either loop body.
+    # Each plate's shared `s > 0` guard is decided once per call, so each plate
+    # has one cell loop per arm.
     small = string(readable_code(prepare(guarded_gamma_plates; bound=(; y1, y2))))
     large = string(readable_code(prepare(guarded_gamma_plates;
         bound=(; y1=repeat(y1, 7), y2=repeat(y2, 5)))))
     loops(code) = length(collect(eachmatch(r"(?m)^\s*for ", code)))
-    @test loops(small) == loops(large) == 2
+    @test loops(small) == loops(large) == 4
 end
 
 @testset "bound split-arm plates under unannotated native Reverse" begin

@@ -1059,16 +1059,39 @@ tuples `CI`/`TI`/`EI`; a nested branch arm is itself a `_KernelBranch` over
 every argument. Plate partial evaluation reads them: a condition whose ports
 are all bound data is evaluated per lane at preparation, and the plate splits
 into one plate per taken arm (`_partition_plate_recipe`).
+
+In a plate cell, a leaf arm may also carry its own graph, `then_spec` /
+`else_spec`: a `KernelSpec` over the arm's ports (by name) whose one output is
+the arm's value, authored as a cell body would be (`nothing` otherwise). The
+native plate lowering reads them when the condition reads only shared
+operands: the condition is decided once per call and the cells run the taken
+arm's graph, whose shared recipes are hoisted above the cell loop like any
+other cell invariant (`_plate_shared_branch`).
 """
 struct _KernelBranch{CI,TI,EI,F,C,T,E}
     call::F
     condition::C
     then_arm::T
     else_arm::E
+    # Cold lowering metadata, untyped: prepared operation tables carry this
+    # branch, and a graph in its type would be compiled with every program.
+    then_spec::Any
+    else_spec::Any
 end
-_KernelBranch(::Val{CI}, ::Val{TI}, ::Val{EI}, call::F, condition::C,
-              then_arm::T, else_arm::E) where {CI,TI,EI,F,C,T,E} =
-    _KernelBranch{CI,TI,EI,F,C,T,E}(call, condition, then_arm, else_arm)
+_KernelBranch(ci::Val, ti::Val, ei::Val, call, condition, then_arm, else_arm) =
+    _KernelBranch(ci, ti, ei, call, condition, then_arm, else_arm, nothing, nothing)
+# Built once per authored branch, so assemble it without compiling a
+# constructor per closure type (as `_KernelSourceOp` does).
+Base.@nospecializeinfer function _KernelBranch(
+        @nospecialize(ci::Val), @nospecialize(ti::Val), @nospecialize(ei::Val),
+        @nospecialize(call), @nospecialize(condition), @nospecialize(then_arm),
+        @nospecialize(else_arm), @nospecialize(then_spec), @nospecialize(else_spec))
+    T = _KernelBranch{_val_parameter(ci), _val_parameter(ti), _val_parameter(ei),
+                      typeof(call), typeof(condition), typeof(then_arm),
+                      typeof(else_arm)}
+    _kernel_new_instance(T, (call, condition, then_arm, else_arm,
+                             then_spec, else_spec))::_KernelBranch
+end
 @inline (branch::_KernelBranch)(args...) = branch.call(args...)
 
 """
