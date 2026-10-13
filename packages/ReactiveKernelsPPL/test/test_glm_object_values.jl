@@ -350,3 +350,78 @@ end
         @test hv ≈ hv_fd rtol = 1e-5 atol = 1e-7
     end
 end
+
+# The per-observation spelling of the same regression reads the same rule:
+# a Gaussian response located at `M * v` or `alpha .+ M * v` (bound data
+# matrix, declared coefficient vector, sampled intercept; one shared scale)
+# has the NormalIDGLM density. Other locations keep the per-cell plate, and a
+# non-positive scale keeps the plate cell's `-Inf`.
+@testset "per-observation Normal over a design product reads the GLM rule" begin
+    n = 9
+    X, y = _gv_X(n), _gv_y(n)
+    g = [1, 2, 3, 1, 2, 3, 1, 2, 3]
+    _sampler_code(built, plan) =
+        sprint(show, MIME"text/plain"(), readable_code(prepare_query(built, plan, :sampler)))
+    product = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        y .~ Normal.(X * beta, sigma)
+    end
+    intercept = @rkppl begin
+        alpha ~ Normal(0, 10)
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        mu = alpha .+ X * beta
+        y .~ Normal.(mu, sigma)
+    end
+    fixed_scale = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        y .~ Normal.(X * beta, s)
+    end
+    cases = (
+        (product(; X) | (; y), (; X, y), nt -> X * nt.beta, nt -> nt.sigma),
+        (intercept(; X) | (; y), (; X, y), nt -> nt.alpha .+ X * nt.beta, nt -> nt.sigma),
+        (fixed_scale(; X, s = 2) | (; y), (; X, y), nt -> X * nt.beta, nt -> 2.0),
+    )
+    for (plan, data, mean, scale) in cases
+        oracle = nt -> logpdf.(Normal.(mean(nt), scale(nt)), y)
+        built = _gv_check(plan, data, nt -> sum(oracle(nt)))
+        @test occursin("normal_id_glm_lpdf(", _sampler_code(built, plan))
+        u = _gv_u(built)
+        nt = constrain(built.layout, u)
+        @test Base.invokelatest(prepare_query(built, plan, :pointwise), u).y ≈ oracle(nt)
+        # The per-observation queries still read the plate.
+        obs = Base.invokelatest(prepare_query(built, plan, :observations), u).y
+        @test obs.location ≈ mean(nt) && all(obs.scale .≈ scale(nt))
+        cell = prepare_cell_query(built, plan, :y)
+        @test Base.invokelatest(cell, u, 4) ≈ oracle(nt)[4]
+    end
+
+    # A real-support scale keeps the plate cell's guard: -Inf at sigma <= 0.
+    signed = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        sigma ~ Normal(0, 1)
+        y .~ Normal.(X * beta, sigma)
+    end
+    plan = signed(; X) | (; y)
+    built = build_kernel(plan)
+    likelihood = prepare_query(built, plan, :likelihood)
+    u = _gv_u(built)
+    nt = constrain(built.layout, u)
+    k = findfirst(==(:sigma), coordinate_names(built.layout))
+    u[k] = 0.7
+    @test Base.invokelatest(likelihood, u) ≈
+        sum(logpdf.(Normal.(X * constrain(built.layout, u).beta, 0.7), y))
+    u[k] = -0.7
+    @test Base.invokelatest(likelihood, u) == -Inf
+
+    # A location that is not a data-matrix product keeps the plate.
+    grouped = @rkppl begin
+        z[levels(g)] .~ Normal.(0, 1)
+        sigma ~ Exponential(1)
+        y .~ Normal.(z[g], sigma)
+    end
+    plan = grouped(; g) | (; y)
+    built = _gv_check(plan, (; g, y), nt -> sum(logpdf.(Normal.(nt.z[g], nt.sigma), y)))
+    @test !occursin("normal_id_glm_lpdf", _sampler_code(built, plan))
+end
