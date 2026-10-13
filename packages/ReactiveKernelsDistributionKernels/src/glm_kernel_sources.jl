@@ -7,6 +7,9 @@
 #   - `logpdf(y)` — the summed log-density (the HMC objective;
 #     differentiated by generic AD, never a per-function rule);
 #   - `pointwise(y)` — per-observation log-densities (LOO etc.);
+#   - `logkernel(y)` / `lognormalizer(y)` (Poisson-log only) — the
+#     per-observation density split into the terms that read eta and the
+#     data-only normalizer; `pointwise` is their sum;
 #   - `score(y)` — dℓ/dη per observation (Stan's theta_derivative);
 #   - `eta` — the linear predictor `X * beta` (extractable owner node);
 #   - `mu` — the inverse-link fitted mean (extractable owner node);
@@ -118,19 +121,20 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
     mu::Vector{Float64} = exp.(eta)
     working_weights::Vector{Float64} = mu
 
+    # Per observation, the density splits like the scalar `poisson`
+    # object's: `logkernel` is Stan's y*eta - exp(eta) (no cutoff; Stan
+    # has none either), and `lognormalizer` is the data-only -log(y!).
+    # Over a bound y the normalizer is a bind-time value, so `logpdf`'s
+    # `cterm` folds to a constant at prepare time, and a caller that sums
+    # `logkernel` and adds the normalizer's sum evaluates no `loggamma`.
+    logkernel(y::Vector{Int})::Vector{Float64} = y .* eta .- exp.(eta)
+    lognormalizer(y::Vector{Int})::Vector{Float64} = 0.0 .- loggamma.(y .+ 1)
+    # Scalar combo over sibling endpoints (see bernoulli NOTE).
     logpdf(y::Vector{Int})::Float64 = begin
-        # Stan's form with no cutoff (Stan has none either): y*eta -
-        # exp(eta), minus the data-only lgamma normalizer (bound y
-        # folds `cterm` to a constant at prepare time). Scalar combo:
-        # each temp is a port-only broadcast (see bernoulli NOTE).
-        cterm::Float64 = sum(loggamma.(y .+ 1))
-        et::Vector{Float64} = exp.(eta)
-        sum(y .* eta) - sum(et) - cterm
+        cterm::Float64 = sum(lognormalizer(y))
+        sum(logkernel(y)) + cterm
     end
-    # Port-only leaves throughout (see bernoulli NOTE): the normalizer
-    # nests into the one fused cells broadcast.
-    pointwise(y::Vector{Int})::Vector{Float64} =
-        y .* eta .- exp.(eta) .- loggamma.(y .+ 1)
+    pointwise(y::Vector{Int})::Vector{Float64} = logkernel(y) .+ lognormalizer(y)
     score(y::Vector{Int})::Vector{Float64} = y .- exp.(eta)
 end
 """
