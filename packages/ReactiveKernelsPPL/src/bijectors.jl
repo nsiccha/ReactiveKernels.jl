@@ -27,10 +27,7 @@ end
     constrain(u::Float64)::Float64 = 1 / (1 + exp(-u))
     inv(constrain, x::Float64)::Float64 = log(x) - log1p(-x)
     unconstrain(x::Float64)::Float64 = inv(constrain, x)
-    logjac(u::Float64)::Float64 = begin
-        x = 1 / (1 + exp(-u))
-        log(x) + log1p(-x)
-    end
+    logjac(u::Float64)::Float64 = -log1pexp(-u) - log1pexp(u)
 end
 
 """Transform symbol → bijector kernel object (constrained supports only)."""
@@ -74,16 +71,15 @@ end
 # it exactly like the parameterless splice); the host prepares an endpoint with
 # the constants `bound=` in, so the host call is just `k(value)`.
 
-# Bounded interval (lo, hi): affine-logistic ℝ → (lo, hi). `logjac` is written in
-# the CONSTRAINED value so host and in-graph forms match bit-for-bit.
+# Bounded interval (lo, hi): affine-logistic ℝ → (lo, hi). The Jacobian reads
+# the source coordinate so it stays finite when the constrained value rounds
+# to either endpoint.
 @kernel interval_bijector(lo::Float64, hi::Float64) = begin
     constrain(u::Float64)::Float64 = rk_affine_logistic(lo, hi, u)
     inv(constrain, x::Float64)::Float64 = log(x - lo) - log(hi - x)
     unconstrain(x::Float64)::Float64 = inv(constrain, x)
-    logjac(u::Float64)::Float64 = begin
-        x = rk_affine_logistic(lo, hi, u)
-        log(x - lo) + log(hi - x) - log(hi - lo)
-    end
+    logjac(u::Float64)::Float64 =
+        log(hi - lo) - log1pexp(-u) - log1pexp(u)
 end
 
 # Cache of prepared interval endpoints, keyed by (lo, hi, endpoint): the owner

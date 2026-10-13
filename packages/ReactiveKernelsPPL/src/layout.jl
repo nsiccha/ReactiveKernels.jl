@@ -1309,9 +1309,9 @@ _host_value_type(x) = Float64
 """
     logjac(layout, unconstrained) -> Real
 
-Host-side total log-Jacobian, using the identical operations as the
-in-graph terms (positive: the unconstrained value; unit:
-`log(x) + log1p(-x)` from the constrained value).
+Host-side total log-Jacobian, using the same source-coordinate formulas as
+the in-graph terms (positive: `u`; unit:
+`-log1pexp(-u) - log1pexp(u)`).
 """
 function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
     length(u) == layout.total ||
@@ -1401,12 +1401,12 @@ _logjac_value(transform::Symbol, u) =
 # single source of truth shared with the in-graph splices). An `:interval`
 # transform is PARAMETERIZED by per-entry bounds, so it does not fit the
 # Symbol-keyed parameterless bijector registry (like `:identity`, it lives
-# outside it): it maps ℝ → (lo, hi) via the RK-owned affine-logistic rule
-# (`lo + (hi-lo)·σ(u)`)
-# with log-Jacobian `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED
-# value. `:floored` is likewise parameterized (ℝ → (lo, ∞), `lo + exp(u)`,
-# log-Jacobian `u`), as is `:upper` (ℝ → (-∞, hi), `hi - exp(u)`,
-# log-Jacobian `u`). Prior density normalizers are emitted separately.
+# outside it): it maps ℝ → (lo, hi) through RK's affine-logistic rule
+# (`lo + (hi-lo)·σ(u)`). Its log-Jacobian reads the source coordinate:
+# `log(hi-lo) - log1pexp(-u) - log1pexp(u)`. `:floored` is likewise
+# parameterized (ℝ → (lo, ∞), `lo + exp(u)`, log-Jacobian `u`), as is
+# `:upper` (ℝ → (-∞, hi), `hi - exp(u)`, log-Jacobian `u`). Prior density
+# normalizers are emitted separately.
 # The in-graph interval constrain edge calls that same rule. The other edges
 # fold literal bounds (`_bound_add`), so host and graph agree bit-for-bit up
 # to the sign of an exact zero.
@@ -1428,10 +1428,9 @@ function _logjac_elt(e::LayoutEntry, u)
         e.transform === :upper || return _logjac_value(e.transform, u)
     e.transform === :floored && return u
     e.transform === :upper && return u
-    x = rk_affine_logistic(e.lo, e.hi, u)
-    # The width takes the value's number type, so a wide input keeps its
-    # precision; for Float64 this is the identity.
-    return log(x - e.lo) + log(e.hi - x) - log(oftype(x, e.hi - e.lo))
+    # The width takes the coordinate's number type, so a wide input keeps
+    # its precision; no rounded constrained value enters the logarithms.
+    return log(oftype(u, e.hi - e.lo)) - log1pexp(-u) - log1pexp(u)
 end
 
 """
@@ -1481,7 +1480,7 @@ end
 # Interval edges ℝ → (lo, hi): the RK-owned affine-logistic constrain rule,
 # whose primal is `lo + (hi - lo) / (1 + exp(-u))`, its
 # inverse `log(x - lo) - log(hi - x)`, and the log-Jacobian
-# `log(x - lo) + log(hi - x) - log(hi - lo)` (summed over the block when
+# `log(hi - lo) - log1pexp(-u) - log1pexp(u)` (summed over the block when
 # `dot`).
 function _interval_constrain(lo, hi, u; dot::Bool = false)
     return dot ? :(rk_affine_logistic.($lo, $hi, $u)) :
@@ -1490,14 +1489,11 @@ end
 _interval_unconstrain(lo, hi, x; dot::Bool = false) = dot ?
     :(log.($(_bound_sub(x, lo; dot))) .- log.($(_bound_sub(hi, x; dot)))) :
     :(log($(_bound_sub(x, lo))) - log($(_bound_sub(hi, x))))
-function _interval_logjac(lo, hi, x; dot::Bool = false)
+function _interval_logjac(lo, hi, u; dot::Bool = false)
     w = _bound_sub(hi, lo)
     logw = _literal_bound(w) && isone(w) ? 0.0 : :(log($w))
-    dot || return _bound_sub(
-        :(log($(_bound_sub(x, lo))) + log($(_bound_sub(hi, x)))), logw)
-    return :(sum($(_bound_sub(
-        :(log.($(_bound_sub(x, lo; dot))) .+ log.($(_bound_sub(hi, x; dot)))),
-        logw; dot))))
+    dot || return :($logw - log1pexp(-$u) - log1pexp($u))
+    return :(sum($logw .- log1pexp.(-$u) .- log1pexp.($u)))
 end
 
 """
@@ -1857,7 +1853,7 @@ function jacobian_term(e::LayoutEntry)
         e.transform === :interval || throw(ContractValidationError(
             "[layout] coefficient block $(e.name) has no Jacobian rule " *
             "for $(e.transform) (admitted: :identity, :interval)"))
-        return _interval_logjac(e.lo, e.hi, e.name; dot = true)
+        return _interval_logjac(e.lo, e.hi, block_read(e.offset, e.size); dot = true)
     end
     if e.kind === :cholesky_corr
         isempty(e.dims) || return _lkj_array_logjac(e.name)
@@ -1891,7 +1887,7 @@ function jacobian_term(e::LayoutEntry)
         # `_plate_transform_statements`. GLM vectors use the same shape.
         # Missing companion plates must fail explicitly.
         e.transform === :interval &&
-            return _interval_logjac(e.lo, e.hi, e.name; dot = true)
+            return _interval_logjac(e.lo, e.hi, block_read(e.offset, e.size); dot = true)
         if e.transform === :upper || e.transform === :floored
             # Both one-sided exp transforms have the bare-coordinate Jacobian.
             return :(sum($(block_read(e.offset, e.size))))
@@ -1904,8 +1900,8 @@ function jacobian_term(e::LayoutEntry)
     end
     if e.transform === :interval
         # Parameterized bounds ⇒ hand-rolled (not in the bijector registry);
-        # uses the constrained `e.name` from the interval constrain edge.
-        return _interval_logjac(e.lo, e.hi, e.name)
+        # reads the original coordinate, even if `e.name` has rounded.
+        return _interval_logjac(e.lo, e.hi, coordinate_read(e.offset))
     end
     if e.transform === :floored
         # Stan's lower-bound kernel: the bare unconstrained coordinate
