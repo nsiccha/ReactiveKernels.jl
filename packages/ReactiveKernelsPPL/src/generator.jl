@@ -1834,10 +1834,15 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
         :($obj($xaug, $bfull).pointwise($yf))
     design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
     n = r.mi_jobs === nothing ? _response_rows_source(plan, r) : Expr(:call, :length, r.mi_jobs)
+    # A literal zero intercept adds nothing: the object reads X and beta as
+    # they are, with no ones column.
+    xaug_expr, bfull_expr = r.glm_alpha isa Real && iszero(r.glm_alpha) ?
+        (:(Float64.($design)), :([$(r.glm_beta);])) :
+        (:(hcat(ones($n), $design)), :([$(r.glm_alpha); $(r.glm_beta)]))
     return Expr[
         :($yf = $yconv.($y)),
-        :($xaug = hcat(ones($n), $design)),
-        :($bfull = [$(r.glm_alpha); $(r.glm_beta)]),
+        :($xaug = $xaug_expr),
+        :($bfull = $bfull_expr),
         :($pw = $call),
         :($node::Float64 = sum($pw)),
     ]
@@ -3761,8 +3766,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
     # columns (priors addressed by response label — validation pins
     # full coverage).
     for r in plan.responses
-        _is_glm_family(r.family) || continue
-        _is_array_param(plan, r.glm_beta) && continue
+        _is_glm_family(r.family) && _glm_coefficient_block(plan, r) || continue
         m = _find_matrix(plan, r.predictor)
         cols = Symbol[c for c in m.columns if c !== nothing]
         loc = Float64[]

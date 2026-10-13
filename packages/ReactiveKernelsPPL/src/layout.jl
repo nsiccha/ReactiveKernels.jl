@@ -383,8 +383,7 @@ function assign_layout(plan::StructuralPlan)
     # agree on width.
     glm_widths = Dict{Symbol,Int}()
     for r in plan.responses
-        _is_glm_family(r.family) || continue
-        _is_array_param(plan, r.glm_beta) && continue
+        _is_glm_family(r.family) && _glm_coefficient_block(plan, r) || continue
         m = _find_matrix(plan, r.predictor)
         K = count(c -> c !== nothing, m.columns)
         if haskey(glm_widths, r.glm_beta)
