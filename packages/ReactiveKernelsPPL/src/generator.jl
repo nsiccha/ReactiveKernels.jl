@@ -303,7 +303,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     zero_inflated_binomial_logit_zi,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm, normal_id_glm_lpdf,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
-    rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
+    rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail,
+    _half_normal_logpdf_on_support, _half_cauchy_logpdf_on_support
 using SpecialFunctions: besseli, besselix, erfc, loggamma
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: logbeta
 # Selective (explicit imports win over any re-export chain, so no `using`
@@ -4397,6 +4398,19 @@ end
 function _sampled_prior_expr(p::SampledParameter; pre::Vector{Expr} = Expr[], conditioned = false,
         float64_args = ())
     argvals = Any[v for v in values(p.args)]
+    if p.support_override === :positive && p.family in (:normal, :cauchy) &&
+            argvals[1] isa Real && iszero(argvals[1])
+        # HalfNormal/HalfCauchy are scalar priors. Preserve the existing
+        # support guard and evaluate the same distribution graph behind one
+        # named operation instead of splicing its internals into this model.
+        call = p.family === :normal ? :_half_normal_logpdf_on_support :
+            :_half_cauchy_logpdf_on_support
+        x = conditioned ? _float64_port(p.name) : p.name
+        scale = argvals[2] in float64_args ? argvals[2] : _float64_port(argvals[2])
+        density = Expr(:call, call, x, scale)
+        return conditioned ? _conditioned_support_guard(p.name, p.support_override,
+            density) : density
+    end
     base = _family_logpdf_expr(p.family, argvals, p.name; float64_variate = !conditioned,
         float64_args)
     local_pre = conditioned ? Expr[] : pre
