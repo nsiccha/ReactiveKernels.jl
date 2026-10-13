@@ -3088,6 +3088,25 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
+    # A pure total-only one-axis plate is a scalar reduction. SIMD requires
+    # an indexable range, whereas `_plate_cells` returns a Generator for one
+    # axis. Iterate that axis directly and reconstruct the same cell index.
+    # Expand before an embedded kernel renames locals: late macro expansion
+    # can interpret its renamed index as a module global.
+    if accumulator !== nothing && pointwise_lhs === nothing &&
+            !has_scheduled_groups && nested === nothing &&
+            all(r -> !r.effectful, inner.recipes)
+        linear = gensym(:plate_linear)
+        simd_body = Expr(:block,
+            Expr(:(=), index, Expr(:call, GlobalRef(Base, :CartesianIndex), linear)),
+            deepcopy(loopbody.args)...)
+        simd_loop = Expr(:for, Expr(:(=), linear,
+            Expr(:call, GlobalRef(Base, :only), output_axes)), simd_body)
+        simd = Expr(:macrocall, GlobalRef(Base, Symbol("@simd")),
+            LineNumberNode(0), simd_loop)
+        cell_loop = Expr(:if, :(length($output_axes) == 1),
+            macroexpand(@__MODULE__, simd), cell_loop)
+    end
     reduction = cells && nested === nothing ? _plate_reduction_plan(
         inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
         pointwise_lhs) : nothing
