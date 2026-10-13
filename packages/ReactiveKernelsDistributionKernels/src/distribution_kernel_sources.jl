@@ -576,6 +576,24 @@ using SpecialFunctions: gamma_inc
     log_rate::Float64 = log(rate)
     rate::Float64 = exp(log_rate)
 
+    # The data-only log factorial term, `-log(observed!)`: zero at zero and at
+    # invalid counts, which never form it.
+    lognormalizer(observed::Int)::Float64 =
+        observed > 0 ? -loggamma(observed + 1.0) : 0.0
+    # `logpdf` without `lognormalizer`: the terms that read the rate.
+    logkernel(observed::Int)::Float64 = begin
+        lp::Float64 =
+            observed >= 0 ?
+                (observed == 0 ? -rate : observed * log_rate - rate) : -Inf
+        lp::Float64 =
+            observed >= 0 ?
+                (observed == 0 ? -rate : observed * log(rate) - rate) : -Inf
+        lp
+    end
+    # `logpdf` equals `logkernel(observed) + lognormalizer(observed)`, written
+    # out rather than summed: summing the two endpoints in one cell makes
+    # released Enzyme fail reverse compilation ("Illegal cached pointer").
+    # The DK test pins the identity.
     logpdf(observed::Int)::Float64 = begin
         lp::Float64 =
             observed >= 0 ?
@@ -660,6 +678,34 @@ using SpecialFunctions: beta_inc
     logp::Float64 = -log1pexp(-logit)
     log1mp::Float64 = -log1pexp(logit)
 
+    # The data-only log binomial coefficient. The zero, full and invalid
+    # counts never form it, so it is zero there and those lanes stay free of
+    # `loggamma`.
+    lognormalizer(observed::Int)::Float64 =
+        (observed > 0) & (observed < n) ?
+            loggamma(n + 1.0) - loggamma(observed + 1.0) -
+                loggamma(n - observed + 1.0) : 0.0
+    # `logpdf` without `lognormalizer`: the terms that read `p` or `logit`.
+    logkernel(observed::Int)::Float64 = begin
+        # Read the supplied logit directly so HAVE planning preserves tails.
+        lp::Float64 =
+            (observed >= 0) & (observed <= n) ?
+                (n == 0 ? 0.0 :
+                 observed == 0 ? -n * log1pexp(logit) :
+                 observed == n ? -n * log1pexp(-logit) :
+                 -observed * log1pexp(-logit) - (n - observed) * log1pexp(logit)) :
+                -Inf
+        lp::Float64 =
+            (observed >= 0) & (observed <= n) ?
+                ((observed == 0 ? 0.0 : observed * log(p)) +
+                 (observed == n ? 0.0 : (n - observed) * log1p(-p))) :
+                -Inf
+        lp
+    end
+    # `logpdf` equals `logkernel(observed) + lognormalizer(observed)`, written
+    # out rather than summed: summing the two endpoints in one cell makes
+    # released Enzyme fail reverse compilation ("Illegal cached pointer").
+    # The DK test pins the identity.
     logpdf(observed::Int)::Float64 = begin
         # Read the supplied logit directly so HAVE planning preserves tails.
         lp::Float64 =
@@ -981,6 +1027,46 @@ using SpecialFunctions: beta_inc
     logp::Float64 = -log1pexp(-logit)
     log1mp::Float64 = -log1pexp(logit)
 
+    # The data-only log binomial coefficient of the positive arm. The zero,
+    # full and invalid counts never form it, so it is zero there and those
+    # lanes stay free of `loggamma`.
+    lognormalizer(observed::Int)::Float64 =
+        (observed > 0) & (observed < n) ?
+            loggamma(n + 1.0) - loggamma(observed + 1.0) -
+                loggamma(n - observed + 1.0) : 0.0
+    # `logpdf` without `lognormalizer`: the terms that read `p`, `logit` or `zi`.
+    logkernel(observed::Int)::Float64 = begin
+        # Read the supplied logit directly so HAVE planning preserves tails.
+        lp::Float64 =
+            ((observed >= 0) & (observed <= n) & (zi >= 0) & (zi <= 1)) ?
+                (n == 0 ? 0.0 : observed == 0 ?
+                    (n * log1pexp(logit) <= 700 ?
+                        log1p(zi * expm1(n * log1pexp(logit))) - n * log1pexp(logit) :
+                        (zi >= 0.5 ? log(zi + (1 - zi) * exp(-n * log1pexp(logit))) :
+                            logaddexp(log(zi), log1p(-zi) - n * log1pexp(logit)))) :
+                    log1p(-zi) + (observed == n ? -n * log1pexp(-logit) :
+                        -observed * log1pexp(-logit) -
+                        (n - observed) * log1pexp(logit))) :
+                -Inf
+        lp::Float64 =
+            ((observed >= 0) & (observed <= n) & (zi >= 0) & (zi <= 1) &
+                (p >= 0) & (p <= 1)) ?
+                (observed == 0 ?
+                    (n <= 1 ? log(zi + (1 - zi) * (1 - p)^n) :
+                        (p == 1 ? log(zi) :
+                            (-n * log1p(-p) <= 700 ?
+                                n * log1p(-p) + log1p(zi * expm1(-n * log1p(-p))) :
+                                (zi >= 0.5 ? log(zi + (1 - zi) * exp(n * log1p(-p))) :
+                                    logaddexp(log(zi), log1p(-zi) + n * log1p(-p)))))) :
+                    log1p(-zi) + observed * log(p) +
+                    (observed == n ? 0.0 : (n - observed) * log1p(-p))) :
+                -Inf
+        lp
+    end
+    # `logpdf` equals `logkernel(observed) + lognormalizer(observed)`, written
+    # out rather than summed: summing the two endpoints in one cell makes
+    # released Enzyme fail reverse compilation ("Illegal cached pointer").
+    # The DK test pins the identity.
     logpdf(observed::Int)::Float64 = begin
         # Read the supplied logit directly so HAVE planning preserves tails.
         lp::Float64 =
