@@ -623,8 +623,15 @@ function _predictor_statements(plan::StructuralPlan)
         # Full-length vector plans read one location entry per row. A value
         # of unknown shape gets those rows once, as Julia broadcasting
         # against the rows would, rather than a ones vector per summand.
-        rows && (rhs = Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs,
-            _located_rows_source(plan, pred)))
+        # A value of known extent other than the rows (a one-entry declared
+        # array) broadcasts to them directly: its type then does not depend
+        # on `_ppl_rows`'s run-time length test.
+        if rows
+            n = _located_rows_source(plan, pred)
+            rhs = _known_row_mismatch(plan, pred, rhs) ?
+                Expr(:call, :.*, Expr(:call, :ones, n), rhs) :
+                Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs, n)
+        end
         # A proven scalar declares its type, so plates statically read it
         # as a shared argument rather than through a runtime axis test.
         push!(stmts, _predictor_value_type(plan, pred) === :Number &&
@@ -737,7 +744,38 @@ function _composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec,
         i !== nothing && _authored_plate_result(plan.assignments[i].expr) &&
             return false
     end
+    # A value with the located responses' own axes (a declared array
+    # `theta[axes(y, 1)]` read whole by `Normal.(theta, s)`) already holds
+    # one entry per row. It reads in place, as `_ppl_rows` would return it,
+    # without that call's run-time choice between it and a broadcast copy.
+    _has_located_axes(plan, pred, ex) && return false
     return true
+end
+
+function _has_located_axes(plan::StructuralPlan, pred::PredictorSpec, ex)
+    a = _known_axes(plan, ex)
+    a === nothing && return false
+    located = [r for r in plan.responses if _response_uses_predictor(r, pred.name)]
+    return !isempty(located) && all(located) do r
+        haskey(plan.columns, r.response) && r.range === nothing &&
+            _value_axes(plan, r.response; data_axes = true) == a
+    end
+end
+
+# A value whose known extent is not the location's rows (a one-entry
+# declared array), so `_ppl_rows` would always take its broadcast branch.
+function _known_row_mismatch(plan::StructuralPlan, pred::PredictorSpec, ex)
+    a = _known_axes(plan, ex)
+    return a !== nothing && prod(a) != _located_rows(plan, pred)
+end
+
+# The bound integer axes of an array value, or `nothing` when a scalar,
+# unbound or of unknown shape.
+function _known_axes(plan::StructuralPlan, ex)
+    isbound(plan) || return nothing
+    a = _value_axes(plan, ex; data_axes = true)
+    a isa Vector && !isempty(a) && all(d -> d isa Int, a) || return nothing
+    return a
 end
 
 # A called @kernel whose single result is an authored plate already has an
