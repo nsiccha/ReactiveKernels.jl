@@ -77,11 +77,11 @@ end
 # Bounded interval (lo, hi): affine-logistic ℝ → (lo, hi). `logjac` is written in
 # the CONSTRAINED value so host and in-graph forms match bit-for-bit.
 @kernel interval_bijector(lo::Float64, hi::Float64) = begin
-    constrain(u::Float64)::Float64 = lo + (hi - lo) / (1 + exp(-u))
+    constrain(u::Float64)::Float64 = rk_affine_logistic(lo, hi, u)
     inv(constrain, x::Float64)::Float64 = log(x - lo) - log(hi - x)
     unconstrain(x::Float64)::Float64 = inv(constrain, x)
     logjac(u::Float64)::Float64 = begin
-        x = lo + (hi - lo) / (1 + exp(-u))
+        x = rk_affine_logistic(lo, hi, u)
         log(x - lo) + log(hi - x) - log(hi - lo)
     end
 end
