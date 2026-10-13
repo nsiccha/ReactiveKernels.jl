@@ -73,6 +73,9 @@ end
 _is_axis_dim(d) = d isa Expr && d.head === :call && length(d.args) == 3 &&
     (d.args[1] === :axes || d.args[1] === :size) && d.args[2] isa Symbol &&
     (d.args[3] === 1 || d.args[3] === 2)
+_is_bound_extent_dim(d) = d isa Symbol ||
+    (d isa Expr && !_is_levels_dim(d) && !_is_axis_dim(d) &&
+        _levels_count(d) === nothing)
 
 function _validate_array_dim(p::ArrayParameter, d)
     d isa Int && d >= 0 && return nothing
@@ -81,10 +84,12 @@ function _validate_array_dim(p::ArrayParameter, d)
             _levels_subset(d)))
         return nothing
     end
-    (_is_levels_dim(d) || _is_axis_dim(d) || _levels_count(d) !== nothing) &&
+    (_is_levels_dim(d) || _is_axis_dim(d) || _levels_count(d) !== nothing ||
+        _is_bound_extent_dim(d)) &&
         return nothing
     _fail(p.label, "array $(p.name) axis $(repr(d)) is not a size: axes " *
-          "are a literal `1:K` (K ≥ 0), `1:length(levels(g)) - k`, " *
+          "are `1:K` with a nonnegative bound-data extent, " *
+          "`1:length(levels(g)) - k`, " *
           "`levels(g)`, or `axes(M, d)` / `size(M, d)` of a matrix `M` " *
           "(d = 1 or 2)")
 end
@@ -127,6 +132,8 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d;
             "negative size $n on the bound data ($g has $(n + k) levels)")
         return n
     end
+    _is_bound_extent_dim(d) && return _sampling_extent(plan, d, name;
+        what = "array $name axis $(repr(d))")
     fn, M, k = d.args[1], d.args[2], d.args[3]
     m = _find_matrix(plan, M)
     if m !== nothing

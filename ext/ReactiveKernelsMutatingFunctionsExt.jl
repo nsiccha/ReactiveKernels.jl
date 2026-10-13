@@ -322,8 +322,8 @@ end
 end
 
 # Partitioned-plate lane gathers: `x[lanes]` elementwise into the cache, or a
-# fill when the argument is a singleton (the twin's
-# `x[ones(Int, length(lanes))]` branch). The guards mirror the twin's branch
+# fill when the argument is a singleton (the twin's indexed-view branch).
+# The guards mirror the twin's branch
 # order exactly — the singleton check first, so out-of-range lane indices on
 # a length-1 argument fill rather than throwing — and any mismatch falls back
 # to the twin call, preserving its exact result and errors (`enumerate` keeps

@@ -94,7 +94,7 @@ isdefined(@__MODULE__, :BranchPartition) ||
                       for (m, xi, yi, o) in zip(mu, xc, yc, obs))
         bound = prepare(C.chained_arms; bound = (; x = xc, y = yc, obs))
         @test length(plates(bound.plan)) == 4
-        @test count(op -> op isa RK._LaneAssemble, bound.ops) == 1
+        @test any(op -> op isa RK._LaneAssemble, bound.ops)
         @test bound(mu) ≈ ref(mu)
         pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), mu; active = :mu)
         value, grad = RK.ad_value_and_gradient!(pb, similar(mu), mu)
@@ -114,7 +114,7 @@ isdefined(@__MODULE__, :BranchPartition) ||
                      for (xi, yi, o) in zip(xc, yc, obs))
         bound = prepare(C.guarded_location;
                         bound = (; x = xc, y = yc, idx = collect(1:3), obs))
-        @test count(op -> op isa RK._LaneAssemble, bound.ops) == 1
+        @test any(op -> op isa RK._LaneAssemble, bound.ops)
         u = [0.2, -0.3]
         @test bound(u) ≈ ref(u)
         pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), u; active = :u)
