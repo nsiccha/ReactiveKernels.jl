@@ -101,6 +101,32 @@ end
     end
 end
 
+# Native forward substitution over `Float64` storage. The row form above
+# is what tracing retains as one loop body; natively it allocates five
+# temporaries per margin. Here every slice solves into one fresh buffer,
+# `Z[i, g] = (X[g, i] - Σ_{j<i} F[i, j] Z[j, g]) / F[i, i]`, each entry
+# written once, so native reverse records no overwritten storage. Tracing
+# never selects this method: `traced` keeps the authored generic body.
+function _lower_solve_rows_logpdf(X::AbstractMatrix{Float64},
+        F::AbstractMatrix{Float64}, logdet::Float64)
+    groups, k = size(X)
+    groups == 0 && return 0.0
+    size(F) == (k, k) || throw(DimensionMismatch("slices have length $k, " *
+        "but the factor has size $(size(F))"))
+    Z = Matrix{Float64}(undef, k, groups)
+    squares = 0.0
+    @inbounds for g in 1:groups, i in 1:k
+        s = X[g, i]
+        for j in 1:(i - 1)
+            s -= F[i, j] * Z[j, g]
+        end
+        z = s / F[i, i]
+        Z[i, g] = z
+        squares += z * z
+    end
+    return -0.5squares - groups * (0.5k * log(2pi) + logdet)
+end
+
 # Σ log F[i, i] of a K×K lower-triangular Cholesky factor, checking the
 # positive diagonal and the zero upper triangle.
 @traceable function _cholesky_factor_logdet(F, k)
@@ -161,6 +187,39 @@ end
                 F[i, j]
             end
             F[i, j] = factor_entry
+        end
+    end
+    return F
+end
+
+# The same factor over native `Float64` storage, column by column
+# (Cholesky–Crout), with the triangular bounds the traced form above
+# replaces by guarded full-length loops: `k³/3` multiply-adds instead of
+# `k³` branches, each entry written once. Checks and messages are the
+# traced form's; tracing never selects this method.
+function _covariance_cholesky(Sigma::AbstractMatrix{Float64}, k)
+    size(Sigma) == (k, k) || throw(DimensionMismatch("MvNormal slices " *
+        "have length $k, but the covariance has size $(size(Sigma))"))
+    for j in 1:k, i in (j + 1):k
+        ReactiveKernels._runtime_check(abs(Sigma[i, j] - Sigma[j, i]) <= 1e-8,
+            ArgumentError("MvNormal covariance is not symmetric"))
+    end
+    F = zeros(Float64, k, k)
+    @inbounds for j in 1:k
+        d = Sigma[j, j]
+        for p in 1:(j - 1)
+            d -= F[j, p] * F[j, p]
+        end
+        ReactiveKernels._runtime_check(d > 0,
+            ArgumentError("MvNormal covariance is not positive definite"))
+        pivot = sqrt(d)
+        F[j, j] = pivot
+        for i in (j + 1):k
+            s = Sigma[i, j]
+            for p in 1:(j - 1)
+                s -= F[i, p] * F[j, p]
+            end
+            F[i, j] = s / pivot
         end
     end
     return F
