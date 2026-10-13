@@ -65,14 +65,21 @@ end
     end
 end
 
+@kernel let_local_argument(scale::Float64) = begin
+    base(x::Float64)::Float64 = scale * x
+    outer(x::Float64)::Float64 = let z = 2x
+        base(z)
+    end
+end
+
 @testset "a let in a pure endpoint keeps the object transparent" begin
     @test ReactiveKernels.kernel_endpoint_names(inflated_let) == (:logkernel,)
     @test ReactiveKernels.kernel_endpoint_names(let_scopes) ==
           (:sequential, :shadowed, :statement, :sibling, :shadowed_endpoint)
-    @test occursin("let nl1pe",
-                   string(readable_code(prepare(inflated_let.logkernel))))
-
     endpoint_let = prepare(inflated_let.logkernel)
+    @test occursin("let nl1pe",
+                   string(ReactiveKernels._readable_expr(
+                       code_expr(endpoint_let), endpoint_let)))
     endpoint_block = prepare(inflated_block.logkernel)
     for (n, logit, zi, observed) in ((8, -0.4, 0.3, 0), (8, 100.0, 0.3, 0),
                                      (8, 0.7, 0.2, 3), (8, -1.3, 0.6, 8))
@@ -118,34 +125,27 @@ end
         end
     end
 
-    # Capability gap: an endpoint call is hoisted into its own recipe ahead of
-    # its statement, outside the `let`, so it cannot read a `let`-local. Until
-    # that is built, definition fails naming the `let` rather than reading an
-    # unrelated port of the same name (the owner's `scale` in the second case).
-    for definition in (
-        :(@kernel let_local_argument(scale::Float64) = begin
-            base(x::Float64)::Float64 = scale * x
-            outer(x::Float64)::Float64 = let z = 2x
-                base(z)
-            end
-        end),
-        :(@kernel let_shadowed_argument(scale::Float64) = begin
+    # An endpoint call reading a `let`-bound name stays inside the `let`: the
+    # object's builder prepares the callee once and the call applies it there.
+    @test prepare(let_local_argument.outer)(1.5, 2.0) == 6.0
+
+    # Capability gap: the in-place call passes the owner's ports by name, so
+    # a `let` rebinding one of them would hand the callee the `let`'s value.
+    # Until that is built, definition fails naming the `let`.
+    defined = try
+        Core.eval(@__MODULE__, :(@kernel let_shadowed_argument(scale::Float64) = begin
             base(x::Float64)::Float64 = scale * x
             outer(x::Float64)::Float64 = let scale = 2x
                 base(scale)
             end
-        end),
-    )
-        defined = try
-            Core.eval(@__MODULE__, definition)
-            :defined
-        catch err
-            err
-        end
-        @test_broken defined === :defined
-        defined === :defined ||
-            @test occursin("`let` binds", sprint(showerror, defined))
+        end))
+        :defined
+    catch err
+        err
     end
+    @test_broken defined === :defined
+    defined === :defined ||
+        @test occursin("rename the `let` binding", sprint(showerror, defined))
 end
 
 end
