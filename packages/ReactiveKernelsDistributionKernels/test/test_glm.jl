@@ -10,12 +10,13 @@ using LogExpFunctions: log1pexp, softmax
 import LogExpFunctions
 using SpecialFunctions: loggamma
 using ReactiveKernels: @kernel, code_expr, extract, prepare,
-    prepare_ad, ad_value_and_gradient!
+    prepare_ad, ad_value_and_gradient!, forward_cut, reverse_cut,
+    has_forward_branch, has_reverse_branch, stage_residuals
 using ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     BERNOULLI_LOGIT_GLM_KERNEL_SOURCE, bernoulli_logit_glm,
     POISSON_LOG_GLM_KERNEL_SOURCE, poisson_log_glm,
-    NORMAL_ID_GLM_KERNEL_SOURCE, normal_id_glm,
+    NORMAL_ID_GLM_KERNEL_SOURCE, normal_id_glm, normal_id_glm_lpdf,
     BINOMIAL_LOGIT_GLM_KERNEL_SOURCE, binomial_logit_glm,
     NEG_BINOMIAL_2_LOG_GLM_KERNEL_SOURCE, neg_binomial_2_log_glm,
     CATEGORICAL_LOGIT_GLM_KERNEL_SOURCE, categorical_logit_glm,
@@ -292,6 +293,33 @@ end
             have = (:X, :beta), want = :eta))(X, beta) ≈ eta
         @test prepare(extract(normal_id_glm;
             have = (:X, :beta), want = :mu))(X, beta) ≈ eta
+    end
+
+    @testset "logpdf is an owned rule whose graph authors both derivative branches" begin
+        # Both cuts against central differences of the independent oracle,
+        # one input at a time; the sampler's pattern (beta and sigma active)
+        # stages X'r in the primal and retains neither X nor the residual vector.
+        lp(Xv, bv, sv, yv) = sum(logpdf(Normal(e, sv), yi) for (e, yi) in zip(Xv * bv, yv))
+        fd(f, z; h = 1e-6) = [(f(z .+ h .* (eachindex(z) .== i)) -
+            f(z .- h .* (eachindex(z) .== i))) / 2h for i in eachindex(z)]
+        @test has_forward_branch(normal_id_glm_lpdf) && has_reverse_branch(normal_id_glm_lpdf)
+        @test normal_id_glm_lpdf(X, beta, sigma, y) ≈ ref_total
+        X_bar, beta_bar, sigma_bar, y_bar =
+            reverse_cut(normal_id_glm_lpdf, Val(15), X, beta, sigma, y, 0.7)
+        @test vec(X_bar) ≈ 0.7 .* fd(z -> lp(reshape(z, size(X)), beta, sigma, y), vec(X)) rtol = 1e-6
+        @test beta_bar ≈ 0.7 .* fd(z -> lp(X, z, sigma, y), beta) rtol = 1e-6
+        @test sigma_bar ≈ 0.7 * only(fd(z -> lp(X, beta, only(z), y), [sigma])) rtol = 1e-6
+        @test y_bar ≈ 0.7 .* fd(z -> lp(X, beta, sigma, z), y) rtol = 1e-6
+        beta_bar6, sigma_bar6 = reverse_cut(normal_id_glm_lpdf, Val(6), X, beta, sigma, y, 0.7)
+        @test beta_bar6 ≈ beta_bar && sigma_bar6 ≈ sigma_bar
+        @test !(:X in stage_residuals(normal_id_glm_lpdf, Val(6)))
+        @test !(:r in stage_residuals(normal_id_glm_lpdf, Val(6)))
+        Xd = [0.1 -0.2; 0.3 0.0; -0.1 0.2; 0.0 0.1; 0.2 -0.3; 0.1 0.1]
+        bd, sd, yd = [0.3, -0.4], 0.2, [0.1, 0.0, -0.2, 0.3, 0.1, -0.1]
+        value, lp_dot = forward_cut(normal_id_glm_lpdf, X, beta, sigma, y, Xd, bd, sd, yd)
+        @test value ≈ ref_total
+        @test lp_dot ≈ only(fd(t -> lp(X .+ only(t) .* Xd, beta .+ only(t) .* bd,
+            sigma + only(t) * sd, y .+ only(t) .* yd), [0.0])) rtol = 1e-6
     end
 
     @testset "tight sigma and far residuals stay finite" begin

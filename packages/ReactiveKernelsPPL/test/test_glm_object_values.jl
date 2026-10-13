@@ -293,3 +293,60 @@ end
         @test pw ≈ [logpdf(_gv_family(head, eta[k]), y[k]) for k in eachindex(jobs)]
     end
 end
+
+# The Normal-identity object's density is its `logpdf` endpoint, an owned rule
+# whose reverse branch is one X'r product (DK `normal_id_glm_lpdf`): the
+# sampler neither builds nor differentiates the per-observation vector, which
+# `:pointwise` still returns. Forward and second-order queries go through the
+# rule's authored forward branch.
+@testset "NormalIDGLM density reads the rule-backed logpdf endpoint" begin
+    n = 9
+    X, y = _gv_X(n), _gv_y(n)
+    x1 = X[:, 1]
+    zero_intercept = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        y ~ NormalIDGLM(X, 0.0, beta, sigma)
+    end
+    live_design = @rkppl begin
+        a ~ Normal(0, 1)
+        alpha ~ Normal(0, 10)
+        Z = hcat(x1, exp.(a .* x1))
+        beta[axes(Z, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        y ~ NormalIDGLM(Z, alpha, beta, sigma)
+    end
+    second_order = SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+        AutoEnzyme(; mode = Enzyme.Forward))
+    cases = (
+        (zero_intercept(; X) | (; y), (; X, y), nt -> X * nt.beta),
+        (live_design(; x1) | (; y), (; x1, y),
+            nt -> nt.alpha .+ hcat(x1, exp.(nt.a .* x1)) * nt.beta),
+    )
+    for (plan, data, mean) in cases
+        oracle = nt -> logpdf.(Normal.(mean(nt), nt.sigma), y)
+        built = _gv_check(plan, data, nt -> sum(oracle(nt)))
+        code = sprint(show, MIME"text/plain"(), readable_code(prepare_query(built, plan, :sampler)))
+        @test occursin("normal_id_glm_lpdf(", code)
+        @test !occursin("_ppl_pw_", code)
+        u = _gv_u(built)
+        cells = oracle(constrain(built.layout, u))
+        @test Base.invokelatest(prepare_query(built, plan, :pointwise), u).y ≈ cells
+        q = prepare_sampler(built, plan, u; backend = _GV_BACKEND)
+        retaining = prepare_sampler(built, plan, u; backend = _GV_BACKEND, retain = (:pointwise,))
+        value, gradient = sampler_value_and_gradient!(q, similar(u), u)
+        rvalue, rgradient, retained = sampler_value_gradient_and_retained!(retaining, similar(u), u)
+        @test rvalue ≈ value
+        @test rgradient ≈ gradient
+        @test retained.pointwise.y ≈ cells
+        # Reverse over forward, against a central difference of the gradient.
+        grad(v) = sampler_value_and_gradient!(q, similar(v), v)[2]
+        v = [cos(i) for i in eachindex(u)]
+        h = 1e-5
+        hv_fd = (grad(u .+ h .* v) .- grad(u .- h .* v)) ./ 2h
+        qh = prepare_query_ad(prepare_ad_hvp, built, plan, :sampler, second_order, (v,), u)
+        hvp_gradient, (hv,) = ad_gradient_and_hvp(qh, (v,), u)
+        @test hvp_gradient ≈ gradient
+        @test hv ≈ hv_fd rtol = 1e-5 atol = 1e-7
+    end
+end

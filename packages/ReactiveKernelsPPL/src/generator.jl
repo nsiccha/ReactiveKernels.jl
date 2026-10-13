@@ -1891,7 +1891,13 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     ]
     r.family === PoissonLogGLMFam &&
         return Expr[head..., _poisson_glm_split_stmts(r, o, yf, pw, node)...]
-    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = sum($pw))]
+    # The Normal-identity density reads the object's `logpdf`, an owned rule
+    # whose reverse branch is one X'r product (DK `normal_id_glm_lpdf`), so
+    # neither the sampler nor its gradient materializes or differentiates the
+    # per-observation vector that only the `:pointwise` query reads. The
+    # Bernoulli object's `logpdf` is `sum(pointwise)`, so it sums that vector.
+    density = r.family === NormalIDGLMFam ? :($o.logpdf($yf)) : :(sum($pw))
+    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = $density)]
 end
 
 # The Poisson-log object's density in its two endpoint parts, as a count plate
