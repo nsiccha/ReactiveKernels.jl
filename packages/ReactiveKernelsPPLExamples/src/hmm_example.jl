@@ -98,7 +98,7 @@ using LogExpFunctions: logsumexp
         scan(y[2:T]; init = gamma1) do carry, yt
             emit = c0 .- 0.5 .* (yt .- mu) .^ 2
             M = carry .+ logtheta                             # M[j,k] = γ[j] + logθ[j,k]
-            newg = vec(mapslices(logsumexp, M; dims = 1)) .+ emit
+            newg = vec(logsumexp(M; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end
     likelihood::Float64 = lls[T - 1]
