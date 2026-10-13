@@ -1068,13 +1068,15 @@ operands: the condition is decided once per call and the cells run the taken
 arm's graph, whose shared recipes are hoisted above the cell loop like any
 other cell invariant (`_plate_shared_branch`).
 """
-struct _KernelBranch{CI,TI,EI,F,C,T,E,TS,ES}
+struct _KernelBranch{CI,TI,EI,F,C,T,E}
     call::F
     condition::C
     then_arm::T
     else_arm::E
-    then_spec::TS
-    else_spec::ES
+    # Cold lowering metadata, untyped: prepared operation tables carry this
+    # branch, and a graph in its type would be compiled with every program.
+    then_spec::Any
+    else_spec::Any
 end
 _KernelBranch(ci::Val, ti::Val, ei::Val, call, condition, then_arm, else_arm) =
     _KernelBranch(ci, ti, ei, call, condition, then_arm, else_arm, nothing, nothing)
@@ -1086,7 +1088,7 @@ Base.@nospecializeinfer function _KernelBranch(
         @nospecialize(else_arm), @nospecialize(then_spec), @nospecialize(else_spec))
     T = _KernelBranch{_val_parameter(ci), _val_parameter(ti), _val_parameter(ei),
                       typeof(call), typeof(condition), typeof(then_arm),
-                      typeof(else_arm), typeof(then_spec), typeof(else_spec)}
+                      typeof(else_arm)}
     _kernel_new_instance(T, (call, condition, then_arm, else_arm,
                              then_spec, else_spec))::_KernelBranch
 end

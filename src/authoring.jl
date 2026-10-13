@@ -2414,6 +2414,13 @@ function _kernel_plate_arm_spec(side, names, shared, mod, scope; endpoint_cache)
         endpoint_cache).spec
 end
 
+# Marks an arm graph's construction expression inside a branch operation, so
+# operation post-processing (`_kernel_source_functions`) leaves its recipe
+# closures and construction groups as `_kernel_expand` emitted them.
+_kernel_branch_arm_graph(@nospecialize(spec)) = spec
+_kernel_is_branch_arm_graph(ex) = ex isa Expr && ex.head === :call &&
+    !isempty(ex.args) && ex.args[1] == GlobalRef(@__MODULE__, :_kernel_branch_arm_graph)
+
 function _kernel_plate_arm_value(ex, mod)
     ex isa Expr || return true
     if ex.head === :block
@@ -3702,6 +3709,8 @@ end
 function _kernel_source_functions(ex, mod)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
+    # A branch arm's graph is complete construction code of its own.
+    _kernel_is_branch_arm_graph(ex) && return ex
     ex.head === :-> && return Expr(:call,
         GlobalRef(@__MODULE__, :_kernel_source_function), ex, QuoteNode(ex), QuoteNode(mod))
     Expr(ex.head, Any[_kernel_source_functions(arg, mod) for arg in ex.args]...)
@@ -3914,7 +3923,8 @@ function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
     eex, eports = _kernel_branch_callable(else_side, deps, known, mod, tensorize;
         arms = else_arms isa NamedTuple ? else_arms : nothing)
     val(ports) = Expr(:call, GlobalRef(Base, :Val), positions(ports))
-    leaf_spec(entry) = entry isa NamedTuple ? nothing : entry
+    leaf_spec(entry) = entry isa NamedTuple || entry === nothing ? nothing :
+        Expr(:call, GlobalRef(@__MODULE__, :_kernel_branch_arm_graph), entry)
     Expr(:call, GlobalRef(@__MODULE__, :_KernelBranch),
          val(cports), val(tports), val(eports), call, cex, tex, eex,
          leaf_spec(then_arms), leaf_spec(else_arms)), deps
