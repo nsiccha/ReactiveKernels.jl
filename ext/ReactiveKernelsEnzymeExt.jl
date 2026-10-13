@@ -9,7 +9,7 @@ module ReactiveKernelsEnzymeExt
 
 using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule, forward_cut,
     has_forward_branch, has_reverse_branch, stage_primal, stage_reverse
-using ReactiveKernels: _activity_mask, _stage_residual_sources
+using ReactiveKernels: _stage_residual_sources
 import ReactiveKernels
 import Enzyme
 using Enzyme: Const, Active, Duplicated, DuplicatedNoNeed, BatchDuplicated,
@@ -132,8 +132,19 @@ end
 # Enzyme's directions (zero for inactive inputs), once per batch lane.
 
 const _ReverseActive = Union{Active,Duplicated,BatchDuplicated}
-@generated _reverse_active_vector(args::Tuple) =
-    Tuple(T <: _ReverseActive for T in args.parameters)
+# The activity mask as a TYPE (bit `i` set when argument `i` is active), read
+# off the annotation types at code generation. Cut selection and the
+# no-derivative branch then never depend on constant propagation, which
+# inference skips for large rule types: a value-level mask there left
+# `augmented_primal` returning a Union of tapes, and Enzyme compiled `reverse`
+# against the `nothing` one.
+@generated function _reverse_mask(args::Tuple)
+    mask = 0
+    for (i, T) in enumerate(args.parameters)
+        T <: _ReverseActive && (mask |= 1 << (i - 1))
+    end
+    :(Val{$mask}())
+end
 
 @inline _zero_shadow(::Val{1}, primal) = _zero_like(primal)
 @inline _zero_shadow(::Val{W}, primal) where {W} = ntuple(_ -> _zero_like(primal), Val(W))
@@ -159,9 +170,9 @@ end
 function EnzymeRules.augmented_primal(
         config::RevConfig, rule::Const{<:DerivativeRule}, ::Type{RT},
         args::Vararg{Annotation,N}) where {RT,N}
-    active = _reverse_active_vector(args)
+    mask = _reverse_mask(args)
     values = _values(args)
-    if !any(active) || RT <: Const
+    if mask === Val(0) || RT <: Const
         primal = rule.val(values...)
         shadow = needs_shadow(config) ? _zero_shadow(Val(width(config)), primal) : nothing
         return AugmentedReturn(needs_primal(config) ? primal : nothing, shadow, nothing)
@@ -169,7 +180,6 @@ function EnzymeRules.augmented_primal(
     has_reverse_branch(rule.val) || throw(ArgumentError(
         "reverse-mode Enzyme through $(rule.val): the rule has no reverse branch " *
         "(author a covector + cotangents branch in its graph)"))
-    mask = Val(_activity_mask(active, 1))
     primal, staged = stage_primal(rule.val, mask, values...)
     shadow = needs_shadow(config) ? _zero_shadow(Val(width(config)), primal) : nothing
     residuals = _retain_residuals(_stage_residual_sources(rule.val, mask), staged, primal,
@@ -180,11 +190,13 @@ end
 function EnzymeRules.reverse(
         config::RevConfig, rule::Const{<:DerivativeRule}, dret, tape,
         args::Vararg{Annotation,N}) where {N}
-    tape === nothing && return ntuple(_ -> nothing, Val(N))
+    # No derivative flowed (constant result or no active input): an Active
+    # input still needs a numeric zero cotangent.
+    tape === nothing && return map(arg -> arg isa Active ?
+        _zero_tangent(Val(width(config)), arg.val) : nothing, args)
     shadow, residuals = tape
-    active = _reverse_active_vector(args)
-    mask = _activity_mask(active, 1)
-    _reverse_lanes(Val(width(config)), rule.val, Val(mask), dret, shadow, residuals, args)
+    _reverse_lanes(Val(width(config)), rule.val, _reverse_mask(args), dret, shadow,
+                   residuals, args)
 end
 
 # Width 1: one covector, one cotangent per active input.
