@@ -458,7 +458,9 @@ end
 # is straight-line like any other expression.  An authored `plate(...) do`
 # cell is likewise an RK subgraph the recipe lowering owns
 # (`_kernel_authored_plate_expr`), not an opaque closure: it is straight-line
-# whenever its threaded arguments and its cell body are.
+# whenever its threaded arguments and its cell body are.  A `let` only scopes
+# its bindings, which the recipe lowering resolves (`_kernel_free_ports_flow!`),
+# so it is straight-line whenever its bindings and body are.
 _kernel_endpoint_callee_name(callee::Symbol) = callee
 _kernel_endpoint_callee_name(callee::GlobalRef) = callee.name
 function _kernel_endpoint_callee_name(callee)
@@ -479,7 +481,7 @@ function _kernel_endpoint_has_nonstraight(x)
         return any(_kernel_endpoint_has_nonstraight, call.args[2:end]) ||
                _kernel_endpoint_has_nonstraight(lambda.args[2])
     end
-    x.head in (:for, :while, :try, :let, :function, :->,
+    x.head in (:for, :while, :try, :function, :->,
                :comprehension, :generator) && return true
     if x.head === :block
         statements = Any[arg for arg in x.args if !(arg isa LineNumberNode)]
@@ -755,16 +757,24 @@ function _kernel_endpoint_binding_spec!(st::_KernelEndpointBuildState,
     end
 end
 
-function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector{Any})
+# A lifted endpoint call becomes its own recipe ahead of the statement that
+# spells it, outside any `let` around the call. `scoped` holds the names a
+# surrounding `let` binds: they shadow endpoint and owner names, and a call
+# reading one cannot leave the `let`, so it is refused rather than reading an
+# unrelated port of the same name.
+function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector{Any},
+                                scoped::Set{Symbol} = Set{Symbol}())
     x isa Expr || return x
     x.head in (:quote, :inert) && return x
+    x.head === :let && return _kernel_endpoint_lift_let!(st, x, lifted, scoped)
     if x.head === :call && !isempty(x.args)
         callee = x.args[1]
-        args = Any[_kernel_endpoint_lift!(st, a, lifted) for a in x.args[2:end]]
-        if callee isa Symbol && callee in st.endpoint_names
+        args = Any[_kernel_endpoint_lift!(st, a, lifted, scoped) for a in x.args[2:end]]
+        if callee isa Symbol && callee in st.endpoint_names && !(callee in scoped)
             all(arg -> arg isa Symbol, args) || throw(ArgumentError(
                 "pure endpoint :$(st.current_method) must assign expression arguments " *
                 "to named ports before calling :$callee"))
+            _kernel_endpoint_lift_unscoped(st, callee, args, scoped)
             spec = st.endpoint_vars[callee]
             placeholder = gensym(Symbol(callee, :_call))
             st.nested_specs[placeholder] = spec
@@ -774,12 +784,14 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
             push!(lifted, Expr(:(=), Expr(:(::), out, out_type),
                                Expr(:call, placeholder, actuals...)))
             return out
-        elseif callee === :inv && length(args) == 2 && args[1] isa Symbol &&
+        elseif callee === :inv && !(callee in scoped) && length(args) == 2 &&
+               args[1] isa Symbol && !(args[1] in scoped) &&
                haskey(st.inverse_targets, args[1])
             target = args[1]
             value = args[2]
             value isa Symbol || throw(ArgumentError(
                 "inv($target, value) in :$(st.current_method) requires a named value port"))
+            _kernel_endpoint_lift_unscoped(st, :inv, Any[value], scoped)
             input_name, input_type = st.inverse_targets[target]
             forward = st.endpoint_vars[target]
             inverse_spec = Expr(:call, GlobalRef(@__MODULE__, :extract),
@@ -798,11 +810,12 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
             return out
         end
         target = _kernel_endpoint_property_target(callee, st.owner_set)
-        if target !== nothing
+        if target !== nothing && !(target[1] in scoped)
             root, method = target
             spec = _kernel_endpoint_binding_spec!(st, root, method)
             all(arg -> arg isa Symbol, args) || throw(ArgumentError(
                 "bound endpoint `$root.$method` in :$(st.current_method) requires named port arguments"))
+            _kernel_endpoint_lift_unscoped(st, Symbol(root, ".", method), args, scoped)
             placeholder = gensym(Symbol(root, :_, method, :_call))
             st.nested_specs[placeholder] = spec
             out = _kernel_endpoint_named_output!(
@@ -814,9 +827,52 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
                                Expr(:call, placeholder, args...)))
             return out
         end
-        return Expr(:call, _kernel_endpoint_lift!(st, callee, lifted), args...)
+        return Expr(:call, _kernel_endpoint_lift!(st, callee, lifted, scoped), args...)
     end
-    Expr(x.head, (_kernel_endpoint_lift!(st, a, lifted) for a in x.args)...)
+    Expr(x.head, (_kernel_endpoint_lift!(st, a, lifted, scoped) for a in x.args)...)
+end
+
+function _kernel_endpoint_lift_unscoped(st::_KernelEndpointBuildState, callee,
+                                        args, scoped::Set{Symbol})
+    index = findfirst(arg -> arg isa Symbol && arg in scoped, args)
+    index === nothing && return nothing
+    name = args[index]
+    throw(ArgumentError(
+        "pure endpoint :$(st.current_method) calls :$callee with :$name, which a " *
+        "`let` binds; an endpoint call is hoisted into its own recipe outside the " *
+        "`let`, so assign :$name in a statement of the endpoint body instead"))
+end
+
+# Bindings are sequential: each sees the earlier ones, and the body sees all of
+# them plus the names it assigns itself (also local to the `let`).
+function _kernel_endpoint_lift_let!(st::_KernelEndpointBuildState, x, lifted::Vector{Any},
+                                    scoped::Set{Symbol})
+    bindings = x.args[1]
+    list = Meta.isexpr(bindings, :block) ? bindings.args : Any[bindings]
+    inner = copy(scoped)
+    rebuilt = Any[]
+    for binding in list
+        if Meta.isexpr(binding, :(=)) && length(binding.args) == 2
+            push!(rebuilt, Expr(:(=), binding.args[1],
+                _kernel_endpoint_lift!(st, binding.args[2], lifted, inner)))
+            _kernel_bound_names!(inner, binding.args[1])
+        else
+            push!(rebuilt, binding)
+            _kernel_bound_names!(inner, binding)
+        end
+    end
+    _kernel_endpoint_let_assigned!(inner, x.args[2])
+    Expr(:let, Meta.isexpr(bindings, :block) ? Expr(:block, rebuilt...) : only(rebuilt),
+         _kernel_endpoint_lift!(st, x.args[2], lifted, inner))
+end
+
+function _kernel_endpoint_let_assigned!(names::Set{Symbol}, x)
+    x isa Expr || return names
+    x.head in (:quote, :inert) && return names
+    Meta.isexpr(x, :(=)) && length(x.args) == 2 &&
+        _kernel_bound_names!(names, x.args[1])
+    foreach(arg -> _kernel_endpoint_let_assigned!(names, arg), x.args)
+    names
 end
 
 function _kernel_endpoint_lower_body(m::_KernelMethod, st::_KernelEndpointBuildState,

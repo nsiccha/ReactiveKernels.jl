@@ -315,6 +315,17 @@ end
             observed - e
         end))
         @test straight(:(map(x -> x + 1, y)))
+        # A `let` only scopes its bindings; what it contains still decides.
+        @test !straight(:(observed == 0 ? let a = n * x, b = a + 1
+            a <= 700 ? log(b) : a
+        end : 0.0))
+        @test straight(:(let a = x
+            if a > 0; a = 1.0; end
+            a
+        end))
+        @test straight(:(let f = y -> y + 1
+            f(x)
+        end))
     end
 
     @testset "(1)+(2) short/long extraction with kwargs/typed/where/return-ann" begin
