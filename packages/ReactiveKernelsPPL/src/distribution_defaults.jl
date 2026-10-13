@@ -61,6 +61,9 @@ const _DISTRIBUTION_ROLES = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :InverseGaussian => (:location, :shape),
     :VonMises => (:location, :concentration),
     :ZeroInflatedPoisson => (:rate, :zi), :ZeroInflatedBinomial => (:n, :p, :zi),
+    :NormalIDGLM => (:design, :intercept, :coefficients, :scale),
+    :BernoulliLogitGLM => (:design, :intercept, :coefficients),
+    :PoissonLogGLM => (:design, :intercept, :coefficients),
 )
 
 # The role of argument `position` of `head(args...)` with `nargs` authored
