@@ -518,7 +518,8 @@ statement at every step, named or not.
 
 A cell statement whose right-hand side is a lazy branch keeps each arm's own
 evaluation, but a branch whose condition reads only shared values (closure
-captures, `Ref` operands and `Number` plate arguments) takes the same arm at
+captures, `Ref` operands and `Number` plate arguments, including scalar results
+inferred from unannotated caller recipes) takes the same arm at
 every cell. The native lowering decides such a condition once per call, above
 the traversal, and then runs the cells of the taken arm alone. Each plain arm
 expression is also authored as a cell of its own, so its shared work is
@@ -530,10 +531,13 @@ one such as `s > 0 && x > 0`, keeps its branch in every cell. An arm with
 shared work is inlined into the cell loop, and that work runs at the first
 cell that takes the arm and is reused by the later ones: an arm no cell takes
 evaluates nothing, and a shared value that throws does so at the same cell as
-before. An arm without shared work keeps its own evaluation. Work written inside one recipe of a constructed endpoint, such as the
-`loggamma(shape)` term of a Gamma density, stays with that recipe. The graph
-keeps the authored branch; the tensorized body decides a shared condition in
-its own batch dispatch.
+before. An arm without shared work keeps its own evaluation. Constructed
+endpoints spliced into a plate cell get the same treatment: their authored
+branch-arm recipes are exposed to the plate lowering, so `loggamma(shape)` in
+a Gamma density or `log1p(-zi)` in a zero-inflated count density runs once at
+the first lane that takes its arm when its input is shared. Local bindings
+inside an arm remain separate recipes. The graph keeps the authored branch;
+the tensorized body decides a shared condition in its own batch dispatch.
 
 The per-element WANT is
 either accumulated with a reducer (sum by default) or collected in the one

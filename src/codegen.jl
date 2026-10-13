@@ -2049,19 +2049,87 @@ Base.@nospecializeinfer function _plate_shared_branch(
          r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
          _embedded_kernel(r.op) !== nothing) && return nothing
     end
+    g = inner.graph
+    root_positions = Dict(canon_id(g, v.id) => position
+                          for (position, v) in enumerate(inner.have))
+    dependencies = _plate_dependencies(inner, Set(keys(root_positions))).values
     for (index, r) in enumerate(inner.recipes)
         _plate_branch_operation(r.op) || continue
-        _plate_branch_has_graph(getfield(r.op, :f)) || continue
         condition_positions = _plate_branch_shared_condition(inner, r, atomic,
                                                              callvalues)
         condition_positions === nothing && continue
-        then_kernel = _plate_branch_arm_kernel(inner, index, :then)
-        else_kernel = _plate_branch_arm_kernel(inner, index, :else)
+        names, shared = _plate_branch_source_inputs(inner, r, atomic,
+            callvalues, dependencies, root_positions)
+        branch = _plate_branch_source_graphs(r, names, shared)
+        _plate_branch_has_graph(branch) || continue
+        then_kernel = _plate_branch_arm_kernel(inner, index, :then, branch, names)
+        else_kernel = _plate_branch_arm_kernel(inner, index, :else, branch, names)
         (then_kernel === nothing || else_kernel === nothing) && continue
         return _PlateSharedBranch(index,
             Any[callargs[p] for p in condition_positions], then_kernel, else_kernel)
     end
     nothing
+end
+
+function _plate_branch_source_inputs(inner::Plan, r::Recipe, atomic, callvalues,
+                                     dependencies, root_positions)
+    g = inner.graph
+    names = _recipe_source_names(r)
+    shared_root(root) = root_positions[root] in atomic ||
+        valtype(callvalues[root_positions[root]]) <: Number
+    shared = Set{Symbol}(name for (name, v) in zip(names, r.inputs)
+        if all(shared_root, get(dependencies, canon_id(g, v.id), Set{Int}())))
+    names, shared
+end
+
+# A constructed endpoint's branch is spliced into the cell as recipes, so its
+# authored branch operation does not carry the arm graphs made for a cell's own
+# source. Recover those graphs only when a plate lowers it, with the actual
+# shared inputs of that plate. The operation's source module owns its globals;
+# the graphs remain cold metadata and the original lazy closures execute.
+Base.@nospecializeinfer function _plate_branch_source_graphs(
+        r::Recipe, names, shared::Set{Symbol})
+    branch = getfield(r.op, :f)
+    (_plate_branch_has_graph(branch) || isempty(shared) ||
+     _kernel_branch_parts(r.source) === nothing) && return branch
+    mod = _kernel_endpoint_source_module(r.op)
+    key = (Tuple(names), Tuple(sort!(collect(shared))), mod)
+    # Native and tensorized lowerings must append the SAME arm operation
+    # objects to their tables. The source expression is the plan-owned weak
+    # key, so this cold cache does not retain prepared models after the plan
+    # and its source have gone away.
+    lock(_PLATE_BRANCH_SOURCE_GRAPHS_LOCK) do
+        by_op = get!(_PLATE_BRANCH_SOURCE_GRAPHS, r.source::Expr) do
+            IdDict{Any,Any}()
+        end
+        by_inputs = get!(by_op, r.op) do
+            Dict{Any,Any}()
+        end
+        get!(by_inputs, key) do
+            inputs = Set(names)
+            entries = _kernel_plate_arm_entries(r.source, inputs, shared, mod,
+                inputs; endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}())
+            entries === nothing ? branch :
+                _plate_branch_with_source_graphs(branch, entries, mod)
+        end
+    end
+end
+
+const _PLATE_BRANCH_SOURCE_GRAPHS = WeakKeyDict{Expr,Any}()
+const _PLATE_BRANCH_SOURCE_GRAPHS_LOCK = ReentrantLock()
+
+Base.@nospecializeinfer function _plate_branch_with_source_graphs(
+        @nospecialize(branch), entries, mod::Module)
+    CI, TI, EI = (typeof(branch)::DataType).parameters
+    child(arm, entry) = arm isa _KernelBranch && entry isa NamedTuple ?
+        _plate_branch_with_source_graphs(arm, entry, mod) : arm
+    spec(arm, entry) = arm isa _KernelBranch ? nothing :
+        (entry isa Expr ? _kernel_eval_construction(mod, entry) : nothing)
+    _KernelBranch(Val(CI), Val(TI), Val(EI), branch.call, branch.condition,
+        child(branch.then_arm, entries.then_arm),
+        child(branch.else_arm, entries.else_arm),
+        spec(branch.then_arm, entries.then_arm),
+        spec(branch.else_arm, entries.else_arm))
 end
 
 # The plate argument positions a branch recipe's condition reads, when each is
@@ -2119,21 +2187,20 @@ Base.@nospecializeinfer function _plate_lane_arm_slots!(
     root_positions = Dict(canon_id(g, v.id) => position
                           for (position, v) in enumerate(inner.have))
     dependencies = _plate_dependencies(inner, Set(keys(root_positions))).values
-    shared_root(root) = root_positions[root] in atomic ||
-        valtype(callvalues[root_positions[root]]) <: Number
     for (index, r) in enumerate(inner.recipes)
         _plate_branch_operation(r.op) || continue
-        _plate_branch_has_graph(getfield(r.op, :f)) || continue
         # A shared condition is decided once per call instead.
         _plate_branch_shared_condition(inner, r, atomic, callvalues) === nothing ||
             continue
-        names = Set{Symbol}()
-        all(v -> !(v.name in names) && (push!(names, v.name); true), r.inputs) ||
+        names, shared = _plate_branch_source_inputs(inner, r, atomic,
+            callvalues, dependencies, root_positions)
+        branch = _plate_branch_source_graphs(r, names, shared)
+        _plate_branch_has_graph(branch) || continue
+        length(unique(names)) == length(names) ||
             continue
-        shared = Set{Symbol}(v.name for v in r.inputs
-            if all(shared_root, get(dependencies, canon_id(g, v.id), Set{Int}())))
-        arms[index] = _plate_lane_branch_slots!(runtime_ops, runtime_recipes,
-                                                getfield(r.op, :f), names, shared)
+        slots = _plate_lane_branch_slots!(runtime_ops, runtime_recipes,
+                                         branch, Set(names), shared)
+        arms[index] = (; branch, names, slots)
     end
     arms
 end
@@ -2187,16 +2254,18 @@ end
 # First-use flags and the arms' shared locals are declared in `declarations`,
 # above the loop.
 Base.@nospecializeinfer function _native_plate_lane_branch_expr(
-        @nospecialize(branch), reference, args, inputs, slots, shared, declarations)
+        @nospecialize(branch), reference, args, inputs, names, slots, shared,
+        declarations)
     CI, TI, EI = (typeof(branch)::DataType).parameters
-    by_name = Dict(v.name => (arg, shared(v)) for (arg, v) in zip(args, inputs))
+    by_name = Dict(name => (arg, shared(v))
+                   for (name, arg, v) in zip(names, args, inputs))
     condition = Expr(:call, :(getfield($reference, :condition)),
                      (args[i] for i in CI)...)
     arm_expr(@nospecialize(arm), field, indices, entry) = begin
         arm_reference = :(getfield($reference, $(QuoteNode(field))))
         if arm isa _KernelBranch
             _native_plate_lane_branch_expr(arm, arm_reference, args, inputs,
-                                           entry, shared, declarations)
+                                           names, entry, shared, declarations)
         elseif entry === nothing
             Expr(:call, arm_reference, (args[i] for i in indices)...)
         else
@@ -2265,9 +2334,9 @@ end
 # closure over its own ports (a nested branch stays a branch over every
 # argument, and is examined again), as in `_partition_plate_recipe`.
 Base.@nospecializeinfer function _plate_branch_arm_kernel(
-        inner::Plan, index::Int, side::Symbol)
+        inner::Plan, index::Int, side::Symbol, @nospecialize(native), names)
     r = inner.recipes[index]
-    native, tensor = getfield(r.op, :f), getfield(r.op, :tensor_f)
+    tensor = getfield(r.op, :tensor_f)
     then = side === :then
     positions = (typeof(native)::DataType).parameters[then ? 2 : 3]
     spec = getfield(native, then ? :then_spec : :else_spec)
@@ -2286,7 +2355,7 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
         Recipe[Recipe(r.id, Tuple(r.inputs[i] for i in positions), r.outputs,
                       arm_op, r.cost, nothing, false, r.source)]
     else
-        _plate_branch_arm_recipes!(copied, spec, r, fresh)
+        _plate_branch_arm_recipes!(copied, spec, r, names, fresh)
     end
     replacement === nothing && return nothing
     recipes = Recipe[]
@@ -2304,13 +2373,13 @@ end
 # The recipes of an arm's graph over the branch recipe `r`: the arm's ports
 # read the branch inputs of the same name and its value is the branch output.
 Base.@nospecializeinfer function _plate_branch_arm_recipes!(
-        copied::Graph, @nospecialize(spec), r::Recipe, fresh)
+        copied::Graph, @nospecialize(spec), r::Recipe, names, fresh)
     arm = plan(spec)
     ag = arm.graph
     inputs = Dict{Symbol,Value}()
-    for v in r.inputs
-        get(inputs, v.name, v) == v || return nothing
-        inputs[v.name] = v
+    for (name, v) in zip(names, r.inputs)
+        get(inputs, name, v) == v || return nothing
+        inputs[name] = v
     end
     mapping = Dict{Int,Value}()
     for port in arm.have
@@ -2969,10 +3038,11 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                 input, index, true) for input in recipe.inputs]
             operation = Expr(:ref, _OPS_ARG, op_offset + recipe_index)
             if haskey(lane_arms, recipe_index)
+                arm = lane_arms[recipe_index]
                 push!(assignments.args, Expr(:(=), out,
-                    _native_plate_lane_branch_expr(recipe.op.f,
+                    _native_plate_lane_branch_expr(arm.branch,
                         :(getfield($operation, :f)), args, recipe.inputs,
-                        lane_arms[recipe_index], shared, declarations)))
+                        arm.names, arm.slots, shared, declarations)))
             else
                 _lower_plate_recipe_native!(assignments, recipe, args, out,
                     operation, get(scan_offsets, recipe_index, nothing))
@@ -3276,6 +3346,64 @@ function _declare_typed_output!(body::Expr, value::Value, name, declared::Set{Sy
     push!(body.args, Expr(:local, Expr(:(::), name, T)))
 end
 
+# An unannotated outer recipe can still have a provably scalar result. RKPPL
+# uses such values for synthesized distribution arguments (`1 - omega`, for
+# example), and a plate must classify them as shared without asserting a
+# particular numeric type or changing the authored assignment. Infer only
+# scalar facts from the parent DAG; all other declared Value types stay as-is.
+function _plate_inferred_scalar_types(p::Plan)
+    g = p.graph
+    target = Set(canon_id(g, v.id) for r in p.recipes
+        if r.op isa _AuthoredPlateOp &&
+           any(q -> _plate_branch_operation(q.op), r.op.kernel.plan.recipes)
+        for v in r.inputs if valtype(v) === Any)
+    producer = Dict(canon_id(g, v.id) => r for r in p.recipes for v in r.outputs)
+    needed = Set{Int}()
+    while !isempty(target)
+        cid = pop!(target)
+        recipe = get(producer, cid, nothing)
+        recipe === nothing && continue
+        recipe.id in needed && continue
+        push!(needed, recipe.id)
+        union!(target, (canon_id(g, v.id) for v in recipe.inputs))
+    end
+    types = Dict{Int,Any}(canon_id(g, v.id) => valtype(v) for v in p.have)
+    for recipe in p.recipes
+        recipe.id in needed || continue
+        inputs = Any[get(types, canon_id(g, v.id), Any) for v in recipe.inputs]
+        T = if recipe.op isa _BoundConstant
+            typeof(recipe.op.value)
+        elseif recipe.op isa Union{_AuthoredPlateOp,_AuthoredScanOp}
+            Any
+        elseif all(t -> t isa Type, inputs)
+            _promote_op(recipe.op, inputs...)
+        else
+            Any
+        end
+        for (v, output_type) in zip(recipe.outputs, _recipe_output_types(recipe, T))
+            declared = valtype(v)
+            # The parent lowering enforces concretely declared locals. Keep
+            # that fact when inference of an earlier source closure is weaker;
+            # otherwise a later unannotated scalar such as `1 - omega` loses
+            # its Number proof even though `omega::Float64` is authoritative.
+            types[canon_id(g, v.id)] =
+                _concrete_value_type(declared) &&
+                !(recipe.op isa _BoundConstant) ? declared : output_type
+        end
+    end
+    types
+end
+
+function _plate_scalar_values(g::Graph, values, types)
+    result = Any[]
+    for v in values
+        T = get(types, canon_id(g, v.id), Any)
+        push!(result, T isa Type && T !== Union{} && T <: Number &&
+            !(valtype(v) <: Number) ? Value{T}(v.id, v.name) : v)
+    end
+    result
+end
+
 # `recycle` lists (value id => argument name) pairs, appended to the signature
 # after the HAVE ports: each argument is `nothing` or a buffer that the value's
 # authored plate or scan may fill instead of allocating its output (the
@@ -3307,6 +3435,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     runtime_recipes = Recipe[]
     skipped_recipes = Set{Int}()
     pending_scans = Dict{Int,Any}()
+    inferred_scalars = nothing
     declared = Set{Symbol}()
     declare_types = declare
     # HAVE is authoritative, and the first selected producer of any other
@@ -3345,6 +3474,13 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         end
 
         if inline_embedded && r.op isa _AuthoredPlateOp
+            callvalues = r.inputs
+            if type_hints === nothing && any(q -> _plate_branch_operation(q.op),
+                                             r.op.kernel.plan.recipes)
+                inferred_scalars === nothing &&
+                    (inferred_scalars = _plate_inferred_scalar_types(p))
+                callvalues = _plate_scalar_values(g, r.inputs, inferred_scalars)
+            end
             length(r.outputs) == 1 || throw(ArgumentError(
                 "an authored plate recipe must have exactly one pointwise output"))
             pointwise = only(r.outputs)
@@ -3384,24 +3520,24 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     type_offset = scan_type_offset)
             elseif tensorized
                 _lower_authored_plate_tensorized!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
+                    body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
                     pointwise_lhs, total_lhs; lanes = pointwise_lhs !== nothing &&
                         _plate_read_by_plates(p, pointwise_id, sum_recipe))
             elseif r.id in strip_members
                 hints = type_hints === nothing ? nothing :
                     Any[type_hints[canon_id(g, v.id)] for v in r.inputs]
-                strip_plates[r.id] = (; op = r.op, callargs, callvalues = r.inputs,
+                strip_plates[r.id] = (; op = r.op, callargs, callvalues,
                     lhs = pointwise_lhs, hints, recycled = recycled(pointwise_id),
                     offset = length(runtime_ops), hoisted = false)
                 # Reserve this plate's table slots here; its code is emitted
                 # with the scan (`_lower_authored_scan_strips!`).
                 _lower_authored_plate_native!(
                     Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
-                    r.inputs, pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    callvalues, pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
                     input_type_hints = hints)
             else
                 _lower_authored_plate_native!(
-                    body, runtime_ops, runtime_recipes, r.op, callargs, r.inputs,
+                    body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
                     pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
                     input_type_hints = type_hints === nothing ? nothing :
                         Any[type_hints[canon_id(g, v.id)] for v in r.inputs])

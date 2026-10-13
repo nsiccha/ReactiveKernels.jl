@@ -82,6 +82,36 @@ end
     return total
 end
 
+# The branch belongs to a constructed endpoint rather than the plate cell's
+# own source. Its positive arm contains a shared subexpression inside a mixed
+# lane/shared recipe; the first positive lane computes it for all later lanes.
+@kernel _endpoint_law(scale::Float64) = begin
+    logpdf(x::Float64)::Float64 =
+        x > 0 ? (twice = 2x; 0.5twice * _counted_log(scale)) : -x
+end
+@kernel _endpoint_law_plate(x::Vector{Float64}, scale::Float64) = begin
+    cells = plate(x) do xi
+        _endpoint_law(scale).logpdf(xi)
+    end
+    total::Float64 = sum(cells)
+end
+@kernel _endpoint_law_inferred(x::Vector{Float64}, offset::Float64) = begin
+    scale = 1 - offset
+    cells = plate(x, scale) do xi, si
+        _endpoint_law(si).logpdf(xi)
+    end
+    total::Float64 = sum(cells)
+end
+@kernel _endpoint_law_math(scale::Float64) = begin
+    logpdf(x::Float64)::Float64 = x > 0 ? x * log(scale) : -x
+end
+@kernel _endpoint_law_math_plate(x::Vector{Float64}, scale::Float64) = begin
+    cells = plate(x) do xi
+        _endpoint_law_math(scale).logpdf(xi)
+    end
+    total::Float64 = sum(cells)
+end
+
 _reference_normal(y, mu, sigma) =
     sigma > 0 ? sum(@. -0.5 * log(2π) - 0.5 * ((y - mu) / sigma)^2 - log(sigma)) : -Inf
 
@@ -169,6 +199,36 @@ end
         value, gradient = ad_value_and_gradient(prepared, x, s)
         @test gradient ≈ [xi > 0 ? log(s) : -1.0 for xi in x]
     end
+end
+
+@testset "constructed endpoint arm shares work across taking lanes" begin
+    x = [-2.0, 1.0, -3.0, 0.5, 4.0]
+    k = prepare(_endpoint_law_plate)
+    _ARM_CALLS[] = 0
+    @test k(x, 2.0) ≈ 5.0 + 5.5log(2.0)
+    @test _ARM_CALLS[] == 1
+    _ARM_CALLS[] = 0
+    @test k([-2.0, -3.0], -1.0) == 5.0
+    @test _ARM_CALLS[] == 0
+    _ARM_CALLS[] = 0
+    @test k(Float64[], -1.0) == 0.0
+    @test _ARM_CALLS[] == 0
+    @test_throws DomainError k(x, -1.0)
+
+    # The generated scalar assignment has no declared type, as in RKPPL's
+    # synthesized distribution argument. Its inferred Number type still makes
+    # the endpoint's scale shared.
+    inferred = prepare(_endpoint_law_inferred)
+    _ARM_CALLS[] = 0
+    @test inferred(x, -1.0) ≈ 5.0 + 5.5log(2.0)
+    @test _ARM_CALLS[] == 1
+
+    math = prepare(_endpoint_law_math_plate)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    pb = prepare_ad(math, backend, x, 2.0; active = :scale)
+    value, gradient = ad_value_and_gradient(pb, x, 2.0)
+    @test value ≈ 5.0 + 5.5log(2.0)
+    @test gradient ≈ 5.5 / 2.0
 end
 
 @testset "bound data and native Reverse through a shared plate branch" begin

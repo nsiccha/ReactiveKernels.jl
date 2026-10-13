@@ -1394,6 +1394,8 @@ end
 # belongs to a different caller module. The wrapper's module is core RK;
 # its captured body carries the authored scope.
 _kernel_endpoint_source_module(op) = parentmodule(typeof(op))
+_kernel_endpoint_source_module(op::_KernelSourceFunction) =
+    _kernel_endpoint_source_module(op.f)
 _kernel_endpoint_source_module(op::_KernelSourceOp) =
     _kernel_endpoint_source_module(op.f)
 _kernel_endpoint_source_module(op::_KernelBranch) =
@@ -2399,15 +2401,18 @@ function _kernel_plate_arm_entries(rhs, names, shared, mod, scope; endpoint_cach
 end
 
 # A leaf arm's graph over the cell names it reads, or `nothing` for an arm that
-# is not one plain value expression: a bare name (there is nothing to lift),
-# statements, loops, closures, macro calls, or a call of a function-shaped
-# graph, which a cell splices only over ports. Those arms keep their closure.
+# is not a pure value expression: a bare name (there is nothing to lift),
+# loops, closures, macro calls, or a call of a function-shaped graph, which a
+# cell splices only over ports. Sequential local bindings in an arm remain
+# separate recipes, so a plate can share a binding without evaluating the arm
+# on a lane that does not take it.
 function _kernel_plate_arm_spec(side, names, shared, mod, scope; endpoint_cache)
     arm = _kernel_branch_unwrap(side)
     arm isa Symbol && return nothing
     _kernel_plate_arm_value(arm, mod) || return nothing
     ports = _kernel_free_ports(arm, names)
-    body = Expr(:block, LineNumberNode(0, :plate_branch_arm), deepcopy(arm))
+    statements = arm isa Expr && arm.head === :block ? deepcopy(arm.args) : Any[deepcopy(arm)]
+    body = Expr(:block, LineNumberNode(0, :plate_branch_arm), statements...)
     _kernel_plate_cell_spec(body, ports,
         Set(port for port in ports if !(port in shared)),
         Set(port for port in ports if port in shared), mod, scope;
@@ -2425,7 +2430,15 @@ function _kernel_plate_arm_value(ex, mod)
     ex isa Expr || return true
     if ex.head === :block
         statements = Any[arg for arg in ex.args if !_kernel_is_line(arg)]
-        return length(statements) == 1 && _kernel_plate_arm_value(only(statements), mod)
+        isempty(statements) && return false
+        for statement in statements[1:end-1]
+            statement isa Expr && statement.head === :(=) &&
+                (statement.args[1] isa Symbol ||
+                 statement.args[1] isa Expr && statement.args[1].head === :(::) &&
+                 statement.args[1].args[1] isa Symbol) &&
+                _kernel_plate_arm_value(statement.args[2], mod) || return false
+        end
+        return _kernel_plate_arm_value(last(statements), mod)
     end
     ex.head in (:call, :., :ref, :tuple, :vect, :hcat, :vcat, :row, :comparison,
                 :&&, :||, :if, :elseif, :kw, :parameters, :(::), :..., :curly,
@@ -4861,7 +4874,13 @@ function _kernel_eval_definition(mod::Module, definition::Expr)
         expanded.args[1] isa Symbol || throw(ArgumentError(
             "_kernel_eval_definition requires a stateless `name(args...) = body` " *
             "@kernel definition"))
-    construction = expanded.args[2]
+    _kernel_eval_construction(mod, expanded.args[2])
+end
+
+# Evaluate one already-expanded graph construction without compiling its
+# once-only recipe-construction groups. Plate lowering uses this for an arm
+# graph recovered from a constructed endpoint's authored recipe source.
+function _kernel_eval_construction(mod::Module, construction::Expr)
     locals = Set{Symbol}()
     _kernel_construction_locals!(locals, construction)
     Core.eval(mod, Expr(:let, Expr(:block),
