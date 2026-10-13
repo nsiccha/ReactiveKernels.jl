@@ -39,6 +39,7 @@ const _MATRIX_CORE_TESTS = (
     "test_shared_preparation.jl",
     "test_inner_plate_partial_evaluation.jl",
     "test_branch_partition.jl",
+    "test_bound_partition_fusion.jl",
     "test_inner_plate_split.jl",
     "test_ad.jl",
     "test_manual_derivative_rule_example.jl",

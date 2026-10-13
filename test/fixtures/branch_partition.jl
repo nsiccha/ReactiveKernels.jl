@@ -30,8 +30,9 @@ end
     total::Float64 = sum(pointwise)
 end
 
-# Two split plates in sequence: the first's values, reassembled in lane order,
-# are gathered onto the second's arms. The `sqrt` arm is invalid off its lanes.
+# Two split plates in sequence. An additional consumer keeps the first plate's
+# pointwise boundary so its arms must be reassembled before the second splits.
+# The `sqrt` arm is invalid off its lanes.
 @kernel chained_arms(mu::Vector{Float64}, x::Vector{Float64}, y::Vector{Float64},
                      obs::Vector{Bool}) = begin
     loc = plate(mu, x, obs) do mi, xi, oi
@@ -42,12 +43,13 @@ end
         c::Float64 = oi ? -0.5 * (yi - li)^2 : 0.0
         c
     end
-    total::Float64 = sum(pointwise)
+    extra::Float64 = sum(loc)
+    total::Float64 = sum(pointwise) + 0.0 * extra
 end
 
 # A guarded location over a bound index domain, read from captured live
 # scalars, with a constant fallback arm, then gathered by a guarded density
-# plate: the shape of a missing observation's computed location. The `sqrt`
+# plate. Its extra consumer preserves the intermediate boundary. The `sqrt`
 # arm is invalid off its lanes.
 @kernel guarded_location(u::Vector{Float64}, x::Vector{Float64},
                          y::Vector{Float64}, idx::Vector{Int},
@@ -65,7 +67,8 @@ end
     pointwise = plate(y, loc, obs) do yi, li, oi
         oi ? -0.5 * (yi - li)^2 : 0.0
     end
-    total::Float64 = sum(pointwise)
+    extra::Float64 = sum(loc)
+    total::Float64 = sum(pointwise) + 0.0 * extra
 end
 
 # A bound-only condition computed in the cell first (a cached frontier).

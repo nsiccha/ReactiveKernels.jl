@@ -5460,7 +5460,8 @@ _is_axes2_call(index) =
     index.args[3] == 2
 
 # Declared array parameters ([`ArrayParameter`](@ref)): `z[1:K] .~ ...`
-# (a literal range over a non-data name) and two-axis `z[a, b] .~ ...`
+# (a literal or bound-data extent over a non-data name) and two-axis
+# `z[a, b] .~ ...`
 # (each axis `1:K`, `levels(g)`, or `axes(M, d)`). One-axis
 # `z[levels(g)]` / `z[axes(X, 2)]` have separate parse arms but the same
 # ordinary array semantics. A `levels(gg)` axis over a definition `gg`
@@ -5639,10 +5640,13 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
             n = Expr(:call, :length, Expr(:call, :levels, g))
             return k == 0 ? n : Expr(:call, :-, n, k)
         end
-        lo === 1 && hi isa Integer && !(hi isa Bool) && hi >= 0 || _sfail(
-            "array $target axis $(repr(a)) must be a literal `1:K` with " *
-            "K ≥ 0, or `1:length(levels(g)) - k`")
-        return Int(hi)
+        lo === 1 || _sfail("array $target axis $(repr(a)) must start at 1")
+        if hi isa Integer && !(hi isa Bool) && hi >= 0
+            return Int(hi)
+        end
+        hi isa Union{Symbol,Expr} && return hi
+        _sfail("array $target axis $(repr(a)) must end at a nonnegative " *
+            "integer literal or bound-data expression")
     end
     _is_def_levels_call(a, data, detnames) && return a
     if a isa Expr && a.head === :ref && !isempty(a.args) &&
@@ -5658,9 +5662,9 @@ function _array_axis(target::Symbol, a, data::Set{Symbol},
             a.args[1] === :axes && a.args[2] isa Symbol && a.args[3] in (1, 2)
         return Expr(:call, :axes, a.args[2], a.args[3])
     end
-    return _sfail("array $target axis $(repr(a)) must be a literal `1:K`, " *
-                  "`levels(g)` (optionally selected), or `axes(M, d)` " *
-                  "of a matrix `M`")
+    return _sfail("array $target axis $(repr(a)) must be `1:K` with a " *
+                  "nonnegative bound-data extent, `levels(g)` (optionally " *
+                  "selected), or `axes(M, d)` of a matrix `M`")
 end
 
 # Joint-response statement: `[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)`
@@ -11325,7 +11329,8 @@ end
 
 # The extent of a declared axis as a value expression, or `nothing`.
 _axis_extent(d::Int) = d
-_axis_extent(d) = _is_axis_dim(d) ? Expr(:call, :size, d.args[2], d.args[3]) :
+_axis_extent(d) = _is_bound_extent_dim(d) ? d :
+    _is_axis_dim(d) ? Expr(:call, :size, d.args[2], d.args[3]) :
     Meta.isexpr(d, :call, 2) && d.args[1] === :_ppl_axis_values ?
         Expr(:call, :length, d.args[2]) : nothing
 

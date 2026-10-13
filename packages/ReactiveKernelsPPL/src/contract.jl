@@ -6540,6 +6540,7 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     for p in plan.array_parameters, d in p.dims
         g = _level_pool_source(d)
         g === nothing || push!(required, g)
+        _is_bound_extent_dim(d) && union!(required, _expr_value_symbols(d))
     end
     for p in plan.vector_parameters
         p.extent_expr === nothing || union!(required, _expr_value_symbols(p.extent_expr))
@@ -6736,7 +6737,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     # Its row count does not become an observation count. In contrast, a
     # grouping axis retains its existing alignment and level-code contract.
     for p in plan.array_parameters
-        axes = filter(_is_axis_dim, p.dims)
+        axes = filter(d -> _is_axis_dim(d) || _is_bound_extent_dim(d), p.dims)
         isempty(axes) || push!(defs, Symbol(:_ppl_axis_input_, p.name) =>
             Expr(:tuple, axes...))
     end
@@ -6815,6 +6816,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
             for p in plan.array_parameters
                 delete!(free, p.name)
                 _drop_held_names!(free, filter(d -> !_is_axis_dim(d) &&
+                    !_is_bound_extent_dim(d) &&
                     _level_pool_source(d) === nothing, p.dims))
             end
         elseif f === :responses
@@ -6988,7 +6990,8 @@ function _drop_held_names!(out::Set{Symbol}, p::ArrayParameter)
     for f in fieldnames(ArrayParameter)
         if f === :dims
             for d in p.dims
-                (_is_axis_dim(d) || _level_pool_source(d) !== nothing) ||
+                (_is_axis_dim(d) || _is_bound_extent_dim(d) ||
+                    _level_pool_source(d) !== nothing) ||
                     _drop_held_names!(out, d)
             end
         else
