@@ -343,6 +343,7 @@ import .._array_prior_cells
 import .._SliceRows, .._SliceCols, .._SliceWhole, .._PerSlice
 import .._mvnormal_cholesky_slices_logpdf, .._mvnormal_slices_logpdf
 import .._dirichlet_slices_logpdf, .._ordered_normal_slices_logpdf
+import .._check_slice_vector_arg
 import .._mvnormal_cholesky_slices_pointwise, .._mvnormal_slices_pointwise
 import .._dirichlet_slices_pointwise, .._ordered_normal_slices_pointwise
 import .._simplex_slices_constrain, .._simplex_slices_logjac
@@ -4510,10 +4511,10 @@ end
 # Vector-latent prior node `_ppl_prior_<name>`: elementwise Normal for
 # threshold/coefficient packs as one plate-sum over the vector (Stan
 # `ordered`/`vector` semantics — no factorial normalizer, matching
-# `_BRMThresholdPrior`), Dirichlet for simplexes as one broadcast (Stan
-# `dirichlet_lpdf`: the log-multivariate-Beta normalizer folds host-side —
-# data-only — plus Σ (α−1)·log(s); a symmetric concentration inlines one
-# scalar, an asymmetric one its literal α−1 vector), and — for the
+# `_BRMThresholdPrior`), Dirichlet for simplexes as vector reductions (Stan
+# `dirichlet_lpdf`: the log-multivariate-Beta normalizer and α−1 are
+# separate graph values, so bound concentrations fold during preparation),
+# and — for the
 # structural joint factor, whose size is the joint outcome count —
 # elementwise Exponential over the scale scalars (a literal scale inlines;
 # a sampled hyperparameter resolves as a body local) and the shared LKJ
@@ -4539,7 +4540,27 @@ function _vector_parameter_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     rhs = if p.family === :simplex_dirichlet
         alpha = p.args.arg1
         arg = alpha isa AbstractVector ? :(Float64[$(alpha...)]) : alpha
-        :(_dirichlet_slices_logpdf(_SliceWhole(), $(p.name), $arg))
+        concentration = Symbol(:_ppl_dirichlet_alpha_, p.name)
+        valid = Symbol(:_ppl_dirichlet_valid_, p.name)
+        normalizer = Symbol(:_ppl_dirichlet_normalizer_, p.name)
+        powers = Symbol(:_ppl_dirichlet_powers_, p.name)
+        lgamma = GlobalRef(DistributionKernelSources, :loggamma)
+        push!(stmts, :($concentration = $arg))
+        push!(stmts, :($valid = begin
+            _check_slice_vector_arg("the Dirichlet concentration", $concentration, 1, $m)
+            all(isfinite.($concentration) .& ($concentration .> 0))
+        end))
+        push!(stmts, :($normalizer = if $valid
+            $lgamma(sum($concentration)) - sum($lgamma.($concentration))
+        else
+            -Inf
+        end))
+        push!(stmts, :($powers = $concentration .- 1.0))
+        :(if $valid
+            $normalizer + sum($powers .* log.($(p.name)))
+        else
+            -Inf
+        end)
     elseif p.family === :cholesky_corr_lkj
         _lkj_prior_terms(p.name, m, Float64(p.args.arg1))
     elseif p.family === :positive_exponential

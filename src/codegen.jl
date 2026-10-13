@@ -5837,9 +5837,9 @@ end
 function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
                        exemplars = nothing)
     p = _kernel_error_policy(p, on_error)
-    # Compose cell-only producers before bound specialization can partition a
-    # guarded plate into arms and materialize its other cells. Other plate
-    # chains keep their usual post-specialization fusion.
+    # Compose cell-only producers before the top-level bound split. Other
+    # eligible chains compose after that split but before guarded cells are
+    # partitioned, so data-only producers can still be cached.
     bound === () || (p = _fuse_authored_plate_chains(p; cells_only = true))
     p = _partial_apply(p, bound)
     exemplar_types = if exemplars === nothing

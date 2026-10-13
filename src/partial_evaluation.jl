@@ -748,23 +748,22 @@ end
 """
     _LaneGather(n)
 
-Gathers a live plate argument onto one arm's lanes: a lane-length vector is
+Selects a live plate argument onto one arm's lanes: a lane-length vector is
 indexed by the arm's (bound) lane indices, a singleton array is repeated over
-them, and a scalar broadcasts unchanged. An array result is always a fresh
-gather, never the argument itself, and the call inlines with its shape
-check thrown out of line: native Enzyme reverse cannot statically resolve the
-activity of a result that is sometimes an alias of its input, nor of an array
-returned across a non-inlined call. Any other shape cannot belong to the
-partitioned one-dimensional domain and is rejected.
+them, and a scalar broadcasts unchanged. Native execution reads the selected
+lanes through a view instead of copying the live array; tracing backends may
+materialize the indexed result. Both native array branches return views, so
+native Enzyme does not face a copy-versus-alias return split. Any other shape
+cannot belong to the partitioned one-dimensional domain and is rejected.
 """
 struct _LaneGather
     n::Int
 end
 @inline (::_LaneGather)(x::Number, lanes) = x
 @inline function (gather::_LaneGather)(x::AbstractArray, lanes)
-    length(x) == 1 && return x[ones(Int, length(lanes))]
+    length(x) == 1 && return _tensorized_view(x, ones(Int, length(lanes)))
     ndims(x) == 1 && length(x) == gather.n || _lane_gather_mismatch(x, gather.n)
-    x[lanes]
+    _tensorized_view(x, lanes)
 end
 @noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
@@ -1392,6 +1391,10 @@ function _partial_residual(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
         known[canon_id(g, value.id)] = data
     end
     residual = _partial_residual_plan(p, b, hoisted)
+    # The data-only prefix is already separate. Compose remaining plate
+    # producers before branch partitioning replaces their consumer edges with
+    # lane selections; a later pass cannot see those edges again.
+    residual = _fuse_authored_plate_chains(residual)
     residual, _partial_inner_plates(residual, known)
 end
 
