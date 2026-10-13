@@ -135,7 +135,7 @@ end
 function _scalar_column_plate_eligible(plan::StructuralPlan, pred::PredictorSpec,
         shape::DesignShape)
     _uses_structured_observation_axes(plan) && return false
-    shape.width <= 2 || return false
+    shape.width <= 3 || return false
     any(r -> _response_uses_predictor(r, pred.name), plan.responses) || return false
     all(t -> t.kind in (InterceptTerm, ContinuousTerm), pred.terms) || return false
     any(t -> t.kind === ContinuousTerm, pred.terms) || return false
