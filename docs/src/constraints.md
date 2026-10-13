@@ -413,11 +413,12 @@ and lock the one Reactant 0.2.289 lifted:
   does: `repro_enzyme_forward_over_reverse_const_array.jl` reproduces it with
   Enzyme only. Reverse over forward differentiates the same objectives, so
   `prepare_ad_hvp` documents that composition and its tests use it; the
-  forward-over-reverse case is pinned as broken. A `NonAllocatingKernel`'s
-  Hessian-vector products fail static activity analysis in both orders and
-  are pinned as broken; its pushforwards and the dataflow kernel's
-  Hessian-vector products work. No activity configuration or derivative rule
-  is involved.
+  forward-over-reverse case is pinned as broken. On Julia 1.10.12 with Enzyme
+  0.13.216 a `NonAllocatingKernel`'s Hessian-vector products still fail static
+  activity analysis in both orders and are pinned as broken. Both orders pass
+  on Julia 1.12.7 and 1.13.1 with that Enzyme version; its pushforwards and
+  the dataflow kernel's Hessian-vector products work. No activity configuration
+  or derivative rule is involved.
 - On Julia 1.10, native Enzyme 0.13.210 reverse mode fails static activity
   analysis (`EnzymeRuntimeActivityError`) for an empty array when a function
   branches on the array's length and then allocates over it, for example
@@ -591,6 +592,29 @@ and lock the one Reactant 0.2.289 lifted:
   a store into the captured array. The repair belongs in Enzyme;
   `test_scan_plate_ad.jl` pins the captured-closure call through a prepared
   scan kernel as broken on Julia 1.12 and later.
+- On Julia 1.12.7 and 1.13.1, Enzyme 0.13.216 reverse mode allocates 16 bytes
+  per element when a loop stores into an array that is either a reused buffer
+  or a fresh `similar` one and the store keeps its bounds check. Julia 1.12's
+  `setindex!` loads the array's `Memory` pointer in every iteration for that
+  check. Enzyme computes the shadow of that load and tapes it once per
+  iteration (a GC-tracked tape plus its type-tag svec), although the loaded
+  address does not change in the loop. Always reusing the buffer, and Julia
+  1.10.12, allocate nothing; gradients are correct either way. Always-reuse is
+  only a control: a shorter cache would fail when the result length changes.
+  `repro_enzyme_reuse_or_similar_shadow_tape.jl` reproduces it with Enzyme
+  only. Its `broadcast!` control also allocates when the destination is written
+  back into its slot: 16 bytes per element on Julia 1.12.7, about 24 on
+  1.13.1, and none without that writeback. `Profile.Allocs` of the decomposed
+  non-allocating cache step on Julia 1.12 shows the same tape in Enzyme's
+  `override_bc_copyto!` path. The non-allocating reverse plate
+  loop (`_ad_na_plate_loop!`) selects its result buffer this way, so under
+  `--check-bounds=yes` its gradient is not size-invariant on Julia 1.12 and
+  later. The repair belongs in Enzyme; `test_nonallocating_ad.jl` pins its
+  plate and cache-step allocation checks as broken there. Under any bounds
+  flag on Julia 1.12 and later, the plate gradient also grows by 16 bytes per
+  element because of the source callable's per-call `hasmethod` query, until
+  its fold lands. The two triggers overlap: with both present, the measured
+  plate-gradient growth is still 16 bytes per element, not their sum.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later
