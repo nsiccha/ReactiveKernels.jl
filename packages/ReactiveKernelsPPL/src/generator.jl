@@ -623,8 +623,15 @@ function _predictor_statements(plan::StructuralPlan)
         # Full-length vector plans read one location entry per row. A value
         # of unknown shape gets those rows once, as Julia broadcasting
         # against the rows would, rather than a ones vector per summand.
-        rows && (rhs = Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs,
-            _located_rows_source(plan, pred)))
+        # A value of known extent other than the rows (a one-entry declared
+        # array) broadcasts to them directly: its type then does not depend
+        # on `_ppl_rows`'s run-time length test.
+        if rows
+            n = _located_rows_source(plan, pred)
+            rhs = _known_row_mismatch(plan, pred, rhs) ?
+                Expr(:call, :.*, Expr(:call, :ones, n), rhs) :
+                Expr(:call, GlobalRef(@__MODULE__, :_ppl_rows), rhs, n)
+        end
         # A proven scalar declares its type, so plates statically read it
         # as a shared argument rather than through a runtime axis test.
         push!(stmts, _predictor_value_type(plan, pred) === :Number &&
@@ -737,7 +744,38 @@ function _composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec,
         i !== nothing && _authored_plate_result(plan.assignments[i].expr) &&
             return false
     end
+    # A value with the located responses' own axes (a declared array
+    # `theta[axes(y, 1)]` read whole by `Normal.(theta, s)`) already holds
+    # one entry per row. It reads in place, as `_ppl_rows` would return it,
+    # without that call's run-time choice between it and a broadcast copy.
+    _has_located_axes(plan, pred, ex) && return false
     return true
+end
+
+function _has_located_axes(plan::StructuralPlan, pred::PredictorSpec, ex)
+    a = _known_axes(plan, ex)
+    a === nothing && return false
+    located = [r for r in plan.responses if _response_uses_predictor(r, pred.name)]
+    return !isempty(located) && all(located) do r
+        haskey(plan.columns, r.response) && r.range === nothing &&
+            _value_axes(plan, r.response; data_axes = true) == a
+    end
+end
+
+# A value whose known extent is not the location's rows (a one-entry
+# declared array), so `_ppl_rows` would always take its broadcast branch.
+function _known_row_mismatch(plan::StructuralPlan, pred::PredictorSpec, ex)
+    a = _known_axes(plan, ex)
+    return a !== nothing && prod(a) != _located_rows(plan, pred)
+end
+
+# The bound integer axes of an array value, or `nothing` when a scalar,
+# unbound or of unknown shape.
+function _known_axes(plan::StructuralPlan, ex)
+    isbound(plan) || return nothing
+    a = _value_axes(plan, ex; data_axes = true)
+    a isa Vector && !isempty(a) && all(d -> d isa Int, a) || return nothing
+    return a
 end
 
 # A called @kernel whose single result is an authored plate already has an
@@ -1547,6 +1585,15 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
     elseif r.family === VonMisesFam
         return _vonmises_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialLogitFam
+        # Base GLM case: fused whole-vector reduction with the data-only
+        # binomial coefficient a named recipe that preparation folds.
+        r.evidence.kind === :none && r.weights === nothing &&
+            r.range === nothing && r.mi_jobs === nothing && r.link === LogitLink &&
+            !haskey(plan.columns, _observed_mask_name(r.response)) &&
+            !_is_bare_param_location(r, plan) &&
+            !_cell_broadcast_response(plan, r) &&
+            _wholevec_location(r, plan) && _wholevec_trials(r, plan) &&
+            return _binomial_wholevec_stmts(r, plan, node)
         return _binomial_plate_stmts(r, plan, node, pw)
     elseif r.family === BinomialProbFam
         return _binomial_prob_plate_stmts(r, plan, node, pw)
@@ -1797,7 +1844,7 @@ function _mixture_component_lpdf(f::LikelihoodFamily, r::LikelihoodSpec,
     throw(ContractValidationError("[generator] mixture over $f has no cell emitter"))
 end
 
-# A GLM-object response: one fused constructed-endpoint application
+# A GLM-object response: fused constructed-endpoint applications
 # over the whole column (no plate — the object owns eta). The
 # intercept-free design matrix gains its ones column from the bound
 # row count (data-only, folds at prepare) and the split coefficients
@@ -1829,9 +1876,7 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     bfull = Symbol(:_ppl_glm_b_, r.label)
     yconv = r.family === NormalIDGLMFam ? :Float64 : :Int
     s = r.scale isa Symbol ? r.scale : :(Float64($(r.scale)))
-    call = r.family === NormalIDGLMFam ?
-        :($obj($xaug, $bfull, $s).pointwise($yf)) :
-        :($obj($xaug, $bfull).pointwise($yf))
+    o = r.family === NormalIDGLMFam ? :($obj($xaug, $bfull, $s)) : :($obj($xaug, $bfull))
     design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
     n = r.mi_jobs === nothing ? _response_rows_source(plan, r) : Expr(:call, :length, r.mi_jobs)
     # A literal zero intercept adds nothing: the object reads X and beta as
@@ -1839,12 +1884,32 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     xaug_expr, bfull_expr = r.glm_alpha isa Real && iszero(r.glm_alpha) ?
         (:(Float64.($design)), :([$(r.glm_beta);])) :
         (:(hcat(ones($n), $design)), :([$(r.glm_alpha); $(r.glm_beta)]))
-    return Expr[
+    head = Expr[
         :($yf = $yconv.($y)),
         :($xaug = $xaug_expr),
         :($bfull = $bfull_expr),
-        :($pw = $call),
-        :($node::Float64 = sum($pw)),
+    ]
+    r.family === PoissonLogGLMFam &&
+        return Expr[head..., _poisson_glm_split_stmts(r, o, yf, pw, node)...]
+    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = sum($pw))]
+end
+
+# The Poisson-log object's density in its two endpoint parts, as a count plate
+# sums them (`_count_plate_stmts!`): `logkernel` reads eta, and
+# `lognormalizer`, `-log(y!)`, reads the bound response only, so preparation
+# folds it and its sum and no `loggamma` runs per evaluation. The pointwise
+# vector adds the two, so a sweep that retains it evaluates the kernel once.
+function _poisson_glm_split_stmts(r::LikelihoodSpec, o::Expr, yf::Symbol,
+        pw::Symbol, node::Symbol)
+    pwk, kern = Symbol(:_ppl_pwk_, r.label), Symbol(:_ppl_kernel_, r.label)
+    pwn, norm = Symbol(:_ppl_pwn_, r.label), Symbol(:_ppl_lnorm_, r.label)
+    return Expr[
+        :($pwk = $o.logkernel($yf)),
+        :($pwn = $o.lognormalizer($yf)),
+        :($pw = $pwk .+ $pwn),
+        :($kern::Float64 = sum($pwk)),
+        :($norm = sum($pwn)),
+        :($node::Float64 = $kern + $norm),
     ]
 end
 
@@ -1983,7 +2048,8 @@ end
 # shape and layout still describe the response), but omit the generated
 # `y_eta = loc` statement and use `loc` at every later read. The synthesized
 # predictor for an inline expression, and aliases of sampled parameters, keep
-# their own graph names.
+# their own graph names. A cell parameter that shares the alias's name (the
+# role-named `do value, location, scale` cells) is its own variable and keeps it.
 function _elide_named_location_aliases(plan::StructuralPlan, def::Expr)
     aliases = Dict{Symbol,Symbol}()
     for pred in plan.predictors
@@ -2002,7 +2068,7 @@ function _elide_named_location_aliases(plan::StructuralPlan, def::Expr)
             active[lhs] = st.args[2]
             continue
         end
-        push!(stmts, isempty(active) ? st : _hsubst(st, active))
+        push!(stmts, isempty(active) ? st : _hsubst(st, active; shadow = true))
         lhs === nothing || push!(defined, lhs)
     end
     return Expr(:(=), def.args[1], Expr(:block, stmts...))
@@ -2095,6 +2161,52 @@ function _plate_sum_stmts(pointwise::Symbol, node::Symbol, inputs::Vector{Any},
     doex = _plate_closure(inputs, cell isa Expr ? Expr[cell] : cell)
     isempty(names) || (doex = _name_plate_cell(doex, (p, _) -> get(names, p, nothing)))
     return Expr[:($pointwise = $doex), :($node::Float64 = sum($pointwise))]
+end
+
+# A count likelihood whose distribution object splits `logpdf` into the
+# parameter-dependent `logkernel` and the data-only `lognormalizer`.
+# `law(method)` is the cell's density call through that endpoint, over
+# `inputs`; `normalizer` is the `lognormalizer` call over `ninputs`, which hold
+# only the response and the data the normalizer reads (its trials). The
+# pointwise plate keeps the whole `logpdf`. The summed node adds the kernel
+# plate to the normalizer plate, which reads bound data only, so preparation
+# folds its sum to one constant and no `loggamma` runs per evaluation.
+# Evidence, presence masks, packed rows, ranges and arrays per index rewrite
+# the pointwise plate alone; they keep the whole-`logpdf` sum. So does a
+# response that stretches over a longer location (a number or one entry
+# beside more rows): the normalizer plate iterates the response, so it covers
+# the kernel plate's cells only when the response spans the domain.
+function _count_plate_stmts!(pre::Vector{Expr}, r::LikelihoodSpec,
+        plan::StructuralPlan, node::Symbol, pw::Symbol, inputs::Vector{Any},
+        law, ninputs::Vector{Any}, normalizer::Expr)
+    y = get(plan.columns, r.response, nothing)
+    split = r.evidence.kind === :none && r.mi_jobs === nothing &&
+        r.range === nothing &&
+        !haskey(plan.columns, _observed_mask_name(r.response)) &&
+        !_cell_broadcast_response(plan, r) &&
+        y isa AbstractArray && length(y) == _response_rows(plan, r)
+    cell = _wrap_evidence!(r, plan, pre, inputs, law(:logpdf))
+    kernel = split ? law(:logkernel) : nothing
+    if r.weights !== nothing
+        wv = _thread_ref!(inputs, r.weights)
+        cell = _weighted_cell(wv, cell)
+        if split
+            kernel = _weighted_cell(wv, kernel)
+            normalizer = :($(_thread_ref!(ninputs, r.weights)) * $normalizer)
+        end
+    end
+    stmts = _plate_sum_stmts(pw, node, inputs, cell)
+    split || return stmts
+    # Each sum is its own statement: a plate whose only consumer is `sum`
+    # reduces in place, and the data-only normalizer sum folds by itself.
+    pwk, kern = Symbol(:_ppl_pwk_, r.label), Symbol(:_ppl_kernel_, r.label)
+    pwn, norm = Symbol(:_ppl_pwn_, r.label), Symbol(:_ppl_lnorm_, r.label)
+    return Expr[stmts[1],
+        :($pwk = $(_plate_closure(inputs, kernel isa Expr ? Expr[kernel] : kernel))),
+        :($kern::Float64 = sum($pwk)),
+        :($pwn = $(_plate_closure(ninputs, Expr[normalizer]))),
+        :($norm = sum($pwn)),
+        :($node::Float64 = $kern + $norm)]
 end
 
 _is_shared_input(x) = Meta.isexpr(x, :call, 2) &&
@@ -2368,6 +2480,13 @@ end
 # ordinary Enzyme/Reactant AD — no analytic adjoint.
 _yfloat_name(label::Symbol) = Symbol(:_ppl_yf_, label)
 
+# A fused form keeps its emitter's statements through the pointwise plate,
+# which `:pointwise` queries read, and replaces the summed node.
+function _through_pointwise(stmts::Vector{Expr}, r::LikelihoodSpec)
+    pw = _pw_name(r.label)
+    return stmts[1:findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)]
+end
+
 # Fused whole-vector Bernoulli-logit likelihood (base case). Logit-form log-mass
 # `Σ yᵢ·ηᵢ − Σ log1pexp(ηᵢ)` — no data-only normalizer, a plain fused reduction.
 # Value-identical to `Σ bernoulli(; logit=ηᵢ).logpdf(yᵢ)`; same folded-`_ppl_yf`
@@ -2377,7 +2496,7 @@ function _bernoulli_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node
     lp = _location_node(r, plan)
     yf = _yfloat_name(r.label)
     return Expr[
-        _bernoulli_plate_stmts(r, plan, node, _pw_name(r.label))[1:end-1]...,
+        _through_pointwise(_bernoulli_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
         :($yf = Float64.($y)),
         :($node::Float64 = dot($yf, $lp) - sum(log1pexp, $lp)),
     ]
@@ -2389,11 +2508,48 @@ function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::
     yf = _yfloat_name(r.label)
     cterm = Symbol(:_ppl_lfact_, r.label)
     return Expr[
-        _poisson_plate_stmts(r, plan, node, _pw_name(r.label))[1:end-1]...,
+        _through_pointwise(_poisson_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
         :($yf = Float64.($y)),
         :($cterm = sum(loggamma.($yf .+ 1.0))),
         :($node::Float64 = dot($yf, $lp) - sum(exp, $lp) - $cterm),
     ]
+end
+
+# Fused whole-vector Binomial-logit likelihood (base case). For counts the
+# contract keeps within `0..n`, `Σ binomial(; n = nᵢ, logit = ηᵢ).logpdf(yᵢ)`
+# is `Σ yᵢ·ηᵢ − Σ nᵢ·log1pexp(ηᵢ) + C`, with `C = Σ log C(nᵢ, yᵢ)` a NAMED
+# data-only recipe over the bound response and trials (`_ppl_lchoose_<label>`):
+# `bound=` folds it to a constant, so no `loggamma` runs per evaluation, and
+# a binding with other counts computes its own. Trials are a literal, which
+# scales one `sum(log1pexp, η)`, or a column with one entry per response
+# entry (`_wholevec_trials`). Gradient stays ordinary AD.
+function _binomial_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
+    y = r.response
+    lp = _location_node(r, plan)
+    yf = _yfloat_name(r.label)
+    nf = Symbol(:_ppl_nf_, r.label)
+    cterm = Symbol(:_ppl_lchoose_, r.label)
+    trials = r.trials isa Int ? Float64(r.trials) : :(Float64.($(r.trials)))
+    tail = r.trials isa Int ?
+        :($nf * sum(log1pexp, $lp)) : :(dot($nf, log1pexp.($lp)))
+    return Expr[
+        _through_pointwise(_binomial_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
+        :($yf = Float64.($y)),
+        :($nf = $trials),
+        :($cterm = sum(loggamma.($nf .+ 1.0) .- loggamma.($yf .+ 1.0) .-
+            loggamma.($nf .- $yf .+ 1.0))),
+        :($node::Float64 = dot($yf, $lp) - $tail + $cterm),
+    ]
+end
+
+# Trials the fused Binomial form reads: a literal, or a column with one entry
+# per response entry (binding admits only these two). A one-entry column
+# stretching over the rows keeps the plate path, which broadcasts it.
+function _wholevec_trials(r::LikelihoodSpec, plan::StructuralPlan)
+    r.trials isa Int && return true
+    t = get(plan.columns, r.trials, nothing)
+    y = get(plan.columns, r.response, nothing)
+    return t isa AbstractVector && y isa AbstractVector && length(t) == length(y)
 end
 
 function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
@@ -2405,21 +2561,17 @@ function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     if _is_bare_param_location(r, plan) || r.link !== LogLink
         rate = _response_value_node!(pre, r, plan)
         ratev = _thread_ref!(inputs, rate)
-        base = :(poisson($ratev).logpdf($yv))
-        cell = :($ratev >= 0 ? $base : -Inf)
+        law = m -> :($ratev >= 0 ? poisson($ratev).$m($yv) : -Inf)
     else
         lp = _location_node(r, plan)
         push!(inputs, lp)
         etav = _dovar(2)
-        base = :(poisson(; log_rate = $etav).logpdf($yv))
-        cell = base
+        law = m -> :(poisson(; log_rate = $etav).$m($yv))
     end
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
-    end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    # The keyword form binds no owner port: the normalizer reads none.
+    normalizer = :(poisson(; ).lognormalizer($(_dovar(1))))
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, Any[y], normalizer)
+    return Expr[pre..., stmts...]
 end
 
 # ZIP plate: the Poisson-plate shape with a zero-inflation argument —
@@ -2653,7 +2805,7 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         nref = _thread_ref!(inputs, r.trials, true)
         p = _response_value_node!(pre, r, plan)
         pv = _thread_ref!(inputs, p)
-        cell = :((($pv >= 0) & ($pv <= 1)) ? binomial($nref, $pv).logpdf($yv) : -Inf)
+        law = m -> :((($pv >= 0) & ($pv <= 1)) ? binomial($nref, $pv).$m($yv) : -Inf)
     else
         lp = _location_node(r, plan)
         push!(inputs, lp)
@@ -2661,14 +2813,19 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
         nref = _thread_ref!(inputs, r.trials, true)
         # All-keyword: the object constructor cannot mix positional and named
         # owner bindings (matches the `:observed/:n/:logit` HAVE ports).
-        cell = :(binomial(; n = $nref, logit = $etav).logpdf($yv))
+        law = m -> :(binomial(; n = $nref, logit = $etav).$m($yv))
     end
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
-    end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    ninputs, normalizer = _binomial_normalizer(yin, r, :binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
+    return Expr[pre..., stmts...]
+end
+
+# The `lognormalizer` cell of a Binomial-coefficient family (`binomial`,
+# `zero_inflated_binomial`): it reads the response and the trials only.
+function _binomial_normalizer(yin, r::LikelihoodSpec, family::Symbol)
+    ninputs = Any[yin]
+    nn = _thread_ref!(ninputs, r.trials, true)
+    return ninputs, :($family(; n = $nn).lognormalizer($(_dovar(1))))
 end
 
 # Prob-space Binomial (SB `binomial(n, theta)` with a Beta prior — the Rate
@@ -2684,13 +2841,10 @@ function _binomial_prob_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, nod
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
     pref = _thread_ref!(inputs, r.predictor)
-    cell = :(binomial($nref, $pref).logpdf($yv))
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
-    end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    law = m -> :(binomial($nref, $pref).$m($yv))
+    ninputs, normalizer = _binomial_normalizer(yin, r, :binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
+    return Expr[pre..., stmts...]
 end
 
 # Zero-inflated-Binomial plate (the ZIB head): prob-space scalar p (the
@@ -2701,7 +2855,10 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     pre = Expr[]
     y = r.response
     pre = Expr[]
-    p = _response_value_node!(pre, r, plan)
+    # A logit-link location is the endpoint's `logit` HAVE (the ZIP
+    # `log_rate` precedent): no probability vector, no `log(p)` round trip.
+    logit = r.link === LogitLink && !_is_bare_param_location(r, plan)
+    p = logit ? _location_node(r, plan) : _response_value_node!(pre, r, plan)
     ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, Symbol(r.label, :_zi))
     yin = _count_yplate!(pre, plan, y, r.label)
     inputs = Any[yin]
@@ -2709,14 +2866,15 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     nref = _thread_ref!(inputs, r.trials, true)
     pref = _thread_ref!(inputs, p)
     ziref = _thread_ref!(inputs, ziarg)
-    cell = :((($pref >= 0) & ($pref <= 1)) && (($ziref >= 0) & ($ziref <= 1)) ?
-        zero_inflated_binomial($nref, $pref, $ziref).logpdf($yv) : -Inf)
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
-    end
-    return Expr[pre..., _plate_sum_stmts(pw, node, inputs, cell)...]
+    law = m -> logit ?
+        :((($ziref >= 0) & ($ziref <= 1)) ?
+            zero_inflated_binomial(; n = $nref, logit = $pref, zi = $ziref).$m($yv) :
+            -Inf) :
+        :((($pref >= 0) & ($pref <= 1)) && (($ziref >= 0) & ($ziref <= 1)) ?
+            zero_inflated_binomial($nref, $pref, $ziref).$m($yv) : -Inf)
+    ninputs, normalizer = _binomial_normalizer(yin, r, :zero_inflated_binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
+    return Expr[pre..., stmts...]
 end
 
 # Mean/rate vectors are precomputed statements (like predictor nodes): plate
@@ -2948,15 +3106,12 @@ function _binomial_probit_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, n
     inputs = Any[yin, logitp]
     yv, lpv = _dovar(1), _dovar(2)
     nref = _thread_ref!(inputs, r.trials, true)
-    cell = :(binomial(; n = $nref, logit = $lpv).logpdf($yv))
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
-    end
+    law = m -> :(binomial(; n = $nref, logit = $lpv).$m($yv))
+    ninputs, normalizer = _binomial_normalizer(yin, r, :binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
     return Expr[pre..., :($p = 0.5 .* erfc.(-$lp ./ sqrt(2))),
         :($logitp = log.($p) .- log1p.(-$p)),
-        _plate_sum_stmts(pw, node, inputs, cell)...]
+        stmts...]
 end
 
 function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
@@ -2970,15 +3125,12 @@ function _binomial_cloglog_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, 
     inputs = Any[yin, logitp]
     yv, lpv = _dovar(1), _dovar(2)
     nref = _thread_ref!(inputs, r.trials, true)
-    cell = :(binomial(; n = $nref, logit = $lpv).logpdf($yv))
-    cell = _wrap_evidence!(r, plan, pre, inputs, cell)
-    if r.weights !== nothing
-        wv = _thread_ref!(inputs, r.weights)
-        cell = _weighted_cell(wv, cell)
-    end
+    law = m -> :(binomial(; n = $nref, logit = $lpv).$m($yv))
+    ninputs, normalizer = _binomial_normalizer(yin, r, :binomial)
+    stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
     return Expr[pre..., :($p = 1 .- exp.(-exp.($lp))),
         :($logitp = log.($p) .- log1p.(-$p)),
-        _plate_sum_stmts(pw, node, inputs, cell)...]
+        stmts...]
 end
 
 # Beta mean-concentration: mu/a/b precomputes (Gamma-pre pattern), kappa
