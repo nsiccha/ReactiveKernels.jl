@@ -8,7 +8,7 @@ using Test
 # value the caller assigns keeps its name, child formals read the caller's
 # values (no `identity` aliases), the child's result is not `__return__`, the
 # child's own values are scoped under the caller's name, and arguments RK
-# materializes into hygienic ports show as their values in `readable_code`.
+# materializes into hygienic ports show as their values in `code_expr`.
 
 const _DKS = DistributionKernelSources
 
@@ -120,7 +120,7 @@ _names_normal(x, location, scale) =
 _names_priors_reference(u) = _names_exponential(exp(u[1]), 4.0) +
     _names_exponential(u[2], 4.0) + _names_normal(u[3], -0.5, 2.0)
 
-# Source-aware recipe view for naming assertions; public `readable_code` keeps
+# Source-aware recipe view for naming assertions; public `code_expr` keeps
 # executable operation slots and does not substitute recipe source.
 function _names_text(spec)
     p = plan(spec)

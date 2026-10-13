@@ -270,7 +270,7 @@ call above the branch, where it splices as usual.
 Inside an object's own method bodies, a straight-position call of a sibling,
 a bound child or `inv` splices the same way. In a lazy arm, or with an
 argument a `let` binds, the call stays where it is written: the object's
-builder prepares the callee's graph once, and `readable_code` shows the call as
+builder prepares the callee's graph once, and `code_expr` contains the call as
 `var"prepared standardized"(location, scale, x)`. The arm evaluates it only
 when taken.
 

@@ -1,10 +1,8 @@
 using ReactiveKernels
 using Test
 
-# Human-readable display of existing graphs, plans and kernels: the `Graph`
-# text listing, `readable_code`, and source-aware recipe labels in `explain`
-# and DAG views. Every view must read the authored sources, never print an
-# operation's parameterized type, and never mutate what it displays.
+# Structural graph and plan explanations are distinct from executable code.
+# `code_expr` exposes the executable expression without display rewriting.
 
 @kernel display_standard_normal() = begin
     logpdf(z::Float64)::Float64 = -0.5 * log(2π) - 0.5 * z^2
@@ -81,39 +79,25 @@ _has_linenumber(x) = x isa LineNumberNode ||
         @test occursin("= sum(pointwise)", explained)
     end
 
-    @testset "readable_code over a spec, plan and prepared kernel" begin
-        from_spec = readable_code(display_model)
+    @testset "code_expr exposes the generated program" begin
+        @test !isdefined(ReactiveKernels, :readable_code)
+        @test !isdefined(ReactiveKernels, :ReadableCode)
         display_plan = plan(display_model)
-        from_plan = readable_code(display_plan)
-        @test from_spec isa ReadableCode
-        @test length(from_spec.operations) == length(from_plan.operations)
-        text = string(from_spec)
-        @test !occursin("#=", text)
-        @test occursin("__ops__", text)
-        @test length(from_plan.operations) == length(lower_with_ops(display_plan)[2])
-        @test !_has_linenumber(from_spec.expr)
-        @test isempty(from_spec.modules)
-        @test occursin("# __ops__ table", text)
-        @test occursin("_KernelSourceOp", text)
-        # The displayed program is ordinary Julia.
-        parsed = Meta.parseall(text)
-        @test !any(arg -> arg isa Expr && arg.head === :error, parsed.args)
-        @test sprint(show, MIME"text/plain"(), from_spec) == text
-        @test sprint(show, from_spec) == text
+        @test code_expr(display_model) isa Expr
+        @test code_expr(display_plan) isa Expr
+        @test occursin("__ops__", string(code_expr(display_plan)))
 
         kernel = prepare(display_model)
         xs = [-1.0, 0.5, 2.0]
         @test kernel(xs, 0.2, 1.3) ≈ _display_model_reference(xs, 0.2, 1.3)
-        prepared = string(readable_code(kernel))
-        @test !occursin("#=", prepared)
-        @test occursin("__ops__", prepared)
-        @test readable_code(kernel).operations === kernel.ops
-        @test readable_code(kernel).expr == Base.remove_linenums!(deepcopy(code_expr(kernel)))
-        # `code_expr` remains the exact executable AST.
+        @test code_expr(kernel) === kernel.ast
+        visible = Base.remove_linenums!(deepcopy(code_expr(kernel)))
+        @test !_has_linenumber(visible)
+        @test occursin("__ops__", string(visible))
         @test code_expr(kernel) === kernel.ast
     end
 
-    @testset "displayed expressions preserve scopes and eager argument evaluation" begin
+    @testset "the executable expression preserves scopes and eager arguments" begin
         @kernel display_rebind_child(rows, vals) = begin
             cells = plate(rows) do r
                 y = vals[r]
@@ -127,11 +111,10 @@ _has_linenumber(x) = x isa LineNumberNode ||
             return t
         end
         rebind = prepare(display_rebind_parent)
-        rebind_code = readable_code(rebind)
-        rendered_rebind = Core.eval(@__MODULE__, rebind_code.expr)
+        rendered_rebind = Core.eval(@__MODULE__, code_expr(rebind))
         rows = [[1, 2], [3]]
         ys = [1.0, 2.0, 4.0]
-        @test Base.invokelatest(rendered_rebind, rebind_code.operations, rows, ys) ==
+        @test Base.invokelatest(rendered_rebind, rebind.ops, rows, ys) ==
               rebind(rows, ys) == [10.0, 11.0]
 
         @kernel display_arm_child(x::Float64, s::Float64) = begin
@@ -143,61 +126,26 @@ _has_linenumber(x) = x isa LineNumberNode ||
             return q
         end
         arm = prepare(display_arm_parent)
-        arm_code = readable_code(arm)
-        rendered_arm = Core.eval(@__MODULE__, arm_code.expr)
-        @test Base.invokelatest(rendered_arm, arm_code.operations, [2.0], -1.0) ==
+        rendered_arm = Core.eval(@__MODULE__, code_expr(arm))
+        @test Base.invokelatest(rendered_arm, arm.ops, [2.0], -1.0) ==
               arm([2.0], -1.0) == -Inf
-        @test_throws BoundsError Base.invokelatest(rendered_arm, arm_code.operations,
+        @test_throws BoundsError Base.invokelatest(rendered_arm, arm.ops,
                                                   Float64[], -1.0)
         @test_throws BoundsError arm(Float64[], -1.0)
     end
 
-    @testset "readable_code of an expression is a non-mutating copy" begin
+    @testset "line-number removal does not rewrite or mutate code" begin
         source = quote
             y = 2x
-            @inline f(z) = z + y
+            f(z) = z + y
             f(y)
         end
         original = deepcopy(source)
-        code = readable_code(source; modules = (Base,))
+        visible = Base.remove_linenums!(deepcopy(source))
         @test source == original
         @test _has_linenumber(source)
-        @test !_has_linenumber(code.expr)
-        @test code.modules == [Base]
-        @test !occursin("#=", string(code))
-        @test occursin("@inline f(z) = begin", string(code))
-    end
-
-    @testset "global references keep their defining module" begin
-        first_mod, second_mod = Module(:DisplayGlobalsA), Module(:DisplayGlobalsB)
-        f1, f2 = GlobalRef(first_mod, :f), GlobalRef(second_mod, :f)
-        g2 = GlobalRef(second_mod, :g)
-        source = :(y = $f1(x) + $g2(x))
-        original = deepcopy(source)
-        code = readable_code(source)
-        @test source == original
-        @test code.expr == Base.remove_linenums!(deepcopy(source))
-        @test occursin("DisplayGlobalsA.f(x)", string(code.expr))
-        @test occursin("DisplayGlobalsB.g(x)", string(code.expr))
-        @test isempty(code.modules)
-        @test readable_code(source; modules = (Base,)).modules == [Base]
-        clash = readable_code(:(y = $f1(x) + $f2(x)))
-        @test occursin("DisplayGlobalsA.f(x)", string(clash.expr))
-        @test occursin("DisplayGlobalsB.f(x)", string(clash.expr))
-        @test isempty(clash.modules)
-        shadowed = readable_code(:(f = x; y = $f1(f)))
-        @test occursin("DisplayGlobalsA.f(f)", string(shadowed.expr))
-        # A Base reference is not respelled either.
-        based = readable_code(:(y = $(GlobalRef(Base, :sum))(x)))
-        @test based.expr == :(y = $(GlobalRef(Base, :sum))(x))
-        @test isempty(based.modules)
-    end
-
-    @testset "rich display of readable code escapes HTML" begin
-        code = readable_code(:(x < y && y > z))
-        html = sprint(show, MIME"text/html"(), code)
-        @test startswith(html, "<pre class=\"rk-readable-code\"><code class=\"language-julia\">")
-        @test occursin("x &lt; y &amp;&amp; y &gt; z", html)
+        @test !_has_linenumber(visible)
+        @test visible == Base.remove_linenums!(deepcopy(original))
     end
 
     @testset "empty graph" begin

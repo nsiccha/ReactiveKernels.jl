@@ -98,7 +98,7 @@ _tv_zib_oracle(n) = u -> sum(_tv_zib_cell.(_TV_Y, n, logistic.(_tv_eta(u)),
     @test occursin("_ppl_lchoose_y_resp", source)
     @test occursin("sum(log1pexp", source)
     @test !occursin("loggamma",
-        sprint(show, MIME"text/plain"(), readable_code(number.kernel)))
+        sprint(print, Base.remove_linenums!(deepcopy(code_expr(number.kernel)))))
     # A Beta-sampled probability (the probability-space Binomial plate).
     f = _tv_model(quote
         p ~ Beta(2, 2)

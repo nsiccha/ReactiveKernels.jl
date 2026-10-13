@@ -122,7 +122,7 @@ end
     source = sprint(print, kernel_expr(plan, built.layout))
     @test occursin(".logkernel(", source) && occursin(".lognormalizer(", source)
     prepared = prepare_query(built, plan, :sampler)
-    code = sprint(show, MIME"text/plain"(), readable_code(prepared))
+    code = sprint(print, Base.remove_linenums!(deepcopy(code_expr(prepared))))
     @test !occursin("loggamma", code)
     normalizer = match(r"\b_ppl_lnorm_\w+ = \(__ops__\[(\d+)\]\)\(\)", code)
     @test normalizer !== nothing
@@ -347,7 +347,8 @@ end
     for (plan, data, mean) in cases
         oracle = nt -> logpdf.(Normal.(mean(nt), nt.sigma), y)
         built = _gv_check(plan, data, nt -> sum(oracle(nt)))
-        code = sprint(show, MIME"text/plain"(), readable_code(prepare_query(built, plan, :sampler)))
+        code = sprint(print, Base.remove_linenums!(deepcopy(
+            code_expr(prepare_query(built, plan, :sampler)))))
         @test occursin("normal_id_glm(", sprint(print, kernel_expr(plan, built.layout)))
         @test !occursin("_ppl_pw_", code)
         u = _gv_u(built)

@@ -48,11 +48,11 @@ end
     nested = prepare(nested_arm_caller)
     @test (nested(1.5, 2.0, true), nested(1.5, -1.0, true), nested(1.5, -1.0, false)) ==
           (log(2.0) * 1.5, 0.0, 1.0)
-    nested_code = string(readable_code(nested))
+    nested_code = string(code_expr(nested))
     @test occursin("let var\"prepared sib\" = ", nested_code)
     @test occursin("var\"prepared sib\"(scale, x)", nested_code)
     # No sibling value is computed ahead of the branch.
-    code = string(readable_code(f))
+    code = string(code_expr(f))
     @test !occursin("sib = ", code)
     @test occursin(r"if x > 0\s+var\"prepared sib\"\(scale, x\)", code)
 

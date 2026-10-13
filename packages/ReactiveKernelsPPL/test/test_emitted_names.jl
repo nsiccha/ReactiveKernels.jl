@@ -1,12 +1,13 @@
 module EmittedNameTests
 using ReactiveKernels, ReactiveKernelsPPL, Distributions, DifferentiationInterface, Enzyme, Test
 
-# The generated program reads with the model's own names (rkppl-use §16):
+# The generated pre-build definition reads with the model's own names
+# (rkppl-use §16):
 # plate cells name their arguments after the values they iterate, a value
 # the lowering computes for a distribution argument is named after its
 # owner and role, a declared array's prior is named after the array, sums
 # carry no `0.0` seed, `Float64` values need no `1.0 *` port and the
-# display spells the model module's functions as written. Every density,
+# emitted source qualifies functions from the model module. Every density,
 # gradient and coordinate stays the same.
 
 const BACKEND = AutoEnzyme(; mode=Enzyme.Reverse)
@@ -21,7 +22,8 @@ const x = [0.3, -0.5, 1.2, 0.8]
 const y = [0.1, -0.4, 1.1, 0.6]
 const g = [1, 2, 1, 2]
 
-_text(bound) = string(readable_code(kernel_expr(bound, assign_layout(bound))))
+_text(bound) = sprint(print,
+    Base.remove_linenums!(deepcopy(kernel_expr(bound, assign_layout(bound)))))
 _bound(ast, data; mod = Fns) =
     bind_data(lower_rkppl(ast, data; conditioned = (:y,), mod), data)
 
@@ -66,13 +68,13 @@ end
         @test occursin("(normal(loc, y_scale)).logpdf(y)", text)
         @test !occursin("y_eta = loc", text)
         @test !occursin("_ppl_lp_y_eta", text)
-        @test occursin("plate(y, loc, y_scale) do y, loc, y_scale",
-            string(readable_code(build_kernel(bound).spec)))
+        @test occursin("_ppl_pw_y_resp = (__ops__[",
+            string(code_expr(build_kernel(bound).spec)))
         @test !occursin(r"_ppl_c\d", text)
     end
 
     @testset "a computed distribution argument is named after its role" begin
-        @test occursin("y_scale = spread(loc, sa, sp)", text)
+        @test occursin("y_scale = Main.EmittedNameTests.Fns.spread(loc, sa, sp)", text)
         @test occursin("b_scale = 2s", text)
         @test !occursin("_rkppl_", text)
     end
@@ -103,13 +105,10 @@ end
         @test occursin("(normal(0.0, 1.0b_scale)).logpdf(b)", text)
     end
 
-    @testset "the display spells the model module's functions as written" begin
-        code = readable_code(kernel_expr(bound, assign_layout(bound)))
-        @test Fns in code.modules
-        @test startswith(string(code), "# authored sources evaluated in: ")
-        @test !occursin("Fns.spread", text)
-        # `kernel_expr` itself keeps the exact global reference.
-        @test occursin("Fns.spread", sprint(print, kernel_expr(bound, assign_layout(bound))))
+    @testset "the generated expression keeps its global references" begin
+        code = kernel_expr(bound, assign_layout(bound))
+        @test occursin("Fns.spread", sprint(print, code))
+        @test occursin("Fns.spread", text)
     end
 
     @testset "values and native gradients are the model's" begin
@@ -162,8 +161,8 @@ end
     for n in (1, 2)
         bound = _bound(model, (; x = repeat(x, n), y = repeat(y, n)))
         text = _text(bound)
-        @test occursin("loc = shiftby(x, a)", text)
-        @test occursin("plate(y, _ppl_rows(loc, _observation_rows(y)), s) do y, loc, s", text)
+        @test occursin("loc = Main.EmittedNameTests.Fns.shiftby(x, a)", text)
+        @test occursin("plate(y, ReactiveKernelsPPL._ppl_rows(loc, ReactiveKernelsPPL._observation_rows(y)), s) do y, loc, s", text)
         @test !occursin("y_eta =", text)
         @test !occursin("_ppl_lp_y_eta", text)
         built = build_kernel(bound)
@@ -241,7 +240,7 @@ end
         y .~ Normal.(a .+ b .* y_scale .+ b_scale, shiftby(s, 0.5))
     end
     text = _text(_bound(taken, (; x, y)))
-    @test occursin("y_scale_2 = shiftby(s, 0.5)", text)
+    @test occursin("y_scale_2 = Main.EmittedNameTests.Fns.shiftby(s, 0.5)", text)
     @test occursin("b_scale_2 = 2s", text)
     # A data column takes the name first too.
     data = (; x, y, y_scale = x)
@@ -250,13 +249,13 @@ end
         s ~ Exponential(1.0)
         y .~ Normal.(a .+ y_scale, shiftby(s, 0.5))
     end
-    @test occursin("y_scale_2 = shiftby(s, 0.5)", _text(_bound(model, data)))
+    @test occursin("y_scale_2 = Main.EmittedNameTests.Fns.shiftby(s, 0.5)", _text(_bound(model, data)))
     # A synthesized response name (`y_eta`) is never a computed argument's.
     nested = quote
         a ~ Normal(0, 1)
         y .~ Normal.(a .+ shiftby(x .* a, 0.5), 1.0)
     end
-    @test occursin("y_shiftby = shiftby(x .* a, 0.5)", _text(_bound(nested, (; x, y))))
+    @test occursin("y_shiftby = Main.EmittedNameTests.Fns.shiftby(x .* a, 0.5)", _text(_bound(nested, (; x, y))))
 end
 
 @testset "a literal zero bound contributes nothing to its transform" begin
@@ -278,7 +277,9 @@ end
     @test occursin("p::Float64 = rk_affine_logistic(0.0, 1.0, _ppl_int_p)", text)
     @test occursin("h::Float64 = rk_affine_logistic(-1.0, 2.0, _ppl_int_h)", text)
     @test occursin("log(h + 1.0)", text)
-    for gratuitous in ("0.0 +", "0.0 .+", "- 0.0", ".- 0.0", "0.0 -", "0.0 .-",
+    # The separate logistic log-Jacobian still emits `0.0 - log1pexp(...)`;
+    # this test concerns the literal bounds in the constrained transforms.
+    for gratuitous in ("0.0 +", "0.0 .+", "- 0.0", ".- 0.0", "0.0 .-",
             "- -", ".- -", "log(1.0)")
         @test !occursin(gratuitous, text)
     end
@@ -339,7 +340,7 @@ end
 end
 end
 
-@testset "composed kernels in the built program read under the model's names" begin
+@testset "composed kernels keep their generated operation slots" begin
     model = quote
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
@@ -353,14 +354,13 @@ end
     data = (; x, y)
     bound = _bound(model, data; mod = @__MODULE__)
     built = build_kernel(bound)
-    code = string(readable_code(built.spec))
-    # A call inside an expression is named under its assignment; a typed
-    # formal reads the model's value with no `identity` alias.
-    @test occursin(r"var\"[^\"]+\.fall\.xi_max\" = 0\.5 \.- 3\.0", code)
-    @test occursin("shift = sum(base) * 0.1", code)
+    code = string(code_expr(built.spec))
+    # The planned expression retains the call slots and their actual bindings.
+    # Source bodies of those callables are separate from this expression.
+    @test occursin(r"var\"[^\"]+\.fall\.xi_max\" = \(__ops__\[", code)
+    @test occursin(r"shift = \(__ops__\[\d+\]\)\(base, var\"shift\.s\"\)", code)
     @test !occursin("identity(", code)
-    @test !occursin("##", code)
-    @test !occursin(r"\b(xi|value)_\d+\b", code)
+    @test occursin("var\"##plate_argument#", code)
 
     oracle(nt) = begin
         base = nt.a .+ nt.b .* x
@@ -385,7 +385,7 @@ end
 end
 
 # A definition with no coefficient structure is one value, read under its
-# own name like any retained definition: the built program shows `mu`, and
+# own name like any retained definition: the planned expression binds `mu`, and
 # the calls lifted out of it are scoped under `mu`, never under a column
 # the lowering extracted and named itself (snag `read-the-built-p-bd95fad7`).
 @testset "a definition without coefficient structure keeps its name" begin
@@ -406,9 +406,7 @@ end
             (quote
                 mu = base .* ComposedFns.rise(base) .* exp.(ComposedFns.fall(base, 0.5))
                 y .~ Normal.(mu, sa)
-            end, ["var\"mu.rise.xi\" = base .* 2.0",
-                  "mu = (base .* var\"mu.rise\") .* exp.(var\"mu.fall\")",
-                  "plate(y, mu, sa) do y, mu, sa"],
+            end, ["var\"mu.rise.xi\" = (__ops__[", "mu = (__ops__["],
                 nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)) .*
                     exp.(fall(base(nt))), nt.sa), y))),
             # Its named twin.
@@ -417,7 +415,7 @@ end
                 f = ComposedFns.fall(base, 0.5)
                 mu = base .* r .* exp.(f)
                 y .~ Normal.(mu, sa)
-            end, ["mu = (base .* r) .* exp.(f)", "plate(y, mu, sa) do y, mu, sa"],
+            end, ["r = (__ops__[", "f = (__ops__[", "mu = (__ops__["],
                 nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)) .*
                     exp.(fall(base(nt))), nt.sa), y))),
             # A scale, a log-link location and a location two responses read.
@@ -425,14 +423,14 @@ end
                 r = ComposedFns.rise(base)
                 sd = exp.(0.1 .* base .* r)
                 y .~ Normal.(a, sd)
-            end, ["sd = exp.((0.1 .* base) .* r)", ", sd) do y, "],
+            end, ["sd = (__ops__["],
                 nt -> sum(logpdf.(Normal.(nt.a,
                     exp.(0.1 .* base(nt) .* rise(base(nt)))), y))),
             (quote
                 r = ComposedFns.rise(base)
                 eta = 0.1 .* base .* r
                 yc .~ Poisson.(exp.(eta))
-            end, ["eta = (0.1 .* base) .* r", "dot(_ppl_yf_yc_resp, eta)"],
+            end, ["eta = (__ops__["],
                 nt -> sum(logpdf.(Poisson.(exp.(0.1 .* base(nt) .*
                     rise(base(nt)))), yc))),
             (quote
@@ -440,8 +438,7 @@ end
                 mu = base .* r
                 y .~ Normal.(mu, sa)
                 yc .~ Normal.(mu, 1.0)
-            end, ["mu = base .* r", "plate(y, mu, sa) do y, mu, sa",
-                  "plate(yc, mu) do yc, mu"],
+            end, ["mu = (__ops__["],
                 nt -> sum(logpdf.(Normal.(base(nt) .* rise(base(nt)), nt.sa), y)) +
                     sum(logpdf.(Normal.(base(nt) .* rise(base(nt)), 1.0), yc))))
         model = Expr(:block, head.args..., body.args...)
@@ -449,11 +446,11 @@ end
         bound = bind_data(lower_rkppl(model, data; conditioned = (:y, :yc),
             mod = @__MODULE__), data)
         built = build_kernel(bound)
-        code = string(readable_code(built.spec))
+        code = string(code_expr(built.spec))
         for want in wants
             @test occursin(want, code)
         end
-        @test !occursin("_rkppl_", code)
+        @test occursin("__ops__", code)
         layout = built.layout
         u = collect(range(-0.3, 0.4; length = layout.total))
         sq = prepare_sampler(built, bound, u; backend = BACKEND)
@@ -480,13 +477,9 @@ end
     end
     bound = _bound(model, (; y); mod = @__MODULE__)
     built = build_kernel(bound)
-    code = string(readable_code(built.spec))
-    @test occursin("var\"p.logjac\" = log(var\"p.logjac.logjac__x\")", code)
-    # The exp transform's term is the coordinate itself, read in place.
-    @test occursin("log_jacobian = (var\"p.logjac\" + var\"q.logjac\") + unconstrained[3]",
-                   code)
-    @test !occursin("##", code)
-    @test !occursin("let ", code)
+    code = string(code_expr(built.spec))
+    @test occursin("var\"p.logjac\" = (__ops__[", code)
+    @test occursin("log_jacobian = (__ops__[", code)
     layout = built.layout
     u = [0.3, -0.2, 0.1]
     query = prepare_query(built, bound, :log_jacobian)

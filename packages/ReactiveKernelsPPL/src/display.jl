@@ -1,7 +1,7 @@
-# Model display for an existing build. Every view reads values the caller
-# already holds — the `build_kernel` result and, optionally, the bound program
-# and a prepared query — so displaying a model never lowers, binds, builds,
-# prepares or evaluates it again.
+# Model display for an existing build. The code pane lowers the stored spec to
+# obtain its actual planned expression; bound and prepared panes read the
+# expressions the caller supplies. Display does not bind, build, prepare or
+# evaluate the model again.
 
 """
     RKPPLModelView
@@ -10,14 +10,16 @@ Separate views of one built `@rkppl` program, returned by [`model_view`](@ref):
 
 - `inputs` / `outputs`: the kernel's HAVE inputs and WANT outputs;
 - `coordinates`: the packed sampler coordinates, `coordinate_names(layout)`;
-- `code`: the built ReactiveKernels program, `readable_code(spec)` — every
-  operation, including composed child kernels, shown by its authored source;
+- `code`: the planned ReactiveKernels expression, `code_expr(spec)`;
 - `graph`: the structural graph, `kernel_graph(spec)`; its text display lists
   values and recipes with plate and scan bodies nested, and its HTML display is
   the interactive DAG;
-- `source`: the generated pre-build `@kernel` program
+- `source`: the generated pre-build kernel definition
   `kernel_expr(bound, layout)`, or `nothing` when no bound program was given;
-- `prepared`: the readable prepared program of a supplied query, or `nothing`.
+- `prepared`: the exact expression of a supplied prepared query, or `nothing`.
+
+Code expressions are printed without display rewrites. Only line-number nodes
+are removed from a copy for presentation.
 
 `show` renders the views as labeled sections in plain text or HTML.
 """
@@ -27,10 +29,10 @@ struct RKPPLModelView
     inputs::Vector{Symbol}
     outputs::Vector{Symbol}
     coordinates::Vector{Symbol}
-    code::ReadableCode
+    code::Expr
     graph::ReactiveKernels.Graph
-    source::Union{Nothing,ReadableCode}
-    prepared::Union{Nothing,ReadableCode}
+    source::Union{Nothing,Expr}
+    prepared::Union{Nothing,Expr}
 end
 
 """
@@ -43,38 +45,39 @@ retains as `backend.model`. The built program, structural graph and coordinates
 need nothing else.
 
 Pass `bound`, the bound `StructuralPlan` that was built, to add the generated
-pre-build `@kernel` program, and `query`, a kernel returned by
+pre-build kernel definition, and `query`, a kernel returned by
 [`prepare_query`](@ref) or a [`SamplerQuery`](@ref), to add its prepared
 program (with its bound data folded in as literals). These values are only
-read; the model is not lowered, bound, built, prepared or evaluated again.
+read; the model is not bound, built, prepared or evaluated again. The code
+pane lowers the stored spec to obtain its planned expression.
 """
 model_view(built::NamedTuple; kwargs...) = model_view(built.spec, built.layout; kwargs...)
 
 function model_view(spec::KernelSpec, layout::LayoutTable;
                     bound = nothing, query = nothing)
     RKPPLModelView(spec, layout, copy(spec.have_names), copy(spec.want_names),
-        coordinate_names(layout), readable_code(spec), kernel_graph(spec),
+        coordinate_names(layout), _model_visible_expr(code_expr(spec)), kernel_graph(spec),
         _model_source(bound, layout), _model_prepared(query))
 end
 
+_model_visible_expr(expr::Expr) = Base.remove_linenums!(deepcopy(expr))
+
 _model_source(::Nothing, layout) = nothing
 function _model_source(bound::StructuralPlan, layout::LayoutTable)
-    def = kernel_expr(bound, layout)
-    readable_code(Expr(:macrocall, Symbol("@kernel"), nothing, def);
-                  modules = (PPLGeneratedModels,))
+    _model_visible_expr(kernel_expr(bound, layout))
 end
 _model_source(bound, layout) = throw(ArgumentError(
     "model_view: `bound` must be the bound StructuralPlan that was built; got $(typeof(bound))"))
 
 _model_prepared(::Nothing) = nothing
 _model_prepared(query::SamplerQuery) = _model_prepared(query.kernel)
-_model_prepared(query) = readable_code(query)
+_model_prepared(query) = _model_visible_expr(code_expr(query))
 
 const _MODEL_VIEW_SECTIONS = (
-    (:code, "Built ReactiveKernels program", "readable_code(spec)"),
+    (:code, "Planned ReactiveKernels program", "code_expr(spec)"),
     (:graph, "Structural graph", "kernel_graph(spec)"),
-    (:source, "Generated pre-build @kernel program", "kernel_expr(bound, layout)"),
-    (:prepared, "Prepared query program", "readable_code(query)"),
+    (:source, "Generated pre-build kernel definition", "kernel_expr(bound, layout)"),
+    (:prepared, "Prepared query program", "code_expr(query)"),
 )
 
 _joined(names) = isempty(names) ? "(none)" : join(string.(names), ", ")
@@ -100,7 +103,8 @@ function Base.show(io::IO, mime::MIME"text/plain", view::RKPPLModelView)
                 "(not shown: pass `bound`, the bound program that was built)" :
                 "(not shown: pass `query`, a prepared query)")
         else
-            show(io, mime, content)
+            field === :graph ? show(io, mime, content) :
+                print(IOContext(io, :limit => false), content)
         end
     end
 end
@@ -119,7 +123,9 @@ function Base.show(io::IO, mime::MIME"text/html", view::RKPPLModelView)
             print(io, "<pre class=\"rk-graph-listing\">",
                   esc(sprint(show, MIME"text/plain"(), content)), "</pre>")
         else
-            show(io, mime, content)
+            print(io, "<pre><code class=\"language-julia\">",
+                  esc(sprint(print, content; context = :limit => false)),
+                  "</code></pre>")
         end
         print(io, "</details>")
     end

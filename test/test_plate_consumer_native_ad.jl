@@ -68,10 +68,18 @@ end
     # Both response lengths may change without duplicating either loop body.
     # Each plate's shared `s > 0` guard is decided once per call, so each plate
     # has one cell loop per arm.
-    small = string(readable_code(prepare(guarded_gamma_plates; bound=(; y1, y2))))
-    large = string(readable_code(prepare(guarded_gamma_plates;
-        bound=(; y1=repeat(y1, 7), y2=repeat(y2, 5)))))
-    loops(code) = length(collect(eachmatch(r"(?m)^\s*for ", code)))
+    function generated_code_tree(kernel)
+        parts = String[string(code_expr(kernel))]
+        for op in kernel.ops
+            op isa ReactiveKernels._AuthoredPlateOp || continue
+            append!(parts, generated_code_tree(op.kernel))
+        end
+        parts
+    end
+    small = generated_code_tree(prepare(guarded_gamma_plates; bound=(; y1, y2)))
+    large = generated_code_tree(prepare(guarded_gamma_plates;
+        bound=(; y1=repeat(y1, 7), y2=repeat(y2, 5))))
+    loops(parts) = sum(length(collect(eachmatch(r"(?m)^\s*for ", code))) for code in parts)
     @test loops(small) == loops(large) == 4
 end
 
@@ -281,7 +289,7 @@ untyped_domain_loop(xs, s) = sum(x -> (x * s + log(s))^2, xs; init = 0.0)
     # computed above the loop.
     for xs in ([0.25, -1.0, 2.0], 1:4, (0.5, 1.5), M)
         bound = prepare(untyped_domain_cells; bound = (; xs))
-        code = string(readable_code(bound))
+        code = string(code_expr(bound))
         @test !occursin("_authored_plate_is_axis(xs)", code)
         @test !occursin("_authored_plate_marker", code)
         value, gradient = ad_value_and_gradient(

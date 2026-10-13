@@ -38,7 +38,7 @@ end
     calls[] = 0
     q = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
     @test calls[] == columns.subject_count
-    @test !occursin("counted_findall", string(readable_code(q.kernel)))
+    @test !occursin("counted_findall", string(code_expr(q.kernel)))
 
     selected = [1, 4, 3, 6, 1, 3]
     normal_logpdf(x, m, s) = -0.5 * ((x - m) / s)^2 - log(s) - 0.5 * log(2pi)
@@ -126,7 +126,7 @@ end
     calls[] = 0
     q = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
     @test calls[] == scan_columns.subject_count
-    code = string(readable_code(q.kernel))
+    code = string(code_expr(q.kernel))
     @test !occursin("counted_findall", code)
     @test occursin("bound_plate_observation_operations", code)
     h = 1e-6

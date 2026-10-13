@@ -13,7 +13,7 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
     RK = ReactiveKernels
     caches(p) = filter(r -> r.op isa RK._BoundConstant &&
         startswith(String(only(r.outputs).name), "bound_plate_"), p.recipes)
-    readable(k) = sprint(show, MIME"text/plain"(), readable_code(k))
+    actual_code(k) = sprint(print, Base.remove_linenums!(deepcopy(code_expr(k))))
     gradient(f, q, data...) =
         Enzyme.gradient(Enzyme.Reverse, Const(f), q, map(Const, data)...)[1]
 
@@ -62,7 +62,7 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
             @test bound(2 .* q) == doubled
             @test C.calls[] == length(y)             # never per evaluation
             @test only(caches(bound.plan)).op.value == log.(y .+ 1.0)
-            @test !occursin("counted_term", readable(bound))
+            @test !occursin("counted_term", actual_code(bound))
             @test gradient(bound, q) == gradient(plain, q, y)
         end
     end
@@ -135,7 +135,7 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
             @test bound(-3 .* q) == doubled
             @test C.calls[] == length(y)
             @test gradient(bound, q) == gradient(plain, q, y)
-            @test !occursin("counted_term", readable(bound))
+            @test !occursin("counted_term", actual_code(bound))
         end
     end
 

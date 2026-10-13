@@ -497,7 +497,7 @@ lane. Each cell computes only `yi * li - ni * log1pexp(li)` and adds it. With
   order, so values and derivatives are unchanged; nothing is reassociated or
   simplified.
 
-`readable_code` shows a cached part as `bound_plate_<name>` in a cell, or as a
+`code_expr` contains a cached part as `bound_plate_<name>` in a cell, or as a
 hoisted constant at top level, and the remaining recipe reading it by name.
 
 ### 5. Composition

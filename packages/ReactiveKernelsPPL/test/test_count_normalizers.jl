@@ -22,7 +22,7 @@ const _CN_Y = [0, 5, 0, 2, 6, 1, 3, 1]
 const _CN_W = [1.0, 0.5, 2.0, 1.0, 1.5, 1.0, 0.25, 3.0]
 
 _cn_source(f) = string(kernel_expr(f.plan, f.built.layout))
-_cn_prepared(f) = sprint(show, MIME"text/plain"(), readable_code(f.kernel))
+_cn_prepared(f) = sprint(print, Base.remove_linenums!(deepcopy(code_expr(f.kernel))))
 function _cn_folded(f, name)
     slot = match(Regex("\\b$(name) = \\(__ops__\\[(\\d+)\\]\\)\\(\\)"), _cn_prepared(f))
     slot !== nothing &&

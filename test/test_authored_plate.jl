@@ -1551,7 +1551,16 @@ end
     end
     return sum(pointwise)
 end
-_unguarded(kernel) = (code = string(readable_code(kernel));
+function _generated_code_text(kernel)
+    parts = String[string(code_expr(kernel))]
+    for op in kernel.ops
+        (op isa ReactiveKernels._AuthoredPlateOp ||
+         op isa ReactiveKernels._AuthoredScanOp) || continue
+        push!(parts, _generated_code_text(op.kernel))
+    end
+    join(parts, "\n")
+end
+_unguarded(kernel) = (code = _generated_code_text(kernel);
     !occursin("_authored_plate_is_axis", code) && !occursin("plate_first", code) &&
     !occursin("plate_previous", code))
 # The generated body with gensym counters and the argument line removed: a
@@ -1600,9 +1609,9 @@ _lowered_body(kernel) = [replace(line, r"#\d+" => "#")
     scale_guard = "_authored_plate_is_axis(scale)"
     matrix = prepare(_bound_class_matrix; bound = (; scale))
     declared = prepare(_declared_class_matrix)
-    @test !occursin(scale_guard, string(readable_code(matrix)))
-    @test !occursin(scale_guard, string(readable_code(declared)))
-    @test occursin(scale_guard, string(readable_code(prepare(_bound_class_matrix))))
+    @test !occursin(scale_guard, _generated_code_text(matrix))
+    @test !occursin(scale_guard, _generated_code_text(declared))
+    @test occursin(scale_guard, _generated_code_text(prepare(_bound_class_matrix)))
     @test matrix(x) ≈ declared(x, scale) ≈ sum(x .* (log.(scale) .+ 0.0625))
 
     # One compiled residual per class through a cache.

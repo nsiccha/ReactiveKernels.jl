@@ -167,19 +167,14 @@ isdefined(@__MODULE__, :BranchPartition) ||
     @testset "partitioned code display keeps the executed slots" begin
         for want in (:total, :pointwise)
             bound = prepare(C.guarded; have = (:x, :y), want, bound = (; y))
-            code = readable_code(bound)
-            @test code.expr == Base.remove_linenums!(deepcopy(code_expr(bound)))
-            @test code.operations === bound.ops
+            code = code_expr(bound)
+            @test code === bound.ast
             @test occursin("__ops__", string(code))
             @test !occursin("yi > 0", string(code))
-            @test occursin("BranchPartition.counted_log", string(code))
-            @test occursin(" - 1.0", string(code))
             for recipe in plates(bound.plan)
                 inner = recipe.op.kernel
-                inner_code = readable_code(inner)
-                @test inner_code.expr ==
-                      Base.remove_linenums!(deepcopy(code_expr(inner)))
-                @test inner_code.operations === inner.ops
+                inner_code = code_expr(inner)
+                @test inner_code === inner.ast
                 @test !occursin("yi > 0", string(inner_code))
             end
             expected = want === :total ? reference_guarded(x, y) :

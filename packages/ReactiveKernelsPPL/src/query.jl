@@ -149,7 +149,8 @@ function _check_built_program(built, plan::StructuralPlan)
 end
 
 function _program_difference(built::Expr, other::Expr)
-    text(x) = x === nothing ? "(absent)" : sprint(print, readable_code(x))
+    text(x) = x === nothing ? "(absent)" :
+        sprint(print, Base.remove_linenums!(deepcopy(x)))
     sig(def) = def.args[1]
     sig(built) == sig(other) || return "in the data arguments:\n  built: " *
         text(sig(built)) * "\n  this:  " * text(sig(other))

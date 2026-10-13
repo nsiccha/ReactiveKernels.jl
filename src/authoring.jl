@@ -1616,7 +1616,7 @@ end
 # A child kernel prepared once when its caller is defined and applied where
 # the splicer cannot reach (a lazy arm or a closure), in place of the runtime
 # `(spec::KernelSpec)(args...)` that prepares it on every call. `name` is the
-# authored callee, shown by `readable_code`.
+# authored callee, present in `code_expr`.
 struct _KernelPreparedChild{K}
     name::Symbol
     kernel::K

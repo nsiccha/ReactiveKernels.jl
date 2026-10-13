@@ -97,7 +97,6 @@ export PartialFunction, partial
 export prepare_transpiled, initial_transpiled_state, transpiled_endpoint
 export DAGVisualization, visualize, dot_source, save_visualization
 export recipe_kind, recipe_inventory
-export ReadableCode, readable_code
 # Reactive layer
 export ReactiveState, set!, get!, freeze!, unfreeze!, checkpoint, materialize!
 export ReactiveProgram, CompiledReactiveState, ReactiveValue
