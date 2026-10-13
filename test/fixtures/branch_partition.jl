@@ -30,6 +30,21 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# Two split plates in sequence: the first's values, reassembled in lane order,
+# are gathered onto the second's arms. The `sqrt` arm is invalid off its lanes.
+@kernel chained_arms(mu::Vector{Float64}, x::Vector{Float64}, y::Vector{Float64},
+                     obs::Vector{Bool}) = begin
+    loc = plate(mu, x, obs) do mi, xi, oi
+        l::Float64 = oi ? mi + sqrt(xi) : 0.0
+        l
+    end
+    pointwise = plate(loc, y, obs) do li, yi, oi
+        c::Float64 = oi ? -0.5 * (yi - li)^2 : 0.0
+        c
+    end
+    total::Float64 = sum(pointwise)
+end
+
 # A bound-only condition computed in the cell first (a cached frontier).
 @kernel derived_condition(x::Vector{Float64}, y::Vector{Float64}) = begin
     pointwise = plate(x, y) do xi, yi

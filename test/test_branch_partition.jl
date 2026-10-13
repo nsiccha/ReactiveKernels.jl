@@ -85,6 +85,24 @@ isdefined(@__MODULE__, :BranchPartition) ||
                       for (l, wi) in zip(level, w)]
     end
 
+    @testset "reverse through a reassembled plate gathered by a second split plate" begin
+        mu = [0.3, -0.1, 0.2, 0.05, 0.7]
+        xc = [0.2, -1.0, 0.5, 1.5, -0.3]
+        yc = [0.1, 0.0, 0.4, -0.2, 0.0]
+        obs = [true, false, true, true, false]
+        ref(mu) = sum(o ? -0.5 * (yi - (m + sqrt(xi)))^2 : 0.0
+                      for (m, xi, yi, o) in zip(mu, xc, yc, obs))
+        bound = prepare(C.chained_arms; bound = (; x = xc, y = yc, obs))
+        @test length(plates(bound.plan)) == 4
+        @test count(op -> op isa RK._LaneAssemble, bound.ops) == 1
+        @test bound(mu) ≈ ref(mu)
+        pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), mu; active = :mu)
+        value, grad = RK.ad_value_and_gradient!(pb, similar(mu), mu)
+        @test value ≈ ref(mu)
+        @test grad ≈ [o ? yi - (m + sqrt(xi)) : 0.0
+                      for (m, xi, yi, o) in zip(mu, xc, yc, obs)]
+    end
+
     @testset "a bound-only cell condition partitions after caching" begin
         yv = [2.0, 0.5, 1.0, 3.0, 0.1]
         xv = [1.5, 2.5, 3.5, 0.5, 1.0]
