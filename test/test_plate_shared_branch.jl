@@ -87,7 +87,7 @@ _reference_normal(y, mu, sigma) =
 
 function _program(k)
     names = Dict{String,String}()
-    replace(string(readable_code(k)),
+    replace(string(ReactiveKernels._readable_expr(code_expr(k), k)),
             r"var\"[^\"]*\"" => m -> get!(names, m, "v$(length(names) + 1)"))
 end
 

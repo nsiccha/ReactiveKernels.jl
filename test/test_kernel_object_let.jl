@@ -76,10 +76,10 @@ end
     @test ReactiveKernels.kernel_endpoint_names(inflated_let) == (:logkernel,)
     @test ReactiveKernels.kernel_endpoint_names(let_scopes) ==
           (:sequential, :shadowed, :statement, :sibling, :shadowed_endpoint)
-    @test occursin("let nl1pe",
-                   string(readable_code(prepare(inflated_let.logkernel))))
-
     endpoint_let = prepare(inflated_let.logkernel)
+    @test occursin("let nl1pe",
+                   string(ReactiveKernels._readable_expr(
+                       code_expr(endpoint_let), endpoint_let)))
     endpoint_block = prepare(inflated_block.logkernel)
     for (n, logit, zi, observed) in ((8, -0.4, 0.3, 0), (8, 100.0, 0.3, 0),
                                      (8, 0.7, 0.2, 3), (8, -1.3, 0.6, 8))

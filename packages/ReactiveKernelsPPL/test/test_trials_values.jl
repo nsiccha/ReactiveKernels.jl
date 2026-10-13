@@ -126,6 +126,12 @@ end
         built = build_kernel(plan)
         (; plan, built, kernel = prepare_query(built, plan, :sampler))
     end
+    # The inline array product belongs to the predictor broadcast. There is
+    # no intermediate sampled-size vector between it and the scalar logit.
+    terms = only(p for p in fs[1].plan.predictors if p.name === :logit_p).terms
+    @test any(t -> t.kind === ComposedTerm &&
+        t.options.tree == :(sigma .* eps_raw), terms)
+    @test !any(a -> a.expr == :(sigma .* eps_raw), fs[1].plan.assignments)
     oracle = u -> begin
         omega, mean_p = logistic(u[1]), logistic(u[2])
         sigma = 5 * logistic(u[3])
@@ -139,6 +145,47 @@ end
     _tv_check(fs[1], oracle, u)
     @test _tv_value(fs[1], u) ≈ _tv_value(fs[2], u) rtol = 1e-13
     @test _tv_gradient(fs[1], u)[2] ≈ _tv_gradient(fs[2], u)[2] rtol = 1e-12
+end
+
+@testset "anonymous array predictor keeps broadcast axes" begin
+    m = @rkppl begin
+        a ~ Normal(0, 1)
+        s ~ Normal(0, 1)
+        z[axes(x, 1)] .~ Normal.(0, 1)
+        eta = a .+ s .* z
+        y .~ Normal.(eta, 1)
+    end
+    function density(x, y, u)
+        plan = m(; x) | (; y)
+        built = build_kernel(plan)
+        f = prepare_query(built, plan, :sampler)
+        return Base.invokelatest(f, u), f, plan
+    end
+    v, f, _ = density(Float64[], Float64[], [0.2, -0.3])
+    @test v ≈ logpdf(Normal(), 0.2) + logpdf(Normal(), -0.3)
+    ad = Base.invokelatest(prepare_ad, f,
+        AutoEnzyme(; mode = Enzyme.Reverse), [0.2, -0.3];
+        active = :unconstrained)
+    _, g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, ad,
+        zeros(2), [0.2, -0.3])
+    @test g ≈ [-0.2, 0.3]
+    v1, _, _ = density([0.0], [0.4, -0.2, 0.1], [0.2, -0.3, 0.1])
+    @test v1 ≈ sum(logpdf.(Normal.([0.17], 1), [0.4, -0.2, 0.1])) +
+        sum(logpdf.(Normal(), [0.2, -0.3, 0.1]))
+    @test_throws DimensionMismatch density([0.0, 0.0], [0.0, 0.0, 0.0],
+        [0.2, -0.3, 0.1, -0.1])
+    named = @rkppl begin
+        a ~ Normal(0, 1)
+        s ~ Normal(0, 1)
+        z[axes(x, 1)] .~ Normal.(0, 1)
+        v = s .* z
+        eta = a .+ v
+        y .~ Normal.(eta, 1)
+        y2 .~ Normal.(v, 1)
+    end
+    plan = named(; x = [0.0, 0.0]) | (; y = [0.4, -0.2], y2 = [0.1, 0.3])
+    @test any(a -> a.name === :v, plan.assignments) ||
+        any(d -> d.name === :v, plan.derived)
 end
 
 @testset "a definition reading only data supplies trials" begin
