@@ -116,6 +116,16 @@ _rename_arguments(x::Symbol, names) = get(names, x, x)
 _rename_arguments(ex::Expr, names) =
     Expr(ex.head, (_rename_arguments(arg, names) for arg in ex.args)...)
 
+function _display_capture_names!(renamed, x, captured)
+    if x isa Symbol
+        name = _source_argument(x)
+        name !== x && name in captured && (renamed[x] = name)
+    elseif x isa Expr && !(x.head in (:quote, :inert))
+        foreach(arg -> _display_capture_names!(renamed, arg, captured), x.args)
+    end
+    renamed
+end
+
 function _display_object(f::_KernelSourceFunction)
     f.runtime_f isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction ||
         return _opaque_object(f)
@@ -128,6 +138,12 @@ function _display_object(f::_KernelSourceFunction)
     # The retained body is `let <captured names> = getfield(env, :name); body end`.
     # Show each captured value through this same renderer.
     if body isa Expr && body.head === :let && f.captures isa NamedTuple
+        # The body may spell a capture as RuntimeGeneratedFunctions renamed it
+        # (`#name#2`); show it under the captured name its binding uses.
+        captured = Set(keys(f.captures))
+        renamed = Dict{Symbol,Symbol}()
+        _display_capture_names!(renamed, body.args[2], captured)
+        isempty(renamed) || (body = _rename_arguments(body, renamed))
         bindings = Any[Expr(:(=), name, _display_object(value))
                        for (name, value) in pairs(f.captures)]
         body = isempty(bindings) ? body.args[2] :
