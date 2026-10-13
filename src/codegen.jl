@@ -4749,6 +4749,44 @@ Base.@nospecializeinfer function _prepared_kernel(
                              lowered_recipes))::PreparedKernel
 end
 
+# A caller that guarantees execution through a latest-world entry may use the
+# authored closure directly. Ordinary prepare retains its world-age fallback.
+_kernel_latest_source(x) = x
+_kernel_latest_source(xs::Tuple) = map(_kernel_latest_source, xs)
+function _kernel_latest_source(f::_KernelSourceFunction{F,RF,C}) where {F,RF,C}
+    _KernelSourceFunction{F,RF,C,Val{:latest_world}}(
+        f.f, f.runtime_f, f.captures)
+end
+function _kernel_latest_source(op::_KernelSourceOp)
+    _KernelSourceOp(Val(kernel_sourceop_token(op)), Val(kernel_sourceop_form(op)),
+        _kernel_latest_source(op.f), _kernel_latest_source(op.tensor_f),
+        _kernel_latest_source(op.ignored_throws), op.call_identity)
+end
+function _kernel_latest_source(split::_KernelSplit)
+    _KernelSplit(Val(_kernel_split_spec(split)),
+        _kernel_latest_source(split.call),
+        map(_kernel_latest_source, split.wholes),
+        map(_kernel_latest_source, split.splits),
+        _kernel_latest_source(split.root))
+end
+function _kernel_latest_source(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
+    _KernelBranch(Val(CI), Val(TI), Val(EI),
+        _kernel_latest_source(branch.call),
+        _kernel_latest_source(branch.condition),
+        _kernel_latest_source(branch.then_arm),
+        _kernel_latest_source(branch.else_arm),
+        branch.then_spec, branch.else_spec)
+end
+function _kernel_latest_source(op::_AuthoredPlateOp{K,A}) where {K,A}
+    kernel = _kernel_latest_prepared(op.kernel)
+    _AuthoredPlateOp{typeof(kernel),A}(kernel, op.axis_checks)
+end
+function _kernel_latest_prepared(kernel::PreparedKernel)
+    _prepared_kernel(kernel.f, map(_kernel_latest_source, kernel.ops),
+        kernel.inputs, kernel.outputs, kernel.plan, kernel.ast,
+        kernel.lowered_recipes)
+end
+
 # A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
 # carry output `Type`s as data (authoring.jl `_kernel_provenance_key`), and
 # ReactantCore's `::Type` `is_traced` early-out covers only the 1-arg call

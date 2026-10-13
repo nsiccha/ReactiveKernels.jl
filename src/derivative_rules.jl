@@ -314,6 +314,16 @@ struct DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO} <
     staged_ops::SO
 end
 
+function _kernel_latest_rule(rule::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged}) where
+        {Name,N,Inputs,Primal,Forward,Reverse,Staged}
+    po = _kernel_latest_source(rule.primal_ops)
+    fo = _kernel_latest_source(rule.forward_ops)
+    ro = _kernel_latest_source(rule.reverse_ops)
+    so = _kernel_latest_source(rule.staged_ops)
+    DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,
+        typeof(po),typeof(fo),typeof(ro),typeof(so)}(po,fo,ro,so)
+end
+
 function Base.show(io::IO,
         ::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse}) where
         {Name,N,Inputs,Primal,Forward,Reverse}

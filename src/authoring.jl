@@ -3759,7 +3759,7 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     # leaf would add GC roots to the prepared callable's captured operation
     # table, obstructing ordinary reverse's read-only function analysis.
     runtime_f = RuntimeGeneratedFunctions.drop_expr(compile(qualified))
-    T = _KernelSourceFunction{typeof(f),typeof(runtime_f),typeof(captures)}
+    T = _KernelSourceFunction{typeof(f),typeof(runtime_f),typeof(captures),Val{:guarded}}
     _kernel_new_instance(T, (f, runtime_f, captures))::_KernelSourceFunction
 end
 
