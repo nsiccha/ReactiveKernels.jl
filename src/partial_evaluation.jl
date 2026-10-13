@@ -148,21 +148,359 @@ _partial_plate_cacheable(::Type) = false
 _partial_plate_cacheable(::Type{<:_PartialPlateScalar}) = true
 _partial_plate_cacheable(::Type{<:Array{<:_PartialPlateScalar}}) = true
 
-# A live array can make a singleton or previously absent dimension empty.
-# Such a domain must keep the original lazy per-cell execution: eager prefix
-# evaluation could otherwise throw for a cell that is never visited. A known
-# rank is safe only when bound non-singleton axes already fix each dimension
-# it can contribute. Atomic arguments never contribute axes. Only the rank
-# matters, so a declaration with an abstract element type (`AbstractVector`,
-# `AbstractVector{<:Real}`) qualifies like `Vector{Float64}` (snag
-# rk-declared-rank-317aa725: an element type bound outside the `<:` matched only
-# declarations with one element type).
+# A live array can make a singleton or previously absent dimension empty, so
+# the plate may visit fewer cells than its bound inputs span, or none: eager
+# prefix evaluation over the bound domain could throw for a cell that is never
+# visited. A known rank rules that out only when bound non-singleton axes
+# already fix each dimension it can contribute. Atomic arguments never
+# contribute axes. Only the rank matters, so a declaration with an abstract
+# element type (`AbstractVector`, `AbstractVector{<:Real}`) qualifies like
+# `Vector{Float64}` (snag rk-declared-rank-317aa725: an element type bound
+# outside the `<:` matched only declarations with one element type). Without
+# such a declaration the prefix still runs over the bound domain, and an
+# exception there keeps the original plate (`_partial_plate_recipe`).
 _partial_plate_live_domain(::Type, bound_axes) = false
 _partial_plate_live_domain(::Type{<:Number}, bound_axes) = true
 function _partial_plate_live_domain(::Type{<:AbstractArray{<:Any,N}},
                                     bound_axes) where {N}
     N isa Int && N <= length(bound_axes) &&
         all(d -> length(bound_axes[d]) > 1, 1:N)
+end
+
+# ---------------------------------------------------------------------------
+# Data-only parts of mixed cell recipes.
+#
+# A cell recipe that reads both bound data and a live value runs whole in every
+# cell. When its operation keeps split nodes (`_KernelSplit`, authoring.jl),
+# each maximal node whose arguments are all bound data becomes a recipe of its
+# own here, so the cache below evaluates it once per lane at preparation, like
+# any data-only recipe (todo `14jgmez`). The rest of the expression becomes
+# recipes only along the way to those nodes: a part that reads a live value and
+# holds no data-only node stays one recipe for its whole subexpression. Values
+# are unchanged: the parts apply the authored operations to the same operands
+# in the same order, and a node runs on exactly the lanes that evaluate its
+# expression.
+
+# The split metadata of recipe `r` and its decomposition recomputed from the
+# retained source, or `nothing`. The source supplies the parts' readable
+# recipes; a decomposition that does not match the metadata's shape is not
+# split.
+function _partial_split_parts(r::Recipe)
+    r.op isa _KernelSourceOp || return nothing
+    native, tensor = r.op.f, r.op.tensor_f
+    native isa _KernelSplit && tensor isa _KernelSplit || return nothing
+    shape = _kernel_split_spec(native)
+    _kernel_split_spec(tensor) == shape || return nothing
+    ports = collect(Symbol, first(shape))
+    length(ports) == length(r.inputs) || return nothing
+    split = _kernel_split_nodes(r.source, ports)
+    split === nothing || _kernel_split_shape(ports, split) == shape || return nothing
+    split === nothing ? nothing : (; native, tensor, split)
+end
+
+# Replace recipe `r` by the recipes of its parts, appended to `recipes`, with
+# their readable recipes in `readable`. `dataonly[i]` is whether node `i`
+# reads bound data only.
+function _partial_emit_split!(recipes::Vector{Recipe}, readable, g::Graph,
+                              r::Recipe, parts, dataonly::Vector{Bool}, fresh)
+    (; native, tensor, split) = parts
+    nodes = split.nodes
+    holds = copy(dataonly)
+    for (i, node) in enumerate(nodes)          # post-order: kids come first
+        holds[i] |= any(k -> holds[k], node.kids)
+    end
+    output = only(r.outputs)
+    token = kernel_sourceop_token(r.op)
+    function emit!(i)
+        node = nodes[i]
+        value = value!(g, Symbol(output.name, :_part, i), Any)
+        part = if dataonly[i] || !holds[i]
+            Recipe(fresh(), Tuple(r.inputs[p] for p in node.own), (value,),
+                   _KernelSourceOp(Val(Symbol(token, :_part, i)), Val(:fused),
+                                   native.wholes[i], tensor.wholes[i]),
+                   r.cost, nothing, false, node.expr)
+        else
+            kids = Value[emit!(k) for k in node.kids]
+            Recipe(fresh(), (Tuple(r.inputs[p] for p in node.direct)..., kids...),
+                   (value,),
+                   _KernelSourceOp(Val(Symbol(token, :_split, i)), Val(:fused),
+                                   native.splits[i], tensor.splits[i]),
+                   r.cost, nothing, false, node.body)
+        end
+        push!(recipes, part)
+        readable[part.id] = part
+        value
+    end
+    kids = Value[emit!(k) for k in split.root.kids]
+    root = Recipe(r.id, (Tuple(r.inputs[p] for p in split.root.direct)..., kids...),
+                  r.outputs,
+                  _KernelSourceOp(Val(Symbol(token, :_root)), Val(kernel_sourceop_form(r.op)),
+                                  native.root, tensor.root),
+                  r.cost, nothing, false, split.root.body)
+    push!(recipes, root)
+    readable[r.id] = root
+    recipes
+end
+
+"""
+    _partial_split_recipes(inner::Plan, bound, excluded, readable) -> Plan
+
+`inner` with each recipe that reads a live value but holds a split node whose
+arguments are all bound data (`bound`, or values computed from bound data
+alone) replaced by the recipes of its parts (`_partial_emit_split!`). Their
+readable recipes are added to `readable`, keyed by recipe id. New values live
+in a copy of the inner graph. Returns `inner` itself when nothing splits.
+"""
+function _partial_split_recipes(inner::Plan, bound::Set{Int}, excluded::Set{Int},
+                                readable)
+    g = inner.graph
+    dataonly = copy(bound)
+    recipes = Recipe[]
+    copied = nothing
+    next_id = Ref(minimum((r.id for r in inner.recipes); init = 0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
+    for r in inner.recipes
+        reads = Bool[canon_id(g, v.id) in dataonly for v in r.inputs]
+        if !(r.id in excluded) && all(reads)
+            foreach(v -> push!(dataonly, canon_id(g, v.id)), r.outputs)
+            push!(recipes, r)
+            continue
+        end
+        parts = r.id in excluded ? nothing : _partial_split_parts(r)
+        if parts === nothing
+            push!(recipes, r)
+            continue
+        end
+        nodedata = Bool[all(p -> reads[p], node.own) for node in parts.split.nodes]
+        if !any(nodedata)
+            push!(recipes, r)
+            continue
+        end
+        copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
+            copy(g.producers), copy(g.aliases), g.version))
+        _partial_emit_split!(recipes, readable, copied, r, parts, nodedata, fresh)
+    end
+    copied === nothing && return inner
+    template = Plan(copied, inner.have, inner.want, inner.recipes, inner.producer,
+                    inner.cost, inner.candidates)
+    _partial_subplan(template, inner.have, inner.want, recipes)
+end
+
+# ---------------------------------------------------------------------------
+# Speculative data-only parts of lazy branch arms.
+#
+# A cell recipe whose top-level branch condition reads a live value runs one
+# arm per cell, chosen at run time, so the split above leaves its arms whole.
+# A data-only node of an arm (a count likelihood's log normalizer behind a
+# validity check that also reads the parameters) can still be computed at
+# preparation for every lane, speculatively: it is pure, its value is read
+# only where the arm is taken, and a node whose computation throws on any lane
+# stays in its arm (`_partial_plate_recipe` retries without it), so
+# preparation never raises an error the original plate would not. The arm
+# itself stays lazy: the branch is rebuilt (`_KernelBranchCall`) with each
+# such arm reading its cached nodes (`_KernelSplitApply`) and computing
+# everything else exactly where the authored arm does. A branch whose
+# condition reads bound data only is left to the lane partition, after which
+# each arm is split without speculation.
+
+# The leaves of branch `(native, tensor)`, whose positions index the recipe's
+# inputs, each `(; path, positions, native, tensor, source)`, or `nothing`
+# when a nested branch does not take every argument in order.
+function _partial_branch_leaves!(leaves, native::_KernelBranch, tensor::_KernelBranch,
+                                 source, path, count)
+    CI, TI, EI = typeof(native).parameters[1:3]
+    Tuple(typeof(tensor).parameters[1:3]) == (CI, TI, EI) || return nothing
+    parts = source isa Expr ? _kernel_branch_parts(source) : nothing
+    parts === nothing && return nothing
+    for (side, positions, arm_source) in ((:then_arm, TI, parts[2]), (:else_arm, EI, parts[3]))
+        n, t = getfield(native, side), getfield(tensor, side)
+        if n isa _KernelBranch
+            t isa _KernelBranch && positions == Tuple(1:count) || return nothing
+            _partial_branch_leaves!(leaves, n, t, arm_source, (path..., side), count) ===
+                nothing && return nothing
+        else
+            push!(leaves, (; path = (path..., side), positions = collect(Int, positions),
+                             native = n, tensor = t, source = arm_source))
+        end
+    end
+    leaves
+end
+
+# The names of a rebuilt branch's arguments in its recipe's readable source.
+_branch_call_names(f) = nothing
+_branch_call_names(branch::_KernelBranch) = _branch_call_names(branch.call)
+_branch_call_names(::_KernelBranchCall{CI,TI,EI,Names}) where {CI,TI,EI,Names} =
+    collect(Symbol, Names)
+
+# The branch `(native, tensor)` with each leaf in `plans` reading its cached
+# nodes, appended as arguments `count + 1:count + added`. A leaf arm that is
+# not rebuilt keeps its graph (`then_spec`/`else_spec`), which the shared
+# branch lowering may splice; a rebuilt arm has none.
+function _partial_rebuild_branch(native::_KernelBranch, tensor::_KernelBranch, path,
+                                 plans, count, added, names)
+    CI, TI, EI = typeof(native).parameters[1:3]
+    all_positions = Tuple(1:(count + added))
+    spec_field(side) = side === :then_arm ? :then_spec : :else_spec
+    arm(side, positions) = begin
+        n, t = getfield(native, side), getfield(tensor, side)
+        key = (path..., side)
+        if n isa _KernelBranch
+            (_partial_rebuild_branch(n, t, key, plans, count, added, names)...,
+             all_positions, nothing, nothing)
+        elseif haskey(plans, key)
+            plan = plans[key]
+            (_KernelSplitApply(Val(plan.plan), n), _KernelSplitApply(Val(plan.plan), t),
+             (positions..., (count .+ plan.slots)...), nothing, nothing)
+        else
+            (n, t, positions, getfield(native, spec_field(side)),
+             getfield(tensor, spec_field(side)))
+        end
+    end
+    tn, tt, TI2, tns, tts = arm(:then_arm, TI)
+    en, et, EI2, ens, ets = arm(:else_arm, EI)
+    built(condition, then_arm, else_arm, then_spec, else_spec) =
+        _KernelBranch(Val(CI), Val(TI2), Val(EI2),
+            _KernelBranchCall(Val(CI), Val(TI2), Val(EI2), Val(names), condition,
+                              then_arm, else_arm),
+            condition, then_arm, else_arm, then_spec, else_spec)
+    built(native.condition, tn, en, tns, ens), built(tensor.condition, tt, et, tts, ets)
+end
+
+"""
+    _partial_speculate_recipes(inner::Plan, bound, excluded, readable, refused)
+        -> (Plan, speculative)
+
+`inner` with each recipe whose top-level branch condition reads a live value,
+and one of whose arms holds a data-only split node, rebuilt to read those
+nodes from recipes of their own (see above). `speculative` maps each such
+node recipe's id to its key `(recipe id, arm path, node)`; nodes whose key is
+in `refused` are not split out. Returns `inner` itself when nothing changes.
+"""
+function _partial_speculate_recipes(inner::Plan, bound::Set{Int}, excluded::Set{Int},
+                                    readable, refused)
+    g = inner.graph
+    dataonly = copy(bound)
+    recipes = Recipe[]
+    speculative = Dict{Int,Any}()
+    copied = nothing
+    next_id = Ref(minimum((r.id for r in inner.recipes); init = 0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
+    for r in inner.recipes
+        reads = Bool[canon_id(g, v.id) in dataonly for v in r.inputs]
+        if !(r.id in excluded) && all(reads)
+            foreach(v -> push!(dataonly, canon_id(g, v.id)), r.outputs)
+            push!(recipes, r)
+            continue
+        end
+        rebuilt = r.id in excluded ? nothing :
+            _partial_speculate_recipe(r, reads, refused)
+        if rebuilt === nothing
+            push!(recipes, r)
+            continue
+        end
+        copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
+            copy(g.producers), copy(g.aliases), g.version))
+        values = Value[]
+        for node in rebuilt.nodes
+            value = value!(copied, Symbol(only(r.outputs).name, :_arm_part, length(values) + 1),
+                           Any)
+            part = Recipe(fresh(), Tuple(r.inputs[p] for p in node.inputs), (value,),
+                          _KernelSourceOp(Val(Symbol(kernel_sourceop_token(r.op), :_arm,
+                                                     length(values) + 1)),
+                                          Val(:fused), node.native, node.tensor),
+                          r.cost, nothing, false, node.source)
+            push!(recipes, part)
+            readable[part.id] = part
+            speculative[part.id] = node.key
+            push!(values, value)
+        end
+        root = Recipe(r.id, (r.inputs..., values...), r.outputs, rebuilt.op, r.cost,
+                      nothing, false, rebuilt.source)
+        push!(recipes, root)
+        readable[r.id] = root
+    end
+    copied === nothing && return inner, speculative
+    template = Plan(copied, inner.have, inner.want, inner.recipes, inner.producer,
+                    inner.cost, inner.candidates)
+    _partial_subplan(template, inner.have, inner.want, recipes), speculative
+end
+
+# Recipe `r` rebuilt around the speculative nodes of its branch arms, given
+# which of its inputs read bound data only (`reads`), or `nothing`.
+function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused)
+    r.op isa _KernelSourceOp || return nothing
+    native, tensor = r.op.f, r.op.tensor_f
+    native isa _KernelBranch && tensor isa _KernelBranch || return nothing
+    count = length(r.inputs)
+    # A branch on bound data is the lane partition's.
+    CI = typeof(native).parameters[1]
+    all(i -> reads[i], CI) && return nothing
+    leaves = _partial_branch_leaves!(Any[], native, tensor, r.source, (), count)
+    leaves === nothing && return nothing
+    names = _recipe_source_names(r)
+    length(names) == count || return nothing
+    nodes = Any[]
+    plans = Dict{Any,Any}()
+    mapping = IdDict{Any,Symbol}()
+    for leaf in leaves
+        parts = _partial_split_leaf(leaf.native, leaf.tensor, leaf.source, length(leaf.positions))
+        parts === nothing && continue
+        split = parts.split
+        arm_reads(own) = all(p -> reads[leaf.positions[p]], own)
+        # The arm reads bound data only: no live value to split it from.
+        arm_reads(split.root.direct) && all(k -> arm_reads(split.nodes[k].own), split.root.kids) &&
+            continue
+        dataonly = Bool[arm_reads(node.own) for node in split.nodes]
+        parent = zeros(Int, length(split.nodes))
+        for (i, node) in enumerate(split.nodes), k in node.kids
+            parent[k] = i
+        end
+        chosen = Int[i for i in eachindex(split.nodes)
+                     if dataonly[i] && (parent[i] == 0 || !dataonly[parent[i]]) &&
+                        !((r.id, leaf.path, i) in refused)]
+        isempty(chosen) && continue
+        holds = Bool[i in chosen for i in eachindex(split.nodes)]
+        for (i, node) in enumerate(split.nodes)          # post-order
+            holds[i] |= any(k -> holds[k], node.kids)
+        end
+        slots = Int[]
+        slot = Dict{Int,Int}()
+        for i in chosen
+            node = split.nodes[i]
+            name = _kernel_split_placeholder(count + length(nodes) + 1)
+            mapping[node.expr] = name
+            push!(names, name)
+            push!(nodes, (; inputs = leaf.positions[node.own], native = parts.native.wholes[i],
+                            tensor = parts.tensor.wholes[i], source = node.expr,
+                            key = (r.id, leaf.path, i)))
+            push!(slots, length(nodes))
+            slot[i] = length(slots)
+        end
+        plan(k) = k in chosen ? (:value, slot[k]) :
+            holds[k] ? (:split, k, Tuple(plan(c) for c in split.nodes[k].kids)) :
+            (:whole, k)
+        plans[leaf.path] = (; plan = Tuple(plan(k) for k in split.root.kids), slots)
+    end
+    isempty(nodes) && return nothing
+    native2, tensor2 = _partial_rebuild_branch(native, tensor, (), plans, count,
+                                               length(nodes), Tuple(names))
+    op = _KernelSourceOp(Val(Symbol(kernel_sourceop_token(r.op), :_speculative)),
+                         Val(kernel_sourceop_form(r.op)), native2, tensor2)
+    (; nodes, op, source = _kernel_split_replace(r.source, mapping))
+end
+
+# The split metadata of one arm and its decomposition from the arm's source,
+# or `nothing` (as `_partial_split_parts` for a whole recipe).
+function _partial_split_leaf(native, tensor, source, count)
+    native isa _KernelSplit && tensor isa _KernelSplit || return nothing
+    shape = _kernel_split_spec(native)
+    _kernel_split_spec(tensor) == shape || return nothing
+    ports = collect(Symbol, first(shape))
+    length(ports) == count || return nothing
+    split = _kernel_split_nodes(source, ports)
+    split === nothing && return nothing
+    _kernel_split_shape(ports, split) == shape || return nothing
+    (; native, tensor, split)
 end
 
 _partial_plate_recipe(g, recipe, known, op) = nothing
@@ -198,7 +536,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
 
     bound = Set{Int}()
     arguments = Dict{Int,Any}()
-    types = Dict{Int,Any}()
+    cell_types = Dict{Int,Any}()
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
         cid = canon_id(g, outer.id)
         haskey(known, cid) || continue
@@ -207,7 +545,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         cid = canon_id(inner.graph, input.id)
         push!(bound, cid)
         arguments[cid] = index in atomic_inputs ? Ref(data) : data
-        types[cid] = index in atomic_inputs || data isa Number ?
+        cell_types[cid] = index in atomic_inputs || data isa Number ?
             typeof(data) : eltype(data)
     end
     # Nullary inner recipes can form a prefix even when this plate has no
@@ -222,13 +560,24 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         index in atomic_inputs || haskey(known, canon_id(g, input.id)) ||
             _partial_plate_live_domain(valtype(input), bound_axes)
     end
-    fixed_domain || return nothing
     # No possible batched axis: preserve the ordinary rejection.
     isempty(bound_axes) && return nothing
 
+    original_readable = Dict{Int,Any}(r.id => source for (r, source) in
+                                      zip(inner.recipes, op.kernel.lowered_recipes))
+    original, original_excluded = inner, copy(excluded)
+    original_arguments, bound_types = copy(arguments), cell_types
+    # Speculative arm nodes whose evaluation threw; each attempt splits
+    # without them.
+    refused = Set{Any}()
+    local readable, residual, frontier, selected, whole, want_id, want_cached
+    while true
+    readable, excluded = copy(original_readable), copy(original_excluded)
+    arguments = copy(original_arguments)
+    inner = _partial_split_recipes(original, bound, excluded, readable)
+    inner, speculative = _partial_speculate_recipes(inner, bound, excluded, readable,
+                                                    refused)
     have_ids = Set(canon_id(inner.graph, v.id) for v in inner.have)
-    bound_types = types
-    local residual, frontier, selected
     while true
         prefix, residual, owned = _partial_split(inner, bound, excluded)
         isempty(prefix) && return nothing
@@ -255,12 +604,12 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         # cross the cache boundary. A cached array is a bind-time constant
         # shared by every later evaluation, read-only to the pure residual like
         # any top-level hoisted value or bound array.
-        types = copy(bound_types)
+        cell_types = copy(bound_types)
         for r in selected
             T = Base.promote_op(r.op,
-                (types[canon_id(inner.graph, v.id)] for v in r.inputs)...)
+                (cell_types[canon_id(inner.graph, v.id)] for v in r.inputs)...)
             isconcretetype(T) || return nothing
-            types[canon_id(inner.graph, only(r.outputs).id)] = T
+            cell_types[canon_id(inner.graph, only(r.outputs).id)] = T
         end
         # A frontier value the cache cannot hold (a tuple, struct, view or
         # range, such as a static-vector scan seed) keeps its producer in the
@@ -270,7 +619,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         uncached = Int[]
         for r in selected
             cid = canon_id(inner.graph, only(r.outputs).id)
-            cid in frontier_ids && !_partial_plate_cacheable(types[cid]) &&
+            cid in frontier_ids && !_partial_plate_cacheable(cell_types[cid]) &&
                 push!(uncached, r.id)
         end
         isempty(uncached) && break
@@ -295,23 +644,46 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         all(enumerate(recipe.inputs)) do (index, input)
             index in atomic_inputs || haskey(known, canon_id(g, input.id))
         end
-    want_cached && !whole && types[want_id] <: AbstractArray && return nothing
-    for r in selected
-        args = Tuple(arguments[canon_id(inner.graph, v.id)] for v in r.inputs)
-        batch = Base.Broadcast.instantiate(Base.broadcasted(r.op, args...))
-        cid = canon_id(inner.graph, only(r.outputs).id)
-        if isempty(axes(batch))
-            arguments[cid] = Ref(batch[CartesianIndex()])
-        else
-            # Preserve the broadcast container and concrete element type. Bool
-            # results may use packed BitArrays; bound-array externalization also
-            # supports these at the tensor boundary.
-            result = similar(batch, types[cid])
-            for index in CartesianIndices(axes(batch))
-                result[index] = batch[index]
+    want_cached && !whole && cell_types[want_id] <: AbstractArray && return nothing
+    current = 0
+    try
+        for r in selected
+            current = r.id
+            args = Tuple(arguments[canon_id(inner.graph, v.id)] for v in r.inputs)
+            batch = Base.Broadcast.instantiate(Base.broadcasted(r.op, args...))
+            cid = canon_id(inner.graph, only(r.outputs).id)
+            if isempty(axes(batch))
+                arguments[cid] = Ref(batch[CartesianIndex()])
+            else
+                # Preserve the broadcast container and concrete element type.
+                # Bool results may use packed BitArrays; bound-array
+                # externalization also supports these at the tensor boundary.
+                result = similar(batch, cell_types[cid])
+                for index in CartesianIndices(axes(batch))
+                    result[index] = batch[index]
+                end
+                arguments[cid] = result
             end
-            arguments[cid] = result
         end
+    catch err
+        err isa InterruptException && rethrow()
+        # A speculative arm node runs on lanes whose arm may never be taken:
+        # it stays in its arm.
+        if haskey(speculative, current)
+            push!(refused, speculative[current])
+            continue
+        end
+        # A live input whose declaration does not fix its rank can leave the
+        # plate fewer cells than the bound domain, or none (see
+        # `_partial_plate_live_domain`), so this exception need not occur in
+        # any evaluation of the original plate: keep that plate. Its cached
+        # values would otherwise serve every cell it does visit, since they
+        # vary only along bound axes. A rank-fixed domain visits exactly
+        # these cells, and the exception surfaces here as before.
+        fixed_domain && rethrow()
+        return nothing
+    end
+    break
     end
 
     # A whole-plate value is computed by the same plate over its bound inputs
@@ -336,8 +708,6 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                                   inner.want, residual)
     kernel = _prepare(scalar_plan,
         _lower_with_ops(scalar_plan; inline_embedded = false)...)
-    readable = Dict(r.id => source for (r, source) in
-                    zip(inner.recipes, op.kernel.lowered_recipes))
     kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
         kernel.plan, kernel.ast, Tuple(readable[r.id] for r in residual))
     axis_checks = Tuple(Tuple(position[index] for index in group)
@@ -589,9 +959,15 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         end
         arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
                                  arm_f, arm_tf)
+        # The arm recipe's source is its own arm, which a nested branch arm
+        # partitions again and a split arm decomposes.
+        branch_parts = branch_recipe.source isa Expr ?
+            _kernel_branch_parts(branch_recipe.source) : nothing
+        arm_source = branch_parts === nothing ? branch_recipe.source :
+            branch_parts[side === :then ? 2 : 3]
         replaced = Recipe(branch_recipe.id, Tuple(arm_inputs),
             branch_recipe.outputs, arm_op, branch_recipe.cost, nothing,
-            branch_recipe.effectful, branch_recipe.source)
+            branch_recipe.effectful, arm_source)
         arm_recipes = Recipe[r === branch_recipe ? replaced : r
                              for r in inner.recipes]
         arm_plan = _partial_subplan(inner, inner.have, inner.want, arm_recipes)
@@ -798,12 +1174,16 @@ that is such an array but sits beside a live non-atomic input keeps its
 original per-cell execution: caching it would store the same shared arrays in
 every evaluation's output.
 
-The inner pass conservatively retains the original plate for known empty
-domains or live inputs that could introduce an empty broadcast dimension.
-A live array is eligible only when its declared type fixes its rank (whatever
-its element type) and each of its
-dimensions is fixed by a bound axis of length greater than one; live numeric
-scalars and explicit atomic inputs do not contribute dimensions.
+The inner pass retains the original plate for known empty domains. A live
+array whose declared type fixes its rank (whatever its element type), each of
+whose dimensions a bound axis of length greater than one fixes, cannot change
+which cells the plate visits; live numeric scalars and explicit atomic inputs
+do not contribute dimensions. Any other live input could make the domain
+smaller than the bound one, or empty, so the eligible computations run over
+the bound domain and the original plate is retained if any of them throws:
+preparation never raises an error that no evaluation of the original plate
+would. Their cached values serve every cell the plate visits, as they vary
+only along bound axes.
 Other exclusions are non-array/non-numeric batched bound inputs, non-concrete
 prefix results and overlapping inner producers. A nested plate, scan or
 embedded prepared kernel is never evaluated here: it stays in the residual
@@ -812,8 +1192,18 @@ number nor a dense `Array` of them (a tuple, struct, view or range); the
 cell's other eligible values are still cached.
 Ordinary recipe purity remains required. Like top-level partial evaluation,
 eligible computations execute eagerly at preparation over their bound domain.
-Mixed-input recipes remain indivisible: inline data-only subexpressions inside
-one such recipe are not extracted or algebraically simplified.
+
+A recipe, at top level or in such a cell, that reads bound and live values
+alike is split where its authored expression allows (`_KernelSplit`): each
+maximal strict subexpression that reads only bound data and calls more than
+cheap arithmetic (`loggamma(n + 1.0) - loggamma(y + 1.0)` beside a live logit,
+`log(y)` beside a live location) becomes a recipe of its own, computed once
+per binding (per lane in a cell), and the remainder reads its value. Branch
+arms, short-circuit operands, generators and closures are not entered, so no
+part runs where its expression would not; a data-bound branch arm is split
+after the plate partitions its lanes. The parts apply the authored operations
+to the same operands in the same order, so values are unchanged; nothing is
+algebraically simplified or reassociated.
 
 The pass only transforms the plan: it adds no runtime wrapper and never
 mutates the original graph. New cached value identities use a private graph
@@ -826,6 +1216,7 @@ function partial_evaluation(p::Plan, bound, values)
     length(bound_values) == length(value_tuple) || throw(ArgumentError(
         "partial evaluation received $(length(bound_values)) bound ports " *
         "but $(length(value_tuple)) bound values"))
+    p = _partial_split_bound(p, bound_values)
     boundary = _partial_boundary(p, bound_values)
     hoisted = _partial_hoisted(p, boundary, value_tuple)
     last(_partial_residual(p, boundary, hoisted))
@@ -850,6 +1241,16 @@ struct _PartialBoundary
     residual::Vector{Recipe}
     constants::Vector{Value}
     plate_slots::Vector{Int}
+end
+
+# `p` with each top-level recipe that reads a live value split around its
+# maximal subexpressions that read only `bound_values` (`_partial_split_recipes`),
+# so the prefix computes them once per binding. A function of the bound port
+# set alone, like the boundary computed from its result.
+function _partial_split_bound(p::Plan, bound_values::Vector{Value})
+    isempty(bound_values) && return p
+    bound = Set{Int}(canon_id(p.graph, v.id) for v in bound_values)
+    _partial_split_recipes(p, bound, Set{Int}(), Dict{Int,Any}())
 end
 
 function _partial_boundary(p::Plan, bound_values::Vector{Value})
@@ -1066,7 +1467,9 @@ function _bound_entry(p::Plan, @nospecialize(ports))
     # Keep a cell's single-use argument producer inside the cell before bound
     # specialization can split a guarded producer into materialized arms.
     p = _fuse_authored_plate_chains(p; cells_only = true)
-    boundary = _partial_boundary(p, collect(Value, _astuple(ports)))
+    bound_values = collect(Value, _astuple(ports))
+    p = _partial_split_bound(p, bound_values)
+    boundary = _partial_boundary(p, bound_values)
     prefix = isempty(boundary.constants) ? nothing :
              _prepare_plan(_partial_prefix_plan(p, boundary))
     plates = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)

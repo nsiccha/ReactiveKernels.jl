@@ -70,8 +70,10 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         plain = prepare(C.projected)
         C.calls[] = 0
         bound = prepare(C.projected; bound = (; data))
-        @test C.calls[] == 0 # untyped live inputs can make the domain empty
-        @test isempty(caches(bound.plan))
+        # Untyped live inputs could make the domain smaller than the bound
+        # one: the cache is computed over the bound domain under protection.
+        @test C.calls[] == 3
+        @test size(only(caches(bound.plan)).op.value) == (3, 1)
         @test bound(q, shift) == sum((log.(data) .+ shift) .* q)
         @test bound(2.0, shift) == plain(2.0, data, shift)
         @test_throws DimensionMismatch bound(ones(2, 2), shift)
@@ -100,11 +102,13 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
 
         # Source-identical ON/OFF controls: neither unknown rank nor a known
         # rank may turn a skipped invalid-data cell into a preparation error.
-        C.calls[] = 0
+        # Preparation may try the cell's pure data-only work; when it throws,
+        # the plate keeps its original execution and visits no cell.
         for spec in (C.projected, C.vector_live, C.vector_live_rank)
             empty_args = spec === C.projected ? (Float64[], 1.0) : (Float64[],)
             invalid = prepare(spec; bound = (; data = [-1.0]))
             @test isempty(caches(invalid.plan))
+            C.calls[] = 0
             @test invalid(empty_args...) == 0.0
             @test prepare(spec)(Float64[], [-1.0], empty_args[2:end]...) == 0.0
             @test C.calls[] == 0
@@ -115,6 +119,7 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
             bad_data, shift = [-1.0, -2.0, -3.0], 0.0
             extra_axis = prepare(spec; bound = (; data = bad_data, shift))
             @test isempty(caches(extra_axis.plan))
+            C.calls[] = 0
             @test extra_axis(zeros(3, 0)) == 0.0
             @test prepare(spec)(zeros(3, 0), bad_data, shift) == 0.0
             @test C.calls[] == 0
@@ -149,9 +154,10 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         @test_throws DimensionMismatch rank_matrix(ones(2, 2))
         C.calls[] = 0
         rankless = prepare(C.vector_live_rankless; bound = (; data = rank_data))
-        @test C.calls[] == 0
-        @test isempty(caches(rankless.plan))
+        @test C.calls[] == 3 # an open rank caches under protection as well
+        @test length(caches(rankless.plan)) == 1
         @test rankless([0.5, 2.0, 3.0]) == vector([0.5, 2.0, 3.0])
+        @test C.calls[] == 3
     end
 
     @testset "numeric scalars, atomic data and source granularity" begin
@@ -162,15 +168,17 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         atomic = prepare(C.atomic; bound = (; data, coefficients = coefs))
         @test atomic(2.0) == prepare(C.atomic)(2.0, data, coefs)
         @test length(caches(atomic.plan)) == 1
+        expected_inline = prepare(C.inline)(2.0, data)
         C.calls[] = 0
         inline = prepare(C.inline; bound = (; data))
-        @test C.calls[] == 0
-        @test isempty(caches(inline.plan))
-        inline(2.0)
-        @test C.calls[] == 3 # the mixed recipe is deliberately indivisible
-        # A dense primitive array per cell is cached as an array of arrays.
+        @test C.calls[] == 3 # the mixed recipe's data-only call is split out
+        @test only(caches(inline.plan)).op.value == log.(data)
+        @test inline(2.0) == expected_inline
+        @test C.calls[] == 3
+        # The cell reads its per-cell array only through `sum`, so the split
+        # caches that sum rather than the array.
         mutable_result = prepare(C.mutable_result; bound = (; data))
-        @test only(caches(mutable_result.plan)).op.value == [fill(d, 2) for d in data]
+        @test only(caches(mutable_result.plan)).op.value == 2 .* data
         @test mutable_result(2.0) == prepare(C.mutable_result)(2.0, data)
         tuple_result = prepare(C.tuple_result; bound = (; data))
         @test isempty(caches(tuple_result.plan))
@@ -360,7 +368,9 @@ import Enzyme
                        bound=(; xs))
     cached = filter(r -> r.op isa ReactiveKernels._BoundConstant &&
         startswith(String(only(r.outputs).name), "bound_plate_"), bound.kernel.plan.recipes)
-    @test only(cached).op.value == [log.(x) for x in xs]
+    # The cell reads its per-cell array only through `sum`, so the split
+    # caches that sum rather than the array.
+    @test only(cached).op.value == [sum(log.(x)) for x in xs]
     @test ad_value_and_gradient(bound, q) == ad_value_and_gradient(plain, q, xs)
     @test ad_gradient(bound, q) ≈ fill(sum(sum(log, x; init = 0.0) for x in xs), length(q))
 

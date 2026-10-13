@@ -255,13 +255,15 @@ this example without adding an AD toolchain to the documentation build.
 Caching adds preparation work and storage; cheap arithmetic may gain nothing or
 run slower. Original data arguments remain retained for shape validation even
 when their elements are no longer read by the residual. Empty bound domains
-and live inputs that could introduce an empty dimension keep their original
-execution. A live array needs a declared rank, whatever its declared element
-type (`AbstractVector` qualifies like `Vector{Float64}`, while
-`AbstractArray{Float64}` leaves the rank open), and bound axes longer than one
-in every dimension it can supply; scalar and explicit atomic inputs add no
-dimensions. Non-concrete intermediate results also keep their original
-execution. A nested plate, scan or prepared kernel in the cell is never run
+keep their original execution. A live array with a declared rank, whatever
+its declared element type (`AbstractVector` qualifies like `Vector{Float64}`,
+while `AbstractArray{Float64}` leaves the rank open), and bound axes longer
+than one in every dimension it can supply cannot change which cells run;
+scalar and explicit atomic inputs add no dimensions. Any other live input
+could leave the plate fewer cells than its bound inputs span, so the cached
+values are computed over the bound domain and the cell keeps its original
+execution if that computation throws. Non-concrete intermediate results also
+keep their original execution. A nested plate, scan or prepared kernel in the cell is never run
 during preparation: it stays in the cell, lowered as before, and the cell's
 other bound-only values are still cached, such as a per-subject index list
 beside a recurrence over that subject's operations. Cached cell values are
@@ -280,8 +282,9 @@ original execution, so a plate's output never stores the shared cached arrays.
 Under Reactant a tensorized plate still needs rectangular
 per-lane arrays; ragged lanes are refused there with or without the cache.
 Recipes still follow the pure-operation contract.
-An inline expression such as `theta * log(d)` is one mixed-input recipe and is
-not split by this pass.
+An inline expression such as `theta * log(d)` is split along its authored
+structure: `log(d)` is cached and the cell computes `theta *` that value (see
+[Data-only subexpressions](compiler.md#data-only-subexpressions)).
 
 ## Accepted boundary
 

@@ -437,7 +437,10 @@ end
             have = (:y, :X, :beta, :N), want = :logpdf,
             bound = (; X = X, y = y, N = N))
         skb = string(code_expr(kb))
-        @test occursin("logpdf__lg", skb) && !occursin(")(N, y)", skb)
+        # The bound normalizer's sum folds too: the residual reads one
+        # hoisted value and no longer the per-observation `lg` vector.
+        @test occursin("logpdf_part", skb) && !occursin("logpdf__lg", skb) &&
+              !occursin(")(N, y)", skb)
         @test !occursin("Distributions", skb)
     end
 
