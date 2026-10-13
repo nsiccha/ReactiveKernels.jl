@@ -189,17 +189,22 @@ _KernelSourceOp(token::Val, form::Val, f) = _KernelSourceOp(token, form, f, f)
 # method is visible. A generated body carries explicit lexical captures for
 # immediate execution of newly composed expressions, including ordinary AD.
 # Bodies with Julia's local function/macro/exception scopes keep native lowering.
-struct _KernelSourceFunction{F,RF,C} <: Function
+# The call mode is a type parameter so switching it never replaces the real
+# captures needed by the runtime fallback and source display.
+struct _KernelSourceFunction{F,RF,C,M} <: Function
     f::F
     runtime_f::RF
     captures::C
 end
+_KernelSourceFunction(f::F, runtime_f::RF, captures::C) where {F,RF,C} =
+    _KernelSourceFunction{F,RF,C,Val{:guarded}}(f, runtime_f, captures)
 
 _kernel_native_source(f) = f
 _kernel_native_source(f::_KernelSourceFunction) = f.f
 
-@inline @generated function (f::_KernelSourceFunction)(args::Vararg{Any,N}) where {N}
+@inline @generated function (f::_KernelSourceFunction{F,RF,C,M})(args::Vararg{Any,N}) where {F,RF,C,M,N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
+    M === Val{:latest_world} && return :(Base.@inline f.f($(forwarded...)))
     argtypes = Tuple{args...}
     quote
         # The type-only query uses the caller's world without boxing active

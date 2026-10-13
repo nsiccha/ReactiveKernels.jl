@@ -43,6 +43,7 @@ const _PPL_TEST_FILES = (
     "test_native_generator_capture.jl",
     "test_concurrent_build.jl",
     "test_fresh_module.jl",
+    "test_latest_native_source.jl",
     "test_surface.jl",
     "test_affine_parameters.jl",
     "test_affine_parameters_reactant.jl",

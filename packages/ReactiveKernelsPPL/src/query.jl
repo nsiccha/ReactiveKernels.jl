@@ -235,13 +235,14 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
-    kern = prepare_query(built, plan, :sampler; on_error)
+    kern = ReactiveKernels._kernel_latest_prepared(
+        prepare_query(built, plan, :sampler; on_error))
     gradient_kernel, wants = if isempty(retain)
         kern, ()
     else
         wants = _retained_wants(retain)
-        _prepare_wants(built, plan,
-            (workflow_wants(:sampler), wants...); on_error), wants
+        ReactiveKernels._kernel_latest_prepared(_prepare_wants(built, plan,
+            (workflow_wants(:sampler), wants...); on_error)), wants
     end
     prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
         Vector{Float64}(u0); active = :unconstrained, retain = wants, warm)

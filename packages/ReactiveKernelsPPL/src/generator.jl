@@ -294,6 +294,7 @@ _data_arg(name::Symbol, ::AbstractArray{T,N}) where {T,N} = Expr(:(::), name, Ar
 # here (see `_eval_kernel_def`).
 module PPLGeneratedModels
 using ReactiveKernels
+import ReactiveKernelsDistributionKernels: DistributionKernelSources
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     normal, bernoulli, poisson, cauchy, exponential, gamma, lognormal,
     beta, inverse_gamma, binomial, negative_binomial2, beta_binomial,
@@ -301,10 +302,15 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
     zero_inflated_binomial_logit_zi,
-    normal_id_glm, bernoulli_logit_glm, poisson_log_glm, normal_id_glm_lpdf,
+    normal_id_glm, bernoulli_logit_glm, poisson_log_glm,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
     rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail,
     _half_normal_logpdf_on_support, _half_cauchy_logpdf_on_support
+# This copy is used only by generated PPL code. Its cuts were created at
+# package load, before any model built by a caller; generated model methods
+# still require the query's documented latest-world entry.
+const normal_id_glm_lpdf = ReactiveKernels._kernel_latest_rule(
+    DistributionKernelSources.normal_id_glm_lpdf)
 using SpecialFunctions: besseli, besselix, erfc, loggamma
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: logbeta
 # Selective (explicit imports win over any re-export chain, so no `using`
