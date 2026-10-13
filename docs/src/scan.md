@@ -352,9 +352,11 @@ every outer step (`benchmark/repro_enzyme_guarded_inner_loop_cache.jl`).
 
 Plain `Enzyme.autodiff` of a closure that captures the sequence meets a
 separate Enzyme boundary on Julia 1.12 and later. Enzyme must prove the
-closure is never written, and that proof rejects the scan's result stores
-with `EnzymeMutabilityException`; in one loop shape without RK it silently
-returns 0.0 instead (`benchmark/repro_enzyme_closure_float_store_readonly.jl`).
+closure is never written. On Julia 1.12 that proof rejects the scan's result
+stores with `EnzymeMutabilityException`; the same prepared-scan call on Julia
+1.13 can either differentiate exactly or raise that exception, depending on
+its optimized IR. In one loop shape without RK it silently returns 0.0
+instead (`benchmark/repro_enzyme_closure_float_store_readonly.jl`).
 Pass the data as a `Const` argument, annotate the closure `Const(f)`, or use
 `prepare_ad`, which passes data as `Constant` contexts
 ([constraints](constraints.md)).
