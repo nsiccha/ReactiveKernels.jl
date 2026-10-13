@@ -119,8 +119,11 @@ end
 # loads, so the gradient never recomputes bound-data-only work. The owned AD
 # caches arrive as the trailing `Cache` context, so the backend shadows them
 # itself; the kernel's borrowed primal caches are never exposed to
-# differentiation.
-struct _ADNonAllocatingKernelCall{I,F,O,A}
+# differentiation. When the table holds bound or folded values (`H`), `f` is
+# the packed externalized program (`_externalize_bound_array_call`), `ops` is
+# `nothing`, and those values arrive as one hidden `Constant` pack just before
+# the caches, exactly as the dataflow call receives its bound operands.
+struct _ADNonAllocatingKernelCall{I,H,F,O,A}
     f::F
     ops::O
     cache_apply::A
@@ -266,7 +269,12 @@ struct _PackedOperandCall{K}
 end
 
 function _pack_hidden_operands(call, values::Tuple, recipes, ops)
-    names = _hidden_operand_names(recipes, ops, call)
+    _pack_named_hidden_operands(call, values,
+                                _hidden_operand_names(recipes, ops, call), ops)
+end
+
+function _pack_named_hidden_operands(call, values::Tuple, slot_names::Tuple, ops)
+    names = _hidden_operand_leaf_names(call, slot_names, ops)
     length(names) == length(values) || throw(ArgumentError(
         "internal: $(length(values)) hidden operand(s) but $(length(names)) " *
         "name(s) derived from the bound slots"))
@@ -281,18 +289,31 @@ end
 # operation slots one to one, nested plate and scan bodies included (the plan's
 # own recipes cover only the top level).
 function _hidden_operand_names(
-        recipes, ops, ::_ExternalizedBoundArrayCall{F,O,P,H}) where {F,O,P,H}
+        recipes, ops, ::_ExternalizedBoundArrayCall{F,O,P}) where {F,O,P}
     length(recipes) == length(ops) || throw(ArgumentError(
         "internal: $(length(ops)) operation slots but $(length(recipes)) " *
         "lowered recipes"))
-    names = Symbol[]
-    for slot in P
+    map(P) do slot
         recipe = recipes[slot]
         recipe.op isa _BoundConstant && ops[slot] isa _BoundConstant ||
             throw(ArgumentError("internal: operation slot $slot is not the " *
                                 "bound constant of lowered recipe $slot"))
-        name = only(recipe.outputs).name
-        for path in (H ? _bound_leaf_paths(recipe.op.value) : ((),))
+        only(recipe.outputs).name
+    end
+end
+
+_externalized_slots(::_ExternalizedBoundArrayCall{F,O,P}) where {F,O,P} = P
+
+# One name per hidden operand from one name per externalized slot.
+function _hidden_operand_leaf_names(
+        ::_ExternalizedBoundArrayCall{F,O,P,H}, slot_names::Tuple,
+        ops) where {F,O,P,H}
+    length(slot_names) == length(P) || throw(ArgumentError(
+        "internal: $(length(P)) externalized slot(s) but " *
+        "$(length(slot_names)) slot name(s)"))
+    names = Symbol[]
+    for (slot, name) in zip(P, slot_names)
+        for path in (H ? _bound_leaf_paths(ops[slot].value) : ((),))
             push!(names, isempty(path) ? name : Symbol(join((name, path...), "_")))
         end
     end
@@ -704,13 +725,19 @@ end
 
 _ad_na_concretize_cache(::Nothing, step::Int, op) = nothing
 
-# Bound views cross the AD boundary as owning copies with identical contents:
-# a `SubArray`-typed constant operand defeats reverse-mode static activity
-# analysis, while identical owning contents differentiate cleanly (the same
-# freeze `prepare_ad` already applies to externalized dataflow operands).
-_ad_na_ad_ops(ops::Tuple) = map(ops) do op
-    op isa _BoundConstant && op.value isa AbstractArray ?
-        _BoundConstant(_externalize_bound_value(op.value, true)) : op
+# Name each externalized slot after the variable its program loads it into
+# (`X = __ops__[1]()`: a bound port or a folded step's result), falling back
+# to the slot number for a load that is not a whole statement.
+function _ad_na_slot_names(stmts, positions::Tuple)
+    loaded = Dict{Int,Symbol}()
+    for stmt in stmts
+        stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
+            stmt.args[2] isa Expr && stmt.args[2].head === :call &&
+            length(stmt.args[2].args) == 1 || continue
+        slot = _operation_slot(stmt.args[2].args[1])
+        slot === nothing || get!(loaded, slot, stmt.args[1])
+    end
+    map(slot -> get(loaded, slot, Symbol(:op, slot)), positions)
 end
 
 # Build the differentiated program for a `NonAllocatingKernel`: seed the
@@ -720,7 +747,8 @@ end
 # steps that cannot see any HAVE input (their seeded value is call-
 # independent, so it is captured once as an appended `_BoundConstant`), and
 # compile the resulting unbound program alongside its owned AD caches and
-# operation table.
+# operation table. Returns the rewritten statements too, which name the
+# hidden operands.
 function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
                         exemplars::Tuple)
     ast = kernel.ast
@@ -767,12 +795,12 @@ function _ad_na_program(kernel::NonAllocatingKernel, active_selector,
                      Expr(:block, new_stmts...)))
     ad_ops = isempty(fold_values) ? ops :
         (ops..., map(_BoundConstant, fold_values)...)
-    f, ad_caches, _ad_na_ad_ops(ad_ops)
+    f, ad_caches, ad_ops, new_stmts
 end
 
 function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
                          ::Val{I}) where {I}
-    f, ad_caches, ad_ops = _ad_na_program(kernel, I, args)
+    f, ad_caches, ad_ops, stmts = _ad_na_program(kernel, I, args)
     # A cacheless step program still carries the positional cache-table ABI,
     # but asking the backend to shadow `Tuple{Nothing,...}` marks a ghost-only
     # type differentiable. Keep that inert table Constant; any retained slot
@@ -780,10 +808,24 @@ function _ad_kernel_call(kernel::NonAllocatingKernel, args::Tuple,
     cache_context = all(isnothing, ad_caches) ?
         DifferentiationInterface.Constant(ad_caches) :
         DifferentiationInterface.Cache(ad_caches)
-    _ADNonAllocatingKernelCall{I,typeof(f),typeof(ad_ops),
+    # Bound and folded values cross as hidden operands, not as fields of the
+    # differentiated callable: a callable holding them must be proven readonly
+    # by a plain reverse backend, which fails once one reaches an opaque call
+    # such as BLAS `gemv`. Views cross as owning copies and numbers leave the
+    # table too, exactly as for the dataflow call.
+    externalized, values = _externalize_bound_array_call(
+        f, ad_ops; materialize_view_copies = true, externalize_scalars = true)
+    if externalized === nothing
+        return _ADNonAllocatingKernelCall{I,false,typeof(f),typeof(ad_ops),
+                                          typeof(kernel.cache_apply)}(
+            f, ad_ops, kernel.cache_apply), (cache_context,)
+    end
+    packed, pack = _pack_named_hidden_operands(
+        externalized, values,
+        _ad_na_slot_names(stmts, _externalized_slots(externalized)), ad_ops)
+    _ADNonAllocatingKernelCall{I,true,typeof(packed),Nothing,
                                typeof(kernel.cache_apply)}(
-        f, ad_ops, kernel.cache_apply),
-    (cache_context,)
+        packed, nothing, kernel.cache_apply), (pack..., cache_context)
 end
 
 @generated function (call::_ADKernelCall{I})(
@@ -810,12 +852,13 @@ end
     :(Base.@inline call.kernel($(arguments...)))
 end
 
-# The trailing context is the owned AD cache tuple; the leading N - 1 restore
-# the inactive HAVE arguments around the active one, exactly as above.
-@generated function (call::_ADNonAllocatingKernelCall{I,F})(
-        active, contexts::Vararg{Any,N}) where {I,F,N}
+# The trailing context is the owned AD cache tuple, preceded by the hidden
+# operand pack when `H`; the leading contexts restore the inactive HAVE
+# arguments around the active one, exactly as above.
+@generated function (call::_ADNonAllocatingKernelCall{I,H,F})(
+        active, contexts::Vararg{Any,N}) where {I,H,F,N}
     indices = _ad_selector_indices(I)
-    input_count = N + length(indices) - 1
+    input_count = N + length(indices) - (H ? 2 : 1)
     all(index -> 1 <= index <= input_count, indices) || return :(throw(
         ArgumentError("invalid active input selector $I for an RK " *
                       "non-allocating AD call with $input_count inputs")))
@@ -831,6 +874,12 @@ end
             context_index += 1
         end
     end
+    # The packed externalized program forwards its operands to the generated
+    # body without the RGF vararg wrapper itself; inline it as `_ADKernelCall`
+    # inlines its kernel.
+    H && return :(Base.@inline call.f(
+        getfield(contexts, $N), call.cache_apply, $(arguments...),
+        getfield(contexts, $(N - 1))))
     # Enter the program without the RGF vararg wrapper: once its operands (the
     # operation table, caches and driver plus every HAVE port) pass 32, the
     # wrapper's one-tuple splat stays a dynamic `Core._apply_iterate`, and
@@ -840,6 +889,10 @@ end
         Any[:(call.ops), :(getfield(contexts, $N)), :(call.cache_apply),
             arguments...])
 end
+
+# The hidden operands in their original order; the cache context follows them.
+_ad_hidden_operands(::_ADNonAllocatingKernelCall{I,true}, values) where {I} =
+    Tuple(first(values))
 
 function _ad_active_index(kernel::_ADKernel, active::Symbol)
     matches = findall(input -> input.name === active, inputs(kernel))
@@ -1498,7 +1551,11 @@ backend shadows them itself. Cache steps that cannot see the active input
 differentiated program: storing caller-owned constant data into a shadowed
 slot would be a static-activity error. The kernel's borrowed primal caches
 are never exposed to the backend, and primal calls keep using them
-independently of the prepared object.
+independently of the prepared object. Bound values, and the steps that read
+only bound values (computed once during preparation), reach the backend as
+hidden `DifferentiationInterface.Constant` contexts, as for a dataflow kernel,
+so the differentiated callable carries no bound data and ordinary reverse-mode
+`AutoEnzyme` needs no function annotation.
 
 Result types must be stable across calls: a step whose result type changes
 after preparation fails loudly instead of silently reseeding. Like every

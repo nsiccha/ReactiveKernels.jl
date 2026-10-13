@@ -190,6 +190,47 @@ end
     @test plate_counts[1] == plate_counts[2]
 end
 
+@testset "an elided location alias leaves same-named cell parameters alone" begin
+    # The scalar priors' cell binds `value, location, scale`; eliding the
+    # authored `location = value` must not rename those parameters.
+    y3 = y[1:3]
+    model = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        value = [a, b, a + b]
+        location = value
+        y .~ Normal.(location, 1.0)
+    end
+    bound = _bound(model, (; y = y3))
+    text = _text(bound)
+    @test !occursin("location = value", text)
+    @test occursin("do value, location, scale", text)
+    @test occursin("(normal(location, scale)).logpdf(value)", text)
+    built = build_kernel(bound)
+    @test coordinate_names(built.layout) == [:a, :b]
+    u = [0.2, -0.3]
+    mean(q) = [q[1], q[2], q[1] + q[2]]
+    oracle(q) = sum(logpdf.(Normal.(mean(q), 1.0), y3)) +
+        logpdf(Normal(0, 1), q[1]) + logpdf(Normal(0, 1), q[2])
+    r = y3 .- mean(u)
+    grad = similar(u)
+    value, _ = sampler_value_and_gradient!(
+        prepare_sampler(built, bound, u; backend = BACKEND), grad, u)
+    @test value ≈ oracle(u) rtol = 1e-12
+    @test grad ≈ [r[1] + r[3] - u[1], r[2] + r[3] - u[2]] rtol = 1e-10
+
+    subst(ex, map) = Base.remove_linenums!(ReactiveKernelsPPL._hsubst(
+        ex, Dict{Symbol,Any}(map); shadow = true))
+    @test subst(:(plate(location) do location; location end), :location => :mu) ==
+        Base.remove_linenums!(:(plate(mu) do location; location end))
+    @test subst(:(plate(v) do value; location + value end), :location => :mu) ==
+        Base.remove_linenums!(:(plate(v) do value; mu + value end))
+    # refused: the substituted value would read the cell's own parameter
+    # instead of the outer value it names (dev §1, never silently wrong).
+    @test_throws ArgumentError subst(:(plate(v) do value; location + value end),
+        :location => :value)
+end
+
 @testset "generated names never take a name the model uses" begin
     taken = quote
         a ~ Normal(0, 1)
