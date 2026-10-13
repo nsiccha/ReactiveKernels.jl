@@ -1954,13 +1954,20 @@ function _guard_missing_observation_argument(name, ex, plan, columns)
         selected = mask[rows, r.range.args[3:end]...]
         present = present === nothing ? Array(selected) : present .| selected
     end
+    # The skipped arm's value is never read: the density is guarded by the
+    # same presence. A live argument is computed from the Float64 packed
+    # parameters, so its skipped arm is a Float64 zero and the cell stays
+    # concretely typed. A bound argument is evaluated at preparation, where
+    # `_concrete_guarded_numeric_storage` promotes its storage, so an Int `0`
+    # keeps an integer argument integer.
+    skipped = _guarded_argument_is_bound(ex, columns) ? 0 : 0.0
     guarded = deepcopy(ex)
     inputs, lambda = guarded.args
     lane = gensym(:_rkppl_argument_present)
     push!(inputs.args, QuoteNode(present))
     push!(lambda.args[1].args, lane)
     lambda.args[2] = Expr(:block, LineNumberNode(0, :rkppl_plate),
-        Expr(:if, lane, lambda.args[2], 0))
+        Expr(:if, lane, lambda.args[2], skipped))
     return guarded
 end
 
