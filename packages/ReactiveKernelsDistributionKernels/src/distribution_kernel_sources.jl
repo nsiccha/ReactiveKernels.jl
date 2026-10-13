@@ -175,6 +175,7 @@ export INVERSE_GAMMA_KERNEL_SOURCE, DIRICHLET_KERNEL_SOURCE
 export LKJ_CORR_CHOLESKY_KERNEL_SOURCE
 export ZERO_INFLATED_POISSON_KERNEL_SOURCE
 export ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE
+export ZERO_INFLATED_BINOMIAL_LOGIT_ZI_KERNEL_SOURCE
 export NEGATIVE_BINOMIAL_KERNEL_SOURCE
 export WEIBULL_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
@@ -183,7 +184,7 @@ export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
 export inverse_gamma, dirichlet, lkj_corr_cholesky, zero_inflated_poisson
 export negative_binomial
-export weibull, zero_inflated_binomial
+export weibull, zero_inflated_binomial, zero_inflated_binomial_logit_zi
 export BERNOULLI_LOGIT_GLM_KERNEL_SOURCE, BERNOULLI_LOGIT_GLM_SOURCE
 export bernoulli_logit_glm
 export POISSON_LOG_GLM_KERNEL_SOURCE, POISSON_LOG_GLM_SOURCE
@@ -1131,6 +1132,44 @@ using SpecialFunctions: beta_inc
 end
 """
 
+# A complementary zero-inflation representation for models that already own
+# its source logit. The ordinary ZIB object keeps its probability endpoint,
+# including its exact zi=0/1 derivatives; this object never forms a rounded
+# zi probability. Its binomial component is the existing binomial graph.
+const ZERO_INFLATED_BINOMIAL_LOGIT_ZI_KERNEL_SOURCE = raw"""
+using LogExpFunctions: logaddexp, log1pexp
+
+@kernel zero_inflated_binomial_logit_zi(n::Int, p::Float64, zi_logit::Float64) = begin
+    logit::Float64 = ((p >= 0) & (p <= 1)) ? log(p) - log1p(-p) : NaN
+    p::Float64 = 1 / (1 + exp(-logit))
+    logzi::Float64 = -log1pexp(-zi_logit)
+    log1mzi::Float64 = -log1pexp(zi_logit)
+
+    lognormalizer(observed::Int)::Float64 =
+        binomial(; n = n).lognormalizer(observed)
+    logkernel(observed::Int)::Float64 =
+        ((observed >= 0) & (observed <= n) & (logit == logit) &
+            (zi_logit == zi_logit)) ?
+            (n == 0 ? 0.0 :
+             observed == 0 ?
+                logaddexp(logzi, log1mzi +
+                    binomial(; n = n, logit = logit).logkernel(observed)) :
+                log1mzi + binomial(; n = n, logit = logit).logkernel(observed)) :
+            -Inf
+    # Use the binomial object's full endpoint directly: released Enzyme
+    # cannot reverse a sum of logkernel and lognormalizer in one cell.
+    logpdf(observed::Int)::Float64 =
+        ((observed >= 0) & (observed <= n) & (logit == logit) &
+            (zi_logit == zi_logit)) ?
+            (n == 0 ? 0.0 :
+             observed == 0 ?
+                logaddexp(logzi, log1mzi +
+                    binomial(; n = n, logit = logit).logpdf(observed)) :
+                log1mzi + binomial(; n = n, logit = logit).logpdf(observed)) :
+            -Inf
+end
+"""
+
 include("evidence_cdfs.jl")
 
 const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
@@ -1148,14 +1187,15 @@ const _OTHER_DISTRIBUTION_BINDINGS = _evaluate_source_bindings(
           ZERO_INFLATED_POISSON_KERNEL_SOURCE,
           NEGATIVE_BINOMIAL_KERNEL_SOURCE,
           WEIBULL_KERNEL_SOURCE,
-          ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE), "\n"),
+          ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE,
+          ZERO_INFLATED_BINOMIAL_LOGIT_ZI_KERNEL_SOURCE), "\n"),
     (:bernoulli, :lognormal, :exponential, :geometric, :uniform, :mvnormal, :ar1,
      :categorical_logit, :categorical_logit_ref,
      :poisson, :gamma, :beta, :binomial, :negative_binomial2,
      :beta_binomial,
      :inverse_gamma, :dirichlet, :lkj_corr_cholesky, :zero_inflated_poisson,
      :negative_binomial,
-     :weibull, :zero_inflated_binomial),
+     :weibull, :zero_inflated_binomial, :zero_inflated_binomial_logit_zi),
 )
 const bernoulli = _OTHER_DISTRIBUTION_BINDINGS[1]
 const lognormal = _OTHER_DISTRIBUTION_BINDINGS[2]
@@ -1179,6 +1219,7 @@ const zero_inflated_poisson = _OTHER_DISTRIBUTION_BINDINGS[19]
 const negative_binomial = _OTHER_DISTRIBUTION_BINDINGS[20]
 const weibull = _OTHER_DISTRIBUTION_BINDINGS[21]
 const zero_inflated_binomial = _OTHER_DISTRIBUTION_BINDINGS[22]
+const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 
