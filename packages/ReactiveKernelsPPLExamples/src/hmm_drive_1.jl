@@ -120,7 +120,7 @@ using LogExpFunctions: logsumexp, logaddexp
             emit = c_u .- 0.5 .* ((row[1] .- phi) ./ tau) .^ 2 .+
                    c_v .- 0.5 .* ((row[2] .- lambda) ./ rho) .^ 2
             transitioned = carry .+ row[3] .* logtheta
-            newg = vec(mapslices(logsumexp, transitioned; dims = 1)) .+ emit
+            newg = vec(logsumexp(transitioned; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end
     # The final marginal is the scan's last per-step output; a 0/1 mask-weighted

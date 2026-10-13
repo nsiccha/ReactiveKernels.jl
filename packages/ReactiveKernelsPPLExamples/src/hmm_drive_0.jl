@@ -118,7 +118,7 @@ using LogExpFunctions: logsumexp, logaddexp
         scan(eachrow(scan_rows); init = uniform_log_mass) do carry, row
             emit = log.(phi) .- phi .* row[1] .+ log.(lambda) .- lambda .* row[2]
             transitioned = carry .+ row[3] .* logtheta
-            newg = vec(mapslices(logsumexp, transitioned; dims = 1)) .+ emit
+            newg = vec(logsumexp(transitioned; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end
     # Final marginal via a 0/1 mask-weighted sum — no scalar indexing of the
