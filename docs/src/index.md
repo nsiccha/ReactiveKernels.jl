@@ -267,6 +267,13 @@ endpoint whose lowered form binds locals, runs a plate or scan, or reads a
 non-`Base` global is rejected at authoring time with an action to hoist the
 call above the branch, where it splices as usual.
 
+Inside an object's own method bodies, a straight-position call of a sibling,
+a bound child or `inv` splices the same way. In a lazy arm, or with an
+argument a `let` binds, the call stays where it is written: the object's
+builder prepares the callee's graph once, and `readable_code` shows the call as
+`var"prepared standardized"(location, scale, x)`. The arm evaluates it only
+when taken.
+
 Named relations stay available as alternate cuts. Authoring one direction is
 enough: a unary call such as `log_scale = log(scale)` gains the reverse edge
 (`scale = exp(log_scale)`, via InverseFunctions.jl) automatically, so the

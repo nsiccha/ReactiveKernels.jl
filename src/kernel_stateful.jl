@@ -594,6 +594,9 @@ function _kernel_endpoint_dependencies(m, endpoint_names::Set{Symbol})
         x isa Expr || return
         if x.head === :call && !isempty(x.args) && x.args[1] isa Symbol
             name = x.args[1]
+            # `inv(target, z)` reads the forward endpoint `target`'s graph.
+            name === :inv && length(x.args) == 3 && x.args[2] isa Symbol &&
+                (name = x.args[2])
             name in endpoint_names && name !== m.name &&
                 (name in deps || push!(deps, name))
         end
@@ -700,6 +703,11 @@ mutable struct _KernelEndpointBuildState
     nested_specs::Dict{Symbol,Any}
     lifted_names::Dict{Symbol,Int}
     current_method::Symbol
+    # In-place endpoint calls (`_kernel_endpoint_in_place_call!`): callee key =>
+    # (builder local, spec expression, input count, display name), and the keys
+    # the current method reads.
+    arm_children::Dict{Any,Tuple{Symbol,Any,Int,Symbol}}
+    method_arm_keys::Vector{Any}
 end
 
 function _kernel_endpoint_named_output!(st::_KernelEndpointBuildState, base::Symbol)
@@ -757,24 +765,32 @@ function _kernel_endpoint_binding_spec!(st::_KernelEndpointBuildState,
     end
 end
 
-# A lifted endpoint call becomes its own recipe ahead of the statement that
-# spells it, outside any `let` around the call. `scoped` holds the names a
-# surrounding `let` binds: they shadow endpoint and owner names, and a call
-# reading one cannot leave the `let`, so it is refused rather than reading an
-# unrelated port of the same name.
+# A straight endpoint call (a sibling, a bound child or an `inv`) is lifted
+# into its own recipe ahead of the statement that spells it, where it splices
+# as graph recipes. A call in a lazy branch arm, or one reading a name a
+# surrounding `let` binds, cannot leave its position: lifting the first would
+# evaluate it when the arm is not taken, and the second would read an
+# unrelated port of the same name. Such a call stays in place and applies the
+# endpoint's graph prepared once by the object's builder
+# (`_kernel_endpoint_in_place_call!`). `scoped` holds the names a surrounding
+# `let` binds; they shadow endpoint and owner names. `lazy` marks a position
+# Julia evaluates only on one branch.
 function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector{Any},
-                                scoped::Set{Symbol} = Set{Symbol}())
+                                scoped::Set{Symbol} = Set{Symbol}(), lazy::Bool = false)
     x isa Expr || return x
     x.head in (:quote, :inert) && return x
-    x.head === :let && return _kernel_endpoint_lift_let!(st, x, lifted, scoped)
+    x.head === :let && return _kernel_endpoint_lift_let!(st, x, lifted, scoped, lazy)
     if x.head === :call && !isempty(x.args)
         callee = x.args[1]
-        args = Any[_kernel_endpoint_lift!(st, a, lifted, scoped) for a in x.args[2:end]]
+        args = Any[_kernel_endpoint_lift!(st, a, lifted, scoped, lazy) for a in x.args[2:end]]
+        in_place = lazy || any(arg -> _kernel_endpoint_reads(arg, scoped), args)
         if callee isa Symbol && callee in st.endpoint_names && !(callee in scoped)
+            in_place && return _kernel_endpoint_in_place_call!(
+                st, callee, callee, () -> st.endpoint_vars[callee],
+                Any[st.residual_owner_names...; args...], scoped)
             all(arg -> arg isa Symbol, args) || throw(ArgumentError(
                 "pure endpoint :$(st.current_method) must assign expression arguments " *
                 "to named ports before calling :$callee"))
-            _kernel_endpoint_lift_unscoped(st, callee, args, scoped)
             spec = st.endpoint_vars[callee]
             placeholder = gensym(Symbol(callee, :_call))
             st.nested_specs[placeholder] = spec
@@ -789,20 +805,21 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
                haskey(st.inverse_targets, args[1])
             target = args[1]
             value = args[2]
-            value isa Symbol || throw(ArgumentError(
-                "inv($target, value) in :$(st.current_method) requires a named value port"))
-            _kernel_endpoint_lift_unscoped(st, :inv, Any[value], scoped)
             input_name, input_type = st.inverse_targets[target]
-            forward = st.endpoint_vars[target]
-            inverse_spec = Expr(:call, GlobalRef(@__MODULE__, :extract),
+            inverse_spec() = Expr(:call, GlobalRef(@__MODULE__, :extract),
                 Expr(:parameters,
                      Expr(:kw, :have, Expr(:tuple,
                          (QuoteNode(n) for n in st.residual_owner_names)...,
                          QuoteNode(target))),
                      Expr(:kw, :want, QuoteNode(input_name))),
-                forward)
+                st.endpoint_vars[target])
+            in_place && return _kernel_endpoint_in_place_call!(
+                st, (:inv, target), Symbol("inv(", target, ")"), inverse_spec,
+                Any[st.residual_owner_names...; value], scoped)
+            value isa Symbol || throw(ArgumentError(
+                "inv($target, value) in :$(st.current_method) requires a named value port"))
             placeholder = gensym(Symbol(target, :_inverse_call))
-            st.nested_specs[placeholder] = inverse_spec
+            st.nested_specs[placeholder] = inverse_spec()
             out = _kernel_endpoint_named_output!(st, input_name)
             actuals = Any[st.residual_owner_names...; value]
             push!(lifted, Expr(:(=), Expr(:(::), out, input_type),
@@ -813,9 +830,11 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
         if target !== nothing && !(target[1] in scoped)
             root, method = target
             spec = _kernel_endpoint_binding_spec!(st, root, method)
+            in_place && return _kernel_endpoint_in_place_call!(
+                st, (root, method), _kernel_scoped_port(root, method), () -> spec,
+                args, scoped)
             all(arg -> arg isa Symbol, args) || throw(ArgumentError(
                 "bound endpoint `$root.$method` in :$(st.current_method) requires named port arguments"))
-            _kernel_endpoint_lift_unscoped(st, Symbol(root, ".", method), args, scoped)
             placeholder = gensym(Symbol(root, :_, method, :_call))
             st.nested_specs[placeholder] = spec
             out = _kernel_endpoint_named_output!(
@@ -827,26 +846,53 @@ function _kernel_endpoint_lift!(st::_KernelEndpointBuildState, x, lifted::Vector
                                Expr(:call, placeholder, args...)))
             return out
         end
-        return Expr(:call, _kernel_endpoint_lift!(st, callee, lifted, scoped), args...)
+        return Expr(:call, _kernel_endpoint_lift!(st, callee, lifted, scoped, lazy), args...)
     end
-    Expr(x.head, (_kernel_endpoint_lift!(st, a, lifted, scoped) for a in x.args)...)
+    Expr(x.head, (_kernel_endpoint_lift!(st, a, lifted, scoped,
+                                         lazy || _kernel_endpoint_lazy_child(x, i))
+                  for (i, a) in enumerate(x.args))...)
 end
 
-function _kernel_endpoint_lift_unscoped(st::_KernelEndpointBuildState, callee,
-                                        args, scoped::Set{Symbol})
-    index = findfirst(arg -> arg isa Symbol && arg in scoped, args)
-    index === nothing && return nothing
-    name = args[index]
-    throw(ArgumentError(
-        "pure endpoint :$(st.current_method) calls :$callee with :$name, which a " *
-        "`let` binds; an endpoint call is hoisted into its own recipe outside the " *
-        "`let`, so assign :$name in a statement of the endpoint body instead"))
+# The positions of `?:`/`if`/`elseif`, `&&` and `||` that Julia evaluates only
+# on one branch: everything but the condition and the first operand
+# (`_kernel_straight_child` is the recipe lowering's twin).
+_kernel_endpoint_lazy_child(x::Expr, i::Int) =
+    x.head in (:if, :elseif, :(&&), :(||)) && i > 1
+
+_kernel_endpoint_reads(x, names::Set{Symbol}) =
+    x isa Symbol ? x in names :
+    x isa Expr && !(x.head in (:quote, :inert)) &&
+        any(arg -> _kernel_endpoint_reads(arg, names), x.args)
+
+# An endpoint call left at its position. The object's builder binds the
+# callee's graph, prepared once, to a local the call reads
+# (`_kernel_endpoint_arm_child`). The local is named `prepared <callee>`: no
+# port name contains a space, so no port of the method can shadow it, and the
+# name has no leading `#`, so lowering keeps it as spelled
+# (`_lowering_gensym`) and `readable_code` shows it. It is assigned once,
+# before the first endpoint that reads it. `actuals` are the callee's inputs in order: the residual owner
+# ports, then the call's arguments. An owner port a surrounding `let` rebinds
+# would pass the `let`'s value instead, so that is refused.
+function _kernel_endpoint_in_place_call!(st::_KernelEndpointBuildState, key, name::Symbol,
+                                         spec_expr, actuals::Vector{Any},
+                                         scoped::Set{Symbol})
+    for owner in st.residual_owner_names
+        owner in scoped && throw(ArgumentError(
+            "pure endpoint :$(st.current_method) calls :$name inside a `let` that " *
+            "binds :$owner, but :$name reads the owner port :$owner; rename the " *
+            "`let` binding"))
+    end
+    child = get!(st.arm_children, key) do
+        (Symbol("prepared ", name), spec_expr(), length(actuals), name)
+    end
+    key in st.method_arm_keys || push!(st.method_arm_keys, key)
+    Expr(:call, child[1], actuals...)
 end
 
 # Bindings are sequential: each sees the earlier ones, and the body sees all of
 # them plus the names it assigns itself (also local to the `let`).
 function _kernel_endpoint_lift_let!(st::_KernelEndpointBuildState, x, lifted::Vector{Any},
-                                    scoped::Set{Symbol})
+                                    scoped::Set{Symbol}, lazy::Bool)
     bindings = x.args[1]
     list = Meta.isexpr(bindings, :block) ? bindings.args : Any[bindings]
     inner = copy(scoped)
@@ -854,7 +900,7 @@ function _kernel_endpoint_lift_let!(st::_KernelEndpointBuildState, x, lifted::Ve
     for binding in list
         if Meta.isexpr(binding, :(=)) && length(binding.args) == 2
             push!(rebuilt, Expr(:(=), binding.args[1],
-                _kernel_endpoint_lift!(st, binding.args[2], lifted, inner)))
+                _kernel_endpoint_lift!(st, binding.args[2], lifted, inner, lazy)))
             _kernel_bound_names!(inner, binding.args[1])
         else
             push!(rebuilt, binding)
@@ -863,7 +909,7 @@ function _kernel_endpoint_lift_let!(st::_KernelEndpointBuildState, x, lifted::Ve
     end
     _kernel_endpoint_let_assigned!(inner, x.args[2])
     Expr(:let, Meta.isexpr(bindings, :block) ? Expr(:block, rebuilt...) : only(rebuilt),
-         _kernel_endpoint_lift!(st, x.args[2], lifted, inner))
+         _kernel_endpoint_lift!(st, x.args[2], lifted, inner, lazy))
 end
 
 function _kernel_endpoint_let_assigned!(names::Set{Symbol}, x)
@@ -977,16 +1023,20 @@ function _kernel_endpoint_templates_expr(signature_inputs, recipe_stmts,
         endpoint_vars, endpoint_formals, endpoint_returns, inverse_targets,
         bindings_var, Dict{Tuple{Symbol,Symbol},Symbol}(), Any[],
         Dict{Symbol,Any}(), Dict{Symbol,Int}(), :none,
+        Dict{Any,Tuple{Symbol,Any,Int,Symbol}}(), Any[],
     )
 
     endpoint_exprs = Dict{Symbol,Any}()
+    endpoint_arm_keys = Dict{Symbol,Vector{Any}}()
     for name in _kernel_endpoint_toposort(endpoints)
         m = only(filter(x -> x.name === name, endpoints))
         state.current_method = name
         empty!(state.nested_specs)
         empty!(state.lifted_names)
+        empty!(state.method_arm_keys)
         body = _kernel_endpoint_lower_body(
             m, state, haskey(inverses, name) ? (name, inverses[name]) : nothing)
+        endpoint_arm_keys[name] = copy(state.method_arm_keys)
         signature = Tuple{Symbol,Any}[]
         for owner_name in residual_owner_names
             T = Expr(:call, GlobalRef(@__MODULE__, :valtype),
@@ -999,7 +1049,18 @@ function _kernel_endpoint_templates_expr(signature_inputs, recipe_stmts,
     end
 
     builder_body = Any[state.binding_prelude...]
+    prepared_children = Set{Any}()
     for name in _kernel_endpoint_toposort(endpoints)
+        # Each in-place callee is prepared once, after its own graph and before
+        # the first endpoint that reads it (a single assignment, so the
+        # endpoint's recipe closures capture it unboxed).
+        for key in endpoint_arm_keys[name]
+            key in prepared_children && continue
+            push!(prepared_children, key)
+            var, spec_expr, nactuals, display = state.arm_children[key]
+            push!(builder_body, :($var = $(GlobalRef(@__MODULE__, :_kernel_endpoint_arm_child))(
+                $(QuoteNode(display)), $spec_expr, $nactuals)))
+        end
         push!(builder_body, :($(endpoint_vars[name]) = $(endpoint_exprs[name])))
     end
     snapshots = Expr(:tuple, (
@@ -1010,6 +1071,16 @@ function _kernel_endpoint_templates_expr(signature_inputs, recipe_stmts,
     arg_meta = Tuple(m.name => Tuple(first.(endpoint_formals[m.name])) for m in endpoints)
     Expr(:call, _KernelEndpointTemplates, QuoteNode(Tuple(binding_names)),
          QuoteNode(Tuple(m.name for m in endpoints)), QuoteNode(arg_meta), builder)
+end
+
+# The callee of an in-place endpoint call (`_kernel_endpoint_in_place_call!`):
+# its graph prepared once, applied to the call's actuals in input order.
+function _kernel_endpoint_arm_child(name::Symbol, spec::KernelSpec, nactuals::Int)
+    n = length(inputs(spec))
+    n == nactuals || throw(ArgumentError(
+        "endpoint :$name is applied in place to $nactuals input(s) but its graph has $n " *
+        "($(join((v.name for v in inputs(spec)), ", ")))"))
+    _KernelPreparedChild(name, prepare(spec))
 end
 
 struct _CapturedTypeAuthority{T}
