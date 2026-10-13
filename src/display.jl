@@ -1,9 +1,25 @@
 # Human-readable display of graphs, plans and generated code.
 #
 # Every view here is a cold-path rendering of an existing graph, plan or
-# kernel: nothing is planned differently, lowered again for execution, or
-# evaluated. `code_expr` stays the exact executable AST; `readable_code` is its
-# display counterpart, and the `Graph` text listing is the structural view.
+# kernel: nothing is planned differently or evaluated. `readable_code` retains
+# the executable AST and its operation tuple; the `Graph` text listing is the
+# structural view.
+
+# Only source-location metadata is removed from the public code display.
+# In particular, operation calls, argument evaluation, globals and scopes must
+# stay exactly as they are in `code_expr`.
+_strip_display_linenums(x) = x
+function _strip_display_linenums(ex::Expr)
+    args = Any[]
+    for (i, arg) in enumerate(ex.args)
+        if ex.head === :macrocall && i == 2 && arg isa LineNumberNode
+            push!(args, nothing)
+        elseif !(ex.head in (:block, :quote) && arg isa LineNumberNode)
+            push!(args, _strip_display_linenums(arg))
+        end
+    end
+    Expr(ex.head, args...)
+end
 
 # Line-number annotations are source metadata, not code. Removing them from
 # `:block`/`:quote` arguments and blanking a macro call's line slot matches
@@ -296,23 +312,25 @@ end
 """
     ReadableCode
 
-Display-only Julia source for a ReactiveKernels program, returned by
-[`readable_code`](@ref). It prints as ordinary indented Julia without
-line-number annotations; `string(code)` returns that text and `code.expr` the
-displayed expression. `code.modules` lists the modules whose bindings the
-authored `@kernel` sources were evaluated in, in order of first use, and the
-module of each global the program shows by its bare name; the text starts
-with a comment naming them.
-
-The displayed program is an explanation, not executable authority:
-[`code_expr`](@ref) remains the exact compiled AST.
+The generated Julia expression with only line-number annotations removed.
+`code.expr` is a copy of [`code_expr`](@ref), and `code.operations` is the exact
+operation tuple indexed by its `__ops__` argument. For a prepared kernel this
+is the kernel's own operation tuple. The printed operation table indexes those
+same objects by kind and, for source operations, their definition token and
+stored generated source-function expression where available;
+it never substitutes authored source for an operation preparation changed.
+The string is for inspection. If the expression embeds an operation object,
+Julia's textual AST display may contain dollar-sign interpolation syntax that cannot
+be parsed on its own; `code.expr` retains the executable object.
 """
-struct ReadableCode
+struct ReadableCode{O<:Tuple}
     expr::Any
     modules::Vector{Module}
+    operations::O
 end
 
-ReadableCode(expr) = ReadableCode(expr, Module[])
+ReadableCode(expr, modules::Vector{Module}) = ReadableCode(expr, modules, ())
+ReadableCode(expr) = ReadableCode(expr, Module[], ())
 
 """
     readable_code(spec::KernelSpec; have, want) -> ReadableCode
@@ -320,33 +338,25 @@ ReadableCode(expr) = ReadableCode(expr, Module[])
     readable_code(kernel::PreparedKernel) -> ReadableCode
     readable_code(expr::Expr; modules = Module[]) -> ReadableCode
 
-Readable Julia for an existing program. A `KernelSpec` or `Plan` shows the
-planned program over its HAVE inputs, with every operation slot replaced by its
-authored source or operation name; a spec is planned at its default boundary
-unless `have`/`want` are given, and nothing is prepared or evaluated. A
-`PreparedKernel` shows its prepared program, including any `bound=` data folded
-into it as literal constants. An `Expr`, such as a generated `@kernel`
-definition, is shown as written. Line-number annotations are removed from a
-copy; the argument is never mutated. A global reference (`M.f`) shows by its
-bare name, as source spells it, unless the program also spells that name
-another way; the comment then names `M`.
+Show the generated expression with only line-number annotations removed.
+Operation calls retain their `__ops__[k]` slots; `code.operations[k]` is the
+callable in that slot, including specialized operations after `bound=`. A
+`KernelSpec` is planned at its default boundary unless `have`/`want` are given.
+An `Expr` is shown as written. The argument is never mutated.
 """
 function readable_code(p::Plan)
-    modules = _collect_source_modules!(Module[], p.recipes)
-    ReadableCode(_display_globals(_display_expr(
-        _readable_inline_generated(_readable_expr(code_expr(p), p), p)), modules)...)
+    ast, ops, _ = lower_with_ops(p)
+    ReadableCode(_strip_display_linenums(ast), Module[], ops)
 end
 
 function readable_code(k::PreparedKernel)
-    modules = _collect_source_modules!(Module[], k.lowered_recipes)
-    ReadableCode(_display_globals(_display_expr(_readable_expr(code_expr(k), k)),
-        modules)...)
+    ReadableCode(_strip_display_linenums(code_expr(k)), Module[], k.ops)
 end
 
 readable_code(spec::KernelSpec; kwargs...) = readable_code(plan(spec; kwargs...))
 readable_code(g::Graph; kwargs...) = readable_code(plan(g; kwargs...))
 readable_code(ex::Expr; modules = Module[]) =
-    ReadableCode(_display_globals(_display_expr(ex), collect(Module, modules))...)
+    ReadableCode(_strip_display_linenums(ex), collect(Module, modules), ())
 
 # A definition with a block body (`function (args…) … end`, `f(args…) = begin
 # … end`, optionally under a macro such as `@kernel`) prints its statements
@@ -374,12 +384,61 @@ function _print_code(io::IO, ex)
     print(io, "\nend")
 end
 
+_display_operation_kind(op) = string(nameof(typeof(op)))
+_display_operation_kind(op::_KernelSourceOp{Token,Form}) where {Token,Form} =
+    string("_KernelSourceOp{", repr(Token), ", ", repr(Form), "}")
+_display_operation_kernel(op) = nothing
+_display_operation_kernel(op::_AuthoredPlateOp) = op.kernel
+_display_operation_kernel(op::_AuthoredScanOp) = op.kernel
+_display_source_expression(f) = nothing
+function _display_source_expression(f::_KernelSourceFunction)
+    f.runtime_f isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction ||
+        return nothing
+    RuntimeGeneratedFunctions.get_expression(f.runtime_f)
+end
+
+function _print_operation_callable(io::IO, callable, path::String)
+    source = _display_source_expression(callable)
+    source === nothing && return
+    print(io, "\n# ", path, ".runtime_f expression:")
+    body = sprint(_print_code, _strip_display_linenums(source);
+                  context = :limit => false)
+    for line in split(body, '\n')
+        print(io, "\n#   ", line)
+    end
+end
+
+function _print_operation_table(io::IO, operations::Tuple, path::String)
+    for (i, op) in enumerate(operations)
+        slot = string(path, "[", i, "]")
+        print(io, "\n# ", slot, " (", _display_operation_kind(op), ")")
+        if op isa _KernelSourceOp
+            _print_operation_callable(io, op.f, string(slot, ".f"))
+            op.tensor_f === op.f ||
+                _print_operation_callable(io, op.tensor_f, string(slot, ".tensor_f"))
+        end
+        child = _display_operation_kernel(op)
+        child === nothing && continue
+        print(io, "\n# ", slot, ".kernel.ast:")
+        body = sprint(_print_code, _strip_display_linenums(code_expr(child));
+                      context = :limit => false)
+        for line in split(body, '\n')
+            print(io, "\n#   ", line)
+        end
+        _print_operation_table(io, child.ops, string(slot, ".kernel.ops"))
+    end
+end
+
 function _print_readable(io::IO, code::ReadableCode)
     if !isempty(code.modules)
-        print(io, "# authored sources evaluated in: ",
+        print(io, "# supplied modules: ",
               join(string.(code.modules), ", "), "\n")
     end
     _print_code(IOContext(io, :limit => false), code.expr)
+    if !isempty(code.operations)
+        print(io, "\n# __ops__ table (exact callables: code.operations):")
+        _print_operation_table(io, code.operations, "code.operations")
+    end
 end
 
 Base.print(io::IO, code::ReadableCode) = _print_readable(io, code)

@@ -340,7 +340,8 @@ end
 
 @testset "a function-shaped child under a plate arm compiles lazily" begin
     k = prepare(child_arm_cells; want = :total)
-    @test !occursin("arm_softplus(", sprint(show, readable_code(k)))
+    @test !occursin("arm_softplus(",
+                    string(ReactiveKernels._readable_expr(code_expr(k), k)))
     x = [2.0, -1.0, 0.5, 0.0, -3.0]
     hlo = repr(Reactant.@code_hlo optimize = false k(_traced(x)))
     @test occursin("stablehlo.if", hlo)

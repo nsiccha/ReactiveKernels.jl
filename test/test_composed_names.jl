@@ -120,7 +120,12 @@ _names_normal(x, location, scale) =
 _names_priors_reference(u) = _names_exponential(exp(u[1]), 4.0) +
     _names_exponential(u[2], 4.0) + _names_normal(u[3], -0.5, 2.0)
 
-_names_text(spec) = string(readable_code(spec))
+# Source-aware recipe view for naming assertions; public `readable_code` keeps
+# executable operation slots and does not substitute recipe source.
+function _names_text(spec)
+    p = plan(spec)
+    string(ReactiveKernels._readable_expr(code_expr(p), p))
+end
 _names_identity_recipes(spec) =
     count(recipe -> recipe.op === identity, kernel_graph(spec).recipes)
 
