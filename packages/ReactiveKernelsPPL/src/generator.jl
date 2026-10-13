@@ -4254,7 +4254,22 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     end
     names = Dict{Symbol,Symbol}(t => cell_names[v] for (v, t) in zip(values(args), argvals)
         if v isa Symbol && haskey(cell_names, v))
-    append!(stmts, _plate_sum_stmts(pw, node, inputs, Expr[pre..., cell]; names))
+    plate = _plate_sum_stmts(pw, node, inputs, Expr[pre..., cell]; names)
+    scale = length(args) == 2 ? last(values(args)) : nothing
+    sf = scale isa Real ? Float64(scale) : NaN
+    if family === :normal && !conditioned && support === nothing &&
+            length(args) == 2 && first(values(args)) isa Real &&
+            iszero(first(values(args))) && isfinite(sf) && sf > 0
+        # Keep the cell densities for :pointwise, but let the summed prior
+        # standardize before squaring, as the scalar Normal cells do. The
+        # sampler prunes the unused plate and ordinary AD reads this dot.
+        z = Symbol(:_ppl_prior_standardized_, label)
+        push!(stmts, plate[1], :($z = $name ./ $sf),
+            :($node::Float64 = -0.5 * dot($z, $z) -
+                length($name) * $(log(sf) + 0.5 * log(2 * π))))
+    else
+        append!(stmts, plate)
+    end
     push!(terms, node)
     return nothing
 end

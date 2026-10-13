@@ -14,6 +14,14 @@ function _gv_reactant_case(kind, n)
             y ~ NormalIDGLM(X, 0.0, beta, sigma)
         end
         return m(; X) | (; y)
+    elseif kind === :named_product
+        m = @rkppl begin
+            beta[axes(X, 2)] .~ Normal.(0, 10)
+            sigma ~ Exponential(1)
+            mu = X * beta
+            y .~ Normal.(mu, sigma)
+        end
+        return m(; X) | (; y)
     elseif kind === :bound_design
         m = @rkppl begin
             alpha ~ Normal(0, 10)
@@ -35,7 +43,7 @@ function _gv_reactant_case(kind, n)
 end
 
 @testset "GLM objects over matrix values: compiled parity and retained structure" begin
-    for kind in (:zero_intercept, :bound_design, :vector_coefficients)
+    for kind in (:zero_intercept, :named_product, :bound_design, :vector_coefficients)
         structures = Dict{String,Int}[]
         for n in (4, 9)
             plan = _gv_reactant_case(kind, n)
