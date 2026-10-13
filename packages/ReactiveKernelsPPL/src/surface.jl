@@ -10405,6 +10405,18 @@ end
 
 # Anonymous value substructure becomes an offset. Model-level scalars
 # stay scalar assignments; preprocessing broadcasts them over the rows.
+function _anonymous_array_broadcast(ex, ctx)
+    ex isa Expr && ex.head === :call && !isempty(ex.args) || return false
+    op, n = ex.args[1], length(ex.args) - 1
+    ((op in (:.*, :.+) && n >= 1) ||
+     (op === :.- && n in (1, 2)) ||
+     (op in (:./, :.^) && n == 2)) || return false
+    return all(ex.args[2:end]) do arg
+        arg isa Number || (arg isa Symbol && _is_composed_scalar(arg, ctx)) ||
+            _anonymous_array_broadcast(arg, ctx)
+    end
+end
+
 function _extract_summand(pname, core, sign::Int, ctx)
     if core isa Symbol && core in ctx.value_arrays
         value = sign < 0 ? Expr(:call, :.-, core) : core
@@ -10414,6 +10426,18 @@ function _extract_summand(pname, core, sign::Int, ctx)
             (tree = leaf, subs = Symbol[], scalars = [leaf]), label, label), nothing
     end
     shape = _canon_shape(core, ctx)
+    if sign > 0 && shape === :array &&
+            _anonymous_array_broadcast(core, ctx) &&
+            !_composed_has_sub(core, ctx, true)
+        # An inline dotted arithmetic tree is one Julia broadcast. Keep it
+        # inside the predictor instead of materializing an anonymous array
+        # before adding sibling terms. Named operands remain named leaves.
+        subs, scalars, datas = Symbol[], Symbol[], Symbol[]
+        tree = _extract_composed_tree(pname, core, ctx, subs, scalars, datas)
+        label = Symbol(pname, :_array_value)
+        return TermSpec(ComposedTerm, ColumnRef[datas...],
+            (tree = tree, subs = subs, scalars = scalars), label, label), nothing
+    end
     if core isa Number || shape in (:scalar, :array)
         e = sign < 0 ? Expr(:call, :-, core) : core
         nm = _composed_scalar_leaf!(pname, e, ctx, Symbol[])

@@ -85,14 +85,17 @@ depth, parent, recipe)` entry per listed recipe, and `recipe_kind` classifies a
 single recipe as `:plate`, `:scan` or `:ordinary` (see [Inspecting
 structure](compiler.md#Inspecting-structure)).
 
-`readable_code(spec_or_plan)` shows the planned program as ordinary Julia,
-with every operation slot replaced by its authored source or name and no
-line-number annotations; `readable_code(prepared)` shows a prepared kernel,
-including data folded in by `bound=`. The result names the modules the authored
-sources were evaluated in and also displays as HTML. A global reference (`M.f`)
-shows by its bare name, as source spells it, unless the program also spells
-that name another way; the result then names `M` too. It is an explanation:
-`code_expr` remains the exact compiled AST.
+`readable_code(spec_or_plan)` and `readable_code(prepared)` show the generated
+Julia expression with only line-number metadata removed. Calls retain their
+`__ops__[k]` slots. The printed table indexes the callables by operation kind
+and shows a stored source-function expression when one is available;
+`code.operations[k]` holds the exact callable, including specialized
+operations after `bound=` preparation. For authored plates and scans the table
+also prints the nested kernel's exact expression and operation slots.
+`code.expr` is a copy of `code_expr`
+with line numbers removed. When the expression embeds an operation object,
+its textual AST display may not parse on its own; inspect `code.expr` and
+`code.operations` together. The result also displays as HTML.
 
 ```julia
 graph = kernel_graph(spec)

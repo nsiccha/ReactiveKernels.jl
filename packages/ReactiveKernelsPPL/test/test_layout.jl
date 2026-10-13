@@ -182,15 +182,14 @@ end
     ]
     @test jacobian_term(uentry) ==
         :(unit_bijector().logjac(unconstrained[2]))
-    # Interval transform: parameterized bounds ⇒ hand-rolled (not a bijector
-    # splice) — affine-logistic forward/inverse edges + bounded jacobian.
-    # Literal bound arithmetic is folded: the width is one number and
-    # `q - -2.0` reads `q + 2.0`.
+    # Interval transform: parameterized bounds ⇒ RK's owned affine-logistic
+    # forward rule, the log-ratio inverse and bounded Jacobian. Literal
+    # arithmetic in the latter edges still folds (`q - -2.0` is `q + 2.0`).
     blo, bhi = -2.0, 3.0
     ientry = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, blo, bhi)
     @test transform_statements(ientry) == Expr[
         :(_ppl_int_q::Float64 = unconstrained[3]),
-        :(q::Float64 = -2.0 + 5.0 / (1 + exp(-_ppl_int_q))),
+        :(q::Float64 = rk_affine_logistic(-2.0, 3.0, _ppl_int_q)),
         :(_ppl_int_q::Float64 = log(q + 2.0) - log(3.0 - q)),
     ]
     @test jacobian_term(ientry) == :(log(q + 2.0) + log(3.0 - q) - log(5.0))
@@ -200,13 +199,13 @@ end
     zentry = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, 0.0, 0.5)
     @test transform_statements(zentry) == Expr[
         :(_ppl_int_q::Float64 = unconstrained[3]),
-        :(q::Float64 = 0.5 / (1 + exp(-_ppl_int_q))),
+        :(q::Float64 = rk_affine_logistic(0.0, 0.5, _ppl_int_q)),
         :(_ppl_int_q::Float64 = log(q) - log(0.5 - q)),
     ]
     @test jacobian_term(zentry) == :(log(q) + log(0.5 - q) - log(0.5))
     uentry01 = LayoutEntry(:sampled, nothing, :q, [:q], 3, 1, :interval, -1.0, 0.0)
     @test transform_statements(uentry01)[2:3] == Expr[
-        :(q::Float64 = -1.0 + 1.0 / (1 + exp(-_ppl_int_q))),
+        :(q::Float64 = rk_affine_logistic(-1.0, 0.0, _ppl_int_q)),
         :(_ppl_int_q::Float64 = log(q + 1.0) - log(-q)),
     ]
     @test jacobian_term(uentry01) == :(log(q + 1.0) + log(-q))
@@ -221,17 +220,17 @@ end
         :(c::Float64 = -(exp(_ppl_up_c))),
         :(_ppl_up_c::Float64 = log(-c)),
     ]
-    # Plate blocks fold the same way, elementwise.
+    # Plate blocks broadcast the same rule.
     pentry = LayoutEntry(:plate, nothing, :d, [:d1, :d2], 1, 2, :interval, 0.0, 0.5)
     @test transform_statements(pentry)[2:3] == Expr[
-        :(d::AbstractVector{Float64} = 0.5 ./ (1 .+ exp.(-_ppl_int_d))),
+        :(d::AbstractVector{Float64} = rk_affine_logistic.(0.0, 0.5, _ppl_int_d)),
         :(_ppl_int_d::AbstractVector{Float64} = log.(d) .- log.(0.5 .- d)),
     ]
     @test jacobian_term(pentry) == :(sum((log.(d) .+ log.(0.5 .- d)) .- log(0.5)))
     # A sampled bound stays as authored.
     dentry = LayoutEntry(:sampled, nothing, :w, [:w], 2, 1, :interval, 0.0, :w_hi)
     @test transform_statements(dentry)[2:3] == Expr[
-        :(w::Float64 = w_hi / (1 + exp(-_ppl_int_w))),
+        :(w::Float64 = rk_affine_logistic(0.0, w_hi, _ppl_int_w)),
         :(_ppl_int_w::Float64 = log(w) - log(w_hi - w)),
     ]
     @test jacobian_term(dentry) == :(log(w) + log(w_hi - w) - log(w_hi))

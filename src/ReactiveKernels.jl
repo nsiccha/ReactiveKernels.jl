@@ -61,6 +61,7 @@ include("visualization.jl")
 include("display.jl")
 include("expm_rule.jl")
 include("symmetric_eigen_rules.jl")
+include("affine_logistic.jl")
 include("cholesky.jl")
 include("native_bdf.jl")
 
@@ -75,6 +76,7 @@ export prepare_ad_pullback, ad_pullback
 export ScalarDerivativeRule, scalar_derivative_rule, derivative_cut
 export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residuals
 export rk_expm, rk_symmetric_eigvals, rk_symmetric_eigvecs
+export rk_affine_logistic
 export rk_cholesky_lower
 export rk_ode_bdf_tol
 export has_forward_branch, has_reverse_branch, rule_inputs
