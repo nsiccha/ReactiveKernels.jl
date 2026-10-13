@@ -415,7 +415,9 @@ or a bound-only cell value that the pass has already evaluated per lane.
 5. The results are combined:
    - a sole `sum(pointwise)` consumer becomes a sum of the arm sums;
    - any other use of the pointwise vector reassembles it in lane order with
-     one gather.
+     one gather. Like the lane indices, its constant lane order is a bound
+     operand rather than data held by the operation, so a backend receives it
+     as an inactive array.
 
 A lane-invariant condition selects its arm without splitting.
 
