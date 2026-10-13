@@ -103,6 +103,29 @@ isdefined(@__MODULE__, :BranchPartition) ||
                       for (m, xi, yi, o) in zip(mu, xc, yc, obs)]
     end
 
+    @testset "reverse through a reassembled constant arm beside captured live values" begin
+        # Base's vcat of the constant arm's vector beside the live arm's fails
+        # native Reverse (EnzymeRuntimeActivityError, Enzyme 0.13.216); the
+        # reassembly concatenates as the native kernel body does.
+        xc = [0.2, -1.0, 0.5]
+        yc = [0.1, 0.0, 0.4]
+        obs = [true, false, true]
+        ref(u) = sum(o ? -0.5 * (yi - (u[1] + u[2] * sqrt(xi)))^2 : 0.0
+                     for (xi, yi, o) in zip(xc, yc, obs))
+        bound = prepare(C.guarded_location;
+                        bound = (; x = xc, y = yc, idx = collect(1:3), obs))
+        @test count(op -> op isa RK._LaneAssemble, bound.ops) == 1
+        u = [0.2, -0.3]
+        @test bound(u) ≈ ref(u)
+        pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), u; active = :u)
+        value, grad = RK.ad_value_and_gradient!(pb, similar(u), u)
+        @test value ≈ ref(u)
+        @test grad ≈ [sum(o ? (yi - (u[1] + u[2] * sqrt(xi))) * d : 0.0
+                          for (xi, yi, o, d) in zip(xc, yc, obs,
+                              j == 1 ? ones(3) : sqrt.(abs.(xc))))
+                      for j in 1:2]
+    end
+
     @testset "a bound-only cell condition partitions after caching" begin
         yv = [2.0, 0.5, 1.0, 3.0, 0.1]
         xv = [1.5, 2.5, 3.5, 0.5, 1.0]

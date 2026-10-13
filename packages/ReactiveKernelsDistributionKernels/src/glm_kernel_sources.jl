@@ -7,6 +7,9 @@
 #   - `logpdf(y)` — the summed log-density (the HMC objective;
 #     differentiated by generic AD, never a per-function rule);
 #   - `pointwise(y)` — per-observation log-densities (LOO etc.);
+#   - `logkernel(y)` / `lognormalizer(y)` (Poisson-log only) — the
+#     per-observation density split into the terms that read eta and the
+#     data-only normalizer; `pointwise` is their sum;
 #   - `score(y)` — dℓ/dη per observation (Stan's theta_derivative);
 #   - `eta` — the linear predictor `X * beta` (extractable owner node);
 #   - `mu` — the inverse-link fitted mean (extractable owner node);
@@ -40,7 +43,7 @@
 # data-only normalizer must stay a named, foldable temp).
 
 const BERNOULLI_LOGIT_GLM_KERNEL_SOURCE = raw"""
-using LogExpFunctions: logistic as _rk_logistic
+using LogExpFunctions: logistic as _rk_logistic, log1pexp
 
 @kernel bernoulli_logit_glm(
         X::Matrix{Float64}, beta::Vector{Float64}) = begin
@@ -54,22 +57,21 @@ using LogExpFunctions: logistic as _rk_logistic
     # runtime; core fuser bug). What survives: port-only broadcasts,
     # plain `sum(t)` / `sum(f, t)` / scalar combos over named temps,
     # and sibling-endpoint calls. So per-cell math nests fully to ports
-    # (the signed margin repeats textually; extra exps per cell), and
-    # `logpdf` sums the shared `pointwise` port instead of restating
+    # (a value read twice in one cell repeats textually, as in `score`),
+    # and `logpdf` sums the shared `pointwise` port instead of restating
     # the cells (scalar combos where a data-only normalizer must stay a
     # named, foldable temp).
     logpdf(y::Vector{Int})::Float64 = sum(pointwise(y))
-    # Signed-margin Bernoulli in Stan's cutoff-20 form: -log1p(em)
-    # interior, Taylor tails past |yt| > 20 (finite at +-Inf). One
-    # fused broadcast; the margin nests per branch (see NOTE).
+    # Signed-margin Bernoulli, the scalar `bernoulli(; logit)` object's
+    # form: -log1pexp(-s*eta) with s = 2y - 1, one log1pexp per cell.
+    # Exact in both tails; -Inf only where the probability is 0 (eta
+    # infinite against y), and log1pexp's lazy branches keep the
+    # gradient finite at every eta.
     pointwise(y::Vector{Int})::Vector{Float64} =
-        ifelse.(((2 .* y .- 1) .* eta) .> 20.0,
-            0.0 .- exp.(0.0 .- ((2 .* y .- 1) .* eta)),
-            ifelse.((((2 .* y .- 1) .* eta)) .< -20.0, ((2 .* y .- 1) .* eta),
-                0.0 .- log1p.(exp.(0.0 .- ((2 .* y .- 1) .* eta)))))
-    # dℓ/dη per cell: s*em/(em+1) interior, s*em / s past the
-    # em-magnitude cutoffs (same edges as the value's +-20). Fully
-    # nested (even scalar temps drop edges here — see NOTE).
+        0.0 .- log1pexp.((1 .- 2 .* y) .* eta)
+    # dℓ/dη per cell, Stan's theta_derivative: s*em/(em+1) interior,
+    # s*em / s past the em-magnitude cutoffs exp(-+20). Fully nested
+    # (even scalar temps drop edges here — see NOTE).
     score(y::Vector{Int})::Vector{Float64} =
         ifelse.(exp.(0.0 .- (2 .* y .- 1) .* eta) .< exp(-20.0),
             (2 .* y .- 1) .* exp.(0.0 .- (2 .* y .- 1) .* eta),
@@ -118,19 +120,20 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources: loggamma
     mu::Vector{Float64} = exp.(eta)
     working_weights::Vector{Float64} = mu
 
+    # Per observation, the density splits like the scalar `poisson`
+    # object's: `logkernel` is Stan's y*eta - exp(eta) (no cutoff; Stan
+    # has none either), and `lognormalizer` is the data-only -log(y!).
+    # Over a bound y the normalizer is a bind-time value, so `logpdf`'s
+    # `cterm` folds to a constant at prepare time, and a caller that sums
+    # `logkernel` and adds the normalizer's sum evaluates no `loggamma`.
+    logkernel(y::Vector{Int})::Vector{Float64} = y .* eta .- exp.(eta)
+    lognormalizer(y::Vector{Int})::Vector{Float64} = 0.0 .- loggamma.(y .+ 1)
+    # Scalar combo over sibling endpoints (see bernoulli NOTE).
     logpdf(y::Vector{Int})::Float64 = begin
-        # Stan's form with no cutoff (Stan has none either): y*eta -
-        # exp(eta), minus the data-only lgamma normalizer (bound y
-        # folds `cterm` to a constant at prepare time). Scalar combo:
-        # each temp is a port-only broadcast (see bernoulli NOTE).
-        cterm::Float64 = sum(loggamma.(y .+ 1))
-        et::Vector{Float64} = exp.(eta)
-        sum(y .* eta) - sum(et) - cterm
+        cterm::Float64 = sum(lognormalizer(y))
+        sum(logkernel(y)) + cterm
     end
-    # Port-only leaves throughout (see bernoulli NOTE): the normalizer
-    # nests into the one fused cells broadcast.
-    pointwise(y::Vector{Int})::Vector{Float64} =
-        y .* eta .- exp.(eta) .- loggamma.(y .+ 1)
+    pointwise(y::Vector{Int})::Vector{Float64} = logkernel(y) .+ lognormalizer(y)
     score(y::Vector{Int})::Vector{Float64} = y .- exp.(eta)
 end
 """

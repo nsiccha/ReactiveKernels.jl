@@ -1844,7 +1844,7 @@ function _mixture_component_lpdf(f::LikelihoodFamily, r::LikelihoodSpec,
     throw(ContractValidationError("[generator] mixture over $f has no cell emitter"))
 end
 
-# A GLM-object response: one fused constructed-endpoint application
+# A GLM-object response: fused constructed-endpoint applications
 # over the whole column (no plate — the object owns eta). The
 # intercept-free design matrix gains its ones column from the bound
 # row count (data-only, folds at prepare) and the split coefficients
@@ -1876,9 +1876,7 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     bfull = Symbol(:_ppl_glm_b_, r.label)
     yconv = r.family === NormalIDGLMFam ? :Float64 : :Int
     s = r.scale isa Symbol ? r.scale : :(Float64($(r.scale)))
-    call = r.family === NormalIDGLMFam ?
-        :($obj($xaug, $bfull, $s).pointwise($yf)) :
-        :($obj($xaug, $bfull).pointwise($yf))
+    o = r.family === NormalIDGLMFam ? :($obj($xaug, $bfull, $s)) : :($obj($xaug, $bfull))
     design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
     n = r.mi_jobs === nothing ? _response_rows_source(plan, r) : Expr(:call, :length, r.mi_jobs)
     # A literal zero intercept adds nothing: the object reads X and beta as
@@ -1886,12 +1884,32 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     xaug_expr, bfull_expr = r.glm_alpha isa Real && iszero(r.glm_alpha) ?
         (:(Float64.($design)), :([$(r.glm_beta);])) :
         (:(hcat(ones($n), $design)), :([$(r.glm_alpha); $(r.glm_beta)]))
-    return Expr[
+    head = Expr[
         :($yf = $yconv.($y)),
         :($xaug = $xaug_expr),
         :($bfull = $bfull_expr),
-        :($pw = $call),
-        :($node::Float64 = sum($pw)),
+    ]
+    r.family === PoissonLogGLMFam &&
+        return Expr[head..., _poisson_glm_split_stmts(r, o, yf, pw, node)...]
+    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = sum($pw))]
+end
+
+# The Poisson-log object's density in its two endpoint parts, as a count plate
+# sums them (`_count_plate_stmts!`): `logkernel` reads eta, and
+# `lognormalizer`, `-log(y!)`, reads the bound response only, so preparation
+# folds it and its sum and no `loggamma` runs per evaluation. The pointwise
+# vector adds the two, so a sweep that retains it evaluates the kernel once.
+function _poisson_glm_split_stmts(r::LikelihoodSpec, o::Expr, yf::Symbol,
+        pw::Symbol, node::Symbol)
+    pwk, kern = Symbol(:_ppl_pwk_, r.label), Symbol(:_ppl_kernel_, r.label)
+    pwn, norm = Symbol(:_ppl_pwn_, r.label), Symbol(:_ppl_lnorm_, r.label)
+    return Expr[
+        :($pwk = $o.logkernel($yf)),
+        :($pwn = $o.lognormalizer($yf)),
+        :($pw = $pwk .+ $pwn),
+        :($kern::Float64 = sum($pwk)),
+        :($norm = sum($pwn)),
+        :($node::Float64 = $kern + $norm),
     ]
 end
 
