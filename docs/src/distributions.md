@@ -163,12 +163,14 @@ observation domain to `-Inf` with a lazy branch and expose `logpdf`, `cdf` and
 iterative search rather than a pure straight-line endpoint. The generic `plate`
 API lifts each `.logpdf` over independent counts without family-specific code.
 
-Their `logpdf` is the sum of two endpoints: `lognormalizer(y)`, the data-only
-term (the log binomial coefficient, or `-log(y!)`), and `logkernel(y)`, the
-terms that read the parameters. `zero_inflated_binomial` has the same pair. A
-plate of `lognormalizer` cells over bound counts and trials is a bind-time
-value, so a likelihood that sums `logkernel` cells and adds that plate evaluates
-no `loggamma` per call.
+Their `logpdf` equals the sum of two further endpoints: `lognormalizer(y)`, the
+data-only term (the log binomial coefficient, or `-log(y!)`), and
+`logkernel(y)`, the terms that read the parameters. `zero_inflated_binomial` has
+the same pair. A plate of `lognormalizer` cells over bound counts and trials is
+a bind-time value, so a likelihood that sums `logkernel` cells and adds that
+plate evaluates no `loggamma` per call. Keep the two in separate plates:
+summing them inside one differentiated cell trips a released-Enzyme reverse
+compilation failure, which is also why `logpdf` is written out.
 
 ```@eval
 Main.ReactiveKernelsDocs.execute_example(
