@@ -38,6 +38,24 @@ function _gv_check(plan, data, lik)
     return built
 end
 
+@testset "zero-centered Normal vector prior scales before squaring" begin
+    m = @rkppl begin
+        beta[1:2] .~ Normal.(0, 1e150)
+    end
+    plan = bind_data(m())
+    built = build_kernel(plan)
+    u = [1e160, 0.0]
+    expected = sum(logpdf.(Normal(0, 1e150), u))
+    prior = prepare_query(built, plan, :prior)
+    @test isfinite(Base.invokelatest(prior, u))
+    @test Base.invokelatest(prior, u) ≈ expected rtol = 1e-12
+    q = prepare_sampler(built, plan, u; backend = _GV_BACKEND)
+    g = similar(u)
+    value, _ = sampler_value_and_gradient!(q, g, u)
+    @test value ≈ expected rtol = 1e-12
+    @test g ≈ [-1e-140, 0.0] rtol = 1e-10
+end
+
 @testset "GLM objects over bound data matrices and literal intercepts" begin
     n = 7
     X, y, counts, flags = _gv_X(n), _gv_y(n), _gv_counts(n), _gv_flags(n)
