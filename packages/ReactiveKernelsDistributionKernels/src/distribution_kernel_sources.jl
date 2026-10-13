@@ -367,6 +367,17 @@ const CAUCHY_LOGDENSITY = extract(cauchy;
 const LAPLACE_LOGDENSITY = extract(laplace;
     have = (:x, :location, :scale), want = :logpdf)
 
+# Keep scalar half-family priors as one named call in generated PPL programs.
+# The prepared endpoint is shared, so a density evaluation never prepares the
+# distribution graph again. Support is checked by the PPL's existing guard or
+# positive-coordinate transform before these on-support calls are reached.
+const _HALF_NORMAL_BASE = prepare(NORMAL_LOGDENSITY)
+const _HALF_CAUCHY_BASE = prepare(CAUCHY_LOGDENSITY)
+@inline _half_normal_logpdf_on_support(x::Float64, scale::Float64) =
+    _HALF_NORMAL_BASE(x, 0.0, scale) + log(2)
+@inline _half_cauchy_logpdf_on_support(x::Float64, scale::Float64) =
+    _HALF_CAUCHY_BASE(x, 0.0, scale) + log(2)
+
 # `p` and `logit` are the two equivalent success-probability HAVE routes.
 # `logpdf` carries a route per HAVE: the planner picks whichever is directly
 # reachable (each is a self-contained fused recipe at cost 1.0, so the native
