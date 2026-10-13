@@ -10,7 +10,7 @@ using ReactiveKernels, DifferentiationInterface, Enzyme, Test
 # spellings compare equal exactly when they lower to the same program.
 function _closure_program(k)
     names = Dict{String,String}()
-    replace(string(readable_code(k)),
+    replace(string(ReactiveKernels._readable_expr(code_expr(k), k)),
             r"var\"[^\"]*\"" => m -> get!(names, m, "v$(length(names) + 1)"))
 end
 

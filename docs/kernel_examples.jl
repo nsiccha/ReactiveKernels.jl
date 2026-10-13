@@ -86,14 +86,8 @@ function _display_code(label::AbstractString, code::AbstractString;
 end
 
 function _readable_generated_source(expr::Expr, context, label)
-    readable = ReactiveKernels._readable_expr(expr, context)
-    occursin(r"__ops__\[\d+\]", string(readable)) && error(
-        "$label readable generated view retained an opaque operation slot",
-    )
-    occursin(r"\boperation\(", string(readable)) && error(
-        "$label readable generated view retained an unnamed operation",
-    )
-    _generated_source(readable)
+    expr == code_expr(context) || error("$label generated expression changed")
+    string(readable_code(context))
 end
 
 # --- eval-throughput visualization ----------------------------------------

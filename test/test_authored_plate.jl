@@ -1097,7 +1097,7 @@ end
 
     # The same seed when a summed plate consumes a scan in its loop.
     scanned = prepare(U.scan_total)
-    @test !occursin("trajectory", sprint(show, readable_code(scanned)))
+    @test !occursin("trajectory", string(code_expr(scanned)))
     @test scanned([1.0, 2.0]) === 8.0
     @test scanned(Float64[]) === 0.0
 end
@@ -1480,7 +1480,8 @@ end
     return sum(path)
 end
 _emitted_count(kernel, literal) =
-    count(_ -> true, eachmatch(literal, string(readable_code(kernel))))
+    count(_ -> true, eachmatch(literal,
+        string(ReactiveKernels._readable_expr(code_expr(kernel), kernel))))
 
 @testset "authored plate native: each cell recipe is emitted once" begin
     xs = collect(range(-1.0, 2.0; length = 7))
@@ -1556,7 +1557,8 @@ _unguarded(kernel) = (code = string(readable_code(kernel));
 # The generated body with gensym counters and the argument line removed: a
 # bound port is a constant line instead of an argument.
 _lowered_body(kernel) = [replace(line, r"#\d+" => "#")
-    for line in split(string(readable_code(kernel)), '\n')
+    for line in split(string(ReactiveKernels._readable_expr(
+        code_expr(kernel), kernel)), '\n')
     if !startswith(line, "function") && !occursin(r"^\s*xs = ", line)]
 
 @testset "authored plate native: bound plate arguments lower as their class" begin

@@ -1,4 +1,6 @@
 using Test, ReactiveKernelsPPL
+using DifferentiationInterface: AutoEnzyme
+import Enzyme
 import ReactiveKernels
 import Distributions as D
 
@@ -20,6 +22,31 @@ function _parameter_prior_check(expr, columns, q, density)
     expected = density(q) + logjac(built.layout, u)
     @test actual ≈ expected atol = 1e-12 rtol = 1e-12
     return bound, built, kernel, u
+end
+
+@testset "bounded Poisson-log coefficient keeps a finite native gradient" begin
+    data = Dict(:year => [-1000.0], :counts => [1])
+    plan = lower_rkppl(quote
+        alpha ~ Normal(0, 1)
+        beta ~ Uniform(-10, 10)
+        eta = alpha .+ beta .* year
+        counts .~ Poisson.(exp.(eta))
+    end, keys(data); conditioned = keys(data))
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    @test coordinate_names(built.layout) == [:alpha, :beta]
+    u = unconstrain(built.layout, (alpha = 0.0, beta = -0.7))
+    sampler = prepare_sampler(built, bound, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse), warm = true)
+    g = similar(u)
+    value, _ = sampler_value_and_gradient!(sampler, g, u)
+    rate = exp(700.0)
+    slope = 20.0 * 0.465 * 0.535
+    expected = (1.0 - rate) * (-1000.0) * slope
+    @test isfinite(value)
+    @test value ≈ 700.0 - rate rtol = 1e-11
+    @test isfinite(g[2])
+    @test g[2] ≈ expected rtol = 1e-10
 end
 
 _numeric_prior_scale(x) = 2x

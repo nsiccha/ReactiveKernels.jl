@@ -2498,7 +2498,7 @@ end
     @test ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :logjac)(u) ≈ lj
     @test ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :unconstrain)(x) ≈ u
     @test lo < ReactiveKernelsPPL._prepared_interval_endpoint(lo, hi, :constrain)(u) < hi
-    # graph splice with literal bounds inlines (no runtime call) and evaluates
+    # graph splice removes the interval_bijector wrapper and evaluates
     spec = @kernel _itest(unconstrained::Vector{Float64}) = begin
         q::Float64 = interval_bijector(-2.0, 5.0).constrain(sum(view(unconstrained, 1:1)))
         qlj::Float64 = interval_bijector(-2.0, 5.0).logjac(sum(view(unconstrained, 1:1)))
