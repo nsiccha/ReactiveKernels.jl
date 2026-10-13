@@ -5,9 +5,10 @@
 # the executable AST and its operation tuple; the `Graph` text listing is the
 # structural view.
 
-# Only source-location metadata is removed from the public code display.
-# In particular, operation calls, argument evaluation, globals and scopes must
-# stay exactly as they are in `code_expr`.
+# Only source-location metadata is removed from the executable expression in
+# the public code display. Graph aliases elided from that expression are shown
+# separately as comments; operation calls, argument evaluation, globals and
+# scopes stay exactly as they are in `code_expr`.
 _strip_display_linenums(x) = x
 function _strip_display_linenums(ex::Expr)
     args = Any[]
@@ -324,6 +325,9 @@ is the kernel's own operation tuple. The printed operation table indexes those
 same objects by kind and, for source operations, their definition token and
 stored generated source-function expression where available;
 it never substitutes authored source for an operation preparation changed.
+`code.aliases` records graph names omitted from the executable expression as
+`alias => displayed_name` pairs. They print as comments, not assignments, so
+they add no work to the prepared kernel.
 The string is for inspection. If the expression embeds an operation object,
 Julia's textual AST display may contain dollar-sign interpolation syntax that cannot
 be parsed on its own; `code.expr` retains the executable object.
@@ -332,10 +336,38 @@ struct ReadableCode{O<:Tuple}
     expr::Any
     modules::Vector{Module}
     operations::O
+    aliases::Vector{Pair{Symbol,Symbol}}
 end
 
+ReadableCode(expr, modules::Vector{Module}, operations::Tuple) =
+    ReadableCode(expr, modules, operations, Pair{Symbol,Symbol}[])
 ReadableCode(expr, modules::Vector{Module}) = ReadableCode(expr, modules, ())
 ReadableCode(expr) = ReadableCode(expr, Module[], ())
+
+# A plan retains every name in a canonical graph-value class even when its
+# selected executable binds that class under only one name. Show only omitted
+# names whose selected binding actually occurs in this expression. A name
+# belonging to more than one selected class is ambiguous, so omit it.
+function _display_elided_aliases(p::Plan, expr::Expr)
+    present = _display_plain_symbols!(Set{Symbol}(), expr)
+    names = _varnames(p)
+    groups = _value_groups(p.graph)
+    candidates = Pair{Symbol,Symbol}[]
+    for id in sort!(collect(keys(names)))
+        displayed = names[id]
+        displayed in present || continue
+        for name in unique(v.name for v in get(groups, id, Value[]))
+            (name === displayed || name in present || _generated_value_name(name)) &&
+                continue
+            push!(candidates, name => displayed)
+        end
+    end
+    counts = Dict{Symbol,Int}()
+    for (alias, _) in candidates
+        counts[alias] = get(counts, alias, 0) + 1
+    end
+    Pair{Symbol,Symbol}[pair for pair in candidates if counts[first(pair)] == 1]
+end
 
 """
     readable_code(spec::KernelSpec; have, want) -> ReadableCode
@@ -347,15 +379,18 @@ Show the generated expression with only line-number annotations removed.
 Operation calls retain their `__ops__[k]` slots; `code.operations[k]` is the
 callable in that slot, including specialized operations after `bound=`. A
 `KernelSpec` is planned at its default boundary unless `have`/`want` are given.
-An `Expr` is shown as written. The argument is never mutated.
+Elided graph aliases print as explanatory comments for plans and prepared
+kernels. An `Expr` is shown as written. The argument is never mutated.
 """
 function readable_code(p::Plan)
     ast, ops, _ = lower_with_ops(p)
-    ReadableCode(_strip_display_linenums(ast), Module[], ops)
+    expr = _strip_display_linenums(ast)
+    ReadableCode(expr, Module[], ops, _display_elided_aliases(p, expr))
 end
 
 function readable_code(k::PreparedKernel)
-    ReadableCode(_strip_display_linenums(code_expr(k)), Module[], k.ops)
+    expr = _strip_display_linenums(code_expr(k))
+    ReadableCode(expr, Module[], k.ops, _display_elided_aliases(k.plan, expr))
 end
 
 readable_code(spec::KernelSpec; kwargs...) = readable_code(plan(spec; kwargs...))
@@ -438,6 +473,13 @@ function _print_readable(io::IO, code::ReadableCode)
     if !isempty(code.modules)
         print(io, "# supplied modules: ",
               join(string.(code.modules), ", "), "\n")
+    end
+    if !isempty(code.aliases)
+        print(io, "# elided graph aliases (same value; no extra computation):\n")
+        for (alias, displayed) in code.aliases
+            print(io, "#   ", sprint(Base.show_unquoted, alias), " = ",
+                  sprint(Base.show_unquoted, displayed), "\n")
+        end
     end
     _print_code(IOContext(io, :limit => false), code.expr)
     if !isempty(code.operations)

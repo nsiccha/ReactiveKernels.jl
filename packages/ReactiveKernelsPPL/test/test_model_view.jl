@@ -14,6 +14,25 @@ const CALLS = Ref(0)
 halved(x) = (CALLS[] += 1; x ./ 2)
 end
 
+@testset "prepared display explains elided posterior component names" begin
+    model = @rkppl begin
+        sigma ~ Exponential(1.0)
+        y .~ Normal.(0.0, sigma)
+    end
+    bound = model() | (; y = [0.2, 0.5, -0.1])
+    built = build_kernel(bound)
+    query = prepare_query(built, bound, :sampler)
+    code = readable_code(query)
+    rendered = string(code)
+    @test occursin("# elided graph aliases (same value; no extra computation):", rendered)
+    for name in (:prior, :likelihood, :log_jacobian)
+        @test count(pair -> first(pair) === name, code.aliases) == 1
+        @test occursin(Regex("(?m)^#   $(name) = "), rendered)
+    end
+    @test code.expr == Base.remove_linenums!(deepcopy(code_expr(query)))
+    @test Base.invokelatest(query, [0.1]) isa Float64
+end
+
 _has_linenumber(x) = x isa LineNumberNode ||
     x isa Expr && any(_has_linenumber, x.args)
 
