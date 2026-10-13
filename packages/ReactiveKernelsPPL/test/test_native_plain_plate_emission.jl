@@ -1,5 +1,29 @@
 using Test, ReactiveKernelsPPL, ReactiveKernels, DifferentiationInterface, Enzyme
 
+@testset "bound in-cell observations keep embedded operation tables aligned" begin
+    # The docs corpus prepares this plate with its observation data bound.
+    # Its shared Normal support branch must reserve the same operation slots
+    # in the native and tensorized companions.
+    model = @rkppl begin
+        sigma ~ Exponential(1.0)
+        b0 ~ Normal(0.0, 1.0)
+        @plate for i in eachindex(obs)
+            mu = (b0 * dose[i]) * t[i]
+            obs[i] ~ Normal(mu, sigma)
+        end
+    end
+    t = [0.5, 1.0, 2.0, 0.5, 1.0, 2.0]
+    dose = [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]
+    obs = [0.5, 1.2, 2.1, 0.8, 1.5, 2.5]
+    plan = model(; t, dose) | (; obs)
+    built = build_kernel(plan)
+    u = collect(range(-0.5, 0.5; length = built.layout.total))
+    kernel = prepare_query(built, plan, :sampler)
+    @test isfinite(kernel(u))
+    with_evidence = prepare_query(built, plan, :sampler; exemplars = (u,))
+    @test with_evidence(u) ≈ kernel(u)
+end
+
 @testset "native scalar intercept over a vector value" begin
     m = @rkppl begin
         alpha ~ Normal(0, 10)

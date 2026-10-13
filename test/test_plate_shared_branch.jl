@@ -36,6 +36,12 @@ end
     total = sum(cells)
     return total
 end
+@kernel _guarded_untyped(x, s) = begin
+    cells = plate(x, s) do xi, si
+        si > 0 ? xi * log(si) : -xi
+    end
+    total = sum(cells)
+end
 @kernel _guarded_elseif(x, s) = begin
     cells = plate(x) do xi
         if s > 1
@@ -119,6 +125,13 @@ function _program(k)
     names = Dict{String,String}()
     replace(string(ReactiveKernels._readable_expr(code_expr(k), k)),
             r"var\"[^\"]*\"" => m -> get!(names, m, "v$(length(names) + 1)"))
+end
+
+@testset "exemplar scalar evidence keeps embedded operation tables aligned" begin
+    x = [1.0, 2.0, 3.0]
+    k = prepare(_guarded_untyped; exemplars = (x, 2.0))
+    @test k(x, 2.0) ≈ sum(x) * log(2.0)
+    @test k(x, -2.0) == -sum(x)
 end
 
 @testset "a shared plate branch is decided once per call" begin
