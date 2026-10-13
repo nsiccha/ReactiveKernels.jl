@@ -1351,6 +1351,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # other consumers, including reductions, extracted leaves and the
     # retained recurrence body. Keep their definition dependencies too.
     needed = copy(declaration_dependencies)
+    # A GLM object reads its arguments whole, by name.
+    for r in responses
+        _is_glm_family(r.family) || continue
+        for nm in (r.predictor, r.glm_alpha, r.glm_beta, r.scale)
+            nm isa Symbol && !haskey(ctx.matrices, nm) && push!(needed, nm)
+        end
+    end
     for observation in external_observations
         push!(needed, observation.name)
         union!(needed, _value_symbols(observation.args.rhs))
@@ -2812,7 +2819,10 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
             if any(in(data), observed) ||
                     (_is_broadcast_sample(st) && any(in(defined), observed))
                 stem = first(sort!(collect(observed)))
-                rhs = _map_rhs_arguments(st.args[3]) do value, head, position, nargs
+                rhs = _glm_argument_names(st.args[3]) do value, role
+                    name!(value, stem, role)
+                end
+                rhs = _map_rhs_arguments(rhs) do value, head, position, nargs
                     _bind_module_calls(value) do call
                         role = call === value ?
                             _argument_role(head, position, nargs) : nothing
@@ -2826,6 +2836,30 @@ function _observation_call_definitions(ast::Expr, data::Set{Symbol},
         push!(out, st)
     end
     return Expr(:block, out...)
+end
+
+# A GLM object reads each argument whole, so an inline argument is its
+# named definition (`y_design`, `y_intercept`, `y_coefficients`,
+# `y_scale`), including inside an evidence wrapper. Names and numbers stay.
+function _glm_argument_names(name, rhs)
+    rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || return rhs
+    head = _rhs_head_symbol(rhs.args[1])
+    if head in (:truncated, :censored, :interval_censored) && length(rhs.args) >= 2
+        return Expr(:call, rhs.args[1], _glm_argument_names(name, rhs.args[2]),
+            rhs.args[3:end]...)
+    end
+    head in _GLM_HEADS || return rhs
+    args = rhs.args[2:end]
+    nargs = count(a -> !Meta.isexpr(a, :parameters), args)
+    position = 0
+    out = Any[]
+    for a in args
+        Meta.isexpr(a, :parameters) && (push!(out, a); continue)
+        position += 1
+        push!(out, a isa Expr ?
+            name(a, _argument_role(head, position, nargs)) : a)
+    end
+    return Expr(:call, rhs.args[1], out...)
 end
 
 # A whole argument's role: its keyword's name, or its positional role.
@@ -3491,11 +3525,16 @@ end
 function _ordinary_hcat_values(sample, det, data, glms)
     detmap = Dict{Symbol,Any}(det)
     mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
-    glm_mats = Set{Symbol}(g.matrix for g in glms)
+    params = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
+    # A GLM object reads its design matrix whole. An `hcat` of bare data or
+    # derived columns keeps the fused design-matrix recipe; any other
+    # `hcat` (an intercept `ones(length(x))` column, a parameter column)
+    # is an ordinary matrix value the object reads by name.
+    glm_mats = Set{Symbol}(g.matrix for g in glms if g.matrix in mats &&
+        _glm_design_hcat(detmap[g.matrix], params))
     setdiff!(mats, glm_mats)
     generic = Set{Symbol}()
     isempty(mats) && return generic
-    params = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     coefvec = Set{Symbol}(s.lhs for s in sample
         if s.broadcast && s.matrix !== nothing)
     arrays = Set{Symbol}(s.lhs for s in sample if s.dims !== nothing ||
@@ -3568,8 +3607,17 @@ function _ordinary_hcat_values(sample, det, data, glms)
         walk(s.rhs)
     end
     union!(generic, setdiff(mats, used))
+    # The GLM reads these whole, as values.
+    for g in glms
+        g.matrix in mats && push!(generic, g.matrix)
+    end
     return generic
 end
+
+# An `hcat` the GLM design-matrix recipe builds: bare columns, none of
+# them a sampled value.
+_glm_design_hcat(rhs, params) = length(rhs.args) > 1 &&
+    all(a -> a isa Symbol && a ∉ params, rhs.args[2:end])
 
 function _resolve_hcat_values(ex; keep = false, resolve = identity)
     ex isa Expr || return ex
@@ -5778,15 +5826,17 @@ end
 
 """One whole-data GLM-object statement
 (`y ~ NormalIDGLM(X, alpha, beta, sigma)`): the response column, the
-head family, the intercept-free design-matrix name, the scalar
-intercept and coefficient-vector parameters, and the Normal sigma
-(parameter name or positive literal, `nothing` otherwise). Plain `~`
-only — the object owns eta over the whole column, never broadcasts."""
+head family, and the values the object reads whole: the design matrix,
+the scalar intercept (a name or a literal number), the coefficient
+vector and the Normal sigma (a name or a literal number, `nothing`
+otherwise). Inline arguments arrive as their named definitions
+(`_observation_call_definitions`). Plain `~` only — the object owns eta
+over the whole column, never broadcasts."""
 struct GLMSampleStmt
     response::Symbol
     head::Symbol
     matrix::Symbol
-    alpha::Symbol
+    alpha::Union{Symbol,Float64}
     beta::Symbol
     sigma::Any
     line::Int
@@ -5820,11 +5870,12 @@ function _parse_glm_stmt(st::Expr, line::Int, data::Set{Symbol})
                                    "$usage, got $(length(args)) arguments")
     X, alpha, beta = args[1], args[2], args[3]
     X isa Symbol || _sfail("response $lhs: `$head` design matrix " *
-                           "must be a name (`X = hcat(...)`), got $(repr(X))")
-    alpha isa Symbol || _sfail("response $lhs: `$head` intercept " *
-                               "must be a parameter name, got $(repr(alpha))")
+                           "must be a matrix value, got $(repr(X))")
+    (alpha isa Symbol || alpha isa Real) || _sfail("response $lhs: " *
+        "`$head` intercept must be a scalar value, got $(repr(alpha))")
+    alpha isa Real && (alpha = Float64(alpha))
     beta isa Symbol || _sfail("response $lhs: `$head` coefficients " *
-                              "must be a parameter name, got $(repr(beta))")
+                              "must be a vector value, got $(repr(beta))")
     sigma = nothing
     if head === :NormalIDGLM
         sigma = args[4]
@@ -7363,7 +7414,9 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
             return _lower_location(lhs, loc, pred_link, ctx, predictors,
                 pred_idx, coefuse; value = true, synth = Symbol(lhs, "_mix_", k, "_eta"))
         end
-        if haskey(ctx.detmap, loc) && pred_link === IdentityLink
+        # A declared array is a value, as its named twin `loc = theta` is.
+        if (haskey(ctx.detmap, loc) || _is_declared_array(loc, ctx)) &&
+                pred_link === IdentityLink
             return _lower_location(lhs, loc, pred_link, ctx, predictors,
                 pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
                 value = true)
@@ -7695,45 +7748,57 @@ function _lower_glm_response(g::GLMSampleStmt, sample, prior_names::Set{Symbol},
     fam, link = g.head === :NormalIDGLM ? (NormalIDGLMFam, IdentityLink) :
         g.head === :BernoulliLogitGLM ? (BernoulliLogitGLMFam, LogitLink) :
         (PoissonLogGLMFam, LogLink)
+    label = Symbol(g.response, "_resp")
+    # The object reads each argument whole: data, a definition or a sampled
+    # value. A bare-column `hcat` keeps its fused design-matrix recipe.
+    known(nm) = nm in ctx.taken
     m = get(ctx.matrices, g.matrix, nothing)
-    m === nothing && _sfail("response $(g.response): `$(g.head)` " *
-                            "design matrix $(g.matrix) is not a bound " *
-                            "design matrix (`$(g.matrix) = hcat(...)`)")
-    any(c -> c === nothing, m.columns) && _sfail(
+    m === nothing && !known(g.matrix) && _sfail(
         "response $(g.response): `$(g.head)` design matrix $(g.matrix) " *
-        "has an intercept-ones position — pass intercept-free X and a " *
-        "separate alpha")
+        "is undefined — bind it as data or define it " *
+        "(`$(g.matrix) = hcat(...)`)")
     for (nm, role) in ((g.alpha, "intercept"), (g.beta, "coefficients"))
+        nm isa Symbol || continue
         haskey(coefuse, nm) && nm ∉ ctx.ordinary_parameters && _sfail(
             "response $(g.response): `$(g.head)` $role $nm is also a " *
             "predictor coefficient — one use per name")
     end
-    g.alpha in prior_names || _sfail(
+    g.alpha isa Symbol && !known(g.alpha) && _sfail(
         "response $(g.response): `$(g.head)` intercept $(g.alpha) " *
         "needs a prior statement (`$(g.alpha) ~ Normal(0, 10)`)")
-    for s in sample
-        s.lhs === g.beta || continue
-        if s.matrix === nothing
-            _sfail("response $(g.response): `$(g.head)` coefficient " *
-                   "vector $(g.beta) needs a broadcast prior " *
-                   "(`$(g.beta)[axes($(g.matrix), 2)] .~ Normal.(...)`)")
+    g.alpha isa Symbol && (g.alpha in ctx.vector_params ||
+        haskey(ctx.array_dims, g.alpha) ||
+        get(ctx.detshape, g.alpha, :scalar) in (:vector, :matrix)) && _sfail(
+        "response $(g.response): `$(g.head)` intercept $(g.alpha) is " *
+        "an array; the object takes one scalar intercept (a " *
+        "per-observation intercept is not built yet)")
+    if g.beta in prior_names && g.beta ∉ ctx.ordinary_parameters
+        # An unsized broadcast prior takes its size from the matrix.
+        for s in sample
+            s.lhs === g.beta || continue
+            if s.matrix === nothing
+                _sfail("response $(g.response): `$(g.head)` coefficient " *
+                       "vector $(g.beta) needs a broadcast prior " *
+                       "(`$(g.beta)[axes($(g.matrix), 2)] .~ Normal.(...)`)")
+            end
+            s.matrix === g.matrix || _sfail(
+                "response $(g.response): `$(g.head)` coefficient prior " *
+                "sizes $(s.matrix), not the response matrix $(g.matrix)")
         end
-        s.matrix === g.matrix || _sfail(
-            "response $(g.response): `$(g.head)` coefficient prior " *
-            "sizes $(s.matrix), not the response matrix $(g.matrix)")
+        glmuse[g.beta] = (label, g.matrix)
+    elseif !known(g.beta)
+        _undeclared_vector(g.beta, g.matrix, label)
     end
     sigma = g.sigma
     if sigma isa Symbol
-        sigma in prior_names || _sfail(
+        known(sigma) || _sfail(
             "response $(g.response): `$(g.head)` sigma $sigma needs " *
             "a prior statement or a positive literal")
         haskey(coefuse, sigma) && sigma ∉ ctx.ordinary_parameters && _sfail(
             "response $(g.response): `$(g.head)` sigma $sigma is also " *
             "a predictor coefficient — one use per name")
     end
-    label = Symbol(g.response, "_resp")
-    push!(ctx.matrices_used, g.matrix)
-    glmuse[g.beta] = (label, g.matrix)
+    m === nothing || push!(ctx.matrices_used, g.matrix)
     ev = g.wrapper === nothing ? ResponseEvidence(:none, nothing, nothing) :
         first(_peel_evidence(g.response, g.wrapper, ctx))
     return LikelihoodSpec(fam, link, g.response, g.matrix, sigma, nothing,
@@ -8099,6 +8164,13 @@ struct _BareSlot
     name::Symbol
 end
 
+# A bare name such a slot marks: a sampled scalar (or a data column, which
+# `_lower_location` refuses with the link guidance). A declared array
+# (`Poisson.(lam)` with `lam[axes(y, 1)] .~ …`) is an ordinary value read
+# under the identity link, exactly as its named twin `r = lam` is.
+_bare_slot_name(arg, ctx) = arg isa Symbol && !haskey(ctx.detmap, arg) &&
+    !_is_declared_array(arg, ctx)
+
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
                                  "got $(repr(rhs))")
@@ -8125,7 +8197,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `normcdf`/`cexpexp` for the inverse link)")
-        if args[1] isa Symbol && !haskey(ctx.detmap, args[1])
+        if _bare_slot_name(args[1], ctx)
             # Bare sampled parameter (constrained-scale, no link
             # inversion): the mixture bare-mean triple. A deterministic
             # definition is a predictor, not a parameter — it falls
@@ -8140,7 +8212,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
                                     "`Binomial.(n, logistic.(mu))` (or `normcdf`/`cexpexp` for the inverse link)")
-        if args[2] isa Symbol && !haskey(ctx.detmap, args[2])
+        if _bare_slot_name(args[2], ctx)
             # Bare sampled parameter (constrained-scale): the mixture
             # bare-mean triple. A deterministic definition is a
             # predictor, not a parameter — it falls through to link
@@ -8222,7 +8294,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                                     "`ZeroInflatedBinomial.(n, p, zi)`")
         link, loc = _lower_slot_link(lhs,
             _dot2call_nested_link(lhs, args[2], :Binomial))
-        args[2] isa Symbol && loc in ctx.prior_names && (loc = _BareSlot(loc))
+        args[2] isa Symbol && loc in ctx.prior_names &&
+            !_is_declared_array(loc, ctx) && (loc = _BareSlot(loc))
         return ZeroInflatedBinomialFam, link, IdentityLink, loc,
         nothing, _lower_trials(lhs, args[1], ctx), nothing, args[3], nothing
     elseif fam === :InverseGaussian
@@ -8257,7 +8330,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
-        if args[1] isa Symbol && !haskey(ctx.detmap, args[1])
+        if _bare_slot_name(args[1], ctx)
             # Bare sampled parameter (constrained-scale): the mixture
             # bare-mean triple. A deterministic definition is a
             # predictor, not a parameter — it falls through to link
@@ -8557,11 +8630,14 @@ function _lower_argument_value(lhs, slot, value, ctx)
     folded = _fold_literal(rhs)
     folded === nothing || return folded
     shape = _canon_shape(rhs, ctx)
-    shape in (:scalar, :vector) || _sfail("response $lhs $slot " *
+    shape in (:scalar, :vector, :array) || _sfail("response $lhs $slot " *
         "needs a scalar or one value per row, got $shape")
     if shape === :vector
         return _extract_column(lhs, rhs, ctx)
     end
+    # A scalar, or a value computed from declared arrays (`exp.(s)` over
+    # `s[axes(y, 1)]`): one named value, read as a declared array or its
+    # named twin `sd = exp.(s)` is, broadcast against the response.
     return get!(ctx.leaf_exprs, rhs) do
         while true
             ctx.synth[] += 1
@@ -8789,7 +8865,9 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             !_is_design_shaped(loc, ctx) && !_scalar_location_value(loc, ctx)
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
-    if loc isa Symbol
+    # A declared array read whole is a value expression (below), not a name
+    # with a location role of its own.
+    if loc isa Symbol && !(value && _is_declared_array(loc, ctx))
         haskey(ctx.matrices, loc) && _sfail(
             "response $lhs location $loc is a design matrix — locations " *
             "are predictors (`mu = $loc * b`), data, or inline affine " *
@@ -8865,6 +8943,11 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # Per-cell latents classify inline like data columns: `b .* x_true`
         # is a ContinuousTerm over the latent; an unscaled summand is a
         # LatentTerm, just as when the whole location names that latent.
+        # A declared array written bare (`Normal.(theta, s)`,
+        # `Poisson.(exp.(theta))`, `Poisson.(lam)`) lowers here too, as its
+        # named twin `loc = theta` does: broadcasting pairs `theta[j]` with
+        # `y[j]`, stretches a singleton and fails on other lengths, as in
+        # Julia.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
         pname = _predictor_name!(something(synth, Symbol(lhs, "_eta")), ctx)
@@ -8942,11 +9025,16 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
 end
 
 # A name a response may read as its location value: a data column, or a
-# sampled scalar parameter of any prior (arrays, varying blocks, latents
-# and scan states carry their own location arms).
+# sampled scalar parameter of any prior (declared arrays, latents and scan
+# states carry their own location arms).
 _is_value_location(loc::Symbol, ctx) = loc in ctx.data ||
-    (loc in ctx.prior_names && loc ∉ ctx.sized_decls &&
-        loc ∉ ctx.vector_params)
+    (loc in ctx.prior_names && !_is_declared_array(loc, ctx))
+
+# A declared array: a sized, data-sized, simplex or ordered declaration
+# (`theta[axes(y, 1)] .~ …`, `p ~ Dirichlet(…)`), whose value carries its
+# own axes, unlike a sampled scalar.
+_is_declared_array(loc::Symbol, ctx) = loc in ctx.prior_names &&
+    (loc in ctx.sized_decls || loc in ctx.vector_params)
 
 # Scalar definitions/expressions, plus scalar sums the affine path refuses
 # (two intercepts or a literal summand). Other vector-shaped expressions
@@ -9170,9 +9258,6 @@ function _lower_location_symbol_error(lhs, loc, ctx; bare::Bool = false,
         "definitions (`eta = a .+ b .* x`); a scalar parameter or data " *
         "column as the whole location is admitted for single-family " *
         "responses (`y .~ Normal.($loc, s)`)")
-    loc in ctx.prior_names && _sfail("response $lhs location $loc is a " *
-        "declared array, not one value per observation — read it by " *
-        "index (`$loc[g]`) or in a definition")
     return _sfail("response $lhs location $loc is not a predictor " *
                   "definition (`$loc = ...` affine in data)")
 end
