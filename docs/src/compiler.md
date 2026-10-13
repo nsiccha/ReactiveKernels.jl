@@ -521,11 +521,11 @@ lifted like any other invariant: the support guard
 `sigma > 0 ? normal(mu, sigma).logpdf(y) : -Inf` computes `log(sigma)` once
 per call, and only when `sigma > 0`. An empty domain evaluates neither the
 condition nor an arm. A condition that reads the cell, including a combined
-one such as `s > 0 && x > 0`, keeps its branch in every cell. Its arms are
-inlined into the cell loop, and an arm's shared work runs at the first cell
-that takes the arm and is reused by the later ones: an arm no cell takes
+one such as `s > 0 && x > 0`, keeps its branch in every cell. An arm with
+shared work is inlined into the cell loop, and that work runs at the first
+cell that takes the arm and is reused by the later ones: an arm no cell takes
 evaluates nothing, and a shared value that throws does so at the same cell as
-before. Work written inside one recipe of a constructed endpoint, such as the
+before. An arm without shared work keeps its own evaluation. Work written inside one recipe of a constructed endpoint, such as the
 `loggamma(shape)` term of a Gamma density, stays with that recipe. The graph
 keeps the authored branch; the tensorized body decides a shared condition in
 its own batch dispatch.
