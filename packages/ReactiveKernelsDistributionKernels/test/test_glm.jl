@@ -162,7 +162,8 @@ end
 
 @testset "poisson_log_glm fused object" begin
     @test occursin("@kernel poisson_log_glm(", POISSON_LOG_GLM_KERNEL_SOURCE)
-    @test all(hasproperty(poisson_log_glm, ep) for ep in (:logpdf, :pointwise, :score))
+    @test all(hasproperty(poisson_log_glm, ep)
+        for ep in (:logpdf, :pointwise, :score, :logkernel, :lognormalizer))
 
     X = [1.0 -1.5; 1.0 -0.5; 1.0 0.5; 1.0 1.5; 1.0 0.0; 1.0 2.0]
     beta = [0.5, 0.3]
@@ -184,6 +185,17 @@ end
         ll = prepare(poisson_log_glm.logpdf;
             have = (:y, :X, :beta), want = :logpdf)(y, X, beta)
         @test sum(pw) ≈ ll
+    end
+
+    @testset "logkernel and lognormalizer split the per-observation density" begin
+        lk = prepare(poisson_log_glm.logkernel;
+            have = (:y, :X, :beta), want = :logkernel)(y, X, beta)
+        ln = prepare(poisson_log_glm.lognormalizer;
+            have = (:y,), want = :lognormalizer)(y)
+        @test lk ≈ y .* eta .- exp.(eta)
+        @test ln ≈ .-loggamma.(y .+ 1)
+        @test lk .+ ln ≈ ref_cells
+        @test sum(lk) + sum(ln) ≈ ref_total
     end
 
     @testset "eta / mu / working weights extract as owner nodes" begin
