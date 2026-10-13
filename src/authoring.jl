@@ -5289,7 +5289,7 @@ function _kernel_bound_pairs(spec::KernelSpec, bound)
 end
 
 """
-    prepare(spec::KernelSpec; have, want, passes=(), bound=(;), on_error=nothing) -> callable
+    prepare(spec::KernelSpec; have, want, passes=(), bound=(;), on_error=nothing, exemplars=nothing) -> callable
 
 Prepare an authored kernel. With a non-empty `bound` NamedTuple
 (`bound = (; X, y)`), the [`partial_evaluation`](@ref) pre-pass runs first:
@@ -5298,6 +5298,9 @@ reachable from only those ports executes once here, and the returned kernel is
 positional over the remaining HAVE ports in their selected order. The authored
 signature convenience layer (positional defaults and keywords) applies only to
 unbound default-boundary preparations.
+
+`exemplars` follows [`prepare`](@ref) on a `Plan`: it opts into native type
+evidence for the remaining positional HAVE ports after binding.
 
 A repeated bound preparation of the same kernel, boundary and bound port set
 reuses the plan and compiled code of earlier bindings and runs only the
@@ -5314,13 +5317,15 @@ policy continues execution; it does not catch exceptions or return a fallback.
 """
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                 bound = NamedTuple(), on_error = nothing)
+                 bound = NamedTuple(), on_error = nothing,
+                 exemplars = nothing)
     isempty(bound) || return prepare(spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
-        passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error)
+        passes = passes, bound = _kernel_bound_pairs(spec, bound),
+        on_error = on_error, exemplars)
     prepared = prepare(plan(spec; have = have, want = want); passes = passes,
-                       on_error = on_error)
+                       on_error = on_error, exemplars)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end

@@ -3368,14 +3368,16 @@ end
 # An unannotated outer recipe can still have a provably scalar result. RKPPL
 # uses such values for synthesized distribution arguments (`1 - omega`, for
 # example), and a plate must classify them as shared without asserting a
-# particular numeric type or changing the authored assignment. Infer only
-# scalar facts from the parent DAG; all other declared Value types stay as-is.
-function _plate_inferred_scalar_types(p::Plan)
+# particular numeric type or changing the authored assignment. An opt-in
+# exemplar also proves array rank from the parent DAG. This reads types only;
+# no recipe or sample value is evaluated to obtain evidence.
+function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
     g = p.graph
     target = Set(canon_id(g, v.id) for r in p.recipes
         if r.op isa _AuthoredPlateOp &&
-           any(q -> _plate_branch_operation(q.op), r.op.kernel.plan.recipes)
-        for v in r.inputs if valtype(v) === Any)
+           (exemplar_types !== nothing ||
+            any(q -> _plate_branch_operation(q.op), r.op.kernel.plan.recipes))
+        for v in r.inputs if exemplar_types !== nothing || valtype(v) === Any)
     producer = Dict(canon_id(g, v.id) => r for r in p.recipes for v in r.outputs)
     needed = Set{Int}()
     while !isempty(target)
@@ -3386,7 +3388,9 @@ function _plate_inferred_scalar_types(p::Plan)
         push!(needed, recipe.id)
         union!(target, (canon_id(g, v.id) for v in recipe.inputs))
     end
-    types = Dict{Int,Any}(canon_id(g, v.id) => valtype(v) for v in p.have)
+    types = Dict{Int,Any}(canon_id(g, v.id) =>
+        (exemplar_types === nothing ? valtype(v) : exemplar_types[i])
+        for (i, v) in enumerate(p.have))
     for recipe in p.recipes
         recipe.id in needed || continue
         inputs = Any[get(types, canon_id(g, v.id), Any) for v in recipe.inputs]
@@ -3405,20 +3409,26 @@ function _plate_inferred_scalar_types(p::Plan)
             # that fact when inference of an earlier source closure is weaker;
             # otherwise a later unannotated scalar such as `1 - omega` loses
             # its Number proof even though `omega::Float64` is authoritative.
-            types[canon_id(g, v.id)] =
+            types[canon_id(g, v.id)] = if exemplar_types === nothing
                 _concrete_value_type(declared) &&
-                !(recipe.op isa _BoundConstant) ? declared : output_type
+                    !(recipe.op isa _BoundConstant) ? declared : output_type
+            else
+                declared !== Any && !(recipe.op isa _BoundConstant) &&
+                    !(output_type <: declared) ? declared : output_type
+            end
         end
     end
     types
 end
 
-function _plate_scalar_values(g::Graph, values, types)
+function _plate_inferred_values(g::Graph, values, types; rank_evidence::Bool = false)
     result = Any[]
     for v in values
         T = get(types, canon_id(g, v.id), Any)
-        push!(result, T isa Type && T !== Union{} && T <: Number &&
-            !(valtype(v) <: Number) ? Value{T}(v.id, v.name) : v)
+        proven = T isa Type && T !== Union{} &&
+            (T <: Number || rank_evidence && (T <: AbstractVector || T <: Tuple))
+        push!(result, proven && !(valtype(v) <: T) ?
+            Value{T}(v.id, v.name) : v)
     end
     result
 end
@@ -3436,7 +3446,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          declare::Bool = !tensorized && inline_embedded &&
                                          _needs_embedded_tensorization(p),
                          recycle::Vector{Pair{Int,Symbol}} = Pair{Int,Symbol}[],
-                         type_hints = nothing)
+                         type_hints = nothing, exemplar_types = nothing)
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
@@ -3454,7 +3464,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     runtime_recipes = Recipe[]
     skipped_recipes = Set{Int}()
     pending_scans = Dict{Int,Any}()
-    inferred_scalars = nothing
+    inferred_plate_types = nothing
     declared = Set{Symbol}()
     declare_types = declare
     # HAVE is authoritative, and the first selected producer of any other
@@ -3494,11 +3504,14 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
 
         if inline_embedded && r.op isa _AuthoredPlateOp
             callvalues = r.inputs
-            if type_hints === nothing && any(q -> _plate_branch_operation(q.op),
-                                             r.op.kernel.plan.recipes)
-                inferred_scalars === nothing &&
-                    (inferred_scalars = _plate_inferred_scalar_types(p))
-                callvalues = _plate_scalar_values(g, r.inputs, inferred_scalars)
+            if !tensorized && type_hints === nothing &&
+                    (exemplar_types !== nothing ||
+                     any(q -> _plate_branch_operation(q.op),
+                         r.op.kernel.plan.recipes))
+                inferred_plate_types === nothing &&
+                    (inferred_plate_types = _plate_inferred_input_types(p; exemplar_types))
+                callvalues = _plate_inferred_values(g, r.inputs, inferred_plate_types;
+                    rank_evidence = exemplar_types !== nothing)
             end
             length(r.outputs) == 1 || throw(ArgumentError(
                 "an authored plate recipe must have exactly one pointwise output"))
@@ -4744,7 +4757,7 @@ A small callable object holding the RGF-generated function, the positional
 `ops` tuple, and metadata (graph values in call/return order, the plan, and the
 lowered AST). Runtime invocation does not consult any planning logic.
 """
-struct PreparedKernel{F,O,IN,OUT,RR}
+struct PreparedKernel{F,O,IN,OUT,RR,S}
     f::F
     ops::O
     inputs::IN
@@ -4761,9 +4774,9 @@ end
 Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
-        @nospecialize(lowered_recipes::Tuple))
+        @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing)
     T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
-                       typeof(lowered_recipes)}
+                       typeof(lowered_recipes),exact_signature}
     _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
                              lowered_recipes))::PreparedKernel
 end
@@ -4800,10 +4813,10 @@ function _kernel_latest_source(op::_AuthoredPlateOp{K,A}) where {K,A}
     kernel = _kernel_latest_prepared(op.kernel)
     _AuthoredPlateOp{typeof(kernel),A}(kernel, op.axis_checks)
 end
-function _kernel_latest_prepared(kernel::PreparedKernel)
+function _kernel_latest_prepared(kernel::PreparedKernel{F,O,IN,OUT,RR,S}) where {F,O,IN,OUT,RR,S}
     _prepared_kernel(kernel.f, map(_kernel_latest_source, kernel.ops),
-        kernel.inputs, kernel.outputs, kernel.plan, kernel.ast,
-        kernel.lowered_recipes)
+                     kernel.inputs, kernel.outputs, kernel.plan, kernel.ast,
+                     kernel.lowered_recipes; exact_signature = S)
 end
 
 # A prepared kernel is statically untraced. `Recipe.cse_key` provenance tuples
@@ -5527,18 +5540,28 @@ end
     :(Base.@inline k.f(k.ops, $(positional...)))
 end
 
-@inline function (k::PreparedKernel{F,O,IN,OUT})(
-        args::Vararg{Any,N}) where {F,O,IN,OUT,N}
+@inline function (k::PreparedKernel{F,O,IN,OUT,RR,S})(
+        args::Vararg{Any,N}) where {F,O,IN,OUT,RR,S,N}
     N == fieldcount(IN) || throw(MethodError(k, args))
+    S === Nothing || args isa S ||
+        _dynamic_tensorized_marker(args) !== nothing ||
+        _prepared_argument_types_error(k, S, args)
     _prepared_call(k, args, Val(N))
 end
+
+@noinline _prepared_argument_types_error(k, ::Type{S}, args) where {S} =
+    throw(ArgumentError("this kernel was prepared from exemplar argument " *
+        "types $(Tuple(fieldtypes(S))) and was called with $(map(typeof, args)); " *
+        "prepare another kernel for the new types"))
 
 # The compiled body's type is new for every prepared kernel, so specializing
 # this assembly step on it would compile code that is never reused.
 Base.@nospecializeinfer function _prepare(p::Plan, ast::Expr,
                                           @nospecialize(ops::Tuple),
-                                          @nospecialize(recipes::Tuple))
-    _prepared_kernel(compile(ast), ops, Tuple(p.have), Tuple(p.want), p, ast, recipes)
+                                          @nospecialize(recipes::Tuple);
+                                          exact_signature::Type = Nothing)
+    _prepared_kernel(compile(ast), ops, Tuple(p.have), Tuple(p.want), p, ast,
+        recipes; exact_signature)
 end
 
 """
@@ -5706,8 +5729,8 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
 end
 
 """
-    prepare(p::Plan; passes=(), bound=(), on_error=nothing) -> PreparedKernel
-    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing) -> PreparedKernel
+    prepare(p::Plan; passes=(), bound=(), on_error=nothing, exemplars=nothing) -> PreparedKernel
+    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing, exemplars=nothing) -> PreparedKernel
 
 Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
 tuple of AST passes applied before compilation.
@@ -5731,6 +5754,13 @@ a mutation of the graph starts afresh, and they keep no bound values. Passes
 that are not singletons (closures) are not retained: such a binding is
 prepared afresh. A `Plan` is always prepared afresh.
 
+`exemplars = (x, ...)` opts into native type evidence from one value per
+remaining positional HAVE port. Native calls then require those exact input
+types; prepare another kernel for different types. The tensorized body keeps
+the declared port types, as does the native signature; only native plate
+lowering reads the exemplar evidence. Lengths and values are not baked into
+the program. A graph prepared with exemplars is compiled afresh.
+
 Selected authored plates with a single plate consumer are composed during
 lowering, eliminating the intermediate array. Named ports remain in `p`: asking
 for an intermediate, supplying it as HAVE, or selecting another consumer keeps
@@ -5748,26 +5778,45 @@ native reverse-mode AD may refuse the program. Preparation still succeeds.
 [`prepare_ad`](@ref) repeats the check with the types of its exemplar
 arguments.
 """
-function prepare(p::Plan; passes = (), bound = (), on_error = nothing)
+function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
+                 exemplars = nothing)
     _warn_uninferred_values(
-        _prepare_plan(p; passes = passes, bound = bound, on_error = on_error))
+        _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
+                      exemplars))
 end
 
 # `prepare` without the type-stability check, for a program RK runs once while
 # it prepares another (the data-only prefix of a bound preparation): its values
 # feed the checked program as bound data of their runtime types.
-function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing)
+function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
+                       exemplars = nothing)
     p = _kernel_error_policy(p, on_error)
     # Compose cell-only producers before bound specialization can partition a
     # guarded plate into arms and materialize its other cells. Other plate
     # chains keep their usual post-specialization fusion.
     bound === () || (p = _fuse_authored_plate_chains(p; cells_only = true))
     p = _partial_apply(p, bound)
+    exemplar_types = if exemplars === nothing
+        nothing
+    else
+        exemplars isa Tuple || throw(ArgumentError(
+            "prepare exemplars must be a tuple in positional HAVE order"))
+        length(exemplars) == length(p.have) || throw(ArgumentError(
+            "prepare received $(length(exemplars)) exemplars for " *
+            "$(length(p.have)) remaining HAVE ports"))
+        map(Tuple(p.have), exemplars) do port, value
+            typeof(value) <: valtype(port) || throw(ArgumentError(
+                "the exemplar for HAVE port `$(port.name)` has type " *
+                "$(typeof(value)), which is not a $(valtype(port))"))
+            typeof(value)
+        end
+    end
     lowered_plan = _fuse_authored_plate_chains(p)
-    native_ast, ops, recipes = _lower_with_ops(lowered_plan)
+    exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
+    native_ast, ops, recipes = _lower_with_ops(lowered_plan; exemplar_types)
     isempty(passes) || (native_ast = transform(native_ast, passes...))
     if !_needs_embedded_tensorization(p)
-        return _prepare(p, native_ast, ops, recipes)
+        return _prepare(p, native_ast, ops, recipes; exact_signature)
     end
 
     tensorized_ast, tensorized_ops, tensorized_recipes =
@@ -5796,14 +5845,16 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing)
             input_index,typeof(native),typeof(tensorized),typeof(tensorized_ast)}(
                 native, tensorized, tensorized_ast)
     end
-    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast, recipes)
+    _prepared_kernel(f, ops, Tuple(p.have), Tuple(p.want), p, native_ast,
+        recipes; exact_signature)
 end
 
-function prepare(g::Graph; have = (), want = (), passes = (), bound = (), on_error = nothing)
-    _reuses_bound_preparation(bound, passes) &&
+function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
+                 on_error = nothing, exemplars = nothing)
+    exemplars === nothing && _reuses_bound_preparation(bound, passes) &&
         return _graph_bound_preparation(g, have, want, passes, bound, on_error)
     p = plan(g; have = have, want = want)
-    prepare(p; passes = passes, bound = bound, on_error = on_error)
+    prepare(p; passes = passes, bound = bound, on_error = on_error, exemplars)
 end
 
 """
