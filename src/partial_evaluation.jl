@@ -407,19 +407,21 @@ _readable_callee(::_LaneGather) = :lane_gather
 _opname(::_LaneGather) = "lane_gather"
 
 """
-    _LaneAssemble(order)
+    _LaneAssemble()
 
 Reassembles arm pointwise vectors into lane order: `vcat(parts...)[order]`
-(one gather, `order = invperm(vcat(arm_lanes...))`).
+(one gather, `order = invperm(vcat(arm_lanes...))`). Like `_LaneGather`'s
+lanes, `order` is a bound operand rather than a field: a native gradient
+receives bound arrays as inactive operands, whereas an array stored in an
+operation belongs to the differentiated callable, which native Enzyme reverse
+must prove read-only. It could not once a later split plate gathered the
+reassembled vector (`EnzymeMutabilityException`).
 """
-struct _LaneAssemble
-    order::Vector{Int}
-end
+struct _LaneAssemble end
 # `Vararg{Any,N}` specializes on the arm count; an unspecialized `parts...`
 # left `vcat(parts...)` a run-time `Core._apply_iterate` call in every
 # evaluation of a partitioned plate.
-(assemble::_LaneAssemble)(parts::Vararg{Any,N}) where {N} =
-    vcat(parts...)[assemble.order]
+(::_LaneAssemble)(order, parts::Vararg{Any,N}) where {N} = vcat(parts...)[order]
 _readable_callee(::_LaneAssemble) = :lane_assemble
 _opname(::_LaneAssemble) = "lane_assemble"
 
@@ -658,8 +660,12 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         return (; expansion, rewrite = total.id => combined)
     end
     order = invperm(reduce(vcat, (last(arm) for arm in arms)))
-    push!(expansion, Recipe(fresh(), Tuple(arm_outputs), (pointwise,),
-        _LaneAssemble(order), 0.0, nothing, false))
+    order_value = value!(g, :plate_lane_order, Vector{Int})
+    push!(expansion, Recipe(fresh(), (), (order_value,), _BoundConstant(order),
+        0.0, nothing, false))
+    known[canon_id(g, order_value.id)] = order
+    push!(expansion, Recipe(fresh(), (order_value, arm_outputs...), (pointwise,),
+        _LaneAssemble(), 0.0, nothing, false))
     (; expansion, rewrite = nothing)
 end
 
