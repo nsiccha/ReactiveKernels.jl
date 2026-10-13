@@ -172,6 +172,8 @@ isdefined(@__MODULE__, :BranchPartition) ||
             @test code.operations === bound.ops
             @test occursin("__ops__", string(code))
             @test !occursin("yi > 0", string(code))
+            @test occursin("BranchPartition.counted_log", string(code))
+            @test occursin(" - 1.0", string(code))
             for recipe in plates(bound.plan)
                 inner = recipe.op.kernel
                 inner_code = readable_code(inner)

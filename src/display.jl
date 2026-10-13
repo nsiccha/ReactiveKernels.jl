@@ -316,7 +316,8 @@ The generated Julia expression with only line-number annotations removed.
 `code.expr` is a copy of [`code_expr`](@ref), and `code.operations` is the exact
 operation tuple indexed by its `__ops__` argument. For a prepared kernel this
 is the kernel's own operation tuple. The printed operation table indexes those
-same objects by kind and, for source operations, their definition token;
+same objects by kind and, for source operations, their definition token and
+stored generated source-function expression where available;
 it never substitutes authored source for an operation preparation changed.
 The string is for inspection. If the expression embeds an operation object,
 Julia's textual AST display may contain dollar-sign interpolation syntax that cannot
@@ -389,11 +390,33 @@ _display_operation_kind(op::_KernelSourceOp{Token,Form}) where {Token,Form} =
 _display_operation_kernel(op) = nothing
 _display_operation_kernel(op::_AuthoredPlateOp) = op.kernel
 _display_operation_kernel(op::_AuthoredScanOp) = op.kernel
+_display_source_expression(f) = nothing
+function _display_source_expression(f::_KernelSourceFunction)
+    f.runtime_f isa RuntimeGeneratedFunctions.RuntimeGeneratedFunction ||
+        return nothing
+    RuntimeGeneratedFunctions.get_expression(f.runtime_f)
+end
+
+function _print_operation_callable(io::IO, callable, path::String)
+    source = _display_source_expression(callable)
+    source === nothing && return
+    print(io, "\n# ", path, ".runtime_f expression:")
+    body = sprint(_print_code, _strip_display_linenums(source);
+                  context = :limit => false)
+    for line in split(body, '\n')
+        print(io, "\n#   ", line)
+    end
+end
 
 function _print_operation_table(io::IO, operations::Tuple, path::String)
     for (i, op) in enumerate(operations)
         slot = string(path, "[", i, "]")
         print(io, "\n# ", slot, " (", _display_operation_kind(op), ")")
+        if op isa _KernelSourceOp
+            _print_operation_callable(io, op.f, string(slot, ".f"))
+            op.tensor_f === op.f ||
+                _print_operation_callable(io, op.tensor_f, string(slot, ".tensor_f"))
+        end
         child = _display_operation_kernel(op)
         child === nothing && continue
         print(io, "\n# ", slot, ".kernel.ast:")

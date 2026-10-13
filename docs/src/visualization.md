@@ -87,7 +87,8 @@ structure](compiler.md#Inspecting-structure)).
 
 `readable_code(spec_or_plan)` and `readable_code(prepared)` show the generated
 Julia expression with only line-number metadata removed. Calls retain their
-`__ops__[k]` slots. The printed table indexes the callables by operation kind;
+`__ops__[k]` slots. The printed table indexes the callables by operation kind
+and shows a stored source-function expression when one is available;
 `code.operations[k]` holds the exact callable, including specialized
 operations after `bound=` preparation. For authored plates and scans the table
 also prints the nested kernel's exact expression and operation slots.
