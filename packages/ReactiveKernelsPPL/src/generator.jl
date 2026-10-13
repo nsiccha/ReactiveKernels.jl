@@ -2520,17 +2520,20 @@ end
 # is `Σ yᵢ·ηᵢ − Σ nᵢ·log1pexp(ηᵢ) + C`, with `C = Σ log C(nᵢ, yᵢ)` a NAMED
 # data-only recipe over the bound response and trials (`_ppl_lchoose_<label>`):
 # `bound=` folds it to a constant, so no `loggamma` runs per evaluation, and
-# a binding with other counts computes its own. Trials are a literal, which
-# scales one `sum(log1pexp, η)`, or a column with one entry per response
-# entry (`_wholevec_trials`). Gradient stays ordinary AD.
+# a binding with other counts computes its own. Trials are a number (a
+# literal or bound data), which scales one `sum(log1pexp, η)`, or a column
+# with one entry per response entry (`_wholevec_trials`). Gradient stays
+# ordinary AD.
 function _binomial_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
     lp = _location_node(r, plan)
     yf = _yfloat_name(r.label)
     nf = Symbol(:_ppl_nf_, r.label)
     cterm = Symbol(:_ppl_lchoose_, r.label)
-    trials = r.trials isa Int ? Float64(r.trials) : :(Float64.($(r.trials)))
-    tail = r.trials isa Int ?
+    scalar = r.trials isa Int || get(plan.columns, r.trials, nothing) isa Number
+    trials = r.trials isa Int ? Float64(r.trials) :
+        scalar ? :(Float64($(r.trials))) : :(Float64.($(r.trials)))
+    tail = scalar ?
         :($nf * sum(log1pexp, $lp)) : :(dot($nf, log1pexp.($lp)))
     return Expr[
         _through_pointwise(_binomial_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
@@ -2542,14 +2545,15 @@ function _binomial_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
     ]
 end
 
-# Trials the fused Binomial form reads: a literal, or a column with one entry
-# per response entry (binding admits only these two). A one-entry column
+# Trials the fused Binomial form reads: a number (a literal or bound data),
+# or a column with one entry per response entry. A one-entry column
 # stretching over the rows keeps the plate path, which broadcasts it.
 function _wholevec_trials(r::LikelihoodSpec, plan::StructuralPlan)
     r.trials isa Int && return true
     t = get(plan.columns, r.trials, nothing)
     y = get(plan.columns, r.response, nothing)
-    return t isa AbstractVector && y isa AbstractVector && length(t) == length(y)
+    y isa AbstractVector || return false
+    return t isa Integer || t isa AbstractVector && length(t) == length(y)
 end
 
 function _poisson_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)

@@ -183,6 +183,15 @@ a finite interval of width `2pi`. A live lower endpoint can use
 `hi = lo + 2pi`. The interval and support are checked before wrapping the
 location or evaluating the density.
 
+Count trials are data. `Binomial.(n, …)`, `ZeroInflatedBinomial.(n, …)`,
+`BetaBinomial2.(n, …)`, Binomial mixture components and
+`Multinomial.(N, Ref(s))` read an Int literal, bound Int data (a number or
+an array) or a definition that reads only data. A bound number such as
+`m(; n = 5)` gives every observation the same trials, as
+`fill(5, length(y))` would, and a definition such as `n = t .+ 1` is
+evaluated once at binding. Trials computed from a sampled value fail at
+lowering.
+
 An ordered vector may use Normal, Cauchy, Laplace, Logistic or StudentT
 element priors with live scalar arguments, for example
 `c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log

@@ -688,12 +688,19 @@ using SpecialFunctions: beta_inc
     # `logpdf` without `lognormalizer`: the terms that read `p` or `logit`.
     logkernel(observed::Int)::Float64 = begin
         # Read the supplied logit directly so HAVE planning preserves tails.
+        # An interior count evaluates one `log1pexp` and forms the other tail
+        # term from it (`log1pexp(x) = log1pexp(-x) + x`) on the side where the
+        # sum has no cancellation; infinite and NaN logits keep their values.
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?
                 (n == 0 ? 0.0 :
                  observed == 0 ? -n * log1pexp(logit) :
                  observed == n ? -n * log1pexp(-logit) :
-                 -observed * log1pexp(-logit) - (n - observed) * log1pexp(logit)) :
+                 logit >= 0 ?
+                     (l1pe = log1pexp(-logit);
+                      -observed * l1pe - (n - observed) * (l1pe + logit)) :
+                     (l1pe = log1pexp(logit);
+                      -observed * (l1pe - logit) - (n - observed) * l1pe)) :
                 -Inf
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?
@@ -714,8 +721,12 @@ using SpecialFunctions: beta_inc
                  observed == 0 ? -n * log1pexp(logit) :
                  observed == n ? -n * log1pexp(-logit) :
                  loggamma(n + 1.0) - loggamma(observed + 1.0) -
-                 loggamma(n - observed + 1.0) -
-                 observed * log1pexp(-logit) - (n - observed) * log1pexp(logit)) :
+                 loggamma(n - observed + 1.0) +
+                 (logit >= 0 ?
+                     (l1pe = log1pexp(-logit);
+                      -observed * l1pe - (n - observed) * (l1pe + logit)) :
+                     (l1pe = log1pexp(logit);
+                      -observed * (l1pe - logit) - (n - observed) * l1pe))) :
                 -Inf
         lp::Float64 =
             (observed >= 0) & (observed <= n) ?
@@ -1037,16 +1048,24 @@ using SpecialFunctions: beta_inc
     # `logpdf` without `lognormalizer`: the terms that read `p`, `logit` or `zi`.
     logkernel(observed::Int)::Float64 = begin
         # Read the supplied logit directly so HAVE planning preserves tails.
+        # A zero count names `n * log1pexp(logit)` (or `n * log1p(-p)`) once:
+        # Julia evaluates every repeated call, and the guard and the value read
+        # it three times (most of a zero-heavy plate's time, snag
+        # rkppl-zib-mh-slo-b7a55aaf). An interior count evaluates one
+        # `log1pexp`, as in `binomial`.
         lp::Float64 =
             ((observed >= 0) & (observed <= n) & (zi >= 0) & (zi <= 1)) ?
                 (n == 0 ? 0.0 : observed == 0 ?
-                    (n * log1pexp(logit) <= 700 ?
-                        log1p(zi * expm1(n * log1pexp(logit))) - n * log1pexp(logit) :
-                        (zi >= 0.5 ? log(zi + (1 - zi) * exp(-n * log1pexp(logit))) :
-                            logaddexp(log(zi), log1p(-zi) - n * log1pexp(logit)))) :
+                    (nl1pe = n * log1pexp(logit);
+                     nl1pe <= 700 ? log1p(zi * expm1(nl1pe)) - nl1pe :
+                        (zi >= 0.5 ? log(zi + (1 - zi) * exp(-nl1pe)) :
+                            logaddexp(log(zi), log1p(-zi) - nl1pe))) :
                     log1p(-zi) + (observed == n ? -n * log1pexp(-logit) :
-                        -observed * log1pexp(-logit) -
-                        (n - observed) * log1pexp(logit))) :
+                        logit >= 0 ?
+                            (l1pe = log1pexp(-logit);
+                             -observed * l1pe - (n - observed) * (l1pe + logit)) :
+                            (l1pe = log1pexp(logit);
+                             -observed * (l1pe - logit) - (n - observed) * l1pe))) :
                 -Inf
         lp::Float64 =
             ((observed >= 0) & (observed <= n) & (zi >= 0) & (zi <= 1) &
@@ -1054,10 +1073,10 @@ using SpecialFunctions: beta_inc
                 (observed == 0 ?
                     (n <= 1 ? log(zi + (1 - zi) * (1 - p)^n) :
                         (p == 1 ? log(zi) :
-                            (-n * log1p(-p) <= 700 ?
-                                n * log1p(-p) + log1p(zi * expm1(-n * log1p(-p))) :
-                                (zi >= 0.5 ? log(zi + (1 - zi) * exp(n * log1p(-p))) :
-                                    logaddexp(log(zi), log1p(-zi) + n * log1p(-p)))))) :
+                            (nl1mp = n * log1p(-p);
+                             -nl1mp <= 700 ? nl1mp + log1p(zi * expm1(-nl1mp)) :
+                                (zi >= 0.5 ? log(zi + (1 - zi) * exp(nl1mp)) :
+                                    logaddexp(log(zi), log1p(-zi) + nl1mp))))) :
                     log1p(-zi) + observed * log(p) +
                     (observed == n ? 0.0 : (n - observed) * log1p(-p))) :
                 -Inf
@@ -1072,14 +1091,18 @@ using SpecialFunctions: beta_inc
         lp::Float64 =
             ((observed >= 0) & (observed <= n) & (zi >= 0) & (zi <= 1)) ?
                 (n == 0 ? 0.0 : observed == 0 ?
-                    (n * log1pexp(logit) <= 700 ?
-                        log1p(zi * expm1(n * log1pexp(logit))) - n * log1pexp(logit) :
-                        (zi >= 0.5 ? log(zi + (1 - zi) * exp(-n * log1pexp(logit))) :
-                            logaddexp(log(zi), log1p(-zi) - n * log1pexp(logit)))) :
+                    (nl1pe = n * log1pexp(logit);
+                     nl1pe <= 700 ? log1p(zi * expm1(nl1pe)) - nl1pe :
+                        (zi >= 0.5 ? log(zi + (1 - zi) * exp(-nl1pe)) :
+                            logaddexp(log(zi), log1p(-zi) - nl1pe))) :
                     log1p(-zi) + (observed == n ? -n * log1pexp(-logit) :
                         loggamma(n + 1.0) - loggamma(observed + 1.0) -
-                        loggamma(n - observed + 1.0) - observed * log1pexp(-logit) -
-                        (n - observed) * log1pexp(logit))) :
+                        loggamma(n - observed + 1.0) +
+                        (logit >= 0 ?
+                            (l1pe = log1pexp(-logit);
+                             -observed * l1pe - (n - observed) * (l1pe + logit)) :
+                            (l1pe = log1pexp(logit);
+                             -observed * (l1pe - logit) - (n - observed) * l1pe)))) :
                 -Inf
         lp::Float64 =
             ((observed >= 0) & (observed <= n) & (zi >= 0) & (zi <= 1) &
@@ -1087,10 +1110,10 @@ using SpecialFunctions: beta_inc
                 (observed == 0 ?
                     (n <= 1 ? log(zi + (1 - zi) * (1 - p)^n) :
                         (p == 1 ? log(zi) :
-                            (-n * log1p(-p) <= 700 ?
-                                n * log1p(-p) + log1p(zi * expm1(-n * log1p(-p))) :
-                                (zi >= 0.5 ? log(zi + (1 - zi) * exp(n * log1p(-p))) :
-                                    logaddexp(log(zi), log1p(-zi) + n * log1p(-p)))))) :
+                            (nl1mp = n * log1p(-p);
+                             -nl1mp <= 700 ? nl1mp + log1p(zi * expm1(-nl1mp)) :
+                                (zi >= 0.5 ? log(zi + (1 - zi) * exp(nl1mp)) :
+                                    logaddexp(log(zi), log1p(-zi) + nl1mp))))) :
                     log1p(-zi) + loggamma(n + 1.0) - loggamma(observed + 1.0) -
                     loggamma(n - observed + 1.0) + observed * log(p) +
                     (observed == n ? 0.0 : (n - observed) * log1p(-p))) :
