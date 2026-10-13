@@ -2563,9 +2563,9 @@ function _through_pointwise(stmts::Vector{Expr}, r::LikelihoodSpec)
     return stmts[1:findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)]
 end
 
-# A Gaussian response located at `M * v` or `alpha .+ M * v` (bound data
-# matrix `M`, any vector value `v`, a sampled scalar `alpha`) has the
-# NormalIDGLM density, so its likelihood reads the same owned rule (DK
+# A Gaussian response located at `M * v` (inline or named) or
+# `alpha .+ M * v` (bound data matrix `M`, vector value `v`, sampled
+# scalar `alpha`) has the NormalIDGLM density and reads the owned rule (DK
 # `normal_id_glm_lpdf`): one `M'r` product in reverse, where the plate
 # differentiated `M * v` and every cell. `sigma > 0` keeps the plate cell's
 # guard; the plate (`_through_pointwise`) keeps the `:pointwise` densities,
@@ -2584,6 +2584,9 @@ function _gaussian_glm_location(r::LikelihoodSpec, plan::StructuralPlan)
             alpha = t.options.parameter
         elseif t.kind === OffsetTerm && product === nothing && length(t.columns) == 1
             product = only(t.columns)
+        elseif t.kind === ComposedTerm && length(pred.terms) == 1 &&
+                t.options.tree isa Symbol
+            product = t.options.tree
         else
             return nothing
         end

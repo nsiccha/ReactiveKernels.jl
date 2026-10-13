@@ -355,8 +355,9 @@ end
 end
 
 # The per-observation spelling of the same regression reads the same rule:
-# a Gaussian response located at `M * v` or `alpha .+ M * v` (bound data
-# matrix, declared coefficient vector, sampled intercept; one shared scale)
+# a Gaussian response located at `M * v` (inline or named) or
+# `alpha .+ M * v` (bound data matrix, declared coefficient vector,
+# sampled intercept; one shared scale)
 # has the NormalIDGLM density. Other locations keep the per-cell plate, and a
 # non-positive scale keeps the plate cell's `-Inf`.
 @testset "per-observation Normal over a design product reads the GLM rule" begin
@@ -367,6 +368,12 @@ end
         beta[axes(X, 2)] .~ Normal.(0, 10)
         sigma ~ Exponential(1)
         y .~ Normal.(X * beta, sigma)
+    end
+    named_product = @rkppl begin
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        sigma ~ Exponential(1)
+        mu = X * beta
+        y .~ Normal.(mu, sigma)
     end
     intercept = @rkppl begin
         alpha ~ Normal(0, 10)
@@ -381,6 +388,7 @@ end
     end
     cases = (
         (product(; X) | (; y), (; X, y), nt -> X * nt.beta, nt -> nt.sigma),
+        (named_product(; X) | (; y), (; X, y), nt -> X * nt.beta, nt -> nt.sigma),
         (intercept(; X) | (; y), (; X, y), nt -> nt.alpha .+ X * nt.beta, nt -> nt.sigma),
         (fixed_scale(; X, s = 2) | (; y), (; X, y), nt -> X * nt.beta, nt -> 2.0),
     )
