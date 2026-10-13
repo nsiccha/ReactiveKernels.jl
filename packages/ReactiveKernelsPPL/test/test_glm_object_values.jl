@@ -103,9 +103,12 @@ end
     built = _gv_check(plan, (; X, counts), nt -> sum(oracle(nt)))
     source = sprint(print, kernel_expr(plan, built.layout))
     @test occursin(".logkernel(", source) && occursin(".lognormalizer(", source)
-    code = sprint(show, MIME"text/plain"(), readable_code(prepare_query(built, plan, :sampler)))
+    prepared = prepare_query(built, plan, :sampler)
+    code = sprint(show, MIME"text/plain"(), readable_code(prepared))
     @test !occursin("loggamma", code)
-    @test occursin(r"\b_ppl_lnorm_\w+ = -?[0-9]", code)
+    normalizer = match(r"\b_ppl_lnorm_\w+ = \(__ops__\[(\d+)\]\)\(\)", code)
+    @test normalizer !== nothing
+    @test prepared.ops[parse(Int, normalizer.captures[1])] isa ReactiveKernels._BoundConstant
     u = _gv_u(built)
     cells = oracle(constrain(built.layout, u))
     @test Base.invokelatest(prepare_query(built, plan, :pointwise), u).counts ≈ cells
@@ -327,7 +330,7 @@ end
         oracle = nt -> logpdf.(Normal.(mean(nt), nt.sigma), y)
         built = _gv_check(plan, data, nt -> sum(oracle(nt)))
         code = sprint(show, MIME"text/plain"(), readable_code(prepare_query(built, plan, :sampler)))
-        @test occursin("normal_id_glm_lpdf(", code)
+        @test occursin("normal_id_glm(", sprint(print, kernel_expr(plan, built.layout)))
         @test !occursin("_ppl_pw_", code)
         u = _gv_u(built)
         cells = oracle(constrain(built.layout, u))
@@ -360,8 +363,6 @@ end
     n = 9
     X, y = _gv_X(n), _gv_y(n)
     g = [1, 2, 3, 1, 2, 3, 1, 2, 3]
-    _sampler_code(built, plan) =
-        sprint(show, MIME"text/plain"(), readable_code(prepare_query(built, plan, :sampler)))
     product = @rkppl begin
         beta[axes(X, 2)] .~ Normal.(0, 10)
         sigma ~ Exponential(1)
@@ -386,7 +387,7 @@ end
     for (plan, data, mean, scale) in cases
         oracle = nt -> logpdf.(Normal.(mean(nt), scale(nt)), y)
         built = _gv_check(plan, data, nt -> sum(oracle(nt)))
-        @test occursin("normal_id_glm_lpdf(", _sampler_code(built, plan))
+        @test occursin("normal_id_glm_lpdf(", sprint(print, kernel_expr(plan, built.layout)))
         u = _gv_u(built)
         nt = constrain(built.layout, u)
         @test Base.invokelatest(prepare_query(built, plan, :pointwise), u).y ≈ oracle(nt)
@@ -423,5 +424,5 @@ end
     end
     plan = grouped(; g) | (; y)
     built = _gv_check(plan, (; g, y), nt -> sum(logpdf.(Normal.(nt.z[g], nt.sigma), y)))
-    @test !occursin("normal_id_glm_lpdf", _sampler_code(built, plan))
+    @test !occursin("normal_id_glm_lpdf", sprint(print, kernel_expr(plan, built.layout)))
 end
