@@ -85,6 +85,39 @@ end
         nt -> sum(logpdf.(Bernoulli.(1 ./ (1 .+ exp.(.-(X * nt.beta)))), flags)))
 end
 
+# The Poisson-log object sums its `logkernel` endpoint and adds its
+# `lognormalizer`, `-log(y!)`, over the bound counts: preparation folds the
+# normalizer, so the prepared program evaluates no `loggamma`. The pointwise
+# densities add the two parts, and a sweep that retains them returns them
+# beside the same value and gradient.
+@testset "PoissonLogGLM folds its log-factorial normalizer" begin
+    n = 9
+    X, counts = _gv_X(n), _gv_counts(n)
+    m = @rkppl begin
+        alpha ~ Normal(0, 10)
+        beta[axes(X, 2)] .~ Normal.(0, 10)
+        counts ~ PoissonLogGLM(X, alpha, beta)
+    end
+    plan = m(; X) | (; counts)
+    oracle = nt -> logpdf.(Poisson.(exp.(nt.alpha .+ X * nt.beta)), counts)
+    built = _gv_check(plan, (; X, counts), nt -> sum(oracle(nt)))
+    source = sprint(print, kernel_expr(plan, built.layout))
+    @test occursin(".logkernel(", source) && occursin(".lognormalizer(", source)
+    code = sprint(show, MIME"text/plain"(), readable_code(prepare_query(built, plan, :sampler)))
+    @test !occursin("loggamma", code)
+    @test occursin(r"\b_ppl_lnorm_\w+ = -?[0-9]", code)
+    u = _gv_u(built)
+    cells = oracle(constrain(built.layout, u))
+    @test Base.invokelatest(prepare_query(built, plan, :pointwise), u).counts ≈ cells
+    q = prepare_sampler(built, plan, u; backend = _GV_BACKEND)
+    retaining = prepare_sampler(built, plan, u; backend = _GV_BACKEND, retain = (:pointwise,))
+    value, gradient = sampler_value_and_gradient!(q, similar(u), u)
+    rvalue, rgradient, retained = sampler_value_gradient_and_retained!(retaining, similar(u), u)
+    @test rvalue ≈ value
+    @test rgradient ≈ gradient
+    @test retained.pointwise.counts ≈ cells
+end
+
 @testset "GLM object arguments are values: scalar data, expressions, inline matrices" begin
     n = 6
     X, y = _gv_X(n), _gv_y(n)
