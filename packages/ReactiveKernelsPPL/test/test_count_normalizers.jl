@@ -97,6 +97,15 @@ end
             @test _cn_pointwise(f, u) ≈ pointwise(eta)
         end
     end
+    # A response stretching over longer rows keeps the whole-logpdf plate:
+    # its normalizer counts once per stretched row.
+    for y in (2, [2])
+        f = _cn_linear(:(y .~ weighted.(Binomial.(n, logistic.(eta)), w)),
+            (; n = _CN_N .+ 2, w = _CN_W, y))
+        @test !occursin("_ppl_lnorm_", _cn_source(f))
+        _distributional_check(f, u -> sum(_CN_W .* logpdf.(Binomial.(_CN_N .+ 2,
+            logistic.(_cn_eta(u))), 2)) + _cn_normal_prior(u), u)
+    end
     # The plate cell reads the logit directly: no probability vector.
     f = _cn_linear(:(y .~ ZeroInflatedBinomial.(n, logistic.(eta), 0.3)),
         (; n = _CN_N, y = _CN_Y))

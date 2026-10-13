@@ -481,7 +481,8 @@ end
 end
 
 @testset "count objects split logpdf into logkernel and data-only lognormalizer" begin
-    # `logpdf = logkernel + lognormalizer` on every HAVE route. The normalizer
+    # `logpdf == logkernel + lognormalizer` on every HAVE route (`logpdf` is
+    # written out, so equal to rounding). The normalizer
     # reads only the count and the trials, and it is zero wherever `logpdf`
     # never forms it (zero, full and invalid counts).
     sigmoid(x) = 1 / (1 + exp(-x))
@@ -512,7 +513,7 @@ end
         for y in (-1, 0, 1, 3, 5, 6)
             @test full(y, args...) ≈ oracle(y) atol = 1e-12
             @test norm(y, norm_args...) ≈ normalizer(y) atol = 1e-12
-            @test full(y, args...) == kernel(y, args...) + norm(y, norm_args...)
+            @test full(y, args...) ≈ kernel(y, args...) + norm(y, norm_args...) atol = 1e-12
         end
         @test norm(0, norm_args...) === 0.0
         @test norm(-1, norm_args...) === 0.0

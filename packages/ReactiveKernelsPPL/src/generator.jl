@@ -2110,14 +2110,19 @@ end
 # plate to the normalizer plate, which reads bound data only, so preparation
 # folds its sum to one constant and no `loggamma` runs per evaluation.
 # Evidence, presence masks, packed rows, ranges and arrays per index rewrite
-# the pointwise plate alone; they keep the whole-`logpdf` sum.
+# the pointwise plate alone; they keep the whole-`logpdf` sum. So does a
+# response that stretches over a longer location (a number or one entry
+# beside more rows): the normalizer plate iterates the response, so it covers
+# the kernel plate's cells only when the response spans the domain.
 function _count_plate_stmts!(pre::Vector{Expr}, r::LikelihoodSpec,
         plan::StructuralPlan, node::Symbol, pw::Symbol, inputs::Vector{Any},
         law, ninputs::Vector{Any}, normalizer::Expr)
+    y = get(plan.columns, r.response, nothing)
     split = r.evidence.kind === :none && r.mi_jobs === nothing &&
         r.range === nothing &&
         !haskey(plan.columns, _observed_mask_name(r.response)) &&
-        !_cell_broadcast_response(plan, r)
+        !_cell_broadcast_response(plan, r) &&
+        y isa AbstractArray && length(y) == _response_rows(plan, r)
     cell = _wrap_evidence!(r, plan, pre, inputs, law(:logpdf))
     kernel = split ? law(:logkernel) : nothing
     if r.weights !== nothing
