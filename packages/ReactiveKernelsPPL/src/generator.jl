@@ -2453,9 +2453,9 @@ end
 # is `Σ yᵢ·ηᵢ − Σ nᵢ·log1pexp(ηᵢ) + C`, with `C = Σ log C(nᵢ, yᵢ)` a NAMED
 # data-only recipe over the bound response and trials (`_ppl_lchoose_<label>`):
 # `bound=` folds it to a constant, so no `loggamma` runs per evaluation, and
-# a binding with other counts computes its own. Trials are a literal, a
-# number or a column with one entry per response entry (`_wholevec_trials`);
-# a number scales one `sum(log1pexp, η)`. Gradient stays ordinary AD.
+# a binding with other counts computes its own. Trials are a literal, which
+# scales one `sum(log1pexp, η)`, or a column with one entry per response
+# entry (`_wholevec_trials`). Gradient stays ordinary AD.
 function _binomial_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
     lp = _location_node(r, plan)
@@ -2463,8 +2463,8 @@ function _binomial_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
     nf = Symbol(:_ppl_nf_, r.label)
     cterm = Symbol(:_ppl_lchoose_, r.label)
     trials = r.trials isa Int ? Float64(r.trials) : :(Float64.($(r.trials)))
-    tail = _wholevec_trials_vector(r, plan) ?
-        :(dot($nf, log1pexp.($lp))) : :($nf * sum(log1pexp, $lp))
+    tail = r.trials isa Int ?
+        :($nf * sum(log1pexp, $lp)) : :(dot($nf, log1pexp.($lp)))
     return Expr[
         _through_pointwise(_binomial_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
         :($yf = Float64.($y)),
@@ -2475,16 +2475,12 @@ function _binomial_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
     ]
 end
 
-# Trials the fused Binomial form reads: a literal, a number, or a vector with
-# one entry per response entry. Other shapes (a one-entry vector stretching
-# over the rows, say) keep the plate path, which broadcasts them.
-_wholevec_trials_vector(r::LikelihoodSpec, plan::StructuralPlan) =
-    r.trials isa Symbol && get(plan.columns, r.trials, nothing) isa AbstractVector
+# Trials the fused Binomial form reads: a literal, or a column with one entry
+# per response entry (binding admits only these two). A one-entry column
+# stretching over the rows keeps the plate path, which broadcasts it.
 function _wholevec_trials(r::LikelihoodSpec, plan::StructuralPlan)
     r.trials isa Int && return true
-    r.trials isa Symbol || return false
     t = get(plan.columns, r.trials, nothing)
-    t isa Number && return true
     y = get(plan.columns, r.response, nothing)
     return t isa AbstractVector && y isa AbstractVector && length(t) == length(y)
 end

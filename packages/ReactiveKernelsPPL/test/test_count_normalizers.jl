@@ -47,8 +47,7 @@ end
     y5 = min.(_CN_Y, 5)
     for (trials, data, counts, n) in (
             (:n, (; n = _CN_N), _CN_Y, _CN_N),
-            (5, (;), y5, fill(5, length(y5))),
-            (:m, (; m = 5), y5, fill(5, length(y5))))
+            (5, (;), y5, fill(5, length(y5))))
         f = _cn_linear(:(y .~ Binomial.($trials, logistic.(eta))),
             merge(data, (; y = counts)))
         source = _cn_source(f)
@@ -101,7 +100,7 @@ end
     # The plate cell reads the logit directly: no probability vector.
     f = _cn_linear(:(y .~ ZeroInflatedBinomial.(n, logistic.(eta), 0.3)),
         (; n = _CN_N, y = _CN_Y))
-    @test occursin("zero_inflated_binomial(; n = n, logit = eta", _cn_source(f))
+    @test occursin(r"zero_inflated_binomial\(; n = \w+, logit = eta,", _cn_source(f))
     @test !occursin("_ppl_mu_y_resp", _cn_source(f))
     # A visible Binomial kernel plate evaluates no `loggamma`.
     f = _cn_linear(:(y .~ weighted.(Binomial.(n, logistic.(eta)), w)),
@@ -137,7 +136,7 @@ end
         a ~ Normal(0, 1)
         b ~ Normal(0, 1)
         c ~ Normal(0, 1)
-        zi = 1.5 * logistic(c)
+        zi = 1.5 / (1 + exp(-c))
         eta = a .+ b .* x
         y .~ ZeroInflatedBinomial.(n, logistic.(eta), zi)
     end, (; x = _CN_X, n = _CN_N, y = _CN_Y))
