@@ -7448,7 +7448,9 @@ function _lower_mixture_loc(lhs, k::Int, loc, pred_link, wrapped::Bool, ctx,
             return _lower_location(lhs, loc, pred_link, ctx, predictors,
                 pred_idx, coefuse; value = true, synth = Symbol(lhs, "_mix_", k, "_eta"))
         end
-        if haskey(ctx.detmap, loc) && pred_link === IdentityLink
+        # A declared array is a value, as its named twin `loc = theta` is.
+        if (haskey(ctx.detmap, loc) || _is_declared_array(loc, ctx)) &&
+                pred_link === IdentityLink
             return _lower_location(lhs, loc, pred_link, ctx, predictors,
                 pred_idx, coefuse; synth = Symbol(lhs, "_mix_", k, "_eta"),
                 value = true)
@@ -8196,6 +8198,13 @@ struct _BareSlot
     name::Symbol
 end
 
+# A bare name such a slot marks: a sampled scalar (or a data column, which
+# `_lower_location` refuses with the link guidance). A declared array
+# (`Poisson.(lam)` with `lam[axes(y, 1)] .~ …`) is an ordinary value read
+# under the identity link, exactly as its named twin `r = lam` is.
+_bare_slot_name(arg, ctx) = arg isa Symbol && !haskey(ctx.detmap, arg) &&
+    !_is_declared_array(arg, ctx)
+
 function _lower_response_base(lhs, rhs::Expr, ctx)
     rhs.head === :call || _sfail("response $lhs: $_RESPONSE_BASE_MSG; " *
                                  "got $(repr(rhs))")
@@ -8222,7 +8231,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Bernoulli
         length(args) == 1 || _sfail("response $lhs: `Bernoulli` takes " *
                                     "`Bernoulli.(logistic.(eta))` (or `normcdf`/`cexpexp` for the inverse link)")
-        if args[1] isa Symbol && !haskey(ctx.detmap, args[1])
+        if _bare_slot_name(args[1], ctx)
             # Bare sampled parameter (constrained-scale, no link
             # inversion): the mixture bare-mean triple. A deterministic
             # definition is a predictor, not a parameter — it falls
@@ -8237,7 +8246,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     elseif fam === :Binomial
         length(args) == 2 || _sfail("response $lhs: `Binomial` takes " *
                                     "`Binomial.(n, logistic.(mu))` (or `normcdf`/`cexpexp` for the inverse link)")
-        if args[2] isa Symbol && !haskey(ctx.detmap, args[2])
+        if _bare_slot_name(args[2], ctx)
             # Bare sampled parameter (constrained-scale): the mixture
             # bare-mean triple. A deterministic definition is a
             # predictor, not a parameter — it falls through to link
@@ -8319,7 +8328,8 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
                                     "`ZeroInflatedBinomial.(n, p, zi)`")
         link, loc = _lower_slot_link(lhs,
             _dot2call_nested_link(lhs, args[2], :Binomial))
-        args[2] isa Symbol && loc in ctx.prior_names && (loc = _BareSlot(loc))
+        args[2] isa Symbol && loc in ctx.prior_names &&
+            !_is_declared_array(loc, ctx) && (loc = _BareSlot(loc))
         return ZeroInflatedBinomialFam, link, IdentityLink, loc,
         nothing, _lower_trials(lhs, args[1], ctx), nothing, args[3], nothing
     elseif fam === :InverseGaussian
@@ -8354,7 +8364,7 @@ function _lower_response_base(lhs, rhs::Expr, ctx)
     else
         length(args) == 1 || _sfail("response $lhs: `Poisson` takes " *
                                     "`Poisson.(exp.(eta))`")
-        if args[1] isa Symbol && !haskey(ctx.detmap, args[1])
+        if _bare_slot_name(args[1], ctx)
             # Bare sampled parameter (constrained-scale): the mixture
             # bare-mean triple. A deterministic definition is a
             # predictor, not a parameter — it falls through to link
@@ -8654,11 +8664,14 @@ function _lower_argument_value(lhs, slot, value, ctx)
     folded = _fold_literal(rhs)
     folded === nothing || return folded
     shape = _canon_shape(rhs, ctx)
-    shape in (:scalar, :vector) || _sfail("response $lhs $slot " *
+    shape in (:scalar, :vector, :array) || _sfail("response $lhs $slot " *
         "needs a scalar or one value per row, got $shape")
     if shape === :vector
         return _extract_column(lhs, rhs, ctx)
     end
+    # A scalar, or a value computed from declared arrays (`exp.(s)` over
+    # `s[axes(y, 1)]`): one named value, read as a declared array or its
+    # named twin `sd = exp.(s)` is, broadcast against the response.
     return get!(ctx.leaf_exprs, rhs) do
         while true
             ctx.synth[] += 1
@@ -8886,7 +8899,9 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
             !_is_design_shaped(loc, ctx) && !_scalar_location_value(loc, ctx)
         return _latent_predictor!(lhs, loc, pred_link, ctx, predictors, pred_idx)
     end
-    if loc isa Symbol
+    # A declared array read whole is a value expression (below), not a name
+    # with a location role of its own.
+    if loc isa Symbol && !(value && _is_declared_array(loc, ctx))
         haskey(ctx.matrices, loc) && _sfail(
             "response $lhs location $loc is a design matrix — locations " *
             "are predictors (`mu = $loc * b`), data, or inline affine " *
@@ -8962,6 +8977,11 @@ function _lower_location(lhs, loc, pred_link, ctx, predictors, pred_idx,
         # Per-cell latents classify inline like data columns: `b .* x_true`
         # is a ContinuousTerm over the latent; an unscaled summand is a
         # LatentTerm, just as when the whole location names that latent.
+        # A declared array written bare (`Normal.(theta, s)`,
+        # `Poisson.(exp.(theta))`, `Poisson.(lam)`) lowers here too, as its
+        # named twin `loc = theta` does: broadcasting pairs `theta[j]` with
+        # `y[j]`, stretches a singleton and fails on other lengths, as in
+        # Julia.
         # Multi-eta responses (CategoricalLogit) index their synthetic
         # predictors; the single-eta default keeps its established name.
         pname = _predictor_name!(something(synth, Symbol(lhs, "_eta")), ctx)
@@ -9039,11 +9059,16 @@ function _latent_predictor!(lhs, col, pred_link, ctx, predictors, pred_idx;
 end
 
 # A name a response may read as its location value: a data column, or a
-# sampled scalar parameter of any prior (arrays, varying blocks, latents
-# and scan states carry their own location arms).
+# sampled scalar parameter of any prior (declared arrays, latents and scan
+# states carry their own location arms).
 _is_value_location(loc::Symbol, ctx) = loc in ctx.data ||
-    (loc in ctx.prior_names && loc ∉ ctx.sized_decls &&
-        loc ∉ ctx.vector_params)
+    (loc in ctx.prior_names && !_is_declared_array(loc, ctx))
+
+# A declared array: a sized, data-sized, simplex or ordered declaration
+# (`theta[axes(y, 1)] .~ …`, `p ~ Dirichlet(…)`), whose value carries its
+# own axes, unlike a sampled scalar.
+_is_declared_array(loc::Symbol, ctx) = loc in ctx.prior_names &&
+    (loc in ctx.sized_decls || loc in ctx.vector_params)
 
 # Scalar definitions/expressions, plus scalar sums the affine path refuses
 # (two intercepts or a literal summand). Other vector-shaped expressions
@@ -9267,9 +9292,6 @@ function _lower_location_symbol_error(lhs, loc, ctx; bare::Bool = false,
         "definitions (`eta = a .+ b .* x`); a scalar parameter or data " *
         "column as the whole location is admitted for single-family " *
         "responses (`y .~ Normal.($loc, s)`)")
-    loc in ctx.prior_names && _sfail("response $lhs location $loc is a " *
-        "declared array, not one value per observation — read it by " *
-        "index (`$loc[g]`) or in a definition")
     return _sfail("response $lhs location $loc is not a predictor " *
                   "definition (`$loc = ...` affine in data)")
 end

@@ -32,6 +32,8 @@ const _TS_PROGRAMS = (
                              x2 = [cos(0.7i) for i in 1:_TS_N])),
     ("54_mixture", (; y = [0.4 + 0.8x + 0.2sin(3x) for x in _TS_X], x = _TS_X)),
     ("72_centered_levels", (; y = [0.3sin(i) for i in 1:_TS_N], g = _TS_G)),
+    ("72_centered_declared_location", (; y = [0.3sin(i) for i in 1:_TS_N],
+                                        sigma = [1.0 + 0.1i for i in 1:_TS_N])),
     ("98_array_rows_mvnormal", (; y = [0.1i for i in 1:_TS_N], x = _TS_X, g = _TS_G)),
 )
 
