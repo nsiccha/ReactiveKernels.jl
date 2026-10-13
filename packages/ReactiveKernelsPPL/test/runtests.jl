@@ -31,6 +31,7 @@ const _PPL_TEST_FILES = (
     "test_distributional_means.jl",
     "test_distributional_means_reactant.jl",
     "test_distributional_count_tails.jl",
+    "test_unit_parameter_tails.jl",
     "test_distributional_count_tails_reactant.jl",
     "test_distributional_broadcasts.jl",
     "test_distributional_broadcasts_reactant.jl",

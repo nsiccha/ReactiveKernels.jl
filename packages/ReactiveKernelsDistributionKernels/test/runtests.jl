@@ -719,6 +719,8 @@ end
         ZERO_INFLATED_BINOMIAL_KERNEL_SOURCE)
 end
 
+include("test_zero_inflated_binomial_logit_zi.jl")
+
 @testset "beta_binomial Stan lpmf parity" begin
     # beta_binomial(n, alpha, beta) is Stan's beta_binomial: the FULL
     # lpmf (binomial coefficient + lbeta terms), checked against
