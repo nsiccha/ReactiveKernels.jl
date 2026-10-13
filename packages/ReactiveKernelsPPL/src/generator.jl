@@ -2048,7 +2048,8 @@ end
 # shape and layout still describe the response), but omit the generated
 # `y_eta = loc` statement and use `loc` at every later read. The synthesized
 # predictor for an inline expression, and aliases of sampled parameters, keep
-# their own graph names.
+# their own graph names. A cell parameter that shares the alias's name (the
+# role-named `do value, location, scale` cells) is its own variable and keeps it.
 function _elide_named_location_aliases(plan::StructuralPlan, def::Expr)
     aliases = Dict{Symbol,Symbol}()
     for pred in plan.predictors
@@ -2067,7 +2068,7 @@ function _elide_named_location_aliases(plan::StructuralPlan, def::Expr)
             active[lhs] = st.args[2]
             continue
         end
-        push!(stmts, isempty(active) ? st : _hsubst(st, active))
+        push!(stmts, isempty(active) ? st : _hsubst(st, active; shadow = true))
         lhs === nothing || push!(defined, lhs)
     end
     return Expr(:(=), def.args[1], Expr(:block, stmts...))

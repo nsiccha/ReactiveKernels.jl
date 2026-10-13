@@ -6430,12 +6430,19 @@ end
 # Call heads, dotted function names (`f.(…)`), keyword names and macro names
 # are never renamed; a bare keyword shorthand (`f(; k)`, meaning `k = k`)
 # expands to `k = <renamed>` when `k` is renamed. QuoteNodes remain opaque.
-_hsubst(ex::Symbol, map::AbstractDict) = get(map, ex, ex)
-_hsubst(ex, ::AbstractDict) = ex
-function _hsubst(ex::Expr, map::AbstractDict)
+# A `->`/`do` parameter is renamed with its uses by default: submodel scoping
+# puts the body's own binders in `map`. With `shadow = true` the map names
+# outer values instead: a parameter keeps its name and hides its entry in the
+# body, and a value that would land under a parameter it mentions fails closed.
+_hsubst(ex::Symbol, map::AbstractDict; shadow::Bool = false) = get(map, ex, ex)
+_hsubst(ex, ::AbstractDict; shadow::Bool = false) = ex
+function _hsubst(ex::Expr, map::AbstractDict; shadow::Bool = false)
     h = ex.head
-    sub(a) = _hsubst(a, map)
-    if h === :call && !isempty(ex.args)
+    sub(a) = _hsubst(a, map; shadow)
+    if shadow && h === :-> && length(ex.args) == 2
+        inner = _shadowed_map(map, ex)
+        return Expr(:->, ex.args[1], _hsubst(ex.args[2], inner; shadow))
+    elseif h === :call && !isempty(ex.args)
         f = ex.args[1]
         if f isa Symbol && get(map, f, nothing) isa GlobalRef
             f = map[f]
@@ -6467,6 +6474,33 @@ function _hsubst(ex::Expr, map::AbstractDict)
             Any[a isa LineNumberNode ? a : sub(a) for a in ex.args[2:end]]...)
     end
     return Expr(h, Any[sub(a) for a in ex.args]...)
+end
+
+# The map inside the body of `lambda` under `shadow = true`.
+function _shadowed_map(map::AbstractDict, lambda::Expr)
+    params = _param_names!(Set{Symbol}(), lambda.args[1])
+    inner = filter(kv -> !(first(kv) in params), map)
+    read = _all_symbols!(Set{Symbol}(), lambda.args[2])
+    for (k, v) in inner
+        k in read || continue
+        captured = intersect(_all_symbols!(Set{Symbol}(), v), params)
+        isempty(captured) || throw(ArgumentError(
+            "substituting `$k` → `$v` into `$lambda` would capture its " *
+            "parameter(s) $(join(("`$p`" for p in sort!(collect(captured))), ", "))"))
+    end
+    return inner
+end
+
+# The names a `->` parameter list binds: `x`, `(x, y; k)`, `x::T`, `x = d`, `xs...`.
+_param_names!(out::Set{Symbol}, p::Symbol) = push!(out, p)
+_param_names!(out::Set{Symbol}, p) = out
+function _param_names!(out::Set{Symbol}, p::Expr)
+    if p.head in (:tuple, :parameters)
+        foreach(a -> _param_names!(out, a), p.args)
+    elseif p.head in (:kw, :(=), :...) || Meta.isexpr(p, :(::), 2)
+        _param_names!(out, p.args[1])
+    end
+    return out
 end
 
 # A call head that names an argument or a body binder would silently stay
