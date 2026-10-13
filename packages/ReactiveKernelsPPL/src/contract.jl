@@ -2698,6 +2698,9 @@ _tuple_field_value(ex) = Meta.isexpr(ex, :(=), 2) && ex.args[1] isa Symbol ?
 function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
+    # A module constant (`LinearAlgebra.I`, functions as values) is a value,
+    # never a plan name.
+    ex isa GlobalRef && return nothing
     _is_plate_column_expr(ex) &&
         return _collect_plate_column_refs!(refs, ex, plan, label, bound)
     _is_matrix_math(ex, plan) &&
@@ -3015,6 +3018,7 @@ end
 function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
     ex isa Number && return nothing
     ex isa LineNumberNode && return nothing
+    ex isa GlobalRef && return nothing  # a module constant
     if ex isa Symbol
         # Per-cell latent (plate) parameters are vectors, so a derived column
         # may transform one (`theta = mu .+ tau .* z`) — the non-centered shape.
@@ -7321,6 +7325,7 @@ end
 function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
         memo::Dict{Symbol,Any}, root::Symbol)
     ex isa Number && return ex
+    ex isa GlobalRef && return getglobal(ex.mod, ex.name)
     ex isa Symbol &&
         return _eval_derived_name(plan, ex, det_exprs, columns, memo, root)
     ex isa Expr || throw(ContractValidationError(

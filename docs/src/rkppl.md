@@ -462,6 +462,30 @@ The mean, factor and their priors are declared values. Read rows with
 `B[g, 1]`, or columns with `B[:, g]`. Integer axes use positive integer
 positions; level axes map the authored labels.
 
+Multivariate priors read their arguments as values, so a mean, covariance
+or factor written inline means its named definition. A whole vector drawn
+from one multivariate normal, such as the response of a Gaussian-process
+regression, builds its covariance from data and parameters with ordinary
+Julia arithmetic:
+
+```julia
+using LinearAlgebra: I
+gp = @rkppl begin
+    rho ~ LogNormal(0, 0.5)
+    alpha ~ HalfNormal(2)
+    sigma ~ HalfNormal(1)
+    K = alpha^2 .* exp.(-0.5 .* D ./ rho^2) + sigma * I
+    y[axes(D, 1)] ~ MvNormal(zeros(N), K)
+end
+gp(; D, N = size(D, 1)) | (; y)
+```
+
+`D` holds squared distances. The model reads it only for the declared axis
+and inside the covariance, so it has no observation axis. `sigma * I` is
+Julia's `UniformScaling`, added to the diagonal. The factor spellings
+`MvNormalCholesky(zeros(N), cholesky(Symmetric(K)).L)` and
+`MvNormalCholesky(zeros(N), rk_cholesky_lower(K))` state the same density.
+
 Valid multivariate priors compile with Reactant when prepared with
 `on_error = :ignore`. This explicit preparation policy strips visible
 throws and assertions; native preparation checks the factor or covariance.

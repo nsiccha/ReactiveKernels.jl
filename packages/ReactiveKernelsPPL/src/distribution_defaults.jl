@@ -46,8 +46,9 @@ end
 # Each constructor argument's role, by position, in the distribution
 # kernels' vocabulary (`normal(location, scale)`). A value the lowering
 # computes for one argument is named after its owner and that role
-# (`y .~ Normal.(mu, f(x))` names `y_scale`). One row per family; a family
-# without a row names a computed argument after its function.
+# (`y .~ Normal.(mu, f(x))` names `y_scale`, `b[1:K] ~ MvNormal(zeros(N), K)`
+# names `b_mean`). One row per family; a family without a row names a
+# computed argument after its function.
 const _DISTRIBUTION_ROLES = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :Normal => (:location, :scale), :Cauchy => (:location, :scale),
     :Laplace => (:location, :scale), :Logistic => (:location, :scale),
@@ -64,6 +65,8 @@ const _DISTRIBUTION_ROLES = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :NormalIDGLM => (:design, :intercept, :coefficients, :scale),
     :BernoulliLogitGLM => (:design, :intercept, :coefficients),
     :PoissonLogGLM => (:design, :intercept, :coefficients),
+    :MvNormal => (:mean, :covariance), :MvNormalCholesky => (:mean, :factor),
+    :Dirichlet => (:concentration,),
 )
 
 # The role of argument `position` of `head(args...)` with `nargs` authored
@@ -72,6 +75,9 @@ const _DISTRIBUTION_ROLES = Dict{Symbol,Tuple{Vararg{Symbol}}}(
 function _distribution_role(head::Symbol, position::Int, nargs::Int)
     head === :VonMises && nargs == 1 && return :concentration
     head === :Beta && nargs == 1 && return :shape
+    # The symmetric `Dirichlet(K, a)`: a length, then one concentration.
+    head === :Dirichlet && nargs == 2 &&
+        return position == 1 ? :dimension : :concentration
     roles = get(_DISTRIBUTION_ROLES, head, ())
     return position in eachindex(roles) ? roles[position] : nothing
 end
