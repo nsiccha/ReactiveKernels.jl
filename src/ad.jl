@@ -1551,7 +1551,11 @@ backend shadows them itself. Cache steps that cannot see the active input
 differentiated program: storing caller-owned constant data into a shadowed
 slot would be a static-activity error. The kernel's borrowed primal caches
 are never exposed to the backend, and primal calls keep using them
-independently of the prepared object.
+independently of the prepared object. Bound values, and the steps that read
+only bound values (computed once during preparation), reach the backend as
+hidden `DifferentiationInterface.Constant` contexts, as for a dataflow kernel,
+so the differentiated callable carries no bound data and ordinary reverse-mode
+`AutoEnzyme` needs no function annotation.
 
 Result types must be stable across calls: a step whose result type changes
 after preparation fails loudly instead of silently reseeding. Like every
