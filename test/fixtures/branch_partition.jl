@@ -45,6 +45,29 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# A guarded location over a bound index domain, read from captured live
+# scalars, with a constant fallback arm, then gathered by a guarded density
+# plate: the shape of a missing observation's computed location. The `sqrt`
+# arm is invalid off its lanes.
+@kernel guarded_location(u::Vector{Float64}, x::Vector{Float64},
+                         y::Vector{Float64}, idx::Vector{Int},
+                         obs::Vector{Bool}) = begin
+    a::Float64 = u[1]
+    b::Float64 = u[2]
+    loc = plate(idx, obs) do i, oi
+        if oi
+            mi = a + b * sqrt(x[i])
+            mi
+        else
+            0.0
+        end
+    end
+    pointwise = plate(y, loc, obs) do yi, li, oi
+        oi ? -0.5 * (yi - li)^2 : 0.0
+    end
+    total::Float64 = sum(pointwise)
+end
+
 # A bound-only condition computed in the cell first (a cached frontier).
 @kernel derived_condition(x::Vector{Float64}, y::Vector{Float64}) = begin
     pointwise = plate(x, y) do xi, yi
