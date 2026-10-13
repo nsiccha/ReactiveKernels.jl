@@ -3421,13 +3421,21 @@ function _plate_inferred_input_types(p::Plan; exemplar_types = nothing)
     types
 end
 
-function _plate_inferred_values(g::Graph, values, types; rank_evidence::Bool = false)
+function _plate_inferred_values(g::Graph, values, scalar_types; rank_types = nothing)
     result = Any[]
     for v in values
-        T = get(types, canon_id(g, v.id), Any)
-        proven = T isa Type && T !== Union{} &&
-            (T <: Number || rank_evidence && (T <: AbstractVector || T <: Tuple))
-        push!(result, proven && !(valtype(v) <: T) ?
+        cid = canon_id(g, v.id)
+        scalar = get(scalar_types, cid, Any)
+        rank = rank_types === nothing ? Any : get(rank_types, cid, Any)
+        T = if scalar isa Type && scalar !== Union{} && scalar <: Number
+            scalar
+        elseif rank isa Type && rank !== Union{} &&
+                (rank <: AbstractVector || rank <: Tuple)
+            rank
+        else
+            Any
+        end
+        push!(result, T !== Any && !(valtype(v) <: T) ?
             Value{T}(v.id, v.name) : v)
     end
     result
@@ -3465,6 +3473,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     skipped_recipes = Set{Int}()
     pending_scans = Dict{Int,Any}()
     inferred_plate_types = nothing
+    inferred_exemplar_types = nothing
     declared = Set{Symbol}()
     declare_types = declare
     # HAVE is authoritative, and the first selected producer of any other
@@ -3504,14 +3513,25 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
 
         if inline_embedded && r.op isa _AuthoredPlateOp
             callvalues = r.inputs
-            if !tensorized && type_hints === nothing &&
-                    (exemplar_types !== nothing ||
-                     any(q -> _plate_branch_operation(q.op),
-                         r.op.kernel.plan.recipes))
+            # Shared-branch arm slots belong to the common operation table,
+            # so both lowerings use source-inferred scalar inputs. Exemplar
+            # rank evidence is native-only; exemplar-only scalar evidence
+            # cannot change a branch table shared with the tensorized kernel.
+            branch = any(q -> _plate_branch_operation(q.op),
+                         r.op.kernel.plan.recipes)
+            if type_hints === nothing &&
+                    ((!tensorized && exemplar_types !== nothing) || branch)
                 inferred_plate_types === nothing &&
-                    (inferred_plate_types = _plate_inferred_input_types(p; exemplar_types))
-                callvalues = _plate_inferred_values(g, r.inputs, inferred_plate_types;
-                    rank_evidence = exemplar_types !== nothing)
+                    (inferred_plate_types = _plate_inferred_input_types(p))
+                if !tensorized && exemplar_types !== nothing
+                    inferred_exemplar_types === nothing &&
+                        (inferred_exemplar_types =
+                            _plate_inferred_input_types(p; exemplar_types))
+                end
+                scalars = branch ? inferred_plate_types :
+                    something(inferred_exemplar_types, inferred_plate_types)
+                callvalues = _plate_inferred_values(g, r.inputs, scalars;
+                    rank_types = inferred_exemplar_types)
             end
             length(r.outputs) == 1 || throw(ArgumentError(
                 "an authored plate recipe must have exactly one pointwise output"))
