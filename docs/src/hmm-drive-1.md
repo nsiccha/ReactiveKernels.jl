@@ -77,12 +77,13 @@ earlier pin unrolled it into a ~9.6 MB module). The counts are read from
 authored-scan tests assert on — because `module_string` is empty on the pinned
 Reactant and a count against it would be vacuous.
 
-The **native plain-Enzyme reverse gradient** is a documented UNSUPPORTED axis
-(snag `scan-prior-enzym-d67d4ac1`): it fails Enzyme's *static* activity
-analysis (`EnzymeRuntimeActivityError`) under both the ordinary and
-Const-annotated configurations, while the same graph's components, the same
-priors without the scan, and a three-prior scan control all pass, and
-`Enzyme.set_runtime_activity` matches BridgeStan's gradient. The
+The **native plain-Enzyme reverse gradient** works under both the ordinary and
+Const-annotated configurations, because the scan step reduces with the
+type-stable `logsumexp(M; dims = 1)`; the example test checks the ordinary
+configuration against finite differences. While the step used
+`mapslices(logsumexp, M; dims = 1)`, which infers `Any`, the gradient failed
+Enzyme's *static* activity analysis (`EnzymeRuntimeActivityError`, snag
+`scan-prior-enzym-d67d4ac1`) and needed `Enzyme.set_runtime_activity`. The
 Reactant-compiled gradient is an explicit UNSUPPORTED axis at this pin on both
 query shapes, each measured in its own isolated process (no native gradient
 work of any mode beforehand): the all-bound shape's unrolled module is

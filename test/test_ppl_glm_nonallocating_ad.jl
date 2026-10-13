@@ -13,8 +13,9 @@ using Distributions: Bernoulli, Poisson, Normal, logpdf
 import Enzyme
 using Test
 
-const GLM_NA_BACKEND = AutoEnzyme(mode = Enzyme.Reverse,
-    function_annotation = Enzyme.Const)
+# Ordinary reverse mode: the bound design matrix reaches BLAS through the
+# GLM likelihood, so this also covers bound data under a plain backend.
+const GLM_NA_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
 const _GLM_X1 = [0.5, -0.3, 1.2, 0.1, -0.8, 0.4]
 const _GLM_X2 = [1.0, 0.5, -0.5, 0.3, 0.9, -0.2]

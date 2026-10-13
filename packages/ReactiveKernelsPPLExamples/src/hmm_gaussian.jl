@@ -74,7 +74,7 @@ using LogExpFunctions: logsumexp
     # logA[i,j] = log A[i][j].
     Fmat::Matrix{Float64} = reshape(A_free, K - 1, K)
     Xmat::Matrix{Float64} = B * Fmat                          # K×K, col i = sum_to_zero(A[i]_free)
-    lseA::Vector{Float64} = vec(mapslices(logsumexp, Xmat; dims = 1))   # per-column lse
+    lseA::Vector{Float64} = vec(logsumexp(Xmat; dims = 1))   # per-column lse
     logAcols::Matrix{Float64} = Xmat .- lseA'                 # col i = log A[i]
     logA::Matrix{Float64} = permutedims(logAcols)             # logA[i,j] = log A[i][j]
     A::Matrix{Float64} = exp.(logA)
@@ -104,7 +104,7 @@ using LogExpFunctions: logsumexp
         scan(y[2:T]; init = gamma1) do carry, yt
             emit = c0 .- log.(sigma) .- 0.5 .* ((yt .- mu) ./ sigma) .^ 2
             M = carry .+ logA                                 # M[i,j] = γ[i] + logA[i,j]
-            newg = vec(mapslices(logsumexp, M; dims = 1)) .+ emit
+            newg = vec(logsumexp(M; dims = 1)) .+ emit
             (newg, logsumexp(newg))
         end
     likelihood::Float64 = lls[T - 1]

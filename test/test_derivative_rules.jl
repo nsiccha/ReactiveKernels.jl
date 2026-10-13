@@ -54,6 +54,26 @@ const two_input = scalar_derivative_rule(
 end # module
 
 const _DRG = DerivativeRuleTestGraphs
+@testset "affine logistic keeps a representable reverse derivative" begin
+    lo, hi = -10.0, 10.0
+    u = log(0.465 / 0.535)
+    s = 0.465
+    @test @inferred(rk_affine_logistic(lo, hi, u)) ≈ -0.7
+    @test collect(Base.tail(derivative_cut(rk_affine_logistic,
+        (true, true, true), lo, hi, u))) ≈
+        [1 - s, s, (hi - lo) * s * (1 - s)]
+
+    objective(z) = begin
+        eta = -1000.0 * rk_affine_logistic(-10.0, 10.0, z)
+        eta - exp(eta)
+    end
+    got = only(only(Enzyme.autodiff(Reverse, objective, Active, Active(u))))
+    expected = (1 - exp(700.0)) * (-1000.0) *
+        ((hi - lo) * s * (1 - s))
+    @test isfinite(got)
+    @test got ≈ expected rtol = 1e-10
+end
+
 _two_input_reference(a, b) = (
     y = exp(a * b) + log(a + b),
     dy_da = b * exp(a * b) + 1 / (a + b),

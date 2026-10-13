@@ -19,9 +19,11 @@
 # An axis blocked by a DOCUMENTED limitation is recorded per-model as
 # UNSUPPORTED with the COMPLETE exception and backtrace retained to
 # STRUCTURED_ERRDIR (or stdout) — never a silent skip, and a different error is
-# a hard failure. Current documented limitation (snag
-# scan-prior-enzym-d67d4ac1): the native plain-Enzyme static-activity gradient
-# of the authored-scan HMM graphs. Runtime-activity and compile-order priming
+# a hard failure. Documented limitation (snag scan-prior-enzym-d67d4ac1): the
+# native plain-Enzyme static-activity gradient of the authored-scan HMM graphs
+# failed while their scan step used `mapslices(logsumexp, M; dims = 1)`; with
+# the type-stable `logsumexp(M; dims = 1)` it differentiates, and the axis is
+# recorded UNSUPPORTED only if that signature recurs. Runtime-activity and compile-order priming
 # experiments are NOT part of acceptance; they live in
 # structured_gate_diagnostics.jl.
 #

@@ -78,16 +78,19 @@ end
         @test k(Int.(Float64.(y)), X, beta) ≈ ref_total
     end
 
-    @testset "saturating tails stay finite and match the cutoff form" begin
-        # Stan's fused form (cutoff-20 Taylor tails), written independently.
-        stan_cell(yθ) = (em = exp(-yθ);
-            yθ > 20 ? -em : yθ < -20 ? yθ : -log1p(em))
-        for et in (-30.0, -21.0, -20.0, 20.0, 21.0, 30.0), yi in (0, 1)
+    @testset "saturating tails are exact and finite where the probability is positive" begin
+        # The exact signed-margin log-probability, written independently:
+        # log(p) = -log(1 + exp(-yθ)), its tails in closed form.
+        exact_cell(yθ) = yθ >= 0 ? -log1p(exp(-yθ)) : yθ - log1p(exp(yθ))
+        kp = prepare(bernoulli_logit_glm.pointwise; have = (:y, :X, :beta), want = :pointwise)
+        for et in (-800.0, -40.0, -30.0, -21.0, -20.0, 0.0, 20.0, 21.0, 30.0, 40.0, 800.0),
+                yi in (0, 1)
             yθ = (2 * yi - 1) * et
-            @test prepare(bernoulli_logit_glm.pointwise;
-                have = (:y, :X, :beta), want = :pointwise)(
-                    [yi], [1.0 et], [0.0, 1.0])[1] ≈ stan_cell(yθ)
+            @test kp([yi], [1.0 et], [0.0, 1.0])[1] ≈ exact_cell(yθ) rtol = 1e-14
         end
+        # Infinite eta: probability 1 for the agreeing outcome, 0 against it.
+        @test kp([1, 0], [1.0 Inf; 1.0 -Inf], [0.0, 1.0]) == [0.0, 0.0]
+        @test kp([0, 1], [1.0 Inf; 1.0 -Inf], [0.0, 1.0]) == [-Inf, -Inf]
     end
 
     @testset "score tails match Stan's cutoff theta" begin
@@ -140,14 +143,21 @@ end
         gref = _glm_fd_grad(oracle, q)
         @test g ≈ gref rtol = 1e-6
         @test v ≈ kb(q) rtol = 1e-12
-        # Saturating tails exercise the kernel's cutoff branches too. FD runs
+        # Saturating tails exercise log1pexp's tail branches too. FD runs
         # against the kernel primal itself here, NOT the Distributions oracle:
         # the oracle's probability form (`Bernoulli(LogExpFunctions.logistic(e))`) suffers
         # 1-p cancellation at saturating eta, and FD amplifies that ~1e-7
-        # noise to O(1) — the cutoff form under test has no such noise.
+        # noise to O(1) — the log-space form under test has no such noise.
         qtail = [3.0, -12.0]
         _, gt = ad_value_and_gradient!(prep, similar(qtail), qtail)
         @test gt ≈ _glm_fd_grad(kb, qtail) rtol = 1e-5
+        # Far past exp overflow (|eta| up to 2000) the gradient is the exact
+        # X'(y - logistic(eta)) - beta, finite: no branch evaluates exp of a
+        # large positive margin.
+        qfar = [0.0, 1000.0]
+        _, gf = ad_value_and_gradient!(prep, similar(qfar), qfar)
+        @test all(isfinite, gf)
+        @test gf ≈ X' * (y .- LogExpFunctions.logistic.(X * qfar)) .- qfar rtol = 1e-12
     end
 end
 

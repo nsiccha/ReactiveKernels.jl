@@ -9,8 +9,10 @@ using LinearAlgebra
 import Enzyme
 using Test
 
-const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse,
-                                 function_annotation = Enzyme.Const)
+# Ordinary reverse mode, with no function annotation: bound and folded values
+# reach the differentiated program as hidden `Constant` operands, so the
+# callable holds no data a plain backend must prove readonly.
+const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
 nlp_naad(x, m, s) = -0.5 * log(2π) - log(s) - 0.5 * ((x - m) / s)^2
 g_prior_naad(q) = nlp_naad(q[1], 0.0, 5.0) + nlp_naad(q[2], 0.0, 5.0) +
@@ -35,6 +37,13 @@ naad_spec = @kernel naad_model(unconstrained, X, Cf, cterm) = begin
     posterior = prior + likelihood
     return posterior
 end
+
+# The differentiated program's operation table and hidden operands. Bound and
+# folded values leave the table as placeholders and cross as the pack.
+naad_ad_ops(prepared) = prepared.call.ops === nothing ?
+    prepared.call.f.call.ops : prepared.call.ops
+naad_hidden(prepared) =
+    ReactiveKernels._ad_hidden_operands(prepared.call, prepared.external_values)
 
 function naad_findiff(kb, qq)
     h = 1e-6
@@ -67,12 +76,12 @@ end
     prepna = prepare_ad(kbna, NA_AD_BACKEND, q; active = :unconstrained)
 
     @testset "owned Cache threading" begin
-        @test length(prepna.external_values) == 1
-        @test only(prepna.external_values) isa Cache
+        @test length(prepna.external_values) == 2
+        @test last(prepna.external_values) isa Cache
         untyped = prepare_nonallocating(kb)
         @test all(isnothing, untyped.caches)
         prepu = prepare_ad(untyped, NA_AD_BACKEND, q; active = :unconstrained)
-        @test only(prepu.external_values) isa DifferentiationInterface.Constant
+        @test last(prepu.external_values) isa DifferentiationInterface.Constant
         gu = similar(q)
         g = similar(q)
         vu, _ = ad_value_and_gradient!(prepu, gu, q)
@@ -129,6 +138,20 @@ end
         vvna, _ = ad_value_and_gradient!(prepnav, gvna, q)
         @test vvna == vv
         @test gvna ≈ gv
+    end
+
+    @testset "bound values cross as hidden operands" begin
+        # `X * b` reaches BLAS `gemv`, an opaque call a plain reverse backend
+        # cannot prove readonly when `X` is a field of the differentiated
+        # callable (EnzymeMutabilityException). The bound values instead form
+        # one named `Constant` pack before the owned caches.
+        @test prepna.call.ops === nothing
+        @test keys(first(prepna.external_values)) == (:X, :Cf, :cterm)
+        @test naad_hidden(prepna) == (X, Cf, cterm)
+        annotated = prepare_ad(kbna, AutoEnzyme(mode = Enzyme.Reverse,
+            function_annotation = Enzyme.Const), q; active = :unconstrained)
+        @test ad_gradient(annotated, qalt) == ad_gradient(prepna, qalt)
+        @test ad_gradient(prepna, qalt) ≈ ad_gradient(prep, qalt)
     end
 
     @testset "fail closed" begin
@@ -357,11 +380,11 @@ end
     @test gna == g == ones(n)
     # Locate the product by its value, independently of operation-table layout.
     product = m * v
-    folded_ops = filter(op -> op isa ReactiveKernels._BoundConstant &&
-        op.value isa AbstractVector && op.value == product, prepna.call.ops)
-    @test length(folded_ops) == 1
+    folded_values = filter(value -> value isa AbstractVector &&
+        value == product, naad_hidden(prepna))
+    @test length(folded_values) == 1
     # The folded value is an owned copy, never the primal slot's buffer.
-    folded = only(folded_ops).value
+    folded = only(folded_values)
     @test folded == kbna.caches[matmul_step][] == product
     @test folded !== kbna.caches[matmul_step][]
     # The gradient never recomputes the bound-only product.
@@ -413,9 +436,8 @@ end
         @test m.products[] == 0
         prepared = prepare_ad(kernel, NA_AD_BACKEND, a; active = :a)
         @test m.products[] == 1
-        folded = only(op.value for op in prepared.call.ops
-            if op isa ReactiveKernels._BoundConstant &&
-               op.value isa AbstractVector && op.value == product)
+        folded = only(value for value in naad_hidden(prepared)
+            if value isa AbstractVector && value == product)
         matmul = only(i for i in eachindex(kernel.ops)
             if kernel.ops[i] isa ReactiveKernels._MatMulStep)
         @test folded == product
@@ -435,9 +457,8 @@ end
         @test m.products[] == 1
         second = prepare_ad(kernel, NA_AD_BACKEND, a; active = :a)
         @test m.products[] == 2
-        second_folded = only(op.value for op in second.call.ops
-            if op isa ReactiveKernels._BoundConstant &&
-               op.value isa AbstractVector && op.value == product)
+        second_folded = only(value for value in naad_hidden(second)
+            if value isa AbstractVector && value == product)
         @test second_folded == folded
         @test second_folded !== folded
         @test kernel(a) == sum(product .+ a)
@@ -478,8 +499,10 @@ end
     kbna = prepare_nonallocating(spec; have = (:m, :v, :a), want = :s,
                                  bound = (; m))
     prepna = prepare_ad(kbna, NA_AD_BACKEND, v, a0; active = :a)
-    # The product sees the unbound port, so nothing folds.
-    @test length(prepna.call.ops) == length(kbna.ops)
+    # The product sees the unbound port, so nothing folds: the bound matrix
+    # is the only hidden operand.
+    @test length(naad_ad_ops(prepna)) == length(kbna.ops)
+    @test naad_hidden(prepna) == (m,)
     gna = similar(a0)
     va, _ = ad_value_and_gradient!(prepna, gna, v, a0)
     @test va ≈ sum(m * v) + sum(a0)
@@ -516,8 +539,8 @@ end
     @test any(op -> op === -, kbna.ops)
     prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
     prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
-    @test any(op -> op === +, prepna.call.ops)
-    @test any(op -> op === -, prepna.call.ops)
+    @test any(op -> op === +, naad_ad_ops(prepna))
+    @test any(op -> op === -, naad_ad_ops(prepna))
     g, gna = similar(a0), similar(a0)
     v, _ = ad_value_and_gradient!(prep, g, a0)
     vna, _ = ad_value_and_gradient!(prepna, gna, a0)
@@ -539,7 +562,7 @@ end
     @test any(op -> op isa ReactiveKernels._MaterializeStep, kbna.ops)
     prep = prepare_ad(kb, NA_AD_BACKEND, a0; active = :a)
     prepna = prepare_ad(kbna, NA_AD_BACKEND, a0; active = :a)
-    @test any(op -> op isa ReactiveKernels._MaterializeStep, prepna.call.ops)
+    @test any(op -> op isa ReactiveKernels._MaterializeStep, naad_ad_ops(prepna))
     g, gna = similar(a0), similar(a0)
     v, _ = ad_value_and_gradient!(prep, g, a0)
     vna, _ = ad_value_and_gradient!(prepna, gna, a0)

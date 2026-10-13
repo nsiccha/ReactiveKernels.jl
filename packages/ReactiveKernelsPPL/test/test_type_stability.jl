@@ -58,3 +58,38 @@ end
                      findings(q.kernel, (Vector{Float64},)))
     @test _ts_report("$name (gradient call)", ad_call_findings(q.ad, u))
 end
+
+# A missing observation skips its cell's computed argument; the skipped arm
+# has the computed arm's type, so the whole-response sampler and one cell's
+# sampler stay concretely typed (snag `rkppl-missing-ob-b1746293`). The
+# location's `sqrt` is invalid at the missing row.
+const _TS_MISSING_LOCATION = quote
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    @plate for i in eachindex(y)
+        mu = a + b * sqrt(x[i])
+        y[i] ~ Normal(mu, 0.7)
+    end
+end
+
+@testset "RKPPL samplers with a missing observation are concretely typed" begin
+    data = (; y = Union{Missing,Float64}[0.1, missing, 0.4, 0.3],
+            x = [0.2, -1.0, 0.5, 0.9])
+    bound = bind_data(lower_rkppl(_TS_MISSING_LOCATION, data; conditioned = (:y,),
+                                  mod = @__MODULE__), data)
+    built = build_kernel(bound)
+    u = [0.2, -0.3]
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    q = @test_logs min_level = Base.CoreLogging.Warn prepare_sampler(
+        built, bound, u; backend)
+    @test isfinite(q(u))
+    @test _ts_report("missing location (native kernel)",
+                     findings(q.kernel, (Vector{Float64},)))
+    @test _ts_report("missing location (gradient call)", ad_call_findings(q.ad, u))
+    cell = @test_logs min_level = Base.CoreLogging.Warn prepare_cell_sampler(
+        built, bound, :y, u; backend)
+    @test _ts_report("missing location (cell kernel)",
+                     findings(cell.kernel, (Vector{Float64}, Int)))
+    @test _ts_report("missing location (cell gradient call)",
+                     ad_call_findings(cell.ad, u, 2))
+end

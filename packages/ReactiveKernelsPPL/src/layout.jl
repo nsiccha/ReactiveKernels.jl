@@ -1401,17 +1401,18 @@ _logjac_value(transform::Symbol, u) =
 # single source of truth shared with the in-graph splices). An `:interval`
 # transform is PARAMETERIZED by per-entry bounds, so it does not fit the
 # Symbol-keyed parameterless bijector registry (like `:identity`, it lives
-# outside it): it maps ℝ → (lo, hi) via an affine-logistic (`lo + (hi-lo)·σ(u)`)
+# outside it): it maps ℝ → (lo, hi) via the RK-owned affine-logistic rule
+# (`lo + (hi-lo)·σ(u)`)
 # with log-Jacobian `log(x-lo) + log(hi-x) - log(hi-lo)` in the CONSTRAINED
 # value. `:floored` is likewise parameterized (ℝ → (lo, ∞), `lo + exp(u)`,
 # log-Jacobian `u`), as is `:upper` (ℝ → (-∞, hi), `hi - exp(u)`,
 # log-Jacobian `u`). Prior density normalizers are emitted separately.
-# The in-graph interval/floored/upper edges (below) use the same operations
-# with literal bounds folded (`_bound_add`), so host and graph agree
-# bit-for-bit up to the sign of an exact zero.
+# The in-graph interval constrain edge calls that same rule. The other edges
+# fold literal bounds (`_bound_add`), so host and graph agree bit-for-bit up
+# to the sign of an exact zero.
 function _constrain_elt(e::LayoutEntry, u)
     e.transform === :interval &&
-        return e.lo + (e.hi - e.lo) / (1 + exp(-u))
+        return rk_affine_logistic(e.lo, e.hi, u)
     e.transform === :floored && return e.lo + exp(u)
     e.transform === :upper && return e.hi - exp(u)
     return _constrain_value(e.transform, u)
@@ -1427,7 +1428,7 @@ function _logjac_elt(e::LayoutEntry, u)
         e.transform === :upper || return _logjac_value(e.transform, u)
     e.transform === :floored && return u
     e.transform === :upper && return u
-    x = e.lo + (e.hi - e.lo) / (1 + exp(-u))
+    x = rk_affine_logistic(e.lo, e.hi, u)
     # The width takes the value's number type, so a wide input keeps its
     # precision; for Float64 this is the identity.
     return log(x - e.lo) + log(e.hi - x) - log(oftype(x, e.hi - e.lo))
@@ -1451,7 +1452,7 @@ block_read(offset::Int, width::Int) =
     :(view(unconstrained, $offset:$(offset + width - 1)))
 
 # Bound arithmetic of the parameterized (`:interval`/`:floored`/`:upper`)
-# edges, spelled as the model states it. Literal operands fold
+# inverse, Jacobian and one-sided edges. Literal operands fold
 # (`(0.5 - 0.0)` is `0.5`, `x - -1.0` is `x + 1.0`) and a literal zero
 # drops out (`0.0 + exp(u)` is `exp(u)`, `log(x - 0.0)` is `log(x)`,
 # `0.0 - exp(u)` is `-exp(u)`, `- log(1.0)` vanishes). No fold changes an
@@ -1477,14 +1478,14 @@ function _bound_sub(a, b; dot::Bool = false)
     return dot ? :($a .- $b) : :($a - $b)
 end
 
-# Interval edges ℝ → (lo, hi): `lo + (hi - lo) / (1 + exp(-u))`, its
+# Interval edges ℝ → (lo, hi): the RK-owned affine-logistic constrain rule,
+# whose primal is `lo + (hi - lo) / (1 + exp(-u))`, its
 # inverse `log(x - lo) - log(hi - x)`, and the log-Jacobian
 # `log(x - lo) + log(hi - x) - log(hi - lo)` (summed over the block when
 # `dot`).
 function _interval_constrain(lo, hi, u; dot::Bool = false)
-    w = _bound_sub(hi, lo)
-    return _bound_add(lo,
-        dot ? :($w ./ (1 .+ exp.(-$u))) : :($w / (1 + exp(-$u))); dot)
+    return dot ? :(rk_affine_logistic.($lo, $hi, $u)) :
+        :(rk_affine_logistic($lo, $hi, $u))
 end
 _interval_unconstrain(lo, hi, x; dot::Bool = false) = dot ?
     :(log.($(_bound_sub(x, lo; dot))) .- log.($(_bound_sub(hi, x; dot)))) :
@@ -1579,8 +1580,8 @@ function transform_statements(e::LayoutEntry)
     if e.transform === :interval
         # An :interval transform is parameterized by per-entry bounds, so it is
         # not in the Symbol-keyed (parameterless) bijector registry — its
-        # forward + inverse edges are hand-rolled here, with the host `_*_elt`
-        # path's math (`_bound_add` notes the folded literal bounds).
+        # forward edge calls the host `_*_elt` path's RK-owned rule; the
+        # inverse edge retains the authored log-ratio expression.
         u = Symbol(:_ppl_int_, e.name)
         return Expr[
             :($u::Float64 = $coord),

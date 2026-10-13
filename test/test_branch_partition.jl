@@ -103,6 +103,29 @@ isdefined(@__MODULE__, :BranchPartition) ||
                       for (m, xi, yi, o) in zip(mu, xc, yc, obs)]
     end
 
+    @testset "reverse through a reassembled constant arm beside captured live values" begin
+        # Base's vcat of the constant arm's vector beside the live arm's fails
+        # native Reverse (EnzymeRuntimeActivityError, Enzyme 0.13.216); the
+        # reassembly concatenates as the native kernel body does.
+        xc = [0.2, -1.0, 0.5]
+        yc = [0.1, 0.0, 0.4]
+        obs = [true, false, true]
+        ref(u) = sum(o ? -0.5 * (yi - (u[1] + u[2] * sqrt(xi)))^2 : 0.0
+                     for (xi, yi, o) in zip(xc, yc, obs))
+        bound = prepare(C.guarded_location;
+                        bound = (; x = xc, y = yc, idx = collect(1:3), obs))
+        @test count(op -> op isa RK._LaneAssemble, bound.ops) == 1
+        u = [0.2, -0.3]
+        @test bound(u) ≈ ref(u)
+        pb = prepare_ad(bound, AutoEnzyme(; mode = Enzyme.Reverse), u; active = :u)
+        value, grad = RK.ad_value_and_gradient!(pb, similar(u), u)
+        @test value ≈ ref(u)
+        @test grad ≈ [sum(o ? (yi - (u[1] + u[2] * sqrt(xi))) * d : 0.0
+                          for (xi, yi, o, d) in zip(xc, yc, obs,
+                              j == 1 ? ones(3) : sqrt.(abs.(xc))))
+                      for j in 1:2]
+    end
+
     @testset "a bound-only cell condition partitions after caching" begin
         yv = [2.0, 0.5, 1.0, 3.0, 0.1]
         xv = [1.5, 2.5, 3.5, 0.5, 1.0]
@@ -141,21 +164,28 @@ isdefined(@__MODULE__, :BranchPartition) ||
         @test bound(x) ≈ sum(abs(xi - 1.0) for xi in x)
     end
 
-    @testset "partitioned recipes keep the readable view named" begin
-        # The docs Generated-kernel pane refuses an `operation(` callee
-        # (docs/kernel_examples.jl): the partition's synthesized lane ops must
-        # render under their own names, not as an opaque operation slot.
+    @testset "partitioned code display keeps the executed slots" begin
         for want in (:total, :pointwise)
             bound = prepare(C.guarded; have = (:x, :y), want, bound = (; y))
-            readable = string(RK._readable_expr(RK.code_expr(bound), bound))
-            @test !occursin(r"__ops__\[\d+\]", readable)
-            @test !occursin(r"\boperation\(", readable)
+            code = readable_code(bound)
+            @test code.expr == Base.remove_linenums!(deepcopy(code_expr(bound)))
+            @test code.operations === bound.ops
+            @test occursin("__ops__", string(code))
+            @test !occursin("yi > 0", string(code))
+            @test occursin("BranchPartition.counted_log", string(code))
+            @test occursin(" - 1.0", string(code))
+            for recipe in plates(bound.plan)
+                inner = recipe.op.kernel
+                inner_code = readable_code(inner)
+                @test inner_code.expr ==
+                      Base.remove_linenums!(deepcopy(code_expr(inner)))
+                @test inner_code.operations === inner.ops
+                @test !occursin("yi > 0", string(inner_code))
+            end
+            expected = want === :total ? reference_guarded(x, y) :
+                [yi > 0 ? log(xi * yi) : xi - 1.0 for (xi, yi) in zip(x, y)]
+            @test bound(x) ≈ expected
         end
-        pointwise = prepare(C.guarded; have = (:x, :y), want = :pointwise,
-                            bound = (; y))
-        readable = string(RK._readable_expr(RK.code_expr(pointwise), pointwise))
-        @test occursin("lane_gather", readable)
-        @test occursin("lane_assemble", readable)
     end
 end
 

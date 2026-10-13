@@ -1954,13 +1954,20 @@ function _guard_missing_observation_argument(name, ex, plan, columns)
         selected = mask[rows, r.range.args[3:end]...]
         present = present === nothing ? Array(selected) : present .| selected
     end
+    # The skipped arm's value is never read: the density is guarded by the
+    # same presence. A live argument is computed from the Float64 packed
+    # parameters, so its skipped arm is a Float64 zero and the cell stays
+    # concretely typed. A bound argument is evaluated at preparation, where
+    # `_concrete_guarded_numeric_storage` promotes its storage, so an Int `0`
+    # keeps an integer argument integer.
+    skipped = _guarded_argument_is_bound(ex, columns) ? 0 : 0.0
     guarded = deepcopy(ex)
     inputs, lambda = guarded.args
     lane = gensym(:_rkppl_argument_present)
     push!(inputs.args, QuoteNode(present))
     push!(lambda.args[1].args, lane)
     lambda.args[2] = Expr(:block, LineNumberNode(0, :rkppl_plate),
-        Expr(:if, lane, lambda.args[2], 0))
+        Expr(:if, lane, lambda.args[2], skipped))
     return guarded
 end
 
@@ -6191,23 +6198,24 @@ function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
             _fail(r.label, "$what exceeds trials $t")
         return nothing
     end
-    _is_derived(plan, t) && _fail(r.label,
-        "trials column $t is derived — slice-1 binds trials " *
-        "raw (derived trials need shape metadata — planned)")
+    # Bound data or a data-only definition, which binds as data
+    # (`_module_data_names`). A number broadcasts over every row.
     haskey(plan.columns, t) ||
-        _fail(r.label, "trials column $t missing")
-    col = _response_slot_column(plan, r, t, "trials column")
+        _fail(r.label, "trials $t missing")
+    col = plan.columns[t] isa Number ? plan.columns[t] :
+        _response_slot_column(plan, r, t, "trials column")
     (eltype(col) <: Integer && eltype(col) !== Bool) ||
-        _fail(r.label, "trials column must hold integers")
+        _fail(r.label, "trials $t must hold integers")
     all(>=(0), col) ||
-        _fail(r.label, "trials column must be non-negative")
+        _fail(r.label, "trials $t must be non-negative")
     # The observation domain validates every broadcast dimension.
-    if r.mi_jobs !== nothing
+    if r.mi_jobs !== nothing && !(col isa Number)
         n = _response_rows(plan, r)
         length(col) == n ||
             _fail(r.label, "trials column length $(length(col)) ≠ n_obs $n")
     end
-    observed_trials = r.mi_jobs === nothing ? col : col[plan.columns[r.mi_jobs]]
+    observed_trials = r.mi_jobs === nothing || col isa Number ? col :
+        col[plan.columns[r.mi_jobs]]
     (!check_support || r.evidence.kind in (:censored, :interval_censored) ||
         all(ycol .<= observed_trials)) ||
         _fail(r.label, "$what exceeds trials in some row")
@@ -6234,17 +6242,16 @@ function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
                 "in every row")
         return nothing
     end
-    _is_derived(plan, t) && _fail(r.label,
-        "trials column $t is derived — slice-2 binds trials " *
-        "raw (derived trials need shape metadata — planned)")
     haskey(plan.columns, t) ||
-        _fail(r.label, "trials column $t missing")
-    col = _vector_column(plan.columns, t, r.label, "trials column")
+        _fail(r.label, "trials $t missing")
+    col = plan.columns[t] isa Number ? plan.columns[t] :
+        _vector_column(plan.columns, t, r.label, "trials column")
     (eltype(col) <: Integer && eltype(col) !== Bool) ||
-        _fail(r.label, "trials column must hold integers")
+        _fail(r.label, "trials $t must hold integers")
     all(>=(0), col) ||
-        _fail(r.label, "trials column must be non-negative")
-    observed_trials = r.mi_jobs === nothing ? col : col[plan.columns[r.mi_jobs]]
+        _fail(r.label, "trials $t must be non-negative")
+    observed_trials = r.mi_jobs === nothing || col isa Number ? col :
+        col[plan.columns[r.mi_jobs]]
     all(rowsums .== observed_trials) ||
         _fail(r.label, "multinomial row counts must sum to trials in every row")
     return nothing
@@ -6521,6 +6528,10 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     required = Set{Symbol}(r.weights for r in plan.responses if r.weights !== nothing)
     for r in plan.responses, scale in (r.scale, r.mixture_scales...)
         scale isa Symbol && push!(required, scale)
+    end
+    # Trials are data: a data-only definition there binds, as weights do.
+    for r in plan.responses, t in (r.trials, r.mixture_trials...)
+        t isa Symbol && push!(required, t)
     end
     for p in plan.array_parameters, d in p.dims
         g = _level_pool_source(d)

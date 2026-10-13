@@ -416,12 +416,19 @@ receives bound arrays as inactive operands, whereas an array stored in an
 operation belongs to the differentiated callable, which native Enzyme reverse
 must prove read-only. It could not once a later split plate gathered the
 reassembled vector (`EnzymeMutabilityException`).
+
+The concatenation is the native kernel body's (`_native_vcat`): an arm that
+reads no live value (a constant fallback such as `0.0`) yields a constant
+vector, and Base's `vcat` of it beside a live arm of the same element type
+can fail native Enzyme reverse (`EnzymeRuntimeActivityError`,
+docs/src/constraints.md).
 """
 struct _LaneAssemble end
 # `Vararg{Any,N}` specializes on the arm count; an unspecialized `parts...`
 # left `vcat(parts...)` a run-time `Core._apply_iterate` call in every
 # evaluation of a partitioned plate.
-(::_LaneAssemble)(order, parts::Vararg{Any,N}) where {N} = vcat(parts...)[order]
+(::_LaneAssemble)(order, parts::Vararg{Any,N}) where {N} =
+    _native_vcat(parts...)[order]
 _readable_callee(::_LaneAssemble) = :lane_assemble
 _opname(::_LaneAssemble) = "lane_assemble"
 

@@ -107,9 +107,9 @@ rejected.
 This function-shaped form describes a graph, not a new object type. Compiled
 reactive state lets you change inputs in place through `set!`, `mutate!`, and
 `touch!`. A `@kernel` that contains its own inner methods can expose pure,
-straight-line methods as transparent endpoints; a branch in value position and
-an authored `plate(...) do` cell are straight-line, since the recipe lowering
-owns them. Methods with mutation, loops, or statement-position control flow
+straight-line methods as transparent endpoints; a branch in value position, a
+`let` and an authored `plate(...) do` cell are straight-line, since the recipe
+lowering owns them. Methods with mutation, loops, or statement-position control flow
 remain on the separate, stricter stateful compiler: it reads their source
 directly and only allows calls whose effects it can account for.
 The [compiler capability and limits](compiler.md) page covers the full planning,
@@ -266,6 +266,13 @@ copy is one `let` over the endpoint's own value names,
 endpoint whose lowered form binds locals, runs a plate or scan, or reads a
 non-`Base` global is rejected at authoring time with an action to hoist the
 call above the branch, where it splices as usual.
+
+Inside an object's own method bodies, a straight-position call of a sibling,
+a bound child or `inv` splices the same way. In a lazy arm, or with an
+argument a `let` binds, the call stays where it is written: the object's
+builder prepares the callee's graph once, and `readable_code` shows the call as
+`var"prepared standardized"(location, scale, x)`. The arm evaluates it only
+when taken.
 
 Named relations stay available as alternate cuts. Authoring one direction is
 enough: a unary call such as `log_scale = log(scale)` gains the reverse edge

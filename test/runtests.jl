@@ -54,6 +54,8 @@ const _MATRIX_CORE_TESTS = (
     "test_tensorized_macros.jl",
     "test_docs_navigation.jl",
     "test_kernel_objects.jl",
+    "test_kernel_object_let.jl",
+    "test_kernel_object_arms.jl",
     "test_inverse_edges.jl",
     "test_readable_expr.jl",
     "test_display.jl",
