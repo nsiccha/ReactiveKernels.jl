@@ -417,7 +417,10 @@ or a bound-only cell value that the pass has already evaluated per lane.
    - any other use of the pointwise vector reassembles it in lane order with
      one gather. Like the lane indices, its constant lane order is a bound
      operand rather than data held by the operation, so a backend receives it
-     as an inactive array.
+     as an inactive array. The arm vectors are concatenated as the native
+     kernel body concatenates (see the [core constraints](constraints.md)),
+     so an arm that reads no live value, such as a constant fallback, can sit
+     beside a live arm under native reverse.
 
 A lane-invariant condition selects its arm without splitting.
 

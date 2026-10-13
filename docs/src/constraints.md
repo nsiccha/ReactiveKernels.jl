@@ -522,7 +522,13 @@ and lock the one Reactant 0.2.289 lifted:
   dense, inferred path: SparseArrays, which Enzyme loads, otherwise claims
   Base's concatenation of numbers and dense arrays and builds the result
   through slower generic methods, and Base's own mixed scalar/array `hvcat`
-  infers no concrete result type. The tensorized body keeps its own
+  infers no concrete result type. A data-bound branch partition of a plate
+  (the compiler guide's "Data-bound branches in plate cells") reassembles its
+  arms' pointwise vectors with the same `vcat` companion: an arm that reads
+  no live value, such as the constant fallback `0.0` of a missing
+  observation's computed location, beside a live arm otherwise fails native
+  reverse in Base's `vcat` on Enzyme 0.13.216 (`test_branch_partition.jl`
+  pins the reassembled shape). The tensorized body keeps its own
   concatenation lowering. Concatenation inside an opaque helper the kernel
   calls, `cat`, `stack`, folds such as `reduce(vcat, A; init)` and non-dense
   operands (views, adjoints) keep Base's methods and remain the backend's
