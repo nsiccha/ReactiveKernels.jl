@@ -243,3 +243,57 @@ end
         y .~ Normal.(mu, 1)
     end, Dict(:z => ones(3), :y => zeros(3)), (a=-1.2, p=[0.2,0.3,0.5]), q -> -Inf)
 end
+
+@testset "whole-vector Dirichlet folds bound factors with native reverse" begin
+    model = @rkppl begin p ~ Dirichlet(alpha) end
+    for K in (3, 32)
+        alpha = fill(1.3, K)
+        plan = bind_data(model(; alpha))
+        built = build_kernel(plan)
+        p = fill(1.0 / K, K)
+        u = collect(Float64, unconstrain(built.layout, (; p)))
+        sampler = prepare_sampler(built, plan, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse), warm = true)
+        g = similar(u)
+        value, _ = sampler_value_and_gradient!(sampler, g, u)
+        @test value ≈ D.logpdf(D.Dirichlet(alpha), p) + logjac(built.layout, u)
+        @test all(isfinite, g)
+        source = sprint(show, built.program)
+        prepared = sprint(show, MIME"text/plain"(),
+            Base.remove_linenums!(deepcopy(ReactiveKernels.code_expr(sampler.kernel))))
+        @test occursin("_tensorized_view", source)
+        @test !occursin("_dirichlet_slices_logpdf", source)
+        @test occursin("_ppl_dirichlet_normalizer_p", prepared)
+        for j in unique((1, length(u)))
+            h = 1e-5
+            plus, minus = copy(u), copy(u)
+            plus[j] += h
+            minus[j] -= h
+            @test g[j] ≈ (sampler(plus) - sampler(minus)) / (2h) rtol = 1e-5 atol = 1e-5
+        end
+    end
+
+    active = @rkppl begin
+        a ~ Normal(0, 1)
+        p ~ Dirichlet(3, a)
+    end
+    plan = bind_data(active())
+    built = build_kernel(plan)
+    u = collect(Float64, unconstrain(built.layout, (a = 1.7, p = [0.2, 0.3, 0.5])))
+    sampler = prepare_sampler(built, plan, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse), warm = true)
+    g = similar(u)
+    value, _ = sampler_value_and_gradient!(sampler, g, u)
+    @test isfinite(value) && all(isfinite, g)
+    h = 1e-5
+    plus, minus = copy(u), copy(u)
+    plus[1] += h
+    minus[1] -= h
+    @test g[1] ≈ (sampler(plus) - sampler(minus)) / (2h) rtol = 1e-5 atol = 1e-5
+    bad = copy(u)
+    bad[1] = -1.2
+    bad_gradient = similar(u)
+    bad_value, _ = sampler_value_and_gradient!(sampler, bad_gradient, bad)
+    @test bad_value == -Inf
+    @test all(isfinite, bad_gradient)
+end
