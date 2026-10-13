@@ -4785,6 +4785,32 @@ end
 # authored closure directly. Ordinary prepare retains its world-age fallback.
 _kernel_latest_source(x) = x
 _kernel_latest_source(xs::Tuple) = map(_kernel_latest_source, xs)
+
+# A generated kernel whose public entry guarantees a latest-world barrier can
+# carry that guarantee into literal source calls within its native recipe
+# bodies. Only the native argument of a source-op construction is visited; the
+# tensorized body and quoted source/provenance expressions remain unchanged.
+function _kernel_latest_native_source_literals(ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    args = map(_kernel_latest_native_source_literals, ex.args)
+    if ex.head === :call && length(args) >= 4 &&
+       args[1] == GlobalRef(@__MODULE__, :_KernelSourceOp)
+        args[4] = _kernel_latest_literal_calls(args[4])
+    end
+    Expr(ex.head, args...)
+end
+
+function _kernel_latest_literal_calls(ex)
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    args = map(_kernel_latest_literal_calls, ex.args)
+    if ex.head === :call && !isempty(args) && args[1] isa QuoteNode &&
+       args[1].value isa Union{_KernelSourceOp,_KernelSourceFunction,_KernelBranch,_KernelSplit}
+        args[1] = QuoteNode(_kernel_latest_source(args[1].value))
+    end
+    Expr(ex.head, args...)
+end
 function _kernel_latest_source(f::_KernelSourceFunction{F,RF,C}) where {F,RF,C}
     _KernelSourceFunction{F,RF,C,Val{:latest_world}}(
         f.f, f.runtime_f, f.captures)
