@@ -131,7 +131,7 @@ end
             sd = only(d for d in fx.plan.derived if d.name === :sd)
             @test :mu in ReactiveKernelsPPL._expr_names(sd.expr)
             @test occursin("sd = hypot.(add, mu .* prop)",
-                string(readable_code(kernel_expr(fx.bound, fx.built.layout))))
+                src)
         end
     end
     for dependent in (false, true)

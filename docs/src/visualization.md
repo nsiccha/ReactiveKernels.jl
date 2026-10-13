@@ -85,22 +85,18 @@ depth, parent, recipe)` entry per listed recipe, and `recipe_kind` classifies a
 single recipe as `:plate`, `:scan` or `:ordinary` (see [Inspecting
 structure](compiler.md#Inspecting-structure)).
 
-`readable_code(spec_or_plan)` and `readable_code(prepared)` show the generated
-Julia expression with only line-number metadata removed. Calls retain their
-`__ops__[k]` slots. The printed table indexes the callables by operation kind
-and shows a stored source-function expression when one is available;
-`code.operations[k]` holds the exact callable, including specialized
-operations after `bound=` preparation. For authored plates and scans the table
-also prints the nested kernel's exact expression and operation slots.
-`code.expr` is a copy of `code_expr`
-with line numbers removed. When the expression embeds an operation object,
-its textual AST display may not parse on its own; inspect `code.expr` and
-`code.operations` together. The result also displays as HTML.
+`code_expr(spec_or_plan)` and `code_expr(prepared)` return the generated
+Julia expression itself. Print that expression with Julia's ordinary printer;
+for a cleaner listing, remove only line-number nodes from a copy. Calls retain
+their actual `__ops__[k]` slots. The operation tuple is available separately
+as `prepared.ops`; a printed expression that embeds an operation object may
+not parse on its own. The structural graph view explains names and recipes
+without altering this executable expression.
 
 ```julia
 graph = kernel_graph(spec)
 show(stdout, MIME"text/plain"(), graph)   # values and recipes
-print(readable_code(spec))                # the planned program
+print(Base.remove_linenums!(deepcopy(code_expr(spec)))) # the planned program
 ```
 
 ## Reading a diagram

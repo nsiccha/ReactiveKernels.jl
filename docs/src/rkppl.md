@@ -995,14 +995,15 @@ side.
 
 ## Debugging
 
-- `model_view(built)` displays an existing build: its coordinates, the built
-  ReactiveKernels program (`readable_code(built.spec)`) and its structural
+- `model_view(built)` displays an existing build: its coordinates, the planned
+  ReactiveKernels program (`code_expr(built.spec)`) and its structural
   graph (`kernel_graph(built.spec)`), as labeled sections in plain text or
   HTML. `built` is the `(; spec, layout)` returned by `build_kernel`, including
   the built model a BRM `RKBRMI` retains as `backend.model`. Pass
-  `bound = plan` to add the generated pre-build `@kernel` program and
+  `bound = plan` to add the generated pre-build kernel definition and
   `query = prepare_query(...)` to add that prepared program. The view only
-  reads these values; nothing is lowered, bound, built or evaluated again.
+  derives the planned expression from the stored spec and reads the other
+  supplied values; nothing is bound, built, prepared or evaluated again.
 - `recipe_inventory` lists a program's plates and scans with their nesting, so a
   structure check reads the public contract rather than internal operation
   types. For a model whose subject plate holds a child scan, beside its
@@ -1017,7 +1018,7 @@ side.
 
   `recipe_kind(recipe)` classifies one recipe, and `plate_body`/`scan_body`
   return a body plan; see the ReactiveKernels compiler page.
-- `kernel_expr(plan, built.layout)` returns the generated `@kernel` program
+- `kernel_expr(plan, built.layout)` returns the generated kernel definition
   shown above. It reads with the model's names: a plate cell names each
   argument after the value it iterates (`y .~ Normal.(loc, s)` is
   `plate(y, loc, s) do y, loc, s ... normal(loc, s).logpdf(y)`), a prior cell

@@ -5818,11 +5818,12 @@ outputs(k::NonAllocatingKernel) = k.outputs
 outputs(p::Plan) = Tuple(p.want)
 
 """
-    code_expr(p) -> Expr
+    code_expr(spec_or_plan_or_kernel) -> Expr
 
-The generated Julia `Expr` before RGF compilation. Accepts a `Plan` or a
-`PreparedKernel`. Useful for asserting that unused operations are literally
-absent from the kernel (gist §20).
+The generated Julia `Expr` before RGF compilation. A `KernelSpec` or `Graph`
+is planned at its default boundary unless `have`/`want` are given. A `Plan`
+is lowered to its generated expression; a prepared kernel returns its stored
+expression. Useful for asserting that unused operations are literally absent.
 """
 code_expr(p::Plan) = lower(p)
 code_expr(k::PreparedKernel) = k.ast
@@ -6184,8 +6185,8 @@ end
 # authored RHS, and hidden operation/cache arguments are removed from the shown
 # signature. Passing a PreparedKernel uses its flattened recipe sequence, so a
 # nested generated kernel never leaves mismatched or opaque operation slots.
-# This internal explanatory expression is not the public `readable_code`
-# result or executable authority; `code_expr` remains the exact compiled AST.
+# This internal explanatory expression is not executable authority or a code
+# display; `code_expr` remains the exact compiled AST.
 _readable_expr(ast::Expr, plan::Plan) = _readable_expr(ast, plan.recipes)
 _readable_expr(ast::Expr, kernel::PreparedKernel) =
     _readable_expr(ast, kernel.lowered_recipes)

@@ -869,7 +869,7 @@ _kernel_endpoint_reads(x, names::Set{Symbol}) =
 # (`_kernel_endpoint_arm_child`). The local is named `prepared <callee>`: no
 # port name contains a space, so no port of the method can shadow it, and the
 # name has no leading `#`, so lowering keeps it as spelled
-# (`_lowering_gensym`) and `readable_code` shows it. It is assigned once,
+# (`_lowering_gensym`) and `code_expr` contains it. It is assigned once,
 # before the first endpoint that reads it. `actuals` are the callee's inputs in order: the residual owner
 # ports, then the call's arguments. An owner port a surrounding `let` rebinds
 # would pass the `let`'s value instead, so that is refused.

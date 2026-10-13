@@ -85,9 +85,9 @@ function _display_code(label::AbstractString, code::AbstractString;
     ), '\n')
 end
 
-function _readable_generated_source(expr::Expr, context, label)
+function _generated_source(expr::Expr, context, label)
     expr == code_expr(context) || error("$label generated expression changed")
-    string(readable_code(context))
+    sprint(print, Base.remove_linenums!(deepcopy(expr)))
 end
 
 # --- eval-throughput visualization ----------------------------------------
@@ -908,7 +908,7 @@ function render_examples(artifacts)
             "# Executed input\n", _plain_repr(artifact.inputs), "\n\n",
             "# Actual output\n", _plain_repr(artifact.output),
         )
-        generated = _readable_generated_source(
+        generated = _generated_source(
             artifact.generated, artifact.kernel, artifact.name,
         )
         _three_pane_blocks!(
