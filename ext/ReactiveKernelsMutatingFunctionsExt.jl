@@ -323,13 +323,11 @@ end
 
 # Partitioned-plate lane gathers: `x[lanes]` elementwise into the cache, or a
 # fill when the argument is a singleton (the twin's indexed-view branch).
-# The guards mirror the twin's branch
-# order exactly — the singleton check first, so out-of-range lane indices on
-# a length-1 argument fill rather than throwing — and any mismatch falls back
-# to the twin call, preserving its exact result and errors (`enumerate` keeps
-# the loop correct for any lane-vector axes). Bool lane masks stay on the
-# fallback: positional indexing with a Bool element is an error, not a mask
-# selection.
+# The guards mirror the twin's branch order exactly — the singleton check
+# first, so out-of-range lane indices on a length-1 argument fill rather than
+# throwing. Resize the owned vector when the lane count changes; shape errors
+# still call the twin, preserving its error. Bool lane masks use the twin's
+# selection and copy its view into owned storage.
 #
 # The gather loop itself is `@inbounds`, with the twin's `BoundsError` on
 # out-of-range lanes preserved by an explicit integer-range validation (pinned
@@ -341,14 +339,14 @@ end
 @inline function MutatingFunctions.apply!!(
         cache::Vector{T}, gather::ReactiveKernels._LaneGather,
         x::AbstractVector{T}, lanes::AbstractVector{<:Integer}) where {T}
-    eltype(lanes) === Bool && return gather(x, lanes)
+    eltype(lanes) === Bool && return copy(gather(x, lanes))
     if length(x) == 1
-        length(cache) == length(lanes) || return gather(x, lanes)
+        length(cache) == length(lanes) || resize!(cache, length(lanes))
         fill!(cache, x[1])
         return cache
     end
-    ndims(x) == 1 && length(x) == gather.n || return gather(x, lanes)
-    length(cache) == length(lanes) || return gather(x, lanes)
+    ndims(x) == 1 && length(x) == gather.n || return copy(gather(x, lanes))
+    length(cache) == length(lanes) || resize!(cache, length(lanes))
     n = length(x)
     @inbounds for (i, lane) in enumerate(lanes)
         (1 <= lane <= n) || throw(BoundsError(x, lane))
