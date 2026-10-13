@@ -47,6 +47,8 @@ _direct_density(kernel, args::Vararg{Any,N}) where {N} = _measure(() -> kernel(a
 _direct_gradient(ad, g, args::Vararg{Any,N}) where {N} =
     _measure(() -> ad_value_and_gradient!(ad, g, args...))
 _query_density(q, args::Vararg{Any,N}) where {N} = _measure(() -> q(args...))
+_public_sampler_density(q, u) = q(u)
+_public_cell_density(q, u, cell) = q(u, cell)
 _query_gradient(q, g, u) = _measure(() -> sampler_value_and_gradient!(q, g, u))
 _cell_gradient(s, g, u, cell) = _measure(() -> cell_value_and_gradient!(s, g, u, cell))
 _query_ad_gradient(q, g, u) = _measure(() -> ad_value_and_gradient!(q, g, u))
@@ -64,6 +66,7 @@ _query_ad_gradient(q, g, u) = _measure(() -> ad_value_and_gradient!(q, g, u))
         expected = Base.invokelatest(ad_value_and_gradient!, q.ad, zeros(n), u)
         @test (value, g) == expected
         @test q(u) == value
+        @test (@inferred _public_sampler_density(q, u)) == value
         @test q(Float32.(u)) == q(Vector{Float64}(Float32.(u)))
 
         @test _query_density(q, u) <= Base.invokelatest(_direct_density, q.kernel, u) + 16
@@ -83,6 +86,7 @@ _query_ad_gradient(q, g, u) = _measure(() -> ad_value_and_gradient!(q, g, u))
         for cell in (1, 3)
             cell_value, cell_g = cell_value_and_gradient!(cs, zeros(n), u, cell)
             @test cq(u, cell) == cell_value
+            @test (@inferred _public_cell_density(cq, u, cell)) == cell_value
             @test (cell_value, cell_g) ==
                   Base.invokelatest(ad_value_and_gradient!, cs.ad, zeros(n), u, cell)
         end

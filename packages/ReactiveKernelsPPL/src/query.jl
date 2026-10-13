@@ -269,7 +269,10 @@ Posterior value at unconstrained `u`. Zero-copy for `Vector{Float64}` (the
 HMC-loop case); any other real vector is converted. `u` must have
 `q.layout.total` entries.
 """
-(q::SamplerQuery)(u::Vector{Float64}) = Base.invokelatest(_sampler_density, q, u)
+# The generated kernel is scalar-valued, but invokelatest itself infers Any.
+# Assert the public density contract after crossing the world-age barrier.
+(q::SamplerQuery)(u::Vector{Float64}) =
+    Base.invokelatest(_sampler_density, q, u)::Float64
 (q::SamplerQuery)(u::AbstractVector{<:Real}) = q(Vector{Float64}(u))
 _sampler_density(q::SamplerQuery, u) = q.kernel(u)
 
@@ -396,7 +399,7 @@ mutable struct CellQuery{K,L}
 end
 
 (q::CellQuery)(u::AbstractVector{Float64}, cell) =
-    Base.invokelatest(_cell_density, q, u, cell)
+    Base.invokelatest(_cell_density, q, u, cell)::Float64
 (q::CellQuery)(u::AbstractVector{<:Real}, cell) = q(Vector{Float64}(u), cell)
 _cell_density(q::CellQuery, u, cell) = q.kernel(u, cell)
 
