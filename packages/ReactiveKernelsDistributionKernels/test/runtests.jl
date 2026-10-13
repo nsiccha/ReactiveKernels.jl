@@ -461,7 +461,9 @@ end
     zib = prepare(zero_inflated_binomial.logpdf;
         have = (:observed, :n, :logit, :zi), want = :logpdf)
     zib_ad = prepare_ad(zib, backend, 1, 3, 0.0, 0.2; active = :logit)
-    for eta in (-1000.0, -80.0, 80.0, 1000.0), y in (0, 1, 3)
+    # `±0.0` is where the interior count arm switches which `log1pexp` it
+    # evaluates; its value and score match on both sides.
+    for eta in (-1000.0, -80.0, -0.0, 0.0, 80.0, 1000.0), y in (0, 1, 3)
         p = 1 / (1 + exp(-eta))
         combination = y == 1 ? log(3.0) : 0.0
         binomial_mass = combination - y * log1pexp(-eta) - (3 - y) * log1pexp(eta)
@@ -477,6 +479,12 @@ end
     for eta in (-1000.0, 1000.0), zi in (0.0, 1.0)
         @test bm(0, 0, eta) == 0.0
         @test zib(0, 0, eta, zi) == 0.0
+    end
+    # An interior count has zero mass at an infinite logit, on either side.
+    for eta in (-Inf, Inf)
+        @test bm(1, 3, eta) == -Inf
+        @test zib(1, 3, eta, 0.2) == -Inf
+        @test isnan(bm(1, 3, NaN)) && isnan(zib(1, 3, NaN, 0.2))
     end
 end
 
