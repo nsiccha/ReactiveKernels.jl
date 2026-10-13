@@ -103,9 +103,10 @@ end
 end
 
 # Plain Enzyme over a closure that captures its data must first prove the
-# closure is never written. On Julia 1.12 and 1.13 that proof follows each
-# Float64 read from the captured sequence and calls its store into the scan's
-# result a capture (`EnzymeMutabilityException`). Loops without RK, such as
+# closure is never written. On Julia 1.12 and sometimes 1.13 that proof follows
+# each Float64 read from the captured sequence and calls its store into the
+# scan's result a capture (`EnzymeMutabilityException`). The Julia 1.13 outcome
+# depends on optimized IR. Loops without RK, such as
 # `xs .* g`, fail the same way, and one shape returns 0.0 for the primal and
 # the derivative without an error:
 # `benchmark/repro_enzyme_closure_float_store_readonly.jl`. `prepare_ad`
@@ -124,7 +125,25 @@ end
     argument = Enzyme.autodiff(Enzyme.Reverse, (g, sequence) -> k(sequence, g),
                                Enzyme.Active, Enzyme.Active(gain), Enzyme.Const(xs))
     @test first(only(argument)) ≈ derivative atol=1e-12
-    if VERSION >= v"1.12"
+    if VERSION >= v"1.13"
+        # CI has differentiated this call exactly on Julia 1.13, while the
+        # same Enzyme release can still reject its readonly proof. Keep the
+        # positive assertion whenever the proof succeeds.
+        outcome = try
+            reverse_gradient(captured)
+        catch err
+            err
+        end
+        if outcome isa Enzyme.Compiler.EnzymeMutabilityException
+            @test occursin("Function argument passed to autodiff cannot be proven readonly",
+                           sprint(showerror, outcome))
+            @test_broken false
+        elseif outcome isa Exception
+            throw(outcome)
+        else
+            @test outcome ≈ derivative atol=1e-12
+        end
+    elseif VERSION >= v"1.12"
         # Upstream Enzyme readonly-proof gap; drop with docs/src/constraints.md.
         @test_broken reverse_gradient(captured) ≈ derivative atol=1e-12
     else

@@ -566,10 +566,10 @@ and lock the one Reactant 0.2.289 lifted:
   operands beyond its block-row counts; Base's `hcat` and `vcat` of the same
   operands compile. An opaque helper that builds such a literal keeps the
   backend's limitation.
-- On Julia 1.12.7 and 1.13.1, Enzyme 0.13.210 and 0.13.213 cannot prove that
+- On Julia 1.12.7 and 1.13.1, Enzyme 0.13.210 and 0.13.213 can fail to prove that
   a closure capturing an array is never written when a loop stores values
   read from that array into a fresh result. Plain `Enzyme.autodiff` of such
-  an unannotated function argument raises `EnzymeMutabilityException`
+  an unannotated function argument can raise `EnzymeMutabilityException`
   ("Function argument passed to autodiff cannot be proven readonly") when the
   store runs. In one shape, an `@inbounds` loop into a fixed-length buffer, it
   instead returns 0.0 for the primal and for the Reverse and Forward
@@ -591,7 +591,10 @@ and lock the one Reactant 0.2.289 lifted:
   capture passes the reproducer and RK's scan testsets, and still raises for
   a store into the captured array. The repair belongs in Enzyme;
   `test_scan_plate_ad.jl` pins the captured-closure call through a prepared
-  scan kernel as broken on Julia 1.12 and later.
+  scan kernel as broken on Julia 1.12. On Julia 1.13, hosted CI has also
+  differentiated the same call exactly with Enzyme 0.13.210, while local
+  runs with Enzyme 0.13.210 and 0.13.216 still raise the readonly exception.
+  Its test accepts only the exact gradient or that specific exception.
 - On Julia 1.12.7 and 1.13.1, Enzyme 0.13.216 reverse mode allocates 16 bytes
   per element when a loop stores into an array that is either a reused buffer
   or a fresh `similar` one and the store keeps its bounds check. Julia 1.12's
