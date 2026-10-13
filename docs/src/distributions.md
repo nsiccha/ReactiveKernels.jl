@@ -166,8 +166,14 @@ API lifts each `.logpdf` over independent counts without family-specific code.
 Their `logpdf` equals the sum of two further endpoints: `lognormalizer(y)`, the
 data-only term (the log binomial coefficient, or `-log(y!)`), and
 `logkernel(y)`, the terms that read the parameters. `zero_inflated_binomial` has
-the same pair. A plate of `lognormalizer` cells over bound counts and trials is
-a bind-time value, so a likelihood that sums `logkernel` cells and adds that
+the same pair. `zero_inflated_binomial_logit_zi(; n, logit, zi_logit)` accepts a
+zero-inflation logit directly and composes the existing Binomial graph with
+log-scale mixture weights. Its `logkernel`, `lognormalizer` and `logpdf`
+endpoints keep finite source logits through rounded probability tails. The
+ordinary `zero_inflated_binomial(; n, logit, zi)` accepts a probability,
+including exact `zi=0` and `zi=1` inputs. A plate of `lognormalizer` cells
+over bound counts and trials is a bind-time value, so a likelihood that sums
+`logkernel` cells and adds that
 plate evaluates no `loggamma` per call. Keep the two in separate plates:
 summing them inside one differentiated cell trips a released-Enzyme reverse
 compilation failure, which is also why `logpdf` is written out.

@@ -73,7 +73,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     # Level gathers (`z[g]` over a `levels(h)` axis) read level-code
     # vectors; collect them from every expression before emitting.
     gathers = Set{Tuple{Symbol,Symbol,Int}}()
-    assigns = _assignment_statements(plan; gathers)
+    assigns = _assignment_statements(plan; layout, gathers)
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan)
     transforms = Expr[]
@@ -300,7 +300,8 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     negative_binomial, weibull,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
-    normal_id_glm, bernoulli_logit_glm, poisson_log_glm,
+    zero_inflated_binomial_logit_zi,
+    normal_id_glm, bernoulli_logit_glm, poisson_log_glm, normal_id_glm_lpdf,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
     rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
 using SpecialFunctions: besseli, besselix, erfc, loggamma
@@ -354,6 +355,7 @@ _eval_kernel_def(def::Expr) =
 # for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
 function _assignment_statements(plan::StructuralPlan;
+        layout::LayoutTable,
         gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}())
     by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
     for d in plan.derived
@@ -384,7 +386,8 @@ function _assignment_statements(plan::StructuralPlan;
             (ex = _concrete_guarded_argument(ex))
         push!(order, name)
         rewritten[name] = _bound_extent_indices(name,
-            _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers)), plan)
+            _unit_logit_rewrite(_value_math_rewrite(
+                _array_gather_rewrite(ex, plan, gathers)), layout), plan)
     end
     destructured = _destructuring_statements(order, rewritten)
     stmts = Expr[]
@@ -524,6 +527,56 @@ function _value_math_rewrite(ex::Expr)
         args[1] = :_ppl_logistic
     end
     return Expr(ex.head, args...)
+end
+
+# A unit-interval sampled parameter has two exact representations in the
+# built graph: its rounded constrained value and its source logit coordinate.
+# Only a call to the resolved LogExpFunctions.logit on that sampled value
+# selects the latter. Other functions and arbitrary probability expressions
+# keep their authored operations.
+function _unit_sample_coordinate(layout::LayoutTable, name::Symbol)
+    for e in layout.entries
+        e.kind === :sampled && e.name === name || continue
+        (e.transform === :logistic ||
+            (e.transform === :interval && e.lo isa Real && e.hi isa Real &&
+                iszero(e.lo) && isone(e.hi))) ||
+            return nothing
+        return coordinate_read(e.offset)
+    end
+    return nothing
+end
+
+_unit_logit_rewrite(ex, ::LayoutTable) = ex
+function _unit_logit_rewrite(ex::Expr, layout::LayoutTable)
+    # Do not rewrite a lexically scoped local that happens to share a sampled
+    # parameter's name.
+    ex.head in (:do, :->, :function, :let) && return ex
+    if ex.head === :call && length(ex.args) == 2 &&
+            ex.args[1] isa GlobalRef && ex.args[1].name === :logit &&
+            isdefined(ex.args[1].mod, :logit) &&
+            getglobal(ex.args[1].mod, :logit) === logit &&
+            ex.args[2] isa Symbol
+        coord = _unit_sample_coordinate(layout, ex.args[2])
+        coord === nothing || return coord
+    end
+    return Expr(ex.head, Any[_unit_logit_rewrite(a, layout) for a in ex.args]...)
+end
+
+function _unit_complement_logit(plan::StructuralPlan, zi)
+    zi isa Symbol || return nothing
+    for a in plan.assignments
+        a.name === zi || continue
+        ex = a.expr
+        ex isa Expr && ex.head === :call && length(ex.args) == 3 || return nothing
+        f = ex.args[1]
+        (f === :- || (f isa GlobalRef && f.mod === Base && f.name === :-)) ||
+            return nothing
+        ex.args[2] isa Real && isone(ex.args[2]) || return nothing
+        ex.args[3] isa Symbol || return nothing
+        coord = _unit_sample_coordinate(assign_layout(plan), ex.args[3])
+        return coord === nothing ? nothing : :(-$coord)
+    end
+    return nothing
 end
 
 # Functions as values: a data-only module call nested in a parameter-
@@ -1543,6 +1596,19 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
     if r.family === GaussianFam
+        # Base case (no evidence, weights, ranges, packed rows or missing
+        # entries; one shared scalar scale) whose location is a data-matrix
+        # product `M * v`, optionally plus a sampled intercept: the
+        # NormalIDGLM density. The per-cell plate keeps `:pointwise`.
+        if r.evidence.kind === :none && r.weights === nothing &&
+                r.range === nothing && r.mi_jobs === nothing && r.link === IdentityLink &&
+                !haskey(plan.columns, _observed_mask_name(r.response)) &&
+                !_is_bare_param_location(r, plan) &&
+                !_cell_broadcast_response(plan, r) &&
+                _wholevec_location(r, plan) && _wholevec_scalar_scale(r, plan)
+            glm = _gaussian_glm_location(r, plan)
+            glm === nothing || return _gaussian_glm_stmts(r, plan, node, glm...)
+        end
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
         return _student_plate_stmts(r, plan, node, pw)
@@ -1879,11 +1945,7 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     o = r.family === NormalIDGLMFam ? :($obj($xaug, $bfull, $s)) : :($obj($xaug, $bfull))
     design = r.mi_jobs === nothing ? X : Expr(:ref, X, r.mi_jobs, :(:))
     n = r.mi_jobs === nothing ? _response_rows_source(plan, r) : Expr(:call, :length, r.mi_jobs)
-    # A literal zero intercept adds nothing: the object reads X and beta as
-    # they are, with no ones column.
-    xaug_expr, bfull_expr = r.glm_alpha isa Real && iszero(r.glm_alpha) ?
-        (:(Float64.($design)), :([$(r.glm_beta);])) :
-        (:(hcat(ones($n), $design)), :([$(r.glm_alpha); $(r.glm_beta)]))
+    xaug_expr, bfull_expr = _glm_design_args(design, r.glm_alpha, r.glm_beta, n)
     head = Expr[
         :($yf = $yconv.($y)),
         :($xaug = $xaug_expr),
@@ -1891,8 +1953,22 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     ]
     r.family === PoissonLogGLMFam &&
         return Expr[head..., _poisson_glm_split_stmts(r, o, yf, pw, node)...]
-    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = sum($pw))]
+    # The Normal-identity density reads the object's `logpdf`, an owned rule
+    # whose reverse branch is one X'r product (DK `normal_id_glm_lpdf`), so
+    # neither the sampler nor its gradient materializes or differentiates the
+    # per-observation vector that only the `:pointwise` query reads. The
+    # Bernoulli object's `logpdf` is `sum(pointwise)`, so it sums that vector.
+    density = r.family === NormalIDGLMFam ? :($o.logpdf($yf)) : :(sum($pw))
+    return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = $density)]
 end
+
+# The GLM design and coefficients over `n` rows. A literal zero intercept adds
+# nothing: the object reads X and beta as they are, with no ones column; any
+# other intercept prepends a ones column (data-only, folded at preparation)
+# and its coefficient.
+_glm_design_args(design, alpha, beta, n) = alpha isa Real && iszero(alpha) ?
+    (:(Float64.($design)), :([$beta;])) :
+    (:(hcat(ones($n), $design)), :([$alpha; $beta]))
 
 # The Poisson-log object's density in its two endpoint parts, as a count plate
 # sums them (`_count_plate_stmts!`): `logkernel` reads eta, and
@@ -2487,6 +2563,80 @@ function _through_pointwise(stmts::Vector{Expr}, r::LikelihoodSpec)
     return stmts[1:findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)]
 end
 
+# A Gaussian response located at `M * v` or `alpha .+ M * v` (bound data
+# matrix `M`, any vector value `v`, a sampled scalar `alpha`) has the
+# NormalIDGLM density, so its likelihood reads the same owned rule (DK
+# `normal_id_glm_lpdf`): one `M'r` product in reverse, where the plate
+# differentiated `M * v` and every cell. `sigma > 0` keeps the plate cell's
+# guard; the plate (`_through_pointwise`) keeps the `:pointwise` densities,
+# and the location node stays available to its other readers.
+# Returns `(M, alpha, v)` (`alpha = 0.0` without an intercept) or `nothing`.
+function _gaussian_glm_location(r::LikelihoodSpec, plan::StructuralPlan)
+    _is_latent_location(r, plan) && return nothing
+    i = findfirst(p -> p.name === r.predictor, plan.predictors)
+    i === nothing && return nothing
+    pred = plan.predictors[i]
+    pred.link === IdentityLink || return nothing
+    alpha, product = 0.0, nothing
+    for t in pred.terms
+        if t.kind === InterceptTerm && alpha isa Real &&
+                get(t.options, :sign, 1) == 1 && get(t.options, :parameter, nothing) isa Symbol
+            alpha = t.options.parameter
+        elseif t.kind === OffsetTerm && product === nothing && length(t.columns) == 1
+            product = only(t.columns)
+        else
+            return nothing
+        end
+    end
+    product === nothing && return nothing
+    j = findfirst(d -> d.name === product, plan.derived)
+    j === nothing && return nothing
+    ex = plan.derived[j].expr
+    Meta.isexpr(ex, :call, 3) && ex.args[1] === :* || return nothing
+    M, v = ex.args[2], ex.args[3]
+    M isa Symbol && v isa Symbol || return nothing
+    get(plan.columns, M, nothing) isa AbstractMatrix{<:Real} || return nothing
+    get(plan.columns, r.response, nothing) isa AbstractVector{<:Real} || return nothing
+    scalar(a) = any(q -> q.name === a, plan.parameters) || get(plan.columns, a, nothing) isa Real
+    alpha isa Symbol && !scalar(alpha) && return nothing
+    vector = any(q -> q.name === v && length(q.dims) == 1, plan.array_parameters) ||
+        get(plan.columns, v, nothing) isa AbstractVector{<:Real}
+    vector || return nothing
+    return (M, alpha, v)
+end
+
+function _gaussian_glm_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
+        M::Symbol, alpha, v::Symbol)
+    stmts = _gaussian_plate_stmts(r, plan, node, _pw_name(r.label))
+    s = _scale_plate_arg(r, plan, Expr[])
+    sf = s isa Real ? Float64(s) :
+        s isa Symbol && haskey(plan.columns, s) ? :(Float64($s)) : s
+    yf = _yfloat_name(r.label)
+    xaug = Symbol(:_ppl_glm_X_, r.label)
+    bfull = Symbol(:_ppl_glm_b_, r.label)
+    xaug_expr, bfull_expr = _glm_design_args(M, alpha, v, _response_rows_source(plan, r))
+    return Expr[
+        _through_pointwise(stmts, r)...,
+        :($yf = Float64.($(r.response))),
+        :($xaug = $xaug_expr),
+        :($bfull = $bfull_expr),
+        :($node::Float64 = $sf > 0 ? normal_id_glm_lpdf($xaug, $bfull, $sf, $yf) : -Inf),
+    ]
+end
+
+# One scale shared by every observation: a literal, a sampled scalar, scalar
+# data, or a scale predictor proven scalar. Per-observation scales keep the
+# plate.
+function _wholevec_scalar_scale(r::LikelihoodSpec, plan::StructuralPlan)
+    s = r.scale
+    s isa Real && return true
+    s isa Symbol && return any(p -> p.name === s, plan.parameters) ||
+        get(plan.columns, s, nothing) isa Real
+    s isa ScalePredictorRef &&
+        return _predictor_value_type(plan, _predictor(plan, s.predictor)) === :Number
+    return false
+end
+
 # Fused whole-vector Bernoulli-logit likelihood (base case). Logit-form log-mass
 # `Σ yᵢ·ηᵢ − Σ log1pexp(ηᵢ)` — no data-only normalizer, a plain fused reduction.
 # Value-identical to `Σ bernoulli(; logit=ηᵢ).logpdf(yᵢ)`; same folded-`_ppl_yf`
@@ -2825,7 +2975,8 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
 end
 
 # The `lognormalizer` cell of a Binomial-coefficient family (`binomial`,
-# `zero_inflated_binomial`): it reads the response and the trials only.
+# `zero_inflated_binomial`, or its logit-zi companion): it reads the response
+# and the trials only.
 function _binomial_normalizer(yin, r::LikelihoodSpec, family::Symbol)
     ninputs = Any[yin]
     nn = _thread_ref!(ninputs, r.trials, true)
@@ -2863,20 +3014,35 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     # `log_rate` precedent): no probability vector, no `log(p)` round trip.
     logit = r.link === LogitLink && !_is_bare_param_location(r, plan)
     p = logit ? _location_node(r, plan) : _response_value_node!(pre, r, plan)
-    ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, Symbol(r.label, :_zi))
+    zi_logit = _unit_complement_logit(plan, r.zi)
+    if zi_logit === nothing
+        ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, Symbol(r.label, :_zi))
+    else
+        ziarg = Symbol(:_ppl_zilogit_, r.label)
+        push!(pre, :($ziarg::Float64 = $zi_logit))
+    end
     yin = _count_yplate!(pre, plan, y, r.label)
     inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
     pref = _thread_ref!(inputs, p)
     ziref = _thread_ref!(inputs, ziarg)
-    law = m -> logit ?
-        :((($ziref >= 0) & ($ziref <= 1)) ?
-            zero_inflated_binomial(; n = $nref, logit = $pref, zi = $ziref).$m($yv) :
-            -Inf) :
-        :((($pref >= 0) & ($pref <= 1)) && (($ziref >= 0) & ($ziref <= 1)) ?
-            zero_inflated_binomial($nref, $pref, $ziref).$m($yv) : -Inf)
-    ninputs, normalizer = _binomial_normalizer(yin, r, :zero_inflated_binomial)
+    law = zi_logit !== nothing ?
+        (logit ?
+            (m -> :(zero_inflated_binomial_logit_zi(;
+                n = $nref, logit = $pref, zi_logit = $ziref).$m($yv))) :
+            (m -> :((($pref >= 0) & ($pref <= 1)) ?
+                zero_inflated_binomial_logit_zi(;
+                    n = $nref, p = $pref, zi_logit = $ziref).$m($yv) : -Inf))) :
+        (logit ?
+            (m -> :((($ziref >= 0) & ($ziref <= 1)) ?
+                zero_inflated_binomial(; n = $nref, logit = $pref, zi = $ziref).$m($yv) :
+                -Inf)) :
+            (m -> :((($pref >= 0) & ($pref <= 1)) && (($ziref >= 0) & ($ziref <= 1)) ?
+                zero_inflated_binomial($nref, $pref, $ziref).$m($yv) : -Inf)))
+    normalizer_family = zi_logit === nothing ? :zero_inflated_binomial :
+        :zero_inflated_binomial_logit_zi
+    ninputs, normalizer = _binomial_normalizer(yin, r, normalizer_family)
     stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
     return Expr[pre..., stmts...]
 end
