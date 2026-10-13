@@ -1,4 +1,5 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL
+using DifferentiationInterface, Enzyme
 import Distributions as PD
 
 _positive_half(d) = PD.truncated(d, 0, Inf)
@@ -11,6 +12,41 @@ function _positive_prior_query(expr, data, oracle)
     @test Base.invokelatest(query, u) ≈ oracle(q, built.layout) atol=1e-12 rtol=1e-12
     @test unconstrain(built.layout, q) ≈ u atol=1e-12
     return plan, built, u
+end
+
+@testset "scalar half priors keep a named density call" begin
+    data = Dict(:y => [0.1, 0.2])
+    scale = 10.0
+    sigma = 1.5
+    u = [log(sigma)]
+    for (family, helper) in ((:HalfNormal, "_half_normal_logpdf_on_support"),
+                             (:HalfCauchy, "_half_cauchy_logpdf_on_support"))
+        prior = Expr(:call, family, scale)
+        plan = bind_data(lower_rkppl(quote
+            sigma ~ $prior
+            y .~ Normal.(0, sigma)
+        end, data; conditioned=(:y,)), data)
+        built = build_kernel(plan)
+        source = string(model_view(built; bound=plan).source)
+        @test occursin(helper, source)
+        @test !occursin("_ppl_prior_sigma.logpdf.", source)
+        code = string(readable_code(built.spec))
+        @test occursin(helper, code)
+        @test !occursin("_ppl_prior_sigma.logpdf.", code)
+
+        q = prepare_sampler(built, plan, u;
+            backend=AutoEnzyme(mode=Enzyme.Reverse))
+        prepared_code = string(readable_code(q.kernel))
+        @test occursin(helper, prepared_code)
+        @test !occursin("_ppl_prior_sigma.logpdf.", prepared_code)
+        grad = zeros(length(u))
+        value, _ = sampler_value_and_gradient!(q, grad, u)
+        @test isfinite(value)
+        prior_grad = family === :HalfNormal ? 1 - (sigma / scale)^2 :
+            1 - 2sigma^2 / (scale^2 + sigma^2)
+        expected = prior_grad - length(data[:y]) + sum(abs2, data[:y]) / sigma^2
+        @test only(grad) ≈ expected atol=1e-10 rtol=1e-10
+    end
 end
 
 @testset "positive priors have one normalized meaning in generic slots" begin
