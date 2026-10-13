@@ -162,7 +162,8 @@ function scan_reference(xs, s)
     total, gradient
 end
 
-inlined(kernel) = !occursin("stable_softplus(", sprint(show, readable_code(kernel)))
+inlined(kernel) = !occursin("stable_softplus(",
+    string(ReactiveKernels._readable_expr(code_expr(kernel), kernel)))
 
 @testset "function-shaped children under lazy arms differentiate natively" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)

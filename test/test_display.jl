@@ -83,21 +83,18 @@ _has_linenumber(x) = x isa LineNumberNode ||
 
     @testset "readable_code over a spec, plan and prepared kernel" begin
         from_spec = readable_code(display_model)
-        from_plan = readable_code(plan(display_model))
+        display_plan = plan(display_model)
+        from_plan = readable_code(display_plan)
         @test from_spec isa ReadableCode
-        @test string(from_spec) == string(from_plan)
+        @test length(from_spec.operations) == length(from_plan.operations)
         text = string(from_spec)
         @test !occursin("#=", text)
-        @test !occursin("__ops__", text)
-        @test !occursin("_KernelSourceOp", text)
+        @test occursin("__ops__", text)
+        @test length(from_plan.operations) == length(lower_with_ops(display_plan)[2])
         @test !_has_linenumber(from_spec.expr)
-        @test startswith(text, "# authored sources evaluated in: ")
-        @test (@__MODULE__) in from_spec.modules
-        @test occursin("\nfunction (x::Vector{Float64}, location::Any, scale::Any)\n" *
-                       "    shifted = location + 1.0\n", text)
-        @test occursin("(display_normal(li, si)).logpdf(xi)", text)
-        @test occursin("shifted = location + 1.0", text)
-        @test endswith(text, "\nend")
+        @test isempty(from_spec.modules)
+        @test occursin("# __ops__ table", text)
+        @test occursin("_KernelSourceOp", text)
         # The displayed program is ordinary Julia.
         parsed = Meta.parseall(text)
         @test !any(arg -> arg isa Expr && arg.head === :error, parsed.args)
@@ -109,9 +106,50 @@ _has_linenumber(x) = x isa LineNumberNode ||
         @test kernel(xs, 0.2, 1.3) ≈ _display_model_reference(xs, 0.2, 1.3)
         prepared = string(readable_code(kernel))
         @test !occursin("#=", prepared)
-        @test !occursin("__ops__", prepared)
+        @test occursin("__ops__", prepared)
+        @test readable_code(kernel).operations === kernel.ops
+        @test readable_code(kernel).expr == Base.remove_linenums!(deepcopy(code_expr(kernel)))
         # `code_expr` remains the exact executable AST.
         @test code_expr(kernel) === kernel.ast
+    end
+
+    @testset "displayed expressions preserve scopes and eager argument evaluation" begin
+        @kernel display_rebind_child(rows, vals) = begin
+            cells = plate(rows) do r
+                y = vals[r]
+                sum(y)
+            end
+            return cells
+        end
+        @kernel display_rebind_parent(rows::Vector{Vector{Int}}, y::Vector{Float64}) = begin
+            g = display_rebind_child(rows, y)
+            t = sum(y) .+ g
+            return t
+        end
+        rebind = prepare(display_rebind_parent)
+        rebind_code = readable_code(rebind)
+        rendered_rebind = Core.eval(@__MODULE__, rebind_code.expr)
+        rows = [[1, 2], [3]]
+        ys = [1.0, 2.0, 4.0]
+        @test Base.invokelatest(rendered_rebind, rebind_code.operations, rows, ys) ==
+              rebind(rows, ys) == [10.0, 11.0]
+
+        @kernel display_arm_child(x::Float64, s::Float64) = begin
+            r::Float64 = s > 0 ? log(x) : -Inf
+            return r
+        end
+        @kernel display_arm_parent(u::Vector{Float64}, s::Float64) = begin
+            q::Float64 = display_arm_child(u[1] * 2.0, s)
+            return q
+        end
+        arm = prepare(display_arm_parent)
+        arm_code = readable_code(arm)
+        rendered_arm = Core.eval(@__MODULE__, arm_code.expr)
+        @test Base.invokelatest(rendered_arm, arm_code.operations, [2.0], -1.0) ==
+              arm([2.0], -1.0) == -Inf
+        @test_throws BoundsError Base.invokelatest(rendered_arm, arm_code.operations,
+                                                  Float64[], -1.0)
+        @test_throws BoundsError arm(Float64[], -1.0)
     end
 
     @testset "readable_code of an expression is a non-mutating copy" begin
@@ -127,10 +165,10 @@ _has_linenumber(x) = x isa LineNumberNode ||
         @test !_has_linenumber(code.expr)
         @test code.modules == [Base]
         @test !occursin("#=", string(code))
-        @test occursin("@inline f(z) = z + y", string(code))
+        @test occursin("@inline f(z) = begin", string(code))
     end
 
-    @testset "a global shows by its bare name unless the program spells it otherwise" begin
+    @testset "global references keep their defining module" begin
         first_mod, second_mod = Module(:DisplayGlobalsA), Module(:DisplayGlobalsB)
         f1, f2 = GlobalRef(first_mod, :f), GlobalRef(second_mod, :f)
         g2 = GlobalRef(second_mod, :g)
@@ -138,21 +176,20 @@ _has_linenumber(x) = x isa LineNumberNode ||
         original = deepcopy(source)
         code = readable_code(source)
         @test source == original
-        @test string(code.expr) == "y = f(x) + g(x)"
-        @test code.modules == [first_mod, second_mod]
-        @test startswith(string(code), "# authored sources evaluated in: ")
-        @test readable_code(source; modules = (Base,)).modules == [Base, first_mod, second_mod]
-        # Two modules' globals of one name, or a local spelled like a global,
-        # keep their module paths.
+        @test code.expr == Base.remove_linenums!(deepcopy(source))
+        @test occursin("DisplayGlobalsA.f(x)", string(code.expr))
+        @test occursin("DisplayGlobalsB.g(x)", string(code.expr))
+        @test isempty(code.modules)
+        @test readable_code(source; modules = (Base,)).modules == [Base]
         clash = readable_code(:(y = $f1(x) + $f2(x)))
         @test occursin("DisplayGlobalsA.f(x)", string(clash.expr))
         @test occursin("DisplayGlobalsB.f(x)", string(clash.expr))
         @test isempty(clash.modules)
         shadowed = readable_code(:(f = x; y = $f1(f)))
         @test occursin("DisplayGlobalsA.f(f)", string(shadowed.expr))
-        # A Base name keeps its Base display.
+        # A Base reference is not respelled either.
         based = readable_code(:(y = $(GlobalRef(Base, :sum))(x)))
-        @test string(based.expr) == "y = sum(x)"
+        @test based.expr == :(y = $(GlobalRef(Base, :sum))(x))
         @test isempty(based.modules)
     end
 

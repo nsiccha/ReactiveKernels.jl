@@ -164,21 +164,26 @@ isdefined(@__MODULE__, :BranchPartition) ||
         @test bound(x) ≈ sum(abs(xi - 1.0) for xi in x)
     end
 
-    @testset "partitioned recipes keep the readable view named" begin
-        # The docs Generated-kernel pane refuses an `operation(` callee
-        # (docs/kernel_examples.jl): the partition's synthesized lane ops must
-        # render under their own names, not as an opaque operation slot.
+    @testset "partitioned code display keeps the executed slots" begin
         for want in (:total, :pointwise)
             bound = prepare(C.guarded; have = (:x, :y), want, bound = (; y))
-            readable = string(RK._readable_expr(RK.code_expr(bound), bound))
-            @test !occursin(r"__ops__\[\d+\]", readable)
-            @test !occursin(r"\boperation\(", readable)
+            code = readable_code(bound)
+            @test code.expr == Base.remove_linenums!(deepcopy(code_expr(bound)))
+            @test code.operations === bound.ops
+            @test occursin("__ops__", string(code))
+            @test !occursin("yi > 0", string(code))
+            for recipe in plates(bound.plan)
+                inner = recipe.op.kernel
+                inner_code = readable_code(inner)
+                @test inner_code.expr ==
+                      Base.remove_linenums!(deepcopy(code_expr(inner)))
+                @test inner_code.operations === inner.ops
+                @test !occursin("yi > 0", string(inner_code))
+            end
+            expected = want === :total ? reference_guarded(x, y) :
+                [yi > 0 ? log(xi * yi) : xi - 1.0 for (xi, yi) in zip(x, y)]
+            @test bound(x) ≈ expected
         end
-        pointwise = prepare(C.guarded; have = (:x, :y), want = :pointwise,
-                            bound = (; y))
-        readable = string(RK._readable_expr(RK.code_expr(pointwise), pointwise))
-        @test occursin("lane_gather", readable)
-        @test occursin("lane_assemble", readable)
     end
 end
 

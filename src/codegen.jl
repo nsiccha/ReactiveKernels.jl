@@ -5735,7 +5735,7 @@ _readable_bound_constant(value) = value
 
 # --- display-only value inlining ---------------------------------------------------
 #
-# `readable_code` shows a recipe's source with each authored name it reads in
+# This internal source-aware recipe view shows a recipe's source with each authored name it reads in
 # place of the program variable that holds it, as a human writes an inlined
 # call: `exp(unconstrained[2])`, not `let u = unconstrained[2]; exp(u) end`. A
 # name, literal or once-read value takes the name's place. A computed value
@@ -6037,13 +6037,13 @@ function _readable_expr(node, recipes)
     Expr(node.head, args...)
 end
 
-# Build a display-only copy of a lowered kernel or reactive getter. Positional
+# Build a source-aware explanatory copy of a lowered kernel or reactive getter. Positional
 # `__ops__[k]` calls become the selected recipe's named operation or its retained
 # authored RHS, and hidden operation/cache arguments are removed from the shown
 # signature. Passing a PreparedKernel uses its flattened recipe sequence, so a
 # nested generated kernel never leaves mismatched or opaque operation slots.
-# This internal explanatory expression is not executable authority; `code_expr`
-# remains the exact compiled AST.
+# This internal explanatory expression is not the public `readable_code`
+# result or executable authority; `code_expr` remains the exact compiled AST.
 _readable_expr(ast::Expr, plan::Plan) = _readable_expr(ast, plan.recipes)
 _readable_expr(ast::Expr, kernel::PreparedKernel) =
     _readable_expr(ast, kernel.lowered_recipes)
