@@ -73,7 +73,7 @@ function _kernel_expr_latest(plan::StructuralPlan, layout::LayoutTable; name::Sy
     # Level gathers (`z[g]` over a `levels(h)` axis) read level-code
     # vectors; collect them from every expression before emitting.
     gathers = Set{Tuple{Symbol,Symbol,Int}}()
-    assigns = _assignment_statements(plan; gathers)
+    assigns = _assignment_statements(plan; layout, gathers)
     free = _density_selection(plan, n -> n ∉ plan.conditioned)
     priors = _prior_statements(free, layout; gathers, context = plan)
     transforms = Expr[]
@@ -300,6 +300,7 @@ using ReactiveKernelsDistributionKernels.DistributionKernelSources:
     negative_binomial, weibull,
     uniform, laplace, logistic,
     student_t, zero_inflated_poisson, zero_inflated_binomial,
+    zero_inflated_binomial_logit_zi,
     normal_id_glm, bernoulli_logit_glm, poisson_log_glm, normal_id_glm_lpdf,
     rk_inverse_gaussian_tail, rk_von_mises_cdf, rk_logprob_tail,
     rk_von_mises_periodic_cdf, rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
@@ -354,6 +355,7 @@ _eval_kernel_def(def::Expr) =
 # for the recipes below). Unannotated: Int temporaries (e.g. `length`)
 # must not meet a Float64 assertion.
 function _assignment_statements(plan::StructuralPlan;
+        layout::LayoutTable,
         gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}())
     by_name = Dict{Symbol,Any}(a.name => a for a in plan.assignments)
     for d in plan.derived
@@ -384,7 +386,8 @@ function _assignment_statements(plan::StructuralPlan;
             (ex = _concrete_guarded_argument(ex))
         push!(order, name)
         rewritten[name] = _bound_extent_indices(name,
-            _value_math_rewrite(_array_gather_rewrite(ex, plan, gathers)), plan)
+            _unit_logit_rewrite(_value_math_rewrite(
+                _array_gather_rewrite(ex, plan, gathers)), layout), plan)
     end
     destructured = _destructuring_statements(order, rewritten)
     stmts = Expr[]
@@ -524,6 +527,56 @@ function _value_math_rewrite(ex::Expr)
         args[1] = :_ppl_logistic
     end
     return Expr(ex.head, args...)
+end
+
+# A unit-interval sampled parameter has two exact representations in the
+# built graph: its rounded constrained value and its source logit coordinate.
+# Only a call to the resolved LogExpFunctions.logit on that sampled value
+# selects the latter. Other functions and arbitrary probability expressions
+# keep their authored operations.
+function _unit_sample_coordinate(layout::LayoutTable, name::Symbol)
+    for e in layout.entries
+        e.kind === :sampled && e.name === name || continue
+        (e.transform === :logistic ||
+            (e.transform === :interval && e.lo isa Real && e.hi isa Real &&
+                iszero(e.lo) && isone(e.hi))) ||
+            return nothing
+        return coordinate_read(e.offset)
+    end
+    return nothing
+end
+
+_unit_logit_rewrite(ex, ::LayoutTable) = ex
+function _unit_logit_rewrite(ex::Expr, layout::LayoutTable)
+    # Do not rewrite a lexically scoped local that happens to share a sampled
+    # parameter's name.
+    ex.head in (:do, :->, :function, :let) && return ex
+    if ex.head === :call && length(ex.args) == 2 &&
+            ex.args[1] isa GlobalRef && ex.args[1].name === :logit &&
+            isdefined(ex.args[1].mod, :logit) &&
+            getglobal(ex.args[1].mod, :logit) === logit &&
+            ex.args[2] isa Symbol
+        coord = _unit_sample_coordinate(layout, ex.args[2])
+        coord === nothing || return coord
+    end
+    return Expr(ex.head, Any[_unit_logit_rewrite(a, layout) for a in ex.args]...)
+end
+
+function _unit_complement_logit(plan::StructuralPlan, zi)
+    zi isa Symbol || return nothing
+    for a in plan.assignments
+        a.name === zi || continue
+        ex = a.expr
+        ex isa Expr && ex.head === :call && length(ex.args) == 3 || return nothing
+        f = ex.args[1]
+        (f === :- || (f isa GlobalRef && f.mod === Base && f.name === :-)) ||
+            return nothing
+        ex.args[2] isa Real && isone(ex.args[2]) || return nothing
+        ex.args[3] isa Symbol || return nothing
+        coord = _unit_sample_coordinate(assign_layout(plan), ex.args[3])
+        return coord === nothing ? nothing : :(-$coord)
+    end
+    return nothing
 end
 
 # Functions as values: a data-only module call nested in a parameter-
@@ -2922,7 +2975,8 @@ function _binomial_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sy
 end
 
 # The `lognormalizer` cell of a Binomial-coefficient family (`binomial`,
-# `zero_inflated_binomial`): it reads the response and the trials only.
+# `zero_inflated_binomial`, or its logit-zi companion): it reads the response
+# and the trials only.
 function _binomial_normalizer(yin, r::LikelihoodSpec, family::Symbol)
     ninputs = Any[yin]
     nn = _thread_ref!(ninputs, r.trials, true)
@@ -2960,20 +3014,35 @@ function _zib_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
     # `log_rate` precedent): no probability vector, no `log(p)` round trip.
     logit = r.link === LogitLink && !_is_bare_param_location(r, plan)
     p = logit ? _location_node(r, plan) : _response_value_node!(pre, r, plan)
-    ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, Symbol(r.label, :_zi))
+    zi_logit = _unit_complement_logit(plan, r.zi)
+    if zi_logit === nothing
+        ziarg = _scale_use_plate_arg(r, plan, pre, r.zi, Symbol(r.label, :_zi))
+    else
+        ziarg = Symbol(:_ppl_zilogit_, r.label)
+        push!(pre, :($ziarg::Float64 = $zi_logit))
+    end
     yin = _count_yplate!(pre, plan, y, r.label)
     inputs = Any[yin]
     yv = _dovar(1)
     nref = _thread_ref!(inputs, r.trials, true)
     pref = _thread_ref!(inputs, p)
     ziref = _thread_ref!(inputs, ziarg)
-    law = m -> logit ?
-        :((($ziref >= 0) & ($ziref <= 1)) ?
-            zero_inflated_binomial(; n = $nref, logit = $pref, zi = $ziref).$m($yv) :
-            -Inf) :
-        :((($pref >= 0) & ($pref <= 1)) && (($ziref >= 0) & ($ziref <= 1)) ?
-            zero_inflated_binomial($nref, $pref, $ziref).$m($yv) : -Inf)
-    ninputs, normalizer = _binomial_normalizer(yin, r, :zero_inflated_binomial)
+    law = zi_logit !== nothing ?
+        (logit ?
+            (m -> :(zero_inflated_binomial_logit_zi(;
+                n = $nref, logit = $pref, zi_logit = $ziref).$m($yv))) :
+            (m -> :((($pref >= 0) & ($pref <= 1)) ?
+                zero_inflated_binomial_logit_zi(;
+                    n = $nref, p = $pref, zi_logit = $ziref).$m($yv) : -Inf))) :
+        (logit ?
+            (m -> :((($ziref >= 0) & ($ziref <= 1)) ?
+                zero_inflated_binomial(; n = $nref, logit = $pref, zi = $ziref).$m($yv) :
+                -Inf)) :
+            (m -> :((($pref >= 0) & ($pref <= 1)) && (($ziref >= 0) & ($ziref <= 1)) ?
+                zero_inflated_binomial($nref, $pref, $ziref).$m($yv) : -Inf)))
+    normalizer_family = zi_logit === nothing ? :zero_inflated_binomial :
+        :zero_inflated_binomial_logit_zi
+    ninputs, normalizer = _binomial_normalizer(yin, r, normalizer_family)
     stmts = _count_plate_stmts!(pre, r, plan, node, pw, inputs, law, ninputs, normalizer)
     return Expr[pre..., stmts...]
 end
