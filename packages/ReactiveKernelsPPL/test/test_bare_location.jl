@@ -703,7 +703,13 @@ end
     for (prog, cols, q, want) in cases
         bound, built, _, u = _rows_sampler(prog, cols)
         src = string(kernel_expr(bound, built.layout))
-        @test occursin("$(only(bound.predictors).name)::Number = ", src)
+        if prog === defined
+            @test occursin("m = exp(lm)", src)
+            @test occursin("plate(y, m, s)", src)
+            @test occursin("location = m", src)
+        else
+            @test occursin("$(only(bound.predictors).name)::Number = ", src)
+        end
         @test !occursin("_ppl_rows", src) && !occursin("hcat(ones", src)
         @test _value_posterior(prog, cols, q) ≈ want rtol = 1e-12
         _check_gradient(built.spec, bound, u)
