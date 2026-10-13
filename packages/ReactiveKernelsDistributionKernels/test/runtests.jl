@@ -41,6 +41,13 @@ using Test
     return sum(pointwise)
 end
 
+@kernel _binomial_normalizer_total(observed::Vector{Int}, n::Vector{Int}) = begin
+    pointwise = plate(observed, n) do y, trials
+        binomial(; n = trials).lognormalizer(y)
+    end
+    return sum(pointwise)
+end
+
 function _public_normal_plate_allocated(kernel, x, location, scale)
     kernel(x, location, scale)
     @allocated kernel(x, location, scale)
@@ -471,6 +478,53 @@ end
         @test bm(0, 0, eta) == 0.0
         @test zib(0, 0, eta, zi) == 0.0
     end
+end
+
+@testset "count objects split logpdf into logkernel and data-only lognormalizer" begin
+    # `logpdf == logkernel + lognormalizer` on every HAVE route (`logpdf` is
+    # written out, so equal to rounding). The normalizer
+    # reads only the count and the trials, and it is zero wherever `logpdf`
+    # never forms it (zero, full and invalid counts).
+    sigmoid(x) = 1 / (1 + exp(-x))
+    lchoose(n, y) = logpdf(Binomial(n, 0.5), y) + n * log(2)  # log C(n, y)
+    lfactorial(y) = -(logpdf(Poisson(1.0), y) + 1.0)          # log(y!)
+    zib_mass(n, p, zi, y) = 0 <= y <= n ?
+        log((y == 0) * zi + (1 - zi) * exp(logpdf(Binomial(n, p), y))) : -Inf
+    binomial_norm(n) = y -> 0 < y < n ? lchoose(n, y) : 0.0
+    cases = (
+        (binomial, (:observed, :n, :logit), (5, 0.4), (5,),
+            y -> logpdf(Binomial(5, sigmoid(0.4)), y), binomial_norm(5)),
+        (binomial, (:observed, :n, :p), (5, 0.3), (5,),
+            y -> logpdf(Binomial(5, 0.3), y), binomial_norm(5)),
+        (poisson, (:observed, :log_rate), (0.4,), (),
+            y -> logpdf(Poisson(exp(0.4)), y), y -> y > 0 ? -lfactorial(y) : 0.0),
+        (poisson, (:observed, :rate), (1.5,), (),
+            y -> logpdf(Poisson(1.5), y), y -> y > 0 ? -lfactorial(y) : 0.0),
+        (zero_inflated_binomial, (:observed, :n, :logit, :zi), (5, 0.4, 0.2), (5,),
+            y -> zib_mass(5, sigmoid(0.4), 0.2, y), binomial_norm(5)),
+        (zero_inflated_binomial, (:observed, :n, :p, :zi), (5, 0.3, 0.2), (5,),
+            y -> zib_mass(5, 0.3, 0.2, y), binomial_norm(5)),
+    )
+    for (object, have, args, norm_args, oracle, normalizer) in cases
+        full = prepare(object.logpdf; have, want = :logpdf)
+        kernel = prepare(object.logkernel; have, want = :logkernel)
+        norm = prepare(object.lognormalizer;
+            have = (:observed, have[2:1+length(norm_args)]...), want = :lognormalizer)
+        for y in (-1, 0, 1, 3, 5, 6)
+            @test full(y, args...) ≈ oracle(y) atol = 1e-12
+            @test norm(y, norm_args...) ≈ normalizer(y) atol = 1e-12
+            @test full(y, args...) ≈ kernel(y, args...) + norm(y, norm_args...) atol = 1e-12
+        end
+        @test norm(0, norm_args...) === 0.0
+        @test norm(-1, norm_args...) === 0.0
+    end
+    # Over bound counts and trials a plate of normalizers is a bind-time
+    # value: the prepared program evaluates no `loggamma`.
+    counts, trials = [0, 1, 3, 5, 2], [5, 5, 4, 5, 2]
+    folded = prepare(_binomial_normalizer_total;
+        bound = (; observed = counts, n = trials))
+    @test folded() ≈ sum(binomial_norm(n)(y) for (y, n) in zip(counts, trials))
+    @test !occursin("loggamma", string(code_expr(folded)))
 end
 
 @testset "negative_binomial2 Stan lpmf parity" begin
