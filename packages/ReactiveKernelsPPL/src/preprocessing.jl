@@ -135,6 +135,13 @@ end
 function _broadcast_affine(plan::StructuralPlan, pred::PredictorSpec)
     _uses_structured_observation_axes(plan) && return false
     _scalar_valued_predictor(plan, pred) && return true
+    # An intercept added to a vector expression remains a scalar broadcast.
+    # Turning it into a ones-column matrix product creates a needless GEMV
+    # and its reverse-mode tape, even when the other summand is already a
+    # matrix product. Keep genuine multi-column designs on their usual path.
+    any(t -> t.kind === InterceptTerm, pred.terms) &&
+        !any(t -> t.kind in (ContinuousTerm, FactorTerm, MatrixTerm), pred.terms) &&
+        return true
     for t in pred.terms
         t.kind in (ContinuousTerm, OffsetTerm, FactorTerm, ComposedTerm) || continue
         for c in t.columns

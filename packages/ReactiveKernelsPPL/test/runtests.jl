@@ -285,6 +285,7 @@ const _PPL_TEST_FILES = (
     "test_base_value_names.jl",
     "test_rebinding_rows.jl",
     "test_glm_object_values.jl",
+    "test_native_plain_plate_emission.jl",
     "test_glm_object_values_reactant.jl",
     "test_sampler_retained.jl",
     "test_shared_value_closures.jl",

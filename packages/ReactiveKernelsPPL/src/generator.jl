@@ -637,6 +637,26 @@ end
 # Each predictor's value is the graph node named after the predictor: the
 # authored definition it lowers (`mu = a .+ b .* x` emits `mu`), or the
 # fresh name the lowering gave an inline one (`y_eta`).
+function _predictor_plate_addition(plan::StructuralPlan, pred::PredictorSpec,
+        terms, rows::Bool)
+    rows && return false
+    length(terms) > 1 && length(terms) == length(pred.terms) || return false
+    _broadcast_affine(plan, pred) || return false
+    any(r -> _response_uses_predictor(r, pred.name), plan.responses) || return false
+    n = _located_rows(plan, pred)
+    axes = map(pred.terms) do t
+        t.kind === InterceptTerm && return Any[]
+        t.kind === OffsetTerm && length(t.columns) == 1 &&
+            return _value_axes(plan, only(t.columns); data_axes = true)
+        t.kind === ComposedTerm &&
+            return _value_axes(plan, _composed_expr(plan, pred, t);
+                data_axes = true)
+        return nothing
+    end
+    any(a -> a == Any[n], axes) &&
+        all(a -> a == Any[] || a == Any[n], axes)
+end
+
 function _predictor_statements(plan::StructuralPlan)
     stmts = Expr[]
     for pred in plan.predictors
@@ -680,6 +700,17 @@ function _predictor_statements(plan::StructuralPlan)
         # Degenerate (e.g. single-level-factor-only) predictors carry a scalar
         # zero LP, which broadcasts everywhere a vector LP would.
         rhs = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a .+ $b), terms)
+        # A known one-axis predictor can add its summands per observation.
+        # The authored plate then composes with a sole plate consumer, so the
+        # intermediate predictor vector need not be materialized. Require a
+        # bound rank/extent proof for every summand and keep scalar and
+        # row-expanding predictors on their existing broadcast path.
+        if _predictor_plate_addition(plan, pred, terms, rows)
+            formals = [gensym(:summand) for _ in terms]
+            cell = foldl((a, b) -> Expr(:call, :+, a, b), formals)
+            rhs = Expr(:do, Expr(:call, :plate, terms...),
+                Expr(:->, Expr(:tuple, formals...), Expr(:block, cell)))
+        end
         # Full-length vector plans read one location entry per row. A value
         # of unknown shape gets those rows once, as Julia broadcasting
         # against the rows would, rather than a ones vector per summand.
@@ -4262,21 +4293,10 @@ function _vector_prior_stmts!(stmts::Vector{Expr}, terms::Vector{Any},
     names = Dict{Symbol,Symbol}(t => cell_names[v] for (v, t) in zip(values(args), argvals)
         if v isa Symbol && haskey(cell_names, v))
     plate = _plate_sum_stmts(pw, node, inputs, Expr[pre..., cell]; names)
-    scale = length(args) == 2 ? last(values(args)) : nothing
-    sf = scale isa Real ? Float64(scale) : NaN
-    if family === :normal && !conditioned && support === nothing &&
-            length(args) == 2 && first(values(args)) isa Real &&
-            iszero(first(values(args))) && isfinite(sf) && sf > 0
-        # Keep the cell densities for :pointwise, but let the summed prior
-        # standardize before squaring, as the scalar Normal cells do. The
-        # sampler prunes the unused plate and ordinary AD reads this dot.
-        z = Symbol(:_ppl_prior_standardized_, label)
-        push!(stmts, plate[1], :($z = $name ./ $sf),
-            :($node::Float64 = -0.5 * dot($z, $z) -
-                length($name) * $(log(sf) + 0.5 * log(2 * π))))
-    else
-        append!(stmts, plate)
-    end
+    # Keep the ordinary scalar plate for the sum as well as pointwise values.
+    # A standardized temporary followed by dot(z,z) makes ordinary reverse AD
+    # allocate that temporary and call BLAS twice for the same self-product.
+    append!(stmts, plate)
     push!(terms, node)
     return nothing
 end

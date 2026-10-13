@@ -270,6 +270,20 @@ Values computed from such a value, or from a HAVE port whose type is not
 known, are not reported again. Preparation still succeeds, so the primal of
 such a kernel keeps working.
 
+When an abstract HAVE declaration hides a concrete input type needed to infer
+an authored plate's rank, `prepare(...; exemplars = (x, ...))` opts the native
+lowering into type evidence from one exemplar per remaining positional HAVE
+port. Calls with different input types are refused; prepare again for those
+types. No exemplar length or value is baked into the loop. RKPPL's
+`prepare_sampler` uses the converted `Vector{Float64}` exemplar by default,
+and its public calls convert other real vectors to that type. Tensorized
+lowering retains the declared input types. A graph prepared with exemplars
+compiles afresh rather than reusing its bound-preparation cache.
+The authored `AbstractVector{Float64}` boundary remains broad; for example,
+a coefficient slice can be a concrete `SubArray` view. Native plate inference
+uses that concrete inferred subtype when available and keeps the declaration
+when inference is weaker.
+
 ```julia
 uninferred_curve(t, a) = Base.inferencebarrier(t .* exp(a))
 

@@ -83,13 +83,14 @@ function _query_bound(plan::StructuralPlan)
 end
 
 """
-    prepare_query(built, plan, preset::Symbol; on_error = nothing)
+    prepare_query(built, plan, preset::Symbol; on_error = nothing, exemplars = nothing)
 
 Prepare the `build_kernel` output `built` for a named workflow `preset`
 over the sampler boundary (`:unconstrained` + data columns, data hoisted
 via `bound=`). Thin wrapper over `ReactiveKernels.prepare` with
 `want = workflow_wants(preset)` and the supplied `on_error` policy. The
-returned kernel maps an unconstrained `Vector{Float64}` to the preset node's
+optional `exemplars` tuple is forwarded to RK's native type-evidence path.
+The returned kernel maps an unconstrained float vector to the preset node's
 value. `plan` may be any binding that generates the same program as `built`
 (other row counts and data values, or the same source lowered in another
 gensym-created isolation module); one that generates another program
@@ -113,13 +114,16 @@ with the earlier `sum(view(unconstrained, i:i))` spelling, which fell through
 to Base's scalar `mapreduce`; `test_reactant_joint.jl` pins the working
 shape).
 """
-function prepare_query(built, plan::StructuralPlan, preset::Symbol; on_error = nothing)
-    return _prepare_wants(built, plan, workflow_wants(preset); on_error)
+function prepare_query(built, plan::StructuralPlan, preset::Symbol;
+        on_error = nothing, exemplars = nothing)
+    return _prepare_wants(built, plan, workflow_wants(preset);
+        on_error, exemplars)
 end
 
 # Prepare the built graph over the sampler boundary for one WANT node or a
 # tuple of them (a tuple-WANT kernel returns a tuple in that order).
-function _prepare_wants(built, plan::StructuralPlan, want; on_error = nothing)
+function _prepare_wants(built, plan::StructuralPlan, want;
+        on_error = nothing, exemplars = nothing)
     isbound(plan) || throw(ContractValidationError(
         "[query] prepare_query requires a bound plan (bind_data first)"))
     _check_built_program(built, plan)
@@ -127,7 +131,7 @@ function _prepare_wants(built, plan::StructuralPlan, want; on_error = nothing)
     # (newer than any already-compiled caller), so partial evaluation must
     # run at the latest world. Same barrier guards every call below.
     return Base.invokelatest(prepare, built.spec; have = _query_have(plan),
-        want, bound = _query_bound(plan), on_error)
+        want, bound = _query_bound(plan), on_error, exemplars)
 end
 
 # A built graph evaluates the program its build generated. A binding that
@@ -220,6 +224,11 @@ the backend value alone does not load
 DifferentiationInterface's backend extension, and preparation without it
 fails loudly naming the missing `using`.
 
+The sampler passes its converted `Vector{Float64}` exemplar to native
+preparation by default. Its public calls convert other real vectors to that
+type; the prepared native kernel uses the concrete type to infer plate inputs
+without fixing the vector's length.
+
 `retain` names further query presets (`:pointwise`, `:likelihood`, `:prior`,
 `:log_jacobian`) whose values the gradient's own primal sweep returns through
 [`sampler_value_gradient_and_retained!`](@ref), with no second primal pass.
@@ -235,17 +244,20 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
+    u = Vector{Float64}(u0)
+    exemplar = (u,)
     kern = ReactiveKernels._kernel_latest_prepared(
-        prepare_query(built, plan, :sampler; on_error))
+        prepare_query(built, plan, :sampler; on_error, exemplars = exemplar))
     gradient_kernel, wants = if isempty(retain)
         kern, ()
     else
         wants = _retained_wants(retain)
         ReactiveKernels._kernel_latest_prepared(_prepare_wants(built, plan,
-            (workflow_wants(:sampler), wants...); on_error)), wants
+            (workflow_wants(:sampler), wants...); on_error,
+            exemplars = exemplar)), wants
     end
     prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
-        Vector{Float64}(u0); active = :unconstrained, retain = wants, warm)
+        u; active = :unconstrained, retain = wants, warm)
     return SamplerQuery(kern, prep, layout)
 end
 
