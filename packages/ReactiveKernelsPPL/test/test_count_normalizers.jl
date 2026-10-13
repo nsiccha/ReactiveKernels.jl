@@ -23,7 +23,11 @@ const _CN_W = [1.0, 0.5, 2.0, 1.0, 1.5, 1.0, 0.25, 3.0]
 
 _cn_source(f) = string(kernel_expr(f.plan, f.built.layout))
 _cn_prepared(f) = sprint(show, MIME"text/plain"(), readable_code(f.kernel))
-_cn_folded(code, name) = occursin(Regex("\\b$(name) = -?[0-9]"), code)
+function _cn_folded(f, name)
+    slot = match(Regex("\\b$(name) = \\(__ops__\\[(\\d+)\\]\\)\\(\\)"), _cn_prepared(f))
+    slot !== nothing &&
+        f.kernel.ops[parse(Int, slot.captures[1])] isa ReactiveKernels._BoundConstant
+end
 _cn_eta(u) = u[1] .+ u[2] .* _CN_X
 _cn_normal_prior(u) = sum(logpdf.(Normal(), u))
 
@@ -55,7 +59,7 @@ end
         @test occursin("_ppl_lchoose_y_resp", source)
         code = _cn_prepared(f)
         @test !occursin("loggamma", code)
-        @test _cn_folded(code, "_ppl_lchoose_y_resp")
+        @test _cn_folded(f, "_ppl_lchoose_y_resp")
         oracle = u -> sum(logpdf.(Binomial.(n, logistic.(_cn_eta(u))), counts)) +
             _cn_normal_prior(u)
         _distributional_check(f, oracle, u)
@@ -65,7 +69,7 @@ end
     # normalizer still folds.
     f = _cn_linear(:(y .~ Binomial.(n, logistic.(eta))), (; n = [5], y = y5))
     @test !occursin("dot(", _cn_source(f))
-    @test _cn_folded(_cn_prepared(f), "_ppl_lnorm_y_resp")
+    @test _cn_folded(f, "_ppl_lnorm_y_resp")
     _distributional_check(f,
         u -> sum(logpdf.(Binomial.(5, logistic.(_cn_eta(u))), y5)) + _cn_normal_prior(u), u)
 end
@@ -92,7 +96,7 @@ end
             source = _cn_source(f)
             @test occursin(".logkernel(", source)
             @test occursin(".lognormalizer(", source)
-            @test _cn_folded(_cn_prepared(f), "_ppl_lnorm_y_resp")
+            @test _cn_folded(f, "_ppl_lnorm_y_resp")
             _distributional_check(f, u -> sum(pointwise(_cn_eta(u))) + _cn_normal_prior(u), u)
             @test _cn_pointwise(f, u) ≈ pointwise(eta)
         end
@@ -132,7 +136,7 @@ end
         @testset "$name" begin
             f = _distributional_model(Expr(:block, prior, response), (; n = _CN_N, y = _CN_Y))
             @test occursin(".logkernel(", _cn_source(f))
-            @test _cn_folded(_cn_prepared(f), "_ppl_lnorm_y_resp")
+            @test _cn_folded(f, "_ppl_lnorm_y_resp")
             for v in (-0.4, 0.7)
                 _distributional_check(f, u -> oracle(only(u)), [v])
             end
@@ -149,7 +153,7 @@ end
         eta = a .+ b .* x
         y .~ ZeroInflatedBinomial.(n, logistic.(eta), zi)
     end, (; x = _CN_X, n = _CN_N, y = _CN_Y))
-    @test _cn_folded(_cn_prepared(f), "_ppl_lnorm_y_resp")
+    @test _cn_folded(f, "_ppl_lnorm_y_resp")
     @test Base.invokelatest(f.kernel, [0.3, -0.2, 3.0]) == -Inf
     valid(u) = (zi = 1.5 * logistic(u[3]);
         sum(_zib_oracle_cell.(_CN_Y, _CN_N, logistic.(_cn_eta(u)), zi)) + _cn_normal_prior(u))
