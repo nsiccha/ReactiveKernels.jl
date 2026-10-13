@@ -9,11 +9,6 @@ using SpecialFunctions: loggamma
 
 const _HMM1_AE = AutoEnzyme(mode = Enzyme.Reverse)
 
-# Signature of the pinned upstream Enzyme static-activity gap (see the gradient
-# testset below): `Enzyme.Compiler.EnzymeRuntimeActivityError` "Detected potential
-# need for runtime activity" (measured Enzyme 0.13.208, Julia 1.10.11).
-_hmm1_is_upstream_gap(e) = e isa Enzyme.Compiler.EnzymeRuntimeActivityError
-
 function _hmm1_fd(f, q; h = 1e-6)
     g = similar(q)
     for i in eachindex(q)
@@ -168,27 +163,19 @@ end
     end
 
     @testset "native primal + plain-Enzyme gradient vs finite differences" begin
-        # Pinned upstream Enzyme gap (snag scan-prior-enzym-d67d4ac1;
-        # reactivekernels-use §7q): the authored scan plus the prior endpoint
-        # terms fail plain static-activity reverse mode with
-        # `Enzyme.Compiler.EnzymeRuntimeActivityError`. Only that signature is
-        # tolerated; anything else rethrows.
-        gapped = true
+        # Plain static-activity reverse mode differentiates this program since
+        # its scan step reduces with the type-stable `logsumexp(M; dims = 1)`.
+        # With `mapslices(logsumexp, M; dims = 1)` (which infers `Any`) it
+        # failed with `EnzymeRuntimeActivityError` (snag
+        # scan-prior-enzym-d67d4ac1; reactivekernels-use §7q).
         kb = prepare(model; have = _HMM1_HAVE, want = :posterior, bound = _HMM1_BOUND)
         q = [0.4, 0.25, -0.1, 0.2, 0.05, -0.15]
         reference(qq) = _hmm_drive_1_reference(qq, HMM_DRIVE_1_U, HMM_DRIVE_1_V,
             HMM_DRIVE_1_ALPHA, HMM_DRIVE_1_TAU, HMM_DRIVE_1_RHO).posterior
-        try
-            prep = prepare_ad(kb, _HMM1_AE, q; active = :unconstrained)
-            value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
-            @test value ≈ reference(q)
-            @test all(isfinite, g)
-            @test g ≈ _hmm1_fd(reference, q) rtol = 1e-5
-            # Self-firing pin: errors (Unexpected Pass) once upstream Enzyme
-            # differentiates this program, forcing removal of the gate.
-            gapped && @test_broken true
-        catch e
-            gapped && _hmm1_is_upstream_gap(e) || rethrow()
-        end
+        prep = prepare_ad(kb, _HMM1_AE, q; active = :unconstrained)
+        value, g = ReactiveKernels.ad_value_and_gradient!(prep, similar(q), q)
+        @test value ≈ reference(q)
+        @test all(isfinite, g)
+        @test g ≈ _hmm1_fd(reference, q) rtol = 1e-5
     end
 end
