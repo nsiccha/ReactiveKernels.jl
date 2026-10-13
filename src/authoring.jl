@@ -1400,6 +1400,8 @@ _kernel_endpoint_source_module(op::_KernelSourceOp) =
     _kernel_endpoint_source_module(op.f)
 _kernel_endpoint_source_module(op::_KernelBranch) =
     _kernel_endpoint_source_module(op.call)
+_kernel_endpoint_source_module(op::_KernelSplit) =
+    _kernel_endpoint_source_module(op.call)
 
 # Render a constructed-endpoint call as source for a branch-arm position.
 # `actuals` are the call-site binding sources in the endpoint HAVE order
@@ -3709,9 +3711,10 @@ function _kernel_operation(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     mod = get(kwargs, :mod, nothing)
     ignored_rhs = _kernel_ignore_throw_source(rhs, mod, known)
     # Branch arm graphs belong to the authored source only; the throw-stripped
-    # twin keeps its arms as closures.
+    # twin keeps its arms as closures, and no split nodes.
     ignored = _kernel_operation_body(ignored_rhs, deps, known;
-        (key => value for (key, value) in kwargs if key !== :branch_arms)...)
+        (key => value for (key, value) in kwargs if key !== :branch_arms)...,
+        split = false)
     Expr(:call, GlobalRef(@__MODULE__, :_kernel_with_ignored_throws),
          _kernel_source_functions(normal, mod), _kernel_source_functions(ignored, mod))
 end
@@ -3801,7 +3804,8 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
                            tensorize::Bool = true,
                            mod::Union{Module,Nothing} = nothing,
                            nested_specs = Dict{Symbol,Any}(),
-                           branch_arms = nothing)
+                           branch_arms = nothing,
+                           split::Bool = true)
     form = :fused
     call_identity = nothing
     call_capture_name = nothing
@@ -3847,14 +3851,17 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
     # with a definition-unique gensym token (RK 07:21) + its Form, so a prepared handle distinguishes it
     # from a manually-inserted raw (opaque) closure without IR inspection. Call forwards inline.
     deftoken = gensym(:rk_srcop)
+    # An effectful recipe is never evaluated at preparation, so it keeps no
+    # split nodes; neither does the throw-stripped twin.
+    split &= tensorize
     if _kernel_branch_parts(rhs) !== nothing
         # A top-level lazy branch keeps its parts as `_KernelBranch` metadata
         # (same lazy call semantics) so plate partial evaluation can split
         # lanes on a data-bound condition. In a plate cell its leaf arms also
         # carry their graphs (`branch_arms`, `_kernel_plate_branch_arms`).
         native, _ = _kernel_branch_callable(rhs, deps, known, mod, false;
-                                            arms = branch_arms)
-        tensor, _ = _kernel_branch_callable(rhs, deps, known, mod, tensorize)
+                                            arms = branch_arms, split)
+        tensor, _ = _kernel_branch_callable(rhs, deps, known, mod, tensorize; split)
         return Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
              Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)), native, tensor)
@@ -3870,14 +3877,27 @@ function _kernel_operation_body(rhs, deps::Vector{Symbol}, known::Set{Symbol};
              Expr(:->, Expr(:tuple, deps...),
                   tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs))
     end
+    native = Expr(:->, Expr(:tuple, deps...), _kernel_native_body(rhs, mod, known))
+    tensor = Expr(:->, Expr(:tuple, deps...),
+                  tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs)
+    if split && form === :fused
+        native = _kernel_split_callable(rhs, deps, native,
+                                        _kernel_split_native_body(mod, known))
+        tensor = _kernel_split_callable(rhs, deps, tensor,
+                                        _kernel_split_tensor_body(mod, known))
+    end
     Expr(:call, GlobalRef(@__MODULE__, :_KernelSourceOp),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(deftoken)),
          Expr(:call, GlobalRef(Base, :Val), QuoteNode(form)),
-         Expr(:->, Expr(:tuple, deps...), _kernel_native_body(rhs, mod, known)),
-         Expr(:->, Expr(:tuple, deps...),
-              tensorize ? _kernel_tensorized_rhs(rhs, known, mod, Set{Symbol}(deps)) : rhs),
-         nothing, call_identity, call_capture_name, resolved_callable)
+         native, tensor, nothing, call_identity, call_capture_name, resolved_callable)
 end
+
+# Part bodies of a split expression: the same native or tensorized rewrite as
+# its whole body, with the kid placeholders among the closure's own names.
+_kernel_split_native_body(mod, known) =
+    (e, params) -> _kernel_native_body(e, mod, union(known, params))
+_kernel_split_tensor_body(mod, known) =
+    (e, params) -> _kernel_tensorized_rhs(e, union(known, params), mod, Set{Symbol}(params))
 
 # `(condition, then, else)` of a value-producing top-level lazy branch —
 # `c ? a : b` / `if … elseif … else … end` (an `elseif` tail is the nested
@@ -3912,7 +3932,7 @@ end
 # is its graph's construction expression or `nothing`.
 function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
                                  mod, tensorize::Bool; leaf::Bool = false,
-                                 arms = nothing)
+                                 arms = nothing, split::Bool = false)
     parts = leaf ? nothing : _kernel_branch_parts(part)
     if parts === nothing
         read = Set(_kernel_free_ports(part, Set{Symbol}(deps)))
@@ -3920,7 +3940,16 @@ function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
         body = tensorize ?
             _kernel_tensorized_rhs(part, known, mod, Set{Symbol}(ports)) :
             _kernel_native_body(part, mod, known)
-        return Expr(:->, Expr(:tuple, ports...), body), ports
+        closure = Expr(:->, Expr(:tuple, ports...), body)
+        # An arm leaf runs exactly when its lane takes it, so its split nodes
+        # are evaluated at preparation on those lanes only. The condition is
+        # read whole.
+        if split && !leaf
+            closure = _kernel_split_callable(part, ports, closure, tensorize ?
+                _kernel_split_tensor_body(mod, known) :
+                _kernel_split_native_body(mod, known))
+        end
+        return closure, ports
     end
     condition, then_side, else_side = parts
     positions(ports) = Tuple(findfirst(==(p), deps) for p in ports)
@@ -3932,15 +3961,238 @@ function _kernel_branch_callable(part, deps::Vector{Symbol}, known::Set{Symbol},
     then_arms = arms === nothing ? nothing : arms.then_arm
     else_arms = arms === nothing ? nothing : arms.else_arm
     tex, tports = _kernel_branch_callable(then_side, deps, known, mod, tensorize;
-        arms = then_arms isa NamedTuple ? then_arms : nothing)
+        arms = then_arms isa NamedTuple ? then_arms : nothing, split)
     eex, eports = _kernel_branch_callable(else_side, deps, known, mod, tensorize;
-        arms = else_arms isa NamedTuple ? else_arms : nothing)
+        arms = else_arms isa NamedTuple ? else_arms : nothing, split)
     val(ports) = Expr(:call, GlobalRef(Base, :Val), positions(ports))
     leaf_spec(entry) = entry isa NamedTuple || entry === nothing ? nothing :
         Expr(:call, GlobalRef(@__MODULE__, :_kernel_branch_arm_graph), entry)
     Expr(:call, GlobalRef(@__MODULE__, :_KernelBranch),
          val(cports), val(tports), val(eports), call, cex, tex, eex,
          leaf_spec(then_arms), leaf_spec(else_arms)), deps
+end
+
+# ---------------------------------------------------------------------------
+# Data-only split nodes (`_KernelSplit`).
+#
+# Plate partial evaluation caches a cell recipe whose inputs are all bound
+# data, but a recipe that mixes bound and live arguments ran whole in every
+# cell, so a data-only subexpression written inside it (the log binomial
+# coefficient of a count likelihood, `log(y)` of a positive family) was
+# recomputed on every evaluation (todo `14jgmez`, the user's principle that
+# RK precomputes all worthwhile work that depends only on data). Which
+# arguments are bound is known only at preparation, so authoring records every
+# subexpression that some binding could make data-only while the expression
+# around it is not: a SPLIT NODE is a strict subexpression (a call, field read
+# or index, as `_kernel_hoist_cell_invariants` lifts) that reads some but
+# fewer of the expression's arguments than its nearest enclosing such
+# subexpression, and does work worth caching. For any bound set, the maximal
+# data-only subexpressions are exactly the split nodes whose arguments are all
+# bound and whose enclosing split node (or root) reads a live one.
+#
+# Only strict positions are entered: a branch, short-circuit, generator,
+# closure, `let` or macro call keeps its own evaluation, so a node never runs
+# where the authored expression would not (docs/src/constraints.md, "Preserve
+# lazy branches"); its whole enclosing call can still be a node. A dotted call
+# is a node only as a whole, which keeps Base's broadcast fusion. The
+# decomposition is a function of the expression and its argument names alone,
+# so preparation recomputes it from the recipe's retained source for the
+# readable recipes of the parts it splits out.
+
+# Calls no more expensive to recompute in a cell than to read from a cache: a
+# subexpression made only of these (and names, literals, field reads and
+# indexing) is not worth a cached array.
+const _KERNEL_SPLIT_CHEAP = Set{Symbol}([
+    :+, :-, :*, :/, :\, :muladd, :fma, :min, :max, :abs, :abs2, :inv, :ifelse,
+    :<, :<=, :>, :>=, :(==), :!=, :!, :&, :|, :xor, :sign, :copysign, :flipsign,
+    :zero, :one, :oftype, :convert, :float, :Float64, :Float32, :Float16, :Int,
+    :Int64, :Int32, :Bool, :identity, :first, :last, :getindex, :getfield,
+    :length, :size, :tuple])
+
+_kernel_split_callee_name(callee::Symbol) = callee
+_kernel_split_callee_name(callee::GlobalRef) = callee.name
+_kernel_split_callee_name(callee::Expr) =
+    callee.head === :. && length(callee.args) == 2 && callee.args[2] isa QuoteNode &&
+        callee.args[2].value isa Symbol ? callee.args[2].value : nothing
+_kernel_split_callee_name(callee) = nothing
+
+# Whether evaluating `ex` does work worth caching: a call other than the
+# cheap ones above, with Julia's literal integer powers counted as cheap
+# multiplications, or a loop, generator or macro.
+function _kernel_split_worthwhile(ex)
+    ex isa Expr || return false
+    ex.head in (:quote, :inert) && return false
+    ex.head in (:generator, :comprehension, :typed_comprehension, :macrocall,
+                :for, :while, :do) && return true
+    if ex.head === :call && !isempty(ex.args)
+        name = _kernel_split_callee_name(ex.args[1])
+        if name === nothing
+            return true
+        elseif name === :^
+            length(ex.args) == 3 && ex.args[3] isa Integer || return true
+        else
+            text = String(name)
+            base = startswith(text, ".") && length(text) > 1 ? Symbol(text[2:end]) : name
+            base in _KERNEL_SPLIT_CHEAP || return true
+        end
+        return any(_kernel_split_worthwhile, ex.args[2:end])
+    elseif ex.head === :. && length(ex.args) == 2 && Meta.isexpr(ex.args[2], :tuple)
+        name = _kernel_split_callee_name(ex.args[1])
+        (name === nothing || !(name in _KERNEL_SPLIT_CHEAP)) && return true
+        return any(_kernel_split_worthwhile, ex.args[2].args)
+    end
+    any(_kernel_split_worthwhile, ex.args)
+end
+
+# A subexpression that can be evaluated on its own: a call (whose callee does
+# not end in `!`), a field read, a dotted call or an index.
+_kernel_split_liftable(ex) = ex isa Expr && (
+    (ex.head === :call && !isempty(ex.args) && !_kernel_mutating_callee(ex.args[1])) ||
+    (ex.head === :. && length(ex.args) == 2 &&
+     (ex.args[2] isa QuoteNode ||
+      (Meta.isexpr(ex.args[2], :tuple) && !_kernel_mutating_callee(ex.args[1])))) ||
+    ex.head === :ref)
+
+# The strict operand positions of `ex`, as `_kernel_lift_invariant_operands!`
+# enters them, except a dotted call's arguments.
+function _kernel_split_children(ex)
+    ex isa Expr || return ()
+    head = ex.head
+    if head === :call && !isempty(ex.args)
+        _kernel_mutating_callee(ex.args[1]) && return ()
+        return ex.args[2:end]
+    elseif head === :. && length(ex.args) == 2 && ex.args[2] isa QuoteNode
+        return (ex.args[1],)
+    elseif head === :ref && !isempty(ex.args)
+        return Any[ex.args[1],
+                   (arg for arg in ex.args[2:end] if !_kernel_reads_index_bound(arg))...]
+    elseif head in (:tuple, :vect, :parameters)
+        return Any[arg isa Expr && arg.head in (:(=), :kw) && length(arg.args) == 2 ?
+                       arg.args[2] : arg for arg in ex.args]
+    elseif head === :kw && length(ex.args) == 2
+        return (ex.args[2],)
+    elseif head in (:(::), :(...)) && !isempty(ex.args)
+        return (ex.args[1],)
+    end
+    ()
+end
+
+_kernel_split_placeholder(index::Int) = Symbol("__rk_split_", index)
+
+# Replace the expressions in `mapping` (by identity) with their names.
+function _kernel_split_replace(ex, mapping::IdDict{Any,Symbol})
+    haskey(mapping, ex) && return mapping[ex]
+    ex isa Expr || return ex
+    ex.head in (:quote, :inert) && return ex
+    Expr(ex.head, Any[_kernel_split_replace(arg, mapping) for arg in ex.args]...)
+end
+
+function _kernel_split_unique!(seen::Base.IdSet{Any}, ex)
+    ex isa Expr || return true
+    ex in seen && return false
+    push!(seen, ex)
+    all(arg -> _kernel_split_unique!(seen, arg), ex.args)
+end
+
+"""
+    _kernel_split_nodes(ex, ports) -> nothing | (; root, nodes)
+
+The split nodes of authored expression `ex` over its ordered argument names
+`ports`, or `nothing` when it has none. Each node, in post-order, is
+`(; expr, own, direct, kids, body)`: its subexpression, the positions in
+`ports` its whole subexpression reads and those it reads outside its kids, the
+indices of its immediately nested nodes, and its subexpression with those kids
+replaced by `_kernel_split_placeholder(kid)`. `root` has the same `direct`,
+`kids` and `body` for the whole expression. A pure function of `ex` and
+`ports`: preparation recomputes it from a recipe's source.
+"""
+function _kernel_split_nodes(ex, ports::Vector{Symbol})
+    root = _kernel_branch_unwrap(ex)
+    root isa Expr || return nothing
+    _kernel_split_unique!(Base.IdSet{Any}(), root) || return nothing
+    portset = Set{Symbol}(ports)
+    free(e) = try
+        Set{Symbol}(_kernel_free_ports(e, portset))
+    catch err
+        err isa ArgumentError || rethrow()
+        nothing
+    end
+    reference = free(root)
+    reference === nothing && return nothing
+    found = Any[]
+    failed = Ref(false)
+    function walk(e, enclosing::Set{Symbol})
+        kids = Int[]
+        for child in _kernel_split_children(e)
+            child isa Expr || continue
+            if _kernel_split_liftable(child)
+                reads = free(child)
+                reads === nothing && (failed[] = true; return kids)
+                if !isempty(reads) && length(reads) < length(enclosing) &&
+                   issubset(reads, enclosing) && _kernel_split_worthwhile(child)
+                    inner = walk(child, reads)
+                    push!(found, (child, reads, inner))
+                    push!(kids, length(found))
+                else
+                    append!(kids, walk(child, reads))
+                end
+            else
+                append!(kids, walk(child, enclosing))
+            end
+        end
+        kids
+    end
+    root_kids = walk(root, reference)
+    (failed[] || isempty(found)) && return nothing
+    placeholders = Set{Symbol}(_kernel_split_placeholder(i) for i in eachindex(found))
+    isempty(intersect(placeholders, _kernel_collect_symbols!(Set{Symbol}(), root))) ||
+        return nothing
+    positions(reads) = [i for (i, port) in enumerate(ports) if port in reads]
+    function part(e, kids)
+        mapping = IdDict{Any,Symbol}(found[k][1] => _kernel_split_placeholder(k)
+                                     for k in kids)
+        body = _kernel_split_replace(e, mapping)
+        reads = free(body)
+        reads === nothing && return nothing
+        (; direct = positions(reads), kids = kids, body = body)
+    end
+    nodes = Any[]
+    for (child, reads, kids) in found
+        p = part(child, kids)
+        p === nothing && return nothing
+        push!(nodes, (; expr = child, own = positions(reads), p...))
+    end
+    top = part(root, root_kids)
+    top === nothing && return nothing
+    (; root = top, nodes)
+end
+
+# `(ports, root, nodes)`: the shape `_KernelSplit` carries as its type
+# parameter and preparation checks a recomputed decomposition against.
+_kernel_split_shape(ports, split) = (
+    Tuple(ports), (Tuple(split.root.direct), Tuple(split.root.kids)),
+    Tuple((Tuple(n.own), Tuple(n.direct), Tuple(n.kids)) for n in split.nodes))
+
+# Wrap the closure expression `closure` of authored expression `ex` over
+# `ports` in its `_KernelSplit` construction, or return it unchanged when `ex`
+# has no split node. `body(e, params)` builds a part's function body (the
+# native or the tensorized rewrite of `e`) for closure parameters `params`.
+function _kernel_split_callable(ex, ports::Vector{Symbol}, closure, body)
+    split = _kernel_split_nodes(ex, ports)
+    split === nothing && return closure
+    function lambda(params, e)
+        Expr(:->, Expr(:tuple, params...), body(e, params))
+    end
+    kid_names(kids) = Symbol[_kernel_split_placeholder(k) for k in kids]
+    wholes = Any[lambda(ports[n.own], n.expr) for n in split.nodes]
+    splits = Any[isempty(n.kids) ? nothing :
+                 lambda(vcat(ports[n.direct], kid_names(n.kids)), n.body)
+                 for n in split.nodes]
+    root = lambda(vcat(ports[split.root.direct], kid_names(split.root.kids)),
+                  split.root.body)
+    Expr(:call, GlobalRef(@__MODULE__, :_KernelSplit),
+         Expr(:call, GlobalRef(Base, :Val), QuoteNode(_kernel_split_shape(ports, split))),
+         closure, Expr(:tuple, wholes...), Expr(:tuple, splits...), root)
 end
 
 # The parts of a generator sum as a `_KernelReduction` construction

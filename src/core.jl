@@ -1095,6 +1095,121 @@ end
 @inline (branch::_KernelBranch)(args...) = branch.call(args...)
 
 """
+    _KernelSplit{S}(call, wholes, splits, root)
+
+An authored expression (a fused recipe's right-hand side, or one leaf arm of a
+`_KernelBranch`) whose strict subexpressions read fewer of its arguments than
+their enclosing expression keeps those subexpressions as metadata beside its
+ordinary body. Under some `bound=` binding each could read only bound data
+while the expression around it does not. Calling it runs `call`, the authored
+expression over every argument, so every lowering that treats the enclosing
+`_KernelSourceOp` as opaque is unchanged.
+
+`S` is `(ports, root, nodes)`: the expression's argument names in order, the
+root's `(direct, kids)` and, for each split node in post-order,
+`(own, direct, kids)`. `own` are the argument positions the node's whole
+subexpression reads, `direct` those it reads outside its nested split nodes,
+and `kids` the indices of those nested nodes. `wholes[i]` evaluates node `i`
+from its `own` arguments. `splits[i]` (`nothing` for a node without kids)
+evaluates it from its `direct` arguments followed by its kids' values, and
+`root` evaluates the whole expression from the root's `direct` arguments
+followed by the root kids' values. Plate partial evaluation reads them
+(`_partial_split_recipes`): a node whose arguments are all bound data becomes
+its own recipe there, so preparation evaluates it once per lane.
+"""
+struct _KernelSplit{S,F,W,P,R}
+    call::F
+    wholes::W
+    splits::P
+    root::R
+end
+# Built once per authored recipe, of a new concrete type each time: construct
+# it without compiling its constructor per type, as `_KernelSourceOp` does.
+Base.@nospecializeinfer function _KernelSplit(@nospecialize(spec::Val), @nospecialize(call),
+                                              @nospecialize(wholes::Tuple),
+                                              @nospecialize(splits::Tuple),
+                                              @nospecialize(root))
+    T = _KernelSplit{_val_parameter(spec), typeof(call), typeof(wholes),
+                     typeof(splits), typeof(root)}
+    _kernel_new_instance(T, (call, wholes, splits, root))::_KernelSplit
+end
+_kernel_split_spec(::_KernelSplit{S}) where {S} = S
+# Source readers of the whole expression (destination forms, nonallocating
+# decomposition) read the authored closure the split metadata wraps.
+_kernel_native_source(split::_KernelSplit) = _kernel_native_source(split.call)
+# Forwarded positionally and inlined, as `_KernelSourceFunction` forwards.
+@inline @generated function (split::_KernelSplit)(args::Vararg{Any,N}) where {N}
+    forwarded = [:(getfield(args, $index)) for index in 1:N]
+    :(Base.@inline split.call($(forwarded...)))
+end
+
+"""
+    _KernelSplitApply{P}(split)
+
+A split expression (`_KernelSplit`) evaluated with some of its nodes supplied
+as values: its arguments are the expression's own, followed by one value per
+supplied node. `P` holds the root's kids in order, each `(:value, j)` (the
+`j`-th supplied value), `(:whole, k)` (node `k` from its own arguments) or
+`(:split, k, kids)` (node `k` from its direct arguments and its kids, given
+the same way). Everything else is computed exactly where the authored
+expression computes it, so a lazy arm holding the expression still runs only
+when taken.
+"""
+struct _KernelSplitApply{P,S}
+    split::S
+end
+_KernelSplitApply(::Val{P}, split::S) where {P,S} = _KernelSplitApply{P,S}(split)
+@inline @generated function (apply::_KernelSplitApply{P,S})(args::Vararg{Any,N}) where {P,S,N}
+    ports, root, nodes = S.parameters[1]
+    count = length(ports)
+    arg(i) = :(getfield(args, $i))
+    split = :(getfield(apply, :split))
+    function node(plan)
+        plan[1] === :value && return arg(count + plan[2])
+        k = plan[2]
+        plan[1] === :whole && return :(Base.@inline getfield(getfield($split, :wholes), $k)(
+            $(map(arg, nodes[k][1])...)))
+        :(Base.@inline getfield(getfield($split, :splits), $k)(
+            $(map(arg, nodes[k][2])...), $(map(node, plan[3])...)))
+    end
+    :(Base.@inline getfield($split, :root)($(map(arg, root[1])...), $(map(node, P)...)))
+end
+_kernel_native_source(apply::_KernelSplitApply) = _kernel_native_source(apply.split)
+
+# One arm of a `_KernelBranchCall`: its operation over the arguments at `I`.
+struct _KernelArm{I,F}
+    f::F
+end
+@inline @generated function (arm::_KernelArm{I})(args::Vararg{Any,N}) where {I,N}
+    :(Base.@inline getfield(arm, :f)($((:(getfield(args, $i)) for i in I)...)))
+end
+
+"""
+    _KernelBranchCall{CI,TI,EI,Names}(condition, then_arm, else_arm)
+
+The lazy branch of a `_KernelBranch` whose arms preparation rebuilt: the
+condition over the arguments at `CI`, then exactly one arm through
+`_recurrence_branch` (the native ternary, and a backend's lazy conditional
+region). `Names` are its arguments' names in the recipe's readable source.
+"""
+struct _KernelBranchCall{CI,TI,EI,Names,C,T,E}
+    condition::C
+    then_arm::T
+    else_arm::E
+end
+_KernelBranchCall(::Val{CI}, ::Val{TI}, ::Val{EI}, ::Val{Names}, condition::C,
+                  then_arm::T, else_arm::E) where {CI,TI,EI,Names,C,T,E} =
+    _KernelBranchCall{CI,TI,EI,Names,C,T,E}(condition, then_arm, else_arm)
+@inline @generated function (b::_KernelBranchCall{CI,TI,EI})(args::Vararg{Any,N}) where {CI,TI,EI,N}
+    condition = Any[:(getfield(args, $i)) for i in CI]
+    quote
+        _recurrence_branch(getfield(b, :condition)($(condition...)),
+            _KernelArm{$TI,typeof(getfield(b, :then_arm))}(getfield(b, :then_arm)),
+            _KernelArm{$EI,typeof(getfield(b, :else_arm))}(getfield(b, :else_arm)), args)
+    end
+end
+
+"""
     _KernelReduction{II,XI,KI,AI}(call, iterator, init, step, index, array,
                                    step_in, step_out)
 
