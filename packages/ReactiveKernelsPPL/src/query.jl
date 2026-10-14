@@ -211,7 +211,7 @@ function _latest_value(f::F, query, args::Vararg{Any,N}) where {F,N}
 end
 
 """
-    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false, native_forward_batch = true) -> SamplerQuery
+    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false, native_forward_batch = false) -> SamplerQuery
 
 Prepare a reusable [`SamplerQuery`](@ref): the `:sampler`-cut value kernel
 plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
@@ -239,18 +239,18 @@ It needs a backend that keeps that sweep's values (reverse-mode
 so [`sampler_value_and_gradient!`](@ref) with a `Vector{Float64}` point runs
 compiled code from its first call.
 
-For native reverse-mode `AutoEnzyme`, a pure independent summed plate with at
-most four active coordinates uses one batched forward sweep by default. It
-differentiates the unchanged generated kernel with ordinary Enzyme, including
-priors and coordinate transforms. Wider, effectful, scan, and
-retained-output programs keep the ordinary reverse preparation. Set
-`native_forward_batch = false` to select that reverse path explicitly. The
-forward preparation keeps the reverse operator for traced calls and for a
-later input whose active shape differs from the exemplar.
+The sampler preserves an explicitly requested AD mode. Native forward batching
+is disabled by default. With `AutoEnzyme()` (no explicit mode), the opt-in
+`native_forward_batch = true` may select one batched forward sweep for a pure
+independent summed plate with one to four active coordinates. It differentiates
+the unchanged generated kernel, including priors and transforms. Explicit
+reverse mode, wider, effectful, scan, and retained-output programs keep the
+ordinary reverse preparation. The opt-in forward preparation keeps a reverse
+operator for traced calls and a later input with a different active shape.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
         backend, on_error = nothing, retain::Tuple = (), warm::Bool = false,
-        native_forward_batch::Bool = true)
+        native_forward_batch::Bool = false)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))

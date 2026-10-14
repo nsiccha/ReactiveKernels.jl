@@ -11,7 +11,7 @@ using Test, ReactiveKernelsPPL, ReactiveKernels, DifferentiationInterface, Enzym
         built = build_kernel(plan)
         for forward_batch in (false, true)
             q = prepare_sampler(built, plan, [0.0];
-                backend=AutoEnzyme(; mode=Enzyme.Reverse),
+                backend=forward_batch ? AutoEnzyme() : AutoEnzyme(; mode=Enzyme.Reverse),
                 native_forward_batch=forward_batch)
             gradient = zeros(1)
             for eta in (-1000.0, -100.0, -50.0, -40.0, -20.0, 0.0,
@@ -51,7 +51,8 @@ end
         slope = [yi == 1 ? inv(1 + exp(e)) : -inv(1 + exp(-e)) for (yi,e) in zip(y,eta)]
         expected_gradient = [sum(slope), sum(slope .* x), sum(slope .* z)]
         for forward_batch in (false, true)
-            q = prepare_sampler(built, plan, u; backend,
+            q = prepare_sampler(built, plan, u;
+                backend=forward_batch ? AutoEnzyme() : backend,
                 native_forward_batch=forward_batch)
             gradient = similar(u)
             value, _ = sampler_value_and_gradient!(q, gradient, u)

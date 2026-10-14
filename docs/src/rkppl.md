@@ -925,14 +925,14 @@ constrain(built.layout, u)               # named constrained values
 restore_draws(built.layout, U)           # U: layout.total × draws
 ```
 
-With reverse-mode `AutoEnzyme`, a pure summed plate and one to four active
-coordinates use a batched forward sweep by default. The generated primal is
-unchanged; Enzyme computes the partials in one traversal without a later
-reverse sweep over the observations. Wider, effectful, scan and retained-output
-programs use the ordinary reverse preparation. `native_forward_batch=false`
-selects that reverse path explicitly for comparison or a workload where it
-performs better. The optimized path can allocate more tangent storage, so
-measure both on the model you fit.
+An explicit `AutoEnzyme(mode=Reverse)` always uses reverse mode. Native forward
+batching is disabled by default. To request that optimization explicitly, use
+`AutoEnzyme()` without a mode together with `native_forward_batch=true`.
+For an eligible pure summed plate with one to four active coordinates, Enzyme
+then computes partials in one batched traversal of the unchanged primal.
+Wider, effectful, scan and retained-output programs keep ordinary reverse.
+The optional path can allocate more tangent storage; measure both on the
+model you fit, and identify the mode used when reporting results.
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.

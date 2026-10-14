@@ -288,10 +288,10 @@ ReactiveKernels.ad_retains_primal_sweep(
 # A small active vector can carry one forward tangent lane per coordinate.
 # Enzyme differentiates the *same* native RK callable, so every plate cell,
 # prior, transform, and bound-data read follows its ordinary primal path. This
-# is a scheduling choice, not a derivative rule for a likelihood or operation.
+# changes the AD algorithm and therefore requires an explicit opt-in without
+# an explicit backend mode. It never overrides a requested reverse mode.
 const _FORWARD_BATCH_MODE = Enzyme.set_abi(Enzyme.ForwardWithPrimal, Enzyme.InlineABI)
-const _ReverseAutoEnzyme = ReactiveKernels.DifferentiationInterface.AutoEnzyme{
-    <:Union{Nothing,Enzyme.ReverseMode}}
+const _AutomaticModeEnzyme = ReactiveKernels.DifferentiationInterface.AutoEnzyme{Nothing}
 
 struct _NativeForwardBatchAD{K,R,B}
     reverse::R
@@ -299,7 +299,7 @@ struct _NativeForwardBatchAD{K,R,B}
 end
 
 function ReactiveKernels._native_forward_batch_eligible(
-        ::_ReverseAutoEnzyme, kernel::ReactiveKernels.PreparedKernel,
+        ::_AutomaticModeEnzyme, kernel::ReactiveKernels.PreparedKernel,
         point::Vector{Float64})
     1 <= length(point) <= 4 || return false
     plan = kernel.plan
@@ -326,7 +326,7 @@ end
 
 function ReactiveKernels._prepare_native_forward_batch_ad(
         kernel::ReactiveKernels.PreparedKernel, resolver,
-        backend::_ReverseAutoEnzyme, args::Tuple, kwargs::NamedTuple, active;
+        backend::_AutomaticModeEnzyme, args::Tuple, kwargs::NamedTuple, active;
         retain::Tuple = (), warm::Bool = false)
     isempty(retain) || throw(ArgumentError(
         "native forward batching does not retain further WANT values"))
@@ -350,6 +350,16 @@ function ReactiveKernels._prepare_native_forward_batch_ad(
     warm && Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
         prepared, similar(point), args...; kwargs...)
     prepared
+end
+
+# An optimization hint cannot override an explicitly requested AD mode.
+function ReactiveKernels._prepare_native_forward_batch_ad(
+        kernel::ReactiveKernels.PreparedKernel, resolver,
+        backend::ReactiveKernels.DifferentiationInterface.AutoEnzyme{<:Enzyme.ReverseMode},
+        args::Tuple, kwargs::NamedTuple, active;
+        retain::Tuple = (), warm::Bool = false)
+    ReactiveKernels._prepare_ad(kernel, resolver, backend, args, kwargs, active;
+        retain, warm)
 end
 
 function _forward_batch_value_gradient!(prepared::_NativeForwardBatchAD{K},
