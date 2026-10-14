@@ -183,6 +183,7 @@ export product_mixture_logdensity, bernoulli_product_mixture_logdensity
 export binomial_product_mixture_logdensity
 export bernoulli_logit_product_mixture_logdensity
 export binomial_logit_product_mixture_logdensity
+export hmm_logdensity, normal_hmm_logdensity, exponential_hmm_logdensity
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
@@ -1316,6 +1317,99 @@ end
         sum(cells)
     end
     return product_mixture_logdensity(components, weights)
+end
+
+# Hidden Markov models. The forward algorithm marginalizes the discrete state
+# path of one observed sequence. `log_emissions[t, k]` is the log density of
+# step t's observation under state k. `transition[i, j]` weighs a move from
+# state i to state j (a row-stochastic matrix); a third axis gives the move
+# into step t at index t - 1. `initial[k]` weighs the first state. Weights are
+# used as given, so all-ones initial weights reproduce a forward pass that
+# starts from the bare first emission. Weight arrays broadcast singleton axes.
+#
+# The pass is one history scan over the (step, state) cells: a cell reads the
+# previous step's K cells from the scan's own output, so no step allocates a
+# carried vector (docs/src/scan.md, "Reading earlier outputs"). Each
+# log-sum-exp is a max-shifted generator sum, which runs as an explicit loop.
+@inline _hmm_index(x, axis, i) = size(x, axis) == 1 ? 1 : i
+@inline _hmm_at(x, a, b, c) =
+    x[_hmm_index(x, 1, a), _hmm_index(x, 2, b), _hmm_index(x, 3, c)]
+_hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 && size(x, 1) in (1, a) &&
+    size(x, 2) in (1, b) && size(x, 3) in (1, c)
+
+@kernel hmm_logdensity(log_emissions, transition, initial) = begin
+    K = length(initial)
+    T = size(log_emissions, 1)
+    checked_emissions = K >= 1 && ndims(log_emissions) == 2 &&
+        size(log_emissions, 2) == K ? log_emissions :
+        throw(DimensionMismatch("log emissions must be steps × states, one column per initial weight"))
+    checked_transition = _hmm_broadcasts(transition, K, K, max(T - 1, 1)) ?
+        transition :
+        throw(DimensionMismatch("transition weights must broadcast over states × states × (steps - 1)"))
+    log_transition = log.(checked_transition)
+    log_initial = log.(initial)
+    forward = scan(1:(T * K); init = 0, history = 0.0) do carry, cell, earlier
+        t = (cell - 1) ÷ K + 1
+        j = (cell - 1) % K + 1
+        previous = (t - 2) * K
+        shift = t == 1 ? 0.0 : maximum(earlier[previous + i] for i in 1:K)
+        incoming = t == 1 ? log_initial[j] : isfinite(shift) ?
+            shift + log(sum(exp(earlier[previous + i] - shift +
+                _hmm_at(log_transition, i, j, t - 1)) for i in 1:K; init = 0.0)) :
+            shift
+        (carry, incoming + checked_emissions[t, j])
+    end
+    final_offset = (T - 1) * K
+    final_shift = T == 0 ? 0.0 : maximum(forward[final_offset + k] for k in 1:K)
+    return T == 0 ? 0.0 : isfinite(final_shift) ?
+        final_shift + log(sum(exp(forward[final_offset + k] - final_shift)
+            for k in 1:K; init = 0.0)) :
+        final_shift
+end
+
+# Emission laws observe a vector (one stream) or a steps × streams matrix whose
+# streams are independent given the state. Emission parameters broadcast over
+# states × streams × steps: a per-state vector, a states × streams matrix, or
+# a third axis for parameters that change with the step.
+@kernel normal_hmm_logdensity(observed, locations, scales, transition,
+        initial) = begin
+    K = length(initial)
+    T = size(observed, 1)
+    S = size(observed, 2)
+    checked_observed = ndims(observed) <= 2 ? observed :
+        throw(DimensionMismatch("observations must be a vector or a steps × streams matrix"))
+    checked_locations = _hmm_broadcasts(locations, K, S, T) ? locations :
+        throw(DimensionMismatch("locations must broadcast over states × streams × steps"))
+    checked_scales = _hmm_broadcasts(scales, K, S, T) ? scales :
+        throw(DimensionMismatch("scales must broadcast over states × streams × steps"))
+    cells = plate(1:(T * K * S)) do cell
+        t = (cell - 1) % T + 1
+        k = ((cell - 1) ÷ T) % K + 1
+        s = (cell - 1) ÷ (T * K) + 1
+        normal(_hmm_at(checked_locations, k, s, t),
+            _hmm_at(checked_scales, k, s, t)).logpdf(checked_observed[t, s])
+    end
+    log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
+    return hmm_logdensity(log_emissions, transition, initial)
+end
+
+@kernel exponential_hmm_logdensity(observed, scales, transition,
+        initial) = begin
+    K = length(initial)
+    T = size(observed, 1)
+    S = size(observed, 2)
+    checked_observed = ndims(observed) <= 2 ? observed :
+        throw(DimensionMismatch("observations must be a vector or a steps × streams matrix"))
+    checked_scales = _hmm_broadcasts(scales, K, S, T) ? scales :
+        throw(DimensionMismatch("scales must broadcast over states × streams × steps"))
+    cells = plate(1:(T * K * S)) do cell
+        t = (cell - 1) % T + 1
+        k = ((cell - 1) ÷ T) % K + 1
+        s = (cell - 1) ÷ (T * K) + 1
+        exponential(_hmm_at(checked_scales, k, s, t)).logpdf(checked_observed[t, s])
+    end
+    log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
+    return hmm_logdensity(log_emissions, transition, initial)
 end
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
