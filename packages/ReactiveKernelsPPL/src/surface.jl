@@ -4058,6 +4058,7 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
             push!(plate_defs, lc.args[1])
         end
     end
+    cells = Any[_categorical_plate_cell(c, plate_defs, data) for c in cells]
     # A cell reading a value that holds one array per index computes an
     # array per index too: its outputs and locals are such values for
     # later plates and definitions.
@@ -4098,6 +4099,22 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
             params, pidx)...)
     end
     return out, ctx, params
+end
+
+# A named simplex keeps the optimized shared-Categorical response. An
+# expression computes a probability vector in each plate cell; route it
+# through the observed sampling-RHS path so the computation stays in RK.
+function _categorical_plate_cell(c, plate_defs::Set{Symbol}, data::Set{Symbol})
+    c isa Expr && (_is_sample(c) || _is_broadcast_sample(c)) || return c
+    lhs = c.args[2]
+    Meta.isexpr(lhs, :ref) && lhs.args[1] in data || return c
+    rhs = c.args[3]
+    Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :Categorical &&
+        rhs.args[2] isa Symbol && rhs.args[2] ∉ plate_defs && return c
+    Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :Categorical || return c
+    density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
+        GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), rhs.args[2])
+    return Expr(:call, c.args[1], c.args[2], density)
 end
 
 # Partial observation loops compute their arguments inside retained RK cells.
@@ -4926,6 +4943,10 @@ function _plate_column_expr(nm::Symbol, call::Expr,
                 base, gatherindices = X, Any[iscodeidx(a) ? a : rw(a) for a in idx]
                 for j in eachindex(idx)
                     iscodeidx(idx[j]) || continue
+                    if !_is_levels_dim(d[j])
+                        gatherindices[j] = rw(idx[j])
+                        continue
+                    end
                     gatherindices[j] = code(idx[j], d[j], X, j)
                     if _levels_subset(d[j]) !== Colon()
                         zero = length(d) == 1 ? 0.0 :
@@ -5315,6 +5336,7 @@ function _dotify_cell(ex::Expr, ivar, pidx, object::Bool)
             per |= pa
         end
         f isa Symbol || return (Expr(:call, f, args...), per)
+        f === :Categorical && object && return (Expr(:call, f, args...), per)
         dotted = startswith(string(f), ".")
         (dotted || !(per || object && _cell_object_call(f))) &&
             return (Expr(:call, f, args...), per)

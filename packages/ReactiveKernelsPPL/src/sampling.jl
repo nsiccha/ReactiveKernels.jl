@@ -31,6 +31,18 @@ end
 LogDensity(f, args...; kwargs...) = LogDensity(f, args, (;kwargs...), Val(:packed))
 sampling_logdensity(d::LogDensity, value) = d.f(value, d.args...; d.kwargs...)
 
+# A categorical probability vector computed in a plate cell is an ordinary
+# sampling RHS. Keep its matrix product or gather in the RK graph; only the
+# scalar observation lookup belongs in this density.
+function _ppl_categorical_logdensity(value::Integer, probabilities::AbstractVector)
+    all(p -> p >= zero(p), probabilities) &&
+        isapprox(sum(probabilities), one(eltype(probabilities))) ||
+        throw(DomainError(probabilities,
+            "categorical probabilities must be nonnegative and sum to one"))
+    1 <= value <= length(probabilities) || return -Inf
+    return log(probabilities[value])
+end
+
 """
     ParameterGeometry(shape, unconstrained; support, constrain, unconstrain,
                       logjac, coordinate_names=nothing)
