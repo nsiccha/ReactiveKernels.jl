@@ -951,7 +951,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         (input in data || _mentions_symbol(ast, input)) &&
             _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
     end
-    sample, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
+    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
         _partition_statements(ast, data; array_entries)
     sample, det = _rewrite_plate_rows(sample, det)
     # Latent plates over values read their cell count as bound data.
@@ -976,6 +976,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     det = _hoist_prior_args!(sample, det, data, plate_specs;
         resolve = a -> _resolve_module_calls(a, mod, model_names,
             "prior argument `$(repr(a))`"))
+    det = _hoist_prior_args!(factors, det, data, plate_specs;
+        factor_names = Set(s.lhs for s in factors),
+        resolve = a -> _resolve_module_calls(a, mod, model_names,
+            "factor argument `$(repr(a))`"))
     det = _hoist_data_gather_indices!(sample, det, data,
         union(model_names, _expr_names(ast));
         resolve = a -> _resolve_module_calls(a, mod, model_names,
@@ -1143,8 +1147,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         canonmap[nm] = _canonical_expr(rhs, data, detmap, detshape, shape_env,
             "definition `$nm = $(repr(rhs))`")
     end
-    declaration_dependencies = _declaration_dependencies(sample, plate_specs,
+    declaration_dependencies = _declaration_dependencies(vcat(sample, factors), plate_specs,
         union(data, derived_response_names), canonmap)
+    union!(declaration_dependencies, (s.lhs for s in factors))
     declaration_data = Set{Symbol}(nm for nm in declaration_dependencies
         if haskey(canonmap, nm) && _data_only(canonmap[nm], data, canonmap))
     # Design matrices leave `det` for the plan-level table (validated
@@ -1307,6 +1312,20 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     union!(paramsyms, declared_syms)
     prepend!(dirichlets, declared_vectors)
     prepend!(arrays, declared_arrays)
+    factor_params = SampledParameter[]
+    for s in factors
+        detshape[s.lhs] === :scalar || _sfail(
+            "deterministic density factor $(s.lhs) needs a scalar definition; " *
+            "use `.~` to observe a data-derived vector")
+        _external_rhs(s.rhs) && _sfail(
+            "deterministic density factor $(s.lhs) needs an admitted scalar distribution")
+        p = _lower_parameter(s.lhs, s.rhs, owned_coefs, ctx.matrices)
+        push!(factor_params, p)
+        push!(paramsyms, p.name)
+        for v in (values(p.args)..., _support_args(p.support_override)...)
+            union!(paramsyms, _value_symbols(v))
+        end
+    end
     # Declaration order is independent of which values the optimizer used.
     declaration_order = Dict(s.lhs => i for (i, s) in enumerate(sample))
     sort!(arrays; by = p -> declaration_order[p.name])
@@ -1514,7 +1533,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
             if k in indexed_observations || k in indexed_external),
-        named_values)
+        named_values, factors = factor_params)
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -3198,6 +3217,7 @@ end
 function _partition_statements(ast::Expr, data::Set{Symbol};
         array_entries::Set{Symbol} = Set{Symbol}())
     sample = SampleStmt[]
+    factors = SampleStmt[]
     det = Pair{Symbol,Any}[]
     scans = ScanSpec[]
     joints = JointSampleStmt[]
@@ -3208,6 +3228,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
     # Definitions observed by a `.~` response (derived responses —
     # either statement order; the double-observation guard).
     derived_observed = Set{Symbol}()
+    factored = Set{Symbol}()
     seen_doc = false
     line = 0
     cell_broadcasts = Dict{Symbol,Vector{Symbol}}()
@@ -3355,6 +3376,14 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
             lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde,
                 derived_range ? union(data, (st.args[2].args[1],)) : data,
                 level_bindings)
+            if !bc && st.args[2] isa Symbol && lhs in detnames && lhs ∉ data
+                lhs in factored && _sfail(
+                    "deterministic density factor $lhs is stated twice")
+                push!(factored, lhs)
+                _reject_target(st.args[3], lhs)
+                push!(factors, SampleStmt(lhs, st.args[3], false))
+                continue
+            end
             if bc && (st.args[2] isa Symbol || derived_range)
                 # A derived response observes an existing deterministic
                 # definition (`ly = log.(earn)` then `ly .~ ...`) instead
@@ -3400,7 +3429,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
             _reject_statement(st)
         end
     end
-    return sample, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts
+    return sample, factors, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
@@ -11184,7 +11213,7 @@ what the same expression bound to a name would. Rewrites `sample` and
 `plate_specs` in place (both fresh from `_partition_statements`) and
 returns the extended definition list."""
 function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
-        plate_specs; resolve = identity)
+        plate_specs; resolve = identity, factor_names = Set{Symbol}())
     detmap = Dict{Symbol,Any}(nm => rhs for (nm, rhs) in det)
     detnames = Set{Symbol}(keys(detmap))
     taken = union(data, detnames, Set{Symbol}(s.lhs for s in sample),
@@ -11333,7 +11362,7 @@ function _hoist_prior_args!(sample::Vector{SampleStmt}, det, data::Set{Symbol},
             new === args && continue
             rhs = Expr(:., rhs.args[1], Expr(:tuple, new...))
         else
-            s.lhs in detnames && continue
+            s.lhs in detnames && s.lhs ∉ factor_names && continue
             rhs = hoist_call(s.lhs, rhs)
         end
         rhs === s.rhs && continue

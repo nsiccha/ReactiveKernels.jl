@@ -209,8 +209,10 @@ per-position storage in a borrowed reader. A source recipe of any other shape,
 one whose source captures a local variable, or one prepared with
 `on_error = :ignore` keeps its ordinary call; such recipes, opaque functions,
 concatenations and matrix products allocate as they do in the scalar kernel.
-A reduction such as `minimum(rel)` reads its argument's buffer; it is not fused
-into the producing loop.
+A reduction usually reads its argument's buffer. Eligible terminal minima
+of an init-including scan and its dotted transforms instead stream through
+the scan loop; see [scans](scan.md). Those trajectories and transformed
+vectors need no lane buffers.
 
 By default every call owns fresh stacked output arrays, including record
 leaves. Later calls cannot change retained results. To consume bounded batches
