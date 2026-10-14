@@ -112,3 +112,96 @@ _cat_q(built, bound, query, u) =
     @test_throws BoundsError _cat_q(outside_built, outside_bound,
         :likelihood, zeros(length(coordinate_names(outside_built.layout))))
 end
+
+# Counts how often a model computes a categorical probability vector.
+const _CATEGORICAL_EVALUATIONS = Ref(0)
+_counted_mix(P, t) = (_CATEGORICAL_EVALUATIONS[] += 1; P * t)
+
+@testset "computed categorical vectors: one per key, one check per vector" begin
+    prior = quote
+        eachcol(theta[1:2, 1:M]) .~ Dirichlet(ones(2))
+        eachcol(phi[1:V, 1:2]) .~ Dirichlet(ones(V))
+    end
+    model(cell) = Expr(:block, prior.args..., cell)
+    # A word reads its document only through doc[i], so every word of one
+    # document scores the same vector: it is computed once per document.
+    keyed = model(:(@plate for i in eachindex(w)
+        w[i] ~ Categorical(_counted_mix(phi, theta[:, doc[i]]))
+    end))
+    # Reading the index through two columns keeps one vector per word.
+    two_keys = model(:(@plate for i in eachindex(w)
+        w[i] ~ Categorical(_counted_mix(phi,
+            0.5 .* theta[:, doc[i]] .+ 0.5 .* theta[:, alt[i]]))
+    end))
+    data = (; M=3, V=3, doc=[2, 1, 2, 3, 2, 1, 3], alt=[1, 1, 3, 2, 2, 3, 1],
+        w=[1, 3, 2, 2, 3, 1, 1])
+    u = [0.2, -0.3, 0.1, -0.2, 0.3, -0.4, 0.15, 0.05, -0.1]
+    for (ast, location, evaluations) in ((keyed, (q, i) -> q.theta[:, data.doc[i]], 3),
+            (two_keys, (q, i) -> 0.5 .* q.theta[:, data.doc[i]] .+
+                0.5 .* q.theta[:, data.alt[i]], length(data.w)))
+        saved = deepcopy(data)
+        bound = bind_data(lower_rkppl(ast, data; conditioned=(:w,),
+            mod=@__MODULE__), data)
+        built = build_kernel(bound)
+        q = constrain(built.layout, u)
+        oracle = [logpdf(Categorical(q.phi * location(q, i)), y)
+            for (i, y) in enumerate(data.w)]
+        likelihood = prepare_query(built, bound, :likelihood)
+        Base.invokelatest(likelihood, u)
+        _CATEGORICAL_EVALUATIONS[] = 0
+        @test Base.invokelatest(likelihood, u) ≈ sum(oracle) atol=1e-12
+        @test _CATEGORICAL_EVALUATIONS[] == evaluations
+        @test _cat_q(built, bound, :pointwise, u).w ≈ oracle atol=1e-12
+        sampler = prepare_sampler(built, bound, u;
+            backend=DifferentiationInterface.AutoEnzyme(; mode=Enzyme.Reverse))
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        direct = v -> _cat_q(built, bound, :sampler, v)
+        finite_difference = map(eachindex(u)) do j
+            plus, minus = copy(u), copy(u)
+            plus[j] += 1e-5
+            minus[j] -= 1e-5
+            (direct(plus) - direct(minus)) / 2e-5
+        end
+        @test value ≈ direct(u) atol=1e-12
+        @test gradient ≈ finite_difference atol=2e-6 rtol=2e-5
+        @test data == saved
+    end
+
+    # refused: probabilities summing to 0.5 define no categorical law; the
+    # check runs once per computed vector, and still runs (dev §1).
+    halved = model(:(@plate for i in eachindex(w)
+        w[i] ~ Categorical(0.5 .* (phi * theta[:, doc[i]]))
+    end))
+    halved_bound = bind_data(lower_rkppl(halved, data; conditioned=(:w,)), data)
+    @test_throws DomainError _cat_q(build_kernel(halved_bound), halved_bound,
+        :likelihood, u)
+
+    # A document's words share its vector, checked once for all of them.
+    document = model(:(@plate for m in eachindex(words)
+        words[m] .~ Categorical(phi * theta[:, m])
+    end))
+    halved_document = model(:(@plate for m in eachindex(words)
+        words[m] .~ Categorical(0.5 .* (phi * theta[:, m]))
+    end))
+    words = [[1, 3], [2, 2, 3], Int[]]
+    document_data = (; M=3, V=3, words)
+    document_bound = bind_data(lower_rkppl(document, document_data;
+        conditioned=(:words,)), document_data)
+    document_built = build_kernel(document_bound)
+    q = constrain(document_built.layout, u)
+    @test _cat_q(document_built, document_bound, :likelihood, u) ≈
+        sum(logpdf(Categorical(q.phi * q.theta[:, m]), y)
+            for (m, ys) in enumerate(words) for y in ys) atol=1e-12
+    halved_document_bound = bind_data(lower_rkppl(halved_document,
+        document_data; conditioned=(:words,)), document_data)
+    @test_throws DomainError _cat_q(build_kernel(halved_document_bound),
+        halved_document_bound, :likelihood, u)
+
+    # No words: no vectors, zero likelihood.
+    empty_data = (; M=3, V=3, doc=Int[], w=Int[])
+    empty_bound = bind_data(lower_rkppl(keyed, empty_data; conditioned=(:w,),
+        mod=@__MODULE__), empty_data)
+    _CATEGORICAL_EVALUATIONS[] = 0
+    @test _cat_q(build_kernel(empty_bound), empty_bound, :likelihood, u) == 0
+    @test _CATEGORICAL_EVALUATIONS[] == 0
+end
