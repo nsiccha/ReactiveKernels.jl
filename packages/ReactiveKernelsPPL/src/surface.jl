@@ -5025,7 +5025,8 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
             _plate_param_range(col, rkind, data), line))
         return Expr[]
     end
-    bares = _cell_bares(obj, ivar, data)
+    bares = _cell_bares(obj, ivar, data;
+        whole_arguments = _external_rhs(obj) && Meta.isexpr(obj, :call))
     setdiff!(bares, plate_defs)
     push!(ctx, (col, line, bares))
     (obj isa Expr && (obj.head === :call || obj.head === :.) || _external_rhs(obj)) || _sfail(
@@ -5130,9 +5131,16 @@ end
 # discipline on the way: refs are exactly `v[i]` or a gather `v[g[i]]`
 # through a data index column `g`, and `i` appears only as an index.
 # Function heads and kw names are positions, not refs.
-function _cell_bares(ex, ivar, data::Set{Symbol})
+function _cell_bares(ex, ivar, data::Set{Symbol}; whole_arguments::Bool = false)
     bares = Set{Symbol}()
-    _cell_bares!(ex, ivar, bares, data)
+    if whole_arguments
+        for argument in ex.args[2:end]
+            _expr_has_sym(argument, ivar) || continue
+            _cell_bares!(argument, ivar, bares, data)
+        end
+    else
+        _cell_bares!(ex, ivar, bares, data)
+    end
     return bares
 end
 
@@ -5236,7 +5244,7 @@ _cell_object_call(f::Symbol) =
     isuppercase(first(string(f))) || f in _CELL_OBJECT_WRAPPERS
 _cell_object_call(f) = false
 
-_cell_whole_call(f::Symbol) = f in REDUCTION_FNS || f in _WHOLE_READ_FNS ||
+_cell_whole_call(f::Symbol) = f === :Ref || f in REDUCTION_FNS || f in _WHOLE_READ_FNS ||
     (!_builtin_value_head(f) && !_cell_object_call(f))
 _cell_whole_call(f::GlobalRef) = !_cell_object_call(f.name)
 _cell_whole_call(f::Expr) = f.head === :. && length(f.args) == 2 &&

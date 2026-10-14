@@ -5,6 +5,12 @@ using ReactiveKernelsPPL
 import Distributions
 normal_shared(p::AbstractVector, x::Real) = Distributions.Normal(sum(p)+x, 1.0)
 normal_scalar(p::Real, x::Real) = Distributions.Normal(p+x, 1.0)
+struct SharedNormal{P,X}
+    parameters::P
+    offset::X
+end
+ReactiveKernelsPPL.sampling_logdensity(d::SharedNormal, y) =
+    Distributions.logpdf(normal_shared(d.parameters, d.offset), y)
 const MIXED = @rkppl begin
     beta[1:3] .~ Normal.(0,1)
     @plate for i in eachindex(y)
@@ -21,6 +27,12 @@ const SELECTED = @rkppl begin
     beta[1:3] .~ Normal.(0,1)
     @plate for i in 2:3
         y[i] ~ normal_shared(beta,x[i])
+    end
+end
+const TYPE_CONSTRUCTOR = @rkppl begin
+    beta[1:3] .~ Normal.(0,1)
+    @plate for i in eachindex(y)
+        y[i] ~ SharedNormal(beta[1:2],x[i])
     end
 end
 const GROUPED = @rkppl begin
@@ -99,6 +111,8 @@ end
     _argument_sharing_check("shared",F.SHARED,(;),[0.2,0.6],:shared)
     _argument_sharing_check("dotted",F.DOTTED,(;x=[-0.2,0.3,0.4]),[0.2,0.6,0.1],:dotted)
     _argument_sharing_check("prefix",F.MIXED,(;x=[-0.2,0.3,0.4]),[0.2,0.6],:mixed)
+    _argument_sharing_check("type-constructor",F.TYPE_CONSTRUCTOR,
+        (;x=[-0.2,0.3]),[0.2,0.6],:mixed,2)
     _argument_sharing_check("selected",F.SELECTED,(;x=[100.0,0.3,0.4,200.0]),
         [300.0,0.6,0.1,400.0],:mixed;indices=2:3)
     # An authored x[i] is an indexed read, not a broadcastable singleton.
