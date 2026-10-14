@@ -152,15 +152,14 @@ function _program_identity(def)
     return rename(def)
 end
 
-# The source surface admits ordinary dotted arithmetic, but an opaque array
+# The source surface admits ordinary dotted scalar math, but an opaque array
 # assignment hides each producer from RK's plate-to-plate reduction fusion.
 # Restrict this emission to one-based Float64 or built-in integer vectors with
-# a known common length and their scalar operands. Every operand is read once, the arithmetic is
-# pure, and Julia's scalar operations and broadcast axes are then identical
-# to the original dotted tree. Other ranks, axes and callable leaves retain
-# their exact authored expression.
+# a known common length and their scalar operands. Every operand is read once;
+# the listed scalar operations and broadcast axes match the dotted tree.
+# Other ranks, axes and callable leaves retain their exact authored expression.
 const _POINTWISE_ARITHMETIC = Dict(Symbol(".+") => :+, Symbol(".-") => :-,
-    Symbol(".*") => :*, Symbol("./") => :/)
+    Symbol(".*") => :*, Symbol("./") => :/, Symbol(".^") => :^)
 
 struct _PointwiseValue
     rank::Int                         # -1 unknown, 0 scalar, 1 vector
@@ -214,6 +213,13 @@ end
 function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
     if ex isa Symbol && haskey(gathers, ex)
         return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers)
+    end
+    if Meta.isexpr(ex, :., 2) && ex.args[1] === :exp &&
+            Meta.isexpr(ex.args[2], :tuple, 1)
+        term, state = _pointwise_tree!(inputs, formals, only(ex.args[2].args),
+            values, columns, gathers)
+        state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
+        return Expr(:call, :exp, term), state
     end
     if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
             haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&

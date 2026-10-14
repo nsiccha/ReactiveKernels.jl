@@ -292,6 +292,7 @@ const _PPL_TEST_FILES = (
     "test_glm_object_values.jl",
     "test_native_plain_plate_emission.jl",
     "test_pointwise_arithmetic_emission.jl",
+    "test_pointwise_nonlinear_reactant.jl",
     "test_native_forward_batch_ad.jl",
     "test_glm_object_values_reactant.jl",
     "test_sampler_retained.jl",
