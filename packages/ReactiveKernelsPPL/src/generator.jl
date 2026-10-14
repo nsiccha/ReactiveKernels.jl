@@ -62,6 +62,7 @@ Pure (no eval): the generator tests inspect and evaluate it.
 function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
     def = Base.invokelatest(_kernel_expr_latest, plan, layout; name)
     def = _elide_named_location_aliases(plan, def)
+    def = _pointwise_arithmetic_plates(plan, def)
     return _name_plate_cells(def, _location_value_aliases(plan, def))
 end
 
@@ -149,6 +150,170 @@ function _program_identity(def)
     rename(x::Expr) = Expr(x.head, Any[rename(a) for a in x.args]...)
     rename(x) = x
     return rename(def)
+end
+
+# The source surface admits ordinary dotted arithmetic, but an opaque array
+# assignment hides each producer from RK's plate-to-plate reduction fusion.
+# Restrict this emission to one-based Float64 vectors with a known common
+# length and Float64 scalars. Every operand is read once, the arithmetic is
+# pure, and Julia's scalar operations and broadcast axes are then identical
+# to the original dotted tree. Other ranks, axes and callable leaves retain
+# their exact authored expression.
+const _POINTWISE_ARITHMETIC = Dict(Symbol(".+") => :+, Symbol(".-") => :-,
+    Symbol(".*") => :*, Symbol("./") => :/)
+
+struct _PointwiseValue
+    rank::Int                         # -1 unknown, 0 scalar, 1 vector
+    length::Int                       # known vector length, else 0
+    live::Bool                        # reads a sampled value
+    generated::Bool                   # array was made inside this program
+end
+const _POINTWISE_UNKNOWN = _PointwiseValue(-1, 0, false, false)
+
+function _pointwise_leaf(ex, values::Dict{Symbol,_PointwiseValue})
+    ex isa Symbol && return get(values, ex, _POINTWISE_UNKNOWN)
+    ex isa Float64 && return _PointwiseValue(0, 0, false, false)
+    ex isa Integer && return _PointwiseValue(0, 0, false, false)
+    if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
+            ex.args[2] isa Integer
+        base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
+        base.rank == 1 && return _PointwiseValue(0, 0, base.live, false)
+    end
+    return _POINTWISE_UNKNOWN
+end
+
+function _pointwise_tree!(inputs, formals, ex, values)
+    if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+            haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
+            length(ex.args) in (2, 3)
+        terms = Any[]
+        states = _PointwiseValue[]
+        for a in ex.args[2:end]
+            term, state = _pointwise_tree!(inputs, formals, a, values)
+            state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
+            push!(terms, term)
+            push!(states, state)
+        end
+        lens = unique!([s.length for s in states if s.rank == 1])
+        length(lens) <= 1 || return nothing, _POINTWISE_UNKNOWN
+        rank = isempty(lens) ? 0 : 1
+        return Expr(:call, _POINTWISE_ARITHMETIC[ex.args[1]], terms...),
+            _PointwiseValue(rank, rank == 1 ? only(lens) : 0,
+                any(s.live for s in states), rank == 1)
+    end
+    state = _pointwise_leaf(ex, values)
+    state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
+    ex isa Number && return ex, state
+    i = findfirst(x -> isequal(x, ex), inputs)
+    if i === nothing
+        push!(inputs, ex)
+        push!(formals, Symbol(:_ppl_c, length(formals) + 1))
+        i = length(inputs)
+    end
+    return formals[i], state
+end
+
+function _pointwise_rhs(ex, values)
+    inputs, formals = Any[], Symbol[]
+    body, state = _pointwise_tree!(inputs, formals, ex, values)
+    state.rank == 1 && state.live || return ex, state
+    plate = Expr(:do, Expr(:call, :plate, inputs...),
+        Expr(:->, Expr(:tuple, formals...), Expr(:block, body)))
+    named = _name_plate_cell(plate, (_, input) -> input isa Symbol ? input :
+        Meta.isexpr(input, :ref, 2) ? Symbol(input.args[1], :_, input.args[2]) :
+        :value)
+    return named, state
+end
+
+_pointwise_occurrences(ex, name) = ex === name ? 1 :
+    ex isa Expr ? sum(_pointwise_occurrences(a, name) for a in ex.args; init = 0) : 0
+
+_pointwise_pure_tree(ex::Union{Symbol,Real}) = true
+function _pointwise_pure_tree(ex::Expr)
+    if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+            haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
+            length(ex.args) in (2, 3)
+        return all(_pointwise_pure_tree, ex.args[2:end])
+    end
+    return Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
+        ex.args[2] isa Integer
+end
+_pointwise_pure_tree(ex) = false
+
+function _pointwise_single_arithmetic_use(stmts, name)
+    uses = Any[]
+    for st in stmts
+        rhs = Meta.isexpr(st, :(=), 2) ? st.args[2] : st
+        n = _pointwise_occurrences(rhs, name)
+        n == 0 && continue
+        n == 1 && Meta.isexpr(st, :(=), 2) || return false
+        push!(uses, rhs)
+    end
+    length(uses) == 1 || return false
+    rhs = only(uses)
+    _pointwise_occurrences(rhs, name) == 1 || return false
+    return Meta.isexpr(rhs, :call) && _pointwise_pure_tree(rhs)
+end
+
+function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
+    stmts = def.args[2].args
+    values = Dict{Symbol,_PointwiseValue}()
+    for (name, value) in plan.columns
+        if value isa Vector{Float64} && axes(value, 1) == Base.OneTo(length(value))
+            values[name] = _PointwiseValue(1, length(value), false, false)
+        elseif value isa Float64 || value isa Integer
+            values[name] = _PointwiseValue(0, 0, false, false)
+        end
+    end
+    for st in stmts
+        Meta.isexpr(st, :(=), 2) || continue
+        lhs, rhs = st.args
+        name = Meta.isexpr(lhs, :(::), 2) ? lhs.args[1] : lhs
+        name isa Symbol || continue
+        declared = Meta.isexpr(lhs, :(::), 2) ? lhs.args[2] : nothing
+        if declared === :Float64
+            values[name] = _PointwiseValue(0, 0, true, false)
+            continue
+        elseif Meta.isexpr(declared, :curly) &&
+                declared.args == Any[:AbstractVector, :Float64]
+            dims = _value_axes(plan, name; data_axes = true)
+            if dims !== nothing && length(dims) == 1 && only(dims) isa Int
+                values[name] = _PointwiseValue(1, only(dims), true, false)
+            else
+                delete!(values, name)
+            end
+            continue
+        end
+        if Meta.isexpr(rhs, :ref, 2) && startswith(String(name), "_rkppl_synth_") &&
+                rhs.args[1] isa Symbol && rhs.args[2] isa Symbol
+            base = get(values, rhs.args[1], _POINTWISE_UNKNOWN)
+            idx = get(plan.columns, rhs.args[2], nothing)
+            if base.rank == 1 && base.generated && base.live &&
+                    idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
+                    axes(idx, 1) == Base.OneTo(length(idx)) &&
+                    _pointwise_single_arithmetic_use(stmts, name)
+                st.args[2] = :(ReactiveKernels._tensorized_view($(rhs.args...)))
+                values[name] = _PointwiseValue(1, length(idx), base.live, false)
+                continue
+            end
+        end
+        if Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
+                haskey(_POINTWISE_ARITHMETIC, rhs.args[1])
+            candidate, state = _pointwise_rhs(rhs, values)
+            if state.rank >= 0
+                values[name] = _PointwiseValue(state.rank, state.length,
+                    state.live, state.rank == 1)
+            else
+                delete!(values, name)
+            end
+            st.args[2] = candidate
+        elseif rhs isa Symbol && haskey(values, rhs)
+            values[name] = values[rhs]
+        else
+            delete!(values, name)
+        end
+    end
+    return def
 end
 
 # Conditioning selects the same declaration-density graph as a prior. Its
