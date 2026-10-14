@@ -136,10 +136,45 @@ function preprocessing_recipes(plan::StructuralPlan)
 end
 
 # A pure affine predictor can read its data columns in the observation cell.
-# Only bound, one-based vectors with the observation extent qualify. Keep
+# Bound vectors and simple derived numeric maps over them have the observation
+# extent and one-based axes. Keep
 # wider designs on the matrix path: their BLAS product can beat a scalar
 # reverse pass through a long plate cell. The coefficient block still owns
 # every scalar coordinate and its prior.
+const _FUSABLE_DOT_OPS = Dict(Symbol(".+") => :+, Symbol(".-") => :-,
+    Symbol(".*") => :*, Symbol("./") => :/, Symbol(".^") => :^)
+
+function _dotted_numeric_parts(ex)
+    if Meta.isexpr(ex, :call, 3)
+        op = get(_FUSABLE_DOT_OPS, ex.args[1], nothing)
+        op === nothing || return (op, ex.args[2:3])
+    elseif Meta.isexpr(ex, :., 2) && ex.args[1] in values(_FUSABLE_DOT_OPS) &&
+            Meta.isexpr(ex.args[2], :tuple, 2)
+        return (ex.args[1], ex.args[2].args)
+    end
+    return nothing
+end
+
+function _fusable_derived_column(plan::StructuralPlan, name::Symbol)
+    i = findfirst(d -> d.name === name, plan.derived)
+    i === nothing && return false
+    ex = plan.derived[i].expr
+    parts = _dotted_numeric_parts(ex)
+    parts === nothing && return false
+    _, args = parts
+    any(args) do arg
+        arg isa Symbol || return false
+        col = get(plan.columns, arg, nothing)
+        col isa Vector{<:Number} && axes(col) == (Base.OneTo(plan.n_obs),)
+    end || return false
+    all(args) do arg
+        _value_axes(plan, arg; data_axes = true) == Any[] && return true
+        arg isa Symbol || return false
+        col = get(plan.columns, arg, nothing)
+        col isa Vector{<:Number} && axes(col) == (Base.OneTo(plan.n_obs),)
+    end
+end
+
 function _scalar_column_plate_eligible(plan::StructuralPlan, pred::PredictorSpec,
         shape::DesignShape)
     _uses_structured_observation_axes(plan) && return false
@@ -152,7 +187,9 @@ function _scalar_column_plate_eligible(plan::StructuralPlan, pred::PredictorSpec
         b.kind === InterceptTerm && return true
         b.kind === ContinuousTerm || return false
         col = get(plan.columns, b.column, nothing)
-        return col isa Vector{<:Number} && axes(col) == (Base.OneTo(plan.n_obs),)
+        return (col isa Vector{<:Number} &&
+            axes(col) == (Base.OneTo(plan.n_obs),)) ||
+            _fusable_derived_column(plan, b.column)
     end
 end
 
