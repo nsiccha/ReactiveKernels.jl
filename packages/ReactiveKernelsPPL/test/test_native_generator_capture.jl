@@ -40,9 +40,13 @@ const _NGC = NativeGeneratorCaptureRepro
                 println("UNSUPPORTED PPL ", reader, ": ", nameof(typeof(err)))
                 nothing
             end
-            if reader in (:ordinary_reader, :prepared_reader)
+            if reader in (:ordinary_reader, :prepared_reader, :inline_collect_reader)
                 # Valid authored Julia shape awaiting the upstream capability;
                 # never an admission refusal or a substitute AD configuration.
+                # RKPPL passes `b` as a reshaped view of the sampler
+                # coordinates; the inline-collect control differentiates a
+                # `Matrix` or a plain view but not a reshaped view
+                # (Enzyme 0.13.210 and 0.13.216; decision 0lmzc6p).
                 @test_broken result !== nothing && result[1] ≈ expected_value &&
                     g ≈ expected_gradient
             else

@@ -487,9 +487,13 @@ and lock the one Reactant 0.2.289 lifted:
   call-site-inlined `collect`, and a fresh-buffer runtime loop pass ordinary
   reverse for Float32 and Float64, including empty inputs. A typed
   comprehension performs Julia's ordinary element conversion, so it is only
-  an equivalent control when that element type is intended. PPL's ordinary
-  and array-bearing prepared-input readers keep their authored primal and
-  remain native reverse capability gaps in `test_native_generator_capture.jl`.
+  an equivalent control when that element type is intended. The
+  call-site-inlined `collect` holds only for a `Matrix` or a plain view: with
+  a reshaped view of a vector, which is how RKPPL passes a declared two-axis
+  real array, Enzyme 0.13.210 and 0.13.216 reject it the same way. PPL's
+  ordinary, inline-collect and array-bearing prepared-input readers keep
+  their authored primal and remain native reverse capability gaps in
+  `test_native_generator_capture.jl`.
   No consumer function, activity configuration or derivative rule is replaced.
   A six-line isolated Enzyme compiler prototype marks
   `Base.collect(::Generator)` for inlining before activity analysis and makes
