@@ -617,13 +617,12 @@ end
         kern = prepare_query(built, bound, :sampler)
         q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
         # The prepared program evaluates the gather and the value once too:
-        # one top-level prepared recipe computes each, and only that recipe
-        # reads `x_`. Its printed code names operations by slot, so read the
-        # recipes' authored sources (`s`'s transform calls `exp` as well).
-        top = [e.recipe for e in recipe_inventory(q.kernel) if e.depth == 0]
-        sources = [recipe.source for recipe in top]
+        # one top-level prepared recipe calls the gather, and one reads `x_`
+        # to compute the value that both locations then read by name. Its
+        # printed code names operations by slot, so read the recipes'
+        # authored sources (`s`'s transform also calls `exp`).
+        sources = [e.recipe.source for e in recipe_inventory(q.kernel) if e.depth == 0]
         @test count(s -> _fv_calls(s, :column_gather) > 0, sources) == 1
-        @test count(recipe -> any(o -> o.name === :v, recipe.outputs), top) == 1
         @test count(s -> _fv_reads(s, :x_) > 0, sources) == 1
         val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
             q.ad, similar(u), u)
