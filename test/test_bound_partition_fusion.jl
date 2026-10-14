@@ -62,8 +62,12 @@ end
 
     cache = PreparationCache()
     first_mask = prepare!(cache, C.chain; bound = (; y))
+    entry = only(values(cache.bound))
+    fused = only(values(entry.fused))
     second_y = reverse(y)
     second_mask = prepare!(cache, C.chain; bound = (; y = second_y))
+    @test only(values(entry.fused)) === fused
+    @test count(r -> r.op isa RK._AuthoredPlateOp, fused) == 1
     @test first_mask(x, q) ≈ reference(x)
     @test second_mask(x, q) ≈ sum(yi ? (xi + q[1])^2 : -(xi + q[1])
                                   for (xi, yi) in zip(x, second_y))
