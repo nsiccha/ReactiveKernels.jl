@@ -3928,12 +3928,14 @@ end
 @inline function _replicated_store!(destination::Tuple, index, value::Tuple)
     length(destination) == length(value) || throw(ArgumentError(
         "position outputs must have the same tuple length"))
-    map((out, item) -> _replicated_store!(out, index, item), destination, value)
+    foreach((out, item) -> _replicated_store!(out, index, item), destination, value)
+    destination
 end
 @inline function _replicated_store!(destination::NamedTuple{K}, index,
                                     value::NamedTuple{L}) where {K,L}
     K == L || throw(ArgumentError("position outputs must have the same record fields"))
-    map((out, item) -> _replicated_store!(out, index, item), destination, value)
+    foreach((out, item) -> _replicated_store!(out, index, item), destination, value)
+    destination
 end
 @inline _replicated_output(value::Number, replica_count) =
     Vector{typeof(value)}(undef, replica_count)
@@ -5489,9 +5491,20 @@ end
     end
 end
 
+# An array of concrete numeric records cannot hide an array that aliases an
+# output. Keep the outer-array check, and walk elements when their type leaves
+# room for a nested array (including abstract fields and custom records).
+_replicated_may_contain_array(::Type) = true
+_replicated_may_contain_array(::Type{<:Number}) = false
+@inline function _replicated_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
+    isconcretetype(T) || return true
+    any(_replicated_may_contain_array, fieldtypes(T))
+end
+
 _replicated_alias(cache::AbstractArray, arg::AbstractArray) =
     Base.mightalias(cache, arg) ||
-    (!(eltype(arg) <: Number) && any(item -> _replicated_alias(cache, item), arg))
+    (_replicated_may_contain_array(eltype(arg)) &&
+     any(item -> _replicated_alias(cache, item), arg))
 _replicated_alias(cache::AbstractArray, arg::Union{Tuple,NamedTuple}) =
     any(item -> _replicated_alias(cache, item), arg)
 _replicated_alias(cache, arg) = false
