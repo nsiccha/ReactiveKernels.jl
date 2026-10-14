@@ -4126,8 +4126,12 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         (_is_sample(c) || _is_broadcast_sample(c)) ||
             _sfail("cells hold `~` observations and `=` assignments only")
         lnames = Set(first.(locals))
+        external = _external_rhs(c.args[3])
         function arg(ex; object=false)
-            Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
+            # An external constructor's indexed argument follows the authored
+            # iterator. Retain its read in the cell, including bounds checks;
+            # stripping it to a column would broadcast a singleton instead.
+            !external && Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
                 ex.args[1] isa Symbol && ex.args[1] ∉ lnames && return ex
             if ex isa Expr && (ex.head === :call || _is_dotted_call(ex)) &&
                     !isempty(ex.args) && (_cell_object_call(ex.args[1]) || object)
@@ -5159,6 +5163,9 @@ function _cell_bares!(ex::Expr, ivar, bares, data)
         whole = _cell_whole_call(fn)
         reads = whole ? Set{Symbol}() : bares
         for a in ex.args[2:end]
+            # A shared slice is one whole argument, not a cell-index read.
+            # Reads involving the loop index still obey the ordinary checks.
+            whole && !_expr_has_sym(a, ivar) && continue
             _cell_bares!(a, ivar, reads, data)
         end
         return nothing
