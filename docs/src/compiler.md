@@ -507,6 +507,13 @@ lane. Each cell computes only `yi * li - ni * log1pexp(li)` and adds it. With
   the cached value where it is taken. A node whose computation throws on any
   lane stays in its arm, so preparation never raises an error the original
   program would not.
+- The same split applies to sequential bindings and constructed endpoints in
+  those arms. Their retained arm graphs supply the dependencies of local
+  bindings, including live locals inside an inline `let`. Preparation caches
+  the pure data-only prefix and keeps the selected residual plan beneath its
+  original guards. A speculative value that cannot cross the cache boundary
+  also stays inside its arm. This includes RKPPL's parameter-support guards
+  around distribution endpoints, without rewriting individual families.
 - The parts apply the authored operations to the same operands in the same
   order, so values and derivatives are unchanged; nothing is reassociated or
   simplified.

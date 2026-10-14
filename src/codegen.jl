@@ -2165,6 +2165,11 @@ struct _PlateArmVariant
     lowered_recipes::Tuple
 end
 
+# Preparation may cut an arm's already selected plan at cached values. Keep
+# that exact recipe selection instead of asking the planner to choose again.
+_plate_arm_plan(spec) = plan(spec)
+_plate_arm_plan(p::Plan) = p
+
 # A branch whose condition reads the cell takes its arm per cell, but an arm
 # with its own graph is inlined into the cell loop. Its recipes that read only
 # shared values run at the first cell that takes the arm and are reused by the
@@ -2227,7 +2232,7 @@ Base.@nospecializeinfer function _plate_lane_branch_slots!(
     elseif spec === nothing
         nothing
     else
-        armplan = plan(spec)
+        armplan = _plate_arm_plan(spec)
         fits = all(port -> port.name in names, armplan.have) &&
             !any(port -> canon_id(armplan.graph, port.id) ==
                          canon_id(armplan.graph, only(armplan.want).id),
@@ -2374,7 +2379,7 @@ end
 # read the branch inputs of the same name and its value is the branch output.
 Base.@nospecializeinfer function _plate_branch_arm_recipes!(
         copied::Graph, @nospecialize(spec), r::Recipe, names, fresh)
-    arm = plan(spec)
+    arm = _plate_arm_plan(spec)
     ag = arm.graph
     inputs = Dict{Symbol,Value}()
     for (name, v) in zip(names, r.inputs)
@@ -4808,8 +4813,9 @@ _kernel_latest_source(xs::Tuple) = map(_kernel_latest_source, xs)
 
 # A generated kernel whose public entry guarantees a latest-world barrier can
 # carry that guarantee into literal source calls within its native recipe
-# bodies. Only the native argument of a source-op construction is visited; the
-# tensorized body and quoted source/provenance expressions remain unchanged.
+# bodies and retained arm plans. Only the native argument of a source-op
+# construction is visited; the tensorized body and quoted source/provenance
+# expressions remain unchanged.
 function _kernel_latest_native_source_literals(ex)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
@@ -4829,7 +4835,9 @@ function _kernel_latest_literal_calls(ex)
        args[1].value isa Union{_KernelSourceOp,_KernelSourceFunction,_KernelBranch,_KernelSplit}
         args[1] = QuoteNode(_kernel_latest_source(args[1].value))
     end
-    Expr(ex.head, args...)
+    result = Expr(ex.head, args...)
+    _kernel_is_branch_arm_graph(result) ?
+        Expr(:call, GlobalRef(@__MODULE__, :_kernel_latest_arm_plan), result) : result
 end
 function _kernel_latest_source(f::_KernelSourceFunction{F,RF,C}) where {F,RF,C}
     _KernelSourceFunction{F,RF,C,Val{:latest_world}}(
@@ -4853,7 +4861,20 @@ function _kernel_latest_source(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
         _kernel_latest_source(branch.condition),
         _kernel_latest_source(branch.then_arm),
         _kernel_latest_source(branch.else_arm),
-        branch.then_spec, branch.else_spec)
+        _kernel_latest_arm_plan(branch.then_spec),
+        _kernel_latest_arm_plan(branch.else_spec))
+end
+
+# Arm graphs are executable metadata: partial evaluation or shared-arm
+# lowering can use them instead of the original closure. Preserve the same
+# caller guarantee there, or each newly exposed source call would regain a
+# runtime method query. Keep the exact selection and leave the graph untouched.
+function _kernel_latest_arm_plan(spec)
+    spec === nothing && return nothing
+    p = _plate_arm_plan(spec)
+    recipes = Recipe[Recipe(r.id, r.inputs, r.outputs, _kernel_latest_source(r.op),
+        r.cost, r.cse_key, r.effectful, r.source) for r in p.recipes]
+    _partial_subplan(p, p.have, p.want, recipes)
 end
 function _kernel_latest_source(op::_AuthoredPlateOp{K,A}) where {K,A}
     kernel = _kernel_latest_prepared(op.kernel)
