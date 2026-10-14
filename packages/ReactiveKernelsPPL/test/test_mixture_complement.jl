@@ -5,7 +5,7 @@
 # Reactant/XLA value+grad (in test_mixture_complement_reactant.jl).
 # (`_check_gradient` / `_findiff_grad` /
 # `_GEN_BACKEND` come from test_generator.jl, included first.)
-using Distributions: Beta, Exponential, Normal, logpdf
+using Distributions: Beta, Exponential, Normal, Uniform, logpdf
 using Enzyme
 using ReactiveKernels
 using ReactiveKernelsPPL
@@ -88,6 +88,54 @@ end
 
 # Two-term log-sum-exp oracle (stable; no new test dep).
 _mixc_lse(a, b) = max(a, b) + log1p(exp(-abs(a - b)))
+
+@testset "complement weights from bounded priors" begin
+    model(prior) = Meta.parse("""begin
+        m1 ~ Normal(0, 2)
+        m2 ~ Normal(0, 2)
+        theta ~ $prior
+        y .~ MixtureModel.(vcat.(Normal.(m1, 1), Normal.(m2, 1)), Ref([theta, 1-theta]))
+    end""")
+    cols = Dict{Symbol,AbstractVector}(:y => [0.5, -1.0])
+
+    for prior in ("Uniform(0, 1)", "Uniform(0.2, 0.8)",
+            "truncated(Normal(0, 1), 0, 1)")
+        plan = lower_rkppl(model(prior), keys(cols); conditioned = keys(cols))
+        @test bind_data(plan, cols) isa StructuralPlan
+    end
+    for prior in ("Uniform(-0.1, 1)", "Uniform(0, 1.1)", "Normal(0, 1)")
+        @test_throws ContractValidationError lower_rkppl(
+            model(prior), keys(cols); conditioned = keys(cols))
+    end
+    data = Dict{Symbol,Any}(:y => cols[:y], :lo => 0.0, :hi => 1.0)
+    data_plan = lower_rkppl(model("Uniform(lo, hi)"), data; conditioned = (:y,))
+    @test bind_data(data_plan, data) isa StructuralPlan
+    bad_data = merge(data, Dict{Symbol,Any}(:lo => -0.5))
+    @test_throws ContractValidationError bind_data(data_plan, bad_data)
+
+    bound = bind_data(lower_rkppl(model("Uniform(0, 1)"), keys(cols);
+        conditioned = keys(cols)), cols)
+    built = build_kernel(bound)
+    kern = prepare_query(built, bound, :sampler)
+    q = (; m1 = 0.0, m2 = 1.0, theta = 0.4)
+    got = _mixc_posterior(kern, built.layout, q)
+    want = logpdf(Normal(0, 2), q.m1) + logpdf(Normal(0, 2), q.m2) +
+        logpdf(Uniform(0, 1), q.theta) + log(q.theta) + log1p(-q.theta) +
+        sum(_mixc_lse(log(q.theta) + logpdf(Normal(q.m1, 1), y),
+            log1p(-q.theta) + logpdf(Normal(q.m2, 1), y)) for y in cols[:y])
+    @test got ≈ want atol = 1e-12
+    u = [0.1, -0.2, 0.3]
+    uniform_gradient = _check_gradient(built.spec, bound, u)
+
+    # Beta(1, 1) is the same prior measure as Uniform(0, 1), so the
+    # alternate spelling must emit the same posterior and gradient.
+    beta_bound = bind_data(lower_rkppl(model("Beta(1, 1)"), keys(cols);
+        conditioned = keys(cols)), cols)
+    beta_built = build_kernel(beta_bound)
+    beta_kern = prepare_query(beta_built, beta_bound, :sampler)
+    @test Base.invokelatest(kern, u) ≈ Base.invokelatest(beta_kern, u) atol = 1e-12
+    @test uniform_gradient ≈ _check_gradient(beta_built.spec, beta_bound, u)
+end
 
 @testset "complement values" begin
     prog = Meta.parse("""begin
