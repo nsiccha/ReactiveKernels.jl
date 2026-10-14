@@ -212,9 +212,23 @@ copy) and takes 15.5 µs, and a hand-written loop filling one `n + 1` buffer
 takes 13.7 µs with the same 26,224 B. Values are bitwise identical across all
 three.
 
-Natively, the seed slot keeps the vector materialized: a reducing `plate` over
-an init-including scan reads the stored trajectory rather than streaming each
-cell inside the carry loop (the per-step form's fusion described under
+Natively, terminal `minimum` reductions can stream through an init-including
+scan, including the seed. This covers a trajectory declared as `Vector{T}` or
+`AbstractVector{T}` for `T` equal to `Float16`, `Float32` or `Float64`, with a
+dense first input sequence and an inferred floating output type. Direct minima
+and minima of one source-authored dotted expression (including `@.`) using
+`+`, `-`, `*`, `/`,
+the trajectory, `trajectory[1]`, and available primitive scalar inputs share
+the scan loop. For example, `minimum(100 .* (trajectory .- trajectory[1]) ./
+trajectory[1])`, authored as a transform followed by a reduction, needs no
+trajectory or transformed vector. Arithmetic nesting and declared conversions
+are preserved; the transform is evaluated for every sample before its minimum.
+Requesting either vector as a WANT, adding another reader, or using unsupported
+storage or expressions retains the ordinary materialized path. This also
+applies inside native position batching, including borrowed readers.
+
+A reducing `plate` over an init-including scan still reads the stored
+trajectory (the per-step form's fusion is described under
 [Lowering and semantics](#Lowering-and-semantics)). Under Reactant the seed is
 element 1 of the traced output buffer and step `i` writes element `i + 1` from
 the same single `stablehlo.while`; the program contains no concatenation. The
