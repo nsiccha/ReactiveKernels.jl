@@ -2857,7 +2857,8 @@ end
 # (bound columns are inputs, not nodes); keyword names and function values
 # are not reads.
 function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
-    ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
+    # An interpolated `nothing` or `missing` is Base's value, as its name is.
+    ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String,Nothing,Missing} &&
         return nothing
     if ex isa Symbol
         # `:` in a positional read (`Z[:, 1]`) is a whole axis, and `end`

@@ -5248,7 +5248,8 @@ function _externalize_bound_array_call(f, ops;
         slot === nothing ? ops[index] :
             _ExternalBoundArraySlot{slot}()
     end
-    structured = any(value -> value isa Union{Tuple,NamedTuple}, values)
+    structured = any(value -> value isa Union{Tuple,NamedTuple} ||
+                              _bound_record(value), values)
     external_body = structured ?
         _externalize_bound_array_body(f, positions, values) : nothing
     callable = external_body === nothing ? f :
@@ -5270,7 +5271,23 @@ _bound_array_leaves(values::Tuple) =
     Tuple(Iterators.flatten(map(_bound_array_leaves, values)))
 _bound_array_leaves(value::NamedTuple) = _bound_array_leaves(Tuple(value))
 _bound_array_leaves(value::AbstractArray) = (value,)
-_bound_array_leaves(value) = ()
+_bound_array_leaves(value) = _bound_record(value) ?
+    _bound_array_leaves(_bound_record_fields(value)) : ()
+
+# A bound immutable struct whose fields hold arrays (a model's wrapper around
+# a data matrix, say) is a record: its array leaves leave the callable like a
+# named tuple's, and the body rebuilds it with `new` from the same field
+# values. Left in the operation table, the arrays are part of the callable,
+# whose readonly proof native Reverse cannot then always complete.
+_bound_record(value) = _bound_record_type(typeof(value)) &&
+    _has_external_bound_array(_bound_record_fields(value), 0)
+_bound_record_type(T::DataType) = isconcretetype(T) && isstructtype(T) &&
+    !ismutabletype(T) && fieldcount(T) > 0 &&
+    !(T <: Union{Tuple,NamedTuple,AbstractArray,Number,Function,Type,
+                 Module,Symbol,AbstractString})
+_bound_record_type(T) = false
+_bound_record_fields(value) =
+    ntuple(i -> getfield(value, i), Val(fieldcount(typeof(value))))
 
 function _bound_rebuild_expr(value::NamedTuple, ports, next::Ref{Int})
     fields = Any[_bound_rebuild_expr(v, ports, next) for v in value]
@@ -5280,7 +5297,11 @@ _bound_rebuild_expr(value::Tuple, ports, next::Ref{Int}) =
     Expr(:tuple, Any[_bound_rebuild_expr(v, ports, next) for v in value]...)
 _bound_rebuild_expr(::AbstractArray, ports, next::Ref{Int}) =
     ports[next[] += 1]
-_bound_rebuild_expr(value, ports, next::Ref{Int}) = QuoteNode(value)
+function _bound_rebuild_expr(value, ports, next::Ref{Int})
+    _bound_record(value) || return QuoteNode(value)
+    fields = Any[_bound_rebuild_expr(v, ports, next) for v in _bound_record_fields(value)]
+    Expr(:new, typeof(value), fields...)
+end
 
 # A compiled body whose operation-table accesses are literal can load hidden
 # bound operands directly. This changes only its internal argument boundary;
@@ -5327,7 +5348,9 @@ function _externalize_bound_array_body(
     compile(ast)
 end
 
-_has_external_bound_array(value, min_elements) = false
+_has_external_bound_array(value, min_elements) =
+    _bound_record_type(typeof(value)) &&
+    _has_external_bound_array(_bound_record_fields(value), min_elements)
 _has_external_bound_array(value::AbstractArray, min_elements) =
     length(value) >= min_elements
 _has_external_bound_array(value::Union{Tuple,NamedTuple}, min_elements) =

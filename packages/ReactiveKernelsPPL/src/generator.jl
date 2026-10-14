@@ -922,8 +922,12 @@ function _predictor_plate_addition(plan::StructuralPlan, pred::PredictorSpec,
     rows && return false
     length(terms) > 1 && length(terms) == length(pred.terms) || return false
     _broadcast_affine(plan, pred) || return false
-    any(r -> _response_uses_predictor(r, pred.name), plan.responses) || return false
-    n = _located_rows(plan, pred)
+    # One plate needs one row count: responses observing different rows
+    # through a shared predictor keep its ordinary broadcast.
+    located = unique!([_response_rows(plan, r) for r in plan.responses
+        if _response_uses_predictor(r, pred.name)])
+    length(located) == 1 || return false
+    n = only(located)
     axes = map(pred.terms) do t
         t.kind === InterceptTerm && return Any[]
         t.kind === OffsetTerm && length(t.columns) == 1 &&
@@ -1958,7 +1962,9 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
                 !haskey(plan.columns, _observed_mask_name(r.response)) &&
                 !_is_bare_param_location(r, plan) &&
                 !_cell_broadcast_response(plan, r) &&
-                _wholevec_location(r, plan) && _wholevec_scalar_scale(r, plan)
+                _wholevec_rows(r, plan) && _wholevec_scalar_scale(r, plan)
+            # `alpha .+ M * v` broadcasts its scalar intercept, yet the
+            # matched data-matrix product reads the whole design.
             glm = _gaussian_glm_location(r, plan)
             glm === nothing || return _gaussian_glm_stmts(r, plan, node, glm...)
         end
@@ -2397,11 +2403,19 @@ end
 # does a response: a number or one-entry `y` stretches over a longer location.
 # The plate path evaluates that, so fusion requires equal lengths.
 function _wholevec_location(r::LikelihoodSpec, plan::StructuralPlan)
+    _is_latent_location(r, plan) || !_broadcast_affine(plan, _predictor(plan, r.predictor)) ||
+        return false
+    return _wholevec_rows(r, plan)
+end
+
+# The location has one row per response entry. A predictor that broadcasts a
+# scalar intercept over a vector summand still has those rows; whether that
+# predictor is read whole is the caller's choice.
+function _wholevec_rows(r::LikelihoodSpec, plan::StructuralPlan)
     y = get(plan.columns, r.response, nothing)
     rows = y isa AbstractVector ? length(y) : nothing
     _is_latent_location(r, plan) && return _latent_rows(plan, r.predictor) == rows
     pred = _predictor(plan, r.predictor)
-    _broadcast_affine(plan, pred) && return false
     _predictor_rows(plan, pred.name) == rows || return false
     return all(pred.terms) do t
         t.kind === LatentTerm || return true
