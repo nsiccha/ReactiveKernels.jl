@@ -171,6 +171,24 @@ function _scan_cap_data_model(n, kind)
             end
             z .~ Normal.(h, sigma)
         end
+    elseif kind === :arma_tuple
+        # ARMA(1,1) as two carried arrays: a tuple carry whose step reads its
+        # current write (`err[t]` reads `nu[t]`) and indexed data.
+        quote
+            m ~ Normal(0, 5)
+            phi ~ Normal(0, 1)
+            theta ~ Normal(0, 1)
+            sigma ~ Exponential(1)
+            @scan begin
+                nu[1] = m + phi * m
+                err[1] = y[1] - nu[1]
+                for t in 2:T
+                    nu[t] = m + phi * y[t - 1] + theta * err[t - 1]
+                    err[t] = y[t] - nu[t]
+                end
+            end
+            y .~ Normal.(nu, sigma)
+        end
     else
         quote
             m ~ Normal(0, 1)
@@ -199,7 +217,19 @@ function _scan_cap_data_model(n, kind)
     parameter(u, name) = u[only(e for e in built.layout.entries if e.name === name).offset]
     function oracle(u)
         m = parameter(u, :m)
-        if kind === :arma
+        if kind === :arma_tuple
+            phi, theta = parameter(u, :phi), parameter(u, :theta)
+            rawsigma = parameter(u, :sigma)
+            sigma = exp(rawsigma)
+            lp = logpdf(Normal(0,5),m) + logpdf(Normal(),phi) +
+                logpdf(Normal(),theta) + logpdf(Exponential(),sigma) + rawsigma
+            err = 0.0
+            for t in 1:n
+                nu = t == 1 ? m + phi * m : m + phi * y[t-1] + theta * err
+                err = y[t] - nu
+                lp += logpdf(Normal(nu,sigma),y[t])
+            end
+        elseif kind === :arma
             phi, theta = parameter(u, :phi), parameter(u, :theta)
             rawsigma = parameter(u, :sigma)
             sigma = exp(rawsigma)
@@ -228,7 +258,7 @@ function _scan_cap_data_model(n, kind)
 end
 
 @testset "scan capabilities: deterministic ARMA and GARCH" begin
-    for kind in (:arma, :garch), n in (1,4)
+    for kind in (:arma, :arma_tuple, :garch), n in (1,4)
         f, oracle = _scan_cap_data_model(n,kind)
         @test !any(e -> e.kind === :scan, f.built.layout.entries)
         _scan_cap_check(f,oracle)

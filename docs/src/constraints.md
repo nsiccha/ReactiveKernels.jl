@@ -532,7 +532,12 @@ and lock the one Reactant 0.2.289 lifted:
   `Vector` and `Matrix` operands whose promoted element type is isbits, they
   allocate Base's result, with Base's shape, promoted element type and
   values, and write each operand in its own inlined call; a number is a 1×1
-  block. Every other operand combination, and every `hcat`/`vcat` layout
+  block. From Julia 1.11 a dense operand is written element by element:
+  Enzyme differentiates `unsafe_copyto!` there as an untyped `memmove`, and
+  in a kernel prepared with `bound=` data (the `@rkppl` scan trajectory
+  `vcat([seed], rest)`) native reverse failed with `EnzymeNoTypeError`.
+  Julia 1.10 keeps the copy, since its element loop fails on an empty fresh
+  operand. Every other operand combination, and every `hcat`/`vcat` layout
   they do not lay out, calls Base, which keeps its value and error
   (including `vcat`'s fill of leading numbers across a wider matrix). A
   layout `hvcat` rejects throws the companion's own `DimensionMismatch`

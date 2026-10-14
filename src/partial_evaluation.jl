@@ -880,9 +880,22 @@ struct _LaneGather
 end
 @inline (::_LaneGather)(x::Number, lanes) = x
 @inline function (gather::_LaneGather)(x::AbstractArray, lanes)
-    length(x) == 1 && return _tensorized_view(x, ones(Int, length(lanes)))
+    length(x) == 1 && return _lane_view(x, ones(Int, length(lanes)))
     ndims(x) == 1 && length(x) == gather.n || _lane_gather_mismatch(x, gather.n)
-    _tensorized_view(x, lanes)
+    _lane_view(x, lanes)
+end
+# Base's `view` unaliases its index vector against the parent, and native
+# Enzyme compiles the `copy` of that never-taken branch through its untyped
+# `memmove` override; on Julia 1.12 type analysis rejects it
+# (`IllegalTypeAnalysisException`; a one-entry scan trajectory broadcast over
+# guarded observations in `test_scan_capabilities.jl`).  Lane indices are
+# fresh or bound `Int` vectors that nothing writes, so a native lane view needs
+# no unaliasing; its bounds are still checked.  Other operands, and tracing
+# backends, keep `_tensorized_view`.
+@inline _lane_view(x::AbstractArray, lanes) = _tensorized_view(x, lanes)
+@inline function _lane_view(x::Vector, lanes::Vector{Int})
+    checkbounds(x, lanes)
+    Base.unsafe_view(x, lanes)
 end
 @noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
