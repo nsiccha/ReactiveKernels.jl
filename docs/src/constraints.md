@@ -493,7 +493,9 @@ and lock the one Reactant 0.2.289 lifted:
   real array, Enzyme 0.13.210 and 0.13.216 reject it the same way. PPL's
   ordinary, inline-collect and array-bearing prepared-input readers keep
   their authored primal and remain native reverse capability gaps in
-  `test_native_generator_capture.jl`.
+  `test_native_generator_capture.jl`. The Enzyme dogfood line repairs every
+  one of these readers from `ba8bc90b` on Julia 1.10.12 and 1.12.7; released
+  Enzyme 0.13.216 does not.
   No consumer function, activity configuration or derivative rule is replaced.
   A six-line isolated Enzyme compiler prototype marks
   `Base.collect(::Generator)` for inlining before activity analysis and makes
