@@ -3906,6 +3906,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     retval = length(p.want) == 1 ? output(p.want[1]) :
              Expr(:tuple, (output(w) for w in p.want)...)
     push!(body.args, Expr(:return, retval))
+    !tensorized && inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     Expr(:function, Expr(:tuple, argexprs...), body),
     Tuple(runtime_ops), Tuple(runtime_recipes)
 end

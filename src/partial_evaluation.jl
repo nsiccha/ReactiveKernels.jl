@@ -1335,6 +1335,7 @@ function partial_evaluation(p::Plan, bound, values)
         "partial evaluation received $(length(bound_values)) bound ports " *
         "but $(length(value_tuple)) bound values"))
     p = _partial_split_bound(p, bound_values)
+    p = _partial_index_runs(p, bound_values)
     boundary = _partial_boundary(p, bound_values)
     hoisted = _partial_hoisted(p, boundary, value_tuple)
     last(_partial_residual(p, boundary, hoisted))
@@ -1589,10 +1590,11 @@ struct _BoundEntry
     boundary::_PartialBoundary
     prefix::Any          # prepared prefix kernel, or `nothing` without constants
     plates::Bool         # residual authored plates: the inner-plate pass runs per binding
+    index_run_slots::Vector{Int} # finite flat/grouped policy constants
     # Per plate-class tuple, the residual recipe tail after value-independent
     # plate-chain fusion. No binding's constant recipes or values are retained.
     fused::Dict{Any,Vector{Recipe}}
-    # Per plate-class tuple: a `_BoundTemplate`; the kernel itself when it
+    # Per (plate classes, index-run schedule classes): a `_BoundTemplate`; the kernel itself when it
     # has no constant slots; or `nothing` (a residual whose leading slots are
     # not exactly its constants: the per-binding path). An absent class is
     # unbuilt.
@@ -1605,11 +1607,13 @@ function _bound_entry(p::Plan, @nospecialize(ports))
     p = _fuse_authored_plate_chains(p; cells_only = true)
     bound_values = collect(Value, _astuple(ports))
     p = _partial_split_bound(p, bound_values)
+    p = _partial_index_runs(p, bound_values)
     boundary = _partial_boundary(p, bound_values)
     prefix = isempty(boundary.constants) ? nothing :
              _prepare_plan(_partial_prefix_plan(p, boundary))
     plates = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
-    _BoundEntry(p, boundary, prefix, plates, Dict{Any,Vector{Recipe}}(), Dict{Any,Any}())
+    _BoundEntry(p, boundary, prefix, plates, _partial_index_run_slots(p.graph,boundary),
+                Dict{Any,Vector{Recipe}}(), Dict{Any,Any}())
 end
 
 _bound_hoisted(entry::_BoundEntry, @nospecialize(data::Tuple)) =
