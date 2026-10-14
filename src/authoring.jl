@@ -1400,6 +1400,10 @@ _kernel_endpoint_source_module(op::_KernelSourceOp) =
     _kernel_endpoint_source_module(op.f)
 _kernel_endpoint_source_module(op::_KernelBranch) =
     _kernel_endpoint_source_module(op.call)
+# A rebuilt branch's call is RK's own `_KernelBranchCall`; its authored parts
+# (the condition, like each arm, a closure of the source) name the module.
+_kernel_endpoint_source_module(op::_KernelBranchCall) =
+    _kernel_endpoint_source_module(op.condition)
 _kernel_endpoint_source_module(op::_KernelSplit) =
     _kernel_endpoint_source_module(op.call)
 

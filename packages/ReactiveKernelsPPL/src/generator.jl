@@ -950,14 +950,14 @@ function _predictor_statements(plan::StructuralPlan)
             cell_terms = Any[]
             k = 1
             for b in shape.blocks
-                c = gensym(:coefficient)
+                c = _dovar(length(formals) + 1)
                 push!(inputs, _coef_coord(coef, k))
                 push!(formals, c)
                 k += 1
                 if b.kind === InterceptTerm
                     push!(cell_terms, c)
                 else
-                    x = gensym(:column)
+                    x = _dovar(length(formals) + 1)
                     push!(inputs, b.column)
                     push!(formals, x)
                     push!(cell_terms, :($c * $x))
@@ -1012,7 +1012,7 @@ function _predictor_statements(plan::StructuralPlan)
         # bound rank/extent proof for every summand and keep scalar and
         # row-expanding predictors on their existing broadcast path.
         if _predictor_plate_addition(plan, pred, terms, rows)
-            formals = [gensym(:summand) for _ in terms]
+            formals = [_dovar(i) for i in eachindex(terms)]
             cell = foldl((a, b) -> Expr(:call, :+, a, b), formals)
             rhs = Expr(:do, Expr(:call, :plate, terms...),
                 Expr(:->, Expr(:tuple, formals...), Expr(:block, cell)))
