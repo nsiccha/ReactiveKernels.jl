@@ -221,6 +221,27 @@ kernel. An outer `@plate` may select several such vectors; each outer cell
 then has its own marginalized component, and the inner RK plates retain the
 positions within that event.
 
+`bernoulli_logit_product_mixture_logdensity(observed, logits, weights)` and
+`binomial_logit_product_mixture_logdensity(observed, trials, logits, weights)`
+take a log-odds matrix of the same shape instead of probabilities. Each cell
+reads the logit route of `bernoulli(; logit)` or `binomial(; n, logit)`, so a
+component defined on the logit scale stays in log space. Passing
+`logistic.(eta)` to the probability laws rounds the probability first: the
+absent outcome's `log1p(-p)` loses accuracy as `eta` grows and is `-Inf` from
+about `eta = 37`, where the exact log mass is `-eta`. A component that can
+never produce a success (a structural zero) has logit `-Inf`:
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    bernoulli_logit_product_mixture_logdensity
+
+event = Bool[true, false, true]
+logits = [0.5 -Inf; 40.0 -Inf; 2.0 -Inf]
+loglik = prepare(bernoulli_logit_product_mixture_logdensity)
+loglik(event, logits, [0.6, 0.4])
+```
+
 ## Positive-support and bounded families
 
 LogNormal, Exponential, Geometric, and Uniform illustrate shapes that are not all
