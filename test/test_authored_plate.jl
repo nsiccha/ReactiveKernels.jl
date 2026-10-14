@@ -32,7 +32,13 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
     @test prepare(C.chain; want = :mu)(q, x, y) == mu
     @test prepare(C.chain; want = :pointwise)(q, x, y) == pw
     both = prepare(C.chain; want = (:mu, :pointwise, :total))
-    @test both(q, x, y) == (mu, pw, kernel(q, x, y))
+    # A total-only plate sums its cells in a `@simd` loop, which may
+    # reassociate; with `pointwise` wanted, the total sums the stored cells in
+    # order. The two agree to rounding, and bitwise only where the fused loop
+    # does not vectorize.
+    both_mu, both_pw, both_total = both(q, x, y)
+    @test (both_mu, both_pw) == (mu, pw)
+    @test both_total ≈ kernel(q, x, y) rtol = 1e-14
     shared = prepare(C.chain; want = (:total, :extra))
     @test first(shared(q, x, y)) == kernel(q, x, y)
     @test last(shared(q, x, y)) ≈ sum(mu) atol = 1e-10
@@ -1430,6 +1436,53 @@ end
     @test checked([1.0, 2.0, 3.0], [3, 1, 2], table) == [5.0, 4.0, 9.0]
     @test occursin(_BOUNDS_THROW, _plate_entry_llvm(checked, [1.0], [1], table))
     @test_throws BoundsError checked([1.0, 2.0], [1, 4], table)
+end
+
+# --- a source-function cell asks for its method without a per-cell loop
+# (snags native-lowering-948c4ab6, guarded-kernelso-e7baca4c)
+@kernel _two_statement_plate(xs::Vector{Float64}, c::Float64) = begin
+    ys::Vector{Float64} = plate(xs) do x
+        u = x * c
+        u * u + x
+    end
+    return ys
+end
+@kernel _gathered_residual_plate(a::Vector{Float64}, idx::Vector{Int},
+                                 x::Vector{Float64}, y::Vector{Float64}) = begin
+    gathered = ReactiveKernels._readonly_gather(a, idx)
+    terms = plate(gathered, x, y) do ai, xi, yi
+        -0.5 * (yi - ai * xi)^2
+    end
+    total::Float64 = sum(terms)
+    return total
+end
+
+@testset "authored plate native: a source-function cell has no per-call method query" begin
+    # A cell body runs through RK's source callable, which asks whether its
+    # method is visible in the caller's world. On Julia 1.12 and 1.13
+    # `hasmethod` kept a loop over the argument types in every cell
+    # (`jl_f__svec_ref`), so these loops stayed scalar.
+    xs = [1 / (k + 0.5) for k in 0:999]
+    two_statement = prepare(_two_statement_plate)
+    @test two_statement(xs, 1.5) == [(x * 1.5) * (x * 1.5) + x for x in xs]
+    llvm = _plate_entry_llvm(two_statement, xs, 1.5)
+    @test !occursin("svec_ref", llvm)
+    if Sys.ARCH in (:x86_64, :aarch64)
+        @test occursin(r"<\d+ x double>", llvm)
+    end
+    checked = prepare(_checked_cell_plate)
+    @test !occursin("svec_ref", _plate_entry_llvm(checked, [1.0], [1], [2.0]))
+
+    idx = [mod1(7k, 5) for k in 1:64]
+    x, y, a = sin.(1:64), cos.(1:64), [0.5, -1.0, 2.0, 0.25, 1.5]
+    residual = prepare(_gathered_residual_plate; bound = (; idx, x, y))
+    @test residual(a) ≈ sum(-0.5 .* (y .- a[idx] .* x) .^ 2) rtol = 1e-14
+    llvm = sprint(io -> InteractiveUtils.code_llvm(io, residual, (Vector{Float64},);
+                                                  debuginfo = :none))
+    @test !occursin("svec_ref", llvm)
+    if Sys.ARCH in (:x86_64, :aarch64)
+        @test occursin(r"fmul[^\n]*<\d+ x double>", llvm)
+    end
 end
 
 # --- each cell recipe is emitted once (snag prepared-kernel-ae180d1a)

@@ -14,26 +14,18 @@ using Test
 # callable holds no data a plain backend must prove readonly.
 const NA_AD_BACKEND = AutoEnzyme(mode = Enzyme.Reverse)
 
-# Known Julia 1.12+ reverse-mode triggers that keep some NA gradients from
-# being size-invariant, absent on Julia 1.10. Each plate trigger produces
-# about 16 B per element. They overlap: with both present, measured plate
-# growth is still about 16 B per element, not 32.
-# - Each plate cell's source callable still runs `hasmethod`'s argument-type
-#   loop (`_KernelSourceFunction`, the type-stability audit's `JUSTIFIED`
-#   entry), and reverse-mode Enzyme tapes it per element. The fold that removes
-#   the query waits on todo `0itft6t` (a registered Enzyme release fixing
-#   EnzymeAD/Enzyme.jl#3787); drop `NA_CELL_QUERY` when it lands.
-# - With bounds checks forced on (`--check-bounds=yes`, the integration lane's
-#   flag), Enzyme tapes the shadow of a cached buffer's `Memory` pointer once
-#   per element when a loop stores into the buffer and the buffer is then
-#   stored back into its `Ref` slot: the AD plate loop's reuse-or-`similar`
-#   result and a cache step's `broadcast!` both hit it (the cache step grows
-#   by about 16 B per element on Julia 1.12, 24 B on Julia 1.13)
-#   (`repro_enzyme_reuse_or_similar_shadow_tape.jl`, Enzyme snag
-#   `julia-1-12-rever-30566488`).
-const NA_CELL_QUERY = VERSION >= v"1.12"
+# A known Julia 1.12+ reverse-mode trigger that keeps some NA gradients from
+# being size-invariant, absent on Julia 1.10: with bounds checks forced on
+# (`--check-bounds=yes`, the integration lane's flag), Enzyme tapes the shadow
+# of a cached buffer's `Memory` pointer once per element when a loop stores
+# into the buffer and the buffer is then stored back into its `Ref` slot: the
+# AD plate loop's reuse-or-`similar` result and a cache step's `broadcast!`
+# both hit it (about 16 B per element on Julia 1.12, 24 B for the cache step
+# on Julia 1.13) (`repro_enzyme_reuse_or_similar_shadow_tape.jl`, Enzyme snag
+# `julia-1-12-rever-30566488`). A plate cell's per-element method query, a
+# second trigger of the same size, is gone since `_KernelSourceFunction` asks
+# `Core._hasmethod` (snag `guarded-kernelso-e7baca4c`).
 const NA_SHADOW_TAPE = VERSION >= v"1.12" && Base.JLOptions().check_bounds == 1
-const NA_PLATE_ELEMENT_COST = NA_CELL_QUERY || NA_SHADOW_TAPE
 
 nlp_naad(x, m, s) = -0.5 * log(2π) - log(s) - 0.5 * ((x - m) / s)^2
 g_prior_naad(q) = nlp_naad(q[1], 0.0, 5.0) + nlp_naad(q[2], 0.0, 5.0) +
@@ -256,7 +248,7 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
 # closure-held nested kernel trips Enzyme static activity analysis. Single
 # (`flat`) and chained (`chain`) plates agree with dataflow, the analytic
 # gradient, and central differences, with size-invariant allocations on
-# Julia 1.10 (Julia 1.12+: `NA_PLATE_ELEMENT_COST` at the top of this file).
+# Julia 1.10 (Julia 1.12+: `NA_SHADOW_TAPE` at the top of this file).
 @testset "prepare_ad over NonAllocatingKernel with authored plates" begin
     C = AuthoredPlateChains
     q = [0.7]
@@ -287,7 +279,7 @@ isdefined(@__MODULE__, :AuthoredPlateChains) ||
         ad_value_and_gradient!(prepna, gna, q)
         @allocated ad_value_and_gradient!(prepna, gna, q)
     end
-    @test alloc_bytes[1] == alloc_bytes[2] broken = NA_PLATE_ELEMENT_COST
+    @test alloc_bytes[1] == alloc_bytes[2] broken = NA_SHADOW_TAPE
 end
 
 # Partitioned plates gather live lane arguments at run time (`_LaneGather`).
@@ -296,8 +288,8 @@ end
 #gather loop's per-element bounds checks allocated ~17.6 bytes/lane under
 #reverse-mode Enzyme (the same class as the plate-loop `checkbounds`
 #regression), and the NA gradient must stay size-invariant there too. Each
-#partition is a plate, so the Julia 1.12+ plate costs
-#(`NA_PLATE_ELEMENT_COST`, top of this file) apply to it as well.
+#partition is a plate, so the Julia 1.12+ plate cost
+#(`NA_SHADOW_TAPE`, top of this file) applies to it as well.
 @kernel arith_partition_naad(x::Vector{Float64}, y::Vector{Float64}) = begin
     pointwise = plate(x, y) do xi, yi
         cell::Float64 = yi > 0 ? xi * yi : 2.0 * xi + 1.0
@@ -344,7 +336,7 @@ end
         na_bytes
     end
     println("NONALLOCATING_AD_ALLOC\tpartition_arith\t", alloc_bytes)
-    @test alloc_bytes[1] == alloc_bytes[2] broken = NA_PLATE_ELEMENT_COST
+    @test alloc_bytes[1] == alloc_bytes[2] broken = NA_SHADOW_TAPE
 end
 
 fscale_naad(a, b) = a * b
