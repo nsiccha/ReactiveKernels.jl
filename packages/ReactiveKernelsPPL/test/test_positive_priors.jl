@@ -30,14 +30,17 @@ end
         source = string(model_view(built; bound=plan).source)
         @test occursin(helper, source)
         @test !occursin("_ppl_prior_sigma.logpdf.", source)
+        # Generated code calls operations by slot; the prior's recipe source
+        # names the helper it calls.
+        recipe_sources(k) = join((string(e.recipe.source) for e in recipe_inventory(k)), "\n")
+        @test occursin(helper, recipe_sources(built.spec))
         code = string(code_expr(built.spec))
-        @test occursin(helper, code)
         @test !occursin("_ppl_prior_sigma.logpdf.", code)
 
         q = prepare_sampler(built, plan, u;
             backend=AutoEnzyme(mode=Enzyme.Reverse))
+        @test occursin(helper, recipe_sources(q.kernel))
         prepared_code = string(code_expr(q.kernel))
-        @test occursin(helper, prepared_code)
         @test !occursin("_ppl_prior_sigma.logpdf.", prepared_code)
         grad = zeros(length(u))
         value, _ = sampler_value_and_gradient!(q, grad, u)
