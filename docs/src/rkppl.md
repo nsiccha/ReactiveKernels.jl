@@ -75,6 +75,14 @@ Main.ReactiveKernelsDocs.render_rkppl_strict_error()
 Coefficient vectors are declared the same way, sized by their design matrix:
 `b[axes(X, 2)] .~ Normal.(0, 1)`.
 
+A scalar deterministic definition can carry a density factor without adding
+a sampled coordinate. For example, `beta_last = -sum(beta_free)` followed by
+`beta_last ~ Normal(0, 3)` adds `logpdf(Normal(0, 3), beta_last)` to the prior.
+The factor uses an admitted scalar distribution and the definition keeps its
+ordinary value for later reads, such as `beta = vcat(beta_free, beta_last)`.
+The definition is still assigned once; a second factor on the same name is
+rejected. Vector observations use `.~`.
+
 ## Parameter priors
 
 Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
@@ -365,8 +373,9 @@ from parameter geometry, without adding generated values to sampler coordinates.
   execution remains gated by the missing traced `besseli` method.
 - A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
   `y ~ Normal(...)` on a data vector is rejected.
-- A `~` whose left-hand side is a bound data column is an observation; every
-  other `~` declares a parameter.
+- A `~` whose left-hand side is a bound data column is an observation. On an
+  existing scalar definition it adds a density factor; otherwise it declares
+  a parameter.
 - `Ordinal` permits an intercept alongside its thresholds, for both
   cumulative and stopping-ratio responses. Both declarations and their
   priors are translated as written.

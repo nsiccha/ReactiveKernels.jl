@@ -401,7 +401,7 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         else
             # A scalar coordinate remains a shared plate input. Its ordinary
             # indexed read retains the original bounds check.
-            state = _pointwise_leaf(rhs, values)
+            state = _pointwise_concat_part(rhs, values, bound_names)
             state.rank >= 0 ? (values[name] = state) : delete!(values, name)
         end
     end
@@ -4392,6 +4392,13 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         end
     end
     _parameter_prior_statements!(stmts, terms, plan, layout)
+    for factor in plan.factors
+        node = Symbol(:_ppl_factor_, factor.name)
+        density = _sampled_prior_expr(factor; conditioned = true,
+            float64_args = _float64_inputs(context, values(factor.args)))
+        push!(stmts, :($node::Float64 = $density))
+        push!(terms, node)
+    end
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
     # columns (priors addressed by response label — validation pins
