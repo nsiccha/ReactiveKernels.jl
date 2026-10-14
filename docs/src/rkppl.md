@@ -278,6 +278,15 @@ observed definition reading only data (`y = v[positions(rows)]`,
 `y = sum(f(raw))`) is evaluated once by `bind_data` and validated as the
 response, exactly like the same value bound as data.
 
+An undotted external constructor keeps each argument whole:
+`y .~ some_distribution(parameters)` shares the vector `parameters` across
+the observations. To broadcast constructor arguments, write the constructor
+call with a dot, for example `y .~ some_distribution.(means, Ref(covariance))`.
+Inside an authored plate, `y[i] ~ some_distribution(parameters, x[i])`
+shares `parameters` and reads `x` at the authored index, including its ordinary
+bounds checks. A dotted observation within a cell applies the resulting
+distribution to that cell's observations.
+
 A parameter declaration additionally needs structural geometry. The method
 receives the constructor binding, authored argument expressions and declared
 constrained shape; it must not evaluate active statistical arguments. For

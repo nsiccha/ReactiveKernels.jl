@@ -1341,9 +1341,16 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         push!(points, r.response => pw)
     end
     for p in plan.external_observations
-        ps = _external_density_statements(p)
+        observation = get(p.args, :observation, p.name)
+        selected = observation === p.name ? p.name :
+            Symbol(:_ppl_external_observed_, p.name)
+        selection = observation === p.name ? Expr[] : Expr[:($selected = $observation)]
+        ps = _external_density_statements(p; observation=selected)
+        # Select the authored observation axis before entering a grouped
+        # cell. Its inner observations must not reuse those outer indices.
+        append!(stmts, selection)
         append!(stmts, _cell_broadcast_observation(plan, p.name) ?
-            _cell_broadcast_stmts(p, plan, ps, upstream) : ps)
+            _cell_broadcast_stmts(p, plan, ps, vcat(upstream, selection)) : ps)
         push!(terms, Symbol(:_ppl_prior_, p.name))
         push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
     end
@@ -1478,7 +1485,9 @@ end
 # of a numeric response.
 function _cell_broadcast_stmts(p::SampledParameter, plan::StructuralPlan,
         stmts::Vector{Expr}, upstream::Vector{Expr})
-    isempty(plan.columns[p.name]) && return stmts
+    # Keep the outer cell even for an empty response: a constructor may read
+    # per-group values, which must not become whole shared arguments merely
+    # because this invocation has no groups.
     return _cell_broadcast_group(plan, p.name, Symbol(:_ppl_prior_, p.name),
         Symbol(:_ppl_pw_prior_, p.name), stmts, upstream, Symbol[],
         "observation $(p.name) holds one array per index, and its sampling-RHS statements")

@@ -1235,6 +1235,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         if _external_rhs(s.rhs) && s.broadcast && (s.lhs in data || s.lhs in ctx.vecdefs)
             args = _external_parameter(s.lhs, s.rhs, (), mod, ctx.taken;
                 observed=true, broadcast=true)
+            observation = s.range isa UnitRange ? Expr(:ref, s.lhs,
+                Expr(:call, :(:), first(s.range), last(s.range))) :
+                s.range === nothing ? s.lhs : s.range
+            args = merge(args, (; observation))
             push!(external_observations, SampledParameter(s.lhs, :external, args, nothing, s.lhs))
             continue
         end
@@ -4155,13 +4159,19 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         (_is_sample(c) || _is_broadcast_sample(c)) ||
             _sfail("cells hold `~` observations and `=` assignments only")
         lnames = Set(first.(locals))
+        external = _external_rhs(c.args[3])
         function arg(ex; object=false)
-            Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
+            # An external constructor's indexed argument follows the authored
+            # iterator. Retain its read in the cell, including bounds checks;
+            # stripping it to a column would broadcast a singleton instead.
+            !external && Meta.isexpr(ex, :ref, 2) && ex.args[2] === ivar &&
                 ex.args[1] isa Symbol && ex.args[1] ∉ lnames && return ex
             if ex isa Expr && (ex.head === :call || _is_dotted_call(ex)) &&
                     !isempty(ex.args) && (_cell_object_call(ex.args[1]) || object)
                 vals = ex.head === :call ? ex.args[2:end] : ex.args[2].args
-                return Expr(:call, ex.args[1], map(arg, vals)...)
+                arguments = map(arg, vals)
+                return ex.head === :call ? Expr(:call, ex.args[1], arguments...) :
+                    Expr(:., ex.args[1], Expr(:tuple, arguments...))
             end
             if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames)
                 nm = gensym(:_rkppl_selected)
@@ -5048,7 +5058,8 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
             _plate_param_range(col, rkind, data), line))
         return Expr[]
     end
-    bares = _cell_bares(obj, ivar, data)
+    bares = _cell_bares(obj, ivar, data;
+        whole_arguments = _external_rhs(obj) && Meta.isexpr(obj, :call))
     setdiff!(bares, plate_defs)
     push!(ctx, (col, line, bares))
     (obj isa Expr && (obj.head === :call || obj.head === :.) || _external_rhs(obj)) || _sfail(
@@ -5058,11 +5069,10 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     # vectorized observation (the distribution call and its wrappers take
     # their dotted form even over scalar-only arguments — `y[i] ~ Normal(0,
     # 1)` observes every row).
-    obj, _ = _dotify_cell(obj, ivar, pidx, true)
-    # An open RHS constructor at the root is applied once per authored
-    # iteration, including qualified and lowercase caller bindings.
     if _external_rhs(obj) && Meta.isexpr(obj, :call)
-        obj = Expr(:., obj.args[1], Expr(:tuple, obj.args[2:end]...))
+        obj = _dotify_external_cell_call(obj, ivar, pidx, _is_broadcast_sample(c))
+    else
+        obj, _ = _dotify_cell(obj, ivar, pidx, true)
     end
     if rkind[1] === :coloncall
         # A literal range keeps its authored indices (`indexed_observations`),
@@ -5073,6 +5083,32 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     index = rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
         Expr(:call, :axes, rkind[2], rkind[3])
     return Expr[Expr(:call, :.~, Expr(:ref, col, index, lhs.args[3:end]...), obj)]
+end
+
+# An undotted external constructor consumes its shared arrays whole. A
+# per-index argument adds an outer constructor lane, without turning those
+# shared arrays (including shared slices) into lanes. In a dotted observation
+# cell the retained group already selects the per-index arguments; its inner
+# observations share the resulting undotted constructor.
+function _dotify_external_cell_call(obj, ivar, pidx, broadcast_observations)
+    positional = filter(a -> !Meta.isexpr(a, :parameters), obj.args[2:end])
+    broadcast_constructor = !broadcast_observations &&
+        any(a -> _cell_reads_index(a, ivar, pidx), positional)
+    arguments = Any[]
+    for argument in obj.args[2:end]
+        if Meta.isexpr(argument, :parameters)
+            push!(arguments, _strip_cell(argument, ivar))
+            continue
+        end
+        per = _cell_reads_index(argument, ivar, pidx)
+        value = per ? first(_dotify_cell(argument, ivar, pidx, false)) : argument
+        if broadcast_constructor && !per
+            value = Expr(:call, GlobalRef(Base, :Ref), value)
+        end
+        push!(arguments, value)
+    end
+    broadcast_constructor ? Expr(:., obj.args[1], Expr(:tuple, arguments...)) :
+        Expr(:call, obj.args[1], arguments...)
 end
 
 _undot_cell_object(ex) = ex
@@ -5128,9 +5164,16 @@ end
 # discipline on the way: refs are exactly `v[i]` or a gather `v[g[i]]`
 # through a data index column `g`, and `i` appears only as an index.
 # Function heads and kw names are positions, not refs.
-function _cell_bares(ex, ivar, data::Set{Symbol})
+function _cell_bares(ex, ivar, data::Set{Symbol}; whole_arguments::Bool = false)
     bares = Set{Symbol}()
-    _cell_bares!(ex, ivar, bares, data)
+    if whole_arguments
+        for argument in ex.args[2:end]
+            _expr_has_sym(argument, ivar) || continue
+            _cell_bares!(argument, ivar, bares, data)
+        end
+    else
+        _cell_bares!(ex, ivar, bares, data)
+    end
     return bares
 end
 
@@ -5161,6 +5204,9 @@ function _cell_bares!(ex::Expr, ivar, bares, data)
         whole = _cell_whole_call(fn)
         reads = whole ? Set{Symbol}() : bares
         for a in ex.args[2:end]
+            # A shared slice is one whole argument, not a cell-index read.
+            # Reads involving the loop index still obey the ordinary checks.
+            whole && !_expr_has_sym(a, ivar) && continue
             _cell_bares!(a, ivar, reads, data)
         end
         return nothing
@@ -5231,7 +5277,7 @@ _cell_object_call(f::Symbol) =
     isuppercase(first(string(f))) || f in _CELL_OBJECT_WRAPPERS
 _cell_object_call(f) = false
 
-_cell_whole_call(f::Symbol) = f in REDUCTION_FNS || f in _WHOLE_READ_FNS ||
+_cell_whole_call(f::Symbol) = f === :Ref || f in REDUCTION_FNS || f in _WHOLE_READ_FNS ||
     (!_builtin_value_head(f) && !_cell_object_call(f))
 _cell_whole_call(f::GlobalRef) = !_cell_object_call(f.name)
 _cell_whole_call(f::Expr) = f.head === :. && length(f.args) == 2 &&
