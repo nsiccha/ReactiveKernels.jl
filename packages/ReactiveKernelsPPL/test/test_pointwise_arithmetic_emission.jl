@@ -1,4 +1,5 @@
 using Test, ReactiveKernelsPPL, ReactiveKernels, DifferentiationInterface, Enzyme
+using Distributions: Normal, LogNormal, logpdf
 
 @testset "one-axis arithmetic producers and an internal indexed read" begin
     model = @rkppl begin
@@ -163,6 +164,56 @@ end
 
 _pointwise_primal_bytes(q, u) = @allocated q(u)
 _pointwise_reverse_bytes(q, g, u) = @allocated sampler_value_and_gradient!(q, g, u)
+
+@testset "nonlinear pointwise producer fuses into a likelihood plate" begin
+    model = @rkppl begin
+        effects[1:3] .~ Normal.(0, 1)
+        scale ~ LogNormal(0, 0.5)
+        power ~ LogNormal(0, 0.5)
+        mu = effects[idx] .* exp.(-((x ./ scale) .^ power))
+        y .~ Normal.(mu, 1.2)
+    end
+    bytes = Int[]
+    for n in (5, 55)
+        idx = mod1.(1:n, 3)
+        x = [0.2 + 0.03i for i in 1:n]
+        y = [-0.4 + 0.02i for i in 1:n]
+        saved = deepcopy((idx, x, y))
+        plan = model(; idx, x) | (; y)
+        built = build_kernel(plan)
+        source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
+        @test occursin("mu = plate(", source)
+        @test occursin("ReactiveKernels._readonly_gather(effects, idx)", source)
+        u = collect(unconstrain(built.layout,
+            (; effects = [-0.2, 0.3, 0.1], scale = 1.1, power = 1.4)))
+        query = prepare_sampler(built, plan, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        gradient = similar(u)
+        oracle(v) = begin
+            c = constrain(built.layout, v)
+            mean = c.effects[idx] .* exp.(-((x ./ c.scale) .^ c.power))
+            sum(logpdf(Normal(0, 1), effect) for effect in c.effects; init = 0.0) +
+                logpdf(LogNormal(0, 0.5), c.scale) +
+                logpdf(LogNormal(0, 0.5), c.power) +
+                sum(logpdf(Normal(mean[i], 1.2), y[i]) for i in eachindex(y); init = 0.0) +
+                log(c.scale) + log(c.power)
+        end
+        value, _ = sampler_value_and_gradient!(query, gradient, u)
+        @test value ≈ oracle(u) rtol = 1e-12
+        @test query(u) ≈ value rtol = 1e-12
+        for k in eachindex(u)
+            up, down = copy(u), copy(u)
+            up[k] += 1e-6
+            down[k] -= 1e-6
+            @test gradient[k] ≈ (oracle(up) - oracle(down)) / 2e-6 atol = 2e-6
+        end
+        @test (idx, x, y) == saved
+        emitted = sprint(show, Base.remove_linenums!(deepcopy(code_expr(query.kernel))))
+        @test !occursin(r"\bmu = \(__ops__\[", emitted)
+        push!(bytes, _pointwise_primal_bytes(query.kernel, u))
+    end
+    @test bytes[2] - bytes[1] <= 64
+end
 
 @testset "direct parameter gathers share read-only views with queries" begin
     model = @rkppl begin
