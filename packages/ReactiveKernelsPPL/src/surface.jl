@@ -1168,8 +1168,12 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         prior_names, plate_names)
     setdiff!(structural, value_defs)
     vecdefs = Set{Symbol}(nm for (nm, _) in det if detshape[nm] === :vector)
+    # Model names: a scan's carried arrays are values like any definition,
+    # so every distribution argument reads them (`Normal.(mu, sigma)` over a
+    # scan-carried `sigma`), they shadow module bindings and synthesized
+    # names avoid them.
     taken = union(data, Set{Symbol}(nm for (nm, _) in det), prior_names,
-        plate_names)
+        plate_names, Set{Symbol}(st for s in scans for st in s.states))
     # Interned predictors by name (shared with `ctx`: a composition over a
     # definition already interned as a predictor reads its LP node).
     pred_idx = Dict{Symbol,Int}()
