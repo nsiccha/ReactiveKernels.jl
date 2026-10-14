@@ -245,6 +245,7 @@ const _PPL_TEST_FILES = (
     "test_boolean_response_values.jl",
     "test_boolean_response_values_reactant.jl",
     "test_parameter_priors.jl",
+    "test_dirichlet_data_size.jl",
     "test_restricted_priors.jl",
     "test_expression_arguments.jl",
     "test_inline_latent_values.jl",

@@ -7712,9 +7712,22 @@ function _dirichlet_size(plan, alpha, label)
         i === nothing || return _dirichlet_size(plan, definitions[i].expr, label)
     end
     axes = _value_axes(plan, alpha; data_axes = true)
-    axes !== nothing && length(axes) == 1 || _fail(label,
+    if axes !== nothing && length(axes) == 1
+        return _array_dim_size(plan, Symbol(label), label, only(axes))
+    end
+    # A data-only constructor such as `ones(K)` has a concrete value at
+    # binding even when the symbolic array-shape walker cannot infer it.
+    names = Set{Symbol}(_all_names(plan))
+    all(s -> _reads_data_only(plan, s, names, Set{Symbol}()),
+        _expr_value_symbols(alpha)) || _fail(label,
         "Dirichlet concentration must have a known vector shape; got $(repr(alpha))")
-    return _array_dim_size(plan, Symbol(label), label, only(axes))
+    value = _bound_data_value(plan, alpha, label, "Dirichlet concentration")
+    value isa AbstractVector || _fail(label,
+        "Dirichlet concentration must be a vector; got $(summary(value))")
+    isempty(value) && _fail(label, "Dirichlet concentration vector must be nonempty")
+    all(x -> x isa Real && isfinite(x) && x > 0, value) || _fail(label,
+        "Dirichlet concentrations must be finite and strictly positive")
+    return length(value)
 end
 
 function _resolve_vector_extent(p::VectorParameter, plan, columns, responses)
