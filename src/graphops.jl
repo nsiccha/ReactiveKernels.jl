@@ -162,14 +162,15 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     residual, specialized = _bound_residual(entry, cache, hoisted, classes)
     # A residual the inner-plate pass rewrote bakes this binding's values in.
     specialized === residual || return prepare(specialized; passes = passes)
-    # Bindings whose plates read bound arguments of the same classes share a
-    # compiled residual; a new class lowers its own.
+    # Bindings with the same plate classes and finite loop schedules share a
+    # compiled residual. Extents and index patterns stay runtime constants.
+    template_key = (classes, _bound_index_run_classes(entry.index_run_slots, hoisted))
     fresh = nothing
     template = lock(cache.lock) do
-        current = get(entry.templates, classes, _UnbuiltTemplate())
+        current = get(entry.templates, template_key, _UnbuiltTemplate())
         current isa _UnbuiltTemplate || return current
         template, kernel = _bound_build(entry, residual, hoisted, passes)
-        entry.templates[classes] = template
+        entry.templates[template_key] = template
         fresh = kernel
         template
     end
