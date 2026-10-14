@@ -182,14 +182,14 @@ function _pointwise_leaf(ex, values::Dict{Symbol,_PointwiseValue})
     return _POINTWISE_UNKNOWN
 end
 
-function _pointwise_tree!(inputs, formals, ex, values)
+function _pointwise_tree!(inputs, formals, ex, values, columns)
     if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
             haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
             length(ex.args) in (2, 3)
         terms = Any[]
         states = _PointwiseValue[]
         for a in ex.args[2:end]
-            term, state = _pointwise_tree!(inputs, formals, a, values)
+            term, state = _pointwise_tree!(inputs, formals, a, values, columns)
             state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
             push!(terms, term)
             push!(states, state)
@@ -201,21 +201,36 @@ function _pointwise_tree!(inputs, formals, ex, values)
             _PointwiseValue(rank, rank == 1 ? only(lens) : 0,
                 any(s.live for s in states), rank == 1)
     end
-    state = _pointwise_leaf(ex, values)
+    leaf, state = if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
+            ex.args[2] isa Symbol
+        base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
+        idx = get(columns, ex.args[2], nothing)
+        if base.rank == 1 && base.generated && base.live &&
+                idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
+                axes(idx, 1) == Base.OneTo(length(idx))
+            # The view is read only by this pure cell; no gathered alias escapes.
+            :(ReactiveKernels._tensorized_view($(ex.args...))),
+                _PointwiseValue(1, length(idx), true, false)
+        else
+            ex, _POINTWISE_UNKNOWN
+        end
+    else
+        ex, _pointwise_leaf(ex, values)
+    end
     state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
-    ex isa Number && return ex, state
-    i = findfirst(x -> isequal(x, ex), inputs)
+    leaf isa Number && return leaf, state
+    i = findfirst(x -> isequal(x, leaf), inputs)
     if i === nothing
-        push!(inputs, ex)
+        push!(inputs, leaf)
         push!(formals, Symbol(:_ppl_c, length(formals) + 1))
         i = length(inputs)
     end
     return formals[i], state
 end
 
-function _pointwise_rhs(ex, values)
+function _pointwise_rhs(ex, values, columns)
     inputs, formals = Any[], Symbol[]
-    body, state = _pointwise_tree!(inputs, formals, ex, values)
+    body, state = _pointwise_tree!(inputs, formals, ex, values, columns)
     state.rank == 1 && state.live || return ex, state
     plate = Expr(:do, Expr(:call, :plate, inputs...),
         Expr(:->, Expr(:tuple, formals...), Expr(:block, body)))
@@ -299,7 +314,7 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         end
         if Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
                 haskey(_POINTWISE_ARITHMETIC, rhs.args[1])
-            candidate, state = _pointwise_rhs(rhs, values)
+            candidate, state = _pointwise_rhs(rhs, values, plan.columns)
             if state.rank >= 0
                 values[name] = _PointwiseValue(state.rank, state.length,
                     state.live, state.rank == 1)
