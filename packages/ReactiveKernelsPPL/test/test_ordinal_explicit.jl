@@ -137,6 +137,33 @@ end
     @test only(long_bound.vector_parameters).size == 3
 end
 
+@testset "native ordered vectors preserve packed inputs and gradients" begin
+    model = @rkppl begin
+        c ~ Ordered(Normal(0, 1), length(indices))
+    end
+    for n in (0, 1, 3, 32)
+        bound = bind_data(model(; indices = collect(1:n)))
+        built = build_kernel(bound)
+        u = [0.4 * sin(i) - 0.3 for i in 1:n]
+        original = copy(u)
+        q = prepare_sampler(built, bound, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        c = ordered_constrain(u)
+        expected = -n * log(2pi) / 2 - sum(abs2, c; init = 0.0) / 2 +
+            (n < 2 ? 0.0 : sum(view(u, 2:n)))
+        @test q(u) ≈ expected rtol = 1e-12 atol = 1e-12
+        g = similar(u)
+        value, _ = sampler_value_and_gradient!(q, g, u)
+        @test value ≈ expected rtol = 1e-12 atol = 1e-12
+        @test u == original
+        for i in eachindex(u)
+            expected_g = i == 1 ? -sum(c) :
+                1 - exp(u[i]) * sum(view(c, i:n))
+            @test g[i] ≈ expected_g rtol = 1e-11 atol = 1e-11
+        end
+    end
+end
+
 @testset "explicit cutpoints: Ordinal cumulative and stopping densities" begin
     cols = _oe_cols()
     for (link, F) in ((:ProbitLink, _oe_probit), (:CloglogLink, _oe_cloglog))

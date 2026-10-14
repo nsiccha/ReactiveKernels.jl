@@ -515,8 +515,9 @@ _simplex_logit(z::Real) = log(z) - log1p(-z)
     ordered_constrain(u) -> Vector
 
 Host-side ordered transform (Stan `ordered`): `y[1] = u[1]`,
-`y[i] = y[i-1] + exp(u[i])` — the running sum `cumsum` computes in the
-same order, which is what the in-graph twin emits (bit-identical).
+`y[i] = y[i-1] + exp(u[i])`. The native in-graph transform uses the same
+recurrence; its traced array expression is mathematically equivalent and may
+differ in floating-point rounding.
 Like every host transform, it follows the input's number type and returns
 `Float64` values for plain reals.
 """
@@ -527,6 +528,31 @@ function ordered_constrain(u::AbstractVector{<:Real})
         y[i] = i == 1 ? convert(T, x) : y[i-1] + exp(convert(T, x))
     end
     return y
+end
+
+# The packed sampler input stays read-only. Native execution builds the
+# constrained vector in one fresh buffer, then reuses it for the prefix sum.
+# The traced path retains the vector expression used by the compiled backend.
+@inline function _ordered_constrain_native(u::AbstractVector{Float64})
+    y = Vector{Float64}(undef, length(u))
+    isempty(u) && return y
+    y[1] = u[1]
+    @inbounds @simd for i in 2:length(u)
+        y[i] = exp(u[i])
+    end
+    @inbounds for i in 2:length(u)
+        y[i] = y[i-1] + y[i]
+    end
+    return y
+end
+
+@inline function _ordered_constrain_kernel(u::AbstractVector{Float64}, lo::Int, hi::Int)
+    # Value-level is_traced walks an IdSet that native Enzyme cannot differentiate.
+    if ReactiveKernels.ReactantCore.within_compile()
+        return cumsum(vcat(Float64.(view(u, lo:lo)),
+            exp.(view(u, lo + 1:hi))))
+    end
+    return _ordered_constrain_native(view(u, lo:hi))
 end
 
 """Inverse of [`ordered_constrain`](@ref)."""
@@ -1703,11 +1729,12 @@ _vector_lr(e::LayoutEntry) = Symbol(:_ppl_vlr_, e.name)
 # entry's own name, whatever its (data-inferred) level count — the
 # statement count and the traced program do not grow with K (core
 # constraint 1). They emit the host `ordered_constrain`/`simplex_constrain`
-# vector operations verbatim, so in-graph and host agree bit-for-bit.
+# vector mathematics; the native ordered path uses the host recurrence.
 # Consumers gather from the vector (`Ref(v)` plate inputs, `v[idx]`).
-# Every leading/pivot slice is materialized: a
-# `vcat` mixing a `SubArray` and a `Vector` lowers through a Union-typed
-# path the native Enzyme reverse pass rejects. Simplex packed coordinates
+# The traced ordered path materializes its leading slice: a `vcat` mixing a
+# `SubArray` and a `Vector` lowers through a Union-typed path the native
+# Enzyme reverse pass rejects. Native ordered execution uses one buffer.
+# Simplex packed coordinates
 # use a native view; traced arrays use an array slice through
 # `_tensorized_view`, avoiding Reactant's nested SubArray reindexing.
 # Size specializations
@@ -1738,9 +1765,9 @@ function _vector_transform_statements(e::LayoutEntry)
         e.size == 0 && return Expr[]
         e.size == 1 && return Expr[:($(e.name)::AbstractVector{Float64} =
             view(unconstrained, $lo:$lo))]
+        f = GlobalRef(@__MODULE__, :_ordered_constrain_kernel)
         return Expr[:($(e.name)::AbstractVector{Float64} =
-            cumsum(vcat(Float64.(view(unconstrained, $lo:$lo)),
-                exp.(view(unconstrained, $(lo + 1):$hi)))))]
+            $f(unconstrained, $lo, $hi))]
     end
     # :simplex — stick-breaking (thin-layer-owned, not Stan's ILR).
     K = e.size + 1
