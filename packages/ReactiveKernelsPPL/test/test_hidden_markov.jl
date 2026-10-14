@@ -101,6 +101,46 @@ end
         points = (collect(range(-0.5, 0.5; length = 11)),))
 end
 
+# The same softmax over `hcat` of declared per-state columns: an `hcat` of
+# model-level values is a model-level matrix, so the named, two-step and
+# one-line spellings mean what the declared matrix `W` does above.
+@testset "input-driven transitions from hcat columns" begin
+    u = [0.5 1.0; 1.2 -0.3; 0.1 0.4; 2.0 1.1; -0.4 0.2; 0.9 -1.0]
+    function oracle(c)
+        R = u * hcat(c.w1, c.w2)
+        P = exp.(R) ./ sum(exp.(R); dims = 2)
+        path_sum((t, k) -> logpdf(Normal(c.mu[k], 1), y[t]),
+            (i, j, t) -> P[t, i], [0.5, 0.5], length(y))
+    end
+    softmaxes = (
+        :(begin
+            R = u * hcat(w1, w2)
+            E = exp.(R)
+            P = E ./ sum.(eachrow(E))
+        end),
+        :(begin
+            R = u * hcat(w1, w2)
+            P = exp.(R .- log.(sum.(eachrow(exp.(R)))))
+        end),
+        :(begin
+            Wm = hcat(w1, w2)
+            P = exp.(u * Wm) ./ sum.(eachrow(exp.(u * Wm)))
+        end),
+    )
+    for softmax in softmaxes
+        check_model(quote
+            w1[axes(u, 2)] .~ Normal.(0, 5)
+            w2[axes(u, 2)] .~ Normal.(0, 5)
+            mu ~ Ordered(Normal(0, 5), 2)
+            $(softmax.args...)
+            moves = reshape(permutedims(P[2:end, :]), 2, 1, size(u, 1) - 1)
+            y ~ LogDensity(normal_hmm_logdensity, mu, 1.0, moves, [0.5, 0.5])
+        end, (; y, u), oracle;
+            points = ([0.3, -0.4, 0.1, 0.5, -0.2, 0.6],
+                [-0.7, 0.2, 0.9, -0.3, 0.4, 1.1]))
+    end
+end
+
 streams = hcat([0.5, 1.2, 0.1, 2.0, 0.3, 0.8], [1.0, 0.3, 0.7, 0.2, 1.4, 0.5])
 
 @testset "two exponential streams" begin

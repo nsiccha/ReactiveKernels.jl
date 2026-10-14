@@ -631,6 +631,13 @@ preserves the inline expression's density, priors and coefficient coordinates.
 A direct product can also be an affine component in a composed predictor,
 such as `p = X * b; mu = p .+ q` with another component `q`.
 
+An `hcat` of model-level values, such as declared vectors or sampled scalars,
+is a model-level matrix, as a declared matrix is: `u * hcat(w1, w2)` means
+`u * W` for `W[axes(u, 2), 1:2]`. Elementwise maps over it keep their Julia
+meaning, named or inline: `E = exp.(u * hcat(w1, w2)); P = E ./ sum.(eachrow(E))`
+normalizes each row. An `hcat` with an observation column, such as
+`hcat(ones(length(x)), x)`, has one row per observation.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
 ```
