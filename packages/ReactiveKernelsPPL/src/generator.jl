@@ -1352,7 +1352,9 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         append!(stmts, _cell_broadcast_observation(plan, p.name) ?
             _cell_broadcast_stmts(p, plan, ps, vcat(upstream, selection)) : ps)
         push!(terms, Symbol(:_ppl_prior_, p.name))
-        push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
+        # An undotted observation is one whole-event density.
+        push!(points, p.name => Symbol(
+            p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
     end
     observed = _density_selection(plan, n -> n in plan.conditioned)
     _parameter_prior_statements!(stmts, terms, observed, layout;

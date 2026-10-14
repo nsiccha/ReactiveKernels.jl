@@ -662,6 +662,10 @@ function _conditioned_declarations(ast, names)
         # broadcast response, its observed value keeps its observation axis
         # instead of becoming an internal conditioned-parameter input.
         _is_glm_call(last(st.args)) && continue
+        # A caller-owned law observing a definition reads that value, so the
+        # definition is never a conditioned input (`_partition_statements`).
+        _is_sample(st) && lhs isa Symbol && haskey(definitions, lhs) &&
+            _external_rhs(last(st.args)) && continue
         # A positional slice of an observed stream remains a response.
         # Sized level/matrix axes and matrix declarations retain array metadata.
         array = lhs isa Expr && ((lhs.head === :ref &&
@@ -953,6 +957,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     end
     sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
         _partition_statements(ast, data; array_entries)
+    # Definitions a caller-owned law observes as one whole event with an
+    # undotted `~` (`_partition_statements`): observations, never parameters.
+    whole_observed = Set{Symbol}(s.lhs for s in sample if !s.broadcast &&
+        s.dims === nothing && any(p -> first(p) === s.lhs, det))
     sample, det = _rewrite_plate_rows(sample, det)
     # Latent plates over values read their cell count as bound data.
     extents = Set{Symbol}(_plate_extent_input(nm) for (nm, rhs, _, _) in plate_specs
@@ -1016,14 +1024,14 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # name table (mixture/coef-prior/param positions keep treating them
     # as data) and skipped by parameter lowering.
     derived_response_names = Set{Symbol}(s.lhs for s in sample
-        if s.broadcast && s.levels === nothing && s.matrix === nothing &&
-            s.lhs ∉ data && s.lhs in detnames_all)
+        if (s.broadcast || s.lhs in whole_observed) && s.levels === nothing &&
+            s.matrix === nothing && s.lhs ∉ data && s.lhs in detnames_all)
     sampled_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     prior_names = setdiff(sampled_names, derived_response_names)
     # Declarations determine value/prior semantics. Affine recognition
     # may use these values regardless of their prior or other readers.
     ordinary_parameters = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && _ordinary_sampling(s))
+        if s.lhs ∉ data && s.lhs ∉ whole_observed && _ordinary_sampling(s))
     scalar_parameters = Set{Symbol}(s.lhs for s in sample
         if s.lhs in ordinary_parameters && !s.broadcast &&
             s.dims === nothing)
@@ -1132,9 +1140,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # prove: an undotted module call's result is model-level here
     # (`y = f(raw)`). `bind_data` evaluates the definition once and
     # validates its value as the response; a number is one observation, as
-    # when bound as data.
+    # when bound as data. An ordinary `hcat` matrix value
+    # (`_route_hcat_values`) is observed as the same matrix bound as data.
     for nm in derived_response_names
-        get(detshape, nm, nothing) === :scalar || continue
+        shape = get(detshape, nm, nothing)
+        shape === :scalar || (shape === :matrix && nm in matrix_values) || continue
         rhs = detmap[nm]
         !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
             (detshape[nm] = :vector)
@@ -1244,6 +1254,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
                 s.range === nothing ? s.lhs : s.range
             args = merge(args, (; observation))
             push!(external_observations, SampledParameter(s.lhs, :external, args, nothing, s.lhs))
+            continue
+        end
+        if s.lhs in whole_observed
+            # One whole-event density of the definition's value; a
+            # data-only value binds once (`_derived_response_names`).
+            args = _external_parameter(s.lhs, s.rhs, (), mod, ctx.taken;
+                observed=true, broadcast=false)
+            push!(external_observations, SampledParameter(s.lhs, :external,
+                merge(args, (; observation = s.lhs)), nothing, s.lhs))
             continue
         end
         if s.broadcast
@@ -3232,6 +3251,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
     # Definitions observed by a `.~` response (derived responses —
     # either statement order; the double-observation guard).
     derived_observed = Set{Symbol}()
+    # Definitions a caller-owned law observes whole with an undotted `~`.
+    whole_observed = Set{Symbol}()
     factored = Set{Symbol}()
     seen_doc = false
     line = 0
@@ -3380,8 +3401,23 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
             lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde,
                 derived_range ? union(data, (st.args[2].args[1],)) : data,
                 level_bindings)
+            if !bc && st.args[2] isa Symbol && lhs in detnames && lhs ∉ data &&
+                    _external_rhs(st.args[3])
+                # A caller-owned law observes a definition as one whole
+                # event (`ys = log.(raw); ys ~ LogDensity(f, m)`), exactly as
+                # it observes the same value bound as data; `.~` broadcasts
+                # the same law over the value's entries instead.
+                (lhs in derived_observed || lhs in factored) && _sfail(
+                    "$lhs is already observed (one observation per definition)")
+                lhs in seen || _claim!(seen, seelines, lhs, line)
+                push!(derived_observed, lhs)
+                push!(whole_observed, lhs)
+                _reject_target(st.args[3], lhs)
+                push!(sample, SampleStmt(lhs, st.args[3], false))
+                continue
+            end
             if !bc && st.args[2] isa Symbol && lhs in detnames && lhs ∉ data
-                lhs in factored && _sfail(
+                (lhs in factored || lhs in whole_observed) && _sfail(
                     "deterministic density factor $lhs is stated twice")
                 push!(factored, lhs)
                 _reject_target(st.args[3], lhs)
@@ -3700,6 +3736,9 @@ function _ordinary_hcat_values(sample, det, data, glms)
     for s in sample
         s.matrix in mats && push!(used, s.matrix)
         walk(s.rhs)
+        # An observed `hcat` definition is the matrix value it observes,
+        # read like the same matrix bound as data.
+        s.lhs in mats && push!(generic, s.lhs)
     end
     union!(generic, setdiff(mats, used))
     # The GLM reads these whole, as values.
