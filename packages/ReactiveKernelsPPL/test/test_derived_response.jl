@@ -101,7 +101,7 @@ end
                 mu = b1 .+ b2 .* x
                 ly ~ Normal(0, 1)
             end,
-            "defined twice"),
+            "needs a scalar definition"),
         ("design matrix LHS",
             quote
                 X = hcat(ones(length(x)), x)

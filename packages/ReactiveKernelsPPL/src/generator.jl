@@ -181,6 +181,36 @@ function _pointwise_leaf(ex, values::Dict{Symbol,_PointwiseValue})
     return _POINTWISE_UNKNOWN
 end
 
+# A concatenated numeric value may subsequently be gathered by observation
+# indices. Its length is structural metadata for the pointwise pass; the
+# concatenation itself remains the authored Julia call and runs once.
+function _pointwise_concat_part(ex, values, bound_names)
+    state = _pointwise_leaf(ex, values)
+    state.rank >= 0 && return state
+    Meta.isexpr(ex, :call) && !isempty(ex.args) || return _POINTWISE_UNKNOWN
+    fn = ex.args[1]
+    if fn === :sum && :sum ∉ bound_names && length(ex.args) == 2
+        part = _pointwise_concat_part(ex.args[2], values, bound_names)
+        part.rank == 1 && return _PointwiseValue(0, 0, part.live)
+    elseif fn in (:+, :-) && length(ex.args) == 2
+        part = _pointwise_concat_part(ex.args[2], values, bound_names)
+        part.rank == 0 && return part
+    end
+    return _POINTWISE_UNKNOWN
+end
+
+function _pointwise_concat_state(rhs, values, bound_names)
+    Meta.isexpr(rhs, :call) && length(rhs.args) >= 2 || return _POINTWISE_UNKNOWN
+    fn = rhs.args[1]
+    is_base_vcat = fn isa GlobalRef && isdefined(fn.mod, fn.name) &&
+        getglobal(fn.mod, fn.name) === Base.vcat
+    is_base_vcat || return _POINTWISE_UNKNOWN
+    parts = [_pointwise_concat_part(a, values, bound_names) for a in rhs.args[2:end]]
+    all(p -> p.rank >= 0, parts) || return _POINTWISE_UNKNOWN
+    return _PointwiseValue(1, sum(p -> p.rank == 0 ? 1 : p.length, parts),
+        any(p.live for p in parts))
+end
+
 function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
     if ex isa Symbol && haskey(gathers, ex)
         return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers)
@@ -301,6 +331,13 @@ end
 function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
     stmts = def.args[2].args
     values = Dict{Symbol,_PointwiseValue}()
+    bound_names = Set{Symbol}(keys(plan.columns))
+    for st in stmts
+        Meta.isexpr(st, :(=), 2) || continue
+        lhs = st.args[1]
+        name = Meta.isexpr(lhs, :(::), 2) ? lhs.args[1] : lhs
+        name isa Symbol && push!(bound_names, name)
+    end
     gathers = Dict{Symbol,Expr}()
     gather_stmts = Dict{Symbol,Expr}()
     for (name, value) in plan.columns
@@ -345,6 +382,11 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
                 continue
             end
         end
+        concat = _pointwise_concat_state(rhs, values, bound_names)
+        if concat.rank == 1
+            values[name] = concat
+            continue
+        end
         if Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
                 haskey(_POINTWISE_ARITHMETIC, rhs.args[1])
             candidate, state = _pointwise_rhs(rhs, values, plan.columns, gathers)
@@ -359,7 +401,7 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         else
             # A scalar coordinate remains a shared plate input. Its ordinary
             # indexed read retains the original bounds check.
-            state = _pointwise_leaf(rhs, values)
+            state = _pointwise_concat_part(rhs, values, bound_names)
             state.rank >= 0 ? (values[name] = state) : delete!(values, name)
         end
     end
@@ -415,17 +457,20 @@ function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTabl
         shape = design_shape(p, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
         chunks = Any[]
+        scalar_chunks = Any[]
         legacy_offset = 0
         for (t, b) in zip(p.terms, shape.blocks)
             b.width == 0 && continue
             if _parameter_term(t)
                 value = t.options.parameter
                 value = t.options.sign == 1 ? value : :(-$value)
+                push!(scalar_chunks, value)
                 # All concatenation inputs are vectors. Mixing a traced
                 # scalar with a vector takes Julia's scalar-fill cat path.
                 push!(chunks, t.kind in (FactorTerm, MatrixTerm) ?
                     :(Float64.($value)) : :([$value]))
             else
+                push!(scalar_chunks, nothing)
                 coef = block_name(p.name)
                 slice = Expr(:ref, coef,
                     Expr(:call, :(:), legacy_offset + 1,
@@ -435,7 +480,12 @@ function _affine_coefficient_statements(plan::StructuralPlan, layout::LayoutTabl
             end
         end
         terms = [t for (t, b) in zip(p.terms, shape.blocks) if b.width > 0]
-        if length(chunks) == 1 && any(t -> _parameter_term(t) &&
+        if _scalar_column_plate_eligible(plan, p, shape) &&
+                all(!isnothing, scalar_chunks)
+            # This path reads only scalar coordinates; no matrix consumer
+            # needs an allocated coefficient vector.
+            rhs = Expr(:tuple, scalar_chunks...)
+        elseif length(chunks) == 1 && any(t -> _parameter_term(t) &&
                 t.kind in (FactorTerm, MatrixTerm), terms)
             t = only(t for t in terms if _parameter_term(t))
             value = t.options.parameter
@@ -2232,12 +2282,13 @@ function _glm_object_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol
     ]
     r.family === PoissonLogGLMFam &&
         return Expr[head..., _poisson_glm_split_stmts(r, o, yf, pw, node)...]
-    # The Normal-identity density reads the object's `logpdf`, an owned rule
-    # whose reverse branch is one X'r product (DK `normal_id_glm_lpdf`), so
-    # neither the sampler nor its gradient materializes or differentiates the
-    # per-observation vector that only the `:pointwise` query reads. The
-    # Bernoulli object's `logpdf` is `sum(pointwise)`, so it sums that vector.
-    density = r.family === NormalIDGLMFam ? :($o.logpdf($yf)) : :(sum($pw))
+    # Call the owned Normal rule directly, as the equivalent per-observation
+    # design-product path does. The object remains for pointwise queries, but
+    # the sampler need not enter its constructed `logpdf` endpoint. Its
+    # reverse branch is one X'r product; Bernoulli still sums its pointwise
+    # vector.
+    density = r.family === NormalIDGLMFam ?
+        :(normal_id_glm_lpdf($xaug, $bfull, $s, $yf)) : :(sum($pw))
     return Expr[head..., :($pw = $o.pointwise($yf)), :($node::Float64 = $density)]
 end
 
@@ -4350,6 +4401,13 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         end
     end
     _parameter_prior_statements!(stmts, terms, plan, layout)
+    for factor in plan.factors
+        node = Symbol(:_ppl_factor_, factor.name)
+        density = _sampled_prior_expr(factor; conditioned = true,
+            float64_args = _float64_inputs(context, values(factor.args)))
+        push!(stmts, :($node::Float64 = $density))
+        push!(terms, node)
+    end
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
     # columns (priors addressed by response label — validation pins

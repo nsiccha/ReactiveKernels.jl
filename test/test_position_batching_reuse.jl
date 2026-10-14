@@ -5,6 +5,12 @@ function _position_output_bytes(f::F, args...) where {F}
     f(args...)
     minimum(@allocated(f(args...)) for _ in 1:5)
 end
+function _borrowed_alias_guard(caches, args)
+    for slot in caches
+        ReactiveKernels._replicated_aliases(slot[], args) && (slot[] = nothing)
+    end
+    nothing
+end
 _position_output_buffer(position, data) =
     Matrix{eltype(data)}(undef, length(data), length(position))
 _position_output_scalar_control(position, data) = map(p -> p .* data, position)
@@ -378,6 +384,22 @@ end
     @test result_curves == before_curves[:, [2, 1]] .+ 1
     @test first_curves == before_curves
     @test result_curves !== first_curves
+end
+
+@testset "borrowed numeric records keep alias protection without nested walks" begin
+    records = [(; dose=Float64(i), cov=(; age=40.0+i, male=isodd(i)),
+                weights=(0.1*i, 0.2*i)) for i in 1:32]
+    caches = ntuple(_ -> Ref{Any}(zeros(4, 32)), 24)
+    output = caches[1][]
+    @test !ReactiveKernels._replicated_aliases(output, (records,))
+    @test ReactiveKernels._replicated_aliases(output, (view(output, :, 1),))
+    @test ReactiveKernels._replicated_aliases(output,
+        ([(; cov=(; values=view(output, :, 1)))],))
+    @test ReactiveKernels._replicated_aliases(output,
+        (Any[(; cov=(; values=view(output, :, 1)))],))
+    _borrowed_alias_guard(caches, (records,))
+    bytes = minimum(@allocated(_borrowed_alias_guard(caches, (records,))) for _ in 1:5)
+    @test bytes <= 32_768
 end
 
 # The native position driver projects each batched dense array port into one

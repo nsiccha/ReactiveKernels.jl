@@ -75,6 +75,14 @@ Main.ReactiveKernelsDocs.render_rkppl_strict_error()
 Coefficient vectors are declared the same way, sized by their design matrix:
 `b[axes(X, 2)] .~ Normal.(0, 1)`.
 
+A scalar deterministic definition can carry a density factor without adding
+a sampled coordinate. For example, `beta_last = -sum(beta_free)` followed by
+`beta_last ~ Normal(0, 3)` adds `logpdf(Normal(0, 3), beta_last)` to the prior.
+The factor uses an admitted scalar distribution and the definition keeps its
+ordinary value for later reads, such as `beta = vcat(beta_free, beta_last)`.
+The definition is still assigned once; a second factor on the same name is
+rejected. Vector observations use `.~`.
+
 ## Parameter priors
 
 Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
@@ -365,8 +373,9 @@ from parameter geometry, without adding generated values to sampler coordinates.
   execution remains gated by the missing traced `besseli` method.
 - A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
   `y ~ Normal(...)` on a data vector is rejected.
-- A `~` whose left-hand side is a bound data column is an observation; every
-  other `~` declares a parameter.
+- A `~` whose left-hand side is a bound data column is an observation. On an
+  existing scalar definition it adds a density factor; otherwise it declares
+  a parameter.
 - `Ordinal` permits an intercept alongside its thresholds, for both
   cumulative and stopping-ratio responses. Both declarations and their
   priors are translated as written.
@@ -916,14 +925,14 @@ constrain(built.layout, u)               # named constrained values
 restore_draws(built.layout, U)           # U: layout.total × draws
 ```
 
-With reverse-mode `AutoEnzyme`, a pure summed plate and one to four active
-coordinates use a batched forward sweep by default. The generated primal is
-unchanged; Enzyme computes the partials in one traversal without a later
-reverse sweep over the observations. Wider, effectful, scan and retained-output
-programs use the ordinary reverse preparation. `native_forward_batch=false`
-selects that reverse path explicitly for comparison or a workload where it
-performs better. The optimized path can allocate more tangent storage, so
-measure both on the model you fit.
+An explicit `AutoEnzyme(mode=Reverse)` always uses reverse mode. Native forward
+batching is disabled by default. To request that optimization explicitly, use
+`AutoEnzyme()` without a mode together with `native_forward_batch=true`.
+For an eligible pure summed plate with one to four active coordinates, Enzyme
+then computes partials in one batched traversal of the unchanged primal.
+Wider, effectful, scan and retained-output programs keep ordinary reverse.
+The optional path can allocate more tangent storage; measure both on the
+model you fit, and identify the mode used when reporting results.
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.

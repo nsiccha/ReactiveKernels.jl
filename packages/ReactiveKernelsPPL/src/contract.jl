@@ -955,6 +955,8 @@ the names that cell reads per index; when the bound response holds one
 array per index, each cell broadcasts over its own entries.
 `named_values` keeps each authored alias the lowering absorbed addressable
 by its name: `name => node` binds `name` to the graph value `node`.
+`factors` are scalar distribution densities on deterministic assignments;
+they add no coordinate or transform and contribute to `prior`.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -978,7 +980,21 @@ struct StructuralPlan
     external_observations::Vector{SampledParameter}
     cell_broadcasts::Dict{Symbol,Vector{Symbol}}
     named_values::Vector{Pair{Symbol,Symbol}}
+    factors::Vector{SampledParameter}
 end
+
+# Full-positional plans built before deterministic factors carry none.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps,
+        plate_parameters, scans, vector_parameters, matrices,
+        array_parameters, submodel_scopes, conditioned, indexed_observations,
+        external_observations, cell_broadcasts, named_values,
+        SampledParameter[])
 
 # The former full constructor has no optimized authored names.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1120,13 +1136,14 @@ function StructuralPlan(
         indexed_observations::Set{Symbol} = Set{Symbol}(),
         external_observations::Vector{SampledParameter} = SampledParameter[],
         cell_broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
-        named_values::Vector{Pair{Symbol,Symbol}} = Pair{Symbol,Symbol}[])
+        named_values::Vector{Pair{Symbol,Symbol}} = Pair{Symbol,Symbol}[],
+        factors::Vector{SampledParameter} = SampledParameter[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations,
-        external_observations, cell_broadcasts, named_values)
+        external_observations, cell_broadcasts, named_values, factors)
 end
 
 """Find a design matrix by name, or `nothing`."""
@@ -1369,6 +1386,7 @@ function validate_structure(plan::StructuralPlan)
     _validate_assignments_structure(plan)
     _validate_vector_structure(plan)
     _validate_parameters(plan)
+    _validate_factors(plan)
     _validate_plate_parameters(plan)
     for observation in plan.external_observations
         _validate_external_parameter(plan, observation; observation=true)
@@ -3337,7 +3355,7 @@ end
 
 function _validate_parameters(plan::StructuralPlan)
     names = _union_names(plan)
-    for p in plan.parameters
+    for p in (plan.parameters..., plan.factors...)
         if p.family === :external
             _validate_external_parameter(plan, p)
             continue
@@ -3368,6 +3386,18 @@ function _validate_parameters(plan::StructuralPlan)
         end
         _validate_uniform_args(p.label, p.family, p.args)
         _validate_support_override(p.label, p.family, p.support_override, p.args)
+    end
+    return nothing
+end
+
+function _validate_factors(plan::StructuralPlan)
+    definitions = Set{Symbol}(a.name for a in (plan.assignments..., plan.derived...))
+    names = Symbol[f.name for f in plan.factors]
+    length(unique(names)) == length(names) || _fail(:factor,
+        "a deterministic value may have only one density factor")
+    for f in plan.factors
+        f.name in definitions || _fail(f.label,
+            "a deterministic density factor needs an assignment for $(f.name)")
     end
     return nothing
 end

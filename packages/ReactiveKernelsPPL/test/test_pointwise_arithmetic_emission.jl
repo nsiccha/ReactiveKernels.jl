@@ -47,6 +47,46 @@ using Test, ReactiveKernelsPPL, ReactiveKernels, DifferentiationInterface, Enzym
     end
 end
 
+@testset "numeric concatenation feeds a read-only observation gather" begin
+    model = @rkppl begin
+        raw[1:3] .~ Normal.(0, 1)
+        scale ~ Normal(0, 1)
+        beta = vcat(raw, -sum(raw))
+        eta = scale .* x .- beta[idx]
+        y .~ BernoulliLogit.(eta)
+    end
+    logbernoulli(y, eta) = y == 1 ? -log1p(exp(-eta)) : -log1p(exp(eta))
+    lognormal(x) = -0.5x^2 - 0.5log(2pi)
+    for idx in (Int[], [4], [2, 4, 1, 4, 3, 2])
+        x = [0.1i for i in eachindex(idx)]
+        y = Int[isodd(i) for i in eachindex(idx)]
+        saved = deepcopy((idx, x, y))
+        plan = model(; idx, x) | (; y)
+        built = build_kernel(plan)
+        source = sprint(show, Base.remove_linenums!(deepcopy(kernel_expr(plan, built.layout))))
+        @test occursin("beta =", source)
+        @test occursin("ReactiveKernels._readonly_gather(beta, idx)", source)
+        raw, scale = [0.2, -0.4, 0.1], 0.3
+        u = collect(Float64, unconstrain(built.layout, (; raw, scale)))
+        sampler = prepare_sampler(built, plan, u;
+            backend=AutoEnzyme(; mode=Enzyme.Reverse))
+        gradient = similar(u)
+        value, _ = sampler_value_and_gradient!(sampler, gradient, u)
+        beta = [raw; -sum(raw)]
+        eta = scale .* x .- beta[idx]
+        expected = sum(lognormal, raw; init=0.0) + lognormal(scale) +
+            sum(logbernoulli.(y, eta); init=0.0)
+        @test value ≈ expected rtol=1e-12
+        @test (idx, x, y) == saved
+        for k in eachindex(u)
+            up, down = copy(u), copy(u)
+            up[k] += 1e-6
+            down[k] -= 1e-6
+            @test gradient[k] ≈ (sampler(up) - sampler(down))/2e-6 atol=2e-6
+        end
+    end
+end
+
 @testset "two generated county gathers fuse into the likelihood" begin
     model = @rkppl begin
         alpha_raw[1:J] .~ Normal.(0, 1)
