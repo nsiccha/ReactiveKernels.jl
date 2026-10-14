@@ -6731,7 +6731,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     for p in plan.external_observations
         push!(defs, Symbol(:_ppl_external_value_, p.name) =>
             Expr(:tuple, (Expr(:call, GlobalRef(Base, :identity), value)
-                for value in (p.name, p.args.rhs))...))
+                for value in (get(p.args, :observation, p.name), p.args.rhs))...))
     end
     # An array read only for a declared axis is a whole preparation input.
     # Its row count does not become an observation count. In contrast, a

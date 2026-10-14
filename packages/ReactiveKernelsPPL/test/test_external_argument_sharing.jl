@@ -29,6 +29,16 @@ const SELECTED = @rkppl begin
         y[i] ~ normal_shared(beta,x[i])
     end
 end
+const SELECTED_GROUPED = @rkppl begin
+    beta[1:3] .~ Normal.(0,1)
+    @plate for i in 2:3
+        y[i] .~ normal_shared(beta,x[i])
+    end
+end
+const SELECTED_SHARED = @rkppl begin
+    beta[1:3] .~ Normal.(0,1)
+    y[2:3] .~ normal_shared(beta,0.5)
+end
 const TYPE_CONSTRUCTOR = @rkppl begin
     beta[1:3] .~ Normal.(0,1)
     @plate for i in eachindex(y)
@@ -56,6 +66,7 @@ _argument_expr_size(x::Expr) = 1 + sum(_argument_expr_size, x.args; init=0)
 const _ARGUMENT_SHARING_SHAPES = Dict{String,Tuple{Int,Int}}()
 
 function _argument_sharing_check(label,model,data,observations,kind,used=3; indices=eachindex(observations))
+    @testset "$label" begin
     before=deepcopy((data,observations))
     plan=model(;data...) | (;y=observations)
     built=build_kernel(plan)
@@ -63,7 +74,7 @@ function _argument_sharing_check(label,model,data,observations,kind,used=3; indi
     ad=prepare_sampler(built,plan,point;backend=AutoEnzyme(;mode=Enzyme.Reverse),native_forward_batch=false)
     for beta in (point,point .+ 0.1)
         residuals = if kind==:grouped
-            [yi-(sum(beta)+data.x[i]) for i in eachindex(observations) for yi in observations[i]]
+            [yi-(sum(beta)+data.x[i]) for i in indices for yi in observations[i]]
         elseif kind==:dotted
             observations .- (beta .+ data.x)
         else
@@ -96,6 +107,7 @@ function _argument_sharing_check(label,model,data,observations,kind,used=3; indi
         end
     end
     println("ARGUMENT_SHARING ",label," PASS");flush(stdout)
+    end
 end
 
 @testset "shared and per-index external constructor arguments" begin
@@ -115,6 +127,11 @@ end
         (;x=[-0.2,0.3]),[0.2,0.6],:mixed,2)
     _argument_sharing_check("selected",F.SELECTED,(;x=[100.0,0.3,0.4,200.0]),
         [300.0,0.6,0.1,400.0],:mixed;indices=2:3)
+    _argument_sharing_check("selected-grouped",F.SELECTED_GROUPED,
+        (;x=[100.0,0.3,0.4,200.0]),
+        [[300.0],Float64[],[0.1,0.7],[400.0]],:grouped;indices=2:3)
+    _argument_sharing_check("selected-shared",F.SELECTED_SHARED,(;),
+        [300.0,0.6,0.1,400.0],:shared;indices=2:3)
     # An authored x[i] is an indexed read, not a broadcastable singleton.
     caught=nothing
     try

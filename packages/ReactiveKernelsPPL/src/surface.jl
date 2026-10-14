@@ -1230,6 +1230,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         if _external_rhs(s.rhs) && s.broadcast && (s.lhs in data || s.lhs in ctx.vecdefs)
             args = _external_parameter(s.lhs, s.rhs, (), mod, ctx.taken;
                 observed=true, broadcast=true)
+            observation = s.range isa UnitRange ? Expr(:ref, s.lhs,
+                Expr(:call, :(:), first(s.range), last(s.range))) :
+                s.range === nothing ? s.lhs : s.range
+            args = merge(args, (; observation))
             push!(external_observations, SampledParameter(s.lhs, :external, args, nothing, s.lhs))
             continue
         end

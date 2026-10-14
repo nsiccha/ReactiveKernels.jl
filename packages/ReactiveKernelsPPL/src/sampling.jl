@@ -148,7 +148,8 @@ function _validate_external_parameter(plan, p; observation=false)
     (observation || p.name in plan.conditioned || g isa ParameterGeometry) ||
         _fail(p.label, "external parameter needs ParameterGeometry")
     known = union(_all_names(plan), Set(keys(plan.columns)))
-    for ref in _value_symbols(p.args.rhs)
+    values = (p.args.rhs, get(p.args, :observation, p.name))
+    for ref in union((_value_symbols(value) for value in values)...)
         (ref in known || !isbound(plan)) || _fail(p.label, "external RHS references unknown name $ref")
     end
     return nothing
@@ -345,7 +346,7 @@ function _external_graph_density_call(endpoint, arguments, keywords)
     return statements
 end
 
-function _external_density_statements(p)
+function _external_density_statements(p; observation = p.name)
     node = Symbol(:_ppl_prior_, p.name)
     density = GlobalRef(@__MODULE__, :sampling_logdensity)
     graph_density = _external_graph_density(p.args)
@@ -359,7 +360,7 @@ function _external_density_statements(p)
         end
         return Expr[:($node::Float64 = $density($(p.args.rhs), $(p.name)))]
     end
-    inputs = Any[p.name]
+    inputs = Any[observation]
     args = Any[]
     for arg in _external_arguments(p.args)
         # Function values and literal scalars are invariant; array/value
