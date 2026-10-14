@@ -4813,8 +4813,9 @@ _kernel_latest_source(xs::Tuple) = map(_kernel_latest_source, xs)
 
 # A generated kernel whose public entry guarantees a latest-world barrier can
 # carry that guarantee into literal source calls within its native recipe
-# bodies. Only the native argument of a source-op construction is visited; the
-# tensorized body and quoted source/provenance expressions remain unchanged.
+# bodies and retained arm plans. Only the native argument of a source-op
+# construction is visited; the tensorized body and quoted source/provenance
+# expressions remain unchanged.
 function _kernel_latest_native_source_literals(ex)
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
@@ -4834,7 +4835,9 @@ function _kernel_latest_literal_calls(ex)
        args[1].value isa Union{_KernelSourceOp,_KernelSourceFunction,_KernelBranch,_KernelSplit}
         args[1] = QuoteNode(_kernel_latest_source(args[1].value))
     end
-    Expr(ex.head, args...)
+    result = Expr(ex.head, args...)
+    _kernel_is_branch_arm_graph(result) ?
+        Expr(:call, GlobalRef(@__MODULE__, :_kernel_latest_arm_plan), result) : result
 end
 function _kernel_latest_source(f::_KernelSourceFunction{F,RF,C}) where {F,RF,C}
     _KernelSourceFunction{F,RF,C,Val{:latest_world}}(
@@ -4858,7 +4861,20 @@ function _kernel_latest_source(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
         _kernel_latest_source(branch.condition),
         _kernel_latest_source(branch.then_arm),
         _kernel_latest_source(branch.else_arm),
-        branch.then_spec, branch.else_spec)
+        _kernel_latest_arm_plan(branch.then_spec),
+        _kernel_latest_arm_plan(branch.else_spec))
+end
+
+# Arm graphs are executable metadata: partial evaluation or shared-arm
+# lowering can use them instead of the original closure. Preserve the same
+# caller guarantee there, or each newly exposed source call would regain a
+# runtime method query. Keep the exact selection and leave the graph untouched.
+function _kernel_latest_arm_plan(spec)
+    spec === nothing && return nothing
+    p = _plate_arm_plan(spec)
+    recipes = Recipe[Recipe(r.id, r.inputs, r.outputs, _kernel_latest_source(r.op),
+        r.cost, r.cse_key, r.effectful, r.source) for r in p.recipes]
+    _partial_subplan(p, p.have, p.want, recipes)
 end
 function _kernel_latest_source(op::_AuthoredPlateOp{K,A}) where {K,A}
     kernel = _kernel_latest_prepared(op.kernel)
