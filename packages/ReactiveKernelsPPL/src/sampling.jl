@@ -155,10 +155,7 @@ function _validate_external_parameter(plan, p; observation=false)
     return nothing
 end
 
-function _sampling_extent(plan, ex, name; what = "sampling geometry dimension")
-    ex isa Int && ex >= 0 && return ex
-    (_is_axis_dim(ex) || _is_levels_dim(ex) || _levels_count(ex) !== nothing) &&
-        return _array_dim_size(plan, name, name, ex)
+function _bound_data_value(plan, ex, name, what)
     expressions = Dict(a.name=>a.expr for a in (plan.assignments..., plan.derived...))
     active = Set{Symbol}()
     function lookup(n)
@@ -170,12 +167,19 @@ function _sampling_extent(plan, ex, name; what = "sampling geometry dimension")
         delete!(active, n)
         return v
     end
-    value = try
+    return try
         _eval_value_expr(_resolve_extent_levels(ex), lookup, name)
     catch e
         e isa ContractValidationError && rethrow()
         _fail(name, "$what failed in Julia: " * sprint(showerror, e))
     end
+end
+
+function _sampling_extent(plan, ex, name; what = "sampling geometry dimension")
+    ex isa Int && ex >= 0 && return ex
+    (_is_axis_dim(ex) || _is_levels_dim(ex) || _levels_count(ex) !== nothing) &&
+        return _array_dim_size(plan, name, name, ex)
+    value = _bound_data_value(plan, ex, name, what)
     value isa Integer && !(value isa Bool) && value >= 0 || _fail(name,
         "$what must be a nonnegative integer, got $(repr(value))")
     return try
