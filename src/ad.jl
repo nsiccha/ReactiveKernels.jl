@@ -1434,7 +1434,7 @@ _native_forward_batch_eligible(backend, kernel, point) = false
 function _prepare_native_forward_batch_ad(kernel, resolver, backend,
         args::Tuple, kwargs::NamedTuple, active; retain::Tuple = (),
         warm::Bool = false)
-    throw(ArgumentError("native forward batching requires reverse-mode AutoEnzyme with Enzyme loaded"))
+    throw(ArgumentError("native forward batching requires AutoEnzyme() with no explicit mode and Enzyme loaded"))
 end
 
 _prepare_ad_pullback(kernel::_ADKernel, resolver,
@@ -1511,12 +1511,13 @@ then evaluates the gradient once at a copy of the exemplar. An array active
 input warms [`ad_value_and_gradient!`](@ref); any other warms
 [`ad_value_and_gradient`](@ref). The default compiles at the first evaluation.
 
-`native_forward_batch = true` asks native reverse-mode `AutoEnzyme` to run one
-ordinary Enzyme forward sweep with one tangent lane per coordinate. It applies
+With `AutoEnzyme()` (no explicit mode), `native_forward_batch = true` requests
+one ordinary Enzyme forward sweep with one tangent lane per coordinate. It applies
 to a single active `Vector{Float64}` of one to four entries and no retained
 WANT values. The exemplar length fixes the batch width; calls with another
 length use the stored ordinary reverse preparation. It does not rewrite the
-kernel or attach a derivative rule. This is an explicit option for measured
+kernel or attach a derivative rule. Explicit reverse mode stays reverse even
+when this optimization hint is set. This is an explicit option for measured
 small-width workloads; the default remains ordinary reverse preparation.
 """
 function prepare_ad(spec::KernelSpec,
