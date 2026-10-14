@@ -110,7 +110,10 @@ function _partial_index_runs(p::Plan,bound_values::Vector{Value})
         end
         index=r.inputs[2];cid=canon_id(g,index.id)
         if !haskey(metadata,cid)
-            value=value!(copied,gensym(:index_runs),_IndexRunData)
+            # Derived from the index value's name, never a fresh gensym: a
+            # name that changes between preparations changes the prepared
+            # program's identity and recompiles the AD operator every time.
+            value=value!(copied,Symbol(index.name,:_index_runs),_IndexRunData)
             metadata[cid]=value
             push!(recipes,Recipe(fresh,(index,),(value,),_index_run_metadata,
                 0.0,nothing,false))
@@ -175,6 +178,7 @@ function _lower_index_runs_native(body::Expr,ops)
         end
     end
     isempty(projections) && return body
+    rewritten=Ref(0)
     _index_run_replace(body) do ex
         ex.head===:if && length(ex.args)==3 || return ex
         # A previously grouped reduction has an inner conditional here. Only
@@ -216,8 +220,11 @@ function _lower_index_runs_native(body::Expr,ops)
         # Distinct index maps keep their original scalar projection. Only inputs
         # sharing this exact data-only metadata are invariant over its runs.
         filter!(s->projections[s]===metadata,selected)
-        shared=Dict(s=>gensym(:index_run_value) for s in selected)
-        part,run,lo,hi,linear=(gensym(s) for s in (:run_partial,:run,:run_lo,:run_hi,:run_linear))
+        # Deterministic locals (see the metadata name above): derived from
+        # the metadata name and the reduction's position in this body.
+        k=(rewritten[]+=1)
+        shared=Dict(s=>Symbol(s,:_index_run_value_,k) for s in selected)
+        part,run,lo,hi,linear=(Symbol(metadata,:_,s,:_,k) for s in (:run_partial,:run,:run_lo,:run_hi,:run_linear))
         grouped_body=_index_run_replace(cellbody) do cell
             if _index_run_call(cell,GlobalRef(Base.Broadcast,:_broadcast_getindex),2) &&
                     cell.args[3]==index && haskey(shared,cell.args[2])
