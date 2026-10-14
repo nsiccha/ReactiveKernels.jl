@@ -33,12 +33,17 @@ sampling_logdensity(d::LogDensity, value) = d.f(value, d.args...; d.kwargs...)
 
 # A categorical probability vector computed in a plate cell is an ordinary
 # sampling RHS. Keep its matrix product or gather in the RK graph; only the
-# scalar observation lookup belongs in this density.
-function _ppl_categorical_logdensity(value::Integer, probabilities::AbstractVector)
+# scalar observation lookup belongs in this density. The vector is checked
+# where it is computed (`_ppl_categorical_probabilities`), so one check
+# serves every observation that shares it.
+function _ppl_categorical_probabilities(probabilities::AbstractVector)
     all(p -> p >= zero(p), probabilities) &&
         isapprox(sum(probabilities), one(eltype(probabilities))) ||
         throw(DomainError(probabilities,
             "categorical probabilities must be nonnegative and sum to one"))
+    return probabilities
+end
+function _ppl_categorical_logdensity(value::Integer, probabilities::AbstractVector)
     # An unsupported category has zero probability; log(0) keeps the
     # element type of an in-support result.
     1 <= value <= length(probabilities) ||

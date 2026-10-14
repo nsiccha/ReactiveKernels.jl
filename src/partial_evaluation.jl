@@ -886,6 +886,16 @@ end
 end
 @noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
+# The gathered value is typed by the gather's own result (a view of an array
+# argument), not by the argument's authored type: a native typed local
+# (`_declare_typed_output!`) of the authored `Vector{Float64}` would convert
+# the view into a copy through Base's `unalias`, whose alias-or-copy result
+# native Enzyme reverse rejects for an inactive argument
+# (`EnzymeRuntimeActivityError`).
+function _lane_gather_type(n::Int, ::Type{T}) where {T}
+    R = Base.promote_op(_LaneGather(n), T, Vector{Int})
+    R === Union{} ? Any : R
+end
 (::_LaneGather)(x, lanes) = throw(ArgumentError("a partitioned plate " *
     "argument must be a number or a lane vector, got $(typeof(x))"))
 # Callable structs have no `nameof`, so without these the readable
@@ -1127,7 +1137,8 @@ Base.@nospecializeinfer function _partition_plate_recipe(
                     known[canon_id(g, v.id)] = lanes
                     v
                 end
-                v = value!(g, Symbol(:lane_, side, :_, outer.name), valtype(outer))
+                v = value!(g, Symbol(:lane_, side, :_, outer.name),
+                           _lane_gather_type(n, valtype(outer)))
                 push!(expansion, Recipe(fresh(), (outer, idx), (v,),
                     _LaneGather(n), 0.0, nothing, false))
                 push!(arguments, v)

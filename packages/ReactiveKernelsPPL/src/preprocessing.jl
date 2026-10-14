@@ -320,6 +320,40 @@ function _declared_codes(x::AbstractVector, levels::AbstractVector)
     return codes
 end
 
+"""
+    _ppl_key_cells(keys, indices) -> Vector{Int}
+    _ppl_key_codes(keys, indices) -> Vector{Int}
+
+Data-only encoders for a plate-cell value that reads its loop index only
+through one integer data column `keys` (`theta[:, doc[i]]`). The value is
+equal at every index sharing a key, so it is computed once per distinct
+key: `_ppl_key_cells` names, in first-occurrence order over the selected
+`indices`, the first index carrying each key. `_ppl_key_codes` maps every
+selected index to the position of its key in that list (0 elsewhere).
+Keys compare with `isequal`, as `Dict` does.
+"""
+function _ppl_key_cells(keys::AbstractArray, indices)
+    v = vec(keys)
+    seen = Dict{eltype(v),Int}()
+    cells = Int[]
+    for i in indices
+        k = v[i]
+        haskey(seen, k) && continue
+        push!(cells, i)
+        seen[k] = length(cells)
+    end
+    return cells
+end
+function _ppl_key_codes(keys::AbstractArray, indices)
+    v = vec(keys)
+    seen = Dict{eltype(v),Int}()
+    codes = zeros(Int, length(v))
+    for i in indices
+        codes[i] = get!(seen, v[i], length(seen) + 1)
+    end
+    return codes
+end
+
 # Stage lanes of a stopping-ratio response (SB `brm_ordinal` structure 2):
 # observation `i` with level `y[i]` passes stages `1..min(y[i], K-1)` —
 # survives (logCC) below its level, stops (logF) at it. The per-observation

@@ -242,6 +242,47 @@ loglik = prepare(bernoulli_logit_product_mixture_logdensity)
 loglik(event, logits, [0.6, 0.4])
 ```
 
+## Hidden Markov sequences
+
+`hmm_logdensity(log_emissions, transition, initial)` is the forward
+algorithm: the log density of one observed sequence, summed over every path of
+a hidden state that moves as a Markov chain. `log_emissions[t, k]` is step
+`t`'s emission log density under state `k`. `transition[i, j]` weighs a move
+from state `i` to state `j`, as a row-stochastic matrix; a
+`states × states × (steps - 1)` array gives the move into step `t` at index
+`t - 1`. `initial[k]` weighs the first state. Weights are used as given, so
+all-ones initial weights reproduce a forward pass that starts from the bare
+first emission, and singleton axes broadcast: a `states × 1 × (steps - 1)`
+array weighs each move by the previous state only.
+
+`normal_hmm_logdensity(observed, locations, scales, transition, initial)` and
+`exponential_hmm_logdensity(observed, scales, transition, initial)` compute
+the emissions with the Normal and Exponential families and pass them to
+`hmm_logdensity`. `observed` is a vector, or a `steps × streams` matrix whose
+streams are independent given the state. Emission parameters broadcast over
+`states × streams × steps`: a vector holds one value per state, a matrix one
+per state and stream, and a third axis lets a parameter change with the step.
+Exponential parameters are scales, as for `exponential`.
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    normal_hmm_logdensity
+
+y = [0.3, 2.9, 3.1, 0.2, -0.1]
+transition = [0.8 0.2; 0.3 0.7]
+loglik = prepare(normal_hmm_logdensity)
+loglik(y, [0.0, 3.0], [1.0, 0.5], transition, [0.5, 0.5])
+```
+
+The pass is one `scan` with a `history` (see [the scan page](scan.md)) over the
+`(step, state)` cells: each cell reads the previous step's cells from the scan's
+own output, so no step allocates a carried vector, and the derivatives are
+ordinary Enzyme derivatives of these graphs, with no hand-written rule. A PPL
+model passes the whole sequence to `LogDensity` with one of these kernels. For
+another emission family, author a kernel that fills the `steps × states`
+log-emission matrix in a plate and returns `hmm_logdensity`.
+
 ## Positive-support and bounded families
 
 LogNormal, Exponential, Geometric, and Uniform illustrate shapes that are not all

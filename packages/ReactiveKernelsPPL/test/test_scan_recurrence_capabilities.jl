@@ -235,6 +235,93 @@ end
     end
 end
 
+# A trajectory is a value in every distribution argument: read bare or inline
+# there, it lowers as its named alias (`sigma = sqrt.(h)` above) does.
+function _scan_cap_argument_model(n, kind)
+    y = kind === :zi ? [iseven(t) ? 0 : t for t in 1:n] : [0.3sin(t) for t in 1:n]
+    data = Dict{Symbol,Any}(:y => y)
+    program = if kind === :garch
+        data[:s1] = 0.5
+        quote
+            m ~ Flat()
+            a0 ~ restricted(Flat(), 0, Inf)
+            a1 ~ restricted(Flat(), 0, 1)
+            b1 ~ restricted(Flat(), 0, 1 - a1)
+            @scan begin
+                sigma[1] = s1
+                for t in 2:T
+                    sigma[t] = sqrt(a0 + a1 * (y[t - 1] - m)^2 + b1 * sigma[t - 1]^2)
+                end
+            end
+            y .~ Normal.(m, sigma)
+        end
+    else
+        observe = Dict(
+            :inline => :(y .~ Normal.(m, sqrt.(s))),
+            :nu => :(y .~ StudentT.(s, m, 1.0)),
+            :zi => :(y .~ ZeroInflatedPoisson.(exp.(m), logistic.(s))),
+            :mixture => :(y .~ MixtureModel.(vcat.(Normal.(m, s), Normal.(0, 1)),
+                Ref([0.3, 0.7]))))[kind]
+        Expr(:block, :(m ~ Normal(0, 1)), :(a ~ Normal(0, 1)),
+            :(@scan begin
+                s[1] = exp(a)
+                for t in 2:T
+                    s[t] = exp(a) + 0.5 * s[t - 1]
+                end
+            end), observe)
+    end
+    f = _scan_cap_sampler(program, data)
+    parameter(u, name) = u[only(e for e in f.built.layout.entries if e.name === name).offset]
+    function oracle(u)
+        m = parameter(u, :m)
+        if kind === :garch
+            ra0, ra1, rb1 = parameter(u, :a0), parameter(u, :a1), parameter(u, :b1)
+            a0, a1, l = exp(ra0), 1 / (1 + exp(-ra1)), 1 / (1 + exp(-rb1))
+            b1 = (1 - a1) * l
+            lp = ra0 + log(a1) + log1p(-a1) + log(1 - a1) + log(l) + log1p(-l)
+            s = data[:s1]
+            for t in 1:n
+                t == 1 || (s = sqrt(a0 + a1 * (y[t - 1] - m)^2 + b1 * s^2))
+                lp += logpdf(Normal(m, s), y[t])
+            end
+            return lp
+        end
+        a = parameter(u, :a)
+        lp = logpdf(Normal(), m) + logpdf(Normal(), a)
+        s = exp(a)
+        for t in 1:n
+            t == 1 || (s = exp(a) + 0.5 * s)
+            lp += if kind === :inline
+                logpdf(Normal(m, sqrt(s)), y[t])
+            elseif kind === :nu
+                logpdf(LocationScale(m, 1.0, TDist(s)), y[t])
+            elseif kind === :zi
+                p = 1 / (1 + exp(-s))
+                log(p * (y[t] == 0) + (1 - p) * pdf(Poisson(exp(m)), y[t]))
+            else
+                logpdf(MixtureModel([Normal(m, s), Normal(0, 1)], [0.3, 0.7]), y[t])
+            end
+        end
+        return lp
+    end
+    return f, oracle
+end
+
+@testset "scan capabilities: a trajectory read in distribution arguments" begin
+    for kind in (:garch, :inline, :nu, :zi, :mixture), n in (1, 4)
+        f, oracle = _scan_cap_argument_model(n, kind)
+        @test !any(e -> e.kind === :scan, f.built.layout.entries)
+        if kind === :zi
+            # Value only: native Reverse through a live per-observation
+            # zero-inflation vector fails for the named spelling too
+            # (`w = s; logistic.(w)`), independently of how it is read.
+            @test f.sampler(f.u) ≈ oracle(f.u) rtol=1e-11
+        else
+            _scan_cap_check(f, oracle)
+        end
+    end
+end
+
 function _scan_cap_defaults(n)
     program = quote
         phi ~ Normal()
