@@ -396,11 +396,11 @@ end
     plan = _vector_layout_plan()
     layout = assign_layout(plan)
     entry = layout.entries[2]
-    # Ordered: one running-sum statement over the packed slice.
+    # Ordered: one call of the native ordered kernel over the packed slice.
     @test transform_statements(entry) == Expr[
         :(y_cutpoints::AbstractVector{Float64} =
-            cumsum(vcat(Float64.(view(unconstrained, 2:2)),
-                exp.(view(unconstrained, 3:3))))),
+            $(GlobalRef(ReactiveKernelsPPL, :_ordered_constrain_kernel))(
+                unconstrained, 2, 3)),
     ]
     @test jacobian_term(entry) == :(sum(view(unconstrained, 3:3)))
     one_ord = LayoutEntry(:vector, nothing, :o, [:o_1], 7, 1, :ordered)
@@ -412,18 +412,17 @@ end
     @test transform_statements(ientry) == Expr[
         :(t::AbstractVector{Float64} = unconstrained[4:5])]
     @test jacobian_term(ientry) === nothing
-    # Simplex: closed-form stick-breaking in four vector statements + the
-    # break Jacobian (K=3 here).
+    # Simplex: one native stick-breaking kernel returns the simplex and its
+    # break Jacobian together (K=3 here).
     sentry = LayoutEntry(:vector, nothing, :s, [:s_1, :s_2], 6, 2, :simplex)
     @test transform_statements(sentry) == Expr[
-        :(_ppl_vz_s::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(
-            unconstrained[6:7] .+ log.(3 .- (1:2)))))),
-        :(_ppl_vl_s::AbstractVector{Float64} = log1p.(-_ppl_vz_s)),
-        :(_ppl_vlr_s::AbstractVector{Float64} = cumsum(vcat(0.0, _ppl_vl_s))),
-        :(s::AbstractVector{Float64} = exp.(_ppl_vlr_s) .* vcat(_ppl_vz_s, ones(1))),
+        :(_ppl_simplex_pair_s =
+            $(GlobalRef(ReactiveKernelsPPL, :_simplex_constrain_logjac_kernel))(
+                unconstrained, 6, 7)),
+        :(s::AbstractVector{Float64} = _ppl_simplex_pair_s[1]),
+        :(_ppl_simplex_logjac_s::Float64 = _ppl_simplex_pair_s[2]),
     ]
-    @test jacobian_term(sentry) == :(sum(_ppl_vlr_s[1:2] .+
-        log.(_ppl_vz_s) .+ _ppl_vl_s))
+    @test jacobian_term(sentry) === :_ppl_simplex_logjac_s
     # A 1-simplex emits its constant; an empty ordered/identity pack emits
     # nothing.
     one = LayoutEntry(:vector, nothing, :s1, Symbol[], 9, 0, :simplex)

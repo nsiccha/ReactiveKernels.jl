@@ -30,13 +30,13 @@ end
         source = string(model_view(built; bound=plan).source)
         @test occursin(helper, source)
         @test !occursin("_ppl_prior_sigma.logpdf.", source)
-        code = string(readable_code(built.spec))
+        code = string(code_expr(built.spec))
         @test occursin(helper, code)
         @test !occursin("_ppl_prior_sigma.logpdf.", code)
 
         q = prepare_sampler(built, plan, u;
             backend=AutoEnzyme(mode=Enzyme.Reverse))
-        prepared_code = string(readable_code(q.kernel))
+        prepared_code = string(code_expr(q.kernel))
         @test occursin(helper, prepared_code)
         @test !occursin("_ppl_prior_sigma.logpdf.", prepared_code)
         grad = zeros(length(u))

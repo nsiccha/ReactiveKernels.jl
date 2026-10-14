@@ -77,11 +77,19 @@ function _check_retained(plan, retain)
         value, _ = sampler_value_and_gradient!(q, g, point)
         value_r, returned, retained = sampler_value_gradient_and_retained!(qr, gr, point)
         @test returned === gr
-        @test value_r == value
+        # A total-only plate reduces with `@simd`; the retaining sweep sums
+        # its stored cells in order. Both are the sum, to rounding.
+        @test value_r ≈ value rtol = 1e-12
         @test gr ≈ g rtol = 1e-12 atol = 1e-12
         @test keys(retained) == retain
         for (preset, query) in zip(retain, queries)
-            @test retained[preset] == Base.invokelatest(query, point)
+            expected = Base.invokelatest(query, point)
+            # Cells are identical; a summed preset agrees to rounding.
+            if expected isa Number
+                @test retained[preset] ≈ expected rtol = 1e-12
+            else
+                @test retained[preset] == expected
+            end
         end
         # A later call returns fresh values and leaves earlier ones untouched.
         if previous !== nothing
@@ -91,7 +99,7 @@ function _check_retained(plan, retain)
         previous = (deepcopy(retained), retained)
         # The retaining preparation still answers the ordinary call.
         value_o, _ = sampler_value_and_gradient!(qr, gr, point)
-        @test value_o == value
+        @test value_o ≈ value rtol = 1e-12
         @test gr ≈ g rtol = 1e-12 atol = 1e-12
     end
     q, qr
@@ -173,6 +181,7 @@ end
         expected = sampler_value_and_gradient!(q, zeros(n), point)
         @test sampler_value_and_gradient!(qw, zeros(n), point) == expected
         value, gradient, _ = sampler_value_gradient_and_retained!(qwr, zeros(n), point)
-        @test (value, gradient) == expected
+        @test value ≈ expected[1] rtol = 1e-12
+        @test gradient ≈ expected[2] rtol = 1e-12 atol = 1e-12
     end
 end

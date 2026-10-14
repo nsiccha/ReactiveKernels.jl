@@ -595,10 +595,12 @@ end
         @test _fv_value(built, bound, :likelihood, u) ≈ ll
         kern = prepare_query(built, bound, :sampler)
         q = prepare_sampler(built, bound, u; backend = _FV_BACKEND)
-        # The prepared program evaluates the gather and the value once too.
-        prepared = sprint(print, model_view(built; bound, query = q).prepared)
-        @test count("column_gather(", prepared) == 1
-        @test count("exp.(", prepared) == 1
+        # The prepared program evaluates the gather and the value once too:
+        # one top-level prepared recipe computes each. Its printed code names
+        # operations by slot, so read the recipes' authored sources.
+        sources = [e.recipe.source for e in recipe_inventory(q.kernel) if e.depth == 0]
+        @test count(s -> _fv_calls(s, :column_gather) > 0, sources) == 1
+        @test count(s -> _fv_calls(s, :exp) > 0, sources) == 1
         val, grad = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
             q.ad, similar(u), u)
         @test val ≈ Base.invokelatest(kern, u)
