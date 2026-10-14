@@ -15,19 +15,29 @@ _index_run_metadata(indices) = (Int[],Int[],0,false)
 # The mean-run threshold conservatively amortizes the outer-loop overhead;
 # data patterns below it retain the original flat reduction.
 function _index_run_metadata(indices::Vector{Int})
-    starts, stops = Int[], Int[]
     n = length(indices)
-    n == 0 && return (starts, stops, n, false)
-    lo = 1
-    @inbounds for i in 2:(n + 1)
-        if i == n + 1 || indices[i] != indices[i - 1]
-            push!(starts, lo)
-            push!(stops, i - 1)
-            lo = i
-        end
+    # `n ÷ runs >= minimum` is `runs <= n ÷ minimum`. Count first: a rejected
+    # schedule allocates nothing, and counting stops once rejection is certain.
+    limit = n ÷ _INDEX_RUN_MINIMUM_MEAN_LENGTH
+    runs = min(n, 1)
+    @inbounds for i in 2:n
+        indices[i] == indices[i - 1] && continue
+        runs += 1
+        runs > limit && return (Int[], Int[], n, false)
     end
-    enabled = n ÷ length(starts) >= _INDEX_RUN_MINIMUM_MEAN_LENGTH
-    (starts, stops, n, enabled)
+    (runs == 0 || runs > limit) && return (Int[], Int[], n, false)
+    starts = Vector{Int}(undef, runs)
+    stops = Vector{Int}(undef, runs)
+    r = 1
+    @inbounds starts[1] = 1
+    @inbounds for i in 2:n
+        indices[i] == indices[i - 1] && continue
+        stops[r] = i - 1
+        r += 1
+        starts[r] = i
+    end
+    @inbounds stops[runs] = n
+    (starts, stops, n, true)
 end
 
 # The extra dependency is compiler metadata only. The ordinary and tensorized
@@ -122,7 +132,17 @@ function _index_run_replace(f,x)
     x.head in (:quote,:inert) && return x
     y=f(x)
     y===x || return y
-    Expr(x.head,(_index_run_replace(f,a) for a in x.args)...)
+    # An untouched subtree is returned as is, so a flat schedule's body is not
+    # copied node by node on every fresh preparation.
+    args=x.args
+    replaced=Vector{Any}(undef,length(args))
+    changed=false
+    for (i,a) in enumerate(args)
+        b=_index_run_replace(f,a)
+        b===a || (changed=true)
+        replaced[i]=b
+    end
+    changed ? Expr(x.head,replaced...) : x
 end
 
 # This local emitter transformation reads only compiler-owned operation identity
