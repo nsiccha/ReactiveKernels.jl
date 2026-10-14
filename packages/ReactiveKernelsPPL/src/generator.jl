@@ -166,30 +166,32 @@ struct _PointwiseValue
     rank::Int                         # -1 unknown, 0 scalar, 1 vector
     length::Int                       # known vector length, else 0
     live::Bool                        # reads a sampled value
-    generated::Bool                   # array was made inside this program
 end
-const _POINTWISE_UNKNOWN = _PointwiseValue(-1, 0, false, false)
+const _POINTWISE_UNKNOWN = _PointwiseValue(-1, 0, false)
 
 function _pointwise_leaf(ex, values::Dict{Symbol,_PointwiseValue})
     ex isa Symbol && return get(values, ex, _POINTWISE_UNKNOWN)
-    ex isa Float64 && return _PointwiseValue(0, 0, false, false)
-    ex isa Integer && return _PointwiseValue(0, 0, false, false)
+    ex isa Float64 && return _PointwiseValue(0, 0, false)
+    ex isa Integer && return _PointwiseValue(0, 0, false)
     if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
             ex.args[2] isa Integer
         base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
-        base.rank == 1 && return _PointwiseValue(0, 0, base.live, false)
+        base.rank == 1 && return _PointwiseValue(0, 0, base.live)
     end
     return _POINTWISE_UNKNOWN
 end
 
-function _pointwise_tree!(inputs, formals, ex, values, columns)
+function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
+    if ex isa Symbol && haskey(gathers, ex)
+        return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers)
+    end
     if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
             haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
             length(ex.args) in (2, 3)
         terms = Any[]
         states = _PointwiseValue[]
         for a in ex.args[2:end]
-            term, state = _pointwise_tree!(inputs, formals, a, values, columns)
+            term, state = _pointwise_tree!(inputs, formals, a, values, columns, gathers)
             state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
             push!(terms, term)
             push!(states, state)
@@ -199,18 +201,18 @@ function _pointwise_tree!(inputs, formals, ex, values, columns)
         rank = isempty(lens) ? 0 : 1
         return Expr(:call, _POINTWISE_ARITHMETIC[ex.args[1]], terms...),
             _PointwiseValue(rank, rank == 1 ? only(lens) : 0,
-                any(s.live for s in states), rank == 1)
+                any(s.live for s in states))
     end
     leaf, state = if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
             ex.args[2] isa Symbol
         base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
         idx = get(columns, ex.args[2], nothing)
-        if base.rank == 1 && base.generated && base.live &&
+        if base.rank == 1 &&
                 idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
                 axes(idx, 1) == Base.OneTo(length(idx))
-            # The view is read only by this pure cell; no gathered alias escapes.
-            :(ReactiveKernels._tensorized_view($(ex.args...))),
-                _PointwiseValue(1, length(idx), true, false)
+            # This arithmetic cell reads scalar entries from the borrowed view.
+            :(ReactiveKernels._readonly_gather($(ex.args...))),
+                _PointwiseValue(1, length(idx), base.live)
         else
             ex, _POINTWISE_UNKNOWN
         end
@@ -228,9 +230,9 @@ function _pointwise_tree!(inputs, formals, ex, values, columns)
     return formals[i], state
 end
 
-function _pointwise_rhs(ex, values, columns)
+function _pointwise_rhs(ex, values, columns, gathers)
     inputs, formals = Any[], Symbol[]
-    body, state = _pointwise_tree!(inputs, formals, ex, values, columns)
+    body, state = _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
     state.rank == 1 && state.live || return ex, state
     plate = Expr(:do, Expr(:call, :plate, inputs...),
         Expr(:->, Expr(:tuple, formals...), Expr(:block, body)))
@@ -243,41 +245,69 @@ end
 _pointwise_occurrences(ex, name) = ex === name ? 1 :
     ex isa Expr ? sum(_pointwise_occurrences(a, name) for a in ex.args; init = 0) : 0
 
-_pointwise_pure_tree(ex::Union{Symbol,Real}) = true
-function _pointwise_pure_tree(ex::Expr)
-    if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
-            haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
-            length(ex.args) in (2, 3)
-        return all(_pointwise_pure_tree, ex.args[2:end])
-    end
-    return Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
-        ex.args[2] isa Integer
+# Whether a use can observe a gather's container representation. Arithmetic
+# consumers have already been recognized and rewritten below. A plate iterates
+# Float64 entries, whereas an opaque call may dispatch on Vector or inspect its
+# parent/type even when it is pure. Aliases and query containers propagate the
+# borrowed representation, so follow their readers as well.
+function _pointwise_container(ex, name)
+    _pointwise_occurrences(ex, name) == 0 && return true
+    ex === name && return true
+    ex isa Expr || return false
+    ex.head in (:kw, :(=)) && return _pointwise_container(ex.args[2], name)
+    return ex.head === :tuple && all(a -> _pointwise_container(a, name), ex.args)
 end
-_pointwise_pure_tree(ex) = false
 
-function _pointwise_single_arithmetic_use(stmts, name)
-    uses = Any[]
+function _pointwise_readonly_use(rhs, name, vector)
+    _pointwise_container(rhs, name) && return :borrow
+    if Meta.isexpr(rhs, :return, 1) && _pointwise_container(rhs.args[1], name)
+        return :value
+    elseif vector && Meta.isexpr(rhs, :ref, 2) && rhs.args[1] === name && rhs.args[2] isa Integer
+        return :value
+    elseif vector && Meta.isexpr(rhs, :do, 2)
+        call, cell = rhs.args
+        Meta.isexpr(call, :call) && call.args[1] === :plate || return :sensitive
+        all(a -> _pointwise_occurrences(a, name) == 0 || a === name,
+            call.args[2:end]) || return :sensitive
+        Meta.isexpr(cell, :->, 2) || return :sensitive
+        args = Meta.isexpr(cell.args[1], :tuple) ? cell.args[1].args : Any[cell.args[1]]
+        name in args || _pointwise_occurrences(cell.args[2], name) == 0 || return :sensitive
+        return :value
+    end
+    return :sensitive
+end
+
+function _pointwise_readonly_uses(stmts, name, seen = Set{Symbol}(); vector = true)
+    name in seen && return true
+    push!(seen, name)
     for st in stmts
         rhs = Meta.isexpr(st, :(=), 2) ? st.args[2] : st
-        n = _pointwise_occurrences(rhs, name)
-        n == 0 && continue
-        n == 1 && Meta.isexpr(st, :(=), 2) || return false
-        push!(uses, rhs)
+        _pointwise_occurrences(rhs, name) == 0 && continue
+        use = _pointwise_readonly_use(rhs, name, vector)
+        use === :sensitive && return false
+        if use === :borrow && Meta.isexpr(st, :(=), 2)
+            # A concrete container annotation is itself a representation boundary.
+            lhs = st.args[1]
+            lhs isa Symbol || return false
+            # Indexing a tuple that contains the view can expose the array
+            # itself; only direct vector aliases yield scalars when indexed.
+            _pointwise_readonly_uses(stmts, lhs, seen;
+                vector = vector && rhs === name) || return false
+        end
     end
-    length(uses) == 1 || return false
-    rhs = only(uses)
-    _pointwise_occurrences(rhs, name) == 1 || return false
-    return Meta.isexpr(rhs, :call) && _pointwise_pure_tree(rhs)
+    return true
 end
 
 function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
     stmts = def.args[2].args
     values = Dict{Symbol,_PointwiseValue}()
+    gathers = Dict{Symbol,Expr}()
+    gather_stmts = Dict{Symbol,Expr}()
     for (name, value) in plan.columns
         if value isa Vector{Float64} && axes(value, 1) == Base.OneTo(length(value))
-            values[name] = _PointwiseValue(1, length(value), false, false)
+            values[name] = _PointwiseValue(1, length(value), false)
         elseif value isa Float64 || value isa Integer
-            values[name] = _PointwiseValue(0, 0, false, false)
+            values[name] = _PointwiseValue(0, 0, false)
         end
     end
     for st in stmts
@@ -287,37 +317,38 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         name isa Symbol || continue
         declared = Meta.isexpr(lhs, :(::), 2) ? lhs.args[2] : nothing
         if declared === :Float64
-            values[name] = _PointwiseValue(0, 0, true, false)
+            values[name] = _PointwiseValue(0, 0, true)
             continue
         elseif Meta.isexpr(declared, :curly) &&
                 declared.args == Any[:AbstractVector, :Float64]
             dims = _value_axes(plan, name; data_axes = true)
             if dims !== nothing && length(dims) == 1 && only(dims) isa Int
-                values[name] = _PointwiseValue(1, only(dims), true, false)
+                values[name] = _PointwiseValue(1, only(dims), true)
             else
                 delete!(values, name)
             end
             continue
         end
-        if Meta.isexpr(rhs, :ref, 2) && startswith(String(name), "_rkppl_synth_") &&
+        if Meta.isexpr(rhs, :ref, 2) &&
                 rhs.args[1] isa Symbol && rhs.args[2] isa Symbol
             base = get(values, rhs.args[1], _POINTWISE_UNKNOWN)
             idx = get(plan.columns, rhs.args[2], nothing)
-            if base.rank == 1 && base.generated && base.live &&
+            if base.rank == 1 &&
                     idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
-                    axes(idx, 1) == Base.OneTo(length(idx)) &&
-                    _pointwise_single_arithmetic_use(stmts, name)
-                st.args[2] = :(ReactiveKernels._tensorized_view($(rhs.args...)))
-                values[name] = _PointwiseValue(1, length(idx), base.live, false)
+                    axes(idx, 1) == Base.OneTo(length(idx))
+                # Recognition is transactional: substitute inside arithmetic
+                # only when the entire consumer lowers to a typed plate.
+                gathers[name] = rhs
+                gather_stmts[name] = st
+                values[name] = _PointwiseValue(1, length(idx), base.live)
                 continue
             end
         end
         if Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
                 haskey(_POINTWISE_ARITHMETIC, rhs.args[1])
-            candidate, state = _pointwise_rhs(rhs, values, plan.columns)
+            candidate, state = _pointwise_rhs(rhs, values, plan.columns, gathers)
             if state.rank >= 0
-                values[name] = _PointwiseValue(state.rank, state.length,
-                    state.live, state.rank == 1)
+                values[name] = state
             else
                 delete!(values, name)
             end
@@ -327,6 +358,13 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         else
             delete!(values, name)
         end
+    end
+    for (name, rhs) in gathers
+        # Read-only queries and any number of value consumers may share a view.
+        # A representation-sensitive consumer retains the ordinary copied node;
+        # recognized arithmetic still borrows directly from its parent.
+        _pointwise_readonly_uses(stmts, name) || continue
+        gather_stmts[name].args[2] = :(ReactiveKernels._readonly_gather($(rhs.args...)))
     end
     return def
 end

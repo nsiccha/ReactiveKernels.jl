@@ -344,6 +344,18 @@ end
 # place.  A tracing extension may return the slice instead, the same values,
 # where its views do not trace.
 @inline _tensorized_view(array::AbstractArray, indices...) = view(array, indices...)
+# Read-only graph gathers may share their parent's storage, including in queries.
+# Keep a packed vector's contiguous slice as the parent: Base.view would eagerly
+# materialize range[indices] to flatten this pair of views. As with other borrowed
+# graph values, neither the parent nor the indices are writable cache storage.
+@inline _readonly_gather(array::AbstractVector, indices::AbstractVector{<:Integer}) =
+    _tensorized_view(array, indices)
+@inline function _readonly_gather(
+        array::SubArray{Float64,1,Vector{Float64},Tuple{UnitRange{Int}},true},
+        indices::Vector{Int})
+    checkbounds(array, indices)
+    return Base.SubArray(array, (indices,))
+end
 @inline function _tensorized_setindex(array, value, indices...)
     setindex!(array, value, indices...)
     array
