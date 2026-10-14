@@ -97,7 +97,7 @@ function preprocessing_recipes(plan::StructuralPlan)
     for pred in plan.predictors
         shape = design_shape(pred, plan.columns; levelmaps = plan.levelmaps,
             matrices = plan.matrices)
-        if !_broadcast_affine(plan, pred) &&
+        if shape.width > 0 && !_broadcast_affine(plan, pred) &&
                 !_scalar_column_plate_eligible(plan, pred, shape)
             rows = _predictor_rows_source(plan, pred.name)
             recipe = design_recipe(shape, rows; plates)
@@ -105,9 +105,17 @@ function preprocessing_recipes(plan::StructuralPlan)
         end
         scalars = Set{Symbol}(only(t.columns) for t in pred.terms
             if _is_scalar_offset(t, plan))
-        rows = isempty(scalars) ? 0 : _located_rows_source(plan, pred)
+        # A scalar summand does not make the complete offset scalar. Preserve
+        # a sum whose inferred axes already match every located response, so
+        # its arithmetic remains visible to the later plate-fusion pass.
+        offset_columns = Any[b.column for b in shape.blocks if b.kind === OffsetTerm]
+        offset_sum = isempty(offset_columns) ? nothing :
+            foldl((a, c) -> :($a .+ $c), offset_columns)
+        retain_axes = _broadcast_affine(plan, pred) ||
+            _has_located_axes(plan, pred, offset_sum)
+        rows = isempty(scalars) || retain_axes ? 0 : _located_rows_source(plan, pred)
         off = offset_recipe(shape; scalars, n_rows = rows,
-            broadcast = _broadcast_affine(plan, pred))
+            broadcast = retain_axes)
         off !== nothing && push!(stmts, off)
     end
     # GLM-object response matrices: one `X = Float64.(hcat(...))` recipe

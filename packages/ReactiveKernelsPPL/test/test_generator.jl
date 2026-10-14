@@ -116,8 +116,8 @@ end
     built = build_kernel(plan)
     @test built.spec isa ReactiveKernels.KernelSpec
     @test built.layout.total == 3
-    # Gaussian likelihoods lower to plate calls (Expr(:do)); Bernoulli-logit
-    # and Poisson-log base GLMs fuse to whole-vector reductions instead.
+    # Gaussian and Bernoulli-logit likelihoods lower to plate calls
+    # (Expr(:do)); Poisson-log base GLMs use whole-vector reductions.
     _has_do(ex::Expr) = ex.head === :do ||
         any(a -> a isa Expr && _has_do(a), ex.args)
     _has_do(_) = false
@@ -223,10 +223,9 @@ function _gen_query_has_response_plate(spec, plan, want)
         startswith(String(name), "_ppl_pw_y_resp_"), names)
 end
 
-# Base Bernoulli-logit / Poisson-log lower to a fused whole-vector
-# reduction (`dot` + `sum(f, x)`); literal ranges, weights, and evidence
-# stay on the per-cell plate path. Ranged ≡ bare up to summation order
-# (the cover rule), pinning fused-vs-plate parity on identical densities.
+# Bernoulli-logit keeps stable cells; base Poisson-log uses a whole-vector
+# reduction (`dot` + `sum(f, x)`). Ranged ≡ bare up to summation order
+# (the cover rule), with pointwise queries retaining the same densities.
 function _gen_ranged_plan(base::StructuralPlan, range::UnitRange{Int})
     r = base.responses[1]
     rr = LikelihoodSpec(r.family, r.link, r.response, r.predictor, r.scale,
@@ -240,20 +239,19 @@ function _gen_ranged_plan(base::StructuralPlan, range::UnitRange{Int})
     return plan
 end
 
-@testset "bernoulli/poisson whole-vector fusion" begin
-    # Base Bernoulli routes fused.
+@testset "stable Bernoulli cells and Poisson whole-vector fusion" begin
+    # Base Bernoulli keeps the stable endpoint through its reduction.
     plan = _gen_bernoulli_plan(repeat([false, true], 3))
     built = build_kernel(plan)
     ex = kernel_expr(plan, built.layout)
-    @test _has_call(ex, :dot)
-    # The shared graph also supplies pointwise queries. Density cuts must
-    # prune that plate, while the pointwise cut must select it.
+    @test !_has_call(ex, :dot)
+    # Density and pointwise cuts both use the stable observation plate.
     @test _has_sym(ex, :_ppl_pw_y_resp)
     for want in (:likelihood, :posterior)
-        @test !_gen_query_has_response_plate(built.spec, plan, want)
+        @test _gen_query_has_response_plate(built.spec, plan, want)
     end
     @test _gen_query_has_response_plate(built.spec, plan, :pointwise)
-    # Ranged Bernoulli routes plate and matches the fused density.
+    # Ranged Bernoulli matches the whole response's density.
     rplan = _gen_ranged_plan(plan, 1:6)
     rbuilt = build_kernel(rplan)
     rex = kernel_expr(rplan, rbuilt.layout)
