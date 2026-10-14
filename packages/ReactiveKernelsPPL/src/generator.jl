@@ -2416,6 +2416,10 @@ function _wholevec_rows(r::LikelihoodSpec, plan::StructuralPlan)
     rows = y isa AbstractVector ? length(y) : nothing
     _is_latent_location(r, plan) && return _latent_rows(plan, r.predictor) == rows
     pred = _predictor(plan, r.predictor)
+    # A predictor that reads or feeds several row counts (singleton operands
+    # broadcast over responses of different lengths) has no single row
+    # count, so it is not read whole.
+    length(_value_row_counts(plan, pred.name)) > 1 && return false
     _predictor_rows(plan, pred.name) == rows || return false
     return all(pred.terms) do t
         t.kind === LatentTerm || return true

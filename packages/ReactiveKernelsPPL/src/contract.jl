@@ -2215,14 +2215,7 @@ end
 Values with no data anchor (an intercept or dar path) use their response
 consumers. No dimension is inferred from the total of unrelated axes."""
 function _value_rows(plan::StructuralPlan, name::Symbol)
-    haskey(plan.columns, name) && return _column_nrows(plan.columns[name])
-    reads = _response_reads(plan, name, _row_columns(plan))
-    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
-    if isempty(ns)
-        names = Set{Symbol}([name])
-        ns = unique!([_response_rows(plan, r) for r in plan.responses
-            if name in _response_reads(plan, r, names)])
-    end
+    ns = _value_row_counts(plan, name)
     length(ns) == 1 && return only(ns)
     if isempty(ns)
         axes = unique!([_response_rows(plan, r) for r in plan.responses])
@@ -2231,6 +2224,19 @@ function _value_rows(plan::StructuralPlan, name::Symbol)
         _fail(name, "value $name has no data range or response to establish its rows")
     end
     _fail(name, "value $name reads or feeds different row counts $ns")
+end
+
+# The distinct row counts that establish `name`'s rows (see `_value_rows`):
+# its own data column, the row columns it reads, else the responses it
+# feeds. Empty when none applies; several when they disagree.
+function _value_row_counts(plan::StructuralPlan, name::Symbol)
+    haskey(plan.columns, name) && return [_column_nrows(plan.columns[name])]
+    reads = _response_reads(plan, name, _row_columns(plan))
+    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    isempty(ns) || return ns
+    names = Set{Symbol}([name])
+    return unique!([_response_rows(plan, r) for r in plan.responses
+        if name in _response_reads(plan, r, names)])
 end
 
 function _plate_rows(plan::StructuralPlan, p::PlateParameter;
