@@ -860,33 +860,32 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     end
     terminal_init = Expr(:block)
     if terminals !== nothing
-        samples = gensym(:scan_terminal_samples)
-        T = :($(GlobalRef(Base, :promote_type))($typeof_ref($(callargs[1])), $output_type))
-        push!(terminal_init.args, :($samples = $(GlobalRef(@__MODULE__,
-            :_scan_terminal_samples))($(callargs[1]), $T, $(GlobalRef(Base,
-            :length))($indices) + 1)))
-        push!(terminal_init.args, :($position = 1))
-        push!(initial_output.args, :($position += 1))
-        push!(initial_output.args, :($(GlobalRef(@__MODULE__,
-            :_scan_terminal_advance!))($samples, $output, $position)))
-        push!(loop_output.args, :($position += 1))
-        push!(loop_output.args, :($(GlobalRef(@__MODULE__,
-            :_scan_terminal_advance!))($samples, $output, $position)))
-        for term in terminals
-            sample = if term.slot === nothing
-                :($samples.seed), :($samples.current)
-            else
-                broadcast = gensym(:scan_terminal_broadcast)
-                args = Any[arg === nothing ? samples : arg for arg in term.args]
-                push!(terminal_init.args, :($broadcast = $(_OPS_ARG)[$(term.slot)]($(args...))))
-                getindex_ref = GlobalRef(Base.Broadcast, :_broadcast_getindex)
-                :($getindex_ref($broadcast, 1)), :($getindex_ref($broadcast, $position))
+        seed_sample, sample = gensym.((:scan_terminal_seed, :scan_terminal_sample))
+        storage_type = gensym(:scan_terminal_storage_type)
+        push!(typing.args, :($storage_type = $(GlobalRef(Base, :promote_type))(
+            $typeof_ref($(callargs[1])), $output_type)))
+        # The declared local converts the allocated vector before any writes.
+        # Its element type therefore controls each seed/output conversion.
+        converted(value) = terminals.eltype === nothing ?
+            :($(GlobalRef(Base, :convert))($storage_type, $value)) :
+            _scan_terminal_convert(terminals.eltype, value)
+        push!(terminal_init.args, :($seed_sample = $(converted(callargs[1]))))
+        for block in (initial_output, loop_output)
+            push!(block.args, :($sample = $(converted(output))))
+        end
+        for term in terminals.items
+            cell(value) = term.transform === nothing ? value :
+                _scan_terminal_convert(term.eltype, _scan_terminal_scalar(
+                    term.transform.source, term.bindings, term.scan_names,
+                    value, seed_sample, term.mod))
+            accumulator = gensym(:scan_minimum)
+            push!(terminal_init.args, :($accumulator = $(cell(seed_sample))))
+            for block in (initial_output, loop_output)
+                push!(block.args, :($accumulator = $(GlobalRef(Base, :min))(
+                    $accumulator, $(cell(sample)))))
             end
-            push!(terminal_init.args, :($(term.lhs) = $(sample[1])))
-            push!(initial_output.args, :($(term.lhs) = $(GlobalRef(Base, :min))(
-                $(term.lhs), $(sample[2]))))
-            push!(loop_output.args, :($(term.lhs) = $(GlobalRef(Base, :min))(
-                $(term.lhs), $(sample[2]))))
+            # A declared reduction result converts once, after the reduction.
+            push!(final_output.args, :($(term.lhs) = $accumulator))
         end
     end
     # `eachindex(seqs...)` throws `DimensionMismatch` unless every iterated
@@ -894,7 +893,35 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
     append!(body.args, invariant)
     append!(body.args, typing.args)
-    append!(body.args, terminal_init.args)
+    outer_body = body
+    if terminals !== nothing
+        # Dense vector storage has ordinary element conversion and indexing.
+        # Custom/non-vector storage and uninferred step types retain exactly
+        # the materialized scan and its original source callables.
+        fallback = Expr(:block)
+        _lower_authored_scan_native!(fallback, op, callargs, terminals.scan_lhs,
+            offset; recycled, type_offset)
+        for term in terminals.items
+            input = terminals.scan_lhs
+            if term.transform !== nothing
+                input = term.transform_lhs
+                term.eltype === nothing || push!(fallback.args,
+                    Expr(:local, Expr(:(::), input, valtype(only(term.transform.outputs)))))
+                call = term.recycled === nothing ? nothing :
+                    _lane_source_expr(term.transform, term.args, term.recycled)
+                call === nothing && (call = Expr(:call,
+                    Expr(:ref, _OPS_ARG, term.slot), term.args...))
+                push!(fallback.args, :($input = $call))
+            end
+            push!(fallback.args, :($(term.lhs) = $(GlobalRef(Base, :minimum))($input)))
+        end
+        ready = :($xs isa $(Vector) && $storage_type <: $(Union{Float16,Float32,Float64}))
+        for seq in seqs[2:end]
+            ready = :($ready && $seq isa $(AbstractVector))
+        end
+        body = Expr(:block, terminal_init.args...)
+        push!(outer_body.args, Expr(:if, ready, body, fallback))
+    end
     nonempty = Expr(:block)
     push!(nonempty.args, :($carry = $(callargs[1])))
     push!(nonempty.args, :($index = $(GlobalRef(Base, :first))($indices)))
@@ -924,7 +951,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     push!(body.args, Expr(:if, :($(GlobalRef(Base, :isempty))($indices)),
                           empty_output, nonempty))
     append!(body.args, final_output.args)
-    body
+    outer_body
 end
 
 # `local = __ops__[slot](...)` for a hoisted step statement becomes a read of
@@ -1053,72 +1080,50 @@ function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
     consumer
 end
 
-# A virtual, single-sample scan trajectory. A source-authored dotted expression
-# over it stays a Broadcasted tree; the scan loop asks that tree for only the
-# current cell. `path[1]` still reads the seed. The object is fresh and never
-# escapes the generated call.
-struct _ScanTerminalStyle{N} <: Base.Broadcast.AbstractArrayStyle{N} end
-_ScanTerminalStyle{N}(::Val{M}) where {N,M} = _ScanTerminalStyle{M}()
-
-mutable struct _ScanTerminalSamples{T} <: AbstractVector{T}
-    seed::T
-    current::T
-    current_index::Int
-    count::Int
-end
-Base.BroadcastStyle(::Type{<:_ScanTerminalSamples}) = _ScanTerminalStyle{1}()
-Base.copy(bc::Base.Broadcast.Broadcasted{<:_ScanTerminalStyle}) =
-    Base.Broadcast.instantiate(bc)
-Base.size(s::_ScanTerminalSamples) = (s.count,)
-Base.axes(s::_ScanTerminalSamples) = (Base.OneTo(s.count),)
-Base.IndexStyle(::Type{<:_ScanTerminalSamples}) = IndexLinear()
-@inline function Base.getindex(s::_ScanTerminalSamples, i::Int)
-    @boundscheck checkbounds(s, i)
-    i == 1 && return s.seed
-    i == s.current_index || throw(BoundsError(s, i))
-    s.current
-end
-@inline function _scan_terminal_samples(seed, ::Type{T}, count) where T
-    converted = convert(T, seed)
-    _ScanTerminalSamples{T}(converted, converted, 1, count)
-end
-@inline function _scan_terminal_advance!(s::_ScanTerminalSamples, value, index)
-    s.current = value
-    s.current_index = index
-    s.current
-end
-
-# Only source-authored, pure scalar arithmetic over the scan and numeric
-# scalars is eligible. This keeps side effects, other arrays, and whole-array
-# reads on the ordinary materialized path. The runtime callable retains the
-# author's resolved arithmetic bindings and nesting/order.
-function _scan_terminal_arithmetic(ex, scan_name, scalar_names, mod)
-    ex isa Number && return true
-    ex isa Symbol && return ex == scan_name || ex in scalar_names
-    ex isa Expr || return false
+# Scalarize only a verified Base arithmetic broadcast over primitive scalar
+# operands. Preserve expression nesting, including division after multiplication;
+# no monotonicity identity is used to move a transform outside its minimum.
+function _scan_terminal_scalar(ex, bindings, scan_names, sample, seed, mod)
+    ex isa Real && isprimitivetype(typeof(ex)) && return ex
+    ex isa Symbol && return ex in scan_names ? sample : get(bindings, ex, nothing)
+    ex isa Expr || return nothing
     if ex.head === :ref
-        return length(ex.args) == 2 && ex.args[1] === scan_name && ex.args[2] === 1
+        return length(ex.args) == 2 && ex.args[1] in scan_names &&
+            ex.args[2] === 1 ? seed : nothing
     end
-    ex.head === :call || return false
+    ex.head === :call || return nothing
     callee = ex.args[1]
-    callee isa Symbol && _is_broadcast_operator(callee) || return false
+    callee isa Symbol && _is_broadcast_operator(callee) || return nothing
     name = Symbol(String(callee)[2:end])
-    name in (:+, :-, :*, :/) || return false
-    _kernel_resolve_binding(mod, name) === getglobal(Base, name) || return false
-    all(arg -> _scan_terminal_arithmetic(arg, scan_name, scalar_names, mod),
-        ex.args[2:end])
+    name in (:+, :-, :*, :/) || return nothing
+    isdefined(mod, name) && isconst(mod, name) || return nothing
+    _kernel_resolve_binding(mod, name) === getglobal(Base, name) || return nothing
+    args = Any[_scan_terminal_scalar(arg, bindings, scan_names, sample, seed, mod)
+               for arg in ex.args[2:end]]
+    any(isnothing, args) && return nothing
+    Expr(:call, GlobalRef(Base, name), args...)
+end
+
+_scan_terminal_convert(::Nothing, value) = value
+_scan_terminal_convert(T::Type, value) = Expr(:call, GlobalRef(Base, :convert), T, value)
+
+function _scan_terminal_eltype(T)
+    T <: AbstractVector || return nothing
+    E = eltype(T)
+    isconcretetype(E) && E <: Union{Float16,Float32,Float64} &&
+        (T === Vector{E} || T === AbstractVector{E}) ? E : nothing
 end
 
 # A scan may feed several direct minima and one-level dotted transforms, each
 # used only by a minimum. Requesting the trajectory or a transform, or giving
 # either another consumer, retains the ordinary buffers. Restrict to a typed
-# floating trajectory: its materialized writes convert each sample to T, and
-# the virtual trajectory makes that same conversion before any cell reads it.
+# floating trajectory with ordinary vector conversions. Other declarations,
+# captured callables and whole-array reads keep the materialized path.
 function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
     op = scan_recipe.op
     (_scan_includes_init(op) && !_scan_has_history(op)) || return nothing
     scan_value = only(scan_recipe.outputs)
-    valtype(scan_value) <: AbstractVector{<:AbstractFloat} || return nothing
+    _scan_terminal_eltype(valtype(scan_value)) === nothing && return nothing
     g = p.graph
     scan_id = canon_id(g, scan_value.id)
     any(w -> canon_id(g, w.id) == scan_id, p.want) && return nothing
@@ -1136,17 +1141,25 @@ function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
             continue
         end
         length(reader.outputs) == 1 && reader.op isa _KernelSourceOp || return nothing
+        fieldcount(typeof(_kernel_native_source(reader.op.f))) == 0 || return nothing
+        declared = valtype(only(reader.outputs))
+        declared === Any || _scan_terminal_eltype(declared) !== nothing || return nothing
         transform_id = canon_id(g, only(reader.outputs).id)
         any(w -> canon_id(g, w.id) == transform_id, p.want) && return nothing
-        scalar_names = Set{Symbol}()
-        for v in reader.inputs
+        names = _recipe_source_names(reader)
+        scalar_names, scan_names = Dict{Symbol,Any}(), Set{Symbol}()
+        for (name, v) in zip(names, reader.inputs)
             cid = canon_id(g, v.id)
-            cid == scan_id && continue
-            cid in available && valtype(v) <: Number || return nothing
-            push!(scalar_names, v.name)
+            if cid == scan_id
+                push!(scan_names, name)
+            else
+                T = valtype(v)
+                cid in available && T <: Real && isprimitivetype(T) || return nothing
+                scalar_names[name] = name
+            end
         end
-        _scan_terminal_arithmetic(reader.source, scan_value.name, scalar_names,
-            _kernel_endpoint_source_module(reader.op)) || return nothing
+        _scan_terminal_scalar(reader.source, scalar_names, scan_names, :sample, :seed,
+            _kernel_endpoint_source_module(reader.op)) === nothing && return nothing
         downstream = readers(transform_id)
         length(downstream) == 1 || return nothing
         reduction = only(downstream)
@@ -1154,7 +1167,10 @@ function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
             !reduction.effectful || return nothing
         push!(terminal, (; reduction, transform = reader))
     end
-    isempty(terminal) ? nothing : terminal
+    isempty(terminal) && return nothing
+    last_index = maximum(findfirst(==(term.reduction), p.recipes) for term in terminal)
+    any(r -> r.effectful, p.recipes[scan_index:last_index]) && return nothing
+    terminal
 end
 
 # Plates that compute a scan's per-step sequences, and that only that scan (or
@@ -3775,7 +3791,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             append!(runtime_ops, r.op.kernel.ops)
             append!(runtime_recipes, r.op.kernel.lowered_recipes)
             type_offset = _scan_type_slots!(runtime_ops, runtime_recipes, r.op)
-            terminal = inline_embedded ? _authored_scan_terminal_minima(p, r) : nothing
+            terminal = _authored_scan_terminal_minima(p, r)
             terminal_records = Any[]
             if terminal !== nothing
                 scan_id = canon_id(g, only(r.outputs).id)
@@ -3791,10 +3807,20 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     reduction = item.reduction
                     reduction_value = only(reduction.outputs)
                     reduction_id = canon_id(g, reduction_value.id)
+                    args = transform === nothing ? Any[] : Any[nm(v) for v in transform.inputs]
+                    source_names = transform === nothing ? Symbol[] : _recipe_source_names(transform)
                     push!(terminal_records, (; slot, lhs = nm(reduction_value),
-                        args = transform === nothing ? Any[] :
-                            Any[canon_id(g, v.id) == scan_id ? nothing : nm(v)
-                                for v in transform.inputs]))
+                        transform, args,
+                        transform_lhs = transform === nothing ? nothing : nm(only(transform.outputs)),
+                        eltype = transform === nothing || !declare_types ? nothing :
+                            _scan_terminal_eltype(valtype(only(transform.outputs))),
+                        bindings = Dict{Symbol,Any}(name => arg for (name, arg) in zip(source_names, args)),
+                        scan_names = transform === nothing ? Set{Symbol}() :
+                            Set(name for (name, v) in zip(source_names, transform.inputs)
+                                if canon_id(g, v.id) == scan_id),
+                        mod = transform === nothing ? nothing : _kernel_endpoint_source_module(transform.op),
+                        recycled = transform === nothing ? nothing :
+                            recycled(canon_id(g, only(transform.outputs).id))))
                     if !tensorized
                         transform === nothing || push!(terminal_skips, transform.id)
                         push!(terminal_skips, reduction.id)
@@ -3813,7 +3839,10 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 hoisted = consumer === nothing ? _authored_scan_hoistable(r.op) : Int[]
                 if terminal !== nothing
                     _lower_authored_scan_native!(body, r.op, callargs, nothing,
-                        scan_index; type_offset, terminals = terminal_records)
+                        scan_index; type_offset,
+                        recycled = recycled(canon_id(g, only(r.outputs).id)),
+                        terminals = (; items = terminal_records, scan_lhs = lhs,
+                            eltype = declare_types ? _scan_terminal_eltype(valtype(only(r.outputs))) : nothing))
                 elseif haskey(strip_regions, r.id) || !isempty(hoisted)
                     output = only(r.outputs)
                     records = Any[strip_plates[x.id]
