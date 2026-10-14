@@ -555,6 +555,42 @@ end
     return _ordered_constrain_native(view(u, lo:hi))
 end
 
+# Build the native simplex and its log-Jacobian in one pass. Only the fresh
+# result is written; the packed coordinates remain read-only. The loop count
+# is the runtime block length, including when that length came from bound data.
+@inline function _simplex_constrain_logjac_native(u::AbstractVector{Float64},
+                                                  lo::Int, hi::Int)
+    n = hi - lo + 1
+    K = n + 1
+    p = Vector{Float64}(undef, K)
+    lr = 0.0
+    jac = 0.0
+    @inbounds for j in 1:n
+        z = 1.0 / (1.0 + exp(-(u[lo + j - 1] + log(K - j))))
+        l = log1p(-z)
+        p[j] = exp(lr) * z
+        jac += (lr + log(z)) + l
+        lr += l
+    end
+    p[K] = exp(lr)
+    return p, jac
+end
+
+@inline function _simplex_constrain_logjac_kernel(u::AbstractVector{Float64},
+                                                  lo::Int, hi::Int)
+    if ReactiveKernels.ReactantCore.within_compile()
+        K = hi - lo + 2
+        z = 1.0 ./ (1.0 .+ exp.(-(
+            ReactiveKernels._tensorized_view(u, lo:hi) .+
+                log.(K .- (1:(K - 1))))))
+        l = log1p.(-z)
+        lr = cumsum(vcat(0.0, l))
+        return exp.(lr) .* vcat(z, ones(1)),
+            sum(lr[1:(K - 1)] .+ log.(z) .+ l)
+    end
+    return _simplex_constrain_logjac_native(u, lo, hi)
+end
+
 """Inverse of [`ordered_constrain`](@ref)."""
 function ordered_unconstrain(y::AbstractVector{<:Real})
     T = _host_eltype(y)
@@ -586,9 +622,9 @@ the middle layer owns layout+transforms, the LKJ-factor precedent):
 break fractions `z[j] = σ(u[j] + log(K-j))`, stick remainders
 `r[j] = Π_{i<j} (1 - z[i])` (in closed form, `exp` of the running sum of
 `log1p(-z)`), `s[j] = r[j]*z[j]`, `s[K] = r[K]`. Empty input constrains
-to `[1.0]` (the deterministic 1-simplex, as in Stan). The in-graph twin
-(`_vector_transform_statements`) emits these identical vector operations,
-so host and graph agree bit-for-bit.
+to `[1.0]` (the deterministic 1-simplex, as in Stan). The traced in-graph
+twin uses these vector operations; native execution fuses them into one
+result buffer and a scalar log-Jacobian.
 """
 function simplex_constrain(u::AbstractVector{<:Real})
     length(u) == 0 && return [one(_host_eltype(u))]
@@ -598,7 +634,7 @@ end
 
 # Break fractions `z` (K−1), `l = log1p(-z)` (K−1), and log stick remainders
 # `lr` (K, `lr[1] = 0`) of the stick-breaking simplex — the vector operations
-# the in-graph twin emits statement by statement.
+# used by the traced in-graph twin.
 function _simplex_breaks(u::AbstractVector{<:Real})
     K = length(u) + 1
     z = 1.0 ./ (1.0 .+ exp.(-(_host_real.(u) .+ log.(K .- (1:(K - 1))))))
@@ -1394,10 +1430,9 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
     return total
 end
 
-# Entry-level vector edges (host side). The in-graph twins in
-# `_vector_transform_statements`/`jacobian_term` emit the IDENTICAL
-# operations (vector statements for thresholds/simplexes, per-element
-# edges for `:exp`), so host and graph agree bit-for-bit.
+# Entry-level vector edges (host side). The traced in-graph twins in
+# `_vector_transform_statements`/`jacobian_term` use the same vector
+# operations. Native simplex execution uses the equivalent fused loop.
 _vector_constrain(e::LayoutEntry, seg) =
     e.transform === :identity ? Vector{_host_eltype(seg)}(seg) :
     e.transform === :ordered ? ordered_constrain(seg) :
@@ -1715,28 +1750,26 @@ end
 
 # Per-element scalar names of a positive (`:exp`) `:vector` entry
 # (`_ppl_v_<name>_<i>`, read by the joint-factor prior and the structural
-# L-entry algebra), and the stick-breaking temporaries of a `:simplex`
-# entry: break fractions `_ppl_vz_<name>`, `log1p(-z)` `_ppl_vl_<name>`,
-# log stick remainders `_ppl_vlr_<name>`. All `_ppl_`-hygienic.
+# L-entry algebra), and the constrained value/Jacobian pair of a `:simplex`
+# entry. All `_ppl_`-hygienic.
 _vector_elt_name(name::Symbol, i::Int) = Symbol(:_ppl_v_, name, :_, i)
 _vector_elt(e::LayoutEntry, i::Int) = _vector_elt_name(e.name, i)
-_vector_z(e::LayoutEntry) = Symbol(:_ppl_vz_, e.name)
-_vector_l(e::LayoutEntry) = Symbol(:_ppl_vl_, e.name)
-_vector_lr(e::LayoutEntry) = Symbol(:_ppl_vlr_, e.name)
+_vector_simplex_pair(e::LayoutEntry) = Symbol(:_ppl_simplex_pair_, e.name)
+_vector_simplex_logjac(e::LayoutEntry) = Symbol(:_ppl_simplex_logjac_, e.name)
 
 # Leveled vector edges (thresholds, threshold-coefficient packs,
 # simplexes): ONE vector-valued statement chain per entry, bound to the
 # entry's own name, whatever its (data-inferred) level count — the
 # statement count and the traced program do not grow with K (core
-# constraint 1). They emit the host `ordered_constrain`/`simplex_constrain`
-# vector mathematics; the native ordered path uses the host recurrence.
+# constraint 1). Traced execution uses the host vector mathematics;
+# native ordered and simplex execution use runtime loops.
 # Consumers gather from the vector (`Ref(v)` plate inputs, `v[idx]`).
 # The traced ordered path materializes its leading slice: a `vcat` mixing a
 # `SubArray` and a `Vector` lowers through a Union-typed path the native
 # Enzyme reverse pass rejects. Native ordered execution uses one buffer.
-# Simplex packed coordinates
-# use a native view; traced arrays use an array slice through
-# `_tensorized_view`, avoiding Reactant's nested SubArray reindexing.
+# The native simplex path reads packed coordinates directly. Traced arrays
+# use an array slice through `_tensorized_view`, avoiding Reactant's nested
+# SubArray reindexing.
 # Size specializations
 # (empty packs emit nothing — their consumers never read them; a one-element
 # ordered vector is its coordinate; a 1-simplex is the constant `[1.0]`)
@@ -1772,16 +1805,12 @@ function _vector_transform_statements(e::LayoutEntry)
     # :simplex — stick-breaking (thin-layer-owned, not Stan's ILR).
     K = e.size + 1
     K == 1 && return Expr[:($(e.name)::AbstractVector{Float64} = ones(1))]
-    z, l, lr = _vector_z(e), _vector_l(e), _vector_lr(e)
-    # The packed port is already Float64. Native execution reads a view;
-    # compiled tracing materializes the slice to avoid SubArray reindexing.
+    pair, jac = _vector_simplex_pair(e), _vector_simplex_logjac(e)
+    f = GlobalRef(@__MODULE__, :_simplex_constrain_logjac_kernel)
     return Expr[
-        :($z::AbstractVector{Float64} = 1.0 ./ (1.0 .+ exp.(-(
-            ReactiveKernels._tensorized_view(unconstrained, $lo:$hi) .+
-                log.($K .- (1:$(K - 1))))))),
-        :($l::AbstractVector{Float64} = log1p.(-$z)),
-        :($lr::AbstractVector{Float64} = cumsum(vcat(0.0, $l))),
-        :($(e.name)::AbstractVector{Float64} = exp.($lr) .* vcat($z, ones(1))),
+        :($pair = $f(unconstrained, $lo, $hi)),
+        :($(e.name)::AbstractVector{Float64} = $pair[1]),
+        :($jac::Float64 = $pair[2]),
     ]
 end
 
@@ -1862,8 +1891,8 @@ This entry's log-Jacobian contribution (`nothing` for identity). A scalar
 constrained support splices the bijector's `logjac` endpoint over the same
 coordinate the `constrain` edge reads (shared via structural CSE); a per-cell
 latent (plate) block sums its companion `logjac` plate (`_plate_logjac_name`);
-a leveled vector entry sums its unrolled twin of the host
-`ordered_logjac`/`simplex_logjac` (shared coordinates via CSE); an LKJ
+a leveled vector entry reads the ordered coordinates or the simplex
+transform's scalar Jacobian; an LKJ
 declared LKJ entry reads the retained sum over the partials shared with its
 transform. Legacy structural-margin LKJ blocks sum their named scalar edges.
 """
@@ -1902,11 +1931,9 @@ function jacobian_term(e::LayoutEntry)
             return foldl((a, b) -> :($a + $b), terms)
         end
         # :simplex — Σ [log(r) + log(z) + log1p(-z)] over the K−1 breaks,
-        # reading the `_vector_transform_statements` temps (the host
-        # `simplex_logjac`).
+        # computed alongside the constrained vector.
         e.size < 1 && return nothing
-        return :(sum($(_vector_lr(e))[1:$(e.size)] .+
-            log.($(_vector_z(e))) .+ $(_vector_l(e))))
+        return _vector_simplex_logjac(e)
     end
     if e.kind === :plate ||
        e.kind === :glm

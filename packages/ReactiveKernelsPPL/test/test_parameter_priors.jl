@@ -246,7 +246,7 @@ end
 
 @testset "whole-vector Dirichlet folds bound factors with native reverse" begin
     model = @rkppl begin p ~ Dirichlet(alpha) end
-    for K in (3, 32)
+    for K in (3, 32, 256)
         alpha = fill(1.3, K)
         plan = bind_data(model(; alpha))
         built = build_kernel(plan)
@@ -261,12 +261,30 @@ end
         source = sprint(show, built.program)
         prepared = sprint(show, MIME"text/plain"(),
             Base.remove_linenums!(deepcopy(ReactiveKernels.code_expr(sampler.kernel))))
-        @test occursin("_tensorized_view", source)
+        @test occursin("_simplex_constrain_logjac_kernel", source)
         @test !occursin("_dirichlet_slices_logpdf", source)
         @test occursin("_ppl_dirichlet_normalizer_p", prepared)
         for j in unique((1, length(u)))
             h = 1e-5
             plus, minus = copy(u), copy(u)
+            plus[j] += h
+            minus[j] -= h
+            @test g[j] ≈ (sampler(plus) - sampler(minus)) / (2h) rtol = 1e-5 atol = 1e-5
+        end
+
+        # A nonuniform interior point exercises the full prefix recurrence.
+        varying = u .+ 0.15 .* sin.(1:(K - 1))
+        original = copy(varying)
+        q = constrain(built.layout, varying)
+        value, _ = sampler_value_and_gradient!(sampler, g, varying)
+        @test all(>(0), q.p)
+        @test isfinite(value) && all(isfinite, g)
+        @test varying == original
+        @test value ≈ D.logpdf(D.Dirichlet(alpha), q.p) +
+            logjac(built.layout, varying) rtol = 1e-10 atol = 1e-10
+        for j in unique((1, max(1, length(varying) ÷ 2), length(varying)))
+            h = 1e-5
+            plus, minus = copy(varying), copy(varying)
             plus[j] += h
             minus[j] -= h
             @test g[j] ≈ (sampler(plus) - sampler(minus)) / (2h) rtol = 1e-5 atol = 1e-5
