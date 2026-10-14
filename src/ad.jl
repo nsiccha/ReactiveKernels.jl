@@ -1427,6 +1427,16 @@ _prepare_ad(kernel::_ADKernel, resolver,
     _prepare_ad_operator(Val(:gradient), kernel, resolver, backend, (),
                          args, kwargs, active; retain, warm)
 
+# Native Enzyme can differentiate a small active vector in one forward sweep,
+# with one tangent lane per coordinate. The optional Enzyme extension supplies
+# this preparation; other backends retain the ordinary prepared gradient.
+_native_forward_batch_eligible(backend, kernel, point) = false
+function _prepare_native_forward_batch_ad(kernel, resolver, backend,
+        args::Tuple, kwargs::NamedTuple, active; retain::Tuple = (),
+        warm::Bool = false)
+    throw(ArgumentError("native forward batching requires reverse-mode AutoEnzyme with Enzyme loaded"))
+end
+
 _prepare_ad_pullback(kernel::_ADKernel, resolver,
                      backend::DifferentiationInterface.AbstractADType,
                      seed, args::Tuple, kwargs::NamedTuple, active) =
@@ -1450,7 +1460,7 @@ function _prepare_ad_tangent_operator(op::Val, kernel::_ADKernel, resolver,
 end
 
 """
-    prepare_ad(spec, backend, args...; active, want, bound=(;), retain=(), warm=false, kwargs...) -> PreparedADKernel
+    prepare_ad(spec, backend, args...; active, want, bound=(;), retain=(), warm=false, native_forward_batch=false, kwargs...)
 
 Prepare a reusable DifferentiationInterface gradient of the explicit scalar
 `want` port in a [`KernelSpec`](@ref). `active` names one selected HAVE port or
@@ -1500,18 +1510,30 @@ inference (`AutoEnzyme`) without stalling JIT compilation on other threads,
 then evaluates the gradient once at a copy of the exemplar. An array active
 input warms [`ad_value_and_gradient!`](@ref); any other warms
 [`ad_value_and_gradient`](@ref). The default compiles at the first evaluation.
+
+`native_forward_batch = true` asks native reverse-mode `AutoEnzyme` to run one
+ordinary Enzyme forward sweep with one tangent lane per coordinate. It applies
+to a single active `Vector{Float64}` of one to four entries and no retained
+WANT values. The exemplar length fixes the batch width; calls with another
+length use the stored ordinary reverse preparation. It does not rewrite the
+kernel or attach a derivative rule. This is an explicit option for measured
+small-width workloads; the default remains ordinary reverse preparation.
 """
 function prepare_ad(spec::KernelSpec,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, want, bound = NamedTuple(),
-                    retain::Tuple = (), warm::Bool = false, kwargs...)
+                    retain::Tuple = (), warm::Bool = false,
+                    native_forward_batch::Bool = false, kwargs...)
     kernel, resolver, keywords =
         _ad_spec_boundary(spec, want, bound, kwargs; retain)
-    _prepare_ad(kernel, resolver, backend, args, keywords, active; retain, warm)
+    native_forward_batch ?
+        _prepare_native_forward_batch_ad(kernel, resolver, backend, args,
+            keywords, active; retain, warm) :
+        _prepare_ad(kernel, resolver, backend, args, keywords, active; retain, warm)
 end
 
 """
-    prepare_ad(kernel, backend, args...; active, retain=(), warm=false) -> PreparedADKernel
+    prepare_ad(kernel, backend, args...; active, retain=(), warm=false, native_forward_batch=false)
 
 Prepare a reusable gradient for a low-level [`PreparedKernel`](@ref) whose
 boundary is already fully selected. Such kernels accept only their positional
@@ -1520,7 +1542,8 @@ identifier or an ordered tuple of identifiers. With `retain`, the kernel's
 WANT ports are the scalar objective plus the retained ports named there, whose
 values the gradient's primal sweep returns (see the `KernelSpec` method).
 `warm = true` compiles the gradient during preparation, as for the `KernelSpec`
-method.
+method. `native_forward_batch` has the same bounded native meaning as for the
+`KernelSpec` method.
 
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
@@ -1530,9 +1553,12 @@ fails loudly naming the missing `using`.
 function prepare_ad(kernel::PreparedKernel,
                     backend::DifferentiationInterface.AbstractADType,
                     args...; active, retain::Tuple = (), warm::Bool = false,
-                    kwargs...)
+                    native_forward_batch::Bool = false, kwargs...)
     keywords = _ad_reject_low_level_keywords(kernel, kwargs)
-    _prepare_ad(kernel, tuple, backend, args, keywords, active; retain, warm)
+    native_forward_batch ?
+        _prepare_native_forward_batch_ad(kernel, tuple, backend, args,
+            keywords, active; retain, warm) :
+        _prepare_ad(kernel, tuple, backend, args, keywords, active; retain, warm)
 end
 
 """

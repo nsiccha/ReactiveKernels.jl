@@ -1,10 +1,12 @@
 # Enzyme adapter for rules generated from one pure-math graph
-# (`src/derivative_rules.jl`). Every method here is generic over the rule: the
-# activity pattern of the call selects the graph cut, and the cut's partials
-# are combined with Enzyme's directions or covectors by the scalar chain rule.
-# No derivative mathematics is authored in this file, and nothing attaches to a
-# function ReactiveKernels does not own. It also declares which Enzyme modes
-# keep WANT values retained during a prepared gradient's primal sweep.
+# (`src/derivative_rules.jl`). The rule methods are generic: the call's
+# activity pattern selects the graph cut, and its partials combine with
+# Enzyme's directions or covectors by the scalar chain rule. The native AD
+# preparation below chooses a bounded forward batch over the unchanged RK
+# callable. No derivative mathematics is authored here, and nothing attaches
+# to a function ReactiveKernels does not own. This extension also declares
+# which Enzyme modes retain WANT values during a prepared gradient's primal
+# sweep.
 module ReactiveKernelsEnzymeExt
 
 using ReactiveKernels: ScalarDerivativeRule, derivative_cut, DerivativeRule, forward_cut,
@@ -282,5 +284,143 @@ end
 ReactiveKernels.ad_retains_primal_sweep(
     ::ReactiveKernels.DifferentiationInterface.AutoEnzyme{
         <:Union{Nothing,Enzyme.ReverseMode}}) = true
+
+# A small active vector can carry one forward tangent lane per coordinate.
+# Enzyme differentiates the *same* native RK callable, so every plate cell,
+# prior, transform, and bound-data read follows its ordinary primal path. This
+# is a scheduling choice, not a derivative rule for a likelihood or operation.
+const _FORWARD_BATCH_MODE = Enzyme.set_abi(Enzyme.ForwardWithPrimal, Enzyme.InlineABI)
+const _ReverseAutoEnzyme = ReactiveKernels.DifferentiationInterface.AutoEnzyme{
+    <:Union{Nothing,Enzyme.ReverseMode}}
+
+struct _NativeForwardBatchAD{K,R,B}
+    reverse::R
+    basis::B
+end
+
+function ReactiveKernels._native_forward_batch_eligible(
+        ::_ReverseAutoEnzyme, kernel::ReactiveKernels.PreparedKernel,
+        point::Vector{Float64})
+    1 <= length(point) <= 4 || return false
+    plan = kernel.plan
+    recipes = plan.recipes
+    all(r -> !r.effectful && !(r.op isa ReactiveKernels._AuthoredScanOp),
+        recipes) || return false
+    any(recipes) do recipe
+        recipe.op isa ReactiveKernels._AuthoredPlateOp || return false
+        all(r -> !r.effectful && !(r.op isa Union{
+                ReactiveKernels._AuthoredPlateOp,
+                ReactiveKernels._AuthoredScanOp}),
+            recipe.op.kernel.plan.recipes) || return false
+        consumer = ReactiveKernels._authored_plate_sum_recipe(plan, recipe)
+        consumer === nothing && return false
+        output_id = ReactiveKernels.canon_id(
+            plan.graph, only(recipe.outputs).id)
+        any(w -> ReactiveKernels.canon_id(plan.graph, w.id) == output_id,
+            plan.want) && return false
+        !any(candidate -> candidate !== consumer && any(input ->
+            ReactiveKernels.canon_id(plan.graph, input.id) == output_id,
+            candidate.inputs), recipes)
+    end
+end
+
+function ReactiveKernels._prepare_native_forward_batch_ad(
+        kernel::ReactiveKernels.PreparedKernel, resolver,
+        backend::_ReverseAutoEnzyme, args::Tuple, kwargs::NamedTuple, active;
+        retain::Tuple = (), warm::Bool = false)
+    isempty(retain) || throw(ArgumentError(
+        "native forward batching does not retain further WANT values"))
+    reverse = ReactiveKernels._prepare_ad(kernel, resolver, backend,
+        args, kwargs, active; warm = false)
+    point, contexts = ReactiveKernels._ad_prepared_arguments(
+        reverse, args, kwargs)
+    point isa Vector{Float64} || throw(ArgumentError(
+        "native forward batching needs one active Vector{Float64} port"))
+    1 <= length(point) <= 4 || throw(ArgumentError(
+        "native forward batching supports one to four active coordinates"))
+    all(c -> c isa ReactiveKernels.DifferentiationInterface.Constant,
+        contexts) || throw(ArgumentError(
+        "native forward batching needs read-only Constant contexts"))
+    K = length(point)
+    basis = ntuple(K) do direction
+        [coordinate == direction ? 1.0 : 0.0 for coordinate in 1:K]
+    end
+    prepared = _NativeForwardBatchAD{K,typeof(reverse),typeof(basis)}(
+        reverse, basis)
+    warm && Base.invokelatest(ReactiveKernels.ad_value_and_gradient!,
+        prepared, similar(point), args...; kwargs...)
+    prepared
+end
+
+function _forward_batch_value_gradient!(prepared::_NativeForwardBatchAD{K},
+        gradient::AbstractVector, point::Vector{Float64}, contexts) where {K}
+    axes(gradient) == axes(point) || throw(DimensionMismatch(
+        "gradient axes $(axes(gradient)) differ from active point axes $(axes(point))"))
+    annotations = map(c -> Enzyme.Const(c.data), contexts)
+    tangents, value = Enzyme.autodiff(_FORWARD_BATCH_MODE,
+        prepared.reverse.call, Enzyme.BatchDuplicated(point, prepared.basis),
+        annotations...)
+    @inbounds for coordinate in 1:K
+        gradient[coordinate] = getfield(tangents, coordinate)
+    end
+    value, gradient
+end
+
+function _forward_batch_value_gradient!(prepared::_NativeForwardBatchAD{1},
+        gradient::AbstractVector, point::Vector{Float64}, contexts)
+    axes(gradient) == axes(point) || throw(DimensionMismatch(
+        "gradient axes $(axes(gradient)) differ from active point axes $(axes(point))"))
+    annotations = map(c -> Enzyme.Const(c.data), contexts)
+    tangent, value = Enzyme.autodiff(_FORWARD_BATCH_MODE,
+        prepared.reverse.call, Enzyme.Duplicated(point, prepared.basis[1]),
+        annotations...)
+    gradient[1] = tangent
+    value, gradient
+end
+
+function ReactiveKernels.ad_value_and_gradient!(prepared::_NativeForwardBatchAD{K},
+        gradient, args...; kwargs...) where {K}
+    point, contexts = ReactiveKernels._ad_prepared_arguments(
+        prepared.reverse, args, NamedTuple(kwargs))
+    if point isa Vector{Float64} && length(point) == K &&
+            all(c -> c isa ReactiveKernels.DifferentiationInterface.Constant,
+                contexts)
+        return _forward_batch_value_gradient!(prepared, gradient, point, contexts)
+    end
+    ReactiveKernels.ad_value_and_gradient!(prepared.reverse, gradient,
+                                           args...; kwargs...)
+end
+
+function ReactiveKernels.ad_value_and_gradient(prepared::_NativeForwardBatchAD,
+        args...; kwargs...)
+    point, _ = ReactiveKernels._ad_prepared_arguments(
+        prepared.reverse, args, NamedTuple(kwargs))
+    point isa AbstractVector || return ReactiveKernels.ad_value_and_gradient(
+        prepared.reverse, args...; kwargs...)
+    ReactiveKernels.ad_value_and_gradient!(prepared, similar(point), args...;
+                                            kwargs...)
+end
+
+ReactiveKernels.ad_gradient(prepared::_NativeForwardBatchAD, args...; kwargs...) =
+    last(ReactiveKernels.ad_value_and_gradient(prepared, args...; kwargs...))
+
+ReactiveKernels.ad_value_gradient_and_retained!(prepared::_NativeForwardBatchAD,
+        gradient, args...; kwargs...) =
+    ReactiveKernels.ad_value_gradient_and_retained!(prepared.reverse,
+        gradient, args...; kwargs...)
+
+ReactiveKernels.ad_value_gradient_and_retained(prepared::_NativeForwardBatchAD,
+        args...; kwargs...) =
+    ReactiveKernels.ad_value_gradient_and_retained(prepared.reverse,
+        args...; kwargs...)
+
+ReactiveKernels.compile_ad_gradient(prepared::_NativeForwardBatchAD,
+        args...; kwargs...) =
+    ReactiveKernels.compile_ad_gradient(prepared.reverse, args...; kwargs...)
+
+ReactiveKernels.compile_ad_value_and_gradient(prepared::_NativeForwardBatchAD,
+        args...; kwargs...) =
+    ReactiveKernels.compile_ad_value_and_gradient(prepared.reverse,
+                                                  args...; kwargs...)
 
 end # module

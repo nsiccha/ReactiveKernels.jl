@@ -211,7 +211,7 @@ function _latest_value(f::F, query, args::Vararg{Any,N}) where {F,N}
 end
 
 """
-    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false) -> SamplerQuery
+    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false, native_forward_batch = true) -> SamplerQuery
 
 Prepare a reusable [`SamplerQuery`](@ref): the `:sampler`-cut value kernel
 plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
@@ -238,9 +238,19 @@ It needs a backend that keeps that sweep's values (reverse-mode
 `warm = true` compiles the gradient during preparation (`prepare_ad`'s `warm`),
 so [`sampler_value_and_gradient!`](@ref) with a `Vector{Float64}` point runs
 compiled code from its first call.
+
+For native reverse-mode `AutoEnzyme`, a pure independent summed plate with at
+most four active coordinates uses one batched forward sweep by default. It
+differentiates the unchanged generated kernel with ordinary Enzyme, including
+priors and coordinate transforms. Wider, effectful, scan, and
+retained-output programs keep the ordinary reverse preparation. Set
+`native_forward_batch = false` to select that reverse path explicitly. The
+forward preparation keeps the reverse operator for traced calls and for a
+later input whose active shape differs from the exemplar.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
-        backend, on_error = nothing, retain::Tuple = (), warm::Bool = false)
+        backend, on_error = nothing, retain::Tuple = (), warm::Bool = false,
+        native_forward_batch::Bool = true)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
@@ -256,8 +266,12 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
             (workflow_wants(:sampler), wants...); on_error,
             exemplars = exemplar)), wants
     end
+    use_forward = native_forward_batch && isempty(wants) &&
+        ReactiveKernels._native_forward_batch_eligible(
+            backend, gradient_kernel, u)
     prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
-        u; active = :unconstrained, retain = wants, warm)
+        u; active = :unconstrained, retain = wants, warm,
+        native_forward_batch = use_forward)
     return SamplerQuery(kern, prep, layout)
 end
 

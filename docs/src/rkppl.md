@@ -899,7 +899,7 @@ writes do not replace a complete declaration and fail explicitly.
 
 ## Querying and fitting
 
-`prepare_sampler` adds a reverse-mode gradient over the same cut. The
+`prepare_sampler` adds a gradient over the same cut. The
 gradient's executable authority is the package test suite, so it is shown here
 as source:
 
@@ -915,6 +915,15 @@ prepare_query(built, plan, :likelihood)  # presets: :sampler | :likelihood | :pr
 constrain(built.layout, u)               # named constrained values
 restore_draws(built.layout, U)           # U: layout.total × draws
 ```
+
+With reverse-mode `AutoEnzyme`, a pure summed plate and one to four active
+coordinates use a batched forward sweep by default. The generated primal is
+unchanged; Enzyme computes the partials in one traversal without a later
+reverse sweep over the observations. Wider, effectful, scan and retained-output
+programs use the ordinary reverse preparation. `native_forward_batch=false`
+selects that reverse path explicitly for comparison or a workload where it
+performs better. The optimized path can allocate more tangent storage, so
+measure both on the model you fit.
 
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.
