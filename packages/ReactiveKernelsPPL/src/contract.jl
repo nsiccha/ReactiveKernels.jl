@@ -1414,6 +1414,9 @@ function validate_data(plan::StructuralPlan)
     _validate_predictor_columns(plan)
     _validate_levelmaps_data(plan)
     _validate_response_data(plan)
+    for r in plan.responses
+        _validate_mixture_complement_support(r, plan)
+    end
     _validate_plate_parameters_data(plan)
     for s in plan.scans
         _scan_length(plan, s)
@@ -5181,6 +5184,38 @@ function _validate_mixture_literal_loc(r::LikelihoodSpec, f::LikelihoodFamily,
     return nothing
 end
 
+# A complement pair is a probability vector exactly when its sampled value
+# stays in [0, 1]. Use the same transform and effective bounds as the layout:
+# a Uniform or a bounded/truncated prior can satisfy this without having the
+# natural `:unit` family tag. Data-derived bounds are checked again after
+# binding; parameter-dependent bounds cannot prove this condition.
+function _mixture_weight_has_unit_support(p::SampledParameter, plan::StructuralPlan)
+    haskey(SAMPLED_SUPPORT, p.family) || return false
+    override = _bound_override(plan, p.support_override)
+    args = p.family === :uniform ?
+        map(x -> _layout_bound(plan, x), p.args) : p.args
+    transform, lo, hi = _entry_transform(p.family, override, args)
+    transform === :logistic && return true
+    transform === :interval || return false
+    within_unit(x) = x isa Real ? 0 <= x <= 1 : !isbound(plan)
+    return within_unit(lo) && within_unit(hi)
+end
+
+function _validate_mixture_complement_support(r::LikelihoodSpec, plan::StructuralPlan)
+    w = r.mixture_weights
+    w isa MixtureComplementWeights || return nothing
+    pi = findfirst(p -> p.name === w.param, plan.parameters)
+    pi === nothing && _fail(r.label,
+        "complement-pair mixture weight $(w.param) is not a sampled parameter")
+    p = plan.parameters[pi]
+    _mixture_weight_has_unit_support(p, plan) ||
+        _fail(r.label,
+            "complement-pair mixture weight $(w.param) must have support " *
+            "within [0, 1], got $(p.family) with arguments $(p.args) " *
+            "and support override $(p.support_override)")
+    return nothing
+end
+
 # A finite-mixture response (SB `y ~ MixtureModel(comps, w)` mirror):
 # K same-family components over dedicated slots, validated whole. The
 # anchor in `predictor` is never resolved here (it may name a
@@ -5270,15 +5305,7 @@ function _validate_mixture_response(r::LikelihoodSpec, plan::StructuralPlan,
         K == 2 || _fail(r.label,
             "complement-pair mixture weights take exactly 2 components " *
             "(got $K)")
-        pi = findfirst(p -> p.name === w.param, plan.parameters)
-        pi === nothing && _fail(r.label,
-            "complement-pair mixture weight $(w.param) is not a sampled " *
-            "parameter")
-        get(SAMPLED_SUPPORT, plan.parameters[pi].family, :unknown) === :unit ||
-            _fail(r.label,
-            "complement-pair mixture weight $(w.param) must be " *
-            ":unit-support (a Beta/uniform/interval parameter), got " *
-            "$(plan.parameters[pi].family)")
+        _validate_mixture_complement_support(r, plan)
     else
         _validate_mixture_weights(r, w, K)
     end
