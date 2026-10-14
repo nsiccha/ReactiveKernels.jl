@@ -154,8 +154,8 @@ end
 
 # The source surface admits ordinary dotted arithmetic, but an opaque array
 # assignment hides each producer from RK's plate-to-plate reduction fusion.
-# Restrict this emission to one-based Float64 vectors with a known common
-# length and Float64 scalars. Every operand is read once, the arithmetic is
+# Restrict this emission to one-based Float64 or built-in integer vectors with
+# a known common length and their scalar operands. Every operand is read once, the arithmetic is
 # pure, and Julia's scalar operations and broadcast axes are then identical
 # to the original dotted tree. Other ranks, axes and callable leaves retain
 # their exact authored expression.
@@ -304,7 +304,8 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
     gathers = Dict{Symbol,Expr}()
     gather_stmts = Dict{Symbol,Expr}()
     for (name, value) in plan.columns
-        if value isa Vector{Float64} && axes(value, 1) == Base.OneTo(length(value))
+        if value isa Vector{<:Union{Float64,Base.BitInteger,Bool}} &&
+                axes(value, 1) == Base.OneTo(length(value))
             values[name] = _PointwiseValue(1, length(value), false)
         elseif value isa Float64 || value isa Integer
             values[name] = _PointwiseValue(0, 0, false)
@@ -356,7 +357,10 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         elseif rhs isa Symbol && haskey(values, rhs)
             values[name] = values[rhs]
         else
-            delete!(values, name)
+            # A scalar coordinate remains a shared plate input. Its ordinary
+            # indexed read retains the original bounds check.
+            state = _pointwise_leaf(rhs, values)
+            state.rank >= 0 ? (values[name] = state) : delete!(values, name)
         end
     end
     for (name, rhs) in gathers
@@ -1899,18 +1903,9 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
     elseif r.family === LogNormalFam
         return _lognormal_plate_stmts(r, plan, node, pw)
     elseif r.family === BernoulliLogitFam
-        # Base GLM case (no evidence, no weights, no literal range): fused
-        # whole-vector reduction. Ranged responses stay on the plate path
-        # (the cover rule makes them whole-column today, but the fused sum
-        # must never silently outgrow a future partial range). A response
-        # holding one array per index runs its pointwise plate per index.
-        r.evidence.kind === :none && r.weights === nothing &&
-            r.range === nothing && r.mi_jobs === nothing && r.link === LogitLink &&
-            !haskey(plan.columns, _observed_mask_name(r.response)) &&
-            !_is_bare_param_location(r, plan) &&
-            !_cell_broadcast_response(plan, r) &&
-            _wholevec_location(r, plan) &&
-            return _bernoulli_wholevec_stmts(r, plan, node)
+        # Keep stable scalar arithmetic through the summed plate. The
+        # algebraic dot(y, eta) - sum(log1pexp, eta) loses representable
+        # positive tails. RK can fuse the predictor into this same plate.
         return _bernoulli_plate_stmts(r, plan, node, pw)
     elseif r.family === PoissonLogFam
         # Base GLM case (no evidence, no weights, no literal range): fused
@@ -2922,21 +2917,6 @@ function _wholevec_scalar_scale(r::LikelihoodSpec, plan::StructuralPlan)
     s isa ScalePredictorRef &&
         return _predictor_value_type(plan, _predictor(plan, s.predictor)) === :Number
     return false
-end
-
-# Fused whole-vector Bernoulli-logit likelihood (base case). Logit-form log-mass
-# `Σ yᵢ·ηᵢ − Σ log1pexp(ηᵢ)` — no data-only normalizer, a plain fused reduction.
-# Value-identical to `Σ bernoulli(; logit=ηᵢ).logpdf(yᵢ)`; same folded-`_ppl_yf`
-# and `sum(f, x)` treatment as the Poisson form. Gradient stays ordinary AD.
-function _bernoulli_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
-    y = r.response
-    lp = _location_node(r, plan)
-    yf = _yfloat_name(r.label)
-    return Expr[
-        _through_pointwise(_bernoulli_plate_stmts(r, plan, node, _pw_name(r.label)), r)...,
-        :($yf = Float64.($y)),
-        :($node::Float64 = dot($yf, $lp) - sum(log1pexp, $lp)),
-    ]
 end
 
 function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)

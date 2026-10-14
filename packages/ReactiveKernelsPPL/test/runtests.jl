@@ -11,6 +11,7 @@ const _PPL_TEST_FILES = (
     "test_host_transform_numbers.jl",
     "test_preprocessing.jl",
     "test_generator.jl",
+    "test_bernoulli_arithmetic_tails.jl",
     "test_identifiability_admission.jl",
     "test_empty_domains.jl",
     "test_empty_domains_reactant.jl",
