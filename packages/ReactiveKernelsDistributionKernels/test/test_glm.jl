@@ -559,9 +559,19 @@ end
             have = (:y, :X, :beta, :phi), want = :logpdf,
             bound = (; X = X, y = y, phi = phi0))
         skb = string(code_expr(kb))
-        # phi bound: lgp folds to a nullary thunk (no per-call lgamma).
-        @test occursin("logpdf__lgp", skb) && !occursin(")(y, phi)", skb)
+        # phi bound: normalizer subexpressions fold into cached values;
+        # the live logpdf__lgp binding may disappear during that lowering.
+        @test !occursin(")(y, phi)", skb)
         @test !occursin("Distributions", skb)
+        for coefficients in (beta, [-0.3, 0.8])
+            for precision in (0.7, phi0, 5.0)
+                means = exp.(X * coefficients)
+                expected = sum(logpdf(NegativeBinomial(precision,
+                    precision / (m + precision)), yi) for (m, yi) in zip(means, y))
+                @test ku(coefficients, precision) ≈ expected
+                precision == phi0 && @test kb(coefficients) ≈ expected
+            end
+        end
     end
 
     @testset "lowered code is self-contained (no helper escapes)" begin

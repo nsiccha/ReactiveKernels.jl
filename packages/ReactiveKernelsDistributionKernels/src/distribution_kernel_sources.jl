@@ -179,6 +179,10 @@ export ZERO_INFLATED_BINOMIAL_LOGIT_ZI_KERNEL_SOURCE
 export NEGATIVE_BINOMIAL_KERNEL_SOURCE
 export WEIBULL_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
+export product_mixture_logdensity, bernoulli_product_mixture_logdensity
+export binomial_product_mixture_logdensity
+export bernoulli_logit_product_mixture_logdensity
+export binomial_logit_product_mixture_logdensity
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
@@ -1231,6 +1235,88 @@ const negative_binomial = _OTHER_DISTRIBUTION_BINDINGS[20]
 const weibull = _OTHER_DISTRIBUTION_BINDINGS[21]
 const zero_inflated_binomial = _OTHER_DISTRIBUTION_BINDINGS[22]
 const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
+
+# One component is chosen for the entire observed vector. Columns of the
+# parameter matrices are component laws; rows are positions within the one
+# event. The two nested plates retain both data-derived loops, while the
+# shared mixture fold keeps any family-specific cell density in one place.
+@kernel product_mixture_logdensity(component_scores::Vector{Float64},
+        weights::Vector{Float64}) = begin
+    # A singleton vector is broadcast by plate; that would assign one weight
+    # to every component instead of representing one weight per component.
+    checked_weights = length(component_scores) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
+    weighted = plate(component_scores, checked_weights) do score, weight
+        log(weight) + score
+    end
+    return reduce(LogExpFunctions.logaddexp, weighted; init = -Inf)
+end
+
+@kernel bernoulli_product_mixture_logdensity(observed::Vector{Bool},
+        probabilities::Matrix{Float64}, weights::Vector{Float64}) = begin
+    checked_probabilities = size(probabilities, 1) == length(observed) ?
+        probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    components = plate(1:size(checked_probabilities, 2)) do k
+        cells = plate(1:length(observed)) do i
+            bernoulli(checked_probabilities[i, k]).logpdf(observed[i])
+        end
+        sum(cells)
+    end
+    return product_mixture_logdensity(components, weights)
+end
+
+@kernel binomial_product_mixture_logdensity(observed::Vector{Int},
+        trials::Matrix{Int}, probabilities::Matrix{Float64},
+        weights::Vector{Float64}) = begin
+    checked_trials = size(trials) == size(probabilities) ?
+        trials : throw(DimensionMismatch("trial counts and probabilities must match"))
+    checked_probabilities = size(probabilities, 1) == length(observed) ?
+        probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    components = plate(1:size(checked_probabilities, 2)) do k
+        cells = plate(1:length(observed)) do i
+            binomial(checked_trials[i, k], checked_probabilities[i, k]).logpdf(observed[i])
+        end
+        sum(cells)
+    end
+    return product_mixture_logdensity(components, weights)
+end
+
+# Logit-scale versions: `logits[i, k]` is component k's log-odds at position i.
+# Each cell reads the scalar law's logit HAVE route, so a saturated
+# probability keeps its log-space tail. Passing `logistic(eta)` to the
+# probability laws above instead rounds the probability first, and
+# `log1p(-p)` then loses the tail (it is -Inf from about eta = 37). A
+# structural-zero component uses logit -Inf (probability 0); +Inf is
+# probability 1.
+@kernel bernoulli_logit_product_mixture_logdensity(observed::Vector{Bool},
+        logits::Matrix{Float64}, weights::Vector{Float64}) = begin
+    checked_logits = size(logits, 1) == length(observed) ?
+        logits : throw(DimensionMismatch("logit rows must match observations"))
+    components = plate(1:size(checked_logits, 2)) do k
+        cells = plate(1:length(observed)) do i
+            bernoulli(; logit = checked_logits[i, k]).logpdf(observed[i])
+        end
+        sum(cells)
+    end
+    return product_mixture_logdensity(components, weights)
+end
+
+@kernel binomial_logit_product_mixture_logdensity(observed::Vector{Int},
+        trials::Matrix{Int}, logits::Matrix{Float64},
+        weights::Vector{Float64}) = begin
+    checked_trials = size(trials) == size(logits) ?
+        trials : throw(DimensionMismatch("trial counts and logits must match"))
+    checked_logits = size(logits, 1) == length(observed) ?
+        logits : throw(DimensionMismatch("logit rows must match observations"))
+    components = plate(1:size(checked_logits, 2)) do k
+        cells = plate(1:length(observed)) do i
+            binomial(; n = checked_trials[i, k],
+                logit = checked_logits[i, k]).logpdf(observed[i])
+        end
+        sum(cells)
+    end
+    return product_mixture_logdensity(components, weights)
+end
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""
 

@@ -31,6 +31,21 @@ end
 LogDensity(f, args...; kwargs...) = LogDensity(f, args, (;kwargs...), Val(:packed))
 sampling_logdensity(d::LogDensity, value) = d.f(value, d.args...; d.kwargs...)
 
+# A categorical probability vector computed in a plate cell is an ordinary
+# sampling RHS. Keep its matrix product or gather in the RK graph; only the
+# scalar observation lookup belongs in this density.
+function _ppl_categorical_logdensity(value::Integer, probabilities::AbstractVector)
+    all(p -> p >= zero(p), probabilities) &&
+        isapprox(sum(probabilities), one(eltype(probabilities))) ||
+        throw(DomainError(probabilities,
+            "categorical probabilities must be nonnegative and sum to one"))
+    # An unsupported category has zero probability; log(0) keeps the
+    # element type of an in-support result.
+    1 <= value <= length(probabilities) ||
+        return log(zero(eltype(probabilities)))
+    return log(probabilities[value])
+end
+
 """
     ParameterGeometry(shape, unconstrained; support, constrain, unconstrain,
                       logjac, coordinate_names=nothing)
@@ -155,10 +170,7 @@ function _validate_external_parameter(plan, p; observation=false)
     return nothing
 end
 
-function _sampling_extent(plan, ex, name; what = "sampling geometry dimension")
-    ex isa Int && ex >= 0 && return ex
-    (_is_axis_dim(ex) || _is_levels_dim(ex) || _levels_count(ex) !== nothing) &&
-        return _array_dim_size(plan, name, name, ex)
+function _bound_data_value(plan, ex, name, what)
     expressions = Dict(a.name=>a.expr for a in (plan.assignments..., plan.derived...))
     active = Set{Symbol}()
     function lookup(n)
@@ -170,12 +182,19 @@ function _sampling_extent(plan, ex, name; what = "sampling geometry dimension")
         delete!(active, n)
         return v
     end
-    value = try
+    return try
         _eval_value_expr(_resolve_extent_levels(ex), lookup, name)
     catch e
         e isa ContractValidationError && rethrow()
         _fail(name, "$what failed in Julia: " * sprint(showerror, e))
     end
+end
+
+function _sampling_extent(plan, ex, name; what = "sampling geometry dimension")
+    ex isa Int && ex >= 0 && return ex
+    (_is_axis_dim(ex) || _is_levels_dim(ex) || _levels_count(ex) !== nothing) &&
+        return _array_dim_size(plan, name, name, ex)
+    value = _bound_data_value(plan, ex, name, what)
     value isa Integer && !(value isa Bool) && value >= 0 || _fail(name,
         "$what must be a nonnegative integer, got $(repr(value))")
     return try
@@ -323,6 +342,14 @@ function _external_graph_density(args)
     positional = _external_arguments(args)
     isempty(positional) && return nothing
     endpoint = first(positional)
+    # A retained @plate cell broadcasts its RHS constructor when an argument
+    # varies by outer cell. The graph endpoint is invariant in that broadcast
+    # and `_dotify_external_cell_call` wraps it in Ref; it is still the same
+    # direct graph call, now inside one whole-event observation cell.
+    if Meta.isexpr(endpoint, :call, 2) &&
+            endpoint.args[1] == GlobalRef(Base, :Ref)
+        endpoint = endpoint.args[2]
+    end
     endpoint isa GlobalRef && getglobal(endpoint.mod, endpoint.name) isa KernelSpec ||
         return nothing
     return endpoint
