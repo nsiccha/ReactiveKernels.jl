@@ -2475,6 +2475,20 @@ _builtin_dotted_head(f::Symbol) =
 # the vocabulary's own binding — the one undotted `var(x)` means.
 _vocabulary_ref(f::Symbol) = GlobalRef(PPLGeneratedModels, f)
 
+# A built-in reduction's whole-column reading is its one-argument form
+# (`sum(x)`, `mean(z)`). Any other call — keywords (`sum(x; dims = 2)`,
+# `std(x; corrected = false)`) or a function argument (`sum(abs2, x)`) — is
+# Julia's own function, exactly as the qualified `Base.sum(x; dims = 2)`:
+# a module call over whole values.
+_julia_reduction_call(fn, args) = fn isa Symbol && fn in REDUCTION_FNS &&
+    !(length(args) == 1 && !Meta.isexpr(args[1], (:parameters, :kw)))
+
+# The function the bare reduction names (`Base.sum`, `Statistics.mean`).
+function _julia_reduction_ref(fn::Symbol)
+    f = getfield(@__MODULE__, fn)
+    return GlobalRef(parentmodule(f), nameof(f))
+end
+
 function _resolve_module_path(ex, mod::Module, where)
     m = if ex isa Symbol
         isdefined(mod, ex) ? getfield(mod, ex) : nothing
@@ -2727,7 +2741,9 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
         return Expr(:call, ex.args[1], Expr(:tuple, resolved...), ex.args[3:end]...)
     end
     if ex.head === :call && !isempty(ex.args)
-        head = _resolve_call_head(ex.args[1], mod, names, where)
+        head = _julia_reduction_call(ex.args[1], ex.args[2:end]) ?
+            _julia_reduction_ref(ex.args[1]) :
+            _resolve_call_head(ex.args[1], mod, names, where)
         args = Any[recur(a) for a in ex.args[2:end]]
         if head isa GlobalRef || _constructed_endpoint_head(head)
             args = Any[_resolve_function_arg(a, mod, names, where)
@@ -2816,6 +2832,8 @@ _rhs_head_symbol(fn) = nothing
 function _module_call(ex)
     dotted = _is_dotted_call(ex)
     dotted || Meta.isexpr(ex, :call) && !isempty(ex.args) || return false
+    !dotted && _julia_reduction_call(ex.args[1], ex.args[2:end]) &&
+        return true
     return _module_call_head(ex.args[1], dotted)
 end
 _module_call_head(fn::GlobalRef, dotted) = fn.mod !== PPLGeneratedModels
