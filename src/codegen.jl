@@ -2165,6 +2165,11 @@ struct _PlateArmVariant
     lowered_recipes::Tuple
 end
 
+# Preparation may cut an arm's already selected plan at cached values. Keep
+# that exact recipe selection instead of asking the planner to choose again.
+_plate_arm_plan(spec) = plan(spec)
+_plate_arm_plan(p::Plan) = p
+
 # A branch whose condition reads the cell takes its arm per cell, but an arm
 # with its own graph is inlined into the cell loop. Its recipes that read only
 # shared values run at the first cell that takes the arm and are reused by the
@@ -2227,7 +2232,7 @@ Base.@nospecializeinfer function _plate_lane_branch_slots!(
     elseif spec === nothing
         nothing
     else
-        armplan = plan(spec)
+        armplan = _plate_arm_plan(spec)
         fits = all(port -> port.name in names, armplan.have) &&
             !any(port -> canon_id(armplan.graph, port.id) ==
                          canon_id(armplan.graph, only(armplan.want).id),
@@ -2374,7 +2379,7 @@ end
 # read the branch inputs of the same name and its value is the branch output.
 Base.@nospecializeinfer function _plate_branch_arm_recipes!(
         copied::Graph, @nospecialize(spec), r::Recipe, names, fresh)
-    arm = plan(spec)
+    arm = _plate_arm_plan(spec)
     ag = arm.graph
     inputs = Dict{Symbol,Value}()
     for (name, v) in zip(names, r.inputs)

@@ -7,6 +7,7 @@ const calls = Ref(0)
 counted_term(y) = (calls[] += 1; log(y + 1.0))
 counted_root(y) = (calls[] += 1; sqrt(y))
 counted_sum(y) = (calls[] += 1; sum(log1p, y))
+counted_pair(y) = (calls[] += 1; (y, y + 1.0))
 
 # A data-only call beside a live term in one top-level recipe.
 @kernel top_level(q::Vector{Float64}, y) = begin
@@ -88,6 +89,92 @@ end
             (m - d) * parameter
     end
     total::Float64 = sum(pointwise)
+end
+
+# The endpoint is inlined into a let inside the outer branch; its retained
+# arm graph, rather than those let-local spellings, supplies dependencies.
+@kernel endpoint(scale::Float64) = begin
+    value(d::Float64)::Float64 = begin
+        live = scale + 1.0
+        shifted = d + 1.0
+        live > 0 ? live * d - counted_term(shifted) : 0.0
+    end
+end
+@kernel guarded_endpoint(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        parameter > -0.5 ? endpoint(parameter).value(d) : 0.0
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel compound_endpoint(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        parameter > 0 ? counted_term(d) + endpoint(parameter).value(d) : parameter
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel domain_endpoint(scale::Float64) = begin
+    value(d::Float64)::Float64 = begin
+        valid = d >= 0
+        valid ? scale * counted_root(d) : 0.0
+    end
+end
+@kernel guarded_domain_endpoint(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        parameter > 0 ? domain_endpoint(parameter).value(d) : 0.0
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel sequential_arm(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        if parameter > 0
+            live = parameter + 1.0
+            transformed = counted_term(d)
+            live * transformed
+        else
+            parameter
+        end
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel uncacheable_arm(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        if parameter > 0
+            pair = counted_pair(d)
+            parameter * pair[1] + pair[2]
+        else
+            parameter
+        end
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel throwing_arm(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        if parameter > 0
+            transformed = counted_root(d)
+            parameter * transformed
+        else
+            parameter
+        end
+    end
+    total::Float64 = sum(pointwise)
+end
+
+@kernel data_result_arm(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        if parameter > 0
+            live = parameter + 1.0
+            result = fill(d, 2)
+            result
+        else
+            fill(parameter, 2)
+        end
+    end
+    total::Float64 = sum(sum, pointwise)
 end
 
 end

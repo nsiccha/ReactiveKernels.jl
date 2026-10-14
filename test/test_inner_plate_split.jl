@@ -152,6 +152,46 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
         @test C.calls[] == count(>=(0), signed)  # per evaluation, taken lanes only
     end
 
+    @testset "guarded endpoint and sequential arm graphs" begin
+        for (spec, count_per_lane) in ((C.guarded_endpoint, 1),
+                (C.sequential_arm, 1), (C.compound_endpoint, 2))
+            plain = prepare(spec; have = (:q, :y), want = :total)
+            expected = [plain(x, y) for x in (q, -3 .* q, 2 .* q)]
+            derivatives = [gradient(plain, x, y) for x in (q, -3 .* q, 2 .* q)]
+            C.calls[] = 0
+            bound = prepare(spec; have = (:q, :y), want = :total, bound = (; y))
+            prepared_calls = C.calls[]
+            @test prepared_calls == count_per_lane * length(y)
+            @test !isempty(caches(bound.plan))
+            for (x, reference, derivative) in zip((q, -3 .* q, 2 .* q), expected, derivatives)
+                @test bound(x) == reference
+                @test C.calls[] == prepared_calls
+                @test gradient(bound, x) == derivative
+            end
+            @test y == [0.0, 2.0, 5.0, 1.0, 7.0]
+            @test prepare(spec; have = (:q, :y), want = :total,
+                          bound = (; y = Float64[]))(Float64[]) == 0.0
+            rebound = prepare(spec; have = (:q, :y), want = :total,
+                              bound = (; y = [2.0, 4.0]))
+            @test rebound([0.2, -0.1]) == plain([0.2, -0.1], [2.0, 4.0])
+        end
+        # An inner data guard still protects the throwing call when a live
+        # outer guard is selected. Failed speculation must restore BOTH guards.
+        data = [4.0, -1.0, 9.0]
+        plain = prepare(C.guarded_domain_endpoint)
+        bound = prepare(C.guarded_domain_endpoint; bound = (; y = data))
+        for x in ([0.5, 1.0, 0.25], [-0.5, -1.0, -0.25])
+            @test bound(x) == plain(x, data)
+            @test gradient(bound, x) == gradient(plain, x, data)
+        end
+        C.calls[] = 0
+        valid = prepare(C.guarded_domain_endpoint; bound = (; y = [4.0, 9.0]))
+        @test C.calls[] == 2
+        @test valid([0.5, -1.0]) == 1.0
+        @test valid([-0.5, 1.0]) == 3.0
+        @test C.calls[] == 2
+    end
+
     @testset "an error a live input may avoid keeps the cell" begin
         plain = prepare(C.guarded_domain; have = (:q, :y), want = :total)
         bound = prepare(C.guarded_domain; have = (:q, :y), want = :total,
@@ -166,5 +206,36 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
         @test only(caches(valid.plan)).op.value == [2.0, 3.0]
         @test valid([1.0, 2.0]) == 8.0
         @test C.calls[] == 2
+    end
+
+    @testset "uncacheable and throwing graph prefixes keep their guard" begin
+        data = [4.0, -1.0, 9.0]
+        for spec in (C.uncacheable_arm, C.throwing_arm)
+            plain = prepare(spec)
+            bound = prepare(spec; bound = (; y = data))
+            C.calls[] = 0
+            @test bound([-1.0, -2.0, -3.0]) == -6.0
+            @test C.calls[] == 0
+            @test bound([1.0, -2.0, 3.0]) == plain([1.0, -2.0, 3.0], data)
+            @test C.calls[] == 4
+            @test gradient(bound, [1.0, -2.0, 3.0]) ==
+                  gradient(plain, [1.0, -2.0, 3.0], data)
+        end
+        # The selected arm still throws on an invalid square root.
+        bound = prepare(C.throwing_arm; bound = (; y = data))
+        @test_throws DomainError bound(ones(3))
+
+        # An array returned by an arm remains freshly allocated per call,
+        # including when an unused live local appears before the result.
+        spec = C.data_result_arm
+        plain = prepare(spec)
+        bound = prepare(spec; bound = (; y = data))
+        x = [1.0, -2.0, 3.0]
+        @test bound(x) == plain(x, data)
+        @test gradient(bound, x) == gradient(plain, x, data)
+        pointwise = prepare(spec; want = :pointwise, bound = (; y = data))
+        first_result, next_result = pointwise(x), pointwise(x)
+        @test first_result == next_result
+        @test all(a !== b for (a, b) in zip(first_result, next_result))
     end
 end
