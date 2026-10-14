@@ -35,21 +35,26 @@ import ReactiveKernelsNUTSExamples
     # sidesteps an AD failure mode (e.g. `codegen.jl` narrowing a plate
     # accumulator's element type), or a docstring telling the caller which
     # backend package to load (e.g. `using Enzyme` for `AutoEnzyme` in
-    # `ad.jl`). Scan code with docstrings and comments stripped so a prose
-    # mention is not mistaken for a dependency — a real
-    # `using`/`import`/qualified reference in code still trips this, as does
-    # the `deps` guard above. Docstrings strip first: no `"""` appears in a
-    # src/ comment, and no `#` shares a line with a docstring delimiter, so
-    # neither strip unbalances the other.
-    strip_prose(code) = replace(
-        replace(
-            replace(code, r"\"\"\".*?\"\"\""s => " "),  # docstrings
-            r"#=.*?=#"s => " "),  # block comments
-        r"#[^\n]*" => "",  # line comments
-    )
-    @test all(readdir(srcdir; join = true)) do path
-        !isfile(path) || !occursin(r"\bEnzyme\b", strip_prose(read(path, String)))
+    # `ad.jl`). Parse Julia syntax so prose in docstrings, comments, and
+    # diagnostic strings is ignored, while imports, qualified calls,
+    # and executable string interpolations retain their symbol references.
+    function references_enzyme(ex)
+        ex === :Enzyme && return true
+        ex isa Expr && return any(references_enzyme, ex.args)
+        ex isa QuoteNode && return references_enzyme(ex.value)
+        return false
     end
+    references_enzyme_source(code) = references_enzyme(Meta.parseall(code))
+    @test !references_enzyme_source("# Enzyme\nerror(\"Enzyme must be loaded\")")
+    @test !references_enzyme_source("\"\"\"Load Enzyme first.\"\"\"\nf() = 1")
+    @test references_enzyme_source("using Enzyme")
+    @test references_enzyme_source("import Enzyme: Reverse")
+    @test references_enzyme_source("f() = Enzyme.Reverse")
+    @test references_enzyme_source(raw"f() = \"backend: $(Enzyme.Reverse)\"")
+    dependency_paths = filter(readdir(srcdir; join = true)) do path
+        isfile(path) && references_enzyme_source(read(path, String))
+    end
+    @test isempty(dependency_paths)
 
     for file in ("kernel_nuts.jl", "kernel_nuts_native.jl", "hmc.jl", "reactive_nuts.jl")
         @test !isfile(joinpath(srcdir, file))
