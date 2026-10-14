@@ -876,7 +876,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         for term in terminals.items
             cell(value) = term.transform === nothing ? value :
                 _scan_terminal_convert(term.eltype, _scan_terminal_scalar(
-                    term.transform.source, term.bindings, term.scan_names,
+                    term.source, term.bindings, term.scan_names,
                     value, seed_sample, term.mod))
             accumulator = gensym(:scan_minimum)
             push!(terminal_init.args, :($accumulator = $(cell(seed_sample))))
@@ -1091,15 +1091,23 @@ function _scan_terminal_scalar(ex, bindings, scan_names, sample, seed, mod)
         return length(ex.args) == 2 && ex.args[1] in scan_names &&
             ex.args[2] === 1 ? seed : nothing
     end
-    ex.head === :call || return nothing
-    callee = ex.args[1]
-    callee isa Symbol && _is_broadcast_operator(callee) || return nothing
-    name = Symbol(String(callee)[2:end])
+    name, operands = if ex.head === :call
+        callee = ex.args[1]
+        callee isa Symbol && _is_broadcast_operator(callee) || return nothing
+        Symbol(String(callee)[2:end]), ex.args[2:end]
+    elseif ex.head === :. && length(ex.args) == 2 &&
+           ex.args[2] isa Expr && ex.args[2].head === :tuple
+        # Base's @. expansion spells arithmetic as (+).(a, b), rather
+        # than the :call node used by explicitly written a .+ b.
+        ex.args[1], ex.args[2].args
+    else
+        return nothing
+    end
     name in (:+, :-, :*, :/) || return nothing
     isdefined(mod, name) && isconst(mod, name) || return nothing
     _kernel_resolve_binding(mod, name) === getglobal(Base, name) || return nothing
     args = Any[_scan_terminal_scalar(arg, bindings, scan_names, sample, seed, mod)
-               for arg in ex.args[2:end]]
+               for arg in operands]
     any(isnothing, args) && return nothing
     Expr(:call, GlobalRef(Base, name), args...)
 end
@@ -1137,11 +1145,14 @@ function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
     for reader in readers(scan_id)
         reader.effectful && return nothing
         if reader.op === Base.minimum && length(reader.inputs) == 1
-            push!(terminal, (; reduction = reader, transform = nothing))
+            push!(terminal, (; reduction = reader, transform = nothing, source = nothing))
             continue
         end
         length(reader.outputs) == 1 && reader.op isa _KernelSourceOp || return nothing
-        fieldcount(typeof(_kernel_native_source(reader.op.f))) == 0 || return nothing
+        closure = _lane_source_closure(reader)
+        closure === nothing && return nothing
+        _, _, mod = closure
+        source = _lane_expand_dot(_lane_strip_lines(reader.source), mod)
         declared = valtype(only(reader.outputs))
         declared === Any || _scan_terminal_eltype(declared) !== nothing || return nothing
         transform_id = canon_id(g, only(reader.outputs).id)
@@ -1158,14 +1169,14 @@ function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
                 scalar_names[name] = name
             end
         end
-        _scan_terminal_scalar(reader.source, scalar_names, scan_names, :sample, :seed,
-            _kernel_endpoint_source_module(reader.op)) === nothing && return nothing
+        _scan_terminal_scalar(source, scalar_names, scan_names, :sample, :seed,
+            mod) === nothing && return nothing
         downstream = readers(transform_id)
         length(downstream) == 1 || return nothing
         reduction = only(downstream)
         reduction.op === Base.minimum && length(reduction.inputs) == 1 &&
             !reduction.effectful || return nothing
-        push!(terminal, (; reduction, transform = reader))
+        push!(terminal, (; reduction, transform = reader, source))
     end
     isempty(terminal) && return nothing
     last_index = maximum(findfirst(==(term.reduction), p.recipes) for term in terminal)
@@ -3810,7 +3821,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     args = transform === nothing ? Any[] : Any[nm(v) for v in transform.inputs]
                     source_names = transform === nothing ? Symbol[] : _recipe_source_names(transform)
                     push!(terminal_records, (; slot, lhs = nm(reduction_value),
-                        transform, args,
+                        transform, args, source = item.source,
                         transform_lhs = transform === nothing ? nothing : nm(only(transform.outputs)),
                         eltype = transform === nothing || !declare_types ? nothing :
                             _scan_terminal_eltype(valtype(only(transform.outputs))),

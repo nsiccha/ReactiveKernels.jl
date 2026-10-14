@@ -12,7 +12,7 @@ allocated(f::F, args::Vararg{Any,N}) where {F,N} = @allocated f(args...)
         next = carry + x
         (next, next)
     end
-    relative = 100 .* (trajectory .- trajectory[1]) ./ trajectory[1]
+    relative = @.(100 * (trajectory - trajectory[1]) / trajectory[1])
     low::Float64 = minimum(trajectory)
     relative_low::Float64 = minimum(relative)
     return low, relative_low
@@ -24,7 +24,7 @@ end
         next = carry + x
         (next, next)
     end
-    relative = 100 .* (trajectory .- trajectory[1]) ./ trajectory[1]
+    relative = @.(100 * (trajectory - trajectory[1]) / trajectory[1])
     low::Float64 = minimum(trajectory)
     relative_low::Float64 = minimum(relative)
     return trajectory, low, relative_low

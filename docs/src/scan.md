@@ -216,7 +216,8 @@ Natively, terminal `minimum` reductions can stream through an init-including
 scan, including the seed. This covers a trajectory declared as `Vector{T}` or
 `AbstractVector{T}` for `T` equal to `Float16`, `Float32` or `Float64`, with a
 dense first input sequence and an inferred floating output type. Direct minima
-and minima of one source-authored dotted expression using `+`, `-`, `*`, `/`,
+and minima of one source-authored dotted expression (including `@.`) using
+`+`, `-`, `*`, `/`,
 the trajectory, `trajectory[1]`, and available primitive scalar inputs share
 the scan loop. For example, `minimum(100 .* (trajectory .- trajectory[1]) ./
 trajectory[1])`, authored as a transform followed by a reduction, needs no

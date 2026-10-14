@@ -8,7 +8,7 @@ materialized_minimum(xs) = minimum(xs)
         next = carry + gain*x
         (next,next)
     end
-    relative::Vector{Float64} = 100 .* (trajectory .- trajectory[1]) ./ trajectory[1]
+    relative::Vector{Float64} = @.(100 * (trajectory - trajectory[1]) / trajectory[1])
     low::Float64 = minimum(trajectory)
     relative_low::Float64 = minimum(relative)
     objective::Float64 = low + 0.01*relative_low
@@ -21,7 +21,7 @@ end
         next = carry + gain*x
         (next,next)
     end
-    relative::Vector{Float64} = 100 .* (trajectory .- trajectory[1]) ./ trajectory[1]
+    relative::Vector{Float64} = @.(100 * (trajectory - trajectory[1]) / trajectory[1])
     low::Float64 = materialized_minimum(trajectory)
     relative_low::Float64 = materialized_minimum(relative)
     objective::Float64 = low + 0.01*relative_low
