@@ -97,6 +97,30 @@ end
     end
 end
 
+@testset "elementwise maps over a live design matrix" begin
+    # Columns read only inside the `hcat` make it a model-level matrix too,
+    # so mapping over a parameter-dependent design keeps Julia's meaning.
+    x1 = collect(range(-1, 1; length = 6))
+    design(c) = hcat(ones(length(x1)), x1, exp.(c.a .* x1))
+    check(quote
+        a ~ Normal(0, 1)
+        X = hcat(ones(length(x1)), x1, exp.(a .* x1))
+        E = X .* 2
+        b[axes(X, 2)] .~ Normal.(0, 1)
+        s ~ Exponential(1)
+        y .~ Normal.(E * b, s)
+    end, (; y, x1), c -> sum(logpdf.(Normal.((2 .* design(c)) * c.b, c.s), y));
+        points)
+    check(quote
+        a ~ Normal(0, 1)
+        X = hcat(ones(length(x1)), x1, exp.(a .* x1))
+        E = exp.(X)
+        s ~ Exponential(1)
+        y .~ Normal.(E[:, 3], s)
+    end, (; y, x1), c -> sum(logpdf.(Normal.(exp.(design(c))[:, 3], c.s), y));
+        points = (points[1][1:2], points[2][1:2]))
+end
+
 @testset "hcat columns and a declared matrix give one density" begin
     # `W[axes(u, 2), 1:2]` packs column-major, so its coordinates line up
     # with `w1` then `w2`.
