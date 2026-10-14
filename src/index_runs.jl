@@ -1,0 +1,259 @@
+# Bound-data contiguous-index runs for native scalar reductions.
+# The derived metadata is an ordinary data-only graph dependency. It therefore
+# occupies the existing leading constant slots and is recomputed on rebinding;
+# no bound arrays or extents enter a cached template's operation tail or syntax.
+# Only the finite flat/grouped schedule class distinguishes compiled templates.
+
+const _IndexRunData = Tuple{Vector{Int},Vector{Int},Int,Bool}
+# Grouped cost is per cell plus per run; flat cost is per cell only. On the
+# production-path synthetic (centered hierarchical intercept, n=4096) the
+# crossover is a mean run of about 5 for the density and 2 for Reverse, and a
+# mean of 8 wins both by more than 20% (evidence: RKPPLBench todo 0arze4h).
+const _INDEX_RUN_MINIMUM_MEAN_LENGTH = 8
+
+# Unknown index representations retain the original gather and loop. A concrete
+# return type also keeps concretely typed client programs concrete.
+_index_run_metadata(indices) = (Int[],Int[],0,false)
+# Choose one schedule for the entire reduction. Mixed grouped/flat spans
+# introduce an inner policy branch and were slower in native primal controls.
+# The mean-run threshold conservatively amortizes the outer-loop overhead;
+# data patterns below it retain the original flat reduction.
+function _index_run_metadata(indices::Vector{Int})
+    n = length(indices)
+    # `n ÷ runs >= minimum` is `runs <= n ÷ minimum`. Count first: a rejected
+    # schedule allocates nothing, and counting stops once rejection is certain.
+    limit = n ÷ _INDEX_RUN_MINIMUM_MEAN_LENGTH
+    runs = min(n, 1)
+    @inbounds for i in 2:n
+        indices[i] == indices[i - 1] && continue
+        runs += 1
+        runs > limit && return (Int[], Int[], n, false)
+    end
+    (runs == 0 || runs > limit) && return (Int[], Int[], n, false)
+    starts = Vector{Int}(undef, runs)
+    stops = Vector{Int}(undef, runs)
+    r = 1
+    @inbounds starts[1] = 1
+    @inbounds for i in 2:n
+        indices[i] == indices[i - 1] && continue
+        stops[r] = i - 1
+        r += 1
+        starts[r] = i
+    end
+    @inbounds stops[runs] = n
+    (starts, stops, n, true)
+end
+
+# The extra dependency is compiler metadata only. The ordinary and tensorized
+# semantic fallback return exactly the original borrowed gather representation.
+@inline _readonly_gather_runs(parent,indices,runs) = _readonly_gather(parent,indices)
+
+# Record these constant slots once per bound plan. Rebinding keys the compiled
+# template only by each schedule's Boolean, never by an extent or index pattern.
+function _partial_index_run_slots(g::Graph, b::_PartialBoundary)
+    ids=Set{Int}()
+    for r in b.residual
+        r.op===_readonly_gather_runs || continue
+        push!(ids,canon_id(g,r.inputs[3].id))
+    end
+    [i for (i,v) in enumerate(b.constants) if canon_id(g,v.id) in ids]
+end
+
+function _bound_index_run_classes(slots::Vector{Int}, @nospecialize(hoisted))
+    isempty(slots) && return ()
+    classes=Vector{Bool}(undef,length(slots))
+    for (i,slot) in enumerate(slots)
+        classes[i]=hoisted[slot][4]
+    end
+    Tuple(classes)
+end
+
+_index_run_gather(op) = op === _readonly_gather ||
+    (op isa _KernelSourceOp && op.call_identity !== nothing &&
+     first(op.call_identity) === _readonly_gather)
+
+function _partial_index_runs(p::Plan,bound_values::Vector{Value})
+    isempty(bound_values) && return p
+    g=p.graph
+    # Limit metadata construction to ancestors of a visible total-only plate.
+    wanted=Set(canon_id(g,w.id) for w in p.want)
+    needed=Set{Int}()
+    for r in p.recipes
+        r.op isa _AuthoredPlateOp || continue
+        total=_authored_plate_sum_recipe(p,r)
+        total===nothing && continue
+        id=canon_id(g,only(r.outputs).id)
+        id in wanted && continue
+        any(q -> q!==total && any(v->canon_id(g,v.id)==id,q.inputs),p.recipes) && continue
+        union!(needed,(canon_id(g,v.id) for v in r.inputs))
+    end
+    isempty(needed) && return p
+    for r in Iterators.reverse(p.recipes)
+        any(v->canon_id(g,v.id) in needed,r.outputs) || continue
+        union!(needed,(canon_id(g,v.id) for v in r.inputs))
+    end
+    bound=Set(canon_id(g,v.id) for v in bound_values)
+    _,_,dataonly=_partial_split(p,bound)
+    eligible=Set(r.id for r in p.recipes if !r.effectful &&
+        length(r.inputs)==2 && length(r.outputs)==1 && _index_run_gather(r.op) &&
+        canon_id(g,only(r.outputs).id) in needed &&
+        !(canon_id(g,r.inputs[1].id) in dataonly) &&
+        canon_id(g,r.inputs[2].id) in dataonly)
+    isempty(eligible) && return p
+    copied=Graph(copy(g.values),copy(g.recipes),copy(g.producers),copy(g.aliases),g.version)
+    recipes=Recipe[]
+    metadata=Dict{Int,Value}()
+    fresh=minimum((r.id for r in p.recipes);init=0)-1
+    for r in p.recipes
+        if !(r.id in eligible)
+            push!(recipes,r);continue
+        end
+        index=r.inputs[2];cid=canon_id(g,index.id)
+        if !haskey(metadata,cid)
+            # Derived from the index value's name, never a fresh gensym: a
+            # name that changes between preparations changes the prepared
+            # program's identity and recompiles the AD operator every time.
+            value=value!(copied,Symbol(index.name,:_index_runs),_IndexRunData)
+            metadata[cid]=value
+            push!(recipes,Recipe(fresh,(index,),(value,),_index_run_metadata,
+                0.0,nothing,false))
+            fresh-=1
+        end
+        push!(recipes,Recipe(r.id,(r.inputs...,metadata[cid]),r.outputs,
+            _readonly_gather_runs,r.cost,r.cse_key,false))
+    end
+    template=Plan(copied,p.have,p.want,p.recipes,p.producer,p.cost,p.candidates)
+    _partial_subplan(template,p.have,p.want,recipes)
+end
+
+_index_run_call(x,f,n=nothing)=x isa Expr && x.head===:call &&
+    x.args[1]==f && (n===nothing || length(x.args)==n+1)
+function _index_run_visit(f,x)
+    x isa Expr || return
+    x.head in (:quote,:inert) && return
+    f(x)
+    foreach(a->_index_run_visit(f,a),x.args)
+end
+function _index_run_replace(f,x)
+    x isa Expr || return x
+    x.head in (:quote,:inert) && return x
+    y=f(x)
+    y===x || return y
+    # An untouched subtree is returned as is, so a flat schedule's body is not
+    # copied node by node on every fresh preparation.
+    args=x.args
+    replaced=Vector{Any}(undef,length(args))
+    changed=false
+    for (i,a) in enumerate(args)
+        b=_index_run_replace(f,a)
+        b===a || (changed=true)
+        replaced[i]=b
+    end
+    changed ? Expr(x.head,replaced...) : x
+end
+
+# This local emitter transformation reads only compiler-owned operation identity
+# and generated data flow. It adds no operation slots, so native and tensorized
+# products retain identical tables. Tensorized execution keeps the original loop.
+function _lower_index_runs_native(body::Expr,ops)
+    any(op->op===_readonly_gather_runs,ops) || return body
+    gathers=Dict{Symbol,Symbol}();raw=Dict{Symbol,Symbol}();projections=Dict{Symbol,Symbol}()
+    policies=Dict{Symbol,Bool}()
+    _index_run_visit(body) do ex
+        ex.head===:(=) && length(ex.args)==2 && ex.args[1] isa Symbol || return
+        lhs,rhs=ex.args
+        rhs isa Expr && rhs.head===:call || return
+        fn=rhs.args[1]
+        if fn isa Expr && fn.head===:ref && length(fn.args)==2 &&
+                fn.args[1]===_OPS_ARG && fn.args[2] isa Int
+            op=ops[fn.args[2]]
+            op isa _BoundConstant && op.value isa _IndexRunData &&
+                (policies[lhs]=op.value[4])
+            op===_readonly_gather_runs && length(rhs.args)==4 &&
+                rhs.args[4] isa Symbol && (gathers[lhs]=rhs.args[4])
+        elseif _index_run_call(rhs,GlobalRef(Base,:broadcastable),1)
+            m=get(gathers,rhs.args[2],nothing);m===nothing || (raw[lhs]=m)
+        elseif _index_run_call(rhs,GlobalRef(Base.Broadcast,:preprocess),2)
+            m=get(raw,rhs.args[3],nothing);m===nothing || (projections[lhs]=m)
+        end
+    end
+    isempty(projections) && return body
+    rewritten=Ref(0)
+    _index_run_replace(body) do ex
+        ex.head===:if && length(ex.args)==3 || return ex
+        # A previously grouped reduction has an inner conditional here. Only
+        # the original macro-expanded SIMD block is eligible, making this
+        # pass idempotent when an already lowered body is embedded again.
+        native=ex.args[2]
+        native isa Expr && native.head===:block || return ex
+        fallback=ex.args[3]
+        fallback isa Expr && fallback.head===:for || return ex
+        binding,cellbody=fallback.args
+        binding isa Expr && binding.head===:(=) || return ex
+        index,iteration=binding.args
+        index isa Symbol || return ex
+        _index_run_call(iteration,GlobalRef(@__MODULE__,:_plate_cells),1) || return ex
+        domain=iteration.args[2]
+        _index_run_call(domain,GlobalRef(Base,:CartesianIndices),1) || return ex
+        axes=domain.args[2];condition=ex.args[1]
+        condition==:(length($axes)==1) || return ex
+        selected=Symbol[];additions=Expr[]
+        _index_run_visit(cellbody) do cell
+            if _index_run_call(cell,GlobalRef(Base.Broadcast,:_broadcast_getindex),2) &&
+                    cell.args[3]==index && haskey(projections,cell.args[2])
+                cell.args[2] in selected || push!(selected,cell.args[2])
+            end
+            cell.head===:(=) && length(cell.args)==2 &&
+                _index_run_call(cell.args[2],GlobalRef(@__MODULE__,:_plate_total_add),2) &&
+                cell.args[2].args[2]==cell.args[1] && push!(additions,cell)
+        end
+        isempty(selected) && return ex
+        length(additions)==1 || return ex
+        accumulator=only(additions).args[1]
+        accumulator isa Symbol || return ex
+        metadata=projections[first(selected)]
+        policy=get(policies,metadata,nothing)
+        # A known flat schedule retains the original body verbatim. The bound
+        # template cache includes this finite policy, so later grouped bindings
+        # cannot accidentally reuse a flat template (or vice versa).
+        policy===false && return ex
+        # Distinct index maps keep their original scalar projection. Only inputs
+        # sharing this exact data-only metadata are invariant over its runs.
+        filter!(s->projections[s]===metadata,selected)
+        # Deterministic locals (see the metadata name above): derived from
+        # the metadata name and the reduction's position in this body.
+        k=(rewritten[]+=1)
+        shared=Dict(s=>Symbol(s,:_index_run_value_,k) for s in selected)
+        part,run,lo,hi,linear=(Symbol(metadata,:_,s,:_,k) for s in (:run_partial,:run,:run_lo,:run_hi,:run_linear))
+        grouped_body=_index_run_replace(cellbody) do cell
+            if _index_run_call(cell,GlobalRef(Base.Broadcast,:_broadcast_getindex),2) &&
+                    cell.args[3]==index && haskey(shared,cell.args[2])
+                return shared[cell.args[2]]
+            end
+            cell
+        end
+        grouped_body=_index_run_replace(grouped_body) do cell
+            cell.head===:(=) && cell.args[1]==accumulator &&
+                _index_run_call(cell.args[2],GlobalRef(@__MODULE__,:_plate_total_add),2) ?
+                :($part=$(GlobalRef(@__MODULE__,:_plate_total_add))($part,$(cell.args[2].args[3]))) : cell
+        end
+        simd(block)=macroexpand(@__MODULE__,Expr(:macrocall,GlobalRef(Base,Symbol("@simd")),
+            LineNumberNode(0),Expr(:for,Expr(:(=),linear,:($lo:$hi)),
+                Expr(:block,:($index=Base.CartesianIndex($linear)),block))))
+        grouped=Expr(:block)
+        for s in selected
+            push!(grouped.args,:($(shared[s])=$(GlobalRef(Base.Broadcast,:_broadcast_getindex))($s,Base.CartesianIndex($lo))))
+        end
+        push!(grouped.args,:($part=zero($accumulator)),simd(grouped_body),
+            :($accumulator=$(GlobalRef(@__MODULE__,:_plate_total_add))($accumulator,$part)))
+        reads=_inbounds_expr(Expr(:block,
+            :($lo=getfield($metadata,1)[$run]),:($hi=getfield($metadata,2)[$run])))
+        # Both vectors are created together, indexed by eachindex(starts).
+        # Authored array accesses remain under their original checks.
+        runbody=Expr(:block,reads,grouped)
+        runs=Expr(:for,Expr(:(=),run,:(eachindex(getfield($metadata,1)))),runbody)
+        guard=:(Base.only($axes)==Base.OneTo(getfield($metadata,3)) && $accumulator isa Number)
+        policy===nothing && (guard=:(getfield($metadata,4) && $guard))
+        Expr(:if,condition,Expr(:if,guard,runs,ex.args[2]),fallback)
+    end
+end
