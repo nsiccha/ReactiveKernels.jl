@@ -720,7 +720,8 @@ end
 function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                                       offset; consumer = nothing, recycled = nothing,
                                       pointwise_recycled = nothing,
-                                      type_offset = nothing, strips = nothing)
+                                      type_offset = nothing, strips = nothing,
+                                      terminals = nothing)
     _scan_has_history(op) && return _lower_authored_scan_history_native!(
         body, op, callargs, lhs, offset; recycled)
     step = op.kernel
@@ -857,11 +858,43 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
             $(GlobalRef(@__MODULE__, :_plate_total_value))($total_seed)))
         push!(loop_output.args, :($total_lhs = $total_lhs + $cell_output))
     end
+    terminal_init = Expr(:block)
+    if terminals !== nothing
+        samples = gensym(:scan_terminal_samples)
+        T = :($(GlobalRef(Base, :promote_type))($typeof_ref($(callargs[1])), $output_type))
+        push!(terminal_init.args, :($samples = $(GlobalRef(@__MODULE__,
+            :_scan_terminal_samples))($(callargs[1]), $T, $(GlobalRef(Base,
+            :length))($indices) + 1)))
+        push!(terminal_init.args, :($position = 1))
+        push!(initial_output.args, :($position += 1))
+        push!(initial_output.args, :($(GlobalRef(@__MODULE__,
+            :_scan_terminal_advance!))($samples, $output, $position)))
+        push!(loop_output.args, :($position += 1))
+        push!(loop_output.args, :($(GlobalRef(@__MODULE__,
+            :_scan_terminal_advance!))($samples, $output, $position)))
+        for term in terminals
+            sample = if term.slot === nothing
+                :($samples.seed), :($samples.current)
+            else
+                broadcast = gensym(:scan_terminal_broadcast)
+                args = Any[arg === nothing ? samples : arg for arg in term.args]
+                push!(terminal_init.args, :($broadcast = $(_OPS_ARG)[$(term.slot)]($(args...))))
+                getindex_ref = GlobalRef(Base.Broadcast, :_broadcast_getindex)
+                :($getindex_ref($broadcast, 1)), :($getindex_ref($broadcast, $position))
+            end
+            push!(terminal_init.args, :($(term.lhs) = $(sample[1])))
+            push!(initial_output.args, :($(term.lhs) = $(GlobalRef(Base, :min))(
+                $(term.lhs), $(sample[2]))))
+            push!(loop_output.args, :($(term.lhs) = $(GlobalRef(Base, :min))(
+                $(term.lhs), $(sample[2]))))
+        end
+    end
     # `eachindex(seqs...)` throws `DimensionMismatch` unless every iterated
     # sequence shares axes, giving the lockstep length check for free.
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
     append!(body.args, invariant)
     append!(body.args, typing.args)
+    append!(body.args, terminal_init.args)
     nonempty = Expr(:block)
     push!(nonempty.args, :($carry = $(callargs[1])))
     push!(nonempty.args, :($index = $(GlobalRef(Base, :first))($indices)))
@@ -1018,6 +1051,110 @@ function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
         end
     end
     consumer
+end
+
+# A virtual, single-sample scan trajectory. A source-authored dotted expression
+# over it stays a Broadcasted tree; the scan loop asks that tree for only the
+# current cell. `path[1]` still reads the seed. The object is fresh and never
+# escapes the generated call.
+struct _ScanTerminalStyle{N} <: Base.Broadcast.AbstractArrayStyle{N} end
+_ScanTerminalStyle{N}(::Val{M}) where {N,M} = _ScanTerminalStyle{M}()
+
+mutable struct _ScanTerminalSamples{T} <: AbstractVector{T}
+    seed::T
+    current::T
+    current_index::Int
+    count::Int
+end
+Base.BroadcastStyle(::Type{<:_ScanTerminalSamples}) = _ScanTerminalStyle{1}()
+Base.copy(bc::Base.Broadcast.Broadcasted{<:_ScanTerminalStyle}) =
+    Base.Broadcast.instantiate(bc)
+Base.size(s::_ScanTerminalSamples) = (s.count,)
+Base.axes(s::_ScanTerminalSamples) = (Base.OneTo(s.count),)
+Base.IndexStyle(::Type{<:_ScanTerminalSamples}) = IndexLinear()
+@inline function Base.getindex(s::_ScanTerminalSamples, i::Int)
+    @boundscheck checkbounds(s, i)
+    i == 1 && return s.seed
+    i == s.current_index || throw(BoundsError(s, i))
+    s.current
+end
+@inline function _scan_terminal_samples(seed, ::Type{T}, count) where T
+    converted = convert(T, seed)
+    _ScanTerminalSamples{T}(converted, converted, 1, count)
+end
+@inline function _scan_terminal_advance!(s::_ScanTerminalSamples, value, index)
+    s.current = value
+    s.current_index = index
+    s.current
+end
+
+# Only source-authored, pure scalar arithmetic over the scan and numeric
+# scalars is eligible. This keeps side effects, other arrays, and whole-array
+# reads on the ordinary materialized path. The runtime callable retains the
+# author's resolved arithmetic bindings and nesting/order.
+function _scan_terminal_arithmetic(ex, scan_name, scalar_names, mod)
+    ex isa Number && return true
+    ex isa Symbol && return ex == scan_name || ex in scalar_names
+    ex isa Expr || return false
+    if ex.head === :ref
+        return length(ex.args) == 2 && ex.args[1] === scan_name && ex.args[2] === 1
+    end
+    ex.head === :call || return false
+    callee = ex.args[1]
+    callee isa Symbol && _is_broadcast_operator(callee) || return false
+    name = Symbol(String(callee)[2:end])
+    name in (:+, :-, :*, :/) || return false
+    _kernel_resolve_binding(mod, name) === getglobal(Base, name) || return false
+    all(arg -> _scan_terminal_arithmetic(arg, scan_name, scalar_names, mod),
+        ex.args[2:end])
+end
+
+# A scan may feed several direct minima and one-level dotted transforms, each
+# used only by a minimum. Requesting the trajectory or a transform, or giving
+# either another consumer, retains the ordinary buffers. Restrict to a typed
+# floating trajectory: its materialized writes convert each sample to T, and
+# the virtual trajectory makes that same conversion before any cell reads it.
+function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
+    op = scan_recipe.op
+    (_scan_includes_init(op) && !_scan_has_history(op)) || return nothing
+    scan_value = only(scan_recipe.outputs)
+    valtype(scan_value) <: AbstractVector{<:AbstractFloat} || return nothing
+    g = p.graph
+    scan_id = canon_id(g, scan_value.id)
+    any(w -> canon_id(g, w.id) == scan_id, p.want) && return nothing
+    scan_index = findfirst(==(scan_recipe), p.recipes)
+    available = Set(canon_id(g, v.id) for v in p.have)
+    for r in p.recipes[1:scan_index-1], v in r.outputs
+        push!(available, canon_id(g, v.id))
+    end
+    readers(id) = [r for r in p.recipes if any(v -> canon_id(g, v.id) == id, r.inputs)]
+    terminal = Any[]
+    for reader in readers(scan_id)
+        reader.effectful && return nothing
+        if reader.op === Base.minimum && length(reader.inputs) == 1
+            push!(terminal, (; reduction = reader, transform = nothing))
+            continue
+        end
+        length(reader.outputs) == 1 && reader.op isa _KernelSourceOp || return nothing
+        transform_id = canon_id(g, only(reader.outputs).id)
+        any(w -> canon_id(g, w.id) == transform_id, p.want) && return nothing
+        scalar_names = Set{Symbol}()
+        for v in reader.inputs
+            cid = canon_id(g, v.id)
+            cid == scan_id && continue
+            cid in available && valtype(v) <: Number || return nothing
+            push!(scalar_names, v.name)
+        end
+        _scan_terminal_arithmetic(reader.source, scan_value.name, scalar_names,
+            _kernel_endpoint_source_module(reader.op)) || return nothing
+        downstream = readers(transform_id)
+        length(downstream) == 1 || return nothing
+        reduction = only(downstream)
+        reduction.op === Base.minimum && length(reduction.inputs) == 1 &&
+            !reduction.effectful || return nothing
+        push!(terminal, (; reduction, transform = reader))
+    end
+    isempty(terminal) ? nothing : terminal
 end
 
 # Plates that compute a scan's per-step sequences, and that only that scan (or
@@ -3476,6 +3613,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     runtime_ops = Any[]
     runtime_recipes = Recipe[]
     skipped_recipes = Set{Int}()
+    terminal_skips = Set{Int}()
     pending_scans = Dict{Int,Any}()
     inferred_plate_types = nothing
     inferred_exemplar_types = nothing
@@ -3506,6 +3644,13 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
+        if r.id in terminal_skips
+            # The native scan computed this value. Keep the original slots in
+            # both products so their operation tables remain identical.
+            push!(runtime_ops, r.op)
+            push!(runtime_recipes, r)
+            continue
+        end
         callargs = Any[nm(inp) for inp in r.inputs]
         if cells !== nothing && r.id in cells.recipes
             # Its table slot stays here; its consumer cell calls it per row.
@@ -3630,6 +3775,35 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             append!(runtime_ops, r.op.kernel.ops)
             append!(runtime_recipes, r.op.kernel.lowered_recipes)
             type_offset = _scan_type_slots!(runtime_ops, runtime_recipes, r.op)
+            terminal = inline_embedded ? _authored_scan_terminal_minima(p, r) : nothing
+            terminal_records = Any[]
+            if terminal !== nothing
+                scan_id = canon_id(g, only(r.outputs).id)
+                for item in terminal
+                    transform = item.transform
+                    slot = if transform === nothing
+                        nothing
+                    else
+                        push!(runtime_ops, transform.op)
+                        push!(runtime_recipes, transform)
+                        length(runtime_ops)
+                    end
+                    reduction = item.reduction
+                    reduction_value = only(reduction.outputs)
+                    reduction_id = canon_id(g, reduction_value.id)
+                    push!(terminal_records, (; slot, lhs = nm(reduction_value),
+                        args = transform === nothing ? Any[] :
+                            Any[canon_id(g, v.id) == scan_id ? nothing : nm(v)
+                                for v in transform.inputs]))
+                    if !tensorized
+                        transform === nothing || push!(terminal_skips, transform.id)
+                        push!(terminal_skips, reduction.id)
+                        push!(assigned, reduction_id)
+                        declare_types && _declare_typed_output!(body,
+                            reduction_value, nm(reduction_value), declared)
+                    end
+                end
+            end
             if tensorized
                 call = Expr(:call, Expr(:ref, _OPS_ARG, scan_index),
                             callargs...)
@@ -3637,7 +3811,10 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             else
                 consumer = _authored_scan_sum_consumer(p, r)
                 hoisted = consumer === nothing ? _authored_scan_hoistable(r.op) : Int[]
-                if haskey(strip_regions, r.id) || !isempty(hoisted)
+                if terminal !== nothing
+                    _lower_authored_scan_native!(body, r.op, callargs, nothing,
+                        scan_index; type_offset, terminals = terminal_records)
+                elseif haskey(strip_regions, r.id) || !isempty(hoisted)
                     output = only(r.outputs)
                     records = Any[strip_plates[x.id]
                                   for x in get(strip_regions, r.id, Recipe[])]

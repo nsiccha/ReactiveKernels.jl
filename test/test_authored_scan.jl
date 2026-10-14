@@ -4,6 +4,74 @@ using Test
 if !isdefined(@__MODULE__, :AuthoredScanFixtures)
     include(joinpath(@__DIR__, "fixtures", "authored_scan.jl"))
 end
+
+@kernel terminal_scan_minima(xs::Vector{Float64}, seed::Float64) = begin
+    trajectory::Vector{Float64} = scan(xs; init = seed,
+                                         include_init = true) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    relative = 100 .* (trajectory .- trajectory[1]) ./ trajectory[1]
+    low::Float64 = minimum(trajectory)
+    relative_low::Float64 = minimum(relative)
+    return low, relative_low
+end
+
+@kernel terminal_scan_minima_with_trajectory(xs::Vector{Float64}, seed::Float64) = begin
+    trajectory::Vector{Float64} = scan(xs; init = seed,
+                                         include_init = true) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    relative = 100 .* (trajectory .- trajectory[1]) ./ trajectory[1]
+    low::Float64 = minimum(trajectory)
+    relative_low::Float64 = minimum(relative)
+    return trajectory, low, relative_low
+end
+
+@kernel terminal_scan_minima_with_other_reader(xs::Vector{Float64}, seed::Float64) = begin
+    trajectory::Vector{Float64} = scan(xs; init = seed,
+                                         include_init = true) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    low::Float64 = minimum(trajectory)
+    total::Float64 = sum(trajectory)
+    return low, total
+end
+
+@testset "init-including scan terminal minimum" begin
+    fused = prepare(terminal_scan_minima)
+    materialized = prepare(terminal_scan_minima_with_trajectory)
+    expr = string(code_expr(fused))
+    @test occursin("_scan_terminal_samples", expr)
+    @test !occursin("_scan_preallocated", expr)
+    @test occursin("scan_preallocated", string(code_expr(materialized)))
+    @test occursin("scan_preallocated", string(code_expr(
+        prepare(terminal_scan_minima_with_other_reader))))
+    for (xs, seed) in ((Float64[], 2.0), ([1.0], 2.0),
+                       ([1.0, -3.0, 4.0], 2.0),
+                       (fill(-0.0, 5), -0.0),
+                       ([NaN, 1.0], 2.0),
+                       (collect(range(-0.1, 0.1; length = 129)), 2.0))
+        trajectory, expected_low, expected_relative_low = materialized(xs, seed)
+        got_low, got_relative_low = fused(xs, seed)
+        @test isequal(got_low, expected_low)
+        @test isequal(got_relative_low, expected_relative_low)
+        @test isequal(trajectory, [seed; accumulate(+, xs; init = seed)])
+    end
+    # The same scalar residual is used by position batching, including its
+    # borrowed-output mode. Neither input nor a returned value is mutated.
+    batch = vectorize(terminal_scan_minima; batched = :seed, reuse = true)
+    xs = [0.2, -0.5, 0.3]
+    seeds = [1.0, 2.0, 4.0]
+    saved = copy(xs), copy(seeds)
+    got = batch(xs, seeds)
+    expected = [fused(xs, seed) for seed in seeds]
+    @test all(i -> isequal(got[1][i], expected[i][1]) &&
+                   isequal(got[2][i], expected[i][2]), eachindex(seeds))
+    @test (xs, seeds) == saved
+end
 using .AuthoredScanFixtures: authored_scan_arma, _authored_scan_reference,
     authored_scan_lockstep, _authored_scan_lockstep_reference,
     authored_scan_lazy_branch, prepared_authored_scan_nonempty
