@@ -106,6 +106,19 @@ function _partial_constants(p::Plan, prefix_owned::Set{Int},
     constants
 end
 
+# Keep the selected producers needed by a cache frontier, in their original
+# order. Replanning could select different producers from the public graph.
+function _partial_frontier_prefix(p::Plan, prefix, frontier)
+    needed = Set(canon_id(p.graph, v.id) for v in frontier)
+    selected = Recipe[]
+    for r in Iterators.reverse(prefix)
+        canon_id(p.graph, only(r.outputs).id) in needed || continue
+        push!(selected, r)
+        union!(needed, (canon_id(p.graph, v.id) for v in r.inputs))
+    end
+    reverse!(selected)
+end
+
 # Build a Plan over a subset (or synthetic extension) of an existing plan's
 # recipes. The relative execution order of `recipes` must already be a valid
 # topological order for the `have` boundary; both callers inherit it from
@@ -304,7 +317,7 @@ end
 # each arm is split without speculation.
 
 # The leaves of branch `(native, tensor)`, whose positions index the recipe's
-# inputs, each `(; path, positions, native, tensor, source)`, or `nothing`
+# inputs, each `(; path, positions, native, tensor, source, spec)`, or `nothing`
 # when a nested branch does not take every argument in order.
 function _partial_branch_leaves!(leaves, native::_KernelBranch, tensor::_KernelBranch,
                                  source, path, count)
@@ -320,7 +333,8 @@ function _partial_branch_leaves!(leaves, native::_KernelBranch, tensor::_KernelB
                 nothing && return nothing
         else
             push!(leaves, (; path = (path..., side), positions = collect(Int, positions),
-                             native = n, tensor = t, source = arm_source))
+                             native = n, tensor = t, source = arm_source,
+                             spec = getfield(native, side === :then_arm ? :then_spec : :else_spec)))
         end
     end
     leaves
@@ -335,7 +349,8 @@ _branch_call_names(::_KernelBranchCall{CI,TI,EI,Names}) where {CI,TI,EI,Names} =
 # The branch `(native, tensor)` with each leaf in `plans` reading its cached
 # nodes, appended as arguments `count + 1:count + added`. A leaf arm that is
 # not rebuilt keeps its graph (`then_spec`/`else_spec`), which the shared
-# branch lowering may splice; a rebuilt arm has none.
+# branch lowering may splice. Rebuilt graph arms keep their residual plan;
+# expression-only split arms have no graph metadata.
 function _partial_rebuild_branch(native::_KernelBranch, tensor::_KernelBranch, path,
                                  plans, count, added, names)
     CI, TI, EI = typeof(native).parameters[1:3]
@@ -349,8 +364,12 @@ function _partial_rebuild_branch(native::_KernelBranch, tensor::_KernelBranch, p
              all_positions, nothing, nothing)
         elseif haskey(plans, key)
             plan = plans[key]
-            (_KernelSplitApply(Val(plan.plan), n), _KernelSplitApply(Val(plan.plan), t),
-             (positions..., (count .+ plan.slots)...), nothing, nothing)
+            if hasproperty(plan, :native)
+                (plan.native, plan.tensor, plan.positions, plan.spec, plan.spec)
+            else
+                (_KernelSplitApply(Val(plan.plan), n), _KernelSplitApply(Val(plan.plan), t),
+                 (positions..., (count .+ plan.slots)...), nothing, nothing)
+            end
         else
             (n, t, positions, getfield(native, spec_field(side)),
              getfield(tensor, spec_field(side)))
@@ -377,7 +396,7 @@ node recipe's id to its key `(recipe id, arm path, node)`; nodes whose key is
 in `refused` are not split out. Returns `inner` itself when nothing changes.
 """
 function _partial_speculate_recipes(inner::Plan, bound::Set{Int}, excluded::Set{Int},
-                                    readable, refused)
+                                    readable, refused; bound_guards::Bool = false)
     g = inner.graph
     dataonly = copy(bound)
     recipes = Recipe[]
@@ -393,7 +412,7 @@ function _partial_speculate_recipes(inner::Plan, bound::Set{Int}, excluded::Set{
             continue
         end
         rebuilt = r.id in excluded ? nothing :
-            _partial_speculate_recipe(r, reads, refused)
+            _partial_speculate_recipe(r, reads, refused; bound_guards)
         if rebuilt === nothing
             push!(recipes, r)
             continue
@@ -404,7 +423,8 @@ function _partial_speculate_recipes(inner::Plan, bound::Set{Int}, excluded::Set{
         for node in rebuilt.nodes
             value = value!(copied, Symbol(only(r.outputs).name, :_arm_part, length(values) + 1),
                            Any)
-            part = Recipe(fresh(), Tuple(r.inputs[p] for p in node.inputs), (value,),
+            available = (r.inputs..., values...)
+            part = Recipe(fresh(), Tuple(available[p] for p in node.inputs), (value,),
                           _KernelSourceOp(Val(Symbol(kernel_sourceop_token(r.op), :_arm,
                                                      length(values) + 1)),
                                           Val(:fused), node.native, node.tensor),
@@ -427,24 +447,35 @@ end
 
 # Recipe `r` rebuilt around the speculative nodes of its branch arms, given
 # which of its inputs read bound data only (`reads`), or `nothing`.
-function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused)
+function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused;
+                                   bound_guards::Bool = false)
     r.op isa _KernelSourceOp || return nothing
     native, tensor = r.op.f, r.op.tensor_f
     native isa _KernelBranch && tensor isa _KernelBranch || return nothing
     count = length(r.inputs)
-    # A branch on bound data is the lane partition's.
+    # The outer cell's bound branch belongs to the lane partition. Inside
+    # an unpartitioned arm graph it can use the same protected speculation.
     CI = typeof(native).parameters[1]
-    all(i -> reads[i], CI) && return nothing
+    !bound_guards && all(i -> reads[i], CI) && return nothing
     leaves = _partial_branch_leaves!(Any[], native, tensor, r.source, (), count)
     leaves === nothing && return nothing
     names = _recipe_source_names(r)
     length(names) == count || return nothing
     nodes = Any[]
     plans = Dict{Any,Any}()
-    mapping = IdDict{Any,Symbol}()
+    mapping = IdDict{Any,Any}()
     for leaf in leaves
         parts = _partial_split_leaf(leaf.native, leaf.tensor, leaf.source, length(leaf.positions))
-        parts === nothing && continue
+        # A compound arm can have strict split nodes AND an inline endpoint.
+        # Prefer its expanded graph when it exposes more than one recipe, so
+        # splitting the surrounding arithmetic does not hide the endpoint.
+        if parts === nothing ||
+           (leaf.spec !== nothing && length(_plate_arm_plan(leaf.spec).recipes) > 1)
+            _partial_speculate_graph_arm!(nodes, plans, names, mapping,
+                                          r, leaf, reads, refused)
+            haskey(plans, leaf.path) && continue
+            parts === nothing && continue
+        end
         split = parts.split
         arm_reads(own) = all(p -> reads[leaf.positions[p]], own)
         # The arm reads bound data only: no live value to split it from.
@@ -487,6 +518,94 @@ function _partial_speculate_recipe(r::Recipe, reads::Vector{Bool}, refused)
     op = _KernelSourceOp(Val(Symbol(kernel_sourceop_token(r.op), :_speculative)),
                          Val(kernel_sourceop_form(r.op)), native2, tensor2)
     (; nodes, op, source = _kernel_split_replace(r.source, mapping))
+end
+
+# Inline endpoints and sequential arm bindings already have an authored graph.
+# Its dependency edges distinguish bound expressions from live locals without
+# speculating across lexical scope. Lift its pure data-only prefix into the
+# enclosing cell and keep a cut of the selected plan as the lazy residual arm.
+# Nested speculative nodes retain their refusal keys, so a throwing operation
+# is restored beneath every guard it originally had on the next attempt.
+function _partial_speculate_graph_arm!(nodes, plans, names, mapping,
+                                       r::Recipe, leaf, reads, refused)
+    leaf.spec === nothing && return
+    arm = _plate_arm_plan(leaf.spec)
+    length(arm.want) == 1 || return
+    any(q -> q.effectful || length(q.outputs) != 1 ||
+             q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+             _embedded_kernel(q.op) !== nothing, arm.recipes) && return
+    original_names = _recipe_source_names(r)
+    positions = Dict(name => i for (i, name) in enumerate(original_names))
+    all(v -> haskey(positions, v.name), arm.have) || return
+    g = arm.graph
+    bound = Set(canon_id(g, v.id) for v in arm.have if reads[positions[v.name]])
+    isempty(bound) && return
+    # As for expression arms, split mixed computations only. Returning a
+    # cached array as the whole arm would publish shared bind-time storage.
+    all(v -> canon_id(g, v.id) in bound, arm.have) && return
+    prefix_key = (:arm_recipe, r.id, leaf.path)
+    node_key = (:arm_node, r.id, leaf.path)
+    excluded = Set(q.id for q in arm.recipes if (prefix_key..., q.id) in refused)
+    nested_refused = Set(key[4] for key in refused
+                         if length(key) == 4 && key[1:3] == node_key)
+    readable = Dict{Int,Any}()
+    arm = _partial_split_recipes(arm, bound, excluded, readable)
+    # Split-created ids are deterministic too and may have been refused.
+    union!(excluded, (q.id for q in arm.recipes if (prefix_key..., q.id) in refused))
+    arm, speculative = _partial_speculate_recipes(arm, bound, excluded, readable,
+                                                  nested_refused; bound_guards = true)
+    prefix, residual, owned = _partial_split(arm, bound, excluded)
+    canon_id(arm.graph, only(arm.want).id) in owned && return
+    frontier = filter(v -> !(canon_id(g, v.id) in bound),
+                      _partial_constants(arm, owned, residual))
+    isempty(frontier) && return
+    selected = _partial_frontier_prefix(arm, prefix, frontier)
+    available = Dict(canon_id(arm.graph, v.id) => positions[v.name] for v in arm.have)
+    count = length(r.inputs)
+    for q in selected
+        slot = count + length(nodes) + 1
+        push!(names, _kernel_split_placeholder(slot))
+        key = haskey(speculative, q.id) ? (node_key..., speculative[q.id]) :
+                                         (prefix_key..., q.id)
+        push!(nodes, (; inputs = [available[canon_id(arm.graph, v.id)] for v in q.inputs],
+                        native = q.op, tensor = q.op, source = q.source, key))
+        available[canon_id(arm.graph, only(q.outputs).id)] = slot
+    end
+    ag = arm.graph
+    copied = Graph(copy(ag.values), copy(ag.recipes), copy(ag.producers),
+                   copy(ag.aliases), ag.version)
+    renamed = Dict(canon_id(ag, v.id) => value!(copied,
+        names[available[canon_id(ag, v.id)]], valtype(v)) for v in frontier)
+    mapped(v) = get(renamed, canon_id(ag, v.id), v)
+    recipes = Recipe[Recipe(q.id, Tuple(mapped(v) for v in q.inputs), q.outputs,
+        q.op, q.cost, nothing, false, q.source) for q in residual]
+    template = Plan(copied, arm.have, arm.want, arm.recipes, arm.producer,
+                    arm.cost, arm.candidates)
+    cut = _partial_subplan(template, Value[arm.have..., mapped.(frontier)...],
+                          Value[mapped(v) for v in arm.want], recipes)
+    native = _partial_arm_function(cut)
+    tensor = _partial_arm_function(cut; tensorized = true)
+    indices = Tuple(vcat([positions[v.name] for v in arm.have],
+                         [available[canon_id(ag, v.id)] for v in frontier]))
+    plans[leaf.path] = (; native, tensor, positions = indices, spec = cut)
+    mapping[leaf.source] = Expr(:call, QuoteNode(native), (names[i] for i in indices)...)
+    nothing
+end
+
+# The arm is a generated function over explicit data inputs, with code-only
+# operations bound as literals and its Plan retained for shared-arm lowering.
+# Like the containing native plate, its native body honors authored output
+# declarations. This keeps nested calls concrete under Julia's recursive
+# inference heuristic. Its separate tensorized body omits host declarations.
+function _partial_arm_function(p::Plan; tensorized::Bool = false)
+    ast, ops, _ = _lower_with_ops(p; inline_embedded = false,
+                                 tensorized, declare = !tensorized)
+    popfirst!(ast.args[1].args) # the operation tuple becomes a literal
+    bind(ex) = ex === :__ops__ ? QuoteNode(ops) :
+        ex isa Expr && !(ex.head in (:quote, :inert)) ?
+            Expr(ex.head, map(bind, ex.args)...) : ex
+    ast.args[2] = bind(ast.args[2])
+    compile(ast)
 end
 
 # The split metadata of one arm and its decomposition from the arm's source,
@@ -578,6 +697,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     inner, speculative = _partial_speculate_recipes(inner, bound, excluded, readable,
                                                     refused)
     have_ids = Set(canon_id(inner.graph, v.id) for v in inner.have)
+    retry_speculation = false
     while true
         prefix, residual, owned = _partial_split(inner, bound, excluded)
         isempty(prefix) && return nothing
@@ -586,17 +706,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         end
         isempty(frontier) && return nothing
 
-        # Keep only the selected prefix producers needed by the cut. Never
-        # re-plan: doing so could select a different producer from the public
-        # graph.
-        needed = Set(canon_id(inner.graph, v.id) for v in frontier)
-        selected = Recipe[]
-        for r in Iterators.reverse(prefix)
-            canon_id(inner.graph, only(r.outputs).id) in needed || continue
-            push!(selected, r)
-            union!(needed, (canon_id(inner.graph, v.id) for v in r.inputs))
-        end
-        reverse!(selected)
+        selected = _partial_frontier_prefix(inner, prefix, frontier)
 
         # Establish the complete eligible prefix before executing any of it.
         # Intermediates only need a concrete type: they are bind-time
@@ -623,8 +733,17 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                 push!(uncached, r.id)
         end
         isempty(uncached) && break
+        # A speculative value that cannot cross the cache boundary must go
+        # back inside its arm, not become an eager per-cell residual recipe.
+        for id in uncached
+            haskey(speculative, id) || continue
+            push!(refused, speculative[id])
+            retry_speculation = true
+        end
+        retry_speculation && break
         union!(excluded, uncached)
     end
+    retry_speculation && continue
 
     # A cell result that reads only bound data is itself a cache frontier, and
     # a residual cell would merely copy the shared cached values into the

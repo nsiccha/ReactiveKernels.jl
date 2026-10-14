@@ -46,6 +46,12 @@ function _latest_source_fresh_model()
                 y[j] ~ Normal(latent[j], sigma[j])
             end
         end
+        guarded_endpoint = @rkppl begin
+            a ~ Normal(0, 1)
+            c ~ Normal(0, 1)
+            eta = a .+ x
+            y .~ NegativeBinomial2.(exp.(eta), exp(c))
+        end
     end)
     X = [1.0 0.5; 1.0 -0.4; 1.0 1.2; 1.0 -0.7]
     y = [0.3, -0.5, 1.1, -0.2]
@@ -106,6 +112,30 @@ function _latest_source_fresh_model()
         finite = (Base.invokelatest(nested_raw, nested_u .+ step) -
                   Base.invokelatest(nested_raw, nested_u .- step)) / 2e-5
         @test nested_g[i] ≈ finite rtol = 1e-5 atol = 1e-6
+    end
+
+    # Cutting an endpoint's retained arm graph must preserve the same caller
+    # guarantee as its original inline body. Exercise the public barrier from
+    # this older world after preparation caches the data-only log-gamma terms.
+    # Select ordinary reverse explicitly: the baseline's default batched
+    # forward path hits an Enzyme LLVM duplicate-name error for this model.
+    guarded = Core.eval(mod, :guarded_endpoint)
+    guarded_plan = guarded(; x = [-0.4, 0.2, 0.7]) | (; y = [0, 2, 5])
+    guarded_built = build_kernel(guarded_plan)
+    guarded_u = [0.3, 0.7]
+    guarded_raw = prepare_query(guarded_built, guarded_plan, :sampler)
+    guarded_q = prepare_sampler(guarded_built, guarded_plan, guarded_u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse), native_forward_batch = false)
+    @test guarded_q(guarded_u) ≈ Base.invokelatest(guarded_raw, guarded_u)
+    guarded_g = similar(guarded_u)
+    guarded_value, _ = sampler_value_and_gradient!(guarded_q, guarded_g, guarded_u)
+    @test guarded_value ≈ Base.invokelatest(guarded_raw, guarded_u)
+    for i in eachindex(guarded_u)
+        step = zeros(length(guarded_u))
+        step[i] = 1e-5
+        finite = (Base.invokelatest(guarded_raw, guarded_u .+ step) -
+                  Base.invokelatest(guarded_raw, guarded_u .- step)) / 2e-5
+        @test guarded_g[i] ≈ finite rtol = 1e-5 atol = 1e-6
     end
     nothing
 end

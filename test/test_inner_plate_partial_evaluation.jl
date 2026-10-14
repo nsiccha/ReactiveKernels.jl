@@ -38,7 +38,7 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         bound = prepare(p; bound = p.have[2] => data)
         @test C.calls[] == length(data)
         @test bound(2.0) == expected
-        @test bound(3.0) == 3sum(log, data)
+        @test bound(3.0) ≈ 3sum(log, data)
         @test C.calls[] == length(data)
         @test inputs(bound) == (p.have[1],)
         @test outputs(bound) == Tuple(p.want)

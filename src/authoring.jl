@@ -4079,8 +4079,8 @@ end
 
 _kernel_split_placeholder(index::Int) = Symbol("__rk_split_", index)
 
-# Replace the expressions in `mapping` (by identity) with their names.
-function _kernel_split_replace(ex, mapping::IdDict{Any,Symbol})
+# Replace expressions by identity with their cached names or residual calls.
+function _kernel_split_replace(ex, mapping::IdDict)
     haskey(mapping, ex) && return mapping[ex]
     ex isa Expr || return ex
     ex.head in (:quote, :inert) && return ex
