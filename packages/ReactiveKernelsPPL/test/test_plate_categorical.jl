@@ -122,20 +122,24 @@ _counted_mix(P, t) = (_CATEGORICAL_EVALUATIONS[] += 1; P * t)
         eachcol(theta[1:2, 1:M]) .~ Dirichlet(ones(2))
         eachcol(phi[1:V, 1:2]) .~ Dirichlet(ones(V))
     end
-    model(cell) = Expr(:block, prior.args..., cell)
+    model(cell) = Expr(:block, prior.args..., cell.args...)
     # A word reads its document only through doc[i], so every word of one
     # document scores the same vector: it is computed once per document.
-    keyed = model(:(@plate for i in eachindex(w)
-        w[i] ~ Categorical(_counted_mix(phi, theta[:, doc[i]]))
-    end))
+    keyed = model(quote
+        @plate for i in eachindex(w)
+            w[i] ~ Categorical(_counted_mix(phi, theta[:, doc[i]]))
+        end
+    end)
     # Reading the index through two columns keeps one vector per word.
-    two_keys = model(:(@plate for i in eachindex(w)
-        w[i] ~ Categorical(_counted_mix(phi,
-            0.5 .* theta[:, doc[i]] .+ 0.5 .* theta[:, alt[i]]))
-    end))
+    two_keys = model(quote
+        @plate for i in eachindex(w)
+            w[i] ~ Categorical(_counted_mix(phi,
+                0.5 .* theta[:, doc[i]] .+ 0.5 .* theta[:, alt[i]]))
+        end
+    end)
     data = (; M=3, V=3, doc=[2, 1, 2, 3, 2, 1, 3], alt=[1, 1, 3, 2, 2, 3, 1],
         w=[1, 3, 2, 2, 3, 1, 1])
-    u = [0.2, -0.3, 0.1, -0.2, 0.3, -0.4, 0.15, 0.05, -0.1]
+    u = [0.2, -0.3, 0.1, -0.2, 0.3, -0.4, 0.15]
     for (ast, location, evaluations) in ((keyed, (q, i) -> q.theta[:, data.doc[i]], 3),
             (two_keys, (q, i) -> 0.5 .* q.theta[:, data.doc[i]] .+
                 0.5 .* q.theta[:, data.alt[i]], length(data.w)))
@@ -169,20 +173,26 @@ _counted_mix(P, t) = (_CATEGORICAL_EVALUATIONS[] += 1; P * t)
 
     # refused: probabilities summing to 0.5 define no categorical law; the
     # check runs once per computed vector, and still runs (dev §1).
-    halved = model(:(@plate for i in eachindex(w)
-        w[i] ~ Categorical(0.5 .* (phi * theta[:, doc[i]]))
-    end))
+    halved = model(quote
+        @plate for i in eachindex(w)
+            w[i] ~ Categorical(0.5 .* (phi * theta[:, doc[i]]))
+        end
+    end)
     halved_bound = bind_data(lower_rkppl(halved, data; conditioned=(:w,)), data)
     @test_throws DomainError _cat_q(build_kernel(halved_bound), halved_bound,
         :likelihood, u)
 
     # A document's words share its vector, checked once for all of them.
-    document = model(:(@plate for m in eachindex(words)
-        words[m] .~ Categorical(phi * theta[:, m])
-    end))
-    halved_document = model(:(@plate for m in eachindex(words)
-        words[m] .~ Categorical(0.5 .* (phi * theta[:, m]))
-    end))
+    document = model(quote
+        @plate for m in eachindex(words)
+            words[m] .~ Categorical(phi * theta[:, m])
+        end
+    end)
+    halved_document = model(quote
+        @plate for m in eachindex(words)
+            words[m] .~ Categorical(0.5 .* (phi * theta[:, m]))
+        end
+    end)
     words = [[1, 3], [2, 2, 3], Int[]]
     document_data = (; M=3, V=3, words)
     document_bound = bind_data(lower_rkppl(document, document_data;
