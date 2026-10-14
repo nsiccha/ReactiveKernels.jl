@@ -1373,29 +1373,40 @@ end
 
 # The residual plan for one binding: constant slots first, then the residual
 # recipes, their plates' bound arguments narrowed to this binding's classes.
-function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
-    residual = _partial_narrow_plate_inputs(p.graph, b,
-                                            _partial_plate_classes(b, hoisted))
+function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hoisted),
+                                residual::Vector{Recipe})
     recipes = isempty(b.constants) ? residual :
         vcat(_partial_constant_recipes(b.constants, hoisted), residual)
     _partial_subplan(p, b.remaining, p.want, recipes)
+end
+
+function _partial_residual_plan(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
+    residual = _partial_narrow_plate_inputs(p.graph, b,
+                                            _partial_plate_classes(b, hoisted))
+    _partial_residual_plan(p, b, hoisted, residual)
+end
+
+# Known bind-time values for the inner-plate pass; built afresh for every
+# binding because branch partitions and cached cell values depend on them.
+function _partial_known_values(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
+    g = p.graph
+    known = Dict{Int,Any}()
+    for (value, data) in zip(b.constants, hoisted)
+        known[canon_id(g, value.id)] = data
+    end
+    known
 end
 
 # That plan and its inner-plate specialization over the hoisted values. The
 # second is the plan `prepare` compiles; it is the first object exactly when
 # the inner-plate pass had nothing to do.
 function _partial_residual(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
-    g = p.graph
-    known = Dict{Int,Any}()
-    for (value, data) in zip(b.constants, hoisted)
-        known[canon_id(g, value.id)] = data
-    end
     residual = _partial_residual_plan(p, b, hoisted)
     # The data-only prefix is already separate. Compose remaining plate
     # producers before branch partitioning replaces their consumer edges with
     # lane selections; a later pass cannot see those edges again.
     residual = _fuse_authored_plate_chains(residual)
-    residual, _partial_inner_plates(residual, known)
+    residual, _partial_inner_plates(residual, _partial_known_values(p, b, hoisted))
 end
 
 # ---------------------------------------------------------------------------
@@ -1459,6 +1470,9 @@ struct _BoundEntry
     boundary::_PartialBoundary
     prefix::Any          # prepared prefix kernel, or `nothing` without constants
     plates::Bool         # residual authored plates: the inner-plate pass runs per binding
+    # Per plate-class tuple, the residual recipe tail after value-independent
+    # plate-chain fusion. No binding's constant recipes or values are retained.
+    fused::Dict{Any,Vector{Recipe}}
     # Per plate-class tuple: a `_BoundTemplate`; the kernel itself when it
     # has no constant slots; or `nothing` (a residual whose leading slots are
     # not exactly its constants: the per-binding path). An absent class is
@@ -1476,18 +1490,39 @@ function _bound_entry(p::Plan, @nospecialize(ports))
     prefix = isempty(boundary.constants) ? nothing :
              _prepare_plan(_partial_prefix_plan(p, boundary))
     plates = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
-    _BoundEntry(p, boundary, prefix, plates, Dict{Any,Any}())
+    _BoundEntry(p, boundary, prefix, plates, Dict{Any,Vector{Recipe}}(), Dict{Any,Any}())
 end
 
 _bound_hoisted(entry::_BoundEntry, @nospecialize(data::Tuple)) =
     entry.prefix === nothing ? () :
     _partial_prefix_values(entry.boundary.constants, entry.prefix(data...))
 
+# Fuse the value-independent residual once per plate class. Treat the hoisted
+# constants as HAVE while fusing: they are inputs to the residual, and the
+# cached recipe tail must never contain a binding's `_BoundConstant` values.
+function _bound_fused_residual(entry::_BoundEntry, cache,
+                               @nospecialize(classes::Tuple))
+    lock(cache.lock) do
+        get!(entry.fused, classes) do
+            b = entry.boundary
+            narrowed = _partial_narrow_plate_inputs(entry.plan.graph, b, classes)
+            skeleton = _partial_subplan(entry.plan, vcat(b.remaining, b.constants),
+                                        entry.plan.want, narrowed)
+            _fuse_authored_plate_chains(skeleton).recipes
+        end
+    end
+end
+
 # One binding's residual plan, and the plan the inner-plate pass specialized
 # from it (the same object when the pass left it alone, or did not run).
-function _bound_residual(entry::_BoundEntry, @nospecialize(hoisted))
+function _bound_residual(entry::_BoundEntry, cache,
+                         @nospecialize(hoisted), @nospecialize(classes::Tuple))
     entry.plates || return nothing, nothing
-    _partial_residual(entry.plan, entry.boundary, hoisted)
+    b = entry.boundary
+    residual = _partial_residual_plan(entry.plan, b, hoisted,
+                                      _bound_fused_residual(entry, cache, classes))
+    residual, _partial_inner_plates(residual,
+                                    _partial_known_values(entry.plan, b, hoisted))
 end
 
 # The residual plan `_bound_residual` built, or, where the inner-plate pass did

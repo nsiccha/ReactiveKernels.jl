@@ -287,6 +287,9 @@ end
     entries = collect(values(F.simulation.graph.preparations.cache.bound))
     @test length(entries) == 1
     @test only(values(only(entries).templates)) isa ReactiveKernels._BoundTemplate
+    @test length(only(entries).fused) == 1
+    @test all(r -> !(r.op isa ReactiveKernels._BoundConstant),
+              only(values(only(entries).fused)))
     # The same through a caller-owned cache, and across a kernel's type.
     cache = PreparationCache()
     k1 = prepare!(cache, F.simulation; bound = (; kernel, plan = F.schedule(30, 2)))

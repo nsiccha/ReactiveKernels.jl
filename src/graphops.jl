@@ -158,12 +158,12 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     end
     # The per-binding mathematics runs outside the lock.
     hoisted = _bound_hoisted(entry, data)
-    residual, specialized = _bound_residual(entry, hoisted)
+    classes = _partial_plate_classes(entry.boundary, hoisted)
+    residual, specialized = _bound_residual(entry, cache, hoisted, classes)
     # A residual the inner-plate pass rewrote bakes this binding's values in.
     specialized === residual || return prepare(specialized; passes = passes)
     # Bindings whose plates read bound arguments of the same classes share a
     # compiled residual; a new class lowers its own.
-    classes = _partial_plate_classes(entry.boundary, hoisted)
     fresh = nothing
     template = lock(cache.lock) do
         current = get(entry.templates, classes, _UnbuiltTemplate())
@@ -197,7 +197,8 @@ for residual in (Plan, Nothing)
         error("no _bound_residual_plan method for a $residual residual")
 end
 for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, Tuple)),
-                   (_bound_residual, (_BoundEntry, Any)),
+                   (_bound_residual, (_BoundEntry, PreparationCache, Any, Tuple)),
+                   (_bound_fused_residual, (_BoundEntry, PreparationCache, Tuple)),
                    (_bound_build, (_BoundEntry, Any, Any, Any)),
                    (_partial_residual, (Plan, _PartialBoundary, Any)),
                    (_partial_plate_classes, (_PartialBoundary, Any)),
