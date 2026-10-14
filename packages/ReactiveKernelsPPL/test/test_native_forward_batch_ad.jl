@@ -1,7 +1,8 @@
 using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme
 
-@testset "small pure summed plates use one native forward batch" begin
+@testset "native forward batching requires opt-in and respects explicit mode" begin
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    automatic = AutoEnzyme()
     bernoulli = @rkppl begin
         a ~ Normal(0, 2)
         b ~ Normal(0, 3)
@@ -31,27 +32,43 @@ using Test, ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzym
         plan = model(; data...) | observations
         built = build_kernel(plan)
         u = [-0.35 + 0.15 * (i - 1) for i in 1:built.layout.total]
-        fast = prepare_sampler(built, plan, u; backend)
-        ordinary = prepare_sampler(built, plan, u; backend,
-                                   native_forward_batch = false)
+        fast = prepare_sampler(built, plan, u; backend=automatic,
+                               native_forward_batch=true)
+        ordinary = prepare_sampler(built, plan, u; backend)
+        default_mode = prepare_sampler(built, plan, u; backend=automatic)
+        requested_reverse = prepare_sampler(built, plan, u; backend,
+                                            native_forward_batch=true)
         @test (fast.ad isa PreparedADKernel) == !uses_forward
         @test ordinary.ad isa PreparedADKernel
+        @test default_mode.ad isa PreparedADKernel
+        @test requested_reverse.ad isa PreparedADKernel
+        @test requested_reverse.ad.backend == backend
         basis = uses_forward ? deepcopy(fast.ad.basis) : nothing
         if case_index == 1
             direct = Base.invokelatest(prepare_ad, fast.ad.reverse.kernel,
-                backend, u; active = :unconstrained,
+                automatic, u; active = :unconstrained,
                 native_forward_batch = true)
             @test !(direct isa PreparedADKernel)
             @test Base.invokelatest(ad_value_and_gradient, direct, u) ==
                 Base.invokelatest(ad_value_and_gradient, fast.ad, u)
+            reverse_direct = Base.invokelatest(prepare_ad, ordinary.ad.kernel,
+                backend, u; active=:unconstrained, native_forward_batch=true)
+            @test reverse_direct isa PreparedADKernel
+            @test reverse_direct.backend == backend
+            @test Base.invokelatest(ad_value_and_gradient, reverse_direct, u) ==
+                Base.invokelatest(ad_value_and_gradient, ordinary.ad, u)
         end
         for point in (u, u .+ 0.6, u .- 1.1)
             before = copy(point)
             gfast, gordinary = similar(point), similar(point)
             value, _ = sampler_value_and_gradient!(fast, gfast, point)
             reference, _ = sampler_value_and_gradient!(ordinary, gordinary, point)
+            requested_value, requested_gradient = sampler_value_and_gradient!(
+                requested_reverse, similar(point), point)
             @test value ≈ reference rtol = 1e-12
             @test gfast ≈ gordinary rtol = 1e-11 atol = 1e-12
+            @test requested_value == reference
+            @test requested_gradient == gordinary
             @test point == before
             if uses_forward
                 @test fast.ad.basis == basis
