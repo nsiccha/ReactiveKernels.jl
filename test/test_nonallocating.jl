@@ -438,6 +438,34 @@ end
         @test (@allocated MutatingFunctions.apply!!(cache, gather, x, lanes)) == 0
     end
 
+    @testset "read-only parameter gathers never become writable caches" begin
+        spec = @kernel parameter_gather(packed::Vector{Float64}, idx::Vector{Int}) = begin
+            block = view(packed, 3:5)
+            selected = ReactiveKernels._readonly_gather(block, idx)
+            total::Float64 = sum(selected)
+        end
+        idx = [3, 1, 3, 2]
+        k = prepare_nonallocating(spec; have = (:packed, :idx),
+            want = (:selected, :total), bound = (; idx))
+        packed = [90.0, 80.0, 1.0, 2.0, 3.0, 70.0]
+        original = copy(packed)
+        selected, total = k(packed)
+        @test selected isa SubArray
+        @test Base.mightalias(selected, packed)
+        @test selected == [3.0, 1.0, 3.0, 2.0]
+        @test total == 9.0
+        changed = packed .+ 10
+        changed_original = copy(changed)
+        next_selected, next_total = k(changed)
+        @test next_selected == [13.0, 11.0, 13.0, 12.0]
+        @test next_total == 49.0
+        @test selected == [3.0, 1.0, 3.0, 2.0]
+        @test packed == original
+        @test changed == changed_original
+        @test idx == [3, 1, 3, 2]
+        @test k(packed) == (selected, total)
+    end
+
     @testset "partitioned plates stay allocation-free end to end" begin
         isdefined(@__MODULE__, :BranchPartition) ||
             include("fixtures/branch_partition.jl")
