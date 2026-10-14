@@ -327,6 +327,14 @@ function _external_graph_density(args)
     positional = _external_arguments(args)
     isempty(positional) && return nothing
     endpoint = first(positional)
+    # A retained @plate cell broadcasts its RHS constructor when an argument
+    # varies by outer cell. The graph endpoint is invariant in that broadcast
+    # and `_dotify_external_cell_call` wraps it in Ref; it is still the same
+    # direct graph call, now inside one whole-event observation cell.
+    if Meta.isexpr(endpoint, :call, 2) &&
+            endpoint.args[1] == GlobalRef(Base, :Ref)
+        endpoint = endpoint.args[2]
+    end
     endpoint isa GlobalRef && getglobal(endpoint.mod, endpoint.name) isa KernelSpec ||
         return nothing
     return endpoint

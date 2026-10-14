@@ -6082,6 +6082,33 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                       exemplars))
 end
 
+# Re-lowering an embedded nested plate may fuse its child plates separately in
+# each product. Fusion gives the same readable recipes fresh Value identities.
+# Accept only a consistent renaming: source, operations, order and all graph
+# edges must still agree.
+function _same_readable_recipes(a, b)
+    length(a) == length(b) || return false
+    forward = Dict{Int,Int}()
+    backward = Dict{Int,Int}()
+    for (left, right) in zip(a, b)
+        for field in (:id, :op, :cost, :cse_key, :effectful, :source)
+            isequal(getfield(left, field), getfield(right, field)) || return false
+        end
+        for field in (:inputs, :outputs)
+            x, y = getfield(left, field), getfield(right, field)
+            length(x) == length(y) || return false
+            for (lv, rv) in zip(x, y)
+                lv.name == rv.name && valtype(lv) == valtype(rv) || return false
+                get(forward, lv.id, rv.id) == rv.id || return false
+                get(backward, rv.id, lv.id) == lv.id || return false
+                forward[lv.id] = rv.id
+                backward[rv.id] = lv.id
+            end
+        end
+    end
+    true
+end
+
 # `prepare` without the type-stability check, for a program RK runs once while
 # it prepares another (the data-only prefix of a bound preparation): its values
 # feed the checked program as bound data of their runtime types.
@@ -6120,7 +6147,7 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
         _lower_with_ops(lowered_plan; tensorized = true)
     tensorized_ops == ops || throw(ArgumentError(
         "embedded native and tensorized kernels produced different operation tables"))
-    tensorized_recipes == recipes || throw(ArgumentError(
+    _same_readable_recipes(tensorized_recipes, recipes) || throw(ArgumentError(
         "embedded native and tensorized kernels produced different readable recipes"))
     isempty(passes) ||
         (tensorized_ast = transform(tensorized_ast, passes...))
