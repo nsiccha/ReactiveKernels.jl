@@ -92,6 +92,13 @@ end
     @test parent(gathered)===q
     @test gathered==q[idx]
     @test total≈oracle(q,idx,x)[1]
+    # A gather that binding can compute entirely has no residual gather to
+    # optimize. Do not derive run metadata just to discard it in the prefix.
+    bound_cache=PreparationCache()
+    bound_gather=prepare!(bound_cache,subject;bound=(;q,idx))
+    @test bound_gather(x)≈oracle(q,idx,x)[1]
+    @test all(r->r.op!==RK._index_run_metadata && r.op!==RK._readonly_gather_runs,
+        only(values(bound_cache.bound)).plan.recipes)
     # Distinct index maps vary inside runs: only the selected map is hoisted.
     other=repeat([3,1],length(idx)÷2)
     k=prepare(multiple;bound=(;idx,other,x))

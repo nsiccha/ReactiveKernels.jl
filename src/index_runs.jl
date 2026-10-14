@@ -83,6 +83,7 @@ function _partial_index_runs(p::Plan,bound_values::Vector{Value})
     eligible=Set(r.id for r in p.recipes if !r.effectful &&
         length(r.inputs)==2 && length(r.outputs)==1 && _index_run_gather(r.op) &&
         canon_id(g,only(r.outputs).id) in needed &&
+        !(canon_id(g,r.inputs[1].id) in dataonly) &&
         canon_id(g,r.inputs[2].id) in dataonly)
     isempty(eligible) && return p
     copied=Graph(copy(g.values),copy(g.recipes),copy(g.producers),copy(g.aliases),g.version)
