@@ -90,13 +90,25 @@ _cat_q(built, bound, query, u) =
     invalid_bound = bind_data(lower_rkppl(invalid, invalid_data;
         conditioned=keys(invalid_data)), invalid_data)
     invalid_built = build_kernel(invalid_bound)
+    # refused: probabilities summing to 0.5 define no categorical law, so
+    # scoring them would return a meaningless density (dev §1: no silent
+    # defaults for invalid inputs).
     @test_throws DomainError _cat_q(invalid_built, invalid_bound,
         :likelihood, [0.1])
+
+    # An observed category outside the vector has zero probability, with the
+    # probabilities' own floating-point type.
+    @test ReactiveKernelsPPL._ppl_categorical_logdensity(3, [0.5, 0.5]) ===
+        -Inf
+    @test ReactiveKernelsPPL._ppl_categorical_logdensity(0, Float32[0.5, 0.5]) ===
+        -Inf32
 
     outside_data = (; M=2, V=3, doc=[3], w=[1])
     outside_bound = bind_data(lower_rkppl(scalar, outside_data;
         conditioned=keys(outside_data)), outside_data)
     outside_built = build_kernel(outside_bound)
+    # refused: doc[1] = 3 names a third theta column that M = 2 does not
+    # allocate; Julia indexing semantics must surface the invalid read.
     @test_throws BoundsError _cat_q(outside_built, outside_bound,
         :likelihood, zeros(length(coordinate_names(outside_built.layout))))
 end

@@ -39,7 +39,10 @@ function _ppl_categorical_logdensity(value::Integer, probabilities::AbstractVect
         isapprox(sum(probabilities), one(eltype(probabilities))) ||
         throw(DomainError(probabilities,
             "categorical probabilities must be nonnegative and sum to one"))
-    1 <= value <= length(probabilities) || return -Inf
+    # An unsupported category has zero probability; log(0) keeps the
+    # element type of an in-support result.
+    1 <= value <= length(probabilities) ||
+        return log(zero(eltype(probabilities)))
     return log(probabilities[value])
 end
 
