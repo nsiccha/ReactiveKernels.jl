@@ -116,4 +116,31 @@ end
         @test data == saved
     end
 end
+
+@testset "graph density composes in retained whole-event cells" begin
+    histories = [[0.2, -0.4], [0.7], [-0.1, 0.3, 0.5]]
+    offsets = [0.1, -0.2, 0.4]
+    data = (; histories, offsets)
+    bound = bind_data(lower_rkppl(quote
+        a ~ Normal(0, 1)
+        @plate for i in eachindex(histories)
+            histories[i] ~ LogDensity(GraphDensityFixtures.event_score,
+                a + offsets[i])
+        end
+    end, data; mod=@__MODULE__, conditioned=(:histories,)), data)
+    built = build_kernel(bound)
+    @test !occursin("sampling_logdensity", string(kernel_expr(bound, built.layout)))
+    sampler = prepare_sampler(built, bound, [0.2];
+        backend=DI.AutoEnzyme(;mode=Enzyme.Reverse))
+    for a in (0.2, -0.3)
+        expected = -log(2pi)/2-a^2/2 + sum(
+            sum(-log(2pi)/2-(y-a-offsets[i])^2/2 for y in histories[i])
+            for i in eachindex(histories))
+        value, gradient = sampler_value_and_gradient!(sampler, zeros(1), [a])
+        @test value ≈ expected
+        @test only(gradient) ≈ -a + sum(
+            sum(y-a-offsets[i] for y in histories[i])
+            for i in eachindex(histories))
+    end
+end
 end

@@ -20,6 +20,12 @@ const alias = threshold_score
 @kernel scalar_score(value, mu, scale) = begin
     return normal(mu, scale).logpdf(value)
 end
+@kernel event_score(value::Vector{Float64}, mu::Float64) = begin
+    cells = plate(value) do observed
+        normal(mu, 1.0).logpdf(observed)
+    end
+    return sum(cells)
+end
 @kernel score_object() = begin
     density(value::Float64, mu::Float64, scale::Float64)::Float64 =
         normal(mu, scale).logpdf(value)

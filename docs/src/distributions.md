@@ -190,6 +190,37 @@ Main.ReactiveKernelsDocs.execute_example(
 )
 ```
 
+## One mixture component for a whole observed event
+
+`bernoulli_product_mixture_logdensity` and
+`binomial_product_mixture_logdensity` are function-shaped graph kernels in
+`ReactiveKernelsDistributionKernels.DistributionKernelSources`. Each accepts
+one observed vector, a probability matrix whose rows are observation
+positions and columns are components, and one weight per column. The Binomial
+version also accepts a trial-count matrix of the same shape. Each component
+adds its cell log densities first; the outer mixture then computes
+`logsumexp(log(weight[k]) + component_score[k])`. Thus one component governs
+the complete vector. The lower-level `product_mixture_logdensity(scores,
+weights)` performs the outer fold when component scores come from another
+family. All three are transparent RK kernels with data-sized loops.
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    bernoulli_product_mixture_logdensity
+
+event = Bool[true, false, true]
+probabilities = [0.8 0.1; 0.2 0.7; 0.5 0.3]
+weights = [0.4, 0.6]
+loglik = prepare(bernoulli_product_mixture_logdensity)
+loglik(event, probabilities, weights)
+```
+
+A PPL model can pass one complete response vector to `LogDensity` with this
+kernel. An outer `@plate` may select several such vectors; each outer cell
+then has its own marginalized component, and the inner RK plates retain the
+positions within that event.
+
 ## Positive-support and bounded families
 
 LogNormal, Exponential, Geometric, and Uniform illustrate shapes that are not all
