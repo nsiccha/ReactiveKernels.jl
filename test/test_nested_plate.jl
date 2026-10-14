@@ -245,3 +245,47 @@ end
         @test N.head_count(code_expr(reader), :for) == 2
     end
 end
+
+# Counts how often a cell holding a nested plate evaluates its shared recipe.
+const _NESTED_SHARED_EVALUATIONS = Ref(0)
+_counted_log(scale) = (_NESTED_SHARED_EVALUATIONS[] += 1; log(scale))
+
+@kernel nested_shared_recipe(groups, scale::Float64) = begin
+    totals = plate(groups) do observations
+        logscale = _counted_log(scale)
+        pointwise = plate(observations) do x
+            -logscale - 0.5 * (x / scale)^2
+        end
+        sum(pointwise)
+    end
+    total = sum(totals)
+    return total
+end
+
+@testset "Cells holding a nested plate compute shared recipes once" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    k = prepare(nested_shared_recipe)
+    groups = [[0.2, 0.7], Float64[], [-1.2], [0.4, 0.1, -0.3]]
+    original = deepcopy(groups)
+    n = sum(length, groups)
+    sq = sum(v -> sum(abs2, v; init=0.0), groups)
+    for sigma in (0.6, 1.3)
+        expected = -n*log(sigma) - 0.5*sq/sigma^2
+        _NESTED_SHARED_EVALUATIONS[] = 0
+        @test k(groups, sigma) ≈ expected
+        # `log(scale)` reads only the captured scale: it runs once per call,
+        # above the group loop, as an ordinary cell's invariant does.
+        @test _NESTED_SHARED_EVALUATIONS[] == 1
+        ad = prepare_ad(k, backend, groups, sigma; active=:scale)
+        value, gradient = ad_value_and_gradient(ad, groups, sigma)
+        @test value ≈ expected
+        @test gradient ≈ -n/sigma + sq/sigma^3
+    end
+    @test groups == original
+    # Like an ordinary cell's invariant, it runs once even without cells.
+    _NESTED_SHARED_EVALUATIONS[] = 0
+    @test k(Vector{Float64}[], 1.3) == 0
+    @test _NESTED_SHARED_EVALUATIONS[] == 1
+    # Both loops remain, and neither is replicated.
+    @test NestedPlates.head_count(code_expr(k), :for) == 2
+end

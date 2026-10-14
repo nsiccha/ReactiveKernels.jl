@@ -2803,7 +2803,12 @@ end
 # selected sum consumers, and preserves all named scalar recipes for replay.
 # Type-only arguments carry the enclosing DAG's coordinate evidence through
 # embedding without rebasing its operation-table references a second time.
-function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types)
+# `hoisted` (`_nested_cell_invariants`) names the cell recipes computed above
+# the cell loop: the spliced kernel is the residual plan that reads their
+# values as inputs after the cell's own, and `input_types` covers both.
+function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
+                               hoisted = Int[])
+    kernel = _nested_cell_residual(kernel, hoisted)
     scalar = _fuse_authored_plate_chains(kernel.plan)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
     hint_ids = sort!(collect(keys(types)))
@@ -2813,7 +2818,48 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     append!(runtime_ops, ops)
     append!(runtime_recipes, recipes)
     T = types[canon_id(kernel.plan.graph, only(kernel.plan.want).id)]
-    (; ast, offset, type = T, input_types = Any[types[cid] for cid in hint_ids])
+    (; ast, offset, type = T, input_types = Any[types[cid] for cid in hint_ids],
+     hoisted)
+end
+
+# The cell recipes of a plate whose cell holds a nested plate that read only
+# shared values: atomic arguments, statically scalar ports, and earlier such
+# recipes. A cell without a nested plate computes these once above its loop
+# (`_authored_plate_recipe_groups`); this cell does the same, rather than at
+# every coordinate. Plates, scans, embedded kernels and effectful recipes stay
+# in the cell, as does the cell's result.
+function _nested_cell_invariants(inner::Plan, atomic, callvalues)
+    g = inner.graph
+    shared = Set{Int}(canon_id(g, input.id) for (position, input) in enumerate(inner.have)
+        if position in atomic || valtype(callvalues[position]) <: Number)
+    result = canon_id(g, only(inner.want).id)
+    hoisted = Int[]
+    for (index, recipe) in enumerate(inner.recipes)
+        length(recipe.outputs) == 1 || continue
+        output = canon_id(g, only(recipe.outputs).id)
+        (output == result || recipe.effectful ||
+         recipe.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} ||
+         _embedded_kernel(recipe.op) !== nothing) && continue
+        all(input -> canon_id(g, input.id) in shared, recipe.inputs) || continue
+        push!(shared, output)
+        push!(hoisted, index)
+    end
+    hoisted
+end
+
+# The cell kernel without its `hoisted` recipes, whose outputs it reads as
+# further inputs, in recipe order. Only the parts `_plate_body_types!` and the
+# lowering read are kept: the plan and its per-recipe operations.
+function _nested_cell_residual(kernel, hoisted)
+    isempty(hoisted) && return kernel
+    p = kernel.plan
+    kept = [index for index in eachindex(p.recipes) if !(index in hoisted)]
+    have = Value[p.have; [only(p.recipes[index].outputs) for index in hoisted]]
+    recipes = p.recipes[kept]
+    producer = Dict(canon_id(p.graph, v.id) => r for r in recipes for v in r.outputs)
+    (; plan = Plan(p.graph, have, p.want, recipes, producer, p.cost, p.candidates),
+     ops = Tuple(kernel.ops)[kept],
+     lowered_recipes = Tuple(kernel.lowered_recipes)[kept])
 end
 
 # Each authored plate carries a generated kernel type. The lowering itself is
@@ -3082,10 +3128,6 @@ Base.@nospecializeinfer function _plate_cell_types!(
                 plate_type_exprs[cid], hint)
         end
     end
-    nested = any(r -> r.op isa _AuthoredPlateOp, inner.recipes) ?
-        _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
-            Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inner.have]) :
-        nothing
     for (recipe_index, recipe) in enumerate(inner.recipes)
         input_type_exprs = Any[
             get(plate_type_exprs, canon_id(inner.graph, input.id),
@@ -3108,6 +3150,13 @@ Base.@nospecializeinfer function _plate_cell_types!(
             Expr(:call, GlobalRef(@__MODULE__, :_promote_op),
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index), input_type_exprs...) : scan_type
     end
+    nested = nothing
+    if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)
+        hoisted = _nested_cell_invariants(inner, atomic, callvalues)
+        inputs = Value[inner.have; [only(inner.recipes[index].outputs) for index in hoisted]]
+        nested = _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
+            Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inputs], hoisted)
+    end
     (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms)
 end
 
@@ -3121,7 +3170,10 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         lane_arms)
     groups = _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues)
-    nested === nothing || (groups = [])
+    # A nested-bearing cell runs as one embedded kernel per coordinate; only
+    # its shared recipes are emitted here, above the loop.
+    nested === nothing ||
+        (groups = isempty(nested.hoisted) ? [] : [(Set{Int}(), nested.hoisted)])
     has_scheduled_groups = any(groups) do (roots, _)
         !isempty(roots) && !_authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues)
@@ -3180,6 +3232,10 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         args = Any[_authored_plate_scalar_ref(
             inner, locals, callargs, callvalues, prepared_arguments, atomic,
             input, index, true) for input in inner.have]
+        for recipe_index in nested.hoisted
+            push!(args, locals[canon_id(inner.graph,
+                only(inner.recipes[recipe_index].outputs).id)])
+        end
         # Hint queries used only by a cell stay inside its loop: an empty outer
         # domain must not evaluate new queries merely to bind an unused hint.
         input_types = _bind_native_type_exprs!(loopbody, nested.input_types)
@@ -3444,8 +3500,11 @@ Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
     _plate_shared_branch_reserve!(runtime_ops, runtime_recipes, inner_kernel,
         atomic, callargs, callvalues, pointwise_lhs, total_lhs)
     if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)
+        # The native lowering's slots, hoisted invariants included.
+        hoisted = _nested_cell_invariants(inner, atomic, callvalues)
         _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
-            Any[GlobalRef(Core, :Any) for _ in inner.have])
+            Any[GlobalRef(Core, :Any) for _ in 1:(length(inner.have) + length(hoisted))],
+            hoisted)
         # The current tensor product batches individual scalar recipes. Calling
         # a nested plate's host fallback there would trace a data-sized loop.
         # Keep this capability gap explicit until nested backend regions exist.
