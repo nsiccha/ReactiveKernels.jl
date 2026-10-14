@@ -1,7 +1,8 @@
 # Bound-data contiguous-index runs for native scalar reductions.
 # The derived metadata is an ordinary data-only graph dependency. It therefore
 # occupies the existing leading constant slots and is recomputed on rebinding;
-# no bound values enter a cached template's operation tail or emitted syntax.
+# no bound arrays or extents enter a cached template's operation tail or syntax.
+# Only the finite flat/grouped schedule class distinguishes compiled templates.
 
 const _IndexRunData = Tuple{Vector{Int},Vector{Int},Int,Bool}
 const _INDEX_RUN_MINIMUM_MEAN_LENGTH = 16
@@ -32,6 +33,26 @@ end
 # The extra dependency is compiler metadata only. The ordinary and tensorized
 # semantic fallback return exactly the original borrowed gather representation.
 @inline _readonly_gather_runs(parent,indices,runs) = _readonly_gather(parent,indices)
+
+# Record these constant slots once per bound plan. Rebinding keys the compiled
+# template only by each schedule's Boolean, never by an extent or index pattern.
+function _partial_index_run_slots(g::Graph, b::_PartialBoundary)
+    ids=Set{Int}()
+    for r in b.residual
+        r.op===_readonly_gather_runs || continue
+        push!(ids,canon_id(g,r.inputs[3].id))
+    end
+    [i for (i,v) in enumerate(b.constants) if canon_id(g,v.id) in ids]
+end
+
+function _bound_index_run_classes(slots::Vector{Int}, @nospecialize(hoisted))
+    isempty(slots) && return ()
+    classes=Vector{Bool}(undef,length(slots))
+    for (i,slot) in enumerate(slots)
+        classes[i]=hoisted[slot][4]
+    end
+    Tuple(classes)
+end
 
 _index_run_gather(op) = op === _readonly_gather ||
     (op isa _KernelSourceOp && op.call_identity !== nothing &&
@@ -109,6 +130,7 @@ end
 function _lower_index_runs_native(body::Expr,ops)
     any(op->op===_readonly_gather_runs,ops) || return body
     gathers=Dict{Symbol,Symbol}();raw=Dict{Symbol,Symbol}();projections=Dict{Symbol,Symbol}()
+    policies=Dict{Symbol,Bool}()
     _index_run_visit(body) do ex
         ex.head===:(=) && length(ex.args)==2 && ex.args[1] isa Symbol || return
         lhs,rhs=ex.args
@@ -116,7 +138,10 @@ function _lower_index_runs_native(body::Expr,ops)
         fn=rhs.args[1]
         if fn isa Expr && fn.head===:ref && length(fn.args)==2 &&
                 fn.args[1]===_OPS_ARG && fn.args[2] isa Int
-            ops[fn.args[2]]===_readonly_gather_runs && length(rhs.args)==4 &&
+            op=ops[fn.args[2]]
+            op isa _BoundConstant && op.value isa _IndexRunData &&
+                (policies[lhs]=op.value[4])
+            op===_readonly_gather_runs && length(rhs.args)==4 &&
                 rhs.args[4] isa Symbol && (gathers[lhs]=rhs.args[4])
         elseif _index_run_call(rhs,GlobalRef(Base,:broadcastable),1)
             m=get(gathers,rhs.args[2],nothing);m===nothing || (raw[lhs]=m)
@@ -158,6 +183,11 @@ function _lower_index_runs_native(body::Expr,ops)
         accumulator=only(additions).args[1]
         accumulator isa Symbol || return ex
         metadata=projections[first(selected)]
+        policy=get(policies,metadata,nothing)
+        # A known flat schedule retains the original body verbatim. The bound
+        # template cache includes this finite policy, so later grouped bindings
+        # cannot accidentally reuse a flat template (or vice versa).
+        policy===false && return ex
         # Distinct index maps keep their original scalar projection. Only inputs
         # sharing this exact data-only metadata are invariant over its runs.
         filter!(s->projections[s]===metadata,selected)
@@ -190,7 +220,8 @@ function _lower_index_runs_native(body::Expr,ops)
         # Authored array accesses remain under their original checks.
         runbody=Expr(:block,reads,grouped)
         runs=Expr(:for,Expr(:(=),run,:(eachindex(getfield($metadata,1)))),runbody)
-        guard=:(getfield($metadata,4) && Base.only($axes)==Base.OneTo(getfield($metadata,3)) && $accumulator isa Number)
+        guard=:(Base.only($axes)==Base.OneTo(getfield($metadata,3)) && $accumulator isa Number)
+        policy===nothing && (guard=:(getfield($metadata,4) && $guard))
         Expr(:if,condition,Expr(:if,guard,runs,ex.args[2]),fallback)
     end
 end

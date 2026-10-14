@@ -41,7 +41,7 @@ end
     cache=PreparationCache();q=[.1,-.4,.3]
     shapes=(Int[],[1],repeat([1,2,3],inner=2),repeat([1,2,3],inner=16),
         [fill(2,32);1;3;fill(1,23)],repeat([3,1],inner=64))
-    kernels=Any[];references=Any[];source=nothing
+    kernels=Any[];references=Any[];sources=Dict{Bool,Any}();asts=Dict{Bool,Expr}()
     for (idx,enabled) in zip(shapes,(false,false,false,true,false,true))
         x=[sin(i/3)/2 for i in eachindex(idx)]
         oldidx=copy(idx);oldx=copy(x)
@@ -49,21 +49,25 @@ end
         push!(kernels,k);push!(references,oracle(q,idx,x))
         verify(k,q,last(references))
         @test idx==oldidx && x==oldx
-        if source===nothing
-            source=k.f
+        if !haskey(sources,enabled)
+            sources[enabled]=k.f
+            asts[enabled]=k.ast
         else
-            @test k.f===source
-            @test k.ast==first(kernels).ast
+            @test k.f===sources[enabled]
+            @test k.ast==asts[enabled]
         end
+        @test occursin("run_partial",string(k.ast))==enabled
         metas=[op.value for op in k.ops if op isa RK._BoundConstant && op.value isa RK._IndexRunData]
         @test length(metas)==1
         @test only(metas)[3]==length(idx)
         @test only(metas)[4]==enabled
     end
+    @test length(sources)==2
+    @test sources[false]!==sources[true]
     # The active array length is a runtime property too.
     q4=[q;0.7];idx4=fill(4,32);x4=fill(.1,32)
     k4=prepare!(cache,subject;bound=(idx=idx4,x=x4))
-    @test k4.f===source
+    @test k4.f===sources[true]
     verify(k4,q4,oracle(q4,idx4,x4))
     # Earlier kernels retain their own constants after later rebindings.
     for (k,ref) in zip(kernels,references)

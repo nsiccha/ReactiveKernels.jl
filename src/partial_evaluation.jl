@@ -1590,10 +1590,11 @@ struct _BoundEntry
     boundary::_PartialBoundary
     prefix::Any          # prepared prefix kernel, or `nothing` without constants
     plates::Bool         # residual authored plates: the inner-plate pass runs per binding
+    index_run_slots::Vector{Int} # finite flat/grouped policy constants
     # Per plate-class tuple, the residual recipe tail after value-independent
     # plate-chain fusion. No binding's constant recipes or values are retained.
     fused::Dict{Any,Vector{Recipe}}
-    # Per plate-class tuple: a `_BoundTemplate`; the kernel itself when it
+    # Per (plate classes, index-run schedule classes): a `_BoundTemplate`; the kernel itself when it
     # has no constant slots; or `nothing` (a residual whose leading slots are
     # not exactly its constants: the per-binding path). An absent class is
     # unbuilt.
@@ -1611,7 +1612,8 @@ function _bound_entry(p::Plan, @nospecialize(ports))
     prefix = isempty(boundary.constants) ? nothing :
              _prepare_plan(_partial_prefix_plan(p, boundary))
     plates = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
-    _BoundEntry(p, boundary, prefix, plates, Dict{Any,Vector{Recipe}}(), Dict{Any,Any}())
+    _BoundEntry(p, boundary, prefix, plates, _partial_index_run_slots(p.graph,boundary),
+                Dict{Any,Vector{Recipe}}(), Dict{Any,Any}())
 end
 
 _bound_hoisted(entry::_BoundEntry, @nospecialize(data::Tuple)) =
