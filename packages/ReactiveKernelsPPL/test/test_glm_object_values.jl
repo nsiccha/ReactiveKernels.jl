@@ -315,12 +315,12 @@ end
     end
 end
 
-# The Normal-identity object's density is its `logpdf` endpoint, an owned rule
+# The Normal-identity object's density calls the owned rule directly,
 # whose reverse branch is one X'r product (DK `normal_id_glm_lpdf`): the
 # sampler neither builds nor differentiates the per-observation vector, which
 # `:pointwise` still returns. Forward and second-order queries go through the
 # rule's authored forward branch.
-@testset "NormalIDGLM density reads the rule-backed logpdf endpoint" begin
+@testset "NormalIDGLM density calls the owned rule directly" begin
     n = 9
     X, y = _gv_X(n), _gv_y(n)
     x1 = X[:, 1]
@@ -349,7 +349,9 @@ end
         built = _gv_check(plan, data, nt -> sum(oracle(nt)))
         code = sprint(print, Base.remove_linenums!(deepcopy(
             code_expr(prepare_query(built, plan, :sampler)))))
-        @test occursin("normal_id_glm(", sprint(print, kernel_expr(plan, built.layout)))
+        kernel_code = sprint(print, kernel_expr(plan, built.layout))
+        @test occursin("normal_id_glm(", kernel_code)
+        @test occursin("normal_id_glm_lpdf(", kernel_code)
         @test !occursin("_ppl_pw_", code)
         u = _gv_u(built)
         cells = oracle(constrain(built.layout, u))
