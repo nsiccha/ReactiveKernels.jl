@@ -3,36 +3,30 @@
 # occupies the existing leading constant slots and is recomputed on rebinding;
 # no bound values enter a cached template's operation tail or emitted syntax.
 
-const _IndexRunData = Tuple{Vector{Int},Vector{Int},Vector{Bool},Int,Bool}
-const _INDEX_RUN_MINIMUM = 16
+const _IndexRunData = Tuple{Vector{Int},Vector{Int},Int,Bool}
+const _INDEX_RUN_MINIMUM_MEAN_LENGTH = 16
 
 # Unknown index representations retain the original gather and loop. A concrete
 # return type also keeps concretely typed client programs concrete.
-_index_run_metadata(indices) = (Int[],Int[],Bool[],0,false)
+_index_run_metadata(indices) = (Int[],Int[],0,false)
+# Choose one schedule for the entire reduction. Mixed grouped/flat spans
+# introduce an inner policy branch and were slower in native primal controls.
+# The mean-run threshold conservatively amortizes the outer-loop overhead;
+# data patterns below it retain the original flat reduction.
 function _index_run_metadata(indices::Vector{Int})
-    starts,stops,grouped = Int[],Int[],Bool[]
-    n=length(indices)
-    n==0 && return (starts,stops,grouped,n,false)
-    # Short adjacent runs share one flat span. They keep the original scalar
-    # body and scatter rather than paying a new outer-loop iteration per run.
-    flat=1; lo=1
-    @inbounds for i in 2:(n+1)
-        if i==n+1 || indices[i]!=indices[i-1]
-            hi=i-1
-            if hi-lo+1 >= _INDEX_RUN_MINIMUM
-                if flat<lo
-                    push!(starts,flat);push!(stops,lo-1);push!(grouped,false)
-                end
-                push!(starts,lo);push!(stops,hi);push!(grouped,true)
-                flat=i
-            end
-            lo=i
+    starts, stops = Int[], Int[]
+    n = length(indices)
+    n == 0 && return (starts, stops, n, false)
+    lo = 1
+    @inbounds for i in 2:(n + 1)
+        if i == n + 1 || indices[i] != indices[i - 1]
+            push!(starts, lo)
+            push!(stops, i - 1)
+            lo = i
         end
     end
-    if flat<=n
-        push!(starts,flat);push!(stops,n);push!(grouped,false)
-    end
-    (starts,stops,grouped,n,any(grouped))
+    enabled = n ÷ length(starts) >= _INDEX_RUN_MINIMUM_MEAN_LENGTH
+    (starts, stops, n, enabled)
 end
 
 # The extra dependency is compiler metadata only. The ordinary and tensorized
@@ -168,7 +162,7 @@ function _lower_index_runs_native(body::Expr,ops)
         # sharing this exact data-only metadata are invariant over its runs.
         filter!(s->projections[s]===metadata,selected)
         shared=Dict(s=>gensym(:index_run_value) for s in selected)
-        part,run,lo,hi,linear,isgrouped=(gensym(s) for s in (:run_partial,:run,:run_lo,:run_hi,:run_linear,:run_grouped))
+        part,run,lo,hi,linear=(gensym(s) for s in (:run_partial,:run,:run_lo,:run_hi,:run_linear))
         grouped_body=_index_run_replace(cellbody) do cell
             if _index_run_call(cell,GlobalRef(Base.Broadcast,:_broadcast_getindex),2) &&
                     cell.args[3]==index && haskey(shared,cell.args[2])
@@ -191,13 +185,12 @@ function _lower_index_runs_native(body::Expr,ops)
         push!(grouped.args,:($part=zero($accumulator)),simd(grouped_body),
             :($accumulator=$(GlobalRef(@__MODULE__,:_plate_total_add))($accumulator,$part)))
         reads=_inbounds_expr(Expr(:block,
-            :($lo=getfield($metadata,1)[$run]),:($hi=getfield($metadata,2)[$run]),
-            :($isgrouped=getfield($metadata,3)[$run])))
-        # All three vectors are created together, indexed by eachindex(starts).
+            :($lo=getfield($metadata,1)[$run]),:($hi=getfield($metadata,2)[$run])))
+        # Both vectors are created together, indexed by eachindex(starts).
         # Authored array accesses remain under their original checks.
-        runbody=Expr(:block,reads,Expr(:if,isgrouped,grouped,simd(deepcopy(cellbody))))
+        runbody=Expr(:block,reads,grouped)
         runs=Expr(:for,Expr(:(=),run,:(eachindex(getfield($metadata,1)))),runbody)
-        guard=:(getfield($metadata,5) && Base.only($axes)==Base.OneTo(getfield($metadata,4)) && $accumulator isa Number)
+        guard=:(getfield($metadata,4) && Base.only($axes)==Base.OneTo(getfield($metadata,3)) && $accumulator isa Number)
         Expr(:if,condition,Expr(:if,guard,runs,ex.args[2]),fallback)
     end
 end

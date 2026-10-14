@@ -42,7 +42,7 @@ end
     shapes=(Int[],[1],repeat([1,2,3],inner=2),repeat([1,2,3],inner=16),
         [fill(2,32);1;3;fill(1,23)],repeat([3,1],inner=64))
     kernels=Any[];references=Any[];source=nothing
-    for idx in shapes
+    for (idx,enabled) in zip(shapes,(false,false,false,true,false,true))
         x=[sin(i/3)/2 for i in eachindex(idx)]
         oldidx=copy(idx);oldx=copy(x)
         k=prepare!(cache,subject;bound=(;idx,x))
@@ -57,8 +57,8 @@ end
         end
         metas=[op.value for op in k.ops if op isa RK._BoundConstant && op.value isa RK._IndexRunData]
         @test length(metas)==1
-        @test only(metas)[4]==length(idx)
-        @test only(metas)[5]==any(all(idx[j]==idx[i] for j in i:(i+15)) for i in 1:max(0,length(idx)-15))
+        @test only(metas)[3]==length(idx)
+        @test only(metas)[4]==enabled
     end
     # The active array length is a runtime property too.
     q4=[q;0.7];idx4=fill(4,32);x4=fill(.1,32)
