@@ -4112,8 +4112,10 @@ function _categorical_plate_cell(c, plate_defs::Set{Symbol}, data::Set{Symbol})
     Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :Categorical &&
         rhs.args[2] isa Symbol && rhs.args[2] ∉ plate_defs && return c
     Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :Categorical || return c
+    probabilities = Expr(:call,
+        GlobalRef(@__MODULE__, :_ppl_categorical_probabilities), rhs.args[2])
     density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
-        GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), rhs.args[2])
+        GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), probabilities)
     return Expr(:call, c.args[1], c.args[2], density)
 end
 
@@ -4192,7 +4194,13 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             end
             if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames)
                 nm = gensym(:_rkppl_selected)
-                _cell_value!(out, values, nm, locals, ex)
+                key = _categorical_key_column(ex, locals, ivar, data)
+                if key === nothing
+                    _cell_value!(out, values, nm, locals, ex)
+                else
+                    _keyed_cell_value!(out, values, nm, locals, ex, ivar,
+                        indices, key, plate_defs)
+                end
                 push!(plate_defs, nm)
                 push!(pidx, nm)
                 return Expr(:ref, nm, ivar)
@@ -4214,6 +4222,53 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
     end
     _emit_cell_values!(out, values, plate_defs)
     return out, ctx, params
+end
+
+# A computed categorical probability vector that reads the loop index only
+# through one integer data column (`phi * theta[:, doc[i]]`) is the same
+# vector at every index sharing that column's value. Return that column,
+# or `nothing` when the vector reads the index any other way (`x[i]`, a
+# bare `i`, a per-index local or latent, or two key columns).
+function _categorical_key_column(ex, locals, ivar::Symbol, data::Set{Symbol})
+    Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+        ex.args[1] == GlobalRef(@__MODULE__, :_ppl_categorical_probabilities) ||
+        return nothing
+    keys = Set{Symbol}()
+    keyed = true
+    function walk(e)
+        e === ivar && (keyed = false)
+        e isa Expr || return
+        if Meta.isexpr(e, :ref, 2) && e.args[2] === ivar &&
+                e.args[1] isa Symbol && e.args[1] in data
+            push!(keys, e.args[1])
+            return
+        end
+        foreach(walk, e.args)
+    end
+    walk(ex)
+    foreach(l -> walk(last(l)), _needed_cell_locals(locals, ex))
+    return keyed && length(keys) == 1 ? only(keys) : nothing
+end
+
+# Compute such a vector once per distinct key, at the first index carrying
+# it (so exactly the evaluations, and the first failure, of the per-index
+# cell remain), then read it per index through the key's data-only codes.
+# The per-index value `nm` is that reference, not a copy of the vector.
+function _keyed_cell_value!(out, values, nm::Symbol, locals, rhs,
+        ivar::Symbol, indices, key::Symbol, plate_defs::Set{Symbol})
+    cells = gensym(:_rkppl_key_cells)
+    codes = gensym(:_rkppl_key_codes)
+    perkey = gensym(:_rkppl_key_values)
+    push!(out, Expr(:(=), cells,
+        Expr(:call, GlobalRef(@__MODULE__, :_ppl_key_cells), key, indices)))
+    push!(out, Expr(:(=), codes,
+        Expr(:call, GlobalRef(@__MODULE__, :_ppl_key_codes), key, indices)))
+    push!(out, Expr(:(=), perkey, _plate_column_call(ivar,
+        _needed_cell_locals(locals, rhs), rhs, nothing; indices = cells)))
+    push!(plate_defs, perkey)
+    _cell_value!(out, values, nm, Pair{Symbol,Any}[],
+        Expr(:ref, perkey, Expr(:ref, codes, ivar)))
+    return nm
 end
 
 # Whole-column evaluation (`_desugar_cell`) strips `[i]` and broadcasts each
