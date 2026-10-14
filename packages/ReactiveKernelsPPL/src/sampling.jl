@@ -138,7 +138,8 @@ function _external_parameter(name, rhs, shape, mod, names; observed=false,
             "but its declaration has shape $(Tuple(shape)); declare its constrained dimensions")
         g
     end
-    return (rhs=call, geometry=geometry, broadcast=broadcast || _is_dotted_call(rhs))
+    return (rhs=call, geometry=geometry, broadcast=broadcast || _is_dotted_call(rhs),
+        constructor_broadcast=_is_dotted_call(rhs))
 end
 
 function _validate_external_parameter(plan, p; observation=false)
@@ -366,7 +367,9 @@ function _external_density_statements(p)
         if arg isa Number || arg isa QuoteNode || arg isa GlobalRef
             push!(args, arg)
         else
-            push!(inputs, arg)
+            input = p.args.constructor_broadcast ? arg :
+                Expr(:call, GlobalRef(Base, :Ref), arg)
+            push!(inputs, input)
             push!(args, _dovar(length(inputs)))
         end
     end

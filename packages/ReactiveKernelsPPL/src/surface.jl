@@ -4132,7 +4132,9 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             if ex isa Expr && (ex.head === :call || _is_dotted_call(ex)) &&
                     !isempty(ex.args) && (_cell_object_call(ex.args[1]) || object)
                 vals = ex.head === :call ? ex.args[2:end] : ex.args[2].args
-                return Expr(:call, ex.args[1], map(arg, vals)...)
+                arguments = map(arg, vals)
+                return ex.head === :call ? Expr(:call, ex.args[1], arguments...) :
+                    Expr(:., ex.args[1], Expr(:tuple, arguments...))
             end
             if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames)
                 nm = gensym(:_rkppl_selected)
@@ -5029,11 +5031,10 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     # vectorized observation (the distribution call and its wrappers take
     # their dotted form even over scalar-only arguments — `y[i] ~ Normal(0,
     # 1)` observes every row).
-    obj, _ = _dotify_cell(obj, ivar, pidx, true)
-    # An open RHS constructor at the root is applied once per authored
-    # iteration, including qualified and lowercase caller bindings.
     if _external_rhs(obj) && Meta.isexpr(obj, :call)
-        obj = Expr(:., obj.args[1], Expr(:tuple, obj.args[2:end]...))
+        obj = _dotify_external_cell_call(obj, ivar, pidx, _is_broadcast_sample(c))
+    else
+        obj, _ = _dotify_cell(obj, ivar, pidx, true)
     end
     if rkind[1] === :coloncall
         # A literal range keeps its authored indices (`indexed_observations`),
@@ -5044,6 +5045,32 @@ function _desugar_cell_sample(c, ivar, rkind, line, data, plate_defs, ctx,
     index = rkind[1] === :eachindex ? Expr(:call, :eachindex, rkind[2]) :
         Expr(:call, :axes, rkind[2], rkind[3])
     return Expr[Expr(:call, :.~, Expr(:ref, col, index, lhs.args[3:end]...), obj)]
+end
+
+# An undotted external constructor consumes its shared arrays whole. A
+# per-index argument adds an outer constructor lane, without turning those
+# shared arrays (including shared slices) into lanes. In a dotted observation
+# cell the retained group already selects the per-index arguments; its inner
+# observations share the resulting undotted constructor.
+function _dotify_external_cell_call(obj, ivar, pidx, broadcast_observations)
+    positional = filter(a -> !Meta.isexpr(a, :parameters), obj.args[2:end])
+    broadcast_constructor = !broadcast_observations &&
+        any(a -> _cell_reads_index(a, ivar, pidx), positional)
+    arguments = Any[]
+    for argument in obj.args[2:end]
+        if Meta.isexpr(argument, :parameters)
+            push!(arguments, _strip_cell(argument, ivar))
+            continue
+        end
+        per = _cell_reads_index(argument, ivar, pidx)
+        value = per ? first(_dotify_cell(argument, ivar, pidx, false)) : argument
+        if broadcast_constructor && !per
+            value = Expr(:call, GlobalRef(Base, :Ref), value)
+        end
+        push!(arguments, value)
+    end
+    broadcast_constructor ? Expr(:., obj.args[1], Expr(:tuple, arguments...)) :
+        Expr(:call, obj.args[1], arguments...)
 end
 
 _undot_cell_object(ex) = ex
