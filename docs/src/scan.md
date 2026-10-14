@@ -363,6 +363,12 @@ iterate the indices after their peeled first step as a unit range. Iterating
 them with `Iterators.drop` made Enzyme raise `OutOfMemoryError` from the
 second outer step on whenever the inner sequence was empty and the same at
 every outer step (`benchmark/repro_enzyme_guarded_inner_loop_cache.jl`).
+On Julia 1.12 and later, registered Enzyme (0.13.216) fails the unit-range
+loop of that shape too: it sizes the skipped inner loop's reverse cache with a
+negative count, which throws `OutOfMemoryError` from two outer steps on and
+writes past an allocation at exactly one
+(`benchmark/repro_enzyme_skipped_inner_loop_count.jl`, EnzymeAD/Enzyme.jl#3787).
+Julia 1.10 and the Enzyme `dogfood` line differentiate it.
 
 Plain `Enzyme.autodiff` of a closure that captures the sequence meets a
 separate Enzyme boundary on Julia 1.12 and later. Enzyme must prove the

@@ -205,11 +205,20 @@ _kernel_native_source(f::_KernelSourceFunction) = f.f
 @inline @generated function (f::_KernelSourceFunction{F,RF,C,M})(args::Vararg{Any,N}) where {F,RF,C,M,N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
     M === Val{:latest_world} && return :(Base.@inline f.f($(forwarded...)))
-    argtypes = Tuple{args...}
+    # The query is `Core._hasmethod` on the complete signature, which inference
+    # folds to a constant in the caller's world on every supported Julia.
+    # `hasmethod(f.f, argtypes)` folds too, but from Julia 1.12 it first
+    # validates its argument tuple type with `Base.to_tuple_type`, a loop over
+    # the signature's parameters that stayed in every call: a plate cell then
+    # walked its argument types once per cell and did not vectorize. The
+    # signature is built in the body, from `f.f`, so that the generator reads
+    # no more of the callable's type than the call mode.
+    signature = Expr(:curly, GlobalRef(Core, :Tuple),
+                     :($(GlobalRef(Core, :Typeof))(f.f)), args...)
     quote
         # The type-only query uses the caller's world without boxing active
         # argument values into a method-lookup array during ordinary AD.
-        if hasmethod(f.f, $argtypes)
+        if Core._hasmethod($signature)
             Base.@inline f.f($(forwarded...))
         else
             Base.@inline _kernel_runtime_source_call(
@@ -829,7 +838,11 @@ end
 # body: with an inner sequence that is empty and the same at every outer step,
 # it raises `OutOfMemoryError` from the second outer step on. The unit-range
 # loop differentiates. `benchmark/repro_enzyme_guarded_inner_loop_cache.jl`
-# reproduces both with Enzyme only.
+# reproduces both with Enzyme only. On Julia 1.12 and later, registered Enzyme
+# also fails the unit-range loop there: it sizes the skipped loop's reverse
+# cache with a negative count (EnzymeAD/Enzyme.jl#3787,
+# `benchmark/repro_enzyme_skipped_inner_loop_count.jl`). That is Enzyme's to
+# repair; the indices stay as they are.
 @inline _scan_rest(indices::AbstractUnitRange{<:Integer}) =
     (first(indices) + oneunit(eltype(indices))):last(indices)
 @inline _scan_rest(indices) = Iterators.drop(indices, 1)

@@ -470,8 +470,10 @@ and lock the one Reactant 0.2.289 lifted:
   first step. For unit-range indices the native scan loops now iterate the
   unit range that starts after the first index. It holds the same indices and
   keeps the loop, and ordinary reverse differentiates both `include_init` and
-  ordinary inner scans over empty sequences. Other index collections keep
-  `Iterators.drop` and remain the backend's limitation. No activity
+  ordinary inner scans over empty sequences on Julia 1.10; on Julia 1.12 and
+  later registered Enzyme fails the unit-range loop of this shape with a
+  negative cache count (EnzymeAD/Enzyme.jl#3787, below). Other index
+  collections keep `Iterators.drop` and remain the backend's limitation. No activity
   configuration or derivative rule is involved.
 - Native Enzyme 0.13.209 on Julia 1.10.12 also rejects an ordinary untyped
   comprehension whose generator captures both an active array and a constant
@@ -619,11 +621,26 @@ and lock the one Reactant 0.2.289 lifted:
   loop (`_ad_na_plate_loop!`) selects its result buffer this way, so under
   `--check-bounds=yes` its gradient is not size-invariant on Julia 1.12 and
   later. The repair belongs in Enzyme; `test_nonallocating_ad.jl` pins its
-  plate and cache-step allocation checks as broken there. Under any bounds
-  flag on Julia 1.12 and later, the plate gradient also grows by 16 bytes per
-  element because of the source callable's per-call `hasmethod` query, until
-  its fold lands. The two triggers overlap: with both present, the measured
-  plate-gradient growth is still 16 bytes per element, not their sum.
+  plate and cache-step allocation checks as broken there. Until the source
+  callable asked `Core._hasmethod` (snag `guarded-kernelso-e7baca4c`), its
+  per-call `hasmethod` query grew the plate gradient by the same 16 bytes per
+  element under any bounds flag.
+- On Julia 1.12.7 and 1.13.1, Enzyme 0.13.216 reverse mode sizes the cache of
+  an inner loop over `2:m` outside the loop around it, as
+  `(m - 1) * outer steps`. When the inner sequence is empty that count is
+  negative, and since Enzyme 0.13.206 it reaches `jl_svec_fill`: two or more
+  outer steps throw `OutOfMemoryError` from the gradient, and exactly one
+  writes past a zero-byte allocation. The primal is correct.
+  `repro_enzyme_skipped_inner_loop_count.jl` reproduces it with Enzyme only;
+  EnzymeAD/Enzyme.jl#3787 is open, and the Enzyme `dogfood` line carries the
+  fix. A native `scan` inside a scan step over an empty sequence is this
+  shape, because a native scan peels its first step. While the step's source
+  callable ran an opaque `hasmethod` query, Enzyme did not move that cache;
+  the query was removed for its per-cell cost (snag
+  `guarded-kernelso-e7baca4c`), not to change this outcome. Runtime activity
+  does not avoid it. The repair belongs in Enzyme; `test_scan_plate_ad.jl`
+  pins the two-or-more-step cases as broken on Julia 1.12 and later and skips
+  the one-step case, which corrupts the heap.
 - Two backend rewrite patterns, `reshape_dynamic_slice` and `reshape_dus`,
   never finish on a reshape that inserts a unit dimension ahead of a dropped
   one: each creates a constant for the inserted dimension, fails a later
