@@ -30,6 +30,16 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# A live lane vector beside a shared live scalar: each arm gathers `x` at run
+# time, while a gradient may hold `x` inactive and `s` active.
+@kernel guarded_shared(x::Vector{Float64}, y::Vector{Float64}, s::Float64) = begin
+    pointwise = plate(x, y, s) do xi, yi, si
+        cell::Float64 = yi > 0 ? xi * log(si) : xi - 1.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
 # Two split plates in sequence. An additional consumer keeps the first plate's
 # pointwise boundary so its arms must be reassembled before the second splits.
 # The `sqrt` arm is invalid off its lanes.

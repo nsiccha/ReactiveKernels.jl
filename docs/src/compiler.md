@@ -418,7 +418,9 @@ or a bound-only cell value that the pass has already evaluated per lane.
 2. The plate becomes one plate per taken arm, each over that arm's lanes.
 3. The plate's arguments follow the arm's lanes:
    - bound arguments are gathered during preparation;
-   - live arguments are gathered at run time by constant lane indices;
+   - live arguments are gathered at run time by constant lane indices; native
+     execution reads an array argument's lanes through a view of it rather
+     than a copy;
    - a singleton or scalar argument broadcasts over the lanes.
 4. A nested arm is split again over its own lanes only, so an inner condition
    is never evaluated for a lane that does not reach it.

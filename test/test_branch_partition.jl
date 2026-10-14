@@ -126,6 +126,39 @@ isdefined(@__MODULE__, :BranchPartition) ||
                       for j in 1:2]
     end
 
+    @testset "reverse with an inactive live lane vector and an active scalar" begin
+        # Each arm reads live `x` through `_LaneGather`'s view. A local typed
+        # as the authored `Vector{Float64}` converted that view into a copy
+        # through `Base.unalias`, which native Reverse rejected for inactive
+        # `x` (EnzymeRuntimeActivityError, Enzyme 0.13.216; snag
+        # `native-enzyme-re-fdecb734`).
+        s = 2.5
+        ref(x, s) = sum(yi > 0 ? xi * log(s) : xi - 1.0 for (xi, yi) in zip(x, y))
+        bound = prepare(C.guarded_shared; have = (:x, :y, :s), want = :total,
+                        bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        @test count(op -> op isa RK._LaneGather, bound.ops) == 4
+        @test bound(x, s) ≈ ref(x, s)
+        # No arm copies its lanes of `x`: the evaluation allocates the same
+        # at twenty times the lane count.
+        allocated(f, args...) = (f(args...); @allocated f(args...))
+        xl, yl = repeat(x, 20), repeat(y, 20)
+        large = prepare(C.guarded_shared; have = (:x, :y, :s), want = :total,
+                        bound = (; y = yl))
+        @test large(xl, s) ≈ sum(yi > 0 ? xi * log(s) : xi - 1.0
+                                 for (xi, yi) in zip(xl, yl))
+        @test allocated(bound, x, s) == allocated(large, xl, s)
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        ps = prepare_ad(bound, backend, x, s; active = :s)
+        value, grad = RK.ad_value_and_gradient(ps, x, s)
+        @test value ≈ ref(x, s)
+        @test grad ≈ sum(x[y .> 0]) / s
+        px = prepare_ad(bound, backend, x, s; active = :x)
+        value, grad = RK.ad_value_and_gradient!(px, similar(x), x, s)
+        @test value ≈ ref(x, s)
+        @test grad ≈ [yi > 0 ? log(s) : 1.0 for yi in y]
+    end
+
     @testset "a bound-only cell condition partitions after caching" begin
         yv = [2.0, 0.5, 1.0, 3.0, 0.1]
         xv = [1.5, 2.5, 3.5, 0.5, 1.0]
