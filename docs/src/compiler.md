@@ -252,13 +252,8 @@ only throw. A small union of concrete types, such as the `Union{Nothing,Tuple}`
 of Julia's iteration protocol, is accepted. A kernel calling a function whose
 result is uninferred is the test's negative control.
 
-One RK-introduced residue is exempted, with its reason in
-`test/type_stability_audit.jl`. From Julia 1.12, the method query of a
-captured source operation, `hasmethod`, folds but leaves
-`Base.to_tuple_type`'s validation loop in every call. The loop is dynamically
-typed but makes no dynamic call. Folding it with `Core._hasmethod` is held
-until a registered Enzyme repairs the native reverse-mode failure it exposes
-in nested empty scans.
+An RK-introduced residue that cannot be removed would be exempted with its
+reason in `test/type_stability_audit.jl`; none is exempt.
 
 Client code is checked when it is prepared. A recipe whose inputs are
 concretely typed but whose result Julia does not infer concretely (`Any`, an

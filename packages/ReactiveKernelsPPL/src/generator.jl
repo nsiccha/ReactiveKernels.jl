@@ -2096,11 +2096,16 @@ function _mixture_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         push!(inputs, :(Ref($logp)))
         lwv = _dovar(length(inputs))
     elseif w isa MixtureComplementWeights
-        # Complement pair (K == 2 by contract): thread the constrained
-        # scalar once; `log1p(-p)` is the stable `log(1-p)` arm.
-        pv = _thread_ref!(inputs, w.param)
-        first, second = :(log($pv)), :(log1p(-$pv))
-        logw_comp = w.param_first ? (first, second) : (second, first)
+        # Complement pair (K == 2 by contract): both log weights are
+        # model-level scalars hoisted out of the plate, like the simplex
+        # log-vector above — 2 logs, not 2n. `log1p(-p)` is the stable
+        # `log(1-p)` arm.
+        logp = Symbol(:_ppl_mix_logw_, r.label)
+        logq = Symbol(:_ppl_mix_logw_complement_, r.label)
+        push!(pre, :($logp::Float64 = log($(w.param))),
+            :($logq::Float64 = log1p(-$(w.param))))
+        pv, qv = _thread_ref!(inputs, logp), _thread_ref!(inputs, logq)
+        logw_comp = w.param_first ? (pv, qv) : (qv, pv)
     end
     terms = Expr[]
     distributions = Any[]

@@ -335,6 +335,26 @@ function _carry_recurrence(xs, w1, α, β)
     total, dtotal
 end
 
+# Julia 1.12+ with registered Enzyme (0.13.216 and earlier): an empty inner
+# sequence under one or more outer steps gives the inner loop a negative
+# reverse cache count (`(length(us) - 1) * length(xs)`), EnzymeAD/Enzyme.jl#3787.
+# Two or more outer steps throw `OutOfMemoryError`; exactly one overruns the
+# heap, so that case is not run. Julia 1.10 is unaffected, and the Enzyme
+# `dogfood` line carries the fix (`d37d3d9`), where the broken pin below
+# reports an Unexpected Pass. Drop `_EMPTY_INNER_CACHE` and these pins once
+# the registered Enzyme in RK's environments carries it.
+const _EMPTY_INNER_CACHE = VERSION >= v"1.12"
+
+function _nested_gradient_matches(ad, args, value, derivative)
+    got, gradient = try
+        ad_value_and_gradient(ad, args...)
+    catch err
+        err isa OutOfMemoryError || rethrow()
+        return false
+    end
+    isapprox(got, value; atol=1e-12) && isapprox(gradient, derivative; atol=1e-12)
+end
+
 @testset "scans nested over an outer-invariant empty sequence keep ordinary reverse AD" begin
     backend = AutoEnzyme(; mode=Enzyme.Reverse)
     w = [1.3, 2.0, 0.5]
@@ -350,11 +370,15 @@ end
             value, derivative = total + sum(w), [dtotal + 1, 1.0, 1.0]
             k = bound ? prepare(spec; bound=(; us)) : prepare(spec)
             args = bound ? (xs, w) : (xs, us, w)
-            ad = prepare_ad(k, backend, args...; active=:w)
-            got, gradient = ad_value_and_gradient(ad, args...)
             @test k(args...) ≈ value atol=1e-12
-            @test got ≈ value atol=1e-12
-            @test gradient ≈ derivative atol=1e-12
+            ad = prepare_ad(k, backend, args...; active=:w)
+            if _EMPTY_INNER_CACHE && m == 0 && length(xs) == 1
+                @test_skip _nested_gradient_matches(ad, args, value, derivative)
+            elseif _EMPTY_INNER_CACHE && m == 0 && length(xs) > 1
+                @test_broken _nested_gradient_matches(ad, args, value, derivative)
+            else
+                @test _nested_gradient_matches(ad, args, value, derivative)
+            end
         end
         @test isequal((us, xs), original)
     end
