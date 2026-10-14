@@ -113,8 +113,10 @@ end
 # written into. The generic fallback allocates the result before copying it,
 # so the plain call does no more work.
 #
-# The decomposition's own step operations produce fresh storage by
-# construction and carry destination-passing methods in the extension.
+# The decomposition's own step operations carry destination-passing methods in
+# the extension. `_LaneGather` is the exception to their fresh ordinary result:
+# it returns a view, so its non-allocating slot is seeded with an owned vector
+# by `_nonalloc_slot` below.
 _nonalloc_fresh_step(op) = false
 _nonalloc_fresh_step(::Union{_MaterializeStep,_GatherStep,_MatMulStep,
                              _ConcatenateStep,_FillConstructorStep,
@@ -149,6 +151,18 @@ function _static_type(f, argtypes...)
 end
 
 _nonalloc_slot(::Type{T}) where {T} = Ref{Union{Nothing,T}}(nothing)
+
+# `_LaneGather` returns a view for ordinary execution. Its non-allocating
+# destination must instead own storage: caching that view would make the next
+# call write through it into the caller's input. Keep a concrete vector slot
+# for the extension's elementwise gather, even though the ordinary result type
+# is a SubArray.
+_nonalloc_slot(op, ::Type{T}) where {T} = _nonalloc_slot(T)
+function _nonalloc_slot(::_LaneGather, ::Type{T}) where {T<:AbstractVector}
+    E = eltype(T)
+    isconcretetype(E) ? Ref(Vector{E}()) : nothing
+end
+_nonalloc_slot(::_LaneGather, ::Type) = nothing
 
 # Identity-preserving wrappers that are cheaper to rebuild inline than to
 # cache: caching them buys no buffer reuse and may force conversion copies.
@@ -734,8 +748,10 @@ function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
     # wrapper result never forces a `convert` copy into the declared port type.
     T = _static_type(op, argtypes...)
     slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
-    if _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes)
-        j = _step!(prog, op, _nonalloc_slot(slot_type))
+    slot = _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes) ?
+           _nonalloc_slot(op, slot_type) : nothing
+    if slot !== nothing
+        j = _step!(prog, op, slot)
         push!(newbody.args, Expr(:(=), lhs, _step_call(j, callargs...)))
     else
         j = _step!(prog, op, nothing)
@@ -756,8 +772,10 @@ function _nonalloc_rewrite_nested(prog::_StepProgram, p::Plan, node)
         if slot !== nothing && 1 <= slot <= length(p.recipes)
             r = p.recipes[slot]
             out = only(r.outputs)
-            if _nonalloc_destination(prog.cache_apply, r.op, valtype(out), nothing)
-                j = _step!(prog, r.op, _cache_slot(out))
+            slot = _nonalloc_destination(prog.cache_apply, r.op,
+                valtype(out), nothing) ? _nonalloc_slot(r.op, valtype(out)) : nothing
+            if slot !== nothing
+                j = _step!(prog, r.op, slot)
                 return _step_call(j, rewritten.args[2:end]...)
             end
             j = _step!(prog, r.op, nothing)

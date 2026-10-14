@@ -415,10 +415,12 @@ end
         filled = MutatingFunctions.apply!!(fill_cache, gather, solo, [9, 9])
         @test filled === fill_cache
         @test filled == [7.0, 7.0]
-        # Shape mismatches fall back to the twin call and reseed.
+        # A lane-count change resizes the owned destination.
         wrong = Vector{Float64}(undef, 1)
-        @test MutatingFunctions.apply!!(wrong, gather, x, lanes) == x[lanes]
-        @test MutatingFunctions.apply!!(wrong, gather, solo, [9, 9]) == [7.0, 7.0]
+        @test MutatingFunctions.apply!!(wrong, gather, x, lanes) === wrong
+        @test wrong == x[lanes]
+        @test MutatingFunctions.apply!!(wrong, gather, solo, [9, 9]) === wrong
+        @test wrong == [7.0, 7.0]
         # The twin's errors survive the rule unchanged.
         @test_throws DimensionMismatch MutatingFunctions.apply!!(
             cache, gather, [1.0, 2.0], lanes)
@@ -448,6 +450,19 @@ end
                                   bound = (; y))
         @test any(op -> op isa ReactiveKernels._LaneGather, k.ops)
         @test k(x) ≈ reference
+        # The ordinary gather returns a view; the non-allocating cache must
+        # never retain that view and overwrite the caller's input on reuse.
+        original = copy(x)
+        @test k(x) ≈ reference
+        @test x == original
+        changed = reverse(copy(x))
+        changed_original = copy(changed)
+        changed_reference = sum(yi > 0 ? log(xi * yi) : xi - 1.0
+                                for (xi, yi) in zip(changed, y))
+        @test k(changed) ≈ changed_reference
+        @test changed == changed_original
+        @test k(x) ≈ reference
+        @test x == original
         allocated = kernel_allocations(k, x)
         println("NONALLOCATING_ALLOC_BYTES\tlane_gather\t", allocated)
         @test allocated == 0
