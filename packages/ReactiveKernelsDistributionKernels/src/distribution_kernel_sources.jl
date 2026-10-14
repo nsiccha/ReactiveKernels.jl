@@ -181,6 +181,8 @@ export WEIBULL_KERNEL_SOURCE
 export bernoulli, lognormal, exponential, geometric, uniform, mvnormal, ar1
 export product_mixture_logdensity, bernoulli_product_mixture_logdensity
 export binomial_product_mixture_logdensity
+export bernoulli_logit_product_mixture_logdensity
+export binomial_logit_product_mixture_logdensity
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
@@ -1273,6 +1275,43 @@ end
     components = plate(1:size(checked_probabilities, 2)) do k
         cells = plate(1:length(observed)) do i
             binomial(checked_trials[i, k], checked_probabilities[i, k]).logpdf(observed[i])
+        end
+        sum(cells)
+    end
+    return product_mixture_logdensity(components, weights)
+end
+
+# Logit-scale versions: `logits[i, k]` is component k's log-odds at position i.
+# Each cell reads the scalar law's logit HAVE route, so a saturated
+# probability keeps its log-space tail. Passing `logistic(eta)` to the
+# probability laws above instead rounds the probability first, and
+# `log1p(-p)` then loses the tail (it is -Inf from about eta = 37). A
+# structural-zero component uses logit -Inf (probability 0); +Inf is
+# probability 1.
+@kernel bernoulli_logit_product_mixture_logdensity(observed::Vector{Bool},
+        logits::Matrix{Float64}, weights::Vector{Float64}) = begin
+    checked_logits = size(logits, 1) == length(observed) ?
+        logits : throw(DimensionMismatch("logit rows must match observations"))
+    components = plate(1:size(checked_logits, 2)) do k
+        cells = plate(1:length(observed)) do i
+            bernoulli(; logit = checked_logits[i, k]).logpdf(observed[i])
+        end
+        sum(cells)
+    end
+    return product_mixture_logdensity(components, weights)
+end
+
+@kernel binomial_logit_product_mixture_logdensity(observed::Vector{Int},
+        trials::Matrix{Int}, logits::Matrix{Float64},
+        weights::Vector{Float64}) = begin
+    checked_trials = size(trials) == size(logits) ?
+        trials : throw(DimensionMismatch("trial counts and logits must match"))
+    checked_logits = size(logits, 1) == length(observed) ?
+        logits : throw(DimensionMismatch("logit rows must match observations"))
+    components = plate(1:size(checked_logits, 2)) do k
+        cells = plate(1:length(observed)) do i
+            binomial(; n = checked_trials[i, k],
+                logit = checked_logits[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
