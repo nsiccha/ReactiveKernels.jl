@@ -158,6 +158,58 @@ end
     @test got ≈ want atol = 1e-12
 end
 
+@testset "complement values, reversed order" begin
+    prog = Meta.parse("""begin
+        mu1 ~ Normal(0.0, 2.0)
+        mu2 ~ Normal(0.0, 2.0)
+        sigma1 ~ Exponential(1.0)
+        sigma2 ~ Exponential(1.0)
+        theta ~ Beta(5.0, 5.0)
+        y .~ MixtureModel.(vcat.(Normal.(mu1, sigma1), Normal.(mu2, sigma2)), Ref([1.0 - theta, theta]))
+    end""")
+    cols = Dict{Symbol,AbstractVector}(:y => [0.5, -1.0, 2.0])
+    bound, built, kern, lay = _mixc_query(prog, cols)
+    q = (; mu1 = 0.0, mu2 = 1.0, sigma1 = 1.0, sigma2 = 2.0, theta = 0.4)
+    got = _mixc_posterior(kern, lay, q)
+    want = logpdf(Normal(0, 2), 0.0) + logpdf(Normal(0, 2), 1.0) +
+           logpdf(Exponential(1), 1.0) + logpdf(Exponential(1), 2.0) +
+           logpdf(Beta(5, 5), 0.4) + log(2.0) + log(0.4) + log(0.6) +
+           sum(_mixc_lse(log(0.6) + logpdf(Normal(0, 1), y),
+               log(0.4) + logpdf(Normal(1, 2), y)) for y in cols[:y])
+    @test got ≈ want atol = 1e-12
+    _check_gradient(built.spec, bound, [0.3 * sin(1.7i) for i in 1:lay.total])
+end
+
+# `log`/`log1p` calls on the weight parameter, each flagged by whether it
+# sits inside a plate cell (a `do` block).
+function _mixc_weight_logs!(found, ex, param::Symbol, incell::Bool = false)
+    ex isa Expr || return found
+    if ex.head === :call && length(ex.args) == 2 &&
+            (ex.args[1], ex.args[2]) in ((:log, param), (:log1p, :(-$param)))
+        push!(found, ex => incell)
+    end
+    foreach(a -> _mixc_weight_logs!(found, a, param, incell || ex.head === :do), ex.args)
+    return found
+end
+
+@testset "complement log weights are shared by every cell" begin
+    cols = Dict{Symbol,AbstractVector}(:y => [0.5, -1.0, 2.0])
+    for weights in ("[theta, 1 - theta]", "[1 - theta, theta]")
+        plan = lower_rkppl(Meta.parse("""begin
+            m1 ~ Normal(0, 2)
+            m2 ~ Normal(0, 2)
+            theta ~ Uniform(0, 1)
+            y .~ MixtureModel.(vcat.(Normal.(m1, 1), Normal.(m2, 1)), Ref($weights))
+        end"""), keys(cols); conditioned = keys(cols))
+        bound = bind_data(plan, cols)
+        found = _mixc_weight_logs!(Pair{Expr,Bool}[],
+            ReactiveKernelsPPL.kernel_expr(bound, assign_layout(bound)), :theta)
+        @test (:(log(theta)) => false) in found
+        @test (:(log1p(-theta)) => false) in found
+        @test !any(last, found)
+    end
+end
+
 @testset "complement Enzyme-vs-findiff" begin
     prog = Meta.parse("""begin
         mu1 ~ Normal(0.0, 2.0)
