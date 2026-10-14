@@ -1576,6 +1576,12 @@ end
 @inline _plate_cells(cells::CartesianIndices{1}) =
     Base.Generator(CartesianIndex, only(cells.indices))
 @inline _plate_cells(cells::CartesianIndices) = cells
+# The `@simd` iteration space of a pure total-only plate (see
+# `_lower_authored_plate_cells_native!`): one axis is its own indexable range,
+# several are their `CartesianIndices`. The loop body rebuilds the cell index
+# with `CartesianIndex`, which accepts either element.
+@inline _plate_simd_cells(axes::Tuple{Any}) = only(axes)
+@inline _plate_simd_cells(axes::Tuple) = CartesianIndices(axes)
 
 # The cell positions whose gather index `first_index + position - 1` lies in
 # `source`'s range, as `lo:hi` within `1:n` (empty when none do).
