@@ -39,8 +39,9 @@ function verify(k,q,ref)
 end
 @testset "index runs: binding, native semantics and Reverse" begin
     cache=PreparationCache();q=[.1,-.4,.3]
+    # Mean runs 0, 1, 2, 16, 6.5 and 64 around the policy threshold of 8.
     shapes=(Int[],[1],repeat([1,2,3],inner=2),repeat([1,2,3],inner=16),
-        [fill(2,32);1;3;fill(1,23)],repeat([3,1],inner=64))
+        [fill(2,16);1;3;fill(1,7)],repeat([3,1],inner=64))
     kernels=Any[];references=Any[];sources=Dict{Bool,Any}();asts=Dict{Bool,Expr}()
     for (idx,enabled) in zip(shapes,(false,false,false,true,false,true))
         x=[sin(i/3)/2 for i in eachindex(idx)]
