@@ -58,8 +58,8 @@ end
 # observation instead of O(length(A)) per vector. The observation reads `A`
 # and `B` in place as shared values; its plate value is only the column `j`,
 # returned by `_ppl_categorical_column` once the vector is checked. That check
-# uses the column sums and sign of `A`, which `_ppl_categorical_columns` reads
-# once: it depends on `A` only, so a plate hoists it out of its cells.
+# uses the column sums and sign of `A` (`_ppl_categorical_columns`), which
+# read `A` only: a plate invariant.
 _ppl_categorical_columns(A::AbstractMatrix) =
     (vec(sum(A; dims=1)), all(a -> a >= zero(a), A))
 _ppl_categorical_columns(A) = nothing
