@@ -580,3 +580,62 @@ end
     @test value ≈ sum(-0.5 .* z .^ 2 .- log_sigma)
     @test gradient ≈ sum(z .^ 2 .- 1)
 end
+
+# A zipped plate argument declared as a number is the same in every cell, so
+# its cell subexpressions run once per call, as for a `Ref` operand.
+@kernel _scalar_arg_inline(t, dose, log_k::Float64) = begin
+    cells = plate(t, dose, log_k) do t, dose, lk
+        _shared_decay(t, dose, _counted_exp(lk))
+    end
+    return cells
+end
+@kernel _scalar_arg_local(t, dose, a) = begin
+    log_k::Float64 = 2a
+    cells = plate(t, dose, log_k) do t, dose, lk
+        _shared_decay(t, dose, _counted_exp(lk))
+    end
+    return cells
+end
+@kernel _scalar_arg_lazy(x, k::Float64) = begin
+    cells = plate(x, k) do xi, ki
+        xi > 0 ? xi * _counted_exp(ki) : -xi
+    end
+    return cells
+end
+@kernel _scalar_arg_density(y, mu::Float64, log_sigma::Float64) = begin
+    cells = plate(y, mu, log_sigma) do yi, m, ls
+        -0.5 * ((yi - m) / exp(ls))^2 - ls
+    end
+    total = sum(cells)
+    return total
+end
+
+@testset "subexpressions of a number-typed plate argument run once per call" begin
+    t = [[0.5, 1.5], Float64[], [0.7, 1.1, 2.0]]
+    dose = [1.0, 2.0, 1.5]
+    for (spec, arg, log_k) in ((_scalar_arg_inline, 0.3, 0.3),
+                               (_scalar_arg_local, 0.15, 2 * 0.15))
+        k = prepare(spec)
+        _SHARED_CALLS[] = 0
+        @test k(t, dose, arg) == [_shared_decay(ti, d, exp(log_k)) for (ti, d) in zip(t, dose)]
+        @test _SHARED_CALLS[] == 1
+        program = _closure_program(k)
+        @test findfirst("_counted_exp(", program).start < findfirst("for ", program).start
+    end
+    cell(spec) = only(r for r in plan(spec).recipes if recipe_kind(r) === :plate)
+    @test length(plate_body(cell(_scalar_arg_inline)).recipes) == 2
+
+    x = [1.0, -2.0, 3.0]
+    _SHARED_CALLS[] = 0
+    @test prepare(_scalar_arg_lazy)(x, 0.5) == [1.0, 2.0, 3.0] .* [exp(0.5), 1.0, exp(0.5)]
+    @test _SHARED_CALLS[] == 1
+
+    # Native Reverse through the lifted value of an active zipped argument.
+    y, mu, log_sigma = [0.5, -1.0, 2.0, 0.25], 0.2, 0.3
+    prepared = prepare_ad(prepare(_scalar_arg_density), AutoEnzyme(; mode = Enzyme.Reverse),
+                          y, mu, log_sigma; active = :log_sigma)
+    value, gradient = ad_value_and_gradient(prepared, y, mu, log_sigma)
+    z = (y .- mu) ./ exp(log_sigma)
+    @test value ≈ sum(-0.5 .* z .^ 2 .- log_sigma)
+    @test gradient ≈ sum(z .^ 2 .- 1)
+end

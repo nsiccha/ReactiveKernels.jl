@@ -7138,7 +7138,8 @@ end
 # law observes it (`y .~ LogDensity.(f, mu)` too).
 function _scalar_responses_as_observations!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
-    observed = Symbol[p.name for p in plan.external_observations]
+    # An undotted caller-owned observation reads its value whole.
+    observed = Symbol[p.name for p in plan.external_observations if p.args.broadcast]
     for r in plan.responses
         push!(observed, r.response, r.count_columns..., r.extra_responses...)
     end
