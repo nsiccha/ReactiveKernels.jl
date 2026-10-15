@@ -73,6 +73,7 @@ const _MATRIX_CORE_TESTS = (
     "test_native_type_queries.jl",
     "test_native_exemplar_rank.jl",
     "test_type_stability.jl",
+    "test_value_metadata.jl",
     "test_nested_source_inference.jl",
     "test_authored_scan.jl",
     "test_scan_terminal_minima.jl",

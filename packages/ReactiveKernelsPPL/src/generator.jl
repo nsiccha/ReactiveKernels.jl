@@ -168,30 +168,48 @@ _same_program(x::Array, y::Array) = typeof(x) === typeof(y) &&
 
 # The source surface admits ordinary dotted scalar math, but an opaque array
 # assignment hides each producer from RK's plate-to-plate reduction fusion.
-# Restrict this emission to one-based Float64 or built-in integer vectors with
-# a known common length and their scalar operands. Every operand is read once;
-# the listed scalar operations and broadcast axes match the dotted tree.
-# Other ranks, axes and callable leaves retain their exact authored expression.
+# OutputSignatures proves the ordinary scalar/vector operations and broadcast
+# axes; PPL separately tracks sampled-value dependence. Every operand is read
+# once. Other ranks, axes and callable leaves keep their authored expression.
 const _POINTWISE_ARITHMETIC = Dict(Symbol(".+") => :+, Symbol(".-") => :-,
     Symbol(".*") => :*, Symbol("./") => :/, Symbol(".^") => :^)
 
 struct _PointwiseValue
-    rank::Int                         # -1 unknown, 0 scalar, 1 vector
-    length::Int                       # known vector length, else 0
+    info::ReactiveKernels.OutputSignatures.ValueInfo
     live::Bool                        # reads a sampled value
 end
-const _POINTWISE_UNKNOWN = _PointwiseValue(-1, 0, false)
+const _OS = ReactiveKernels.OutputSignatures
+const _POINTWISE_UNKNOWN = _PointwiseValue(_OS.ValueInfo(), false)
+
+_pointwise_live(ex, values) = ex isa Symbol ?
+    get(values, ex, _POINTWISE_UNKNOWN).live :
+    ex isa Expr && any(a -> _pointwise_live(a, values), ex.args)
+_pointwise_unknown(ex, values) = _PointwiseValue(_OS.ValueInfo(), _pointwise_live(ex, values))
+
+_pointwise_vector(state::_PointwiseValue) = _OS.value_rank(state.info) === 1
+function _pointwise_known(state::_PointwiseValue)
+    _OS.value_rank(state.info) === 0 && return true
+    _pointwise_vector(state) || return false
+    ax = _OS.value_axes(state.info)
+    return ax !== nothing && only(ax) isa Base.OneTo
+end
+
+function _pointwise_call(ex, states, bound_names)
+    info = ReactiveKernels._call_value_info(ex,
+        _OS.ValueInfo[s.info for s in states], @__MODULE__, bound_names)
+    return _PointwiseValue(info, any(s.live for s in states))
+end
 
 function _pointwise_leaf(ex, values::Dict{Symbol,_PointwiseValue})
     ex isa Symbol && return get(values, ex, _POINTWISE_UNKNOWN)
-    ex isa Float64 && return _PointwiseValue(0, 0, false)
-    ex isa Integer && return _PointwiseValue(0, 0, false)
+    ex isa Number && return _PointwiseValue(_OS.known_info(ex), false)
     if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
             ex.args[2] isa Integer
         base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
-        base.rank == 1 && return _PointwiseValue(0, 0, base.live)
+        return _pointwise_call(ex,
+            [base, _PointwiseValue(_OS.known_info(ex.args[2]), false)], keys(values))
     end
-    return _POINTWISE_UNKNOWN
+    return _pointwise_unknown(ex, values)
 end
 
 # A concatenated numeric value may subsequently be gathered by observation
@@ -199,17 +217,17 @@ end
 # concatenation itself remains the authored Julia call and runs once.
 function _pointwise_concat_part(ex, values, bound_names)
     state = _pointwise_leaf(ex, values)
-    state.rank >= 0 && return state
-    Meta.isexpr(ex, :call) && !isempty(ex.args) || return _POINTWISE_UNKNOWN
+    _pointwise_known(state) && return state
+    Meta.isexpr(ex, :call) && !isempty(ex.args) || return state
     fn = ex.args[1]
     if fn === :sum && :sum ∉ bound_names && length(ex.args) == 2
         part = _pointwise_concat_part(ex.args[2], values, bound_names)
-        part.rank == 1 && return _PointwiseValue(0, 0, part.live)
+        return _pointwise_call(ex, [part], bound_names)
     elseif fn in (:+, :-) && length(ex.args) == 2
         part = _pointwise_concat_part(ex.args[2], values, bound_names)
-        part.rank == 0 && return part
+        return _pointwise_call(ex, [part], bound_names)
     end
-    return _POINTWISE_UNKNOWN
+    return _pointwise_unknown(ex, values)
 end
 
 function _pointwise_concat_state(rhs, values, bound_names)
@@ -219,21 +237,20 @@ function _pointwise_concat_state(rhs, values, bound_names)
         getglobal(fn.mod, fn.name) === Base.vcat
     is_base_vcat || return _POINTWISE_UNKNOWN
     parts = [_pointwise_concat_part(a, values, bound_names) for a in rhs.args[2:end]]
-    all(p -> p.rank >= 0, parts) || return _POINTWISE_UNKNOWN
-    return _PointwiseValue(1, sum(p -> p.rank == 0 ? 1 : p.length, parts),
-        any(p.live for p in parts))
+    return _pointwise_call(rhs, parts, bound_names)
 end
 
-function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
+function _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_names)
     if ex isa Symbol && haskey(gathers, ex)
-        return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers)
+        return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers, bound_names)
     end
     if Meta.isexpr(ex, :., 2) && ex.args[1] === :exp &&
             Meta.isexpr(ex.args[2], :tuple, 1)
         term, state = _pointwise_tree!(inputs, formals, only(ex.args[2].args),
-            values, columns, gathers)
-        state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
-        return Expr(:call, :exp, term), state
+            values, columns, gathers, bound_names)
+        result = _pointwise_call(ex, [state], bound_names)
+        _pointwise_known(result) || return nothing, result
+        return Expr(:call, :exp, term), result
     end
     if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
             haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
@@ -241,35 +258,34 @@ function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
         terms = Any[]
         states = _PointwiseValue[]
         for a in ex.args[2:end]
-            term, state = _pointwise_tree!(inputs, formals, a, values, columns, gathers)
-            state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
+            term, state = _pointwise_tree!(inputs, formals, a, values, columns, gathers, bound_names)
+            _pointwise_known(state) || return nothing, state
             push!(terms, term)
             push!(states, state)
         end
-        lens = unique!([s.length for s in states if s.rank == 1])
-        length(lens) <= 1 || return nothing, _POINTWISE_UNKNOWN
-        rank = isempty(lens) ? 0 : 1
+        result = _pointwise_call(ex, states, bound_names)
+        _pointwise_known(result) || return nothing, result
         return Expr(:call, _POINTWISE_ARITHMETIC[ex.args[1]], terms...),
-            _PointwiseValue(rank, rank == 1 ? only(lens) : 0,
-                any(s.live for s in states))
+            result
     end
     leaf, state = if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
             ex.args[2] isa Symbol
         base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
         idx = get(columns, ex.args[2], nothing)
-        if base.rank == 1 &&
+        if _pointwise_vector(base) &&
                 idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
                 axes(idx, 1) == Base.OneTo(length(idx))
             # This arithmetic cell reads scalar entries from the borrowed view.
             :(ReactiveKernels._readonly_gather($(ex.args...))),
-                _PointwiseValue(1, length(idx), base.live)
+                _pointwise_call(ex,
+                    [base, _PointwiseValue(_OS.value_info(idx), false)], bound_names)
         else
-            ex, _POINTWISE_UNKNOWN
+            ex, _pointwise_unknown(ex, values)
         end
     else
         ex, _pointwise_leaf(ex, values)
     end
-    state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
+    _pointwise_known(state) || return nothing, state
     leaf isa Number && return leaf, state
     i = findfirst(x -> isequal(x, leaf), inputs)
     if i === nothing
@@ -280,10 +296,13 @@ function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
     return formals[i], state
 end
 
-function _pointwise_rhs(ex, values, columns, gathers)
+function _pointwise_rhs(ex, values, columns, gathers, bound_names)
     inputs, formals = Any[], Symbol[]
-    body, state = _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
-    state.rank == 1 && state.live || return ex, state
+    body, state = _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_names)
+    # A failed numerical query may have stopped before visiting a live operand.
+    # Dependence follows the whole source expression independently of shape.
+    state = _PointwiseValue(state.info, _pointwise_live(ex, values))
+    _pointwise_vector(state) && state.live && _pointwise_known(state) || return ex, state
     plate = Expr(:do, Expr(:call, :plate, inputs...),
         Expr(:->, Expr(:tuple, formals...), Expr(:block, body)))
     named = _name_plate_cell(plate, (_, input) -> input isa Symbol ? input :
@@ -361,12 +380,7 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
     gathers = Dict{Symbol,Expr}()
     gather_stmts = Dict{Symbol,Expr}()
     for (name, value) in plan.columns
-        if value isa Vector{<:Union{Float64,Base.BitInteger,Bool}} &&
-                axes(value, 1) == Base.OneTo(length(value))
-            values[name] = _PointwiseValue(1, length(value), false)
-        elseif value isa Float64 || value isa Integer
-            values[name] = _PointwiseValue(0, 0, false)
-        end
+        values[name] = _PointwiseValue(_OS.value_info(value), false)
     end
     for st in stmts
         Meta.isexpr(st, :(=), 2) || continue
@@ -375,15 +389,17 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         name isa Symbol || continue
         declared = Meta.isexpr(lhs, :(::), 2) ? lhs.args[2] : nothing
         if declared === :Float64
-            values[name] = _PointwiseValue(0, 0, true)
+            values[name] = _PointwiseValue(_OS.scalar_info(Float64), true)
             continue
         elseif Meta.isexpr(declared, :curly) &&
                 declared.args == Any[:AbstractVector, :Float64]
             dims = _value_axes(plan, name; data_axes = true)
             if dims !== nothing && length(dims) == 1 && only(dims) isa Int
-                values[name] = _PointwiseValue(1, only(dims), true)
+                values[name] = _PointwiseValue(_OS.vector_info(Float64, only(dims);
+                    container_type = AbstractVector{Float64}), true)
             else
-                delete!(values, name)
+                values[name] = _PointwiseValue(_OS.vector_info(Float64;
+                    container_type = AbstractVector{Float64}), true)
             end
             continue
         end
@@ -391,30 +407,28 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
                 rhs.args[1] isa Symbol && rhs.args[2] isa Symbol
             base = get(values, rhs.args[1], _POINTWISE_UNKNOWN)
             idx = get(plan.columns, rhs.args[2], nothing)
-            if base.rank == 1 &&
+            state = idx === nothing ? _POINTWISE_UNKNOWN : _pointwise_call(rhs,
+                [base, _PointwiseValue(_OS.value_info(idx), false)], bound_names)
+            if _pointwise_vector(state) && _pointwise_known(state) &&
                     idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
                     axes(idx, 1) == Base.OneTo(length(idx))
                 # Recognition is transactional: substitute inside arithmetic
                 # only when the entire consumer lowers to a typed plate.
                 gathers[name] = rhs
                 gather_stmts[name] = st
-                values[name] = _PointwiseValue(1, length(idx), base.live)
+                values[name] = state
                 continue
             end
         end
         concat = _pointwise_concat_state(rhs, values, bound_names)
-        if concat.rank == 1
+        if _pointwise_vector(concat) && _pointwise_known(concat)
             values[name] = concat
             continue
         end
         if Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
                 haskey(_POINTWISE_ARITHMETIC, rhs.args[1])
-            candidate, state = _pointwise_rhs(rhs, values, plan.columns, gathers)
-            if state.rank >= 0
-                values[name] = state
-            else
-                delete!(values, name)
-            end
+            candidate, state = _pointwise_rhs(rhs, values, plan.columns, gathers, bound_names)
+            values[name] = state
             st.args[2] = candidate
         elseif rhs isa Symbol && haskey(values, rhs)
             values[name] = values[rhs]
@@ -422,7 +436,7 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
             # A scalar coordinate remains a shared plate input. Its ordinary
             # indexed read retains the original bounds check.
             state = _pointwise_concat_part(rhs, values, bound_names)
-            state.rank >= 0 ? (values[name] = state) : delete!(values, name)
+            values[name] = state
         end
     end
     for (name, rhs) in gathers

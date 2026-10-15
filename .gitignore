@@ -4,3 +4,4 @@
 /scratchpad_gist.md
 *.cov
 /docs/build/
+.rk-deps/
