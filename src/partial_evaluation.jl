@@ -972,7 +972,7 @@ end
 _plate_branch_anchor(operation) = nothing
 function _plate_branch_anchor(operation::_KernelSourceOp{D,F,N,T}) where
         {D,F,N<:_KernelBranch,T<:_KernelBranch}
-    _KernelSourceOp(Val(D), Val(F), _plate_branch_anchor_metadata(operation.f),
+    _KernelSourceOp(Val(kernel_sourceop_token(operation)), Val(F), _plate_branch_anchor_metadata(operation.f),
         _plate_branch_anchor_metadata(operation.tensor_f), operation.ignored_throws)
 end
 function _plate_branch_anchor_metadata(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
