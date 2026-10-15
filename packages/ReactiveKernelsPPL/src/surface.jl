@@ -662,6 +662,10 @@ function _conditioned_declarations(ast, names)
         # broadcast response, its observed value keeps its observation axis
         # instead of becoming an internal conditioned-parameter input.
         _is_glm_call(last(st.args)) && continue
+        # A caller-owned law observing a definition reads that value, so the
+        # definition is never a conditioned input (`_partition_statements`).
+        _is_sample(st) && lhs isa Symbol && haskey(definitions, lhs) &&
+            _external_rhs(last(st.args)) && continue
         # A positional slice of an observed stream remains a response.
         # Sized level/matrix axes and matrix declarations retain array metadata.
         array = lhs isa Expr && ((lhs.head === :ref &&
@@ -953,6 +957,10 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     end
     sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
         _partition_statements(ast, data; array_entries)
+    # Definitions a caller-owned law observes as one whole event with an
+    # undotted `~` (`_partition_statements`): observations, never parameters.
+    whole_observed = Set{Symbol}(s.lhs for s in sample if !s.broadcast &&
+        s.dims === nothing && any(p -> first(p) === s.lhs, det))
     sample, det = _rewrite_plate_rows(sample, det)
     # Latent plates over values read their cell count as bound data.
     extents = Set{Symbol}(_plate_extent_input(nm) for (nm, rhs, _, _) in plate_specs
@@ -1016,14 +1024,14 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # name table (mixture/coef-prior/param positions keep treating them
     # as data) and skipped by parameter lowering.
     derived_response_names = Set{Symbol}(s.lhs for s in sample
-        if s.broadcast && s.levels === nothing && s.matrix === nothing &&
-            s.lhs ∉ data && s.lhs in detnames_all)
+        if (s.broadcast || s.lhs in whole_observed) && s.levels === nothing &&
+            s.matrix === nothing && s.lhs ∉ data && s.lhs in detnames_all)
     sampled_names = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     prior_names = setdiff(sampled_names, derived_response_names)
     # Declarations determine value/prior semantics. Affine recognition
     # may use these values regardless of their prior or other readers.
     ordinary_parameters = Set{Symbol}(s.lhs for s in sample
-        if s.lhs ∉ data && _ordinary_sampling(s))
+        if s.lhs ∉ data && s.lhs ∉ whole_observed && _ordinary_sampling(s))
     scalar_parameters = Set{Symbol}(s.lhs for s in sample
         if s.lhs in ordinary_parameters && !s.broadcast &&
             s.dims === nothing)
@@ -1132,9 +1140,11 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # prove: an undotted module call's result is model-level here
     # (`y = f(raw)`). `bind_data` evaluates the definition once and
     # validates its value as the response; a number is one observation, as
-    # when bound as data.
+    # when bound as data. An ordinary `hcat` matrix value
+    # (`_route_hcat_values`) is observed as the same matrix bound as data.
     for nm in derived_response_names
-        get(detshape, nm, nothing) === :scalar || continue
+        shape = get(detshape, nm, nothing)
+        shape === :scalar || (shape === :matrix && nm in matrix_values) || continue
         rhs = detmap[nm]
         !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
             (detshape[nm] = :vector)
@@ -1244,6 +1254,15 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
                 s.range === nothing ? s.lhs : s.range
             args = merge(args, (; observation))
             push!(external_observations, SampledParameter(s.lhs, :external, args, nothing, s.lhs))
+            continue
+        end
+        if s.lhs in whole_observed
+            # One whole-event density of the definition's value; a
+            # data-only value binds once (`_derived_response_names`).
+            args = _external_parameter(s.lhs, s.rhs, (), mod, ctx.taken;
+                observed=true, broadcast=false)
+            push!(external_observations, SampledParameter(s.lhs, :external,
+                merge(args, (; observation = s.lhs)), nothing, s.lhs))
             continue
         end
         if s.broadcast
@@ -1813,7 +1832,8 @@ end
 # Shape inference + canonicalization (data-free, Julia-truthful). Shapes:
 # data columns are vectors, sampled/det names resolve by position and memo,
 # dotted forms follow their operands' observation axis or model-level
-# provenance, reductions are scalars, `hcat` is a matrix,
+# provenance, reductions are scalars, `hcat` is a matrix (rows per
+# observation when a column has them, else a model-level array),
 # undotted scalar-array combinations follow Julia exactly (`2*v`, `v*2`,
 # `v/2`, `-v` are vectors; `a+x`, `x*z`, `s/x`, `x^2`, `x>1`, `log(x)`
 # are `:invalid` — Julia `MethodError`s, reported with the dotted fix).
@@ -1853,7 +1873,10 @@ function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
         env::_ShapeEnv = _NO_SHAPE_ENV)
     ex isa Symbol ||
         return _shape_of_expr(ex, data, detmap, memo, active, env)
-    ex in env.matrices && return :matrix
+    # A matrix value still in the definition table takes its definition's
+    # shape (`Wm = hcat(w1, w2)` is model-level); one that left it as data
+    # keeps its rows.
+    ex in env.matrices && !haskey(detmap, ex) && return :matrix
     ex in data && return ex in env.values ? :scalar : :vector
     haskey(detmap, ex) || return get(memo, ex, :scalar)
     haskey(memo, ex) && return memo[ex]
@@ -1915,7 +1938,17 @@ function _shape_of_expr(ex, data, detmap, memo, active,
                 (Base.eachindex, Base.axes, getfield(Base, :(:))))
         index_iterator && return :vector
     end
-    fn === GlobalRef(Base, :hcat) && return length(ex.args) > 1 ? :matrix : :array
+    if fn === GlobalRef(Base, :hcat)
+        length(ex.args) > 1 || return :array
+        # Its rows are observations exactly when a column's are. Columns
+        # of model-level values (declared arrays, scalars, whole data,
+        # module results) make a model-level array, as a declared matrix
+        # is: `u * hcat(w1, w2)` and `exp.(hcat(w1, w2))` keep their
+        # `u * W` and `exp.(W)` shapes.
+        argshapes = [shape(a) for a in ex.args[2:end]]
+        :invalid in argshapes && return :invalid
+        return any(in((:vector, :matrix)), argshapes) ? :matrix : :array
+    end
     fn isa GlobalRef && fn.mod === (@__MODULE__) && fn.name === :_bound_array_value &&
         return :array
     fn isa Symbol || return :scalar  # module/anonymous calls: model-level
@@ -2477,6 +2510,20 @@ _builtin_dotted_head(f::Symbol) =
 # the vocabulary's own binding — the one undotted `var(x)` means.
 _vocabulary_ref(f::Symbol) = GlobalRef(PPLGeneratedModels, f)
 
+# A built-in reduction's whole-column reading is its one-argument form
+# (`sum(x)`, `mean(z)`). Any other call — keywords (`sum(x; dims = 2)`,
+# `std(x; corrected = false)`) or a function argument (`sum(abs2, x)`) — is
+# Julia's own function, exactly as the qualified `Base.sum(x; dims = 2)`:
+# a module call over whole values.
+_julia_reduction_call(fn, args) = fn isa Symbol && fn in REDUCTION_FNS &&
+    !(length(args) == 1 && !Meta.isexpr(args[1], (:parameters, :kw)))
+
+# The function the bare reduction names (`Base.sum`, `Statistics.mean`).
+function _julia_reduction_ref(fn::Symbol)
+    f = getfield(@__MODULE__, fn)
+    return GlobalRef(parentmodule(f), nameof(f))
+end
+
 function _resolve_module_path(ex, mod::Module, where)
     m = if ex isa Symbol
         isdefined(mod, ex) ? getfield(mod, ex) : nothing
@@ -2688,9 +2735,12 @@ const _BINDING_VALUE_HEADS = (:comprehension, :generator, :->, :do, :let)
 
 function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
         values::Bool = true)
-    ex in (:pi, :π) && ex ∉ names && return Float64(pi)
-    ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
-    ex isa Symbol && return values ? _resolve_value_name(ex, mod, names) : ex
+    # Names only: an interpolated `missing` value compares as `missing`.
+    if ex isa Symbol
+        ex in (:pi, :π) && ex ∉ names && return Float64(pi)
+        ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
+        return values ? _resolve_value_name(ex, mod, names) : ex
+    end
     ex isa Expr || return ex
     ex.head === :quote && return ex
     recur(a) = _resolve_module_calls(a, mod, names, where;
@@ -2729,7 +2779,9 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
         return Expr(:call, ex.args[1], Expr(:tuple, resolved...), ex.args[3:end]...)
     end
     if ex.head === :call && !isempty(ex.args)
-        head = _resolve_call_head(ex.args[1], mod, names, where)
+        head = _julia_reduction_call(ex.args[1], ex.args[2:end]) ?
+            _julia_reduction_ref(ex.args[1]) :
+            _resolve_call_head(ex.args[1], mod, names, where)
         args = Any[recur(a) for a in ex.args[2:end]]
         if head isa GlobalRef || _constructed_endpoint_head(head)
             args = Any[_resolve_function_arg(a, mod, names, where)
@@ -2818,6 +2870,8 @@ _rhs_head_symbol(fn) = nothing
 function _module_call(ex)
     dotted = _is_dotted_call(ex)
     dotted || Meta.isexpr(ex, :call) && !isempty(ex.args) || return false
+    !dotted && _julia_reduction_call(ex.args[1], ex.args[2:end]) &&
+        return true
     return _module_call_head(ex.args[1], dotted)
 end
 _module_call_head(fn::GlobalRef, dotted) = fn.mod !== PPLGeneratedModels
@@ -3230,6 +3284,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
     # Definitions observed by a `.~` response (derived responses —
     # either statement order; the double-observation guard).
     derived_observed = Set{Symbol}()
+    # Definitions a caller-owned law observes whole with an undotted `~`.
+    whole_observed = Set{Symbol}()
     factored = Set{Symbol}()
     seen_doc = false
     line = 0
@@ -3378,8 +3434,23 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
             lhs, rng, levs, mat = _sample_lhs(st.args[2], bc, tilde,
                 derived_range ? union(data, (st.args[2].args[1],)) : data,
                 level_bindings)
+            if !bc && st.args[2] isa Symbol && lhs in detnames && lhs ∉ data &&
+                    _external_rhs(st.args[3])
+                # A caller-owned law observes a definition as one whole
+                # event (`ys = log.(raw); ys ~ LogDensity(f, m)`), exactly as
+                # it observes the same value bound as data; `.~` broadcasts
+                # the same law over the value's entries instead.
+                (lhs in derived_observed || lhs in factored) && _sfail(
+                    "$lhs is already observed (one observation per definition)")
+                lhs in seen || _claim!(seen, seelines, lhs, line)
+                push!(derived_observed, lhs)
+                push!(whole_observed, lhs)
+                _reject_target(st.args[3], lhs)
+                push!(sample, SampleStmt(lhs, st.args[3], false))
+                continue
+            end
             if !bc && st.args[2] isa Symbol && lhs in detnames && lhs ∉ data
-                lhs in factored && _sfail(
+                (lhs in factored || lhs in whole_observed) && _sfail(
                     "deterministic density factor $lhs is stated twice")
                 push!(factored, lhs)
                 _reject_target(st.args[3], lhs)
@@ -3698,6 +3769,9 @@ function _ordinary_hcat_values(sample, det, data, glms)
     for s in sample
         s.matrix in mats && push!(used, s.matrix)
         walk(s.rhs)
+        # An observed `hcat` definition is the matrix value it observes,
+        # read like the same matrix bound as data.
+        s.lhs in mats && push!(generic, s.lhs)
     end
     union!(generic, setdiff(mats, used))
     # The GLM reads these whole, as values.

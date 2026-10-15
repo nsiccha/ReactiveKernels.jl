@@ -158,8 +158,10 @@ end
         original = deepcopy(data)
         # The subject plate holds the child scan in its body in the built
         # graph, its printed-source replay, and once the data are bound. The
-        # second top-level plate is the observation plate.
+        # second top-level plate is the observation plate; preparation
+        # composes it into the subject plate, its sole producer.
         subject_structure = [(:plate, 0), (:scan, 1), (:plate, 0)]
+        prepared_structure = [(:plate, 0), (:scan, 1)]
         @test structure(built.spec) == subject_structure
         entries = recipe_inventory(built.spec)
         child = only(entry for entry in entries if entry.kind === :scan)
@@ -169,10 +171,10 @@ end
                     plate_body(subject.recipe).recipes) == 1
         replayed = ReactiveKernelsPPL._eval_kernel_def(kernel_expr(bound, built.layout))
         @test structure(replayed) == subject_structure
-        @test structure(prepare(replayed; bound=data)) == subject_structure
+        @test structure(prepare(replayed; bound=data)) == prepared_structure
         push!(counts, length(built.spec.graph.recipes))
         sampler = prepare_sampler(built, bound, [0.2]; backend=BACKEND)
-        @test structure(sampler.kernel) == subject_structure
+        @test structure(sampler.kernel) == prepared_structure
         for a in (0.2, -0.4)
             value = Base.invokelatest(sampler.kernel, [a])
             @test value ≈ subject_reference(data, a)

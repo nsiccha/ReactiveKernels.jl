@@ -152,6 +152,34 @@ function _index_run_replace(f,x)
     changed ? Expr(x.head,replaced...) : x
 end
 
+# The macro-expanded `@simd` loop of a pure total-only plate
+# (`_lower_authored_plate_cells_native!`): `let r = _plate_simd_cells(axes)`
+# around Base's SIMD loop, whose body block begins with
+# `index = CartesianIndex(linear)`. Returns `(axes, index, cellbody)`, the
+# cell body being the statements after that index, or `nothing`.
+function _index_run_simd_plate(ex)
+    ex isa Expr && ex.head===:let && length(ex.args)==2 || return nothing
+    binding=ex.args[1]
+    binding isa Expr && binding.head===:(=) && length(binding.args)==2 || return nothing
+    domain=binding.args[2]
+    _index_run_call(domain,GlobalRef(@__MODULE__,:_plate_simd_cells),1) || return nothing
+    cell=Ref{Any}(nothing)
+    _index_run_visit(ex.args[2]) do b
+        cell[]===nothing && b.head===:block || return
+        statements=Any[a for a in b.args if !(a isa LineNumberNode)]
+        isempty(statements) && return
+        first_statement=first(statements)
+        first_statement isa Expr && first_statement.head===:(=) &&
+            length(first_statement.args)==2 && first_statement.args[1] isa Symbol &&
+            _index_run_call(first_statement.args[2],GlobalRef(Base,:CartesianIndex),1) ||
+            return
+        cell[]=(first_statement.args[1],Expr(:block,statements[2:end]...))
+    end
+    cell[]===nothing && return nothing
+    index,cellbody=cell[]
+    (domain.args[2],index,cellbody)
+end
+
 # This local emitter transformation reads only compiler-owned operation identity
 # and generated data flow. It adds no operation slots, so native and tensorized
 # products retain identical tables. Tensorized execution keeps the original loop.
@@ -180,23 +208,16 @@ function _lower_index_runs_native(body::Expr,ops)
     isempty(projections) && return body
     rewritten=Ref(0)
     _index_run_replace(body) do ex
-        ex.head===:if && length(ex.args)==3 || return ex
-        # A previously grouped reduction has an inner conditional here. Only
-        # the original macro-expanded SIMD block is eligible, making this
-        # pass idempotent when an already lowered body is embedded again.
-        native=ex.args[2]
-        native isa Expr && native.head===:block || return ex
-        fallback=ex.args[3]
-        fallback isa Expr && fallback.head===:for || return ex
-        binding,cellbody=fallback.args
-        binding isa Expr && binding.head===:(=) || return ex
-        index,iteration=binding.args
-        index isa Symbol || return ex
-        _index_run_call(iteration,GlobalRef(@__MODULE__,:_plate_cells),1) || return ex
-        domain=iteration.args[2]
-        _index_run_call(domain,GlobalRef(Base,:CartesianIndices),1) || return ex
-        axes=domain.args[2];condition=ex.args[1]
-        condition==:(length($axes)==1) || return ex
+        # A previously grouped reduction keeps its flat loop in the `else` arm
+        # of its run conditional. Return that conditional as a fresh node,
+        # which stops the descent, so the pass is idempotent when an already
+        # lowered body is embedded again.
+        ex.head===:if && length(ex.args)==3 && ex.args[2] isa Expr &&
+            ex.args[2].head===:for && _index_run_simd_plate(ex.args[3])!==nothing &&
+            return Expr(:if,ex.args...)
+        plate=_index_run_simd_plate(ex)
+        plate===nothing && return ex
+        axes,index,cellbody=plate
         selected=Symbol[];additions=Expr[]
         _index_run_visit(cellbody) do cell
             if _index_run_call(cell,GlobalRef(Base.Broadcast,:_broadcast_getindex),2) &&
@@ -252,8 +273,11 @@ function _lower_index_runs_native(body::Expr,ops)
         # Authored array accesses remain under their original checks.
         runbody=Expr(:block,reads,grouped)
         runs=Expr(:for,Expr(:(=),run,:(eachindex(getfield($metadata,1)))),runbody)
-        guard=:(Base.only($axes)==Base.OneTo(getfield($metadata,3)) && $accumulator isa Number)
+        # Runs are vector positions, so only a one-axis plate is eligible;
+        # the axis count is a type property, so this test folds away.
+        guard=:(length($axes)==1 && Base.only($axes)==Base.OneTo(getfield($metadata,3)) &&
+            $accumulator isa Number)
         policy===nothing && (guard=:(getfield($metadata,4) && $guard))
-        Expr(:if,condition,Expr(:if,guard,runs,ex.args[2]),fallback)
+        Expr(:if,guard,runs,ex)
     end
 end
