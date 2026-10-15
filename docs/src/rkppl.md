@@ -686,6 +686,17 @@ meaning, named or inline: `E = exp.(u * hcat(w1, w2)); P = E ./ sum.(eachrow(E))
 normalizes each row. An `hcat` with an observation column, such as
 `hcat(ones(length(x)), x)`, has one row per observation.
 
+A value the model computes with one row per observation is the matrix of a
+product too, as in Julia. With `A[axes(x, 2), 1:J]`, `a1[1:J]`,
+`B[1:J, 1:K]` and `b1[1:K]` declared, the hidden layer
+`hidden = tanh.(a1' .+ x * A)` is N × J: the adjoint `a1'` is a 1 × J row
+that broadcasts against the N × J product. `v = b1' .+ hidden * B` then
+contracts the columns of `hidden` and keeps its rows. Named or inline, it has
+the density of the append-column spelling
+`hcat(ones(size(x, 1)), hidden) * vcat(b1', B)`, and a data-only elementwise
+matrix such as `X = x .- c` reads the same way in `X * b`. Julia checks the
+dimensions of a computed product where it computes it.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
 ```

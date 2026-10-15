@@ -3086,6 +3086,11 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
             return _collect_opaque_refs!(refs, ex, plan, label, bound)
         _is_data_matvec(ex, plan) &&
             return _collect_data_matvec!(refs, ex, plan, label, bound)
+        if _is_computed_row_product(ex, plan)
+            _collect_vector_refs!(refs, ex.args[2], plan, label, bound)
+            _collect_opaque_refs!(refs, ex.args[3], plan, label, bound)
+            return nothing
+        end
         if fn isa GlobalRef
             # An undotted module call inside a column expression is a
             # model-level subterm over whole values.
@@ -3118,6 +3123,12 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
                             "IR/contract growth")
     end
     head === :. && return _collect_vector_dot!(refs, ex, plan, label, bound)
+    if head === Symbol("'") && length(ex.args) == 1
+        # Julia's adjoint: `alpha1'` turns a model-level vector into a 1×J
+        # row that broadcasts against a per-observation N×J value.
+        _collect_vector_refs!(refs, ex.args[1], plan, label, bound)
+        return nothing
+    end
     if _is_observation_slice(plan, ex)
         # `P[:, 1]` keeps every row of a per-observation value: n_obs.
         _collect_vector_refs!(refs, ex.args[1], plan, label, bound)
