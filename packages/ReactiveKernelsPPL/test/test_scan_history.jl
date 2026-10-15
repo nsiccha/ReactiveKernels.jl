@@ -589,8 +589,7 @@ end
         @test _hist_scans(f.built.spec) == (T == 1 ? 0 : 1)
     end
 
-    # Capability gap: a `@scan` in a plate cell is deterministic (its seeds
-    # and steps are `=`); per-cell sampled recurrence draws are not built yet.
+    # Sampled seeds now use the ordinary packed cell-site layout.
     sampled = try
         lower_rkppl(quote
             s ~ Exponential(1)
@@ -609,7 +608,7 @@ end
         err isa SurfaceLoweringError || rethrow()
         nothing
     end
-    @test_broken sampled !== nothing
+    @test sampled !== nothing
 end
 
 @testset "scan columns: conditional densities read shared trajectories" begin

@@ -152,11 +152,10 @@ end
     check(fixture(:(W[1, 1] > -1.0 ? column_sums(W)[2] : column_sums(W)[20])); query=true)
     empty = fixture(:(column_sums(W)[20]); n=0)
     check(empty)
-    # Known RK limitation (0j2nqi0): materializing an empty plate still
-    # evaluates shared invariants. Its empty likelihood needs no cell work.
+    # The empty output query, like its likelihood, evaluates no cell work.
     read_empty = Base.invokelatest(prepare, empty.built.spec;
         have=(:unconstrained, keys(empty.data)...), want=:r, bound=empty.data)
-    @test_broken Base.invokelatest(read_empty, empty.p) == Float64[]
+    @test Base.invokelatest(read_empty, empty.p) == Float64[]
     # The same out-of-bounds arm must throw when it is selected.
     @test_throws BoundsError begin
         fx = fixture(:(x[i] < -1.0 ? column_sums(W)[2] : column_sums(W)[20]))

@@ -1,5 +1,6 @@
 using Pkg
 using UUIDs
+include(joinpath(@__DIR__, "..", "deps", "source_dependencies.jl"))
 
 const MUTATING_FUNCTIONS_URL = "https://github.com/nsiccha/MutatingFunctions.jl"
 const MUTATING_FUNCTIONS_REV = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"
@@ -31,7 +32,7 @@ mktempdir() do env
     # oracles for its independent references.
     Pkg.add(["DifferentiationInterface", "Enzyme", "BenchmarkTools",
              "Distributions"])
-    Pkg.develop(path = root)
+    Pkg.develop([PackageSpec(path = root); rk_source_dependencies()])
     # test_nonallocating_mnist.jl runs the real MNIST example graph. Julia 1.10
     # ignores [sources], so the nested example packages are developed by path.
     Pkg.develop(path = joinpath(root, "packages",

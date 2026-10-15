@@ -25,6 +25,57 @@ boundary. In particular, a stateless recipe may contain arbitrary ordinary
 Julia behind an opaque recipe call, while a source-captured state-machine method
 must stay inside the compiler's inspectable and registered subset.
 
+## Numerical metadata and the first migration slice
+
+OutputSignatures owns numerical transfer rules for compiler-visible calls.
+RK's internal `src/value_metadata.jl` adapter resolves callable identities and
+translates indexing, broadcast and literal-power syntax into metadata queries.
+It does not execute a helper, manufacture an example input, or ask Julia to
+infer an arbitrary helper body. Descriptors are ordinary data; graph contents,
+array lengths and literal exponents are not metadata type parameters.
+
+The first consumer is PPL's pointwise arithmetic emission. Its former
+`_PointwiseValue.rank` and `.length` rules have been removed: indexing,
+scalar/vector arithmetic, broadcast axes, `sum` and numeric `vcat` now obtain
+their numerical facts from OS. PPL still owns the separate fact that an
+expression reads a sampled value. Density roles, conditioning, observation
+domains and parameter layout remain PPL responsibilities. A scalar numerical
+result does not imply any of those roles.
+
+The adapter accepts a supported OS result only. Unknown or incompatible
+analysis retains the original Julia expression; it does not invent a scalar
+or copy an input's shape/type. A supported result is conditional on ordinary
+Julia execution succeeding, so bounds and broadcast compatibility checks must
+remain. A descriptor for an abstract vector is not permission to assume Base
+semantics for an arbitrary custom array. Literal `x .^ -1` is queried as
+`literal_pow`, preserving its distinction from `broadcast(^, x, -1)`.
+
+Further compiler changes should follow these rules:
+
+- Add numerical operation rules to OS, with independent Julia result checks;
+  keep source binding/normalization in RK and statistical meaning in PPL.
+- Preserve unknown facts and sampled dependence independently. Partial axes
+  alone do not authorize fusion of an unsupported callable.
+- Replace and delete one duplicated rule at a time. Each slice needs numerical,
+  observation-scope and ordinary-Reverse checks, plus separate construction,
+  preparation and first-call measurements on exact source/dependency pins.
+- Keep metadata as cold data structures and retain runtime loops over data.
+  Do not expand graph-wide compiler inference or encode observation lengths
+  in generated program structure to make an analysis appear precise.
+
+This slice does not replace RK's general recipe typing or PPL's whole-model
+shape classifier. Matrix operations, scans, planner migration and a general
+opaque-call tracing protocol remain separate work. The next slice should name
+its numerical duplicate and acceptance examples before expanding the interface.
+The runnable [`benchmark/compiler_metadata_slice.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/compiler_metadata_slice.jl)
+shows the complete model, query/gradient interaction and separate timing stages;
+`test/test_value_metadata.jl` exercises the corresponding kernel directly.
+The [recorded comparison](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/results/compiler_metadata_slice_20261015.json)
+pins the isolated before/after trees and dependency versions. Both runs pass
+32 value/gradient checks. Emitted size is unchanged at 238/252 nodes for the
+two expression widths, at both 8 and 256 observations. These are single-run
+compiler-cost checks, not evidence of a speedup.
+
 ## API map
 
 ```@eval
@@ -205,6 +256,20 @@ and inspection metadata. Calling it performs no graph traversal, producer
 selection, topological sort, cache lookup, or dynamic scheduling. Julia still
 specializes and executes the recipe callables normally; their own dispatch,
 allocations, exceptions, and side effects are not erased by the graph compiler.
+
+Fresh authored definitions retain distinct provenance even when their source is
+identical. At prepared-kernel assembly, execution uses the existing generated
+source companion and its concrete lexical captures, with definition tokens
+carried as metadata instead of executable type parameters. This lets identical
+fresh builds reuse operation and derivative types without merging their graph
+identities or caching bound data. The original operations remain in the plan
+and source recipes. Bodies with local functions, generators, exception scopes,
+or boxed lexical cells retain Julia's native closure path. Private generated
+names in the derivative operand pack are canonicalized in that actual pack;
+the operands and their positional reads are unchanged. Construction, planning,
+and preparation still perform work, so reusing a build remains useful.
+Colliding local names receive suffixes from their stable plan order, rather
+than fresh graph IDs, so repeated child composition can also reuse code.
 
 One rewrite reaches into those callables. Natively, a generator fold over a
 data-length iterator, `sum(term for i in iter [if condition]; init = x)` with
@@ -696,12 +761,20 @@ rule is required. The native acceptance suite also replays the displayed
 authoring source in a fresh module without its producer's operation table.
 
 Compiled nested plate regions are not implemented yet: traced execution reports
-that capability gap explicitly. A cell containing another plate gives up the
-work that reads only shared values (captured or `Ref` arrays, scalars, and
-values computed from them alone) before lowering: that work runs once, in
-front of the outer loop, and the cell reads its results whole. The rest of the
-cell graph, including its inner loops, runs per outer coordinate. As for a flat
-plate's invariants, the moved work also runs when the outer domain is empty.
+that capability gap explicitly. In native execution, a cell containing another
+plate computes work that reads only shared values (captured or `Ref` arrays,
+scalars, and values computed from them alone) once before its outer loop. The
+cell reads those results whole; the rest of its graph, including inner loops,
+runs per outer coordinate.
+
+An empty native plate evaluates no cell work, including shared expressions.
+For inferable cells, pointwise readers still return a concretely typed empty
+array; total readers return the reduction identity. This applies separately at each nesting level:
+an expression written in an outer cell runs when that cell is visited, even if
+its inner plate is empty; an expression written inside the inner cell runs only
+when the inner domain has cells. Expressions authored outside a plate retain
+their ordinary evaluation. Nonempty plates retain once-per-call shared work,
+and visited cells retain ordinary bounds and domain errors.
 
 ### One cell of a plate
 

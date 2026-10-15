@@ -62,13 +62,16 @@ function _varnames(p::Plan)
     used = Set{Symbol}((_OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG))
     out = Dict{Int,Symbol}()
     named = _class_name_values(g)
-    for id in ids
+    # Plan order is stable across equivalent graphs; graph IDs are not. Use
+    # that order to disambiguate locals without changing compilation identity
+    # whenever a composed child receives fresh value IDs.
+    for (position, id) in enumerate(ids)
         base = _value_local_name(g.values[get(named, id, id)].name)
         candidate = base
         suffix = 0
         while candidate in used
-            candidate = suffix == 0 ? Symbol(base, :_, id) :
-                        Symbol(base, :_, id, :_, suffix)
+            candidate = suffix == 0 ? Symbol(base, :_, position) :
+                        Symbol(base, :_, position, :_, suffix)
             suffix += 1
         end
         out[id] = candidate
@@ -1715,57 +1718,22 @@ function _fuse_authored_plate_chains(p::Plan; cells_only = false)
     Plan(p.graph, p.have, p.want, selected, producer, p.cost, p.candidates)
 end
 
-# The plan both backend products lower: composed plate chains, then the shared
-# work of nested-plate cells moved out of their plates. A nested cell's own
-# lowering (`_plate_nested_native!`) types its arguments by the cell plan's
-# values, so it composes chains only.
-_lowering_plan(p::Plan) = _hoist_nested_plate_invariants(_fuse_authored_plate_chains(p))
+# Both backend products keep plate boundaries until lowering. Shared cell work
+# belongs inside its plate's nonempty-domain guard, not in the enclosing plan.
+_lowering_plan(p::Plan) = _fuse_authored_plate_chains(p)
 
-# A plate cell that contains another plate is lowered whole at every outer
-# coordinate (`_plate_nested_native!`), so the invariant grouping of
-# `_lower_authored_plate_loop_native!` does not reach its recipes. Move the
-# cell work that reads only shared values (atomic or scalar plate arguments,
-# and values computed from them alone) in front of the plate: it runs once,
-# and each of its values the remaining cell reads becomes an additional atomic
-# plate argument. As for a flat plate's invariants, this work also runs for an
-# empty domain. Loops, effectful recipes and the cell's result stay in the
-# cell. The authored plan keeps its plate; only the lowered plan changes.
-function _hoist_nested_plate_invariants(p::Plan)
-    g = p.graph
-    copied = nothing
-    recipes = Recipe[]
-    next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
-    fresh() = (id = next_id[]; next_id[] -= 1; id)
-    for r in p.recipes
-        hoisted = r.op isa _AuthoredPlateOp ? _nested_plate_invariants(r) : nothing
-        if hoisted === nothing
-            push!(recipes, r)
-            continue
-        end
-        copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
-            copy(g.producers), copy(g.aliases), g.version))
-        append!(recipes, _hoisted_plate_recipes(copied, r, hoisted, fresh))
-    end
-    copied === nothing && return p
-    template = Plan(copied, p.have, p.want, p.recipes, p.producer, p.cost,
-                    p.candidates)
-    _partial_subplan(template, p.have, p.want, recipes)
-end
-
-# The cell recipes of nested-plate recipe `r` that read shared values only,
-# and the residual cell's new arguments (`frontier`), or `nothing`.
-function _nested_plate_invariants(r::Recipe)
-    op = r.op
-    inner = op.kernel.plan
+# Shared recipes of a cell that contains another plate. The native lowering
+# emits them once inside the outer plate's nonempty guard; their frontier is
+# passed to the residual cell without crossing the plate's evaluation boundary.
+function _nested_plate_invariants(inner::Plan, atomic, callvalues)
     ig = inner.graph
     loop(q) = q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp,_AuthoredPlateCellOp}
     # The cells `_lower_authored_plate_loop_native!` lowers whole (`nested`);
     # every other cell keeps its codegen-time invariant grouping.
     any(q -> q.op isa _AuthoredPlateOp, inner.recipes) || return nothing
-    atomic = typeof(op).parameters[2]
     shared = Set{Int}()
     for (position, input) in enumerate(inner.have)
-        (position in atomic || valtype(r.inputs[position]) <: Number) &&
+        (position in atomic || valtype(callvalues[position]) <: Number) &&
             push!(shared, canon_id(ig, input.id))
     end
     results = Set(canon_id(ig, v.id) for v in inner.want)
@@ -1790,41 +1758,7 @@ function _nested_plate_invariants(r::Recipe)
     end
     residual = Recipe[q for (index, q) in enumerate(inner.recipes)
                       if !(index in moved)]
-    (; moved = inner.recipes[moved], frontier, residual)
-end
-
-# `r`'s moved cell recipes as outer recipes over the plate's arguments, then
-# `r` over its residual cell with the frontier appended as atomic arguments.
-# New outer values register in `copied`.
-function _hoisted_plate_recipes(copied::Graph, r::Recipe, hoisted, fresh)
-    op = r.op
-    inner = op.kernel.plan
-    ig = inner.graph
-    outer = Dict{Int,Value}(canon_id(ig, v.id) => r.inputs[position]
-                            for (position, v) in enumerate(inner.have))
-    recipes = Recipe[]
-    for q in hoisted.moved
-        outputs = Tuple(get!(outer, canon_id(ig, v.id)) do
-            value!(copied, v.name, valtype(v))
-        end for v in q.outputs)
-        push!(recipes, Recipe(fresh(), Tuple(outer[canon_id(ig, v.id)] for v in q.inputs),
-            outputs, q.op, q.cost, nothing, false, q.source))
-    end
-    readable = Dict(q.id => source for (q, source) in
-                    zip(inner.recipes, op.kernel.lowered_recipes))
-    scalar_plan = _partial_subplan(inner, vcat(inner.have, hoisted.frontier),
-                                   inner.want, hoisted.residual)
-    kernel = _prepare(scalar_plan,
-        _lower_with_ops(scalar_plan; inline_embedded = false)...)
-    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-        kernel.plan, kernel.ast, Tuple(readable[q.id] for q in hoisted.residual))
-    count = length(inner.have)
-    atomic = (typeof(op).parameters[2]..., (count + 1):(count + length(hoisted.frontier))...)
-    replacement = _AuthoredPlateOp{typeof(kernel),atomic}(kernel, op.axis_checks)
-    push!(recipes, Recipe(r.id,
-        (r.inputs..., (outer[canon_id(ig, v.id)] for v in hoisted.frontier)...),
-        r.outputs, replacement, r.cost, nothing, r.effectful, r.source))
-    recipes
+    (; moved, frontier, residual)
 end
 
 # `producer` (an authored plate with output `cid`) composed into `consumer`, an
@@ -2749,7 +2683,8 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     replacement = if spec === nothing
-        token, form = (typeof(r.op)::DataType).parameters
+        token = getfield(r.op, :token)
+        form = (typeof(r.op)::DataType).parameters[2]
         arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
             getfield(native, then ? :then_arm : :else_arm),
             getfield(tensor, then ? :then_arm : :else_arm))
@@ -2899,8 +2834,8 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
         push!(body.args, selected)
         return body
     end
-    # An empty domain evaluates neither the condition nor an arm: only the
-    # cell's invariants, as its per-cell branch would.
+    # An empty domain evaluates neither the condition, an arm, nor any
+    # other cell recipe.
     empty_block = _lower_authored_plate_cells_native!(Expr(:block), runtime_ops,
         runtime_recipes, inner_kernel, atomic, callargs, callvalues,
         raw_arguments, prepared_arguments, marker, output_axes, pointwise_lhs,
@@ -3038,8 +2973,13 @@ end
 # selected sum consumers, and preserves all named scalar recipes for replay.
 # Type-only arguments carry the enclosing DAG's coordinate evidence through
 # embedding without rebasing its operation-table references a second time.
-function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types)
-    scalar = _fuse_authored_plate_chains(kernel.plan)
+function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
+                                atomic, callvalues)
+    inner = kernel.plan
+    hoisted = _nested_plate_invariants(inner, atomic, callvalues)
+    scalar = hoisted === nothing ? inner : _partial_subplan(inner,
+        vcat(inner.have, hoisted.frontier), inner.want, hoisted.residual)
+    scalar = _fuse_authored_plate_chains(scalar)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
     hint_ids = sort!(collect(keys(types)))
     type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
@@ -3048,7 +2988,9 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     append!(runtime_ops, ops)
     append!(runtime_recipes, recipes)
     T = types[canon_id(kernel.plan.graph, only(kernel.plan.want).id)]
-    (; ast, offset, type = T, input_types = Any[types[cid] for cid in hint_ids])
+    (; ast, offset, type = T, inputs = scalar.have,
+       invariants = hoisted === nothing ? Int[] : hoisted.moved,
+       input_types = Any[types[cid] for cid in hint_ids])
 end
 
 # Each authored plate carries a generated kernel type. The lowering itself is
@@ -3218,7 +3160,7 @@ end
 # bound: the invariants above the loop, the cell loop, the pointwise buffer and
 # the total. `inner_kernel` is the plate's cell kernel or a branch-arm variant
 # of it (`_PlateArmVariant`). With `cells = false` the domain is
-# known to be empty: the invariants and the empty result are emitted, no loop.
+# known to be empty: only the empty result is emitted, with no cell work.
 Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         body, runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
         @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
@@ -3274,7 +3216,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         output_axes, pointwise_lhs, total_lhs, recycled, into, cells,
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
-        lane_arms; total_fold)
+        lane_arms; nonempty, total_fold)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -3320,7 +3262,8 @@ Base.@nospecializeinfer function _plate_cell_types!(
     end
     nested = any(r -> r.op isa _AuthoredPlateOp, inner.recipes) ?
         _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
-            Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inner.have]) :
+            Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inner.have],
+            atomic, callvalues) :
         nothing
     for (recipe_index, recipe) in enumerate(inner.recipes)
         input_type_exprs = Any[
@@ -3354,23 +3297,25 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         pointwise_lhs, total_lhs, recycled, into::Bool, cells::Bool,
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
-        lane_arms; total_fold = sum)
-    groups = _authored_plate_recipe_groups(
-        inner, dependencies, root_positions, atomic, callvalues)
-    nested === nothing || (groups = [])
+        lane_arms; nonempty::Bool = false, total_fold = sum)
+    groups = nested === nothing ? _authored_plate_recipe_groups(
+        inner, dependencies, root_positions, atomic, callvalues) :
+        [(Set{Int}(), nested.invariants)]
     has_scheduled_groups = any(groups) do (roots, _)
         !isempty(roots) && !_authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues)
     end
 
     # Every cell recipe is emitted once. A group without dynamic roots is a
-    # plate invariant, computed here above the loop. Recipes with the same
+    # plate invariant, computed above the loop only when it has cells.
+    # Recipes with the same
     # dynamic root set share one scheduling guard inside the loop
     # (`_authored_plate_schedule`), which preserves partial-dimension invariant
     # caching; their outputs are declared here, so a value computed at one
     # coordinate is still bound at the next. Common vector-plate groups are
     # known to be safe to recompute at every coordinate and need no guard in
     # either the primal or differentiated native kernel.
+    invariants = Expr(:block)
     for (roots, recipe_indices) in groups
         _authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues) && continue
@@ -3387,7 +3332,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, false) for input in recipe.inputs]
-            _lower_plate_recipe_native!(body, recipe, args, out,
+            _lower_plate_recipe_native!(invariants, recipe, args, out,
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index),
                 get(scan_offsets, recipe_index, nothing))
         end
@@ -3416,7 +3361,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     if nested !== nothing
         args = Any[_authored_plate_scalar_ref(
             inner, locals, callargs, callvalues, prepared_arguments, atomic,
-            input, index, true) for input in inner.have]
+            input, index, true) for input in nested.inputs]
         # Hint queries used only by a cell stay inside its loop: an empty outer
         # domain must not evaluate new queries merely to bind an unused hint.
         input_types = _bind_native_type_exprs!(loopbody, nested.input_types)
@@ -3523,16 +3468,29 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             (accumulator === nothing || total_fold === sum) ? _plate_reduction_plan(
         inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
         pointwise_lhs) : nothing
-    cells && append!(body.args, declarations)
-    if !cells
-        # A domain known to be empty runs no cell.
-    elseif reduction === nothing
-        push!(body.args, cell_loop)
-    else
-        push!(body.args, _lower_plate_reduction_native(reduction.kind,
-            reduction, inner, locals, callargs, callvalues, raw_arguments,
-            prepared_arguments, atomic, root_positions, plate_type_exprs, op_offset, plate_eltype,
-            output_axes, pointwise_lhs, accumulator, cell_loop))
+    if cells
+        append!(body.args, declarations)
+        execution = Expr(:block, invariants.args...)
+        if reduction === nothing
+            push!(execution.args, cell_loop)
+        else
+            push!(execution.args, _lower_plate_reduction_native(reduction.kind,
+                reduction, inner, locals, callargs, callvalues, raw_arguments,
+                prepared_arguments, atomic, root_positions, plate_type_exprs, op_offset, plate_eltype,
+                output_axes, pointwise_lhs, accumulator, cell_loop))
+        end
+        # Allocate the concrete pointwise buffer and seed the total before the
+        # guard. Invariants and cells share one guarded scope, so an empty
+        # plate neither evaluates a cell recipe nor needs a sentinel value for
+        # its result. The same buffer reaches both paths under ordinary Reverse.
+        if nonempty || isempty(invariants.args)
+            append!(body.args, execution.args)
+        else
+            has_cells = Expr(:call, GlobalRef(Base, :!),
+                Expr(:call, GlobalRef(Base, :isempty),
+                    Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)))
+            push!(body.args, Expr(:if, has_cells, execution))
+        end
     end
     # Fallback runtime narrowing of the pointwise container. `plate_eltype`
     # already types the buffer up front, so for an inferable body this is a
@@ -3689,7 +3647,7 @@ Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         atomic, callargs, callvalues, pointwise_lhs, total_lhs)
     if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)
         _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
-            Any[GlobalRef(Core, :Any) for _ in inner.have])
+            Any[GlobalRef(Core, :Any) for _ in inner.have], atomic, callvalues)
         # The current tensor product batches individual scalar recipes. Calling
         # a nested plate's host fallback there would trace a data-sized loop.
         # Keep this capability gap explicit until nested backend regions exist.
@@ -5267,14 +5225,14 @@ struct PreparedKernel{F,O,IN,OUT,RR,S}
     lowered_recipes::RR
 end
 
-# Nearly every preparation or rebinding assembles a `PreparedKernel` of a new
-# concrete type (its compiled body is new). Assemble it without compiling the
-# struct's constructor for that type; calls on the prepared kernel still
-# dispatch on its exact type.
+# Assemble new prepared types without compiling a constructor for each one;
+# equivalent generated bodies and operation types can reuse their existing
+# specializations. Calls still dispatch on the exact prepared type.
 Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
         @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing)
+    ops = _execution_source(ops)
     T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
                        typeof(lowered_recipes),exact_signature}
     _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
@@ -6675,7 +6633,7 @@ function _readable_substitute(ex, subst::AbstractDict)
 end
 
 # Whether `value` is the program variable codegen made of the authored `name`
-# to avoid a collision (`_varnames`: `name_<id>` or `name_<id>_<k>`). Such a
+# to avoid a collision (`_varnames`: `name_<position>` or `name_<position>_<k>`). Such a
 # name stays an explicit binding, so the authored spelling remains visible.
 _readable_collision_rename(name::Symbol, value) =
     value isa Symbol &&
