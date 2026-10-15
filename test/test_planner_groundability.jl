@@ -180,6 +180,21 @@ end
         @test prepare(p)(3.0) == (3.0, 9.0)
     end
 
+    @testset "grounding producers can have their own prerequisites" begin
+        g = Graph()
+        x, seed, a, b = [value!(g, name, Float64) for name in (:x, :seed, :a, :b)]
+        cycle = add!(g, a => (a, b), a -> (a, a^2); cost = 0.0)
+        ground = add!(g, seed => a, identity; cost = 0.5)
+        prefix = add!(g, x => seed, x -> 2x; cost = 0.5)
+        p = plan(g; have = (x,), want = (b,))
+        @test p.recipes == [prefix, ground, cycle]
+        @test p.cost == 1.0
+        @test prepare(p)(3.0) == 36.0
+        # Equal total cost is resolved by recipe count, including zero-cost work.
+        direct = add!(g, x => b, x -> 4x^2; cost = 1.0)
+        @test only(plan(g; have = (x,), want = (b,)).recipes) === direct
+    end
+
     @testset "independent grounding orders do not multiply the search" begin
         g = Graph()
         x = value!(g, :x, Float64)
