@@ -15,6 +15,33 @@ counted_log(x) = (arm_calls[] += 1; log(x))
     total::Float64 = sum(pointwise)
 end
 
+# The counted `log` in the arm reads only the shared number `s`; it is the same
+# on every lane that takes the arm.
+@kernel guarded_counted_shared(x::Vector{Float64}, y::Vector{Float64}, s::Float64) = begin
+    pointwise = plate(x, y, s) do xi, yi, si
+        cell::Float64 = yi > 0 ? xi * counted_log(si) : xi - 1.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# A guarded total composed into a caller: the child's plate port is scoped
+# under the caller's `t` (`t.pointwise`), while its sum keeps the source
+# `sum(pointwise)`.
+@kernel guarded_total(x::Vector{Float64}, y::Vector{Float64}) = begin
+    pointwise = plate(x, y) do xi, yi
+        cell::Float64 = yi > 0 ? log(xi * yi) : xi - 1.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
+@kernel guarded_caller(x::Vector{Float64}, y::Vector{Float64}) = begin
+    t = guarded_total(x, y)
+    return 3.0 * t
+end
+
 # Three arms by level; the interior arm gathers `c[l]`/`c[l-1]`, which are out
 # of bounds on the first and last levels, and the nested condition is itself
 # never evaluated on first-level lanes.

@@ -81,7 +81,8 @@ a sampled coordinate. For example, `beta_last = -sum(beta_free)` followed by
 The factor uses an admitted scalar distribution and the definition keeps its
 ordinary value for later reads, such as `beta = vcat(beta_free, beta_last)`.
 The definition is still assigned once; a second factor on the same name is
-rejected. Vector observations use `.~`.
+rejected. Vector observations use `.~`. A caller-owned law instead observes
+the definition as one whole event (see caller-owned sampling laws below).
 
 ## Parameter priors
 
@@ -275,8 +276,12 @@ custom broadcasts need not share another response's row count. Observations
 acquire no packed coordinates and need no transform or random generator. As
 under a built-in family, an observed number is one observation, and an
 observed definition reading only data (`y = v[positions(rows)]`,
-`y = sum(f(raw))`) is evaluated once by `bind_data` and validated as the
-response, exactly like the same value bound as data.
+`y = sum(f(raw))`, `y = hcat(u, v)`) is evaluated once by `bind_data` and
+validated as the response, exactly like the same value bound as data.
+Undotted, `ys = log.(raw); ys ~ LogDensity(f, m)` evaluates `f(ys, m)` once
+on the whole value, whether it is a vector, a number or a matrix. A
+caller-owned law observing a definition that reads a sampled value reads it
+as the graph computes it, dotted or undotted.
 
 An undotted external constructor keeps each argument whole:
 `y .~ some_distribution(parameters)` shares the vector `parameters` across
@@ -361,6 +366,12 @@ from parameter geometry, without adding generated values to sampler coordinates.
   `Beta.(logistic.(eta) .* k, (1 .- logistic.(eta)) .* k)` changes its mean
   from `logistic.(eta)` to `1 .- logistic.(eta)`.
 - Broadcasting is explicit: `mu = a .+ b .* x`.
+- A reduction's one-argument form (`sum(x)`, `mean(z)`) is the built-in
+  whole-column reduction. Called with keywords or a function argument it is
+  Julia's own function, as its qualified spelling `Base.sum` is: with
+  `dims = 2`, `P = exp.(U .- log.(sum(exp.(U); dims = 2)))` normalizes each
+  row of `U`, and `std(x; corrected = false)`, `sum(z; init = 0.0)` and
+  `sum(abs2, W)` keep their Julia meaning.
 - Distribution arguments use their ordinary values. `exp.`, `logistic.`,
   `normcdf.` and `cexpexp.` apply at each use, including means, rates,
   probabilities, scales, shapes, Student degrees of freedom and zero
@@ -383,8 +394,9 @@ from parameter geometry, without adding generated values to sampler coordinates.
 - A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
   `y ~ Normal(...)` on a data vector is rejected.
 - A `~` whose left-hand side is a bound data column is an observation. On an
-  existing scalar definition it adds a density factor; otherwise it declares
-  a parameter.
+  existing scalar definition a built-in family adds a density factor, while a
+  caller-owned law observes the definition's whole value; otherwise it
+  declares a parameter.
 - `Ordinal` permits an intercept alongside its thresholds, for both
   cumulative and stopping-ratio responses. Both declarations and their
   priors are translated as written.
@@ -618,6 +630,42 @@ slice. An array with a constrained prior is its transform's fresh output. A
 function that receives one whole should accept `AbstractVector` or
 `AbstractMatrix`, and must not write into it.
 
+### Intrinsic CAR fields
+
+`phi[1:N] ~ ICAR(node1, node2)` declares one value per node of an undirected
+graph with the intrinsic conditional autoregressive (ICAR) prior. Edge `e`
+joins nodes `node1[e]` and `node2[e]`, and each edge is listed once. The log
+density is the pairwise-difference penalty
+`-1/2 * sum((phi[node1] .- phi[node2]) .^ 2)`, the Gaussian Markov random
+field whose precision is the graph Laplacian. The field has unit scale; scale
+it outside the prior, as BYM2 does.
+
+The prior is improper: adding a constant to every node of a connected
+component leaves the density unchanged. State the identifying constraint as
+its own statement. A soft sum-to-zero constraint is a density factor on a
+scalar definition:
+
+```julia
+beta0 ~ Normal(0, 1)
+sigma ~ truncated(Normal(0, 1), 0, Inf)
+rho ~ Beta(0.5, 0.5)
+theta[1:N] .~ Normal.(0, 1)
+phi[1:N] ~ ICAR(node1, node2)
+phi_sum = sum(phi)
+phi_sum ~ Normal(0, 0.001 * N)
+convolved_re = sqrt(1 - rho) .* theta .+ sqrt(rho / scaling_factor) .* phi
+y .~ Poisson.(exp.(log.(E) .+ beta0 .+ sigma .* convolved_re))
+```
+
+The declaration sizes the field, so a node on no edge adds no term. The node
+vectors are integer data or data-only expressions such as `edges[:, 1]`.
+Binding checks that both have one entry per edge and that every entry is a
+node of the field. The entries of `phi` are its coordinates
+(`phi.1 … phi.N`), read in place. The density is the graph law
+`icar_logdensity` (see [Distributions](distributions.md)), one retained plate
+over the edges, and native Enzyme Reverse differentiates it without a custom
+rule. Rows or columns of independent ICAR fields are not built yet.
+
 ## Design matrices
 
 Bind the matrix once with `hcat` and size the coefficients with an axes prior.
@@ -630,6 +678,13 @@ Naming it first (`p = X * b; mu = f(p)`) or returning it from a submodel
 preserves the inline expression's density, priors and coefficient coordinates.
 A direct product can also be an affine component in a composed predictor,
 such as `p = X * b; mu = p .+ q` with another component `q`.
+
+An `hcat` of model-level values, such as declared vectors or sampled scalars,
+is a model-level matrix, as a declared matrix is: `u * hcat(w1, w2)` means
+`u * W` for `W[axes(u, 2), 1:2]`. Elementwise maps over it keep their Julia
+meaning, named or inline: `E = exp.(u * hcat(w1, w2)); P = E ./ sum.(eachrow(E))`
+normalizes each row. An `hcat` with an observation column, such as
+`hcat(ones(length(x)), x)`, has one row per observation.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
@@ -779,7 +834,11 @@ In an array cell, an observation must read a named per-index output
 (`y[i] ~ Normal(r[i], sigma)`), rather than a cell local directly.
 
 `@scan begin … end` writes a sequential recurrence, such as an AR(1) state
-(corpus `38_scan_ar.jl`).
+(corpus `38_scan_ar.jl`). Its sampled seeds and steps take the scalar priors a
+declaration takes, including `Flat()`, half priors, `truncated(D, lo, hi)` and
+`restricted(D, lo, hi)` with bounds fixed across steps. For example,
+`h[t] ~ restricted(Normal(h[t - 1], s), lo, hi)` is a random walk on `(lo, hi)`
+that keeps the Normal density.
 
 ### One array per index
 

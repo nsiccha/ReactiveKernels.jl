@@ -801,7 +801,7 @@ VectorAssignmentSpec(name::Symbol, expr::Union{Expr,Symbol}) =
     VectorAssignmentSpec(name, expr, name)
 
 """
-    ScanSetup(target, index, kind, family, args, expr)
+    ScanSetup(target, index, kind, family, args, expr[, support])
 
 One literal-index seed fill of a `@scan` carried array `target`, mirroring
 [`ScanStep`](@ref):
@@ -809,10 +809,12 @@ One literal-index seed fill of a `@scan` carried array `target`, mirroring
 - `kind === :sample` — `target[index] ~ Dist(args…)`: a sampled seed.
   `family` is an internal family symbol (see the surface's
   `_PARAM_FAMILIES`), `args` the positional distribution-argument
-  expressions; `expr` is `nothing`.
+  expressions and `support` its [`SupportOverride`](@ref) (`restricted`,
+  `truncated` and half priors, as for a scalar parameter); `expr` is
+  `nothing`.
 - `kind === :assign` — `target[index] = expr`: a deterministic seed (a
   literal, or an expression over scalar parameters, definitions and earlier
-  seeds). `family`/`args` are `nothing`.
+  seeds). `family`/`args`/`support` are `nothing`.
 """
 struct ScanSetup
     target::Symbol
@@ -821,20 +823,24 @@ struct ScanSetup
     family::Union{Symbol,Nothing}
     args::Union{Vector{Any},Nothing}
     expr::Any
+    support::SupportOverride
 end
+ScanSetup(target, index, kind, family, args, expr) =
+    ScanSetup(target, index, kind, family, args, expr, nothing)
 
 """
-    ScanStep(kind, target, indexed, family, args, expr)
+    ScanStep(kind, target, indexed, family, args, expr[, support])
 
 One `@scan` recurrence-body statement.
 
 - `kind === :sample` — a `~` statement: a carried array at the loop index
   (`indexed = true`, `target` one of the scan's `states`, centered form) or a
   fresh per-step local innovation (`indexed = false`, non-centered form).
-  `family`/`args` describe the distribution; `expr` is `nothing`.
+  `family`/`args`/`support` describe the distribution, as for a
+  [`ScanSetup`](@ref); `expr` is `nothing`.
 - `kind === :assign` — a `=` statement: a carried array's deterministic write
   (`indexed = true`) or a per-step deterministic local (`indexed = false`).
-  `expr` is the RHS AST; `family`/`args` are `nothing`.
+  `expr` is the RHS AST; `family`/`args`/`support` are `nothing`.
 
 Statements run in order, as in a Julia loop body: a step reads a carried
 array's backward lags `a[t - k]`, its current value `a[t]` once an earlier
@@ -847,7 +853,15 @@ struct ScanStep
     family::Union{Symbol,Nothing}
     args::Union{Vector{Any},Nothing}
     expr::Any
+    support::SupportOverride
 end
+ScanStep(kind, target, indexed, family, args, expr) =
+    ScanStep(kind, target, indexed, family, args, expr, nothing)
+
+# The value expressions a seed or step reads: a sampled statement's
+# distribution arguments and support bounds, an assignment's expression.
+_scan_reads(st::Union{ScanSetup,ScanStep}) = st.kind === :sample ?
+    Any[st.args..., _support_args(st.support)...] : Any[st.expr]
 
 """
     ScanSpec(states, loopvar, lo, hi, setup, step, maxlag, label)
@@ -2215,14 +2229,7 @@ end
 Values with no data anchor (an intercept or dar path) use their response
 consumers. No dimension is inferred from the total of unrelated axes."""
 function _value_rows(plan::StructuralPlan, name::Symbol)
-    haskey(plan.columns, name) && return _column_nrows(plan.columns[name])
-    reads = _response_reads(plan, name, _row_columns(plan))
-    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
-    if isempty(ns)
-        names = Set{Symbol}([name])
-        ns = unique!([_response_rows(plan, r) for r in plan.responses
-            if name in _response_reads(plan, r, names)])
-    end
+    ns = _value_row_counts(plan, name)
     length(ns) == 1 && return only(ns)
     if isempty(ns)
         axes = unique!([_response_rows(plan, r) for r in plan.responses])
@@ -2231,6 +2238,19 @@ function _value_rows(plan::StructuralPlan, name::Symbol)
         _fail(name, "value $name has no data range or response to establish its rows")
     end
     _fail(name, "value $name reads or feeds different row counts $ns")
+end
+
+# The distinct row counts that establish `name`'s rows (see `_value_rows`):
+# its own data column, the row columns it reads, else the responses it
+# feeds. Empty when none applies; several when they disagree.
+function _value_row_counts(plan::StructuralPlan, name::Symbol)
+    haskey(plan.columns, name) && return [_column_nrows(plan.columns[name])]
+    reads = _response_reads(plan, name, _row_columns(plan))
+    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    isempty(ns) || return ns
+    names = Set{Symbol}([name])
+    return unique!([_response_rows(plan, r) for r in plan.responses
+        if name in _response_reads(plan, r, names)])
 end
 
 function _plate_rows(plan::StructuralPlan, p::PlateParameter;
@@ -2857,7 +2877,8 @@ end
 # (bound columns are inputs, not nodes); keyword names and function values
 # are not reads.
 function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
-    ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
+    # An interpolated `nothing` or `missing` is Base's value, as its name is.
+    ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String,Nothing,Missing} &&
         return nothing
     if ex isa Symbol
         # `:` in a positional read (`Z[:, 1]`) is a whole axis, and `end`
@@ -3782,10 +3803,8 @@ function topological_order(plan::StructuralPlan)
     for s in plan.scans
         refs = Set{Symbol}()
         locals = Set(st.target for st in s.step if !st.indexed)
-        for st in (s.setup..., s.step...)
-            for expr in (st.kind === :sample ? st.args : (st.expr,))
-                union!(refs, _expr_value_symbols(expr))
-            end
+        for st in (s.setup..., s.step...), expr in _scan_reads(st)
+            union!(refs, _expr_value_symbols(expr))
         end
         filter!(r -> r in allnames && r ∉ s.states && r ∉ locals, refs)
         for state in s.states
@@ -6822,7 +6841,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     for s in plan.scans
         exprs = Any[s.hi]
         for st in (s.setup..., s.step...)
-            append!(exprs, st.kind === :sample ? st.args : (st.expr,))
+            append!(exprs, _scan_reads(st))
         end
         push!(defs, Symbol(:_ppl_scan_input_, s.label) => Expr(:tuple, exprs...))
     end
@@ -6892,22 +6911,40 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         end
     end
     held = setdiff!(named, free)
-    inputs, ctx = _whole_value_reads(defs, raw, held)
+    inputs, ctx = _whole_value_reads(defs, raw, held;
+        matrices = _product_matrix_names(plan, raw, value_matrices))
     return union!(setdiff!(inputs, held), unused), ctx
+end
+
+# Names that can hold the matrix of a product `M * v` in a finished plan:
+# bound data, design and value matrices, and definitions computed from data
+# alone (`X = hcat(x1, x2)`, a basis matrix a module call returns).
+function _product_matrix_names(plan::StructuralPlan, raw::AbstractSet{Symbol},
+        value_matrices::AbstractSet{Symbol})
+    out = union(Set{Symbol}(raw), value_matrices,
+        Set{Symbol}(m.name for m in plan.matrices))
+    detmap = Dict{Symbol,Any}(d.name => d.expr
+        for d in (plan.assignments..., plan.derived...))
+    for (nm, ex) in detmap
+        !isempty(_value_symbols(ex)) && _data_only(ex, raw, detmap) &&
+            push!(out, nm)
+    end
+    return out
 end
 
 """Whole-value reads over `defs` (`name => expr`): the columns of `raw`
 read only as whole values, and the whole-context definitions — every use
 a whole read or inside another whole-context definition (the greatest
-fixpoint), none of them in `pinned`."""
+fixpoint), none of them in `pinned`. `matrices` names the values that can
+be the matrix of a product (`_matrix_product_operand`)."""
 function _whole_value_reads(defs, raw::AbstractSet{Symbol},
-        pinned::AbstractSet{Symbol})
+        pinned::AbstractSet{Symbol}; matrices::AbstractSet{Symbol} = raw)
     names = Set{Symbol}(first(d) for d in defs)
     known = union(Set{Symbol}(raw), names)
     reads = Dict{Symbol,Tuple{Set{Symbol},Set{Symbol}}}()
     for (nm, ex) in defs
         w, p = Set{Symbol}(), Set{Symbol}()
-        _classify_reads!(w, p, ex, known, false)
+        _classify_reads!(w, p, ex, known, false; matrices)
         reads[nm] = (w, p)
     end
     ctx = setdiff(names, pinned)
@@ -6948,11 +6985,13 @@ _has_observation_axis(plan) = !isempty(plan.responses) ||
 
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
 # inside an argument of an undotted module call into `whole`, anywhere
-# else into `per_obs`.
+# else into `per_obs`. The vector of a matrix product `M * v`, with `M`
+# one of `matrices` (`_matrix_product_operand`), is a whole read too.
 function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
-        raw::AbstractSet{Symbol}, inside::Bool; reductions_whole::Bool=false)
+        raw::AbstractSet{Symbol}, inside::Bool; reductions_whole::Bool=false,
+        matrices::AbstractSet{Symbol} = _NO_MATRIX_OPERANDS)
     visit(a, context) = _classify_reads!(whole, per_obs, a, raw, context;
-        reductions_whole)
+        reductions_whole, matrices)
     if ex isa Symbol
         ex in raw && push!(inside ? whole : per_obs, ex)
     elseif ex isa Expr
@@ -6971,6 +7010,14 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
             foreach(a -> visit(a, true), _plate_column_captures(ex))
         elseif ex.head === :kw && length(ex.args) == 2
             visit(ex.args[2], inside)
+        elseif ex.head === :call && length(ex.args) == 3 &&
+                ex.args[1] === :* && _matrix_product_operand(ex.args[2], matrices)
+            # As in Julia, `M * v` contracts `v` with the columns of the
+            # matrix `M`: `v` has their length, never the observation axis
+            # (`X * (spd .* z)` with `spd` read from one value per column).
+            # The matrix keeps the surrounding context.
+            visit(ex.args[2], inside)
+            visit(ex.args[3], true)
         elseif ex.head === :call
             constructed = _constructed_endpoint_call(ex)
             inner = inside || (!isempty(ex.args) && (ex.args[1] isa GlobalRef ||
@@ -7001,6 +7048,18 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
     end
     return nothing
 end
+
+# The matrix of a product `M * v`: a name that can hold a matrix (bound
+# data, a data matrix the model computes, an `hcat` value) or an inline
+# `hcat`. A data name whose value is a vector or a number still reads
+# Julia's meaning there: `x * v` is valid only for a scalar `v`, whose
+# reads have no observation axis either.
+const _NO_MATRIX_OPERANDS = Set{Symbol}()
+_matrix_product_operand(ex::Symbol, matrices::AbstractSet{Symbol}) = ex in matrices
+_matrix_product_operand(ex::Expr, ::AbstractSet{Symbol}) =
+    ex.head === :call && length(ex.args) > 1 &&
+    (ex.args[1] === :hcat || ex.args[1] === GlobalRef(Base, :hcat))
+_matrix_product_operand(_, ::AbstractSet{Symbol}) = false
 
 # Drop from `out` every Symbol `x` holds, at any depth.
 _drop_held_names!(out::Set{Symbol}, x::Symbol) = (delete!(out, x); nothing)
@@ -7131,7 +7190,8 @@ end
 # law observes it (`y .~ LogDensity.(f, mu)` too).
 function _scalar_responses_as_observations!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
-    observed = Symbol[p.name for p in plan.external_observations]
+    # An undotted caller-owned observation reads its value whole.
+    observed = Symbol[p.name for p in plan.external_observations if p.args.broadcast]
     for r in plan.responses
         push!(observed, r.response, r.count_columns..., r.extra_responses...)
     end
@@ -7242,6 +7302,8 @@ function _eval_value_expr(ex, lookup, label; calls = nothing)
     ex isa Union{Number,String,AbstractArray} && return ex
     ex isa QuoteNode && return ex.value
     ex isa GlobalRef && return getglobal(ex.mod, ex.name)
+    # A bare `:` is Julia's whole-axis index (`X[:, 1]`), never a name.
+    ex === :(:) && return Colon()
     ex isa Symbol && return lookup(ex)
     ex isa Expr || throw(ContractValidationError(
         "[bind] $label: unsupported literal $(repr(ex))"))

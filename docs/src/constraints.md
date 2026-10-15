@@ -487,9 +487,15 @@ and lock the one Reactant 0.2.289 lifted:
   call-site-inlined `collect`, and a fresh-buffer runtime loop pass ordinary
   reverse for Float32 and Float64, including empty inputs. A typed
   comprehension performs Julia's ordinary element conversion, so it is only
-  an equivalent control when that element type is intended. PPL's ordinary
-  and array-bearing prepared-input readers keep their authored primal and
-  remain native reverse capability gaps in `test_native_generator_capture.jl`.
+  an equivalent control when that element type is intended. The
+  call-site-inlined `collect` holds only for a `Matrix` or a plain view: with
+  a reshaped view of a vector, which is how RKPPL passes a declared two-axis
+  real array, Enzyme 0.13.210 and 0.13.216 reject it the same way. PPL's
+  ordinary, inline-collect and array-bearing prepared-input readers keep
+  their authored primal and remain native reverse capability gaps in
+  `test_native_generator_capture.jl`. The Enzyme dogfood line repairs every
+  one of these readers from `ba8bc90b` on Julia 1.10.12 and 1.12.7; released
+  Enzyme 0.13.216 does not.
   No consumer function, activity configuration or derivative rule is replaced.
   A six-line isolated Enzyme compiler prototype marks
   `Base.collect(::Generator)` for inlining before activity analysis and makes
@@ -532,7 +538,12 @@ and lock the one Reactant 0.2.289 lifted:
   `Vector` and `Matrix` operands whose promoted element type is isbits, they
   allocate Base's result, with Base's shape, promoted element type and
   values, and write each operand in its own inlined call; a number is a 1×1
-  block. Every other operand combination, and every `hcat`/`vcat` layout
+  block. From Julia 1.11 a dense operand is written element by element:
+  Enzyme differentiates `unsafe_copyto!` there as an untyped `memmove`, and
+  in a kernel prepared with `bound=` data (the `@rkppl` scan trajectory
+  `vcat([seed], rest)`) native reverse failed with `EnzymeNoTypeError`.
+  Julia 1.10 keeps the copy, since its element loop fails on an empty fresh
+  operand. Every other operand combination, and every `hcat`/`vcat` layout
   they do not lay out, calls Base, which keeps its value and error
   (including `vcat`'s fill of leading numbers across a wider matrix). A
   layout `hvcat` rejects throws the companion's own `DimensionMismatch`

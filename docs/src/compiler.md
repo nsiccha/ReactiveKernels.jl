@@ -436,6 +436,13 @@ or a bound-only cell value that the pass has already evaluated per lane.
 
 A lane-invariant condition selects its arm without splitting.
 
+An arm with its own graph (a plain arm expression, authored as a cell of its
+own as described below) becomes that graph's recipes in its plate, as in the
+native shared-condition lowering. Its work over shared plate arguments
+therefore runs once per call, above the lane loop, and only when some lane
+takes the arm. An arm without a graph, or one reading no lane value, runs as
+its closure on each of its lanes.
+
 The prepared program contains no branch for that condition, so no backend
 receives one:
 
@@ -573,9 +580,14 @@ plated dependency are emitted once above the traversal.
 
 An authored cell is split into recipes before planning. Besides its
 statements, each maximal subexpression that reads only shared values (closure
-captures, `Ref` operands and cell locals computed from them) becomes a recipe
-of its own. In `f(t, exp(log_k))`, `exp(log_k)` therefore runs once, above the
-traversal, exactly as in `k = exp(log_k); f(t, k)`. Only positions that Julia
+captures, `Ref` operands, plate arguments whose port is annotated with a
+`Number` type, and cell locals computed from them) becomes a recipe of its own.
+In `f(t, exp(log_k))`, `exp(log_k)` therefore runs once, above the traversal,
+exactly as in `k = exp(log_k); f(t, k)`. Such an annotated argument stays a
+zipped operand; its split-off recipe runs once because a number has no plate
+dimension. An unannotated plate argument is not known to be a number when the
+cell is split: annotate its port, or name the value as a cell local, which the
+traversal runs once when the argument is a number. Only positions that Julia
 evaluates whenever the cell runs are split: call and broadcast arguments, field
 reads, indexing and tuple elements. A branch arm, loop, generator term,
 closure or macro call keeps its own evaluation, as do the arguments of a
@@ -636,7 +648,9 @@ associative tree reduction, or an effect-ordering construct.
 
 An authored plate cell can contain another authored plate. Native lowering
 retains each axis as a runtime loop and fuses a selected `sum` into its plate;
-a total-only reader needs no intermediate pointwise arrays. Ragged groups,
+a total-only reader needs no intermediate pointwise arrays. A plate read only
+by `LogExpFunctions.logsumexp` streams the same way, folding each cell into the
+running log-sum-exp with `logaddexp` from `-Inf`, the empty plate's value. Ragged groups,
 empty groups, and array views use the same graph and generated loop structure.
 A cell reads an enclosing value whole, as a Julia closure does: the observation
 cells below read the kernel's `scale` directly, with no `Ref` argument.
@@ -658,10 +672,12 @@ rule is required. The native acceptance suite also replays the displayed
 authoring source in a fresh module without its producer's operation table.
 
 Compiled nested plate regions are not implemented yet: traced execution reports
-that capability gap explicitly. Native lowering of a cell containing another
-plate currently executes the whole selected cell graph per outer coordinate;
-it does not apply the scalar-only plate scheduler's outer invariant hoisting
-across that boundary.
+that capability gap explicitly. A cell containing another plate gives up the
+work that reads only shared values (captured or `Ref` arrays, scalars, and
+values computed from them alone) before lowering: that work runs once, in
+front of the outer loop, and the cell reads its results whole. The rest of the
+cell graph, including its inner loops, runs per outer coordinate. As for a flat
+plate's invariants, the moved work also runs when the outer domain is empty.
 
 ### One cell of a plate
 

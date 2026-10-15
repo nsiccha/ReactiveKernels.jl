@@ -186,6 +186,61 @@ _plate_empty_total(::Type{F}) where {F} = throw(ArgumentError(
     "zero. Declare the cell's result type, for example " *
     "`cell::Float64 = ...`, so that the empty total is its zero."))
 
+# A plate whose only consumer is `LogExpFunctions.logsumexp` streams too: the
+# accumulator folds each cell into the running log-sum-exp with `logaddexp`,
+# starting from `-Inf`, the log-sum-exp of no cells. That left fold can differ
+# from `logsumexp` over the materialized vector by rounding only, as a
+# streamed sum does from Base's pairwise `sum`. The accumulator is the plain
+# running value; only the cell loop adds to it, through the fold-aware
+# `_plate_total_add`. The SIMD and tiled reduction loops sum, so a plate with
+# another fold keeps the plain cell loop. The fold step stays out of line:
+# inlined into the cell loop, native Enzyme Reverse records every step's
+# branch and intermediate values, which made a streamed 318-event whole-event
+# mixture gradient slower than reducing a materialized vector (177 versus
+# 158 us); out of line it is 137 us.
+struct _PlateLogSumExpSeed{F} end
+
+@inline _plate_total_seed(::typeof(LogExpFunctions.logsumexp), ::Type{T},
+                          fallback) where {T} =
+    T <: Real && isconcretetype(T) ? convert(float(T), -Inf) :
+        _PlateLogSumExpSeed{_plate_fallback_eltype(fallback)}()
+
+@noinline _plate_total_add(::typeof(LogExpFunctions.logsumexp), total, cell) =
+    LogExpFunctions.logaddexp(total, cell)
+@inline _plate_total_add(::typeof(LogExpFunctions.logsumexp),
+                         ::_PlateLogSumExpSeed, cell) = cell
+
+@inline _plate_total_value(::_PlateLogSumExpSeed{F}) where {F} =
+    _plate_empty_logsumexp(F)
+
+_plate_empty_logsumexp(::Type{F}) where {F<:Real} = convert(float(F), -Inf)
+_plate_empty_logsumexp(::Type{F}) where {F} = throw(ArgumentError(
+    "an empty log-sum-exp plate has no total: its cell result type was not " *
+    "inferred to a concrete type, and the fallback element type $F is not " *
+    "real. Declare the cell's result type, for example " *
+    "`cell::Float64 = ...`, so that the empty total is `-Inf`."))
+
+# The fold a plate's selected total consumer streams, or `nothing`. A sum is
+# its bare operation or a captured source spelled `sum`. A log-sum-exp is an
+# exact call of `LogExpFunctions.logsumexp` itself, bare or qualified
+# (`_kernel_operation_identity`), never another function that shares its name.
+function _plate_total_consumer_fold(recipe::Recipe)
+    callee = recipe.source.args[1]
+    (callee === :sum || callee === GlobalRef(Base, :sum)) &&
+        (recipe.op === sum || recipe.op isa _KernelSourceOp) && return sum
+    _kernel_operation_identity(recipe) === LogExpFunctions.logsumexp &&
+        return LogExpFunctions.logsumexp
+    nothing
+end
+
+# The generated-code reference of a streamed fold other than `sum`.
+_plate_fold_ref(::typeof(LogExpFunctions.logsumexp)) =
+    GlobalRef(LogExpFunctions, :logsumexp)
+
+# The materialized tensor lanes of a plate reduced by its streamed fold.
+@inline _tensorized_plate_total(::typeof(LogExpFunctions.logsumexp), value) =
+    LogExpFunctions.logsumexp(_tensorized_plate_materialize(value))
+
 # The pointwise buffer's container type and shape come from the axis marker. For
 # an array marker `similar(marker, T, output_axes)` is the single-allocation fast
 # path (unchanged). A `Tuple` axis marker — a tuple-valued batched argument, or a
@@ -553,26 +608,46 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     statements
 end
 
-function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
+# Whether a recipe is the authored one-argument call `f(x)` of its one input.
+# Its source spells the input by the name the source reads it by
+# (`_recipe_source_names`), which is not the value's name in a composed child:
+# the child's `sum(squares)` reads the value `p.squares` scoped under the
+# caller's result `p`.
+function _unary_source_call(recipe::Recipe)
+    recipe.effectful && return false
+    length(recipe.inputs) == 1 || return false
+    source = recipe.source
+    source isa Expr && source.head === :call && length(source.args) == 2 || return false
+    source.args[2] === only(_recipe_source_names(recipe))
+end
+
+# Whether a recipe is the authored `sum(x)` of its one input.
+_plain_sum_recipe(recipe::Recipe) =
+    _unary_source_call(recipe) && _plate_total_consumer_fold(recipe) === sum
+
+# The selected recipe that reduces an authored plate's pointwise port by a
+# streamed fold (`_plate_total_consumer_fold`), or `nothing`.
+function _authored_plate_total_recipe(p::Plan, plate_recipe::Recipe)
     pointwise = only(plate_recipe.outputs)
     pointwise_id = canon_id(p.graph, pointwise.id)
     matches = Recipe[]
     for recipe in p.recipes
         recipe === plate_recipe && continue
-        recipe.effectful && continue
-        length(recipe.inputs) == 1 || continue
+        _unary_source_call(recipe) || continue
         canon_id(p.graph, only(recipe.inputs).id) == pointwise_id || continue
-        source = recipe.source
-        source isa Expr && source.head === :call && length(source.args) == 2 || continue
-        callee = source.args[1]
-        (callee === :sum || callee === GlobalRef(Base, :sum)) || continue
-        source.args[2] === pointwise.name || continue
-        (recipe.op === sum || recipe.op isa _KernelSourceOp) || continue
+        _plate_total_consumer_fold(recipe) === nothing && continue
         push!(matches, recipe)
     end
     length(matches) <= 1 || throw(ArgumentError(
-        "an authored plate pointwise port has more than one selected sum consumer"))
+        "an authored plate pointwise port has more than one selected total consumer"))
     isempty(matches) ? nothing : only(matches)
+end
+
+# The selected summing consumer of an authored plate, or `nothing`.
+function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
+    recipe = _authored_plate_total_recipe(p, plate_recipe)
+    recipe === nothing && return nothing
+    _plate_total_consumer_fold(recipe) === sum ? recipe : nothing
 end
 
 # A scan step whose own operation table holds one plain operation per recipe.
@@ -1616,6 +1691,118 @@ function _fuse_authored_plate_chains(p::Plan; cells_only = false)
     Plan(p.graph, p.have, p.want, selected, producer, p.cost, p.candidates)
 end
 
+# The plan both backend products lower: composed plate chains, then the shared
+# work of nested-plate cells moved out of their plates. A nested cell's own
+# lowering (`_plate_nested_native!`) types its arguments by the cell plan's
+# values, so it composes chains only.
+_lowering_plan(p::Plan) = _hoist_nested_plate_invariants(_fuse_authored_plate_chains(p))
+
+# A plate cell that contains another plate is lowered whole at every outer
+# coordinate (`_plate_nested_native!`), so the invariant grouping of
+# `_lower_authored_plate_loop_native!` does not reach its recipes. Move the
+# cell work that reads only shared values (atomic or scalar plate arguments,
+# and values computed from them alone) in front of the plate: it runs once,
+# and each of its values the remaining cell reads becomes an additional atomic
+# plate argument. As for a flat plate's invariants, this work also runs for an
+# empty domain. Loops, effectful recipes and the cell's result stay in the
+# cell. The authored plan keeps its plate; only the lowered plan changes.
+function _hoist_nested_plate_invariants(p::Plan)
+    g = p.graph
+    copied = nothing
+    recipes = Recipe[]
+    next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
+    fresh() = (id = next_id[]; next_id[] -= 1; id)
+    for r in p.recipes
+        hoisted = r.op isa _AuthoredPlateOp ? _nested_plate_invariants(r) : nothing
+        if hoisted === nothing
+            push!(recipes, r)
+            continue
+        end
+        copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
+            copy(g.producers), copy(g.aliases), g.version))
+        append!(recipes, _hoisted_plate_recipes(copied, r, hoisted, fresh))
+    end
+    copied === nothing && return p
+    template = Plan(copied, p.have, p.want, p.recipes, p.producer, p.cost,
+                    p.candidates)
+    _partial_subplan(template, p.have, p.want, recipes)
+end
+
+# The cell recipes of nested-plate recipe `r` that read shared values only,
+# and the residual cell's new arguments (`frontier`), or `nothing`.
+function _nested_plate_invariants(r::Recipe)
+    op = r.op
+    inner = op.kernel.plan
+    ig = inner.graph
+    loop(q) = q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp,_AuthoredPlateCellOp}
+    # The cells `_lower_authored_plate_loop_native!` lowers whole (`nested`);
+    # every other cell keeps its codegen-time invariant grouping.
+    any(q -> q.op isa _AuthoredPlateOp, inner.recipes) || return nothing
+    atomic = typeof(op).parameters[2]
+    shared = Set{Int}()
+    for (position, input) in enumerate(inner.have)
+        (position in atomic || valtype(r.inputs[position]) <: Number) &&
+            push!(shared, canon_id(ig, input.id))
+    end
+    results = Set(canon_id(ig, v.id) for v in inner.want)
+    moved = Int[]
+    for (index, q) in enumerate(inner.recipes)
+        (q.effectful || loop(q) || isempty(q.inputs)) && continue
+        all(v -> canon_id(ig, v.id) in shared, q.inputs) || continue
+        any(v -> canon_id(ig, v.id) in results, q.outputs) && continue
+        push!(moved, index)
+        foreach(v -> push!(shared, canon_id(ig, v.id)), q.outputs)
+    end
+    isempty(moved) && return nothing
+    produced = Set(canon_id(ig, v.id) for i in moved for v in inner.recipes[i].outputs)
+    frontier = Value[]
+    for (index, q) in enumerate(inner.recipes)
+        index in moved && continue
+        for v in q.inputs
+            cid = canon_id(ig, v.id)
+            cid in produced && !any(f -> canon_id(ig, f.id) == cid, frontier) &&
+                push!(frontier, v)
+        end
+    end
+    residual = Recipe[q for (index, q) in enumerate(inner.recipes)
+                      if !(index in moved)]
+    (; moved = inner.recipes[moved], frontier, residual)
+end
+
+# `r`'s moved cell recipes as outer recipes over the plate's arguments, then
+# `r` over its residual cell with the frontier appended as atomic arguments.
+# New outer values register in `copied`.
+function _hoisted_plate_recipes(copied::Graph, r::Recipe, hoisted, fresh)
+    op = r.op
+    inner = op.kernel.plan
+    ig = inner.graph
+    outer = Dict{Int,Value}(canon_id(ig, v.id) => r.inputs[position]
+                            for (position, v) in enumerate(inner.have))
+    recipes = Recipe[]
+    for q in hoisted.moved
+        outputs = Tuple(get!(outer, canon_id(ig, v.id)) do
+            value!(copied, v.name, valtype(v))
+        end for v in q.outputs)
+        push!(recipes, Recipe(fresh(), Tuple(outer[canon_id(ig, v.id)] for v in q.inputs),
+            outputs, q.op, q.cost, nothing, false, q.source))
+    end
+    readable = Dict(q.id => source for (q, source) in
+                    zip(inner.recipes, op.kernel.lowered_recipes))
+    scalar_plan = _partial_subplan(inner, vcat(inner.have, hoisted.frontier),
+                                   inner.want, hoisted.residual)
+    kernel = _prepare(scalar_plan,
+        _lower_with_ops(scalar_plan; inline_embedded = false)...)
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+        kernel.plan, kernel.ast, Tuple(readable[q.id] for q in hoisted.residual))
+    count = length(inner.have)
+    atomic = (typeof(op).parameters[2]..., (count + 1):(count + length(hoisted.frontier))...)
+    replacement = _AuthoredPlateOp{typeof(kernel),atomic}(kernel, op.axis_checks)
+    push!(recipes, Recipe(r.id,
+        (r.inputs..., (outer[canon_id(ig, v.id)] for v in hoisted.frontier)...),
+        r.outputs, replacement, r.cost, nothing, r.effectful, r.source))
+    recipes
+end
+
 # `producer` (an authored plate with output `cid`) composed into `consumer`, an
 # authored plate or one cell of one, or `nothing` when the consumer reads that
 # output other than per cell.
@@ -2585,7 +2772,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
         @nospecialize(branch), @nospecialize(atomic), @nospecialize(callargs),
         @nospecialize(callvalues), raw_arguments, prepared_arguments, marker,
         output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
-        element_type, into, nonempty::Bool)
+        element_type, into, nonempty::Bool, total_fold = sum)
     # The cell's own operations come first, where the tensorized lowering
     # places them (`_lower_authored_plate_tensorized!`); the condition and the
     # empty-domain cells read them there. Every arm stores into one container
@@ -2616,7 +2803,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_native!(
         inner_kernel, branch, atomic, callargs, callvalues, raw_arguments,
         prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
         recycled, input_type_hints, element_type, into = into || allocate,
-        nonempty, types)
+        nonempty, types, total_fold)
     allocate && push!(body.args, :($pointwise_lhs =
         $(GlobalRef(@__MODULE__, :_narrow_plate_output))($pointwise_lhs)))
     body
@@ -2651,7 +2838,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
         @nospecialize(branch), @nospecialize(atomic), @nospecialize(callargs),
         @nospecialize(callvalues), raw_arguments, prepared_arguments, marker,
         output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
-        element_type, into, nonempty::Bool, types)
+        element_type, into, nonempty::Bool, types, total_fold = sum)
     operation = Expr(:ref, _OPS_ARG, types.op_offset + branch.index)
     condition = Expr(:call, :(getfield(getfield($operation, :f), :condition)),
                      branch.condition_args...)
@@ -2659,7 +2846,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
         Expr(:block), runtime_ops, runtime_recipes, kernel, atomic, callargs,
         callvalues, raw_arguments, prepared_arguments, marker, output_axes,
         pointwise_lhs, total_lhs; recycled, input_type_hints, element_type,
-        into, nonempty = true)
+        into, nonempty = true, total_fold)
     then_block = arm(branch.then_kernel)
     else_block = arm(branch.else_kernel)
     selected = Expr(:if, condition, then_block, else_block)
@@ -2673,7 +2860,7 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
         runtime_recipes, inner_kernel, atomic, callargs, callvalues,
         raw_arguments, prepared_arguments, marker, output_axes, pointwise_lhs,
         total_lhs; recycled, input_type_hints, element_type, into,
-        unswitch = false, cells = false, types)
+        unswitch = false, cells = false, types, total_fold)
     has_cells = Expr(:call, GlobalRef(Base, :!), Expr(:call, GlobalRef(Base, :isempty),
         Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)))
     push!(body.args, Expr(:if, has_cells, selected, empty_block))
@@ -2823,7 +3010,8 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
         pointwise_lhs, total_lhs; recycled = nothing,
-        input_type_hints = nothing, element_type = nothing, into::Bool = false)
+        input_type_hints = nothing, element_type = nothing, into::Bool = false,
+        total_fold = sum)
     # `into`: `pointwise_lhs` already holds a buffer at least as long as the
     # plate, of its element type; the cells are written into it in place and
     # the binding is left alone (a strip refill, `_lower_authored_scan_strips!`).
@@ -2975,7 +3163,7 @@ Base.@nospecializeinfer function _lower_authored_plate_native!(
     _lower_authored_plate_cells_native!(body, runtime_ops, runtime_recipes,
         inner_kernel, atomic, callargs, callvalues, raw_arguments,
         prepared_arguments, marker, output_axes, pointwise_lhs, total_lhs;
-        recycled, input_type_hints, element_type, into)
+        recycled, input_type_hints, element_type, into, total_fold)
 end
 
 # The cells of an authored plate, once its arguments, axes and marker are
@@ -2990,7 +3178,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         output_axes, pointwise_lhs, total_lhs; recycled = nothing,
         input_type_hints = nothing, element_type = nothing, into::Bool = false,
         unswitch::Bool = true, cells::Bool = true, nonempty::Bool = false,
-        types = nothing)
+        types = nothing, total_fold = sum)
     inner = inner_kernel.plan
     if unswitch
         branch = _plate_shared_branch(inner_kernel, atomic, callargs, callvalues)
@@ -2998,7 +3186,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
             body, runtime_ops, runtime_recipes, inner_kernel, branch, atomic,
             callargs, callvalues, raw_arguments, prepared_arguments, marker,
             output_axes, pointwise_lhs, total_lhs; recycled, input_type_hints,
-            element_type, into, nonempty)
+            element_type, into, nonempty, total_fold)
     end
     plate_eltype = gensym(:plate_eltype)
     index = gensym(:plate_index)
@@ -3038,7 +3226,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         output_axes, pointwise_lhs, total_lhs, recycled, into, cells,
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
-        lane_arms)
+        lane_arms; total_fold)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -3118,7 +3306,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         pointwise_lhs, total_lhs, recycled, into::Bool, cells::Bool,
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
-        lane_arms)
+        lane_arms; total_fold = sum)
     groups = _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues)
     nested === nothing || (groups = [])
@@ -3169,9 +3357,10 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         # against `Float64` cells. Without a concrete or numeric `T`, the first
         # cell starts the total, and only an empty plate falls back to
         # `zero(eltype(marker))`.
-        push!(body.args, Expr(:(=), accumulator,
-            Expr(:call, GlobalRef(@__MODULE__, :_plate_total_seed),
-                 plate_eltype, marker)))
+        seed = Expr(:call, GlobalRef(@__MODULE__, :_plate_total_seed),
+                    plate_eltype, marker)
+        total_fold === sum || insert!(seed.args, 2, _plate_fold_ref(total_fold))
+        push!(body.args, Expr(:(=), accumulator, seed))
     end
 
     loopbody = Expr(:block)
@@ -3239,9 +3428,12 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # (`_lower_plate_reduction_native`) already assume.
     pointwise_lhs === nothing ||
         push!(loopbody.args, _inbounds_expr(:($pointwise_lhs[$index] = $scalar_result)))
-    accumulator === nothing ||
-        push!(loopbody.args, :($accumulator =
-            $(GlobalRef(@__MODULE__, :_plate_total_add))($accumulator, $scalar_result)))
+    if accumulator !== nothing
+        add = Expr(:call, GlobalRef(@__MODULE__, :_plate_total_add),
+                   accumulator, scalar_result)
+        total_fold === sum || insert!(add.args, 2, _plate_fold_ref(total_fold))
+        push!(loopbody.args, :($accumulator = $add))
+    end
     if has_scheduled_groups
         push!(loopbody.args, :($previous = $index))
         push!(loopbody.args, :($first_coordinate = false))
@@ -3257,26 +3449,30 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
-    # A pure total-only one-axis plate is a scalar reduction. SIMD requires
-    # an indexable range, whereas `_plate_cells` returns a Generator for one
-    # axis. Iterate that axis directly and reconstruct the same cell index.
-    # Expand before an embedded kernel renames locals: late macro expansion
-    # can interpret its renamed index as a module global.
-    if accumulator !== nothing && pointwise_lhs === nothing &&
+    # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
+    # SIMD needs an indexable iteration space, whereas `_plate_cells` returns
+    # a Generator for one axis: `_plate_simd_cells` iterates that axis's range
+    # directly (and several axes as their `CartesianIndices`), and the body
+    # reconstructs the same cell index. This replaces the plain loop rather
+    # than branching beside it, so the cell body is emitted once. Expand
+    # before an embedded kernel renames locals: late macro expansion can
+    # interpret its renamed index as a module global.
+    if accumulator !== nothing && pointwise_lhs === nothing && total_fold === sum &&
             !has_scheduled_groups && nested === nothing &&
             all(r -> !r.effectful, inner.recipes)
         linear = gensym(:plate_linear)
         simd_body = Expr(:block,
             Expr(:(=), index, Expr(:call, GlobalRef(Base, :CartesianIndex), linear)),
-            deepcopy(loopbody.args)...)
+            loopbody.args...)
         simd_loop = Expr(:for, Expr(:(=), linear,
-            Expr(:call, GlobalRef(Base, :only), output_axes)), simd_body)
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_simd_cells), output_axes)),
+            simd_body)
         simd = Expr(:macrocall, GlobalRef(Base, Symbol("@simd")),
             LineNumberNode(0), simd_loop)
-        cell_loop = Expr(:if, :(length($output_axes) == 1),
-            macroexpand(@__MODULE__, simd), cell_loop)
+        cell_loop = macroexpand(@__MODULE__, simd)
     end
-    reduction = cells && nested === nothing ? _plate_reduction_plan(
+    reduction = cells && nested === nothing &&
+            (accumulator === nothing || total_fold === sum) ? _plate_reduction_plan(
         inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
         pointwise_lhs) : nothing
     cells && append!(body.args, declarations)
@@ -3395,7 +3591,7 @@ end
 Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         body, runtime_ops, runtime_recipes,
         @nospecialize(op::_AuthoredPlateOp), callargs, callvalues,
-        pointwise_lhs, total_lhs; lanes::Bool = false)
+        pointwise_lhs, total_lhs; lanes::Bool = false, total_fold = sum)
     inner_kernel = op.kernel
     inner = inner_kernel.plan
     length(inner.want) == 1 || throw(ArgumentError(
@@ -3493,8 +3689,10 @@ Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         lanes ? :_tensorized_plate_lanes : :_tensorized_plate_pointwise), scalar_result)
     pointwise_lhs === nothing ||
         push!(body.args, :($pointwise_lhs = $pointwise))
-    total = Expr(:call,
-        GlobalRef(@__MODULE__, :_tensorized_plate_sum), scalar_result)
+    total = total_fold === sum ?
+        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_sum), scalar_result) :
+        Expr(:call, GlobalRef(@__MODULE__, :_tensorized_plate_total),
+             _plate_fold_ref(total_fold), scalar_result)
     total_lhs === nothing || push!(body.args, :($total_lhs = $total))
     body
 end
@@ -3714,23 +3912,30 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 "an authored plate recipe must have exactly one pointwise output"))
             pointwise = only(r.outputs)
             pointwise_id = canon_id(g, pointwise.id)
-            sum_recipe = _authored_plate_sum_recipe(p, r)
+            total_recipe = _authored_plate_total_recipe(p, r)
+            total_fold = total_recipe === nothing ? sum :
+                _plate_total_consumer_fold(total_recipe)
+            # Scan consumers and strip refills stream sums only; another fold
+            # reads its materialized pointwise port there.
+            if total_fold !== sum && (haskey(pending_scans, r.id) || r.id in strip_members)
+                total_recipe, total_fold = nothing, sum
+            end
             pointwise_needed = pointwise_id in Set(canon_id(g, w.id) for w in p.want) ||
-                any(candidate -> candidate !== sum_recipe &&
+                any(candidate -> candidate !== total_recipe &&
                     any(input -> canon_id(g, input.id) == pointwise_id,
                         candidate.inputs), p.recipes)
             pointwise_lhs = pointwise_needed ? nm(pointwise) : nothing
-            total_lhs = sum_recipe === nothing ? nothing : nm(only(sum_recipe.outputs))
+            total_lhs = total_recipe === nothing ? nothing : nm(only(total_recipe.outputs))
             pointwise_lhs === nothing || push!(assigned, pointwise_id)
-            if sum_recipe !== nothing
-                push!(assigned, canon_id(g, only(sum_recipe.outputs).id))
-                push!(skipped_recipes, sum_recipe.id)
+            if total_recipe !== nothing
+                push!(assigned, canon_id(g, only(total_recipe.outputs).id))
+                push!(skipped_recipes, total_recipe.id)
             end
             if declare_types
                 pointwise_lhs === nothing ||
                     _declare_typed_output!(body, pointwise, pointwise_lhs, declared)
                 total_lhs === nothing || _declare_typed_output!(
-                    body, only(sum_recipe.outputs), total_lhs, declared)
+                    body, only(total_recipe.outputs), total_lhs, declared)
             end
             if !tensorized && haskey(pending_scans, r.id)
                 scan_recipe, scan_args, scan_offset, scan_type_offset =
@@ -3750,8 +3955,9 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             elseif tensorized
                 _lower_authored_plate_tensorized!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
-                    pointwise_lhs, total_lhs; lanes = pointwise_lhs !== nothing &&
-                        _plate_read_by_plates(p, pointwise_id, sum_recipe))
+                    pointwise_lhs, total_lhs; total_fold,
+                    lanes = pointwise_lhs !== nothing &&
+                        _plate_read_by_plates(p, pointwise_id, total_recipe))
             elseif r.id in strip_members
                 hints = type_hints === nothing ? nothing :
                     Any[type_hints[canon_id(g, v.id)] for v in r.inputs]
@@ -3768,6 +3974,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 _lower_authored_plate_native!(
                     body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
                     pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    total_fold,
                     input_type_hints = type_hints === nothing ? nothing :
                         Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
             end
@@ -4265,7 +4472,7 @@ end
 # as the position driver always did: its body is host-only by construction
 # (a traced batch calls the scalar target through `_replica`).
 _replicated_part_ast(part::Plan; recycle = Pair{Int,Symbol}[]) =
-    _lower_with_ops(_fuse_authored_plate_chains(part); declare = true, recycle)
+    _lower_with_ops(_lowering_plan(part); declare = true, recycle)
 
 # A bound constant keeps its exact value type (a bound view stays a view).
 function _replicated_declares(p::Plan, value::Value)
@@ -5248,7 +5455,8 @@ function _externalize_bound_array_call(f, ops;
         slot === nothing ? ops[index] :
             _ExternalBoundArraySlot{slot}()
     end
-    structured = any(value -> value isa Union{Tuple,NamedTuple}, values)
+    structured = any(value -> value isa Union{Tuple,NamedTuple} ||
+                              _bound_record(value), values)
     external_body = structured ?
         _externalize_bound_array_body(f, positions, values) : nothing
     callable = external_body === nothing ? f :
@@ -5270,7 +5478,23 @@ _bound_array_leaves(values::Tuple) =
     Tuple(Iterators.flatten(map(_bound_array_leaves, values)))
 _bound_array_leaves(value::NamedTuple) = _bound_array_leaves(Tuple(value))
 _bound_array_leaves(value::AbstractArray) = (value,)
-_bound_array_leaves(value) = ()
+_bound_array_leaves(value) = _bound_record(value) ?
+    _bound_array_leaves(_bound_record_fields(value)) : ()
+
+# A bound immutable struct whose fields hold arrays (a model's wrapper around
+# a data matrix, say) is a record: its array leaves leave the callable like a
+# named tuple's, and the body rebuilds it with `new` from the same field
+# values. Left in the operation table, the arrays are part of the callable,
+# whose readonly proof native Reverse cannot then always complete.
+_bound_record(value) = _bound_record_type(typeof(value)) &&
+    _has_external_bound_array(_bound_record_fields(value), 0)
+_bound_record_type(T::DataType) = isconcretetype(T) && isstructtype(T) &&
+    !ismutabletype(T) && fieldcount(T) > 0 &&
+    !(T <: Union{Tuple,NamedTuple,AbstractArray,Number,Function,Type,
+                 Module,Symbol,AbstractString})
+_bound_record_type(T) = false
+_bound_record_fields(value) =
+    ntuple(i -> getfield(value, i), Val(fieldcount(typeof(value))))
 
 function _bound_rebuild_expr(value::NamedTuple, ports, next::Ref{Int})
     fields = Any[_bound_rebuild_expr(v, ports, next) for v in value]
@@ -5280,7 +5504,11 @@ _bound_rebuild_expr(value::Tuple, ports, next::Ref{Int}) =
     Expr(:tuple, Any[_bound_rebuild_expr(v, ports, next) for v in value]...)
 _bound_rebuild_expr(::AbstractArray, ports, next::Ref{Int}) =
     ports[next[] += 1]
-_bound_rebuild_expr(value, ports, next::Ref{Int}) = QuoteNode(value)
+function _bound_rebuild_expr(value, ports, next::Ref{Int})
+    _bound_record(value) || return QuoteNode(value)
+    fields = Any[_bound_rebuild_expr(v, ports, next) for v in _bound_record_fields(value)]
+    Expr(:new, typeof(value), fields...)
+end
 
 # A compiled body whose operation-table accesses are literal can load hidden
 # bound operands directly. This changes only its internal argument boundary;
@@ -5327,7 +5555,9 @@ function _externalize_bound_array_body(
     compile(ast)
 end
 
-_has_external_bound_array(value, min_elements) = false
+_has_external_bound_array(value, min_elements) =
+    _bound_record_type(typeof(value)) &&
+    _has_external_bound_array(_bound_record_fields(value), min_elements)
 _has_external_bound_array(value::AbstractArray, min_elements) =
     length(value) >= min_elements
 _has_external_bound_array(value::Union{Tuple,NamedTuple}, min_elements) =
@@ -6136,7 +6366,7 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
             typeof(value)
         end
     end
-    lowered_plan = _fuse_authored_plate_chains(p)
+    lowered_plan = _lowering_plan(p)
     exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
     native_ast, ops, recipes = _lower_with_ops(lowered_plan; exemplar_types)
     isempty(passes) || (native_ast = transform(native_ast, passes...))

@@ -101,6 +101,46 @@ end
         points = (collect(range(-0.5, 0.5; length = 11)),))
 end
 
+# The same softmax over `hcat` of declared per-state columns: an `hcat` of
+# model-level values is a model-level matrix, so the named, two-step and
+# one-line spellings mean what the declared matrix `W` does above.
+@testset "input-driven transitions from hcat columns" begin
+    u = [0.5 1.0; 1.2 -0.3; 0.1 0.4; 2.0 1.1; -0.4 0.2; 0.9 -1.0]
+    function oracle(c)
+        R = u * hcat(c.w1, c.w2)
+        P = exp.(R) ./ sum(exp.(R); dims = 2)
+        path_sum((t, k) -> logpdf(Normal(c.mu[k], 1), y[t]),
+            (i, j, t) -> P[t, i], [0.5, 0.5], length(y))
+    end
+    softmaxes = (
+        :(begin
+            R = u * hcat(w1, w2)
+            E = exp.(R)
+            P = E ./ sum.(eachrow(E))
+        end),
+        :(begin
+            R = u * hcat(w1, w2)
+            P = exp.(R .- log.(sum.(eachrow(exp.(R)))))
+        end),
+        :(begin
+            Wm = hcat(w1, w2)
+            P = exp.(u * Wm) ./ sum.(eachrow(exp.(u * Wm)))
+        end),
+    )
+    for softmax in softmaxes
+        check_model(quote
+            w1[axes(u, 2)] .~ Normal.(0, 5)
+            w2[axes(u, 2)] .~ Normal.(0, 5)
+            mu ~ Ordered(Normal(0, 5), 2)
+            $(softmax.args...)
+            moves = reshape(permutedims(P[2:end, :]), 2, 1, size(u, 1) - 1)
+            y ~ LogDensity(normal_hmm_logdensity, mu, 1.0, moves, [0.5, 0.5])
+        end, (; y, u), oracle;
+            points = ([0.3, -0.4, 0.1, 0.5, -0.2, 0.6],
+                [-0.7, 0.2, 0.9, -0.3, 0.4, 1.1]))
+    end
+end
+
 streams = hcat([0.5, 1.2, 0.1, 2.0, 0.3, 0.8], [1.0, 0.3, 0.7, 0.2, 1.4, 0.5])
 
 @testset "two exponential streams" begin
@@ -113,6 +153,25 @@ streams = hcat([0.5, 1.2, 0.1, 2.0, 0.3, 0.8], [1.0, 0.3, 0.7, 0.2, 1.4, 0.5])
         streams ~ LogDensity(exponential_hmm_logdensity,
             1 ./ exp.(hcat(phi, lambda)), Gamma, [1.0, 1.0])
     end, (; streams), c -> path_sum((t, k) ->
+            logpdf(Exponential(exp(-c.phi[k])), streams[t, 1]) +
+            logpdf(Exponential(exp(-c.lambda[k])), streams[t, 2]),
+        (i, j, t) -> rows(c.theta1, c.theta2)[i, j], [1.0, 1.0], size(streams, 1));
+        points = ([0.3, -0.4, 0.1, 0.5, -0.2, 0.3],))
+end
+
+# The same matrix as an in-model `hcat` definition of its columns binds once
+# and is observed as the same whole value (snag rkppl-undotted-c-f517b2f1).
+@testset "two exponential streams defined in the model" begin
+    check_model(quote
+        theta1 ~ Dirichlet([4.0, 2.0])
+        theta2 ~ Dirichlet([2.0, 4.0])
+        phi ~ Ordered(Normal(0, 1), 2)
+        lambda ~ Ordered(Normal(0, 1), 2)
+        Gamma = permutedims(hcat(theta1, theta2))
+        streams = hcat(s1, s2)
+        streams ~ LogDensity(exponential_hmm_logdensity,
+            1 ./ exp.(hcat(phi, lambda)), Gamma, [1.0, 1.0])
+    end, (; s1 = streams[:, 1], s2 = streams[:, 2]), c -> path_sum((t, k) ->
             logpdf(Exponential(exp(-c.phi[k])), streams[t, 1]) +
             logpdf(Exponential(exp(-c.lambda[k])), streams[t, 2]),
         (i, j, t) -> rows(c.theta1, c.theta2)[i, j], [1.0, 1.0], size(streams, 1));

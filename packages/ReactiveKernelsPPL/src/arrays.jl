@@ -31,12 +31,12 @@ end
 # slices). `:rows` / `:cols` slice a two-axis array, `:vector` is a
 # one-axis array drawn once; simplex and ordered slices are two-axis only
 # (their one-vector forms are `phi ~ Dirichlet(alpha)`,
-# `c ~ Ordered(Normal(m, s), K)`).
+# `c ~ Ordered(Normal(m, s), K)`), and an ICAR field is one vector only.
 const _MV_SLICE_FAMILIES = Dict{Symbol,Tuple{Symbol,Symbol}}(
     Symbol(stem, :_, sl) => (stem, sl)
     for (stem, sls) in ((:mvnormal_cholesky, (:rows, :cols, :vector)),
         (:mvnormal, (:rows, :cols, :vector)), (:dirichlet, (:rows, :cols)),
-        (:ordered_normal, (:rows, :cols)))
+        (:ordered_normal, (:rows, :cols)), (:icar, (:vector,)))
     for sl in sls)
 
 _is_slice_array(p::ArrayParameter) = haskey(_MV_SLICE_FAMILIES, p.family)
@@ -390,12 +390,14 @@ _is_fill_call(a) = a isa Expr && a.head === :call && length(a.args) == 3 &&
 # The family argument roles of each slice stem, in positional-key order:
 # `:vector` (a K-vector, shared or per slice), `:matrix` (a shared K×K
 # matrix), `:scalar` (a shared scalar), `:count` (the literal slice
-# length).
+# length), `:edges` (an integer node vector of a graph's edge list, one
+# entry per edge, read whole).
 _slice_roles(::Val{:mvnormal_cholesky}) = (arg1 = :vector, arg2 = :matrix)
 _slice_roles(::Val{:mvnormal}) = (arg1 = :vector, arg2 = :matrix)
 _slice_roles(::Val{:dirichlet}) = (arg1 = :vector,)
 _slice_roles(::Val{:ordered_normal}) =
     (arg1 = :scalar, arg2 = :scalar, arg3 = :count)
+_slice_roles(::Val{:icar}) = (arg1 = :edges, arg2 = :edges)
 _slice_roles(p::ArrayParameter) = _slice_roles(Val(_slice_stem(p)))
 
 _slice_noun(p::ArrayParameter) = _slice_kind(p) === :rows ? "rows" :
@@ -420,6 +422,19 @@ function _validate_array_slices(plan::StructuralPlan, p::ArrayParameter)
         if role === :count
             a isa Int && a >= 1 || _fail(p.label, "array $(p.name): the " *
                 "slice length is a literal ≥ 1, got $(repr(a))")
+            continue
+        end
+        if role === :edges
+            # An edge list is data: a name or a data-only expression, or a
+            # literal vector of node indices. Binding checks its values.
+            if a isa Expr && a.head === :vect
+                all(x -> x isa Integer && !(x isa Bool) && x >= 1, a.args) ||
+                    _fail(p.label, "array $(p.name): an `ICAR` node vector " *
+                        "holds positive integer node indices, got $(repr(a))")
+                continue
+            end
+            a isa Symbol && a === p.name && _fail(p.label, "array " *
+                "$(p.name) cannot index its own ICAR edge list")
             continue
         end
         if _is_slice_iterator(a)
@@ -497,6 +512,7 @@ function _validate_array_slices_data(plan::StructuralPlan, p::ArrayParameter,
     G, K = kind === :rows ? (dims[1], dims[2]) :
         kind === :cols ? (dims[2], dims[1]) : (1, dims[1])
     roles = _slice_roles(p)
+    _slice_stem(p) === :icar && return _validate_icar_edges(plan, p, K)
     for (k, a) in pairs(p.args)
         role = roles[k]
         if role === :count
@@ -515,6 +531,29 @@ function _validate_array_slices_data(plan::StructuralPlan, p::ArrayParameter,
             "has $G slice(s) of length $K, so its argument $(repr(a)) has " *
             "size $(repr(want)), but $(repr(b)) has size $(repr(sz))")
     end
+    return nothing
+end
+
+# The edge list of `phi[1:N] ~ ICAR(node1, node2)` is bound data: two
+# integer vectors of one length whose entries are node indices of `phi`.
+# Data-only expressions evaluate here, as for any other data-only value.
+function _validate_icar_edges(plan::StructuralPlan, p::ArrayParameter, N::Int)
+    edges = map(values(p.args)) do a
+        v = a isa Expr && a.head === :vect ? Int[a.args...] :
+            _bound_data_value(plan, a, p.name, "the `ICAR` edge list")
+        v isa AbstractVector{<:Integer} && !(eltype(v) <: Bool) ||
+            _fail(p.label, "array $(p.name): an `ICAR` node vector is an " *
+                "integer vector, got $(repr(a)) = $(summary(v))")
+        bad = findfirst(i -> !(1 <= i <= N), v)
+        bad === nothing || _fail(p.label, "array $(p.name): `ICAR` node " *
+            "index $(v[bad]) (entry $bad of $(repr(a))) is not a node of " *
+            "$(p.name), which has $N")
+        v
+    end
+    length(edges[1]) == length(edges[2]) || _fail(p.label, "array " *
+        "$(p.name): the `ICAR` node vectors list one entry per edge, but " *
+        "$(repr(p.args.arg1)) has $(length(edges[1])) and " *
+        "$(repr(p.args.arg2)) has $(length(edges[2]))")
     return nothing
 end
 
@@ -652,10 +691,12 @@ function _value_axes(plan::StructuralPlan, ex,
     if fn isa GlobalRef && getglobal(fn.mod, fn.name) === Base.hcat
         return _hcat_axes(Any[ax(a) for a in args])
     end
-    # Qualified Base calls have the same shape rules as their bare spelling.
-    fn isa GlobalRef && fn.mod === Base && (fn = fn.name)
+    # Qualified Base calls, and the Julia function a bare reduction names
+    # (`Statistics.mean`), have the same shape rules as their bare spelling.
+    fn isa GlobalRef && (fn.mod === Base || fn.name in REDUCTION_FNS &&
+        fn == _julia_reduction_ref(fn.name)) && (fn = fn.name)
     fn isa Symbol || return nothing
-    fn in REDUCTION_FNS && return Any[]
+    fn in REDUCTION_FNS && return _reduction_axes(ax, args)
     fn === :transpose && length(args) == 1 &&
         return _adjoint_axes(ax(args[1]))
     fn === :* && return foldl(_matmul_axes, Any[ax(a) for a in args])
@@ -666,6 +707,31 @@ function _value_axes(plan::StructuralPlan, ex,
         all(a -> ax(a) == Any[], args) && return Any[]
     end
     return nothing
+end
+
+# A reduction is a scalar unless it keeps dimensions: `sum(A; dims = d)`
+# has `A`'s axes with each reduced one of length 1, as in Julia (a `dims`
+# beyond `A`'s rank leaves it unchanged). A `dims` that is not literal has
+# no known shape before the value is computed.
+function _reduction_axes(ax, args)
+    dims = nothing
+    for a in args, kw in (Meta.isexpr(a, :parameters) ? a.args : (a,))
+        kw === :dims && (dims = kw)
+        Meta.isexpr(kw, :kw, 2) && kw.args[1] === :dims && (dims = kw.args[2])
+    end
+    dims === nothing && return Any[]
+    ds = dims isa Int ? (dims,) : Meta.isexpr(dims, :tuple) &&
+        all(d -> d isa Int, dims.args) ? Tuple(dims.args) : nothing
+    (ds === nothing || !all(>=(1), ds)) && return nothing
+    pos = Any[a for a in args if !Meta.isexpr(a, (:parameters, :kw))]
+    isempty(pos) && return nothing
+    out = ax(last(pos))
+    out === nothing && return nothing
+    out = copy(out)
+    for d in ds
+        d <= length(out) && (out[d] = 1)
+    end
+    return out
 end
 
 # Concatenation shares the same shape walk as broadcasts, products and
@@ -1170,6 +1236,7 @@ _slice_transform(::Val{:mvnormal_cholesky}, kind) = :identity
 _slice_transform(::Val{:mvnormal}, kind) = :identity
 _slice_transform(::Val{:dirichlet}, kind) = Symbol(:simplex_, kind)
 _slice_transform(::Val{:ordered_normal}, kind) = Symbol(:ordered_, kind)
+_slice_transform(::Val{:icar}, kind) = :identity
 
 const _SLICE_TRANSFORMS = (:simplex_rows, :simplex_cols, :ordered_rows,
     :ordered_cols)
@@ -1693,6 +1760,7 @@ _slice_density(::Val{:dirichlet}) = :_dirichlet_slices_logpdf
 _slice_density(::Val{:ordered_normal}) = :_ordered_normal_slices_logpdf
 
 function _slice_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
+    _slice_stem(p) === :icar && return _icar_prior_call!(stmts, p)
     roles = _slice_roles(p)
     vals = Any[]
     for (i, (k, a)) in enumerate(pairs(p.args))
@@ -1721,6 +1789,24 @@ function _slice_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
     end
     o = _orientation_expr(_slice_orientation(_slice_kind(p)))
     return :($(_slice_density(Val(_slice_stem(p))))($o, $(p.name), $(vals...)))
+end
+
+# An ICAR field's density is RK's graph law `icar_logdensity`, called
+# directly so its edge plate composes into the model graph. Its ports are
+# names: the field, then the two node vectors.
+function _icar_prior_call!(stmts::Vector{Expr}, p::ArrayParameter)
+    ports = Any[p.name]
+    for (i, a) in enumerate(values(p.args))
+        if a isa Symbol
+            push!(ports, a)
+        else
+            local_name = Symbol(:_ppl_parg_, p.name, :_, i)
+            push!(stmts, :($local_name = $a))
+            push!(ports, local_name)
+        end
+    end
+    return Expr(:call, GlobalRef(DistributionKernelSources, :icar_logdensity),
+        ports...)
 end
 
 _slice_value_expr(a) = _is_array_literal(a) ? _float64_array_literal(a) :

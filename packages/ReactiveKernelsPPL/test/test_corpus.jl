@@ -102,8 +102,13 @@ function _canon(io::IO, x, depth::Int = 0, names = nothing)
             (fs = filter(!=(:external_observations), fs))
         x isa StructuralPlan && isempty(x.cell_broadcasts) &&
             (fs = filter(!=(:cell_broadcasts), fs))
+        x isa StructuralPlan && isempty(x.factors) &&
+            (fs = filter(!=(:factors), fs))
         x isa VectorParameter && x.extent_expr === nothing &&
             (fs = filter(!=(:extent_expr), fs))
+        # A scan seed or step without a support override keeps its golden.
+        x isa Union{ScanSetup,ScanStep} && x.support === nothing &&
+            (fs = filter(!=(:support), fs))
         # Canonical mathematical plans compare loop/broadcast spellings.
         # Their indexing admission metadata is tested independently.
         x isa StructuralPlan &&
