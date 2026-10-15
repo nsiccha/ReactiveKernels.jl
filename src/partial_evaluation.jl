@@ -897,6 +897,18 @@ end
     checkbounds(x, lanes)
     Base.unsafe_view(x, lanes)
 end
+# Base.view flattens an indexed view by materializing its old indices at the
+# selected lanes. Keep the read-only parent instead: a partition of a gathered
+# argument then needs no new index vector on each evaluation. The bound lane
+# indices and every parent remain borrowed, just as for the dense case above.
+@inline _lane_view(x::SubArray{T,1}, lanes::Vector{Int}) where {T} =
+    _lane_subarray_view(_kernel_source_arg_style(x), x, lanes)
+@inline function _lane_subarray_view(::Val{:native}, x, lanes)
+    checkbounds(x, lanes)
+    Base.SubArray(x, (lanes,))
+end
+@inline _lane_subarray_view(::Val{:tensorized}, x, lanes) =
+    _tensorized_view(x, lanes)
 @noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
 # The gathered value is typed by the gather's own result (a view of an array
