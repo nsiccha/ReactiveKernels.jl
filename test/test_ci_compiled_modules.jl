@@ -81,7 +81,12 @@ end
     @test occursin("timeout-minutes: 30", smoke)
     @test occursin("julia-version: ['1', 'pre']", smoke)
     @test occursin("--compiled-modules=yes", smoke)
-    @test occursin("Pkg.activate(pwd())", smoke)
+    # The pinned unregistered source dependencies are resolved into the
+    # repository project before the fresh depot instantiates it.
+    sources = findfirst("--project=. deps/source_dependencies.jl", smoke)
+    instantiate = findfirst("--compiled-modules=yes --project=. -e 'using Pkg; Pkg.instantiate()", smoke)
+    @test sources !== nothing && instantiate !== nothing &&
+        last(sources) < first(instantiate)
     @test occursin("Pkg.precompile(; strict=true)", smoke)
     @test occursin("using ReactiveKernels", smoke)
     @test occursin("timeout-minutes: 90", reactant)
