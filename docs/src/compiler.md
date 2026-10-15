@@ -210,7 +210,9 @@ One rewrite reaches into those callables. Natively, a generator fold over a
 data-length iterator, `sum(term for i in iter [if condition]; init = x)` with
 `iter` an `eachindex`, `axes`, `range` or `a:b` call, runs as its
 explicit-accumulator loop in every recipe, plate cell, scan step and
-`@traceable` method body. Base evaluates `sum` with `init` as the left fold
+`@traceable` method body. A call head resolved to its binding, as `@rkppl`
+lowering emits `1:P` (a `GlobalRef` to Base's `:` in the model module), is the
+same iterator. Base evaluates `sum` with `init` as the left fold
 `foldl(add_sum, …; init)` on Julia 1.10 through 1.13, so the loop returns
 Base's value bitwise, in Base's order: the iterator, then `init`, then the
 condition and the term for each element. The rewrite exists for Julia 1.10's
