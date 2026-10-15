@@ -3275,7 +3275,8 @@ end
 # The NATIVE body of authored source (a recipe, a plate cell, a scan step, a
 # `@traceable` method) with each generator fold over a data-length iterator,
 # `sum(term for i in iter [if condition]; init = x)` with `iter` matching
-# `_kernel_range_iterator`, spelled as its explicit-accumulator loop:
+# `_kernel_native_range_iterator` (`_kernel_range_iterator`, or the same call
+# with a resolved head), spelled as its explicit-accumulator loop:
 #
 #     let it = iter, acc = x
 #         for i in it
@@ -3422,11 +3423,28 @@ function _kernel_native_folds(ex, mod, shadowed::Set{Symbol})
     _kernel_native_folds_walk(ex)
 end
 
+# A data-length iterator of the native fold rewrite: `_kernel_range_iterator`'s
+# syntax, or the same call with a resolved head, a `GlobalRef` whose binding is
+# Base's `:`, `eachindex`, `axes`, `range` or `OneTo`.  `@rkppl` lowering
+# resolves every call head in the model module, so its `1:P` arrives as
+# `GlobalRef(<model module>, :(:))(1, P)`; reading that binding keeps the
+# rewrite, and its loop, for generated model bodies too.  Any other binding of
+# those names keeps its own call.
+_kernel_native_range_iterator(iter) = _kernel_range_iterator(iter) ||
+    (iter isa Expr && iter.head === :call && !isempty(iter.args) &&
+     _kernel_base_range_head(iter.args[1]))
+_kernel_base_range_head(head) = false
+function _kernel_base_range_head(head::GlobalRef)
+    isdefined(head.mod, head.name) || return false
+    f = getglobal(head.mod, head.name)
+    any(g -> f === g, (Base.:(:), Base.eachindex, Base.axes, Base.range, Base.OneTo))
+end
+
 function _kernel_native_folds_walk(ex)
     ex isa Expr || return ex
     ex.head in (:quote, :inert, :meta, :macrocall) && return ex
     parts = _kernel_generator_sum_parts(ex)
-    if parts !== nothing && _kernel_range_iterator(parts.iterator) &&
+    if parts !== nothing && _kernel_native_range_iterator(parts.iterator) &&
        !_kernel_fold_term_escapes(parts.term) &&
        (parts.condition === nothing || !_kernel_fold_term_escapes(parts.condition))
         iterator = gensym(:native_sum_iterator)

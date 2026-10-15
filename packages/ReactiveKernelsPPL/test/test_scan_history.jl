@@ -24,13 +24,20 @@ end
 
 # Value against the independent oracle at several points, and the native
 # Enzyme Reverse gradient against central finite differences of the oracle.
-function _hist_check(f, oracle; points = 3)
+# With `reverse_gap`, the gradient is a pinned upstream capability gap: the
+# value is checked through the primal, and the gradient leg is `@test_broken`
+# (an Unexpected Pass under an Enzyme that carries the repair).
+function _hist_check(f, oracle; points = 3, reverse_gap = false)
     n = f.built.layout.total
     for j in 1:points
         u = [0.15 * sin(3j + i) for i in 1:n]
         g = similar(u)
-        value, _ = sampler_value_and_gradient!(f.q, g, u)
-        @test value ≈ oracle(u) rtol = 1e-11
+        result = try
+            sampler_value_and_gradient!(f.q, g, u)
+        catch err
+            reverse_gap && err isa Enzyme.Compiler.EnzymeRuntimeActivityError || rethrow()
+            nothing
+        end
         h = cbrt(eps(Float64))
         fd = map(1:n) do i
             up, dn = copy(u), copy(u)
@@ -38,7 +45,14 @@ function _hist_check(f, oracle; points = 3)
             dn[i] -= h
             (oracle(up) - oracle(dn)) / (2h)
         end
-        @test g ≈ fd rtol = 1e-5 atol = 1e-7
+        if reverse_gap
+            @test f.q(u) ≈ oracle(u) rtol = 1e-11
+            @test_broken result !== nothing && isapprox(result[1], oracle(u); rtol = 1e-11) &&
+                isapprox(g, fd; rtol = 1e-5, atol = 1e-7)
+        else
+            @test result[1] ≈ oracle(u) rtol = 1e-11
+            @test g ≈ fd rtol = 1e-5 atol = 1e-7
+        end
     end
 end
 
@@ -503,21 +517,43 @@ function _hist_imperial_oracle(d)
     end
 end
 
+# The program with every generator fold given `init = 0.0`.
+_hist_with_init(ex) = ex isa Expr ?
+    (ex.head === :call && ex.args[1] === :sum && length(ex.args) == 2 &&
+     Meta.isexpr(ex.args[2], :generator) ?
+        Expr(:call, :sum, Expr(:parameters, Expr(:kw, :init, 0.0)), ex.args[2]) :
+        Expr(ex.head, map(_hist_with_init, ex.args)...)) : ex
+
+# Native Reverse through `sum(X[m, t, j] * alpha[j] for j in 1:P)`, Base's fold
+# over a generator whose closure holds the bound array `X` beside the active
+# `alpha`: registered Enzyme (0.13.216) rejects the store of `X` into that
+# closure on Julia 1.12 and 1.13 (`EnzymeRuntimeActivityError`), while Julia
+# 1.10.12 inlines this fold. The Enzyme dogfood line repairs it
+# (`reactivekernels-use` §7af); `benchmark/repro_enzyme_generator_fold_capture.jl`
+# reproduces it with Enzyme alone.
+const _HIST_GENERATOR_CAPTURE_GAP = VERSION >= v"1.11-"
+
 @testset "scan history: the Imperial COVID-19 renewal model per country" begin
     d = _hist_imperial_data(3, 24, 2)
     data = Dict{Symbol,Any}(pairs(d))
     snapshot = deepcopy(data)
-    plan = bind_data(lower_rkppl(_hist_imperial_program(), data;
-        conditioned = (:observed,)), data)
-    built = build_kernel(plan)
-    q = prepare_sampler(built, plan, zeros(built.layout.total);
-        backend = AutoEnzyme(; mode = Enzyme.Reverse))
-    @test data == snapshot
-    @test built.layout.total == 3 + 2 + 3 * 3
-    _hist_check((; plan, built, q), _hist_imperial_oracle(d))
-    # Both recurrences stay RK scans, retained inside the country plate:
-    # infections and cumulative share one scan, followed by expected deaths.
-    @test count(e -> e.kind === :scan, recipe_inventory(built.spec)) == 2
+    for (program, reverse_gap) in (
+            (_hist_imperial_program(), _HIST_GENERATOR_CAPTURE_GAP),
+            # With `init`, each fold runs natively as RK's explicit loop (no
+            # generator closure), which registered Enzyme differentiates.
+            (_hist_with_init(_hist_imperial_program()), false))
+        plan = bind_data(lower_rkppl(program, data;
+            conditioned = (:observed,)), data)
+        built = build_kernel(plan)
+        q = prepare_sampler(built, plan, zeros(built.layout.total);
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        @test data == snapshot
+        @test built.layout.total == 3 + 2 + 3 * 3
+        _hist_check((; plan, built, q), _hist_imperial_oracle(d); reverse_gap)
+        # Both recurrences stay RK scans, retained inside the country plate:
+        # infections and cumulative share one scan, followed by expected deaths.
+        @test count(e -> e.kind === :scan, recipe_inventory(built.spec)) == 2
+    end
 end
 
 @testset "scan history: arrays reading one another's history" begin
