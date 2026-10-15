@@ -4898,6 +4898,20 @@ end
 
 _scan_where(s::ScanSpec) = "[generator] scan $(join(s.states, ", "))"
 
+# A sampled seed's or step's stated density at `x`: the family density plus
+# its support normalizer (`truncated` subtracts the interval mass, a half
+# prior adds log(2); `restricted` and `Flat` keep the family density).
+# `translate` maps the statement's argument and bound expressions into the
+# enclosing block; the normalizer's intermediates go to `pre`.
+function _scan_density!(pre::Vector{Expr}, st, translate, x, stem::Symbol)
+    args = Any[translate(a) for a in st.args]
+    support = st.support isa Tuple ?
+        (st.support[1], map(translate, st.support[2:end])...) : st.support
+    base = _family_logpdf_expr(st.family, args, x)
+    corr = _support_correction(st.family, support, args; pre, stem)
+    return corr === nothing ? base : :($base + $corr)
+end
+
 # The innovation steps of an emittable non-centered scan, in body order; a
 # shape the emitter does not build (`_scan_shape_gap`) throws
 # `ContractValidationError` naming the gap.
@@ -5004,9 +5018,10 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
         rhs = if st.kind === :sample
             value = samples[st.target]
             if output === nothing
-                args = [_scan_translate_step(a, s, env, scalars) for a in st.args]
                 lp = Symbol(:_ppl_scan_lp_, st.target)
-                push!(body, :($lp::Float64 = $(_family_logpdf_expr(st.family, args, value))))
+                density = _scan_density!(body, st,
+                    a -> _scan_translate_step(a, s, env, scalars), value, lp)
+                push!(body, :($lp::Float64 = $density))
                 push!(logps, lp)
             end
             value
@@ -5114,9 +5129,9 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
     for f in s.setup
         f.kind === :sample || continue
         lp = Symbol(:_ppl_scan_seedlp_, f.target, :_, f.index)
-        args = Any[_scan_translate_seed(a, s, scalars) for a in f.args]
-        push!(stmts, :($lp::Float64 = $(_family_logpdf_expr(f.family, args,
-            :($zname[$(seedpos[(f.target, f.index)])])))))
+        density = _scan_density!(stmts, f, a -> _scan_translate_seed(a, s, scalars),
+            :($zname[$(seedpos[(f.target, f.index)])]), lp)
+        push!(stmts, :($lp::Float64 = $density))
         push!(terms, lp)
     end
     if T >= s.lo && !isempty(innov)
@@ -5165,8 +5180,9 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         for (k, f) in enumerate(sc.setup)
             push!(stmts, :($(_scan_init_name(state, k)) = $state[$k]))
             seed = Symbol(:_ppl_scan_seed_, state, :_, k)
-            push!(stmts, :($seed::Float64 =
-                $(_family_logpdf_expr(f.family, [_scan_translate_seed(a, sc, scalars) for a in f.args], :($(state)[$k])))))
+            density = _scan_density!(stmts, f, a -> _scan_translate_seed(a, sc, scalars),
+                :($(state)[$k]), seed)
+            push!(stmts, :($seed::Float64 = $density))
             push!(terms, seed)
         end
         lags = sort!(collect(_scan_lags([step], [state], sc.loopvar)[state]))
@@ -5178,12 +5194,12 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         end
         # Substitute the lag reads; the cell reads the recurrence's other
         # scalars (params/assignments) by closing over them.
-        lagargs = [_subst_scan_lags(a, state, sc.loopvar, dovar) for a in step.args]
         push!(inputs, :($(sc.lo):$T))
-        lagargs = [_subst_syms(a, Dict(sc.loopvar => _dovar(length(inputs)))) for a in lagargs]
+        cellarg(a) = _subst_syms(_subst_scan_lags(a, state, sc.loopvar, dovar),
+            Dict(sc.loopvar => _dovar(length(inputs))))
         caps = Symbol[]
-        for a in lagargs
-            _scan_cell_caps!(caps, a)
+        for a in _scan_reads(step)
+            _scan_cell_caps!(caps, cellarg(a))
         end
         sc.loopvar in caps && throw(ContractValidationError(
             "[generator] scan $(state): the recurrence uses the loop index " *
@@ -5191,10 +5207,11 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         for c in caps
             c in scalars || throw(ContractValidationError("$(_scan_where(sc)): unknown captured value $c"))
         end
-        cell = _family_logpdf_expr(step.family, lagargs, _dovar(1))
         recnode = Symbol(:_ppl_scan_rec_, state)
         recpw = Symbol(:_ppl_scan_pw_, state)
-        append!(stmts, _plate_sum_stmts(recpw, recnode, inputs, cell))
+        pre = Expr[]
+        cell = _scan_density!(pre, step, cellarg, _dovar(1), recnode)
+        append!(stmts, _plate_sum_stmts(recpw, recnode, inputs, Expr[pre..., cell]))
         push!(terms, recnode)
         total = Symbol(:_ppl_scan_, state)
         push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))

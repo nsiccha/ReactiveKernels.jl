@@ -1401,10 +1401,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     for (nm, _) in det
         nm in skip || union!(needed, _value_symbols(canonmap[nm]))
     end
-    for s in scans, st in (s.setup..., s.step...)
-        for ex in (st.kind === :sample ? st.args : (st.expr,))
-            union!(needed, _value_symbols(ex))
-        end
+    for s in scans, st in (s.setup..., s.step...), ex in _scan_reads(st)
+        union!(needed, _value_symbols(ex))
     end
     pending = collect(needed)
     kept = Set{Symbol}()
@@ -12054,42 +12052,51 @@ function _lower_plain_thresholds(s, coefuse, ctx)
 end
 
 function _lower_parameter(lhs, rhs, coefuse, matrices)
+    arg(a) = _lower_param_arg(lhs, a, coefuse, matrices)
+    bound(b) = b isa Symbol && b !== :Inf ? arg(b) : _truncation_bound(lhs, b)
+    return _parse_prior(lhs, rhs, "parameter $lhs", arg, bound,
+        fam -> _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
+            "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
+            "Beta, InverseGamma, StudentT, TDist, Laplace, Logistic, Uniform, Weibull, " *
+            "HalfNormal, HalfCauchy, Flat, " *
+            "Dirichlet, LKJCholesky, truncated, restricted). If `$fam` is " *
+            "meant as a submodel, define it with " *
+            "`@rkppl $fam(args...) = begin ... end` and " *
+            "make it visible in the lowering module (`mod=`)."))
+end
+
+# One scalar prior call: its family, positional arguments and support
+# override. `arg` reads a family argument and `bound` a `truncated` /
+# `restricted` bound; `who` names the declaration in messages and `unknown`
+# fails an unadmitted family. A scalar declaration reads names and literals
+# (`_lower_parameter`); a scan seed or step keeps value expressions (`@scan`).
+function _parse_prior(lhs, rhs, who, arg, bound, unknown)
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) || _sfail(
-        "parameter $lhs needs a distribution call, got $(repr(rhs))")
+        "$who needs a distribution call, got $(repr(rhs))")
     fam = rhs.args[1]
-    fam === :Flat && return _lower_flat(lhs, rhs)
-    fam === :flat && _sfail("parameter $lhs: use `Flat()` (Turing-style " *
+    fam === :Flat && return _lower_flat(lhs, rhs, who)
+    fam === :flat && _sfail("$who: use `Flat()` (Turing-style " *
                             "improper uniform), not Stan-style `flat()`")
-    fam === :truncated && return _lower_truncated_param(lhs, rhs, coefuse,
-        matrices)
-    fam === :restricted && return _lower_bounded_param(lhs, rhs, coefuse,
-        matrices, :restricted)
+    fam in (:truncated, :restricted) &&
+        return _lower_bounded_param(lhs, rhs, who, arg, bound, unknown, fam)
     fam in (:HalfNormal, :HalfCauchy) &&
-        return _lower_half_param(lhs, rhs, fam, coefuse, matrices)
-    fam === :positive && _sfail("parameter $lhs: write `HalfNormal(s)` " *
+        return _lower_half_param(lhs, rhs, fam, who, arg)
+    fam === :positive && _sfail("$who: write `HalfNormal(s)` " *
                                 "or `truncated(Normal(0, s), 0, Inf)`")
     fam in (:weighted, :censored, :interval_censored) &&
-        _sfail("`$fam` applies to responses only (parameter $lhs)")
+        _sfail("`$fam` applies to responses only ($who)")
     fam in (:normal, :cauchy, :exponential, :gamma, :lognormal, :beta,
         :inverse_gamma, :student_t, :laplace, :logistic, :uniform,
         :halfnormal, :halfcauchy) &&
-        _sfail("parameter $lhs: use Distributions.jl constructors " *
+        _sfail("$who: use Distributions.jl constructors " *
                "(`Normal`, not `normal`)")
-    haskey(_PARAM_FAMILIES, fam) ||
-        _sfail("parameter $lhs: unknown distribution `$(repr(fam))` " *
-               "(admitted: Normal, Cauchy, Exponential, Gamma, LogNormal, " *
-               "Beta, InverseGamma, StudentT, TDist, Laplace, Logistic, Uniform, Weibull, " *
-               "HalfNormal, HalfCauchy, Flat, " *
-               "Dirichlet, LKJCholesky, truncated, restricted). If `$fam` is " *
-               "meant as a submodel, define it with " *
-               "`@rkppl $fam(args...) = begin ... end` and " *
-               "make it visible in the lowering module (`mod=`).")
+    haskey(_PARAM_FAMILIES, fam) || unknown(fam)
     any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end]) &&
-        _sfail("parameter $lhs: `$fam` does not take support keywords; " *
+        _sfail("$who: `$fam` does not take support keywords; " *
             "use `truncated($fam(args...), lo, hi)`, `HalfNormal(s)`, " *
             "or `HalfCauchy(s)` for a normalized positive prior")
     args = _distribution_args(fam, _plain_args(rhs, "`$fam`"))
-    vals = [_lower_param_arg(lhs, a, coefuse, matrices) for a in args]
+    vals = [arg(a) for a in args]
     argkeys = ntuple(i -> Symbol(:arg, i), length(vals))
     return SampledParameter(lhs, _PARAM_FAMILIES[fam],
         NamedTuple{argkeys}(Tuple(vals)), nothing, lhs)
@@ -12107,22 +12114,22 @@ function _lower_param_arg(lhs, a, coefuse, matrices)
     return a
 end
 
-function _lower_flat(lhs, rhs)
+function _lower_flat(lhs, rhs, who)
     any(a -> a isa Expr && a.head === :parameters, rhs.args[2:end]) &&
-        _sfail("parameter $lhs: `Flat()` has no support keywords; use " *
+        _sfail("$who: `Flat()` has no support keywords; use " *
             "`Exponential(s)` for a positive prior, `Uniform(lo, hi)` for " *
             "a bounded uniform, or `Flat()` for an improper real prior")
-    isempty(rhs.args[2:end]) || _sfail("parameter $lhs: `Flat()` takes no arguments")
+    isempty(rhs.args[2:end]) || _sfail("$who: `Flat()` takes no arguments")
     return SampledParameter(lhs, :flat, NamedTuple(), nothing, lhs)
 end
 
 # `HalfNormal(s)` / `HalfCauchy(s)` lower to the `:positive` support
 # override with synthesized literal-zero location (exact +log(2)).
-function _lower_half_param(lhs, rhs, fam, coefuse, matrices)
+function _lower_half_param(lhs, rhs, fam, who, arg)
     args = _plain_args(rhs, "`$fam`")
     length(args) == 1 ||
-        _sfail("parameter $lhs: `$fam` takes exactly the scale")
-    scale = _lower_param_arg(lhs, args[1], coefuse, matrices)
+        _sfail("$who: `$fam` takes exactly the scale")
+    scale = arg(args[1])
     base = fam === :HalfNormal ? :normal : :cauchy
     return SampledParameter(lhs, base, (arg1 = 0, arg2 = scale), :positive,
         lhs)
@@ -12155,29 +12162,23 @@ const _TRUNCATED_BASES = Dict{Symbol,Tuple{Int,Int}}(
 # Truncation keeps the base density and its authored bounds together. The
 # layout intersects them with the base support; the prior subtracts the
 # probability of precisely that interval (Distributions semantics).
-function _lower_truncated_param(lhs, rhs, coefuse, matrices)
-    return _lower_bounded_param(lhs, rhs, coefuse, matrices, :truncated)
-end
-
 # Both forms share exactly the same support/transform lowering. Only
 # `truncated` subtracts the interval mass from the authored family density.
-function _lower_bounded_param(lhs, rhs, coefuse, matrices, mode)
+function _lower_bounded_param(lhs, rhs, who, arg, bound, unknown, mode)
     args = _plain_args(rhs, "`$mode`")
-    length(args) == 3 || _sfail("parameter $lhs: use " *
+    length(args) == 3 || _sfail("$who: use " *
         "`$mode(D(args...), lo, hi)`")
     obj, lower, upper = args
-    obj isa Expr && obj.head === :call || _sfail("parameter $lhs: " *
+    obj isa Expr && obj.head === :call || _sfail("$who: " *
         "`$mode` wraps a distribution object, got $(repr(obj))")
-    base = _lower_parameter(lhs, obj, coefuse, matrices)
-    mode === :truncated && base.family === :flat && _sfail("parameter $lhs: `truncated` needs a " *
+    base = _parse_prior(lhs, obj, who, arg, bound, unknown)
+    mode === :truncated && base.family === :flat && _sfail("$who: `truncated` needs a " *
         "proper distribution; bound an improper prior with `Flat` instead")
-    base.support_override in (nothing, :positive) || _sfail("parameter " *
-        "$lhs: nested truncations are not yet supported")
-    bound(a) = a isa Symbol && a !== :Inf ?
-        _lower_param_arg(lhs, a, coefuse, matrices) : _truncation_bound(lhs, a)
+    base.support_override in (nothing, :positive) || _sfail("$who: " *
+        "nested truncations are not yet supported")
     lo, hi = bound(lower), bound(upper)
     if lo isa Real && hi isa Real
-        lo < hi || _sfail("parameter $lhs: truncation needs lower < upper, " *
+        lo < hi || _sfail("$who: truncation needs lower < upper, " *
             "got ($lo, $hi)")
     end
     # Both forms intersect a half's support with the nonnegative half-line.

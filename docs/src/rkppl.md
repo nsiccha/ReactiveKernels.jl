@@ -779,7 +779,11 @@ In an array cell, an observation must read a named per-index output
 (`y[i] ~ Normal(r[i], sigma)`), rather than a cell local directly.
 
 `@scan begin … end` writes a sequential recurrence, such as an AR(1) state
-(corpus `38_scan_ar.jl`).
+(corpus `38_scan_ar.jl`). Its sampled seeds and steps take the scalar priors a
+declaration takes, including `Flat()`, half priors, `truncated(D, lo, hi)` and
+`restricted(D, lo, hi)` with bounds fixed across steps. For example,
+`h[t] ~ restricted(Normal(h[t - 1], s), lo, hi)` is a random walk on `(lo, hi)`
+that keeps the Normal density.
 
 ### One array per index
 
