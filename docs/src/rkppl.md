@@ -220,6 +220,8 @@ An ordered vector may use Normal, Cauchy, Laplace, Logistic or StudentT
 element priors with live scalar arguments, for example
 `c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log
 densities on increasing vectors, with no factorial normalizer.
+`c ~ Ordered(Flat(), n)` is Stan's `ordered[n] c;` with no prior statement:
+its elements have zero density, leaving the ordering transform's Jacobian.
 
 Ordered extents may be data-only expressions, including
 `length(levels(x)) - 1`, `length(levels(y)) - 2` and
@@ -228,9 +230,9 @@ extent even when a Gaussian response reads the vector. An ordinal response
 has support `1:length(c)+1`; an observed category outside it fails at bind.
 `levels` includes a declared DataAPI level pool; `unique` counts observed
 values. The prior and support come from the declaration: cumulative
-cutpoints may have an ordinary Normal vector prior (non-increasing values
-give `-Inf`), and stopping-ratio thresholds may have an Ordered or ordinary
-Normal/Cauchy/Laplace/Logistic/StudentT prior.
+cutpoints may have an ordinary Normal or Flat vector prior (non-increasing
+values give `-Inf`), and stopping-ratio thresholds may have an Ordered or
+ordinary Normal/Cauchy/Laplace/Logistic/StudentT/Flat prior.
 
 A per-cell `Flat()` prior contributes zero density and retains its layout
 coordinates. Its posterior may be proper through the likelihood; density

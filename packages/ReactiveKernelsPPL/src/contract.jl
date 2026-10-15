@@ -660,7 +660,9 @@ thresholds, or a shared simplex), packed as one contiguous block:
 - `:vector_normal` — a plain (unconstrained, identity-transform) vector
   with an elementwise `Normal(arg1, arg2)` prior (stopping-ratio stage
   thresholds). Cauchy, Laplace, Logistic and StudentT have corresponding
-  `:ordered_*` and `:vector_*` element-density families.
+  `:ordered_*` and `:vector_*` element-density families. `:ordered_flat`
+  and `:vector_flat` (`args = (;)`) have zero element density: the surface
+  `c ~ Ordered(Flat(), n)` and `t[1:n] .~ Flat.()` thresholds.
 - `:simplex_dirichlet` — a simplex with a `Dirichlet(arg1)` prior
   (`arg1` a literal concentration vector — frozen data, the
   coefficient-prior precedent) + the stick-breaking Jacobian.
@@ -3633,12 +3635,16 @@ end
 
 # Ordered vectors use the same scalar element densities as ordinary
 # priors, with the ordering transform independent of the chosen family.
+# A `Flat()` element has zero density, so `c ~ Ordered(Flat(), n)` is
+# Stan's `ordered[n] c;` with no prior statement: the transform Jacobian.
 const _VECTOR_ELEMENT_FAMILIES = Dict{Symbol,Symbol}(
     :ordered_normal => :normal, :vector_normal => :normal,
     :ordered_cauchy => :cauchy, :ordered_laplace => :laplace,
     :ordered_logistic => :logistic, :ordered_student_t => :student_t,
+    :ordered_flat => :flat,
     :vector_cauchy => :cauchy, :vector_laplace => :laplace,
     :vector_logistic => :logistic, :vector_student_t => :student_t,
+    :vector_flat => :flat,
 )
 _is_ordered_parameter(f) = haskey(_VECTOR_ELEMENT_FAMILIES, f) &&
     startswith(String(f), "ordered_")
@@ -3650,11 +3656,13 @@ const VECTOR_ARITY = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :ordered_laplace => (:arg1, :arg2),
     :ordered_logistic => (:arg1, :arg2),
     :ordered_student_t => (:arg1, :arg2, :arg3),
+    :ordered_flat => (),
     :vector_normal => (:arg1, :arg2),
     :vector_cauchy => (:arg1, :arg2),
     :vector_laplace => (:arg1, :arg2),
     :vector_logistic => (:arg1, :arg2),
     :vector_student_t => (:arg1, :arg2, :arg3),
+    :vector_flat => (),
     :simplex_dirichlet => (:arg1,),
     :positive_exponential => (:arg1,),
     :cholesky_corr_lkj => (:arg1,),
@@ -3734,10 +3742,12 @@ function _validate_vector_parameters(plan::StructuralPlan)
                         "element prior $key must be finite, got $(repr(arg))")
                 end
             end
-            scale = _VECTOR_ELEMENT_FAMILIES[p.family] === :student_t ? p.args.arg3 : p.args.arg2
+            # `Flat()` elements take no arguments, so there is no scale.
+            element = _VECTOR_ELEMENT_FAMILIES[p.family]
+            scale = get(p.args, element === :student_t ? :arg3 : :arg2, nothing)
             scale isa Real && scale <= 0 && _fail(p.label,
                 "element prior scale must be positive")
-            if _VECTOR_ELEMENT_FAMILIES[p.family] === :student_t
+            if element === :student_t
                 nu = p.args.arg1
                 nu isa Real && nu <= 0 && _fail(p.label,
                     "element prior degrees of freedom must be positive")
