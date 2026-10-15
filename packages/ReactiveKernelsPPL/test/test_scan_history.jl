@@ -24,13 +24,20 @@ end
 
 # Value against the independent oracle at several points, and the native
 # Enzyme Reverse gradient against central finite differences of the oracle.
-function _hist_check(f, oracle; points = 3)
+# With `reverse_gap`, the gradient is a pinned upstream capability gap: the
+# value is checked through the primal, and the gradient leg is `@test_broken`
+# (an Unexpected Pass under an Enzyme that carries the repair).
+function _hist_check(f, oracle; points = 3, reverse_gap = false)
     n = f.built.layout.total
     for j in 1:points
         u = [0.15 * sin(3j + i) for i in 1:n]
         g = similar(u)
-        value, _ = sampler_value_and_gradient!(f.q, g, u)
-        @test value ≈ oracle(u) rtol = 1e-11
+        result = try
+            sampler_value_and_gradient!(f.q, g, u)
+        catch err
+            reverse_gap && err isa Enzyme.Compiler.EnzymeRuntimeActivityError || rethrow()
+            nothing
+        end
         h = cbrt(eps(Float64))
         fd = map(1:n) do i
             up, dn = copy(u), copy(u)
@@ -38,7 +45,14 @@ function _hist_check(f, oracle; points = 3)
             dn[i] -= h
             (oracle(up) - oracle(dn)) / (2h)
         end
-        @test g ≈ fd rtol = 1e-5 atol = 1e-7
+        if reverse_gap
+            @test f.q(u) ≈ oracle(u) rtol = 1e-11
+            @test_broken result !== nothing && isapprox(result[1], oracle(u); rtol = 1e-11) &&
+                isapprox(g, fd; rtol = 1e-5, atol = 1e-7)
+        else
+            @test result[1] ≈ oracle(u) rtol = 1e-11
+            @test g ≈ fd rtol = 1e-5 atol = 1e-7
+        end
     end
 end
 
@@ -214,9 +228,9 @@ end
         plan = bind_data(lower_rkppl(_hist_renewal_program(), Tuple(keys(data));
             conditioned = (:y,)), data)
         built = build_kernel(plan)
-        @test _hist_scans(built.spec) == 3      # infections, cumulative, deaths
+        @test _hist_scans(built.spec) == 2      # coupled recurrence, then deaths
         code = string(kernel_expr(plan, built.layout))
-        @test occursin("history = [", code)
+        @test occursin("history = (infections = [", code)
         _hist_structure(built.spec)
     end
     @test allequal(shapes)
@@ -503,51 +517,77 @@ function _hist_imperial_oracle(d)
     end
 end
 
+# The program with every generator fold given `init = 0.0`.
+_hist_with_init(ex) = ex isa Expr ?
+    (ex.head === :call && ex.args[1] === :sum && length(ex.args) == 2 &&
+     Meta.isexpr(ex.args[2], :generator) ?
+        Expr(:call, :sum, Expr(:parameters, Expr(:kw, :init, 0.0)), ex.args[2]) :
+        Expr(ex.head, map(_hist_with_init, ex.args)...)) : ex
+
+# Native Reverse through `sum(X[m, t, j] * alpha[j] for j in 1:P)`, Base's fold
+# over a generator whose closure holds the bound array `X` beside the active
+# `alpha`: registered Enzyme (0.13.216) rejects the store of `X` into that
+# closure on Julia 1.12 and 1.13 (`EnzymeRuntimeActivityError`), while Julia
+# 1.10.12 inlines this fold. The Enzyme dogfood line repairs it
+# (`reactivekernels-use` §7af); `benchmark/repro_enzyme_generator_fold_capture.jl`
+# reproduces it with Enzyme alone.
+const _HIST_GENERATOR_CAPTURE_GAP = VERSION >= v"1.11-"
+
 @testset "scan history: the Imperial COVID-19 renewal model per country" begin
     d = _hist_imperial_data(3, 24, 2)
     data = Dict{Symbol,Any}(pairs(d))
     snapshot = deepcopy(data)
-    plan = bind_data(lower_rkppl(_hist_imperial_program(), data;
-        conditioned = (:observed,)), data)
-    built = build_kernel(plan)
-    q = prepare_sampler(built, plan, zeros(built.layout.total);
-        backend = AutoEnzyme(; mode = Enzyme.Reverse))
-    @test data == snapshot
-    @test built.layout.total == 3 + 2 + 3 * 3
-    _hist_check((; plan, built, q), _hist_imperial_oracle(d))
-    # Both recurrences stay RK scans, retained inside the country plate: the
-    # infections fold (which carries the cumulative sum in its window) and
-    # the expected-deaths fold. Nothing reads `cumulative` itself, so its
-    # own fold is pruned.
-    @test count(e -> e.kind === :scan, recipe_inventory(built.spec)) == 2
+    for (program, reverse_gap) in (
+            (_hist_imperial_program(), _HIST_GENERATOR_CAPTURE_GAP),
+            # With `init`, each fold runs natively as RK's explicit loop (no
+            # generator closure), which registered Enzyme differentiates.
+            (_hist_with_init(_hist_imperial_program()), false))
+        plan = bind_data(lower_rkppl(program, data;
+            conditioned = (:observed,)), data)
+        built = build_kernel(plan)
+        q = prepare_sampler(built, plan, zeros(built.layout.total);
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        @test data == snapshot
+        @test built.layout.total == 3 + 2 + 3 * 3
+        _hist_check((; plan, built, q), _hist_imperial_oracle(d); reverse_gap)
+        # Both recurrences stay RK scans, retained inside the country plate:
+        # infections and cumulative share one scan, followed by expected deaths.
+        @test count(e -> e.kind === :scan, recipe_inventory(built.spec)) == 2
+    end
 end
 
 @testset "scan history: arrays reading one another's history" begin
-    # Capability gap: each fold produces one array's history, so two arrays
-    # that read each other's earlier entries are not built yet.
-    T = 6
-    data = Dict{Symbol,Any}(:y => _HIST_Y[1:T], :T => T)
-    program = quote
-        r ~ LogNormal(0, 0.3)
-        @scan begin
-            p[1] = 1.0
-            q[1] = 1.0
-            for t in 2:T
-                p[t] = r * sum(q[s] for s in 1:(t - 1)) / t
-                q[t] = r * sum(p[s] for s in 1:(t - 1)) / t
+    for T in (1, 6, 13)
+        data = Dict{Symbol,Any}(:y => _HIST_Y[1:T], :T => T)
+        program = quote
+            r ~ LogNormal(0, 0.3)
+            @scan begin
+                p[1] = 1.0
+                q[1] = 0.5
+                for t in 2:T
+                    p[t] = r * sum(q[s] for s in 1:(t - 1)) / t
+                    q[t] = r * sum(p[s] for s in 1:(t - 1)) / t + p[t]
+                end
             end
+            mu = p .+ q
+            y .~ Normal.(mu, 1.0)
         end
-        y .~ Normal.(p, 1.0)
+        f = _hist_sampler(program, data)
+        function oracle(u)
+            r = exp(u[1])
+            p, q = [1.0], [0.5]
+            for t in 2:T
+                pn = r * sum(q) / t
+                qn = r * sum(p) / t + pn
+                push!(p, pn)
+                push!(q, qn)
+            end
+            logpdf(LogNormal(0, 0.3), r) + u[1] +
+                sum(logpdf.(Normal.(p .+ q, 1.0), data[:y]))
+        end
+        _hist_check(f, oracle)
+        @test _hist_scans(f.built.spec) == (T == 1 ? 0 : 1)
     end
-    built = try
-        plan = bind_data(lower_rkppl(program, Tuple(keys(data));
-            conditioned = (:y,)), data)
-        build_kernel(plan)
-    catch err
-        err isa ContractValidationError || rethrow()
-        nothing
-    end
-    @test_broken built !== nothing
 
     # Capability gap: a `@scan` in a plate cell is deterministic (its seeds
     # and steps are `=`); per-cell sampled recurrence draws are not built yet.
@@ -570,4 +610,76 @@ end
         nothing
     end
     @test_broken sampled !== nothing
+end
+
+@testset "scan columns: conditional densities read shared trajectories" begin
+    for history in (false, true), T in (1, 2, 8)
+        past = history ? :(sum(b[s] for s in 1:(t - 1)) / t) : :(b[t - 1])
+        program = quote
+            r ~ Normal(0, 0.5)
+            @scan begin
+                a[1] = 0.1
+                b[1] = -0.2
+                for t in 2:T
+                    shared = sin(r * t)
+                    e ~ Normal(0, exp(0.1 * $past))
+                    a[t] = r * $past + e + shared
+                    b[t] = 0.3 * a[t - 1] + a[t] + shared
+                end
+            end
+            mu = a .+ 2 .* b
+            y .~ Normal.(mu, 1.0)
+        end
+        data = Dict{Symbol,Any}(:y => _HIST_Y[1:T], :T => T)
+        f = _hist_sampler(program, data)
+        function oracle(u)
+            r = u[1]
+            a, b = [0.1], [-0.2]
+            lp = logpdf(Normal(0, 0.5), r)
+            for t in 2:T
+                past_value = history ? sum(b) / t : b[end]
+                e = u[t]
+                lp += logpdf(Normal(0, exp(0.1 * past_value)), e)
+                shared = sin(r * t)
+                an = r * past_value + e + shared
+                bn = 0.3 * a[end] + an + shared
+                push!(a, an)
+                push!(b, bn)
+            end
+            lp + sum(logpdf.(Normal.(a .+ 2 .* b, 1.0), data[:y]))
+        end
+        _hist_check(f, oracle)
+        @test _hist_scans(f.built.spec) == (T == 1 ? 0 : 1)
+        # The posterior query selects likelihood and prior together. Its
+        # prepared graph retains that same single recurrence.
+        @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
+            f.q.kernel.plan.recipes) == (T == 1 ? 0 : 1)
+    end
+end
+
+@testset "scan columns: state queries omit innovation densities" begin
+    data = Dict{Symbol,Any}(:y => zeros(3), :T => 3)
+    program = quote
+        r ~ Normal(0, 1)
+        @scan begin
+            a[1] = 0.1
+            b[1] = -0.2
+            for t in 2:T
+                e ~ Normal(0, sqrt(r))
+                a[t] = r * b[t - 1] + e
+                b[t] = 0.3 * a[t - 1] + a[t]
+            end
+        end
+        y .~ Normal.(a, 1.0)
+    end
+    plan = bind_data(lower_rkppl(program, Tuple(keys(data)); conditioned = (:y,)), data)
+    built = build_kernel(plan)
+    states = ReactiveKernelsPPL._prepare_wants(built, plan, (:a, :b))
+    # These coordinates define the trajectories, while sqrt(r) is outside
+    # its density domain. A state-only query must not evaluate that density.
+    a, b = Base.invokelatest(states, [-1.0, 0.3, 0.4])
+    @test a ≈ [0.1, 0.5, -0.13]
+    @test b ≈ [-0.2, 0.53, 0.02]
+    @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
+        states.plan.recipes) == 1
 end

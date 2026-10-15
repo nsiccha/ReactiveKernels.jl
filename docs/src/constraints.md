@@ -506,6 +506,22 @@ and lock the one Reactant 0.2.289 lifted:
   [Enzyme issue #2386](https://github.com/EnzymeAD/Enzyme.jl/issues/2386)
   tracks comprehension activity analysis. This evidence and boundary note are
   interim tracking, not completion of that capability.
+- The same store rejects Base's fold over such a generator,
+  `sum(X[m, t, j] * alpha[j] for j in 1:P)` with `X` bound data and `alpha`
+  active: `mapfoldl` takes the generator, and its closure holds both arrays.
+  `repro_enzyme_generator_fold_capture.jl` reproduces it with Enzyme alone.
+  With Enzyme 0.13.216 the direct fold fails on Julia 1.12.7 and 1.13.1 and
+  passes on 1.10.12, which inlines it; a fold inside a step closure called
+  through a non-inlined driver fails on all three. Enzyme dogfood `2690dbd8`
+  passes all three shapes on all three versions. An `@rkppl` `@scan` step
+  written this way, such as the per-country renewal equation of
+  `test_scan_history.jl`, keeps its primal and pins its native Reverse leg as
+  a capability gap on Julia 1.11 and later. The same fold written with `init`
+  runs natively as RK's explicit loop, which has no generator closure and
+  differentiates with registered Enzyme; `@rkppl` bodies reach that loop
+  because the rewrite reads their resolved `GlobalRef` range heads. A fold
+  without `init` keeps Base's call: the repair of its closure store belongs to
+  the backend compiler.
 - Native Enzyme reverse mode fails static activity analysis
   (`EnzymeRuntimeActivityError`) when a fresh container holds arrays loaded
   from a constant argument and its contents reach an active result. The
@@ -614,6 +630,20 @@ and lock the one Reactant 0.2.289 lifted:
   differentiated the same call exactly with Enzyme 0.13.210, while local
   runs with Enzyme 0.13.210 and 0.13.216 still raise the readonly exception.
   Its test accepts only the exact gradient or that specific exception.
+- On Julia 1.13.1 with `--check-bounds=yes`, Enzyme 0.13.216 raises
+  `EnzymeRuntimeActivityError` when a reshaped `Const` vector feeds both
+  a constant row reduction and a broadcast with an active matrix. The
+  diagnostic identifies the array-header pointer store in `Base.reshape`;
+  neither input is written. `repro_enzyme_const_reshape_reduction.jl`
+  reproduces it with Enzyme and Base only, at four matrix shapes, and checks
+  analytic gradients and input ownership. Removing the constant reduction
+  passes, as does the unchanged expression with default bounds checking.
+  Shared constant concentrations in Dirichlet slice priors reach this shape:
+  `test_plate_categorical.jl` fails at `_arg_rows` with forced bounds checks
+  and passes with default bounds checks. Enzyme dogfood `2690dbd8` with
+  Enzyme_jll 0.0.301 still rejects the isolated expression and both row and
+  column slice helpers. The repair belongs in Enzyme; no runtime-activity
+  setting or replacement derivative is applied in RK.
 - On Julia 1.10.12, 1.12.7 and 1.13.1, Enzyme 0.13.216 rejects the readonly
   proof of a read-only callable that holds a matrix beside a
   `UniformScaling{Float64}` and adds them with Base's

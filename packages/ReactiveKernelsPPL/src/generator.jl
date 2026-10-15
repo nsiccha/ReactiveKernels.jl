@@ -139,8 +139,8 @@ end
 # between lowerings) renamed in order of first appearance. References owned
 # by a gensym-created lowering module get the same treatment: the module is an
 # isolation namespace, not part of the emitted program. Stable named modules
-# remain part of the identity. Two bindings generate the same program exactly
-# when these are equal.
+# remain part of the identity. Compare the results with `_same_program`:
+# Julia's Expr equality need not compare embedded array literals by value.
 function _program_identity(def)
     names = Dict{Symbol,Symbol}()
     modules = IdDict{Module,Symbol}()
@@ -153,6 +153,18 @@ function _program_identity(def)
     rename(x) = x
     return rename(def)
 end
+
+# Missing-observation guards contain freshly allocated quoted Bool arrays.
+# On Julia 1.13, Expr/QuoteNode equality compares such literals by object
+# identity. Their type, shape and contents determine this read-only program;
+# allocation identity does not. Types still matter for dispatch, and symbols
+# inside quoted data are not private bindings to rename.
+_same_program(x, y) = typeof(x) === typeof(y) && isequal(x, y)
+_same_program(x::QuoteNode, y::QuoteNode) = _same_program(x.value, y.value)
+_same_program(x::Expr, y::Expr) = x.head === y.head &&
+    length(x.args) == length(y.args) && all(_same_program(a, b) for (a, b) in zip(x.args, y.args))
+_same_program(x::Array, y::Array) = typeof(x) === typeof(y) &&
+    axes(x) == axes(y) && all(_same_program(a, b) for (a, b) in zip(x, y))
 
 # The source surface admits ordinary dotted scalar math, but an opaque array
 # assignment hides each producer from RK's plate-to-plate reduction fusion.
@@ -424,10 +436,12 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
 end
 
 # Conditioning selects the same declaration-density graph as a prior. Its
-# constrained value is a read-only input, with no layout entry or Jacobian.
+# constrained value is a read-only input or a graph definition, with
+# no layout entry or Jacobian.
 function _density_selection(plan, selected)
     return _with(plan;
         parameters = filter(p -> selected(p.name), plan.parameters),
+        factors = filter(p -> selected(p.name), plan.factors),
         array_parameters = filter(p -> selected(p.name), plan.array_parameters),
         vector_parameters = filter(p -> selected(p.name), plan.vector_parameters),
         plate_parameters = filter(p -> selected(p.name), plan.plate_parameters))
@@ -435,7 +449,7 @@ end
 
 function _conditioned_value_statements(plan)
     stmts = Expr[]
-    for name in sort!(collect(plan.conditioned))
+    for name in sort!(collect(_conditioned_inputs(plan)))
         push!(stmts, :($name = $(_conditioned_input(name))))
         for p in plan.array_parameters
             p.name === name || continue
@@ -1380,6 +1394,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
             p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
     end
     observed = _density_selection(plan, n -> n in plan.conditioned)
+    _factor_density_statements!(stmts, terms, observed; context = plan, pointwise = points)
     _parameter_prior_statements!(stmts, terms, observed, layout;
         prefix = :_ppl_condition_, group_scalars = false)
     for p in observed.parameters
@@ -1971,8 +1986,9 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
     if r.family === GaussianFam
         # Base case (no evidence, weights, ranges, packed rows or missing
         # entries; one shared scalar scale) whose location is a data-matrix
-        # product `M * v`, optionally plus a sampled intercept: the
-        # NormalIDGLM density. The per-cell plate keeps `:pointwise`.
+        # product `M * v`, optionally plus a sampled intercept: sum its
+        # Normal density through ordinary residual-and-dot arithmetic.
+        # The per-cell plate keeps `:pointwise`.
         if r.evidence.kind === :none && r.weights === nothing &&
                 r.range === nothing && r.mi_jobs === nothing && r.link === IdentityLink &&
                 !haskey(plan.columns, _observed_mask_name(r.response)) &&
@@ -1981,8 +1997,8 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
                 _wholevec_rows(r, plan) && _wholevec_scalar_scale(r, plan)
             # `alpha .+ M * v` broadcasts its scalar intercept, yet the
             # matched data-matrix product reads the whole design.
-            glm = _gaussian_glm_location(r, plan)
-            glm === nothing || return _gaussian_glm_stmts(r, plan, node, glm...)
+            _is_gaussian_design_location(r, plan) &&
+                return _gaussian_design_stmts(r, plan, node)
         end
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
@@ -2949,18 +2965,14 @@ end
 
 # A Gaussian response located at `M * v` (inline or named) or
 # `alpha .+ M * v` (bound data matrix `M`, vector value `v`, sampled
-# scalar `alpha`) has the NormalIDGLM density and reads the owned rule (DK
-# `normal_id_glm_lpdf`): one `M'r` product in reverse, where the plate
-# differentiated `M * v` and every cell. `sigma > 0` keeps the plate cell's
-# guard; the plate (`_through_pointwise`) keeps the `:pointwise` densities,
-# and the location node stays available to its other readers.
-# Returns `(M, alpha, v)` (`alpha = 0.0` without an intercept) or `nothing`.
-function _gaussian_glm_location(r::LikelihoodSpec, plan::StructuralPlan)
-    _is_latent_location(r, plan) && return nothing
+# scalar `alpha`) can sum its density from the location's residual vector.
+# The explicit NormalIDGLM object alone selects the owned derivative rule.
+function _is_gaussian_design_location(r::LikelihoodSpec, plan::StructuralPlan)
+    _is_latent_location(r, plan) && return false
     i = findfirst(p -> p.name === r.predictor, plan.predictors)
-    i === nothing && return nothing
+    i === nothing && return false
     pred = plan.predictors[i]
-    pred.link === IdentityLink || return nothing
+    pred.link === IdentityLink || return false
     alpha, product = 0.0, nothing
     for t in pred.terms
         if t.kind === InterceptTerm && alpha isa Real &&
@@ -2972,42 +2984,51 @@ function _gaussian_glm_location(r::LikelihoodSpec, plan::StructuralPlan)
                 t.options.tree isa Symbol
             product = t.options.tree
         else
-            return nothing
+            return false
         end
     end
-    product === nothing && return nothing
+    product === nothing && return false
     j = findfirst(d -> d.name === product, plan.derived)
-    j === nothing && return nothing
+    j === nothing && return false
     ex = plan.derived[j].expr
-    Meta.isexpr(ex, :call, 3) && ex.args[1] === :* || return nothing
+    Meta.isexpr(ex, :call, 3) && ex.args[1] === :* || return false
     M, v = ex.args[2], ex.args[3]
-    M isa Symbol && v isa Symbol || return nothing
-    get(plan.columns, M, nothing) isa AbstractMatrix{<:Real} || return nothing
-    get(plan.columns, r.response, nothing) isa AbstractVector{<:Real} || return nothing
+    M isa Symbol && v isa Symbol || return false
+    get(plan.columns, M, nothing) isa AbstractMatrix{<:Real} || return false
+    get(plan.columns, r.response, nothing) isa AbstractVector{<:Real} || return false
     scalar(a) = any(q -> q.name === a, plan.parameters) || get(plan.columns, a, nothing) isa Real
-    alpha isa Symbol && !scalar(alpha) && return nothing
+    alpha isa Symbol && !scalar(alpha) && return false
     vector = any(q -> q.name === v && length(q.dims) == 1, plan.array_parameters) ||
         get(plan.columns, v, nothing) isa AbstractVector{<:Real}
-    vector || return nothing
-    return (M, alpha, v)
+    return vector
 end
 
-function _gaussian_glm_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
-        M::Symbol, alpha, v::Symbol)
+# Reuse the authored location instead of rebuilding an augmented design and
+# coefficient vector. The guard stays lazy, including at nonpositive scales;
+# Enzyme differentiates the residual and dot without an RK-only rule.
+function _gaussian_design_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     stmts = _gaussian_plate_stmts(r, plan, node, _pw_name(r.label))
     s = _scale_plate_arg(r, plan, Expr[])
     sf = s isa Real ? Float64(s) :
         s isa Symbol && haskey(plan.columns, s) ? :(Float64($s)) : s
     yf = _yfloat_name(r.label)
-    xaug = Symbol(:_ppl_glm_X_, r.label)
-    bfull = Symbol(:_ppl_glm_b_, r.label)
-    xaug_expr, bfull_expr = _glm_design_args(M, alpha, v, _response_rows_source(plan, r))
+    loc = _location_node(r, plan)
+    residual = Symbol(:_ppl_normal_residual_, r.label)
+    ss = Symbol(:_ppl_normal_ss_, r.label)
+    nf = Symbol(:_ppl_normal_n_, r.label)
+    prec = Symbol(:_ppl_normal_prec_, r.label)
     return Expr[
         _through_pointwise(stmts, r)...,
         :($yf = Float64.($(r.response))),
-        :($xaug = $xaug_expr),
-        :($bfull = $bfull_expr),
-        :($node::Float64 = $sf > 0 ? normal_id_glm_lpdf($xaug, $bfull, $sf, $yf) : -Inf),
+        :($node::Float64 = if $sf > 0
+            $residual = $yf .- $loc
+            $ss = dot($residual, $residual)
+            $nf = length($yf) * 1.0
+            $prec = 1.0 / ($sf * $sf)
+            -0.5 * $ss * $prec - $nf * (log($sf) + 0.5 * log(2 * π))
+        else
+            -Inf
+        end),
     ]
 end
 
@@ -4439,6 +4460,18 @@ function _parameter_prior_statements!(stmts, terms, plan, layout;
     return nothing
 end
 
+function _factor_density_statements!(stmts, terms, plan; context = plan, pointwise = nothing)
+    for factor in plan.factors
+        node = Symbol(:_ppl_factor_, factor.name)
+        density = _sampled_prior_expr(factor; conditioned = true,
+            float64_args = _float64_inputs(context, values(factor.args)))
+        push!(stmts, :($node::Float64 = $density))
+        push!(terms, node)
+        pointwise === nothing || push!(pointwise, factor.name => node)
+    end
+    return nothing
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}(), context = plan)
     stmts = Expr[]
@@ -4473,13 +4506,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         end
     end
     _parameter_prior_statements!(stmts, terms, plan, layout)
-    for factor in plan.factors
-        node = Symbol(:_ppl_factor_, factor.name)
-        density = _sampled_prior_expr(factor; conditioned = true,
-            float64_args = _float64_inputs(context, values(factor.args)))
-        push!(stmts, :($node::Float64 = $density))
-        push!(terms, node)
-    end
+    _factor_density_statements!(stmts, terms, plan; context)
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
     # columns (priors addressed by response label — validation pins
@@ -5102,12 +5129,14 @@ function _scan_translate_step(ex, s::ScanSpec, env, scalars)
         _history_is_earlier(idx, s.loopvar, s.lo, env.binders) ||
             throw(ContractValidationError("$where: `$(a)[$(idx)]` is not a " *
                 "lag, a current read or an entry provably before the loop index"))
-        a in env.completed || a === env.hist || throw(ContractValidationError(
+        available = env.hist isa AbstractVector ? a in env.hist : a === env.hist
+        a in env.completed || available || throw(ContractValidationError(
             "$where: the history of `$(a)` is not available in the fold for " *
             "`$(something(env.hist, :density))`"))
         # A finished trajectory, or the fold's own `history`: the whole
         # trajectory `[seeds; outputs so far]`.
-        source = a in env.completed ? a : :_ppl_hist
+        source = a in env.completed ? a : env.hist isa AbstractVector ?
+            Expr(:., :_ppl_hist, QuoteNode(a)) : :_ppl_hist
         return slice ? Expr(:call, GlobalRef(Base, :view), source, tidx) :
             Expr(:ref, source, tidx)
     end
@@ -5118,12 +5147,13 @@ function _scan_translate_step(ex, s::ScanSpec, env, scalars)
 end
 
 # The do-block body of one reconstruction: the steps in order, the next carry
-# window, and `(next, <output>)`. The step reads parameters and data values
-# by closing over them. `completed` arrays are read from their trajectories
+# window, and `(next, <output>)`, or just the density for a plate. The step
+# reads parameters and data values by closing over them. `completed` arrays
+# are read from their trajectories
 # and their writes are skipped; `exec` (statement indices) limits the body to
-# the statements this fold needs; `hist` names the array whose earlier entries
+# the statements this fold needs; `hist` names the arrays whose earlier entries
 # come from the scan's `history` argument.
-function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, scalars;
+function _scan_step_block(s::ScanSpec, innov, output, scalars;
         completed = Set{Symbol}(), exec = nothing, hist = nothing)
     env = (; locals = Dict{Symbol,Any}(s.loopvar => :_ppl_scan_index),
         current = Dict{Symbol,Symbol}(), binders = Dict{Symbol,Any}(),
@@ -5156,6 +5186,9 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
             env.locals[st.target] = nm
         end
     end
+    if output === nothing
+        return Any[body..., _sum_terms(logps)]
+    end
     active = exec === nothing ? setdiff(Set(s.states), completed) :
         Set(s.step[i].target for i in exec if s.step[i].indexed &&
             !(s.step[i].target in completed))
@@ -5166,7 +5199,8 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
         push!(fields, Expr(:(=), _scan_lag_field(a, k), val))
     end
     push!(body, :(_ppl_next = $(Expr(:tuple, fields...))))
-    result = output === nothing ? _sum_terms(logps) : env.current[output]
+    result = output isa AbstractVector ?
+        ReactiveKernels._scan_named_tuple_expr(output, a -> env.current[a]) : env.current[output]
     push!(body, :((_ppl_next, $result)))
     return body
 end
@@ -5185,39 +5219,19 @@ function _scan_fold(s, innov, ranges, zname, T, output, scalars;
     body = _scan_step_block(s, innov, output, scalars; completed, exec, hist)
     lambda = Expr(:->, Expr(:tuple, :_ppl_carry, elems...), Expr(:block, body...))
     kws = Any[Expr(:kw, :init, Expr(:tuple, init...))]
-    hist === nothing || push!(kws, Expr(:kw, :history,
-        Expr(:vect, (_scan_init_name(hist, k) for k in 1:m)...)))
+    if hist !== nothing
+        seed(a) = Expr(:vect, (_scan_init_name(a, k) for k in 1:m)...)
+        leading = hist isa AbstractVector ?
+            ReactiveKernels._scan_named_tuple_expr(output, seed) : seed(hist)
+        push!(kws, Expr(:kw, :history, leading))
+    end
     call = Expr(:call, :scan, Expr(:parameters, kws...), seqs...)
     return Expr(:do, call, lambda)
 end
 
-# The order in which a history-reading scan's carried arrays are produced,
-# each with the statements its fold executes (`_history_fold_order`).
-function _scan_fold_order(s::ScanSpec)
-    statements = _scan_fold_statements(s)
-    reads = _history_statement_reads(s.states, s.loopvar, statements)
-    order = _history_fold_order(s.states, statements, reads)
-    order === nothing && throw(ContractValidationError(
-        "$(_scan_where(s)): carried arrays of $(join(s.states, ", ")) read one " *
-        "another's earlier entries, which is not built yet: each fold reads the " *
-        "history of the one array it produces, so a history-read array must be " *
-        "computable without another array's history"))
-    return order, reads
-end
-
-# Reconstruction statements for every non-centered scan, in plan order. The
-# seeds bind first (`_ppl_scan_init_<a>_<k>`: a sampled seed reads its slice
-# coordinate, a deterministic one evaluates its expression). Each carried
-# array then folds its own RK-core `scan(...)` over the innovation blocks:
-#   `rest = scan(view(z, r₁), …; init = (a_lag1 = …, …)) do
-#        _ppl_carry, _ppl_e1, …   # the steps, in order, reading params…
-#        (next, <a's new value>) end`
-#   `a = vcat(<a's seeds>…, rest)`
-# The carry is the tuple of every carried array's lag window, seeded from the
-# last `L` seeds. One fold per carried array keeps every per-step output a
-# scalar (the RK scan output contract under Reactant); the planner prunes a
-# carried array nothing reads. Runs before predictors/likelihood (both may
-# read a state); the latent prior stays in `_scan_prior_statements`.
+# All trajectories share one retained scan.
+# Column projections give each trajectory its own graph value without replaying
+# the recurrence when several outputs or the prior are requested together.
 function _scan_reconstruction_statements(plan::StructuralPlan,
         layout::LayoutTable)
     stmts = Expr[]
@@ -5240,60 +5254,66 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
             push!(stmts, :($nm::Float64 = $val))
         end
         m = s.lo - 1
-        if T > m && _scan_has_history(s)
-            _scan_history_reconstruction!(stmts, s, innov, ranges, zname, T, scalars)
-            continue
-        end
-        for a in s.states
-            if T == m
+        if T == m
+            for a in s.states
                 seeds = [_scan_init_name(a, k) for k in 1:m]
                 push!(stmts, :($a = [$(seeds...)]))
-                continue
             end
-            rest = Symbol(:_ppl_scan_rest_, a)
-            push!(stmts, :($rest = $(_scan_fold(s, innov, ranges, zname, T, a, scalars))))
-            seeds = [_scan_init_name(a, k) for k in 1:m]
-            push!(stmts, :($a = vcat([$(seeds...)], $rest)))
+            continue
+        end
+        history = _scan_has_history(s)
+        if length(s.states) == 1
+            a = only(s.states)
+            fold = _scan_fold(s, innov, ranges, zname, T, a, scalars;
+                hist = history ? a : nothing)
+            if history
+                push!(stmts, :($a = $fold))
+            else
+                rest = Symbol(:_ppl_scan_rest_, a)
+                seeds = [_scan_init_name(a, k) for k in 1:m]
+                push!(stmts, :($rest = $fold))
+                push!(stmts, :($a = vcat([$(seeds...)], $rest)))
+            end
+            continue
+        end
+        outputs = s.states
+        shared = Symbol(:_ppl_scan_outputs_, first(s.states))
+        fold = _scan_fold(s, innov, ranges, zname, T, outputs, scalars;
+            hist = history ? s.states : nothing)
+        push!(stmts, :($shared = $fold))
+        for a in outputs
+            column = history ? Expr(:., shared, QuoteNode(a)) :
+                ReactiveKernels._scan_column_expr(shared, a)
+            if history
+                push!(stmts, :($a = $column))
+            else
+                rest = Symbol(:_ppl_scan_rest_, a)
+                seeds = [_scan_init_name(a, k) for k in 1:m]
+                push!(stmts, :($rest = $column))
+                push!(stmts, :($a = vcat([$(seeds...)], $rest)))
+            end
         end
     end
     return stmts
 end
 
-# A scan with history reads produces its carried arrays one fold at a time
-# (`_scan_fold_order`): the fold for `a` executes only the statements `a`
-# needs and reads every array produced before it from its finished
-# trajectory. When it reads `a`'s own earlier entries, it scans with
-# `history = <a's seeds>`, so its result and its step's `history` are the
-# whole trajectory:
-#   `a = scan(…; init = (…), history = [<a's seeds>…]) do _ppl_carry, …, _ppl_hist
-#        … _ppl_hist[s] …
-#        (next, <a's new value>) end`
-# A fold without own history reads keeps `a = vcat(<a's seeds>…, rest)`.
-function _scan_history_reconstruction!(stmts, s::ScanSpec, innov, ranges, zname,
-        T, scalars)
-    m = s.lo - 1
-    order, reads = _scan_fold_order(s)
-    completed = Set{Symbol}()
-    for (a, exec) in order
-        seeds = [_scan_init_name(a, k) for k in 1:m]
-        own = _history_fold_reads_own(reads, exec, a)
-        fold = _scan_fold(s, innov, ranges, zname, T, a, scalars;
-            completed = copy(completed), exec, hist = own ? a : nothing)
-        if own
-            push!(stmts, :($a = $fold))
-        else
-            rest = Symbol(:_ppl_scan_rest_, a)
-            push!(stmts, :($rest = $fold))
-            push!(stmts, :($a = vcat([$(seeds...)], $rest)))
-        end
-        push!(completed, a)
-    end
-    return stmts
+# Conditional densities read the completed trajectories. Only the sampled
+# statements and their local dependencies execute: no carried update is replayed.
+# A plate keeps these densities independently selectable from state outputs.
+function _scan_density_plate(s, innov, ranges, zname, T, scalars)
+    completed = Set(s.states)
+    exec = _history_fold_closure(_scan_fold_statements(s),
+        _scan_statement_reads(s), nothing, completed)
+    body = _scan_step_block(s, innov, nothing, scalars; completed, exec)
+    seqs = Any[:($(s.lo):$T), [:(view($zname, $(first(r)):$(last(r)))) for r in ranges]...]
+    elems = Symbol[:_ppl_scan_index, [Symbol(:_ppl_e, j) for j in eachindex(innov)]...]
+    Expr(:do, Expr(:call, :plate, seqs...),
+        Expr(:->, Expr(:tuple, elems...), Expr(:block, body...)))
 end
 
-# Seeds contribute their stated density once. The same ordered recurrence
-# supplies each per-step sample's conditional density before binding its new
-# value, so innovation scales may read carried values, locals, data and time.
+# Seeds contribute their stated density once; the plate supplies each per-step
+# sample's conditional density. Innovation scales may read carried values,
+# locals, data and time in the original statement order.
 function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
         s::ScanSpec, plan::StructuralPlan)
     s = _resolve_scan(plan, s)
@@ -5315,15 +5335,8 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
     if T >= s.lo && !isempty(innov)
         pointwise = Symbol(:_ppl_scan_density_, head)
         node = Symbol(:_ppl_scan_stepslp_, head)
-        # With history reads every carried array is reconstructed first, so
-        # each step's density reads the finished trajectories.
-        fold = _scan_has_history(s) ?
-            _scan_fold(s, innov, ranges, zname, T, nothing, scalars;
-                completed = Set(s.states),
-                exec = _history_fold_closure(_scan_fold_statements(s),
-                    _scan_statement_reads(s), nothing, Set(s.states))) :
-            _scan_fold(s, innov, ranges, zname, T, nothing, scalars)
-        push!(stmts, :($pointwise = $fold))
+        push!(stmts, :($pointwise = $(_scan_density_plate(s, innov, ranges,
+            zname, T, scalars))))
         push!(stmts, :($node::Float64 = sum($pointwise)))
         push!(terms, node)
     end
@@ -5341,8 +5354,8 @@ _scan_reads_carried(ex, s::ScanSpec) = ex isa Expr &&
 # the prior sum. Centered: the recurrence body is exactly one indexed `~` of
 # the carried state (`state[t] ~ dist`); the density is the seed term(s) plus
 # a plate over aligned lagged slices (the recurrence factorizes given the
-# state). Non-centered: the iid-innovation prior over the `_ppl_scan_z_`
-# slice (the plate-vector prior shape), with the state reconstructed in
+# state). Non-centered: conditional innovation densities over the `_ppl_scan_z_`
+# slice, with any state-dependent arguments reading the trajectories from
 # `_scan_reconstruction_statements`.
 function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
     stmts = Expr[]
