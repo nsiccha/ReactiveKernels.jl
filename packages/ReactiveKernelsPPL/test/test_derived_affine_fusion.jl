@@ -12,6 +12,83 @@ const _DERIVED_AFFINE_MODEL = @rkppl begin
     y .~ Normal.(mu, s)
 end
 
+const _AFFINE_GATHER_OFFSET = @rkppl begin
+    b ~ Normal(0, 1)
+    z[1:J] .~ Normal.(0, 1)
+    mu = b .* x .+ z[group]
+    y .~ Normal.(mu, 0.9)
+end
+
+const _AFFINE_TRANSFORMED_OFFSET = @rkppl begin
+    b ~ Normal(0, 1)
+    a ~ Normal(0, 1)
+    z[1:J] .~ Normal.(0, 1)
+    level = a .+ z
+    mu = level[group] .+ b .* x
+    y .~ Normal.(mu, 0.9)
+end
+
+_offset_expr_nodes(x) = x isa Expr ?
+    1 + sum(_offset_expr_nodes, x.args; init=0) : 0
+
+@testset "scalar-column predictors fuse vector offsets" begin
+    for (model, transformed) in ((_AFFINE_GATHER_OFFSET, false),
+            (_AFFINE_TRANSFORMED_OFFSET, true))
+        structures = Int[]
+        for (n, J) in ((0, 3), (1, 3), (48, 3), (384, 7))
+            group = [mod1(div(i-1, 16)+1, J) for i in 1:n]
+            x = [0.2 + sin(i/11) for i in 1:n]
+            y = [cos(i/9)/2 for i in 1:n]
+            pristine = deepcopy((group, x, y))
+            plan = model(; J, group, x) | (; y)
+            built = build_kernel(plan)
+            source = kernel_expr(plan, built.layout)
+            @test !occursin("_ppl_design_mu", string(source))
+            @test occursin("mu = plate(", string(source))
+            n >= 48 && push!(structures, _offset_expr_nodes(source))
+            for shift in (0.0, 0.15)
+                z = [0.2sin(i) + shift for i in 1:J]
+                b, a = 0.3-shift, transformed ? -0.2+shift : 0.0
+                params = transformed ? (; b, a, z) : (; b, z)
+                u = collect(Float64, unconstrain(built.layout, params))
+                saved_u = copy(u)
+                q = prepare_sampler(built, plan, u;
+                    backend=AutoEnzyme(; mode=Enzyme.Reverse),
+                    native_forward_batch=false)
+                @test q.ad.backend.mode === Enzyme.Reverse
+                mu = b .* x .+ a .+ z[group]
+                residual = (y .- mu) ./ 0.9^2
+                gz = -copy(z)
+                for i in eachindex(group)
+                    gz[group[i]] += residual[i]
+                end
+                gb = -b + sum(residual .* x; init=0.0)
+                ga = -a + sum(residual; init=0.0)
+                gradients = transformed ? (; b=gb, a=ga, z=gz) : (; b=gb, z=gz)
+                expected_g = collect(Float64, unconstrain(built.layout, gradients))
+                logunit(v) = -0.5v^2 - 0.5log(2pi)
+                expected = logunit(b) + sum(logunit, z; init=0.0) +
+                    (transformed ? logunit(a) : 0.0) +
+                    sum(v -> logunit(v/0.9)-log(0.9), y .- mu; init=0.0)
+                g = similar(u)
+                value, _ = sampler_value_and_gradient!(q, g, u)
+                @test value ≈ expected rtol=1e-12 atol=1e-12
+                @test q(u) ≈ expected rtol=1e-12 atol=1e-12
+                @test g ≈ expected_g rtol=1e-11 atol=1e-11
+                @test u == saved_u
+                @test (group, x, y) == pristine
+                if n == 48 && shift == 0.0
+                    observations = prepare_query(built, plan, :observations)
+                    @test Base.invokelatest(observations, u).y.location ≈ mu
+                end
+            end
+        end
+        @test all(==(first(structures)), structures)
+        @test_throws ContractValidationError model(;
+            J=3, group=fill(0, 16), x=zeros(16)) | (; y=zeros(16))
+    end
+end
+
 function _derived_affine_findiff(f, u)
     h = cbrt(eps(Float64))
     [begin

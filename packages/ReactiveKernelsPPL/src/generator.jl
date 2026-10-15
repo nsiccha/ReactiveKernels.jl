@@ -956,6 +956,13 @@ function _predictor_statements(plan::StructuralPlan)
             cell_terms = Any[]
             k = 1
             for b in shape.blocks
+                if b.kind === OffsetTerm
+                    offset = _dovar(length(formals) + 1)
+                    push!(inputs, b.column)
+                    push!(formals, offset)
+                    push!(cell_terms, offset)
+                    continue
+                end
                 c = _dovar(length(formals) + 1)
                 push!(inputs, _coef_coord(coef, k))
                 push!(formals, c)
