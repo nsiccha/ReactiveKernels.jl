@@ -2968,6 +2968,33 @@ end
     end
 end
 
+# The scalar plan of a cell containing another plate: its shared work hoisted
+# (`_nested_plate_invariants`) and its plate chains composed. Composing gives the
+# composed values fresh identities (`_compose_authored_plates`). Both backend
+# products of one preparation lower the same cells, and one product can lower a
+# cell more than once, so within a preparation (`_sharing_cell_plans`) every
+# lowering of a cell reuses one plan: they name the same values and compose once.
+# The plan depends only on the cell kernel, the atomic positions and which call
+# values are scalars.
+const _SHARED_CELL_PLANS = :ReactiveKernels_shared_cell_plans
+
+_sharing_cell_plans(f) = haskey(task_local_storage(), _SHARED_CELL_PLANS) ? f() :
+    task_local_storage(f, _SHARED_CELL_PLANS, IdDict{Any,Any}())
+
+function _nested_cell_plan(kernel, atomic, callvalues)
+    function compose()
+        inner = kernel.plan
+        hoisted = _nested_plate_invariants(inner, atomic, callvalues)
+        scalar = hoisted === nothing ? inner : _partial_subplan(inner,
+            vcat(inner.have, hoisted.frontier), inner.want, hoisted.residual)
+        (hoisted, _fuse_authored_plate_chains(scalar))
+    end
+    shared = get(task_local_storage(), _SHARED_CELL_PLANS, nothing)
+    shared === nothing && return compose()
+    scalar_calls = Tuple(valtype(v) <: Number for v in callvalues)
+    get!(compose, shared, (kernel, atomic, scalar_calls))
+end
+
 # A cell containing another plate is lowered by the same graph compiler as a
 # top-level kernel. Splicing that AST retains each nested runtime loop, fuses
 # selected sum consumers, and preserves all named scalar recipes for replay.
@@ -2975,11 +3002,7 @@ end
 # embedding without rebasing its operation-table references a second time.
 function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
                                 atomic, callvalues)
-    inner = kernel.plan
-    hoisted = _nested_plate_invariants(inner, atomic, callvalues)
-    scalar = hoisted === nothing ? inner : _partial_subplan(inner,
-        vcat(inner.have, hoisted.frontier), inner.want, hoisted.residual)
-    scalar = _fuse_authored_plate_chains(scalar)
+    hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
     hint_ids = sort!(collect(keys(types)))
     type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
@@ -6319,10 +6342,10 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                       exemplars))
 end
 
-# Re-lowering an embedded nested plate may fuse its child plates separately in
-# each product. Fusion gives the same readable recipes fresh Value identities.
-# Accept only a consistent renaming: source, operations, order and all graph
-# edges must still agree.
+# The two backend products of one preparation reuse each nested cell's composed
+# plan (`_nested_cell_plan`); other intermediates they create independently can
+# carry fresh Value identities. Accept only a consistent renaming: source,
+# operations, order and all graph edges must still agree.
 function _same_readable_recipes(a, b)
     length(a) == length(b) || return false
     forward = Dict{Int,Int}()
@@ -6374,14 +6397,16 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
     end
     lowered_plan = _lowering_plan(p)
     exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
-    native_ast, ops, recipes = _lower_with_ops(lowered_plan; exemplar_types)
-    isempty(passes) || (native_ast = transform(native_ast, passes...))
-    if !_needs_embedded_tensorization(p)
-        return _prepare(p, native_ast, ops, recipes; exact_signature)
+    embedded = _needs_embedded_tensorization(p)
+    (native_ast, ops, recipes), tensorized_lowering = _sharing_cell_plans() do
+        native_lowering = _lower_with_ops(lowered_plan; exemplar_types)
+        embedded || return (native_lowering, nothing)
+        (native_lowering, _lower_with_ops(lowered_plan; tensorized = true))
     end
+    isempty(passes) || (native_ast = transform(native_ast, passes...))
+    embedded || return _prepare(p, native_ast, ops, recipes; exact_signature)
 
-    tensorized_ast, tensorized_ops, tensorized_recipes =
-        _lower_with_ops(lowered_plan; tensorized = true)
+    tensorized_ast, tensorized_ops, tensorized_recipes = tensorized_lowering
     tensorized_ops == ops || throw(ArgumentError(
         "embedded native and tensorized kernels produced different operation tables"))
     _same_readable_recipes(tensorized_recipes, recipes) || throw(ArgumentError(
