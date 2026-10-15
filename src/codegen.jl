@@ -686,10 +686,9 @@ function _scan_step_input_types(op::_AuthoredScanOp, input_types)
         (input_types[i] for i in 2:last_shared if i in atomic)...]
 end
 
-# The type of a scan's result vector from its argument types and the step's
+# The type of a scan's result from its argument types and the step's
 # output type `element`: the seed promoted in for `include_init = true`, or
-# the history value's element type (`_scan_history_element`, then without
-# `element`).
+# the history column types (independent of `element`).
 function _scan_result_type_expr(op::_AuthoredScanOp, input_types, element)
     _scan_has_history(op) && return Expr(:call,
         GlobalRef(@__MODULE__, :_scan_history_result_type), input_types[end])
@@ -2468,11 +2467,20 @@ Base.@nospecializeinfer function _plate_branch_source_graphs(
     mod = _kernel_endpoint_source_module(r.op)
     key = (Tuple(names), Tuple(sort!(collect(shared))), mod)
     # Native and tensorized lowerings must append the SAME arm operation
-    # objects to their tables. The source expression is the plan-owned weak
-    # key, so this cold cache does not retain prepared models after the plan
-    # and its source have gone away.
+    # objects to their tables. Key by source identity: equal expressions in
+    # different plans have independent lifetimes. WeakKeyDict compares Exprs
+    # structurally, so its entry could belong to a dead earlier plan and be
+    # collected between the two lowerings of the live plan.
     lock(_PLATE_BRANCH_SOURCE_GRAPHS_LOCK) do
-        by_op = get!(_PLATE_BRANCH_SOURCE_GRAPHS, r.source::Expr) do
+        if Threads.atomic_xchg!(_PLATE_BRANCH_SOURCE_GRAPHS_DIRTY, false)
+            filter!(entry -> entry.first.source.value !== nothing,
+                    _PLATE_BRANCH_SOURCE_GRAPHS)
+        end
+        source = r.source::Expr
+        by_op = get!(_PLATE_BRANCH_SOURCE_GRAPHS, _PlateBranchSourceKey(source)) do
+            # Finalizers only mark the cache for cleanup; dictionary mutation
+            # stays under the lowering lock, outside the finalizer.
+            finalizer(_ -> (_PLATE_BRANCH_SOURCE_GRAPHS_DIRTY[] = true), source)
             IdDict{Any,Any}()
         end
         by_inputs = get!(by_op, r.op) do
@@ -2488,7 +2496,19 @@ Base.@nospecializeinfer function _plate_branch_source_graphs(
     end
 end
 
-const _PLATE_BRANCH_SOURCE_GRAPHS = WeakKeyDict{Expr,Any}()
+# A stable hash plus weak identity keeps this cold cache from retaining a
+# prepared model. Include the hash in equality even after both refs expire.
+struct _PlateBranchSourceKey
+    source::WeakRef
+    id::UInt
+end
+_PlateBranchSourceKey(source::Expr) = _PlateBranchSourceKey(WeakRef(source), objectid(source))
+Base.hash(key::_PlateBranchSourceKey, h::UInt) = hash(key.id, h)
+Base.isequal(a::_PlateBranchSourceKey, b::_PlateBranchSourceKey) =
+    a.id == b.id && a.source.value === b.source.value
+
+const _PLATE_BRANCH_SOURCE_GRAPHS = Dict{_PlateBranchSourceKey,Any}()
+const _PLATE_BRANCH_SOURCE_GRAPHS_DIRTY = Threads.Atomic{Bool}(false)
 const _PLATE_BRANCH_SOURCE_GRAPHS_LOCK = ReentrantLock()
 
 Base.@nospecializeinfer function _plate_branch_with_source_graphs(
@@ -2980,15 +3000,10 @@ end
 # for bottom; concrete nonempty lanes keep their ordinary inferred types.
 @inline _plate_coordinate_type(::Type{T}, hint) where {T} = T
 @inline _plate_coordinate_type(::Type{Union{}}, hint) = hint
-@generated function _plate_axis_types(::Val{A}, ::Val{I}, args::T) where {A,I,T<:Tuple}
-    # Select structural argument slots directly. Recursive filtering can widen
-    # a tuple of constant Type values to Tuple{Vararg{DataType}} on Julia 1.10,
-    # leaving nested plate result inference in the differentiated runtime.
-    Expr(:tuple, (:(getfield(args, $j)) for j in 1:fieldcount(T)
-                  if !(I + j - 1 in A))...)
-end
 @inline _plate_marker_type(::Tuple{}) = Nothing
-@inline function _plate_marker_type(args::Tuple)
+# Inlining each branch of this recursive search expands the broad DataType
+# specialization exponentially before constant propagation selects a marker.
+@noinline function _plate_marker_type(args::Tuple)
     class = _static_plate_axis_class(first(args))
     class === :axis && return first(args)
     class === :not_axis && return _plate_marker_type(Base.tail(args))
@@ -2997,14 +3012,22 @@ end
     fieldcount(axes_type) > 0 ? first(args) :
         _plate_marker_type(Base.tail(args))
 end
-@inline function _plate_array_type(::Type{T}, ::Val{A}, args...) where {T,A}
-    # Preserve the structural slots of these type-only operands so known
-    # result types fold before the differentiated runtime.
-    axes_args = _plate_axis_types(Val(A), Val(1), args)
-    marker = _plate_marker_type(axes_args)
-    (marker === Nothing || marker === Any) && return Any # the emitted region validates its axis
-    axes_type = Base.promote_op(Base.Broadcast.combine_axes, axes_args...)
-    Base.promote_op(_plate_similar_output, marker, Type{T}, axes_type)
+@inline @generated function _plate_array_type(::Type{T}, ::Val{A},
+                                              args::Vararg{Type,N}) where {T,A,N}
+    # Mirror the emitted allocation: select the batched operands, infer their
+    # axes individually, and type RK's splat-free broadcast-shape fold. Inferring
+    # Base.combine_axes over a wide operand list can take minutes and gigabytes.
+    # Keep every type operand positional as well: a forwarded splat or Base's
+    # promote_op leaves runtime inference once Julia's tuple-splat limit is hit.
+    batched = Any[:(getfield(args, $j)) for j in 1:N if !(j in A)]
+    shapes = Any[:(_promote_op(axes, $arg)) for arg in batched]
+    quote
+        marker = _plate_marker_type(($(batched...),))
+        (marker === Nothing || marker === Any) && return Any # the region validates its axis
+        axes_type = _promote_op(_plate_broadcast_shape,
+                               Core.apply_type(Tuple, $(shapes...)))
+        _promote_op(_plate_similar_output, marker, Type{T}, axes_type)
+    end
 end
 
 # A cell containing another plate is lowered by the same graph compiler as a
