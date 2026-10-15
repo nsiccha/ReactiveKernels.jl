@@ -160,6 +160,14 @@ end
 function _index_run_simd_plate(ex)
     ex isa Expr && ex.head===:let && length(ex.args)==2 || return nothing
     binding=ex.args[1]
+    # Macro hygiene on newer Julia versions wraps even one let binding in a
+    # block. Only unwrap a single binding: replacing a multi-binding let
+    # would discard the evaluation and scope of its other bindings.
+    if binding isa Expr && binding.head===:block
+        bindings=Any[a for a in binding.args if !(a isa LineNumberNode)]
+        length(bindings)==1 || return nothing
+        binding=only(bindings)
+    end
     binding isa Expr && binding.head===:(=) && length(binding.args)==2 || return nothing
     domain=binding.args[2]
     _index_run_call(domain,GlobalRef(@__MODULE__,:_plate_simd_cells),1) || return nothing
