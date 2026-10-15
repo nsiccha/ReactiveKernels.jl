@@ -53,6 +53,7 @@ const _MATRIX_CORE_TESTS = (
     "test_authoring.jl",
     "test_globalref_composition.jl",
     "test_source_world_age.jl",
+    "test_execution_sources.jl",
     "test_error_policy.jl",
     "test_tensorized_vect.jl",
     "test_tensorized_macros.jl",
