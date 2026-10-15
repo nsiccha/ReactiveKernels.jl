@@ -656,3 +656,30 @@ end
             f.q.kernel.plan.recipes) == (T == 1 ? 0 : 1)
     end
 end
+
+@testset "scan columns: state queries omit innovation densities" begin
+    data = Dict{Symbol,Any}(:y => zeros(3), :T => 3)
+    program = quote
+        r ~ Normal(0, 1)
+        @scan begin
+            a[1] = 0.1
+            b[1] = -0.2
+            for t in 2:T
+                e ~ Normal(0, sqrt(r))
+                a[t] = r * b[t - 1] + e
+                b[t] = 0.3 * a[t - 1] + a[t]
+            end
+        end
+        y .~ Normal.(a, 1.0)
+    end
+    plan = bind_data(lower_rkppl(program, Tuple(keys(data)); conditioned = (:y,)), data)
+    built = build_kernel(plan)
+    states = ReactiveKernelsPPL._prepare_wants(built, plan, (:a, :b))
+    # These coordinates define the trajectories, while sqrt(r) is outside
+    # its density domain. A state-only query must not evaluate that density.
+    a, b = Base.invokelatest(states, [-1.0, 0.3, 0.4])
+    @test a ≈ [0.1, 0.5, -0.13]
+    @test b ≈ [-0.2, 0.53, 0.02]
+    @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
+        states.plan.recipes) == 1
+end
