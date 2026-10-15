@@ -73,7 +73,7 @@ end
 
 function _adg_native(fx, u)
     q = prepare_sampler(fx.built, fx.bound, u;
-        backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        backend = AutoEnzyme(; mode = Enzyme.Reverse), native_forward_batch = false)
     value, grad = sampler_value_and_gradient!(q, similar(u), u)
     oracle = _adg_oracle(fx, u)
     @test value ≈ oracle.posterior rtol = 1e-12

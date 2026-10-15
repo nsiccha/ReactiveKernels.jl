@@ -597,7 +597,8 @@ _is_array_assignment(plan::StructuralPlan, name) =
 # broadcasting keeps the operands' axes (a length-1 axis stretches),
 # `A * B` takes `A`'s rows and `B`'s columns, an adjoint or `transpose`
 # swaps them (a vector becomes a 1×n row), `M[:, j]` keeps the axes read
-# with `:`, and a reduction is a scalar. `Any[]` is a scalar; `nothing`
+# with `:`, a gather `a[g]` takes its bound index column's axes, and a
+# reduction is a scalar. `Any[]` is a scalar; `nothing`
 # means the shape is unavailable (for example, an opaque module call).
 # With bound data, data_axes resolves declared dimensions to concrete
 # lengths as well, without evaluating any sampled value.
@@ -681,9 +682,30 @@ function _value_axes(plan::StructuralPlan, ex,
     if head === :ref
         base = ax(ex.args[1])
         idx = ex.args[2:end]
-        (base === nothing || length(idx) != length(base) ||
-            !all(_is_position, idx)) && return nothing
-        return Any[d for (i, d) in zip(idx, base) if i === :(:)]
+        base === nothing && return nothing
+        if all(_is_position, idx)
+            length(idx) == length(base) || return nothing
+            return Any[d for (i, d) in zip(idx, base) if i === :(:)]
+        end
+        # A per-observation gather (`a[g]`, `A[g, :]`, `A[:, g]`) follows
+        # Julia indexing: each index contributes its own axes, a `:` the
+        # array's axis there, a literal position none and the index column
+        # its bound shape. A single index is linear, giving the column's
+        # axes alone. An unbound column has no size, so the gather does not.
+        _array_index_kind(plan, ex) === :gather || return nothing
+        cols = ax(idx[_gather_index_axis(plan, ex)])
+        cols === nothing && return nothing
+        length(idx) == 1 && return cols
+        length(idx) == length(base) || return nothing
+        out = Any[]
+        for (i, d) in zip(idx, base)
+            if i === :(:)
+                push!(out, d)
+            elseif !_is_scalar_position(i)
+                append!(out, cols)
+            end
+        end
+        return out
     end
     head === :call && !isempty(ex.args) || return nothing
     fn = ex.args[1]

@@ -537,12 +537,13 @@ end
 # Float64 per row is read as it is (snag rkppl-scalar-loc-b96d576a).
 _rows_gather(z, idx, j) = z[idx, j]
 
-function _rows_sampler(prog::Expr, cols::AbstractDict{Symbol})
+function _rows_sampler(prog::Expr, cols::AbstractDict{Symbol};
+        native_forward_batch = false)
     plan = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
     bound = bind_data(plan, cols)
     built = build_kernel(bound)
     u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
-    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+    q = prepare_sampler(built, bound, u; backend = _GEN_BACKEND, native_forward_batch)
     return bound, built, q, u
 end
 
@@ -720,5 +721,138 @@ end
     for prog in (_VALUE_NORMAL, intercept, defined)
         _, _, q, u = _rows_sampler(prog, yl)
         @test _rows_primal_bytes(q, u) < 4n
+    end
+end
+
+# A per-observation gather of a declared array has the axes Julia indexing
+# gives it once its index column is bound: the column's axes in the gathered
+# position, the array's own axis for each `:`. A location adding a scalar to
+# gathers therefore keeps its broadcast shape (no `_ppl_rows`), and the
+# offset sum can fuse through the ordinary plate planner.
+@testset "gathered locations keep their rows" begin
+    D = Distributions
+    PPL = ReactiveKernelsPPL
+    y = [0.3, -1.2, 2.1, 0.7, -0.4]
+    x = [0.5, -0.2, 1.0, 0.1, 0.8]
+    g = [1, 3, 2, 3, 1]
+    h = ["u", "v", "u", "w", "v"]
+    prog = Meta.parse("""begin
+        beta[1:2] .~ Normal.(0, 1)
+        a[1:K] .~ Normal.(0, 1)
+        c[levels(h)] .~ Normal.(0, 1)
+        A[1:K, 1:3] .~ Normal.(0, 1)
+        s ~ Exponential(1)
+        eta = beta[1] .+ beta[2] .* x .+ a[g] .+ c[h]
+        y .~ Normal.(eta, s)
+    end""")
+    cols = Dict{Symbol,Any}(:y => y, :x => x, :g => g, :h => h, :K => 3)
+    unbound = lower_rkppl(prog, keys(cols); conditioned = keys(cols))
+    @test PPL._value_axes(unbound, :(a[g]); data_axes = true) === nothing
+    bound, built, _, u = _rows_sampler(prog, cols; native_forward_batch = false)
+    axes_of(ex) = PPL._value_axes(bound, ex; data_axes = true)
+    @test axes_of(:(a[g])) == Any[5]
+    @test axes_of(:(c[h])) == Any[5]
+    @test axes_of(:(A[g, :])) == Any[5, 3]
+    @test axes_of(:(A[:, g])) == Any[3, 5]
+    @test axes_of(:(A[g, 2])) == Any[5]
+    @test axes_of(:(A[g])) == Any[5] # linear matrix indexing
+    @test axes_of(:(A[g, g])) === nothing # unsupported two-index gather
+    @test axes_of(:(identity(A)[g])) === nothing # opaque base shape
+    @test axes_of(:(beta[1] .+ a[g])) == Any[5]
+    # Without bound data the index column has no size yet.
+    @test PPL._value_axes(bound, :(a[g])) === nothing
+    pred = only(bound.predictors)
+    offsets = Any[b.column for b in PPL.design_shape(pred, bound.columns;
+        levelmaps = bound.levelmaps, matrices = bound.matrices).blocks
+        if b.kind === PPL.OffsetTerm]
+    @test PPL._has_located_axes(bound, pred,
+        foldl((l, r) -> :($l .+ $r), offsets))
+    @test !occursin("_ppl_rows", string(kernel_expr(bound, built.layout)))
+
+    B = [0.4, -0.3]
+    av = [0.2, -0.5, 0.7]
+    cv = [0.1, -0.6, 0.3]
+    Av = [0.2 -0.1 0.3; 0.5 0.3 -0.2; -0.4 0.6 0.1]
+    code = Dict("u" => 1, "v" => 2, "w" => 3)
+    eta = B[1] .+ B[2] .* x .+ av[g] .+ cv[getindex.(Ref(code), h)]
+    want = sum(D.logpdf.(D.Normal(0, 1), [B; av; cv; vec(Av)])) +
+        D.logpdf(D.Exponential(1), 1.3) + log(1.3) +
+        sum(D.logpdf.(D.Normal.(eta, 1.3), y))
+    q = (; beta = B, a = av, c = cv, A = Av, s = 1.3)
+    @test _value_posterior(prog, cols, q) ≈ want rtol = 1e-12
+    _check_gradient(built.spec, bound, u)
+
+    # The offset sum fuses into one plate that reads the gather in place:
+    # three row vectors per evaluation remain (the offset plate's output and
+    # the `c[levels(h)]` factor term's design product plus its sum), against
+    # five before gathers had axes.
+    n = 1000
+    big = Dict{Symbol,Any}(:y => collect(range(-1, 1; length = n)),
+        :x => collect(range(0, 2; length = n)), :g => mod1.(1:n, 3),
+        :h => ["u", "v", "w"][mod1.(1:n, 3)], :K => 3)
+    _, _, qb, ub = _rows_sampler(prog, big; native_forward_batch = false)
+    @test _rows_primal_bytes(qb, ub) < 4 * 8n
+    # Capability gap: the whole location fused into the observation plate,
+    # with no row vector per evaluation.
+    @test_broken _rows_primal_bytes(qb, ub) < 4n
+end
+
+# These are independent Julia spellings of scalar + gathered values. The
+# inferred row axis must survive naming, array definitions and empty data.
+@testset "gather axes retain natural scalar-plus-array spellings" begin
+    for geometry in (:vector, :matrix), kind in (:inline, :named, :computed),
+            n in (0, 1, 17, 1000)
+        firstread = kind === :named ? :v : kind === :computed ? :(scaled[g]) : :(a[g])
+        declaration = geometry === :vector ? :(c[1:3] .~ Normal.(0, 1)) :
+            :(A[1:3, 1:2] .~ Normal.(0, 1))
+        gather = geometry === :vector ? :(c[g]) : :(A[g, 2])
+        secondread = kind === :named ? :w : gather
+        prog = quote
+            b[1:2] .~ Normal.(0, 1)
+            a[1:3] .~ Normal.(0, 1)
+            $declaration
+            scaled = 2 .* a
+            v = a[g]
+            w = $gather
+            eta = b[1] .+ b[2] .* x .+ $firstread .+ $secondread
+            y .~ Normal.(eta, 1.0)
+        end
+        cols = Dict{Symbol,Any}(:g => mod1.(1:n, 3), :x => sin.(1:n), :y => cos.(1:n))
+        pristine = deepcopy(cols)
+        bound, built, q, u = _rows_sampler(prog, cols; native_forward_batch = false)
+        @test q.ad.backend.mode === Enzyme.Reverse
+        @test ReactiveKernelsPPL._value_axes(bound, :(a[g]); data_axes = true) == Any[n]
+        @test ReactiveKernelsPPL._value_axes(bound, :(scaled[g]); data_axes = true) == Any[n]
+        @test ReactiveKernelsPPL._value_axes(bound, :v; data_axes = true) == Any[n]
+        @test !occursin("_ppl_rows", string(kernel_expr(bound, built.layout)))
+        function oracle(w)
+            nt = constrain(built.layout, w)
+            multiplier = kind === :computed ? 2 : 1
+            mu = nt.b[1] .+ nt.b[2] .* cols[:x] .+
+                multiplier .* nt.a[cols[:g]] .+
+                (geometry === :vector ? nt.c[cols[:g]] : nt.A[cols[:g], 2])
+            other = geometry === :vector ? nt.c : vec(nt.A)
+            sum(Distributions.logpdf.(Distributions.Normal(), [nt.b; nt.a; other])) +
+                sum(Distributions.logpdf.(Distributions.Normal.(mu, 1.0), cols[:y]))
+        end
+        original_u = copy(u)
+        value, gradient = sampler_value_and_gradient!(q, similar(u), u)
+        @test value ≈ oracle(u) rtol = 1e-12
+        @test gradient ≈ _findiff_grad(oracle, u) rtol = 1e-5 atol = 1e-7
+        @test u == original_u && cols == pristine
+        if geometry === :vector && n == 1000
+            # A row-sized Float64 vector would take 8n bytes. Constant-size
+            # values in computed definitions are allowed; row temporaries are not.
+            @test _rows_primal_bytes(q, u) < 4n
+            dest = similar(u)
+            @test minimum(@allocated(sampler_value_and_gradient!(q, dest, u))
+                for _ in 1:3) < 4n
+        end
+        # Full-row results stay queryable after sampler fusion.
+        nt = constrain(built.layout, u)
+        multiplier = kind === :computed ? 2 : 1
+        @test _query(built.spec, bound, :eta, u) ≈ nt.b[1] .+ nt.b[2] .* cols[:x] .+
+            multiplier .* nt.a[cols[:g]] .+
+            (geometry === :vector ? nt.c[cols[:g]] : nt.A[cols[:g], 2])
     end
 end
