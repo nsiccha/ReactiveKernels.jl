@@ -213,3 +213,67 @@ end
         _dc_check(_dc_bound(ast, data), [0.2, -0.3, 0.15], oracle)
     end
 end
+
+# Exact 256-bit cumulative-logit mathematics with analytic gradients. The
+# Float64 oracle above forms `log(hi - lo)` in probability space, which
+# itself cancels once both cumulative probabilities approach one.
+function _dc_tail_oracle(u, data; discrimination)
+    setprecision(BigFloat, 256) do
+        v, c = big.(u), big.(data.cuts)
+        F(z) = inv(1 + exp(-z))
+        K = length(c) + 1
+        g = -v
+        cells = map(eachindex(data.y)) do i
+            x, k = big(data.x[i]), data.y[i]
+            eta = v[1] + v[2] * x
+            d = discrimination ? exp(v[3] * x) : big(1)
+            hi = k == K ? big(1) : F(d * (c[k] - eta))
+            lo = k == 1 ? big(0) : F(d * (c[k-1] - eta))
+            mass = hi - lo
+            g[1] += d * (hi + lo - 1)
+            g[2] += d * (hi + lo - 1) * x
+            if discrimination
+                dhi = k == K ? big(0) : hi * (1 - hi) * (c[k] - eta)
+                dlo = k == 1 ? big(0) : lo * (1 - lo) * (c[k-1] - eta)
+                g[3] += (dhi - dlo) / mass * d * x
+            end
+            log(mass)
+        end
+        prior = sum(t -> -(log(2 * big(pi)) + t^2) / 2, v)
+        (; value = Float64(prior + sum(cells)), gradient = Float64.(g),
+            pointwise = Float64.(cells))
+    end
+end
+
+@testset "cumulative logit interior levels keep precision in both tails" begin
+    # Levels 2 and 5 sit between cutpoints 20 units below and above eta:
+    # both cumulative probabilities of level 5 are within e^-20 of one.
+    data = (; y = [1, 2, 3, 4, 5, 6, 5, 2, 5, 3],
+        x = [-0.6, 0.2, 0.8, -0.1, 0.4, 0.7, -0.3, 0.5, 0.1, -0.8],
+        cuts = [-22.0, -20.0, 0.0, 20.0, 22.0])
+    for kind in (:ordered, :cumulative, :discriminated)
+        response = kind === :ordered ? :(OrderedLogistic.(eta, Ref(cuts))) :
+            kind === :cumulative ?
+                :(Ordinal.(Cumulative(), LogitLink(), eta, Ref(cuts))) :
+                :(Ordinal.(Cumulative(), LogitLink(), eta, Ref(cuts), exp.(gamma .* x)))
+        ast = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            eta = a .+ b .* x
+        end
+        kind === :discriminated && push!(ast.args, :(gamma ~ Normal(0, 1)))
+        push!(ast.args, :(y .~ $response))
+        bound = _dc_bound(ast, data)
+        u = kind === :discriminated ? [0.2, -0.3, 0.15] : [0.2, -0.3]
+        ref = _dc_tail_oracle(u, data; discrimination = kind === :discriminated)
+        built = build_kernel(bound)
+        sampler = prepare_sampler(built, bound, u;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        value, grad = sampler_value_and_gradient!(sampler, similar(u), copy(u))
+        @test abs(value - ref.value) <= 1e-13 * abs(ref.value)
+        @test maximum(abs.(grad .- ref.gradient)) <=
+            1e-12 * maximum(abs.(ref.gradient))
+        pw = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+        @test maximum(abs.(pw.y .- ref.pointwise)) <= 1e-13
+    end
+end
