@@ -880,10 +880,13 @@ seed position, or a window `a[(t - k):(t - 1)]`. A scan body also reads other
 model values whole, so a delay convolution of `infections` can be a second
 `@scan`. A deterministic `@scan` inside a `@plate` cell runs one recurrence
 per index, retained as an RK scan inside the plate cell; its carried arrays
-hold one array per index. Each array that reads its own earlier entries is one
-RK scan with `history = [<its seeds>…]` (see [Scans](scan.md), "Reading
-earlier entries"). Native values and ordinary Enzyme reverse gradients are
-supported.
+hold one array per index. All carried arrays share one retained recurrence,
+including arrays that read each other's earlier entries. History-reading
+recurrences keep the seeds and outputs in one buffer per trajectory (see
+[Scans](scan.md), "Reading earlier entries"). Native values and ordinary
+Enzyme reverse gradients are supported. Innovation densities use a separately
+selectable plate reading the completed trajectories, so the prior does not
+replay the carried updates.
 
 ### One array per index
 
