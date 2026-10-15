@@ -395,15 +395,18 @@ end
 
 # The right fold `broadcast_shape(s1, broadcast_shape(s2, …))` of Base's
 # `combine_axes`, so results and `DimensionMismatch` messages are unchanged.
-# Kept out of line: inlined, one 50-operand reader plate's fold kept a large
-# model's native Reverse gradient compiling for over 33 minutes; out of line
-# the same gradient compiled in about a minute.
+# Inline the identity and single binary shape operation: hiding their result
+# behind a call hides invariant loop extents from native Reverse and can make
+# a nested plate allocate a separate tape per outer cell. Longer folds stay
+# out of line: inlined, one 50-operand reader plate's fold kept a large model's
+# native Reverse gradient compiling for over 33 minutes; out of line the same
+# gradient compiled in about a minute.
 @generated function _plate_broadcast_shape(shapes::Tuple)
     fold = foldr(Any[:(getfield(shapes, $index))
                      for index in 1:fieldcount(shapes)]) do shape, rest
         Expr(:call, GlobalRef(Base.Broadcast, :broadcast_shape), shape, rest)
     end
-    Expr(:block, Expr(:meta, :noinline), fold)
+    Expr(:block, Expr(:meta, fieldcount(shapes) <= 2 ? :inline : :noinline), fold)
 end
 
 # `Base.promote_op(f, T1, …, Tn)` for the types an emitted body computes: the
