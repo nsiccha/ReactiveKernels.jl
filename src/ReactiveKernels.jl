@@ -18,6 +18,7 @@ module ReactiveKernels
 
 using RuntimeGeneratedFunctions
 import ReactantCore
+import OutputSignatures
 using InverseFunctions: inverse, NoInverse
 using LinearAlgebra
 using LogExpFunctions
@@ -40,6 +41,7 @@ include("scan_history.jl")
 include("authored_loops.jl")
 include("authoring.jl")
 include("execution_sources.jl")
+include("value_metadata.jl")
 include("cells.jl")
 include("cell_windows.jl")
 include("lane_sources.jl")

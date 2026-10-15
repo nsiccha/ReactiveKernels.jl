@@ -973,7 +973,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     input_data = data
     ast = _observation_call_definitions(ast, data, mod)
     ast = _gathered_value_definitions(ast, data)
-    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
+    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts, cell_priors =
         _partition_statements(ast, data; array_entries)
     for name in conditioned
         any(f -> f.lhs === name, factors) && continue
@@ -1195,6 +1195,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     declaration_dependencies = _declaration_dependencies(vcat(sample, factors), plate_specs,
         union(data, derived_response_names), canonmap)
     union!(declaration_dependencies, (s.lhs for s in factors))
+    union!(declaration_dependencies, cell_priors)
     declaration_data = Set{Symbol}(nm for nm in declaration_dependencies
         if haskey(canonmap, nm) && _data_only(canonmap[nm], data, canonmap))
     # Design matrices leave `det` for the plan-level table (validated
@@ -1596,7 +1597,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
             if k in indexed_observations || k in indexed_external),
-        named_values, factors = factor_params)
+        named_values, factors = factor_params, cell_priors)
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -3339,8 +3340,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
     seen_doc = false
     line = 0
     cell_broadcasts = Dict{Symbol,Vector{Symbol}}()
+    cell_priors = Symbol[]
     args, plate_ctx, plate_params = _expand_plates(ast.args, data;
-        broadcasts = cell_broadcasts, array_entries)
+        broadcasts = cell_broadcasts, array_entries, cell_priors)
     # Defined names, collected before lowering so the checks below admit
     # forward references. The scan never throws — the main loop below owns
     # every rejection.
@@ -3551,7 +3553,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
             _reject_statement(st)
         end
     end
-    return sample, factors, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts
+    return sample, factors, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts, cell_priors
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
@@ -4038,7 +4040,8 @@ end
 # the post-analysis whole-vector check.
 function _expand_plates(args, data::Set{Symbol};
         broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
-        array_entries::Set{Symbol} = Set{Symbol}())
+        array_entries::Set{Symbol} = Set{Symbol}(),
+        cell_priors::Vector{Symbol} = Symbol[])
     definitions = Dict{Symbol,Any}(arg.args[1] => arg.args[2] for arg in args
         if arg isa Expr && arg.head === :(=) && length(arg.args) == 2 &&
             arg.args[1] isa Symbol)
@@ -4069,6 +4072,15 @@ function _expand_plates(args, data::Set{Symbol};
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
+            prelude, arg, priors = _expand_stochastic_cell_scans(arg, taken)
+            append!(expanded, prelude)
+            append!(cell_priors, priors)
+            for st in prelude
+                if Meta.isexpr(st, :(=), 2)
+                    definitions[st.args[1]] = st.args[2]
+                    _data_only(st.args[2], data, definitions) && push!(plate_data, st.args[1])
+                end
+            end
             arg = _expand_cell_scans(arg)
             arg, locals = _scope_plate_locals(arg, plate_locals, taken)
             stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts, arrays)
@@ -4081,6 +4093,9 @@ function _expand_plates(args, data::Set{Symbol};
             end
             append!(ctx, stx)
             append!(params, prm)
+            for prior in priors
+                push!(expanded, :($prior = sum($(Symbol(prior, :_cells)))))
+            end
             continue
         end
         push!(expanded, arg)
@@ -4120,9 +4135,7 @@ function _expand_cell_scans(st::Expr)
                 ReactiveKernels._kernel_scan_loop_statements(c, nothing, nothing)
             catch err
                 err isa ArgumentError || rethrow()
-                _sfail("`@scan` in a `@plate` cell: $(err.msg). A cell " *
-                       "recurrence writes its seeds and steps with `=`; " *
-                       "sampled seeds and steps per cell are not built yet")
+                _sfail("`@scan` in a `@plate` cell: $(err.msg)")
             end
             append!(cells, stmts)
         else
@@ -4365,6 +4378,12 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         lnames = Set(first.(locals))
         external = _external_rhs(c.args[3])
         function arg(ex; object=false)
+            # Preserve sharing within a dotted cell while lowering the
+            # indexed vector through the ordinary selected-plate path.
+            if _is_ref_call(ex) && _expr_has_sym(ex, ivar)
+                value = arg(ex.args[2])
+                return _is_broadcast_sample(c) ? :(Ref($value)) : value
+            end
             # An external constructor's indexed argument follows the authored
             # iterator. Retain its read in the cell, including bounds checks;
             # stripping it to a column would broadcast a singleton instead.
@@ -4936,10 +4955,17 @@ function _cell_free_syms!(out::Set{Symbol}, ex)
             _lambda_assigned!(bound, ex.args[2])
             union!(out, setdiff!(_cell_free_syms!(Set{Symbol}(), ex.args[2]), bound))
         elseif ex.head === :call && !isempty(ex.args)
+            _constructed_endpoint_head(ex.args[1]) &&
+                _cell_free_syms!(out, ex.args[1].args[1])
             foreach(a -> _cell_free_syms!(out, a), ex.args[2:end])
         elseif ex.head === :. && length(ex.args) == 2
-            ex.args[2] isa Expr && foreach(a -> _cell_free_syms!(out, a),
-                ex.args[2].args)
+            if ex.args[2] isa QuoteNode
+                # A field projection reads its value (including the named
+                # buffers produced by a shared history scan).
+                _cell_free_syms!(out, ex.args[1])
+            elseif ex.args[2] isa Expr
+                foreach(a -> _cell_free_syms!(out, a), ex.args[2].args)
+            end
         elseif ex.head === :kw
             _cell_free_syms!(out, ex.args[2])
         else
@@ -5592,7 +5618,7 @@ function _dotify_cell(ex::Expr, ivar, pidx, object::Bool)
     # Ref denotes one whole shared argument to a broadcasted constructor.
     # Broadcasting Ref itself would replace that argument by scalar wrappers.
     Meta.isexpr(ex, :call, 2) && ex.args[1] === :Ref &&
-        return (ex, false)
+        return (_strip_cell(ex, ivar), false)
     Meta.isexpr(ex, :call, 1) && return (ex, false)
     if ex.head === :call && !isempty(ex.args)
         f = ex.args[1]
@@ -8028,24 +8054,35 @@ function _lower_categorical_logit_response(lhs, call, range, weights,
         extra_predictors = pnames[2:end])
 end
 
-# Explicit cutpoints/thresholds of an ordinal response: the trailing
-# argument `Ref(c)` names one declared vector shared by every observation
-# (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
+# Explicit cutpoints/thresholds of an ordinal response: `Ref(c)` shares
+# one vector, either sampled with its stated prior or supplied as data.
 # Either structure reads an Ordered vector or a one-axis sized vector
 # with its stated element prior and support. A vector may serve several
 # responses; its first use records a size source for `_lower_parameters`.
 function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         shown::String)
-    name = arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
-        arg.args[1] === :Ref && arg.args[2] isa Symbol ? arg.args[2] : nothing
-    if name === nothing
+    if !_is_ref_call(arg)
+        if _data_only(arg, ctx.data, ctx.detmap)
+            name = _lower_argument_value(lhs, :thresholds, arg, ctx)
+            name isa Symbol || _sfail("response $lhs: thresholds must be a vector")
+            return ThresholdRows(name)
+        end
         arg isa Symbol && _sfail("response $lhs: the cutpoints $arg are " *
             "one vector shared by every observation — write `Ref($arg)` " *
             "(standard broadcasting would pair each observation with one " *
             "element of $arg)")
         _sfail("response $lhs: $shown takes its cutpoints as `Ref(c)` of " *
-               "a declared vector, got $(repr(arg))")
+               "a sampled or data vector, got $(repr(arg))")
     end
+    value = arg.args[2]
+    if _data_only(value, ctx.data, ctx.detmap)
+        name = _lower_argument_value(lhs, :thresholds, value, ctx)
+        name isa Symbol || _sfail("response $lhs: thresholds must be a vector")
+        return name
+    end
+    name = value isa Symbol ? value : nothing
+    name === nothing && _sfail("response $lhs: sampled thresholds must " *
+        "name a declared vector, got $(repr(value))")
     if name ∉ ctx.ordered_names
         dims = get(ctx.array_dims, name, nothing)
         dims !== nothing && length(dims) == 1 || _sfail("response $lhs: " *

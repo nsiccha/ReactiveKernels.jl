@@ -135,7 +135,7 @@ function preprocessing_recipes(plan::StructuralPlan)
     return stmts
 end
 
-# A pure affine predictor can read its data columns in the observation cell.
+# An affine predictor can read its columns and vector offsets in the observation cell.
 # Bound vectors and simple derived numeric maps over them have the observation
 # extent and one-based axes. Keep
 # wider designs on the matrix path: their BLAS product can beat a scalar
@@ -180,11 +180,22 @@ function _scalar_column_plate_eligible(plan::StructuralPlan, pred::PredictorSpec
     _uses_structured_observation_axes(plan) && return false
     shape.width <= 3 || return false
     any(r -> _response_uses_predictor(r, pred.name), plan.responses) || return false
-    all(t -> t.kind in (InterceptTerm, ContinuousTerm), pred.terms) || return false
+    all(t -> t.kind in (InterceptTerm, ContinuousTerm, OffsetTerm), pred.terms) || return false
     any(t -> t.kind === ContinuousTerm, pred.terms) || return false
     length(shape.blocks) == length(pred.terms) || return false
     return all(shape.blocks) do b
         b.kind === InterceptTerm && return true
+        # A gathered or computed offset is already a graph value. Reading it
+        # in the same plate keeps its producer available to ordinary fusion.
+        # Unknown and non-vector shapes keep the existing affine paths.
+        if b.kind === OffsetTerm
+            if haskey(plan.columns, b.column)
+                col = plan.columns[b.column]
+                return col isa Vector{<:Number} &&
+                    axes(col) == (Base.OneTo(plan.n_obs),)
+            end
+            return _value_axes(plan, b.column; data_axes = true) == Any[plan.n_obs]
+        end
         b.kind === ContinuousTerm || return false
         col = get(plan.columns, b.column, nothing)
         return (col isa Vector{<:Number} &&
@@ -369,20 +380,17 @@ end
     return effects
 end
 
-function _ordinal_stage_obs(y::AbstractVector{<:Integer}, K::Integer)
+function _ordinal_stage_lanes(f, y::AbstractVector{<:Integer}, K)
     out = Int[]
-    for (i, v) in enumerate(y), _ in 1:min(v, K - 1)
-        push!(out, i)
+    for (i, count) in enumerate(min.(y, K .- 1)), j in 1:count
+        push!(out, f(i, j))
     end
     return out
 end
-function _ordinal_stage_idx(y::AbstractVector{<:Integer}, K::Integer)
-    out = Int[]
-    for v in y, j in 1:min(v, K - 1)
-        push!(out, j)
-    end
-    return out
-end
+_ordinal_stage_obs(y::AbstractVector{<:Integer}, K) =
+    _ordinal_stage_lanes((i, j) -> i, y, K)
+_ordinal_stage_idx(y::AbstractVector{<:Integer}, K) =
+    _ordinal_stage_lanes((i, j) -> j, y, K)
 
 # The values a prior argument of a two-axis elementwise array gives its
 # packed cells: a number is shared by every element, and an array of the

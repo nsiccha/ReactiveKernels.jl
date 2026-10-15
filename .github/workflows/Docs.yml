@@ -52,7 +52,8 @@ jobs:
           clone_pin https://github.com/nsiccha/BayesianRegressionModels.jl.git 1f296dac2c086347525194887500948edb213228 "$DEPS/BayesianRegressionModels.jl" # ns/devibe; GP/HSGP adoption
           # Supply BRM's unregistered deps and its published StanBlocks API floor.
           clone_pin https://github.com/nsiccha/MutatingFunctions.jl.git 12b953dc4ac494fabca5e145f3470bca468235ff "$DEPS/MutatingFunctions.jl"
-          clone_pin https://github.com/nsiccha/OutputSignatures.jl.git c86bd6088beaf14f4dfd3c38329d7b44e6657288 "$DEPS/OutputSignatures.jl"
+          OS_REV=$(julia --startup-file=no -e 'using TOML; print(TOML.parsefile("Project.toml")["sources"]["OutputSignatures"]["rev"])')
+          clone_pin https://github.com/nsiccha/OutputSignatures.jl.git "$OS_REV" "$DEPS/OutputSignatures.jl"
           clone_pin https://github.com/nsiccha/StanBlocks.jl.git 8580826e492aa8681e833f87e8d215b06407bfa1 "$DEPS/StanBlocks.jl" # devibe; ValueFamily
           julia --project=docs -e '
             using Pkg

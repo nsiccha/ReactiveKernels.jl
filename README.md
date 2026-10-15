@@ -55,6 +55,13 @@ straight-line Julia Expr  ──►  (optional AST passes)  ──►  RuntimeGe
 
 ## Quick start
 
+From a source checkout, resolve the pinned OutputSignatures dependency before
+loading ReactiveKernels (this also works with Julia 1.10):
+
+```sh
+julia --startup-file=no --project=. deps/source_dependencies.jl
+```
+
 ```julia
 using ReactiveKernels
 

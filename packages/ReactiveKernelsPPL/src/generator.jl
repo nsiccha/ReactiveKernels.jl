@@ -168,30 +168,48 @@ _same_program(x::Array, y::Array) = typeof(x) === typeof(y) &&
 
 # The source surface admits ordinary dotted scalar math, but an opaque array
 # assignment hides each producer from RK's plate-to-plate reduction fusion.
-# Restrict this emission to one-based Float64 or built-in integer vectors with
-# a known common length and their scalar operands. Every operand is read once;
-# the listed scalar operations and broadcast axes match the dotted tree.
-# Other ranks, axes and callable leaves retain their exact authored expression.
+# OutputSignatures proves the ordinary scalar/vector operations and broadcast
+# axes; PPL separately tracks sampled-value dependence. Every operand is read
+# once. Other ranks, axes and callable leaves keep their authored expression.
 const _POINTWISE_ARITHMETIC = Dict(Symbol(".+") => :+, Symbol(".-") => :-,
     Symbol(".*") => :*, Symbol("./") => :/, Symbol(".^") => :^)
 
 struct _PointwiseValue
-    rank::Int                         # -1 unknown, 0 scalar, 1 vector
-    length::Int                       # known vector length, else 0
+    info::ReactiveKernels.OutputSignatures.ValueInfo
     live::Bool                        # reads a sampled value
 end
-const _POINTWISE_UNKNOWN = _PointwiseValue(-1, 0, false)
+const _OS = ReactiveKernels.OutputSignatures
+const _POINTWISE_UNKNOWN = _PointwiseValue(_OS.ValueInfo(), false)
+
+_pointwise_live(ex, values) = ex isa Symbol ?
+    get(values, ex, _POINTWISE_UNKNOWN).live :
+    ex isa Expr && any(a -> _pointwise_live(a, values), ex.args)
+_pointwise_unknown(ex, values) = _PointwiseValue(_OS.ValueInfo(), _pointwise_live(ex, values))
+
+_pointwise_vector(state::_PointwiseValue) = _OS.value_rank(state.info) === 1
+function _pointwise_known(state::_PointwiseValue)
+    _OS.value_rank(state.info) === 0 && return true
+    _pointwise_vector(state) || return false
+    ax = _OS.value_axes(state.info)
+    return ax !== nothing && only(ax) isa Base.OneTo
+end
+
+function _pointwise_call(ex, states, bound_names)
+    info = ReactiveKernels._call_value_info(ex,
+        _OS.ValueInfo[s.info for s in states], @__MODULE__, bound_names)
+    return _PointwiseValue(info, any(s.live for s in states))
+end
 
 function _pointwise_leaf(ex, values::Dict{Symbol,_PointwiseValue})
     ex isa Symbol && return get(values, ex, _POINTWISE_UNKNOWN)
-    ex isa Float64 && return _PointwiseValue(0, 0, false)
-    ex isa Integer && return _PointwiseValue(0, 0, false)
+    ex isa Number && return _PointwiseValue(_OS.known_info(ex), false)
     if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
             ex.args[2] isa Integer
         base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
-        base.rank == 1 && return _PointwiseValue(0, 0, base.live)
+        return _pointwise_call(ex,
+            [base, _PointwiseValue(_OS.known_info(ex.args[2]), false)], keys(values))
     end
-    return _POINTWISE_UNKNOWN
+    return _pointwise_unknown(ex, values)
 end
 
 # A concatenated numeric value may subsequently be gathered by observation
@@ -199,17 +217,17 @@ end
 # concatenation itself remains the authored Julia call and runs once.
 function _pointwise_concat_part(ex, values, bound_names)
     state = _pointwise_leaf(ex, values)
-    state.rank >= 0 && return state
-    Meta.isexpr(ex, :call) && !isempty(ex.args) || return _POINTWISE_UNKNOWN
+    _pointwise_known(state) && return state
+    Meta.isexpr(ex, :call) && !isempty(ex.args) || return state
     fn = ex.args[1]
     if fn === :sum && :sum ∉ bound_names && length(ex.args) == 2
         part = _pointwise_concat_part(ex.args[2], values, bound_names)
-        part.rank == 1 && return _PointwiseValue(0, 0, part.live)
+        return _pointwise_call(ex, [part], bound_names)
     elseif fn in (:+, :-) && length(ex.args) == 2
         part = _pointwise_concat_part(ex.args[2], values, bound_names)
-        part.rank == 0 && return part
+        return _pointwise_call(ex, [part], bound_names)
     end
-    return _POINTWISE_UNKNOWN
+    return _pointwise_unknown(ex, values)
 end
 
 function _pointwise_concat_state(rhs, values, bound_names)
@@ -219,21 +237,20 @@ function _pointwise_concat_state(rhs, values, bound_names)
         getglobal(fn.mod, fn.name) === Base.vcat
     is_base_vcat || return _POINTWISE_UNKNOWN
     parts = [_pointwise_concat_part(a, values, bound_names) for a in rhs.args[2:end]]
-    all(p -> p.rank >= 0, parts) || return _POINTWISE_UNKNOWN
-    return _PointwiseValue(1, sum(p -> p.rank == 0 ? 1 : p.length, parts),
-        any(p.live for p in parts))
+    return _pointwise_call(rhs, parts, bound_names)
 end
 
-function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
+function _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_names)
     if ex isa Symbol && haskey(gathers, ex)
-        return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers)
+        return _pointwise_tree!(inputs, formals, gathers[ex], values, columns, gathers, bound_names)
     end
     if Meta.isexpr(ex, :., 2) && ex.args[1] === :exp &&
             Meta.isexpr(ex.args[2], :tuple, 1)
         term, state = _pointwise_tree!(inputs, formals, only(ex.args[2].args),
-            values, columns, gathers)
-        state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
-        return Expr(:call, :exp, term), state
+            values, columns, gathers, bound_names)
+        result = _pointwise_call(ex, [state], bound_names)
+        _pointwise_known(result) || return nothing, result
+        return Expr(:call, :exp, term), result
     end
     if Meta.isexpr(ex, :call) && !isempty(ex.args) &&
             haskey(_POINTWISE_ARITHMETIC, ex.args[1]) &&
@@ -241,35 +258,34 @@ function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
         terms = Any[]
         states = _PointwiseValue[]
         for a in ex.args[2:end]
-            term, state = _pointwise_tree!(inputs, formals, a, values, columns, gathers)
-            state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
+            term, state = _pointwise_tree!(inputs, formals, a, values, columns, gathers, bound_names)
+            _pointwise_known(state) || return nothing, state
             push!(terms, term)
             push!(states, state)
         end
-        lens = unique!([s.length for s in states if s.rank == 1])
-        length(lens) <= 1 || return nothing, _POINTWISE_UNKNOWN
-        rank = isempty(lens) ? 0 : 1
+        result = _pointwise_call(ex, states, bound_names)
+        _pointwise_known(result) || return nothing, result
         return Expr(:call, _POINTWISE_ARITHMETIC[ex.args[1]], terms...),
-            _PointwiseValue(rank, rank == 1 ? only(lens) : 0,
-                any(s.live for s in states))
+            result
     end
     leaf, state = if Meta.isexpr(ex, :ref, 2) && ex.args[1] isa Symbol &&
             ex.args[2] isa Symbol
         base = get(values, ex.args[1], _POINTWISE_UNKNOWN)
         idx = get(columns, ex.args[2], nothing)
-        if base.rank == 1 &&
+        if _pointwise_vector(base) &&
                 idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
                 axes(idx, 1) == Base.OneTo(length(idx))
             # This arithmetic cell reads scalar entries from the borrowed view.
             :(ReactiveKernels._readonly_gather($(ex.args...))),
-                _PointwiseValue(1, length(idx), base.live)
+                _pointwise_call(ex,
+                    [base, _PointwiseValue(_OS.value_info(idx), false)], bound_names)
         else
-            ex, _POINTWISE_UNKNOWN
+            ex, _pointwise_unknown(ex, values)
         end
     else
         ex, _pointwise_leaf(ex, values)
     end
-    state.rank >= 0 || return nothing, _POINTWISE_UNKNOWN
+    _pointwise_known(state) || return nothing, state
     leaf isa Number && return leaf, state
     i = findfirst(x -> isequal(x, leaf), inputs)
     if i === nothing
@@ -280,10 +296,13 @@ function _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
     return formals[i], state
 end
 
-function _pointwise_rhs(ex, values, columns, gathers)
+function _pointwise_rhs(ex, values, columns, gathers, bound_names)
     inputs, formals = Any[], Symbol[]
-    body, state = _pointwise_tree!(inputs, formals, ex, values, columns, gathers)
-    state.rank == 1 && state.live || return ex, state
+    body, state = _pointwise_tree!(inputs, formals, ex, values, columns, gathers, bound_names)
+    # A failed numerical query may have stopped before visiting a live operand.
+    # Dependence follows the whole source expression independently of shape.
+    state = _PointwiseValue(state.info, _pointwise_live(ex, values))
+    _pointwise_vector(state) && state.live && _pointwise_known(state) || return ex, state
     plate = Expr(:do, Expr(:call, :plate, inputs...),
         Expr(:->, Expr(:tuple, formals...), Expr(:block, body)))
     named = _name_plate_cell(plate, (_, input) -> input isa Symbol ? input :
@@ -361,12 +380,7 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
     gathers = Dict{Symbol,Expr}()
     gather_stmts = Dict{Symbol,Expr}()
     for (name, value) in plan.columns
-        if value isa Vector{<:Union{Float64,Base.BitInteger,Bool}} &&
-                axes(value, 1) == Base.OneTo(length(value))
-            values[name] = _PointwiseValue(1, length(value), false)
-        elseif value isa Float64 || value isa Integer
-            values[name] = _PointwiseValue(0, 0, false)
-        end
+        values[name] = _PointwiseValue(_OS.value_info(value), false)
     end
     for st in stmts
         Meta.isexpr(st, :(=), 2) || continue
@@ -375,15 +389,17 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
         name isa Symbol || continue
         declared = Meta.isexpr(lhs, :(::), 2) ? lhs.args[2] : nothing
         if declared === :Float64
-            values[name] = _PointwiseValue(0, 0, true)
+            values[name] = _PointwiseValue(_OS.scalar_info(Float64), true)
             continue
         elseif Meta.isexpr(declared, :curly) &&
                 declared.args == Any[:AbstractVector, :Float64]
             dims = _value_axes(plan, name; data_axes = true)
             if dims !== nothing && length(dims) == 1 && only(dims) isa Int
-                values[name] = _PointwiseValue(1, only(dims), true)
+                values[name] = _PointwiseValue(_OS.vector_info(Float64, only(dims);
+                    container_type = AbstractVector{Float64}), true)
             else
-                delete!(values, name)
+                values[name] = _PointwiseValue(_OS.vector_info(Float64;
+                    container_type = AbstractVector{Float64}), true)
             end
             continue
         end
@@ -391,30 +407,28 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
                 rhs.args[1] isa Symbol && rhs.args[2] isa Symbol
             base = get(values, rhs.args[1], _POINTWISE_UNKNOWN)
             idx = get(plan.columns, rhs.args[2], nothing)
-            if base.rank == 1 &&
+            state = idx === nothing ? _POINTWISE_UNKNOWN : _pointwise_call(rhs,
+                [base, _PointwiseValue(_OS.value_info(idx), false)], bound_names)
+            if _pointwise_vector(state) && _pointwise_known(state) &&
                     idx isa Vector{<:Integer} && !(eltype(idx) <: Bool) &&
                     axes(idx, 1) == Base.OneTo(length(idx))
                 # Recognition is transactional: substitute inside arithmetic
                 # only when the entire consumer lowers to a typed plate.
                 gathers[name] = rhs
                 gather_stmts[name] = st
-                values[name] = _PointwiseValue(1, length(idx), base.live)
+                values[name] = state
                 continue
             end
         end
         concat = _pointwise_concat_state(rhs, values, bound_names)
-        if concat.rank == 1
+        if _pointwise_vector(concat) && _pointwise_known(concat)
             values[name] = concat
             continue
         end
         if Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
                 haskey(_POINTWISE_ARITHMETIC, rhs.args[1])
-            candidate, state = _pointwise_rhs(rhs, values, plan.columns, gathers)
-            if state.rank >= 0
-                values[name] = state
-            else
-                delete!(values, name)
-            end
+            candidate, state = _pointwise_rhs(rhs, values, plan.columns, gathers, bound_names)
+            values[name] = state
             st.args[2] = candidate
         elseif rhs isa Symbol && haskey(values, rhs)
             values[name] = values[rhs]
@@ -422,7 +436,7 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
             # A scalar coordinate remains a shared plate input. Its ordinary
             # indexed read retains the original bounds check.
             state = _pointwise_concat_part(rhs, values, bound_names)
-            state.rank >= 0 ? (values[name] = state) : delete!(values, name)
+            values[name] = state
         end
     end
     for (name, rhs) in gathers
@@ -970,6 +984,13 @@ function _predictor_statements(plan::StructuralPlan)
             cell_terms = Any[]
             k = 1
             for b in shape.blocks
+                if b.kind === OffsetTerm
+                    offset = _dovar(length(formals) + 1)
+                    push!(inputs, b.column)
+                    push!(formals, offset)
+                    push!(cell_terms, offset)
+                    continue
+                end
                 c = _dovar(length(formals) + 1)
                 push!(inputs, _coef_coord(coef, k))
                 push!(formals, c)
@@ -1326,6 +1347,33 @@ end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 
+function _ordinal_pointwise_stmts(r, plan; grouped = false)
+    pw = _pw_name(r.label)
+    if !(r.family === OrdinalFam && r.ordinal_structure === :stopping &&
+            r.evidence.kind === :none && r.n_levels > 1 &&
+            _response_rows(plan, r) > 0 && _has_observed_response(plan, r))
+        return Expr[], pw
+    end
+    # A stopping-ratio lane represents a visited stage. Zero-threshold
+    # observations visit no stage; the padded prefix also covers these.
+    ends = Symbol(pw, :_ends)
+    cumulative = Symbol(pw, :_cumulative)
+    values = Symbol(pw, :_observations)
+    observed = !grouped && r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) :
+        !grouped && r.mi_jobs !== nothing ? Symbol(:_ppl_mi_response_, r.label) : r.response
+    endexpr = if r.thresholds isa ThresholdRows
+        # Stage membership is prepared after any response selection.
+        obs = _stage_lane(r.label, :obs)
+        :(searchsortedlast.(Ref($obs), eachindex($observed)))
+    else
+        stages = _group_thresholds(plan, r) ? :(length($(r.thresholds))) : r.n_levels - 1
+        :(cumsum(min.($observed, $stages)))
+    end
+    return Expr[:($ends = $endexpr),
+        :($cumulative = vcat(0.0, cumsum($pw))[$ends .+ 1]),
+        :($values = $cumulative .- vcat(0.0, $cumulative)[1:end-1])], values
+end
+
 function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         upstream::Vector{Expr} = Expr[])
     stmts = Expr[]
@@ -1344,19 +1392,9 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         args === nothing || push!(arguments, r.response => args)
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
-        if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.evidence.kind === :none &&
-                r.n_levels > 1 && _response_rows(plan, r) > 0 && _has_observed_response(plan, r)
-            # Stopping-ratio emits one lane per visited stage. Gather the
-            # prefix sum at each observation's last stage, then difference.
-            ends = Symbol(pw, :_ends)
-            cumulative = Symbol(pw, :_cumulative)
-            values = Symbol(pw, :_observations)
-            observed = r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) :
-                r.mi_jobs !== nothing ? Symbol(:_ppl_mi_response_, r.label) : r.response
-            push!(stmts, :($ends = cumsum(min.($observed, $(r.n_levels-1)))),
-                :($cumulative = cumsum($pw)[$ends]),
-                :($values = $cumulative .- vcat(0.0, $cumulative)[1:end-1]))
-            pw = values
+        if !_cell_broadcast_response(plan, r)
+            pointstmts, pw = _ordinal_pointwise_stmts(r, plan)
+            append!(stmts, pointstmts)
         end
         push!(points, r.response => pw)
     end
@@ -1495,11 +1533,12 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     end
     # The response's predictor nodes lie on its observation axis, here the
     # indices.
+    pointstmts, pointvalue = _ordinal_pointwise_stmts(r, plan; grouped = true)
     return _cell_broadcast_group(plan, r.response, _lik_name(r.label), _pw_name(r.label),
         stmts, upstream, [p.name for p in plan.predictors],
         "response $(r.label) observes one array per index, and its $(r.family) statements";
         arguments = _observation_argument_inputs(r, stmts),
-        argument_node = Symbol(:_ppl_obsargs_, r.label))
+        argument_node = Symbol(:_ppl_obsargs_, r.label), pointstmts, pointvalue)
 end
 
 # A caller-owned sampling RHS (`y[i] .~ LogDensity.(f, loc[i], s)`) in the
@@ -1519,12 +1558,14 @@ end
 function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Symbol,
         pw::Symbol, stmts::Vector{Expr}, upstream::Vector{Expr},
         axisnodes::Vector{Symbol}, what::String; arguments = nothing,
-        argument_node::Symbol = :_ppl_unused_observation_arguments)
+        argument_node::Symbol = :_ppl_unused_observation_arguments,
+        pointstmts = Expr[], pointvalue = pw)
     k = findall(st -> Meta.isexpr(st, :(=), 2) && st.args[1] == :($node::Float64), stmts)
     (length(k) == 1 && stmts[only(k)].args[2] == :(sum($pw))) ||
         throw(ContractValidationError("[generator] $what have no summed " *
             "pointwise plate to run per index"))
     body = Expr[st for (i, st) in enumerate(stmts) if i != only(k)]
+    append!(body, pointstmts)
     defined = Set{Symbol}(something.(_assigned_name.(body), :_))
     known = Set{Symbol}(keys(plan.columns))
     for st in upstream
@@ -1613,7 +1654,8 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
             Expr(:block, LineNumberNode(0, :generator), deepcopy(statements)..., result...)))
     totals = Symbol(pw, :_totals)
     result = Expr[
-        :($pw = $(groupplate(cell, Expr(:call, GlobalRef(Base, :identity), group)))),
+        :($pw = $(groupplate(cell, Expr(:call, GlobalRef(Base, :identity),
+            _hsubst(pointvalue, aliases))))),
         :($totals = $(groupplate(cell, :(_ppl_group_total::Float64 = sum($group)),
             :_ppl_group_total))),
         :($node::Float64 = sum($totals))]
@@ -1771,17 +1813,6 @@ _ppl_range_values(x::AbstractArray, indices) = x[indices]
 # authored indices. Positions and indices differ for a literal `a:b`. Read
 # without a gather, the observation plate consumes the column's plate
 # directly, so a cell query composes it and runs only that cell.
-function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
-    i = findfirst(p -> p.name === value, plan.predictors)
-    i === nothing && return false
-    p = plan.predictors[i]
-    p.link === IdentityLink && length(p.terms) == 1 &&
-        p.terms[1].kind === OffsetTerm || return false
-    d = findfirst(d -> d.name === only(p.terms[1].columns), plan.derived)
-    return d !== nothing && _authored_spelling(
-        _selected_plate_indices(plan.derived[d].expr)) == r.range.args[2]
-end
-
 function _ranged_response_stmts(r, plan, stmts)
     idx = Symbol(:_ppl_range_indices_, r.label)
     selected = Symbol(:_ppl_range_response_, r.label)
@@ -1809,6 +1840,7 @@ function _ranged_response_stmts(r, plan, stmts)
                 push!(rows, slot)
             end
         end
+        r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
         for (i, value) in enumerate(sort!(collect(rows)))
             value === r.response && continue
             _selected_cell_value(plan, r, value) && continue
@@ -1945,6 +1977,7 @@ function _mi_stopping_response_stmts(r, plan, stmts)
     end
     aliases = Dict{Symbol,Symbol}(r.response => observed)
     rows = Set{Symbol}([_location_node(r, plan)])
+    r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
     for ref in (r.weights, r.discrimination, r.evidence.lower, r.evidence.upper,
             r.threshold_columns...)
         if ref isa ScalePredictorRef
@@ -3894,10 +3927,21 @@ end
 # level, so nothing in the emitted program — statements or cell — grows
 # with the level count K. K=1 lowers to a zero cell (SB's
 # zero-information likelihood).
-_ordinal_cutpoints_valid(c) = all(c[2:end] .> c[1:end-1])
+# A guarded data-only plate may leave a scalar placeholder at a missing
+# observation; validate its shape before attempting any vector reads.
+_ordinal_cutpoints_valid(c) = c isa AbstractVector && all(c[2:end] .> c[1:end-1])
+_threshold_input(name::Symbol) = :(Ref($name))
+_threshold_input(rows::ThresholdRows) = rows.name
+_threshold_validity(name::Symbol) =
+    Expr(:call, GlobalRef(@__MODULE__, :_ordinal_cutpoints_valid), name)
+_threshold_validity(rows::ThresholdRows) =
+    Expr(:., GlobalRef(@__MODULE__, :_ordinal_cutpoints_valid), Expr(:tuple, rows.name))
+_threshold_stages(name::Symbol, obs, stage) = :($name[$stage])
+_threshold_stages(rows::ThresholdRows, obs, stage) =
+    :(getindex.(_broadcast_gather($(rows.name), $obs), $stage))
 
 function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
-    K = r.n_levels
+    K = _group_thresholds(plan, r) ? :(length($(r.thresholds)) + 1) : r.n_levels
     K === nothing && throw(ContractValidationError(
         "[generator] ordered response $(r.label) has unresolved n_levels " *
         "(bind_data infers it)"))
@@ -3918,18 +3962,23 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         # bare Float64, which the plate builder does not take).
         :(0.0 * $yv)
     else
-        push!(inputs, :(Ref($(r.thresholds))))
+        push!(inputs, _threshold_input(r.thresholds))
         cutref = _dovar(length(inputs))
-        cumulative = _ordinal_cumulative_cell(r.link, K, yv, etav, dref, cutref)
+        levels = r.thresholds isa ThresholdRows ? :(length($cutref) + 1) : K
+        cumulative = _ordinal_cumulative_cell(r.link, levels, yv, etav, dref, cutref)
+        (r.thresholds isa ThresholdRows || _group_thresholds(plan, r)) &&
+            (cumulative = :(isempty($cutref) ? 0.0 * $yv : $cumulative))
         # A response reads the authored vector; it does not impose an
         # Ordered transform or replace its prior. Guard before logarithms,
         # including when only boundary categories are observed.
-        parameter = only(p for p in plan.vector_parameters if p.name === r.thresholds)
-        if _is_ordered_parameter(parameter.family) && parameter.name ∉ plan.conditioned
+        pi = findfirst(p -> p.name === r.thresholds, plan.vector_parameters)
+        parameter = pi === nothing ? nothing : plan.vector_parameters[pi]
+        if parameter !== nothing && _is_ordered_parameter(parameter.family) &&
+                parameter.name ∉ plan.conditioned
             cumulative
         else
             valid = Symbol(:_ppl_cutpoints_valid_,r.label)
-            check = Expr(:call,GlobalRef(@__MODULE__,:_ordinal_cutpoints_valid),r.thresholds)
+            check = _threshold_validity(r.thresholds)
             push!(prests,:($valid = $check))
             push!(inputs,valid)
             validref = _dovar(length(inputs))
@@ -3942,9 +3991,10 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     c = cutref
     function ordinal_tail(b, upper)
         K == 1 && return upper ? :($b < 1 ? 1.0 : 0.0) : :($b < 1 ? 0.0 : 1.0)
+        levels = r.thresholds isa ThresholdRows ? :(length($c) + 1) : K
         logtail=upper ? _ordinal_logCC(r.link,:($dref * ($c[$b]-$etav))) :
             _ordinal_logF(r.link,:($dref * ($c[$b]-$etav)))
-        :($b < 1 ? $(upper ? 1.0 : 0.0) : ($b >= $K ? $(upper ? 0.0 : 1.0) : exp($logtail)))
+        :($b < 1 ? $(upper ? 1.0 : 0.0) : ($b >= $levels ? $(upper ? 0.0 : 1.0) : exp($logtail)))
     end
     cell=_wrap_evidence!(r,plan,prests,inputs,cell;
         cdf=b->ordinal_tail(b,false),ccdf=b->ordinal_tail(b,true))
@@ -3962,10 +4012,10 @@ end
 # level: only the observation's own arm runs, so every gather is in bounds
 # by construction; the branch condition reads bound data only, so plate
 # lowering splits the lanes by arm before any backend sees a branch.
-function _ordinal_cumulative_cell(link::LinkFunction, K::Int, yv::Symbol,
+function _ordinal_cumulative_cell(link::LinkFunction, K, yv::Symbol,
         etav::Symbol, dref, c::Symbol)
     first = _ordinal_logF(link, :($dref * ($c[1] - $etav)))
-    last = _ordinal_logCC(link, :($dref * ($c[$(K - 1)] - $etav)))
+    last = _ordinal_logCC(link, :($dref * ($c[$K - 1] - $etav)))
     K == 2 && return :($yv == 1 ? $first : $last)
     hi = _ordinal_logF(link, :($dref * ($c[$yv] - $etav)))
     lo = _ordinal_logF(link, :($dref * ($c[$yv - 1] - $etav)))
@@ -3985,7 +4035,7 @@ _stage_lane(label::Symbol, what::Symbol) = Symbol(:_ppl_srl_, what, :_, label)
 # lowering splits by arm. K=1 runs zero stages (SB's zero-information
 # likelihood) and lowers to a zero cell over the observations.
 function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
-        node::Symbol, pw::Symbol, K::Int)
+        node::Symbol, pw::Symbol, K)
     r.evidence.kind === :none || return _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     y = r.response
     if K == 1
@@ -3993,13 +4043,14 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     end
     lp = _location_node(r, plan)
     obs, stage = _stage_lane(r.label, :obs), _stage_lane(r.label, :stage)
-    prests = Expr[:($obs = _ordinal_stage_obs($y, $K)),
-        :($stage = _ordinal_stage_idx($y, $K))]
+    levels = r.thresholds isa ThresholdRows ? :(length.($(r.thresholds.name)) .+ 1) : K
+    prests = Expr[:($obs = _ordinal_stage_obs($y, $levels)),
+        :($stage = _ordinal_stage_idx($y, $levels))]
     level = _stage_lane(r.label, :y)
     eta = _stage_lane(r.label, :eta)
     thr = _stage_lane(r.label, :t)
     push!(prests, :($level = $y[$obs]), :($eta = _broadcast_gather($lp, $obs)),
-        :($thr = $(r.thresholds)[$stage]))
+        :($thr = $(_threshold_stages(r.thresholds, obs, stage))))
     inputs = Any[stage, level, eta, thr]
     sv, yv, etav, tv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
     dref = _ordinal_lane_ref!(inputs, prests,
@@ -4042,7 +4093,7 @@ function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     lp = _location_node(r, plan)
     row = _stage_lane(r.label, :evidence_row)
     push!(pre, :($row = collect(eachindex($(r.response)))))
-    inputs = Any[r.response, lp, :(Ref($(r.thresholds))), row]
+    inputs = Any[r.response, lp, _threshold_input(r.thresholds), row]
     yv, eta, t, iv = (_dovar(i) for i in 1:4)
     d = _ordinal_lane_ref!(inputs, pre, _ordinal_scale_source!(pre, r, plan), nothing, :_)
     effects = nothing
@@ -4054,7 +4105,7 @@ function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     elseif !isempty(r.threshold_columns)
         matrix = _stage_lane(r.label, :effects_matrix)
         p = length(r.threshold_columns)
-        push!(pre, :($matrix = hcat($(r.threshold_columns...)) * reshape($(r.threshold_coefs), $p, $(K-1))))
+        push!(pre, :($matrix = hcat($(r.threshold_columns...)) * reshape($(r.threshold_coefs), $p, $K - 1)))
         push!(inputs, :(Ref($matrix)))
         effects = _dovar(length(inputs))
     end
@@ -4394,7 +4445,10 @@ function _parameter_prior_input(ps, plan, layout)
         return _affine_block_name(pred)
     end
     view = _parameter_coordinate_view([(n, 1) for n in names], layout)
-    return view === nothing ? :([$(names...)]) : view
+    # A prior only reads these scalar values. An immutable pack keeps that
+    # fact visible to ordinary Reverse; a temporary vector can obscure
+    # invariance and induce native tapes in downstream observation loops.
+    return view === nothing ? :(($(names...),)) : view
 end
 
 function _parameter_prior_statements!(stmts, terms, plan, layout;
@@ -4476,6 +4530,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         end
     end
     _parameter_prior_statements!(stmts, terms, plan, layout)
+    append!(terms, plan.cell_priors)
     _factor_density_statements!(stmts, terms, plan; context)
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
@@ -4705,7 +4760,11 @@ function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x;
     args = family === :gamma ? (a[1], _gamma_rate(a[2])) : Tuple(a)
     known = map(v -> v in float64_args, Tuple(a))
     args = map((v, k) -> k ? v : _float64_port(v), args, known)
-    return Expr(:call, Expr(:., Expr(:call, ep, args...), QuoteNode(method)),
+    # These endpoints also enter authored cell expressions before module
+    # resolution. Keep their library binding explicit there, independently
+    # of similarly named functions in the model's module.
+    endpoint = GlobalRef(PPLGeneratedModels, ep)
+    return Expr(:call, Expr(:., Expr(:call, endpoint, args...), QuoteNode(method)),
         float64_variate ? x : _float64_port(x))
 end
 
