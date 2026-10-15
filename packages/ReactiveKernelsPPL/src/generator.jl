@@ -922,8 +922,12 @@ function _predictor_plate_addition(plan::StructuralPlan, pred::PredictorSpec,
     rows && return false
     length(terms) > 1 && length(terms) == length(pred.terms) || return false
     _broadcast_affine(plan, pred) || return false
-    any(r -> _response_uses_predictor(r, pred.name), plan.responses) || return false
-    n = _located_rows(plan, pred)
+    # One plate needs one row count: responses observing different rows
+    # through a shared predictor keep its ordinary broadcast.
+    located = unique!([_response_rows(plan, r) for r in plan.responses
+        if _response_uses_predictor(r, pred.name)])
+    length(located) == 1 || return false
+    n = only(located)
     axes = map(pred.terms) do t
         t.kind === InterceptTerm && return Any[]
         t.kind === OffsetTerm && length(t.columns) == 1 &&
@@ -950,14 +954,14 @@ function _predictor_statements(plan::StructuralPlan)
             cell_terms = Any[]
             k = 1
             for b in shape.blocks
-                c = gensym(:coefficient)
+                c = _dovar(length(formals) + 1)
                 push!(inputs, _coef_coord(coef, k))
                 push!(formals, c)
                 k += 1
                 if b.kind === InterceptTerm
                     push!(cell_terms, c)
                 else
-                    x = gensym(:column)
+                    x = _dovar(length(formals) + 1)
                     push!(inputs, b.column)
                     push!(formals, x)
                     push!(cell_terms, :($c * $x))
@@ -1012,7 +1016,7 @@ function _predictor_statements(plan::StructuralPlan)
         # bound rank/extent proof for every summand and keep scalar and
         # row-expanding predictors on their existing broadcast path.
         if _predictor_plate_addition(plan, pred, terms, rows)
-            formals = [gensym(:summand) for _ in terms]
+            formals = [_dovar(i) for i in eachindex(terms)]
             cell = foldl((a, b) -> Expr(:call, :+, a, b), formals)
             rhs = Expr(:do, Expr(:call, :plate, terms...),
                 Expr(:->, Expr(:tuple, formals...), Expr(:block, cell)))
@@ -1352,7 +1356,9 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         append!(stmts, _cell_broadcast_observation(plan, p.name) ?
             _cell_broadcast_stmts(p, plan, ps, vcat(upstream, selection)) : ps)
         push!(terms, Symbol(:_ppl_prior_, p.name))
-        push!(points, p.name => Symbol(:_ppl_pw_prior_, p.name))
+        # An undotted observation is one whole-event density.
+        push!(points, p.name => Symbol(
+            p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
     end
     observed = _density_selection(plan, n -> n in plan.conditioned)
     _parameter_prior_statements!(stmts, terms, observed, layout;
@@ -1958,7 +1964,9 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
                 !haskey(plan.columns, _observed_mask_name(r.response)) &&
                 !_is_bare_param_location(r, plan) &&
                 !_cell_broadcast_response(plan, r) &&
-                _wholevec_location(r, plan) && _wholevec_scalar_scale(r, plan)
+                _wholevec_rows(r, plan) && _wholevec_scalar_scale(r, plan)
+            # `alpha .+ M * v` broadcasts its scalar intercept, yet the
+            # matched data-matrix product reads the whole design.
             glm = _gaussian_glm_location(r, plan)
             glm === nothing || return _gaussian_glm_stmts(r, plan, node, glm...)
         end
@@ -2397,11 +2405,23 @@ end
 # does a response: a number or one-entry `y` stretches over a longer location.
 # The plate path evaluates that, so fusion requires equal lengths.
 function _wholevec_location(r::LikelihoodSpec, plan::StructuralPlan)
+    _is_latent_location(r, plan) || !_broadcast_affine(plan, _predictor(plan, r.predictor)) ||
+        return false
+    return _wholevec_rows(r, plan)
+end
+
+# The location has one row per response entry. A predictor that broadcasts a
+# scalar intercept over a vector summand still has those rows; whether that
+# predictor is read whole is the caller's choice.
+function _wholevec_rows(r::LikelihoodSpec, plan::StructuralPlan)
     y = get(plan.columns, r.response, nothing)
     rows = y isa AbstractVector ? length(y) : nothing
     _is_latent_location(r, plan) && return _latent_rows(plan, r.predictor) == rows
     pred = _predictor(plan, r.predictor)
-    _broadcast_affine(plan, pred) && return false
+    # A predictor that reads or feeds several row counts (singleton operands
+    # broadcast over responses of different lengths) has no single row
+    # count, so it is not read whole.
+    length(_value_row_counts(plan, pred.name)) > 1 && return false
     _predictor_rows(plan, pred.name) == rows || return false
     return all(pred.terms) do t
         t.kind === LatentTerm || return true
@@ -4898,6 +4918,20 @@ end
 
 _scan_where(s::ScanSpec) = "[generator] scan $(join(s.states, ", "))"
 
+# A sampled seed's or step's stated density at `x`: the family density plus
+# its support normalizer (`truncated` subtracts the interval mass, a half
+# prior adds log(2); `restricted` and `Flat` keep the family density).
+# `translate` maps the statement's argument and bound expressions into the
+# enclosing block; the normalizer's intermediates go to `pre`.
+function _scan_density!(pre::Vector{Expr}, st, translate, x, stem::Symbol)
+    args = Any[translate(a) for a in st.args]
+    support = st.support isa Tuple ?
+        (st.support[1], map(translate, st.support[2:end])...) : st.support
+    base = _family_logpdf_expr(st.family, args, x)
+    corr = _support_correction(st.family, support, args; pre, stem)
+    return corr === nothing ? base : :($base + $corr)
+end
+
 # The innovation steps of an emittable non-centered scan, in body order; a
 # shape the emitter does not build (`_scan_shape_gap`) throws
 # `ContractValidationError` naming the gap.
@@ -5004,9 +5038,10 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
         rhs = if st.kind === :sample
             value = samples[st.target]
             if output === nothing
-                args = [_scan_translate_step(a, s, env, scalars) for a in st.args]
                 lp = Symbol(:_ppl_scan_lp_, st.target)
-                push!(body, :($lp::Float64 = $(_family_logpdf_expr(st.family, args, value))))
+                density = _scan_density!(body, st,
+                    a -> _scan_translate_step(a, s, env, scalars), value, lp)
+                push!(body, :($lp::Float64 = $density))
                 push!(logps, lp)
             end
             value
@@ -5114,9 +5149,9 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
     for f in s.setup
         f.kind === :sample || continue
         lp = Symbol(:_ppl_scan_seedlp_, f.target, :_, f.index)
-        args = Any[_scan_translate_seed(a, s, scalars) for a in f.args]
-        push!(stmts, :($lp::Float64 = $(_family_logpdf_expr(f.family, args,
-            :($zname[$(seedpos[(f.target, f.index)])])))))
+        density = _scan_density!(stmts, f, a -> _scan_translate_seed(a, s, scalars),
+            :($zname[$(seedpos[(f.target, f.index)])]), lp)
+        push!(stmts, :($lp::Float64 = $density))
         push!(terms, lp)
     end
     if T >= s.lo && !isempty(innov)
@@ -5165,8 +5200,9 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         for (k, f) in enumerate(sc.setup)
             push!(stmts, :($(_scan_init_name(state, k)) = $state[$k]))
             seed = Symbol(:_ppl_scan_seed_, state, :_, k)
-            push!(stmts, :($seed::Float64 =
-                $(_family_logpdf_expr(f.family, [_scan_translate_seed(a, sc, scalars) for a in f.args], :($(state)[$k])))))
+            density = _scan_density!(stmts, f, a -> _scan_translate_seed(a, sc, scalars),
+                :($(state)[$k]), seed)
+            push!(stmts, :($seed::Float64 = $density))
             push!(terms, seed)
         end
         lags = sort!(collect(_scan_lags([step], [state], sc.loopvar)[state]))
@@ -5178,12 +5214,12 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         end
         # Substitute the lag reads; the cell reads the recurrence's other
         # scalars (params/assignments) by closing over them.
-        lagargs = [_subst_scan_lags(a, state, sc.loopvar, dovar) for a in step.args]
         push!(inputs, :($(sc.lo):$T))
-        lagargs = [_subst_syms(a, Dict(sc.loopvar => _dovar(length(inputs)))) for a in lagargs]
+        cellarg(a) = _subst_syms(_subst_scan_lags(a, state, sc.loopvar, dovar),
+            Dict(sc.loopvar => _dovar(length(inputs))))
         caps = Symbol[]
-        for a in lagargs
-            _scan_cell_caps!(caps, a)
+        for a in _scan_reads(step)
+            _scan_cell_caps!(caps, cellarg(a))
         end
         sc.loopvar in caps && throw(ContractValidationError(
             "[generator] scan $(state): the recurrence uses the loop index " *
@@ -5191,10 +5227,11 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         for c in caps
             c in scalars || throw(ContractValidationError("$(_scan_where(sc)): unknown captured value $c"))
         end
-        cell = _family_logpdf_expr(step.family, lagargs, _dovar(1))
         recnode = Symbol(:_ppl_scan_rec_, state)
         recpw = Symbol(:_ppl_scan_pw_, state)
-        append!(stmts, _plate_sum_stmts(recpw, recnode, inputs, cell))
+        pre = Expr[]
+        cell = _scan_density!(pre, step, cellarg, _dovar(1), recnode)
+        append!(stmts, _plate_sum_stmts(recpw, recnode, inputs, Expr[pre..., cell]))
         push!(terms, recnode)
         total = Symbol(:_ppl_scan_, state)
         push!(stmts, :($total::Float64 = $(foldl((a, b) -> :($a + $b), terms))))
