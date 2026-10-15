@@ -6892,22 +6892,40 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         end
     end
     held = setdiff!(named, free)
-    inputs, ctx = _whole_value_reads(defs, raw, held)
+    inputs, ctx = _whole_value_reads(defs, raw, held;
+        matrices = _product_matrix_names(plan, raw, value_matrices))
     return union!(setdiff!(inputs, held), unused), ctx
+end
+
+# Names that can hold the matrix of a product `M * v` in a finished plan:
+# bound data, design and value matrices, and definitions computed from data
+# alone (`X = hcat(x1, x2)`, a basis matrix a module call returns).
+function _product_matrix_names(plan::StructuralPlan, raw::AbstractSet{Symbol},
+        value_matrices::AbstractSet{Symbol})
+    out = union(Set{Symbol}(raw), value_matrices,
+        Set{Symbol}(m.name for m in plan.matrices))
+    detmap = Dict{Symbol,Any}(d.name => d.expr
+        for d in (plan.assignments..., plan.derived...))
+    for (nm, ex) in detmap
+        !isempty(_value_symbols(ex)) && _data_only(ex, raw, detmap) &&
+            push!(out, nm)
+    end
+    return out
 end
 
 """Whole-value reads over `defs` (`name => expr`): the columns of `raw`
 read only as whole values, and the whole-context definitions — every use
 a whole read or inside another whole-context definition (the greatest
-fixpoint), none of them in `pinned`."""
+fixpoint), none of them in `pinned`. `matrices` names the values that can
+be the matrix of a product (`_matrix_product_operand`)."""
 function _whole_value_reads(defs, raw::AbstractSet{Symbol},
-        pinned::AbstractSet{Symbol})
+        pinned::AbstractSet{Symbol}; matrices::AbstractSet{Symbol} = raw)
     names = Set{Symbol}(first(d) for d in defs)
     known = union(Set{Symbol}(raw), names)
     reads = Dict{Symbol,Tuple{Set{Symbol},Set{Symbol}}}()
     for (nm, ex) in defs
         w, p = Set{Symbol}(), Set{Symbol}()
-        _classify_reads!(w, p, ex, known, false)
+        _classify_reads!(w, p, ex, known, false; matrices)
         reads[nm] = (w, p)
     end
     ctx = setdiff(names, pinned)
@@ -6948,11 +6966,13 @@ _has_observation_axis(plan) = !isempty(plan.responses) ||
 
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
 # inside an argument of an undotted module call into `whole`, anywhere
-# else into `per_obs`.
+# else into `per_obs`. The vector of a matrix product `M * v`, with `M`
+# one of `matrices` (`_matrix_product_operand`), is a whole read too.
 function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
-        raw::AbstractSet{Symbol}, inside::Bool; reductions_whole::Bool=false)
+        raw::AbstractSet{Symbol}, inside::Bool; reductions_whole::Bool=false,
+        matrices::AbstractSet{Symbol} = _NO_MATRIX_OPERANDS)
     visit(a, context) = _classify_reads!(whole, per_obs, a, raw, context;
-        reductions_whole)
+        reductions_whole, matrices)
     if ex isa Symbol
         ex in raw && push!(inside ? whole : per_obs, ex)
     elseif ex isa Expr
@@ -6971,6 +6991,14 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
             foreach(a -> visit(a, true), _plate_column_captures(ex))
         elseif ex.head === :kw && length(ex.args) == 2
             visit(ex.args[2], inside)
+        elseif ex.head === :call && length(ex.args) == 3 &&
+                ex.args[1] === :* && _matrix_product_operand(ex.args[2], matrices)
+            # As in Julia, `M * v` contracts `v` with the columns of the
+            # matrix `M`: `v` has their length, never the observation axis
+            # (`X * (spd .* z)` with `spd` read from one value per column).
+            # The matrix keeps the surrounding context.
+            visit(ex.args[2], inside)
+            visit(ex.args[3], true)
         elseif ex.head === :call
             constructed = _constructed_endpoint_call(ex)
             inner = inside || (!isempty(ex.args) && (ex.args[1] isa GlobalRef ||
@@ -7001,6 +7029,18 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
     end
     return nothing
 end
+
+# The matrix of a product `M * v`: a name that can hold a matrix (bound
+# data, a data matrix the model computes, an `hcat` value) or an inline
+# `hcat`. A data name whose value is a vector or a number still reads
+# Julia's meaning there: `x * v` is valid only for a scalar `v`, whose
+# reads have no observation axis either.
+const _NO_MATRIX_OPERANDS = Set{Symbol}()
+_matrix_product_operand(ex::Symbol, matrices::AbstractSet{Symbol}) = ex in matrices
+_matrix_product_operand(ex::Expr, ::AbstractSet{Symbol}) =
+    ex.head === :call && length(ex.args) > 1 &&
+    (ex.args[1] === :hcat || ex.args[1] === GlobalRef(Base, :hcat))
+_matrix_product_operand(_, ::AbstractSet{Symbol}) = false
 
 # Drop from `out` every Symbol `x` holds, at any depth.
 _drop_held_names!(out::Set{Symbol}, x::Symbol) = (delete!(out, x); nothing)
