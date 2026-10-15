@@ -1189,7 +1189,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     pid = canon_id(g, pointwise.id)
     consumers = [r for r in pending
                  if any(inp -> canon_id(g, inp.id) == pid, r.inputs)]
-    total = _partition_sum_consumer(consumers, pointwise)
+    total = _partition_sum_consumer(consumers)
     wanted = any(w -> canon_id(g, w.id) == pid, want)
     if total !== nothing && length(consumers) == 1 && !wanted
         totals = Value[]
@@ -1224,19 +1224,10 @@ function _partition_arm_hoists(variant::Plan, cell_ids, lane_roots, live_roots)
     end
 end
 
-function _partition_sum_consumer(consumers, pointwise)
+function _partition_sum_consumer(consumers)
     length(consumers) == 1 || return nothing
     r = only(consumers)
-    r.effectful && return nothing
-    length(r.inputs) == 1 && length(r.outputs) == 1 || return nothing
-    source = r.source
-    source isa Expr && source.head === :call && length(source.args) == 2 ||
-        return nothing
-    (source.args[1] === :sum || source.args[1] === GlobalRef(Base, :sum)) ||
-        return nothing
-    source.args[2] === pointwise.name || return nothing
-    (r.op === sum || r.op isa _KernelSourceOp) || return nothing
-    r
+    length(r.outputs) == 1 && _plain_sum_recipe(r) ? r : nothing
 end
 
 function _partial_inner_plates(p::Plan, known)

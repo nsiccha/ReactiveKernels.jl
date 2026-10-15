@@ -62,6 +62,23 @@ end
     return total
 end
 
+# A child whose named total sums its plate. Composed, the plate's port is
+# scoped under the caller's result (`p.squares`) while the sum keeps its
+# source `sum(squares)`.
+@kernel names_plate_total(phi, node1, node2) = begin
+    squares = plate(node1, node2) do i, j
+        difference = phi[i] - phi[j]
+        difference * difference
+    end
+    total = sum(squares)
+    return -0.5 * total
+end
+
+@kernel names_plate_total_parent(phi, node1, node2) = begin
+    p = names_plate_total(phi, node1, node2)
+    return 2.0 * p
+end
+
 # A typed child formal: an unannotated caller value takes the declared type.
 @kernel names_typed_child(v::AbstractVector{Float64}, s) = begin
     total = sum(v) * s
@@ -200,6 +217,24 @@ _names_identity_recipes(spec) =
         @test occursin("p = plate(x, s) do values, scale", text)
         @test !occursin("let ", text)
         @test prepare(names_cell_parent)([1.0, 2.0, 4.0], 2.0) == 3.5
+    end
+
+    @testset "a composed child's plate total fuses into its loop" begin
+        plate_recipe = only(r for r in plan(names_plate_total_parent).recipes
+                            if r.op isa ReactiveKernels._AuthoredPlateOp)
+        @test only(plate_recipe.outputs).name === Symbol("p.squares")
+        child = prepare(names_plate_total)
+        composed = prepare(names_plate_total_parent)
+        # As prepared alone, no per-edge vector is filled.
+        @test !occursin("similar", string(code_expr(child)))
+        @test !occursin("similar", string(code_expr(composed)))
+        phi = [0.3, -0.1, 0.7, 0.2, -0.4, 1.1]
+        node1 = [1, 1, 2, 3, 4, 2]
+        node2 = [2, 3, 3, 4, 5, 4]
+        @test composed(phi, node1, node2) ≈ 2 * child(phi, node1, node2)
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        @test gradient(u -> composed(u, node1, node2), backend, phi) ≈
+              2 .* gradient(u -> child(u, node1, node2), backend, phi)
     end
 
     @testset "structural views read authored source names" begin
