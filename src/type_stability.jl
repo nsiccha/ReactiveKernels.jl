@@ -174,9 +174,9 @@ function _checked_recipe_type!(found, op::_AuthoredPlateOp{K,A}, input_types,
         class === :axis && (marker = T; break)
     end
     marker === nothing && return nothing
-    shape = _promote_op(_plate_broadcast_shape,
-        Tuple{(_promote_op(axes, T) for T in batched)...})
-    T = _promote_op(_plate_similar_output, marker, Type{element}, shape)
+    # The generated body's nested type query shares this same allocation
+    # inference; neither path infers the wide semantic-fallback operation.
+    T = _plate_array_type(element, Val(A), input_types...)
     _concrete_value_type(T) ? T : nothing
 end
 
@@ -188,7 +188,7 @@ end
 function _checked_recipe_type!(found, op::_AuthoredScanOp, input_types, path)
     # A history scan's result holds values of the fill's type, or the
     # leading entries' element type.
-    _scan_has_history(op) && return Vector{_scan_history_element(input_types[end])}
+    _scan_has_history(op) && return _scan_history_result_type(input_types[end])
     step = op.kernel.plan
     types = _uninferred_values!(found, step,
         _scan_step_argument_types(op, input_types), path,

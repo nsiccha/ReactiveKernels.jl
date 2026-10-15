@@ -20,6 +20,22 @@ end
     total::Float64=sum(terms)
     return total
 end
+@kernel matrix_subject(q::Vector{Float64},idx::Vector{Int},x::Matrix{Float64})=begin
+    gathered=ReactiveKernels._readonly_gather(q,idx)
+    terms=plate(gathered,x) do a,z
+        -0.5*(z-a)^2
+    end
+    total::Float64=sum(terms)
+    return total
+end
+@kernel nonlinear_subject(q::Vector{Float64},idx::Vector{Int},x::Vector{Float64})=begin
+    gathered=ReactiveKernels._readonly_gather(q,idx)
+    terms=plate(gathered,x) do a,z
+        sin(a)*z+exp(a)/(1+z*z)
+    end
+    total::Float64=sum(terms)
+    return total
+end
 function oracle(q,idx,x)
     value=0.;g=zero(q)
     for i in eachindex(idx)
@@ -39,16 +55,21 @@ function verify(k,q,ref)
 end
 @testset "index runs: binding, native semantics and Reverse" begin
     cache=PreparationCache();q=[.1,-.4,.3]
-    # Mean runs 0, 1, 2, 16, 6.5 and 64 around the policy threshold of 8.
-    shapes=(Int[],[1],repeat([1,2,3],inner=2),repeat([1,2,3],inner=16),
-        [fill(2,16);1;3;fill(1,7)],repeat([3,1],inner=64))
+    # Include both sides of the mean-run threshold of 8, unequal run lengths,
+    # and a group id that reappears after another group (not globally sorted).
+    shapes=(Int[],[1],repeat([1,2,3],inner=2),repeat([1,2,3],inner=7),
+        repeat([1,2,3],inner=8),repeat([1,2,3],inner=16),
+        [fill(2,16);1;3;fill(1,7)],
+        [fill(2,17);fill(1,8);fill(3,9);fill(1,13)],repeat([3,1],inner=64))
     kernels=Any[];references=Any[];sources=Dict{Bool,Any}();asts=Dict{Bool,Expr}()
-    for (idx,enabled) in zip(shapes,(false,false,false,true,false,true))
+    for (idx,enabled) in zip(shapes,(false,false,false,false,true,true,false,true,true))
         x=[sin(i/3)/2 for i in eachindex(idx)]
         oldidx=copy(idx);oldx=copy(x)
         k=prepare!(cache,subject;bound=(;idx,x))
         push!(kernels,k);push!(references,oracle(q,idx,x))
         verify(k,q,last(references))
+        changed=[-.8,.6,1.2]
+        verify(k,changed,oracle(changed,idx,x))
         @test idx==oldidx && x==oldx
         if !haskey(sources,enabled)
             sources[enabled]=k.f
@@ -62,6 +83,16 @@ end
         @test length(metas)==1
         @test only(metas)[3]==length(idx)
         @test only(metas)[4]==enabled
+        starts,stops=only(metas)[1:2]
+        if enabled
+            # Runs partition every observation exactly once, each with one
+            # constant index, and boundaries separate different indices.
+            @test reduce(vcat,(collect(a:b) for (a,b) in zip(starts,stops)))==collect(eachindex(idx))
+            @test all(all(==(idx[a]),idx[a:b]) for (a,b) in zip(starts,stops))
+            @test all(idx[stops[i]]!=idx[starts[i+1]] for i in 1:length(starts)-1)
+        else
+            @test isempty(starts) && isempty(stops)
+        end
     end
     @test length(sources)==2
     @test sources[false]!==sources[true]
@@ -116,5 +147,54 @@ end
     _,nativeops,_=RK._lower_with_ops(k.plan;inline_embedded=true)
     _,tensorops,_=RK._lower_with_ops(k.plan;inline_embedded=true,tensorized=true)
     @test nativeops==tensorops
+end
+
+@testset "index runs: retained loops across fresh data sizes" begin
+    # No cached template can conceal data-dependent body replication here:
+    # prepare afresh as both the number of runs and observations per run grow.
+    inventories=Dict{Symbol,Int}[]
+    for (nruns,runlength) in ((1,8),(3,16),(9,64))
+        idx=repeat(mod1.(1:nruns,3),inner=runlength)
+        x=sin.(eachindex(idx))./2
+        k=prepare(subject;bound=(;idx,x))
+        @test occursin("run_partial",string(k.ast))
+        counts=Dict{Symbol,Int}()
+        RK._index_run_visit(k.ast) do ex
+            counts[ex.head]=get(counts,ex.head,0)+1
+        end
+        @test get(counts,:for,0)>0
+        @test get(counts,:while,0)>0
+        push!(inventories,counts)
+        verify(k,[.1,-.4,.3],oracle([.1,-.4,.3],idx,x))
+    end
+    @test all(==(first(inventories)),inventories)
+end
+
+@testset "index runs: multidimensional plate keeps its flat fallback" begin
+    idx=repeat([3,1,2],inner=8)
+    x=reshape(sin.(1:3length(idx)),length(idx),3)
+    k=prepare(matrix_subject;bound=(;idx,x))
+    for q in ([.1,-.4,.3],[-.8,.6,1.2])
+        refs=[oracle(q,idx,x[:,j]) for j in axes(x,2)]
+        verify(k,q,(sum(first,refs),sum(last,refs)))
+    end
+    @test RK._lower_index_runs_native(k.ast,k.ops)==k.ast
+end
+
+@testset "index runs: nonlinear cells reuse the same transformation" begin
+    for idx in (repeat([2,1,3,1],inner=8),[fill(1,11);fill(3,19)])
+        x=cos.(eachindex(idx))
+        k=prepare(nonlinear_subject;bound=(;idx,x))
+        @test occursin("run_partial",string(k.ast))
+        for q in ([.1,-.4,.3],[-.8,.6,1.2])
+            value=0.;g=zero(q)
+            for i in eachindex(idx)
+                a=q[idx[i]];z=x[i]
+                value+=sin(a)*z+exp(a)/(1+z*z)
+                g[idx[i]]+=cos(a)*z+exp(a)/(1+z*z)
+            end
+            verify(k,q,(value,g))
+        end
+    end
 end
 end
