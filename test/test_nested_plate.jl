@@ -245,3 +245,48 @@ end
         @test N.head_count(code_expr(reader), :for) == 2
     end
 end
+
+@testset "Shared work of a nested-plate cell runs once" begin
+    N = NestedPlates
+    k = prepare(N.shared_cell_work)
+    weights = [0.5, -1.25, 2.0]
+    original = copy(weights)
+    expected(groups, scale) = scale * sum(sum(weights[p] for p in g; init=0.0)
+                                          for g in groups; init=0.0)
+    few = [[1, 3], [2]]
+    many = [[1 + mod(i, 3), 1 + mod(2i, 3)] for i in 1:40]
+    for groups in (few, many, Vector{Int}[], [Int[], [3]])
+        @test k(groups, weights, 0.7) ≈ expected(groups, 0.7)
+    end
+    # Before hoisting, `scale .* weights` allocated once per group.
+    @test N.allocated(k, few, weights, 0.7) == N.allocated(k, many, weights, 0.7)
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    ad = prepare_ad(k, backend, many, weights, 0.7; active=:scale)
+    value, grad = ad_value_and_gradient(ad, many, weights, 0.7)
+    @test value ≈ expected(many, 0.7)
+    @test grad ≈ expected(many, 1.0)
+    @test weights == original
+end
+
+@testset "A plate read only by logsumexp streams its total" begin
+    N = NestedPlates
+    k = prepare(N.streamed_logsumexp)
+    reference(x, scale) = N.LogExpFunctions.logsumexp(scale .* x)
+    for x in ([0.3, -1.2, 2.5], [-800.0, -801.0], [1.0], collect(range(-3, 3; length=50)))
+        @test k(x, 0.8) ≈ reference(x, 0.8) rtol=1e-14
+    end
+    @test k(Float64[], 0.8) == -Inf
+    @test !occursin("similar", string(code_expr(k)))
+    @test N.allocated(k, [0.3, -1.2, 2.5], 0.8) == 0
+    @test N.allocated(k, collect(range(-3, 3; length=50)), 0.8) == 0
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    x = [0.3, -1.2, 2.5]
+    ad = prepare_ad(k, backend, x, 0.8; active=:scale)
+    value, grad = ad_value_and_gradient(ad, x, 0.8)
+    weights = exp.(0.8 .* x .- reference(x, 0.8))
+    @test value ≈ reference(x, 0.8)
+    @test grad ≈ sum(weights .* x)
+
+    shadowed = prepare(N.ShadowedFold.shadowed_logsumexp)
+    @test shadowed([0.3, -1.2, 2.5]) ≈ 2 * (0.3 - 1.2 + 2.5)
+end
