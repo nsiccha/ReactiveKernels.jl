@@ -1312,6 +1312,33 @@ end
 
 _lik_name(label::Symbol) = Symbol(:_ppl_lik_, label)
 
+function _ordinal_pointwise_stmts(r, plan; grouped = false)
+    pw = _pw_name(r.label)
+    if !(r.family === OrdinalFam && r.ordinal_structure === :stopping &&
+            r.evidence.kind === :none && r.n_levels > 1 &&
+            _response_rows(plan, r) > 0 && _has_observed_response(plan, r))
+        return Expr[], pw
+    end
+    # A stopping-ratio lane represents a visited stage. Zero-threshold
+    # observations visit no stage; the padded prefix also covers these.
+    ends = Symbol(pw, :_ends)
+    cumulative = Symbol(pw, :_cumulative)
+    values = Symbol(pw, :_observations)
+    observed = !grouped && r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) :
+        !grouped && r.mi_jobs !== nothing ? Symbol(:_ppl_mi_response_, r.label) : r.response
+    endexpr = if r.thresholds isa ThresholdRows
+        # Stage membership is prepared after any response selection.
+        obs = _stage_lane(r.label, :obs)
+        :(searchsortedlast.(Ref($obs), eachindex($observed)))
+    else
+        stages = _group_thresholds(plan, r) ? :(length($(r.thresholds))) : r.n_levels - 1
+        :(cumsum(min.($observed, $stages)))
+    end
+    return Expr[:($ends = $endexpr),
+        :($cumulative = vcat(0.0, cumsum($pw))[$ends .+ 1]),
+        :($values = $cumulative .- vcat(0.0, $cumulative)[1:end-1])], values
+end
+
 function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         upstream::Vector{Expr} = Expr[])
     stmts = Expr[]
@@ -1330,19 +1357,9 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         args === nothing || push!(arguments, r.response => args)
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
-        if r.family === OrdinalFam && r.ordinal_structure === :stopping && r.evidence.kind === :none &&
-                r.n_levels > 1 && _response_rows(plan, r) > 0 && _has_observed_response(plan, r)
-            # Stopping-ratio emits one lane per visited stage. Gather the
-            # prefix sum at each observation's last stage, then difference.
-            ends = Symbol(pw, :_ends)
-            cumulative = Symbol(pw, :_cumulative)
-            values = Symbol(pw, :_observations)
-            observed = r.range isa Expr ? Symbol(:_ppl_range_response_, r.label) :
-                r.mi_jobs !== nothing ? Symbol(:_ppl_mi_response_, r.label) : r.response
-            push!(stmts, :($ends = cumsum(min.($observed, $(r.n_levels-1)))),
-                :($cumulative = cumsum($pw)[$ends]),
-                :($values = $cumulative .- vcat(0.0, $cumulative)[1:end-1]))
-            pw = values
+        if !_cell_broadcast_response(plan, r)
+            pointstmts, pw = _ordinal_pointwise_stmts(r, plan)
+            append!(stmts, pointstmts)
         end
         push!(points, r.response => pw)
     end
@@ -1480,11 +1497,12 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     end
     # The response's predictor nodes lie on its observation axis, here the
     # indices.
+    pointstmts, pointvalue = _ordinal_pointwise_stmts(r, plan; grouped = true)
     return _cell_broadcast_group(plan, r.response, _lik_name(r.label), _pw_name(r.label),
         stmts, upstream, [p.name for p in plan.predictors],
         "response $(r.label) observes one array per index, and its $(r.family) statements";
         arguments = _observation_argument_inputs(r, stmts),
-        argument_node = Symbol(:_ppl_obsargs_, r.label))
+        argument_node = Symbol(:_ppl_obsargs_, r.label), pointstmts, pointvalue)
 end
 
 # A caller-owned sampling RHS (`y[i] .~ LogDensity.(f, loc[i], s)`) in the
@@ -1504,12 +1522,14 @@ end
 function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Symbol,
         pw::Symbol, stmts::Vector{Expr}, upstream::Vector{Expr},
         axisnodes::Vector{Symbol}, what::String; arguments = nothing,
-        argument_node::Symbol = :_ppl_unused_observation_arguments)
+        argument_node::Symbol = :_ppl_unused_observation_arguments,
+        pointstmts = Expr[], pointvalue = pw)
     k = findall(st -> Meta.isexpr(st, :(=), 2) && st.args[1] == :($node::Float64), stmts)
     (length(k) == 1 && stmts[only(k)].args[2] == :(sum($pw))) ||
         throw(ContractValidationError("[generator] $what have no summed " *
             "pointwise plate to run per index"))
     body = Expr[st for (i, st) in enumerate(stmts) if i != only(k)]
+    append!(body, pointstmts)
     defined = Set{Symbol}(something.(_assigned_name.(body), :_))
     known = Set{Symbol}(keys(plan.columns))
     for st in upstream
@@ -1598,7 +1618,8 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
             Expr(:block, LineNumberNode(0, :generator), deepcopy(statements)..., result...)))
     totals = Symbol(pw, :_totals)
     result = Expr[
-        :($pw = $(groupplate(cell, Expr(:call, GlobalRef(Base, :identity), group)))),
+        :($pw = $(groupplate(cell, Expr(:call, GlobalRef(Base, :identity),
+            _hsubst(pointvalue, aliases))))),
         :($totals = $(groupplate(cell, :(_ppl_group_total::Float64 = sum($group)),
             :_ppl_group_total))),
         :($node::Float64 = sum($totals))]
@@ -1756,17 +1777,6 @@ _ppl_range_values(x::AbstractArray, indices) = x[indices]
 # authored indices. Positions and indices differ for a literal `a:b`. Read
 # without a gather, the observation plate consumes the column's plate
 # directly, so a cell query composes it and runs only that cell.
-function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
-    i = findfirst(p -> p.name === value, plan.predictors)
-    i === nothing && return false
-    p = plan.predictors[i]
-    p.link === IdentityLink && length(p.terms) == 1 &&
-        p.terms[1].kind === OffsetTerm || return false
-    d = findfirst(d -> d.name === only(p.terms[1].columns), plan.derived)
-    return d !== nothing && _authored_spelling(
-        _selected_plate_indices(plan.derived[d].expr)) == r.range.args[2]
-end
-
 function _ranged_response_stmts(r, plan, stmts)
     idx = Symbol(:_ppl_range_indices_, r.label)
     selected = Symbol(:_ppl_range_response_, r.label)
@@ -1794,6 +1804,7 @@ function _ranged_response_stmts(r, plan, stmts)
                 push!(rows, slot)
             end
         end
+        r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
         for (i, value) in enumerate(sort!(collect(rows)))
             value === r.response && continue
             _selected_cell_value(plan, r, value) && continue
@@ -1930,6 +1941,7 @@ function _mi_stopping_response_stmts(r, plan, stmts)
     end
     aliases = Dict{Symbol,Symbol}(r.response => observed)
     rows = Set{Symbol}([_location_node(r, plan)])
+    r.thresholds isa ThresholdRows && push!(rows, r.thresholds.name)
     for ref in (r.weights, r.discrimination, r.evidence.lower, r.evidence.upper,
             r.threshold_columns...)
         if ref isa ScalePredictorRef
@@ -3873,10 +3885,21 @@ end
 # level, so nothing in the emitted program — statements or cell — grows
 # with the level count K. K=1 lowers to a zero cell (SB's
 # zero-information likelihood).
-_ordinal_cutpoints_valid(c) = all(c[2:end] .> c[1:end-1])
+# A guarded data-only plate may leave a scalar placeholder at a missing
+# observation; validate its shape before attempting any vector reads.
+_ordinal_cutpoints_valid(c) = c isa AbstractVector && all(c[2:end] .> c[1:end-1])
+_threshold_input(name::Symbol) = :(Ref($name))
+_threshold_input(rows::ThresholdRows) = rows.name
+_threshold_validity(name::Symbol) =
+    Expr(:call, GlobalRef(@__MODULE__, :_ordinal_cutpoints_valid), name)
+_threshold_validity(rows::ThresholdRows) =
+    Expr(:., GlobalRef(@__MODULE__, :_ordinal_cutpoints_valid), Expr(:tuple, rows.name))
+_threshold_stages(name::Symbol, obs, stage) = :($name[$stage])
+_threshold_stages(rows::ThresholdRows, obs, stage) =
+    :(getindex.(_broadcast_gather($(rows.name), $obs), $stage))
 
 function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol, pw::Symbol)
-    K = r.n_levels
+    K = _group_thresholds(plan, r) ? :(length($(r.thresholds)) + 1) : r.n_levels
     K === nothing && throw(ContractValidationError(
         "[generator] ordered response $(r.label) has unresolved n_levels " *
         "(bind_data infers it)"))
@@ -3897,18 +3920,23 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
         # bare Float64, which the plate builder does not take).
         :(0.0 * $yv)
     else
-        push!(inputs, :(Ref($(r.thresholds))))
+        push!(inputs, _threshold_input(r.thresholds))
         cutref = _dovar(length(inputs))
-        cumulative = _ordinal_cumulative_cell(r.link, K, yv, etav, dref, cutref)
+        levels = r.thresholds isa ThresholdRows ? :(length($cutref) + 1) : K
+        cumulative = _ordinal_cumulative_cell(r.link, levels, yv, etav, dref, cutref)
+        (r.thresholds isa ThresholdRows || _group_thresholds(plan, r)) &&
+            (cumulative = :(isempty($cutref) ? 0.0 * $yv : $cumulative))
         # A response reads the authored vector; it does not impose an
         # Ordered transform or replace its prior. Guard before logarithms,
         # including when only boundary categories are observed.
-        parameter = only(p for p in plan.vector_parameters if p.name === r.thresholds)
-        if _is_ordered_parameter(parameter.family) && parameter.name ∉ plan.conditioned
+        pi = findfirst(p -> p.name === r.thresholds, plan.vector_parameters)
+        parameter = pi === nothing ? nothing : plan.vector_parameters[pi]
+        if parameter !== nothing && _is_ordered_parameter(parameter.family) &&
+                parameter.name ∉ plan.conditioned
             cumulative
         else
             valid = Symbol(:_ppl_cutpoints_valid_,r.label)
-            check = Expr(:call,GlobalRef(@__MODULE__,:_ordinal_cutpoints_valid),r.thresholds)
+            check = _threshold_validity(r.thresholds)
             push!(prests,:($valid = $check))
             push!(inputs,valid)
             validref = _dovar(length(inputs))
@@ -3921,9 +3949,10 @@ function _ordinal_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Sym
     c = cutref
     function ordinal_tail(b, upper)
         K == 1 && return upper ? :($b < 1 ? 1.0 : 0.0) : :($b < 1 ? 0.0 : 1.0)
+        levels = r.thresholds isa ThresholdRows ? :(length($c) + 1) : K
         logtail=upper ? _ordinal_logCC(r.link,:($dref * ($c[$b]-$etav))) :
             _ordinal_logF(r.link,:($dref * ($c[$b]-$etav)))
-        :($b < 1 ? $(upper ? 1.0 : 0.0) : ($b >= $K ? $(upper ? 0.0 : 1.0) : exp($logtail)))
+        :($b < 1 ? $(upper ? 1.0 : 0.0) : ($b >= $levels ? $(upper ? 0.0 : 1.0) : exp($logtail)))
     end
     cell=_wrap_evidence!(r,plan,prests,inputs,cell;
         cdf=b->ordinal_tail(b,false),ccdf=b->ordinal_tail(b,true))
@@ -3941,10 +3970,10 @@ end
 # level: only the observation's own arm runs, so every gather is in bounds
 # by construction; the branch condition reads bound data only, so plate
 # lowering splits the lanes by arm before any backend sees a branch.
-function _ordinal_cumulative_cell(link::LinkFunction, K::Int, yv::Symbol,
+function _ordinal_cumulative_cell(link::LinkFunction, K, yv::Symbol,
         etav::Symbol, dref, c::Symbol)
     first = _ordinal_logF(link, :($dref * ($c[1] - $etav)))
-    last = _ordinal_logCC(link, :($dref * ($c[$(K - 1)] - $etav)))
+    last = _ordinal_logCC(link, :($dref * ($c[$K - 1] - $etav)))
     K == 2 && return :($yv == 1 ? $first : $last)
     hi = _ordinal_logF(link, :($dref * ($c[$yv] - $etav)))
     lo = _ordinal_logF(link, :($dref * ($c[$yv - 1] - $etav)))
@@ -3964,7 +3993,7 @@ _stage_lane(label::Symbol, what::Symbol) = Symbol(:_ppl_srl_, what, :_, label)
 # lowering splits by arm. K=1 runs zero stages (SB's zero-information
 # likelihood) and lowers to a zero cell over the observations.
 function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
-        node::Symbol, pw::Symbol, K::Int)
+        node::Symbol, pw::Symbol, K)
     r.evidence.kind === :none || return _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     y = r.response
     if K == 1
@@ -3972,13 +4001,14 @@ function _ordinal_stopping_stmts(r::LikelihoodSpec, plan::StructuralPlan,
     end
     lp = _location_node(r, plan)
     obs, stage = _stage_lane(r.label, :obs), _stage_lane(r.label, :stage)
-    prests = Expr[:($obs = _ordinal_stage_obs($y, $K)),
-        :($stage = _ordinal_stage_idx($y, $K))]
+    levels = r.thresholds isa ThresholdRows ? :(length.($(r.thresholds.name)) .+ 1) : K
+    prests = Expr[:($obs = _ordinal_stage_obs($y, $levels)),
+        :($stage = _ordinal_stage_idx($y, $levels))]
     level = _stage_lane(r.label, :y)
     eta = _stage_lane(r.label, :eta)
     thr = _stage_lane(r.label, :t)
     push!(prests, :($level = $y[$obs]), :($eta = _broadcast_gather($lp, $obs)),
-        :($thr = $(r.thresholds)[$stage]))
+        :($thr = $(_threshold_stages(r.thresholds, obs, stage))))
     inputs = Any[stage, level, eta, thr]
     sv, yv, etav, tv = _dovar(1), _dovar(2), _dovar(3), _dovar(4)
     dref = _ordinal_lane_ref!(inputs, prests,
@@ -4021,7 +4051,7 @@ function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     lp = _location_node(r, plan)
     row = _stage_lane(r.label, :evidence_row)
     push!(pre, :($row = collect(eachindex($(r.response)))))
-    inputs = Any[r.response, lp, :(Ref($(r.thresholds))), row]
+    inputs = Any[r.response, lp, _threshold_input(r.thresholds), row]
     yv, eta, t, iv = (_dovar(i) for i in 1:4)
     d = _ordinal_lane_ref!(inputs, pre, _ordinal_scale_source!(pre, r, plan), nothing, :_)
     effects = nothing
@@ -4033,7 +4063,7 @@ function _ordinal_stopping_evidence_stmts(r, plan, node, pw, K)
     elseif !isempty(r.threshold_columns)
         matrix = _stage_lane(r.label, :effects_matrix)
         p = length(r.threshold_columns)
-        push!(pre, :($matrix = hcat($(r.threshold_columns...)) * reshape($(r.threshold_coefs), $p, $(K-1))))
+        push!(pre, :($matrix = hcat($(r.threshold_columns...)) * reshape($(r.threshold_coefs), $p, $K - 1)))
         push!(inputs, :(Ref($matrix)))
         effects = _dovar(length(inputs))
     end

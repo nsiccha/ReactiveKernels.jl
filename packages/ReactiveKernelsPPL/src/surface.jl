@@ -4350,6 +4350,12 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         lnames = Set(first.(locals))
         external = _external_rhs(c.args[3])
         function arg(ex; object=false)
+            # Preserve sharing within a dotted cell while lowering the
+            # indexed vector through the ordinary selected-plate path.
+            if _is_ref_call(ex) && _expr_has_sym(ex, ivar)
+                value = arg(ex.args[2])
+                return _is_broadcast_sample(c) ? :(Ref($value)) : value
+            end
             # An external constructor's indexed argument follows the authored
             # iterator. Retain its read in the cell, including bounds checks;
             # stripping it to a column would broadcast a singleton instead.
@@ -5567,7 +5573,7 @@ function _dotify_cell(ex::Expr, ivar, pidx, object::Bool)
     # Ref denotes one whole shared argument to a broadcasted constructor.
     # Broadcasting Ref itself would replace that argument by scalar wrappers.
     Meta.isexpr(ex, :call, 2) && ex.args[1] === :Ref &&
-        return (ex, false)
+        return (_strip_cell(ex, ivar), false)
     Meta.isexpr(ex, :call, 1) && return (ex, false)
     if ex.head === :call && !isempty(ex.args)
         f = ex.args[1]
@@ -8003,24 +8009,35 @@ function _lower_categorical_logit_response(lhs, call, range, weights,
         extra_predictors = pnames[2:end])
 end
 
-# Explicit cutpoints/thresholds of an ordinal response: the trailing
-# argument `Ref(c)` names one declared vector shared by every observation
-# (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
+# Explicit cutpoints/thresholds of an ordinal response: `Ref(c)` shares
+# one vector, either sampled with its stated prior or supplied as data.
 # Either structure reads an Ordered vector or a one-axis sized vector
 # with its stated element prior and support. A vector may serve several
 # responses; its first use records a size source for `_lower_parameters`.
 function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         shown::String)
-    name = arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
-        arg.args[1] === :Ref && arg.args[2] isa Symbol ? arg.args[2] : nothing
-    if name === nothing
+    if !_is_ref_call(arg)
+        if _data_only(arg, ctx.data, ctx.detmap)
+            name = _lower_argument_value(lhs, :thresholds, arg, ctx)
+            name isa Symbol || _sfail("response $lhs: thresholds must be a vector")
+            return ThresholdRows(name)
+        end
         arg isa Symbol && _sfail("response $lhs: the cutpoints $arg are " *
             "one vector shared by every observation — write `Ref($arg)` " *
             "(standard broadcasting would pair each observation with one " *
             "element of $arg)")
         _sfail("response $lhs: $shown takes its cutpoints as `Ref(c)` of " *
-               "a declared vector, got $(repr(arg))")
+               "a sampled or data vector, got $(repr(arg))")
     end
+    value = arg.args[2]
+    if _data_only(value, ctx.data, ctx.detmap)
+        name = _lower_argument_value(lhs, :thresholds, value, ctx)
+        name isa Symbol || _sfail("response $lhs: thresholds must be a vector")
+        return name
+    end
+    name = value isa Symbol ? value : nothing
+    name === nothing && _sfail("response $lhs: sampled thresholds must " *
+        "name a declared vector, got $(repr(value))")
     if name ∉ ctx.ordered_names
         dims = get(ctx.array_dims, name, nothing)
         dims !== nothing && length(dims) == 1 || _sfail("response $lhs: " *
