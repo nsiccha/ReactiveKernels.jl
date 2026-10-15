@@ -187,9 +187,14 @@ wrapper's registry and local-source additions and before any precompile.
 - `dogfood` develops Enzyme and its in-tree EnzymeCore from the exact local
   commit.
 
-Both resolve at the same preserve tier: the environment's other direct
-dependencies keep their versions, and indirect dependencies follow only what
-the selected Enzyme requires. An exact Enzyme/EnzymeCore compat entry in the
+Both apply their Enzyme through the same targeted resolve at
+`PRESERVE_DIRECT`: the environment's other direct dependencies keep their
+versions, and indirect dependencies are re-resolved to the newest versions
+the environment admits, identically for both variants, so they differ only
+where the two Enzyme versions require. (Pkg cannot hold indirect versions
+across a change that Enzyme forces on its own dependencies, such as
+Enzyme_jll, so the registered variant takes the same targeted resolve rather
+than a narrower `update`.) An exact Enzyme/EnzymeCore compat entry in the
 active project moves with the selection. The selection is recorded in the
 variant directory for the matrix.
 """
@@ -203,16 +208,20 @@ function select_enzyme!(variant::Variant)
         bound = isempty(replay) ? _root_enzyme_compat() : "=$replay"
         _set_compat!(project_path, project, compat, Dict("Enzyme" => bound), ("EnzymeCore",))
         selection["latest_registered"] = _latest_registered_enzyme()
-        if isempty(replay)
+        target = if isempty(replay)
             selection["request"] = "newest registered release admitted by the environment"
+            # `update` finds the newest admitted release; the targeted `add`
+            # below applies it with the same resolve the dogfood variant uses.
             _resolve_with_fallback!(selection) do preserve
                 Pkg.update(["Enzyme"]; preserve)
             end
+            _manifest_entry("Enzyme")["version"]
         else
             selection["request"] = "exact replay pin $replay"
-            _resolve_with_fallback!(selection) do preserve
-                Pkg.add(Pkg.PackageSpec(name = "Enzyme", version = VersionNumber(replay)); preserve)
-            end
+            replay
+        end
+        _resolve_with_fallback!(selection) do preserve
+            Pkg.add(Pkg.PackageSpec(name = "Enzyme", version = VersionNumber(target)); preserve)
         end
     else
         dogfood = variant.dogfood
@@ -413,7 +422,8 @@ function _run_variant(prepare, variant::Variant, packages, precompile)
             record["log_tail"] = _log_tail(log)
         end
     catch e
-        record["error"] = _error_text(e)
+        # An unavailable dogfood source is already a complete message.
+        record["error"] = e === variant.dogfood ? sprint(showerror, e) : _error_text(e)
     finally
         rm(environment; recursive = true, force = true)
     end

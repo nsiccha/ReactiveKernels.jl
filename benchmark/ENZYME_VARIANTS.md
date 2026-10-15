@@ -9,9 +9,12 @@ benchmark body, inputs, arguments, Julia command and host settings.
 | `registered` | The newest registered Enzyme release the suite's environment admits. A suite's historical pin, such as `Enzyme v0.13.199`, is lifted for this variant. This is the baseline. |
 | `dogfood` | The same environment with `Enzyme` and its in-tree `lib/EnzymeCore` developed from one exact local commit. |
 
-Both variants make that change at the same resolver tier. The suite's other
-direct dependencies keep their pinned versions. Indirect dependencies change
-only as far as the selected Enzyme requires. If that is unsatisfiable, the
+Both variants apply their Enzyme through the same targeted resolve
+(`PRESERVE_DIRECT`). The suite's other direct dependencies keep their pinned
+versions. Indirect dependencies are re-resolved to the newest versions the
+environment admits, identically for both variants, so the two manifests differ
+only where the two Enzyme versions require. In practice that is Enzyme,
+EnzymeCore and Enzyme_jll. If the targeted resolve is unsatisfiable, the
 variant falls back to Pkg's ordinary tiered resolution and records why.
 
 The dogfood-versus-registered ratio is a change within one implementation. No
