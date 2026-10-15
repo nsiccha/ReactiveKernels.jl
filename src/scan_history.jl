@@ -195,6 +195,18 @@ end
 
 _history_has_reads(reads) = any(r -> !isempty(r.history), reads)
 
+# Both front ends expose one recurrence result through named columns. The
+# projection is itself a transparent, retained plate, not a replay of the step.
+_scan_named_tuple_expr(names, value) = Expr(:tuple,
+    (Expr(:(=), name, value(name)) for name in names)...)
+
+function _scan_column_expr(rows, name)
+    row = gensym(:scan_row)
+    Expr(:do, Expr(:call, GlobalRef(@__MODULE__, :plate), rows),
+        Expr(:(->), Expr(:tuple, row),
+            Expr(:block, Expr(:., row, QuoteNode(name)))))
+end
+
 # The statements a fold executes: those producing `output` (or every sampled
 # statement, for a density fold with `output === nothing`) and everything they
 # read, except arrays already `completed`. `nothing` when an executed

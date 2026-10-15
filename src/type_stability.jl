@@ -188,7 +188,7 @@ end
 function _checked_recipe_type!(found, op::_AuthoredScanOp, input_types, path)
     # A history scan's result holds values of the fill's type, or the
     # leading entries' element type.
-    _scan_has_history(op) && return Vector{_scan_history_element(input_types[end])}
+    _scan_has_history(op) && return _scan_history_result_type(input_types[end])
     step = op.kernel.plan
     types = _uninferred_values!(found, step,
         _scan_step_argument_types(op, input_types), path,

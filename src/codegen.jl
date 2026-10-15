@@ -691,9 +691,9 @@ end
 # the history value's element type (`_scan_history_element`, then without
 # `element`).
 function _scan_result_type_expr(op::_AuthoredScanOp, input_types, element)
-    element = _scan_has_history(op) ?
-        Expr(:call, GlobalRef(@__MODULE__, :_scan_history_element), input_types[end]) :
-        _scan_includes_init(op) ?
+    _scan_has_history(op) && return Expr(:call,
+        GlobalRef(@__MODULE__, :_scan_history_result_type), input_types[end])
+    element = _scan_includes_init(op) ?
             Expr(:call, GlobalRef(Base, :promote_type), input_types[1], element) :
             element
     Expr(:curly, GlobalRef(Base, :Vector), element)
@@ -1095,12 +1095,12 @@ function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callarg
     start = gensym(:scan_history_offset)
     record = Any[
         :($carry = $(module_ref(:_scan_history_carry))($carry)),
-        :($lhs[$start + $index] = $output)]
+        :($(module_ref(:_scan_history_record!))($lhs, $start, $index, $output))]
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
     push!(body.args, :($lhs = $(module_ref(:_scan_history_buffer))(
         $((recycled === nothing ? () : (recycled,))...), $(first(seqs)), $fill_value)))
     push!(body.args, :($start = $(module_ref(:_scan_history_offset))($fill_value)))
-    push!(body.args, :($earlier = $(module_ref(:_ScanHistory))($lhs)))
+    push!(body.args, :($earlier = $(module_ref(:_scan_history_views))($lhs)))
     nonempty = Expr(:block,
         :($carry = $(callargs[1])),
         :($index = $(GlobalRef(Base, :first))($indices)),
