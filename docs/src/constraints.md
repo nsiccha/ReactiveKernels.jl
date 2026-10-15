@@ -506,6 +506,22 @@ and lock the one Reactant 0.2.289 lifted:
   [Enzyme issue #2386](https://github.com/EnzymeAD/Enzyme.jl/issues/2386)
   tracks comprehension activity analysis. This evidence and boundary note are
   interim tracking, not completion of that capability.
+- The same store rejects Base's fold over such a generator,
+  `sum(X[m, t, j] * alpha[j] for j in 1:P)` with `X` bound data and `alpha`
+  active: `mapfoldl` takes the generator, and its closure holds both arrays.
+  `repro_enzyme_generator_fold_capture.jl` reproduces it with Enzyme alone.
+  With Enzyme 0.13.216 the direct fold fails on Julia 1.12.7 and 1.13.1 and
+  passes on 1.10.12, which inlines it; a fold inside a step closure called
+  through a non-inlined driver fails on all three. Enzyme dogfood `2690dbd8`
+  passes all three shapes on all three versions. An `@rkppl` `@scan` step
+  written this way, such as the per-country renewal equation of
+  `test_scan_history.jl`, keeps its primal and pins its native Reverse leg as
+  a capability gap on Julia 1.11 and later. The same fold written with `init`
+  runs natively as RK's explicit loop, which has no generator closure and
+  differentiates with registered Enzyme; `@rkppl` bodies reach that loop
+  because the rewrite reads their resolved `GlobalRef` range heads. A fold
+  without `init` keeps Base's call: the repair of its closure store belongs to
+  the backend compiler.
 - Native Enzyme reverse mode fails static activity analysis
   (`EnzymeRuntimeActivityError`) when a fresh container holds arrays loaded
   from a constant argument and its contents reach an active result. The
