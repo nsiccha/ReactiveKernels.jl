@@ -380,20 +380,17 @@ end
     return effects
 end
 
-function _ordinal_stage_obs(y::AbstractVector{<:Integer}, K::Integer)
+function _ordinal_stage_lanes(f, y::AbstractVector{<:Integer}, K)
     out = Int[]
-    for (i, v) in enumerate(y), _ in 1:min(v, K - 1)
-        push!(out, i)
+    for (i, count) in enumerate(min.(y, K .- 1)), j in 1:count
+        push!(out, f(i, j))
     end
     return out
 end
-function _ordinal_stage_idx(y::AbstractVector{<:Integer}, K::Integer)
-    out = Int[]
-    for v in y, j in 1:min(v, K - 1)
-        push!(out, j)
-    end
-    return out
-end
+_ordinal_stage_obs(y::AbstractVector{<:Integer}, K) =
+    _ordinal_stage_lanes((i, j) -> i, y, K)
+_ordinal_stage_idx(y::AbstractVector{<:Integer}, K) =
+    _ordinal_stage_lanes((i, j) -> j, y, K)
 
 # The values a prior argument of a two-axis elementwise array gives its
 # packed cells: a number is shared by every element, and an array of the
