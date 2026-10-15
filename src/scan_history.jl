@@ -244,31 +244,6 @@ function _history_fold_closure(statements, reads, output, completed)
     return exec
 end
 
-# The order in which the carried arrays are produced, each with the
-# statements its fold executes, or `nothing` when some arrays read one
-# another's earlier entries (no fold can produce either first). Among the
-# feasible arrays the one with the fewest statements goes first.
-function _history_fold_order(states, statements, reads)
-    completed = Set{Symbol}()
-    order = Tuple{Symbol,Set{Int}}[]
-    while length(order) < length(states)
-        best = nothing
-        for a in states
-            a in completed && continue
-            exec = _history_fold_closure(statements, reads, a, completed)
-            exec === nothing && continue
-            (best === nothing || length(exec) < length(best[2])) && (best = (a, exec))
-        end
-        best === nothing && return nothing
-        push!(order, best)
-        push!(completed, best[1])
-    end
-    return order
-end
-
-# Does the fold executing `exec` read `a`'s earlier entries?
-_history_fold_reads_own(reads, exec, a) = any(i -> a in reads[i].history, exec)
-
 # Rebuild generator `gen`: each range maps through `range(ex, env)` in the
 # environment of the clauses before it, and the body and filters through
 # `body(ex, env)` inside every binder.
