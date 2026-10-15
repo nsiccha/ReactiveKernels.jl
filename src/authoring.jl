@@ -2159,11 +2159,12 @@ end
 # recomputed in every cell. Each maximal subexpression that reads only shared
 # values (closure captures, `Ref` operands and cell locals computed from them)
 # now becomes its own cell statement, exactly as if the author had named it,
-# so it runs once per call (snag `plate-body-evalu-4235a1ca`). `varying` names
+# so native lowering runs it once per nonempty plate call (snag
+# `plate-body-evalu-4235a1ca`). `varying` names
 # the zipped formals and `shared` the others. A scan step is not split: its
 # native lowering evaluates every step statement at every step, named or not.
-# Like a named invariant, a lifted one runs once per call even when the plate
-# has no cells.
+# Like a named invariant, a lifted one remains cell work: native lowering
+# skips it when the plate has no cells.
 #
 # Only strict positions are entered, as for `@node`: call and broadcast
 # arguments, field reads, indexing and tuple elements. A branch, loop,
