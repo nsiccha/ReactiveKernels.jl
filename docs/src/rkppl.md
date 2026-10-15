@@ -565,6 +565,15 @@ array follows the same rule, and so does the expression written inline:
 `(z * (sd .* L)')[g, 1]` gathers exactly as `b[g, 1]`, level lookup included. A data-only definition can size a declared array
 through `levels(gg)`, as in the multi-membership example above.
 
+Bound per-observation gathers also retain their result dimensions. A vector
+read `a[g]` has `length(g)` entries; `A[g, :]` and `A[:, g]` retain the
+unselected matrix dimension. This information follows named and computed
+array definitions, so scalar-plus-gather locations can use ordinary graph
+fusion without an opaque row-broadcast wrapper. Unbound indices and opaque
+array results keep unknown dimensions. Known dimensions enable fusion;
+matrix-column gathers and surrounding design products or sums can still
+materialize.
+
 Level axes preserve the order of their source. `z[levels(g)]` uses the
 `DataAPI.levels` pool, including unobserved categorical levels;
 `z[unique(g)]` uses first occurrence order. A supplied vector or range
