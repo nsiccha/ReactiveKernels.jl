@@ -7242,6 +7242,8 @@ function _eval_value_expr(ex, lookup, label; calls = nothing)
     ex isa Union{Number,String,AbstractArray} && return ex
     ex isa QuoteNode && return ex.value
     ex isa GlobalRef && return getglobal(ex.mod, ex.name)
+    # A bare `:` is Julia's whole-axis index (`X[:, 1]`), never a name.
+    ex === :(:) && return Colon()
     ex isa Symbol && return lookup(ex)
     ex isa Expr || throw(ContractValidationError(
         "[bind] $label: unsupported literal $(repr(ex))"))

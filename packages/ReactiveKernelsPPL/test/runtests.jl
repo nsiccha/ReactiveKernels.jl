@@ -133,6 +133,7 @@ const _PPL_TEST_FILES = (
     "test_graph_density.jl",
     "test_whole_event_mixture.jl",
     "test_hidden_markov.jl",
+    "test_icar.jl",
     "test_graph_density_reactant.jl",
     "test_names.jl",
     "test_scoped_submodels_reactant.jl",
