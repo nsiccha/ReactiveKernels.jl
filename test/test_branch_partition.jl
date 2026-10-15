@@ -39,6 +39,36 @@ isdefined(@__MODULE__, :BranchPartition) ||
         @test one(x) ≈ reference_guarded(x, ypos)
     end
 
+    @testset "a taken arm's shared work runs once per call" begin
+        ref(x, y, s) = sum(yi > 0 ? xi * log(s) : xi - 1.0 for (xi, yi) in zip(x, y))
+        have = (:x, :y, :s)
+        bound = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        C.arm_calls[] = 0
+        @test bound(x, 2.5) ≈ ref(x, y, 2.5)
+        @test C.arm_calls[] == 1
+        ypos = abs.(y) .+ 0.5
+        one = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y = ypos))
+        @test length(plates(one.plan)) == 1
+        C.arm_calls[] = 0
+        @test one(x, 2.5) ≈ ref(x, ypos, 2.5)
+        @test C.arm_calls[] == 1
+        # No lane takes the arm: its shared work is not evaluated.
+        yneg = -abs.(y)
+        none = prepare(C.guarded_counted_shared; have, want = :total, bound = (; y = yneg))
+        C.arm_calls[] = 0
+        @test none(x, -1.0) ≈ ref(x, yneg, 1.0)
+        @test C.arm_calls[] == 0
+        # Native Reverse through the hoisted value of the active shared number.
+        for (prepared, ys) in ((bound, y), (one, ypos))
+            pb = prepare_ad(prepared, AutoEnzyme(; mode = Enzyme.Reverse), x, 2.5;
+                            active = :s)
+            value, grad = RK.ad_value_and_gradient(pb, x, 2.5)
+            @test value ≈ ref(x, ys, 2.5)
+            @test grad ≈ sum(xi for (xi, yi) in zip(x, ys) if yi > 0) / 2.5
+        end
+    end
+
     @testset "pointwise output is reassembled in lane order" begin
         bound = prepare(C.guarded; have = (:x, :y), want = :pointwise, bound = (; y))
         @test length(plates(bound.plan)) == 2
@@ -124,6 +154,39 @@ isdefined(@__MODULE__, :BranchPartition) ||
                           for (xi, yi, o, d) in zip(xc, yc, obs,
                               j == 1 ? ones(3) : sqrt.(abs.(xc))))
                       for j in 1:2]
+    end
+
+    @testset "reverse with an inactive live lane vector and an active scalar" begin
+        # Each arm reads live `x` through `_LaneGather`'s view. A local typed
+        # as the authored `Vector{Float64}` converted that view into a copy
+        # through `Base.unalias`, which native Reverse rejected for inactive
+        # `x` (EnzymeRuntimeActivityError, Enzyme 0.13.216; snag
+        # `native-enzyme-re-fdecb734`).
+        s = 2.5
+        ref(x, s) = sum(yi > 0 ? xi * log(s) : xi - 1.0 for (xi, yi) in zip(x, y))
+        bound = prepare(C.guarded_shared; have = (:x, :y, :s), want = :total,
+                        bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        @test count(op -> op isa RK._LaneGather, bound.ops) == 4
+        @test bound(x, s) ≈ ref(x, s)
+        # No arm copies its lanes of `x`: the evaluation allocates the same
+        # at twenty times the lane count.
+        allocated(f, args...) = (f(args...); @allocated f(args...))
+        xl, yl = repeat(x, 20), repeat(y, 20)
+        large = prepare(C.guarded_shared; have = (:x, :y, :s), want = :total,
+                        bound = (; y = yl))
+        @test large(xl, s) ≈ sum(yi > 0 ? xi * log(s) : xi - 1.0
+                                 for (xi, yi) in zip(xl, yl))
+        @test allocated(bound, x, s) == allocated(large, xl, s)
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)
+        ps = prepare_ad(bound, backend, x, s; active = :s)
+        value, grad = RK.ad_value_and_gradient(ps, x, s)
+        @test value ≈ ref(x, s)
+        @test grad ≈ sum(x[y .> 0]) / s
+        px = prepare_ad(bound, backend, x, s; active = :x)
+        value, grad = RK.ad_value_and_gradient!(px, similar(x), x, s)
+        @test value ≈ ref(x, s)
+        @test grad ≈ [yi > 0 ? log(s) : 1.0 for yi in y]
     end
 
     @testset "a bound-only cell condition partitions after caching" begin

@@ -23,11 +23,11 @@ const _DAL_TRIALS = fill(8, 8)
 
 # Build and prepare the sampler at a fixed nonzero point; preparation must
 # not warn (a location read in place is concretely typed).
-function _dal_query(bound)
+function _dal_query(bound; backend = AutoEnzyme(; mode = Enzyme.Reverse))
     built = build_kernel(bound)
     u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
     q = @test_logs min_level = Base.CoreLogging.Warn prepare_sampler(built,
-        bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        bound, u; backend)
     g = similar(u)
     value, _ = sampler_value_and_gradient!(q, g, u)
     return (; built, u, q, value, g = copy(g))
@@ -52,6 +52,32 @@ function _dal_check(r, density)
 end
 
 _dal_same(a, b) = a.value ≈ b.value && isapprox(a.g, b.g; rtol = 1e-12)
+
+# A sized Beta array prior: registered Enzyme 0.13.216 (and 0.13.210) cannot
+# prove the prepared callable readonly, at the store that initializes
+# Enzyme's own by-value copy of it (`innerparm`), not at a write in the model
+# (`benchmark/repro_enzyme_innerparm_split_store_readonly.jl`;
+# `reactivekernels-use` §7aq). Enzyme `dogfood` from `4c73c40c` repairs the
+# proof. `Const(f)` differentiates the same call exactly, so the annotated
+# backend checks the model on every Enzyme; the plain backend accepts only
+# the exact gradient or that specific readonly diagnostic.
+function _dal_check_readonly(bound, density)
+    r = _dal_query(bound; backend = AutoEnzyme(; mode = Enzyme.Reverse,
+                                               function_annotation = Enzyme.Const))
+    _dal_check(r, density)
+    outcome = try
+        _dal_query(bound)
+    catch err
+        err
+    end
+    if outcome isa Enzyme.Compiler.EnzymeMutabilityException
+        @test occursin("Function argument passed to autodiff cannot be proven readonly",
+                       sprint(showerror, outcome))
+    else
+        @test _dal_same(r, outcome)
+    end
+    return r
+end
 
 @testset "a declared array as the location (centered eight schools)" begin
     direct = @rkppl begin
@@ -138,13 +164,13 @@ end
         p[axes(binary, 1)] .~ Beta.(2, 2)
         binary .~ Bernoulli.(p)
     end
-    _dal_check(_dal_query(probability() | (; binary)), nt ->
+    _dal_check_readonly(probability() | (; binary), nt ->
         sum(logpdf.(Beta(2, 2), nt.p)) + sum(logpdf.(Bernoulli.(nt.p), binary)))
     trials = @rkppl begin
         p[axes(counts, 1)] .~ Beta.(2, 2)
         counts .~ Binomial.(n, p)
     end
-    _dal_check(_dal_query(trials(; n) | (; counts)), nt ->
+    _dal_check_readonly(trials(; n) | (; counts), nt ->
         sum(logpdf.(Beta(2, 2), nt.p)) + sum(logpdf.(Binomial.(n, nt.p), counts)))
     inflated = @rkppl begin
         p[axes(counts, 1)] .~ Beta.(2, 2)
@@ -152,7 +178,7 @@ end
     end
     zib(k, m, q) = k == 0 ? log(0.2 + 0.8 * pdf(Binomial(m, q), 0)) :
         log(0.8) + logpdf(Binomial(m, q), k)
-    _dal_check(_dal_query(inflated(; n) | (; counts)), nt ->
+    _dal_check_readonly(inflated(; n) | (; counts), nt ->
         sum(logpdf.(Beta(2, 2), nt.p)) + sum(zib.(counts, n, nt.p)))
 end
 

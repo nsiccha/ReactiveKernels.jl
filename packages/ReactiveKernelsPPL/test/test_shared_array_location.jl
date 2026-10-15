@@ -130,7 +130,7 @@ end
             # retained values: `sd` reads the location's value by name.
             sd = only(d for d in fx.plan.derived if d.name === :sd)
             @test :mu in ReactiveKernelsPPL._expr_names(sd.expr)
-            @test occursin("sd = hypot.(add, mu .* prop)",
+            @test occursin(r"sd = (?:\w+\.)*hypot\.\(add, mu \.\* prop\)",
                 src)
         end
     end

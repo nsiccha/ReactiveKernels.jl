@@ -126,11 +126,13 @@ end
 # times standard-normal draws, observed through Poisson counts. The constant
 # jitter `1e-9 * I` is bound-only, so partial evaluation folds the
 # `UniformScaling{Float64}` into the prepared callable's operation table, and
-# plain `AutoEnzyme` must prove that callable readonly. Enzyme 0.13.216 and
-# the dogfood line reject that proof at the store that initializes Enzyme's
-# own by-value copy of the callable (`innerparm`), not at any write in the
-# model: `benchmark/repro_enzyme_innerparm_split_store_readonly.jl` reproduces
-# it with Enzyme only. `Const(f)` differentiates the same call exactly, so the
+# plain `AutoEnzyme` must prove that callable readonly. Enzyme 0.13.216
+# rejects that proof at the store that initializes Enzyme's own by-value copy
+# of the callable (`innerparm`), not at any write in the model:
+# `benchmark/repro_enzyme_innerparm_split_store_readonly.jl` reproduces it
+# with Enzyme only. Enzyme `dogfood` from `4c73c40c` repairs the proof, and
+# there the plain backend takes the exact branch. `Const(f)` differentiates
+# the same call exactly, so the
 # annotated backend checks the model on every Enzyme; the plain backend
 # accepts only the exact gradient or that specific readonly diagnostic.
 @testset "multivariate priors: a non-centered latent GP with a constant jitter" begin

@@ -880,12 +880,35 @@ struct _LaneGather
 end
 @inline (::_LaneGather)(x::Number, lanes) = x
 @inline function (gather::_LaneGather)(x::AbstractArray, lanes)
-    length(x) == 1 && return _tensorized_view(x, ones(Int, length(lanes)))
+    length(x) == 1 && return _lane_view(x, ones(Int, length(lanes)))
     ndims(x) == 1 && length(x) == gather.n || _lane_gather_mismatch(x, gather.n)
-    _tensorized_view(x, lanes)
+    _lane_view(x, lanes)
+end
+# Base's `view` unaliases its index vector against the parent, and native
+# Enzyme compiles the `copy` of that never-taken branch through its untyped
+# `memmove` override; on Julia 1.12 type analysis rejects it
+# (`IllegalTypeAnalysisException`; a one-entry scan trajectory broadcast over
+# guarded observations in `test_scan_capabilities.jl`).  Lane indices are
+# fresh or bound `Int` vectors that nothing writes, so a native lane view needs
+# no unaliasing; its bounds are still checked.  Other operands, and tracing
+# backends, keep `_tensorized_view`.
+@inline _lane_view(x::AbstractArray, lanes) = _tensorized_view(x, lanes)
+@inline function _lane_view(x::Vector, lanes::Vector{Int})
+    checkbounds(x, lanes)
+    Base.unsafe_view(x, lanes)
 end
 @noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
+# The gathered value is typed by the gather's own result (a view of an array
+# argument), not by the argument's authored type: a native typed local
+# (`_declare_typed_output!`) of the authored `Vector{Float64}` would convert
+# the view into a copy through Base's `unalias`, whose alias-or-copy result
+# native Enzyme reverse rejects for an inactive argument
+# (`EnzymeRuntimeActivityError`).
+function _lane_gather_type(n::Int, ::Type{T}) where {T}
+    R = Base.promote_op(_LaneGather(n), T, Vector{Int})
+    R === Union{} ? Any : R
+end
 (::_LaneGather)(x, lanes) = throw(ArgumentError("a partitioned plate " *
     "argument must be a number or a lane vector, got $(typeof(x))"))
 # Callable structs have no `nameof`, so without these the readable
@@ -1064,6 +1087,23 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     lanes_value = Dict{Symbol,Value}()
     expansion = Recipe[]
     arm_outputs = Value[]
+    # An arm with its own graph that holds work over live shared plate
+    # arguments runs as that graph's recipes, as the native shared-condition
+    # lowering runs it (`_plate_shared_branch`), so that work is hoisted above
+    # the lane loop instead of running inside an opaque per-lane arm call.
+    branch_index = findfirst(r -> r === branch_recipe, inner.recipes)
+    names = _recipe_source_names(branch_recipe)
+    root_positions = Dict(canon_id(inner.graph, v.id) => position
+                          for (position, v) in enumerate(inner.have))
+    _, shared = _plate_branch_source_inputs(inner, branch_recipe, atomic_inputs,
+        recipe.inputs, _plate_dependencies(inner, Set(keys(root_positions))).values,
+        root_positions)
+    graphs = _plate_branch_source_graphs(branch_recipe, names, shared)
+    lane_roots = intersect(lane_values, keys(root_positions))
+    live_roots = setdiff(Set(keys(root_positions)), lane_roots, keys(bound))
+    cell_ids = Set(r.id for r in inner.recipes)
+    readable = Dict(r.id => source for (r, source) in
+                    zip(inner.recipes, op.kernel.lowered_recipes))
     for (side, lanes) in arms
         # The arm's scalar body: the branch recipe runs only this arm (a
         # nested branch arm stays a `_KernelBranch` and partitions again).
@@ -1071,31 +1111,45 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         arm_f = getfield(native, side === :then ? :then_arm : :else_arm)
         arm_tf = getfield(tensor, side === :then ? :then_arm : :else_arm)
         arm_inputs = Value[branch_recipe.inputs[i] for i in positions]
-        if !any(v -> canon_id(inner.graph, v.id) in lane_values, arm_inputs)
-            arm_f, arm_tf = _LaneAnchored(arm_f), _LaneAnchored(arm_tf)
-            pushfirst!(arm_inputs, anchor)
+        anchored = !any(v -> canon_id(inner.graph, v.id) in lane_values, arm_inputs)
+        spliced = anchored ||
+            getfield(graphs, side === :then ? :then_spec : :else_spec) === nothing ?
+            nothing : _plate_branch_arm_kernel(inner, branch_index, side, graphs, names)
+        spliced === nothing ||
+            _partition_arm_hoists(spliced.plan, cell_ids, lane_roots, live_roots) ||
+            (spliced = nothing)
+        kernel = if spliced === nothing
+            if anchored
+                arm_f, arm_tf = _LaneAnchored(arm_f), _LaneAnchored(arm_tf)
+                pushfirst!(arm_inputs, anchor)
+            end
+            arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
+                                     arm_f, arm_tf)
+            # The arm recipe's source is its own arm, which a nested branch arm
+            # partitions again and a split arm decomposes.
+            branch_parts = branch_recipe.source isa Expr ?
+                _kernel_branch_parts(branch_recipe.source) : nothing
+            arm_source = branch_parts === nothing ? branch_recipe.source :
+                branch_parts[side === :then ? 2 : 3]
+            replaced = Recipe(branch_recipe.id, Tuple(arm_inputs),
+                branch_recipe.outputs, arm_op, branch_recipe.cost, nothing,
+                branch_recipe.effectful, arm_source)
+            arm_recipes = Recipe[r === branch_recipe ? replaced : r
+                                 for r in inner.recipes]
+            arm_plan = _partial_subplan(inner, inner.have, inner.want, arm_recipes)
+            prepared = _prepare(arm_plan,
+                _lower_with_ops(arm_plan; inline_embedded = false)...)
+            _prepared_kernel(prepared.f, prepared.ops, prepared.inputs,
+                prepared.outputs, prepared.plan, prepared.ast,
+                Tuple(readable[r.id] for r in arm_recipes))
+        else
+            prepared = _prepare(spliced.plan,
+                _lower_with_ops(spliced.plan; inline_embedded = false)...)
+            _prepared_kernel(prepared.f, prepared.ops, prepared.inputs,
+                prepared.outputs, prepared.plan, prepared.ast,
+                Tuple(get(readable, r.id, source) for (r, source) in
+                      zip(prepared.plan.recipes, prepared.lowered_recipes)))
         end
-        arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
-                                 arm_f, arm_tf)
-        # The arm recipe's source is its own arm, which a nested branch arm
-        # partitions again and a split arm decomposes.
-        branch_parts = branch_recipe.source isa Expr ?
-            _kernel_branch_parts(branch_recipe.source) : nothing
-        arm_source = branch_parts === nothing ? branch_recipe.source :
-            branch_parts[side === :then ? 2 : 3]
-        replaced = Recipe(branch_recipe.id, Tuple(arm_inputs),
-            branch_recipe.outputs, arm_op, branch_recipe.cost, nothing,
-            branch_recipe.effectful, arm_source)
-        arm_recipes = Recipe[r === branch_recipe ? replaced : r
-                             for r in inner.recipes]
-        arm_plan = _partial_subplan(inner, inner.have, inner.want, arm_recipes)
-        kernel = _prepare(arm_plan,
-            _lower_with_ops(arm_plan; inline_embedded = false)...)
-        readable = Dict(r.id => source for (r, source) in
-                        zip(inner.recipes, op.kernel.lowered_recipes))
-        kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs,
-            kernel.outputs, kernel.plan, kernel.ast,
-            Tuple(readable[r.id] for r in arm_recipes))
         arm_plate = _AuthoredPlateOp{typeof(kernel),atomic_inputs}(
             kernel, op.axis_checks)
 
@@ -1127,7 +1181,8 @@ Base.@nospecializeinfer function _partition_plate_recipe(
                     known[canon_id(g, v.id)] = lanes
                     v
                 end
-                v = value!(g, Symbol(:lane_, side, :_, outer.name), valtype(outer))
+                v = value!(g, Symbol(:lane_, side, :_, outer.name),
+                           _lane_gather_type(n, valtype(outer)))
                 push!(expansion, Recipe(fresh(), (outer, idx), (v,),
                     _LaneGather(n), 0.0, nothing, false))
                 push!(arguments, v)
@@ -1169,6 +1224,17 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     push!(expansion, Recipe(fresh(), (order_value, arm_outputs...), (pointwise,),
         _LaneAssemble(), 0.0, nothing, false))
     (; expansion, rewrite = nothing)
+end
+
+# Whether a spliced arm hoists work: one of its recipes reads a live shared
+# plate argument and no lane value. Otherwise the arm's own closure is kept,
+# whose constants stay compile-time literals inside each lane's call.
+function _partition_arm_hoists(variant::Plan, cell_ids, lane_roots, live_roots)
+    roots = _plate_dependencies(variant, union(lane_roots, live_roots)).recipes
+    any(eachindex(variant.recipes)) do i
+        !(variant.recipes[i].id in cell_ids) &&
+            isdisjoint(roots[i], lane_roots) && !isdisjoint(roots[i], live_roots)
+    end
 end
 
 function _partition_sum_consumer(consumers, pointwise)

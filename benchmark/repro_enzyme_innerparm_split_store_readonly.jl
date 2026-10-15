@@ -25,7 +25,7 @@
 # matrix (`sum(A) * x^2 + n * s.λ`), so holding them is not enough by itself.
 # A body that does `x^2 .* A` and reads `s.λ` itself hits the separate
 # loop-store readonly gap instead (`repro_enzyme_closure_float_store_readonly.jl`),
-# which Enzyme dogfood repairs; dogfood still raises the row above.
+# which Enzyme dogfood also repairs.
 # ReactiveKernels reaches this when partial evaluation folds a bound-only
 # `UniformScaling`, such as a covariance jitter `K = C + 1e-10 * I`, into the
 # operation table of the callable it hands DifferentiationInterface: plain
@@ -35,7 +35,9 @@
 # `AutoEnzyme(; mode = Enzyme.Reverse, function_annotation = Enzyme.Const)`
 # differentiates the same model exactly.
 # Recorded on gordito, Julia 1.10.12, 1.12.7 and 1.13.1 with Enzyme 0.13.216,
-# and Julia 1.13.1 with Enzyme dogfood `3ede25b` (0.13.215), 2026-10-14.
+# and Julia 1.13.1 with Enzyme dogfood `3ede25b` (0.13.215), 2026-10-14: the
+# first row raises. Enzyme dogfood from `4c73c40c` (0.13.215) repairs the
+# proof: every row is exact on Julia 1.13.1, 2026-10-15.
 using Enzyme, LinearAlgebra
 
 struct Shifted{T}

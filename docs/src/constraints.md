@@ -487,9 +487,15 @@ and lock the one Reactant 0.2.289 lifted:
   call-site-inlined `collect`, and a fresh-buffer runtime loop pass ordinary
   reverse for Float32 and Float64, including empty inputs. A typed
   comprehension performs Julia's ordinary element conversion, so it is only
-  an equivalent control when that element type is intended. PPL's ordinary
-  and array-bearing prepared-input readers keep their authored primal and
-  remain native reverse capability gaps in `test_native_generator_capture.jl`.
+  an equivalent control when that element type is intended. The
+  call-site-inlined `collect` holds only for a `Matrix` or a plain view: with
+  a reshaped view of a vector, which is how RKPPL passes a declared two-axis
+  real array, Enzyme 0.13.210 and 0.13.216 reject it the same way. PPL's
+  ordinary, inline-collect and array-bearing prepared-input readers keep
+  their authored primal and remain native reverse capability gaps in
+  `test_native_generator_capture.jl`. The Enzyme dogfood line repairs every
+  one of these readers from `ba8bc90b` on Julia 1.10.12 and 1.12.7; released
+  Enzyme 0.13.216 does not.
   No consumer function, activity configuration or derivative rule is replaced.
   A six-line isolated Enzyme compiler prototype marks
   `Base.collect(::Generator)` for inlining before activity analysis and makes
@@ -532,7 +538,12 @@ and lock the one Reactant 0.2.289 lifted:
   `Vector` and `Matrix` operands whose promoted element type is isbits, they
   allocate Base's result, with Base's shape, promoted element type and
   values, and write each operand in its own inlined call; a number is a 1×1
-  block. Every other operand combination, and every `hcat`/`vcat` layout
+  block. From Julia 1.11 a dense operand is written element by element:
+  Enzyme differentiates `unsafe_copyto!` there as an untyped `memmove`, and
+  in a kernel prepared with `bound=` data (the `@rkppl` scan trajectory
+  `vcat([seed], rest)`) native reverse failed with `EnzymeNoTypeError`.
+  Julia 1.10 keeps the copy, since its element loop fails on an empty fresh
+  operand. Every other operand combination, and every `hcat`/`vcat` layout
   they do not lay out, calls Base, which keeps its value and error
   (including `vcat`'s fill of leading numbers across a wider matrix). A
   layout `hvcat` rejects throws the companion's own `DimensionMismatch`
@@ -603,9 +614,9 @@ and lock the one Reactant 0.2.289 lifted:
   differentiated the same call exactly with Enzyme 0.13.210, while local
   runs with Enzyme 0.13.210 and 0.13.216 still raise the readonly exception.
   Its test accepts only the exact gradient or that specific exception.
-- On Julia 1.10.12, 1.12.7 and 1.13.1, Enzyme 0.13.216 and the local Enzyme
-  `dogfood` line reject the readonly proof of a read-only callable that holds
-  a matrix beside a `UniformScaling{Float64}` and adds them with Base's
+- On Julia 1.10.12, 1.12.7 and 1.13.1, Enzyme 0.13.216 rejects the readonly
+  proof of a read-only callable that holds a matrix beside a
+  `UniformScaling{Float64}` and adds them with Base's
   `Matrix + UniformScaling`.
   Plain reverse `autodiff` of the unannotated callable raises
   `EnzymeMutabilityException` ("Function argument passed to autodiff cannot be
@@ -630,9 +641,12 @@ and lock the one Reactant 0.2.289 lifted:
   way. On Julia 1.13.1, a shared computed slice prior over bound slices
   (`MvNormal.(eachrow(M), Ref(s2 .* S0))`) fails at the same kind of store into
   the rooted copy (`.roots.call.innerparm`). The repair belongs in Enzyme's
-  readonly proof; `test_multivariate_prior_values.jl` checks the latent GP
-  exactly under the `Const` annotation and accepts only the exact gradient or
-  that specific exception under the plain backend.
+  readonly proof. The local Enzyme `dogfood` line carries it from `4c73c40c`:
+  on Julia 1.13.1 the reproducer, the latent GP and the shared slice prior
+  then differentiate exactly with the plain backend. No registered Enzyme
+  release carries it yet. `test_multivariate_prior_values.jl` checks the
+  latent GP exactly under the `Const` annotation and accepts only the exact
+  gradient or that specific exception under the plain backend.
 - On Julia 1.12.7 and 1.13.1, Enzyme 0.13.216 reverse mode allocates 16 bytes
   per element when a loop stores into an array that is either a reused buffer
   or a fresh `similar` one and the store keeps its bounds check. Julia 1.12's
