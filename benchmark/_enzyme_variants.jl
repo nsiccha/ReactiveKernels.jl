@@ -295,6 +295,8 @@ function _run_variant(prepare, variant::Variant, packages, precompile)
     record = Dict{String,Any}("status" => "environment_failed")
     environment = mktempdir(prefix = "reactivekernels-enzyme-$(variant.name)-")
     try
+        # An unavailable dogfood source fails this variant before any setup.
+        variant.name == "dogfood" && !(variant.dogfood isa DogfoodSource) && throw(variant.dogfood)
         Pkg.activate(environment)
         command = nothing
         record["setup_seconds"] = @elapsed begin
