@@ -366,6 +366,12 @@ from parameter geometry, without adding generated values to sampler coordinates.
   `Beta.(logistic.(eta) .* k, (1 .- logistic.(eta)) .* k)` changes its mean
   from `logistic.(eta)` to `1 .- logistic.(eta)`.
 - Broadcasting is explicit: `mu = a .+ b .* x`.
+- A reduction's one-argument form (`sum(x)`, `mean(z)`) is the built-in
+  whole-column reduction. Called with keywords or a function argument it is
+  Julia's own function, as its qualified spelling `Base.sum` is: with
+  `dims = 2`, `P = exp.(U .- log.(sum(exp.(U); dims = 2)))` normalizes each
+  row of `U`, and `std(x; corrected = false)`, `sum(z; init = 0.0)` and
+  `sum(abs2, W)` keep their Julia meaning.
 - Distribution arguments use their ordinary values. `exp.`, `logistic.`,
   `normcdf.` and `cexpexp.` apply at each use, including means, rates,
   probabilities, scales, shapes, Student degrees of freedom and zero

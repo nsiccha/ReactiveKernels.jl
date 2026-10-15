@@ -294,6 +294,7 @@ const _PPL_TEST_FILES = (
     "test_plate_cell_once_reactant.jl",
     "test_index_endpoints.jl",
     "test_base_value_names.jl",
+    "test_reduction_calls.jl",
     "test_rebinding_rows.jl",
     "test_glm_object_values.jl",
     "test_native_plain_plate_emission.jl",
