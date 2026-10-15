@@ -217,6 +217,41 @@ end
     return total
 end
 
+# Work that reads only shared values in a cell holding another plate runs
+# once, before the outer loop: `scaled` reads the captured weights and scale.
+@kernel shared_cell_work(groups, weights::Vector{Float64}, scale::Float64) = begin
+    grouped = plate(groups) do positions
+        scaled = scale .* weights
+        picked = plate(positions) do position
+            scaled[position]
+        end
+        sum(picked)
+    end
+    total = sum(grouped)
+    return total
+end
+
+# A plate read only by `logsumexp` streams its total.
+using ReactiveKernels: LogExpFunctions
+@kernel streamed_logsumexp(x::Vector{Float64}, scale::Float64) = begin
+    scores = plate(x) do value
+        scale * value
+    end
+    return LogExpFunctions.logsumexp(scores)
+end
+
+# Another function that only shares the name is an ordinary consumer.
+module ShadowedFold
+using ReactiveKernels
+logsumexp(values) = sum(values)
+@kernel shadowed_logsumexp(x::Vector{Float64}) = begin
+    scores = plate(x) do value
+        2 * value
+    end
+    return logsumexp(scores)
+end
+end
+
 head_count(ex, head) = ex isa Expr ?
     Int(ex.head === head) + sum(x -> head_count(x, head), ex.args; init=0) : 0
 allocated(k::K, args::Vararg{Any,N}) where {K,N} = @allocated k(args...)
