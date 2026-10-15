@@ -1173,14 +1173,12 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # prove: an undotted module call's result is model-level here
     # (`y = f(raw)`). `bind_data` evaluates the definition once and
     # validates its value as the response; a number is one observation, as
-    # when bound as data. An ordinary `hcat` matrix value
-    # (`_route_hcat_values`) is observed as the same matrix bound as data,
-    # whether its columns give it observation rows (`:matrix`) or make it a
-    # model-level array (`hcat(v, w)` of whole-value data, `:array`).
+    # when bound as data. Array literals and concatenations are observed as
+    # the same arrays bound directly as data; their construction syntax does
+    # not determine an observation axis before binding.
     for nm in derived_response_names
         shape = get(detshape, nm, nothing)
-        shape === :scalar || (shape in (:matrix, :array) && nm in matrix_values) ||
-            continue
+        shape in (:scalar, :matrix, :array) || continue
         rhs = detmap[nm]
         !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
             (detshape[nm] = :vector)
@@ -1964,6 +1962,7 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
+    fn === GlobalRef(Base, :vect) && return :array
     # Collecting a one-dimensional index iterator preserves its vector
     # domain. It is not an opaque scalar module-call result.
     if fn === GlobalRef(Base, :collect) && length(ex.args) == 2 &&
@@ -2779,6 +2778,7 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
     end
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    ex = ReactiveKernels._array_literal_call(ex)
     recur(a) = _resolve_module_calls(a, mod, names, where;
         values = values && !(ex.head in _BINDING_VALUE_HEADS))
     # A keyword's name, and the shorthand `f(x; s)` for `s = s`, stay names.
@@ -3560,6 +3560,13 @@ _is_hcat_def(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] === :hcat
 
+# Before routing, literals and qualified Base calls share the same choice
+# of affine recipe or ordinary value. After routing only the bare head
+# marks a design-matrix definition; resolved calls remain ordinary values.
+_is_hcat_call(rhs) = _is_hcat_def(rhs) ||
+    (Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
+     rhs.args[1] === GlobalRef(Base, :hcat))
+
 # Only Base's ones/length have this recipe. A same-named module function
 # keeps its own meaning. The length anchor must also be a matrix column:
 # bind validates their equal lengths, so recreating the ones column is exact.
@@ -3729,7 +3736,7 @@ end
 # and consumers. Every other hcat keeps Base's ordinary value semantics.
 function _ordinary_hcat_values(sample, det, data, glms)
     detmap = Dict{Symbol,Any}(det)
-    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
+    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_call(rhs))
     params = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     # A GLM object reads its design matrix whole. An `hcat` of bare data or
     # derived columns keeps the fused design-matrix recipe; any other
@@ -3766,7 +3773,7 @@ function _ordinary_hcat_values(sample, det, data, glms)
         end
     end
     legacy = intersect(pure, _hcat_value_reads(det, detmap, sample, data,
-        glms, arrays, Set{Symbol}()))
+        glms, arrays, Set{Symbol}(); is_hcat = _is_hcat_call))
     used = Set{Symbol}()
     function walk(ex; whole = false)
         if ex isa Symbol
@@ -3830,7 +3837,7 @@ _glm_design_hcat(rhs, params) = length(rhs.args) > 1 &&
 function _resolve_hcat_values(ex; keep = false, resolve = identity)
     ex isa Expr || return ex
     ex.head === :quote && return ex
-    if _is_hcat_def(ex)
+    if _is_hcat_call(ex)
         head = keep ? :hcat : GlobalRef(Base, :hcat)
         value = Expr(:call, head, Any[_resolve_hcat_values(a; resolve)
             for a in ex.args[2:end]]...)
@@ -3842,7 +3849,7 @@ end
 function _route_hcat_values(sample, det, data, glms; resolve = identity)
     generic = _ordinary_hcat_values(sample, det, data, glms)
     det = Pair{Symbol,Any}[nm => _resolve_hcat_values(rhs;
-        keep = _is_hcat_def(rhs) && nm ∉ generic, resolve) for (nm, rhs) in det]
+        keep = _is_hcat_call(rhs) && nm ∉ generic, resolve) for (nm, rhs) in det]
     sample = SampleStmt[SampleStmt(s.lhs, _resolve_hcat_values(s.rhs; resolve),
         s.broadcast, s.range, s.levels, s.matrix, s.dims, s.slices,
         s.count_columns) for s in sample]
@@ -3873,8 +3880,8 @@ end
 # The `hcat` definitions of `det` the program reads as values. GLM
 # response matrices stay design matrices (their families read them).
 function _hcat_value_reads(det, detmap, sample, data, glms,
-        simplexes::Set{Symbol}, aligned::Set{Symbol})
-    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
+        simplexes::Set{Symbol}, aligned::Set{Symbol}; is_hcat = _is_hcat_def)
+    mats = Set{Symbol}(nm for (nm, rhs) in det if is_hcat(rhs))
     for g in glms
         delete!(mats, g.matrix)
     end
