@@ -255,10 +255,10 @@ struct _ChildSnapshot{S}
     name::Symbol
     values::Tuple{Vararg{Value}}
     recipes::Tuple{Vararg{Recipe}}
-    producers::Tuple{Vararg{Tuple{Int,Tuple{Vararg{Int}}}}}
-    aliases::Tuple{Vararg{Pair{Int,Int}}}
+    producers::Tuple{Vararg{Tuple{ValueId,Tuple{Vararg{Int}}}}}
+    aliases::Tuple{Vararg{Pair{ValueId,ValueId}}}
     version::Int
-    ports::Tuple{Vararg{Pair{Symbol,Int}}}
+    ports::Tuple{Vararg{Pair{Symbol,ValueId}}}
     port_order::Tuple{Vararg{Symbol}}
     have_names::Tuple{Vararg{Symbol}}
     want_names::Tuple{Vararg{Symbol}}
@@ -285,10 +285,10 @@ end
 
 "Reconstruct a fresh `KernelSpec` from a frozen child snapshot (for planning)."
 function _kernel_reconstruct(snap::_ChildSnapshot)
-    values = Dict{Int,Value}(v.id => v for v in snap.values)
+    values = Dict{ValueId,Value}(v.id => v for v in snap.values)
     recipes = Recipe[r for r in snap.recipes]
-    producers = Dict{Int,Vector{Int}}(id => collect(idxs) for (id, idxs) in snap.producers)
-    aliases = Dict{Int,Int}(p.first => p.second for p in snap.aliases)
+    producers = Dict{ValueId,Vector{Int}}(id => collect(idxs) for (id, idxs) in snap.producers)
+    aliases = Dict{ValueId,ValueId}(p.first => p.second for p in snap.aliases)
     graph = Graph(values, recipes, producers, aliases, snap.version)
     ports = Dict{Symbol,Value}(p.first => values[p.second] for p in snap.ports)
     # `collect(Symbol, …)` (not bare `collect`) so an EMPTY boundary rebuilds as a
@@ -726,7 +726,7 @@ from the enclosing object's public `logpdf`.
 """
 function _kernel_scope_spec(spec::KernelSpec, scope::Symbol)
     graph = Graph()
-    mapped = Dict{Int,Value}()
+    mapped = Dict{ValueId,Value}()
     for id in sort!(collect(keys(spec.graph.values)))
         source = spec.graph.values[id]
         mapped[id] = value!(graph, _kernel_scoped_port(scope, source.name),

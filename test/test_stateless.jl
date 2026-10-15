@@ -4,21 +4,28 @@ using Test
 
 @testset "extending restored graph identities" begin
     RK = ReactiveKernels
-    # Restored metadata can contain IDs not yet seen by this process. Use
-    # disjoint high IDs to exercise each builder path without resetting the
-    # allocator or depending on the order of other tests.
+    # A package image keeps the identities another process allocated. Its
+    # numbers can be any this process will also count to; its namespace is its
+    # own, so a value made here never takes one of its identities.
+    imported = RK.ValueNamespace(rand(UInt))
     for build in (identity, compose)
-        id = RK._VALUE_COUNTER[] + 100
+        number = RK._VALUE_NAMESPACE[].count + 1
+        id = RK.ValueId(imported, number)
         retained = Value{Float64}(id, :retained)
-        g = Graph(Dict(id => retained), Recipe[], Dict{Int,Vector{Int}}(),
-                  Dict{Int,Int}(), 0)
+        g = Graph(Dict(id => retained), Recipe[], Dict{RK.ValueId,Vector{Int}}(),
+                  Dict{RK.ValueId,RK.ValueId}(), 0)
         extended = build(g)
         fresh = value!(extended, :fresh, Float64)
-        @test fresh.id > id
+        @test fresh.id.number == number
+        @test fresh.id != id && fresh != retained
         @test extended.values[id] === retained
         @test length(extended.values) == 2
-        @test value(:standalone, Float64).id > fresh.id
+        @test value(:standalone, Float64).id.number > fresh.id.number
     end
+    # Identity is the namespace object, never an equal-looking copy of it.
+    @test RK.ValueId(RK.ValueNamespace(imported.key), 1) != RK.ValueId(imported, 1)
+    @test RK.ValueId(imported, 1) == RK.ValueId(imported, 1)
+    @test hash(RK.ValueId(imported, 1)) == hash(RK.ValueId(imported, 1))
 end
 
 # Positional operations deliberately have no global names in lowered code.
