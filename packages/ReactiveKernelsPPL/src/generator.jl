@@ -424,10 +424,12 @@ function _pointwise_arithmetic_plates(plan::StructuralPlan, def::Expr)
 end
 
 # Conditioning selects the same declaration-density graph as a prior. Its
-# constrained value is a read-only input, with no layout entry or Jacobian.
+# constrained value is a read-only input or a graph definition, with
+# no layout entry or Jacobian.
 function _density_selection(plan, selected)
     return _with(plan;
         parameters = filter(p -> selected(p.name), plan.parameters),
+        factors = filter(p -> selected(p.name), plan.factors),
         array_parameters = filter(p -> selected(p.name), plan.array_parameters),
         vector_parameters = filter(p -> selected(p.name), plan.vector_parameters),
         plate_parameters = filter(p -> selected(p.name), plan.plate_parameters))
@@ -435,7 +437,7 @@ end
 
 function _conditioned_value_statements(plan)
     stmts = Expr[]
-    for name in sort!(collect(plan.conditioned))
+    for name in sort!(collect(_conditioned_inputs(plan)))
         push!(stmts, :($name = $(_conditioned_input(name))))
         for p in plan.array_parameters
             p.name === name || continue
@@ -1363,6 +1365,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
             p.args.broadcast ? :_ppl_pw_prior_ : :_ppl_prior_, p.name))
     end
     observed = _density_selection(plan, n -> n in plan.conditioned)
+    _factor_density_statements!(stmts, terms, observed; context = plan, pointwise = points)
     _parameter_prior_statements!(stmts, terms, observed, layout;
         prefix = :_ppl_condition_, group_scalars = false)
     for p in observed.parameters
@@ -4409,6 +4412,18 @@ function _parameter_prior_statements!(stmts, terms, plan, layout;
     return nothing
 end
 
+function _factor_density_statements!(stmts, terms, plan; context = plan, pointwise = nothing)
+    for factor in plan.factors
+        node = Symbol(:_ppl_factor_, factor.name)
+        density = _sampled_prior_expr(factor; conditioned = true,
+            float64_args = _float64_inputs(context, values(factor.args)))
+        push!(stmts, :($node::Float64 = $density))
+        push!(terms, node)
+        pointwise === nothing || push!(pointwise, factor.name => node)
+    end
+    return nothing
+end
+
 function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         gathers::Set{Tuple{Symbol,Symbol,Int}} = Set{Tuple{Symbol,Symbol,Int}}(), context = plan)
     stmts = Expr[]
@@ -4443,13 +4458,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         end
     end
     _parameter_prior_statements!(stmts, terms, plan, layout)
-    for factor in plan.factors
-        node = Symbol(:_ppl_factor_, factor.name)
-        density = _sampled_prior_expr(factor; conditioned = true,
-            float64_args = _float64_inputs(context, values(factor.args)))
-        push!(stmts, :($node::Float64 = $density))
-        push!(terms, node)
-    end
+    _factor_density_statements!(stmts, terms, plan; context)
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
     # columns (priors addressed by response label — validation pins
