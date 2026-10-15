@@ -570,6 +570,17 @@ end
     @test F._fold_assigning([1.0, 2.0]) === 5.0
     @test F._fold_tuple((1, 2.5)) === 3.5
     @test F.OwnSum.total([1.0, 2.0]) === -1.0
+
+    # A range head resolved to its binding, as `@rkppl` lowering emits `1:n`
+    # (`GlobalRef(<model module>, :(:))`), is the same iterator; a resolved
+    # head bound to another function keeps Base's `sum`.
+    folds(head) = :(sum((x[i] for i = $head(1, n)); init = 0.0))
+    generator(ex) = ex isa Expr && (ex.head === :generator || any(generator, ex.args))
+    native(ex) = ReactiveKernels._kernel_native_body(ex, F, Set{Symbol}())
+    @test generator(folds(GlobalRef(F, :(:))))
+    @test !generator(native(folds(GlobalRef(F, :(:)))))
+    @test !generator(native(folds(:(:))))
+    @test generator(native(folds(GlobalRef(F, :_fold_steps))))
 end
 
 @testset "history scan contract" begin

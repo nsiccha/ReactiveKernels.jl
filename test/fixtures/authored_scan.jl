@@ -236,6 +236,9 @@ sum(itr; init) = -1.0
 ReactiveKernels.@traceable total(x) = sum(x[i] for i in eachindex(x); init = 0.0)
 end
 
+# A range constructor that is not Base's: a fold over it keeps its call.
+_fold_steps(a, b) = a:b
+
 # A plain scan sharing a host struct and a host named tuple by `Ref`: under a
 # tracing backend both stay host values inside the retained loop, so the plan
 # helper indexes the struct and `_history_scale` loops over a host bound.
