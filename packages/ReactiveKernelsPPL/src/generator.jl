@@ -984,6 +984,13 @@ function _predictor_statements(plan::StructuralPlan)
             cell_terms = Any[]
             k = 1
             for b in shape.blocks
+                if b.kind === OffsetTerm
+                    offset = _dovar(length(formals) + 1)
+                    push!(inputs, b.column)
+                    push!(formals, offset)
+                    push!(cell_terms, offset)
+                    continue
+                end
                 c = _dovar(length(formals) + 1)
                 push!(inputs, _coef_coord(coef, k))
                 push!(formals, c)
@@ -4438,7 +4445,10 @@ function _parameter_prior_input(ps, plan, layout)
         return _affine_block_name(pred)
     end
     view = _parameter_coordinate_view([(n, 1) for n in names], layout)
-    return view === nothing ? :([$(names...)]) : view
+    # A prior only reads these scalar values. An immutable pack keeps that
+    # fact visible to ordinary Reverse; a temporary vector can obscure
+    # invariance and induce native tapes in downstream observation loops.
+    return view === nothing ? :(($(names...),)) : view
 end
 
 function _parameter_prior_statements!(stmts, terms, plan, layout;
