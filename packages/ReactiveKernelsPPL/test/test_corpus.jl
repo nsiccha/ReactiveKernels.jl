@@ -104,6 +104,8 @@ function _canon(io::IO, x, depth::Int = 0, names = nothing)
             (fs = filter(!=(:cell_broadcasts), fs))
         x isa StructuralPlan && isempty(x.factors) &&
             (fs = filter(!=(:factors), fs))
+        x isa StructuralPlan && isempty(x.cell_priors) &&
+            (fs = filter(!=(:cell_priors), fs))
         x isa VectorParameter && x.extent_expr === nothing &&
             (fs = filter(!=(:extent_expr), fs))
         # A scan seed or step without a support override keeps its golden.
@@ -212,6 +214,28 @@ end
     @test !occursin("cell_broadcasts=", sprint(_canon, plain))
     @test !isempty(nested.cell_broadcasts)
     @test occursin("cell_broadcasts={:y=>[:x]}", sprint(_canon, nested))
+
+    # A sampled seed or step in a plate-cell scan records its conditional
+    # prior root; a plan without one keeps its golden.
+    scanned = lower_rkppl(quote
+        phi ~ Normal(0, 0.7)
+        @plate for g in eachindex(y)
+            T = length(y[g])
+            @scan begin
+                h[1] ~ Normal(phi, 1)
+                for t in 2:T
+                    h[t] ~ Normal(phi * h[t - 1], 1)
+                end
+            end
+            loc[g] = h
+            y[g] .~ Normal.(loc[g], 0.8)
+        end
+    end, (:y,); conditioned = (:y,))
+    @test isempty(plain.cell_priors)
+    @test !occursin("cell_priors=", sprint(_canon, plain))
+    @test !isempty(scanned.cell_priors)
+    @test occursin("cell_priors=[" * repr(only(scanned.cell_priors)) * "]",
+        sprint(_canon, scanned))
 end
 
 @testset "corpus private binder alpha equivalence" begin
