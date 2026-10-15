@@ -1374,13 +1374,43 @@ end
 #
 # The pass is one history scan over the (step, state) cells: a cell reads the
 # previous step's K cells from the scan's own output, so no step allocates a
-# carried vector (docs/src/scan.md, "Reading earlier outputs"). Each
-# log-sum-exp is a max-shifted generator sum, which runs as an explicit loop.
+# carried vector (docs/src/scan.md, "Reading earlier outputs"). A cell folds
+# its K predecessor terms pairwise with `_hmm_logaddexp`. When one predecessor
+# dominates by more than about 37 in log space, as between well-separated
+# states, each fold step costs one `exp`; a max-shifted `log(sum(exp(...)))`
+# costs K `exp`s and a `log` per cell, whatever the separation.
 @inline _hmm_index(x, axis, i) = size(x, axis) == 1 ? 1 : i
 @inline _hmm_at(x, a, b, c) =
     x[_hmm_index(x, 1, a), _hmm_index(x, 2, b), _hmm_index(x, 3, c)]
 _hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 && size(x, 1) in (1, a) &&
     size(x, 2) in (1, b) && size(x, 3) in (1, c)
+
+# `log(exp(x) + exp(y))` with the values of `LogExpFunctions.logaddexp`,
+# non-finite inputs included. Each arm is the smooth `x + log1pexp(y - x)` with
+# the larger argument outside `log1pexp`, so ordinary reverse mode returns the
+# exact gradient (1/2, 1/2) at a finite tie; `LogExpFunctions.logaddexp` zeroes
+# the difference at every tie and returns (1, 0). Only the infinite tie, whose
+# difference is NaN, returns the shared infinity.
+@inline _hmm_logaddexp(x, y) = x >= y ?
+    (isinf(x) & (x == y) ? x : x + log1pexp(y - x)) : y + log1pexp(x - y)
+
+# The log of the weighted sum over the K predecessors of state j at `step`,
+# whose forward values start after `previous` in the history.
+@inline function _hmm_incoming(earlier, previous, log_transition, j, step, K)
+    total = earlier[previous + 1] + _hmm_at(log_transition, 1, j, step)
+    for i in 2:K
+        total = _hmm_logaddexp(total,
+            earlier[previous + i] + _hmm_at(log_transition, i, j, step))
+    end
+    total
+end
+@inline function _hmm_total(forward, offset, K)
+    total = forward[offset + 1]
+    for k in 2:K
+        total = _hmm_logaddexp(total, forward[offset + k])
+    end
+    total
+end
 
 @kernel hmm_logdensity(log_emissions, transition, initial) = begin
     K = length(initial)
@@ -1393,23 +1423,18 @@ _hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 && size(x, 1) in (1, a) &&
         throw(DimensionMismatch("transition weights must broadcast over states × states × (steps - 1)"))
     log_transition = log.(checked_transition)
     log_initial = log.(initial)
-    forward = scan(1:(T * K); init = 0, history = 0.0) do carry, cell, earlier
+    # A singleton destination axis weighs a move by its origin only, so every
+    # state of a step receives the same incoming term: the step's first cell
+    # computes it and the carry hands it to the others.
+    shared_incoming = size(checked_transition, 2) == 1
+    forward = scan(1:(T * K); init = 0.0, history = 0.0) do carry, cell, earlier
         t = (cell - 1) ÷ K + 1
         j = (cell - 1) % K + 1
-        previous = (t - 2) * K
-        shift = t == 1 ? 0.0 : maximum(earlier[previous + i] for i in 1:K)
-        incoming = t == 1 ? log_initial[j] : isfinite(shift) ?
-            shift + log(sum(exp(earlier[previous + i] - shift +
-                _hmm_at(log_transition, i, j, t - 1)) for i in 1:K; init = 0.0)) :
-            shift
-        (carry, incoming + checked_emissions[t, j])
+        incoming = t == 1 ? log_initial[j] : shared_incoming && j > 1 ? carry :
+            _hmm_incoming(earlier, (t - 2) * K, log_transition, j, t - 1, K)
+        (incoming, incoming + checked_emissions[t, j])
     end
-    final_offset = (T - 1) * K
-    final_shift = T == 0 ? 0.0 : maximum(forward[final_offset + k] for k in 1:K)
-    return T == 0 ? 0.0 : isfinite(final_shift) ?
-        final_shift + log(sum(exp(forward[final_offset + k] - final_shift)
-            for k in 1:K; init = 0.0)) :
-        final_shift
+    return T == 0 ? 0.0 : _hmm_total(forward, (T - 1) * K, K)
 end
 
 # Emission laws observe a vector (one stream) or a steps × streams matrix whose
