@@ -3001,15 +3001,10 @@ end
 # for bottom; concrete nonempty lanes keep their ordinary inferred types.
 @inline _plate_coordinate_type(::Type{T}, hint) where {T} = T
 @inline _plate_coordinate_type(::Type{Union{}}, hint) = hint
-@generated function _plate_axis_types(::Val{A}, ::Val{I}, args::T) where {A,I,T<:Tuple}
-    # Select structural argument slots directly. Recursive filtering can widen
-    # a tuple of constant Type values to Tuple{Vararg{DataType}} on Julia 1.10,
-    # leaving nested plate result inference in the differentiated runtime.
-    Expr(:tuple, (:(getfield(args, $j)) for j in 1:fieldcount(T)
-                  if !(I + j - 1 in A))...)
-end
 @inline _plate_marker_type(::Tuple{}) = Nothing
-@inline function _plate_marker_type(args::Tuple)
+# Inlining each branch of this recursive search expands the broad DataType
+# specialization exponentially before constant propagation selects a marker.
+@noinline function _plate_marker_type(args::Tuple)
     class = _static_plate_axis_class(first(args))
     class === :axis && return first(args)
     class === :not_axis && return _plate_marker_type(Base.tail(args))
@@ -3018,14 +3013,22 @@ end
     fieldcount(axes_type) > 0 ? first(args) :
         _plate_marker_type(Base.tail(args))
 end
-@inline function _plate_array_type(::Type{T}, ::Val{A}, args...) where {T,A}
-    # Preserve the structural slots of these type-only operands so known
-    # result types fold before the differentiated runtime.
-    axes_args = _plate_axis_types(Val(A), Val(1), args)
-    marker = _plate_marker_type(axes_args)
-    (marker === Nothing || marker === Any) && return Any # the emitted region validates its axis
-    axes_type = Base.promote_op(Base.Broadcast.combine_axes, axes_args...)
-    Base.promote_op(_plate_similar_output, marker, Type{T}, axes_type)
+@inline @generated function _plate_array_type(::Type{T}, ::Val{A},
+                                              args::Vararg{Type,N}) where {T,A,N}
+    # Mirror the emitted allocation: select the batched operands, infer their
+    # axes individually, and type RK's splat-free broadcast-shape fold. Inferring
+    # Base.combine_axes over a wide operand list can take minutes and gigabytes.
+    # Keep every type operand positional as well: a forwarded splat or Base's
+    # promote_op leaves runtime inference once Julia's tuple-splat limit is hit.
+    batched = Any[:(getfield(args, $j)) for j in 1:N if !(j in A)]
+    shapes = Any[:(_promote_op(axes, $arg)) for arg in batched]
+    quote
+        marker = _plate_marker_type(($(batched...),))
+        (marker === Nothing || marker === Any) && return Any # the region validates its axis
+        axes_type = _promote_op(_plate_broadcast_shape,
+                               Core.apply_type(Tuple, $(shapes...)))
+        _promote_op(_plate_similar_output, marker, Type{T}, axes_type)
+    end
 end
 
 # A cell containing another plate is lowered by the same graph compiler as a
