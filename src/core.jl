@@ -202,9 +202,18 @@ _KernelSourceFunction(f::F, runtime_f::RF, captures::C) where {F,RF,C} =
 _kernel_native_source(f) = f
 _kernel_native_source(f::_KernelSourceFunction) = f.f
 
+# The call is a forwarding shim and is never a call boundary: both generated
+# bodies declare themselves inline. `@inline` on a `@generated` definition does
+# not reach the generated code, and the call-site `@inline` of
+# `_kernel_source_call` did not inline the latest-world shim once the source
+# body was large (a scan step's log-sum-exp). `prepare_sampler` converts every
+# operation to that mode, so such a step became a call per scan step, and
+# native Enzyme reverse through it cost 2.5–3× the same kernel with the step
+# inlined (HMM forward pass, snag `rkppl-hmm-forwar-89257681`).
 @inline @generated function (f::_KernelSourceFunction{F,RF,C,M})(args::Vararg{Any,N}) where {F,RF,C,M,N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
-    M === Val{:latest_world} && return :(Base.@inline f.f($(forwarded...)))
+    M === Val{:latest_world} &&
+        return Expr(:block, Expr(:meta, :inline), :(Base.@inline f.f($(forwarded...))))
     # The query is `Core._hasmethod` on the complete signature, which inference
     # folds to a constant in the caller's world on every supported Julia.
     # `hasmethod(f.f, argtypes)` folds too, but from Julia 1.12 it first
@@ -216,6 +225,7 @@ _kernel_native_source(f::_KernelSourceFunction) = f.f
     signature = Expr(:curly, GlobalRef(Core, :Tuple),
                      :($(GlobalRef(Core, :Typeof))(f.f)), args...)
     quote
+        $(Expr(:meta, :inline))
         # The type-only query uses the caller's world without boxing active
         # argument values into a method-lookup array during ordinary AD.
         if Core._hasmethod($signature)
