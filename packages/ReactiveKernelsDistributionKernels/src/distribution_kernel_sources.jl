@@ -185,6 +185,7 @@ export bernoulli_logit_product_mixture_logdensity
 export binomial_logit_product_mixture_logdensity
 export zero_inflated_binomial_logit_product_mixture_logdensity
 export hmm_logdensity, normal_hmm_logdensity, exponential_hmm_logdensity
+export icar_logdensity
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
@@ -1454,6 +1455,30 @@ end
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
     return hmm_logdensity(log_emissions, transition, initial)
+end
+
+# Intrinsic conditional autoregression (ICAR). `phi[k]` is the value at node
+# k of an undirected graph whose edges are the pairs (node1[e], node2[e]),
+# each edge listed once. The unit-scale ICAR log density is the
+# pairwise-difference penalty -1/2 Σ_e (phi[node1[e]] - phi[node2[e]])²: the
+# Gaussian Markov random field whose precision is the graph Laplacian
+# (degrees minus adjacency). It is improper, because adding a constant to
+# every node of a connected component leaves it unchanged, so it carries no
+# normalizer. A model identifies the field with a sum-to-zero constraint or
+# through its likelihood, and scales it outside the law, as BYM2 does.
+#
+# One plate runs over the edges; each cell reads the node vector whole, so no
+# per-edge gather vector is allocated. The named total is a total-only reader,
+# so the sum fuses into the edge loop and no per-edge vector is filled.
+@kernel icar_logdensity(phi, node1, node2) = begin
+    checked_node2 = length(node2) == length(node1) ? node2 :
+        throw(DimensionMismatch("node1 and node2 must list the same number of edges"))
+    squares = plate(node1, checked_node2) do i, j
+        difference = phi[i] - phi[j]
+        difference * difference
+    end
+    total = sum(squares)
+    return -0.5 * total
 end
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""

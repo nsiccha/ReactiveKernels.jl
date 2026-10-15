@@ -134,6 +134,7 @@ const _PPL_TEST_FILES = (
     "test_whole_event_mixture.jl",
     "test_whole_event_occupancy.jl",
     "test_hidden_markov.jl",
+    "test_icar.jl",
     "test_model_level_hcat.jl",
     "test_graph_density_reactant.jl",
     "test_names.jl",

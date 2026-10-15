@@ -11791,7 +11791,8 @@ end
 # `<stem>_<slices>` (`:mvnormal_cholesky_rows`, `:dirichlet_cols`,
 # `:mvnormal_vector`, …).
 const _MV_SLICE_STEMS = (MvNormalCholesky = :mvnormal_cholesky,
-    MvNormal = :mvnormal, Dirichlet = :dirichlet, Ordered = :ordered_normal)
+    MvNormal = :mvnormal, Dirichlet = :dirichlet, Ordered = :ordered_normal,
+    ICAR = :icar)
 
 # The head of a multivariate distribution `D(args...)` / `D.(args...)`
 # (`nothing` otherwise).
@@ -11803,10 +11804,11 @@ function _mv_head(rhs)
     return h
 end
 
-# Multivariate normals also declare one vector (`b[1:K] ~ MvNormal(...)`);
-# a simplex and an ordered vector keep their unsized declarations
+# Multivariate normals also declare one vector (`b[1:K] ~ MvNormal(...)`),
+# and an ICAR field is only ever one node vector (`phi[1:N] ~ ICAR(node1,
+# node2)`); a simplex and an ordered vector keep their unsized declarations
 # (`phi ~ Dirichlet(alpha)`, `c ~ Ordered(Normal(0, 1), K)`).
-_mv_vector_head(rhs) = _mv_head(rhs) in (:MvNormalCholesky, :MvNormal)
+_mv_vector_head(rhs) = _mv_head(rhs) in (:MvNormalCholesky, :MvNormal, :ICAR)
 
 _is_slice_iterator(a) = a isa Expr && a.head === :call &&
     length(a.args) == 2 && a.args[1] in (:eachrow, :eachcol)
@@ -11928,6 +11930,22 @@ function _mv_slice_args(::Val{:Dirichlet}, what, args)
     return (arg1 = _slice_vector_arg(what, :Dirichlet, "concentration",
         args[1]),)
 end
+# An ICAR edge list: one integer node index per edge, read whole. It is
+# data (or a data-only definition), checked at binding.
+function _icar_edge_arg(what, role, a)
+    (a isa Real || a isa Bool) && _sfail("$what: the `ICAR` $role is an " *
+        "integer node vector with one entry per edge, got the scalar $(repr(a))")
+    a isa Expr || a isa Symbol || _sfail("$what: `ICAR` $role $(repr(a)) " *
+        "is not a value")
+    return a
+end
+function _mv_slice_args(::Val{:ICAR}, what, args)
+    length(args) == 2 || _sfail("$what: `ICAR` takes the two node vectors " *
+        "of the edge list, `ICAR(node1, node2)` (edge e joins node1[e] and " *
+        "node2[e]), got $(length(args)) arguments")
+    return (arg1 = _icar_edge_arg(what, "first node vector", args[1]),
+        arg2 = _icar_edge_arg(what, "second node vector", args[2]))
+end
 function _mv_slice_args(::Val{:Ordered}, what, args)
     length(args) == 2 || _sfail("$what: `Ordered` takes (element " *
         "distribution, length) — `Ordered(Normal(m, s), K)`")
@@ -11965,6 +11983,9 @@ function _lower_array_slices(lhs, dims::Vector{Any}, slices::Symbol, rhs,
             "got $(repr(rhs))" * (h isa Symbol ? " (an elementwise prior " *
             "is `$lhs[a, b] .~ $h.(…)`)" : ""))
     end
+    head === :ICAR && slices !== :vector && _sfail("$what: an `ICAR` " *
+        "field is one node vector, `$lhs[1:N] ~ ICAR(node1, node2)`; " *
+        "rows or columns of independent ICAR fields are not built yet")
     dotted = rhs.head === :.
     dotted && !(rhs.args[2] isa Expr && rhs.args[2].head === :tuple) &&
         _sfail("$what: malformed broadcast $(repr(rhs))")
@@ -12192,6 +12213,8 @@ function _parse_prior(lhs, rhs, who, arg, bound, unknown)
                                 "or `truncated(Normal(0, s), 0, Inf)`")
     fam in (:weighted, :censored, :interval_censored) &&
         _sfail("`$fam` applies to responses only ($who)")
+    fam === :ICAR && _sfail("$who: an `ICAR` field has one value per " *
+        "node; declare the nodes, `phi[1:N] ~ ICAR(node1, node2)`")
     fam in (:normal, :cauchy, :exponential, :gamma, :lognormal, :beta,
         :inverse_gamma, :student_t, :laplace, :logistic, :uniform,
         :halfnormal, :halfcauchy) &&

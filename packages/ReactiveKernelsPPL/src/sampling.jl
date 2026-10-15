@@ -176,7 +176,7 @@ _builtin_rhs_head(head::Symbol) =
          :NegativeBinomial2Log, :GammaLog, :BetaLogit,
          :HalfNormal, :HalfCauchy, :Flat, :flat, :positive, :truncated, :restricted,
          :weighted, :censored, :interval_censored, :Ordered, :Dirichlet,
-         :LKJCholesky, :MixtureModel,
+         :LKJCholesky, :MixtureModel, :ICAR,
          :Gaussian, :Bernoulli, :Poisson, :Binomial, :NegativeBinomial,
          :NegativeBinomial2, :Gamma, :Beta, :BetaBinomial2, :BetaKappa,
          :CircularVonMises, :Categorical, :CategoricalLogit, :OrderedLogistic, :Ordinal,
