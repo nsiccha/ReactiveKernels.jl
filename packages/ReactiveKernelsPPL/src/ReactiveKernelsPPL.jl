@@ -19,8 +19,7 @@ using ReactiveKernels: rk_expm_rule, rk_symmetric_eigvals_rule,
 using ReactiveKernels: _history_generator_env, _history_interval,
     _history_range_interval, _history_proves_earlier, _history_is_earlier,
     _history_is_slice, _history_lag_form, _history_foreach_read,
-    _history_statement_reads, _history_has_reads, _history_fold_closure,
-    _history_fold_order, _history_fold_reads_own
+    _history_statement_reads, _history_has_reads, _history_fold_closure
 import DataAPI
 import SpecialFunctions
 using SpecialFunctions: erfc, loggamma
