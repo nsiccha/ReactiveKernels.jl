@@ -747,12 +747,20 @@ rule is required. The native acceptance suite also replays the displayed
 authoring source in a fresh module without its producer's operation table.
 
 Compiled nested plate regions are not implemented yet: traced execution reports
-that capability gap explicitly. A cell containing another plate gives up the
-work that reads only shared values (captured or `Ref` arrays, scalars, and
-values computed from them alone) before lowering: that work runs once, in
-front of the outer loop, and the cell reads its results whole. The rest of the
-cell graph, including its inner loops, runs per outer coordinate. As for a flat
-plate's invariants, the moved work also runs when the outer domain is empty.
+that capability gap explicitly. In native execution, a cell containing another
+plate computes work that reads only shared values (captured or `Ref` arrays,
+scalars, and values computed from them alone) once before its outer loop. The
+cell reads those results whole; the rest of its graph, including inner loops,
+runs per outer coordinate.
+
+An empty native plate evaluates no cell work, including shared expressions.
+For inferable cells, pointwise readers still return a concretely typed empty
+array; total readers return the reduction identity. This applies separately at each nesting level:
+an expression written in an outer cell runs when that cell is visited, even if
+its inner plate is empty; an expression written inside the inner cell runs only
+when the inner domain has cells. Expressions authored outside a plate retain
+their ordinary evaluation. Nonempty plates retain once-per-call shared work,
+and visited cells retain ordinary bounds and domain errors.
 
 ### One cell of a plate
 
