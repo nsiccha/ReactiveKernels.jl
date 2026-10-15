@@ -12129,16 +12129,19 @@ function _threshold_normal_args(lhs::Symbol, d, what::String)
     return m, s
 end
 
-function _ordered_element_prior(lhs, d, coefuse, ctx)
+# The element prior of an ordered vector or a threshold vector: any
+# real-support family `_VECTOR_ELEMENT_FAMILIES` names, including the
+# improper `Flat()` (zero element density, the transform Jacobian only).
+function _ordered_element_prior(lhs, d, coefuse, ctx, what = "Ordered vector")
     if d isa Expr && d.head === :call && !isempty(d.args) && d.args[1] === :Normal
-        m, s = _threshold_normal_args(lhs, d, "Ordered vector")
+        m, s = _threshold_normal_args(lhs, d, what)
         return :ordered_normal, (arg1 = m, arg2 = s)
     end
     p = _lower_parameter(lhs, d, coefuse, ctx.matrices)
     family = Symbol(:ordered_, p.family)
     haskey(_VECTOR_ELEMENT_FAMILIES, family) && p.support_override === nothing ||
-        _sfail("Ordered vector $lhs: the element prior must have real " *
-            "support (Normal, Cauchy, Laplace, Logistic or StudentT)")
+        _sfail("$what $lhs: the element prior must have real support " *
+            "(Normal, Cauchy, Laplace, Logistic, StudentT or Flat)")
     return family, p.args
 end
 
@@ -12177,7 +12180,8 @@ function _lower_plain_thresholds(s, coefuse, ctx)
     haskey(coefuse, lhs) && _sfail("$lhs is a predictor coefficient and " *
         "cannot also be thresholds")
     rhs = _undot_distribution(lhs, s.rhs)
-    family, args = _ordered_element_prior(lhs, rhs, coefuse, ctx)
+    family, args = _ordered_element_prior(lhs, rhs, coefuse, ctx,
+        "Threshold vector")
     family = Symbol(replace(String(family), "ordered_" => "vector_"))
     n = only(s.dims)
     size = n isa Int ? n : _threshold_size(lhs, n,
