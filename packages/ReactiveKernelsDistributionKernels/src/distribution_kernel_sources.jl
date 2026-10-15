@@ -1353,6 +1353,8 @@ end
         zi_logits : throw(DimensionMismatch("zero-inflation logits and logits must match"))
     checked_logits = size(logits, 1) == length(observed) ?
         logits : throw(DimensionMismatch("logit rows must match observations"))
+    checked_weights = size(logits, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_logits, 2)) do k
         cells = plate(1:length(observed)) do i
             zero_inflated_binomial_logit_zi(; n = checked_trials[i, k],
@@ -1361,7 +1363,7 @@ end
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 # Hidden Markov models. The forward algorithm marginalizes the discrete state
