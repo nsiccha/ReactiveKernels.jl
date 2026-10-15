@@ -283,11 +283,10 @@ end
     @test p ≈ rp
     @test c ≈ rc
     @test prepare(_scan_renewal)(1.3, 0.7, si, 2) == ([0.7, 0.7], [0.0, 0.7])
-    # `p` reads its own history in its scan; `c` is folded after it and
-    # reads the finished `p`. Each is one retained scan.
+    # Both histories share one retained recurrence and one set of buffers.
     program = string(code_expr(prepare(_scan_renewal)))
     @test count("_scan_history_buffer", program) == 1
-    @test count(e -> e.kind === :scan, recipe_inventory(_scan_renewal)) == 2
+    @test count(e -> e.kind === :scan, recipe_inventory(_scan_renewal)) == 1
 
     backend = AutoEnzyme(; mode = Enzyme.Reverse)
     prepared = prepare_ad(prepare(_scan_renewal; want = :total), backend,
@@ -340,28 +339,19 @@ end
     @test gradient ≈ (constant_seed_total(0.8 + 1e-6) -
                       constant_seed_total(0.8 - 1e-6)) / 2e-6 rtol = 1e-6
 
-    # Capability gap: each fold reads the history of the one array it
-    # produces, so arrays reading one another's history are not built yet.
-    mutual = try
-        m = Module()
-        Core.eval(m, :(using ReactiveKernels))
-        Core.eval(m, :(@kernel _k(r, T) = begin
-            @scan begin
-                p[1] = 1.0
-                q[1] = 1.0
-                for t in 2:T
-                    p[t] = r * sum(q[s] for s in 1:(t - 1))
-                    q[t] = r * sum(p[s] for s in 1:(t - 1))
-                end
+    @kernel _scan_mutual(r, T) = begin
+        @scan begin
+            p[1] = 1.0
+            q[1] = 1.0
+            for t in 2:T
+                p[t] = r * sum(q[s] for s in 1:(t - 1))
+                q[t] = r * sum(p[s] for s in 1:(t - 1))
             end
-            return p
-        end))
-        true
-    catch err
-        (err isa LoadError ? err.error : err) isa ArgumentError || rethrow()
-        false
+        end
+        return (p, q)
     end
-    @test_broken mutual
+    expected = [1.0, 0.5, 0.75, 1.125]
+    @test prepare(_scan_mutual)(0.5, 4) == (expected, expected)
 end
 
 @testset "loop syntax refusals" begin

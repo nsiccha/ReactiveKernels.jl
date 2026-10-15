@@ -24,6 +24,22 @@ function zib_logit_reference_cell(y, n, l, z)
     top == -Inf ? top : top + log(exp(a - top) + exp(b - top))
 end
 
+@testset "zero-inflated Binomial product mixture streams component scores" begin
+    law = prepare(zero_inflated_binomial_logit_product_mixture_logdensity)
+    for (positions, components) in ((4, 6), (9, 13), (0, 6))
+        counts = mod.(collect(1:positions), 5)
+        trials = fill(4, positions, components)
+        logits = [sin(i + 2k) for i in 1:positions, k in 1:components]
+        zi_logits = [cos(2i - k) for i in 1:positions, k in 1:components]
+        weights = fill(1 / components, components)
+        expected = product_mixture_logit_reference(zib_logit_reference_cell,
+            counts, (trials, logits, zi_logits), weights)
+        @test law(counts, trials, logits, zi_logits, weights) ≈ Float64(expected) atol=1e-14 rtol=1e-13
+        @test law_allocated(law, counts, trials, logits, zi_logits, weights) == 0
+    end
+    @test law([0], zeros(Int, 1, 0), zeros(1, 0), zeros(1, 0), Float64[]) == -Inf
+end
+
 @testset "zero-inflated Binomial whole-event law keeps both log-odds tails" begin
     law = prepare(zero_inflated_binomial_logit_product_mixture_logdensity)
     weights = [0.7, 0.3]
