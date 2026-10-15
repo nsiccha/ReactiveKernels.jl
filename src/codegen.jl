@@ -32,10 +32,26 @@ function _class_name_values(g::Graph)
     chosen
 end
 
+# A value's name can be a `gensym` minted by another process: a package image
+# keeps the names its kernels were authored with (`##plate_argument#6015`),
+# and each process counts its `gensym`s from the start again. Lowering mints
+# its scratch locals with `gensym` (so does the `@simd` it expands), and every
+# `gensym` begins with `##`, so a value bound under such a name could share
+# one variable with a fresh scratch local: the later assignment silently
+# replaces the value (snag `in-a-fresh-julia-19d79835`, where an outer plate's
+# argument replaced an inner plate's hoisted `1:length(observed)`). A value is
+# therefore never bound under a name that begins with `##`; such a name keeps
+# one leading `#` (`#plate_argument#6015`).
+function _value_local_name(name::Symbol)
+    text = String(name)
+    startswith(text, "##") ? Symbol('#', lstrip(text, '#')) : name
+end
+
 # Assign a globally unique source-variable Symbol to every canonical value in
 # the plan. User names are diagnostic hints, not binding authority: they may
-# collide with one another, with a generated disambiguation such as `a_12`, or
-# with the hidden `__ops__` argument.
+# collide with one another, with a generated disambiguation such as `a_12`,
+# with the hidden `__ops__` argument, or with a scratch local the lowering
+# mints (`_value_local_name`).
 function _varnames(p::Plan)
     g = p.graph
     ids = Int[]
@@ -47,7 +63,7 @@ function _varnames(p::Plan)
     out = Dict{Int,Symbol}()
     named = _class_name_values(g)
     for id in ids
-        base = g.values[get(named, id, id)].name
+        base = _value_local_name(g.values[get(named, id, id)].name)
         candidate = base
         suffix = 0
         while candidate in used
