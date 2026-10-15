@@ -375,13 +375,14 @@ end
     end
 end
 
-# The per-observation spelling of the same regression reads the same rule:
+# The per-observation spelling of the same regression uses ordinary AD:
 # a Gaussian response located at `M * v` (inline or named) or
 # `alpha .+ M * v` (bound data matrix, declared coefficient vector,
 # sampled intercept; one shared scale)
-# has the NormalIDGLM density. Other locations keep the per-cell plate, and a
+# has a residual-and-dot total. The explicit NormalIDGLM object retains the
+# authored rule. Other locations keep the per-cell plate, and a
 # non-positive scale keeps the plate cell's `-Inf`.
-@testset "per-observation Normal over a design product reads the GLM rule" begin
+@testset "per-observation Normal over a design product uses ordinary AD" begin
     n = 9
     X, y = _gv_X(n), _gv_y(n)
     g = [1, 2, 3, 1, 2, 3, 1, 2, 3]
@@ -407,16 +408,25 @@ end
         beta[axes(X, 2)] .~ Normal.(0, 10)
         y .~ Normal.(X * beta, s)
     end
+    flat = @rkppl begin
+        beta[axes(X, 2)] .~ Flat()
+        sigma ~ restricted(Flat(), 0, Inf)
+        mu = X * beta
+        y .~ Normal.(mu, sigma)
+    end
     cases = (
         (product(; X) | (; y), (; X, y), nt -> X * nt.beta, nt -> nt.sigma),
         (named_product(; X) | (; y), (; X, y), nt -> X * nt.beta, nt -> nt.sigma),
         (intercept(; X) | (; y), (; X, y), nt -> nt.alpha .+ X * nt.beta, nt -> nt.sigma),
         (fixed_scale(; X, s = 2) | (; y), (; X, y), nt -> X * nt.beta, nt -> 2.0),
+        (flat(; X) | (; y), (; X, y), nt -> X * nt.beta, nt -> nt.sigma),
     )
     for (plan, data, mean, scale) in cases
         oracle = nt -> logpdf.(Normal.(mean(nt), scale(nt)), y)
         built = _gv_check(plan, data, nt -> sum(oracle(nt)))
-        @test occursin("normal_id_glm_lpdf(", sprint(print, kernel_expr(plan, built.layout)))
+        code = sprint(print, kernel_expr(plan, built.layout))
+        @test !occursin("normal_id_glm_lpdf(", code)
+        @test occursin("_ppl_normal_residual_", code)
         u = _gv_u(built)
         nt = constrain(built.layout, u)
         @test Base.invokelatest(prepare_query(built, plan, :pointwise), u).y ≈ oracle(nt)

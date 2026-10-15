@@ -3275,7 +3275,8 @@ end
 # The NATIVE body of authored source (a recipe, a plate cell, a scan step, a
 # `@traceable` method) with each generator fold over a data-length iterator,
 # `sum(term for i in iter [if condition]; init = x)` with `iter` matching
-# `_kernel_range_iterator`, spelled as its explicit-accumulator loop:
+# `_kernel_native_range_iterator` (`_kernel_range_iterator`, or the same call
+# with a resolved head), spelled as its explicit-accumulator loop:
 #
 #     let it = iter, acc = x
 #         for i in it
@@ -3310,6 +3311,34 @@ function _kernel_native_body(ex, mod, names)
         _kernel_native_folds(ex, mod, shadowed), mod, shadowed))
 end
 
+# Julia's untyped vector and concatenation literals as ordinary Base calls.
+# This is a shallow syntax conversion: callers retain their own scope walk.
+# In particular, a vector of arrays keeps its entries; it is not a vcat.
+function _array_literal_call(ex::Expr)
+    args = ex.args
+    ex.head === :vect && return Expr(:call, GlobalRef(Base, :vect), args...)
+    if ex.head === :hcat
+        return Expr(:call, GlobalRef(Base, :hcat), args...)
+    elseif ex.head === :vcat
+        any(arg -> arg isa Expr && arg.head === :row, args) ||
+            return Expr(:call, GlobalRef(Base, :vcat), args...)
+        # `[a b; c d]` is `hvcat((2, 2), a, b, c, d)`: one count per block row.
+        rows = Int[arg isa Expr && arg.head === :row ? length(arg.args) : 1
+                   for arg in args]
+        operands = Any[]
+        for arg in args
+            arg isa Expr && arg.head === :row ? append!(operands, arg.args) :
+                push!(operands, arg)
+        end
+        # A splatted block has no static row count; keep Julia's lowering.
+        any(arg -> arg isa Expr && arg.head === :..., operands) &&
+            return ex
+        return Expr(:call, GlobalRef(Base, :hvcat),
+                    Expr(:tuple, rows...), operands...)
+    end
+    return ex
+end
+
 # The NATIVE body's resolved calls: Base's `exp` selects the owned matrix
 # primitive for Matrix{Float64}, preserving Base for all other inputs. Base's
 # concatenations are lowered in the same binding-aware walk:
@@ -3330,26 +3359,9 @@ end
 function _kernel_native_calls(ex, mod, shadowed::Set{Symbol})
     ex isa Expr || return ex
     ex.head in (:quote, :inert, :meta, :macrocall) && return ex
+    ex.head in (:hcat, :vcat) && (ex = _array_literal_call(ex))
     args = Any[_kernel_native_calls(arg, mod, shadowed) for arg in ex.args]
-    if ex.head === :hcat
-        return Expr(:call, GlobalRef(@__MODULE__, :_native_hcat), args...)
-    elseif ex.head === :vcat
-        any(arg -> arg isa Expr && arg.head === :row, args) ||
-            return Expr(:call, GlobalRef(@__MODULE__, :_native_vcat), args...)
-        # `[a b; c d]` is `hvcat((2, 2), a, b, c, d)`: one count per block row.
-        rows = Int[arg isa Expr && arg.head === :row ? length(arg.args) : 1
-                   for arg in args]
-        operands = Any[]
-        for arg in args
-            arg isa Expr && arg.head === :row ? append!(operands, arg.args) :
-                push!(operands, arg)
-        end
-        # A splatted block has no static row count; keep Julia's lowering.
-        any(arg -> arg isa Expr && arg.head === :..., operands) &&
-            return Expr(ex.head, args...)
-        return Expr(:call, GlobalRef(@__MODULE__, :_native_hvcat),
-                    Expr(:tuple, rows...), operands...)
-    elseif ex.head === :call && !isempty(args) &&
+    if ex.head === :call && !isempty(args) &&
            !any(arg -> arg isa Expr && arg.head === :parameters, args)
         callee = ex.args[1]
         replacement = _native_callee_shadowed(callee, shadowed) ? nothing :
@@ -3422,11 +3434,28 @@ function _kernel_native_folds(ex, mod, shadowed::Set{Symbol})
     _kernel_native_folds_walk(ex)
 end
 
+# A data-length iterator of the native fold rewrite: `_kernel_range_iterator`'s
+# syntax, or the same call with a resolved head, a `GlobalRef` whose binding is
+# Base's `:`, `eachindex`, `axes`, `range` or `OneTo`.  `@rkppl` lowering
+# resolves every call head in the model module, so its `1:P` arrives as
+# `GlobalRef(<model module>, :(:))(1, P)`; reading that binding keeps the
+# rewrite, and its loop, for generated model bodies too.  Any other binding of
+# those names keeps its own call.
+_kernel_native_range_iterator(iter) = _kernel_range_iterator(iter) ||
+    (iter isa Expr && iter.head === :call && !isempty(iter.args) &&
+     _kernel_base_range_head(iter.args[1]))
+_kernel_base_range_head(head) = false
+function _kernel_base_range_head(head::GlobalRef)
+    isdefined(head.mod, head.name) || return false
+    f = getglobal(head.mod, head.name)
+    any(g -> f === g, (Base.:(:), Base.eachindex, Base.axes, Base.range, Base.OneTo))
+end
+
 function _kernel_native_folds_walk(ex)
     ex isa Expr || return ex
     ex.head in (:quote, :inert, :meta, :macrocall) && return ex
     parts = _kernel_generator_sum_parts(ex)
-    if parts !== nothing && _kernel_range_iterator(parts.iterator) &&
+    if parts !== nothing && _kernel_native_range_iterator(parts.iterator) &&
        !_kernel_fold_term_escapes(parts.term) &&
        (parts.condition === nothing || !_kernel_fold_term_escapes(parts.condition))
         iterator = gensym(:native_sum_iterator)
@@ -5728,6 +5757,12 @@ the last argument is that whole vector, with entries not written yet at
 `zero(eltype(leading))`. A recurrence seeded with `a[1:m]` thus reads its seeds
 and earlier steps from one vector. Native only; the Reactant lowering refuses
 it.
+
+With `history = (a = leading_a, b = leading_b, ...)`, each named column uses
+the number or vector semantics above independently. The last argument and
+the scan result are named tuples of column vectors; the step returns a named
+tuple of scalar outputs with those same names. Each vector seed contributes
+its own prefix, and each column retains its seed's element type. Native only.
 
 It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
 loop under Reactant — so a natural sequential recurrence lowers without unrolling

@@ -710,6 +710,8 @@ function _value_axes(plan::StructuralPlan, ex,
     head === :call && !isempty(ex.args) || return nothing
     fn = ex.args[1]
     args = ex.args[2:end]
+    fn === GlobalRef(Base, :vect) &&
+        !any(a -> Meta.isexpr(a, :...), args) && return Any[length(args)]
     if fn isa GlobalRef && getglobal(fn.mod, fn.name) === Base.hcat
         return _hcat_axes(Any[ax(a) for a in args])
     end
