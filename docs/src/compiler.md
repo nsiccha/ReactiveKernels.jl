@@ -436,6 +436,13 @@ or a bound-only cell value that the pass has already evaluated per lane.
 
 A lane-invariant condition selects its arm without splitting.
 
+An arm with its own graph (a plain arm expression, authored as a cell of its
+own as described below) becomes that graph's recipes in its plate, as in the
+native shared-condition lowering. Its work over shared plate arguments
+therefore runs once per call, above the lane loop, and only when some lane
+takes the arm. An arm without a graph, or one reading no lane value, runs as
+its closure on each of its lanes.
+
 The prepared program contains no branch for that condition, so no backend
 receives one:
 
@@ -573,9 +580,14 @@ plated dependency are emitted once above the traversal.
 
 An authored cell is split into recipes before planning. Besides its
 statements, each maximal subexpression that reads only shared values (closure
-captures, `Ref` operands and cell locals computed from them) becomes a recipe
-of its own. In `f(t, exp(log_k))`, `exp(log_k)` therefore runs once, above the
-traversal, exactly as in `k = exp(log_k); f(t, k)`. Only positions that Julia
+captures, `Ref` operands, plate arguments whose port is annotated with a
+`Number` type, and cell locals computed from them) becomes a recipe of its own.
+In `f(t, exp(log_k))`, `exp(log_k)` therefore runs once, above the traversal,
+exactly as in `k = exp(log_k); f(t, k)`. Such an annotated argument stays a
+zipped operand; its split-off recipe runs once because a number has no plate
+dimension. An unannotated plate argument is not known to be a number when the
+cell is split: annotate its port, or name the value as a cell local, which the
+traversal runs once when the argument is a number. Only positions that Julia
 evaluates whenever the cell runs are split: call and broadcast arguments, field
 reads, indexing and tuple elements. A branch arm, loop, generator term,
 closure or macro call keeps its own evaluation, as do the arguments of a

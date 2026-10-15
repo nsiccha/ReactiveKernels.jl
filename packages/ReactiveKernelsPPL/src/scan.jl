@@ -25,6 +25,8 @@
 #           #   x[t] = x[t-1] + d[t]      #   `d[t]` reads the value written above
 #       end
 #   end
+# A sampled seed or step takes any scalar prior a declaration takes, including
+# `Flat()`, half priors and `truncated` / `restricted` with fixed bounds.
 # Statements run in order, as in a Julia loop body: a step reads a carried
 # array's backward lag `a[t-k]` (1 ≤ k ≤ m; a literal or bound integer), its current value `a[t]`
 # once an earlier step of the same iteration wrote it, and locals defined by
@@ -38,21 +40,28 @@
 
 _scan_fail(msg) = _sfail("@scan: " * msg)
 
-# `Dist(args…)` → (internal family symbol, positional argument expressions).
-# Reuses the surface's Distributions.jl family table and positional-arg peeler.
+# `Dist(args…)` → (internal family symbol, positional argument expressions,
+# support override). `Flat()`, `HalfNormal(s)` / `HalfCauchy(s)` and the
+# `truncated(D, lo, hi)` / `restricted(D, lo, hi)` wrappers read exactly as a
+# scalar declaration's prior (`_parse_prior`). Arguments stay value
+# expressions, so they may read lags, locals and the loop index; bounds stay
+# expressions too, and the layout requires them fixed across steps.
 function _scan_parse_dist(call, what)
-    (call isa Expr && call.head === :call && !isempty(call.args)) ||
-        _scan_fail("$what needs a distribution call, got $(repr(call))")
-    fam = call.args[1]
-    fam in (:normal, :cauchy, :exponential, :gamma, :lognormal, :beta,
-        :inverse_gamma) && _scan_fail(
-        "$what: use Distributions.jl constructors (`Normal`, not `$(fam)`)")
-    haskey(_PARAM_FAMILIES, fam) || _scan_fail(
-        "$what: unknown distribution `$(repr(fam))` (admitted: Normal, " *
-        "Cauchy, Exponential, Gamma, LogNormal, Beta, InverseGamma)")
-    return _PARAM_FAMILIES[fam], collect(Any,
-        _distribution_args(fam, _plain_args(call, "`$(fam)`")))
+    p = _parse_prior(:_ppl_scan_draw, call, "@scan: $what", identity,
+        _scan_bound, fam -> _scan_fail("$what: unknown distribution " *
+            "`$(repr(fam))` (admitted: Normal, Cauchy, Exponential, Gamma, " *
+            "LogNormal, Beta, InverseGamma, StudentT, TDist, Laplace, " *
+            "Logistic, Uniform, Weibull, HalfNormal, HalfCauchy, Flat, " *
+            "truncated, restricted)"))
+    return p.family, collect(Any, values(p.args)), p.support_override
 end
+
+# A `truncated` / `restricted` bound: an infinity literal is `±Inf`; any other
+# bound stays a value expression, which the layout requires to be fixed
+# across steps.
+_scan_bound(b) = b === :Inf ? Inf : b isa Real ? Float64(b) :
+    Meta.isexpr(b, :call, 2) && b.args[2] === :Inf && b.args[1] in (:-, :+) ?
+        (b.args[1] === :- ? -Inf : Inf) : b
 
 """
     parse_scan_block(block; label = :scan) -> ScanSpec
@@ -142,11 +151,11 @@ function _parse_scan_setup(setups_ast)
             "setup fills of `$(nm)` must be contiguous `$(nm)[1], $(nm)[2], …`; " *
             "expected index $(want), got $(idx)")
         if sampled
-            fam, args = _scan_parse_dist(s.args[3], "setup `$(nm)[$(idx)]`")
-            for a in args
+            fam, args, support = _scan_parse_dist(s.args[3], "setup `$(nm)[$(idx)]`")
+            for a in (args..., _support_args(support)...)
                 _scan_check_seed_reads(a, carried, next, "setup `$(nm)[$(idx)]`")
             end
-            push!(setup, ScanSetup(nm, idx, :sample, fam, args, nothing))
+            push!(setup, ScanSetup(nm, idx, :sample, fam, args, nothing, support))
         else
             _scan_check_seed_reads(s.args[2], carried, next,
                 "setup `$(nm)[$(idx)]`")
@@ -212,11 +221,11 @@ function _parse_scan_step(s, states, loopvar)
     if s isa Expr && s.head === :call && length(s.args) == 3 && s.args[1] === :~
         lhs = s.args[2]
         target, indexed = _scan_step_lhs(lhs, states, loopvar, "`~`")
-        fam, args = _scan_parse_dist(s.args[3], "step `$(_scan_lhs_show(lhs))`")
-        for a in args
+        fam, args, support = _scan_parse_dist(s.args[3], "step `$(_scan_lhs_show(lhs))`")
+        for a in (args..., _support_args(support)...)
             _scan_check_reads(a, states, loopvar)
         end
-        return ScanStep(:sample, target, indexed, fam, args, nothing)
+        return ScanStep(:sample, target, indexed, fam, args, nothing, support)
     elseif s isa Expr && s.head === :(=) && length(s.args) == 2
         lhs = s.args[1]
         target, indexed = _scan_step_lhs(lhs, states, loopvar, "`=`")
@@ -293,8 +302,7 @@ function _scan_check_order(step, states, loopvar)
     defined = Set{Symbol}()
     written = Set{Symbol}()
     for st in step
-        reads = st.kind === :sample ? st.args : Any[st.expr]
-        for r in reads
+        for r in _scan_reads(st)
             _scan_check_defined(r, states, loopvar, locals, defined, written)
         end
         if st.indexed
@@ -378,14 +386,8 @@ function _scan_lags(step, states, loopvar)
             end
         end
     end
-    for st in step
-        if st.kind === :sample
-            for a in st.args
-                walk(a)
-            end
-        else
-            walk(st.expr)
-        end
+    for st in step, a in _scan_reads(st)
+        walk(a)
     end
     return lags
 end
@@ -430,6 +432,7 @@ function _resolve_scan(plan::StructuralPlan, s::ScanSpec)
         return Expr(ex.head, map(resolve, ex.args)...)
     end
     step = [ScanStep(st.kind, st.target, st.indexed, st.family,
-        st.args === nothing ? nothing : map(resolve, st.args), resolve(st.expr)) for st in s.step]
+        st.args === nothing ? nothing : map(resolve, st.args), resolve(st.expr),
+        st.support) for st in s.step]
     return ScanSpec(s.states, s.loopvar, s.lo, s.hi, s.setup, step, s.maxlag, s.label)
 end

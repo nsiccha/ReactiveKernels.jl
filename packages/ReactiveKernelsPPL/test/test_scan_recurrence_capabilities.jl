@@ -156,6 +156,150 @@ end
     end
 end
 
+# Seeds and steps take every scalar prior a declaration takes: `Flat()`, half
+# priors, and `restricted` / `truncated` with bounds fixed across steps.
+# `:walk` is a bounded random walk beside a flat-seeded sum-to-zero state
+# (tuple carry), `:centered` a single truncated state whose upper bound is
+# sampled, `:innovation` a one-sided truncated innovation.
+function _scan_cap_bounded(n, kind)
+    data = Dict{Symbol,Any}(:y => [0.3sin(t) + 0.5 for t in 1:n], :T => n)
+    program = if kind === :walk
+        data[:lo], data[:hi] = -0.4, 1.3
+        quote
+            s ~ restricted(Normal(0, 1), 0, Inf)
+            @scan begin
+                h[1] ~ restricted(Flat(), lo, hi)
+                h[2] ~ restricted(Normal(h[1], s), lo, hi)
+                g[1] ~ Flat()
+                g[2] ~ Flat()
+                for t in 3:T
+                    h[t] ~ restricted(Normal(h[t - 1], s), lo, hi)
+                    g[t] ~ Normal(-(g[t - 1] + g[t - 2]), s)
+                end
+            end
+            y .~ Normal.(h .+ g, 1.0)
+        end
+    elseif kind === :centered
+        quote
+            phi ~ Normal(0, 1)
+            ub ~ restricted(Normal(3, 1), 1, Inf)
+            @scan begin
+                h[1] ~ HalfNormal(2)
+                for t in 2:T
+                    h[t] ~ truncated(Normal(phi * h[t - 1], 1), 0, ub)
+                end
+            end
+            y .~ Normal.(h, 1.0)
+        end
+    else
+        data[:lo] = -0.5
+        quote
+            phi ~ Normal(0, 1)
+            sd ~ HalfNormal(1)
+            @scan begin
+                h[1] ~ HalfCauchy(1)
+                for t in 2:T
+                    e ~ truncated(Normal(0, sd), lo, Inf)
+                    h[t] = phi * h[t - 1] + e
+                end
+            end
+            y .~ Normal.(h, 1.0)
+        end
+    end
+    f = _scan_cap_sampler(program, data)
+    entry(name) = only(e for e in f.built.layout.entries if e.name === name)
+    ze = only(e for e in f.built.layout.entries if e.kind === :scan)
+    y = data[:y]
+    interval(a, lo, hi) = lo + (hi - lo) / (1 + exp(-a)),
+        log(hi - lo) - log1p(exp(-a)) - log1p(exp(a))
+    function oracle(u; jacobian = false)
+        z = u[ze.offset:(ze.offset + ze.size - 1)]
+        lp, jac = 0.0, 0.0
+        if kind === :walk
+            lo, hi, m = data[:lo], data[:hi], n - 2
+            rs = u[entry(:s).offset]
+            s = exp(rs)
+            lp += logpdf(Normal(), s)
+            jac += rs
+            h, g = zeros(n), zeros(n)
+            for t in 1:n
+                a = t <= 2 ? z[t] : z[4 + t - 2]
+                h[t], j = interval(a, lo, hi)
+                jac += j
+                t == 1 || (lp += logpdf(Normal(h[t - 1], s), h[t]))
+                g[t] = t <= 2 ? z[2 + t] : z[4 + m + t - 2]
+                t <= 2 || (lp += logpdf(Normal(-(g[t - 1] + g[t - 2]), s), g[t]))
+                lp += logpdf(Normal(h[t] + g[t], 1), y[t])
+            end
+        elseif kind === :centered
+            phi, rub = u[entry(:phi).offset], u[entry(:ub).offset]
+            ub = 1 + exp(rub)
+            lp += logpdf(Normal(), phi) + logpdf(Normal(3, 1), ub)
+            jac += rub
+            h = exp(z[1])
+            lp += logpdf(truncated(Normal(0, 2), 0, Inf), h)
+            jac += z[1]
+            lp += logpdf(Normal(h, 1), y[1])
+            for t in 2:n
+                next, j = interval(z[t], 0.0, ub)
+                lp += logpdf(truncated(Normal(phi * h, 1), 0, ub), next)
+                jac += j
+                h = next
+                lp += logpdf(Normal(h, 1), y[t])
+            end
+        else
+            phi, rsd = u[entry(:phi).offset], u[entry(:sd).offset]
+            sd = exp(rsd)
+            lp += logpdf(Normal(), phi) + logpdf(truncated(Normal(), 0, Inf), sd)
+            jac += rsd
+            h = exp(z[1])
+            lp += logpdf(truncated(Cauchy(), 0, Inf), h)
+            jac += z[1]
+            lp += logpdf(Normal(h, 1), y[1])
+            for t in 2:n
+                e = data[:lo] + exp(z[t])
+                lp += logpdf(truncated(Normal(0, sd), data[:lo], Inf), e)
+                jac += z[t]
+                h = phi * h + e
+                lp += logpdf(Normal(h, 1), y[t])
+            end
+        end
+        return jacobian ? jac : lp + jac
+    end
+    return f, oracle, data
+end
+
+@testset "scan capabilities: bounded and improper seed and step priors" begin
+    for kind in (:walk, :centered, :innovation), n in (kind === :walk ? 2 : 1, 5)
+        f, oracle, data = _scan_cap_bounded(n, kind)
+        snapshot = deepcopy(data)
+        _scan_cap_check(f, oracle)
+        @test logjac(f.built.layout, f.u) ≈ oracle(f.u; jacobian = true) rtol=1e-12
+        draws = constrain(f.built.layout, f.u)
+        @test unconstrain(f.built.layout, draws) ≈ f.u
+        z = draws[only(e.name for e in f.built.layout.entries if e.kind === :scan)]
+        if kind === :walk
+            @test all(data[:lo] .< z[[1, 2, (5:(n + 2))...]] .< data[:hi])
+        elseif kind === :centered
+            @test all(0 .< z[2:end] .< draws.ub)
+        else
+            @test all(z[2:end] .> data[:lo])
+        end
+        @test data == snapshot
+    end
+    # refused: `truncated` divides by the base mass inside the bounds, which an
+    # improper `Flat()` lacks; `restricted(Flat(), lo, hi)` is the flat kernel.
+    @test_throws SurfaceLoweringError lower_rkppl(quote
+        @scan begin
+            h[1] ~ truncated(Flat(), 0, 1)
+            for t in 2:T
+                h[t] ~ Normal(h[t - 1], 1)
+            end
+        end
+        y .~ Normal.(h, 1.0)
+    end, (:y, :T); conditioned = (:y,))
+end
+
 function _scan_cap_data_model(n, kind)
     program = if kind === :arma
         quote

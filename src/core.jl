@@ -1245,13 +1245,37 @@ end
 _KernelBranchCall(::Val{CI}, ::Val{TI}, ::Val{EI}, ::Val{Names}, condition::C,
                   then_arm::T, else_arm::E) where {CI,TI,EI,Names,C,T,E} =
     _KernelBranchCall{CI,TI,EI,Names,C,T,E}(condition, then_arm, else_arm)
-@inline @generated function (b::_KernelBranchCall{CI,TI,EI})(args::Vararg{Any,N}) where {CI,TI,EI,N}
-    condition = Any[:(getfield(args, $i)) for i in CI]
+# The body of a `_KernelBranchCall` over the arguments at `P`. A native `Bool`
+# condition takes one arm with the ternary `_recurrence_branch` would apply,
+# and an arm that is itself a rebuilt branch is expanded in place rather than
+# entered through this generated method again: Julia 1.10's inference widens a
+# recursive call of one method with a different signature, so nested rebuilt
+# branches would otherwise make the whole cell infer `Any` (and native Reverse
+# then meets a dynamic call). Any other condition (a traced one) keeps
+# `_recurrence_branch`, a backend's lazy conditional region.
+function _branch_call_body(b, @nospecialize(B), P, path)
+    CI, TI, EI = B.parameters[1], B.parameters[2], B.parameters[3]
+    T, E = fieldtype(B, :then_arm), fieldtype(B, :else_arm)
+    c = Symbol("##branch_condition#", path)
+    read(positions) = Any[:(getfield(args, $(P[i]))) for i in positions]
+    then_arm, else_arm = :(getfield($b, :then_arm)), :(getfield($b, :else_arm))
+    arms = :(_recurrence_branch($c, _KernelArm{$TI,$T}($then_arm),
+        _KernelArm{$EI,$E}($else_arm), ($(read(eachindex(P))...),)))
     quote
-        _recurrence_branch(getfield(b, :condition)($(condition...)),
-            _KernelArm{$TI,typeof(getfield(b, :then_arm))}(getfield(b, :then_arm)),
-            _KernelArm{$EI,typeof(getfield(b, :else_arm))}(getfield(b, :else_arm)), args)
+        $c = getfield($b, :condition)($(read(CI)...))
+        $c isa Bool ? ($c ? $(_branch_arm_body(then_arm, T, Tuple(P[i] for i in TI), path * "t")) :
+                            $(_branch_arm_body(else_arm, E, Tuple(P[i] for i in EI), path * "e"))) :
+            $arms
     end
+end
+function _branch_arm_body(arm, @nospecialize(A), P, path)
+    if A <: _KernelBranch && fieldtype(A, :call) <: _KernelBranchCall
+        return _branch_call_body(:(getfield($arm, :call)), fieldtype(A, :call), P, path)
+    end
+    :(Base.@inline $arm($((:(getfield(args, $i)) for i in P)...)))
+end
+@inline @generated function (b::_KernelBranchCall{CI,TI,EI})(args::Vararg{Any,N}) where {CI,TI,EI,N}
+    _branch_call_body(:b, b, Tuple(1:N), "")
 end
 
 """
@@ -1567,6 +1591,12 @@ end
 @inline _plate_cells(cells::CartesianIndices{1}) =
     Base.Generator(CartesianIndex, only(cells.indices))
 @inline _plate_cells(cells::CartesianIndices) = cells
+# The `@simd` iteration space of a pure total-only plate (see
+# `_lower_authored_plate_cells_native!`): one axis is its own indexable range,
+# several are their `CartesianIndices`. The loop body rebuilds the cell index
+# with `CartesianIndex`, which accepts either element.
+@inline _plate_simd_cells(axes::Tuple{Any}) = only(axes)
+@inline _plate_simd_cells(axes::Tuple) = CartesianIndices(axes)
 
 # The cell positions whose gather index `first_index + position - 1` lies in
 # `source`'s range, as `lo:hi` within `1:n` (empty when none do).
