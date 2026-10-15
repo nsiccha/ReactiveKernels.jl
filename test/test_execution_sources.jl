@@ -2,6 +2,25 @@ module ExecutionSourceTests
 using ReactiveKernels, Enzyme, Test
 const RK = ReactiveKernels
 
+@testset "equivalent graphs disambiguate locals independently of value IDs" begin
+    kernels = map((0, 7)) do padding
+        graph = Graph()
+        for i in 1:padding
+            value!(graph, Symbol(:unused, i), Float64)
+        end
+        ports = map(name -> value!(graph, name, Float64), (:a, :a, :a_2, :__ops__))
+        output = value!(graph, :a, Float64)
+        add!(graph, ports => output, (x, y, z, w) -> 1000x + 100y + 10z + w)
+        prepare(graph; have=ports, want=output)
+    end
+    @test code_expr(kernels[1]) == code_expr(kernels[2])
+    @test typeof(kernels[1].f) === typeof(kernels[2].f)
+    for kernel in kernels
+        @test kernel(1.0, 2.0, 3.0, 4.0) == 1234.0
+        @test kernel(4.0, 3.0, 2.0, 1.0) == 4321.0
+    end
+end
+
 @testset "execution shares code while preserving definition provenance" begin
     mod = Module(gensym(:ExecutionSource))
     Core.eval(mod, :(using ReactiveKernels; shift(x) = x + 1.0))

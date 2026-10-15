@@ -62,13 +62,16 @@ function _varnames(p::Plan)
     used = Set{Symbol}((_OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG))
     out = Dict{Int,Symbol}()
     named = _class_name_values(g)
-    for id in ids
+    # Plan order is stable across equivalent graphs; graph IDs are not. Use
+    # that order to disambiguate locals without changing compilation identity
+    # whenever a composed child receives fresh value IDs.
+    for (position, id) in enumerate(ids)
         base = _value_local_name(g.values[get(named, id, id)].name)
         candidate = base
         suffix = 0
         while candidate in used
-            candidate = suffix == 0 ? Symbol(base, :_, id) :
-                        Symbol(base, :_, id, :_, suffix)
+            candidate = suffix == 0 ? Symbol(base, :_, position) :
+                        Symbol(base, :_, position, :_, suffix)
             suffix += 1
         end
         out[id] = candidate
@@ -5222,10 +5225,9 @@ struct PreparedKernel{F,O,IN,OUT,RR,S}
     lowered_recipes::RR
 end
 
-# Nearly every preparation or rebinding assembles a `PreparedKernel` of a new
-# concrete type (its compiled body is new). Assemble it without compiling the
-# struct's constructor for that type; calls on the prepared kernel still
-# dispatch on its exact type.
+# Assemble new prepared types without compiling a constructor for each one;
+# equivalent generated bodies and operation types can reuse their existing
+# specializations. Calls still dispatch on the exact prepared type.
 Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
@@ -6631,7 +6633,7 @@ function _readable_substitute(ex, subst::AbstractDict)
 end
 
 # Whether `value` is the program variable codegen made of the authored `name`
-# to avoid a collision (`_varnames`: `name_<id>` or `name_<id>_<k>`). Such a
+# to avoid a collision (`_varnames`: `name_<position>` or `name_<position>_<k>`). Such a
 # name stays an explicit binding, so the authored spelling remains visible.
 _readable_collision_rename(name::Symbol, value) =
     value isa Symbol &&

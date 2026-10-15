@@ -268,6 +268,8 @@ or boxed lexical cells retain Julia's native closure path. Private generated
 names in the derivative operand pack are canonicalized in that actual pack;
 the operands and their positional reads are unchanged. Construction, planning,
 and preparation still perform work, so reusing a build remains useful.
+Colliding local names receive suffixes from their stable plan order, rather
+than fresh graph IDs, so repeated child composition can also reuse code.
 
 One rewrite reaches into those callables. Natively, a generator fold over a
 data-length iterator, `sum(term for i in iter [if condition]; init = x)` with
