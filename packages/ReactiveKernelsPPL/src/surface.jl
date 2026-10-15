@@ -937,8 +937,8 @@ function _ordinary_sampling(s)
     s.broadcast && return false
     rhs = s.rhs
     return rhs isa Expr && rhs.head === :call &&
-        rhs.args[1] in union(keys(_PARAM_FAMILIES),
-            (:HalfNormal, :HalfCauchy, :Flat, :truncated, :restricted)) || _external_rhs(rhs)
+        (rhs.args[1] in _SCALAR_PRIOR_HEADS ||
+         rhs.args[1] in (:truncated, :restricted)) || _external_rhs(rhs)
 end
 
 function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
@@ -11586,6 +11586,13 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Weibull => :weibull,
 )
 
+# Every head `_parse_prior` reads as a scalar prior object: the families,
+# the improper `Flat()` and the half wrappers. `truncated` / `restricted`
+# wrap any of them, so an array prior un-dots and holds them alike
+# (`restricted.(Flat.(), 0, Inf)`, `truncated.(HalfNormal.(s), 0, 2)`).
+const _SCALAR_PRIOR_HEADS = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
+    Set{Symbol}((:Flat, :HalfNormal, :HalfCauchy)))
+
 # Families whose positional prior arguments hoist (scalar `~` and per-cell
 # latent priors); `truncated(D(...), lo, hi)` hoists D's arguments only.
 const _HOIST_FAMILIES = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
@@ -11969,7 +11976,9 @@ function _lower_array_slices(lhs, dims::Vector{Any}, slices::Symbol, rhs,
 end
 
 # `Fam.(args...)` → `Fam(args...)`, recursively through the distribution
-# arguments of `truncated.(...)` (`truncated.(Normal.(0, s), 0, Inf)`).
+# arguments of `truncated.(...)` / `restricted.(...)`
+# (`truncated.(Normal.(0, s), 0, Inf)`, `restricted.(Flat.(), 0, Inf)`).
+# A nested wrapper un-dots too, so its scalar refusal names the nesting.
 function _undot_distribution(lhs, rhs)
     Meta.isexpr(rhs, :call) && return rhs
     rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
@@ -11979,7 +11988,8 @@ function _undot_distribution(lhs, rhs)
             "Normal.(0, 1)`), got $(repr(rhs))")
     f = rhs.args[1]
     args = Any[a isa Expr && a.head === :. && length(a.args) == 2 &&
-            a.args[1] isa Symbol && haskey(_PARAM_FAMILIES, a.args[1]) ?
+            (a.args[1] in _SCALAR_PRIOR_HEADS ||
+             a.args[1] in (:truncated, :restricted)) ?
             _undot_distribution(lhs, a) : a for a in rhs.args[2].args]
     return Expr(:call, f, args...)
 end
@@ -11991,7 +12001,7 @@ function _hold_array_args(lhs, call::Expr, held::Dict{Symbol,Any})
     out = Any[call.args[1]]
     for a in call.args[2:end]
         if a isa Expr && a.head === :call && !isempty(a.args) &&
-                a.args[1] isa Symbol && haskey(_PARAM_FAMILIES, a.args[1])
+                a.args[1] in _SCALAR_PRIOR_HEADS
             push!(out, _hold_array_args(lhs, a, held))
         elseif call.args[1] in (:truncated, :restricted)
             push!(out, a)  # support bounds keep the shared scalar grammar
@@ -12262,7 +12272,8 @@ function _lower_bounded_param(lhs, rhs, who, arg, bound, unknown, mode)
         "`$mode` wraps a distribution object, got $(repr(obj))")
     base = _parse_prior(lhs, obj, who, arg, bound, unknown)
     mode === :truncated && base.family === :flat && _sfail("$who: `truncated` needs a " *
-        "proper distribution; bound an improper prior with `Flat` instead")
+        "proper distribution (it divides by the mass inside the bounds); " *
+        "write `restricted(Flat(), lo, hi)` for a bounded flat density")
     base.support_override in (nothing, :positive) || _sfail("$who: " *
         "nested truncations are not yet supported")
     lo, hi = bound(lower), bound(upper)
