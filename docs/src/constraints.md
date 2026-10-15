@@ -641,9 +641,12 @@ and lock the one Reactant 0.2.289 lifted:
   Shared constant concentrations in Dirichlet slice priors reach this shape:
   `test_plate_categorical.jl` fails at `_arg_rows` with forced bounds checks
   and passes with default bounds checks. Enzyme dogfood `2690dbd8` with
-  Enzyme_jll 0.0.301 still rejects the isolated expression and both row and
-  column slice helpers. The repair belongs in Enzyme; no runtime-activity
-  setting or replacement derivative is applied in RK.
+  Enzyme_jll 0.0.301 also rejects the isolated expression and both row and
+  column slice helpers. The repair belongs in Enzyme. The local Enzyme
+  `dogfood` line carries it from `23b72c94`: on Julia 1.13.1 the reproducer,
+  both slice helpers and `test_plate_categorical.jl` then differentiate
+  exactly in both bounds modes. No registered Enzyme release carries it yet.
+  No runtime-activity setting or replacement derivative is applied in RK.
 - On Julia 1.10.12, 1.12.7 and 1.13.1, Enzyme 0.13.216 rejects the readonly
   proof of a read-only callable that holds a matrix beside a
   `UniformScaling{Float64}` and adds them with Base's

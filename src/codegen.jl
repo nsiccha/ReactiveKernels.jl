@@ -62,13 +62,16 @@ function _varnames(p::Plan)
     used = Set{Symbol}((_OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG))
     out = Dict{Int,Symbol}()
     named = _class_name_values(g)
-    for id in ids
+    # Plan order is stable across equivalent graphs; graph IDs are not. Use
+    # that order to disambiguate locals without changing compilation identity
+    # whenever a composed child receives fresh value IDs.
+    for (position, id) in enumerate(ids)
         base = _value_local_name(g.values[get(named, id, id)].name)
         candidate = base
         suffix = 0
         while candidate in used
-            candidate = suffix == 0 ? Symbol(base, :_, id) :
-                        Symbol(base, :_, id, :_, suffix)
+            candidate = suffix == 0 ? Symbol(base, :_, position) :
+                        Symbol(base, :_, position, :_, suffix)
             suffix += 1
         end
         out[id] = candidate
@@ -2719,7 +2722,8 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     replacement = if spec === nothing
-        token, form = (typeof(r.op)::DataType).parameters
+        token = getfield(r.op, :token)
+        form = (typeof(r.op)::DataType).parameters[2]
         arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
             getfield(native, then ? :then_arm : :else_arm),
             getfield(tensor, then ? :then_arm : :else_arm))
@@ -3003,6 +3007,33 @@ end
     end
 end
 
+# The scalar plan of a cell containing another plate: its shared work hoisted
+# (`_nested_plate_invariants`) and its plate chains composed. Composing gives the
+# composed values fresh identities (`_compose_authored_plates`). Both backend
+# products of one preparation lower the same cells, and one product can lower a
+# cell more than once, so within a preparation (`_sharing_cell_plans`) every
+# lowering of a cell reuses one plan: they name the same values and compose once.
+# The plan depends only on the cell kernel, the atomic positions and which call
+# values are scalars.
+const _SHARED_CELL_PLANS = :ReactiveKernels_shared_cell_plans
+
+_sharing_cell_plans(f) = haskey(task_local_storage(), _SHARED_CELL_PLANS) ? f() :
+    task_local_storage(f, _SHARED_CELL_PLANS, IdDict{Any,Any}())
+
+function _nested_cell_plan(kernel, atomic, callvalues)
+    function compose()
+        inner = kernel.plan
+        hoisted = _nested_plate_invariants(inner, atomic, callvalues)
+        scalar = hoisted === nothing ? inner : _partial_subplan(inner,
+            vcat(inner.have, hoisted.frontier), inner.want, hoisted.residual)
+        (hoisted, _fuse_authored_plate_chains(scalar))
+    end
+    shared = get(task_local_storage(), _SHARED_CELL_PLANS, nothing)
+    shared === nothing && return compose()
+    scalar_calls = Tuple(valtype(v) <: Number for v in callvalues)
+    get!(compose, shared, (kernel, atomic, scalar_calls))
+end
+
 # A cell containing another plate is lowered by the same graph compiler as a
 # top-level kernel. Splicing that AST retains each nested runtime loop, fuses
 # selected sum consumers, and preserves all named scalar recipes for replay.
@@ -3010,11 +3041,7 @@ end
 # embedding without rebasing its operation-table references a second time.
 function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
                                 atomic, callvalues)
-    inner = kernel.plan
-    hoisted = _nested_plate_invariants(inner, atomic, callvalues)
-    scalar = hoisted === nothing ? inner : _partial_subplan(inner,
-        vcat(inner.have, hoisted.frontier), inner.want, hoisted.residual)
-    scalar = _fuse_authored_plate_chains(scalar)
+    hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
     hint_ids = sort!(collect(keys(types)))
     type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
@@ -5260,14 +5287,14 @@ struct PreparedKernel{F,O,IN,OUT,RR,S}
     lowered_recipes::RR
 end
 
-# Nearly every preparation or rebinding assembles a `PreparedKernel` of a new
-# concrete type (its compiled body is new). Assemble it without compiling the
-# struct's constructor for that type; calls on the prepared kernel still
-# dispatch on its exact type.
+# Assemble new prepared types without compiling a constructor for each one;
+# equivalent generated bodies and operation types can reuse their existing
+# specializations. Calls still dispatch on the exact prepared type.
 Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
         @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing)
+    ops = _execution_source(ops)
     T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
                        typeof(lowered_recipes),exact_signature}
     _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
@@ -6354,10 +6381,10 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                       exemplars))
 end
 
-# Re-lowering an embedded nested plate may fuse its child plates separately in
-# each product. Fusion gives the same readable recipes fresh Value identities.
-# Accept only a consistent renaming: source, operations, order and all graph
-# edges must still agree.
+# The two backend products of one preparation reuse each nested cell's composed
+# plan (`_nested_cell_plan`); other intermediates they create independently can
+# carry fresh Value identities. Accept only a consistent renaming: source,
+# operations, order and all graph edges must still agree.
 function _same_readable_recipes(a, b)
     length(a) == length(b) || return false
     forward = Dict{Int,Int}()
@@ -6409,14 +6436,16 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
     end
     lowered_plan = _lowering_plan(p)
     exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
-    native_ast, ops, recipes = _lower_with_ops(lowered_plan; exemplar_types)
-    isempty(passes) || (native_ast = transform(native_ast, passes...))
-    if !_needs_embedded_tensorization(p)
-        return _prepare(p, native_ast, ops, recipes; exact_signature)
+    embedded = _needs_embedded_tensorization(p)
+    (native_ast, ops, recipes), tensorized_lowering = _sharing_cell_plans() do
+        native_lowering = _lower_with_ops(lowered_plan; exemplar_types)
+        embedded || return (native_lowering, nothing)
+        (native_lowering, _lower_with_ops(lowered_plan; tensorized = true))
     end
+    isempty(passes) || (native_ast = transform(native_ast, passes...))
+    embedded || return _prepare(p, native_ast, ops, recipes; exact_signature)
 
-    tensorized_ast, tensorized_ops, tensorized_recipes =
-        _lower_with_ops(lowered_plan; tensorized = true)
+    tensorized_ast, tensorized_ops, tensorized_recipes = tensorized_lowering
     tensorized_ops == ops || throw(ArgumentError(
         "embedded native and tensorized kernels produced different operation tables"))
     _same_readable_recipes(tensorized_recipes, recipes) || throw(ArgumentError(
@@ -6668,7 +6697,7 @@ function _readable_substitute(ex, subst::AbstractDict)
 end
 
 # Whether `value` is the program variable codegen made of the authored `name`
-# to avoid a collision (`_varnames`: `name_<id>` or `name_<id>_<k>`). Such a
+# to avoid a collision (`_varnames`: `name_<position>` or `name_<position>_<k>`). Such a
 # name stays an explicit binding, so the authored spelling remains visible.
 _readable_collision_rename(name::Symbol, value) =
     value isa Symbol &&

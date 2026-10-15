@@ -877,3 +877,88 @@ const _CMP_CALL_COLS = Dict{Symbol,AbstractVector}(
         end
     end
 end
+
+# A data gather (`v[g]`, `w[h]`) inside a composition is one per-observation
+# value, read inline exactly as through its named data-only definition
+# (`vg = v[g]`) or the same column bound as data. A sub-predictor whose
+# offset adds a scalar summand (`1 .+ b .* x`, `1 .- exp.(...)`) takes its
+# reader's response rows. Every spelling has the Julia expression's
+# density and gradient.
+using Distributions: LogNormal
+const _CMP_GATHER_COLS = Dict{Symbol,Any}(
+    :x => [0.5, -1.0, 1.5, 0.2, 0.9, -0.3],
+    :g => [1, 2, 1, 3, 2, 3], :v => [1.0, 1.5, 0.8],
+    :h => [1, 2, 3, 1, 2, 4], :w => [0.5, 1.0, 2.0, 4.0],
+    :y => [0.3, -1.2, 0.8, 0.1, 0.4, -0.2])
+
+@testset "composed leaves: inline data gathers and scalar-summand subs" begin
+    cols = _CMP_GATHER_COLS
+    x, g, v, h, w, y = (cols[k] for k in (:x, :g, :v, :h, :w, :y))
+    # The gathers bound as data, as a caller can precompute them.
+    gathered = merge(cols, Dict{Symbol,Any}(:vg => v[g], :t => w[h]))
+    q = (a = 0.4, b = -0.3, be = 0.7, k = 1.3, p = 0.8, s = 0.6,
+        c = [0.9, 1.2, 0.6])
+    priors(q) = logpdf(Normal(0, 1), q.a) + logpdf(Normal(0, 1), q.b) +
+        logpdf(Normal(0, 1), q.be) + logpdf(LogNormal(0, 0.5), q.k) +
+        logpdf(LogNormal(0, 0.5), q.p) + logpdf(LogNormal(0, 0.7), q.s) +
+        sum(logpdf.(LogNormal(0, 1), q.c))
+    head = quote
+        a ~ Normal(0, 1); b ~ Normal(0, 1); be ~ Normal(0, 1)
+        k ~ LogNormal(0, 0.5); p ~ LogNormal(0, 0.5); s ~ LogNormal(0, 0.7)
+        c[1:3] .~ LogNormal.(0, 1)
+    end
+    growth(q) = 1 .- exp.(-((w[h] ./ q.k) .^ q.p))
+    for (spellings, mean, scale) in (
+            # An affine sub-predictor beside an inline data gather.
+            ([(quote
+                    th = a .+ b .* x
+                    mu = be .* th .* v[g]
+                    y .~ Normal.(mu, s)
+                end, cols),
+              (quote
+                    th = a .+ b .* x
+                    vg = v[g]
+                    mu = be .* th .* vg
+                    y .~ Normal.(mu, s)
+                end, cols),
+              (quote
+                    th = a .+ b .* x
+                    mu = be .* th .* vg
+                    y .~ Normal.(mu, s)
+                end, gathered)],
+                q -> q.be .* (q.a .+ q.b .* x) .* v[g], q -> q.s),
+            # An affine sub-predictor with a scalar summand.
+            ([(quote
+                    th = 1 .+ b .* x
+                    mu = be .* th
+                    y .~ Normal.(mu, s)
+                end, cols),
+              (quote
+                    mu = be .* (1 .+ b .* x)
+                    y .~ Normal.(mu, s)
+                end, cols)],
+                q -> q.be .* (1 .+ q.b .* x), q -> q.s),
+            # A nonlinear curve over a data gather, scaled per group.
+            ([(quote
+                    t = w[h]
+                    gr = 1 .- exp.(-((t ./ k) .^ p))
+                    mu = c[g] .* v[g] .* gr
+                    y .~ Normal.(mu, s .* v[g])
+                end, cols),
+              (quote
+                    gr = 1 .- exp.(-((t ./ k) .^ p))
+                    mu = c[g] .* vg .* gr
+                    y .~ Normal.(mu, s .* vg)
+                end, gathered),
+              (quote
+                    mu = c[g] .* v[g] .* (1 .- exp.(-((w[h] ./ k) .^ p)))
+                    y .~ Normal.(mu, s .* v[g])
+                end, cols)],
+                q -> q.c[g] .* v[g] .* growth(q), q -> q.s .* v[g]))
+        want = q -> sum(logpdf.(Normal.(mean(q), scale(q)), y)) + priors(q)
+        for (location, data) in spellings
+            prog = Expr(:block, head.args..., location.args...)
+            _cmp_ap_check(prog, q, want; cols = data)
+        end
+    end
+end

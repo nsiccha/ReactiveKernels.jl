@@ -10257,7 +10257,11 @@ function _extract_composed_tree(pname, node, ctx, subs::Vector{Symbol},
     node isa Expr || return _sfail("$where composition node " *
         "$(repr(node)) is not admitted (v1: `. .*`/`.+`/`.−` over " *
         "sub-predictors and scalars)")
-    if node.head === :ref && _reads_array_value(node, ctx; follow = false)
+    # A gather is one per-observation value, extracted as a column as in an
+    # affine summand: a declared array's (`z[g]`), or a data value's
+    # (`v[g]`), as its named spelling `vg = v[g]` is a data-only leaf.
+    if node.head === :ref && (_reads_array_value(node, ctx; follow = false) ||
+            !_composed_has_sub(node, ctx, true))
         column = _extract_column(pname, node, ctx)
         push!(datas, column)
         return column

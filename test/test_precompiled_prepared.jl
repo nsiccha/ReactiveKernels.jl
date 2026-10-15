@@ -28,6 +28,27 @@ using ReactiveKernels, Test
         write(joinpath(derived, "src", "ImportedPreparedConsumer.jl"), """
             module ImportedPreparedConsumer
             using ReactiveKernels
+            # A loading process can count up to the identities this image
+            # gives its nested-plate law (below).
+            foreach(_ -> value(:padding, Float64), 1:400)
+            @kernel weighted_log_sum(scores::Vector{Float64},
+                    weights::Vector{Float64}) = begin
+                weighted = plate(scores, weights) do score, weight
+                    log(weight) + score
+                end
+                return log(sum(exp.(weighted)))
+            end
+            @kernel nested_mixture(observed::Vector{Bool},
+                    probabilities::Matrix{Float64}, weights::Vector{Float64}) = begin
+                components = plate(1:size(probabilities, 2)) do k
+                    cells = plate(1:length(observed)) do i
+                        p = probabilities[i, k]
+                        observed[i] ? log(p) : log1p(-p)
+                    end
+                    sum(cells)
+                end
+                return weighted_log_sum(components, weights)
+            end
             import PrecompiledPreparedConsumer: trajectory, HAVE, borrowed_curve
             const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
             const BATCH = prepare_batched(trajectory; have = HAVE,
@@ -41,8 +62,11 @@ using ReactiveKernels, Test
         # consumer images; the next processes only load and execute them.
         setup = """
             using Pkg
-            Pkg.develop([PackageSpec(path = path) for path in
-                $(repr((root, consumer, derived)))])
+            include($(repr(joinpath(root, "deps", "source_dependencies.jl"))))
+            # A fresh environment needs explicit source dependencies on Julia
+            # 1.10, which does not read the root package's [sources] table.
+            Pkg.develop([PackageSpec[PackageSpec(path = path) for path in
+                $(repr((root, consumer, derived)))]; rk_source_dependencies()])
             Pkg.precompile()
             """
         julia = Base.julia_cmd()
@@ -187,5 +211,56 @@ using ReactiveKernels, Test
                 `$julia --startup-file=no --check-bounds=yes --project=$env -e $probe`;
                 stdout = stdout, stderr = stderr))
         end
+
+        # A loaded nested-plate law composed into the cells of a plate authored
+        # after load. The loading process's count does not include the image's
+        # allocations, so it reaches the identities of the law's nested cells.
+        # Each backend product composed the law's plates with fresh values
+        # separately; once those took the law's own identities, preparation
+        # refused the products as different (snag readable-recipe-75581e09).
+        composition = """
+            using Test, ReactiveKernels
+            import ImportedPreparedConsumer: nested_mixture
+            const RK = ReactiveKernels
+            @kernel event_mixtures(events::Vector{Vector{Bool}},
+                    probabilities::Matrix{Float64}, weights::Vector{Float64}) = begin
+                scores = plate(events) do observed
+                    nested_mixture(observed, probabilities, weights)
+                end
+                return sum(scores)
+            end
+            @test RK._needs_embedded_tensorization(plan(event_mixtures))
+            function plate_value_ids!(ids, graph)
+                for r in graph.recipes
+                    r.op isa RK._AuthoredPlateOp || continue
+                    inner = r.op.kernel.plan.graph
+                    union!(ids, keys(inner.values))
+                    plate_value_ids!(ids, inner)
+                end
+                ids
+            end
+            nested = setdiff(plate_value_ids!(Set{Int}(), nested_mixture.graph),
+                             keys(nested_mixture.graph.values))
+            # Count to just below them, as an ordered suite does.
+            @test RK._VALUE_COUNTER[] < minimum(nested) - 1
+            while RK._VALUE_COUNTER[] < minimum(nested) - 1
+                value(:ordered_suite, Float64)
+            end
+            mixtures = prepare(event_mixtures)
+            events = [Bool[1, 0, 1], Bool[0, 0, 1], Bool[1, 1, 1]]
+            probabilities = [0.3 0.8; 0.6 0.2; 0.5 0.5]
+            weights = [0.4, 0.6]
+            expected = sum(events) do observed
+                scores = [sum(observed[i] ? log(probabilities[i, k]) :
+                              log1p(-probabilities[i, k]) for i in eachindex(observed))
+                          for k in axes(probabilities, 2)]
+                log(sum(weights .* exp.(scores)))
+            end
+            @test mixtures(events, probabilities, weights) ≈ expected
+            println("NESTED_LAW_COMPOSITION_PASS")
+            """
+        @test success(pipeline(
+            `$julia --startup-file=no --check-bounds=yes --project=$env -e $composition`;
+            stdout = stdout, stderr = stderr))
     end
 end
