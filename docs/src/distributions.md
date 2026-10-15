@@ -219,7 +219,10 @@ loglik(event, probabilities, weights)
 A PPL model can pass one complete response vector to `LogDensity` with this
 kernel. An outer `@plate` may select several such vectors; each outer cell
 then has its own marginalized component, and the inner RK plates retain the
-positions within that event.
+positions within that event. The component scores stream through the outer
+`logsumexp` fold, so an event allocates no score vector, and an argument that
+does not vary by event (a shared probability matrix or weight vector written
+in the cell) is computed once, before the outer loop.
 
 `bernoulli_logit_product_mixture_logdensity(observed, logits, weights)` and
 `binomial_logit_product_mixture_logdensity(observed, trials, logits, weights)`
@@ -305,6 +308,32 @@ ordinary Enzyme derivatives of these graphs, with no hand-written rule. A PPL
 model passes the whole sequence to `LogDensity` with one of these kernels. For
 another emission family, author a kernel that fills the `steps × states`
 log-emission matrix in a plate and returns `hmm_logdensity`.
+
+## Intrinsic CAR fields
+
+`icar_logdensity(phi, node1, node2)` is the unit-scale intrinsic conditional
+autoregressive (ICAR) log density of a node vector `phi` on an undirected graph
+whose edge `e` joins nodes `node1[e]` and `node2[e]`, each edge listed once:
+`-1/2 * sum((phi[node1] .- phi[node2]) .^ 2)`. It is the Gaussian Markov random
+field whose precision is the graph Laplacian. The law is improper, because
+adding a constant to every node of a connected component leaves it unchanged,
+so it has no normalizer. A model identifies the field with a sum-to-zero
+constraint or through its likelihood.
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    icar_logdensity
+
+phi = [0.3, -0.1, 0.7, 0.2]
+logprior = prepare(icar_logdensity)
+logprior(phi, [1, 1, 2, 3], [2, 3, 3, 4])
+```
+
+One plate runs over the edges, and each cell reads `phi` whole, so no gathered
+vector is built. The derivatives are ordinary Enzyme derivatives of this
+graph. In a PPL model, `phi[1:N] ~ ICAR(node1, node2)` declares the field with
+this prior.
 
 ## Positive-support and bounded families
 

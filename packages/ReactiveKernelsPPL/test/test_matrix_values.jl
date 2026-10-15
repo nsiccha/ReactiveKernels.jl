@@ -503,3 +503,121 @@ end
     end
     @test bytes[1] < bytes[2]
 end
+
+# `B * v` contracts `v` with the columns of the matrix `B`, as in Julia. A
+# data vector combined elementwise inside `v` (one weight per basis column)
+# therefore has the column length, never the observation axis.
+function _ma_contracted_case(kind, n, k)
+    data = Dict{Symbol,Any}(:B => [0.1 * sin(i + 2j) for i in 1:n, j in 1:k],
+        :f => [0.3 + 0.4j for j in 1:k], :y => [0.2 + 0.05cos(i) for i in 1:n],
+        :x1 => [0.3 + 0.13i for i in 1:n], :x2 => [0.7 + 0.2sin(i) for i in 1:n],
+        :f2 => [0.5, -1.5])
+    B, f, x1, x2 = data[:B], data[:f], data[:x1], data[:x2]
+    head = quote
+        a ~ Normal(0, 1)
+        s ~ Normal(0, 1)
+        z[axes(B, 2)] .~ Normal.(0, 1)
+    end
+    zs(q) = [q[Symbol("z.", j)] for j in 1:k]
+    weighted(q) = q[:s] .* exp.(-0.25 .* f .^ 2) .* zs(q)
+    coords = [:a, :s, (Symbol("z.", j) for j in 1:k)...]
+    scale = q -> 1.0
+    body, loc = if kind === :named
+        quote
+            w = s .* exp.(-0.25 .* f .^ 2)
+            v = w .* z
+            mu = a .+ B * v
+            y .~ Normal.(mu, 1)
+        end, q -> q[:a] .+ B * weighted(q)
+    elseif kind === :inline
+        quote
+            w = s .* exp.(-0.25 .* f .^ 2)
+            mu = a .+ B * (w .* z)
+            y .~ Normal.(mu, 1)
+        end, q -> q[:a] .+ B * weighted(q)
+    elseif kind === :response
+        quote
+            y .~ Normal.(a .+ B * (s .* exp.(-0.25 .* f .^ 2) .* z), 1)
+        end, q -> q[:a] .+ B * weighted(q)
+    elseif kind === :raw
+        quote
+            mu = a .+ B * (f .* z)
+            y .~ Normal.(mu, 1)
+        end, q -> q[:a] .+ B * (f .* zs(q))
+    elseif kind === :scale
+        scale = q -> exp.(0.1 .+ B * (0.2 .* f .* zs(q)))
+        quote
+            mu = a .+ B * (s .* f .* z)
+            sd = exp.(0.1 .+ B * (0.2 .* f .* z))
+            y .~ Normal.(mu, sd)
+        end, q -> q[:a] .+ B * (q[:s] .* f .* zs(q))
+    elseif kind === :hcat
+        head = :(a ~ Normal(0, 1))
+        coords = [:a, Symbol("c.1"), Symbol("c.2")]
+        quote
+            X = hcat(x1, x2)
+            c[axes(X, 2)] .~ Normal.(0, 1)
+            mu = a .+ X * (f2 .* c)
+            y .~ Normal.(mu, 1)
+        end, q -> q[:a] .+ hcat(x1, x2) * ([0.5, -1.5] .* [q[Symbol("c.1")], q[Symbol("c.2")]])
+    elseif kind === :scalar_def
+        # Control: a scalar times a column keeps the column's observations.
+        head = :(a ~ Normal(0, 1))
+        coords = [:a]
+        quote
+            m = mean(x1)
+            mu = a .+ m * x1
+            y .~ Normal.(mu, 1)
+        end, q -> q[:a] .+ sum(x1) / n .* x1
+    else
+        error("unknown contracted-product fixture $kind")
+    end
+    ast = Expr(:block, (head.head === :block ? head.args : Any[head])..., body.args...)
+    oracle = (layout, u) -> begin
+        q = _ma_q(layout, u)
+        sum(logpdf(Normal(0, 1), v) for v in u; init = 0.0) +
+            sum(logpdf.(Normal.(loc(q), scale(q)), data[:y]))
+    end
+    return (; kind, data, ast, coords, oracle)
+end
+
+@testset "matrix products read their vector whole" begin
+    for (n, k) in ((7, 3), (4, 9), (5, 5)), names_only in (false, true),
+            kind in (:named, :inline, :response, :raw, :scale, :hcat, :scalar_def)
+        @testset "$kind / $n×$k / names_only=$names_only" begin
+            case = _ma_contracted_case(kind, n, k)
+            original = deepcopy(case.data)
+            plan = names_only ?
+                lower_rkppl(case.ast, Set(keys(case.data)); conditioned = (:y,),
+                    mod = @__MODULE__) :
+                lower_rkppl(case.ast, case.data; conditioned = (:y,),
+                    mod = @__MODULE__)
+            bound = bind_data(plan, case.data)
+            @test bound.n_obs == n
+            built = build_kernel(bound)
+            @test Set(coordinate_names(built.layout)) == Set(case.coords)
+            for shift in (0.0, 0.17)
+                u = [0.2sin(i) + shift for i in 1:built.layout.total]
+                _check_model_math(built, bound, u,
+                    w -> case.oracle(built.layout, w))
+            end
+            @test isequal(case.data, original)
+        end
+    end
+    # A weight vector whose length differs from the columns fails as Julia's
+    # product does.
+    for kind in (:named, :raw)
+        case = _ma_contracted_case(kind, 6, 3)
+        data = merge(case.data, Dict{Symbol,Any}(:f => [0.1, 0.2, 0.3, 0.4]))
+        err = try
+            plan = lower_rkppl(case.ast, data; conditioned = (:y,), mod = @__MODULE__)
+            bound = bind_data(plan, data)
+            built = build_kernel(bound)
+            _query(built.spec, bound, :posterior, fill(0.2, built.layout.total))
+            nothing
+        catch e
+            e
+        end
+        @test err isa DimensionMismatch
+    end
+end

@@ -139,3 +139,43 @@ binomial_logit_reference_cell(y, n, l) = log(binomial(big(n), big(y))) +
         end
     end
 end
+
+law_allocated(k::K, args::Vararg{Any,N}) where {K,N} = @allocated k(args...)
+
+@testset "whole-event laws keep no per-component vector" begin
+    prepared = prepare(bernoulli_product_mixture_logdensity)
+    observed = Bool[true, false, true, true]
+    probabilities = reshape(0.05 .+ 0.9 .* abs.(sin.(1:24)), 4, 6)
+    weights = fill(1 / 6, 6)
+    reference = MixtureModel([product_distribution(Bernoulli.(probabilities[:, k]))
+        for k in 1:6], weights)
+    @test prepared(observed, probabilities, weights) ≈
+        logpdf(reference, Int.(observed)) rtol=1e-13
+    # The component scores stream through `logsumexp` instead of filling a
+    # vector per event.
+    @test !occursin("similar", string(code_expr(prepared)))
+    @test law_allocated(prepared, observed, probabilities, weights) == 0
+    @test prepared(observed, zeros(4, 0), Float64[]) == -Inf
+
+    trials = fill(3, 4, 6)
+    counts = [0, 2, 3, 1]
+    binomial_prepared = prepare(binomial_product_mixture_logdensity)
+    binomial_reference = MixtureModel([product_distribution(
+        Binomial.(trials[:, k], probabilities[:, k])) for k in 1:6], weights)
+    @test binomial_prepared(counts, trials, probabilities, weights) ≈
+        logpdf(binomial_reference, counts) rtol=1e-13
+    @test law_allocated(binomial_prepared, counts, trials, probabilities, weights) == 0
+    @test_throws DimensionMismatch binomial_prepared(counts, trials, probabilities,
+        weights[1:5])
+
+    logits = log.(probabilities ./ (1 .- probabilities))
+    logit_prepared = prepare(bernoulli_logit_product_mixture_logdensity)
+    @test logit_prepared(observed, logits, weights) ≈
+        logpdf(reference, Int.(observed)) rtol=1e-13
+    @test law_allocated(logit_prepared, observed, logits, weights) == 0
+    binomial_logit_prepared = prepare(binomial_logit_product_mixture_logdensity)
+    @test binomial_logit_prepared(counts, trials, logits, weights) ≈
+        logpdf(binomial_reference, counts) rtol=1e-13
+    @test law_allocated(binomial_logit_prepared, counts, trials, logits, weights) == 0
+    @test_throws DimensionMismatch logit_prepared(observed, logits, weights[1:5])
+end
