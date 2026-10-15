@@ -102,6 +102,8 @@ function _canon(io::IO, x, depth::Int = 0, names = nothing)
             (fs = filter(!=(:external_observations), fs))
         x isa StructuralPlan && isempty(x.cell_broadcasts) &&
             (fs = filter(!=(:cell_broadcasts), fs))
+        x isa StructuralPlan && isempty(x.factors) &&
+            (fs = filter(!=(:factors), fs))
         x isa VectorParameter && x.extent_expr === nothing &&
             (fs = filter(!=(:extent_expr), fs))
         # Canonical mathematical plans compare loop/broadcast spellings.

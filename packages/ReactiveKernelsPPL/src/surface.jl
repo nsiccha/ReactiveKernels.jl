@@ -2723,9 +2723,12 @@ const _BINDING_VALUE_HEADS = (:comprehension, :generator, :->, :do, :let)
 
 function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
         values::Bool = true)
-    ex in (:pi, :π) && ex ∉ names && return Float64(pi)
-    ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
-    ex isa Symbol && return values ? _resolve_value_name(ex, mod, names) : ex
+    # Names only: an interpolated `missing` value compares as `missing`.
+    if ex isa Symbol
+        ex in (:pi, :π) && ex ∉ names && return Float64(pi)
+        ex in (:nothing, :missing) && ex ∉ names && return GlobalRef(Base, ex)
+        return values ? _resolve_value_name(ex, mod, names) : ex
+    end
     ex isa Expr || return ex
     ex.head === :quote && return ex
     recur(a) = _resolve_module_calls(a, mod, names, where;
