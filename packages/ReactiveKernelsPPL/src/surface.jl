@@ -1434,6 +1434,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # other consumers, including reductions, extracted leaves and the
     # retained recurrence body. Keep their definition dependencies too.
     needed = copy(declaration_dependencies)
+    # A predictor term can read another location as an ordinary column.
+    # That definition must survive even when its own response absorbed it
+    # as a predictor. Replan the conflicting name as a value below, so both
+    # readers share one graph node, independent of response order.
+    for p in predictors, t in p.terms
+        union!(needed, t.columns)
+    end
     # A GLM object reads its arguments whole, by name.
     for r in responses
         _is_glm_family(r.family) || continue
