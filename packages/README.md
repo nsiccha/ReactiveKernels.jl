@@ -64,6 +64,24 @@ dependency, so to test without Reactant run
 the package and adds its dependencies and test dependencies except Reactant. Native files never
 use Reactant or a Reactant file's definitions; the suite checks this.
 
+The `rkppl-current` CI job runs contract, layout, preprocessing, generator,
+query, and corpus tests on Julia-current (`1`), alongside the full Julia 1.10
+shards. Generator and query tests cover fresh-method world age and explicit
+Enzyme Reverse gradients against independent references. Reproduce this
+focused native leg with the current Julia executable:
+
+```sh
+julia --startup-file=no packages/setup_ppl_native.jl /tmp/rkppl-native
+RKPPL_TEST_BACKENDS=native \
+RKPPL_TEST_FILES=test_contract.jl,test_layout.jl,test_preprocessing.jl,test_generator.jl,test_query.jl,test_corpus.jl \
+julia --startup-file=no --check-bounds=yes --project=/tmp/rkppl-native packages/ReactiveKernelsPPL/test/runtests.jl
+```
+
+The setup script copies PPL's dependency UUIDs and compatibility bounds into
+the given environment, omits the Reactant test extra, and develops this
+checkout's core, distribution-kernel, and PPL packages together. The current
+leg is focused acceptance coverage, not the complete native or Reactant suite.
+
 The checked-in `[sources]` entries become useful automatically on newer Julia
 versions; `setup.jl` remains the Julia-1.10-compatible source of local path
 development. CI runs the same path development explicitly rather than assuming
