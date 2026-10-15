@@ -76,23 +76,6 @@ pins the isolated before/after trees and dependency versions. Both runs pass
 two expression widths, at both 8 and 256 observations. These are single-run
 compiler-cost checks, not evidence of a speedup.
 
-PPL's declaration and observation shape inference (`_value_axes` in
-`packages/ReactiveKernelsPPL/src/arrays.jl`) stays in PPL. It is not a
-duplicate of the OS rules. One set of broadcast, product, reduction,
-concatenation, adjoint and indexing rules serves two kinds of dimension:
-symbolic ones for unbound declarations (`levels(g)`, `axes(M, d)`) and integer
-ones for bound data. OS descriptors carry integer axes only. The broadcast rule
-also prefers a `levels(g)` axis to a literal size so that a level gather stays
-possible, which is a PPL choice, not a numerical fact. Sending only the bound
-cases to OS would add a second path and delete no rule. Moving this function
-onto shared metadata needs three things first:
-
-- OS descriptors for symbolic axes.
-- OS rules for the other operations it serves: two-index and linear matrix
-  reads, `length`, matrix products, undotted vector arithmetic, scalar `log`
-  and `sqrt`, and `mean` and `std`.
-- A named deletion in PPL.
-
 ## API map
 
 ```@eval
