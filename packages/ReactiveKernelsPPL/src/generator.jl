@@ -4506,6 +4506,7 @@ function _prior_statements(plan::StructuralPlan, layout::LayoutTable;
         end
     end
     _parameter_prior_statements!(stmts, terms, plan, layout)
+    append!(terms, plan.cell_priors)
     _factor_density_statements!(stmts, terms, plan; context)
     # GLM-object coefficient vectors: the same plate-prior shape as a
     # population-prior coefficient block, driven by the response matrix
@@ -4735,7 +4736,11 @@ function _prior_endpoint_expr(family::Symbol, a, method::Symbol, x;
     args = family === :gamma ? (a[1], _gamma_rate(a[2])) : Tuple(a)
     known = map(v -> v in float64_args, Tuple(a))
     args = map((v, k) -> k ? v : _float64_port(v), args, known)
-    return Expr(:call, Expr(:., Expr(:call, ep, args...), QuoteNode(method)),
+    # These endpoints also enter authored cell expressions before module
+    # resolution. Keep their library binding explicit there, independently
+    # of similarly named functions in the model's module.
+    endpoint = GlobalRef(PPLGeneratedModels, ep)
+    return Expr(:call, Expr(:., Expr(:call, endpoint, args...), QuoteNode(method)),
         float64_variate ? x : _float64_port(x))
 end
 
