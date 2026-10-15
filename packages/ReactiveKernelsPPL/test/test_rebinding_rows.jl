@@ -193,7 +193,7 @@ function _rr_check(kind; fit = 9, new = 6)
     fitted, other = case.bind(fit), case.bind(new)
     built = build_kernel(fitted)
     # The generated program is the same for both bindings: no row count.
-    @test _rr_source(fitted) == _rr_source(other)
+    @test ReactiveKernelsPPL._same_program(_rr_source(fitted), _rr_source(other))
     own = build_kernel(other)
     u = [0.15 - 0.1k for k in 1:built.layout.total]
     reused = prepare_sampler(built, other, u; backend = _RR_BACKEND)

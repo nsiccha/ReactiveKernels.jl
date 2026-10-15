@@ -145,7 +145,7 @@ end
 function _check_built_program(built, plan::StructuralPlan)
     hasproperty(built, :program) || return nothing
     program = _program_identity(kernel_expr(plan, assign_layout(plan)))
-    program == built.program && return nothing
+    _same_program(program, built.program) && return nothing
     throw(ContractValidationError("[query] this binding generates a " *
         "different program than the one this graph was built from, so it " *
         "needs its own `build_kernel(plan)`. First difference, " *
@@ -156,13 +156,13 @@ function _program_difference(built::Expr, other::Expr)
     text(x) = x === nothing ? "(absent)" :
         sprint(print, Base.remove_linenums!(deepcopy(x)))
     sig(def) = def.args[1]
-    sig(built) == sig(other) || return "in the data arguments:\n  built: " *
+    _same_program(sig(built), sig(other)) || return "in the data arguments:\n  built: " *
         text(sig(built)) * "\n  this:  " * text(sig(other))
     body(def) = Any[x for x in def.args[2].args if !(x isa LineNumberNode)]
     a, b = body(built), body(other)
     for i in 1:max(length(a), length(b))
         x, y = get(a, i, nothing), get(b, i, nothing)
-        x == y && continue
+        _same_program(x, y) && continue
         return "statement $i:\n  built: " * text(x) * "\n  this:  " * text(y)
     end
     return "in the program's layout"
