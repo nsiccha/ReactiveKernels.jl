@@ -4,6 +4,7 @@ using InteractiveUtils: code_llvm
 using ReactiveKernelsDistributionKernels.DistributionKernelSources: bernoulli
 
 include("test_authored_plate_chains_ad.jl")
+include("test_plate_fusion_reconvergence_ad.jl")
 include("test_scan_plate_ad.jl")
 include("test_scan_terminal_minima_ad.jl")
 include("test_plate_consumer_native_ad.jl")

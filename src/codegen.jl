@@ -1587,6 +1587,41 @@ function _lower_authored_scan_strips!(body, scan_recipe::Recipe, records,
     body
 end
 
+# A composed plate whose scalar plan is settled but not yet lowered. A later
+# scheduling pass may compose it again, so `_fuse_authored_plate_chains` builds
+# one `_AuthoredPlateOp` (lowering and compilation) per recipe that remains,
+# rather than one per intermediate composition.
+struct _AuthoredPlateDraft{A}
+    plan::Plan
+    lowered_recipes::Tuple
+    axis_checks::Tuple
+end
+struct _AuthoredPlateCellDraft{A}
+    plate::_AuthoredPlateDraft{A}
+end
+const _AuthoredPlateLike = Union{_AuthoredPlateOp,_AuthoredPlateDraft}
+const _AuthoredPlateCellLike = Union{_AuthoredPlateCellOp,_AuthoredPlateCellDraft}
+_plate_atomic(::_AuthoredPlateOp{K,A}) where {K,A} = A
+_plate_atomic(::_AuthoredPlateDraft{A}) where {A} = A
+_plate_body(op::_AuthoredPlateOp) = op.kernel
+_plate_body(op::_AuthoredPlateDraft) = op
+
+function _built_plate_op(draft::_AuthoredPlateDraft{A}) where {A}
+    kernel = _prepare(draft.plan, _lower_with_ops(draft.plan; inline_embedded = false)...)
+    # Source RHSs use the original scalar formal names. Keep their original
+    # recipe metadata in operation-table order so readable code binds those
+    # names to the newly projected scalar arguments, including across chains.
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+        kernel.plan, kernel.ast, draft.lowered_recipes)
+    _AuthoredPlateOp{typeof(kernel),A}(kernel, draft.axis_checks)
+end
+_built_plate_op(draft::_AuthoredPlateCellDraft) =
+    _AuthoredPlateCellOp(_built_plate_op(draft.plate))
+_built_plate_recipe(r::Recipe) =
+    r.op isa Union{_AuthoredPlateDraft,_AuthoredPlateCellDraft} ?
+    Recipe(r.id, r.inputs, r.outputs, _built_plate_op(r.op), r.cost, r.cse_key,
+           r.effectful, r.source) : r
+
 # Compose selected scalar DAGs only at code generation. The public graph and
 # Plan retain every named array node, so another WANT/HAVE query can still
 # materialize it or cut the graph there. A whole-array/Ref use is a boundary,
@@ -1603,8 +1638,9 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
 
     function append_body(recipe, replacement = nothing)
         op = recipe.op
-        inner = op.kernel.plan
-        old_atomic = typeof(op).parameters[2]
+        body = _plate_body(op)
+        inner = body.plan
+        old_atomic = _plate_atomic(op)
         mapped = Dict{Int,Value}()
         input_positions = Vector{Tuple}(undef, length(recipe.inputs))
         for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
@@ -1639,7 +1675,7 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
             end for v in r.outputs)
             copied = add!(scalar_graph, ins => outs, r.op; cost = r.cost,
                           effectful = r.effectful, source = r.source)
-            readable_recipes[copied.id] = op.kernel.lowered_recipes[recipe_index]
+            readable_recipes[copied.id] = body.lowered_recipes[recipe_index]
         end
         (; value = mapped[canon_id(inner.graph, only(inner.want).id)], axes)
     end
@@ -1648,16 +1684,9 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
     result = append_body(consumer, intermediate)
     # Keep the complete HAVE boundary, including unused axis arguments.
     scalar_plan = plan(scalar_graph; have = scalar_have, want = (result.value,))
-    kernel = _prepare(scalar_plan,
-        _lower_with_ops(scalar_plan; inline_embedded = false)...)
-    # Source RHSs use the original scalar formal names. Keep their original
-    # recipe metadata in operation-table order so readable code binds those
-    # names to the newly projected scalar arguments, including across chains.
-    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-        kernel.plan, kernel.ast,
-        Tuple(readable_recipes[r.id] for r in scalar_plan.recipes))
-    op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, Tuple(unique(checks)))
-    Recipe(consumer.id, Tuple(callvalues), consumer.outputs, op,
+    draft = _AuthoredPlateDraft{Tuple(atomic)}(scalar_plan,
+        Tuple(readable_recipes[r.id] for r in scalar_plan.recipes), Tuple(unique(checks)))
+    Recipe(consumer.id, Tuple(callvalues), consumer.outputs, draft,
            producer.cost + consumer.cost, nothing, false, consumer.source)
 end
 
@@ -1670,7 +1699,7 @@ function _fuse_authored_plate_chains(p::Plan; cells_only = false)
     function consumers_of(index)
         producer = recipes[index]
         producer === nothing && return nothing
-        producer.op isa _AuthoredPlateOp || return nothing
+        producer.op isa _AuthoredPlateLike || return nothing
         length(producer.outputs) == 1 || return nothing
         cid = canon_id(p.graph, only(producer.outputs).id)
         cid in boundary && return nothing
@@ -1681,39 +1710,49 @@ function _fuse_authored_plate_chains(p::Plan; cells_only = false)
         all(>(index), consumers) || return nothing
         return cid, consumers
     end
-    for index in eachindex(recipes)
-        found = consumers_of(index)
-        found === nothing && continue
-        cid, consumers = found
-        length(consumers) == 1 || continue
-        cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellOp) && continue
-        composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
-        composed === nothing && continue
-        recipes[only(consumers)] = composed
-        recipes[index] = nothing
-        changed = true
-    end
-    # A plate read only by cells of other plates at one position (`plate_cell`
-    # values sharing an index port: one cell of several observations) composes
-    # into each of those cells, so each runs the plate's cell at that position
-    # instead of the whole plate.
-    for index in eachindex(recipes)
-        found = consumers_of(index)
-        found === nothing && continue
-        cid, consumers = found
-        length(consumers) >= 2 || continue
-        all(c -> recipes[c].op isa _AuthoredPlateCellOp, consumers) || continue
-        length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
-            for c in consumers)) == 1 || continue
-        composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
-            for c in consumers]
-        any(isnothing, composed) && continue
-        recipes[consumers] = composed
-        recipes[index] = nothing
-        changed = true
+    # Composing a consumer can leave an earlier producer with fewer readers: a
+    # branch composed into the plate it reconverges into leaves their shared
+    # producer read by that plate alone. Both passes therefore repeat until
+    # neither composes. Each composition removes a recipe, so this terminates,
+    # and a producer body is copied only into its sole remaining reader(s).
+    progressed = true
+    while progressed
+        progressed = false
+        for index in eachindex(recipes)
+            found = consumers_of(index)
+            found === nothing && continue
+            cid, consumers = found
+            length(consumers) == 1 || continue
+            cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellLike) && continue
+            composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
+            composed === nothing && continue
+            recipes[only(consumers)] = composed
+            recipes[index] = nothing
+            progressed = true
+        end
+        # A plate read only by cells of other plates at one position
+        # (`plate_cell` values sharing an index port: one cell of several
+        # observations) composes into each of those cells, so each runs the
+        # plate's cell at that position instead of the whole plate.
+        for index in eachindex(recipes)
+            found = consumers_of(index)
+            found === nothing && continue
+            cid, consumers = found
+            length(consumers) >= 2 || continue
+            all(c -> recipes[c].op isa _AuthoredPlateCellLike, consumers) || continue
+            length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
+                for c in consumers)) == 1 || continue
+            composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
+                for c in consumers]
+            any(isnothing, composed) && continue
+            recipes[consumers] = composed
+            recipes[index] = nothing
+            progressed = true
+        end
+        changed |= progressed
     end
     changed || return p
-    selected = Recipe[r for r in recipes if r !== nothing]
+    selected = Recipe[_built_plate_recipe(r) for r in recipes if r !== nothing]
     producer = Dict(canon_id(p.graph, v.id) => r for r in selected for v in r.outputs)
     Plan(p.graph, p.have, p.want, selected, producer, p.cost, p.candidates)
 end
@@ -1767,18 +1806,18 @@ end
 function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
     # A plate cell composes its producer as its plate does; its first input is
     # the cell index, which the producer never is.
-    cell = consumer.op isa _AuthoredPlateCellOp
+    cell = consumer.op isa _AuthoredPlateCellLike
     cell && canon_id(g, first(consumer.inputs).id) == cid && return nothing
     plate = cell ? Recipe(consumer.id, consumer.inputs[2:end], consumer.outputs,
         consumer.op.plate, consumer.cost, nothing, false, consumer.source) : consumer
-    plate.op isa _AuthoredPlateOp || return nothing
-    atomic = typeof(plate.op).parameters[2]
+    plate.op isa _AuthoredPlateLike || return nothing
+    atomic = _plate_atomic(plate.op)
     any(position -> position in atomic && canon_id(g, plate.inputs[position].id) == cid,
         eachindex(plate.inputs)) && return nothing
     composed = _compose_authored_plates(g, producer, plate)
     cell || return composed
     Recipe(composed.id, (first(consumer.inputs), composed.inputs...), composed.outputs,
-        _AuthoredPlateCellOp(composed.op), composed.cost, nothing, false, composed.source)
+        _AuthoredPlateCellDraft(composed.op), composed.cost, nothing, false, composed.source)
 end
 
 # Is a plate's pointwise value read only by other plates, each zipping it, and
