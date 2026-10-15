@@ -44,7 +44,7 @@ Display an existing build. `built` is the `(; spec, layout)` returned by
 retains as `backend.model`. The built program, structural graph and coordinates
 need nothing else.
 
-Pass `bound`, the bound `StructuralPlan` that was built, to add the generated
+Pass `bound`, the bound `StructuralPlan` (or the binding) that was built, to add the generated
 pre-build kernel definition, and `query`, a kernel returned by
 [`prepare_query`](@ref) or a [`SamplerQuery`](@ref), to add its prepared
 program (with its bound data folded in as literals). These values are only
@@ -67,7 +67,7 @@ function _model_source(bound::StructuralPlan, layout::LayoutTable)
     _model_visible_expr(kernel_expr(bound, layout))
 end
 _model_source(bound, layout) = throw(ArgumentError(
-    "model_view: `bound` must be the bound StructuralPlan that was built; got $(typeof(bound))"))
+    "model_view: `bound` must be the bound StructuralPlan (or the binding) that was built; got $(typeof(bound))"))
 
 _model_prepared(::Nothing) = nothing
 _model_prepared(query::SamplerQuery) = _model_prepared(query.kernel)

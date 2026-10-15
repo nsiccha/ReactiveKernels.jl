@@ -57,7 +57,9 @@ end
     kernel_expr(plan, layout; name=:ppl_model) -> Expr
 
 The `@kernel` definition expression (`Expr(:(=), signature, body)`).
-Pure (no eval): the generator tests inspect and evaluate it.
+Pure (no eval): the generator tests inspect and evaluate it. `plan` may also
+be a binding with nothing left to observe (`model(; x)`), read as
+`bind_data(binding)`, exactly as [`build_kernel`](@ref) reads it.
 """
 function kernel_expr(plan::StructuralPlan, layout::LayoutTable; name::Symbol = :ppl_model)
     def = Base.invokelatest(_kernel_expr_latest, plan, layout; name)

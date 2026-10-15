@@ -32,6 +32,14 @@ declared variable pins it: `model(; x, sigma = 0.3) | (; y)` removes the
 `build_kernel` generates the program, and `prepare_query(built, plan, :sampler)`
 returns the log-posterior over the packed unconstrained coordinates.
 
+A model with nothing left to observe needs no `|`: a prior-only model, or one
+whose responses are definitions computed from data. Its call returns the
+binding, and every step that takes a bound plan (`build_kernel`,
+`kernel_expr`, `assign_layout`, the `prepare_*` queries and
+`model_view(built; bound)`) takes the binding too, reading the plan
+`bind_data(binding)` lowers it to. Each step lowers it again; bind once with
+`plan = bind_data(binding)` to share one plan.
+
 An explicitly observed empty vector has zero observations and contributes
 zero log-likelihood. Scalar priors and their transforms still contribute as
 authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an
