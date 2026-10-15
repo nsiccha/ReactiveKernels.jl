@@ -10,7 +10,7 @@ using Test
 # `y .~ Ordinal.(structure, link, eta, Ref(c))` take the cutpoints as an
 # argument, stopping-ratio thresholds are a sized `t[1:n] .~ Normal.(m, s)`
 # vector.
-# Every threshold vector and its prior are declared in the model body.
+# Every sampled threshold vector and its prior are declared in the model body.
 # The ordered-logistic oracle is Turing.jl's `OrderedLogistic(η, c)`
 # definition, P(y = k) = F(c[k] − η) − F(c[k−1] − η), evaluated through
 # Distributions.jl CDFs (Distributions.jl itself has no `OrderedLogistic`).

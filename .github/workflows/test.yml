@@ -161,6 +161,26 @@ jobs:
           RKPPL_TEST_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: julia --startup-file=no --project=packages packages/test.jl ReactiveKernelsPPL
 
+  rkppl-current:
+    name: rkppl (current, native acceptance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Resolve native PPL acceptance dependencies
+        run: julia --startup-file=no packages/setup_ppl_native.jl "$RUNNER_TEMP/rkppl-native"
+      - name: Test native PPL on Julia-current
+        env:
+          RKPPL_TEST_BACKENDS: native
+          # Generator and query exercise fresh methods and explicit Enzyme
+          # Reverse gradients; the runner preserves all earlier helper loads.
+          RKPPL_TEST_FILES: test_contract.jl,test_layout.jl,test_preprocessing.jl,test_generator.jl,test_query.jl,test_corpus.jl
+        run: julia --startup-file=no --check-bounds=yes --project="$RUNNER_TEMP/rkppl-native" packages/ReactiveKernelsPPL/test/runtests.jl
+
   reactant-integration:
     runs-on: ubuntu-latest
     # The complete optional compiler suite is about 44 minutes on the pinned

@@ -178,6 +178,7 @@ const _PPL_TEST_FILES = (
     "test_multivariate_prior_values.jl",
     "test_shared_array_location.jl",
     "test_ordinal_explicit.jl",
+    "test_data_cutpoints.jl",
     "test_capability_shapes.jl",
     "test_capability_shapes_reactant.jl",
     "test_capability_scan_priors.jl",
