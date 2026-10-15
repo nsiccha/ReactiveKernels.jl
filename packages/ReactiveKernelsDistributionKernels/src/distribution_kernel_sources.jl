@@ -1243,29 +1243,40 @@ const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
 # parameter matrices are component laws; rows are positions within the one
 # event. The two nested plates retain both data-derived loops, while the
 # shared mixture fold keeps any family-specific cell density in one place.
+# Each law checks its weight count against its own component count, so the
+# fold's only reader of the component scores is its weighting plate: RK then
+# composes the component plate into that plate, and `logsumexp` streams the
+# weighted scores, without a buffer per event.
+@kernel _product_mixture_fold(component_scores::Vector{Float64},
+        weights::Vector{Float64}) = begin
+    weighted = plate(component_scores, weights) do score, weight
+        log(weight) + score
+    end
+    return LogExpFunctions.logsumexp(weighted)
+end
+
 @kernel product_mixture_logdensity(component_scores::Vector{Float64},
         weights::Vector{Float64}) = begin
     # A singleton vector is broadcast by plate; that would assign one weight
     # to every component instead of representing one weight per component.
     checked_weights = length(component_scores) == length(weights) ?
         weights : throw(DimensionMismatch("mixture weights must match components"))
-    weighted = plate(component_scores, checked_weights) do score, weight
-        log(weight) + score
-    end
-    return reduce(LogExpFunctions.logaddexp, weighted; init = -Inf)
+    return _product_mixture_fold(component_scores, checked_weights)
 end
 
 @kernel bernoulli_product_mixture_logdensity(observed::Vector{Bool},
         probabilities::Matrix{Float64}, weights::Vector{Float64}) = begin
     checked_probabilities = size(probabilities, 1) == length(observed) ?
         probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    checked_weights = size(probabilities, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_probabilities, 2)) do k
         cells = plate(1:length(observed)) do i
             bernoulli(checked_probabilities[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 @kernel binomial_product_mixture_logdensity(observed::Vector{Int},
@@ -1275,13 +1286,15 @@ end
         trials : throw(DimensionMismatch("trial counts and probabilities must match"))
     checked_probabilities = size(probabilities, 1) == length(observed) ?
         probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    checked_weights = size(probabilities, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_probabilities, 2)) do k
         cells = plate(1:length(observed)) do i
             binomial(checked_trials[i, k], checked_probabilities[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 # Logit-scale versions: `logits[i, k]` is component k's log-odds at position i.
@@ -1295,13 +1308,15 @@ end
         logits::Matrix{Float64}, weights::Vector{Float64}) = begin
     checked_logits = size(logits, 1) == length(observed) ?
         logits : throw(DimensionMismatch("logit rows must match observations"))
+    checked_weights = size(logits, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_logits, 2)) do k
         cells = plate(1:length(observed)) do i
             bernoulli(; logit = checked_logits[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 @kernel binomial_logit_product_mixture_logdensity(observed::Vector{Int},
@@ -1311,6 +1326,8 @@ end
         trials : throw(DimensionMismatch("trial counts and logits must match"))
     checked_logits = size(logits, 1) == length(observed) ?
         logits : throw(DimensionMismatch("logit rows must match observations"))
+    checked_weights = size(logits, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_logits, 2)) do k
         cells = plate(1:length(observed)) do i
             binomial(; n = checked_trials[i, k],
@@ -1318,7 +1335,7 @@ end
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 # Zero-inflated Binomial cells, both probabilities on the log-odds scale:

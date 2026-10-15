@@ -648,7 +648,9 @@ associative tree reduction, or an effect-ordering construct.
 
 An authored plate cell can contain another authored plate. Native lowering
 retains each axis as a runtime loop and fuses a selected `sum` into its plate;
-a total-only reader needs no intermediate pointwise arrays. Ragged groups,
+a total-only reader needs no intermediate pointwise arrays. A plate read only
+by `LogExpFunctions.logsumexp` streams the same way, folding each cell into the
+running log-sum-exp with `logaddexp` from `-Inf`, the empty plate's value. Ragged groups,
 empty groups, and array views use the same graph and generated loop structure.
 A cell reads an enclosing value whole, as a Julia closure does: the observation
 cells below read the kernel's `scale` directly, with no `Ref` argument.
@@ -670,10 +672,12 @@ rule is required. The native acceptance suite also replays the displayed
 authoring source in a fresh module without its producer's operation table.
 
 Compiled nested plate regions are not implemented yet: traced execution reports
-that capability gap explicitly. Native lowering of a cell containing another
-plate currently executes the whole selected cell graph per outer coordinate;
-it does not apply the scalar-only plate scheduler's outer invariant hoisting
-across that boundary.
+that capability gap explicitly. A cell containing another plate gives up the
+work that reads only shared values (captured or `Ref` arrays, scalars, and
+values computed from them alone) before lowering: that work runs once, in
+front of the outer loop, and the cell reads its results whole. The rest of the
+cell graph, including its inner loops, runs per outer coordinate. As for a flat
+plate's invariants, the moved work also runs when the outer domain is empty.
 
 ### One cell of a plate
 

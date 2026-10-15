@@ -219,7 +219,10 @@ loglik(event, probabilities, weights)
 A PPL model can pass one complete response vector to `LogDensity` with this
 kernel. An outer `@plate` may select several such vectors; each outer cell
 then has its own marginalized component, and the inner RK plates retain the
-positions within that event.
+positions within that event. The component scores stream through the outer
+`logsumexp` fold, so an event allocates no score vector, and an argument that
+does not vary by event (a shared probability matrix or weight vector written
+in the cell) is computed once, before the outer loop.
 
 `bernoulli_logit_product_mixture_logdensity(observed, logits, weights)` and
 `binomial_logit_product_mixture_logdensity(observed, trials, logits, weights)`
