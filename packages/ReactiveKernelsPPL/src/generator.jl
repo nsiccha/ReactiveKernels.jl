@@ -1974,8 +1974,9 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
     if r.family === GaussianFam
         # Base case (no evidence, weights, ranges, packed rows or missing
         # entries; one shared scalar scale) whose location is a data-matrix
-        # product `M * v`, optionally plus a sampled intercept: the
-        # NormalIDGLM density. The per-cell plate keeps `:pointwise`.
+        # product `M * v`, optionally plus a sampled intercept: sum its
+        # Normal density through ordinary residual-and-dot arithmetic.
+        # The per-cell plate keeps `:pointwise`.
         if r.evidence.kind === :none && r.weights === nothing &&
                 r.range === nothing && r.mi_jobs === nothing && r.link === IdentityLink &&
                 !haskey(plan.columns, _observed_mask_name(r.response)) &&
@@ -1984,8 +1985,8 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
                 _wholevec_rows(r, plan) && _wholevec_scalar_scale(r, plan)
             # `alpha .+ M * v` broadcasts its scalar intercept, yet the
             # matched data-matrix product reads the whole design.
-            glm = _gaussian_glm_location(r, plan)
-            glm === nothing || return _gaussian_glm_stmts(r, plan, node, glm...)
+            _is_gaussian_design_location(r, plan) &&
+                return _gaussian_design_stmts(r, plan, node)
         end
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
@@ -2952,18 +2953,14 @@ end
 
 # A Gaussian response located at `M * v` (inline or named) or
 # `alpha .+ M * v` (bound data matrix `M`, vector value `v`, sampled
-# scalar `alpha`) has the NormalIDGLM density and reads the owned rule (DK
-# `normal_id_glm_lpdf`): one `M'r` product in reverse, where the plate
-# differentiated `M * v` and every cell. `sigma > 0` keeps the plate cell's
-# guard; the plate (`_through_pointwise`) keeps the `:pointwise` densities,
-# and the location node stays available to its other readers.
-# Returns `(M, alpha, v)` (`alpha = 0.0` without an intercept) or `nothing`.
-function _gaussian_glm_location(r::LikelihoodSpec, plan::StructuralPlan)
-    _is_latent_location(r, plan) && return nothing
+# scalar `alpha`) can sum its density from the location's residual vector.
+# The explicit NormalIDGLM object alone selects the owned derivative rule.
+function _is_gaussian_design_location(r::LikelihoodSpec, plan::StructuralPlan)
+    _is_latent_location(r, plan) && return false
     i = findfirst(p -> p.name === r.predictor, plan.predictors)
-    i === nothing && return nothing
+    i === nothing && return false
     pred = plan.predictors[i]
-    pred.link === IdentityLink || return nothing
+    pred.link === IdentityLink || return false
     alpha, product = 0.0, nothing
     for t in pred.terms
         if t.kind === InterceptTerm && alpha isa Real &&
@@ -2975,42 +2972,51 @@ function _gaussian_glm_location(r::LikelihoodSpec, plan::StructuralPlan)
                 t.options.tree isa Symbol
             product = t.options.tree
         else
-            return nothing
+            return false
         end
     end
-    product === nothing && return nothing
+    product === nothing && return false
     j = findfirst(d -> d.name === product, plan.derived)
-    j === nothing && return nothing
+    j === nothing && return false
     ex = plan.derived[j].expr
-    Meta.isexpr(ex, :call, 3) && ex.args[1] === :* || return nothing
+    Meta.isexpr(ex, :call, 3) && ex.args[1] === :* || return false
     M, v = ex.args[2], ex.args[3]
-    M isa Symbol && v isa Symbol || return nothing
-    get(plan.columns, M, nothing) isa AbstractMatrix{<:Real} || return nothing
-    get(plan.columns, r.response, nothing) isa AbstractVector{<:Real} || return nothing
+    M isa Symbol && v isa Symbol || return false
+    get(plan.columns, M, nothing) isa AbstractMatrix{<:Real} || return false
+    get(plan.columns, r.response, nothing) isa AbstractVector{<:Real} || return false
     scalar(a) = any(q -> q.name === a, plan.parameters) || get(plan.columns, a, nothing) isa Real
-    alpha isa Symbol && !scalar(alpha) && return nothing
+    alpha isa Symbol && !scalar(alpha) && return false
     vector = any(q -> q.name === v && length(q.dims) == 1, plan.array_parameters) ||
         get(plan.columns, v, nothing) isa AbstractVector{<:Real}
-    vector || return nothing
-    return (M, alpha, v)
+    return vector
 end
 
-function _gaussian_glm_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol,
-        M::Symbol, alpha, v::Symbol)
+# Reuse the authored location instead of rebuilding an augmented design and
+# coefficient vector. The guard stays lazy, including at nonpositive scales;
+# Enzyme differentiates the residual and dot without an RK-only rule.
+function _gaussian_design_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     stmts = _gaussian_plate_stmts(r, plan, node, _pw_name(r.label))
     s = _scale_plate_arg(r, plan, Expr[])
     sf = s isa Real ? Float64(s) :
         s isa Symbol && haskey(plan.columns, s) ? :(Float64($s)) : s
     yf = _yfloat_name(r.label)
-    xaug = Symbol(:_ppl_glm_X_, r.label)
-    bfull = Symbol(:_ppl_glm_b_, r.label)
-    xaug_expr, bfull_expr = _glm_design_args(M, alpha, v, _response_rows_source(plan, r))
+    loc = _location_node(r, plan)
+    residual = Symbol(:_ppl_normal_residual_, r.label)
+    ss = Symbol(:_ppl_normal_ss_, r.label)
+    nf = Symbol(:_ppl_normal_n_, r.label)
+    prec = Symbol(:_ppl_normal_prec_, r.label)
     return Expr[
         _through_pointwise(stmts, r)...,
         :($yf = Float64.($(r.response))),
-        :($xaug = $xaug_expr),
-        :($bfull = $bfull_expr),
-        :($node::Float64 = $sf > 0 ? normal_id_glm_lpdf($xaug, $bfull, $sf, $yf) : -Inf),
+        :($node::Float64 = if $sf > 0
+            $residual = $yf .- $loc
+            $ss = dot($residual, $residual)
+            $nf = length($yf) * 1.0
+            $prec = 1.0 / ($sf * $sf)
+            -0.5 * $ss * $prec - $nf * (log($sf) + 0.5 * log(2 * π))
+        else
+            -Inf
+        end),
     ]
 end
 
