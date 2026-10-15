@@ -163,4 +163,57 @@ end
 @testset "a returned graph executes before namespace binding discovery" begin
     immediate_namespace()
 end
+
+# A history-scan step large enough that inlining it is a cost decision: a
+# max-shifted log-sum-exp over the previous step's K outputs.
+@kernel scan_logsumexp(log_emissions, log_transition) = begin
+    K = size(log_emissions, 2)
+    T = size(log_emissions, 1)
+    forward = scan(1:(T * K); init = 0, history = 0.0) do carry, cell, earlier
+        t = (cell - 1) ÷ K + 1
+        j = (cell - 1) % K + 1
+        previous = (t - 2) * K
+        shift = t == 1 ? 0.0 : maximum(earlier[previous + i] for i in 1:K)
+        incoming = t == 1 ? 0.0 : isfinite(shift) ?
+            shift + log(sum(exp(earlier[previous + i] - shift + log_transition[i, j])
+                for i in 1:K; init = 0.0)) : shift
+        (carry, incoming + log_emissions[t, j])
+    end
+    total = sum(forward)
+    return total
+end
+
+function out_of_line_source_calls(kernel, args)
+    kernel isa ReactiveKernels.PreparedKernel || throw(ArgumentError(
+        "expected a PreparedKernel, got $(typeof(kernel))"))
+    code, _ = only(Base.code_typed(kernel, Tuple{map(typeof, args)...}; optimize = true))
+    count(code.code) do statement
+        statement isa Expr && statement.head === :invoke || return false
+        instance = statement.args[1]
+        instance isa Core.CodeInstance && (instance = instance.def)
+        instance.def.name === :_KernelSourceFunction
+    end
+end
+
+# `prepare_sampler` converts every operation of a prepared kernel to the
+# latest-world call mode. That mode once left a large step body behind a call
+# per scan step, which made native Enzyme reverse through an HMM forward pass
+# 2.5–3× slower than the same kernel in the guarded mode (snag
+# `rkppl-hmm-forwar-89257681`). Both modes inline the source call.
+@testset "latest-world source calls are inlined into their operations" begin
+    e = [sin(3t + k) for t in 1:40, k in 1:3]
+    lt = log.([0.8 0.1 0.1; 0.2 0.6 0.2; 0.3 0.3 0.4])
+    guarded = prepare(scan_logsumexp)
+    latest = ReactiveKernels._kernel_latest_prepared(guarded)
+    @test out_of_line_source_calls(guarded, (e, lt)) == 0
+    @test out_of_line_source_calls(latest, (e, lt)) == 0
+    @test Base.invokelatest(latest, e, lt) == guarded(e, lt)
+    function gradient_of(kernel)
+        de = zero(e)
+        Base.invokelatest(Enzyme.autodiff, Enzyme.Reverse, Enzyme.Const(kernel),
+            Enzyme.Active, Enzyme.Duplicated(e, de), Enzyme.Const(lt))
+        de
+    end
+    @test gradient_of(latest) == gradient_of(guarded)
+end
 end

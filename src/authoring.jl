@@ -1299,11 +1299,96 @@ end
 # arm closure as a bare gensym with no method definition. Such positions inline
 # the endpoint's planned recipes as source instead (see below), which keeps the
 # arm lazy and evaluates the endpoint only when the arm is taken. Conditions
-# and first `&&`/`||` operands always evaluate, so they stay strict.
+# and first `&&`/`||` operands always evaluate, so they stay strict. A loop,
+# generator or comprehension term, closure, local function, `let` or `try`
+# body is not strict either: Julia evaluates it zero or more times, and it can
+# read names that scope binds (`m[s]` in `sum(f(m[s]) for s in 1:2)`), so a
+# recipe hoisted out of it would run with a different count or read the
+# names unbound (snag `rk-endpoint-call-d125dbaf`).
 function _kernel_straight_child(ex, i)
     ex.head in (:if, :elseif) && return i == 1
     ex.head in (:(&&), :(||)) && return i == 1
-    return true
+    return !_kernel_is_scope_expr(ex)
+end
+
+# The expressions whose bodies run in their own scope or more than once:
+# loops, generators and comprehensions, closures, `do` blocks, local
+# functions (both forms), `let` and `try`.
+_kernel_is_scope_expr(ex::Expr) =
+    ex.head in (:for, :while, :generator, :comprehension, :try, :->,
+                :function, :do, :let) ||
+    (ex.head === :(=) && _kernel_is_method_signature(ex.args[1]))
+
+_kernel_is_method_signature(lhs) =
+    Meta.isexpr(lhs, (:call, :where)) ||
+    (Meta.isexpr(lhs, :(::)) && Meta.isexpr(lhs.args[1], (:call, :where)))
+
+# The names a scope expression binds for the code inside it: loop and
+# generator variables, closure and local-function parameters, `let`
+# bindings, the `catch` variable, and the names its body assigns. A nested
+# scope adds its own when the endpoint lowering reaches it. A name bound
+# here is never a caller port inside the scope, so an endpoint argument
+# spelling it stays in place.
+function _kernel_scope_binders!(names::Set{Symbol}, ex::Expr)
+    if ex.head === :for
+        foreach(it -> _kernel_iterator_binders!(names, it),
+                _kernel_iterators(ex.args[1]))
+        _kernel_scope_assignments!(names, ex.args[2])
+    elseif ex.head === :generator
+        foreach(it -> _kernel_iterator_binders!(names, it), ex.args[2:end])
+        _kernel_scope_assignments!(names, ex.args[1])
+    elseif ex.head === :->
+        _kernel_bound_names!(names, ex.args[1])
+        _kernel_scope_assignments!(names, ex.args[2])
+    elseif ex.head === :function || ex.head === :(=)
+        _kernel_function_parameters!(names, ex.args[1])
+        length(ex.args) >= 2 && _kernel_scope_assignments!(names, ex.args[2])
+    elseif ex.head === :let
+        bindings = ex.args[1]
+        for binding in (Meta.isexpr(bindings, :block) ? bindings.args : (bindings,))
+            target = Meta.isexpr(binding, :(=)) ? binding.args[1] : binding
+            _kernel_bound_names!(names, target)
+        end
+        _kernel_scope_assignments!(names, ex.args[2])
+    elseif ex.head === :while
+        _kernel_scope_assignments!(names, ex.args[2])
+    elseif ex.head === :try
+        length(ex.args) >= 2 && ex.args[2] isa Symbol && push!(names, ex.args[2])
+        foreach(block -> _kernel_scope_assignments!(names, block), ex.args)
+    end
+    names
+end
+
+function _kernel_iterator_binders!(names::Set{Symbol}, iterator)
+    if Meta.isexpr(iterator, (:(=), :in))
+        _kernel_bound_names!(names, iterator.args[1])
+    elseif Meta.isexpr(iterator, (:filter, :block))
+        foreach(it -> _kernel_iterator_binders!(names, it),
+                iterator.args[(iterator.head === :filter ? 2 : 1):end])
+    end
+    names
+end
+
+# Assignment targets and `local` declarations of one scope body, without
+# entering the scopes nested in it.
+function _kernel_scope_assignments!(names::Set{Symbol}, ex)
+    ex isa Expr || return names
+    ex.head in (:quote, :inert) && return names
+    if _kernel_is_scope_expr(ex)
+        # A local function's name belongs to this scope, its body to its own.
+        ex.head in (:function, :(=)) && _kernel_function_name!(names, ex.args[1])
+        return names
+    end
+    if ex.head === :(=)
+        _kernel_assignment_names!(names, ex.args[1])
+    elseif ex.head === :local
+        for declaration in ex.args
+            _kernel_assignment_names!(names,
+                Meta.isexpr(declaration, :(=)) ? declaration.args[1] : declaration)
+        end
+    end
+    foreach(arg -> _kernel_scope_assignments!(names, arg), ex.args)
+    names
 end
 
 function _kernel_note_endpoint_port_type!(local_types, actual::Symbol, formal)
@@ -1333,9 +1418,9 @@ const _KERNEL_INLINE_REJECT_HEADS = Set{Symbol}([
 ])
 
 _kernel_inline_reject(endpoint_name, context, why) = throw(ArgumentError(
-    "endpoint :$endpoint_name $context cannot be evaluated under a branch " *
-    "arm ($why); hoist the endpoint call above the branch into its own " *
-    "recipe, where it splices transparently"))
+    "endpoint :$endpoint_name $context cannot be evaluated in place under a " *
+    "branch arm, loop, generator or closure ($why); call it in its own " *
+    "recipe or plate cell outside them, where it splices transparently"))
 
 # Substitute endpoint recipe inputs with caller expressions. Only pure value
 # positions are rewritten: quoted content is inert data, keyword/named-field
@@ -1712,7 +1797,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                                       materialized = Tuple{Symbol,Any,Any}[],
                                       cell_locals::Set{Symbol} = Set{Symbol}(),
                                       straight::Bool = true,
-                                      lift_specs::Bool = true,
+                                      scoped::Set{Symbol} = Set{Symbol}(),
                                       endpoint_cache = IdDict{Any,Dict{Any,KernelSpec}}(),
                                       lift_scope::Union{Nothing,Symbol} = nothing,
                                       boundary_types = Dict{Symbol,Vector{Any}}())
@@ -1738,7 +1823,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         callee = ex.args[1]
         if callee isa Expr && callee.head === :. && length(callee.args) == 2 &&
                 callee.args[2] isa QuoteNode && !(callee.args[1] isa Expr &&
-                callee.args[1].head === :call)
+                callee.args[1].head === :call) && !(callee.args[1] in scoped)
             object = _kernel_resolve_binding(mod, callee.args[1])
             name = callee.args[2].value
             if object isa Union{KernelObjectSpec,_StatefulKernelSkeleton} &&
@@ -1757,7 +1842,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         end
         if callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
            callee.args[1] isa Expr && callee.args[1].head === :call &&
-           callee.args[2] isa QuoteNode
+           callee.args[2] isa QuoteNode && !(callee.args[1].args[1] in scoped)
             constructor = callee.args[1]
             object = _kernel_resolve_binding(mod, constructor.args[1])
             endpoint_name = callee.args[2].value
@@ -1836,7 +1921,9 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 owner_ports = Any[]
                 for (index, (formal, actual)) in
                         enumerate(zip(owner_formals, owner_actuals))
-                    if actual isa Symbol && actual in locals
+                    # A name an enclosing loop, generator, closure or `let`
+                    # binds is read in place (`straight` is false there).
+                    if actual isa Symbol && (actual in scoped || actual in locals)
                         push!(owner_ports, actual)
                         continue
                     elseif actual isa Symbol && !(actual in cell_locals)
@@ -1857,8 +1944,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
                         cell_locals = cell_locals, straight = straight,
-                        endpoint_cache = endpoint_cache, lift_scope = lift_scope,
-                        boundary_types = boundary_types)
+                        scoped = scoped, endpoint_cache = endpoint_cache,
+                        lift_scope = lift_scope, boundary_types = boundary_types)
                     if straight
                         generated_port = gensym(Symbol(formal, :_binding))
                         generated_type = valtype(endpoint_inputs[index])
@@ -1883,7 +1970,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 # owner binding above.
                 endpoint_ports = Any[]
                 for (index, actual) in enumerate(endpoint_actuals)
-                    if actual isa Symbol && actual in locals
+                    if actual isa Symbol && (actual in scoped || actual in locals)
                         push!(endpoint_ports, actual)
                         continue
                     elseif actual isa Symbol
@@ -1894,7 +1981,8 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                     rewritten_actual, _ = _kernel_constructed_endpoint(
                         actual, mod, locals, nested_specs, local_types;
                         context = context, materialized = materialized,
-                        straight = straight, endpoint_cache = endpoint_cache,
+                        straight = straight, scoped = scoped,
+                        endpoint_cache = endpoint_cache,
                         lift_scope = lift_scope, boundary_types = boundary_types)
                     if straight
                         generated_port = gensym(Symbol(explicit[index], :_argument))
@@ -1934,10 +2022,13 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
                 # instead, so each arm carries its own endpoint evaluation
                 # with the authored lazy semantics — ordinary transparent
                 # math, differentiable by the backend's usual reverse mode.
-                # Only named caller ports take endpoint boundary types; inline
-                # binding sources are not ports.
+                # A loop, generator term or closure body is inlined the same
+                # way: it runs once per iteration or call and may read the
+                # names it binds. Only named caller ports take endpoint
+                # boundary types; inline binding sources and scope-bound names
+                # are not ports.
                 for (actual, formal) in zip(actuals, inputs(endpoint))
-                    actual isa Symbol ||
+                    actual isa Symbol && !(actual in scoped) ||
                         continue
                     _kernel_note_endpoint_port_type!(
                         local_types, actual, formal)
@@ -1951,15 +2042,15 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
 
     rewritten = Any[]
     child_types = Any[]
+    child_scoped = _kernel_is_scope_expr(ex) ?
+        _kernel_scope_binders!(copy(scoped), ex) : scoped
     for (i, arg) in enumerate(ex.args)
         child, child_type = _kernel_constructed_endpoint(
             arg, mod, locals, nested_specs, local_types;
             context = context, materialized = materialized,
             cell_locals = cell_locals,
             straight = straight && _kernel_straight_child(ex, i),
-            lift_specs = lift_specs && !(ex.head in
-                (:for, :while, :generator, :comprehension, :try, :->,
-                 :function, :do, :let)), endpoint_cache = endpoint_cache,
+            scoped = child_scoped, endpoint_cache = endpoint_cache,
             lift_scope = ex.head === :(=) && i == 2 ?
                 _kernel_lift_scope(ex.args[1]) : lift_scope,
             boundary_types = boundary_types)
@@ -1969,10 +2060,9 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
         # becomes an opaque runtime call, or an endpoint's generated name has
         # no callable binding. A multi-output child lifts to its tuple value
         # (`child(x)[1]`). Lazy arms and deferred lexical scopes retain their
-        # evaluation position.
+        # evaluation position (`_kernel_straight_child`).
         child_spec = _kernel_called_spec(child, mod, locals, nested_specs)
-        if lift_specs && straight && _kernel_straight_child(ex, i) &&
-           child_spec !== nothing
+        if straight && _kernel_straight_child(ex, i) && child_spec !== nothing
             endpoint_port = _kernel_lifted_port(locals, lift_scope,
                 _kernel_lifted_call_name(child.args[1], child_spec, nested_specs))
             push!(materialized, (endpoint_port, child_type, child))
@@ -1984,7 +2074,7 @@ function _kernel_constructed_endpoint(ex, mod, locals::Set{Symbol},
     end
     rewritten_ex = Expr(ex.head, rewritten...)
     spec = _kernel_called_spec(rewritten_ex, mod, locals, nested_specs)
-    if lift_specs && straight && spec !== nothing &&
+    if straight && spec !== nothing &&
        all(arg -> !(arg isa Expr && arg.head in (:parameters, :kw, :(...))),
            rewritten[2:end])
         # A composed numerical graph takes values, including literals and
@@ -3360,14 +3450,16 @@ end
 # Whether a fold's term (or condition) is anything but a plain expression: an
 # assignment or declaration (scoping the rewrite does not reason about),
 # `return`/`break`/`continue`/a label (they belong to the generator's closure),
-# a loop, `let`, `try`, or a macro call (opaque syntax).  A nested generator's
+# a loop, a `let` other than a plain binding list (`_kernel_fold_plain_let`),
+# `try`, or a macro call (opaque syntax).  A nested generator's
 # `for` clauses bind its own variables and are not assignments; their
 # iterators and the generator's term are checked.
 function _kernel_fold_term_escapes(ex)
     ex isa Expr || return false
     ex.head in (:quote, :inert, :meta) && return false
+    ex.head === :let && return !_kernel_fold_plain_let(ex)
     ex.head in (:return, :break, :continue, :local, :global, :const, :for, :while,
-                :try, :macrocall, :let, :function, :symboliclabel, :symbolicgoto) &&
+                :try, :macrocall, :function, :symboliclabel, :symbolicgoto) &&
         return true
     _kernel_tensorized_assignment_head(ex.head) && return true
     if ex.head === :kw && length(ex.args) == 2
@@ -3379,6 +3471,21 @@ function _kernel_fold_term_escapes(ex)
         end
     end
     any(_kernel_fold_term_escapes, ex.args)
+end
+
+# A `let` whose header only binds names to plain values and whose body is a
+# plain expression (`let a = m[s], b = log(a); b - a end`, the form a
+# constructed endpoint takes when inlined in a generator term) is itself a
+# plain expression: its bindings are new locals in the loop body exactly as
+# in the generator's closure.
+function _kernel_fold_plain_let(ex::Expr)
+    length(ex.args) == 2 || return false
+    bindings = ex.args[1]
+    list = Meta.isexpr(bindings, :block) ? bindings.args : Any[bindings]
+    all(binding -> Meta.isexpr(binding, :(=)) && length(binding.args) == 2 &&
+                   binding.args[1] isa Symbol &&
+                   !_kernel_fold_term_escapes(binding.args[2]), list) &&
+        !_kernel_fold_term_escapes(ex.args[2])
 end
 
 # `begin`/`end` inside an index denote the indexed array's first/last index;

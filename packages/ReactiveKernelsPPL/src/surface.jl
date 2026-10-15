@@ -937,8 +937,8 @@ function _ordinary_sampling(s)
     s.broadcast && return false
     rhs = s.rhs
     return rhs isa Expr && rhs.head === :call &&
-        rhs.args[1] in union(keys(_PARAM_FAMILIES),
-            (:HalfNormal, :HalfCauchy, :Flat, :truncated, :restricted)) || _external_rhs(rhs)
+        (rhs.args[1] in _SCALAR_PRIOR_HEADS ||
+         rhs.args[1] in (:truncated, :restricted)) || _external_rhs(rhs)
 end
 
 function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
@@ -1125,9 +1125,19 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # context before shaping definitions, then confirm it on the final plan.
     prior_defs = Pair{Symbol,Any}[Symbol(:_ppl_prior_input_, s.lhs) => s.rhs
         for s in sample if s.lhs in sized_decls]
-    whole = _whole_value_data(vcat(det, prior_defs), data,
-        _statement_names(ast, union(data, Set{Symbol}(keys(detmap)));
-            whole_priors = sized_decls))
+    # Data and `hcat` values can be the matrix of a product `M * v`, whose
+    # vector `v` is read whole (`_matrix_product_operand`).
+    product_matrices = union(data, matrix_values)
+    # A statement's whole reads (the vector of a product, a gathered value)
+    # are whole exactly as in its named definition.
+    statement_whole = Set{Symbol}()
+    held = _statement_names(ast, union(data, Set{Symbol}(keys(detmap)));
+        whole_priors = sized_decls, matrices = product_matrices,
+        whole_reads = statement_whole)
+    statement_defs = Pair{Symbol,Any}[Symbol("#statement_whole_reads") =>
+        Expr(:call, GlobalRef(Base, :identity), sort!(collect(statement_whole))...)]
+    whole = _whole_value_data(vcat(det, prior_defs, statement_defs), data,
+        held; matrices = product_matrices)
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
     # remains Julia's business at bind/evaluation, never an observation axis.
@@ -1141,10 +1151,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # (`y = f(raw)`). `bind_data` evaluates the definition once and
     # validates its value as the response; a number is one observation, as
     # when bound as data. An ordinary `hcat` matrix value
-    # (`_route_hcat_values`) is observed as the same matrix bound as data.
+    # (`_route_hcat_values`) is observed as the same matrix bound as data,
+    # whether its columns give it observation rows (`:matrix`) or make it a
+    # model-level array (`hcat(v, w)` of whole-value data, `:array`).
     for nm in derived_response_names
         shape = get(detshape, nm, nothing)
-        shape === :scalar || (shape === :matrix && nm in matrix_values) || continue
+        shape === :scalar || (shape in (:matrix, :array) && nm in matrix_values) ||
+            continue
         rhs = detmap[nm]
         !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
             (detshape[nm] = :vector)
@@ -3140,8 +3153,9 @@ end
 # definitions, with each per-observation statement read (`held`: a
 # response, prior, `@plate`, …) pinned observation-aligned.
 # `_confirm_whole_value_data` checks these inputs against the finished plan.
-function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
-    inputs, _ = _whole_value_reads(det, data, held)
+function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol};
+        matrices::AbstractSet{Symbol} = data)
+    inputs, _ = _whole_value_reads(det, data, held; matrices)
     return setdiff!(inputs, held)
 end
 
@@ -3152,8 +3166,12 @@ end
 # kernel cells remain consumers too: a schedule-chain definition moved out
 # of `det` still reads its subject-level predictors. Otherwise those now
 # apparently unused definitions would be classified as whole values.
+# `whole_reads` receives what an ordinary statement reads whole (a gathered
+# value, the vector of a matrix product).
 function _statement_names(ast::Expr, known::Set{Symbol};
-        whole_priors::Set{Symbol} = Set{Symbol}())
+        whole_priors::Set{Symbol} = Set{Symbol}(),
+        matrices::AbstractSet{Symbol} = _NO_MATRIX_OPERANDS,
+        whole_reads::Set{Symbol} = Set{Symbol}())
     out = Set{Symbol}()
     whole = Set{Symbol}()
     for st in ast.args
@@ -3183,7 +3201,7 @@ function _statement_names(ast::Expr, known::Set{Symbol};
             _classify_reads!(whole, out, _stmt_lhs(st), known, true)
             _classify_reads!(whole, out, last(st.args), known, true)
         else
-            _classify_reads!(whole, out, st, known, false)
+            _classify_reads!(whole_reads, out, st, known, false; matrices)
         end
     end
     free = copy(known)
@@ -4227,8 +4245,22 @@ function _categorical_plate_cell(c, plate_defs::Set{Symbol}, data::Set{Symbol})
     Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :Categorical &&
         rhs.args[2] isa Symbol && rhs.args[2] ∉ plate_defs && return c
     Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :Categorical || return c
+    p = rhs.args[2]
+    if Meta.isexpr(p, :call, 3) && p.args[1] === :* && p.args[2] isa Symbol &&
+            Meta.isexpr(p.args[3], :ref, 3) && p.args[3].args[1] isa Symbol &&
+            p.args[3].args[2] === :(:)
+        # `A * B[:, j]`: each observation reads one entry from `A` and `B`
+        # in place; the cell's value is the checked column `j`.
+        A, B, j = p.args[2], p.args[3].args[1], p.args[3].args[3]
+        column = Expr(:call, GlobalRef(@__MODULE__, :_ppl_categorical_column),
+            Expr(:call, GlobalRef(@__MODULE__, :_ppl_categorical_columns), A),
+            A, B, j)
+        density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
+            GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), A, B, column)
+        return Expr(:call, c.args[1], c.args[2], density)
+    end
     probabilities = Expr(:call,
-        GlobalRef(@__MODULE__, :_ppl_categorical_probabilities), rhs.args[2])
+        GlobalRef(@__MODULE__, :_ppl_categorical_probabilities), p)
     density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
         GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), probabilities)
     return Expr(:call, c.args[1], c.args[2], density)
@@ -4339,14 +4371,15 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
     return out, ctx, params
 end
 
-# A computed categorical probability vector that reads the loop index only
-# through one integer data column (`phi * theta[:, doc[i]]`) is the same
-# vector at every index sharing that column's value. Return that column,
-# or `nothing` when the vector reads the index any other way (`x[i]`, a
-# bare `i`, a per-index local or latent, or two key columns).
+# A computed categorical probability vector (or checked column) that reads
+# the loop index only through one integer data column
+# (`phi * theta[:, doc[i]]`) is the same at every index sharing that column's
+# value. Return that column, or `nothing` when it reads the index any other
+# way (`x[i]`, a bare `i`, a per-index local or latent, or two key columns).
 function _categorical_key_column(ex, locals, ivar::Symbol, data::Set{Symbol})
     Meta.isexpr(ex, :call) && !isempty(ex.args) &&
-        ex.args[1] == GlobalRef(@__MODULE__, :_ppl_categorical_probabilities) ||
+        (ex.args[1] == GlobalRef(@__MODULE__, :_ppl_categorical_probabilities) ||
+         ex.args[1] == GlobalRef(@__MODULE__, :_ppl_categorical_column)) ||
         return nothing
     keys = Set{Symbol}()
     keyed = true
@@ -11632,6 +11665,13 @@ const _PARAM_FAMILIES = Dict{Symbol,Symbol}(
     :Weibull => :weibull,
 )
 
+# Every head `_parse_prior` reads as a scalar prior object: the families,
+# the improper `Flat()` and the half wrappers. `truncated` / `restricted`
+# wrap any of them, so an array prior un-dots and holds them alike
+# (`restricted.(Flat.(), 0, Inf)`, `truncated.(HalfNormal.(s), 0, 2)`).
+const _SCALAR_PRIOR_HEADS = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
+    Set{Symbol}((:Flat, :HalfNormal, :HalfCauchy)))
+
 # Families whose positional prior arguments hoist (scalar `~` and per-cell
 # latent priors); `truncated(D(...), lo, hi)` hoists D's arguments only.
 const _HOIST_FAMILIES = union(Set{Symbol}(keys(_PARAM_FAMILIES)),
@@ -11819,7 +11859,8 @@ end
 # `<stem>_<slices>` (`:mvnormal_cholesky_rows`, `:dirichlet_cols`,
 # `:mvnormal_vector`, …).
 const _MV_SLICE_STEMS = (MvNormalCholesky = :mvnormal_cholesky,
-    MvNormal = :mvnormal, Dirichlet = :dirichlet, Ordered = :ordered_normal)
+    MvNormal = :mvnormal, Dirichlet = :dirichlet, Ordered = :ordered_normal,
+    ICAR = :icar)
 
 # The head of a multivariate distribution `D(args...)` / `D.(args...)`
 # (`nothing` otherwise).
@@ -11831,10 +11872,11 @@ function _mv_head(rhs)
     return h
 end
 
-# Multivariate normals also declare one vector (`b[1:K] ~ MvNormal(...)`);
-# a simplex and an ordered vector keep their unsized declarations
+# Multivariate normals also declare one vector (`b[1:K] ~ MvNormal(...)`),
+# and an ICAR field is only ever one node vector (`phi[1:N] ~ ICAR(node1,
+# node2)`); a simplex and an ordered vector keep their unsized declarations
 # (`phi ~ Dirichlet(alpha)`, `c ~ Ordered(Normal(0, 1), K)`).
-_mv_vector_head(rhs) = _mv_head(rhs) in (:MvNormalCholesky, :MvNormal)
+_mv_vector_head(rhs) = _mv_head(rhs) in (:MvNormalCholesky, :MvNormal, :ICAR)
 
 _is_slice_iterator(a) = a isa Expr && a.head === :call &&
     length(a.args) == 2 && a.args[1] in (:eachrow, :eachcol)
@@ -11956,6 +11998,22 @@ function _mv_slice_args(::Val{:Dirichlet}, what, args)
     return (arg1 = _slice_vector_arg(what, :Dirichlet, "concentration",
         args[1]),)
 end
+# An ICAR edge list: one integer node index per edge, read whole. It is
+# data (or a data-only definition), checked at binding.
+function _icar_edge_arg(what, role, a)
+    (a isa Real || a isa Bool) && _sfail("$what: the `ICAR` $role is an " *
+        "integer node vector with one entry per edge, got the scalar $(repr(a))")
+    a isa Expr || a isa Symbol || _sfail("$what: `ICAR` $role $(repr(a)) " *
+        "is not a value")
+    return a
+end
+function _mv_slice_args(::Val{:ICAR}, what, args)
+    length(args) == 2 || _sfail("$what: `ICAR` takes the two node vectors " *
+        "of the edge list, `ICAR(node1, node2)` (edge e joins node1[e] and " *
+        "node2[e]), got $(length(args)) arguments")
+    return (arg1 = _icar_edge_arg(what, "first node vector", args[1]),
+        arg2 = _icar_edge_arg(what, "second node vector", args[2]))
+end
 function _mv_slice_args(::Val{:Ordered}, what, args)
     length(args) == 2 || _sfail("$what: `Ordered` takes (element " *
         "distribution, length) — `Ordered(Normal(m, s), K)`")
@@ -11993,6 +12051,9 @@ function _lower_array_slices(lhs, dims::Vector{Any}, slices::Symbol, rhs,
             "got $(repr(rhs))" * (h isa Symbol ? " (an elementwise prior " *
             "is `$lhs[a, b] .~ $h.(…)`)" : ""))
     end
+    head === :ICAR && slices !== :vector && _sfail("$what: an `ICAR` " *
+        "field is one node vector, `$lhs[1:N] ~ ICAR(node1, node2)`; " *
+        "rows or columns of independent ICAR fields are not built yet")
     dotted = rhs.head === :.
     dotted && !(rhs.args[2] isa Expr && rhs.args[2].head === :tuple) &&
         _sfail("$what: malformed broadcast $(repr(rhs))")
@@ -12015,7 +12076,9 @@ function _lower_array_slices(lhs, dims::Vector{Any}, slices::Symbol, rhs,
 end
 
 # `Fam.(args...)` → `Fam(args...)`, recursively through the distribution
-# arguments of `truncated.(...)` (`truncated.(Normal.(0, s), 0, Inf)`).
+# arguments of `truncated.(...)` / `restricted.(...)`
+# (`truncated.(Normal.(0, s), 0, Inf)`, `restricted.(Flat.(), 0, Inf)`).
+# A nested wrapper un-dots too, so its scalar refusal names the nesting.
 function _undot_distribution(lhs, rhs)
     Meta.isexpr(rhs, :call) && return rhs
     rhs isa Expr && rhs.head === :. && length(rhs.args) == 2 &&
@@ -12025,7 +12088,8 @@ function _undot_distribution(lhs, rhs)
             "Normal.(0, 1)`), got $(repr(rhs))")
     f = rhs.args[1]
     args = Any[a isa Expr && a.head === :. && length(a.args) == 2 &&
-            a.args[1] isa Symbol && haskey(_PARAM_FAMILIES, a.args[1]) ?
+            (a.args[1] in _SCALAR_PRIOR_HEADS ||
+             a.args[1] in (:truncated, :restricted)) ?
             _undot_distribution(lhs, a) : a for a in rhs.args[2].args]
     return Expr(:call, f, args...)
 end
@@ -12037,7 +12101,7 @@ function _hold_array_args(lhs, call::Expr, held::Dict{Symbol,Any})
     out = Any[call.args[1]]
     for a in call.args[2:end]
         if a isa Expr && a.head === :call && !isempty(a.args) &&
-                a.args[1] isa Symbol && haskey(_PARAM_FAMILIES, a.args[1])
+                a.args[1] in _SCALAR_PRIOR_HEADS
             push!(out, _hold_array_args(lhs, a, held))
         elseif call.args[1] in (:truncated, :restricted)
             push!(out, a)  # support bounds keep the shared scalar grammar
@@ -12220,6 +12284,8 @@ function _parse_prior(lhs, rhs, who, arg, bound, unknown)
                                 "or `truncated(Normal(0, s), 0, Inf)`")
     fam in (:weighted, :censored, :interval_censored) &&
         _sfail("`$fam` applies to responses only ($who)")
+    fam === :ICAR && _sfail("$who: an `ICAR` field has one value per " *
+        "node; declare the nodes, `phi[1:N] ~ ICAR(node1, node2)`")
     fam in (:normal, :cauchy, :exponential, :gamma, :lognormal, :beta,
         :inverse_gamma, :student_t, :laplace, :logistic, :uniform,
         :halfnormal, :halfcauchy) &&
@@ -12308,7 +12374,8 @@ function _lower_bounded_param(lhs, rhs, who, arg, bound, unknown, mode)
         "`$mode` wraps a distribution object, got $(repr(obj))")
     base = _parse_prior(lhs, obj, who, arg, bound, unknown)
     mode === :truncated && base.family === :flat && _sfail("$who: `truncated` needs a " *
-        "proper distribution; bound an improper prior with `Flat` instead")
+        "proper distribution (it divides by the mass inside the bounds); " *
+        "write `restricted(Flat(), lo, hi)` for a bounded flat density")
     base.support_override in (nothing, :positive) || _sfail("$who: " *
         "nested truncations are not yet supported")
     lo, hi = bound(lower), bound(upper)

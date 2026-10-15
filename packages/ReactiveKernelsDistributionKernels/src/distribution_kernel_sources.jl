@@ -185,6 +185,7 @@ export bernoulli_logit_product_mixture_logdensity
 export binomial_logit_product_mixture_logdensity
 export zero_inflated_binomial_logit_product_mixture_logdensity
 export hmm_logdensity, normal_hmm_logdensity, exponential_hmm_logdensity
+export icar_logdensity
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
 export beta_binomial
@@ -1242,29 +1243,40 @@ const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
 # parameter matrices are component laws; rows are positions within the one
 # event. The two nested plates retain both data-derived loops, while the
 # shared mixture fold keeps any family-specific cell density in one place.
+# Each law checks its weight count against its own component count, so the
+# fold's only reader of the component scores is its weighting plate: RK then
+# composes the component plate into that plate, and `logsumexp` streams the
+# weighted scores, without a buffer per event.
+@kernel _product_mixture_fold(component_scores::Vector{Float64},
+        weights::Vector{Float64}) = begin
+    weighted = plate(component_scores, weights) do score, weight
+        log(weight) + score
+    end
+    return LogExpFunctions.logsumexp(weighted)
+end
+
 @kernel product_mixture_logdensity(component_scores::Vector{Float64},
         weights::Vector{Float64}) = begin
     # A singleton vector is broadcast by plate; that would assign one weight
     # to every component instead of representing one weight per component.
     checked_weights = length(component_scores) == length(weights) ?
         weights : throw(DimensionMismatch("mixture weights must match components"))
-    weighted = plate(component_scores, checked_weights) do score, weight
-        log(weight) + score
-    end
-    return reduce(LogExpFunctions.logaddexp, weighted; init = -Inf)
+    return _product_mixture_fold(component_scores, checked_weights)
 end
 
 @kernel bernoulli_product_mixture_logdensity(observed::Vector{Bool},
         probabilities::Matrix{Float64}, weights::Vector{Float64}) = begin
     checked_probabilities = size(probabilities, 1) == length(observed) ?
         probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    checked_weights = size(probabilities, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_probabilities, 2)) do k
         cells = plate(1:length(observed)) do i
             bernoulli(checked_probabilities[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 @kernel binomial_product_mixture_logdensity(observed::Vector{Int},
@@ -1274,13 +1286,15 @@ end
         trials : throw(DimensionMismatch("trial counts and probabilities must match"))
     checked_probabilities = size(probabilities, 1) == length(observed) ?
         probabilities : throw(DimensionMismatch("probability rows must match observations"))
+    checked_weights = size(probabilities, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_probabilities, 2)) do k
         cells = plate(1:length(observed)) do i
             binomial(checked_trials[i, k], checked_probabilities[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 # Logit-scale versions: `logits[i, k]` is component k's log-odds at position i.
@@ -1294,13 +1308,15 @@ end
         logits::Matrix{Float64}, weights::Vector{Float64}) = begin
     checked_logits = size(logits, 1) == length(observed) ?
         logits : throw(DimensionMismatch("logit rows must match observations"))
+    checked_weights = size(logits, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_logits, 2)) do k
         cells = plate(1:length(observed)) do i
             bernoulli(; logit = checked_logits[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 @kernel binomial_logit_product_mixture_logdensity(observed::Vector{Int},
@@ -1310,6 +1326,8 @@ end
         trials : throw(DimensionMismatch("trial counts and logits must match"))
     checked_logits = size(logits, 1) == length(observed) ?
         logits : throw(DimensionMismatch("logit rows must match observations"))
+    checked_weights = size(logits, 2) == length(weights) ?
+        weights : throw(DimensionMismatch("mixture weights must match components"))
     components = plate(1:size(checked_logits, 2)) do k
         cells = plate(1:length(observed)) do i
             binomial(; n = checked_trials[i, k],
@@ -1317,7 +1335,7 @@ end
         end
         sum(cells)
     end
-    return product_mixture_logdensity(components, weights)
+    return _product_mixture_fold(components, checked_weights)
 end
 
 # Zero-inflated Binomial cells, both probabilities on the log-odds scale:
@@ -1356,13 +1374,43 @@ end
 #
 # The pass is one history scan over the (step, state) cells: a cell reads the
 # previous step's K cells from the scan's own output, so no step allocates a
-# carried vector (docs/src/scan.md, "Reading earlier outputs"). Each
-# log-sum-exp is a max-shifted generator sum, which runs as an explicit loop.
+# carried vector (docs/src/scan.md, "Reading earlier outputs"). A cell folds
+# its K predecessor terms pairwise with `_hmm_logaddexp`. When one predecessor
+# dominates by more than about 37 in log space, as between well-separated
+# states, each fold step costs one `exp`; a max-shifted `log(sum(exp(...)))`
+# costs K `exp`s and a `log` per cell, whatever the separation.
 @inline _hmm_index(x, axis, i) = size(x, axis) == 1 ? 1 : i
 @inline _hmm_at(x, a, b, c) =
     x[_hmm_index(x, 1, a), _hmm_index(x, 2, b), _hmm_index(x, 3, c)]
 _hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 && size(x, 1) in (1, a) &&
     size(x, 2) in (1, b) && size(x, 3) in (1, c)
+
+# `log(exp(x) + exp(y))` with the values of `LogExpFunctions.logaddexp`,
+# non-finite inputs included. Each arm is the smooth `x + log1pexp(y - x)` with
+# the larger argument outside `log1pexp`, so ordinary reverse mode returns the
+# exact gradient (1/2, 1/2) at a finite tie; `LogExpFunctions.logaddexp` zeroes
+# the difference at every tie and returns (1, 0). Only the infinite tie, whose
+# difference is NaN, returns the shared infinity.
+@inline _hmm_logaddexp(x, y) = x >= y ?
+    (isinf(x) & (x == y) ? x : x + log1pexp(y - x)) : y + log1pexp(x - y)
+
+# The log of the weighted sum over the K predecessors of state j at `step`,
+# whose forward values start after `previous` in the history.
+@inline function _hmm_incoming(earlier, previous, log_transition, j, step, K)
+    total = earlier[previous + 1] + _hmm_at(log_transition, 1, j, step)
+    for i in 2:K
+        total = _hmm_logaddexp(total,
+            earlier[previous + i] + _hmm_at(log_transition, i, j, step))
+    end
+    total
+end
+@inline function _hmm_total(forward, offset, K)
+    total = forward[offset + 1]
+    for k in 2:K
+        total = _hmm_logaddexp(total, forward[offset + k])
+    end
+    total
+end
 
 @kernel hmm_logdensity(log_emissions, transition, initial) = begin
     K = length(initial)
@@ -1375,23 +1423,18 @@ _hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 && size(x, 1) in (1, a) &&
         throw(DimensionMismatch("transition weights must broadcast over states × states × (steps - 1)"))
     log_transition = log.(checked_transition)
     log_initial = log.(initial)
-    forward = scan(1:(T * K); init = 0, history = 0.0) do carry, cell, earlier
+    # A singleton destination axis weighs a move by its origin only, so every
+    # state of a step receives the same incoming term: the step's first cell
+    # computes it and the carry hands it to the others.
+    shared_incoming = size(checked_transition, 2) == 1
+    forward = scan(1:(T * K); init = 0.0, history = 0.0) do carry, cell, earlier
         t = (cell - 1) ÷ K + 1
         j = (cell - 1) % K + 1
-        previous = (t - 2) * K
-        shift = t == 1 ? 0.0 : maximum(earlier[previous + i] for i in 1:K)
-        incoming = t == 1 ? log_initial[j] : isfinite(shift) ?
-            shift + log(sum(exp(earlier[previous + i] - shift +
-                _hmm_at(log_transition, i, j, t - 1)) for i in 1:K; init = 0.0)) :
-            shift
-        (carry, incoming + checked_emissions[t, j])
+        incoming = t == 1 ? log_initial[j] : shared_incoming && j > 1 ? carry :
+            _hmm_incoming(earlier, (t - 2) * K, log_transition, j, t - 1, K)
+        (incoming, incoming + checked_emissions[t, j])
     end
-    final_offset = (T - 1) * K
-    final_shift = T == 0 ? 0.0 : maximum(forward[final_offset + k] for k in 1:K)
-    return T == 0 ? 0.0 : isfinite(final_shift) ?
-        final_shift + log(sum(exp(forward[final_offset + k] - final_shift)
-            for k in 1:K; init = 0.0)) :
-        final_shift
+    return T == 0 ? 0.0 : _hmm_total(forward, (T - 1) * K, K)
 end
 
 # Emission laws observe a vector (one stream) or a steps × streams matrix whose
@@ -1437,6 +1480,30 @@ end
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
     return hmm_logdensity(log_emissions, transition, initial)
+end
+
+# Intrinsic conditional autoregression (ICAR). `phi[k]` is the value at node
+# k of an undirected graph whose edges are the pairs (node1[e], node2[e]),
+# each edge listed once. The unit-scale ICAR log density is the
+# pairwise-difference penalty -1/2 Σ_e (phi[node1[e]] - phi[node2[e]])²: the
+# Gaussian Markov random field whose precision is the graph Laplacian
+# (degrees minus adjacency). It is improper, because adding a constant to
+# every node of a connected component leaves it unchanged, so it carries no
+# normalizer. A model identifies the field with a sum-to-zero constraint or
+# through its likelihood, and scales it outside the law, as BYM2 does.
+#
+# One plate runs over the edges; each cell reads the node vector whole, so no
+# per-edge gather vector is allocated. The named total is a total-only reader,
+# so the sum fuses into the edge loop and no per-edge vector is filled.
+@kernel icar_logdensity(phi, node1, node2) = begin
+    checked_node2 = length(node2) == length(node1) ? node2 :
+        throw(DimensionMismatch("node1 and node2 must list the same number of edges"))
+    squares = plate(node1, checked_node2) do i, j
+        difference = phi[i] - phi[j]
+        difference * difference
+    end
+    total = sum(squares)
+    return -0.5 * total
 end
 
 const BERNOULLI_SOURCE = BERNOULLI_KERNEL_SOURCE * raw"""

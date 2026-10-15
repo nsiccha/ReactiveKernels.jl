@@ -160,4 +160,47 @@ end
         end
     end
 end
+
+# The event-invariant component matrix and weights are computed once, and the
+# law streams its components, so a gradient's allocations do not grow with the
+# number of events.
+@testset "whole-event observations allocate nothing per event" begin
+    model = quote
+        w ~ Uniform(0, 1)
+        p[1:T] .~ Uniform.(0, 1)
+        @plate for i in eachindex(events)
+            events[i] ~ LogDensity(bernoulli_product_mixture_logdensity,
+                hcat(p, absent), [w, 1 - w])
+        end
+    end
+    function oracle(events, unconstrained)
+        w, p = 1 ./ (1 .+ exp.(-unconstrained[1])), 1 ./ (1 .+ exp.(-unconstrained[2:end]))
+        law = MixtureModel([product_distribution(Bernoulli.(p)),
+            product_distribution(Bernoulli.(zero(p)))], [w, 1 - w])
+        sum(logpdf(law, Int.(e)) for e in events; init=0.0)
+    end
+    counts = map((3, 60)) do n
+        events = [Bool[isodd(i + j) && j != 2 || i % 7 == 0 for j in 1:3] for i in 1:n]
+        data = (; events, T=3, absent=zeros(3))
+        bound = bind_data(lower_rkppl(model, data; mod=@__MODULE__,
+            conditioned=(:events,)), data)
+        built = build_kernel(bound)
+        u = [0.3, -0.2, 0.4, 0.1]
+        likelihood = prepare_query(built, bound, :likelihood)
+        @test likelihood(u) ≈ oracle(events, u) rtol=1e-12
+        sampler = prepare_sampler(built, bound, u;
+            backend=DI.AutoEnzyme(; mode=Enzyme.Reverse))
+        g = similar(u)
+        sampler_value_and_gradient!(sampler, g, u)
+        step = 1e-6
+        for j in eachindex(u)
+            plus, minus = copy(u), copy(u)
+            plus[j] += step
+            minus[j] -= step
+            @test g[j] ≈ (sampler(plus) - sampler(minus)) / (2step) rtol=1e-6 atol=1e-7
+        end
+        (@allocations sampler(u)), (@allocations sampler_value_and_gradient!(sampler, g, u))
+    end
+    @test counts[1] == counts[2]
+end
 end

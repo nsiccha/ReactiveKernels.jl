@@ -202,9 +202,18 @@ _KernelSourceFunction(f::F, runtime_f::RF, captures::C) where {F,RF,C} =
 _kernel_native_source(f) = f
 _kernel_native_source(f::_KernelSourceFunction) = f.f
 
+# The call is a forwarding shim and is never a call boundary: both generated
+# bodies declare themselves inline. `@inline` on a `@generated` definition does
+# not reach the generated code, and the call-site `@inline` of
+# `_kernel_source_call` did not inline the latest-world shim once the source
+# body was large (a scan step's log-sum-exp). `prepare_sampler` converts every
+# operation to that mode, so such a step became a call per scan step, and
+# native Enzyme reverse through it cost 2.5–3× the same kernel with the step
+# inlined (HMM forward pass, snag `rkppl-hmm-forwar-89257681`).
 @inline @generated function (f::_KernelSourceFunction{F,RF,C,M})(args::Vararg{Any,N}) where {F,RF,C,M,N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
-    M === Val{:latest_world} && return :(Base.@inline f.f($(forwarded...)))
+    M === Val{:latest_world} &&
+        return Expr(:block, Expr(:meta, :inline), :(Base.@inline f.f($(forwarded...))))
     # The query is `Core._hasmethod` on the complete signature, which inference
     # folds to a constant in the caller's world on every supported Julia.
     # `hasmethod(f.f, argtypes)` folds too, but from Julia 1.12 it first
@@ -216,6 +225,7 @@ _kernel_native_source(f::_KernelSourceFunction) = f.f
     signature = Expr(:curly, GlobalRef(Core, :Tuple),
                      :($(GlobalRef(Core, :Typeof))(f.f)), args...)
     quote
+        $(Expr(:meta, :inline))
         # The type-only query uses the caller's world without boxing active
         # argument values into a method-lookup array during ordinary AD.
         if Core._hasmethod($signature)
@@ -544,19 +554,34 @@ end
     end
     out
 end
-@inline function _native_cat_block!(out::Array{T}, stride, row, column,
-                                    a::Array{T}) where {T}
-    height = size(a, 1)
-    if height == stride
-        # Whole columns of `out` (then `row == 0`): one contiguous block.
-        Base.unsafe_copyto!(out, column * stride + 1, a, 1, length(a))
-    else
-        for j in 1:_native_cat_width(a)
-            Base.unsafe_copyto!(out, (column + j - 1) * stride + row + 1,
-                                a, (j - 1) * height + 1, height)
+# A dense operand of the output's element type is copied with
+# `unsafe_copyto!` on Julia 1.10 only.  There, native Enzyme reverse
+# differentiates the copy, while the element loop above fails static activity
+# analysis on an empty fresh operand (the empty-allocation branch of
+# `reactivekernels-use` §7ai; `test_native_concat_ad.jl`'s zero-row cases).
+# From Julia 1.11, Enzyme differentiates `unsafe_copyto!` of array memory as
+# an untyped `memmove` (its `myunsafe_copyto!` override), and native reverse
+# fails with `EnzymeNoTypeError` ("Cannot deduce type of copy") whenever type
+# analysis cannot recover the element type elsewhere: measured on Julia 1.12
+# and 1.13 for `vcat([a], v)` in a kernel prepared with `bound=` data, the
+# trajectory `@rkppl` builds for a scan
+# (`test_native_concat_ad.jl`, "bound operands").  The typed element loop
+# differentiates there, empty operands included.
+@static if VERSION < v"1.11.0-"
+    @inline function _native_cat_block!(out::Array{T}, stride, row, column,
+                                        a::Array{T}) where {T}
+        height = size(a, 1)
+        if height == stride
+            # Whole columns of `out` (then `row == 0`): one contiguous block.
+            Base.unsafe_copyto!(out, column * stride + 1, a, 1, length(a))
+        else
+            for j in 1:_native_cat_width(a)
+                Base.unsafe_copyto!(out, (column + j - 1) * stride + row + 1,
+                                    a, (j - 1) * height + 1, height)
+            end
         end
+        out
     end
-    out
 end
 
 @inline _native_hcat(args...) = hcat(args...)

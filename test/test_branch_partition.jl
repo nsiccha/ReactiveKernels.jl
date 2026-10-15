@@ -69,6 +69,14 @@ isdefined(@__MODULE__, :BranchPartition) ||
         end
     end
 
+    @testset "a composed child's sum splits into per-arm sums" begin
+        bound = prepare(C.guarded_caller; have = (:x, :y), bound = (; y))
+        @test length(plates(bound.plan)) == 2
+        @test !any(r -> r.op isa RK._LaneAssemble, bound.plan.recipes)
+        @test !occursin("similar", string(code_expr(bound)))
+        @test bound(x) ≈ 3 * reference_guarded(x, y)
+    end
+
     @testset "pointwise output is reassembled in lane order" begin
         bound = prepare(C.guarded; have = (:x, :y), want = :pointwise, bound = (; y))
         @test length(plates(bound.plan)) == 2

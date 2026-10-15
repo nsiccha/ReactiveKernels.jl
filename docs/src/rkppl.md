@@ -630,6 +630,42 @@ slice. An array with a constrained prior is its transform's fresh output. A
 function that receives one whole should accept `AbstractVector` or
 `AbstractMatrix`, and must not write into it.
 
+### Intrinsic CAR fields
+
+`phi[1:N] ~ ICAR(node1, node2)` declares one value per node of an undirected
+graph with the intrinsic conditional autoregressive (ICAR) prior. Edge `e`
+joins nodes `node1[e]` and `node2[e]`, and each edge is listed once. The log
+density is the pairwise-difference penalty
+`-1/2 * sum((phi[node1] .- phi[node2]) .^ 2)`, the Gaussian Markov random
+field whose precision is the graph Laplacian. The field has unit scale; scale
+it outside the prior, as BYM2 does.
+
+The prior is improper: adding a constant to every node of a connected
+component leaves the density unchanged. State the identifying constraint as
+its own statement. A soft sum-to-zero constraint is a density factor on a
+scalar definition:
+
+```julia
+beta0 ~ Normal(0, 1)
+sigma ~ truncated(Normal(0, 1), 0, Inf)
+rho ~ Beta(0.5, 0.5)
+theta[1:N] .~ Normal.(0, 1)
+phi[1:N] ~ ICAR(node1, node2)
+phi_sum = sum(phi)
+phi_sum ~ Normal(0, 0.001 * N)
+convolved_re = sqrt(1 - rho) .* theta .+ sqrt(rho / scaling_factor) .* phi
+y .~ Poisson.(exp.(log.(E) .+ beta0 .+ sigma .* convolved_re))
+```
+
+The declaration sizes the field, so a node on no edge adds no term. The node
+vectors are integer data or data-only expressions such as `edges[:, 1]`.
+Binding checks that both have one entry per edge and that every entry is a
+node of the field. The entries of `phi` are its coordinates
+(`phi.1 … phi.N`), read in place. The density is the graph law
+`icar_logdensity` (see [Distributions](distributions.md)), one retained plate
+over the edges, and native Enzyme Reverse differentiates it without a custom
+rule. Rows or columns of independent ICAR fields are not built yet.
+
 ## Design matrices
 
 Bind the matrix once with `hcat` and size the coefficients with an axes prior.

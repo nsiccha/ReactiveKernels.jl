@@ -66,7 +66,7 @@ const _DISTRIBUTION_ROLES = Dict{Symbol,Tuple{Vararg{Symbol}}}(
     :BernoulliLogitGLM => (:design, :intercept, :coefficients),
     :PoissonLogGLM => (:design, :intercept, :coefficients),
     :MvNormal => (:mean, :covariance), :MvNormalCholesky => (:mean, :factor),
-    :Dirichlet => (:concentration,),
+    :Dirichlet => (:concentration,), :ICAR => (:node1, :node2),
 )
 
 # The role of argument `position` of `head(args...)` with `nargs` authored
