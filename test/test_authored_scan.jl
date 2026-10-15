@@ -582,8 +582,21 @@ end
     # The native history aliases the vector the scan is still writing.
     @test_throws ArgumentError prepare(escape)([1.0, 2.0])
     @test_throws CanonicalIndexError (ReactiveKernels._ScanHistory([1.0])[1] = 2.0)
+    # A vector `history =` gives the leading entries: the result is
+    # `[leading; outputs]`, and the step reads that whole vector, with entries
+    # not written yet at zero.
+    leading = @kernel leading_history(xs::Vector{Float64}) = begin
+        ys = scan(xs; init = 0.0, history = [1.0, 2.0]) do carry, x, earlier
+            (carry, x + sum(earlier))
+        end
+        return ys
+    end
+    @test prepare(leading)([0.5, 1.0]) == [1.0, 2.0, 3.5, 7.5]
+    @test prepare(leading)(Float64[]) == [1.0, 2.0]
+    # refused: a history value is a number or a vector of leading entries
+    # (its type fixes the result's element type)
     nonnumber = @kernel nonnumber_history(xs::Vector{Float64}) = begin
-        ys = scan(xs; init = 0.0, history = [0.0]) do carry, x, earlier
+        ys = scan(xs; init = 0.0, history = "zero") do carry, x, earlier
             (carry, x)
         end
         return ys

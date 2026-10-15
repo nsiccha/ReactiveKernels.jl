@@ -268,6 +268,51 @@ end
     @test weights == original
 end
 
+# Both plate extents are computed, so authoring names each one with a gensym
+# (`##plate_argument#N`), and the inner one is hoisted out of the outer cell.
+@kernel _gensym_named_extents(observed::Vector{Float64},
+        rates::Matrix{Float64}) = begin
+    components = plate(1:size(rates, 2)) do k
+        cells = plate(1:length(observed)) do i
+            observed[i] * rates[i, k]
+        end
+        sum(cells)
+    end
+    return sum(components)
+end
+
+@testset "A value's gensym name never binds a lowered local" begin
+    # A package image keeps the gensym names its kernels were authored with,
+    # and a later process can mint the same `##name#N` for a scratch local:
+    # the outer plate's argument then replaced the hoisted inner extent
+    # (snag in-a-fresh-julia-19d79835). Every scratch local the lowering mints
+    # is a gensym and begins with `##`, so a value's binding never does.
+    k = prepare(_gensym_named_extents)
+    observed = [0.5, -1.0, 2.0]
+    rates = [1.0 2.0; 3.0 4.0; 5.0 6.0]
+    @test k(observed, rates) ≈ sum(observed .* rates)
+    @test k(observed[1:1], rates[1:1, :]) ≈ sum(observed[1] .* rates[1, :])
+    @test k(Float64[], zeros(0, 2)) == 0.0
+    function value_names!(names, plan)
+        foreach(v -> push!(names, v.name), values(plan.graph.values))
+        for r in plan.recipes
+            r.op isa ReactiveKernels._AuthoredPlateOp && value_names!(names, plate_body(r))
+        end
+        names
+    end
+    generated = filter(name -> startswith(String(name), "##"),
+                       value_names!(Set{Symbol}(), k.plan))
+    @test length(generated) >= 2
+    symbols!(found, x) = x isa Symbol ? push!(found, x) :
+        x isa Expr && !(x.head in (:quote, :inert)) ?
+            foldl(symbols!, x.args; init = found) : found
+    @test isdisjoint(generated, symbols!(Set{Symbol}(), code_expr(k)))
+    @test ReactiveKernels._value_local_name(Symbol("##plate_argument#6015")) ===
+          Symbol("#plate_argument#6015")
+    @test ReactiveKernels._value_local_name(Symbol("###x")) === Symbol("#x")
+    @test ReactiveKernels._value_local_name(:observed) === :observed
+end
+
 @testset "A plate read only by logsumexp streams its total" begin
     N = NestedPlates
     k = prepare(N.streamed_logsumexp)

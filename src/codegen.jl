@@ -32,10 +32,26 @@ function _class_name_values(g::Graph)
     chosen
 end
 
+# A value's name can be a `gensym` minted by another process: a package image
+# keeps the names its kernels were authored with (`##plate_argument#6015`),
+# and each process counts its `gensym`s from the start again. Lowering mints
+# its scratch locals with `gensym` (so does the `@simd` it expands), and every
+# `gensym` begins with `##`, so a value bound under such a name could share
+# one variable with a fresh scratch local: the later assignment silently
+# replaces the value (snag `in-a-fresh-julia-19d79835`, where an outer plate's
+# argument replaced an inner plate's hoisted `1:length(observed)`). A value is
+# therefore never bound under a name that begins with `##`; such a name keeps
+# one leading `#` (`#plate_argument#6015`).
+function _value_local_name(name::Symbol)
+    text = String(name)
+    startswith(text, "##") ? Symbol('#', lstrip(text, '#')) : name
+end
+
 # Assign a globally unique source-variable Symbol to every canonical value in
 # the plan. User names are diagnostic hints, not binding authority: they may
-# collide with one another, with a generated disambiguation such as `a_12`, or
-# with the hidden `__ops__` argument.
+# collide with one another, with a generated disambiguation such as `a_12`,
+# with the hidden `__ops__` argument, or with a scratch local the lowering
+# mints (`_value_local_name`).
 function _varnames(p::Plan)
     g = p.graph
     ids = Int[]
@@ -47,7 +63,7 @@ function _varnames(p::Plan)
     out = Dict{Int,Symbol}()
     named = _class_name_values(g)
     for id in ids
-        base = g.values[get(named, id, id)].name
+        base = _value_local_name(g.values[get(named, id, id)].name)
         candidate = base
         suffix = 0
         while candidate in used
@@ -672,9 +688,11 @@ end
 
 # The type of a scan's result vector from its argument types and the step's
 # output type `element`: the seed promoted in for `include_init = true`, or
-# the fill value's type for `history = h0` (then without `element`).
+# the history value's element type (`_scan_history_element`, then without
+# `element`).
 function _scan_result_type_expr(op::_AuthoredScanOp, input_types, element)
-    element = _scan_has_history(op) ? input_types[end] :
+    element = _scan_has_history(op) ?
+        Expr(:call, GlobalRef(@__MODULE__, :_scan_history_element), input_types[end]) :
         _scan_includes_init(op) ?
             Expr(:call, GlobalRef(Base, :promote_type), input_types[1], element) :
             element
@@ -1049,6 +1067,8 @@ end
 # a read-only view of that vector — holds the outputs of the earlier steps and
 # `h0` at and after the current one: the in-place hand loop. Its element type
 # is `typeof(h0)`; an empty sequence runs no step and yields an empty vector.
+# A vector `history = leading` starts the result with those entries and writes
+# each output after them (`_scan_history_offset`).
 function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callargs,
                                               lhs, offset; recycled = nothing)
     lhs === nothing && throw(ArgumentError(
@@ -1072,12 +1092,14 @@ function _lower_authored_scan_history_native!(body, op::_AuthoredScanOp, callarg
     step_body = _embedded_statements(
         step.ast, arguments, Expr(:tuple, carry, output), offset)
     module_ref(name) = GlobalRef(@__MODULE__, name)
+    start = gensym(:scan_history_offset)
     record = Any[
         :($carry = $(module_ref(:_scan_history_carry))($carry)),
-        :($lhs[$index] = $output)]
+        :($lhs[$start + $index] = $output)]
     push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
     push!(body.args, :($lhs = $(module_ref(:_scan_history_buffer))(
         $((recycled === nothing ? () : (recycled,))...), $(first(seqs)), $fill_value)))
+    push!(body.args, :($start = $(module_ref(:_scan_history_offset))($fill_value)))
     push!(body.args, :($earlier = $(module_ref(:_ScanHistory))($lhs)))
     nonempty = Expr(:block,
         :($carry = $(callargs[1])),

@@ -228,6 +228,8 @@ An ordered vector may use Normal, Cauchy, Laplace, Logistic or StudentT
 element priors with live scalar arguments, for example
 `c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log
 densities on increasing vectors, with no factorial normalizer.
+`c ~ Ordered(Flat(), n)` is Stan's `ordered[n] c;` with no prior statement:
+its elements have zero density, leaving the ordering transform's Jacobian.
 
 Ordered extents may be data-only expressions, including
 `length(levels(x)) - 1`, `length(levels(y)) - 2` and
@@ -236,9 +238,9 @@ extent even when a Gaussian response reads the vector. An ordinal response
 has support `1:length(c)+1`; an observed category outside it fails at bind.
 `levels` includes a declared DataAPI level pool; `unique` counts observed
 values. The prior and support come from the declaration: cumulative
-cutpoints may have an ordinary Normal vector prior (non-increasing values
-give `-Inf`), and stopping-ratio thresholds may have an Ordered or ordinary
-Normal/Cauchy/Laplace/Logistic/StudentT prior.
+cutpoints may have an ordinary Normal or Flat vector prior (non-increasing
+values give `-Inf`), and stopping-ratio thresholds may have an Ordered or
+ordinary Normal/Cauchy/Laplace/Logistic/StudentT/Flat prior.
 
 A per-cell `Flat()` prior contributes zero density and retains its layout
 coordinates. Its posterior may be proper through the likelihood; density
@@ -694,6 +696,17 @@ meaning, named or inline: `E = exp.(u * hcat(w1, w2)); P = E ./ sum.(eachrow(E))
 normalizes each row. An `hcat` with an observation column, such as
 `hcat(ones(length(x)), x)`, has one row per observation.
 
+A value the model computes with one row per observation is the matrix of a
+product too, as in Julia. With `A[axes(x, 2), 1:J]`, `a1[1:J]`,
+`B[1:J, 1:K]` and `b1[1:K]` declared, the hidden layer
+`hidden = tanh.(a1' .+ x * A)` is N × J: the adjoint `a1'` is a 1 × J row
+that broadcasts against the N × J product. `v = b1' .+ hidden * B` then
+contracts the columns of `hidden` and keeps its rows. Named or inline, it has
+the density of the append-column spelling
+`hcat(ones(size(x, 1)), hidden) * vcat(b1', B)`, and a data-only elementwise
+matrix such as `X = x .- c` reads the same way in `X * b`. Julia checks the
+dimensions of a computed product where it computes it.
+
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)
 ```
@@ -847,6 +860,30 @@ declaration takes, including `Flat()`, half priors, `truncated(D, lo, hi)` and
 `restricted(D, lo, hi)` with bounds fixed across steps. For example,
 `h[t] ~ restricted(Normal(h[t - 1], s), lo, hi)` is a random walk on `(lo, hi)`
 that keeps the Normal density.
+
+A step reads a carried array at a backward lag
+`a[t - k]`, at `a[t]` after writing it, or at any earlier entry whose index
+provably lies in `1:(t - 1)`, so a renewal equation over the whole earlier
+trajectory is written as stated:
+
+```julia
+@scan begin
+    infections[1] = i0
+    for t in 2:T
+        infections[t] = r * sum(infections[s] * w[t - s] for s in 1:(t - 1))
+    end
+end
+```
+
+The index may be `s` or `t - s` under a generator `for s in 1:(t - 1)`, a
+seed position, or a window `a[(t - k):(t - 1)]`. A scan body also reads other
+model values whole, so a delay convolution of `infections` can be a second
+`@scan`. A deterministic `@scan` inside a `@plate` cell runs one recurrence
+per index, retained as an RK scan inside the plate cell; its carried arrays
+hold one array per index. Each array that reads its own earlier entries is one
+RK scan with `history = [<its seeds>…]` (see [Scans](scan.md), "Reading
+earlier entries"). Native values and ordinary Enzyme reverse gradients are
+supported.
 
 ### One array per index
 

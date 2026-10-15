@@ -71,6 +71,37 @@ end
     @test_throws DimensionMismatch law(log_emissions, varying[:, :, 1:3], initial)
 end
 
+@testset "forward derivatives: finite ties and a shared incoming term" begin
+    law = prepare(hmm_logdensity)
+    backend = DI.AutoEnzyme(; mode = Enzyme.Reverse)
+    # Identical states tie every pair of predecessor terms. The derivative of
+    # the log density in a log emission is that state's posterior probability,
+    # exactly 1/2 here.
+    tied, uniform = zeros(5, 2), fill(0.5, 2, 2)
+    op = prepare_ad(law, backend, tied, uniform, ones(2); active = :log_emissions)
+    @test ad_gradient(op, tied, uniform, ones(2)) ≈ fill(0.5, 5, 2) rtol=1e-14
+
+    # A singleton destination axis: every state of a step receives one shared
+    # incoming term. Reverse gradients against central differences.
+    log_emissions = [-1.2 -0.4 -2.0; -0.3 -1.9 -0.8; -2.2 -0.6 -1.1;
+        -0.9 -0.9 -0.2; -1.5 -0.1 -3.0]
+    previous_only = reshape([0.2 0.5 0.3 0.9; 0.7 0.1 0.6 0.05; 0.1 0.4 0.1 0.05],
+        3, 1, 4)
+    initial = [0.5, 0.3, 0.2]
+    step = 1e-6
+    for (active, position) in ((:log_emissions, 1), (:transition, 2), (:initial, 3))
+        args = (log_emissions, previous_only, initial)
+        op = prepare_ad(law, backend, args...; active)
+        gradient = ad_gradient(op, args...)
+        for i in eachindex(args[position])
+            plus, minus = map(copy, args), map(copy, args)
+            plus[position][i] += step
+            minus[position][i] -= step
+            @test gradient[i] ≈ (law(plus...) - law(minus...)) / (2step) rtol=1e-6 atol=1e-8
+        end
+    end
+end
+
 
 @testset "family emission laws" begin
     transition = [0.8 0.2; 0.3 0.7]

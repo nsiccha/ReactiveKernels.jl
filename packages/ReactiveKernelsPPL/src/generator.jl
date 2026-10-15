@@ -4893,17 +4893,30 @@ function _subst_scan_lags(ex, state::Symbol, loopvar::Symbol, dovar::Dict{Int,Sy
 end
 
 # Value symbols in a (lag-substituted) recurrence arg that must be threaded as
-# plate inputs: captured scalars (params/assignments). Excludes call heads and
-# the already-substituted lag do-vars (`_ppl_c…`).
-function _scan_cell_caps!(caps::Vector{Symbol}, ex)
+# plate inputs: captured scalars (params/assignments). Excludes call heads,
+# generator variables and the already-substituted lag do-vars (`_ppl_c…`).
+function _scan_cell_caps!(caps::Vector{Symbol}, ex, bound = Set{Symbol}())
     if ex isa Symbol
-        (startswith(string(ex), "_ppl_c") || ex in caps) || push!(caps, ex)
+        (startswith(string(ex), "_ppl_c") || ex in caps || ex in bound) ||
+            push!(caps, ex)
         return nothing
     end
     ex isa Expr || return nothing
+    if ex.head === :generator
+        clauses, conds = _scan_generator_clauses(ex)
+        inner = copy(bound)
+        for (v, rng) in clauses
+            _scan_cell_caps!(caps, rng, inner)
+            v isa Symbol && push!(inner, v)
+        end
+        for c in (ex.args[1], conds...)
+            _scan_cell_caps!(caps, c, inner)
+        end
+        return nothing
+    end
     args = ex.head === :call ? ex.args[2:end] : ex.args
     for a in args
-        _scan_cell_caps!(caps, a)
+        _scan_cell_caps!(caps, a, bound)
     end
     return nothing
 end
@@ -4933,6 +4946,14 @@ function _scan_density!(pre::Vector{Expr}, st, translate, x, stem::Symbol)
     corr = _support_correction(st.family, support, args; pre, stem)
     return corr === nothing ? base : :($base + $corr)
 end
+
+# The model values a scan's seeds and steps may read by name: parameters,
+# definitions, supplied data, and whole values such as declared arrays and
+# other scans' trajectories, indexed by the body as in a Julia loop. The
+# scan's own carried arrays are read through their seeds, lags and history.
+_scan_readable_names(plan::StructuralPlan, s::ScanSpec) = setdiff(
+    union(Set{Symbol}(_all_names(plan)), Set{Symbol}(keys(plan.columns))),
+    Set{Symbol}(s.states))
 
 # The innovation steps of an emittable non-centered scan, in body order; a
 # shape the emitter does not build (`_scan_shape_gap`) throws
@@ -4987,20 +5008,26 @@ end
 # `L` values as `<state>_lag1 … <state>_lagL` fields of a NamedTuple carry.
 _scan_lag_field(a::Symbol, k::Int) = Symbol(a, :_lag, k)
 
-function _scan_windows(s::ScanSpec)
+function _scan_windows(s::ScanSpec; active = s.states)
     lags = _scan_lags(s.step, s.states, s.loopvar)
-    return [(a, isempty(lags[a]) ? 0 : max(s.maxlag, maximum(lags[a]))) for a in s.states]
+    return [(a, isempty(lags[a]) ? 0 : max(s.maxlag, maximum(lags[a])))
+        for a in s.states if a in active]
 end
 
 # Translate a step expression into the reconstruction's do-block: a lag read
 # `a[t - k]` becomes its carry field, a current read `a[t]` the value written
-# earlier this step, a local its in-step binding, and every other leaf must be
-# a scalar parameter or definition, which the step reads by closing over it.
-# The contract never inspects step expressions, so these leaves are
-# the only screen for hand-built plans — everything else fails closed.
+# earlier this step, a history read an index into the fold's `history` (the
+# trajectory so far), a read of a `completed` array an index into its finished
+# trajectory, a local its in-step
+# binding, and every other leaf must be a scalar parameter or definition,
+# which the step reads by closing over it. Generator variables are local to
+# their generator. The contract never inspects step expressions, so these
+# leaves are the only screen for hand-built plans — everything else fails
+# closed.
 function _scan_translate_step(ex, s::ScanSpec, env, scalars)
     where = _scan_where(s)
     if ex isa Symbol
+        haskey(env.binders, ex) && return ex
         haskey(env.locals, ex) && return env.locals[ex]
         ex in s.states && throw(ContractValidationError(
             "$where: bare read of the carried array `$(ex)` — read the " *
@@ -5011,16 +5038,48 @@ function _scan_translate_step(ex, s::ScanSpec, env, scalars)
         return ex
     end
     ex isa Expr || return ex
+    if ex.head === :generator
+        clauses, _ = _scan_generator_clauses(ex)
+        for (v, _) in clauses
+            v isa Symbol || throw(ContractValidationError(
+                "$where: a generator iterates one name, got $(repr(v))"))
+            (v === s.loopvar || v in s.states || haskey(env.locals, v)) &&
+                throw(ContractValidationError(
+                    "$where: the generator variable `$(v)` shadows a scan name"))
+        end
+        sub(x, binders) = _scan_translate_step(x, s, merge(env, (; binders)), scalars)
+        return ReactiveKernels._history_map_generator(sub, sub, ex, s.loopvar,
+            env.binders)
+    end
     if ex.head === :ref && length(ex.args) == 2 && ex.args[1] in s.states
         a, idx = ex.args[1], ex.args[2]
         if idx === s.loopvar
+            a in env.completed && return :($a[_ppl_scan_index])
             haskey(env.current, a) || throw(ContractValidationError(
                 "$where: `$(a)[$(s.loopvar)]` is read before the step that " *
                 "writes it"))
             return env.current[a]
         end
-        k = _scan_lag_of(idx, a, s.loopvar)
-        return Expr(:., :_ppl_carry, QuoteNode(_scan_lag_field(a, k)))
+        tidx = _scan_translate_step(idx, s, env, scalars)
+        if _history_lag_form(idx, s.loopvar, env.binders) !== nothing
+            a in env.completed && return Expr(:ref, a, tidx)
+            k = _scan_lag_of(idx, a, s.loopvar)
+            k isa Int || throw(ContractValidationError(
+                "$where: lag `$(idx)` of `$(a)` is not resolved to an integer"))
+            return Expr(:., :_ppl_carry, QuoteNode(_scan_lag_field(a, k)))
+        end
+        slice = _history_is_slice(idx)
+        _history_is_earlier(idx, s.loopvar, s.lo, env.binders) ||
+            throw(ContractValidationError("$where: `$(a)[$(idx)]` is not a " *
+                "lag, a current read or an entry provably before the loop index"))
+        a in env.completed || a === env.hist || throw(ContractValidationError(
+            "$where: the history of `$(a)` is not available in the fold for " *
+            "`$(something(env.hist, :density))`"))
+        # A finished trajectory, or the fold's own `history`: the whole
+        # trajectory `[seeds; outputs so far]`.
+        source = a in env.completed ? a : :_ppl_hist
+        return slice ? Expr(:call, GlobalRef(Base, :view), source, tidx) :
+            Expr(:ref, source, tidx)
     end
     args = ex.head === :call ? ex.args[2:end] : ex.args
     newargs = Any[_scan_translate_step(a, s, env, scalars) for a in args]
@@ -5030,13 +5089,20 @@ end
 
 # The do-block body of one reconstruction: the steps in order, the next carry
 # window, and `(next, <output>)`. The step reads parameters and data values
-# by closing over them.
-function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, scalars)
+# by closing over them. `completed` arrays are read from their trajectories
+# and their writes are skipped; `exec` (statement indices) limits the body to
+# the statements this fold needs; `hist` names the array whose earlier entries
+# come from the scan's `history` argument.
+function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, scalars;
+        completed = Set{Symbol}(), exec = nothing, hist = nothing)
     env = (; locals = Dict{Symbol,Any}(s.loopvar => :_ppl_scan_index),
-        current = Dict{Symbol,Symbol}())
+        current = Dict{Symbol,Symbol}(), binders = Dict{Symbol,Any}(),
+        completed, hist)
     samples = Dict(st.target => Symbol(:_ppl_e, j) for (j, st) in enumerate(innov))
     body, logps = Expr[], Symbol[]
-    for st in s.step
+    for (i, st) in enumerate(s.step)
+        exec === nothing || i in exec || continue
+        (st.indexed && st.target in completed && output !== nothing) && continue
         rhs = if st.kind === :sample
             value = samples[st.target]
             if output === nothing
@@ -5060,8 +5126,11 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
             env.locals[st.target] = nm
         end
     end
+    active = exec === nothing ? setdiff(Set(s.states), completed) :
+        Set(s.step[i].target for i in exec if s.step[i].indexed &&
+            !(s.step[i].target in completed))
     fields = Expr[]
-    for (a, L) in _scan_windows(s), k in 1:L
+    for (a, L) in _scan_windows(s; active), k in 1:L
         val = k == 1 ? env.current[a] :
             Expr(:., :_ppl_carry, QuoteNode(_scan_lag_field(a, k - 1)))
         push!(fields, Expr(:(=), _scan_lag_field(a, k), val))
@@ -5072,17 +5141,38 @@ function _scan_step_block(s::ScanSpec, innov, output::Union{Symbol,Nothing}, sca
     return body
 end
 
-function _scan_fold(s, innov, ranges, zname, T, output, scalars)
+function _scan_fold(s, innov, ranges, zname, T, output, scalars;
+        completed = Set{Symbol}(), exec = nothing, hist = nothing)
     m = s.lo - 1
+    active = exec === nothing ? setdiff(Set(s.states), completed) :
+        Set(s.step[i].target for i in exec if s.step[i].indexed &&
+            !(s.step[i].target in completed))
     init = Expr[Expr(:(=), _scan_lag_field(a, k), _scan_init_name(a, m - k + 1))
-        for (a, L) in _scan_windows(s) for k in 1:L]
+        for (a, L) in _scan_windows(s; active) for k in 1:L]
     seqs = Any[:($(s.lo):$T), [:(view($zname, $(first(r)):$(last(r)))) for r in ranges]...]
     elems = Symbol[:_ppl_scan_index, [Symbol(:_ppl_e, j) for j in eachindex(innov)]...]
-    body = _scan_step_block(s, innov, output, scalars)
+    hist === nothing || push!(elems, :_ppl_hist)
+    body = _scan_step_block(s, innov, output, scalars; completed, exec, hist)
     lambda = Expr(:->, Expr(:tuple, :_ppl_carry, elems...), Expr(:block, body...))
-    kw = Expr(:parameters, Expr(:kw, :init, Expr(:tuple, init...)))
-    call = Expr(:call, :scan, kw, seqs...)
+    kws = Any[Expr(:kw, :init, Expr(:tuple, init...))]
+    hist === nothing || push!(kws, Expr(:kw, :history,
+        Expr(:vect, (_scan_init_name(hist, k) for k in 1:m)...)))
+    call = Expr(:call, :scan, Expr(:parameters, kws...), seqs...)
     return Expr(:do, call, lambda)
+end
+
+# The order in which a history-reading scan's carried arrays are produced,
+# each with the statements its fold executes (`_history_fold_order`).
+function _scan_fold_order(s::ScanSpec)
+    statements = _scan_fold_statements(s)
+    reads = _history_statement_reads(s.states, s.loopvar, statements)
+    order = _history_fold_order(s.states, statements, reads)
+    order === nothing && throw(ContractValidationError(
+        "$(_scan_where(s)): carried arrays of $(join(s.states, ", ")) read one " *
+        "another's earlier entries, which is not built yet: each fold reads the " *
+        "history of the one array it produces, so a history-read array must be " *
+        "computable without another array's history"))
+    return order, reads
 end
 
 # Reconstruction statements for every non-centered scan, in plan order. The
@@ -5101,10 +5191,10 @@ end
 function _scan_reconstruction_statements(plan::StructuralPlan,
         layout::LayoutTable)
     stmts = Expr[]
-    scalars = union(_union_names(plan), collect(keys(plan.columns)))
     for raw in plan.scans
         s = _resolve_scan(plan, raw)
         _is_noncentered_scan(s) || continue
+        scalars = _scan_readable_names(plan, s)
         innov = _scan_innovations(s)
         T = _scan_length(plan, s)
         zname = _scan_innovation_name(s)
@@ -5120,6 +5210,10 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
             push!(stmts, :($nm::Float64 = $val))
         end
         m = s.lo - 1
+        if T > m && _scan_has_history(s)
+            _scan_history_reconstruction!(stmts, s, innov, ranges, zname, T, scalars)
+            continue
+        end
         for a in s.states
             if T == m
                 seeds = [_scan_init_name(a, k) for k in 1:m]
@@ -5135,6 +5229,38 @@ function _scan_reconstruction_statements(plan::StructuralPlan,
     return stmts
 end
 
+# A scan with history reads produces its carried arrays one fold at a time
+# (`_scan_fold_order`): the fold for `a` executes only the statements `a`
+# needs and reads every array produced before it from its finished
+# trajectory. When it reads `a`'s own earlier entries, it scans with
+# `history = <a's seeds>`, so its result and its step's `history` are the
+# whole trajectory:
+#   `a = scan(…; init = (…), history = [<a's seeds>…]) do _ppl_carry, …, _ppl_hist
+#        … _ppl_hist[s] …
+#        (next, <a's new value>) end`
+# A fold without own history reads keeps `a = vcat(<a's seeds>…, rest)`.
+function _scan_history_reconstruction!(stmts, s::ScanSpec, innov, ranges, zname,
+        T, scalars)
+    m = s.lo - 1
+    order, reads = _scan_fold_order(s)
+    completed = Set{Symbol}()
+    for (a, exec) in order
+        seeds = [_scan_init_name(a, k) for k in 1:m]
+        own = _history_fold_reads_own(reads, exec, a)
+        fold = _scan_fold(s, innov, ranges, zname, T, a, scalars;
+            completed = copy(completed), exec, hist = own ? a : nothing)
+        if own
+            push!(stmts, :($a = $fold))
+        else
+            rest = Symbol(:_ppl_scan_rest_, a)
+            push!(stmts, :($rest = $fold))
+            push!(stmts, :($a = vcat([$(seeds...)], $rest)))
+        end
+        push!(completed, a)
+    end
+    return stmts
+end
+
 # Seeds contribute their stated density once. The same ordered recurrence
 # supplies each per-step sample's conditional density before binding its new
 # value, so innovation scales may read carried values, locals, data and time.
@@ -5143,7 +5269,7 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
     s = _resolve_scan(plan, s)
     innov = _scan_innovations(s)
     T = _scan_length(plan, s)
-    scalars = union(_union_names(plan), collect(keys(plan.columns)))
+    scalars = _scan_readable_names(plan, s)
     zname = _scan_innovation_name(s)
     seedpos, ranges = _scan_latent_positions(s, innov, T)
     head = first(s.states)
@@ -5159,7 +5285,15 @@ function _scan_noncentered_prior!(stmts::Vector{Expr}, nodes::Vector{Symbol},
     if T >= s.lo && !isempty(innov)
         pointwise = Symbol(:_ppl_scan_density_, head)
         node = Symbol(:_ppl_scan_stepslp_, head)
-        push!(stmts, :($pointwise = $(_scan_fold(s, innov, ranges, zname, T, nothing, scalars))))
+        # With history reads every carried array is reconstructed first, so
+        # each step's density reads the finished trajectories.
+        fold = _scan_has_history(s) ?
+            _scan_fold(s, innov, ranges, zname, T, nothing, scalars;
+                completed = Set(s.states),
+                exec = _history_fold_closure(_scan_fold_statements(s),
+                    _scan_statement_reads(s), nothing, Set(s.states))) :
+            _scan_fold(s, innov, ranges, zname, T, nothing, scalars)
+        push!(stmts, :($pointwise = $fold))
         push!(stmts, :($node::Float64 = sum($pointwise)))
         push!(terms, node)
     end
@@ -5196,7 +5330,7 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         entry = only(e for e in layout.entries
                      if e.kind === :scan && e.name === state)
         T = entry.size
-        scalars = union(_union_names(plan), collect(keys(plan.columns)))
+        scalars = _scan_readable_names(plan, sc)
         m = length(sc.setup)
         terms = Any[]
         for (k, f) in enumerate(sc.setup)
@@ -5219,6 +5353,19 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
         push!(inputs, :($(sc.lo):$T))
         cellarg(a) = _subst_syms(_subst_scan_lags(a, state, sc.loopvar, dovar),
             Dict(sc.loopvar => _dovar(length(inputs))))
+        # History reads (`h[s]` under `for s in 1:(t - 1)`) read the sampled
+        # state whole; their bounds are re-checked for hand-built plans.
+        history = _scan_has_history(sc)
+        for a in _scan_reads(step)
+            _history_foreach_read(a, sc.states, sc.loopvar) do _, idx, env
+                (idx === sc.loopvar || _history_lag_form(idx, sc.loopvar, env) !== nothing) &&
+                    return nothing
+                _history_is_earlier(idx, sc.loopvar, sc.lo, env) ||
+                    throw(ContractValidationError("$(_scan_where(sc)): " *
+                        "`$(state)[$(idx)]` is not a lag or an entry provably " *
+                        "before the loop index"))
+            end
+        end
         caps = Symbol[]
         for a in _scan_reads(step)
             _scan_cell_caps!(caps, cellarg(a))
@@ -5227,7 +5374,8 @@ function _scan_prior_statements(plan::StructuralPlan, layout::LayoutTable)
             "[generator] scan $(state): the recurrence uses the loop index " *
             "`$(sc.loopvar)` directly — not supported in slice 1"))
         for c in caps
-            c in scalars || throw(ContractValidationError("$(_scan_where(sc)): unknown captured value $c"))
+            (c in scalars || (history && c === state)) ||
+                throw(ContractValidationError("$(_scan_where(sc)): unknown captured value $c"))
         end
         recnode = Symbol(:_ppl_scan_rec_, state)
         recpw = Symbol(:_ppl_scan_pw_, state)
