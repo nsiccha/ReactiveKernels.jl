@@ -257,6 +257,20 @@ selection, topological sort, cache lookup, or dynamic scheduling. Julia still
 specializes and executes the recipe callables normally; their own dispatch,
 allocations, exceptions, and side effects are not erased by the graph compiler.
 
+Fresh authored definitions retain distinct provenance even when their source is
+identical. At prepared-kernel assembly, execution uses the existing generated
+source companion and its concrete lexical captures, with definition tokens
+carried as metadata instead of executable type parameters. This lets identical
+fresh builds reuse operation and derivative types without merging their graph
+identities or caching bound data. The original operations remain in the plan
+and source recipes. Bodies with local functions, generators, exception scopes,
+or boxed lexical cells retain Julia's native closure path. Private generated
+names in the derivative operand pack are canonicalized in that actual pack;
+the operands and their positional reads are unchanged. Construction, planning,
+and preparation still perform work, so reusing a build remains useful.
+Colliding local names receive suffixes from their stable plan order, rather
+than fresh graph IDs, so repeated child composition can also reuse code.
+
 One rewrite reaches into those callables. Natively, a generator fold over a
 data-length iterator, `sum(term for i in iter [if condition]; init = x)` with
 `iter` an `eachindex`, `axes`, `range` or `a:b` call, runs as its

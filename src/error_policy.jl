@@ -131,7 +131,7 @@ end
 Base.@nospecializeinfer function _kernel_with_ignored_throws(
         @nospecialize(op::_KernelSourceOp), @nospecialize(ignored))
     T = typeof(op)::DataType
-    _KernelSourceOp(Val(T.parameters[1]), Val(T.parameters[2]), getfield(op, :f),
+    _KernelSourceOp(Val(getfield(op, :token)), Val(T.parameters[2]), getfield(op, :f),
                     getfield(op, :tensor_f), ignored, getfield(op, :call_identity))
 end
 
