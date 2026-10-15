@@ -1678,36 +1678,46 @@ function _fuse_authored_plate_chains(p::Plan; cells_only = false)
         all(>(index), consumers) || return nothing
         return cid, consumers
     end
-    for index in eachindex(recipes)
-        found = consumers_of(index)
-        found === nothing && continue
-        cid, consumers = found
-        length(consumers) == 1 || continue
-        cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellOp) && continue
-        composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
-        composed === nothing && continue
-        recipes[only(consumers)] = composed
-        recipes[index] = nothing
-        changed = true
-    end
-    # A plate read only by cells of other plates at one position (`plate_cell`
-    # values sharing an index port: one cell of several observations) composes
-    # into each of those cells, so each runs the plate's cell at that position
-    # instead of the whole plate.
-    for index in eachindex(recipes)
-        found = consumers_of(index)
-        found === nothing && continue
-        cid, consumers = found
-        length(consumers) >= 2 || continue
-        all(c -> recipes[c].op isa _AuthoredPlateCellOp, consumers) || continue
-        length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
-            for c in consumers)) == 1 || continue
-        composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
-            for c in consumers]
-        any(isnothing, composed) && continue
-        recipes[consumers] = composed
-        recipes[index] = nothing
-        changed = true
+    # Composing a consumer can leave an earlier producer with fewer readers: a
+    # branch composed into the plate it reconverges into leaves their shared
+    # producer read by that plate alone. Both passes therefore repeat until
+    # neither composes. Each composition removes a recipe, so this terminates,
+    # and a producer body is copied only into its sole remaining reader(s).
+    progressed = true
+    while progressed
+        progressed = false
+        for index in eachindex(recipes)
+            found = consumers_of(index)
+            found === nothing && continue
+            cid, consumers = found
+            length(consumers) == 1 || continue
+            cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellOp) && continue
+            composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
+            composed === nothing && continue
+            recipes[only(consumers)] = composed
+            recipes[index] = nothing
+            progressed = true
+        end
+        # A plate read only by cells of other plates at one position
+        # (`plate_cell` values sharing an index port: one cell of several
+        # observations) composes into each of those cells, so each runs the
+        # plate's cell at that position instead of the whole plate.
+        for index in eachindex(recipes)
+            found = consumers_of(index)
+            found === nothing && continue
+            cid, consumers = found
+            length(consumers) >= 2 || continue
+            all(c -> recipes[c].op isa _AuthoredPlateCellOp, consumers) || continue
+            length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
+                for c in consumers)) == 1 || continue
+            composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
+                for c in consumers]
+            any(isnothing, composed) && continue
+            recipes[consumers] = composed
+            recipes[index] = nothing
+            progressed = true
+        end
+        changed |= progressed
     end
     changed || return p
     selected = Recipe[r for r in recipes if r !== nothing]
