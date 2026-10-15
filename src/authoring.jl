@@ -2197,13 +2197,15 @@ function _kernel_collect_symbols!(names::Set{Symbol}, ex)
     names
 end
 
-# Every name an `@kernel` block binds: its signature inputs, declared inputs and
+# Every name an `@kernel` block binds, with each of its type annotations
+# (`nothing` where a binding has none): its signature inputs, declared inputs and
 # recipe outputs. Statement order does not matter, because forward intermediates
 # are ordinary graph edges. These are the enclosing locals an authored plate cell
 # may capture. Pass 1 of `_kernel_expand` still validates each statement; this
-# scan only collects names and stops at `return`, as pass 1 does.
-function _kernel_enclosing_ports(statements, signature_inputs)
-    names = Set{Symbol}(Symbol(name) for (name, _) in signature_inputs)
+# scan only collects declarations and stops at `return`, as pass 1 does.
+function _kernel_enclosing_declarations(statements, signature_inputs)
+    declarations = Tuple{Symbol,Any}[
+        (Symbol(name), type_expr) for (name, type_expr) in signature_inputs]
     for raw in statements
         _kernel_is_line(raw) && continue
         raw isa Expr && raw.head === :return && break
@@ -2216,18 +2218,34 @@ function _kernel_enclosing_ports(statements, signature_inputs)
         target = raw isa Expr && raw.head === :(=) ? raw.args[1] : raw
         items = target isa Expr && target.head === :tuple ? target.args : Any[target]
         for item in items
+            type_expr = nothing
             item isa Expr && item.head === :(::) && length(item.args) == 2 &&
-                (item = item.args[1])
-            item isa Symbol && push!(names, item)
+                ((item, type_expr) = (item.args[1], item.args[2]))
+            item isa Symbol && push!(declarations, (item, type_expr))
         end
     end
-    names
+    declarations
+end
+
+# The enclosing names whose every annotation names a `Number` type. Julia
+# broadcasts a number as one value, so such a name passed to `plate` is the
+# same in every cell, like a `Ref` operand. An unannotated binding, or one whose
+# annotation does not resolve to a type in `mod`, is not known to be scalar.
+function _kernel_scalar_ports(declarations, mod)
+    mod isa Module || return Set{Symbol}()
+    scalar = Dict{Symbol,Bool}()
+    for (name, type_expr) in declarations
+        T = type_expr === nothing ? nothing : _kernel_resolve_binding(mod, type_expr)
+        scalar[name] = get(scalar, name, true) && T isa Type && T <: Number
+    end
+    Set{Symbol}(name for (name, known) in scalar if known)
 end
 
 function _kernel_authored_plate_expr(rhs, mod,
                                      caller_locals = Set{Symbol}();
                                      endpoint_cache =
-                                         IdDict{Any,Dict{Any,KernelSpec}}())
+                                         IdDict{Any,Dict{Any,KernelSpec}}(),
+                                     scalar_ports = Set{Symbol}())
     rhs isa Expr && rhs.head === :do && length(rhs.args) == 2 || return nothing
     call, lambda = rhs.args
     call isa Expr && call.head === :call && !isempty(call.args) || return nothing
@@ -2288,8 +2306,13 @@ function _kernel_authored_plate_expr(rhs, mod,
     end
 
     scope = union(Set(formals), caller_locals)
-    varying = Set(formals[i] for i in eachindex(formals) if !(i in atomic))
-    shared = Set(formals[i] for i in atomic)
+    # A zipped argument declared as a number is the same in every cell, so the
+    # cell's subexpressions of it are lifted as for a `Ref` operand. It stays a
+    # zipped operand: the prepared plate runs a lifted recipe once because its
+    # root has no plate dimension.
+    shared = Set(formals[i] for i in eachindex(formals)
+                 if i in atomic || arguments[i] in scalar_ports)
+    varying = setdiff(Set(formals), shared)
     branch_arm_specs = _kernel_plate_branch_arms(
         scalar_body, formals, shared, mod, scope; endpoint_cache)
     cell = _kernel_plate_cell_spec(scalar_body, formals, varying, shared, mod,
@@ -4489,7 +4512,9 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
     raw_statements = _kernel_desugar_loops(raw_statements, mod)
     statements = _kernel_lift_plate_expressions(
         _kernel_normalize_return_expressions(raw_statements), mod)
-    enclosing_ports = _kernel_enclosing_ports(statements, signature_inputs)
+    declarations = _kernel_enclosing_declarations(statements, signature_inputs)
+    enclosing_ports = Set{Symbol}(name for (name, _) in declarations)
+    scalar_ports = _kernel_scalar_ports(declarations, mod)
     graph_var = gensym(:kernel_graph)
     ports_var = gensym(:kernel_ports)
     order_var = gensym(:kernel_port_order)
@@ -4567,7 +4592,7 @@ function _kernel_expand(block, signature_inputs = Tuple{Symbol,Any}[],
                 push!(outputs, (name, type_expr))
             end
             plate_expr = _kernel_authored_plate_expr(
-                rhs, mod, enclosing_ports; endpoint_cache = endpoint_cache)
+                rhs, mod, enclosing_ports; endpoint_cache, scalar_ports)
             plate_expr === nothing &&
                 (plate_expr = _kernel_authored_scan_expr(
                     rhs, mod, enclosing_ports; endpoint_cache = endpoint_cache))
