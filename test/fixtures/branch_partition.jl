@@ -25,6 +25,30 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# Natural indexed arguments also remain borrowed when a bound guard partitions
+# their lanes. The same cell is used with direct, packed and matrix storage.
+@kernel gathered_guard(values, groups::Vector{Int}, flags::Vector{Bool}) = begin
+    xs = ReactiveKernels._readonly_gather(values, groups)
+    pointwise = plate(xs, flags) do x, flag
+        cell::Float64 = flag ? log(x) : -x
+        cell
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
+@kernel packed_gathered_guard(values::Vector{Float64}, groups::Vector{Int},
+                              flags::Vector{Bool}) = begin
+    block = view(values, 2:(length(values) - 1))
+    return gathered_guard(block, groups, flags)
+end
+
+@kernel matrix_gathered_guard(values::Matrix{Float64}, groups::Vector{Int},
+                              flags::Vector{Bool}) = begin
+    block = view(values, :, 2)
+    return gathered_guard(block, groups, flags)
+end
+
 # A guarded total composed into a caller: the child's plate port is scoped
 # under the caller's `t` (`t.pointwise`), while its sum keeps the source
 # `sum(pointwise)`.

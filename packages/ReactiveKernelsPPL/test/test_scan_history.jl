@@ -228,9 +228,9 @@ end
         plan = bind_data(lower_rkppl(_hist_renewal_program(), Tuple(keys(data));
             conditioned = (:y,)), data)
         built = build_kernel(plan)
-        @test _hist_scans(built.spec) == 3      # infections, cumulative, deaths
+        @test _hist_scans(built.spec) == 2      # coupled recurrence, then deaths
         code = string(kernel_expr(plan, built.layout))
-        @test occursin("history = [", code)
+        @test occursin("history = (infections = [", code)
         _hist_structure(built.spec)
     end
     @test allequal(shapes)
@@ -551,39 +551,43 @@ const _HIST_GENERATOR_CAPTURE_GAP = VERSION >= v"1.11-"
         @test built.layout.total == 3 + 2 + 3 * 3
         _hist_check((; plan, built, q), _hist_imperial_oracle(d); reverse_gap)
         # Both recurrences stay RK scans, retained inside the country plate:
-        # the infections fold (which carries the cumulative sum in its window)
-        # and the expected-deaths fold. Nothing reads `cumulative` itself, so
-        # its own fold is pruned.
+        # infections and cumulative share one scan, followed by expected deaths.
         @test count(e -> e.kind === :scan, recipe_inventory(built.spec)) == 2
     end
 end
 
 @testset "scan history: arrays reading one another's history" begin
-    # Capability gap: each fold produces one array's history, so two arrays
-    # that read each other's earlier entries are not built yet.
-    T = 6
-    data = Dict{Symbol,Any}(:y => _HIST_Y[1:T], :T => T)
-    program = quote
-        r ~ LogNormal(0, 0.3)
-        @scan begin
-            p[1] = 1.0
-            q[1] = 1.0
-            for t in 2:T
-                p[t] = r * sum(q[s] for s in 1:(t - 1)) / t
-                q[t] = r * sum(p[s] for s in 1:(t - 1)) / t
+    for T in (1, 6, 13)
+        data = Dict{Symbol,Any}(:y => _HIST_Y[1:T], :T => T)
+        program = quote
+            r ~ LogNormal(0, 0.3)
+            @scan begin
+                p[1] = 1.0
+                q[1] = 0.5
+                for t in 2:T
+                    p[t] = r * sum(q[s] for s in 1:(t - 1)) / t
+                    q[t] = r * sum(p[s] for s in 1:(t - 1)) / t + p[t]
+                end
             end
+            mu = p .+ q
+            y .~ Normal.(mu, 1.0)
         end
-        y .~ Normal.(p, 1.0)
+        f = _hist_sampler(program, data)
+        function oracle(u)
+            r = exp(u[1])
+            p, q = [1.0], [0.5]
+            for t in 2:T
+                pn = r * sum(q) / t
+                qn = r * sum(p) / t + pn
+                push!(p, pn)
+                push!(q, qn)
+            end
+            logpdf(LogNormal(0, 0.3), r) + u[1] +
+                sum(logpdf.(Normal.(p .+ q, 1.0), data[:y]))
+        end
+        _hist_check(f, oracle)
+        @test _hist_scans(f.built.spec) == (T == 1 ? 0 : 1)
     end
-    built = try
-        plan = bind_data(lower_rkppl(program, Tuple(keys(data));
-            conditioned = (:y,)), data)
-        build_kernel(plan)
-    catch err
-        err isa ContractValidationError || rethrow()
-        nothing
-    end
-    @test_broken built !== nothing
 
     # Capability gap: a `@scan` in a plate cell is deterministic (its seeds
     # and steps are `=`); per-cell sampled recurrence draws are not built yet.
@@ -606,4 +610,76 @@ end
         nothing
     end
     @test_broken sampled !== nothing
+end
+
+@testset "scan columns: conditional densities read shared trajectories" begin
+    for history in (false, true), T in (1, 2, 8)
+        past = history ? :(sum(b[s] for s in 1:(t - 1)) / t) : :(b[t - 1])
+        program = quote
+            r ~ Normal(0, 0.5)
+            @scan begin
+                a[1] = 0.1
+                b[1] = -0.2
+                for t in 2:T
+                    shared = sin(r * t)
+                    e ~ Normal(0, exp(0.1 * $past))
+                    a[t] = r * $past + e + shared
+                    b[t] = 0.3 * a[t - 1] + a[t] + shared
+                end
+            end
+            mu = a .+ 2 .* b
+            y .~ Normal.(mu, 1.0)
+        end
+        data = Dict{Symbol,Any}(:y => _HIST_Y[1:T], :T => T)
+        f = _hist_sampler(program, data)
+        function oracle(u)
+            r = u[1]
+            a, b = [0.1], [-0.2]
+            lp = logpdf(Normal(0, 0.5), r)
+            for t in 2:T
+                past_value = history ? sum(b) / t : b[end]
+                e = u[t]
+                lp += logpdf(Normal(0, exp(0.1 * past_value)), e)
+                shared = sin(r * t)
+                an = r * past_value + e + shared
+                bn = 0.3 * a[end] + an + shared
+                push!(a, an)
+                push!(b, bn)
+            end
+            lp + sum(logpdf.(Normal.(a .+ 2 .* b, 1.0), data[:y]))
+        end
+        _hist_check(f, oracle)
+        @test _hist_scans(f.built.spec) == (T == 1 ? 0 : 1)
+        # The posterior query selects likelihood and prior together. Its
+        # prepared graph retains that same single recurrence.
+        @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
+            f.q.kernel.plan.recipes) == (T == 1 ? 0 : 1)
+    end
+end
+
+@testset "scan columns: state queries omit innovation densities" begin
+    data = Dict{Symbol,Any}(:y => zeros(3), :T => 3)
+    program = quote
+        r ~ Normal(0, 1)
+        @scan begin
+            a[1] = 0.1
+            b[1] = -0.2
+            for t in 2:T
+                e ~ Normal(0, sqrt(r))
+                a[t] = r * b[t - 1] + e
+                b[t] = 0.3 * a[t - 1] + a[t]
+            end
+        end
+        y .~ Normal.(a, 1.0)
+    end
+    plan = bind_data(lower_rkppl(program, Tuple(keys(data)); conditioned = (:y,)), data)
+    built = build_kernel(plan)
+    states = ReactiveKernelsPPL._prepare_wants(built, plan, (:a, :b))
+    # These coordinates define the trajectories, while sqrt(r) is outside
+    # its density domain. A state-only query must not evaluate that density.
+    a, b = Base.invokelatest(states, [-1.0, 0.3, 0.4])
+    @test a ≈ [0.1, 0.5, -0.13]
+    @test b ≈ [-0.2, 0.53, 0.02]
+    @test count(r -> r.op isa ReactiveKernels._AuthoredScanOp,
+        states.plan.recipes) == 1
 end

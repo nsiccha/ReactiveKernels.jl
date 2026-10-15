@@ -1174,14 +1174,12 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # prove: an undotted module call's result is model-level here
     # (`y = f(raw)`). `bind_data` evaluates the definition once and
     # validates its value as the response; a number is one observation, as
-    # when bound as data. An ordinary `hcat` matrix value
-    # (`_route_hcat_values`) is observed as the same matrix bound as data,
-    # whether its columns give it observation rows (`:matrix`) or make it a
-    # model-level array (`hcat(v, w)` of whole-value data, `:array`).
+    # when bound as data. Array literals and concatenations are observed as
+    # the same arrays bound directly as data; their construction syntax does
+    # not determine an observation axis before binding.
     for nm in derived_response_names
         shape = get(detshape, nm, nothing)
-        shape === :scalar || (shape in (:matrix, :array) && nm in matrix_values) ||
-            continue
+        shape in (:scalar, :matrix, :array) || continue
         rhs = detmap[nm]
         !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
             (detshape[nm] = :vector)
@@ -1434,6 +1432,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # other consumers, including reductions, extracted leaves and the
     # retained recurrence body. Keep their definition dependencies too.
     needed = copy(declaration_dependencies)
+    # A predictor term can read another location as an ordinary column.
+    # That definition must survive even when its own response absorbed it
+    # as a predictor. Replan the conflicting name as a value below, so both
+    # readers share one graph node, independent of response order.
+    for p in predictors, t in p.terms
+        union!(needed, t.columns)
+    end
     # A GLM object reads its arguments whole, by name.
     for r in responses
         _is_glm_family(r.family) || continue
@@ -1965,6 +1970,7 @@ function _shape_of_expr(ex, data, detmap, memo, active,
     head === :call || return :scalar  # exotic heads: downstream rejects
     isempty(ex.args) && return :scalar
     fn = ex.args[1]
+    fn === GlobalRef(Base, :vect) && return :array
     # Collecting a one-dimensional index iterator preserves its vector
     # domain. It is not an opaque scalar module-call result.
     if fn === GlobalRef(Base, :collect) && length(ex.args) == 2 &&
@@ -2780,6 +2786,7 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
     end
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    ex = ReactiveKernels._array_literal_call(ex)
     recur(a) = _resolve_module_calls(a, mod, names, where;
         values = values && !(ex.head in _BINDING_VALUE_HEADS))
     # A keyword's name, and the shorthand `f(x; s)` for `s = s`, stay names.
@@ -3561,6 +3568,13 @@ _is_hcat_def(rhs) =
     rhs isa Expr && rhs.head === :call && !isempty(rhs.args) &&
     rhs.args[1] === :hcat
 
+# Before routing, literals and qualified Base calls share the same choice
+# of affine recipe or ordinary value. After routing only the bare head
+# marks a design-matrix definition; resolved calls remain ordinary values.
+_is_hcat_call(rhs) = _is_hcat_def(rhs) ||
+    (Meta.isexpr(rhs, :call) && !isempty(rhs.args) &&
+     rhs.args[1] === GlobalRef(Base, :hcat))
+
 # Only Base's ones/length have this recipe. A same-named module function
 # keeps its own meaning. The length anchor must also be a matrix column:
 # bind validates their equal lengths, so recreating the ones column is exact.
@@ -3730,7 +3744,7 @@ end
 # and consumers. Every other hcat keeps Base's ordinary value semantics.
 function _ordinary_hcat_values(sample, det, data, glms)
     detmap = Dict{Symbol,Any}(det)
-    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
+    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_call(rhs))
     params = Set{Symbol}(s.lhs for s in sample if s.lhs ∉ data)
     # A GLM object reads its design matrix whole. An `hcat` of bare data or
     # derived columns keeps the fused design-matrix recipe; any other
@@ -3767,7 +3781,7 @@ function _ordinary_hcat_values(sample, det, data, glms)
         end
     end
     legacy = intersect(pure, _hcat_value_reads(det, detmap, sample, data,
-        glms, arrays, Set{Symbol}()))
+        glms, arrays, Set{Symbol}(); is_hcat = _is_hcat_call))
     used = Set{Symbol}()
     function walk(ex; whole = false)
         if ex isa Symbol
@@ -3831,7 +3845,7 @@ _glm_design_hcat(rhs, params) = length(rhs.args) > 1 &&
 function _resolve_hcat_values(ex; keep = false, resolve = identity)
     ex isa Expr || return ex
     ex.head === :quote && return ex
-    if _is_hcat_def(ex)
+    if _is_hcat_call(ex)
         head = keep ? :hcat : GlobalRef(Base, :hcat)
         value = Expr(:call, head, Any[_resolve_hcat_values(a; resolve)
             for a in ex.args[2:end]]...)
@@ -3843,7 +3857,7 @@ end
 function _route_hcat_values(sample, det, data, glms; resolve = identity)
     generic = _ordinary_hcat_values(sample, det, data, glms)
     det = Pair{Symbol,Any}[nm => _resolve_hcat_values(rhs;
-        keep = _is_hcat_def(rhs) && nm ∉ generic, resolve) for (nm, rhs) in det]
+        keep = _is_hcat_call(rhs) && nm ∉ generic, resolve) for (nm, rhs) in det]
     sample = SampleStmt[SampleStmt(s.lhs, _resolve_hcat_values(s.rhs; resolve),
         s.broadcast, s.range, s.levels, s.matrix, s.dims, s.slices,
         s.count_columns) for s in sample]
@@ -3874,8 +3888,8 @@ end
 # The `hcat` definitions of `det` the program reads as values. GLM
 # response matrices stay design matrices (their families read them).
 function _hcat_value_reads(det, detmap, sample, data, glms,
-        simplexes::Set{Symbol}, aligned::Set{Symbol})
-    mats = Set{Symbol}(nm for (nm, rhs) in det if _is_hcat_def(rhs))
+        simplexes::Set{Symbol}, aligned::Set{Symbol}; is_hcat = _is_hcat_def)
+    mats = Set{Symbol}(nm for (nm, rhs) in det if is_hcat(rhs))
     for g in glms
         delete!(mats, g.matrix)
     end
@@ -4351,6 +4365,12 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
         lnames = Set(first.(locals))
         external = _external_rhs(c.args[3])
         function arg(ex; object=false)
+            # Preserve sharing within a dotted cell while lowering the
+            # indexed vector through the ordinary selected-plate path.
+            if _is_ref_call(ex) && _expr_has_sym(ex, ivar)
+                value = arg(ex.args[2])
+                return _is_broadcast_sample(c) ? :(Ref($value)) : value
+            end
             # An external constructor's indexed argument follows the authored
             # iterator. Retain its read in the cell, including bounds checks;
             # stripping it to a column would broadcast a singleton instead.
@@ -4363,7 +4383,8 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
                 return ex.head === :call ? Expr(:call, ex.args[1], arguments...) :
                     Expr(:., ex.args[1], Expr(:tuple, arguments...))
             end
-            if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames)
+            if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames) ||
+                    _retained_cell_expr(ex, ivar, Set{Symbol}())
                 nm = gensym(:_rkppl_selected)
                 key = _categorical_key_column(ex, locals, ivar, data)
                 if key === nothing
@@ -4445,19 +4466,21 @@ end
 
 # Whole-column evaluation (`_desugar_cell`) strips `[i]` and broadcasts each
 # cell over whole columns. That equals the Julia loop only while every
-# per-index value is a scalar. A definition plate is evaluated as retained
-# RK plate cells instead, as plates with observations are, when a cell reads
+# per-index value is a scalar. Definition and prior plates use retained
+# RK plate cells instead, as plates with observations do, when a cell reads
 # a value that holds one array per index (`_plate_reads_array_entries`,
 # whatever operators the cell applies to it), or when it applies an
 # authored broadcast, indexing or a reduction to a per-index value, or
-# calls a module function or kernel on one.
+# calls a module function or kernel on one. Indexing a shared or computed
+# value also retains the cell: its result need not be scalar.
 function _plate_needs_retained_cells(cells, ivar::Symbol)
     perlocals = Set{Symbol}()
     for c in cells
-        Meta.isexpr(c, :(=), 2) || continue
-        lhs, rhs = c.args
-        _cell_reads_index(rhs, ivar, perlocals) || continue
-        lhs isa Symbol && push!(perlocals, lhs)
+        assignment = Meta.isexpr(c, :(=), 2)
+        (assignment || _is_sample(c) || _is_broadcast_sample(c)) || continue
+        lhs, rhs = assignment ? c.args : c.args[2:3]
+        assignment && _cell_reads_index(rhs, ivar, perlocals) && lhs isa Symbol &&
+            push!(perlocals, lhs)
         _retained_cell_expr(rhs, ivar, perlocals) && return true
     end
     return false
@@ -4508,7 +4531,10 @@ function _retained_cell_expr(ex::Expr, ivar, perlocals)
     per(a) = _cell_reads_index(a, ivar, perlocals)
     if ex.head === :ref
         base = ex.args[1]
-        (base isa Symbol ? base in perlocals : per(base)) && return true
+        # Computed or shared indexing keeps its Julia value rank: even a
+        # literal index can select an array, e.g. `columns(W)[2]`.
+        (!_expr_has_sym(ex, ivar) || !(base isa Symbol) || base in perlocals) &&
+            return true
     elseif ex.head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
             ex.args[2].head === :tuple
         any(per, ex.args[2].args) && return true
@@ -5430,8 +5456,9 @@ function _cell_gather_index(ex::Expr, ivar)
 end
 
 # Value-position symbols of a cell expression, validating the loop-variable
-# discipline on the way: refs are exactly `v[i]` or a gather `v[g[i]]`
+# discipline on the way: per-index refs are `v[i]` or a gather `v[g[i]]`
 # through a data index column `g`, and `i` appears only as an index.
+# Shared refs keep ordinary Julia indexing of their whole value.
 # Function heads and kw names are positions, not refs.
 function _cell_bares(ex, ivar, data::Set{Symbol}; whole_arguments::Bool = false)
     bares = Set{Symbol}()
@@ -5455,6 +5482,8 @@ end
 _cell_bares!(ex, ivar, bares, data) = nothing
 function _cell_bares!(ex::Expr, ivar, bares, data)
     if ex.head === :ref
+        # Shared indices select from a whole value; they are not lane reads.
+        _expr_has_sym(ex, ivar) || return nothing
         length(ex.args) == 2 && ex.args[1] isa Symbol &&
             ex.args[2] === ivar && return nothing
         g = _cell_gather_index(ex, ivar)
@@ -5502,10 +5531,11 @@ end
 # Strip per-index refs to whole values (validation ran first): `v[i]` →
 # `v`, a gather `v[g[i]]` → `v[g]`. A latent prior supplies its authored
 # indices, retaining `v[indices]` or `v[g[indices]]` instead of reading
-# every element of a potentially larger input.
+# every element of a potentially larger input. Shared refs are unchanged.
 _strip_cell(ex, ivar, indices=nothing) = ex
 function _strip_cell(ex::Expr, ivar, indices=nothing)
     if ex.head === :ref
+        _expr_has_sym(ex, ivar) || return ex
         g = _cell_gather_index(ex, ivar)
         selected = indices === nothing ? g :
             g === nothing ? indices : Expr(:ref, g, indices)
@@ -5564,11 +5594,11 @@ _cell_whole_call(f) = false
 _dotify_cell(ex, ivar, pidx, object::Bool) = (ex, false)
 _dotify_cell(ex::Symbol, ivar, pidx, object::Bool) = (ex, ex in pidx)
 function _dotify_cell(ex::Expr, ivar, pidx, object::Bool)
-    ex.head === :ref && return (_strip_cell(ex, ivar), true)
+    ex.head === :ref && return (_strip_cell(ex, ivar), _expr_has_sym(ex, ivar))
     # Ref denotes one whole shared argument to a broadcasted constructor.
     # Broadcasting Ref itself would replace that argument by scalar wrappers.
     Meta.isexpr(ex, :call, 2) && ex.args[1] === :Ref &&
-        return (ex, false)
+        return (_strip_cell(ex, ivar), false)
     Meta.isexpr(ex, :call, 1) && return (ex, false)
     if ex.head === :call && !isempty(ex.args)
         f = ex.args[1]
@@ -8004,24 +8034,35 @@ function _lower_categorical_logit_response(lhs, call, range, weights,
         extra_predictors = pnames[2:end])
 end
 
-# Explicit cutpoints/thresholds of an ordinal response: the trailing
-# argument `Ref(c)` names one declared vector shared by every observation
-# (Distributions.jl `OrderedLogistic.(eta, Ref(c))` broadcast semantics).
+# Explicit cutpoints/thresholds of an ordinal response: `Ref(c)` shares
+# one vector, either sampled with its stated prior or supplied as data.
 # Either structure reads an Ordered vector or a one-axis sized vector
 # with its stated element prior and support. A vector may serve several
 # responses; its first use records a size source for `_lower_parameters`.
 function _explicit_thresholds!(ctx, lhs::Symbol, arg, ordered::Bool,
         shown::String)
-    name = arg isa Expr && arg.head === :call && length(arg.args) == 2 &&
-        arg.args[1] === :Ref && arg.args[2] isa Symbol ? arg.args[2] : nothing
-    if name === nothing
+    if !_is_ref_call(arg)
+        if _data_only(arg, ctx.data, ctx.detmap)
+            name = _lower_argument_value(lhs, :thresholds, arg, ctx)
+            name isa Symbol || _sfail("response $lhs: thresholds must be a vector")
+            return ThresholdRows(name)
+        end
         arg isa Symbol && _sfail("response $lhs: the cutpoints $arg are " *
             "one vector shared by every observation — write `Ref($arg)` " *
             "(standard broadcasting would pair each observation with one " *
             "element of $arg)")
         _sfail("response $lhs: $shown takes its cutpoints as `Ref(c)` of " *
-               "a declared vector, got $(repr(arg))")
+               "a sampled or data vector, got $(repr(arg))")
     end
+    value = arg.args[2]
+    if _data_only(value, ctx.data, ctx.detmap)
+        name = _lower_argument_value(lhs, :thresholds, value, ctx)
+        name isa Symbol || _sfail("response $lhs: thresholds must be a vector")
+        return name
+    end
+    name = value isa Symbol ? value : nothing
+    name === nothing && _sfail("response $lhs: sampled thresholds must " *
+        "name a declared vector, got $(repr(value))")
     if name ∉ ctx.ordered_names
         dims = get(ctx.array_dims, name, nothing)
         dims !== nothing && length(dims) == 1 || _sfail("response $lhs: " *
