@@ -41,12 +41,12 @@ function _run_pinned_comparison()
                     Pkg.PackageSpec(name = "MLDatasets", version = v"0.7.21"),
                     Pkg.PackageSpec(name = "NNlib", version = v"0.9.45"),
                 ])
-                Pkg.develop([
+                Pkg.develop([Pkg.PackageSpec[
                     Pkg.PackageSpec(path = root),
                     Pkg.PackageSpec(path = joinpath(
                         root, "packages", "ReactiveKernelsDistributionKernels")),
                     Pkg.PackageSpec(path = joinpath(
-                        root, "packages", "ReactiveKernelsPPLExamples"));
+                        root, "packages", "ReactiveKernelsPPLExamples"))];
                     rk_source_dependencies()])
                 select_enzyme!(variant)
                 Pkg.instantiate()

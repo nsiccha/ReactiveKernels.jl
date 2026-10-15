@@ -28,9 +28,9 @@ function _run()
     EnzymeVariants.run_enzyme_variants(; suite = "gradient_probe", root,
             precompile = false) do env, variant
         Pkg.add(Pkg.PackageSpec(url = "https://github.com/nsiccha/MutatingFunctions.jl", rev = _MF_REV))
-        Pkg.develop([
+        Pkg.develop([Pkg.PackageSpec[
             Pkg.PackageSpec(path = root),
-            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples"));
+            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples"))];
             EnzymeVariants.rk_source_dependencies()])
         Pkg.add([
             Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),

@@ -34,9 +34,9 @@ function _run_pinned_comparison()
             url = "https://github.com/nsiccha/MutatingFunctions.jl",
             rev = _MUTATING_FUNCTIONS_REVISION,
         ))
-        Pkg.develop([
+        Pkg.develop([Pkg.PackageSpec[
             Pkg.PackageSpec(path = root),
-            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples"));
+            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples"))];
             EnzymeVariants.rk_source_dependencies()])
         Pkg.add([
             Pkg.PackageSpec(name = "AdvancedHMC", version = v"0.8.6"),

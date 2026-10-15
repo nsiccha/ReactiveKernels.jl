@@ -28,12 +28,12 @@ function _run_pinned_eight_schools_ad()
             Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),
             Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199"),
         ])
-        Pkg.develop([
+        Pkg.develop([Pkg.PackageSpec[
             Pkg.PackageSpec(path = root),
             Pkg.PackageSpec(path = joinpath(
                 root, "packages", "ReactiveKernelsDistributionKernels")),
             Pkg.PackageSpec(path = joinpath(
-                root, "packages", "ReactiveKernelsPPLExamples"));
+                root, "packages", "ReactiveKernelsPPLExamples"))];
             rk_source_dependencies()])
         select_enzyme!(variant)
         addenv(
