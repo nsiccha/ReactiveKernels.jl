@@ -51,8 +51,9 @@ end
   `[init, output₁, output₂, …]` instead: one element longer than the sequences,
   in one buffer. See [The initial value in the result](#The-initial-value-in-the-result).
 - **`history = h₀`** (a number) gives the do-block one more, last argument: the
-  outputs written so far, `h₀` at and after the current step. See
-  [Reading earlier outputs](#Reading-earlier-outputs).
+  outputs written so far, `h₀` at and after the current step. A vector
+  `history = leading` puts those entries first: the result is
+  `[leading; output₁, …]`. See [Reading earlier outputs](#Reading-earlier-outputs).
 
 The carry may be a scalar, a **`NamedTuple`**, or a vector (an HMM forward
 pass threads its belief-state vector; see the `eachrow` shape below) when
@@ -89,7 +90,8 @@ end
   at `1..m` before the loop, at the same depth `m` for every carried array. A
   seed may read earlier seeds by literal index.
 - **Reads in a step.** A step reads earlier values through literal lags
-  `a[t - k]` with `1 ≤ k ≤ m`, and the current `a[t]` after its write. Other
+  `a[t - k]` with `1 ≤ k ≤ m`, the current `a[t]` after its write, and any
+  earlier entry whose index provably lies in `1:(t - 1)` (below). Other
   values are closures, including `x[t]` and `t` itself.
 - **The result.** `a` is the whole trajectory `[a[1], …, a[T]]`.
 
@@ -97,6 +99,44 @@ One carried array with one seed prepares exactly `a = scan(2:length(x);
 init = s, include_init = true) do a_prev, t … end`. Several carried arrays
 (a `level` driven by an `increment`, say) are folded by one scan each, with
 their seeds prepended.
+
+### Reading earlier entries
+
+A step may read every earlier entry of a carried array, as a renewal equation
+does: each day's infections are a reproduction number times the convolution of
+all earlier infections with a generation-interval kernel `w`.
+
+```julia
+@kernel renewal(i0, r::Vector{Float64}, w::Vector{Float64}, T::Int) = begin
+    @scan begin
+        infections[1] = i0
+        for t in 2:T
+            infections[t] = r[t] * sum(infections[s] * w[t - s] for s in 1:(t - 1))
+        end
+    end
+    return infections
+end
+```
+
+- An earlier entry's index is an integer sum or difference of literals, the
+  loop index and generator variables (`for s in lo:hi`) that lies in
+  `1:(t - 1)` at every step: `a[s]` or `a[t - s]` under
+  `for s in 1:(t - 1)`, a literal seed position `a[1]`, or a window
+  `a[(t - k):(t - 1)]` (a view). An index that is not provably earlier, such
+  as `a[s]` under `for s in 1:t`, is an `ArgumentError` when the kernel is
+  defined. The loop must start one past the seeds, written `for t in (m + 1):…`.
+- A carried array that reads its own earlier entries is one scan with
+  `history = [<its seeds>…]`, whose step reads the trajectory written so far
+  (see [Reading earlier outputs](#Reading-earlier-outputs)). Its seeds and
+  outputs live in one vector, which is also the result.
+- Several carried arrays are produced one scan each, in an order where every
+  array whose history another one reads is finished first; that scan then
+  reads the finished trajectory. Each scan runs only the statements its array
+  needs. Two arrays that read each other's earlier entries are not built yet.
+- A `@scan` inside a `@plate for` cell runs one such recurrence per index, as
+  an RK scan retained inside the plate. Native values and ordinary Enzyme
+  reverse gradients are supported; a vector `history` is not built under
+  Reactant.
 
 ## Example: an ARMA(1,1) error recursion
 
@@ -269,6 +309,15 @@ end
 - `h₀` must be a number. It is the element type of the result: each output is
   stored converted to `typeof(h₀)`. An empty sequence returns an empty vector of
   that type.
+- A vector `history = leading` starts the result with those entries: the result
+  is `[leading; output₁, …]`, step `j` writes entry `length(leading) + j`, and
+  `earlier` is that whole vector, with entries not written yet at zero of the
+  leading entries' element type. An empty sequence returns a copy of
+  `leading`. A recurrence seeded with `a[1:m]` reads `a[s]` as `earlier[s]`
+  whether `s` is a seed or an earlier step, from one buffer; selecting between
+  a separate seed vector and the outputs would make native Enzyme reverse need
+  runtime activity when the seeds are constants. Natively only: the Reactant
+  lowering refuses a vector `history`.
 - The history is read-only and belongs to its step. An indexed write in a
   step is rejected when the kernel is defined, the native view has no
   `setindex!`, and a carry that holds it is an `ArgumentError`: natively it is
@@ -516,8 +565,9 @@ Native iteration remains an ordinary loop.
 - **Per-step output is a scalar** on the Reactant `while` path. A non-scalar
   per-step output there is a loud, reported error, never a silent mis-lowering;
   author the output as a scalar (or open an issue for the shape you need).
-- **`history` holds numbers and excludes `include_init`.** Its value must be a
-  number, and it cannot be combined with `include_init = true`.
+- **`history` holds a number or leading entries, and excludes `include_init`.**
+  Its value is a number or a vector of leading entries (native only), and it
+  cannot be combined with `include_init = true`.
 - **A directly iterated N-D array is rejected** on the Reactant path (its
   native semantics are linear element iteration); iterate `eachrow(M)` or
   `vec(M)` explicitly.
