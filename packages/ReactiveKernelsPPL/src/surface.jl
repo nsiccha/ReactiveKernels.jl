@@ -62,7 +62,10 @@ RKPPLModel(ast, mod, fixed) = RKPPLModel(ast, mod, fixed, Expr[])
 RKPPLModel(ast, mod, fixed, rewrites) = RKPPLModel(ast, mod, fixed, rewrites, Dict{Symbol,ColumnData}())
 
 """Inputs bound to a captured program, awaiting explicit observations.
-Use `binding | (; y)` or `condition(binding; y)` to lower and bind it."""
+Use `binding | (; y)` or `condition(binding; y)` to lower and bind it.
+With nothing left to observe, the binding is the plan `bind_data(binding)`
+lowers it to: `build_kernel`, `kernel_expr`, `assign_layout`, the `prepare_*`
+queries and `model_view(built; bound)` accept it in place of that plan."""
 struct RKPPLBoundModel
     model::RKPPLModel
     data::Dict{Symbol,ColumnData}
@@ -300,8 +303,28 @@ function condition(plan::StructuralPlan; kwargs...)
 end
 Base.:|(plan::StructuralPlan, data::NamedTuple) = condition(plan; data...)
 bind_data(m::RKPPLBoundModel) = _bind_model(m.model, m.data)
-build_kernel(m::RKPPLBoundModel) = build_kernel(bind_data(m))
-build_kernel(m::RKPPLModel) = build_kernel(m())
+
+# A model or binding with nothing left to observe is the plan `bind_data`
+# lowers it to, so every entry point that reads a bound plan reads it through
+# this one conversion: a binding that builds also lays out, prints, displays
+# and prepares. Each call lowers again; `plan = bind_data(binding)` lowers once.
+const _PlanSource = Union{RKPPLModel,RKPPLBoundModel}
+_bound_plan(m::RKPPLModel) = _bound_plan(m())
+_bound_plan(m::RKPPLBoundModel) = bind_data(m)
+_bound_plan(plan::StructuralPlan) = plan
+
+build_kernel(m::_PlanSource) = build_kernel(_bound_plan(m))
+kernel_expr(m::_PlanSource, layout::LayoutTable; kwargs...) =
+    kernel_expr(_bound_plan(m), layout; kwargs...)
+assign_layout(m::_PlanSource) = assign_layout(_bound_plan(m))
+for prepare in (:prepare_query, :prepare_sampler, :prepare_cell_query,
+                :prepare_cell_sampler, :prepare_compact_cell_sampler)
+    @eval $prepare(built, m::_PlanSource, args...; kwargs...) =
+        $prepare(built, _bound_plan(m), args...; kwargs...)
+end
+prepare_query_ad(prepare_operator, built, m::_PlanSource, args...; kwargs...) =
+    prepare_query_ad(prepare_operator, built, _bound_plan(m), args...; kwargs...)
+_model_source(m::_PlanSource, layout::LayoutTable) = _model_source(_bound_plan(m), layout)
 
 function _bind_immediate(m::RKPPLModel, data)
     cols = if data isa NamedTuple

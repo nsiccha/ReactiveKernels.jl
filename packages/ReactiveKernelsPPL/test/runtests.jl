@@ -47,6 +47,7 @@ const _PPL_TEST_FILES = (
     "test_fresh_module.jl",
     "test_latest_native_source.jl",
     "test_surface.jl",
+    "test_bound_model_entry_points.jl",
     "test_affine_parameters.jl",
     "test_affine_parameters_reactant.jl",
     "test_affine_signs.jl",
