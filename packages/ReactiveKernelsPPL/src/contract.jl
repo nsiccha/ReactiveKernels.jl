@@ -233,6 +233,14 @@ struct MixtureComplementWeights
     param_first::Bool
 end
 
+# A broadcast argument containing one data vector per observation. A Symbol
+# in LikelihoodSpec.thresholds instead denotes one shared threshold vector.
+struct ThresholdRows
+    name::Symbol
+end
+_threshold_name(name::Symbol) = name
+_threshold_name(rows::ThresholdRows) = rows.name
+
 """
     LikelihoodSpec(family, link, response, predictor, scale, weights, evidence, label[, trials[, range]])
 
@@ -277,8 +285,9 @@ at their defaults:
   response column for OrderedLogistic/Ordinal/Categorical, structurally
   — 1 + predictor count — for CategoricalLogit, structurally — column
   count — for Multinomial).
-- `thresholds`: ordered/vector threshold parameter ([`VectorParameter`](@ref))
-  for OrderedLogistic/Ordinal, `nothing` otherwise.
+- `thresholds`: shared ordered/vector parameter ([`VectorParameter`](@ref)),
+  shared data vector, or `ThresholdRows` for vectors broadcast per observation
+  for OrderedLogistic/Ordinal; `nothing` otherwise.
 - `extra_predictors`: CategoricalLogit non-reference predictors after
   `predictor` (class order 2..K is `[predictor; extra_predictors...]`,
   K−1 total); empty otherwise.
@@ -416,7 +425,7 @@ struct LikelihoodSpec
     trials::Union{Nothing,ColumnRef,Int}
     range::Union{Nothing,UnitRange{Int},Expr}
     n_levels::Union{Nothing,Int}
-    thresholds::Union{Nothing,ParamName}
+    thresholds::Union{Nothing,ParamName,ThresholdRows}
     extra_predictors::Vector{Symbol}
     count_columns::Vector{ColumnRef}
     ordinal_structure::Union{Nothing,Symbol}
@@ -466,7 +475,7 @@ LikelihoodSpec(family, link, response, predictor, scale, weights, evidence,
 # leveled call sites pass keywords.
 function LikelihoodSpec(family, link, response, predictor, scale, weights,
         evidence, label, trials, range; n_levels::Union{Nothing,Int} = nothing,
-        thresholds::Union{Nothing,ParamName} = nothing,
+        thresholds::Union{Nothing,ParamName,ThresholdRows} = nothing,
         extra_predictors::Vector{Symbol} = Symbol[],
         count_columns::Vector{ColumnRef} = Symbol[],
         ordinal_structure::Union{Nothing,Symbol} = nothing,
@@ -1801,12 +1810,28 @@ function _indexed_operand_axes(plan::StructuralPlan, r::LikelihoodSpec, col, des
     return (Base.OneTo(length(indices)),)
 end
 
-function _response_slot_column(plan, r, name, what)
-    value = _observation_column(plan.columns, name, r.label, what)
+# A selected plate result already holds values in the authored index order.
+# Its positions must not be indexed a second time by the original indices.
+function _selected_cell_value(plan::StructuralPlan, r::LikelihoodSpec, value::Symbol)
+    d = findfirst(d -> d.name === value, plan.derived)
+    d !== nothing && _authored_spelling(_selected_plate_indices(plan.derived[d].expr)) ==
+        r.range.args[2] && return true
+    i = findfirst(p -> p.name === value, plan.predictors)
+    i === nothing && return false
+    p = plan.predictors[i]
+    p.link === IdentityLink && length(p.terms) == 1 &&
+        p.terms[1].kind === OffsetTerm || return false
+    d = findfirst(d -> d.name === only(p.terms[1].columns), plan.derived)
+    return d !== nothing && _authored_spelling(
+        _selected_plate_indices(plan.derived[d].expr)) == r.range.args[2]
+end
+
+function _response_slot_column(plan, r, name, what;
+        value = _observation_column(plan.columns, name, r.label, what))
     if r.range isa Expr
         if name === r.response
             value = _selected_response_column(plan, r)
-        elseif r.response in plan.indexed_observations
+        elseif r.response in plan.indexed_observations && !_selected_cell_value(plan, r, name)
             indices = _response_range_indices(plan, r)
             checkbounds(Bool, value, indices) || _fail(r.label,
                 "$what $name does not cover the authored response range")
@@ -3636,7 +3661,9 @@ _is_glm_family(f) = f === NormalIDGLMFam || f === BernoulliLogitGLMFam ||
 # reads its intercept and coefficients whole: neither has an observation
 # axis.
 _observation_fields(r::LikelihoodSpec) = _is_glm_family(r.family) ?
-    _with(r; glm_alpha = nothing, glm_beta = nothing) : r
+    _with(r; glm_alpha = nothing, glm_beta = nothing) :
+    _is_ordered_family(r.family) && r.thresholds isa Symbol ?
+        _with(r; thresholds = nothing) : r
 
 # A GLM-object coefficient block: the coefficient vector of an
 # intercept-free design matrix whose per-column priors the plan addresses
@@ -3791,9 +3818,13 @@ function _validate_vector_parameters(plan::StructuralPlan)
         p.name => Symbol[] for p in plan.vector_parameters)
     for r in plan.responses
         if r.thresholds !== nothing
-            haskey(refs, r.thresholds) || _fail(r.label,
-                "thresholds parameter $(r.thresholds) is not a vector parameter")
-            push!(refs[r.thresholds], r.label)
+            if haskey(refs, r.thresholds)
+                push!(refs[r.thresholds], r.label)
+            else
+                _reads_data_only(plan, _threshold_name(r.thresholds), Set{Symbol}(_all_names(plan)),
+                    Set{Symbol}()) || _fail(r.label,
+                    "thresholds $(r.thresholds) must be a vector parameter or data")
+            end
         end
         if r.threshold_coefs !== nothing
             haskey(refs, r.threshold_coefs) || _fail(r.label,
@@ -4774,8 +4805,9 @@ end
 function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
         used_predictors::Set{Symbol})
     r.thresholds === nothing && _fail(r.label,
-        "an ordered response requires its thresholds vector parameter")
-    tp = only(p for p in plan.vector_parameters if p.name === r.thresholds)
+        "an ordered response requires its thresholds vector")
+    ti = findfirst(p -> p.name === r.thresholds, plan.vector_parameters)
+    tp = ti === nothing ? nothing : plan.vector_parameters[ti]
     want_ordered = r.family === OrderedLogisticFam ||
         r.ordinal_structure === :cumulative
     want_plain = r.family === OrdinalFam && r.ordinal_structure === :stopping
@@ -4789,10 +4821,10 @@ function _validate_ordered_fields(r::LikelihoodSpec, plan::StructuralPlan,
     end
     (want_ordered || want_plain) || _fail(r.label,
         "internal: ordinal structure $(r.ordinal_structure) unresolved")
-    haskey(_VECTOR_ELEMENT_FAMILIES, tp.family) || _fail(r.label,
+    tp === nothing || haskey(_VECTOR_ELEMENT_FAMILIES, tp.family) || _fail(r.label,
         "thresholds $(tp.name) is $(tp.family) but this response needs " *
         "a real-support vector element prior")
-    if r.n_levels !== nothing && tp.size isa Int
+    if tp !== nothing && r.n_levels !== nothing && tp.size isa Int
         tp.size == r.n_levels - 1 || _fail(r.label,
             "thresholds size $(tp.size) disagrees with n_levels " *
             "$(r.n_levels) (thresholds number K−1)")
@@ -5685,8 +5717,10 @@ end
 
 function _validate_response_data(plan::StructuralPlan)
     for r in plan.responses
-        _validate_response_data(r, _cell_broadcast_response(plan, r) ?
-            _cell_broadcast_entries(plan, r) : plan)
+        grouped = _cell_broadcast_response(plan, r)
+        checked = grouped && _group_thresholds(plan, r) ?
+            _with(r; thresholds = ThresholdRows(r.thresholds)) : r
+        _validate_response_data(checked, grouped ? _cell_broadcast_entries(plan, r) : plan)
     end
     return nothing
 end
@@ -5726,6 +5760,8 @@ _array_entries(col) = isempty(col) || all(isempty, col) ?
 array per index: each cell broadcasts over its own index's entries."""
 _cell_broadcast_response(plan::StructuralPlan, r::LikelihoodSpec) =
     _cell_broadcast_observation(plan, r.response)
+_group_thresholds(plan, r) = r.thresholds isa Symbol &&
+    _cell_broadcast_response(plan, r) && r.thresholds in plan.cell_broadcasts[r.response]
 _cell_broadcast_observation(plan::StructuralPlan, name::Symbol) =
     haskey(plan.cell_broadcasts, name) && _holds_arrays(get(plan.columns, name, nothing))
 
@@ -5755,6 +5791,12 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
     perindex = plan.cell_broadcasts[r.response]
     arrays = Set{Symbol}(k for (k, v) in plan.columns if v isa AbstractArray)
     columns = copy(plan.columns)
+    if _group_thresholds(plan, r)
+        cells = broadcast(y, columns[r.thresholds]) do yi, cuts
+            fill(cuts, size(yi))
+        end
+        columns[r.thresholds] = _array_entries(cells)
+    end
     # A definition the cell reads per index (`sc[i]` with `sc = dose .* s`)
     # supplies that index's value; the data it reads are whole inputs of
     # that value, not observation operands. So are the inputs of a derived
@@ -5932,6 +5974,12 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
         all(x -> 1 <= x <= K, col) ||
             return _fail(r.label, "leveled response must hold integers " *
                 "1..$K (recoded levels)")
+        if r.thresholds isa ThresholdRows
+            cuts = _response_slot_column(plan, r, r.thresholds.name, "threshold vectors")
+            all(broadcast((y, c) -> y <= length(c) + 1, col, cuts)) ||
+                _fail(r.label, "each ordinal observation must lie in its " *
+                    "threshold vector's support 1..length(cuts)+1")
+        end
         (_is_ordered_family(r.family) || r.evidence.kind !== :none ||
             sort(unique(col)) == collect(1:K)) ||
             return _fail(r.label, "leveled response must cover every level " *
@@ -6575,6 +6623,27 @@ end
 _plate_lane_value(lane::Base.RefValue, k) = lane[]
 _plate_lane_value(lane, k) = lane[k]
 
+# Missing-observation guards wrap a whole cell body. Interpret that branch
+# lazily, sharing the cell's locals with its selected block; its other arm
+# may contain an invalid data index and must not be evaluated.
+function _eval_plate_cell(ex, cell, read, label)
+    if Meta.isexpr(ex, :block)
+        value = nothing
+        for st in ex.args
+            st isa LineNumberNode && continue
+            value = _eval_plate_cell(st, cell, read, label)
+        end
+        return value
+    elseif Meta.isexpr(ex, :if)
+        arm = _eval_value_expr(ex.args[1], read, label) ? 2 : 3
+        return arm <= length(ex.args) ?
+            _eval_plate_cell(ex.args[arm], cell, read, label) : nothing
+    elseif Meta.isexpr(ex, :(=), 2) && ex.args[1] isa Symbol
+        return cell[ex.args[1]] = _eval_value_expr(ex.args[2], read, label)
+    end
+    return _eval_value_expr(ex, read, label)
+end
+
 # A data-only plate column at binding: the cell, once per index, over the
 # zipped inputs (`plate(lanes...) do args...; cell; end`).
 function _eval_plate_column(ex, lookup, label)
@@ -6587,21 +6656,11 @@ function _eval_plate_column(ex, lookup, label)
     all(l -> length(l) == n, zipped) || throw(ContractValidationError(
         "[bind] $label: plate inputs differ in length"))
     formals = Meta.isexpr(lam.args[1], :tuple) ? lam.args[1].args : Any[lam.args[1]]
-    body = Meta.isexpr(lam.args[2], :block) ? lam.args[2].args : Any[lam.args[2]]
     return [begin
         cell = Dict{Symbol,Any}(f => _plate_lane_value(lane, k)
             for (f, lane) in zip(formals, lanes))
         read(nm) = haskey(cell, nm) ? cell[nm] : lookup(nm)
-        value = nothing
-        for st in body
-            st isa LineNumberNode && continue
-            if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
-                cell[st.args[1]] = _eval_value_expr(st.args[2], read, label)
-            else
-                value = _eval_value_expr(st, read, label)
-            end
-        end
-        value
+        _eval_plate_cell(lam.args[2], cell, read, label)
     end for k in 1:n]
 end
 
@@ -6695,6 +6754,11 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
     # Trials are data: a data-only definition there binds, as weights do.
     for r in plan.responses, t in (r.trials, r.mixture_trials...)
         t isa Symbol && push!(required, t)
+    end
+    # Data cutpoints determine support and must be available to binding's
+    # shape and observation checks, including selected plate definitions.
+    for r in plan.responses
+        r.thresholds === nothing || push!(required, _threshold_name(r.thresholds))
     end
     for p in plan.array_parameters, d in p.dims
         g = _level_pool_source(d)
@@ -6944,6 +7008,11 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
         r.family === MixtureFam && r.mixture_weights isa Symbol || continue
         push!(defs, Symbol(:_ppl_weights_input_, r.label) =>
             Expr(:call, GlobalRef(Base, :identity), r.mixture_weights))
+    end
+    for r in plan.responses
+        _is_ordered_family(r.family) && r.thresholds isa Symbol || continue
+        push!(defs, Symbol(:_ppl_threshold_input_, r.label) =>
+            Expr(:call, GlobalRef(Base, :identity), r.thresholds))
     end
     for r in plan.responses
         _is_glm_family(r.family) || continue
@@ -7941,6 +8010,19 @@ function _resolve_vector_extent(p::VectorParameter, plan, columns, responses)
     return _with(p;size=Int(extent))
 end
 
+function _data_threshold_extent(::Symbol, cuts, label)
+    cuts isa AbstractVector && all(x -> x isa Real, cuts) || _fail(label,
+        "thresholds must be a real vector; got $(summary(cuts))")
+    return length(cuts)
+end
+function _data_threshold_extent(::ThresholdRows, cuts, label)
+    cuts isa AbstractArray || _fail(label,
+        "broadcast thresholds must contain one real vector per observation")
+    # Empty observation domains need no threshold read. Ragged vectors may
+    # define different supports; the response validator checks each lane.
+    return maximum(c -> _data_threshold_extent(:shared, c, label), cuts; init = 0)
+end
+
 function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         vectors::Vector{VectorParameter}, columns::AbstractDict{Symbol},
         predictors::Vector{PredictorSpec} = PredictorSpec[],
@@ -7958,6 +8040,15 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
             findfirst(p -> p.name === r.thresholds, vectors)
         declared = _is_ordered_family(r.family) && tp !== nothing ?
             vectors[tp].size : nothing
+        if _is_ordered_family(r.family) && tp === nothing && r.thresholds !== nothing
+            cuts = _bound_data_value(plan, _threshold_name(r.thresholds), r.label, "thresholds")
+            if r.thresholds isa ThresholdRows
+                cuts = _response_slot_column(plan, r, r.thresholds.name,
+                    "threshold vectors"; value = cuts)
+            end
+            kind = _group_thresholds(plan, r) ? ThresholdRows(r.thresholds) : r.thresholds
+            declared = _data_threshold_extent(kind, cuts, r.label)
+        end
         K = declared !== nothing ? declared + 1 : if r.evidence.kind !== :none && r.n_levels === nothing &&
                 r.family !== CategoricalLogitFam
             # Clamp endpoints need not be category integers. Infer the law's
@@ -7977,7 +8068,10 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
         else
             _infer_response_levels(r, columns)
         end
-        push!(out_r, _with_levels(r, K))
+        # Data cutpoints define their support on every bind. A level count
+        # inferred by an earlier bind is not a model declaration.
+        fixed_thresholds = _is_ordered_family(r.family) && tp === nothing && r.thresholds !== nothing
+        push!(out_r, fixed_thresholds ? _with(r; n_levels = K) : _with_levels(r, K))
     end
     by_label = Dict{Symbol,LikelihoodSpec}(r.label => r for r in out_r)
     thresh_link = Dict{Symbol,Symbol}()
@@ -7985,7 +8079,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     coefs_link = Dict{Symbol,Symbol}()
     mixture_link = Dict{Symbol,Symbol}()
     for r in out_r
-        r.thresholds !== nothing && (thresh_link[r.thresholds] = r.label)
+        r.thresholds isa Symbol && (thresh_link[r.thresholds] = r.label)
         r.threshold_coefs !== nothing && (coefs_link[r.threshold_coefs] = r.label)
         if _is_simplex_family(r.family)
             simplex_link[r.predictor] = r.label
