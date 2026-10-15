@@ -327,7 +327,10 @@ _bound_leaf_paths(value::Tuple) = Tuple(
     (index, path...) for (index, field) in enumerate(value)
     for path in _bound_leaf_paths(field))
 _bound_leaf_paths(::AbstractArray) = ((),)
-_bound_leaf_paths(value) = ()
+_bound_leaf_paths(value) = _bound_record(value) ? Tuple(
+    (name, path...) for (name, field) in
+        zip(fieldnames(typeof(value)), _bound_record_fields(value))
+    for path in _bound_leaf_paths(field)) : ()
 
 function _unique_symbols(names)
     seen = Set{Symbol}()

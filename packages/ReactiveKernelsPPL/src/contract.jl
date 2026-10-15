@@ -801,7 +801,7 @@ VectorAssignmentSpec(name::Symbol, expr::Union{Expr,Symbol}) =
     VectorAssignmentSpec(name, expr, name)
 
 """
-    ScanSetup(target, index, kind, family, args, expr)
+    ScanSetup(target, index, kind, family, args, expr[, support])
 
 One literal-index seed fill of a `@scan` carried array `target`, mirroring
 [`ScanStep`](@ref):
@@ -809,10 +809,12 @@ One literal-index seed fill of a `@scan` carried array `target`, mirroring
 - `kind === :sample` — `target[index] ~ Dist(args…)`: a sampled seed.
   `family` is an internal family symbol (see the surface's
   `_PARAM_FAMILIES`), `args` the positional distribution-argument
-  expressions; `expr` is `nothing`.
+  expressions and `support` its [`SupportOverride`](@ref) (`restricted`,
+  `truncated` and half priors, as for a scalar parameter); `expr` is
+  `nothing`.
 - `kind === :assign` — `target[index] = expr`: a deterministic seed (a
   literal, or an expression over scalar parameters, definitions and earlier
-  seeds). `family`/`args` are `nothing`.
+  seeds). `family`/`args`/`support` are `nothing`.
 """
 struct ScanSetup
     target::Symbol
@@ -821,20 +823,24 @@ struct ScanSetup
     family::Union{Symbol,Nothing}
     args::Union{Vector{Any},Nothing}
     expr::Any
+    support::SupportOverride
 end
+ScanSetup(target, index, kind, family, args, expr) =
+    ScanSetup(target, index, kind, family, args, expr, nothing)
 
 """
-    ScanStep(kind, target, indexed, family, args, expr)
+    ScanStep(kind, target, indexed, family, args, expr[, support])
 
 One `@scan` recurrence-body statement.
 
 - `kind === :sample` — a `~` statement: a carried array at the loop index
   (`indexed = true`, `target` one of the scan's `states`, centered form) or a
   fresh per-step local innovation (`indexed = false`, non-centered form).
-  `family`/`args` describe the distribution; `expr` is `nothing`.
+  `family`/`args`/`support` describe the distribution, as for a
+  [`ScanSetup`](@ref); `expr` is `nothing`.
 - `kind === :assign` — a `=` statement: a carried array's deterministic write
   (`indexed = true`) or a per-step deterministic local (`indexed = false`).
-  `expr` is the RHS AST; `family`/`args` are `nothing`.
+  `expr` is the RHS AST; `family`/`args`/`support` are `nothing`.
 
 Statements run in order, as in a Julia loop body: a step reads a carried
 array's backward lags `a[t - k]`, its current value `a[t]` once an earlier
@@ -847,7 +853,15 @@ struct ScanStep
     family::Union{Symbol,Nothing}
     args::Union{Vector{Any},Nothing}
     expr::Any
+    support::SupportOverride
 end
+ScanStep(kind, target, indexed, family, args, expr) =
+    ScanStep(kind, target, indexed, family, args, expr, nothing)
+
+# The value expressions a seed or step reads: a sampled statement's
+# distribution arguments and support bounds, an assignment's expression.
+_scan_reads(st::Union{ScanSetup,ScanStep}) = st.kind === :sample ?
+    Any[st.args..., _support_args(st.support)...] : Any[st.expr]
 
 """
     ScanSpec(states, loopvar, lo, hi, setup, step, maxlag, label)
@@ -2215,14 +2229,7 @@ end
 Values with no data anchor (an intercept or dar path) use their response
 consumers. No dimension is inferred from the total of unrelated axes."""
 function _value_rows(plan::StructuralPlan, name::Symbol)
-    haskey(plan.columns, name) && return _column_nrows(plan.columns[name])
-    reads = _response_reads(plan, name, _row_columns(plan))
-    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
-    if isempty(ns)
-        names = Set{Symbol}([name])
-        ns = unique!([_response_rows(plan, r) for r in plan.responses
-            if name in _response_reads(plan, r, names)])
-    end
+    ns = _value_row_counts(plan, name)
     length(ns) == 1 && return only(ns)
     if isempty(ns)
         axes = unique!([_response_rows(plan, r) for r in plan.responses])
@@ -2231,6 +2238,19 @@ function _value_rows(plan::StructuralPlan, name::Symbol)
         _fail(name, "value $name has no data range or response to establish its rows")
     end
     _fail(name, "value $name reads or feeds different row counts $ns")
+end
+
+# The distinct row counts that establish `name`'s rows (see `_value_rows`):
+# its own data column, the row columns it reads, else the responses it
+# feeds. Empty when none applies; several when they disagree.
+function _value_row_counts(plan::StructuralPlan, name::Symbol)
+    haskey(plan.columns, name) && return [_column_nrows(plan.columns[name])]
+    reads = _response_reads(plan, name, _row_columns(plan))
+    ns = unique!([_column_nrows(plan.columns[c]) for c in reads])
+    isempty(ns) || return ns
+    names = Set{Symbol}([name])
+    return unique!([_response_rows(plan, r) for r in plan.responses
+        if name in _response_reads(plan, r, names)])
 end
 
 function _plate_rows(plan::StructuralPlan, p::PlateParameter;
@@ -2857,7 +2877,8 @@ end
 # (bound columns are inputs, not nodes); keyword names and function values
 # are not reads.
 function _collect_opaque_refs!(refs, ex, plan, label, bound::Bool)
-    ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String} &&
+    # An interpolated `nothing` or `missing` is Base's value, as its name is.
+    ex isa Union{Number,LineNumberNode,GlobalRef,QuoteNode,String,Nothing,Missing} &&
         return nothing
     if ex isa Symbol
         # `:` in a positional read (`Z[:, 1]`) is a whole axis, and `end`
@@ -3782,10 +3803,8 @@ function topological_order(plan::StructuralPlan)
     for s in plan.scans
         refs = Set{Symbol}()
         locals = Set(st.target for st in s.step if !st.indexed)
-        for st in (s.setup..., s.step...)
-            for expr in (st.kind === :sample ? st.args : (st.expr,))
-                union!(refs, _expr_value_symbols(expr))
-            end
+        for st in (s.setup..., s.step...), expr in _scan_reads(st)
+            union!(refs, _expr_value_symbols(expr))
         end
         filter!(r -> r in allnames && r ∉ s.states && r ∉ locals, refs)
         for state in s.states
@@ -6822,7 +6841,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     for s in plan.scans
         exprs = Any[s.hi]
         for st in (s.setup..., s.step...)
-            append!(exprs, st.kind === :sample ? st.args : (st.expr,))
+            append!(exprs, _scan_reads(st))
         end
         push!(defs, Symbol(:_ppl_scan_input_, s.label) => Expr(:tuple, exprs...))
     end
@@ -7131,7 +7150,8 @@ end
 # law observes it (`y .~ LogDensity.(f, mu)` too).
 function _scalar_responses_as_observations!(plan::StructuralPlan,
         columns::Dict{Symbol,ColumnData})
-    observed = Symbol[p.name for p in plan.external_observations]
+    # An undotted caller-owned observation reads its value whole.
+    observed = Symbol[p.name for p in plan.external_observations if p.args.broadcast]
     for r in plan.responses
         push!(observed, r.response, r.count_columns..., r.extra_responses...)
     end

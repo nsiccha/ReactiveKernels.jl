@@ -691,10 +691,12 @@ function _value_axes(plan::StructuralPlan, ex,
     if fn isa GlobalRef && getglobal(fn.mod, fn.name) === Base.hcat
         return _hcat_axes(Any[ax(a) for a in args])
     end
-    # Qualified Base calls have the same shape rules as their bare spelling.
-    fn isa GlobalRef && fn.mod === Base && (fn = fn.name)
+    # Qualified Base calls, and the Julia function a bare reduction names
+    # (`Statistics.mean`), have the same shape rules as their bare spelling.
+    fn isa GlobalRef && (fn.mod === Base || fn.name in REDUCTION_FNS &&
+        fn == _julia_reduction_ref(fn.name)) && (fn = fn.name)
     fn isa Symbol || return nothing
-    fn in REDUCTION_FNS && return Any[]
+    fn in REDUCTION_FNS && return _reduction_axes(ax, args)
     fn === :transpose && length(args) == 1 &&
         return _adjoint_axes(ax(args[1]))
     fn === :* && return foldl(_matmul_axes, Any[ax(a) for a in args])
@@ -705,6 +707,31 @@ function _value_axes(plan::StructuralPlan, ex,
         all(a -> ax(a) == Any[], args) && return Any[]
     end
     return nothing
+end
+
+# A reduction is a scalar unless it keeps dimensions: `sum(A; dims = d)`
+# has `A`'s axes with each reduced one of length 1, as in Julia (a `dims`
+# beyond `A`'s rank leaves it unchanged). A `dims` that is not literal has
+# no known shape before the value is computed.
+function _reduction_axes(ax, args)
+    dims = nothing
+    for a in args, kw in (Meta.isexpr(a, :parameters) ? a.args : (a,))
+        kw === :dims && (dims = kw)
+        Meta.isexpr(kw, :kw, 2) && kw.args[1] === :dims && (dims = kw.args[2])
+    end
+    dims === nothing && return Any[]
+    ds = dims isa Int ? (dims,) : Meta.isexpr(dims, :tuple) &&
+        all(d -> d isa Int, dims.args) ? Tuple(dims.args) : nothing
+    (ds === nothing || !all(>=(1), ds)) && return nothing
+    pos = Any[a for a in args if !Meta.isexpr(a, (:parameters, :kw))]
+    isempty(pos) && return nothing
+    out = ax(last(pos))
+    out === nothing && return nothing
+    out = copy(out)
+    for d in ds
+        d <= length(out) && (out[d] = 1)
+    end
+    return out
 end
 
 # Concatenation shares the same shape walk as broadcasts, products and

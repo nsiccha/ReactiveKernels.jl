@@ -160,16 +160,19 @@ _names_identity_recipes(spec) =
         @test !occursin("__return__", text)
         @test !occursin(r"\b(logpdf|log_scale|constrain)_\d+\b", text)
         # The child's own values are named under the caller's result name, so
-        # the two `exponential(4.0)` calls stay distinguishable without ids,
-        # and literal arguments read as values.
-        @test occursin("var\"lp_s.log_scale\" = log(4.0)", text)
-        @test occursin("var\"lp_t.log_scale\" = log(4.0)", text)
-        @test occursin("lp_s = ifelse(s >= 0, -var\"lp_s.log_scale\" - s / 4.0, -Inf)", text)
-        # `u[2]` is read twice by the endpoint, so it stays one named value.
+        # the two `exponential(4.0)` calls stay distinguishable without ids. A
+        # literal or computed argument is the child's own scoped value; the
+        # program reads it by that name rather than a substituted value.
+        @test occursin("var\"lp_s.scale\" = 4.0", text)
+        @test occursin("var\"lp_s.log_scale\" = log(var\"lp_s.scale\")", text)
+        @test occursin("var\"lp_t.log_scale\" = log(var\"lp_t.scale\")", text)
+        @test occursin("lp_s = ifelse(s >= 0, -var\"lp_s.log_scale\" - " *
+                       "s / var\"lp_s.scale\", -Inf)", text)
         @test occursin("var\"lp_t.x\" = u[2]", text)
-        # A once-read computed argument reads in place; a bound child
-        # endpoint's scoped port reads its own value, not `var"standard.z"`.
-        @test occursin("var\"lp_m.standardized\" = (u[3] - -0.5) / 2.0", text)
+        # A bound child endpoint's scoped port reads its own value, not
+        # `var"standard.z"`.
+        @test occursin("var\"lp_m.standardized\" = (var\"lp_m.x\" - " *
+                       "var\"lp_m.location\") / var\"lp_m.scale\"", text)
         @test occursin("var\"lp_m.standard.logpdf\" = -0.5 * log(2π) - 0.5 * " *
                        "var\"lp_m.standardized\" ^ 2", text)
         @test !occursin("standard.z", text)
@@ -213,8 +216,12 @@ _names_identity_recipes(spec) =
         @test ReactiveKernels.valtype(names_typed_parent.ports[:w]) ===
               AbstractVector{Float64}
         text = _names_text(names_typed_parent)
-        @test occursin("var\"r.names_typed_child\" = sum(w) * 2.0", text)
-        @test occursin("var\"r.names_typed_child_2\" = sum(a .* 2.0) * 1.0", text)
+        @test occursin("var\"r.names_typed_child\" = sum(w) * " *
+                       "var\"r.names_typed_child.s\"", text)
+        @test occursin("var\"r.names_typed_child_2.v\" = a .* 2.0", text)
+        @test occursin("var\"r.names_typed_child_2\" = " *
+                       "sum(var\"r.names_typed_child_2.v\") * " *
+                       "var\"r.names_typed_child_2.s\"", text)
         @test !occursin("identity(", text)
         @test !occursin("##", text)
         kernel = prepare(names_typed_parent)
@@ -238,7 +245,8 @@ _names_identity_recipes(spec) =
         @test occursin("var\"mu.names_rise\" = var\"mu.names_rise.xi\" .+ 1.0", text)
         @test occursin("var\"mu.names_fall.xi_max\" = m .- 3.0", text)
         @test occursin("mu = (a .* var\"mu.names_rise\") .* exp.(var\"mu.names_fall\")", text)
-        @test occursin("var\"twice.names_rise.xi\" = (a .* 3.0) .* 2.0", text)
+        @test occursin("var\"twice.names_rise.x\" = a .* 3.0", text)
+        @test occursin("var\"twice.names_rise.xi\" = var\"twice.names_rise.x\" .* 2.0", text)
         @test occursin("var\"twice.names_rise_2.xi\" = m .* 2.0", text)
         @test occursin("twice = var\"twice.names_rise\" .+ var\"twice.names_rise_2\"", text)
         @test !occursin("##", text)
@@ -264,8 +272,13 @@ _names_identity_recipes(spec) =
 
     @testset "an endpoint inside a branch arm reads by its own names" begin
         text = _names_text(names_arm)
-        @test occursin("let log_scale = log(s), standardized = (x - 0.0) / s", text)
-        @test !occursin("##", text)
+        # The arm binds the endpoint's own values by name; their operations
+        # are the callables the generated code embeds.
+        @test occursin(r"let log_scale = \S+\(s\), standardized = ", text)
+        @test occursin("var\"standard.logpdf\", log_scale", text)
+        # No generated binding name (an embedded operation's type may carry
+        # its definition token).
+        @test !occursin("var\"##", text)
         @test !occursin("->", text)
         kernel = prepare(names_arm)
         @test kernel(0.3, 2.0) ≈ _names_normal(0.3, 0.0, 2.0)
