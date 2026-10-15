@@ -183,6 +183,7 @@ export product_mixture_logdensity, bernoulli_product_mixture_logdensity
 export binomial_product_mixture_logdensity
 export bernoulli_logit_product_mixture_logdensity
 export binomial_logit_product_mixture_logdensity
+export zero_inflated_binomial_logit_product_mixture_logdensity
 export hmm_logdensity, normal_hmm_logdensity, exponential_hmm_logdensity
 export icar_logdensity
 export categorical_logit, categorical_logit_ref
@@ -1314,6 +1315,32 @@ end
         cells = plate(1:length(observed)) do i
             binomial(; n = checked_trials[i, k],
                 logit = checked_logits[i, k]).logpdf(observed[i])
+        end
+        sum(cells)
+    end
+    return product_mixture_logdensity(components, weights)
+end
+
+# Zero-inflated Binomial cells, both probabilities on the log-odds scale:
+# `logits[i, k]` is component k's success log-odds at position i and
+# `zi_logits[i, k]` the log-odds of its structural zero. Each cell reads
+# `zero_inflated_binomial_logit_zi` through the logit HAVE route, so neither
+# probability is formed and both tails stay in log space. A component that
+# never produces a nonzero count uses logit -Inf (any zero-inflation value).
+@kernel zero_inflated_binomial_logit_product_mixture_logdensity(
+        observed::Vector{Int}, trials::Matrix{Int}, logits::Matrix{Float64},
+        zi_logits::Matrix{Float64}, weights::Vector{Float64}) = begin
+    checked_trials = size(trials) == size(logits) ?
+        trials : throw(DimensionMismatch("trial counts and logits must match"))
+    checked_zi_logits = size(zi_logits) == size(logits) ?
+        zi_logits : throw(DimensionMismatch("zero-inflation logits and logits must match"))
+    checked_logits = size(logits, 1) == length(observed) ?
+        logits : throw(DimensionMismatch("logit rows must match observations"))
+    components = plate(1:size(checked_logits, 2)) do k
+        cells = plate(1:length(observed)) do i
+            zero_inflated_binomial_logit_zi(; n = checked_trials[i, k],
+                logit = checked_logits[i, k],
+                zi_logit = checked_zi_logits[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end

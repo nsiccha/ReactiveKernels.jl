@@ -4188,8 +4188,22 @@ function _categorical_plate_cell(c, plate_defs::Set{Symbol}, data::Set{Symbol})
     Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :Categorical &&
         rhs.args[2] isa Symbol && rhs.args[2] ∉ plate_defs && return c
     Meta.isexpr(rhs, :call, 2) && rhs.args[1] === :Categorical || return c
+    p = rhs.args[2]
+    if Meta.isexpr(p, :call, 3) && p.args[1] === :* && p.args[2] isa Symbol &&
+            Meta.isexpr(p.args[3], :ref, 3) && p.args[3].args[1] isa Symbol &&
+            p.args[3].args[2] === :(:)
+        # `A * B[:, j]`: each observation reads one entry from `A` and `B`
+        # in place; the cell's value is the checked column `j`.
+        A, B, j = p.args[2], p.args[3].args[1], p.args[3].args[3]
+        column = Expr(:call, GlobalRef(@__MODULE__, :_ppl_categorical_column),
+            Expr(:call, GlobalRef(@__MODULE__, :_ppl_categorical_columns), A),
+            A, B, j)
+        density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
+            GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), A, B, column)
+        return Expr(:call, c.args[1], c.args[2], density)
+    end
     probabilities = Expr(:call,
-        GlobalRef(@__MODULE__, :_ppl_categorical_probabilities), rhs.args[2])
+        GlobalRef(@__MODULE__, :_ppl_categorical_probabilities), p)
     density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
         GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), probabilities)
     return Expr(:call, c.args[1], c.args[2], density)
@@ -4300,14 +4314,15 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
     return out, ctx, params
 end
 
-# A computed categorical probability vector that reads the loop index only
-# through one integer data column (`phi * theta[:, doc[i]]`) is the same
-# vector at every index sharing that column's value. Return that column,
-# or `nothing` when the vector reads the index any other way (`x[i]`, a
-# bare `i`, a per-index local or latent, or two key columns).
+# A computed categorical probability vector (or checked column) that reads
+# the loop index only through one integer data column
+# (`phi * theta[:, doc[i]]`) is the same at every index sharing that column's
+# value. Return that column, or `nothing` when it reads the index any other
+# way (`x[i]`, a bare `i`, a per-index local or latent, or two key columns).
 function _categorical_key_column(ex, locals, ivar::Symbol, data::Set{Symbol})
     Meta.isexpr(ex, :call) && !isempty(ex.args) &&
-        ex.args[1] == GlobalRef(@__MODULE__, :_ppl_categorical_probabilities) ||
+        (ex.args[1] == GlobalRef(@__MODULE__, :_ppl_categorical_probabilities) ||
+         ex.args[1] == GlobalRef(@__MODULE__, :_ppl_categorical_column)) ||
         return nothing
     keys = Set{Symbol}()
     keyed = true

@@ -880,9 +880,22 @@ struct _LaneGather
 end
 @inline (::_LaneGather)(x::Number, lanes) = x
 @inline function (gather::_LaneGather)(x::AbstractArray, lanes)
-    length(x) == 1 && return _tensorized_view(x, ones(Int, length(lanes)))
+    length(x) == 1 && return _lane_view(x, ones(Int, length(lanes)))
     ndims(x) == 1 && length(x) == gather.n || _lane_gather_mismatch(x, gather.n)
-    _tensorized_view(x, lanes)
+    _lane_view(x, lanes)
+end
+# Base's `view` unaliases its index vector against the parent, and native
+# Enzyme compiles the `copy` of that never-taken branch through its untyped
+# `memmove` override; on Julia 1.12 type analysis rejects it
+# (`IllegalTypeAnalysisException`; a one-entry scan trajectory broadcast over
+# guarded observations in `test_scan_capabilities.jl`).  Lane indices are
+# fresh or bound `Int` vectors that nothing writes, so a native lane view needs
+# no unaliasing; its bounds are still checked.  Other operands, and tracing
+# backends, keep `_tensorized_view`.
+@inline _lane_view(x::AbstractArray, lanes) = _tensorized_view(x, lanes)
+@inline function _lane_view(x::Vector, lanes::Vector{Int})
+    checkbounds(x, lanes)
+    Base.unsafe_view(x, lanes)
 end
 @noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
@@ -1189,7 +1202,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     pid = canon_id(g, pointwise.id)
     consumers = [r for r in pending
                  if any(inp -> canon_id(g, inp.id) == pid, r.inputs)]
-    total = _partition_sum_consumer(consumers, pointwise)
+    total = _partition_sum_consumer(consumers)
     wanted = any(w -> canon_id(g, w.id) == pid, want)
     if total !== nothing && length(consumers) == 1 && !wanted
         totals = Value[]
@@ -1224,19 +1237,10 @@ function _partition_arm_hoists(variant::Plan, cell_ids, lane_roots, live_roots)
     end
 end
 
-function _partition_sum_consumer(consumers, pointwise)
+function _partition_sum_consumer(consumers)
     length(consumers) == 1 || return nothing
     r = only(consumers)
-    r.effectful && return nothing
-    length(r.inputs) == 1 && length(r.outputs) == 1 || return nothing
-    source = r.source
-    source isa Expr && source.head === :call && length(source.args) == 2 ||
-        return nothing
-    (source.args[1] === :sum || source.args[1] === GlobalRef(Base, :sum)) ||
-        return nothing
-    source.args[2] === pointwise.name || return nothing
-    (r.op === sum || r.op isa _KernelSourceOp) || return nothing
-    r
+    length(r.outputs) == 1 && _plain_sum_recipe(r) ? r : nothing
 end
 
 function _partial_inner_plates(p::Plan, known)

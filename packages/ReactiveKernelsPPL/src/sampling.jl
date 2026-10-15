@@ -51,6 +51,56 @@ function _ppl_categorical_logdensity(value::Integer, probabilities::AbstractVect
     return log(probabilities[value])
 end
 
+# A categorical vector written as a matrix times a column, `A * B[:, j]` (a
+# mixture of the categorical columns of `A` with the weights in column `j` of
+# `B`, as in topic models), is scored one observed entry at a time,
+# `log(dot(A[y, :], B[:, j]))`, without forming the vector: O(size(A, 2)) per
+# observation instead of O(length(A)) per vector. The observation reads `A`
+# and `B` in place as shared values; its plate value is only the column `j`,
+# returned by `_ppl_categorical_column` once the vector is checked. That check
+# uses the column sums and sign of `A` (`_ppl_categorical_columns`), which
+# read `A` only: a plate invariant.
+_ppl_categorical_columns(A::AbstractMatrix) =
+    (vec(sum(A; dims=1)), all(a -> a >= zero(a), A))
+_ppl_categorical_columns(A) = nothing
+# The check `_ppl_categorical_probabilities(A * B[:, j])` makes, and `j`.
+function _ppl_categorical_column(columns::Tuple, A::AbstractMatrix,
+        B::AbstractVecOrMat, j::Integer)
+    Base.require_one_based_indexing(A, B)
+    # The errors `A * B[:, j]` raises, in its order.
+    checkbounds(B, :, j)
+    size(A, 2) == size(B, 1) || throw(DimensionMismatch(
+        "matrix A has dimensions $(size(A)), vector B[:, j] has length $(size(B, 1))"))
+    sums, nonnegative = columns
+    total = zero(promote_type(eltype(sums), eltype(B)))
+    for k in axes(B, 1)
+        nonnegative &= B[k, j] >= zero(B[k, j])
+        total += sums[k] * B[k, j]
+    end
+    # A nonnegative mixture of nonnegative columns is nonnegative, and its
+    # sum is the weighted sum of the column sums. Otherwise (a negative entry
+    # or a sum off one) only the vector itself decides.
+    nonnegative && isapprox(total, one(total)) ||
+        _ppl_categorical_probabilities(A * B[:, j])
+    return j
+end
+# Other operands keep the computed vector.
+function _ppl_categorical_column(columns, A, B, j)
+    _ppl_categorical_probabilities(A * B[:, j])
+    return j
+end
+function _ppl_categorical_logdensity(value::Integer, A::AbstractMatrix,
+        B::AbstractVecOrMat, j::Integer)
+    total = zero(promote_type(eltype(A), eltype(B)))
+    1 <= value <= size(A, 1) || return log(total)
+    for k in axes(A, 2)
+        total += A[value, k] * B[k, j]
+    end
+    return log(total)
+end
+_ppl_categorical_logdensity(value::Integer, A, B, j) =
+    _ppl_categorical_logdensity(value, A * B[:, j])
+
 """
     ParameterGeometry(shape, unconstrained; support, constrain, unconstrain,
                       logjac, coordinate_names=nothing)
