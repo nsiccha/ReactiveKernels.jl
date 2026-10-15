@@ -268,6 +268,7 @@ const _PPL_TEST_FILES = (
     "test_prior_observation_audit_reactant.jl",
     "test_positive_priors_reactant.jl",
     "test_derived_response.jl",
+    "test_array_literals.jl",
     "test_deterministic_factors.jl",
     "test_derived_response_reactant.jl",
     "test_sweep_replicate.jl",
