@@ -6,6 +6,67 @@ using Test
 isdefined(@__MODULE__, :BranchPartition) ||
     include("fixtures/branch_partition.jl")
 
+@testset "branch partitions borrow indexed views" begin
+    RK = ReactiveKernels
+    C = BranchPartition
+    allocation(f::F, args::Vararg{Any,N}) where {F,N} =
+        (f(args...); @allocated f(args...))
+    lane_sum(x, lanes) = sum(ReactiveKernels._LaneGather(length(x))(x, lanes))
+    values = collect(0.5:0.5:4.0)
+    packed = vcat(11.0, values, 13.0)
+    matrix = hcat(fill(11.0, 8), values, fill(13.0, 8))
+    for parent in (values, view(packed, 2:9), view(matrix, :, 2)),
+        n in (0, 1, 31, 1024)
+        groups = mod1.(3 .* (1:n), 8)
+        gathered = Base.SubArray(parent, (groups,))
+        lanes = reverse(collect(1:2:n))
+        before = deepcopy((parent, groups, lanes))
+        selected = RK._LaneGather(n)(gathered, lanes)
+        @test collect(selected) == parent[groups[lanes]]
+        @test (parent, groups, lanes) == before
+        # A singleton may broadcast to an arbitrary number of lanes; its
+        # existing repeated-index buffer is outside this composition check.
+        n == 1 || @test allocation(lane_sum, gathered, lanes) == 0
+    end
+
+    # Values and ordinary Reverse exercise the prepared graph, including
+    # repeated indices and an inactive log of a negative value.
+    values[2:2:end] .*= -1
+    packed = vcat(11.0, values, 13.0)
+    matrix = hcat(fill(11.0, 8), values, fill(13.0, 8))
+    for (spec, input, embed) in (
+            (C.gathered_guard, values, identity),
+            (C.packed_gathered_guard, packed, g -> vcat(0.0, g, 0.0)),
+            (C.matrix_gathered_guard, matrix, g -> hcat(zeros(8), g, zeros(8))))
+        bytes = Int[]
+        structures = Int[]
+        for n in (31, 1024)
+            groups = mod1.(3 .* (1:n), 8)
+            flags = [isodd(g) for g in groups]
+            saved = deepcopy((input, groups, flags))
+            k = prepare(spec; have=(:values, :groups, :flags),
+                bound=(; groups, flags))
+            expected = sum(flags[i] ? log(values[groups[i]]) : -values[groups[i]]
+                           for i in eachindex(groups))
+            partial = [sum(flags[i] ? inv(values[j]) : -1.0
+                           for i in eachindex(groups) if groups[i] == j; init=0.0)
+                       for j in eachindex(values)]
+            @test k(input) ≈ expected
+            ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), input; active=:values)
+            value, gradient = RK.ad_value_and_gradient(ad, input)
+            @test value ≈ expected
+            @test gradient ≈ embed(partial)
+            @test (input, groups, flags) == saved
+            push!(bytes, allocation(k, input))
+            push!(structures, length(recipe_inventory(k)))
+        end
+        # Small constant bookkeeping may differ across Julia versions; no
+        # lane-count-sized index composition is needed in either program.
+        @test bytes[2] <= bytes[1] + 128
+        @test structures[2] == structures[1]
+    end
+end
+
 # A plate cell whose lazy branch reads bound data only is split at preparation
 # into one branch-free plate per taken arm (docs/src/constraints.md).
 @testset "data-bound branch partitioning of authored plates" begin
