@@ -174,9 +174,9 @@ function _checked_recipe_type!(found, op::_AuthoredPlateOp{K,A}, input_types,
         class === :axis && (marker = T; break)
     end
     marker === nothing && return nothing
-    shape = _promote_op(_plate_broadcast_shape,
-        Tuple{(_promote_op(axes, T) for T in batched)...})
-    T = _promote_op(_plate_similar_output, marker, Type{element}, shape)
+    # The generated body's nested type query shares this same allocation
+    # inference; neither path infers the wide semantic-fallback operation.
+    T = _plate_array_type(element, Val(A), input_types...)
     _concrete_value_type(T) ? T : nothing
 end
 

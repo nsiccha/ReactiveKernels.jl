@@ -42,6 +42,102 @@ end
 # Independent Distributions densities for the P8 argument positions. The
 # same fixtures are also used by the compiled value/gradient checks.
 _expression_sigmoid(x) = 1 / (1 + exp(-x))
+
+# Live zero-inflation values exercise the per-cell support branch, including
+# nested branch arms whose data-only parts preparation caches. Keep this native
+# regression separate from `_expression_cases`, which also drives Reactant.
+function _expression_live_zi_case(n, source, named; varying_rate=false)
+    x = collect(range(-0.6, 0.7; length=n))
+    y = [mod(i - 1, 4) for i in 1:n]
+    expr = quote a ~ Normal(0, 1) end
+    q = if source === :declared
+        push!(expr.args, :(z[axes(y, 1)] .~ Normal.(0, 1)))
+        (a=0.3, z=collect(range(-0.4, 0.3; length=n)))
+    else
+        push!(expr.args, :(z ~ Normal(0, 1)))
+        (a=0.3, z=-0.4)
+    end
+    logits = if source === :scan
+        push!(expr.args, :(@scan begin
+            w[1] = z
+            for t in 2:T
+                w[t] = 0.7 * w[t - 1] + z * x[t]
+            end
+        end))
+        :w
+    elseif source === :computed
+        :(z .* x)
+    else
+        :z
+    end
+    if named
+        push!(expr.args, :(zi_logits = $logits))
+        logits = :zi_logits
+    end
+    rate = if varying_rate
+        push!(expr.args, :(b ~ Normal(0, 1)))
+        q = merge(q, (b=-0.2,))
+        :(exp.(a .+ b .* x))
+    else
+        :(exp.(a))
+    end
+    push!(expr.args, :(y .~ ZeroInflatedPoisson.($rate, logistic.($logits))))
+    function oracle(q)
+        w = if source === :scan
+            trajectory = [q.z]
+            for i in 2:n
+                push!(trajectory, 0.7 * trajectory[end] + q.z * x[i])
+            end
+            trajectory
+        elseif source === :computed
+            q.z .* x
+        elseif source === :declared
+            q.z
+        else
+            fill(q.z, n)
+        end
+        lp = D.logpdf(D.Normal(), q.a) +
+            (source === :declared ? sum(D.logpdf.(D.Normal(), q.z)) :
+                                   D.logpdf(D.Normal(), q.z)) +
+            (varying_rate ? D.logpdf(D.Normal(), q.b) : 0.0)
+        for i in eachindex(y)
+            zi = _expression_sigmoid(w[i])
+            lambda = exp(q.a + (varying_rate ? q.b * x[i] : 0.0))
+            lp += log((y[i] == 0 ? zi : 0.0) +
+                      (1 - zi) * D.pdf(D.Poisson(lambda), y[i]))
+        end
+        lp
+    end
+    (; expr, data=(; x, y, T=n), q, oracle)
+end
+
+@testset "ordinary Reverse through live zero-inflation values" begin
+    for n in (3, 7), source in (:scalar, :declared, :computed, :scan),
+            named in (false, true)
+        @testset "$source named=$named n=$n" begin
+            # The larger fixture varies the rate too, so correctness cannot
+            # depend on hoisting all rate arithmetic out of the cell loop.
+            case = _expression_live_zi_case(n, source, named; varying_rate=n == 7)
+            before = deepcopy(case.data)
+            bound = bind_data(lower_rkppl(case.expr, case.data; conditioned=(:y,)), case.data)
+            built = build_kernel(bound)
+            u0 = unconstrain(built.layout, case.q)
+            backend = AutoEnzyme(; mode=Enzyme.Reverse)
+            sampler = prepare_sampler(built, bound, u0; backend)
+            @test sampler.ad.backend == backend
+            oracle = u -> case.oracle(constrain(built.layout, u))
+            for u in (u0, u0 .+ range(-0.15, 0.1; length=length(u0)))
+                original = copy(u)
+                value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+                @test value ≈ oracle(u) atol=1e-11 rtol=1e-11
+                @test gradient ≈ _findiff_grad(oracle, u) atol=1e-7 rtol=1e-5
+                @test u == original
+            end
+            @test case.data == before
+        end
+    end
+end
+
 function _expression_cases(n)
     x = collect(range(-0.4, 0.5; length=n))
     y = fill(0.2, n)

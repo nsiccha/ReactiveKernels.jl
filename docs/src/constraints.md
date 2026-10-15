@@ -630,6 +630,20 @@ and lock the one Reactant 0.2.289 lifted:
   differentiated the same call exactly with Enzyme 0.13.210, while local
   runs with Enzyme 0.13.210 and 0.13.216 still raise the readonly exception.
   Its test accepts only the exact gradient or that specific exception.
+- On Julia 1.13.1 with `--check-bounds=yes`, Enzyme 0.13.216 raises
+  `EnzymeRuntimeActivityError` when a reshaped `Const` vector feeds both
+  a constant row reduction and a broadcast with an active matrix. The
+  diagnostic identifies the array-header pointer store in `Base.reshape`;
+  neither input is written. `repro_enzyme_const_reshape_reduction.jl`
+  reproduces it with Enzyme and Base only, at four matrix shapes, and checks
+  analytic gradients and input ownership. Removing the constant reduction
+  passes, as does the unchanged expression with default bounds checking.
+  Shared constant concentrations in Dirichlet slice priors reach this shape:
+  `test_plate_categorical.jl` fails at `_arg_rows` with forced bounds checks
+  and passes with default bounds checks. Enzyme dogfood `2690dbd8` with
+  Enzyme_jll 0.0.301 still rejects the isolated expression and both row and
+  column slice helpers. The repair belongs in Enzyme; no runtime-activity
+  setting or replacement derivative is applied in RK.
 - On Julia 1.10.12, 1.12.7 and 1.13.1, Enzyme 0.13.216 rejects the readonly
   proof of a read-only callable that holds a matrix beside a
   `UniformScaling{Float64}` and adds them with Base's
