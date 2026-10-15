@@ -36,12 +36,12 @@ _mp_prior(nt) = logpdf(LogNormal(0, 0.5), nt.rho) +
 # The sampler value against the independent oracle `density(constrained
 # values)` plus the transform's log Jacobian, the native Enzyme gradient
 # against central differences, and the caller's data left unchanged.
-function _mp_check(plan, data, density)
+function _mp_check(plan, data, density; backend = _MP_BACKEND)
     saved = deepcopy(data)
     built = build_kernel(plan)
     u = _mp_u(built)
     oracle(v) = density(constrain(built.layout, v)) + logjac(built.layout, v)
-    q = prepare_sampler(built, plan, u; backend = _MP_BACKEND)
+    q = prepare_sampler(built, plan, u; backend)
     g = similar(u)
     value, _ = sampler_value_and_gradient!(q, g, u)
     @test value ≈ oracle(u) rtol = 1e-10
@@ -120,6 +120,72 @@ end
     data = (; D, N = n, idx)
     built = _mp_check(model(; data...) | (; z), merge(data, (; z)), density)
     @test length(constrain(built.layout, _mp_u(built)).f) == n
+end
+
+# A non-centered latent GP: the latent values are a lower Cholesky factor
+# times standard-normal draws, observed through Poisson counts. The constant
+# jitter `1e-9 * I` is bound-only, so partial evaluation folds the
+# `UniformScaling{Float64}` into the prepared callable's operation table, and
+# plain `AutoEnzyme` must prove that callable readonly. Enzyme 0.13.216
+# rejects that proof at the store that initializes Enzyme's own by-value copy
+# of the callable (`innerparm`), not at any write in the model:
+# `benchmark/repro_enzyme_innerparm_split_store_readonly.jl` reproduces it
+# with Enzyme only. Enzyme `dogfood` from `4c73c40c` repairs the proof, and
+# there the plain backend takes the exact branch. `Const(f)` differentiates
+# the same call exactly, so the
+# annotated backend checks the model on every Enzyme; the plain backend
+# accepts only the exact gradient or that specific readonly diagnostic.
+@testset "multivariate priors: a non-centered latent GP with a constant jitter" begin
+    n = 6
+    D = _mp_D(n)
+    k = [3, 1, 0, 2, 5, 4]
+    spellings = [
+        quote
+            L = rk_cholesky_lower(K)
+        end,
+        quote
+            L = cholesky(Symmetric(K)).L
+        end,
+    ]
+    function density(nt)
+        K = nt.alpha^2 .* exp.(-0.5 .* D ./ nt.rho^2) + 1e-9 * I
+        f = cholesky(Symmetric(K)).L * nt.z
+        logpdf(LogNormal(0, 0.5), nt.rho) +
+            logpdf(truncated(Normal(0, 2), 0, Inf), nt.alpha) +
+            sum(logpdf.(Normal(0, 1), nt.z)) + sum(logpdf.(Poisson.(exp.(f)), k))
+    end
+    data = (; D, N = n)
+    for factor in spellings
+        m = _mp_model(quote
+            rho ~ LogNormal(0, 0.5)
+            alpha ~ HalfNormal(2)
+            z[1:N] .~ Normal.(0, 1)
+            K = alpha^2 .* exp.(-0.5 .* D ./ rho^2) + 1e-9 * I
+            $(factor.args...)
+            f = L * z
+            k .~ PoissonLog.(f)
+        end)
+        plan = m(; data...) | (; k)
+        built = _mp_check(plan, merge(data, (; k)), density;
+            backend = AutoEnzyme(; mode = Enzyme.Reverse,
+                                 function_annotation = Enzyme.Const))
+        @test coordinate_names(built.layout) ==
+            [:rho; :alpha; [Symbol("z.", i) for i in 1:n]]
+        outcome = try
+            _mp_check(plan, merge(data, (; k)), density)
+        catch err
+            err
+        end
+        if outcome isa Enzyme.Compiler.EnzymeMutabilityException
+            @test occursin("Function argument passed to autodiff cannot be proven readonly",
+                           sprint(showerror, outcome))
+            # Upstream Enzyme readonly-proof gap (snag readonly-proof-f-34071c89);
+            # drop with docs/src/constraints.md once a registered Enzyme repairs it.
+            @test_broken false
+        elseif outcome isa Exception
+            throw(outcome)
+        end
+    end
 end
 
 @testset "multivariate priors: shared computed slice arguments" begin

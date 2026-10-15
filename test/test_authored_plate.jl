@@ -1395,6 +1395,15 @@ end
 # `throw_boundserror` from 1.12.
 const _BOUNDS_THROW = r"bounds_?error"
 
+# The unchecked-access and vectorization assertions describe code built with
+# Julia's default flags. `Pkg.test` in CI runs with `--check-bounds=yes`, which
+# disables `@inbounds`, and with line coverage, whose counters keep loops
+# scalar. Under those flags the assertions are recorded as skipped; the control
+# that a cell's own indexing stays checked holds under every flag.
+const _DEFAULT_CODEGEN = Base.JLOptions().check_bounds != 1 &&
+                         Base.JLOptions().code_coverage == 0
+const _VECTOR_CODEGEN = _DEFAULT_CODEGEN && Sys.ARCH in (:x86_64, :aarch64)
+
 function _plate_entry_llvm(kernel, args...)
     kernel(args...)
     sprint(io -> InteractiveUtils.code_llvm(io,
@@ -1424,9 +1433,15 @@ end
     # vectorizes like the hand loop.
     for (kernel, args) in ((affine, (xs,)), (poly, (xs, Tuple(coefficients))))
         llvm = _plate_entry_llvm(kernel, args...)
-        @test !occursin(_BOUNDS_THROW, llvm)
-        if Sys.ARCH in (:x86_64, :aarch64)
+        if _DEFAULT_CODEGEN
+            @test !occursin(_BOUNDS_THROW, llvm)
+        else
+            @test_skip !occursin(_BOUNDS_THROW, llvm)
+        end
+        if _VECTOR_CODEGEN
             @test occursin(r"<\d+ x double>", llvm)
+        elseif Sys.ARCH in (:x86_64, :aarch64)
+            @test_skip occursin(r"<\d+ x double>", llvm)
         end
     end
 
@@ -1467,8 +1482,10 @@ end
     @test two_statement(xs, 1.5) == [(x * 1.5) * (x * 1.5) + x for x in xs]
     llvm = _plate_entry_llvm(two_statement, xs, 1.5)
     @test !occursin("svec_ref", llvm)
-    if Sys.ARCH in (:x86_64, :aarch64)
+    if _VECTOR_CODEGEN
         @test occursin(r"<\d+ x double>", llvm)
+    elseif Sys.ARCH in (:x86_64, :aarch64)
+        @test_skip occursin(r"<\d+ x double>", llvm)
     end
     checked = prepare(_checked_cell_plate)
     @test !occursin("svec_ref", _plate_entry_llvm(checked, [1.0], [1], [2.0]))
@@ -1480,8 +1497,10 @@ end
     llvm = sprint(io -> InteractiveUtils.code_llvm(io, residual, (Vector{Float64},);
                                                   debuginfo = :none))
     @test !occursin("svec_ref", llvm)
-    if Sys.ARCH in (:x86_64, :aarch64)
+    if _VECTOR_CODEGEN
         @test occursin(r"fmul[^\n]*<\d+ x double>", llvm)
+    elseif Sys.ARCH in (:x86_64, :aarch64)
+        @test_skip occursin(r"fmul[^\n]*<\d+ x double>", llvm)
     end
 end
 
@@ -2104,7 +2123,11 @@ _evalpoly_lowered(kernel) = occursin("_plate_evalpoly_ready", string(code_expr(k
             ReactiveKernels._plate_evalpoly_chunk!,
             Tuple{Vector{Float64}, Vector{Float64}, Vector{Float64}, Int, Float64, Int,
                   Val{chunk}}; debuginfo = :none))
-        @test occursin(r"<\d+ x double>", chunk_llvm)
+        if _VECTOR_CODEGEN
+            @test occursin(r"<\d+ x double>", chunk_llvm)
+        else
+            @test_skip occursin(r"<\d+ x double>", chunk_llvm)
+        end
     end
 end
 

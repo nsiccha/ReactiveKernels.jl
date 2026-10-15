@@ -487,9 +487,15 @@ and lock the one Reactant 0.2.289 lifted:
   call-site-inlined `collect`, and a fresh-buffer runtime loop pass ordinary
   reverse for Float32 and Float64, including empty inputs. A typed
   comprehension performs Julia's ordinary element conversion, so it is only
-  an equivalent control when that element type is intended. PPL's ordinary
-  and array-bearing prepared-input readers keep their authored primal and
-  remain native reverse capability gaps in `test_native_generator_capture.jl`.
+  an equivalent control when that element type is intended. The
+  call-site-inlined `collect` holds only for a `Matrix` or a plain view: with
+  a reshaped view of a vector, which is how RKPPL passes a declared two-axis
+  real array, Enzyme 0.13.210 and 0.13.216 reject it the same way. PPL's
+  ordinary, inline-collect and array-bearing prepared-input readers keep
+  their authored primal and remain native reverse capability gaps in
+  `test_native_generator_capture.jl`. The Enzyme dogfood line repairs every
+  one of these readers from `ba8bc90b` on Julia 1.10.12 and 1.12.7; released
+  Enzyme 0.13.216 does not.
   No consumer function, activity configuration or derivative rule is replaced.
   A six-line isolated Enzyme compiler prototype marks
   `Base.collect(::Generator)` for inlining before activity analysis and makes
@@ -603,6 +609,39 @@ and lock the one Reactant 0.2.289 lifted:
   differentiated the same call exactly with Enzyme 0.13.210, while local
   runs with Enzyme 0.13.210 and 0.13.216 still raise the readonly exception.
   Its test accepts only the exact gradient or that specific exception.
+- On Julia 1.10.12, 1.12.7 and 1.13.1, Enzyme 0.13.216 rejects the readonly
+  proof of a read-only callable that holds a matrix beside a
+  `UniformScaling{Float64}` and adds them with Base's
+  `Matrix + UniformScaling`.
+  Plain reverse `autodiff` of the unannotated callable raises
+  `EnzymeMutabilityException` ("Function argument passed to autodiff cannot be
+  proven readonly") at a store into `innerparm`, the stack slot Enzyme's
+  calling-convention wrapper creates for a function argument passed by value:
+  the flagged store initializes Enzyme's own copy of the callable, field by
+  field, and is not a write in the model.
+  `repro_enzyme_innerparm_split_store_readonly.jl` reproduces it with Enzyme
+  only; `Const(f)` and a `Const` data argument differentiate the same call
+  exactly. A model reaches it when partial evaluation folds a bound-only
+  `UniformScaling` into the prepared callable, as a constant jitter does in
+  `K = alpha^2 .* exp.(-0.5 .* D ./ rho^2) + 1e-9 * I`: prepared AD with plain
+  `AutoEnzyme(; mode = Enzyme.Reverse)` raises the exception, and
+  `AutoEnzyme(; mode = Enzyme.Reverse, function_annotation = Enzyme.Const)`
+  differentiates that model exactly: the prepared callable holds the
+  generated body and bound constants, while active values reach it as
+  arguments. Measured with a latent Gaussian process on Julia 1.12.7 and
+  1.13.1; on Julia 1.10.12 the same model differentiates exactly with the
+  plain backend too, so whether a model reaches the store depends on its
+  optimized IR. A jitter that depends on a parameter, or one bound as
+  a matrix (`.+ 1e-9 .* Id`), never folds a `UniformScaling` and passes either
+  way. On Julia 1.13.1, a shared computed slice prior over bound slices
+  (`MvNormal.(eachrow(M), Ref(s2 .* S0))`) fails at the same kind of store into
+  the rooted copy (`.roots.call.innerparm`). The repair belongs in Enzyme's
+  readonly proof. The local Enzyme `dogfood` line carries it from `4c73c40c`:
+  on Julia 1.13.1 the reproducer, the latent GP and the shared slice prior
+  then differentiate exactly with the plain backend. No registered Enzyme
+  release carries it yet. `test_multivariate_prior_values.jl` checks the
+  latent GP exactly under the `Const` annotation and accepts only the exact
+  gradient or that specific exception under the plain backend.
 - On Julia 1.12.7 and 1.13.1, Enzyme 0.13.216 reverse mode allocates 16 bytes
   per element when a loop stores into an array that is either a reused buffer
   or a fresh `similar` one and the store keeps its bounds check. Julia 1.12's

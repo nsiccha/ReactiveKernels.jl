@@ -54,7 +54,7 @@ const _REPORT_POSTERIOR = "posterior(u) = -15.886646898631646"
     @test occursin("scale :sigma", md)
     @test occursin("Dict(:y => :response, :x => :predictor)", md)
     @test occursin("## Layer 4 — emitted RK kernel (verbatim)", md)
-    @test occursin("ppl_model(unconstrained::Vector{Float64}", md)
+    @test occursin("ppl_model(unconstrained::AbstractVector{Float64}", md)
     # Bit-for-bit vs the peer's old-spelling oracle: same IR, same kernel.
     @test occursin(_REPORT_POSTERIOR, md)
     @test occursin("gradient cross-check: AD vs central differences", md)
@@ -119,7 +119,7 @@ end
         _verification_multi_block([pr])...,
     ], "\n")
     @test occursin("n_obs = 6", md)
-    @test occursin("ppl_model(unconstrained::Vector{Float64}", md)
+    @test occursin("ppl_model(unconstrained::AbstractVector{Float64}", md)
     @test occursin("- probes: 1", md)
     @test occursin("- probe 1: `posterior(u) = -15.886646898631646`", md)
 end

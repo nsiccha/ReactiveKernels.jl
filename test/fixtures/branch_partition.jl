@@ -15,6 +15,16 @@ counted_log(x) = (arm_calls[] += 1; log(x))
     total::Float64 = sum(pointwise)
 end
 
+# The counted `log` in the arm reads only the shared number `s`; it is the same
+# on every lane that takes the arm.
+@kernel guarded_counted_shared(x::Vector{Float64}, y::Vector{Float64}, s::Float64) = begin
+    pointwise = plate(x, y, s) do xi, yi, si
+        cell::Float64 = yi > 0 ? xi * counted_log(si) : xi - 1.0
+        cell
+    end
+    total::Float64 = sum(pointwise)
+end
+
 # Three arms by level; the interior arm gathers `c[l]`/`c[l-1]`, which are out
 # of bounds on the first and last levels, and the nested condition is itself
 # never evaluated on first-level lanes.
@@ -26,6 +36,16 @@ end
         arm::Float64 = l == 1 ? cuts[1] - e :
             (l == k ? e - cuts[k - 1] : cuts[l] * e - cuts[l - 1])
         wi * arm
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# A live lane vector beside a shared live scalar: each arm gathers `x` at run
+# time, while a gradient may hold `x` inactive and `s` active.
+@kernel guarded_shared(x::Vector{Float64}, y::Vector{Float64}, s::Float64) = begin
+    pointwise = plate(x, y, s) do xi, yi, si
+        cell::Float64 = yi > 0 ? xi * log(si) : xi - 1.0
+        cell
     end
     total::Float64 = sum(pointwise)
 end

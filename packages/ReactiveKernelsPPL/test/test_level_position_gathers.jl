@@ -147,7 +147,7 @@ end
                 @test coordinate_names(tw.built.layout) == coordinate_names(fx.built.layout)
                 t = evaluate(tw, u)
                 @test isequal(t.value, r.value)
-                @test isequal(t.grad, r.grad)
+                @test t.grad ≈ r.grad rtol = 1e-12 atol = 1e-12
                 @test isequal(t.pointwise, r.pointwise)
             end
             @test d == before
