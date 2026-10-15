@@ -118,6 +118,38 @@ end
     total::Float64 = sum(cells)
 end
 
+@kernel _endpoint_nested(scale::Float64) = begin
+    logpdf(x::Float64)::Float64 =
+        scale > 0 ? (x > 0 ? log(scale) + x * scale : -x) : -Inf
+end
+@kernel _endpoint_pair_plate(x::Vector{Float64}, scale::Float64) = begin
+    cells = plate(x) do xi
+        _endpoint_law_math(scale).logpdf(xi) + _endpoint_nested(scale).logpdf(xi)
+    end
+    total::Float64 = sum(cells)
+end
+
+_collect_between_emissions(ast) = (GC.gc(); ast)
+
+@testset "constructed endpoint operations survive collection between lowerings" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    x = [-2.0, 1.0, 0.5, 4.0]
+    for spec in (_endpoint_law_math_plate, _endpoint_pair_plate)
+        k = prepare(spec; bound = (; x), passes = (_collect_between_emissions,))
+        reference = spec === _endpoint_law_math_plate ?
+            s -> 2.0 + 5.5log(s) : s -> 4.0 + 8.5log(s) + 5.5s
+        derivative = spec === _endpoint_law_math_plate ?
+            s -> 5.5 / s : s -> 8.5 / s + 5.5
+        for scale in (0.5, 2.0)
+            @test k(scale) ≈ reference(scale)
+            ad = prepare_ad(k, backend, scale; active = :scale)
+            value, gradient = ad_value_and_gradient(ad, scale)
+            @test value ≈ reference(scale)
+            @test gradient ≈ derivative(scale)
+        end
+    end
+end
+
 _reference_normal(y, mu, sigma) =
     sigma > 0 ? sum(@. -0.5 * log(2π) - 0.5 * ((y - mu) / sigma)^2 - log(sigma)) : -Inf
 
