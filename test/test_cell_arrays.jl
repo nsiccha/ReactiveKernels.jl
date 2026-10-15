@@ -115,6 +115,33 @@ end
     value = transformed[1]
     return value
 end
+@kernel checked_array_empty_reader(x, y) = begin
+    transformed = log.(x)
+    table = hcat(transformed, transformed)
+    values = plate(y) do v
+        table[1, 1] + v
+    end
+    total::Float64 = sum(values)
+    return total
+end
+@kernel shaped_array_empty_reader(x, y, z) = begin
+    table = hcat(x, y)
+    values = plate(z) do v
+        table[1, 1] + v
+    end
+    total::Float64 = sum(values)
+    return total
+end
+@kernel earlier_array_error(x) = begin
+    transformed = log.(x)
+    table = hcat(transformed, transformed)
+    values = plate(axes(table, 1)) do i
+        a = table[i, 1]
+        a >= 0 ? throw(ArgumentError("consumer reached")) : a
+    end
+    total::Float64 = sum(values)
+    return total
+end
 opaque_sum(x) = sum(x)
 @kernel opaque_reader(x) = begin
     table = hcat(x, x)
@@ -206,6 +233,28 @@ end
     @test_throws DomainError prepare(eager_error)([1.0, -1.0])
     @test_throws DimensionMismatch prepare(incompatible_shapes)(ones(2), ones(3))
     @test_throws DimensionMismatch prepare(partial_broadcast)(ones(2), ones(3))
+    # A later empty domain cannot suppress an earlier producer's exception
+    # or shape validation, including when the empty domain is bound data.
+    for bound in (false, true)
+        reader = bound ? prepare(checked_array_empty_reader; bound=(; y=Float64[])) :
+            prepare(checked_array_empty_reader)
+        args(x) = bound ? (x,) : (x, Float64[])
+        @test_throws DomainError reader(args([-1.0])...)
+        @test reader(args([1.0])...) == 0.0
+    end
+    shapes = prepare(shaped_array_empty_reader)
+    @test_throws DimensionMismatch shapes(ones(2), ones(3), Float64[])
+    @test shapes(ones(2), ones(2), Float64[]) == 0.0
+    @test_throws DimensionMismatch prepare(shaped_array_empty_reader;
+        bound=(; y=ones(3), z=Float64[]))(ones(2))
+    @test prepare(shaped_array_empty_reader;
+        bound=(; y=ones(2), z=Float64[]))(ones(2)) == 0.0
+    # The producer's exception precedes a consumer's competing exception.
+    competing = prepare(earlier_array_error)
+    err = try competing([1.0, -1.0]); nothing catch e; e end
+    @test err isa DomainError && err.val == -1.0
+    @test_throws ArgumentError competing([1.0, 1.0])
+    @test competing([0.5, 0.25]) ≈ sum(log.([0.5, 0.25]))
     @test prepare(converted_array)(Float32[0.2, 0.4]) ≈ 2sum(abs2, Float64.(Float32[0.2, 0.4]))
     @test prepare(opaque_reader)(x) == 2sum(x)
     @test prepare(array_index)(x, 2) == x[2]
@@ -233,6 +282,20 @@ end
     @test broadcasted(column) ≈ 2sum(abs2, column .+ row)
     ad_matrix = prepare_ad(broadcasted, AutoEnzyme(; mode=Enzyme.Reverse), column; active=:x)
     @test ad_gradient(ad_matrix, column) ≈ 4sum(column .+ row; dims=2)
+end
+
+function event_allocations(groups)
+    k = prepare(event_columns; bound=(; groups))
+    ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), 0.6; active=:scale)
+    k(0.6), ad_gradient(ad, 0.6)
+    ((@allocations k(0.6)), (@allocations ad_gradient(ad, 0.6)))
+end
+@testset "event-dependent recipes allocate independently of event count" begin
+    vectors = map(n -> event_allocations([fill(0.1i, 3) for i in 1:n]), (3, 60))
+    @test vectors[1] == vectors[2]
+    # Matrix broadcasts still materialize per event (`_cell_array_broadcast`).
+    matrices = map(n -> event_allocations([fill(0.1i, 2, 2) for i in 1:n]), (3, 60))
+    @test_broken matrices[1] == matrices[2]
 end
 
 @testset "cell composition preserves index-run grouping" begin

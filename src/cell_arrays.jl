@@ -82,13 +82,19 @@ _cell_total_function(f) = f === (+) || f === (-) || f === (*) || f === (/) ||
     end
     _native_hcat(map(_cell_array_materialize, args)...)
 end
+# Only one-dimensional broadcasts compose; a higher-rank result keeps its
+# materialization. On Julia 1.10, ordinary Enzyme Reverse of composed reads
+# from a matrix broadcast (`x .+ y` with a column and a row) fails with an
+# internal "Illegal cached pointer" error in Enzyme 0.13.216
+# (EnzymeAD/Enzyme.jl#3822). Julia 1.13, and Enzyme with that issue's repair,
+# differentiate it.
 @inline function _cell_array_broadcast(bc::Base.Broadcast.Broadcasted)
     if bc.style isa Base.Broadcast.DefaultArrayStyle &&
             _cell_array_operand(bc)
         ready = Base.Broadcast.instantiate(bc)
         T = Base.Broadcast.combine_eltypes(ready.f, ready.args)
-        if (T === Float32 || T === Float64) && !isempty(axes(ready))
-            return _CellBroadcast{T,length(axes(ready)),typeof(ready)}(ready)
+        if (T === Float32 || T === Float64) && length(axes(ready)) == 1
+            return _CellBroadcast{T,1,typeof(ready)}(ready)
         end
     end
     _native_broadcast_materialize(_cell_array_materialize(bc))
