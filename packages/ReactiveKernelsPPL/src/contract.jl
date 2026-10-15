@@ -983,6 +983,9 @@ by its name: `name => node` binds `name` to the graph value `node`.
 `factors` are scalar distribution densities on deterministic assignments;
 they add no coordinate or transform and contribute to `prior`, or to
 `likelihood` when explicitly conditioned.
+`cell_priors` names scalar sums of conditional draw densities computed by
+retained cell scans; their coordinates and transforms belong to ordinary
+array parameters.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -1007,7 +1010,21 @@ struct StructuralPlan
     cell_broadcasts::Dict{Symbol,Vector{Symbol}}
     named_values::Vector{Pair{Symbol,Symbol}}
     factors::Vector{SampledParameter}
+    # Scalar graph values containing conditional priors emitted inside cells.
+    cell_priors::Vector{Symbol}
 end
+
+# Plans authored before cell-local conditional priors carry none.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, Symbol[])
 
 # Full-positional plans built before deterministic factors carry none.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1163,13 +1180,14 @@ function StructuralPlan(
         external_observations::Vector{SampledParameter} = SampledParameter[],
         cell_broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         named_values::Vector{Pair{Symbol,Symbol}} = Pair{Symbol,Symbol}[],
-        factors::Vector{SampledParameter} = SampledParameter[])
+        factors::Vector{SampledParameter} = SampledParameter[],
+        cell_priors::Vector{Symbol} = Symbol[])
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations,
-        external_observations, cell_broadcasts, named_values, factors)
+        external_observations, cell_broadcasts, named_values, factors, cell_priors)
 end
 
 """Find a design matrix by name, or `nothing`."""
@@ -1553,7 +1571,8 @@ end
 
 """Plan slots whose dimensions resolve from their authored inputs or uses.
 New slots must establish the same property before joining this list.
-`named_values` only names existing nodes, so it has their dimensions.
+`named_values` and `cell_priors` only name existing nodes, so they have
+their dimensions.
 Scalar density `factors` read their definitions and arguments, never an
 observation count, and contribute once irrespective of response axes."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
@@ -1562,7 +1581,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :plate_parameters, :scans,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
-    :cell_broadcasts, :named_values, :factors)
+    :cell_broadcasts, :named_values, :factors, :cell_priors)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -3463,6 +3482,11 @@ function _validate_factors(plan::StructuralPlan)
     for f in plan.factors
         f.name in definitions || _fail(f.label,
             "a deterministic density factor needs an assignment for $(f.name)")
+    end
+    scalar_definitions = Set(a.name for a in plan.assignments)
+    for name in plan.cell_priors
+        name in scalar_definitions || _fail(name,
+            "a cell prior must name a scalar graph assignment")
     end
     return nothing
 end

@@ -1,5 +1,6 @@
 using Pkg
 using UUIDs
+include(joinpath(@__DIR__, "..", "deps", "source_dependencies.jl"))
 
 const REACTANT_VERSION = v"0.2.289"
 const REACTANT_UUID = UUID("3c362404-f566-11ee-1572-e11a4b42c853")
@@ -54,9 +55,9 @@ mktempdir() do env
     # mask the omission by loading ReactiveKernels' transitive dependencies.
     Pkg.add(PackageSpec(name = "Reactant", version = REACTANT_VERSION))
     Pkg.pin(PackageSpec(name = "Reactant"))
-    Pkg.develop([
+    Pkg.develop([PackageSpec[
         PackageSpec(path = path) for path in (root, example_packages...)
-    ])
+    ]; rk_source_dependencies()])
     Pkg.add([
         PackageSpec(name = "Distributions"),
         PackageSpec(name = "Enzyme"),
