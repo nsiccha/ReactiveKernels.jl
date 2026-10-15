@@ -7,9 +7,37 @@
 # A process-global counter giving every `Value` a stable identity independent of
 # its name or of any particular graph. Identity must not depend solely on the
 # name (gist §5), so two values may share a name yet remain distinct.
+#
+# Identities also cross process boundaries: a package image keeps the values
+# its kernels were authored with, and every process that loads this package
+# resumes the count stored in its own image. Precompiling two consumers, or
+# loading one, would therefore hand out the same identities again. Each
+# process allocates within its own range of `2^_VALUE_ID_RANGE_BITS`
+# identities instead: a process that loads images keeps the range of this
+# package's image, and a process that generates an image moves to a random
+# other range when this package initializes there (`__init__`). A graph's
+# `value_id_floor` extends the count only within the current range.
+const _VALUE_ID_RANGE_BITS = 32
 const _VALUE_COUNTER = Ref(0)
-_next_value_id(floor::Int = 0) =
-    (_VALUE_COUNTER[] = max(_VALUE_COUNTER[], floor) + 1)
+_value_id_range(id::Int) = id >> _VALUE_ID_RANGE_BITS
+_fresh_value_id_range() =
+    rand(RandomDevice(), 1:(1 << (63 - _VALUE_ID_RANGE_BITS) - 1)) << _VALUE_ID_RANGE_BITS
+function _next_value_id(floor::Int = 0)
+    current = _VALUE_COUNTER[]
+    _value_id_range(floor) == _value_id_range(current) &&
+        (current = max(current, floor))
+    id = current + 1
+    # The range is exhausted: continue in a fresh one.
+    _value_id_range(id) == _value_id_range(current) || (id = _fresh_value_id_range() + 1)
+    _VALUE_COUNTER[] = id
+end
+
+function __init__()
+    # This process generates a package image; give its values their own range.
+    ccall(:jl_generating_output, Cint, ()) == 0 ||
+        (_VALUE_COUNTER[] = _fresh_value_id_range())
+    nothing
+end
 
 """
     Value{T}
@@ -1971,9 +1999,10 @@ mutable struct Graph
     # `prepare(…; bound)` (`_graph_preparations`, graphops.jl); `nothing` until
     # the first one. Not part of the graph's meaning.
     preparations::Any
-    # This graph's identity high-water mark travels with a package image.
-    # A dependency's process-local counter does not retain allocations made
-    # while precompiling a consumer, so it alone cannot extend a loaded graph.
+    # This graph's identity high-water mark travels with the graph. A graph
+    # restored from another process of this allocation range can hold
+    # identities this process has not counted to yet; one from another
+    # range cannot collide with this process's allocations (`_next_value_id`).
     value_id_floor::Int
 end
 Graph(values, recipes, producers, aliases, version) =
