@@ -959,14 +959,35 @@ function _scan_history_buffer(xs, leading::AbstractVector)
     fill!(buffer, zero(T))
     copyto!(buffer, firstindex(buffer), leading, firstindex(leading), length(leading))
 end
+_scan_history_buffer(xs, columns::NamedTuple) =
+    map(column -> _scan_history_buffer(xs, column), columns)
 
 # Where step outputs start in a history buffer.
 _scan_history_offset(::Number) = 0
 _scan_history_offset(leading::AbstractVector) = length(leading)
+_scan_history_offset(columns::NamedTuple) = map(_scan_history_offset, columns)
 
 # The element type of a history scan's result from its history value's type.
 _scan_history_element(::Type{T}) where {T} = T
 _scan_history_element(::Type{V}) where {V<:AbstractVector} = eltype(V)
+_scan_history_result_type(::Type{T}) where {T} = Vector{_scan_history_element(T)}
+function _scan_history_result_type(::Type{NamedTuple{names,types}}) where {names,types}
+    NamedTuple{names,Tuple{map(_scan_history_result_type, fieldtypes(types))...}}
+end
+
+_scan_history_views(buffer::AbstractVector) = _ScanHistory(buffer)
+_scan_history_views(columns::NamedTuple) = map(_scan_history_views, columns)
+@inline function _scan_history_record!(buffer::AbstractVector, offset, index, output)
+    buffer[offset + index] = output
+    nothing
+end
+@inline function _scan_history_record!(buffers::NamedTuple{names}, offsets::NamedTuple{names},
+                                       index, outputs::NamedTuple{names}) where {names}
+    map(buffers, offsets, outputs) do buffer, offset, output
+        _scan_history_record!(buffer, offset, index, output)
+    end
+    nothing
+end
 
 # The native position driver supplies either its first-position scratch or a
 # column of the owned output stack. A plate or scan overwrites the matching
@@ -1068,7 +1089,8 @@ end
 _scan_history_buffer(recycled, xs, fill) = _scan_history_buffer(xs, fill)
 _scan_history_buffer(xs, fill) = throw(ArgumentError(
     "a scan's `history =` value must be a number (it fills the outputs not yet " *
-    "written and fixes their element type) or a vector of leading entries; " *
+    "written and fixes their element type), a vector of leading entries, " *
+    "or a named tuple of these column specifications; " *
     "got a $(typeof(fill))"))
 
 _scan_holds_history(::Type{<:_ScanHistory}) = true
@@ -1093,16 +1115,16 @@ function _tensorized_scan_history_lowering(::Nothing, step, init, fill,
     idx = eachindex(iterated...)
     result = _scan_history_buffer(first(iterated), fill)
     offset = _scan_history_offset(fill)
-    earlier = _ScanHistory(result)
+    earlier = _scan_history_views(result)
     isempty(idx) && return result
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared..., earlier)
     carry = _scan_history_carry(carry)
-    result[offset + i1] = out1
+    _scan_history_record!(result, offset, i1, out1)
     for i in _scan_rest(idx)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared..., earlier)
         carry = _scan_history_carry(carry)
-        result[offset + i] = out
+        _scan_history_record!(result, offset, i, out)
     end
     result
 end
