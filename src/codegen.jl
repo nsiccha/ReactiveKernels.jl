@@ -553,21 +553,29 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     statements
 end
 
+# Whether a recipe is the authored `sum(x)` of its one input. Its source spells
+# the input by the name the source reads it by (`_recipe_source_names`), which
+# is not the value's name in a composed child: the child's `sum(squares)` reads
+# the value `p.squares` scoped under the caller's result `p`.
+function _plain_sum_recipe(recipe::Recipe)
+    recipe.effectful && return false
+    length(recipe.inputs) == 1 || return false
+    source = recipe.source
+    source isa Expr && source.head === :call && length(source.args) == 2 || return false
+    callee = source.args[1]
+    (callee === :sum || callee === GlobalRef(Base, :sum)) || return false
+    source.args[2] === only(_recipe_source_names(recipe)) || return false
+    recipe.op === sum || recipe.op isa _KernelSourceOp
+end
+
 function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
     pointwise = only(plate_recipe.outputs)
     pointwise_id = canon_id(p.graph, pointwise.id)
     matches = Recipe[]
     for recipe in p.recipes
         recipe === plate_recipe && continue
-        recipe.effectful && continue
-        length(recipe.inputs) == 1 || continue
+        _plain_sum_recipe(recipe) || continue
         canon_id(p.graph, only(recipe.inputs).id) == pointwise_id || continue
-        source = recipe.source
-        source isa Expr && source.head === :call && length(source.args) == 2 || continue
-        callee = source.args[1]
-        (callee === :sum || callee === GlobalRef(Base, :sum)) || continue
-        source.args[2] === pointwise.name || continue
-        (recipe.op === sum || recipe.op isa _KernelSourceOp) || continue
         push!(matches, recipe)
     end
     length(matches) <= 1 || throw(ArgumentError(
