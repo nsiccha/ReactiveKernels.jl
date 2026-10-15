@@ -31,8 +31,9 @@ julia --startup-file=no benchmark/receipts/validate_distribution_gradients.jl \
   benchmark/receipts/distribution-gradient-v1.toml
 ```
 
-The gradient benchmark runs once with this project's registered Enzyme and once
-with the host's local Enzyme `dogfood` source. The requested path receives the
+The gradient benchmark runs once with the newest registered Enzyme and once
+with the host's local Enzyme `dogfood` source; the project's `=0.13.199` pin
+remains the historical receipt's version. The requested path receives the
 registered receipt; `distribution-gradient-v1.enzyme-dogfood.toml` and
 `distribution-gradient-v1.enzyme-variants.toml` are written beside it. Each
 variant's environment is derived from this project, together with

@@ -3,7 +3,8 @@
 # A wrapper that times Enzyme gradients resolves its environment once per
 # variant and runs the same body, arguments and Julia command in each:
 #
-#   registered  the wrapper's own registry Enzyme selection (its baseline)
+#   registered  the newest registered Enzyme release the environment admits
+#               (the baseline)
 #   dogfood     the same environment with Enzyme and its in-tree EnzymeCore
 #               developed from the host's exact local dogfood commit
 #
@@ -25,6 +26,8 @@
 #   RK_ENZYME_DOGFOOD_CHECKOUTS   directory of immutable per-SHA checkouts
 #   RK_ENZYME_VARIANTS_DIR        run directory (default: a new directory
 #                                 under ~/.local/state/reactivekernels-benchmarks)
+#   RK_ENZYME_REGISTERED_VERSION  exact registered Enzyme instead of the newest,
+#                                 e.g. to replay a historical receipt's pin
 module EnzymeVariants
 
 import Pkg
@@ -176,29 +179,107 @@ end
     select_enzyme!(variant)
 
 Put this variant's Enzyme into the active environment. Call it after the
-wrapper's registry and local-source additions and before any precompile. The
-registered variant keeps the wrapper's own registry selection. The dogfood
-variant develops Enzyme and its in-tree EnzymeCore from the exact local
-commit; an exact Enzyme/EnzymeCore compat entry in the active project moves to
-that source's versions.
+wrapper's registry and local-source additions and before any precompile.
+
+- `registered` moves Enzyme to the newest registered release the environment
+  admits, or to `RK_ENZYME_REGISTERED_VERSION` exactly when that is set (to
+  replay a historical receipt's pin).
+- `dogfood` develops Enzyme and its in-tree EnzymeCore from the exact local
+  commit.
+
+Both resolve at the same preserve tier: the environment's other direct
+dependencies keep their versions, and indirect dependencies follow only what
+the selected Enzyme requires. An exact Enzyme/EnzymeCore compat entry in the
+active project moves with the selection. The selection is recorded in the
+variant directory for the matrix.
 """
 function select_enzyme!(variant::Variant)
-    variant.name == "registered" && return _verify_enzyme(variant)
-    dogfood = variant.dogfood
-    dogfood isa DogfoodSource || throw(dogfood)
     project_path = Base.active_project()
     project = TOML.parsefile(project_path)
     compat = get(project, "compat", Dict{String,Any}())
-    pins = Dict("Enzyme" => dogfood.version, "EnzymeCore" => dogfood.core_version)
-    if any(haskey(compat, name) for name in keys(pins))
-        for (name, version) in pins
-            haskey(compat, name) && (compat[name] = "=$version")
+    selection = Dict{String,Any}("preserve" => "direct")
+    if variant.name == "registered"
+        replay = get(ENV, "RK_ENZYME_REGISTERED_VERSION", "")
+        bound = isempty(replay) ? _root_enzyme_compat() : "=$replay"
+        _set_compat!(project_path, project, compat, Dict("Enzyme" => bound), ("EnzymeCore",))
+        selection["latest_registered"] = _latest_registered_enzyme()
+        if isempty(replay)
+            selection["request"] = "newest registered release admitted by the environment"
+            _resolve_with_fallback!(selection) do preserve
+                Pkg.update(["Enzyme"]; preserve)
+            end
+        else
+            selection["request"] = "exact replay pin $replay"
+            _resolve_with_fallback!(selection) do preserve
+                Pkg.add(Pkg.PackageSpec(name = "Enzyme", version = VersionNumber(replay)); preserve)
+            end
         end
-        open(io -> TOML.print(io, project; sorted = true), project_path, "w")
+    else
+        dogfood = variant.dogfood
+        dogfood isa DogfoodSource || throw(dogfood)
+        _set_compat!(project_path, project, compat,
+            Dict("Enzyme" => "=$(dogfood.version)", "EnzymeCore" => "=$(dogfood.core_version)"), ())
+        selection["request"] = "local source $(dogfood.revision)"
+        _resolve_with_fallback!(selection) do preserve
+            Pkg.develop([Pkg.PackageSpec(path = dogfood.path),
+                         Pkg.PackageSpec(path = dogfood.core_path)]; preserve)
+        end
     end
-    Pkg.develop([Pkg.PackageSpec(path = dogfood.path),
-                 Pkg.PackageSpec(path = dogfood.core_path)])
     _verify_enzyme(variant)
+    selection["enzyme_version"] = _manifest_entry("Enzyme")["version"]
+    _write_toml(joinpath(variant.dir, "enzyme-selection.toml"), selection)
+    nothing
+end
+
+# Rewrite only compat entries the project already has: `bounds` replace, and
+# `drop` names lose an exact pin that would contradict the new selection.
+function _set_compat!(path, project, compat, bounds, drop)
+    changed = false
+    for (name, bound) in bounds
+        haskey(compat, name) || continue
+        compat[name] = bound
+        changed = true
+    end
+    for name in drop
+        haskey(compat, name) && startswith(strip(compat[name]), "=") || continue
+        delete!(compat, name)
+        changed = true
+    end
+    changed && open(io -> TOML.print(io, project; sorted = true), path, "w")
+    nothing
+end
+
+_root_enzyme_compat() =
+    TOML.parsefile(joinpath(@__DIR__, "..", "Project.toml"))["compat"]["Enzyme"]
+
+"Resolve at PRESERVE_DIRECT; record and fall back to Pkg's tiered resolve if that is unsatisfiable."
+function _resolve_with_fallback!(resolve, selection)
+    try
+        resolve(Pkg.PRESERVE_DIRECT)
+    catch e
+        e isa Pkg.Resolve.ResolverError || rethrow()
+        selection["preserve"] = "tiered"
+        selection["direct_preserve_error"] = first(sprint(showerror, e), 4000)
+        resolve(Pkg.PRESERVE_TIERED)
+    end
+end
+
+"The newest non-yanked Enzyme release in the reachable registries, or why it is unknown."
+function _latest_registered_enzyme()
+    uuid = Base.UUID("7da242da-08ed-463a-9acd-ee780be4f1d9")
+    try
+        versions = VersionNumber[]
+        for registry in Pkg.Registry.reachable_registries()
+            entry = get(registry, uuid, nothing)
+            entry === nothing && continue
+            info = Pkg.Registry.registry_info(entry)
+            append!(versions, [v for (v, data) in info.version_info if !data.yanked])
+        end
+        isempty(versions) ? "unavailable: Enzyme is absent from the reachable registries" :
+            string(maximum(versions))
+    catch e
+        "unavailable: " * first(sprint(showerror, e), 500)
+    end
 end
 
 "Fail unless the active environment resolved this variant's Enzyme source."
@@ -304,6 +385,9 @@ function _run_variant(prepare, variant::Variant, packages, precompile)
             command isa Cmd || error("prepare must return the body command, got $(typeof(command))")
         end
         _verify_enzyme(variant)
+        selection = joinpath(variant.dir, "enzyme-selection.toml")
+        isfile(selection) || error("the wrapper did not call select_enzyme!(variant)")
+        record["selection"] = TOML.parsefile(selection)
         precompile && (record["precompile_seconds"] = @elapsed Pkg.precompile())
         manifest = _manifest_path()
         for path in (Base.active_project(), manifest)

@@ -6,8 +6,13 @@ benchmark body, inputs, arguments, Julia command and host settings.
 
 | Variant | Enzyme |
 |---|---|
-| `registered` | The suite's own registry selection, such as its exact `Enzyme v0.13.199` pin. This is the baseline. |
+| `registered` | The newest registered Enzyme release the suite's environment admits. A suite's historical pin, such as `Enzyme v0.13.199`, is lifted for this variant. This is the baseline. |
 | `dogfood` | The same environment with `Enzyme` and its in-tree `lib/EnzymeCore` developed from one exact local commit. |
+
+Both variants make that change at the same resolver tier. The suite's other
+direct dependencies keep their pinned versions. Indirect dependencies change
+only as far as the selected Enzyme requires. If that is unsatisfiable, the
+variant falls back to Pkg's ordinary tiered resolution and records why.
 
 The dogfood-versus-registered ratio is a change within one implementation. No
 variant is chosen by speed, and a variant that fails still appears in the
@@ -62,6 +67,7 @@ therefore cannot mark the source tree dirty for the second.
 | `RK_ENZYME_DOGFOOD_REVISION` | A ref or full SHA in that mirror. The default is `refs/kb-fetched/local/dogfood`. Set it to a full SHA to replay a recorded run. |
 | `RK_ENZYME_DOGFOOD_CHECKOUTS` | Directory of immutable per-SHA checkouts. Each must be clean and at its SHA. |
 | `RK_ENZYME_VARIANTS_DIR` | Run directory. |
+| `RK_ENZYME_REGISTERED_VERSION` | An exact registered Enzyme version for the `registered` variant instead of the newest. With `RK_ENZYME_VARIANTS=registered`, `RK_ENZYME_REGISTERED_VERSION=0.13.199` replays the Enzyme pin of the historical receipts. |
 
 The process fails when the baseline fails: registered, or dogfood when it runs
 alone. A dogfood failure beside a completed registered baseline is recorded and
@@ -73,6 +79,9 @@ printed, and the process exits successfully.
 
 - `status`: `completed`, `failed`, `environment_failed` or `not_requested`.
 - On failure, `error`, the exit code or signal, and the tail of the log.
+- `selection`: the requested Enzyme, the resolved `enzyme_version`, the newest
+  non-yanked registered release (`latest_registered`), and the resolver tier
+  used, including any reason for a tiered fallback.
 - Setup and precompile seconds.
 - The manifest's SHA-256 and the resolved dependencies.
 - The exact body command, with the variant's paths made symbolic. Its
@@ -120,6 +129,9 @@ run in one:
 | `practicalbayes_comparison.jl` | PracticalBayes and RK gradients | `0.13.199` |
 | `gradient_probe.jl` | RK DI+Enzyme gradient invocation paths | `0.13.199` |
 | `distribution_gradients.jl` (via `enzyme_variants.jl`, `--project=benchmark/distributions`) | prepared RK reverse gradients for the distribution corpus | `=0.13.199` in the committed project |
+
+The last column is the suite's historical pin, which the `registered` variant
+lifts. Each suite must list Enzyme as a direct dependency.
 
 The covered wrappers also add ReactiveKernels' exact source dependencies
 (`deps/source_dependencies.jl`). On Julia 1.10, which ignores `[sources]`,

@@ -111,10 +111,11 @@ julia --startup-file=no benchmark/receipts/validate_mnist_logistic_ad.jl \
   benchmark/receipts/mnist-logistic-ad-wren-pca40-v1.toml
 ```
 
-The wrapper runs once with its registered Enzyme and once with the host's local
-Enzyme `dogfood` source. The requested path receives the registered receipt;
-the dogfood receipt and the comparison file are written beside it.
-`RK_ENZYME_VARIANTS=registered` reproduces the single-environment receipt.
+The wrapper runs once with the newest registered Enzyme and once with the
+host's local Enzyme `dogfood` source. The requested path receives the
+registered receipt; the dogfood receipt and the comparison file are written
+beside it. `RK_ENZYME_VARIANTS=registered RK_ENZYME_REGISTERED_VERSION=0.13.199`
+replays the Enzyme pin of the published receipt.
 [`benchmark/ENZYME_VARIANTS.md`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/ENZYME_VARIANTS.md)
 describes the outputs.
 
