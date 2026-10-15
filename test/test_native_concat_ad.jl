@@ -180,4 +180,58 @@ _derivative(f, a) = (f(a + cbrt(eps(a))) - f(a - cbrt(eps(a)))) / (2cbrt(eps(a))
         @test (u, C, R, r) == saved
     end
 end
+
+# A scalar seed concatenated before a vector computed from bound data, the
+# trajectory `@rkppl` builds for a scan (`vcat([seed], rest)`).  On Julia 1.12
+# and 1.13 a dense copy here failed native Reverse with `EnzymeNoTypeError`
+# ("Cannot deduce type of copy" of a `memmove`).
+@kernel seeded_scan(u, y) = begin
+    m = u[1]
+    phi = u[2]
+    seed = y[1] - m
+    rest = scan(2:length(y); init = seed) do carry, t
+        next = y[t] - m - phi * carry
+        (next, next)
+    end
+    path = vcat([seed], rest)
+    total = sum(path .* path)
+    return total
+end
+@kernel seeded_broadcast(u, y) = begin
+    path = [y[1] - u[1]; u[2] .* y[2:end]]
+    total = sum(path .* path)
+    return total
+end
+function seeded_scan_ref(u, y)
+    h = y[1] - u[1]
+    total = h * h
+    for t in 2:length(y)
+        h = y[t] - u[1] - u[2] * h
+        total += h * h
+    end
+    total
+end
+seeded_broadcast_ref(u, y) =
+    (y[1] - u[1])^2 + sum(abs2(u[2] * y[t]) for t in 2:length(y); init = zero(eltype(u)))
+_gradient(f, u) = [(f(u .+ cbrt(eps(eltype(u))) .* (1:length(u) .== i)) -
+                    f(u .- cbrt(eps(eltype(u))) .* (1:length(u) .== i))) /
+                   (2cbrt(eps(eltype(u)))) for i in eachindex(u)]
+
+@testset "native Reverse through concatenations of bound operands" begin
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for T in (Float64, Float32), n in (1, 2, 6),
+            (spec, reference) in ((seeded_scan, seeded_scan_ref),
+                                  (seeded_broadcast, seeded_broadcast_ref))
+        y = T[0.3 * sin(t) for t in 1:n]
+        saved = copy(y)
+        u = T[0.2, 0.3]
+        k = prepare(spec; bound = (; y))
+        ad = prepare_ad(k, backend, u; active = :u)
+        value, gradient = ad_value_and_gradient(ad, u)
+        @test value ≈ reference(u, y)
+        @test gradient ≈ _gradient(v -> reference(v, Float64.(y)), Float64.(u)) rtol = sqrt(eps(T)) atol = sqrt(eps(T))
+        @test eltype(gradient) == T
+        @test y == saved
+    end
+end
 end

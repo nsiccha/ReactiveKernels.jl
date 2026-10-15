@@ -880,9 +880,22 @@ struct _LaneGather
 end
 @inline (::_LaneGather)(x::Number, lanes) = x
 @inline function (gather::_LaneGather)(x::AbstractArray, lanes)
-    length(x) == 1 && return _tensorized_view(x, ones(Int, length(lanes)))
+    length(x) == 1 && return _lane_view(x, ones(Int, length(lanes)))
     ndims(x) == 1 && length(x) == gather.n || _lane_gather_mismatch(x, gather.n)
-    _tensorized_view(x, lanes)
+    _lane_view(x, lanes)
+end
+# Base's `view` unaliases its index vector against the parent, and native
+# Enzyme compiles the `copy` of that never-taken branch through its untyped
+# `memmove` override; on Julia 1.12 type analysis rejects it
+# (`IllegalTypeAnalysisException`; a one-entry scan trajectory broadcast over
+# guarded observations in `test_scan_capabilities.jl`).  Lane indices are
+# fresh or bound `Int` vectors that nothing writes, so a native lane view needs
+# no unaliasing; its bounds are still checked.  Other operands, and tracing
+# backends, keep `_tensorized_view`.
+@inline _lane_view(x::AbstractArray, lanes) = _tensorized_view(x, lanes)
+@inline function _lane_view(x::Vector, lanes::Vector{Int})
+    checkbounds(x, lanes)
+    Base.unsafe_view(x, lanes)
 end
 @noinline _lane_gather_mismatch(x, n) = throw(DimensionMismatch(
     "a partitioned plate argument of size $(size(x)) does not match its $n lanes"))
@@ -1074,6 +1087,23 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     lanes_value = Dict{Symbol,Value}()
     expansion = Recipe[]
     arm_outputs = Value[]
+    # An arm with its own graph that holds work over live shared plate
+    # arguments runs as that graph's recipes, as the native shared-condition
+    # lowering runs it (`_plate_shared_branch`), so that work is hoisted above
+    # the lane loop instead of running inside an opaque per-lane arm call.
+    branch_index = findfirst(r -> r === branch_recipe, inner.recipes)
+    names = _recipe_source_names(branch_recipe)
+    root_positions = Dict(canon_id(inner.graph, v.id) => position
+                          for (position, v) in enumerate(inner.have))
+    _, shared = _plate_branch_source_inputs(inner, branch_recipe, atomic_inputs,
+        recipe.inputs, _plate_dependencies(inner, Set(keys(root_positions))).values,
+        root_positions)
+    graphs = _plate_branch_source_graphs(branch_recipe, names, shared)
+    lane_roots = intersect(lane_values, keys(root_positions))
+    live_roots = setdiff(Set(keys(root_positions)), lane_roots, keys(bound))
+    cell_ids = Set(r.id for r in inner.recipes)
+    readable = Dict(r.id => source for (r, source) in
+                    zip(inner.recipes, op.kernel.lowered_recipes))
     for (side, lanes) in arms
         # The arm's scalar body: the branch recipe runs only this arm (a
         # nested branch arm stays a `_KernelBranch` and partitions again).
@@ -1081,31 +1111,45 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         arm_f = getfield(native, side === :then ? :then_arm : :else_arm)
         arm_tf = getfield(tensor, side === :then ? :then_arm : :else_arm)
         arm_inputs = Value[branch_recipe.inputs[i] for i in positions]
-        if !any(v -> canon_id(inner.graph, v.id) in lane_values, arm_inputs)
-            arm_f, arm_tf = _LaneAnchored(arm_f), _LaneAnchored(arm_tf)
-            pushfirst!(arm_inputs, anchor)
+        anchored = !any(v -> canon_id(inner.graph, v.id) in lane_values, arm_inputs)
+        spliced = anchored ||
+            getfield(graphs, side === :then ? :then_spec : :else_spec) === nothing ?
+            nothing : _plate_branch_arm_kernel(inner, branch_index, side, graphs, names)
+        spliced === nothing ||
+            _partition_arm_hoists(spliced.plan, cell_ids, lane_roots, live_roots) ||
+            (spliced = nothing)
+        kernel = if spliced === nothing
+            if anchored
+                arm_f, arm_tf = _LaneAnchored(arm_f), _LaneAnchored(arm_tf)
+                pushfirst!(arm_inputs, anchor)
+            end
+            arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
+                                     arm_f, arm_tf)
+            # The arm recipe's source is its own arm, which a nested branch arm
+            # partitions again and a split arm decomposes.
+            branch_parts = branch_recipe.source isa Expr ?
+                _kernel_branch_parts(branch_recipe.source) : nothing
+            arm_source = branch_parts === nothing ? branch_recipe.source :
+                branch_parts[side === :then ? 2 : 3]
+            replaced = Recipe(branch_recipe.id, Tuple(arm_inputs),
+                branch_recipe.outputs, arm_op, branch_recipe.cost, nothing,
+                branch_recipe.effectful, arm_source)
+            arm_recipes = Recipe[r === branch_recipe ? replaced : r
+                                 for r in inner.recipes]
+            arm_plan = _partial_subplan(inner, inner.have, inner.want, arm_recipes)
+            prepared = _prepare(arm_plan,
+                _lower_with_ops(arm_plan; inline_embedded = false)...)
+            _prepared_kernel(prepared.f, prepared.ops, prepared.inputs,
+                prepared.outputs, prepared.plan, prepared.ast,
+                Tuple(readable[r.id] for r in arm_recipes))
+        else
+            prepared = _prepare(spliced.plan,
+                _lower_with_ops(spliced.plan; inline_embedded = false)...)
+            _prepared_kernel(prepared.f, prepared.ops, prepared.inputs,
+                prepared.outputs, prepared.plan, prepared.ast,
+                Tuple(get(readable, r.id, source) for (r, source) in
+                      zip(prepared.plan.recipes, prepared.lowered_recipes)))
         end
-        arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
-                                 arm_f, arm_tf)
-        # The arm recipe's source is its own arm, which a nested branch arm
-        # partitions again and a split arm decomposes.
-        branch_parts = branch_recipe.source isa Expr ?
-            _kernel_branch_parts(branch_recipe.source) : nothing
-        arm_source = branch_parts === nothing ? branch_recipe.source :
-            branch_parts[side === :then ? 2 : 3]
-        replaced = Recipe(branch_recipe.id, Tuple(arm_inputs),
-            branch_recipe.outputs, arm_op, branch_recipe.cost, nothing,
-            branch_recipe.effectful, arm_source)
-        arm_recipes = Recipe[r === branch_recipe ? replaced : r
-                             for r in inner.recipes]
-        arm_plan = _partial_subplan(inner, inner.have, inner.want, arm_recipes)
-        kernel = _prepare(arm_plan,
-            _lower_with_ops(arm_plan; inline_embedded = false)...)
-        readable = Dict(r.id => source for (r, source) in
-                        zip(inner.recipes, op.kernel.lowered_recipes))
-        kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs,
-            kernel.outputs, kernel.plan, kernel.ast,
-            Tuple(readable[r.id] for r in arm_recipes))
         arm_plate = _AuthoredPlateOp{typeof(kernel),atomic_inputs}(
             kernel, op.axis_checks)
 
@@ -1158,7 +1202,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     pid = canon_id(g, pointwise.id)
     consumers = [r for r in pending
                  if any(inp -> canon_id(g, inp.id) == pid, r.inputs)]
-    total = _partition_sum_consumer(consumers, pointwise)
+    total = _partition_sum_consumer(consumers)
     wanted = any(w -> canon_id(g, w.id) == pid, want)
     if total !== nothing && length(consumers) == 1 && !wanted
         totals = Value[]
@@ -1182,19 +1226,21 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     (; expansion, rewrite = nothing)
 end
 
-function _partition_sum_consumer(consumers, pointwise)
+# Whether a spliced arm hoists work: one of its recipes reads a live shared
+# plate argument and no lane value. Otherwise the arm's own closure is kept,
+# whose constants stay compile-time literals inside each lane's call.
+function _partition_arm_hoists(variant::Plan, cell_ids, lane_roots, live_roots)
+    roots = _plate_dependencies(variant, union(lane_roots, live_roots)).recipes
+    any(eachindex(variant.recipes)) do i
+        !(variant.recipes[i].id in cell_ids) &&
+            isdisjoint(roots[i], lane_roots) && !isdisjoint(roots[i], live_roots)
+    end
+end
+
+function _partition_sum_consumer(consumers)
     length(consumers) == 1 || return nothing
     r = only(consumers)
-    r.effectful && return nothing
-    length(r.inputs) == 1 && length(r.outputs) == 1 || return nothing
-    source = r.source
-    source isa Expr && source.head === :call && length(source.args) == 2 ||
-        return nothing
-    (source.args[1] === :sum || source.args[1] === GlobalRef(Base, :sum)) ||
-        return nothing
-    source.args[2] === pointwise.name || return nothing
-    (r.op === sum || r.op isa _KernelSourceOp) || return nothing
-    r
+    length(r.outputs) == 1 && _plain_sum_recipe(r) ? r : nothing
 end
 
 function _partial_inner_plates(p::Plan, known)

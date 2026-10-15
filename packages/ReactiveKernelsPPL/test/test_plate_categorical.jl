@@ -215,3 +215,103 @@ _counted_mix(P, t) = (_CATEGORICAL_EVALUATIONS[] += 1; P * t)
     @test _cat_q(build_kernel(empty_bound), empty_bound, :likelihood, u) == 0
     @test _CATEGORICAL_EVALUATIONS[] == 0
 end
+
+# A data matrix that counts the matrix-vector products it takes part in.
+struct _CountedColumns{M<:AbstractMatrix{Float64}} <: AbstractMatrix{Float64}
+    parent::M
+end
+Base.size(A::_CountedColumns) = size(A.parent)
+Base.getindex(A::_CountedColumns, i::Int, j::Int) = A.parent[i, j]
+const _CATEGORICAL_PRODUCTS = Ref(0)
+Base.:*(A::_CountedColumns, x::AbstractVector) =
+    (_CATEGORICAL_PRODUCTS[] += 1; A.parent * x)
+
+@testset "categorical matrix-column products score observed entries" begin
+    # `P * theta[:, g]` scores each category as `log(dot(P[y, :], theta[:, g]))`
+    # without forming the vector; its check reads the column sums of `P`.
+    keyed = quote
+        eachcol(theta[1:2, 1:M]) .~ Dirichlet(ones(2))
+        @plate for i in eachindex(w)
+            w[i] ~ Categorical(P * theta[:, doc[i]])
+        end
+    end
+    document = quote
+        eachcol(theta[1:2, 1:M]) .~ Dirichlet(ones(2))
+        @plate for m in eachindex(words)
+            words[m] .~ Categorical(P * theta[:, m])
+        end
+    end
+    P = [0.5 0.1; 0.3 0.2; 0.2 0.7]
+    doc = [2, 1, 2, 3, 1]
+    w = [1, 3, 2, 2, 3]
+    words = [w[doc .== m] for m in 1:3]
+    u = [0.2, -0.3, 0.4]
+    for (ast, data) in ((keyed, (; M=3, P=_CountedColumns(P), doc, w)),
+            (document, (; M=3, P=_CountedColumns(P), words)))
+        saved = deepcopy(data)
+        conditioned = haskey(data, :w) ? (:w,) : (:words,)
+        bound = bind_data(lower_rkppl(ast, data; conditioned), data)
+        built = build_kernel(bound)
+        q = constrain(built.layout, u)
+        oracle = [logpdf(Categorical(P * q.theta[:, doc[i]]), y)
+            for (i, y) in enumerate(w)]
+        _CATEGORICAL_PRODUCTS[] = 0
+        @test _cat_q(built, bound, :likelihood, u) ≈ sum(oracle) atol=1e-12
+        # Valid nonnegative columns: no vector is formed.
+        @test _CATEGORICAL_PRODUCTS[] == 0
+        haskey(data, :w) &&
+            @test _cat_q(built, bound, :pointwise, u).w ≈ oracle atol=1e-12
+        sampler = prepare_sampler(built, bound, u;
+            backend=DifferentiationInterface.AutoEnzyme(; mode=Enzyme.Reverse))
+        value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+        direct = v -> _cat_q(built, bound, :sampler, v)
+        finite_difference = map(eachindex(u)) do j
+            plus, minus = copy(u), copy(u)
+            plus[j] += 1e-5
+            minus[j] -= 1e-5
+            (direct(plus) - direct(minus)) / 2e-5
+        end
+        @test value ≈ direct(u) atol=1e-12
+        @test gradient ≈ finite_difference atol=2e-6 rtol=2e-5
+        @test data == saved
+    end
+
+    # A category outside the vector has zero probability.
+    outside = (; M=3, P=_CountedColumns(P), doc=[1], w=[4])
+    outside_bound = bind_data(lower_rkppl(keyed, outside; conditioned=(:w,)), outside)
+    @test _cat_q(build_kernel(outside_bound), outside_bound, :likelihood, u) === -Inf
+
+    # refused: columns summing to one half define no categorical law (dev §1);
+    # the check still runs without forming the vector, and raises with it.
+    halved = (; M=3, P=_CountedColumns(0.5 .* P), doc, w)
+    halved_bound = bind_data(lower_rkppl(keyed, halved; conditioned=(:w,)), halved)
+    @test_throws DomainError _cat_q(build_kernel(halved_bound), halved_bound,
+        :likelihood, u)
+
+    # A negative entry leaves the sign to the vector itself: it is formed
+    # once per checked column, and a valid one scores as before.
+    mixed = [0.6 0.0; 0.5 0.1; -0.1 0.9]
+    weights = [1.0 0.5; 0.0 0.5]
+    fixed = quote
+        s ~ Normal(0, 1)
+        @plate for i in eachindex(w)
+            w[i] ~ Categorical(P * W[:, doc[i]])
+        end
+    end
+    valid = (; P=_CountedColumns(mixed), W=weights, doc=[2, 2, 2], w=[1, 2, 3])
+    valid_bound = bind_data(lower_rkppl(fixed, valid; conditioned=(:w,)), valid)
+    _CATEGORICAL_PRODUCTS[] = 0
+    @test _cat_q(build_kernel(valid_bound), valid_bound, :likelihood, [0.1]) ≈
+        sum(log((mixed * weights[:, 2])[y]) for y in valid.w) atol=1e-12
+    @test _CATEGORICAL_PRODUCTS[] == 1
+    # refused: column 1 gives the third category probability -0.1 (dev §1).
+    negative = (; P=_CountedColumns(mixed), W=weights, doc=[2, 1], w=[1, 2])
+    negative_bound = bind_data(lower_rkppl(fixed, negative; conditioned=(:w,)), negative)
+    @test_throws DomainError _cat_q(build_kernel(negative_bound), negative_bound,
+        :likelihood, [0.1])
+    # refused: `P * W[:, j]` needs one weight per column of `P`, as in Julia.
+    short = (; P=_CountedColumns(mixed), W=ones(1, 2), doc=[1], w=[1])
+    short_bound = bind_data(lower_rkppl(fixed, short; conditioned=(:w,)), short)
+    @test_throws DimensionMismatch _cat_q(build_kernel(short_bound), short_bound,
+        :likelihood, [0.1])
+end
