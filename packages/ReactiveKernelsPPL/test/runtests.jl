@@ -136,6 +136,7 @@ const _PPL_TEST_FILES = (
     "test_hidden_markov.jl",
     "test_icar.jl",
     "test_model_level_hcat.jl",
+    "test_computed_row_products.jl",
     "test_graph_density_reactant.jl",
     "test_names.jl",
     "test_scoped_submodels_reactant.jl",
