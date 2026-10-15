@@ -1834,7 +1834,8 @@ end
 # Shape inference + canonicalization (data-free, Julia-truthful). Shapes:
 # data columns are vectors, sampled/det names resolve by position and memo,
 # dotted forms follow their operands' observation axis or model-level
-# provenance, reductions are scalars, `hcat` is a matrix,
+# provenance, reductions are scalars, `hcat` is a matrix (rows per
+# observation when a column has them, else a model-level array),
 # undotted scalar-array combinations follow Julia exactly (`2*v`, `v*2`,
 # `v/2`, `-v` are vectors; `a+x`, `x*z`, `s/x`, `x^2`, `x>1`, `log(x)`
 # are `:invalid` — Julia `MethodError`s, reported with the dotted fix).
@@ -1874,7 +1875,10 @@ function _shape_of(ex, data, detmap, memo, active::Set{Symbol},
         env::_ShapeEnv = _NO_SHAPE_ENV)
     ex isa Symbol ||
         return _shape_of_expr(ex, data, detmap, memo, active, env)
-    ex in env.matrices && return :matrix
+    # A matrix value still in the definition table takes its definition's
+    # shape (`Wm = hcat(w1, w2)` is model-level); one that left it as data
+    # keeps its rows.
+    ex in env.matrices && !haskey(detmap, ex) && return :matrix
     ex in data && return ex in env.values ? :scalar : :vector
     haskey(detmap, ex) || return get(memo, ex, :scalar)
     haskey(memo, ex) && return memo[ex]
@@ -1936,7 +1940,17 @@ function _shape_of_expr(ex, data, detmap, memo, active,
                 (Base.eachindex, Base.axes, getfield(Base, :(:))))
         index_iterator && return :vector
     end
-    fn === GlobalRef(Base, :hcat) && return length(ex.args) > 1 ? :matrix : :array
+    if fn === GlobalRef(Base, :hcat)
+        length(ex.args) > 1 || return :array
+        # Its rows are observations exactly when a column's are. Columns
+        # of model-level values (declared arrays, scalars, whole data,
+        # module results) make a model-level array, as a declared matrix
+        # is: `u * hcat(w1, w2)` and `exp.(hcat(w1, w2))` keep their
+        # `u * W` and `exp.(W)` shapes.
+        argshapes = [shape(a) for a in ex.args[2:end]]
+        :invalid in argshapes && return :invalid
+        return any(in((:vector, :matrix)), argshapes) ? :matrix : :array
+    end
     fn isa GlobalRef && fn.mod === (@__MODULE__) && fn.name === :_bound_array_value &&
         return :array
     fn isa Symbol || return :scalar  # module/anonymous calls: model-level
