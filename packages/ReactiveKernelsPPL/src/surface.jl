@@ -1125,9 +1125,19 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # context before shaping definitions, then confirm it on the final plan.
     prior_defs = Pair{Symbol,Any}[Symbol(:_ppl_prior_input_, s.lhs) => s.rhs
         for s in sample if s.lhs in sized_decls]
-    whole = _whole_value_data(vcat(det, prior_defs), data,
-        _statement_names(ast, union(data, Set{Symbol}(keys(detmap)));
-            whole_priors = sized_decls))
+    # Data and `hcat` values can be the matrix of a product `M * v`, whose
+    # vector `v` is read whole (`_matrix_product_operand`).
+    product_matrices = union(data, matrix_values)
+    # A statement's whole reads (the vector of a product, a gathered value)
+    # are whole exactly as in its named definition.
+    statement_whole = Set{Symbol}()
+    held = _statement_names(ast, union(data, Set{Symbol}(keys(detmap)));
+        whole_priors = sized_decls, matrices = product_matrices,
+        whole_reads = statement_whole)
+    statement_defs = Pair{Symbol,Any}[Symbol("#statement_whole_reads") =>
+        Expr(:call, GlobalRef(Base, :identity), sort!(collect(statement_whole))...)]
+    whole = _whole_value_data(vcat(det, prior_defs, statement_defs), data,
+        held; matrices = product_matrices)
     # Whole-value data compose with array parameters before canonicalization,
     # exactly like a module call's model-level result. Their concrete shape
     # remains Julia's business at bind/evaluation, never an observation axis.
@@ -3143,8 +3153,9 @@ end
 # definitions, with each per-observation statement read (`held`: a
 # response, prior, `@plate`, …) pinned observation-aligned.
 # `_confirm_whole_value_data` checks these inputs against the finished plan.
-function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol})
-    inputs, _ = _whole_value_reads(det, data, held)
+function _whole_value_data(det, data::Set{Symbol}, held::Set{Symbol};
+        matrices::AbstractSet{Symbol} = data)
+    inputs, _ = _whole_value_reads(det, data, held; matrices)
     return setdiff!(inputs, held)
 end
 
@@ -3155,8 +3166,12 @@ end
 # kernel cells remain consumers too: a schedule-chain definition moved out
 # of `det` still reads its subject-level predictors. Otherwise those now
 # apparently unused definitions would be classified as whole values.
+# `whole_reads` receives what an ordinary statement reads whole (a gathered
+# value, the vector of a matrix product).
 function _statement_names(ast::Expr, known::Set{Symbol};
-        whole_priors::Set{Symbol} = Set{Symbol}())
+        whole_priors::Set{Symbol} = Set{Symbol}(),
+        matrices::AbstractSet{Symbol} = _NO_MATRIX_OPERANDS,
+        whole_reads::Set{Symbol} = Set{Symbol}())
     out = Set{Symbol}()
     whole = Set{Symbol}()
     for st in ast.args
@@ -3186,7 +3201,7 @@ function _statement_names(ast::Expr, known::Set{Symbol};
             _classify_reads!(whole, out, _stmt_lhs(st), known, true)
             _classify_reads!(whole, out, last(st.args), known, true)
         else
-            _classify_reads!(whole, out, st, known, false)
+            _classify_reads!(whole_reads, out, st, known, false; matrices)
         end
     end
     free = copy(known)
