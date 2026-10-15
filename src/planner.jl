@@ -1,10 +1,10 @@
-# have/want planning: select the minimum-cost acyclic set of recipes turning
+# have/want planning: select the minimum-cost executable set of recipes turning
 # `have` into `want`, accounting for shared work and multi-output producers.
 #
 # The search is an exact branch-and-bound over the backward-reachable recipe
-# frontier. This is exact for acyclic graphs with additive non-negative costs
-# (gist §7); it is intended for the modest graphs a PoC exercises, not for
-# large-scale optimization.
+# frontier, including external producers needed to ground cyclic alternatives.
+# Costs are additive and non-negative (gist §7); shared alternatives can still
+# require exponential search.
 
 """
     PlanningError
@@ -174,7 +174,7 @@ mutable struct _Search
     saw_cyclic_complete::Bool
 end
 
-# The set of value ids available given `have` plus the outputs of `selected`.
+# Syntactic coverage by HAVE plus selected outputs, not executable availability.
 function _produced(s::_Search, selected::Vector{Int})
     p = copy(s.have)
     for rid in selected, o in s.g.recipes[rid].outputs
@@ -195,15 +195,18 @@ function _frontier(s::_Search, selected::Vector{Int}, produced::Set{Int})
     f
 end
 
-function _search!(s::_Search, selected::Vector{Int}, cost::Float64)
+function _search!(s::_Search, selected::Vector{Int}, cost::Float64,
+                  excluded::Set{Int} = Set{Int}())
     # Prune: costs are non-negative, so a branch cannot beat the incumbent.
     (cost > s.best_cost) && return
     (cost == s.best_cost && length(selected) >= s.best_len) && return
     produced = _produced(s, selected)
     frontier = _frontier(s, selected, produced)
     if isempty(frontier)
-        # A complete selection. Accept only if it can be topologically ordered.
-        if _is_acyclic(s.g, selected, s.have)
+        # Output coverage alone can hide a cycle. Execute the selected prefix
+        # from HAVE; only a fully executable selection may become the incumbent.
+        order, available = _executable_prefix(s.g, selected, s.have)
+        if length(order) == length(selected)
             better = cost < s.best_cost ||
                      (cost == s.best_cost && length(selected) < s.best_len)
             if better
@@ -211,18 +214,42 @@ function _search!(s::_Search, selected::Vector{Int}, cost::Float64)
                 s.best_len = length(selected)
                 s.best_sel = copy(selected)
             end
-        else
-            s.saw_cyclic_complete = true
+            return
         end
-        return
+        s.saw_cyclic_complete = true
+        frontier = _frontier(s, selected, available)
+
+        # Any executable completion must add a producer of at least one value
+        # on this stalled frontier. It need not produce its FIRST value: a
+        # cycle may be grounded at any of its inputs. First rule out branches
+        # whose excluded recipes make completion impossible even with every
+        # remaining candidate. This also cuts independent deadlocks as soon as
+        # their last grounding route is excluded.
+        allowed = [rid for rid in s.candidates if !(rid in excluded)]
+        _, reachable = _executable_prefix(s.g, allowed, s.have)
+        all(v -> v in reachable, frontier) || return
+    else
+        # Ordinary backward expansion only needs one uncovered obligation.
+        resize!(frontier, 1)
     end
-    v = frontier[1]
+    alternatives = Int[]
     for rid in s.candidates
         (rid in selected) && continue
-        any(o -> canon_id(s.g, o.id) == v, s.g.recipes[rid].outputs) || continue
+        (rid in excluded) && continue
+        any(o -> canon_id(s.g, o.id) in frontier, s.g.recipes[rid].outputs) || continue
+        push!(alternatives, rid)
+    end
+    for rid in alternatives
         push!(selected, rid)
-        _search!(s, selected, cost + s.g.recipes[rid].cost)
+        _search!(s, selected, cost + s.g.recipes[rid].cost, excluded)
         pop!(selected)
+        # Partition completions by their first included alternative. Later
+        # branches exclude earlier alternatives, avoiding factorial revisits
+        # of the same subset through different grounding orders.
+        push!(excluded, rid)
+    end
+    for rid in alternatives
+        delete!(excluded, rid)
     end
     return
 end
@@ -238,8 +265,8 @@ end
 # "first producer" can manufacture a cycle even when another producer makes a
 # valid order possible. Instead, execute any recipe whose inputs are currently
 # available, adding all of its outputs to the availability frontier.
-# Returns ordered recipe ids, or `nothing` when no valid order exists.
-function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
+# Returns the executable prefix and its available values, including on a stall.
+function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{Int})
     available = copy(have)
     remaining = Set(selected)
     order = Int[]
@@ -248,7 +275,7 @@ function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
             rid for rid in remaining
             if all(inp -> canon_id(g, inp.id) in available, g.recipes[rid].inputs)
         ])
-        isempty(ready) && return nothing
+        isempty(ready) && break
         rid = first(ready)
         delete!(remaining, rid)
         push!(order, rid)
@@ -256,17 +283,21 @@ function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
             push!(available, canon_id(g, output.id))
         end
     end
-    order
+    order, available
+end
+
+# Full-plan validation still requires every selected recipe to execute.
+function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
+    order, _ = _executable_prefix(g, selected, have)
+    length(order) == length(selected) ? order : nothing
 end
 
 # --- greedy incumbent ------------------------------------------------------
 
 # Polynomial cheapest-producer fixpoint used ONLY to seed the exact
-# branch-and-bound incumbent. The traversal order and prune rules of `_search!`
-# are unchanged, so the final selection is identical to the unseeded search;
-# branches that cannot beat the incumbent are pruned from the start instead
-# of only after the first complete leaf is found (exponential in the number
-# of alternative producers when every recipe shares one cost).
+# branch-and-bound incumbent. Branches that cannot beat it are pruned from the
+# start instead of only after the first complete leaf is found (exponential in
+# the number of alternative producers when every recipe shares one cost).
 # Returns `nothing` when no complete acyclic selection is reachable this way,
 # in which case planning proceeds exactly as before.
 function _seed_greedy_incumbent!(s::_Search)
@@ -311,9 +342,10 @@ end
 """
     plan(g; have, want) -> Plan
 
-Select the minimum-cost acyclic set of recipes producing every value in `want`
+Select the minimum-cost executable set of recipes producing every value in `want`
 from the boundary `have`. Values in `have` are authoritative and are never
-recomputed (gist §7). Throws `PlanningError` for impossible or cyclic queries.
+recomputed (gist §7). Cyclic alternatives may use external grounding producers;
+throws `PlanningError` when no executable selection exists.
 """
 function plan(g::Graph; have = (), want = ())
     # HAVE is set-like. Preserve first-seen order for the positional API while

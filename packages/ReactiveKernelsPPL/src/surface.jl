@@ -655,7 +655,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     plan = _lower_rkppl_once(ast, data, m.mod;
         submodel_scopes = scopes, conditioned = observed_parameters,
         array_entries = Set{Symbol}(k for k in data if _holds_arrays(get(values, k, nothing))))
-    for name in observed_parameters
+    for name in _conditioned_inputs(plan)
         values[_conditioned_input(name)] = pop!(values, name)
     end
     return plan, values
@@ -973,13 +973,14 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     input_data = data
     ast = _observation_call_definitions(ast, data, mod)
     ast = _gathered_value_definitions(ast, data)
+    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
+        _partition_statements(ast, data; array_entries)
     for name in conditioned
+        any(f -> f.lhs === name, factors) && continue
         input = _conditioned_input(name)
         (input in data || _mentions_symbol(ast, input)) &&
             _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
     end
-    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
-        _partition_statements(ast, data; array_entries)
     # Definitions a caller-owned law observes as one whole event with an
     # undotted `~` (`_partition_statements`): observations, never parameters.
     whole_observed = Set{Symbol}(s.lhs for s in sample if !s.broadcast &&
@@ -4362,7 +4363,8 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
                 return ex.head === :call ? Expr(:call, ex.args[1], arguments...) :
                     Expr(:., ex.args[1], Expr(:tuple, arguments...))
             end
-            if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames)
+            if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames) ||
+                    _retained_cell_expr(ex, ivar, Set{Symbol}())
                 nm = gensym(:_rkppl_selected)
                 key = _categorical_key_column(ex, locals, ivar, data)
                 if key === nothing
@@ -4444,19 +4446,21 @@ end
 
 # Whole-column evaluation (`_desugar_cell`) strips `[i]` and broadcasts each
 # cell over whole columns. That equals the Julia loop only while every
-# per-index value is a scalar. A definition plate is evaluated as retained
-# RK plate cells instead, as plates with observations are, when a cell reads
+# per-index value is a scalar. Definition and prior plates use retained
+# RK plate cells instead, as plates with observations do, when a cell reads
 # a value that holds one array per index (`_plate_reads_array_entries`,
 # whatever operators the cell applies to it), or when it applies an
 # authored broadcast, indexing or a reduction to a per-index value, or
-# calls a module function or kernel on one.
+# calls a module function or kernel on one. Indexing a shared or computed
+# value also retains the cell: its result need not be scalar.
 function _plate_needs_retained_cells(cells, ivar::Symbol)
     perlocals = Set{Symbol}()
     for c in cells
-        Meta.isexpr(c, :(=), 2) || continue
-        lhs, rhs = c.args
-        _cell_reads_index(rhs, ivar, perlocals) || continue
-        lhs isa Symbol && push!(perlocals, lhs)
+        assignment = Meta.isexpr(c, :(=), 2)
+        (assignment || _is_sample(c) || _is_broadcast_sample(c)) || continue
+        lhs, rhs = assignment ? c.args : c.args[2:3]
+        assignment && _cell_reads_index(rhs, ivar, perlocals) && lhs isa Symbol &&
+            push!(perlocals, lhs)
         _retained_cell_expr(rhs, ivar, perlocals) && return true
     end
     return false
@@ -4507,7 +4511,10 @@ function _retained_cell_expr(ex::Expr, ivar, perlocals)
     per(a) = _cell_reads_index(a, ivar, perlocals)
     if ex.head === :ref
         base = ex.args[1]
-        (base isa Symbol ? base in perlocals : per(base)) && return true
+        # Computed or shared indexing keeps its Julia value rank: even a
+        # literal index can select an array, e.g. `columns(W)[2]`.
+        (!_expr_has_sym(ex, ivar) || !(base isa Symbol) || base in perlocals) &&
+            return true
     elseif ex.head === :. && length(ex.args) == 2 && ex.args[2] isa Expr &&
             ex.args[2].head === :tuple
         any(per, ex.args[2].args) && return true
@@ -5429,8 +5436,9 @@ function _cell_gather_index(ex::Expr, ivar)
 end
 
 # Value-position symbols of a cell expression, validating the loop-variable
-# discipline on the way: refs are exactly `v[i]` or a gather `v[g[i]]`
+# discipline on the way: per-index refs are `v[i]` or a gather `v[g[i]]`
 # through a data index column `g`, and `i` appears only as an index.
+# Shared refs keep ordinary Julia indexing of their whole value.
 # Function heads and kw names are positions, not refs.
 function _cell_bares(ex, ivar, data::Set{Symbol}; whole_arguments::Bool = false)
     bares = Set{Symbol}()
@@ -5454,6 +5462,8 @@ end
 _cell_bares!(ex, ivar, bares, data) = nothing
 function _cell_bares!(ex::Expr, ivar, bares, data)
     if ex.head === :ref
+        # Shared indices select from a whole value; they are not lane reads.
+        _expr_has_sym(ex, ivar) || return nothing
         length(ex.args) == 2 && ex.args[1] isa Symbol &&
             ex.args[2] === ivar && return nothing
         g = _cell_gather_index(ex, ivar)
@@ -5501,10 +5511,11 @@ end
 # Strip per-index refs to whole values (validation ran first): `v[i]` →
 # `v`, a gather `v[g[i]]` → `v[g]`. A latent prior supplies its authored
 # indices, retaining `v[indices]` or `v[g[indices]]` instead of reading
-# every element of a potentially larger input.
+# every element of a potentially larger input. Shared refs are unchanged.
 _strip_cell(ex, ivar, indices=nothing) = ex
 function _strip_cell(ex::Expr, ivar, indices=nothing)
     if ex.head === :ref
+        _expr_has_sym(ex, ivar) || return ex
         g = _cell_gather_index(ex, ivar)
         selected = indices === nothing ? g :
             g === nothing ? indices : Expr(:ref, g, indices)
@@ -5563,7 +5574,7 @@ _cell_whole_call(f) = false
 _dotify_cell(ex, ivar, pidx, object::Bool) = (ex, false)
 _dotify_cell(ex::Symbol, ivar, pidx, object::Bool) = (ex, ex in pidx)
 function _dotify_cell(ex::Expr, ivar, pidx, object::Bool)
-    ex.head === :ref && return (_strip_cell(ex, ivar), true)
+    ex.head === :ref && return (_strip_cell(ex, ivar), _expr_has_sym(ex, ivar))
     # Ref denotes one whole shared argument to a broadcasted constructor.
     # Broadcasting Ref itself would replace that argument by scalar wrappers.
     Meta.isexpr(ex, :call, 2) && ex.args[1] === :Ref &&

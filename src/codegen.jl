@@ -2468,11 +2468,20 @@ Base.@nospecializeinfer function _plate_branch_source_graphs(
     mod = _kernel_endpoint_source_module(r.op)
     key = (Tuple(names), Tuple(sort!(collect(shared))), mod)
     # Native and tensorized lowerings must append the SAME arm operation
-    # objects to their tables. The source expression is the plan-owned weak
-    # key, so this cold cache does not retain prepared models after the plan
-    # and its source have gone away.
+    # objects to their tables. Key by source identity: equal expressions in
+    # different plans have independent lifetimes. WeakKeyDict compares Exprs
+    # structurally, so its entry could belong to a dead earlier plan and be
+    # collected between the two lowerings of the live plan.
     lock(_PLATE_BRANCH_SOURCE_GRAPHS_LOCK) do
-        by_op = get!(_PLATE_BRANCH_SOURCE_GRAPHS, r.source::Expr) do
+        if Threads.atomic_xchg!(_PLATE_BRANCH_SOURCE_GRAPHS_DIRTY, false)
+            filter!(entry -> entry.first.source.value !== nothing,
+                    _PLATE_BRANCH_SOURCE_GRAPHS)
+        end
+        source = r.source::Expr
+        by_op = get!(_PLATE_BRANCH_SOURCE_GRAPHS, _PlateBranchSourceKey(source)) do
+            # Finalizers only mark the cache for cleanup; dictionary mutation
+            # stays under the lowering lock, outside the finalizer.
+            finalizer(_ -> (_PLATE_BRANCH_SOURCE_GRAPHS_DIRTY[] = true), source)
             IdDict{Any,Any}()
         end
         by_inputs = get!(by_op, r.op) do
@@ -2488,7 +2497,19 @@ Base.@nospecializeinfer function _plate_branch_source_graphs(
     end
 end
 
-const _PLATE_BRANCH_SOURCE_GRAPHS = WeakKeyDict{Expr,Any}()
+# A stable hash plus weak identity keeps this cold cache from retaining a
+# prepared model. Include the hash in equality even after both refs expire.
+struct _PlateBranchSourceKey
+    source::WeakRef
+    id::UInt
+end
+_PlateBranchSourceKey(source::Expr) = _PlateBranchSourceKey(WeakRef(source), objectid(source))
+Base.hash(key::_PlateBranchSourceKey, h::UInt) = hash(key.id, h)
+Base.isequal(a::_PlateBranchSourceKey, b::_PlateBranchSourceKey) =
+    a.id == b.id && a.source.value === b.source.value
+
+const _PLATE_BRANCH_SOURCE_GRAPHS = Dict{_PlateBranchSourceKey,Any}()
+const _PLATE_BRANCH_SOURCE_GRAPHS_DIRTY = Threads.Atomic{Bool}(false)
 const _PLATE_BRANCH_SOURCE_GRAPHS_LOCK = ReentrantLock()
 
 Base.@nospecializeinfer function _plate_branch_with_source_graphs(
