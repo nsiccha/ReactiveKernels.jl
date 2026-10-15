@@ -102,21 +102,11 @@ end
                 ly ~ Normal(0, 1)
             end,
             "needs a scalar definition"),
-        ("design matrix LHS",
-            quote
-                X = hcat(ones(length(x)), x)
-                mu = X * b
-                X .~ Normal.(mu, s)
-            end,
-            "is a design matrix"),
     )
     for (label, prog, msg) in cases
-        if label in ("scalar definition", "design matrix LHS")
-            # capability: scalar/matrix data values and valid indexed derived observations (P10a 0dejlw1; todo `1qlbn5b`).
-            declarations = label == "design matrix LHS" ? quote
-                b[axes(X, 2)] .~ Normal.(0, 1)
-                s ~ Exponential(1)
-            end : quote
+        if label == "scalar definition"
+            # capability: literal-only scalar data values as derived observations (P10a 0dejlw1; todo `1qlbn5b`).
+            declarations = quote
                 b1 ~ Normal(0, 1)
                 b2 ~ Normal(0, 1)
                 s ~ Exponential(1)
@@ -539,4 +529,183 @@ end
     @test v ≈ _drc_oracle(0.3, 0.7, _DRL_JOINED) rtol = 1e-12
     @test isapprox(g, _findiff_grad(w -> Base.invokelatest(kern, w), u);
         rtol = 1e-5, atol = 1e-7)
+end
+
+# An undotted `~` with a caller-owned law observes a definition as ONE
+# whole-event density of its value, exactly like the same value bound as
+# data under that name (`ys ~ LogDensity(f, m)` with `ys` conditioned):
+# a vector, a reduction's number and an ordinary `hcat` matrix alike.
+# A data-only definition binds once; `.~` broadcasts the same law over the
+# value's entries instead (snag rkppl-undotted-c-f517b2f1).
+module _DRWhole
+using ReactiveKernels
+using ReactiveKernelsPPL: LogDensity
+whole(v, mu) = sum(-0.5 .* (v .- mu) .^ 2)
+cell(v, mu) = -0.5 * (v - mu)^2
+number(v::Real, mu) = -0.5 * (v - mu)^2
+const calls = Ref(0)
+counted_log(raw) = (calls[] += 1; log.(raw))
+@kernel graph_whole(S, mu) = begin
+    r = S .- mu
+    return sum(-0.5 .* r .^ 2)
+end
+end
+
+const _DRW_RAW = exp.([0.3, 2.9, 3.1, 0.2, -0.1, 3.3])
+const _DRW_V = [0.1, 0.4, -0.2]
+const _DRW_W = [1.0, 0.5, 0.25]
+_drw_whole(v, m) = sum(-0.5 .* (v .- m) .^ 2)
+_drw_prior(m) = logpdf(Normal(0, 5), m)
+
+function _drw_queries(prog, data, lowered = data; conditioned = (:ys,))
+    plan = lower_rkppl(prog, lowered; mod = _DRWhole, conditioned)
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    q(cut) = u -> Base.invokelatest(prepare_query(built, bound, cut), u)
+    return (; plan, bound, built, sampler = q(:sampler), likelihood = q(:likelihood),
+        prior = q(:prior), pointwise = q(:pointwise))
+end
+_drw_model(def, law) = Expr(:block, :(m ~ Normal(0, 5)), def, :(ys ~ $law))
+
+@testset "undotted caller-owned law observes a definition whole" begin
+    shapes = (
+        vector = (:(ys = log.(raw)), :(LogDensity(whole, m)), (; raw = copy(_DRW_RAW)),
+            log.(_DRW_RAW)),
+        number = (:(ys = sum(log.(raw))), :(LogDensity(number, m)), (; raw = copy(_DRW_RAW)),
+            sum(log.(_DRW_RAW))),
+        matrix = (:(ys = hcat(v, w)), :(LogDensity(whole, m)), (; v = copy(_DRW_V), w = copy(_DRW_W)),
+            hcat(_DRW_V, _DRW_W)),
+        graph_law = (:(ys = hcat(v, w)), :(LogDensity(graph_whole, m)),
+            (; v = copy(_DRW_V), w = copy(_DRW_W)), hcat(_DRW_V, _DRW_W)),
+    )
+    for (name, (def, law, data, value)) in pairs(shapes)
+        twin = _drw_queries(Expr(:block, :(m ~ Normal(0, 5)), :(ys ~ $law)), (; ys = value))
+        for lowered in (data, keys(data)), conditioned in ((:ys,), ())
+            fx = _drw_queries(_drw_model(def, law), data, lowered; conditioned)
+            @test fx.bound.columns[:ys] == value
+            @test coordinate_names(fx.built.layout) == [:m]
+            for m in (0.7, -1.3)
+                u = unconstrain(fx.built.layout, (; m))
+                @test fx.likelihood(u) ≈ _drw_whole(value, m) rtol = 1e-12
+                @test fx.prior(u) ≈ _drw_prior(m) rtol = 1e-12
+                @test keys(fx.pointwise(u)) == (:ys,)
+                @test fx.pointwise(u).ys ≈ fx.likelihood(u) rtol = 1e-14
+                @test fx.sampler(u) ≈ twin.sampler(u) rtol = 1e-14
+            end
+        end
+    end
+    # Either statement order lowers identically.
+    fwd = _drw_queries(:(begin m ~ Normal(0, 5); ys ~ LogDensity(whole, m); ys = log.(raw) end),
+        (; raw = copy(_DRW_RAW)))
+    u = unconstrain(fwd.built.layout, (; m = 0.7))
+    @test fwd.likelihood(u) ≈ _drw_whole(log.(_DRW_RAW), 0.7) rtol = 1e-12
+    # Evaluated once, at bind; preparation and evaluation never call it.
+    _DRWhole.calls[] = 0
+    once = _drw_queries(_drw_model(:(ys = counted_log(raw)), :(LogDensity(whole, m))),
+        (; raw = copy(_DRW_RAW)), (:raw,))
+    @test _DRWhole.calls[] == 1
+    for m in (0.7, -1.3)
+        @test once.sampler(unconstrain(once.built.layout, (; m))) ≈
+            _drw_prior(m) + _drw_whole(log.(_DRW_RAW), m) rtol = 1e-12
+    end
+    @test _DRWhole.calls[] == 1
+    # A parameter-dependent definition is observed as the graph computes it,
+    # as under `.~` with a caller-owned law.
+    live = _drw_queries(_drw_model(:(ys = log.(raw) .* m), :(LogDensity(whole, 0.3))),
+        (; raw = copy(_DRW_RAW)); conditioned = ())
+    @test :ys ∉ keys(live.bound.columns)
+    for m in (0.7, -1.3)
+        @test live.likelihood(unconstrain(live.built.layout, (; m))) ≈
+            _drw_whole(log.(_DRW_RAW) .* m, 0.3) rtol = 1e-12
+    end
+    # refused: caller data shadows a value the model derives (single assignment, P3).
+    shadow = try
+        plan = lower_rkppl(_drw_model(:(ys = log.(raw)), :(LogDensity(whole, m))), (:raw,);
+            mod = _DRWhole)
+        bind_data(plan, (; raw = copy(_DRW_RAW), ys = log.(_DRW_RAW)))
+        nothing
+    catch e
+        e
+    end
+    @test shadow isa ContractValidationError
+    @test occursin("drop it from bind_data", sprint(showerror, shadow))
+    # refused: a definition is one value with one observation (single assignment, P3).
+    for (second, msg) in ((:(ys ~ LogDensity(whole, m)), "ys is already observed"),
+            (:(ys .~ LogDensity.(cell, m)), "ys is already observed"),
+            (:(ys ~ Normal(m, 1)), "deterministic density factor ys is stated twice"))
+        err = try
+            lower_rkppl(Expr(:block, _drw_model(:(ys = sum(log.(raw))),
+                    :(LogDensity(number, m))).args..., second), (:raw,); mod = _DRWhole)
+            nothing
+        catch e
+            e
+        end
+        @test err isa SurfaceLoweringError
+        @test occursin(msg, sprint(showerror, err))
+    end
+    @test _DRW_RAW == exp.([0.3, 2.9, 3.1, 0.2, -0.1, 3.3])
+end
+
+@testset "undotted caller-owned law observes a definition whole: Enzyme gradients" begin
+    for (def, law, data) in (
+            (:(ys = log.(raw)), :(LogDensity(whole, m)), (; raw = copy(_DRW_RAW))),
+            (:(ys = hcat(v, w)), :(LogDensity(graph_whole, m)), (; v = copy(_DRW_V), w = copy(_DRW_W))),
+            (:(ys = log.(raw) .* m), :(LogDensity(whole, 0.3)), (; raw = copy(_DRW_RAW))))
+        fx = _drw_queries(_drw_model(def, law), data; conditioned = ())
+        u = unconstrain(fx.built.layout, (; m = 0.7))
+        prep = prepare_sampler(fx.built, fx.bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        v, _ = sampler_value_and_gradient!(prep, g, u)
+        @test v ≈ fx.sampler(u) rtol = 1e-12
+        @test isapprox(g, _findiff_grad(fx.sampler, u); rtol = 1e-5, atol = 1e-7)
+    end
+end
+
+# An observed `hcat` definition reading only data is the matrix value it
+# observes, exactly like the same matrix bound as data: under a built-in
+# family or a caller-owned law, dotted or undotted, and also when the model
+# multiplies it by a declared coefficient vector.
+@testset "observation of an hcat matrix definition" begin
+    data = (; v = copy(_DRW_V), w = copy(_DRW_W))
+    value = hcat(_DRW_V, _DRW_W)
+    for law in (:(Normal.(m, 1)), :(LogDensity.(cell, m)))
+        fx = _drw_queries(Expr(:block, :(m ~ Normal(0, 5)), :(ys = hcat(v, w)), :(ys .~ $law)), data)
+        twin = _drw_queries(Expr(:block, :(m ~ Normal(0, 5)), :(ys .~ $law)), (; ys = value))
+        @test fx.bound.columns[:ys] == value
+        for m in (0.7, -1.3)
+            u = unconstrain(fx.built.layout, (; m))
+            @test fx.sampler(u) ≈ twin.sampler(u) rtol = 1e-14
+            @test fx.pointwise(u).ys ≈ twin.pointwise(u).ys rtol = 1e-14
+            @test size(fx.pointwise(u).ys) == size(value)
+        end
+    end
+    x = [0.3, -0.1, 0.8]
+    y = [0.2, 0.0, 1.1]
+    X = hcat(ones(3), x)
+    normal_lpdf(z, mu) = -0.5 * log(2pi) - 0.5 * (z - mu)^2
+    designs = (
+        # The design matrix is also the observed response.
+        (quote
+            b[axes(X, 2)] .~ Normal.(0, 1)
+            X = hcat(ones(length(x)), x)
+            mu = X * b
+            X .~ Normal.(mu, 1)
+        end, (; x), (b, m) -> sum(normal_lpdf.(X, X * b))),
+        # A whole-event observation of a matrix a response's product reads.
+        (quote
+            m ~ Normal(0, 5)
+            b[axes(ys, 2)] .~ Normal.(0, 1)
+            ys = hcat(v, w)
+            y .~ Normal.(ys * b, 1)
+            ys ~ LogDensity(whole, m)
+        end, (; data..., y), (b, m) -> sum(normal_lpdf.(y, value * b)) + _drw_whole(value, m)),
+    )
+    for (prog, d, oracle) in designs
+        fx = _drw_queries(prog, d; conditioned = (:y, :ys, :X))
+        names = coordinate_names(fx.built.layout)
+        for (b, m) in (([0.2, -0.3], 0.7), ([-1.1, 0.4], -1.3))
+            q = :m in names ? (; m, b) : (; b)
+            @test fx.likelihood(unconstrain(fx.built.layout, q)) ≈ oracle(b, m) rtol = 1e-12
+        end
+    end
 end

@@ -81,7 +81,8 @@ a sampled coordinate. For example, `beta_last = -sum(beta_free)` followed by
 The factor uses an admitted scalar distribution and the definition keeps its
 ordinary value for later reads, such as `beta = vcat(beta_free, beta_last)`.
 The definition is still assigned once; a second factor on the same name is
-rejected. Vector observations use `.~`.
+rejected. Vector observations use `.~`. A caller-owned law instead observes
+the definition as one whole event (see caller-owned sampling laws below).
 
 ## Parameter priors
 
@@ -275,8 +276,12 @@ custom broadcasts need not share another response's row count. Observations
 acquire no packed coordinates and need no transform or random generator. As
 under a built-in family, an observed number is one observation, and an
 observed definition reading only data (`y = v[positions(rows)]`,
-`y = sum(f(raw))`) is evaluated once by `bind_data` and validated as the
-response, exactly like the same value bound as data.
+`y = sum(f(raw))`, `y = hcat(u, v)`) is evaluated once by `bind_data` and
+validated as the response, exactly like the same value bound as data.
+Undotted, `ys = log.(raw); ys ~ LogDensity(f, m)` evaluates `f(ys, m)` once
+on the whole value, whether it is a vector, a number or a matrix. A
+caller-owned law observing a definition that reads a sampled value reads it
+as the graph computes it, dotted or undotted.
 
 An undotted external constructor keeps each argument whole:
 `y .~ some_distribution(parameters)` shares the vector `parameters` across
@@ -383,8 +388,9 @@ from parameter geometry, without adding generated values to sampler coordinates.
 - A vector response uses the dotted tilde, `y .~ Normal.(mu, sigma)`. A plain
   `y ~ Normal(...)` on a data vector is rejected.
 - A `~` whose left-hand side is a bound data column is an observation. On an
-  existing scalar definition it adds a density factor; otherwise it declares
-  a parameter.
+  existing scalar definition a built-in family adds a density factor, while a
+  caller-owned law observes the definition's whole value; otherwise it
+  declares a parameter.
 - `Ordinal` permits an intercept alongside its thresholds, for both
   cumulative and stopping-ratio responses. Both declarations and their
   priors are translated as written.
