@@ -41,8 +41,11 @@ using ReactiveKernels, Test
         # consumer images; the next processes only load and execute them.
         setup = """
             using Pkg
-            Pkg.develop([PackageSpec(path = path) for path in
-                $(repr((root, consumer, derived)))])
+            include($(repr(joinpath(root, "deps", "source_dependencies.jl"))))
+            # A fresh environment needs explicit source dependencies on Julia
+            # 1.10, which does not read the root package's [sources] table.
+            Pkg.develop([PackageSpec[PackageSpec(path = path) for path in
+                $(repr((root, consumer, derived)))]; rk_source_dependencies()])
             Pkg.precompile()
             """
         julia = Base.julia_cmd()
