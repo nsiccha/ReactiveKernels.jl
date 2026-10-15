@@ -18,13 +18,15 @@ const _MUTATING_FUNCTIONS_REVISION =
     "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
+include(joinpath(@__DIR__, "_enzyme_variants.jl"))
 
+# One run per Enzyme variant (registered, then local dogfood); see
+# `_enzyme_variants.jl` for the per-variant logs and matrix file.
 function _run_pinned_comparison()
     root = normpath(joinpath(@__DIR__, ".."))
     candidate_sha = _require_clean_detached_candidate(root)
-    mktempdir(prefix = "reactivekernels-nuts-comparison-") do environment
-        Pkg.activate(environment)
-
+    EnzymeVariants.run_enzyme_variants(; suite = "nuts_comparison", root,
+            precompile = false) do environment, variant
         # ReactiveKernels carries an unregistered weak dependency. Developing
         # it first preserves that weakdep/extension relationship on Julia 1.10
         # while keeping it outside the package's ordinary hard dependencies.
@@ -34,8 +36,8 @@ function _run_pinned_comparison()
         ))
         Pkg.develop([
             Pkg.PackageSpec(path = root),
-            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples")),
-        ])
+            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples"));
+            EnzymeVariants.rk_source_dependencies()])
         Pkg.add([
             Pkg.PackageSpec(name = "AdvancedHMC", version = v"0.8.6"),
             Pkg.PackageSpec(name = "DynamicHMC", version = v"3.6.1"),
@@ -46,14 +48,14 @@ function _run_pinned_comparison()
             Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),
             Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199"),
         ])
+        EnzymeVariants.select_enzyme!(variant)
         Pkg.precompile()
 
-        command = addenv(
+        addenv(
             `$(Base.julia_cmd()) --startup-file=no --project=$environment $(@__FILE__)`,
             _COMPARISON_INNER => "1",
             "REACTIVEKERNELS_CANDIDATE_SHA" => candidate_sha,
         )
-        run(command)
     end
 end
 

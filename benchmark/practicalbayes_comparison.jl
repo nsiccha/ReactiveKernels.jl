@@ -15,15 +15,20 @@ const PRACTICALBAYES_REVISION =
     "c6b340baef4f4a9e3d26cd0ea5082a2baf26dcf9"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
+include(joinpath(@__DIR__, "_enzyme_variants.jl"))
+using .EnzymeVariants
 
+# One run per Enzyme variant (registered, then local dogfood); see
+# `_enzyme_variants.jl` for the variant receipts and matrix file. Setup and
+# precompile seconds are each variant's own.
 function _run_pinned_comparison()
     root = normpath(joinpath(@__DIR__, ".."))
     sha = _require_clean_detached_candidate(root)
-    mktempdir(prefix = "reactivekernels-practicalbayes-") do environment
+    run_enzyme_variants(; suite = "practicalbayes_comparison", root,
+            output = requested_output(ARGS), precompile = false) do environment, variant
         setup_seconds = precompile_seconds = 0.0
         withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
             setup_seconds = @elapsed begin
-                Pkg.activate(environment)
                 Pkg.add(Pkg.PackageSpec(
                     url = PRACTICALBAYES_REPOSITORY,
                     rev = PRACTICALBAYES_REVISION))
@@ -41,14 +46,15 @@ function _run_pinned_comparison()
                     Pkg.PackageSpec(path = joinpath(
                         root, "packages", "ReactiveKernelsDistributionKernels")),
                     Pkg.PackageSpec(path = joinpath(
-                        root, "packages", "ReactiveKernelsPPLExamples")),
-                ])
+                        root, "packages", "ReactiveKernelsPPLExamples"));
+                    rk_source_dependencies()])
+                select_enzyme!(variant)
                 Pkg.instantiate()
             end
             precompile_seconds = @elapsed Pkg.precompile()
         end
-        command = addenv(
-            `$(Base.julia_cmd()) --startup-file=no --project=$environment $(joinpath(@__DIR__, "practicalbayes_comparison_body.jl")) $(ARGS...)`,
+        addenv(
+            `$(Base.julia_cmd()) --startup-file=no --project=$environment $(joinpath(@__DIR__, "practicalbayes_comparison_body.jl")) $(variant_arguments(ARGS, variant))`,
             _PRACTICALBAYES_INNER => "1",
             "REACTIVEKERNELS_CANDIDATE_SHA" => sha,
             "RK_PRACTICALBAYES_ENV_SETUP_SECONDS" => string(setup_seconds),
@@ -58,7 +64,6 @@ function _run_pinned_comparison()
             "JULIA_PKG_PRECOMPILE_AUTO" => "0",
             "DATADEPS_ALWAYS_ACCEPT" => "true",
         )
-        run(command)
     end
 end
 

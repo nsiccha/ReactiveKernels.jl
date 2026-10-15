@@ -71,6 +71,8 @@ end
     for name in ("nuts_comparison.jl", "nuts_comparison_body.jl",
                  "nuts_microbench.jl", "nuts_microbench_ca9.jl",
                  "_ca9_microbench_body.jl", "_repro_guard.jl",
+                 "_enzyme_variants.jl", "enzyme_variants.jl",
+                 "gradient_probe.jl",
                  "distributions_comparison.jl",
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",

@@ -14,12 +14,17 @@ _mnist_logistic_ad_body() = any(==("--dataset=wren-pca40"), ARGS) ?
     "mnist_logistic_ad_comparison_body.jl"
 
 include(joinpath(@__DIR__, "_repro_guard.jl"))
+include(joinpath(@__DIR__, "_enzyme_variants.jl"))
+using .EnzymeVariants
 
+# One run per Enzyme variant (registered, then local dogfood); see
+# `_enzyme_variants.jl` for the variant receipts and matrix file.
 function _run_pinned_mnist_logistic_ad()
     root = normpath(joinpath(@__DIR__, ".."))
     sha = _require_clean_detached_candidate(root)
-    mktempdir(prefix = "reactivekernels-mnist-logistic-ad-") do environment
-        Pkg.activate(environment)
+    body = joinpath(@__DIR__, _mnist_logistic_ad_body())
+    run_enzyme_variants(; suite = splitext(basename(body))[1], root,
+            output = requested_output(ARGS)) do environment, variant
         Pkg.add([
             Pkg.PackageSpec(name = "BenchmarkTools", version = v"1.6.3"),
             Pkg.PackageSpec(name = "Turing", version = v"0.47.1"),
@@ -35,17 +40,16 @@ function _run_pinned_mnist_logistic_ad()
             Pkg.PackageSpec(path = joinpath(
                 root, "packages", "ReactiveKernelsDistributionKernels")),
             Pkg.PackageSpec(path = joinpath(
-                root, "packages", "ReactiveKernelsPPLExamples")),
-        ])
-        body = joinpath(@__DIR__, _mnist_logistic_ad_body())
-        command = addenv(
-            `$(Base.julia_cmd()) --startup-file=no --project=$environment $body $ARGS`,
+                root, "packages", "ReactiveKernelsPPLExamples"));
+            rk_source_dependencies()])
+        select_enzyme!(variant)
+        addenv(
+            `$(Base.julia_cmd()) --startup-file=no --project=$environment $body $(variant_arguments(ARGS, variant))`,
             _MNIST_LOGISTIC_AD_INNER => "1",
             "REACTIVEKERNELS_CANDIDATE_SHA" => sha,
             "JULIA_PKG_PRECOMPILE_AUTO" => "0",
             "DATADEPS_ALWAYS_ACCEPT" => "true",
         )
-        run(command)
     end
 end
 

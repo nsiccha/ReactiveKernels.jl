@@ -24,12 +24,19 @@ julia --startup-file=no --project=benchmark/distributions \
 julia --startup-file=no benchmark/receipts/validate_structured_distributions.jl \
   benchmark/receipts/structured-distribution-logdensity-v1.toml
 
-julia --startup-file=no --project=benchmark/distributions \
-  benchmark/distribution_gradients.jl \
+julia --startup-file=no benchmark/enzyme_variants.jl \
+  --project=benchmark/distributions benchmark/distribution_gradients.jl \
   --output=benchmark/receipts/distribution-gradient-v1.toml
 julia --startup-file=no benchmark/receipts/validate_distribution_gradients.jl \
   benchmark/receipts/distribution-gradient-v1.toml
 ```
+
+The gradient benchmark runs once with this project's registered Enzyme and once
+with the host's local Enzyme `dogfood` source. The requested path receives the
+registered receipt; `distribution-gradient-v1.enzyme-dogfood.toml` and
+`distribution-gradient-v1.enzyme-variants.toml` are written beside it. Each
+variant's environment is derived from this project, together with
+ReactiveKernels' exact source dependencies. See `../ENZYME_VARIANTS.md`.
 
 The benchmark refuses a dirty ReactiveKernels tree by default. Reactant
 compilation and host-to-device transfers are outside the timed execution

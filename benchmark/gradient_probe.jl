@@ -19,21 +19,26 @@ import Pkg
 const _PROBE_INNER = "RK_GRADIENT_PROBE_INNER"
 const _MF_REV = "4fc41b1c7b774133ceaacc4ff3c34c67b15b87b2"
 
+include(joinpath(@__DIR__, "_enzyme_variants.jl"))
+
+# One run per Enzyme variant (registered, then local dogfood); see
+# `_enzyme_variants.jl` for the per-variant logs and matrix file.
 function _run()
     root = normpath(joinpath(@__DIR__, ".."))
-    mktempdir(prefix = "rk-gradient-probe-") do env
-        Pkg.activate(env)
+    EnzymeVariants.run_enzyme_variants(; suite = "gradient_probe", root,
+            precompile = false) do env, variant
         Pkg.add(Pkg.PackageSpec(url = "https://github.com/nsiccha/MutatingFunctions.jl", rev = _MF_REV))
         Pkg.develop([
             Pkg.PackageSpec(path = root),
-            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples")),
-        ])
+            Pkg.PackageSpec(path = joinpath(root, "packages", "ReactiveKernelsNUTSExamples"));
+            EnzymeVariants.rk_source_dependencies()])
         Pkg.add([
             Pkg.PackageSpec(name = "DifferentiationInterface", version = v"0.7.21"),
             Pkg.PackageSpec(name = "Enzyme", version = v"0.13.199")])
+        EnzymeVariants.select_enzyme!(variant)
         Pkg.precompile()
-        run(addenv(`$(Base.julia_cmd()) --startup-file=no --project=$env $(@__FILE__)`,
-                   _PROBE_INNER => "1"))
+        addenv(`$(Base.julia_cmd()) --startup-file=no --project=$env $(@__FILE__)`,
+               _PROBE_INNER => "1")
     end
 end
 
