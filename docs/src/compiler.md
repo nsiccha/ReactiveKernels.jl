@@ -97,9 +97,10 @@ The planner then performs these steps:
    backward until reaching HAVE. This forms the candidate-recipe frontier.
    Effectful recipes are excluded.
 - **Exact subset search.** Search exact subsets of that frontier with branch-and-bound. A search state
-   contains selected recipes. Its available set is HAVE plus every selected
-   output; its unresolved frontier is the unsatisfied WANTS plus inputs of
-   selected recipes that are not yet available.
+   contains selected recipes and excluded alternatives. HAVE plus every selected
+   output gives syntactic coverage; its unresolved frontier is the WANTS and
+   selected inputs outside that coverage. Coverage alone does not establish
+   executable availability.
 - **Groundability.** For a value with alternative producers, test forward
    reachability from HAVE while withholding that value. A recipe whose only
    non-HAVE output is that value cannot be its first producer if one of its
@@ -108,7 +109,9 @@ The planner then performs these steps:
    non-HAVE values remain candidates.
 - **Branching.** Pick the first unresolved value and branch over every remaining
    candidate recipe that can produce it. Non-negative costs allow pruning any
-   branch already more expensive than the incumbent.
+   branch already more expensive than the incumbent. Each branch excludes the
+   alternatives explored before it, partitioning subsets instead of revisiting
+   them in different selection orders.
 - **Ranking.** Rank complete selections lexicographically by total declared cost and then
    by number of recipes. Recipe identifiers provide deterministic traversal
    order; the cost is an author-supplied planning weight, not a timing estimate.
@@ -116,6 +119,12 @@ The planner then performs these steps:
    execute it. Each ready recipe adds all of its outputs to the available set.
    This avoids inventing a cycle when overlapping multi-output recipes admit a
    valid order through a different producer.
+- **Grounding a stalled selection.** If outputs cover every obligation but
+   execution stalls, branch over external producers of any still-unavailable
+   WANT or selected input. A cycle can be grounded at different inputs, so
+   choosing only the first unavailable value would lose valid plans. Forward
+   reachability with every non-excluded candidate rules out a branch if even
+   those candidates cannot supply the stalled frontier.
 - **Recorded result.** Record the topological recipe order and one selected owner recipe for each
    produced canonical value. Collateral outputs from a non-owner recipe may be
    computed, but they never overwrite HAVE or an earlier selected owner.
@@ -127,12 +136,25 @@ search; topology and declared costs determine that work, rather than parameter
 or observation counts alone. The pass preserves authored plates, scans and
 scalar laws.
 
-The result is exact for the implemented domain: a finite, acyclic graph with
-additive finite non-negative recipe costs. Search is exponential in the worst
-case and is intended for modest kernel graphs, not large-scale mathematical
-optimization. Cycles, impossible wants, and an effectful-only route fail with a
-`PlanningError`; impossible-query diagnostics report the missing producer
-frontier.
+The result minimizes total declared cost, then recipe count, over executable
+subsets of a finite graph with additive finite non-negative recipe costs.
+The graph may contain cycles. For example, with `x → a` at cost 1,
+`a → (a, b)` at cost 0 and `x → b` at cost 2, HAVE `x` / WANT `b` selects
+the first two recipes at cost 1. The independent producer of `a` grounds the
+self-output recipe. Without a grounding route, that recipe cannot execute.
+
+Completeness follows from the frontier obligations. An uncovered value needs
+a producer in any executable completion. At a cyclic stall, some additional
+recipe must produce a currently unavailable frontier value before all selected
+recipes can run. Branching over those producers retains every possible
+completion, partitioned by its first included alternative. The reachability
+check uses all non-excluded candidates and therefore cannot discard an
+executable completion. Every accepted subset still passes the full execution
+check; the greedy incumbent also passes that check before it can prune search.
+
+Search remains exponential in the worst case. An impossible query, including
+a cycle with no executable grounding or an effectful-only route, fails with a
+`PlanningError`; impossible-query diagnostics report the missing producer frontier.
 
 The planner does not do algebraic simplification, constant folding, common
 subexpression discovery from Julia code, shape inference, symbolic
@@ -188,7 +210,9 @@ One rewrite reaches into those callables. Natively, a generator fold over a
 data-length iterator, `sum(term for i in iter [if condition]; init = x)` with
 `iter` an `eachindex`, `axes`, `range` or `a:b` call, runs as its
 explicit-accumulator loop in every recipe, plate cell, scan step and
-`@traceable` method body. Base evaluates `sum` with `init` as the left fold
+`@traceable` method body. A call head resolved to its binding, as `@rkppl`
+lowering emits `1:P` (a `GlobalRef` to Base's `:` in the model module), is the
+same iterator. Base evaluates `sum` with `init` as the left fold
 `foldl(add_sum, …; init)` on Julia 1.10 through 1.13, so the loop returns
 Base's value bitwise, in Base's order: the iterator, then `init`, then the
 condition and the term for each element. The rewrite exists for Julia 1.10's
