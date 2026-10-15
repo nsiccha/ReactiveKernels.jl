@@ -343,8 +343,9 @@ after its write, and any earlier entry whose index provably lies in
 window `a[(t - k):(t - 1)]`. Other values are read as closures. The result `a`
 is the whole trajectory `[a[1], …, a[T]]`. One carried array with one seed
 prepares the same kernel as `a = scan(2:T; init = seed, include_init = true) do
-a_prev, t … end`; several carried arrays are folded by one scan each. An array
-that reads its own earlier entries scans with `history = [<its seeds>…]`
+a_prev, t … end`; several carried arrays share one scan and expose named
+output columns. History reads use seed-prefixed buffers, one per carried
+array, so mutually dependent earlier entries are supported in the same scan
 (`docs/src/scan.md`, "Reading earlier entries").
 """
 macro scan(args...)
@@ -480,14 +481,16 @@ function _kernel_scan_loop_statements(statement::Expr, mod, line)
         Expr(:kw, Symbol(name, :_lag, k), k == 1 ? step_locals[name] : lag(name, k - 1))
         for name in carried for k in 1:depth)...))
     steps = gensym(:scan_steps)
-    output = _scan_named_tuple_expr(carried, name -> step_locals[name])
+    one_output = length(carried) == 1
+    output = one_output ? step_locals[only(carried)] :
+        _scan_named_tuple_expr(carried, name -> step_locals[name])
     call = Expr(:call, scan_ref, Expr(:parameters, Expr(:kw, :init, init)), domain)
     step_body = Expr(:block, lines..., step..., Expr(:tuple, next, output))
     push!(result, Expr(:(=), steps,
                        Expr(:do, call, Expr(:(->), Expr(:tuple, carry, index), step_body))))
     for name in carried
-        column = gensym(Symbol(name, :_steps))
-        push!(result, Expr(:(=), column, _scan_column_expr(steps, name)))
+        column = one_output ? steps : gensym(Symbol(name, :_steps))
+        one_output || push!(result, Expr(:(=), column, _scan_column_expr(steps, name)))
         push!(result, Expr(:(=), name, Expr(:call, GlobalRef(Base, :vcat),
                                             Expr(:vect, (seed_names[(name, k)] for k in 1:depth)...),
                                             column)))

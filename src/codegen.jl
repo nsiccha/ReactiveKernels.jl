@@ -686,10 +686,9 @@ function _scan_step_input_types(op::_AuthoredScanOp, input_types)
         (input_types[i] for i in 2:last_shared if i in atomic)...]
 end
 
-# The type of a scan's result vector from its argument types and the step's
+# The type of a scan's result from its argument types and the step's
 # output type `element`: the seed promoted in for `include_init = true`, or
-# the history value's element type (`_scan_history_element`, then without
-# `element`).
+# the history column types (independent of `element`).
 function _scan_result_type_expr(op::_AuthoredScanOp, input_types, element)
     _scan_has_history(op) && return Expr(:call,
         GlobalRef(@__MODULE__, :_scan_history_result_type), input_types[end])
