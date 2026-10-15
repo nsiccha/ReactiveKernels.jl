@@ -110,6 +110,7 @@ const _PPL_TEST_FILES = (
     "test_exponential.jl",
     "test_exponential_reactant.jl",
     "test_weibull.jl",
+    "test_weibull_preparation.jl",
     "test_weibull_reactant.jl",
     "test_interval.jl",
     "test_interval_reactant.jl",

@@ -972,7 +972,8 @@ array per index, each cell broadcasts over its own entries.
 `named_values` keeps each authored alias the lowering absorbed addressable
 by its name: `name => node` binds `name` to the graph value `node`.
 `factors` are scalar distribution densities on deterministic assignments;
-they add no coordinate or transform and contribute to `prior`.
+they add no coordinate or transform and contribute to `prior`, or to
+`likelihood` when explicitly conditioned.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -6749,10 +6750,11 @@ function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         names; bind_roots = axes))
 end
 
-# Whole-value data definitions consumed by a parameter-dependent module
-# call belong to preparation, whether lowering inlined them or retained
-# them as assignments (notably beside declared arrays). They may return
-# arbitrary Julia values; the generated data-only statements fold once.
+# Whole-value data definitions consumed by a density factor or a
+# parameter-dependent module call belong to preparation, whether lowering
+# inlined them or retained them as assignments (notably beside declared
+# arrays). They may return arbitrary Julia values; the generated data-only
+# statements fold once.
 # Keep every dependency needed by bind-time consumers at bind instead.
 function _preparation_data_names(plan, nodes, raw, onlydata, names;
         bind_roots = Set{Symbol}())
@@ -6773,6 +6775,12 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
         _contains_module_call(ex) || continue
         dependencies!(runtime, nm)
     end
+    for factor in plan.factors
+        for input in (factor.name, values(factor.args)...,
+                _support_args(factor.support_override)...)
+            dependencies!(runtime, input)
+        end
+    end
     prepared = intersect(names, wholedefs, runtime)
     isempty(prepared) && return prepared
 
@@ -6783,7 +6791,7 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
     free = Set{Symbol}(keys(nodes))
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :submodel_scopes,
-            :cell_broadcasts) && continue
+            :cell_broadcasts, :factors, :conditioned) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     # Whole-value classification exempts `axes(M, d)` from observation
@@ -6851,12 +6859,17 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     # Scalar, declared-array and latent-plate prior arguments are model values.
     # Propagate that context through their definitions just as for a
     # module-call argument; their raw data have no observation axis.
-    for ps in (plan.parameters, plan.array_parameters, plan.plate_parameters), p in ps
+    for ps in (plan.parameters, plan.factors, plan.array_parameters,
+            plan.plate_parameters), p in ps
         push!(defs, Symbol(:_ppl_prior_input_, p.name) =>
             Expr(:tuple, values(p.args)..., _support_args(p.support_override)...))
         p.family === :external && p.name in plan.conditioned && push!(defs,
             Symbol(:_ppl_external_value_, p.name) =>
                 Expr(:call, GlobalRef(Base, :identity), p.name))
+    end
+    for p in plan.factors
+        push!(defs, Symbol(:_ppl_factor_input_, p.name) =>
+            Expr(:call, GlobalRef(Base, :identity), p.name))
     end
     # Open densities receive ordinary whole values. Their explicit broadcast
     # has its own Julia axes, independent of a legacy response's row axis.
@@ -6927,7 +6940,7 @@ function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
                 p.family === :external && p.name in plan.conditioned && continue
                 delete!(free, p.name)
             end
-        elseif f in (:external_observations, :cell_broadcasts)
+        elseif f in (:external_observations, :cell_broadcasts, :factors, :conditioned)
             continue
         elseif f === :vector_parameters
             for p in plan.vector_parameters
@@ -7031,10 +7044,14 @@ function _bound_model_level_inputs(plan::StructuralPlan)
         Set{Symbol}(d.name for d in plan.derived))
     inputs, definitions = _model_level_inputs(plan,
         Set{Symbol}(k for k in keys(plan.columns) if k ∉ nodes))
-    return union(inputs, Set(_conditioned_input(n) for n in plan.conditioned)), definitions
+    return union(inputs, Set(_conditioned_input(n) for n in _conditioned_inputs(plan))), definitions
 end
 
 _conditioned_input(name::Symbol) = Symbol("_rkppl_conditioned_", name)
+# A conditioned definition keeps its graph value. Only sampled declarations
+# need caller-supplied constrained values and their internal input aliases.
+_conditioned_inputs(plan::StructuralPlan) =
+    setdiff(plan.conditioned, Set(p.name for p in plan.factors))
 _has_observation_axis(plan) = !isempty(plan.responses) ||
     any(p -> p.range === nothing, plan.plate_parameters) ||
     !isempty(plan.scans)
@@ -7583,9 +7600,11 @@ assignment/extra columns stay `:data`; `:group` is an explicit role. The retired
 argument accepts only an empty dictionary; array dimensions and plate ranges
 come from authored expressions. Data values are numbers or arrays of any shape; observation
 values follow their authored broadcast axes and structured operations retain
-their own shape requirements. Data-only definitions that call a module
-function (functions as values) are evaluated here, once, and bound under
-their own names — never supplied by the caller; a model-level one may be a
+their own shape requirements. Data-only module definitions needed by structural
+consumers are evaluated here, once, and bound under their own names — never
+supplied by the caller. Whole-value definitions used only by scalar factors
+or parameter-dependent module calls remain in the graph for RK preparation
+to freeze, independently of conditioning. A model-level definition may be a
 number or an array of any shape and carries no `n_obs` requirement. So does a model-level
 data input: a column every definition reads only inside an argument of an
 undotted module call (`gx_m = f(gx)`, or inlined `(b .* f(gx))[g]`) and no
@@ -7612,7 +7631,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
         conditioned = plan.conditioned)
-    sampled = Set(p.name for ps in (plan.parameters, plan.array_parameters,
+    sampled = Set(p.name for ps in (plan.parameters, plan.factors, plan.array_parameters,
         plan.vector_parameters, plan.plate_parameters) for p in ps)
     observing = intersect(sampled, Set{Symbol}(_conditioned_names(conditioned)))
     plan = _with(plan; conditioned = union(plan.conditioned, observing))
@@ -7632,7 +7651,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # Raw inputs read only as whole values (module-call arguments,
     # gathered values): no n_obs anchor.
     inputs, _ = _model_level_inputs(plan, raw)
-    union!(inputs, (_conditioned_input(n) for n in plan.conditioned))
+    union!(inputs, (_conditioned_input(n) for n in _conditioned_inputs(plan)))
     _materialize_derived_responses!(plan, columns)
     # A derived response that evaluates to a number is one observation,
     # exactly like the same number bound as data.
@@ -7752,7 +7771,7 @@ _value_extent_input(it::Expr) = length(it.args) == 2 ?
     Symbol("_rkppl_extent_", it.args[2], "_", it.args[3])
 
 function _route_conditioned_values!(plan, columns)
-    for name in plan.conditioned
+    for name in _conditioned_inputs(plan)
         input = _conditioned_input(name)
         if haskey(columns, name)
             columns[input] = pop!(columns, name)
@@ -7763,7 +7782,9 @@ function _route_conditioned_values!(plan, columns)
 end
 
 function _validate_conditioned_values(plan)
-    known = Set{Symbol}()
+    # Definitions already have a graph value and are validated as factors;
+    # they require no separate caller-supplied observed value.
+    known = Set{Symbol}(p.name for p in plan.factors if p.name in plan.conditioned)
     for p in plan.parameters
         p.name in plan.conditioned || continue
         push!(known, p.name)
