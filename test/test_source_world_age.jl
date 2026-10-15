@@ -191,7 +191,7 @@ function out_of_line_source_calls(kernel, args)
         statement isa Expr && statement.head === :invoke || return false
         instance = statement.args[1]
         instance isa Core.CodeInstance && (instance = instance.def)
-        instance.def.name === :_KernelSourceFunction
+        instance.def.name in (:_KernelSourceFunction, :_ExecutableSourceFunction)
     end
 end
 

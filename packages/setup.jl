@@ -1,5 +1,6 @@
 using Pkg
 using UUIDs
+include(joinpath(@__DIR__, "..", "deps", "source_dependencies.jl"))
 
 const REPOSITORY_ROOT = normpath(joinpath(@__DIR__, ".."))
 const MUTATING_FUNCTIONS_URL = "https://github.com/nsiccha/MutatingFunctions.jl"
@@ -19,7 +20,8 @@ const LOCAL_PACKAGE_PATHS = (
     joinpath(@__DIR__, "ReactiveKernelsReactantODESolvers"),
 )
 
-Pkg.develop([PackageSpec(path = path) for path in LOCAL_PACKAGE_PATHS])
+Pkg.develop([PackageSpec[PackageSpec(path = path) for path in LOCAL_PACKAGE_PATHS];
+             rk_source_dependencies()])
 # Unregistered test-only dependencies must be pinned here, not just in the
 # example packages' [extras]: Julia 1.10 ignores [sources], and Pkg.test
 # builds its sandbox from the pruned parent manifest, so a test extra that

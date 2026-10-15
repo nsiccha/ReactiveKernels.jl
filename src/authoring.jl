@@ -249,10 +249,10 @@ end
 struct _KernelProvenanceKey{Token} end
 
 # Graph assembly reads `recipe.op` as an unknown subtype of `_KernelSourceOp`.
-# The token comes from the op's type and fields are read with the `getfield`
-# builtin, so no reader is compiled again for every authored op type.
+# Read the token with the `getfield` builtin, without compiling a reader for
+# every authored operation type. Execution copies retain this same identity.
 Base.@nospecializeinfer _kernel_source_token(@nospecialize(op::_KernelSourceOp)) =
-    (typeof(op)::DataType).parameters[1]
+    getfield(op, :token)
 
 # Inverse recognition uses the callable retained when an exact call was
 # authored. Looking up a recipe's source binding later could observe a
@@ -2159,11 +2159,12 @@ end
 # recomputed in every cell. Each maximal subexpression that reads only shared
 # values (closure captures, `Ref` operands and cell locals computed from them)
 # now becomes its own cell statement, exactly as if the author had named it,
-# so it runs once per call (snag `plate-body-evalu-4235a1ca`). `varying` names
+# so native lowering runs it once per nonempty plate call (snag
+# `plate-body-evalu-4235a1ca`). `varying` names
 # the zipped formals and `shared` the others. A scan step is not split: its
 # native lowering evaluates every step statement at every step, named or not.
-# Like a named invariant, a lifted one runs once per call even when the plate
-# has no cells.
+# Like a named invariant, a lifted one remains cell work: native lowering
+# skips it when the plate has no cells.
 #
 # Only strict positions are entered, as for `@node`: call and broadcast
 # arguments, field reads, indexing and tuple elements. A branch, loop,

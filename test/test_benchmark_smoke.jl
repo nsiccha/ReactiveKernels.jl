@@ -71,6 +71,8 @@ end
     for name in ("nuts_comparison.jl", "nuts_comparison_body.jl",
                  "nuts_microbench.jl", "nuts_microbench_ca9.jl",
                  "_ca9_microbench_body.jl", "_repro_guard.jl",
+                 "_enzyme_variants.jl", "enzyme_variants.jl",
+                 "gradient_probe.jl",
                  "distributions_comparison.jl",
                  "scalar_distribution_gallery_comparison.jl",
                  "structured_distributions_comparison.jl",
@@ -137,6 +139,36 @@ end
         path = joinpath(_BENCH_DIR, name)
         @test isfile(path)
         @test _parses(path)
+    end
+end
+
+# Parsing alone misses lowering-time syntax errors, such as mixing `,` and `;`
+# in one array literal. Lower each top-level statement (and module body)
+# without evaluating it.
+function _lowering_errors(path)
+    errors = String[]
+    function check(statements)
+        for stmt in statements
+            stmt isa Expr || continue
+            if stmt.head === :module
+                check(stmt.args[3].args)
+                continue
+            end
+            lowered = Meta.lower(Module(), stmt)
+            lowered isa Expr && lowered.head === :error &&
+                push!(errors, string(lowered.args[1]))
+        end
+    end
+    check(Meta.parseall(read(path, String); filename = path).args)
+    errors
+end
+
+@testset "Enzyme variant benchmark entry points lower" begin
+    for name in ("_enzyme_variants.jl", "enzyme_variants.jl",
+                 "eight_schools_ad_comparison.jl", "sum_to_zero_comparison.jl",
+                 "mnist_logistic_ad_comparison.jl", "nuts_comparison.jl",
+                 "practicalbayes_comparison.jl", "gradient_probe.jl")
+        @test isempty(_lowering_errors(joinpath(_BENCH_DIR, name)))
     end
 end
 

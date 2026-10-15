@@ -62,13 +62,16 @@ function _varnames(p::Plan)
     used = Set{Symbol}((_OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG))
     out = Dict{Int,Symbol}()
     named = _class_name_values(g)
-    for id in ids
+    # Plan order is stable across equivalent graphs; graph IDs are not. Use
+    # that order to disambiguate locals without changing compilation identity
+    # whenever a composed child receives fresh value IDs.
+    for (position, id) in enumerate(ids)
         base = _value_local_name(g.values[get(named, id, id)].name)
         candidate = base
         suffix = 0
         while candidate in used
-            candidate = suffix == 0 ? Symbol(base, :_, id) :
-                        Symbol(base, :_, id, :_, suffix)
+            candidate = suffix == 0 ? Symbol(base, :_, position) :
+                        Symbol(base, :_, position, :_, suffix)
             suffix += 1
         end
         out[id] = candidate
@@ -1584,6 +1587,41 @@ function _lower_authored_scan_strips!(body, scan_recipe::Recipe, records,
     body
 end
 
+# A composed plate whose scalar plan is settled but not yet lowered. A later
+# scheduling pass may compose it again, so `_fuse_authored_plate_chains` builds
+# one `_AuthoredPlateOp` (lowering and compilation) per recipe that remains,
+# rather than one per intermediate composition.
+struct _AuthoredPlateDraft{A}
+    plan::Plan
+    lowered_recipes::Tuple
+    axis_checks::Tuple
+end
+struct _AuthoredPlateCellDraft{A}
+    plate::_AuthoredPlateDraft{A}
+end
+const _AuthoredPlateLike = Union{_AuthoredPlateOp,_AuthoredPlateDraft}
+const _AuthoredPlateCellLike = Union{_AuthoredPlateCellOp,_AuthoredPlateCellDraft}
+_plate_atomic(::_AuthoredPlateOp{K,A}) where {K,A} = A
+_plate_atomic(::_AuthoredPlateDraft{A}) where {A} = A
+_plate_body(op::_AuthoredPlateOp) = op.kernel
+_plate_body(op::_AuthoredPlateDraft) = op
+
+function _built_plate_op(draft::_AuthoredPlateDraft{A}) where {A}
+    kernel = _prepare(draft.plan, _lower_with_ops(draft.plan; inline_embedded = false)...)
+    # Source RHSs use the original scalar formal names. Keep their original
+    # recipe metadata in operation-table order so readable code binds those
+    # names to the newly projected scalar arguments, including across chains.
+    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+        kernel.plan, kernel.ast, draft.lowered_recipes)
+    _AuthoredPlateOp{typeof(kernel),A}(kernel, draft.axis_checks)
+end
+_built_plate_op(draft::_AuthoredPlateCellDraft) =
+    _AuthoredPlateCellOp(_built_plate_op(draft.plate))
+_built_plate_recipe(r::Recipe) =
+    r.op isa Union{_AuthoredPlateDraft,_AuthoredPlateCellDraft} ?
+    Recipe(r.id, r.inputs, r.outputs, _built_plate_op(r.op), r.cost, r.cse_key,
+           r.effectful, r.source) : r
+
 # Compose selected scalar DAGs only at code generation. The public graph and
 # Plan retain every named array node, so another WANT/HAVE query can still
 # materialize it or cut the graph there. A whole-array/Ref use is a boundary,
@@ -1600,8 +1638,9 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
 
     function append_body(recipe, replacement = nothing)
         op = recipe.op
-        inner = op.kernel.plan
-        old_atomic = typeof(op).parameters[2]
+        body = _plate_body(op)
+        inner = body.plan
+        old_atomic = _plate_atomic(op)
         mapped = Dict{Int,Value}()
         input_positions = Vector{Tuple}(undef, length(recipe.inputs))
         for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
@@ -1636,7 +1675,7 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
             end for v in r.outputs)
             copied = add!(scalar_graph, ins => outs, r.op; cost = r.cost,
                           effectful = r.effectful, source = r.source)
-            readable_recipes[copied.id] = op.kernel.lowered_recipes[recipe_index]
+            readable_recipes[copied.id] = body.lowered_recipes[recipe_index]
         end
         (; value = mapped[canon_id(inner.graph, only(inner.want).id)], axes)
     end
@@ -1645,16 +1684,9 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
     result = append_body(consumer, intermediate)
     # Keep the complete HAVE boundary, including unused axis arguments.
     scalar_plan = plan(scalar_graph; have = scalar_have, want = (result.value,))
-    kernel = _prepare(scalar_plan,
-        _lower_with_ops(scalar_plan; inline_embedded = false)...)
-    # Source RHSs use the original scalar formal names. Keep their original
-    # recipe metadata in operation-table order so readable code binds those
-    # names to the newly projected scalar arguments, including across chains.
-    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-        kernel.plan, kernel.ast,
-        Tuple(readable_recipes[r.id] for r in scalar_plan.recipes))
-    op = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(kernel, Tuple(unique(checks)))
-    Recipe(consumer.id, Tuple(callvalues), consumer.outputs, op,
+    draft = _AuthoredPlateDraft{Tuple(atomic)}(scalar_plan,
+        Tuple(readable_recipes[r.id] for r in scalar_plan.recipes), Tuple(unique(checks)))
+    Recipe(consumer.id, Tuple(callvalues), consumer.outputs, draft,
            producer.cost + consumer.cost, nothing, false, consumer.source)
 end
 
@@ -1667,7 +1699,7 @@ function _fuse_authored_plate_chains(p::Plan; cells_only = false)
     function consumers_of(index)
         producer = recipes[index]
         producer === nothing && return nothing
-        producer.op isa _AuthoredPlateOp || return nothing
+        producer.op isa _AuthoredPlateLike || return nothing
         length(producer.outputs) == 1 || return nothing
         cid = canon_id(p.graph, only(producer.outputs).id)
         cid in boundary && return nothing
@@ -1678,94 +1710,69 @@ function _fuse_authored_plate_chains(p::Plan; cells_only = false)
         all(>(index), consumers) || return nothing
         return cid, consumers
     end
-    for index in eachindex(recipes)
-        found = consumers_of(index)
-        found === nothing && continue
-        cid, consumers = found
-        length(consumers) == 1 || continue
-        cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellOp) && continue
-        composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
-        composed === nothing && continue
-        recipes[only(consumers)] = composed
-        recipes[index] = nothing
-        changed = true
-    end
-    # A plate read only by cells of other plates at one position (`plate_cell`
-    # values sharing an index port: one cell of several observations) composes
-    # into each of those cells, so each runs the plate's cell at that position
-    # instead of the whole plate.
-    for index in eachindex(recipes)
-        found = consumers_of(index)
-        found === nothing && continue
-        cid, consumers = found
-        length(consumers) >= 2 || continue
-        all(c -> recipes[c].op isa _AuthoredPlateCellOp, consumers) || continue
-        length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
-            for c in consumers)) == 1 || continue
-        composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
-            for c in consumers]
-        any(isnothing, composed) && continue
-        recipes[consumers] = composed
-        recipes[index] = nothing
-        changed = true
+    # Composing a consumer can leave an earlier producer with fewer readers: a
+    # branch composed into the plate it reconverges into leaves their shared
+    # producer read by that plate alone. Both passes therefore repeat until
+    # neither composes. Each composition removes a recipe, so this terminates,
+    # and a producer body is copied only into its sole remaining reader(s).
+    progressed = true
+    while progressed
+        progressed = false
+        for index in eachindex(recipes)
+            found = consumers_of(index)
+            found === nothing && continue
+            cid, consumers = found
+            length(consumers) == 1 || continue
+            cells_only && !(recipes[only(consumers)].op isa _AuthoredPlateCellLike) && continue
+            composed = _compose_plate_into(p.graph, recipes[index], recipes[only(consumers)], cid)
+            composed === nothing && continue
+            recipes[only(consumers)] = composed
+            recipes[index] = nothing
+            progressed = true
+        end
+        # A plate read only by cells of other plates at one position
+        # (`plate_cell` values sharing an index port: one cell of several
+        # observations) composes into each of those cells, so each runs the
+        # plate's cell at that position instead of the whole plate.
+        for index in eachindex(recipes)
+            found = consumers_of(index)
+            found === nothing && continue
+            cid, consumers = found
+            length(consumers) >= 2 || continue
+            all(c -> recipes[c].op isa _AuthoredPlateCellLike, consumers) || continue
+            length(unique(canon_id(p.graph, first(recipes[c].inputs).id)
+                for c in consumers)) == 1 || continue
+            composed = [_compose_plate_into(p.graph, recipes[index], recipes[c], cid)
+                for c in consumers]
+            any(isnothing, composed) && continue
+            recipes[consumers] = composed
+            recipes[index] = nothing
+            progressed = true
+        end
+        changed |= progressed
     end
     changed || return p
-    selected = Recipe[r for r in recipes if r !== nothing]
+    selected = Recipe[_built_plate_recipe(r) for r in recipes if r !== nothing]
     producer = Dict(canon_id(p.graph, v.id) => r for r in selected for v in r.outputs)
     Plan(p.graph, p.have, p.want, selected, producer, p.cost, p.candidates)
 end
 
-# The plan both backend products lower: composed plate chains, then the shared
-# work of nested-plate cells moved out of their plates. A nested cell's own
-# lowering (`_plate_nested_native!`) types its arguments by the cell plan's
-# values, so it composes chains only.
-_lowering_plan(p::Plan) = _hoist_nested_plate_invariants(_fuse_authored_plate_chains(p))
+# Both backend products keep plate boundaries until lowering. Shared cell work
+# belongs inside its plate's nonempty-domain guard, not in the enclosing plan.
+_lowering_plan(p::Plan) = _fuse_authored_plate_chains(p)
 
-# A plate cell that contains another plate is lowered whole at every outer
-# coordinate (`_plate_nested_native!`), so the invariant grouping of
-# `_lower_authored_plate_loop_native!` does not reach its recipes. Move the
-# cell work that reads only shared values (atomic or scalar plate arguments,
-# and values computed from them alone) in front of the plate: it runs once,
-# and each of its values the remaining cell reads becomes an additional atomic
-# plate argument. As for a flat plate's invariants, this work also runs for an
-# empty domain. Loops, effectful recipes and the cell's result stay in the
-# cell. The authored plan keeps its plate; only the lowered plan changes.
-function _hoist_nested_plate_invariants(p::Plan)
-    g = p.graph
-    copied = nothing
-    recipes = Recipe[]
-    next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
-    fresh() = (id = next_id[]; next_id[] -= 1; id)
-    for r in p.recipes
-        hoisted = r.op isa _AuthoredPlateOp ? _nested_plate_invariants(r) : nothing
-        if hoisted === nothing
-            push!(recipes, r)
-            continue
-        end
-        copied === nothing && (copied = Graph(copy(g.values), copy(g.recipes),
-            copy(g.producers), copy(g.aliases), g.version))
-        append!(recipes, _hoisted_plate_recipes(copied, r, hoisted, fresh))
-    end
-    copied === nothing && return p
-    template = Plan(copied, p.have, p.want, p.recipes, p.producer, p.cost,
-                    p.candidates)
-    _partial_subplan(template, p.have, p.want, recipes)
-end
-
-# The cell recipes of nested-plate recipe `r` that read shared values only,
-# and the residual cell's new arguments (`frontier`), or `nothing`.
-function _nested_plate_invariants(r::Recipe)
-    op = r.op
-    inner = op.kernel.plan
+# Shared recipes of a cell that contains another plate. The native lowering
+# emits them once inside the outer plate's nonempty guard; their frontier is
+# passed to the residual cell without crossing the plate's evaluation boundary.
+function _nested_plate_invariants(inner::Plan, atomic, callvalues)
     ig = inner.graph
     loop(q) = q.op isa Union{_AuthoredPlateOp,_AuthoredScanOp,_AuthoredPlateCellOp}
     # The cells `_lower_authored_plate_loop_native!` lowers whole (`nested`);
     # every other cell keeps its codegen-time invariant grouping.
     any(q -> q.op isa _AuthoredPlateOp, inner.recipes) || return nothing
-    atomic = typeof(op).parameters[2]
     shared = Set{Int}()
     for (position, input) in enumerate(inner.have)
-        (position in atomic || valtype(r.inputs[position]) <: Number) &&
+        (position in atomic || valtype(callvalues[position]) <: Number) &&
             push!(shared, canon_id(ig, input.id))
     end
     results = Set(canon_id(ig, v.id) for v in inner.want)
@@ -1790,41 +1797,7 @@ function _nested_plate_invariants(r::Recipe)
     end
     residual = Recipe[q for (index, q) in enumerate(inner.recipes)
                       if !(index in moved)]
-    (; moved = inner.recipes[moved], frontier, residual)
-end
-
-# `r`'s moved cell recipes as outer recipes over the plate's arguments, then
-# `r` over its residual cell with the frontier appended as atomic arguments.
-# New outer values register in `copied`.
-function _hoisted_plate_recipes(copied::Graph, r::Recipe, hoisted, fresh)
-    op = r.op
-    inner = op.kernel.plan
-    ig = inner.graph
-    outer = Dict{Int,Value}(canon_id(ig, v.id) => r.inputs[position]
-                            for (position, v) in enumerate(inner.have))
-    recipes = Recipe[]
-    for q in hoisted.moved
-        outputs = Tuple(get!(outer, canon_id(ig, v.id)) do
-            value!(copied, v.name, valtype(v))
-        end for v in q.outputs)
-        push!(recipes, Recipe(fresh(), Tuple(outer[canon_id(ig, v.id)] for v in q.inputs),
-            outputs, q.op, q.cost, nothing, false, q.source))
-    end
-    readable = Dict(q.id => source for (q, source) in
-                    zip(inner.recipes, op.kernel.lowered_recipes))
-    scalar_plan = _partial_subplan(inner, vcat(inner.have, hoisted.frontier),
-                                   inner.want, hoisted.residual)
-    kernel = _prepare(scalar_plan,
-        _lower_with_ops(scalar_plan; inline_embedded = false)...)
-    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-        kernel.plan, kernel.ast, Tuple(readable[q.id] for q in hoisted.residual))
-    count = length(inner.have)
-    atomic = (typeof(op).parameters[2]..., (count + 1):(count + length(hoisted.frontier))...)
-    replacement = _AuthoredPlateOp{typeof(kernel),atomic}(kernel, op.axis_checks)
-    push!(recipes, Recipe(r.id,
-        (r.inputs..., (outer[canon_id(ig, v.id)] for v in hoisted.frontier)...),
-        r.outputs, replacement, r.cost, nothing, r.effectful, r.source))
-    recipes
+    (; moved, frontier, residual)
 end
 
 # `producer` (an authored plate with output `cid`) composed into `consumer`, an
@@ -1833,18 +1806,18 @@ end
 function _compose_plate_into(g::Graph, producer::Recipe, consumer::Recipe, cid)
     # A plate cell composes its producer as its plate does; its first input is
     # the cell index, which the producer never is.
-    cell = consumer.op isa _AuthoredPlateCellOp
+    cell = consumer.op isa _AuthoredPlateCellLike
     cell && canon_id(g, first(consumer.inputs).id) == cid && return nothing
     plate = cell ? Recipe(consumer.id, consumer.inputs[2:end], consumer.outputs,
         consumer.op.plate, consumer.cost, nothing, false, consumer.source) : consumer
-    plate.op isa _AuthoredPlateOp || return nothing
-    atomic = typeof(plate.op).parameters[2]
+    plate.op isa _AuthoredPlateLike || return nothing
+    atomic = _plate_atomic(plate.op)
     any(position -> position in atomic && canon_id(g, plate.inputs[position].id) == cid,
         eachindex(plate.inputs)) && return nothing
     composed = _compose_authored_plates(g, producer, plate)
     cell || return composed
     Recipe(composed.id, (first(consumer.inputs), composed.inputs...), composed.outputs,
-        _AuthoredPlateCellOp(composed.op), composed.cost, nothing, false, composed.source)
+        _AuthoredPlateCellDraft(composed.op), composed.cost, nothing, false, composed.source)
 end
 
 # Is a plate's pointwise value read only by other plates, each zipping it, and
@@ -2749,7 +2722,8 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     replacement = if spec === nothing
-        token, form = (typeof(r.op)::DataType).parameters
+        token = getfield(r.op, :token)
+        form = (typeof(r.op)::DataType).parameters[2]
         arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
             getfield(native, then ? :then_arm : :else_arm),
             getfield(tensor, then ? :then_arm : :else_arm))
@@ -2899,8 +2873,8 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
         push!(body.args, selected)
         return body
     end
-    # An empty domain evaluates neither the condition nor an arm: only the
-    # cell's invariants, as its per-cell branch would.
+    # An empty domain evaluates neither the condition, an arm, nor any
+    # other cell recipe.
     empty_block = _lower_authored_plate_cells_native!(Expr(:block), runtime_ops,
         runtime_recipes, inner_kernel, atomic, callargs, callvalues,
         raw_arguments, prepared_arguments, marker, output_axes, pointwise_lhs,
@@ -3033,13 +3007,41 @@ end
     end
 end
 
+# The scalar plan of a cell containing another plate: its shared work hoisted
+# (`_nested_plate_invariants`) and its plate chains composed. Composing gives the
+# composed values fresh identities (`_compose_authored_plates`). Both backend
+# products of one preparation lower the same cells, and one product can lower a
+# cell more than once, so within a preparation (`_sharing_cell_plans`) every
+# lowering of a cell reuses one plan: they name the same values and compose once.
+# The plan depends only on the cell kernel, the atomic positions and which call
+# values are scalars.
+const _SHARED_CELL_PLANS = :ReactiveKernels_shared_cell_plans
+
+_sharing_cell_plans(f) = haskey(task_local_storage(), _SHARED_CELL_PLANS) ? f() :
+    task_local_storage(f, _SHARED_CELL_PLANS, IdDict{Any,Any}())
+
+function _nested_cell_plan(kernel, atomic, callvalues)
+    function compose()
+        inner = kernel.plan
+        hoisted = _nested_plate_invariants(inner, atomic, callvalues)
+        scalar = hoisted === nothing ? inner : _partial_subplan(inner,
+            vcat(inner.have, hoisted.frontier), inner.want, hoisted.residual)
+        (hoisted, _fuse_authored_plate_chains(scalar))
+    end
+    shared = get(task_local_storage(), _SHARED_CELL_PLANS, nothing)
+    shared === nothing && return compose()
+    scalar_calls = Tuple(valtype(v) <: Number for v in callvalues)
+    get!(compose, shared, (kernel, atomic, scalar_calls))
+end
+
 # A cell containing another plate is lowered by the same graph compiler as a
 # top-level kernel. Splicing that AST retains each nested runtime loop, fuses
 # selected sum consumers, and preserves all named scalar recipes for replay.
 # Type-only arguments carry the enclosing DAG's coordinate evidence through
 # embedding without rebasing its operation-table references a second time.
-function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types)
-    scalar = _fuse_authored_plate_chains(kernel.plan)
+function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
+                                atomic, callvalues)
+    hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
     hint_ids = sort!(collect(keys(types)))
     type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
@@ -3048,7 +3050,9 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     append!(runtime_ops, ops)
     append!(runtime_recipes, recipes)
     T = types[canon_id(kernel.plan.graph, only(kernel.plan.want).id)]
-    (; ast, offset, type = T, input_types = Any[types[cid] for cid in hint_ids])
+    (; ast, offset, type = T, inputs = scalar.have,
+       invariants = hoisted === nothing ? Int[] : hoisted.moved,
+       input_types = Any[types[cid] for cid in hint_ids])
 end
 
 # Each authored plate carries a generated kernel type. The lowering itself is
@@ -3218,7 +3222,7 @@ end
 # bound: the invariants above the loop, the cell loop, the pointwise buffer and
 # the total. `inner_kernel` is the plate's cell kernel or a branch-arm variant
 # of it (`_PlateArmVariant`). With `cells = false` the domain is
-# known to be empty: the invariants and the empty result are emitted, no loop.
+# known to be empty: only the empty result is emitted, with no cell work.
 Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         body, runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
         @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
@@ -3274,7 +3278,7 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
         output_axes, pointwise_lhs, total_lhs, recycled, into, cells,
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
-        lane_arms; total_fold)
+        lane_arms; nonempty, total_fold)
 end
 
 # Append a cell kernel's operations to the table and build the type expression
@@ -3320,7 +3324,8 @@ Base.@nospecializeinfer function _plate_cell_types!(
     end
     nested = any(r -> r.op isa _AuthoredPlateOp, inner.recipes) ?
         _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
-            Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inner.have]) :
+            Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inner.have],
+            atomic, callvalues) :
         nothing
     for (recipe_index, recipe) in enumerate(inner.recipes)
         input_type_exprs = Any[
@@ -3354,23 +3359,25 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         pointwise_lhs, total_lhs, recycled, into::Bool, cells::Bool,
         plate_eltype, index, previous, first_coordinate, root_positions,
         dependencies, locals, op_offset, scan_offsets, plate_type_exprs, nested,
-        lane_arms; total_fold = sum)
-    groups = _authored_plate_recipe_groups(
-        inner, dependencies, root_positions, atomic, callvalues)
-    nested === nothing || (groups = [])
+        lane_arms; nonempty::Bool = false, total_fold = sum)
+    groups = nested === nothing ? _authored_plate_recipe_groups(
+        inner, dependencies, root_positions, atomic, callvalues) :
+        [(Set{Int}(), nested.invariants)]
     has_scheduled_groups = any(groups) do (roots, _)
         !isempty(roots) && !_authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues)
     end
 
     # Every cell recipe is emitted once. A group without dynamic roots is a
-    # plate invariant, computed here above the loop. Recipes with the same
+    # plate invariant, computed above the loop only when it has cells.
+    # Recipes with the same
     # dynamic root set share one scheduling guard inside the loop
     # (`_authored_plate_schedule`), which preserves partial-dimension invariant
     # caching; their outputs are declared here, so a value computed at one
     # coordinate is still bound at the next. Common vector-plate groups are
     # known to be safe to recompute at every coordinate and need no guard in
     # either the primal or differentiated native kernel.
+    invariants = Expr(:block)
     for (roots, recipe_indices) in groups
         _authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues) && continue
@@ -3387,7 +3394,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, false) for input in recipe.inputs]
-            _lower_plate_recipe_native!(body, recipe, args, out,
+            _lower_plate_recipe_native!(invariants, recipe, args, out,
                 Expr(:ref, _OPS_ARG, op_offset + recipe_index),
                 get(scan_offsets, recipe_index, nothing))
         end
@@ -3416,7 +3423,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     if nested !== nothing
         args = Any[_authored_plate_scalar_ref(
             inner, locals, callargs, callvalues, prepared_arguments, atomic,
-            input, index, true) for input in inner.have]
+            input, index, true) for input in nested.inputs]
         # Hint queries used only by a cell stay inside its loop: an empty outer
         # domain must not evaluate new queries merely to bind an unused hint.
         input_types = _bind_native_type_exprs!(loopbody, nested.input_types)
@@ -3523,16 +3530,29 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             (accumulator === nothing || total_fold === sum) ? _plate_reduction_plan(
         inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
         pointwise_lhs) : nothing
-    cells && append!(body.args, declarations)
-    if !cells
-        # A domain known to be empty runs no cell.
-    elseif reduction === nothing
-        push!(body.args, cell_loop)
-    else
-        push!(body.args, _lower_plate_reduction_native(reduction.kind,
-            reduction, inner, locals, callargs, callvalues, raw_arguments,
-            prepared_arguments, atomic, root_positions, plate_type_exprs, op_offset, plate_eltype,
-            output_axes, pointwise_lhs, accumulator, cell_loop))
+    if cells
+        append!(body.args, declarations)
+        execution = Expr(:block, invariants.args...)
+        if reduction === nothing
+            push!(execution.args, cell_loop)
+        else
+            push!(execution.args, _lower_plate_reduction_native(reduction.kind,
+                reduction, inner, locals, callargs, callvalues, raw_arguments,
+                prepared_arguments, atomic, root_positions, plate_type_exprs, op_offset, plate_eltype,
+                output_axes, pointwise_lhs, accumulator, cell_loop))
+        end
+        # Allocate the concrete pointwise buffer and seed the total before the
+        # guard. Invariants and cells share one guarded scope, so an empty
+        # plate neither evaluates a cell recipe nor needs a sentinel value for
+        # its result. The same buffer reaches both paths under ordinary Reverse.
+        if nonempty || isempty(invariants.args)
+            append!(body.args, execution.args)
+        else
+            has_cells = Expr(:call, GlobalRef(Base, :!),
+                Expr(:call, GlobalRef(Base, :isempty),
+                    Expr(:call, GlobalRef(Base, :CartesianIndices), output_axes)))
+            push!(body.args, Expr(:if, has_cells, execution))
+        end
     end
     # Fallback runtime narrowing of the pointwise container. `plate_eltype`
     # already types the buffer up front, so for an inferable body this is a
@@ -3689,7 +3709,7 @@ Base.@nospecializeinfer function _lower_authored_plate_tensorized!(
         atomic, callargs, callvalues, pointwise_lhs, total_lhs)
     if any(r -> r.op isa _AuthoredPlateOp, inner.recipes)
         _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
-            Any[GlobalRef(Core, :Any) for _ in inner.have])
+            Any[GlobalRef(Core, :Any) for _ in inner.have], atomic, callvalues)
         # The current tensor product batches individual scalar recipes. Calling
         # a nested plate's host fallback there would trace a data-sized loop.
         # Keep this capability gap explicit until nested backend regions exist.
@@ -5267,14 +5287,14 @@ struct PreparedKernel{F,O,IN,OUT,RR,S}
     lowered_recipes::RR
 end
 
-# Nearly every preparation or rebinding assembles a `PreparedKernel` of a new
-# concrete type (its compiled body is new). Assemble it without compiling the
-# struct's constructor for that type; calls on the prepared kernel still
-# dispatch on its exact type.
+# Assemble new prepared types without compiling a constructor for each one;
+# equivalent generated bodies and operation types can reuse their existing
+# specializations. Calls still dispatch on the exact prepared type.
 Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
         @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing)
+    ops = _execution_source(ops)
     T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
                        typeof(lowered_recipes),exact_signature}
     _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
@@ -6361,10 +6381,10 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                       exemplars))
 end
 
-# Re-lowering an embedded nested plate may fuse its child plates separately in
-# each product. Fusion gives the same readable recipes fresh Value identities.
-# Accept only a consistent renaming: source, operations, order and all graph
-# edges must still agree.
+# The two backend products of one preparation reuse each nested cell's composed
+# plan (`_nested_cell_plan`); other intermediates they create independently can
+# carry fresh Value identities. Accept only a consistent renaming: source,
+# operations, order and all graph edges must still agree.
 function _same_readable_recipes(a, b)
     length(a) == length(b) || return false
     forward = Dict{Int,Int}()
@@ -6416,14 +6436,16 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
     end
     lowered_plan = _lowering_plan(p)
     exact_signature = exemplar_types === nothing ? Nothing : Tuple{exemplar_types...}
-    native_ast, ops, recipes = _lower_with_ops(lowered_plan; exemplar_types)
-    isempty(passes) || (native_ast = transform(native_ast, passes...))
-    if !_needs_embedded_tensorization(p)
-        return _prepare(p, native_ast, ops, recipes; exact_signature)
+    embedded = _needs_embedded_tensorization(p)
+    (native_ast, ops, recipes), tensorized_lowering = _sharing_cell_plans() do
+        native_lowering = _lower_with_ops(lowered_plan; exemplar_types)
+        embedded || return (native_lowering, nothing)
+        (native_lowering, _lower_with_ops(lowered_plan; tensorized = true))
     end
+    isempty(passes) || (native_ast = transform(native_ast, passes...))
+    embedded || return _prepare(p, native_ast, ops, recipes; exact_signature)
 
-    tensorized_ast, tensorized_ops, tensorized_recipes =
-        _lower_with_ops(lowered_plan; tensorized = true)
+    tensorized_ast, tensorized_ops, tensorized_recipes = tensorized_lowering
     tensorized_ops == ops || throw(ArgumentError(
         "embedded native and tensorized kernels produced different operation tables"))
     _same_readable_recipes(tensorized_recipes, recipes) || throw(ArgumentError(
@@ -6675,7 +6697,7 @@ function _readable_substitute(ex, subst::AbstractDict)
 end
 
 # Whether `value` is the program variable codegen made of the authored `name`
-# to avoid a collision (`_varnames`: `name_<id>` or `name_<id>_<k>`). Such a
+# to avoid a collision (`_varnames`: `name_<position>` or `name_<position>_<k>`). Such a
 # name stays an explicit binding, so the authored spelling remains visible.
 _readable_collision_rename(name::Symbol, value) =
     value isa Symbol &&
