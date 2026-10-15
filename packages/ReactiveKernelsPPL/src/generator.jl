@@ -3851,18 +3851,24 @@ function _ordinal_logCC(link::LinkFunction, z)
     return :(-exp($z))
 end
 
-# Stable `log(1 - exp(x))` for x ≤ 0 (Mächler's `log1mexp`, Stan
-# `log1m_exp`): `log(-expm1(x))` above -log(2), `log1p(-exp(x))` below.
-# `log1p(-exp(x))` alone cancels as x → 0⁻, so an interior cumulative level
-# whose cutpoints both lie far above eta (both log-probs near 0) lost all
-# but ~eps/|x| of its relative precision. `ifelse` keeps the cell
-# branch-free; the clamp keeps the unselected `log1p` arm finite, so its
-# zero adjoint never meets an infinite partial in reverse.
-_ppl_log1mexp(x) = ifelse(x > -0.6931471805599453, log(-expm1(x)),
-    log1p(-exp(min(x, -0.6931471805599453))))
+# Log-difference of log-probs (a ≥ b): `a + log1p(-exp(b - a))`. It
+# cancels as b - a → 0⁻; only the probit and cloglog interior levels use it,
+# and their log-CDFs already round away the upper-tail mass it would need.
+_log_diff_exp(a, b) = :($a + log1p(-exp($b - $a)))
 
-# Stable log-difference of log-probs (a ≥ b): `a + log1mexp(b - a)`.
-_log_diff_exp(a, b) = :($a + $(GlobalRef(@__MODULE__, :_ppl_log1mexp))($b - $a))
+# Interior cumulative level `F(hi) - F(lo)` (hi = d*(c[y] - eta) ≥
+# lo = d*(c[y-1] - eta); `gap` = d*(c[y-1] - c[y]) = lo - hi ≤ 0). Logit
+# takes the exact identity F(hi) - F(lo) = F(hi) (1 - F(lo)) (1 - exp(gap))
+# (Stan `log_inv_logit_diff`): log-CDF plus log-CCDF, each exact in both
+# tails, plus a term that reads only the scaled cutpoint gap — absolute
+# error ~eps for any gap, and no eta in it, so with data cutpoints the
+# reverse pass skips it. `log_diff_exp` of two log-CDFs instead cancels when
+# both cutpoints lie far above eta (both log-CDFs near 0).
+function _ordinal_interior_logmass(link::LinkFunction, hi, lo, gap)
+    link === LogitLink && return :($(_ordinal_logF(link, hi)) +
+        $(_ordinal_logCC(link, lo)) + log(-expm1($gap)))
+    return _log_diff_exp(_ordinal_logF(link, hi), _ordinal_logF(link, lo))
+end
 
 # Modeled-scale precompute name (response `label`).
 _disc_name(label::Symbol) = Symbol(:_ppl_disc_, label)
@@ -3996,8 +4002,8 @@ end
 
 # Cumulative cell over the shared threshold vector `c`: the first level
 # takes logF at `c[1]`, the last logCC at `c[K-1]`, an interior level `y`
-# the stable log-difference of logF at `c[y]` and `c[y-1]` (thresholds
-# are ordered, so hi ≥ lo). Authored as lazy branches on the observed
+# the log mass between `c[y-1]` and `c[y]` (`_ordinal_interior_logmass`;
+# thresholds are ordered, so hi ≥ lo). Authored as lazy branches on the observed
 # level: only the observation's own arm runs, so every gather is in bounds
 # by construction; the branch condition reads bound data only, so plate
 # lowering splits the lanes by arm before any backend sees a branch.
@@ -4006,10 +4012,10 @@ function _ordinal_cumulative_cell(link::LinkFunction, K, yv::Symbol,
     first = _ordinal_logF(link, :($dref * ($c[1] - $etav)))
     last = _ordinal_logCC(link, :($dref * ($c[$K - 1] - $etav)))
     K == 2 && return :($yv == 1 ? $first : $last)
-    hi = _ordinal_logF(link, :($dref * ($c[$yv] - $etav)))
-    lo = _ordinal_logF(link, :($dref * ($c[$yv - 1] - $etav)))
+    interior = _ordinal_interior_logmass(link, :($dref * ($c[$yv] - $etav)),
+        :($dref * ($c[$yv - 1] - $etav)), :($dref * ($c[$yv - 1] - $c[$yv])))
     return :($yv == 1 ? $first :
-        ($yv == $K ? $last : $(_log_diff_exp(hi, lo))))
+        ($yv == $K ? $last : $interior))
 end
 
 # Stage-lane names for response `label`.
