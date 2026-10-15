@@ -62,7 +62,10 @@ RKPPLModel(ast, mod, fixed) = RKPPLModel(ast, mod, fixed, Expr[])
 RKPPLModel(ast, mod, fixed, rewrites) = RKPPLModel(ast, mod, fixed, rewrites, Dict{Symbol,ColumnData}())
 
 """Inputs bound to a captured program, awaiting explicit observations.
-Use `binding | (; y)` or `condition(binding; y)` to lower and bind it."""
+Use `binding | (; y)` or `condition(binding; y)` to lower and bind it.
+With nothing left to observe, the binding is the plan `bind_data(binding)`
+lowers it to: `build_kernel`, `kernel_expr`, `assign_layout`, the `prepare_*`
+queries and `model_view(built; bound)` accept it in place of that plan."""
 struct RKPPLBoundModel
     model::RKPPLModel
     data::Dict{Symbol,ColumnData}
@@ -300,8 +303,28 @@ function condition(plan::StructuralPlan; kwargs...)
 end
 Base.:|(plan::StructuralPlan, data::NamedTuple) = condition(plan; data...)
 bind_data(m::RKPPLBoundModel) = _bind_model(m.model, m.data)
-build_kernel(m::RKPPLBoundModel) = build_kernel(bind_data(m))
-build_kernel(m::RKPPLModel) = build_kernel(m())
+
+# A model or binding with nothing left to observe is the plan `bind_data`
+# lowers it to, so every entry point that reads a bound plan reads it through
+# this one conversion: a binding that builds also lays out, prints, displays
+# and prepares. Each call lowers again; `plan = bind_data(binding)` lowers once.
+const _PlanSource = Union{RKPPLModel,RKPPLBoundModel}
+_bound_plan(m::RKPPLModel) = _bound_plan(m())
+_bound_plan(m::RKPPLBoundModel) = bind_data(m)
+_bound_plan(plan::StructuralPlan) = plan
+
+build_kernel(m::_PlanSource) = build_kernel(_bound_plan(m))
+kernel_expr(m::_PlanSource, layout::LayoutTable; kwargs...) =
+    kernel_expr(_bound_plan(m), layout; kwargs...)
+assign_layout(m::_PlanSource) = assign_layout(_bound_plan(m))
+for prepare in (:prepare_query, :prepare_sampler, :prepare_cell_query,
+                :prepare_cell_sampler, :prepare_compact_cell_sampler)
+    @eval $prepare(built, m::_PlanSource, args...; kwargs...) =
+        $prepare(built, _bound_plan(m), args...; kwargs...)
+end
+prepare_query_ad(prepare_operator, built, m::_PlanSource, args...; kwargs...) =
+    prepare_query_ad(prepare_operator, built, _bound_plan(m), args...; kwargs...)
+_model_source(m::_PlanSource, layout::LayoutTable) = _model_source(_bound_plan(m), layout)
 
 function _bind_immediate(m::RKPPLModel, data)
     cols = if data isa NamedTuple
@@ -12190,16 +12213,19 @@ function _threshold_normal_args(lhs::Symbol, d, what::String)
     return m, s
 end
 
-function _ordered_element_prior(lhs, d, coefuse, ctx)
+# The element prior of an ordered vector or a threshold vector: any
+# real-support family `_VECTOR_ELEMENT_FAMILIES` names, including the
+# improper `Flat()` (zero element density, the transform Jacobian only).
+function _ordered_element_prior(lhs, d, coefuse, ctx, what = "Ordered vector")
     if d isa Expr && d.head === :call && !isempty(d.args) && d.args[1] === :Normal
-        m, s = _threshold_normal_args(lhs, d, "Ordered vector")
+        m, s = _threshold_normal_args(lhs, d, what)
         return :ordered_normal, (arg1 = m, arg2 = s)
     end
     p = _lower_parameter(lhs, d, coefuse, ctx.matrices)
     family = Symbol(:ordered_, p.family)
     haskey(_VECTOR_ELEMENT_FAMILIES, family) && p.support_override === nothing ||
-        _sfail("Ordered vector $lhs: the element prior must have real " *
-            "support (Normal, Cauchy, Laplace, Logistic or StudentT)")
+        _sfail("$what $lhs: the element prior must have real support " *
+            "(Normal, Cauchy, Laplace, Logistic, StudentT or Flat)")
     return family, p.args
 end
 
@@ -12238,7 +12264,8 @@ function _lower_plain_thresholds(s, coefuse, ctx)
     haskey(coefuse, lhs) && _sfail("$lhs is a predictor coefficient and " *
         "cannot also be thresholds")
     rhs = _undot_distribution(lhs, s.rhs)
-    family, args = _ordered_element_prior(lhs, rhs, coefuse, ctx)
+    family, args = _ordered_element_prior(lhs, rhs, coefuse, ctx,
+        "Threshold vector")
     family = Symbol(replace(String(family), "ordered_" => "vector_"))
     n = only(s.dims)
     size = n isa Int ? n : _threshold_size(lhs, n,

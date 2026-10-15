@@ -10,11 +10,12 @@ import Enzyme
 
 # Zero-inflated Binomial cells with both probabilities on the log-odds scale.
 # The reference cell is the exact log mass at success log-odds `l` and
-# zero-inflation log-odds `z`, in 512-bit arithmetic.
+# zero-inflation log-odds `z`, in 512-bit arithmetic (`Base.binomial`, as in
+# `test_product_mixture.jl`).
 function zib_logit_reference_cell(y, n, l, z)
     l, z = big(l), big(z)
     logzi, log1mzi = -log1p(exp(-z)), -log1p(exp(z))
-    count = log(binomial(big(n), big(y))) +
+    count = log(Base.binomial(big(n), big(y))) +
         (y == 0 ? big(0.0) : y * -log1p(exp(-l))) +
         (y == n ? big(0.0) : (n - y) * -log1p(exp(l)))
     y > 0 && return log1mzi + count

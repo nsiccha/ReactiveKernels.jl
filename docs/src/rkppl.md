@@ -32,6 +32,14 @@ declared variable pins it: `model(; x, sigma = 0.3) | (; y)` removes the
 `build_kernel` generates the program, and `prepare_query(built, plan, :sampler)`
 returns the log-posterior over the packed unconstrained coordinates.
 
+A model with nothing left to observe needs no `|`: a prior-only model, or one
+whose responses are definitions computed from data. Its call returns the
+binding, and every step that takes a bound plan (`build_kernel`,
+`kernel_expr`, `assign_layout`, the `prepare_*` queries and
+`model_view(built; bound)`) takes the binding too, reading the plan
+`bind_data(binding)` lowers it to. Each step lowers it again; bind once with
+`plan = bind_data(binding)` to share one plan.
+
 An explicitly observed empty vector has zero observations and contributes
 zero log-likelihood. Scalar priors and their transforms still contribute as
 authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an
@@ -220,6 +228,8 @@ An ordered vector may use Normal, Cauchy, Laplace, Logistic or StudentT
 element priors with live scalar arguments, for example
 `c ~ Ordered(Normal(m, 2s), 2)`. Its density is the sum of the element log
 densities on increasing vectors, with no factorial normalizer.
+`c ~ Ordered(Flat(), n)` is Stan's `ordered[n] c;` with no prior statement:
+its elements have zero density, leaving the ordering transform's Jacobian.
 
 Ordered extents may be data-only expressions, including
 `length(levels(x)) - 1`, `length(levels(y)) - 2` and
@@ -228,9 +238,9 @@ extent even when a Gaussian response reads the vector. An ordinal response
 has support `1:length(c)+1`; an observed category outside it fails at bind.
 `levels` includes a declared DataAPI level pool; `unique` counts observed
 values. The prior and support come from the declaration: cumulative
-cutpoints may have an ordinary Normal vector prior (non-increasing values
-give `-Inf`), and stopping-ratio thresholds may have an Ordered or ordinary
-Normal/Cauchy/Laplace/Logistic/StudentT prior.
+cutpoints may have an ordinary Normal or Flat vector prior (non-increasing
+values give `-Inf`), and stopping-ratio thresholds may have an Ordered or
+ordinary Normal/Cauchy/Laplace/Logistic/StudentT/Flat prior.
 
 A per-cell `Flat()` prior contributes zero density and retains its layout
 coordinates. Its posterior may be proper through the likelihood; density
@@ -685,6 +695,17 @@ is a model-level matrix, as a declared matrix is: `u * hcat(w1, w2)` means
 meaning, named or inline: `E = exp.(u * hcat(w1, w2)); P = E ./ sum.(eachrow(E))`
 normalizes each row. An `hcat` with an observation column, such as
 `hcat(ones(length(x)), x)`, has one row per observation.
+
+A value the model computes with one row per observation is the matrix of a
+product too, as in Julia. With `A[axes(x, 2), 1:J]`, `a1[1:J]`,
+`B[1:J, 1:K]` and `b1[1:K]` declared, the hidden layer
+`hidden = tanh.(a1' .+ x * A)` is N × J: the adjoint `a1'` is a 1 × J row
+that broadcasts against the N × J product. `v = b1' .+ hidden * B` then
+contracts the columns of `hidden` and keeps its rows. Named or inline, it has
+the density of the append-column spelling
+`hcat(ones(size(x, 1)), hidden) * vcat(b1', B)`, and a data-only elementwise
+matrix such as `X = x .- c` reads the same way in `X * b`. Julia checks the
+dimensions of a computed product where it computes it.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_corpus_example("46_matrix_gaussian.jl", :rkppl_matrix)

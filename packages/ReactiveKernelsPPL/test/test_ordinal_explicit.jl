@@ -251,6 +251,113 @@ end
         sum(logpdf.(Normal.(a .+ c[1] .* cols[:x], 1.0), cols[:z]))
 end
 
+# `mu ~ Ordered(Flat(), n)` is Stan's `ordered[n] mu;` with no prior
+# statement: zero element density and the ordered-transform Jacobian only.
+# Flat sized thresholds, `t[1:n] .~ Flat.()`, keep their identity transform.
+@testset "Flat ordered vectors and thresholds have zero element density" begin
+    cols = _oe_cols()
+    gaps(c) = sum(log.(diff(c)); init = 0.0)
+    # Free-standing, against an independent density and the equivalent
+    # chain of restricted Flat scalars at the same coordinates.
+    plan = _oe_lower(quote
+        mu ~ Ordered(Flat(), 3)
+        z .~ Normal.(mu[1] + mu[2] + mu[3], 1)
+    end, (:z,))
+    @test only(plan.vector_parameters).family === :ordered_flat
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = _oe_point(built.layout.total)
+    mu = constrain(built.layout, u).mu
+    @test issorted(mu)
+    @test _query(built.spec, bound, :prior, u) == 0.0
+    @test _query(built.spec, bound, :log_jacobian, u) ≈ gaps(mu)
+    @test _query(built.spec, bound, :posterior, u) ≈
+        gaps(mu) + sum(logpdf.(Normal(sum(mu), 1), cols[:z]))
+    gradient = _check_gradient(built.spec, bound, u)
+    chain = bind_data(_oe_lower(quote
+        m1 ~ Flat()
+        m2 ~ restricted(Flat(), m1, Inf)
+        m3 ~ restricted(Flat(), m2, Inf)
+        z .~ Normal.(m1 + m2 + m3, 1)
+    end, (:z,)), cols)
+    chain_built = build_kernel(chain)
+    nt = constrain(chain_built.layout, u)
+    @test [nt.m1, nt.m2, nt.m3] ≈ mu
+    @test _query(chain_built.spec, chain, :posterior, u) ≈
+        _query(built.spec, bound, :posterior, u)
+    chain_gradient = _check_gradient(chain_built.spec, chain, u)
+    @test chain_gradient ≈ gradient
+    # A data-sized ordered Flat vector as cumulative cutpoints.
+    plan = _oe_lower(quote
+        b ~ Normal(0, 1)
+        c ~ Ordered(Flat(), length(levels(y)) - 1)
+        y .~ OrderedLogistic.(b .* x, Ref(c))
+    end)
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = _oe_point(built.layout.total)
+    nt = constrain(built.layout, u)
+    c, b = nt.c, nt.b
+    @test length(c) == 2
+    @test _query(built.spec, bound, :prior, u) ≈ logpdf(Normal(), b)
+    @test _query(built.spec, bound, :posterior, u) ≈
+        logpdf(Normal(), b) + gaps(c) +
+        sum(_oe_cumulative_lp(_oe_logistic, b * x, c, y)
+            for (x, y) in zip(cols[:x], cols[:y]))
+    _check_gradient(built.spec, bound, u)
+    # Flat stopping-ratio thresholds: no density, no Jacobian.
+    plan = _oe_lower(quote
+        b ~ Normal(0, 2)
+        t[1:length(levels(y)) - 1] .~ Flat.()
+        y .~ Ordinal.(StoppingRatio(), LogitLink(), b .* x, Ref(t))
+    end)
+    @test only(plan.vector_parameters).family === :vector_flat
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    u = _oe_point(built.layout.total)
+    nt = constrain(built.layout, u)
+    t, b = nt.t, nt.b
+    @test _query(built.spec, bound, :prior, u) ≈ logpdf(Normal(0, 2), b)
+    @test _query(built.spec, bound, :log_jacobian, u) == 0.0
+    @test _query(built.spec, bound, :likelihood, u) ≈
+        sum(_oe_stopping_lp(_oe_logistic, b * x, t, y)
+            for (x, y) in zip(cols[:x], cols[:y]))
+    _check_gradient(built.spec, bound, u)
+    # Flat cumulative cutpoints stay unconstrained: unordered ones have
+    # zero likelihood.
+    plan = _oe_lower(quote
+        b ~ Normal(0, 1)
+        t[1:2] .~ Flat.()
+        y .~ OrderedLogistic.(b .* x, Ref(t))
+    end)
+    bound = bind_data(plan, cols)
+    built = build_kernel(bound)
+    names = coordinate_names(built.layout)
+    at(b, t) = [n === :b ? b : t[parse(Int, last(split(String(n), ".")))]
+        for n in names]
+    @test _query(built.spec, bound, :likelihood, at(0.3, [-0.4, 0.6])) ≈
+        sum(_oe_cumulative_lp(_oe_logistic, 0.3 * x, [-0.4, 0.6], y)
+            for (x, y) in zip(cols[:x], cols[:y]))
+    @test _query(built.spec, bound, :likelihood, at(0.3, [0.6, -0.4])) == -Inf
+    @test _query(built.spec, bound, :prior, at(0.3, [0.6, -0.4])) ≈
+        logpdf(Normal(), 0.3)
+    # One and zero elements: no gaps, no density.
+    for n in (0, 1)
+        plan = _oe_lower(quote
+            a ~ Normal(0, 1)
+            k ~ Ordered(Flat(), $n)
+            z .~ Normal.(a, 1)
+        end, (:z,))
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        u = _oe_point(built.layout.total)
+        nt = constrain(built.layout, u)
+        @test length(nt.k) == n
+        @test _query(built.spec, bound, :posterior, u) ≈
+            logpdf(Normal(), nt.a) + sum(logpdf.(Normal(nt.a, 1), cols[:z]))
+    end
+end
+
 @testset "array axis 1:length(levels(g)) - k" begin
     cols = _oe_cols()
     plan = _oe_lower(quote
