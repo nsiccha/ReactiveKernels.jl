@@ -48,13 +48,20 @@ end
     nested = prepare(nested_arm_caller)
     @test (nested(1.5, 2.0, true), nested(1.5, -1.0, true), nested(1.5, -1.0, false)) ==
           (log(2.0) * 1.5, 0.0, 1.0)
-    nested_code = string(code_expr(nested))
-    @test occursin("let var\"prepared sib\" = ", nested_code)
-    @test occursin("var\"prepared sib\"(scale, x)", nested_code)
+    # Prepared code calls each body as one operation (`code_expr`); its recipe
+    # source shows where the sibling is called.
+    top_sources(k) = [e.recipe.source for e in recipe_inventory(k) if e.depth == 0]
+    outputs(k) = [v.name for e in recipe_inventory(k) for v in e.recipe.outputs]
+    # The caller's arm calls `f`'s operation, which carries its prepared child.
+    nested_source = string(only(top_sources(nested)))
+    @test occursin(r"^if c\b", nested_source)
+    @test occursin("_KernelPreparedChild", nested_source)
+    @test !(:sib in outputs(nested))
     # No sibling value is computed ahead of the branch.
-    code = string(code_expr(f))
-    @test !occursin("sib = ", code)
-    @test occursin(r"if x > 0\s+var\"prepared sib\"\(scale, x\)", code)
+    @test !occursin("sib = ", string(code_expr(f)))
+    @test !(:sib in outputs(f))
+    @test occursin(r"if x > 0\s+var\"prepared sib\"\(scale, x\)",
+                   string(only(top_sources(f))))
 
     logpdf = prepare(guarded_half.logpdf)
     @test logpdf(1.0, 2.0, 5.0) == log((5.0 - 1.0) / 2.0) - log(2.0)

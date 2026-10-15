@@ -553,21 +553,29 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     statements
 end
 
+# Whether a recipe is the authored `sum(x)` of its one input. Its source spells
+# the input by the name the source reads it by (`_recipe_source_names`), which
+# is not the value's name in a composed child: the child's `sum(squares)` reads
+# the value `p.squares` scoped under the caller's result `p`.
+function _plain_sum_recipe(recipe::Recipe)
+    recipe.effectful && return false
+    length(recipe.inputs) == 1 || return false
+    source = recipe.source
+    source isa Expr && source.head === :call && length(source.args) == 2 || return false
+    callee = source.args[1]
+    (callee === :sum || callee === GlobalRef(Base, :sum)) || return false
+    source.args[2] === only(_recipe_source_names(recipe)) || return false
+    recipe.op === sum || recipe.op isa _KernelSourceOp
+end
+
 function _authored_plate_sum_recipe(p::Plan, plate_recipe::Recipe)
     pointwise = only(plate_recipe.outputs)
     pointwise_id = canon_id(p.graph, pointwise.id)
     matches = Recipe[]
     for recipe in p.recipes
         recipe === plate_recipe && continue
-        recipe.effectful && continue
-        length(recipe.inputs) == 1 || continue
+        _plain_sum_recipe(recipe) || continue
         canon_id(p.graph, only(recipe.inputs).id) == pointwise_id || continue
-        source = recipe.source
-        source isa Expr && source.head === :call && length(source.args) == 2 || continue
-        callee = source.args[1]
-        (callee === :sum || callee === GlobalRef(Base, :sum)) || continue
-        source.args[2] === pointwise.name || continue
-        (recipe.op === sum || recipe.op isa _KernelSourceOp) || continue
         push!(matches, recipe)
     end
     length(matches) <= 1 || throw(ArgumentError(
@@ -3257,24 +3265,27 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
-    # A pure total-only one-axis plate is a scalar reduction. SIMD requires
-    # an indexable range, whereas `_plate_cells` returns a Generator for one
-    # axis. Iterate that axis directly and reconstruct the same cell index.
-    # Expand before an embedded kernel renames locals: late macro expansion
-    # can interpret its renamed index as a module global.
+    # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
+    # SIMD needs an indexable iteration space, whereas `_plate_cells` returns
+    # a Generator for one axis: `_plate_simd_cells` iterates that axis's range
+    # directly (and several axes as their `CartesianIndices`), and the body
+    # reconstructs the same cell index. This replaces the plain loop rather
+    # than branching beside it, so the cell body is emitted once. Expand
+    # before an embedded kernel renames locals: late macro expansion can
+    # interpret its renamed index as a module global.
     if accumulator !== nothing && pointwise_lhs === nothing &&
             !has_scheduled_groups && nested === nothing &&
             all(r -> !r.effectful, inner.recipes)
         linear = gensym(:plate_linear)
         simd_body = Expr(:block,
             Expr(:(=), index, Expr(:call, GlobalRef(Base, :CartesianIndex), linear)),
-            deepcopy(loopbody.args)...)
+            loopbody.args...)
         simd_loop = Expr(:for, Expr(:(=), linear,
-            Expr(:call, GlobalRef(Base, :only), output_axes)), simd_body)
+            Expr(:call, GlobalRef(@__MODULE__, :_plate_simd_cells), output_axes)),
+            simd_body)
         simd = Expr(:macrocall, GlobalRef(Base, Symbol("@simd")),
             LineNumberNode(0), simd_loop)
-        cell_loop = Expr(:if, :(length($output_axes) == 1),
-            macroexpand(@__MODULE__, simd), cell_loop)
+        cell_loop = macroexpand(@__MODULE__, simd)
     end
     reduction = cells && nested === nothing ? _plate_reduction_plan(
         inner, inner_kernel, dependencies, root_positions, atomic, callvalues,
@@ -5248,7 +5259,8 @@ function _externalize_bound_array_call(f, ops;
         slot === nothing ? ops[index] :
             _ExternalBoundArraySlot{slot}()
     end
-    structured = any(value -> value isa Union{Tuple,NamedTuple}, values)
+    structured = any(value -> value isa Union{Tuple,NamedTuple} ||
+                              _bound_record(value), values)
     external_body = structured ?
         _externalize_bound_array_body(f, positions, values) : nothing
     callable = external_body === nothing ? f :
@@ -5270,7 +5282,23 @@ _bound_array_leaves(values::Tuple) =
     Tuple(Iterators.flatten(map(_bound_array_leaves, values)))
 _bound_array_leaves(value::NamedTuple) = _bound_array_leaves(Tuple(value))
 _bound_array_leaves(value::AbstractArray) = (value,)
-_bound_array_leaves(value) = ()
+_bound_array_leaves(value) = _bound_record(value) ?
+    _bound_array_leaves(_bound_record_fields(value)) : ()
+
+# A bound immutable struct whose fields hold arrays (a model's wrapper around
+# a data matrix, say) is a record: its array leaves leave the callable like a
+# named tuple's, and the body rebuilds it with `new` from the same field
+# values. Left in the operation table, the arrays are part of the callable,
+# whose readonly proof native Reverse cannot then always complete.
+_bound_record(value) = _bound_record_type(typeof(value)) &&
+    _has_external_bound_array(_bound_record_fields(value), 0)
+_bound_record_type(T::DataType) = isconcretetype(T) && isstructtype(T) &&
+    !ismutabletype(T) && fieldcount(T) > 0 &&
+    !(T <: Union{Tuple,NamedTuple,AbstractArray,Number,Function,Type,
+                 Module,Symbol,AbstractString})
+_bound_record_type(T) = false
+_bound_record_fields(value) =
+    ntuple(i -> getfield(value, i), Val(fieldcount(typeof(value))))
 
 function _bound_rebuild_expr(value::NamedTuple, ports, next::Ref{Int})
     fields = Any[_bound_rebuild_expr(v, ports, next) for v in value]
@@ -5280,7 +5308,11 @@ _bound_rebuild_expr(value::Tuple, ports, next::Ref{Int}) =
     Expr(:tuple, Any[_bound_rebuild_expr(v, ports, next) for v in value]...)
 _bound_rebuild_expr(::AbstractArray, ports, next::Ref{Int}) =
     ports[next[] += 1]
-_bound_rebuild_expr(value, ports, next::Ref{Int}) = QuoteNode(value)
+function _bound_rebuild_expr(value, ports, next::Ref{Int})
+    _bound_record(value) || return QuoteNode(value)
+    fields = Any[_bound_rebuild_expr(v, ports, next) for v in _bound_record_fields(value)]
+    Expr(:new, typeof(value), fields...)
+end
 
 # A compiled body whose operation-table accesses are literal can load hidden
 # bound operands directly. This changes only its internal argument boundary;
@@ -5327,7 +5359,9 @@ function _externalize_bound_array_body(
     compile(ast)
 end
 
-_has_external_bound_array(value, min_elements) = false
+_has_external_bound_array(value, min_elements) =
+    _bound_record_type(typeof(value)) &&
+    _has_external_bound_array(_bound_record_fields(value), min_elements)
 _has_external_bound_array(value::AbstractArray, min_elements) =
     length(value) >= min_elements
 _has_external_bound_array(value::Union{Tuple,NamedTuple}, min_elements) =

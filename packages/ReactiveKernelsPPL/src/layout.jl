@@ -205,7 +205,8 @@ LayoutEntry(kind::Symbol, predictor::Union{Nothing,Symbol}, name::Symbol,
     LayoutEntry(kind, predictor, name, labels, offset, size, transform, NaN, NaN)
 
 # One block per sampled seed / body statement, independent of the number of
-# iterations. Native and generated transforms use the existing bijectors.
+# iterations. Native and generated transforms use the existing bijectors,
+# with the support a `truncated` / `restricted` / half prior states.
 function _scan_layout_entry(plan, s, name, offset, T)
     blocks = LayoutEntry[]
     pos = offset
@@ -214,13 +215,16 @@ function _scan_layout_entry(plan, s, name, offset, T)
         width = st isa ScanSetup ? 1 : T - (s.lo - 1)
         width == 0 && continue
         args = NamedTuple{Tuple(Symbol(:arg, i) for i in eachindex(st.args))}(Tuple(st.args))
-        transform, lo, hi = _entry_transform(st.family, nothing, args)
-        if transform === :interval
+        transform, lo, hi = _entry_transform(st.family, st.support, args)
+        if transform in (:interval, :floored, :upper)
+            # One block transforms every step with the same bounds.
             locals = Set(step.target for step in s.step if !step.indexed)
             bounds = union(_expr_value_symbols(lo), _expr_value_symbols(hi))
             (_scan_reads_carried(lo, s) || _scan_reads_carried(hi, s) ||
                 s.loopvar in bounds || !isdisjoint(locals, bounds)) &&
-                _fail(s.label, "scan Uniform bounds that vary by step are not supported yet")
+                _fail(s.label, "scan prior bounds that vary by step (reading " *
+                    "a carried array, the loop index or a step local) are not " *
+                    "supported yet")
             lo, hi = _layout_bound(plan, lo), _layout_bound(plan, hi)
         end
         blockname = Symbol(name, :_block_, length(blocks) + 1)

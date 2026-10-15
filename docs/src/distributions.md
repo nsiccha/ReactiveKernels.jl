@@ -242,6 +242,29 @@ loglik = prepare(bernoulli_logit_product_mixture_logdensity)
 loglik(event, logits, [0.6, 0.4])
 ```
 
+`zero_inflated_binomial_logit_product_mixture_logdensity(observed, trials,
+logits, zi_logits, weights)` gives each component zero-inflated Binomial
+cells. `logits[i, k]` is the success log-odds and `zi_logits[i, k]` the
+log-odds of a structural zero, both read through
+`zero_inflated_binomial_logit_zi(; n, logit, zi_logit)`, so neither
+probability is rounded. A data-augmented community occupancy model uses it
+for each species row: a member species occupies each site with occupancy
+log-odds `psi` (zero-inflation log-odds `-psi`) and is then detected with
+log-odds `theta` on each of `K` visits, while a non-member is never
+detected (success logit `-Inf`):
+
+```julia
+using ReactiveKernels
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    zero_inflated_binomial_logit_product_mixture_logdensity
+
+counts = [0, 3, 0, 1]                      # detections at four sites
+psi, theta, omega = 0.8, -0.4, 0.6         # occupancy, detection, membership
+loglik = prepare(zero_inflated_binomial_logit_product_mixture_logdensity)
+loglik(counts, fill(18, 4, 2), hcat(fill(theta, 4), fill(-Inf, 4)),
+    hcat(fill(-psi, 4), fill(-Inf, 4)), [omega, 1 - omega])
+```
+
 ## Hidden Markov sequences
 
 `hmm_logdensity(log_emissions, transition, initial)` is the forward
