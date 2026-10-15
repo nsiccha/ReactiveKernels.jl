@@ -595,9 +595,20 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
     length(params) == length(callargs) || throw(ArgumentError(
         "embedded kernel expected $(length(params)) inputs, got $(length(callargs))"))
 
+    statements = Any[]
     names = Dict{Symbol,Any}()
     for (param, callarg) in zip(params, callargs)
-        names[_signature_name(param)] = callarg
+        name = _signature_name(param)
+        # A call evaluates each argument once, before entering its body.
+        # Preserve that boundary when embedding: substituting an array
+        # projection at each use can move its load into nested loops.
+        if callarg isa Expr
+            binding = gensym(Symbol(:embedded_argument_, name))
+            push!(statements, Expr(:(=), binding, callarg))
+            names[name] = binding
+        else
+            names[name] = callarg
+        end
     end
     locals = _local_symbols!(Set{Symbol}(), body)
     for local_name in locals
@@ -605,7 +616,6 @@ function _embedded_statements(ast::Expr, callargs, lhs, op_offset::Int)
             (names[local_name] = gensym(Symbol(:embedded_, local_name)))
     end
 
-    statements = Any[]
     bodyargs = body.args
     return_index = findlast(statement ->
         statement isa Expr && statement.head === :return, bodyargs)
@@ -4156,6 +4166,10 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     retval = length(p.want) == 1 ? output(p.want[1]) :
              Expr(:tuple, (output(w) for w in p.want)...)
     push!(body.args, Expr(:return, retval))
+    # Compose before index runs duplicate a cell body into grouped/flat arms;
+    # otherwise those mutually exclusive definitions appear to escape here.
+    !tensorized && inline_embedded &&
+        (body = _lower_cell_arrays_native(body, runtime_recipes))
     !tensorized && inline_embedded && (body = _lower_index_runs_native(body, runtime_ops))
     Expr(:function, Expr(:tuple, argexprs...), body),
     Tuple(runtime_ops), Tuple(runtime_recipes)
