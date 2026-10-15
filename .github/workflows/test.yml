@@ -54,11 +54,15 @@ jobs:
         if: matrix.test-shard == 'acceptance-samplers'
         with:
           fetch-depth: 0
+      - name: Configure git for source dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.julia-version }}
           arch: ${{ matrix.julia-arch }}
       - uses: julia-actions/cache@v2
+      - name: Resolve pinned source dependencies
+        run: julia --startup-file=no --project=. deps/source_dependencies.jl
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
         with:
@@ -83,6 +87,8 @@ jobs:
         julia-version: ['1', 'pre']
     steps:
       - uses: actions/checkout@v4
+      - name: Configure git for source dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.julia-version }}
@@ -92,12 +98,16 @@ jobs:
       # upstream precompile regression returns, it fails here directly without
       # changing the full suite's execution model.
       - name: Precompile and load ReactiveKernels
-        run: julia --startup-file=no --compiled-modules=yes --project=@stdlib -e 'using Pkg; Pkg.activate(pwd()); Pkg.instantiate(); Pkg.precompile(; strict=true); using ReactiveKernels'
+        run: |
+          julia --startup-file=no --project=. deps/source_dependencies.jl
+          julia --startup-file=no --compiled-modules=yes --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile(; strict=true); using ReactiveKernels'
 
   nonallocating-integration:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure git for source dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.10'
@@ -109,6 +119,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Configure git for source dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.10'
@@ -133,6 +145,8 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
+      - name: Configure git for source dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.10'
@@ -155,6 +169,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Configure git for source dependencies
+        run: git config --global url."https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.10'
