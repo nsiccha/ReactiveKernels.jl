@@ -655,7 +655,7 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     plan = _lower_rkppl_once(ast, data, m.mod;
         submodel_scopes = scopes, conditioned = observed_parameters,
         array_entries = Set{Symbol}(k for k in data if _holds_arrays(get(values, k, nothing))))
-    for name in observed_parameters
+    for name in _conditioned_inputs(plan)
         values[_conditioned_input(name)] = pop!(values, name)
     end
     return plan, values
@@ -973,13 +973,14 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     input_data = data
     ast = _observation_call_definitions(ast, data, mod)
     ast = _gathered_value_definitions(ast, data)
+    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
+        _partition_statements(ast, data; array_entries)
     for name in conditioned
+        any(f -> f.lhs === name, factors) && continue
         input = _conditioned_input(name)
         (input in data || _mentions_symbol(ast, input)) &&
             _sfail("condition `$name` needs internal input `$input`, already used by the model or its data")
     end
-    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts =
-        _partition_statements(ast, data; array_entries)
     # Definitions a caller-owned law observes as one whole event with an
     # undotted `~` (`_partition_statements`): observations, never parameters.
     whole_observed = Set{Symbol}(s.lhs for s in sample if !s.broadcast &&
