@@ -4013,6 +4013,7 @@ function _expand_plates(args, data::Set{Symbol};
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
+            arg = _expand_cell_scans(arg)
             arg, locals = _scope_plate_locals(arg, plate_locals, taken)
             stmts, stx, prm = _desugar_plate(arg, pl, plate_data; broadcasts, arrays)
             _array_entry_values!(arrays, definitions)
@@ -4046,6 +4047,42 @@ function _expand_plates(args, data::Set{Symbol};
     end
     return expanded, ctx, params
 end
+
+# A `@scan` block in a plate cell is one recurrence per index: a scan inside
+# a plate. RK's own `@scan` loop lowering turns it into cell locals: the
+# seeds, one `scan(...) do` fold per carried array (reading earlier entries
+# through the scan's `history`), and each carried array's trajectory, which
+# then holds one array per index. Seeds and steps are `=` statements.
+function _expand_cell_scans(st::Expr)
+    loop = st.args[3]
+    (Meta.isexpr(loop, :for) && Meta.isexpr(loop.args[2], :block)) || return st
+    any(_is_cell_scan_block, loop.args[2].args) || return st
+    cells = Any[]
+    for c in loop.args[2].args
+        if _is_cell_scan_block(c)
+            stmts = try
+                ReactiveKernels._kernel_scan_loop_statements(c, nothing, nothing)
+            catch err
+                err isa ArgumentError || rethrow()
+                _sfail("`@scan` in a `@plate` cell: $(err.msg). A cell " *
+                       "recurrence writes its seeds and steps with `=`; " *
+                       "sampled seeds and steps per cell are not built yet")
+            end
+            append!(cells, stmts)
+        else
+            push!(cells, c)
+        end
+    end
+    return Expr(st.head, st.args[1:2]..., Expr(:for, loop.args[1], Expr(:block, cells...)))
+end
+
+_is_cell_scan_block(c) = Meta.isexpr(c, :macrocall) && length(c.args) >= 2 &&
+    c.args[1] === Symbol("@scan")
+
+# A cell local computed by a cell `@scan` fold (`scan(...) do … end`).
+_is_cell_scan_fold(c) = Meta.isexpr(c, :(=), 2) && Meta.isexpr(c.args[2], :do) &&
+    Meta.isexpr(c.args[2].args[1], :call) &&
+    c.args[2].args[1].args[1] == GlobalRef(ReactiveKernels, :scan)
 
 # Bare cell locals (`m = ...` inside the loop) of one plate, respelled
 # `m#k` when an earlier plate already used the name. Returns the plate
@@ -4139,14 +4176,16 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     # array per index too: its outputs and locals are such values for
     # later plates and definitions.
     reads_arrays = _plate_reads_array_entries(cells, ivar, arrays)
-    reads_arrays && union!(arrays, plate_defs)
+    # A cell `@scan` computes one trajectory per index.
+    scanned = any(_is_cell_scan_fold, cells)
+    (reads_arrays || scanned) && union!(arrays, plate_defs)
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
     params = Tuple{Symbol,Any,Union{Nothing,UnitRange{Int},Symbol,Expr},Int}[]
     selected = rkind[1] !== :levels && any(c -> c isa Expr &&
         (_is_sample(c) || _is_broadcast_sample(c)) &&
         Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
-    selected &&
+    (selected || scanned) &&
         return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             broadcasts)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
@@ -4807,11 +4846,19 @@ function _plate_column_call(ivar, locals, rhs, axis; indices=nothing, reads=())
 end
 
 # Value names an expression reads (call heads, `:` and keywords skipped).
+# A generator's iteration names and a lambda's arguments and assigned locals
+# (a `scan(...) do` step from a cell `@scan`) are local to them.
 function _cell_free_syms!(out::Set{Symbol}, ex)
     if ex isa Symbol
         ex === :(:) || ex === :end || push!(out, ex)
     elseif ex isa Expr
-        if ex.head === :call && !isempty(ex.args)
+        if ex.head === :generator
+            _generator_symbols!(_cell_free_syms!, out, ex)
+        elseif ex.head === :-> && length(ex.args) == 2
+            bound = _binder_symbols!(Set{Symbol}(), ex.args[1])
+            _lambda_assigned!(bound, ex.args[2])
+            union!(out, setdiff!(_cell_free_syms!(Set{Symbol}(), ex.args[2]), bound))
+        elseif ex.head === :call && !isempty(ex.args)
             foreach(a -> _cell_free_syms!(out, a), ex.args[2:end])
         elseif ex.head === :. && length(ex.args) == 2
             ex.args[2] isa Expr && foreach(a -> _cell_free_syms!(out, a),
@@ -4822,6 +4869,19 @@ function _cell_free_syms!(out::Set{Symbol}, ex)
             foreach(a -> _cell_free_syms!(out, a), ex.args)
         end
     end
+    return out
+end
+
+# Names a lambda body assigns (its locals), outside nested lambdas.
+_lambda_assigned!(out, ex) = out
+function _lambda_assigned!(out, ex::Expr)
+    ex.head === :-> && return out
+    if ex.head === :(=) && length(ex.args) == 2
+        lhs = ex.args[1]
+        Meta.isexpr(lhs, :(::)) && (lhs = lhs.args[1])
+        (lhs isa Symbol || Meta.isexpr(lhs, :tuple)) && _binder_symbols!(out, lhs)
+    end
+    foreach(a -> _lambda_assigned!(out, a), ex.args)
     return out
 end
 
@@ -7274,6 +7334,7 @@ end
 function _value_symbols!(out::Set{Symbol}, ex)
     ex isa Symbol && return push!(out, ex)
     ex isa Expr || return nothing
+    ex.head === :generator && return (_generator_symbols!(_value_symbols!, out, ex); nothing)
     # A keyword argument's name is not a value (`f(x; k = 4)`).
     ex.head === :kw && length(ex.args) == 2 &&
         return _value_symbols!(out, ex.args[2])

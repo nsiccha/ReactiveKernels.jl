@@ -1611,6 +1611,9 @@ ReactiveKernels._tensorized_scan_history_lowering(
 _scan_history_traced_buffer(fill::Number, n) = _scan_owned_buffer(Base.fill(fill, n))
 _scan_history_traced_buffer(fill::Reactant.TracedRNumber{T}, n) where {T} =
     Reactant.promote_to(Reactant.TracedRArray, zeros(T, n)) .+ fill
+_scan_history_traced_buffer(fill::AbstractVector, n) = throw(ArgumentError(
+    "a scan whose `history =` is a vector of leading entries is not built yet " *
+    "under Reactant; run it natively, or use a number `history = h0`"))
 _scan_history_traced_buffer(fill, n) =
     ReactiveKernels._scan_history_buffer(nothing, fill)  # throws: not a number
 
