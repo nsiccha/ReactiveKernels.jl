@@ -46,6 +46,7 @@ const _PPL_TEST_FILES = (
     "test_concurrent_build.jl",
     "test_fresh_module.jl",
     "test_program_identity.jl",
+    "test_preparation_identity.jl",
     "test_latest_native_source.jl",
     "test_surface.jl",
     "test_bound_model_entry_points.jl",

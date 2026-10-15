@@ -317,7 +317,11 @@ function _hidden_operand_leaf_names(
             push!(names, isempty(path) ? name : Symbol(join((name, path...), "_")))
         end
     end
-    _unique_symbols(names)
+    # These names enter the backend context's type. Private lowering names
+    # vary between otherwise identical builds; normalize them in the actual
+    # operand pack, whose positional field reads and values are unchanged.
+    canonical = _canonical_locals(Expr(:tuple, names...))
+    _unique_symbols(canonical.args)
 end
 
 _bound_leaf_paths(value::NamedTuple) = Tuple(

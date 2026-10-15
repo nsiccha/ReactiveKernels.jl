@@ -249,10 +249,10 @@ end
 struct _KernelProvenanceKey{Token} end
 
 # Graph assembly reads `recipe.op` as an unknown subtype of `_KernelSourceOp`.
-# The token comes from the op's type and fields are read with the `getfield`
-# builtin, so no reader is compiled again for every authored op type.
+# Read the token with the `getfield` builtin, without compiling a reader for
+# every authored operation type. Execution copies retain this same identity.
 Base.@nospecializeinfer _kernel_source_token(@nospecialize(op::_KernelSourceOp)) =
-    (typeof(op)::DataType).parameters[1]
+    getfield(op, :token)
 
 # Inverse recognition uses the callable retained when an exact call was
 # authored. Looking up a recipe's source binding later could observe a

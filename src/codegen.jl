@@ -2746,7 +2746,8 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     replacement = if spec === nothing
-        token, form = (typeof(r.op)::DataType).parameters
+        token = getfield(r.op, :token)
+        form = (typeof(r.op)::DataType).parameters[2]
         arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
             getfield(native, then ? :then_arm : :else_arm),
             getfield(tensor, then ? :then_arm : :else_arm))
@@ -5272,6 +5273,7 @@ Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
         @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing)
+    ops = _execution_source(ops)
     T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
                        typeof(lowered_recipes),exact_signature}
     _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
