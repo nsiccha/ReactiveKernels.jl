@@ -1141,10 +1141,13 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     # (`y = f(raw)`). `bind_data` evaluates the definition once and
     # validates its value as the response; a number is one observation, as
     # when bound as data. An ordinary `hcat` matrix value
-    # (`_route_hcat_values`) is observed as the same matrix bound as data.
+    # (`_route_hcat_values`) is observed as the same matrix bound as data,
+    # whether its columns give it observation rows (`:matrix`) or make it a
+    # model-level array (`hcat(v, w)` of whole-value data, `:array`).
     for nm in derived_response_names
         shape = get(detshape, nm, nothing)
-        shape === :scalar || (shape === :matrix && nm in matrix_values) || continue
+        shape === :scalar || (shape in (:matrix, :array) && nm in matrix_values) ||
+            continue
         rhs = detmap[nm]
         !isempty(_value_symbols(rhs)) && _data_only(rhs, data, detmap) &&
             (detshape[nm] = :vector)
