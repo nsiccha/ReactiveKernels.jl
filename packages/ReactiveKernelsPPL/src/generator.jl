@@ -139,8 +139,8 @@ end
 # between lowerings) renamed in order of first appearance. References owned
 # by a gensym-created lowering module get the same treatment: the module is an
 # isolation namespace, not part of the emitted program. Stable named modules
-# remain part of the identity. Two bindings generate the same program exactly
-# when these are equal.
+# remain part of the identity. Compare the results with `_same_program`:
+# Julia's Expr equality need not compare embedded array literals by value.
 function _program_identity(def)
     names = Dict{Symbol,Symbol}()
     modules = IdDict{Module,Symbol}()
@@ -153,6 +153,18 @@ function _program_identity(def)
     rename(x) = x
     return rename(def)
 end
+
+# Missing-observation guards contain freshly allocated quoted Bool arrays.
+# On Julia 1.13, Expr/QuoteNode equality compares such literals by object
+# identity. Their type, shape and contents determine this read-only program;
+# allocation identity does not. Types still matter for dispatch, and symbols
+# inside quoted data are not private bindings to rename.
+_same_program(x, y) = typeof(x) === typeof(y) && isequal(x, y)
+_same_program(x::QuoteNode, y::QuoteNode) = _same_program(x.value, y.value)
+_same_program(x::Expr, y::Expr) = x.head === y.head &&
+    length(x.args) == length(y.args) && all(_same_program(a, b) for (a, b) in zip(x.args, y.args))
+_same_program(x::Array, y::Array) = typeof(x) === typeof(y) &&
+    axes(x) == axes(y) && all(_same_program(a, b) for (a, b) in zip(x, y))
 
 # The source surface admits ordinary dotted scalar math, but an opaque array
 # assignment hides each producer from RK's plate-to-plate reduction fusion.
