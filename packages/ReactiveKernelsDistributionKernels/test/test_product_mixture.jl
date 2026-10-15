@@ -52,7 +52,8 @@ end
 
 # Independent 512-bit reference for the logit-scale laws: each cell is the
 # exact Bernoulli or Binomial log mass at logit `l`, and the outer fold is a
-# log-sum-exp over weighted component sums.
+# log-sum-exp over weighted component sums. The coefficient is spelled
+# `Base.binomial`: `runtests.jl` imports DK's `binomial` kernel object.
 function product_mixture_logit_reference(cell, observed, args, weights)
     setprecision(BigFloat, 512) do
         scores = [log(big(weights[k])) +
@@ -64,7 +65,7 @@ function product_mixture_logit_reference(cell, observed, args, weights)
     end
 end
 bernoulli_logit_reference_cell(y, l) = y ? -log1p(exp(-big(l))) : -log1p(exp(big(l)))
-binomial_logit_reference_cell(y, n, l) = log(binomial(big(n), big(y))) +
+binomial_logit_reference_cell(y, n, l) = log(Base.binomial(big(n), big(y))) +
     (y == 0 ? big(0.0) : y * -log1p(exp(-big(l)))) +
     (y == n ? big(0.0) : (n - y) * -log1p(exp(big(l))))
 

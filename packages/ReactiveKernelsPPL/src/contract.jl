@@ -3088,6 +3088,11 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
             return _collect_opaque_refs!(refs, ex, plan, label, bound)
         _is_data_matvec(ex, plan) &&
             return _collect_data_matvec!(refs, ex, plan, label, bound)
+        if _is_computed_row_product(ex, plan)
+            _collect_vector_refs!(refs, ex.args[2], plan, label, bound)
+            _collect_opaque_refs!(refs, ex.args[3], plan, label, bound)
+            return nothing
+        end
         if fn isa GlobalRef
             # An undotted module call inside a column expression is a
             # model-level subterm over whole values.
@@ -3120,6 +3125,12 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
                             "IR/contract growth")
     end
     head === :. && return _collect_vector_dot!(refs, ex, plan, label, bound)
+    if head === Symbol("'") && length(ex.args) == 1
+        # Julia's adjoint: `alpha1'` turns a model-level vector into a 1×J
+        # row that broadcasts against a per-observation N×J value.
+        _collect_vector_refs!(refs, ex.args[1], plan, label, bound)
+        return nothing
+    end
     if _is_observation_slice(plan, ex)
         # `P[:, 1]` keeps every row of a per-observation value: n_obs.
         _collect_vector_refs!(refs, ex.args[1], plan, label, bound)
@@ -6576,11 +6587,46 @@ _constructed_endpoint_call(ex) =
     Meta.isexpr(ex, :call) && !isempty(ex.args) &&
     _constructed_endpoint_head(ex.args[1])
 
+# The names a generator (`f(s) for s in r if c`) reads: its ranges, and its
+# body and filters minus the iteration names it binds. `walk(set, ex)` adds
+# the names of `ex` to `set`.
+function _generator_symbols!(walk, out::Set{Symbol}, ex::Expr)
+    inner = Set{Symbol}()
+    binders = Set{Symbol}()
+    for it in ex.args[2:end]
+        iters = it
+        if Meta.isexpr(it, :filter) && !isempty(it.args)
+            walk(inner, it.args[1])
+            iters = Expr(:block, it.args[2:end]...)
+        else
+            iters = Expr(:block, it)
+        end
+        for i in iters.args
+            if Meta.isexpr(i, :(=)) && length(i.args) == 2
+                walk(out, i.args[2])
+                _binder_symbols!(binders, i.args[1])
+            else
+                walk(out, i)
+            end
+        end
+    end
+    walk(inner, ex.args[1])
+    union!(out, setdiff(inner, binders))
+    return out
+end
+
+_binder_symbols!(out::Set{Symbol}, b::Symbol) = push!(out, b)
+_binder_symbols!(out::Set{Symbol}, b::Expr) =
+    (foreach(a -> _binder_symbols!(out, a), b.args); out)
+_binder_symbols!(out::Set{Symbol}, b) = out
+
 function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
     if ex isa Symbol
         push!(out, ex)
     elseif ex isa Expr
-        if ex.head === :kw && length(ex.args) == 2
+        if ex.head === :generator
+            _generator_symbols!((o, e) -> _expr_value_symbols(e, o), out, ex)
+        elseif ex.head === :kw && length(ex.args) == 2
             _expr_value_symbols(ex.args[2], out)
         elseif ex.head === :call
             if !isempty(ex.args) && _constructed_endpoint_head(ex.args[1])
@@ -7226,7 +7272,7 @@ function _materialize_module_data!(plan::StructuralPlan,
     isempty(names) && return names
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     for d in plan.derived
-        exprs[d.name] = _guard_missing_observation_argument(d.name, d.expr, plan, columns)
+        exprs[d.name] = d.expr
     end
     vector_defs = Set{Symbol}(d.name for d in plan.derived)
     memo = Dict{Symbol,Any}()
@@ -7238,7 +7284,13 @@ function _materialize_module_data!(plan::StructuralPlan,
         haskey(columns, nm) && return columns[nm]
         haskey(exprs, nm) || throw(ContractValidationError(
             "[bind] data definition reads $nm, which is not bound data"))
-        memo[nm] = _eval_value_expr(exprs[nm], lookup, nm; calls)
+        # A derived definition evaluated here gets its missing-observation
+        # guard now, when the responses it reads are bound. Guarding every
+        # derived definition up front read a response that is itself a data
+        # definition before it was materialized.
+        ex = nm in vector_defs ?
+            _guard_missing_observation_argument(nm, exprs[nm], plan, columns) : exprs[nm]
+        memo[nm] = _eval_value_expr(ex, lookup, nm; calls)
         return memo[nm]
     end
     for nm in sort!(collect(names))

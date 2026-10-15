@@ -1114,6 +1114,20 @@ function _is_data_matvec(ex, plan::StructuralPlan)
     return rows && _mentions_array(w, plan)
 end
 
+# `D * w`: a per-observation value the graph computes (`hidden =
+# tanh.(x * W)`, named or inline) times a model-level value. Julia's
+# product contracts `D`'s columns and keeps its rows, one per observation,
+# as for a bound data matrix (`B * w` above); `w` is read whole. The
+# dimensions are checked where Julia computes the product.
+function _is_computed_row_product(ex, plan::StructuralPlan)
+    ex isa Expr && ex.head === :call && length(ex.args) == 3 &&
+        ex.args[1] === :* || return false
+    D, w = ex.args[2], ex.args[3]
+    computed = D isa Symbol ? _is_derived(plan, D) && !_is_bind_data_derived(plan, D) :
+        _is_vector_valued(D, plan)
+    return computed && !_is_vector_valued(w, plan)
+end
+
 # A derived column the model computes at bind from data alone (a module
 # call reading only raw columns or other such columns): bound data, so
 # its value may be a matrix with one row per observation.
