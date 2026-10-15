@@ -264,8 +264,18 @@ when taken, and a data-bound branch still splits per arm at preparation. The
 copy is one `let` over the endpoint's own value names,
 `let log_scale = log(s), standardized = (x - 0.0) / s; … end`. An
 endpoint whose lowered form binds locals, runs a plate or scan, or reads a
-non-`Base` global is rejected at authoring time with an action to hoist the
-call above the branch, where it splices as usual.
+non-`Base` global is rejected at authoring time with an action to call it in
+its own recipe, where it splices as usual.
+
+The same in-place copy serves an endpoint call inside a generator term,
+comprehension, closure, `do` block, local function, loop, `let` or `try`
+body. Julia evaluates such a position zero or more times, and it may read
+the names its scope binds, so the endpoint stays where it is written:
+`sum(normal(m[s], 1.0).logpdf(x[1]) for s in eachindex(m); init = 0.0)`
+evaluates one endpoint per element and reads that element's `m[s]`, and a
+bare scope-bound name such as `normal(m[s], s)` is read in place too. A
+generator `sum` with `init` over such terms still runs as one explicit loop
+natively, as for any other term.
 
 Inside an object's own method bodies, a straight-position call of a sibling,
 a bound child or `inv` splices the same way. In a lazy arm, or with an
