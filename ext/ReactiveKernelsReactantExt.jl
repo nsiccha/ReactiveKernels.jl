@@ -1614,6 +1614,9 @@ _scan_history_traced_buffer(fill::Reactant.TracedRNumber{T}, n) where {T} =
 _scan_history_traced_buffer(fill::AbstractVector, n) = throw(ArgumentError(
     "a scan whose `history =` is a vector of leading entries is not built yet " *
     "under Reactant; run it natively, or use a number `history = h0`"))
+_scan_history_traced_buffer(fill::NamedTuple, n) = throw(ArgumentError(
+    "a scan whose `history =` has named columns is not built yet under " *
+    "Reactant; run it natively"))
 _scan_history_traced_buffer(fill, n) =
     ReactiveKernels._scan_history_buffer(nothing, fill)  # throws: not a number
 

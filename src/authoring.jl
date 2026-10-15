@@ -5747,6 +5747,12 @@ the last argument is that whole vector, with entries not written yet at
 and earlier steps from one vector. Native only; the Reactant lowering refuses
 it.
 
+With `history = (a = leading_a, b = leading_b, ...)`, each named column uses
+the number or vector semantics above independently. The last argument and
+the scan result are named tuples of column vectors; the step returns a named
+tuple of scalar outputs with those same names. Each vector seed contributes
+its own prefix, and each column retains its seed's element type. Native only.
+
 It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
 loop under Reactant — so a natural sequential recurrence lowers without unrolling
 into forbidden scalar indexing. This is `@kernel` authoring sugar recognized by

@@ -97,8 +97,9 @@ end
 
 One carried array with one seed prepares exactly `a = scan(2:length(x);
 init = s, include_init = true) do a_prev, t … end`. Several carried arrays
-(a `level` driven by an `increment`, say) are folded by one scan each, with
-their seeds prepended.
+(a `level` driven by an `increment`, say) share one scan. Its step returns
+all columns together; retained projection plates expose each trajectory with
+its seeds prepended. Requesting several trajectories does not replay the step.
 
 ### Reading earlier entries
 
@@ -129,10 +130,11 @@ end
   `history = [<its seeds>…]`, whose step reads the trajectory written so far
   (see [Reading earlier outputs](#Reading-earlier-outputs)). Its seeds and
   outputs live in one vector, which is also the result.
-- Several carried arrays are produced one scan each, in an order where every
-  array whose history another one reads is finished first; that scan then
-  reads the finished trajectory. Each scan runs only the statements its array
-  needs. Two arrays that read each other's earlier entries are not built yet.
+- Several carried arrays share one scan with a named history buffer per array.
+  The step executes once in source order and can read every column's earlier
+  entries, including mutually dependent histories. Current-step reads still
+  require an earlier write in the step. The graph exposes each trajectory
+  separately, and separately authored scans remain independent.
 - A `@scan` inside a `@plate for` cell runs one such recurrence per index, as
   an RK scan retained inside the plate. Native values and ordinary Enzyme
   reverse gradients are supported; a vector `history` is not built under
@@ -318,6 +320,12 @@ end
   a separate seed vector and the outputs would make native Enzyme reverse need
   runtime activity when the seeds are constants. Natively only: the Reactant
   lowering refuses a vector `history`.
+- A named tuple `history = (a = a_seeds, b = b_seeds)` returns a named tuple
+  of trajectory vectors. The step receives matching read-only columns
+  (`earlier.a`, `earlier.b`) and returns a named tuple of outputs with the same
+  keys. Each column follows the scalar-fill or leading-vector rules above;
+  its element type and seed offset are independent of the other columns.
+  This form supports coupled trajectories natively.
 - The history is read-only and belongs to its step. An indexed write in a
   step is rejected when the kernel is defined, the native view has no
   `setindex!`, and a carry that holds it is an `ArgumentError`: natively it is
@@ -565,9 +573,10 @@ Native iteration remains an ordinary loop.
 - **Per-step output is a scalar** on the Reactant `while` path. A non-scalar
   per-step output there is a loud, reported error, never a silent mis-lowering;
   author the output as a scalar (or open an issue for the shape you need).
-- **`history` holds a number or leading entries, and excludes `include_init`.**
-  Its value is a number or a vector of leading entries (native only), and it
-  cannot be combined with `include_init = true`.
+- **`history` excludes `include_init`.** Its value is a number, a vector of
+  leading entries, or a named tuple of such columns. Leading vectors and
+  named columns are native only. It cannot be combined with
+  `include_init = true`.
 - **A directly iterated N-D array is rejected** on the Reactant path (its
   native semantics are linear element iteration); iterate `eachrow(M)` or
   `vec(M)` explicitly.

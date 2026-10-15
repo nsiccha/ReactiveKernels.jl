@@ -195,6 +195,18 @@ end
 
 _history_has_reads(reads) = any(r -> !isempty(r.history), reads)
 
+# Both front ends expose one recurrence result through named columns. The
+# projection is itself a transparent, retained plate, not a replay of the step.
+_scan_named_tuple_expr(names, value) = Expr(:tuple,
+    (Expr(:(=), name, value(name)) for name in names)...)
+
+function _scan_column_expr(rows, name)
+    row = gensym(:scan_row)
+    Expr(:do, Expr(:call, GlobalRef(@__MODULE__, :plate), rows),
+        Expr(:(->), Expr(:tuple, row),
+            Expr(:block, Expr(:., row, QuoteNode(name)))))
+end
+
 # The statements a fold executes: those producing `output` (or every sampled
 # statement, for a density fold with `output === nothing`) and everything they
 # read, except arrays already `completed`. `nothing` when an executed
@@ -231,31 +243,6 @@ function _history_fold_closure(statements, reads, output, completed)
     end
     return exec
 end
-
-# The order in which the carried arrays are produced, each with the
-# statements its fold executes, or `nothing` when some arrays read one
-# another's earlier entries (no fold can produce either first). Among the
-# feasible arrays the one with the fewest statements goes first.
-function _history_fold_order(states, statements, reads)
-    completed = Set{Symbol}()
-    order = Tuple{Symbol,Set{Int}}[]
-    while length(order) < length(states)
-        best = nothing
-        for a in states
-            a in completed && continue
-            exec = _history_fold_closure(statements, reads, a, completed)
-            exec === nothing && continue
-            (best === nothing || length(exec) < length(best[2])) && (best = (a, exec))
-        end
-        best === nothing && return nothing
-        push!(order, best)
-        push!(completed, best[1])
-    end
-    return order
-end
-
-# Does the fold executing `exec` read `a`'s earlier entries?
-_history_fold_reads_own(reads, exec, a) = any(i -> a in reads[i].history, exec)
 
 # Rebuild generator `gen`: each range maps through `range(ex, env)` in the
 # environment of the clauses before it, and the body and filters through
