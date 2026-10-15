@@ -1,5 +1,6 @@
 using Pkg
 using TOML
+include(joinpath(@__DIR__, "..", "deps", "source_dependencies.jl"))
 
 # Pkg.test installs every test extra, including Reactant. Build the native
 # acceptance environment from the same dependency UUIDs and compat bounds,
@@ -22,11 +23,11 @@ open(joinpath(env, "Project.toml"), "w") do io
     TOML.print(io, Dict("deps" => deps, "compat" => compat))
 end
 Pkg.activate(env)
-Pkg.develop([
+Pkg.develop([PackageSpec[
     PackageSpec(path = root),
     PackageSpec(path = joinpath(@__DIR__, "ReactiveKernelsDistributionKernels")),
     PackageSpec(path = ppl),
-])
+]; rk_source_dependencies()])
 Pkg.instantiate()
 Pkg.precompile()
 println("Native PPL acceptance environment: Julia ", VERSION)

@@ -35,11 +35,15 @@ function _call_value_info(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
     # particular integer bases with negative literal powers produce floats;
     # the ordinary ^ call can throw instead. Normalize syntax, not a guessed
     # numerical rule, and keep alias calls (pow(x, n)) as ordinary calls.
-    if f === Base.:^ && ex.head === :call && length(ex.args) == 3 &&
-            ex.args[1] in (:^, Symbol(".^")) && ex.args[3] isa Integer
+    callee = first(ex.args)
+    power_syntax = callee in (:^, Symbol(".^")) ||
+        (callee isa GlobalRef && callee.name === :^)
+    operands = ex.head === :call ? ex.args[2:end] :
+        Meta.isexpr(ex, :., 2) && Meta.isexpr(ex.args[2], :tuple) ? ex.args[2].args : ()
+    if f === Base.:^ && power_syntax && length(operands) == 2 && operands[2] isa Integer
         f = Base.literal_pow
         args = OutputSignatures.ValueInfo[OutputSignatures.known_info(Base.:^),
-            args[1], OutputSignatures.known_info(Val(ex.args[3]))]
+            args[1], OutputSignatures.known_info(Val(operands[2]))]
     end
     result = if broadcasted
         isempty(kwargs) || return OutputSignatures.ValueInfo()

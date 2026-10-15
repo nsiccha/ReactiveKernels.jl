@@ -1,0 +1,318 @@
+{
+  "purpose": "Single-run compiler-cost regression check; not a speedup benchmark or provider-capacity estimate.",
+  "host": "strato2",
+  "julia": "1.13.1",
+  "julia_threads": 1,
+  "blas_threads": 1,
+  "check_bounds": "yes",
+  "backend": "AutoEnzyme(mode=Enzyme.Reverse)",
+  "case_order": "width 1 then 4, n 8 then 256; first row is first use in each fresh process, later rows reuse that process",
+  "baseline_sha": "db79347719010b5ef45b0f6fe3574635f7136ff3",
+  "candidate_sha": "75127404fa90665c13ad9f88512f79d0e231fc59",
+  "outputsignatures_sha": "5ecdead11eb8bbae599629a1c3119c5f403d45a1",
+  "dependency_difference": "Only OutputSignatures added; all existing dependency versions and git tree hashes matched.",
+  "versions": {
+    "Enzyme": "0.13.216",
+    "Enzyme_jll": "0.0.303+0",
+    "DifferentiationInterface": "0.7.21",
+    "Distributions": "0.25.131",
+    "StaticArrays": "1.9.23",
+    "ReactantCore": "0.1.26",
+    "OutputSignatures": "0.1.1"
+  },
+  "baseline_manifest_sha256": "2c9325d1731c3a87c5f4ef31c5787a564ce8f8b9f01bec34af6b6d3d5002fd9f",
+  "candidate_manifest_sha256": "4b5e135be01bc4566ed24adada430d166d9279773a064e1aca23e3d8149a31e8",
+  "assertions_per_run": 32,
+  "baseline": [
+    {
+      "n": 8,
+      "emitted_nodes": 238,
+      "width": 1,
+      "emitted_bytes": 1861,
+      "build": {
+        "seconds": 17.056763008,
+        "bytes": 828619712,
+        "compile_seconds": 16.940124715
+      },
+      "construction": {
+        "seconds": 11.886924591,
+        "bytes": 1043216672,
+        "compile_seconds": 11.876213211
+      },
+      "first_derivative": {
+        "seconds": 21.339562158,
+        "bytes": 1567522040,
+        "compile_seconds": 21.339504198
+      },
+      "first_primal": {
+        "seconds": 0.268892092,
+        "bytes": 43548192,
+        "compile_seconds": 0.268848592
+      },
+      "ad_preparation": {
+        "seconds": 5.170350401,
+        "bytes": 252266200,
+        "compile_seconds": 5.155282063
+      },
+      "preparation": {
+        "seconds": 6.418910325,
+        "bytes": 382262472,
+        "compile_seconds": 6.393676774
+      }
+    },
+    {
+      "n": 256,
+      "emitted_nodes": 238,
+      "width": 1,
+      "emitted_bytes": 1861,
+      "build": {
+        "seconds": 0.24285635,
+        "bytes": 16590816,
+        "compile_seconds": 0.106035542
+      },
+      "construction": {
+        "seconds": 0.002335269,
+        "bytes": 806384,
+        "compile_seconds": 0.0
+      },
+      "first_derivative": {
+        "seconds": 0.469432285,
+        "bytes": 54844136,
+        "compile_seconds": 0.469355348
+      },
+      "first_primal": {
+        "seconds": 0.124470504,
+        "bytes": 22883928,
+        "compile_seconds": 0.124389833
+      },
+      "ad_preparation": {
+        "seconds": 2.72384476,
+        "bytes": 61734584,
+        "compile_seconds": 2.712741595
+      },
+      "preparation": {
+        "seconds": 1.08346864,
+        "bytes": 25608088,
+        "compile_seconds": 1.07066369
+      }
+    },
+    {
+      "n": 8,
+      "emitted_nodes": 252,
+      "width": 4,
+      "emitted_bytes": 1896,
+      "build": {
+        "seconds": 0.206512677,
+        "bytes": 16966576,
+        "compile_seconds": 0.106891459
+      },
+      "construction": {
+        "seconds": 0.001750453,
+        "bytes": 1022400,
+        "compile_seconds": 0.0
+      },
+      "first_derivative": {
+        "seconds": 0.526700225,
+        "bytes": 75635864,
+        "compile_seconds": 0.52663129
+      },
+      "first_primal": {
+        "seconds": 0.156315827,
+        "bytes": 25474696,
+        "compile_seconds": 0.156280648
+      },
+      "ad_preparation": {
+        "seconds": 2.976325717,
+        "bytes": 69667312,
+        "compile_seconds": 2.965638052
+      },
+      "preparation": {
+        "seconds": 2.091290885,
+        "bytes": 49649208,
+        "compile_seconds": 2.076688173
+      }
+    },
+    {
+      "n": 256,
+      "emitted_nodes": 252,
+      "width": 4,
+      "emitted_bytes": 1896,
+      "build": {
+        "seconds": 0.187765452,
+        "bytes": 16928544,
+        "compile_seconds": 0.08999791
+      },
+      "construction": {
+        "seconds": 0.001773635,
+        "bytes": 1022400,
+        "compile_seconds": 0.0
+      },
+      "first_derivative": {
+        "seconds": 0.424274962,
+        "bytes": 61234552,
+        "compile_seconds": 0.424191116
+      },
+      "first_primal": {
+        "seconds": 0.12456114,
+        "bytes": 25028264,
+        "compile_seconds": 0.124527683
+      },
+      "ad_preparation": {
+        "seconds": 3.131063777,
+        "bytes": 66226360,
+        "compile_seconds": 3.11979535
+      },
+      "preparation": {
+        "seconds": 1.21979612,
+        "bytes": 30047824,
+        "compile_seconds": 1.207785387
+      }
+    }
+  ],
+  "candidate": [
+    {
+      "n": 8,
+      "emitted_nodes": 238,
+      "width": 1,
+      "emitted_bytes": 1861,
+      "build": {
+        "seconds": 16.418170725,
+        "bytes": 833621432,
+        "compile_seconds": 16.302613503
+      },
+      "construction": {
+        "seconds": 12.444923144,
+        "bytes": 1043206544,
+        "compile_seconds": 12.433458354
+      },
+      "first_derivative": {
+        "seconds": 21.149083868,
+        "bytes": 1567487936,
+        "compile_seconds": 21.14902672
+      },
+      "first_primal": {
+        "seconds": 0.241655417,
+        "bytes": 43549008,
+        "compile_seconds": 0.241605278
+      },
+      "ad_preparation": {
+        "seconds": 5.180556649,
+        "bytes": 252256864,
+        "compile_seconds": 5.164643708
+      },
+      "preparation": {
+        "seconds": 7.040701272,
+        "bytes": 382330144,
+        "compile_seconds": 7.01389961
+      }
+    },
+    {
+      "n": 256,
+      "emitted_nodes": 238,
+      "width": 1,
+      "emitted_bytes": 1861,
+      "build": {
+        "seconds": 0.204723203,
+        "bytes": 16594408,
+        "compile_seconds": 0.108502541
+      },
+      "construction": {
+        "seconds": 0.002098658,
+        "bytes": 806384,
+        "compile_seconds": 0.0
+      },
+      "first_derivative": {
+        "seconds": 0.36036429,
+        "bytes": 54788792,
+        "compile_seconds": 0.360301703
+      },
+      "first_primal": {
+        "seconds": 0.12059004,
+        "bytes": 22883928,
+        "compile_seconds": 0.120512823
+      },
+      "ad_preparation": {
+        "seconds": 2.732998602,
+        "bytes": 61833528,
+        "compile_seconds": 2.722557661
+      },
+      "preparation": {
+        "seconds": 1.079164464,
+        "bytes": 25627168,
+        "compile_seconds": 1.066490752
+      }
+    },
+    {
+      "n": 8,
+      "emitted_nodes": 252,
+      "width": 4,
+      "emitted_bytes": 1896,
+      "build": {
+        "seconds": 0.176550705,
+        "bytes": 16970168,
+        "compile_seconds": 0.08583588
+      },
+      "construction": {
+        "seconds": 0.001504397,
+        "bytes": 1022400,
+        "compile_seconds": 0.0
+      },
+      "first_derivative": {
+        "seconds": 0.519190055,
+        "bytes": 75537336,
+        "compile_seconds": 0.51913582
+      },
+      "first_primal": {
+        "seconds": 0.160115638,
+        "bytes": 25472608,
+        "compile_seconds": 0.160083773
+      },
+      "ad_preparation": {
+        "seconds": 3.09638184,
+        "bytes": 69652672,
+        "compile_seconds": 3.085263704
+      },
+      "preparation": {
+        "seconds": 1.838409184,
+        "bytes": 49547824,
+        "compile_seconds": 1.826258137
+      }
+    },
+    {
+      "n": 256,
+      "emitted_nodes": 252,
+      "width": 4,
+      "emitted_bytes": 1896,
+      "build": {
+        "seconds": 0.190089332,
+        "bytes": 16931496,
+        "compile_seconds": 0.089682214
+      },
+      "construction": {
+        "seconds": 0.001468278,
+        "bytes": 1022400,
+        "compile_seconds": 0.0
+      },
+      "first_derivative": {
+        "seconds": 0.474552688,
+        "bytes": 61185920,
+        "compile_seconds": 0.474452511
+      },
+      "first_primal": {
+        "seconds": 0.123782649,
+        "bytes": 25028264,
+        "compile_seconds": 0.123750194
+      },
+      "ad_preparation": {
+        "seconds": 3.116386779,
+        "bytes": 66225104,
+        "compile_seconds": 3.105329842
+      },
+      "preparation": {
+        "seconds": 1.185642825,
+        "bytes": 30057888,
+        "compile_seconds": 1.173293311
+      }
+    }
+  ]
+}

@@ -19,6 +19,8 @@ function rk_source_dependencies(; project = joinpath(@__DIR__, "..", "Project.to
         end
         actual = strip(read(`git -C $path rev-parse HEAD`, String))
         actual == revision || error("$name source checkout has $actual; expected $revision")
+        isempty(read(`git -C $path status --porcelain`, String)) ||
+            error("$name source checkout has local changes: $path")
         push!(specs, PackageSpec(path=path))
     end
     return specs

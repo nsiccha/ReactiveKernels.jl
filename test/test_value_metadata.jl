@@ -58,6 +58,9 @@ end
     end
     # A normal call through an alias is not Julia's literal-power syntax.
     @test OS.type_bound(info(:(pow_alias(a, -1)), bindings)) === Int8
+    @test OS.type_bound(info(:(Base.:^(a, -1)), bindings)) === Int8
+    @test OS.type_bound(info(:( (^).(x, -1) ), bindings)) === Vector{Float64}
+    @test OS.type_bound(info(Expr(:call, GlobalRef(Base, :^), :a, -1), bindings)) === Float64
     @test OS.type_bound(info(:(a ^ n), bindings)) === Int8
 end
 

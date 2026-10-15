@@ -70,6 +70,11 @@ its numerical duplicate and acceptance examples before expanding the interface.
 The runnable [`benchmark/compiler_metadata_slice.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/compiler_metadata_slice.jl)
 shows the complete model, query/gradient interaction and separate timing stages;
 `test/test_value_metadata.jl` exercises the corresponding kernel directly.
+The [recorded comparison](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/results/compiler_metadata_slice_20261015.json)
+pins the isolated before/after trees and dependency versions. Both runs pass
+32 value/gradient checks. Emitted size is unchanged at 238/252 nodes for the
+two expression widths, at both 8 and 256 observations. These are single-run
+compiler-cost checks, not evidence of a speedup.
 
 ## API map
 

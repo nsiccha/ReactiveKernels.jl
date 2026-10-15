@@ -1,7 +1,7 @@
 name = "ReactiveKernels"
 uuid = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
 authors = ["Nikolas Siccha <nikolassiccha@gmail.com>"]
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
 DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
