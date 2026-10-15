@@ -176,3 +176,63 @@ end
             sum(D.logpdf.(D.Normal.(q.x, 1), data.y); init=0.0))
     end
 end
+
+@testset "array priors bound Flat and half bases" begin
+    # `restricted.(Flat.(), 0, Inf)` is one flat positive scale per element,
+    # exactly the three scalar declarations it abbreviates.
+    y = [-0.7, 0.2, 0.6, 1.1]
+    r = _restriction_check(quote
+        sigma[1:3] .~ restricted.(Flat.(), 0, Inf)
+        y .~ Normal.(0, sigma[1] + sigma[2] + sigma[3])
+    end, (; y), (sigma=[0.3, 0.5, 0.9],), q ->
+        sum(D.logpdf.(D.Normal(0, sum(q.sigma)), y)))
+    s = _restriction_check(quote
+        s1 ~ restricted(Flat(), 0, Inf)
+        s2 ~ restricted(Flat(), 0, Inf)
+        s3 ~ restricted(Flat(), 0, Inf)
+        y .~ Normal.(0, s1 + s2 + s3)
+    end, (; y), (s1=0.3, s2=0.5, s3=0.9), q ->
+        sum(D.logpdf.(D.Normal(0, q.s1 + q.s2 + q.s3), y)))
+    @test r.u ≈ s.u atol=1e-14
+    @test r.value ≈ s.value atol=1e-12
+    @test r.gradient ≈ s.gradient atol=1e-12
+    # Live shared bounds over a data-sized axis, empty included.
+    for n in (0, 3, 9)
+        expr = quote
+            a ~ Normal(0, 1)
+            hi = 2 + exp(a)
+            x[axes(rows, 1)] .~ restricted.(Flat.(), a, hi)
+        end
+        _restriction_check(expr, (; rows=zeros(n)), (a=0.2, x=fill(0.4, n)),
+            q -> D.logpdf(D.Normal(), q.a))
+    end
+    # Half bases keep their normalized half density (`+log(2)`) under
+    # `restricted` and renormalize over the bounds under `truncated`; a
+    # computed scale stays live.
+    for (wrapper, base) in ((:HalfNormal, D.Normal), (:HalfCauchy, D.Cauchy))
+        values = (s=0.7, x=[0.3, 0.9, 1.6])
+        _restriction_check(quote
+            s ~ Exponential(1)
+            x[1:3] .~ restricted.($wrapper.(2 * s), 0.2, 2)
+        end, (;), values, q -> D.logpdf(D.Exponential(1), q.s) +
+            sum(D.logpdf.(base(0, 2q.s), q.x)) + 3log(2))
+        _restriction_check(quote
+            s ~ Exponential(1)
+            x[1:3] .~ truncated.($wrapper.(2 * s), 0.2, 2)
+        end, (;), values, q -> D.logpdf(D.Exponential(1), q.s) +
+            sum(D.logpdf.(D.truncated(base(0, 2q.s), 0.2, 2), q.x)))
+    end
+    # refused: `truncated` divides by the base mass inside the bounds, which an
+    # improper `Flat()` lacks; `restricted.(Flat.(), lo, hi)` is the flat kernel.
+    err = try
+        lower_rkppl(quote
+            x[1:3] .~ truncated.(Flat.(), 0, Inf)
+            y .~ Normal.(x[1], 1)
+        end, (; y=[0.2]); conditioned=(:y,))
+        nothing
+    catch e
+        e
+    end
+    @test err isa SurfaceLoweringError
+    @test occursin("`truncated` needs a proper distribution", sprint(showerror, err))
+end

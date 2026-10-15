@@ -5722,6 +5722,13 @@ with `j` from a lockstep `eachindex(xs)`) needs no carried copy of them. The
 result's element type is `typeof(h0)`. A carry may not hold the history, and
 `history` cannot be combined with `include_init = true`.
 
+With `history = leading` (a vector), the result starts with those entries:
+it is `[leading; output…]`, step `j` writes entry `length(leading) + j`, and
+the last argument is that whole vector, with entries not written yet at
+`zero(eltype(leading))`. A recurrence seeded with `a[1:m]` thus reads its seeds
+and earlier steps from one vector. Native only; the Reactant lowering refuses
+it.
+
 It lowers to an ordinary ordered loop natively, and to a `stablehlo.while` carry
 loop under Reactant — so a natural sequential recurrence lowers without unrolling
 into forbidden scalar indexing. This is `@kernel` authoring sugar recognized by

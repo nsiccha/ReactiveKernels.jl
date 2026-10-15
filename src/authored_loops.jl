@@ -337,11 +337,15 @@ end
 Loop syntax for an authored scan inside a `@kernel` body. Every array the loop
 writes at `t` is carried: it is seeded at `1..m` before the loop (the same depth
 for every carried array), each step writes it once, and the step reads earlier
-values through literal lags `a[t - k]` (`1 ≤ k ≤ m`) and the current value
-`a[t]` after its write. Other values are read as closures. The result `a` is the
-whole trajectory `[a[1], …, a[T]]`. One carried array with one seed prepares the
-same kernel as `a = scan(2:T; init = seed, include_init = true) do a_prev, t …
-end`; several carried arrays are folded by one scan each.
+values through literal lags `a[t - k]` (`1 ≤ k ≤ m`), the current value `a[t]`
+after its write, and any earlier entry whose index provably lies in
+`1:(t - 1)`: `a[s]` or `a[t - s]` under a generator `for s in 1:(t - 1)`, or a
+window `a[(t - k):(t - 1)]`. Other values are read as closures. The result `a`
+is the whole trajectory `[a[1], …, a[T]]`. One carried array with one seed
+prepares the same kernel as `a = scan(2:T; init = seed, include_init = true) do
+a_prev, t … end`; several carried arrays are folded by one scan each. An array
+that reads its own earlier entries scans with `history = [<its seeds>…]`
+(`docs/src/scan.md`, "Reading earlier entries").
 """
 macro scan(args...)
     throw(ArgumentError(
@@ -428,6 +432,12 @@ function _kernel_scan_loop_statements(statement::Expr, mod, line)
         name in writes || throw(ArgumentError(
             "`@scan` seeds `$name` but its loop never writes `$name[$index]`"))
     end
+
+    summaries = _kernel_scan_statement_summaries(statements, index)
+    reads = _history_statement_reads(carried, index, last.(summaries))
+    _history_has_reads(reads) && return append!(result,
+        _kernel_scan_history_folds(statements, summaries, reads, index, domain,
+            carried, depth, seed_names, fresh, mod, line))
 
     scalar = length(carried) == 1 && depth == 1
     carry = scalar ? fresh(Symbol(only(carried), :_prev)) : fresh(:carry)
@@ -518,15 +528,24 @@ function _kernel_scan_write(st, index)
 end
 
 # Rewrite carried reads in a step: `a[t - k]` reads the carry, `a[t]` the value
-# this step already wrote. Any other read of a carried array is refused.
-function _kernel_scan_rewrite(ex, index, carried, depth, lag, step_locals, written)
+# this step already wrote. With a history context `ctx`, an array produced by an
+# earlier fold (`ctx.completed`) is read from its finished trajectory, and an
+# entry provably before `t` of the fold's own array (`ctx.own`) from its seeds
+# and the scan's `history` argument. Any other read of a carried array is
+# refused.
+function _kernel_scan_rewrite(ex, index, carried, depth, lag, step_locals, written;
+                              ctx = nothing, env = Dict{Symbol,Any}())
     ex isa Expr || return ex
     ex.head === :quote && return ex
+    rewrite(x, e = env) = _kernel_scan_rewrite(x, index, carried, depth, lag,
+        step_locals, written; ctx, env = e)
     if ex.head === :ref && ex.args[1] isa Symbol && ex.args[1] in carried
         name = ex.args[1]
         length(ex.args) == 2 || throw(ArgumentError(
             "`@scan` reads its carried array `$name` with one index"))
         position = ex.args[2]
+        ctx !== nothing && name in ctx.completed &&
+            return Expr(:ref, name, rewrite(position))
         if position === index
             name in written || throw(ArgumentError(
                 "`@scan` reads `$name[$index]` before the step writes it"))
@@ -535,12 +554,137 @@ function _kernel_scan_rewrite(ex, index, carried, depth, lag, step_locals, writt
                position.args[1] === :- && position.args[2] === index &&
                position.args[3] isa Int && 1 <= position.args[3] <= depth
             return lag(name, position.args[3])
+        elseif ctx !== nothing && name === ctx.own &&
+               _history_is_earlier(position, index, ctx.lo, env)
+            # The fold's `history` holds `[seeds; outputs so far]`.
+            return _history_is_slice(position) ?
+                Expr(:call, GlobalRef(Base, :view), ctx.history, rewrite(position)) :
+                Expr(:ref, ctx.history, rewrite(position))
         end
         throw(ArgumentError(
-            "`@scan` reads `$(ex)`: a carried array is read at `$index` after its write " *
-            "or at a literal lag `$name[$index - k]` with 1 ≤ k ≤ $depth"))
+            "`@scan` reads `$(ex)`: a carried array is read at `$index` after its write, " *
+            "at a literal lag `$name[$index - k]` with 1 ≤ k ≤ $depth, or at an " *
+            "earlier entry whose index lies in `1:($index - 1)` at every step " *
+            "(`$name[s]` or `$name[$index - s]` under `for s in 1:($index - 1)`, " *
+            "or a slice `$name[($index - k):($index - 1)]`)"))
     end
     _kernel_loop_rebinds(ex, index) && return ex
-    Expr(ex.head, (_kernel_scan_rewrite(arg, index, carried, depth, lag, step_locals, written)
-                   for arg in ex.args)...)
+    if ex.head === :generator && _history_generator_clauses(ex) !== nothing
+        return _history_map_generator((x, e) -> rewrite(x, e), (x, e) -> rewrite(x, e),
+            ex, index, env)
+    end
+    Expr(ex.head, (rewrite(arg) for arg in ex.args)...)
+end
+
+# Each statement of a scan body in the shared fold-planning form
+# (`_history_statement_reads`), paired with its position in `statements`. A
+# statement that neither writes a carried array nor assigns a name is kept in
+# every fold.
+function _kernel_scan_statement_summaries(statements, index)
+    out = Tuple{Int,Any}[]
+    for (i, st) in enumerate(statements)
+        st isa Expr || continue
+        target = _kernel_scan_write(st, index)
+        summary = if target !== nothing
+            (; writes = target[1], defines = Set{Symbol}(), sampled = false,
+               reads = Any[target[3]])
+        elseif st.head === :(=) && length(st.args) == 2
+            (; writes = nothing, defines = _kernel_assignment_names!(Set{Symbol}(), st.args[1]),
+               sampled = false, reads = Any[st.args[2]])
+        else
+            (; writes = nothing, defines = Set{Symbol}(), sampled = false, reads = Any[st])
+        end
+        push!(out, (i, summary))
+    end
+    out
+end
+
+# A recurrence that reads earlier entries of its carried arrays. Each array is
+# produced by its own `scan` (`_history_fold_order`): the fold executes only
+# the statements the array needs and reads arrays produced by earlier folds
+# from their finished trajectories. A fold that reads its own array's earlier
+# entries scans with `history = <seeds>`, so its result, and the `history` its
+# step reads, is the whole trajectory `[seeds; outputs]`.
+function _kernel_scan_history_folds(statements, summaries, reads, index, domain,
+                                    carried, depth, seed_names, fresh, mod, line)
+    lo = depth + 1
+    (domain isa Expr && domain.head === :call && length(domain.args) == 3 &&
+     domain.args[1] === :(:) && domain.args[2] == lo) || throw(ArgumentError(
+        "`@scan` reads earlier entries of its carried arrays, so its loop must start " *
+        "one past the seeds, written `for $index in $lo:…`; got `$domain`"))
+    for (_, summary) in summaries, r in summary.reads
+        _history_foreach_read(r, carried, index) do name, position, env
+            position === index && return nothing
+            _history_lag_form(position, index, env) !== nothing && return nothing
+            _history_is_earlier(position, index, lo, env) || throw(ArgumentError(
+                "`@scan` reads `$name[$position]`, whose index is not provably before " *
+                "`$index`: an earlier entry's index must lie in `1:($index - 1)` at " *
+                "every step (`$name[s]` or `$name[$index - s]` under " *
+                "`for s in 1:($index - 1)`, or a slice `$name[($index - k):($index - 1)]`)"))
+        end
+    end
+    plan = last.(summaries)
+    order = _history_fold_order(carried, plan, reads)
+    order === nothing && throw(ArgumentError(
+        "`@scan` carried arrays $(join(carried, ", ")) read one another's earlier " *
+        "entries, which is not built yet: each fold reads the history of the one " *
+        "array it produces"))
+    always = Set(i for (i, summary) in enumerate(plan)
+        if summary.writes === nothing && isempty(summary.defines))
+    lines = line === nothing ? () : (line,)
+    scan_ref = GlobalRef(@__MODULE__, :scan)
+    result = Any[]
+    completed = Set{Symbol}()
+    for (name, exec) in order
+        exec = union(exec, always)
+        carry = fresh(:carry)
+        lag(a, k) = Expr(:., carry, QuoteNode(Symbol(a, :_lag, k)))
+        step_locals = Dict{Symbol,Symbol}(a => fresh(Symbol(a, :_, index)) for a in carried)
+        active = [a for a in carried if !(a in completed) &&
+                  any(j -> plan[j].writes === a, exec)]
+        own = _history_fold_reads_own(reads, exec, name)
+        seeds = Expr(:vect, (seed_names[(name, k)] for k in 1:depth)...)
+        history = own ? fresh(:history) : nothing
+        ctx = (; completed = copy(completed), own = own ? name : nothing, history, lo)
+        written = Set{Symbol}()
+        step = Any[]
+        for (j, (position, _)) in enumerate(summaries)
+            j in exec || continue
+            st = statements[position]
+            target = _kernel_scan_write(st, index)
+            if target === nothing
+                push!(step, _kernel_scan_rewrite(st, index, carried, depth, lag,
+                                                 step_locals, written; ctx))
+            else
+                a, T, rhs = target
+                rewritten = _kernel_scan_rewrite(rhs, index, carried, depth, lag,
+                                                 step_locals, written; ctx)
+                push!(written, a)
+                lhs = T === nothing ? step_locals[a] : Expr(:(::), step_locals[a], T)
+                push!(step, Expr(:(=), lhs, rewritten))
+            end
+        end
+        step = _kernel_desugar_loops(step, mod)
+        init = Expr(:tuple, Expr(:parameters, (
+            Expr(:kw, Symbol(a, :_lag, k), seed_names[(a, depth - k + 1)])
+            for a in active for k in 1:depth)...))
+        next = Expr(:tuple, Expr(:parameters, (
+            Expr(:kw, Symbol(a, :_lag, k), k == 1 ? step_locals[a] : lag(a, k - 1))
+            for a in active for k in 1:depth)...))
+        keywords = Any[Expr(:kw, :init, init)]
+        own && push!(keywords, Expr(:kw, :history, seeds))
+        call = Expr(:call, scan_ref, Expr(:parameters, keywords...), domain)
+        formals = own ? Expr(:tuple, carry, index, history) : Expr(:tuple, carry, index)
+        step_body = Expr(:block, lines..., step..., Expr(:tuple, next, step_locals[name]))
+        fold = Expr(:do, call, Expr(:(->), formals, step_body))
+        if own
+            push!(result, Expr(:(=), name, fold))
+        else
+            steps = gensym(Symbol(name, :_steps))
+            push!(result, Expr(:(=), steps, fold))
+            push!(result, Expr(:(=), name, Expr(:call, GlobalRef(Base, :vcat), seeds, steps)))
+        end
+        push!(completed, name)
+    end
+    result
 end

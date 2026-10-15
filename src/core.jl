@@ -202,9 +202,18 @@ _KernelSourceFunction(f::F, runtime_f::RF, captures::C) where {F,RF,C} =
 _kernel_native_source(f) = f
 _kernel_native_source(f::_KernelSourceFunction) = f.f
 
+# The call is a forwarding shim and is never a call boundary: both generated
+# bodies declare themselves inline. `@inline` on a `@generated` definition does
+# not reach the generated code, and the call-site `@inline` of
+# `_kernel_source_call` did not inline the latest-world shim once the source
+# body was large (a scan step's log-sum-exp). `prepare_sampler` converts every
+# operation to that mode, so such a step became a call per scan step, and
+# native Enzyme reverse through it cost 2.5–3× the same kernel with the step
+# inlined (HMM forward pass, snag `rkppl-hmm-forwar-89257681`).
 @inline @generated function (f::_KernelSourceFunction{F,RF,C,M})(args::Vararg{Any,N}) where {F,RF,C,M,N}
     forwarded = [:(getfield(args, $index)) for index in 1:N]
-    M === Val{:latest_world} && return :(Base.@inline f.f($(forwarded...)))
+    M === Val{:latest_world} &&
+        return Expr(:block, Expr(:meta, :inline), :(Base.@inline f.f($(forwarded...))))
     # The query is `Core._hasmethod` on the complete signature, which inference
     # folds to a constant in the caller's world on every supported Julia.
     # `hasmethod(f.f, argtypes)` folds too, but from Julia 1.12 it first
@@ -216,6 +225,7 @@ _kernel_native_source(f::_KernelSourceFunction) = f.f
     signature = Expr(:curly, GlobalRef(Core, :Tuple),
                      :($(GlobalRef(Core, :Typeof))(f.f)), args...)
     quote
+        $(Expr(:meta, :inline))
         # The type-only query uses the caller's world without boxing active
         # argument values into a method-lookup array during ordinary AD.
         if Core._hasmethod($signature)
@@ -925,6 +935,12 @@ end
 # `h0` is a scalar number and fixes the result's element type; each output is
 # stored converted to it. The view has no `setindex!`, and a carry holding it
 # is refused, because the native view aliases the vector the scan still writes.
+#
+# `history = leading` (a vector) puts the given entries first: the result is
+# `[leading; outputs]`, step `j` writes entry `length(leading) + j` and reads
+# the leading entries and earlier outputs below it, and entries not written
+# yet read `zero` of the leading entries' element type. A recurrence seeded
+# with `a[1:m]` then reads its whole trajectory from one vector.
 struct _ScanHistory{T,A<:AbstractVector{T}} <: AbstractVector{T}
     outputs::A
 end
@@ -937,6 +953,20 @@ function _scan_history_buffer(xs, fill::Number)
     buffer = similar(xs, typeof(fill))
     fill!(buffer, fill)
 end
+function _scan_history_buffer(xs, leading::AbstractVector)
+    T = eltype(leading)
+    buffer = similar(xs, T, length(leading) + length(xs))
+    fill!(buffer, zero(T))
+    copyto!(buffer, firstindex(buffer), leading, firstindex(leading), length(leading))
+end
+
+# Where step outputs start in a history buffer.
+_scan_history_offset(::Number) = 0
+_scan_history_offset(leading::AbstractVector) = length(leading)
+
+# The element type of a history scan's result from its history value's type.
+_scan_history_element(::Type{T}) where {T} = T
+_scan_history_element(::Type{V}) where {V<:AbstractVector} = eltype(V)
 
 # The native position driver supplies either its first-position scratch or a
 # column of the owned output stack. A plate or scan overwrites the matching
@@ -1027,10 +1057,19 @@ function _scan_history_buffer(recycled, xs, fill::Number)
     buffer === nothing ?
         _lane_keep!(recycled, _scan_history_buffer(xs, fill)) : fill!(buffer, fill)
 end
+function _scan_history_buffer(recycled, xs, leading::AbstractVector)
+    T = eltype(leading)
+    buffer = _lane_reuse(recycled, T, (Base.OneTo(length(leading) + length(xs)),))
+    buffer === nothing &&
+        return _lane_keep!(recycled, _scan_history_buffer(xs, leading))
+    fill!(buffer, zero(T))
+    copyto!(buffer, firstindex(buffer), leading, firstindex(leading), length(leading))
+end
 _scan_history_buffer(recycled, xs, fill) = _scan_history_buffer(xs, fill)
 _scan_history_buffer(xs, fill) = throw(ArgumentError(
     "a scan's `history =` value must be a number (it fills the outputs not yet " *
-    "written and fixes their element type); got a $(typeof(fill))"))
+    "written and fixes their element type) or a vector of leading entries; " *
+    "got a $(typeof(fill))"))
 
 _scan_holds_history(::Type{<:_ScanHistory}) = true
 _scan_holds_history(T::DataType) = (T <: Tuple || T <: NamedTuple) &&
@@ -1053,16 +1092,17 @@ function _tensorized_scan_history_lowering(::Nothing, step, init, fill,
                                            iterated::Tuple, shared::Tuple)
     idx = eachindex(iterated...)
     result = _scan_history_buffer(first(iterated), fill)
+    offset = _scan_history_offset(fill)
     earlier = _ScanHistory(result)
     isempty(idx) && return result
     i1 = first(idx)
     carry, out1 = step(init, map(xs -> xs[i1], iterated)..., shared..., earlier)
     carry = _scan_history_carry(carry)
-    result[i1] = out1
+    result[offset + i1] = out1
     for i in _scan_rest(idx)
         carry, out = step(carry, map(xs -> xs[i], iterated)..., shared..., earlier)
         carry = _scan_history_carry(carry)
-        result[i] = out
+        result[offset + i] = out
     end
     result
 end

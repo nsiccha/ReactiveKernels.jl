@@ -223,6 +223,7 @@ const _PPL_TEST_FILES = (
     "test_scan.jl",
     "test_scan_capabilities.jl",
     "test_scan_recurrence_capabilities.jl",
+    "test_scan_history.jl",
     "test_scan_capabilities_reactant.jl",
     "test_scan_recurrence_capabilities_reactant.jl",
     "test_merge.jl",

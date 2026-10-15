@@ -851,6 +851,30 @@ declaration takes, including `Flat()`, half priors, `truncated(D, lo, hi)` and
 `h[t] ~ restricted(Normal(h[t - 1], s), lo, hi)` is a random walk on `(lo, hi)`
 that keeps the Normal density.
 
+A step reads a carried array at a backward lag
+`a[t - k]`, at `a[t]` after writing it, or at any earlier entry whose index
+provably lies in `1:(t - 1)`, so a renewal equation over the whole earlier
+trajectory is written as stated:
+
+```julia
+@scan begin
+    infections[1] = i0
+    for t in 2:T
+        infections[t] = r * sum(infections[s] * w[t - s] for s in 1:(t - 1))
+    end
+end
+```
+
+The index may be `s` or `t - s` under a generator `for s in 1:(t - 1)`, a
+seed position, or a window `a[(t - k):(t - 1)]`. A scan body also reads other
+model values whole, so a delay convolution of `infections` can be a second
+`@scan`. A deterministic `@scan` inside a `@plate` cell runs one recurrence
+per index, retained as an RK scan inside the plate cell; its carried arrays
+hold one array per index. Each array that reads its own earlier entries is one
+RK scan with `history = [<its seeds>…]` (see [Scans](scan.md), "Reading
+earlier entries"). Native values and ordinary Enzyme reverse gradients are
+supported.
+
 ### One array per index
 
 A dotted cell broadcasts over its own iteration's values, as the loop it
