@@ -92,6 +92,18 @@ The definition is still assigned once; a second factor on the same name is
 rejected. Vector observations use `.~`. A caller-owned law instead observes
 the definition as one whole event (see caller-owned sampling laws below).
 
+Computing a scalar from data does not automatically condition its density.
+For `z = sum(log.(raw)); z ~ Normal(mu, 3)`, use
+`lower_rkppl(ast, (; raw); conditioned=(:z,))` to select an observation, or
+`bind_data(plan, (; raw); conditioned=(:z,))` after lowering. The definition
+stays in the graph and reads `raw`; do not supply a second value for `z`.
+Its density then contributes to `likelihood` and the scalar entry `pointwise.z`,
+with no coordinate or transform Jacobian. Conditioning selects the density's
+role and preserves the definition's dependencies, including any dependence
+on free parameters. Data-only work can be frozen by RK preparation regardless
+of whether the density is conditioned; freezing and conditioning are separate
+choices.
+
 ## Parameter priors
 
 Scalar parameter priors include `Normal`, `Cauchy`, `Exponential`, `Gamma`,
