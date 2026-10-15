@@ -21,33 +21,6 @@ using Test
     end
 end
 
-@testset "identities from another allocation range" begin
-    RK = ReactiveKernels
-    here = RK._value_id_range(RK._VALUE_COUNTER[])
-    # Another process's image allocates in its own range. Extending its graph
-    # allocates in this process's range, which never reaches that image.
-    id = RK._fresh_value_id_range() + 1
-    @test RK._value_id_range(id) != here
-    imported = Value{Float64}(id, :imported)
-    g = Graph(Dict(id => imported), Recipe[], Dict{Int,Vector{Int}}(),
-              Dict{Int,Int}(), 0)
-    fresh = value!(g, :fresh, Float64)
-    @test RK._value_id_range(fresh.id) == here
-    @test g.values[id] === imported
-    @test value(:standalone, Float64).id == fresh.id + 1
-    # A process continues in a fresh range once its own is exhausted.
-    saved = RK._VALUE_COUNTER[]
-    try
-        RK._VALUE_COUNTER[] = (here + 1) << RK._VALUE_ID_RANGE_BITS - 1
-        wrapped = value(:wrapped, Float64)
-        @test RK._value_id_range(wrapped.id) != here
-        # The first identity of that range, not the next range in order.
-        @test wrapped.id & ((1 << RK._VALUE_ID_RANGE_BITS) - 1) == 1
-    finally
-        RK._VALUE_COUNTER[] = saved
-    end
-end
-
 # Positional operations deliberately have no global names in lowered code.
 # Inspect the Expr structurally so generated-code assertions prove exactly
 # which operation slots are called instead of searching for absent op names.

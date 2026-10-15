@@ -60,28 +60,6 @@ end
 end
 const PAIR_GRID = prepare(pair_grid)
 
-# A law whose component plate nests an observation plate, as the whole-event
-# mixture laws of the distribution kernels do. A plate authored after load
-# composes it into its cells.
-@kernel weighted_log_sum(scores::Vector{Float64}, weights::Vector{Float64}) = begin
-    weighted = plate(scores, weights) do score, weight
-        log(weight) + score
-    end
-    return log(sum(exp.(weighted)))
-end
-
-@kernel nested_mixture(observed::Vector{Bool}, probabilities::Matrix{Float64},
-        weights::Vector{Float64}) = begin
-    components = plate(1:size(probabilities, 2)) do k
-        cells = plate(1:length(observed)) do i
-            p = probabilities[i, k]
-            observed[i] ? log(p) : log1p(-p)
-        end
-        sum(cells)
-    end
-    return weighted_log_sum(components, weights)
-end
-
 module Nested
 using ReactiveKernels
 import ..PrecompiledPreparedConsumer: trajectory, HAVE

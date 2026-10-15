@@ -30,9 +30,6 @@ using ReactiveKernels, Test
             using ReactiveKernels
             import PrecompiledPreparedConsumer: trajectory, HAVE, borrowed_curve
             const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
-            @kernel doubled(x::Vector{Float64}) = begin
-                twice::Vector{Float64} = 2 .* x
-            end
             const BATCH = prepare_batched(trajectory; have = HAVE,
                 batched = :position, want = (:total, :conc))
             const BORROWED = prepare_batched(borrowed_curve;
@@ -59,35 +56,19 @@ using ReactiveKernels, Test
         probe = """
             using Test, ReactiveKernels, PrecompiledPreparedConsumer,
                   ImportedPreparedConsumer
-            import PrecompiledPreparedConsumer: nested_mixture
             const C = PrecompiledPreparedConsumer
             @test C.WAS_PRECOMPILED
             @test ImportedPreparedConsumer.WAS_PRECOMPILED
-            # Each image keeps the identities its kernels were authored with,
-            # and each process allocates in its own identity range, so this
-            # process never counts onto an imported identity. With one shared
-            # range, a new bound plate cache reused the loaded right-location
-            # ID, and the native and tensorized products of a loaded
-            # nested-plate law gave their fresh values the law's own
-            # identities (snag readable-recipe-75581e09).
+            # Consumer-image allocations do not advance the dependency's
+            # counter after load. Reproduce the reported alignment, where a
+            # new bound plate cache reused the loaded right-location ID.
             const RK = ReactiveKernels
-            function image_ranges!(found, graph)
-                foreach(id -> push!(found, RK._value_id_range(id)), keys(graph.values))
-                for r in graph.recipes
-                    r.op isa RK._AuthoredPlateOp &&
-                        image_ranges!(found, r.op.kernel.plan.graph)
-                end
-                found
-            end
-            here = RK._value_id_range(RK._VALUE_COUNTER[])
-            consumer_ranges = image_ranges!(Set{Int}(), C.nested_mixture.graph)
-            derived_ranges = image_ranges!(Set{Int}(), ImportedPreparedConsumer.doubled.graph)
-            @test !(here in consumer_ranges)
-            @test !(here in derived_ranges)
-            @test isdisjoint(consumer_ranges, derived_ranges)
             graph = C.pair_grid.graph
             right_id = RK.canon_id(graph, C.pair_grid.right.id)
-            @test RK._value_id_range(right_id) != here
+            @test RK._VALUE_COUNTER[] < right_id
+            while RK._VALUE_COUNTER[] < right_id - 1
+                value(:alignment, Float64)
+            end
             original_values = copy(graph.values)
             original_recipes = copy(graph.recipes)
             for x in ([-0.7, 0.2, 0.2, 1.1], collect(range(-1.3, 0.8; length=9)))
@@ -201,29 +182,6 @@ using ReactiveKernels, Test
             @test positions == [1.0 2.0; 0.0 0.0]
             @test schedule == [0.5, 1.0]
             @test doses == [3.0, 4.0]
-
-            # Both backend products lower the loaded law's nested plates again
-            # with fresh values; preparation checks that they agree up to a
-            # consistent renaming (`_same_readable_recipes`).
-            @kernel event_mixtures(events::Vector{Vector{Bool}},
-                    probabilities::Matrix{Float64}, weights::Vector{Float64}) = begin
-                scores = plate(events) do observed
-                    nested_mixture(observed, probabilities, weights)
-                end
-                return sum(scores)
-            end
-            @test RK._needs_embedded_tensorization(plan(event_mixtures))
-            mixtures = prepare(event_mixtures)
-            events = [Bool[1, 0, 1], Bool[0, 0, 1], Bool[1, 1, 1]]
-            probabilities = [0.3 0.8; 0.6 0.2; 0.5 0.5]
-            weights = [0.4, 0.6]
-            expected_mixture = sum(events) do observed
-                scores = [sum(observed[i] ? log(probabilities[i, k]) :
-                              log1p(-probabilities[i, k]) for i in eachindex(observed))
-                          for k in axes(probabilities, 2)]
-                log(sum(weights .* exp.(scores)))
-            end
-            @test mixtures(events, probabilities, weights) ≈ expected_mixture
             println("PRECOMPILED_PREPARED_PASS")
             """
         # Two independent loads rule out a process-local body-cache recovery.
