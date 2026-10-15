@@ -1193,7 +1193,7 @@ end
 function _has_located_axes(plan::StructuralPlan, pred::PredictorSpec, ex)
     a = _known_axes(plan, ex)
     a === nothing && return false
-    located = [r for r in plan.responses if _response_uses_predictor(r, pred.name)]
+    located = _located_responses(plan, pred.name)
     return !isempty(located) && all(located) do r
         haskey(plan.columns, r.response) && r.range === nothing &&
             _value_axes(plan, r.response; data_axes = true) == a
@@ -1255,11 +1255,29 @@ function _full_observation_view(plan::StructuralPlan, ex)
     return _is_observation_slice(plan, Expr(:ref, base, :(:), ex.args[4]))
 end
 
+# The responses a predictor locates: those reading it directly and, for a
+# composed predictor's sub-predictor (`th` in `mu = be .* th`), those its
+# reader locates, since the combination is elementwise over their rows.
+function _located_responses(plan::StructuralPlan, name::Symbol,
+        seen::Set{Symbol} = Set{Symbol}())
+    name in seen && return LikelihoodSpec[]
+    push!(seen, name)
+    located = LikelihoodSpec[r for r in plan.responses
+        if _response_uses_predictor(r, name)]
+    for p in plan.predictors, t in p.terms
+        t.kind === ComposedTerm && name in t.options.subs || continue
+        for r in _located_responses(plan, p.name, seen)
+            any(l -> l === r, located) || push!(located, r)
+        end
+    end
+    return located
+end
+
 # Rows of the responses a predictor locates — their own observation axis,
 # which is not `n_obs` when responses observe different rows.
 function _located_rows(plan::StructuralPlan, pred::PredictorSpec)
-    rows = unique!([_response_rows(plan, r) for r in plan.responses
-        if _response_uses_predictor(r, pred.name)])
+    rows = unique!([_response_rows(plan, r)
+        for r in _located_responses(plan, pred.name)])
     length(rows) == 1 || throw(ContractValidationError("[generator] " *
         "predictor $(pred.name) locates responses with rows $rows " *
         "(one row count per scalar-valued predictor)"))
@@ -1285,7 +1303,7 @@ end
 
 _located_rows_source(plan::StructuralPlan, pred::PredictorSpec) =
     _rows_source(_located_rows(plan, pred), _response_rows_anchors(plan,
-        first(r for r in plan.responses if _response_uses_predictor(r, pred.name))))
+        first(_located_responses(plan, pred.name))))
 
 _response_rows_source(plan::StructuralPlan, r::LikelihoodSpec) =
     _rows_source(_response_rows(plan, r), _response_rows_anchors(plan, r))
