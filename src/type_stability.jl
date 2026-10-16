@@ -33,7 +33,7 @@ _concrete_value_type(::Type{Type{T}}) where {T} = true
 # `recipe_types(recipe, input_types)` gives a recipe's output types from its
 # input types, where an unknown input is `Any`.
 function _plan_value_types(recipe_types, p::Plan, argument_types)
-    types = Dict{Int,Any}(canon_id(p.graph, v.id) => T
+    types = Dict{ValueId,Any}(canon_id(p.graph, v.id) => T
                           for (v, T) in zip(p.have, argument_types))
     for recipe in p.recipes
         input_types = Any[get(types, canon_id(p.graph, v.id), Any)

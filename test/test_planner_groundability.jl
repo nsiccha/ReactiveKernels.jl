@@ -9,7 +9,7 @@ function exhaustive_planner_rank(g, have, want)
     for mask in 0:(2^length(g.recipes) - 1)
         chosen = [r for r in g.recipes if !iszero(mask & (1 << (r.id - 1)))]
         any(r -> r.effectful, chosen) && continue
-        available = Set{Int}(canon_id(g, v.id) for v in have)
+        available = Set{ReactiveKernels.ValueId}(canon_id(g, v.id) for v in have)
         pending = copy(chosen)
         while !isempty(pending)
             pos = findfirst(r -> all(v -> canon_id(g, v.id) in available,
@@ -234,7 +234,7 @@ end
                 solved += 1
                 p = plan(g; have, want)
                 @test (p.cost, length(p.recipes)) == expected
-                available = Set{Int}(canon_id(g, v.id) for v in have)
+                available = Set{ReactiveKernels.ValueId}(canon_id(g, v.id) for v in have)
                 for r in p.recipes
                     @test all(v -> canon_id(g, v.id) in available, r.inputs)
                     union!(available, (canon_id(g, v.id) for v in r.outputs))

@@ -408,7 +408,7 @@ Base.@nospecializeinfer function _kernel_add!(
         "WANT boundary has only $(length(child_outputs)) port(s)"))
 
     child_graph = getfield(spec, :graph)
-    child_have = Set{Int}(canon_id(child_graph, v.id) for v in child_inputs)
+    child_have = Set{ValueId}(canon_id(child_graph, v.id) for v in child_inputs)
     # The call owns a lexical namespace under the caller's name for its result:
     # the child's values are named `result.name`, as a bound child endpoint's
     # are `standard.name`, so an argument RK passes through a hygienic port
@@ -418,8 +418,8 @@ Base.@nospecializeinfer function _kernel_add!(
     # results scope nothing.
     scope = length(outs) == 1 && !_generated_value_name(first(outs).name) ?
         first(outs).name : nothing
-    results = Set{Int}(canon_id(child_graph, v.id) for v in child_outputs)
-    cloned = Dict{Int,Value}()
+    results = Set{ValueId}(canon_id(child_graph, v.id) for v in child_outputs)
+    cloned = Dict{ValueId,Value}()
     for id in sort!(collect(keys(child_graph.values)))
         value = child_graph.values[id]
         name = scope === nothing || canon_id(child_graph, id) in results ||
@@ -442,9 +442,9 @@ Base.@nospecializeinfer function _kernel_add!(
     for (actual, formal) in zip(call_inputs, child_inputs)
         _kernel_inline_alias!(graph, cloned[formal.id], actual, "input")
     end
-    child_read = Set{Int}(canon_id(child_graph, value.id)
+    child_read = Set{ValueId}(canon_id(child_graph, value.id)
                           for recipe in child_graph.recipes for value in recipe.inputs)
-    cloned_ids = Set{Int}(value.id for value in values(cloned))
+    cloned_ids = Set{ValueId}(value.id for value in values(cloned))
     for (actual, formal) in zip(outs, child_outputs)
         result = cloned[formal.id]
         root = canon_id(graph, result.id)
@@ -1515,7 +1515,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
     p = plan(endpoint)
     g = endpoint.graph
     have_names = Tuple(endpoint.have_names)
-    have_source = Dict{Int,Any}()
+    have_source = Dict{ValueId,Any}()
     for v in p.have
         position = findfirst(==(v.name), have_names)
         position === nothing && _kernel_inline_reject(
@@ -1531,7 +1531,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
     length(p.want) == 1 || _kernel_inline_reject(
         endpoint_name, context, "it has $(length(p.want)) outputs")
     known = Set{Symbol}(endpoint.port_order)
-    used = Set{Int}(canon_id(g, v.id) for v in p.want)
+    used = Set{ValueId}(canon_id(g, v.id) for v in p.want)
     for r in p.recipes, v in r.inputs
         push!(used, canon_id(g, v.id))
     end
@@ -1549,7 +1549,7 @@ function _kernel_inline_endpoint_call(endpoint::KernelSpec, endpoint_name,
         name
     end
     bindings = Any[]
-    expr_of = Dict{Int,Any}()
+    expr_of = Dict{ValueId,Any}()
     for v in p.have
         cid = canon_id(g, v.id)
         cid in used || continue
@@ -5793,7 +5793,7 @@ Base.@nospecializeinfer outputs(@nospecialize(spec::KernelSpec)) = _kernel_selec
 function _kernel_clone_value_map!(graph::Graph, ports::Dict{Symbol,Value},
                                   spec::KernelSpec)
     public_ids = Dict(value.id => ports[name] for (name, value) in spec.ports)
-    mapped = Dict{Int,Value}()
+    mapped = Dict{ValueId,Value}()
     for id in sort!(collect(keys(spec.graph.values)))
         source = spec.graph.values[id]
         mapped[id] = get(public_ids, id) do
@@ -5806,7 +5806,7 @@ function _kernel_clone_value_map!(graph::Graph, ports::Dict{Symbol,Value},
     mapped
 end
 
-function _kernel_clone_recipes!(graph::Graph, mapped::Dict{Int,Value},
+function _kernel_clone_recipes!(graph::Graph, mapped::Dict{ValueId,Value},
                                 spec::KernelSpec)
     for recipe in spec.graph.recipes
         ins = Tuple(mapped[value.id] for value in recipe.inputs)
@@ -5817,9 +5817,9 @@ function _kernel_clone_recipes!(graph::Graph, mapped::Dict{Int,Value},
     graph
 end
 
-function _kernel_clone_aliases!(graph::Graph, mapped::Dict{Int,Value},
+function _kernel_clone_aliases!(graph::Graph, mapped::Dict{ValueId,Value},
                                 spec::KernelSpec)
-    relations = Tuple{Int,Int}[]
+    relations = Tuple{ValueId,ValueId}[]
     for alias_id in keys(spec.graph.aliases)
         canonical_id = canon_id(spec.graph, alias_id)
         push!(relations, (alias_id, canonical_id))

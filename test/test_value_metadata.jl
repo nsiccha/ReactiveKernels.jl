@@ -36,8 +36,12 @@ info(ex, bindings; kwargs...) =
         shadowed=union(keys(bindings), (:sum,)))) === nothing
     @test OS.value_rank(info(:(exp.(x)), bindings;
         shadowed=union(keys(bindings), (:exp,)))) === nothing
-    # Unsupported keyword semantics must not be mistaken for a full reduction.
-    @test OS.value_rank(info(:(sum(x; dims=1)), bindings)) === nothing
+    # A keyword is never mistaken for a full reduction: `dims` keeps the
+    # reduced axis, and a keyword without a rule leaves the result unknown.
+    dims_sum = info(:(sum(x; dims=1)), bindings)
+    @test OS.value_rank(dims_sum) === 1
+    @test OS.value_length(dims_sum) === 1
+    @test OS.value_rank(info(:(sum(x; init=0.0)), bindings)) === nothing
     @test OS.value_rank(info(:(x .+ y), merge(bindings,
         Dict(:y=>OS.vector_info(Float64, 2))))) === nothing
     partial = info(:(a .+ x), merge(bindings,

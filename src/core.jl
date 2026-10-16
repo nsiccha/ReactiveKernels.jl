@@ -4,22 +4,97 @@
 # consulted inside a prepared kernel (see codegen.jl); the hot path sees only
 # ordinary Julia values.
 
-# A process-global counter giving every `Value` a stable identity independent of
-# its name or of any particular graph. Identity must not depend solely on the
-# name (gist §5), so two values may share a name yet remain distinct.
-const _VALUE_COUNTER = Ref(0)
-_next_value_id(floor::Int = 0) =
-    (_VALUE_COUNTER[] = max(_VALUE_COUNTER[], floor) + 1)
+# Every `Value` has an identity independent of its name or of any particular
+# graph. Identity must not depend solely on the name (gist §5), so two values
+# may share a name yet remain distinct.
+#
+# Identities also cross process boundaries: a package image keeps the values its
+# kernels were authored with, and the process that loads it makes values of its
+# own. An identity is therefore the namespace that allocated it plus a number
+# within that namespace. Each process allocates in a namespace of its own
+# (`__init__`), so values from different package images and from the loading
+# process never coincide, and a value one image refers to from another keeps its
+# identity: loading preserves which namespace object it belongs to.
+"""
+    ValueNamespace
+
+An allocator of `Value` identities. Identities from different namespaces are
+distinct; a namespace is compared by object identity.
+"""
+mutable struct ValueNamespace
+    # Identities allocated so far. Atomic because graphs may be built from
+    # concurrent tasks, all allocating in this process's namespace.
+    @atomic count::Int
+    # The hash and order of identities. A namespace's address differs in every
+    # process that loads it from a package image; this key travels with it.
+    key::UInt
+end
+ValueNamespace(key::UInt) = ValueNamespace(0, key)
+# A namespace is an identity, not data: a deep copy of a graph or a table keyed
+# by value identities refers to the same values, so it keeps the namespace.
+Base.deepcopy_internal(namespace::ValueNamespace, ::IdDict) = namespace
+
+"""
+    ValueId
+
+The identity of a `Value`: the namespace that allocated it and its number there.
+"""
+struct ValueId
+    namespace::ValueNamespace
+    number::Int
+end
+Base.:(==)(a::ValueId, b::ValueId) =
+    a.namespace === b.namespace && a.number == b.number
+Base.hash(id::ValueId, h::UInt) = hash(id.number, hash(id.namespace.key, h))
+# Allocation order within a namespace; namespaces in the order of their keys.
+Base.isless(a::ValueId, b::ValueId) = a.namespace === b.namespace ?
+    isless(a.number, b.number) : isless(a.namespace.key, b.namespace.key)
+Base.show(io::IO, id::ValueId) =
+    print(io, "ValueId(", id.number, "@", string(id.namespace.key; base = 16), ")")
+
+# An identity as one `Int`, for the stateful kernel factory: its plan keys are
+# type parameters, which a `ValueId` (it refers to its mutable namespace) cannot
+# be. The number is the same in every process. It is not an identity by
+# itself, so a graph whose identities would share one is refused
+# (`_check_canon_ints`) rather than having two values merged.
+function _canon_int(id::ValueId)
+    n = reinterpret(Int, hash(id.number, id.namespace.key))
+    n == 0 ? 1 : n
+end
+function _check_canon_ints(g)
+    length(Set(_canon_int(id) for id in keys(g.values))) == length(g.values) ||
+        throw(ArgumentError("two values of one graph share a kernel-factory " *
+                            "identity number; rebuild the graph"))
+    g
+end
+
+# The namespace of this package's own image. A process that loads it replaces
+# it with one of its own (`__init__`).
+const _VALUE_NAMESPACE = Ref(ValueNamespace(rand(RandomDevice(), UInt)))
+function _next_value_id()
+    namespace = _VALUE_NAMESPACE[]
+    ValueId(namespace, @atomic namespace.count += 1)
+end
+
+function __init__()
+    # A process that loads package images keeps a fixed key, so the order of
+    # its own values relative to imported ones is the same in every session; a
+    # process that generates an image gives that image a key of its own.
+    generating = ccall(:jl_generating_output, Cint, ()) != 0
+    _VALUE_NAMESPACE[] = ValueNamespace(generating ? rand(RandomDevice(), UInt) : zero(UInt))
+    nothing
+end
 
 """
     Value{T}
 
 A stable graph identity for a runtime value of Julia type `T`. `id` is the
-identity (globally unique); `name` exists only for diagnostics and for
-generated-code readability. Values are immutable and cheap to hash/compare.
+identity (a `ValueId`, unique across processes and package images); `name`
+exists only for diagnostics and for generated-code readability. Values are
+immutable and cheap to hash/compare.
 """
 struct Value{T}
-    id::Int
+    id::ValueId
     name::Symbol
 end
 
@@ -1040,6 +1115,49 @@ end
 @inline _lane_keep!(recycled, value) = value
 @inline _lane_keep!(slot::Base.RefValue{Any}, value) = (slot[] = value; value)
 
+# The buffer an authored plate or scan fills (`_lane_allocation`): the matching
+# recycled buffer, or `allocate(args...)`, kept when `recycled` is a lane slot.
+# - Not inlined, with one fixed-arity method per allocation arity. Inline, the
+#   reused and the fresh buffer merge into a phi of derived data pointers in
+#   the filling loop, which reverse-mode Enzyme cannot keep rooted for the
+#   garbage collector; a non-inlined varargs method boxes its arguments on
+#   Julia 1.10; a tuple of them stores an active array, which Enzyme rejects.
+# - A lane slot of a differentiated non-allocating program (`_ad_na_program`)
+#   is a `Ref{Array{T,N}}` seeded with an owned copy of the exemplar call's
+#   buffer (`_ad_na_concretize_cache`), and is only read: one inline load,
+#   no store, no merge. A call that may store into the slot made Enzyme cache
+#   loads conservatively (about 1 µs per gradient on small models), and a
+#   merged buffer lost its derivative in scans. That program keeps the
+#   exemplar's shapes and element types; another one fails loudly.
+const _LANE_ACQUIRE_ARITIES = 1:4
+for arity in _LANE_ACQUIRE_ARITIES
+    args = [Symbol(:allocation_argument_, i) for i in 1:arity]
+    @eval @noinline function _lane_acquire(recycled, ::Type{T}, output_axes,
+                                           allocate::F, $(args...)) where {T,F}
+        buffer = _lane_reuse(recycled, T, output_axes)
+        buffer === nothing ? _lane_keep!(recycled, allocate($(args...))) : buffer
+    end
+    @eval @inline function _lane_acquire(slot::Base.RefValue{B}, ::Type{T},
+            output_axes::NTuple{N,Any}, allocate::F,
+            $(args...)) where {B<:Array,T,N,F}
+        buffer = slot[]
+        buffer isa Array{T,N} && axes(buffer) == output_axes ||
+            _lane_changed(buffer, T, output_axes)
+        buffer::Array{T,N}
+    end
+    # No buffer to offer (the position driver's `nothing`, or a lane the
+    # exemplar call never filled): allocate inline, as the ordinary program.
+    @eval @inline _lane_acquire(::Nothing, ::Type{T}, output_axes, allocate::F,
+                                $(args...)) where {T,F} = allocate($(args...))
+end
+
+@noinline _lane_changed(buffer, ::Type{T}, output_axes) where {T} =
+    throw(ArgumentError(
+        "a non-allocating gradient fills each materialized value into the " *
+        "buffer it prepared from the exemplar call, a $(typeof(buffer)) with " *
+        "axes $(axes(buffer)); this call's value is an array of $T with axes " *
+        "$output_axes. Prepare the gradient again for the new shape"))
+
 # Destination forms of a top-level dotted call and an array slice in a
 # position residual (`_lane_source_expr`). Each returns exactly the value its
 # source would (`_native_broadcast_materialize`, `getindex`): a matching
@@ -1077,16 +1195,14 @@ const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<
     copyto!(buffer, view(A, J...))
 end
 
-function _scan_history_buffer(recycled, xs, fill::Number)
-    buffer = _lane_reuse(recycled, typeof(fill), axes(xs))
-    buffer === nothing ?
-        _lane_keep!(recycled, _scan_history_buffer(xs, fill)) : fill!(buffer, fill)
-end
+_scan_history_buffer(recycled, xs, fill::Number) = fill!(
+    _lane_acquire(recycled, typeof(fill), axes(xs), _scan_history_buffer, xs, fill),
+    fill)
 function _scan_history_buffer(recycled, xs, leading::AbstractVector)
     T = eltype(leading)
-    buffer = _lane_reuse(recycled, T, (Base.OneTo(length(leading) + length(xs)),))
-    buffer === nothing &&
-        return _lane_keep!(recycled, _scan_history_buffer(xs, leading))
+    buffer = _lane_acquire(recycled, T,
+        (Base.OneTo(length(leading) + length(xs)),), _scan_history_buffer, xs,
+        leading)
     fill!(buffer, zero(T))
     copyto!(buffer, firstindex(buffer), leading, firstindex(leading), length(leading))
 end
@@ -1962,41 +2078,34 @@ A mutable builder collecting `Value`s and `Recipe`s plus the producer index the
 planner needs. Building executes nothing.
 """
 mutable struct Graph
-    values::Dict{Int,Value}          # id => Value
+    values::Dict{ValueId,Value}          # id => Value
     recipes::Vector{Recipe}
-    producers::Dict{Int,Vector{Int}} # canonical value id => indices into `recipes`
-    aliases::Dict{Int,Int}           # value id => structurally-equal canonical id
+    producers::Dict{ValueId,Vector{Int}} # canonical value id => indices into `recipes`
+    aliases::Dict{ValueId,ValueId}       # value id => structurally-equal canonical id
     version::Int
     # The value-independent work of this graph's bound preparations, reused by
     # `prepare(…; bound)` (`_graph_preparations`, graphops.jl); `nothing` until
     # the first one. Not part of the graph's meaning.
     preparations::Any
-    # This graph's identity high-water mark travels with a package image.
-    # A dependency's process-local counter does not retain allocations made
-    # while precompiling a consumer, so it alone cannot extend a loaded graph.
-    value_id_floor::Int
 end
 Graph(values, recipes, producers, aliases, version) =
     Graph(values, recipes, producers, aliases, version, nothing)
-Graph(values, recipes, producers, aliases, version, preparations) =
-    Graph(values, recipes, producers, aliases, version, preparations,
-          maximum(keys(values); init = 0))
-Graph() = Graph(Dict{Int,Value}(), Recipe[], Dict{Int,Vector{Int}}(),
-                Dict{Int,Int}(), 0)
+Graph() = Graph(Dict{ValueId,Value}(), Recipe[], Dict{ValueId,Vector{Int}}(),
+                Dict{ValueId,ValueId}(), 0)
 
-function _register!(g::Graph, v::Value)
-    g.values[v.id] = v
-    g.value_id_floor = max(g.value_id_floor, v.id)
-    v
-end
+_register!(g::Graph, v::Value) = (g.values[v.id] = v; v)
 
 """
-    canon_id(g, id) -> Int
+    canon_id(g, id) -> ValueId
 
 Resolve a value id to its structural-CSE canonical representative (gist §8).
 Absent any structural CSE this is the identity.
 """
-canon_id(g::Graph, id::Int) = haskey(g.aliases, id) ? canon_id(g, g.aliases[id]) : id
+canon_id(g::Graph, id::ValueId) =
+    haskey(g.aliases, id) ? canon_id(g, g.aliases[id]) : id
+
+# The canonical identity of `v` in `g` as one `Int` (`_canon_int(::ValueId)`).
+_canon_int(g::Graph, v::Value) = _canon_int(canon_id(g, v.id))
 
 """
     value!(g, name, T) -> Value{T}
@@ -2004,7 +2113,7 @@ canon_id(g::Graph, id::Int) = haskey(g.aliases, id) ? canon_id(g, g.aliases[id])
 Create a `Value{T}` and register it into graph `g`.
 """
 function value!(g::Graph, name::Symbol, ::Type{T}) where {T}
-    v = Value{T}(_next_value_id(g.value_id_floor), name)
+    v = Value{T}(_next_value_id(), name)
     _register!(g, v)
     g.version += 1
     v
@@ -2015,8 +2124,8 @@ _astuple(t::Tuple) = t
 _astuple(v::AbstractVector) = Tuple(v)
 
 function _cse_alias_plan(g::Graph, new_outputs::Tuple, old_outputs::Tuple, cse_key)
-    targets = Dict{Int,Int}()
-    edges = Pair{Int,Int}[]
+    targets = Dict{ValueId,ValueId}()
+    edges = Pair{ValueId,ValueId}[]
 
     for (position, (new_output, old_output)) in enumerate(zip(new_outputs, old_outputs))
         new_type = valtype(new_output)
@@ -2044,7 +2153,7 @@ function _cse_alias_plan(g::Graph, new_outputs::Tuple, old_outputs::Tuple, cse_k
     # crossed multi-output mappings such as (a, b) => (b, a) must not create a
     # recursive alias chain.
     for start in sort!(collect(keys(targets)))
-        seen = Set{Int}()
+        seen = Set{ValueId}()
         current = start
         while haskey(targets, current)
             current in seen && throw(ArgumentError(
@@ -2059,7 +2168,7 @@ end
 function _reindex_producers!(g::Graph)
     empty!(g.producers)
     for recipe in g.recipes
-        indexed = Set{Int}()
+        indexed = Set{ValueId}()
         for output in recipe.outputs
             canonical = canon_id(g, output.id)
             canonical in indexed && continue
@@ -2086,7 +2195,7 @@ end
 
 # Compare canonical value ids elementwise. `==` on tuples of unknown length is an
 # abstract call that any package method on tuples invalidates.
-function _canonical_ids_equal(g::Graph, values::Tuple{Vararg{Value}}, ids::Vector{Int})
+function _canonical_ids_equal(g::Graph, values::Tuple{Vararg{Value}}, ids::Vector{ValueId})
     length(values) == length(ids) || return false
     for (value, id) in zip(values, ids)
         canon_id(g, value.id) == id || return false
@@ -2111,7 +2220,7 @@ Base.@nospecializeinfer function _add_recipe!(g::Graph,
     # arity, it computes the same thing. Alias the new outputs onto the existing
     # producer's outputs instead of adding a duplicate recipe.
     if cse_key !== nothing && !effectful
-        canon_ins = Int[canon_id(g, v.id) for v in ins]
+        canon_ins = ValueId[canon_id(g, v.id) for v in ins]
         for r in g.recipes
             r.effectful && continue
             r.cse_key === nothing && continue
@@ -2146,4 +2255,4 @@ add!(g::Graph, pair::Pair, op; kwargs...) =
     add!(g; inputs = pair.first, outputs = pair.second, op = op, kwargs...)
 
 "All recipes that can produce value id `vid` (resolved through structural CSE)."
-producers_of(g::Graph, vid::Int) = get(g.producers, canon_id(g, vid), Int[])
+producers_of(g::Graph, vid::ValueId) = get(g.producers, canon_id(g, vid), Int[])
