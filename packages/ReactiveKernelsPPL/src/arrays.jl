@@ -140,7 +140,10 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d;
         return k == 2 ? length(m.columns) : _value_rows(plan, M)
     end
     if !haskey(plan.columns, M)
-        shape = _value_axes(plan, M, active; data_axes = true)
+        # Sizing a declared axis needs the shape: a proved conflict in the
+        # definition of M is Julia's dimension error, not a missing matrix.
+        shape = _value_axes(plan, M, active; data_axes = true,
+            throw_conflicts = true)
         # Julia supplies singleton dimensions beyond an array's rank.
         shape === nothing || return k <= length(shape) ? shape[k] : 1
     end
@@ -593,34 +596,87 @@ _is_array_assignment(plan::StructuralPlan, name) =
 # ── axes of array values ─────────────────────────────────────────────
 
 # The axes of an array-valued expression, in the dim forms declarations
-# use (a literal `K`, `levels(g)`, `axes(M, d)`, ...), following Julia:
-# broadcasting keeps the operands' axes (a length-1 axis stretches),
-# `A * B` takes `A`'s rows and `B`'s columns, an adjoint or `transpose`
-# swaps them (a vector becomes a 1×n row), `M[:, j]` keeps the axes read
-# with `:`, a gather `a[g]` takes its bound index column's axes, and a
-# reduction is a scalar. `Any[]` is a scalar; `nothing`
-# means the shape is unavailable (for example, an opaque module call).
-# With bound data, data_axes resolves declared dimensions to concrete
-# lengths as well, without evaluating any sampled value.
-function _value_axes(plan::StructuralPlan, ex,
-        seen::Set{Symbol} = Set{Symbol}(); data_axes::Bool = false)
-    ex isa Number && return Any[]
-    _is_bound_value_call(ex) && !_is_bound_array_value_call(ex) && return Any[]
+# use (a literal `K`, `levels(g)`, `axes(M, d)`, ...). OutputSignatures owns
+# the numerical rules (broadcasting, products, adjoints, indexing,
+# reductions, concatenation), queried through RK's source adapter: a literal
+# size enters as a known extent, any other declared dimension as a named
+# `SymbolicAxis` that comes back in its declared form. PPL adds what its
+# declarations mean (`_declared_broadcast`) and which reads are per-
+# observation gathers. `Any[]` is a scalar; `nothing` means the shape is
+# unavailable (for example, an opaque module call). With bound data,
+# data_axes resolves declared dimensions to concrete lengths as well, without
+# evaluating any sampled value. A proved shape conflict reads as unavailable,
+# leaving Julia's own error to the evaluation, unless `throw_conflicts` asks
+# for it now (`DimensionMismatch`).
+_value_axes(plan::StructuralPlan, ex, seen::Set{Symbol} = Set{Symbol}();
+        data_axes::Bool = false, throw_conflicts::Bool = false) =
+    _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts))
+
+_metadata_axis(d::Int) = d >= 0 ? d : _OS.SymbolicAxis(d)
+_metadata_axis(::Nothing) = nothing
+_metadata_axis(d) = _OS.SymbolicAxis(d)
+_declared_dim(ax::Base.OneTo) = length(ax)
+_declared_dim(ax::_OS.SymbolicAxis) = ax.name
+_declared_dim(ax) = nothing
+# An OutputSignatures axis as an `array_info` dimension.
+_array_info_dim(ax::Base.OneTo) = length(ax)
+_array_info_dim(ax) = ax
+
+function _declared_dims(info::_OS.ValueInfo)
+    axs = _OS.value_axes(info)
+    axs === nothing && return nothing
+    dims = Any[_declared_dim(a) for a in axs]
+    return any(isnothing, dims) ? nothing : dims
+end
+
+# A sampled value of these dims: a Float64 scalar or a Base array view
+# (packed parameters are read through views).
+_sampled_metadata(dims) = isempty(dims) ? _OS.scalar_info(Float64) :
+    _OS.array_info(Float64, (_metadata_axis(d) for d in dims)...;
+        container_type = AbstractArray{Float64,length(dims)})
+
+# A call's result facts. A proved conflict has none; an unsupported call may
+# still know some (a broadcast's axes).
+function _metadata_result(r::_OS.CallInfo, ex, throw_conflicts::Bool)
+    r.status === :incompatible || return r.value
+    throw_conflicts && throw(DimensionMismatch("$(repr(ex)): $(r.reason)"))
+    return _OS.ValueInfo()
+end
+
+_source_call_metadata(ex::Expr, args; kwargs = Pair{Symbol,_OS.ValueInfo}[]) =
+    ReactiveKernels._call_metadata(ex, _OS.ValueInfo[args...], @__MODULE__, ();
+        kwargs)
+
+_position_metadata(i) = i === :(:) ? _OS.known_info(Colon()) :
+    i isa Int ? _OS.known_info(i) : _OS.scalar_info(Int)
+
+_is_dotted_operator_call(ex) = Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+    ex.args[1] isa Symbol && ex.args[1] !== :. && startswith(String(ex.args[1]), ".")
+
+function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
+        data_axes::Bool, throw_conflicts::Bool = false)
+    ex isa Number && return _OS.known_info(ex)
+    if _is_bound_value_call(ex)
+        # A caller's value: bound data supplies its type and shape.
+        input = ex.args[2]
+        data_axes && input isa Symbol && haskey(plan.columns, input) &&
+            return _OS.value_info(plan.columns[input])
+        return _is_bound_array_value_call(ex) ? _OS.ValueInfo() :
+            _OS.ValueInfo(; axes = ())
+    end
     if ex isa Symbol
-        ex in seen && return nothing
-        if data_axes && haskey(plan.columns, ex)
-            value = plan.columns[ex]
-            return value isa AbstractArray ? Any[size(value)...] : Any[]
-        end
+        ex in seen && return _OS.ValueInfo()
+        data_axes && haskey(plan.columns, ex) &&
+            return _OS.value_info(plan.columns[ex])
         if _is_array_param(plan, ex)
             p = _array_param(plan, ex)
-            (data_axes && isbound(plan)) || return Any[p.dims...]
+            (data_axes && isbound(plan)) || return _sampled_metadata(p.dims)
             push!(seen, ex)
             r = p.family === :external ?
                 Any[_sampling_extent(plan, d, p.name) for d in p.dims] :
                 Any[_array_dim_size(plan, p, d; active = seen) for d in p.dims]
             delete!(seen, ex)
-            return r
+            return _sampled_metadata(r)
         end
         i = findfirst(v -> v.name === ex, plan.vector_parameters)
         if i !== nothing
@@ -629,7 +685,7 @@ function _value_axes(plan::StructuralPlan, ex,
                 plan.responses).size : p.size
             data_axes && sz === nothing && p.family === :simplex_dirichlet &&
                 (sz = _dirichlet_size(plan, p.args.arg1, p.label))
-            return sz === nothing ? nothing : Any[sz]
+            return _sampled_metadata(Any[sz])
         end
         if data_axes
             i = findfirst(p -> p.name === ex, plan.plate_parameters)
@@ -637,177 +693,140 @@ function _value_axes(plan::StructuralPlan, ex,
                 push!(seen, ex)
                 n = _plate_rows(plan, plan.plate_parameters[i]; active = seen)
                 delete!(seen, ex)
-                return Any[n]
+                return _sampled_metadata(Any[n])
             end
             i = findfirst(s -> ex in s.states, plan.scans)
             if i !== nothing
                 s = plan.scans[i]
                 # A trajectory owns its authored bound, not the row count
                 # of a response that happens to consume another value.
-                (s.hi isa Int || haskey(plan.columns, s.hi)) || return nothing
-                return Any[_scan_length(plan, s)]
+                (s.hi isa Int || haskey(plan.columns, s.hi)) ||
+                    return _OS.ValueInfo()
+                return _sampled_metadata(Any[_scan_length(plan, s)])
             end
         end
-        any(p -> p.name === ex, plan.parameters) && return Any[]
+        any(p -> p.name === ex, plan.parameters) && return _OS.scalar_info(Float64)
         definitions = data_axes ? (plan.assignments..., plan.derived...) : plan.assignments
         j = findfirst(a -> a.name === ex, definitions)
-        (j === nothing || ex in seen) && return nothing
+        j === nothing && return _OS.ValueInfo()
         push!(seen, ex)
-        r = _value_axes(plan, definitions[j].expr, seen; data_axes)
+        r = _value_metadata(plan, definitions[j].expr, seen; data_axes,
+            throw_conflicts)
         delete!(seen, ex)
         return r
     end
-    ex isa Expr || return nothing
+    ex isa Expr || return _OS.ValueInfo()
     levelaxis = _level_plate_axis(ex)
-    levelaxis === nothing || return Any[:(levels($levelaxis))]
-    ax(a) = _value_axes(plan, a, seen; data_axes)
-    head = ex.head
+    levelaxis === nothing || return _sampled_metadata(Any[:(levels($levelaxis))])
+    meta(a) = _value_metadata(plan, a, seen; data_axes, throw_conflicts)
     anchor = _matrix_intercept_anchor(ex)
     if anchor !== nothing
-        a = ax(anchor)
-        a === nothing && return nothing
-        all(d -> d isa Int, a) && return Any[prod(a; init = 1)]
-        length(a) == 1 && return a
-        return nothing
+        a = _declared_dims(meta(anchor))
+        a === nothing && return _OS.ValueInfo()
+        all(d -> d isa Int, a) && return _sampled_metadata(Any[prod(a; init = 1)])
+        length(a) == 1 && return _sampled_metadata(a)
+        return _OS.ValueInfo()
     end
+    Meta.isexpr(ex, :tuple) && all(a -> a isa Int, ex.args) &&
+        return _OS.known_info(Tuple(ex.args))
     # A vector literal keeps its outer axis even when its entries are live
     # scalars. Matrix products contract that axis rather than broadcasting
     # the matrix's columns into the observation domain.
-    head === :vect && return Any[length(ex.args)]
-    head === Symbol("'") && return _adjoint_axes(ax(ex.args[1]))
+    entries = ex.head === :vect ? ex.args :
+        Meta.isexpr(ex, :call) && !isempty(ex.args) &&
+            ex.args[1] === GlobalRef(Base, :vect) &&
+            !any(a -> Meta.isexpr(a, :...), ex.args[2:end]) ? ex.args[2:end] :
+        nothing
+    entries === nothing ||
+        return _vector_literal_metadata(ex, map(meta, entries), throw_conflicts)
+    head = ex.head
+    head === Symbol("'") && return _metadata_result(
+        _OS.infer_call(adjoint, _OS.ValueInfo[meta(ex.args[1])]), ex, throw_conflicts)
     if head === :.
-        _is_dotted_call(ex) || return nothing
-        return _broadcast_axes(Any[ax(a) for a in ex.args[2].args])
+        _is_dotted_call(ex) || return _OS.ValueInfo()
+        args = map(meta, ex.args[2].args)
+        return _declared_broadcast(_source_call_metadata(ex, args), args, ex,
+            throw_conflicts)
     end
-    if head === :ref
-        base = ax(ex.args[1])
-        idx = ex.args[2:end]
-        base === nothing && return nothing
-        if all(_is_position, idx)
-            length(idx) == length(base) || return nothing
-            return Any[d for (i, d) in zip(idx, base) if i === :(:)]
-        end
-        # A per-observation gather (`a[g]`, `A[g, :]`, `A[:, g]`) follows
-        # Julia indexing: each index contributes its own axes, a `:` the
-        # array's axis there, a literal position none and the index column
-        # its bound shape. A single index is linear, giving the column's
-        # axes alone. An unbound column has no size, so the gather does not.
-        _array_index_kind(plan, ex) === :gather || return nothing
-        cols = ax(idx[_gather_index_axis(plan, ex)])
-        cols === nothing && return nothing
-        length(idx) == 1 && return cols
-        length(idx) == length(base) || return nothing
-        out = Any[]
-        for (i, d) in zip(idx, base)
-            if i === :(:)
-                push!(out, d)
-            elseif !_is_scalar_position(i)
-                append!(out, cols)
-            end
-        end
-        return out
-    end
-    head === :call && !isempty(ex.args) || return nothing
-    fn = ex.args[1]
-    args = ex.args[2:end]
-    fn === GlobalRef(Base, :vect) &&
-        !any(a -> Meta.isexpr(a, :...), args) && return Any[length(args)]
-    if fn isa GlobalRef && getglobal(fn.mod, fn.name) === Base.hcat
-        return _hcat_axes(Any[ax(a) for a in args])
-    end
-    # Qualified Base calls, and the Julia function a bare reduction names
-    # (`Statistics.mean`), have the same shape rules as their bare spelling.
-    fn isa GlobalRef && (fn.mod === Base || fn.name in REDUCTION_FNS &&
-        fn == _julia_reduction_ref(fn.name)) && (fn = fn.name)
-    fn isa Symbol || return nothing
-    fn in REDUCTION_FNS && return _reduction_axes(ax, args)
-    fn === :transpose && length(args) == 1 &&
-        return _adjoint_axes(ax(args[1]))
-    fn === :* && return foldl(_matmul_axes, Any[ax(a) for a in args])
-    (fn in ELEMENTWISE_OPS || fn in (:+, :-, :/, :^)) &&
-        return _broadcast_axes(Any[ax(a) for a in args])
-    if fn in ASSIGNMENT_FNS
-        # Undotted scalar math (`exp(s)`) on scalars is a scalar.
-        all(a -> ax(a) == Any[], args) && return Any[]
-    end
-    return nothing
-end
-
-# A reduction is a scalar unless it keeps dimensions: `sum(A; dims = d)`
-# has `A`'s axes with each reduced one of length 1, as in Julia (a `dims`
-# beyond `A`'s rank leaves it unchanged). A `dims` that is not literal has
-# no known shape before the value is computed.
-function _reduction_axes(ax, args)
-    dims = nothing
-    for a in args, kw in (Meta.isexpr(a, :parameters) ? a.args : (a,))
-        kw === :dims && (dims = kw)
-        Meta.isexpr(kw, :kw, 2) && kw.args[1] === :dims && (dims = kw.args[2])
-    end
-    dims === nothing && return Any[]
-    ds = dims isa Int ? (dims,) : Meta.isexpr(dims, :tuple) &&
-        all(d -> d isa Int, dims.args) ? Tuple(dims.args) : nothing
-    (ds === nothing || !all(>=(1), ds)) && return nothing
-    pos = Any[a for a in args if !Meta.isexpr(a, (:parameters, :kw))]
-    isempty(pos) && return nothing
-    out = ax(last(pos))
-    out === nothing && return nothing
-    out = copy(out)
-    for d in ds
-        d <= length(out) && (out[d] = 1)
-    end
-    return out
-end
-
-# Concatenation shares the same shape walk as broadcasts, products and
-# declared arrays. It never runs live values or their element functions.
-function _hcat_axes(parts::Vector{Any})
-    any(isnothing, parts) && return nothing
-    isempty(parts) && return Any[0] # Base.hcat() returns an empty vector.
-    any(a -> length(a) > 2, parts) && return nothing
-    rows = Any[isempty(a) ? 1 : a[1] for a in parts]
-    if all(r -> r isa Int, rows) && !all(==(first(rows)), rows)
-        throw(DimensionMismatch("hcat operands have different row counts: $(repr(rows))"))
-    end
-    cols = Any[length(a) < 2 ? 1 : a[2] for a in parts]
-    all(c -> c isa Int, cols) || return nothing
-    return Any[first(rows), sum(cols)]
-end
-
-_adjoint_axes(a) = a === nothing ? nothing :
-    isempty(a) ? Any[] :
-    length(a) == 1 ? Any[1, a[1]] :
-    length(a) == 2 ? Any[a[2], a[1]] : nothing
-
-_is_singleton_axis(d) = d === 1
-
-# Broadcast axes: per position, the operands' non-singleton axis (a
-# `levels(g)` axis wins over a literal size, so a level gather stays
-# possible; mismatched lengths fail in Julia when the value is computed).
-function _broadcast_axes(axs::Vector{Any})
-    any(isnothing, axs) && return nothing
-    n = maximum(length, axs; init = 0)
-    out = Any[]
-    for i in 1:n
-        cands = Any[a[i] for a in axs
-            if length(a) >= i && !_is_singleton_axis(a[i])]
-        if isempty(cands)
-            push!(out, 1)
+    head === :ref && return _ref_metadata(plan, ex, meta, throw_conflicts)
+    head === :call && !isempty(ex.args) || return _OS.ValueInfo()
+    args = _OS.ValueInfo[]
+    kwargs = Pair{Symbol,_OS.ValueInfo}[]
+    for a in ex.args[2:end], kw in (Meta.isexpr(a, :parameters) ? a.args : (a,))
+        if Meta.isexpr(kw, :kw, 2) && kw.args[1] isa Symbol
+            push!(kwargs, kw.args[1] => meta(kw.args[2]))
+        elseif kw isa Symbol && a !== kw
+            push!(kwargs, kw => meta(kw))  # `f(x; dims)` reads `dims`
         else
-            j = findfirst(_is_levels_dim, cands)
-            push!(out, cands[j === nothing ? 1 : j])
+            push!(args, meta(kw))
         end
     end
-    return out
+    r = _source_call_metadata(ex, args; kwargs)
+    return _is_dotted_operator_call(ex) ?
+        _declared_broadcast(r, args, ex, throw_conflicts) :
+        _metadata_result(r, ex, throw_conflicts)
 end
 
-function _matmul_axes(A, B)
-    (A === nothing || B === nothing) && return nothing
-    isempty(A) && return B
-    isempty(B) && return A
-    length(A) == 2 && length(B) == 2 && return Any[A[1], B[2]]
-    length(A) == 2 && length(B) == 1 && return Any[A[1]]
-    length(A) == 1 && length(B) == 2 && return Any[A[1], B[2]]
-    return nothing
+# A vector literal of scalars is the vcat of its entries; entries that are
+# arrays make a vector of arrays, with only its outer axis known.
+function _vector_literal_metadata(ex, entries, throw_conflicts::Bool)
+    all(e -> _OS.value_rank(e) == 0, entries) && return _metadata_result(
+        _OS.infer_call(vcat, _OS.ValueInfo[entries...]), ex, throw_conflicts)
+    return _OS.ValueInfo(; type_bound = AbstractVector,
+        axes = (Base.OneTo(length(entries)),))
+end
+
+# `A[...]` reads literal positions or `:` (one per axis), or gathers per
+# observation (`a[g]`, `A[g, :]`, `A[:, g]`): the bound index column holds one
+# position per row, whatever its values (a level gather reads labels), and a
+# single index is linear.
+function _ref_metadata(plan::StructuralPlan, ex::Expr, meta, throw_conflicts::Bool)
+    base = meta(ex.args[1])
+    idx = ex.args[2:end]
+    if all(_is_position, idx)
+        _OS.value_rank(base) === length(idx) || return _OS.ValueInfo()
+        return _metadata_result(_OS.infer_call(getindex,
+            _OS.ValueInfo[base; map(_position_metadata, idx)]), ex, throw_conflicts)
+    end
+    _array_index_kind(plan, ex) === :gather || return _OS.ValueInfo()
+    k = _gather_index_axis(plan, ex)
+    rows = _OS.value_axes(meta(idx[k]))
+    rows === nothing && return _OS.ValueInfo()
+    length(idx) == 1 || _OS.value_rank(base) === length(idx) ||
+        return _OS.ValueInfo()
+    positions = _OS.array_info(Int, map(_array_info_dim, rows)...)
+    return _metadata_result(_OS.infer_call(getindex, _OS.ValueInfo[base;
+        [i == k ? positions : _position_metadata(idx[i]) for i in eachindex(idx)]]),
+        ex, throw_conflicts)
+end
+
+# PPL reads each declared dimension as an axis of its own, never a singleton
+# that a broadcast stretches. Where an operand carries one, the result keeps
+# it — a level axis first, so a level gather on the result stays possible —
+# even where lengths alone cannot prove which named (or literal) axis the
+# broadcast has.
+function _declared_broadcast(r::_OS.CallInfo, args, ex, throw_conflicts::Bool)
+    result = _metadata_result(r, ex, throw_conflicts)
+    rax = _OS.value_axes(result)
+    rax === nothing && return result
+    out = collect(Any, rax)
+    for i in eachindex(out)
+        named = _OS.SymbolicAxis[]
+        for a in args
+            axs = _OS.value_axes(a)
+            axs !== nothing && i <= length(axs) && axs[i] isa _OS.SymbolicAxis &&
+                push!(named, axs[i])
+        end
+        isempty(named) && continue
+        j = findfirst(a -> _is_levels_dim(a.name), named)
+        (j === nothing && out[i] !== nothing) && continue
+        out[i] = named[j === nothing ? 1 : j]
+    end
+    out == collect(Any, rax) && return result
+    r.status === :supported && return _OS.array_info(_OS.element_type(result),
+        map(_array_info_dim, out)...; container_type = _OS.type_bound(result))
+    return _OS.ValueInfo(; type_bound = _OS.type_bound(result),
+        element_type = _OS.element_type(result), axes = Tuple(out))
 end
 
 # The axes a per-observation read `A[g, ...]` gathers along: a declared

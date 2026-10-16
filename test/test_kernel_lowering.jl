@@ -42,11 +42,12 @@ end
     potid = RK._l_field_id(_LwPP, :pot)
     # the faithful phasepoint has BOTH pot_f(pos) and grad_f(pos) as pot producers; the OWNER is the
     # plan's selected producer — assert EQUALITY to plan.producer, not mere membership in plan.recipes.
+    owners = Dict(RK._canon_int(cid) => r.id for (cid, r) in pg.plan.producer)
     @test haskey(pg.producer, potid)
-    @test pg.producer[potid] == pg.plan.producer[potid].id     # the plan's chosen owner recipe id
+    @test pg.producer[potid] == owners[potid]                  # the plan's chosen owner recipe id
     # every derived value's owner is exactly its plan.producer entry (no last-writer drift)
     for (cid, rid) in pg.producer
-        @test rid == pg.plan.producer[cid].id
+        @test rid == owners[cid]
     end
 end
 
@@ -61,8 +62,8 @@ end
     r2 = RK.add!(g; inputs = (a,), outputs = (y, z), op = v -> (v, v), cost = 1.0)
     p = RK.plan(g; have = (a,), want = (x, z))
     pg = RK._l_plan_graph(p, ())
-    ycid = RK.canon_id(g, y.id); zcid = RK.canon_id(g, z.id)
-    owner = p.producer[ycid].id                                # the SELECTED owner of y
+    ycid = RK._canon_int(g, y); zcid = RK._canon_int(g, z)
+    owner = p.producer[RK.canon_id(g, y.id)].id                # the SELECTED owner of y
     nonowner = owner == r1.id ? r2.id : r1.id
     @test pg.producer[ycid] == owner                           # producer = plan's chosen owner (equality)
     @test ycid in pg.recipe_owned[owner]                       # owner owns y

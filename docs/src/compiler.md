@@ -25,7 +25,7 @@ boundary. In particular, a stateless recipe may contain arbitrary ordinary
 Julia behind an opaque recipe call, while a source-captured state-machine method
 must stay inside the compiler's inspectable and registered subset.
 
-## Numerical metadata and the first migration slice
+## Numerical metadata and its consumers
 
 OutputSignatures owns numerical transfer rules for compiler-visible calls.
 RK's internal `src/value_metadata.jl` adapter resolves callable identities and
@@ -42,7 +42,28 @@ expression reads a sampled value. Density roles, conditioning, observation
 domains and parameter layout remain PPL responsibilities. A scalar numerical
 result does not imply any of those roles.
 
-The adapter accepts a supported OS result only. Unknown or incompatible
+The second consumer is PPL's declaration and observation shape inference,
+`_value_axes` (`packages/ReactiveKernelsPPL/src/arrays.jl`). Its own broadcast,
+product, reduction, concatenation and adjoint rules have been removed; every
+numerical axis fact now comes from OS through the same adapter, which also
+reports a call's status and any sound partial facts. A literal size enters as a
+known extent and any other declared dimension (`levels(g)`, `axes(M, d)`) as a
+named `SymbolicAxis`, which comes back in its declared form. Bound data and a
+caller's values enter with their actual types; sampled values are `Float64`.
+Two PPL rules remain on top of the OS facts:
+
+- A broadcast keeps a declared axis that an operand carries, a level axis
+  first, so that a later level gather on the result stays possible.
+- A per-observation gather reads its bound index column as positions, whatever
+  the column's values (a level gather reads labels).
+
+Where OS proves a shape conflict, the shape is unavailable and Julia's own error
+appears when the value is computed. The exception is a declared axis sized from
+the value (`axes(M, d)`), which raises the `DimensionMismatch` at once. Where OS
+has no rule, the shape stays unknown: a whole reduction of an operand whose
+facts are unknown is not assumed to be a scalar.
+
+The pointwise adapter accepts a supported OS result only. Unknown or incompatible
 analysis retains the original Julia expression; it does not invent a scalar
 or copy an input's shape/type. A supported result is conditional on ordinary
 Julia execution succeeding, so bounds and broadcast compatibility checks must
@@ -63,9 +84,9 @@ Further compiler changes should follow these rules:
   Do not expand graph-wide compiler inference or encode observation lengths
   in generated program structure to make an analysis appear precise.
 
-This slice does not replace RK's general recipe typing or PPL's whole-model
-shape classifier. Matrix operations, scans, planner migration and a general
-opaque-call tracing protocol remain separate work. The next slice should name
+These consumers do not replace RK's general recipe typing or PPL's whole-model
+shape classifier. Scans, planner migration and a general opaque-call tracing
+protocol remain separate work. The next slice should name
 its numerical duplicate and acceptance examples before expanding the interface.
 The runnable [`benchmark/compiler_metadata_slice.jl`](https://github.com/nsiccha/ReactiveKernels.jl/blob/main/benchmark/compiler_metadata_slice.jl)
 shows the complete model, query/gradient interaction and separate timing stages;
@@ -98,7 +119,11 @@ establish](#what-the-nuts-proof-does-and-does-not-establish).
 
 ### 1. Graph construction
 
-A `Value` has a stable process-unique identity and a declared Julia value type.
+A `Value` has a stable identity and a declared Julia value type. The identity
+is the namespace that allocated the value plus a number within it. Every
+process, and every package image, allocates in a namespace of its own, so
+values from different images and from the running process never coincide, and
+a value that one image refers to from another keeps its identity after loading.
 Its name is only a diagnostic hint. Two values with the same name are distinct;
 generated local variables therefore never use a name as identity.
 
@@ -250,7 +275,10 @@ kernel) are alpha-renamed to canonical names before the expression reaches its
 content-addressed cache, so an unchanged plan lowers to one callable type:
 preparing the same graph shape again — including a `bound=` rebinding to data
 of the same types — reuses that type and compiles once per process rather than
-once per preparation. The resulting
+once per preparation. The cache, not the callable, retains the expression:
+the callable is identified by its type alone, so a prepared callable holds no
+mutable `Expr` for Enzyme to prove read-only where its call is not inlined, as
+for a prepared lazy-arm child. The resulting
 `PreparedKernel` stores the compiled callable, its concrete operation tuple,
 and inspection metadata. Calling it performs no graph traversal, producer
 selection, topological sort, cache lookup, or dynamic scheduling. Julia still
@@ -259,12 +287,15 @@ allocations, exceptions, and side effects are not erased by the graph compiler.
 
 Fresh authored definitions retain distinct provenance even when their source is
 identical. At prepared-kernel assembly, execution uses the existing generated
-source companion and its concrete lexical captures, with definition tokens
-carried as metadata instead of executable type parameters. This lets identical
-fresh builds reuse operation and derivative types without merging their graph
-identities or caching bound data. The original operations remain in the plan
-and source recipes. Bodies with local functions, generators, exception scopes,
-or boxed lexical cells retain Julia's native closure path. Private generated
+source companion and its concrete lexical captures. The execution copy carries
+no definition token: the original operations, with their tokens, remain in the
+plan, source recipes and `lowered_recipes`. This lets identical fresh builds
+reuse operation and derivative types without merging their graph identities or
+caching bound data. The execution copy holds no provenance value either, so a
+capture-free operation table stays free of heap references that Enzyme would
+otherwise have to prove read-only in the differentiated callable. Bodies with
+local functions, generators, exception scopes, or boxed lexical cells retain
+Julia's native closure path. Private generated
 names in the derivative operand pack are canonicalized in that actual pack;
 the operands and their positional reads are unchanged. Construction, planning,
 and preparation still perform work, so reusing a build remains useful.
@@ -766,6 +797,27 @@ plate computes work that reads only shared values (captured or `Ref` arrays,
 scalars, and values computed from them alone) once before its outer loop. The
 cell reads those results whole; the rest of its graph, including inner loops,
 runs per outer coordinate.
+
+Work that varies per outer coordinate cannot move out of the loop. When such a
+cell computes an `hcat` or a broadcast whose only readers are scalar indexing
+and shape queries, including readers in an embedded kernel's nested plates,
+native lowering reads its entries through those readers instead of storing it
+per cell. For example, `present = p .* offsets[event]` followed by
+`components = hcat(present, absent)` builds neither array per event. The graph
+and its queries keep both authored values, and ordinary Enzyme Reverse
+differentiates the composed reads without a derivative rule. Shape checks and
+declarations still run at the authored statement, and scalar reads keep bounds
+checks. The composition covers dense `Float32`/`Float64` arrays and real
+scalars, `hcat` of vectors and matrices, and one-dimensional broadcasts of
+total arithmetic (`+ - * /`, `exp`, `abs`, `abs2`, `logistic`, `log1pexp`,
+`identity`). Other values,
+whole-array readers, custom storage, broadcasts that may throw (such as `log.`)
+and effectful regions keep their stored arrays. A higher-rank broadcast is also
+stored: on Julia 1.10, ordinary Enzyme Reverse of composed matrix-broadcast
+reads fails with an internal error in Enzyme 0.13.216
+([EnzymeAD/Enzyme.jl#3822](https://github.com/EnzymeAD/Enzyme.jl/issues/3822)).
+`test/test_cell_arrays.jl` covers these cases and the event-count-independent
+allocations.
 
 An empty native plate evaluates no cell work, including shared expressions.
 For inferable cells, pointwise readers still return a concretely typed empty

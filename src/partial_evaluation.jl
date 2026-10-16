@@ -40,7 +40,7 @@ Base.show(io::IO, c::_BoundConstant) = print(io, "bound_constant(",
 _opname(::_BoundConstant) = "bound_constant"
 
 """
-    _partial_split(p::Plan, bound::Set{Int}, excluded = Set{Int}()) -> (prefix, residual, prefix_owned)
+    _partial_split(p::Plan, bound::Set{ValueId}, excluded = Set{Int}()) -> (prefix, residual, prefix_owned)
 
 Partition `p.recipes` (kept in execution order) into the data-only `prefix` —
 recipes whose every input is a bound HAVE port or a value owned by an earlier
@@ -54,7 +54,7 @@ Zero-input recipes are data-only by definition and hoist under any bound set,
 including an empty one. Recipes whose ids are in `excluded` stay in the
 residual whatever their inputs, and so do their data-only consumers.
 """
-function _partial_split(p::Plan, bound::Set{Int}, excluded::Set{Int} = Set{Int}())
+function _partial_split(p::Plan, bound::Set{ValueId}, excluded::Set{Int} = Set{Int}())
     g = p.graph
     prefix_owned = copy(bound)
     assigned = Set(canon_id(g, v.id) for v in p.have)
@@ -85,11 +85,11 @@ end
 # list) consumes whose authoritative binding is bind-time — a bound HAVE port
 # or a prefix-owned output. Ordered deterministically by first residual use,
 # then first WANT use.
-function _partial_constants(p::Plan, prefix_owned::Set{Int},
+function _partial_constants(p::Plan, prefix_owned::Set{ValueId},
                             residual::Vector{Recipe})
     g = p.graph
     constants = Value[]
-    seen = Set{Int}()
+    seen = Set{ValueId}()
     consider(v::Value) = begin
         cid = canon_id(g, v.id)
         cid in prefix_owned || return
@@ -127,7 +127,7 @@ function _partial_subplan(p::Plan, have::Vector{Value}, want::Vector{Value},
                           recipes::Vector{Recipe})
     g = p.graph
     have_ids = Set(canon_id(g, v.id) for v in have)
-    producer = Dict{Int,Recipe}()
+    producer = Dict{ValueId,Recipe}()
     for r in recipes, o in r.outputs
         cid = canon_id(g, o.id)
         cid in have_ids && continue
@@ -264,7 +264,7 @@ alone) replaced by the recipes of its parts (`_partial_emit_split!`). Their
 readable recipes are added to `readable`, keyed by recipe id. New values live
 in a copy of the inner graph. Returns `inner` itself when nothing splits.
 """
-function _partial_split_recipes(inner::Plan, bound::Set{Int}, excluded::Set{Int},
+function _partial_split_recipes(inner::Plan, bound::Set{ValueId}, excluded::Set{Int},
                                 readable)
     g = inner.graph
     dataonly = copy(bound)
@@ -395,7 +395,7 @@ nodes from recipes of their own (see above). `speculative` maps each such
 node recipe's id to its key `(recipe id, arm path, node)`; nodes whose key is
 in `refused` are not split out. Returns `inner` itself when nothing changes.
 """
-function _partial_speculate_recipes(inner::Plan, bound::Set{Int}, excluded::Set{Int},
+function _partial_speculate_recipes(inner::Plan, bound::Set{ValueId}, excluded::Set{Int},
                                     readable, refused; bound_guards::Bool = false)
     g = inner.graph
     dataonly = copy(bound)
@@ -653,9 +653,9 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         push!(assigned, cid)
     end
 
-    bound = Set{Int}()
-    arguments = Dict{Int,Any}()
-    cell_types = Dict{Int,Any}()
+    bound = Set{ValueId}()
+    arguments = Dict{ValueId,Any}()
+    cell_types = Dict{ValueId,Any}()
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
         cid = canon_id(g, outer.id)
         haskey(known, cid) || continue
@@ -972,7 +972,7 @@ end
 _plate_branch_anchor(operation) = nothing
 function _plate_branch_anchor(operation::_KernelSourceOp{D,F,N,T}) where
         {D,F,N<:_KernelBranch,T<:_KernelBranch}
-    _KernelSourceOp(Val(kernel_sourceop_token(operation)), Val(F), _plate_branch_anchor_metadata(operation.f),
+    _KernelSourceOp(Val(D), Val(F), _plate_branch_anchor_metadata(operation.f),
         _plate_branch_anchor_metadata(operation.tensor_f), operation.ignored_throws)
 end
 function _plate_branch_anchor_metadata(branch::_KernelBranch{CI,TI,EI}) where {CI,TI,EI}
@@ -1012,7 +1012,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
 
     # Bound plate arguments by inner port, and the one-dimensional lane count
     # they fix. Live arguments are gathered at run time (`_LaneGather`).
-    bound = Dict{Int,Any}()
+    bound = Dict{ValueId,Any}()
     n = nothing
     singleton_axis = false
     unknown_axis = false
@@ -1074,7 +1074,7 @@ Base.@nospecializeinfer function _partition_plate_recipe(
     # native loop and the tensorized batch evaluate it per lane. Known lane
     # values: bound lane-length vectors and live arguments declared as arrays,
     # plus every cell value computed from one.
-    lane_values = Set{Int}()
+    lane_values = Set{ValueId}()
     anchor = nothing
     for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
         index in atomic_inputs && continue
@@ -1262,7 +1262,7 @@ function _partial_inner_plates(p::Plan, known)
     g = p.graph
     copied = Graph(copy(g.values), copy(g.recipes), copy(g.producers),
                    copy(g.aliases), g.version)
-    known = Dict{Int,Any}(known)
+    known = Dict{ValueId,Any}(known)
     recipes = Recipe[]
     next_id = Ref(minimum((r.id for r in p.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
@@ -1437,14 +1437,14 @@ end
 # set alone, like the boundary computed from its result.
 function _partial_split_bound(p::Plan, bound_values::Vector{Value})
     isempty(bound_values) && return p
-    bound = Set{Int}(canon_id(p.graph, v.id) for v in bound_values)
+    bound = Set{ValueId}(canon_id(p.graph, v.id) for v in bound_values)
     _partial_split_recipes(p, bound, Set{Int}(), Dict{Int,Any}())
 end
 
 function _partial_boundary(p::Plan, bound_values::Vector{Value})
     g = p.graph
     have_ids = Set(canon_id(g, v.id) for v in p.have)
-    bound_ids = Set{Int}()
+    bound_ids = Set{ValueId}()
     for v in bound_values
         cid = canon_id(g, v.id)
         cid in have_ids || throw(ArgumentError(
@@ -1535,7 +1535,7 @@ end
 # its identity, and every other recipe, are the boundary's own.
 function _partial_narrow_plate_inputs(g::Graph, b::_PartialBoundary,
                                       @nospecialize(classes::Tuple))
-    narrowed = Dict{Int,Any}()
+    narrowed = Dict{ValueId,Any}()
     for (slot, class) in zip(b.plate_slots, classes)
         class === nothing || (narrowed[canon_id(g, b.constants[slot].id)] = class)
     end
@@ -1579,7 +1579,7 @@ end
 # binding because branch partitions and cached cell values depend on them.
 function _partial_known_values(p::Plan, b::_PartialBoundary, @nospecialize(hoisted))
     g = p.graph
-    known = Dict{Int,Any}()
+    known = Dict{ValueId,Any}()
     for (value, data) in zip(b.constants, hoisted)
         known[canon_id(g, value.id)] = data
     end

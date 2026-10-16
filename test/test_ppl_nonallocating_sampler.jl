@@ -15,8 +15,7 @@ using Test
 const NA_SAMPLER_BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
 
 # A Gaussian regression whose location is a matrix-vector product: the
-# ordinary kernel allocates the product, the location plate's output and the
-# likelihood residual on every evaluation.
+# ordinary kernel allocates the product on every evaluation.
 _na_regression = @rkppl begin
     alpha ~ Normal(0, 10)
     beta[axes(X, 2)] .~ Normal.(0, 10)
@@ -112,12 +111,12 @@ end
     qna = prepare_sampler(built, plan, u; backend = NA_SAMPLER_BACKEND, nonallocating = true)
     ordinary = Base.invokelatest(_na_density_bytes, q, u)
     reused = Base.invokelatest(_na_density_bytes, qna, u)
-    # The ordinary density allocates the product, the location and the
-    # residual (three 60-element vectors); the non-allocating one keeps at
-    # most the likelihood residual's.
-    @test ordinary >= 3 * 60 * sizeof(Float64)
+    # The ordinary density allocates the product (one 60-element vector; the
+    # location and likelihood plates fuse into the total); the non-allocating
+    # one reuses its buffer and keeps no observation-length vector.
+    @test ordinary >= 60 * sizeof(Float64)
     @test reused < ordinary
-    @test reused <= 2 * 60 * sizeof(Float64)
+    @test reused < 60 * sizeof(Float64)
 end
 
 @testset "non-allocating sampler options" begin

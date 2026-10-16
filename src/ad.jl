@@ -168,9 +168,10 @@ _ad_restore_cotangent(point, cotangent) = cotangent
             context_index += 1
         end
     end
-    # Share the primal call boundary with externalized bound arrays: pass the
-    # original operands directly to the existing generated model body.
-    _native_body_call_expr(F, :(call.native), Any[:(call.ops), positional...])
+    # Pass the original operands directly to the existing generated model body,
+    # as externalized bound arrays do, without a warm wrapper's image-build
+    # dispatch (`_differentiated_body_call_expr`).
+    _differentiated_body_call_expr(F, :(call.native), Any[:(call.ops), positional...])
 end
 
 function _ad_operation_slots!(used, node)
@@ -732,6 +733,16 @@ end
 
 _ad_na_concretize_cache(::Nothing, step::Int, op) = nothing
 
+# A lane slot keeps an owned copy of its seeded buffer, typed by it, which the
+# differentiated program only reads (`_lane_acquire(::Base.RefValue{<:Array},
+# ...)`). A lane the exemplar call never filled (an untaken branch) has no
+# buffer to offer: its producer allocates there, as the ordinary program does.
+function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, ::_NonallocLane)
+    seeded = slot[]
+    seeded isa Array || return nothing
+    Base.RefValue{typeof(seeded)}(copy(seeded))
+end
+
 # Name each externalized slot after the variable its program loads it into
 # (`X = __ops__[1]()`: a bound port or a folded step's result), falling back
 # to the slot number for a load that is not a whole statement.
@@ -892,7 +903,7 @@ end
     # wrapper's one-tuple splat stays a dynamic `Core._apply_iterate`, and
     # native Reverse rejects the constant HAVE arrays stored there beside the
     # shadowed caches (`_native_body_call_expr`).
-    _native_body_call_expr(F, :(call.f),
+    _differentiated_body_call_expr(F, :(call.f),
         Any[:(call.ops), :(getfield(contexts, $N)), :(call.cache_apply),
             arguments...])
 end
@@ -951,7 +962,7 @@ _ad_active_selector(kernel::_ADKernel, active) =
 function _ad_validate_unique_haves(spec::KernelSpec)
     graph = spec.graph
     haves = inputs(spec)
-    first_name = Dict{Int,Symbol}()
+    first_name = Dict{ValueId,Symbol}()
     aliases = Pair{Symbol,Symbol}[]
     for input in haves
         id = canon_id(graph, input.id)
@@ -1592,7 +1603,10 @@ so the differentiated callable carries no bound data and ordinary reverse-mode
 `AutoEnzyme` needs no function annotation.
 
 Result types must be stable across calls: a step whose result type changes
-after preparation fails loudly instead of silently reseeding. Like every
+after preparation fails loudly instead of silently reseeding. Each materialized
+plate or scan output fills the buffer the exemplar call produced, so the
+gradient also keeps those shapes: a call whose output has another shape fails
+loudly; prepare the gradient again for it. Like every
 [`PreparedADKernel`](@ref), the stored preparation is mutable and not
 thread-safe; prepare one object per concurrent caller.
 

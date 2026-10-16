@@ -761,15 +761,15 @@ function _kernel_factory_recipe_closure(skel, seed::Set{Symbol})
     graph = _kernel_the_graph(skel)
     pmap = _kernel_ports_map(skel)
     names = _kernel_all_ports(skel)
-    canonof(n) = canon_id(graph, pmap[n].id)
+    canonof(n) = _canon_int(graph, pmap[n])
     owned_canon = Set{Int}(canonof(n) for n in seed if haskey(pmap, n))
     changed = true
     while changed
         changed = false
         for r in graph.recipes
-            any(v -> canon_id(graph, v.id) in owned_canon, r.inputs) || continue
+            any(v -> _canon_int(graph, v) in owned_canon, r.inputs) || continue
             for o in r.outputs
-                c = canon_id(graph, o.id)
+                c = _canon_int(graph, o)
                 c in owned_canon || (push!(owned_canon, c); changed = true)
             end
         end
@@ -1113,7 +1113,8 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     graph = _kernel_the_graph(skel)
     pmap = _kernel_ports_map(skel)
     names = _kernel_all_ports(skel)
-    canonof(n) = canon_id(graph, pmap[n].id)
+    _check_canon_ints(graph)
+    canonof(n) = _canon_int(graph, pmap[n])
     havek = Set(_kernel_have_names(skel))
     # ONE ABSOLUTE superset field index per canonical Value (RK 05:48): distinct canonical Values in
     # authored port order → positions 1..N shared by BOTH role structs; the role only selects which
@@ -1148,18 +1149,18 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
     external_ids = Int[]       # HAVE callable authorities from ALL reachable portcall candidates
     if haveplan
         pl = plan(graph; have = have, want = want)
-        producer = Tuple(sort!([(cid, r.id) for (cid, r) in pl.producer]))
+        producer = Tuple(sort!([(_canon_int(cid), r.id) for (cid, r) in pl.producer]))
         recipes = Tuple(r.id for r in pl.recipes)
         # DETACHED recipe-input snapshot (RK 04:43/05:00): each selected recipe's CANONICAL input
         # Value ids in EXACT authored input ORDER (never sorted — the execution applier binds
         # arguments positionally), captured now so a live-graph mutation cannot alter it.
-        recipe_inputs = Tuple((r.id, Tuple(canon_id(graph, v.id) for v in r.inputs))
+        recipe_inputs = Tuple((r.id, Tuple(_canon_int(graph, v) for v in r.inputs))
                               for r in pl.recipes)
         # DETACHED ordered OUTPUT snapshot (RK 07:09): each selected recipe's CANONICAL output Value ids
         # in EXACT AUTHORED POSITIONAL ORDER from `r.outputs` — a returned tuple/scalar binds positionally,
         # so this is NEVER reconstructed by inverting/sorting the producer map (which drops order AND
         # collateral outputs). The producer-OWNED subset (blessing) stays `producer`.
-        recipe_outputs = Tuple((r.id, Tuple(canon_id(graph, v.id) for v in r.outputs))
+        recipe_outputs = Tuple((r.id, Tuple(_canon_int(graph, v) for v in r.outputs))
                                for r in pl.recipes)
         # The selected recipe OP VALUES in exact plan order (RK 07:20) — captured from the source-built
         # Recipe objects during THIS single planning pass, for the prepared executable handle tuple.
@@ -1172,7 +1173,7 @@ function _kernel_factory_plan(skel, owned::Set{Symbol}, shared::Set{Symbol}; key
             op = r.op
             (op isa _KernelSourceOp && kernel_sourceop_form(op) === :portcall && !isempty(r.inputs)) ||
                 continue
-            c = canon_id(graph, r.inputs[1].id)
+            c = _canon_int(graph, r.inputs[1])
             c in external_ids || push!(external_ids, c)
         end
         producer_keys = Int[cid for (cid, _) in producer]
