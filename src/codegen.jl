@@ -804,37 +804,15 @@ function _bind_native_type_exprs!(body, roots)
     map(bind, roots)
 end
 
-# Inline the scalar step into the ordered native loop. Calling the nested
-# PreparedKernel from a loop with a changing carry defeats inference across the
-# RGF boundary; the same step AST and operation table specialize normally here.
-# An empty sequence runs no step: the scan port is an empty vector of the
-# step's output type and a fused plate consumer sums nothing. An
-# `include_init = true` scan writes the carry seed and then each output into
-# one buffer one element longer than the sequences (`[init]` when empty).
-#
-# When the step's inferred output type is concrete, the first output has
-# exactly that type, so each buffer is allocated once with it, before the
-# emptiness branch, and both arms return that one allocation. Two buffers
-# allocated in separate arms would meet in one SSA value, which Enzyme's
-# static activity analysis rejects once the empty arm's buffer is never
-# written with active data (`EnzymeRuntimeActivityError`;
-# `benchmark/repro_enzyme_branch_allocation_phi.jl`). Allocating after a
-# branch that peels the first step to type the buffer does not avoid it: the
-# optimizer splits that allocation back into the arms. An inferred type that
-# is not concrete keeps one allocation per arm, typed by the first output when
-# there is one. A step with a nested plate, scan or embedded kernel is typed
-# from the cold slots at `type_offset` (`_scan_type_slots!`); without them its
-# type is `Any`.
-function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
-                                      offset; consumer = nothing, recycled = nothing,
-                                      pointwise_recycled = nothing,
-                                      type_offset = nothing, strips = nothing,
-                                      terminals = nothing)
-    _scan_has_history(op) && return _lower_authored_scan_history_native!(
-        body, op, callargs, lhs, offset; recycled)
+# The inlined scalar step of a scan without `history`, shared by its native
+# lowerings: the iterated sequences `seqs` (`xs` defines the axis), the step
+# body reading one element of each sequence at `index` and binding
+# `(carry, output)`, and the step's static output type. The step reads the
+# carry and the sequence elements by the names given; shared operands pass
+# whole.
+function _authored_scan_step(op::_AuthoredScanOp, callargs, offset, index, carry,
+                             output; strips = nothing, type_offset = nothing)
     step = op.kernel
-    indices, index, carry, output, output_type, position = gensym.((:scan_indices,
-        :scan_index, :scan_carry, :scan_output, :scan_output_type, :scan_position))
     # `A` marks the atomic operands: index 1 (the carry seed) plus the `Ref`
     # shareds.  The iterated sequences are the remaining operand indices; each is
     # indexed by the loop counter per step, while shared operands pass whole.
@@ -886,6 +864,42 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
     inferred_output_type = something(
         _authored_scan_step_output_type(step, step_input_types, offset;
                                         type_offset), Any)
+    (; seqs, xs, step_body, inferred_output_type)
+end
+
+# Inline the scalar step into the ordered native loop. Calling the nested
+# PreparedKernel from a loop with a changing carry defeats inference across the
+# RGF boundary; the same step AST and operation table specialize normally here.
+# An empty sequence runs no step: the scan port is an empty vector of the
+# step's output type and a fused plate consumer sums nothing. An
+# `include_init = true` scan writes the carry seed and then each output into
+# one buffer one element longer than the sequences (`[init]` when empty).
+#
+# When the step's inferred output type is concrete, the first output has
+# exactly that type, so each buffer is allocated once with it, before the
+# emptiness branch, and both arms return that one allocation. Two buffers
+# allocated in separate arms would meet in one SSA value, which Enzyme's
+# static activity analysis rejects once the empty arm's buffer is never
+# written with active data (`EnzymeRuntimeActivityError`;
+# `benchmark/repro_enzyme_branch_allocation_phi.jl`). Allocating after a
+# branch that peels the first step to type the buffer does not avoid it: the
+# optimizer splits that allocation back into the arms. An inferred type that
+# is not concrete keeps one allocation per arm, typed by the first output when
+# there is one. A step with a nested plate, scan or embedded kernel is typed
+# from the cold slots at `type_offset` (`_scan_type_slots!`); without them its
+# type is `Any`.
+function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
+                                      offset; consumer = nothing, recycled = nothing,
+                                      pointwise_recycled = nothing,
+                                      type_offset = nothing, strips = nothing,
+                                      terminals = nothing)
+    _scan_has_history(op) && return _lower_authored_scan_history_native!(
+        body, op, callargs, lhs, offset; recycled)
+    indices, index, carry, output, output_type, position = gensym.((:scan_indices,
+        :scan_index, :scan_carry, :scan_output, :scan_output_type, :scan_position))
+    (; seqs, xs, step_body, inferred_output_type) = _authored_scan_step(
+        op, callargs, offset, index, carry, output; strips, type_offset)
+    typeof_ref = GlobalRef(Base, :typeof)
     invariant = Any[]
     # `typing` runs before the emptiness branch: it binds the inferred output
     # type and, when that type is concrete, preallocates every buffer into its
@@ -1060,6 +1074,96 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                           empty_output, nonempty))
     append!(body.args, final_output.args)
     outer_body
+end
+
+# A scan read only through `trajectory[lo:hi]` (`_authored_scan_slice_demand`)
+# runs only the steps that slice reads and writes their outputs straight into
+# the slice's result, emitted where the reader is. It stops after the last
+# demanded step; a `carry_free` step (one that reads neither its carry nor
+# history) also skips every step before the first demanded one. The steps it
+# skips compute only values nothing reads, as plan selection drops unread
+# values elsewhere. The result is the reader's: the same bounds, an
+# out-of-bounds slice throws the `BoundsError` that slicing the whole
+# trajectory throws, and an empty slice runs no step. The demand loop needs a
+# concrete trajectory element type, `Int` bounds, unit-range step indices and
+# a vector or range sequence (whose trajectory is a `Vector`), all decided
+# when the body is compiled; otherwise the ordinary scan and the reader's own
+# call `reader_call` run.
+function _lower_authored_scan_slice_native!(body, op::_AuthoredScanOp, callargs,
+        offset, demand, reader_args, lhs, reader_call; type_offset = nothing)
+    indices, index, carry, output = gensym.((:scan_indices, :scan_index,
+        :scan_carry, :scan_output))
+    (; seqs, xs, step_body, inferred_output_type) = _authored_scan_step(
+        op, callargs, offset, index, carry, output; type_offset)
+    init = Int(_scan_includes_init(op))
+    seed = callargs[1]
+    # Evaluate each reader argument once, as its call would.
+    reader_args = Any[reader_args...]
+    for (i, arg) in enumerate(reader_args)
+        (i == demand.position || arg isa Symbol) && continue
+        name = gensym(:scan_slice_argument)
+        push!(body.args, :($name = $arg))
+        reader_args[i] = name
+    end
+    trajectory_length, lo, hi, element_type, slot, position = gensym.((
+        :scan_trajectory_length, :scan_slice_lo, :scan_slice_hi,
+        :scan_trajectory_eltype, :scan_slice_slot, :scan_slice_position))
+    lo_ex, hi_ex = _scan_slice_bound_exprs(demand, reader_args, trajectory_length)
+
+    ordinary = Expr(:block)
+    trajectory = gensym(:scan_trajectory)
+    _lower_authored_scan_native!(ordinary, op, callargs, trajectory, offset; type_offset)
+    ordinary_args = copy(reader_args)
+    ordinary_args[demand.position] = trajectory
+    push!(ordinary.args, Expr(:(=), lhs, Expr(:call, reader_call, ordinary_args...)))
+
+    typing = Expr(:block)
+    output_type = only(_bind_native_type_exprs!(typing, [inferred_output_type]))
+    append!(body.args, typing.args)
+    push!(body.args, :($indices = $(GlobalRef(Base, :eachindex))($(seqs...))))
+    push!(body.args, :($element_type = $(init == 1 ?
+        :($(GlobalRef(Base, :promote_type))($(GlobalRef(Base, :typeof))($seed), $output_type)) :
+        output_type)))
+    push!(body.args, :($trajectory_length = $(GlobalRef(Base, :length))($indices) + $init))
+    push!(body.args, :($lo = $lo_ex))
+    push!(body.args, :($hi = $hi_ex))
+
+    vector_ref = GlobalRef(Base, :Vector)
+    store(at, value) = _inbounds_expr(:($lhs[$at - $lo + 1] = $value))
+    demanded = Expr(:block)
+    push!(demanded.args, :($lo <= $hi && !(1 <= $lo && $hi <= $trajectory_length) &&
+        $(GlobalRef(Core, :throw))($(GlobalRef(Core, :BoundsError))(
+            $vector_ref{$element_type}(undef, $trajectory_length), ($lo:$hi,)))))
+    push!(demanded.args, :($lhs = $vector_ref{$element_type}(undef,
+        $(GlobalRef(Base, :max))($hi - $lo + 1, 0))))
+    init == 1 && push!(demanded.args, :($lo == 1 && $hi >= 1 && $(store(1, seed))))
+    step_at(k) = Expr(:block, :($index = $(_inbounds_value(:($indices[$k])))),
+                      copy(step_body).args...)
+    if demand.carry_free
+        # Each output depends on its own step: run exactly the demanded ones.
+        first_position = :($(GlobalRef(Base, :max))($lo, $(1 + init)))
+        push!(demanded.args, :($carry = $seed))
+        push!(demanded.args, Expr(:for, Expr(:(=), position, :($first_position:$hi)),
+            Expr(:block, step_at(:($position - $init)).args..., store(position, output))))
+    else
+        # Steps 1 through the last demanded one, the first peeled so the carry
+        # takes the step's type, as in the ordinary loop.
+        last_step = gensym(:scan_slice_last_step)
+        steps = Expr(:block, :($carry = $seed), step_at(1).args...,
+            :($position = $(1 + init)),
+            :($position >= $lo && $(store(position, output))),
+            Expr(:for, :($slot = 2:$last_step), Expr(:block, step_at(slot).args...,
+                :($position = $slot + $init),
+                :($position >= $lo && $(store(position, output))))))
+        push!(demanded.args, :($last_step = $hi - $init))
+        push!(demanded.args, Expr(:if, :($lo <= $hi && $last_step >= 1), steps))
+    end
+    ready = :($(GlobalRef(Base, :isconcretetype))($element_type) &&
+              $lo isa $Int && $hi isa $Int &&
+              $indices isa $(AbstractUnitRange{Int}) &&
+              $xs isa $(Union{AbstractRange,Vector}))
+    push!(body.args, Expr(:if, ready, demanded, ordinary))
+    body
 end
 
 # `local = __ops__[slot](...)` for a hoisted step statement becomes a read of
@@ -1294,6 +1398,74 @@ function _authored_scan_terminal_minima(p::Plan, scan_recipe::Recipe)
     last_index = maximum(findfirst(==(term.reduction), p.recipes) for term in terminal)
     any(r -> r.effectful, p.recipes[scan_index:last_index]) && return nothing
     terminal
+end
+
+# A scan read only through one slice `trajectory[lo:hi]`, whose other steps
+# compute nothing that is read (`_lower_authored_scan_slice_native!`). Returns
+# `(; reader, position, lo, hi, params, mod, carry_free)` or `nothing`.
+#
+# The scan has no `history` and a pure step; its result is no WANT and is read
+# by exactly one recipe, as exactly one of that recipe's inputs (`position`).
+# The reader is a pure ordinary source operation (`_lane_source_closure`)
+# whose native body is `x[lo:hi]` for the scan's parameter `x`, with Base's
+# `:` and bounds that do not read `x` (`begin`/`end` there are the
+# trajectory's first and last index). No effectful recipe runs between the
+# scan and its reader, where the slice is emitted. `carry_free`: the step
+# reads neither its carry nor history, so each output depends on its own step
+# only.
+function _authored_scan_slice_demand(p::Plan, scan_recipe::Recipe)
+    op = scan_recipe.op
+    op isa _AuthoredScanOp && !_scan_has_history(op) || return nothing
+    step = op.kernel.plan
+    any(r -> r.effectful, step.recipes) && return nothing
+    g = p.graph
+    scan_id = canon_id(g, only(scan_recipe.outputs).id)
+    any(w -> canon_id(g, w.id) == scan_id, p.want) && return nothing
+    readers = [r for r in p.recipes if any(v -> canon_id(g, v.id) == scan_id, r.inputs)]
+    length(readers) == 1 || return nothing
+    reader = only(readers)
+    !reader.effectful && length(reader.outputs) == 1 || return nothing
+    positions = findall(v -> canon_id(g, v.id) == scan_id, reader.inputs)
+    length(positions) == 1 || return nothing
+    position = only(positions)
+    closure = _lane_source_closure(reader)
+    closure === nothing && return nothing
+    _, params, mod = closure
+    source = _lane_expand_dot(_lane_strip_lines(reader.source), mod)
+    source isa Expr && !_lane_has_macro(source) || return nothing
+    native = _lane_strip_lines(_kernel_native_body(source, mod, Set{Symbol}(params)))
+    native isa Expr && native.head === :ref && length(native.args) == 2 &&
+        native.args[1] === params[position] || return nothing
+    range = native.args[2]
+    range isa Expr && range.head === :call && length(range.args) == 3 &&
+        _kernel_resolve_binding(mod, range.args[1]) === Base.:(:) || return nothing
+    lo, hi = range.args[2], range.args[3]
+    params[position] in _source_symbols!(Set{Symbol}(), Expr(:tuple, lo, hi)) &&
+        return nothing
+    demand = (; reader, position, lo, hi, params, mod, carry_free = false)
+    # The bounds must be expressible over the reader's arguments.
+    placeholders = Any[gensym(:argument) for _ in reader.inputs]
+    any(isnothing, _scan_slice_bound_exprs(demand, placeholders, :length)) &&
+        return nothing
+    scan_index = findfirst(r -> r === scan_recipe, p.recipes)
+    reader_index = findfirst(r -> r === reader, p.recipes)
+    scan_index !== nothing && reader_index !== nothing && scan_index < reader_index ||
+        return nothing
+    any(r -> r.effectful, p.recipes[(scan_index + 1):(reader_index - 1)]) &&
+        return nothing
+    carry = canon_id(step.graph, first(step.have).id)
+    carry_free = canon_id(step.graph, step.want[2].id) != carry &&
+        !any(r -> any(v -> canon_id(step.graph, v.id) == carry, r.inputs), step.recipes)
+    (; demand..., carry_free)
+end
+
+# The slice bounds of `demand` over the reader's call arguments, with `end`
+# meaning `trajectory_length`; `nothing` for a bound outside the source grammar
+# (`_lane_source_node`).
+function _scan_slice_bound_exprs(demand, reader_args, trajectory_length)
+    ctx = _LaneSourceContext(demand.mod, Dict{Symbol,Any}(zip(demand.params, reader_args)))
+    ends = (trajectory_length, 1)
+    (_lane_source_node(ctx, demand.lo, ends), _lane_source_node(ctx, demand.hi, ends))
 end
 
 # Plates that compute a scan's per-step sequences, and that only that scan (or
@@ -2346,6 +2518,34 @@ end
 # Each authored scan of a plate body: its step operations, then any cold
 # type-only slots of a step that is not plain (`_scan_type_slots!`). Both
 # backend products append them in this order.
+# The scans of a plate cell that run only the steps their one slice reader
+# reads (`_lower_authored_scan_slice_native!`): reader index => (scan index,
+# demand). The scan then runs where, and as often as, its reader does. The
+# reader's dynamic roots include the scan's, so that is correct wherever it
+# sits; it adds no evaluations when both groups have the same roots, or when
+# both are dynamic groups evaluated at every coordinate (`unconditional`).
+# Neither may be a lane branch.
+function _plate_scan_slice_pairs(inner::Plan, groups, lane_arms, unconditional)
+    roots_of = Dict{Int,Set{Int}}()
+    for (roots, recipe_indices) in groups, recipe_index in recipe_indices
+        roots_of[recipe_index] = roots
+    end
+    pairs = Dict{Int,Tuple{Int,Any}}()
+    for (scan_index, recipe) in enumerate(inner.recipes)
+        recipe.op isa _AuthoredScanOp || continue
+        haskey(roots_of, scan_index) && !haskey(lane_arms, scan_index) || continue
+        demand = _authored_scan_slice_demand(inner, recipe)
+        demand === nothing && continue
+        reader_index = findfirst(r -> r === demand.reader, inner.recipes)
+        haskey(roots_of, reader_index) && !haskey(lane_arms, reader_index) || continue
+        scan_roots, reader_roots = roots_of[scan_index], roots_of[reader_index]
+        scan_roots == reader_roots ||
+            unconditional(scan_roots) && unconditional(reader_roots) || continue
+        pairs[reader_index] = (scan_index, demand)
+    end
+    pairs
+end
+
 function _plate_scan_offsets!(runtime_ops, runtime_recipes, inner)
     offsets = Dict{Int,NamedTuple{(:offset, :type_offset),
                                   Tuple{Int,Union{Nothing,Int}}}}()
@@ -3373,6 +3573,26 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     groups = nested === nothing ? _authored_plate_recipe_groups(
         inner, dependencies, root_positions, atomic, callvalues) :
         [(Set{Int}(), nested.invariants)]
+    slices = _plate_scan_slice_pairs(inner, groups, lane_arms, roots ->
+        !isempty(roots) && _authored_plate_unconditional_group(
+            roots, root_positions, atomic, callvalues))
+    sliced_scans = Set(first(pair) for pair in values(slices))
+    # A scan read only through one slice is emitted where that slice is read
+    # (`_lower_authored_scan_slice_native!`).
+    function lower_recipe!(block, recipe_index, args, out, operation, looped)
+        recipe_index in sliced_scans && return block
+        haskey(slices, recipe_index) || return _lower_plate_recipe_native!(
+            block, inner.recipes[recipe_index], args, out, operation,
+            get(scan_offsets, recipe_index, nothing))
+        scan_index, demand = slices[recipe_index]
+        scan_recipe = inner.recipes[scan_index]
+        scan_args = Any[_authored_plate_scalar_ref(
+            inner, locals, callargs, callvalues, prepared_arguments, atomic,
+            input, index, looped) for input in scan_recipe.inputs]
+        slots = scan_offsets[scan_index]
+        _lower_authored_scan_slice_native!(block, scan_recipe.op, scan_args,
+            slots.offset, demand, args, out, operation; slots.type_offset)
+    end
     has_scheduled_groups = any(groups) do (roots, _)
         !isempty(roots) && !_authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues)
@@ -3404,9 +3624,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             args = Any[_authored_plate_scalar_ref(
                 inner, locals, callargs, callvalues, prepared_arguments, atomic,
                 input, index, false) for input in recipe.inputs]
-            _lower_plate_recipe_native!(invariants, recipe, args, out,
-                Expr(:ref, _OPS_ARG, op_offset + recipe_index),
-                get(scan_offsets, recipe_index, nothing))
+            lower_recipe!(invariants, recipe_index, args, out,
+                Expr(:ref, _OPS_ARG, op_offset + recipe_index), false)
         end
     end
 
@@ -3467,8 +3686,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
                         :(getfield($operation, :f)), args, recipe.inputs,
                         arm.names, arm.slots, shared, declarations)))
             else
-                _lower_plate_recipe_native!(assignments, recipe, args, out,
-                    operation, get(scan_offsets, recipe_index, nothing))
+                lower_recipe!(assignments, recipe_index, args, out, operation, true)
             end
         end
         if _authored_plate_unconditional_group(
@@ -3918,6 +4136,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     skipped_recipes = Set{Int}()
     terminal_skips = Set{Int}()
     pending_scans = Dict{Int,Any}()
+    # Scans read only through one slice, emitted at that reader (native only).
+    pending_slices = Dict{Int,Any}()
     inferred_plate_types = nothing
     inferred_exemplar_types = nothing
     declared = Set{Symbol}()
@@ -4133,7 +4353,20 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             else
                 consumer = _authored_scan_sum_consumer(p, r)
                 hoisted = consumer === nothing ? _authored_scan_hoistable(r.op) : Int[]
-                if terminal !== nothing
+                slice = consumer === nothing && terminal === nothing &&
+                    !haskey(strip_regions, r.id) &&
+                    recycled(canon_id(g, only(r.outputs).id)) === nothing ?
+                    _authored_scan_slice_demand(p, r) : nothing
+                if slice !== nothing &&
+                        (recycled(canon_id(g, only(slice.reader.outputs).id)) !== nothing ||
+                         cells !== nothing && slice.reader.id in cells.recipes)
+                    slice = nothing
+                end
+                if slice !== nothing
+                    # Its reader's arguments are ready only there.
+                    pending_slices[slice.reader.id] =
+                        (r, callargs, scan_index, type_offset, slice)
+                elseif terminal !== nothing
                     _lower_authored_scan_native!(body, r.op, callargs, nothing,
                         scan_index; type_offset,
                         recycled = recycled(canon_id(g, only(r.outputs).id)),
@@ -4166,6 +4399,15 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         if embedded === nothing
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
+            if !tensorized && haskey(pending_slices, r.id)
+                scan_recipe, scan_args, scan_offset, scan_type_offset, slice =
+                    pending_slices[r.id]
+                _lower_authored_scan_slice_native!(body, scan_recipe.op, scan_args,
+                    scan_offset, slice, callargs, lhs,
+                    Expr(:ref, _OPS_ARG, length(runtime_ops));
+                    type_offset = scan_type_offset)
+                continue
+            end
             # A recycled dotted-call or slice result fills its lane buffer
             # (`_lane_source_expr`); the table keeps the operation either way.
             destination = !tensorized && length(r.outputs) == 1 &&
