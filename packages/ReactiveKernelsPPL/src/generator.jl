@@ -3870,10 +3870,11 @@ function _categorical_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
     return Expr[pre..., _plate_sum_stmts(pw,node,inputs,cell)...]
 end
 
-# Stable log-logistic (Stan `log_inv_logit`): `z ≥ 0` takes
-# `-log1p(exp(-z))`, `z < 0` takes `z - log1p(exp(z))` — no overflow
-# either tail. Base ops only (transparent to the reverse pass).
-_log_inv_logit(z) = :(ifelse($z >= 0.0, -log1p(exp(-$z)), $z - log1p(exp($z))))
+# Stable log-logistic (Stan `log_inv_logit`): `-log1pexp(-z)`, the RK
+# Bernoulli-logit law's form. Its lazy branches evaluate one `exp` and one
+# `log1p`, with no overflow in either tail. An eager `ifelse` of the two
+# one-sided forms evaluated both, doubling every ordinal cell's work.
+_log_inv_logit(z) = :(-log1pexp(-$z))
 
 # Ordinal link log-CDF / log-CCDF over a scalar z (SB `brm_ordinal_logcdf`
 # / `brm_ordinal_logccdf`). Probit uses the slice-1 erfc treatment
