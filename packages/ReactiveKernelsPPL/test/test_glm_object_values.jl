@@ -378,10 +378,10 @@ end
 # The per-observation spelling of the same regression uses ordinary AD:
 # a Gaussian response located at `M * v` (inline or named) or
 # `alpha .+ M * v` (bound data matrix, declared coefficient vector,
-# sampled intercept; one shared scale)
-# has a residual-and-dot total. The explicit NormalIDGLM object retains the
-# authored rule. Other locations keep the per-cell plate, and a
-# non-positive scale keeps the plate cell's `-Inf`.
+# sampled intercept; one shared scale) sums its cells in the observation
+# plate, as every other Normal location does. The explicit NormalIDGLM
+# object retains the authored rule, and a non-positive scale keeps the plate
+# cell's `-Inf`.
 @testset "per-observation Normal over a design product uses ordinary AD" begin
     n = 9
     X, y = _gv_X(n), _gv_y(n)
@@ -426,7 +426,6 @@ end
         built = _gv_check(plan, data, nt -> sum(oracle(nt)))
         code = sprint(print, kernel_expr(plan, built.layout))
         @test !occursin("normal_id_glm_lpdf(", code)
-        @test occursin("_ppl_normal_residual_", code)
         u = _gv_u(built)
         nt = constrain(built.layout, u)
         @test Base.invokelatest(prepare_query(built, plan, :pointwise), u).y ≈ oracle(nt)
@@ -454,6 +453,23 @@ end
         sum(logpdf.(Normal.(X * constrain(built.layout, u).beta, 0.7), y))
     u[k] = -0.7
     @test Base.invokelatest(likelihood, u) == -Inf
+
+    # The gradient allocates the design product and its shadow, nothing
+    # observation-sized beyond them: the plate reads the location in place.
+    # A materialized residual (`y .- mu`, then `dot`) cost two more vectors
+    # (snag rkppl-natural-ga-1c464809). Bounded, not exact: allocation
+    # identity is not portable across platforms.
+    big = 1000
+    Xb = hcat(ones(big), sin.(1:big))
+    yb = Xb * [0.3, 0.2] .+ cos.(1:big)
+    for plan in (flat(; X = Xb) | (; y = yb), intercept(; X = Xb) | (; y = yb))
+        built = build_kernel(plan)
+        u = _gv_u(built)
+        q = prepare_sampler(built, plan, u; backend = _GV_BACKEND)
+        gb = similar(u)
+        sampler_value_and_gradient!(q, gb, u)
+        @test @allocated(sampler_value_and_gradient!(q, gb, u)) < 3 * sizeof(Float64) * big
+    end
 
     # A location that is not a data-matrix product keeps the plate.
     grouped = @rkppl begin
