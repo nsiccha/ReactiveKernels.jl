@@ -67,7 +67,7 @@ function _kernel_synthesize_recipe_edges!(graph::Graph, recipe::Recipe)
 end
 
 Base.@nospecializeinfer function _kernel_has_equivalent_recipe(
-        graph::Graph, input_id::Int, output_id::Int, @nospecialize(op))
+        graph::Graph, input_id::ValueId, output_id::ValueId, @nospecialize(op))
     for candidate in graph.recipes
         length(candidate.inputs) == 1 || continue
         canon_id(graph, only(candidate.inputs).id) == input_id || continue

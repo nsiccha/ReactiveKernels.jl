@@ -333,9 +333,9 @@ end
             return total
         end
         g = multi_site_logpdf.graph
-        have_ids = Set(ReactiveKernels.canon_id(g, multi_site_logpdf.v.id))
+        have_ids = Set((ReactiveKernels.canon_id(g, multi_site_logpdf.v.id),))
         want_ids = [ReactiveKernels.canon_id(g, multi_site_logpdf.total.id)]
-        counts = Dict{Int,Int}()
+        counts = Dict{ReactiveKernels.ValueId,Int}()
         for rid in ReactiveKernels._candidate_recipes(g, have_ids, want_ids)
             for o in g.recipes[rid].outputs
                 cid = ReactiveKernels.canon_id(g, o.id)

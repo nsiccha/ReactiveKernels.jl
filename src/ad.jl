@@ -952,7 +952,7 @@ _ad_active_selector(kernel::_ADKernel, active) =
 function _ad_validate_unique_haves(spec::KernelSpec)
     graph = spec.graph
     haves = inputs(spec)
-    first_name = Dict{Int,Symbol}()
+    first_name = Dict{ValueId,Symbol}()
     aliases = Pair{Symbol,Symbol}[]
     for input in haves
         id = canon_id(graph, input.id)

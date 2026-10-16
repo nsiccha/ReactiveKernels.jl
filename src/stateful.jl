@@ -71,7 +71,7 @@ struct ReactiveProgram{H,G,V,IN,OUT}
     values::V
     inputs::IN
     outputs::OUT
-    index::Dict{Int,Int}
+    index::Dict{ValueId,Int}
     dependents::Vector{Vector{Int}}
     sources::BitVector
     plan::Plan
@@ -92,7 +92,7 @@ mutable struct CompiledReactiveState{P,S}
     stack::Vector{Int}
 end
 
-function _owned_output(plan::Plan, recipe::Recipe, id::Int)
+function _owned_output(plan::Plan, recipe::Recipe, id::ValueId)
     any(value -> canon_id(plan.graph, value.id) == id, plan.have) && return false
     owner = get(plan.producer, id, nothing)
     owner !== nothing && owner.id == recipe.id
@@ -101,7 +101,7 @@ end
 function _state_values(plan::Plan)
     graph = plan.graph
     result = Value[]
-    seen = Set{Int}()
+    seen = Set{ValueId}()
     for value in plan.have
         id = canon_id(graph, value.id)
         id in seen && continue
@@ -146,7 +146,7 @@ end
 # `prepare_reactive` program, so that program's AST is byte-identical to before
 # this hook existed. For a slot in the set, the store site is routed through the
 # injected `__cache_apply__` helper (see `_ReactiveGetterInPlace`).
-function _ensure_expr(plan::Plan, index, recipe_index, id::Int,
+function _ensure_expr(plan::Plan, index, recipe_index, id::ValueId,
                       mutating_slots::Set{Int} = Set{Int}())
     graph = plan.graph
     slot_index = index[id]
@@ -234,7 +234,7 @@ function _ensure_expr(plan::Plan, index, recipe_index, id::Int,
     end
 end
 
-function _getter_ast(plan::Plan, index, recipe_index, id::Int;
+function _getter_ast(plan::Plan, index, recipe_index, id::ValueId;
                      in_place::Bool = false,
                      mutating_slots::Set{Int} = Set{Int}())
     slot_index = index[id]
@@ -247,7 +247,7 @@ function _getter_ast(plan::Plan, index, recipe_index, id::Int;
     Expr(:function, signature, body)
 end
 
-function _prepare_getter(plan::Plan, index, recipe_index, id::Int;
+function _prepare_getter(plan::Plan, index, recipe_index, id::ValueId;
                          cache_apply = nothing,
                          mutating_slots::Set{Int} = Set{Int}())
     in_place = cache_apply !== nothing
@@ -693,7 +693,7 @@ _handle_tuple(values::AbstractVector) = Tuple(values)
 
 "Checkpoint valid derived values for a later `program(...; frozen=cp)` instance."
 function checkpoint(state::CompiledReactiveState, values)
-    result = Dict{Int,Any}()
+    result = Dict{ValueId,Any}()
     for value in _handle_tuple(values)
         handle = value isa ReactiveValue ? value : statevalue(state, value)
         _check_handle(state, handle)
