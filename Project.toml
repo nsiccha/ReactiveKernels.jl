@@ -32,7 +32,7 @@ ReactiveKernelsMutatingFunctionsExt = "MutatingFunctions"
 ReactiveKernelsReactantExt = "Reactant"
 
 [sources]
-OutputSignatures = {url = "https://github.com/nsiccha/OutputSignatures.jl.git", rev = "5ecdead11eb8bbae599629a1c3119c5f403d45a1"}
+OutputSignatures = {url = "https://github.com/nsiccha/OutputSignatures.jl.git", rev = "74b2ae4cc2f48ca06dde204ce77ed188c07aad9b"}
 
 [compat]
 ChainRulesCore = "1"
@@ -43,7 +43,7 @@ Enzyme_jll = "0.0.0 - 0.0.301, 0.0.303 - 0.0"
 InverseFunctions = "0.1"
 LambertW = "1"
 LogExpFunctions = "0.3"
-OutputSignatures = "0.1.1"
+OutputSignatures = "0.1.4"
 MutatingFunctions = "0.1"
 OrdinaryDiffEqBDF = "2.4"
 PrecompileTools = "1.2"

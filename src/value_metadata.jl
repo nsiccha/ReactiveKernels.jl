@@ -3,6 +3,8 @@
 # translates Julia's call/index/broadcast syntax. No user function is run.
 
 function _metadata_callable(callee, mod::Module, shadowed)
+    callee isa GlobalRef && return isdefined(callee.mod, callee.name) ?
+        getglobal(callee.mod, callee.name) : nothing
     callee isa Symbol && callee in shadowed && return nothing
     if Meta.isexpr(callee, :., 2) && callee.args[1] isa Symbol
         callee.args[1] in shadowed && return nothing
@@ -10,12 +12,13 @@ function _metadata_callable(callee, mod::Module, shadowed)
     return _kernel_resolve_binding(mod, callee)
 end
 
-# Return the result descriptor for a source call whose operand descriptors
-# have already been computed. Unsupported or incompatible analysis leaves the
-# authored operation intact at the caller; it is not a runtime error policy.
-function _call_value_info(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
-                          mod::Module, shadowed;
-                          kwargs = Pair{Symbol,OutputSignatures.ValueInfo}[])
+# The OutputSignatures `CallInfo` for a source call whose operand descriptors
+# have already been computed: `.status` says whether a rule applied, and an
+# `:unknown` result may still carry sound partial facts (a broadcast's axes).
+function _call_metadata(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
+                        mod::Module, shadowed;
+                        kwargs = Pair{Symbol,OutputSignatures.ValueInfo}[])
+    unknown(reason) = OutputSignatures.CallInfo(OutputSignatures.ValueInfo(), :unknown, reason)
     f, broadcasted = if ex.head === :ref
         getindex, false
     elseif ex.head === :call && !isempty(ex.args)
@@ -28,9 +31,9 @@ function _call_value_info(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
     elseif Meta.isexpr(ex, :., 2) && Meta.isexpr(ex.args[2], :tuple)
         _metadata_callable(ex.args[1], mod, shadowed), true
     else
-        return OutputSignatures.ValueInfo()
+        return unknown("no call syntax")
     end
-    f === nothing && return OutputSignatures.ValueInfo()
+    f === nothing && return unknown("callee is not a resolved binding")
     # Julia lowers a literal exponent in x^n / x.^n to literal_pow. In
     # particular integer bases with negative literal powers produce floats;
     # the ordinary ^ call can throw instead. Normalize syntax, not a guessed
@@ -45,15 +48,21 @@ function _call_value_info(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
         args = OutputSignatures.ValueInfo[OutputSignatures.known_info(Base.:^),
             args[1], OutputSignatures.known_info(Val(operands[2]))]
     end
-    result = if broadcasted
-        isempty(kwargs) || return OutputSignatures.ValueInfo()
-        OutputSignatures.infer_call(broadcast,
-            OutputSignatures.ValueInfo[OutputSignatures.known_info(f); args])
-    else
-        OutputSignatures.infer_call(f, args; kwargs)
-    end
-    # An unsupported broadcast can still know its axes. Those partial facts
-    # alone do not authorize replacing its materialization with a plate.
+    broadcasted || return OutputSignatures.infer_call(f, args; kwargs)
+    isempty(kwargs) || return unknown("a broadcast call takes no keywords")
+    return OutputSignatures.infer_call(broadcast,
+        OutputSignatures.ValueInfo[OutputSignatures.known_info(f); args])
+end
+
+# Return the result descriptor for a source call whose operand descriptors
+# have already been computed. Unsupported or incompatible analysis leaves the
+# authored operation intact at the caller; it is not a runtime error policy.
+# An unsupported broadcast can still know its axes. Those partial facts
+# alone do not authorize replacing its materialization with a plate.
+function _call_value_info(ex::Expr, args::Vector{OutputSignatures.ValueInfo},
+                          mod::Module, shadowed;
+                          kwargs = Pair{Symbol,OutputSignatures.ValueInfo}[])
+    result = _call_metadata(ex, args, mod, shadowed; kwargs)
     return result.status === :supported ? result.value : OutputSignatures.ValueInfo()
 end
 
