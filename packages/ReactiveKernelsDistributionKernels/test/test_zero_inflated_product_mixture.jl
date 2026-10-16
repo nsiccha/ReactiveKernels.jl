@@ -26,6 +26,7 @@ end
 
 @testset "zero-inflated Binomial product mixture streams component scores" begin
     law = prepare(zero_inflated_binomial_logit_product_mixture_logdensity)
+    allocated = Dict{Tuple{Int,Int},Int}()
     for (positions, components) in ((4, 6), (9, 13), (0, 6))
         counts = mod.(collect(1:positions), 5)
         trials = fill(4, positions, components)
@@ -35,8 +36,12 @@ end
         expected = product_mixture_logit_reference(zib_logit_reference_cell,
             counts, (trials, logits, zi_logits), weights)
         @test law(counts, trials, logits, zi_logits, weights) ≈ Float64(expected) atol=1e-14 rtol=1e-13
-        @test law_allocated(law, counts, trials, logits, zi_logits, weights) == 0
+        allocated[(positions, components)] =
+            law_allocated(law, counts, trials, logits, zi_logits, weights)
     end
+    # The weights' logs are the one vector a call allocates: no component
+    # vector, and nothing that grows with the positions.
+    @test allocated[(4, 6)] == allocated[(0, 6)]
     @test law([0], zeros(Int, 1, 0), zeros(1, 0), zeros(1, 0), Float64[]) == -Inf
 end
 

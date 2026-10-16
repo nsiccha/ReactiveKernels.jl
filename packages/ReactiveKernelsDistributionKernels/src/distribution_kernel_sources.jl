@@ -1245,14 +1245,21 @@ const zero_inflated_binomial_logit_zi = _OTHER_DISTRIBUTION_BINDINGS[23]
 # parameter matrices are component laws; rows are positions within the one
 # event. The two nested plates retain both data-derived loops, while the
 # shared mixture fold keeps any family-specific cell density in one place.
-# Each law checks its weight count against its own component count, so the
-# fold's only reader of the component scores is its weighting plate: RK then
-# composes the component plate into that plate, and `logsumexp` streams the
-# weighted scores, without a buffer per event.
+# Each law checks its parameter matrix's component count against the weights
+# and passes the weights on as given. The fold's only reader of the component
+# scores is then its weighting plate: RK composes the component plate into that
+# plate, and `logsumexp` streams the weighted scores, without a buffer per
+# event. The weights' logs are taken before that plate, from the weights alone:
+# in a plate over events that share the weights, they are shared work of the
+# event cell, which RK computes once per call rather than once per event.
+# Weights that vary by event instead cost one K-entry vector per event; a log
+# computed inside the weighting plate (or by a plate composed into it) would
+# avoid that vector but run once per event even when the weights are shared.
 @kernel _product_mixture_fold(component_scores::Vector{Float64},
         weights::Vector{Float64}) = begin
-    weighted = plate(component_scores, weights) do score, weight
-        log(weight) + score
+    log_weights = log.(weights)
+    weighted = plate(component_scores, log_weights) do score, log_weight
+        log_weight + score
     end
     return LogExpFunctions.logsumexp(weighted)
 end
@@ -1261,24 +1268,25 @@ end
         weights::Vector{Float64}) = begin
     # A singleton vector is broadcast by plate; that would assign one weight
     # to every component instead of representing one weight per component.
-    checked_weights = length(component_scores) == length(weights) ?
-        weights : throw(DimensionMismatch("mixture weights must match components"))
-    return _product_mixture_fold(component_scores, checked_weights)
+    # The check returns the scores, so the weights reach the fold as given.
+    checked_scores = length(component_scores) == length(weights) ?
+        component_scores : throw(DimensionMismatch("mixture weights must match components"))
+    return _product_mixture_fold(checked_scores, weights)
 end
 
 @kernel bernoulli_product_mixture_logdensity(observed::Vector{Bool},
         probabilities::Matrix{Float64}, weights::Vector{Float64}) = begin
-    checked_probabilities = size(probabilities, 1) == length(observed) ?
+    rows_checked = size(probabilities, 1) == length(observed) ?
         probabilities : throw(DimensionMismatch("probability rows must match observations"))
-    checked_weights = size(probabilities, 2) == length(weights) ?
-        weights : throw(DimensionMismatch("mixture weights must match components"))
-    components = plate(1:size(checked_probabilities, 2)) do k
+    checked_probabilities = size(rows_checked, 2) == length(weights) ?
+        rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
             bernoulli(checked_probabilities[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return _product_mixture_fold(components, checked_weights)
+    return _product_mixture_fold(components, weights)
 end
 
 @kernel binomial_product_mixture_logdensity(observed::Vector{Int},
@@ -1286,17 +1294,17 @@ end
         weights::Vector{Float64}) = begin
     checked_trials = size(trials) == size(probabilities) ?
         trials : throw(DimensionMismatch("trial counts and probabilities must match"))
-    checked_probabilities = size(probabilities, 1) == length(observed) ?
+    rows_checked = size(probabilities, 1) == length(observed) ?
         probabilities : throw(DimensionMismatch("probability rows must match observations"))
-    checked_weights = size(probabilities, 2) == length(weights) ?
-        weights : throw(DimensionMismatch("mixture weights must match components"))
-    components = plate(1:size(checked_probabilities, 2)) do k
+    checked_probabilities = size(rows_checked, 2) == length(weights) ?
+        rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
             binomial(checked_trials[i, k], checked_probabilities[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return _product_mixture_fold(components, checked_weights)
+    return _product_mixture_fold(components, weights)
 end
 
 # Logit-scale versions: `logits[i, k]` is component k's log-odds at position i.
@@ -1308,17 +1316,17 @@ end
 # probability 1.
 @kernel bernoulli_logit_product_mixture_logdensity(observed::Vector{Bool},
         logits::Matrix{Float64}, weights::Vector{Float64}) = begin
-    checked_logits = size(logits, 1) == length(observed) ?
+    rows_checked = size(logits, 1) == length(observed) ?
         logits : throw(DimensionMismatch("logit rows must match observations"))
-    checked_weights = size(logits, 2) == length(weights) ?
-        weights : throw(DimensionMismatch("mixture weights must match components"))
-    components = plate(1:size(checked_logits, 2)) do k
+    checked_logits = size(rows_checked, 2) == length(weights) ?
+        rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
             bernoulli(; logit = checked_logits[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return _product_mixture_fold(components, checked_weights)
+    return _product_mixture_fold(components, weights)
 end
 
 @kernel binomial_logit_product_mixture_logdensity(observed::Vector{Int},
@@ -1326,18 +1334,18 @@ end
         weights::Vector{Float64}) = begin
     checked_trials = size(trials) == size(logits) ?
         trials : throw(DimensionMismatch("trial counts and logits must match"))
-    checked_logits = size(logits, 1) == length(observed) ?
+    rows_checked = size(logits, 1) == length(observed) ?
         logits : throw(DimensionMismatch("logit rows must match observations"))
-    checked_weights = size(logits, 2) == length(weights) ?
-        weights : throw(DimensionMismatch("mixture weights must match components"))
-    components = plate(1:size(checked_logits, 2)) do k
+    checked_logits = size(rows_checked, 2) == length(weights) ?
+        rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
             binomial(; n = checked_trials[i, k],
                 logit = checked_logits[i, k]).logpdf(observed[i])
         end
         sum(cells)
     end
-    return _product_mixture_fold(components, checked_weights)
+    return _product_mixture_fold(components, weights)
 end
 
 # Zero-inflated Binomial cells, both probabilities on the log-odds scale:
@@ -1353,11 +1361,11 @@ end
         trials : throw(DimensionMismatch("trial counts and logits must match"))
     checked_zi_logits = size(zi_logits) == size(logits) ?
         zi_logits : throw(DimensionMismatch("zero-inflation logits and logits must match"))
-    checked_logits = size(logits, 1) == length(observed) ?
+    rows_checked = size(logits, 1) == length(observed) ?
         logits : throw(DimensionMismatch("logit rows must match observations"))
-    checked_weights = size(logits, 2) == length(weights) ?
-        weights : throw(DimensionMismatch("mixture weights must match components"))
-    components = plate(1:size(checked_logits, 2)) do k
+    checked_logits = size(rows_checked, 2) == length(weights) ?
+        rows_checked : throw(DimensionMismatch("mixture weights must match components"))
+    components = plate(1:length(weights)) do k
         cells = plate(1:length(observed)) do i
             zero_inflated_binomial_logit_zi(; n = checked_trials[i, k],
                 logit = checked_logits[i, k],
@@ -1365,7 +1373,7 @@ end
         end
         sum(cells)
     end
-    return _product_mixture_fold(components, checked_weights)
+    return _product_mixture_fold(components, weights)
 end
 
 # Hidden Markov models. The forward algorithm marginalizes the discrete state
@@ -1456,6 +1464,14 @@ end
 # streams are independent given the state. Emission parameters broadcast over
 # states × streams × steps: a per-state vector, a states × streams matrix, or
 # a third axis for parameters that change with the step.
+#
+# A scale is read by every cell its broadcast reaches, often T cells per
+# element, so its log is taken once per element, before the plate, and handed
+# to each cell's family object through its `log_scale` port. With cells to
+# visit, every element is read by some cell; an empty plate takes no log, as
+# before.
+@inline _hmm_log_scales(scales, cells) = cells == 0 ? float.(scales) : log.(scales)
+
 @kernel normal_hmm_log_weights_logdensity(observed, locations, scales,
         log_transition, log_initial) = begin
     K = length(log_initial)
@@ -1467,12 +1483,14 @@ end
         throw(DimensionMismatch("locations must broadcast over states × streams × steps"))
     checked_scales = _hmm_broadcasts(scales, K, S, T) ? scales :
         throw(DimensionMismatch("scales must broadcast over states × streams × steps"))
+    log_scales = _hmm_log_scales(checked_scales, T * K * S)
     cells = plate(1:(T * K * S)) do cell
         t = (cell - 1) % T + 1
         k = ((cell - 1) ÷ T) % K + 1
         s = (cell - 1) ÷ (T * K) + 1
-        normal(_hmm_at(checked_locations, k, s, t),
-            _hmm_at(checked_scales, k, s, t)).logpdf(checked_observed[t, s])
+        normal(; location = _hmm_at(checked_locations, k, s, t),
+            scale = _hmm_at(checked_scales, k, s, t),
+            log_scale = _hmm_at(log_scales, k, s, t)).logpdf(checked_observed[t, s])
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
     return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
@@ -1495,11 +1513,13 @@ end
         throw(DimensionMismatch("observations must be a vector or a steps × streams matrix"))
     checked_scales = _hmm_broadcasts(scales, K, S, T) ? scales :
         throw(DimensionMismatch("scales must broadcast over states × streams × steps"))
+    log_scales = _hmm_log_scales(checked_scales, T * K * S)
     cells = plate(1:(T * K * S)) do cell
         t = (cell - 1) % T + 1
         k = ((cell - 1) ÷ T) % K + 1
         s = (cell - 1) ÷ (T * K) + 1
-        exponential(_hmm_at(checked_scales, k, s, t)).logpdf(checked_observed[t, s])
+        exponential(; scale = _hmm_at(checked_scales, k, s, t),
+            log_scale = _hmm_at(log_scales, k, s, t)).logpdf(checked_observed[t, s])
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
     return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
