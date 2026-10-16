@@ -100,6 +100,9 @@ init = s, include_init = true) do a_prev, t … end`. Several carried arrays
 (a `level` driven by an `increment`, say) share one scan. Its step returns
 all columns together; retained projection plates expose each trajectory with
 its seeds prepended. Requesting several trajectories does not replay the step.
+When the projections are the only readers of the rows, the native lowering
+writes each projected column directly from the scan loop and never stores the
+rows; the tensorized lowering keeps the plates.
 
 ### Reading earlier entries
 
