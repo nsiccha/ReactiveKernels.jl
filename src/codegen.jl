@@ -279,6 +279,11 @@ _plate_fold_ref(::typeof(LogExpFunctions.logsumexp)) =
 @inline _plate_similar_output(marker::Tuple, ::Type{T}, output_axes) where {T} =
     similar(Array{T}, output_axes)
 
+# A column projection's element type: the field's type in a concrete
+# named-tuple scan output, else `Any`, as the projection plate infers it.
+@inline _scan_column_eltype(::Type{T}, ::Val{name}) where {T,name} =
+    T <: NamedTuple && isconcretetype(T) && hasfield(T, name) ? fieldtype(T, name) : Any
+
 # An untyped plate cell exposes its result through a metadata-`Any` boundary
 # port (type annotations are optional metadata in an authored kernel), so the
 # native lowering allocates its pointwise container as a boxed `Vector{Any}` —
@@ -893,7 +898,7 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
                                       offset; consumer = nothing, recycled = nothing,
                                       pointwise_recycled = nothing,
                                       type_offset = nothing, strips = nothing,
-                                      terminals = nothing)
+                                      terminals = nothing, columns = nothing)
     _scan_has_history(op) && return _lower_authored_scan_history_native!(
         body, op, callargs, lhs, offset; recycled)
     indices, index, carry, output, output_type, position = gensym.((:scan_indices,
@@ -949,6 +954,25 @@ function _lower_authored_scan_native!(body, op::_AuthoredScanOp, callargs, lhs,
         push!(initial_output.args, :($lhs[$index] = $output))
         # The buffer shares the sequences' axes, which `index` comes from.
         push!(loop_output.args, _inbounds_expr(:($lhs[$index] = $output)))
+    end
+    if columns !== nothing
+        # Each projected field of the named-tuple output goes straight into its
+        # column's buffer, typed and narrowed as the projection plate's own
+        # pointwise buffer (`_authored_scan_column_projections`).
+        for column in columns
+            field = QuoteNode(column.field)
+            column_type = :($(GlobalRef(@__MODULE__, :_scan_column_eltype))(
+                $output_type, $(GlobalRef(Base, :Val))($field)))
+            allocation = :($(GlobalRef(Base, :similar))($xs, $column_type))
+            buffer!(column.lhs, column.recycled === nothing ? allocation :
+                _lane_allocation(column.recycled, column_type, :($axes_ref($xs)),
+                                 allocation))
+            value = :($(GlobalRef(Base, :getproperty))($output, $field))
+            push!(initial_output.args, :($(column.lhs)[$index] = $value))
+            push!(loop_output.args, _inbounds_expr(:($(column.lhs)[$index] = $value)))
+            push!(final_output.args, :($(column.lhs) =
+                $(GlobalRef(@__MODULE__, :_narrow_plate_output))($(column.lhs))))
+        end
     end
     if consumer !== nothing
         cell, args, positions, cell_offset, pointwise_lhs, total_lhs = consumer
@@ -1295,6 +1319,55 @@ function _authored_scan_sum_consumer(p::Plan, scan_recipe::Recipe)
         end
     end
     consumer
+end
+
+# The field `name` when `recipe` is a column projection of the scan output
+# `rows_id`, `plate(rows) do row; row.name end` (`_scan_column_expr`), else
+# `nothing`. The cell is exactly the undeclared field read of its one lane.
+function _scan_column_projection_field(p::Plan, recipe::Recipe, rows_id)
+    recipe.op isa _AuthoredPlateOp && length(recipe.inputs) == 1 &&
+        length(recipe.outputs) == 1 || return nothing
+    canon_id(p.graph, only(recipe.inputs).id) == rows_id || return nothing
+    1 in typeof(recipe.op).parameters[2] && return nothing # Ref(rows) is whole.
+    isempty(recipe.op.axis_checks) || return nothing
+    inner = recipe.op.kernel.plan
+    length(inner.have) == 1 && length(inner.recipes) == 1 &&
+        length(inner.want) == 1 || return nothing
+    cell = only(inner.recipes)
+    length(cell.inputs) == 1 && length(cell.outputs) == 1 || return nothing
+    canon_id(inner.graph, only(cell.inputs).id) ==
+        canon_id(inner.graph, only(inner.have).id) || return nothing
+    canon_id(inner.graph, only(cell.outputs).id) ==
+        canon_id(inner.graph, only(inner.want).id) || return nothing
+    valtype(only(inner.want)) === Any || return nothing
+    cell.op isa _KernelSourceOp || return nothing
+    source = cell.source
+    source isa Expr && source.head === :. && length(source.args) == 2 &&
+        source.args[2] isa QuoteNode && source.args[2].value isa Symbol &&
+        source.args[1] === only(_recipe_source_names(cell)) || return nothing
+    source.args[2].value
+end
+
+# A scan whose rows are read only through column projections writes each
+# projected column directly, so neither the row vector nor a projection pass
+# is materialized. Each projection's output must be needed and unsummed: a
+# selected total would need the plate's own streamed fold. Returns
+# `[(; recipe, field)]` in plan order, or `nothing`.
+function _authored_scan_column_projections(p::Plan, scan_recipe::Recipe)
+    op = scan_recipe.op
+    (_scan_includes_init(op) || _scan_has_history(op)) && return nothing
+    g = p.graph
+    rows_id = canon_id(g, only(scan_recipe.outputs).id)
+    any(v -> canon_id(g, v.id) == rows_id, (p.want..., p.have...)) && return nothing
+    columns = Any[]
+    for recipe in p.recipes
+        any(v -> canon_id(g, v.id) == rows_id, recipe.inputs) || continue
+        field = _scan_column_projection_field(p, recipe, rows_id)
+        field === nothing && return nothing
+        _authored_plate_total_recipe(p, recipe) === nothing || return nothing
+        push!(columns, (; recipe, field))
+    end
+    isempty(columns) ? nothing : columns
 end
 
 # Scalarize only a verified Base arithmetic broadcast over primitive scalar
@@ -1705,7 +1778,8 @@ end
 function _lower_authored_scan_strips!(body, scan_recipe::Recipe, records,
                                       hoisting, callargs, lhs, offset,
                                       runtime_ops, runtime_recipes;
-                                      type_offset = nothing, recycled = nothing)
+                                      type_offset = nothing, recycled = nothing,
+                                      columns = nothing)
     op = scan_recipe.op
     region_outputs = Dict{Symbol,Nothing}()
     for record in records
@@ -1741,7 +1815,7 @@ function _lower_authored_scan_strips!(body, scan_recipe::Recipe, records,
     if isempty(outer)
         emit_plates!(body, false, false; ordinary = true)
         return _lower_authored_scan_native!(body, op, callargs, lhs, offset;
-                                            type_offset, recycled)
+                                            type_offset, recycled, columns)
     end
     lo, hi, axis = gensym(:strip_lo), gensym(:strip_hi), gensym(:strip_axis)
     views = Dict(arg => gensym(:strip_lane) for arg in outer)
@@ -1758,11 +1832,11 @@ function _lower_authored_scan_strips!(body, scan_recipe::Recipe, records,
             $(GlobalRef(Base, :last))($axis))))
     emit_plates!(bind_views(fused), true, false)
     _lower_authored_scan_native!(fused, op, callargs, lhs, offset; type_offset,
-        recycled, strips = (; positions, lo, hi, axis, refill,
-                              hoisted = hoisting.slots))
+        recycled, columns, strips = (; positions, lo, hi, axis, refill,
+                                       hoisted = hoisting.slots))
     ordinary = emit_plates!(Expr(:block), false, false; ordinary = true)
     _lower_authored_scan_native!(ordinary, op, callargs, lhs, offset; type_offset,
-                                 recycled)
+                                 recycled, columns)
     ready = Expr(:call, GlobalRef(@__MODULE__, :_plate_strip_ready), outer..., others...)
     isempty(hoisting.types) || (ready = Expr(:&&, ready,
         Expr(:call, GlobalRef(@__MODULE__, :_scan_hoisted_numbers), hoisting.types...)))
@@ -4172,6 +4246,9 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         end
     end
     strip_members = Set(x.id for region in values(strip_regions) for x in region)
+    # Column projections a native scan writes directly
+    # (`_authored_scan_column_projections`); each keeps its table slots.
+    scan_columns = Set{Int}()
     # Values plate cells read only at their own row, computed there
     # (`_cell_pushdowns`, cell_windows.jl). Native only: the tensorized product
     # computes them whole, and both keep the same operation table.
@@ -4247,7 +4324,16 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 total_lhs === nothing || _declare_typed_output!(
                     body, only(total_recipe.outputs), total_lhs, declared)
             end
-            if !tensorized && haskey(pending_scans, r.id)
+            if !tensorized && r.id in scan_columns
+                # The scan wrote this column; reserve the projection's table
+                # slots here, as for a strip member.
+                _lower_authored_plate_native!(
+                    Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
+                    callvalues, pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
+                    total_fold,
+                    input_type_hints = type_hints === nothing ? nothing :
+                        Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
+            elseif !tensorized && haskey(pending_scans, r.id)
                 scan_recipe, scan_args, scan_offset, scan_type_offset =
                     pending_scans[r.id]
                 output_id = canon_id(g, only(scan_recipe.outputs).id)
@@ -4376,6 +4462,29 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          cells !== nothing && slice.reader.id in cells.recipes)
                     slice = nothing
                 end
+                projections = slice === nothing && terminal === nothing &&
+                    consumer === nothing ?
+                    _authored_scan_column_projections(p, r) : nothing
+                if projections !== nothing && any(c -> c.recipe.id in strip_members ||
+                        (cells !== nothing && c.recipe.id in cells.recipes), projections)
+                    projections = nothing
+                end
+                columns = nothing
+                if projections !== nothing
+                    columns = Any[]
+                    for projection in projections
+                        column = only(projection.recipe.outputs)
+                        column_id = canon_id(g, column.id)
+                        push!(scan_columns, projection.recipe.id)
+                        push!(assigned, column_id)
+                        declare_types &&
+                            _declare_typed_output!(body, column, nm(column), declared)
+                        push!(columns, (; projection.field, lhs = nm(column),
+                                        recycled = recycled(column_id)))
+                    end
+                    # Nothing reads the rows themselves.
+                    lhs = nothing
+                end
                 if slice !== nothing
                     # Its reader's arguments are ready only there.
                     pending_slices[slice.reader.id] =
@@ -4395,12 +4504,12 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     _lower_authored_scan_strips!(body, r, records, hoisting,
                         callargs, lhs, scan_index, runtime_ops,
                         runtime_recipes; type_offset, recycled = lhs === nm(output) ?
-                            recycled(canon_id(g, output.id)) : nothing)
+                            recycled(canon_id(g, output.id)) : nothing, columns)
                 elseif consumer === nothing
                     output = only(r.outputs)
                     _lower_authored_scan_native!(body, r.op, callargs, lhs, scan_index;
                         type_offset, recycled = lhs === nm(output) ?
-                            recycled(canon_id(g, output.id)) : nothing)
+                            recycled(canon_id(g, output.id)) : nothing, columns)
                 else
                     # Emit at the plate, where all its scalar inputs are ready.
                     # The reserved table slots keep both backend products equal.
