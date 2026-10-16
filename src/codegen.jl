@@ -5431,6 +5431,19 @@ function _native_body_call_expr(::Type{F}, f, args) where {F}
     :($f($(args...)))
 end
 
+# A differentiated call boundary enters a warm wrapper's generated body
+# directly. The image-build branch above hands the operation table to a
+# latest-world dynamic call, which boxes a copy of the table read from the
+# differentiated callable. Once the table holds heap references, such as
+# source-operation tokens, plain Enzyme Reverse can no longer prove that
+# callable read-only. Enzyme compiles in the caller's world, so differentiating
+# while an image is being built requires the context method to be visible there.
+_differentiated_body_call_expr(::Type{F}, f, args) where {F} =
+    _native_body_call_expr(F, f, args)
+_differentiated_body_call_expr(::Type{<:_PrecompileWarmFunction}, f, args) =
+    :(Base.@inline RuntimeGeneratedFunctions.generated_callfunc(
+        getfield($f, :f), $(args...)))
+
 # Enter the existing generated body with positional operands. Together with
 # the inline prepared call, this keeps captured readonly operations out of a
 # temporary aggregate that ordinary Reverse otherwise treats as writable.
