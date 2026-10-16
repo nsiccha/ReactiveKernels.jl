@@ -1,7 +1,8 @@
 module HiddenMarkovTests
 using Test, ReactiveKernels, ReactiveKernelsPPL
 using ReactiveKernelsDistributionKernels.DistributionKernelSources:
-    normal_hmm_logdensity, exponential_hmm_logdensity
+    normal_hmm_logdensity, exponential_hmm_logdensity,
+    normal_hmm_log_weights_logdensity
 using Distributions: Exponential, Normal, logpdf
 import DifferentiationInterface as DI
 import Enzyme
@@ -138,6 +139,45 @@ end
         end, (; y, u), oracle;
             points = ([0.3, -0.4, 0.1, 0.5, -0.2, 0.6],
                 [-0.7, 0.2, 0.9, -0.3, 0.4, 1.1]))
+    end
+end
+
+# A transition defined on the log scale, as the source states it: each
+# previous state's per-step log-softmax goes to the log-weights law, with the
+# initial simplex's logarithms, and no probability matrix is formed. Named and
+# inline spellings have the density of the probability-space softmax above.
+@testset "input-driven log-softmax transitions" begin
+    u = [0.5 1.0; 1.2 -0.3; 0.1 0.4; 2.0 1.1; -0.4 0.2; 0.9 -1.0]
+    function oracle(c)
+        P = exp.(u * c.W) ./ sum(exp.(u * c.W); dims = 2)
+        means = u * c.B
+        path_sum((t, k) -> logpdf(Normal(means[t, k], c.sigma[k]), y[t]),
+            (i, j, t) -> P[t, i], c.rho, length(y))
+    end
+    log_softmaxes = (
+        :(begin
+            R = u * W
+            logP = R .- log.(sum(exp.(R); dims = 2))
+            log_moves = reshape(permutedims(logP[2:end, :]), 2, 1, size(u, 1) - 1)
+        end),
+        :(begin
+            log_moves = reshape(permutedims((u * W .- log.(sum(exp.(u * W);
+                dims = 2)))[2:end, :]), 2, 1, size(u, 1) - 1)
+        end),
+    )
+    for log_softmax in log_softmaxes
+        check_model(quote
+            rho ~ Dirichlet(ones(2))
+            W[axes(u, 2), 1:2] .~ Normal.(0, 5)
+            B[axes(u, 2), 1:2] .~ Normal.(0, 5)
+            sigma[1:2] .~ LogNormal.(0, 1)
+            $(log_softmax.args...)
+            means = reshape(permutedims(u * B), 2, 1, size(u, 1))
+            y ~ LogDensity(normal_hmm_log_weights_logdensity, means, sigma, log_moves,
+                log.(rho))
+        end, (; y, u), oracle;
+            points = (collect(range(-0.5, 0.5; length = 11)),
+                collect(range(0.7, -0.6; length = 11))))
     end
 end
 
