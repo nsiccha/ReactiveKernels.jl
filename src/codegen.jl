@@ -2736,8 +2736,7 @@ Base.@nospecializeinfer function _plate_branch_arm_kernel(
     next_id = Ref(minimum((q.id for q in inner.recipes); init = 0) - 1)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     replacement = if spec === nothing
-        token = getfield(r.op, :token)
-        form = (typeof(r.op)::DataType).parameters[2]
+        token, form = (typeof(r.op)::DataType).parameters
         arm_op = _KernelSourceOp(Val(Symbol(token, :_, side)), Val(form),
             getfield(native, then ? :then_arm : :else_arm),
             getfield(tensor, then ? :then_arm : :else_arm))
@@ -5057,13 +5056,15 @@ Compile a lowered `Expr` into a native Julia function via
 `RuntimeGeneratedFunctions`. The returned callable takes `(__ops__, args...)`.
 Prepared callables may be stored as package-level constants: during package
 precompilation, the package being compiled owns the generated expression cache.
-Global names in the lowered body still resolve in `ReactiveKernels`.
+Global names in the lowered body still resolve in `ReactiveKernels`. The
+callable does not hold the expression; the cache retains it for
+`RuntimeGeneratedFunctions.get_expression`.
 """
 function compile(ast::Expr)
     ast = _canonical_locals(ast)
     cache_module = _generated_function_cache_module()
-    cache_module === (@__MODULE__) &&
-        return RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast)
+    cache_module === (@__MODULE__) && return RuntimeGeneratedFunctions.drop_expr(
+        RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast))
     Base.invokelatest(RuntimeGeneratedFunctions.init, cache_module)
     # The cache and generated method must share an owner on Julia 1.12: a
     # generator defined in an older dependency cannot read new global bindings.
@@ -5074,6 +5075,11 @@ function compile(ast::Expr)
     # Hygiene renames every local through the global `gensym` counter again.
     qualified = _canonical_locals(_native_parameter_names(ast, qualified))
     f = Base.invokelatest(RuntimeGeneratedFunction, cache_module, cache_module, qualified)
+    # The call needs only the callable's type. A retained body is a mutable
+    # `Expr` in every prepared callable, and wherever the generated call is not
+    # inlined, such as a prepared lazy-arm child, Julia passes the callable by
+    # reference; ordinary Enzyme reverse then cannot prove it read-only.
+    f = Base.invokelatest(RuntimeGeneratedFunctions.drop_expr, f)
     # Only functions prepared before the new context method becomes visible
     # need this barrier, e.g. a builder that immediately warms its first kernel.
     applicable(RuntimeGeneratedFunctions.generated_callfunc, f) ? f :
@@ -5463,8 +5469,8 @@ end
 # A differentiated call boundary enters a warm wrapper's generated body
 # directly. The image-build branch above hands the operation table to a
 # latest-world dynamic call, which boxes a copy of the table read from the
-# differentiated callable. Once the table holds heap references, such as
-# source-operation tokens, plain Enzyme Reverse can no longer prove that
+# differentiated callable. Once the table holds heap references, such as a
+# captured `Ref` or array, plain Enzyme Reverse can no longer prove that
 # callable read-only. Enzyme compiles in the caller's world, so differentiating
 # while an image is being built requires the context method to be visible there.
 _differentiated_body_call_expr(::Type{F}, f, args) where {F} =
@@ -5569,8 +5575,7 @@ function _externalize_bound_array_call(f, ops;
                               _bound_record(value), values)
     external_body = structured ?
         _externalize_bound_array_body(f, positions, values) : nothing
-    callable = external_body === nothing ? f :
-        RuntimeGeneratedFunctions.drop_expr(external_body)
+    callable = external_body === nothing ? f : external_body
     external_values = external_body === nothing ? values : _bound_array_leaves(values)
     call = _ExternalizedBoundArrayCall{
         typeof(callable),typeof(stripped),positions,

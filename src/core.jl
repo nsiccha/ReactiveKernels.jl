@@ -187,9 +187,11 @@ validated unless it has an explicit compiler-owned tensorized replacement. `DefT
 definition-unique gensym baked in at graph build — NOT a security boundary (an internal
 constructor/type parameter cannot prevent deliberate internal misuse); it is trusted only because the
 supported authoring path is the ONLY thing that wraps a closure, so an arbitrary public Graph closure is
-never auto-wrapped. Graph operations retain distinct concrete types. Prepared
-execution copies carry the same token as a value, so provenance does not
-specialize an otherwise identical executable. No mutable registry is needed.
+never auto-wrapped. Graph operations retain distinct concrete types. A prepared
+execution copy (`_execution_source`) has `DefToken === nothing`: its plan and
+lowered recipes keep the original operation and its token, so provenance does
+not specialize an otherwise identical executable, and the differentiated
+callable holds no provenance value. No mutable registry is needed.
 `Form` (RK 07:24)
 distinguishes a `:portcall` — a call THROUGH A PORT, `callable(args…)`, whose first input is the callable
 source and the rest are ordered args — from a general `:fused` expression, so a prepared handle can
@@ -204,7 +206,6 @@ The call forwards INLINE. A RAW anonymous closure inserted into a Graph carries 
 rejected as opaque when captured into a prepared handle.
 """
 struct _KernelSourceOp{DefToken,Form,F,TF,IG,CI}
-    token::Symbol
     f::F
     tensor_f::TF
     ignored_throws::IG
@@ -222,8 +223,7 @@ Base.@nospecializeinfer function _KernelSourceOp(
     T = _KernelSourceOp{_val_parameter(token), _val_parameter(form),
                         typeof(f), typeof(tensor_f), typeof(ignored_throws),
                         typeof(call_identity)}
-    _kernel_new_instance(T, (_val_parameter(token), f, tensor_f, ignored_throws,
-                             call_identity))::_KernelSourceOp
+    _kernel_new_instance(T, (f, tensor_f, ignored_throws, call_identity))::_KernelSourceOp
 end
 
 Base.@nospecializeinfer _val_parameter(@nospecialize(value::Val)) =
@@ -408,7 +408,7 @@ end
     forwarded = [:(getfield(args, $index)) for index in 1:N]
     :(_kernel_source_call($style, op, $(forwarded...)))
 end
-kernel_sourceop_token(op::_KernelSourceOp) = getfield(op, :token)
+kernel_sourceop_token(::_KernelSourceOp{DefToken}) where {DefToken} = DefToken
 kernel_sourceop_form(::_KernelSourceOp{DefToken,Form}) where {DefToken,Form} = Form
 # The element type of an empty plate is Julia's empty-broadcast type: inferred
 # from the authored native cell over the operands' native element types, with
@@ -1954,13 +1954,13 @@ end
     end
     predicate = _plate_branch_predicate(branch.condition, condition_args)
     args = _plate_branch_operands(predicate, args)
-    # Retain the operation's type-level execution identity and its provenance
-    # value separately; a runtime token must not create a dynamic `Val` here.
+    # Build the arm operations from the static type parameters; a `Val` built
+    # here would dispatch dynamically on every call.
     yes = _KernelSourceOp{D,F,typeof(operation.f.then_arm),typeof(branch.then_arm),
-        typeof(operation.ignored_throws),Nothing}(operation.token,
+        typeof(operation.ignored_throws),Nothing}(
         operation.f.then_arm, branch.then_arm, operation.ignored_throws, nothing)
     no = _KernelSourceOp{D,F,typeof(operation.f.else_arm),typeof(branch.else_arm),
-        typeof(operation.ignored_throws),Nothing}(operation.token,
+        typeof(operation.ignored_throws),Nothing}(
         operation.f.else_arm, branch.else_arm, operation.ignored_throws, nothing)
     _recurrence_branch(predicate, _PlateBranchArm{TI,typeof(yes)}(yes),
         _PlateBranchArm{EI,typeof(no)}(no), args)
