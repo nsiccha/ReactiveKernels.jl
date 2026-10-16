@@ -4,6 +4,7 @@ const OS = ReactiveKernels.OutputSignatures
 
 const helper_calls = Ref(0)
 opaque_shape_change(x) = (helper_calls[] += 1; length(x))
+opaque_value(v) = (helper_calls[] += 1; v)
 const sum_alias = sum
 const pow_alias = ^
 
@@ -66,6 +67,36 @@ end
     @test OS.type_bound(info(:( (^).(x, -1) ), bindings)) === Vector{Float64}
     @test OS.type_bound(info(Expr(:call, GlobalRef(Base, :^), :a, -1), bindings)) === Float64
     @test OS.type_bound(info(:(a ^ n), bindings)) === Int8
+end
+
+@testset "concatenation keeps the axes of an opaque broadcast" begin
+    # An opaque scalar broadcast knows its axes but not its element type.
+    # Concatenation takes its axes from operand shapes alone, so the result
+    # is `:unknown` with sound partial axes (RKPPL keeps them to size
+    # `beta[axes(X, 2)]`). Partial facts do not authorize fusion:
+    # `_call_value_info` is the supported-only view.
+    calls = helper_calls[]
+    meta(ex, args) = ReactiveKernels._call_metadata(ex, OS.ValueInfo[args...],
+        @__MODULE__, ())
+    for n in (0, 1, 7)
+        column = OS.vector_info(Float64, n)
+        scaled = info(:(a .* x), Dict(:a=>OS.scalar_info(Float64), :x=>column))
+        opaque = meta(:(opaque_value.(z)), [scaled])
+        @test opaque.status === :unknown
+        @test OS.value_axes(opaque.value) == (Base.OneTo(n),)
+        X = meta(:(hcat(c, z)), [column, opaque.value])
+        @test X.status === :unknown
+        @test OS.value_axes(X.value) == (Base.OneTo(n), Base.OneTo(2))
+        @test OS.value_rank(ReactiveKernels._call_value_info(:(hcat(c, z)),
+            OS.ValueInfo[column, opaque.value], @__MODULE__, ())) === nothing
+        stacked = meta(:(vcat(c, z)), [column, opaque.value])
+        @test stacked.status === :unknown
+        @test OS.value_axes(stacked.value) == (Base.OneTo(2n),)
+    end
+    # Known unequal row counts are a proved conflict, not an unknown.
+    @test meta(:(hcat(c, z)), [OS.vector_info(Float64, 2),
+        OS.vector_info(Float64, 3)]).status === :incompatible
+    @test helper_calls[] == calls
 end
 
 @testset "kernel chain agrees with Julia and ordinary Reverse" begin
