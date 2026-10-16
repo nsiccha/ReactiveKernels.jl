@@ -58,27 +58,27 @@ struct _LPlanGraph
 end
 
 # Canonical id of a value in a graph.
-_l_cid(g::Graph, v::Value) = canon_id(g, v.id)
+_l_cid(g::Graph, v::Value) = _canon_int(g, v)
 
 # Build the endpoint recompute graph EXACTLY from an exact selected `Plan.producer` at `path`. Producer
 # ownership + which outputs a recipe blesses come ONLY from `plan.producer` (the selected owner map);
 # raw recipe outputs the plan did NOT assign to that recipe are COLLATERAL and never blessed/edged.
 function _l_plan_graph(plan::Plan, path::_LPath = (); name_of::Dict{Int,Symbol} = Dict{Int,Symbol}())
-    g = plan.graph
+    g = _check_canon_ints(plan.graph)
     sources = Set{Int}(_l_cid(g, v) for v in plan.have)
     # producer + owned outputs derived DIRECTLY from plan.producer (cid => the SELECTED owner recipe).
     producer = Dict{Int,Int}()
     recipe_owned = Dict{Int,Vector{Int}}()
     ownerrecipes = Dict{Int,Recipe}()
     for (vid, recipe) in plan.producer
-        cid = canon_id(g, vid)
+        cid = _canon_int(canon_id(g, vid))
         (cid in sources) && continue                  # a HAVE value is authoritative, never plan-produced
         producer[cid] = recipe.id                      # the plan's chosen owner (NOT last-writer)
         push!(get!(recipe_owned, recipe.id, Int[]), cid)
         ownerrecipes[recipe.id] = recipe
     end
     recipe_inputs = Dict{Int,Vector{Int}}(
-        rid => Int[canon_id(g, i.id) for i in r.inputs] for (rid, r) in ownerrecipes)
+        rid => Int[_l_cid(g, i) for i in r.inputs] for (rid, r) in ownerrecipes)
     dependents = _l_dependents(sources, producer, recipe_owned, recipe_inputs)
     _LPlanGraph(path, plan, producer, recipe_owned, recipe_inputs, dependents, sources, name_of)
 end
