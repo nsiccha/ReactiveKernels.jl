@@ -150,8 +150,11 @@ end
             @test result == reference
         end
         k = prepare_nonallocating(LAZY_DOMAIN; want = :y)
-        @test k(args...) isa Vector{Float64}
-        @test k.caches[2] isa Base.RefValue{Vector{Float64}}
+        y = k(args...)
+        @test y isa Vector{Float64}
+        # The kernel keeps that buffer, of the declared element type.
+        @test any(slot -> slot isa Base.RefValue && slot[] === y, k.caches)
+        @test k(args...) === y
     end
 
     @testset "exemplar arguments type the program" begin

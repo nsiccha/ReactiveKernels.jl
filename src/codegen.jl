@@ -2065,16 +2065,19 @@ function _plate_reduction_kind(::typeof(evalpoly), recipe, recipe_index, roots,
 end
 
 # Fill a recycled lane buffer (`_lane_reuse`) instead of evaluating
-# `allocation` when it fits; `recycled` is a recycle argument of
+# `allocation`, a call, when it fits; `recycled` is a recycle argument of
 # `_lower_with_ops`. A lane slot keeps a fresh allocation (`_lane_keep!`).
+# The choice between the two buffers is made inside `_lane_acquire`, so the
+# program receives one array from one call (see there).
 function _lane_allocation(recycled, eltype, output_axes, allocation)
-    buffer = gensym(:lane_buffer)
-    Expr(:block,
-        :($buffer = $(GlobalRef(@__MODULE__, :_lane_reuse))(
-            $recycled, $eltype, $output_axes)),
-        :($buffer === nothing ?
-            $(GlobalRef(@__MODULE__, :_lane_keep!))($recycled, $allocation) :
-            $buffer))
+    allocation isa Expr && allocation.head === :call &&
+        length(allocation.args) - 1 in _LANE_ACQUIRE_ARITIES &&
+        !any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :...),
+             allocation.args) || throw(ArgumentError(
+        "a lane allocation must be a positional call with " *
+        "$(_LANE_ACQUIRE_ARITIES) arguments; got $allocation"))
+    Expr(:call, GlobalRef(@__MODULE__, :_lane_acquire), recycled, eltype,
+         output_axes, allocation.args...)
 end
 
 # `@inbounds` for generated code, which carries no macro calls.
@@ -3892,6 +3895,13 @@ end
 # authored plate or scan may fill instead of allocating its output (the
 # position driver hands back the previous position's lane buffer,
 # `_lower_replicated_with_ops`). Any other producer ignores it.
+# `pushdowns` computes values plate cells read only at their own row inside
+# those cells (`_cell_pushdowns`); a value computed there never fills its
+# recycled buffer. The position driver keeps it off.
+# `plate_element_types` fills a plate's buffer with the element type of its
+# declared array output (`y::Vector{Float64} = plate(...)`), each cell
+# converting on store, instead of converting a buffer of the cells' own type
+# into the declaration afterwards.
 # `type_hints` maps logical value ids to extra type-only arguments in an
 # embedded native region. Empty coordinates can use the enclosing DAG's types;
 # no sample value or scalar recipe is evaluated to discover them.
@@ -3900,6 +3910,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                          declare::Bool = !tensorized && inline_embedded &&
                                          _needs_embedded_tensorization(p),
                          recycle::Vector{Pair{ValueId,Symbol}} = Pair{ValueId,Symbol}[],
+                         pushdowns::Bool = isempty(recycle),
+                         plate_element_types::Bool = false,
                          type_hints = nothing, exemplar_types = nothing)
     g = p.graph
     names = _varnames(p)
@@ -3944,7 +3956,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
     # Values plate cells read only at their own row, computed there
     # (`_cell_pushdowns`, cell_windows.jl). Native only: the tensorized product
     # computes them whole, and both keep the same operation table.
-    cells = !tensorized && inline_embedded && isempty(recycle) &&
+    cells = !tensorized && inline_embedded && pushdowns &&
         type_hints === nothing ? _cell_pushdowns(p) : nothing
     for r in p.recipes
         r.id in skipped_recipes && continue
@@ -4054,6 +4066,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                     body, runtime_ops, runtime_recipes, r.op, callargs, callvalues,
                     pointwise_lhs, total_lhs; recycled = recycled(pointwise_id),
                     total_fold,
+                    element_type = plate_element_types ?
+                        first(_declared_array_layout(valtype(pointwise))) : nothing,
                     input_type_hints = type_hints === nothing ? nothing :
                         Any[type_hints[canon_id(g, v.id)] for v in r.inputs])
             end
@@ -6310,14 +6324,14 @@ end
         "with $(map(typeof, args)). Prepare another kernel from exemplars of " *
         "the new types"))
 
-function _prepare_nonallocating(p::Plan, ast::Expr, cache_apply; have_types=nothing,
-                                exact_signature::Bool=false)
+function _prepare_nonallocating(p::Plan, cache_apply; have_types=nothing,
+                                exact_signature::Bool=false, passes=())
     for r in p.recipes
         length(r.outputs) == 1 || throw(ArgumentError(
             "prepare_nonallocating requires single-output recipes; recipe $(r.id) has $(length(r.outputs)) outputs"))
     end
-    rewritten, ops, caches = _nonallocating_program(p, ast; have_types,
-                                                    cache_apply)
+    rewritten, ops, caches = _nonallocating_program(p; have_types,
+                                                    cache_apply, passes)
     exact_signature &&
         (rewritten = _nonalloc_exact_signature(rewritten, have_types))
     # Compile with the operation and cache tuples bound as constants inside the
@@ -6518,10 +6532,13 @@ Optional MutatingFunctions-backed preparation interface. Install and load
 `MutatingFunctions` alongside `ReactiveKernels` to activate the package
 extension that supplies these methods (for a `Plan`, a `Graph`, an authored
 `KernelSpec`, or an already-prepared `PreparedKernel`'s plan). The extension
-prepares the same straight-line plan as [`prepare`](@ref), then applies a final
-AST transform that routes operations with a destination-passing form through
-`MutatingFunctions.apply!!` and a persistent per-step cache. User `passes` run
-before this final transform.
+lowers the same native program as [`prepare`](@ref): plate chains compose,
+summed plates fold into running totals, scans stream into the plates they
+feed. It then routes the program's remaining allocations to storage the kernel
+keeps: each materialized authored plate or scan output fills a buffer kept
+across calls, and every other operation with a destination-passing form goes
+through `MutatingFunctions.apply!!` and a persistent per-step cache. User
+`passes` run on the native program before this final transform.
 
 A step keeps a cache only when its result is fresh storage that a
 destination-passing method fills: the decomposition's own steps below, or an

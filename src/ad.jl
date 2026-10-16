@@ -733,6 +733,16 @@ end
 
 _ad_na_concretize_cache(::Nothing, step::Int, op) = nothing
 
+# A lane slot keeps an owned copy of its seeded buffer, typed by it, which the
+# differentiated program only reads (`_lane_acquire(::Base.RefValue{<:Array},
+# ...)`). A lane the exemplar call never filled (an untaken branch) has no
+# buffer to offer: its producer allocates there, as the ordinary program does.
+function _ad_na_concretize_cache(slot::Base.RefValue, step::Int, ::_NonallocLane)
+    seeded = slot[]
+    seeded isa Array || return nothing
+    Base.RefValue{typeof(seeded)}(copy(seeded))
+end
+
 # Name each externalized slot after the variable its program loads it into
 # (`X = __ops__[1]()`: a bound port or a folded step's result), falling back
 # to the slot number for a load that is not a whole statement.
@@ -1593,7 +1603,10 @@ so the differentiated callable carries no bound data and ordinary reverse-mode
 `AutoEnzyme` needs no function annotation.
 
 Result types must be stable across calls: a step whose result type changes
-after preparation fails loudly instead of silently reseeding. Like every
+after preparation fails loudly instead of silently reseeding. Each materialized
+plate or scan output fills the buffer the exemplar call produced, so the
+gradient also keeps those shapes: a call whose output has another shape fails
+loudly; prepare the gradient again for it. Like every
 [`PreparedADKernel`](@ref), the stored preparation is mutable and not
 thread-safe; prepare one object per concurrent caller.
 

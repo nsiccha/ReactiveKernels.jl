@@ -106,12 +106,13 @@ operation, which preserves the original closure semantics unchanged — a
 `cumsum(m; dims = 2)` recipe therefore still computes correctly while re-running
 its allocating twin.
 
-One observable difference: a plate reduction such as `sum` over an authored
-plate is fused into an accumulator loop by ordinary `prepare`, while the
-non-allocating kernel materializes the pointwise plate into its cache and then
-sums it. The materialized total is bit-exactly `sum` of the pointwise values;
-against the fused accumulation, only floating-point summation association
-differs.
+The program around these steps is the native program ordinary `prepare`
+compiles: plate chains compose, a plate reduction such as `sum` over an authored
+plate folds into an accumulator loop, and a scan streams into the plate that
+reads it. The non-allocating total therefore equals the ordinary one bit for
+bit; against `sum` of the materialized pointwise values, only floating-point
+summation association differs. Only values the native program materializes
+take a buffer.
 
 ## Which operations keep a buffer
 

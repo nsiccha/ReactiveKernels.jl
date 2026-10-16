@@ -7,6 +7,8 @@ function kernel_allocations(k, x)
     @allocated k(x)
 end
 
+include(joinpath(@__DIR__, "fixtures", "nonallocating_called_ops.jl"))
+
 # Fused captured sources resolve their free symbols in the authoring module.
 # This module deliberately shadows `vcat`; a name-based Base.vcat rewrite would
 # silently change semantics, so parity here pins exact-binding resolution.
@@ -172,13 +174,13 @@ end
         u, X = data(8, 5)
         @test k(u, X) == ordinary(u, X)
 
-        # Every fused captured source decomposed: no opaque fused closure is
-        # left in the step table, and the destination steps are present.
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
-        @test any(op -> op isa ReactiveKernels._MaterializeStep, k.ops)
-        @test any(op -> op isa ReactiveKernels._ConcatenateStep, k.ops)
-        @test any(op -> op isa ReactiveKernels._FillConstructorStep, k.ops)
-        @test any(op -> op isa ReactiveKernels._MatMulStep, k.ops)
+        # Every fused captured source decomposed: the program calls no opaque
+        # fused closure, and it calls the destination steps.
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._MaterializeStep, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._ConcatenateStep, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._FillConstructorStep, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._MatMulStep, called_ops(k))
 
         small = steady(k, data(8, 5)...)
         large = steady(k, data(200, 5)...)
@@ -213,9 +215,9 @@ end
         u, X = data(8)
         @test k(u, X) == ordinary(u, X)
 
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
-        @test any(op -> op isa ReactiveKernels._MaterializeStep, k.ops)
-        @test any(op -> op isa ReactiveKernels._MatMulStep, k.ops)
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._MaterializeStep, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._MatMulStep, called_ops(k))
 
         small = steady(k, data(8)...)
         large = steady(k, data(200)...)
@@ -234,8 +236,8 @@ end
         k = prepare_nonallocating(spec; have = (:x,), want = :out)
         x = randn(64)
         @test k(x) == ordinary(x)
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
-        @test any(op -> op isa ReactiveKernels._MaterializeStep, k.ops)
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._MaterializeStep, called_ops(k))
         steady(k, args...) = (k(args...); @allocated k(args...))
         small = steady(k, randn(64))
         large = steady(k, randn(256))
@@ -260,8 +262,8 @@ end
         k_rs = prepare_nonallocating(reshape_spec; have = (:X, :a), want = :out)
         X, a = randn(32, 3), randn(3)
         @test k(X, a) == ordinary(X, a) == k_rs(X, a) == ordinary_rs(X, a)
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
-        @test any(op -> op isa ReactiveKernels._MaterializeStep, k.ops)
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._MaterializeStep, called_ops(k))
         steady(k, args...) = (k(args...); @allocated k(args...))
         small = steady(k, randn(32, 3), randn(3))
         large = steady(k, randn(200, 3), randn(3))
@@ -287,8 +289,8 @@ end
         end
         ordinary = prepare(spec; have = (:m,), want = :out)
         k = prepare_nonallocating(spec; have = (:m,), want = :out)
-        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
-        @test any(op -> op isa ReactiveKernels._RowReduceStep, k.ops)
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k))
         m = randn(64, 3)
         @test k(m) == ordinary(m)
         # Bit-identical to the plain reduction across sizes, including the
@@ -308,7 +310,7 @@ end
         ordinary_cs = prepare(colsum_spec; have = (:m,), want = :out)
         k_cs = prepare_nonallocating(colsum_spec; have = (:m,), want = :out)
         @test k_cs(m) == ordinary_cs(m)
-        @test any(op -> op isa ReactiveKernels._RowReduceStep, k_cs.ops)
+        @test any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k_cs))
     end
 
     @testset "non-reduction kwargs and port-valued dims keep the fallback" begin
@@ -324,14 +326,14 @@ end
         k = prepare_nonallocating(cumsum_spec; have = (:m,), want = :out)
         m = randn(16, 3)
         @test k(m) == ordinary(m)
-        @test any(op -> op isa ReactiveKernels._KernelSourceOp, k.ops)
-        @test !any(op -> op isa ReactiveKernels._RowReduceStep, k.ops)
+        @test any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test !any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k))
 
         ordinary_dyn = prepare(dyn_spec; have = (:m, :d), want = :out)
         k_dyn = prepare_nonallocating(dyn_spec; have = (:m, :d), want = :out)
         @test k_dyn(m, 2) == ordinary_dyn(m, 2)
-        @test any(op -> op isa ReactiveKernels._KernelSourceOp, k_dyn.ops)
-        @test !any(op -> op isa ReactiveKernels._RowReduceStep, k_dyn.ops)
+        @test any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k_dyn))
+        @test !any(op -> op isa ReactiveKernels._RowReduceStep, called_ops(k_dyn))
     end
 
     @testset "authored plates keep exact pointwise semantics" begin
@@ -349,15 +351,15 @@ end
         ordinary = prepare(spec; have = (:x,), want = :total)
         pointwise = prepare(spec; have = (:x,), want = :terms)
         x = rand(64)
-        # The non-allocating kernel materializes the plate then sums it; the
-        # ordinary kernel fuses the reduction into an accumulator loop. The
-        # materialized total is bit-exactly `sum` of the plain pointwise
-        # values; against the fused accumulation only association differs.
-        @test k(x) == sum(pointwise(x))
-        @test isapprox(k(x), ordinary(x); rtol = 1e-12)
+        # Both kernels lower the same native program: the summed plate folds
+        # into an accumulator loop, so the non-allocating total is bit-exactly
+        # the ordinary one. Against `sum` of the materialized pointwise values
+        # only association differs.
+        @test k(x) == ordinary(x)
+        @test isapprox(k(x), sum(pointwise(x)); rtol = 1e-12)
         for n in (64, 16, 256)
             xn = rand(n)
-            @test k(xn) == sum(pointwise(xn))
+            @test k(xn) == ordinary(xn)
         end
     end
 
@@ -476,7 +478,7 @@ end
                         for (xi, yi) in zip(x, y))
         k = prepare_nonallocating(C.guarded; have = (:x, :y), want = :total,
                                   bound = (; y))
-        @test any(op -> op isa ReactiveKernels._LaneGather, k.ops)
+        @test any(op -> op isa ReactiveKernels._LaneGather, called_ops(k))
         @test k(x) ≈ reference
         # The ordinary gather returns a view; the non-allocating cache must
         # never retain that view and overwrite the caller's input on reuse.
