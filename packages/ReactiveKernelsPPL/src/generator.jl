@@ -2023,22 +2023,10 @@ function _response_likelihood_stmts_full(r::LikelihoodSpec, plan::StructuralPlan
     node = _lik_name(r.label)
     pw = _pw_name(r.label)
     if r.family === GaussianFam
-        # Base case (no evidence, weights, ranges, packed rows or missing
-        # entries; one shared scalar scale) whose location is a data-matrix
-        # product `M * v`, optionally plus a sampled intercept: sum its
-        # Normal density through ordinary residual-and-dot arithmetic.
-        # The per-cell plate keeps `:pointwise`.
-        if r.evidence.kind === :none && r.weights === nothing &&
-                r.range === nothing && r.mi_jobs === nothing && r.link === IdentityLink &&
-                !haskey(plan.columns, _observed_mask_name(r.response)) &&
-                !_is_bare_param_location(r, plan) &&
-                !_cell_broadcast_response(plan, r) &&
-                _wholevec_rows(r, plan) && _wholevec_scalar_scale(r, plan)
-            # `alpha .+ M * v` broadcasts its scalar intercept, yet the
-            # matched data-matrix product reads the whole design.
-            _is_gaussian_design_location(r, plan) &&
-                return _gaussian_design_stmts(r, plan, node)
-        end
+        # Every location, a data-matrix product `M * v` included, sums its
+        # cells in the observation plate. RK reduces a total-only plate in one
+        # loop with the scale's invariants hoisted, so the reverse pass reads
+        # the location in place instead of a materialized residual vector.
         return _gaussian_plate_stmts(r, plan, node, pw)
     elseif r.family === StudentTFam
         return _student_plate_stmts(r, plan, node, pw)
@@ -3002,88 +2990,6 @@ function _through_pointwise(stmts::Vector{Expr}, r::LikelihoodSpec)
     return stmts[1:findfirst(st -> st.head === :(=) && st.args[1] === pw, stmts)]
 end
 
-# A Gaussian response located at `M * v` (inline or named) or
-# `alpha .+ M * v` (bound data matrix `M`, vector value `v`, sampled
-# scalar `alpha`) can sum its density from the location's residual vector.
-# The explicit NormalIDGLM object alone selects the owned derivative rule.
-function _is_gaussian_design_location(r::LikelihoodSpec, plan::StructuralPlan)
-    _is_latent_location(r, plan) && return false
-    i = findfirst(p -> p.name === r.predictor, plan.predictors)
-    i === nothing && return false
-    pred = plan.predictors[i]
-    pred.link === IdentityLink || return false
-    alpha, product = 0.0, nothing
-    for t in pred.terms
-        if t.kind === InterceptTerm && alpha isa Real &&
-                get(t.options, :sign, 1) == 1 && get(t.options, :parameter, nothing) isa Symbol
-            alpha = t.options.parameter
-        elseif t.kind === OffsetTerm && product === nothing && length(t.columns) == 1
-            product = only(t.columns)
-        elseif t.kind === ComposedTerm && length(pred.terms) == 1 &&
-                t.options.tree isa Symbol
-            product = t.options.tree
-        else
-            return false
-        end
-    end
-    product === nothing && return false
-    j = findfirst(d -> d.name === product, plan.derived)
-    j === nothing && return false
-    ex = plan.derived[j].expr
-    Meta.isexpr(ex, :call, 3) && ex.args[1] === :* || return false
-    M, v = ex.args[2], ex.args[3]
-    M isa Symbol && v isa Symbol || return false
-    get(plan.columns, M, nothing) isa AbstractMatrix{<:Real} || return false
-    get(plan.columns, r.response, nothing) isa AbstractVector{<:Real} || return false
-    scalar(a) = any(q -> q.name === a, plan.parameters) || get(plan.columns, a, nothing) isa Real
-    alpha isa Symbol && !scalar(alpha) && return false
-    vector = any(q -> q.name === v && length(q.dims) == 1, plan.array_parameters) ||
-        get(plan.columns, v, nothing) isa AbstractVector{<:Real}
-    return vector
-end
-
-# Reuse the authored location instead of rebuilding an augmented design and
-# coefficient vector. The guard stays lazy, including at nonpositive scales;
-# Enzyme differentiates the residual and dot without an RK-only rule.
-function _gaussian_design_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
-    stmts = _gaussian_plate_stmts(r, plan, node, _pw_name(r.label))
-    s = _scale_plate_arg(r, plan, Expr[])
-    sf = s isa Real ? Float64(s) :
-        s isa Symbol && haskey(plan.columns, s) ? :(Float64($s)) : s
-    yf = _yfloat_name(r.label)
-    loc = _location_node(r, plan)
-    residual = Symbol(:_ppl_normal_residual_, r.label)
-    ss = Symbol(:_ppl_normal_ss_, r.label)
-    nf = Symbol(:_ppl_normal_n_, r.label)
-    prec = Symbol(:_ppl_normal_prec_, r.label)
-    return Expr[
-        _through_pointwise(stmts, r)...,
-        :($yf = Float64.($(r.response))),
-        :($node::Float64 = if $sf > 0
-            $residual = $yf .- $loc
-            $ss = dot($residual, $residual)
-            $nf = length($yf) * 1.0
-            $prec = 1.0 / ($sf * $sf)
-            -0.5 * $ss * $prec - $nf * (log($sf) + 0.5 * log(2 * π))
-        else
-            -Inf
-        end),
-    ]
-end
-
-# One scale shared by every observation: a literal, a sampled scalar, scalar
-# data, or a scale predictor proven scalar. Per-observation scales keep the
-# plate.
-function _wholevec_scalar_scale(r::LikelihoodSpec, plan::StructuralPlan)
-    s = r.scale
-    s isa Real && return true
-    s isa Symbol && return any(p -> p.name === s, plan.parameters) ||
-        get(plan.columns, s, nothing) isa Real
-    s isa ScalePredictorRef &&
-        return _predictor_value_type(plan, _predictor(plan, s.predictor)) === :Number
-    return false
-end
-
 function _poisson_wholevec_stmts(r::LikelihoodSpec, plan::StructuralPlan, node::Symbol)
     y = r.response
     lp = _location_node(r, plan)
@@ -3870,10 +3776,11 @@ function _categorical_plate_stmts(r::LikelihoodSpec, plan::StructuralPlan, node:
     return Expr[pre..., _plate_sum_stmts(pw,node,inputs,cell)...]
 end
 
-# Stable log-logistic (Stan `log_inv_logit`): `z ≥ 0` takes
-# `-log1p(exp(-z))`, `z < 0` takes `z - log1p(exp(z))` — no overflow
-# either tail. Base ops only (transparent to the reverse pass).
-_log_inv_logit(z) = :(ifelse($z >= 0.0, -log1p(exp(-$z)), $z - log1p(exp($z))))
+# Stable log-logistic (Stan `log_inv_logit`): `-log1pexp(-z)`, the RK
+# Bernoulli-logit law's form. Its lazy branches evaluate one `exp` and one
+# `log1p`, with no overflow in either tail. An eager `ifelse` of the two
+# one-sided forms evaluated both, doubling every ordinal cell's work.
+_log_inv_logit(z) = :(-log1pexp(-$z))
 
 # Ordinal link log-CDF / log-CCDF over a scalar z (SB `brm_ordinal_logcdf`
 # / `brm_ordinal_logccdf`). Probit uses the slice-1 erfc treatment

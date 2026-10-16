@@ -1071,6 +1071,16 @@ Wider, effectful, scan and retained-output programs keep ordinary reverse.
 The optional path can allocate more tangent storage; measure both on the
 model you fit, and identify the mode used when reporting results.
 
+`prepare_sampler(...; nonallocating = true)` (with `using MutatingFunctions`)
+prepares the density and its gradient over
+`ReactiveKernels.prepare_nonallocating`. The query owns the buffers its
+operations write into, so repeated evaluations reuse the same memory instead
+of allocating observation-length intermediates on every call. That matters
+most when several sampler processes share a host, for example one process per
+chain. Values and gradients equal the ordinary sampler's; the density is
+usually faster, while the reverse gradient is faster on some programs and
+slower on others, so measure both on the model you fit.
+
 - `:sampler` is the posterior preset; `:posterior` is the generated node's
   name, not a preset.
 - `constrain`, `unconstrain` and `logjac` follow the number type of their

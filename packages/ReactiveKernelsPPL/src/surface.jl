@@ -4256,13 +4256,13 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
         Meta.isexpr(c.args[2], :ref) && c.args[2].args[1] in data, cells)
     (selected || scanned) &&
         return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
-            broadcasts)
+            broadcasts, arrays)
     (rkind[1] === :levels || _plate_has_array_cells(cells)) &&
         return _desugar_array_plate(cells, ivar, rkind, line, data,
             plate_defs)
     (reads_arrays || _plate_needs_retained_cells(cells, ivar)) &&
         return _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
-            broadcasts)
+            broadcasts, arrays)
     # Cell locals bound from a per-index value (they vary with the loop
     # variable, so arithmetic over them vectorizes in the desugar).
     pidx = Set{Symbol}()
@@ -4320,7 +4320,8 @@ end
 # Partial observation loops compute their arguments inside retained RK cells.
 # Slicing a fully computed vector would evaluate arithmetic in unselected cells.
 function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
-        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}())
+        broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
+        arrays::Set{Symbol} = Set{Symbol}())
     iterator = rkind[1] === :coloncall ? rkind[2] :
         rkind[1] === :eachindex ? Expr(:call, GlobalRef(Base, :eachindex), rkind[2]) :
         Expr(:call, GlobalRef(Base, :axes), rkind[2], rkind[3])
@@ -4399,6 +4400,8 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
             if _expr_has_sym(ex, ivar) || any(n -> _expr_has_sym(ex, n), lnames) ||
                     _retained_cell_expr(ex, ivar, Set{Symbol}())
                 nm = gensym(:_rkppl_selected)
+                _is_broadcast_sample(c) &&
+                    (ex = _cell_index_vector_gather(ex, ivar, data, locals, arrays))
                 key = _categorical_key_column(ex, locals, ivar, data)
                 if key === nothing
                     _cell_value!(out, values, nm, locals, ex)
@@ -4427,6 +4430,31 @@ function _desugar_selected_plate(cells, ivar, rkind, line, data, plate_defs;
     end
     _emit_cell_values!(out, values, plate_defs)
     return out, ctx, params
+end
+
+# A dotted observation cell broadcasts over each argument's entries, so an
+# argument `X[I[i]]` whose data column `I` holds one index vector per index
+# (`theta[child[j]]`) is only read entry by entry. Read those entries of the
+# whole value `X` in place (`_ppl_cell_gather`) rather than copying them into
+# a new vector in every cell and evaluation. A cell local bound to such a
+# gather reads the same way; its other readers keep their own copy. A data
+# `X` keeps its gather, which binding computes once.
+function _cell_index_vector_gather(ex, ivar::Symbol, data::Set{Symbol},
+        locals, arrays::Set{Symbol})
+    if ex isa Symbol
+        k = findlast(l -> first(l) === ex, locals)
+        k === nothing && return ex
+        gathered = _cell_index_vector_gather(last(locals[k]), ivar, data,
+            locals[1:k-1], arrays)
+        return gathered === last(locals[k]) ? ex : gathered
+    end
+    Meta.isexpr(ex, :ref, 2) || return ex
+    X, index = ex.args
+    X isa Symbol && X ∉ data && !any(l -> first(l) === X, locals) || return ex
+    Meta.isexpr(index, :ref, 2) && index.args[2] === ivar &&
+        index.args[1] isa Symbol && index.args[1] in data &&
+        index.args[1] in arrays || return ex
+    return Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_gather), X, index)
 end
 
 # A computed categorical probability vector (or checked column) that reads
