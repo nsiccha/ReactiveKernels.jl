@@ -168,9 +168,10 @@ _ad_restore_cotangent(point, cotangent) = cotangent
             context_index += 1
         end
     end
-    # Share the primal call boundary with externalized bound arrays: pass the
-    # original operands directly to the existing generated model body.
-    _native_body_call_expr(F, :(call.native), Any[:(call.ops), positional...])
+    # Pass the original operands directly to the existing generated model body,
+    # as externalized bound arrays do, without a warm wrapper's image-build
+    # dispatch (`_differentiated_body_call_expr`).
+    _differentiated_body_call_expr(F, :(call.native), Any[:(call.ops), positional...])
 end
 
 function _ad_operation_slots!(used, node)
@@ -892,7 +893,7 @@ end
     # wrapper's one-tuple splat stays a dynamic `Core._apply_iterate`, and
     # native Reverse rejects the constant HAVE arrays stored there beside the
     # shadowed caches (`_native_body_call_expr`).
-    _native_body_call_expr(F, :(call.f),
+    _differentiated_body_call_expr(F, :(call.f),
         Any[:(call.ops), :(getfield(contexts, $N)), :(call.cache_apply),
             arguments...])
 end
