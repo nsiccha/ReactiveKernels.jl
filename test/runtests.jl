@@ -80,6 +80,7 @@ const _MATRIX_CORE_TESTS = (
     "test_nested_source_inference.jl",
     "test_authored_scan.jl",
     "test_scan_terminal_minima.jl",
+    "test_scan_slice_demand.jl",
     "test_plate_closures.jl",
     "test_plate_shared_branch.jl",
     "test_empty_plate_invariants.jl",

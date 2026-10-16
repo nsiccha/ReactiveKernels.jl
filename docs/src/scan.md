@@ -269,6 +269,29 @@ Requesting either vector as a WANT, adding another reader, or using unsupported
 storage or expressions retains the ordinary materialized path. This also
 applies inside native position batching, including borrowed readers.
 
+Natively, a scan whose trajectory is read only by one slice,
+`trajectory[lo:hi]`, runs only the steps that slice reads and writes their
+outputs directly into the slice's result; the trajectory is never stored. The
+loop stops after the last demanded step. When the step reads neither its carry
+nor `history`, so that each output depends on its own step only, the steps
+before the first demanded one are skipped too. The bounds may be expressions of
+other values, for example a plate cell's observation window
+`expected[epidemic_start[m]:last_day[m]]`, with `begin` and `end` meaning the
+trajectory's first and last index. The result's value, type and errors are the
+slice's: an empty slice runs no step, and an out-of-bounds slice throws the
+`BoundsError` that slicing the whole trajectory throws. A skipped step only
+computes a value nothing reads, and, as for other unread values, it is not
+evaluated, so an error it would have raised does not occur. The ordinary
+materialized path is kept in any of these cases:
+
+- the trajectory is requested as a WANT, or has another reader;
+- the scan uses `history`, or its step is effectful;
+- the trajectory element type is not concrete;
+- the bounds are not `Int`s;
+- the sequence is neither a vector nor a range.
+
+The tensorized product computes the whole trajectory.
+
 A reducing `plate` over an init-including scan still reads the stored
 trajectory (the per-step form's fusion is described under
 [Lowering and semantics](#Lowering-and-semantics)). Under Reactant the seed is
