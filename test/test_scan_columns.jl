@@ -145,3 +145,24 @@ end
         @test grad ≈ (f(0.400001) - f(0.399999)) / 2e-6 atol = 1e-8 rtol = 1e-6
     end
 end
+
+_scan_columns_allocated(k, args::Vararg{Any,N}) where {N} = @allocated k(args...)
+_scan_columns_buffer(xs, n) = similar(xs, Float64, n)
+_scan_columns_buffer_allocated(xs, n) = @allocated _scan_columns_buffer(xs, n)
+
+@testset "projected scan columns are written without a row vector" begin
+    # The scan writes each read column's steps straight into that column's
+    # buffer; `a = vcat(seeds, steps)` then adds the trajectory. Neither the
+    # named-tuple rows nor a projection pass over them is materialized.
+    single = prepare(_coupled_lags; want = :a)
+    both = prepare(_coupled_lags)
+    for n in (400, 401, 4096)
+        x = [cos(t) for t in 1:n]
+        single(x, 0.4); both(x, 0.4)
+        _scan_columns_buffer_allocated(x, n - 1); _scan_columns_buffer_allocated(x, n)
+        steps = _scan_columns_buffer_allocated(x, n - 1)
+        trajectory = _scan_columns_buffer_allocated(x, n)
+        @test _scan_columns_allocated(single, x, 0.4) <= steps + trajectory + 128
+        @test _scan_columns_allocated(both, x, 0.4) <= 2 * (steps + trajectory) + 256
+    end
+end
