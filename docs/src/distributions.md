@@ -202,7 +202,11 @@ adds its cell log densities first; the outer mixture then computes
 `logsumexp(log(weight[k]) + component_score[k])`. Thus one component governs
 the complete vector. The lower-level `product_mixture_logdensity(scores,
 weights)` performs the outer fold when component scores come from another
-family. All three are transparent RK kernels with data-sized loops.
+family. All three are transparent RK kernels with data-sized loops. The
+weights' logs are taken once, before the weighting loop, so observed in a plate
+over events that share the weights they are computed once per call, not once
+per event, whether the probabilities are shared or vary by event. Weights that
+vary by event allocate those `K` logs once per event.
 
 ```julia
 using ReactiveKernels
@@ -288,7 +292,10 @@ the emissions with the Normal and Exponential families and pass them to
 streams are independent given the state. Emission parameters broadcast over
 `states × streams × steps`: a vector holds one value per state, a matrix one
 per state and stream, and a third axis lets a parameter change with the step.
-Exponential parameters are scales, as for `exponential`.
+Exponential parameters are scales, as for `exponential`. Each scale's log is
+taken once per element, before the emission plate, and reaches the cells
+through the family object's `log_scale` port, so a per-state scale costs one
+log per state rather than one per step.
 
 ```julia
 using ReactiveKernels

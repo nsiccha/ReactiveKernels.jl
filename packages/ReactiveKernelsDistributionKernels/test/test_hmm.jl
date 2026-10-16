@@ -169,4 +169,30 @@ end
     expected = (normal_law(y, mu, sigma, plus, initial) -
         normal_law(y, mu, sigma, minus, initial)) / (2step)
     @test gradient[1, 2] ≈ expected rtol=1e-6
+
+    # Each scale's log is taken once, before the emission plate, and reaches
+    # the cells through the family objects' `log_scale` port: no cell takes it.
+    for law in (normal_law, exponential_law)
+        emission = only(filter(r -> r.op isa ReactiveKernels._AuthoredPlateOp,
+                               law.plan.recipes))
+        @test !any(r -> occursin("log(scale)", string(r.source)),
+                   plate_body(emission).recipes)
+    end
+    for (law, args) in ((normal_law, (streams, locations, scales, transition, ones(2))),
+                        (exponential_law, (positive, rate_scales, transition, ones(2))))
+        op = prepare_ad(law, backend, args...; active = :scales)
+        gradient = ad_gradient(op, args...)
+        scale_values = args[end - 2]
+        for index in eachindex(scale_values)
+            plus, minus = copy(scale_values), copy(scale_values)
+            plus[index] += step
+            minus[index] -= step
+            expected = (law(args[1:end - 3]..., plus, args[end - 1:end]...) -
+                law(args[1:end - 3]..., minus, args[end - 1:end]...)) / (2step)
+            @test gradient[index] ≈ expected rtol=1e-6
+        end
+    end
+    # An empty sequence still takes no log: an invalid scale is never read.
+    @test normal_law(Float64[], mu, [-1.0, 0.5], transition, initial) == 0.0
+    @test exponential_law(Float64[], [-1.0, 0.5], transition, initial) == 0.0
 end

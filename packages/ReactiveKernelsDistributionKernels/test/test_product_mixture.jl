@@ -153,9 +153,13 @@ law_allocated(k::K, args::Vararg{Any,N}) where {K,N} = @allocated k(args...)
     @test prepared(observed, probabilities, weights) ≈
         logpdf(reference, Int.(observed)) rtol=1e-13
     # The component scores stream through `logsumexp` instead of filling a
-    # vector per event.
+    # vector per event. The weights' logs are one vector per call, taken
+    # before the weighting loop: nothing allocated grows with the event.
     @test !occursin("similar", string(code_expr(prepared)))
-    @test law_allocated(prepared, observed, probabilities, weights) == 0
+    longer = repeat(observed, 10)
+    longer_probabilities = repeat(probabilities, 10, 1)
+    @test law_allocated(prepared, observed, probabilities, weights) ==
+          law_allocated(prepared, longer, longer_probabilities, weights)
     @test prepared(observed, zeros(4, 0), Float64[]) == -Inf
 
     trials = fill(3, 4, 6)
@@ -165,7 +169,9 @@ law_allocated(k::K, args::Vararg{Any,N}) where {K,N} = @allocated k(args...)
         Binomial.(trials[:, k], probabilities[:, k])) for k in 1:6], weights)
     @test binomial_prepared(counts, trials, probabilities, weights) ≈
         logpdf(binomial_reference, counts) rtol=1e-13
-    @test law_allocated(binomial_prepared, counts, trials, probabilities, weights) == 0
+    # Each law allocates at most that one weights-log vector.
+    @test law_allocated(binomial_prepared, counts, trials, probabilities, weights) <=
+          law_allocated(prepared, observed, probabilities, weights)
     @test_throws DimensionMismatch binomial_prepared(counts, trials, probabilities,
         weights[1:5])
 
@@ -173,10 +179,73 @@ law_allocated(k::K, args::Vararg{Any,N}) where {K,N} = @allocated k(args...)
     logit_prepared = prepare(bernoulli_logit_product_mixture_logdensity)
     @test logit_prepared(observed, logits, weights) ≈
         logpdf(reference, Int.(observed)) rtol=1e-13
-    @test law_allocated(logit_prepared, observed, logits, weights) == 0
+    @test law_allocated(logit_prepared, observed, logits, weights) <=
+          law_allocated(prepared, observed, probabilities, weights)
     binomial_logit_prepared = prepare(binomial_logit_product_mixture_logdensity)
     @test binomial_logit_prepared(counts, trials, logits, weights) ≈
         logpdf(binomial_reference, counts) rtol=1e-13
-    @test law_allocated(binomial_logit_prepared, counts, trials, logits, weights) == 0
+    @test law_allocated(binomial_logit_prepared, counts, trials, logits, weights) <=
+          law_allocated(prepared, observed, probabilities, weights)
     @test_throws DimensionMismatch logit_prepared(observed, logits, weights[1:5])
 end
+
+# The `for` depth of each assignment whose target name contains `name`.
+function loop_depths(ex, name, depth = 0, found = Int[])
+    ex isa Expr || return found
+    ex.head === :(=) && ex.args[1] isa Symbol && occursin(name, String(ex.args[1])) &&
+        push!(found, depth)
+    foreach(a -> loop_depths(a, name, ex.head === :for ? depth + 1 : depth, found),
+            ex.args)
+    found
+end
+
+@kernel shared_weight_events(histories, probabilities::Matrix{Float64},
+        omega::Float64) = begin
+    weights = [omega, 1 - omega]
+    cells = plate(histories) do observed
+        bernoulli_product_mixture_logdensity(observed, probabilities, weights)
+    end
+    return sum(cells)
+end
+@kernel per_event_probabilities(histories, present, absent::Vector{Float64},
+        omega::Float64) = begin
+    weights = [omega, 1 - omega]
+    cells = plate(histories, present) do observed, p
+        bernoulli_product_mixture_logdensity(observed, hcat(p, absent), weights)
+    end
+    return sum(cells)
+end
+
+@testset "events that share the weights take their logs once per call" begin
+    histories = [Bool[isodd(i + j) for j in 1:3] for i in 1:7]
+    present = [0.2 .+ 0.1 .* [i, i + 1, i + 2] ./ 10 for i in 1:7]
+    absent = zeros(3)
+    probabilities = hcat(present[1], absent)
+    backend = DI.AutoEnzyme(; mode = Enzyme.Reverse)
+    reference(omega, probabilities_of) = sum(eachindex(histories)) do i
+        P = probabilities_of(i)
+        logpdf(MixtureModel([product_distribution(Bernoulli.(P[:, k])) for k in 1:2],
+                            [omega, 1 - omega]), Int.(histories[i]))
+    end
+    for (spec, args, probabilities_of) in (
+            (shared_weight_events, omega -> (histories, probabilities, omega),
+             i -> probabilities),
+            (per_event_probabilities, omega -> (histories, present, absent, omega),
+             i -> hcat(present[i], absent)))
+        k = prepare(spec)
+        # The logs sit outside the event loop, whether or not the
+        # probabilities vary by event.
+        depths = loop_depths(code_expr(k), "log_weights")
+        @test !isempty(depths) && all(==(0), depths)
+        for omega in (0.3, 0.8)
+            @test k(args(omega)...) ≈ reference(omega, probabilities_of) rtol = 1e-12
+            op = prepare_ad(k, backend, args(omega)...; active = :omega)
+            value, gradient = ad_value_and_gradient(op, args(omega)...)
+            h = 1e-6
+            @test value ≈ reference(omega, probabilities_of) rtol = 1e-12
+            @test gradient ≈ (reference(omega + h, probabilities_of) -
+                reference(omega - h, probabilities_of)) / 2h rtol = 1e-6
+        end
+    end
+end
+
