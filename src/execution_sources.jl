@@ -3,11 +3,12 @@
 # fallback, and its concrete lexical captures. Reusing that program prevents
 # eval-created closure types and provenance tokens from specializing the same
 # executable on every fresh build. No plan or source recipe is replaced.
-struct _ExecutableSourceFunction{F,C,N} <: Function
+# Provenance stays with the plan and lowered recipes. Every field here is part
+# of the differentiated callable, so it holds only what execution reads; the
+# authoring module `M` is shared by repeated builds and costs no field.
+struct _ExecutableSourceFunction{F,C,M} <: Function
     f::F
     captures::C
-    names::NTuple{N,Symbol}
-    mod::Module
 end
 
 @inline @generated function (f::_ExecutableSourceFunction)(args::Vararg{Any,N}) where {N}
@@ -17,10 +18,7 @@ end
             getfield(f, :f), getfield(f, :captures), $(forwarded...))))
 end
 
-# These are cold metadata readers, including when a prepared child is composed.
-_kernel_endpoint_source_module(f::_ExecutableSourceFunction) = f.mod
-_closure_parameter_names(f::_ExecutableSourceFunction, n) =
-    length(f.names) == n ? collect(f.names) : nothing
+_kernel_endpoint_source_module(::_ExecutableSourceFunction{F,C,M}) where {F,C,M} = M
 
 _execution_source(@nospecialize(x)) = x
 Base.@nospecializeinfer function _execution_source(@nospecialize(xs::Tuple))
@@ -36,11 +34,10 @@ Base.@nospecializeinfer function _execution_source(@nospecialize(f::_KernelSourc
     # Julia retains ownership of local functions, generators, exception scopes
     # and boxed lexical cells; they have no generated-source companion.
     runtime === nothing && return f
-    native = getfield(f, :f)
-    names = Tuple(Base.method_argnames(only(methods(native)))[2:end])
     captures = getfield(f, :captures)
-    T = _ExecutableSourceFunction{typeof(runtime),typeof(captures),length(names)}
-    _kernel_new_instance(T, (runtime, captures, names, parentmodule(typeof(native))))
+    mod = parentmodule(typeof(getfield(f, :f)))
+    T = _ExecutableSourceFunction{typeof(runtime),typeof(captures),mod}
+    _kernel_new_instance(T, (runtime, captures))
 end
 
 _execution_source(op::_KernelSourceOp{nothing}) = op
@@ -51,7 +48,7 @@ Base.@nospecializeinfer function _execution_source(@nospecialize(op::_KernelSour
     identity = getfield(op, :call_identity)
     form = (typeof(op)::DataType).parameters[2]
     T = _KernelSourceOp{nothing,form,typeof(f),typeof(tensor),typeof(ignored),typeof(identity)}
-    _kernel_new_instance(T, (getfield(op, :token), f, tensor, ignored, identity))
+    _kernel_new_instance(T, (f, tensor, ignored, identity))
 end
 
 Base.@nospecializeinfer function _execution_source(@nospecialize(split::_KernelSplit))

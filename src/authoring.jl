@@ -249,10 +249,16 @@ end
 struct _KernelProvenanceKey{Token} end
 
 # Graph assembly reads `recipe.op` as an unknown subtype of `_KernelSourceOp`.
-# Read the token with the `getfield` builtin, without compiling a reader for
-# every authored operation type. Execution copies retain this same identity.
-Base.@nospecializeinfer _kernel_source_token(@nospecialize(op::_KernelSourceOp)) =
-    getfield(op, :token)
+# The token comes from the op's type, so no reader is compiled again for every
+# authored op type. An execution copy has none; keying it would merge
+# separately authored definitions.
+Base.@nospecializeinfer function _kernel_source_token(@nospecialize(op::_KernelSourceOp))
+    token = (typeof(op)::DataType).parameters[1]
+    token === nothing && throw(ArgumentError(
+        "a prepared execution copy of a source operation has no definition " *
+        "token; graph recipes must hold the original operation"))
+    token
+end
 
 # Inverse recognition uses the callable retained when an exact call was
 # authored. Looking up a recipe's source binding later could observe a
@@ -3919,10 +3925,7 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     body = Expr(:let, Expr(:block, bindings...), source.args[2])
     runtime_source = Expr(:->, Expr(:tuple, environment, params...), body)
     qualified = macroexpand(mod, Expr(Symbol("hygienic-scope"), runtime_source, mod))
-    # The owning RGF cache retains the body. Keeping its mutable Expr in each
-    # leaf would add GC roots to the prepared callable's captured operation
-    # table, obstructing ordinary reverse's read-only function analysis.
-    runtime_f = RuntimeGeneratedFunctions.drop_expr(compile(qualified))
+    runtime_f = compile(qualified)
     T = _KernelSourceFunction{typeof(f),typeof(runtime_f),typeof(captures),Val{:guarded}}
     _kernel_new_instance(T, (f, runtime_f, captures))::_KernelSourceFunction
 end

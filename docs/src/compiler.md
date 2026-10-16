@@ -250,7 +250,10 @@ kernel) are alpha-renamed to canonical names before the expression reaches its
 content-addressed cache, so an unchanged plan lowers to one callable type:
 preparing the same graph shape again — including a `bound=` rebinding to data
 of the same types — reuses that type and compiles once per process rather than
-once per preparation. The resulting
+once per preparation. The cache, not the callable, retains the expression:
+the callable is identified by its type alone, so a prepared callable holds no
+mutable `Expr` for Enzyme to prove read-only where its call is not inlined, as
+for a prepared lazy-arm child. The resulting
 `PreparedKernel` stores the compiled callable, its concrete operation tuple,
 and inspection metadata. Calling it performs no graph traversal, producer
 selection, topological sort, cache lookup, or dynamic scheduling. Julia still
@@ -259,12 +262,15 @@ allocations, exceptions, and side effects are not erased by the graph compiler.
 
 Fresh authored definitions retain distinct provenance even when their source is
 identical. At prepared-kernel assembly, execution uses the existing generated
-source companion and its concrete lexical captures, with definition tokens
-carried as metadata instead of executable type parameters. This lets identical
-fresh builds reuse operation and derivative types without merging their graph
-identities or caching bound data. The original operations remain in the plan
-and source recipes. Bodies with local functions, generators, exception scopes,
-or boxed lexical cells retain Julia's native closure path. Private generated
+source companion and its concrete lexical captures. The execution copy carries
+no definition token: the original operations, with their tokens, remain in the
+plan, source recipes and `lowered_recipes`. This lets identical fresh builds
+reuse operation and derivative types without merging their graph identities or
+caching bound data. The execution copy holds no provenance value either, so a
+capture-free operation table stays free of heap references that Enzyme would
+otherwise have to prove read-only in the differentiated callable. Bodies with
+local functions, generators, exception scopes, or boxed lexical cells retain
+Julia's native closure path. Private generated
 names in the derivative operand pack are canonicalized in that actual pack;
 the operands and their positional reads are unchanged. Construction, planning,
 and preparation still perform work, so reusing a build remains useful.

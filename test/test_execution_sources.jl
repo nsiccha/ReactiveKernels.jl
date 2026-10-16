@@ -15,6 +15,8 @@ const RK = ReactiveKernels
     end
     @test code_expr(kernels[1]) == code_expr(kernels[2])
     @test typeof(kernels[1].f) === typeof(kernels[2].f)
+    # The generated-function cache retains the body; the callable is its type.
+    @test Base.issingletontype(typeof(kernels[1].f))
     for kernel in kernels
         @test kernel(1.0, 2.0, 3.0, 4.0) == 1234.0
         @test kernel(4.0, 3.0, 2.0, 1.0) == 4321.0
@@ -35,12 +37,21 @@ end
     @test Base.invokelatest(kernels[1], 2.0) == Base.invokelatest(kernels[2], 2.0) == 5.0
     source = [only(filter(r -> r.op isa RK._KernelSourceOp, spec.graph.recipes)) for spec in specs]
     @test RK._kernel_source_token(source[1].op) !== RK._kernel_source_token(source[2].op)
-    for kernel in kernels, (op, recipe) in zip(kernel.ops, kernel.lowered_recipes)
+    # The differentiated callable holds only executable state: no token,
+    # parameter names or module value that Enzyme must prove read-only.
+    @test isbitstype(typeof(kernels[1].ops))
+    for (kernel, original) in zip(kernels, source),
+            (op, recipe) in zip(kernel.ops, kernel.lowered_recipes)
         op isa RK._KernelSourceOp || continue
-        @test RK.kernel_sourceop_token(op) === RK.kernel_sourceop_token(recipe.op)
-        @test RK._kernel_endpoint_source_module(op) === RK._kernel_endpoint_source_module(recipe.op)
-        @test RK._source_parameter_names(op, recipe.source, length(recipe.inputs)) ==
-            RK._source_parameter_names(recipe.op, recipe.source, length(recipe.inputs))
+        @test RK.kernel_sourceop_token(op) === nothing
+        @test RK.kernel_sourceop_token(recipe.op) === RK._kernel_source_token(original.op)
+        @test RK._kernel_endpoint_source_module(op) === mod ===
+            RK._kernel_endpoint_source_module(recipe.op)
+        @test RK._source_parameter_names(recipe.op, recipe.source, length(recipe.inputs)) !==
+            nothing
+        # refused: keying a token-free copy would merge separately authored
+        # definitions in graph CSE; recipes must hold the original operation.
+        @test_throws ArgumentError RK._kernel_source_token(op)
     end
     # Generated-source reuse must still observe ordinary Julia method changes.
     Core.eval(mod, :(shift(x) = 3.0x))
@@ -55,7 +66,7 @@ end
         scale -> scale > 0, (x, scale) -> x * log(scale), x -> -x)
     source = RK._KernelSourceOp(Val(gensym(:branch)), Val(:fused), branch, branch)
     op = RK._execution_source(source)
-    @test RK.kernel_sourceop_token(op) === RK.kernel_sourceop_token(source)
+    @test RK.kernel_sourceop_token(op) === nothing
     @test RK._tensorized_plate_dispatch(op, ([2.0, 3.0], 2.0)) ≈
         [2.0, 3.0] .* log(2.0)
     @test RK._tensorized_plate_dispatch(op, ([2.0, 3.0], -2.0)) ==
