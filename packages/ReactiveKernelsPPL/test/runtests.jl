@@ -302,6 +302,7 @@ const _PPL_TEST_FILES = (
     "test_covariance_values_reactant.jl",
     "test_varying_values_reactant.jl",
     "test_cell_broadcast_arrays.jl",
+    "test_cell_index_gathers.jl",
     "test_plate_cell_arrays.jl",
     "test_plate_cell_once.jl",
     "test_plate_cell_once_reactant.jl",
