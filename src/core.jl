@@ -1040,6 +1040,49 @@ end
 @inline _lane_keep!(recycled, value) = value
 @inline _lane_keep!(slot::Base.RefValue{Any}, value) = (slot[] = value; value)
 
+# The buffer an authored plate or scan fills (`_lane_allocation`): the matching
+# recycled buffer, or `allocate(args...)`, kept when `recycled` is a lane slot.
+# - Not inlined, with one fixed-arity method per allocation arity. Inline, the
+#   reused and the fresh buffer merge into a phi of derived data pointers in
+#   the filling loop, which reverse-mode Enzyme cannot keep rooted for the
+#   garbage collector; a non-inlined varargs method boxes its arguments on
+#   Julia 1.10; a tuple of them stores an active array, which Enzyme rejects.
+# - A lane slot of a differentiated non-allocating program (`_ad_na_program`)
+#   is a `Ref{Array{T,N}}` seeded with an owned copy of the exemplar call's
+#   buffer (`_ad_na_concretize_cache`), and is only read: one inline load,
+#   no store, no merge. A call that may store into the slot made Enzyme cache
+#   loads conservatively (about 1 µs per gradient on small models), and a
+#   merged buffer lost its derivative in scans. That program keeps the
+#   exemplar's shapes and element types; another one fails loudly.
+const _LANE_ACQUIRE_ARITIES = 1:4
+for arity in _LANE_ACQUIRE_ARITIES
+    args = [Symbol(:allocation_argument_, i) for i in 1:arity]
+    @eval @noinline function _lane_acquire(recycled, ::Type{T}, output_axes,
+                                           allocate::F, $(args...)) where {T,F}
+        buffer = _lane_reuse(recycled, T, output_axes)
+        buffer === nothing ? _lane_keep!(recycled, allocate($(args...))) : buffer
+    end
+    @eval @inline function _lane_acquire(slot::Base.RefValue{B}, ::Type{T},
+            output_axes::NTuple{N,Any}, allocate::F,
+            $(args...)) where {B<:Array,T,N,F}
+        buffer = slot[]
+        buffer isa Array{T,N} && axes(buffer) == output_axes ||
+            _lane_changed(buffer, T, output_axes)
+        buffer::Array{T,N}
+    end
+    # No buffer to offer (the position driver's `nothing`, or a lane the
+    # exemplar call never filled): allocate inline, as the ordinary program.
+    @eval @inline _lane_acquire(::Nothing, ::Type{T}, output_axes, allocate::F,
+                                $(args...)) where {T,F} = allocate($(args...))
+end
+
+@noinline _lane_changed(buffer, ::Type{T}, output_axes) where {T} =
+    throw(ArgumentError(
+        "a non-allocating gradient fills each materialized value into the " *
+        "buffer it prepared from the exemplar call, a $(typeof(buffer)) with " *
+        "axes $(axes(buffer)); this call's value is an array of $T with axes " *
+        "$output_axes. Prepare the gradient again for the new shape"))
+
 # Destination forms of a top-level dotted call and an array slice in a
 # position residual (`_lane_source_expr`). Each returns exactly the value its
 # source would (`_native_broadcast_materialize`, `getindex`): a matching
@@ -1077,16 +1120,14 @@ const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<
     copyto!(buffer, view(A, J...))
 end
 
-function _scan_history_buffer(recycled, xs, fill::Number)
-    buffer = _lane_reuse(recycled, typeof(fill), axes(xs))
-    buffer === nothing ?
-        _lane_keep!(recycled, _scan_history_buffer(xs, fill)) : fill!(buffer, fill)
-end
+_scan_history_buffer(recycled, xs, fill::Number) = fill!(
+    _lane_acquire(recycled, typeof(fill), axes(xs), _scan_history_buffer, xs, fill),
+    fill)
 function _scan_history_buffer(recycled, xs, leading::AbstractVector)
     T = eltype(leading)
-    buffer = _lane_reuse(recycled, T, (Base.OneTo(length(leading) + length(xs)),))
-    buffer === nothing &&
-        return _lane_keep!(recycled, _scan_history_buffer(xs, leading))
+    buffer = _lane_acquire(recycled, T,
+        (Base.OneTo(length(leading) + length(xs)),), _scan_history_buffer, xs,
+        leading)
     fill!(buffer, zero(T))
     copyto!(buffer, firstindex(buffer), leading, firstindex(leading), length(leading))
 end

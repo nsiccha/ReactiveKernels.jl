@@ -585,48 +585,38 @@ function _plate_broadcast_rank(::Val{A}, argtypes) where {A}
     maximum(ranks; init=0)
 end
 
-# The cache slot and recorded result type use the inferred concrete element
-# type (`_authored_plate_result_eltype`) rather than the plan-level `Any` of an
-# unannotated body, so an untyped plate materializes a typed buffer here exactly
-# as the ordinary native lowering now does — no boxed `Vector{Any}`, and both
-# execution paths agree bit-for-bit on the materialized pointwise vector.
+# The recorded result type of an authored plate uses the inferred concrete
+# element type (`_authored_plate_result_eltype`) rather than the plan-level
+# `Any` of an unannotated body, as the ordinary native lowering does.
 _nested_plate_cache(op, argtypes, T, N) = nothing
 function _nonalloc_plan_result_types(kernel, argument_types)
     p = kernel.plan
-    types = _plan_value_types(p, argument_types) do recipe, inputs
-        _recipe_output_types(recipe, _nonalloc_recipe_type(recipe.op, inputs))
-    end
+    types = _nonalloc_value_types(p, argument_types)
     Tuple(get(types, canon_id(p.graph, v.id), Any) for v in p.want)
 end
-_nonalloc_recipe_type(op, types) = _static_type(op, types...)
-function _nonalloc_recipe_type(op::_AuthoredScanOp{K,A,I,H}, types) where {K,A,I,H}
+# Static types of every value of `p`, keyed by canonical value id, from the
+# HAVE argument types.
+function _nonalloc_value_types(p::Plan, argument_types)
+    _plan_value_types(p, argument_types) do recipe, inputs
+        _recipe_output_types(recipe, _nonalloc_recipe_type(recipe.op, inputs,
+            length(recipe.outputs) == 1 ? valtype(only(recipe.outputs)) : Any))
+    end
+end
+_nonalloc_recipe_type(op, types, declared::Type = Any) = _static_type(op, types...)
+function _nonalloc_recipe_type(op::_AuthoredScanOp{K,A,I,H}, types,
+                               declared::Type = Any) where {K,A,I,H}
     H && return _static_type(op, types...)
     output = last(_nonalloc_plan_result_types(op.kernel,
                                               _scan_step_argument_types(op, types)))
     _scan_result_type(op, types, output)
 end
+_nonalloc_recipe_type(op::_AuthoredPlateOp, types, declared::Type = Any) =
+    _plate_result_type(op, types, declared)
 
-function _nonalloc_rewrite_recipe!(body, prog::_StepProgram, r::Recipe,
-        types::Dict{Symbol,Any}, lhs, args, ::Val{:scan})
-    T = _nonalloc_recipe_type(r.op, _nonalloc_argument_types(types, args))
-    slot = _step!(prog, identity, _nonalloc_slot(T))
-    offset = length(prog.ops)
-    for op in r.op.kernel.ops
-        _step!(prog, op, nothing)
-    end
-    cache = Expr(:ref, Expr(:ref, _CACHES_ARG, slot))
-    _lower_authored_scan_native!(body, r.op, args, lhs, offset; recycled=cache)
-    push!(body.args, Expr(:(=), cache, lhs))
-    lhs isa Symbol && (types[lhs] = T)
-    nothing
-end
 # A declared array output (`y::Vector{Float64} = plate(...)`) fixes the
 # element type and rank the native kernel's typed local converts the plate's
-# result to (`_declare_typed_output!`). Filling a buffer of that element type
-# gives the same values without a conversion copy; a cell type that inference
-# cannot see through an untyped HAVE port would otherwise leave an `Array{Any}`
-# buffer. Returns `(eltype, rank)`, either `nothing` when the declaration
-# leaves it open.
+# result to (`_declare_typed_output!`). Returns `(eltype, rank)`, either
+# `nothing` when the declaration leaves it open.
 function _declared_array_layout(::Type{D}) where {D}
     D <: AbstractArray || return (nothing, nothing)
     E = eltype(D)
@@ -649,15 +639,6 @@ function _nonalloc_plate_rank(op::_AuthoredPlateOp{K,A}, argtypes,
     N = _plate_broadcast_rank(Val(A), argtypes)
     N === nothing ? last(_declared_array_layout(declared)) : N
 end
-function _plate_cache_slot(op::_AuthoredPlateOp{K,A}, argtypes,
-                           declared::Type = Any) where {K,A}
-    T = _nonalloc_plate_eltype(op, argtypes, declared)
-    N = _nonalloc_plate_rank(op, argtypes, declared)
-    nested = _nested_plate_cache(op, argtypes, T, N)
-    nested === nothing || return nested
-    N === nothing && return Ref{Array{T}}(Vector{T}())
-    Ref{Array{T,N}}(Array{T,N}(undef, ntuple(_ -> 0, N)...))
-end
 
 function _plate_result_type(op::_AuthoredPlateOp{K,A}, argtypes,
                             declared::Type = Any) where {K,A}
@@ -666,123 +647,129 @@ function _plate_result_type(op::_AuthoredPlateOp{K,A}, argtypes,
     N === nothing ? Array{T} : Array{T,N}
 end
 
-# --- statement-level program builder ----------------------------------------
+# --- program builder ---------------------------------------------------------
+
+# A plate whose cells return arrays stays one cache step: its slot
+# (`_nested_plate_cache`, the MutatingFunctions extension) reuses the cells'
+# arrays as well as the outer array, where the native plate lowering would
+# allocate every cell's array afresh. Wrapping the plate keeps the lowering
+# from inlining it; calling the wrapper is the plate's own call.
+struct _NonallocNestedPlate{P,S}
+    plate::P
+    slot::S
+end
+(op::_NonallocNestedPlate)(args...) = op.plate(args...)
+
+function _nonalloc_nested_plates(p::Plan, types::Dict{Int,Any})
+    g = p.graph
+    changed = false
+    recipes = map(p.recipes) do r
+        r.op isa _AuthoredPlateOp && length(r.outputs) == 1 || return r
+        argtypes = Any[get(types, canon_id(g, v.id), Any) for v in r.inputs]
+        declared = valtype(only(r.outputs))
+        slot = _nested_plate_cache(r.op, argtypes,
+            _nonalloc_plate_eltype(r.op, argtypes, declared),
+            _nonalloc_plate_rank(r.op, argtypes, declared))
+        slot === nothing && return r
+        changed = true
+        Recipe(r.id, r.inputs, r.outputs, _NonallocNestedPlate(r.op, slot),
+               r.cost, r.cse_key, r.effectful, r.source)
+    end
+    changed || return p
+    producer = Dict(canon_id(g, v.id) => r for r in recipes for v in r.outputs)
+    Plan(g, p.have, p.want, recipes, producer, p.cost, p.candidates)
+end
+
+# A lane slot: the kernel-owned buffer of one materialized authored plate or
+# scan output, top-level dotted call or array slice (the `recycle` protocol of
+# `_lower_with_ops`, `_lane_reuse`/`_lane_keep!`). Its producer fills it in
+# place once it holds a buffer of the right element type and axes, and keeps
+# its first allocation otherwise. Its operation-table entry is never called.
+struct _NonallocLane end
+
+function _nonalloc_lanes(p::Plan, types::Dict{Int,Any})
+    g = p.graph
+    have_ids = Set(canon_id(g, v.id) for v in p.have)
+    recycle = Pair{Int,Symbol}[]
+    for r in p.recipes
+        # An effect may retain the value it was given; its storage stays fresh.
+        length(r.outputs) == 1 && !r.effectful || continue
+        cid = canon_id(g, only(r.outputs).id)
+        cid in have_ids && continue
+        # A scalar slice `x[i]` is a value, not storage.
+        T = get(types, cid, Any)
+        T isa Type && isconcretetype(T) && isbitstype(T) && continue
+        get(p.producer, cid, nothing) === r || continue
+        any(pair -> first(pair) == cid, recycle) && continue
+        # Fused sources take the step rule instead: their decomposition also
+        # reuses the buffers of the calls inside a dotted expression.
+        r.op isa Union{_AuthoredPlateOp,_AuthoredScanOp} || continue
+        push!(recycle, cid => gensym(Symbol(only(r.outputs).name, :_lane)))
+    end
+    recycle
+end
 
 function _nonalloc_argument_types(types::Dict{Symbol,Any}, callargs)
     Any[a isa Symbol ? get(types, a, Any) :
         a isa Expr ? Any : typeof(a) for a in callargs]
 end
 
-function _nonalloc_rewrite_recipe!(newbody, prog::_StepProgram, r::Recipe,
-                                   types::Dict{Symbol,Any}, lhs, callargs)
-    argtypes = _nonalloc_argument_types(types, callargs)
-    record!(T) = lhs isa Symbol && (types[lhs] = T)
-    op = r.op
-    if !r.effectful
-        if op isa _AuthoredScanOp
-            _nonalloc_rewrite_recipe!(newbody, prog, r, types, lhs, callargs, Val(:scan))
-            return
-        end
-        if op isa _AuthoredPlateOp
-            declared = valtype(only(r.outputs))
-            slot = _plate_cache_slot(op, argtypes, declared)
-            if slot isa Base.RefValue{<:Array}
-                # Lower the cells natively, as ordinary `prepare` does, into the
-                # cached buffer (`recycled`), like the scan step. Broadcasting
-                # the cell's prepared kernel instead boxed a descriptor holding
-                # it on every call (240 B with one `Ref` operand, 352 B with
-                # three, Julia 1.10.12): inside this program its `copyto!` is
-                # not inlined, and the operation it carries is a constant.
-                j = _step!(prog, identity, slot)
-                cache = Expr(:ref, Expr(:ref, _CACHES_ARG, j))
-                _lower_authored_plate_native!(newbody, prog.ops, Recipe[], op,
-                    callargs, r.inputs, lhs, nothing; recycled=cache,
-                    element_type=first(_declared_array_layout(declared)))
-                # The cell operations the lowering appended keep no cache.
-                append!(prog.caches, fill(nothing, length(prog.ops) - length(prog.caches)))
-                push!(newbody.args, Expr(:(=), cache, lhs))
-                record!(_plate_result_type(op, argtypes, declared))
-                return
-            end
-            j = _step!(prog, op, slot)
-            push!(newbody.args,
-                  Expr(:(=), lhs, _step_call(j, callargs...)))
-            record!(_plate_result_type(op, argtypes, declared))
-            return
-        end
-        if op isa _KernelSourceOp
-            if !(r.source isa _NoKernelSource)
-                dec = _decompose_fused_recipe!(prog, r, callargs, argtypes, lhs)
-                if dec !== nothing
-                    append!(newbody.args, dec[1])
-                    record!(dec[2])
-                    return
-                end
-            end
-            # A fused source outside the decomposition grammar (control flow,
-            # a branch closure) with an isbits result needs no cache either:
-            # call it directly, exactly as the bare-operation path does below.
-            T = _static_type(op, argtypes...)
-            if isconcretetype(T) && isbitstype(T)
-                j = _step!(prog, op, nothing)
-                push!(newbody.args, Expr(:(=), lhs, _plain_call(j, callargs...)))
-                record!(T)
-                return
-            end
-        else
-            # A bare identity operation: isbits results and identity-preserving
-            # wrappers need no cache at all.
-            T = _static_type(op, argtypes...)
-            if (isconcretetype(T) && isbitstype(T)) || _nonalloc_is_lazy(op)
-                j = _step!(prog, op, nothing)
-                push!(newbody.args, Expr(:(=), lhs, _plain_call(j, callargs...)))
-                record!(T)
-                return
-            end
-        end
+# One top-level statement of the native program. An operation call
+# `lhs = __ops__[i](callargs...)` takes the step rule; everything else (the
+# inlined plates, scans and cells, lane-filling sources, control flow) is kept.
+function _nonalloc_statement!(prog::_StepProgram, recipes::Tuple,
+                              types::Dict{Symbol,Any}, stmt)
+    stmt isa Expr && stmt.head === :(=) && stmt.args[1] isa Symbol &&
+        stmt.args[2] isa Expr && stmt.args[2].head === :call || return Any[stmt]
+    call = stmt.args[2]
+    i = _operation_slot(call.args[1])
+    i !== nothing && 1 <= i <= length(recipes) &&
+        length(recipes[i].outputs) == 1 || return Any[stmt]
+    _nonalloc_step!(prog, recipes[i], i, types, stmt.args[1],
+                    call.args[2:end], stmt)
+end
+
+# The step rule: fused captured sources decompose into destination-passing
+# steps where the grammar allows; isbits results and identity-preserving
+# wrappers are called directly; an operation whose result is fresh storage that
+# a destination-passing method fills (`_nonalloc_destination`) keeps a cache
+# slot at its own table index; every other operation is called directly.
+function _nonalloc_step!(prog::_StepProgram, r::Recipe, i::Int,
+                         types::Dict{Symbol,Any}, lhs::Symbol, callargs, stmt)
+    op = prog.ops[i]
+    if op isa _NonallocNestedPlate
+        prog.ops[i] = op.plate
+        prog.caches[i] = op.slot
+        return Any[Expr(:(=), lhs, _step_call(i, callargs...))]
     end
-    # Whole-recipe step. It keeps a cache slot only when a destination-passing
-    # method fills owned storage (see `_nonalloc_destination`); otherwise the
-    # operation is called directly and its result is never written into. The
-    # slot is typed by the inferred result when concrete, so storing a lazy
-    # wrapper result never forces a `convert` copy into the declared port type.
+    argtypes = _nonalloc_argument_types(types, callargs)
     T = _static_type(op, argtypes...)
+    if !r.effectful
+        if op isa _KernelSourceOp && !(r.source isa _NoKernelSource)
+            dec = _decompose_fused_recipe!(prog, r, callargs, argtypes, lhs)
+            if dec !== nothing
+                types[lhs] = dec[2]
+                return dec[1]
+            end
+        end
+        isconcretetype(T) && isbitstype(T) && return Any[stmt]
+        !(op isa _KernelSourceOp) && _nonalloc_is_lazy(op) && return Any[stmt]
+    end
     slot_type = T isa Type && isconcretetype(T) ? T : valtype(only(r.outputs))
     slot = _nonalloc_destination(prog.cache_apply, op, slot_type, argtypes) ?
            _nonalloc_slot(op, slot_type) : nothing
-    if slot !== nothing
-        j = _step!(prog, op, slot)
-        push!(newbody.args, Expr(:(=), lhs, _step_call(j, callargs...)))
-    else
-        j = _step!(prog, op, nothing)
-        push!(newbody.args, Expr(:(=), lhs, _plain_call(j, callargs...)))
-    end
-    record!(T isa Type && T !== Any ? T : valtype(only(r.outputs)))
-    nothing
+    slot === nothing && return Any[stmt]
+    prog.caches[i] = slot
+    Any[Expr(:(=), lhs, _step_call(i, callargs...))]
 end
 
-# Safety net for statement shapes the builder does not model: every embedded
-# `__ops__[i](...)` call still becomes a whole-recipe cache step.
-function _nonalloc_rewrite_nested(prog::_StepProgram, p::Plan, node)
-    node isa Expr || return node
-    args = map(a -> _nonalloc_rewrite_nested(prog, p, a), node.args)
-    rewritten = Expr(node.head, args...)
-    if rewritten.head === :call && !isempty(rewritten.args)
-        slot = _operation_slot(rewritten.args[1])
-        if slot !== nothing && 1 <= slot <= length(p.recipes)
-            r = p.recipes[slot]
-            out = only(r.outputs)
-            slot = _nonalloc_destination(prog.cache_apply, r.op,
-                valtype(out), nothing) ? _nonalloc_slot(r.op, valtype(out)) : nothing
-            if slot !== nothing
-                j = _step!(prog, r.op, slot)
-                return _step_call(j, rewritten.args[2:end]...)
-            end
-            j = _step!(prog, r.op, nothing)
-            return _plain_call(j, rewritten.args[2:end]...)
-        end
+function _nonalloc_mentions!(names::Set{Symbol}, node)
+    if node isa Symbol
+        push!(names, node)
+    elseif node isa Expr
+        foreach(arg -> _nonalloc_mentions!(names, arg), node.args)
     end
-    rewritten
+    names
 end
 
 # --- exemplar-typed preparation ---------------------------------------------
@@ -822,50 +809,62 @@ function _nonalloc_exact_signature(ast::Expr, have_types::Tuple)
 end
 
 """
-    _nonallocating_program(p::Plan, ast::Expr) -> (ast, ops, caches)
+    _nonallocating_program(p::Plan; have_types, cache_apply, passes) -> (ast, ops, caches)
 
-Rewrite the un-embedded lowering of `p` into the non-allocating step program:
-per-step operations and typed persistent caches, with fused captured sources
-decomposed into destination-passing steps where the grammar allows, and a
-whole-recipe step as the universal fallback. Only steps with an owned,
-destination-filled result keep a cache (`_nonalloc_destination`).
+The non-allocating step program of `p`. It is the native program ordinary
+`prepare` compiles (`_lower_with_ops` over `_lowering_plan(p)`): plate chains
+compose, summed plates fold their totals, scans stream into the plates they
+feed, and plate cells compute the rows they read. Its remaining allocation
+sites are routed to kernel-owned storage:
+
+- each materialized authored plate or scan output, top-level dotted call or
+  array slice fills a lane slot that keeps its buffer across calls
+  (`_nonalloc_lanes`);
+- each other top-level operation call takes the step rule
+  (`_nonalloc_step!`);
+- a plate whose cells return arrays stays one cache step
+  (`_nonalloc_nested_plates`).
+
+The operation table is the native one, so every inlined `__ops__[i]`
+reference keeps its meaning; decomposition steps and lane slots are appended.
 """
-function _nonallocating_program(p::Plan, ast::Expr; have_types=nothing,
-                                cache_apply=nothing)
-    ast.head === :function ||
-        throw(ArgumentError("non-allocating preparation requires a function Expr"))
-    signature = ast.args[1]
-    signature isa Expr && signature.head === :tuple &&
-        !isempty(signature.args) && first(signature.args) === _OPS_ARG ||
-        throw(ArgumentError("non-allocating preparation requires the lowered __ops__ signature"))
-
-    prog = _StepProgram(Any[], Any[], cache_apply)
-    types = Dict{Symbol,Any}()
-    for (index, (v, argexpr)) in enumerate(zip(p.have, signature.args[2:end]))
-        name = argexpr isa Expr && argexpr.head === :(::) ?
-               argexpr.args[1] : argexpr
-        name isa Symbol && (types[name] = have_types === nothing ? valtype(v) : have_types[index])
+function _nonallocating_program(p::Plan; have_types = nothing,
+                                cache_apply = nothing, passes = ())
+    lowered = _lowering_plan(p)
+    argument_types = have_types === nothing ?
+        map(valtype, Tuple(lowered.have)) : have_types
+    values = _nonalloc_value_types(lowered, argument_types)
+    lowered = _nonalloc_nested_plates(lowered, values)
+    recycle = _nonalloc_lanes(lowered, values)
+    # No typed local declarations: the program is host-only, and declaring
+    # `W::Matrix{Float64} = reshape(view(u, r), a, b)` would copy the lazy
+    # value into a fresh matrix on every call. Declared plate outputs still
+    # fix their buffers' element types.
+    ast, ops, recipes = _lower_with_ops(lowered; exemplar_types = have_types,
+                                        declare = false, recycle,
+                                        pushdowns = true,
+                                        plate_element_types = true)
+    isempty(passes) || (ast = transform(ast, passes...))
+    names = _varnames(lowered)
+    types = Dict{Symbol,Any}(names[cid] => T for (cid, T) in values
+                             if haskey(names, cid))
+    prog = _StepProgram(Any[ops...], Any[nothing for _ in ops], cache_apply)
+    body = Expr(:block)
+    for stmt in ast.args[2].args
+        append!(body.args, _nonalloc_statement!(prog, recipes, types, stmt))
     end
-
-    body = ast.args[2]
-    newbody = Expr(:block)
-    for stmt in body.args
-        handled = false
-        if stmt isa Expr && stmt.head === :(=) && stmt.args[2] isa Expr &&
-           stmt.args[2].head === :call
-            call = stmt.args[2]
-            slot = _operation_slot(call.args[1])
-            if slot !== nothing && 1 <= slot <= length(p.recipes)
-                _nonalloc_rewrite_recipe!(newbody, prog, p.recipes[slot],
-                                          types, stmt.args[1],
-                                          call.args[2:end])
-                handled = true
-            end
-        end
-        handled ||
-            push!(newbody.args, _nonalloc_rewrite_nested(prog, p, stmt))
+    # A value the native lowering never materializes (a summed plate, a scan
+    # streamed into its plate, a row computed in a cell) leaves its lane unused.
+    mentioned = _nonalloc_mentions!(Set{Symbol}(), body)
+    lanes = Any[]
+    for (_, lane) in recycle
+        lane in mentioned || continue
+        j = _step!(prog, _NonallocLane(), Ref{Any}(nothing))
+        push!(lanes, Expr(:(=), lane, Expr(:ref, _CACHES_ARG, j)))
     end
-    args = Expr(:tuple, _OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG,
-                signature.args[2:end]...)
-    (Expr(:function, args, newbody), Tuple(prog.ops), Tuple(prog.caches))
+    prepend!(body.args, lanes)
+    ports = ast.args[1].args[2:1 + length(lowered.have)]
+    (Expr(:function, Expr(:tuple, _OPS_ARG, _CACHES_ARG, _CACHE_APPLY_ARG,
+                          ports...), body),
+     Tuple(prog.ops), Tuple(prog.caches))
 end

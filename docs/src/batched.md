@@ -186,8 +186,8 @@ an `Int` lag and a `Vector` response, all decided when the kernel is
 compiled; the window split also needs the lag's per-observation inputs to span
 the plate's axes. Otherwise, and for the filtered spelling (whose filter can
 skip the lag), the observation-outer loop runs as before.
-`prepare_nonallocating` evaluates a plate cell by cell through its broadcast
-step and is unchanged.
+`prepare_nonallocating` lowers the same native loop and fills the pointwise
+result into a buffer the kernel keeps.
 
 A domain port needs no declared type. `observations = domain(plan)`, with
 `domain` returning `1:plan.nobs` for one plan type and `eachrow(plan.rows)` for
