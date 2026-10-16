@@ -30,6 +30,9 @@ mutable struct ValueNamespace
     key::UInt
 end
 ValueNamespace(key::UInt) = ValueNamespace(0, key)
+# A namespace is an identity, not data: a deep copy of a graph or a table keyed
+# by value identities refers to the same values, so it keeps the namespace.
+Base.deepcopy_internal(namespace::ValueNamespace, ::IdDict) = namespace
 
 """
     ValueId

@@ -26,6 +26,11 @@ using Test
     @test RK.ValueId(RK.ValueNamespace(imported.key), 1) != RK.ValueId(imported, 1)
     @test RK.ValueId(imported, 1) == RK.ValueId(imported, 1)
     @test hash(RK.ValueId(imported, 1)) == hash(RK.ValueId(imported, 1))
+    # A deep copy refers to the same values: it keeps their namespace.
+    v = value(:copied, Float64)
+    table = Dict(v.id => [1], RK.ValueId(imported, 1) => [2])
+    @test deepcopy(v) == v && deepcopy(v).id.namespace === v.id.namespace
+    @test deepcopy(table) == table
 end
 
 # Positional operations deliberately have no global names in lowered code.
