@@ -203,4 +203,63 @@ end
     end
     @test counts[1] == counts[2]
 end
+
+# Event-dependent broadcasts cannot be hoisted. Their scalar reads compose
+# through the law's component and observation plates instead.
+@testset "event-dependent component arrays have constant allocation counts" begin
+    model = quote
+        w ~ Uniform(0, 1)
+        p[1:T] .~ Uniform.(0, 1)
+        @plate for i in eachindex(events)
+            present = p .* offsets[i]
+            components = hcat(present, absent)
+            events[i] ~ LogDensity(bernoulli_product_mixture_logdensity,
+                components, [w, 1 - w])
+        end
+    end
+    function oracle(events, offsets, absent, u)
+        probability = 1 ./ (1 .+ exp.(-u))
+        w, p = probability[1], probability[2:end]
+        likelihood = sum(eachindex(events); init=0.0) do i
+            law = MixtureModel([product_distribution(Bernoulli.(p .* offsets[i])),
+                product_distribution(Bernoulli.(absent))], [w, 1 - w])
+            logpdf(law, Int.(events[i]))
+        end
+        likelihood + sum(log.(probability) .+ log1p.(-probability))
+    end
+    for T in (2, 5)
+        counts = map((3, 60)) do n
+            events = [Bool[isodd(i + j) for j in 1:T] for i in 1:n]
+            offsets = [0.5 + 0.1sin(i) for i in 1:n]
+            absent = fill(0.2, T)
+            data = (; events, offsets, absent, T)
+            bound = bind_data(lower_rkppl(model, data; mod=@__MODULE__,
+                conditioned=(:events,)), data)
+            built = build_kernel(bound)
+            u = [0.2; range(-0.3, 0.4; length=T)]
+            sampler = prepare_sampler(built, bound, u;
+                backend=DI.AutoEnzyme(; mode=Enzyme.Reverse))
+            g = similar(u)
+            value, _ = sampler_value_and_gradient!(sampler, g, u)
+            @test value ≈ oracle(events, offsets, absent, u) rtol=1e-12
+            step = 1e-6
+            for j in eachindex(u)
+                plus, minus = copy(u), copy(u)
+                plus[j] += step
+                minus[j] -= step
+                target = (oracle(events, offsets, absent, plus) -
+                    oracle(events, offsets, absent, minus)) / (2step)
+                @test g[j] ≈ target rtol=2e-6 atol=2e-7
+            end
+            sampler(u)
+            allocation_counts = ((@allocations sampler(u)),
+                (@allocations sampler_value_and_gradient!(sampler, g, u)))
+            allocation_bytes = ((@allocated sampler(u)),
+                (@allocated sampler_value_and_gradient!(sampler, g, u)))
+            @info "event-dependent component arrays" T n allocation_counts allocation_bytes
+            allocation_counts
+        end
+        @test counts[1] == counts[2]
+    end
+end
 end
