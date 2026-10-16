@@ -22,7 +22,9 @@ An allocator of `Value` identities. Identities from different namespaces are
 distinct; a namespace is compared by object identity.
 """
 mutable struct ValueNamespace
-    count::Int
+    # Identities allocated so far. Atomic because graphs may be built from
+    # concurrent tasks, all allocating in this process's namespace.
+    @atomic count::Int
     # The hash and order of identities. A namespace's address differs in every
     # process that loads it from a package image; this key travels with it.
     key::UInt
@@ -68,7 +70,7 @@ end
 const _VALUE_NAMESPACE = Ref(ValueNamespace(rand(RandomDevice(), UInt)))
 function _next_value_id()
     namespace = _VALUE_NAMESPACE[]
-    ValueId(namespace, namespace.count += 1)
+    ValueId(namespace, @atomic namespace.count += 1)
 end
 
 function __init__()

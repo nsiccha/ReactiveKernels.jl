@@ -98,7 +98,11 @@ establish](#what-the-nuts-proof-does-and-does-not-establish).
 
 ### 1. Graph construction
 
-A `Value` has a stable process-unique identity and a declared Julia value type.
+A `Value` has a stable identity and a declared Julia value type. The identity
+is the namespace that allocated the value plus a number within it. Every
+process, and every package image, allocates in a namespace of its own, so
+values from different images and from the running process never coincide, and
+a value that one image refers to from another keeps its identity after loading.
 Its name is only a diagnostic hint. Two values with the same name are distinct;
 generated local variables therefore never use a name as identity.
 
