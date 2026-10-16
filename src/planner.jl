@@ -29,7 +29,7 @@ struct Plan
     have::Vector{Value}
     want::Vector{Value}
     recipes::Vector{Recipe}          # selected, in execution order
-    producer::Dict{Int,Recipe}       # value id => the recipe that produces it
+    producer::Dict{ValueId,Recipe}   # value id => the recipe that produces it
     cost::Float64
     candidates::Vector{Recipe}       # all backward-reachable candidates (for explain)
 end
@@ -39,11 +39,11 @@ end
 # Candidate recipes: those reachable backward from `want`, stopping at `have`.
 # Effectful recipes are excluded (never selected); if that makes a want
 # unreachable the ordinary impossible-query diagnostic fires (gist §12).
-function _candidate_recipes(g::Graph, have::Set{Int}, want::Vector{Int})
+function _candidate_recipes(g::Graph, have::Set{ValueId}, want::Vector{ValueId})
     cand = Int[]
     seen_recipe = Set{Int}()
-    seen_value = Set{Int}()
-    stack = Int[]
+    seen_value = Set{ValueId}()
+    stack = ValueId[]
     for w in want
         (w in have) || push!(stack, w)
     end
@@ -80,8 +80,8 @@ end
 # minimum always survives and no value loses its last producer. This keeps
 # backward (inverse-route) producers from multiplying the exact search
 # whenever the direct HAVE route exists at no greater cost.
-function _prune_dominated_candidates!(g::Graph, have::Set{Int}, cand::Vector{Int})
-    by_value = Dict{Int,Vector{Int}}()
+function _prune_dominated_candidates!(g::Graph, have::Set{ValueId}, cand::Vector{Int})
+    by_value = Dict{ValueId,Vector{Int}}()
     for rid in cand, o in g.recipes[rid].outputs
         cid = canon_id(g, o.id)
         cid in have && continue
@@ -122,8 +122,8 @@ end
 # v. Multi-output recipes remain candidates whenever they can add other values.
 # Reachability deliberately ignores costs and may overestimate what is possible;
 # failure to reach an input is therefore a proof, not a greedy route choice.
-function _prune_ungroundable_candidates!(g::Graph, have::Set{Int}, cand::Vector{Int})
-    by_value = Dict{Int,Vector{Int}}()
+function _prune_ungroundable_candidates!(g::Graph, have::Set{ValueId}, cand::Vector{Int})
+    by_value = Dict{ValueId,Vector{Int}}()
     for rid in cand, output in g.recipes[rid].outputs
         cid = canon_id(g, output.id)
         cid in have && continue
@@ -165,8 +165,8 @@ end
 
 mutable struct _Search
     g::Graph
-    have::Set{Int}
-    want::Vector{Int}
+    have::Set{ValueId}
+    want::Vector{ValueId}
     candidates::Vector{Int}
     best_sel::Union{Nothing,Vector{Int}}
     best_cost::Float64
@@ -183,8 +183,8 @@ function _produced(s::_Search, selected::Vector{Int})
     p
 end
 
-function _frontier(s::_Search, selected::Vector{Int}, produced::Set{Int})
-    f = Int[]
+function _frontier(s::_Search, selected::Vector{Int}, produced::Set{ValueId})
+    f = ValueId[]
     for w in s.want
         (w in produced) || (w in f) || push!(f, w)
     end
@@ -256,7 +256,7 @@ end
 
 # --- topological ordering / cycle detection --------------------------------
 
-function _is_acyclic(g::Graph, selected::Vector{Int}, have::Set{Int})
+function _is_acyclic(g::Graph, selected::Vector{Int}, have::Set{ValueId})
     _topo(g, selected, have) !== nothing
 end
 
@@ -266,7 +266,7 @@ end
 # valid order possible. Instead, execute any recipe whose inputs are currently
 # available, adding all of its outputs to the availability frontier.
 # Returns the executable prefix and its available values, including on a stall.
-function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{Int})
+function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{ValueId})
     available = copy(have)
     remaining = Set(selected)
     order = Int[]
@@ -287,7 +287,7 @@ function _executable_prefix(g::Graph, selected::Vector{Int}, have::Set{Int})
 end
 
 # Full-plan validation still requires every selected recipe to execute.
-function _topo(g::Graph, selected::Vector{Int}, have::Set{Int})
+function _topo(g::Graph, selected::Vector{Int}, have::Set{ValueId})
     order, _ = _executable_prefix(g, selected, have)
     length(order) == length(selected) ? order : nothing
 end
@@ -351,7 +351,7 @@ function plan(g::Graph; have = (), want = ())
     # HAVE is set-like. Preserve first-seen order for the positional API while
     # collapsing repeated and structural-CSE-aliased identities to one input.
     haves = Value[]
-    seen_have = Set{Int}()
+    seen_have = Set{ValueId}()
     for v in _astuple(have)
         cid = canon_id(g, v.id)
         cid in seen_have && continue
@@ -379,7 +379,7 @@ function plan(g::Graph; have = (), want = ())
     order === nothing && throw(PlanningError("selected computation contains a cycle"))
 
     recipes = [g.recipes[rid] for rid in order]
-    producer = Dict{Int,Recipe}()
+    producer = Dict{ValueId,Recipe}()
     for r in recipes, o in r.outputs
         cid = canon_id(g, o.id)
         cid in have_ids && continue
@@ -391,7 +391,7 @@ end
 
 # Diagnose why `want` cannot be produced: report the values on the missing
 # frontier that have no available producer (gist §16).
-function _impossible_message(g::Graph, have::Set{Int}, want::Vector{Int}, cand::Vector{Int})
+function _impossible_message(g::Graph, have::Set{ValueId}, want::Vector{ValueId}, cand::Vector{Int})
     # A value is reachable if in `have` or produced by a candidate whose inputs
     # are (transitively) reachable.
     reachable = copy(have)
@@ -418,7 +418,7 @@ function _impossible_message(g::Graph, have::Set{Int}, want::Vector{Int}, cand::
             " from available values {", havestr, "}.")
     println(io, "Missing frontier:")
     # Report unreachable values that block progress.
-    blocked = Set{Int}()
+    blocked = Set{ValueId}()
     for w in missing_wants
         _collect_blocked!(blocked, g, w, reachable, have)
     end

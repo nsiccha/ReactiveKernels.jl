@@ -98,7 +98,11 @@ establish](#what-the-nuts-proof-does-and-does-not-establish).
 
 ### 1. Graph construction
 
-A `Value` has a stable process-unique identity and a declared Julia value type.
+A `Value` has a stable identity and a declared Julia value type. The identity
+is the namespace that allocated the value plus a number within it. Every
+process, and every package image, allocates in a namespace of its own, so
+values from different images and from the running process never coincide, and
+a value that one image refers to from another keeps its identity after loading.
 Its name is only a diagnostic hint. Two values with the same name are distinct;
 generated local variables therefore never use a name as identity.
 
@@ -766,6 +770,27 @@ plate computes work that reads only shared values (captured or `Ref` arrays,
 scalars, and values computed from them alone) once before its outer loop. The
 cell reads those results whole; the rest of its graph, including inner loops,
 runs per outer coordinate.
+
+Work that varies per outer coordinate cannot move out of the loop. When such a
+cell computes an `hcat` or a broadcast whose only readers are scalar indexing
+and shape queries, including readers in an embedded kernel's nested plates,
+native lowering reads its entries through those readers instead of storing it
+per cell. For example, `present = p .* offsets[event]` followed by
+`components = hcat(present, absent)` builds neither array per event. The graph
+and its queries keep both authored values, and ordinary Enzyme Reverse
+differentiates the composed reads without a derivative rule. Shape checks and
+declarations still run at the authored statement, and scalar reads keep bounds
+checks. The composition covers dense `Float32`/`Float64` arrays and real
+scalars, `hcat` of vectors and matrices, and one-dimensional broadcasts of
+total arithmetic (`+ - * /`, `exp`, `abs`, `abs2`, `logistic`, `log1pexp`,
+`identity`). Other values,
+whole-array readers, custom storage, broadcasts that may throw (such as `log.`)
+and effectful regions keep their stored arrays. A higher-rank broadcast is also
+stored: on Julia 1.10, ordinary Enzyme Reverse of composed matrix-broadcast
+reads fails with an internal error in Enzyme 0.13.216
+([EnzymeAD/Enzyme.jl#3822](https://github.com/EnzymeAD/Enzyme.jl/issues/3822)).
+`test/test_cell_arrays.jl` covers these cases and the event-count-independent
+allocations.
 
 An empty native plate evaluates no cell work, including shared expressions.
 For inferable cells, pointwise readers still return a concretely typed empty

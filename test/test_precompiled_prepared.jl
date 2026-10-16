@@ -51,6 +51,19 @@ using ReactiveKernels, Test
             end
             import PrecompiledPreparedConsumer: trajectory, HAVE, borrowed_curve
             const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
+            # A value of the consumer image held by this image, and a table
+            # this image keys by values of both images.
+            const SHARED_INPUT = first(inputs(trajectory))
+            # A graph template, y = 2x, that a loading process extends; its
+            # numbers lie above any the law's composition below counts to.
+            foreach(_ -> value(:padding, Float64), 1:2000)
+            const TEMPLATE = let g = Graph()
+                x = value!(g, :x, Float64)
+                y = value!(g, :y, Float64)
+                add!(g, (x,) => (y,), v -> 2v)
+                (; graph = g, x, y)
+            end
+            const NAMES = Dict(SHARED_INPUT => :position, TEMPLATE.x => :x)
             const BATCH = prepare_batched(trajectory; have = HAVE,
                 batched = :position, want = (:total, :conc))
             const BORROWED = prepare_batched(borrowed_curve;
@@ -80,14 +93,25 @@ using ReactiveKernels, Test
             const C = PrecompiledPreparedConsumer
             @test C.WAS_PRECOMPILED
             @test ImportedPreparedConsumer.WAS_PRECOMPILED
-            # Consumer-image allocations do not advance the dependency's
-            # counter after load. Reproduce the reported alignment, where a
-            # new bound plate cache reused the loaded right-location ID.
+            # Each image keeps the identities its kernels were authored with,
+            # in a namespace of its own, and this process allocates in another.
+            # A value one image refers to from the other keeps its identity.
             const RK = ReactiveKernels
+            const D = ImportedPreparedConsumer
+            here = RK._VALUE_NAMESPACE[]
+            consumer_namespace = first(inputs(C.trajectory)).id.namespace
+            derived_namespace = D.TEMPLATE.x.id.namespace
+            @test consumer_namespace !== derived_namespace
+            @test consumer_namespace !== here && derived_namespace !== here
+            @test D.SHARED_INPUT == first(inputs(C.trajectory))
+            @test D.SHARED_INPUT.id.namespace === consumer_namespace
+            @test D.NAMES[first(inputs(C.trajectory))] === :position
+            @test D.NAMES[D.TEMPLATE.x] === :x
             graph = C.pair_grid.graph
             right_id = RK.canon_id(graph, C.pair_grid.right.id)
-            @test RK._VALUE_COUNTER[] < right_id
-            while RK._VALUE_COUNTER[] < right_id - 1
+            # Count to the right location's number, where a new bound plate
+            # cache once reused the loaded identity.
+            while here.count < right_id.number - 1
                 value(:alignment, Float64)
             end
             original_values = copy(graph.values)
@@ -239,11 +263,13 @@ using ReactiveKernels, Test
                 end
                 ids
             end
-            nested = setdiff(plate_value_ids!(Set{Int}(), nested_mixture.graph),
+            nested = setdiff(plate_value_ids!(Set{RK.ValueId}(), nested_mixture.graph),
                              keys(nested_mixture.graph.values))
-            # Count to just below them, as an ordered suite does.
-            @test RK._VALUE_COUNTER[] < minimum(nested) - 1
-            while RK._VALUE_COUNTER[] < minimum(nested) - 1
+            # Count to just below their numbers, as an ordered suite does.
+            first_nested = minimum(id.number for id in nested)
+            here = RK._VALUE_NAMESPACE[]
+            @test here.count < first_nested - 1
+            while here.count < first_nested - 1
                 value(:ordered_suite, Float64)
             end
             mixtures = prepare(event_mixtures)
@@ -257,6 +283,25 @@ using ReactiveKernels, Test
                 log(sum(weights .* exp.(scores)))
             end
             @test mixtures(events, probabilities, weights) ≈ expected
+
+            # Values made here, with the numbers of the loaded template's
+            # values, wired into that template. Sharing identities made `a`
+            # the template's `x` and `b` its `y`: planning `b` from `x` then
+            # returned `y` (2x) instead of refusing the missing `a`.
+            import ImportedPreparedConsumer: TEMPLATE
+            while here.count < TEMPLATE.x.id.number - 1
+                value(:ordered_suite, Float64)
+            end
+            a = value(:a, Float64)
+            b = value(:b, Float64)
+            @test a.id.number == TEMPLATE.x.id.number && a != TEMPLATE.x
+            @test b.id.number == TEMPLATE.y.id.number && b != TEMPLATE.y
+            g = compose(TEMPLATE.graph)
+            add!(g, (a,) => (b,), v -> v + 100)
+            @test g.values[TEMPLATE.x.id] === TEMPLATE.x
+            @test prepare(g; have = (TEMPLATE.x,), want = (TEMPLATE.y,))(1.0) == 2.0
+            @test prepare(g; have = (a,), want = (b,))(1.0) == 101.0
+            @test_throws RK.PlanningError prepare(g; have = (TEMPLATE.x,), want = (b,))
             println("NESTED_LAW_COMPOSITION_PASS")
             """
         @test success(pipeline(

@@ -660,7 +660,7 @@ struct _NonallocNestedPlate{P,S}
 end
 (op::_NonallocNestedPlate)(args...) = op.plate(args...)
 
-function _nonalloc_nested_plates(p::Plan, types::Dict{Int,Any})
+function _nonalloc_nested_plates(p::Plan, types::AbstractDict)
     g = p.graph
     changed = false
     recipes = map(p.recipes) do r
@@ -687,10 +687,10 @@ end
 # its first allocation otherwise. Its operation-table entry is never called.
 struct _NonallocLane end
 
-function _nonalloc_lanes(p::Plan, types::Dict{Int,Any})
+function _nonalloc_lanes(p::Plan, types::AbstractDict)
     g = p.graph
     have_ids = Set(canon_id(g, v.id) for v in p.have)
-    recycle = Pair{Int,Symbol}[]
+    recycle = Pair{ValueId,Symbol}[]
     for r in p.recipes
         # An effect may retain the value it was given; its storage stays fresh.
         length(r.outputs) == 1 && !r.effectful || continue

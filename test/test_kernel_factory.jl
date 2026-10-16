@@ -524,7 +524,7 @@ end
         # POST-CONSTRUCTION entry_current = HAVE ∪ producer-map KEYS (recipe-owned; no collateral)
         ec = RKS.kernel_plan_entry_current(plan)
         gphc = RKS.kernel_graph(phasepoint_ep)
-        canonof(n) = RKS.canon_id(gphc, phasepoint_ep.ports[n].id)
+        canonof(n) = RKS._canon_int(gphc, phasepoint_ep.ports[n])
         @test cdp in ec && canonof(:pos) in ec
         @test length(ec) == length(unique(ec))            # deduped, stable
         # every canonical HAVE is present directly
@@ -550,10 +550,10 @@ end
                       if !(n in phasepoint_ep.have_names)]
         plactual = RKS.plan(RKS.kernel_graph(phasepoint_ep); have = havev, want = wantv)
         @test RKS.kernel_plan_producer(plan) ==
-              Tuple(sort!([(cid, r.id) for (cid, r) in plactual.producer]))
+              Tuple(sort!([(RKS._canon_int(cid), r.id) for (cid, r) in plactual.producer]))
         # multi-output producer: `pot` is produced by BOTH pot_f(pos) and grad_f(pos); the producer
         # map selects EXACTLY ONE (recipe-owned), so entry_current follows it, not collateral.
-        cpot = RKS.canon_id(RKS.kernel_graph(phasepoint_ep), phasepoint_ep.ports[:pot].id)
+        cpot = RKS._canon_int(RKS.kernel_graph(phasepoint_ep), phasepoint_ep.ports[:pot])
         @test count(e -> e[1] == cpot, RKS.kernel_plan_producer(plan)) == 1
         # DEEPLY IMMUTABLE: only Tuples reachable — no Vector/Dict anywhere in the seam
         @test RKS.kernel_plan_slots(plan) isa Tuple
@@ -570,7 +570,7 @@ end
         # the Plan's canonical-Value → (role, field index) map the storage family consumes
         @test RKS.kernel_plan_field(plan, cdp) == (RKS.kernel_plan_slot(plan, :dham_dpos).role,
                                                    RKS.kernel_plan_slot(plan, :dham_dpos).slot)
-        cmet = RKS.canon_id(gph, phasepoint_ep.ports[:metric].id)
+        cmet = RKS._canon_int(gph, phasepoint_ep.ports[:metric])
         @test RKS.kernel_plan_field(plan, cmet)[1] === :shared
         @test RKS.kernel_plan_field(plan, -1) === nothing        # unknown canon → nothing
 
@@ -593,11 +593,11 @@ end
         # AUTHORED INPUT ORDER preserved (RK 05:00 pt1/5): `z = b - a` records inputs (b, a), the
         # exact order the execution applier binds — NOT sorted; a position swap is distinguishable.
         go = RKS.kernel_graph(orderk)
-        ca = RKS.canon_id(go, orderk.ports[:a].id); cb = RKS.canon_id(go, orderk.ports[:b].id)
+        ca = RKS._canon_int(go, orderk.ports[:a]); cb = RKS._canon_int(go, orderk.ports[:b])
         plano = RKS._kernel_factory_plan(orderk, Set((:z,)), Set((:a, :b)))
         rio = RKS.kernel_plan_recipe_inputs(plano)
         @test length(rio) == 1 && rio[1][2] == (cb, ca)         # authored order (b, a)
-        @test rio[1][2] != Tuple(sort([ca, cb]))                # NOT sorted → a swap is distinct
+        @test rio[1][2] != (ca, cb)                             # a position swap is distinct
         @test cb in RKS.kernel_plan_key(plano)[6][1][2]         # ordered inputs are in the Key
     end
 
@@ -957,7 +957,7 @@ end
         integ = RKS.kernel_registration(leapfrog_ep!)
         plan = RKS._kernel_factory_endpoint_plan(phasepoint_ep, integ)
         gp = RKS.kernel_graph(phasepoint_ep)
-        canonf(n) = RKS.canon_id(gp, phasepoint_ep.ports[n].id)
+        canonf(n) = RKS._canon_int(gp, phasepoint_ep.ports[n])
         canons, roles = RKS.kernel_plan_superset(plan)
         # shared pot_f/grad_f/metric precede owned pos/mom → pos/mom get ABSOLUTE positions ≥ 4,
         # NOT per-role slot 1/2 (the bug RK 05:49 reproduced).
@@ -1001,7 +1001,7 @@ end
         integ = RKS.kernel_registration(gradonly_step!)
         plan = RKS._kernel_factory_endpoint_plan(gradonly_ep, integ)
         g = RKS.kernel_graph(gradonly_ep)
-        canonof(n) = RKS.canon_id(g, gradonly_ep.ports[n].id)
+        canonof(n) = RKS._canon_int(g, gradonly_ep.ports[n])
         cpot, cdpot = canonof(:pot), canonof(:dpot_dpos)
         ro = RKS.kernel_plan_recipe_outputs(plan)
         po = RKS.kernel_plan_producer_owned(plan)
@@ -1014,7 +1014,7 @@ end
         grown = only(os for (rid, os) in po if rid == gr)
         # EXACT AUTHORED POSITIONAL ORDER from r.outputs — NOT reconstructed by sorted ids
         grrecipe = only(r for r in g.recipes if r.id == gr)
-        @test grout == Tuple(RKS.canon_id(g, v.id) for v in grrecipe.outputs)   # authored positional order
+        @test grout == Tuple(RKS._canon_int(g, v) for v in grrecipe.outputs)   # authored positional order
         @test Set(grown) ⊆ Set(grout) && Set(grown) == Set((cpot, cdpot))       # pot_f-free -> both owned
         @test grown == Tuple(c for c in grout if c in Set(grown))               # owned subset keeps order
         # the type-stable binding derives pot/dest from these ORDERED outputs (not sorted ids)
@@ -1062,7 +1062,7 @@ end
     @testset "construction seam — PREPARED plan (zero planner/graph per instance), HAVE-only, type-stable grad, mask==entry_current (RK 05:47/06:49/06:55)" begin
         integ = RKS.kernel_registration(gradonly_poison_step!)   # ISOLATED endpoint — poison never leaks
         g = RKS.kernel_graph(gradonly_poison_ep)
-        canonof(n) = RKS.canon_id(g, gradonly_poison_ep.ports[n].id)
+        canonof(n) = RKS._canon_int(g, gradonly_poison_ep.ports[n])
         cpos, cpot, cdpot, cgf = canonof(:pos), canonof(:pot), canonof(:dpot_dpos), canonof(:grad_f)
         plan0 = RKS._kernel_factory_endpoint_plan(gradonly_poison_ep, integ)
         prod = Dict(RKS.kernel_plan_producer(plan0))
@@ -1108,7 +1108,7 @@ end
     @testset "construction seam — copy owned children (ONE shared, ZERO extra pgrad, exception-safe, 0-B) (RK 06:53/06:56/06:59)" begin
         integ = RKS.kernel_registration(gradonly_step!)
         g = RKS.kernel_graph(gradonly_ep)
-        canonof(n) = RKS.canon_id(g, gradonly_ep.ports[n].id)
+        canonof(n) = RKS._canon_int(g, gradonly_ep.ports[n])
         cpos, cpot, cdpot, cgf = canonof(:pos), canonof(:pot), canonof(:dpot_dpos), canonof(:grad_f)
         gr = Dict(RKS.kernel_plan_producer(RKS._kernel_factory_endpoint_plan(gradonly_ep, integ)))[cpot]
         pf = RKS._prepare_factory(gradonly_ep, integ)                            # SELF-DISCOVERING
@@ -1321,7 +1321,7 @@ end
         integ = RKS.kernel_registration(leapfrog_ep!)
         pf = RKS._prepare_factory(euclidean_ep, integ)
         plan = RKS.kernel_prepared_plan(pf)
-        gE = RKS.kernel_graph(euclidean_ep); cf(n) = RKS.canon_id(gE, euclidean_ep.ports[n].id)
+        gE = RKS.kernel_graph(euclidean_ep); cf(n) = RKS._canon_int(gE, euclidean_ep.ports[n])
         ownedbufs = [RKS.kernel_plan_field(plan, cf(n))[2] for n in (:pos, :mom, :dpot_dpos, :dkin_dmom)]
         ecmask = RKS._canon_current_mask                                       # alias
         entry_owned = sort([RKS.kernel_plan_field(plan, c)[2] for c in RKS.kernel_plan_entry_current(plan)
