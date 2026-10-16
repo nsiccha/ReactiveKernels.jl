@@ -211,7 +211,7 @@ function _latest_value(f::F, query, args::Vararg{Any,N}) where {F,N}
 end
 
 """
-    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false, native_forward_batch = false) -> SamplerQuery
+    prepare_sampler(built, plan, u0::AbstractVector{<:Real}; backend, on_error = nothing, retain = (), warm = false, native_forward_batch = false, nonallocating = false) -> SamplerQuery
 
 Prepare a reusable [`SamplerQuery`](@ref): the `:sampler`-cut value kernel
 plus a `prepare_ad` gradient with `active = :unconstrained`. `u0` is a
@@ -247,10 +247,25 @@ the unchanged generated kernel, including priors and transforms. Explicit
 reverse mode, wider, effectful, scan, and retained-output programs keep the
 ordinary reverse preparation. The opt-in forward preparation keeps a reverse
 operator for traced calls and a later input with a different active shape.
+
+`nonallocating = true` prepares the density and its gradient over
+`ReactiveKernels.prepare_nonallocating`, which needs `using MutatingFunctions`
+in the calling session. Every operation with a destination-passing form then
+writes into a buffer the query owns: an evaluation reuses the same memory
+instead of allocating fresh observation-length intermediates (matrix-vector
+products, plate outputs) on every call. Values and gradients equal the
+ordinary sampler's. The density is usually faster, and loses less when another
+allocating process shares the CPU core; the reverse gradient is faster on some
+programs and slower on others, so measure both on the model you fit. The
+query keeps the buffers, which is why a query serves one caller at a time.
+The kernel and gradient are native only (ReactiveKernels does not compile a
+non-allocating kernel with Reactant). Native forward batching does not apply,
+and ReactiveKernels does not build retained outputs over a non-allocating
+kernel yet, so `retain` fails there.
 """
 function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real};
         backend, on_error = nothing, retain::Tuple = (), warm::Bool = false,
-        native_forward_batch::Bool = false)
+        native_forward_batch::Bool = false, nonallocating::Bool = false)
     layout = built.layout::LayoutTable
     length(u0) == layout.total || throw(ContractValidationError(
         "[query] exemplar length $(length(u0)) ≠ layout total $(layout.total)"))
@@ -266,12 +281,17 @@ function prepare_sampler(built, plan::StructuralPlan, u0::AbstractVector{<:Real}
             (workflow_wants(:sampler), wants...); on_error,
             exemplars = exemplar)), wants
     end
-    use_forward = native_forward_batch && isempty(wants) &&
-        ReactiveKernels._native_forward_batch_eligible(
-            backend, gradient_kernel, u)
+    if nonallocating
+        kern = Base.invokelatest(ReactiveKernels.prepare_nonallocating, kern, u)
+        gradient_kernel = isempty(wants) ? kern :
+            Base.invokelatest(ReactiveKernels.prepare_nonallocating, gradient_kernel, u)
+    end
+    # The non-allocating `prepare_ad` method takes no forward-batching keyword.
+    forward = nonallocating ? (;) : (; native_forward_batch = native_forward_batch &&
+        isempty(wants) && ReactiveKernels._native_forward_batch_eligible(
+            backend, gradient_kernel, u))
     prep = Base.invokelatest(prepare_ad, gradient_kernel, backend,
-        u; active = :unconstrained, retain = wants, warm,
-        native_forward_batch = use_forward)
+        u; active = :unconstrained, retain = wants, warm, forward...)
     return SamplerQuery(kern, prep, layout)
 end
 
