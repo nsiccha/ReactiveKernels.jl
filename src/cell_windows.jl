@@ -287,7 +287,7 @@ function _cell_capture_positions(r::Recipe, static_type)
     atomic = typeof(plate).parameters[2]
     inner = plate.kernel.plan
     ig = inner.graph
-    roots = Int[canon_id(ig, v.id) for v in inner.have]
+    roots = ValueId[canon_id(ig, v.id) for v in inner.have]
     length(roots) == length(r.inputs) - 1 && allunique(roots) || return Dict{Int,Int}()
     wants = Set(canon_id(ig, w.id) for w in inner.want)
     captures = Dict{Int,Int}()
@@ -352,9 +352,9 @@ batched argument positions.
 """
 struct _CellPushdowns
     graph::Graph
-    pushed::Set{Int}
+    pushed::Set{ValueId}
     recipes::Set{Int}
-    producer::Dict{Int,Recipe}
+    producer::Dict{ValueId,Recipe}
     forms::Dict{Int,_CellForm}
     captures::Dict{Int,Dict{Int,Int}}
     batched::Dict{Int,Set{Int}}
@@ -365,8 +365,8 @@ function _cell_pushdowns(p::Plan)
     any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return nothing
     g = p.graph
     cidof(v) = canon_id(g, v.id)
-    producers = Dict{Int,Vector{Recipe}}()
-    readers = Dict{Int,Vector{Recipe}}()
+    producers = Dict{ValueId,Vector{Recipe}}()
+    readers = Dict{ValueId,Vector{Recipe}}()
     for r in p.recipes
         foreach(o -> push!(get!(producers, cidof(o), Recipe[]), r), r.outputs)
         foreach(c -> push!(get!(readers, c, Recipe[]), r), unique(map(cidof, r.inputs)))
@@ -408,8 +408,8 @@ function _cell_pushdowns(p::Plan)
     end
     captures = Dict{Int,Dict{Int,Int}}()
     batched = Dict{Int,Set{Int}}()
-    pushed = Set{Int}()
-    work = Int[]
+    pushed = Set{ValueId}()
+    work = ValueId[]
     function reach!(cid, role)
         cid in pushed && return
         fits(cid, role) && operands_fit(cid) || return
@@ -475,13 +475,13 @@ end
 struct _CellEmitter
     body::Expr
     pushdowns::_CellPushdowns
-    names::Dict{Int,Symbol}
-    shapes::Dict{Int,Symbol}
-    rows::Dict{Tuple{Int,Symbol},Symbol}
-    windows::Dict{Tuple{Int,Symbol},Symbol}
+    names::Dict{ValueId,Symbol}
+    shapes::Dict{ValueId,Symbol}
+    rows::Dict{Tuple{ValueId,Symbol},Symbol}
+    windows::Dict{Tuple{ValueId,Symbol},Symbol}
 end
 _CellEmitter(body, pushdowns, names) = _CellEmitter(body, pushdowns, names,
-    Dict{Int,Symbol}(), Dict{Tuple{Int,Symbol},Symbol}(), Dict{Tuple{Int,Symbol},Symbol}())
+    Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}())
 
 _cell_ref(name) = GlobalRef(@__MODULE__, name)
 
@@ -491,7 +491,7 @@ function _cell_bind!(e::_CellEmitter, prefix::Symbol, value)
     name
 end
 
-function _cell_shape!(e::_CellEmitter, cid::Int)
+function _cell_shape!(e::_CellEmitter, cid::ValueId)
     haskey(e.shapes, cid) && return e.shapes[cid]
     d = e.pushdowns
     r = d.producer[cid]
@@ -511,7 +511,7 @@ function _cell_shape!(e::_CellEmitter, cid::Int)
         Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple, parts...)))
 end
 
-function _cell_operand_row!(e::_CellEmitter, cid::Int, row::Symbol)
+function _cell_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
     get!(e.rows, (cid, row)) do
         _cell_bind!(e, :cell_operand, Expr(:call, _cell_ref(:_cell_row_slice),
             Expr(:call, GlobalRef(Base, :broadcastable), e.names[cid]), row))
@@ -519,7 +519,7 @@ function _cell_operand_row!(e::_CellEmitter, cid::Int, row::Symbol)
 end
 
 # The rows `row:row` of pushed value `cid`, by its own operation.
-function _cell_window!(e::_CellEmitter, cid::Int, row::Symbol)
+function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
     haskey(e.windows, (cid, row)) && return e.windows[(cid, row)]
     d = e.pushdowns
     r = d.producer[cid]
@@ -562,7 +562,7 @@ end
 
 # The window a cell reads in place of pushed capture `cid`, at linear
 # position `only(slice)` (the cell's batched element).
-function _cell_capture!(e::_CellEmitter, cid::Int, slice)
+function _cell_capture!(e::_CellEmitter, cid::ValueId, slice)
     position = _cell_bind!(e, :cell_read, Expr(:call, GlobalRef(Base, :only), slice))
     shape = _cell_shape!(e, cid)
     row = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_linear_row), shape, position))

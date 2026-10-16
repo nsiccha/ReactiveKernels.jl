@@ -51,7 +51,7 @@ end
 # Record these constant slots once per bound plan. Rebinding keys the compiled
 # template only by each schedule's Boolean, never by an extent or index pattern.
 function _partial_index_run_slots(g::Graph, b::_PartialBoundary)
-    ids=Set{Int}()
+    ids=Set{ValueId}()
     for r in b.residual
         r.op===_readonly_gather_runs || continue
         push!(ids,canon_id(g,r.inputs[3].id))
@@ -77,7 +77,7 @@ function _partial_index_runs(p::Plan,bound_values::Vector{Value})
     g=p.graph
     # Limit metadata construction to ancestors of a visible total-only plate.
     wanted=Set(canon_id(g,w.id) for w in p.want)
-    needed=Set{Int}()
+    needed=Set{ValueId}()
     for r in p.recipes
         r.op isa _AuthoredPlateOp || continue
         total=_authored_plate_sum_recipe(p,r)
@@ -102,7 +102,7 @@ function _partial_index_runs(p::Plan,bound_values::Vector{Value})
     isempty(eligible) && return p
     copied=Graph(copy(g.values),copy(g.recipes),copy(g.producers),copy(g.aliases),g.version)
     recipes=Recipe[]
-    metadata=Dict{Int,Value}()
+    metadata=Dict{ValueId,Value}()
     fresh=minimum((r.id for r in p.recipes);init=0)-1
     for r in p.recipes
         if !(r.id in eligible)

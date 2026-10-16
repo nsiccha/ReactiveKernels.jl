@@ -26,18 +26,18 @@ does not change planner semantics.
 """
 mutable struct ReactiveState
     graph::Graph
-    values::Dict{Int,Any}                 # canonical id => current runtime value
-    versions::Dict{Int,Int}               # canonical id => version stamp
-    provenance::Dict{Int,Dict{Int,Int}}   # reactive id => {dep id => dep version}
-    policy::Dict{Int,Symbol}              # canonical id => :source | :reactive | :frozen
-    materialize::Set{Int}                 # canonical ids to persist across requests
+    values::Dict{ValueId,Any}             # canonical id => current runtime value
+    versions::Dict{ValueId,Int}           # canonical id => version stamp
+    provenance::Dict{ValueId,Dict{ValueId,Int}} # reactive id => {dep id => dep version}
+    policy::Dict{ValueId,Symbol}          # canonical id => :source | :reactive | :frozen
+    materialize::Set{ValueId}             # canonical ids to persist across requests
     cache::PreparationCache
     clock::Int
 end
 
 function ReactiveState(g::Graph; materialize = (), frozen = nothing)
-    st = ReactiveState(g, Dict{Int,Any}(), Dict{Int,Int}(), Dict{Int,Dict{Int,Int}}(),
-                       Dict{Int,Symbol}(), Set{Int}(), PreparationCache(), 0)
+    st = ReactiveState(g, Dict{ValueId,Any}(), Dict{ValueId,Int}(), Dict{ValueId,Dict{ValueId,Int}}(),
+                       Dict{ValueId,Symbol}(), Set{ValueId}(), PreparationCache(), 0)
     for v in _astuple(materialize)
         push!(st.materialize, canon_id(g, v.id))
     end
@@ -56,7 +56,7 @@ end
 
 _cid(st::ReactiveState, v::Value) = canon_id(st.graph, v.id)
 
-function _install!(st::ReactiveState, id::Int, val, policy::Symbol)
+function _install!(st::ReactiveState, id::ValueId, val, policy::Symbol)
     st.clock += 1
     st.values[id] = val
     st.versions[id] = st.clock
@@ -105,7 +105,7 @@ e.g. via a prior `get!`) into an `id => value` mapping suitable for seeding a
 new `ReactiveState(g; frozen=cp)` for cross-phase replay (gist §18).
 """
 function checkpoint(st::ReactiveState, values)
-    cp = Dict{Int,Any}()
+    cp = Dict{ValueId,Any}()
     for v in _astuple(values)
         id = _cid(st, v)
         haskey(st.values, id) || error("checkpoint: value $(v.name) is not materialized yet")
@@ -122,7 +122,7 @@ end
 # A reactive value is valid iff every recorded dependency version still matches
 # and each dependency is itself valid. Recursion stops at authoritative
 # (source/frozen) boundaries — their upstream is never inspected (gist §18).
-function _valid(st::ReactiveState, id::Int, visiting = Set{Int}())
+function _valid(st::ReactiveState, id::ValueId, visiting = Set{ValueId}())
     pol = get(st.policy, id, nothing)
     (pol === :source || pol === :frozen) && return true
     pol === :reactive || return false
@@ -148,7 +148,7 @@ end
 # single policy, source/frozen already shadow any reactive derivation.
 function _effective_have(st::ReactiveState)
     g = st.graph
-    ids = Int[]
+    ids = ValueId[]
     for (id, pol) in st.policy
         haskey(st.values, id) || continue
         if pol === :source || pol === :frozen
@@ -163,8 +163,8 @@ end
 
 # The have values a plan actually consumes (kernel inputs), sorted by id for a
 # stable reuse signature.
-function _needed_have(g::Graph, p::Plan, have_set::Set{Int})
-    needed = Set{Int}()
+function _needed_have(g::Graph, p::Plan, have_set::Set{ValueId})
+    needed = Set{ValueId}()
     for r in p.recipes, inp in r.inputs
         cid = canon_id(g, inp.id)
         (cid in have_set) && push!(needed, cid)
@@ -179,7 +179,7 @@ end
 # The authoritative/reactive have leaves an output actually depends on, per the
 # selected plan — this is *actual provenance*, not hypothetical ancestry, so an
 # unused alternative path never invalidates a cached value (gist §18).
-function _have_leaves!(acc::Set{Int}, g::Graph, p::Plan, id::Int, have_set::Set{Int})
+function _have_leaves!(acc::Set{ValueId}, g::Graph, p::Plan, id::ValueId, have_set::Set{ValueId})
     if id in have_set
         push!(acc, id); return
     end
@@ -230,14 +230,14 @@ function get!(st::ReactiveState, want)
     ewvals = length(ew) == 1 ? (res,) : res
 
     # index results by canonical id
-    valof = Dict{Int,Any}()
+    valof = Dict{ValueId,Any}()
     for (i, v) in enumerate(ew)
         valof[canon_id(g, v.id)] = ewvals[i]
     end
 
     # Persist nominated materializations in two phases so every provenance
     # snapshot observes the final versions published by this result batch.
-    installed = Tuple{Int,Set{Int}}[]
+    installed = Tuple{ValueId,Set{ValueId}}[]
     for m in ew
         mid = canon_id(g, m.id)
         (mid in st.materialize) || continue
@@ -248,7 +248,7 @@ function get!(st::ReactiveState, want)
         # materialization. Reinstalling it would bump its version and
         # immediately stale both itself and batch siblings that depend on it.
         (mid in have_set) && continue
-        leaves = Set{Int}()
+        leaves = Set{ValueId}()
         _have_leaves!(leaves, g, p, mid, have_set)
         _install!(st, mid, valof[mid], :reactive)
         push!(installed, (mid, leaves))

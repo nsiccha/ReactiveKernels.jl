@@ -41,8 +41,8 @@ function plate_cell(spec::KernelSpec, plate::Symbol; index::Symbol = :cell,
     haskey(spec.ports, name) && throw(ArgumentError(
         "plate_cell: the kernel already has a port :$name"))
     copied = Graph(copy(graph.values), copy(graph.recipes),
-        Dict{Int,Vector{Int}}(id => copy(ids) for (id, ids) in graph.producers),
-        copy(graph.aliases), graph.version, nothing, graph.value_id_floor)
+        Dict{ValueId,Vector{Int}}(id => copy(ids) for (id, ids) in graph.producers),
+        copy(graph.aliases), graph.version, nothing)
     ports = copy(spec.ports)
     order = copy(spec.port_order)
     have_names = copy(spec.have_names)

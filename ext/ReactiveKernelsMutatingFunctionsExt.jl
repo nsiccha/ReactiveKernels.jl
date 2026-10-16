@@ -16,8 +16,8 @@ function ReactiveKernels._nested_plate_cache(op::ReactiveKernels._AuthoredPlateO
     all(isconcretetype, celltypes) || return nothing
     p = op.kernel.plan
     all(r -> length(r.outputs) == 1, p.recipes) || return nothing
-    cell = ReactiveKernels._prepare_nonallocating(p, ReactiveKernels._lower_unembedded(p),
-        cache_apply!; have_types=celltypes)
+    cell = ReactiveKernels._prepare_nonallocating(p, cache_apply!;
+        have_types=celltypes)
     result = Array{T,N}(undef, ntuple(_ -> 0, N)...)
     Ref(_NestedPlateCache(cell, result))
 end
@@ -434,15 +434,13 @@ end
 function ReactiveKernels.prepare_nonallocating(p::ReactiveKernels.Plan,
                                                exemplars...;
                                                passes = (), bound = ())
+    # As ordinary `prepare`: cell-only producers compose before the bound split.
+    bound === () ||
+        (p = ReactiveKernels._fuse_authored_plate_chains(p; cells_only = true))
     p = ReactiveKernels._partial_apply(p, bound)
     have_types = ReactiveKernels._nonalloc_exemplar_types(p, exemplars)
-    # Embedded prepared recipes are already allocation-free executable kernels.
-    # Keep them as one cache operation here; ordinary `prepare` is the boundary
-    # that splices their generated bodies into a flat operation table.
-    ast = ReactiveKernels._lower_unembedded(p)
-    isempty(passes) || (ast = ReactiveKernels.transform(ast, passes...))
-    ReactiveKernels._prepare_nonallocating(p, ast, cache_apply!; have_types,
-        exact_signature = have_types !== nothing)
+    ReactiveKernels._prepare_nonallocating(p, cache_apply!; have_types,
+        exact_signature = have_types !== nothing, passes)
 end
 
 function ReactiveKernels.prepare_nonallocating(g::ReactiveKernels.Graph,
