@@ -301,13 +301,38 @@ loglik = prepare(normal_hmm_logdensity)
 loglik(y, [0.0, 3.0], [1.0, 0.5], transition, [0.5, 0.5])
 ```
 
+Each law has a log-weights twin that takes both weights on the log scale:
+`hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)`,
+`normal_hmm_log_weights_logdensity(observed, locations, scales, log_transition,
+log_initial)` and `exponential_hmm_log_weights_logdensity(observed, scales,
+log_transition, log_initial)`. Use a twin when the weights are defined on the
+log scale, as a per-step log-softmax is: no probability is formed, so the
+weights are neither rounded nor taken back to the log scale, and a weight
+below Float64's smallest positive number keeps its value. `-Inf` is a
+structural zero, and all-zero initial log weights start from the bare first
+emission. Each probability law is its twin at the logarithms of its weights.
+
+```julia
+using ReactiveKernelsDistributionKernels.DistributionKernelSources:
+    normal_hmm_log_weights_logdensity
+
+scores = [0.4 -1.3 2.2 0.1; 1.7 0.3 -0.6 -2.4]    # states × (steps - 1)
+log_moves = reshape(scores .- log.(sum(exp.(scores); dims = 1)), 2, 1, 4)
+loglik = prepare(normal_hmm_log_weights_logdensity)
+loglik(y, [0.0, 3.0], [1.0, 0.5], log_moves, log.([0.5, 0.5]))
+```
+
+Here the move into step `t` weighs the previous state `i` by
+`softmax(scores[:, t - 1])[i]`, whatever the destination.
+
 The pass is one `scan` with a `history` (see [the scan page](scan.md)) over the
 `(step, state)` cells: each cell reads the previous step's cells from the scan's
 own output, so no step allocates a carried vector, and the derivatives are
 ordinary Enzyme derivatives of these graphs, with no hand-written rule. A PPL
 model passes the whole sequence to `LogDensity` with one of these kernels. For
 another emission family, author a kernel that fills the `steps × states`
-log-emission matrix in a plate and returns `hmm_logdensity`.
+log-emission matrix in a plate and returns `hmm_logdensity`, or
+`hmm_log_weights_logdensity` for log-scale weights.
 
 ## Intrinsic CAR fields
 

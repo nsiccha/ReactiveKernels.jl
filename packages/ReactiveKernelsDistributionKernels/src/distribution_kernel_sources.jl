@@ -185,6 +185,8 @@ export bernoulli_logit_product_mixture_logdensity
 export binomial_logit_product_mixture_logdensity
 export zero_inflated_binomial_logit_product_mixture_logdensity
 export hmm_logdensity, normal_hmm_logdensity, exponential_hmm_logdensity
+export hmm_log_weights_logdensity, normal_hmm_log_weights_logdensity,
+    exponential_hmm_log_weights_logdensity
 export icar_logdensity
 export categorical_logit, categorical_logit_ref
 export poisson, gamma, beta, binomial, negative_binomial2
@@ -1374,6 +1376,12 @@ end
 # used as given, so all-ones initial weights reproduce a forward pass that
 # starts from the bare first emission. Weight arrays broadcast singleton axes.
 #
+# Each law has a log-weights twin (`hmm_log_weights_logdensity`, ...) that takes
+# `log_transition` and `log_initial` on the log scale, as a model whose weights
+# are defined there (a per-step log-softmax, say) states them: no probability
+# is formed, so it is neither rounded nor taken back to the log scale. The
+# probability laws take the logarithms of their weights and call the twin.
+#
 # The pass is one history scan over the (step, state) cells: a cell reads the
 # previous step's K cells from the scan's own output, so no step allocates a
 # carried vector (docs/src/scan.md, "Reading earlier outputs"). A cell folds
@@ -1414,17 +1422,16 @@ end
     total
 end
 
-@kernel hmm_logdensity(log_emissions, transition, initial) = begin
-    K = length(initial)
+@kernel hmm_log_weights_logdensity(log_emissions, log_transition,
+        log_initial) = begin
+    K = length(log_initial)
     T = size(log_emissions, 1)
     checked_emissions = K >= 1 && ndims(log_emissions) == 2 &&
         size(log_emissions, 2) == K ? log_emissions :
         throw(DimensionMismatch("log emissions must be steps × states, one column per initial weight"))
-    checked_transition = _hmm_broadcasts(transition, K, K, max(T - 1, 1)) ?
-        transition :
+    checked_transition = _hmm_broadcasts(log_transition, K, K, max(T - 1, 1)) ?
+        log_transition :
         throw(DimensionMismatch("transition weights must broadcast over states × states × (steps - 1)"))
-    log_transition = log.(checked_transition)
-    log_initial = log.(initial)
     # A singleton destination axis weighs a move by its origin only, so every
     # state of a step receives the same incoming term: the step's first cell
     # computes it and the carry hands it to the others.
@@ -1433,19 +1440,25 @@ end
         t = (cell - 1) ÷ K + 1
         j = (cell - 1) % K + 1
         incoming = t == 1 ? log_initial[j] : shared_incoming && j > 1 ? carry :
-            _hmm_incoming(earlier, (t - 2) * K, log_transition, j, t - 1, K)
+            _hmm_incoming(earlier, (t - 2) * K, checked_transition, j, t - 1, K)
         (incoming, incoming + checked_emissions[t, j])
     end
     return T == 0 ? 0.0 : _hmm_total(forward, (T - 1) * K, K)
+end
+
+@kernel hmm_logdensity(log_emissions, transition, initial) = begin
+    log_transition = log.(transition)
+    log_initial = log.(initial)
+    return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
 end
 
 # Emission laws observe a vector (one stream) or a steps × streams matrix whose
 # streams are independent given the state. Emission parameters broadcast over
 # states × streams × steps: a per-state vector, a states × streams matrix, or
 # a third axis for parameters that change with the step.
-@kernel normal_hmm_logdensity(observed, locations, scales, transition,
-        initial) = begin
-    K = length(initial)
+@kernel normal_hmm_log_weights_logdensity(observed, locations, scales,
+        log_transition, log_initial) = begin
+    K = length(log_initial)
     T = size(observed, 1)
     S = size(observed, 2)
     checked_observed = ndims(observed) <= 2 ? observed :
@@ -1462,12 +1475,20 @@ end
             _hmm_at(checked_scales, k, s, t)).logpdf(checked_observed[t, s])
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
-    return hmm_logdensity(log_emissions, transition, initial)
+    return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
 end
 
-@kernel exponential_hmm_logdensity(observed, scales, transition,
+@kernel normal_hmm_logdensity(observed, locations, scales, transition,
         initial) = begin
-    K = length(initial)
+    log_transition = log.(transition)
+    log_initial = log.(initial)
+    return normal_hmm_log_weights_logdensity(observed, locations, scales,
+        log_transition, log_initial)
+end
+
+@kernel exponential_hmm_log_weights_logdensity(observed, scales, log_transition,
+        log_initial) = begin
+    K = length(log_initial)
     T = size(observed, 1)
     S = size(observed, 2)
     checked_observed = ndims(observed) <= 2 ? observed :
@@ -1481,7 +1502,15 @@ end
         exponential(_hmm_at(checked_scales, k, s, t)).logpdf(checked_observed[t, s])
     end
     log_emissions = dropdims(sum(reshape(cells, T, K, S); dims = 3); dims = 3)
-    return hmm_logdensity(log_emissions, transition, initial)
+    return hmm_log_weights_logdensity(log_emissions, log_transition, log_initial)
+end
+
+@kernel exponential_hmm_logdensity(observed, scales, transition,
+        initial) = begin
+    log_transition = log.(transition)
+    log_initial = log.(initial)
+    return exponential_hmm_log_weights_logdensity(observed, scales, log_transition,
+        log_initial)
 end
 
 # Intrinsic conditional autoregression (ICAR). `phi[k]` is the value at node
