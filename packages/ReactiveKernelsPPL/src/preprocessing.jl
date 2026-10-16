@@ -365,6 +365,15 @@ function _ppl_key_codes(keys::AbstractArray, indices)
     return codes
 end
 
+# The entries `x[index]` a dotted observation cell reads entry by entry
+# (`_cell_index_vector_gather`): an integer index vector reads them in place,
+# a bounds-checked read-only view that the cell never writes; any other index
+# keeps Base's indexing.
+@inline _ppl_cell_gather(x, index) = x[index]
+@inline _ppl_cell_gather(x::AbstractVector, index::AbstractVector{<:Integer}) =
+    ReactiveKernels._readonly_gather(x, index)
+@inline _ppl_cell_gather(x::AbstractVector, index::AbstractVector{Bool}) = x[index]
+
 # Stage lanes of a stopping-ratio response (SB `brm_ordinal` structure 2):
 # observation `i` with level `y[i]` passes stages `1..min(y[i], K-1)` —
 # survives (logCC) below its level, stops (logF) at it. The per-observation
