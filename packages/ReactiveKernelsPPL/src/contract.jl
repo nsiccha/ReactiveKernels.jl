@@ -6736,6 +6736,8 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
     end
     if ev.kind === :interval_censored
         resp = _response_slot_column(plan, r, r.response, "response")
+        # An absent response has no endpoints to check; the bound still validates.
+        _supplied(resp) || return nothing
         all(isfinite, resp) ||
             _fail(r.label, "interval evidence requires finite response values")
         (hi === nothing || all(resp .< hi)) ||
@@ -6745,6 +6747,9 @@ function _validate_evidence_data(r::LikelihoodSpec, plan::StructuralPlan)
     (lo === nothing || hi === nothing || all(lo .<= hi)) ||
         _fail(r.label, "evidence requires lower ≤ upper every row")
     resp = _response_slot_column(plan, r, r.response, "response")
+    # An absent response has no values to check against its bounds, which
+    # still validate.
+    _supplied(resp) || return nothing
     below = lo === nothing ? false : resp .< lo
     above = hi === nothing ? false : resp .> hi
     bad = lo === nothing && hi === nothing ? Int[] : findall(below .| above)
