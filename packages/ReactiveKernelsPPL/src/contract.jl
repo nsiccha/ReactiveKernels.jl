@@ -1996,7 +1996,27 @@ end
 struct _AbsentNumber{T<:Real} <: Real
     name::Symbol
 end
-const _Absent = Union{_AbsentArray,_AbsentNumber}
+# A response holding one array per index (`y[i] .~ D.(…)` cells), absent:
+# each index's cell is an absent array of that cell's shape.
+struct _AbsentCells{A<:AbstractArray} <: AbstractVector{A}
+    name::Symbol
+    cells::Vector{Tuple{Vararg{Int}}}
+end
+const _Absent = Union{_AbsentArray,_AbsentNumber,_AbsentCells}
+
+Base.size(c::_AbsentCells) = (length(c.cells),)
+Base.getindex(c::_AbsentCells{A}, i::Int) where {A} =
+    _AbsentArray{eltype(A),ndims(A)}(c.name, c.cells[i])
+function Base.getindex(c::_AbsentCells{A}, I...) where {A}
+    J = to_indices(c, I)
+    only(J) isa Integer && return c[only(J)]
+    return _AbsentCells{A}(c.name, c.cells[only(J)])
+end
+Base.show(io::IO, c::_AbsentCells{A}) where {A} = print(io, "absent `", c.name,
+    "` (", length(c.cells), " cells of ", A, ")")
+Base.show(io::IO, ::MIME"text/plain", c::_AbsentCells) = show(io, c)
+_absent_cells(name::Symbol, ::Type{A}, cells) where {A<:AbstractArray} =
+    _AbsentCells{A}(name, Tuple{Vararg{Int}}[Tuple(d) for d in cells])
 
 Base.size(a::_AbsentArray) = a.dims
 Base.IndexStyle(::Type{<:_AbsentArray}) = IndexCartesian()
@@ -2030,10 +2050,6 @@ _absent_like(name::Symbol, ::Type{T}, dims::Tuple) where {T} =
     _AbsentArray{T,length(dims)}(name, dims)
 _absent_like(name::Symbol, ::Type{T}, ::Tuple{}) where {T<:Real} = _AbsentNumber{T}(name)
 _absent_source(x::_Absent) = x.name
-_absent_eltype(x::_AbsentArray) = eltype(x)
-_absent_eltype(::_AbsentNumber{T}) where {T} = T
-_absent_dims(x::_AbsentArray) = x.dims
-_absent_dims(::_AbsentNumber) = ()
 
 """The values of `plan` bound absent (names of their inputs)."""
 _absent_inputs(plan::StructuralPlan) =
@@ -2126,14 +2142,41 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
             rows = _response_range_indices(columns, r)
             dims = (max(first(dims), maximum(rows; init = 0)), Base.tail(dims)...)
         end
+        cells = _absent_cell_shapes(plan, columns, r.response)
         for nm in names
             old = columns[nm]
             # A joint response's outcomes and a Multinomial's counts are
             # columns of the observation rows.
-            columns[nm] = _absent_like(nm, eltype(old), dims)
+            columns[nm] = cells === nothing ? _absent_like(nm, eltype(old), dims) :
+                _absent_cells(nm, Array{eltype(old),length(first(cells))}, cells)
         end
     end
     return columns
+end
+
+# A dotted `@plate` cell (`y[i] .~ D.(…)`) whose per-index data hold one
+# array per index (`x[i]`) observes one array per index: index `i`'s cell has
+# the broadcast shape of those data's `i`th arrays. The per-index data are
+# the cell's per-index reads and the data read by the values computed over
+# the response's own indices (its location plates). `nothing` when none
+# holds arrays: each index then observes one value, unless the built graph
+# says otherwise (`_absent_typed_as`).
+function _absent_cell_shapes(plan::StructuralPlan, columns, response::Symbol)
+    haskey(plan.cell_broadcasts, response) || return nothing
+    reads = Set{Symbol}(plan.cell_broadcasts[response])
+    for d in (plan.assignments..., plan.derived...)
+        rd = _definition_reads(d.expr)
+        response in rd && union!(reads, rd)
+    end
+    operands = sort!([c for c in reads if c !== response &&
+        _supplied(get(columns, c, nothing)) && _holds_arrays(get(columns, c, nothing))])
+    isempty(operands) && return nothing
+    n = length(columns[first(operands)])
+    all(c -> length(columns[c]) == n, operands) || _fail(response, "the arrays " *
+        "per index of $(join(operands, ", ")) have different counts, so the " *
+        "absent response $response has no one number of cells")
+    return [map(length, foldl((s, c) -> Base.Broadcast.broadcast_shape(s,
+        axes(columns[c][i])), operands; init = ())) for i in 1:n]
 end
 
 # Missing is a host-side representation. RK receives an owned concrete array
@@ -5921,6 +5964,8 @@ _cell_broadcast_operand(plan::StructuralPlan, c::Symbol) =
             plan.cell_broadcasts)
 _array_entries(col) = isempty(col) || all(isempty, col) ?
     eltype(eltype(col))[] : identity.(collect(Iterators.flatten(col)))
+_array_entries(col::_AbsentCells{A}) where {A} =
+    _AbsentArray{eltype(A),1}(col.name, (sum(prod, col.cells; init = 0),))
 
 """A dotted `@plate` cell (`y[i] .~ D.(…)`) whose bound response holds one
 array per index: each cell broadcasts over its own index's entries."""
@@ -5954,6 +5999,9 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
     r.mi_jobs === nothing || _fail(r.label,
         "mi() missingness over a response holding arrays is not built yet")
     y = plan.columns[r.response]
+    # Operands broadcast against each cell's shape; an absent cell has no
+    # values to read.
+    cellshapes = y isa _AbsentCells ? [falses(d) for d in y.cells] : y
     perindex = plan.cell_broadcasts[r.response]
     arrays = Set{Symbol}(k for (k, v) in plan.columns if v isa AbstractArray)
     columns = copy(plan.columns)
@@ -5975,7 +6023,7 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
         c === r.response && continue
         v = plan.columns[c]
         cells = try
-            broadcast(y, c in perindex ? v : Ref(v)) do yi, vi
+            broadcast(cellshapes, c in perindex ? v : Ref(v)) do yi, vi
                 broadcast((_, x) -> x, yi, vi)
             end
         catch e
@@ -5987,7 +6035,7 @@ function _cell_broadcast_entries(plan::StructuralPlan, r::LikelihoodSpec)
         columns[c] = _array_entries(cells)
     end
     entries = _array_entries(y)
-    any(ismissing, entries) && _fail(r.label, "missing entries inside the " *
+    _supplied(entries) && any(ismissing, entries) && _fail(r.label, "missing entries inside the " *
         "arrays of `$(r.response)` are not built yet; drop them from their array")
     columns[r.response] = entries
     return _with(plan; columns = Dict{Symbol,ColumnData}(columns))

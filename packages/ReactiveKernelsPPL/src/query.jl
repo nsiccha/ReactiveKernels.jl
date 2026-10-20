@@ -218,7 +218,14 @@ function _absent_typed_as(plan::StructuralPlan, program::Expr)
     for k in absent
         v, T = columns[k], get(types, k, nothing)
         T isa Type || continue
-        if v isa _AbsentArray && T <: AbstractArray && ndims(T) == ndims(v)
+        if v isa _AbsentArray && T <: AbstractVector{<:AbstractArray} && ndims(v) == 1
+            # The graph observes one array per index: one cell per index,
+            # each of one entry (shapes are not part of the program).
+            columns[k] = _absent_cells(v.name, eltype(T),
+                fill(ntuple(_ -> 1, ndims(eltype(T))), length(v)))
+        elseif v isa _AbsentCells && T <: AbstractVector{<:AbstractArray}
+            columns[k] = _AbsentCells{eltype(T)}(v.name, v.cells)
+        elseif v isa _AbsentArray && T <: AbstractArray && ndims(T) == ndims(v)
             columns[k] = _AbsentArray{eltype(T),ndims(v)}(v.name, v.dims)
         elseif v isa _AbsentNumber && T <: Real
             columns[k] = _AbsentNumber{T}(v.name)

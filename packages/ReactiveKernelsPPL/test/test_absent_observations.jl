@@ -226,6 +226,62 @@ end
     end
 end
 
+_ao_shift_cells(t, a) = [a .+ ti for ti in t]
+
+@testset "absent observations: one array per index" begin
+    X = [[0.1, 0.2], [0.3], [0.4, 0.5, 0.6]]
+    Y = [[1.0, 2.0], [3.0], [4.0, 5.0, 6.0]]
+    # Data read per index (`x[i]`) give each index's cell its shape.
+    src = quote
+        a ~ Normal(0, 1); s ~ Exponential(1)
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(a .+ x[i], s)
+        end
+    end
+    fit = bind_data(lower_rkppl(src, Dict{Symbol,Any}(:x => X, :y => Y);
+        conditioned = (:y,), mod = @__MODULE__), Dict{Symbol,Any}(:x => X, :y => Y))
+    built = build_kernel(fit)
+    d = bind_data(fit, Dict{Symbol,Any}(:x => [[0.1], [0.2, 0.3]]))
+    @test length(d.columns[:y]) == 2
+    @test size(d.columns[:y][2]) == (2,)
+    u = [0.3, -0.2]
+    @test _ao_eval(prepare_query(built, d, :prior), u) ≈
+        _ao_eval(prepare_query(built, fit, :prior), u) rtol = 1e-12
+    @test _ao_refused(() -> prepare_query(built, d, :sampler), :y)
+    # This program computes each cell's observation arguments inside the
+    # plate over the response's entries, so `:observations` reads it.
+    @test _ao_refused(() -> prepare_query(built, d, :observations), :y)
+
+    # A per-index location computed by a function: the built graph says the
+    # response holds one array per index.
+    src = quote
+        a ~ Normal(0, 1); s ~ Exponential(1)
+        loc = _ao_shift_cells(t, a)
+        @plate for i in eachindex(t)
+            y[i] .~ Normal.(loc[i], s)
+        end
+    end
+    data = Dict{Symbol,Any}(:t => X, :y => Y)
+    fit = bind_data(lower_rkppl(src, data; conditioned = (:y,), mod = @__MODULE__), data)
+    built = build_kernel(fit)
+    T = [[0.5], [0.7, 0.9]]
+    d = bind_data(fit, Dict{Symbol,Any}(:t => T))
+    a = constrain(built.layout, u).a
+    @test _ao_eval(_ao_prepare(built, d, (:loc,)), u) ≈ [a .+ ti for ti in T] rtol = 1e-12
+    @test _ao_eval(prepare_query(built, d, :prior), u) ≈
+        _ao_eval(prepare_query(built, fit, :prior), u) rtol = 1e-12
+    @test _ao_refused(() -> prepare_query(built, d, :likelihood), :y)
+    # Not built yet: without per-index data or a built graph, a binding
+    # cannot tell that the absent response holds one array per index, so a
+    # graph built from it observes one value per index.
+    @test_broken try
+        _ao_eval(prepare_query(build_kernel(d), fit, :prior), u) ≈
+            _ao_eval(prepare_query(built, fit, :prior), u)
+    catch
+        false
+    end
+end
+
 @testset "absent observations: a conditioned declaration without its value" begin
     src = quote
         theta ~ Beta(2, 2)

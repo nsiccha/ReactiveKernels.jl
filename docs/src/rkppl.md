@@ -1147,10 +1147,18 @@ prepare_query(built, design, :sampler)        # refused: `y` is absent
   refused. A program shape that would come from its values, such as an
   extent `length(levels(y)) - 1` or an inferred number of categories, is
   refused at binding; rebinding a binding that sized it keeps that size.
+- A response holding one array per index (`y[i] .~ D.(…)` cells) can be
+  absent too. Each index's cell takes the shape of the data the cell reads
+  per index (`x[i]`). When the cell reads only computed values, the graph
+  built from the fit says the response holds arrays. In that program each
+  cell's observation arguments are computed inside the plate over the
+  response's entries, so `:observations` reads it; query an authored
+  per-index value instead (`loc` in `y[i] .~ Normal.(loc[i], s)`).
 - Program identity is checked as for any other binding (other levels or
   data types need their own build). An absent value takes the type its input
   has in the built graph. Building from a binding without the response uses
-  `Float64`, or `Int` for counts and categories.
+  `Float64`, or `Int` for counts and categories. It also reads one value per
+  index unless the data read per index hold arrays.
 - The raw `ReactiveKernels.prepare(built.spec; …, bound)` cut over
   `design.columns` evaluates the available values too; reading an absent
   value raises `AbsentObservationError` naming it.
