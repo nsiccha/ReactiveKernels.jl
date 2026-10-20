@@ -1119,6 +1119,54 @@ slower on others, so measure both on the model you fit.
   Call it from top level or through `Base.invokelatest`; `SamplerQuery` calls
   already carry that barrier.
 
+### Predicting without the response
+
+A binding may omit an observation's value. The observation keeps its
+statement, so the binding generates the program a binding with the value
+generates, and a graph built from the fit evaluates it. Every query leaves
+the absent value out of its inputs:
+
+```julia
+fit = bind_data(lower_rkppl(src, (; x, y); conditioned = (:y,)), (; x, y))
+built = build_kernel(fit)
+design = bind_data(fit, (; x = xnew))         # y absent
+prepare_query(built, design, :observations)   # (y = (location = …, scale = …),)
+prepare_query(built, design, :sampler)        # refused: `y` is absent
+```
+
+- An observation is absent when a binding supplies no value for it: a
+  response, a joint response's outcome, a Multinomial count column, or the
+  observed value of a conditioned declaration. `lower_rkppl` keeps a name
+  that `conditioned` lists as an observation when the data omit it, and a
+  model call leaves a response it does not supply absent (`m(; x)` beside
+  `y .~ Normal.(mu, s)`; `m(; x) | (; y)` observes it). Other data stay
+  required.
+- Values that do not read the absent observation evaluate as with a supplied
+  one: authored values such as `mu`, and the `:observations`, `:prior` and
+  `:log_jacobian` presets. `:sampler`, `:likelihood`, `:pointwise`,
+  `prepare_sampler` and cell queries read it and are refused with a
+  `ContractValidationError` naming it.
+- A data-only definition computed from an absent observation
+  (`ybar = mean(y)`) is absent too, so only the queries that read it are
+  refused. A program shape that would come from its values, such as an
+  extent `length(levels(y)) - 1` or an inferred number of categories, is
+  refused at binding; rebinding a binding that sized it keeps that size.
+- A response holding one array per index (`y[i] .~ D.(…)` cells) can be
+  absent too. Each index's cell takes the shape of the data the cell reads
+  per index (`x[i]`). When the cell reads only computed values, the graph
+  built from the fit says the response holds arrays. In that program each
+  cell's observation arguments are computed inside the plate over the
+  response's entries, so `:observations` reads it; query an authored
+  per-index value instead (`loc` in `y[i] .~ Normal.(loc[i], s)`).
+- Program identity is checked as for any other binding (other levels or
+  data types need their own build). An absent value takes the type its input
+  has in the built graph. Building from a binding without the response uses
+  `Float64`, or `Int` for counts and categories. It also reads one value per
+  index unless the data read per index hold arrays.
+- The raw `ReactiveKernels.prepare(built.spec; …, bound)` cut over
+  `design.columns` evaluates the available values too; reading an absent
+  value raises `AbsentObservationError` naming it.
+
 ### One cell of an observation
 
 `prepare_cell_query` evaluates ONE cell of the plates that observe the named

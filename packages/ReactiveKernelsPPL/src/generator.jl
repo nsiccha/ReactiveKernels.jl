@@ -594,6 +594,7 @@ _ordered_columns(plan::StructuralPlan) =
 _data_arg(name::Symbol, ::AbstractVector{T}) where {T} = Expr(:(::), name, Vector{T})
 _data_arg(name::Symbol, ::AbstractMatrix{T}) where {T} = Expr(:(::), name, Matrix{T})
 _data_arg(name::Symbol, v::Number) = Expr(:(::), name, typeof(v))
+_data_arg(name::Symbol, v::_AbsentNumber) = Expr(:(::), name, _value_type(v))
 _data_arg(name::Symbol, ::AbstractArray{T,N}) where {T,N} = Expr(:(::), name, Array{T,N})
 
 # Dedicated eval scope for generated models. The `using` lines resolve via
@@ -4689,7 +4690,7 @@ _float64_inputs(plan::StructuralPlan, values) = Set{Symbol}(v for v in values
 _reads_float64(plan::StructuralPlan, x::Symbol) =
     (x ∉ plan.conditioned &&
         any(p -> p.name === x && p.family !== :external, plan.parameters)) ||
-    get(plan.columns, x, nothing) isa Union{Float64,AbstractArray{Float64}}
+    _value_type(get(plan.columns, x, nothing)) <: Union{Float64,AbstractArray{Float64}}
 _gamma_rate(v) = :(1 / $v)
 _gamma_rate(v::Union{Bool,Base.BitInteger,Base.IEEEFloat}) = 1 / v
 
