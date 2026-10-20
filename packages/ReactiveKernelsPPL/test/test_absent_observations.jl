@@ -226,6 +226,122 @@ end
     end
 end
 
+# Censoring, truncation and interval evidence (snag rkppl-absent-cen-9af487f3):
+# an absent response has no values to check against its bounds, which still
+# validate, so a prediction design with an LLOQ binds like any other.
+@testset "absent observations: censored, truncated and interval evidence" begin
+    X = _ao_x(8)
+    Y = [0.3, 0.5, -0.2, 1.1, 0.9, 0.0, 0.4, 0.8]
+    rows = 2:5
+    design_mu = (nt, d) -> hcat(ones(length(d[:x])), d[:x]) * nt.b
+    affine_mu = (nt, d) -> nt.a .+ nt.c .* d[:x]
+    cases = (
+        (name = "censored below, a design matrix", src = quote
+            X_mu = hcat(ones(length(x)), x)
+            b[axes(X_mu, 2)] .~ Normal.(0, 1)
+            mu = X_mu * b
+            y .~ censored.(Normal.(mu, 1.0), lo, Inf)
+        end, y = Y, bounds = Dict{Symbol,Any}(:lo => fill(-0.5, 8)), oracle = design_mu),
+        (name = "censored on both sides, literal bounds", src = quote
+            a ~ Normal(0, 1); c ~ Normal(0, 1)
+            mu = a .+ c .* x
+            y .~ censored.(Normal.(mu, 1.0), -0.5, 1.5)
+        end, y = Y, bounds = Dict{Symbol,Any}(), oracle = affine_mu),
+        (name = "censored below a sampled bound", src = quote
+            a ~ Normal(0, 1); c ~ Normal(0, 1); l ~ Normal(-1, 0.3)
+            mu = a .+ c .* x
+            y .~ censored.(Normal.(mu, 1.0), l, Inf)
+        end, y = Y, bounds = Dict{Symbol,Any}(), oracle = affine_mu),
+        (name = "truncated", src = quote
+            a ~ Normal(0, 1); c ~ Normal(0, 1)
+            mu = a .+ c .* x
+            y .~ truncated.(Normal.(mu, 1.0), lo, Inf)
+        end, y = Y, bounds = Dict{Symbol,Any}(:lo => fill(-0.5, 8)), oracle = affine_mu),
+        (name = "interval censored", src = quote
+            a ~ Normal(0, 1); c ~ Normal(0, 1)
+            mu = a .+ c .* x
+            y .~ interval_censored.(Normal.(mu, 1.0), hi)
+        end, y = Y, bounds = Dict{Symbol,Any}(:hi => Y .+ 1.0), oracle = affine_mu),
+        (name = "censored counts", src = quote
+            a ~ Normal(0, 1); c ~ Normal(0, 1)
+            mu = a .+ c .* x
+            y .~ censored.(Poisson.(exp.(mu)), 0, hi)
+        end, y = [0, 1, 2, 3, 1, 0, 2, 3], bounds = Dict{Symbol,Any}(:hi => fill(3, 8)),
+            oracle = affine_mu),
+    )
+    for k in cases
+        @testset "$(k.name)" begin
+            data = Dict{Symbol,Any}(:x => X, :y => k.y, k.bounds...)
+            fit = bind_data(lower_rkppl(k.src, data; conditioned = (:y,), mod = @__MODULE__), data)
+            built = build_kernel(fit)
+            design = Dict{Symbol,Any}(:x => X[rows], (b => v[rows] for (b, v) in k.bounds)...)
+            before = deepcopy(design)
+            d = bind_data(fit, design)
+            @test design == before
+            @test ReactiveKernelsPPL._absent_observations(d) == [:y]
+            supplied = bind_data(fit, merge(design, Dict{Symbol,Any}(:y => k.y[rows])))
+            u = [0.1 * i - 0.35 for i in 1:built.layout.total]
+            mu = _ao_eval(_ao_prepare(built, d, (:mu,)), u)
+            @test mu == _ao_eval(_ao_prepare(built, supplied, (:mu,)), u)
+            @test mu ≈ k.oracle(constrain(built.layout, u), design) rtol = 1e-12
+            for preset in (:prior, :log_jacobian)
+                @test _ao_eval(prepare_query(built, d, preset), u) ==
+                    _ao_eval(prepare_query(built, supplied, preset), u)
+            end
+            for preset in (:sampler, :likelihood, :pointwise)
+                @test _ao_refused(() -> prepare_query(built, d, preset), :y)
+            end
+            # Lowered from names alone, the design builds the fit's program.
+            names = (:y, keys(design)...)
+            alone = bind_data(lower_rkppl(k.src, names; conditioned = (:y,), mod = @__MODULE__), design)
+            @test _ao_eval(prepare_query(build_kernel(alone), fit, :sampler), u) ≈
+                _ao_eval(prepare_query(built, fit, :sampler), u) rtol = 1e-12
+        end
+    end
+    # A censored GLM object and a censored response holding one array per index.
+    others = (
+        (quote
+            a ~ Normal(0, 1); b[axes(Xd, 2)] .~ Normal.(0, 1); s ~ Exponential(1)
+            y ~ censored(NormalIDGLM(Xd, a, b, s), lo, Inf)
+        end, Dict{Symbol,Any}(:Xd => hcat(X, X .^ 2), :y => Y, :lo => fill(-0.5, 8)),
+            Dict{Symbol,Any}(:Xd => hcat(X, X .^ 2)[rows, :], :lo => fill(-0.5, 4))),
+        (quote
+            a ~ Normal(0, 1); s ~ Exponential(1)
+            @plate for i in eachindex(y)
+                y[i] .~ censored.(Normal.(a .+ x[i], s), lo[i], Inf)
+            end
+        end, Dict{Symbol,Any}(:x => [[0.1, 0.2], [0.3], [0.4, 0.5, 0.6]],
+                :y => [[1.0, 2.0], [3.0], [4.0, 5.0, 6.0]], :lo => [[-1.0, -1.0], [-1.0], fill(-1.0, 3)]),
+            Dict{Symbol,Any}(:x => [[0.1], [0.2, 0.3]], :lo => [[-1.0], [-1.0, -1.0]])),
+    )
+    for (src, data, design) in others
+        fit = bind_data(lower_rkppl(src, data; conditioned = (:y,), mod = @__MODULE__), data)
+        built = build_kernel(fit)
+        d = bind_data(fit, design)
+        @test ReactiveKernelsPPL._absent_observations(d) == [:y]
+        u = [0.1 * i - 0.35 for i in 1:built.layout.total]
+        @test _ao_eval(prepare_query(built, d, :prior), u) ==
+            _ao_eval(prepare_query(built, fit, :prior), u)
+        @test _ao_refused(() -> prepare_query(built, d, :likelihood), :y)
+    end
+    # The bounds of an absent response still validate.
+    src = quote
+        a ~ Normal(0, 1)
+        y .~ censored.(Normal.(a .+ x, 1.0), lo, hi)
+    end
+    plan = lower_rkppl(src, (:x, :lo, :hi, :y); conditioned = (:y,), mod = @__MODULE__)
+    @test_throws "lower ≤ upper" bind_data(plan,
+        Dict{Symbol,Any}(:x => X, :lo => fill(1.0, 8), :hi => fill(0.0, 8)))
+    @test_throws "finite numerics" bind_data(plan,
+        Dict{Symbol,Any}(:x => X, :lo => fill(NaN, 8), :hi => fill(2.0, 8)))
+    src = quote
+        a ~ Normal(0, 1)
+        y .~ interval_censored.(Normal.(a .+ x, 1.0), hi)
+    end
+    plan = lower_rkppl(src, (:x, :hi, :y); conditioned = (:y,), mod = @__MODULE__)
+    @test_throws "finite numerics" bind_data(plan, Dict{Symbol,Any}(:x => X, :hi => fill(Inf, 8)))
+end
+
 _ao_shift_cells(t, a) = [a .+ ti for ti in t]
 
 @testset "absent observations: one array per index" begin
