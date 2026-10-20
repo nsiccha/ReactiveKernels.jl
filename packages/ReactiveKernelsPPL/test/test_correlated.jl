@@ -426,11 +426,12 @@ end
 @testset "correlated data admission" begin
     plan = _corr_plan2()
     good = _corr_data2()
-    # A missing tail outcome fails at bind.
+    # A tail outcome the data omit binds absent (decision `1spnf7v`): the
+    # binding generates the same program, and queries reading `y2` are
+    # refused (test_absent_observations.jl).
     missing_tail = copy(good)
     delete!(missing_tail, :y2)
-    # refused: missing data name (tail outcome `y2`)
-    @test_throws ContractValidationError bind_data(plan, missing_tail)
+    @test ReactiveKernelsPPL._absent_observations(bind_data(plan, missing_tail)) == [:y2]
     # A non-numeric tail outcome fails.
     bad_tail = copy(good)
     bad_tail[:y2] = ["a", "b", "c", "d"]

@@ -1963,6 +1963,179 @@ function _validate_observed_selections!(plan::StructuralPlan, columns::AbstractD
     return columns
 end
 
+# The element type of a response port whose values carry none (all missing,
+# or absent): counts and categories require an integer port; continuous
+# responses use Float64.
+_valueless_response_eltype(r::LikelihoodSpec) =
+    _is_bernoulli_family(r.family) || _is_binomial_family(r.family) ||
+        _is_ordered_family(r.family) || r.family in
+        (PoissonLogFam, NegativeBinomial2Fam, NegativeBinomialFam,
+         HurdlePoissonFam, ZeroInflatedPoissonFam, CategoricalFam,
+         CategoricalLogitFam, BernoulliLogitGLMFam, PoissonLogGLMFam,
+         MultinomialFam) ? Int : Float64
+
+# ── Absent observations ──────────────────────────────────────────────
+# A binding that supplies no value for an observation (a response, or a
+# conditioned declaration) binds it ABSENT: the program is the one a
+# binding with that value generates, and every query leaves the value out
+# of its inputs, so a query that reads it is refused. Its stand-in carries
+# only the type and shape the program needs; reading an element names the
+# observation. A data-only definition reading an absent value is absent too.
+struct AbsentObservationError <: Exception
+    name::Symbol
+end
+Base.showerror(io::IO, e::AbsentObservationError) = print(io,
+    "AbsentObservationError: `$(e.name)` is absent in this binding (no value ",
+    "was supplied for it), so nothing that reads its values can be evaluated. ",
+    "Supply `$(e.name)`, or evaluate values that do not read it.")
+
+struct _AbsentArray{T,N} <: AbstractArray{T,N}
+    name::Symbol        # the absent observation this value comes from
+    dims::NTuple{N,Int}
+end
+struct _AbsentNumber{T<:Real} <: Real
+    name::Symbol
+end
+const _Absent = Union{_AbsentArray,_AbsentNumber}
+
+Base.size(a::_AbsentArray) = a.dims
+Base.IndexStyle(::Type{<:_AbsentArray}) = IndexCartesian()
+Base.getindex(a::_AbsentArray{T,N}, ::Vararg{Int,N}) where {T,N} =
+    throw(AbsentObservationError(a.name))
+# Slicing reads no element: a selection of an absent value is absent, with
+# the selection's shape (an `@plate` observation measures its rows this way).
+function Base.getindex(a::_AbsentArray{T}, I...) where {T}
+    J = to_indices(a, I)
+    all(j -> j isa Integer, J) && throw(AbsentObservationError(a.name))
+    dims = map(length, Base.index_shape(J...))
+    return _AbsentArray{T,length(dims)}(a.name, dims)
+end
+Base.show(io::IO, a::_AbsentArray) = print(io, "absent `", a.name, "` (",
+    join(a.dims, "×"), " ", eltype(a), ")")
+Base.show(io::IO, ::MIME"text/plain", a::_AbsentArray) = show(io, a)
+Base.convert(::Type{S}, x::_AbsentNumber) where {S<:Number} =
+    throw(AbsentObservationError(x.name))
+Base.convert(::Type{_AbsentNumber{T}}, x::_AbsentNumber{T}) where {T} = x
+Base.promote_rule(::Type{_AbsentNumber{T}}, ::Type{S}) where {T,S<:Number} =
+    promote_type(T, S)
+Base.show(io::IO, x::_AbsentNumber{T}) where {T} =
+    print(io, "absent `", x.name, "` (", T, ")")
+
+# The type of the value an input holds: an absent number stands for a value
+# of its type parameter.
+_value_type(v) = typeof(v)
+_value_type(::_AbsentNumber{T}) where {T} = T
+
+_absent_like(name::Symbol, ::Type{T}, dims::Tuple) where {T} =
+    _AbsentArray{T,length(dims)}(name, dims)
+_absent_like(name::Symbol, ::Type{T}, ::Tuple{}) where {T<:Real} = _AbsentNumber{T}(name)
+_absent_source(x::_Absent) = x.name
+_absent_eltype(x::_AbsentArray) = eltype(x)
+_absent_eltype(::_AbsentNumber{T}) where {T} = T
+_absent_dims(x::_AbsentArray) = x.dims
+_absent_dims(::_AbsentNumber) = ()
+
+"""The values of `plan` bound absent (names of their inputs)."""
+_absent_inputs(plan::StructuralPlan) =
+    sort!([k for (k, v) in plan.columns if v isa _Absent])
+"""The observations `plan` binds absent, as their authors named them."""
+_absent_observations(plan::StructuralPlan) =
+    sort!(unique!([_absent_source(v) for v in values(plan.columns) if v isa _Absent]))
+
+# An absent value never reaches a value check: binding validates only the
+# values a caller supplied.
+_supplied(x) = !(x isa _Absent)
+
+# The observation names `plan` reads from data that `columns` does not
+# supply, as the absent stand-ins binding starts from: responses (with a
+# Multinomial's count columns and a joint response's outcomes) and the
+# observed values of conditioned declarations. A response's stand-in is
+# provisional (one cell); `_size_absent_responses!` gives it the shape of
+# the operands it broadcasts with, once those are bound.
+function _absent_observations!(plan::StructuralPlan, columns::AbstractDict)
+    derived = Set{Symbol}(_derived_response_names(plan))
+    defined = Set{Symbol}(d.name for d in (plan.assignments..., plan.derived...))
+    for r in plan.responses, nm in (r.response, r.count_columns..., r.extra_responses...)
+        (haskey(columns, nm) || nm in derived || nm in defined) && continue
+        columns[nm] = _absent_like(nm, _valueless_response_eltype(r), (1,))
+    end
+    for name in _conditioned_inputs(plan)
+        input = _conditioned_input(name)
+        (haskey(columns, name) || haskey(columns, input)) && continue
+        columns[name] = _absent_conditioned_value(plan, name)
+    end
+    return columns
+end
+
+function _absent_conditioned_value(plan::StructuralPlan, name::Symbol)
+    for p in plan.parameters
+        p.name === name || continue
+        return _absent_like(name, p.family in (:binomial, :poisson, :bernoulli) ?
+            Int : Float64, ())
+    end
+    # Array declarations take their declared extents once data are bound.
+    return _absent_like(name, Float64, (1,))
+end
+
+function _size_absent_conditioned_arrays!(plan::StructuralPlan)
+    dims(p::ArrayParameter) = Tuple(_array_dims(plan, p))
+    dims(p::VectorParameter) = (p.size,)
+    dims(p::PlateParameter) = (_plate_rows(plan, p),)
+    for ps in (plan.array_parameters, plan.vector_parameters, plan.plate_parameters), p in ps
+        input = _conditioned_input(p.name)
+        v = get(plan.columns, input, nothing)
+        v isa _AbsentArray || continue
+        plan.columns[input] = _absent_like(p.name, eltype(v), dims(p))
+    end
+    return plan
+end
+
+# Each absent response takes the broadcast shape of the operands it reads
+# per observation (an `@plate` observation: the operands its cells read),
+# exactly the shape its value would need; a response reading none keeps
+# one cell. Rows are not part of the program, so any shape the operands
+# admit generates it.
+function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
+    absent = Set{Symbol}(k for (k, v) in columns if v isa _AbsentArray && v.name === k)
+    isempty(absent) && return columns
+    axis_plan = _with(plan; columns = Dict{Symbol,ColumnData}(columns))
+    modelvals, managed = _axis_exempt_columns(axis_plan)
+    perobs = Set{Symbol}(k for (k, v) in columns
+        if k ∉ modelvals && k ∉ managed && v isa AbstractArray && !(v isa _Absent))
+    designs = _observation_design_columns(axis_plan)
+    for r in plan.responses
+        names = filter(in(absent), [r.response, r.count_columns..., r.extra_responses...])
+        isempty(names) && continue
+        shape = ()
+        for c in sort!(collect(_response_reads(axis_plan, _with(r; range = nothing), perobs)))
+            ax = c in designs ? (axes(columns[c], 1),) : axes(columns[c])
+            shape = try
+                Base.Broadcast.broadcast_shape(shape, ax)
+            catch e
+                e isa DimensionMismatch || rethrow()
+                _fail(c, "column shape $(size(columns[c])) is not broadcast-" *
+                    "compatible with the other operands of the absent response " *
+                    "$(r.response): " * sprint(showerror, e))
+            end
+        end
+        dims = isempty(shape) ? (1,) : map(length, shape)
+        # An `@plate` loop over another array (`y[eachindex(x)]`) selects
+        # its cells from the response: the stand-in covers them.
+        if r.range isa Expr && _response_range_source(r) !== r.response &&
+                get(columns, _response_range_source(r), nothing) isa AbstractArray
+            rows = _response_range_indices(columns, r)
+            dims = (max(first(dims), maximum(rows; init = 0)), Base.tail(dims)...)
+        end
+        for nm in names
+            old = columns[nm]
+            # A joint response's outcomes and a Multinomial's counts are
+            # columns of the observation rows.
+            columns[nm] = _absent_like(nm, eltype(old), dims)
+        end
+    end
+    return columns
+end
+
 # Missing is a host-side representation. RK receives an owned concrete array
 # and a Bool mask, retaining every axis. The neutral stored value is never an
 # observation: the generated plate guards density evaluation with the mask.
@@ -1984,15 +2157,8 @@ function _prepare_missing_responses!(plan::StructuralPlan, columns::AbstractDict
                 "likelihood skipping does not define that value")
         end
         T = Base.nonmissingtype(eltype(value))
-        if T === Union{}
-            # An all-Missing array carries no numeric type. Counts/categories
-            # require an integer port; continuous responses use Float64.
-            T = _is_bernoulli_family(r.family) || _is_binomial_family(r.family) ||
-                _is_ordered_family(r.family) || r.family in
-                (PoissonLogFam, NegativeBinomial2Fam, NegativeBinomialFam,
-                 HurdlePoissonFam, ZeroInflatedPoissonFam, CategoricalFam,
-                 CategoricalLogitFam, BernoulliLogitGLMFam, PoissonLogGLMFam) ? Int : Float64
-        end
+        # An all-Missing array carries no numeric type.
+        T === Union{} && (T = _valueless_response_eltype(r))
         T <: Real && isconcretetype(T) || _fail(r.label,
             "response $name needs a concrete numeric type beside Missing, got $(eltype(value))")
         owned = Array{T}(undef, size(value))
@@ -2436,7 +2602,7 @@ function _validate_columns(plan::StructuralPlan)
             name in managed || length(col) == n || length(col) == 1 ||
                 _fail(name, "column length $(length(col)) ≠ n_obs $n")
         end
-        name in labelcols || !any(ismissing, col) ||
+        name in labelcols || !_supplied(col) || !any(ismissing, col) ||
             _fail(name, "column contains missing (slice 1 has no missingness machinery)")
     end
     return nothing
@@ -5842,6 +6008,7 @@ function _validate_response_column(r::LikelihoodSpec, plan::StructuralPlan)
     end
     col = r.range isa Expr ? _selected_response_column(plan, r) :
         _observation_column(plan.columns, r.response, r.label, "response")
+    _supplied(col) || return nothing
     mask = _response_observed_mask(plan, r)
     mask === nothing || (col = col[mask])
     _holds_arrays(col) && _refuse_array_response(r, plan)
@@ -6366,6 +6533,8 @@ end
 function _validate_trials_values(r::LikelihoodSpec, plan::StructuralPlan,
         what::AbstractString; check_support::Bool = true)
     ycol = _response_slot_column(plan, r, r.response, "response")
+    # Absent counts have no support to check; the trials still validate.
+    check_support &= _supplied(ycol)
     t = r.trials
     if t isa Int
         t >= 0 || _fail(r.label, "trials literal must be non-negative")
@@ -6406,14 +6575,16 @@ function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
     t === nothing && _fail(r.label,
         "Multinomial response requires trials (Int column or literal)")
     counts = [r.response; r.count_columns...]
+    # Absent counts have no row sums to check; the trials still validate.
+    supplied = all(c -> _supplied(plan.columns[c]), counts)
     n = r.mi_jobs === nothing ? _response_rows(plan, r) : length(plan.columns[r.mi_jobs])
     rowsums = zeros(Int, n)
-    for c in counts
+    supplied && for c in counts
         rowsums .+= plan.columns[c]
     end
     if t isa Int
         t >= 0 || _fail(r.label, "Multinomial trials literal must be non-negative")
-        all(rowsums .== t) ||
+        !supplied || all(rowsums .== t) ||
             _fail(r.label, "multinomial row counts must sum to trials $t " *
                 "in every row")
         return nothing
@@ -6428,7 +6599,7 @@ function _validate_multinomial_trials(r::LikelihoodSpec, plan::StructuralPlan)
         _fail(r.label, "trials $t must be non-negative")
     observed_trials = r.mi_jobs === nothing || col isa Number ? col :
         col[plan.columns[r.mi_jobs]]
-    all(rowsums .== observed_trials) ||
+    !supplied || all(rowsums .== observed_trials) ||
         _fail(r.label, "multinomial row counts must sum to trials in every row")
     return nothing
 end
@@ -7405,9 +7576,12 @@ function _materialize_module_data!(plan::StructuralPlan,
         memo[nm] = _eval_value_expr(ex, lookup, nm; calls)
         return memo[nm]
     end
+    absent = _absent_definition_sources(exprs, columns)
     for nm in sort!(collect(names))
+        source = get(absent, nm, nothing)
         v = try
-            lookup(nm)
+            source === nothing ? lookup(nm) :
+                _absent_definition_value(nm, source, exprs, vector_defs, plan, columns)
         catch e
             e isa ContractValidationError && rethrow()
             throw(ContractValidationError(
@@ -7425,10 +7599,67 @@ function _materialize_module_data!(plan::StructuralPlan,
             v isa ColumnData || continue
         end
         # Dense storage retains every observation operand's rank and axes.
-        columns[nm] = v isa AbstractVector ? collect(v) :
+        columns[nm] = v isa _Absent ? v : v isa AbstractVector ? collect(v) :
             v isa AbstractArray ? Array(v) : v
     end
     return names
+end
+
+# Data definitions reading an absent value, directly or through other
+# definitions, mapped to the absent observation they read.
+function _absent_definition_sources(exprs::AbstractDict, columns::AbstractDict)
+    sources = Dict{Symbol,Symbol}()
+    memo = Dict{Symbol,Union{Symbol,Nothing}}()
+    function source(nm, active)
+        haskey(memo, nm) && return memo[nm]
+        v = get(columns, nm, nothing)
+        v isa _Absent && return _absent_source(v)
+        (haskey(exprs, nm) && nm ∉ active) || return nothing
+        push!(active, nm)
+        found = nothing
+        for s in _definition_reads(exprs[nm])
+            found = source(s, active)
+            found === nothing || break
+        end
+        delete!(active, nm)
+        return memo[nm] = found
+    end
+    for nm in keys(exprs)
+        s = source(nm, Set{Symbol}())
+        s === nothing || (sources[nm] = s)
+    end
+    return sources
+end
+
+# An absent definition's stand-in. Its type and shape are those the
+# definition computes from values of the absent observation's type and
+# shape (ones): the program reads only those. The values themselves are
+# discarded, and no query binds this input.
+function _absent_definition_value(nm::Symbol, source::Symbol, exprs, vector_defs,
+        plan::StructuralPlan, columns::AbstractDict)
+    surrogate(v::_AbsentArray) = ones(eltype(v), v.dims)
+    surrogate(v::_AbsentNumber{T}) where {T} = one(T)
+    surrogate(v) = v
+    memo = Dict{Symbol,Any}()
+    calls = Dict{Any,Any}()
+    function lookup(s::Symbol)
+        haskey(memo, s) && return memo[s]
+        haskey(columns, s) && return surrogate(columns[s])
+        haskey(exprs, s) || throw(ContractValidationError(
+            "[bind] data definition reads $s, which is not bound data"))
+        return memo[s] = _eval_value_expr(exprs[s], lookup, s; calls)
+    end
+    v = try
+        lookup(nm)
+    catch e
+        throw(ContractValidationError("[bind] data definition $nm reads " *
+            "`$source`, which this binding leaves absent, and its value's " *
+            "type and shape cannot be determined without `$source`'s values: " *
+            sprint(showerror, e) * ". Supply `$source`."))
+    end
+    v isa Real && return _AbsentNumber{typeof(v)}(source)
+    v isa AbstractArray && return _AbsentArray{eltype(v),ndims(v)}(source, size(v))
+    return v
 end
 
 # Value matrices (`_value_design_matrix_names`): each binds under
@@ -7735,6 +7966,9 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     isempty(columns) && _has_observation_axis(plan) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
     columns = _checked_columns(columns)
+    # Rebinding a binding: what it left absent stays absent unless supplied.
+    filter!(p -> _supplied(last(p)), columns)
+    _absent_observations!(plan, columns)
     _route_conditioned_values!(plan, columns)
     _route_bound_values!(plan, columns)
     _scalar_responses_as_observations!(plan, columns)
@@ -7743,6 +7977,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     _materialize_value_matrices!(plan, columns)
     raw = Set{Symbol}(keys(columns))
     computed = _materialize_module_data!(plan, columns)
+    _size_absent_responses!(plan, columns)
     # Raw inputs read only as whole values (module-call arguments,
     # gathered values): no n_obs anchor.
     inputs, _ = _model_level_inputs(plan, raw)
@@ -7807,6 +8042,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps,
         vector_parameters = vectors2)
+    _size_absent_conditioned_arrays!(bound)
     _validate_conditioned_values(bound)
     validate_data(bound)
     return bound

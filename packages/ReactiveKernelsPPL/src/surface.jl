@@ -626,6 +626,12 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
         if occursin('.', String(k)) && k in observing)
     data = Set(keys(values))
     ast = Expr(:block, _desugar_destructuring(m.ast.args)...)
+    # Observations the call leaves without a value bind absent.
+    union!(data, _conditioned_without_value(ast, observing, data,
+        _conditioned_parameters(ast, observing, m.mod)))
+    unsupplied = _unsupplied_responses(ast, data)
+    union!(data, unsupplied)
+    union!(observing, unsupplied)
     scoped_values = Dict{Symbol,ColumnData}()
     ast, scopes = _expand_submodels(ast, data, m.mod; with_scopes = true,
         rewrites = m.rewrites, fixes = scoped, bound_values = scoped_values)
@@ -707,6 +713,61 @@ function _conditioned_declarations(ast, names)
         (_is_sample(st) || array) && push!(out, name)
     end
     return out
+end
+
+# ── Observations without values ─────────────────────────────────────────
+# An observation whose value the data omit keeps its observation statement:
+# it lowers reading the observed name as data, and `bind_data` leaves that
+# value absent. Two spellings omit a value: a name `conditioned` names that
+# the data do not supply, and, in a model call, a response statement over a
+# name nothing supplies (`y .~ D.(…)`, `[y1, y2] ~ D(…)`). A declaration
+# conditioned without its value keeps its parameter reading; its observed
+# value is absent instead.
+function _sampling_stems!(out::Set{Symbol}, ex)
+    ex isa Expr || return out
+    if _is_sample(ex) || _is_broadcast_sample(ex)
+        lhs = _stmt_lhs(ex)
+        if Meta.isexpr(lhs, :vect)
+            foreach(a -> a isa Symbol && push!(out, a), lhs.args)
+        else
+            stem = _merge_stem(lhs)
+            stem === nothing || push!(out, stem)
+        end
+    end
+    foreach(a -> _sampling_stems!(out, a), ex.args)
+    return out
+end
+
+# Conditioned declarations before submodel expansion: parameters observed at
+# a value. A submodel stream needs its observation name as data during
+# expansion, so it is not one of them.
+_conditioned_parameters(ast, observing, mod::Module) =
+    Set(n for n in _conditioned_declarations(ast, observing)
+        if !any(a -> a isa Expr && _stmt_is_submodel_call(a, mod) &&
+            _merge_stem(_stmt_lhs(_unwrap_trivia(a))) === n, ast.args))
+
+_top_level_definitions(ast) = Set{Symbol}(first(st.args) for st in ast.args
+    if st isa Expr && st.head === :(=) && first(st.args) isa Symbol)
+
+function _conditioned_without_value(ast, observing, data, declarations)
+    stems = _sampling_stems!(Set{Symbol}(), ast)
+    return setdiff(intersect(observing, stems), data, declarations,
+        _top_level_definitions(ast))
+end
+
+function _unsupplied_responses(ast, data)
+    out = Set{Symbol}()
+    for raw in ast.args
+        raw isa Expr && !_is_block_macro(raw) || continue
+        st = _unwrap_trivia(raw)
+        lhs = (_is_sample(st) || _is_broadcast_sample(st)) ? _stmt_lhs(st) : nothing
+        if _is_broadcast_sample(st) && lhs isa Symbol
+            push!(out, lhs)
+        elseif _is_sample(st) && Meta.isexpr(lhs, :vect) && all(a -> a isa Symbol, lhs.args)
+            union!(out, lhs.args)
+        end
+    end
+    return setdiff(out, data, _top_level_definitions(ast))
 end
 
 function _check_observed_inputs(ast, inputs, observing)
@@ -890,11 +951,9 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
         _sfail("lower_rkppl takes a `begin ... end` block AST")
     ast = Expr(:block, _desugar_destructuring(ast.args)...)
     observing = Set{Symbol}(_conditioned_names(conditioned))
-    # Submodel streams need their observation name during expansion.
-    primitive = Set(n for n in _conditioned_declarations(ast, observing)
-        if !any(a -> a isa Expr && _stmt_is_submodel_call(a, mod) &&
-            _merge_stem(_stmt_lhs(_unwrap_trivia(a))) === n, ast.args))
+    primitive = _conditioned_parameters(ast, observing, mod)
     setdiff!(data, primitive)
+    union!(data, _conditioned_without_value(ast, observing, data, primitive))
     ast, scopes = _expand_submodels(ast, data, mod; with_scopes = true)
     observed_parameters = _conditioned_declarations(ast, observing)
     setdiff!(data, observed_parameters)

@@ -74,12 +74,61 @@ end
 
 # The sampler boundary: packed unconstrained parameters plus the raw data
 # columns, sorted by name (same order the generator uses for data args).
-_query_have(plan::StructuralPlan) =
-    (:unconstrained, sort!(collect(keys(plan.columns)))...)
+# Values the binding leaves absent are not inputs: a query reading one has
+# nothing to read (`_absent_refusal`).
+_query_columns(plan::StructuralPlan) =
+    sort!([k for (k, v) in plan.columns if _supplied(v)])
+
+_query_have(plan::StructuralPlan) = (:unconstrained, _query_columns(plan)...)
 
 function _query_bound(plan::StructuralPlan)
-    names = sort!(collect(keys(plan.columns)))
+    names = _query_columns(plan)
     return NamedTuple{Tuple(names)}(Tuple(plan.columns[k] for k in names))
+end
+
+# Run a preparation of `want` from `have` over `plan`'s inputs. When it
+# needs a value the binding leaves absent, RK's planner finds no producer for
+# that input; planning again with the absent inputs available shows which
+# ones the query reads, and the query is refused naming their observations.
+function _absent_refusal(f, plan::StructuralPlan, spec, have, want)
+    absent = _absent_inputs(plan)
+    isempty(absent) && return f()
+    try
+        return f()
+    catch e
+        e isa ReactiveKernels.PlanningError || rethrow()
+        selected = try
+            Base.invokelatest(ReactiveKernels.plan, spec;
+                have = (have..., absent...), want)
+        catch
+            rethrow(e)
+        end
+        # The planner collapses aliases (`k = <conditioned k>`): compare the
+        # inputs' canonical values, not their port names.
+        g = spec.graph
+        canon(v) = ReactiveKernels.canon_id(g, v.id)
+        reads = Set(canon(v) for r in selected.recipes for v in r.inputs)
+        union!(reads, (canon(v) for v in selected.want))
+        needed = filter(k -> haskey(spec.ports, k) && canon(spec.ports[k]) in reads, absent)
+        isempty(needed) && rethrow(e)
+        _refuse_absent(unique!([_absent_source(plan.columns[k]) for k in needed]))
+    end
+end
+
+# A cell query evaluates its observations' densities, which read them.
+function _refuse_absent_cells(plan::StructuralPlan, names)
+    absent = intersect(names, _absent_observations(plan))
+    isempty(absent) || _refuse_absent(absent)
+    return nothing
+end
+
+function _refuse_absent(names)
+    them = join(("`$n`" for n in names), ", ", " and ")
+    it = length(names) == 1 ? "it" : "them"
+    throw(ContractValidationError("[query] this binding leaves $them absent " *
+        "(no value was supplied), and this query reads $it. Supply $them, " *
+        "or query values that do not read $it, such as a location by its " *
+        "authored name or the `:observations` preset."))
 end
 
 """
@@ -130,8 +179,11 @@ function _prepare_wants(built, plan::StructuralPlan, want;
     # World-age barrier: `built.spec` holds closures eval'd at build time
     # (newer than any already-compiled caller), so partial evaluation must
     # run at the latest world. Same barrier guards every call below.
-    return Base.invokelatest(prepare, built.spec; have = _query_have(plan),
-        want, bound = _query_bound(plan), on_error, exemplars)
+    have = _query_have(plan)
+    return _absent_refusal(plan, built.spec, have, want) do
+        Base.invokelatest(prepare, built.spec; have,
+            want, bound = _query_bound(plan), on_error, exemplars)
+    end
 end
 
 # A built graph evaluates the program its build generated. A binding that
@@ -142,14 +194,37 @@ end
 # entries, an empty response, another broadcast shape) needs its own build;
 # evaluating the old graph on it can be silently wrong, so it is refused.
 # Values made outside `build_kernel` carry no `program` and are not checked.
+# A value the binding leaves absent has the type its input has in the built
+# program: the binding supplies no value to say otherwise.
 function _check_built_program(built, plan::StructuralPlan)
     hasproperty(built, :program) || return nothing
+    plan = _absent_typed_as(plan, built.program)
     program = _program_identity(kernel_expr(plan, assign_layout(plan)))
     _same_program(program, built.program) && return nothing
     throw(ContractValidationError("[query] this binding generates a " *
         "different program than the one this graph was built from, so it " *
         "needs its own `build_kernel(plan)`. First difference, " *
         _program_difference(built.program, program)))
+end
+
+function _absent_typed_as(plan::StructuralPlan, program::Expr)
+    absent = _absent_inputs(plan)
+    isempty(absent) && return plan
+    types = Dict{Symbol,Any}()
+    for a in program.args[1].args[2:end]
+        Meta.isexpr(a, :(::), 2) && a.args[1] isa Symbol && (types[a.args[1]] = a.args[2])
+    end
+    columns = copy(plan.columns)
+    for k in absent
+        v, T = columns[k], get(types, k, nothing)
+        T isa Type || continue
+        if v isa _AbsentArray && T <: AbstractArray && ndims(T) == ndims(v)
+            columns[k] = _AbsentArray{eltype(T),ndims(v)}(v.name, v.dims)
+        elseif v isa _AbsentNumber && T <: Real
+            columns[k] = _AbsentNumber{T}(v.name)
+        end
+    end
+    return _with(plan; columns)
 end
 
 function _program_difference(built::Expr, other::Expr)
@@ -483,9 +558,12 @@ function prepare_cell_query(built, plan::StructuralPlan, observations;
     names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_cell_query needs at least one observation name"))
+    _refuse_absent_cells(plan, names)
     spec, want = _cell_query_spec(built, plan, names)
-    kernel = Base.invokelatest(prepare, spec; have = (_query_have(plan)..., _CELL_PORT),
-        want, bound = _query_bound(plan), on_error)
+    have = (_query_have(plan)..., _CELL_PORT)
+    kernel = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+    end
     return CellQuery(kernel, built.layout, names)
 end
 
@@ -662,6 +740,7 @@ function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
     names = observations isa Symbol ? (observations,) : Tuple(Symbol.(observations))
     isempty(names) && throw(ContractValidationError(
         "[query] prepare_compact_cell_sampler needs at least one observation name"))
+    _refuse_absent_cells(plan, names)
     spec, want = _cell_query_spec(built, plan, names)
     for (name, type) in ((:_ppl_cell_base, AbstractVector{Float64}),
             (:_ppl_cell_active, AbstractVector{Float64}),
@@ -675,8 +754,11 @@ function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
         spec[:_ppl_cell_indices]) => spec[:unconstrained], _compact_cell_point)
     filter!(!=(:unconstrained), spec.have_names)
     prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_indices])
-    kernel = Base.invokelatest(prepare, spec; have = Tuple(spec.have_names),
-        want, bound = _query_bound(plan), on_error)
+    filter!(n -> n ∉ _absent_inputs(plan), spec.have_names)
+    have = Tuple(spec.have_names)
+    kernel = _absent_refusal(plan, spec, have, want) do
+        Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
+    end
     ad = Base.invokelatest(prepare_ad, kernel, backend, base0, active0, indices0, 1;
         active = :_ppl_cell_active)
     CompactCellSampler(ad, layout, names)
