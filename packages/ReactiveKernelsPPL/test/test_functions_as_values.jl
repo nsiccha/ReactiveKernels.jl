@@ -1244,6 +1244,115 @@ end
     @test_throws ContractValidationError bind_data(weighted_plan, cols)
 end
 
+@testset "functions as values: a built-in reduction reads its argument whole" begin
+    # `mean(x_fit)` reads the whole array, exactly as `Statistics.mean(x_fit)`
+    # does: a column read only by built-in reductions is model-level data of
+    # any length, beside responses of another length.
+    x_fit = [0.3, -1.2, 0.8, 2.1, -0.4, 1.5, 0.0, -2.2, 0.9, 1.1, -0.7, 0.6]
+    x = [0.5, -0.3, 1.8, -1.0]
+    y = [1.1, 0.2, 2.9, -0.8]
+    y2 = [0.2, -0.5, 1.0, 0.4, 0.1, -0.9, 1.4, 0.3, -0.2, 0.8, 0.0, 0.5]
+    m, sd = sum(x_fit) / length(x_fit), sqrt(var(x_fit))
+    r = maximum(x_fit) - minimum(x_fit)
+    z = (x .- m) ./ sd
+    lik(mu, s) = sum(logpdf.(Normal.(mu, s), y))
+    data = (; x_fit, x, y)
+    cases = (
+        (quote
+            a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+            z = (x .- mean(x_fit)) ./ std(x_fit)
+            mu = a .+ b .* z
+            y .~ Normal.(mu, s)
+        end, th -> lik(th.a .+ th.b .* z, th.s)),
+        (quote
+            a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+            xc = mean(x_fit); xs = std(x_fit)
+            z = (x .- xc) ./ xs
+            mu = a .+ b .* z
+            y .~ Normal.(mu, s)
+        end, th -> lik(th.a .+ th.b .* z, th.s)),
+        (quote
+            a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+            y .~ Normal.(a .+ b .* ((x .- mean(x_fit)) ./ std(x_fit)), s)
+        end, th -> lik(th.a .+ th.b .* z, th.s)),
+        (quote
+            a ~ Normal(0, 5); b ~ Normal(0, 2)
+            y .~ Normal.(a .+ b .* x, std(x_fit))
+        end, th -> lik(th.a .+ th.b .* x, sd)),
+        (quote
+            a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+            off = sum(x_fit) / length(x_fit)
+            mu = a .+ b .* x .+ off
+            y .~ Normal.(mu, s)
+        end, th -> lik(th.a .+ th.b .* x .+ m, th.s)),
+        (quote
+            a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+            w = x ./ (maximum(x_fit) - minimum(x_fit))
+            mu = a .+ b .* w .+ var(x_fit)
+            y .~ Normal.(mu, s)
+        end, th -> lik(th.a .+ th.b .* (x ./ r) .+ sd^2, th.s)),
+    )
+    for (ast, ref) in cases
+        bound = bind_data(lower_rkppl(ast, data; mod = _FV, conditioned = (:y,)), data)
+        @test bound.n_obs == 4
+        @test bound.columns[:x_fit] == x_fit
+        built = build_kernel(bound)
+        for u in ([0.3, -0.2, 0.1], [-1.1, 0.7, -0.5])
+            u = u[1:built.layout.total]
+            th = ReactiveKernelsPPL.constrain(built.layout, u)
+            @test _fv_value(built, bound, :likelihood, u) ≈ ref(th)
+        end
+    end
+    # Another response may read the same array per observation: that
+    # response has the array's 12 rows, while `y` keeps its 4.
+    two = quote
+        a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+        xc = mean(x_fit); xs = std(x_fit)
+        mu = a .+ b .* (x .- xc) ./ xs
+        y .~ Normal.(mu, s)
+        y2 .~ Normal.(b .* x_fit, s)
+    end
+    data2 = (; x_fit, x, y, y2)
+    bound2 = bind_data(lower_rkppl(two, data2; mod = _FV, conditioned = (:y, :y2)), data2)
+    @test bound2.n_obs == 16
+    built2 = build_kernel(bound2)
+    for u in ([0.3, -0.2, 0.1], [-1.1, 0.7, -0.5])
+        th = ReactiveKernelsPPL.constrain(built2.layout, u)
+        @test _fv_value(built2, bound2, :likelihood, u) ≈
+            lik(th.a .+ th.b .* z, th.s) + sum(logpdf.(Normal.(th.b .* x_fit, th.s), y2))
+    end
+    # The reductions run once, at binding; the gradient differentiates the
+    # parameter-dependent location only.
+    grad = quote
+        a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+        xc = mean(x_fit); xs = std(x_fit)
+        mu = a .+ b .* (x .- xc) ./ xs .* exp(a)
+        y .~ Normal.(mu, s)
+    end
+    gbound = bind_data(lower_rkppl(grad, data; mod = _FV, conditioned = (:y,)), data)
+    gbuilt = build_kernel(gbound)
+    for u in ([0.3, -0.2, 0.1], [-0.6, 0.9, -0.4])
+        th = ReactiveKernelsPPL.constrain(gbuilt.layout, u)
+        @test _fv_value(gbuilt, gbound, :likelihood, u) ≈
+            lik(th.a .+ th.b .* z .* exp(th.a), th.s)
+        q = prepare_sampler(gbuilt, gbound, u; backend = _FV_BACKEND)
+        kern = prepare_query(gbuilt, gbound, :sampler)
+        v, g = Base.invokelatest(ReactiveKernels.ad_value_and_gradient!, q.ad,
+            similar(u), u)
+        @test v ≈ Base.invokelatest(kern, u)
+        @test isapprox(g, _fv_findiff(w -> Base.invokelatest(kern, w), u);
+            rtol = 1e-5, atol = 1e-7)
+    end
+    # A per-observation read beside `y` still aligns the array with `y`.
+    mixed = lower_rkppl(quote
+            a ~ Normal(0, 5); b ~ Normal(0, 2); s ~ Exponential(1.0)
+            mu = a .+ b .* (x .- mean(x_fit)) .+ x_fit
+            y .~ Normal.(mu, s)
+        end, data; mod = _FV, conditioned = (:y,))
+    # refused: x_fit is also read per observation beside y (`.+ x_fit`), so its 12 entries must broadcast with y's 4 (wrong data; a Julia DimensionMismatch, P3)
+    @test_throws ContractValidationError bind_data(mixed, data)
+end
+
 @testset "functions as values: data on several axes (Enzyme vs FD)" begin
     # Observations (8), events (5), groups (3) and weights (4): every
     # column off the observation axis reaches the kernel through module

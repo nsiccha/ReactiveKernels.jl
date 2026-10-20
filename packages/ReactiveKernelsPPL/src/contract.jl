@@ -1622,9 +1622,9 @@ end
 
 """Per-observation columns (of `perobs`) a response reads: the names its
 own fields hold, then — transitively — the names every predictor, derived
-column and definition among them holds. `whole_values=true` follows composed
-expressions and treats reductions as whole-array reads for latent-domain
-validation, without changing the default observation-axis classification."""
+column and definition among them holds. A gather's source and a reduction's
+argument are whole reads, never aligned ones. `whole_values=true` also
+follows composed expressions for latent-domain validation."""
 function _response_reads(plan::StructuralPlan, r,
         perobs::Set{Symbol}; whole_values::Bool=false,
         stop::Set{Symbol}=Set{Symbol}())
@@ -1638,10 +1638,10 @@ function _response_reads(plan::StructuralPlan, r,
     function held(x)
         if x isa Expr
             whole, aligned = Set{Symbol}(), Set{Symbol}()
-            # A gather consumes its source whole. Module-call arguments
-            # also carry their own axes rather than the result's axis.
-            _classify_reads!(whole, aligned, x, cands, false;
-                reductions_whole=whole_values)
+            # A gather and a reduction consume their source whole.
+            # Module-call arguments also carry their own axes rather than
+            # the result's axis.
+            _classify_reads!(whole, aligned, x, cands, false)
             return aligned
         end
         return record_reads(x)
@@ -7132,14 +7132,15 @@ end
 
 """Model-level data inputs of `plan`: raw columns of `raw` read only as
 whole values. A read is whole inside an argument of an undotted module
-call (`f(gx)`, at any depth), as the gathered value of a gather
+call (`f(gx)`, at any depth) or of a built-in reduction (`mean(gx)`, as
+`Statistics.mean(gx)`), as the gathered value of a gather
 (`gx[g]`, `(b .* gx)[g]`), or anywhere in a definition whose every use is
 whole (`scale = a .+ b .* gx` passed only to calls) — so naming a
 subexpression never changes the verdict. Such a column has no observation
 axis — any length or shape, like the model-level values computed from
 it — and it neither anchors nor crosses `n_obs`. Any other read keeps a
 column observation-aligned: a definition read outside those positions
-(`gx .+ 1` in a predictor, `f.(gx)`, `mean(gx)`, a gather index), or any
+(`gx .+ 1` in a predictor, `f.(gx)`, a gather index), or any
 name an observation-bearing structural slot holds (new slots remain
 fail-closed). Prior-only reads keep their declared latent domain.
 Returns `(inputs, defs)`: the columns, and the
@@ -7373,12 +7374,14 @@ _has_observation_axis(plan) = !isempty(plan.responses) ||
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
 # inside an argument of an undotted module call into `whole`, anywhere
 # else into `per_obs`. The vector of a matrix product `M * v`, with `M`
-# one of `matrices` (`_matrix_product_operand`), is a whole read too.
+# one of `matrices` (`_matrix_product_operand`), is a whole read too, and
+# so is the argument of a built-in reduction: `mean(x_fit)` reads the whole
+# array, exactly as the qualified `Statistics.mean(x_fit)` does.
 function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
-        raw::AbstractSet{Symbol}, inside::Bool; reductions_whole::Bool=false,
+        raw::AbstractSet{Symbol}, inside::Bool;
         matrices::AbstractSet{Symbol} = _NO_MATRIX_OPERANDS)
     visit(a, context) = _classify_reads!(whole, per_obs, a, raw, context;
-        reductions_whole, matrices)
+        matrices)
     if ex isa Symbol
         ex in raw && push!(inside ? whole : per_obs, ex)
     elseif ex isa Expr
@@ -7408,8 +7411,7 @@ function _classify_reads!(whole::Set{Symbol}, per_obs::Set{Symbol}, ex,
         elseif ex.head === :call
             constructed = _constructed_endpoint_call(ex)
             inner = inside || (!isempty(ex.args) && (ex.args[1] isa GlobalRef ||
-                constructed ||
-                (reductions_whole && ex.args[1] in REDUCTION_FNS)))
+                constructed || ex.args[1] in REDUCTION_FNS))
             if constructed
                 for a in ex.args[1].args[1].args[2:end]
                     visit(a, true)

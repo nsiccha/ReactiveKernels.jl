@@ -389,7 +389,11 @@ from parameter geometry, without adding generated values to sampler coordinates.
   from `logistic.(eta)` to `1 .- logistic.(eta)`.
 - Broadcasting is explicit: `mu = a .+ b .* x`.
 - A reduction's one-argument form (`sum(x)`, `mean(z)`) is the built-in
-  whole-column reduction. Called with keywords or a function argument it is
+  whole-column reduction. It reads its argument whole, as
+  `Statistics.mean(z)` does, so an array that only reductions read has no
+  observation axis: `xs = (x .- mean(x_fit)) ./ std(x_fit)` binds an
+  `x_fit` of any length beside the observations of `x`.
+  Called with keywords or a function argument it is
   Julia's own function, as its qualified spelling `Base.sum` is: with
   `dims = 2`, `P = exp.(U .- log.(sum(exp.(U); dims = 2)))` normalizes each
   row of `U`, and `std(x; corrected = false)`, `sum(z; init = 0.0)` and
