@@ -159,8 +159,10 @@ end
         # The subject plate holds the child scan in its body in the built
         # graph, its printed-source replay, and once the data are bound. The
         # second top-level plate is the observation plate; preparation
-        # composes it into the subject plate, its sole producer.
-        subject_structure = [(:plate, 0), (:scan, 1), (:plate, 0)]
+        # composes it into the subject plate, its sole producer. The third is
+        # the observation's law plate (`prepare_predictive`), which the
+        # sampler does not read, so preparation leaves it out.
+        subject_structure = [(:plate, 0), (:scan, 1), (:plate, 0), (:plate, 0)]
         prepared_structure = [(:plate, 0), (:scan, 1)]
         @test structure(built.spec) == subject_structure
         entries = recipe_inventory(built.spec)
