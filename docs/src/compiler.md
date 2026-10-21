@@ -173,7 +173,7 @@ PPL artifacts are external compilation examples and acceptance evidence, not
 domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
 in the `ReactiveKernelsNUTSExamples` nested package; a bare `using ReactiveKernels` does not load or
 export them. See [What the NUTS proof does and does not
-establish](#what-the-nuts-proof-does-and-does-not-establish).
+establish](#What-the-NUTS-proof-does-and-does-not-establish).
 
 ## The stateless compiler
 
@@ -508,7 +508,7 @@ Binding freezes values for that preparation; changing or mutating the data is
 not an invalidation signal. Rebind by preparing again from the original graph
 or plan. The pass does not rewrite mathematics or mutate the shared graph; it
 splits a recipe only along the structure its author wrote (see
-[Data-only subexpressions](#data-only-subexpressions)). The default
+[Data-only subexpressions](#Data-only-subexpressions)). The default
 `bound = ()`/`bound = (;)` path is unchanged.
 
 The same named `bound` contract is available on `prepare_nonallocating`, whose
