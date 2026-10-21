@@ -52,7 +52,7 @@ provenance-aware invalidation and do not use the iterative-method compiler.
 
 **The iterative-method compiler** is the third pipeline listed above. It
 compiles stateful object kernels and free update methods (see [Two stateful
-authoring modes](#two-stateful-authoring-modes)) into state machines. It is
+authoring modes](#Two-stateful-authoring-modes)) into state machines. It is
 **frozen**: its tests stay green, but it takes no new features and no Reactant
 work until it is revisited. Its public entry points are:
 
@@ -1092,7 +1092,7 @@ mutable value is still borrowed from its state.
 ## Source-captured method compiler
 
 This is the frozen iterative-method compiler (see [Pure kernels and the
-iterative-method compiler](#pure-kernels-and-the-iterative-method-compiler)).
+iterative-method compiler](#Pure-kernels-and-the-iterative-method-compiler)).
 Compiled as state machines, method-bearing `@kernel` definitions enter a
 stricter compiler. Their pure, straight-line methods are also endpoint graphs
 of the pure half, which need nothing from this section. They are not
