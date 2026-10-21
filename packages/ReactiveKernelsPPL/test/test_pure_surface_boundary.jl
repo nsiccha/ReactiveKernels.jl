@@ -14,10 +14,13 @@ using Test
                         --project=$(Base.active_project()) $fixture`)
     lines(tag) = [chop(l; head = length(tag) + 1, tail = 0)
                   for l in report if startswith(l, tag * " ")]
-    files = Dict(Pair(split(l)...) for l in lines("FILE"))
-    # Every listed file still exists and defines methods the census can see.
+    files = Dict(f => parse(Int, n) for (f, n) in split.(lines("FILE")))
+    # Every listed file still exists, and the census sees the methods of each.
+    # native_slot_compiler.jl only opens a module around its includes; from
+    # Julia 1.12 that module's `include` is not a method, so it defines none.
+    @test isempty(lines("MISSING"))
     @test !isempty(files)
-    @test all(n -> parse(Int, n) > 0, values(files))
+    @test all(n > 0 for (f, n) in files if f != "native_slot_compiler.jl")
     @test lines("WORKLOAD") == ["true"]
     # Only module-level constants are compiled by loading; a package image
     # whose precompile workload ran the compiler would show here.

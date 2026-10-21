@@ -71,6 +71,7 @@ _load_time(m::Method) = m.name === :include ||
 
 methods_iter = _iterative_methods()
 for file in ITERATIVE_FILES
+    isfile(joinpath(_SRC, file)) || println("MISSING ", file)
     println("FILE ", file, " ", count(m -> basename(String(m.file)) == file, methods_iter))
 end
 before = _census(methods_iter)
