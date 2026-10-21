@@ -151,17 +151,66 @@ function _law_statement(r::LikelihoodSpec, stmts::Vector{Expr})
     return Expr(:(=), _law_name(r.label), plate_call)
 end
 
-# The predictive entry of a response: its law plate, and the response
-# entries a ranged observation's cells belong to.
+# The predictive entry of a response: its law plate's cells as columns
+# (`_ppl_law_columns`), and the response entries a ranged observation's cells
+# belong to.
 function _law_entry(r::LikelihoodSpec, plan::StructuralPlan, rs::Vector{Expr})
     name = _law_name(r.label)
     any(st -> _assigned_name(st) === name, rs) || return nothing
+    columns = GlobalRef(@__MODULE__, :_ppl_law_columns)
     indices = Symbol(:_ppl_range_indices_, r.label)
     if r.range isa Expr && !_cell_broadcast_response(plan, r) &&
             any(st -> _assigned_name(st) === indices, rs)
-        return :((laws = $name, indices = $indices))
+        return :((; $columns($name)..., indices = $indices))
     end
-    return :((laws = $name,))
+    return :($columns($name))
+end
+
+# The law plate returns one record per cell, `(law = Val{:normal}(), _1 = …,
+# _2 = …, evidence = Val{:censored}(), lower = …)`. RK batches a value over
+# positions (`vectorize`) only when its leaves are numbers or numeric arrays,
+# so the predictive node holds those records as columns, one array per
+# argument, keyed by the law's and the evidence's names:
+# `(law = (normal = (_1 = A, _2 = B),), evidence = (censored = (lower = L,),))`.
+# Every column has the law plate's shape. A response holding one array per
+# index concatenates its indices' cells, in index order, and records each
+# index's plate shape as a column of `sizes`. An empty response has no law.
+function _ppl_law_columns(cells::AbstractArray{T}) where {T<:NamedTuple}
+    isconcretetype(T) && return _law_record_columns(cells, T)
+    return isempty(cells) ? (law = NamedTuple(),) :
+        _law_record_columns(cells, typeof(first(cells)))
+end
+function _ppl_law_columns(groups::AbstractVector{<:AbstractArray{<:NamedTuple,N}}) where {N}
+    sizes = Matrix{Int}(undef, N, length(groups))
+    for (i, g) in enumerate(groups)
+        sizes[:, i] .= size(g)
+    end
+    cells = isempty(groups) ? eltype(eltype(groups))[] : reduce(vcat, vec.(groups))
+    return (; _ppl_law_columns(cells)..., sizes)
+end
+# An empty response, or one whose law plate yields no typed cells.
+function _ppl_law_columns(cells::Union{Tuple{},AbstractArray})
+    isempty(cells) || all(isempty, cells) || throw(ContractValidationError(
+        "[query] the observation laws are $(typeof(cells)), not records of " *
+        "law arguments"))
+    return (law = NamedTuple(),)
+end
+
+_law_column(cells, ::Val{field}) where {field} = map(c -> getfield(c, field), cells)
+# `(name = (field = column, …),)` for a `Val{name}` tag.
+_tagged_columns_expr(::Type{Val{name}}, fields::Tuple) where {name} =
+    :(NamedTuple{($(QuoteNode(name)),)}((NamedTuple{$fields}(($((
+        :(_law_column(cells, Val($(QuoteNode(f))))) for f in fields)...),)),)))
+# `_law_statement` writes a cell as the law, its arguments, then `evidence`
+# and the bounds. The field names are the cell type's, so the columns'
+# layout is known when this compiles and the node stays concretely typed.
+@generated function _law_record_columns(cells::AbstractArray,
+        ::Type{NamedTuple{K,V}}) where {K,V}
+    i = findfirst(==(:evidence), K)
+    args, bounds = i === nothing ? (K[2:end], ()) : (K[2:i-1], K[i+1:end])
+    entry = :(law = $(_tagged_columns_expr(V.parameters[1], args)))
+    i === nothing && return :(($entry,))
+    return :(($entry, evidence = $(_tagged_columns_expr(V.parameters[i], bounds))))
 end
 
 function _predictive_statement(points::Vector{Pair{Symbol,Any}},
@@ -228,16 +277,58 @@ laws = predictive_laws(pred, u)        # lazy: one Distributions law per entry
 ```
 """
 function prepare_predictive(built, plan::StructuralPlan; on_error = nothing)
-    kernel = _prepare_wants(built, plan, :_ppl_predictive; on_error)
-    return PredictiveQuery(kernel, _predictive_targets(built, plan))
+    kernel = _prepare_wants(built, plan, predictive_node(built); on_error)
+    return PredictiveQuery(kernel, predictive_targets(built, plan))
 end
 
-# The shape each response's draws take: the bound response's, or, for a
-# response left absent, the shape of the operands it broadcasts with. Binding
-# gives a flat absent response that shape; a response holding one array per
-# index is classified by the program the graph was built from, and each
-# index's draws take the shape of that index's laws (`dims = nothing`).
-function _predictive_targets(built, plan::StructuralPlan)
+"""
+    predictive_node(built) -> Symbol
+
+The graph value of `built` (`build_kernel`'s result) that holds every
+observation's law arguments: the value `prepare_predictive` evaluates. WANT
+it in any cut of `built.spec`, or of a graph composed from it, beside other
+values and with any HAVE that determines it (random effects, interventions or
+design data as runtime inputs), and `vectorize` that cut over draws like any
+other. Then turn its value into laws or draws with [`predictive_laws`](@ref),
+[`predictive_draws`](@ref) or [`predictive_draws!`](@ref), given
+[`predictive_targets`](@ref).
+
+```julia
+node = predictive_node(built)
+targets = predictive_targets(built, design)
+cut = ReactiveKernels.prepare(ReactiveKernels.compose(built.spec, summary);
+    have = (:unconstrained, :b, data_ports...), want = (node, :summary))
+reader = ReactiveKernels.vectorize(cut; batched = (:unconstrained, :b))
+value, summary = reader(U, B, data...)
+predictive_draws(value, targets, rng; position = k)   # draw k's observations
+```
+
+The value holds numbers only (one array per law argument), so a vectorized
+cut stacks it on its trailing draw axis; its layout is otherwise not part of
+the interface.
+"""
+function predictive_node(built)
+    hasproperty(built, :spec) && haskey(built.spec.ports, :_ppl_predictive) ||
+        throw(ArgumentError("[query] predictive_node needs a `build_kernel` " *
+            "result, whose graph holds the observations' laws"))
+    return :_ppl_predictive
+end
+
+"""
+    predictive_targets(built, plan) -> NamedTuple
+
+The shape each observation's draws take on the binding `plan` of the program
+`built` was built from, keyed like `:pointwise`: the bound response's shape,
+or, for a response `plan` leaves absent, the shape of the operands it
+broadcasts with. A response holding one array per `@plate` index takes each
+index's shape (from the law values themselves when the response is absent and
+no data the cell reads per index fix it). Pass it to
+[`predictive_laws`](@ref) and [`predictive_draws`](@ref) with the value of
+[`predictive_node`](@ref) on a cut over the same design.
+"""
+function predictive_targets(built, plan::StructuralPlan)
+    # Binding gives a flat absent response that shape; a response holding one
+    # array per index is classified by the program the graph was built from.
     program = hasproperty(built, :program) ? _absent_typed_as(plan, built.program) : plan
     names = Symbol[r.response for r in plan.responses]
     targets = map(plan.responses) do r
@@ -260,53 +351,72 @@ The laws of one response's entries, shaped like the response
 ([`predictive_laws`](@ref)). Indexing builds that entry's Distributions.jl
 law from the arguments the graph computed; nothing is stored per entry.
 """
-struct PredictiveLaws{T,N,C,P} <: AbstractArray{T,N}
-    cells::C
+struct PredictiveLaws{T,N,S,P} <: AbstractArray{T,N}
+    source::S
     dims::NTuple{N,Int}
     positions::P
 end
 
-function PredictiveLaws(cells, dims::NTuple{N,Int}, indices = nothing) where {N}
+# `source` is one response's law columns (`_ppl_law_columns`); `indices`, for
+# a ranged response, the response entry each column position belongs to.
+function PredictiveLaws(source::NamedTuple, dims::NTuple{N,Int}, indices = nothing) where {N}
     positions = nothing
     if indices !== nothing
         positions = zeros(Int, dims)
         for (k, i) in enumerate(indices)
             positions[i] = k
         end
-    elseif !(cells isa Tuple)
+    elseif !isempty(source.law)
         shape = try
-            Base.Broadcast.broadcast_shape(size(cells), dims)
+            Base.Broadcast.broadcast_shape(_law_shape(source), dims)
         catch
             nothing
         end
         shape == dims || throw(DimensionMismatch("[query] the observation " *
-            "laws have shape $(size(cells)), which does not broadcast to the " *
-            "response's shape $dims"))
+            "laws have shape $(_law_shape(source)), which does not broadcast to " *
+            "the response's shape $dims (a vectorized cut's value needs " *
+            "`position = k` to select draw k)"))
     end
-    T = cells isa Tuple || isempty(cells) ? Any :
-        Base.promote_op(_predictive_law, eltype(cells))
+    T = isempty(source.law) ? Any :
+        Base.promote_op(_entry_law, typeof(source), NTuple{N,Int}, typeof(positions))
     (T === Union{} || !isconcretetype(T)) && (T = Any)
-    return PredictiveLaws{T,N,typeof(cells),typeof(positions)}(cells, dims, positions)
+    return PredictiveLaws{T,N,typeof(source),typeof(positions)}(source, dims, positions)
 end
+
+# Every column has the law plate's shape.
+_law_shape(source::NamedTuple) = size(first(only(values(source.law))))
 
 Base.size(L::PredictiveLaws) = L.dims
 Base.IndexStyle(::Type{<:PredictiveLaws}) = IndexCartesian()
 function Base.getindex(L::PredictiveLaws{T,N}, I::Vararg{Int,N}) where {T,N}
     @boundscheck checkbounds(L, I...)
-    return _predictive_law(_law_cell(L, I))
+    return _entry_law(L.source, I, L.positions)
 end
 
-function _law_cell(L::PredictiveLaws, I::Tuple)
-    cells = L.cells
-    if L.positions !== nothing
-        k = L.positions[I...]
+_entry_law(source, I, positions) = _predictive_law(_law_cell(source, I, positions))
+
+# The law plate position entry `I` reads: a ranged response's own position,
+# or Julia's broadcast of the plate's shape over the response's.
+function _law_position(source, I::Tuple, positions)
+    if positions !== nothing
+        k = positions[I...]
         k == 0 && throw(ArgumentError("[query] entry $I of the response is " *
             "not one its observation loop covers"))
-        return length(cells) == 1 ? first(cells) : cells[k]
+        return length(first(only(values(source.law)))) == 1 ? (1,) : (k,)
     end
-    nd = ndims(cells)
-    nd == 0 && return cells[]
-    return cells[ntuple(d -> size(cells, d) == 1 ? 1 : I[d], nd)...]
+    shape = _law_shape(source)
+    return ntuple(d -> shape[d] == 1 ? 1 : I[d], length(shape))
+end
+
+# One entry's law cell, as `_law_statement` writes it: the law, its
+# arguments, then `evidence` and the bounds.
+function _law_cell(source::NamedTuple, I::Tuple, positions)
+    J = _law_position(source, I, positions)
+    law = source.law
+    cell = (; law = Val(only(keys(law))), map(a -> a[J...], only(values(law)))...)
+    hasproperty(source, :evidence) || return cell
+    ev = source.evidence
+    return (; cell..., evidence = Val(only(keys(ev))), map(b -> b[J...], only(values(ev)))...)
 end
 
 # Without the Distributions.jl extension there is nothing to build a law with.
@@ -315,47 +425,94 @@ _predictive_law(cell) = throw(ArgumentError("predictive draws build each " *
     "(it loads ReactiveKernelsPPL's Distributions extension)"))
 
 """
+    predictive_laws(value, targets; position = nothing) -> NamedTuple
     predictive_laws(q::PredictiveQuery, u) -> NamedTuple
 
-The law of every observation at the parameters `u`, keyed like `:pointwise`:
-a lazy [`PredictiveLaws`](@ref) array shaped like each response (a number
-bound to a response is one observation, as in `:pointwise`), and a vector of
-them for a response holding one array per `@plate` index.
+The law of every observation, keyed like `:pointwise`: a lazy
+[`PredictiveLaws`](@ref) array shaped like each response (a number bound to a
+response is one observation, as in `:pointwise`), and a vector of them for a
+response holding one array per `@plate` index.
+
+`value` is the value of [`predictive_node`](@ref) in any cut, and `targets`
+is [`predictive_targets`](@ref) of the design that cut evaluates. A cut
+vectorized over draws returns the value stacked on its trailing axis:
+`position = k` takes draw `k`'s laws, without copying. `q(u)`'s laws are
+`predictive_laws(q, u)`.
 """
-function predictive_laws(q::PredictiveQuery, u::AbstractVector)
-    raw = Base.invokelatest(q.kernel, u)
-    names = keys(raw)
-    return NamedTuple{names}(map(k -> _response_laws(raw[k], q.targets[k]), names))
+function predictive_laws(value::NamedTuple, targets::NamedTuple; position = nothing)
+    names = keys(targets)
+    keys(value) == names || throw(ArgumentError("[query] the predictive value " *
+        "holds the laws of $(keys(value)), the targets $(names): pass the targets " *
+        "of the design the value's cut evaluates"))
+    value = position === nothing ? value : _at_position(value, position)
+    return NamedTuple{names}(map(k -> _response_laws(value[k], targets[k]), names))
+end
+predictive_laws(q::PredictiveQuery, u::AbstractVector) =
+    predictive_laws(Base.invokelatest(q.kernel, u), q.targets)
+
+# Draw `k` of a vectorized cut's value: every leaf at position `k` of its
+# trailing axis.
+_at_position(x::Union{Tuple,NamedTuple}, k) = map(v -> _at_position(v, k), x)
+function _at_position(x::AbstractArray, k::Integer)
+    checkbounds(Bool, axes(x, ndims(x)), k) || throw(BoundsError(x, (k,)))
+    return selectdim(x, ndims(x), k)
 end
 
 function _response_laws(entry, target)
-    indices = hasproperty(entry, :indices) ? entry.indices : nothing
     if target.kind === :cells
-        cells = entry.laws
-        cells isa Tuple && return PredictiveLaws[]
-        dims = target.dims === nothing ? [size(c) for c in cells] : target.dims
-        length(cells) == length(dims) || throw(DimensionMismatch(
-            "[query] the observation laws have $(length(cells)) indices, the " *
+        hasproperty(entry, :sizes) || return [PredictiveLaws(entry, d)
+            for d in something(target.dims, Tuple{Vararg{Int}}[])]
+        sizes = entry.sizes
+        ndims(sizes) == 2 || throw(DimensionMismatch("[query] the observation " *
+            "laws hold $(ndims(sizes) - 2) more axes than one design's: a " *
+            "vectorized cut's value needs `position = k` to select draw k"))
+        dims = target.dims === nothing ?
+            [Tuple(view(sizes, :, i)) for i in axes(sizes, 2)] : target.dims
+        length(dims) == size(sizes, 2) || throw(DimensionMismatch(
+            "[query] the observation laws have $(size(sizes, 2)) indices, the " *
             "response $(length(dims))"))
-        return [PredictiveLaws(cells[i], dims[i]) for i in eachindex(dims)]
+        laws = PredictiveLaws[]
+        offset = 0
+        for i in axes(sizes, 2)
+            shape = Tuple(view(sizes, :, i))
+            n = prod(shape)
+            push!(laws, PredictiveLaws(_index_source(entry, offset, shape), dims[i]))
+            offset += n
+        end
+        return laws
     end
-    return PredictiveLaws(entry.laws, target.dims, indices)
+    indices = hasproperty(entry, :indices) ? entry.indices : nothing
+    return PredictiveLaws(entry, target.dims, indices)
+end
+
+# Index `i`'s columns of a response holding one array per index: its plate
+# cells, in place.
+function _index_source(entry, offset, shape)
+    columns(nt) = map(c -> reshape(view(c, offset+1:offset+prod(shape)), shape), nt)
+    law = map(columns, entry.law)
+    hasproperty(entry, :evidence) || return (; law)
+    return (; law, evidence = map(columns, entry.evidence))
 end
 
 """
+    predictive_draws(value, targets, rng; position = nothing) -> NamedTuple
     (q::PredictiveQuery)(u, rng) -> NamedTuple
 
-One posterior-predictive draw of every observation at the parameters `u`,
-keyed like `:pointwise` and shaped like the responses. Entries are drawn in
-order (column-major, then index by index for a response holding one array
-per index), so a seeded `rng` reproduces the draws, and passing a copy of
-one RNG at every posterior draw reuses one stream.
+One posterior-predictive draw of every observation, keyed like `:pointwise`
+and shaped like the responses, from the laws [`predictive_laws`](@ref) gives
+for `value`, `targets` and `position`. `q(u, rng)` draws at the parameters
+`u`. Entries are drawn in order (column-major, then index by index for a
+response holding one array per index), so a seeded `rng` reproduces the
+draws, and passing a copy of one RNG at every posterior draw reuses one
+stream.
 """
-function (q::PredictiveQuery)(u::AbstractVector, rng)
-    laws = predictive_laws(q, u)
-    names = keys(laws)
-    return NamedTuple{names}(map(k -> _draw(rng, laws[k], q.targets[k].eltype), names))
-end
+predictive_draws(value::NamedTuple, targets::NamedTuple, rng; position = nothing) =
+    _draws(rng, predictive_laws(value, targets; position), targets)
+(q::PredictiveQuery)(u::AbstractVector, rng) =
+    _draws(rng, predictive_laws(q, u), q.targets)
+
+_draws(rng, laws::NamedTuple, targets::NamedTuple) =
+    NamedTuple{keys(laws)}(map(k -> _draw(rng, laws[k], targets[k].eltype), keys(laws)))
 
 # An empty response draws nothing, and keeps its element type.
 _draw(rng, L::PredictiveLaws, T) = isempty(L) ? Array{T}(undef, size(L)) :
@@ -363,14 +520,19 @@ _draw(rng, L::PredictiveLaws, T) = isempty(L) ? Array{T}(undef, size(L)) :
 _draw(rng, L::AbstractVector{<:PredictiveLaws}, T) = [_draw(rng, Li, T) for Li in L]
 
 """
+    predictive_draws!(out::NamedTuple, value, targets, rng; position = nothing) -> out
     predictive_draws!(out::NamedTuple, q::PredictiveQuery, u, rng) -> out
 
-Draw every observation into `out` (a result of `q(u, rng)`, or arrays of the
-same shapes), reusing its storage.
+Draw every observation into `out` (a result of [`predictive_draws`](@ref) or
+`q(u, rng)`, or arrays of the same shapes), reusing its storage.
 """
-function predictive_draws!(out::NamedTuple, q::PredictiveQuery, u::AbstractVector,
-        rng)
-    laws = predictive_laws(q, u)
+predictive_draws!(out::NamedTuple, value::NamedTuple, targets::NamedTuple, rng;
+        position = nothing) =
+    _draws!(rng, out, predictive_laws(value, targets; position))
+predictive_draws!(out::NamedTuple, q::PredictiveQuery, u::AbstractVector, rng) =
+    _draws!(rng, out, predictive_laws(q, u))
+
+function _draws!(rng, out::NamedTuple, laws::NamedTuple)
     for k in keys(laws)
         _draw!(rng, getproperty(out, k), laws[k])
     end

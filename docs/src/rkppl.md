@@ -1283,6 +1283,42 @@ laws = predictive_laws(pred, u)        # lazy: laws.y[i] isa Distributions.Censo
   has the model's own `:pointwise` density at the observed value, at
   several parameter points.
 
+**In your own cut.** The law arguments are a graph value like any other:
+`predictive_node(built)` names it. WANT it in any cut of `built.spec`, or of
+a graph composed from it, beside other values and with any HAVE that
+determines it, and vectorize that cut over draws. A simulator whose random
+effects, interventions and design data are runtime inputs then draws
+observations from the same evaluation that computes its summaries:
+
+```julia
+node = predictive_node(built)
+targets = predictive_targets(built, design)   # each response's shape on the design
+graph = ReactiveKernels.compose(built.spec, summary)
+cut = ReactiveKernels.prepare(graph; have = (:unconstrained, :b, data_ports...),
+    want = (node, :summary))
+reader = ReactiveKernels.vectorize(cut; batched = (:unconstrained, :b))
+value, summaries = reader(U, B, data...)       # draws stacked on the last axis
+for k in axes(U, 2)
+    laws = predictive_laws(value, targets; position = k)        # draw k's laws
+    predictive_draws!(out, value, targets, rng; position = k)   # or its draws
+end
+```
+
+- `predictive_targets(built, design)` takes the binding the cut's data come
+  from (a fit, or a design that leaves the responses absent).
+  `predictive_laws(value, targets)` and `predictive_draws(value, targets,
+  rng)` read one evaluation's value; `position = k` reads draw `k` of a
+  vectorized cut's value, in place. `prepare_predictive(built, design)` is
+  this with HAVE `:unconstrained` and the design's data bound.
+- The value holds numbers only, one array per law argument, which is what
+  lets a vectorized cut stack it; its layout is otherwise not part of the
+  interface. With `vectorize(…; reuse = true)` the laws read the reader's
+  output buffers, so draw from them before its next call.
+- Pinned by `test_predictive_draws.jl` ("the law node in a caller's
+  vectorized cut", "ranged and per-index laws in a vectorized cut"): a
+  random-effect block as a runtime input of a composed cut, against
+  independent laws at every draw, with and without native scheduling.
+
 ### One cell of an observation
 
 `prepare_cell_query` evaluates ONE cell of the plates that observe the named

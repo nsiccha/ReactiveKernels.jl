@@ -355,7 +355,13 @@ caching bound data. The execution copy holds no provenance value either, so a
 capture-free operation table stays free of heap references that Enzyme would
 otherwise have to prove read-only in the differentiated callable. Bodies with
 local functions, generators, exception scopes, or boxed lexical cells retain
-Julia's native closure path. Private generated
+Julia's native closure path. A companion compiled while a package image is
+built, before the image's generated method is visible, is wrapped for a
+latest-world call. Once that method is visible, as in every process that loads
+the image, the execution copy holds the generated function itself, so a graph
+defined in a package image runs its cells as one built at run time does.
+Before then, preparation keeps the guarded closure, whose method query selects
+the native closure after loading. Private generated
 names in the derivative operand pack are canonicalized in that actual pack;
 the operands and their positional reads are unchanged. Construction, planning,
 and preparation still perform work, so reusing a build remains useful.
