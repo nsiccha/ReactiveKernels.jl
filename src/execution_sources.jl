@@ -30,7 +30,7 @@ Base.@nospecializeinfer function _execution_source(@nospecialize(xs::Tuple))
 end
 
 Base.@nospecializeinfer function _execution_source(@nospecialize(f::_KernelSourceFunction))
-    runtime = getfield(f, :runtime_f)
+    runtime = _execution_runtime(getfield(f, :runtime_f))
     # Julia retains ownership of local functions, generators, exception scopes
     # and boxed lexical cells; they have no generated-source companion.
     runtime === nothing && return f
@@ -39,6 +39,19 @@ Base.@nospecializeinfer function _execution_source(@nospecialize(f::_KernelSourc
     T = _ExecutableSourceFunction{typeof(runtime),typeof(captures),mod}
     _kernel_new_instance(T, (runtime, captures))
 end
+
+# A companion compiled while a package image is built, in the same world that
+# defines its generated method, is wrapped in `_PrecompileWarmFunction`. The
+# wrapper tests for image generation and keeps a latest-world call on every
+# invocation, so an execution copy holding it ran a dynamic call in every cell
+# of a plate from a package-defined graph (snag `generator-sum-in-862b7041`).
+# Once the method is visible, as in every process that loads the image, the
+# copy holds the generated function itself, as for a graph built at run time.
+# While it is not, keep the guarded closure; its method query selects the
+# native closure after loading.
+_execution_runtime(@nospecialize(f)) = f
+_execution_runtime(f::_PrecompileWarmFunction) =
+    applicable(RuntimeGeneratedFunctions.generated_callfunc, f.f) ? f.f : nothing
 
 _execution_source(op::_KernelSourceOp{nothing}) = op
 Base.@nospecializeinfer function _execution_source(@nospecialize(op::_KernelSourceOp))
