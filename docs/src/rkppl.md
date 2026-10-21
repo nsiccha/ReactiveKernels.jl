@@ -782,7 +782,11 @@ A cell runs once per index however many values it defines. Indexed outputs
 that share cell locals (`m = f(t[i], a); c[i] = m; r[i] = 2 .* m`), the
 components of a row output and computed observation arguments come from one
 RK plate whose cell runs those statements once and returns the values
-together; each output reads its own entry. A value reading only data keeps
+together; each output reads its own entry. A query runs only the statements
+of the values it reads: a value that no density reads, such as a derived
+`res[i] = (yin[i] .- m) ./ s` read only by `all_res = flatten(res)`, runs in a
+query of it and never in the sampler, its gradient or the pointwise and cell
+queries. A value reading only data keeps
 its own plate, which runs once when the query or sampler is prepared, and
 reads only the cell statements it needs: an output such as
 `wt[i] = 0.5 .* w[i]` beside outputs that read parameters is a data-only
@@ -934,6 +938,12 @@ one series per index, as in AR(1) errors per group:
 end
 ```
 
+A submodel may hold the scan and return the carried array. A per-cell call
+`y[g] ~ sm(…)` then observes `y[g]` exactly as the cell scan above, and a
+top-level call `y ~ sm(…)` observes `y` as a top-level scan does; each keeps
+its own loop-bound rules (a cell's bound may be data such as
+`length(mu[g])`).
+
 The densities enter `likelihood`, and `:pointwise` holds one density per
 entry; the observed array adds no coordinates. Latent and deterministic
 carried arrays may share the recurrence, such as a stochastic volatility
@@ -1016,7 +1026,12 @@ a local. The caller can read sampled and deterministic locals, including
 data-only definitions. Ordinary caller assignments cannot redefine them;
 explicit `merge` operations replace their declarations. Loop variables remain local
 to their loop. Per-cell calls support `theta[i].b` and the whole local array
-`theta.b`; their scalar-body restrictions still apply.
+`theta.b`. A per-cell body holds what a hand-written cell holds: `~` / `=`
+statements over bare names and `@scan` blocks. A returned carried array of a
+body `@scan` is the cell's per-index array `theta[i]`: observed in place when
+`theta` is data, exactly as the per-index cell scan below, and the latent
+trajectory per index otherwise. The scan's loop variable and step locals stay
+inside the scan.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_submodel_example()
@@ -1273,7 +1288,12 @@ supported forms). Its cost is then what one iteration costs, independent of the
 number of groups. A predictor computed through a module function call, or read
 whole elsewhere in the program, is still computed for every index.
 When the queried observations read one shared cell (two outputs of one loop),
-each observation's cell runs that shared cell at the same index.
+each observation's cell runs that shared cell at the same index. An output of
+an earlier `@plate for` loop that the observation reads at its own index
+(`pred[i]`) is computed at that index too, whatever law observes it: a
+`Normal` observation and a caller-owned law such as
+`y[i] .~ LogDensity.(score, pred[i], sigma)` both run that earlier loop's
+iteration `i` only.
 
 ```julia
 q = prepare_cell_query(built, plan, :y)          # or (:y, :z): one loop's observations

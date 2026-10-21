@@ -9,8 +9,8 @@ import Enzyme
 # `:pointwise`; reads of the array read the data. Oracles are independent
 # Distributions.jl recursions.
 
-build(program, data; observed = (:y,)) = begin
-    plan = lower_rkppl(program, data; conditioned = observed)
+build(program, data; observed = (:y,), mod = Main) = begin
+    plan = lower_rkppl(program, data; conditioned = observed, mod)
     bound = bind_data(plan, data)
     (; plan, bound, built = build_kernel(bound))
 end
@@ -174,6 +174,215 @@ end
         y = [series(n, g) for (g, n) in enumerate(lengths)],
         mu = [zeros(n) for n in lengths])).built.spec)
     @test shape([2, 3]) == shape([4, 1, 6, 2, 5, 3, 2])
+end
+
+# A submodel whose body holds the scan and returns its carried array
+# (rkppl-use §12): `y[g] ~ ar_gaps(…)` in a cell observes `y[g]` exactly as
+# the hand-written cell scan `y[g][t] ~ …` does. AR(1) errors over irregular
+# times: a gap of k steps has correlation phi^k.
+@rkppl ar_gaps(mu, sigma, phi, time) = begin
+    @scan begin
+        y[1] ~ Normal(mu[1], sigma / sqrt(1 - phi^2))
+        for t in 2:length(time)
+            k = time[t] - time[t - 1]
+            y[t] ~ Normal(mu[t] + phi^k * (y[t - 1] - mu[t - 1]),
+                sigma * sqrt((1 - phi^(2k)) / (1 - phi^2)))
+        end
+    end
+    return y
+end
+
+ar_gaps_call = quote
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    @plate for g in eachindex(y)
+        y[g] ~ ar_gaps(mu[g], sigma, phi, time[g])
+    end
+end
+ar_gaps_inline = quote
+    phi ~ Uniform(-1, 1)
+    sigma ~ Exponential(1)
+    @plate for g in eachindex(y)
+        @scan begin
+            y[g][1] ~ Normal(mu[g][1], sigma / sqrt(1 - phi^2))
+            for t in 2:length(time[g])
+                k = time[g][t] - time[g][t - 1]
+                y[g][t] ~ Normal(mu[g][t] + phi^k * (y[g][t - 1] - mu[g][t - 1]),
+                    sigma * sqrt((1 - phi^(2k)) / (1 - phi^2)))
+            end
+        end
+    end
+end
+
+gap_times(n, g) = cumsum([1.0 + mod(t + g, 3) for t in 1:n])
+
+@testset "a submodel's observed carried array, called per cell" begin
+    for lengths in ([3, 1, 5], [6, 2, 4, 1, 7, 3])
+        y = [series(n, g) for (g, n) in enumerate(lengths)]
+        mu = [[0.2g + 0.05t for t in 1:n] for (g, n) in enumerate(lengths)]
+        time = [gap_times(n, g) for (g, n) in enumerate(lengths)]
+        data = (; y, mu, time)
+        f = build(ar_gaps_call, data; mod = @__MODULE__)
+        twin = build(ar_gaps_inline, data)
+        @test coordinate_names(f.built.layout) == [:phi, :sigma]
+        oracle(u) = begin
+            phi = 2 / (1 + exp(-only(raw(f, u, :phi)))) - 1
+            ls = only(raw(f, u, :sigma)); sigma = exp(ls)
+            jac = log(2) + log(1 + phi) + log(1 - phi) - log(4) + ls
+            prior = logpdf(Uniform(-1, 1), phi) + logpdf(Exponential(1), sigma)
+            pw = map(y, mu, time) do yg, m, tg
+                [logpdf(Normal(m[1], sigma / sqrt(1 - phi^2)), yg[1]);
+                    [logpdf(Normal(m[t] + phi^(tg[t] - tg[t - 1]) * (yg[t - 1] - m[t - 1]),
+                        sigma * sqrt((1 - phi^(2(tg[t] - tg[t - 1]))) / (1 - phi^2))), yg[t])
+                        for t in 2:length(yg)]]
+            end
+            (; prior, likelihood = sum(sum, pw), jac, pointwise = pw)
+        end
+        check(f, oracle)
+        # The call expands into the hand-written cell scan: the same retained
+        # structure and the same posterior.
+        @test structure(f.built.spec) == structure(twin.built.spec)
+        q, qt = (prepare_query(x.built, x.bound, :sampler) for x in (f, twin))
+        for u in ([0.3, -0.2], [-1.1, 0.4])
+            @test Base.invokelatest(q, u) ≈ Base.invokelatest(qt, u) rtol = 1e-12
+        end
+    end
+end
+
+# The same rule at top level: a single observed series.
+@rkppl ar_steps(mu, sigma, phi) = begin
+    @scan begin
+        y[1] ~ Normal(mu[1], sigma / sqrt(1 - phi^2))
+        for t in 2:T
+            y[t] ~ Normal(mu[t] + phi * (y[t - 1] - mu[t - 1]), sigma)
+        end
+    end
+    return y
+end
+
+@testset "a submodel's observed carried array, called at top level" begin
+    called = quote
+        phi ~ Uniform(-1, 1)
+        sigma ~ Exponential(1)
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        m = a .+ b .* x
+        y ~ ar_steps(m, sigma, phi)
+    end
+    for n in (2, 9)
+        y, x = series(n), [0.3cos(t) for t in 1:n]
+        f = build(called, (; y, x); mod = @__MODULE__)
+        @test coordinate_names(f.built.layout) == [:phi, :sigma, :a, :b]
+        check(f, ar_oracle(f, y, x))
+        @test (:scan, 0) in structure(f.built.spec)
+    end
+end
+
+# Without data, the returned carried array is the latent trajectory per
+# index, as the hand-written per-index spelling `h[g][t] ~ …` is.
+@rkppl walk(phi, s, len) = begin
+    @scan begin
+        h[1] ~ Normal(0, 1)
+        for t in 2:len
+            h[t] ~ Normal(phi * h[t - 1], s)
+        end
+    end
+    return h
+end
+@rkppl scaled_walk(s, len) = begin
+    sc = 2 * s
+    @scan begin
+        h[1] ~ Normal(0, 1)
+        for t in 2:len
+            z ~ Normal(0, 1)
+            h[t] = h[t - 1] + sc * z
+        end
+    end
+    return h
+end
+
+@rkppl rebinding_walk(s, len) = begin
+    k = 2 * s
+    @scan begin
+        h[1] ~ Normal(0, 1)
+        for t in 2:len
+            k = h[t - 1]
+            h[t] ~ Normal(k, s)
+        end
+    end
+    return h
+end
+
+@testset "a submodel's latent carried array, called per cell" begin
+    data = (; y = [series(4), series(1), series(3, 2)])
+    pairs = (
+        (quote
+            phi ~ Normal(0, 0.7)
+            s ~ Exponential(1)
+            @plate for g in eachindex(y)
+                h[g] ~ walk(phi, s, length(y[g]))
+                y[g] .~ Normal.(h[g], 0.5)
+            end
+        end, quote
+            phi ~ Normal(0, 0.7)
+            s ~ Exponential(1)
+            @plate for g in eachindex(y)
+                @scan begin
+                    h[g][1] ~ Normal(0, 1)
+                    for t in 2:length(y[g])
+                        h[g][t] ~ Normal(phi * h[g][t - 1], s)
+                    end
+                end
+                y[g] .~ Normal.(h[g], 0.5)
+            end
+        end),
+        # A body local read by the scan, with non-centered steps. The call
+        # exposes the local per index (`h[g].sc`), so its twin is the
+        # indexed output `sc[g]`, which the cell's scan step reads.
+        (quote
+            s ~ Exponential(1)
+            @plate for g in eachindex(y)
+                h[g] ~ scaled_walk(s, length(y[g]))
+                y[g] .~ Normal.(h[g], 0.5)
+            end
+        end, quote
+            s ~ Exponential(1)
+            @plate for g in eachindex(y)
+                sc[g] = 2 * s
+                @scan begin
+                    h[g][1] ~ Normal(0, 1)
+                    for t in 2:length(y[g])
+                        z ~ Normal(0, 1)
+                        h[g][t] = h[g][t - 1] + sc[g] * z
+                    end
+                end
+                y[g] .~ Normal.(h[g], 0.5)
+            end
+        end))
+    # refused: single assignment (rkppl-use §9, §12 "a genuine
+    # redefinition") — the cell and its scan's step both bind `k`.
+    @test_throws SurfaceLoweringError build(quote
+        s ~ Exponential(1)
+        @plate for g in eachindex(y)
+            h[g] ~ rebinding_walk(s, length(y[g]))
+            y[g] .~ Normal.(h[g], 0.5)
+        end
+    end, data; mod = @__MODULE__)
+    for (called, inline) in pairs
+        f, twin = build(called, data; mod = @__MODULE__), build(inline, data)
+        @test f.built.layout.total == twin.built.layout.total
+        @test structure(f.built.spec) == structure(twin.built.spec)
+        sampler(x) = prepare_sampler(x.built, x.bound, zeros(x.built.layout.total);
+            backend = DI.AutoEnzyme(; mode = Enzyme.Reverse))
+        q, qt = sampler(f), sampler(twin)
+        for shift in (0.0, 0.3)
+            u = [0.1sin(i) + shift for i in 1:f.built.layout.total]
+            v, g = sampler_value_and_gradient!(q, similar(u), u)
+            vt, gt = sampler_value_and_gradient!(qt, similar(u), u)
+            @test v ≈ vt rtol = 1e-12
+            @test g ≈ gt rtol = 1e-10
+        end
+    end
 end
 
 @testset "observed and latent carried arrays share one recurrence" begin

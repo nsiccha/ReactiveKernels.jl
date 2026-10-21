@@ -7249,19 +7249,26 @@ function _expand_one_submodel(lhs::Symbol, callexpr::Expr, mod::Module,
     end
     _all_symbols!(used.used, ret)
     stream = _stream_response(sm, stmts, ret) !== nothing
+    # A returned carried array of a body `@scan` is a response pointer too:
+    # on a data LHS the scan writes the data name, as a hand-written observed
+    # scan does (§5 "Observing a carried array").
+    scan_return = ret isa Symbol && any(st -> _is_cell_scan_block(st) &&
+        ret in _scan_carried_arrays(st), stmts)
     # Shape compatibility (dots follow the callee): a data column is
     # vector-shaped, so it admits only a vectorized (stream) callee; a non-data
     # LHS binds a latent value.
     if lhs in data
-        stream || _sfail("`$lhs` is a data column, so `$(sm.name)` must be an " *
-            "observation-stream submodel: end its body by returning a `slot` " *
-            "that is the LHS of an internal `slot .~ family.(...)` response. " *
-            "`$(sm.name)` returns a value (latent) — use a non-data LHS.")
+        stream || scan_return || _sfail("`$lhs` is a data column, so " *
+            "`$(sm.name)` must be an observation-stream submodel: end its body " *
+            "by returning a `slot` that is the LHS of an internal " *
+            "`slot .~ family.(...)` response, or a carried array of an " *
+            "internal `@scan`. `$(sm.name)` returns a value (latent) — use a " *
+            "non-data LHS.")
         ret in _submodel_args(sm) && _sfail("stream submodel `$(sm.name)`: the " *
             "response slot `$ret` is an argument — the slot is a local name " *
             "the use-site data column replaces")
     end
-    observed = stream && lhs in data
+    observed = (stream || scan_return) && lhs in data
     # An observed slot binds to the data LHS. A generative slot retains
     # its private name beside every other binder in the call's namespace.
     keep = observed ? Dict{Symbol,Any}(ret => lhs) : Dict{Symbol,Any}()
@@ -7357,9 +7364,10 @@ end
 # non-centered transform (`z[i] ~ dist; col[i] = f(z[i])`), or a per-cell
 # observation stream (`col` a data column). No new IR: the inlined statements
 # reduce to the per-cell parameter / derived-cell / observation shapes the
-# primitive already supports. A cell is scalar, so a per-cell body holds
-# scalar `~` / `=` statements over bare names only (and per-cell submodel
-# calls, which expand per cell in turn: `col_w_b[i]`).
+# primitive already supports. A per-cell body holds what a hand-written cell
+# holds: `~` / `=` statements over bare names, `@scan` blocks (a returned
+# carried array is written `col[i][t]`, the per-index cell scan), and
+# per-cell submodel calls, which expand per cell in turn (`col_w_b[i]`).
 
 # A plate cell that is a per-cell submodel call `col[i] ~ sm(…)`: returns
 # `(colref, callexpr)` with `colref === Expr(:ref, col, i)`, else nothing. Only a
@@ -7462,62 +7470,111 @@ function _expand_cell_submodel(colref::Expr, callexpr::Expr, ivar::Symbol,
         _all_symbols!(used.used, st)
     end
     _all_symbols!(used.used, ret)
-    # A cell is scalar: a per-cell body holds scalar `~` / `=` statements over
-    # bare names (no indexed priors, plates or scans).
+    # A per-cell body holds what a hand-written cell holds: `~` / `=`
+    # statements over bare names and `@scan` blocks (no indexed priors or
+    # plates).
     for st in stmts
-        (st isa Expr && (_is_sample(st) || _is_broadcast_sample(st) ||
-            (st.head === :(=) && length(st.args) == 2)) &&
-            _stmt_lhs(st) isa Symbol) || _sfail(
+        (st isa Expr && (_is_cell_scan_block(st) ||
+            (_is_sample(st) || _is_broadcast_sample(st) ||
+                (st.head === :(=) && length(st.args) == 2)) &&
+            _stmt_lhs(st) isa Symbol)) || _sfail(
             "submodel `$(sm.name)` is called per cell (`$col[$ivar] ~ " *
-            "$(sm.name)(...)`), so its body holds scalar `~`/`=` statements " *
-            "over bare names; `$(repr(st))` is not one (call it at top level " *
-            "for plates, scans and sized priors)")
+            "$(sm.name)(...)`), so its body holds what a cell holds: `~`/`=` " *
+            "statements over bare names and `@scan` blocks; `$(repr(st))` is " *
+            "not one (call it at top level for plates and sized priors)")
     end
+    scans = filter(_is_cell_scan_block, stmts)
+    lines = filter(!_is_cell_scan_block, stmts)
+    # A returned carried array of a body `@scan` is the cell's per-index
+    # array `col[i]`, written `col[i][t]` as in the hand-written cell scan:
+    # observed in place on a data column, the latent trajectory otherwise.
+    scan_return = ret isa Symbol && any(s -> ret in _scan_carried_arrays(s), scans)
     # The direct-bound slot: a bare-Symbol return naming exactly one internal
     # statement, whose LHS binds to `col[i]`.
     slot = nothing
     if ret isa Symbol
-        hits = findall(st -> _stmt_lhs(st) === ret, stmts)
+        hits = findall(st -> _stmt_lhs(st) === ret, lines)
         length(hits) > 1 && _sfail("submodel `$(sm.name)`: return `$ret` names " *
             "more than one statement")
         isempty(hits) || (slot = first(hits))
     end
-    if col in data
-        (slot !== nothing && _is_dotted_obj(stmts[slot])) || _sfail(
+    if col in data && !scan_return
+        (slot !== nothing && _is_dotted_obj(lines[slot])) || _sfail(
             "`$col` is a data column, so `$(sm.name)` must be a per-cell " *
             "observation submodel: return a `slot` that is the LHS of an " *
-            "internal `slot ~ family.(...)` dotted response — `$(sm.name)` " *
+            "internal `slot ~ family.(...)` dotted response, or a carried " *
+            "array of an internal `@scan` — `$(sm.name)` " *
             "returns " *
             (slot === nothing ? "a value" :
-             _is_sample(stmts[slot]) ? "a scalar (latent) distribution" :
+             _is_sample(lines[slot]) ? "a scalar (latent) distribution" :
              "a derived assignment") *
             ", so use a non-data LHS.")
     end
-    latent_stream = col ∉ data && slot !== nothing && _is_dotted_obj(stmts[slot])
+    latent_stream = col ∉ data && slot !== nothing && _is_dotted_obj(lines[slot])
     argset = Set{Symbol}(_submodel_args(sm))
-    for st in stmts
+    for st in lines
         nm = _stmt_lhs(st)
         nm in argset && _sfail("submodel `$(sm.name)`: `$nm` is both an " *
             "argument and a local statement — rename the local")
     end
+    # A scan's loop variable and step locals live inside that scan.
+    scoped = Set{Symbol}()
+    foreach(s -> _scan_scoped_names!(scoped, s), scans)
+    outside = Set{Symbol}()
+    foreach(st -> _collect_binders!(outside, st), lines)
+    for s in scans, setup in _observed_scan_setups(s.args[end])
+        lhs = _observed_scan_lhs(setup)
+        lhs === nothing || _collect_lhs_binders!(outside, lhs)
+    end
+    clash = intersect(scoped, outside)
+    isempty(clash) || _sfail("submodel `$(sm.name)`: `$(first(sort!(collect(clash))))` " *
+        "is a `@scan` loop variable or step local and also a name of the cell " *
+        "— rename one of them")
     # A returned nested call keeps its own scope instead of claiming the
     # outer call's binding. The outer cell then reads that call's return.
-    if slot !== nothing && _is_sample(stmts[slot]) &&
-            _resolve_submodel(stmts[slot].args[3], sm.mod) !== nothing
+    if slot !== nothing && _is_sample(lines[slot]) &&
+            _resolve_submodel(lines[slot].args[3], sm.mod) !== nothing
         slot = nothing
     end
     # Build the substitution: args → call args; each internal name → its indexed
     # namespaced ref, except the direct-bound slot → `col[i]`.
-    keep = slot === nothing || latent_stream ? Dict{Symbol,Any}() :
-        Dict{Symbol,Any}(_stmt_lhs(stmts[slot]) => colref)
+    keep = scan_return ? Dict{Symbol,Any}(ret => colref) :
+        slot === nothing || latent_stream ? Dict{Symbol,Any}() :
+        Dict{Symbol,Any}(_stmt_lhs(lines[slot]) => colref)
     scope = _new_submodel_scope!(used, col; per_cell = true)
     submap = _submodel_substitution(sm, stmts, ret,
         callargs, data, _NsRoot(col, ivar, scope, used), keep)
+    # Scan-scoped names keep a bare private spelling, as in a hand-written
+    # cell scan; they are not per-index values, so the scope does not
+    # expose them (`col[i].t` names no local).
+    for nm in scoped
+        haskey(scope.locals, nm) || continue
+        submap[nm] = pop!(scope.locals, nm)
+    end
     out = Any[_hsubst(st, submap) for st in stmts]
     # Compound-return latent: bind `col[i]` to the substituted return value.
-    (slot === nothing || latent_stream) &&
+    (slot === nothing || latent_stream) && !scan_return &&
         push!(out, Expr(:(=), colref, _hsubst(ret, submap)))
     return sm, out
+end
+
+# The carried arrays of a `@scan` block: the arrays its seeds write.
+_scan_carried_arrays(st) = Symbol[lhs.args[1]
+    for lhs in (_observed_scan_lhs(s) for s in _observed_scan_setups(st.args[end]))
+    if Meta.isexpr(lhs, :ref) && length(lhs.args) >= 2 && lhs.args[1] isa Symbol]
+
+# The names a `@scan` block binds inside its loop: the loop variable and the
+# step locals (`k = …`, `z ~ …`).
+function _scan_scoped_names!(out::Set{Symbol}, st)
+    for s in st.args[end].args
+        Meta.isexpr(s, :for, 2) || continue
+        _collect_iter_binders!(out, s.args[1])
+        for b in s.args[2].args
+            lhs = _observed_scan_lhs(b)
+            lhs isa Symbol && push!(out, lhs)
+        end
+    end
+    return out
 end
 
 # Value-position symbols (call heads and dotted function names excluded):
