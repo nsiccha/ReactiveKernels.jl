@@ -3287,15 +3287,28 @@ Base.@nospecializeinfer function _lower_plate_shared_branch_arms!(
     body
 end
 
-function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots)
+# `recycled`: the lane slot of the recipe's value (`_lower_authored_plate_loop_native!`),
+# which a scan, dotted call or slice fills instead of allocating.
+function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
+                                     recycled = nothing)
     if recipe.op isa _AuthoredScanOp
         _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
-                                     slots.type_offset)
+                                     slots.type_offset, recycled)
+    elseif recipe.op isa _KernelSourceOp && recipe.op.f isa _KernelBranch
+        push!(body.args, Expr(:(=), out,
+            _native_plate_branch_expr(recipe.op.f, :(getfield($operation, :f)), args)))
     else
-        value = recipe.op isa _KernelSourceOp && recipe.op.f isa _KernelBranch ?
-            _native_plate_branch_expr(recipe.op.f, :(getfield($operation, :f)), args) :
-            Expr(:call, operation, args...)
-        push!(body.args, Expr(:(=), out, value))
+        # The destination form reads each argument where its source does, so
+        # evaluate the cell's argument expressions once, as the call would.
+        names = Any[gensym(:plate_lane_argument) for _ in args]
+        destination = recycled === nothing ? nothing :
+            _lane_source_expr(recipe, names, recycled)
+        if destination === nothing
+            push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
+        else
+            append!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
+            push!(body.args, Expr(:(=), out, destination))
+        end
     end
     body
 end
@@ -3782,13 +3795,32 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         !isempty(roots) && _authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues))
     sliced_scans = Set(first(pair) for pair in values(slices))
+    # Within a lowering that collects cell slots (a position residual), each
+    # destination-form value these recipes produce other than the cell's
+    # result keeps a lane slot across cells, as a nested-bearing cell's own
+    # values do (`_plate_nested_native!`).
+    cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
+    slotted = Pair{Int,Symbol}[]
+    if cell_slots !== nothing
+        emitted = Set(i for (_, indices) in groups for i in indices)
+        excluded = Set(canon_id(inner.graph, v.id) for v in vcat(inner.want, inner.have))
+        for i in _lane_slot_recipes(inner, excluded)
+            i in emitted && !haskey(lane_arms, i) && !(i in sliced_scans) &&
+                !haskey(slices, i) || continue
+            push!(slotted, i => gensym(Symbol(only(inner.recipes[i].outputs).name,
+                                              :_cell_slot)))
+        end
+        append!(cell_slots, (last(pair) for pair in slotted))
+    end
+    slot_of(i) = (k = findfirst(pair -> first(pair) == i, slotted);
+                  k === nothing ? nothing : last(slotted[k]))
     # A scan read only through one slice is emitted where that slice is read
     # (`_lower_authored_scan_slice_native!`).
     function lower_recipe!(block, recipe_index, args, out, operation, looped)
         recipe_index in sliced_scans && return block
         haskey(slices, recipe_index) || return _lower_plate_recipe_native!(
             block, inner.recipes[recipe_index], args, out, operation,
-            get(scan_offsets, recipe_index, nothing))
+            get(scan_offsets, recipe_index, nothing); recycled = slot_of(recipe_index))
         scan_index, demand = slices[recipe_index]
         scan_recipe = inner.recipes[scan_index]
         scan_args = Any[_authored_plate_scalar_ref(
@@ -3864,8 +3896,6 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         append!(loopbody.args,
             _embedded_statements(nested.ast, [args; nested.slots; input_types],
                                  nested_result, nested.offset))
-        isempty(nested.slots) || push!(loopbody.args, :($nested_result =
-            $(GlobalRef(@__MODULE__, :_lane_release!))($nested_result, $(nested.slots...))))
     end
     # A lane branch with arm graphs is inlined with first-use shared work
     # (`_plate_lane_arm_slots!`); its flags and shared locals are declared
@@ -3913,6 +3943,15 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     scalar_result = nested === nothing ? _authored_plate_scalar_ref(
         inner, locals, callargs, callvalues, prepared_arguments, atomic,
         only(inner.want), index, true) : nested_result
+    # The result leaves the cell: it takes any slot buffer it shares memory
+    # with or holds (`_lane_release!`).
+    released = Symbol[(nested === nothing ? Symbol[] : nested.slots); last.(slotted)]
+    if !isempty(released)
+        result = gensym(:plate_cell_result)
+        push!(loopbody.args, :($result = $(GlobalRef(@__MODULE__, :_lane_release!))(
+            $scalar_result, $(released...))))
+        scalar_result = result
+    end
     # The pointwise buffer has the plate's axes (allocated or recycled for
     # `output_axes`), so this store is in bounds, as the dose-outer passes
     # (`_lower_plate_reduction_native`) already assume.
@@ -3947,8 +3986,9 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # than branching beside it, so the cell body is emitted once. Expand
     # before an embedded kernel renames locals: late macro expansion can
     # interpret its renamed index as a module global.
+    # A cell that fills lane slots carries state from one cell to the next.
     if accumulator !== nothing && pointwise_lhs === nothing && total_fold === sum &&
-            !has_scheduled_groups && nested === nothing &&
+            !has_scheduled_groups && nested === nothing && isempty(released) &&
             all(r -> !r.effectful, inner.recipes)
         linear = gensym(:plate_linear)
         simd_body = Expr(:block,
@@ -4338,20 +4378,23 @@ function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = no
 end
 const _CELL_SLOTS = :ReactiveKernels_cell_slots
 
-# The values of `p` that keep a lane slot: each single-output recipe value with
-# a destination form (`_replicated_lane_producer`) other than an `excluded` id.
-function _lane_slot_values(p::Plan, excluded)
-    values = Value[]
-    for r in p.recipes
+# The positions in `p.recipes` of the recipes whose value keeps a lane slot:
+# each single-output producer with a destination form
+# (`_replicated_lane_producer`) of a value other than an `excluded` id.
+function _lane_slot_recipes(p::Plan, excluded)
+    positions = Int[]
+    for (position, r) in enumerate(p.recipes)
         length(r.outputs) == 1 || continue
         cid = canon_id(p.graph, only(r.outputs).id)
         cid in excluded && continue
         get(p.producer, cid, nothing) === r || continue
         _replicated_lane_producer(r) || continue
-        push!(values, only(r.outputs))
+        push!(positions, position)
     end
-    values
+    positions
 end
+_lane_slot_values(p::Plan, excluded) =
+    Value[only(p.recipes[position].outputs) for position in _lane_slot_recipes(p, excluded)]
 
 function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
                          inline_embedded::Bool = true,
