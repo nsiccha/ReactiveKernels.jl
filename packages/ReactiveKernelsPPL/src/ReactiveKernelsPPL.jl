@@ -77,6 +77,8 @@ export prepare_query, prepare_sampler, SamplerQuery, sampler_value_and_gradient!
 export QueryAD, prepare_query_ad
 export prepare_cell_query, CellQuery, prepare_cell_sampler, CellSampler, cell_value_and_gradient!
 export prepare_compact_cell_sampler, CompactCellSampler
+export prepare_predictive, PredictiveQuery, PredictiveLaws, predictive_laws, predictive_draws!,
+    predictive_draws, predictive_node, predictive_targets
 export restore_draws
 export sampling_logdensity, sampling_geometry, sampling_fragment, LogDensity, ParameterGeometry
 export RKPPLModel, RKPPLBoundModel, RKPPLSubmodel, lower_rkppl, condition, @rkppl, SurfaceLoweringError
@@ -97,6 +99,7 @@ include("preprocessing.jl")
 include("generator.jl")
 include("arrays.jl")
 include("query.jl")
+include("predictive.jl")
 include("display.jl")
 include("distribution_defaults.jl")
 include("surface.jl")

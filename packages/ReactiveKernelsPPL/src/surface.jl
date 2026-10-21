@@ -318,7 +318,8 @@ kernel_expr(m::_PlanSource, layout::LayoutTable; kwargs...) =
     kernel_expr(_bound_plan(m), layout; kwargs...)
 assign_layout(m::_PlanSource) = assign_layout(_bound_plan(m))
 for prepare in (:prepare_query, :prepare_sampler, :prepare_cell_query,
-                :prepare_cell_sampler, :prepare_compact_cell_sampler)
+                :prepare_cell_sampler, :prepare_compact_cell_sampler, :prepare_predictive,
+                :predictive_targets)
     @eval $prepare(built, m::_PlanSource, args...; kwargs...) =
         $prepare(built, _bound_plan(m), args...; kwargs...)
 end
