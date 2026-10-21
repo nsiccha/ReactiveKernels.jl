@@ -311,7 +311,7 @@ end
 # ── data validation ──────────────────────────────────────────────────
 
 function _validate_array_parameters_data(plan::StructuralPlan)
-    known = union(Set{Symbol}(_all_names(plan)), Set{Symbol}(keys(plan.columns)))
+    known = union(_all_name_set(plan), Set{Symbol}(keys(plan.columns)))
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         p.family === :external && continue
@@ -589,9 +589,11 @@ end
 # Julia value too: readable by position, and per observation along an axis
 # its expression carries (`b = z * (sd .* L)'` keeps `z`'s `levels(g)`
 # rows, so `b[g, 1]` reads each observation's level).
-_is_array_assignment(plan::StructuralPlan, name) =
-    name isa Symbol && any(a -> a.name === name && _mentions_array(a.expr, plan; opaque=true),
-        plan.assignments)
+_is_array_assignment(plan::StructuralPlan, name) = name isa Symbol &&
+    _structural(plan, (:is_array_assignment, name); columns = :none) do
+        any(a -> a.name === name && _mentions_array(a.expr, plan; opaque=true),
+            plan.assignments)
+    end
 
 # ── axes of array values ─────────────────────────────────────────────
 
@@ -611,6 +613,14 @@ _is_array_assignment(plan::StructuralPlan, name) =
 _value_axes(plan::StructuralPlan, ex, seen::Set{Symbol} = Set{Symbol}();
         data_axes::Bool = false, throw_conflicts::Bool = false) =
     _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts))
+# A name's declared axes read the structure alone: once per structure.
+_value_axes(plan::StructuralPlan, ex::Symbol, seen::Set{Symbol} = Set{Symbol}();
+        data_axes::Bool = false, throw_conflicts::Bool = false) =
+    data_axes || !isempty(seen) ?
+        _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts)) :
+        _structural(plan, (:value_axes, ex, throw_conflicts); columns = :none) do
+            _declared_dims(_value_metadata(plan, ex, seen; data_axes, throw_conflicts))
+        end
 
 _metadata_axis(d::Int) = d >= 0 ? d : _OS.SymbolicAxis(d)
 _metadata_axis(::Nothing) = nothing
@@ -894,16 +904,18 @@ _is_position(i) = _is_scalar_position(i) || i === :(:)
 # evaluates into a column.
 _is_row_index(plan::StructuralPlan, i) =
     i isa Symbol && i !== :(:) && !_is_endpoint(i) &&
-    !_is_array_param(plan, i) &&
-    (!(i in _union_names(plan)) || _is_data_only_assignment(plan, i))
+    _structural(plan, (:is_row_index, i); columns = :none) do
+        !_is_array_param(plan, i) &&
+            (!(i in _union_name_set(plan)) || _is_data_only_assignment(plan, i))
+    end
 _is_data_only_assignment(plan::StructuralPlan, i::Symbol) =
     any(a -> a.name === i, plan.assignments) &&
-    _reads_data_only(plan, i, Set{Symbol}(_all_names(plan)), Set{Symbol}())
+    _reads_data_only(plan, i, _all_name_set(plan), Set{Symbol}())
 # In a model-level definition, a gather by a data index is ordinary Julia
 # indexing with a model-level result, so naming the definition never
 # changes its legality.
 _model_level_gather(plan::StructuralPlan, g) = g isa Symbol &&
-    _reads_data_only(plan, g, Set{Symbol}(_all_names(plan)), Set{Symbol}())
+    _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}())
 
 # Index forms of `A[...]` over an array parameter `A`:
 # `:scalar` (every index a literal Int), `:slice` (literal Ints and `:`),
@@ -949,7 +961,7 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "gathers from the $(length(axs))-axis array value $base with " *
             "$(length(idx)) indices. Give one index per axis or one " *
             "linear index")
-        _reads_data_only(plan, g, Set{Symbol}(_all_names(plan)), Set{Symbol}()) ||
+        _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
             _fail(label, "`$(repr(ex))` gather index $g must be data")
         push!(refs, base)
         if bound
@@ -986,7 +998,7 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
             "`$(repr(ex))` gathers from the LKJCholesky factor $(base)")
         axis = _gather_index_axis(plan, ex)
         g = ex.args[1 + axis]
-        _reads_data_only(plan, g, Set{Symbol}(_all_names(plan)), Set{Symbol}()) ||
+        _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
             _fail(label, "`$(repr(ex))` gather index $g must be data")
         bound && _validate_gather_axis(plan, p.name, label, p.dims[axis], g)
     elseif bound
@@ -1073,13 +1085,13 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
     ex isa LineNumberNode && return nothing
     ex isa GlobalRef && return nothing  # a module constant
     if ex isa Symbol
-        (_is_array_param(plan, ex) || ex in _union_names(plan)) &&
+        (_is_array_param(plan, ex) || ex in _union_name_set(plan)) &&
             return push!(refs, ex)
         # Whole-value data have no observation axis. An array definition
         # retained by lowering reads these as bound operands, just like a
         # scalar assignment or an undotted module call.
         bound && haskey(plan.columns, ex) &&
-            ex in first(_bound_model_level_inputs(plan)) && return nothing
+            ex in _bound_model_level_input_set(plan) && return nothing
         _is_derived(plan, ex) && _fail(label, "derived column $ex is " *
             "per-observation — it does not combine with arrays here")
         bound && haskey(plan.columns, ex) && _fail(label, "column $ex is " *
@@ -1151,7 +1163,7 @@ function _is_data_matvec(ex, plan::StructuralPlan)
         ex.args[1] === :* || return false
     B, w = ex.args[2], ex.args[3]
     rows = (B isa Symbol && !_is_array_param(plan, B) &&
-            !(B in _union_names(plan)) &&
+            !(B in _union_name_set(plan)) &&
             (!_is_derived(plan, B) || _is_bind_data_derived(plan, B))) ||
         _is_row_gather(plan, B)
     return rows && _mentions_array(w, plan)
