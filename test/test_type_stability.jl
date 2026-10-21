@@ -216,6 +216,16 @@ end
     total::Float64 = sum(subtotals)
     return total
 end
+
+# A scan step whose lazy arm calls the helper.
+@kernel step_arm(a::Float64, kinds::Vector{Int}, xs::Vector{Float64}) = begin
+    path = scan(kinds, xs; init = 0.0) do carry, kind, x
+        next = kind == 2 ? uninferred_curve(x, a) : carry + x
+        (next, next)
+    end
+    total::Float64 = sum(path)
+    return total
+end
 end # module Uninferred
 
 const C = Corpus
@@ -307,6 +317,9 @@ uninferred_warning(name) = (:warn, Regex("`$name` is not concretely typed"))
 
     # A cell's uninferred result is named with the plate that encloses it.
     @test_logs (:warn, r"The cell value of `mus` is not concretely typed.*uninferred_curve\(ti, a\)") prepare(U.subject_cells)
+
+    # A scan step's uninferred value is named with the scan that encloses it.
+    @test_logs (:warn, r"`next` in the body of `path` is not concretely typed.*uninferred_curve\(x, a\)") prepare(U.step_arm)
 end
 
 end # module
