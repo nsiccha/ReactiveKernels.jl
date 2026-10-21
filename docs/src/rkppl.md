@@ -935,6 +935,12 @@ one series per index, as in AR(1) errors per group:
 end
 ```
 
+A submodel may hold the scan and return the carried array. A per-cell call
+`y[g] ~ sm(…)` then observes `y[g]` exactly as the cell scan above, and a
+top-level call `y ~ sm(…)` observes `y` as a top-level scan does; each keeps
+its own loop-bound rules (a cell's bound may be data such as
+`length(mu[g])`).
+
 The densities enter `likelihood`, and `:pointwise` holds one density per
 entry; the observed array adds no coordinates. Latent and deterministic
 carried arrays may share the recurrence, such as a stochastic volatility
@@ -1017,7 +1023,12 @@ a local. The caller can read sampled and deterministic locals, including
 data-only definitions. Ordinary caller assignments cannot redefine them;
 explicit `merge` operations replace their declarations. Loop variables remain local
 to their loop. Per-cell calls support `theta[i].b` and the whole local array
-`theta.b`; their scalar-body restrictions still apply.
+`theta.b`. A per-cell body holds what a hand-written cell holds: `~` / `=`
+statements over bare names and `@scan` blocks. A returned carried array of a
+body `@scan` is the cell's per-index array `theta[i]`: observed in place when
+`theta` is data, exactly as the per-index cell scan below, and the latent
+trajectory per index otherwise. The scan's loop variable and step locals stay
+inside the scan.
 
 ```@eval
 Main.ReactiveKernelsDocs.render_rkppl_submodel_example()

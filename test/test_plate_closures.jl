@@ -639,3 +639,35 @@ end
     @test value ≈ sum(-0.5 .* z .^ 2 .- log_sigma)
     @test gradient ≈ sum(z .^ 2 .- 1)
 end
+
+# A cell local named like a kernel value: the step closure and the `map`
+# closure read the cell's local, as Julia closures do, not the kernel value of
+# that name that the plate itself computes (a self-dependency otherwise).
+@kernel _closure_shadowing_local(groups, w::Vector{Float64}) = begin
+    cells = plate(groups) do g
+        rate = w[1] * length(g)
+        trajectory = scan(g; init = 0.0) do carry, x
+            next = carry * w[2] + x * rate
+            (next, next)
+        end
+        scaled = map(x -> x * rate, g)
+        (rate, sum(trajectory; init = 0.0) + sum(scaled; init = 0.0))
+    end
+    rate = plate(cells) do c
+        c[1]
+    end
+    totals = plate(cells) do c
+        c[2]
+    end
+    total::Float64 = sum(totals) + sum(rate)
+end
+
+@testset "a closure reads its cell's local, not a kernel value of that name" begin
+    groups, w = [[1.0, 2.0, 3.0], Float64[], [0.5]], [0.5, 0.25]
+    expected = sum(groups) do g
+        rate = w[1] * length(g)
+        trajectory = accumulate((c, x) -> c * w[2] + x * rate, g; init = 0.0)
+        rate + sum(trajectory; init = 0.0) + sum(g .* rate; init = 0.0)
+    end
+    @test prepare(_closure_shadowing_local)(groups, w) ≈ expected
+end
