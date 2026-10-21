@@ -191,7 +191,9 @@ end
 
 @testset "an elided location alias leaves same-named cell parameters alone" begin
     # The scalar priors' cell binds `value, location, scale`; eliding the
-    # authored `location = value` must not rename those parameters.
+    # response's own `y_eta = location` must not rename those parameters.
+    # The authored `location = value` stays a node under its own name
+    # (rkppl-use §14).
     y3 = y[1:3]
     model = quote
         a ~ Normal(0, 1)
@@ -202,7 +204,8 @@ end
     end
     bound = _bound(model, (; y = y3))
     text = _text(bound)
-    @test !occursin("location = value", text)
+    @test occursin("location = value", text)
+    @test occursin("plate(y, location) do y, location", text)
     @test occursin("do value, location, scale", text)
     @test occursin("(normal(location, scale)).logpdf(value)", text)
     built = build_kernel(bound)
@@ -217,6 +220,10 @@ end
         prepare_sampler(built, bound, u; backend = BACKEND), grad, u)
     @test value ≈ oracle(u) rtol = 1e-12
     @test grad ≈ [r[1] + r[3] - u[1], r[2] + r[3] - u[2]] rtol = 1e-10
+    location = Base.invokelatest(ReactiveKernels.prepare(built.spec;
+        have = built.spec.have_names, want = (:location,),
+        bound = NamedTuple(k => v for (k, v) in bound.columns)), u)
+    @test location ≈ mean(u) rtol = 1e-12
 
     subst(ex, map) = Base.remove_linenums!(ReactiveKernelsPPL._hsubst(
         ex, Dict{Symbol,Any}(map); shadow = true))

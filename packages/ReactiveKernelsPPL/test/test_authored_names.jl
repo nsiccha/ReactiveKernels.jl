@@ -15,6 +15,14 @@ const X = [0.1, -0.3, 0.5, 1.2]
 const G = [1, 2, 1, 2]
 const COUNTS = [1, 0, 3, 2]
 
+# A submodel returning its design's product, as BRM's population effects do.
+@rkppl design_effects(D, K) = begin
+    beta[1:K] .~ Normal.(0, 1)
+    return D * beta
+end
+# The design matrix with a column computed from a sampled `t`.
+live_design(t) = hcat(ones(length(X)), X .* exp(t))
+
 query(built, bound, name, u) = Base.invokelatest(ReactiveKernels.prepare(built.spec;
     have = built.spec.have_names, want = (name,),
     bound = NamedTuple(k => v for (k, v) in bound.columns)), u)
@@ -75,6 +83,50 @@ const CASES = [
             mu = Xm * b
             y .~ Normal.(mu, s)
         end), values = nt -> (; mu = hcat(X, X .^ 2) * nt.b)),
+    # A product over a design the graph computes is one value, not a design
+    # term; the definition holding it keeps its name.
+    (label = "location over a computed design", data = (; x = X), obs = (; y = Y),
+        model = @rkppl(begin
+            t ~ Normal(0, 1); s ~ Exponential(1)
+            Xm = hcat(ones(length(x)), x .* exp(t))
+            b[axes(Xm, 2)] .~ Normal.(0, 1)
+            mu = Xm * b
+            y .~ Normal.(mu, s)
+        end), values = nt -> (; mu = live_design(nt.t) * nt.b)),
+    (label = "alias of a submodel's computed-design product", data = (; x = X),
+        obs = (; y = Y),
+        model = @rkppl(begin
+            t ~ Normal(0, 1); s ~ Exponential(1)
+            Xm = hcat(ones(length(x)), x .* exp(t))
+            pop ~ design_effects(Xm, 2)
+            mu = pop
+            y .~ Normal.(mu, s)
+        end), values = nt -> (; mu = live_design(nt.t) * nt.pop.beta)),
+    (label = "alias of a submodel's inline-design product", data = (; x = X),
+        obs = (; y = Y),
+        model = @rkppl(begin
+            s ~ Exponential(1)
+            pop ~ design_effects(hcat(ones(length(x)), x), 2)
+            mu = pop
+            y .~ Normal.(mu, s)
+        end), values = nt -> (; mu = hcat(ones(length(X)), X) * nt.pop.beta)),
+    (label = "scale over a computed design", data = (; x = X), obs = (; y = Y),
+        model = @rkppl(begin
+            a ~ Normal(0, 1); t ~ Normal(0, 1)
+            Xm = hcat(ones(length(x)), x .* exp(t))
+            b[axes(Xm, 2)] .~ Normal.(0, 1)
+            lsd = Xm * b
+            y .~ Normal.(a, exp.(lsd))
+        end), values = nt -> (; lsd = live_design(nt.t) * nt.b)),
+    (label = "link-scale location over a computed design", data = (; x = X),
+        obs = (; y = COUNTS),
+        model = @rkppl(begin
+            t ~ Normal(0, 1)
+            Xm = hcat(ones(length(x)), x .* exp(t))
+            b[axes(Xm, 2)] .~ Normal.(0, 1)
+            eta = Xm * b
+            y .~ Poisson.(exp.(eta))
+        end), values = nt -> (; eta = live_design(nt.t) * nt.b)),
     (label = "composed location and its sub-predictor", data = (; x = X), obs = (; y = Y),
         model = @rkppl(begin
             a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1)
@@ -131,6 +183,41 @@ const CASES = [
             @test coordinate_names(built.layout) == coordinate_names(plain_built.layout)
             @test density(built, bound, u) == density(plain_built, plain, u)
         end
+    end
+end
+
+@testset "a location over a covariate completed from a sampled value" begin
+    # The covariate's missing entry is sampled; the completed column is
+    # standardized by its observed entries, which a second response
+    # observes, and enters the design a submodel multiplies.
+    m = @rkppl begin
+        s ~ Exponential(1)
+        z[1:1] .~ LogNormal.(0.5, 0.6)
+        xc = xpart .+ mask .* z[lookup]
+        xs = (xc .- mean(xfit)) ./ std(xfit)
+        Xm = hcat(ones(length(xpart)), xs)
+        pop ~ design_effects(Xm, 2)
+        mu = pop
+        xfit .~ LogNormal.(0.5, 0.6)
+        y .~ Normal.(mu, s)
+    end
+    xfit = [1.2, 2.1, 0.8]
+    data = (; xpart = [1.2, 0.0, 2.1, 0.8], mask = [0.0, 1.0, 0.0, 0.0],
+        lookup = [1, 1, 1, 1])
+    bound = m(; data...) | (; y = Y, xfit)
+    built = build_kernel(bound)
+    @test haskey(built.spec.ports, :mu)
+    for u in (collect(range(-0.4, 0.5; length = built.layout.total)),
+            [0.3, -0.2, 0.7, -0.5])
+        nt = constrain(built.layout, u)
+        xs = (data.xpart .+ data.mask .* nt.z[data.lookup] .- mean(xfit)) ./ std(xfit)
+        mu = hcat(ones(4), xs) * nt.pop.beta
+        @test query(built, bound, :mu, u) ≈ mu rtol = 1e-12
+        prior = logpdf(Exponential(1), nt.s) + logpdf(LogNormal(0.5, 0.6), only(nt.z)) +
+            sum(logpdf.(Normal(0, 1), nt.pop.beta))
+        likelihood = sum(logpdf.(LogNormal(0.5, 0.6), xfit)) + sum(logpdf.(Normal.(mu, nt.s), Y))
+        @test Base.invokelatest(prepare_query(built, bound, :prior), u) ≈ prior rtol = 1e-12
+        @test Base.invokelatest(prepare_query(built, bound, :likelihood), u) ≈ likelihood rtol = 1e-12
     end
 end
 

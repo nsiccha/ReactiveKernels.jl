@@ -11024,11 +11024,17 @@ function _extract_summand(pname, core, sign::Int, ctx)
 end
 
 # Whether a predictor analysis found no coefficient structure: its only
-# term is one column `_extract_column` extracted whole, so the analyzed
-# definition's value is that column.
+# term is one column `_extract_column` extracted whole, or a composition
+# that is one leaf extracted whole (`mu = X * b` over a computed design
+# reads `_rkppl_leaf_k = X * b`), so the analyzed definition's value is
+# that column or leaf.
 function _whole_value_terms(terms, ctx)
-    length(terms) == 1 && only(terms).kind === OffsetTerm || return false
-    columns = only(terms).columns
+    length(terms) == 1 || return false
+    term = only(terms)
+    term.kind === ComposedTerm && return term.options.tree isa Symbol &&
+        term.options.tree in values(ctx.leaf_exprs)
+    term.kind === OffsetTerm || return false
+    columns = term.columns
     length(columns) == 1 || return false
     return any(d -> d.name === only(columns), ctx.synth_derived)
 end
