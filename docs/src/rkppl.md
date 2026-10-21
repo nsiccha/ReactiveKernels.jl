@@ -1207,7 +1207,12 @@ supported forms). Its cost is then what one iteration costs, independent of the
 number of groups. A predictor computed through a module function call, or read
 whole elsewhere in the program, is still computed for every index.
 When the queried observations read one shared cell (two outputs of one loop),
-each observation's cell runs that shared cell at the same index.
+each observation's cell runs that shared cell at the same index. An output of
+an earlier `@plate for` loop that the observation reads at its own index
+(`pred[i]`) is computed at that index too, whatever law observes it: a
+`Normal` observation and a caller-owned law such as
+`y[i] .~ LogDensity.(score, pred[i], sigma)` both run that earlier loop's
+iteration `i` only.
 
 ```julia
 q = prepare_cell_query(built, plan, :y)          # or (:y, :z): one loop's observations

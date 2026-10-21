@@ -914,7 +914,14 @@ these producers:
 - a product `A * W` with an array input as its left factor (row `r` is
   `A[r:r, :] * W`). A matrix-vector product `X * beta` (a matrix input and a
   vector input) can be read like any other value; other products only by
-  gathers `R[g, k]`, since their full shape is not known before they run.
+  gathers `R[g, k]`, since their full shape is not known before they run;
+- an authored plate. Row `r` of its value is the plate over row `r` of each
+  batched argument, so the cell runs that plate's body at row `r` only. A
+  shared array the plate reads only at its own position, `u[j]` with `j` an
+  integer element of one of its batched arguments, is in turn computed at that
+  row by these rules. So a later plate reading `pred[i]` from
+  `pred = plate(rows) do r; f(log_k[r]) end` computes `pred` and `log_k` at
+  row `i` only.
 
 The producer's own operation runs on one-row views of its row-aligned
 operands; an operand that broadcasting extrudes is passed whole. A value it
