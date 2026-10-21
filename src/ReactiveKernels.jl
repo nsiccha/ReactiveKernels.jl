@@ -69,7 +69,7 @@ include("expm_rule.jl")
 include("symmetric_eigen_rules.jl")
 include("affine_logistic.jl")
 include("cholesky.jl")
-include("native_bdf.jl")
+include("native_ode.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export PreparedADOperator, PreparedADPushforward, PreparedADHVP
@@ -84,7 +84,7 @@ export DerivativeRule, derivative_rule, forward_cut, reverse_cut, reverse_residu
 export rk_expm, rk_symmetric_eigvals, rk_symmetric_eigvecs
 export rk_affine_logistic
 export rk_cholesky_lower
-export rk_ode_bdf_tol
+export rk_ode_bdf_tol, rk_ode_rk45_tol
 export has_forward_branch, has_reverse_branch, rule_inputs
 export stage_primal, stage_reverse, stage_residuals
 export ad_value_and_pullback, ad_value_and_pullback!

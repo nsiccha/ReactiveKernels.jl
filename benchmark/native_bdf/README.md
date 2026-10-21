@@ -1,9 +1,10 @@
 # Native BDF implementation experiments
 
 The user selected Julia's standard BDF implementation on 2026-10-04. The
-generic numerical bridge now lives in `ext/ReactiveKernelsBDFExt.jl` as
-`ReactiveKernels.rk_ode_bdf_tol`, delegating to `OrdinaryDiffEqBDF.FBDF()`.
-Its public acceptance is `test/test_native_bdf.jl`. The CVODE experiments below
+generic numerical bridge is `ReactiveKernels.rk_ode_bdf_tol`, delegating to
+`OrdinaryDiffEqBDF.FBDF()` through the adapter in
+`ext/ReactiveKernelsSciMLODEExt.jl` that `rk_ode_rk45_tol` shares.
+Its public acceptance is `test/test_native_ode.jl`. The CVODE experiments below
 are preserved research; their solver-selection recommendation is superseded.
 The compatibility signature does not require consumers to retain old helper
 layouts or argument counts. Equivalent source binding may restructure those
