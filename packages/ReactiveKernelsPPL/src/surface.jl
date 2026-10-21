@@ -654,14 +654,17 @@ function _lower_model_latest(m::RKPPLModel, supplied; conditioned = keys(m.condi
     setdiff!(data, observed_parameters)
     # Response LHSs are data only through the explicit conditioning set.
     _check_observed_inputs(expanded.ast, data, observing)
+    array_entries = _value_array_entries(expanded.ast, data, values, m.mod)
     ast, data = _scalar_value_definitions(expanded.ast, data,
         Set{Symbol}(k for (k, v) in values if v isa Number && k ∉ observed_parameters);
         arrays = Set{Symbol}(k for (k, v) in values if v isa AbstractArray &&
             (haskey(m.fixed, k) || haskey(scoped_values, k))))
     ast = _indexed_observation_definitions(ast, data)
+    # Pinned values bind as definitions from here on, not as data.
+    pinned = setdiff(Set{Symbol}(keys(values)), data)
     plan = _lower_rkppl_once(ast, data, m.mod;
         submodel_scopes = scopes, conditioned = observed_parameters,
-        array_entries = Set{Symbol}(k for k in data if _holds_arrays(get(values, k, nothing))))
+        array_entries = setdiff(array_entries, pinned))
     for name in _conditioned_inputs(plan)
         values[_conditioned_input(name)] = pop!(values, name)
     end
@@ -913,8 +916,11 @@ broadcast argument also keeps Julia's scalar broadcasting. A number bound
 to a response is one observation. A value holding one array per index
 (`t = [[0.1, 0.7], [0.2]]`) makes every `@plate` cell that reads it at the
 loop index, directly or through values computed from it, one iteration of
-its Julia loop whatever operators the cell applies (`t[i] * a`, `-t[i]`);
-names alone cannot show this, so such a plan refuses those arrays at binding.
+its Julia loop whatever operators the cell applies (`t[i] * a`, `-t[i]`).
+So does a definition reading only data that a cell reads at the loop index
+(`rows = part(g, cells)`, then `x[rows[i]] * a`), when its value holds one
+array per index: lowering evaluates such a definition to see that. Names
+alone cannot show this, so such a plan refuses those arrays at binding.
 """
 lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=()) =
     lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned)
@@ -922,27 +928,26 @@ lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=()) =
 function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=())
     names = Symbol[]
     scalars = Set{Symbol}()
-    array_entries = Set{Symbol}()
     for (k, v) in data
         k isa Symbol || _sfail("data names must be Symbols, got $(repr(k))")
         push!(names, k)
         v isa Number && push!(scalars, k)
-        _holds_arrays(v) && push!(array_entries, k)
     end
-    return _lower_rkppl(ast, names, scalars, mod; conditioned, array_entries)
+    return _lower_rkppl(ast, names, scalars, mod; conditioned, values = data)
 end
 
 lower_rkppl(ast, data_names; mod::Module = Main, conditioned=()) =
     _lower_rkppl(ast, data_names, Set{Symbol}(), mod; conditioned)
 
-# `array_entries`: data whose value holds one array per index (`_holds_arrays`).
-# Lowering from values knows them; lowering from names alone cannot.
+# `values`: the data values when lowering from values, which show the
+# values that hold one array per index (`_value_array_entries`); lowering
+# from names alone cannot see them.
 _lower_rkppl(ast, data_names, scalars::Set{Symbol}, mod::Module; conditioned=(),
-        array_entries::Set{Symbol} = Set{Symbol}())::StructuralPlan =
-    Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod; conditioned, array_entries)
+        values::Union{Nothing,AbstractDict} = nothing)::StructuralPlan =
+    Base.invokelatest(_lower_rkppl_latest, ast, data_names, scalars, mod; conditioned, values)
 
 function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
-        mod::Module; conditioned=(), array_entries::Set{Symbol} = Set{Symbol}())::StructuralPlan
+        mod::Module; conditioned=(), values::Union{Nothing,AbstractDict} = nothing)::StructuralPlan
     data = Set{Symbol}()
     for n in data_names
         n isa Symbol || _sfail("data names must be Symbols, got $(repr(n))")
@@ -959,11 +964,12 @@ function _lower_rkppl_latest(ast, data_names, scalars::Set{Symbol},
     observed_parameters = _conditioned_declarations(ast, observing)
     setdiff!(data, observed_parameters)
     _check_observed_inputs(ast, data, observing)
+    array_entries = values === nothing ? Set{Symbol}() :
+        _value_array_entries(ast, data, values, mod)
     ast, data = _scalar_value_definitions(ast, data, setdiff(scalars, observed_parameters))
     ast = _indexed_observation_definitions(ast, data)
     return _lower_rkppl_once(ast, data, mod;
-        submodel_scopes = scopes, conditioned = observed_parameters,
-        array_entries = intersect(array_entries, data))
+        submodel_scopes = scopes, conditioned = observed_parameters, array_entries)
 
 end
 
@@ -4612,12 +4618,71 @@ end
 # `t[g[i]]`, `t[i][k]`), directly or through a cell local bound from one.
 _plate_reads_array_entries(cells, ivar::Symbol, arrays::Set{Symbol}) =
     !isempty(arrays) && any(c -> Meta.isexpr(c, :(=), 2) &&
-        _reads_array_entry(c.args[2], ivar, arrays), cells)
-_reads_array_entry(ex, ivar, arrays) = false
-function _reads_array_entry(ex::Expr, ivar, arrays)
-    ex.head === :ref && ex.args[1] isa Symbol && ex.args[1] in arrays &&
-        any(a -> _expr_has_sym(a, ivar), ex.args[2:end]) && return true
-    return any(a -> _reads_array_entry(a, ivar, arrays), ex.args)
+        !isdisjoint(_index_read_bases!(Set{Symbol}(), c.args[2], ivar), arrays), cells)
+
+# The values an expression reads at the loop index: `t` in `t[i]`,
+# `t[g[i]]` and `t[i][k]`, `rows` in `x[rows[i]]`.
+_index_read_bases!(out::Set{Symbol}, ex, ivar::Symbol) = out
+function _index_read_bases!(out::Set{Symbol}, ex::Expr, ivar::Symbol)
+    ex.head === :ref && ex.args[1] isa Symbol &&
+        any(a -> _expr_has_sym(a, ivar), ex.args[2:end]) && push!(out, ex.args[1])
+    foreach(a -> _index_read_bases!(out, a, ivar), ex.args)
+    return out
+end
+
+# Values that hold one array per index, as lowering from values sees them:
+# bound data, and each data-only definition a `@plate` definition cell
+# reads at its loop index (`rows` in `x[rows[i]] * theta[i]`, with
+# `rows = part(g, cells)`). Only its value shows whether such a definition
+# holds arrays, so it is evaluated here, in the model module, exactly as
+# `bind_data` evaluates it. A definition reading a value the data leave
+# absent, or one already known to hold arrays (`_array_entry_values!`), is
+# not evaluated.
+function _value_array_entries(ast::Expr, data::Set{Symbol},
+        values::AbstractDict{Symbol}, mod::Module)
+    arrays = Set{Symbol}(k for k in data if _holds_arrays(get(values, k, nothing)))
+    definitions = Dict{Symbol,Any}(st.args[1] => st.args[2] for st in ast.args
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol)
+    known = _array_entry_values!(copy(arrays), definitions)
+    read = Set{Symbol}()
+    for st in ast.args
+        Meta.isexpr(st, :macrocall, 3) && st.args[1] === Symbol("@plate") &&
+            Meta.isexpr(st.args[3], :for, 2) || continue
+        asg, body = st.args[3].args
+        Meta.isexpr(asg, :(=), 2) && asg.args[1] isa Symbol || continue
+        for c in body.args
+            Meta.isexpr(c, :(=), 2) && _index_read_bases!(read, c.args[2], asg.args[1])
+        end
+    end
+    # `_data_only` holds first, so every name reached is data or an acyclic
+    # data-only definition.
+    supplied(s) = s in data ? haskey(values, s) && _supplied(values[s]) :
+        all(supplied, _value_symbols(definitions[s]))
+    candidates = sort!([nm for nm in read if haskey(definitions, nm) &&
+        nm ∉ data && nm ∉ known && _data_only(definitions[nm], data, definitions) &&
+        supplied(nm)])
+    isempty(candidates) && return arrays
+    names = union(data, keys(definitions))
+    memo = Dict{Symbol,Any}()
+    function lookup(nm::Symbol)
+        haskey(memo, nm) && return memo[nm]
+        nm in data && return values[nm]
+        rhs = definitions[nm]
+        ex = _resolve_module_calls(rhs, mod, names, "definition `$nm = $(repr(rhs))`")
+        return memo[nm] = _eval_value_expr(ex, lookup, nm)
+    end
+    for nm in candidates
+        value = try
+            lookup(nm)
+        catch e
+            e isa SurfaceLoweringError && rethrow()
+            _fail(nm, "data definition $nm failed to evaluate, which lowering " *
+                "from values does to see whether the `@plate` cell reading " *
+                "`$nm[i]` reads one array per index: " * sprint(showerror, e))
+        end
+        _holds_arrays(value) && push!(arrays, nm)
+    end
+    return arrays
 end
 
 # A per-index value: a read at the loop index (`x[i]`, `v[g[i]]`, `t[i][k]`)
