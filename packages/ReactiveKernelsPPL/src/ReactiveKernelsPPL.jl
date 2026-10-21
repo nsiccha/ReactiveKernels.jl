@@ -86,6 +86,7 @@ export rk_expm
 export rk_symmetric_eigvals, rk_symmetric_eigvecs
 
 include("contract.jl")
+include("structural_cache.jl")
 include("sampling.jl")
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 # The general numerical callables and rule graphs are owned by RK proper;

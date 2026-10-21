@@ -2564,8 +2564,12 @@ end
 
 # Missing is a valid label, but remains invalid numeric evidence. Only
 # exempt a column when every read is a declared level axis or its gather.
-# A second, numeric read of that same column removes the exemption.
-function _label_only_columns(plan::StructuralPlan)
+# A second, numeric read of that same column removes the exemption. Once per
+# structure: it reads the column names, never a column value.
+_label_only_columns(plan::StructuralPlan) = _structural(
+    () -> _uncached_label_only_columns(plan), plan, (:label_only_columns,))
+
+function _uncached_label_only_columns(plan::StructuralPlan)
     labels, numeric = Set{Symbol}(), Set{Symbol}()
     raw = Set{Symbol}(keys(plan.columns))
     function visit(x)
@@ -2889,7 +2893,7 @@ function _validate_assignments_data(plan::StructuralPlan)
         refs = Symbol[]
         _collect_assignment_refs!(refs, a.expr, plan, a.label, true)
         for r in refs
-            r in _all_names(plan) ||
+            r in _all_name_set(plan) ||
                 _fail(a.label, "assignment references unknown name $r")
         end
     end
@@ -2904,10 +2908,14 @@ end
 # (`_materialize_derived_responses!`), exactly like the same value bound as
 # data. A caller-owned law observing a parameter-dependent definition
 # reads it in the graph instead.
-function _derived_response_names(plan::StructuralPlan)
+_derived_response_names(plan::StructuralPlan) = _structural(
+    () -> _uncached_derived_response_names(plan), plan, (:derived_response_names,);
+    columns = :none)
+
+function _uncached_derived_response_names(plan::StructuralPlan)
     names = Symbol[r.response for r in plan.responses
         if _is_derived(plan, r.response)]
-    known = Set{Symbol}(_all_names(plan))
+    known = _all_name_set(plan)
     for p in plan.external_observations
         _is_derived(plan, p.name) &&
             _reads_data_only(plan, p.name, known, Set{Symbol}()) &&
@@ -2943,7 +2951,7 @@ function _validate_vector_data(plan::StructuralPlan)
         refs = Symbol[]
         _collect_vector_refs!(refs, d.expr, plan, d.label, true)
         for r in refs
-            r in _all_names(plan) ||
+            r in _all_name_set(plan) ||
                 _fail(d.label, "derived column references unknown name $r")
         end
         _is_vector_valued(d.expr, plan) || _bind_checked_derived(plan, d.name) ||
@@ -2960,7 +2968,7 @@ function _validate_vector_alias(d::VectorAssignmentSpec, plan, bound::Bool)
     target = d.expr
     any(s -> target in s.states, plan.scans) && return nothing
     _is_derived(plan, target) && return nothing
-    target in _union_names(plan) &&
+    target in _union_name_set(plan) &&
         _fail(d.label, "alias target $target is a scalar name — aliases " *
                        "take columns only")
     bound || return nothing
@@ -2969,17 +2977,31 @@ function _validate_vector_alias(d::VectorAssignmentSpec, plan, bound::Bool)
     return nothing
 end
 
-_union_names(plan::StructuralPlan) =
+_union_names(plan::StructuralPlan) = _structural(plan, (:union_names,);
+        columns = :none) do
     union([p.name for p in plan.parameters], [a.name for a in plan.assignments])
+end
+# The same names as a set, shared: callers only test membership.
+_union_name_set(plan::StructuralPlan) = _structural(plan, (:union_name_set,);
+    columns = :none, fresh = false) do
+    Set{Symbol}(_union_names(plan))
+end
 
 """Full name table: scalar names plus derived columns plus per-cell latent
 (plate) parameter VECTORS (dependency edges and bind-time reference checks
 admit all; sampled-arg positions stay scalar-only via [`_union_names`](@ref),
 so a scalar arg can never reference a latent vector)."""
-_all_names(plan::StructuralPlan) =
+_all_names(plan::StructuralPlan) = _structural(plan, (:all_names,);
+        columns = :none) do
     union(_union_names(plan), [d.name for d in plan.derived],
         [p.name for p in plan.plate_parameters], _vector_value_names(plan),
         _array_names(plan), [a for s in plan.scans for a in s.states])
+end
+# The same names as a set, shared: callers only test membership.
+_all_name_set(plan::StructuralPlan) = _structural(plan, (:all_name_set,);
+    columns = :none, fresh = false) do
+    Set{Symbol}(_all_names(plan))
+end
 
 """Vector-parameter names (simplexes, cutpoints, …): model-level array values
 that definitions may read whole (`cumsum(vcat(0.0, zeta))`), never scalars."""
@@ -3035,7 +3057,7 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
         # bind — is a column entry but no observation column.)
         # A raw whole-value input is a bound operand, not a graph node.
         bound && haskey(plan.columns, ex) &&
-            ex in first(_bound_model_level_inputs(plan)) && return nothing
+            ex in _bound_model_level_input_set(plan) && return nothing
         bound && haskey(plan.columns, ex) &&
             !any(a -> a.name === ex, plan.assignments) && _fail(
             label,
@@ -3191,7 +3213,7 @@ end
 function _check_gather_index(ex::Expr, plan::StructuralPlan, label,
         bound::Bool)
     idx = ex.args[2]
-    names = Set{Symbol}(_all_names(plan))
+    names = _all_name_set(plan)
     for s in _expr_value_symbols(idx)
         _reads_data_only(plan, s, names, Set{Symbol}()) || _fail(label,
             "gather `$(repr(ex))` indexes by $s, which is not data — a " *
@@ -3340,7 +3362,7 @@ function _collect_vector_refs!(refs, ex, plan, label, bound::Bool)
         # may transform one (`theta = mu .+ tau .* z`) — the non-centered shape.
         if _is_derived(plan, ex) || _is_plate_param(plan, ex) ||
                 any(s -> ex in s.states, plan.scans) ||
-                ex in _union_names(plan) || ex in _vector_value_names(plan) ||
+                ex in _union_name_set(plan) || ex in _vector_value_names(plan) ||
                 _is_array_param(plan, ex)
             push!(refs, ex)
             return nothing
@@ -3448,7 +3470,7 @@ function _collect_vector_reduction!(refs, ex, plan, label, bound::Bool)
     # Reductions read a graph value whole, including latent plate vectors,
     # declared arrays and scan states. Keep its dependency edge just as for
     # a derived value; its observation axis is irrelevant to the reduction.
-    if arg in _all_names(plan)
+    if arg in _all_name_set(plan)
         push!(refs, arg)
         return nothing
     end
@@ -3557,7 +3579,7 @@ _array_entry_lowering_hint(c) = "A `@plate` cell that reads `$c[i]` means " *
 # (possibly-column) evidence and resolve at bind.
 function _is_vector_valued(ex, plan::StructuralPlan)
     _is_plate_column_expr(ex) && return true
-    ex isa Symbol && return !(ex in _union_names(plan) ||
+    ex isa Symbol && return !(ex in _union_name_set(plan) ||
         ex in _vector_value_names(plan)) && !_is_array_param(plan, ex)
     _is_observation_slice(plan, ex) && return true
     ex isa Expr && ex.head === :ref && ex.args[1] isa Symbol &&
@@ -3976,7 +3998,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
                     "simplex size $(p.size) disagrees with its concentration length $(length(alpha))")
             elseif alpha isa Symbol || alpha isa Expr
                 for ref in _value_symbols(alpha)
-                    (!isbound(plan) || ref in _all_names(plan) || haskey(plan.columns, ref)) ||
+                    (!isbound(plan) || ref in _all_name_set(plan) || haskey(plan.columns, ref)) ||
                         _fail(p.label, "Dirichlet concentration references unknown name $ref")
                 end
             else
@@ -3987,7 +4009,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
         elseif p.family === :positive_exponential
             th = p.args.arg1
             if th isa Symbol
-                th in _union_names(plan) || _fail(p.label,
+                th in _union_name_set(plan) || _fail(p.label,
                     "exponential scale $th is not a scalar " *
                     "parameter/assignment name")
             else
@@ -4013,7 +4035,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
         else
             for (key, arg) in pairs(p.args)
                 if arg isa Symbol
-                    (!isbound(plan) || arg in _all_names(plan) ||
+                    (!isbound(plan) || arg in _all_name_set(plan) ||
                         haskey(plan.columns, arg)) || _fail(p.label,
                             "element prior $key references unknown name $arg")
                 else
@@ -4046,7 +4068,7 @@ function _validate_vector_parameters(plan::StructuralPlan)
             if haskey(refs, r.thresholds)
                 push!(refs[r.thresholds], r.label)
             else
-                _reads_data_only(plan, _threshold_name(r.thresholds), Set{Symbol}(_all_names(plan)),
+                _reads_data_only(plan, _threshold_name(r.thresholds), _all_name_set(plan),
                     Set{Symbol}()) || _fail(r.label,
                     "thresholds $(r.thresholds) must be a vector parameter or data")
             end
@@ -4396,7 +4418,7 @@ function _validate_scan_term(t::TermSpec, pred::PredictorSpec, plan::StructuralP
         _fail(t.label, "scan summand addresses unknown scan state " *
               ":$(o.scan_id) (no such `@scan` carried array)")
     o.coef === nothing && return nothing
-    o.coef in _union_names(plan) ||
+    o.coef in _union_name_set(plan) ||
         _fail(t.label, "scan summand coef :$(o.coef) must name a scalar " *
               "parameter or assignment")
     return nothing
@@ -6372,7 +6394,7 @@ function _validate_scale_use(r::LikelihoodSpec, plan::StructuralPlan, s,
     # is a raw data column resolved at bind (see `_validate_scale_data`), so
     # defer an unknown symbol rather than failing structurally (mirrors how
     # per-obs weight/trials columns validate only once data is attached).
-    s isa Symbol && s in _union_names(plan) && return nothing
+    s isa Symbol && s in _union_name_set(plan) && return nothing
     s isa Symbol && return nothing
     return _fail(r.label, "$what references unknown name $s")
 end
@@ -6417,7 +6439,7 @@ function _validate_scale_data_use(r::LikelihoodSpec, plan::StructuralPlan, s)
     # A data-only scalar definition used as a scale is materialized at bind.
     # Validate that value just like a caller-supplied scale; live definitions
     # and sampled parameters have no bound value here.
-    (s in _union_names(plan) || s in _all_names(plan)) &&
+    (s in _union_name_set(plan) || s in _all_name_set(plan)) &&
         !haskey(plan.columns, s) && return nothing
     haskey(plan.columns, s) ||
         _fail(r.label, "scale references unknown name $s")
@@ -6461,7 +6483,7 @@ function _validate_nu(r::LikelihoodSpec, plan::StructuralPlan)
     end
     n isa Real && ((isfinite(n) && n > 0) ||
         _fail(r.label, "nu literal must be finite positive"))
-    n isa Symbol && (n in _all_names(plan) || haskey(plan.columns, n) ||
+    n isa Symbol && (n in _all_name_set(plan) || haskey(plan.columns, n) ||
         !isbound(plan) || _fail(r.label, "nu references unknown name $n"))
     return nothing
 end
@@ -6484,7 +6506,7 @@ function _validate_zi(r::LikelihoodSpec, plan::StructuralPlan)
     z isa ScalePredictorRef && return _validate_zi_predictor(r, plan, z)
     z isa Real && ((isfinite(z) && 0 <= z <= 1) ||
         _fail(r.label, "zi literal must lie in [0, 1]"))
-    z isa Symbol && (z in _all_names(plan) || haskey(plan.columns, z) ||
+    z isa Symbol && (z in _all_name_set(plan) || haskey(plan.columns, z) ||
         !isbound(plan) || _fail(r.label, "zi references unknown name $z"))
     return nothing
 end
@@ -6494,7 +6516,7 @@ end
 function _validate_auxiliary_data(r::LikelihoodSpec, plan::StructuralPlan, value,
         slot::Symbol)
     value isa Symbol || return nothing
-    value in _all_names(plan) && !haskey(plan.columns, value) && return nothing
+    value in _all_name_set(plan) && !haskey(plan.columns, value) && return nothing
     haskey(plan.columns, value) ||
         _fail(r.label, "$slot references unknown name $value")
     data = plan.columns[value]
@@ -6534,7 +6556,7 @@ function _validate_interval(r::LikelihoodSpec, plan::StructuralPlan)
     end
     r.interval === nothing && return nothing
     for a in r.interval
-        a isa Real || a in _all_names(plan) ||
+        a isa Real || a in _all_name_set(plan) ||
             (!isbound(plan) || haskey(plan.columns, a)) || _fail(r.label,
                 "interval references unknown name $a")
     end
@@ -6728,7 +6750,7 @@ function _validate_evidence_structure(r::LikelihoodSpec, plan::StructuralPlan)
     r.family in (MvNormalCholeskyFam, MultinomialFam) &&
         _fail(r.label, "scalar evidence bounds require a univariate distribution")
     for b in (ev.lower, ev.upper)
-        isbound(plan) && b isa Symbol && b ∉ _all_names(plan) && !haskey(plan.columns, b) &&
+        isbound(plan) && b isa Symbol && b ∉ _all_name_set(plan) && !haskey(plan.columns, b) &&
             _fail(r.label, "evidence bound $b is not a declared value")
     end
     if ev.kind === :interval_censored
@@ -6984,8 +7006,15 @@ module function or fill a bind-time slot, and read only raw data or other
 data-only definitions.
 Derived responses keep their own materialization. `bind_only` excludes
 definitions used only during preparation, while preserving their names
-for caller-supplied column collision checks."""
-function _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
+for caller-supplied column collision checks. Once per structure: it reads
+the column names, roles and conditioned names, never a column value."""
+_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
+        bind_only = false, unbound::Bool=false) =
+    _structural(plan, (:module_data_names, _sorted_names(raw), bind_only, unbound)) do
+        _uncached_module_data_names(plan, raw; bind_only, unbound)
+    end
+
+function _uncached_module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         bind_only = false, unbound::Bool=false)
     required = Set{Symbol}(r.weights for r in plan.responses if r.weights !== nothing)
     for r in plan.responses, scale in (r.scale, r.mixture_scales...)
@@ -7165,8 +7194,13 @@ column observation-aligned: a definition read outside those positions
 name an observation-bearing structural slot holds (new slots remain
 fail-closed). Prior-only reads keep their declared latent domain.
 Returns `(inputs, defs)`: the columns, and the
-whole-context definitions (whose values may have any length too)."""
-function _model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
+whole-context definitions (whose values may have any length too). Once per
+structure: it reads the column names, never a column value."""
+_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol}) =
+    _structural(() -> _uncached_model_level_inputs(plan, raw), plan,
+        (:model_level_inputs, _sorted_names(raw)))
+
+function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Symbol})
     # A column with no value consumer has no observation axis. Infer this
     # from the finished plan, where optimized matrix/predictor reads are
     # represented too, rather than from an intermediate definition table.
@@ -7375,7 +7409,14 @@ function _whole_value_reads(defs, raw::AbstractSet{Symbol},
 end
 
 """In a bound plan: `(inputs, defs)` of [`_model_level_inputs`](@ref)."""
-function _bound_model_level_inputs(plan::StructuralPlan)
+_bound_model_level_inputs(plan::StructuralPlan) = _structural(
+    () -> _uncached_bound_model_level_inputs(plan), plan, (:bound_model_level_inputs,))
+# Its inputs, shared: callers only test membership.
+_bound_model_level_input_set(plan::StructuralPlan) = _structural(
+    () -> first(_bound_model_level_inputs(plan)), plan,
+    (:bound_model_level_input_set,); fresh = false)
+
+function _uncached_bound_model_level_inputs(plan::StructuralPlan)
     nodes = union(Set{Symbol}(a.name for a in plan.assignments),
         Set{Symbol}(d.name for d in plan.derived))
     inputs, definitions = _model_level_inputs(plan,
@@ -7540,7 +7581,12 @@ end
 
 # The `_bound_value` inputs a plan reads, wherever lowering moved their
 # definitions (a definition used only in a predictor is inlined there).
-function _bound_value_inputs(plan::StructuralPlan)
+# Once per structure: it reads no column.
+_bound_value_inputs(plan::StructuralPlan) = _structural(
+    () -> _uncached_bound_value_inputs(plan), plan, (:bound_value_inputs,);
+    columns = :none)
+
+function _uncached_bound_value_inputs(plan::StructuralPlan)
     found = Set{Symbol}()
     seen = Base.IdSet{Any}()
     for f in fieldnames(StructuralPlan)
@@ -7647,7 +7693,8 @@ function _materialize_module_data!(plan::StructuralPlan,
         # definition before it was materialized.
         ex = nm in vector_defs ?
             _guard_missing_observation_argument(nm, exprs[nm], plan, columns) : exprs[nm]
-        memo[nm] = _eval_value_expr(ex, lookup, nm; calls)
+        memo[nm] = _eval_value_expr(ex, lookup, nm; calls,
+            kernels = spec -> _prepared_kernel(plan, spec))
         return memo[nm]
     end
     absent = _absent_definition_sources(exprs, columns)
@@ -7775,7 +7822,7 @@ end
 # Plain-Julia evaluation of a resolved definition expression (functions as
 # values): module calls through their `GlobalRef`s, built-in vocabulary
 # heads through the generated-model scope — the bindings the kernel uses.
-function _eval_value_expr(ex, lookup, label; calls = nothing)
+function _eval_value_expr(ex, lookup, label; calls = nothing, kernels = nothing)
     # An array is a value lowering already folded (a literal concentration
     # in `length([1.0, 1.0])`); like any Julia constant it evaluates to itself.
     ex isa Union{Number,String,AbstractArray} && return ex
@@ -7787,7 +7834,7 @@ function _eval_value_expr(ex, lookup, label; calls = nothing)
     ex isa Expr || throw(ContractValidationError(
         "[bind] $label: unsupported literal $(repr(ex))"))
     _is_plate_column_expr(ex) && return _eval_plate_column(ex, lookup, label)
-    ev(a) = _eval_value_expr(a, lookup, label; calls)
+    ev(a) = _eval_value_expr(a, lookup, label; calls, kernels)
     h = ex.head
     cached = h === :call && calls !== nothing && ex.args[1] isa GlobalRef
     cached && haskey(calls, ex) && return calls[ex]
@@ -7813,6 +7860,10 @@ function _eval_value_expr(ex, lookup, label; calls = nothing)
                 push!(pos, ev(a))
             end
         end
+        # A kernel called positionally runs `prepare(f)`: `kernels` prepares
+        # it once, where the caller keeps it (`spec(args...)` prepares anew).
+        kernels !== nothing && f isa ReactiveKernels.KernelSpec && isempty(kws) &&
+            !isempty(pos) && (f = kernels(f))
         # `invokelatest`: the model module's functions may postdate the
         # caller's world (bind_data is callable from any world).
         v = Base.invokelatest(f, pos...; kws...)
@@ -8024,7 +8075,9 @@ function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # Resolve the callee binding in the same scope as its evaluation: on
     # Julia 1.12, a call-only invokelatest cannot see a just-created binding
     # while evaluating its function argument in the caller's older world.
-    return Base.invokelatest(_bind_data_latest, plan, columns; roles, dims, conditioned)
+    return _with_structural_cache() do
+        Base.invokelatest(_bind_data_latest, plan, columns; roles, dims, conditioned)
+    end
 end
 
 function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
@@ -8034,8 +8087,15 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     sampled = Set(p.name for ps in (plan.parameters, plan.factors, plan.array_parameters,
         plan.vector_parameters, plan.plate_parameters) for p in ps)
     observing = intersect(sampled, Set{Symbol}(_conditioned_names(conditioned)))
-    plan = _with(plan; conditioned = union(plan.conditioned, observing))
-    validate_structure(plan)
+    conditioned = union(plan.conditioned, observing)
+    plan = _with(plan; conditioned = _interned(plan,
+        (:conditioned, _sorted_names(conditioned)), conditioned))
+    # Binding never mutates its input's columns: the verdict holds for the
+    # structure, whatever data it binds next.
+    _structural(plan, (:validate_structure,); columns = :identity, n_obs = true) do
+        validate_structure(plan)
+        true
+    end
     isempty(dims) || _fail(:bind, "dims keys are not consumed: use explicit array dimensions and authored @plate ranges")
     isempty(columns) && _has_observation_axis(plan) && throw(ContractValidationError(
         "[bind] bind_data requires non-empty columns"))
@@ -8095,6 +8155,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
         end
     end
     merged = merge(inferred, roles)
+    merged = _interned(plan, (:roles, _sorted_roles(merged)), merged)
     # Observation statements determine their own axes; unrelated axes add
     # their likelihood rows without sizing one value from another's extent.
     axis_plan = _with(plan; columns = columns)
@@ -8110,9 +8171,13 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     isempty(_bind_plate_extents!(_with(axis_plan; n_obs = n), columns)) ||
         _materialize_module_data!(plan, columns; already = computed)
     maps = _eval_levelmaps(plan.levelmaps, columns)
+    maps = _interned(plan, (:levelmaps, map(m -> (m.predictor, m.column,
+        Tuple(m.values), m.source, m.subset), maps)...), maps)
     responses2, vectors2 =
         _infer_leveled_sizes(plan.responses, plan.vector_parameters, columns,
             plan.predictors, _with(plan; columns = columns, n_obs = n))
+    responses2 = _interned(plan, (:responses, responses2...), responses2)
+    vectors2 = _interned(plan, (:vector_parameters, vectors2...), vectors2)
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps,
         vector_parameters = vectors2)
@@ -8267,7 +8332,7 @@ function _dirichlet_size(plan, alpha, label)
     end
     # A data-only constructor such as `ones(K)` has a concrete value at
     # binding even when the symbolic array-shape walker cannot infer it.
-    names = Set{Symbol}(_all_names(plan))
+    names = _all_name_set(plan)
     all(s -> _reads_data_only(plan, s, names, Set{Symbol}()),
         _expr_value_symbols(alpha)) || _fail(label,
         "Dirichlet concentration must have a known vector shape; got $(repr(alpha))")
@@ -8402,7 +8467,7 @@ function _infer_leveled_sizes(responses::Vector{LikelihoodSpec},
     for p in vectors
         if p.family === :simplex_dirichlet && p.size === nothing && p.extent_expr === nothing &&
                 (plan === nothing || all(s -> _reads_data_only(plan, s,
-                    Set{Symbol}(_all_names(plan)), Set{Symbol}()),
+                    _all_name_set(plan), Set{Symbol}()),
                     _expr_value_symbols(p.args.arg1)))
             # Preserve inferred concentration sizing just like an authored
             # data expression, without changing the linked-width checks.

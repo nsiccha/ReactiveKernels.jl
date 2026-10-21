@@ -40,6 +40,14 @@ binding, and every step that takes a bound plan (`build_kernel`,
 `bind_data(binding)` lowers it to. Each step lowers it again; bind once with
 `plan = bind_data(binding)` to share one plan.
 
+Rebinding one lowered plan to other data, as a prediction design or a
+simulation scenario does (`bind_data(plan, data)`), reuses what the plan's
+structure decides from its first binding: which definitions are data, which
+inputs are model-level, the axes of array values and the structure checks.
+Each further binding pays for its data alone: it evaluates the definitions
+that read only data (a kernel such a definition calls is prepared once per
+lowering) and validates the values.
+
 An explicitly observed empty vector has zero observations and contributes
 zero log-likelihood. Scalar priors and their transforms still contribute as
 authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an
