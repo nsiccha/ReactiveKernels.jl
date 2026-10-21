@@ -20,7 +20,14 @@
 #   row `r` of the product is `A[r:r, ...] * W...`. Its full axes, which a
 #   dotted reader and the cell's linear reads need, are known for a
 #   matrix-vector product `A * v` (`(axes(A, 1),)`); any other product is read
-#   only by gathers.
+#   only by gathers;
+# - an authored plate: row `r` of its value is the plate over row `r` of each
+#   batched argument, lowered natively over those one-row views at the reading
+#   cell. A shared argument its body reads only as `v[q]`, `q` the element of
+#   one batched integer argument, is a linear gather by that argument, as in a
+#   cell (`_cell_capture_reader`); its other shared arguments are read whole.
+#   Its full axes are its batched arguments' broadcast axes, as its loop
+#   combines them.
 #
 # Row `r` of the dotted expression is the same expression over row `r` of each
 # array operand (the operand itself when broadcasting extrudes it), and row
@@ -197,6 +204,7 @@ end
 
 function _cell_form(r::Recipe)
     length(r.outputs) == 1 && !r.effectful || return nothing
+    r.op isa _AuthoredPlateOp && return _cell_plate_form(r)
     if r.op === Base.:* && length(r.inputs) >= 2
         # A bare exact call `A * B...` keeps Base's `*` itself as its
         # operation (`_kernel_operation_body`); it is called positionally.
@@ -272,6 +280,33 @@ function _cell_form(r::Recipe)
     _CellForm(kind, roles, gather_index, unique!(leaves), operand)
 end
 
+# An authored plate's value, row by row: its batched arguments are broadcast
+# operands, a shared argument read only at one batched integer argument's
+# element is gathered by it, and any other shared argument is read whole.
+function _cell_plate_form(r::Recipe)
+    op = r.op::_AuthoredPlateOp
+    atomic = typeof(op).parameters[2]
+    inner = op.kernel.plan
+    ig = inner.graph
+    roots = ValueId[canon_id(ig, v.id) for v in inner.have]
+    length(roots) == length(r.inputs) && allunique(roots) || return nothing
+    n = length(r.inputs)
+    leaves = Int[k for k in 1:n if !(k in atomic)]
+    isempty(leaves) && return nothing
+    roles = Symbol[k in atomic ? :whole : :leaf for k in 1:n]
+    gather_index = zeros(Int, n)
+    wants = Set(canon_id(ig, w.id) for w in inner.want)
+    for k in atomic
+        roots[k] in wants && continue
+        b = _cell_capture_reader(inner, roots, atomic, roots[k])
+        b === nothing && continue
+        roles[k] = :linear_gather
+        gather_index[k] = b
+        roles[b] = :index
+    end
+    _CellForm(:pointwise, roles, gather_index, leaves, 0)
+end
+
 # `*` as the closure resolves it is Base's.
 function _cell_base_product(callee, mod, params)
     callee isa GlobalRef && return isdefined(callee.mod, callee.name) &&
@@ -345,7 +380,9 @@ end
 
 The plan-wide pushdown decision for `_lower_with_ops`: `recipes` are the
 producers computed only at their readers' rows (their table slots are kept and
-recorded in `slots` as lowering reaches them). `captures[cell recipe id]`
+recorded in `slots` as lowering reaches them: an operation's slot, or, for an
+authored plate, the table length before its reserved slots, with the
+argument values it is lowered with in `plates`). `captures[cell recipe id]`
 maps each shared argument position read at the cell's own row to the batched
 argument holding that row; `batched[cell recipe id]` names the cell's ordinary
 batched argument positions.
@@ -359,6 +396,7 @@ struct _CellPushdowns
     captures::Dict{Int,Dict{Int,Int}}
     batched::Dict{Int,Set{Int}}
     slots::Dict{Int,Int}
+    plates::Dict{Int,Any}
 end
 
 function _cell_pushdowns(p::Plan)
@@ -465,23 +503,29 @@ function _cell_pushdowns(p::Plan)
     recipes = Set(only(producers[cid]).id for cid in pushed)
     _CellPushdowns(g, pushed, recipes,
         Dict(cid => only(producers[cid]) for cid in pushed), forms, captures, batched,
-        Dict{Int,Int}())
+        Dict{Int,Int}(), Dict{Int,Any}())
 end
 
 # ---------------------------------------------------------------- emission
 
 # Emits, into `body`, the rows of pushed values one cell reads. Shapes are
 # memoized per value, operand rows and windows per (value, row binding).
+# `runtime_ops` / `runtime_recipes` are the operation table being built; a
+# pushed plate's code reads the slots reserved at its own position.
 struct _CellEmitter
     body::Expr
     pushdowns::_CellPushdowns
     names::Dict{ValueId,Symbol}
+    runtime_ops::Vector{Any}
+    runtime_recipes::Vector{Recipe}
     shapes::Dict{ValueId,Symbol}
     rows::Dict{Tuple{ValueId,Symbol},Symbol}
     windows::Dict{Tuple{ValueId,Symbol},Symbol}
 end
-_CellEmitter(body, pushdowns, names) = _CellEmitter(body, pushdowns, names,
-    Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}())
+_CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes) =
+    _CellEmitter(body, pushdowns, names, runtime_ops, runtime_recipes,
+        Dict{ValueId,Symbol}(), Dict{Tuple{ValueId,Symbol},Symbol}(),
+        Dict{Tuple{ValueId,Symbol},Symbol}())
 
 _cell_ref(name) = GlobalRef(@__MODULE__, name)
 
@@ -555,6 +599,15 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
         else
             push!(args, e.names[icid])
         end
+    end
+    if r.op isa _AuthoredPlateOp
+        # The plate over these one-row arguments, with the table slots reserved
+        # at its own position (`_lower_with_ops`).
+        offset = d.slots[r.id]
+        window = gensym(:cell_rows)
+        _lower_authored_plate_native!(e.body, e.runtime_ops[1:offset],
+            e.runtime_recipes[1:offset], r.op, args, d.plates[r.id], window, nothing)
+        return e.windows[(cid, row)] = window
     end
     call = Expr(:call, Expr(:ref, _OPS_ARG, d.slots[r.id]), args...)
     e.windows[(cid, row)] = _cell_bind!(e, :cell_rows, call)

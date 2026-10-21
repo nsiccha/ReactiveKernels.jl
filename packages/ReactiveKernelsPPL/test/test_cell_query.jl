@@ -155,6 +155,115 @@ end
     @test measured[2].compact_bytes <= measured[1].compact_bytes + 1024
 end
 
+# BRM's NLME emission for a caller-provided scalar law: a kernel plate writes
+# each subject's prediction, and the observation plate reads it per subject
+# through `LogDensity` (snag `brm-s-nlme-subje-f6f0efd3`). A subject's cell
+# runs the kernel plate, and the predictors it reads, at that subject only, as
+# the same program observed by `Normal` does.
+ReactiveKernels.@kernel _cq_scalar_law(value, location, scale) = begin
+    residual = (value - location) / scale
+    density = -0.5 * log(2 * pi) - log(scale) - 0.5 * residual * residual
+    return density
+end
+_cq_flatten_cells(cells) = reduce(vcat, cells; init = Float64[])
+
+_cq_kernel_plate(observation) = quote
+    sigma ~ Exponential(1)
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    s1 ~ Exponential(1)
+    s2 ~ Exponential(1)
+    z1[levels(subject)] .~ Normal.(0, 1)
+    z2[levels(subject)] .~ Normal.(0, 1)
+    log_CL = a .+ s1 .* z1[subject]
+    log_V = b .+ s2 .* z2[subject]
+    @plate for i = eachindex(log_CL)
+        CL = exp(log_CL[i])
+        Vc = exp(log_V[i])
+        pred_cell = (dose[i] / Vc) .* exp.(-(CL / Vc) .* t[i])
+        pred_cells[i] = pred_cell
+        pred_argument_dv_1[i] = pred_cell
+    end
+    pred = _cq_flatten_cells(pred_cells)
+    @plate for i = eachindex(dv)
+        $observation
+    end
+end
+
+function _cq_pk_data(n)
+    t = [[0.5, 1.0, 2.0, 4.0][1:mod1(j, 4)] for j in 1:n]
+    (; subject = ["s$j" for j in 1:n], dose = fill(100.0, n), t,
+       dv = [5 .* exp.(-0.15 .* tj) .* (1 .+ 0.05 .* sin.(j .+ tj))
+             for (j, tj) in enumerate(t)])
+end
+
+@testset "cell query: a caller-owned law reads a kernel plate's row" begin
+    law = :(dv[i] .~ LogDensity.(_cq_scalar_law, pred_argument_dv_1[i], sigma))
+    normal = :(dv[i] .~ Normal.(pred_argument_dv_1[i], sigma))
+    data = _cq_pk_data(5)
+    bound, built = _cq_bound(_cq_kernel_plate(law), data, (:dv,))
+    nbound, nbuilt = _cq_bound(_cq_kernel_plate(normal), data, (:dv,))
+    @test coordinate_names(built.layout) == coordinate_names(nbuilt.layout)
+    u = collect(range(-0.4, 0.5; length = built.layout.total))
+    pointwise = Base.invokelatest(prepare_query(built, bound, :pointwise), u)
+    q = prepare_cell_query(built, bound, :dv)
+    nq = prepare_cell_query(nbuilt, nbound, :dv)
+    cells = [q(u, i) for i in eachindex(data.dv)]
+    @test cells ≈ [sum(x; init = 0.0) for x in pointwise.dv]
+    @test cells ≈ [nq(u, i) for i in eachindex(data.dv)]
+    @test_throws BoundsError q(u, length(data.dv) + 1)
+
+    names = coordinate_names(built.layout)
+    block(i) = findall(n -> n in (Symbol("z1.$i"), Symbol("z2.$i")), names)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    s = prepare_cell_sampler(built, bound, :dv, u; backend)
+    full = prepare_ad(prepare_query(built, bound, :likelihood), backend, u;
+        active = :unconstrained)
+    _, gfull = Base.invokelatest(ad_value_and_gradient, full, u)
+    compact = prepare_compact_cell_sampler(built, bound, :dv, u,
+        sort!([1:5; block(1)]);
+        backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
+    for i in (1, 4)
+        g = similar(u)
+        value, _ = cell_value_and_gradient!(s, g, u, i)
+        @test value ≈ cells[i]
+        @test g[block(i)] ≈ gfull[block(i)]
+        @test all(iszero, g[block(j)] for j in eachindex(data.dv) if j != i)
+        for j in (1, 2, first(block(i)))
+            @test g[j] ≈ _cq_central(x -> q(x, i), u, j) rtol = 1e-5
+        end
+        indices = sort!([1:5; block(i)])
+        active = u[indices]
+        compact_gradient = similar(active)
+        compact_value, _ = cell_value_and_gradient!(
+            compact, compact_gradient, u, active, indices, i)
+        @test compact_value ≈ value
+        @test compact_gradient ≈ g[indices]
+    end
+    @test data == _cq_pk_data(5)
+
+    # One subject's cell allocates the same at 10 subjects as at 2,000.
+    measured = map((10, 2_000)) do n
+        data = _cq_pk_data(n)
+        bound, built = _cq_bound(_cq_kernel_plate(law), data, (:dv,))
+        u = collect(range(-0.4, 0.5; length = built.layout.total))
+        q = prepare_cell_query(built, bound, :dv)
+        names = coordinate_names(built.layout)
+        indices = sort!([1:5; findall(n -> n in (Symbol("z1.2"), Symbol("z2.2")), names)])
+        active = u[indices]
+        compact = prepare_compact_cell_sampler(built, bound, :dv, u, indices;
+            backend = AutoEnzyme(; mode = Enzyme.set_runtime_activity(Enzyme.Reverse)))
+        compact_gradient = similar(active)
+        cell_value_and_gradient!(compact, compact_gradient, u, active, indices, 2)
+        q(u, 2)
+        (; bytes = (@allocated q(u, 2)),
+           compact_bytes = (@allocated cell_value_and_gradient!(
+               compact, compact_gradient, u, active, indices, 2)))
+    end
+    @test measured[1].bytes == measured[2].bytes
+    @test measured[1].compact_bytes == measured[2].compact_bytes
+end
+
 @testset "cell query: elementwise and scalar-cell observations" begin
     x = [0.2, -0.4, 1.1, 0.7]
     y = [0.5, -0.1, 1.8, 1.0]

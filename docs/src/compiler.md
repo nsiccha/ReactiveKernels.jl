@@ -25,6 +25,66 @@ boundary. In particular, a stateless recipe may contain arbitrary ordinary
 Julia behind an opaque recipe call, while a source-captured state-machine method
 must stay inside the compiler's inspectable and registered subset.
 
+## Pure kernels and the iterative-method compiler
+
+ReactiveKernels has two halves, and they have different status.
+
+**Pure kernels** are where development is focused. This half is everything a
+stateless graph needs, from authoring to execution:
+
+- function-shaped `@kernel` specifications (`KernelSpec`) and pure
+   method-bearing kernel objects (`KernelObjectSpec`), including every
+   DistributionKernels family;
+- have→want planning and lowering: `plan`, `prepare`, `explain`, `code_expr`,
+   `compose`, `extract` and preparation-time partial evaluation;
+- plates and scans: `plate`, `scan`, `@plate`, `@scan`, `plate_cell`,
+   `plate_body`, `scan_body` and `replica`;
+- position batching with `vectorize` and `prepare_batched`;
+- differentiation: `prepare_ad` with its gradient, pullback, pushforward and
+   Hessian-vector entry points, and scalar and vector derivative rules;
+- `prepare_nonallocating`, and the owned primitives such as `rk_expm`,
+   `rk_cholesky_lower` and `rk_ode_bdf_tol`.
+
+ReactiveKernelsPPL is built entirely on this half. So are the reactive
+execution layers, `ReactiveState` and `prepare_reactive` with
+`CompiledReactiveState`: they run prepared pure kernels with
+provenance-aware invalidation and do not use the iterative-method compiler.
+
+**The iterative-method compiler** is the third pipeline listed above. It
+compiles stateful object kernels and free update methods (see [Two stateful
+authoring modes](#Two-stateful-authoring-modes)) into state machines. It is
+**frozen**: its tests stay green, but it takes no new features and no Reactant
+work until it is revisited. Its public entry points are:
+
+- `compile_stateful`, `stateful_compiler_bindings`, `functionalize_stateful`,
+   `stateful_snapshot`, `compile_state_transition`, `initial_transition_state`,
+   `validated_compiled_transition` and `stateful_control_bounds`, with their
+   result types;
+- effect ports and host-drained observations: `pure_callable_port`,
+   `effect_callable_port`, `effect_lowering_port`, `structured_state_port`,
+   `total_functional_lowering`, `initial_transition_effects`,
+   `transition_with_effects` and `drain_observations!`;
+- functionalized randomness: `rng_provider` and `OrderedRNGReplay`;
+- the experimental captured-program interface: `prepare_transpiled`,
+   `initial_transpiled_state` and `transpiled_endpoint`;
+- the token-preserving binder `partial` (`PartialFunction`).
+
+Its consumers are the NUTS and HMC compiler examples
+(`ReactiveKernelsNUTSExamples` and the [HMC transpiler](hmc-transpiler.md)
+page) and the compiled accumulators of `ReactiveKernelsStreamingStats`.
+
+The two halves share one front end. The `@kernel` mode discrimination, method
+extraction and endpoint templates in `src/kernel_stateful.jl` build pure kernel
+objects as well as stateful ones. No other pure source file, and nothing in
+ReactiveKernelsPPL or DistributionKernels, calls into the compiler's source
+files. A test keeps it that way:
+`packages/ReactiveKernelsPPL/test/test_pure_surface_boundary.jl` runs a pure
+workload in a fresh process: an `@rkppl` model with a native Reverse sampler,
+a DistributionKernels family object, a pure kernel object, `prepare`,
+`prepare_ad` and `vectorize`. It fails, naming the method, when the workload
+compiles any method of the compiler's source files. Its fixture,
+`pure_surface_census.jl`, lists those files.
+
 ## Numerical metadata and its consumers
 
 OutputSignatures owns numerical transfer rules for compiler-visible calls.
@@ -113,7 +173,7 @@ PPL artifacts are external compilation examples and acceptance evidence, not
 domain APIs owned by ReactiveKernels. The NUTS runtime and domain surface live
 in the `ReactiveKernelsNUTSExamples` nested package; a bare `using ReactiveKernels` does not load or
 export them. See [What the NUTS proof does and does not
-establish](#what-the-nuts-proof-does-and-does-not-establish).
+establish](#What-the-NUTS-proof-does-and-does-not-establish).
 
 ## The stateless compiler
 
@@ -448,7 +508,7 @@ Binding freezes values for that preparation; changing or mutating the data is
 not an invalidation signal. Rebind by preparing again from the original graph
 or plan. The pass does not rewrite mathematics or mutate the shared graph; it
 splits a recipe only along the structure its author wrote (see
-[Data-only subexpressions](#data-only-subexpressions)). The default
+[Data-only subexpressions](#Data-only-subexpressions)). The default
 `bound = ()`/`bound = (;)` path is unchanged.
 
 The same named `bound` contract is available on `prepare_nonallocating`, whose
@@ -864,7 +924,14 @@ these producers:
 - a product `A * W` with an array input as its left factor (row `r` is
   `A[r:r, :] * W`). A matrix-vector product `X * beta` (a matrix input and a
   vector input) can be read like any other value; other products only by
-  gathers `R[g, k]`, since their full shape is not known before they run.
+  gathers `R[g, k]`, since their full shape is not known before they run;
+- an authored plate. Row `r` of its value is the plate over row `r` of each
+  batched argument, so the cell runs that plate's body at row `r` only. A
+  shared array the plate reads only at its own position, `u[j]` with `j` an
+  integer element of one of its batched arguments, is in turn computed at that
+  row by these rules. So a later plate reading `pred[i]` from
+  `pred = plate(rows) do r; f(log_k[r]) end` computes `pred` and `log_k` at
+  row `i` only.
 
 The producer's own operation runs on one-row views of its row-aligned
 operands; an operand that broadcasting extrudes is passed whole. A value it
@@ -1041,7 +1108,11 @@ mutable value is still borrowed from its state.
 
 ## Source-captured method compiler
 
-Method-bearing `@kernel` definitions enter a stricter compiler. They are not
+This is the frozen iterative-method compiler (see [Pure kernels and the
+iterative-method compiler](#Pure-kernels-and-the-iterative-method-compiler)).
+Compiled as state machines, method-bearing `@kernel` definitions enter a
+stricter compiler. Their pure, straight-line methods are also endpoint graphs
+of the pure half, which need nothing from this section. They are not
 opaque recipe closures and are not analyzed through Julia's compiled IR.
 
 ### Authoritative input is captured source

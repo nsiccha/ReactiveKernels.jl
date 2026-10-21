@@ -42,5 +42,43 @@ an ODE call to it or restructure equivalent helpers and parameter layouts;
 preserve the scientific equations and accuracy controls. This signature is a
 compatibility entry point, not a required downstream source layout. The bridge
 does not install a method on a foreign source token.
+
+See also [`rk_ode_rk45_tol`](@ref), the same bridge over an explicit method.
 """
 function rk_ode_bdf_tol end
+
+"""
+    rk_ode_rk45_tol(f, y0, t0, ts, reltol, abstol, maxsteps, args...)
+
+Integrate `dy/dt = f(t, y, args...)` with Julia's standard
+`OrdinaryDiffEqLowOrderRK.DP5()`, the explicit adaptive Dormand–Prince 5(4)
+Runge–Kutta method that Stan's `ode_rk45_tol` also uses. Load
+`OrdinaryDiffEqLowOrderRK`, `SciMLBase`, and `SciMLSensitivity` to activate
+this native numerical extension.
+
+The arguments, the returned times-by-states `Matrix{Float64}`, the per-output
+step budget, the read-only and dual-number requirements on the RHS, the
+packing of `args`, and ordinary native Enzyme Reverse through
+`ForwardDiffSensitivity()` are exactly those of [`rk_ode_bdf_tol`](@ref): both
+are one shared adapter. Besides the integration method, they differ in one
+respect: outputs come from DP5's dense interpolant, as in Stan's dense-output
+RK45, so requesting more output times adds no solver steps, whereas
+`rk_ode_bdf_tol` ends a step at every output time. As an explicit method, DP5
+suits nonstiff systems and needs no Newton Jacobian; a stiff system takes many
+small steps and can exhaust `maxsteps`, where `rk_ode_bdf_tol` is the stiff
+choice.
+
+Stan's `ode_rk45(f, y0, t0, ts, args...)` is this call with `reltol = 1e-6`,
+`abstol = 1e-6` and `maxsteps = 10^6`. Stan returns one state vector per
+output time; this callable returns them as matrix rows.
+"""
+function rk_ode_rk45_tol end
+
+# Shared standard-Julia adapter behind the named entries above, implemented by
+# the SciML extension: `_native_ode_tol(alg, f, y0, t0, ts, reltol, abstol,
+# maxsteps, args...)` with `alg` a SciML ODE algorithm.
+function _native_ode_tol end
+
+# Whether the adapter ends a solver step at every requested output time
+# (`true`) or takes outputs from the solver's dense interpolant (`false`).
+function _native_ode_steps_to_outputs end
