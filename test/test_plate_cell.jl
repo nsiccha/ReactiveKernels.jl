@@ -401,6 +401,83 @@ end
     @test findall(vec(any(!iszero, dZ; dims = 2))) == [d.codes[2]]
 end
 
+# A plate's output read whole by a later plate at that plate's own position
+# (`pred[i]`), the shape RKPPL emits for a caller-owned law observing a kernel
+# plate's per-row output (snag `brm-s-nlme-subje-f6f0efd3`). The producing
+# plate, and the predictor it reads at its own row, run at the cell's row only.
+@kernel _cell_plate_upstream(positions::Vector{Int}, y, rows::Vector{Int}, w,
+                             codes::Vector{Int}, z, a::Float64) = begin
+    log_k = a .+ 0.5 .* w .+ z[codes]
+    pred = plate(rows) do r
+        k = exp(log_k[r])
+        (k, 2k)
+    end
+    second = plate(rows, pred) do r, p
+        p[2]
+    end
+    dens = plate(positions, y) do i, yi
+        -(yi - second[i])^2 / 2
+    end
+    total = sum(dens)
+    return total
+end
+
+@testset "plate_cell: a plate's output read at the cell's own position" begin
+    have = (:positions, :y, :rows, :w, :codes, :z, :a)
+    k = prepare(plate_cell(_cell_plate_upstream, :dens; index = :i);
+        have = (have..., :i), want = :dens_cell)
+    full = prepare(_cell_plate_upstream; have, want = :dens)
+    function data(n; levels = max(1, n ÷ 2))
+        (; positions = collect(1:n), y = sin.(1:n), rows = collect(1:n),
+           w = collect(range(-1.0, 1.0; length = n)),
+           codes = [mod1(3j, levels) for j in 1:n],
+           z = collect(range(-0.5, 0.7; length = levels)))
+    end
+    d = data(9)
+    reference = full(d..., 0.3)
+    @test [k(d..., 0.3, i) for i in d.positions] ≈ reference
+    # Neither plate nor the predictor is computed for the domain.
+    allocated(d) = (k(d..., 0.3, 2); @allocated k(d..., 0.3, 2))
+    small, large = allocated(data(10)), allocated(data(100_000))
+    @test large == small
+    @test large < 8 * 1000
+    bound = prepare(plate_cell(_cell_plate_upstream, :dens; index = :i);
+        have = (have..., :i), want = :dens_cell,
+        bound = (; d.positions, d.y, d.rows, d.w, d.codes))
+    @test [bound(d.z, 0.3, i) for i in d.positions] ≈ reference
+    # A value also wanted whole is computed whole and read in place.
+    both = prepare(plate_cell(_cell_plate_upstream, :dens; index = :i);
+        have = (have..., :i), want = (:dens_cell, :second))
+    second = prepare(_cell_plate_upstream; have, want = :second)(d..., 0.3)
+    @test all(both(d..., 0.3, i) == (k(d..., 0.3, i), second) for i in d.positions)
+    # The read keeps its index semantics: a shorter producer is out of bounds
+    # at the cells it lacks, as in the whole program, never extruded.
+    short = (; d..., rows = [1, 2, 3])
+    @test [k(short..., 0.3, i) for i in 1:3] ≈ [k(d..., 0.3, i) for i in 1:3]
+    @test_throws BoundsError full(short..., 0.3)
+    @test_throws BoundsError k(short..., 0.3, 4)
+    @test_throws BoundsError k(d..., 0.3, 10)
+    bad_code = (; d..., codes = [d.codes[1], length(d.z) + 1, d.codes[3:end]...])
+    @test_throws BoundsError k(bad_code..., 0.3, 2)
+    @test_throws DimensionMismatch k((; d..., w = [d.w; 0.0])..., 0.3, 2)
+    # Native Enzyme Reverse: only the gathered entry of z has a derivative.
+    original = deepcopy(d)
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for i in (1, 6)
+        latent = prepare_ad(k, backend, d..., 0.3, i; active = :z)
+        value, dz = ad_value_and_gradient(latent, d..., 0.3, i)
+        @test value ≈ reference[i]
+        @test findall(!iszero, dz) == [d.codes[i]]
+        e = zero(d.z); e[d.codes[i]] = 1.0
+        @test dz[d.codes[i]] ≈ _cell_central(
+            h -> k((; d..., z = d.z .+ h .* e)..., 0.3, i), 0.0) rtol = 1e-6
+        scalar = prepare_ad(k, backend, d..., 0.3, i; active = :a)
+        _, da = ad_value_and_gradient(scalar, d..., 0.3, i)
+        @test da ≈ _cell_central(a -> k(d..., a, i), 0.3) rtol = 1e-6
+    end
+    @test d == original
+end
+
 @kernel _cell_batched_matrix(x::Matrix{Float64}, y::Matrix{Float64}, a::Float64) = begin
     loc = x .+ a
     dens = plate(loc, y) do li, yi

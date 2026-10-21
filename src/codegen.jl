@@ -4264,7 +4264,7 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
             continue
         end
         callargs = Any[nm(inp) for inp in r.inputs]
-        if cells !== nothing && r.id in cells.recipes
+        if cells !== nothing && r.id in cells.recipes && !(r.op isa _AuthoredPlateOp)
             # Its table slot stays here; its consumer cell calls it per row.
             push!(runtime_ops, r.op)
             push!(runtime_recipes, r)
@@ -4299,6 +4299,18 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
                 "an authored plate recipe must have exactly one pointwise output"))
             pointwise = only(r.outputs)
             pointwise_id = canon_id(g, pointwise.id)
+            if cells !== nothing && r.id in cells.recipes
+                # Computed only at the rows its reading cells read
+                # (`_cell_window!`): reserve its table slots here, as for a
+                # strip member, and lower it at each of those rows.
+                cells.slots[r.id] = length(runtime_ops)
+                cells.plates[r.id] = callvalues
+                _lower_authored_plate_native!(
+                    Expr(:block), runtime_ops, runtime_recipes, r.op, callargs,
+                    callvalues, nm(pointwise), nothing)
+                push!(assigned, pointwise_id)
+                continue
+            end
             total_recipe = _authored_plate_total_recipe(p, r)
             total_fold = total_recipe === nothing ? sum :
                 _plate_total_consumer_fold(total_recipe)
@@ -4395,7 +4407,8 @@ function _lower_with_ops(p::Plan; tensorized::Bool = false,
         if inline_embedded && r.op isa _AuthoredPlateCellOp
             _lower_authored_plate_cell!(body, runtime_ops, runtime_recipes, r,
                 callargs, lhs, tensorized;
-                windows = cells === nothing ? nothing : _CellEmitter(body, cells, names))
+                windows = cells === nothing ? nothing :
+                    _CellEmitter(body, cells, names, runtime_ops, runtime_recipes))
             continue
         end
         if inline_embedded && r.op isa _AuthoredScanOp
