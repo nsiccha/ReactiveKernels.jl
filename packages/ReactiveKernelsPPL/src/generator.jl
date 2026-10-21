@@ -5019,7 +5019,7 @@ end
 # other scans' trajectories, indexed by the body as in a Julia loop. The
 # scan's own carried arrays are read through their seeds, lags and history.
 _scan_readable_names(plan::StructuralPlan, s::ScanSpec) = setdiff(
-    union(Set{Symbol}(_all_names(plan)), Set{Symbol}(keys(plan.columns))),
+    union(_all_name_set(plan), Set{Symbol}(keys(plan.columns))),
     Set{Symbol}(s.states))
 
 # The innovation steps of an emittable non-centered scan, in body order; a
