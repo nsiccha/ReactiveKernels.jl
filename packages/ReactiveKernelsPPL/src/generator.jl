@@ -1399,6 +1399,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
     terms = Any[]
     points = Pair{Symbol,Any}[]
     arguments = Pair{Symbol,Any}[]
+    laws = Pair{Symbol,Any}[]
     for r in plan.responses
         # A plate loop covers its whole response, so a cell-broadcast
         # response observes every entry of each index's array.
@@ -1409,6 +1410,8 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         append!(stmts, rs)
         args = _observation_arguments(r, plan, rs)
         args === nothing || push!(arguments, r.response => args)
+        law = _law_entry(r, plan, rs)
+        law === nothing || push!(laws, r.response => law)
         push!(terms, _lik_name(r.label))
         pw = _pw_name(r.label)
         if !_cell_broadcast_response(plan, r)
@@ -1468,6 +1471,7 @@ function _likelihood_statements(plan::StructuralPlan, layout; gathers,
         Expr(:tuple, (Expr(:(=), name, value) for (name, value) in points)...)
     push!(stmts, Expr(:(=), :pointwise, values))
     push!(stmts, _observations_statement(points, arguments))
+    push!(stmts, _predictive_statement(points, laws))
     return stmts
 end
 
@@ -1557,7 +1561,8 @@ function _cell_broadcast_stmts(r::LikelihoodSpec, plan::StructuralPlan,
         stmts, upstream, [p.name for p in plan.predictors],
         "response $(r.label) observes one array per index, and its $(r.family) statements";
         arguments = _observation_argument_inputs(r, stmts),
-        argument_node = Symbol(:_ppl_obsargs_, r.label), pointstmts, pointvalue)
+        argument_node = Symbol(:_ppl_obsargs_, r.label), pointstmts, pointvalue,
+        law = _law_name(r.label))
 end
 
 # A caller-owned sampling RHS (`y[i] .~ LogDensity.(f, loc[i], s)`) in the
@@ -1578,12 +1583,15 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
         pw::Symbol, stmts::Vector{Expr}, upstream::Vector{Expr},
         axisnodes::Vector{Symbol}, what::String; arguments = nothing,
         argument_node::Symbol = :_ppl_unused_observation_arguments,
-        pointstmts = Expr[], pointvalue = pw)
+        pointstmts = Expr[], pointvalue = pw, law::Union{Nothing,Symbol} = nothing)
     k = findall(st -> Meta.isexpr(st, :(=), 2) && st.args[1] == :($node::Float64), stmts)
     (length(k) == 1 && stmts[only(k)].args[2] == :(sum($pw))) ||
         throw(ContractValidationError("[generator] $what have no summed " *
             "pointwise plate to run per index"))
     body = Expr[st for (i, st) in enumerate(stmts) if i != only(k)]
+    # The law gets its own group plate below, zipping only what it reads.
+    lawi = law === nothing ? nothing : findfirst(st -> _assigned_name(st) === law, body)
+    lawstmt = lawi === nothing ? nothing : popat!(body, lawi)
     append!(body, pointstmts)
     defined = Set{Symbol}(something.(_assigned_name.(body), :_))
     known = Set{Symbol}(keys(plan.columns))
@@ -1668,9 +1676,20 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
     # its per-index totals; RK evaluates only the plate a query selects. The
     # declared total type also seeds RK's summed plate when the operands'
     # element types are known only at run time (a composed child's output).
-    groupplate(statements, result...) = Expr(:do, Expr(:call, :plate, lanes...),
-        Expr(:(->), Expr(:tuple, (aliases[v] for v in lanes)...),
+    groupplate_on(sub, statements, result...) = Expr(:do, Expr(:call, :plate, sub...),
+        Expr(:(->), Expr(:tuple, (aliases[v] for v in sub)...),
             Expr(:block, LineNumberNode(0, :generator), deepcopy(statements)..., result...)))
+    groupplate(statements, result...) = groupplate_on(lanes, statements, result...)
+    # A value the observation's arguments determine (its law, its location
+    # and scale) zips only the per-index values it reads: the response is
+    # not among them, so a binding that leaves the response absent evaluates
+    # it, with the indices the cell's other per-index values give.
+    function readlanes(statements, value)
+        reads = _statement_value_reads!(Set{Symbol}(), value)
+        foreach(st -> _statement_value_reads!(reads, st.args[2]), statements)
+        sub = Symbol[v for v in lanes if aliases[v] in reads]
+        return isempty(sub) ? lanes : sub
+    end
     totals = Symbol(pw, :_totals)
     result = Expr[
         :($pw = $(groupplate(cell, Expr(:call, GlobalRef(Base, :identity),
@@ -1678,6 +1697,17 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
         :($totals = $(groupplate(cell, :(_ppl_group_total::Float64 = sum($group)),
             :_ppl_group_total))),
         :($node::Float64 = sum($totals))]
+    if lawstmt !== nothing
+        lawgroup = Symbol(law, :_group)
+        la = copy(aliases)
+        la[law] = lawgroup
+        lawcell, _ = _needed_statements(
+            Expr[(_hsubst(st, la) for st in body)..., _hsubst(lawstmt, la)])
+        lawvalue = Expr(:call, GlobalRef(Base, :identity), lawgroup)
+        sub = readlanes(lawcell, lawvalue)
+        _cell_value_types!(lawcell, Set{Symbol}(aliases[v] for v in sub))
+        push!(result, :($law = $(groupplate_on(sub, lawcell, lawvalue))))
+    end
     if arguments !== nothing
         location, scale = arguments
         grouped(x) = x isa Symbol && x in argument_pergroup
@@ -1691,7 +1721,8 @@ function _cell_broadcast_group(plan::StructuralPlan, response::Symbol, node::Sym
             value = location_grouped && scale_grouped ?
                 :((location = $loc, scale = $sc)) : location_grouped ? loc : sc
             grouped_node = Symbol(argument_node, :_groups)
-            push!(result, :($grouped_node = $(groupplate(argument_cell, value))))
+            push!(result, :($grouped_node = $(groupplate_on(
+                readlanes(argument_cell, value), argument_cell, value))))
             project(field) = :(plate($grouped_node) do argument
                 getproperty(argument, $(QuoteNode(field)))
             end)
@@ -1885,11 +1916,19 @@ function _response_likelihood_stmts(r::LikelihoodSpec, plan::StructuralPlan)
         shape = obs !== nothing && hasproperty(obs, :domains) ?
             length.(obs.domains[r.label]) :
             r.range isa Expr ? size(_selected_response_column(plan, r)) : size(plan.columns[r.response])
-        return Expr[
+        stmts = Expr[
         :($(_pw_name(r.label)) = zeros($shape)),
         :($(_lik_name(r.label))::Float64 = 0.0)]
+        # An empty response draws nothing, so its law reads nothing.
+        _response_rows(plan, r) == 0 && push!(stmts, :($(_law_name(r.label)) = ()))
+        return stmts
     end
     stmts = _response_likelihood_stmts_full(r, plan)
+    # The law each observation is drawn from (`prepare_predictive`) is read
+    # off the density's own plate before range, presence and packing rewrite
+    # it, so those rewrites reach the law exactly as they reach the density.
+    law = _law_statement(r, stmts)
+    law === nothing || push!(stmts, law)
     if r.range isa Expr
         return _mask_response_stmts(r, plan, _ranged_response_stmts(r, plan, stmts))
     end

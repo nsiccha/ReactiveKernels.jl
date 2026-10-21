@@ -313,6 +313,7 @@ const _PPL_TEST_FILES = (
     "test_cell_call_index.jl",
     "test_rebinding_rows.jl",
     "test_absent_observations.jl",
+    "test_predictive_draws.jl",
     "test_glm_object_values.jl",
     "test_native_plain_plate_emission.jl",
     "test_pointwise_arithmetic_emission.jl",

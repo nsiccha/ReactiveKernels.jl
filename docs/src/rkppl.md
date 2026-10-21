@@ -366,9 +366,12 @@ geometry is not yet implemented. Ordinary RHS keyword arguments are preserved;
 geometry endpoints receive those same keyword values. Structural argument
 expressions retain Julia's `Expr(:parameters, ...)` keyword representation.
 
-This protocol currently computes log densities. Generated-only draws and RNG
-execution remain future work; they will require a draw capability separately
-from parameter geometry, without adding generated values to sampler coordinates.
+This protocol computes log densities. Posterior-predictive draws of the
+built-in response families are available through `prepare_predictive`
+("Predictive draws" below); draws from caller-owned RHS definitions,
+generated-only declarations and prior resampling remain future work. They
+will need a draw capability separate from parameter geometry, without adding
+generated values to sampler coordinates.
 
 ## Julia semantics, written out
 
@@ -1181,10 +1184,12 @@ prepare_query(built, design, :sampler)        # refused: `y` is absent
 - A response holding one array per index (`y[i] .~ D.(…)` cells) can be
   absent too. Each index's cell takes the shape of the data the cell reads
   per index (`x[i]`). When the cell reads only computed values, the graph
-  built from the fit says the response holds arrays. In that program each
-  cell's observation arguments are computed inside the plate over the
-  response's entries, so `:observations` reads it; query an authored
-  per-index value instead (`loc` in `y[i] .~ Normal.(loc[i], s)`).
+  built from the fit says the response holds arrays. `:observations` and
+  predictive draws compute each index's arguments in a plate over the
+  per-index values the cell reads besides the response (`x[i]`, `loc[i]`),
+  so they evaluate on a design without the response. A cell that reads no
+  per-index value but the response (`y[i] .~ Normal.(mu, s)` with shared
+  `mu` and `s`) has no other indices to go by, and those queries read it.
 - Program identity is checked as for any other binding (other levels or
   data types need their own build). An absent value takes the type its input
   has in the built graph. Building from a binding without the response uses
@@ -1193,6 +1198,67 @@ prepare_query(built, design, :sampler)        # refused: `y` is absent
 - The raw `ReactiveKernels.prepare(built.spec; …, bound)` cut over
   `design.columns` evaluates the available values too; reading an absent
   value raises `AbsentObservationError` naming it.
+
+### Predictive draws
+
+`prepare_predictive` draws every observation from the law the model gives
+it at given parameter values: posterior-predictive draws when the values are
+posterior draws, on the fitted binding or on a prediction design without the
+response. The graph computes each observation's law arguments, the same
+values its density reads, as an ordinary query with no randomness in it.
+Drawing happens in plain Julia at the query boundary: with Distributions.jl
+loaded, its package extension builds each observation's law, and
+`rand(rng, law)` draws it.
+
+```julia
+using Distributions, Random
+x = [0.1, 0.5, 1.0, 2.0]; y = [1.2, 0.5, 2.5, 4.0]; lloq = 0.5
+m = @rkppl begin
+    a ~ Normal(0, 1); b ~ Normal(0, 1); add ~ Exponential(1); prop ~ Exponential(1)
+    mu = exp.(a .+ b .* x)
+    sd = hypot.(add, mu .* prop)
+    y .~ censored.(Normal.(mu, sd), lloq, Inf)
+end
+fit = m(; x, lloq) | (; y)
+built = build_kernel(fit)
+design = bind_data(fit, (; x = [0.0, 3.0, 5.0], lloq))   # y absent
+pred = prepare_predictive(built, design)
+draws = pred(u, Xoshiro(1))           # (y = [...],): one draw per design row
+predictive_draws!(draws, pred, u, rng) # in place, reusing `draws`
+laws = predictive_laws(pred, u)        # lazy: laws.y[i] isa Distributions.Censored
+```
+
+- **Laws.** Each response's law is the Distributions.jl law of the RK
+  distribution object its density evaluates: `Normal`, `LogNormal`,
+  `μ + σ * TDist(ν)`, `Poisson`, `Bernoulli`, `Binomial`, `NegativeBinomial`,
+  `Gamma`, `Weibull`, `Exponential`, `BetaBinomial`, zero-inflated Poisson
+  and Binomial (a mixture with a structural zero), with the link the model
+  wrote. `censored` and `truncated` evidence wrap it as RKPPL observes it:
+  `Distributions.censored` is the clamp law, `Distributions.truncated` the
+  law renormalized on its inclusive bounds. The extension's adapter methods
+  are the only place Distributions.jl enters.
+- **Shapes.** Draws are keyed like `:pointwise` and shaped like the
+  responses, with one array per index for a response holding one array per
+  `@plate` index. A response left absent takes the shape binding gave it:
+  the operands it broadcasts with, and for one array per index each index's
+  operands (`x[i]`). A shared location or scale broadcasts over the entries.
+- **Randomness stays outside RK kernels.** `pred(u, rng)` draws the entries
+  in order (column-major, then index by index) with the caller's RNG, so a
+  seeded RNG reproduces the draws, and passing a copy of one RNG at every
+  posterior draw reuses one stream. The sampler's coordinates, density and
+  gradients are unchanged; the law node is a separate query.
+- **Memory.** The graph returns the law arguments, about one number per
+  argument and entry; a law is built per entry when it is read and not
+  stored. `predictive_draws!` reuses one output across posterior draws.
+- **Not covered yet.** Mixtures, hurdle models, Beta, inverse Gaussian,
+  von Mises, categorical and ordinal responses, caller-owned sampling laws
+  (`LogDensity`), scalar `~` observations and conditioned declarations: a
+  model with any of them is refused at `prepare_predictive`, naming them.
+  Weighted likelihoods, interval-censored evidence and packed (`mi`)
+  responses define no single draw and are refused the same way.
+- Native execution. Pinned by `test_predictive_draws.jl`: each entry's law
+  has the model's own `:pointwise` density at the observed value, at
+  several parameter points.
 
 ### One cell of an observation
 
