@@ -214,6 +214,21 @@ of an init-including scan and its dotted transforms instead stream through
 the scan loop; see [scans](scan.md). Those trajectories and transformed
 vectors need no lane buffers.
 
+The values a plate cell computes keep lane slots too. In the cells of a
+residual plate, at every nesting depth, each value other than the cell's
+result that a nested plate or scan, a dotted call or an array slice produces
+reuses one buffer across the plate's cells, its positions and, for a borrowed
+reader or a scheduled worker, its calls. A group plate whose cell computes a
+plate over the group's times, a scan over its doses and a few dotted calls
+therefore allocates none of them per group. The cell's result is stored by
+reference in the plate's output. A result that shares memory with a slot's
+buffer, or holds it (an opaque function returned the buffer or a view of it, a
+tuple or array contains it), takes that buffer with it, and the next cell
+allocates afresh, so every stored result keeps its values. Each cell's result,
+the values of opaque functions and the work inside scan steps still allocate
+as in the scalar kernel. A prepared scalar kernel, including one prepared for
+reverse-mode AD, keeps allocating its cell values at every cell.
+
 By default every call owns fresh stacked output arrays, including record
 leaves. Later calls cannot change retained results. To consume bounded batches
 immediately on the native backend, opt into final output-buffer reuse:
