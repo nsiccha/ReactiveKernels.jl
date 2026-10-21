@@ -21,16 +21,19 @@ function _pco_compiled_ops(kernel, ru)
 end
 
 @testset "Reactant: a shared @plate cell's projections read its lanes" begin
-    for kind in (:scalar_two_outputs, :cell_observations, :output_and_observation,
-            :level_outputs)
+    for kind in (:scalar_two_outputs, :scalar_with_unread, :cell_observations,
+            :output_and_observation, :level_outputs)
         inventories = map((4, 11)) do n
             fx = _pco_fixture(kind, n)
             sampler = prepare_sampler(fx.built, fx.bound, fx.u;
                 backend = AutoEnzyme(; mode = Enzyme.Reverse))
             kernel = prepare_query(fx.built, fx.bound, :sampler)
             ru = Reactant.to_rarray(fx.u)
+            _PCO_DERIVED[] = 0
             primal = Reactant.@compile kernel(ru)
             reverse = compile_ad_value_and_gradient(sampler.ad, ru)
+            # An unread value of the cell is not traced into either program.
+            @test _PCO_DERIVED[] == 0
             for u in (fx.u, fx.u .+ 0.11)
                 input = Reactant.to_rarray(u)
                 value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)

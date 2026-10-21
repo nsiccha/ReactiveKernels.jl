@@ -9,11 +9,14 @@ using DifferentiationInterface, Distributions, Enzyme, ReactiveKernels, Reactive
 
 const _PCO_LIVE = Ref(0)
 const _PCO_DATA = Ref(0)
+# A value that no density reads (a derived quantity) counts separately.
+const _PCO_DERIVED = Ref(0)
 _pco_live(t, rate) = (_PCO_LIVE[] += 1; t .* exp(rate))
 _pco_scalar(w, rate) = (_PCO_LIVE[] += 1; w * exp(rate))
 _pco_row(w, rate) = (_PCO_LIVE[] += 1; [w * exp(rate), w + rate])
 _pco_positions(kinds) = (_PCO_DATA[] += 1; findall(isone, kinds))
 _pco_flat(cells) = reduce(vcat, cells; init = Float64[])
+_pco_unread(m) = (_PCO_DERIVED[] += 1; m^2)
 
 function _pco_data(n)
     t = [Float64[0.2 + 0.1 * i + 0.3 * j for j in 1:(1 + mod(i, 3))] for i in 1:n]
@@ -56,6 +59,21 @@ function _pco_case(kind)
             c[i] = m
             r[i] = 2 * m
         end
+        y1 .~ Normal.(c, s)
+        y2 .~ Normal.(r, s)
+    end, d -> length(d.w), function (d, q)
+        m = d.w .* exp.(q.a .+ d.x)
+        (m, 2 .* m)
+    end)
+    # A third value of the cell that only an unread definition reads.
+    kind === :scalar_with_unread && return (quote
+        @plate for i in eachindex(w)
+            m = _pco_scalar(w[i], la[i])
+            c[i] = m
+            r[i] = 2 * m
+            d[i] = _pco_unread(m)
+        end
+        dsum = sum(d)
         y1 .~ Normal.(c, s)
         y2 .~ Normal.(r, s)
     end, d -> length(d.w), function (d, q)
@@ -178,8 +196,9 @@ end
 _pco_structure(program) = [(e.kind, e.depth) for e in recipe_inventory(program)
     if e.kind !== :ordinary]
 
-const _PCO_KINDS = (:arrays_two_outputs, :scalar_two_outputs, :cell_observations,
-    :output_and_observation, :row_output, :level_outputs, :data_only_beside_live)
+const _PCO_KINDS = (:arrays_two_outputs, :scalar_two_outputs, :scalar_with_unread,
+    :cell_observations, :output_and_observation, :row_output, :level_outputs,
+    :data_only_beside_live)
 
 @testset "a @plate cell runs once per index however many values it defines" begin
     for kind in _PCO_KINDS
@@ -195,12 +214,13 @@ const _PCO_KINDS = (:arrays_two_outputs, :scalar_two_outputs, :cell_observations
                 @test value ≈ fx.oracle(u) rtol = 1e-10
                 @test gradient ≈ _pco_fd(fx.oracle, u) rtol = 1e-6 atol = 1e-8
             end
-            _PCO_LIVE[] = 0
+            _PCO_LIVE[] = _PCO_DERIVED[] = 0
             sampler(fx.u)
             @test _PCO_LIVE[] == fx.cells
             _PCO_LIVE[] = 0
             sampler_value_and_gradient!(sampler, g, fx.u)
             @test _PCO_LIVE[] == fx.cells
+            @test _PCO_DERIVED[] == 0
             @test isequal(fx.data, saved)
             _pco_structure(sampler.kernel)
         end
@@ -299,7 +319,6 @@ end
 # beside active values, which static-activity Enzyme Reverse cannot
 # differentiate, so a gradient that ran it would fail (snag
 # density-gradient-e07d1360).
-const _PCO_DERIVED = Ref(0)
 _pco_derived(yi, m, s) = (_PCO_DERIVED[] += 1; map((o, l) -> (o - l) / s, yi, m))
 
 @testset "a shared @plate cell's unread value runs only when queried" begin
