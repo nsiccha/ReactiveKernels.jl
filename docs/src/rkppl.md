@@ -913,6 +913,31 @@ Enzyme reverse gradients are supported. Innovation densities use a separately
 selectable plate reading the completed trajectories, so the prior does not
 replay the carried updates.
 
+A carried array whose name is observed data is observed. Each of its seed and
+step `~` statements is an observation: its density at the observed entry is
+that entry's conditional density given the earlier ones, and every read of the
+array reads the data. With the array unbound, the same block is a latent
+trajectory. In a `@plate` cell the observed array is the loop index's array,
+one series per index, as in AR(1) errors per group:
+
+```julia
+@plate for g in eachindex(y)          # y[g]: group g's observed series
+    @scan begin
+        y[g][1] ~ Normal(mu[g][1], sigma / sqrt(1 - phi^2))
+        for t in 2:length(y[g])
+            y[g][t] ~ Normal(mu[g][t] + phi * (y[g][t - 1] - mu[g][t - 1]), sigma)
+        end
+    end
+end
+```
+
+The densities enter `likelihood`, and `:pointwise` holds one density per
+entry; the observed array adds no coordinates. Latent and deterministic
+carried arrays may share the recurrence, such as a stochastic volatility
+`h[t]` or an ARMA residual. An observed array is written only by `~`
+statements and has one entry per scan index; missing entries are not
+supported yet.
+
 ### One array per index
 
 A dotted cell broadcasts over its own iteration's values, as the loop it
@@ -1135,8 +1160,10 @@ prepare_query(built, design, :sampler)        # refused: `y` is absent
 ```
 
 - An observation is absent when a binding supplies no value for it: a
-  response, a joint response's outcome, a Multinomial count column, or the
-  observed value of a conditioned declaration. `lower_rkppl` keeps a name
+  response, a joint response's outcome, a Multinomial count column, a
+  caller-owned law's observation (`y .~ LogDensity.(f, …)`, including an
+  observed `@scan` array), or the observed value of a conditioned
+  declaration. `lower_rkppl` keeps a name
   that `conditioned` lists as an observation when the data omit it, and a
   model call leaves a response it does not supply absent (`m(; x)` beside
   `y .~ Normal.(mu, s)`; `m(; x) | (; y)` observes it). Other data stay

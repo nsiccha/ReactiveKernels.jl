@@ -1030,6 +1030,9 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         shared_defs::Set{Symbol} = Set{Symbol}(),
         array_entries::Set{Symbol} = Set{Symbol}())
     input_data = data
+    # A `@scan` carried array that is observed data observes its entries
+    # (`observed_scan.jl`); the rewrite is an ordinary program.
+    ast = Expr(:block, _expand_observed_scans(ast.args, data)...)
     ast = _observation_call_definitions(ast, data, mod)
     ast = _gathered_value_definitions(ast, data)
     sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts, cell_priors =

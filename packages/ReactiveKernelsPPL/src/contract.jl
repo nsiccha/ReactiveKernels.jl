@@ -2075,6 +2075,13 @@ function _absent_observations!(plan::StructuralPlan, columns::AbstractDict)
         (haskey(columns, nm) || nm in derived || nm in defined) && continue
         columns[nm] = _absent_like(nm, _valueless_response_eltype(r), (1,))
     end
+    # A caller-owned law's observation (`y .~ LogDensity.(f, …)`) is absent
+    # the same way.
+    for p in plan.external_observations
+        nm = p.name
+        (haskey(columns, nm) || nm in derived || nm in defined) && continue
+        columns[nm] = _absent_like(nm, Float64, (1,))
+    end
     for name in _conditioned_inputs(plan)
         input = _conditioned_input(name)
         (haskey(columns, name) || haskey(columns, input)) && continue
@@ -2150,6 +2157,15 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
             columns[nm] = cells === nothing ? _absent_like(nm, eltype(old), dims) :
                 _absent_cells(nm, Array{eltype(old),length(first(cells))}, cells)
         end
+    end
+    # A caller-owned law broadcasts over its own arguments, so only a dotted
+    # `@plate` cell's per-index data shape its absent observation.
+    for p in plan.external_observations
+        nm = p.name
+        nm in absent || continue
+        cells = _absent_cell_shapes(plan, columns, nm)
+        cells === nothing && continue
+        columns[nm] = _absent_cells(nm, Array{eltype(columns[nm]),length(first(cells))}, cells)
     end
     return columns
 end
@@ -7374,7 +7390,10 @@ _conditioned_inputs(plan::StructuralPlan) =
     setdiff(plan.conditioned, Set(p.name for p in plan.factors))
 _has_observation_axis(plan) = !isempty(plan.responses) ||
     any(p -> p.range === nothing, plan.plate_parameters) ||
-    !isempty(plan.scans)
+    any(s -> !_scan_length_bound(plan, s), plan.scans)
+# A scan takes the observation axis only for the historical unsupplied length
+# name (`_scan_length`); a literal or bound length is its own.
+_scan_length_bound(plan, s::ScanSpec) = s.hi isa Int || haskey(plan.columns, s.hi)
 
 # Reads of `raw` names in `ex` (the reads `_expr_value_symbols` sees):
 # inside an argument of an undotted module call into `whole`, anywhere
@@ -8079,7 +8098,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # Observation statements determine their own axes; unrelated axes add
     # their likelihood rows without sizing one value from another's extent.
     axis_plan = _with(plan; columns = columns)
-    n = if !_has_observation_axis(plan)
+    n = if !_has_observation_axis(axis_plan)
         1
     else
         axes = _observation_axes(axis_plan)

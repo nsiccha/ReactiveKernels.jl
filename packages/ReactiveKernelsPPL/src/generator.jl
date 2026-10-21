@@ -5029,8 +5029,17 @@ function _scan_translate_seed(ex, s::ScanSpec, scalars)
     args = ex.head === :call ? ex.args[2:end] : ex.args
     newargs = Any[_scan_translate_seed(a, s, scalars) for a in args]
     return ex.head === :call ?
-        Expr(:call, ex.args[1], newargs...) : Expr(ex.head, newargs...)
+        Expr(:call, _scan_translate_head(ex.args[1],
+            h -> _scan_translate_seed(h, s, scalars)), newargs...) :
+        Expr(ex.head, newargs...)
 end
+
+# A call head computed from values (`normal(m, s).logpdf(x)`, `f(a)(x)`)
+# reads the same scope as the arguments, as in Julia. A function name or a
+# module path (`Base.sqrt`) stays as written.
+_scan_computed_head(h) = h isa Expr &&
+    (h.head === :call || (h.head === :. && _scan_computed_head(h.args[1])))
+_scan_translate_head(h, translate) = _scan_computed_head(h) ? translate(h) : h
 
 # The carry window: each carried array read at backward lags keeps its last
 # `L` values as `<state>_lag1 … <state>_lagL` fields of a NamedTuple carry.
@@ -5114,7 +5123,9 @@ function _scan_translate_step(ex, s::ScanSpec, env, scalars)
     args = ex.head === :call ? ex.args[2:end] : ex.args
     newargs = Any[_scan_translate_step(a, s, env, scalars) for a in args]
     return ex.head === :call ?
-        Expr(:call, ex.args[1], newargs...) : Expr(ex.head, newargs...)
+        Expr(:call, _scan_translate_head(ex.args[1],
+            h -> _scan_translate_step(h, s, env, scalars)), newargs...) :
+        Expr(ex.head, newargs...)
 end
 
 # The do-block body of one reconstruction: the steps in order, the next carry
