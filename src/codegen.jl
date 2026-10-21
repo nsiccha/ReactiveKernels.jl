@@ -3440,18 +3440,32 @@ end
 # selected sum consumers, and preserves all named scalar recipes for replay.
 # Type-only arguments carry the enclosing DAG's coordinate evidence through
 # embedding without rebasing its operation-table references a second time.
+# Within a lowering that collects cell slots (`_lower_with_ops(...; cell_slots)`,
+# a position residual), every value of the cell other than its result that has a
+# destination form keeps a lane slot across cells: `slots` are the slot names
+# the cell's AST takes after its inputs, and the collection gains them.
 function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
                                 atomic, callvalues)
     hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
     hint_ids = sort!(collect(keys(types)))
     type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
-    ast, ops, recipes = _lower_with_ops(scalar; type_hints)
+    cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
+    recycle = Pair{ValueId,Symbol}[]
+    if cell_slots !== nothing
+        excluded = Set(canon_id(scalar.graph, v.id) for v in vcat(scalar.want, scalar.have))
+        for v in _lane_slot_values(scalar, excluded)
+            push!(recycle, canon_id(scalar.graph, v.id) => gensym(Symbol(v.name, :_cell_slot)))
+        end
+        append!(cell_slots, (last(pair) for pair in recycle))
+    end
+    ast, ops, recipes = _lower_with_ops(scalar; type_hints, recycle, cell_slots)
     offset = length(runtime_ops)
     append!(runtime_ops, ops)
     append!(runtime_recipes, recipes)
     T = types[canon_id(kernel.plan.graph, only(kernel.plan.want).id)]
     (; ast, offset, type = T, inputs = scalar.have,
+       slots = Symbol[last(pair) for pair in recycle],
        invariants = hoisted === nothing ? Int[] : hoisted.moved,
        input_types = Any[types[cid] for cid in hint_ids])
 end
@@ -3848,8 +3862,10 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         # domain must not evaluate new queries merely to bind an unused hint.
         input_types = _bind_native_type_exprs!(loopbody, nested.input_types)
         append!(loopbody.args,
-            _embedded_statements(nested.ast, [args; input_types],
+            _embedded_statements(nested.ast, [args; nested.slots; input_types],
                                  nested_result, nested.offset))
+        isempty(nested.slots) || push!(loopbody.args, :($nested_result =
+            $(GlobalRef(@__MODULE__, :_lane_release!))($nested_result, $(nested.slots...))))
     end
     # A lane branch with arm graphs is inlined with first-use shared work
     # (`_plate_lane_arm_slots!`); its flags and shared locals are declared
@@ -4310,7 +4326,34 @@ end
 # `type_hints` maps logical value ids to extra type-only arguments in an
 # embedded native region. Empty coordinates can use the enclosing DAG's types;
 # no sample value or scalar recipe is evaluated to discover them.
-function _lower_with_ops(p::Plan; tensorized::Bool = false,
+# `cell_slots` collects the lane slots that the cells of this lowering's plates
+# give their own intermediates (`_plate_nested_native!`), at every nesting
+# depth. They are free names of the returned AST, which its caller binds to
+# `Ref{Any}` slots (`_lower_replicated_with_ops`). Every other lowering,
+# including one started while this one runs, collects none.
+function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
+                         kwargs...)
+    task_local_storage(() -> _lower_with_ops_collecting(p; kwargs...),
+                       _CELL_SLOTS, cell_slots)
+end
+const _CELL_SLOTS = :ReactiveKernels_cell_slots
+
+# The values of `p` that keep a lane slot: each single-output recipe value with
+# a destination form (`_replicated_lane_producer`) other than an `excluded` id.
+function _lane_slot_values(p::Plan, excluded)
+    values = Value[]
+    for r in p.recipes
+        length(r.outputs) == 1 || continue
+        cid = canon_id(p.graph, only(r.outputs).id)
+        cid in excluded && continue
+        get(p.producer, cid, nothing) === r || continue
+        _replicated_lane_producer(r) || continue
+        push!(values, only(r.outputs))
+    end
+    values
+end
+
+function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
                          inline_embedded::Bool = true,
                          declare::Bool = !tensorized && inline_embedded &&
                                          _needs_embedded_tensorization(p),
@@ -5045,8 +5088,9 @@ end
 # Lower one part as `prepare` lowers a scalar kernel. Every output is declared,
 # as the position driver always did: its body is host-only by construction
 # (a traced batch calls the scalar target through `_replica`).
-_replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[]) =
-    _lower_with_ops(_lowering_plan(part); declare = true, recycle)
+_replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
+                     cell_slots = nothing) =
+    _lower_with_ops(_lowering_plan(part); declare = true, recycle, cell_slots)
 
 # A bound constant keeps its exact value type (a bound view stays a view).
 function _replicated_declares(p::Plan, value::Value)
@@ -5099,20 +5143,18 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     # lane slot (`_lane_reuse(::Base.RefValue{Any}, ...)`) across positions and,
     # for a borrowed reader, across calls. A value the residual lowering fuses
     # away (a summed plate, a scan feeding a plate) never touches its slot.
-    want_ids = Set(canon_id(g, v.id) for v in p.want)
-    residual_have_ids = Set(canon_id(g, v.id) for v in parts.residual.have)
+    excluded = Set(canon_id(g, v.id) for v in vcat(p.want, parts.residual.have))
     scratch_vars = Any[]
-    for r in parts.residual.recipes
-        length(r.outputs) == 1 || continue
-        cid = canon_id(g, only(r.outputs).id)
-        (cid in want_ids || cid in residual_have_ids) && continue
-        get(parts.residual.producer, cid, nothing) === r || continue
-        any(pair -> first(pair) == cid, recycle) && continue
-        _replicated_lane_producer(r) || continue
-        push!(recycle, cid => gensym(Symbol(only(r.outputs).name, :_recycled)))
-        push!(scratch_vars, gensym(Symbol(only(r.outputs).name, :_scratch)))
+    for v in _lane_slot_values(parts.residual, excluded)
+        push!(recycle, canon_id(g, v.id) => gensym(Symbol(v.name, :_recycled)))
+        push!(scratch_vars, gensym(Symbol(v.name, :_scratch)))
     end
-    residual_ast, residual_ops, _ = _replicated_part_ast(parts.residual; recycle)
+    # The intermediates inside its plates' cells keep lane slots too, across
+    # cells as well as positions (`_plate_nested_native!`): the residual AST
+    # reads each by its collected name, bound below with the scratch slots.
+    cell_slots = Symbol[]
+    residual_ast, residual_ops, _ = _replicated_part_ast(parts.residual; recycle,
+                                                         cell_slots)
     residual_offset = length(prefix_ops)
     lane_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_lane))
                      for v in parts.residual.have if mapped(canon_id(g, v.id)))
@@ -5213,7 +5255,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane), nm(v), valtype(v))
         push!(body.args, Expr(:(=), lane, allocation))
     end
-    for (index, scratch) in enumerate(scratch_vars)
+    for (index, scratch) in enumerate([scratch_vars; cell_slots])
         push!(body.args, Expr(:(=), scratch, reuse ? slot(2 * nout + nhave + index) :
             Expr(:call, Expr(:curly, GlobalRef(Base, :RefValue), GlobalRef(Core, :Any)),
                  GlobalRef(Core, :nothing))))
@@ -5276,7 +5318,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     push!(body.args, Expr(:return, retval))
     Expr(:function, Expr(:tuple, argexprs...), body),
     (prefix_ops..., residual_ops...),
-    2 * nout + nhave + length(scratch_vars)
+    2 * nout + nhave + length(scratch_vars) + length(cell_slots)
 end
 
 # Destination-form producers of a position value: authored plates and scans,

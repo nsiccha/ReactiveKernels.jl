@@ -1115,6 +1115,30 @@ end
 @inline _lane_keep!(recycled, value) = value
 @inline _lane_keep!(slot::Base.RefValue{Any}, value) = (slot[] = value; value)
 
+# The intermediates of a plate cell in a position residual keep lane slots
+# across cells (`_plate_nested_native!`), but the cell's result is stored by
+# reference in the plate's output. A result that shares memory with a slot's
+# buffer (an opaque function returned the buffer or a view of it, a container
+# holds it) takes the buffer with it: the slot is emptied, so a later cell
+# allocates afresh instead of overwriting a stored result.
+@inline function _lane_release!(result, slots::Vararg{Base.RefValue{Any},N}) where {N}
+    isbits(result) && return result
+    foreach(slots) do slot
+        buffer = slot[]
+        buffer === nothing || !_lane_may_reference(result, buffer) || (slot[] = nothing)
+    end
+    result
+end
+# Any other value may hold an array.
+_lane_may_reference(result, buffer) = true
+_lane_may_reference(::Number, buffer) = false
+_lane_may_reference(result::AbstractArray, buffer) =
+    buffer isa AbstractArray && Base.mightalias(result, buffer) ||
+    (_replicated_may_contain_array(eltype(result)) &&
+     any(item -> _lane_may_reference(item, buffer), result))
+_lane_may_reference(result::Union{Tuple,NamedTuple}, buffer) =
+    any(item -> _lane_may_reference(item, buffer), result)
+
 # The buffer an authored plate or scan fills (`_lane_allocation`): the matching
 # recycled buffer, or `allocate(args...)`, kept when `recycled` is a lane slot.
 # - Not inlined, with one fixed-arity method per allocation arity. Inline, the
