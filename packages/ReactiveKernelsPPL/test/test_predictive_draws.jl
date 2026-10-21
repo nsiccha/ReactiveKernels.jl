@@ -275,6 +275,147 @@ end
     @test q(u, Xoshiro(2)).y == prepare_predictive(built, fit)(u, Xoshiro(2)).y
 end
 
+# The law node in a caller's own cut (snag prepare-predicti-ab9db01a): a
+# simulator WANTs it beside its summaries, with a random-effect block as a
+# runtime input, and vectorizes the cut over draws.
+_pd_ports(plan) = ReactiveKernelsPPL._query_columns(plan)
+_pd_data(plan) = Tuple(plan.columns[k] for k in _pd_ports(plan))
+_pd_summary = @kernel _pd_summary_kernel(mu) = begin
+    mu_mean = sum(mu) / length(mu)
+    return mu_mean
+end
+
+@testset "predictive draws: the law node in a caller's vectorized cut" begin
+    x, lloq = [0.1, 0.5, 1.0, 2.0, 0.3], _pd_lloq
+    g = [1, 1, 2, 2, 3]
+    y = [1.2, 0.5, 2.5, 4.0, 0.9]
+    m = @rkppl begin
+        a ~ Normal(0, 1); s ~ Exponential(1); tau ~ Exponential(1)
+        z[levels(g)] .~ Normal.(0, 1)
+        b = tau .* z
+        mu = a .+ b[g] .+ x
+        y .~ censored.(Normal.(mu, s), lloq, Inf)
+    end
+    fit = m(; x, g, lloq) | (; y)
+    built = build_kernel(fit)
+    node = predictive_node(built)
+    targets = predictive_targets(built, fit)
+    @test predictive_targets(built, m(; x, g, lloq) | (; y)) == targets
+    graph = ReactiveKernels.compose(built.spec, _pd_summary)
+    have = (:unconstrained, :b, _pd_ports(fit)...)
+    cut = Base.invokelatest(ReactiveKernels.prepare, graph; have, want = (node, :mu_mean))
+    D = 4
+    U = 0.2 .* randn(Xoshiro(1), built.layout.total, D)
+    B = randn(Xoshiro(2), 3, D)
+    one = Base.invokelatest(ReactiveKernels.prepare, graph; have, want = node)
+    for schedule in ((;), (; schedule = ReactiveKernels.NativeScheduling(; chunk_size = 2)))
+        reader = Base.invokelatest(ReactiveKernels.vectorize, cut;
+            batched = (:unconstrained, :b), reuse = true, schedule...)
+        value, mu_mean = Base.invokelatest(reader, U, B, _pd_data(fit)...)
+        for k in 1:D
+            c = constrain(built.layout, U[:, k])
+            mu = c.a .+ B[g, k] .+ x
+            @test mu_mean[k] ≈ sum(mu) / length(mu)
+            laws = predictive_laws(value, targets; position = k).y
+            @test size(laws) == size(y)
+            @test all(_pd_same(laws[i], mu[i], c.s, lloq) for i in eachindex(y))
+            # The batched value's position k is the unbatched cut's value.
+            single = Base.invokelatest(one, U[:, k], B[:, k], _pd_data(fit)...)
+            @test collect(predictive_laws(single, targets).y) == collect(laws)
+            rng = Xoshiro(k)
+            expected = [rand(rng, laws[i]) for i in eachindex(laws)]
+            @test predictive_draws(value, targets, Xoshiro(k); position = k).y == expected
+            out = (y = fill(NaN, size(y)),)
+            @test predictive_draws!(out, value, targets, Xoshiro(k); position = k) === out
+            @test out.y == expected
+        end
+        # A vectorized value needs its draw.
+        @test_throws DimensionMismatch predictive_laws(value, targets)
+        @test_throws BoundsError predictive_laws(value, targets; position = D + 1)
+    end
+    # Without extra inputs the cut evaluates what `prepare_predictive` does.
+    q = prepare_predictive(built, fit)
+    plain = Base.invokelatest(ReactiveKernels.prepare, built.spec;
+        have = (:unconstrained, _pd_ports(fit)...), want = node)
+    for k in 1:2
+        u = U[:, k]
+        @test q(u, Xoshiro(7)) == predictive_draws(
+            Base.invokelatest(plain, u, _pd_data(fit)...), targets, Xoshiro(7))
+    end
+    @test_throws ArgumentError predictive_node((; spec = _pd_summary))
+    @test_throws ArgumentError predictive_laws(
+        Base.invokelatest(plain, U[:, 1], _pd_data(fit)...), (z = targets.y,))
+end
+
+@testset "predictive draws: ranged and per-index laws in a vectorized cut" begin
+    x, lloq = _pd_x, _pd_lloq
+    D = 3
+    # A scalar cell observes the response entry by entry.
+    mc = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); add ~ Exponential(1); prop ~ Exponential(1)
+        @plate for i in eachindex(x)
+            loc = exp(a + b * x[i])
+            y[i] ~ censored(Normal(loc, _pd_addprop(loc, add, prop)), lloq, Inf)
+        end
+    end
+    fitc = mc(; x, lloq) | (; y = [1.2, 0.5, 2.5, 4.0])
+    builtc = build_kernel(fitc)
+    xnew = [0.0, 3.0, 5.0]
+    design = bind_data(fitc, (; x = xnew, lloq))
+    reader = Base.invokelatest(ReactiveKernels.vectorize,
+        Base.invokelatest(ReactiveKernels.prepare, builtc.spec;
+            have = (:unconstrained, _pd_ports(design)...), want = predictive_node(builtc));
+        batched = :unconstrained)
+    U = 0.2 .* randn(Xoshiro(3), builtc.layout.total, D)
+    value = Base.invokelatest(reader, U, _pd_data(design)...)
+    targets = predictive_targets(builtc, design)
+    for k in 1:D
+        u = U[:, k]
+        laws = predictive_laws(value, targets; position = k).y
+        @test size(laws) == (3,)
+        for i in 1:3
+            mu = exp(u[1] + u[2] * xnew[i])
+            @test _pd_same(laws[i], mu, _pd_addprop(mu, exp(u[3]), exp(u[4])), lloq)
+        end
+    end
+    # One array per index, on a design without the response: each index's
+    # laws take that index's operands' shape.
+    mg = @rkppl begin
+        a ~ Normal(0, 1); b ~ Normal(0, 1); add ~ Exponential(1); prop ~ Exponential(1)
+        @plate for i in eachindex(x)
+            mi = exp.(a .+ b .* x[i])
+            si = hypot.(add, mi .* prop)
+            y[i] .~ censored.(Normal.(mi, si), lloq, Inf)
+        end
+    end
+    xg = [[0.1, 0.5], [1.0, 2.0, 3.0], Float64[]]
+    yg = [[1.2, 0.5], [2.5, 4.0, 0.5], Float64[]]
+    fitg = mg(; x = xg, lloq) | (; y = yg)
+    builtg = build_kernel(fitg)
+    for plan in (fitg, bind_data(fitg, (; x = [[0.0], Float64[], [3.0, 4.0, 5.0, 6.0]], lloq)))
+        xs = plan.columns[:x]
+        reader = Base.invokelatest(ReactiveKernels.vectorize,
+            Base.invokelatest(ReactiveKernels.prepare, builtg.spec;
+                have = (:unconstrained, _pd_ports(plan)...), want = predictive_node(builtg));
+            batched = :unconstrained)
+        Ug = 0.2 .* randn(Xoshiro(4), builtg.layout.total, D)
+        value = Base.invokelatest(reader, Ug, _pd_data(plan)...)
+        targets = predictive_targets(builtg, plan)
+        for k in 1:D
+            u = Ug[:, k]
+            laws = predictive_laws(value, targets; position = k).y
+            @test length.(laws) == length.(xs)
+            for (lg, xi) in zip(laws, xs), j in eachindex(xi)
+                mu = exp(u[1] + u[2] * xi[j])
+                @test _pd_same(lg[j], mu, hypot(exp(u[3]), mu * exp(u[4])), lloq)
+            end
+            draws = predictive_draws(value, targets, Xoshiro(k); position = k).y
+            @test length.(draws) == length.(xs)
+            @test draws == prepare_predictive(builtg, plan)(u, Xoshiro(k)).y
+        end
+    end
+end
+
 @testset "predictive draws: what is refused, and what is not built yet" begin
     x = _pd_x
     y = [1.2, 0.5, 2.5, 4.0]
