@@ -389,6 +389,28 @@ _pca_cell_values(v, rows) = [v[r] for r in rows]
     @test err isa ReactiveKernelsPPL.ContractValidationError
     @test occursin("gather index rows holds one array per entry", sprint(showerror, err))
     @test occursin("lowered with the data values", sprint(showerror, err))
+    # Lowering evaluates the definition, so its exception fails lowering,
+    # naming the definition, as it would fail binding.
+    failing = quote
+        a ~ Normal(0, 1)
+        theta = a .+ shift
+        rows = _pca_part(g, cells[1:0])[1]
+        @plate for i in eachindex(cells)
+            loc[i] = x[rows[i]] * theta[i]
+        end
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(loc[i], 1)
+        end
+    end
+    err = try
+        lower_rkppl(failing, small; conditioned = (:y,), mod = @__MODULE__)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ReactiveKernelsPPL.ContractValidationError
+    @test occursin("data definition rows failed to evaluate", sprint(showerror, err))
+    @test occursin("BoundsError", sprint(showerror, err))
 end
 
 # Over data (`eachindex(kinds)`) and over a computed value whose shape bound
