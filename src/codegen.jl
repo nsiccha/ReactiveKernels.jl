@@ -1947,10 +1947,124 @@ function _compose_authored_plates(g::Graph, producer::Recipe, consumer::Recipe)
            producer.cost + consumer.cost, nothing, false, consumer.source)
 end
 
-function _fuse_authored_plate_chains(p::Plan; cells_only = false)
+# A plate whose cell returns a tuple (`(a, b, c)`) that other plates read only
+# through constant entries (`t[2]`) keeps, in one query's plan, only the work of
+# the entries that plan reads: a query computes a value only when asked, and a
+# cell sharing its locals among several values (one evaluation per index) must
+# not make every query pay for all of them. An unread entry takes the value of a
+# read one, so the cell keeps its arity and its readers are unchanged, and the
+# statements only unread entries need leave the cell. Effectful work stays.
+function _drop_unread_plate_entries(p::Plan)
+    g = p.graph
+    boundary = Set(canon_id(g, v.id) for v in (p.have..., p.want...))
+    recipes = collect(p.recipes)
+    changed = false
+    for (index, producer) in enumerate(recipes)
+        producer.op isa _AuthoredPlateLike && length(producer.outputs) == 1 || continue
+        cid = canon_id(g, only(producer.outputs).id)
+        cid in boundary && continue
+        read = _plate_entries_read(g, recipes, cid)
+        read === nothing && continue
+        sliced = _plate_keeping_entries(producer, read)
+        sliced === nothing && continue
+        recipes[index] = sliced
+        changed = true
+    end
+    changed || return p
+    producer = Dict(canon_id(g, v.id) => r for r in recipes for v in r.outputs)
+    Plan(g, p.have, p.want, recipes, producer, p.cost, p.candidates)
+end
+
+# The tuple entries the readers of plate output `cid` read, or `nothing` when
+# one reads it otherwise: every reader must be a plate (or one cell of one)
+# zipping it, whose cell reads it only as `t[k]` with a literal `k`.
+function _plate_entries_read(g::Graph, recipes, cid)
+    read = Set{Int}()
+    found = false
+    for r in recipes
+        any(v -> canon_id(g, v.id) == cid, r.inputs) || continue
+        found = true
+        cell = r.op isa _AuthoredPlateCellLike
+        cell && canon_id(g, first(r.inputs).id) == cid && return nothing
+        op = cell ? r.op.plate : r.op
+        op isa _AuthoredPlateLike || return nothing
+        inputs = cell ? r.inputs[2:end] : r.inputs
+        inner = _plate_body(op).plan
+        ig = inner.graph
+        results = Set(canon_id(ig, v.id) for v in inner.want)
+        for (position, outer) in enumerate(inputs)
+            canon_id(g, outer.id) == cid || continue
+            position in _plate_atomic(op) && return nothing
+            have = canon_id(ig, inner.have[position].id)
+            have in results && return nothing
+            for q in inner.recipes
+                any(v -> canon_id(ig, v.id) == have, q.inputs) || continue
+                k = _constant_tuple_entry(q)
+                k === nothing && return nothing
+                push!(read, k)
+            end
+        end
+    end
+    found ? read : nothing
+end
+
+# `k` when recipe `q` is the source `t[k]` of its one input with a literal
+# integer `k`, otherwise `nothing`.
+function _constant_tuple_entry(q::Recipe)
+    q.op isa _KernelSourceOp && length(q.inputs) == 1 && length(q.outputs) == 1 &&
+        !q.effectful || return nothing
+    source = q.source
+    Meta.isexpr(source, :ref, 2) && source.args[2] isa Int || return nothing
+    source.args[1] === only(_recipe_source_names(q)) || return nothing
+    source.args[2]
+end
+
+# `producer` with a cell computing only tuple entries `read`, or `nothing` when
+# its cell is not a source tuple of its inputs, every entry is read, or the
+# entries left unread need effectful work.
+function _plate_keeping_entries(producer::Recipe, read::Set{Int})
+    op = producer.op
+    body = _plate_body(op)
+    inner = body.plan
+    ig = inner.graph
+    length(body.lowered_recipes) == length(inner.recipes) || return nothing
+    result = canon_id(ig, only(inner.want).id)
+    at = findfirst(q -> any(v -> canon_id(ig, v.id) == result, q.outputs), inner.recipes)
+    at === nothing && return nothing
+    tuple = inner.recipes[at]
+    tuple.op isa _KernelSourceOp && length(tuple.outputs) == 1 && !tuple.effectful ||
+        return nothing
+    n = length(tuple.inputs)
+    Meta.isexpr(tuple.source, :tuple, n) &&
+        tuple.source.args == _recipe_source_names(tuple) || return nothing
+    !isempty(read) && issubset(read, 1:n) && length(read) < n || return nothing
+    stand_in = tuple.inputs[minimum(read)]
+    inputs = Tuple(k in read ? tuple.inputs[k] : stand_in for k in 1:n)
+    recipes = Recipe[q for q in inner.recipes]
+    recipes[at] = Recipe(tuple.id, inputs, tuple.outputs, tuple.op, tuple.cost,
+                         nothing, false, tuple.source)
+    needed = Set((result,))
+    keep = falses(length(recipes))
+    for index in reverse(eachindex(recipes))
+        q = recipes[index]
+        any(v -> canon_id(ig, v.id) in needed, q.outputs) || continue
+        keep[index] = true
+        foreach(v -> push!(needed, canon_id(ig, v.id)), q.inputs)
+    end
+    any(index -> !keep[index] && recipes[index].effectful, eachindex(recipes)) &&
+        return nothing
+    sliced = _partial_subplan(inner, inner.have, inner.want, recipes[keep])
+    draft = _AuthoredPlateDraft{_plate_atomic(op)}(sliced,
+        Tuple(body.lowered_recipes[keep]), op.axis_checks)
+    Recipe(producer.id, producer.inputs, producer.outputs, draft, producer.cost,
+           nothing, producer.effectful, producer.source)
+end
+
+function _fuse_authored_plate_chains(original::Plan; cells_only = false)
+    p = _drop_unread_plate_entries(original)
     recipes = Union{Nothing,Recipe}[p.recipes...]
     boundary = Set(canon_id(p.graph, v.id) for v in (p.have..., p.want...))
-    changed = false
+    changed = p !== original
     # A plate's output, unless it is a boundary value, and the recipes that
     # read it.
     function consumers_of(index)

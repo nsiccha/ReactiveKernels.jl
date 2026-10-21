@@ -739,6 +739,16 @@ the first lane that takes its arm when its input is shared. Local bindings
 inside an arm remain separate recipes. The graph keeps the authored branch;
 the tensorized body decides a shared condition in its own batch dispatch.
 
+A cell may return a tuple of its locals, `(m, s, d)`, that other plates read
+entry by entry (`c[2]`). Each query then runs only the cell statements of the
+entries its plan reads: an unread entry takes the value of a read one, so the
+cell keeps its arity and its readers are unchanged, and statements that only
+unread entries need leave the cell. A query of that entry still computes it,
+and a reader that takes the tuple other than by a literal entry (`first(c)`, a
+`Ref(cell)` operand) keeps every entry. RKPPL's shared `@plate` cells are such
+plates, so a per-index value that no density reads costs the sampler and its
+gradient nothing, and adds none of its AD requirements to them.
+
 The per-element WANT is
 either accumulated with a reducer (sum by default) or collected in the one
 requested broadcast-shaped output.

@@ -291,3 +291,95 @@ end
     end
     @test isequal(data, saved)
 end
+
+# A value of a shared cell that no density reads (a derived quantity) is
+# computed only by a query that asks for it: the density, gradient,
+# pointwise, retained and cell queries skip its statements, and its own query
+# still computes it. `_pco_derived` is a closure `map` over the observed data
+# beside active values, which static-activity Enzyme Reverse cannot
+# differentiate, so a gradient that ran it would fail (snag
+# density-gradient-e07d1360).
+const _PCO_DERIVED = Ref(0)
+_pco_derived(yi, m, s) = (_PCO_DERIVED[] += 1; map((o, l) -> (o - l) / s, yi, m))
+
+@testset "a shared @plate cell's unread value runs only when queried" begin
+    function fixture(derived, n)
+        t = [Float64[0.2 + 0.1 * i + 0.3 * j for j in 1:(1 + mod(i, 3))] for i in 1:n]
+        x = collect(range(-0.4, 0.6; length = n))
+        y = [ti .* exp(0.2 + xi) .+ 0.1 .* sin.(eachindex(ti)) for (ti, xi) in zip(t, x)]
+        data = Dict{Symbol,Any}(:t => t, :x => x, :y => y)
+        derived && (data[:yin] = deepcopy(y))
+        plate = derived ? quote
+            @plate for i in eachindex(t)
+                m = t[i] .* exp(a + x[i])
+                sc = s .* (1 .+ m)
+                residual = _pco_derived(yin[i], m, s)
+                residuals[i] = residual
+                loc[i] = m
+                scale[i] = sc
+            end
+            all_residuals = _pco_flat(residuals)
+        end : quote
+            @plate for i in eachindex(t)
+                m = t[i] .* exp(a + x[i])
+                sc = s .* (1 .+ m)
+                loc[i] = m
+                scale[i] = sc
+            end
+        end
+        ast = quote
+            a ~ Normal(0, 1)
+            s ~ Exponential(1.0)
+            $plate
+            @plate for i in eachindex(y)
+                y[i] .~ Normal.(loc[i], scale[i])
+            end
+        end
+        ast = Expr(:block, Iterators.flatten(Meta.isexpr(e, :block) ? e.args : (e,)
+            for e in ast.args)...)
+        bound = bind_data(lower_rkppl(ast, data; conditioned = (:y,),
+            mod = @__MODULE__), data)
+        built = build_kernel(bound)
+        (; data, bound, built, u = unconstrain(built.layout, (; a = 0.2, s = 0.7)))
+    end
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    for n in (4, 11)
+        fx, twin = fixture(true, n), fixture(false, n)
+        saved = deepcopy(fx.data)
+        sampler = prepare_sampler(fx.built, fx.bound, fx.u; backend)
+        reference = prepare_sampler(twin.built, twin.bound, twin.u; backend)
+        retained = prepare_sampler(fx.built, fx.bound, fx.u; backend,
+            retain = (:pointwise,))
+        cell = prepare_cell_sampler(fx.built, fx.bound, :y, fx.u; backend)
+        pointwise = prepare_query(fx.built, fx.bound, :pointwise)
+        for shift in (0.0, 0.13)
+            u = fx.u .+ shift
+            g, gt = similar(u), similar(u)
+            _PCO_DERIVED[] = 0
+            value, _ = sampler_value_and_gradient!(sampler, g, u)
+            @test _PCO_DERIVED[] == 0
+            expected, _ = sampler_value_and_gradient!(reference, gt, u)
+            @test value ≈ expected rtol = 1e-14
+            @test g ≈ gt rtol = 1e-12
+            _PCO_DERIVED[] = 0
+            @test sampler(u) ≈ expected rtol = 1e-14
+            v, _, kept = sampler_value_gradient_and_retained!(retained, g, u)
+            @test v ≈ expected rtol = 1e-14
+            @test sum(sum, kept.pointwise.y) ≈
+                sum(sum, Base.invokelatest(pointwise, u).y) rtol = 1e-14
+            cell_value, _ = cell_value_and_gradient!(cell, similar(u), u, 2)
+            @test cell_value ≈ sum(kept.pointwise.y[2]) rtol = 1e-12
+            @test _PCO_DERIVED[] == 0
+        end
+        # Its own query computes it once per index.
+        want = ReactiveKernels.prepare(fx.built.spec; have = fx.built.spec.have_names,
+            want = (:all_residuals,), bound = NamedTuple(fx.bound.columns))
+        _PCO_DERIVED[] = 0
+        residuals = Base.invokelatest(want, fx.u)
+        @test _PCO_DERIVED[] == n
+        q = constrain(fx.built.layout, fx.u)
+        @test residuals ≈ reduce(vcat, [(yi .- ti .* exp(q.a + xi)) ./ q.s
+            for (yi, ti, xi) in zip(fx.data[:y], fx.data[:t], fx.data[:x])])
+        @test isequal(fx.data, saved)
+    end
+end
