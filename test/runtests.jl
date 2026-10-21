@@ -91,6 +91,7 @@ const _MATRIX_CORE_TESTS = (
     "test_scan_endpoint_scope.jl",
     "test_replica.jl",
     "test_precompiled_prepared.jl",
+    "test_precompiled_source_companions.jl",
     "test_position_batching.jl",
     "test_position_batching_reuse.jl",
     "test_native_scheduling.jl",
