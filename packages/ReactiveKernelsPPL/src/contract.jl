@@ -3220,6 +3220,11 @@ function _check_gather_index(ex::Expr, plan::StructuralPlan, label,
             "gather index is an integer data column (`v[c]`); a " *
             "parameter or latent is a value, never an index")
     end
+    # Bound or computed at binding, an index holding one array per entry
+    # (`rows[i]` read in a whole-column `@plate` cell) is no Julia index.
+    bound && idx isa Symbol && _holds_arrays(get(plan.columns, idx, nothing)) &&
+        _fail(label, "gather index $idx holds one array per entry, which a " *
+            "gather `$(repr(ex))` cannot index by. " * _array_entry_lowering_hint(idx))
     if bound && idx isa Symbol && haskey(plan.columns, idx) &&
             !(idx in names)
         col = _vector_column(plan.columns, idx, label, "gather index")
@@ -3570,8 +3575,9 @@ end
 # index only when lowering saw the values: names alone carry no shape.
 _array_entry_lowering_hint(c) = "A `@plate` cell that reads `$c[i]` means " *
     "one iteration of its loop when the model is lowered with the data " *
-    "values (`lower_rkppl(ast, data)` or the model call); lowering from data " *
-    "names alone cannot see that `$c` holds arrays"
+    "values (`lower_rkppl(ast, data)` or the model call), also when `$c` is " *
+    "a definition reading only data; lowering from data names alone cannot " *
+    "see that `$c` holds arrays"
 
 # A derived column must be row-varying by value: some column-or-derived
 # reference in a length-propagating position. Dotted forms propagate,

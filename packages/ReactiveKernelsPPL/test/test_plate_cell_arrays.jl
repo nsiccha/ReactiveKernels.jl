@@ -303,6 +303,94 @@ end
     @test occursin("lowered with the data values", sprint(showerror, err))
 end
 
+# A definition reading only data may hold one array per index too: one row
+# index vector per cell, computed from the raw grouping and the cell labels.
+# Lowering from values evaluates it, so a cell reading it at the loop index
+# is one iteration of the loop, exactly as with the same partition bound as
+# data, whatever operators the cell applies.
+_pca_part(groups, cells) = [findall(==(c), groups) for c in cells]
+_pca_cell_values(v, rows) = [v[r] for r in rows]
+
+@testset "a computed definition holding one array per index" begin
+    function cells_data(g, cells)
+        rows = _pca_part(g, cells)
+        x = collect(range(0.2, 1.4; length = length(g)))
+        shift = collect(range(-0.2, 0.3; length = length(cells)))
+        y = [0.3 .* sin.(eachindex(r)) .+ 0.1i for (i, r) in enumerate(rows)]
+        return Dict{Symbol,Any}(:g => g, :cells => cells, :x => x, :shift => shift, :y => y)
+    end
+    small = cells_data(["a", "b", "b", "a", "a"], ["b", "empty", "a"])
+    large = cells_data(["c", "a", "b", "b", "a", "c", "a", "b", "c", "c", "a"],
+        ["a", "none", "c", "b"])
+    cell = Dict(
+        :gather => (:(rows = _pca_part(g, cells)), :(loc[i] = x[rows[i]] * theta[i])),
+        :values => (:(xs = _pca_cell_values(x, _pca_part(g, cells))), :(loc[i] = xs[i] * theta[i])))
+    model(kind) = quote
+        a ~ Normal(0, 1)
+        theta = a .+ shift
+        $(cell[kind][1])
+        @plate for i in eachindex(cells)
+            $(cell[kind][2])
+        end
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(loc[i], 1)
+        end
+    end
+    oracle(d, a) = logpdf(Normal(), a) + sum(sum(logpdf.(Normal.(d[:x][r] .* (a + s), 1), yi);
+        init = 0.0) for (r, s, yi) in zip(_pca_part(d[:g], d[:cells]), d[:shift], d[:y]))
+    for kind in (:gather, :values)
+        ast = model(kind)
+        structures = map((small, large)) do d
+            saved = deepcopy(d)
+            values = Dict(k => v for (k, v) in d if k !== :y)
+            entries = (
+                bind_data(lower_rkppl(ast, d; conditioned = (:y,), mod = @__MODULE__), d),
+                RKPPLModel(ast, @__MODULE__)(; pairs(values)...) | (; y = d[:y]))
+            for bound in entries
+                built = build_kernel(bound)
+                sampler = prepare_sampler(built, bound, [0.0];
+                    backend = AutoEnzyme(; mode = Enzyme.Reverse))
+                for a in (0.1, -0.35)
+                    value, gradient = sampler_value_and_gradient!(sampler, zeros(1), [a])
+                    @test value ≈ oracle(d, a) rtol = 1e-12
+                    @test gradient ≈ _pca_fd(u -> oracle(d, only(u)), [a]) rtol = 1e-6 atol = 1e-8
+                end
+            end
+            @test isequal(d, saved)
+            _pca_structure(build_kernel(first(entries)).spec)
+        end
+        # The cells stay one retained plate whatever the cell count.
+        @test structures[1] == structures[2]
+    end
+    # The same partition bound as data is the control: equal densities.
+    control = quote
+        a ~ Normal(0, 1)
+        theta = a .+ shift
+        @plate for i in eachindex(rows)
+            loc[i] = x[rows[i]] * theta[i]
+        end
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(loc[i], 1)
+        end
+    end
+    d = merge(small, Dict{Symbol,Any}(:rows => _pca_part(small[:g], small[:cells])))
+    bound = bind_data(lower_rkppl(control, d; conditioned = (:y,), mod = @__MODULE__), d)
+    @test Base.invokelatest(prepare_query(build_kernel(bound), bound, :sampler), [0.1]) ≈
+        oracle(small, 0.1) rtol = 1e-12
+    # Names alone cannot show that `rows` holds arrays: binding refuses the
+    # whole-column gather, naming the value-aware lowering.
+    err = try
+        bind_data(lower_rkppl(model(:gather), collect(keys(small)); conditioned = (:y,),
+            mod = @__MODULE__), small)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ReactiveKernelsPPL.ContractValidationError
+    @test occursin("gather index rows holds one array per entry", sprint(showerror, err))
+    @test occursin("lowered with the data values", sprint(showerror, err))
+end
+
 # Over data (`eachindex(kinds)`) and over a computed value whose shape bound
 # data establish (`eachindex(la)`, `la = a .+ x`), data-only cell work runs
 # once, at preparation.
