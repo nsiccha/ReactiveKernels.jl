@@ -133,7 +133,14 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
     @test !occursin("Adaptive NUTS is currently a CPU sampler", nuts)
     @test !occursin("stays on the CPU because", index)
 
+    # The pure/iterative boundary names the test that guards it.
+    guard = joinpath("packages", "ReactiveKernelsPPL", "test",
+        "test_pure_surface_boundary.jl")
+    @test occursin("`" * join(splitpath(guard), "/") * "`", page)
+    @test isfile(joinpath(root, guard))
+
     for heading in (
+        "## Pure kernels and the iterative-method compiler",
         "## The stateless compiler",
         "## Batch and replica lowering",
         "## Incremental and compiled reactive execution",
