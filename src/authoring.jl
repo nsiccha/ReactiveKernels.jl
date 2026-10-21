@@ -955,7 +955,8 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
         )
         function_names = Set{Symbol}()
         _kernel_function_parameters!(function_names, ex.args[1])
-        body_hidden = union(copy(hidden), function_names)
+        # A function body captures the enclosing locals already written.
+        body_hidden = union(copy(hidden), assigned, function_names)
         _kernel_explicit_locals!(body_hidden, ex.args[2])
         _kernel_free_ports_flow!(
             out, seen, ex.args[2], known, Set{Symbol}(), body_hidden,
@@ -1085,7 +1086,9 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
         _kernel_validate_function_signature!(
             ex.args[1], known, assigned, hidden,
         )
-        function_hidden = copy(hidden)
+        # A closure reads the enclosing locals already written, not ports of
+        # the same name (a `scan … do` step reading its plate cell's local).
+        function_hidden = union(copy(hidden), assigned)
         _kernel_bound_names!(function_hidden, ex.args[1])
         _kernel_explicit_locals!(function_hidden, ex.args[2])
         _kernel_free_ports_flow!(
@@ -1098,7 +1101,7 @@ function _kernel_free_ports_flow!(out::Vector{Symbol}, seen::Set{Symbol}, ex,
         _kernel_function_default_reads!(
             out, seen, ex.args[1], known, assigned, hidden,
         )
-        function_hidden = copy(hidden)
+        function_hidden = union(copy(hidden), assigned)
         function_names = Set{Symbol}()
         _kernel_function_parameters!(function_names, ex.args[1])
         union!(function_hidden, function_names)
