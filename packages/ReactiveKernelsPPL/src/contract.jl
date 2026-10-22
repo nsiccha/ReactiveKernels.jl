@@ -6081,6 +6081,9 @@ end
 # A response value holding one array per index (`y = [[0.7, 0.3], [1.4]]`).
 _holds_arrays(col) = col isa AbstractArray && !(eltype(col) <: Number) &&
     (isempty(col) ? eltype(col) <: AbstractArray : all(x -> x isa AbstractArray, col))
+# An absent value has no elements to read (a frozen `Vector{String}` input):
+# its element type alone says.
+_holds_arrays(col::_AbsentArray) = eltype(col) <: AbstractArray
 
 # Data a cell-broadcast response reads per index hold that index's array.
 _cell_broadcast_operand(plan::StructuralPlan, c::Symbol) =
