@@ -122,8 +122,9 @@ planner's existing graph cuts and binding, with caller-owned stage values.
 When shared inputs change between requests, either bind them per request or
 keep them as runtime HAVE in both cuts. A repeated `prepare(...; bound=...)` of
 the same graph, cut and bound ports reuses the plan and compiled code of
-earlier bindings and runs only the data-only work on the new values (see
-"Rebinding" on the [compiler](compiler.md) page). Runtime HAVE instead prepares
+earlier bindings and runs only the data-only work on the new values, and
+`vectorize` of the rebound kernel reuses the position drivers lowered for an
+earlier binding (see "Rebinding" on the [compiler](compiler.md) page). Runtime HAVE instead prepares
 nothing per request. For this graph, the read cut above is already independent
 of the schedule; reuse it with a runtime build cut:
 

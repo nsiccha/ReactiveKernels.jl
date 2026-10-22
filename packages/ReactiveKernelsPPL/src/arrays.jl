@@ -966,14 +966,16 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
         push!(refs, base)
         if bound
             d = _gather_axis(plan, ex)
-            if d === nothing
-                # An opaque result can depend on parameter values; its
-                # size is checked by Julia indexing at evaluation time.
-                K = axs === nothing ? nothing : prod(
-                    _array_dim_size(plan, base, label, a) for a in axs)
-                _validate_positional_gather(plan, base, label, g, K)
-            else
-                _validate_gather_axis(plan, base, label, d, g)
+            _data_check(plan) do plan
+                if d === nothing
+                    # An opaque result can depend on parameter values; its
+                    # size is checked by Julia indexing at evaluation time.
+                    K = axs === nothing ? nothing : prod(
+                        _array_dim_size(plan, base, label, a) for a in axs)
+                    _validate_positional_gather(plan, base, label, g, K)
+                else
+                    _validate_gather_axis(plan, base, label, d, g)
+                end
             end
         end
         return true
@@ -1000,21 +1002,25 @@ function _collect_array_ref!(refs, ex::Expr, plan::StructuralPlan, label,
         g = ex.args[1 + axis]
         _reads_data_only(plan, g, _all_name_set(plan), Set{Symbol}()) ||
             _fail(label, "`$(repr(ex))` gather index $g must be data")
-        bound && _validate_gather_axis(plan, p.name, label, p.dims[axis], g)
+        bound && _data_check(plan) do plan
+            _validate_gather_axis(plan, p.name, label, p.dims[axis], g)
+        end
     elseif bound
-        dims = _array_dims(plan, p)
-        idx = ex.args[2:end]
-        inbounds(i, d) = !_is_scalar_position(i) ||
-            1 <= _endpoint_value(i, 1, d) <= d
-        if length(idx) == length(dims)
-            for (i, d) in zip(idx, dims)
-                inbounds(i, d) || _fail(label, "`$(repr(ex))` is out of " *
-                    "bounds: $(base) has size $(repr(Tuple(dims)))")
+        _data_check(plan) do plan
+            dims = _array_dims(plan, p)
+            idx = ex.args[2:end]
+            inbounds(i, d) = !_is_scalar_position(i) ||
+                1 <= _endpoint_value(i, 1, d) <= d
+            if length(idx) == length(dims)
+                for (i, d) in zip(idx, dims)
+                    inbounds(i, d) || _fail(label, "`$(repr(ex))` is out of " *
+                        "bounds: $(base) has size $(repr(Tuple(dims)))")
+                end
+            elseif !(length(idx) == 1 && _is_scalar_position(idx[1]) &&
+                    inbounds(idx[1], prod(dims)))
+                _fail(label, "`$(repr(ex))` indexes $(length(idx)) axes of the " *
+                    "$(length(dims))-axis array $(base)")
             end
-        elseif !(length(idx) == 1 && _is_scalar_position(idx[1]) &&
-                inbounds(idx[1], prod(dims)))
-            _fail(label, "`$(repr(ex))` indexes $(length(idx)) axes of the " *
-                "$(length(dims))-axis array $(base)")
         end
     end
     return true
@@ -1220,16 +1226,18 @@ function _collect_data_matvec!(refs, ex::Expr, plan::StructuralPlan, label,
     bound || return nothing
     haskey(plan.columns, B) || _fail(label, "`$(repr(ex))`: $B is not a " *
         "bound column")
-    col = plan.columns[B]
-    col isa AbstractMatrix || _fail(label, "`$(repr(ex))` multiplies $B by " *
-        "an array — $B must be a bound matrix (a vector times a vector is " *
-        "not a product in Julia; write elementwise math dotted)")
-    eltype(col) <: Real || _fail(label, "matrix $B is not numeric")
-    if w isa Symbol && _is_array_param(plan, w)
-        dims = _array_dims(plan, _array_param(plan, w))
-        length(dims) in (1, 2) && dims[1] == size(col, 2) || _fail(label,
-            "`$(repr(ex))`: $B has $(size(col, 2)) columns but $w has " *
-            "size $(repr(Tuple(dims)))")
+    _data_check(plan) do plan
+        col = plan.columns[B]
+        col isa AbstractMatrix || _fail(label, "`$(repr(ex))` multiplies $B by " *
+            "an array — $B must be a bound matrix (a vector times a vector is " *
+            "not a product in Julia; write elementwise math dotted)")
+        eltype(col) <: Real || _fail(label, "matrix $B is not numeric")
+        if w isa Symbol && _is_array_param(plan, w)
+            dims = _array_dims(plan, _array_param(plan, w))
+            length(dims) in (1, 2) && dims[1] == size(col, 2) || _fail(label,
+                "`$(repr(ex))`: $B has $(size(col, 2)) columns but $w has " *
+                "size $(repr(Tuple(dims)))")
+        end
     end
     return nothing
 end

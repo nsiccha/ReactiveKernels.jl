@@ -5740,9 +5740,13 @@ RuntimeGeneratedFunctions.drop_expr(f::_PrecompileWarmFunction) =
 # than the graph's author module: consumers can prepare imported graphs, and
 # preparation can run inside helpers or submodules. This is cold-path loader
 # state only. Ordinary runtime preparation still uses RK's existing context.
-function _generated_function_cache_module()
+_generated_function_cache_module() = something(_image_target_module(), @__MODULE__)
+
+# The root module of the package whose image Julia is generating, or `nothing`
+# outside incremental package precompilation.
+function _image_target_module()
     (ccall(:jl_generating_output, Cint, ()) == 0 ||
-     Base.JLOptions().incremental == 0) && return @__MODULE__
+     Base.JLOptions().incremental == 0) && return nothing
     target = @static if isdefined(Base, :precompilation_target)
         # Julia 1.10 / 1.11.
         Base.precompilation_target
@@ -5753,8 +5757,7 @@ function _generated_function_cache_module()
         error("cannot identify the package owning generated functions during precompilation")
     end
     # Non-package output generation has no package-loader target.
-    target === nothing && return @__MODULE__
-    Base.root_module(target)
+    target === nothing ? nothing : Base.root_module(target)
 end
 
 # A plated kernel owns two compiled bodies but presents exactly the same
@@ -5883,6 +5886,10 @@ struct PreparedKernel{F,O,IN,OUT,RR,S}
     plan::Plan
     ast::Expr
     lowered_recipes::RR
+    # The vectorized lowerings shared by every binding of the bound template
+    # this kernel instantiates (`_BoundVectorizations`, partial_evaluation.jl),
+    # or `nothing`. Never read on the call path.
+    rebinding::Any
 end
 
 # Assemble new prepared types without compiling a constructor for each one;
@@ -5891,13 +5898,18 @@ end
 Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
-        @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing)
+        @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing,
+        @nospecialize(rebinding = nothing))
     ops = _execution_source(ops)
     T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
                        typeof(lowered_recipes),exact_signature}
     _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
-                             lowered_recipes))::PreparedKernel
+                             lowered_recipes, rebinding))::PreparedKernel
 end
+
+# The `exact_signature` a prepared kernel was built with.
+_exact_signature(@nospecialize(kernel::PreparedKernel)) =
+    (typeof(kernel)::DataType).parameters[6]
 
 # A caller that guarantees execution through a latest-world entry may use the
 # authored closure directly. Ordinary prepare retains its world-age fallback.
