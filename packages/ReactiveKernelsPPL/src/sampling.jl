@@ -226,7 +226,7 @@ function _validate_external_parameter(plan, p; observation=false)
 end
 
 function _bound_data_value(plan, ex, name, what)
-    expressions = Dict(a.name=>a.expr for a in (plan.assignments..., plan.derived...))
+    expressions = Dict(a.name=>a.expr for a in _definitions(plan))
     active = Set{Symbol}()
     function lookup(n)
         haskey(plan.columns, n) && return plan.columns[n]

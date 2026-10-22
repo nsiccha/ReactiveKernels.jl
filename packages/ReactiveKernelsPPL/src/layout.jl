@@ -504,7 +504,7 @@ function assign_layout(plan::StructuralPlan)
     offset = _array_layout_entries!(entries, plan, offset)
     return LayoutTable(entries, offset - 1, _scope_layout_paths(plan),
         Dict{Symbol,Any}(plan.columns),
-        Dict{Symbol,Any}(a.name => a.expr for a in (plan.assignments..., plan.derived...)))
+        Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)))
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
