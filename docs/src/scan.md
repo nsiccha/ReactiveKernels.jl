@@ -438,10 +438,11 @@ A step can keep its carry through a lazy branch, for example
 seed is a constant array, the carry is then constant memory on the paths that
 keep it and active memory on the others, and Enzyme's static activity analysis
 rejects it (`EnzymeRuntimeActivityError`;
-`benchmark/repro_enzyme_branch_kept_seed_carry.jl`). The inner scan's
-`include_init = true` result starts with its seed, so `inner[end]` is that seed
-when the inner sequence is empty: the same value without the branch, and it
-differentiates whether the inner sequences are empty or not. Native scans
+`benchmark/repro_enzyme_branch_kept_seed_carry.jl`, issue #47). The lowering
+keeps the branch as authored. Registered Enzyme 0.13.216 still rejects it on
+Julia 1.10; the Enzyme dogfood line differentiates it from `d2892e7`, which
+gives a fresh allocation that no active data reaches a zero shadow (see
+`constraints.md`, the lazy branch whose arms differ in activity). Native scans
 iterate the indices after their peeled first step as a unit range. Iterating
 them with `Iterators.drop` made Enzyme raise `OutOfMemoryError` from the
 second outer step on whenever the inner sequence was empty and the same at
