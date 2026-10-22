@@ -554,19 +554,43 @@ afresh, like a `Plan`, which is always prepared afresh.
 caller-owned `PreparationCache`, for a caller who wants the entries' lifetime
 decoupled from the graph's (dropped with the cache, or shared across graphs).
 
-The residual body is value-independent exactly when the inner-plate pass
-below leaves it alone. A residual whose authored plates specialize on bound
-data — bound-only cell recipes evaluated at preparation, data-bound branch
-partitions — is still specialized and compiled per binding and reuses only
-the plan and prefix. For a residual containing authored plates the pass runs
-on every binding (it declines before evaluating anything when a plate has
-nothing bound to specialize), and every binding it leaves alone shares the
-compiled residual of its class, whatever the bound values' element types or
-array lengths: an inline plate over a bound domain rebinds to a new domain
-length at the cost of the prefix, exactly as the same plate in a separately
-prepared child does. A plate that reads a bound argument lowers for that
-argument's class — scalar, vector or range, rank-N array, or tuple — as a
-port declaring that class would, even when the port is untyped: a bound
+Position batching of a rebound kernel is reused the same way. `vectorize`
+lowers and compiles position drivers for the whole graph: the owning driver,
+and with `reuse = true` or a `NativeScheduling` the borrowed driver, the
+shared prefix and the per-worker residual. For a kernel rebound from a cached
+residual, the first `vectorize` keeps those drivers per batched ports,
+`reuse`, scheduling and operation-table type, without the binding's
+constants. A later binding's `vectorize` with the same key rebuilds them
+around its own constants, without lowering or compiling, so binding and
+vectorizing again costs what the rebinding `prepare` costs. Each call still
+returns an independent instance with its own buffers, and the kept drivers
+retain no binding's values. A residual specialized per binding (below) is
+vectorized afresh for each binding. (Before, every `vectorize` of a rebound
+kernel lowered and compiled the graph again: 52–68 ms and 26–30 MB per
+binding on a 12-port synthetic composed graph whose rebinding `prepare` took
+0.3 ms. On a large composed simulation graph whose plates the inner-plate
+pass rewrites, binding a design and vectorizing its reader took 490–520 ms
+and 170 MB, 400–440 ms of it in `vectorize`; it now takes 4.5–4.9 ms and
+5–6 MB, with `vectorize` at 0.3–0.5 ms. Snag `rebinding-a-comp-d03576ab`.)
+
+For a residual containing authored plates the inner-plate pass below runs on
+every binding (it declines before evaluating anything when a plate has
+nothing bound to specialize). A plate it rewrites to read bound-only cell
+values cached at preparation follows from the pass's caching decisions, not
+from the cached values, so the entry keeps that rewrite: a later binding that
+decides alike has the same residual up to its cached values and shares the
+compiled residual, as a binding the pass leaves alone does. A plate the pass
+partitions by a data-bound branch, or replaces by a bind-time value, bakes
+that binding's structure in: such a binding is still specialized and compiled
+per binding and reuses only the plan and prefix. (Before, every binding the
+pass rewrote was prepared, lowered and compiled afresh: 63–88 ms per design
+on the composed simulation graph above, now 1.6–4.1 ms.) Every other binding shares
+the compiled residual of its class and plate rewrites, whatever the bound
+values' element types or array lengths: an inline plate over a bound domain
+rebinds to a new domain length at the cost of the prefix, exactly as the same
+plate in a separately prepared child does. A plate that reads a bound
+argument lowers for that argument's class — scalar, vector or range, rank-N
+array, or tuple — as a port declaring that class would, even when the port is untyped: a bound
 `1:n` domain has no runtime axis guard or per-coordinate bookkeeping, and a
 recipe that reads only a bound scalar runs once above the loop. So each class
 has its own compiled residual; a rank-0 array or any other bound value keeps

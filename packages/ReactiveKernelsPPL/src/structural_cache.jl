@@ -58,7 +58,9 @@ function _structural_cache(plan::StructuralPlan)
     end
 end
 
-_sorted_names(names) = Tuple(sort!(collect(Symbol, names)))
+# Names in a canonical order, for keys. A Symbol is interned for the life of
+# the process, so its identity orders it stably and compares as an integer.
+_sorted_names(names) = Tuple(sort!(collect(Symbol, names); by = objectid))
 _sorted_roles(roles) = Tuple(sort!(collect(roles); by = first))
 
 # Every field but the anchor and the per-call facets, by identity. Binding
@@ -68,12 +70,17 @@ _sorted_roles(roles) = Tuple(sort!(collect(roles); by = first))
         if f ∉ (:assignments, :columns, :n_obs))...)
 end
 
+_column_types(columns) =
+    Tuple(sort!([k => typeof(v) for (k, v) in columns]; by = objectid ∘ first))
+
 # The structure `plan`'s analyses read. `columns` chooses what of the column
 # table: `:none` (an analysis that reads none of it), `:names` (the column
-# names, no value) or `:identity` (the table itself).
+# names, no value), `:types` (the names and each value's type) or
+# `:identity` (the table itself).
 function _structural_key(plan::StructuralPlan; columns::Symbol = :names,
         n_obs::Bool = false)
     cols = columns === :names ? _sorted_names(keys(plan.columns)) :
+        columns === :types ? _column_types(plan.columns) :
         columns === :identity ? plan.columns :
         columns === :none ? nothing : throw(ArgumentError("columns = $columns"))
     return (_structure_fields(plan), cols, n_obs ? plan.n_obs : nothing)
@@ -93,35 +100,95 @@ const _UNCACHED = gensym(:uncached)
 const _STRUCTURAL_CACHE_CHECK = Ref(false)
 
 """
-    _structural(f, plan, tag; columns = :names, n_obs = false, fresh = true)
+    _structural(f, plan, tag; columns = :names, n_obs = false, fresh = true,
+        same = isequal)
 
 `f()`, an analysis of `plan` that `tag` (a tuple naming the analysis and its
 other arguments, by value) identifies, computed once per structure while
 `bind_data` runs. `f` must read only what `_structural_key` keys: no column
-unless `columns = :names` (names) or `:identity` (values; for a plan whose
-columns no step mutates), and `n_obs` only when `n_obs = true`. Callers
-receive a fresh copy, so they may mutate the result; `fresh = false` shares
-the cached value with callers that only read it.
+unless `columns = :names` (names), `:types` (names and value types) or
+`:identity` (values; for a plan whose columns no step mutates), and `n_obs`
+only when `n_obs = true`. Callers receive a fresh copy, so they may mutate
+the result; `fresh = false` shares the cached value with callers that only
+read it. `same(recomputed, cached)` is the hit check's comparison.
 """
 function _structural(f, plan::StructuralPlan, tag::Tuple;
-        columns::Symbol = :names, n_obs::Bool = false, fresh::Bool = true)
+        columns::Symbol = :names, n_obs::Bool = false, fresh::Bool = true,
+        same = isequal)
     _structural_enabled() || return f()
     cache = _structural_cache(plan)
     key = (tag, _structural_key(plan; columns, n_obs))
     hit = lock(() -> get(cache.entries, key, _UNCACHED), cache.lock)
     if hit !== _UNCACHED
-        _STRUCTURAL_CACHE_CHECK[] && !isequal(f(), hit) && error(
+        _STRUCTURAL_CACHE_CHECK[] && !same(_analysis(f, columns), hit) && error(
             "structural cache: $(first(tag)) of this plan differs from the " *
             "value cached for its key")
         return fresh ? _fresh(hit) : hit
     end
     # Compute outside the lock: an analysis may consult the cache itself.
-    value = f()
+    value = _analysis(f, columns)
     lock(cache.lock) do
         length(cache.entries) >= _STRUCTURAL_CACHE_LIMIT && empty!(cache.entries)
         cache.entries[key] = value
     end
     return fresh ? _fresh(value) : value
+end
+
+# ── Data checks inside structural walks ──────────────────────────────
+#
+# Some validations walk a plan's expressions (which names a definition
+# reads, whether a column sits where a scalar belongs) and test bound values
+# only at a few leaves: a gather index's element type and range, a matrix's
+# column count. `_data_checks` walks once per structure and records those
+# leaves as checks that every binding runs on its own values, so rebinding
+# costs the data checks alone (snag `rkppl-bind-data-96ae5ee3`).
+
+const _DATA_CHECKS = :rkppl_data_checks
+const _NO_DATA_CHECKS = gensym(:no_data_checks)
+
+# A cached analysis returns a value: a data check it ran would be skipped on
+# every hit, unless the analysis is keyed by the column table itself (which
+# no step mutates), so it may run checks only then.
+_analysis(f, columns::Symbol) = task_local_storage(f, _DATA_CHECKS,
+    columns === :identity ? nothing : _NO_DATA_CHECKS)
+
+"""
+    _data_check(check, plan)
+
+`check(plan)`, a test of `plan`'s bound values at a leaf of a structural
+walk: run now, or recorded while [`_data_checks`](@ref) walks. `check` reads
+columns and `n_obs` from its argument only; naming that argument `plan`
+keeps it from capturing the walk's plan. It may capture what the walk
+derived from the plan's other fields and column names.
+"""
+function _data_check(check, plan::StructuralPlan)
+    sink = get(task_local_storage(), _DATA_CHECKS, nothing)
+    sink === _NO_DATA_CHECKS && error("internal: a data check inside a " *
+        "cached structural analysis")
+    sink === nothing ? check(plan) : push!(sink, check)
+    return nothing
+end
+
+"""
+    _data_checks(walk, plan, tag)
+
+`walk()`, a structural walk of `plan` that reads column names and value
+types but no column value or `n_obs` (its data tests are
+[`_data_check`](@ref) leaves), once per structure while `bind_data` runs;
+then the recorded checks, against `plan`. `tag` names the walk, as for
+[`_structural`](@ref).
+"""
+function _data_checks(walk, plan::StructuralPlan, tag::Tuple)
+    checks = _structural(plan, tag; columns = :types, fresh = false,
+            same = (a, b) -> map(typeof, a) == map(typeof, b)) do
+        sink = Any[]
+        task_local_storage(walk, _DATA_CHECKS, sink)
+        sink
+    end
+    for check in checks
+        check(plan)
+    end
+    return nothing
 end
 
 """`value`, or the equal object an earlier binding of this lowering produced
