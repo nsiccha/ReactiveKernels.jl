@@ -5841,9 +5841,11 @@ Base.@nospecializeinfer outputs(@nospecialize(spec::KernelSpec)) = _kernel_selec
 
 # --- pure named-port composition ------------------------------------------
 
+# `port_name` maps each of `spec`'s port names to its name in `ports`
+# (`rename`); composition keeps every name.
 function _kernel_clone_value_map!(graph::Graph, ports::Dict{Symbol,Value},
-                                  spec::KernelSpec)
-    public_ids = Dict(value.id => ports[name] for (name, value) in spec.ports)
+                                  spec::KernelSpec, port_name = identity)
+    public_ids = Dict(value.id => ports[port_name(name)] for (name, value) in spec.ports)
     mapped = Dict{ValueId,Value}()
     for id in sort!(collect(keys(spec.graph.values)))
         source = spec.graph.values[id]
@@ -5966,7 +5968,8 @@ end
 
 Compose declarative specs by named ports. The default preserves the first
 spec's boundary through every merge. `boundary=:fragment` explicitly adopts
-the final spec's boundary.
+the final spec's boundary. To join a port to a value of another name, rename
+the port first with [`ReactiveKernels.rename`](@ref rename).
 """
 function compose(first::KernelSpec, rest::KernelSpec...; boundary::Symbol = :base)
     boundary in (:base, :fragment) || throw(ArgumentError(
@@ -5980,4 +5983,76 @@ function compose(first::KernelSpec, rest::KernelSpec...; boundary::Symbol = :bas
     last = rest[end]
     KernelSpec(combined.graph, combined.ports, combined.port_order,
                copy(last.have_names), copy(last.want_names), last.call_signature)
+end
+
+"""
+    ReactiveKernels.rename(spec::KernelSpec, old => new, ...) -> KernelSpec
+
+Create a fresh kernel whose port `old` is named `new`, for each pair. The
+recipes, their operations and their plate and scan bodies are the same; `spec`
+is unchanged. The port order, the default HAVE/WANT boundary and the call
+signature keep their positions under the new names, so a renamed keyword port
+takes its new name as the keyword.
+
+Use it to [`compose`](@ref) a kernel whose port has a different name from the
+value that should feed it, for example a summary written once against a port
+`prediction` and a model whose prediction value is named at run time:
+
+    compose(model, ReactiveKernels.rename(summaries, :prediction => node))
+
+Renaming evaluates no source, so it also works while a downstream package
+image is generated. Each `old` must be a port of `spec`, named once, and the
+renamed ports must have distinct names; ports are joined by `compose`, not
+by renaming them to one name. `rename` is not exported, since `DataFrames`
+exports a function of that name.
+"""
+Base.@nospecializeinfer function rename(@nospecialize(spec::KernelSpec),
+                                        pairs::Pair{Symbol,Symbol}...)
+    ports = getfield(spec, :ports)
+    order = getfield(spec, :port_order)
+    names = Dict{Symbol,Symbol}()
+    for (old, new) in pairs
+        haskey(ports, old) || throw(ArgumentError(
+            "cannot rename :$old: the kernel has no port :$old; available ports: " *
+            join(string.(order), ", ")))
+        haskey(names, old) && throw(ArgumentError(
+            "cannot rename :$old twice (to :$(names[old]) and to :$new)"))
+        names[old] = new
+    end
+    port_name(name::Symbol) = get(names, name, name)
+    renamed = Symbol[port_name(name) for name in order]
+    for name in unique(renamed)
+        sources = order[renamed .== name]
+        length(sources) == 1 || throw(ArgumentError(
+            "cannot rename ports to :$name: it would name the ports " *
+            join(string.(":", sources), " and ") * "; rename onto a free name, " *
+            "or join same-name ports with `compose`"))
+    end
+
+    graph = Graph()
+    new_ports = Dict{Symbol,Value}()
+    new_order = Symbol[]
+    for name in order
+        _kernel_declare!(graph, new_ports, new_order, port_name(name),
+                         valtype(ports[name]))
+    end
+    values = _kernel_clone_value_map!(graph, new_ports, spec, port_name)
+    _kernel_clone_aliases!(graph, values, spec)
+    _kernel_clone_recipes!(graph, values, spec)
+    _kernel_reindex_producers!(graph)
+    KernelSpec(graph, new_ports, new_order,
+               Symbol[port_name(name) for name in getfield(spec, :have_names)],
+               Symbol[port_name(name) for name in getfield(spec, :want_names)],
+               _kernel_rename_signature(getfield(spec, :call_signature), port_name))
+end
+
+_kernel_rename_signature(::Nothing, port_name) = nothing
+_kernel_rename_signature(signature::_KernelCallSignature{P,K,M}, port_name) where {P,K,M} =
+    _kernel_call_signature(Val(map(port_name, P)), Val(map(port_name, K)), Val(M),
+                           signature.defaults)
+# An endpoint signature names owner ports, or holds a caller's values once
+# retargeted; only names are renamed.
+function _kernel_rename_signature(::_KernelEndpointCallSignature{I,E}, port_name) where {I,E}
+    rename_name(x) = x isa Symbol ? port_name(x) : x
+    _kernel_endpoint_call_signature(Val(map(rename_name, I)), Val(map(rename_name, E)))
 end

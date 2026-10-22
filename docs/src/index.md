@@ -132,6 +132,30 @@ the base boundary by default. That makes an extended kernel a drop-in for the
 base while extra requested outputs opt into extra work. The explicit
 `boundary = :fragment` option replaces both defaults when that is intentional.
 
+When the value a fragment should read has another name, rename the fragment's
+port first. A summary written once against a port `prediction` composes onto a
+model whose prediction value is named at run time:
+
+```julia
+@kernel summaries(prediction, rows) = begin
+    cells = plate(eachindex(rows)) do s
+        cell::Float64 = sum(prediction[rows[s]])
+    end
+    total::Float64 = sum(cells)
+end
+
+node = :mu   # e.g. read from the model
+graph = compose(model_graph, ReactiveKernels.rename(summaries, :prediction => node))
+```
+
+`ReactiveKernels.rename(spec, old => new, ...)` returns a fresh kernel with the
+same recipes and the ports renamed, positions kept: the default boundary and
+the call signature use the new names, and a renamed keyword port takes its new
+name as the keyword. It evaluates no source, so it works in a downstream
+package's precompile workload too. A renamed port must exist, be named once and
+not take a name another port keeps: join same-name ports with `compose`.
+`rename` is not exported, since `DataFrames` exports a function of that name.
+
 ## Reuse a kernel inside another kernel
 
 ```julia
