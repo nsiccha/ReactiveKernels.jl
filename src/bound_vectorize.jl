@@ -5,9 +5,9 @@
 # `NativeScheduling` the borrowed driver, the shared prefix kernel and the
 # per-worker residual driver as well. That is several lowerings and
 # compilations of the whole graph per call, independent of the bound values
-# (snag rebinding-a-comp-d03576ab: 400–440 ms and 134 MB of the ~520 ms
+# (snag rebinding-a-comp-d03576ab: 400–440 ms and 134 MB of the 490–520 ms
 # needed to bind and vectorize each design of a large composed simulation
-# graph). Every binding of one bound template (`_BoundTemplate`,
+# graph, 4.5–4.9 ms in all once kept). Every binding of one bound template (`_BoundTemplate`,
 # partial_evaluation.jl) has the same plan up to its constant recipes'
 # values, so its kernels share one `_BoundVectorizations`: per vectorize key,
 # the products of the first binding lowered with that key, kept without that
