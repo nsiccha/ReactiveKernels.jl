@@ -958,6 +958,28 @@ function _scope_name_paths(scopes::Vector{SubmodelScope})
 end
 
 """
+    FrozenValues(values::NamedTuple, inputs::NamedTuple)
+
+Data-only definitions frozen by value: what [`frozen_values`](@ref) reads
+from a binding and [`bind_data`](@ref)'s `frozen` keyword binds in place of
+evaluating them. `values` holds each definition's value. `inputs` describes
+each data input those definitions read, as `(type, size)`: the type the
+program declares for it (`Vector{Float64}`, `Float64`, …) and its size, never
+its values. A binding that leaves such an input out binds it absent with that
+type and size, so the program is the one a binding with the input generates.
+"""
+struct FrozenValues
+    values::NamedTuple
+    inputs::NamedTuple
+end
+FrozenValues() = FrozenValues((;), (;))
+Base.isempty(f::FrozenValues) = isempty(f.values)
+Base.:(==)(a::FrozenValues, b::FrozenValues) = a.values == b.values && a.inputs == b.inputs
+Base.isequal(a::FrozenValues, b::FrozenValues) =
+    isequal(a.values, b.values) && isequal(a.inputs, b.inputs)
+Base.hash(f::FrozenValues, h::UInt) = hash(f.inputs, hash(f.values, hash(FrozenValues, h)))
+
+"""
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
 
@@ -986,6 +1008,8 @@ they add no coordinate or transform and contribute to `prior`, or to
 `cell_priors` names scalar sums of conditional draw densities computed by
 retained cell scans; their coordinates and transforms belong to ordinary
 array parameters.
+`frozen` holds the data-only definitions a binding takes by value
+([`FrozenValues`](@ref), `bind_data(…; frozen)`); it is empty otherwise.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -1012,7 +1036,21 @@ struct StructuralPlan
     factors::Vector{SampledParameter}
     # Scalar graph values containing conditional priors emitted inside cells.
     cell_priors::Vector{Symbol}
+    # Data-only definitions a binding takes by value (`bind_data(…; frozen)`).
+    frozen::FrozenValues
 end
+
+# Plans authored before frozen definitions carry none.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors, cell_priors) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, cell_priors, FrozenValues())
 
 # Plans authored before cell-local conditional priors carry none.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1181,13 +1219,15 @@ function StructuralPlan(
         cell_broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         named_values::Vector{Pair{Symbol,Symbol}} = Pair{Symbol,Symbol}[],
         factors::Vector{SampledParameter} = SampledParameter[],
-        cell_priors::Vector{Symbol} = Symbol[])
+        cell_priors::Vector{Symbol} = Symbol[],
+        frozen::FrozenValues = FrozenValues())
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations,
-        external_observations, cell_broadcasts, named_values, factors, cell_priors)
+        external_observations, cell_broadcasts, named_values, factors, cell_priors,
+        frozen)
 end
 
 """Find a design matrix by name, or `nothing`."""
@@ -1580,7 +1620,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :plate_parameters, :scans,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
-    :cell_broadcasts, :named_values, :factors, :cell_priors)
+    :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -1943,7 +1983,7 @@ function _read_only_by_selection(plan::StructuralPlan, name::Symbol)
     end
     for f in fieldnames(StructuralPlan)
         f in (:columns, :roles, :n_obs, :submodel_scopes, :responses,
-            :indexed_observations, :cell_broadcasts) && continue
+            :indexed_observations, :cell_broadcasts, :frozen) && continue
         visit(getfield(plan, f))
     end
     for r in plan.responses, f in fieldnames(LikelihoodSpec)
@@ -2648,7 +2688,8 @@ function _uncached_label_only_columns(plan::StructuralPlan)
         return nothing
     end
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :roles, :n_obs, :submodel_scopes, :cell_broadcasts) && continue
+        f in (:columns, :roles, :n_obs, :submodel_scopes, :cell_broadcasts,
+            :frozen) && continue
         visit(getfield(plan, f))
     end
     return setdiff!(labels, numeric)
@@ -7208,7 +7249,7 @@ function _preparation_data_names(plan, nodes, raw, onlydata, names;
     free = Set{Symbol}(keys(nodes))
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :submodel_scopes,
-            :cell_broadcasts, :factors, :conditioned) && continue
+            :cell_broadcasts, :factors, :conditioned, :frozen) && continue
         _drop_held_names!(free, getfield(plan, f))
     end
     # Whole-value classification exempts `axes(M, d)` from observation
@@ -7264,7 +7305,8 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     # represented too, rather than from an intermediate definition table.
     unused = Set{Symbol}(raw)
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :n_obs, :roles, :submodel_scopes, :cell_broadcasts) && continue
+        f in (:columns, :n_obs, :roles, :submodel_scopes, :cell_broadcasts,
+            :frozen) && continue
         _drop_held_names!(unused, getfield(plan, f))
     end
     defs = Pair{Symbol,Any}[a.name => a.expr for a in plan.assignments]
@@ -7362,7 +7404,7 @@ function _uncached_model_level_inputs(plan::StructuralPlan, raw::AbstractSet{Sym
     named = copy(free)
     for f in fieldnames(StructuralPlan)
         f in (:assignments, :derived, :columns, :n_obs, :roles,
-            :submodel_scopes) && continue
+            :submodel_scopes, :frozen) && continue
         if f === :parameters
             for p in plan.parameters
                 p.family === :external && p.name in plan.conditioned && continue
@@ -7648,7 +7690,7 @@ function _uncached_bound_value_inputs(plan::StructuralPlan)
     found = Set{Symbol}()
     seen = Base.IdSet{Any}()
     for f in fieldnames(StructuralPlan)
-        f in (:columns, :submodel_scopes) && continue
+        f in (:columns, :submodel_scopes, :frozen) && continue
         _collect_bound_value_inputs!(found, getfield(plan, f), seen)
     end
     return found
@@ -7720,7 +7762,8 @@ function _scalar_responses_as_observations!(plan::StructuralPlan,
 end
 
 function _materialize_module_data!(plan::StructuralPlan,
-        columns::Dict{Symbol,ColumnData}; already = Set{Symbol}())
+        columns::Dict{Symbol,ColumnData}; already = Set{Symbol}(),
+        frozen::NamedTuple = (;))
     names = setdiff(_module_data_names(plan, Set{Symbol}(keys(columns))), already)
     isempty(names) && return names
     for nm in sort!(collect(names))
@@ -7731,14 +7774,59 @@ function _materialize_module_data!(plan::StructuralPlan,
     names = setdiff(_module_data_names(plan, Set{Symbol}(keys(columns));
         bind_only = true), already)
     isempty(names) && return names
+    exprs, vector_defs = _definition_exprs(plan)
+    # A frozen definition has its value: every definition reading it reads
+    # that value, and nothing it reads is evaluated for it.
+    memo = Dict{Symbol,Any}(pairs(frozen))
+    lookup = _definition_lookup(plan, columns, exprs, vector_defs, memo)
+    absent = _absent_definition_sources(plan, columns; supplied = keys(frozen))
+    for nm in sort!(collect(names))
+        source = get(absent, nm, nothing)
+        v = try
+            haskey(frozen, nm) ? frozen[nm] :
+            source === nothing ? lookup(nm) :
+                _absent_definition_value(nm, source, exprs, vector_defs, plan,
+                    columns; frozen)
+        catch e
+            e isa ContractValidationError && rethrow()
+            throw(ContractValidationError(
+                "[bind] data definition $nm failed to evaluate: " *
+                sprint(showerror, e)))
+        end
+        what = haskey(frozen, nm) ? "its frozen value is" : "evaluated to"
+        if nm in vector_defs
+            v isa Number || v isa AbstractArray ||
+                throw(ContractValidationError(
+                "[bind] data definition $nm is read per observation (an " *
+                "operand with Julia broadcast axes) but $what $(summary(v))"))
+        else
+            # Other Julia values stay graph assignments, where preparation
+            # can fold them without imposing a column type.
+            v isa ColumnData || continue
+        end
+        # Dense storage retains every observation operand's rank and axes.
+        columns[nm] = v isa _Absent ? v : v isa AbstractVector ? collect(v) :
+            v isa AbstractArray ? Array(v) : v
+    end
+    return names
+end
+
+# The definitions of `plan` by name, and the names of its derived (per
+# observation) ones.
+function _definition_exprs(plan::StructuralPlan)
     exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
     for d in plan.derived
         exprs[d.name] = d.expr
     end
-    vector_defs = Set{Symbol}(d.name for d in plan.derived)
-    memo = Dict{Symbol,Any}()
-    # Identical module calls share one evaluation (`(Xf, Zp) = f(x)` reads
-    # `f(x)` twice): within one bind every name has one value.
+    return exprs, Set{Symbol}(d.name for d in plan.derived)
+end
+
+# Plain-Julia evaluation of data-only definitions over `columns`: each name
+# evaluates once (`memo`, which may start with values already known), and
+# identical module calls share one evaluation (`(Xf, Zp) = f(x)` reads
+# `f(x)` twice): within one evaluation every name has one value.
+function _definition_lookup(plan::StructuralPlan, columns::AbstractDict, exprs,
+        vector_defs, memo::Dict{Symbol,Any} = Dict{Symbol,Any}())
     calls = Dict{Any,Any}()
     function lookup(nm::Symbol)
         haskey(memo, nm) && return memo[nm]
@@ -7755,43 +7843,19 @@ function _materialize_module_data!(plan::StructuralPlan,
             kernels = spec -> _prepared_kernel(plan, spec))
         return memo[nm]
     end
-    absent = _absent_definition_sources(plan, columns)
-    for nm in sort!(collect(names))
-        source = get(absent, nm, nothing)
-        v = try
-            source === nothing ? lookup(nm) :
-                _absent_definition_value(nm, source, exprs, vector_defs, plan, columns)
-        catch e
-            e isa ContractValidationError && rethrow()
-            throw(ContractValidationError(
-                "[bind] data definition $nm failed to evaluate: " *
-                sprint(showerror, e)))
-        end
-        if nm in vector_defs
-            v isa Number || v isa AbstractArray ||
-                throw(ContractValidationError(
-                "[bind] data definition $nm is read per observation (an " *
-                "operand with Julia broadcast axes) but evaluated to $(summary(v))"))
-        else
-            # Other Julia values stay graph assignments, where preparation
-            # can fold them without imposing a column type.
-            v isa ColumnData || continue
-        end
-        # Dense storage retains every observation operand's rank and axes.
-        columns[nm] = v isa _Absent ? v : v isa AbstractVector ? collect(v) :
-            v isa AbstractArray ? Array(v) : v
-    end
-    return names
+    return lookup
 end
 
 # Data definitions reading an absent value, directly or through other
 # definitions, mapped to the absent observation they read: the first absent
 # name in the definition's read order. The order is the structure's; only
-# which names are absent is data.
-function _absent_definition_sources(plan::StructuralPlan, columns::AbstractDict)
+# which names are absent is data. A `supplied` definition (a frozen value)
+# reads nothing.
+function _absent_definition_sources(plan::StructuralPlan, columns::AbstractDict;
+        supplied = ())
     sources = Dict{Symbol,Symbol}()
     any(v -> v isa _Absent, values(columns)) || return sources
-    for (nm, order) in _definition_read_orders(plan)
+    for (nm, order) in _definition_read_orders(plan, _sorted_names(supplied))
         i = findfirst(s -> get(columns, s, nothing) isa _Absent, order)
         i === nothing || (sources[nm] = _absent_source(columns[order[i]]))
     end
@@ -7799,18 +7863,17 @@ function _absent_definition_sources(plan::StructuralPlan, columns::AbstractDict)
 end
 
 # Each definition's name, then the names it reads, each followed by what
-# that name reads in turn (depth first, every name once). Once per structure.
-_definition_read_orders(plan::StructuralPlan) =
-    _structural(plan, (:definition_read_orders,); columns = :none, fresh = false) do
-        exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
-        for d in plan.derived
-            exprs[d.name] = d.expr
-        end
+# that name reads in turn (depth first, every name once), never past a
+# `supplied` name. Once per structure.
+_definition_read_orders(plan::StructuralPlan, supplied::Tuple = ()) =
+    _structural(plan, (:definition_read_orders, supplied...); columns = :none,
+            fresh = false) do
+        exprs, _ = _definition_exprs(plan)
         function visit!(order, seen, nm)
             nm in seen && return order
             push!(seen, nm)
             push!(order, nm)
-            haskey(exprs, nm) || return order
+            (haskey(exprs, nm) && nm ∉ supplied) || return order
             for s in _definition_reads(exprs[nm])
                 visit!(order, seen, s)
             end
@@ -7822,13 +7885,14 @@ _definition_read_orders(plan::StructuralPlan) =
 # An absent definition's stand-in. Its type and shape are those the
 # definition computes from values of the absent observation's type and
 # shape (ones): the program reads only those. The values themselves are
-# discarded, and no query binds this input.
+# discarded, and no query binds this input. A frozen definition reads as
+# its value.
 function _absent_definition_value(nm::Symbol, source::Symbol, exprs, vector_defs,
-        plan::StructuralPlan, columns::AbstractDict)
+        plan::StructuralPlan, columns::AbstractDict; frozen::NamedTuple = (;))
     surrogate(v::_AbsentArray) = ones(eltype(v), v.dims)
     surrogate(v::_AbsentNumber{T}) where {T} = one(T)
     surrogate(v) = v
-    memo = Dict{Symbol,Any}()
+    memo = Dict{Symbol,Any}(pairs(frozen))
     calls = Dict{Any,Any}()
     function lookup(s::Symbol)
         haskey(memo, s) && return memo[s]
@@ -8104,7 +8168,8 @@ function _eval_derived_node(ex, plan::StructuralPlan, det_exprs, columns,
 end
 
 """
-    bind_data(plan, columns; roles=Dict(), dims=Dict(), conditioned=plan.conditioned) -> StructuralPlan
+    bind_data(plan, columns; roles=Dict(), dims=Dict(), conditioned=plan.conditioned,
+              frozen=plan.frozen) -> StructuralPlan
 
 `columns` accepts a symbol-keyed `AbstractDict` or a `NamedTuple` of data
 values, as does value-based `lower_rkppl`. Named tuples use the same binding
@@ -8129,6 +8194,18 @@ undotted module call (`gx_m = f(gx)`, or inlined `(b .* f(gx))[g]`) and no
 response, predictor or other slot names — it may have any length or shape
 and never sets `n_obs` (see `_model_level_inputs`).
 
+`frozen` ([`FrozenValues`](@ref), as [`frozen_values`](@ref) reads it from
+another binding) supplies data-only definitions by value: each takes its
+frozen value exactly where binding would have evaluated it, whether binding
+binds it as data or RK preparation folds it (a whole value a
+parameter-dependent call reads, supplied to preparation as a HAVE value).
+A data input that only frozen definitions read may be left out: binding binds
+it absent with the type and size `frozen` records, so the program is the one
+a binding with that input generates, and nothing reads it. Supplying a frozen
+definition as data is refused, as for any definition. A rebinding keeps its
+plan's frozen values unless `frozen` replaces them; `frozen = nothing`
+evaluates every definition again.
+
 Binding resolves module values and calls in a package-owned latest-world
 scope, including definitions just evaluated in a builder.
 """
@@ -8138,19 +8215,21 @@ bind_data(plan::StructuralPlan, columns::NamedTuple; kwargs...) =
 function bind_data(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
-        conditioned = plan.conditioned)
+        conditioned = plan.conditioned,
+        frozen::Union{FrozenValues,Nothing} = plan.frozen)
     # Resolve the callee binding in the same scope as its evaluation: on
     # Julia 1.12, a call-only invokelatest cannot see a just-created binding
     # while evaluating its function argument in the caller's older world.
     return _with_structural_cache() do
-        Base.invokelatest(_bind_data_latest, plan, columns; roles, dims, conditioned)
+        Base.invokelatest(_bind_data_latest, plan, columns; roles, dims, conditioned,
+            frozen = something(frozen, FrozenValues()))
     end
 end
 
 function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
         roles::Dict{Symbol,Symbol} = Dict{Symbol,Symbol}(),
         dims::AbstractDict{Symbol,<:Integer} = Dict{Symbol,Int}(),
-        conditioned = plan.conditioned)
+        conditioned = plan.conditioned, frozen::FrozenValues = plan.frozen)
     sampled = Set(p.name for ps in (plan.parameters, plan.factors, plan.array_parameters,
         plan.vector_parameters, plan.plate_parameters) for p in ps)
     observing = intersect(sampled, Set{Symbol}(_conditioned_names(conditioned)))
@@ -8169,6 +8248,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     columns = _checked_columns(columns)
     # Rebinding a binding: what it left absent stays absent unless supplied.
     filter!(p -> _supplied(last(p)), columns)
+    frozen_inputs = _bind_frozen!(plan, columns, frozen)
     _absent_observations!(plan, columns)
     _route_conditioned_values!(plan, columns)
     _route_bound_values!(plan, columns)
@@ -8177,7 +8257,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     # exactly like a caller-supplied matrix.
     _materialize_value_matrices!(plan, columns)
     raw = Set{Symbol}(keys(columns))
-    computed = _materialize_module_data!(plan, columns)
+    computed = _materialize_module_data!(plan, columns; frozen = frozen.values)
     _size_absent_responses!(plan, columns)
     # Raw inputs read only as whole values (module-call arguments,
     # gathered values): no n_obs anchor.
@@ -8231,12 +8311,13 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     else
         axes = _observation_axes(axis_plan)
         axes === nothing ? _bind_nrows(columns,
-            union(_mi_managed_columns(plan), computed, inputs)) : axes.total
+            union(_mi_managed_columns(plan), computed, inputs, frozen_inputs)) : axes.total
     end
     # Latent plates over values now know their cell counts; the data-only
     # indices selecting their prior inputs evaluate like any other.
     isempty(_bind_plate_extents!(_with(axis_plan; n_obs = n), columns)) ||
-        _materialize_module_data!(plan, columns; already = computed)
+        _materialize_module_data!(plan, columns; already = computed,
+            frozen = frozen.values)
     maps = _eval_levelmaps(plan.levelmaps, columns)
     maps = _interned(plan, (:levelmaps, map(m -> (m.predictor, m.column,
         Tuple(m.values), m.source, m.subset), maps)...), maps)
@@ -8247,7 +8328,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     vectors2 = _interned(plan, (:vector_parameters, vectors2...), vectors2)
     bound = _with(plan; responses = responses2, columns = columns,
         n_obs = n, roles = merged, levelmaps = maps,
-        vector_parameters = vectors2)
+        vector_parameters = vectors2, frozen = frozen)
     _size_absent_conditioned_arrays!(bound)
     _validate_conditioned_values(bound)
     validate_data(bound)

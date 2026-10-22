@@ -51,6 +51,7 @@ export DesignMatrix
 export StructuralPlan, SubmodelScope
 export ContractValidationError, validate_plan, validate_structure, validate_data
 export topological_order, isbound, bind_data, COLUMN_ROLES
+export FrozenValues, frozen_values
 export admitted_families, admitted_terms, admitted_functions, admitted_elementwise
 export supports_term
 export block_name
@@ -87,6 +88,7 @@ export rk_symmetric_eigvals, rk_symmetric_eigvecs
 
 include("contract.jl")
 include("structural_cache.jl")
+include("frozen.jl")
 include("sampling.jl")
 import ReactiveKernelsDistributionKernels: DistributionKernelSources
 # The general numerical callables and rule graphs are owned by RK proper;
