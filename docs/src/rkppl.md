@@ -50,6 +50,24 @@ data (a kernel such a definition calls is prepared once per lowering) and
 validates the values, such as a gather index's element type and range or a
 column's numbers.
 
+A model can fit its preprocessing in the graph from a fit-role copy of its
+data (`x_mean = fit_mean(x_fit)`, then `z = (x .- x_mean) ./ x_sd`) and
+freeze it by value for later designs, so a design binds without the training
+data. `frozen_values(fit, (:x_mean, :x_sd))` reads those definitions' values
+from the fit's binding, together with the type and size (never the values)
+of each data input they read. `bind_data(plan, design; frozen = state)`
+then takes each value exactly where binding would have evaluated it, and
+leaves out an input only frozen definitions read. The design generates the
+fit's program, so a kernel built for the fit evaluates it, with equal values,
+densities and gradients. A whole value that RK preparation folds (one a
+parameter-dependent call reads, such as an HSGP interval) freezes the same
+way: preparation receives its frozen value at its own graph node, and
+computes neither it nor what only it reads. A design lowered without the
+training data passes the record to lowering too,
+`lower_rkppl(ast, design; frozen = state)`, which then knows the omitted
+input is data, and `bind_data` binds the lowered plan's record by default.
+Supplying a computed definition as plain data stays refused.
+
 An explicitly observed empty vector has zero observations and contributes
 zero log-likelihood. Scalar priors and their transforms still contribute as
 authored. An elementwise declaration such as `z[1:0] .~ Normal.(0, 1)` is an

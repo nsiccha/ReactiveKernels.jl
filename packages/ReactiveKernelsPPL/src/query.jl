@@ -75,15 +75,19 @@ end
 # The sampler boundary: packed unconstrained parameters plus the raw data
 # columns, sorted by name (same order the generator uses for data args).
 # Values the binding leaves absent are not inputs: a query reading one has
-# nothing to read (`_absent_refusal`).
+# nothing to read (`_absent_refusal`). Frozen definitions the graph computes
+# are inputs too, at their own nodes: RK computes neither them nor what only
+# they read (`_frozen_graph_names`).
 _query_columns(plan::StructuralPlan) =
     sort!([k for (k, v) in plan.columns if _supplied(v)])
 
-_query_have(plan::StructuralPlan) = (:unconstrained, _query_columns(plan)...)
+_query_have(plan::StructuralPlan) =
+    (:unconstrained, _query_columns(plan)..., _frozen_graph_names(plan)...)
 
 function _query_bound(plan::StructuralPlan)
     names = _query_columns(plan)
-    return NamedTuple{Tuple(names)}(Tuple(plan.columns[k] for k in names))
+    return merge(NamedTuple{Tuple(names)}(Tuple(plan.columns[k] for k in names)),
+        _frozen_graph_values(plan))
 end
 
 # Run a preparation of `want` from `have` over `plan`'s inputs. When it
@@ -762,7 +766,7 @@ function prepare_compact_cell_sampler(built, plan::StructuralPlan, observations,
     filter!(!=(:unconstrained), spec.have_names)
     prepend!(spec.have_names, [:_ppl_cell_base, :_ppl_cell_active, :_ppl_cell_indices])
     filter!(n -> n ∉ _absent_inputs(plan), spec.have_names)
-    have = Tuple(spec.have_names)
+    have = (spec.have_names..., _frozen_graph_names(plan)...)
     kernel = _absent_refusal(plan, spec, have, want) do
         Base.invokelatest(prepare, spec; have, want, bound = _query_bound(plan), on_error)
     end

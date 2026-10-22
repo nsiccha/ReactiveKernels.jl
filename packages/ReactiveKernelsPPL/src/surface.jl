@@ -921,11 +921,21 @@ So does a definition reading only data that a cell reads at the loop index
 (`rows = part(g, cells)`, then `x[rows[i]] * a`), when its value holds one
 array per index: lowering evaluates such a definition to see that. Names
 alone cannot show this, so such a plan refuses those arrays at binding.
-"""
-lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=()) =
-    lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned)
 
-function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=())
+`frozen` ([`FrozenValues`](@ref), from [`frozen_values`](@ref)) lowers a
+design that freezes data-only definitions by value: each data input the
+record describes and `data` omits (a fit-role copy `x_fit` of training data)
+is data of its recorded type and size, so the plan is the one lowering with
+that input gives. The plan carries `frozen`, and [`bind_data`](@ref) binds it
+by default.
+"""
+lower_rkppl(ast, data::NamedTuple; mod::Module = Main, conditioned=(),
+        frozen::Union{FrozenValues,Nothing} = nothing) =
+    lower_rkppl(ast, Dict{Symbol,Any}(pairs(data)); mod, conditioned, frozen)
+
+function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=(),
+        frozen::Union{FrozenValues,Nothing} = nothing)
+    frozen === nothing || (data = _with_frozen_inputs(data, frozen))
     names = Symbol[]
     scalars = Set{Symbol}()
     for (k, v) in data
@@ -933,11 +943,31 @@ function lower_rkppl(ast, data::AbstractDict; mod::Module = Main, conditioned=()
         push!(names, k)
         v isa Number && push!(scalars, k)
     end
-    return _lower_rkppl(ast, names, scalars, mod; conditioned, values = data)
+    return _with_frozen(_lower_rkppl(ast, names, scalars, mod; conditioned,
+        values = data), frozen)
 end
 
-lower_rkppl(ast, data_names; mod::Module = Main, conditioned=()) =
-    _lower_rkppl(ast, data_names, Set{Symbol}(), mod; conditioned)
+function lower_rkppl(ast, data_names; mod::Module = Main, conditioned=(),
+        frozen::Union{FrozenValues,Nothing} = nothing)
+    names = collect(data_names)
+    frozen === nothing || union!(names, keys(_with_frozen_inputs(Dict{Symbol,Any}(), frozen)))
+    return _with_frozen(_lower_rkppl(ast, names, Set{Symbol}(), mod; conditioned), frozen)
+end
+
+# The data a lowering with `frozen` reads: `data`, plus each input the record
+# describes that `data` omits, as an absent value of its recorded type and
+# size under the name the author binds (a number binds as `x`, read through
+# its `_rkppl_value_x` input). The caller's container is not mutated.
+function _with_frozen_inputs(data::AbstractDict, frozen::FrozenValues)
+    out = Dict{Symbol,Any}(data)
+    for (input, info) in pairs(frozen.inputs)
+        name = Symbol(chopprefix(String(input), "_rkppl_value_"))
+        haskey(out, name) || (out[name] = _frozen_input_stub(name, info))
+    end
+    return out
+end
+_with_frozen(plan::StructuralPlan, ::Nothing) = plan
+_with_frozen(plan::StructuralPlan, frozen::FrozenValues) = _with(plan; frozen)
 
 # `values`: the data values when lowering from values, which show the
 # values that hold one array per index (`_value_array_entries`); lowering
@@ -10788,14 +10818,20 @@ _def_reads_module(s, ctx) = _contains_module_call(ctx.detmap[s]) ||
         _value_symbols(ctx.detmap[s]))
 
 # An alias or a signed alias computes nothing of its own and still reads
-# through; a data-only definition folds once at binding; array and matrix
-# definitions are never inlined.
+# through; array and matrix definitions are never inlined. A data-only
+# definition folds once wherever it is read, but a whole value a module call
+# computes from data (a fitted interval, a basis) stays one named value as
+# well: a binding can then freeze it by name (`bind_data(…; frozen)`), and
+# the graph holds it under its authored name. Per-observation data-only
+# definitions keep their own route (bind-time columns or inlined terms).
 function _computed_value_def(nm, ctx, canonmap, data)
     rhs = canonmap[nm]
     rhs isa Expr || return false
     _is_signed_alias(rhs) && return false
-    get(ctx.detshape, nm, :scalar) in (:array, :matrix) && return false
-    return !_data_only(rhs, data, canonmap)
+    shape = get(ctx.detshape, nm, :scalar)
+    shape in (:array, :matrix) && return false
+    _data_only(rhs, data, canonmap) || return true
+    return shape !== :vector && _contains_module_call(rhs)
 end
 
 _is_signed_alias(rhs) = Meta.isexpr(rhs, :call) && length(rhs.args) == 2 &&
