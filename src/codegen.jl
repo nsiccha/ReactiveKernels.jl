@@ -5819,6 +5819,10 @@ Base.@nospecializeinfer function _prepared_kernel(
                              lowered_recipes, rebinding))::PreparedKernel
 end
 
+# The `exact_signature` a prepared kernel was built with.
+_exact_signature(@nospecialize(kernel::PreparedKernel)) =
+    (typeof(kernel)::DataType).parameters[6]
+
 # A caller that guarantees execution through a latest-world entry may use the
 # authored closure directly. Ordinary prepare retains its world-age fallback.
 _kernel_latest_source(x) = x

@@ -104,8 +104,6 @@ function _rebind_holds_constant(@nospecialize(ops::Tuple),
 end
 
 _rebind_constants(@nospecialize(kernel::PreparedKernel), n::Int) = kernel.ops[1:n]
-_exact_signature(@nospecialize(kernel::PreparedKernel)) =
-    (typeof(kernel)::DataType).parameters[6]
 
 # --- keeping a product without its binding's constants ----------------------
 

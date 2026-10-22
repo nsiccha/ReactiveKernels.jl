@@ -1669,7 +1669,6 @@ end
 # A class's template before its first binding the inner-plate pass left alone.
 struct _UnbuiltTemplate end
 
-
 struct _BoundEntry
     plan::Plan
     boundary::_PartialBoundary
@@ -1766,7 +1765,7 @@ function _rebinding_kernel(@nospecialize(kernel::PreparedKernel),
                            vectorizations::_BoundVectorizations)
     _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs, kernel.plan,
                      kernel.ast, kernel.lowered_recipes;
-                     exact_signature = (typeof(kernel)::DataType).parameters[6],
+                     exact_signature = _exact_signature(kernel),
                      rebinding = vectorizations)
 end
 
