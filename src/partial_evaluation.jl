@@ -622,11 +622,11 @@ function _partial_split_leaf(native, tensor, source, count)
     (; native, tensor, split)
 end
 
-_partial_plate_recipe(g, recipe, known, op) = nothing
+_partial_plate_recipe(g, recipe, known, op, rewrites) = nothing
 # Generated inner-kernel types are data to this structural pass. Specializing
 # on them recompiles the entire partial evaluator once per authored plate.
 Base.@nospecializeinfer function _partial_plate_recipe(
-        g, recipe, known, @nospecialize(op::_AuthoredPlateOp))
+        g, recipe, known, @nospecialize(op::_AuthoredPlateOp), rewrites)
     atomic_inputs = typeof(op).parameters[2]
     inner = op.kernel.plan
     length(inner.have) == length(recipe.inputs) || return nothing
@@ -823,32 +823,49 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         end
         push!(cache_data, data)
     end
-    scalar_plan = _partial_subplan(inner, vcat(inner.have[keep], frontier),
-                                  inner.want, residual)
-    kernel = _prepare(scalar_plan,
-        _lower_with_ops(scalar_plan; inline_embedded = false)...)
-    kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-        kernel.plan, kernel.ast, Tuple(readable[r.id] for r in residual))
-    axis_checks = Tuple(Tuple(position[index] for index in group)
-                        for group in op.axis_checks)
-    replacement = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(
-        kernel, axis_checks)
+    # The rewritten plate and its cache values follow from the decisions
+    # above, not from the cached data, so a later binding of a cached bound
+    # preparation that decides alike reuses them (`_PlateRewrites`): its
+    # residual then differs only in its `_BoundConstant` values.
+    key = (recipe.id, Tuple(r.id for r in residual), Tuple(v.name for v in frontier),
+           Tuple(keep), Tuple(atomic), whole,
+           Tuple(Any[typeof(data) for data in cache_data]))
+    rewrite = rewrites === nothing ? nothing : _plate_rewrite(rewrites, key)
+    if rewrite === nothing
+        scalar_plan = _partial_subplan(inner, vcat(inner.have[keep], frontier),
+                                      inner.want, residual)
+        kernel = _prepare(scalar_plan,
+            _lower_with_ops(scalar_plan; inline_embedded = false)...)
+        kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
+            kernel.plan, kernel.ast, Tuple(readable[r.id] for r in residual))
+        axis_checks = Tuple(Tuple(position[index] for index in group)
+                            for group in op.axis_checks)
+        replacement = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(
+            kernel, axis_checks)
+        cache_values = whole ? Value[] :
+            Value[value!(g, Symbol(:bound_plate_, v.name), typeof(data))
+                  for (v, data) in zip(frontier, cache_data)]
+        rewrite = (; replacement, cache_values)
+        rewrites === nothing || (rewrite = _plate_rewrite!(rewrites, key, rewrite))
+    end
+    (; replacement, cache_values) = rewrite
+    for value in cache_values
+        haskey(g.values, value.id) || (_register!(g, value); g.version += 1)
+    end
     if whole
         args = (Any[known[canon_id(g, recipe.inputs[index].id)]
                     for index in keep]..., cache_data...)
-        for group in axis_checks
+        for group in replacement.axis_checks
             _plate_require_axes(Base.Broadcast.combine_axes(
                 (args[p] for p in group)...))
         end
         return (; recipe = nothing, cache_values = Value[only(recipe.outputs)],
-                cache_data = Any[replacement(args...)])
+                cache_data = Any[replacement(args...)], key)
     end
-    cache_values = Value[value!(g, Symbol(:bound_plate_, v.name), typeof(data))
-                         for (v, data) in zip(frontier, cache_data)]
     updated = Recipe(recipe.id, (recipe.inputs..., cache_values...),
         recipe.outputs, replacement, recipe.cost, nothing,
         recipe.effectful, recipe.source)
-    (; recipe = updated, cache_values, cache_data)
+    (; recipe = updated, cache_values, cache_data, key)
 end
 
 # ---------------------------------------------------------------------------
@@ -1255,8 +1272,14 @@ function _partition_sum_consumer(consumers)
     length(r.outputs) == 1 && _plain_sum_recipe(r) ? r : nothing
 end
 
-function _partial_inner_plates(p::Plan, known)
-    any(r -> r.op isa _AuthoredPlateOp, p.recipes) || return p
+_partial_inner_plates(p::Plan, known) = first(_partial_inner_plates(p, known, nothing))
+
+# The specialized plan and its signature: `()` when the pass left `p` alone,
+# the keys of its plate rewrites when it only rewrote plates through
+# `rewrites` (every later binding with the same signature then has the same
+# plan up to its `_BoundConstant` values), and `nothing` otherwise.
+function _partial_inner_plates(p::Plan, known, rewrites)
+    any(r -> r.op isa _AuthoredPlateOp, p.recipes) || return p, ()
     # A shallow structural copy preserves public Value identities and recipe
     # operations. Only its value registry is extended; no shared graph changes.
     g = p.graph
@@ -1268,15 +1291,18 @@ function _partial_inner_plates(p::Plan, known)
     fresh() = (id = next_id[]; next_id[] -= 1; id)
     changed = false
     whole = false
+    signature = Any[]
+    keyed = rewrites !== nothing
     # A worklist: an arm plate emitted by the branch partition is examined
     # again (a nested arm or a further branch in its cell), and a rewritten
     # `sum` consumer replaces the original later in the queue.
     pending = copy(p.recipes)
     while !isempty(pending)
         r = popfirst!(pending)
-        specialized = _partial_plate_recipe(copied, r, known, r.op)
+        specialized = _partial_plate_recipe(copied, r, known, r.op, rewrites)
         if specialized !== nothing
             changed = true
+            push!(signature, specialized.key)
             for (value, data) in zip(specialized.cache_values, specialized.cache_data)
                 push!(recipes, Recipe(fresh(), (), (value,), _BoundConstant(data),
                                       0.0, nothing, false))
@@ -1293,17 +1319,19 @@ function _partial_inner_plates(p::Plan, known)
             continue
         end
         changed = true
+        keyed = false
         if partitioned.rewrite !== nothing
             id, combined = partitioned.rewrite
             pending[findfirst(q -> q.id == id, pending)] = combined
         end
         prepend!(pending, partitioned.expansion)
     end
-    changed || return p
+    changed || return p, ()
     template = Plan(copied, p.have, p.want, p.recipes, p.producer,
                     p.cost, p.candidates)
     specialized = _partial_subplan(template, p.have, p.want, recipes)
-    whole ? _partial_fold_bound(specialized) : specialized
+    whole && return _partial_fold_bound(specialized), nothing
+    specialized, keyed ? Tuple(signature) : nothing
 end
 
 # A plate whose whole result became a bind-time value can leave consumers that
@@ -1642,27 +1670,78 @@ end
 # A template also keeps no binding's values: only the compiled callable and
 # the value-independent tails of the operation table and readable recipes.
 
+# The rewrites of a residual's authored plates by the inner-plate pass
+# (`_partial_plate_recipe`) for one plate class tuple of a cached entry, keyed
+# by everything they follow from. A rewrite holds a prepared cell kernel and
+# the cache values' identities, never a binding's cached data.
+struct _PlateRewrites
+    rewrites::Dict{Any,Any}
+    lock::ReentrantLock
+end
+_PlateRewrites() = _PlateRewrites(Dict{Any,Any}(), ReentrantLock())
+_plate_rewrite(r::_PlateRewrites, @nospecialize(key)) =
+    lock(() -> get(r.rewrites, key, nothing), r.lock)
+_plate_rewrite!(r::_PlateRewrites, @nospecialize(key), @nospecialize(rewrite)) =
+    lock(() -> get!(r.rewrites, key, rewrite), r.lock)
+
+# A table (an operation table, a recipe list) without one binding's
+# constants: `fixed` holds every other entry and `slots[j]` the position of
+# constant `j`. Each constant must occur exactly once, in order, and no other
+# entry may be one of them, so the table holds nothing of that binding.
+struct _RebindTable
+    fixed::Vector{Any}
+    slots::Vector{Int}
+end
+
+function _rebind_table(@nospecialize(table), constants::Vector)
+    fixed = Any[table...]
+    slots = Int[]
+    for (k, x) in enumerate(fixed)
+        any(c -> x === c, constants) || continue
+        j = length(slots) + 1
+        j <= length(constants) && x === constants[j] || return nothing
+        push!(slots, k)
+        fixed[k] = nothing
+    end
+    length(slots) == length(constants) ? _RebindTable(fixed, slots) : nothing
+end
+
+# The table with another binding's constants in their slots.
+function _rebound_table(t::_RebindTable, constants::Vector)
+    table = copy(t.fixed)
+    for (j, k) in enumerate(t.slots)
+        table[k] = constants[j]
+    end
+    table
+end
+
+# A plan's per-binding constant recipes, in plan order: the hoisted constants
+# and the values the inner-plate pass cached.
+_bound_constants(p::Plan) = Recipe[r for r in p.recipes if r.op isa _BoundConstant]
+
 # The vectorized lowerings every binding of one template shares. `vectorize`
 # of a template's kernel keeps, per vectorize key, the position-batched
 # programs of the first binding it lowered, without that binding's constants
 # (`_RebindReplicated` and friends, bound_vectorize.jl); a later binding's
 # `vectorize` places its own constants in the leading `constants` slots of
 # their operation tables instead of lowering and compiling them again.
+# `slots` are the positions of the kernel's constants in its operation table
+# and readable recipes.
 struct _BoundVectorizations
-    constants::Int
+    slots::Vector{Int}
     products::Dict{Any,Any}
     lock::ReentrantLock
 end
-_BoundVectorizations(constants::Int) =
-    _BoundVectorizations(constants, Dict{Any,Any}(), ReentrantLock())
+_BoundVectorizations(slots::Vector{Int}) =
+    _BoundVectorizations(slots, Dict{Any,Any}(), ReentrantLock())
 
 struct _BoundTemplate
-    f::Any           # the compiled residual callable, shared by every binding
-    ops::Tuple       # the operation table after the constant slots
+    f::Any                # the compiled residual callable, shared by every binding
+    ops::_RebindTable     # the operation table without the constants
     inputs::Tuple
     outputs::Tuple
     ast::Expr
-    lowered::Tuple   # the readable recipes after the constant slots
+    lowered::_RebindTable # the readable recipes without the constants
     vectorizations::_BoundVectorizations
 end
 
@@ -1678,11 +1757,14 @@ struct _BoundEntry
     # Per plate-class tuple, the residual recipe tail after value-independent
     # plate-chain fusion. No binding's constant recipes or values are retained.
     fused::Dict{Any,Vector{Recipe}}
-    # Per (plate classes, index-run schedule classes): a `_BoundTemplate`; the kernel itself when it
-    # has no constant slots; or `nothing` (a residual whose leading slots are
-    # not exactly its constants: the per-binding path). An absent class is
-    # unbuilt.
+    # Per (plate classes, index-run schedule classes, plate-rewrite
+    # signature): a `_BoundTemplate`; the kernel itself when it has no
+    # constant slots; or `nothing` (a residual whose constants do not fill
+    # exactly their own operation-table slots: the per-binding path). An
+    # absent key is unbuilt.
     templates::Dict{Any,Any}
+    # Per plate-class tuple, the inner-plate pass's plate rewrites.
+    rewrites::Dict{Any,Any}
 end
 
 function _bound_entry(p::Plan, @nospecialize(ports))
@@ -1697,7 +1779,7 @@ function _bound_entry(p::Plan, @nospecialize(ports))
              _prepare_plan(_partial_prefix_plan(p, boundary))
     plates = any(r -> r.op isa _AuthoredPlateOp, boundary.residual)
     _BoundEntry(p, boundary, prefix, plates, _partial_index_run_slots(p.graph,boundary),
-                Dict{Any,Vector{Recipe}}(), Dict{Any,Any}())
+                Dict{Any,Vector{Recipe}}(), Dict{Any,Any}(), Dict{Any,Any}())
 end
 
 _bound_hoisted(entry::_BoundEntry, @nospecialize(data::Tuple)) =
@@ -1724,12 +1806,14 @@ end
 # from it (the same object when the pass left it alone, or did not run).
 function _bound_residual(entry::_BoundEntry, cache,
                          @nospecialize(hoisted), @nospecialize(classes::Tuple))
-    entry.plates || return nothing, nothing
+    entry.plates || return nothing, nothing, ()
     b = entry.boundary
     residual = _partial_residual_plan(entry.plan, b, hoisted,
                                       _bound_fused_residual(entry, cache, classes))
-    residual, _partial_inner_plates(residual,
-                                    _partial_known_values(entry.plan, b, hoisted))
+    rewrites = lock(() -> get!(_PlateRewrites, entry.rewrites, classes), cache.lock)
+    specialized, signature = _partial_inner_plates(residual,
+        _partial_known_values(entry.plan, b, hoisted), rewrites)
+    residual, specialized, signature
 end
 
 # The residual plan `_bound_residual` built, or, where the inner-plate pass did
@@ -1741,23 +1825,27 @@ _bound_residual_plan(::_BoundEntry, residual::Plan, @nospecialize(hoisted)) = re
 _bound_residual_plan(entry::_BoundEntry, ::Nothing, @nospecialize(hoisted)) =
     _partial_residual_plan(entry.plan, entry.boundary, hoisted)
 
-# The first value-independent binding: the ordinary preparation, capturing
-# the template when the leading operation-table slots are exactly the
-# constants. Returns the template (or `nothing`) and this binding's kernel.
+# The first binding of a template key: the ordinary preparation, capturing
+# the template when each of the plan's constants fills exactly its own
+# operation-table slot. Returns the template (or `nothing`) and this
+# binding's kernel.
 function _bound_build(entry::_BoundEntry, @nospecialize(residual),
                       @nospecialize(hoisted), @nospecialize(passes))
-    kernel = prepare(_bound_residual_plan(entry, residual, hoisted); passes = passes)
-    n = length(entry.boundary.constants)
-    # Rebinding swaps the leading operation-table slots, so they must be
-    # exactly this binding's constants in slot order.
-    templated = all(i -> kernel.ops[i] isa _BoundConstant &&
-                         kernel.ops[i].value === hoisted[i], 1:n)
-    templated || return nothing, kernel
-    vectorizations = _BoundVectorizations(n)
+    plan = _bound_residual_plan(entry, residual, hoisted)
+    kernel = prepare(plan; passes = passes)
+    constants = _bound_constants(plan)
+    # Rebinding replaces the constants' operation-table entries and readable
+    # recipes, so each must fill one slot of both, the same one, and no other
+    # entry may hold it.
+    lowered = _rebind_table(kernel.lowered_recipes, constants)
+    lowered === nothing && return nothing, kernel
+    ops = _rebind_table(kernel.ops, Any[c.op for c in constants])
+    ops !== nothing && ops.slots == lowered.slots || return nothing, kernel
+    vectorizations = _BoundVectorizations(lowered.slots)
     kernel = _rebinding_kernel(kernel, vectorizations)
-    n == 0 && return kernel, kernel
-    _BoundTemplate(kernel.f, kernel.ops[(n + 1):end], kernel.inputs, kernel.outputs,
-                   kernel.ast, kernel.lowered_recipes[(n + 1):end], vectorizations), kernel
+    isempty(constants) && return kernel, kernel
+    _BoundTemplate(kernel.f, ops, kernel.inputs, kernel.outputs, kernel.ast, lowered,
+                   vectorizations), kernel
 end
 
 # `kernel`, linked to the vectorizations its template's bindings share.
@@ -1769,7 +1857,7 @@ function _rebinding_kernel(@nospecialize(kernel::PreparedKernel),
                      rebinding = vectorizations)
 end
 
-# A later binding of a residual whose leading slots are not its constants:
+# A later binding of a residual whose constants do not fill their own slots:
 # compilation on the cached plan and prefix.
 function _bound_rebind(entry::_BoundEntry, ::Nothing, @nospecialize(residual),
                        @nospecialize(hoisted), @nospecialize(passes))
@@ -1780,17 +1868,21 @@ end
 _bound_rebind(::_BoundEntry, @nospecialize(kernel::PreparedKernel), @nospecialize(residual),
               @nospecialize(hoisted), @nospecialize(passes)) = kernel
 
-# A later value-independent binding: the same compiled callable over a fresh
-# constant table.
+# A later binding of the same key: the same compiled callable over its own
+# constants.
 function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
                        @nospecialize(residual), @nospecialize(hoisted),
                        @nospecialize(passes))
     plan = _bound_residual_plan(entry, residual, hoisted)
-    recipes = plan.recipes[1:length(entry.boundary.constants)]
-    ops = (Any[recipe.op for recipe in recipes]..., template.ops...)
-    _prepared_kernel(template.f, ops, template.inputs, template.outputs, plan,
-                     template.ast, (recipes..., template.lowered...);
-                     rebinding = template.vectorizations)
+    constants = _bound_constants(plan)
+    # The key fixes the plan up to its constants; a different count would mean
+    # it does not, and the ordinary preparation is the safe answer.
+    length(constants) == length(template.lowered.slots) ||
+        return prepare(plan; passes = passes)
+    ops = _rebound_table(template.ops, Any[c.op for c in constants])
+    lowered = _rebound_table(template.lowered, constants)
+    _prepared_kernel(template.f, Tuple(ops), template.inputs, template.outputs, plan,
+                     template.ast, Tuple(lowered); rebinding = template.vectorizations)
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an

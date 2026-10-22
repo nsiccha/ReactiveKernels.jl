@@ -669,3 +669,70 @@ end
     GC.gc(); GC.gc()
     @test data.value === nothing
 end
+
+module RewrittenPlateFixture
+using ReactiveKernels
+# The cell's `c` reads bound data only, so the inner-plate pass caches it per
+# binding and rewrites the plate to read the cached values.
+@kernel model(q, x, data) = begin
+    theta = q[1] + q[2]
+    values = plate(x, data) do xi, d
+        c = exp(d)
+        xi * c * theta
+    end
+    total = sum(values)
+    return values, total
+end
+end
+
+# A residual the inner-plate pass rewrites by caching cell values is shared
+# too: the rewritten plate is kept per decision, so a later binding has the
+# same plan up to its cached values and reuses the compiled residual and its
+# vectorized drivers (snag rebinding-a-comp-d03576ab: such a graph prepared,
+# lowered and compiled its residual and drivers again for every design).
+@testset "rebinding a residual whose plates the pass rewrites" begin
+    F = RewrittenPlateFixture
+    have = (:q, :x, :data)
+    unbound = prepare(F.model; have, want = (:values, :total))
+    datas = ([0.1, 0.2, 0.3], [0.5, -0.5, 1.0, 2.0], [1.0, 2.0, 3.0])
+    kernels = map(datas) do data
+        x = collect(1.0:length(data))
+        k = prepare(F.model; have, want = (:values, :total), bound = (; data))
+        @test any(r -> r.op isa ReactiveKernels._AuthoredPlateOp && length(r.inputs) > 2,
+                  k.plan.recipes)
+        @test k([0.25, 0.5], x) == unbound([0.25, 0.5], x, data)
+        k
+    end
+    @test all(k -> k.f === first(kernels).f && k.ast === first(kernels).ast, kernels)
+
+    positions = 4
+    q = reshape(collect(range(-1.0, 1.0; length = 2positions)), 2, positions)
+    for (reuse, schedule) in ((false, nothing), (true, NativeScheduling(chunk_size = 2)))
+        readers = map(datas) do data
+            x = collect(1.0:length(data))
+            k = prepare(F.model; have, want = (:values, :total), bound = (; data))
+            reader = vectorize(k; batched = :q, reuse, schedule)
+            @test reader(q, x) == vectorize(unbound; batched = :q)(q, x, data)
+            reader
+        end
+        @test all(r -> code_expr(r) === code_expr(first(readers)), readers)
+    end
+
+    # Neither the plate rewrites nor the templates keep a binding's cached
+    # values: the first binding's data is collectable once dropped.
+    function first_binding_data()
+        local data = [7.0, 8.0, 9.0]
+        local k = prepare(F.model; have, want = (:values, :total), bound = (; data))
+        local reader = vectorize(k; batched = :q, reuse = true,
+                                 schedule = NativeScheduling(chunk_size = 2))
+        reader(q, [1.0, 2.0, 3.0])
+        WeakRef(data)
+    end
+    data = first_binding_data()
+    later = [0.0, 1.0, 0.0]
+    @test vectorize(prepare(F.model; have, want = (:values, :total), bound = (; data = later));
+                    batched = :q)(q, [1.0, 2.0, 3.0]) ==
+          vectorize(unbound; batched = :q)(q, [1.0, 2.0, 3.0], later)
+    GC.gc(); GC.gc()
+    @test data.value === nothing
+end

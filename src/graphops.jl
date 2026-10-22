@@ -159,22 +159,26 @@ function _prepare_bound!(cache::PreparationCache, g::Graph, @nospecialize(have),
     # The per-binding mathematics runs outside the lock.
     hoisted = _bound_hoisted(entry, data)
     classes = _partial_plate_classes(entry.boundary, hoisted)
-    residual, specialized = _bound_residual(entry, cache, hoisted, classes)
-    # A residual the inner-plate pass rewrote bakes this binding's values in.
-    specialized === residual || return prepare(specialized; passes = passes)
-    # Bindings with the same plate classes and finite loop schedules share a
-    # compiled residual. Extents and index patterns stay runtime constants.
-    template_key = (classes, _bound_index_run_classes(entry.index_run_slots, hoisted))
+    _, specialized, signature = _bound_residual(entry, cache, hoisted, classes)
+    # A residual the inner-plate pass rewrote other than through its shared
+    # plate rewrites (a data-bound branch partition, a whole-plate value)
+    # bakes this binding's structure in.
+    signature === nothing && return prepare(specialized; passes = passes)
+    # Bindings with the same plate classes, finite loop schedules and plate
+    # rewrites share a compiled residual. Extents, index patterns and cached
+    # cell values stay runtime constants.
+    template_key = (classes, _bound_index_run_classes(entry.index_run_slots, hoisted),
+                    signature)
     fresh = nothing
     template = lock(cache.lock) do
         current = get(entry.templates, template_key, _UnbuiltTemplate())
         current isa _UnbuiltTemplate || return current
-        template, kernel = _bound_build(entry, residual, hoisted, passes)
+        template, kernel = _bound_build(entry, specialized, hoisted, passes)
         entry.templates[template_key] = template
         fresh = kernel
         template
     end
-    fresh === nothing ? _bound_rebind(entry, template, residual, hoisted, passes) : fresh
+    fresh === nothing ? _bound_rebind(entry, template, specialized, hoisted, passes) : fresh
 end
 
 # The bound-preparation path is untyped (partial_evaluation.jl), so one
@@ -203,7 +207,13 @@ for (f, types) in ((_bound_entry, (Plan, Any)), (_bound_hoisted, (_BoundEntry, T
                    (_bound_build, (_BoundEntry, Any, Any, Any)),
                    (_partial_residual, (Plan, _PartialBoundary, Any)),
                    (_partial_plate_classes, (_PartialBoundary, Any)),
-                   (_partial_narrow_plate_inputs, (Graph, _PartialBoundary, Tuple)))
+                   (_partial_narrow_plate_inputs, (Graph, _PartialBoundary, Tuple)),
+                   (_partial_inner_plates, (Plan, Dict{ValueId,Any}, _PlateRewrites)),
+                   (_bound_constants, (Plan,)),
+                   (_rebind_table, (Any, Vector{Any})),
+                   (_rebind_table, (Any, Vector{Recipe})),
+                   (_rebound_table, (_RebindTable, Vector{Any})),
+                   (_rebound_table, (_RebindTable, Vector{Recipe})))
     precompile(f, types) || error("no $f method for $types")
 end
 for value in (Any, Number, Tuple, AbstractArray)
