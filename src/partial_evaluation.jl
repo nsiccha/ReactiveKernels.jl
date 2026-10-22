@@ -1642,6 +1642,20 @@ end
 # A template also keeps no binding's values: only the compiled callable and
 # the value-independent tails of the operation table and readable recipes.
 
+# The vectorized lowerings every binding of one template shares. `vectorize`
+# of a template's kernel keeps, per vectorize key, the position-batched
+# programs of the first binding it lowered, without that binding's constants
+# (`_RebindReplicated` and friends, bound_vectorize.jl); a later binding's
+# `vectorize` places its own constants in the leading `constants` slots of
+# their operation tables instead of lowering and compiling them again.
+struct _BoundVectorizations
+    constants::Int
+    products::Dict{Any,Any}
+    lock::ReentrantLock
+end
+_BoundVectorizations(constants::Int) =
+    _BoundVectorizations(constants, Dict{Any,Any}(), ReentrantLock())
+
 struct _BoundTemplate
     f::Any           # the compiled residual callable, shared by every binding
     ops::Tuple       # the operation table after the constant slots
@@ -1649,10 +1663,12 @@ struct _BoundTemplate
     outputs::Tuple
     ast::Expr
     lowered::Tuple   # the readable recipes after the constant slots
+    vectorizations::_BoundVectorizations
 end
 
 # A class's template before its first binding the inner-plate pass left alone.
 struct _UnbuiltTemplate end
+
 
 struct _BoundEntry
     plan::Plan
@@ -1738,9 +1754,20 @@ function _bound_build(entry::_BoundEntry, @nospecialize(residual),
     templated = all(i -> kernel.ops[i] isa _BoundConstant &&
                          kernel.ops[i].value === hoisted[i], 1:n)
     templated || return nothing, kernel
+    vectorizations = _BoundVectorizations(n)
+    kernel = _rebinding_kernel(kernel, vectorizations)
     n == 0 && return kernel, kernel
     _BoundTemplate(kernel.f, kernel.ops[(n + 1):end], kernel.inputs, kernel.outputs,
-                   kernel.ast, kernel.lowered_recipes[(n + 1):end]), kernel
+                   kernel.ast, kernel.lowered_recipes[(n + 1):end], vectorizations), kernel
+end
+
+# `kernel`, linked to the vectorizations its template's bindings share.
+function _rebinding_kernel(@nospecialize(kernel::PreparedKernel),
+                           vectorizations::_BoundVectorizations)
+    _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs, kernel.plan,
+                     kernel.ast, kernel.lowered_recipes;
+                     exact_signature = (typeof(kernel)::DataType).parameters[6],
+                     rebinding = vectorizations)
 end
 
 # A later binding of a residual whose leading slots are not its constants:
@@ -1763,7 +1790,8 @@ function _bound_rebind(entry::_BoundEntry, template::_BoundTemplate,
     recipes = plan.recipes[1:length(entry.boundary.constants)]
     ops = (Any[recipe.op for recipe in recipes]..., template.ops...)
     _prepared_kernel(template.f, ops, template.inputs, template.outputs, plan,
-                     template.ast, (recipes..., template.lowered...))
+                     template.ast, (recipes..., template.lowered...);
+                     rebinding = template.vectorizations)
 end
 
 # Normalize the public `bound` kwarg — one `Value => data` pair or an

@@ -5798,6 +5798,10 @@ struct PreparedKernel{F,O,IN,OUT,RR,S}
     plan::Plan
     ast::Expr
     lowered_recipes::RR
+    # The vectorized lowerings shared by every binding of the bound template
+    # this kernel instantiates (`_BoundVectorizations`, partial_evaluation.jl),
+    # or `nothing`. Never read on the call path.
+    rebinding::Any
 end
 
 # Assemble new prepared types without compiling a constructor for each one;
@@ -5806,12 +5810,13 @@ end
 Base.@nospecializeinfer function _prepared_kernel(
         @nospecialize(f), @nospecialize(ops::Tuple), @nospecialize(inputs::Tuple),
         @nospecialize(outputs::Tuple), plan::Plan, ast::Expr,
-        @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing)
+        @nospecialize(lowered_recipes::Tuple); exact_signature::Type = Nothing,
+        @nospecialize(rebinding = nothing))
     ops = _execution_source(ops)
     T = PreparedKernel{typeof(f),typeof(ops),typeof(inputs),typeof(outputs),
                        typeof(lowered_recipes),exact_signature}
     _kernel_new_instance(T, (f, ops, inputs, outputs, plan, ast,
-                             lowered_recipes))::PreparedKernel
+                             lowered_recipes, rebinding))::PreparedKernel
 end
 
 # A caller that guarantees execution through a latest-world entry may use the

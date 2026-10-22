@@ -5672,8 +5672,9 @@ instance with empty output buffers and the same prepared computation. See
 [`prepare_batched`](@ref) for its lifetime and concurrency contract.
 """
 function vectorize(kernel::PreparedKernel; batched, reuse = false, schedule = nothing)
-    replicated = replica_graph(kernel; batched)
-    _position_schedule(replicated, schedule, Val(reuse))
+    # A kernel `prepare(…; bound)` rebound from a cached template reuses the
+    # position drivers lowered for an earlier binding (bound_vectorize.jl).
+    _vectorize(kernel.rebinding, kernel, batched, reuse, schedule)
 end
 
 function vectorize(spec::KernelSpec;
