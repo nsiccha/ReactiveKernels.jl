@@ -24,7 +24,6 @@ import DataAPI
 import SpecialFunctions
 using SpecialFunctions: erfc, loggamma
 using LogExpFunctions: logaddexp, log1pexp, logit
-using StaticArrays: SMatrix, SVector
 using Statistics: mean, std, var
 using PrecompileTools: @setup_workload, @compile_workload
 
