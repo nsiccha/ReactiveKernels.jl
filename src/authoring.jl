@@ -5295,6 +5295,11 @@ evaluated in `mod`'s global scope, `definition` cannot capture local variables.
 guarantee a latest-world execution barrier. It propagates that guarantee to
 source operations embedded inside native recipe bodies, avoiding a per-call
 method query. Ordinary `@kernel` construction keeps its guarded source calls.
+
+While a package image is generated and `mod` belongs to another package, the
+closures are evaluated in a child module of the package being built, whose
+names resolve as in `mod` (see `_kernel_eval_module`), so a downstream
+precompile workload can build generated programs and keep them in its image.
 """
 function _kernel_eval_definition(mod::Module, definition::Expr;
                                  latest_world_native_sources::Bool = false)
@@ -5316,8 +5321,48 @@ end
 function _kernel_eval_construction(mod::Module, construction::Expr)
     locals = Set{Symbol}()
     _kernel_construction_locals!(locals, construction)
+    mod = _kernel_eval_module(mod, construction)
     Core.eval(mod, Expr(:let, Expr(:block),
                         _kernel_toplevel_construction(construction, mod, locals)))
+end
+
+# While a package image is generated, Julia refuses evaluation into a module of
+# another package (it is closed), and closures defined outside the package being
+# built would not be kept in its image. Evaluate such a construction in a fresh
+# child module of that package instead. It binds every name the construction
+# mentions, including in the quoted recipe sources that later lowering
+# re-evaluates in a recipe's module, to the value the name has in `mod`, so the
+# recipes resolve exactly as they would in `mod`. Outside image generation, and
+# for a module of the package being built, this is `mod` itself.
+function _kernel_eval_module(mod::Module, construction::Expr)
+    target = _image_target_module()
+    (target === nothing || Base.moduleroot(mod) === target) && return mod
+    names = _kernel_mentioned_names!(Set{Symbol}(), construction)
+    # The construction may read bindings `mod` gained just before it was built.
+    aliases = Base.invokelatest(_kernel_scope_aliases, mod, names)
+    Core.eval(target, Expr(:module, false, gensym(nameof(mod)), Expr(:block, aliases...)))
+end
+
+function _kernel_scope_aliases(mod::Module, names::Set{Symbol})
+    aliases = Any[]
+    for name in names
+        isdefined(mod, name) &&
+            push!(aliases, Expr(:const, Expr(:(=), name, QuoteNode(getglobal(mod, name)))))
+    end
+    aliases
+end
+
+function _kernel_mentioned_names!(names::Set{Symbol}, @nospecialize(ex))
+    if ex isa Symbol
+        push!(names, ex)
+    elseif ex isa QuoteNode
+        _kernel_mentioned_names!(names, ex.value)
+    elseif ex isa Expr
+        for arg in ex.args
+            _kernel_mentioned_names!(names, arg)
+        end
+    end
+    names
 end
 
 # Zero-argument closures invoked in place: `_kernel_expand`'s recipe groups.

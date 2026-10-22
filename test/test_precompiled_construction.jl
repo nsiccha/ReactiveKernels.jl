@@ -1,0 +1,117 @@
+using ReactiveKernels, Test
+
+# Kernel construction evaluates recipe closures in the module a definition was
+# authored for. While a downstream package's image is generated, Julia refuses
+# evaluation into another package's module, so preparing an imported kernel
+# whose constructed-endpoint branch arms are evaluated in the endpoint's
+# package, or evaluating a generated definition authored for another package
+# (as ReactiveKernelsPPL's `build_kernel` does), failed with "Evaluation into
+# the closed module" (snag `rkppl-build-kern-4607ff90`). Construction now
+# evaluates in a child module of the package being built whose names resolve
+# as in the authoring module, and the image keeps the result.
+@testset "constructions for another package's module in a package image" begin
+    root = dirname(dirname(pathof(ReactiveKernels)))
+    mktempdir() do env
+        source = joinpath(env, "ArmSource")
+        consumer = joinpath(env, "ArmConsumer")
+        for path in (source, consumer)
+            mkpath(joinpath(path, "src"))
+        end
+        write(joinpath(source, "Project.toml"), """
+            name = "ArmSource"
+            uuid = "8e4b6f1a-3c2d-4e5f-9a8b-7c6d5e4f3a2b"
+            version = "0.1.0"
+            [deps]
+            ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+            """)
+        write(joinpath(source, "src", "ArmSource.jl"), """
+            module ArmSource
+            using ReactiveKernels
+            # Visible only through this module: a construction evaluated
+            # elsewhere must resolve it as this module does.
+            scaled_log(scale) = log(scale)
+            # Preparing the plate evaluates the endpoint's branch-arm graph in
+            # this module (`_plate_branch_with_source_graphs`).
+            @kernel endpoint_law(scale::Float64) = begin
+                logpdf(x::Float64)::Float64 =
+                    x > 0 ? (twice = 2x; 0.5twice * scaled_log(scale)) : -x
+            end
+            @kernel endpoint_law_plate(x::Vector{Float64}, scale::Float64) = begin
+                cells = plate(x) do xi
+                    endpoint_law(scale).logpdf(xi)
+                end
+                total::Float64 = sum(cells)
+            end
+            # `offset` is a top-level recipe closure, whose module the probe
+            # reads (a bare call would use `scaled_log` itself as the recipe).
+            const DEFINITION = :(generated(x::Vector{Float64}, scale::Float64) = begin
+                offset = 2 * scaled_log(sqrt(scale))
+                cells = plate(x) do xi
+                    endpoint_law(scale).logpdf(xi) + offset
+                end
+                total::Float64 = sum(cells)
+            end)
+            end
+            """)
+        write(joinpath(consumer, "Project.toml"), """
+            name = "ArmConsumer"
+            uuid = "9f5c7a2b-4d3e-4f6a-8b9c-8d7e6f5a4b3c"
+            version = "0.1.0"
+            [deps]
+            ArmSource = "8e4b6f1a-3c2d-4e5f-9a8b-7c6d5e4f3a2b"
+            ReactiveKernels = "78e9f072-d36b-4c73-b7a3-751b0eb26cf9"
+            """)
+        write(joinpath(consumer, "src", "ArmConsumer.jl"), """
+            module ArmConsumer
+            using ReactiveKernels, ArmSource
+            const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
+            const PREPARED = prepare(ArmSource.endpoint_law_plate)
+            const VALUE = PREPARED([-2.0, 1.0, -3.0, 0.5, 4.0], 2.0)
+            const GENERATED = ReactiveKernels._kernel_eval_definition(ArmSource,
+                deepcopy(ArmSource.DEFINITION))
+            end
+            """)
+        setup = """
+            using Pkg
+            include($(repr(joinpath(root, "deps", "source_dependencies.jl"))))
+            # Julia 1.10 does not read the root package's [sources] table.
+            Pkg.develop([PackageSpec[PackageSpec(path = path) for path in
+                $(repr((root, source, consumer)))]; rk_source_dependencies()])
+            Pkg.precompile()
+            """
+        julia = Base.julia_cmd()
+        setup_ok = success(pipeline(`$julia --startup-file=no --project=$env -e $setup`;
+                                    stdout = stdout, stderr = stderr))
+        @test setup_ok
+        setup_ok || return
+        probe = """
+            using Test, ReactiveKernels, ArmSource, ArmConsumer
+            const RK = ReactiveKernels
+            closure_roots(spec) = Set(Base.moduleroot(RK._kernel_endpoint_source_module(r.op))
+                                      for r in spec.graph.recipes)
+            @testset "loaded image" begin
+            @test ArmConsumer.WAS_PRECOMPILED
+            x = [-2.0, 1.0, -3.0, 0.5, 4.0]
+            saved = copy(x)
+            law(scale) = 5.0 + 5.5log(scale)
+            @test ArmConsumer.VALUE ≈ law(2.0)
+            for scale in (0.5, 2.0, 3.0)
+                @test ArmConsumer.PREPARED(x, scale) ≈ law(scale)
+                @test prepare(ArmSource.endpoint_law_plate)(x, scale) ≈ law(scale)
+                @test prepare(ArmConsumer.GENERATED)(x, scale) ≈ law(scale) + 5log(scale)
+            end
+            @test x == saved
+            # The image owns the generated closures; a construction at run
+            # time is evaluated in the authoring module, as before.
+            @test ArmConsumer in closure_roots(ArmConsumer.GENERATED)
+            runtime = RK._kernel_eval_definition(ArmSource, deepcopy(ArmSource.DEFINITION))
+            @test ArmSource in closure_roots(runtime)
+            @test !(ArmConsumer in closure_roots(runtime))
+            @test prepare(runtime)(x, 2.0) ≈ law(2.0) + 5log(2.0)
+            end
+            println("PRECOMPILED_CONSTRUCTION_PASS")
+            """
+        @test success(pipeline(`$julia --startup-file=no --project=$env -e $probe`;
+                               stdout = stdout, stderr = stderr))
+    end
+end

@@ -447,17 +447,27 @@ and lock the one Reactant 0.2.289 lifted:
   arithmetic through the native materializer still failed inside that
   materializer. Values are unaffected; the testset pins the empty-group
   gradients as broken on Julia 1.10.
-- Native Enzyme 0.13.209 reverse mode also fails static activity analysis
-  (`EnzymeRuntimeActivityError`) when a recurrence's carry starts as a
-  constant array and a reachable lazy branch can keep it while other paths
-  replace it with active memory: `repro_enzyme_branch_kept_seed_carry.jl`
-  reproduces the emitted outer/inner scan shape with Enzyme only. This is the
-  shape of a scan step `isempty(us) ? previous : inner[end]` after an inner
-  scan over `us`. The derivative is defined on every path; only the carried
-  array's activity depends on the data. The branch and its seed stay as
-  authored. The same value written as the inner scan's `include_init = true`
-  result's last element differentiates, as does the branch whose keep arm is
-  unreachable; runtime activity is not used.
+- Native Enzyme reverse mode fails static activity analysis
+  (`EnzymeRuntimeActivityError`) when a lazy branch returns a fresh constant
+  array in one arm and active memory in the other, and the data select the
+  constant arm. A per-group read `!isempty(v) ? v[idx] : zeros(length(idx))`
+  of a plate output `v` fails for a group that produced no values:
+  `repro_enzyme_activity_mixed_branch.jl` reproduces it with Enzyme only. A
+  recurrence whose carry starts as a constant array and a reachable lazy
+  branch can keep it is the same boundary: a scan step
+  `isempty(us) ? previous : inner[end]` after an inner scan over `us`, whose
+  emitted outer/inner scan shape `repro_enzyme_branch_kept_seed_carry.jl`
+  reproduces (issue #47). The derivative is defined on every path; only the
+  activity of the merged array depends on the data. The branch, its arms and
+  the seed stay as authored, with no shadow supplied and no runtime activity.
+  Registered Enzyme 0.13.216 fails the plate read on Julia 1.10.12, 1.12.7
+  and 1.13.1, and the scan-carry reproducer on Julia 1.10.12 (that
+  reproducer passes on 1.12.7). The repair
+  belongs in Enzyme's mixed-activity handler, which on the Enzyme dogfood
+  line gives a fresh allocation that no active data reaches a zero shadow
+  (from `d2892e7`; `23b72c9` passes both reproducers on Julia 1.10.12 and
+  1.12.7). `test_plate_consumer_native_ad.jl` pins the plate read's
+  constant-arm gradients as broken.
 - Native Enzyme 0.13.209 and 0.13.210 reverse mode raise `OutOfMemoryError`
   for a loop over `Iterators.drop(indices, 1)` behind an emptiness test inside
   another loop's body, both in one function, when its sequence is empty and the
