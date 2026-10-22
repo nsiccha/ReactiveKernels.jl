@@ -1,5 +1,43 @@
 using ReactiveKernels, Test
 
+# The child module binds nothing it is not given, and lowering reads some names
+# the source spells only as syntax: `x'` calls `'`, `s -= y` calls `-`. A
+# batched reader of a generated program built in a downstream image called
+# such a recipe's closure and failed with "UndefVarError: `'` not defined"
+# (snag `image-built-kern-ddaab84e`).
+module ScopeAuthor
+# Shadows Base's adjoint: the child must resolve `'` as this module does.
+const var"'" = x -> (:shadowed, x)
+end
+
+@testset "a construction's child module resolves every name lowering reads" begin
+    RK = ReactiveKernels
+    samples = Any[
+        :(let x = [1.0, 2.0]; x' * x end),
+        :(let x = [1.0 2.0]; (y -> y')(x) end),
+        :(let s = 1.0; s -= 0.25; s end),
+        :(let s = [1.0, 2.0]; s .*= 3.0; s end),
+        :(let s = 3; s ⊻= 5; s end),
+        :(let s = 3 // 4; s //= 2; s end),
+        :(let a = [1.0, 2.0]; a .+ 1.0 end),
+        :(let a = [1.0, 2.0]; .-a end),
+        :(let a = [1.0, 2.0]; a .^ 2 end),
+        :(let a = [1.0, 4.0]; a .|> sqrt end),
+        :(Int <: Real),
+        :(Real >: Int),
+        :([Int, String] .<: Real),
+        :(let s = [1, 2]; s[2] += 3; s end),
+        :(let f = x -> x'; f([1.0 2.0]) end),
+    ]
+    for ex in samples
+        child = RK._kernel_scope_module(@__MODULE__, Main, ex)
+        @test Core.eval(child, ex) == Core.eval(Main, ex)
+    end
+    ex = :(let x = 2.0; x' end)
+    child = RK._kernel_scope_module(@__MODULE__, ScopeAuthor, ex)
+    @test Core.eval(child, ex) == Core.eval(ScopeAuthor, ex) == (:shadowed, 2.0)
+end
+
 # Kernel construction evaluates recipe closures in the module a definition was
 # authored for. While a downstream package's image is generated, Julia refuses
 # evaluation into another package's module, so preparing an imported kernel
@@ -51,6 +89,14 @@ using ReactiveKernels, Test
                 end
                 total::Float64 = sum(cells)
             end)
+            # Recipes whose names lowering reads only from syntax (`'`, the
+            # `-` of `-=`). Both summands' factors that read `x` but not
+            # `scale` are split nodes, and a batched reader calls their
+            # closures.
+            const SYNTAX_DEFINITION = :(generated(x::Vector{Float64}, scale::Float64) = begin
+                total::Float64 = scale * sum(x' * x) +
+                                 abs(let s = sum(x); s -= 1.0; s end) * scale
+            end)
             # A summary written once against a port `prediction`, and a model
             # whose prediction value has another name (snag
             # `kernel-input-bou-ce13eae3`).
@@ -81,6 +127,10 @@ using ReactiveKernels, Test
             const VALUE = PREPARED([-2.0, 1.0, -3.0, 0.5, 4.0], 2.0)
             const GENERATED = ReactiveKernels._kernel_eval_definition(ArmSource,
                 deepcopy(ArmSource.DEFINITION))
+            const SYNTAX = ReactiveKernels._kernel_eval_definition(ArmSource,
+                deepcopy(ArmSource.SYNTAX_DEFINITION))
+            const SYNTAX_READER = vectorize(SYNTAX; batched = :scale, reuse = true)
+            const SYNTAX_VALUE = copy(SYNTAX_READER([-2.0, 1.0, -3.0, 0.5, 4.0], [2.0, 3.0]))
             # The prediction value's name is known only at run time. Renaming
             # the closed dependency's port evaluates nothing.
             prediction_name() = Symbol(:m, :u)
@@ -127,6 +177,13 @@ using ReactiveKernels, Test
             @test ArmSource in closure_roots(runtime)
             @test !(ArmConsumer in closure_roots(runtime))
             @test prepare(runtime)(x, 2.0) ≈ law(2.0) + 5log(2.0)
+            # Names lowering reads from syntax, through a batched reader.
+            syntax(scale) = scale * (sum(abs2, x) + abs(sum(x) - 1.0))
+            @test ArmConsumer in closure_roots(ArmConsumer.SYNTAX)
+            @test ArmConsumer.SYNTAX_VALUE ≈ syntax.([2.0, 3.0])
+            @test ArmConsumer.SYNTAX_READER(x, [0.5, 4.0]) ≈ syntax.([0.5, 4.0])
+            @test vectorize(ArmConsumer.SYNTAX; batched = :scale)(x, [1.5]) ≈ [syntax(1.5)]
+            @test x == saved
             # A kernel composed through a renamed port of a closed dependency.
             t = [0.0, 0.5, 1.0]; rows = [[1, 2], [3]]
             total(a, b) = sum(a .+ b .* t)

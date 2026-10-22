@@ -5332,15 +5332,23 @@ end
 # child module of that package instead. It binds every name the construction
 # mentions, including in the quoted recipe sources that later lowering
 # re-evaluates in a recipe's module, to the value the name has in `mod`, so the
-# recipes resolve exactly as they would in `mod`. Outside image generation, and
-# for a module of the package being built, this is `mod` itself.
+# recipes resolve exactly as they would in `mod`. The module imports nothing
+# else, so a name the construction reads but does not bind is an
+# `UndefVarError` when it is read. Outside image generation, and for a module
+# of the package being built, this is `mod` itself.
 function _kernel_eval_module(mod::Module, construction::Expr)
     target = _image_target_module()
     (target === nothing || Base.moduleroot(mod) === target) && return mod
+    _kernel_scope_module(target, mod, construction)
+end
+
+# A fresh child module of `parent` in which `construction` resolves every name
+# it reads as in `mod`.
+function _kernel_scope_module(parent::Module, mod::Module, construction::Expr)
     names = _kernel_mentioned_names!(Set{Symbol}(), construction)
     # The construction may read bindings `mod` gained just before it was built.
     aliases = Base.invokelatest(_kernel_scope_aliases, mod, names)
-    Core.eval(target, Expr(:module, false, gensym(nameof(mod)), Expr(:block, aliases...)))
+    Core.eval(parent, Expr(:module, false, gensym(nameof(mod)), Expr(:block, aliases...)))
 end
 
 function _kernel_scope_aliases(mod::Module, names::Set{Symbol})
@@ -5352,16 +5360,33 @@ function _kernel_scope_aliases(mod::Module, names::Set{Symbol})
     aliases
 end
 
+# Every name lowering can read from `ex`. Besides its symbols, lowering reads
+# names the source spells only as syntax: an expression head (`x'` calls `'`,
+# `T <: S` calls `<:`) and the operator that a dotted or updating operator
+# applies (`x .+ y` broadcasts `+`, `s -= y` calls `-`). A name that lowering
+# does not read only costs an unused binding.
 function _kernel_mentioned_names!(names::Set{Symbol}, @nospecialize(ex))
     if ex isa Symbol
-        push!(names, ex)
+        _kernel_mention!(names, ex)
     elseif ex isa QuoteNode
         _kernel_mentioned_names!(names, ex.value)
     elseif ex isa Expr
+        _kernel_mention!(names, ex.head)
         for arg in ex.args
             _kernel_mentioned_names!(names, arg)
         end
     end
+    names
+end
+
+function _kernel_mention!(names::Set{Symbol}, name::Symbol)
+    push!(names, name)
+    Base.isoperator(name) || return names
+    text = String(name)
+    startswith(text, '.') && (text = text[2:end])
+    Base.operator_precedence(name) == Base.prec_assignment && endswith(text, '=') &&
+        (text = chop(text))
+    isempty(text) || push!(names, Symbol(text))
     names
 end
 
