@@ -476,4 +476,84 @@ end
     @test data == saved
     @test live == [0.1, 0.2, 0.3]
 end
+
+# A lazy branch whose arms differ in activity: a fresh constant array when a
+# group produced no values, a read of the active plate output otherwise. The
+# lowering keeps the branch as authored; registered Enzyme's static activity
+# analysis refuses the constant arm when it is taken
+# (`benchmark/repro_enzyme_activity_mixed_branch.jl`, docs/src/constraints.md).
+@kernel picked_squares(x, idx, n) = begin
+    levels = plate(1:n) do t
+        x[1] * t + x[2]
+    end
+    present = !isempty(levels)
+    picked = present ? levels[idx] : zeros(length(idx))
+    total = sum(abs2, picked)
+    return total
+end
+@kernel picked_groups(x, idxs, ns) = begin
+    per = plate(idxs, ns) do idx, n
+        levels = plate(1:n) do t
+            x[1] * t + x[2]
+        end
+        present = !isempty(levels)
+        picked = present ? levels[idx] : zeros(length(idx))
+        cell::Float64 = sum(abs2, picked)
+        cell
+    end
+    total = sum(per)
+    return total
+end
+picked_value(x, idx, n) = n == 0 ? 0.0 : sum(abs2(x[1] * t + x[2]) for t in idx)
+picked_gradient(x, idx, n) = n == 0 ? [0.0, 0.0] :
+    [sum(2 * (x[1] * t + x[2]) * t for t in idx), sum(2 * (x[1] * t + x[2]) for t in idx)]
+
+@testset "a lazy branch whose arms differ in activity under native Reverse" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    x = [0.3, -0.2]
+    configurations = Any[]
+    for (idx, n) in (([1, 3, 2], 3), ([1, 2], 0))
+        push!(configurations, (picked_squares, (idx, n), (; idx, n),
+            picked_value(x, idx, n), picked_gradient(x, idx, n), n == 0))
+    end
+    for (idxs, ns) in (([[1, 3, 2], [2]], [3, 2]),
+                       ([[1, 3, 2], [1, 2], [2]], [3, 0, 2]))
+        push!(configurations, (picked_groups, (idxs, ns), (; idxs, ns),
+            sum(picked_value(x, i, n) for (i, n) in zip(idxs, ns)),
+            sum(picked_gradient(x, i, n) for (i, n) in zip(idxs, ns)),
+            any(iszero, ns)))
+    end
+    for (spec, data, bound, value, gradient, constant_arm) in configurations,
+            bind in (false, true)
+        saved = deepcopy(data)
+        k = bind ? prepare(spec; bound) : prepare(spec)
+        args = bind ? () : data
+        @test k(x, args...) ≈ value
+        ad = prepare_ad(k, backend, x, args...; active=:x)
+        if constant_arm
+            # Registered Enzyme refuses the taken constant arm (snag
+            # activity-mixed-l-d8bdaffe; issue #47 is the scan-carry form).
+            # Enzyme dogfood from d2892e7 differentiates it: there these pins
+            # report Unexpected Pass and the gradient is checked.
+            result = try
+                ad_value_and_gradient(ad, x, args...)
+            catch err
+                err
+            end
+            @test_broken !(result isa Exception)
+            if result isa Exception
+                @test nameof(typeof(result)) === :EnzymeRuntimeActivityError
+            else
+                @test result[1] ≈ value
+                @test result[2] ≈ gradient
+            end
+        else
+            v, g = ad_value_and_gradient(ad, x, args...)
+            @test v ≈ value
+            @test g ≈ gradient
+        end
+        @test data == saved
+        @test x == [0.3, -0.2]
+    end
+end
 end
