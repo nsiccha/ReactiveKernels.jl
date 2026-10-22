@@ -313,6 +313,12 @@ end
 function _validate_array_parameters_data(plan::StructuralPlan)
     names = _all_name_set(plan)
     known(n) = n in names || haskey(plan.columns, n)
+    # Whether every name the priors read is known: once per structure and
+    # column names. When one is not, the loop below names it.
+    reads_known = _structural(plan, (:array_prior_reads_known,)) do
+        all(p -> all(known, (n for a in values(p.args) for n in _expr_value_symbols(a))),
+            plan.array_parameters)
+    end
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         p.family === :external && continue
@@ -340,9 +346,11 @@ function _validate_array_parameters_data(plan::StructuralPlan)
             continue
         end
         _is_structured_array(p) && continue
-        for (key, arg) in pairs(p.args), name in _expr_value_symbols(arg)
-            known(name) || _fail(p.label,
-                "array $(p.name) prior $key references unknown name $name")
+        if !reads_known
+            for (key, arg) in pairs(p.args), name in _expr_value_symbols(arg)
+                known(name) || _fail(p.label,
+                    "array $(p.name) prior $key references unknown name $name")
+            end
         end
         for (k, a) in pairs(p.args)
             n = _array_arg_size(plan, a)
@@ -1071,14 +1079,19 @@ end
 function _validate_positional_gather(plan::StructuralPlan, name::Symbol,
         label, g::Symbol, K::Union{Int,Nothing})
     col = _gather_index_column(plan, name, label, g)
-    eltype(col) <: Integer && eltype(col) !== Bool || _fail(label,
+    _holds_integers(col) || _fail(label,
         "`$name[$g]` indexes $name by position, but $g does not hold " *
         "integers — declare an axis `levels($g)` to look values up by level")
-    all(i -> i >= 1 && (K === nothing || i <= K), col) || _fail(label,
+    _within_positions(col, K) || _fail(label,
         "`$name[$g]`: $g holds indices outside " *
         (K === nothing ? "the positive integers" : "1:$K"))
     return nothing
 end
+
+# Function barriers: one dispatch on the column's type, not one per test.
+_holds_integers(col::AbstractArray{T}) where {T} = T <: Integer && T !== Bool
+_within_positions(col::AbstractArray, K::Union{Int,Nothing}) =
+    all(i -> i >= 1 && (K === nothing || i <= K), col)
 
 # Array-valued expressions (`sd .* z`, `L[:, 1]`, `phi[1] * 2`): every
 # leaf is a literal, a scalar name or an array parameter (never a

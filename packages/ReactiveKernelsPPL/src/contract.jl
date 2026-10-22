@@ -1768,10 +1768,14 @@ reads differ in rows, or when no observation statement reads a column."""
 function _structured_observation_axes(plan::StructuralPlan)
     isempty(plan.responses) && return nothing
     modelvals, managed = _axis_exempt_columns(plan)
-    mi_managed = _mi_managed_columns(plan)
-    perobs = Set{Symbol}(k for (k, v) in plan.columns
-        if k ∉ modelvals && k ∉ mi_managed &&
-            v isa Union{AbstractVector,AbstractMatrix})
+    # The vectors and matrices with an observation axis: once per structure
+    # and column names and value types.
+    perobs = _structural(plan, (:observation_columns,); columns = :types) do
+        mi_managed = _mi_managed_columns(plan)
+        Set{Symbol}(k for (k, v) in plan.columns
+            if k ∉ modelvals && k ∉ mi_managed &&
+                v isa Union{AbstractVector,AbstractMatrix})
+    end
     resps = [r.response for r in plan.responses]
     all(r -> haskey(plan.columns, r.response), plan.responses) || return nothing
     rows = Dict{Symbol,Int}(c => _column_nrows(plan.columns[c]) for c in perobs)
@@ -2206,9 +2210,12 @@ function _size_absent_responses!(plan::StructuralPlan, columns::AbstractDict)
     absent = Set{Symbol}(k for (k, v) in columns if v isa _AbsentArray && v.name === k)
     isempty(absent) && return columns
     axis_plan = _with(plan; columns = Dict{Symbol,ColumnData}(columns))
-    modelvals, managed = _axis_exempt_columns(axis_plan)
-    perobs = Set{Symbol}(k for (k, v) in columns
-        if k ∉ modelvals && k ∉ managed && v isa AbstractArray && !(v isa _Absent))
+    perobs = _structural(axis_plan, (:absent_response_operands,); columns = :types,
+            fresh = false) do
+        modelvals, managed = _axis_exempt_columns(axis_plan)
+        Set{Symbol}(k for (k, v) in axis_plan.columns
+            if k ∉ modelvals && k ∉ managed && v isa AbstractArray && !(v isa _Absent))
+    end
     designs = _observation_design_columns(axis_plan)
     for r in plan.responses
         names = filter(in(absent), [r.response, r.count_columns..., r.extra_responses...])
