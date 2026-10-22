@@ -1453,8 +1453,7 @@ function validate_data(plan::StructuralPlan)
     _validate_columns(plan)
     _validate_column_names(plan)
     _validate_array_parameters_data(plan)
-    _validate_assignments_data(plan)
-    _validate_vector_data(plan)
+    _validate_definitions_data(plan)
     _validate_predictor_columns(plan)
     _validate_levelmaps_data(plan)
     _validate_response_data(plan)
@@ -1624,8 +1623,17 @@ end
 own fields hold, then — transitively — the names every predictor, derived
 column and definition among them holds. A gather's source and a reduction's
 argument are whole reads, never aligned ones. `whole_values=true` also
-follows composed expressions for latent-domain validation."""
-function _response_reads(plan::StructuralPlan, r,
+follows composed expressions for latent-domain validation. Once per
+structure: it reads the plan's fields and the names it is given, never a
+column."""
+_response_reads(plan::StructuralPlan, r, perobs::Set{Symbol};
+        whole_values::Bool = false, stop::Set{Symbol} = Set{Symbol}()) =
+    _structural(plan, (:response_reads, r, _sorted_names(perobs), whole_values,
+            _sorted_names(stop)); columns = :none) do
+        _uncached_response_reads(plan, r, perobs; whole_values, stop)
+    end
+
+function _uncached_response_reads(plan::StructuralPlan, r,
         perobs::Set{Symbol}; whole_values::Bool=false,
         stop::Set{Symbol}=Set{Symbol}())
     nodes = _observation_nodes(plan)
@@ -2179,10 +2187,14 @@ end
 # says otherwise (`_absent_typed_as`).
 function _absent_cell_shapes(plan::StructuralPlan, columns, response::Symbol)
     haskey(plan.cell_broadcasts, response) || return nothing
-    reads = Set{Symbol}(plan.cell_broadcasts[response])
-    for d in (plan.assignments..., plan.derived...)
-        rd = _definition_reads(d.expr)
-        response in rd && union!(reads, rd)
+    reads = _structural(plan, (:absent_cell_reads, response); columns = :none,
+            fresh = false) do
+        reads = Set{Symbol}(plan.cell_broadcasts[response])
+        for d in (plan.assignments..., plan.derived...)
+            rd = _definition_reads(d.expr)
+            response in rd && union!(reads, rd)
+        end
+        reads
     end
     operands = sort!([c for c in reads if c !== response &&
         _supplied(get(columns, c, nothing)) && _holds_arrays(get(columns, c, nothing))])
@@ -2419,20 +2431,9 @@ end
 # Its columns remain the contracted dimension, rather than observations.
 function _observation_design_columns(plan::StructuralPlan)
     out = Set{Symbol}()
-    function visit(ex)
-        ex isa Expr || return
-        if ex.head === :call && length(ex.args) == 3 && ex.args[1] === :* &&
-                ex.args[2] isa Symbol &&
-                get(plan.columns, ex.args[2], nothing) isa AbstractMatrix
-            _observation_array_operand(plan, ex.args[3]) && push!(out, ex.args[2])
-        end
-        foreach(visit, ex.args)
-    end
-    for d in (plan.assignments..., plan.derived...)
-        visit(d.expr)
-    end
-    for p in plan.predictors, t in p.terms
-        t.kind === ComposedTerm && visit(t.options.tree)
+    for (B, w) in _named_matrix_products(plan)
+        get(plan.columns, B, nothing) isa AbstractMatrix &&
+            _observation_array_operand(plan, w) && push!(out, B)
     end
     # A GLM object multiplies its design matrix by its coefficients.
     for r in plan.responses
@@ -2442,6 +2443,26 @@ function _observation_design_columns(plan::StructuralPlan)
     end
     return out
 end
+
+# The products `B * w` of a name `B` in the plan's definitions and composed
+# terms, as `(B, w)`. Once per structure.
+_named_matrix_products(plan::StructuralPlan) =
+    _structural(plan, (:named_matrix_products,); columns = :none, fresh = false) do
+        out = Tuple{Symbol,Any}[]
+        function visit(ex)
+            ex isa Expr || return
+            ex.head === :call && length(ex.args) == 3 && ex.args[1] === :* &&
+                ex.args[2] isa Symbol && push!(out, (ex.args[2], ex.args[3]))
+            foreach(visit, ex.args)
+        end
+        for d in (plan.assignments..., plan.derived...)
+            visit(d.expr)
+        end
+        for p in plan.predictors, t in p.terms
+            t.kind === ComposedTerm && visit(t.options.tree)
+        end
+        out
+    end
 
 # An opaque helper can obscure sizes without making a broadcast with a
 # known array scalar-valued. Follow definitions and elementwise operands;
@@ -2888,6 +2909,14 @@ function _validate_assignments_structure(plan::StructuralPlan)
     return nothing
 end
 
+# Each definition's reads and placements, walked once per structure; the
+# walk's value tests run on every binding (`_data_checks`).
+_validate_definitions_data(plan::StructuralPlan) =
+    _data_checks(plan, (:definitions_data,)) do
+        _validate_assignments_data(plan)
+        _validate_vector_data(plan)
+    end
+
 function _validate_assignments_data(plan::StructuralPlan)
     for a in plan.assignments
         refs = Symbol[]
@@ -3220,17 +3249,18 @@ function _check_gather_index(ex::Expr, plan::StructuralPlan, label,
             "gather index is an integer data column (`v[c]`); a " *
             "parameter or latent is a value, never an index")
     end
-    # Bound or computed at binding, an index holding one array per entry
-    # (`rows[i]` read in a whole-column `@plate` cell) is no Julia index.
-    bound && idx isa Symbol && _holds_arrays(get(plan.columns, idx, nothing)) &&
-        _fail(label, "gather index $idx holds one array per entry, which a " *
-            "gather `$(repr(ex))` cannot index by. " * _array_entry_lowering_hint(idx))
-    if bound && idx isa Symbol && haskey(plan.columns, idx) &&
-            !(idx in names)
-        col = _vector_column(plan.columns, idx, label, "gather index")
-        (eltype(col) <: Integer && eltype(col) !== Bool) || _fail(label,
-            "gather index $idx must hold integer positions, got eltype " *
-            "$(eltype(col))")
+    bound && idx isa Symbol && _data_check(plan) do plan
+        # Bound or computed at binding, an index holding one array per entry
+        # (`rows[i]` read in a whole-column `@plate` cell) is no Julia index.
+        _holds_arrays(get(plan.columns, idx, nothing)) &&
+            _fail(label, "gather index $idx holds one array per entry, which a " *
+                "gather `$(repr(ex))` cannot index by. " * _array_entry_lowering_hint(idx))
+        if haskey(plan.columns, idx) && !(idx in names)
+            col = _vector_column(plan.columns, idx, label, "gather index")
+            (eltype(col) <: Integer && eltype(col) !== Bool) || _fail(label,
+                "gather index $idx must hold integer positions, got eltype " *
+                "$(eltype(col))")
+        end
     end
     return nothing
 end
@@ -3322,7 +3352,10 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
             axes = _gather_axes(plan, name)
             axes !== nothing && 1 <= axis <= length(axes) || _fail(label,
                 "array plate codes address an unknown axis of $name")
-            bound && _validate_gather_axis(plan, name, label, axes[axis], g)
+            d = axes[axis]
+            bound && _data_check(plan) do plan
+                _validate_gather_axis(plan, name, label, d, g)
+            end
         elseif inp isa Expr && inp.head === :call && length(inp.args) == 4 &&
                 inp.args[1] === :_ppl_level_gather
             nm, g, ld = inp.args[2:end]
@@ -3333,8 +3366,11 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
             push!(refs, nm)
             # levels(g) includes unused categorical pool members too;
             # validate every cell label rather than only observed g rows.
-            bound && _validate_level_gather(plan, nm, label, axs[ld], g,
-                _array_axis_levels(plan, nm, label, g))
+            d = axs[ld]
+            bound && _data_check(plan) do plan
+                _validate_level_gather(plan, nm, label, d, g,
+                    _array_axis_levels(plan, nm, label, g))
+            end
         elseif inp isa Expr && inp.head === :call &&
                 ((length(inp.args) == 3 && inp.args[1] === :_ppl_codes) ||
                  (length(inp.args) == 2 && inp.args[1] in
@@ -3540,10 +3576,12 @@ function _collect_vector_condition!(refs, ex, plan, label, bound::Bool)
         "knowledge — inline the comparison",
     )
     if bound && haskey(plan.columns, ex)
-        condcol =
-            _vector_column(plan.columns, ex, label, "ifelse condition column")
-        eltype(condcol) === Bool ||
-            _fail(label, "`ifelse` condition column $ex must be Bool")
+        _data_check(plan) do plan
+            condcol =
+                _vector_column(plan.columns, ex, label, "ifelse condition column")
+            eltype(condcol) === Bool ||
+                _fail(label, "`ifelse` condition column $ex must be Bool")
+        end
         return nothing
     end
     push!(refs, ex)
@@ -3560,13 +3598,15 @@ function _check_numeric_position!(args, plan, label, bound::Bool)
     bound || return nothing
     for arg in args
         arg isa Symbol && haskey(plan.columns, arg) || continue
-        col = plan.columns[arg]
-        _holds_arrays(col) && _fail(label, "column $arg holds one array per " *
-            "entry, which whole-column elementwise math cannot read. " *
-            _array_entry_lowering_hint(arg))
-        _is_real_column(col) ||
-            _fail(label, "column $arg is not numeric (elementwise math " *
-                         "needs numeric columns)")
+        _data_check(plan) do plan
+            col = plan.columns[arg]
+            _holds_arrays(col) && _fail(label, "column $arg holds one array per " *
+                "entry, which whole-column elementwise math cannot read. " *
+                _array_entry_lowering_hint(arg))
+            _is_real_column(col) ||
+                _fail(label, "column $arg is not numeric (elementwise math " *
+                             "needs numeric columns)")
+        end
     end
     return nothing
 end
@@ -6008,6 +6048,16 @@ _cell_broadcast_operand(plan::StructuralPlan, c::Symbol) =
             plan.cell_broadcasts)
 _array_entries(col) = isempty(col) || all(isempty, col) ?
     eltype(eltype(col))[] : identity.(collect(Iterators.flatten(col)))
+# Arrays of one concrete element type: the same entries, filled in one pass.
+function _array_entries(col::Vector{<:AbstractArray{T}}) where {T}
+    isconcretetype(T) || return invoke(_array_entries, Tuple{Any}, col)
+    out = Vector{T}(undef, sum(length, col; init = 0))
+    i = 0
+    for a in col, x in a
+        out[i += 1] = x
+    end
+    return out
+end
 _array_entries(col::_AbsentCells{A}) where {A} =
     _AbsentArray{eltype(A),1}(col.name, (sum(prod, col.cells; init = 0),))
 
@@ -7013,10 +7063,12 @@ data-only definitions.
 Derived responses keep their own materialization. `bind_only` excludes
 definitions used only during preparation, while preserving their names
 for caller-supplied column collision checks. Once per structure: it reads
-the column names, roles and conditioned names, never a column value."""
+the raw names it is given, roles and conditioned names, never the column
+table."""
 _module_data_names(plan::StructuralPlan, raw::AbstractSet{Symbol};
         bind_only = false, unbound::Bool=false) =
-    _structural(plan, (:module_data_names, _sorted_names(raw), bind_only, unbound)) do
+    _structural(plan, (:module_data_names, _sorted_names(raw), bind_only, unbound);
+            columns = :none) do
         _uncached_module_data_names(plan, raw; bind_only, unbound)
     end
 
@@ -7703,7 +7755,7 @@ function _materialize_module_data!(plan::StructuralPlan,
             kernels = spec -> _prepared_kernel(plan, spec))
         return memo[nm]
     end
-    absent = _absent_definition_sources(exprs, columns)
+    absent = _absent_definition_sources(plan, columns)
     for nm in sort!(collect(names))
         source = get(absent, nm, nothing)
         v = try
@@ -7733,30 +7785,39 @@ function _materialize_module_data!(plan::StructuralPlan,
 end
 
 # Data definitions reading an absent value, directly or through other
-# definitions, mapped to the absent observation they read.
-function _absent_definition_sources(exprs::AbstractDict, columns::AbstractDict)
+# definitions, mapped to the absent observation they read: the first absent
+# name in the definition's read order. The order is the structure's; only
+# which names are absent is data.
+function _absent_definition_sources(plan::StructuralPlan, columns::AbstractDict)
     sources = Dict{Symbol,Symbol}()
-    memo = Dict{Symbol,Union{Symbol,Nothing}}()
-    function source(nm, active)
-        haskey(memo, nm) && return memo[nm]
-        v = get(columns, nm, nothing)
-        v isa _Absent && return _absent_source(v)
-        (haskey(exprs, nm) && nm ∉ active) || return nothing
-        push!(active, nm)
-        found = nothing
-        for s in _definition_reads(exprs[nm])
-            found = source(s, active)
-            found === nothing || break
-        end
-        delete!(active, nm)
-        return memo[nm] = found
-    end
-    for nm in keys(exprs)
-        s = source(nm, Set{Symbol}())
-        s === nothing || (sources[nm] = s)
+    any(v -> v isa _Absent, values(columns)) || return sources
+    for (nm, order) in _definition_read_orders(plan)
+        i = findfirst(s -> get(columns, s, nothing) isa _Absent, order)
+        i === nothing || (sources[nm] = _absent_source(columns[order[i]]))
     end
     return sources
 end
+
+# Each definition's name, then the names it reads, each followed by what
+# that name reads in turn (depth first, every name once). Once per structure.
+_definition_read_orders(plan::StructuralPlan) =
+    _structural(plan, (:definition_read_orders,); columns = :none, fresh = false) do
+        exprs = Dict{Symbol,Any}(a.name => a.expr for a in plan.assignments)
+        for d in plan.derived
+            exprs[d.name] = d.expr
+        end
+        function visit!(order, seen, nm)
+            nm in seen && return order
+            push!(seen, nm)
+            push!(order, nm)
+            haskey(exprs, nm) || return order
+            for s in _definition_reads(exprs[nm])
+                visit!(order, seen, s)
+            end
+            return order
+        end
+        Dict(nm => visit!(Symbol[], Set{Symbol}(), nm) for nm in keys(exprs))
+    end
 
 # An absent definition's stand-in. Its type and shape are those the
 # definition computes from values of the absent observation's type and
@@ -8583,11 +8644,14 @@ end
 # constructor, replacing only the named fields. A hand-written field list
 # silently resets every field added after it was written; unknown override
 # names fail loudly.
-function _with(x::T; overrides...) where {T}
+_with(x; overrides...) = _with_fields(x, values(overrides))
+
+@generated function _with_fields(x::T, overrides::NamedTuple{K}) where {T,K}
     names = fieldnames(T)
-    for k in keys(overrides)
-        k in names || throw(ArgumentError("$T has no field $k"))
+    for k in K
+        k in names || return :(throw(ArgumentError($("$T has no field $k"))))
     end
-    return T((haskey(overrides, f) ? overrides[f] : getfield(x, f)
-        for f in names)...)
+    args = (k in K ? :(getfield(overrides, $(QuoteNode(k)))) :
+        :(getfield(x, $(QuoteNode(k)))) for k in names)
+    return :($T($(args...)))
 end
