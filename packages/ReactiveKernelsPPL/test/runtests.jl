@@ -47,6 +47,7 @@ const _PPL_TEST_FILES = (
     "test_concurrent_build.jl",
     "test_pure_surface_boundary.jl",
     "test_fresh_module.jl",
+    "test_precompiled_build.jl",
     "test_program_identity.jl",
     "test_preparation_identity.jl",
     "test_latest_native_source.jl",
