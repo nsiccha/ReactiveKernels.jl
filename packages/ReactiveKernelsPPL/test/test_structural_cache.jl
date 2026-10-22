@@ -117,6 +117,76 @@ end
     end
 end
 
+# Validation walks a plan's expressions once per structure and tests the
+# bound values at its leaves on every binding (snag rkppl-bind-data-96ae5ee3).
+# Each model below binds valid data first, so the walk is cached, then a
+# design whose values break one leaf: the warm binding fails exactly as an
+# uncached one.
+_scache_error(f) = try
+    f()
+    nothing
+catch e
+    e isa ContractValidationError || rethrow()
+    sprint(showerror, e)
+end
+
+const _SCACHE_LEAVES = [
+    # A positional gather from an array value: integer positions in range.
+    (@rkppl(begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        zeta ~ Dirichlet([1.0, 2.0])
+        cum = cumsum(vcat(0.0, zeta))
+        m = cum[c]
+        y .~ Normal.(a .+ b .* m, 1.0)
+    end), (; c = [1, 2, 3, 1], y = [0.1, 0.2, 0.3, 0.4]),
+        [(; c = [1, 2, 5, 1], y = [0.1, 0.2, 0.3, 0.4]) => "outside 1:3",
+         (; c = [1.0, 2.0, 3.0, 1.0], y = [0.1, 0.2, 0.3, 0.4]) => "does not hold integers"]),
+    # A gather on a levels axis: every index value is one of its labels.
+    (@rkppl(begin
+        s ~ Exponential(1)
+        z[levels(h)] .~ Normal.(0, s)
+        mu = z[g]
+        y .~ Normal.(mu, 1.0)
+    end), (; h = ["a", "b"], g = ["a", "b", "a"], y = [0.1, 0.2, 0.3]),
+        [(; h = ["a", "b"], g = ["a", "c", "a"], y = [0.1, 0.2, 0.3]) => "not a label"]),
+    # Elementwise math over a column: a numeric column.
+    (@rkppl(begin
+        a ~ Normal(0, 1)
+        lx = log.(x .+ 3)
+        y .~ Normal.(a .+ lx, 1.0)
+    end), (; x = [0.1, 0.2, 0.3], y = [0.1, 0.2, 0.3]),
+        [(; x = ["p", "q", "r"], y = [0.1, 0.2, 0.3]) => "not numeric"]),
+    # An `ifelse` condition column: Bool.
+    (@rkppl(begin
+        a ~ Normal(0, 1)
+        m = ifelse.(flag, x, 0.0)
+        y .~ Normal.(a .+ m, 1.0)
+    end), (; flag = [true, false, true], x = [0.1, 0.2, 0.3], y = [0.1, 0.2, 0.3]),
+        [(; flag = [1, 0, 1], x = [0.1, 0.2, 0.3], y = [0.1, 0.2, 0.3]) => "must be Bool"]),
+    # A literal position of a declared array: inside its data-sized axis.
+    (@rkppl(begin
+        z[1:K] .~ Normal.(0, 1)
+        t = z[3]
+        y .~ Normal.(t, 1.0)
+    end), (; K = 3, y = [0.1, 0.2]),
+        [(; K = 2, y = [0.1, 0.2]) => "out of bounds"]),
+]
+
+@testset "structural cache: a rebinding runs every data check" begin
+    for (model, good, bads) in _SCACHE_LEAVES
+        unbound = lower_rkppl(model, good; conditioned = (:y,))
+        @test bind_data(unbound, good) isa _SCACHE.StructuralPlan
+        for (bad, fragment) in bads
+            warm = _scache_error(() -> bind_data(unbound, bad))
+            @test warm !== nothing && occursin(fragment, warm)
+            @test warm == _scache_error(() -> _scache_uncached(unbound, bad))
+            # The valid design still binds after the failure.
+            @test bind_data(unbound, good) isa _SCACHE.StructuralPlan
+        end
+    end
+end
+
 @noinline function _scache_dropped_lowering()
     plan = _scache_lower(_scache_design(5))
     bind_data(plan, _scache_design(7))
