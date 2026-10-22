@@ -109,15 +109,14 @@ end
 _names_id(plan::StructuralPlan, names) =
     _structural_enabled() ? _names_id(_structural_cache(plan), names) : nothing
 
+# Hashed by its names alone: hashing a type (`objectid` of a parametric
+# array type) costs more than comparing the few signatures that share the
+# names, which compare each value's type by identity.
 function _types_id(cache::_StructuralCache, columns::AbstractDict{Symbol})
-    h = UInt(0)
-    for (k, v) in columns
-        h ⊻= hash(k, objectid(typeof(v)))
-    end
-    same(s) = length(s) == length(columns) &&
-        all(((k, v),) -> get(s, k, Union{}) === typeof(v), columns)
-    return _signature_id(same, () -> Dict{Symbol,DataType}(k => typeof(v) for (k, v) in columns),
-        cache, (:types, h, length(columns)))
+    names = _names_id(cache, keys(columns))
+    same(s::Dict{Symbol,DataType}) = all(k -> get(s, k, Union{}) === typeof(columns[k]), keys(columns))
+    return _signature_id(same, () -> Dict{Symbol,DataType}(k => typeof(columns[k]) for k in keys(columns)),
+        cache, (:types, UInt(names), length(columns)))
 end
 
 # The structure `plan`'s analyses read. `columns` chooses what of the column
