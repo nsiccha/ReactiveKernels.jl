@@ -51,6 +51,18 @@ using ReactiveKernels, Test
                 end
                 total::Float64 = sum(cells)
             end)
+            # A summary written once against a port `prediction`, and a model
+            # whose prediction value has another name (snag
+            # `kernel-input-bou-ce13eae3`).
+            @kernel summaries(prediction, rows) = begin
+                cells = plate(eachindex(rows)) do s
+                    cell::Float64 = sum(prediction[rows[s]])
+                end
+                total::Float64 = sum(cells)
+            end
+            @kernel model(a, b, t) = begin
+                mu = a .+ b .* t
+            end
             end
             """)
         write(joinpath(consumer, "Project.toml"), """
@@ -69,6 +81,13 @@ using ReactiveKernels, Test
             const VALUE = PREPARED([-2.0, 1.0, -3.0, 0.5, 4.0], 2.0)
             const GENERATED = ReactiveKernels._kernel_eval_definition(ArmSource,
                 deepcopy(ArmSource.DEFINITION))
+            # The prediction value's name is known only at run time. Renaming
+            # the closed dependency's port evaluates nothing.
+            prediction_name() = Symbol(:m, :u)
+            const RENAMED = compose(ArmSource.model,
+                ReactiveKernels.rename(ArmSource.summaries, :prediction => prediction_name()))
+            const RENAMED_READER = prepare(RENAMED; have = (:a, :b, :t, :rows), want = :total)
+            const RENAMED_VALUE = RENAMED_READER(1.0, 2.0, [0.0, 0.5, 1.0], [[1, 2], [3]])
             end
             """)
         setup = """
@@ -108,6 +127,12 @@ using ReactiveKernels, Test
             @test ArmSource in closure_roots(runtime)
             @test !(ArmConsumer in closure_roots(runtime))
             @test prepare(runtime)(x, 2.0) ≈ law(2.0) + 5log(2.0)
+            # A kernel composed through a renamed port of a closed dependency.
+            t = [0.0, 0.5, 1.0]; rows = [[1, 2], [3]]
+            total(a, b) = sum(a .+ b .* t)
+            @test ArmConsumer.RENAMED_VALUE == total(1.0, 2.0)
+            @test ArmConsumer.RENAMED_READER(-1.0, 4.0, t, rows) == total(-1.0, 4.0)
+            @test haskey(ArmConsumer.RENAMED, :mu) && !haskey(ArmConsumer.RENAMED, :prediction)
             end
             println("PRECOMPILED_CONSTRUCTION_PASS")
             """
