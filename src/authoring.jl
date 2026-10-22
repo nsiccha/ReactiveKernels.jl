@@ -5637,7 +5637,9 @@ and array slices. Other scalar recipes may still allocate intermediates. Reactan
 uses the owning surface (`reuse=false`).
 
 To bind shared values, lift `prepare(spec; have, want, bound=(; shared...))` with
-`vectorize`. To retain position-dependent work across calls, build a named
+`vectorize`. Rebinding new values to the same ports and vectorizing again
+reuses the position drivers lowered for an earlier binding; only the bound-data
+work runs again. To retain position-dependent work across calls, build a named
 intermediate with one vectorized WANT cut, then supply that stacked intermediate
 as a batched HAVE in a second cut of the same graph. No second model is needed.
 """

@@ -87,9 +87,10 @@ have, want, passes, bound)` builds, over the remaining HAVE ports. The cache
 keeps everything that does not depend on the bound values — the plan, the
 prepared prefix and the compiled residual — so repeating the call with new
 data for the same ports runs only the prefix on that data. A residual whose
-inner authored plates specialize on the bound data (bound-only cell recipes,
-data-bound branch partitions) is still specialized and compiled per binding;
-it reuses the plan and prefix only.
+inner authored plates cache bound-only cell values shares its compiled body
+too, across bindings whose caching decisions agree; one whose plates the pass
+partitions by a data-bound branch, or replaces by a bind-time value, is still
+specialized and compiled per binding and reuses the plan and prefix only.
 """
 function prepare!(cache::PreparationCache, g::Graph; have = (), want = (),
                   passes = (), bound = (), on_error = nothing)

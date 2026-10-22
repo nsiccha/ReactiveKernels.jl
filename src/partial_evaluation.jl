@@ -827,7 +827,8 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     # above, not from the cached data, so a later binding of a cached bound
     # preparation that decides alike reuses them (`_PlateRewrites`): its
     # residual then differs only in its `_BoundConstant` values.
-    key = (recipe.id, Tuple(r.id for r in residual), Tuple(v.name for v in frontier),
+    key = (recipe.id, copy(bound), copy(excluded), copy(refused),
+           Tuple(r.id for r in residual), Tuple(v.name for v in frontier),
            Tuple(keep), Tuple(atomic), whole,
            Tuple(Any[typeof(data) for data in cache_data]))
     rewrite = rewrites === nothing ? nothing : _plate_rewrite(rewrites, key)
@@ -1299,7 +1300,10 @@ function _partial_inner_plates(p::Plan, known, rewrites)
     pending = copy(p.recipes)
     while !isempty(pending)
         r = popfirst!(pending)
-        specialized = _partial_plate_recipe(copied, r, known, r.op, rewrites)
+        # Plates a partition emits get ids of this pass, which another binding
+        # may give a different plate: only the plan's own plates share rewrites.
+        specialized = _partial_plate_recipe(copied, r, known, r.op,
+                                            keyed ? rewrites : nothing)
         if specialized !== nothing
             changed = true
             push!(signature, specialized.key)
@@ -1643,20 +1647,24 @@ end
 # prefix on the new values and rebuilds the residual `PreparedKernel` around
 # the same compiled callable with a fresh constant table.
 #
-# The residual body is value-independent exactly when the inner-plate pass
-# (`_partial_inner_plates`) leaves the residual plan alone: its plate
-# specializations and data-bound branch partitions bake bound values in. That
-# pass is the only authority on whether it changes a plan, so a residual
-# containing authored plates runs it on every binding: a binding it rewrites
-# keeps the ordinary per-binding specialization on the cached plan and prefix,
-# and every binding it leaves alone shares the template of its plate classes
-# (`_partial_plate_classes`), whatever its values' element types or array
-# extents. A plate lowers differently for a scalar, vector, rank-N or tuple
-# bound argument, so each class has its own template; a residual whose plates
-# read no bound argument has the one template of the empty class tuple. The
-# pass declines cheaply, before any evaluation, when a plate has nothing bound
-# to specialize. A residual without authored plates skips the pass and shares
-# the template outright. Nothing is kept per binding value, element type or
+# The inner-plate pass (`_partial_inner_plates`) is the only authority on
+# whether it changes a residual plan, so a residual containing authored
+# plates runs it on every binding. A plate it rewrites to read cached cell
+# values follows from its caching decisions alone, so the pass keeps that
+# rewrite per entry (`_PlateRewrites`) and a later binding that decides alike
+# gets the same plan up to its `_BoundConstant` values: the template key
+# includes those decisions (the pass's signature), and the template records
+# where every constant sits in the operation table. A data-bound branch
+# partition or a whole-plate value bakes the binding's structure in, so such a
+# binding keeps the ordinary per-binding specialization on the cached plan and
+# prefix. Every other binding shares the template of its plate classes
+# (`_partial_plate_classes`) and rewrites, whatever its values' element types
+# or array extents. A plate lowers differently for a scalar, vector, rank-N or
+# tuple bound argument, so each class has its own template; a residual whose
+# plates read no bound argument has the one template of the empty class
+# tuple. The pass declines cheaply, before any evaluation, when a plate has
+# nothing bound to specialize. A residual without authored plates skips the
+# pass and shares the template outright. Nothing is kept per binding value, element type or
 # extent (snag inline-plate-reb-7387f072: keying templates on bound array
 # sizes re-lowered the ShinyRK simulation graph at every new schedule length
 # and kept one template per length).
@@ -1668,7 +1676,7 @@ end
 # per prefix and residual kernel type at the first rebinding in a process
 # (snag plain-prepare-wi-4cd01ccf: 290 ms for the ShinyRK simulation graph).
 # A template also keeps no binding's values: only the compiled callable and
-# the value-independent tails of the operation table and readable recipes.
+# the operation table and readable recipes without their constants.
 
 # The rewrites of a residual's authored plates by the inner-plate pass
 # (`_partial_plate_recipe`) for one plate class tuple of a cached entry, keyed
