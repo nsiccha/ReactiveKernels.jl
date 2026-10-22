@@ -14,6 +14,7 @@ _fz_interval(v) = [minimum(v), maximum(v)]
 _fz_bounds(v) = (lo = minimum(v), hi = maximum(v))
 _fz_shifted(x, b, iv) = b .* (x .- iv[1]) ./ (iv[2] - iv[1])
 _fz_scaled(x, b, r) = b .* (x .- r.lo) ./ (r.hi - r.lo)
+_fz_lo_share(g) = mean(g .== "lo")
 _fz_eval(q, u) = Base.invokelatest(q, u)
 _fz_refused(f, pattern) = try
     f()
@@ -226,6 +227,38 @@ end
     own = build_kernel(other)
     @test _fz_eval(prepare_query(own, other, :sampler), u) ≈
         _fz_eval(prepare_query(built, reference, :sampler), u) rtol = 1e-12
+end
+
+@testset "frozen definitions: an omitted input of non-numeric elements" begin
+    # A level share fitted on a fit-role `String` column. Its absent
+    # stand-in has no elements to read, so lowering from values decides
+    # from the recorded element type alone (BRM co-report on the snag).
+    src = quote
+        g_share = _fz_lo_share(g_fit)
+        a ~ Normal(0, 5)
+        sigma ~ Exponential(1.0)
+        mu = a .+ g_share .* x
+        y .~ Normal.(mu, sigma)
+    end
+    g = repeat(["lo", "hi", "mid"], 4)
+    data = (; x = _FZ_X, g_fit = g, y = _FZ_Y)
+    fit = bind_data(lower_rkppl(src, data; conditioned = (:y,), mod = @__MODULE__), data)
+    state = frozen_values(fit, :g_share)
+    @test state.values == (g_share = mean(g .== "lo"),)
+    @test state.inputs == (g_fit = (type = Vector{String}, size = (12,)),)
+    reference = bind_data(fit, (; x = _FZ_XNEW, g_fit = g, y = _FZ_YNEW))
+    built = build_kernel(fit)
+    u = unconstrain(built.layout, (; a = 0.3, sigma = 0.8))
+    lowered = lower_rkppl(src, (; x = _FZ_XNEW); conditioned = (:y,),
+        mod = @__MODULE__, frozen = state)
+    for plan in (fit, lowered)
+        design = bind_data(plan, (; x = _FZ_XNEW, y = _FZ_YNEW); frozen = state)
+        @test !ReactiveKernelsPPL._supplied(design.columns[:g_fit])
+        for preset in (:observations, :sampler)
+            @test isequal(_fz_eval(prepare_query(built, design, preset), u),
+                _fz_eval(prepare_query(built, reference, preset), u))
+        end
+    end
 end
 
 @testset "frozen definitions: an input another value reads stays required" begin
