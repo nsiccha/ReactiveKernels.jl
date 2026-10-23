@@ -1224,6 +1224,14 @@ prepare_query(built, design, :sampler)        # refused: `y` is absent
   refused. A program shape that would come from its values, such as an
   extent `length(levels(y)) - 1` or an inferred number of categories, is
   refused at binding; rebinding a binding that sized it keeps that size.
+- A response that is a definition reading only data
+  (`y = gather(yraw, rows)`, observed) is absent when the binding omits data
+  that only observed definitions read (`yraw`, directly or through
+  definitions only they read): those data are its value. Refused queries
+  name the response and the data to supply. Data another value reads stay
+  required, such as `g` in `rows = part(g, cells)` when a location reads
+  `rows` too. Rebind the fit, or a lowering from names that include the raw
+  data: a lowering without them cannot tell that the name is data.
 - A response holding one array per index (`y[i] .~ D.(…)` cells) can be
   absent too. Each index's cell takes the shape of the data the cell reads
   per index (`x[i]`). When the cell reads only computed values, the graph

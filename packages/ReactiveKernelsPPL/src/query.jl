@@ -115,24 +115,38 @@ function _absent_refusal(f, plan::StructuralPlan, spec, have, want)
         union!(reads, (canon(v) for v in selected.want))
         needed = filter(k -> haskey(spec.ports, k) && canon(spec.ports[k]) in reads, absent)
         isempty(needed) && rethrow(e)
-        _refuse_absent(unique!([_absent_source(plan.columns[k]) for k in needed]))
+        _refuse_absent(plan, unique!([_absent_source(plan.columns[k]) for k in needed]))
     end
 end
 
 # A cell query evaluates its observations' densities, which read them.
 function _refuse_absent_cells(plan::StructuralPlan, names)
     absent = intersect(names, _absent_observations(plan))
-    isempty(absent) || _refuse_absent(absent)
+    isempty(absent) || _refuse_absent(plan, absent)
     return nothing
 end
 
-function _refuse_absent(names)
-    them = join(("`$n`" for n in names), ", ", " and ")
+function _refuse_absent(plan::StructuralPlan, names)
+    quoted(ns) = join(("`$n`" for n in ns), ", ", " and ")
+    them = quoted(names)
     it = length(names) == 1 ? "it" : "them"
+    supply = unique!(Symbol[s for n in names for s in _absent_supply_names(plan, n)])
+    what = supply == names ? "no value was supplied" :
+        "no value was supplied for $(quoted(supply)), which " *
+        (length(names) == 1 ? "it is" : "they are") * " computed from"
     throw(ContractValidationError("[query] this binding leaves $them absent " *
-        "(no value was supplied), and this query reads $it. Supply $them, " *
+        "($what), and this query reads $it. Supply $(quoted(supply)), " *
         "or query values that do not read $it, such as a location by its " *
         "authored name or the `:observations` preset."))
+end
+
+# What a caller supplies to observe the absent `name`: its value, or, for a
+# derived response (`_absent_derived_responses!`), the omitted data it reads.
+function _absent_supply_names(plan::StructuralPlan, name::Symbol)
+    name in _derived_response_names(plan) || return Symbol[name]
+    order = _definition_read_orders(plan, _sorted_names(keys(plan.frozen.values)))[name]
+    raw = Symbol[s for s in order if _is_absent_raw_source(plan, s, get(plan.columns, s, nothing))]
+    return isempty(raw) ? Symbol[name] : raw
 end
 
 """
