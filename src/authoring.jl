@@ -213,9 +213,32 @@ Base.@nospecializeinfer function _kernel_add!(graph::Graph,
     _kernel_add_first!(graph, whole, only(outs))
 end
 
+# Element `i` of `(a, b, …) = value`: what Julia's lowering binds through
+# `Base.indexed_iterate`, one step per name, each threading the previous step's
+# state (an extra element is dropped, a missing one is a `BoundsError`).
+# Tuples, named tuples and arrays read it directly.
+@inline _kernel_destructure_element(value::Union{Tuple,NamedTuple}, i::Int) =
+    getfield(value, i)
+@inline _kernel_destructure_element(value::AbstractArray, i::Int) =
+    value[firstindex(value) + i - 1]
+function _kernel_destructure_element(value, i::Int)
+    item, state = Base.indexed_iterate(value, 1)
+    for k in 2:i
+        item, state = Base.indexed_iterate(value, k, state)
+    end
+    return item
+end
+
 # Julia lowers `(a,) = value` to `a = getfield(Base.indexed_iterate(value, 1), 1)`:
 # the first iterated element, not `value` itself.
-@inline _kernel_destructure_first(value) = getfield(Base.indexed_iterate(value, 1), 1)
+@inline _kernel_destructure_first(value) = _kernel_destructure_element(value, 1)
+
+# Element `I` as an operation. The index is a type parameter, so inference
+# reads `getfield(value, I)` of a heterogeneous tuple exactly; a value-held
+# index would widen to the union of its element types (`_PackIndex`).
+struct _KernelDestructureElement{I} end
+@inline (::_KernelDestructureElement{I})(value) where {I} =
+    _kernel_destructure_element(value, I)
 
 # The first-element read of a one-name destructuring, as its own recipe from
 # the whole right-side value (an existing port, or a hidden value holding the
@@ -2582,10 +2605,51 @@ Base.@nospecializeinfer function _kernel_authored_plate(
     # Store the graph's operation boundary explicitly: an expanded nested
     # region can coincidentally have the same table length as its parent DAG.
     # Length equality alone does not establish one operation per recipe.
-    p = plan(spec)
+    p = _plate_cell_plan(plan(spec))
     kernel = _prepare(p, _lower_with_ops(p; inline_embedded = false)...)
     T = _AuthoredPlateOp{typeof(kernel),_val_parameter(atomic)}
     _kernel_new_instance(T, (kernel, ()))::_AuthoredPlateOp
+end
+
+# The chosen plan of a plate cell, with each multi-output recipe (an authored
+# destructuring `(a, b, …) = f(x…)`, also inside a kernel the cell calls) split
+# into one recipe computing the whole value and one element read per name.
+# Every plate lowering, from the native cell loop to compiled regions and
+# bound-data partitions, reads single-output scalar recipes. Planning has
+# already chosen the recipe with its cost and CSE key; the split changes only
+# how the chosen cell is lowered. The cell graph is copied, never `p`'s own.
+function _plate_cell_plan(p::Plan)
+    any(r -> length(r.outputs) > 1, p.recipes) || return p
+    g = p.graph
+    graph = Graph(copy(g.values), copy(g.recipes),
+        Dict{ValueId,Vector{Int}}(id => copy(ids) for (id, ids) in g.producers),
+        copy(g.aliases), g.version, nothing)
+    recipes = Recipe[]
+    for r in p.recipes
+        if length(r.outputs) == 1
+            push!(recipes, r)
+            continue
+        end
+        get(graph.recipes, r.id, nothing) === r || throw(ArgumentError(
+            "plate cell recipe $(r.id) is not its graph's recipe $(r.id)"))
+        whole = value!(graph, gensym(:destructured_value), Any)
+        root = Recipe(r.id, r.inputs, (whole,), r.op, r.cost, r.cse_key,
+                      r.effectful, r.source)
+        graph.recipes[r.id] = root
+        for output in r.outputs
+            filter!(!=(r.id), graph.producers[canon_id(graph, output.id)])
+        end
+        push!(get!(graph.producers, canon_id(graph, whole.id), Int[]), r.id)
+        push!(recipes, root)
+        for (i, output) in enumerate(r.outputs)
+            source = Expr(:call, GlobalRef(@__MODULE__, :_kernel_destructure_element),
+                          whole.name, i)
+            push!(recipes, _add_recipe!(graph, (whole,), (output,),
+                _KernelDestructureElement{i}(), 1.0, nothing, false, source))
+        end
+    end
+    _partial_subplan(Plan(graph, p.have, p.want, p.recipes, p.producer, p.cost,
+                          p.candidates), p.have, p.want, recipes)
 end
 
 # `scan(xs...; init = c0) do carry, x...  …; (new_carry, output)  end`, reading shared
