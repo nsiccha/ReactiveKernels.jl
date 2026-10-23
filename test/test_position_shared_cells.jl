@@ -188,8 +188,15 @@ end
 @testset "errors" begin
     scalar = prepare(named_cell; have = (:ts, :eta, :theta), want = :cells)
     reader = vectorize(scalar; batched = (:eta, :theta))
-    # A cell value that throws still throws, and so does a domain mismatch.
-    @test_throws MethodError reader([["a"], ["b"], ["c"], ["d"]], etas, thetas)
+    # A cell value that throws raises what the scalar kernel raises, and a
+    # domain mismatch still throws.
+    bad = [["a"], ["b"], ["c"], ["d"]]
+    caught(f) = try f(); nothing catch err; err end
+    expected = caught(() -> scalar(bad, etas[:, 1], thetas[1]))
+    raised = caught(() -> reader(bad, etas, thetas))
+    @test expected !== nothing
+    @test typeof(raised) === typeof(expected)
+    @test sprint(showerror, raised) == sprint(showerror, expected)
     @test_throws DimensionMismatch reader(ts[1:3], etas, thetas)
 end
 
