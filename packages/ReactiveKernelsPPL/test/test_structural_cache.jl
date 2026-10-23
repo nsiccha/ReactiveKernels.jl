@@ -198,6 +198,11 @@ end
     @test _SCACHE._types_id(cache, t1) == _SCACHE._types_id(cache, t2)
     @test _SCACHE._types_id(cache, t1) != _SCACHE._types_id(cache, t3)
     @test _SCACHE._types_id(cache, t1) != _SCACHE._types_id(cache, Dict{Symbol,Any}(:a => 1.0))
+    r1 = Dict(:a => :data, :b => :response)
+    roles(r) = _SCACHE._table_id(cache, r, :roles, identity)
+    @test roles(r1) == roles(Dict(:b => :response, :a => :data))
+    @test roles(r1) != roles(Dict(:a => :predictor, :b => :response))
+    @test roles(r1) != _SCACHE._types_id(cache, Dict{Symbol,Any}(:a => 1.0, :b => [1, 2]))
     @test _SCACHE._names_id(cache, keys(t3)) == _SCACHE._names_id(cache, Set([:b, :a]))
     @test _SCACHE._names_id(cache, Set([:a])) != _SCACHE._names_id(cache, Set([:a, :b]))
     # Signatures that share a hash keep their own ids: the stored signature

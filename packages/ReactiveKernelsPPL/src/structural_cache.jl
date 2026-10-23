@@ -66,7 +66,6 @@ end
 # Names in a canonical order, for keys. A Symbol is interned for the life of
 # the process, so its identity orders it stably and compares as an integer.
 _sorted_names(names) = Tuple(sort!(collect(Symbol, names); by = objectid))
-_sorted_roles(roles) = Tuple(sort!(collect(roles); by = first))
 
 # Every field but the anchor and the per-call facets, by identity. Binding
 # interns the fields it rebuilds (`_interned`), so equal ones are identical.
@@ -109,15 +108,23 @@ end
 _names_id(plan::StructuralPlan, names) =
     _structural_enabled() ? _names_id(_structural_cache(plan), names) : nothing
 
-# Hashed by its names alone: hashing a type (`objectid` of a parametric
-# array type) costs more than comparing the few signatures that share the
-# names, which compare each value's type by identity.
-function _types_id(cache::_StructuralCache, columns::AbstractDict{Symbol})
-    names = _names_id(cache, keys(columns))
-    same(s::Dict{Symbol,DataType}) = all(k -> get(s, k, Union{}) === typeof(columns[k]), keys(columns))
-    return _signature_id(same, () -> Dict{Symbol,DataType}(k => typeof(columns[k]) for k in keys(columns)),
-        cache, (:types, UInt(names), length(columns)))
+# A table's names with `signature(value)` per name, compared by identity:
+# a column table's value types (`:types`), the roles binding assigns
+# (`:roles`). Hashed by its names alone: hashing a type (`objectid` of a
+# parametric array type) costs more than comparing the few signatures that
+# share the names.
+function _table_id(cache::_StructuralCache, table::AbstractDict{Symbol}, kind::Symbol,
+        signature)
+    names = _names_id(cache, keys(table))
+    same(s::Dict{Symbol,Any}) =
+        all(k -> get(s, k, _UNCACHED) === signature(table[k]), keys(table))
+    return _signature_id(same, () -> Dict{Symbol,Any}(k => signature(table[k]) for k in keys(table)),
+        cache, (kind, UInt(names), length(table)))
 end
+_types_id(cache::_StructuralCache, columns::AbstractDict{Symbol}) =
+    _table_id(cache, columns, :types, typeof)
+_roles_id(plan::StructuralPlan, roles::AbstractDict{Symbol,Symbol}) =
+    _structural_enabled() ? _table_id(_structural_cache(plan), roles, :roles, identity) : nothing
 
 # The structure `plan`'s analyses read. `columns` chooses what of the column
 # table: `:none` (an analysis that reads none of it), `:names` (the column

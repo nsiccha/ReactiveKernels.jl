@@ -8376,7 +8376,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
         end
     end
     merged = merge(inferred, roles)
-    merged = _interned(plan, (:roles, _sorted_roles(merged)), merged)
+    merged = _interned(plan, (:roles, _roles_id(plan, merged)), merged)
     # Observation statements determine their own axes; unrelated axes add
     # their likelihood rows without sizing one value from another's extent.
     axis_plan = _with(plan; columns = columns)
