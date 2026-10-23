@@ -5099,7 +5099,9 @@ its scalar-kernel argument at one position.
 
 The plan is split at its batched HAVE ports exactly as `bound=` partial
 evaluation splits it at bound ports (`_replicated_parts`): a shared prefix and
-a per-position residual. Each part is lowered by the ordinary native scalar
+a per-position residual. A residual plate's cell values that read only its
+non-batched arguments join the prefix as a plate of their own
+(`_replicated_shared_cells`). Each part is lowered by the ordinary native scalar
 lowering (`_lower_with_ops`) and spliced into the position driver, so authored
 plates emit their fused loops, scans inline their step, and embedded kernels
 splice, exactly as [`prepare`](@ref) lowers the same recipes. Their internal
@@ -5119,12 +5121,15 @@ function _replicated_parts(p::Plan, analysis)
     g = p.graph
     mapped_have = Value[v for v in p.have if canon_id(g, v.id) in analysis.mapped_ids]
     shared_have = Value[v for v in p.have if !(canon_id(g, v.id) in analysis.mapped_ids)]
-    prefix, residual, prefix_owned = _partial_split(
-        p, Set(canon_id(g, v.id) for v in shared_have))
+    shared = Set(canon_id(g, v.id) for v in shared_have)
+    # Position-invariant cell values of position-dependent plates join the
+    # prefix as plates of their own (`_replicated_shared_cells`).
+    p = _replicated_shared_cells(p, shared)
+    prefix, residual, prefix_owned = _partial_split(p, shared)
     constants = _partial_constants(p, prefix_owned, residual)
     have_ids = Set(canon_id(g, v.id) for v in p.have)
     prefix_want = Value[v for v in constants if !(canon_id(g, v.id) in have_ids)]
-    (; prefix = _partial_subplan(p, shared_have, prefix_want, prefix),
+    (; plan = p, prefix = _partial_subplan(p, shared_have, prefix_want, prefix),
        residual = _partial_subplan(p, vcat(mapped_have, constants), p.want, residual))
 end
 
@@ -5145,11 +5150,12 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     _replicated_graph_plan(p) || throw(ArgumentError(
         "position batching requires pure recipes"))
     analysis = _replicated_dependency_analysis(p, batched)
+    parts = _replicated_parts(p, analysis)
+    p = parts.plan
     g = p.graph
     names = _varnames(p)
     nm(v) = names[canon_id(g, v.id)]
     mapped(cid) = cid in analysis.mapped_ids
-    parts = _replicated_parts(p, analysis)
     have_ids = Set(canon_id(g, v.id) for v in p.have)
     declared = Set{Symbol}()
 

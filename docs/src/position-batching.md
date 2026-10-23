@@ -159,6 +159,29 @@ graph therefore costs per position what it costs in the scalar kernel, whether
 it depends on a position or only on shared ports. Internal loops and lazy
 branches retain the scalar semantics.
 
+A plate that reads a batched value runs at every position, but a value of its
+cell that reads only the plate's shared arguments, at least one of them zipped,
+varies across the plate's cells and not across positions. Native lowering moves
+such cell values into a plate of their own over those shared arguments, which
+runs once per call above the position loop; the position plate reads its output
+as one more zipped argument. A subject's design derived from its own data rows,
+for example, runs once per subject and call instead of once per subject and
+position. An inline call in a cell recipe moves too when it reads only shared
+arguments, split as `bound=` partial evaluation splits it, and a nested plate,
+scan or embedded kernel moves whole. This also covers shared arguments that are
+bound: a record or tuple cell value, which preparation does not cache, runs once
+per cell and call. Values are unchanged: each moved recipe runs its operation on
+the same operands. The moved plate computes every cell its shared zipped
+arguments span and holds the values for the call; an error it raises surfaces
+before any position runs. Three kinds of cell work stay at each position: the
+cell's result, values that read only closures (already computed once per
+position, above the cell loop), and every cell value of a plate that a
+`plate_cell` reads, which computes only the cells read. A moved value is
+allocated once per call, where a dotted call, slice or nested plate at a
+position reuses a lane slot (below), so a one-position read allocates it where
+it did not before. Up to RK `f7bc80cb`, every value of a position-dependent
+plate's cell ran once per cell and position.
+
 Up to canonical `d4f65756` the position driver instead called every plate
 through the plate operation's per-cell fallback. On the ShinyRK superposition
 plate (6529 observations, 14 doses, 32 positions per read) that allocated
