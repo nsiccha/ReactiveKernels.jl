@@ -176,10 +176,11 @@ arguments span and holds the values for the call; an error it raises surfaces
 before any position runs. Three kinds of cell work stay at each position: the
 cell's result, values that read only closures (already computed once per
 position, above the cell loop), and every cell value of a plate that a
-`plate_cell` reads, which computes only the cells read. Before this lowering
-(RK `f7bc80cb` and earlier), every value of a position-dependent plate's cell
-ran once per cell and position; bind such values' inputs and keep them dense
-arrays there, or compute them in a separate cut.
+`plate_cell` reads, which computes only the cells read. A moved value is
+allocated once per call, where a dotted call, slice or nested plate at a
+position reuses a lane slot (below), so a one-position read allocates it where
+it did not before. Up to RK `f7bc80cb`, every value of a position-dependent
+plate's cell ran once per cell and position.
 
 Up to canonical `d4f65756` the position driver instead called every plate
 through the plate operation's per-cell fallback. On the ShinyRK superposition
