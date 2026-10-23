@@ -852,7 +852,10 @@ loop.
 The current plate domain is deliberately narrow:
 
 - at least one non-`Ref` HAVE value must instantiate a broadcast axis;
-- every selected recipe must have exactly one output;
+- every recipe the cell lowers has exactly one output: a destructuring
+  `(a, b) = f(x)` in the cell, or in a kernel the cell calls, is planned as one
+  recipe with several outputs and then lowered as one recipe computing `f(x)`
+  plus one element read per name, as Julia's `Base.indexed_iterate` binds it;
 - there must be exactly one scalar WANT, and it must transitively depend on a
   batched port;
 - the native dependency scheduler assumes the scalar recipe contract is pure;
