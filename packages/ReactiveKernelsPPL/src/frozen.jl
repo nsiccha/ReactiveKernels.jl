@@ -122,7 +122,7 @@ function _bind_frozen!(plan::StructuralPlan, columns::AbstractDict{Symbol},
         return nothing
     end
     foreach(reach, names)
-    live = _frozen_live_names(plan, names, Set{Symbol}(keys(frozen.inputs)))
+    live = _live_names(plan, names, Set{Symbol}(keys(frozen.inputs)))
     for (input, info) in pairs(frozen.inputs)
         # An input another value reads stays required, and an omitted one
         # fails exactly as it does without `frozen`.
@@ -133,11 +133,12 @@ function _bind_frozen!(plan::StructuralPlan, columns::AbstractDict{Symbol},
     return stubs
 end
 
-# The definitions and `inputs` some value other than the `frozen`
-# definitions reads: every plan slot but the definition tables, then each
-# definition a read value is, except a frozen one, whose value is given.
-_frozen_live_names(plan::StructuralPlan, frozen::Set{Symbol}, inputs::Set{Symbol}) =
-    _structural(plan, (:frozen_live, _sorted_names(frozen), _sorted_names(inputs));
+# The definitions and `inputs` some value other than the `given` definitions
+# reads: every plan slot but the definition tables, then each definition a
+# read value is, except a given one, whose value the binding supplies (a
+# frozen value, or an absent derived response, `_absent_derived_responses!`).
+_live_names(plan::StructuralPlan, given::Set{Symbol}, inputs::Set{Symbol}) =
+    _structural(plan, (:live_names, _sorted_names(given), _sorted_names(inputs));
             columns = :none) do
         exprs, _ = _definition_exprs(plan)
         candidates = union(Set{Symbol}(keys(exprs)), inputs)
@@ -151,7 +152,7 @@ _frozen_live_names(plan::StructuralPlan, frozen::Set{Symbol}, inputs::Set{Symbol
         queue = collect(live)
         while !isempty(queue)
             nm = pop!(queue)
-            (haskey(exprs, nm) && nm ∉ frozen) || continue
+            (haskey(exprs, nm) && nm ∉ given) || continue
             for s in _definition_reads(exprs[nm])
                 s in live && continue
                 push!(live, s)

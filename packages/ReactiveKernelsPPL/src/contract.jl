@@ -1621,6 +1621,8 @@ function _uncached_axis_exempt_columns(plan::StructuralPlan)
         intersect(computed, Set{Symbol}(a.name for a in plan.assignments)),
         intersect(computed, wholedefs), observed, inputs)
     union!(modelvals, (n for n in computed if plan.columns[n] isa Number))
+    # The omitted data of an absent derived response: nothing reads it.
+    union!(modelvals, (k for (k, v) in plan.columns if _is_absent_raw_source(plan, k, v)))
     # Binding-owned presence masks encode observations, not model dimensions.
     union!(modelvals, (_observed_mask_name(r.response) for r in plan.responses
         if haskey(plan.columns, _observed_mask_name(r.response))))
@@ -2173,6 +2175,52 @@ function _absent_observations!(plan::StructuralPlan, columns::AbstractDict)
     end
     return columns
 end
+
+# A derived response (`y = gather(yraw, rows)`, then observed) whose value
+# reads data the binding omits is absent too, when only observed derived
+# responses read those data, through definitions only they read: that data
+# is the observation's value, so a design that omits it omits the
+# observation, as one omitting a response bound as data does. The response
+# binds as an absent response (sized by `_size_absent_responses!`), and each
+# omitted source as an absent value of the observation it supplies, typed as
+# in the binding being rebound: the program declares every input, and
+# nothing reads this one. A source another value reads stays required, and
+# an omitted one fails as before. Internal inputs (`_rkppl_…`) bind later.
+function _absent_derived_responses!(plan::StructuralPlan, columns::AbstractDict,
+        frozen::FrozenValues)
+    derived = _derived_response_names(plan)
+    isempty(derived) && return columns
+    known = _all_name_set(plan)
+    orders = _definition_read_orders(plan, _sorted_names(keys(frozen.values)))
+    omitted = Dict{Symbol,Vector{Symbol}}()
+    for y in derived
+        haskey(columns, y) && continue
+        sources = Symbol[s for s in orders[y] if s ∉ known && !haskey(columns, s) &&
+            Base.isidentifier(s) && !startswith(String(s), "_rkppl_")]
+        isempty(sources) || (omitted[y] = sources)
+    end
+    isempty(omitted) && return columns
+    live = _live_names(plan, Set{Symbol}(keys(omitted)),
+        Set{Symbol}(s for sources in values(omitted) for s in sources))
+    eltypes = Dict{Symbol,Type}(r.response => _valueless_response_eltype(r)
+        for r in plan.responses)
+    for y in sort!(collect(keys(omitted)))
+        any(in(live), omitted[y]) && continue
+        columns[y] = _absent_like(y, get(eltypes, y, Float64), (1,))
+        for s in omitted[y]
+            haskey(columns, s) && continue
+            old = get(plan.columns, s, nothing)
+            columns[s] = _frozen_input_stub(y, old === nothing ?
+                (type = Vector{Float64}, size = (0,)) : _frozen_input_info(old))
+        end
+    end
+    return columns
+end
+
+# An omitted source `_absent_derived_responses!` bound absent.
+_is_absent_raw_source(plan::StructuralPlan, k::Symbol, v) = v isa _Absent &&
+    _absent_source(v) !== k && k ∉ _defined_names(plan) &&
+    _absent_source(v) in _derived_response_names(plan)
 
 function _absent_conditioned_value(plan::StructuralPlan, name::Symbol)
     for p in plan.parameters
@@ -8114,6 +8162,8 @@ function _materialize_derived_responses!(plan::StructuralPlan,
         det_exprs[d.name] = d.expr
     end
     for name in derived
+        # Absent (`_absent_derived_responses!`): no value to evaluate.
+        get(columns, name, nothing) isa _Absent && continue
         haskey(columns, name) && throw(ContractValidationError(
             "[bind] column $name is derived in the model — drop it from " *
             "bind_data (derived responses materialize from bound data)"))
@@ -8326,6 +8376,7 @@ function _bind_data_latest(plan::StructuralPlan, columns::AbstractDict{Symbol};
     _absent_observations!(plan, columns)
     _route_conditioned_values!(plan, columns)
     _route_bound_values!(plan, columns)
+    _absent_derived_responses!(plan, columns, frozen)
     _scalar_responses_as_observations!(plan, columns)
     # Value matrices bind next, as data: every later step reads them
     # exactly like a caller-supplied matrix.

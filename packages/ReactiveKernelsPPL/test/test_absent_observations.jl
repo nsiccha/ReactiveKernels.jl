@@ -463,6 +463,99 @@ end
         _ao_eval(prepare_query(built, sized, :prior), u) rtol = 1e-12
 end
 
+_ao_part(groups, cells) = [findall(==(c), groups) for c in cells]
+_ao_gather(values, rows) = [values[r] for r in rows]
+
+# A derived response's raw data (snag rkppl-derived-re-79a3a684): a response
+# the graph gathers from data only it reads is absent when a design omits
+# that data, exactly as a response bound as data is.
+@testset "absent observations: the raw data of a derived response" begin
+    src = quote
+        a ~ Normal(0, 1); s ~ Exponential(1)
+        rows = _ao_part(g, cells)
+        @plate for i in eachindex(cells)
+            loc[i] = a .* x[rows[i]]
+        end
+        y = _ao_gather(yraw, rows)
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(loc[i], s)
+        end
+    end
+    data = Dict{Symbol,Any}(:g => ["a", "b", "b", "a", "a"], :cells => ["b", "empty", "a"],
+        :x => [0.2, 0.1, 0.7, 0.8, 1.3], :yraw => [0.2, -0.1, 0.1, 0.3, -0.2])
+    fit = bind_data(lower_rkppl(src, data; conditioned = (:y,), mod = @__MODULE__), data)
+    built = build_kernel(fit)
+    density(a, s, d, yraw) = logpdf(Normal(0, 1), a) + logpdf(Exponential(1), s) + log(s) +
+        sum(sum(logpdf.(Normal.(a .* d[:x][r], s), yraw[r]); init = 0.0)
+            for r in _ao_part(d[:g], d[:cells]))
+    u = unconstrain(built.layout, (; a = 0.4, s = 1.3))
+    @test _ao_eval(prepare_query(built, fit, :sampler), u) ≈
+        density(0.4, 1.3, data, data[:yraw]) rtol = 1e-12
+    for design in (Dict{Symbol,Any}(:g => ["a", "a", "b"], :cells => ["a", "b"],
+                :x => [0.3, 0.4, 0.9]),
+            Dict{Symbol,Any}(:g => ["c", "b", "c", "b", "b", "a"], :cells => ["a", "b", "c", "d"],
+                :x => collect(0.1:0.1:0.6)))
+        before = deepcopy(design)
+        d = bind_data(fit, design)
+        @test design == before                       # caller data untouched
+        @test ReactiveKernelsPPL._absent_observations(d) == [:y]
+        rows = _ao_part(design[:g], design[:cells])
+        for (a, s) in ((0.4, 1.3), (-1.2, 0.6))
+            v = unconstrain(built.layout, (; a, s))
+            loc = [a .* design[:x][r] for r in rows]
+            @test _ao_eval(_ao_prepare(built, d, (:loc,)), v) ≈ loc rtol = 1e-12
+            obs = _ao_eval(prepare_query(built, d, :observations), v)
+            @test obs.y.location ≈ loc rtol = 1e-12
+            @test obs.y.scale ≈ s rtol = 1e-12
+            @test _ao_eval(prepare_query(built, d, :prior), v) ≈
+                logpdf(Normal(0, 1), a) + logpdf(Exponential(1), s) rtol = 1e-12
+        end
+        for preset in (:sampler, :likelihood, :pointwise)
+            @test _ao_refused(() -> prepare_query(built, d, preset), :y)
+        end
+        @test _ao_refused(() -> prepare_sampler(built, d, u; backend = _AO_BACKEND), :y)
+        # Supplying the raw data again observes the response.
+        yraw = collect(range(-0.5, 0.5; length = length(design[:x])))
+        rebound = bind_data(d, merge(design, Dict{Symbol,Any}(:yraw => yraw)))
+        @test isempty(ReactiveKernelsPPL._absent_observations(rebound))
+        @test _ao_eval(prepare_query(built, rebound, :sampler), u) ≈
+            density(0.4, 1.3, design, yraw) rtol = 1e-12
+    end
+
+    # A flat response computed from its raw data through another definition.
+    src = quote
+        a ~ Normal(0, 1); b ~ Normal(0, 1); s ~ Exponential(1)
+        mu = a .+ b .* x
+        ylog = log.(ypos)
+        y = ylog .- 1.0
+        y .~ Normal.(mu, s)
+    end
+    X = _ao_x(6)
+    data = Dict{Symbol,Any}(:x => X, :ypos => exp.(1 .+ 0.3 .* X))
+    fit = bind_data(lower_rkppl(src, data; conditioned = (:y,), mod = @__MODULE__), data)
+    built = build_kernel(fit)
+    d = bind_data(fit, Dict{Symbol,Any}(:x => X[2:4]))
+    @test ReactiveKernelsPPL._absent_observations(d) == [:y]
+    v = unconstrain(built.layout, (; a = 0.2, b = -0.7, s = 0.9))
+    obs = _ao_eval(prepare_query(built, d, :observations), v)
+    @test obs.y.location ≈ 0.2 .- 0.7 .* X[2:4] rtol = 1e-12
+    @test _ao_refused(() -> prepare_query(built, d, :likelihood), :y)
+    @test _ao_eval(prepare_query(built, fit, :likelihood), v) ≈
+        sum(logpdf.(Normal.(0.2 .- 0.7 .* X, 0.9), 0.3 .* X)) rtol = 1e-12
+
+    # Raw data another value reads stays required: only observation data
+    # may be absent.
+    src = quote
+        ybar = Statistics.mean(yraw)
+        a ~ Normal(ybar, 1); s ~ Exponential(1)
+        y = yraw .- 0.0
+        y .~ Normal.(a .+ x, s)
+    end
+    data = Dict{Symbol,Any}(:x => X, :yraw => 1.0 .+ X)
+    fit = bind_data(lower_rkppl(src, data; conditioned = (:y,), mod = @__MODULE__), data)
+    @test_throws "yraw" bind_data(fit, Dict{Symbol,Any}(:x => X[1:2]))
+end
+
 @testset "absent observations: what stays refused" begin
     X = _ao_x(6)
     data = Dict{Symbol,Any}(:x => X, :x_fit => X, :y => X)
