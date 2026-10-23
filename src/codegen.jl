@@ -3294,21 +3294,23 @@ function _lower_plate_recipe_native!(body, recipe, args, out, operation, slots;
     if recipe.op isa _AuthoredScanOp
         _lower_authored_scan_native!(body, recipe.op, args, out, slots.offset;
                                      slots.type_offset, recycled)
+        return body
+    end
+    # The destination form reads each argument where its source does, so
+    # evaluate the cell's argument expressions once, as the call would. A lazy
+    # branch's form keeps the branch (`_lane_source_expr`); only a position
+    # residual, which is never differentiated, gives a cell recipe a slot.
+    names = Any[gensym(:plate_lane_argument) for _ in args]
+    destination = recycled === nothing ? nothing :
+        _lane_source_expr(recipe, names, recycled)
+    if destination !== nothing
+        append!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
+        push!(body.args, Expr(:(=), out, destination))
     elseif recipe.op isa _KernelSourceOp && recipe.op.f isa _KernelBranch
         push!(body.args, Expr(:(=), out,
             _native_plate_branch_expr(recipe.op.f, :(getfield($operation, :f)), args)))
     else
-        # The destination form reads each argument where its source does, so
-        # evaluate the cell's argument expressions once, as the call would.
-        names = Any[gensym(:plate_lane_argument) for _ in args]
-        destination = recycled === nothing ? nothing :
-            _lane_source_expr(recipe, names, recycled)
-        if destination === nothing
-            push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
-        else
-            append!(body.args, (Expr(:(=), name, arg) for (name, arg) in zip(names, args)))
-            push!(body.args, Expr(:(=), out, destination))
-        end
+        push!(body.args, Expr(:(=), out, Expr(:call, operation, args...)))
     end
     body
 end
@@ -3946,6 +3948,39 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # The result leaves the cell: it takes any slot buffer it shares memory
     # with or holds (`_lane_release!`).
     released = Symbol[(nested === nothing ? Symbol[] : nested.slots); last.(slotted)]
+    # A plate of the position residual's top level (`_CELL_TABLES`) that stores
+    # its cells also keeps, per cell, the buffers its stored result holds
+    # (`_lane_cell_take!`, `_lane_cell_release!`): cell `k` of the next position
+    # or borrowed call refills them. Only values computed at every cell take
+    # part; a plate invariant or a scheduled group's value is computed once
+    # for several cells. A plate inside a cell runs once per outer cell, whose
+    # stored result may still hold its cells, so it keeps no table.
+    tables = get(task_local_storage(), _CELL_TABLES, nothing)
+    table_pairs = Pair{Symbol,Symbol}[]
+    if tables !== nothing && pointwise_lhs !== nothing && !into && cells
+        every_cell = Set{Int}(i for (roots, indices) in groups
+            if !isempty(roots) && _authored_plate_unconditional_group(
+                roots, root_positions, atomic, callvalues) for i in indices)
+        per_cell = Symbol[(nested === nothing ? Symbol[] : nested.slots);
+                          Symbol[slot for (i, slot) in slotted if i in every_cell]]
+        for slot in per_cell
+            table = gensym(Symbol(slot, :_cells))
+            push!(tables, table)
+            push!(table_pairs, slot => table)
+        end
+    end
+    cell_number = gensym(:plate_cell_number)
+    if !isempty(table_pairs)
+        prepend!(loopbody.args, Any[:($cell_number += 1);
+            Any[:($(GlobalRef(@__MODULE__, :_lane_cell_take!))($slot, $table, $cell_number))
+                for (slot, table) in table_pairs]])
+        kept = Expr(:call, GlobalRef(@__MODULE__, :_lane_cell_release!), scalar_result,
+                    cell_number, (Expr(:tuple, slot, table) for (slot, table) in table_pairs)...)
+        result = gensym(:plate_cell_result)
+        push!(loopbody.args, :($result = $kept))
+        scalar_result = result
+        released = setdiff(released, first.(table_pairs))
+    end
     if !isempty(released)
         result = gensym(:plate_cell_result)
         push!(loopbody.args, :($result = $(GlobalRef(@__MODULE__, :_lane_release!))(
@@ -3978,6 +4013,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
+    isempty(table_pairs) || (cell_loop = Expr(:block, :($cell_number = 0), cell_loop))
     # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
     # SIMD needs an indexable iteration space, whereas `_plate_cells` returns
     # a Generator for one axis: `_plate_simd_cells` iterates that axis's range
@@ -4371,12 +4407,19 @@ end
 # depth. They are free names of the returned AST, which its caller binds to
 # `Ref{Any}` slots (`_lower_replicated_with_ops`). Every other lowering,
 # including one started while this one runs, collects none.
+# `cell_tables` collects, the same way, the per-cell tables of the plates at
+# this lowering's own top level (`_lane_cell_take!`); a cell's own lowering
+# collects none.
 function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
+                         cell_tables::Union{Nothing,Vector{Symbol}} = nothing,
                          kwargs...)
-    task_local_storage(() -> _lower_with_ops_collecting(p; kwargs...),
-                       _CELL_SLOTS, cell_slots)
+    task_local_storage(_CELL_TABLES, cell_tables) do
+        task_local_storage(() -> _lower_with_ops_collecting(p; kwargs...),
+                           _CELL_SLOTS, cell_slots)
+    end
 end
 const _CELL_SLOTS = :ReactiveKernels_cell_slots
+const _CELL_TABLES = :ReactiveKernels_cell_tables
 
 # The positions in `p.recipes` of the recipes whose value keeps a lane slot:
 # each single-output producer with a destination form
@@ -5137,8 +5180,9 @@ end
 # as the position driver always did: its body is host-only by construction
 # (a traced batch calls the scalar target through `_replica`).
 _replicated_part_ast(part::Plan; recycle = Pair{ValueId,Symbol}[],
-                     cell_slots = nothing) =
-    _lower_with_ops(_lowering_plan(part); declare = true, recycle, cell_slots)
+                     cell_slots = nothing, cell_tables = nothing) =
+    _lower_with_ops(_lowering_plan(part); declare = true, recycle, cell_slots,
+                    cell_tables)
 
 # A bound constant keeps its exact value type (a bound view stays a view).
 function _replicated_declares(p::Plan, value::Value)
@@ -5202,8 +5246,9 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     # cells as well as positions (`_plate_nested_native!`): the residual AST
     # reads each by its collected name, bound below with the scratch slots.
     cell_slots = Symbol[]
+    cell_tables = Symbol[]
     residual_ast, residual_ops, _ = _replicated_part_ast(parts.residual; recycle,
-                                                         cell_slots)
+                                                         cell_slots, cell_tables)
     residual_offset = length(prefix_ops)
     lane_vars = Dict(canon_id(g, v.id) => gensym(Symbol(v.name, :_lane))
                      for v in parts.residual.have if mapped(canon_id(g, v.id)))
@@ -5304,7 +5349,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
             Expr(:call, GlobalRef(@__MODULE__, :_replicated_lane), nm(v), valtype(v))
         push!(body.args, Expr(:(=), lane, allocation))
     end
-    for (index, scratch) in enumerate([scratch_vars; cell_slots])
+    for (index, scratch) in enumerate([scratch_vars; cell_slots; cell_tables])
         push!(body.args, Expr(:(=), scratch, reuse ? slot(2 * nout + nhave + index) :
             Expr(:call, Expr(:curly, GlobalRef(Base, :RefValue), GlobalRef(Core, :Any)),
                  GlobalRef(Core, :nothing))))
@@ -5367,7 +5412,7 @@ function _lower_replicated_with_ops(p::Plan; batched, reuse = false)
     push!(body.args, Expr(:return, retval))
     Expr(:function, Expr(:tuple, argexprs...), body),
     (prefix_ops..., residual_ops...),
-    2 * nout + nhave + length(scratch_vars) + length(cell_slots)
+    2 * nout + nhave + length(scratch_vars) + length(cell_slots) + length(cell_tables)
 end
 
 # Destination-form producers of a position value: authored plates and scans,
@@ -6645,17 +6690,34 @@ _replicated_may_contain_array(::Type{<:Number}) = false
     any(_replicated_may_contain_array, fieldtypes(T))
 end
 
-_replicated_alias(cache::AbstractArray, arg::AbstractArray) =
-    Base.mightalias(cache, arg) ||
-    (_replicated_may_contain_array(eltype(arg)) &&
-     any(item -> _replicated_alias(cache, item), arg))
-_replicated_alias(cache::AbstractArray, arg::Union{Tuple,NamedTuple}) =
-    any(item -> _replicated_alias(cache, item), arg)
+# These walks run on every borrowed call, over every input. They unroll tuples
+# by their type and loop over arrays, so the walk allocates nothing: `any` with
+# a closure over a heterogeneous tuple dispatched and boxed at every element
+# (about two million allocations per call over a ragged population design,
+# snag reuse-readers-al-25b23112).
+function _replicated_alias(cache::AbstractArray, arg::AbstractArray)
+    Base.mightalias(cache, arg) && return true
+    _replicated_may_contain_array(eltype(arg)) || return false
+    for item in arg
+        _replicated_alias(cache, item) && return true
+    end
+    false
+end
+_replicated_alias(cache::AbstractArray, arg::NamedTuple) =
+    _replicated_alias(cache, values(arg))
+_replicated_alias(cache::AbstractArray, arg::Tuple) = _replicated_alias_any(cache, arg)
 _replicated_alias(cache, arg) = false
-_replicated_aliases(cache::AbstractArray, args) =
-    any(arg -> _replicated_alias(cache, arg), args)
-_replicated_aliases(cache::Union{Tuple,NamedTuple}, args) =
-    any(item -> _replicated_aliases(item, args), cache)
+@generated function _replicated_alias_any(cache, items::Tuple)
+    foldr((i, rest) -> :(_replicated_alias(cache, getfield(items, $i)) || $rest),
+          1:fieldcount(items); init = false)
+end
+_replicated_aliases(cache::AbstractArray, args::Tuple) = _replicated_alias_any(cache, args)
+_replicated_aliases(cache::AbstractArray, args) = _replicated_alias(cache, args)
+_replicated_aliases(cache::NamedTuple, args) = _replicated_aliases(values(cache), args)
+@generated function _replicated_aliases(cache::Tuple, args)
+    foldr((i, rest) -> :(_replicated_aliases(getfield(cache, $i), args) || $rest),
+          1:fieldcount(cache); init = false)
+end
 _replicated_aliases(cache, args) = false
 
 struct BorrowedBatchedKernel{K,F,O,C}

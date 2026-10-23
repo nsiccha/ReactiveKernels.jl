@@ -4,24 +4,40 @@
 # A position residual allocates every array intermediate afresh at each
 # position. Authored plates and scans already fill a recycled buffer
 # (`_lane_allocation`); this file gives the same destination protocol to the
-# two source shapes that produce a dense array of known shape: a top-level
-# dotted call (including `@.`) and a top-level array slice `x[i, j...]`.
+# source shapes that produce a dense array of known shape: a top-level dotted
+# call (including `@.`), a top-level array slice `x[i, j...]`, and a top-level
+# lazy branch (`c ? a : b`, `if`/`elseif`/`else`) whose arms produce arrays.
+# Each arm of such a branch that is one of these shapes, or `zeros`/`ones`/
+# `fill` of integer dimensions, fills the recipe's buffer; the branch stays
+# lazy, so only the taken arm runs. A slice arm counts only beside an arm
+# that is an array by its syntax (a dotted call, `zeros`/`ones`/`fill`, a slice
+# by a range or `:`): `i > 0 ? x[i] : 0.0` reads a scalar and keeps its call.
+#
+# A dotted call nested inside such a source, as the argument of another call
+# (`minimum(x .- y)`) or inside a branch arm, fills a lane slot of its own. The
+# recipe's value releases every such slot it may hold (`_lane_release!`), so a
+# value that keeps the buffer (an opaque function returned it) is never
+# overwritten. Nested slots are free names the position driver binds
+# (`_CELL_SLOTS`); outside a position residual a nested call keeps its own
+# allocation.
 #
 # The recipe's native closure computes `_native_broadcast_materialize(bc)` or
 # `x[...]` from its captured source. The destination form evaluates the same
 # lazy broadcast or the same indices from that source and writes the result
-# into a matching recycled buffer (`_lane_broadcast`, `_lane_getindex`),
-# returning exactly the value the closure would. The source is reinterpreted
-# only when that is unambiguous:
+# into a matching recycled buffer (`_lane_broadcast`, `_lane_getindex`,
+# `_lane_zeros`, `_lane_ones`, `_lane_fill`), returning exactly the value the
+# closure would. The source is reinterpreted only when that is unambiguous:
 #
 # - the operation is an ordinary-mode `:fused` source closure without
-#   captures (an `on_error = :ignore` twin keeps its own stripped body);
+#   captures (an `on_error = :ignore` twin keeps its own stripped body), or
+#   the all-in-one closure of such a lazy branch (`_KernelBranch`);
 # - the closure's parameters name the recipe inputs positionally, so a
 #   composed (renamed) recipe maps by position, exactly as its call does;
 # - the source, after the native rewrite the closure itself received
-#   (`_kernel_native_body`), is a plain expression of calls, indexing, tuples
-#   and literals; every free name is a recipe input or a module binding
-#   defined at lowering, resolved as the closure resolves it (`GlobalRef`).
+#   (`_kernel_native_body`), is a plain expression of calls, indexing, tuples,
+#   literals, lazy branches and short-circuit operators; every free name is a
+#   recipe input or a module binding defined at lowering, resolved as the
+#   closure resolves it (`GlobalRef`).
 #
 # Anything else keeps the ordinary call, so this never changes which value is
 # computed; it changes only where a dense result is stored.
@@ -38,7 +54,7 @@ function _lane_source_closure(r::Recipe)
     # itself (selected by `on_error = :ignore`) does not, and its body differs.
     op.ignored_throws === nothing && return nothing
     r.source isa Expr || return nothing
-    f = _kernel_native_source(op.f)
+    f = _kernel_native_source(_lane_source_callable(op.f))
     fieldcount(typeof(f)) == 0 || return nothing
     candidates = methods(f)
     length(candidates) == 1 || return nothing
@@ -48,6 +64,25 @@ function _lane_source_closure(r::Recipe)
     allunique(params) || return nothing
     (f, params, parentmodule(typeof(f)))
 end
+
+# The source's names of the closure's parameters. A method stores a gensym
+# parameter without its `##` prefix (`var"##cell_invariant#7"`, the name a
+# lifted cell invariant reads by, is the parameter `cell_invariant#7`), so the
+# source may read a parameter by either spelling.
+function _lane_source_arguments(params, callargs)
+    arguments = Dict{Symbol,Any}(zip(params, callargs))
+    for (param, callarg) in zip(params, callargs)
+        name = string(param)
+        occursin('#', name) && !startswith(name, "##") || continue
+        get!(arguments, Symbol("##", name), callarg)
+    end
+    arguments
+end
+
+# A lazy branch runs its authored all-in-one closure (`_KernelBranch`); a branch
+# that preparation rebuilt from its parts (`_KernelBranchCall`) is no closure.
+_lane_source_callable(f) = f
+_lane_source_callable(branch::_KernelBranch) = branch.call
 
 function _lane_strip_lines(ex)
     ex isa Expr || return ex
@@ -74,7 +109,15 @@ _lane_has_macro(ex) = ex isa Expr &&
 struct _LaneSourceContext
     mod::Module
     arguments::Dict{Symbol,Any}
+    # The lane slots of nested dotted calls (`_lane_broadcast`), or `nothing`
+    # where they cannot be bound: a nested call then keeps its allocation.
+    nested::Union{Nothing,Vector{Symbol}}
 end
+_LaneSourceContext(mod, arguments) = _LaneSourceContext(mod, arguments, nothing)
+
+_lane_materialize_call(node) = node isa Expr && node.head === :call &&
+    length(node.args) == 2 &&
+    node.args[1] == _lane_source_ref(:_native_broadcast_materialize)
 
 # Rewrite one node of the native source: inputs become their call arguments,
 # other names `GlobalRef`s. `ends` holds the expressions that `end`/`begin`
@@ -118,7 +161,16 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
             push!(indices, rewritten)
         end
         return Expr(:ref, array, indices...)
-    elseif head in (:call, :tuple, :parameters, :...)
+    elseif head === :call && ctx.nested !== nothing && _lane_materialize_call(node)
+        # A nested dotted call fills its own lane slot.
+        lazy = _lane_source_node(ctx, node.args[2], ends)
+        lazy === nothing && return nothing
+        slot = gensym(:lane_nested)
+        push!(ctx.nested, slot)
+        return Expr(:call, _lane_source_ref(:_lane_broadcast), slot, lazy)
+    elseif head in (:call, :tuple, :parameters, :..., :if, :elseif, :&&, :||)
+        # Lazy branches and short-circuit operators keep their heads, so only
+        # the arm or operand Julia would evaluate runs.
         args = Any[]
         for arg in node.args
             rewritten = _lane_source_node(ctx, arg, ends)
@@ -131,32 +183,63 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
 end
 
 # The destination form of recipe `r`, whose arguments are `callargs`, filling
-# `recycled` (`_lower_with_ops`), or `nothing` for the ordinary call.
-function _lane_source_expr(r::Recipe, callargs, recycled)
+# `recycled` (`_lower_with_ops`), or `nothing` for the ordinary call. `nested`
+# collects the lane slots of nested dotted calls; it defaults to the cell slots
+# of the position residual being lowered (`_CELL_SLOTS`), and is `nothing`
+# outside one. The slots are added only when the form is returned.
+function _lane_source_expr(r::Recipe, callargs, recycled;
+        nested::Union{Nothing,Vector{Symbol}} =
+            get(task_local_storage(), _CELL_SLOTS, nothing))
     length(r.outputs) == 1 || return nothing
     closure = _lane_source_closure(r)
     closure === nothing && return nothing
     _, params, mod = closure
     source = _lane_expand_dot(_lane_strip_lines(r.source), mod)
     source isa Expr && !_lane_has_macro(source) || return nothing
-    native = _lane_strip_lines(_kernel_native_body(source, mod, Set{Symbol}(params)))
-    ctx = _LaneSourceContext(mod, Dict{Symbol,Any}(zip(params, callargs)))
-    if native isa Expr && native.head === :call && length(native.args) == 2 &&
-       native.args[1] == _lane_source_ref(:_native_broadcast_materialize)
-        lazy = _lane_source_node(ctx, native.args[2], nothing)
+    arguments = _lane_source_arguments(params, callargs)
+    native = _lane_strip_lines(_kernel_native_body(source, mod, Set{Symbol}(keys(arguments))))
+    slots = nested === nothing ? nothing : Symbol[]
+    ctx = _LaneSourceContext(mod, arguments, slots)
+    form = _lane_destination(ctx, native, recycled, nothing)
+    form === nothing && return nothing
+    expr, filled = form
+    held = slots === nothing ? Symbol[] : slots
+    filled || !isempty(held) || return nothing
+    nested === nothing || append!(nested, held)
+    isempty(held) && return expr
+    # The value releases every nested slot it may hold.
+    value = gensym(:lane_value)
+    Expr(:block, Expr(:(=), value, expr),
+         Expr(:call, _lane_source_ref(:_lane_release!), value, held...))
+end
+
+# `(expression, filled)`: `node` rewritten as `_lane_source_node` rewrites it,
+# where the shapes with a destination form fill `recycled` (`filled`), or
+# `nothing` outside the grammar. `slices`: whether a slice fills `recycled`,
+# `nothing` at the source's top level, where a slice always does. A branch
+# admits its slice arms only beside an arm that is an array by its syntax
+# (`_lane_array_syntax`), decided once for the whole branch.
+function _lane_destination(ctx::_LaneSourceContext, node, recycled,
+                           slices::Union{Nothing,Bool})
+    plain() = (rewritten = _lane_source_node(ctx, node, nothing);
+               rewritten === nothing ? nothing : (rewritten, false))
+    node isa Expr || return plain()
+    if _lane_materialize_call(node)
+        lazy = _lane_source_node(ctx, node.args[2], nothing)
         lazy === nothing && return nothing
-        return Expr(:call, _lane_source_ref(:_lane_broadcast), recycled, lazy)
-    elseif native isa Expr && native.head === :ref && length(native.args) >= 2
-        array = _lane_source_node(ctx, native.args[1], nothing)
+        return (Expr(:call, _lane_source_ref(:_lane_broadcast), recycled, lazy), true)
+    elseif node.head === :ref && length(node.args) >= 2
+        slices === false && return plain()
+        array = _lane_source_node(ctx, node.args[1], nothing)
         array === nothing && return nothing
-        any(index -> index isa Expr && index.head === :..., native.args[2:end]) &&
+        any(index -> index isa Expr && index.head === :..., node.args[2:end]) &&
             return nothing
         # `end`/`begin` in the k-th of n indices are `lastindex(x, k)` and
         # `firstindex(x, k)`, or the one-argument forms for a single index.
         held = gensym(:lane_array)
-        count = length(native.args) - 1
+        count = length(node.args) - 1
         indices = Any[]
-        for (k, index) in enumerate(native.args[2:end])
+        for (k, index) in enumerate(node.args[2:end])
             position = count == 1 ? () : (k,)
             ends = (Expr(:call, GlobalRef(Base, :lastindex), held, position...),
                     Expr(:call, GlobalRef(Base, :firstindex), held, position...))
@@ -164,12 +247,72 @@ function _lane_source_expr(r::Recipe, callargs, recycled)
             rewritten === nothing && return nothing
             push!(indices, rewritten)
         end
-        return Expr(:let, Expr(:(=), held, array),
-            Expr(:call, _lane_source_ref(:_lane_getindex), recycled, held, indices...))
+        return (Expr(:let, Expr(:(=), held, array),
+            Expr(:call, _lane_source_ref(:_lane_getindex), recycled, held, indices...)),
+            true)
+    elseif (fill = _lane_fill_call(ctx, node)) !== nothing
+        args = Any[]
+        for arg in node.args[2:end]
+            rewritten = _lane_source_node(ctx, arg, nothing)
+            rewritten === nothing && return nothing
+            push!(args, rewritten)
+        end
+        return (Expr(:call, _lane_source_ref(fill), recycled, args...), true)
+    elseif node.head in (:if, :elseif) && length(node.args) == 3
+        condition = _lane_source_node(ctx, node.args[1], nothing)
+        condition === nothing && return nothing
+        # The arms decide the slices of the whole branch, at its root.
+        arm_slices = slices === nothing ? _lane_array_syntax(ctx, node) : slices
+        arms = Any[]
+        filled = false
+        for arm in node.args[2:3]
+            form = _lane_destination(ctx, arm, recycled, arm_slices)
+            form === nothing && return nothing
+            push!(arms, first(form))
+            filled |= last(form)
+        end
+        return (Expr(node.head, condition, arms...), filled)
     end
-    nothing
+    plain()
+end
+
+# The destination name of `zeros`, `ones` or `fill` of Base, called without
+# keywords or splats, or `nothing`.
+function _lane_fill_call(ctx::_LaneSourceContext, node)
+    node isa Expr && node.head === :call && length(node.args) >= 2 || return nothing
+    any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :...), node.args) &&
+        return nothing
+    callee = node.args[1]
+    f = if callee isa Symbol
+        haskey(ctx.arguments, callee) && return nothing
+        isdefined(ctx.mod, callee) || return nothing
+        getglobal(ctx.mod, callee)
+    elseif callee isa GlobalRef
+        isdefined(callee.mod, callee.name) || return nothing
+        getglobal(callee.mod, callee.name)
+    else
+        return nothing
+    end
+    f === Base.zeros ? :_lane_zeros : f === Base.ones ? :_lane_ones :
+        f === Base.fill ? :_lane_fill : nothing
+end
+
+# Whether a branch has a leaf arm that is an array by its syntax: a dotted call,
+# `zeros`/`ones`/`fill`, or a slice by a range or `:`.
+function _lane_array_syntax(ctx::_LaneSourceContext, node)
+    node isa Expr || return false
+    node.head in (:if, :elseif) && length(node.args) == 3 &&
+        return any(arm -> _lane_array_syntax(ctx, arm), node.args[2:3])
+    _lane_materialize_call(node) && return true
+    _lane_fill_call(ctx, node) === nothing || return true
+    node.head === :ref || return false
+    colon(f) = f === :(:) || f isa GlobalRef && f.name === :(:)
+    any(node.args[2:end]) do index
+        colon(index) || index isa Expr && index.head === :call &&
+            !isempty(index.args) && colon(index.args[1])
+    end
 end
 
 # Whether a recipe has a destination form, independently of its call site.
-_lane_source_eligible(r::Recipe) =
-    _lane_source_expr(r, Any[gensym(:argument) for _ in r.inputs], :recycled) !== nothing
+_lane_source_eligible(r::Recipe) = _lane_source_expr(
+    r, Any[gensym(:argument) for _ in r.inputs], :recycled; nested = Symbol[]) !== nothing
