@@ -465,6 +465,7 @@ end
 
 _ao_part(groups, cells) = [findall(==(c), groups) for c in cells]
 _ao_gather(values, rows) = [values[r] for r in rows]
+_ao_code(values, levels) = [findfirst(isequal(v), levels) for v in values]
 
 # A derived response's raw data (snag rkppl-derived-re-79a3a684): a response
 # the graph gathers from data only it reads is absent when a design omits
@@ -514,6 +515,8 @@ _ao_gather(values, rows) = [values[r] for r in rows]
             @test _ao_refused(() -> prepare_query(built, d, preset), :y)
         end
         @test _ao_refused(() -> prepare_sampler(built, d, u; backend = _AO_BACKEND), :y)
+        # The refusal names the data to supply: the model computes `y`.
+        @test_throws "Supply `yraw`" prepare_query(built, d, :likelihood)
         # Supplying the raw data again observes the response.
         yraw = collect(range(-0.5, 0.5; length = length(design[:x])))
         rebound = bind_data(d, merge(design, Dict{Symbol,Any}(:yraw => yraw)))
@@ -542,6 +545,40 @@ _ao_gather(values, rows) = [values[r] for r in rows]
     @test _ao_refused(() -> prepare_query(built, d, :likelihood), :y)
     @test _ao_eval(prepare_query(built, fit, :likelihood), v) ≈
         sum(logpdf.(Normal.(0.2 .- 0.7 .* X, 0.9), 0.3 .* X)) rtol = 1e-12
+
+    # Categories coded in the graph (an ordinal response's levels): the
+    # absent response keeps the integer type the program declares.
+    src = quote
+        b ~ Normal(0, 1)
+        eta = b .* x
+        k = _ao_code(k_raw, [1, 2, 3])
+        c ~ Ordered(Normal(0, 1), 2)
+        k .~ OrderedLogistic.(eta, Ref(c))
+    end
+    direct = quote
+        b ~ Normal(0, 1)
+        eta = b .* x
+        c ~ Ordered(Normal(0, 1), 2)
+        k .~ OrderedLogistic.(eta, Ref(c))
+    end
+    X = _ao_x(8)
+    data = Dict{Symbol,Any}(:x => X, :k_raw => [1, 2, 3, 1, 2, 3, 1, 2])
+    fit = bind_data(lower_rkppl(src, data; conditioned = (:k,), mod = @__MODULE__), data)
+    built = build_kernel(fit)
+    d = bind_data(fit, Dict{Symbol,Any}(:x => X[1:3]))
+    @test ReactiveKernelsPPL._absent_observations(d) == [:k]
+    v = [0.7, 0.1, 0.4]
+    @test _ao_eval(_ao_prepare(built, d, (:eta,)), v) ≈
+        constrain(built.layout, v).b .* X[1:3] rtol = 1e-12
+    @test _ao_eval(prepare_query(built, d, :prior), v) ≈
+        _ao_eval(prepare_query(built, fit, :prior), v) rtol = 1e-12
+    @test _ao_refused(() -> prepare_query(built, d, :sampler), :k)
+    @test_throws "Supply `k_raw`" prepare_query(built, d, :sampler)
+    rebound = bind_data(d, Dict{Symbol,Any}(:x => X[1:3], :k_raw => [3, 1, 2]))
+    own = bind_data(lower_rkppl(direct, (:x, :k); conditioned = (:k,), mod = @__MODULE__),
+        Dict{Symbol,Any}(:x => X[1:3], :k => [3, 1, 2]))
+    @test _ao_eval(prepare_query(built, rebound, :sampler), v) ≈
+        _ao_eval(prepare_query(build_kernel(own), own, :sampler), v) rtol = 1e-12
 
     # Raw data another value reads stays required: only observation data
     # may be absent.
