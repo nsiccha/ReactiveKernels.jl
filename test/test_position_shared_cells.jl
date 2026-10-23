@@ -31,6 +31,15 @@ end
     end
     return cells
 end
+# A destructured opaque call.
+pair(t) = (CALLS[] += 1; (cumsum(t), length(t)))
+@kernel destructured_cell(ts, eta, theta) = begin
+    cells = plate(ts, eta) do t, e
+        (c, n) = pair(t)
+        sum(c) * (theta + e) + n
+    end
+    return cells
+end
 # An inline call inside the cell's result.
 @kernel inline_cell(ts, eta, theta) = begin
     cells = plate(ts, eta) do t, e
@@ -116,6 +125,7 @@ readers(scalar) = (
     for (spec, have, args) in (
             (named_cell, (:ts, :eta, :theta), (ts,)),
             (record_cell, (:ts, :eta, :theta), (ts,)),
+            (destructured_cell, (:ts, :eta, :theta), (ts,)),
             (inline_cell, (:ts, :eta, :theta), (ts,)),
             (several_cell, (:ts, :w, :eta, :theta), (ts, w)))
         scalar = prepare(spec; have, want = :cells)
