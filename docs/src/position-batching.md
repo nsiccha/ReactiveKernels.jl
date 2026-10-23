@@ -229,8 +229,20 @@ position. Slots never leave the call, and every WANT is copied into the stacked
 result before the next position runs, so values, container types and errors
 are those of the scalar kernel. For example, a superposition plate whose output
 is sliced, scanned, mapped with `@.` and reduced with `minimum` allocates no
-per-position storage in a borrowed reader. A source recipe of any other shape,
-one whose source captures a local variable, or one prepared with
+per-position storage in a borrowed reader.
+
+A recipe whose source is a top-level lazy branch (`c ? a : b`,
+`if`/`elseif`/`else`) whose arms produce arrays fills its lane slot from
+whichever arm runs: an arm that is a dotted call, a slice, or `zeros`, `ones`
+or `fill` of integer dimensions writes into the buffer, and the branch stays
+lazy, so `isempty(c) ? zeros(length(idx)) : c[idx]` reads `c[idx]` only when
+it is taken. A slice arm counts only beside an arm that is an array by its
+syntax (a dotted call, `zeros`/`ones`/`fill`, a slice by a range or `:`), so
+`i > 0 ? x[i] : 0.0` keeps its ordinary call. A dotted call nested in another
+call of a source, as in `minimum(100 .* (v .- b))` or inside a branch arm,
+keeps a lane slot of its own; the recipe's value releases that slot when it
+may hold the buffer (an opaque function returned it). A source recipe of any
+other shape, one whose source captures a local variable, or one prepared with
 `on_error = :ignore` keeps its ordinary call; such recipes, opaque functions,
 concatenations and matrix products allocate as they do in the scalar kernel.
 A reduction usually reads its argument's buffer. Eligible terminal minima
@@ -248,9 +260,17 @@ therefore allocates none of them per group. The cell's result is stored by
 reference in the plate's output. A result that shares memory with a slot's
 buffer, or holds it (an opaque function returned the buffer or a view of it, a
 tuple or array contains it), takes that buffer with it, and the next cell
-allocates afresh, so every stored result keeps its values. Each cell's result,
-the values of opaque functions and the work inside scan steps still allocate
-as in the scalar kernel. A prepared scalar kernel, including one prepared for
+allocates afresh, so every stored result keeps its values. A plate at the
+residual's top level keeps those buffers per cell: a stored result is dead
+once the plate runs again (every WANT is stored by value), so cell `k` of the
+next position, or of a borrowed reader's next call, refills the buffers its
+result held. A subject cell that returns its per-observation predictions, or a
+tuple holding them, therefore allocates them only at a reader's first call. A
+plate inside another plate's cell runs once per outer cell, whose stored result
+may still hold its cells, so its cells' results still allocate, as do the
+values of opaque functions and the work inside scan steps. One slot serves all
+the cells of a plate: a cell of another shape than the cell before it
+allocates afresh. A prepared scalar kernel, including one prepared for
 reverse-mode AD, keeps allocating its cell values at every cell.
 
 By default every call owns fresh stacked output arrays, including record

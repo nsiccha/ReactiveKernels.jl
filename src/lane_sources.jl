@@ -45,8 +45,9 @@
 _lane_source_ref(name) = GlobalRef(@__MODULE__, name)
 
 # `(native closure, parameter names, module)` of an eligible source operation,
-# or `nothing`.
-function _lane_source_closure(r::Recipe)
+# or `nothing`. `branches`: whether a lazy branch's all-in-one closure counts
+# (`_lane_source_expr` only; the slice and window analyses read other shapes).
+function _lane_source_closure(r::Recipe; branches::Bool = false)
     op = r.op
     op isa _KernelSourceOp || return nothing
     kernel_sourceop_form(op) === :fused || return nothing
@@ -54,6 +55,7 @@ function _lane_source_closure(r::Recipe)
     # itself (selected by `on_error = :ignore`) does not, and its body differs.
     op.ignored_throws === nothing && return nothing
     r.source isa Expr || return nothing
+    branches || !(op.f isa _KernelBranch) || return nothing
     f = _kernel_native_source(_lane_source_callable(op.f))
     fieldcount(typeof(f)) == 0 || return nothing
     candidates = methods(f)
@@ -112,8 +114,11 @@ struct _LaneSourceContext
     # The lane slots of nested dotted calls (`_lane_broadcast`), or `nothing`
     # where they cannot be bound: a nested call then keeps its allocation.
     nested::Union{Nothing,Vector{Symbol}}
+    # Whether lazy branches and short-circuit operators are in the grammar
+    # (`_lane_source_expr`); other rewrites keep the plain grammar.
+    lazy::Bool
 end
-_LaneSourceContext(mod, arguments) = _LaneSourceContext(mod, arguments, nothing)
+_LaneSourceContext(mod, arguments) = _LaneSourceContext(mod, arguments, nothing, false)
 
 _lane_materialize_call(node) = node isa Expr && node.head === :call &&
     length(node.args) == 2 &&
@@ -168,7 +173,8 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
         slot = gensym(:lane_nested)
         push!(ctx.nested, slot)
         return Expr(:call, _lane_source_ref(:_lane_broadcast), slot, lazy)
-    elseif head in (:call, :tuple, :parameters, :..., :if, :elseif, :&&, :||)
+    elseif head in (:call, :tuple, :parameters, :...) ||
+           ctx.lazy && head in (:if, :elseif, :&&, :||)
         # Lazy branches and short-circuit operators keep their heads, so only
         # the arm or operand Julia would evaluate runs.
         args = Any[]
@@ -191,7 +197,7 @@ function _lane_source_expr(r::Recipe, callargs, recycled;
         nested::Union{Nothing,Vector{Symbol}} =
             get(task_local_storage(), _CELL_SLOTS, nothing))
     length(r.outputs) == 1 || return nothing
-    closure = _lane_source_closure(r)
+    closure = _lane_source_closure(r; branches = true)
     closure === nothing && return nothing
     _, params, mod = closure
     source = _lane_expand_dot(_lane_strip_lines(r.source), mod)
@@ -199,7 +205,7 @@ function _lane_source_expr(r::Recipe, callargs, recycled;
     arguments = _lane_source_arguments(params, callargs)
     native = _lane_strip_lines(_kernel_native_body(source, mod, Set{Symbol}(keys(arguments))))
     slots = nested === nothing ? nothing : Symbol[]
-    ctx = _LaneSourceContext(mod, arguments, slots)
+    ctx = _LaneSourceContext(mod, arguments, slots, true)
     form = _lane_destination(ctx, native, recycled, nothing)
     form === nothing && return nothing
     expr, filled = form

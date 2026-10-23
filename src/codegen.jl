@@ -6693,8 +6693,8 @@ end
 # These walks run on every borrowed call, over every input. They unroll tuples
 # by their type and loop over arrays, so the walk allocates nothing: `any` with
 # a closure over a heterogeneous tuple dispatched and boxed at every element
-# (about two million allocations per call over a ragged population design,
-# snag reuse-readers-al-25b23112).
+# (over a million allocations per call over a ragged population design, snag
+# reuse-readers-al-25b23112).
 function _replicated_alias(cache::AbstractArray, arg::AbstractArray)
     Base.mightalias(cache, arg) && return true
     _replicated_may_contain_array(eltype(arg)) || return false
