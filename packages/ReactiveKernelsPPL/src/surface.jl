@@ -1759,19 +1759,10 @@ function _desugar_destructuring(stmts)
     return out
 end
 
-# Element `i` of `(a, b, …) = value`: what Julia's lowering binds through
-# `Base.indexed_iterate`. Tuples, named tuples and arrays read it directly.
-@inline _destructure_element(value::Union{Tuple,NamedTuple}, i::Int) =
-    getfield(value, i)
-@inline _destructure_element(value::AbstractArray, i::Int) =
-    value[firstindex(value) + i - 1]
-function _destructure_element(value, i::Int)
-    item, state = Base.indexed_iterate(value, 1)
-    for k in 2:i
-        item, state = Base.indexed_iterate(value, k, state)
-    end
-    return item
-end
+# Element `i` of `(a, b, …) = value`, what Julia's lowering binds through
+# `Base.indexed_iterate`: the same read RK splits a destructuring into inside a
+# plate cell.
+const _destructure_element = ReactiveKernels._kernel_destructure_element
 
 # The `(rhs, i)` of a destructured element read, or `nothing`.
 _destructured_read(ex) = nothing
