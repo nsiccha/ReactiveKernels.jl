@@ -22,8 +22,13 @@
 mutable struct _StructuralCache
     const lock::ReentrantLock
     entries::IdDict{Any,Any}
+    # Name sets and column tables this lowering keyed, each with its id
+    # (`_signature_id`): `(kind, hash, length) => [signature => id]`.
+    signatures::Dict{Tuple{Symbol,UInt,Int},Vector{Pair{Any,Int}}}
+    nsignatures::Int
 end
-_StructuralCache() = _StructuralCache(ReentrantLock(), IdDict{Any,Any}())
+_StructuralCache() = _StructuralCache(ReentrantLock(), IdDict{Any,Any}(),
+    Dict{Tuple{Symbol,UInt,Int},Vector{Pair{Any,Int}}}(), 0)
 
 # Entries per lowering. A lowering rebound to designs whose sized fields
 # differ (other level counts) adds entries per design; past this many the
@@ -61,7 +66,6 @@ end
 # Names in a canonical order, for keys. A Symbol is interned for the life of
 # the process, so its identity orders it stably and compares as an integer.
 _sorted_names(names) = Tuple(sort!(collect(Symbol, names); by = objectid))
-_sorted_roles(roles) = Tuple(sort!(collect(roles); by = first))
 
 # Every field but the anchor and the per-call facets, by identity. Binding
 # interns the fields it rebuilds (`_interned`), so equal ones are identical.
@@ -70,17 +74,66 @@ _sorted_roles(roles) = Tuple(sort!(collect(roles); by = first))
         if f ∉ (:assignments, :columns, :n_obs))...)
 end
 
-_column_types(columns) =
-    Tuple(sort!([k => typeof(v) for (k, v) in columns]; by = objectid ∘ first))
+# A set of names, or a column table's names with each value's type, as an
+# integer: one lowering gives equal signatures one id, so a key holding it
+# compares and hashes as an integer. Building a sorted tuple for every key
+# cost more than many of the analyses it keyed (snag
+# `bind-data-per-de-d92f13be`). One pass hashes the signature; a hit is
+# compared with the stored signature, so two signatures never share an id.
+# Ids are never reused, so emptying the table (past the entry limit) keeps
+# every live key exact.
+function _signature_id(same, stored, cache::_StructuralCache, key::Tuple{Symbol,UInt,Int})
+    lock(cache.lock) do
+        bucket = get!(Vector{Pair{Any,Int}}, cache.signatures, key)
+        for (signature, id) in bucket
+            same(signature) && return id
+        end
+        length(cache.signatures) >= _STRUCTURAL_CACHE_LIMIT && empty!(cache.signatures)
+        id = cache.nsignatures += 1
+        push!(get!(Vector{Pair{Any,Int}}, cache.signatures, key), stored() => id)
+        return id
+    end
+end
+
+# Names of a set (each once).
+function _names_id(cache::_StructuralCache, names::AbstractSet{Symbol})
+    h = UInt(0)
+    for n in names
+        h ⊻= hash(n)
+    end
+    return _signature_id(s -> length(s) == length(names) && all(in(s), names),
+        () -> Set{Symbol}(names), cache, (:names, h, length(names)))
+end
+# Outside binding nothing is cached, and a key is never read.
+_names_id(plan::StructuralPlan, names) =
+    _structural_enabled() ? _names_id(_structural_cache(plan), names) : nothing
+
+# A table's names with `signature(value)` per name, compared by identity:
+# a column table's value types (`:types`), the roles binding assigns
+# (`:roles`). Hashed by its names alone: hashing a type (`objectid` of a
+# parametric array type) costs more than comparing the few signatures that
+# share the names.
+function _table_id(cache::_StructuralCache, table::AbstractDict{Symbol}, kind::Symbol,
+        signature)
+    names = _names_id(cache, keys(table))
+    same(s::Dict{Symbol,Any}) =
+        all(k -> get(s, k, _UNCACHED) === signature(table[k]), keys(table))
+    return _signature_id(same, () -> Dict{Symbol,Any}(k => signature(table[k]) for k in keys(table)),
+        cache, (kind, UInt(names), length(table)))
+end
+_types_id(cache::_StructuralCache, columns::AbstractDict{Symbol}) =
+    _table_id(cache, columns, :types, typeof)
+_roles_id(plan::StructuralPlan, roles::AbstractDict{Symbol,Symbol}) =
+    _structural_enabled() ? _table_id(_structural_cache(plan), roles, :roles, identity) : nothing
 
 # The structure `plan`'s analyses read. `columns` chooses what of the column
 # table: `:none` (an analysis that reads none of it), `:names` (the column
 # names, no value), `:types` (the names and each value's type) or
 # `:identity` (the table itself).
-function _structural_key(plan::StructuralPlan; columns::Symbol = :names,
-        n_obs::Bool = false)
-    cols = columns === :names ? _sorted_names(keys(plan.columns)) :
-        columns === :types ? _column_types(plan.columns) :
+function _structural_key(cache::_StructuralCache, plan::StructuralPlan;
+        columns::Symbol = :names, n_obs::Bool = false)
+    cols = columns === :names ? _names_id(cache, keys(plan.columns)) :
+        columns === :types ? _types_id(cache, plan.columns) :
         columns === :identity ? plan.columns :
         columns === :none ? nothing : throw(ArgumentError("columns = $columns"))
     return (_structure_fields(plan), cols, n_obs ? plan.n_obs : nothing)
@@ -117,7 +170,7 @@ function _structural(f, plan::StructuralPlan, tag::Tuple;
         same = isequal)
     _structural_enabled() || return f()
     cache = _structural_cache(plan)
-    key = (tag, _structural_key(plan; columns, n_obs))
+    key = (tag, _structural_key(cache, plan; columns, n_obs))
     hit = lock(() -> get(cache.entries, key, _UNCACHED), cache.lock)
     if hit !== _UNCACHED
         _STRUCTURAL_CACHE_CHECK[] && !same(_analysis(f, columns), hit) && error(
@@ -199,6 +252,26 @@ function _interned(plan::StructuralPlan, id::Tuple, value)
     _structural_enabled() || return value
     cache = _structural_cache(plan)
     return lock(() -> get!(cache.entries, (:interned, id), value), cache.lock)
+end
+
+# ── Values of one binding ───────────────────────────────────────────
+#
+# Checks of one binding read some values of a bound column more than once:
+# every gather along a `levels(g)` axis looks its labels up in the levels of
+# `g`. `_bind_memo` computes each once per `bind_data` call. No step mutates
+# a column while binding, so the column's identity keys its value.
+
+const _BIND_MEMO = :rkppl_bind_memo
+
+_with_bind_memo(f) = task_local_storage(f, _BIND_MEMO, IdDict{Any,Any}())
+
+"""`f()`, a value of the bound column `col` that `tag` names: once per
+binding while `bind_data` runs, computed afresh elsewhere. The value is
+shared within the binding, so callers only read it."""
+function _bind_memo(f, tag::Symbol, col)
+    memo = get(task_local_storage(), _BIND_MEMO, nothing)
+    memo === nothing && return f()
+    return get!(f, memo::IdDict{Any,Any}, (tag, col))
 end
 
 # A cached value is shared; each caller gets its own mutable containers.

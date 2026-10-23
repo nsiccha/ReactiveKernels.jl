@@ -117,7 +117,7 @@ function _array_axis_levels(plan::StructuralPlan, name::Symbol, label, d::Expr)
 end
 
 function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d;
-        active = Set{Symbol}())
+        active::Union{Set{Symbol},Nothing} = nothing)
     d isa Int && return d
     if _is_levels_dim(d)
         levels = _array_axis_levels(plan, name, label, d)
@@ -142,7 +142,7 @@ function _array_dim_size(plan::StructuralPlan, name::Symbol, label, d;
     if !haskey(plan.columns, M)
         # Sizing a declared axis needs the shape: a proved conflict in the
         # definition of M is Julia's dimension error, not a missing matrix.
-        shape = _value_axes(plan, M, active; data_axes = true,
+        shape = _value_axes(plan, M, something(active, Set{Symbol}()); data_axes = true,
             throw_conflicts = true)
         # Julia supplies singleton dimensions beyond an array's rank.
         shape === nothing || return k <= length(shape) ? shape[k] : 1
@@ -311,7 +311,14 @@ end
 # ── data validation ──────────────────────────────────────────────────
 
 function _validate_array_parameters_data(plan::StructuralPlan)
-    known = union(_all_name_set(plan), Set{Symbol}(keys(plan.columns)))
+    names = _all_name_set(plan)
+    known(n) = n in names || haskey(plan.columns, n)
+    # Whether every name the priors read is known: once per structure and
+    # column names. When one is not, the loop below names it.
+    reads_known = _structural(plan, (:array_prior_reads_known,)) do
+        all(p -> all(known, (n for a in values(p.args) for n in _expr_value_symbols(a))),
+            plan.array_parameters)
+    end
     for p in plan.array_parameters
         dims = _array_dims(plan, p)
         p.family === :external && continue
@@ -324,7 +331,7 @@ function _validate_array_parameters_data(plan::StructuralPlan)
                 "$(p.name) is not square: $(repr(dims))")
             eta = p.args.arg1
             if eta isa Symbol
-                eta in known || _fail(p.label, "LKJCholesky factor " *
+                known(eta) || _fail(p.label, "LKJCholesky factor " *
                     "$(p.name) references unknown eta $eta")
                 if haskey(plan.columns, eta)
                     v = plan.columns[eta]
@@ -339,9 +346,11 @@ function _validate_array_parameters_data(plan::StructuralPlan)
             continue
         end
         _is_structured_array(p) && continue
-        for (key, arg) in pairs(p.args), name in _expr_value_symbols(arg)
-            name in known || _fail(p.label,
-                "array $(p.name) prior $key references unknown name $name")
+        if !reads_known
+            for (key, arg) in pairs(p.args), name in _expr_value_symbols(arg)
+                known(name) || _fail(p.label,
+                    "array $(p.name) prior $key references unknown name $name")
+            end
         end
         for (k, a) in pairs(p.args)
             n = _array_arg_size(plan, a)
@@ -716,11 +725,10 @@ function _value_metadata(plan::StructuralPlan, ex, seen::Set{Symbol};
             end
         end
         any(p -> p.name === ex, plan.parameters) && return _OS.scalar_info(Float64)
-        definitions = data_axes ? (plan.assignments..., plan.derived...) : plan.assignments
-        j = findfirst(a -> a.name === ex, definitions)
-        j === nothing && return _OS.ValueInfo()
+        d = _find_definition(plan, ex; derived = data_axes)
+        d === nothing && return _OS.ValueInfo()
         push!(seen, ex)
-        r = _value_metadata(plan, definitions[j].expr, seen; data_axes,
+        r = _value_metadata(plan, d.expr, seen; data_axes,
             throw_conflicts)
         delete!(seen, ex)
         return r
@@ -1071,14 +1079,19 @@ end
 function _validate_positional_gather(plan::StructuralPlan, name::Symbol,
         label, g::Symbol, K::Union{Int,Nothing})
     col = _gather_index_column(plan, name, label, g)
-    eltype(col) <: Integer && eltype(col) !== Bool || _fail(label,
+    _holds_integers(col) || _fail(label,
         "`$name[$g]` indexes $name by position, but $g does not hold " *
         "integers — declare an axis `levels($g)` to look values up by level")
-    all(i -> i >= 1 && (K === nothing || i <= K), col) || _fail(label,
+    _within_positions(col, K) || _fail(label,
         "`$name[$g]`: $g holds indices outside " *
         (K === nothing ? "the positive integers" : "1:$K"))
     return nothing
 end
+
+# Function barriers: one dispatch on the column's type, not one per test.
+_holds_integers(col::AbstractArray{T}) where {T} = T <: Integer && T !== Bool
+_within_positions(col::AbstractArray, K::Union{Int,Nothing}) =
+    all(i -> i >= 1 && (K === nothing || i <= K), col)
 
 # Array-valued expressions (`sd .* z`, `L[:, 1]`, `phi[1] * 2`): every
 # leaf is a literal, a scalar name or an array parameter (never a

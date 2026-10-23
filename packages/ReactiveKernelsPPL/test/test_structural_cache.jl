@@ -6,8 +6,9 @@ using ReactiveKernels, ReactiveKernelsPPL, Test
 # many designs costs each design's data work (snag rkppl-bind-data-deb7f5e5:
 # a 70-statement BRM program bound in about 8.5 ms whatever the data size).
 # The cache is internal; these tests pin that a cached binding equals an
-# uncached one, that rebinding adds no analyses, and that the cache lives
-# only as long as its lowering.
+# uncached one, that rebinding adds no analyses, that keys are exact, that a
+# binding computes a value of a column once, and that the cache lives only
+# as long as its lowering.
 
 const _SCACHE = ReactiveKernelsPPL
 
@@ -184,6 +185,81 @@ const _SCACHE_LEAVES = [
             # The valid design still binds after the failure.
             @test bind_data(unbound, good) isa _SCACHE.StructuralPlan
         end
+    end
+end
+
+# Keys hold a column table's names (and value types) as an interned id, not
+# a sorted tuple built per key (snag bind-data-per-de-d92f13be).
+@testset "structural cache: signature ids are exact" begin
+    cache = _SCACHE._StructuralCache()
+    t1 = Dict{Symbol,Any}(:a => 1.0, :b => [1, 2])
+    t2 = Dict{Symbol,Any}(:b => [3, 4, 5], :a => 2.0)
+    t3 = Dict{Symbol,Any}(:a => 1, :b => [1, 2])
+    @test _SCACHE._types_id(cache, t1) == _SCACHE._types_id(cache, t2)
+    @test _SCACHE._types_id(cache, t1) != _SCACHE._types_id(cache, t3)
+    @test _SCACHE._types_id(cache, t1) != _SCACHE._types_id(cache, Dict{Symbol,Any}(:a => 1.0))
+    r1 = Dict(:a => :data, :b => :response)
+    roles(r) = _SCACHE._table_id(cache, r, :roles, identity)
+    @test roles(r1) == roles(Dict(:b => :response, :a => :data))
+    @test roles(r1) != roles(Dict(:a => :predictor, :b => :response))
+    @test roles(r1) != _SCACHE._types_id(cache, Dict{Symbol,Any}(:a => 1.0, :b => [1, 2]))
+    @test _SCACHE._names_id(cache, keys(t3)) == _SCACHE._names_id(cache, Set([:b, :a]))
+    @test _SCACHE._names_id(cache, Set([:a])) != _SCACHE._names_id(cache, Set([:a, :b]))
+    # Signatures that share a hash keep their own ids: the stored signature
+    # decides.
+    key = (:probe, UInt(7), 1)
+    id = _SCACHE._signature_id(==(:x), () -> :x, cache, key)
+    @test _SCACHE._signature_id(==(:x), () -> :x, cache, key) == id
+    @test _SCACHE._signature_id(==(:y), () -> :y, cache, key) ∉ (id, nothing)
+end
+
+@testset "structural cache: a binding computes a column's value once" begin
+    calls = Ref(0)
+    col = ["b", "a", "b"]
+    levels_of(c) = () -> (calls[] += 1; sort!(unique(c)))
+    # Outside a binding every call computes.
+    @test _SCACHE._bind_memo(levels_of(col), :levels, col) == ["a", "b"]
+    @test _SCACHE._bind_memo(levels_of(col), :levels, col) == ["a", "b"]
+    @test calls[] == 2
+    calls[] = 0
+    other = copy(col)
+    _SCACHE._with_bind_memo() do
+        @test _SCACHE._bind_memo(levels_of(col), :levels, col) == ["a", "b"]
+        @test _SCACHE._bind_memo(levels_of(col), :levels, col) == ["a", "b"]
+        # Another column, equal or not, has its own value.
+        @test _SCACHE._bind_memo(levels_of(other), :levels, other) == ["a", "b"]
+    end
+    @test calls[] == 2
+    # Each binding starts afresh.
+    _SCACHE._with_bind_memo(() -> _SCACHE._bind_memo(levels_of(col), :levels, col))
+    @test calls[] == 3
+end
+
+# An absent response holding one array per index is sized from the arrays
+# its cells read; its operands still validate, whether each index's array
+# has its cell's axes (read as it is) or broadcasts into them.
+@testset "structural cache: an absent response's per-index operands validate" begin
+    src = quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        @plate for i in eachindex(y)
+            y[i] .~ censored.(Normal.(a .+ x[i], s), lo[i], Inf)
+        end
+    end
+    x = [[0.1, 0.2], [0.3], [0.4, 0.5, 0.6]]
+    fit = Dict{Symbol,Any}(:x => x, :y => [[1.0, 2.0], [3.0], [4.0, 5.0, 6.0]],
+        :lo => [[-1.0, -1.0], [-1.0], fill(-1.0, 3)])
+    plan = lower_rkppl(src, fit; conditioned = (:y,), mod = @__MODULE__)
+    bind_data(plan, fit)
+    for lo in ([[-1.0, -0.5], [-1.0], [-1.0, -2.0, -1.0]], [[-1.0], [-1.0], [-2.0]])
+        d = Dict{Symbol,Any}(:x => x, :lo => lo)
+        b, r = bind_data(plan, d), _scache_uncached(plan, d)
+        @test b.columns[:y] isa _SCACHE._Absent
+        @test isequal(b.columns, r.columns)
+        @test _scache_program(b) == _scache_program(r)
+        bad = [copy(c) for c in lo]
+        bad[2][1] = NaN
+        @test_throws "finite numerics" bind_data(plan, Dict{Symbol,Any}(:x => x, :lo => bad))
     end
 end
 
