@@ -100,6 +100,7 @@ const _MATRIX_CORE_TESTS = (
     "test_position_batching_allocation_slices.jl",
     "test_position_lane_scratch.jl",
     "test_position_cell_lane_slots.jl",
+    "test_position_shared_cells.jl",
     "test_kernel_stateful.jl",
     "test_kernel_methodir.jl",
     "test_kernel_factory.jl",
