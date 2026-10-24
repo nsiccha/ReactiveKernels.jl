@@ -37,9 +37,11 @@
 #   composed (renamed) recipe maps by position, exactly as its call does;
 # - the source, after the native rewrite the closure itself received
 #   (`_kernel_native_body`), is a plain expression of calls, indexing, tuples,
-#   literals, lazy branches and short-circuit operators; every free name is a
-#   recipe input or a module binding defined at lowering, resolved as the
-#   closure resolves it (`GlobalRef`).
+#   literals, subtype tests (`a <: b`, `a >: b`), type applications (`A{B}`),
+#   lazy branches and short-circuit operators; every free name is a recipe
+#   input or a module binding defined at lowering, resolved as the closure
+#   resolves it (`GlobalRef`), and a subtype test calls the `<:` or `>:` its
+#   module resolves, as Julia's lowering does.
 #
 # Anything else keeps the ordinary call, so this never changes which value is
 # computed; it changes only where a dense result is stored.
@@ -315,6 +317,24 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
         slot = gensym(:lane_nested)
         push!(ctx.nested, slot)
         return Expr(:call, _lane_source_ref(:_lane_reduce_vcat), slot, cells)
+    elseif head in (:<:, :>:) && length(node.args) == 2
+        # Julia lowers `a <: b` to a call of the `<:` its module resolves. The
+        # one-operand form is a bound in a type application, outside the grammar.
+        args = Any[_lane_source_node(ctx, arg, ends) for arg in (head, node.args...)]
+        any(isnothing, args) && return nothing
+        return Expr(:call, args...)
+    elseif head === :curly
+        # Julia lowers `A{B}` to `Core.apply_type` and `A{<:B}` to a `where`
+        # type, in any module: keep the syntax over the rewritten operands.
+        args = Any[]
+        for arg in node.args
+            bound = arg isa Expr && arg.head in (:<:, :>:)
+            bound && length(arg.args) != 1 && return nothing
+            rewritten = _lane_source_node(ctx, bound ? only(arg.args) : arg, ends)
+            rewritten === nothing && return nothing
+            push!(args, bound ? Expr(arg.head, rewritten) : rewritten)
+        end
+        return Expr(:curly, args...)
     elseif head in (:call, :tuple, :parameters, :...) ||
            ctx.lazy && head in (:if, :elseif, :&&, :||)
         # Lazy branches and short-circuit operators keep their heads, so only

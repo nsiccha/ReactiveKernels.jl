@@ -3910,7 +3910,69 @@ function _traceable_definition(def, mod::Module)
     end
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
     ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
-    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., callee))
+    source = _traceable_source_method(callee, formals, wheres, body, mod)
+    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., source..., callee))
+end
+
+"""
+    @_record_source f(args...) = body
+    @_record_source function f(args...) ... end
+
+Define the method as written and record its source for source-reading
+compilers (`jax_source`), as [`@traceable`](@ref) records it, without the
+`traced` companion: native and traced execution stay exactly the method's.
+For a helper whose compiled form is authored in place (`ReactantCore.@trace`
+control flow) rather than rewritten.
+"""
+macro _record_source(def)
+    def isa Expr && def.head in (:(=), :function) && length(def.args) == 2 ||
+        throw(ArgumentError("@_record_source expects a method definition; got `$(def)`."))
+    signature = def.args[1]
+    wheres = Any[]
+    while signature isa Expr && signature.head === :where
+        push!(wheres, signature.args[2:end])
+        signature = signature.args[1]
+    end
+    signature isa Expr && signature.head === :(::) && (signature = signature.args[1])
+    signature isa Expr && signature.head === :call ||
+        throw(ArgumentError("@_record_source expects a method definition; got `$(def)`."))
+    body = _traceable_tail_body(def.args[2], signature)
+    source = _traceable_source_method(signature.args[1], signature.args[2:end], wheres, body,
+                                      __module__)
+    esc(Expr(:block, def, source..., signature.args[1]))
+end
+
+"""
+    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module) or nothing
+
+The authored source of the `@traceable` method of `f` that arguments of
+`argument_types` call: its formal names, its body and the module the body's
+globals resolve in. Source-reading compilers (`jax_source`) translate the
+helper from it. `nothing` for a function without a `@traceable` method.
+"""
+_traceable_source(@nospecialize(args...)) = nothing
+
+# A method of `_traceable_source` over the argument TYPES, with the method's own
+# formals as type bounds, so dispatch selects the source of the method that
+# values of those types call. Defaulted, splatted and destructured formals
+# record no source.
+function _traceable_source_method(callee, formals, wheres, body, mod)
+    params = Any[]
+    names = Symbol[]
+    for formal in formals
+        formal isa Symbol && (push!(params, :(::Type)); push!(names, formal); continue)
+        formal isa Expr && formal.head === :(::) && length(formal.args) == 2 &&
+            formal.args[1] isa Symbol || return Any[]
+        push!(params, Expr(:(::), Expr(:curly, :Type, Expr(:<:, formal.args[2]))))
+        push!(names, formal.args[1])
+    end
+    signature = Expr(:call, GlobalRef(@__MODULE__, :_traceable_source),
+                     Expr(:(::), Expr(:curly, :Type, Expr(:call, GlobalRef(Core, :typeof), callee))),
+                     params...)
+    for layer in reverse(wheres)
+        signature = Expr(:where, signature, layer...)
+    end
+    Any[Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod))]
 end
 
 # The body with its tail-position `return`s replaced by their values: the

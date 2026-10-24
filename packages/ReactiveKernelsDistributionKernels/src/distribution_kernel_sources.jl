@@ -55,6 +55,10 @@ using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
 # own). Endpoint guards and reflection use lazy branches, including their
 # derivative work. Tail selection only selects between already valid values.
 #
+# `@_record_source` keeps the source of these helpers for `jax_source`, whose
+# `jax.grad` differentiates the continued fraction (`jax.scipy.special.betainc`
+# has no derivative in its shape parameters).
+#
 # Validated against `SpecialFunctions.beta_inc` on the slice (see
 # `test_rk_beta_inc.jl`); outside it use `SpecialFunctions.beta_inc`
 # (native) — the general-domain port is future work, not a silent
@@ -62,7 +66,7 @@ using ReactiveKernels: rk_symmetric_eigvals_rule, rk_symmetric_eigvecs_rule
 const RK_BETA_INC_ITERS = 300
 const RK_BETA_INC_FPMIN = 1e-300
 
-function _rk_beta_inc_cf(a, b, x)
+ReactiveKernels.@_record_source function _rk_beta_inc_cf(a, b, x)
     qab = a + b
     qap = a + 1
     qam = a - 1
@@ -104,12 +108,12 @@ function _rk_beta_inc_cf(a, b, x)
     return h
 end
 
-function _rk_beta_inc_core(a, b, x)
+ReactiveKernels.@_record_source function _rk_beta_inc_core(a, b, x)
     front = exp(a * log(x) + b * log1p(-x) - logbeta(a, b))
     return front * _rk_beta_inc_cf(a, b, x) / a
 end
 
-function _rk_beta_inc_interior(a, b, x, upper::Bool)
+ReactiveKernels.@_record_source function _rk_beta_inc_interior(a, b, x, upper::Bool)
     result = zero(a + b)
     ReactantCore.@trace if x < (a + 1) / (a + b + 2)
         small = _rk_beta_inc_core(a, b, x)
@@ -120,7 +124,7 @@ function _rk_beta_inc_interior(a, b, x, upper::Bool)
     end
     return result
 end
-function _rk_beta_inc_upper_guard(a, b, x, upper::Bool)
+ReactiveKernels.@_record_source function _rk_beta_inc_upper_guard(a, b, x, upper::Bool)
     result = zero(a + b)
     ReactantCore.@trace if x >= 1
         result = ifelse(upper, zero(a + b), one(a + b))
@@ -129,7 +133,7 @@ function _rk_beta_inc_upper_guard(a, b, x, upper::Bool)
     end
     return result
 end
-function rk_beta_inc_tail(a, b, x, upper::Bool)
+ReactiveKernels.@_record_source function rk_beta_inc_tail(a, b, x, upper::Bool)
     result = zero(a + b)
     ReactantCore.@trace if x <= 0
         result = ifelse(upper, one(a + b), zero(a + b))
@@ -143,7 +147,7 @@ rk_beta_inc(a, b, x) = rk_beta_inc_tail(a, b, x, false)
 # Near the centre, the beta change of variables has a removable 0*Inf
 # derivative. Integrating the smooth density's local series avoids that
 # singular coordinate while retaining ordinary differentiation of the primal.
-function rk_student_tail(nu, z, upper::Bool)
+ReactiveKernels.@_record_source function rk_student_tail(nu, z, upper::Bool)
     result = zero(nu + z)
     ReactantCore.@trace if abs(z) <= 1e-4 * sqrt(nu / (nu + 1))
         t = z^2 / nu

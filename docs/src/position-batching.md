@@ -251,7 +251,15 @@ writes into the buffer, and the branch stays lazy, so
 `isempty(c) ? zeros(length(idx)) : c[idx]` reads `c[idx]` only when it is
 taken. A slice arm counts only beside an arm that is an array by its
 syntax (a dotted call, `zeros`/`ones`/`fill`, a slice by a range or `:`), so
-`i > 0 ? x[i] : 0.0` keeps its ordinary call. A dotted call or a
+`i > 0 ? x[i] : 0.0` keeps its ordinary call. The condition may test types
+with Julia's subtype syntax and type applications, so one recipe flattens
+number and vector cells alike:
+`eltype(cells) <: Number ? cells : isempty(cells) ? eltype(eltype(cells))[] : reduce(vcat, cells)`
+returns number cells as they are and fills the slot with vector cells. A bound
+in a type application (`AbstractVector{<:Real}`) makes Julia build a `where`
+type each time the condition runs, about 160 bytes per position as in any
+loop, while `AbstractVector` and `AbstractVector{Float64}` are constants.
+A dotted call or a
 `reduce(vcat, cells)` nested in another call of a source, as in
 `minimum(100 .* (v .- b))`, `2 .* reduce(vcat, cells)` or inside a branch arm,
 keeps a lane slot of its own; the recipe's value releases that slot when it

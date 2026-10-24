@@ -89,6 +89,7 @@ const _MATRIX_CORE_TESTS = (
     "test_empty_plate_invariants.jl",
     "test_plate_cell.jl",
     "test_authored_loops.jl",
+    "test_jax_source.jl",
     "test_scan_columns.jl",
     "test_scan_endpoint_scope.jl",
     "test_replica.jl",
