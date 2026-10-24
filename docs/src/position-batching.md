@@ -302,6 +302,25 @@ cell before it allocates them afresh, while the buffers kept per cell serve
 ragged cells too. A prepared scalar kernel, including one prepared for
 reverse-mode AD, keeps allocating its cell values at every cell.
 
+Two RK-owned callees whose mathematics is a graph fill lane slots in the same
+way: a [derivative rule](manual-derivative-rules.md)'s primal cut, called as a
+recipe (`u = rule(t, p)`) or in a lazy arm, and a child kernel holding a plate
+or scan called in a lazy arm (`flag ? child_a(t, p) : child_b(t, p)`), which
+is prepared once when the caller is defined and applied where the arm runs.
+In a residual such a call runs the callee's lane kernel: its plan lowered as
+a residual part, whose result fills the call's lane slot and whose own plates,
+scans, dotted calls and slices fill slots kept per call site. A treatment cell
+whose unit response comes from a rule or from either arm of such a branch
+therefore reuses that response's buffer, as the same mathematics spliced into
+the cell would, and a top-level plate that stores such results keeps them per
+cell as above; a plate inside another plate's cell still allocates its cells'
+results. The callee's own plates keep no per-cell tables (it may run several
+times per position), and a result that may hold one of its buffers releases
+them all. Only position residuals take this path: a prepared scalar kernel, AD
+included, calls the rule's cuts and the child's prepared body as before. A
+rule whose primal cut ends in an opaque function, or a child whose result no
+destination form produces, keeps its ordinary call.
+
 By default every call owns fresh stacked output arrays, including record
 leaves. Later calls cannot change retained results. To consume bounded batches
 immediately on the native backend, opt into final output-buffer reuse:

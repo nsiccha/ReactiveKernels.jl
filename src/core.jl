@@ -1130,6 +1130,28 @@ end
     result
 end
 
+# The lane slots of an RK-owned callee called from a position residual
+# (`_lane_call`): one state per call site, kept in that site's slot. A value
+# that may hold one of these buffers releases the whole state, so the next
+# call starts a fresh one (`_lane_may_reference`).
+struct _LaneCalleeState
+    slots::Vector{Base.RefValue{Any}}
+end
+@inline function _lane_callee_state!(slot::Base.RefValue{Any}, n::Int)
+    state = slot[]
+    state isa _LaneCalleeState && length(state.slots) == n && return state
+    fresh = _LaneCalleeState(Base.RefValue{Any}[Base.RefValue{Any}(nothing) for _ in 1:n])
+    slot[] = fresh
+    fresh
+end
+function _lane_state_may_reference(result, state::_LaneCalleeState)
+    for slot in state.slots
+        held = slot[]
+        held === nothing || !_lane_may_reference(result, held) || return true
+    end
+    false
+end
+
 # A plate of the position residual's top level that stores its cells keeps one
 # table per lane slot of a value computed at every cell (`_CELL_TABLES`): entry
 # `k` holds the buffer cell `k`'s stored result held when the plate last ran,
@@ -1190,6 +1212,7 @@ end
 _lane_may_reference(result, @nospecialize(buffer)) = true
 _lane_may_reference(::Number, @nospecialize(buffer)) = false
 function _lane_may_reference(result::AbstractArray, @nospecialize(buffer))
+    buffer isa _LaneCalleeState && return _lane_state_may_reference(result, buffer)
     buffer isa AbstractArray && Base.mightalias(result, buffer) && return true
     _replicated_may_contain_array(eltype(result)) || return false
     for item in result

@@ -607,3 +607,88 @@ end
         Const(A), Const(x), Active(s), Const(b))
     @test ds0 == 0.0
 end
+
+module DerivativeRuleRegionGraphs
+using ReactiveKernels
+using ReactiveKernels: plate, scan
+
+@kernel decay(ts, q) = begin
+    y = plate(ts, Ref(q)) do t, q
+        q[1] * exp(-q[2] * t)
+    end
+    return y
+end
+@kernel recurrence(ts, q) = begin
+    y = scan(ts, Ref(q); init = 0.0) do c, t, q
+        n = c * exp(-q[2]) + q[1] * t
+        (n, n)
+    end
+    return y
+end
+# The primal is a plate (the spliced child); the reverse branch reads it.
+@kernel decay_rule(ts::Vector{Float64}, q::Vector{Float64}, y_bar::Vector{Float64}) = begin
+    y::Vector{Float64} = decay(ts, q)
+    ts_bar::Vector{Float64} = -q[2] .* y_bar .* y
+    q_bar::Vector{Float64} = [sum(y_bar .* y) / q[1], -sum(y_bar .* ts .* y)]
+    return y, ts_bar, q_bar
+end
+# A scan primal, and a reverse branch that is itself a plate over the primal.
+@kernel recurrence_rule(ts::Vector{Float64}, q::Vector{Float64},
+        y_bar::Vector{Float64}) = begin
+    y::Vector{Float64} = recurrence(ts, q)
+    weighted = plate(y_bar, y) do b, v
+        b * v
+    end
+    ts_bar::Vector{Float64} = y_bar .* 0.0
+    q_bar::Vector{Float64} = [sum(weighted) / q[1], 0.0]
+    return y, ts_bar, q_bar
+end
+const decay_primitive = derivative_rule(decay_rule; primal = :y, covector = :y_bar,
+    cotangents = (ts = :ts_bar, q = :q_bar), name = :decay)
+# The rule as an operation of a prepared kernel.
+@kernel decay_loss(q::Vector{Float64}, ts::Vector{Float64}, w::Vector{Float64}) = begin
+    y = decay_primitive(ts, q)
+    total::Float64 = sum(y .* w)
+    return total
+end
+end # module
+
+const _DRR = DerivativeRuleRegionGraphs
+
+@testset "vector derivative rule: plates and scans in the graph" begin
+    decay = _DRR.decay_primitive
+    recurrence = derivative_rule(_DRR.recurrence_rule; primal = :y, covector = :y_bar,
+        cotangents = (ts = :ts_bar, q = :q_bar), name = :recurrence)
+    ts = collect(range(0.0, 5.0; length = 7)); q = [1.2, 0.3]
+    ȳ = [0.5, -0.2, 0.1, 0.9, -0.4, 0.3, 0.7]
+    # Each cut is the prepared graph's lowering, so its values are that kernel's.
+    @test decay(ts, q) == prepare(_DRR.decay_rule; have = (:ts, :q), want = :y)(ts, q)
+    @test recurrence(ts, q) == prepare(_DRR.recurrence_rule; have = (:ts, :q), want = :y)(ts, q)
+    reverse_graph = prepare(_DRR.decay_rule; have = (:ts, :q, :y_bar), want = (:ts_bar, :q_bar))
+    @test reverse_cut(decay, Val(3), ts, q, ȳ) == reverse_graph(ts, q, ȳ)
+    # The staging retains the primal plate's output rather than recomputing it.
+    @test stage_residuals(decay, Val(3)) == (:ts, :q, :y)
+    @test stage_residuals(decay, Val(2)) == (:ts, :q, :y)
+    @test stage_residuals(recurrence, Val(2)) == (:q, :y)
+    for rule in (decay, recurrence), mask in 1:3
+        _, residuals = stage_primal(rule, Val(mask), ts, q)
+        @test stage_reverse(rule, Val(mask), residuals, ȳ) ==
+            reverse_cut(rule, Val(mask), ts, q, ȳ)
+    end
+    # The cut's table keeps only the slots its native body reads, so the rule
+    # stays isbits with a plate or a scan.
+    @test isbits(decay) && isbits(recurrence)
+    # Enzyme stages through the generated adapter.
+    w = [1.0, -0.5, 0.25, 2.0, 0.0, -1.0, 0.5]
+    y = decay(ts, q)
+    @test only(Enzyme.gradient(Reverse, Const(qq -> sum(decay(ts, qq) .* w)), q)) ≈
+        [sum(w .* y) / q[1], -sum(w .* ts .* y)]
+    @test only(Enzyme.gradient(Reverse, Const(tt -> sum(decay(tt, q) .* w)), ts)) ≈
+        -q[2] .* w .* y
+    # Inside a prepared kernel, through DifferentiationInterface's plain backend.
+    ad = prepare_ad(prepare(_DRR.decay_loss), AutoEnzyme(; mode = Enzyme.Reverse),
+                    q, ts, w; active = :q)
+    value, g = ad_value_and_gradient(ad, q, ts, w)
+    @test value ≈ sum(y .* w)
+    @test g ≈ [sum(w .* y) / q[1], -sum(w .* ts .* y)]
+end

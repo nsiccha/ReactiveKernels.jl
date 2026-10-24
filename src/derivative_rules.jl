@@ -148,7 +148,8 @@ treats it as a primitive whose reverse and forward rules are generated from
 the activity-selected cuts (see [`derivative_cut`](@ref)): no backend-specific
 derivative code is authored, and no rule attaches to a function this
 repository does not own. Every input, the primal, and every partial must be
-declared with a `Real` scalar type; the graph must not embed a plate.
+declared with a `Real` scalar type. A cut that runs a plate, a scan or an
+embedded kernel is compiled natively (see [`derivative_rule`](@ref)).
 """
 function scalar_derivative_rule(spec::KernelSpec; primal::Symbol,
         partials::NamedTuple, name::Symbol = :scalar_derivative_rule)
@@ -180,13 +181,15 @@ function scalar_derivative_rule(spec::KernelSpec; primal::Symbol,
             "scalar_derivative_rule($(name)) needs real scalar ports; :$(port) is " *
             "declared $(T)"))
     end
-    primal_spec, primal_ops = _derivative_cut_lowering(spec, name, inputs, primal)
+    generator = :scalar_derivative_rule
+    primal_spec, primal_ops = _derivative_cut_lowering(spec, name, inputs, primal;
+                                                       generator)
     cuts = ntuple(2^N - 1) do mask
         selected = Tuple(partials[i] for i in 1:N if (mask >> (i - 1)) & 1 == 1)
-        _derivative_cut_lowering(spec, name, inputs, (primal, selected...))
+        _derivative_cut_lowering(spec, name, inputs, (primal, selected...); generator)
     end
-    cut_specs = map(first, cuts)
-    cut_ops = map(last, cuts)
+    cut_specs = map(cut -> cut[1], cuts)
+    cut_ops = map(cut -> cut[2], cuts)
     ScalarDerivativeRule{
         name,N,inputs,primal_spec,cut_specs,typeof(primal_ops),typeof(cut_ops)}(
         primal_ops, cut_ops)
@@ -196,25 +199,89 @@ end
 # reaches the cut's operation table as an inferable `_TypeOperation` singleton
 # (recipe registration, core.jl), so Enzyme's shadow-only forward check sees an
 # inferred call and the rule stays isbits.
-function _derivative_cut_lowering(spec::KernelSpec, name::Symbol, have, want)
+#
+# Returns `(cut_spec, ops, structure)`. `structure` has the cut spec's shape
+# and lists the plan's top-level recipes (`_rule_region_cut`); the reverse
+# staging reads its residuals from it.
+function _derivative_cut_lowering(spec::KernelSpec, name::Symbol, have, want;
+                                  generator::Symbol)
     p = plan(spec; have = have, want = want)
     Tuple(v.name for v in p.have) == have || throw(ArgumentError(
-        "scalar_derivative_rule($(name)): the planned HAVE order " *
+        "$(generator)($(name)): the planned HAVE order " *
         "$(Tuple(v.name for v in p.have)) differs from the signature order $(have)"))
-    p = _partial_apply(p, ())
-    _needs_embedded_tensorization(p) && throw(ArgumentError(
-        "scalar_derivative_rule($(name)): a scalar derivative rule cannot embed a plate"))
-    ast, ops, _ = _lower_with_ops(_fuse_authored_plate_chains(p))
-    (_encode_cut_body(ast, name), ops)
+    p = _fuse_authored_plate_chains(_partial_apply(p, ()))
+    _needs_embedded_tensorization(p) && return _rule_region_cut(p, name)
+    ast, ops, _ = _lower_with_ops(p)
+    cut_spec = _encode_cut_body(ast, name, generator)
+    (cut_spec, ops, cut_spec)
 end
+
+# A cut that runs a plate, a scan or an embedded kernel lowers to loops, which
+# the type-level grammar below does not encode. Its native body is compiled as
+# `prepare` lowers it, so its values are the prepared kernel's, and the cut
+# calls it as its only operation (`_RuleRegion`). The body reads only the
+# inputs the plan reads, so `reverse_residuals` still names exactly those.
+# The structure lists the plan's top-level recipes, so the reverse staging
+# still retains an intermediate (a plate's output, say) rather than
+# recomputing it from the inputs.
+function _rule_region_cut(p::Plan, name::Symbol)
+    g = p.graph
+    read = Set{ValueId}(canon_id(g, v.id) for r in p.recipes for v in r.inputs)
+    union!(read, (canon_id(g, v.id) for v in p.want))
+    have = Value[v for v in p.have if canon_id(g, v.id) in read]
+    region_plan = _partial_subplan(p, have, p.want, p.recipes)
+    ast, ops, _ = _lower_with_ops(region_plan)
+    region = _RuleRegion{name}(compile(ast), _native_table(ast, Tuple(ops)))
+    names = _varnames(p)
+    nm(v) = names[canon_id(g, v.id)]
+    signature = Tuple(nm(v) for v in p.have)
+    arguments = Tuple(nm(v) for v in have)
+    outputs = Tuple(nm(v) for v in p.want)
+    ret = length(outputs) == 1 ? only(outputs) : outputs
+    cut_spec = (signature, ((ret, 1, arguments),), ret)
+    recipes = Tuple(
+        (length(r.outputs) == 1 ? nm(only(r.outputs)) : Tuple(map(nm, r.outputs)),
+         0, Tuple(unique(map(nm, r.inputs))))
+        for r in p.recipes)
+    (cut_spec, (region,), (signature, recipes, ret))
+end
+
+"""
+    _RuleRegion{Name}
+
+The operation of a rule cut whose graph runs a plate, a scan or an embedded
+kernel (`_rule_region_cut`): the cut's compiled native body and the table it
+reads. The body is native Julia, so a traced call is refused explicitly.
+"""
+struct _RuleRegion{Name,F,O}
+    f::F
+    ops::O
+end
+_RuleRegion{Name}(f::F, ops::O) where {Name,F,O} = _RuleRegion{Name,F,O}(f, ops)
+
+@generated function (region::_RuleRegion{Name,F})(args::Vararg{Any,N}) where {Name,F,N}
+    forwarded = Any[:(getfield(args, $index)) for index in 1:N]
+    quote
+        _dynamic_tensorized_marker(args) === nothing || _rule_region_traced($(QuoteNode(Name)))
+        $(_native_body_call_expr(F, :(getfield(region, :f)),
+                                 Any[:(getfield(region, :ops)), forwarded...]))
+    end
+end
+
+@noinline _rule_region_traced(name::Symbol) = throw(ArgumentError(
+    "derivative rule $(name): a cut that runs a plate, a scan or an embedded " *
+    "kernel has a native body only; tracing it is not built"))
+
+_kernel_latest_source(region::_RuleRegion{Name}) where {Name} =
+    _RuleRegion{Name}(region.f, _kernel_latest_source(region.ops))
 
 # Encode a lowered `function (__ops__, x::T...) name = __ops__[i](names...);
 # ...; return ... end` as type-level data. Anything outside that grammar is a
 # lowering this slice does not cover and is refused explicitly.
-function _encode_cut_body(ast::Expr, name::Symbol)
+function _encode_cut_body(ast::Expr, name::Symbol, generator::Symbol)
     unsupported(what) = throw(ArgumentError(
-        "scalar_derivative_rule($(name)): the lowered cut contains $(what), " *
-        "which the scalar rule generator does not encode: $(ast)"))
+        "$(generator)($(name)): the lowered cut contains $(what), " *
+        "which the rule generator does not encode: $(ast)"))
     ast.head === :function || unsupported("a non-function expression")
     signature = ast.args[1]
     (signature isa Expr && signature.head === :tuple &&
@@ -304,14 +371,19 @@ authored forward and/or reverse branches. Calling it with the `N` inputs runs
 the primal cut. [`forward_cut`](@ref) runs the JVP branch over every direction,
 [`reverse_cut`](@ref) runs the VJP branch of one activity pattern, and
 [`reverse_residuals`](@ref) says which inputs that cut reads. Backend
-extensions stage those cuts into their rule protocols; the callable's only
-fields are the cuts' operation tables.
+extensions stage those cuts into their rule protocols. The callable's fields
+are the cuts' operation tables and `lane`, the primal cut lowered for a
+position residual (`_lane_kernel`), or `nothing`. `Result` records
+the primal's inferred result type for the graph's declared input types, when
+both are concrete (`_promote_op`), or is `nothing`.
 """
-struct DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO} <: Function
+struct DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO,
+                      Result} <: Function
     primal_ops::PO
     forward_ops::FO
     reverse_ops::RO
     staged_ops::SO
+    lane::LO
 end
 
 function _kernel_latest_rule(rule::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged}) where
@@ -321,8 +393,36 @@ function _kernel_latest_rule(rule::DerivativeRule{Name,N,Inputs,Primal,Forward,R
     ro = _kernel_latest_source(rule.reverse_ops)
     so = _kernel_latest_source(rule.staged_ops)
     DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,
-        typeof(po),typeof(fo),typeof(ro),typeof(so)}(po,fo,ro,so)
+        typeof(po),typeof(fo),typeof(ro),typeof(so),typeof(rule.lane),
+        _rule_result(rule)}(po,fo,ro,so,rule.lane)
 end
+
+_rule_result(::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO,
+                              Result}) where {Name,N,Inputs,Primal,Forward,Reverse,
+                                              Staged,PO,FO,RO,SO,LO,Result} = Result
+
+# A rule's result type for its graph's declared input types, inferred when the
+# rule is built (`_rule_result_type`). A kernel calling the rule queries that
+# type (`_promote_op`), and inferring it there, deep inside a large kernel such
+# as a position residual, can stop short of a constant once the rule's cut
+# calls prepared children: the query then ran at every cell (snag
+# `rule-plate-splic-728756b1`). Other argument types are inferred as before.
+@inline @generated function _promote_op(f::DerivativeRule{Name,N,Inputs,Primal,Forward,
+        Reverse,Staged,PO,FO,RO,SO,LO,Result}, types::Vararg{Type,K}) where
+        {Name,N,Inputs,Primal,Forward,Reverse,Staged,PO,FO,RO,SO,LO,Result,K}
+    # Each argument is `Type{T}` for a type the caller's inference knows.
+    known(A) = A isa DataType && A.name === Type.body.name
+    if Result !== nothing && all(known, types) &&
+            Tuple{map(A -> A.parameters[1], types)...} == Result.parameters[1]
+        return Result.parameters[2]
+    end
+    _promote_op_body(K)
+end
+
+# A position residual calls the rule's primal cut through its lane kernel
+# (`_lane_call`), so the cut's plates, scans and dotted calls reuse their
+# buffers there. Every other call, AD included, runs the cuts above.
+_lane_callee(rule::DerivativeRule) = getfield(rule, :lane)
 
 function Base.show(io::IO,
         ::DerivativeRule{Name,N,Inputs,Primal,Forward,Reverse}) where
@@ -522,6 +622,12 @@ const matvec = derivative_rule(matvec_rule; primal = :y,
 optional, but at least one must be given; every AD adapter is generated from
 the cuts of this one graph, attached to the returned callable. Inputs are the
 HAVE ports that are neither directions nor the covector, in HAVE order.
+
+The graph may hold plates, scans and embedded kernels, in any branch. A cut
+that runs one is compiled from its native lowering, so its values are those
+of `prepare(graph; have, want)`, and it is not traced. In a position residual
+(`vectorize`, `prepare_batched`) the primal cut fills lane buffers like the
+same mathematics spliced into the caller.
 """
 function derivative_rule(spec::KernelSpec; primal::Symbol,
         directions = nothing, tangent = nothing, covector = nothing,
@@ -569,34 +675,34 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
         end
         length(unique(Tuple(values(cotangents)))) == N || fail("cotangent ports must be distinct; got $(Tuple(values(cotangents)))")
     end
-    primal_spec, primal_ops = _derivative_cut_lowering(spec, name, inputs, primal)
+    generator = :derivative_rule
+    cut(have, want) = _derivative_cut_lowering(spec, name, have, want; generator)
+    primal_spec, primal_ops = cut(inputs, primal)
     forward_spec, forward_ops = has_forward ?
-        _derivative_cut_lowering(spec, name, (inputs..., direction_names...), (primal, tangent)) :
-        (nothing, nothing)
+        cut((inputs..., direction_names...), (primal, tangent)) : (nothing, nothing)
     reverse = if has_reverse
         ntuple(2^N - 1) do mask
             active = Tuple(cotangents[i] for i in 1:N if (mask >> (i - 1)) & 1 == 1)
             want = length(active) == 1 ? active[1] : active
-            cut_spec, ops = _derivative_cut_lowering(spec, name, (inputs..., covector), want)
+            cut_spec, ops, structure = cut((inputs..., covector), want)
             used = _cut_referenced_names(cut_spec)
             residuals = Tuple(input in used for input in inputs)
-            ((cut_spec[1], cut_spec[2], cut_spec[3], residuals), ops)
+            ((cut_spec[1], cut_spec[2], cut_spec[3], residuals), ops, structure)
         end
     else
         nothing
     end
     reverse_specs = reverse === nothing ? nothing : map(first, reverse)
-    reverse_ops = reverse === nothing ? nothing : map(last, reverse)
+    reverse_ops = reverse === nothing ? nothing : map(r -> r[2], reverse)
     staged = if has_reverse
         ntuple(2^N - 1) do mask
-            frontier = _reverse_frontier(reverse_specs[mask], covector, inputs)
+            frontier = _reverse_frontier(reverse[mask][3], covector, inputs)
             extra = Tuple(n for n in frontier if !(n in inputs) && n !== primal)
             stage_want = isempty(extra) ? primal : (primal, extra...)
-            stage_spec, stage_ops = _derivative_cut_lowering(spec, name, inputs, stage_want)
+            stage_spec, stage_ops = cut(inputs, stage_want)
             active = Tuple(cotangents[i] for i in 1:N if (mask >> (i - 1)) & 1 == 1)
             want = length(active) == 1 ? active[1] : active
-            back_spec, back_ops = _derivative_cut_lowering(
-                spec, name, (frontier..., covector), want)
+            back_spec, back_ops = cut((frontier..., covector), want)
             ((stage_spec, back_spec, frontier), (stage_ops, back_ops))
         end
     else
@@ -604,10 +710,23 @@ function derivative_rule(spec::KernelSpec; primal::Symbol,
     end
     staged_specs = staged === nothing ? nothing : map(first, staged)
     staged_ops = staged === nothing ? nothing : map(last, staged)
-    DerivativeRule{name,N,inputs,primal_spec,forward_spec,reverse_specs,staged_specs,
-                   typeof(primal_ops),typeof(forward_ops),typeof(reverse_ops),
-                   typeof(staged_ops)}(
-        primal_ops, forward_ops, reverse_ops, staged_ops)
+    lane = _lane_kernel(_partial_apply(plan(spec; have = inputs, want = primal), ()))
+    rule(Result) = DerivativeRule{name,N,inputs,primal_spec,forward_spec,reverse_specs,
+                                  staged_specs,typeof(primal_ops),typeof(forward_ops),
+                                  typeof(reverse_ops),typeof(staged_ops),typeof(lane),
+                                  Result}(
+        primal_ops, forward_ops, reverse_ops, staged_ops, lane)
+    rule(_rule_result_type(rule(nothing), spec, inputs))
+end
+
+# `Tuple{Tuple{declared input types...}, inferred primal result type}`, or `nothing`
+# unless every input port declares a concrete type and inference proves a
+# concrete result.
+function _rule_result_type(rule::DerivativeRule, spec::KernelSpec, inputs)
+    types = map(name -> valtype(spec.ports[name]), inputs)
+    all(isconcretetype, types) || return nothing
+    R = Core.Compiler.return_type(rule, Tuple{types...})
+    isconcretetype(R) ? Tuple{Tuple{types...},R} : nothing
 end
 
 # The covector-independent frontier of a lowered reverse cut: every value its

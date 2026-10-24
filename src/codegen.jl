@@ -418,15 +418,8 @@ end
     Expr(:block, Expr(:meta, fieldcount(shapes) <= 2 ? :inline : :noinline), fold)
 end
 
-# `Base.promote_op(f, T1, …, Tn)` for the types an emitted body computes: the
-# same result (`Union{}` when an argument type is `Union{}`, otherwise the
-# inferred return type over `Tuple{T1, …, Tn}`). Base forms that tuple type
-# through two splats (`promote_op(f, S...)`, `TupleOrBottom(tt...)`), which past
-# 32 types (`max_tuple_splat`) stay runtime `Core._apply_iterate` calls: a plate
-# cell with 33 or more operands then computed its element type on every call,
-# allocating about 900 B per plate call. Spelled out positionally, the tuple
-# type folds at compile time for any number of types.
-@inline @generated function _promote_op(f, types::Vararg{Type,N}) where {N}
+# The body of `_promote_op` over `f` and `N` argument types `types`.
+function _promote_op_body(N)
     arguments = Any[:(getfield(types, $index)) for index in 1:N]
     bottom = foldr((argument, rest) -> :($argument === Union{} || $rest),
                    arguments; init = false)
@@ -435,6 +428,16 @@ end
         Base._return_type(f, Core.apply_type(Tuple, $(arguments...)))
     end
 end
+
+# `Base.promote_op(f, T1, …, Tn)` for the types an emitted body computes: the
+# same result (`Union{}` when an argument type is `Union{}`, otherwise the
+# inferred return type over `Tuple{T1, …, Tn}`). Base forms that tuple type
+# through two splats (`promote_op(f, S...)`, `TupleOrBottom(tt...)`), which past
+# 32 types (`max_tuple_splat`) stay runtime `Core._apply_iterate` calls: a plate
+# cell with 33 or more operands then computed its element type on every call,
+# allocating about 900 B per plate call. Spelled out positionally, the tuple
+# type folds at compile time for any number of types.
+@inline @generated _promote_op(f, types::Vararg{Type,N}) where {N} = _promote_op_body(N)
 
 function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     batch = _authored_plate_broadcast(Val(A), args...)
