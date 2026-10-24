@@ -170,6 +170,7 @@ end
 
 # A plain helper whose compiled form is authored in place (`@trace`): its
 # source is recorded for `jax_source`, and it gains no `traced` method.
+"The logarithm above one, the offset below it."
 ReactiveKernels.@_record_source function jax_test_recorded(x)
     result = zero(x)
     ReactiveKernels.ReactantCore.@trace if x > 1
@@ -226,6 +227,7 @@ end
     @test !occursin(r"^\s*for "m, generators)
     @test ReactiveKernels._traceable_source(typeof(jax_test_recorded), Float64) !== nothing
     @test !any(m -> occursin("jax_test_recorded", string(m.sig)), methods(ReactiveKernels.traced))
+    @test occursin("logarithm above one", string(@doc jax_test_recorded))
     checked = string(jax_source(jax_checked; have = (:x,), want = :m))
     @test occursin("jax.debug.callback(", checked)
     @test occursin("_rk_check(jnp.logical_or(", checked)

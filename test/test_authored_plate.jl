@@ -2484,8 +2484,10 @@ struct Lattice
     shifts::Vector{Int}
 end
 struct Exact end
+"The observation's row under the plan's shifts."
 @traceable row_index(t, p::Lattice, i) = t - p.shifts[i]
 @traceable row_index(row, ::Exact, i) = row[i]
+"The distance above the lower bound, or zero."
 @traceable function clipped(x, lo = 0.0)::Float64
     y = x - lo
     if y > 0
@@ -2494,6 +2496,7 @@ struct Exact end
         return 0.0
     end
 end
+"The value scaled by the factor."
 @traceable scaled(x::T, s) where {T<:Real} = s * x
 # A hand-written tracing method: the native method is an opaque in-place loop,
 # the traced one a different implementation of the same mathematics.
@@ -2518,6 +2521,10 @@ end
     @test H.row_index([4, 9, 1], H.Exact(), 2) == 9
     @test H.clipped(2.5, 1.0) === 1.5 && H.clipped(0.5, 1.0) === 0.0 && H.clipped(2.0) === 2.0
     @test H.scaled(2, 1.5) == 3.0
+    # A preceding docstring documents the authored method.
+    @test occursin("plan's shifts", string(@doc H.row_index))
+    @test occursin("above the lower bound", string(@doc H.clipped))
+    @test occursin("scaled by the factor", string(@doc H.scaled))
     # The tensorized hook dispatches to the rewritten body by the authored
     # signature; on host values it computes what the method computes.
     call = ReactiveKernels.traced

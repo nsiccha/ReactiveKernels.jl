@@ -294,9 +294,14 @@ cell (`isempty(row) ? zeros(0) : f.(row)`) still allocates its arm's array. A
 subject cell that returns its per-observation predictions, or a tuple holding
 them, therefore allocates them only at a reader's first call, and so does a plate of such cells read through
 `reduce(vcat, cells)`, the flat vector included. A plate inside another
-plate's cell runs once per outer cell, whose stored result may still hold its
-cells, so its cells' results still allocate, as do the values of opaque
-functions and the work inside scan steps. The values no stored result holds
+plate's cell keeps its cells' results per cell the same way, at every nesting
+depth: it runs once per outer cell, so cell `k` of the next outer cell refills
+the buffers cell `k` held. The outer cell's result may hold some of them (it
+returns the inner plate, or a tuple or array holding its cells); those leave
+the table, and the next outer cell allocates them afresh. Per-treatment unit
+responses stored inside a subject cell and read whole by other plates
+therefore allocate only at a reader's first call. The values of opaque
+functions and the work inside scan steps still allocate. The values no stored result holds
 share one slot across the cells of a plate: a cell of another shape than the
 cell before it allocates them afresh, while the buffers kept per cell serve
 ragged cells too. A prepared scalar kernel, including one prepared for
@@ -312,11 +317,11 @@ a residual part, whose result fills the call's lane slot and whose own plates,
 scans, dotted calls and slices fill slots kept per call site. A treatment cell
 whose unit response comes from a rule or from either arm of such a branch
 therefore reuses that response's buffer, as the same mathematics spliced into
-the cell would, and a top-level plate that stores such results keeps them per
-cell as above; a plate inside another plate's cell still allocates its cells'
-results. The callee's own plates keep no per-cell tables (it may run several
-times per position), and a result that may hold one of its buffers releases
-them all. Only position residuals take this path: a prepared scalar kernel, AD
+the cell would, and a plate that stores such results keeps them per cell as
+above, inside another plate's cell too. The callee's top-level plates keep no
+per-cell tables (it may run several times per position), while plates inside
+their cells do, and a result that may hold one of its buffers releases them
+all. Only position residuals take this path: a prepared scalar kernel, AD
 included, calls the rule's cuts and the child's prepared body as before. A
 rule whose primal cut ends in an opaque function, or a child whose result no
 destination form produces, keeps its ordinary call.
