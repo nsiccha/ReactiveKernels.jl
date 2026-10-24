@@ -3200,6 +3200,7 @@ function _collect_assignment_refs!(refs, ex, plan, label, bound::Bool)
     # A module constant (`LinearAlgebra.I`, functions as values) is a value,
     # never a plan name.
     ex isa GlobalRef && return nothing
+    _is_lazy_value(ex) && return _collect_lazy_refs!(refs, ex, plan, label, bound)
     _is_plate_column_expr(ex) &&
         return _collect_plate_column_refs!(refs, ex, plan, label, bound)
     _is_matrix_math(ex, plan) &&
@@ -3328,6 +3329,54 @@ function _collect_model_value_ref!(refs, ex::Expr, plan, label, bound::Bool)
     end
     return nothing
 end
+
+# A lazy branch (`c ? a : b`, `if`/`elseif`, `&&`, `||`) in a definition is
+# Julia's: its condition and its arms are whole values, and only the arm
+# the condition selects runs. Like a module call's, its result is a value
+# whose shape lowering does not guess.
+_is_lazy_value(ex) = Meta.isexpr(ex, (:if, :elseif, :&&, :||))
+
+# An arm may bind locals (`if c; t = 2a; t - a; else; -a; end`), which its
+# later statements read. Julia's `if` opens no scope, so a local spelled
+# like a model name or a data column would rebind it: refused, as a second
+# assignment is.
+function _collect_lazy_refs!(refs, ex, plan, label, bound::Bool)
+    locals = _lazy_value_locals!(Set{Symbol}(), ex)
+    taken = sort!(collect(filter(s -> s in _all_name_set(plan) ||
+        haskey(plan.columns, s), locals)))
+    isempty(taken) || _fail(label, "a branch arm assigns $(join(taken, ", ")), " *
+        "which the model already names: a name is assigned once, so give the " *
+        "local its own name")
+    inner = Symbol[]
+    _collect_opaque_refs!(inner, ex, plan, label, bound)
+    for r in inner
+        r in locals || push!(refs, r)
+    end
+    return nothing
+end
+
+function _lazy_value_locals!(out::Set{Symbol}, ex)
+    ex isa Expr || return out
+    # A function, comprehension or `let` scopes its own names.
+    ex.head in (:->, :function, :let, :comprehension, :generator, :do) && return out
+    if ex.head === :(=)
+        _assigned_symbols!(out, ex.args[1])
+        return _lazy_value_locals!(out, ex.args[2])
+    end
+    for a in ex.args
+        # `(name = value,)` names a NamedTuple field, not a local.
+        ex.head === :tuple && (a = _tuple_field_value(a))
+        _lazy_value_locals!(out, a)
+    end
+    return out
+end
+
+_assigned_symbols!(out::Set{Symbol}, lhs::Symbol) = push!(out, lhs)
+function _assigned_symbols!(out::Set{Symbol}, lhs::Expr)
+    lhs.head === :tuple && foreach(a -> _assigned_symbols!(out, a), lhs.args)
+    return out
+end
+_assigned_symbols!(out::Set{Symbol}, lhs) = out
 
 # Arguments of a module function call (functions as values) are whole
 # Julia values: columns, derived columns, parameters, assignments and
@@ -7175,6 +7224,11 @@ function _expr_value_symbols(ex, out::Set{Symbol} = Set{Symbol}())
             _generator_symbols!((o, e) -> _expr_value_symbols(e, o), out, ex)
         elseif ex.head === :kw && length(ex.args) == 2
             _expr_value_symbols(ex.args[2], out)
+        elseif _is_lazy_value(ex)
+            # A branch arm's locals are not names the definition reads.
+            inner = Set{Symbol}()
+            foreach(a -> _expr_value_symbols(a, inner), ex.args)
+            union!(out, setdiff!(inner, _lazy_value_locals!(Set{Symbol}(), ex)))
         elseif ex.head === :call
             if !isempty(ex.args) && _constructed_endpoint_head(ex.args[1])
                 for a in ex.args[1].args[1].args[2:end]
@@ -8128,9 +8182,56 @@ function _eval_value_expr(ex, lookup, label; calls = nothing, kernels = nothing)
         return Base.vect(map(ev, ex.args)...)
     elseif h === :tuple
         return Tuple(map(ev, ex.args))
+    elseif h === :if || h === :elseif
+        # Lazy, as Julia's: only the selected arm runs.
+        ev(ex.args[1]) && return ev(ex.args[2])
+        return length(ex.args) == 3 ? ev(ex.args[3]) : nothing
+    elseif h === :&&
+        return ev(ex.args[1]) && ev(ex.args[2])
+    elseif h === :||
+        return ev(ex.args[1]) || ev(ex.args[2])
+    elseif h === :block
+        return _eval_value_block(ex, lookup, label; calls, kernels)
+    elseif h === :curly
+        return _eval_type_application(ex, ev)
     end
     throw(ContractValidationError(
         "[bind] $label: unsupported expression head $h in a data definition"))
+end
+
+# A branch arm's statements in order, its locals read before the
+# definition's names; the last statement is the arm's value. A call that
+# reads a local is not the same value in another definition, so calls here
+# are not shared through `calls`.
+function _eval_value_block(ex::Expr, lookup, label; calls, kernels)
+    locals = Dict{Symbol,Any}()
+    scoped(s::Symbol) = haskey(locals, s) ? locals[s] : lookup(s)
+    any(st -> Meta.isexpr(st, :(=)), ex.args) && (calls = nothing)
+    value = nothing
+    for st in ex.args
+        st isa LineNumberNode && continue
+        if Meta.isexpr(st, :(=), 2) && st.args[1] isa Symbol
+            value = locals[st.args[1]] =
+                _eval_value_expr(st.args[2], scoped, label; calls, kernels)
+        else
+            value = _eval_value_expr(st, scoped, label; calls, kernels)
+        end
+    end
+    return value
+end
+
+# `A{B}` is `Core.apply_type(A, B)`; a bound `A{<:B}` is the `UnionAll` Julia
+# lowers it to.
+function _eval_type_application(ex::Expr, ev)
+    vars = TypeVar[]
+    params = map(ex.args[2:end]) do p
+        Meta.isexpr(p, (:<:, :>:), 1) || return ev(p)
+        b = ev(p.args[1])
+        v = p.head === :<: ? TypeVar(:T, Union{}, b) : TypeVar(:T, b, Any)
+        push!(vars, v)
+        return v
+    end
+    return foldr(UnionAll, vars; init = Core.apply_type(ev(ex.args[1]), params...))
 end
 
 function _eval_callee(fn, label)

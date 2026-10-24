@@ -312,6 +312,7 @@ const _PPL_TEST_FILES = (
     "test_plate_cell_once_reactant.jl",
     "test_index_endpoints.jl",
     "test_base_value_names.jl",
+    "test_lazy_branch_values.jl",
     "test_reduction_calls.jl",
     "test_cell_call_index.jl",
     "test_rebinding_rows.jl",

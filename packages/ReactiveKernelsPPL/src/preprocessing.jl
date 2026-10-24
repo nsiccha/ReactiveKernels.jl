@@ -316,7 +316,7 @@ plans only: bind-time coverage validation proves every value occurs in
 `levels`, so the 0 fallback for uncovered values is unreachable
 in-graph (a loud bind error beats a silent wrong gather).
 """
-function _declared_codes(x::AbstractVector, levels::AbstractVector)
+ReactiveKernels.@_record_source function _declared_codes(x::AbstractVector, levels::AbstractVector)
     codes = Vector{Int}(undef, length(x))
     for (i, v) in enumerate(x)
         c = 0
@@ -343,7 +343,7 @@ key: `_ppl_key_cells` names, in first-occurrence order over the selected
 selected index to the position of its key in that list (0 elsewhere).
 Keys compare with `isequal`, as `Dict` does.
 """
-function _ppl_key_cells(keys::AbstractArray, indices)
+ReactiveKernels.@_record_source function _ppl_key_cells(keys::AbstractArray, indices)
     v = vec(keys)
     seen = Dict{eltype(v),Int}()
     cells = Int[]
@@ -355,7 +355,7 @@ function _ppl_key_cells(keys::AbstractArray, indices)
     end
     return cells
 end
-function _ppl_key_codes(keys::AbstractArray, indices)
+ReactiveKernels.@_record_source function _ppl_key_codes(keys::AbstractArray, indices)
     v = vec(keys)
     seen = Dict{eltype(v),Int}()
     codes = zeros(Int, length(v))
@@ -380,16 +380,18 @@ end
 # stage count is data, so the stages flatten into one lane per
 # (observation, stage) pair, built from the bound response: the lane's
 # observation index and stage index. Data-only (folded under `bound=`).
-@inline function _ordinal_effects_matrix(effects, y, K)
+ReactiveKernels.@_record_source function _ordinal_effects_matrix(effects, y, K)
+    @inline
     return _ordinal_effects_matrix(effects, length(y), K)
 end
-@inline function _ordinal_effects_matrix(effects, n::Integer, K)
+ReactiveKernels.@_record_source function _ordinal_effects_matrix(effects, n::Integer, K)
+    @inline
     ndims(effects) == 2 && size(effects) == (n, K - 1) ||
         throw(DimensionMismatch("ordinal threshold effects require an N × (K-1) matrix"))
     return effects
 end
 
-function _ordinal_stage_lanes(f, y::AbstractVector{<:Integer}, K)
+ReactiveKernels.@_record_source function _ordinal_stage_lanes(f, y::AbstractVector{<:Integer}, K)
     out = Int[]
     for (i, count) in enumerate(min.(y, K .- 1)), j in 1:count
         push!(out, f(i, j))
@@ -420,6 +422,12 @@ end
 # Gather observation values after ordinary scalar/singleton broadcasting.
 # Stage tables may repeat rows; one-entry operands still supply every lane,
 # including zero lanes for an empty response. This stays in the value graph.
-@inline _broadcast_gather(value::Number, rows) = fill(value, length(rows))
-@inline _broadcast_gather(value, rows) =
+# Both methods record their source, so `jax_source` dispatches as Julia does.
+ReactiveKernels.@_record_source function _broadcast_gather(value::Number, rows)
+    @inline
+    fill(value, length(rows))
+end
+ReactiveKernels.@_record_source function _broadcast_gather(value, rows)
+    @inline
     value[length(value) == 1 ? fill(1, length(rows)) : rows]
+end

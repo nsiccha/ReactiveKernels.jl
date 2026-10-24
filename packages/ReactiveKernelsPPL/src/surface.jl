@@ -2836,13 +2836,14 @@ _resolve_module_calls(::Missing, ::Module, ::Set{Symbol}, where) =
 # declarations and binders shadow it) reads its constant binding in the
 # model module, as a free name in a Julia function body reads its module's
 # global: with `using LinearAlgebra: I`, `sigma * I` is
-# `sigma * LinearAlgebra.I`. A free name whose constant is a number or an
+# `sigma * LinearAlgebra.I`, and a type is that type (`convert(Float64, a)`,
+# `eltype(v) <: Number`). A free name whose constant is a number or an
 # array stays an input name, as data of that name would bind it; functions
 # resolve as call heads and arguments, and modules as paths.
 function _resolve_value_name(ex::Symbol, mod::Module, names::Set{Symbol})
     ex in names && return ex
     isdefined(mod, ex) && isconst(mod, ex) || return ex
-    getfield(mod, ex) isa Union{Number,AbstractArray,Function,Module,Type} &&
+    getfield(mod, ex) isa Union{Number,AbstractArray,Function,Module} &&
         return ex
     return GlobalRef(mod, ex)
 end
@@ -2878,6 +2879,9 @@ function _resolve_module_calls(ex, mod::Module, names::Set{Symbol}, where;
     ex isa Expr || return ex
     ex.head === :quote && return ex
     ex = ReactiveKernels._array_literal_call(ex)
+    # `a <: b` and `a >: b` are the calls Julia lowers them to.
+    ex.head in (:<:, :>:) && length(ex.args) == 2 &&
+        (ex = Expr(:call, ex.head, ex.args...))
     recur(a) = _resolve_module_calls(a, mod, names, where;
         values = values && !(ex.head in _BINDING_VALUE_HEADS))
     # A keyword's name, and the shorthand `f(x; s)` for `s = s`, stay names.
