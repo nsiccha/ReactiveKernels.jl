@@ -23,6 +23,8 @@ _rk_py(x::Integer) = string(x)
 _rk_py(x::AbstractFloat) = isnan(x) ? "float('nan')" :
     isinf(x) ? (x > 0 ? "float('inf')" : "float('-inf')") : repr(Float64(x))
 _rk_py(x::AbstractString) = repr(String(x))
+# Any other value (a categorical level) crosses as its label.
+_rk_py(x) = repr(string(x))
 _rk_py(x::AbstractArray) = ndims(x) == 1 ? "[" * join(map(_rk_py, x), ", ") * "]" :
     "[" * join((_rk_py(selectdim(x, 1, i)) for i in axes(x, 1)), ", ") * "]"
 _rk_py_input(x::AbstractArray{<:Number}) = "np.asarray(" * _rk_py(x) * ", dtype=" *
@@ -77,8 +79,16 @@ function rk_jax_evaluate(src::JAXSource, name, args; grad::Bool = false)
     write(args_path, "ARGS = [" * join(map(_rk_py_input, rk_jax_inputs(args)), ", ") * "]\n")
     driver = joinpath(dir, "driver.py")
     write(driver, _RK_JAX_DRIVER)
-    output = read(`$RK_JAX_PYTHON $driver $module_path $args_path $(String(name)) $(grad ? "grad" : "value")`,
-                  String)
+    errors = joinpath(dir, "stderr.txt")
+    cmd = `$RK_JAX_PYTHON $driver $module_path $args_path $(String(name)) $(grad ? "grad" : "value")`
+    output = try
+        read(pipeline(cmd; stderr = errors), String)
+    catch e
+        e isa ProcessFailedException || rethrow()
+        # The Python traceback names the failing line of the emitted module.
+        error("the emitted module failed in Python (module at ", module_path, "):\n",
+              join(last(readlines(errors), 12), "\n"))
+    end
     _rk_jax_unarray(Base.eval(Module(), Meta.parse(output)))
 end
 _rk_jax_unarray(x::AbstractVector) = all(v -> v isa Number, x) ? Float64[v for v in x] :

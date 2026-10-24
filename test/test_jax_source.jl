@@ -82,6 +82,77 @@ end
     return y
 end
 
+# Typed allocations, `hcat`, `permutedims`, a numeric-type broadcast, and a
+# postfix on a compound operand (`size(x .- w, 1)`).
+@kernel jax_alloc(x::Vector{Float64}, w::Float64) = begin
+    n = length(x)
+    D = Float64.(hcat(ones(Float64, n), x))
+    P = permutedims(D)
+    c = fill(w, 2)
+    s = sum(D * c) + sum(P .* w) + size(x .- w, 1)
+    return s
+end
+
+# A loop whose `if` arms end in values of different types (an assignment, a
+# destructuring): the branch carries only the locals they assign.
+@traceable function jax_test_triangle(z::AbstractVector, k::Integer)
+    out = ones(Float64, k)
+    i, j, d = 1, 2, 1.0
+    for p in 1:length(z)
+        d = d * sqrt(1 - z[p]^2)
+        if i + 1 < j
+            i = i + 1
+        else
+            out[j] = d
+            i, j, d = 1, j + 1, 1.0
+        end
+    end
+    return out
+end
+@kernel jax_triangle(z::Vector{Float64}) = begin
+    v = jax_test_triangle(tanh.(z), 3)
+    s = sum(log.(v))
+    return s
+end
+
+# A scan whose step outputs named numbers, read field by field by a plate.
+@kernel jax_named_scan(y::Vector{Float64}, b::Float64) = begin
+    rows = scan(y; init = 0.0) do acc, yi
+        next = b * acc + yi
+        (next, (level = next, step = yi - next))
+    end
+    level = plate(rows) do row
+        row.level
+    end
+    s = sum(level .^ 2)
+    return s
+end
+
+# Runtime checks: one under a branch that a vmapped plate cell evaluates for
+# every lane (it must hold for lanes that do not take the branch), and ones
+# on the data.
+@traceable function jax_test_positive_log(xi::Real)
+    if xi > 0
+        ReactiveKernels._runtime_check(xi > 0, ArgumentError("xi must be positive"))
+        log(xi)
+    else
+        zero(xi)
+    end
+end
+@traceable function jax_test_checked_sum(lp::AbstractVector)
+    ReactiveKernels._runtime_check(length(lp) > 0, ArgumentError("lp is empty"))
+    m = sum(lp)
+    ReactiveKernels._runtime_check(m < 10, ArgumentError("m is too large"))
+    return m
+end
+@kernel jax_checked(x::Vector{Float64}) = begin
+    lp = plate(x) do xi
+        jax_test_positive_log(xi)
+    end
+    m = jax_test_checked_sum(lp)
+    return m
+end
+
 @traceable jax_test_count(x::AbstractVector, n::Integer) = begin
     acc = zero(eltype(x))
     for i in 1:n
@@ -113,6 +184,9 @@ end
     @test occursin("jax.vmap(element", generators)
     @test occursin("jnp.where(kept", generators)
     @test !occursin(r"^\s*for "m, generators)
+    checked = string(jax_source(jax_checked; have = (:x,), want = :m))
+    @test occursin("jax.debug.callback(", checked)
+    @test occursin("_rk_check(jnp.logical_or(", checked)
     traced = string(jax_source(jax_traced; have = (:x,), want = :y))
     @test occursin("jax.lax.while_loop(", traced)
     @test occursin("jax.lax.cond(", traced)
@@ -168,6 +242,19 @@ end
         src = jax_source(jax_traced; have = (:x,), want = :y)
         @test rk_jax_evaluate(src, "kernel", (0.3,)).value ≈ native(0.3) rtol = 1e-12
         @test rk_jax_evaluate(src, "kernel", (-0.3,)).value ≈ native(-0.3) rtol = 1e-12
+
+        for (kernel, have, want, args) in (
+                (jax_alloc, (:x, :w), :s, (x, 0.7)),
+                (jax_triangle, (:z,), :s, ([0.3, -0.5, 0.2],)),
+                (jax_named_scan, (:y, :b), :s, (y, 0.7)),
+                (jax_checked, (:x,), :m, (x,)))
+            native = prepare(kernel; have, want)
+            src = jax_source(kernel; have, want)
+            @test rk_jax_evaluate(src, "kernel", args).value ≈ native(args...) rtol = 1e-12
+        end
+        # A check that fails on the data raises when the module runs.
+        src = jax_source(jax_checked; have = (:x,), want = :m)
+        @test_throws "m is too large" rk_jax_evaluate(src, "kernel", ([5e4, 3e5],))
 
         R = [0.0, 1.2, 0.3, 0.0, 2.5, 0.1]
         native = prepare(jax_loop; have = (:rho, :R, :kappa), want = :s)

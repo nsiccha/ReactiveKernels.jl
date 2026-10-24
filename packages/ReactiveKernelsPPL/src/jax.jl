@@ -72,7 +72,9 @@ _jax_dtype_name(::Type{<:AbstractArray{<:AbstractArray{T}}}) where {T} = _jax_dt
 _jax_dtype_name(::Type{Bool}) = "bool"
 _jax_dtype_name(::Type{<:Integer}) = "int64"
 _jax_dtype_name(::Type{<:AbstractFloat}) = "float64"
-_jax_dtype_name(T::Type) = string(T)
+# Non-numeric columns (level labels) cross as Python objects; the module reads
+# none of them in arithmetic, only their bound codes.
+_jax_dtype_name(T::Type) = "object"
 
 # --- translations of RKPPL's own functions ---------------------------------------
 
@@ -114,3 +116,13 @@ ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
         ::typeof(_ppl_range_values), args::Vector{ReactiveKernels._PyVal}) =
     ReactiveKernels._jax_is_array(args[1].T) ?
     ReactiveKernels._jax_index_values(ctx, args[1], args[2:end]) : args[1]
+
+# The broadcast row count of bound columns: their first-axis lengths are
+# shapes, known while JAX traces, and compatible (one, or a common length).
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_observation_rows), args::Vector{ReactiveKernels._PyVal})
+    rows = [ReactiveKernels._jax_is_array(a.T) ?
+        ReactiveKernels._py_atom(a.code) * ".shape[0]" : "1" for a in args]
+    ReactiveKernels._PyVal(length(rows) == 1 ? only(rows) : "max(" * join(rows, ", ") * ")",
+                           Int, true)
+end

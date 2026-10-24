@@ -109,7 +109,15 @@ The translation follows the [core constraints](constraints.md):
   `ReactantCore.@trace` control flow is translated as written). Their carry is the locals the body assigns, and an
   indexed write `A[i] = v` is `A.at[i].set(v)`.
 - **Static conditions** decide while JAX traces: shapes, literals, and guards
-  such as `n == k || throw(...)`.
+  such as `n == k || throw(...)`. A failing guard raises while JAX traces,
+  including inside a data-dependent branch the native program would not take
+  (the guard is a fact of the shapes, so every run of that branch fails it).
+- **Runtime checks** (`ReactiveKernels._runtime_check`, the domain checks in
+  helpers such as the multivariate normal densities) run when the module runs,
+  through `jax.debug.callback`, and raise on values that fail them. Under a
+  data-dependent condition a check is masked by it: JAX evaluates both arms
+  of a vmapped condition, and the check holds for lanes that do not take its
+  arm.
 - **No unrolling.** Nothing iterates in Python, and sizes are read from the
   inputs (`x.shape[0]`). The same module serves every data size of the same
   program.
@@ -138,7 +146,9 @@ The interface conventions:
 A function that a recipe calls is translated if:
 
 - it has a `jax.numpy` counterpart (Base and LogExpFunctions functions, and
-  SpecialFunctions through the package extension);
+  SpecialFunctions through the package extension). `logbeta` is a helper the
+  module defines, since `jax.scipy.special.betaln` (JAX 0.12) is accurate to
+  about 1e-6 in float64 once an argument reaches 8;
 - it is defined with `@traceable`, in which case its authored body is
   translated;
 - it is a prepared kernel, which becomes a module-level function of its plan;
@@ -156,7 +166,7 @@ recipe and the construct:
 - a plain helper with loops or branches that is not `@traceable`;
 - a loop whose trip count is data with no static bound (JAX loops and arrays
   need static shapes);
-- a `throw` that depends on data;
+- a `throw` that depends on data (a runtime check is the form that has one);
 - `jax.grad` through a `while` loop (JAX differentiates `lax.while_loop`
   forward only; write a differentiated loop as a `for` over a range);
 - filtered comprehensions (their length is data);

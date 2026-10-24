@@ -30,6 +30,9 @@ const _JAX_LENGTHS = [9, 4, 13, 6]
 const _JAX_R = [abs.(randn(_JAX_RNG, n)) for n in _JAX_LENGTHS]
 const _JAX_YR = [0.1 .+ 0.05 .* jax_ppl_recurrence(R, 0.7, 0.3) .+ 0.01 .* randn(_JAX_RNG, length(R))
                  for R in _JAX_R]
+const _JAX_TRIALS = rand(_JAX_RNG, 10:20, _JAX_N)
+const _JAX_SUCCESSES = [rand(_JAX_RNG, 0:n) for n in _JAX_TRIALS]
+const _JAX_HURDLE = [rand(_JAX_RNG) < 0.3 ? 0 : rand(_JAX_RNG, 1:5) for _ in 1:_JAX_N]
 
 const _JAX_CASES = (
     gaussian = () -> (@rkppl(begin
@@ -54,6 +57,41 @@ const _JAX_CASES = (
         theta ~ Dirichlet(ones(3))
         y .~ Categorical(theta)
     end))(;) | (; y = rand(_JAX_RNG, 1:3, _JAX_N)),
+    # A scan of two states, whose step outputs a named tuple.
+    two_state_scan = () -> (@rkppl(begin
+        beta ~ Uniform(0, 1); sigma ~ Exponential(1.0); s ~ Exponential(1.0)
+        @scan begin
+            level[1] = 0.0
+            increment[1] = 0.0
+            for t in 2:T
+                z ~ Normal(0, 1)
+                increment[t] = beta * increment[t - 1] + sigma * z
+                level[t] = level[t - 1] + increment[t]
+            end
+        end
+        y .~ Normal.(level, s)
+    end))(; T = 12) | (; y = cumsum(0.3 .* _JAX_X[1:12])),
+    # `logbeta` of arguments above 8 (`jax.scipy.special.betaln` is not
+    # float64-accurate there).
+    beta_binomial = () -> (@rkppl(begin
+        a ~ Normal(0, 1); phi ~ Exponential(10.0)
+        c .~ BetaBinomial2.(n, logistic.(a .+ 0.3 .* x), phi)
+    end))(; x = _JAX_X, n = _JAX_TRIALS) | (; c = _JAX_SUCCESSES),
+    # Nested lazy branches inside a plate cell.
+    hurdle = () -> (@rkppl(begin
+        a ~ Normal(0, 1); e ~ Normal(0, 1)
+        y .~ HurdlePoisson.(exp.(a .+ 0.2 .* x), logistic.(e .+ 0.1 .* x))
+    end))(; x = _JAX_X) | (; y = _JAX_HURDLE),
+    # An LKJ Cholesky factor (a loop whose branch arms differ in value type),
+    # and multivariate normal slices with their runtime factor checks.
+    lkj = () -> (@rkppl(begin
+        L ~ LKJCholesky(3, 2.0)
+        sd[1:3] .~ Exponential.(1)
+        F = sd .* L
+        eachcol(B[1:3, 1:4]) .~ MvNormalCholesky(zeros(3), F)
+        s ~ Exponential(1)
+        y .~ Normal.(B[1, g] .+ B[2, g] .* x, s)
+    end))(; x = _JAX_X, g = _JAX_G) | (; y = _JAX_Y),
     ragged_recurrence = () -> (@rkppl(begin
         rho ~ LogNormal(log(0.7), 0.3); kappa ~ LogNormal(log(0.3), 1.0)
         b0 ~ Normal(0.1, 0.1); tau ~ Exponential(0.05); s ~ Exponential(0.05)
