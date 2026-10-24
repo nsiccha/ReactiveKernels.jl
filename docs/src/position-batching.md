@@ -309,7 +309,8 @@ reverse-mode AD, keeps allocating its cell values at every cell.
 
 Two RK-owned callees whose mathematics is a graph fill lane slots in the same
 way: a [derivative rule](manual-derivative-rules.md)'s primal cut, called as a
-recipe (`u = rule(t, p)`) or in a lazy arm, and a child kernel holding a plate
+recipe (`u = rule(t, p)`) or in a lazy arm, by its bare name or a
+module-qualified one (`Pkg.Sub.rule(t, p)`), and a child kernel holding a plate
 or scan called in a lazy arm (`flag ? child_a(t, p) : child_b(t, p)`), which
 is prepared once when the caller is defined and applied where the arm runs.
 In a residual such a call runs the callee's lane kernel: its plan lowered as

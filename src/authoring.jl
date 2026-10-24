@@ -4671,8 +4671,9 @@ _kernel_has_node_marker(x) =
         (x.head === :macrocall && !isempty(x.args) && _kernel_is_node_macro(x.args[1])) ||
         any(_kernel_has_node_marker, x.args))
 
-# Resolve a callee/macro-head AST (`name`, `Mod.name`, or a `GlobalRef`) to its BINDING VALUE in
-# `mod`, or `nothing`. Reads bindings only (no call eval) — inside the compiler boundary.
+# Resolve a callee/macro-head AST (`name`, `Mod.name`, `Mod.Sub.name`, or a `GlobalRef`) to its
+# BINDING VALUE in `mod`, or `nothing`. A qualified name resolves its owner first, at any depth.
+# Reads bindings only (no call eval) — inside the compiler boundary.
 _kernel_resolve_binding(::Module, callee::GlobalRef) =
     isdefined(callee.mod, callee.name) ? getglobal(callee.mod, callee.name) : nothing
 
@@ -4680,13 +4681,11 @@ function _kernel_resolve_binding(mod::Module, callee)
     if callee isa Symbol
         isdefined(mod, callee) ? getglobal(mod, callee) : nothing
     elseif callee isa Expr && callee.head === :(.) && length(callee.args) == 2 &&
-           callee.args[1] isa Symbol && callee.args[2] isa QuoteNode
-        outer = callee.args[1]
-        isdefined(mod, outer) || return nothing
-        outerval = getglobal(mod, outer)
+           callee.args[2] isa QuoteNode
+        outerval = _kernel_resolve_binding(mod, callee.args[1])
         inner = callee.args[2].value
         if outerval isa Module
-            isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
+            inner isa Symbol && isdefined(outerval, inner) ? getglobal(outerval, inner) : nothing
         elseif outerval isa Union{_StatefulKernelSkeleton,KernelObjectSpec}
             inner in kernel_endpoint_names(outerval) ? getproperty(outerval, inner) : nothing
         else

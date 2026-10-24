@@ -111,6 +111,47 @@ end
     return total
 end
 
+# The rules reached by module-qualified names, one and two levels deep (snag
+# derivative-rule-a49be6b8): a qualified callee resolves as its bare name does.
+module Callees
+const decay_rule = parentmodule(@__MODULE__).decay_rule
+module Nested
+const choice_rule = parentmodule(parentmodule(@__MODULE__)).choice_rule
+end
+end
+
+# Units stored in a subject cell, the lags passed as a `Ref` operand, read
+# whole by two plates.
+@kernel qualified_cells(theta, subjects, ts, flag) = begin
+    totals = plate(subjects) do treatments
+        params = plate(treatments) do gp
+            gp .* theta
+        end
+        units = plate(params, Ref(ts)) do p, lags
+            Callees.Nested.choice_rule(lags, p, flag)
+        end
+        sums = plate(units) do u
+            s::Float64 = sum(u)
+            s
+        end
+        lasts = plate(units) do u
+            l::Float64 = u[end]
+            l
+        end
+        t::Float64 = sum(sums) + sum(lasts)
+        t
+    end
+    return totals
+end
+
+# A qualified rule called as a recipe of the residual's top level.
+@kernel qualified_top(theta, q, ts) = begin
+    p = q .* theta
+    u = Callees.decay_rule(ts, p)
+    t::Float64 = sum(u)
+    return t
+end
+
 function subjects_input(count, treatments, positions)
     subjects = [[[1.0 + 0.01 * (s + t), 0.1 + 0.001 * t] for t in 1:treatments]
                 for s in 1:count]
@@ -126,6 +167,9 @@ reference_scalar(spec, theta, rest...) = let scalar = prepare(spec)
     [scalar(th, rest...) for th in theta]
 end
 bytes(f::F, args...) where {F} = (f(args...); minimum(@allocated(f(args...)) for _ in 1:5))
+readers_of(spec, schedule) =
+    (vectorize(spec; batched = :theta), copy(vectorize(spec; batched = :theta, reuse = true)),
+     copy(vectorize(spec; batched = :theta, reuse = true, schedule)))
 
 @testset "callee lanes: values" begin
     schedule = NativeScheduling(workers = 2, chunk_size = 2)
@@ -135,7 +179,9 @@ bytes(f::F, args...) where {F} = (f(args...); minimum(@allocated(f(args...)) for
              (arm_cells, (theta, subjects, ts, true)),
              (arm_cells, (theta, subjects, ts, false)),
              (choice_cells, (theta, subjects, ts, true)),
-             (choice_cells, (theta, subjects, ts, false)))
+             (choice_cells, (theta, subjects, ts, false)),
+             (qualified_cells, (theta, subjects, ts, true)),
+             (qualified_cells, (theta, subjects, ts, false)))
     for (spec, args) in cases
         expected = reference(spec, args...)
         readers = (vectorize(spec; batched = :theta), copy(vectorize(spec; batched = :theta, reuse = true)),
@@ -153,10 +199,15 @@ bytes(f::F, args...) where {F} = (f(args...); minimum(@allocated(f(args...)) for
               copy(vectorize(stored_cells; batched = :theta, reuse = true, schedule))), call in 1:2
         @test isequal(r(theta, groups, ragged), expected)
     end
+    q = [1.2, 0.1]
+    expected = reference_scalar(qualified_top, theta, q, ts)
+    for r in readers_of(qualified_top, schedule), call in 1:2
+        @test isequal(r(theta, q, ts), expected)
+    end
 end
 
 @testset "callee lanes: lowering" begin
-    for spec in (rule_cells, arm_cells, choice_cells)
+    for spec in (rule_cells, arm_cells, choice_cells, qualified_cells, qualified_top)
         @test occursin("_lane_call", string(code_expr(vectorize(spec; batched = :theta, reuse = true))))
         # Outside a position residual the callee keeps its ordinary call.
         @test !occursin("_lane_call", string(code_expr(prepare(spec))))
@@ -176,7 +227,8 @@ end
     ts = times(500)
     unit = sizeof(Float64) * length(ts)
     for (spec, extra) in ((rule_cells, ()), (arm_cells, (true,)), (arm_cells, (false,)),
-                          (choice_cells, (true,)), (choice_cells, (false,)))
+                          (choice_cells, (true,)), (choice_cells, (false,)),
+                          (qualified_cells, (true,)), (qualified_cells, (false,)))
         r = copy(vectorize(spec; batched = :theta, reuse = true))
         per_cell = map(((4, 4), (16, 4), (16, 16))) do (count, positions)
             theta, subjects = subjects_input(count, 3, positions)
@@ -184,6 +236,14 @@ end
         end
         @test maximum(per_cell) < unit / 16
     end
+    # A qualified rule called as a top-level recipe: its result fills the
+    # call's lane slot at every position.
+    r = copy(vectorize(qualified_top; batched = :theta, reuse = true))
+    per_position = map((4, 16)) do positions
+        theta = collect(range(0.9, 1.1; length = positions))
+        bytes(r, theta, [1.2, 0.1], ts) / positions
+    end
+    @test maximum(per_position) < unit / 16
 end
 
 end
