@@ -14,6 +14,13 @@ const pair_alias = pair
     return total
 end
 
+# `plus` two module levels down: a qualified name resolves at any depth.
+module Outer
+module Inner
+const plus = parentmodule(parentmodule(@__MODULE__)).plus
+end
+end
+
 @kernel recurrence(xs, gain) = begin
     updates = scan(xs; init=0.0) do carry, x
         next = carry + x * gain
@@ -64,7 +71,7 @@ end
 
 @testset "computed graph arguments and nested values splice transparently" begin
     for head in (:plus, GlobalRef(@__MODULE__, :plus),
-                 :(GlobalRefCompositionTests.plus))
+                 :(GlobalRefCompositionTests.plus), :(Outer.Inner.plus))
         spec = resolved(:(parent(x::Float64) = begin
             first = $head(x + 1, 2.0)
             second = 3 * $head($head(x, x), first)
