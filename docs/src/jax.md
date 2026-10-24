@@ -147,7 +147,10 @@ The translation follows the [core constraints](constraints.md):
   `ReactantCore.@trace` control flow is translated as written). Their carry is the locals the body assigns, and an
   indexed write `A[i] = v` is `A.at[i].set(v)`.
 - **Static conditions** decide while JAX traces: shapes, literals, and guards
-  such as `n == k || throw(...)`. A failing guard raises while JAX traces,
+  such as `n == k || throw(...)`. A function of such values is computed with
+  NumPy, which JAX does not stage, so it decides too: a guard
+  `isfinite(jitter) && jitter >= 0 || throw(...)` over a literal a caller
+  passes, or `log(length(x)) >= 0`. A failing guard raises while JAX traces,
   including inside a data-dependent branch the native program would not take
   (the guard is a fact of the shapes, so every run of that branch fails it).
 - **Runtime checks** (`ReactiveKernels._runtime_check`, the domain checks in
