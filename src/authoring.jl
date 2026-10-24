@@ -3852,7 +3852,8 @@ plan type selects its own rule.  Annotate the arguments that select the
 method; leave the arguments that carry traced values untyped.
 
 Supported: positional arguments with optional defaults, `where` clauses, and
-a return-type annotation (kept on the native method only).  A `@traceable`
+a return-type annotation (kept on the native method only).  A docstring before
+`@traceable` documents the method, as it does a plain definition.  A `@traceable`
 method of a function from Base, Core or ReactiveKernels is rejected, and so
 are keyword arguments and a `return` before the end of the body (write that
 branch as an expression).  Calls with keyword arguments are not routed to the
@@ -3911,8 +3912,12 @@ function _traceable_definition(def, mod::Module)
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
     ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
     source = _traceable_source_method(callee, formals, wheres, body, mod)
-    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., source..., callee))
+    esc(Expr(:block, _documentable(native), Expr(:(=), companion, rewritten), ignored...,
+             source..., callee))
 end
+
+# The authored method, marked for a preceding docstring to document it.
+_documentable(def) = Expr(:macrocall, GlobalRef(Core, Symbol("@__doc__")), nothing, def)
 
 """
     @_record_source f(args...) = body
@@ -3939,7 +3944,7 @@ macro _record_source(def)
     body = _traceable_tail_body(def.args[2], signature)
     source = _traceable_source_method(signature.args[1], signature.args[2:end], wheres, body,
                                       __module__)
-    esc(Expr(:block, def, source..., signature.args[1]))
+    esc(Expr(:block, _documentable(def), source..., signature.args[1]))
 end
 
 """
