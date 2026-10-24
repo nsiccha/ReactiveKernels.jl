@@ -1,5 +1,6 @@
 using ReactiveKernels
 using Test
+using LogExpFunctions: log1mexp
 
 include(joinpath(@__DIR__, "jax_python.jl"))
 
@@ -206,6 +207,38 @@ end
     return s
 end
 
+# Guards over values known while JAX traces are decided then: a literal a
+# caller passes to a spliced child, a shape, a helper of a literal. Their
+# calls are NumPy's, which JAX does not stage (snag jax-source-liter-a9e6219e).
+@kernel jax_guarded_shift(x, jitter) = begin
+    jit = begin
+        isfinite(jitter) && jitter >= 0 ||
+            throw(ArgumentError("jitter must be finite and nonnegative, got $jitter"))
+        Float64(jitter)
+    end
+    total = sum(x) + jit
+end
+@kernel jax_literal_guard(x::Vector{Float64}) = begin
+    t = jax_guarded_shift(x, 1.0e-9)
+    return t
+end
+@kernel jax_literal_guard_fails(x::Vector{Float64}) = begin
+    t = jax_guarded_shift(x, -1.0)
+    return t
+end
+@kernel jax_static_guards(x::Vector{Float64}) = begin
+    scale = begin
+        log(length(x)) >= 0 || throw(ArgumentError("x is empty"))
+        log(length(x))
+    end
+    offset = begin
+        log1mexp(-1.0) < 0 || throw(ArgumentError("log1mexp(-1) is not negative"))
+        log1mexp(-1.0)
+    end
+    total = scale * sum(x) + offset
+    return total
+end
+
 # Data preparation whose shapes follow the data's values (decision 1ooufd4):
 # with `data`, it is `prepare_data`, host NumPy with Python control flow.
 # Helpers whose loops `@traceable`'s traced form cannot carry (`break`,
@@ -343,6 +376,17 @@ end
     plain = string(jax_source(jax_plain; have = (:w, :x), want = :s))
     @test occursin("w ** 2", plain)
     @test !occursin(r"<[a-z]", plain)
+    # Static guards are Python conditionals over NumPy values, not `lax.cond`.
+    guarded = string(jax_source(jax_literal_guard; have = (:x,), want = :t))
+    @test occursin("np.isfinite(", guarded)
+    @test occursin("import numpy as np", guarded)
+    @test !occursin("jax.lax.cond(", guarded)
+    static = string(jax_source(jax_static_guards; have = (:x,), want = :total))
+    @test occursin("np.log(x.size)", static)
+    @test occursin("_rk_log1mexp_np(-1.0)", static)
+    @test !occursin("jax.lax.cond(", static)
+    # A module whose functions compute nothing with NumPy does not import it.
+    @test !occursin("import numpy", text)
     # Several functions over one boundary, with module constants.
     multi = jax_source(jax_gaussian; have = (:mu, :x, :logsigma),
                        functions = (log_density = :lp, both = (:lp, :sigma),
@@ -419,6 +463,19 @@ end
         # A check that fails on the data raises when the module runs.
         src = jax_source(jax_checked; have = (:x,), want = :m)
         @test_throws "m is too large" rk_jax_evaluate(src, "kernel", ([5e4, 3e5],))
+
+        for (kernel, want) in ((jax_literal_guard, :t), (jax_static_guards, :total))
+            native = prepare(kernel; have = (:x,), want)
+            src = jax_source(kernel; have = (:x,), want)
+            r = rk_jax_evaluate(src, "kernel", (x,); grad = true)
+            @test r.value ≈ native(x) rtol = 1e-12
+            @test r.grad ≈ rk_fd_gradient(native, x) rtol = 1e-6
+        end
+        # A literal that fails its guard raises while JAX traces, as the
+        # native kernel raises when called.
+        @test_throws "jitter must be finite" prepare(jax_literal_guard_fails; have = (:x,), want = :t)(x)
+        src = jax_source(jax_literal_guard_fails; have = (:x,), want = :t)
+        @test_throws "jitter must be finite" rk_jax_evaluate(src, "kernel", (x,))
 
         R = [0.0, 1.2, 0.3, 0.0, 2.5, 0.1]
         native = prepare(jax_loop; have = (:rho, :R, :kappa), want = :s)

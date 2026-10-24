@@ -53,11 +53,16 @@ function _host_text(text::AbstractString)
     print(out, _host_names(SubString(text, last)))
     String(take!(out))
 end
+# A JAX construct left in host text (outside its string literals): that text
+# has no host translation.
+_host_leftover(text::AbstractString) =
+    occursin(r"\b(?:jax|lax)\.|\.at\[", replace(text, _PY_STRING => "\"\""))
+
 # A helper's host text; a JAX construct left in it has no host translation.
 function _host_helper_text(ctx::_JaxContext, text::AbstractString)
     text = _host_text(text)
     for line in split(text, '\n')
-        occursin(r"\b(?:jax|lax)\.|\.at\[", replace(line, _PY_STRING => "\"\"")) &&
+        _host_leftover(line) &&
             _jax_error("the line `", strip(line), "` has no host NumPy translation",
                        _jax_where(ctx))
     end
@@ -65,14 +70,20 @@ function _host_helper_text(ctx::_JaxContext, text::AbstractString)
 end
 _host_names(s::AbstractString) = foldl((t, r) -> replace(t, r), _HOST_NAMES; init = String(s))
 
+# The NumPy spelling of an expression over static operands, or `nothing` when
+# it has no host translation.
+function _host_static_text(code::AbstractString)
+    text = _host_text(code)
+    _host_leftover(text) ? nothing : text
+end
+
 # Rewrite the lines a recipe emitted from `first` on; a JAX construct left in
 # them has no host translation.
 function _host_lines!(ctx::_JaxContext, first::Int)
     lines = ctx.scope.lines
     for i in first:length(lines)
         lines[i] = _host_text(lines[i])
-        code = replace(lines[i], _PY_STRING => "\"\"")
-        occursin(r"\b(?:jax|lax)\.|\.at\[", code) &&
+        _host_leftover(lines[i]) &&
             _jax_error("the line `", strip(lines[i]), "` has no host NumPy translation",
                        _jax_where(ctx))
     end
