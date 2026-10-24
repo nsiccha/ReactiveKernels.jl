@@ -72,6 +72,7 @@ include("symmetric_eigen_rules.jl")
 include("affine_logistic.jl")
 include("cholesky.jl")
 include("native_ode.jl")
+include("jax.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export PreparedADOperator, PreparedADPushforward, PreparedADHVP
@@ -103,6 +104,7 @@ export KernelSpec, KernelObjectSpec, @kernel, @node, @traceable, kernel_graph, p
 export PartialFunction, partial
 # Experimental captured-control consumer interface.
 export prepare_transpiled, initial_transpiled_state, transpiled_endpoint
+export jax_source, JAXSource, JAXFunction, JAXEmissionError
 export DAGVisualization, visualize, dot_source, save_visualization
 export recipe_kind, recipe_inventory
 # Reactive layer
