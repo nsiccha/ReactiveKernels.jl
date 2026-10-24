@@ -406,8 +406,13 @@ function _jax_expr(ctx::_JaxContext, ::Val{:tuple}, ex)
                       NamedTuple{names,Tuple{(v.T for v in values)...}})
     end
     values = [_jax_expr(ctx, a) for a in ex.args]
-    _PyVal(_jax_tuple_code(values), Tuple{(v.T for v in values)...})
+    _PyVal(_jax_tuple_code(values), Tuple{(v.T for v in values)...}, false, _jax_tuple_extent(values))
 end
+# The extents of a tuple's padded elements, as a Python tuple (`None` for an
+# element that is not padded), or "" when none is.
+_jax_tuple_extent(values) = all(v -> isempty(v.extent), values) ? "" :
+    "(" * join((isempty(v.extent) ? "None" : v.extent for v in values), ", ") *
+    (length(values) == 1 ? ",)" : ")")
 _jax_tuple_code(values) = "(" * join((v.code for v in values), ", ") *
                           (length(values) == 1 ? ",)" : ")")
 
@@ -439,8 +444,10 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
         length(indices) == 1 && indices[1] isa Integer ||
             _jax_error("a tuple is indexed with a literal integer only", _jax_where(ctx))
         k = indices[1]
-        T = x.T <: NamedTuple ? fieldtype(x.T, k) : fieldtype(x.T, k)
-        return _PyVal(x.code * "[" * string(k - 1) * "]", T)
+        T = fieldtype(x.T, k)
+        extent = isempty(x.extent) ? "" : x.extent * "[" * string(k - 1) * "]"
+        return _PyVal(x.code * "[" * string(k - 1) * "]", T, false,
+                      _jax_is_array(T) ? extent : "")
     end
     _jax_is_array(x.T) || _jax_error("indexing a value of type `", x.T, "`", _jax_where(ctx))
     N = ndims(x.T)
@@ -458,15 +465,23 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
     E = eltype(x.T)
     T = kept == 0 ? E : Array{E,kept}
     if _jax_ragged(x.T)
-        kept == 0 || _jax_error("a gather of several groups of a ragged array", _jax_where(ctx))
         isempty(x.extent) && _jax_error("a ragged array without its lengths", _jax_where(ctx))
+        # One group's row and length, or several groups' rows and lengths.
         return _PyVal(x.code * "[" * join(parts, ", ") * "]", T, false,
                       x.extent * "[" * join(parts, ", ") * "]")
     end
-    isempty(x.extent) || kept == 0 ||
-        _jax_error("slicing a padded group vector has no JAX translation", _jax_where(ctx))
-    _PyVal(x.code * "[" * join(parts, ", ") * "]", T)
+    if !isempty(x.extent) && kept > 0
+        # A gather from a padded group vector by an index vector: the indices
+        # are valid entries, and the result is padded as the index is.
+        gather = length(indices) == 1 ? _jax_bound_expr(ctx, x, 1, indices[1]) : nothing
+        gather !== nothing && _jax_is_array(gather.T) && eltype(gather.T) <: Integer ||
+            _jax_error("slicing a padded group vector has no JAX translation", _jax_where(ctx))
+        return _PyVal(x.code * "[" * join(parts, ", ") * "]", T, false, gather.extent)
+    end
+    _PyVal(x.code * "[" * join(parts, ", ") * "]", T, false, kept > 0 ? _jax_index_extent(ctx, indices) : "")
 end
+# The extent of a gather result: its index vector's, when that is padded.
+_jax_index_extent(ctx, indices) = ""
 
 # One index position: the Python index text and whether it keeps a dimension.
 function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index)
@@ -568,6 +583,45 @@ function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
         ctx.traced_branches -= 1
     end
     _PyVal((is_or ? "jnp.logical_or(" : "jnp.logical_and(") * a.code * ", " * b.code * ")", Bool)
+end
+
+# `map(xs...) do args... body end`: the body as a function of one element of
+# each collection, vectorized over them (padded collections stay padded).
+function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
+    call, lambda = ex.args
+    call isa Expr && call.head === :call && lambda isa Expr && lambda.head === :-> ||
+        _jax_error("the do-block `", ex, "` has no JAX translation", _jax_where(ctx))
+    f = _jax_resolve(ctx, call.args[1])
+    f === map || _jax_error("a do-block on `", f, "` has no JAX translation", _jax_where(ctx))
+    collections = [_jax_expr(ctx, a) for a in call.args[2:end]]
+    all(c -> _jax_rank(c.T) == 1, collections) ||
+        _jax_error("`map` over collections that are not vectors", _jax_where(ctx))
+    params = lambda.args[1]
+    names = params isa Symbol ? Symbol[params] : Symbol[p for p in params.args]
+    length(names) == length(collections) ||
+        _jax_error("a do-block with ", length(names), " arguments over ", length(collections),
+                   " collections", _jax_where(ctx))
+    elements = [_PyVal(_jax_fresh(ctx, n), eltype(c.T)) for (n, c) in zip(names, collections)]
+    fname = _jax_fresh(ctx, :element)
+    outer = ctx.scope
+    inner = _JaxScope(outer)
+    inner.indent = outer.indent + 1
+    saved = copy(ctx.locals)
+    ctx.scope = inner
+    result = try
+        for (n, e) in zip(names, elements)
+            ctx.locals[n] = e
+        end
+        _jax_expr(ctx, lambda.args[2])
+    finally
+        ctx.scope = outer
+        empty!(ctx.locals); merge!(ctx.locals, saved)
+    end
+    push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * join((e.code for e in elements), ", ") * "):")
+    append!(outer.lines, inner.lines)
+    push!(outer.lines, "    "^inner.indent * "return " * result.code)
+    _PyVal("jax.vmap(" * fname * ")(" * _jax_args(collections) * ")", Vector{_jax_typeof(result)},
+           false, _jax_extent(collections))
 end
 
 # Loops. A `for` over a range is `jax.lax.fori_loop` over a function of the
@@ -1462,7 +1516,7 @@ _jax_call_positional(ctx::_JaxContext, ::typeof(Base.broadcasted), args::Vector{
     _jax_broadcast(ctx, _jax_function_of(args[1]), args[2:end])
 _jax_call_positional(ctx::_JaxContext, ::typeof(Base.materialize), args::Vector{_PyVal}) = only(args)
 _jax_call_positional(ctx::_JaxContext, ::typeof(tuple), args::Vector{_PyVal}) =
-    _PyVal(_jax_tuple_code(args), Tuple{(a.T for a in args)...})
+    _PyVal(_jax_tuple_code(args), Tuple{(a.T for a in args)...}, false, _jax_tuple_extent(args))
 function _jax_call_positional(ctx::_JaxContext, ::typeof(Base.literal_pow), args::Vector{_PyVal})
     f, x, p = args
     p.T isa Type && p.T <: Val && !_jax_is_array(x.T) ||
@@ -1685,13 +1739,24 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     length(ranks) == 1 || _jax_error("a plate over arrays of different ranks (",
         join(string.(ranks), ", "), ") has no JAX translation yet", _jax_where(ctx))
     R = only(ranks)
-    ragged = Bool[_jax_ragged(v.T) for v in inputs]
+    # Arguments whose cell value is padded: a ragged array's rows, and the
+    # padded entries of an array of tuples (a shared cell plate's values).
+    ragged = Bool[!isempty(v.extent) && (_jax_ragged(v.T) || (_jax_is_array(v.T) &&
+                  eltype(v.T) <: Tuple) || !mapped[i]) && !(mapped[i] && eltype(v.T) <: Number)
+                  for (i, v) in enumerate(inputs)]
     any(ragged[i] && mapped[i] for i in eachindex(inputs)) && R != 1 &&
         _jax_error("a ragged plate of rank ", R, _jax_where(ctx))
     # A mapped padded group vector: the plate runs over its entries.
     padded = [mapped[i] && !ragged[i] && !isempty(v.extent) for (i, v) in enumerate(inputs)]
     cell_types = Any[mapped[i] ? eltype(v.T) : _jax_unref(v.T) for (i, v) in enumerate(inputs)]
     cell_extents = Bool[ragged[i] for i in eachindex(inputs)]
+    # A lazy branch in the cell stays a `lax.cond`. Under `vmap`, JAX batches a
+    # `lax.cond` whose condition differs between cells by evaluating both arms
+    # and selecting; each lane's untaken arm reads its inputs through
+    # `stop_gradient`, so a NaN or Inf it computes reaches neither the selected
+    # value nor the gradient (measured with JAX 0.12.0.1: the batched jaxpr
+    # selects `stop_gradient` inputs per arm; a vmapped `cond(x > 0, log(x), 0)`
+    # at x = 0 has gradient 0, where `jnp.where` gives NaN).
     cell, wants, with_length = _jax_plan_function!(ctx, :cell, body, cell_types;
                                                    extents = cell_extents)
     want = only(wants)
@@ -1710,6 +1775,17 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         call = "jax.vmap(" * call * ", in_axes=" * axes_text * ")"
     end
     call *= "(" * join(args, ", ") * ")"
+    if E <: Tuple && !(E <: NamedTuple)
+        R == 1 || _jax_error("a plate of rank ", R, " whose cell returns a tuple", _jax_where(ctx))
+        result = _jax_fresh(ctx, :plate_value)
+        if only(with_length)
+            lengths = _jax_fresh(ctx, :plate_lengths)
+            _jax_emit!(ctx, result * ", " * lengths * " = " * call)
+            return [_PyVal(result, Vector{E}, false, lengths)]
+        end
+        _jax_emit!(ctx, result * " = " * call)
+        return [_PyVal(result, Vector{E})]
+    end
     if E <: AbstractVector
         R == 1 || _jax_error("a plate of rank ", R, " whose cell returns a vector", _jax_where(ctx))
         result = _jax_fresh(ctx, :plate_value)
