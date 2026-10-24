@@ -53,6 +53,13 @@ end
     return s
 end
 
+@kernel jax_generators(w::Float64, x::Vector{Float64}) = begin
+    s = sum(w * x[i]^2 for i in 1:length(x); init = 0.0)
+    v = [exp(w * x[i]) for i in eachindex(x)]
+    t = s + sum(v) + sum(x[i] for i in eachindex(x) if x[i] > 0)
+    return t
+end
+
 @traceable jax_test_count(x::AbstractVector, n::Integer) = begin
     acc = zero(eltype(x))
     for i in 1:n
@@ -80,6 +87,10 @@ end
     @test occursin("jax.lax.fori_loop(", loop)
     @test occursin(".at[", loop)
     @test !occursin(r"^\s*for "m, loop)
+    generators = string(jax_source(jax_generators; have = (:w, :x), want = :t))
+    @test occursin("jax.vmap(element", generators)
+    @test occursin("jnp.where(kept", generators)
+    @test !occursin(r"^\s*for "m, generators)
     # Several functions over one boundary, with module constants.
     multi = jax_source(jax_gaussian; have = (:mu, :x, :logsigma),
                        functions = (log_density = :lp, both = (:lp, :sigma),
@@ -121,6 +132,12 @@ end
         f(a) = native(a, y, x[1:4], 0.7, -0.2)
         @test r.value ≈ f(0.1) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> f(only(u)), [0.1])) rtol = 1e-6
+
+        native = prepare(jax_generators; have = (:w, :x), want = :t)
+        src = jax_source(jax_generators; have = (:w, :x), want = :t)
+        r = rk_jax_evaluate(src, "kernel", (0.4, x); grad = true)
+        @test r.value ≈ native(0.4, x) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x), [0.4])) rtol = 1e-6
 
         R = [0.0, 1.2, 0.3, 0.0, 2.5, 0.1]
         native = prepare(jax_loop; have = (:rho, :R, :kappa), want = :s)

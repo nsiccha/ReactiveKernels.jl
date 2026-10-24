@@ -708,6 +708,94 @@ function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
            false, _jax_extent(collections))
 end
 
+# Generators and comprehensions: the element expression as a function of the
+# iteration variable, `jax.vmap`ped over the range (a range with a
+# data-dependent bound runs to its static limit; reductions mask the rest).
+# Reductions combine the mapped values; `init` is added (or multiplied) in.
+const _JAX_GENERATOR_REDUCTIONS = Dict{Any,Tuple{String,String}}(
+    sum => ("jnp.sum", "0.0"), prod => ("jnp.prod", "1.0"),
+    maximum => ("jnp.max", "-jnp.inf"), minimum => ("jnp.min", "jnp.inf"),
+    any => ("jnp.any", "False"), all => ("jnp.all", "True"))
+
+function _jax_generator_values(ctx::_JaxContext, gen::Expr)
+    body, spec = gen.args[1], gen.args[2]
+    condition = nothing
+    if spec isa Expr && spec.head === :filter
+        condition, spec = spec.args[1], spec.args[2]
+    end
+    spec isa Expr && spec.head === :(=) && spec.args[1] isa Symbol ||
+        _jax_error("the generator `", gen, "` has no JAX translation", _jax_where(ctx))
+    var = spec.args[1]
+    lo, hi, bound = _jax_loop_range(ctx, spec.args[2])
+    index = _jax_fresh(ctx, var)
+    fname = _jax_fresh(ctx, :element)
+    outer = ctx.scope
+    inner = _JaxScope(outer)
+    inner.indent = outer.indent + 1
+    push!(inner.used, index)
+    saved = copy(ctx.locals)
+    ctx.scope = inner
+    value, keep = try
+        ctx.locals[var] = _PyVal(index, Int)
+        v = _jax_expr(ctx, body)
+        c = condition === nothing ? nothing : _jax_expr(ctx, condition)
+        (v, c)
+    finally
+        ctx.scope = outer
+        empty!(ctx.locals); merge!(ctx.locals, saved)
+    end
+    push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * index * "):")
+    append!(outer.lines, inner.lines)
+    push!(outer.lines, "    "^inner.indent * "return " *
+          (keep === nothing ? value.code : "(" * value.code * ", " * keep.code * ")"))
+    indices = _jax_fresh(ctx, :indices)
+    _jax_emit!(ctx, indices * " = jnp.arange(" * lo.code * ", " * _jax_plus_one(hi) * ")")
+    mapped = "jax.vmap(" * fname * ")(" * indices * ")"
+    E = _jax_typeof(value)
+    E <: Number || _jax_error("a generator whose elements are `", E, "`", _jax_where(ctx))
+    values = _jax_fresh(ctx, :values)
+    masks = String[]
+    if keep === nothing
+        _jax_emit!(ctx, values * " = " * mapped)
+    else
+        kept = _jax_fresh(ctx, :kept)
+        _jax_emit!(ctx, values * ", " * kept * " = " * mapped)
+        push!(masks, kept)
+    end
+    isempty(bound) || push!(masks, _py_infix("<=", [indices, bound]))
+    _PyVal(values, Vector{E}), masks
+end
+
+function _jax_generator_reduce(ctx::_JaxContext, f, gen::Expr, kwargs)
+    values, masks = _jax_generator_values(ctx, gen)
+    reduce, neutral = _JAX_GENERATOR_REDUCTIONS[f]
+    operand = isempty(masks) ? values.code :
+        "jnp.where(" * join(masks, " & ") * ", " * values.code * ", " * neutral * ")"
+    E = eltype(values.T)
+    result = _PyVal(reduce * "(" * operand * ")", f in (any, all) ? Bool : E)
+    for (k, v) in kwargs
+        k === :init && f in (sum, prod) ||
+            _jax_error("the keyword `", k, "` of `", f, "` over a generator", _jax_where(ctx))
+        init = _jax_expr(ctx, v)
+        result = _PyVal(_py_infix(f === sum ? "+" : "*", [init.code, result.code]),
+                        promote_type(_jax_typeof(init), E))
+    end
+    result
+end
+
+function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
+    gen = only(ex.args)
+    gen isa Expr && gen.head === :generator ||
+        _jax_error("the comprehension `", ex, "` has no JAX translation", _jax_where(ctx))
+    gen.args[2] isa Expr && gen.args[2].head === :filter &&
+        _jax_error("a filtered comprehension has a data-dependent length", _jax_where(ctx))
+    values, masks = _jax_generator_values(ctx, gen)
+    isempty(masks) && return values
+    # The range's data-dependent bound is the vector's length.
+    _, hi, bound = _jax_loop_range(ctx, gen.args[2].args[2])
+    _PyVal(values.code, values.T, false, bound)
+end
+
 # Loops. A `for` over a range is `jax.lax.fori_loop` over a function of the
 # index and the carry, the outer locals the body assigns (an indexed write
 # assigns its array). The range's bounds are static, so the loop lowers to a
@@ -919,6 +1007,11 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
     f = head isa Symbol && _jax_has_local(ctx, head) ?
         _jax_error("calling the local `", head, "` has no JAX translation", _jax_where(ctx)) :
         _jax_resolve(ctx, head)
+    # A reduction over a generator, `sum(f(i) for i in r; init = x)`.
+    if length(positional) == 1 && positional[1] isa Expr && positional[1].head === :generator &&
+       haskey(_JAX_GENERATOR_REDUCTIONS, f)
+        return _jax_generator_reduce(ctx, f, positional[1], kwargs)
+    end
     # Indexing spelled as a call reads its index expressions as indexing does.
     if _jax_is_indexing(f) && length(positional) >= 2 && isempty(kwargs)
         return _jax_index(ctx, _jax_expr(ctx, positional[1]), positional[2:end])

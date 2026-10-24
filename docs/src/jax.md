@@ -101,6 +101,9 @@ The translation follows the [core constraints](constraints.md):
   evaluates both arms of a condition that differs between cells and selects.
   Each lane's untaken arm reads its inputs through `stop_gradient`, so a NaN
   or Inf it computes reaches neither the value nor the gradient.
+- **Generators and comprehensions** (`sum(f(i) for i in r; init = x)`,
+  `[f(i) for i in r]`) are `jax.vmap` of the element over the range; a filter
+  masks the reduction.
 - **Loops** written in a recipe or a `@traceable` helper are
   `jax.lax.fori_loop`. Their carry is the locals the body assigns, and an
   indexed write `A[i] = v` is `A.at[i].set(v)`.
@@ -149,7 +152,8 @@ recipe and the construct:
 - a loop whose trip count is data with no static bound (JAX loops and arrays
   need static shapes);
 - a `throw` that depends on data;
-- `while` loops, generators and comprehensions in recipe source;
+- `while` loops in recipe source, and filtered comprehensions (their length
+  is data);
 - plates of rank above one over ragged data;
 - `history` scans.
 
