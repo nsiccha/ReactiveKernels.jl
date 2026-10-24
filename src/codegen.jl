@@ -3459,8 +3459,10 @@ end
 # a position residual), every value of the cell other than its result that has a
 # destination form keeps a lane slot across cells: `slots` are the slot names
 # the cell's AST takes after its inputs, and the collection gains them.
+# `result_slot`: the cell's result keeps a slot too, because the plate keeps a
+# per-cell table for it (`_plate_stores_cells`).
 function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
-                                atomic, callvalues)
+                                atomic, callvalues; result_slot::Bool = false)
     hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
     hint_ids = sort!(collect(keys(types)))
@@ -3468,7 +3470,8 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
     recycle = Pair{ValueId,Symbol}[]
     if cell_slots !== nothing
-        excluded = Set(canon_id(scalar.graph, v.id) for v in vcat(scalar.want, scalar.have))
+        excluded = Set(canon_id(scalar.graph, v.id) for v in
+                       (result_slot ? scalar.have : vcat(scalar.want, scalar.have)))
         for v in _lane_slot_values(scalar, excluded)
             push!(recycle, canon_id(scalar.graph, v.id) => gensym(Symbol(v.name, :_cell_slot)))
         end
@@ -3691,7 +3694,8 @@ Base.@nospecializeinfer function _lower_authored_plate_cells_native!(
     (; op_offset, scan_offsets, plate_type_exprs, nested, lane_arms) =
         types === nothing ? _plate_cell_types!(runtime_ops, runtime_recipes,
             inner_kernel, atomic, callargs, callvalues, raw_arguments,
-            input_type_hints) : types
+            input_type_hints;
+            result_slot = _plate_stores_cells(pointwise_lhs, into, cells)) : types
     inferred_eltype = nested === nothing ?
         get(plate_type_exprs, canon_id(inner.graph, only(inner.want).id),
             GlobalRef(Core, :Any)) : nested.type
@@ -3716,7 +3720,7 @@ end
 Base.@nospecializeinfer function _plate_cell_types!(
         runtime_ops, runtime_recipes, @nospecialize(inner_kernel),
         @nospecialize(atomic), @nospecialize(callargs), @nospecialize(callvalues),
-        raw_arguments, input_type_hints)
+        raw_arguments, input_type_hints; result_slot::Bool = false)
     inner = inner_kernel.plan
     op_offset = length(runtime_ops)
     append!(runtime_ops, inner_kernel.ops)
@@ -3755,7 +3759,7 @@ Base.@nospecializeinfer function _plate_cell_types!(
     nested = any(r -> r.op isa _AuthoredPlateOp, inner.recipes) ?
         _plate_nested_native!(runtime_ops, runtime_recipes, inner_kernel,
             Any[plate_type_exprs[canon_id(inner.graph, v.id)] for v in inner.have],
-            atomic, callvalues) :
+            atomic, callvalues; result_slot) :
         nothing
     for (recipe_index, recipe) in enumerate(inner.recipes)
         input_type_exprs = Any[
@@ -3797,18 +3801,43 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         !isempty(roots) && _authored_plate_unconditional_group(
             roots, root_positions, atomic, callvalues))
     sliced_scans = Set(first(pair) for pair in values(slices))
+    # A plate that stores its cells with tables (`_plate_stores_cells`) keeps,
+    # per cell, the buffers its stored result holds (below). Only values
+    # computed at every cell take part: `every_cell` maps each to the condition
+    # under which it is, `true` for an unconditional group, and for a scheduled
+    # group the test that its roots are one-dimensional domains at run time
+    # (`_authored_plate_runtime_unconditional`, a constant of the compiled
+    # body; otherwise the group's value serves several cells). A plate
+    # invariant is computed once for all cells.
+    tables = get(task_local_storage(), _CELL_TABLES, nothing)
+    stores_cells = _plate_stores_cells(pointwise_lhs, into, cells)
+    every_cell = Dict{Int,Any}()
+    for (roots, indices) in groups
+        isempty(roots) && continue
+        condition = _authored_plate_unconditional_group(
+            roots, root_positions, atomic, callvalues) ||
+            _authored_plate_runtime_unconditional(callargs, roots, root_positions, atomic)
+        condition === false && continue
+        for i in indices
+            every_cell[i] = condition
+        end
+    end
     # Within a lowering that collects cell slots (a position residual), each
-    # destination-form value these recipes produce other than the cell's
-    # result keeps a lane slot across cells, as a nested-bearing cell's own
-    # values do (`_plate_nested_native!`).
+    # destination-form value these recipes produce keeps a lane slot across
+    # cells, as a nested-bearing cell's own values do (`_plate_nested_native!`).
+    # The cell's result is stored by reference, so it keeps one only where a
+    # per-cell table keeps its buffer for that cell.
     cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
     slotted = Pair{Int,Symbol}[]
     if cell_slots !== nothing
         emitted = Set(i for (_, indices) in groups for i in indices)
-        excluded = Set(canon_id(inner.graph, v.id) for v in vcat(inner.want, inner.have))
+        excluded = Set(canon_id(inner.graph, v.id) for v in inner.have)
+        result_ids = Set(canon_id(inner.graph, v.id) for v in inner.want)
         for i in _lane_slot_recipes(inner, excluded)
             i in emitted && !haskey(lane_arms, i) && !(i in sliced_scans) &&
                 !haskey(slices, i) || continue
+            canon_id(inner.graph, only(inner.recipes[i].outputs).id) in result_ids &&
+                !(stores_cells && haskey(every_cell, i)) && continue
             push!(slotted, i => gensym(Symbol(only(inner.recipes[i].outputs).name,
                                               :_cell_slot)))
         end
@@ -3948,38 +3977,35 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
     # The result leaves the cell: it takes any slot buffer it shares memory
     # with or holds (`_lane_release!`).
     released = Symbol[(nested === nothing ? Symbol[] : nested.slots); last.(slotted)]
-    # A plate of the position residual's top level (`_CELL_TABLES`) that stores
-    # its cells also keeps, per cell, the buffers its stored result holds
+    # A plate that stores its cells with tables (`stores_cells`, above) gives
+    # each slot of a value computed at every cell a table
     # (`_lane_cell_take!`, `_lane_cell_release!`): cell `k` of the next position
-    # or borrowed call refills them. Only values computed at every cell take
-    # part; a plate invariant or a scheduled group's value is computed once
-    # for several cells. A plate inside a cell runs once per outer cell, whose
-    # stored result may still hold its cells, so it keeps no table.
-    tables = get(task_local_storage(), _CELL_TABLES, nothing)
-    table_pairs = Pair{Symbol,Symbol}[]
-    if tables !== nothing && pointwise_lhs !== nothing && !into && cells
-        every_cell = Set{Int}(i for (roots, indices) in groups
-            if !isempty(roots) && _authored_plate_unconditional_group(
-                roots, root_positions, atomic, callvalues) for i in indices)
-        per_cell = Symbol[(nested === nothing ? Symbol[] : nested.slots);
-                          Symbol[slot for (i, slot) in slotted if i in every_cell]]
-        for slot in per_cell
+    # or borrowed call refills the buffers cell `k`'s stored result holds.
+    # Where the value's condition fails, its slot is released instead.
+    table_entries = Tuple{Symbol,Symbol,Any}[]
+    if stores_cells
+        per_cell = Pair{Symbol,Any}[(nested === nothing ? Pair{Symbol,Any}[] :
+                                     Pair{Symbol,Any}[slot => true for slot in nested.slots]);
+                                    Pair{Symbol,Any}[slot => every_cell[i]
+                                     for (i, slot) in slotted if haskey(every_cell, i)]]
+        for (slot, condition) in per_cell
             table = gensym(Symbol(slot, :_cells))
             push!(tables, table)
-            push!(table_pairs, slot => table)
+            push!(table_entries, (slot, table, condition))
         end
     end
     cell_number = gensym(:plate_cell_number)
-    if !isempty(table_pairs)
+    if !isempty(table_entries)
         prepend!(loopbody.args, Any[:($cell_number += 1);
-            Any[:($(GlobalRef(@__MODULE__, :_lane_cell_take!))($slot, $table, $cell_number))
-                for (slot, table) in table_pairs]])
+            Any[:($(GlobalRef(@__MODULE__, :_lane_cell_take!))(
+                    $slot, $table, $cell_number, $plate_eltype, $condition))
+                for (slot, table, condition) in table_entries]])
         kept = Expr(:call, GlobalRef(@__MODULE__, :_lane_cell_release!), scalar_result,
-                    cell_number, (Expr(:tuple, slot, table) for (slot, table) in table_pairs)...)
+                    cell_number, (Expr(:tuple, entry...) for entry in table_entries)...)
         result = gensym(:plate_cell_result)
         push!(loopbody.args, :($result = $kept))
         scalar_result = result
-        released = setdiff(released, first.(table_pairs))
+        released = setdiff(released, Symbol[first(entry) for entry in table_entries])
     end
     if !isempty(released)
         result = gensym(:plate_cell_result)
@@ -4013,7 +4039,7 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
-    isempty(table_pairs) || (cell_loop = Expr(:block, :($cell_number = 0), cell_loop))
+    isempty(table_entries) || (cell_loop = Expr(:block, :($cell_number = 0), cell_loop))
     # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
     # SIMD needs an indexable iteration space, whereas `_plate_cells` returns
     # a Generator for one axis: `_plate_simd_cells` iterates that axis's range
@@ -4420,6 +4446,14 @@ function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = no
 end
 const _CELL_SLOTS = :ReactiveKernels_cell_slots
 const _CELL_TABLES = :ReactiveKernels_cell_tables
+
+# Whether a plate keeps per-cell tables (`_lane_cell_take!`): a plate of the
+# position residual's top level (`_CELL_TABLES`) that stores its cells in a
+# buffer of its own. A plate inside a cell runs once per outer cell, whose
+# stored result may still hold its cells, so it keeps no table.
+_plate_stores_cells(pointwise_lhs, into::Bool, cells::Bool) =
+    get(task_local_storage(), _CELL_TABLES, nothing) !== nothing &&
+    pointwise_lhs !== nothing && !into && cells
 
 # The positions in `p.recipes` of the recipes whose value keeps a lane slot:
 # each single-output producer with a destination form
