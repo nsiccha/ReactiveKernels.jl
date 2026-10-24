@@ -3910,6 +3910,34 @@ function _traceable_definition(def, mod::Module)
 end
 
 """
+    @_record_source f(args...) = body
+    @_record_source function f(args...) ... end
+
+Define the method as written and record its source for source-reading
+compilers (`jax_source`), as [`@traceable`](@ref) records it, without the
+`traced` companion: native and traced execution stay exactly the method's.
+For a helper whose compiled form is authored in place (`ReactantCore.@trace`
+control flow) rather than rewritten.
+"""
+macro _record_source(def)
+    def isa Expr && def.head in (:(=), :function) && length(def.args) == 2 ||
+        throw(ArgumentError("@_record_source expects a method definition; got `$(def)`."))
+    signature = def.args[1]
+    wheres = Any[]
+    while signature isa Expr && signature.head === :where
+        push!(wheres, signature.args[2:end])
+        signature = signature.args[1]
+    end
+    signature isa Expr && signature.head === :(::) && (signature = signature.args[1])
+    signature isa Expr && signature.head === :call ||
+        throw(ArgumentError("@_record_source expects a method definition; got `$(def)`."))
+    body = _traceable_tail_body(def.args[2], signature)
+    source = _traceable_source_method(signature.args[1], signature.args[2:end], wheres, body,
+                                      __module__)
+    esc(Expr(:block, def, source..., signature.args[1]))
+end
+
+"""
     _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module) or nothing
 
 The authored source of the `@traceable` method of `f` that arguments of

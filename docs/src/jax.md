@@ -175,4 +175,7 @@ recipe and the construct:
 
 Data preparation that happens during `bind_data` is not translated: level
 coding, design matrices and frozen definitions. The module takes the bound
-columns, as `DATA` lists them.
+columns, as `DATA` lists them. Data-only recipes in the program translate
+when their shapes follow from the input shapes. Ones whose output length
+depends on data values have no translation yet: ordinal stopping-ratio stage
+lanes, string level coding and the positions of missing values.

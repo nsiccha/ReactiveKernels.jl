@@ -60,8 +60,9 @@ end
     return t
 end
 
-# A helper written for the compiled path: `@trace` control flow, a `while`
-# loop, and a branch whose arms assign an outer local.
+# A helper written for the compiled path: `@trace` control flow, a counted
+# `while` loop (a `fori_loop`, which `jax.grad` reverses), and a branch whose
+# arms assign an outer local.
 @traceable function jax_test_traced(x::Real)
     i = 0
     h = one(x)
@@ -79,6 +80,20 @@ end
 end
 @kernel jax_traced(x::Float64) = begin
     y = jax_test_traced(x)
+    return y
+end
+# A `while` loop whose trip count is data: `jax.lax.while_loop`.
+@traceable function jax_test_doubling(x::Real)
+    h = one(x)
+    n = 0
+    while h < x
+        h = 2 * h
+        n = n + 1
+    end
+    return n * h
+end
+@kernel jax_doubling(x::Float64) = begin
+    y = jax_test_doubling(x)
     return y
 end
 
@@ -153,6 +168,22 @@ end
     return m
 end
 
+# A plain helper whose compiled form is authored in place (`@trace`): its
+# source is recorded for `jax_source`, and it gains no `traced` method.
+ReactiveKernels.@_record_source function jax_test_recorded(x)
+    result = zero(x)
+    ReactiveKernels.ReactantCore.@trace if x > 1
+        result = log(x)
+    else
+        result = x - 1
+    end
+    return result
+end
+@kernel jax_recorded(x::Float64) = begin
+    y = jax_test_recorded(x)
+    return y
+end
+
 @traceable jax_test_count(x::AbstractVector, n::Integer) = begin
     acc = zero(eltype(x))
     for i in 1:n
@@ -184,12 +215,15 @@ end
     @test occursin("jax.vmap(element", generators)
     @test occursin("jnp.where(kept", generators)
     @test !occursin(r"^\s*for "m, generators)
+    @test ReactiveKernels._traceable_source(typeof(jax_test_recorded), Float64) !== nothing
+    @test !any(m -> occursin("jax_test_recorded", string(m.sig)), methods(ReactiveKernels.traced))
     checked = string(jax_source(jax_checked; have = (:x,), want = :m))
     @test occursin("jax.debug.callback(", checked)
     @test occursin("_rk_check(jnp.logical_or(", checked)
     traced = string(jax_source(jax_traced; have = (:x,), want = :y))
-    @test occursin("jax.lax.while_loop(", traced)
+    @test occursin("jax.lax.fori_loop(", traced)
     @test occursin("jax.lax.cond(", traced)
+    @test occursin("jax.lax.while_loop(", string(jax_source(jax_doubling; have = (:x,), want = :y)))
     # Several functions over one boundary, with module constants.
     multi = jax_source(jax_gaussian; have = (:mu, :x, :logsigma),
                        functions = (log_density = :lp, both = (:lp, :sigma),
@@ -242,12 +276,18 @@ end
         src = jax_source(jax_traced; have = (:x,), want = :y)
         @test rk_jax_evaluate(src, "kernel", (0.3,)).value ≈ native(0.3) rtol = 1e-12
         @test rk_jax_evaluate(src, "kernel", (-0.3,)).value ≈ native(-0.3) rtol = 1e-12
+        @test rk_jax_evaluate(src, "kernel", (0.3,); grad = true).grad ≈
+              only(rk_fd_gradient(u -> native(only(u)), [0.3])) rtol = 1e-6
+        native = prepare(jax_doubling; have = (:x,), want = :y)
+        src = jax_source(jax_doubling; have = (:x,), want = :y)
+        @test rk_jax_evaluate(src, "kernel", (37.0,)).value ≈ native(37.0) rtol = 1e-12
 
         for (kernel, have, want, args) in (
                 (jax_alloc, (:x, :w), :s, (x, 0.7)),
                 (jax_triangle, (:z,), :s, ([0.3, -0.5, 0.2],)),
                 (jax_named_scan, (:y, :b), :s, (y, 0.7)),
-                (jax_checked, (:x,), :m, (x,)))
+                (jax_checked, (:x,), :m, (x,)),
+                (jax_recorded, (:x,), :y, (2.0,)), (jax_recorded, (:x,), :y, (0.5,)))
             native = prepare(kernel; have, want)
             src = jax_source(kernel; have, want)
             @test rk_jax_evaluate(src, "kernel", args).value ≈ native(args...) rtol = 1e-12

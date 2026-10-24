@@ -3,6 +3,9 @@ export rk_logprob_tail
 export rk_von_mises_periodic_cdf
 export rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
 
+# `@_record_source` keeps each plain helper's source for `jax_source`; native
+# and traced execution are the methods as written.
+
 # Retained-loop indices reach these ordinary helpers traced. One authored
 # indexing body serves native reads and backend gathers through @traceable.
 @traceable _evidence_index(values, index) = values[index]
@@ -12,7 +15,7 @@ export rk_ordinal_stopping_logpdf, rk_ordinal_stopping_tail
 # outside the child region. Native values pass through without copying arrays.
 _evidence_readonly(x) = ReactiveKernels._loop_capture_traced(x)
 
-function _ordinal_logistic_logcdf(z)
+ReactiveKernels.@_record_source function _ordinal_logistic_logcdf(z)
     result = zero(z)
     ReactantCore.@trace if z >= 0
         result = -log1p(exp(-z))
@@ -30,7 +33,7 @@ _ordinal_logccdf(::Val{:cloglog}, z) = -exp(z)
 @traceable _ordinal_effect(::Nothing, row, j) = 0.0
 @traceable _ordinal_effect(effects, row, j) = effects[row, j]
 
-function _ordinal_logsurvival(t, eta, d, effects, row, k, link)
+ReactiveKernels.@_record_source function _ordinal_logsurvival(t, eta, d, effects, row, k, link)
     total = zero(eta + d)
     i = 0
     ReactantCore.@trace checkpointing=ReactantCore.Binomial(4) while i < k
@@ -43,7 +46,7 @@ function _ordinal_logsurvival(t, eta, d, effects, row, k, link)
     return total
 end
 
-function rk_ordinal_stopping_logpdf(t, eta, d, effects, row, k, link)
+ReactiveKernels.@_record_source function rk_ordinal_stopping_logpdf(t, eta, d, effects, row, k, link)
     t, eta, d, effects, row, k = map(_evidence_readonly, (t, eta, d, effects, row, k))
     total = _ordinal_logsurvival(t, eta, d, effects, row, k-1, link)
     ReactantCore.@trace if k <= length(t)
@@ -54,7 +57,7 @@ function rk_ordinal_stopping_logpdf(t, eta, d, effects, row, k, link)
     return total
 end
 
-function _ordinal_stopping_upper_guard(t, eta, d, effects, row, k, link, upper)
+ReactiveKernels.@_record_source function _ordinal_stopping_upper_guard(t, eta, d, effects, row, k, link, upper)
     result = zero(eta + d)
     ReactantCore.@trace if k > length(t)
         result = ifelse(upper, zero(eta + d), one(eta + d))
@@ -65,7 +68,7 @@ function _ordinal_stopping_upper_guard(t, eta, d, effects, row, k, link, upper)
     return result
 end
 
-function rk_ordinal_stopping_tail(t, eta, d, effects, row, k, link, upper::Bool)
+ReactiveKernels.@_record_source function rk_ordinal_stopping_tail(t, eta, d, effects, row, k, link, upper::Bool)
     t, eta, d, effects, row, k = map(_evidence_readonly, (t, eta, d, effects, row, k))
     result = zero(eta + d)
     ReactantCore.@trace if k < 1
@@ -76,7 +79,7 @@ function rk_ordinal_stopping_tail(t, eta, d, effects, row, k, link, upper::Bool)
     return result
 end
 
-function _von_mises_periodic_upper_guard(mu, kappa, x, lo, hi)
+ReactiveKernels.@_record_source function _von_mises_periodic_upper_guard(mu, kappa, x, lo, hi)
     result = zero(mu + kappa)
     ReactantCore.@trace if x >= hi
         result = one(mu + kappa)
@@ -89,7 +92,7 @@ function _von_mises_periodic_upper_guard(mu, kappa, x, lo, hi)
     return result
 end
 
-function rk_von_mises_periodic_cdf(mu, kappa, x, lo, hi)
+ReactiveKernels.@_record_source function rk_von_mises_periodic_cdf(mu, kappa, x, lo, hi)
     mu, kappa, x, lo, hi = map(_evidence_readonly, (mu, kappa, x, lo, hi))
     result = zero(mu + kappa)
     ReactantCore.@trace if x <= lo
@@ -100,7 +103,7 @@ function rk_von_mises_periodic_cdf(mu, kappa, x, lo, hi)
     return result
 end
 
-function rk_logprob_tail(logp, k, upper::Bool)
+ReactiveKernels.@_record_source function rk_logprob_tail(logp, k, upper::Bool)
     logp, k = map(_evidence_readonly, (logp, k))
     total = zero(eltype(logp))
     i = 0
@@ -115,7 +118,7 @@ end
 
 # Finite discrete tails retain a runtime loop. Neither bound trial counts nor
 # observed endpoints are structural constants; no summand is copied per count.
-function rk_beta_binomial_mass(n, a, b, lo, hi)
+ReactiveKernels.@_record_source function rk_beta_binomial_mass(n, a, b, lo, hi)
     total = zero(a + b)
     i = 0
     count = hi - lo + 1
@@ -128,7 +131,7 @@ function rk_beta_binomial_mass(n, a, b, lo, hi)
     return total
 end
 
-function _beta_binomial_upper_guard(n, a, b, k, upper)
+ReactiveKernels.@_record_source function _beta_binomial_upper_guard(n, a, b, k, upper)
     result = zero(a + b)
     ReactantCore.@trace if k >= n
         result = ifelse(upper, zero(a + b), one(a + b))
@@ -139,7 +142,7 @@ function _beta_binomial_upper_guard(n, a, b, k, upper)
     return result
 end
 
-function rk_beta_binomial_cdf(n, a, b, k)
+ReactiveKernels.@_record_source function rk_beta_binomial_cdf(n, a, b, k)
     n, a, b, k = map(_evidence_readonly, (n, a, b, k))
     result = zero(a + b)
     ReactantCore.@trace if k < 0
@@ -150,7 +153,7 @@ function rk_beta_binomial_cdf(n, a, b, k)
     return result
 end
 
-function rk_beta_binomial_ccdf(n, a, b, k)
+ReactiveKernels.@_record_source function rk_beta_binomial_ccdf(n, a, b, k)
     n, a, b, k = map(_evidence_readonly, (n, a, b, k))
     result = zero(a + b)
     ReactantCore.@trace if k < 0
@@ -163,7 +166,7 @@ end
 
 # Scaled erfc avoids exp(2lambda/mu) overflowing before it is multiplied by
 # a vanishing normal tail. Both formulas are ordinary differentiable math.
-function rk_inverse_gaussian_tail(mu, lambda, x, upper::Bool)
+ReactiveKernels.@_record_source function rk_inverse_gaussian_tail(mu, lambda, x, upper::Bool)
     mu, lambda, x = map(_evidence_readonly, (mu, lambda, x))
     result = zero(mu + lambda)
     ReactantCore.@trace if x <= 0
@@ -183,7 +186,7 @@ end
 # Fourier/Bessel CDF of the ordinary VonMises law on [mu-pi, mu+pi].
 # The convergence-driven iteration remains a loop under tracing. Circular
 # intervals use a difference of this primitive, with wrapped mu, at the caller.
-function _von_mises_cdf_interior(mu, kappa, x)
+ReactiveKernels.@_record_source function _von_mises_cdf_interior(mu, kappa, x)
     z = x - mu
     norm = SpecialFunctions.besselix(0, kappa)
     j = 1
@@ -197,7 +200,7 @@ function _von_mises_cdf_interior(mu, kappa, x)
     return 0.5 + (z + 2total / norm) / (6.283185307179586)
 end
 
-function _von_mises_cdf_upper_guard(mu, kappa, x)
+ReactiveKernels.@_record_source function _von_mises_cdf_upper_guard(mu, kappa, x)
     result = zero(mu + kappa)
     ReactantCore.@trace if x >= mu + 3.141592653589793
         result = one(mu + kappa)
@@ -207,7 +210,7 @@ function _von_mises_cdf_upper_guard(mu, kappa, x)
     return result
 end
 
-function rk_von_mises_cdf(mu, kappa, x)
+ReactiveKernels.@_record_source function rk_von_mises_cdf(mu, kappa, x)
     result = zero(mu + kappa)
     ReactantCore.@trace if x <= mu - 3.141592653589793
         result = zero(mu + kappa)

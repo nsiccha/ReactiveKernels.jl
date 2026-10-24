@@ -67,6 +67,18 @@ _jax_elementwise(::typeof(SpecialFunctions.erfinv)) = "jsp.erfinv"
 _jax_elementwise(::typeof(SpecialFunctions.logerfc)) = "_rk_logerfc" => _HELPERS["_rk_logerfc"]
 _jax_elementwise(::typeof(SpecialFunctions.logerfcx)) = "_rk_logerfcx" => _HELPERS["_rk_logerfcx"]
 
+# Modified Bessel functions of the first kind of order 0 and 1 (and their
+# exponentially scaled forms).
+for (f, names) in ((SpecialFunctions.besseli, ("jsp.i0", "jsp.i1")),
+                   (SpecialFunctions.besselix, ("jsp.i0e", "jsp.i1e")))
+    @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
+        length(args) == 2 && args[1].code in ("0", "1") || ReactiveKernels._jax_error(
+            "`", $f, "` of an order other than a literal 0 or 1")
+        name = $names[parse(Int, args[1].code) + 1]
+        _jax_result($f, args, name * "(" * args[2].code * ")")
+    end
+end
+
 # The regularized incomplete beta and gamma functions return their complement too.
 function _jax_function_call(ctx::_JaxContext, ::typeof(SpecialFunctions.beta_inc),
                             args::Vector{_PyVal})

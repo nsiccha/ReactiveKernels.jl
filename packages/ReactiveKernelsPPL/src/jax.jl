@@ -17,8 +17,8 @@ parameters, then the data columns of the binding `plan` in sorted name order
   sampler targets as `-log_density` potential;
 - `log_prior`, `log_likelihood` and `log_jacobian`: its parts;
 - `constrain(unconstrained, data...)`: a `dict` of every declared
-  parameter's constrained value, plus each value named in `values` (a
-  definition such as `:mu`).
+  parameter's constrained value (an empty parameter has none), plus each value
+  named in `values` (a definition such as `:mu`).
 
 Module constants describe the inputs: `DIMENSION` (the length of
 `unconstrained`), `PARAMETERS` (each parameter's 0-based `start`/`stop` in
@@ -39,7 +39,9 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
     data = _query_bound(plan)
     types = merge((; unconstrained = Vector{Float64}),
                   NamedTuple{keys(data)}(map(typeof, Tuple(data))))
-    parameters = [entry.name for entry in built.layout.entries]
+    # An empty parameter (zero coordinates, such as the thresholds of a
+    # two-category ordinal response) has no value in the program.
+    parameters = [entry.name for entry in built.layout.entries if entry.size > 0]
     returned = Symbol[parameters; collect(Symbol, values)]
     constrained = NamedTuple{Tuple(returned)}(Tuple(returned))
     functions = (log_density = workflow_wants(:sampler),
