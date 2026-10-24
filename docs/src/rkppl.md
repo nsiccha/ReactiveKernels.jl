@@ -460,8 +460,22 @@ generated values to sampler coordinates.
   `OrderedLogistic` and `Ordinal` require an explicit threshold argument
   such as `Ref(c)`; declare the modeled vector and its prior in the body.
   Omitting the argument is rejected.
-- Single assignment, no `if`, no `target +=`. Loops are written as
-  `@plate` cells or `@scan` recurrences (see [Plates](#Plates)).
+- Single assignment, no `target +=`. Loops are written as `@plate` cells or
+  `@scan` recurrences (see [Plates](#Plates)). A definition's value may be a
+  lazy branch, as in Julia and in a plate cell: `m = c ? a : b`,
+  `if`/`elseif`/`else` (an arm may bind locals that its later statements
+  read), `&&` and `||`. Only the arm the condition selects runs; a data-only
+  branch runs once, at binding. A local named like a model value is refused,
+  since a name is assigned once. Types are values (`convert(Float64, a)`,
+  `eltype(cells) <: Number`), so the flatten of
+  [position batching](position-batching.md) is written as a definition:
+
+  ```julia
+  loc = eltype(loc_cells) <: Number ? loc_cells :
+      isempty(loc_cells) ? eltype(eltype(loc_cells))[] : reduce(vcat, loc_cells)
+  ```
+
+  An `if` statement that defines no name does not lower.
 
 Joint `MvNormalCholesky` responses use explicitly declared covariance pieces:
 

@@ -1118,6 +1118,7 @@ function _collect_array_value_refs!(refs, ex, plan::StructuralPlan, label,
         return push!(refs, ex)
     end
     ex isa Expr || _fail(label, "unsupported literal $(repr(ex))")
+    _is_lazy_value(ex) && return _collect_lazy_refs!(refs, ex, plan, label, bound)
     _is_plate_column_expr(ex) &&
         return _collect_plate_column_refs!(refs, ex, plan, label, bound)
     head = ex.head
