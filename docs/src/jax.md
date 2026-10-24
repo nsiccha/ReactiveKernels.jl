@@ -41,7 +41,7 @@ any that are undeclared.
 
 For a built `@rkppl` program, `jax_source(built, plan)` translates the sampler
 boundary, the same one `prepare_query(built, plan, :sampler)` uses: the packed
-unconstrained parameters, followed by the data columns in sorted name order.
+unconstrained parameters and the data columns.
 
 ```@example jax
 using ReactiveKernelsPPL
@@ -62,34 +62,72 @@ module_source = jax_source(built, plan; values = (:mu,))
 ```
 
 The module's functions are:
+- `prepare_data`, which takes the data columns, in sorted name order or by
+  name, and returns the functions' data inputs as a `dict` (see
+  [Data preparation](#Data-preparation));
 - `log_density`, the sampler's target (prior, likelihood and log Jacobian);
 - its parts, `log_prior`, `log_likelihood` and `log_jacobian`;
 - `constrain`, a `dict` of every declared parameter's constrained value plus
   each value named in `values`.
 
+The functions take `unconstrained` followed by the prepared inputs.
+
 Its constants describe the inputs:
 - `DIMENSION`, the length of `unconstrained`;
 - `PARAMETERS`, each parameter's 0-based `start`/`stop` in `unconstrained`,
   its transform and its dimensions;
-- `INPUTS`;
-- `DATA`, each data input's dtype and rank, and whether it is ragged.
+- `DATA`, each data column's dtype and rank, and whether it is ragged;
+- `PREPARED`, the same for each prepared input;
+- `INPUTS`, the functions' parameters in order.
 
-BRM models reach the same function through their RKPPL emission: an `RKBRMI`
-backend holds the build as `backend.model`.
+BRM models reach the same function through their RKPPL emission:
+`jax_source(rk.model, rk_bound_plan(rk))` for an `RKBRMI` backend `rk`.
 
-In Python, a sampler targets `-log_density`, with the data closed over:
+In Python, a sampler targets `-log_density`, with the prepared data closed
+over:
 
 ```python
 import jax, jax.numpy as jnp
 from numpyro.infer import MCMC, NUTS
 import model  # the module jax_source wrote
 
-data = dict(x=x, y=y)  # NumPy or JAX arrays, in Julia's dimension order
-potential = lambda u: -model.log_density(u, **data)
+prepared = model.prepare_data(x=x, y=y)  # raw columns, once per dataset
+potential = lambda u: -model.log_density(u, **prepared)
 mcmc = MCMC(NUTS(potential_fn=potential), num_warmup=500, num_samples=1000)
 mcmc.run(jax.random.PRNGKey(0), init_params=jnp.zeros(model.DIMENSION))
-draws = jax.vmap(lambda u: model.constrain(u, **data))(mcmc.get_samples())
+draws = jax.vmap(lambda u: model.constrain(u, **prepared))(mcmc.get_samples())
 ```
+
+## Data preparation
+
+With `data`, `jax_source(spec; have, want, data)` splits the program in two,
+where binding data splits it (`prepare(...; bound)`): the recipes that read
+data alone run once per dataset in `prepare_data`, and the functions compute
+the rest from its results. `data` names the HAVE values that are data, or
+gives one binding's values (`data = (; g, y)`), whose prepared values then type
+the functions' inputs exactly. `jax_source(built, plan)` passes its binding.
+
+`prepare_data` is NumPy on the host, translated from the same source as the
+JAX code:
+
+- Its values are concrete, so a condition is a Python `if`, a loop a Python
+  `for` or `while` (with `break`, `continue` and an early `return` in a
+  `@traceable` helper), and a value's shape may follow its data: level codes
+  of string columns, stopping-ratio stage lanes, positions of missing values.
+  A loop in the source is a loop in the module; nothing is unrolled.
+- A vector built with `push!` is a list; dictionaries are `dict`s; an array a
+  source writes by index is written in place, after a copy if the source did
+  not allocate it.
+- A ragged column is a list of arrays. A ragged prepared value reaches the
+  functions padded, with its `<name>_lengths` and `<name>_flat` (the
+  positions of its entries in the flattened padded array).
+- Values that read no data (literals, a prior's scale) stay in the functions,
+  where JAX folds them.
+- A data-only recipe without a host translation stays in the functions; a
+  comment in `prepare_data` names it.
+
+The functions' inputs have static shapes, so they also run under `jax.jit`
+with the prepared data as arguments.
 
 ## What the translation keeps
 
@@ -136,10 +174,14 @@ The interface conventions:
 - **Integer index data stay 1-based**, as the Julia program reads them; the
   emitted code subtracts one where it indexes.
 - **Ragged data** (one vector per group, such as per-subject series) are a
-  padded array plus a `<name>_lengths` input; the module's `pad_ragged` builds
-  both. Padding repeats each row's last entry, so padded slots hold valid
-  values. Reductions mask by length, and a loop over a group's entries keeps
-  its carry past the group's length.
+  padded array plus a `<name>_lengths` input; `prepare_data` builds both from
+  a list of arrays (without `data`, the module's `pad_ragged` does). Padding
+  repeats each row's last entry, so padded slots hold valid values.
+  Reductions mask by length, and a loop over a group's entries keeps its carry
+  past the group's length. `reduce(vcat, cells)` of a ragged value drops the
+  padding; its length, the total, is the length of `<name>_flat` of the
+  prepared input whose lengths the cells have (a plate over its rows, or over
+  its group index).
 
 ## Helpers
 
@@ -150,7 +192,8 @@ A function that a recipe calls is translated if:
   module defines, since `jax.scipy.special.betaln` (JAX 0.12) is accurate to
   about 1e-6 in float64 once an argument reaches 8;
 - it is defined with `@traceable`, in which case its authored body is
-  translated;
+  translated (in `prepare_data`, as a host function, where an early `return`
+  is a Python `return`);
 - it is a prepared kernel, which becomes a module-level function of its plan;
 - or it is a plain function whose lowered code is straight-line.
 
@@ -164,18 +207,17 @@ These shapes have no translation; each raises a `JAXEmissionError` naming the
 recipe and the construct:
 
 - a plain helper with loops or branches that is not `@traceable`;
-- a loop whose trip count is data with no static bound (JAX loops and arrays
-  need static shapes);
-- a `throw` that depends on data (a runtime check is the form that has one);
+- in the JAX functions, a loop whose trip count is data with no static bound
+  (JAX loops and arrays need static shapes), and a `throw` that depends on
+  data (a runtime check is the form that has one); `prepare_data` runs both;
 - `jax.grad` through a `while` loop (JAX differentiates `lax.while_loop`
   forward only; write a differentiated loop as a `for` over a range);
-- filtered comprehensions (their length is data);
+- filtered comprehensions in the JAX functions (their length is data);
+- `reduce(vcat, cells)` of a ragged value whose lengths are no prepared
+  input's;
 - plates of rank above one over ragged data;
 - `history` scans.
 
-Data preparation that happens during `bind_data` is not translated: level
-coding, design matrices and frozen definitions. The module takes the bound
-columns, as `DATA` lists them. Data-only recipes in the program translate
-when their shapes follow from the input shapes. Ones whose output length
-depends on data values have no translation yet: ordinal stopping-ratio stage
-lanes, string level coding and the positions of missing values.
+Preparation that `bind_data` does before the program runs (a binder's own
+level coding, frozen definitions) is not in the program, so `prepare_data`
+takes its results: the bound columns, as `DATA` lists them.
