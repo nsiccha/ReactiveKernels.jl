@@ -1084,18 +1084,27 @@ end
 # --- module -------------------------------------------------------------------------
 
 """
-    JAXSource
+    JAXFunction
 
-The Python module [`jax_source`](@ref) emits: `text` is the module source,
-`name` the function it defines, `inputs` and `outputs` the function's
-parameters and results (each `name => Julia type`). `write(path, src)` saves
-the module and `print(src)` shows it.
+One function of a [`JAXSource`](@ref) module: its Python `name`, its
+parameters `inputs` and its results `outputs` (each `name => Julia type`).
 """
-struct JAXSource
-    text::String
+struct JAXFunction
     name::String
     inputs::Vector{Pair{String,Any}}
     outputs::Vector{Pair{String,Any}}
+end
+
+"""
+    JAXSource
+
+The Python module [`jax_source`](@ref) emits: `text` is the module source and
+`functions` the [`JAXFunction`](@ref)s it defines. `write(path, src)` saves the
+module and `print(src)` shows it.
+"""
+struct JAXSource
+    text::String
+    functions::Vector{JAXFunction}
 end
 Base.print(io::IO, src::JAXSource) = print(io, src.text)
 Base.show(io::IO, ::MIME"text/plain", src::JAXSource) = print(io, src.text)
@@ -1113,33 +1122,92 @@ jax.config.update("jax_enable_x64", True)
 
 """
     jax_source(spec::KernelSpec; have, want, types = nothing, name = :kernel) -> JAXSource
+    jax_source(spec::KernelSpec; have, functions, types = nothing, constants = (;),
+               doc = nothing) -> JAXSource
     jax_source(p::Plan; types = nothing, name = :kernel) -> JAXSource
 
 Translate the program that computes `want` from `have` into a Python module
 whose function `name` takes the HAVE values, in order, and returns the WANT
-value (a tuple for several WANTs), computed with `jax.numpy`. `types` gives
-each HAVE value's Julia type, as a `NamedTuple` by port name or a tuple in
-HAVE order; by default the ports' declared types are used, and they must be
-concrete. Value ranks follow from these types, so the module is generic in
-array sizes: one module serves every size of the same program.
+value (a tuple for several WANTs), computed with `jax.numpy`. With
+`functions`, a `NamedTuple` of function name => WANT, the module defines one
+function per entry over the same HAVE values; a WANT is a value name, a tuple
+of them (the function returns a tuple) or a `NamedTuple` of key => value name
+(it returns a `dict`). `constants`, a `NamedTuple`, adds module-level
+constants (numbers, strings, symbols, vectors, tuples, named tuples and
+dictionaries of these), and `doc` replaces the module docstring.
+
+`types` gives each HAVE value's Julia type, as a `NamedTuple` by port name or
+a tuple in HAVE order; by default the ports' declared types are used, and
+they must be concrete. Value ranks follow from these types, so the module is
+generic in array sizes: one module serves every size of the same program.
 
 The translation keeps the program's structure. A plate is `jax.vmap` of its
 cell, a scan is `jax.lax.scan` of its step, a lazy branch is `jax.lax.cond`
 of its arms, and nothing is unrolled per element. Arrays keep Julia's
 dimension order, Julia's broadcasting rules are kept, and integer index data
-stay 1-based. Gradients are `jax.grad` of the function. A construct without a
+stay 1-based. Gradients are `jax.grad` of a function. A construct without a
 translation raises a [`JAXEmissionError`](@ref) naming its recipe.
 """
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
-                    want = _KERNEL_DEFAULT_BOUNDARY, types = nothing, name = :kernel)
-    jax_source(plan(spec; have, want); types, name)
+                    want = nothing, functions = nothing, types = nothing,
+                    name = :kernel, constants = NamedTuple(), doc = nothing)
+    functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
+    if functions === nothing
+        functions = NamedTuple{(Symbol(name),)}((want,))
+    else
+        want === nothing || throw(ArgumentError("jax_source: pass `want` or `functions`, not both"))
+    end
+    functions isa NamedTuple && !isempty(functions) || throw(ArgumentError(
+        "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
+    plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
+             for (fname, w) in pairs(functions)]
+    _jax_module_source(plans, types, constants, doc)
 end
 
-function jax_source(p::Plan; types = nothing, name = :kernel)
-    argtypes = _jax_have_types(p, types)
+jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
+           doc = nothing) =
+    _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
+                       types, constants, doc)
+
+_jax_want_names(w::Symbol) = (w,)
+_jax_want_names(w::Tuple) = w
+_jax_want_names(w::NamedTuple) = Tuple(values(w))
+_jax_want_names(w) = throw(ArgumentError(
+    "jax_source: a function's WANT is a value name, a tuple of names or a NamedTuple; got `$w`"))
+
+function _jax_module_source(plans, types, constants, doc)
     mod = _JaxModule()
     union!(mod.used, ("jax", "jnp", "jsp"))
-    fname = _jax_identifier(mod.used, name)
+    constant_lines = String[]
+    for (key, value) in pairs(constants)
+        cname = _jax_identifier(mod.used, key)
+        push!(constant_lines, cname * " = " * _jax_py_literal(value))
+    end
+    bodies = String[]
+    functions = JAXFunction[]
+    for (fname, (p, w)) in plans
+        lines, f = _jax_function!(mod, fname, p, types, w)
+        push!(bodies, join(lines, "\n"))
+        push!(functions, f)
+    end
+    lines = String[]
+    docstring = doc === nothing ?
+        "Generated by ReactiveKernels.jax_source; do not edit." : String(doc)
+    push!(lines, "\"\"\"" * replace(docstring, "\"\"\"" => "\\\"\\\"\\\"") * "\"\"\"")
+    push!(lines, rstrip(_JAX_HEADER))
+    isempty(constant_lines) || (push!(lines, ""); append!(lines, constant_lines))
+    for block in [mod.helpers; bodies]
+        push!(lines, "")
+        push!(lines, "")
+        push!(lines, block)
+    end
+    JAXSource(join(lines, "\n") * "\n", functions)
+end
+
+# One function `fname` over plan `p`, returning WANT `w` in its shape.
+function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w)
+    argtypes = _jax_have_types(p, types)
+    name = _jax_identifier(mod.used, fname)
     scope = _JaxScope()
     ctx = _JaxContext(mod, scope, nothing, Main, Dict{Symbol,_PyVal}(), nothing)
     params = String[]
@@ -1149,24 +1217,48 @@ function jax_source(p::Plan; types = nothing, name = :kernel)
         scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T)
     end
     _jax_plan!(ctx, p)
-    wants = [_jax_lookup(ctx, p.graph, v) for v in p.want]
-    lines = String[]
-    push!(lines, "\"\"\"Generated by ReactiveKernels.jax_source; do not edit.\"\"\"")
-    push!(lines, rstrip(_JAX_HEADER))
-    for helper in mod.helpers
-        push!(lines, "")
-        push!(lines, "")
-        push!(lines, helper)
+    wants = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v)) for v in p.want]
+    returned = if w isa NamedTuple
+        "{" * join(("\"" * string(k) * "\": " * v.code for (k, v) in zip(keys(w), wants)), ", ") * "}"
+    elseif w isa Symbol
+        only(wants).code
+    else
+        _jax_tuple_code(wants)
     end
-    push!(lines, "")
-    push!(lines, "")
-    push!(lines, "def " * fname * "(" * join(params, ", ") * "):")
+    lines = String["def " * name * "(" * join(params, ", ") * "):"]
     append!(lines, scope.lines)
-    push!(lines, "    return " * (length(wants) == 1 ? wants[1].code : _jax_tuple_code(wants)))
-    JAXSource(join(lines, "\n") * "\n", fname,
-              [param => T for (param, T) in zip(params, argtypes)],
-              [String(v.name) => w.T for (v, w) in zip(p.want, wants)])
+    push!(lines, "    return " * returned)
+    lines, JAXFunction(name, [param => T for (param, T) in zip(params, argtypes)],
+                       [String(v.name) => x.T for (v, x) in zip(p.want, wants)])
 end
+
+# A returned named tuple is a `dict` keyed by its field names.
+function _jax_returned(ctx::_JaxContext, v::_PyVal)
+    v.T isa Type && v.T <: NamedTuple && fieldcount(v.T) > 0 || return v
+    bound = _jax_bind!(ctx, :result, v)
+    names = fieldnames(v.T)
+    _PyVal("{" * join(("\"" * string(n) * "\": " * bound.code * "[" * string(i - 1) * "]"
+                       for (i, n) in enumerate(names)), ", ") * "}", v.T)
+end
+
+# Module-level metadata as Python literals.
+_jax_py_literal(x::Union{Bool,Integer,AbstractFloat,Nothing}) = _jax_scalar_meta(x)
+_jax_scalar_meta(x::Bool) = x ? "True" : "False"
+_jax_scalar_meta(x::Integer) = string(x)
+_jax_scalar_meta(x::AbstractFloat) = _jax_scalar_text(x)
+_jax_scalar_meta(::Nothing) = "None"
+_jax_py_literal(x::Union{AbstractString,Symbol}) = repr(String(x))
+# A vector of pairs is an ordered `dict`.
+_jax_py_literal(x::AbstractVector{<:Pair}) =
+    "{" * join((_jax_py_literal(k) * ": " * _jax_py_literal(v) for (k, v) in x), ", ") * "}"
+_jax_py_literal(x::Union{AbstractVector,Tuple}) =
+    (x isa Tuple ? "(" : "[") * join((_jax_py_literal(v) for v in x), ", ") *
+    (x isa Tuple ? (length(x) == 1 ? ",)" : ")") : "]")
+_jax_py_literal(x::NamedTuple) =
+    "{" * join((repr(string(k)) * ": " * _jax_py_literal(v) for (k, v) in pairs(x)), ", ") * "}"
+_jax_py_literal(x::AbstractDict) =
+    "{" * join((_jax_py_literal(k) * ": " * _jax_py_literal(v) for (k, v) in x), ", ") * "}"
+_jax_py_literal(x) = throw(ArgumentError("jax_source: no Python literal for a `$(typeof(x))` constant"))
 
 function _jax_have_types(p::Plan, types)
     names = [v.name for v in p.have]
