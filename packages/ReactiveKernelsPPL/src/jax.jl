@@ -55,7 +55,8 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
             for entry in built.layout.entries],
         INPUTS = Tuple(String(name) for name in have),
         DATA = [String(name) => (dtype = _jax_dtype_name(typeof(value)),
-                                 ndim = value isa AbstractArray ? ndims(value) : 0)
+                                 ndim = value isa AbstractArray ? ndims(value) : 0,
+                                 ragged = ReactiveKernels._jax_ragged(typeof(value)))
                 for (name, value) in pairs(data)],
     )
     module_doc = doc === nothing ?
@@ -67,6 +68,7 @@ function ReactiveKernels.jax_source(built::NamedTuple, plan::StructuralPlan;
 end
 
 _jax_dtype_name(::Type{<:AbstractArray{T}}) where {T} = _jax_dtype_name(T)
+_jax_dtype_name(::Type{<:AbstractArray{<:AbstractArray{T}}}) where {T} = _jax_dtype_name(T)
 _jax_dtype_name(::Type{Bool}) = "bool"
 _jax_dtype_name(::Type{<:Integer}) = "int64"
 _jax_dtype_name(::Type{<:AbstractFloat}) = "float64"

@@ -35,13 +35,32 @@ _jax_error(message...) = throw(JAXEmissionError(string(message...)))
 # A translated value: its Python expression and the Julia type it stands for.
 # `static` marks a value known while JAX traces the function (a literal, a
 # shape, or arithmetic on those): Python control flow may branch on it.
+#
+# Ragged values. An array of arrays of different lengths (a ragged plate's
+# per-group data) is a padded array, one row per group, whose `extent` is the
+# Python expression of its lengths vector. Inside a cell, one group's padded
+# vector has the scalar length as its `extent`. Padding repeats each row's last
+# valid entry, so every padded slot holds a valid value: computations over it
+# stay finite, and reductions mask by length.
 struct _PyVal
     code::String
     T::Any
     static::Bool
+    extent::String
 end
-_PyVal(code::AbstractString, @nospecialize(T)) = _PyVal(String(code), T, false)
-_jax_static(v::_PyVal) = _PyVal(v.code, v.T, true)
+_PyVal(code::AbstractString, @nospecialize(T)) = _PyVal(String(code), T, false, "")
+_PyVal(code::AbstractString, @nospecialize(T), static::Bool) = _PyVal(String(code), T, static, "")
+_jax_static(v::_PyVal) = _PyVal(v.code, v.T, true, v.extent)
+_jax_ragged(@nospecialize(T)) = T isa Type && T <: AbstractArray && eltype(T) isa Type &&
+    eltype(T) <: AbstractArray
+function _jax_extent(args)
+    for a in args
+        isempty(a.extent) || return a.extent
+    end
+    ""
+end
+# A padded vector's valid-entry mask.
+_jax_mask(v::_PyVal) = "(jnp.arange(" * v.code * ".shape[0]) < " * v.extent * ")"
 
 # The Python keywords and module names an emitted identifier must not take.
 const _JAX_RESERVED = Set{String}(split("""
@@ -119,7 +138,7 @@ function _jax_bind!(ctx::_JaxContext, hint, v::_PyVal)
     occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", v.code) && return v
     name = _jax_fresh(ctx, hint)
     _jax_emit!(ctx, name * " = " * v.code)
-    _PyVal(name, v.T, v.static)
+    _PyVal(name, v.T, v.static, v.extent)
 end
 
 # --- types and ranks ----------------------------------------------------------------
@@ -301,7 +320,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
     if lhs isa Symbol
         name = _jax_fresh(ctx, lhs)
         _jax_emit!(ctx, name * " = " * v.code)
-        ctx.locals[lhs] = _PyVal(name, v.T, v.static)
+        ctx.locals[lhs] = _PyVal(name, v.T, v.static, v.extent)
         return
     end
     if lhs isa Expr && lhs.head === :tuple
@@ -402,6 +421,13 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
     end
     E = eltype(x.T)
     T = kept == 0 ? E : Array{E,kept}
+    if _jax_ragged(x.T)
+        kept == 0 || _jax_error("a gather of several groups of a ragged array", _jax_where(ctx))
+        return _PyVal(x.code * "[" * join(parts, ", ") * "]", T, false,
+                      x.extent * "[" * join(parts, ", ") * "]")
+    end
+    isempty(x.extent) || kept == 0 ||
+        _jax_error("slicing a padded group vector has no JAX translation", _jax_where(ctx))
     _PyVal(x.code * "[" * join(parts, ", ") * "]", T)
 end
 
@@ -635,7 +661,8 @@ _jax_call_positional(ctx::_JaxContext, f, args::Vector{_PyVal}) =
 
 function _jax_result(f, args::Vector{_PyVal}, code::AbstractString)
     T = _jax_return_type(f, [a.T isa Type ? a.T : Any for a in args])
-    _PyVal(code, T, !isempty(args) && all(a -> a.static, args))
+    _PyVal(code, T, !isempty(args) && all(a -> a.static, args),
+           _jax_is_array(T) ? _jax_extent(args) : "")
 end
 _jax_args(args) = join((a.code for a in args), ", ")
 
@@ -839,22 +866,39 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(/), args::Vector{_PyVal})
 end
 
 function _jax_function_call(ctx::_JaxContext, ::typeof(sum), args::Vector{_PyVal})
+    if length(args) == 1 && !isempty(args[1].extent) && _jax_rank(args[1].T) == 1
+        x = args[1]
+        return _PyVal("jnp.sum(jnp.where(" * _jax_mask(x) * ", " * x.code * ", 0.0))", eltype(x.T))
+    end
     length(args) == 1 && return _jax_result(sum, args, "jnp.sum(" * args[1].code * ")")
     length(args) == 2 && _jax_is_array(args[2].T) || _jax_error("this `sum` call", _jax_where(ctx))
     mapped = _jax_broadcast(ctx, _jax_function_of(args[1]), [args[2]])
     _PyVal("jnp.sum(" * mapped.code * ")", eltype(mapped.T))
 end
-for (f, name) in ((prod, "jnp.prod"), (maximum, "jnp.max"), (minimum, "jnp.min"))
-    @eval _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal}) =
-        length(args) == 1 ? _jax_result($f, args, $name * "(" * args[1].code * ")") :
-        _jax_error("this `", $f, "` call", _jax_where(ctx))
+for (f, name, neutral) in ((prod, "jnp.prod", "1.0"), (maximum, "jnp.max", "-jnp.inf"),
+                           (minimum, "jnp.min", "jnp.inf"))
+    @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
+        length(args) == 1 || _jax_error("this `", $f, "` call", _jax_where(ctx))
+        x = args[1]
+        isempty(x.extent) || return _PyVal($name * "(jnp.where(" * _jax_mask(x) * ", " * x.code *
+                                           ", " * $neutral * "))", eltype(x.T))
+        _jax_result($f, args, $name * "(" * x.code * ")")
+    end
 end
-_jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp), args::Vector{_PyVal}) =
-    length(args) == 1 ? _jax_result(LogExpFunctions.logsumexp, args,
-                                    "jsp.logsumexp(" * args[1].code * ")") :
-    _jax_error("this `logsumexp` call", _jax_where(ctx))
+_jax_function_call(ctx::_JaxContext, ::typeof(vec), args::Vector{_PyVal}) =
+    _jax_rank(only(args).T) == 1 || _jax_ragged(only(args).T) ? only(args) :
+    _jax_error("`vec` of a `", only(args).T, "`", _jax_where(ctx))
+function _jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp), args::Vector{_PyVal})
+    length(args) == 1 || _jax_error("this `logsumexp` call", _jax_where(ctx))
+    x = args[1]
+    isempty(x.extent) || return _PyVal("jsp.logsumexp(jnp.where(" * _jax_mask(x) * ", " * x.code *
+                                       ", -jnp.inf))", eltype(x.T))
+    _jax_result(LogExpFunctions.logsumexp, args, "jsp.logsumexp(" * x.code * ")")
+end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
+    isempty(x.extent) || _jax_ragged(x.T) || return _PyVal(x.extent, Int)
+    _jax_ragged(x.T) && return _PyVal(x.code * ".shape[0]", Int, true)
     x.T isa Type && x.T <: Tuple && return _PyVal(string(fieldcount(x.T)), Int, true)
     _PyVal(x.code * ".size", Int, true)
 end
@@ -1006,12 +1050,13 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
             f === (^) ? _PyVal("(" * padded[1].code * " ** " * padded[2].code * ")", E) :
             _jax_scalar_or_elementwise(ctx, f, scalars)
         v === nothing && _jax_error("broadcasting `", f, "`", _jax_where(ctx))
-        return _PyVal(v.code, T)
+        return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args))
     end
     # Any other scalar function: a module-level function translated once over
     # scalar arguments, vectorized over the operands.
     name = _jax_scalar_function!(ctx, f, eltypes)
-    _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T)
+    _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
+           R == 0 ? "" : _jax_extent(args))
 end
 
 # A module-level Python function computing `f` on scalars of `types`.
@@ -1250,7 +1295,7 @@ function _jax_define!(ctx::_JaxContext, g::Graph, v::Value, val::_PyVal; bind::B
     if bind
         name = _jax_fresh(ctx, v.name)
         _jax_emit!(ctx, name * " = " * val.code)
-        val = _PyVal(name, val.T)
+        val = _PyVal(name, val.T, val.static, val.extent)
     end
     ctx.scope.values[id] = val
     val
@@ -1365,18 +1410,26 @@ function _jax_arm_plan(ctx::_JaxContext, p::Plan, env::Dict{Symbol,_PyVal})
 end
 
 # A nested function over plan `p`: its HAVE values are the parameters, its
-# WANT values the result. `inputs` are the Julia types of the parameters.
-function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types; params = nothing)
+# WANT values the result. `types` are the parameters' Julia types; a parameter
+# with `extents[i]` true is padded and takes its length (or lengths) as an
+# extra parameter after it. A WANT with an extent returns its length too.
+# Returns the function name, the WANT values and which of them return a length.
+function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
+                             extents = fill(false, length(p.have)))
     name = _jax_fresh(ctx, hint)
     outer = ctx.scope
     inner = _JaxScope(outer)
     inner.indent = outer.indent + 1
     names = String[]
     for (i, v) in enumerate(p.have)
-        param = params === nothing ? _jax_identifier(inner.used, v.name) : params[i]
-        params === nothing || push!(inner.used, param)
+        param = _jax_identifier(inner.used, v.name)
         push!(names, param)
-        inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i])
+        extent = ""
+        if extents[i]
+            extent = _jax_identifier(inner.used, Symbol(v.name, :_n))
+            push!(names, extent)
+        end
+        inner.values[canon_id(p.graph, v.id)] = _PyVal(param, types[i], false, extent)
     end
     recipe = ctx.recipe
     ctx.scope = inner
@@ -1387,16 +1440,23 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types; params = no
         ctx.scope = outer
         ctx.recipe = recipe
     end
+    returned = String[]
+    for w in wants
+        push!(returned, w.code)
+        isempty(w.extent) || push!(returned, w.extent)
+    end
     push!(outer.lines, "    "^outer.indent * "def " * name * "(" * join(names, ", ") * "):")
     append!(outer.lines, inner.lines)
-    push!(outer.lines, "    "^inner.indent * "return " * (length(wants) == 1 ?
-        wants[1].code : _jax_tuple_code(wants)))
-    name, wants
+    push!(outer.lines, "    "^inner.indent * "return " * (length(returned) == 1 ?
+        returned[1] : "(" * join(returned, ", ") * ")"))
+    name, wants, Bool[!isempty(w.extent) for w in wants]
 end
 
 # A plate: the cell as a function, mapped over the batched arguments with
 # `jax.vmap` (one mapped axis per broadcast dimension). Shared arguments
-# (`Ref` operands, and scalars, which repeat) are not mapped.
+# (`Ref` operands, and scalars, which repeat) are not mapped. A ragged
+# argument is mapped row by row with its lengths; a padded group vector maps
+# its entries, and the plate's values are padded the same way.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                      op::_AuthoredPlateOp{K,A}, inputs) where {K,A}
     body = op.kernel.plan
@@ -1410,24 +1470,48 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     length(ranks) == 1 || _jax_error("a plate over arrays of different ranks (",
         join(string.(ranks), ", "), ") has no JAX translation yet", _jax_where(ctx))
     R = only(ranks)
-    for (i, v) in enumerate(inputs)
-        mapped[i] && !(eltype(v.T) <: Number) && _jax_error(
-            "a plate over `", v.T, "` (an array of arrays, as a ragged plate has) has no ",
-            "JAX translation yet", _jax_where(ctx))
-    end
+    ragged = Bool[_jax_ragged(v.T) for v in inputs]
+    any(ragged[i] && mapped[i] for i in eachindex(inputs)) && R != 1 &&
+        _jax_error("a ragged plate of rank ", R, _jax_where(ctx))
+    # A mapped padded group vector: the plate runs over its entries.
+    padded = [mapped[i] && !ragged[i] && !isempty(v.extent) for (i, v) in enumerate(inputs)]
     cell_types = Any[mapped[i] ? eltype(v.T) : _jax_unref(v.T) for (i, v) in enumerate(inputs)]
-    cell, wants = _jax_plan_function!(ctx, :cell, body, cell_types)
-    E = _jax_typeof(only(wants))
-    axes_text = "(" * join((m ? "0" : "None" for m in mapped), ", ") *
-                (length(mapped) == 1 ? ",)" : ")")
+    cell_extents = Bool[ragged[i] for i in eachindex(inputs)]
+    cell, wants, with_length = _jax_plan_function!(ctx, :cell, body, cell_types;
+                                                   extents = cell_extents)
+    want = only(wants)
+    E = _jax_typeof(want)
+    axes = String[]
+    args = String[]
+    for (i, v) in enumerate(inputs)
+        push!(axes, mapped[i] ? "0" : "None"); push!(args, v.code)
+        if ragged[i]
+            push!(axes, mapped[i] ? "0" : "None"); push!(args, v.extent)
+        end
+    end
+    axes_text = "(" * join(axes, ", ") * (length(axes) == 1 ? ",)" : ")")
     call = cell
     for _ in 1:R
         call = "jax.vmap(" * call * ", in_axes=" * axes_text * ")"
     end
-    T = E <: Tuple ? Any : Array{E,R}
+    call *= "(" * join(args, ", ") * ")"
+    if E <: AbstractVector
+        R == 1 || _jax_error("a plate of rank ", R, " whose cell returns a vector", _jax_where(ctx))
+        result = _jax_fresh(ctx, :plate_value)
+        lengths = _jax_fresh(ctx, :plate_lengths)
+        if only(with_length)
+            _jax_emit!(ctx, result * ", " * lengths * " = " * call)
+        else
+            _jax_emit!(ctx, result * " = " * call)
+            _jax_emit!(ctx, lengths * " = jnp.full((" * result * ".shape[0],), " * result *
+                            ".shape[1])")
+        end
+        return [_PyVal(result, Vector{E}, false, lengths)]
+    end
     E <: Number || _jax_error("a plate whose cell returns `", E, "` has no JAX translation yet",
                               _jax_where(ctx))
-    [_PyVal(call * "(" * _jax_args(map(_jax_unref_val, inputs)) * ")", T)]
+    extent = _jax_extent(inputs[padded])
+    [_PyVal(call, Array{E,R}, false, extent)]
 end
 _jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && fieldcount(T) > 0 &&
     isconcretetype(eltype(T)) && eltype(T) <: Number
@@ -1522,6 +1606,25 @@ Base.show(io::IO, ::MIME"text/plain", src::JAXSource) = print(io, src.text)
 Base.write(io::IO, src::JAXSource) = write(io, src.text)
 Base.write(path::AbstractString, src::JAXSource) = write(path, src.text)
 
+# The host-side helper that turns a ragged input (one array per group) into
+# the padded array and lengths vector the functions take.
+const _JAX_PAD_RAGGED = """
+def pad_ragged(arrays):
+    \"\"\"Pad a list of 1-D arrays into one 2-D array and its lengths vector.
+
+    Each row repeats its last entry up to the longest length, so every padded
+    slot holds a valid value; the functions mask padded entries by length.
+    Pass the two results as the input and its `_lengths` input.
+    \"\"\"
+    import numpy as np
+    rows = [np.asarray(a) for a in arrays]
+    lengths = np.asarray([r.shape[0] for r in rows], dtype=np.int64)
+    width = max([1] + [int(n) for n in lengths])
+    padded = np.stack([np.pad(r, (0, width - r.shape[0]), mode="edge") if r.shape[0] > 0
+                       else np.zeros(width) for r in rows])
+    return padded, lengths
+"""
+
 const _JAX_HEADER = """
 import jax
 import jax.numpy as jnp
@@ -1601,6 +1704,8 @@ function _jax_module_source(plans, types, constants, doc)
         push!(bodies, join(lines, "\n"))
         push!(functions, f)
     end
+    any(f -> any(io -> _jax_ragged(last(io)), f.inputs), functions) &&
+        pushfirst!(mod.helpers, rstrip(_JAX_PAD_RAGGED))
     lines = String[]
     docstring = doc === nothing ?
         "Generated by ReactiveKernels.jax_source; do not edit." : String(doc)
@@ -1622,10 +1727,16 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     scope = _JaxScope()
     ctx = _JaxContext(mod, scope, nothing, Main, Dict{Symbol,_PyVal}(), nothing)
     params = String[]
+    inputs = Pair{String,Any}[]
     for (v, T) in zip(p.have, argtypes)
         param = _jax_identifier(scope.used, v.name)
-        push!(params, param)
-        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T)
+        push!(params, param); push!(inputs, param => T)
+        extent = ""
+        if _jax_ragged(T)
+            extent = _jax_identifier(scope.used, Symbol(v.name, :_lengths))
+            push!(params, extent); push!(inputs, extent => Vector{Int})
+        end
+        scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, false, extent)
     end
     _jax_plan!(ctx, p)
     wants = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v)) for v in p.want]
@@ -1639,8 +1750,7 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
     lines = String["def " * name * "(" * join(params, ", ") * "):"]
     append!(lines, scope.lines)
     push!(lines, "    return " * returned)
-    lines, JAXFunction(name, [param => T for (param, T) in zip(params, argtypes)],
-                       [String(v.name) => x.T for (v, x) in zip(p.want, wants)])
+    lines, JAXFunction(name, inputs, [String(v.name) => x.T for (v, x) in zip(p.want, wants)])
 end
 
 # A returned named tuple is a `dict` keyed by its field names.
