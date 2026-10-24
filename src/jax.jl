@@ -101,6 +101,8 @@ _JaxModule() = _JaxModule(String[], Dict{Any,Any}(), Set{String}(), 0)
 
 # Translation state: the module, the current function scope, the current
 # recipe (for messages) and the module that resolves its source's globals.
+# `host` is `nothing` for JAX code and the host state (`jax_host.jl`) for the
+# NumPy code of `prepare_data`.
 mutable struct _JaxContext
     mod::_JaxModule
     scope::_JaxScope
@@ -109,9 +111,14 @@ mutable struct _JaxContext
     locals::Dict{Symbol,_PyVal}
     captures::Any
     traced_branches::Int
+    host::Any
 end
 _JaxContext(mod, scope, recipe, source_module, locals, captures) =
-    _JaxContext(mod, scope, recipe, source_module, locals, captures, 0)
+    _JaxContext(mod, scope, recipe, source_module, locals, captures, 0, nothing)
+
+# A value known while the code runs its Python control flow: a static value
+# under JAX, any value on the host.
+_jax_known(ctx::_JaxContext, v::_PyVal) = ctx.host !== nothing || v.static
 
 _jax_where(ctx::_JaxContext) = ctx.recipe isa Recipe ?
     " in recipe `" * _recipe_line(ctx.recipe) * "`" : ""
@@ -135,6 +142,17 @@ function _jax_identifier(used::Set{String}, hint)
     end
     push!(used, candidate)
     candidate
+end
+
+# An input's Python name: its own name when that is a free Python identifier
+# (so `prepare_data(**data)` takes the data's own keys), else a fresh one.
+function _jax_param_name(used::Set{String}, name)
+    text = String(Symbol(name))
+    if occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", text) && !(text in _JAX_RESERVED) && !(text in used)
+        push!(used, text)
+        return text
+    end
+    _jax_identifier(used, name)
 end
 
 function _jax_fresh(ctx::_JaxContext, hint)
@@ -301,11 +319,13 @@ _jax_literal(x) = _jax_error("no JAX literal for a value of type `", typeof(x), 
 # values inline, arrays become module-level constants.
 function _jax_constant(ctx::_JaxContext, hint, x)
     x isa AbstractArray || return _jax_literal(x)
-    name = get(ctx.mod.helper_names, (:constant, objectid(x)), nothing)
+    host = ctx.host !== nothing
+    name = get(ctx.mod.helper_names, (:constant, objectid(x), host), nothing)
     if name === nothing
-        name = _jax_identifier(ctx.mod.used, uppercase(string(hint)))
-        push!(ctx.mod.helpers, name * " = " * _jax_literal(x).code)
-        ctx.mod.helper_names[(:constant, objectid(x))] = name
+        name = _jax_identifier(ctx.mod.used, uppercase(string(hint)) * (host ? "_NP" : ""))
+        line = name * " = " * _jax_literal(x).code
+        push!(ctx.mod.helpers, host ? _host_text(line) : line)
+        ctx.mod.helper_names[(:constant, objectid(x), host)] = name
     end
     _PyVal(name, typeof(x))
 end
@@ -342,6 +362,8 @@ _jax_has_local(ctx::_JaxContext, s::Symbol) = haskey(ctx.locals, s)
 function _jax_type_argument(ctx::_JaxContext, a)
     a isa Symbol && haskey(ctx.locals, a) && return _jax_callable(ctx.locals[a])
     a isa Integer && return a
+    # A type computed by a call (`Dict{eltype(v),Int}`).
+    a isa Expr && a.head === :call && return _jax_callable(_jax_expr(ctx, a))
     _jax_resolve(ctx, a)
 end
 
@@ -357,7 +379,8 @@ function _jax_expr(ctx::_JaxContext, ex)
 end
 
 function _jax_symbol(ctx::_JaxContext, s::Symbol)
-    haskey(ctx.locals, s) && return ctx.locals[s]
+    haskey(ctx.locals, s) && return ctx.host === nothing ? ctx.locals[s] :
+        _host_read(ctx, ctx.locals[s])
     s === :nothing && return _PyVal("None", Nothing, true)
     s === :Inf && return _jax_literal(Inf)
     s === :NaN && return _jax_literal(NaN)
@@ -365,7 +388,7 @@ function _jax_symbol(ctx::_JaxContext, s::Symbol)
 end
 
 # A Julia value met in source (a resolved global or capture).
-_jax_value(ctx::_JaxContext, x::Union{Number,Nothing,AbstractString}, hint) = _jax_literal(x)
+_jax_value(ctx::_JaxContext, x::Union{Number,Nothing,AbstractString,Symbol}, hint) = _jax_literal(x)
 _jax_value(ctx::_JaxContext, x::AbstractArray{<:Real}, hint) = _jax_constant(ctx, hint, x)
 _jax_value(ctx::_JaxContext, x::Tuple, hint) = _jax_literal(x)
 # A function passed as a value (`sum(abs2, z)`): its type carries it, and only
@@ -393,8 +416,24 @@ _jax_expr(ctx::_JaxContext, ::Val{H}, ex) where {H} =
                _jax_where(ctx))
 
 _jax_expr(ctx::_JaxContext, ::Val{:block}, ex) = _jax_statements(ctx, ex.args)
+# A subtype test of types known while emitting (`eltype(x) <: Number`).
+_jax_expr(ctx::_JaxContext, ::Val{:<:}, ex) =
+    _jax_literal(_jax_type_operand(ctx, ex.args[1]) <: _jax_type_operand(ctx, ex.args[2]))
+function _jax_type_operand(ctx::_JaxContext, ex)
+    v = _jax_expr(ctx, ex)
+    v.T isa _JaxCallable && v.T.f isa Type && return v.T.f
+    T = _jax_type_of_value(v)
+    T isa Type && return T
+    v.T isa Type && v.T <: Type && return v.T.parameters[1]
+    _jax_error("the subtype test of `", ex, "`, which is not a type", _jax_where(ctx))
+end
 _jax_expr(ctx::_JaxContext, ::Val{:(::)}, ex) = _jax_expr(ctx, ex.args[1])
-_jax_expr(ctx::_JaxContext, ::Val{:return}, ex) = _jax_expr(ctx, ex.args[1])
+_jax_expr(ctx::_JaxContext, ::Val{:return}, ex) = ctx.host === nothing ?
+    _jax_expr(ctx, ex.args[1]) : _host_return(ctx, ex)
+_jax_expr(ctx::_JaxContext, ::Val{:break}, ex) = ctx.host === nothing ?
+    _jax_error("`break` has no JAX translation", _jax_where(ctx)) : _host_jump(ctx, "break")
+_jax_expr(ctx::_JaxContext, ::Val{:continue}, ex) = ctx.host === nothing ?
+    _jax_error("`continue` has no JAX translation", _jax_where(ctx)) : _host_jump(ctx, "continue")
 function _jax_expr(ctx::_JaxContext, ::Val{:macrocall}, ex)
     name = ex.args[1]
     # `ReactantCore.@trace` marks the control flow a compiled backend keeps;
@@ -455,6 +494,8 @@ end
 
 function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
     lhs isa Expr && lhs.head === :(::) && (lhs = lhs.args[1])
+    ctx.host === nothing || lhs isa Expr && lhs.head === :tuple ||
+        return _host_assign!(ctx, lhs, v)
     if lhs isa Symbol
         # A type or callable value exists only while translating.
         v.T isa _JaxCallable && (ctx.locals[lhs] = v; return)
@@ -486,6 +527,7 @@ function _jax_destructure!(ctx::_JaxContext, lhs, v::_PyVal)
 end
 
 function _jax_expr(ctx::_JaxContext, ::Val{:let}, ex)
+    ctx.host === nothing || return _host_let(ctx, ex)
     bindings, body = ex.args
     saved = copy(ctx.locals)
     try
@@ -535,6 +577,7 @@ _jax_expr(ctx::_JaxContext, ::Val{:vect}, ex) =
     _jax_function_call(ctx, Base.vect, _PyVal[_jax_expr(ctx, a) for a in ex.args])
 function _jax_function_call(ctx::_JaxContext, ::typeof(Base.vect), values::Vector{_PyVal})
     T = isempty(values) ? Float64 : promote_type((_jax_eltype(v.T) for v in values)...)
+    isempty(values) && ctx.host !== nothing && return _host_list(ctx, Vector{T})
     isempty(values) && return _PyVal("jnp.zeros((0,), dtype=" * _jax_dtype(T) * ")", Vector{T})
     _PyVal("jnp.stack([" * join((v.code for v in values), ", ") * "])", Vector{T})
 end
@@ -547,16 +590,30 @@ function _jax_expr(ctx::_JaxContext, ::Val{:ref}, ex)
         T = getglobal(ctx.source_module, head)
         values = [_jax_expr(ctx, a) for a in ex.args[2:end]]
         dtype = T <: Bool ? "jnp.bool_" : T <: Integer ? "jnp.int64" : "jnp.float64"
+        isempty(values) && ctx.host !== nothing && return _host_list(ctx, Vector{T})
         isempty(values) && return _PyVal("jnp.zeros((0,), dtype=" * dtype * ")", Vector{T})
         return _PyVal("jnp.asarray([" * join((v.code for v in values), ", ") *
                       "], dtype=" * dtype * ")", Vector{T})
     end
-    x = _jax_expr(ctx, head)
+    x = ctx.host === nothing ? _jax_expr(ctx, head) : _host_raw(ctx, head)
+    if x.T isa _JaxCallable && x.T.f isa Type
+        # A typed array literal whose element type is computed (`eltype(c)[]`).
+        T = x.T.f
+        values = [_jax_expr(ctx, a) for a in ex.args[2:end]]
+        isempty(values) && ctx.host !== nothing && return _host_list(ctx, Vector{T})
+        isempty(values) && return _PyVal("jnp.zeros((0,), dtype=" * _jax_dtype(T) * ")", Vector{T})
+        return _PyVal("jnp.asarray([" * join((v.code for v in values), ", ") * "], dtype=" *
+                      _jax_dtype(T) * ")", Vector{T})
+    end
     _jax_index(ctx, x, ex.args[2:end])
 end
 
 # Index `x` with Julia indices `indices` (source expressions).
 function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
+    if ctx.host !== nothing
+        v = _host_index(ctx, x, indices)
+        v === nothing || return v
+    end
     if x.T isa Type && x.T <: Tuple
         length(indices) == 1 && indices[1] isa Integer ||
             _jax_error("a tuple is indexed with a literal integer only", _jax_where(ctx))
@@ -631,12 +688,12 @@ end
 # An index expression in which `end` and `begin` name the bounds of `x`'s
 # dimension `dim`.
 function _jax_bound_expr(ctx::_JaxContext, x::_PyVal, dim::Int, index)
-    index === :end && return _PyVal(_py_atom(x.code) * ".shape[" * string(dim - 1) * "]", Int, true)
+    index === :end && return _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
     index === :begin && return _PyVal("1", Int)
     if index isa Expr && (_jax_mentions(index, :end) || _jax_mentions(index, :begin))
         saved = copy(ctx.locals)
         try
-            ctx.locals[:end] = _PyVal(_py_atom(x.code) * ".shape[" * string(dim - 1) * "]", Int, true)
+            ctx.locals[:end] = _PyVal(_jax_dim_code(ctx, x, dim), Int, true)
             ctx.locals[:begin] = _PyVal("1", Int)
             return _jax_expr(ctx, index)
         finally
@@ -645,6 +702,10 @@ function _jax_bound_expr(ctx::_JaxContext, x::_PyVal, dim::Int, index)
     end
     _jax_expr(ctx, index)
 end
+# The length of `x`'s dimension `dim`; a host value may be a Python list.
+_jax_dim_code(ctx::_JaxContext, x::_PyVal, dim::Int) = ctx.host === nothing ?
+    _py_atom(x.code) * ".shape[" * string(dim - 1) * "]" :
+    dim == 1 ? "len(" * x.code * ")" : "np.shape(" * x.code * ")[" * string(dim - 1) * "]"
 _jax_mentions(ex, s::Symbol) = ex === s ||
     (ex isa Expr && !(ex.head === :ref) && any(a -> _jax_mentions(a, s), ex.args))
 
@@ -688,6 +749,7 @@ end
 _jax_expr(ctx::_JaxContext, ::Val{:&&}, ex) = _jax_short_circuit(ctx, ex, false)
 _jax_expr(ctx::_JaxContext, ::Val{:||}, ex) = _jax_short_circuit(ctx, ex, true)
 function _jax_short_circuit(ctx::_JaxContext, ex, is_or::Bool)
+    ctx.host === nothing || return _host_short_circuit(ctx, ex, is_or)
     a = _jax_expr(ctx, ex.args[1])
     if a.static
         rest = () -> _jax_expr(ctx, ex.args[2])
@@ -707,6 +769,7 @@ end
 # `map(xs...) do args... body end`: the body as a function of one element of
 # each collection, vectorized over them (padded collections stay padded).
 function _jax_expr(ctx::_JaxContext, ::Val{:do}, ex)
+    ctx.host === nothing || return _host_do(ctx, ex)
     call, lambda = ex.args
     call isa Expr && call.head === :call && lambda isa Expr && lambda.head === :-> ||
         _jax_error("the do-block `", ex, "` has no JAX translation", _jax_where(ctx))
@@ -802,6 +865,7 @@ function _jax_generator_values(ctx::_JaxContext, gen::Expr)
 end
 
 function _jax_generator_reduce(ctx::_JaxContext, f, gen::Expr, kwargs)
+    ctx.host === nothing || return _host_generator_reduce(ctx, f, gen, kwargs)
     values, masks = _jax_generator_values(ctx, gen)
     reduce, neutral = _JAX_GENERATOR_REDUCTIONS[f]
     operand = isempty(masks) ? values.code :
@@ -822,6 +886,7 @@ function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
     gen = only(ex.args)
     gen isa Expr && gen.head === :generator ||
         _jax_error("the comprehension `", ex, "` has no JAX translation", _jax_where(ctx))
+    ctx.host === nothing || return _host_comprehension(ctx, gen)
     gen.args[2] isa Expr && gen.args[2].head === :filter &&
         _jax_error("a filtered comprehension has a data-dependent length", _jax_where(ctx))
     values, masks = _jax_generator_values(ctx, gen)
@@ -839,6 +904,7 @@ _jax_is_trace_macro(name) = name === Symbol("@trace") ||
 # JAX differentiates it forward only; `jax.grad` through it raises JAX's own
 # error, so a differentiated program writes the loop as a `for` over a range.
 function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
+    ctx.host === nothing || return _host_while(ctx, ex)
     counted = _jax_counted_while(ctx, ex)
     counted === nothing || return _jax_expr(ctx, counted)
     condition_ex, body = ex.args
@@ -919,6 +985,7 @@ end
 # static limit (a padded group vector's length) runs to the limit and keeps
 # the carry unchanged past the bound.
 function _jax_expr(ctx::_JaxContext, ::Val{:for}, ex)
+    ctx.host === nothing || return _host_for(ctx, ex)
     binding, body = ex.args
     binding isa Expr && binding.head === :(=) && binding.args[1] isa Symbol ||
         _jax_error("the loop binding `", binding, "` has no JAX translation", _jax_where(ctx))
@@ -1033,6 +1100,7 @@ _jax_expr(ctx::_JaxContext, ::Val{:if}, ex) = _jax_if(ctx, ex, true)
 function _jax_if(ctx::_JaxContext, ex, value::Bool)
     ex.head === :elseif && (ex = Expr(:if, ex.args[1] isa Expr && ex.args[1].head === :block ?
                                       ex.args[1].args[end] : ex.args[1], ex.args[2:end]...))
+    ctx.host === nothing || return _host_if(ctx, ex, value)
     condition = _jax_expr(ctx, ex.args[1])
     otherwise = length(ex.args) >= 3 ? ex.args[3] : nothing
     translate(body) = value ? _jax_expr(ctx, body) :
@@ -1069,6 +1137,7 @@ end
 # Inside a data-dependent branch it raises while JAX traces that branch, even
 # where the native program would not take it.
 function _jax_conditional(ctx::_JaxContext, condition::_PyVal, then_build, else_build)
+    ctx.host === nothing || return _host_conditional(ctx, condition, then_build, else_build)
     # A condition known while emitting (`n === nothing` on a singleton) takes
     # its arm alone: the other is not translated, as Julia never runs it.
     if condition.code in ("True", "False")
@@ -1134,6 +1203,7 @@ def _rk_check(valid, message):
 function _jax_call_positional(ctx::_JaxContext, ::typeof(_runtime_check), args::Vector{_PyVal})
     valid, e = args
     message = e.T isa Type && e.T <: Exception && e.code != "None" ? e.code : repr(string(e.T))
+    ctx.host === nothing || return _host_check(ctx, valid, message)
     if valid.static
         error_arm = () -> _jax_call(ctx, throw, [_PyVal(message, ErrorException)])
         _jax_conditional(ctx, valid, () -> _PyVal("None", Nothing), error_arm)
@@ -1231,9 +1301,13 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
         f = _jax_resolve(ctx, Symbol(String(head)[2:end]))
         return _jax_broadcast(ctx, f, [_jax_expr(ctx, a) for a in positional])
     end
-    f = head isa Symbol && _jax_has_local(ctx, head) ?
-        _jax_error("calling the local `", head, "` has no JAX translation", _jax_where(ctx)) :
+    f = head isa Symbol && _jax_has_local(ctx, head) ? _jax_local_callable(ctx, head) :
         _jax_resolve(ctx, head)
+    # Host calls that read a list or dictionary in place (`push!`, `haskey`).
+    if ctx.host !== nothing
+        v = _host_call(ctx, f, positional, kwargs)
+        v === nothing || return v
+    end
     # A reduction over a generator, `sum(f(i) for i in r; init = x)`.
     if length(positional) == 1 && positional[1] isa Expr && positional[1].head === :generator &&
        haskey(_JAX_GENERATOR_REDUCTIONS, f)
@@ -1246,6 +1320,15 @@ function _jax_expr(ctx::_JaxContext, ::Val{:call}, ex)
     values = _PyVal[_jax_expr(ctx, a) for a in positional]
     kw = Pair{Symbol,_PyVal}[k => _jax_expr(ctx, v) for (k, v) in kwargs]
     _jax_call(ctx, f, values, kw)
+end
+
+# A local called as a function: a function value without captures (an
+# anonymous `(i, j) -> i` passed as an argument), or a type value.
+function _jax_local_callable(ctx::_JaxContext, name::Symbol)
+    v = ctx.locals[name]
+    v.T isa _JaxCallable && return v.T.f
+    v.T isa Type && v.T <: Function && Base.issingletontype(v.T) && return v.T.instance
+    _jax_error("calling the local `", name, "` has no JAX translation", _jax_where(ctx))
 end
 
 _jax_is_indexing(f) = f === getindex || f === view || f === _tensorized_getindex ||
@@ -1378,6 +1461,7 @@ end
 
 # Define the module-level helper `name` (Python source `text`) once.
 function _jax_helper!(ctx::_JaxContext, name::AbstractString, text::AbstractString)
+    ctx.host === nothing || return _host_helper!(ctx, name, text)
     key = (:helper, name)
     haskey(ctx.mod.helper_names, key) && return name
     ctx.mod.helper_names[key] = name
@@ -1515,7 +1599,7 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(permutedims), args::Vecto
         _jax_error("`permutedims` of a rank-", R, " array without a permutation", _jax_where(ctx))
     end
     perm = args[2]
-    perm.static && perm.T isa Type && perm.T <: NTuple{R,Integer} ||
+    _jax_known(ctx, perm) && perm.T isa Type && perm.T <: NTuple{R,Integer} ||
         _jax_error("`permutedims` by a permutation that is not a static tuple", _jax_where(ctx))
     axes = "tuple(a - 1 for a in " * perm.code * ")"
     _PyVal("jnp.transpose(" * x.code * ", " * axes * ")", Array{E,R})
@@ -1570,6 +1654,7 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_PyVal})
     x = only(args)
+    ctx.host === nothing || return _host_length(ctx, x)
     isempty(x.extent) || _jax_ragged(x.T) ||
         return _PyVal(x.extent, Int, false, "", _py_atom(x.code) * ".shape[0]")
     _jax_ragged(x.T) && return _PyVal(_py_atom(x.code) * ".shape[0]", Int, true)
@@ -1577,10 +1662,11 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(length), args::Vector{_Py
     _PyVal(_py_atom(x.code) * ".size", Int, true)
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(size), args::Vector{_PyVal})
-    length(args) == 2 || return _PyVal(_py_atom(args[1].code) * ".shape", NTuple{_jax_rank(args[1].T),Int}, true)
+    shape = ctx.host === nothing ? _py_atom(args[1].code) * ".shape" : "np.shape(" * args[1].code * ")"
+    length(args) == 2 || return _PyVal(shape, NTuple{_jax_rank(args[1].T),Int}, true)
     d = match(r"^[0-9]+$", args[2].code)
     d === nothing && _jax_error("`size` with a computed dimension", _jax_where(ctx))
-    _PyVal(_py_atom(args[1].code) * ".shape[" * string(parse(Int, args[2].code) - 1) * "]", Int, true)
+    _PyVal(shape * "[" * string(parse(Int, args[2].code) - 1) * "]", Int, true)
 end
 _jax_function_call(ctx::_JaxContext, ::typeof(identity), args::Vector{_PyVal}) = only(args)
 # `rem(x, y, mode)`: the remainder of the division rounded by `mode`.
@@ -1623,7 +1709,7 @@ for (f, op) in (((===), " is "), ((!==), " is not "))
         a, b = args
         a.T isa Type && b.T isa Type && Base.issingletontype(a.T) && Base.issingletontype(b.T) &&
             return _jax_literal($f(a.T.instance, b.T.instance))
-        a.static && b.static ||
+        _jax_known(ctx, a) && _jax_known(ctx, b) ||
             _jax_error("`", $f, "` of values that depend on data", _jax_where(ctx))
         _PyVal("(" * a.code * $op * b.code * ")", Bool, true)
     end
@@ -1636,6 +1722,47 @@ end
 _jax_function_call(ctx::_JaxContext, ::typeof(vcat), args::Vector{_PyVal}) =
     _jax_result(vcat, args, "jnp.concatenate([" * join(
         (_jax_is_array(a.T) ? a.code : "jnp.atleast_1d(" * a.code * ")" for a in args), ", ") * "])")
+# `reduce(vcat, cells)`: the cells' entries in order. On the host, a list of
+# arrays concatenated; under JAX an equal-length vector of vectors is a matrix,
+# read row by row, and a ragged one's padded entries are dropped: its valid
+# positions number its total length, the flat positions of the prepared input
+# whose lengths its own are (a static shape). A runtime check confirms they
+# add up.
+function _jax_call_positional(ctx::_JaxContext, ::typeof(reduce), args::Vector{_PyVal})
+    length(args) == 2 && args[1].T isa Type && args[1].T === typeof(vcat) ||
+        return _jax_function_call(ctx, reduce, args)
+    x = args[2]
+    T = x.T
+    T isa Type && T <: AbstractVector && eltype(T) isa Type && eltype(T) <: AbstractVector ||
+        return _jax_function_call(ctx, reduce, args)
+    E = eltype(eltype(T))
+    ctx.host === nothing || return _PyVal("np.concatenate([np.atleast_1d(r) for r in " *
+        x.code * "])", Vector{E}, true)
+    isempty(x.extent) && return _PyVal("jnp.reshape(" * x.code * ", (-1,))", Vector{E})
+    flat = _jax_flat_positions(ctx, x.extent)
+    flat === nothing && _jax_error("flattening a ragged value whose lengths are not those of a ",
+        "prepared ragged input (`prepare_data`) has no JAX translation", _jax_where(ctx))
+    padded = _jax_bind!(ctx, :cells, x)
+    lengths = _jax_bind!(ctx, :lengths, _PyVal(x.extent, Vector{Int}))
+    mask = "(jnp.arange(" * padded.code * ".shape[1])[None, :] < " * lengths.code * "[:, None])"
+    _jax_call(ctx, _runtime_check, [_PyVal("jnp.sum(" * lengths.code * ") == " * flat * ".shape[0]", Bool),
+        _PyVal(repr("reduce(vcat, cells): the cells' lengths do not add up to their input's total"),
+               ArgumentError)])
+    positions = _jax_fresh(ctx, :positions)
+    _jax_emit!(ctx, positions * " = jnp.nonzero(jnp.ravel(" * mask * "), size=" * flat *
+                    ".shape[0])[0]")
+    _PyVal("jnp.ravel(" * padded.code * ")[" * positions * "]", Vector{E})
+end
+# The flat positions of the prepared ragged input whose lengths `extent` reads.
+function _jax_flat_positions(ctx::_JaxContext, extent::AbstractString)
+    found = String[]
+    for (key, flat) in ctx.mod.helper_names
+        key isa Tuple && length(key) == 2 && key[1] === :flat || continue
+        occursin(Regex("(?<![.\\w])" * key[2] * "(?!\\w)"), extent) && push!(found, flat)
+    end
+    length(unique(found)) == 1 ? only(unique(found)) : nothing
+end
+
 _jax_function_call(ctx::_JaxContext, ::typeof(zero), args::Vector{_PyVal}) =
     _jax_is_array(args[1].T) ? _jax_result(zero, args, "jnp.zeros_like(" * args[1].code * ")") :
     _PyVal("0.0", args[1].T)
@@ -1720,14 +1847,14 @@ _jax_plus_one(b::_PyVal) = match(r"^-?[0-9]+$", b.code) === nothing ?
     _py_infix("+", [b.code, "1"]) : string(parse(Int, b.code) + 1)
 _jax_function_call(ctx::_JaxContext, ::typeof(eachindex), args::Vector{_PyVal}) =
     length(args) == 1 && _jax_is_array(args[1].T) && ndims(args[1].T) == 1 ?
-    _PyVal("jnp.arange(1, " * _py_atom(args[1].code) * ".shape[0] + 1)", Base.OneTo{Int}) :
+    _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, args[1], 1) * " + 1)", Base.OneTo{Int}) :
     _jax_error("`eachindex` of `", args[1].T, "`", _jax_where(ctx))
 function _jax_function_call(ctx::_JaxContext, ::typeof(axes), args::Vector{_PyVal})
     length(args) == 2 || _jax_error("`axes` without a dimension", _jax_where(ctx))
     d = match(r"^[0-9]+$", args[2].code)
     d === nothing && _jax_error("`axes` with a computed dimension", _jax_where(ctx))
-    _PyVal("jnp.arange(1, " * _py_atom(args[1].code) * ".shape[" * string(parse(Int, args[2].code) - 1) *
-           "] + 1)", Base.OneTo{Int})
+    _PyVal("jnp.arange(1, " * _jax_dim_code(ctx, args[1], parse(Int, args[2].code)) * " + 1)",
+           Base.OneTo{Int})
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(collect), args::Vector{_PyVal})
     x = only(args)
@@ -1765,7 +1892,7 @@ _jax_value(ctx::_JaxContext, ::UndefInitializer, hint) = _PyVal("<undef>", Undef
 # The size of an allocation: a static integer, or a data-dependent one at its
 # static bound (the array is then padded, its length the value).
 function _jax_allocation_size(ctx::_JaxContext, n::_PyVal)
-    n.static && return (n.code, "")
+    _jax_known(ctx, n) && return (n.code, "")
     isempty(n.limit) || return (n.limit, n.code)
     _jax_error("an array whose length depends on data has no JAX translation",
                _jax_where(ctx))
@@ -1774,6 +1901,10 @@ end
 # A Julia type called as a function: a conversion.
 function _jax_call_positional(ctx::_JaxContext, T::Type, args::Vector{_PyVal})
     isempty(args) && Base.issingletontype(T) && return _PyVal("None", T)
+    if ctx.host !== nothing
+        v = _host_construct(ctx, T, args)
+        v === nothing || return v
+    end
     if T <: AbstractArray && !isempty(args) && args[1].T === UndefInitializer
         dims = args[2:end]
         length(dims) == 1 || _jax_error("allocating a multidimensional array", _jax_where(ctx))
@@ -1834,26 +1965,31 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     # Any other scalar function: a module-level function translated once over
     # scalar arguments, vectorized over the operands.
     name = _jax_scalar_function!(ctx, f, eltypes)
+    # NumPy's `vectorize` needs the result type for empty arrays.
+    ctx.host === nothing || return _PyVal("np.vectorize(" * name * ", otypes=[" *
+        _host_dtype(E) * "])(" * _jax_args(padded) * ")", T)
     _PyVal("jnp.vectorize(" * name * ")(" * _jax_args(padded) * ")", T, false,
            R == 0 ? "" : _jax_extent(args))
 end
 
 # A module-level Python function computing `f` on scalars of `types`.
 function _jax_scalar_function!(ctx::_JaxContext, f, types)
-    key = (:scalar, objectid(f), Tuple(types))
+    host = ctx.host !== nothing
+    key = (:scalar, objectid(f), Tuple(types), host)
     haskey(ctx.mod.helper_names, key) && return ctx.mod.helper_names[key]
-    hint = Symbol("_rk_", replace(string(nameof_or(f)), r"[^A-Za-z0-9_]" => "_"))
+    hint = Symbol("_rk_", replace(string(nameof_or(f)), r"[^A-Za-z0-9_]" => "_"), host ? "_np" : "")
     name = _jax_identifier(ctx.mod.used, hint)
     ctx.mod.helper_names[key] = name
     scope = _JaxScope()
     params = [_jax_identifier(scope.used, Symbol(:x, i)) for i in eachindex(types)]
     inner = _JaxContext(ctx.mod, scope, ctx.recipe, ctx.source_module,
                         Dict{Symbol,_PyVal}(), nothing)
+    host && (inner.host = _HostState(Set{String}(params)))
     v = _jax_call(inner, f, [_PyVal(p, T) for (p, T) in zip(params, types)])
     lines = String["def " * name * "(" * join(params, ", ") * "):"]
     append!(lines, scope.lines)
     push!(lines, "    return " * v.code)
-    push!(ctx.mod.helpers, join(lines, "\n"))
+    push!(ctx.mod.helpers, host ? _host_helper_text(ctx, join(lines, "\n")) : join(lines, "\n"))
     name
 end
 nameof_or(f) = f isa Function && Base.issingletontype(typeof(f)) ? nameof(f) :
@@ -1940,16 +2076,17 @@ function _jax_call_positional(ctx::_JaxContext, k::PreparedKernel, args::Vector{
         _jax_error("a prepared kernel of ", length(p.have), " inputs called with ",
                    length(args), _jax_where(ctx))
     types = Any[a.T for a in args]
-    key = (:kernel, objectid(k), types)
+    host = ctx.host !== nothing
+    key = (:kernel, objectid(k), types, host)
     name = get(ctx.mod.helper_names, key, nothing)
     if name === nothing
         hint = length(p.want) == 1 ? only(p.want).name : :kernel
-        name = _jax_identifier(ctx.mod.used, Symbol("_rk_", hint))
+        name = _jax_identifier(ctx.mod.used, Symbol("_rk_", hint, host ? "_np" : ""))
         ctx.mod.helper_names[key] = name
         lines, f = _jax_function!(ctx.mod, name, p, Tuple(types),
                                   length(p.want) == 1 ? only(p.want).name : Tuple(v.name for v in p.want);
-                                  reserve = false)
-        push!(ctx.mod.helpers, join(lines, "\n"))
+                                  reserve = false, host)
+        push!(ctx.mod.helpers, host ? _host_helper_text(ctx, join(lines, "\n")) : join(lines, "\n"))
         ctx.mod.helper_names[(:kernel_type, name)] = f
     end
     f = ctx.mod.helper_names[(:kernel_type, name)]
@@ -1966,6 +2103,7 @@ function _jax_traceable_call(ctx::_JaxContext, f, args::Vector{_PyVal})
     source === nothing && return nothing
     names, body, mod = source
     length(names) == length(args) || return nothing
+    ctx.host === nothing || return _host_function_call(ctx, f, collect(Symbol, names), body, mod, args)
     v = _jax_source_expr(ctx, body, collect(Symbol, names), args, mod, nothing)
     _jax_bind!(ctx, :value, v)
 end
@@ -2160,19 +2298,24 @@ end
 # Emit every recipe of plan `p` into the current scope.
 function _jax_plan!(ctx::_JaxContext, p::Plan)
     for recipe in p.recipes
-        inputs = _PyVal[_jax_lookup(ctx, p.graph, v) for v in recipe.inputs]
-        ctx.recipe = recipe
-        outputs = _jax_recipe(ctx, p, recipe, recipe.op, inputs)
-        length(outputs) == length(recipe.outputs) ||
-            _jax_error("recipe produced ", length(outputs), " values for ",
-                       length(recipe.outputs), " outputs", _jax_where(ctx))
-        for (v, val) in zip(recipe.outputs, outputs)
-            id = canon_id(p.graph, v.id)
-            # A collateral output never replaces a value already computed.
-            any(s -> haskey(s.values, id), _jax_scope_chain(ctx.scope)) && continue
-            _jax_define!(ctx, p.graph, v, val)
-        end
+        _jax_plan_recipe!(ctx, p, recipe)
     end
+end
+function _jax_plan_recipe!(ctx::_JaxContext, p::Plan, recipe::Recipe)
+    inputs = _PyVal[_jax_lookup(ctx, p.graph, v) for v in recipe.inputs]
+    ctx.recipe = recipe
+    first_line = length(ctx.scope.lines) + 1
+    outputs = _jax_recipe(ctx, p, recipe, recipe.op, inputs)
+    length(outputs) == length(recipe.outputs) ||
+        _jax_error("recipe produced ", length(outputs), " values for ",
+                   length(recipe.outputs), " outputs", _jax_where(ctx))
+    for (v, val) in zip(recipe.outputs, outputs)
+        id = canon_id(p.graph, v.id)
+        # A collateral output never replaces a value already computed.
+        any(s -> haskey(s.values, id), _jax_scope_chain(ctx.scope)) && continue
+        _jax_define!(ctx, p.graph, v, val)
+    end
+    ctx.host === nothing || _host_lines!(ctx, first_line)
 end
 _jax_scope_chain(scope) = scope === nothing ? _JaxScope[] : [scope; _jax_scope_chain(scope.parent)]
 
@@ -2217,14 +2360,16 @@ _jax_captures(f) = nothing
 
 # Translate `source` with `names[i]` bound to `inputs[i]`.
 function _jax_source_expr(ctx::_JaxContext, source, names, inputs, mod::Module, captures)
-    saved = (ctx.locals, ctx.source_module, ctx.captures)
+    saved = (ctx.locals, ctx.source_module, ctx.captures, ctx.host)
     ctx.locals = Dict{Symbol,_PyVal}(zip(names, inputs))
     ctx.source_module = mod
     ctx.captures = captures
+    # On the host a source is a frame of its own: its locals take fresh names.
+    ctx.host === nothing || (ctx.host = _HostState())
     try
         return _jax_expr(ctx, source)
     finally
-        ctx.locals, ctx.source_module, ctx.captures = saved
+        ctx.locals, ctx.source_module, ctx.captures, ctx.host = saved
     end
 end
 
@@ -2303,7 +2448,7 @@ function _jax_plan_function!(ctx::_JaxContext, hint, p::Plan, types;
     append!(outer.lines, inner.lines)
     push!(outer.lines, "    "^inner.indent * "return " * (length(returned) == 1 ?
         returned[1] : "(" * join(returned, ", ") * ")"))
-    name, wants, Bool[!isempty(w.extent) for w in wants]
+    name, wants, Bool[!isempty(w.extent) for w in wants], names
 end
 
 # A plate: the cell as a function, mapped over the batched arguments with
@@ -2313,6 +2458,7 @@ end
 # its entries, and the plate's values are padded the same way.
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                      op::_AuthoredPlateOp{K,A}, inputs) where {K,A}
+    ctx.host === nothing || return _host_plate(ctx, recipe, op, inputs)
     body = op.kernel.plan
     # A tuple of numbers is a plate axis too; it is mapped as a stacked array.
     inputs = [!(i in A) && _jax_numeric_tuple(v.T) ?
@@ -2342,8 +2488,8 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     # value nor the gradient (measured with JAX 0.12.0.1: the batched jaxpr
     # selects `stop_gradient` inputs per arm; a vmapped `cond(x > 0, log(x), 0)`
     # at x = 0 has gradient 0, where `jnp.where` gives NaN).
-    cell, wants, with_length = _jax_plan_function!(ctx, :cell, body, cell_types;
-                                                   extents = cell_extents)
+    cell, wants, with_length, cell_params = _jax_plan_function!(ctx, :cell, body, cell_types;
+                                                                extents = cell_extents)
     want = only(wants)
     E = _jax_typeof(want)
     axes = String[]
@@ -2377,6 +2523,11 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
         lengths = _jax_fresh(ctx, :plate_lengths)
         if only(with_length)
             _jax_emit!(ctx, result * ", " * lengths * " = " * call)
+            # The cell's length in terms of the plate's arguments (an input's
+            # lengths, or their gather by the plate index) keeps their link
+            # to the input, whose flat positions a flattening reads.
+            outer = _jax_outer_extent(want.extent, cell_params, args, axes)
+            outer === nothing || return [_PyVal(result, Vector{E}, false, outer)]
         else
             _jax_emit!(ctx, result * " = " * call)
             _jax_emit!(ctx, lengths * " = jnp.full((" * result * ".shape[0],), " * result *
@@ -2389,6 +2540,31 @@ function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
     extent = _jax_extent(inputs[padded])
     [_PyVal(call, Array{E,R}, false, extent)]
 end
+# A cell's extent expression `extent`, over its parameters `params`, as the
+# plate's: each parameter replaced by its argument (`args`, mapped where `axes`
+# is "0"), or `nothing` when it reads anything else or reads a mapped argument
+# by more than its value (`row.shape`, `row[i]`).
+function _jax_outer_extent(extent::AbstractString, params, args, axes)
+    mapping = Dict(zip(params, zip(args, axes)))
+    out = IOBuffer()
+    last = 1
+    for m in eachmatch(r"(?<![.\w])[A-Za-z_]\w*", extent)
+        print(out, SubString(extent, last, prevind(extent, m.offset)))
+        last = m.offset + ncodeunits(m.match)
+        if m.match == "jnp"
+            print(out, m.match)
+            continue
+        end
+        haskey(mapping, m.match) || return nothing
+        arg, axis = mapping[m.match]
+        next = last <= ncodeunits(extent) ? extent[last] : ' '
+        axis == "0" && next in ('.', '[') && return nothing
+        print(out, _py_atom(arg))
+    end
+    print(out, SubString(extent, last))
+    String(take!(out))
+end
+
 _jax_numeric_namedtuple(@nospecialize(T)) = T isa Type && T <: NamedTuple && isconcretetype(T) &&
     fieldcount(T) > 0 && all(F -> F <: Number, fieldtypes(T))
 _jax_numeric_tuple(@nospecialize(T)) = T isa Type && T <: Tuple && fieldcount(T) > 0 &&
@@ -2402,6 +2578,7 @@ _jax_unref_val(v::_PyVal) = v
 function _jax_recipe(ctx::_JaxContext, p::Plan, recipe::Recipe,
                      op::_AuthoredScanOp{K,A,I,H}, inputs) where {K,A,I,H}
     H && _jax_error("a scan with `history` has no JAX translation yet", _jax_where(ctx))
+    ctx.host === nothing || return _host_scan(ctx, recipe, op, inputs)
     body = op.kernel.plan
     iterated = [i for i in 2:length(inputs) if !(i in A)]
     shared = [i for i in 2:length(inputs) if i in A]
@@ -2546,7 +2723,7 @@ translation raises a [`JAXEmissionError`](@ref) naming its recipe.
 """
 function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                     want = nothing, functions = nothing, types = nothing,
-                    name = :kernel, constants = NamedTuple(), doc = nothing)
+                    name = :kernel, constants = NamedTuple(), doc = nothing, data = nothing)
     functions === nothing && want === nothing && (want = _KERNEL_DEFAULT_BOUNDARY)
     if functions === nothing
         functions = NamedTuple{(Symbol(name),)}((want,))
@@ -2557,13 +2734,13 @@ function jax_source(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
         "jax_source: `functions` must be a nonempty NamedTuple of function name => WANT"))
     plans = [fname => (plan(spec; have, want = _jax_want_names(w)), w)
              for (fname, w) in pairs(functions)]
-    _jax_module_source(plans, types, constants, doc)
+    _jax_module_source(plans, types, constants, doc; data)
 end
 
 jax_source(p::Plan; types = nothing, name = :kernel, constants = NamedTuple(),
-           doc = nothing) =
+           doc = nothing, data = nothing) =
     _jax_module_source([Symbol(name) => (p, Tuple(v.name for v in p.want))],
-                       types, constants, doc)
+                       types, constants, doc; data)
 
 _jax_want_names(w::Symbol) = (w,)
 _jax_want_names(w::Tuple) = w
@@ -2571,28 +2748,63 @@ _jax_want_names(w::NamedTuple) = Tuple(values(w))
 _jax_want_names(w) = throw(ArgumentError(
     "jax_source: a function's WANT is a value name, a tuple of names or a NamedTuple; got `$w`"))
 
-function _jax_module_source(plans, types, constants, doc)
+# With `data`, the module's data-only prefix is `prepare_data` (`jax_host.jl`);
+# a recipe without a host translation is left to the JAX functions.
+function _jax_module_source(plans, types, constants, doc; data = nothing)
+    data === nothing && return _jax_module_text(plans, types, constants, doc, nothing)
+    data isa NamedTuple || data isa Tuple && all(d -> d isa Symbol, data) ||
+        throw(ArgumentError("jax_source: `data` is a tuple of HAVE names or a NamedTuple " *
+                            "of their values"))
+    excluded = Set{Int}()
+    while true
+        try
+            return _jax_module_text(plans, types, constants, doc, (data, excluded))
+        catch e
+            e isa _HostUnsupported && !(e.recipe in excluded) || rethrow()
+            push!(excluded, e.recipe)
+        end
+    end
+end
+
+const _JAX_HOST_HEADER = """
+import numpy as np
+import scipy.special as ssp
+"""
+
+function _jax_module_text(plans, types, constants, doc, prepare)
     mod = _JaxModule()
-    union!(mod.used, ("jax", "jnp", "jsp"))
+    union!(mod.used, ("jax", "jnp", "jsp", "np", "ssp", "scipy"))
+    bodies = String[]
+    functions = JAXFunction[]
+    if prepare === nothing
+        for (fname, (p, w)) in plans
+            lines, f = _jax_function!(mod, fname, p, types, w)
+            push!(bodies, join(lines, "\n"))
+            push!(functions, f)
+        end
+    else
+        data, excluded = prepare
+        meta = _jax_prepared_functions!(mod, bodies, functions, plans, types, data, excluded)
+        constants = merge(constants, meta)
+    end
     constant_lines = String[]
     for (key, value) in pairs(constants)
         cname = _jax_identifier(mod.used, key)
         push!(constant_lines, cname * " = " * _jax_py_literal(value))
     end
-    bodies = String[]
-    functions = JAXFunction[]
-    for (fname, (p, w)) in plans
-        lines, f = _jax_function!(mod, fname, p, types, w)
-        push!(bodies, join(lines, "\n"))
-        push!(functions, f)
-    end
-    any(f -> any(io -> _jax_ragged(last(io)), f.inputs), functions) &&
+    prepare === nothing && any(f -> any(io -> _jax_ragged(last(io)), f.inputs), functions) &&
         pushfirst!(mod.helpers, rstrip(_JAX_PAD_RAGGED))
     lines = String[]
     docstring = doc === nothing ?
         "Generated by ReactiveKernels.jax_source; do not edit." : String(doc)
     push!(lines, "\"\"\"" * replace(docstring, "\"\"\"" => "\\\"\\\"\\\"") * "\"\"\"")
-    push!(lines, rstrip(_JAX_HEADER))
+    header = rstrip(_JAX_HEADER)
+    if prepare !== nothing
+        header = rstrip(_JAX_HOST_HEADER) * "\n" * header
+        any(b -> occursin("scipy.linalg.", b), [mod.helpers; bodies]) &&
+            (header = "import scipy.linalg\n" * header)
+    end
+    push!(lines, header)
     isempty(constant_lines) || (push!(lines, ""); append!(lines, constant_lines))
     for block in [mod.helpers; bodies]
         push!(lines, "")
@@ -2602,21 +2814,100 @@ function _jax_module_source(plans, types, constants, doc)
     JAXSource(join(lines, "\n") * "\n", functions)
 end
 
+# `prepare_data` and the functions over its results; returns the metadata
+# constants `INPUTS` (the functions' parameters) and `PREPARED` (each
+# prepared input's dtype, rank and raggedness).
+function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, types, data,
+                                  excluded)
+    ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
+    split = _jax_prepare_split(plans, ports, excluded)
+    p1 = first(plans).second[1]
+    have_types = Dict{Symbol,Any}(zip((v.name for v in p1.have), _jax_have_types(p1, types)))
+    data isa NamedTuple && for (k, v) in pairs(data)
+        have_types[k] = typeof(v)
+    end
+    raw_types = Any[have_types[v.name] for v in split.raw]
+    used = Set{String}()
+    remaining_names = [_jax_param_name(used, v.name) for v in split.remaining]
+    prepared_names = String[]
+    for v in split.constants
+        name = _jax_param_name(used, v.name)
+        push!(used, name * "_lengths", name * "_flat")
+        push!(prepared_names, name)
+    end
+    # The boundary values' types: those of one binding's values, when `data`
+    # gives them; else those the translation infers.
+    native = nothing
+    if data isa NamedTuple && !isempty(split.constants)
+        native = try
+            values = _prepare_plan(split.plan)((data[v.name] for v in split.raw)...)
+            Any[typeof(x) for x in _partial_prefix_values(split.constants, values)]
+        catch
+            nothing
+        end
+    end
+    lines, prepared_types = _jax_prepare_function!(mod, split, raw_types, prepared_names, native)
+    push!(bodies, join(lines, "\n"))
+    push!(functions, JAXFunction("prepare_data",
+        [String(v.name) => T for (v, T) in zip(split.raw, raw_types)],
+        [n => T for (n, T) in zip(prepared_names, prepared_types)]))
+    all_types = Any[[have_types[v.name] for v in split.remaining]; prepared_types]
+    all_names = [remaining_names; prepared_names]
+    for (fname, (rp, w)) in split.residuals
+        lines, f = _jax_function!(mod, fname, rp, Tuple(all_types), w; names = all_names)
+        push!(bodies, join(lines, "\n"))
+        push!(functions, f)
+    end
+    (INPUTS = Tuple(first(io) for io in functions[2].inputs),
+     PREPARED = [n => (dtype = _jax_dtype_name(T), ndim = _jax_meta_rank(T), ragged = _jax_ragged(T))
+                 for (n, T) in zip(prepared_names, prepared_types)])
+end
+
+# A value's dtype and rank, as module metadata describes an input.
+_jax_dtype_name(::Type{<:AbstractArray{T}}) where {T} = _jax_dtype_name(T)
+_jax_dtype_name(::Type{<:AbstractArray{<:AbstractArray{T}}}) where {T} = _jax_dtype_name(T)
+_jax_dtype_name(::Type{Bool}) = "bool"
+_jax_dtype_name(::Type{<:Integer}) = "int64"
+_jax_dtype_name(::Type{<:AbstractFloat}) = "float64"
+# Non-numeric values (level labels) cross as Python objects.
+_jax_dtype_name(@nospecialize(T)) = "object"
+_jax_meta_rank(@nospecialize(T)) = T isa Type && T <: AbstractArray ? ndims(T) : 0
+
 # One function `fname` over plan `p`, returning WANT `w` in its shape.
-function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool = true)
+function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool = true,
+                        host::Bool = false, names = nothing)
     argtypes = _jax_have_types(p, types)
     name = reserve ? _jax_identifier(mod.used, fname) : String(fname)
     scope = _JaxScope()
     ctx = _JaxContext(mod, scope, nothing, Main, Dict{Symbol,_PyVal}(), nothing)
+    host && (ctx.host = _HostState())
     params = String[]
     inputs = Pair{String,Any}[]
-    for (v, T) in zip(p.have, argtypes)
-        param = _jax_identifier(scope.used, v.name)
+    for (k, (v, T)) in enumerate(zip(p.have, argtypes))
+        param = names === nothing ? _jax_identifier(scope.used, v.name) :
+            (push!(scope.used, names[k]); names[k])
         push!(params, param); push!(inputs, param => T)
+        if host
+            # Host inputs are NumPy arrays; a ragged input is a list of them.
+            scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, true)
+            _jax_ragged(T) ? _jax_emit!(ctx, param * " = [np.asarray(a) for a in " * param * "]") :
+                _jax_is_array(T) && eltype(T) <: Number &&
+                _jax_emit!(ctx, param * " = np.asarray(" * param * ")")
+            continue
+        end
         extent = ""
         if _jax_ragged(T)
-            extent = _jax_identifier(scope.used, Symbol(v.name, :_lengths))
+            extent = names === nothing ? _jax_identifier(scope.used, Symbol(v.name, :_lengths)) :
+                (push!(scope.used, names[k] * "_lengths"); names[k] * "_lengths")
             push!(params, extent); push!(inputs, extent => Vector{Int})
+            if names !== nothing
+                # A prepared ragged input's flat positions; their count, the
+                # total length, is the static length of its flattening.
+                flat = names[k] * "_flat"
+                push!(scope.used, flat)
+                push!(params, flat); push!(inputs, flat => Vector{Int})
+                mod.helper_names[(:flat, extent)] = flat
+            end
         end
         scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, false, extent)
         # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
@@ -2624,6 +2915,8 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
         if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))
             _jax_emit!(ctx, param * " = jnp.asarray(" * param * ")")
             isempty(extent) || _jax_emit!(ctx, extent * " = jnp.asarray(" * extent * ")")
+            haskey(mod.helper_names, (:flat, extent)) && names !== nothing &&
+                _jax_emit!(ctx, names[k] * "_flat = jnp.asarray(" * names[k] * "_flat)")
         end
     end
     _jax_plan!(ctx, p)
