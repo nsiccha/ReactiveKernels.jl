@@ -1129,15 +1129,72 @@ end
     end
     result
 end
+
+# A plate of the position residual's top level that stores its cells keeps one
+# table per lane slot of a value computed at every cell (`_CELL_TABLES`): entry
+# `k` holds the buffer cell `k`'s stored result held when the plate last ran,
+# or a spare. The plate runs once per position, and its stored results are
+# dead once the next position (or, for a borrowed reader, the next call) runs
+# it again: a WANT is stored by value, as numbers (`_replicated_output`
+# refuses arrays of arrays). So cell `k` takes its entry into the slot before
+# computing (`_lane_cell_take!`). A result that holds the slot's buffer gives
+# it to the entry and the slot gets the entry's spare (`_lane_cell_release!`);
+# every other cell keeps reusing the slot. Only the slot is ever written, and a
+# buffer leaves the table only at its own cell, so no stored result is
+# overwritten while it is live.
+@inline function _lane_cell_table(table::Base.RefValue{Any}, cell::Int)
+    entries = table[]
+    entries isa Vector{Any} || (entries = Any[]; table[] = entries)
+    entries = entries::Vector{Any}
+    while length(entries) < cell
+        push!(entries, nothing)
+    end
+    entries
+end
+@inline function _lane_cell_take!(slot::Base.RefValue{Any}, table::Base.RefValue{Any},
+                                  cell::Int)
+    entries = _lane_cell_table(table, cell)
+    held = @inbounds entries[cell]
+    held === nothing && return nothing
+    @inbounds entries[cell] = slot[]
+    slot[] = held
+    nothing
+end
+@inline function _lane_cell_release!(result, cell::Int,
+        pairs::Vararg{Tuple{Base.RefValue{Any},Base.RefValue{Any}},N}) where {N}
+    isbits(result) && return result
+    foreach(pairs) do (slot, table)
+        buffer = slot[]
+        (buffer === nothing || !_lane_may_reference(result, buffer)) && return
+        entries = _lane_cell_table(table, cell)
+        @inbounds slot[] = entries[cell]
+        @inbounds entries[cell] = buffer
+    end
+    result
+end
+
 # Any other value may hold an array.
-_lane_may_reference(result, buffer) = true
-_lane_may_reference(::Number, buffer) = false
-_lane_may_reference(result::AbstractArray, buffer) =
-    buffer isa AbstractArray && Base.mightalias(result, buffer) ||
-    (_replicated_may_contain_array(eltype(result)) &&
-     any(item -> _lane_may_reference(item, buffer), result))
-_lane_may_reference(result::Union{Tuple,NamedTuple}, buffer) =
-    any(item -> _lane_may_reference(item, buffer), result)
+# The walk runs once per cell. It specializes on the result only: a slot's
+# buffer is untyped (`Ref{Any}`), so a method specialized on it would be found
+# at run time and box the result, a tuple included. Tuples recurse by type and
+# arrays loop, so the walk allocates nothing (`any` with a closure over a
+# heterogeneous tuple boxed every item).
+_lane_may_reference(result, @nospecialize(buffer)) = true
+_lane_may_reference(::Number, @nospecialize(buffer)) = false
+function _lane_may_reference(result::AbstractArray, @nospecialize(buffer))
+    buffer isa AbstractArray && Base.mightalias(result, buffer) && return true
+    _replicated_may_contain_array(eltype(result)) || return false
+    for item in result
+        _lane_may_reference(item, buffer) && return true
+    end
+    false
+end
+_lane_may_reference(result::NamedTuple, @nospecialize(buffer)) =
+    _lane_may_reference(values(result), buffer)
+_lane_may_reference(::Tuple{}, @nospecialize(buffer)) = false
+@inline _lane_may_reference(result::Tuple, @nospecialize(buffer)) =
+    _lane_may_reference(first(result), buffer) ||
+    _lane_may_reference(Base.tail(result), buffer)
 
 # The buffer an authored plate or scan fills (`_lane_allocation`): the matching
 # recycled buffer, or `allocate(args...)`, kept when `recycled` is a lane slot.
@@ -1217,6 +1274,29 @@ const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<
     buffer = _lane_reuse(recycled, T, Base.index_shape(J...))
     buffer === nothing && return _lane_keep!(recycled, A[I...])
     copyto!(buffer, view(A, J...))
+end
+
+# `zeros`, `ones` and `fill` of integer dimensions in a lazy-branch arm
+# (`_lane_source_expr`): Base's fresh array, or a matching recycled buffer
+# filled with the same element. Other arguments (dimension tuples, a negative
+# dimension's error) take Base's call.
+@inline _lane_zeros(recycled, args...) = zeros(args...)
+@inline _lane_zeros(recycled, dims::Vararg{Integer}) = _lane_zeros(recycled, Float64, dims...)
+@inline _lane_zeros(recycled, ::Type{T}, dims::Vararg{Integer}) where {T} =
+    _lane_filled(recycled, zeros, zero(T), T, dims)
+@inline _lane_ones(recycled, args...) = ones(args...)
+@inline _lane_ones(recycled, dims::Vararg{Integer}) = _lane_ones(recycled, Float64, dims...)
+@inline _lane_ones(recycled, ::Type{T}, dims::Vararg{Integer}) where {T} =
+    _lane_filled(recycled, ones, one(T), T, dims)
+@inline _lane_fill(recycled, args...) = fill(args...)
+@inline _lane_fill(recycled, value::Number, dims::Vararg{Integer}) =
+    _lane_filled(recycled, fill, value, typeof(value), dims)
+@inline function _lane_filled(recycled, make::F, value, ::Type{T}, dims) where {F,T}
+    fresh() = make === fill ? fill(value, dims...) : make(T, dims...)
+    all(d -> d >= 0, dims) || return fresh()
+    buffer = _lane_reuse(recycled, T, map(d -> Base.OneTo(Int(d)), dims))
+    buffer === nothing && return _lane_keep!(recycled, fresh())
+    fill!(buffer, value)
 end
 
 _scan_history_buffer(recycled, xs, fill::Number) = fill!(
