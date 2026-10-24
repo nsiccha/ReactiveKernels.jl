@@ -185,6 +185,15 @@ end
     return y
 end
 
+# A straight-line plain helper, translated from its lowered code: its literal
+# powers and `eltype` are type values there (`Val{2}`, `Float64`), which bind
+# no Python local.
+jax_test_plain(w, x) = zero(eltype(x)) + sum(x) * w^2 + w^-1
+@kernel jax_plain(w::Float64, x::Vector{Float64}) = begin
+    s = jax_test_plain(w, x)
+    return s
+end
+
 @traceable jax_test_count(x::AbstractVector, n::Integer) = begin
     acc = zero(eltype(x))
     for i in 1:n
@@ -226,6 +235,9 @@ end
     @test occursin("jax.lax.fori_loop(", traced)
     @test occursin("jax.lax.cond(", traced)
     @test occursin("jax.lax.while_loop(", string(jax_source(jax_doubling; have = (:x,), want = :y)))
+    plain = string(jax_source(jax_plain; have = (:w, :x), want = :s))
+    @test occursin("w ** 2", plain)
+    @test !occursin(r"<[a-z]", plain)
     # Several functions over one boundary, with module constants.
     multi = jax_source(jax_gaussian; have = (:mu, :x, :logsigma),
                        functions = (log_density = :lp, both = (:lp, :sigma),
@@ -283,6 +295,11 @@ end
         native = prepare(jax_doubling; have = (:x,), want = :y)
         src = jax_source(jax_doubling; have = (:x,), want = :y)
         @test rk_jax_evaluate(src, "kernel", (37.0,)).value ≈ native(37.0) rtol = 1e-12
+        native = prepare(jax_plain; have = (:w, :x), want = :s)
+        src = jax_source(jax_plain; have = (:w, :x), want = :s)
+        r = rk_jax_evaluate(src, "kernel", (0.7, x); grad = true)
+        @test r.value ≈ native(0.7, x) rtol = 1e-12
+        @test r.grad ≈ 2 * 0.7 * sum(x) - 0.7^-2 rtol = 1e-10
 
         for (kernel, have, want, args) in (
                 (jax_alloc, (:x, :w), :s, (x, 0.7)),
