@@ -241,19 +241,8 @@ _LaneSourceContext(mod, arguments) = _LaneSourceContext(mod, arguments, nothing,
 # The callee a call node names, when it has a lane kernel: a quoted object
 # (`_KernelPreparedChild`) or a module binding, read as the closure reads it.
 function _lane_node_callee(ctx::_LaneSourceContext, node)
-    value = if node isa QuoteNode
-        node.value
-    elseif node isa GlobalRef
-        isdefined(node.mod, node.name) || return nothing
-        getglobal(node.mod, node.name)
-    elseif node isa Symbol
-        haskey(ctx.arguments, node) && return nothing
-        isdefined(ctx.mod, node) || return nothing
-        getglobal(ctx.mod, node)
-    else
-        return nothing
-    end
-    _lane_callee(value) === nothing ? nothing : value
+    value = node isa QuoteNode ? node.value : _lane_binding(ctx, node)
+    value === nothing || _lane_callee(value) === nothing ? nothing : value
 end
 
 # `_lane_call(recycled, state, callee, args...)` for a call whose callee has a
