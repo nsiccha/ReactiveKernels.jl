@@ -111,8 +111,8 @@ the functions' inputs exactly. `jax_source(built, plan)` passes its binding.
 JAX code:
 
 - Its values are concrete, so a condition is a Python `if`, a loop a Python
-  `for` or `while` (with `break`, `continue` and an early `return` in a
-  `@traceable` helper), and a value's shape may follow its data: level codes
+  `for` or `while` (with `break` and `continue`), and a value's shape may
+  follow its data: level codes
   of string columns, stopping-ratio stage lanes, positions of missing values.
   A loop in the source is a loop in the module; nothing is unrolled.
 - A vector built with `push!` is a list; dictionaries are `dict`s; an array a
@@ -192,8 +192,7 @@ A function that a recipe calls is translated if:
   module defines, since `jax.scipy.special.betaln` (JAX 0.12) is accurate to
   about 1e-6 in float64 once an argument reaches 8;
 - it is defined with `@traceable`, in which case its authored body is
-  translated (in `prepare_data`, as a host function, where an early `return`
-  is a Python `return`);
+  translated (in `prepare_data`, as a host function);
 - it is a prepared kernel, which becomes a module-level function of its plan;
 - or it is a plain function whose lowered code is straight-line.
 

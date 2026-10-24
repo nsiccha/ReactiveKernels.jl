@@ -208,7 +208,10 @@ end
 
 # Data preparation whose shapes follow the data's values (decision 1ooufd4):
 # with `data`, it is `prepare_data`, host NumPy with Python control flow.
-@traceable function jax_prep_codes(x::AbstractVector, levels::AbstractVector)
+# Helpers whose loops `@traceable`'s traced form cannot carry (`break`,
+# `continue`, several ranges) record their source with `@_record_source`, as
+# RKPPL's own preparation helpers do.
+ReactiveKernels.@_record_source function jax_prep_codes(x::AbstractVector, levels::AbstractVector)
     codes = Vector{Int}(undef, length(x))
     for (i, v) in enumerate(x)
         c = 0
@@ -222,14 +225,14 @@ end
     end
     return codes
 end
-@traceable function jax_prep_lanes(y::AbstractVector{<:Integer}, K)
+ReactiveKernels.@_record_source function jax_prep_lanes(y::AbstractVector{<:Integer}, K)
     out = Int[]
     for (i, count) in enumerate(min.(y, K .- 1)), j in 1:count
         push!(out, i)
     end
     return out
 end
-@traceable function jax_prep_first(keys::AbstractVector)
+ReactiveKernels.@_record_source function jax_prep_first(keys::AbstractVector)
     seen = Dict{eltype(keys),Int}()
     codes = zeros(Int, length(keys))
     for i in eachindex(keys)
@@ -238,18 +241,24 @@ end
     end
     return codes
 end
-@traceable function jax_prep_search(x::AbstractVector, target)
-    for i in eachindex(x)
-        x[i] >= target && return i
+ReactiveKernels.@_record_source function jax_prep_search(x::AbstractVector, target)
+    found = 0
+    i = 1
+    while i <= length(x)
+        if x[i] >= target
+            found = i
+            break
+        end
+        i += 1
     end
-    return 0
+    return found
 end
 @kernel jax_prep(g::Vector{String}, y::Vector{Int}, theta::Vector{Float64}) = begin
     codes = jax_prep_codes(g, ["a", "b", "c"])
     lanes = jax_prep_lanes(y, 3)
     first = jax_prep_first(g)
     at = jax_prep_search(y, 2)
-    total = sum(theta[codes]) + 2 * sum(theta[first]) + sum(theta[lanes]) + at * theta[1]
+    total = sum(theta[codes]) + 2 * sum(theta[first]) + sum(lanes) * theta[2] + at * theta[1]
     return total
 end
 # A ragged value read through a plate, then flattened.
@@ -391,7 +400,7 @@ end
     @test first(first.(src.functions[2].inputs)) == "theta"
     # The preparation is host code with real loops; the function is JAX code.
     prepare = text[findfirst("def prepare_data", text).start:end]
-    @test occursin(r"^\s*for .* in enumerate\(", text)
+    @test occursin(r"^\s*for .* in enumerate\("m, text)
     @test occursin("break", text) && occursin(".append(", text) && occursin(".setdefault(", text)
     @test !occursin("jnp.", split(prepare, "\ndef kernel")[1])
     @test occursin("PREPARED = {", text)
@@ -406,12 +415,12 @@ end
     else
         theta = [0.3, -1.2, 2.0]
         native = sum(theta[jax_prep_codes(g, ["a", "b", "c"])]) +
-                 2 * sum(theta[jax_prep_first(g)]) + sum(theta[jax_prep_lanes(y, 3)]) +
+                 2 * sum(theta[jax_prep_first(g)]) + sum(jax_prep_lanes(y, 3)) * theta[2] +
                  jax_prep_search(y, 2) * theta[1]
         r = rk_jax_evaluate(src, "kernel", (theta, g, y); grad = true, prepare = true)
         @test r.value ≈ native rtol = 1e-12
         @test r.grad ≈ rk_fd_gradient(t -> sum(t[jax_prep_codes(g, ["a", "b", "c"])]) +
-                 2 * sum(t[jax_prep_first(g)]) + sum(t[jax_prep_lanes(y, 3)]) +
+                 2 * sum(t[jax_prep_first(g)]) + sum(jax_prep_lanes(y, 3)) * t[2] +
                  jax_prep_search(y, 2) * t[1], theta) rtol = 1e-6
         r = rk_jax_evaluate(flat, "kernel", (0.7, R); grad = true, prepare = true)
         @test r.value ≈ sum(abs2, 0.7 .* reduce(vcat, R)) rtol = 1e-12

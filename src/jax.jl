@@ -2163,6 +2163,7 @@ function _jax_lowered_call_body(ctx::_JaxContext, f, args::Vector{_PyVal}, types
         x isa Core.SlotNumber ? (haskey(slots, x.id) ? slots[x.id] :
                                  _jax_error("an unassigned local in `", f, "`")) :
         x isa Core.Argument ? slots[x.n] :
+        x isa Expr && x.head === :new ? _jax_lowered_new(ctx, value(x.args[1]), length(x.args)) :
         x isa GlobalRef ? _jax_global_value(ctx, getglobal(x.mod, x.name), x.name) :
         x isa QuoteNode && x.value isa Symbol ? _PyVal(":" * String(x.value), Symbol) :
         x isa QuoteNode ? _jax_global_value(ctx, x.value, :constant) :
@@ -2196,6 +2197,15 @@ function value_of_rhs(ctx::_JaxContext, rhs, value, mod)
             _jax_callable(value(callee)) :
         callee isa QuoteNode ? callee.value : callee
     _jax_bind!(ctx, :t, _jax_call(ctx, g, _PyVal[value(a) for a in rhs.args[2:end]]))
+end
+# `%new(T)` of a function without captures (an anonymous `(i, j) -> i` passed
+# on): its type carries it.
+function _jax_lowered_new(ctx::_JaxContext, T::_PyVal, nargs::Int)
+    F = T.T isa _JaxCallable ? T.T.f : nothing
+    F isa Type && F <: Function && Base.issingletontype(F) && nargs == 1 ||
+        _jax_error("constructing a `", F, "` in lowered code has no JAX translation",
+                   _jax_where(ctx))
+    _PyVal("None", F, true)
 end
 # A global read in lowered code: callables pass as themselves, data as values.
 _jax_global_value(ctx::_JaxContext, x, hint) = x isa Union{Function,Type,PreparedKernel,Module} ?
@@ -2824,9 +2834,18 @@ function _jax_prepared_functions!(mod::_JaxModule, bodies, functions, plans, typ
     ports = data isa NamedTuple ? Set(keys(data)) : Set(data)
     split = _jax_prepare_split(plans, ports, excluded)
     p1 = first(plans).second[1]
-    have_types = Dict{Symbol,Any}(zip((v.name for v in p1.have), _jax_have_types(p1, types)))
-    data isa NamedTuple && for (k, v) in pairs(data)
-        have_types[k] = typeof(v)
+    # Raw data enters host code, so its types need not be concrete (a column
+    # with missing values); the functions' inputs must be.
+    have_types = Dict{Symbol,Any}()
+    for (k, v) in enumerate(p1.have)
+        have_types[v.name] = data isa NamedTuple && haskey(data, v.name) ? typeof(data[v.name]) :
+            types isa NamedTuple && haskey(types, v.name) ? types[v.name] :
+            types isa Tuple ? types[k] : valtype(v)
+    end
+    for v in split.remaining
+        _concrete_value_type(have_types[v.name]) || throw(ArgumentError(
+            "jax_source: the HAVE value `$(v.name)` has type `$(have_types[v.name])`; pass a " *
+            "concrete type with `types`"))
     end
     raw_types = Any[have_types[v.name] for v in split.raw]
     used = Set{String}()

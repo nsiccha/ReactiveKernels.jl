@@ -411,9 +411,9 @@ function _host_iterable(ctx::_JaxContext, iter)
         elseif (f === eachindex || f === keys || f === values || f === pairs) && length(args) == 1
             x = _host_raw(ctx, args[1])
             if x.T isa Type && x.T <: AbstractDict
-                f === pairs && return x.code * ".items()", Tuple{keytype(x.T),valtype(x.T)}
-                f === values && return x.code * ".values()", valtype(x.T)
-                return x.code * ".keys()", keytype(x.T)
+                f === pairs && return x.code * ".items()", Tuple{Base.keytype(x.T),Base.valtype(x.T)}
+                f === values && return x.code * ".values()", Base.valtype(x.T)
+                return x.code * ".keys()", Base.keytype(x.T)
             end
             f === values && return x.code, _jax_eltype(x.T)
             f === pairs && return "enumerate(" * x.code * ", 1)", Tuple{Int,_jax_eltype(x.T)}
@@ -434,7 +434,7 @@ function _host_iterable(ctx::_JaxContext, iter)
     end
     x = _host_raw(ctx, iter)
     T = x.T
-    T isa Type && T <: AbstractDict && return x.code * ".items()", Tuple{keytype(T),valtype(T)}
+    T isa Type && T <: AbstractDict && return x.code * ".items()", Tuple{Base.keytype(T),Base.valtype(T)}
     T isa Type && T <: Tuple && return x.code, promote_type(fieldtypes(T)...)
     T isa Type && T <: AbstractArray && ndims(T) > 1 &&
         return "np.ravel(" * x.code * ", order=\"F\")", eltype(T)
@@ -691,7 +691,7 @@ function _host_call(ctx::_JaxContext, f, positional, kwargs)
     end
     default = _jax_expr(ctx, positional[3])
     _PyVal(c.code * (f === get ? ".get(" : ".setdefault(") * key.code * ", " * default.code * ")",
-           valtype(c.T), true)
+           Base.valtype(c.T), true)
 end
 
 function _host_length(ctx::_JaxContext, x::_PyVal)
@@ -709,7 +709,7 @@ function _host_index(ctx::_JaxContext, x::_PyVal, indices)
     if T isa Type && T <: AbstractDict
         length(indices) == 1 || _jax_error("a dictionary key of several indices", _jax_where(ctx))
         key = _jax_expr(ctx, indices[1])
-        return _PyVal(_py_atom(x.code) * "[" * key.code * "]", valtype(T), true)
+        return _PyVal(_py_atom(x.code) * "[" * key.code * "]", Base.valtype(T), true)
     end
     x.code in ctx.host.lists || _jax_ragged(T) || return nothing
     length(indices) == 1 || _jax_error("indexing a list with ", length(indices), " indices",
