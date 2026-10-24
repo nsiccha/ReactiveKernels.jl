@@ -418,15 +418,8 @@ end
     Expr(:block, Expr(:meta, fieldcount(shapes) <= 2 ? :inline : :noinline), fold)
 end
 
-# `Base.promote_op(f, T1, …, Tn)` for the types an emitted body computes: the
-# same result (`Union{}` when an argument type is `Union{}`, otherwise the
-# inferred return type over `Tuple{T1, …, Tn}`). Base forms that tuple type
-# through two splats (`promote_op(f, S...)`, `TupleOrBottom(tt...)`), which past
-# 32 types (`max_tuple_splat`) stay runtime `Core._apply_iterate` calls: a plate
-# cell with 33 or more operands then computed its element type on every call,
-# allocating about 900 B per plate call. Spelled out positionally, the tuple
-# type folds at compile time for any number of types.
-@inline @generated function _promote_op(f, types::Vararg{Type,N}) where {N}
+# The body of `_promote_op` over `f` and `N` argument types `types`.
+function _promote_op_body(N)
     arguments = Any[:(getfield(types, $index)) for index in 1:N]
     bottom = foldr((argument, rest) -> :($argument === Union{} || $rest),
                    arguments; init = false)
@@ -435,6 +428,16 @@ end
         Base._return_type(f, Core.apply_type(Tuple, $(arguments...)))
     end
 end
+
+# `Base.promote_op(f, T1, …, Tn)` for the types an emitted body computes: the
+# same result (`Union{}` when an argument type is `Union{}`, otherwise the
+# inferred return type over `Tuple{T1, …, Tn}`). Base forms that tuple type
+# through two splats (`promote_op(f, S...)`, `TupleOrBottom(tt...)`), which past
+# 32 types (`max_tuple_splat`) stay runtime `Core._apply_iterate` calls: a plate
+# cell with 33 or more operands then computed its element type on every call,
+# allocating about 900 B per plate call. Spelled out positionally, the tuple
+# type folds at compile time for any number of types.
+@inline @generated _promote_op(f, types::Vararg{Type,N}) where {N} = _promote_op_body(N)
 
 function (op::_AuthoredPlateOp{K,A})(args...) where {K,A}
     batch = _authored_plate_broadcast(Val(A), args...)
@@ -3461,6 +3464,9 @@ end
 # the cell's AST takes after its inputs, and the collection gains them.
 # `result_slot`: the cell's result keeps a slot too, because the plate keeps a
 # per-cell table for it (`_plate_stores_cells`).
+# The plates of the cell's own lowering keep per-cell tables as well: `tables`
+# names them, which the collection gains for binding, and the outer cell's
+# result releases them (`_lane_tables_release!`).
 function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types,
                                 atomic, callvalues; result_slot::Bool = false)
     hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
@@ -3469,6 +3475,7 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
     type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
     cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
     recycle = Pair{ValueId,Symbol}[]
+    cell_tables = cell_slots === nothing ? nothing : Symbol[]
     if cell_slots !== nothing
         excluded = Set(canon_id(scalar.graph, v.id) for v in
                        (result_slot ? scalar.have : vcat(scalar.want, scalar.have)))
@@ -3477,13 +3484,16 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
         end
         append!(cell_slots, (last(pair) for pair in recycle))
     end
-    ast, ops, recipes = _lower_with_ops(scalar; type_hints, recycle, cell_slots)
+    ast, ops, recipes = _lower_with_ops(scalar; type_hints, recycle, cell_slots,
+                                        cell_tables)
+    cell_tables === nothing || append!(cell_slots, cell_tables)
     offset = length(runtime_ops)
     append!(runtime_ops, ops)
     append!(runtime_recipes, recipes)
     T = types[canon_id(kernel.plan.graph, only(kernel.plan.want).id)]
     (; ast, offset, type = T, inputs = scalar.have,
        slots = Symbol[last(pair) for pair in recycle],
+       tables = cell_tables === nothing ? Symbol[] : cell_tables,
        invariants = hoisted === nothing ? Int[] : hoisted.moved,
        input_types = Any[types[cid] for cid in hint_ids])
 end
@@ -4013,6 +4023,14 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
             $scalar_result, $(released...))))
         scalar_result = result
     end
+    # The plates inside the cell keep per-cell tables (`_plate_nested_native!`):
+    # the result drops the entries it may hold before the next cell reuses them.
+    if nested !== nothing && !isempty(nested.tables)
+        result = gensym(:plate_cell_result)
+        push!(loopbody.args, :($result = $(GlobalRef(@__MODULE__, :_lane_tables_release!))(
+            $scalar_result, $(nested.tables...))))
+        scalar_result = result
+    end
     # The pointwise buffer has the plate's axes (allocated or recycled for
     # `output_axes`), so this store is in bounds, as the dose-outer passes
     # (`_lower_plate_reduction_native`) already assume.
@@ -4435,7 +4453,7 @@ end
 # including one started while this one runs, collects none.
 # `cell_tables` collects, the same way, the per-cell tables of the plates at
 # this lowering's own top level (`_lane_cell_take!`); a cell's own lowering
-# collects none.
+# collects those of its own plates (`_plate_nested_native!`).
 function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
                          cell_tables::Union{Nothing,Vector{Symbol}} = nothing,
                          kwargs...)
@@ -4447,10 +4465,10 @@ end
 const _CELL_SLOTS = :ReactiveKernels_cell_slots
 const _CELL_TABLES = :ReactiveKernels_cell_tables
 
-# Whether a plate keeps per-cell tables (`_lane_cell_take!`): a plate of the
-# position residual's top level (`_CELL_TABLES`) that stores its cells in a
-# buffer of its own. A plate inside a cell runs once per outer cell, whose
-# stored result may still hold its cells, so it keeps no table.
+# Whether a plate keeps per-cell tables (`_lane_cell_take!`): a plate of a
+# lowering that collects them (`_CELL_TABLES`: the position residual's top
+# level, or a cell of one of its plates, `_plate_nested_native!`) that stores
+# its cells in a buffer of its own.
 _plate_stores_cells(pointwise_lhs, into::Bool, cells::Bool) =
     get(task_local_storage(), _CELL_TABLES, nothing) !== nothing &&
     pointwise_lhs !== nothing && !into && cells

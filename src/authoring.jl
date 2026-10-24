@@ -1737,11 +1737,16 @@ end
 # A child kernel prepared once when its caller is defined and applied where
 # the splicer cannot reach (a lazy arm or a closure), in place of the runtime
 # `(spec::KernelSpec)(args...)` that prepares it on every call. `name` is the
-# authored callee, present in `code_expr`.
-struct _KernelPreparedChild{K}
+# authored callee, present in `code_expr`. `lane` is the child lowered for a
+# position residual (`_lane_kernel`), or `nothing`; only that residual's
+# destination forms call it (lane_sources.jl).
+struct _KernelPreparedChild{K,L}
     name::Symbol
     kernel::K
+    lane::L
 end
+_KernelPreparedChild(name::Symbol, kernel::PreparedKernel) =
+    _KernelPreparedChild(name, kernel, _lane_kernel(kernel.plan))
 # The child stays its own compiled call. Its source operations infer concretely
 # inside the caller (`_source_call_recursion_well_founded`), and native Enzyme
 # reverse on Julia 1.10 fails on the caller once the child's body is inlined
@@ -3847,7 +3852,8 @@ plan type selects its own rule.  Annotate the arguments that select the
 method; leave the arguments that carry traced values untyped.
 
 Supported: positional arguments with optional defaults, `where` clauses, and
-a return-type annotation (kept on the native method only).  A `@traceable`
+a return-type annotation (kept on the native method only).  A docstring before
+`@traceable` documents the method, as it does a plain definition.  A `@traceable`
 method of a function from Base, Core or ReactiveKernels is rejected, and so
 are keyword arguments and a `return` before the end of the body (write that
 branch as an expression).  Calls with keyword arguments are not routed to the
@@ -3906,8 +3912,12 @@ function _traceable_definition(def, mod::Module)
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
     ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
     source = _traceable_source_method(callee, formals, wheres, body, mod)
-    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., source..., callee))
+    esc(Expr(:block, _documentable(native), Expr(:(=), companion, rewritten), ignored...,
+             source..., callee))
 end
+
+# The authored method, marked for a preceding docstring to document it.
+_documentable(def) = Expr(:macrocall, GlobalRef(Core, Symbol("@__doc__")), nothing, def)
 
 """
     @_record_source f(args...) = body
@@ -3934,7 +3944,7 @@ macro _record_source(def)
     body = _traceable_tail_body(def.args[2], signature)
     source = _traceable_source_method(signature.args[1], signature.args[2:end], wheres, body,
                                       __module__)
-    esc(Expr(:block, def, source..., signature.args[1]))
+    esc(Expr(:block, _documentable(def), source..., signature.args[1]))
 end
 
 """

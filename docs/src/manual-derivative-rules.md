@@ -171,6 +171,29 @@ result = Main.ManualDerivativeRuleExample.run()
 )
 ```
 
+## Plates, scans and embedded kernels in a rule graph
+
+A rule graph may compute its primal, or any branch, with authored plates,
+scans and embedded kernels, for example a primal that splices a child graph
+holding a plate over its time points, or a lazy branch between a recurrence
+child and a closed-form child. A cut that runs one of them lowers to loops,
+which the type-level encoding above does not carry, so it is compiled from
+the cut's native lowering, exactly as `prepare(graph; have, want)` lowers it,
+and the encoded cut calls that body as its only operation. Its values are that
+prepared kernel's. The body reads only the inputs the cut's plan reads, so
+[`reverse_residuals`](@ref) is unchanged, and the staging reads its residuals
+off the plan's top-level recipes, so a primal plate's output is retained
+rather than recomputed: a reverse branch that reads `y` stages with residuals
+`(inputs..., :y)`. The compiled body's operation table keeps only the slots it
+reads, so the rule stays an `isbits` value when its other operations are
+singletons. The body is native Julia: tracing such a cut under Reactant throws
+an `ArgumentError`.
+
+In a position residual (`vectorize`, `prepare_batched`) the rule's primal cut
+fills lane buffers instead of allocating its result at every cell and position
+(see [position batching](position-batching.md)). Every other call, AD
+included, runs the cuts above.
+
 ## Generated adapters
 
 Each adapter is generic over the rule and is loaded with its AD package:
