@@ -3905,7 +3905,41 @@ function _traceable_definition(def, mod::Module)
     end
     native = Expr(def.head, def.args[1], _kernel_native_body(body, mod, names))
     ignored = _kernel_ignored_traceable_methods(callee, formals, wheres, body, mod, names)
-    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., callee))
+    source = _traceable_source_method(callee, formals, wheres, body, mod)
+    esc(Expr(:block, native, Expr(:(=), companion, rewritten), ignored..., source..., callee))
+end
+
+"""
+    _traceable_source(::Type{typeof(f)}, argument_types...) -> (names, body, module) or nothing
+
+The authored source of the `@traceable` method of `f` that arguments of
+`argument_types` call: its formal names, its body and the module the body's
+globals resolve in. Source-reading compilers (`jax_source`) translate the
+helper from it. `nothing` for a function without a `@traceable` method.
+"""
+_traceable_source(@nospecialize(args...)) = nothing
+
+# A method of `_traceable_source` over the argument TYPES, with the method's own
+# formals as type bounds, so dispatch selects the source of the method that
+# values of those types call. Defaulted, splatted and destructured formals
+# record no source.
+function _traceable_source_method(callee, formals, wheres, body, mod)
+    params = Any[]
+    names = Symbol[]
+    for formal in formals
+        formal isa Symbol && (push!(params, :(::Type)); push!(names, formal); continue)
+        formal isa Expr && formal.head === :(::) && length(formal.args) == 2 &&
+            formal.args[1] isa Symbol || return Any[]
+        push!(params, Expr(:(::), Expr(:curly, :Type, Expr(:<:, formal.args[2]))))
+        push!(names, formal.args[1])
+    end
+    signature = Expr(:call, GlobalRef(@__MODULE__, :_traceable_source),
+                     Expr(:(::), Expr(:curly, :Type, Expr(:call, GlobalRef(Core, :typeof), callee))),
+                     params...)
+    for layer in reverse(wheres)
+        signature = Expr(:where, signature, layer...)
+    end
+    Any[Expr(:(=), signature, Expr(:tuple, QuoteNode(Tuple(names)), QuoteNode(body), mod))]
 end
 
 # The body with its tail-position `return`s replaced by their values: the

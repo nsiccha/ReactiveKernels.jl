@@ -71,3 +71,44 @@ _jax_dtype_name(::Type{Bool}) = "bool"
 _jax_dtype_name(::Type{<:Integer}) = "int64"
 _jax_dtype_name(::Type{<:AbstractFloat}) = "float64"
 _jax_dtype_name(T::Type) = string(T)
+
+# --- translations of RKPPL's own functions ---------------------------------------
+
+ReactiveKernels._jax_elementwise(::typeof(PPLGeneratedModels._ppl_logistic)) = "jax.nn.sigmoid"
+ReactiveKernels._jax_elementwise(::typeof(PPLGeneratedModels._ppl_normcdf)) = "jsp.ndtr"
+
+# The packed-coordinate transforms, as the vector expressions of their traced
+# twins (`layout.jl`). `lo` and `hi` are 1-based literal bounds of the block.
+const _JAX_ORDERED = """
+def _rk_ordered_constrain(u, lo, hi):
+    # RKPPL ordered transform: y[1] = u[lo], y[i] = y[i - 1] + exp(u[lo + i - 1]).
+    v = u[lo - 1:hi]
+    return jnp.cumsum(jnp.concatenate([v[:1], jnp.exp(v[1:])]))
+"""
+const _JAX_SIMPLEX = """
+def _rk_simplex_constrain_logjac(u, lo, hi):
+    # RKPPL stick-breaking simplex of u[lo:hi] and its log-Jacobian.
+    v = u[lo - 1:hi]
+    K = hi - lo + 2
+    z = 1.0 / (1.0 + jnp.exp(-(v + jnp.log(K - jnp.arange(1, K)))))
+    l = jnp.log1p(-z)
+    lr = jnp.cumsum(jnp.concatenate([jnp.zeros(1), l]))
+    return (jnp.exp(lr) * jnp.concatenate([z, jnp.ones(1)]),
+            jnp.sum(lr[:K - 1] + jnp.log(z) + l))
+"""
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ordered_constrain_kernel), args::Vector{ReactiveKernels._PyVal})
+    name = ReactiveKernels._jax_helper!(ctx, "_rk_ordered_constrain", _JAX_ORDERED)
+    ReactiveKernels._PyVal(name * "(" * ReactiveKernels._jax_args(args) * ")", Vector{Float64})
+end
+function ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_simplex_constrain_logjac_kernel), args::Vector{ReactiveKernels._PyVal})
+    name = ReactiveKernels._jax_helper!(ctx, "_rk_simplex_constrain_logjac", _JAX_SIMPLEX)
+    ReactiveKernels._PyVal(name * "(" * ReactiveKernels._jax_args(args) * ")",
+                           Tuple{Vector{Float64},Float64})
+end
+
+ReactiveKernels._jax_function_call(ctx::ReactiveKernels._JaxContext,
+        ::typeof(_ppl_range_values), args::Vector{ReactiveKernels._PyVal}) =
+    ReactiveKernels._jax_is_array(args[1].T) ?
+    ReactiveKernels._jax_index_values(ctx, args[1], args[2:end]) : args[1]
