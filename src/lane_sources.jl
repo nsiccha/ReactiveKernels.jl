@@ -43,8 +43,124 @@
 #
 # Anything else keeps the ordinary call, so this never changes which value is
 # computed; it changes only where a dense result is stored.
+#
+# An RK-owned callee whose mathematics is a graph has a destination form too:
+# a derivative rule's primal cut, called as a recipe's operation or in a lazy
+# arm, and a child kernel prepared for a lazy arm (`_KernelPreparedChild`).
+# Its lane kernel (`_lane_kernel`) is its plan lowered as a position residual
+# part: its WANT fills the call's recycled buffer, and its own lane values and
+# cell values fill slots kept per call site (`_LaneCalleeState`, in a nested
+# slot of the caller). So the callee's plates, scans, dotted calls and slices
+# reuse their buffers as the same mathematics spliced into the caller would.
+# Only position residuals reach these forms; every other call, AD included,
+# runs the callee's ordinary body.
 
 _lane_source_ref(name) = GlobalRef(@__MODULE__, name)
+
+"""
+    _LaneKernel{N}
+
+A callee's plan lowered as a position residual part (`_lane_kernel`): the
+compiled body `f(ops, recycled, slots, inputs...)` and the table it reads,
+with `N` slots for the callee's own lane and cell values.
+"""
+struct _LaneKernel{N,F,O}
+    f::F
+    ops::O
+end
+_LaneKernel{N}(f::F, ops::O) where {N,F,O} = _LaneKernel{N,F,O}(f, ops)
+
+# The operation table of a native body, with every slot the body does not read
+# set to `nothing`. A plate or scan keeps its operation in a slot only the
+# tensorized product reads, and that operation holds its prepared body; the
+# rest of the table is singleton source operations, so the callable holding
+# it stays isbits. A body that reads the table other than by literal index
+# keeps the whole table.
+function _native_table(ast::Expr, ops::Tuple)
+    reads = Set{Int}()
+    whole = Ref(false)
+    function walk(node)
+        if node === _OPS_ARG
+            whole[] = true
+        elseif node isa Expr && node.head === :ref && length(node.args) == 2 &&
+               node.args[1] === _OPS_ARG && node.args[2] isa Int
+            push!(reads, node.args[2])
+        elseif node isa Expr && node.head !== :quote
+            foreach(walk, node.args)
+        end
+    end
+    walk(ast.args[2])
+    whole[] ? ops : ntuple(i -> i in reads ? ops[i] : nothing, length(ops))
+end
+
+# The lane kernel of a plan with one WANT that a destination form produces,
+# or `nothing` (no buffer to reuse). The plan is lowered as
+# `_lower_replicated_with_ops` lowers its residual, without per-cell tables:
+# a callee may run several times per position, so a stored cell result of its
+# own plates is not dead at its next call.
+function _lane_kernel(p::Plan)
+    length(p.want) == 1 || return nothing
+    g = p.graph
+    cid = canon_id(g, only(p.want).id)
+    any(v -> canon_id(g, v.id) == cid, p.have) && return nothing
+    producer = get(p.producer, cid, nothing)
+    producer isa Recipe && _replicated_lane_producer(producer) || return nothing
+    output = gensym(:lane_output)
+    recycle = Pair{ValueId,Symbol}[cid => output]
+    excluded = Set(canon_id(g, v.id) for v in vcat(p.want, p.have))
+    scratch = Symbol[]
+    for v in _lane_slot_values(p, excluded)
+        slot = gensym(Symbol(v.name, :_lane_slot))
+        push!(recycle, canon_id(g, v.id) => slot)
+        push!(scratch, slot)
+    end
+    cell_slots = Symbol[]
+    ast, ops, _ = _replicated_part_ast(p; recycle, cell_slots)
+    slots = gensym(:lane_slots)
+    inputs = Any[gensym(Symbol(v.name, :_lane_input)) for v in p.have]
+    body = Expr(:block)
+    for (index, slot) in enumerate([scratch; cell_slots])
+        push!(body.args, :($slot = $(GlobalRef(Base, :getindex))($slots, $index)))
+    end
+    result = gensym(:lane_result)
+    append!(body.args, _embedded_statements(ast, Any[inputs..., output, scratch...],
+                                            result, 0))
+    push!(body.args, Expr(:return, result))
+    wrapper = Expr(:function, Expr(:tuple, _OPS_ARG, output, slots, inputs...), body)
+    _LaneKernel{length(scratch) + length(cell_slots)}(
+        compile(wrapper), _native_table(wrapper, Tuple(ops)))
+end
+
+# The lane kernel of an RK-owned callee, or `nothing`: a rule's
+# (derivative_rules.jl) or a lazy-arm child's, built with the callee.
+_lane_callee(f) = nothing
+_lane_callee(child::_KernelPreparedChild) = getfield(child, :lane)
+
+# The destination form of a callee call: the lane kernel with the call site's
+# slots, or the ordinary call for a callee without one. The lane kernel is its
+# own call, as the ordinary callee is (`_KernelPreparedChild`): inlined into a
+# large residual, the result-type queries of its scans widened to `Any` once
+# the session had inferred the same scan step elsewhere, and every step then
+# dispatched at run time.
+@inline _lane_call(recycled, slot, f, args::Vararg{Any,N}) where {N} =
+    _lane_call_with(recycled, slot, _lane_callee(f), f, args...)
+@inline _lane_call_with(recycled, slot, ::Nothing, f, args::Vararg{Any,N}) where {N} =
+    f(args...)
+@inline _lane_call_with(recycled, slot, lane::_LaneKernel, f, args::Vararg{Any,N}) where {N} =
+    _lane_call_kernel(recycled, slot, lane, args...)
+@noinline _lane_call_kernel(recycled, slot::Base.RefValue{Any}, lane::_LaneKernel{M},
+                            args::Vararg{Any,N}) where {M,N} =
+    _lane_kernel_body(lane, recycled, getfield(_lane_callee_state!(slot, M), :slots),
+                      args...)
+@generated function _lane_kernel_body(lane::_LaneKernel{M,F}, recycled, slots,
+                                      args::Vararg{Any,N}) where {M,F,N}
+    forwarded = Any[:(getfield(args, $index)) for index in 1:N]
+    quote
+        $(Expr(:meta, :inline))
+        $(_native_body_call_expr(F, :(getfield(lane, :f)),
+            Any[:(getfield(lane, :ops)), :recycled, :slots, forwarded...]))
+    end
+end
 
 # `(native closure, parameter names, module)` of an eligible source operation,
 # or `nothing`. `branches`: whether a lazy branch's all-in-one closure counts
@@ -121,6 +237,34 @@ struct _LaneSourceContext
     lazy::Bool
 end
 _LaneSourceContext(mod, arguments) = _LaneSourceContext(mod, arguments, nothing, false)
+
+# The callee a call node names, when it has a lane kernel: a quoted object
+# (`_KernelPreparedChild`) or a module binding, read as the closure reads it.
+function _lane_node_callee(ctx::_LaneSourceContext, node)
+    value = if node isa QuoteNode
+        node.value
+    elseif node isa GlobalRef
+        isdefined(node.mod, node.name) || return nothing
+        getglobal(node.mod, node.name)
+    elseif node isa Symbol
+        haskey(ctx.arguments, node) && return nothing
+        isdefined(ctx.mod, node) || return nothing
+        getglobal(ctx.mod, node)
+    else
+        return nothing
+    end
+    _lane_callee(value) === nothing ? nothing : value
+end
+
+# `_lane_call(recycled, state, callee, args...)` for a call whose callee has a
+# lane kernel, with a fresh nested slot for the call site's state, or
+# `nothing` where nested slots cannot be bound.
+function _lane_callee_destination(ctx::_LaneSourceContext, callee, args, recycled)
+    ctx.nested === nothing && return nothing
+    state = gensym(:lane_callee)
+    push!(ctx.nested, state)
+    Expr(:call, _lane_source_ref(:_lane_call), recycled, state, callee, args...)
+end
 
 _lane_materialize_call(node) = node isa Expr && node.head === :call &&
     length(node.args) == 2 &&
@@ -206,6 +350,17 @@ function _lane_source_expr(r::Recipe, callargs, recycled;
         nested::Union{Nothing,Vector{Symbol}} =
             get(task_local_storage(), _CELL_SLOTS, nothing))
     length(r.outputs) == 1 || return nothing
+    if _lane_callee(r.op) !== nothing
+        # The recipe's operation is the callee. It is quoted, as a lazy arm's
+        # child is: read from the operation table, a rule that is not isbits
+        # was boxed at every call.
+        ctx = _LaneSourceContext(@__MODULE__, Dict{Symbol,Any}(), nested, false)
+        call = _lane_callee_destination(ctx, QuoteNode(r.op), callargs, recycled)
+        call === nothing && return nothing
+        value = gensym(:lane_value)
+        return Expr(:block, Expr(:(=), value, call),
+                    Expr(:call, _lane_source_ref(:_lane_release!), value, last(nested)))
+    end
     closure = _lane_source_closure(r; branches = true)
     closure === nothing && return nothing
     _, params, mod = closure
@@ -291,6 +446,21 @@ function _lane_destination(ctx::_LaneSourceContext, node, recycled,
             filled |= last(form)
         end
         return (Expr(node.head, condition, arms...), filled)
+    elseif node.head === :call && !isempty(node.args) &&
+           _lane_node_callee(ctx, node.args[1]) !== nothing
+        # A call of an RK-owned callee with a lane kernel (`_lane_call`).
+        callee = node.args[1] isa QuoteNode ? node.args[1] :
+            _lane_source_node(ctx, node.args[1], nothing)
+        args = Any[]
+        for arg in node.args[2:end]
+            arg isa Expr && arg.head in (:parameters, :kw, :...) && return plain()
+            rewritten = _lane_source_node(ctx, arg, nothing)
+            rewritten === nothing && return nothing
+            push!(args, rewritten)
+        end
+        call = _lane_callee_destination(ctx, callee, args, recycled)
+        call === nothing && return plain()
+        return (call, true)
     end
     plain()
 end

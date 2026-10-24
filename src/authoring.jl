@@ -1737,11 +1737,16 @@ end
 # A child kernel prepared once when its caller is defined and applied where
 # the splicer cannot reach (a lazy arm or a closure), in place of the runtime
 # `(spec::KernelSpec)(args...)` that prepares it on every call. `name` is the
-# authored callee, present in `code_expr`.
-struct _KernelPreparedChild{K}
+# authored callee, present in `code_expr`. `lane` is the child lowered for a
+# position residual (`_lane_kernel`), or `nothing`; only that residual's
+# destination forms call it (lane_sources.jl).
+struct _KernelPreparedChild{K,L}
     name::Symbol
     kernel::K
+    lane::L
 end
+_KernelPreparedChild(name::Symbol, kernel::PreparedKernel) =
+    _KernelPreparedChild(name, kernel, _lane_kernel(kernel.plan))
 # The child stays its own compiled call. Its source operations infer concretely
 # inside the caller (`_source_call_recursion_well_founded`), and native Enzyme
 # reverse on Julia 1.10 fails on the caller once the child's body is inlined
