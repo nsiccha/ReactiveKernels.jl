@@ -281,6 +281,24 @@ end
     total = sum(flat .* flat)
     return total
 end
+# Data-only comprehensions, do-blocks, lets, short circuits, scans and plates.
+@kernel jax_prep_misc(x::Vector{Float64}, theta::Float64) = begin
+    positive = [v^2 for v in x if v > 0]
+    kept = map(x) do v
+        let w = v + 1
+            w > 1 && v < 3 ? w : 0.0
+        end
+    end
+    running = scan(x; init = 0.0) do acc, v
+        next = acc + v
+        (next, next)
+    end
+    doubled = plate(x) do v
+        2 * v
+    end
+    total = theta * (sum(positive) + sum(kept) + sum(running) + sum(doubled))
+    return total
+end
 # The flattening BRM emits (reactivekernels-use §4c): type tests decided
 # while emitting, then `reduce(vcat, cells)`.
 @kernel jax_prep_cells(R::Vector{Vector{Float64}}, a::Float64) = begin
@@ -457,6 +475,12 @@ end
         @test rk_jax_evaluate(index, "kernel", (0.7, R); prepare = :arguments).value ≈
               native(0.7, R) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), R), [0.7])) rtol = 1e-6
+        x = [0.5, -1.0, 2.0, 3.5]
+        misc = jax_source(jax_prep_misc; have = (:theta, :x), want = :total, data = (; x))
+        host_part = split(split(string(misc), "def prepare_data")[2], "\ndef kernel")[1]
+        @test !occursin("jax.", host_part) && occursin(" if ", host_part)
+        native = prepare(jax_prep_misc; have = (:theta, :x), want = :total)
+        @test rk_jax_evaluate(misc, "kernel", (0.7, x); prepare = true).value ≈ native(0.7, x) rtol = 1e-12
         cells = jax_source(jax_prep_cells; have = (:a, :R), want = :total, data = (; R))
         native = prepare(jax_prep_cells; have = (:a, :R), want = :total)
         r = rk_jax_evaluate(cells, "kernel", (0.7, R); grad = true, prepare = true)

@@ -916,7 +916,18 @@ function _jax_prepare_split(plans, data_ports, excluded::Set{Int} = Set{Int}())
                 push!(independent, r)
             end
         end
-        residual = [independent; residual]
+        # Of those, the ones the functions read.
+        needed = Set{ValueId}(canon_id(g, v.id) for v in p.want)
+        for r in residual, v in r.inputs
+            push!(needed, canon_id(g, v.id))
+        end
+        kept = Recipe[]
+        for r in Iterators.reverse(independent)
+            any(o -> canon_id(g, o.id) in needed, r.outputs) || continue
+            push!(kept, r)
+            foreach(v -> push!(needed, canon_id(g, v.id)), r.inputs)
+        end
+        residual = [reverse!(kept); residual]
         for r in pre
             r.id in seen_recipes && continue
             push!(seen_recipes, r.id)
