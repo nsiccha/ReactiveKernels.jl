@@ -143,9 +143,11 @@ function _jax_fresh(ctx::_JaxContext, hint)
     name
 end
 
-# Bind `value` to a Python local holding `v`; a plain name is reused.
+# Bind `value` to a Python local holding `v`; a plain name is reused, and a
+# type or callable value (`Val{2}` of a lowered literal power) exists only
+# while translating.
 function _jax_bind!(ctx::_JaxContext, hint, v::_PyVal)
-    occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", v.code) && return v
+    (v.T isa _JaxCallable || occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", v.code)) && return v
     name = _jax_fresh(ctx, hint)
     _jax_emit!(ctx, name * " = " * v.code)
     _PyVal(name, v.T, v.static, v.extent, v.limit)
