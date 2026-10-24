@@ -167,15 +167,99 @@ function _jax_return_type(f, argtypes)
     T
 end
 
+# --- Python operator precedence ---------------------------------------------------
+#
+# Infix expressions are printed with only the parentheses Python's grammar
+# needs. An operand's precedence is that of its loosest operator outside
+# brackets; an atom (a name, a literal, a call, a subscript) binds tightest.
+
+const _PY_PRECEDENCE = Dict{String,Int}(
+    "if" => 1, "or" => 2, "and" => 3, "not" => 4,
+    "<" => 5, ">" => 5, "<=" => 5, ">=" => 5, "==" => 5, "!=" => 5, "is" => 5,
+    "|" => 6, "^" => 7, "&" => 8, "+" => 10, "-" => 10,
+    "*" => 11, "/" => 11, "@" => 11, "//" => 11, "%" => 11,
+    "unary" => 12, "**" => 13)
+const _PY_ATOM = 100
+
+function _py_precedence(code::AbstractString)
+    lowest = _PY_ATOM
+    depth = 0
+    quote_char = nothing
+    previous = :start   # what precedes position i: :start, :operand or :operator
+    chars = collect(code)
+    i = 1
+    while i <= length(chars)
+        c = chars[i]
+        if quote_char !== nothing
+            c == '\\' && (i += 2; continue)
+            c == quote_char && (quote_char = nothing; previous = :operand)
+            i += 1; continue
+        end
+        if c == '"' || c == '\''
+            quote_char = c; i += 1; continue
+        end
+        if c in ('(', '[', '{')
+            depth += 1; i += 1; continue
+        elseif c in (')', ']', '}')
+            depth -= 1; previous = :operand; i += 1; continue
+        end
+        if depth == 0
+            two = i < length(chars) ? string(c, chars[i + 1]) : ""
+            if two in ("**", "<=", ">=", "==", "!=", "//")
+                lowest = min(lowest, _PY_PRECEDENCE[two]); previous = :operator; i += 2; continue
+            elseif c == '-' || c == '+'
+                lowest = min(lowest, previous === :operand ? 10 : 12)
+                previous = :operator; i += 1; continue
+            elseif c in ('*', '/', '@', '%', '<', '>', '|', '^', '&')
+                lowest = min(lowest, _PY_PRECEDENCE[string(c)]); previous = :operator; i += 1; continue
+            elseif isletter(c) || c == '_'
+                j = i
+                while j <= length(chars) && (isletter(chars[j]) || isdigit(chars[j]) || chars[j] == '_')
+                    j += 1
+                end
+                word = String(chars[i:j-1])
+                if word in ("if", "else", "or", "and", "not", "is", "in", "lambda")
+                    lowest = min(lowest, get(_PY_PRECEDENCE, word, 1)); previous = :operator
+                else
+                    previous = :operand
+                end
+                i = j; continue
+            end
+        end
+        isspace(c) || (previous = :operand)
+        i += 1
+    end
+    lowest
+end
+
+# `a op b` (or `op a` for unary minus), parenthesizing operands as needed.
+function _py_infix(op::AbstractString, operands::AbstractVector{<:AbstractString})
+    p = _PY_PRECEDENCE[op]
+    if op == "**"
+        length(operands) == 2 || error("** takes two operands")
+        left = _py_precedence(operands[1]) <= p ? "(" * operands[1] * ")" : operands[1]
+        right = _py_precedence(operands[2]) < p ? "(" * operands[2] * ")" : operands[2]
+        return left * " ** " * right
+    end
+    parts = map(enumerate(operands)) do (k, x)
+        q = _py_precedence(x)
+        # Comparisons do not chain as Julia's binary calls mean them.
+        needs = q < p || (k > 1 && q == p && op in ("-", "/", "//", "%", "@")) ||
+                (p == 5 && q == 5)
+        needs ? "(" * x * ")" : x
+    end
+    join(parts, " " * op * " ")
+end
+_py_negate(x::AbstractString) = (_py_precedence(x) < _PY_PRECEDENCE["unary"] ? "-(" * x * ")" : "-" * x)
+
 # --- literals -----------------------------------------------------------------------
 
 _jax_literal(x::Bool) = _PyVal(x ? "True" : "False", Bool, true)
 _jax_literal(x::Integer) = _PyVal(string(x), typeof(x), true)
 function _jax_literal(x::AbstractFloat)
     isnan(x) && return _PyVal("jnp.nan", typeof(x), true)
-    isinf(x) && return _PyVal(x > 0 ? "jnp.inf" : "(-jnp.inf)", typeof(x), true)
-    text = repr(Float64(x))
-    _PyVal(x < 0 ? "(" * text * ")" : text, typeof(x), true)
+    isinf(x) && return _PyVal(x > 0 ? "jnp.inf" : "-jnp.inf", typeof(x), true)
+    _PyVal(repr(Float64(x)), typeof(x), true)
 end
 _jax_literal(x::Irrational{:π}) = _PyVal("jnp.pi", Float64, true)
 _jax_literal(x::Irrational{:ℯ}) = _PyVal("jnp.e", Float64, true)
@@ -497,13 +581,13 @@ function _jax_index_part(ctx::_JaxContext, x::_PyVal, dim::Int, index)
     if _jax_is_array(i.T) && eltype(i.T) <: Integer
         ndims(i.T) == 1 || _jax_error("a gather by a rank-", ndims(i.T), " index array",
                                       _jax_where(ctx))
-        return ("(" * i.code * ") - 1", 1)
+        return (_py_infix("-", [i.code, "1"]), 1)
     end
     if i.T isa Type && i.T <: AbstractUnitRange
         m = match(r"^jnp\.arange\((.*), (.*)\)$", i.code)
         m === nothing || return (_jax_minus_one(_PyVal(m.captures[1], Int)) * ":" *
                                  _jax_minus_one(_PyVal(m.captures[2], Int)), 1)
-        return ("(" * i.code * ") - 1", 1)
+        return (_py_infix("-", [i.code, "1"]), 1)
     end
     _jax_error("the index `", index, "` (of type `", i.T, "`) has no JAX translation",
                _jax_where(ctx))
@@ -531,7 +615,7 @@ _jax_mentions(ex, s::Symbol) = ex === s ||
 
 function _jax_minus_one(i::_PyVal)
     m = match(r"^-?[0-9]+$", i.code)
-    m === nothing ? "(" * i.code * ") - 1" : string(parse(Int, i.code) - 1)
+    m === nothing ? _py_infix("-", [i.code, "1"]) : string(parse(Int, i.code) - 1)
 end
 
 # `x.field` on a named tuple, or a dotted call `f.(args...)`.
@@ -985,20 +1069,20 @@ const _JAX_INFIX = Dict{Any,String}((+) => "+", (-) => "-", (/) => "/", (<) => "
 function _jax_scalar_or_elementwise(ctx::_JaxContext, f, args::Vector{_PyVal})
     if haskey(_JAX_INFIX, f)
         op = _JAX_INFIX[f]
-        length(args) == 1 && f === (-) && return _jax_result(f, args, "(-" * args[1].code * ")")
+        length(args) == 1 && f === (-) && return _jax_result(f, args, _py_negate(args[1].code))
         length(args) == 1 && f === (+) && return args[1]
         length(args) >= 2 || return nothing
-        return _jax_result(f, args, "(" * join((a.code for a in args), " " * op * " ") * ")")
+        return _jax_result(f, args, _py_infix(op, [a.code for a in args]))
     end
     if f === (*) && any(a -> a.T isa Type && a.T <: AbstractString, args)
-        return _PyVal("(" * join((a.code for a in args), " + ") * ")", String,
+        return _PyVal(_py_infix("+", [a.code for a in args]), String,
                       all(a -> a.static, args))
     end
     if f === (*) && count(a -> _jax_is_array(a.T), args) <= 1
-        return _jax_result(f, args, "(" * join((a.code for a in args), " * ") * ")")
+        return _jax_result(f, args, _py_infix("*", [a.code for a in args]))
     end
     if f === (^) && length(args) == 2 && !_jax_is_array(args[1].T)
-        return _jax_result(f, args, "(" * args[1].code * " ** " * args[2].code * ")")
+        return _jax_result(f, args, _py_infix("**", [args[1].code, args[2].code]))
     end
     name = _jax_elementwise_name(ctx, f, length(args))
     name === nothing && return nothing
@@ -1041,9 +1125,9 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(*), args::Vector{_PyVal})
             return _jax_result(*, args, "jnp.dot(" * a.code * ", " * b.code * ")")
         ndims(a.T) == 1 && b.T <: LinearAlgebra.Adjoint{<:Any,<:AbstractVector} &&
             return _jax_result(*, args, "jnp.outer(" * a.code * ", " * b.code * ")")
-        return _jax_result(*, args, "(" * a.code * " @ " * b.code * ")")
+        return _jax_result(*, args, _py_infix("@", [a.code, b.code]))
     end
-    _jax_result(*, args, "(" * a.code * " * " * b.code * ")")
+    _jax_result(*, args, _py_infix("*", [a.code, b.code]))
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(_native_exp), args::Vector{_PyVal})
     x = only(args)
@@ -1182,7 +1266,7 @@ function _jax_index_values(ctx::_JaxContext, x::_PyVal, indices::Vector{_PyVal})
         if i.T isa Type && i.T <: Integer
             push!(parts, _jax_minus_one(i))
         elseif _jax_is_array(i.T) && eltype(i.T) <: Integer && ndims(i.T) == 1
-            push!(parts, "(" * i.code * ") - 1"); kept += 1
+            push!(parts, _py_infix("-", [i.code, "1"])); kept += 1
         else
             _jax_error("the index of type `", i.T, "`", _jax_where(ctx))
         end
@@ -1198,7 +1282,7 @@ function _jax_call_positional(ctx::_JaxContext, ::Colon, args::Vector{_PyVal})
     _PyVal("jnp.arange(" * a.code * ", " * _jax_plus_one(b) * ")", UnitRange{Int})
 end
 _jax_plus_one(b::_PyVal) = match(r"^-?[0-9]+$", b.code) === nothing ?
-    "(" * b.code * ") + 1" : string(parse(Int, b.code) + 1)
+    _py_infix("+", [b.code, "1"]) : string(parse(Int, b.code) + 1)
 _jax_function_call(ctx::_JaxContext, ::typeof(eachindex), args::Vector{_PyVal}) =
     length(args) == 1 && _jax_is_array(args[1].T) && ndims(args[1].T) == 1 ?
     _PyVal("jnp.arange(1, " * args[1].code * ".shape[0] + 1)", Base.OneTo{Int}) :
@@ -1300,8 +1384,8 @@ function _jax_broadcast(ctx::_JaxContext, f, args::Vector{_PyVal})
     if haskey(_JAX_INFIX, f) || f === (*) || f === (^) ||
        _jax_elementwise_name(ctx, f, length(args)) !== nothing
         scalars = [_PyVal(p.code, eltype_or_self(p.T)) for p in padded]
-        v = f === (*) ? _PyVal("(" * join((p.code for p in padded), " * ") * ")", E) :
-            f === (^) ? _PyVal("(" * padded[1].code * " ** " * padded[2].code * ")", E) :
+        v = f === (*) ? _PyVal(_py_infix("*", [p.code for p in padded]), E) :
+            f === (^) ? _PyVal(_py_infix("**", [padded[1].code, padded[2].code]), E) :
             _jax_scalar_or_elementwise(ctx, f, scalars)
         v === nothing && _jax_error("broadcasting `", f, "`", _jax_where(ctx))
         return _PyVal(v.code, T, false, R == 0 ? "" : _jax_extent(args))
@@ -1522,7 +1606,7 @@ function _jax_call_positional(ctx::_JaxContext, ::typeof(Base.literal_pow), args
     p.T isa Type && p.T <: Val && !_jax_is_array(x.T) ||
         _jax_error("a literal power of `", x.T, "`", _jax_where(ctx))
     n = p.T.parameters[1]
-    _PyVal("(" * x.code * " ** " * string(n) * ")", _jax_return_type(^, Any[x.T, typeof(n)]))
+    _PyVal(_py_infix("**", [x.code, string(n)]), _jax_return_type(^, Any[x.T, typeof(n)]))
 end
 function _jax_call_positional(ctx::_JaxContext, ::typeof(getproperty), args::Vector{_PyVal})
     x, field = args
@@ -2028,6 +2112,12 @@ function _jax_function!(mod::_JaxModule, fname, p::Plan, types, w; reserve::Bool
             push!(params, extent); push!(inputs, extent => Vector{Int})
         end
         scope.values[canon_id(p.graph, v.id)] = _PyVal(param, T, false, extent)
+        # Callers may pass NumPy arrays; JAX indexes only its own arrays by a
+        # traced index.
+        if _jax_is_array(T) && (eltype(T) <: Number || _jax_ragged(T))
+            _jax_emit!(ctx, param * " = jnp.asarray(" * param * ")")
+            isempty(extent) || _jax_emit!(ctx, extent * " = jnp.asarray(" * extent * ")")
+        end
     end
     _jax_plan!(ctx, p)
     wants = [_jax_returned(ctx, _jax_lookup(ctx, p.graph, v)) for v in p.want]

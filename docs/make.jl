@@ -131,6 +131,7 @@ site_pages = [
     "posteriordb benchmark (RK vs Stan vs Turing)" => "posteriordb-comparison.md",
     "Tools and reference" => [
         "DAG visualization" => "visualization.md",
+        "JAX target" => "jax.md",
         "API" => "api.md",
     ],
     "Bijectors" => "bijectors.md",

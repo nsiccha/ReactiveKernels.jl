@@ -37,6 +37,7 @@ const _PPL_TEST_FILES = (
     "test_distributional_broadcasts.jl",
     "test_distributional_broadcasts_reactant.jl",
     "test_query.jl",
+    "test_jax_source.jl",
     "test_derived_affine_fusion.jl",
     "test_scalar_prior_packing.jl",
     "test_query_derivatives.jl",
