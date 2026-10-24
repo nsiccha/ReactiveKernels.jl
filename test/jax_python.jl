@@ -23,12 +23,16 @@ _rk_py(x::Integer) = string(x)
 _rk_py(x::AbstractFloat) = isnan(x) ? "float('nan')" :
     isinf(x) ? (x > 0 ? "float('inf')" : "float('-inf')") : repr(Float64(x))
 _rk_py(x::AbstractString) = repr(String(x))
+_rk_py(::Missing) = "None"
 # Any other value (a categorical level) crosses as its label.
 _rk_py(x) = repr(string(x))
 _rk_py(x::AbstractArray) = ndims(x) == 1 ? "[" * join(map(_rk_py, x), ", ") * "]" :
     "[" * join((_rk_py(selectdim(x, 1, i)) for i in axes(x, 1)), ", ") * "]"
 _rk_py_input(x::AbstractArray{<:Number}) = "np.asarray(" * _rk_py(x) * ", dtype=" *
     (eltype(x) <: Bool ? "bool" : eltype(x) <: Integer ? "np.int64" : "np.float64") * ")"
+# A raw ragged input (for `prepare_data`) is a list of arrays.
+_rk_py_input(x::AbstractVector{<:AbstractVector{<:Number}}) =
+    "[" * join(map(_rk_py_input, x), ", ") * "]"
 _rk_py_input(x) = _rk_py(x)
 
 const _RK_JAX_DRIVER = raw"""
@@ -41,7 +45,16 @@ import jax
 exec(open(sys.argv[2]).read())
 f = getattr(module, sys.argv[3])
 first, rest = ARGS[0], ARGS[1:]
-value = jax.jit(lambda u: f(u, *rest))(first)
+if sys.argv[5] in ("prepare", "arguments"):
+    prepared = module.prepare_data(*rest)
+    call = lambda u: f(u, **prepared)
+else:
+    call = lambda u: f(u, *rest)
+if sys.argv[5] == "arguments":
+    # The prepared data traced as arguments, not closed over.
+    value = jax.jit(f)(first, **prepared)
+else:
+    value = jax.jit(call)(first)
 
 def jl(x):
     if isinstance(x, dict):
@@ -60,27 +73,31 @@ def jl(x):
 
 out = "(value = " + jl(value)
 if sys.argv[4] == "grad":
-    out += ", grad = " + jl(jax.jit(jax.grad(lambda u: f(u, *rest)))(first))
+    out += ", grad = " + jl(jax.jit(jax.grad(call))(first))
 print(out + ",)")
 """
 
 """
-    rk_jax_evaluate(src, name, args; grad = false) -> (; value, grad)
+    rk_jax_evaluate(src, name, args; grad = false, prepare = false) -> (; value, grad)
 
 Call function `name` of the emitted module `src` on `args`, jitted over its
 first argument with the others closed over, as a sampler calls it; with
 `grad = true` also return `jax.grad` with respect to the first argument.
+With `prepare = true` the other arguments are the raw data, which the
+module's `prepare_data` turns into the function's inputs; `prepare =
+:arguments` also passes those to the jitted function as traced arguments.
 """
-function rk_jax_evaluate(src::JAXSource, name, args; grad::Bool = false)
+function rk_jax_evaluate(src::JAXSource, name, args; grad::Bool = false, prepare = false)
     dir = mktempdir()
     module_path = joinpath(dir, "rk_module.py")
     write(module_path, src)
     args_path = joinpath(dir, "args.py")
-    write(args_path, "ARGS = [" * join(map(_rk_py_input, rk_jax_inputs(args)), ", ") * "]\n")
+    inputs = prepare === false ? rk_jax_inputs(args) : Any[args...]
+    write(args_path, "ARGS = [" * join(map(_rk_py_input, inputs), ", ") * "]\n")
     driver = joinpath(dir, "driver.py")
     write(driver, _RK_JAX_DRIVER)
     errors = joinpath(dir, "stderr.txt")
-    cmd = `$RK_JAX_PYTHON $driver $module_path $args_path $(String(name)) $(grad ? "grad" : "value")`
+    cmd = `$RK_JAX_PYTHON $driver $module_path $args_path $(String(name)) $(grad ? "grad" : "value") $(prepare === :arguments ? "arguments" : prepare === false ? "plain" : "prepare")`
     output = try
         read(pipeline(cmd; stderr = errors), String)
     catch e

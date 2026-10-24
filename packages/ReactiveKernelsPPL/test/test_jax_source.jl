@@ -110,16 +110,18 @@ const _JAX_CASES = (
     src = jax_source(built, plan; values = (:mu,))
     text = string(src)
     @test [f.name for f in src.functions] ==
-          ["log_density", "log_prior", "log_likelihood", "log_jacobian", "constrain"]
-    @test all(f -> first.(f.inputs) == ["unconstrained", "x", "y"], src.functions)
+          ["prepare_data", "log_density", "log_prior", "log_likelihood", "log_jacobian", "constrain"]
+    # `prepare_data` takes the raw data; the functions, the prepared inputs.
+    @test first.(src.functions[1].inputs) == ["x", "y"]
+    @test all(f -> first.(f.inputs) == ["unconstrained", "x", "y"], src.functions[2:end])
     @test occursin("DIMENSION = 3", text)
     @test occursin("PARAMETERS = {\"a\": {\"start\": 0, \"stop\": 1", text)
     @test occursin("\"s\": {\"start\": 2, \"stop\": 3, \"transform\": \"exp\"", text)
     @test occursin("return {\"a\": ", text)
     ragged = _JAX_CASES.ragged_recurrence()
     rsrc = jax_source(build_kernel(ragged), ragged)
-    @test occursin("def pad_ragged(arrays):", string(rsrc))
-    @test "R_lengths" in first.(first(rsrc.functions).inputs)
+    @test occursin("def _rk_pad_rows(rows):", string(rsrc))
+    @test "R_lengths" in first.(rsrc.functions[2].inputs)
     @test occursin("\"ragged\": True", string(rsrc))
     @test occursin("jax.lax.fori_loop(", string(rsrc))
 end
@@ -135,7 +137,7 @@ end
         query = prepare_query(built, plan, :sampler)
         u = 0.2 .* randn(Xoshiro(7), built.layout.total)
         data = ReactiveKernelsPPL._query_bound(plan)
-        r = rk_jax_evaluate(src, "log_density", (u, Tuple(data)...); grad = true)
+        r = rk_jax_evaluate(src, "log_density", (u, Tuple(data)...); grad = true, prepare = true)
         @test r.value ≈ query(u) rtol = 1e-10
         reference = rk_fd_gradient(query, u)
         @test maximum(abs.(r.grad .- reference) ./ max.(1, abs.(reference))) < 1e-5
@@ -150,7 +152,7 @@ end
         built = build_kernel(plan)
         src = jax_source(built, plan; values = (:mu,))
         u = [0.9, 1.8, log(0.4)]
-        r = rk_jax_evaluate(src, "constrain", (u, _JAX_X, _JAX_Y))
+        r = rk_jax_evaluate(src, "constrain", (u, _JAX_X, _JAX_Y); prepare = true)
         @test r.value["a"] ≈ 0.9
         @test r.value["s"] ≈ 0.4
         @test r.value["mu"] ≈ 0.9 .+ 1.8 .* _JAX_X
