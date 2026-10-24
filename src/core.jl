@@ -1152,14 +1152,18 @@ function _lane_state_may_reference(result, state::_LaneCalleeState)
     false
 end
 
-# A plate of the position residual's top level that stores its cells keeps one
+# A plate of the position residual that stores its cells keeps one
 # table per lane slot of a value computed at every cell (`_CELL_TABLES`): entry
 # `k` holds the buffer cell `k`'s stored result held when the plate last ran,
-# or a spare. The plate runs once per position, and its stored results are
-# dead once the next position (or, for a borrowed reader, the next call) runs
-# it again: a WANT is stored by value, as numbers (`_replicated_output`
-# refuses arrays of arrays). So cell `k` takes its entry into the slot before
-# computing (`_lane_cell_take!`). A result that holds the slot's buffer gives
+# or a spare. A plate at the residual's top level runs once per position, and
+# its stored results are dead once the next position (or, for a borrowed
+# reader, the next call) runs it again: a WANT is stored by value, as numbers
+# (`_replicated_output` refuses arrays of arrays). A plate inside another
+# plate's cell runs once per outer cell, and its stored results are dead once
+# the next outer cell runs it again, except those the outer cell's result
+# holds, which leave the table (`_lane_tables_release!`). So cell `k` takes its
+# entry into the slot before computing (`_lane_cell_take!`). A result that
+# holds the slot's buffer gives
 # it to the entry and the slot gets the entry's spare (`_lane_cell_release!`);
 # every other cell keeps reusing the slot. Only the slot is ever written, and a
 # buffer leaves the table only at its own cell, so no stored result is
@@ -1199,6 +1203,24 @@ end
         entries = _lane_cell_table(table, cell)
         @inbounds slot[] = entries[cell]
         @inbounds entries[cell] = buffer
+    end
+    result
+end
+
+# The outer cell's result drops every entry of the tables of the plates inside
+# that cell (`_plate_nested_native!`) it may hold: the next outer cell then
+# allocates afresh for that inner cell instead of overwriting a live value.
+@inline function _lane_tables_release!(result,
+        tables::Vararg{Base.RefValue{Any},N}) where {N}
+    isbits(result) && return result
+    foreach(tables) do table
+        entries = table[]
+        entries isa Vector{Any} || return
+        for cell in eachindex(entries::Vector{Any})
+            held = @inbounds entries[cell]
+            held === nothing || !_lane_may_reference(result, held) ||
+                (@inbounds entries[cell] = nothing)
+        end
     end
     result
 end
