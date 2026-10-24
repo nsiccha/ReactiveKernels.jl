@@ -380,10 +380,12 @@ end
 # stage count is data, so the stages flatten into one lane per
 # (observation, stage) pair, built from the bound response: the lane's
 # observation index and stage index. Data-only (folded under `bound=`).
-@inline function _ordinal_effects_matrix(effects, y, K)
+ReactiveKernels.@_record_source function _ordinal_effects_matrix(effects, y, K)
+    @inline
     return _ordinal_effects_matrix(effects, length(y), K)
 end
-@inline function _ordinal_effects_matrix(effects, n::Integer, K)
+ReactiveKernels.@_record_source function _ordinal_effects_matrix(effects, n::Integer, K)
+    @inline
     ndims(effects) == 2 && size(effects) == (n, K - 1) ||
         throw(DimensionMismatch("ordinal threshold effects require an N × (K-1) matrix"))
     return effects
@@ -420,6 +422,12 @@ end
 # Gather observation values after ordinary scalar/singleton broadcasting.
 # Stage tables may repeat rows; one-entry operands still supply every lane,
 # including zero lanes for an empty response. This stays in the value graph.
-@inline _broadcast_gather(value::Number, rows) = fill(value, length(rows))
-@inline _broadcast_gather(value, rows) =
+# Both methods record their source, so `jax_source` dispatches as Julia does.
+ReactiveKernels.@_record_source function _broadcast_gather(value::Number, rows)
+    @inline
+    fill(value, length(rows))
+end
+ReactiveKernels.@_record_source function _broadcast_gather(value, rows)
+    @inline
     value[length(value) == 1 ? fill(1, length(rows)) : rows]
+end

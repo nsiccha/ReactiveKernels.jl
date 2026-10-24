@@ -270,6 +270,28 @@ end
     total = sum(abs2, flat)
     return total
 end
+# A plate over the group index whose cells read a shared ragged input by it
+# and allocate at its rows' lengths, then flattened.
+@kernel jax_prep_index(R::Vector{Vector{Float64}}, a::Float64) = begin
+    groups = eachindex(R)
+    cells = plate(groups, Ref(R)) do i, rows
+        (a .* ones(length(rows[i]))) .+ rows[i]
+    end
+    flat = reduce(vcat, cells)
+    total = sum(flat .* flat)
+    return total
+end
+# The flattening BRM emits (reactivekernels-use §4c): type tests decided
+# while emitting, then `reduce(vcat, cells)`.
+@kernel jax_prep_cells(R::Vector{Vector{Float64}}, a::Float64) = begin
+    cells = plate(R) do r
+        a .* r .+ 1
+    end
+    flat = eltype(cells) <: Number ? cells : eltype(cells) <: AbstractVector ?
+        (isempty(cells) ? eltype(eltype(cells))[] : reduce(vcat, cells)) : cells
+    total = sum(flat .* flat) + length(flat)
+    return total
+end
 
 @testset "jax_source: structure" begin
     src = jax_source(jax_plate_scan; have = (:a, :y, :x, :b, :logsigma), want = :total)
@@ -399,10 +421,10 @@ end
     @test first.(src.functions[1].inputs) == ["g", "y"]
     @test first(first.(src.functions[2].inputs)) == "theta"
     # The preparation is host code with real loops; the function is JAX code.
-    prepare = text[findfirst("def prepare_data", text).start:end]
+    host_code = text[findfirst("def prepare_data", text).start:end]
     @test occursin(r"^\s*for .* in enumerate\("m, text)
     @test occursin("break", text) && occursin(".append(", text) && occursin(".setdefault(", text)
-    @test !occursin("jnp.", split(prepare, "\ndef kernel")[1])
+    @test !occursin("jnp.", split(host_code, "\ndef kernel")[1])
     @test occursin("PREPARED = {", text)
     # Without `data`, the same preparation has no JAX translation.
     @test_throws JAXEmissionError jax_source(jax_prep; have = (:theta, :g, :y), want = :total)
@@ -419,12 +441,27 @@ end
                  jax_prep_search(y, 2) * theta[1]
         r = rk_jax_evaluate(src, "kernel", (theta, g, y); grad = true, prepare = true)
         @test r.value ≈ native rtol = 1e-12
+        # The prepared inputs' shapes are static: the function jits with them
+        # as arguments.
+        @test rk_jax_evaluate(src, "kernel", (theta, g, y); prepare = :arguments).value ≈ native rtol = 1e-12
         @test r.grad ≈ rk_fd_gradient(t -> sum(t[jax_prep_codes(g, ["a", "b", "c"])]) +
                  2 * sum(t[jax_prep_first(g)]) + sum(jax_prep_lanes(y, 3)) * t[2] +
                  jax_prep_search(y, 2) * t[1], theta) rtol = 1e-6
         r = rk_jax_evaluate(flat, "kernel", (0.7, R); grad = true, prepare = true)
         @test r.value ≈ sum(abs2, 0.7 .* reduce(vcat, R)) rtol = 1e-12
         @test r.grad ≈ 2 * 0.7 * sum(abs2, reduce(vcat, R)) rtol = 1e-10
+        index = jax_source(jax_prep_index; have = (:a, :R), want = :total, data = (; R))
+        native = prepare(jax_prep_index; have = (:a, :R), want = :total)
+        r = rk_jax_evaluate(index, "kernel", (0.7, R); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, R) rtol = 1e-12
+        @test rk_jax_evaluate(index, "kernel", (0.7, R); prepare = :arguments).value ≈
+              native(0.7, R) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), R), [0.7])) rtol = 1e-6
+        cells = jax_source(jax_prep_cells; have = (:a, :R), want = :total, data = (; R))
+        native = prepare(jax_prep_cells; have = (:a, :R), want = :total)
+        r = rk_jax_evaluate(cells, "kernel", (0.7, R); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, R) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), R), [0.7])) rtol = 1e-6
         # A loop whose trip count is data runs on the host.
         counted = jax_source(jax_data_count; have = (:x, :n), want = :s, data = (x = [1.0, 2.0, 4.0], n = 2))
         @test occursin("for i in range(1, n + 1):", string(counted))

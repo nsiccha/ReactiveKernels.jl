@@ -627,10 +627,15 @@ function _jax_index(ctx::_JaxContext, x::_PyVal, indices)
     end
     _jax_is_array(x.T) || _jax_error("indexing a value of type `", x.T, "`", _jax_where(ctx))
     N = ndims(x.T)
+    # Linear indexing reads the array in Julia's column-major order.
+    if length(indices) == 1 && N > 1 && !_jax_ragged(x.T) && isempty(x.extent)
+        flat = _PyVal("jnp.ravel(" * x.code * ", order=\"F\")", Vector{eltype(x.T)}, x.static)
+        return _jax_index(ctx, flat, indices)
+    end
     length(indices) == N ||
         (length(indices) == 1 && N == 1) ||
         _jax_error("indexing a rank-", N, " array with ", length(indices),
-                   " indices (linear indexing is not translated)", _jax_where(ctx))
+                   " indices", _jax_where(ctx))
     parts = String[]
     kept = 0
     for (dim, index) in enumerate(indices)
@@ -1785,18 +1790,32 @@ function _jax_dims(ctx::_JaxContext, f, dims::Vector{_PyVal})
                    _jax_where(ctx))
     "(" * join((a.code for a in dims), ", ") * (length(dims) == 1 ? ",)" : ")"), length(dims)
 end
+# A vector of a data-dependent length is allocated at its static bound and
+# padded, its length the value (as `Vector{T}(undef, n)`).
+function _jax_vector_dims(ctx::_JaxContext, f, dims::Vector{_PyVal})
+    length(dims) == 1 && dims[1].T isa Type && dims[1].T <: Integer || return nothing
+    size, extent = _jax_allocation_size(ctx, only(dims))
+    isempty(extent) ? nothing : ("(" * size * ",)", extent)
+end
 for (f, name) in ((ones, "jnp.ones"), (zeros, "jnp.zeros"))
     @eval function _jax_function_call(ctx::_JaxContext, ::typeof($f), args::Vector{_PyVal})
         E = isempty(args) ? nothing : _jax_type_of_value(args[1])
         E === nothing ? (E = Float64) : (args = args[2:end])
+        padded = _jax_vector_dims(ctx, $f, args)
+        padded === nothing ||
+            return _PyVal($name * "(" * padded[1] * ", dtype=" * _jax_dtype(E) * ")", Vector{E},
+                          false, padded[2])
         shape, N = _jax_dims(ctx, $f, args)
         _PyVal($name * "(" * shape * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
     end
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(fill), args::Vector{_PyVal})
     x, dims = args[1], args[2:end]
-    shape, N = _jax_dims(ctx, fill, dims)
     E = _jax_eltype(x.T)
+    padded = _jax_vector_dims(ctx, fill, dims)
+    padded === nothing || return _PyVal("jnp.full(" * padded[1] * ", " * x.code * ", dtype=" *
+                                        _jax_dtype(E) * ")", Vector{E}, false, padded[2])
+    shape, N = _jax_dims(ctx, fill, dims)
     _PyVal("jnp.full(" * shape * ", " * x.code * ", dtype=" * _jax_dtype(E) * ")", Array{E,N})
 end
 # `hcat` of scalars, vectors (columns) and matrices.

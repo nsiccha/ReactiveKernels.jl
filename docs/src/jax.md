@@ -112,9 +112,9 @@ JAX code:
 
 - Its values are concrete, so a condition is a Python `if`, a loop a Python
   `for` or `while` (with `break` and `continue`), and a value's shape may
-  follow its data: level codes
-  of string columns, stopping-ratio stage lanes, positions of missing values.
-  A loop in the source is a loop in the module; nothing is unrolled.
+  follow its data: level codes of string columns, stopping-ratio stage lanes,
+  positions of missing values. A loop in the source is a loop in the module;
+  nothing is unrolled.
 - A vector built with `push!` is a list; dictionaries are `dict`s; an array a
   source writes by index is written in place, after a copy if the source did
   not allocate it.
