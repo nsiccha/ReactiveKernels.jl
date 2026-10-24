@@ -5,28 +5,30 @@
 # position. Authored plates and scans already fill a recycled buffer
 # (`_lane_allocation`); this file gives the same destination protocol to the
 # source shapes that produce a dense array of known shape: a top-level dotted
-# call (including `@.`), a top-level array slice `x[i, j...]`, and a top-level
-# lazy branch (`c ? a : b`, `if`/`elseif`/`else`) whose arms produce arrays.
-# Each arm of such a branch that is one of these shapes, or `zeros`/`ones`/
-# `fill` of integer dimensions, fills the recipe's buffer; the branch stays
-# lazy, so only the taken arm runs. A slice arm counts only beside an arm
-# that is an array by its syntax (a dotted call, `zeros`/`ones`/`fill`, a slice
-# by a range or `:`): `i > 0 ? x[i] : 0.0` reads a scalar and keeps its call.
+# call (including `@.`), a top-level array slice `x[i, j...]`, a top-level
+# `reduce(vcat, cells)` of dense vectors, and a top-level lazy branch
+# (`c ? a : b`, `if`/`elseif`/`else`) whose arms produce arrays. Each arm of
+# such a branch that is one of these shapes, or `zeros`/`ones`/`fill` of
+# integer dimensions, fills the recipe's buffer; the branch stays lazy, so
+# only the taken arm runs. A slice arm counts only beside an arm that is an
+# array by its syntax (a dotted call, `zeros`/`ones`/`fill`, a slice by a
+# range or `:`): `i > 0 ? x[i] : 0.0` reads a scalar and keeps its call.
 #
-# A dotted call nested inside such a source, as the argument of another call
-# (`minimum(x .- y)`) or inside a branch arm, fills a lane slot of its own. The
-# recipe's value releases every such slot it may hold (`_lane_release!`), so a
-# value that keeps the buffer (an opaque function returned it) is never
-# overwritten. Nested slots are free names the position driver binds
+# A dotted call or a `reduce(vcat, cells)` nested inside such a source, as the
+# argument of another call (`minimum(x .- y)`) or inside a branch arm, fills a
+# lane slot of its own. The recipe's value releases every such slot it may
+# hold (`_lane_release!`), so a value that keeps the buffer (an opaque function
+# returned it, a tuple holds it) is never overwritten. Nested slots are free names the position driver binds
 # (`_CELL_SLOTS`); outside a position residual a nested call keeps its own
 # allocation.
 #
-# The recipe's native closure computes `_native_broadcast_materialize(bc)` or
-# `x[...]` from its captured source. The destination form evaluates the same
-# lazy broadcast or the same indices from that source and writes the result
-# into a matching recycled buffer (`_lane_broadcast`, `_lane_getindex`,
-# `_lane_zeros`, `_lane_ones`, `_lane_fill`), returning exactly the value the
-# closure would. The source is reinterpreted only when that is unambiguous:
+# The recipe's native closure computes `_native_broadcast_materialize(bc)`,
+# `x[...]` or `reduce(vcat, cells)` from its captured source. The destination
+# form evaluates the same lazy broadcast, indices or cells from that source and
+# writes the result into a matching recycled buffer (`_lane_broadcast`,
+# `_lane_getindex`, `_lane_reduce_vcat`, `_lane_zeros`, `_lane_ones`,
+# `_lane_fill`), returning exactly the value the closure would. The source is
+# reinterpreted only when that is unambiguous:
 #
 # - the operation is an ordinary-mode `:fused` source closure without
 #   captures (an `on_error = :ignore` twin keeps its own stripped body), or
@@ -173,6 +175,13 @@ function _lane_source_node(ctx::_LaneSourceContext, node, ends)
         slot = gensym(:lane_nested)
         push!(ctx.nested, slot)
         return Expr(:call, _lane_source_ref(:_lane_broadcast), slot, lazy)
+    elseif head === :call && ctx.nested !== nothing && _lane_reduce_vcat_call(ctx, node)
+        # So does a nested `reduce(vcat, cells)`.
+        cells = _lane_source_node(ctx, node.args[3], ends)
+        cells === nothing && return nothing
+        slot = gensym(:lane_nested)
+        push!(ctx.nested, slot)
+        return Expr(:call, _lane_source_ref(:_lane_reduce_vcat), slot, cells)
     elseif head in (:call, :tuple, :parameters, :...) ||
            ctx.lazy && head in (:if, :elseif, :&&, :||)
         # Lazy branches and short-circuit operators keep their heads, so only
@@ -256,6 +265,10 @@ function _lane_destination(ctx::_LaneSourceContext, node, recycled,
         return (Expr(:let, Expr(:(=), held, array),
             Expr(:call, _lane_source_ref(:_lane_getindex), recycled, held, indices...)),
             true)
+    elseif _lane_reduce_vcat_call(ctx, node)
+        cells = _lane_source_node(ctx, node.args[3], nothing)
+        cells === nothing && return nothing
+        return (Expr(:call, _lane_source_ref(:_lane_reduce_vcat), recycled, cells), true)
     elseif (fill = _lane_fill_call(ctx, node)) !== nothing
         args = Any[]
         for arg in node.args[2:end]
@@ -282,26 +295,41 @@ function _lane_destination(ctx::_LaneSourceContext, node, recycled,
     plain()
 end
 
+# Whether `node` is a call with arguments, without keywords or splats.
+_lane_plain_call(node) = node isa Expr && node.head === :call &&
+    length(node.args) >= 2 &&
+    !any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :...), node.args)
+
+# The module binding a name of the source resolves to, as the closure resolves
+# it, or `nothing` for a recipe input, an unbound name or another node.
+function _lane_binding(ctx::_LaneSourceContext, name)
+    if name isa Symbol
+        haskey(ctx.arguments, name) && return nothing
+        isdefined(ctx.mod, name) || return nothing
+        getglobal(ctx.mod, name)
+    elseif name isa GlobalRef
+        isdefined(name.mod, name.name) || return nothing
+        getglobal(name.mod, name.name)
+    else
+        nothing
+    end
+end
+
 # The destination name of `zeros`, `ones` or `fill` of Base, called without
 # keywords or splats, or `nothing`.
 function _lane_fill_call(ctx::_LaneSourceContext, node)
-    node isa Expr && node.head === :call && length(node.args) >= 2 || return nothing
-    any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :...), node.args) &&
-        return nothing
-    callee = node.args[1]
-    f = if callee isa Symbol
-        haskey(ctx.arguments, callee) && return nothing
-        isdefined(ctx.mod, callee) || return nothing
-        getglobal(ctx.mod, callee)
-    elseif callee isa GlobalRef
-        isdefined(callee.mod, callee.name) || return nothing
-        getglobal(callee.mod, callee.name)
-    else
-        return nothing
-    end
+    _lane_plain_call(node) || return nothing
+    f = _lane_binding(ctx, node.args[1])
     f === Base.zeros ? :_lane_zeros : f === Base.ones ? :_lane_ones :
         f === Base.fill ? :_lane_fill : nothing
 end
+
+# Whether `node` is Base's `reduce(vcat, x)`, without keywords (an `init`
+# folds pairwise, a different method) or splats.
+_lane_reduce_vcat_call(ctx::_LaneSourceContext, node) =
+    _lane_plain_call(node) && length(node.args) == 3 &&
+    _lane_binding(ctx, node.args[1]) === Base.reduce &&
+    _lane_binding(ctx, node.args[2]) === Base.vcat
 
 # Whether a branch has a leaf arm that is an array by its syntax: a dotted call,
 # `zeros`/`ones`/`fill`, or a slice by a range or `:`.

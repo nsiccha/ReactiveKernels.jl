@@ -1141,7 +1141,13 @@ end
 # it to the entry and the slot gets the entry's spare (`_lane_cell_release!`);
 # every other cell keeps reusing the slot. Only the slot is ever written, and a
 # buffer leaves the table only at its own cell, so no stored result is
-# overwritten while it is live.
+# overwritten while it is live. A plate whose cells' element type `T` holds no
+# array (numbers, tuples of them) keeps no table: its results never hold a
+# buffer, and a table lookup per cell would only cost time. `every` says
+# whether the slot's value is computed at every cell, a constant of the
+# compiled body (`every_cell` in `_lower_authored_plate_loop_native!`); if
+# not, one computed value can serve several cells, so the slot is released
+# instead, as `_lane_release!` releases it.
 @inline function _lane_cell_table(table::Base.RefValue{Any}, cell::Int)
     entries = table[]
     entries isa Vector{Any} || (entries = Any[]; table[] = entries)
@@ -1152,7 +1158,8 @@ end
     entries
 end
 @inline function _lane_cell_take!(slot::Base.RefValue{Any}, table::Base.RefValue{Any},
-                                  cell::Int)
+                                  cell::Int, ::Type{T}, every::Bool) where {T}
+    every && _replicated_may_contain_array(T) || return nothing
     entries = _lane_cell_table(table, cell)
     held = @inbounds entries[cell]
     held === nothing && return nothing
@@ -1161,11 +1168,12 @@ end
     nothing
 end
 @inline function _lane_cell_release!(result, cell::Int,
-        pairs::Vararg{Tuple{Base.RefValue{Any},Base.RefValue{Any}},N}) where {N}
+        slots::Vararg{Tuple{Base.RefValue{Any},Base.RefValue{Any},Bool},N}) where {N}
     isbits(result) && return result
-    foreach(pairs) do (slot, table)
+    foreach(slots) do (slot, table, every)
         buffer = slot[]
         (buffer === nothing || !_lane_may_reference(result, buffer)) && return
+        every || return (slot[] = nothing)
         entries = _lane_cell_table(table, cell)
         @inbounds slot[] = entries[cell]
         @inbounds entries[cell] = buffer
@@ -1274,6 +1282,29 @@ const _LaneIndex = Union{Integer,AbstractRange{<:Integer},Colon,AbstractVector{<
     buffer = _lane_reuse(recycled, T, Base.index_shape(J...))
     buffer === nothing && return _lane_keep!(recycled, A[I...])
     copyto!(buffer, view(A, J...))
+end
+
+# `reduce(vcat, A)` (`_lane_source_expr`). For a vector of dense vectors,
+# Base's method allocates `similar(A[1], T, n)`, a `Vector{T}` of the promoted
+# element type and the total length, and copies the cells in order
+# (`Base._typed_vcat!`); a matching recycled buffer is filled the same way.
+# Any other argument, no cells (whose Base call throws) and a cell that may
+# share memory with the buffer take Base's call.
+@inline _lane_reduce_vcat(recycled, A) = reduce(vcat, A)
+@inline function _lane_reduce_vcat(recycled,
+        A::AbstractVector{<:Union{Array{<:Any,1},SubArray{<:Any,1,<:Array}}})
+    isempty(A) && return reduce(vcat, A)
+    T = mapreduce(eltype, promote_type, A)
+    n = 0
+    for cell in A
+        n += length(cell)
+    end
+    buffer = _lane_reuse(recycled, T, (Base.OneTo(n),))
+    buffer === nothing && return _lane_keep!(recycled, reduce(vcat, A))
+    for cell in A
+        Base.mightalias(cell, buffer) && return _lane_keep!(recycled, reduce(vcat, A))
+    end
+    Base._typed_vcat!(buffer, A)
 end
 
 # `zeros`, `ones` and `fill` of integer dimensions in a lazy-branch arm

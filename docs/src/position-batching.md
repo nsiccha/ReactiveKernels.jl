@@ -219,32 +219,47 @@ that container. Declared types keep their ordinary Julia conversion semantics.
 
 Position intermediates use the same destination protocol. A residual value
 produced by an authored plate or scan, or by a recipe whose source is a
-top-level dotted call (including `@.`) or an array slice such as `y[2:2:end]`
-or `m[:, j]`, keeps its dense buffer in a lane slot. Later positions overwrite
-that buffer when its element type and axes match, and allocate afresh
-otherwise. An owning call keeps its slots for that call; a borrowed reader and
-each scheduled worker keep them between calls. A WANT produced by a dotted call
-or slice reuses first-position scratch and remains a dense array at every
-position. Slots never leave the call, and every WANT is copied into the stacked
-result before the next position runs, so values, container types and errors
-are those of the scalar kernel. For example, a superposition plate whose output
+top-level dotted call (including `@.`), an array slice such as `y[2:2:end]`
+or `m[:, j]`, or `reduce(vcat, cells)` of dense vectors, keeps its dense
+buffer in a lane slot. Later positions overwrite that buffer when its element
+type and axes match, and allocate afresh otherwise. An owning call keeps its
+slots for that call; a borrowed reader and each scheduled worker keep them
+between calls. A WANT produced by a dotted call, a slice or
+`reduce(vcat, cells)` reuses first-position scratch and remains a dense array
+at every position. Slots never leave the call, and every WANT is copied into
+the stacked result before the next position runs, so values, container types
+and errors are those of the scalar kernel. For example, a superposition plate whose output
 is sliced, scanned, mapped with `@.` and reduced with `minimum` allocates no
 per-position storage in a borrowed reader.
 
+`reduce(vcat, cells)` concatenates a plate's vector cells into one flat
+vector. When every cell is a `Vector`, or a view of a vector `Array`, it
+writes the cells in order into its buffer, as Base's method writes them into
+a new `Vector` of the promoted element type and total length. Base's method has
+no value for an empty `cells` and raises its error, here as in the scalar
+kernel; `isempty(cells) ? eltype(eltype(cells))[] : reduce(vcat, cells)`
+returns a typed empty vector instead and keeps the slot (a lazy branch, below).
+`reduce(vcat, cells; init = v)` is Base's pairwise fold, a different method,
+and keeps its call, as do cells of other types (ranges, abstract element
+types).
+
 A recipe whose source is a top-level lazy branch (`c ? a : b`,
 `if`/`elseif`/`else`) whose arms produce arrays fills its lane slot from
-whichever arm runs: an arm that is a dotted call, a slice, or `zeros`, `ones`
-or `fill` of integer dimensions writes into the buffer, and the branch stays
-lazy, so `isempty(c) ? zeros(length(idx)) : c[idx]` reads `c[idx]` only when
-it is taken. A slice arm counts only beside an arm that is an array by its
+whichever arm runs: an arm that is a dotted call, a slice,
+`reduce(vcat, cells)`, or `zeros`, `ones` or `fill` of integer dimensions
+writes into the buffer, and the branch stays lazy, so
+`isempty(c) ? zeros(length(idx)) : c[idx]` reads `c[idx]` only when it is
+taken. A slice arm counts only beside an arm that is an array by its
 syntax (a dotted call, `zeros`/`ones`/`fill`, a slice by a range or `:`), so
-`i > 0 ? x[i] : 0.0` keeps its ordinary call. A dotted call nested in another
-call of a source, as in `minimum(100 .* (v .- b))` or inside a branch arm,
+`i > 0 ? x[i] : 0.0` keeps its ordinary call. A dotted call or a
+`reduce(vcat, cells)` nested in another call of a source, as in
+`minimum(100 .* (v .- b))`, `2 .* reduce(vcat, cells)` or inside a branch arm,
 keeps a lane slot of its own; the recipe's value releases that slot when it
-may hold the buffer (an opaque function returned it). A source recipe of any
-other shape, one whose source captures a local variable, or one prepared with
-`on_error = :ignore` keeps its ordinary call; such recipes, opaque functions,
-concatenations and matrix products allocate as they do in the scalar kernel.
+may hold the buffer (an opaque function returned it, a tuple holds it). A
+source recipe of any other shape, one whose source captures a local variable,
+or one prepared with `on_error = :ignore` keeps its ordinary call; such
+recipes, opaque functions, other concatenations and matrix products allocate as
+they do in the scalar kernel.
 A reduction usually reads its argument's buffer. Eligible terminal minima
 of an init-including scan and its dotted transforms instead stream through
 the scan loop; see [scans](scan.md). Those trajectories and transformed
@@ -264,13 +279,19 @@ allocates afresh, so every stored result keeps its values. A plate at the
 residual's top level keeps those buffers per cell: a stored result is dead
 once the plate runs again (every WANT is stored by value), so cell `k` of the
 next position, or of a borrowed reader's next call, refills the buffers its
-result held. A subject cell that returns its per-observation predictions, or a
-tuple holding them, therefore allocates them only at a reader's first call. A
-plate inside another plate's cell runs once per outer cell, whose stored result
-may still hold its cells, so its cells' results still allocate, as do the
-values of opaque functions and the work inside scan steps. One slot serves all
-the cells of a plate: a cell of another shape than the cell before it
-allocates afresh. A prepared scalar kernel, including one prepared for
+result held. Such a plate also keeps, per cell, the cell's result itself when
+a dotted call, a slice, `reduce(vcat, ...)` or a nested plate produces it,
+with declared or undeclared ports; a lazy branch whose condition reads the
+cell (`isempty(row) ? zeros(0) : f.(row)`) still allocates its arm's array. A
+subject cell that returns its per-observation predictions, or a tuple holding
+them, therefore allocates them only at a reader's first call, and so does a plate of such cells read through
+`reduce(vcat, cells)`, the flat vector included. A plate inside another
+plate's cell runs once per outer cell, whose stored result may still hold its
+cells, so its cells' results still allocate, as do the values of opaque
+functions and the work inside scan steps. The values no stored result holds
+share one slot across the cells of a plate: a cell of another shape than the
+cell before it allocates them afresh, while the buffers kept per cell serve
+ragged cells too. A prepared scalar kernel, including one prepared for
 reverse-mode AD, keeps allocating its cell values at every cell.
 
 By default every call owns fresh stacked output arrays, including record
