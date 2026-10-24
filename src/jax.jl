@@ -382,6 +382,10 @@ _jax_expr(ctx::_JaxContext, ::Val{:(::)}, ex) = _jax_expr(ctx, ex.args[1])
 _jax_expr(ctx::_JaxContext, ::Val{:return}, ex) = _jax_expr(ctx, ex.args[1])
 function _jax_expr(ctx::_JaxContext, ::Val{:macrocall}, ex)
     name = ex.args[1]
+    # `ReactantCore.@trace` marks the control flow a compiled backend keeps;
+    # its loop or branch is translated as written (options such as
+    # `checkpointing = …` are a compiler's concern, not the program's).
+    _jax_is_trace_macro(name) && return _jax_expr(ctx, ex.args[end])
     name in (Symbol("@inbounds"), Symbol("@fastmath"), Symbol("@inline"),
              Symbol("@noinline")) ||
         (name isa GlobalRef && name.name in (Symbol("@inbounds"), Symbol("@inline"))) ||
@@ -796,6 +800,59 @@ function _jax_expr(ctx::_JaxContext, ::Val{:comprehension}, ex)
     _PyVal(values.code, values.T, false, bound)
 end
 
+_jax_is_trace_macro(name) = name === Symbol("@trace") ||
+    (name isa GlobalRef && name.name === Symbol("@trace")) ||
+    (name isa Expr && name.head === :. && name.args[end] == QuoteNode(Symbol("@trace")))
+
+# A `while` loop: `jax.lax.while_loop` over the outer locals the body assigns.
+# JAX differentiates it forward only; `jax.grad` through it raises JAX's own
+# error, so a differentiated program writes the loop as a `for` over a range.
+function _jax_expr(ctx::_JaxContext, ::Val{:while}, ex)
+    condition_ex, body = ex.args
+    assigned = Set{Symbol}()
+    _jax_assigned_names!(assigned, body)
+    carried = sort!([n for n in assigned if haskey(ctx.locals, n)])
+    isempty(carried) && _jax_error("a `while` loop that assigns no outer local", _jax_where(ctx))
+    initial = [_jax_carry_value(ctx, ctx.locals[n]) for n in carried]
+    carry_code = "(" * join((v.code for v in initial), ", ") * (length(initial) == 1 ? ",)" : ")")
+    function loop_function(hint, build)
+        fname = _jax_fresh(ctx, hint)
+        carry = _jax_fresh(ctx, :carry)
+        outer = ctx.scope
+        inner = _JaxScope(outer)
+        inner.indent = outer.indent + 1
+        push!(inner.used, carry)
+        saved = copy(ctx.locals)
+        ctx.scope = inner
+        result = try
+            names = [_jax_identifier(inner.used, n) for n in carried]
+            _jax_emit!(ctx, "(" * join(names, ", ") * (length(names) == 1 ? ",)" : ")") * " = " * carry)
+            for (n, name, v) in zip(carried, names, initial)
+                ctx.locals[n] = _PyVal(name, v.T)
+            end
+            build()
+        finally
+            ctx.scope = outer
+            empty!(ctx.locals); merge!(ctx.locals, saved)
+        end
+        push!(outer.lines, "    "^outer.indent * "def " * fname * "(" * carry * "):")
+        append!(outer.lines, inner.lines)
+        push!(outer.lines, "    "^inner.indent * "return " * result)
+        fname
+    end
+    cond_f = loop_function(:loop_condition, () -> _jax_expr(ctx, condition_ex).code)
+    body_f = loop_function(:loop_body, () -> begin
+        _jax_statements(ctx, body isa Expr && body.head === :block ? body.args : Any[body])
+        "(" * join((ctx.locals[n].code for n in carried), ", ") * (length(carried) == 1 ? ",)" : ")")
+    end)
+    result = _jax_fresh(ctx, :loop_carry)
+    _jax_emit!(ctx, result * " = jax.lax.while_loop(" * cond_f * ", " * body_f * ", " * carry_code * ")")
+    for (k, (n, v)) in enumerate(zip(carried, initial))
+        ctx.locals[n] = _PyVal(result * "[" * string(k - 1) * "]", v.T)
+    end
+    _PyVal("None", Nothing, true)
+end
+
 # Loops. A `for` over a range is `jax.lax.fori_loop` over a function of the
 # index and the carry, the outer locals the body assigns (an indexed write
 # assigns its array). The range's bounds are static, so the loop lowers to a
@@ -911,8 +968,28 @@ end
 function _jax_expr(ctx::_JaxContext, ::Val{:if}, ex)
     condition = _jax_expr(ctx, ex.args[1])
     otherwise = length(ex.args) >= 3 ? ex.args[3] : nothing
-    _jax_conditional(ctx, condition, () -> _jax_expr(ctx, ex.args[2]),
-                     () -> _jax_expr(ctx, otherwise))
+    # Outer locals an arm assigns leave the branch with it: each arm returns
+    # its value followed by those locals, and the branch rebinds them.
+    assigned = Set{Symbol}()
+    foreach(a -> _jax_assigned_names!(assigned, a), ex.args[2:end])
+    carried = sort!([n for n in assigned if haskey(ctx.locals, n)])
+    isempty(carried) && return _jax_conditional(ctx, condition,
+        () -> _jax_expr(ctx, ex.args[2]), () -> _jax_expr(ctx, otherwise))
+    before = Dict(n => ctx.locals[n] for n in carried)
+    arm(body) = () -> begin
+        v = _jax_expr(ctx, body)
+        parts = [v.T === Nothing || v.T === Union{} ? "None" : v.code]
+        for n in carried
+            push!(parts, _jax_carry_value(ctx, ctx.locals[n]).code)
+        end
+        _PyVal("(" * join(parts, ", ") * ")", Tuple{_jax_typeof(v), (before[n].T for n in carried)...})
+    end
+    result = _jax_bind!(ctx, :branch, _jax_conditional(ctx, condition, arm(ex.args[2]), arm(otherwise)))
+    for (k, n) in enumerate(carried)
+        b = before[n]
+        ctx.locals[n] = _PyVal(result.code * "[" * string(k) * "]", b.T, false, b.extent, b.limit)
+    end
+    _PyVal(result.code * "[0]", result.T isa Type && result.T <: Tuple ? fieldtype(result.T, 1) : Any)
 end
 
 # A conditional: a static condition is a Python conditional, decided while JAX
@@ -1509,7 +1586,7 @@ function _jax_scalar_function!(ctx::_JaxContext, f, types)
     name
 end
 nameof_or(f) = f isa Function && Base.issingletontype(typeof(f)) ? nameof(f) :
-    f isa ScalarDerivativeRule ? typeof(f).parameters[1] : :function
+    f isa Union{ScalarDerivativeRule,DerivativeRule} ? typeof(f).parameters[1] : :function
 eltype_or_self(@nospecialize(T)) = T isa Type && T <: AbstractArray ? eltype(T) : T
 
 
@@ -1542,8 +1619,14 @@ _jax_op_body(f) = _jax_error("an embedded operation `", typeof(f), "` without it
 
 # A derivative rule called as a function: its primal cut, which `jax.grad`
 # differentiates; the rule's partials are not needed.
-function _jax_call_positional(ctx::_JaxContext,
-        rule::ScalarDerivativeRule{Name,N,Inputs,Primal}, args::Vector{_PyVal}) where {Name,N,Inputs,Primal}
+_jax_call_positional(ctx::_JaxContext,
+        rule::ScalarDerivativeRule{Name,N,Inputs,Primal}, args::Vector{_PyVal}) where {Name,N,Inputs,Primal} =
+    _jax_rule_primal(ctx, rule, Primal, args)
+_jax_call_positional(ctx::_JaxContext,
+        rule::DerivativeRule{Name,N,Inputs,Primal}, args::Vector{_PyVal}) where {Name,N,Inputs,Primal} =
+    _jax_rule_primal(ctx, rule, Primal, args)
+
+function _jax_rule_primal(ctx::_JaxContext, rule, Primal, args::Vector{_PyVal})
     signature, steps, ret = Primal
     env = Dict{Symbol,_PyVal}(zip(signature, args))
     for (output, index, arguments) in steps

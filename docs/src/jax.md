@@ -105,7 +105,8 @@ The translation follows the [core constraints](constraints.md):
   `[f(i) for i in r]`) are `jax.vmap` of the element over the range; a filter
   masks the reduction.
 - **Loops** written in a recipe or a `@traceable` helper are
-  `jax.lax.fori_loop`. Their carry is the locals the body assigns, and an
+  `jax.lax.fori_loop` (`while` loops are `jax.lax.while_loop`, and
+  `ReactantCore.@trace` control flow is translated as written). Their carry is the locals the body assigns, and an
   indexed write `A[i] = v` is `A.at[i].set(v)`.
 - **Static conditions** decide while JAX traces: shapes, literals, and guards
   such as `n == k || throw(...)`.
@@ -152,8 +153,9 @@ recipe and the construct:
 - a loop whose trip count is data with no static bound (JAX loops and arrays
   need static shapes);
 - a `throw` that depends on data;
-- `while` loops in recipe source, and filtered comprehensions (their length
-  is data);
+- `jax.grad` through a `while` loop (JAX differentiates `lax.while_loop`
+  forward only; write a differentiated loop as a `for` over a range);
+- filtered comprehensions (their length is data);
 - plates of rank above one over ragged data;
 - `history` scans.
 

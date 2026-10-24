@@ -60,6 +60,28 @@ end
     return t
 end
 
+# A helper written for the compiled path: `@trace` control flow, a `while`
+# loop, and a branch whose arms assign an outer local.
+@traceable function jax_test_traced(x::Real)
+    i = 0
+    h = one(x)
+    ReactiveKernels.ReactantCore.@trace while i < 20
+        h = h * (1 + x / (i + 1))
+        i = i + 1
+    end
+    result = zero(x)
+    ReactiveKernels.ReactantCore.@trace if x > 0
+        result = h
+    else
+        result = -h
+    end
+    return result
+end
+@kernel jax_traced(x::Float64) = begin
+    y = jax_test_traced(x)
+    return y
+end
+
 @traceable jax_test_count(x::AbstractVector, n::Integer) = begin
     acc = zero(eltype(x))
     for i in 1:n
@@ -91,6 +113,9 @@ end
     @test occursin("jax.vmap(element", generators)
     @test occursin("jnp.where(kept", generators)
     @test !occursin(r"^\s*for "m, generators)
+    traced = string(jax_source(jax_traced; have = (:x,), want = :y))
+    @test occursin("jax.lax.while_loop(", traced)
+    @test occursin("jax.lax.cond(", traced)
     # Several functions over one boundary, with module constants.
     multi = jax_source(jax_gaussian; have = (:mu, :x, :logsigma),
                        functions = (log_density = :lp, both = (:lp, :sigma),
@@ -138,6 +163,11 @@ end
         r = rk_jax_evaluate(src, "kernel", (0.4, x); grad = true)
         @test r.value ≈ native(0.4, x) rtol = 1e-12
         @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x), [0.4])) rtol = 1e-6
+
+        native = prepare(jax_traced; have = (:x,), want = :y)
+        src = jax_source(jax_traced; have = (:x,), want = :y)
+        @test rk_jax_evaluate(src, "kernel", (0.3,)).value ≈ native(0.3) rtol = 1e-12
+        @test rk_jax_evaluate(src, "kernel", (-0.3,)).value ≈ native(-0.3) rtol = 1e-12
 
         R = [0.0, 1.2, 0.3, 0.0, 2.5, 0.1]
         native = prepare(jax_loop; have = (:rho, :R, :kappa), want = :s)
