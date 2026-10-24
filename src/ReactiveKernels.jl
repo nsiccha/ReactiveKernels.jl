@@ -73,6 +73,7 @@ include("affine_logistic.jl")
 include("cholesky.jl")
 include("native_ode.jl")
 include("jax.jl")
+include("jax_host.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
 export PreparedADOperator, PreparedADPushforward, PreparedADHVP
