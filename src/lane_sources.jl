@@ -48,7 +48,8 @@
 #
 # An RK-owned callee whose mathematics is a graph has a destination form too:
 # a derivative rule's primal cut, called as a recipe's operation or in a lazy
-# arm, and a child kernel prepared for a lazy arm (`_KernelPreparedChild`).
+# arm by its bare or module-qualified name (`_lane_binding`), and a child
+# kernel prepared for a lazy arm (`_KernelPreparedChild`).
 # Its lane kernel (`_lane_kernel`) is its plan lowered as a position residual
 # part: its WANT fills the call's recycled buffer, and its own lane values and
 # cell values fill slots kept per call site (`_LaneCalleeState`, in a nested
@@ -480,18 +481,16 @@ _lane_plain_call(node) = node isa Expr && node.head === :call &&
     !any(arg -> arg isa Expr && arg.head in (:parameters, :kw, :...), node.args)
 
 # The module binding a name of the source resolves to, as the closure resolves
-# it, or `nothing` for a recipe input, an unbound name or another node.
+# it, or `nothing` for a recipe input, an unbound name or another node. A
+# qualified name (`Mod.Sub.f`) resolves through its owners
+# (`_kernel_resolve_binding`), unless a recipe input is its root.
 function _lane_binding(ctx::_LaneSourceContext, name)
-    if name isa Symbol
-        haskey(ctx.arguments, name) && return nothing
-        isdefined(ctx.mod, name) || return nothing
-        getglobal(ctx.mod, name)
-    elseif name isa GlobalRef
-        isdefined(name.mod, name.name) || return nothing
-        getglobal(name.mod, name.name)
-    else
-        nothing
+    root = name
+    while root isa Expr && root.head === :. && length(root.args) == 2
+        root = root.args[1]
     end
+    root isa Symbol && haskey(ctx.arguments, root) && return nothing
+    _kernel_resolve_binding(ctx.mod, name)
 end
 
 # The destination name of `zeros`, `ones` or `fill` of Base, called without
