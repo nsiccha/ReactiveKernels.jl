@@ -259,6 +259,8 @@ returns number cells as they are and fills the slot with vector cells. A bound
 in a type application (`AbstractVector{<:Real}`) makes Julia build a `where`
 type each time the condition runs, about 160 bytes per position as in any
 loop, while `AbstractVector` and `AbstractVector{Float64}` are constants.
+An `@rkppl` model writes the same recipe as a definition over a `@plate`
+cell's results ([RKPPL](rkppl.md)) and keeps the slot.
 A dotted call or a
 `reduce(vcat, cells)` nested in another call of a source, as in
 `minimum(100 .* (v .- b))`, `2 .* reduce(vcat, cells)` or inside a branch arm,
