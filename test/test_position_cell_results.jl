@@ -13,6 +13,10 @@ using ReactiveKernels: plate, code_expr
 # - `reduce(vcat, cells)` of dense vectors fills one lane slot, at the top
 #   level, in a lazy-branch arm (an empty plate's typed empty vector) and
 #   nested in another call;
+#   - also beside the cells themselves, in a branch on the cells' type
+#     (`eltype(cells) <: Number ? cells : ...`), whose condition is Julia's
+#     subtype syntax, with or without a type application
+#     (snag type-constant-la-902b10ce);
 # - other spellings and arguments keep Base's call: `init` folds pairwise,
 #   non-dense cells, and no cells (Base's error).
 # Values, container types and errors are those of the scalar kernel.
@@ -79,6 +83,35 @@ end
     return loc
 end
 
+# One flatten for number and vector cells: the cells as they are when they are
+# numbers, else their concatenation.
+@kernel flat_by_kind(theta, t) = begin
+    cells = plate(t) do ti
+        theta[1] .* exp.(-theta[2] .* ti)
+    end
+    loc = eltype(cells) <: Number ? cells :
+          isempty(cells) ? eltype(eltype(cells))[] : reduce(vcat, cells)
+    return loc
+end
+
+@kernel flat_by_bound(theta, t) = begin
+    cells = plate(t) do ti
+        theta[1] .* exp.(-theta[2] .* ti)
+    end
+    loc = eltype(cells) <: AbstractVector{<:Real} ?
+          (isempty(cells) ? eltype(eltype(cells))[] : reduce(vcat, cells)) : cells
+    return loc
+end
+
+@kernel numbers_by_kind(theta, t) = begin
+    cells = plate(t) do ti
+        theta[1] * exp(-theta[2] * sum(ti; init = 0.0))
+    end
+    loc = Union{Float32,Float64} >: eltype(cells) ? cells :
+          isempty(cells) ? eltype(eltype(cells))[] : reduce(vcat, cells)
+    return loc
+end
+
 @kernel flat_scaled(theta, t) = begin
     cells = plate(t) do ti
         inner = plate(ti) do x
@@ -127,6 +160,7 @@ readers(spec, want) = (vectorize(spec; batched = :theta, want),
 
 const CASES = ((direct, :total), (via_local, :first_cell), (strided, :total),
                (branched, :total), (nested_result, :total), (flat, :loc), (flat_or_empty, :loc),
+               (flat_by_kind, :loc), (flat_by_bound, :loc), (numbers_by_kind, :loc),
                (flat_scaled, :loc), (flat_init, :loc))
 
 @testset "position cell results: values" begin
@@ -176,12 +210,13 @@ end
     for reader in readers(flat, :loc)
         @test_throws typeof(scalar_error) reader(theta, empty_rows)
     end
-    # The typed empty arm.
-    for reader in readers(flat_or_empty, :loc)
+    # The typed empty arm, and number cells as they are.
+    for spec in (flat_or_empty, flat_by_kind, flat_by_bound, numbers_by_kind),
+            reader in readers(spec, :loc)
         result = reader(theta, empty_rows)
         @test size(result) == (0, 3) && eltype(result) === Float64
         t = rows((2, 3))
-        expected = reference(flat_or_empty, :loc, theta, t)
+        expected = reference(spec, :loc, theta, t)
         result = reader(theta, t)
         @test all(index -> same(column(result, index), expected[index]), 1:3)
     end
@@ -196,6 +231,10 @@ end
     @test occursin("_lane_reduce_vcat", source(flat, :loc))
     @test occursin("_lane_reduce_vcat", source(flat_or_empty, :loc))
     @test occursin("_lane_reduce_vcat", source(flat_scaled, :loc))
+    # A subtype test, with or without a type application, keeps the branch's form.
+    for spec in (flat_by_kind, flat_by_bound, numbers_by_kind)
+        @test occursin("_lane_reduce_vcat", source(spec, :loc))
+    end
     # `init` selects Base's pairwise fold, which keeps its call.
     @test !occursin("_lane_reduce_vcat", source(flat_init, :loc))
 end
@@ -204,11 +243,13 @@ end
 # cell or position count. On RK 25ed45ff2, at 1000 rows per cell, `direct`,
 # `via_local` and `nested_result` allocated 8,128 B per cell and position (the
 # cell), `strided` 4,160 B, and the `flat` kernels 16,140 B (the cell and its
-# share of the flat vector).
+# share of the flat vector). On RK 9f5d1e7de, `flat_by_kind` and
+# `flat_by_bound` allocated the flat vector at every position (8,000 B per cell
+# and position).
 @testset "position cell results: borrowed reads reuse their buffers" begin
     for spec_want in ((direct, :total), (via_local, :first_cell), (strided, :total),
                       (nested_result, :total), (flat, :loc), (flat_or_empty, :loc),
-                      (flat_scaled, :loc))
+                      (flat_by_kind, :loc), (numbers_by_kind, :loc), (flat_scaled, :loc))
         spec, want = spec_want
         reader = copy(vectorize(spec; batched = :theta, want, reuse = true))
         small = bytes(reader, thetas(4), rows(fill(1000, 8)))
@@ -216,6 +257,10 @@ end
         @test large < 4096
         @test large - small < 1024
     end
+    # Julia builds the bound's `where` type each time the condition runs, as in
+    # a loop of its own (160 B per position); the flat vector keeps its slot.
+    reader = copy(vectorize(flat_by_bound; batched = :theta, want = :loc, reuse = true))
+    @test bytes(reader, thetas(16), rows(fill(1000, 32))) < 1000 * sizeof(Float64)
     # The pairwise `init` fold allocates as Base does.
     reader = copy(vectorize(flat_init; batched = :theta, want = :loc, reuse = true))
     @test bytes(reader, thetas(4), rows(fill(1000, 8))) > 4 * 8 * 1000 * sizeof(Float64)
