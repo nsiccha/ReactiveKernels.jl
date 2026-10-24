@@ -118,6 +118,10 @@ The translation follows the [core constraints](constraints.md):
 
 The interface conventions:
 
+- **64-bit floats.** The module enables JAX's 64-bit mode on import
+  (`jax_enable_x64`), so its arithmetic is Julia's `Float64`. Import it before
+  creating arrays that should be 64-bit.
+
 - **Arrays keep Julia's dimension order.** A Julia `n × p` design matrix is an
   `(n, p)` array. Julia's broadcasting is kept by padding axes from known
   ranks, and `reshape` and `vec` stay column-major.
