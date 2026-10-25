@@ -112,8 +112,24 @@ end
         return logpdf(Normal(), v[1]) +
             sum(logpdf.(truncated.(Normal.(locs, 1.0), 0.0, Inf), exp.(v[2:6]))) + sum(v[2:6])
     end
+    # Positive families and `restricted` keep the original density, with the
+    # transform's Jacobian.
+    positive = quote
+        c ~ Normal(0, 1)
+        @plate for i in eachindex(mu)
+            e[i] .~ Exponential.(mu[i] .* exp(c))
+            r[i] .~ restricted.(Normal.(log.(mu[i]), 1.0), 0.0, Inf)
+        end
+    end
+    function positive_oracle(v)
+        flat = vcat(mu[1], mu[2])
+        e, r = exp.(v[2:6]), exp.(v[7:11])
+        return logpdf(Normal(), v[1]) + sum(logpdf.(Exponential.(flat .* exp(v[1])), e)) +
+            sum(logpdf.(Normal.(log.(flat), 1.0), r)) + sum(v[2:11])
+    end
     for (ast, oracle, u) in ((lognormal, lognormal_oracle, [0.2, -0.3, 0.1, 0.5, -0.2, 0.4, 0.0]),
-            (truncated_form, truncated_oracle, [0.3, 0.1, -0.5, 0.2, 0.4, -0.1]))
+            (truncated_form, truncated_oracle, [0.3, 0.1, -0.5, 0.2, 0.4, -0.1]),
+            (positive, positive_oracle, [0.1, 2.0, 2.5, 1.2, 1.8, 0.9, 2.2, 2.9, 1.6, 1.9, 1.1]))
         bound = bind_data(lower_rkppl(ast, (; mu)), (; mu))
         built = build_kernel(bound)
         @test length(coordinate_names(built.layout)) == length(u)
