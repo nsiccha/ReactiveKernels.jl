@@ -10,9 +10,53 @@ import ReactiveKernelsDistributionKernels
 const _CORPUS_DIR = joinpath(@__DIR__, "corpus")
 const _CORPUS_GOLDEN_DIR = joinpath(_CORPUS_DIR, "golden")
 
+# The fields each plan record's committed goldens print. A field outside its
+# record's list is printed only when it holds something, so a new optional
+# field leaves every golden unchanged until a model uses it (todo 1i2xafv).
+# A record without a list prints every field. "corpus field tables" checks
+# the lists against the records and the records the corpus plans hold.
+const _CORPUS_FIELDS = Dict{Type,Tuple{Vararg{Symbol}}}(
+    StructuralPlan => (:responses, :predictors, :population_priors, :parameters,
+        :assignments, :derived, :columns, :n_obs, :roles, :levelmaps,
+        :plate_parameters, :scans, :vector_parameters, :matrices, :array_parameters),
+    LikelihoodSpec => (:family, :link, :response, :predictor, :scale, :weights,
+        :evidence, :label, :trials, :range, :n_levels, :thresholds,
+        :extra_predictors, :count_columns, :ordinal_structure, :discrimination,
+        :threshold_columns, :threshold_coefs, :extra_responses, :factor_scales,
+        :factor_corr, :glm_alpha, :glm_beta, :mixture_family, :mixture_locs,
+        :mixture_scales, :mixture_weights, :nu, :zi, :mi_jobs, :interval),
+    ResponseEvidence => (:kind, :lower, :upper),
+    PredictorSpec => (:name, :link, :terms, :label),
+    TermSpec => (:kind, :columns, :options, :addressee, :label),
+    ScalePredictorRef => (:predictor, :link),
+    SampledParameter => (:name, :family, :args, :support_override, :label),
+    PlateParameter => (:name, :family, :args, :support_override, :range, :label),
+    VectorParameter => (:name, :family, :args, :size, :label),
+    ArrayParameter => (:name, :family, :args, :dims, :support_override, :label),
+    AssignmentSpec => (:name, :expr, :label),
+    VectorAssignmentSpec => (:name, :expr, :label),
+    DesignMatrix => (:name, :columns, :label),
+    LevelMap => (:predictor, :column, :values, :source, :subset),
+    MixtureComplementWeights => (:param, :param_first),
+    ScanSpec => (:states, :loopvar, :lo, :hi, :setup, :step, :maxlag, :label),
+    ScanSetup => (:target, :index, :kind, :family, :args, :expr),
+    ScanStep => (:kind, :target, :indexed, :family, :args, :expr),
+)
+
+# Whether an optional field holds anything: `nothing`, `missing`, an empty
+# collection and a record whose fields all hold nothing do not.
+function _corpus_carries(x)
+    (x === nothing || x === missing) && return false
+    x isa Union{AbstractArray,AbstractDict,AbstractSet,AbstractString,Tuple,NamedTuple} &&
+        return !isempty(x)
+    x isa Union{Symbol,Number,Char,Expr,GlobalRef,QuoteNode,Type,Function,Module} &&
+        return true
+    return nfields(x) == 0 || any(i -> _corpus_carries(getfield(x, i)), 1:nfields(x))
+end
+
 # Generic canonical serializer: fixed field order, sorted dict keys, no
-# line numbers, no memory addresses. New meaningful IR fields change the
-# output; empty optional metadata preserves existing snapshots.
+# line numbers, no memory addresses. Listed fields always print; any other
+# field prints once it holds something.
 function _canon(io::IO, x, depth::Int = 0, names = nothing)
     depth > 60 && (print(io, "<depth>"); return)
     if x === nothing || x === missing
@@ -88,29 +132,12 @@ function _canon(io::IO, x, depth::Int = 0, names = nothing)
         catch
             ()
         end
-        # Empty lexical metadata changes no existing corpus model. Nonempty
-        # scopes remain serialized and require their own reviewed goldens.
-        x isa StructuralPlan && isempty(x.submodel_scopes) &&
-            (fs = filter(!=(:submodel_scopes), fs))
-        x isa LikelihoodSpec && x.threshold_effects === nothing &&
-            (fs = filter(!=(:threshold_effects), fs))
-        x isa LikelihoodSpec && isempty(x.mixture_trials) &&
-            (fs = filter(!=(:mixture_trials), fs))
-        x isa StructuralPlan && isempty(x.conditioned) &&
-            (fs = filter(!=(:conditioned), fs))
-        x isa StructuralPlan && isempty(x.external_observations) &&
-            (fs = filter(!=(:external_observations), fs))
-        x isa StructuralPlan && isempty(x.cell_broadcasts) &&
-            (fs = filter(!=(:cell_broadcasts), fs))
-        x isa StructuralPlan && isempty(x.factors) &&
-            (fs = filter(!=(:factors), fs))
-        x isa StructuralPlan && isempty(x.cell_priors) &&
-            (fs = filter(!=(:cell_priors), fs))
-        x isa VectorParameter && x.extent_expr === nothing &&
-            (fs = filter(!=(:extent_expr), fs))
-        # A scan seed or step without a support override keeps its golden.
-        x isa Union{ScanSetup,ScanStep} && x.support === nothing &&
-            (fs = filter(!=(:support), fs))
+        record = typeof(x).name.wrapper
+        isempty(fs) || names === nothing || !haskey(names, :seen) ||
+            push!(names.seen, record)
+        listed = get(_CORPUS_FIELDS, record, nothing)
+        listed === nothing ||
+            (fs = filter(f -> f in listed || _corpus_carries(getfield(x, f)), fs))
         # Canonical mathematical plans compare loop/broadcast spellings.
         # Their indexing admission metadata is tested independently.
         x isa StructuralPlan &&
@@ -236,6 +263,32 @@ end
     @test !isempty(scanned.cell_priors)
     @test occursin("cell_priors=[" * repr(only(scanned.cell_priors)) * "]",
         sprint(_canon, scanned))
+
+    # A field outside its record's list (`frozen`) prints once it holds
+    # something; a listed field prints even when empty.
+    @test isempty(plain.frozen)
+    @test !occursin("frozen=", sprint(_canon, plain))
+    @test occursin("array_parameters=[]", sprint(_canon, plain))
+    held = ReactiveKernelsPPL._with(plain; frozen = FrozenValues((m = 1.5,), (;)))
+    @test occursin("frozen=FrozenValues(values=(m=1.5) inputs=())", sprint(_canon, held))
+end
+
+@testset "corpus field tables" begin
+    # Each list names fields its record declares, in declaration order.
+    for (record, listed) in _CORPUS_FIELDS
+        @test listed == filter(in(listed), fieldnames(record))
+    end
+    # Every record the corpus plans hold has a list, so a field added to any
+    # of them changes no golden until a model uses it.
+    seen = Set{Type}()
+    for path in filter(f -> endswith(f, ".jl"), readdir(_CORPUS_DIR; join = true))
+        ast, data = _load_corpus_case(path)
+        plan = lower_rkppl(ast, data; conditioned = data)
+        _canon(devnull, plan, 0,
+            (; authored = Set{Symbol}(), selected = Dict{Symbol,Int}(), seen))
+    end
+    @test StructuralPlan in seen
+    @test isempty(setdiff(seen, keys(_CORPUS_FIELDS)))
 end
 
 @testset "corpus private binder alpha equivalence" begin
