@@ -240,6 +240,10 @@ using ReactiveKernels: LogExpFunctions
     return LogExpFunctions.logsumexp(scores)
 end
 
+# A broadcast vector is materialized, so `logsumexp` itself reduces it.
+@kernel materialized_logsumexp(x::Vector{Float64}, scale::Float64) =
+    LogExpFunctions.logsumexp(scale .* x)
+
 # Another function that only shares the name is an ordinary consumer.
 module ShadowedFold
 using ReactiveKernels
