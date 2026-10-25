@@ -814,6 +814,9 @@ function _stack_restored_draws(values)
             _stack_restored_draws([draw[name] for draw in values])
         end
         return NamedTuple{names}(Tuple(columns))
+    elseif value isa AbstractVector && !(eltype(value) <: Number)
+        # One array per index (a dotted cell latent): stacked per index.
+        return [_stack_restored_draws([draw[k] for draw in values]) for k in eachindex(value)]
     elseif value isa AbstractVector
         return hcat([Vector{Float64}(draw) for draw in values]...)
     elseif value isa AbstractArray
@@ -825,7 +828,8 @@ end
 function _empty_restored_draws(value::NamedTuple)
     return map(_empty_restored_draws, value)
 end
-_empty_restored_draws(value::AbstractVector) = zeros(Float64, length(value), 0)
+_empty_restored_draws(value::AbstractVector) = eltype(value) <: Number ?
+    zeros(Float64, length(value), 0) : map(_empty_restored_draws, value)
 _empty_restored_draws(value::AbstractArray) = Array{Float64,ndims(value)}[]
 _empty_restored_draws(::Real) = Float64[]
 

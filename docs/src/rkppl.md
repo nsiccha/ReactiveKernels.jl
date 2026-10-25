@@ -1063,6 +1063,41 @@ MvNormal.(…)` is refused, because it would draw the vector law once per entry.
 Native values and ordinary Enzyme reverse gradients are supported. Predictive
 draws of these vectors are not built yet.
 
+### One latent array per index
+
+A dotted latent in a cell, `v[i] .~ D.(args…)` with `v` not data, holds at
+each index the broadcast of `D` over its arguments' values there, as the
+Julia loop does. That is one value per element of a per-index array whose
+length may vary by index, or a number at an index where the arguments are
+numbers:
+
+```julia
+# mu = [[10.0, 20.0, 5.0], [7.0, 3.0]]; obs and y hold one vector per index
+@plate for i in eachindex(total)
+    loc = log.(mu[i])
+    log_T[i] .~ Normal.(loc, 0.5)       # 3 values in cell 1, 2 in cell 2
+    T = exp.(log_T[i])
+    y[i] .~ Normal.(T[obs[i]], sigma)
+    total[i] ~ Normal(sum(T), 0.01 * total[i])
+end
+```
+
+Each element has the declaration's prior, with its transform and Jacobian
+(`LogNormal`, `Exponential` and `truncated` bounds shared by every index
+included). The arguments may read sampled values, as in
+`Normal.(log.(mu[i]) .+ b, s)`, but their shapes must follow from data:
+from data read per index, from cell locals computed from data, from scalar
+parameters and from the dotted arithmetic between them. A shared array
+argument gives every index its entries, and a matrix per index keeps its
+dimensions. Outside the plate, `log_T` holds one array per index.
+`coordinate_names` reads `log_T.1.1 … log_T.2.2` (index, then entry,
+column-major), `constrain` returns one array per index, and `unconstrain`
+and `restore_draws` take and give that shape. Arguments that are numbers at
+every index give one scalar per index, exactly as `v[i] ~ D(…)`. Dimensions
+that differ by index are valid but make the cells type unstable, so binding
+warns. Not built yet: an argument whose shape a call of sampled values
+decides, and such latents over `levels(…)`.
+
 ## Submodels
 
 `@rkppl name(args...) = begin … end` defines a reusable block. Using it,

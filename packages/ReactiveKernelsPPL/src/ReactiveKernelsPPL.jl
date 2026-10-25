@@ -109,6 +109,7 @@ include("distribution_defaults.jl")
 include("surface.jl")
 include("scan.jl")
 include("cell_scan.jl")
+include("cell_latent.jl")
 include("observed_scan.jl")
 
 include("precompile.jl")

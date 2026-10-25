@@ -1072,8 +1072,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     ast = Expr(:block, _expand_observed_scans(ast.args, data)...)
     ast = _observation_call_definitions(ast, data, mod)
     ast = _gathered_value_definitions(ast, data)
-    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts, cell_priors =
-        _partition_statements(ast, data; array_entries)
+    sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts,
+        cell_priors, cell_latents = _partition_statements(ast, data; array_entries)
     for name in conditioned
         any(f -> f.lhs === name, factors) && continue
         input = _conditioned_input(name)
@@ -1696,7 +1696,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
             if k in indexed_observations || k in indexed_external),
-        named_values, factors = factor_params, cell_priors)
+        named_values, factors = factor_params, cell_priors, cell_latents)
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -3435,8 +3435,9 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
     line = 0
     cell_broadcasts = Dict{Symbol,Vector{Symbol}}()
     cell_priors = Symbol[]
+    cell_latents = Dict{Symbol,Tuple{Symbol,Symbol}}()
     args, plate_ctx, plate_params = _expand_plates(ast.args, data;
-        broadcasts = cell_broadcasts, array_entries, cell_priors)
+        broadcasts = cell_broadcasts, array_entries, cell_priors, cell_latents)
     # Defined names, collected before lowering so the checks below admit
     # forward references. The scan never throws — the main loop below owns
     # every rejection.
@@ -3647,7 +3648,8 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
             _reject_statement(st)
         end
     end
-    return sample, factors, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts, cell_priors
+    return sample, factors, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts,
+        cell_priors, cell_latents
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
@@ -4135,7 +4137,8 @@ end
 function _expand_plates(args, data::Set{Symbol};
         broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         array_entries::Set{Symbol} = Set{Symbol}(),
-        cell_priors::Vector{Symbol} = Symbol[])
+        cell_priors::Vector{Symbol} = Symbol[],
+        cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}} = Dict{Symbol,Tuple{Symbol,Symbol}}())
     definitions = Dict{Symbol,Any}(arg.args[1] => arg.args[2] for arg in args
         if arg isa Expr && arg.head === :(=) && length(arg.args) == 2 &&
             arg.args[1] isa Symbol)
@@ -4166,7 +4169,11 @@ function _expand_plates(args, data::Set{Symbol};
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
+            latents, arg, sites = _expand_cell_array_latents(arg, taken,
+                _CellLatentScope(plate_data, definitions, _scalar_parameter_names(args)))
+            merge!(cell_latents, sites)
             prelude, arg, priors = _expand_stochastic_cell_scans(arg, taken)
+            prelude = vcat(latents, prelude)
             append!(expanded, prelude)
             append!(cell_priors, priors)
             for st in prelude
@@ -4340,8 +4347,9 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
     # array per index too: its outputs and locals are such values for
     # later plates and definitions.
     reads_arrays = _plate_reads_array_entries(cells, ivar, arrays)
-    # A cell `@scan` computes one trajectory per index.
-    scanned = any(_is_cell_scan_fold, cells)
+    # A cell `@scan` computes one trajectory per index, and a dotted array
+    # latent (`cell_latent.jl`) holds one array per index.
+    scanned = any(_is_cell_scan_fold, cells) || any(_is_cell_latent_block, cells)
     (reads_arrays || scanned) && union!(arrays, plate_defs)
     out = Expr[]
     ctx = Tuple{Symbol,Int,Set{Symbol}}[]
