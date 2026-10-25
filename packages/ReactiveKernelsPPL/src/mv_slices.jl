@@ -266,6 +266,45 @@ Cholesky factor. Native and compiled execution both check the covariance
 at runtime.
 """ _mvnormal_slices_logpdf
 
+# ── one observed vector per plate cell ───────────────────────────────
+
+# `y[i] ~ MvNormal(mu, Sigma)` in a `@plate` cell observes index `i`'s
+# vector jointly (`_mvnormal_plate_cell` routes it here as a `LogDensity`
+# law): the density of the one-vector declaration `b[1:K] ~ MvNormal(mu,
+# Sigma)`. An empty vector has density zero, as Distributions.jl gives.
+function _ppl_mvnormal_logdensity(x::AbstractVector, mu::AbstractVector,
+        Sigma::AbstractMatrix)
+    _check_observed_mvnormal("MvNormal", "covariance", x, mu, Sigma)
+    return _mvnormal_slices_logpdf(_SliceWhole(), x, mu, Sigma)
+end
+_ppl_mvnormal_logdensity(x, mu, Sigma) =
+    _observed_mvnormal_error("MvNormal", "covariance matrix", x, mu, Sigma)
+
+# `y[i] ~ MvNormalCholesky(mu, L)`: `L` the lower Cholesky factor of the
+# covariance (Stan's `multi_normal_cholesky`).
+function _ppl_mvnormal_cholesky_logdensity(x::AbstractVector, mu::AbstractVector,
+        F::AbstractMatrix)
+    _check_observed_mvnormal("MvNormalCholesky", "factor", x, mu, F)
+    return _mvnormal_cholesky_slices_logpdf(_SliceWhole(), x, mu, F)
+end
+_ppl_mvnormal_cholesky_logdensity(x, mu, F) =
+    _observed_mvnormal_error("MvNormalCholesky", "lower Cholesky factor", x, mu, F)
+
+function _check_observed_mvnormal(family, matrix, x, mu, S)
+    k = length(x)
+    length(mu) == k || throw(DimensionMismatch("$family observes a vector of " *
+        "length $k, but its mean has length $(length(mu))"))
+    size(S) == (k, k) || throw(DimensionMismatch("$family observes a vector of " *
+        "length $k, but its $matrix has size $(size(S))"))
+    return nothing
+end
+
+@noinline _observed_mvnormal_error(family, matrix, x, mu, S) =
+    throw(ArgumentError("$family observes one vector per cell from a mean " *
+        "vector and a $matrix; got an observation of type $(typeof(x)), a " *
+        "mean of type $(typeof(mu)) and a $matrix of type $(typeof(S)) " *
+        "(bind the response as one vector per index)"))
+
 # ── simplex and ordered slices (vectorized) ──────────────────────────
 
 @traceable function _dirichlet_slices_logpdf(o, B, alpha)

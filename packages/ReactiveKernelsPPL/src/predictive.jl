@@ -231,10 +231,11 @@ _ppl_predictive_unsupported(names::Tuple) = throw(ContractValidationError(
     "Binomial, …), plain, censored or truncated, observed through a flat, " *
     "ranged or in-cell plate. This program has no law to draw " *
     join(names, ", ") * " from. Not covered yet: densities that are not one " *
-    "such object (mixtures, hurdle models, Beta, …), caller-owned sampling " *
-    "laws (`LogDensity`), scalar `~` observations and conditioned " *
-    "declarations. Weighted, interval-censored and packed (`mi`) responses " *
-    "define no single draw"))
+    "such object (mixtures, hurdle models, Beta, …), joint multivariate " *
+    "observations (`MvNormal` / `MvNormalCholesky` vectors, in a `@plate` " *
+    "cell or whole), caller-owned sampling laws (`LogDensity`), scalar `~` " *
+    "observations and conditioned declarations. Weighted, interval-censored " *
+    "and packed (`mi`) responses define no single draw"))
 
 # ── Query surface ───────────────────────────────────────────────────────
 

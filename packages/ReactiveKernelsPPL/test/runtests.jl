@@ -151,6 +151,7 @@ const _PPL_TEST_FILES = (
     "test_qualified_submodels_reactant.jl",
     "test_plates.jl",
     "test_plate_categorical.jl",
+    "test_cell_mvnormal.jl",
     "test_indexed_response_families.jl",
     "test_multi_axes.jl",
     "test_latent_plate_axes.jl",
