@@ -332,6 +332,34 @@ end
     @test value ≈ reference(x, 0.8)
     @test grad ≈ sum(weights .* x)
 
+    # Tied cells share the derivative as `logsumexp`'s softmax does, on every
+    # LogExpFunctions version: the fold step keeps the difference at a finite
+    # tie, where `LogExpFunctions.logaddexp` returns (1, 0).
+    softmax_grad(x, scale) = scale .* exp.(scale .* x .- reference(x, scale))
+    materialized = prepare(N.materialized_logsumexp)
+    for tied in ([0.5, 0.5], [0.0, 0.0, 0.0], [1.0, -2.0, 1.0])
+        value, grad = ad_value_and_gradient(
+            prepare_ad(k, backend, tied, 0.8; active=:x), tied, 0.8)
+        @test value ≈ reference(tied, 0.8)
+        @test grad ≈ softmax_grad(tied, 0.8)
+        # LogExpFunctions keeps tie derivatives in `logsumexp` from 1.0.2
+        # (JuliaStats/LogExpFunctions.jl#129); 0.3 returns them to one element.
+        value, grad = ad_value_and_gradient(
+            prepare_ad(materialized, backend, tied, 0.8; active=:x), tied, 0.8)
+        @test value ≈ reference(tied, 0.8)
+        if pkgversion(N.LogExpFunctions) >= v"1.0.2"
+            @test grad ≈ softmax_grad(tied, 0.8)
+        else
+            @test_broken grad ≈ softmax_grad(tied, 0.8)
+        end
+    end
+    for (a, b) in ((0.3, 0.3), (0.3, -1.2), (-1.2, 0.3), (Inf, Inf), (-Inf, -Inf),
+                   (Inf, -Inf), (-Inf, Inf), (-Inf, 0.3), (0.3, Inf), (NaN, 0.3),
+                   (0.3, NaN), (NaN, Inf), (-Inf, NaN))
+        @test isequal(ReactiveKernels._tie_exact_logaddexp(a, b),
+                      N.LogExpFunctions.logaddexp(a, b))
+    end
+
     shadowed = prepare(N.ShadowedFold.shadowed_logsumexp)
     @test shadowed([0.3, -1.2, 2.5]) ≈ 2 * (0.3 - 1.2 + 2.5)
 end

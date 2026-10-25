@@ -14,7 +14,7 @@ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 [compat]
 DifferentiationInterface = "0.7"
 Enzyme = "0.13"
-LogExpFunctions = "0.3"
+LogExpFunctions = "0.3, 1.0.2"
 ReactiveKernels = "0.1"
 ReactantCore = "0.1"
 SpecialFunctions = "2"

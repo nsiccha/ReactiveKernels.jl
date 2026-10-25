@@ -381,6 +381,18 @@ and lock the one Reactant 0.2.289 lifted:
   adapter.
   PPL's bounded parameter transforms and `interval_bijector` call it; the
   natural `Poisson.(exp.(eta))` spelling is retained.
+- LogExpFunctions before 1.0.2 replaces the difference to a tied maximum by a
+  constant in `logsumexp`, so ordinary reverse mode gives the whole derivative
+  to one tied element: native Enzyme Reverse of `logsumexp([0.0, 0.0])` is
+  `[1, 0]` instead of the softmax `[1/2, 1/2]` with LogExpFunctions 0.3.29.
+  [LogExpFunctions #129](https://github.com/JuliaStats/LogExpFunctions.jl/pull/129)
+  keeps that difference in 1.0.2, and ReactiveKernels' compat admits 0.3 and
+  1.0.2 onward. An environment whose other packages hold LogExpFunctions at
+  0.3, such as StatsFuns before 2.1 or SpecialFunctions before 2.8, keeps the
+  old derivative of a direct `logsumexp` call. A plate read only by `logsumexp`
+  streams through RK's own fold step, which keeps the difference at a finite
+  tie and has the softmax derivative with either version.
+  `LogExpFunctions.logaddexp` still replaces it in 1.0.3.
 - Native Enzyme reverse mode fails static activity analysis
   (`EnzymeRuntimeActivityError`) when a non-inlined function returns a
   `Float64` array read from constant data, bare or inside a tuple, named
