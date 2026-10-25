@@ -206,11 +206,22 @@ _plate_empty_total(::Type{F}) where {F} = throw(ArgumentError(
     "zero. Declare the cell's result type, for example " *
     "`cell::Float64 = ...`, so that the empty total is its zero."))
 
+# `log(exp(x) + exp(y))` with the values of `LogExpFunctions.logaddexp`,
+# non-finite inputs included. Each arm is the smooth `x + log1pexp(y - x)` with
+# the larger argument outside `log1pexp`, so ordinary reverse mode returns the
+# exact gradient (1/2, 1/2) at a finite tie; `LogExpFunctions.logaddexp` zeroes
+# the difference at every tie and returns (1, 0). Only the infinite tie, whose
+# difference is NaN, returns the shared infinity.
+@inline _tie_exact_logaddexp(x, y) = x >= y ?
+    (isinf(x) & (x == y) ? x : x + log1pexp(y - x)) : y + log1pexp(x - y)
+
 # A plate whose only consumer is `LogExpFunctions.logsumexp` streams too: the
-# accumulator folds each cell into the running log-sum-exp with `logaddexp`,
-# starting from `-Inf`, the log-sum-exp of no cells. That left fold can differ
-# from `logsumexp` over the materialized vector by rounding only, as a
-# streamed sum does from Base's pairwise `sum`. The accumulator is the plain
+# accumulator folds each cell into the running log-sum-exp with
+# `_tie_exact_logaddexp`, starting from `-Inf`, the log-sum-exp of no cells.
+# That left fold can differ from `logsumexp` over the materialized vector by
+# rounding only, as a streamed sum does from Base's pairwise `sum`; at tied
+# cells its derivatives are those of `logsumexp` (the softmax), which
+# LogExpFunctions returns from 1.0.2. The accumulator is the plain
 # running value; only the cell loop adds to it, through the fold-aware
 # `_plate_total_add`. The SIMD and tiled reduction loops sum, so a plate with
 # another fold keeps the plain cell loop. The fold step stays out of line:
@@ -226,7 +237,7 @@ struct _PlateLogSumExpSeed{F} end
         _PlateLogSumExpSeed{_plate_fallback_eltype(fallback)}()
 
 @noinline _plate_total_add(::typeof(LogExpFunctions.logsumexp), total, cell) =
-    LogExpFunctions.logaddexp(total, cell)
+    _tie_exact_logaddexp(total, cell)
 @inline _plate_total_add(::typeof(LogExpFunctions.logsumexp),
                          ::_PlateLogSumExpSeed, cell) = cell
 

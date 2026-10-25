@@ -1397,7 +1397,8 @@ end
 # The pass is one history scan over the (step, state) cells: a cell reads the
 # previous step's K cells from the scan's own output, so no step allocates a
 # carried vector (docs/src/scan.md, "Reading earlier outputs"). A cell folds
-# its K predecessor terms pairwise with `_hmm_logaddexp`. When one predecessor
+# its K predecessor terms pairwise with ReactiveKernels' `_tie_exact_logaddexp`,
+# whose finite ties keep exact derivatives. When one predecessor
 # dominates by more than about 37 in log space, as between well-separated
 # states, each fold step costs one `exp`; a max-shifted `log(sum(exp(...)))`
 # costs K `exp`s and a `log` per cell, whatever the separation.
@@ -1407,21 +1408,12 @@ end
 _hmm_broadcasts(x, a, b, c) = ndims(x) <= 3 && size(x, 1) in (1, a) &&
     size(x, 2) in (1, b) && size(x, 3) in (1, c)
 
-# `log(exp(x) + exp(y))` with the values of `LogExpFunctions.logaddexp`,
-# non-finite inputs included. Each arm is the smooth `x + log1pexp(y - x)` with
-# the larger argument outside `log1pexp`, so ordinary reverse mode returns the
-# exact gradient (1/2, 1/2) at a finite tie; `LogExpFunctions.logaddexp` zeroes
-# the difference at every tie and returns (1, 0). Only the infinite tie, whose
-# difference is NaN, returns the shared infinity.
-@inline _hmm_logaddexp(x, y) = x >= y ?
-    (isinf(x) & (x == y) ? x : x + log1pexp(y - x)) : y + log1pexp(x - y)
-
 # The log of the weighted sum over the K predecessors of state j at `step`,
 # whose forward values start after `previous` in the history.
 @inline function _hmm_incoming(earlier, previous, log_transition, j, step, K)
     total = earlier[previous + 1] + _hmm_at(log_transition, 1, j, step)
     for i in 2:K
-        total = _hmm_logaddexp(total,
+        total = ReactiveKernels._tie_exact_logaddexp(total,
             earlier[previous + i] + _hmm_at(log_transition, i, j, step))
     end
     total
@@ -1429,7 +1421,7 @@ end
 @inline function _hmm_total(forward, offset, K)
     total = forward[offset + 1]
     for k in 2:K
-        total = _hmm_logaddexp(total, forward[offset + k])
+        total = ReactiveKernels._tie_exact_logaddexp(total, forward[offset + k])
     end
     total
 end
