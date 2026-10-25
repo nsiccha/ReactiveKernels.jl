@@ -771,6 +771,58 @@ end
                         Base.tail(args))
 end
 
+# Native matrix products.  Base's `*` of a matrix and a vector or matrix with
+# an operand that is not strided, such as a view of a lazily indexed vector,
+# runs LinearAlgebra's generic `mul!`.  On Julia 1.10 that method allocates
+# two 10 KB tile buffers per call, whatever the operand sizes, and it reaches
+# its kernel through a call native Enzyme reverse cannot resolve statically,
+# so the derivative runs through `runtime_generic_augfwd` and allocates the
+# tiles' shadows besides: one row of a 2-column random-effect block
+# (`z[r:r, :] * transpose(tau .* L)`, read from RKPPL's compact-cell overlay)
+# cost 88 KB and 48 µs per gradient (snag `compact-cell-gra-ebf0a114`).  The
+# native body calls this companion instead (`_kernel_native_calls`).  For two
+# operands built only from `Array`s (and `SubArray`, `ReshapedArray`,
+# `Adjoint` and `Transpose` wrappers of them, or another type that opts in
+# through `_native_mul_operand`), one of them not strided, with one-based axes
+# and isbits `Real` element types, it returns Base's result: a fresh `Matrix`
+# (or `Vector` for a vector right factor) of Base's element type, summed in the
+# generic method's order over the shared dimension (each product added in turn
+# to a zero start).  Every other operand list, including two strided operands
+# (which Base may send to BLAS), row vectors, structured and static matrices,
+# mismatched sizes and more than two factors, calls Base itself.
+@inline _native_mul_operand(::Array) = true
+@inline _native_mul_operand(
+    A::Union{SubArray,Base.ReshapedArray,LinearAlgebra.Adjoint,LinearAlgebra.Transpose}) =
+    _native_mul_operand(parent(A))
+@inline _native_mul_operand(_) = false
+
+@inline _native_mul_strided(::StridedVecOrMat) = true
+@inline _native_mul_strided(::LinearAlgebra.AdjOrTrans{<:Any,<:StridedVecOrMat}) = true
+@inline _native_mul_strided(_) = false
+
+@inline _native_mul(args...) = *(args...)
+@inline function _native_mul(A::AbstractMatrix{TA},
+                             B::AbstractVecOrMat{TB}) where {TA<:Real,TB<:Real}
+    isbitstype(TA) && isbitstype(TB) || return A * B
+    A isa LinearAlgebra.AdjOrTransAbsVec && return A * B
+    B isa LinearAlgebra.AdjOrTransAbsVec && return A * B
+    _native_mul_operand(A) && _native_mul_operand(B) || return A * B
+    _native_mul_strided(A) && _native_mul_strided(B) && return A * B
+    Base.has_offset_axes(A, B) && return A * B
+    size(A, 2) == size(B, 1) || return A * B
+    T = Base.promote_op(LinearAlgebra.matprod, TA, TB)
+    isbitstype(T) || return A * B
+    m, n = size(A)
+    C = B isa AbstractVector ? zeros(T, m) : zeros(T, m, size(B, 2))
+    @inbounds for j in 1:size(B, 2), k in 1:n
+        b = B[k, j]
+        for i in 1:m
+            C[i, j] += A[i, k] * b
+        end
+    end
+    C
+end
+
 # Nested dotted calls stay lazy so Julia's broadcast fusion survives the
 # tensorized lowering: only the OUTERMOST dotted call of a nest materializes
 # (via `_tensorized_broadcast` above) — with one exception

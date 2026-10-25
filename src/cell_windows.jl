@@ -307,10 +307,11 @@ function _cell_plate_form(r::Recipe)
     _CellForm(:pointwise, roles, gather_index, leaves, 0)
 end
 
-# `*` as the closure resolves it is Base's.
+# `*` as the closure resolves it is Base's, or the native body's companion
+# for it (`_native_mul`, core.jl).
 function _cell_base_product(callee, mod, params)
     callee isa GlobalRef && return isdefined(callee.mod, callee.name) &&
-        getglobal(callee.mod, callee.name) === Base.:*
+        getglobal(callee.mod, callee.name) in (Base.:*, _native_mul)
     callee === :* && !(callee in params) && mod isa Module || return false
     isdefined(mod, :*) && getglobal(mod, :*) === Base.:*
 end

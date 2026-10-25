@@ -153,6 +153,11 @@ end
     @test measured[1].view_bytes == measured[2].view_bytes
     @test all(m -> m.compact_value ≈ m.reference, measured)
     @test measured[2].compact_bytes <= measured[1].compact_bytes + 1024
+    # The group row of `R = Z * F'` reads `Z` through the compact overlay, which
+    # is not strided; RK's native product computes it with its own loop, where
+    # LinearAlgebra's generic `mul!` allocated 88 KB per gradient on
+    # Julia 1.10 (snag `compact-cell-gra-ebf0a114`).
+    @test all(m -> m.compact_bytes < 8_192, measured)
 end
 
 # BRM's NLME emission for a caller-provided scalar law: a kernel plate writes
