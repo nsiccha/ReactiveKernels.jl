@@ -22,6 +22,21 @@ end
     beta[1:ncoef] .~ Normal.(loc, scale)
     return X * beta
 end
+# The index is computed by a module call, so it is model-level.
+positions(x, lv) = Int[findfirst(==(v), lv) for v in x]
+const vcat_ = vcat
+# An intrinsic CAR field gathered per area: `phi_full` is per observation
+# (a data gather), and `effects[area]` gathers it by a model-level index.
+@rkppl field_effects(node1, node2, struct_pos, area, S) = begin
+    sigma ~ restricted(Normal(0.0, 1.0), 0.0, Inf)
+    phi[1:S] ~ ICAR(node1, node2)
+    cs = cumsum(vcat(0.0, phi))
+    phi_sum = cs[5] - cs[1]               # BRM's literal spelling for S = 4
+    phi_sum ~ Normal(0.0, 0.004)
+    phi_full = (vcat(phi, 0.0))[struct_pos]
+    effects = sigma .* phi_full
+    return effects[area]
+end
 end
 
 _wvg_rows(axis) = axis === :observations ? :(length(y)) : :(length(g))
@@ -155,5 +170,123 @@ _wvg_derived(fx) = Set(d.name for d in fx.bound.derived)
         named = Base.invokelatest(_wvg_native, fxs[:named], u, Val(:positional))
         @test inline.value == named.value
         @test inline.grad == named.grad
+    end
+end
+
+# A gather of a per-observation value by a model-level index (`effects[ar]`
+# with `ar` a module call's result) reads the gathered value whole, as the
+# same gather inside a module call does (`vcat(effects[ar])`): the named,
+# inline and positional spellings lower, as does a model-scope `vcat` of
+# such values that a cell reads (the shape BRM emits for two `car(...)`
+# terms, `u = vcat(u_a, u_b)`).
+function _wvg_field(spelling)
+    u = spelling === :model_scope ? (:(u = vcat(u_a, u_b)),) :
+        spelling === :renamed ? (:(u = vcat_(u_a, u_b)),) : ()
+    read = spelling === :in_cell ? :(vcat(u_a, u_b)[idx[i]]) : :(u[idx[i]])
+    return quote
+        area_a = positions(zone, [1, 2, 3, 4])
+        f_a ~ field_effects(node1, node2, struct_pos, area_a, 4)
+        u_a = f_a
+        area_b = positions(zone, [1, 2, 3, 4])
+        f_b ~ field_effects(node1, node2, struct_pos, area_b, 4)
+        u_b = f_b
+        sigma ~ Exponential(1.0)
+        $(u...)
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.($read, sigma)
+        end
+    end
+end
+
+_wvg_field_data() = Dict{Symbol,Any}(:zone => [2, 4, 1, 3], :node1 => [1, 2, 3],
+    :node2 => [2, 3, 4], :struct_pos => [1, 2, 3, 4],
+    :idx => [[1, 6], [3, 8, 2], [5, 4, 7]],
+    :y => [[0.2, -0.1], [0.5, 0.0, 0.3], [-0.4, 0.1, 0.6]])
+
+function _wvg_top(spelling)
+    body = spelling === :named ? (:(effects = s .* phi_full), :(ua = effects[ar])) :
+        spelling === :inline ? (:(ua = (s .* phi_full)[ar]),) :
+        (:(effects = s .* phi_full), :(t = effects[2]), :(ua = s .* phi .+ t))
+    return quote
+        s ~ Exponential(1.0)
+        phi[1:4] .~ Normal.(0, 1)
+        ar = positions(zone, [1, 2, 3, 4])
+        phi_full = (vcat(phi, 0.0))[struct_pos]
+        $(body...)
+        u = vcat(ua, ua)
+        sigma ~ Exponential(1.0)
+        @plate for i in eachindex(y)
+            y[i] .~ Normal.(u[idx[i]], sigma)
+        end
+    end
+end
+
+_wvg_cells(u, fx, sigma) = sum(sum(logpdf.(Normal.(u[ix], sigma), yi))
+    for (ix, yi) in zip(fx.data[:idx], fx.data[:y]))
+
+# Independent ICAR quadratic form, original Normal density of the
+# restricted scale, and the log Jacobians of the three `exp` transforms.
+function _wvg_oracle(fx, u, ::Val{:field})
+    nt = constrain(fx.built.layout, u)
+    d = fx.data
+    lv = [1, 2, 3, 4]
+    field(f) = f.sigma .* vcat(f.phi, 0.0)[d[:struct_pos]][indexin(d[:zone], lv)]
+    fprior(f) = logpdf(Normal(), f.sigma) - 0.5 * sum(abs2,
+        f.phi[d[:node1]] .- f.phi[d[:node2]]) + logpdf(Normal(0, 0.004), sum(f.phi))
+    values = vcat(field(nt.f_a), field(nt.f_b))
+    likelihood = _wvg_cells(values, fx, nt.sigma)
+    prior = fprior(nt.f_a) + fprior(nt.f_b) + logpdf(Exponential(1), nt.sigma)
+    jac = log(nt.f_a.sigma) + log(nt.f_b.sigma) + log(nt.sigma)
+    return (; likelihood, prior, posterior = likelihood + prior + jac)
+end
+
+_wvg_top_values(nt, pf, d, ::Val{:top}) = (nt.s .* pf)[indexin(d[:zone], [1, 2, 3, 4])]
+_wvg_top_values(nt, pf, d, ::Val{:positional_read}) = nt.s .* nt.phi .+ nt.s * pf[2]
+
+function _wvg_oracle(fx, u, kind::Union{Val{:top},Val{:positional_read}})
+    nt = constrain(fx.built.layout, u)
+    d = fx.data
+    ua = _wvg_top_values(nt, vcat(nt.phi, 0.0)[d[:struct_pos]], d, kind)
+    values = vcat(ua, ua)
+    likelihood = _wvg_cells(values, fx, nt.sigma)
+    prior = logpdf(Exponential(1), nt.s) + sum(logpdf.(Normal(), nt.phi)) +
+        logpdf(Exponential(1), nt.sigma)
+    return (; likelihood, prior,
+        posterior = likelihood + prior + log(nt.s) + log(nt.sigma))
+end
+
+@testset "whole-value gathers: a model-level index gathers a column whole" begin
+    @testset "two CAR fields concatenated at model scope" begin
+        data = _wvg_field_data()
+        before = deepcopy(data)
+        fxs = Dict(s => _wvg_build(_wvg_field(s), data)
+            for s in (:model_scope, :renamed, :in_cell))
+        names = coordinate_names(fxs[:in_cell].built.layout)
+        @test all(fx -> coordinate_names(fx.built.layout) == names, values(fxs))
+        for k in 1:2
+            u = [0.3 * sin(1.2i + k) for i in 1:length(names)]
+            r = Dict(s => Base.invokelatest(_wvg_native, fx, u, Val(:field))
+                for (s, fx) in fxs)
+            @test r[:model_scope].value == r[:in_cell].value == r[:renamed].value
+            @test r[:model_scope].grad == r[:in_cell].grad == r[:renamed].grad
+        end
+        @test data == before
+        # The group plate stays one retained plate as groups grow.
+        more = merge(data, Dict{Symbol,Any}(:idx => repeat(data[:idx], 4),
+            :y => repeat(data[:y], 4)))
+        grown = _wvg_build(_wvg_field(:model_scope), more)
+        structure(fx) = [(e.kind, e.depth) for e in recipe_inventory(fx.built.spec)
+            if e.kind !== :ordinary]
+        @test (:plate, 0) in structure(fxs[:model_scope])
+        @test structure(grown) == structure(fxs[:model_scope])
+        u = [0.3 * sin(1.2i) for i in 1:length(names)]
+        Base.invokelatest(_wvg_native, grown, u, Val(:field))
+    end
+    @testset "$spelling top-level gather" for spelling in (:named, :inline, :positional)
+        data = _wvg_field_data()
+        fx = _wvg_build(_wvg_top(spelling), data)
+        u = [0.3 * sin(1.2i) for i in 1:fx.built.layout.total]
+        Base.invokelatest(_wvg_native, fx, u, Val(spelling === :positional ?
+            :positional_read : :top))
     end
 end

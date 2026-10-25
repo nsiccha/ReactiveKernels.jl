@@ -3342,7 +3342,12 @@ function _collect_model_value_ref!(refs, ex::Expr, plan, label, bound::Bool)
     _collect_array_ref!(refs, ex, plan, label, bound;
         allow_gather=false) && return nothing
     obj = ex.args[1]
-    if !(bound && obj isa Symbol && haskey(plan.columns, obj))
+    if obj isa Symbol && _is_derived(plan, obj)
+        # A gather reads its gathered value whole, as a module call's
+        # argument does: `effects[k]` with a model-level index `k` is the
+        # same value as `vcat(effects[k])`, so naming it changes nothing.
+        push!(refs, obj)
+    elseif !(bound && obj isa Symbol && haskey(plan.columns, obj))
         _collect_assignment_refs!(refs, obj, plan, label, bound)
     end
     for i in ex.args[2:end]
