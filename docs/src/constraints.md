@@ -437,6 +437,19 @@ and lock the one Reactant 0.2.289 lifted:
   on Julia 1.12.7 and 1.13.1 with that Enzyme version; its pushforwards and
   the dataflow kernel's Hessian-vector products work. No activity configuration
   or derivative rule is involved.
+- On Julia 1.12.7 and 1.13.1, native Enzyme 0.13.216 forward mode over forward
+  mode returns NaN on some calls when the objective multiplies a constant
+  matrix by a view of the active vector; identical calls in one process
+  disagree. The single forward pass, the same nested call over a slice, and
+  every call on Julia 1.10.12 are exact:
+  `repro_enzyme_forward_over_forward_view_matvec.jl` reproduces it with Enzyme
+  only (Enzyme snag `nested-forward-o-9434176c`). `prepare_ad_third` runs
+  reverse over forward over forward, and RKPPL reads its coefficients as views
+  of the unconstrained vector, so its third-order derivatives of design-matrix
+  programs inherit the NaN there; the RKPPL tests record a NaN result on Julia
+  1.12 and later as broken and require every finite result to be exact.
+  Hessian-vector products (reverse over forward) are unaffected. No activity
+  configuration or derivative rule is involved.
 - On Julia 1.10, native Enzyme 0.13.210 reverse mode fails static activity
   analysis (`EnzymeRuntimeActivityError`) for an empty array when a function
   branches on the array's length and then allocates over it, for example

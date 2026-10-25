@@ -339,3 +339,134 @@ end
         false
     end
 end
+
+# Third-order directional derivatives `∇(vᵀ H v)` of the sampler preset over
+# design-matrix GLMs with grouped effects (the per-unit Laplace-marginal
+# gradient needs them). Reverse over forward over forward, with plain reverse
+# mode outermost. Oracles are analytic: with η = A u the linear predictor,
+# a Normal likelihood with log scale τ contributes, per observation,
+# Q = -e^{-2τ}(α² + 4ατ̇r + 2τ̇²r²) to vᵀ H v (α = aᵀv, r = y - η, τ̇ the
+# direction's τ entry), and a Poisson-log one -e^η α².
+const _QD_THIRD_ORDER = SecondOrder(_QD_SECOND_ORDER, _QD_FORWARD)
+const _QD_X = hcat(ones(length(_QD_G)), [0.3 * sin(i) for i in eachindex(_QD_G)],
+    [0.2 * cos(2i) for i in eachindex(_QD_G)])
+const _QD_COUNTS = [mod(i, 4) for i in eachindex(_QD_G)]
+
+const _QD_NORMAL_GLM = quote
+    beta[axes(X, 2)] .~ Normal.(0, 1)
+    eta[levels(g)] .~ Normal.(0, 1)
+    sigma ~ Exponential(1)
+    y .~ Normal.(X * beta .+ eta[g], sigma)
+end
+
+# The NormalIDGLM family evaluates its density through the authored
+# `normal_id_glm_lpdf` derivative rule.
+const _QD_NORMAL_RULE = quote
+    alpha ~ Normal(0, 1)
+    beta[axes(X, 2)] .~ Normal.(0, 1)
+    sigma ~ Exponential(1)
+    y ~ NormalIDGLM(X, alpha, beta, sigma)
+end
+
+const _QD_POISSON_GLM = quote
+    beta[axes(X, 2)] .~ Normal.(0, 1)
+    eta[levels(g)] .~ Normal.(0, 1)
+    y .~ PoissonLog.(X * beta .+ eta[g])
+end
+
+# Rows a_i of the linear predictor η = A u.
+function _qd_predictor_map(layout; grouped, intercept = false)
+    A = zeros(length(_QD_G), layout.total)
+    for j in axes(_QD_X, 2)
+        A[:, _qd_index(layout, Symbol("beta.", j))] .= _QD_X[:, j]
+    end
+    intercept && (A[:, _qd_index(layout, :alpha)] .= 1.0)
+    if grouped
+        for (i, group) in enumerate(_QD_G)
+            A[i, _qd_index(layout, Symbol("eta.", group))] = 1.0
+        end
+    end
+    return A
+end
+
+# Sampler preset: Normal likelihood, Exponential(1) scale with its log
+# Jacobian, Normal(0, 1) coefficients (quadratic, so no third derivative).
+function _qd_normal_third(layout, A, u, v)
+    it = _qd_index(layout, :sigma)
+    tau, vt = u[it], v[it]
+    s = exp(-2tau)
+    r = _QD_Y .- A * u
+    alpha = A * v
+    third = A' * (s .* (4 .* alpha .* vt .+ 4 .* vt^2 .* r))
+    third[it] = sum(2s .* (alpha .^ 2 .+ 4 .* alpha .* vt .* r .+ 2 .* vt^2 .* r .^ 2)) -
+        exp(tau) * vt^2
+    return third
+end
+
+_qd_poisson_third(A, u, v) = -(A' * (exp.(A * u) .* (A * v) .^ 2))
+
+# On Julia 1.12 and 1.13, registered Enzyme 0.13.216 returns NaN on some calls
+# of forward over forward through a constant matrix times a view of the active
+# vector, which is how an RKPPL design matrix reads its coefficients (Enzyme
+# snag `nested-forward-o-9434176c`,
+# `benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`). There a NaN
+# result is recorded as broken; every finite result must still be exact.
+function _qd_test_third(result, expected)
+    if VERSION >= v"1.12" && (any(isnan, result) || any(isnan, expected))
+        @test_broken all(isfinite, result) && all(isfinite, expected)
+    else
+        @test result ≈ expected rtol = 1e-10
+    end
+end
+
+@testset "query third-order derivatives of design-matrix GLMs" begin
+    cases = (
+        (_QD_NORMAL_GLM, Dict(:y => _QD_Y, :X => _QD_X, :g => _QD_G),
+            (; grouped = true), :normal),
+        (_QD_NORMAL_RULE, Dict(:y => _QD_Y, :X => _QD_X),
+            (; grouped = false, intercept = true), :normal),
+        (_QD_POISSON_GLM, Dict(:y => _QD_COUNTS, :X => _QD_X, :g => _QD_G),
+            (; grouped = true), :poisson))
+    for (ast, data, map_options, family) in cases
+        fx = _qd_build(ast, data)
+        layout = fx.built.layout
+        d = layout.total
+        A = _qd_predictor_map(layout; map_options...)
+        oracle(u, v) = family === :normal ? _qd_normal_third(layout, A, u, v) :
+            _qd_poisson_third(A, u, v)
+        q = prepare_query_ad(prepare_ad_third, fx.built, fx.bound, :sampler,
+            _QD_THIRD_ORDER, ([sin(i) for i in 1:d],), zeros(d))
+        @test q isa QueryAD
+        for trial in 1:2
+            u = [0.15 * cos(i + trial) for i in 1:d]
+            v = [sin(i * trial) for i in 1:d]
+            _qd_test_third(only(ad_third(q, (v,), u)), oracle(u, v))
+
+            gradient, (hv,), (third,) = ad_gradient_hvp_and_third(q, (v,), u)
+            sampler = prepare_sampler(fx.built, fx.bound, u; backend = _QD_REVERSE)
+            @test gradient ≈ last(sampler_value_and_gradient!(sampler, similar(u), u))
+            hvp = prepare_query_ad(prepare_ad_hvp, fx.built, fx.bound, :sampler,
+                _QD_SECOND_ORDER, (v,), u)
+            @test hv ≈ only(ad_hvp(hvp, (v,), u))
+            _qd_test_third(third, oracle(u, v))
+            results = (similar(u),)
+            @test ad_third!(q, results, (v,), u) === results
+            _qd_test_third(only(results), oracle(u, v))
+        end
+
+        # One direction summed over every unit's effects returns the sum of
+        # the units' own contractions: units never interact.
+        map_options.grouped || continue
+        u = [0.15 * cos(i + 7) for i in 1:d]
+        effects = _qd_effects(layout)
+        weights = [0.5 + 0.1j for j in eachindex(effects)]
+        colored = zeros(d)
+        colored[effects] .= weights
+        parts = map(eachindex(effects)) do j
+            e = zeros(d)
+            e[effects[j]] = weights[j]
+            only(ad_third(q, (e,), u))
+        end
+        _qd_test_third(only(ad_third(q, (colored,), u)), sum(parts))
+    end
+end
