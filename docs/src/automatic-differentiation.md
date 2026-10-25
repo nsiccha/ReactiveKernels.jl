@@ -193,6 +193,56 @@ Hessian-vector products fail Enzyme's static activity analysis, so take them
 from the dataflow kernel. Reactant-compiled pushforwards and Hessian-vector
 products are not provided; these operators run natively.
 
+### Third-order directional derivatives
+
+`prepare_ad_third` prepares, per direction `v`, the gradient of the Hessian
+quadratic form, `∇(vᵀ H v) = D³f[v, v, ·]`, a vector shaped like the active
+point. The gradient of a Laplace-approximate marginal needs these
+contractions: the derivative of `log det(-H)` is a sum of them over the
+columns of an inverse Cholesky factor. It is the Hessian-vector product of
+the directional derivative `x -> Df(x)[v]`, so its backend is
+`SecondOrder(hvp_backend, pushforward_backend)`, and reverse over forward over
+forward extends the reverse-over-forward composition above by one forward
+layer:
+
+```julia
+third_order = SecondOrder(second_order, AutoEnzyme(; mode = Enzyme.Forward))
+third = prepare_ad_third(tangent_density, third_order, (v,), parameters, 0.7;
+                         data, active = :q, want = :density)
+(tv,) = ad_third(third, (v,), parameters, 0.7; data)
+gradient, (hv,), (tv,) = ad_gradient_hvp_and_third(third, (v,), parameters, 0.7;
+                                                    data)
+```
+
+Each direction costs one reverse sweep over a doubly forward-differentiated
+primal. The outermost pass is plain reverse mode, so objectives that multiply
+a constant matrix by the active vector differentiate, and so do the RK
+derivative rules the primal calls (such as the Normal identity-link GLM
+density). `ad_gradient_hvp_and_third` also returns the gradient, from one
+reverse sweep, and the Hessian-vector products, from the Hessian-vector
+backend, at the same point. `ad_third!` and `ad_gradient_hvp_and_third!`
+write into caller-owned destinations, one array per direction.
+
+Colored directions compress third-order contractions as they compress
+Hessians: when active coordinates fall into groups that never interact, a
+direction summed across groups, `v = Σᵢ vᵢ`, returns `Σᵢ D³f[vᵢ, vᵢ, ·]`,
+because every cross term `D³f[vᵢ, vⱼ, ·]` vanishes. A population with `K`
+effects per subject therefore needs `K` directions for every subject's
+contraction, whatever the number of subjects. A bilinear contraction follows
+by polarization, `D³f[w, v, ·] = (D³f[w + v, w + v, ·] - D³f[w - v, w - v, ·]) / 4`.
+The tuple-selector, non-allocating and Reactant boundaries of Hessian-vector
+products apply unchanged: on Julia 1.10 a `NonAllocatingKernel`'s third-order
+derivatives fail Enzyme's static activity analysis, as its Hessian-vector
+products do.
+
+On Julia 1.12 and 1.13, Enzyme 0.13.216's forward mode over forward mode
+returns NaN on some calls when the objective multiplies a constant matrix by a
+view of the active vector, and identical calls disagree
+(`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`, Enzyme only).
+An RKPPL design matrix reads its coefficients that way, so its third-order
+derivatives can be NaN there; on Julia 1.10 every call is exact. The section
+on current backend limitations in `constraints.md` tracks it.
+
 ## Freeze data-only work during preparation
 
 When data stay fixed across many derivative calls, pass them in the named

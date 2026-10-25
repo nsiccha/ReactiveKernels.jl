@@ -464,8 +464,9 @@ program, plus the program's [`LayoutTable`](@ref). Construct one with
 place of the prepared operator, with the unconstrained vector as the one
 argument: `ad_gradient(q, u)`, `ad_value_and_gradient!(q, g, u)`,
 `ad_pullback(q, seed, u)`, `ad_pushforward(q, tangents, u)`,
-`ad_hvp(q, tangents, u)`, `ad_gradient_and_hvp(q, tangents, u)` and their
-other value/in-place forms. Each call carries the `Base.invokelatest` barrier
+`ad_hvp(q, tangents, u)`, `ad_gradient_and_hvp(q, tangents, u)`,
+`ad_third(q, tangents, u)`, `ad_gradient_hvp_and_third(q, tangents, u)` and
+their other value/in-place forms. Each call carries the `Base.invokelatest` barrier
 the query's build-time code needs, so they are safe from compiled callers.
 Not thread-safe (one per caller); not traceable by Reactant.
 """
@@ -482,7 +483,8 @@ Prepare a ReactiveKernels derivative operator over the query
 [`prepare_query`](@ref)`(built, plan, preset)`, differentiating with respect
 to the whole unconstrained vector. `prepare_operator` is the ReactiveKernels
 preparation to apply — `prepare_ad`, `prepare_ad_pullback`,
-`prepare_ad_pushforward` or `prepare_ad_hvp` — and `exemplars` are that
+`prepare_ad_pushforward`, `prepare_ad_hvp` or `prepare_ad_third` — and
+`exemplars` are that
 function's arguments after its backend, ending with an unconstrained exemplar
 `u0` of length `layout.total`:
 
@@ -495,14 +497,19 @@ gradient, (hv,) = ad_gradient_and_hvp(q, (v,), u)
 j = prepare_query_ad(prepare_ad_pushforward, built, plan, :observations,
                      AutoEnzyme(; mode = Enzyme.Forward), (v,), u0)
 observations, (jv,) = ad_value_and_pushforward(j, (v,), u)
+
+third_order = SecondOrder(second_order, AutoEnzyme(; mode = Enzyme.Forward))
+t = prepare_query_ad(prepare_ad_third, built, plan, :sampler, third_order, (v,), u0)
+gradient, (hv,), (tv,) = ad_gradient_hvp_and_third(t, (v,), u)  # tv = ∇(vᵀ H v)
 ```
 
-Gradients and Hessian-vector products need a scalar preset (`:sampler`,
-`:likelihood`, `:prior`, `:log_jacobian`); pullbacks and pushforwards also
-accept `:pointwise` and `:observations`. Directions with disjoint supports
-over `coordinate_names(built.layout)` compress block-structured Jacobians and
-Hessians (see `ReactiveKernels.prepare_ad_hvp`). The backend's packages must be
-loaded in the calling session.
+Gradients, Hessian-vector products and third-order derivatives need a scalar
+preset (`:sampler`, `:likelihood`, `:prior`, `:log_jacobian`); pullbacks and
+pushforwards also accept `:pointwise` and `:observations`. Directions with
+disjoint supports over `coordinate_names(built.layout)` compress
+block-structured Jacobians, Hessians and third-order contractions (see
+`ReactiveKernels.prepare_ad_hvp` and `ReactiveKernels.prepare_ad_third`). The
+backend's packages must be loaded in the calling session.
 """
 function prepare_query_ad(prepare_operator, built, plan::StructuralPlan,
         preset::Symbol, backend, exemplars...; on_error = nothing)
@@ -523,7 +530,9 @@ end
 for verb in (:ad_gradient, :ad_value_and_gradient, :ad_value_and_gradient!,
         :ad_pullback, :ad_value_and_pullback, :ad_value_and_pullback!,
         :ad_pushforward, :ad_value_and_pushforward,
-        :ad_hvp, :ad_hvp!, :ad_gradient_and_hvp, :ad_gradient_and_hvp!)
+        :ad_hvp, :ad_hvp!, :ad_gradient_and_hvp, :ad_gradient_and_hvp!,
+        :ad_third, :ad_third!, :ad_gradient_hvp_and_third,
+        :ad_gradient_hvp_and_third!)
     @eval ReactiveKernels.$verb(q::QueryAD, args...) =
         Base.invokelatest(_query_ad_call, ReactiveKernels.$verb, q, args...)
 end

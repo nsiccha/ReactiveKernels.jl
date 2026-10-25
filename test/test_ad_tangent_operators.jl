@@ -28,7 +28,15 @@ end
     density::Float64 = sum(exp.(z[:, 1] .+ w .* z[:, 2])) - 0.5 * sum(abs2, z)
 end
 
+# A design-matrix product with nonzero third derivatives.
+@kernel tangent_exp_design(beta::Vector{Float64}; X::Matrix{Float64}) = begin
+    density::Float64 = sum(exp.(X * beta)) - 0.5 * sum(abs2, X * beta)
+end
+
 _tangent_hessian(q, s, data) = Diagonal(data .* s^2 .* exp.(s .* q)) - I
+# ∇(vᵀ H v) of `tangent_density` in `q`, and of `tangent_exp_design`.
+_tangent_third(q, s, data, v) = data .* s^3 .* exp.(s .* q) .* v .^ 2
+_tangent_design_third(X, beta, v) = X' * (exp.(X * beta) .* (X * v) .^ 2)
 _tangent_jacobian(q, s, data) = Diagonal(data .* s .* exp.(s .* q))
 _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
 
@@ -189,6 +197,128 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
             nameof(typeof(error)) === :EnzymeRuntimeActivityError || rethrow()
             false
         end
+    end
+
+    # Reverse over forward over forward: the Hessian-vector product of the
+    # directional derivative `x -> Df(x)[v]` is `∇(vᵀ H v) = D³f[v, v, ·]`.
+    third_order = SecondOrder(second_order, forward)
+
+    @testset "third-order directional derivatives rebind constants per call" begin
+        prepared = prepare_ad_third(tangent_density, third_order, (v,), q, s;
+                                    data, active = :q, want = :density)
+        @test prepared isa PreparedADThird
+        @test prepared isa PreparedADOperator
+        @test inputs(prepared) == inputs(tangent_density)
+        @test occursin("PreparedADThird(active=:q, want=:density",
+                       sprint(show, prepared))
+        @test only(ad_third(prepared, (v,), q, s; data)) ≈
+              _tangent_third(q, s, data, v)
+        for (newq, news, newdata) in (([0.1, 0.0, -0.1], 1.1, [1.0, 2.0, 3.0]),
+                                      ([-0.5, 0.4, 0.3], 0.2, [0.5, 0.5, -4.0]))
+            w = [-1.0, 2.0, 0.25]
+            @test only(ad_third(prepared, (w,), newq, news; data = newdata)) ≈
+                  _tangent_third(newq, news, newdata, w)
+        end
+
+        gradient, hvps, thirds = ad_gradient_hvp_and_third(
+            prepared, (v,), q, s; data)
+        @test gradient ≈ data .* s .* exp.(s .* q) .- q
+        @test only(hvps) ≈ _tangent_hessian(q, s, data) * v
+        @test only(thirds) ≈ _tangent_third(q, s, data, v)
+
+        results = (similar(q),)
+        @test ad_third!(prepared, results, (2v,), q, s; data) === results
+        @test only(results) ≈ 4 * _tangent_third(q, s, data, v)
+        gradient_buffer, hvp_buffers, third_buffers =
+            similar(q), (similar(q),), (similar(q),)
+        returned = ad_gradient_hvp_and_third!(
+            prepared, gradient_buffer, hvp_buffers, third_buffers, (v,), q, s;
+            data)
+        @test returned[1] === gradient_buffer
+        @test returned[2] === hvp_buffers && returned[3] === third_buffers
+        @test gradient_buffer ≈ gradient
+        @test only(hvp_buffers) ≈ only(hvps)
+        @test only(third_buffers) ≈ only(thirds)
+        @test_throws DimensionMismatch ad_third!(
+            prepared, (similar(q), similar(q)), (v,), q, s; data)
+    end
+
+    @testset "third-order: batched directions, bound and low-level preparations" begin
+        units = ntuple(i -> _tangent_unit(3, i), 3)
+        batched = prepare_ad_third(tangent_density, third_order, units, q, s;
+                                   data, active = :q, want = :density)
+        for (unit, third) in zip(units, ad_third(batched, units, q, s; data))
+            @test third ≈ _tangent_third(q, s, data, unit)
+        end
+
+        bound = prepare_ad_third(tangent_density, third_order, (v,), q, s;
+                                 active = :q, want = :density,
+                                 bound = (; data))
+        @test only(ad_third(bound, (v,), q, s)) ≈ _tangent_third(q, s, data, v)
+
+        low_level = prepare(plan(tangent_density; want = :density))
+        direct = prepare_ad_third(low_level, third_order, (v,), q, s, data;
+                                  active = :q)
+        @test only(ad_third(direct, (v,), q, s, data)) ≈
+              _tangent_third(q, s, data, v)
+    end
+
+    @testset "third-order derivatives of a constant-matrix product" begin
+        # The design matrix multiplies the active vector; the outermost pass
+        # is plain reverse mode with no activity annotation.
+        X = [1.0 0.5 0.0; 1.0 0.0 0.5; 1.0 1.0 1.0; 1.0 -1.0 2.0]
+        beta = [0.1, 0.2, -0.3]
+        unbound = prepare_ad_third(tangent_exp_design, third_order, (v,), beta;
+                                   X, active = :beta, want = :density)
+        bound = prepare_ad_third(tangent_exp_design, third_order, (v,), beta;
+                                 active = :beta, want = :density,
+                                 bound = (; X))
+        for w in (v, [0.3, -1.0, 0.7])
+            @test only(ad_third(unbound, (w,), beta; X)) ≈
+                  _tangent_design_third(X, beta, w)
+            @test only(ad_third(bound, (w,), beta)) ≈
+                  _tangent_design_third(X, beta, w)
+        end
+    end
+
+    @testset "third-order contractions from colored directions" begin
+        # Groups never interact, so a direction summed across groups returns
+        # the sum of every group's own contraction.
+        groups = 5
+        z = [0.1 * sin(i + j) for i in 1:groups, j in 1:2]
+        w = [0.3 * i for i in 1:groups]
+        colors = ntuple(j -> (seed = zeros(groups, 2); seed[:, j] .= 1.0; seed), 2)
+        prepared = prepare_ad_third(tangent_groups, third_order, colors, z;
+                                    w, active = :z, want = :density)
+        compressed = ad_third(prepared, colors, z; w)
+        for group in 1:groups, j in 1:2
+            e = exp(z[group, 1] + w[group] * z[group, 2])
+            a = j == 1 ? 1.0 : w[group]
+            @test compressed[j][group, 1] ≈ e * a^2
+            @test compressed[j][group, 2] ≈ e * a^2 * w[group]
+        end
+    end
+
+    @testset "third-order backend, tangent and WANT checks" begin
+        # The backend nests a Hessian-vector backend over a pushforward one.
+        for backend in (second_order, forward,
+                        SecondOrder(forward, second_order))
+            @test_throws ArgumentError prepare_ad_third(
+                tangent_density, backend, (v,), q, s;
+                data, active = :q, want = :density)
+        end
+        @test_throws ArgumentError prepare_ad_third(
+            tangent_density, third_order, v, q, s;
+            data, active = :q, want = :density)
+        @test_throws ArgumentError prepare_ad_third(
+            tangent_density, third_order, ([1.0, 2.0],), q, s;
+            data, active = :q, want = :density)
+        prepared = prepare_ad_third(tangent_density, third_order, (v,), q, s;
+                                    data, active = :q, want = :density)
+        @test_throws ArgumentError ad_third(prepared, ([1.0],), q, s; data)
+        @test_throws ArgumentError prepare_ad_third(
+            tangent_mean, third_order, (v,), q, s;
+            data, active = :q, want = :mean)
     end
 
     # DifferentiationInterface 0.7.21 cannot take a Hessian-vector product at

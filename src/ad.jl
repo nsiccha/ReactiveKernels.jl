@@ -5,7 +5,8 @@ One prepared DifferentiationInterface operator over a ReactiveKernels
 boundary. The last parameter `O` names the operator: `:gradient`
 ([`PreparedADKernel`](@ref)),
 `:pullback` ([`PreparedADPullback`](@ref)), `:pushforward`
-([`PreparedADPushforward`](@ref)) or `:hvp` ([`PreparedADHVP`](@ref)). Every
+([`PreparedADPushforward`](@ref)), `:hvp` ([`PreparedADHVP`](@ref)) or
+`:third` ([`PreparedADThird`](@ref)). Every
 operator shares the same boundary: one selected HAVE port or ordered tuple of
 ports is active, every other selected HAVE is rebound on each call as a
 `DifferentiationInterface.Constant` context, and the differentiated callable
@@ -81,6 +82,22 @@ Like [`PreparedADKernel`](@ref), the stored differentiation preparation is
 mutable and not thread-safe. Prepare one object per concurrent caller.
 """
 const PreparedADHVP{I,K,R,F,B,P,E} = PreparedADOperator{I,K,R,F,B,P,E,:hvp}
+
+"""
+    PreparedADThird
+
+A prepared third-order directional derivative of one explicit scalar
+ReactiveKernels WANT port: for each input tangent `v`, the gradient of the
+Hessian quadratic form, `∇(vᵀ H v)`, i.e. the contraction `D³f[v, v, ·]`.
+Construct one with [`prepare_ad_third`](@ref), providing a tuple of input
+tangent exemplars. Calls evaluate one such vector per tangent with
+[`ad_third`](@ref), [`ad_third!`](@ref) or
+[`ad_gradient_hvp_and_third`](@ref).
+
+Like [`PreparedADKernel`](@ref), the stored differentiation preparation is
+mutable and not thread-safe. Prepare one object per concurrent caller.
+"""
+const PreparedADThird{I,K,R,F,B,P,E} = PreparedADOperator{I,K,R,F,B,P,E,:third}
 
 # Same statically-untraced contract as `PreparedKernel` (codegen.jl): this
 # object is captured by the `@trace` loop in `_replica_ad_call`, and its
@@ -1324,6 +1341,7 @@ end
 # any WANT. `seeds` is DI's direction tuple (empty for a gradient).
 _ad_operator_scalar_output(::Val{:gradient}) = true
 _ad_operator_scalar_output(::Val{:hvp}) = true
+_ad_operator_scalar_output(::Val{:third}) = true
 _ad_operator_scalar_output(::Val{:pullback}) = false
 _ad_operator_scalar_output(::Val{:pushforward}) = false
 
@@ -1335,6 +1353,70 @@ _ad_operator_preparation(::Val{:pushforward}, call, backend, point, seeds, conte
     DifferentiationInterface.prepare_pushforward(call, backend, point, seeds, contexts...)
 _ad_operator_preparation(::Val{:hvp}, call, backend, point, seeds, contexts) =
     DifferentiationInterface.prepare_hvp(call, backend, point, seeds, contexts...)
+
+# A third-order operator is the Hessian-vector product of the directional
+# derivative `x -> Df(x)[v]` in the same direction `v`: its gradient is
+# `∇(vᵀ H v) = D³f[v, v, ·]`. The backend is
+# `SecondOrder(hvp_backend, pushforward_backend)`: the Hessian-vector backend
+# differentiates the pushforward backend's directional derivative, so reverse
+# over forward over forward is
+# `SecondOrder(SecondOrder(reverse, forward), forward)`. One preparation serves
+# every direction, which crosses as the directional derivative's `Constant`
+# context. The gradient and the Hessian-vector products of the combined verb
+# take the outermost and the Hessian-vector backends on the kernel call.
+function _ad_operator_preparation(::Val{:third}, call, backend, point, seeds,
+                                  contexts)
+    hvp_backend = backend.outer
+    direction = _ADDirectionalDerivative(call, backend.inner, contexts)
+    seed = first(seeds)
+    (; direction,
+     third = DifferentiationInterface.prepare_hvp(
+         direction, hvp_backend, point, (seed,),
+         DifferentiationInterface.Constant(seed), contexts...),
+     hvp = DifferentiationInterface.prepare_hvp(
+         call, hvp_backend, point, seeds, contexts...),
+     gradient = DifferentiationInterface.prepare_gradient(
+         call, hvp_backend.outer, point, contexts...))
+end
+
+# `x -> Df(x)[v]`, the scalar pushforward of the kernel call along `v`.
+# DifferentiationInterface hands a differentiated function its contexts
+# unwrapped, so the call wraps each again in its original context type
+# (`Constant`, or a non-allocating kernel's `Cache`) before the pushforward.
+# `C` is the type of the contexts it was built from.
+struct _ADDirectionalDerivative{C,F,B}
+    call::F
+    backend::B
+end
+
+_ADDirectionalDerivative(call, backend, contexts::Tuple) =
+    _ADDirectionalDerivative{typeof(contexts),typeof(call),typeof(backend)}(
+        call, backend)
+
+@generated function (derivative::_ADDirectionalDerivative{C})(
+        point, direction, contexts::Vararg{Any,N}) where {C,N}
+    fieldcount(C) == N || return :(throw(ArgumentError(
+        "the directional derivative was prepared with $(fieldcount(C)) " *
+        "contexts; got $N")))
+    wrapped = [:($(Base.typename(fieldtype(C, index)).wrapper)(
+                   getfield(contexts, $index))) for index in 1:N]
+    :(only(DifferentiationInterface.pushforward(
+        derivative.call, derivative.backend, point, (direction,), $(wrapped...))))
+end
+
+# The third-order backend's shape, checked before anything is prepared.
+function _ad_check_third_backend(backend::DifferentiationInterface.AbstractADType)
+    backend isa DifferentiationInterface.SecondOrder &&
+        backend.outer isa DifferentiationInterface.SecondOrder ||
+        throw(ArgumentError(
+            "a third-order derivative takes `SecondOrder(hvp_backend, " *
+            "pushforward_backend)`, with `hvp_backend` itself a SecondOrder, " *
+            "e.g. SecondOrder(SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse), " *
+            "AutoEnzyme(; mode = Enzyme.Forward)), AutoEnzyme(; mode = " *
+            "Enzyme.Forward)) for reverse over forward over forward; got " *
+            "$backend"))
+    backend
+end
 
 # Input tangents of a pushforward or Hessian-vector product are DI's direction
 # tuple: one entry per direction, each shaped like the active point (a tuple of
@@ -2212,6 +2294,173 @@ function ad_gradient_and_hvp!(prepared::PreparedADHVP, gradient,
 end
 
 """
+    prepare_ad_third(spec, backend, tangents, args...;
+                     active, want, bound=(;), kwargs...) -> PreparedADThird
+    prepare_ad_third(kernel, backend, tangents, args...; active) -> PreparedADThird
+
+Prepare reusable third-order directional derivatives of one explicit scalar
+`want` port with respect to the active HAVE port: for each input tangent `v`,
+the gradient of the Hessian quadratic form, `∇(vᵀ H v) = D³f[v, v, ·]`, a
+vector shaped like the active point. `tangents` is a nonempty tuple of
+input-tangent exemplars, one per direction (`(v,)` for one direction). All
+other current HAVE values are rebound as `Constant` contexts on every call,
+exactly as for [`prepare_ad`](@ref), and `bound` runs the same
+partial-evaluation pre-pass.
+
+Pass `SecondOrder(hvp_backend, pushforward_backend)`: the Hessian-vector
+backend differentiates the directional derivative `x -> Df(x)[v]` that the
+pushforward backend computes. Reverse over forward over forward,
+
+```julia
+SecondOrder(SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+                        AutoEnzyme(; mode = Enzyme.Forward)),
+            AutoEnzyme(; mode = Enzyme.Forward))
+```
+
+extends [`prepare_ad_hvp`](@ref)'s reverse over forward by one forward layer
+and also differentiates objectives that multiply a constant matrix by the
+active vector. Each direction costs one reverse sweep over a doubly
+forward-differentiated primal.
+
+Directions with disjoint supports compress, as for Hessian-vector products:
+when active coordinates fall into groups that never interact (per-subject
+effects), a direction summed across groups, `v = Σᵢ vᵢ`, returns
+`Σᵢ D³f[vᵢ, vᵢ, ·]`, because every cross term `D³f[vᵢ, vⱼ, ·]` vanishes. A
+bilinear contraction `D³f[w, v, ·]` follows by polarization,
+`(D³f[w + v, w + v, ·] - D³f[w - v, w - v, ·]) / 4`.
+
+The backend's packages must be loaded in the calling session (`using Enzyme`
+for `AutoEnzyme`); preparation without them fails loudly naming the missing
+`using`.
+"""
+function prepare_ad_third(
+        spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
+        tangents, args...; active, want, bound = NamedTuple(), kwargs...)
+    _ad_check_third_backend(backend)
+    kernel, resolver, keywords = _ad_spec_boundary(spec, want, bound, kwargs)
+    _prepare_ad_tangent_operator(Val(:third), kernel, resolver, backend,
+                                 tangents, args, keywords, active)
+end
+
+function prepare_ad_third(
+        kernel::_ADKernel, backend::DifferentiationInterface.AbstractADType,
+        tangents, args...; active, kwargs...)
+    _ad_check_third_backend(backend)
+    keywords = _ad_reject_low_level_keywords(kernel, kwargs)
+    _prepare_ad_tangent_operator(Val(:third), kernel, tuple, backend,
+                                 tangents, args, keywords, active)
+end
+
+_ad_third_tangent(prepared::PreparedADThird, point, tangent, contexts) =
+    only(DifferentiationInterface.hvp(
+        prepared.preparation.direction, prepared.preparation.third,
+        prepared.backend.outer, point, (tangent,),
+        DifferentiationInterface.Constant(tangent), contexts...))
+
+function _ad_third_tangent!(prepared::PreparedADThird, result, point, tangent,
+                            contexts)
+    DifferentiationInterface.hvp!(
+        prepared.preparation.direction, (result,), prepared.preparation.third,
+        prepared.backend.outer, point, (tangent,),
+        DifferentiationInterface.Constant(tangent), contexts...)
+    result
+end
+
+function _ad_third_results!(prepared::PreparedADThird, results::Tuple, point,
+                            tangents, contexts)
+    length(results) == length(tangents) || throw(DimensionMismatch(
+        "$(length(results)) result destinations for $(length(tangents)) " *
+        "directions"))
+    foreach(results, tangents) do result, tangent
+        _ad_third_tangent!(prepared, result, point, tangent, contexts)
+    end
+    results
+end
+
+"""
+    ad_third(prepared, tangents, args...; kwargs...) -> Tuple
+
+Evaluate one third-order directional derivative `∇(vᵀ H v)` of the prepared
+scalar WANT per input tangent `v` in `tangents`, returning a tuple of results
+in the same order, each shaped like the active point. `tangents` must hold as
+many directions as the preparation exemplar.
+"""
+function ad_third(prepared::PreparedADThird, tangents, args...; kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    _ad_restore_tangents(point, map(
+        tangent -> _ad_third_tangent(prepared, point, tangent, contexts),
+        _ad_prepared_tangents(point, tangents)))
+end
+
+"""
+    ad_third!(prepared, results, tangents, args...; kwargs...) -> results
+
+Evaluate the third-order directional derivatives of [`ad_third`](@ref) into
+caller-owned `results`, a tuple holding one destination array per direction.
+"""
+function ad_third!(prepared::PreparedADThird, results::Tuple, tangents, args...;
+                   kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    _ad_third_results!(prepared, results, point,
+                       _ad_prepared_tangents(point, tangents), contexts)
+end
+
+"""
+    ad_gradient_hvp_and_third(prepared, tangents, args...; kwargs...)
+
+Evaluate, at one point, the gradient of the prepared scalar WANT and, per
+input tangent `v`, the Hessian-vector product `H v` and the third-order
+directional derivative `∇(vᵀ H v)`. Returns `(gradient, hvps, thirds)`. The
+gradient takes one sweep of the outermost backend, each Hessian-vector product
+one sweep of the Hessian-vector backend, and each third-order derivative one
+sweep as in [`ad_third`](@ref).
+"""
+function ad_gradient_hvp_and_third(prepared::PreparedADThird, tangents, args...;
+                                   kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    directions = _ad_prepared_tangents(point, tangents)
+    gradient = DifferentiationInterface.gradient(
+        prepared.call, prepared.preparation.gradient,
+        prepared.backend.outer.outer, point, contexts...)
+    hvps = DifferentiationInterface.hvp(
+        prepared.call, prepared.preparation.hvp, prepared.backend.outer,
+        point, directions, contexts...)
+    thirds = map(
+        tangent -> _ad_third_tangent(prepared, point, tangent, contexts),
+        directions)
+    _ad_restore_cotangent(point, gradient), _ad_restore_tangents(point, hvps),
+        _ad_restore_tangents(point, thirds)
+end
+
+"""
+    ad_gradient_hvp_and_third!(prepared, gradient, hvps, thirds, tangents,
+                               args...; kwargs...)
+
+In-place form of [`ad_gradient_hvp_and_third`](@ref): writes the gradient into
+`gradient`, and the Hessian-vector products and third-order derivatives into
+`hvps` and `thirds`, tuples holding one destination array per direction.
+Returns `(gradient, hvps, thirds)`.
+"""
+function ad_gradient_hvp_and_third!(prepared::PreparedADThird, gradient,
+                                    hvps::Tuple, thirds::Tuple, tangents,
+                                    args...; kwargs...)
+    point, contexts = _ad_prepared_arguments(
+        prepared, args, NamedTuple(kwargs))
+    directions = _ad_prepared_tangents(point, tangents)
+    DifferentiationInterface.gradient!(
+        prepared.call, gradient, prepared.preparation.gradient,
+        prepared.backend.outer.outer, point, contexts...)
+    DifferentiationInterface.hvp!(
+        prepared.call, hvps, prepared.preparation.hvp, prepared.backend.outer,
+        point, directions, contexts...)
+    _ad_third_results!(prepared, thirds, point, directions, contexts)
+    gradient, hvps, thirds
+end
+
+"""
     ad_value_and_gradient!(prepared, gradient, args...; kwargs...)
 
 Compute the scalar value and gradient for a reusable [`PreparedADKernel`](@ref),
@@ -2368,6 +2617,7 @@ _ad_operator_type_name(::Val{:gradient}) = "PreparedADKernel"
 _ad_operator_type_name(::Val{:pullback}) = "PreparedADPullback"
 _ad_operator_type_name(::Val{:pushforward}) = "PreparedADPushforward"
 _ad_operator_type_name(::Val{:hvp}) = "PreparedADHVP"
+_ad_operator_type_name(::Val{:third}) = "PreparedADThird"
 
 _ad_operator(::PreparedADOperator{I,K,R,F,B,P,E,O}) where {I,K,R,F,B,P,E,O} = O
 

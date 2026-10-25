@@ -737,4 +737,16 @@ end
             false
         end broken = VERSION < v"1.12"
     end
+    third_order = SecondOrder(SecondOrder(AutoEnzyme(; mode = Enzyme.Reverse),
+                                          AutoEnzyme(; mode = Enzyme.Forward)),
+                              AutoEnzyme(; mode = Enzyme.Forward))
+    @test try
+        prepared = prepare_ad_third(kernel, third_order, (v,), q, s, data;
+                                    active = :q)
+        only(ad_third(prepared, (v,), q, s, data)) ≈
+            data .* s^3 .* exp.(s .* q) .* v .^ 2
+    catch error
+        nameof(typeof(error)) === :EnzymeRuntimeActivityError || rethrow()
+        false
+    end broken = VERSION < v"1.12"
 end

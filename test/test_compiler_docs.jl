@@ -74,6 +74,9 @@ _compiler_docs_lf(text) = replace(text, "\r\n" => "\n", "\r" => "\n")
             "prepare_ad_pushforward",
             "prepare_ad_hvp",
             "ad_gradient_and_hvp",
+            "### Third-order directional derivatives",
+            "prepare_ad_third",
+            "ad_gradient_hvp_and_third",
             "test_ad_tangent_operators.jl",
         )
         @test occursin(marker, ad_docs)
