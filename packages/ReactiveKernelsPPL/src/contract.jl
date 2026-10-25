@@ -1010,6 +1010,10 @@ retained cell scans; their coordinates and transforms belong to ordinary
 array parameters.
 `frozen` holds the data-only definitions a binding takes by value
 ([`FrozenValues`](@ref), `bind_data(…; frozen)`); it is empty otherwise.
+`cell_latents` maps the packed array parameter of each dotted `@plate` cell
+latent (`v[i] .~ D.(…)` over arrays) to its authored name and the data-only
+definition holding each index's dimensions; draws show it as one array per
+index under that name.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -1038,7 +1042,22 @@ struct StructuralPlan
     cell_priors::Vector{Symbol}
     # Data-only definitions a binding takes by value (`bind_data(…; frozen)`).
     frozen::FrozenValues
+    # Packed array of each dotted cell latent => (authored name, dimensions).
+    cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}
 end
+
+# Plans authored before dotted cell latents over arrays carry none.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors, cell_priors, frozen::FrozenValues) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, cell_priors, frozen,
+        Dict{Symbol,Tuple{Symbol,Symbol}}())
 
 # Plans authored before frozen definitions carry none.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1220,14 +1239,16 @@ function StructuralPlan(
         named_values::Vector{Pair{Symbol,Symbol}} = Pair{Symbol,Symbol}[],
         factors::Vector{SampledParameter} = SampledParameter[],
         cell_priors::Vector{Symbol} = Symbol[],
-        frozen::FrozenValues = FrozenValues())
+        frozen::FrozenValues = FrozenValues(),
+        cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}} =
+            Dict{Symbol,Tuple{Symbol,Symbol}}())
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations,
         external_observations, cell_broadcasts, named_values, factors, cell_priors,
-        frozen)
+        frozen, cell_latents)
 end
 
 # Every definition of `plan`: its assignments, then its per-observation
@@ -1644,8 +1665,8 @@ end
 
 """Plan slots whose dimensions resolve from their authored inputs or uses.
 New slots must establish the same property before joining this list.
-`named_values` and `cell_priors` only name existing nodes, so they have
-their dimensions.
+`named_values`, `cell_priors` and `cell_latents` only name existing nodes,
+so they have their dimensions.
 Scalar density `factors` read their definitions and arguments, never an
 observation count, and contribute once irrespective of response axes."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
@@ -1654,7 +1675,8 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :plate_parameters, :scans,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
-    :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen)
+    :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen,
+    :cell_latents)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -3962,6 +3984,13 @@ function _validate_factors(plan::StructuralPlan)
     for name in plan.cell_priors
         name in scalar_definitions || _fail(name,
             "a cell prior must name a scalar graph assignment")
+    end
+    arrays = Set(p.name for p in plan.array_parameters)
+    for (site, (name, dims)) in plan.cell_latents
+        site in arrays || _fail(name,
+            "a dotted cell latent's coordinates must be an array parameter")
+        (dims in _defined_names(plan) || haskey(plan.columns, dims)) || _fail(name,
+            "a dotted cell latent's dimensions must be a definition")
     end
     return nothing
 end

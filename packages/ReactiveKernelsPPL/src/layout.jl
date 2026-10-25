@@ -246,7 +246,13 @@ struct LayoutTable
     name_paths::Dict{Symbol,Tuple{Vararg{Symbol}}}
     bound_values::Dict{Symbol,Any}
     bound_exprs::Dict{Symbol,Any}
+    # The packed array of a dotted cell latent => (authored name, dimensions).
+    cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}
 end
+LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
+        bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any}) =
+    LayoutTable(entries, total, paths, bound_values, bound_exprs,
+        Dict{Symbol,Tuple{Symbol,Symbol}}())
 LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}}) =
     LayoutTable(entries, total, paths, Dict{Symbol,Any}(), Dict{Symbol,Any}())
 LayoutTable(entries::Vector{LayoutEntry}, total::Int) =
@@ -502,9 +508,15 @@ function assign_layout(plan::StructuralPlan)
     # simplexes reuse the `:cholesky_corr` / `:vector` edges, elementwise
     # arrays pack one `:array` block each.
     offset = _array_layout_entries!(entries, plan, offset)
-    return LayoutTable(entries, offset - 1, _scope_layout_paths(plan),
+    # A dotted cell latent's packed array draws under its authored name.
+    paths = _scope_layout_paths(plan)
+    for (site, (name, _)) in plan.cell_latents
+        paths[site] = get(paths, name, (name,))
+    end
+    return LayoutTable(entries, offset - 1, paths,
         Dict{Symbol,Any}(plan.columns),
-        Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)))
+        Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)),
+        plan.cell_latents)
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
@@ -973,6 +985,8 @@ function coordinate_names(layout::LayoutTable)
             for i in 1:e.size
                 push!(names, Symbol(_draw_name(layout, e.name) * "." * string(i)))
             end
+        elseif e.kind === :array && haskey(layout.cell_latents, e.name)
+            append!(names, _cell_latent_coordinates(layout, e.name))
         elseif e.kind === :vector || e.kind === :array || e.kind === :external || e.kind === :external_plate
             append!(names, [_authored_coordinate(layout, e.name, label)
                 for label in e.labels])
@@ -1078,7 +1092,10 @@ function _flat_draw_values(layout::LayoutTable, nt::NamedTuple)
         name in seen && continue
         push!(seen, name)
         value = _scope_lookup(nt, get(layout.name_paths, name, (name,)))
-        value === _MISSING_SCOPED_VALUE || push!(pairs, name => value)
+        value === _MISSING_SCOPED_VALUE && continue
+        haskey(layout.cell_latents, name) &&
+            (value = _cell_latent_flat(layout, name, value))
+        push!(pairs, name => value)
     end
     return NamedTuple{Tuple(first.(pairs))}(Tuple(last.(pairs)))
 end
@@ -1207,6 +1224,9 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
             push!(pairs, e.name => _lkj_stack_constrain(e, seg))
         elseif e.kind === :array && _is_slice_transform(e.transform)
             push!(pairs, e.name => _array_slices_constrain(e, seg))
+        elseif e.kind === :array && haskey(layout.cell_latents, e.name)
+            v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x)) for x in seg]
+            push!(pairs, e.name => _cell_latent_nested(layout, e.name, v))
         elseif e.kind === :array
             v = _entry_eltype(e, T)[_constrain_elt(e, convert(T, x)) for x in seg]
             push!(pairs, e.name =>
