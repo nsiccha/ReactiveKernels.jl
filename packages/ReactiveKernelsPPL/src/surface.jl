@@ -4334,7 +4334,8 @@ function _desugar_plate(st::Expr, line::Int, data::Set{Symbol};
             push!(plate_defs, lc.args[1])
         end
     end
-    cells = Any[_categorical_plate_cell(c, plate_defs, data) for c in cells]
+    cells = Any[_mvnormal_plate_cell(_categorical_plate_cell(c, plate_defs, data), data)
+        for c in cells]
     # A cell reading a value that holds one array per index computes an
     # array per index too: its outputs and locals are such values for
     # later plates and definitions.
@@ -4409,6 +4410,38 @@ function _categorical_plate_cell(c, plate_defs::Set{Symbol}, data::Set{Symbol})
     density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
         GlobalRef(@__MODULE__, :_ppl_categorical_logdensity), probabilities)
     return Expr(:call, c.args[1], c.args[2], density)
+end
+
+# A multivariate normal in a cell observes that index's vector jointly, as in
+# the Julia loop: `y[i] ~ MvNormal(mu, Sigma)` with `y[i]` one vector per
+# index, or `MvNormalCholesky(mu, L)` with the covariance's lower Cholesky
+# factor. The cell computes the mean and the matrix like any observation's
+# arguments; the density is the one-vector declaration's
+# (`_ppl_mvnormal_logdensity`), observed through the sampling-RHS path as one
+# whole event per index.
+const _CELL_MVNORMAL_LAWS = (MvNormal = :_ppl_mvnormal_logdensity,
+    MvNormalCholesky = :_ppl_mvnormal_cholesky_logdensity)
+
+function _mvnormal_plate_cell(c, data::Set{Symbol})
+    c isa Expr && (_is_sample(c) || _is_broadcast_sample(c)) || return c
+    lhs, rhs = c.args[2], c.args[3]
+    Meta.isexpr(lhs, :ref) && lhs.args[1] in data || return c
+    dotted = _is_dotted_call(rhs)
+    (Meta.isexpr(rhs, :call) || dotted) && !isempty(rhs.args) || return c
+    head = rhs.args[1]
+    head isa Symbol && haskey(_CELL_MVNORMAL_LAWS, head) || return c
+    (dotted || _is_broadcast_sample(c)) && _sfail("cell observation " *
+        "$(repr(lhs)): `$head` observes one vector, so a cell writes it " *
+        "undotted, `$(repr(lhs)) ~ $head(mu, $(head === :MvNormal ? "Sigma" : "L"))`, " *
+        "with $(repr(lhs)) that index's vector (a dotted form would draw " *
+        "`$head` per entry)")
+    args = dotted ? rhs.args[2].args : _plain_args(rhs, "`$head`")
+    length(args) == 2 || _sfail("cell observation $(repr(lhs)): `$head` takes " *
+        "(mean vector, $(head === :MvNormal ? "covariance matrix" :
+            "lower Cholesky factor of the covariance"))")
+    density = Expr(:call, GlobalRef(@__MODULE__, :LogDensity),
+        GlobalRef(@__MODULE__, _CELL_MVNORMAL_LAWS[head]), args...)
+    return Expr(:call, :~, lhs, density)
 end
 
 # Partial observation loops compute their arguments inside retained RK cells.
@@ -9222,9 +9255,15 @@ function _lower_response_base_error(lhs, rhs, fam)
                                     "`:OrderedLogit` (write " *
                                     "`OrderedLogistic.(eta)`)")
     fam === :MvNormalCholesky && _sfail(
-        "response $lhs: `MvNormalCholesky` is joint-only " *
+        "response $lhs: `MvNormalCholesky` observes whole vectors " *
         "(`[y1, y2] ~ MvNormalCholesky([mu1, mu2], L)` with plain `~` — " *
-        "row-grouped, never broadcast)")
+        "row-grouped, never broadcast — or one vector per index, " *
+        "`$lhs[i] ~ MvNormalCholesky(mu, L)` in a `@plate` cell)")
+    fam === :MvNormal && _sfail(
+        "response $lhs: `MvNormal` observes whole vectors, never one draw " *
+        "per entry: one vector with `$lhs[axes(...)] ~ MvNormal(mu, Sigma)`, " *
+        "or one vector per index with `$lhs[i] ~ MvNormal(mu, Sigma)` in a " *
+        "`@plate` cell")
     return _sfail("response $lhs: unknown distribution `$(repr(fam))` " *
                   "(admitted: Normal, StudentT, Bernoulli, Poisson, Binomial, " *
                   "NegativeBinomial2, NegativeBinomial, Weibull, " *

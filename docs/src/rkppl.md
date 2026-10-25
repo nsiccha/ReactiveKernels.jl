@@ -1037,6 +1037,32 @@ undotted cell `y[i] ~ Normal(…)` observes the array `y[i]` with a univariate
 distribution; the error names the dotted cell. Missing entries inside the
 arrays and `mi()` packing are not built yet.
 
+### One vector per index, observed jointly
+
+An undotted multivariate normal in a cell observes that index's vector as one
+joint draw, as the Julia loop does. The cell computes its mean and covariance
+like any other arguments, from parameters, data read per index and the observed
+vector itself:
+
+```julia
+# y = [[0.3, -0.2, 1.1], Float64[], [0.5, 0.9]]; x has the same shape
+@plate for s in eachindex(y)
+    m = a .+ b .* x[s]
+    v = exp(2ls) .* (1.0 .+ x[s] .^ 2)
+    y[s] ~ MvNormal(m, Diagonal(v) .+ rho .* (x[s] * x[s]') ./ length(x[s]))
+end
+```
+
+`MvNormalCholesky(m, L)` takes the lower Cholesky factor of the covariance
+instead. Each index adds one joint log density, the one the whole-vector
+declaration `b[1:K] ~ MvNormal(mu, Sigma)` uses, and an empty vector adds
+zero. `:pointwise` holds one density per index. The covariance must be
+symmetric (within `1e-8`) and positive definite; a mean or matrix whose size is
+not the vector's raises `DimensionMismatch`. A dotted cell `y[s] .~
+MvNormal.(…)` is refused, because it would draw the vector law once per entry.
+Native values and ordinary Enzyme reverse gradients are supported. Predictive
+draws of these vectors are not built yet.
+
 ## Submodels
 
 `@rkppl name(args...) = begin … end` defines a reusable block. Using it,
@@ -1316,8 +1342,10 @@ laws = predictive_laws(pred, u)        # lazy: laws.y[i] isa Distributions.Censo
   argument and entry; a law is built per entry when it is read and not
   stored. `predictive_draws!` reuses one output across posterior draws.
 - **Not covered yet.** Mixtures, hurdle models, Beta, inverse Gaussian,
-  von Mises, categorical and ordinal responses, caller-owned sampling laws
-  (`LogDensity`), scalar `~` observations and conditioned declarations: a
+  von Mises, categorical and ordinal responses, joint multivariate
+  observations (`MvNormal` / `MvNormalCholesky` vectors, whole or one per
+  `@plate` index), caller-owned sampling laws (`LogDensity`), scalar `~`
+  observations and conditioned declarations: a
   model with any of them is refused at `prepare_predictive`, naming them.
   Weighted likelihoods, interval-censored evidence and packed (`mi`)
   responses define no single draw and are refused the same way.
