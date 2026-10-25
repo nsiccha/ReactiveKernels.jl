@@ -173,7 +173,8 @@ The interface conventions:
 
 - **Arrays keep Julia's dimension order.** A Julia `n × p` design matrix is an
   `(n, p)` array. Julia's broadcasting is kept by padding axes from known
-  ranks, and `reshape` and `vec` stay column-major.
+  ranks, and `reshape` and `vec` stay column-major. A `:` dimension
+  (`reshape(v, 1, :)`, also in a dimension tuple) is the remaining length.
 - **Integer index data stay 1-based**, as the Julia program reads them; the
   emitted code subtracts one where it indexes.
 - **Ragged data** (one vector per group, such as per-subject series) are a
@@ -218,6 +219,7 @@ recipe and the construct:
 - `reduce(vcat, cells)` of a ragged value whose lengths are no prepared
   input's;
 - plates of rank above one over ragged data;
+- `reshape` of a ragged value (its padding has no shape);
 - `history` scans.
 
 Preparation that `bind_data` does before the program runs (a binder's own

@@ -399,6 +399,11 @@ _jax_value(ctx::_JaxContext, x::Function, hint) =
     Base.issingletontype(typeof(x)) ? _PyVal("<function " * string(hint) * ">", typeof(x)) :
     _jax_error("the closure `", hint, "` passed as a value has no JAX translation",
                _jax_where(ctx))
+# `:` as a value (a `reshape` dimension, also inside a tuple) is Python's
+# `None`; the calls that take it read its type.
+_jax_value(ctx::_JaxContext, ::Colon, hint) = _PyVal("None", Colon, true)
+# `:` as a value, also as lowered code passes it (a callable global).
+_jax_is_colon(v::_PyVal) = v.T === Colon || v.T isa _JaxCallable{Colon}
 # A type passed as a value (`ones(Float64, n)`, `Float64.(x)`): static, read
 # by the calls that take a type argument.
 _jax_value(ctx::_JaxContext, x::Type, hint) = _PyVal("<type " * string(x) * ">", Type{x}, true)
@@ -1652,16 +1657,29 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(vec), args::Vector{_PyVal
     _jax_is_array(x.T) || _jax_error("`vec` of a `", x.T, "`", _jax_where(ctx))
     _PyVal("jnp.ravel(" * x.code * ", order=\"F\")", Vector{eltype(x.T)})
 end
-# Julia reshapes in column-major order.
+# Julia reshapes in column-major order. A `Colon` dimension (`reshape(v, 1, :)`)
+# is the remaining length, NumPy's `-1`. The dimensions may be one tuple
+# (`reshape(v, size(w))`, `reshape(v, (1, :))`).
 function _jax_function_call(ctx::_JaxContext, ::typeof(reshape), args::Vector{_PyVal})
     x, dims = args[1], args[2:end]
-    length(dims) == 1 && dims[1].T isa Type && dims[1].T <: Tuple &&
-        _jax_error("`reshape` with a dimension tuple value", _jax_where(ctx))
-    all(d -> d.T isa Type && d.T <: Integer, dims) ||
-        _jax_error("`reshape` with dimensions of types (", join((string(d.T) for d in dims), ", "),
-                   ")", _jax_where(ctx))
-    _PyVal("jnp.reshape(" * x.code * ", (" * join((d.code for d in dims), ", ") *
-           (length(dims) == 1 ? ",)" : ")") * ", order=\"F\")", Array{eltype(x.T),length(dims)})
+    isempty(x.extent) || _jax_error("`reshape` of a padded (ragged) value", _jax_where(ctx))
+    packed = length(dims) == 1 && dims[1].T isa Type && dims[1].T <: Tuple
+    types = packed ? (isconcretetype(dims[1].T) ? fieldtypes(dims[1].T) : nothing) :
+        Tuple(_jax_is_colon(d) ? Colon : d.T for d in dims)
+    types !== nothing && all(T -> T === Colon || T isa Type && T <: Integer, types) ||
+        _jax_error("`reshape` with dimensions of types ",
+                   packed ? string(dims[1].T) : "(" * join((string(d.T) for d in dims), ", ") * ")",
+                   _jax_where(ctx))
+    count(T -> T === Colon, types) <= 1 ||
+        _jax_error("`reshape` with more than one `Colon` dimension (Julia raises a ",
+                   "`DimensionMismatch`)", _jax_where(ctx))
+    # A tuple holds `:` as `None` (`_jax_value`).
+    shape = !packed ? "(" * join((_jax_is_colon(d) ? "-1" : d.code for d in dims), ", ") *
+                     (length(dims) == 1 ? ",)" : ")") :
+        Colon in types ? "tuple(-1 if d is None else d for d in " * dims[1].code * ")" :
+        dims[1].code
+    _PyVal("jnp.reshape(" * x.code * ", " * shape * ", order=\"F\")",
+           Array{eltype(x.T),length(types)})
 end
 function _jax_function_call(ctx::_JaxContext, ::typeof(LogExpFunctions.logsumexp), args::Vector{_PyVal})
     length(args) == 1 || _jax_error("this `logsumexp` call", _jax_where(ctx))

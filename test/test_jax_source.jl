@@ -239,6 +239,32 @@ end
     return total
 end
 
+# A `:` dimension is the remaining length, also inside a dimension tuple and
+# in a plain helper's lowered code (snag jax-source-resha-959acdfb).
+jax_test_row(v) = reshape(v, 1, :)
+@kernel jax_reshapes(x::Vector{Float64}, a::Float64) = begin
+    row = reshape(a .* x, 1, :)
+    cols = reshape(a .* x, :, 2)
+    rows = reshape(a .* x, (2, :))
+    same = reshape(cols, size(rows))
+    lowered = jax_test_row(a .* x)
+    total = sum(row .* row) + sum(cols[:, 2] .^ 2) + sum(rows[1, :]) + a * sum(same[2, :]) +
+            sum(lowered)
+    return total
+end
+@kernel jax_ragged_reshape(R::Vector{Vector{Float64}}, a::Float64) = begin
+    cells = plate(R) do r
+        sum(reshape(a .* r, 1, :))
+    end
+    total = sum(cells)
+    return total
+end
+@kernel jax_two_colons(x::Vector{Float64}) = begin
+    r = reshape(x, :, :)
+    total = sum(r)
+    return total
+end
+
 # Data preparation whose shapes follow the data's values (decision 1ooufd4):
 # with `data`, it is `prepare_data`, host NumPy with Python control flow.
 # Helpers whose loops `@traceable`'s traced form cannot carry (`break`,
@@ -343,6 +369,13 @@ end
     total = sum(flat .* flat) + length(flat)
     return total
 end
+# Data-only reshapes with a `:` dimension (BRM's GP pair locations).
+@kernel jax_prep_reshapes(x::Vector{Float64}, a::Float64) = begin
+    row = reshape(x, 1, :)
+    rows = reshape(x, (2, :))
+    total = a * sum(row .* row) + a^2 * sum(rows[1, :])
+    return total
+end
 
 @testset "jax_source: structure" begin
     src = jax_source(jax_plate_scan; have = (:a, :y, :x, :b, :logsigma), want = :total)
@@ -385,6 +418,15 @@ end
     @test occursin("np.log(x.size)", static)
     @test occursin("_rk_log1mexp_np(-1.0)", static)
     @test !occursin("jax.lax.cond(", static)
+    # A `:` dimension is NumPy's `-1`, and the reshape stays column-major.
+    reshaped = string(jax_source(jax_reshapes; have = (:a, :x), want = :total))
+    @test occursin("jnp.reshape(a * x, (1, -1), order=\"F\")", reshaped)
+    @test occursin("jnp.reshape(a * x, (-1, 2), order=\"F\")", reshaped)
+    @test occursin("tuple(-1 if d is None else d for d in (2, None))", reshaped)
+    @test !occursin(r"<[a-z]", reshaped)
+    # Not built yet: a reshape of a ragged value, whose padding has no shape
+    # (docs/src/jax.md, "Limits"). It raises rather than reshaping the padding.
+    @test_broken (jax_source(jax_ragged_reshape; have = (:a, :R), want = :total); true)
     # A module whose functions compute nothing with NumPy does not import it.
     @test !occursin("import numpy", text)
     # Several functions over one boundary, with module constants.
@@ -407,6 +449,9 @@ end
         e
     end
     @test occursin("trip count depends on data", sprint(showerror, err))
+    # refused: Julia itself rejects two `:` dimensions (`DimensionMismatch`).
+    @test_throws DimensionMismatch prepare(jax_two_colons; have = (:x,), want = :total)([1.0, 2.0])
+    @test_throws "more than one `Colon`" jax_source(jax_two_colons; have = (:x,), want = :total)
 end
 
 @testset "jax_source: values and gradients" begin
@@ -449,6 +494,12 @@ end
         r = rk_jax_evaluate(src, "kernel", (0.7, x); grad = true)
         @test r.value ≈ native(0.7, x) rtol = 1e-12
         @test r.grad ≈ 2 * 0.7 * sum(x) - 0.7^-2 rtol = 1e-10
+        x6 = [x; 1.5]
+        native = prepare(jax_reshapes; have = (:a, :x), want = :total)
+        src = jax_source(jax_reshapes; have = (:a, :x), want = :total)
+        r = rk_jax_evaluate(src, "kernel", (0.7, x6); grad = true)
+        @test r.value ≈ native(0.7, x6) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), x6), [0.7])) rtol = 1e-6
 
         for (kernel, have, want, args) in (
                 (jax_alloc, (:x, :w), :s, (x, 0.7)),
@@ -507,6 +558,11 @@ end
     flat = jax_source(jax_prep_flat; have = (:a, :R), want = :total, data = (; R))
     @test "R_flat" in first.(flat.functions[2].inputs)
     @test occursin("jnp.nonzero(", string(flat))
+    xr = [0.5, -1.0, 2.0, 3.5, 0.2, 1.1]
+    reshaped = jax_source(jax_prep_reshapes; have = (:a, :x), want = :total, data = (; x = xr))
+    host_reshape = split(split(string(reshaped), "def prepare_data")[2], "\ndef kernel")[1]
+    @test occursin("np.reshape(x, (1, -1), order=\"F\")", host_reshape)
+    @test !occursin("jnp.", host_reshape)
     if !rk_jax_available()
         @test_skip false
     else
@@ -525,6 +581,10 @@ end
         r = rk_jax_evaluate(flat, "kernel", (0.7, R); grad = true, prepare = true)
         @test r.value ≈ sum(abs2, 0.7 .* reduce(vcat, R)) rtol = 1e-12
         @test r.grad ≈ 2 * 0.7 * sum(abs2, reduce(vcat, R)) rtol = 1e-10
+        native = prepare(jax_prep_reshapes; have = (:a, :x), want = :total)
+        r = rk_jax_evaluate(reshaped, "kernel", (0.7, xr); grad = true, prepare = true)
+        @test r.value ≈ native(0.7, xr) rtol = 1e-12
+        @test r.grad ≈ only(rk_fd_gradient(u -> native(only(u), xr), [0.7])) rtol = 1e-6
         index = jax_source(jax_prep_index; have = (:a, :R), want = :total, data = (; R))
         native = prepare(jax_prep_index; have = (:a, :R), want = :total)
         r = rk_jax_evaluate(index, "kernel", (0.7, R); grad = true, prepare = true)
