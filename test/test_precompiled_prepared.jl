@@ -226,9 +226,9 @@ using ReactiveKernels, Test
             @test typeof(fresh.native) ===
                 typeof(ReactiveKernels._native_generated_function(C.BATCH.native))
             # A program no loaded image compiled is compiled here, as before.
-            total = prepare(C.trajectory; have = C.HAVE, want = :total)
-            @test total(positions[:, 1], args[2:end]...) == expected[2][1]
-            @test owner(total.f) === ReactiveKernels
+            scale = prepare(C.trajectory; have = (:shared,), want = :scale)
+            @test scale(0.3) == exp(0.3)
+            @test owner(scale.f) === ReactiveKernels
             # Inputs and earlier outputs retain their contents across calls.
             earlier = C.BATCH(args...)
             @test C.BATCH(2 .* positions, args[2:end]...) != earlier
