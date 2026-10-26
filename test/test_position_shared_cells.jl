@@ -158,13 +158,15 @@ readers(scalar) = (
     end
 end
 
-@testset "bound non-batched rows run once per cell and call" begin
-    # A record is not cached at preparation; it runs once per cell and call.
+@testset "bound non-batched rows are cached at preparation" begin
+    # A record is cached by its fields at preparation (todo 0r1g1v3), so a
+    # position batch no longer runs it, not even once per cell and call.
     bound = prepare(record_cell; have = (:ts, :eta, :theta), want = :cells,
                     bound = (; ts))
-    expected = reduce(hcat, [bound(etas[:, k], thetas[k]) for k in 1:NPOS])
+    scalar = prepare(record_cell; have = (:ts, :eta, :theta), want = :cells)
+    expected = reduce(hcat, [scalar(ts, etas[:, k], thetas[k]) for k in 1:NPOS])
     count, value = calls(vectorize(bound; batched = (:eta, :theta)), etas, thetas)
-    @test count == NSUB
+    @test count == 0
     @test isequal(value, expected)
     # A dense array is cached at preparation, as before.
     cached = prepare(named_cell; have = (:ts, :eta, :theta), want = :cells,
