@@ -45,9 +45,10 @@ const PreparedADKernel{I,K,R,F,B,P,E} = PreparedADOperator{I,K,R,F,B,P,E,:gradie
     PreparedADPullback
 
 A prepared DifferentiationInterface reverse pullback for one selected
-ReactiveKernels WANT port. Construct one with [`prepare_ad_pullback`](@ref),
-providing an output cotangent exemplar. Calls may then evaluate vector-Jacobian
-products with [`ad_pullback`](@ref) or [`ad_value_and_pullback`](@ref).
+ReactiveKernels WANT port or several. Construct one with
+[`prepare_ad_pullback`](@ref), providing an output cotangent exemplar (one per
+port for several). Calls may then evaluate vector-Jacobian products with
+[`ad_pullback`](@ref) or [`ad_value_and_pullback`](@ref).
 
 Like [`PreparedADKernel`](@ref), the stored differentiation preparation is
 mutable and not thread-safe. Prepare one object per concurrent caller.
@@ -58,10 +59,10 @@ const PreparedADPullback{I,K,R,F,B,P,E} = PreparedADOperator{I,K,R,F,B,P,E,:pull
     PreparedADPushforward
 
 A prepared DifferentiationInterface pushforward (Jacobian-vector product) for
-one selected ReactiveKernels WANT port, which may be non-scalar. Construct one
-with [`prepare_ad_pushforward`](@ref), providing a tuple of input tangent
-exemplars. Calls evaluate one Jacobian-vector product per tangent with
-[`ad_pushforward`](@ref) or [`ad_value_and_pushforward`](@ref).
+one selected ReactiveKernels WANT port, which may be non-scalar, or several.
+Construct one with [`prepare_ad_pushforward`](@ref), providing a tuple of
+input tangent exemplars. Calls evaluate one Jacobian-vector product per tangent
+with [`ad_pushforward`](@ref) or [`ad_value_and_pushforward`](@ref).
 
 Like [`PreparedADKernel`](@ref), the stored differentiation preparation is
 mutable and not thread-safe. Prepare one object per concurrent caller.
@@ -1048,14 +1049,17 @@ _ad_differentiable_value(value::NamedTuple) =
 _ad_differentiable_value(::Any) = false
 
 # Positions, among a prepared kernel's WANT outputs, of the one differentiated
-# objective and of the retained outputs named by `retain` (in that order).
+# scalar objective of a gradient, Hessian-vector product or third-order
+# derivative and of the retained outputs named by `retain` (in that order).
 # Without `retain` the kernel must have exactly one WANT, the objective.
+# Pullbacks and pushforwards differentiate every selected WANT instead.
 function _ad_output_positions(kernel::_ADKernel, retain::Tuple)
     names = Tuple(output.name for output in outputs(kernel))
     if isempty(retain)
         length(names) == 1 || throw(ArgumentError(
-            "AD preparation requires exactly one selected WANT port; got " *
-            string(names)))
+            "a gradient, Hessian-vector product or third-order derivative " *
+            "differentiates exactly one selected scalar WANT port; got " *
+            string(names) * " (pullbacks and pushforwards accept several)"))
         return 1, ()
     end
     retained = map(retain) do name
@@ -1083,8 +1087,8 @@ function _ad_validate_kernel(kernel::_ADKernel, active_selector,
         "selected HAVE boundary expects $(length(inputs(kernel))) values " *
         "$(Tuple(input.name for input in inputs(kernel))); got $(length(args))"))
 
-    objective, _ = _ad_output_positions(kernel, retain)
     if scalar_output
+        objective, _ = _ad_output_positions(kernel, retain)
         output = outputs(kernel)[objective]
         output_type = valtype(output)
         if !(output_type <: Number)
@@ -1147,8 +1151,12 @@ function _ad_resolve(resolver, args::Tuple, kwargs::NamedTuple)
     resolver(args...; kwargs...)
 end
 
+# A pullback passes its cotangent exemplar `seed`: over several selected WANT
+# ports it differentiates the seeded inner product (`_ADSeededCall`), whose
+# port values are kept for `ad_value_and_pullback` when `keep_values`.
 function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
-                  scalar_output::Bool = true, retain::Tuple = ())
+                  scalar_output::Bool = true, retain::Tuple = (),
+                  seed = nothing, keep_values::Bool = false)
     active_selector = _ad_active_selector(kernel, active)
     _ad_validate_kernel(kernel, active_selector, resolved;
                         scalar_output, retain)
@@ -1157,6 +1165,10 @@ function _ad_call(kernel::_ADKernel, resolved::Tuple, active;
     if !isempty(retain)
         call, external_values = _ad_retaining_call(
             kernel, call, external_values, resolved, retain)
+    end
+    if seed !== nothing && length(outputs(kernel)) > 1
+        call, external_values = _ad_seeded_call(
+            kernel, call, external_values, resolved, seed, keep_values)
     end
     point, contexts = _ad_arguments(
         Val(active_selector), (resolved..., external_values...))
@@ -1210,6 +1222,67 @@ function _ad_retaining_call(kernel::NonAllocatingKernel, call, external_values,
         "prepare them from the dataflow kernel (`prepare`)"))
 end
 
+# Several selected WANT ports. The kernel returns them as one tuple from one
+# primal sweep, and a pullback seeds that tuple with one cotangent per port.
+# The pullback at `seed` is the gradient of the seeded inner product
+# `Σᵢ ⟨seedᵢ, yᵢ⟩`: one primal sweep computes every port and one reverse sweep
+# accumulates every port's cotangent. DifferentiationInterface's pullback
+# through Enzyme seeds only a scalar or array output (its reverse extension
+# adds the seed into the output shadow with `.+=`), so the seed crosses as the
+# trailing `Constant` context of a gradient instead. When `V`, the port values
+# of the sweep are stored in an AD-owned box, the `Cache` context before the
+# seed, as `_ADRetainingCall` stores its retained values.
+struct _ADSeededCall{V,F}
+    call::F
+end
+
+@generated function (seeded::_ADSeededCall{V})(
+        active, contexts::Vararg{Any,C}) where {V,C}
+    inner = [:(getfield(contexts, $index)) for index in 1:(C - (V ? 2 : 1))]
+    store = V ? :(getfield(contexts, $(C - 1))[] = values) : nothing
+    quote
+        values = Base.@inline seeded.call(active, $(inner...))
+        $store
+        _ad_seed_dot(getfield(contexts, $C), values)
+    end
+end
+
+_ad_seed_dot(seed::Number, value::Number) = seed * value
+_ad_seed_dot(seed::AbstractArray, value::AbstractArray) = dot(seed, value)
+_ad_seed_dot(seed::Tuple, value::Tuple) = sum(map(_ad_seed_dot, seed, value))
+_ad_seed_dot(seed::NamedTuple{N}, value::NamedTuple{N}) where {N} =
+    _ad_seed_dot(values(seed), values(value))
+_ad_seed_dot(seed, value) = throw(ArgumentError(
+    "a WANT port's cotangent must have the port value's structure; got a " *
+    "$(typeof(seed)) cotangent for a $(typeof(value)) value"))
+
+# The exemplar sweep checks the seed against the port values, so a missing or
+# misshapen cotangent names the boundary before differentiation, and fixes the
+# box's concrete type, as for retained values.
+function _ad_seeded_call(kernel::_ADKernel, call, external_values,
+                         resolved::Tuple, seed, keep_values::Bool)
+    values = kernel(resolved...)
+    _ad_tangent_matches(values, seed) || throw(ArgumentError(
+        "a pullback over WANT ports " *
+        string(Tuple(output.name for output in outputs(kernel))) *
+        " takes one cotangent per port, each with its port value's " *
+        "structure ($(_ad_tangent_shape(values))); got " *
+        _ad_tangent_shape(seed)))
+    keep_values || return _ADSeededCall{false,typeof(call)}(call), external_values
+    _ADSeededCall{true,typeof(call)}(call),
+        (external_values..., DifferentiationInterface.Cache(Ref(values)))
+end
+
+_ad_seeded_contexts(contexts::Tuple, seed) =
+    (contexts..., DifferentiationInterface.Constant(seed))
+
+# The port values of the differentiated sweep: stored in the box when the
+# backend kept the sweep, otherwise one separate primal evaluation.
+_ad_seeded_values(prepared, ::_ADSeededCall{true}, point, contexts) =
+    DifferentiationInterface.unwrap(last(prepared.external_values))[]
+_ad_seeded_values(prepared, call::_ADSeededCall{false}, point, contexts) =
+    Base.@inline call.call(point, map(DifferentiationInterface.unwrap, contexts)...)
+
 """
     ad_retains_primal_sweep(backend) -> Bool
 
@@ -1252,16 +1325,26 @@ _ad_retained_box(call, prepared) = throw(ArgumentError(
     "this AD preparation retains no WANT outputs; prepare it with " *
     "`prepare_ad(...; retain = (names...))`"))
 
+# A gradient, Hessian-vector product or third-order derivative selects exactly
+# one scalar WANT; a pullback or pushforward (`scalar_output = false`) selects
+# one or several, differentiated together as the kernel's tuple result.
 function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple();
-                         retain::Tuple = ())
+                         retain::Tuple = (), scalar_output::Bool = true)
     _ad_validate_unique_haves(spec)
     selected_wants = _kernel_selection(spec, want, spec.want_names, :want)
-    length(selected_wants) == 1 || throw(ArgumentError(
-        "AD preparation requires exactly one explicit WANT port; got " *
-        string(Tuple(output.name for output in selected_wants))))
-    wants = (only(selected_wants),
+    names = Tuple(output.name for output in selected_wants)
+    if scalar_output
+        length(selected_wants) == 1 || throw(ArgumentError(
+            "a gradient, Hessian-vector product or third-order derivative " *
+            "requires exactly one explicit WANT port; got $names " *
+            "(pullbacks and pushforwards accept several)"))
+    else
+        isempty(selected_wants) && throw(ArgumentError(
+            "a pullback or pushforward requires at least one explicit WANT port"))
+    end
+    wants = (selected_wants...,
              _kernel_selection(spec, retain, spec.want_names, :retain)...)
-    selected = isempty(retain) ? only(wants) : wants
+    selected = length(wants) == 1 ? only(wants) : wants
     isempty(bound) && return prepare(plan(spec; want = selected))
     prepare(plan(spec; want = selected);
             bound = _kernel_bound_pairs(spec, bound))
@@ -1349,6 +1432,16 @@ _ad_operator_preparation(::Val{:gradient}, call, backend, point, ::Tuple{}, cont
     DifferentiationInterface.prepare_gradient(call, backend, point, contexts...)
 _ad_operator_preparation(::Val{:pullback}, call, backend, point, seeds, contexts) =
     DifferentiationInterface.prepare_pullback(call, backend, point, seeds, contexts...)
+_ad_operator_preparation(::Val{:pullback}, call::_ADSeededCall, backend, point,
+                         seeds, contexts) =
+    DifferentiationInterface.prepare_gradient(
+        call, backend, point, _ad_seeded_contexts(contexts, only(seeds))...)
+
+# A pullback hands `_ad_call` its seed, which differentiates several WANT
+# ports as their seeded inner product (`_ADSeededCall`).
+_ad_operator_seeding(::Val{:pullback}, seeds, backend) =
+    (; seed = only(seeds), keep_values = ad_retains_primal_sweep(backend))
+_ad_operator_seeding(::Val, seeds, backend) = (;)
 _ad_operator_preparation(::Val{:pushforward}, call, backend, point, seeds, contexts) =
     DifferentiationInterface.prepare_pushforward(call, backend, point, seeds, contexts...)
 _ad_operator_preparation(::Val{:hvp}, call, backend, point, seeds, contexts) =
@@ -1481,7 +1574,7 @@ function _prepare_ad_operator(op::Val{O}, kernel::_ADKernel, resolver,
         _warn_uninferred_values(kernel, map(Core.Typeof, resolved))
     call, point, contexts, active_selector, external_values = _ad_call(
         kernel, resolved, active; scalar_output = _ad_operator_scalar_output(op),
-        retain)
+        retain, _ad_operator_seeding(op, seeds, backend)...)
     preparation = _ad_operator_preparation(
         op, call, backend, point, seeds, contexts)
     prepared = PreparedADOperator{
@@ -1820,11 +1913,23 @@ _replica_ad_stack(values, ::Type{T}) where {T} = throw(ArgumentError(
     prepare_ad_pullback(kernel, backend, seed, args...;
                         active) -> PreparedADPullback
 
-Prepare a reusable reverse pullback (vector-Jacobian product) for one explicit
-`want` port. `seed` is an exemplar output cotangent. Unlike [`prepare_ad`](@ref),
-the selected WANT may be non-scalar. One HAVE port or an ordered tuple of HAVE
-ports is active, and all other current HAVE values are rebound as `Constant`
-contexts on every call.
+Prepare a reusable reverse pullback (vector-Jacobian product) of the explicit
+`want` port or ordered tuple of ports. `seed` is an exemplar output cotangent.
+Unlike [`prepare_ad`](@ref), the selected WANT may be non-scalar. One HAVE port
+or an ordered tuple of HAVE ports is active, and all other current HAVE values
+are rebound as `Constant` contexts on every call.
+
+Several WANT ports (`want = (:a, :b, ...)`, or a low-level kernel prepared
+with several) are differentiated together as the kernel's tuple result, the
+way `prepare(spec; want = (:a, :b, ...))` evaluates them in one sweep. `seed`
+is then a tuple with one cotangent per port, in WANT order, each shaped like
+its port's value, and the pullback returns the active cotangent of
+`Σᵢ ⟨seedᵢ, yᵢ⟩`, the sum of every port's vector-Jacobian product, from one
+primal and one reverse sweep (the gradient of that seeded inner product).
+`ad_value_and_pullback` returns the tuple of port values; a backend that keeps
+its primal sweep ([`ad_retains_primal_sweep`](@ref), reverse-mode `AutoEnzyme`)
+yields them from the same sweep, any other with one separate primal
+evaluation.
 
 The backend's package must be loaded in the calling session (`using Enzyme`
 for `AutoEnzyme`); the backend value alone does not load
@@ -1834,7 +1939,7 @@ fails loudly naming the missing `using`.
 function prepare_ad_pullback(
         spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
         seed, args...; active, want, kwargs...)
-    kernel = _ad_spec_kernel(spec, want)
+    kernel = _ad_spec_kernel(spec, want; scalar_output = false)
     _prepare_ad_pullback(
         kernel, _ad_resolver(spec), backend, seed, args,
         NamedTuple(kwargs), active)
@@ -1971,7 +2076,9 @@ end
 Evaluate a reverse pullback for one output cotangent `seed`, returning the
 cotangent of the selected active HAVE port. For a vector-valued WANT this is the
 vector-Jacobian product `J' * seed`; constructing a full Jacobian still requires
-multiple seeds.
+multiple seeds. Over several WANT ports, `seed` holds one cotangent per port
+and the result is the sum of their vector-Jacobian products, from one primal
+and one reverse sweep (see [`prepare_ad_pullback`](@ref)).
 
 The one-shot forms require the backend's package to be loaded in the calling
 session (`using Enzyme` for `AutoEnzyme`); the backend value alone does not
@@ -1981,56 +2088,51 @@ function ad_pullback(spec::KernelSpec,
                      backend::DifferentiationInterface.AbstractADType,
                      seed, args...; active, want, kwargs...)
     _ad_require_backend_packages(backend)
-    kernel = _ad_spec_kernel(spec, want)
-    resolver = _ad_resolver(spec)
-    resolved = _ad_resolve(resolver, args, NamedTuple(kwargs))
-    call, point, contexts, _, _ =
-        _ad_call(kernel, resolved, active; scalar_output = false)
-    _ad_trace_sanity(point, contexts)
-    cotangent = only(DifferentiationInterface.pullback(
-        call, backend, point, (seed,), contexts...))
-    _ad_restore_cotangent(point, cotangent)
+    kernel = _ad_spec_kernel(spec, want; scalar_output = false)
+    resolved = _ad_resolve(_ad_resolver(spec), args, NamedTuple(kwargs))
+    _ad_unprepared_pullback(kernel, backend, seed, resolved, active)
 end
 
-function ad_pullback(kernel::PreparedKernel,
+function ad_pullback(kernel::_ADKernel,
                      backend::DifferentiationInterface.AbstractADType,
                      seed, args...; active, kwargs...)
     _ad_require_backend_packages(backend)
-    isempty(kwargs) || throw(ArgumentError(
-        "a low-level PreparedKernel has a positional HAVE boundary and does " *
-        "not accept keywords; use a KernelSpec to preserve authored keywords"))
-    call, point, contexts, _, _ =
-        _ad_call(kernel, args, active; scalar_output = false)
-    _ad_trace_sanity(point, contexts)
-    cotangent = only(DifferentiationInterface.pullback(
-        call, backend, point, (seed,), contexts...))
-    _ad_restore_cotangent(point, cotangent)
+    _ad_reject_low_level_keywords(kernel, kwargs)
+    _ad_unprepared_pullback(kernel, backend, seed, args, active)
 end
 
-function ad_pullback(kernel::NonAllocatingKernel,
-                     backend::DifferentiationInterface.AbstractADType,
-                     seed, args...; active, kwargs...)
-    _ad_require_backend_packages(backend)
-    isempty(kwargs) || throw(ArgumentError(
-        "a low-level NonAllocatingKernel has a positional HAVE boundary and " *
-        "does not accept keywords; use a KernelSpec to preserve authored " *
-        "keywords"))
+function _ad_unprepared_pullback(kernel::_ADKernel, backend, seed,
+                                 resolved::Tuple, active)
     call, point, contexts, _, _ =
-        _ad_call(kernel, args, active; scalar_output = false)
+        _ad_call(kernel, resolved, active; scalar_output = false, seed)
     _ad_trace_sanity(point, contexts)
-    cotangent = only(DifferentiationInterface.pullback(
-        call, backend, point, (seed,), contexts...))
-    _ad_restore_cotangent(point, cotangent)
+    _ad_restore_cotangent(point,
+        _ad_unprepared_pullback_call(call, backend, point, seed, contexts))
 end
+
+_ad_unprepared_pullback_call(call, backend, point, seed, contexts) =
+    only(DifferentiationInterface.pullback(
+        call, backend, point, (seed,), contexts...))
+_ad_unprepared_pullback_call(call::_ADSeededCall, backend, point, seed,
+                             contexts) =
+    DifferentiationInterface.gradient(
+        call, backend, point, _ad_seeded_contexts(contexts, seed)...)
 
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
-    cotangent = only(DifferentiationInterface.pullback(
-        prepared.call, prepared.preparation, prepared.backend,
-        point, (seed,), contexts...))
-    _ad_restore_cotangent(point, cotangent)
+    _ad_restore_cotangent(point,
+        _ad_prepared_pullback(prepared.call, prepared, point, seed, contexts))
 end
+
+_ad_prepared_pullback(call, prepared, point, seed, contexts) =
+    only(DifferentiationInterface.pullback(
+        call, prepared.preparation, prepared.backend,
+        point, (seed,), contexts...))
+_ad_prepared_pullback(call::_ADSeededCall, prepared, point, seed, contexts) =
+    DifferentiationInterface.gradient(
+        call, prepared.preparation, prepared.backend,
+        point, _ad_seeded_contexts(contexts, seed)...)
 
 """
     ad_value_and_pullback(prepared, seed, args...; kwargs...)
@@ -2038,17 +2140,30 @@ end
 Evaluate the selected WANT and its reverse pullback together. Returns
 `(value, active_cotangent)`, unwrapping DifferentiationInterface's
 one-direction tuple. A tuple active selector produces a tuple cotangent in the
-selector's order. The prepared object is reusable with new runtime arguments
-and seeds compatible with its preparation exemplars.
+selector's order; several WANT ports produce the tuple of their values. The
+prepared object is reusable with new runtime arguments and seeds compatible
+with its preparation exemplars.
 """
 function ad_value_and_pullback(
         prepared::PreparedADPullback, seed, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
         prepared, args, NamedTuple(kwargs))
+    value, cotangent = _ad_prepared_value_and_pullback(
+        prepared.call, prepared, point, seed, contexts)
+    value, _ad_restore_cotangent(point, cotangent)
+end
+
+function _ad_prepared_value_and_pullback(call, prepared, point, seed, contexts)
     value, pullbacks = DifferentiationInterface.value_and_pullback(
-        prepared.call, prepared.preparation, prepared.backend,
+        call, prepared.preparation, prepared.backend,
         point, (seed,), contexts...)
-    value, _ad_restore_cotangent(point, only(pullbacks))
+    value, only(pullbacks)
+end
+
+function _ad_prepared_value_and_pullback(
+        call::_ADSeededCall, prepared, point, seed, contexts)
+    cotangent = _ad_prepared_pullback(call, prepared, point, seed, contexts)
+    _ad_seeded_values(prepared, call, point, contexts), cotangent
 end
 
 """
@@ -2071,28 +2186,38 @@ end
 
 function _ad_prepared_value_and_pullback!(
         prepared, cotangent, seed, point::Tuple, contexts)
-    value, pullbacks = DifferentiationInterface.value_and_pullback(
-        prepared.call, prepared.preparation, prepared.backend,
-        point, (seed,), contexts...)
-    restored = _ad_restore_cotangent(point, only(pullbacks))
-    _ad_copy_cotangent!(cotangent, restored)
+    value, derivative = _ad_prepared_value_and_pullback(
+        prepared.call, prepared, point, seed, contexts)
+    _ad_copy_cotangent!(cotangent, _ad_restore_cotangent(point, derivative))
     value, cotangent
 end
 
-function _ad_prepared_value_and_pullback!(
-        prepared, cotangent, seed, point, contexts)
+_ad_prepared_value_and_pullback!(prepared, cotangent, seed, point, contexts) =
+    _ad_prepared_value_and_pullback_into!(
+        prepared.call, prepared, cotangent, seed, point, contexts)
+
+function _ad_prepared_value_and_pullback_into!(
+        call, prepared, cotangent, seed, point, contexts)
     value, pullbacks = DifferentiationInterface.value_and_pullback!(
-        prepared.call, (cotangent,), prepared.preparation, prepared.backend,
+        call, (cotangent,), prepared.preparation, prepared.backend,
         point, (seed,), contexts...)
     value, only(pullbacks)
+end
+
+function _ad_prepared_value_and_pullback_into!(
+        call::_ADSeededCall, prepared, cotangent, seed, point, contexts)
+    DifferentiationInterface.gradient!(
+        call, cotangent, prepared.preparation, prepared.backend,
+        point, _ad_seeded_contexts(contexts, seed)...)
+    _ad_seeded_values(prepared, call, point, contexts), cotangent
 end
 
 # The authored-boundary resolution shared by every `KernelSpec` preparation:
 # a bound preparation is positional over the remaining ports, otherwise the
 # authored defaults and keywords resolve as `prepare(spec)` does.
 function _ad_spec_boundary(spec::KernelSpec, want, bound, kwargs;
-                           retain::Tuple = ())
-    kernel = _ad_spec_kernel(spec, want, bound; retain)
+                           retain::Tuple = (), scalar_output::Bool = true)
+    kernel = _ad_spec_kernel(spec, want, bound; retain, scalar_output)
     isempty(bound) && return kernel, _ad_resolver(spec), NamedTuple(kwargs)
     kernel, tuple, _ad_reject_bound_keywords(NamedTuple(kwargs))
 end
@@ -2111,15 +2236,24 @@ end
     prepare_ad_pushforward(kernel, backend, tangents, args...;
                            active) -> PreparedADPushforward
 
-Prepare a reusable forward pushforward (Jacobian-vector product) of one
+Prepare a reusable forward pushforward (Jacobian-vector product) of the
 explicit `want` port, which may be non-scalar (a vector, a `NamedTuple` of
-arrays, …). `tangents` is a nonempty tuple of input-tangent exemplars, one per
-direction, each shaped like the active point: `(v,)` for one direction,
-`(v1, v2, v3)` for three directions evaluated together. A tuple `active`
-selector takes one tuple of component tangents per direction. One HAVE port or
-an ordered tuple of HAVE ports is active, and all other current HAVE values
-are rebound as `Constant` contexts on every call, exactly as for
-[`prepare_ad`](@ref). `bound` runs the same partial-evaluation pre-pass.
+arrays, …), or of an ordered tuple of ports. `tangents` is a nonempty tuple of
+input-tangent exemplars, one per direction, each shaped like the active point:
+`(v,)` for one direction, `(v1, v2, v3)` for three directions evaluated
+together. A tuple `active` selector takes one tuple of component tangents per
+direction. One HAVE port or an ordered tuple of HAVE ports is active, and all
+other current HAVE values are rebound as `Constant` contexts on every call,
+exactly as for [`prepare_ad`](@ref). `bound` runs the same partial-evaluation
+pre-pass.
+
+Several WANT ports (`want = (:a, :b, ...)`, or a low-level kernel prepared
+with several) are differentiated together as the kernel's tuple result, the
+way `prepare(spec; want = (:a, :b, ...))` evaluates them in one sweep: one
+forward sweep carries every direction through the shared graph, and each
+output tangent is a tuple with one tangent per port, in WANT order. Whether a
+backend differentiates a tuple-valued function is the backend's own contract;
+forward-mode `AutoEnzyme` does.
 
 Several directions with disjoint supports give a compressed Jacobian: for a
 WANT whose entries each depend on one group of active coordinates, one
@@ -2133,7 +2267,8 @@ loudly naming the missing `using`.
 function prepare_ad_pushforward(
         spec::KernelSpec, backend::DifferentiationInterface.AbstractADType,
         tangents, args...; active, want, bound = NamedTuple(), kwargs...)
-    kernel, resolver, keywords = _ad_spec_boundary(spec, want, bound, kwargs)
+    kernel, resolver, keywords = _ad_spec_boundary(
+        spec, want, bound, kwargs; scalar_output = false)
     _prepare_ad_tangent_operator(Val(:pushforward), kernel, resolver, backend,
                                  tangents, args, keywords, active)
 end
@@ -2156,8 +2291,9 @@ _ad_prepared_tangents(point, tangents) =
 
 Evaluate one Jacobian-vector product of the prepared WANT per input tangent in
 `tangents`, returning a tuple of output tangents in the same order. Each output
-tangent has the WANT's structure. `tangents` must hold as many directions as
-the preparation exemplar.
+tangent has the WANT's structure: over several WANT ports, a tuple with one
+tangent per port. `tangents` must hold as many directions as the preparation
+exemplar.
 """
 function ad_pushforward(prepared::PreparedADPushforward, tangents, args...;
                         kwargs...)
@@ -2613,6 +2749,10 @@ function _show_ad_active(io::IO, boundary, indices::Tuple)
     show(io, Tuple(boundary[index].name for index in indices))
 end
 
+_show_ad_want(io::IO, wants) = length(wants) == 1 ?
+    print(io, ":", only(wants).name) :
+    show(io, Tuple(want.name for want in wants))
+
 _ad_operator_type_name(::Val{:gradient}) = "PreparedADKernel"
 _ad_operator_type_name(::Val{:pullback}) = "PreparedADPullback"
 _ad_operator_type_name(::Val{:pushforward}) = "PreparedADPushforward"
@@ -2624,7 +2764,9 @@ _ad_operator(::PreparedADOperator{I,K,R,F,B,P,E,O}) where {I,K,R,F,B,P,E,O} = O
 function Base.show(io::IO, prepared::PreparedADOperator{I}) where {I}
     print(io, _ad_operator_type_name(Val(_ad_operator(prepared))), "(active=")
     _show_ad_active(io, inputs(prepared.kernel), I)
-    print(io, ", want=:", only(outputs(prepared.kernel)).name, ", kernel=")
+    print(io, ", want=")
+    _show_ad_want(io, outputs(prepared.kernel))
+    print(io, ", kernel=")
     show(io, prepared.kernel)
     print(io, ")")
 end

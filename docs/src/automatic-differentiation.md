@@ -6,10 +6,10 @@ a concrete differentiation engine: Enzyme is an optional test and example
 dependency, and core package source never imports it.
 
 `prepare_ad` resolves one active HAVE port and one scalar WANT once.
-`prepare_ad_pullback` applies the same boundary to a scalar or non-scalar WANT
-and prepares one reverse output-cotangent direction; `prepare_ad_pushforward`
-and `prepare_ad_hvp` prepare Jacobian-vector and Hessian-vector products on it
-(see below). Every other selected HAVE
+`prepare_ad_pullback` applies the same boundary to a scalar or non-scalar WANT,
+or to several WANT ports at once, and prepares one reverse output-cotangent
+direction; `prepare_ad_pushforward` and `prepare_ad_hvp` prepare
+Jacobian-vector and Hessian-vector products on it (see below). Every other selected HAVE
 is supplied to the backend as a freshly rebound `Constant`, so preparation
 fixes types and shapes without freezing values used by later calls. Both paths
 differentiate the exact primal callable, operation table, and inspectable AST;
@@ -87,6 +87,49 @@ value, vjp = ad_value_and_pullback(
 The returned sensitivity is `J' * output_cotangent`, computed in one reverse
 pass. It is not a full Jacobian. `ad_value_and_pullback!` accepts caller-owned
 array cotangent storage when the backend supports it.
+
+### Several WANT ports in one sweep
+
+A pullback or pushforward may select several WANT ports, `want = (:a, :b, ...)`
+or a low-level kernel prepared with several, the way
+`prepare(spec; want = (:a, :b, ...))` evaluates them in one sweep. The ports
+are differentiated together as the kernel's tuple result, so the graph they
+share (index gathers, design products) is computed once per call rather than
+once per port:
+
+```julia
+@kernel tangent_ports(q::Vector{Float64}, s::Float64;
+                      data::Vector{Float64}) = begin
+    shared = exp.(s .* q)
+    mean = data .* shared
+    total::Float64 = sum(shared) + s^2
+end
+
+vjp = prepare_ad_pullback(tangent_ports, backend, (mean_cotangent, 1.0),
+                          parameters, 0.7; data, active = :q,
+                          want = (:mean, :total))
+(mean, total), cotangent = ad_value_and_pullback(
+    vjp, (mean_cotangent, 1.0), parameters, 0.7; data)
+
+jvp = prepare_ad_pushforward(tangent_ports, AutoEnzyme(; mode = Enzyme.Forward),
+                             (v,), parameters, 0.7; data, active = :q,
+                             want = (:mean, :total))
+(mean, total), ((mean_tangent, total_tangent),) =
+    ad_value_and_pushforward(jvp, (v,), parameters, 0.7; data)
+```
+
+The pullback's seed holds one cotangent per port, in WANT order, each shaped
+like its port's value, and the result is the sum of the ports'
+vector-Jacobian products. RK computes it as the gradient of the seeded inner
+product `Σᵢ ⟨seedᵢ, yᵢ⟩`, one primal and one reverse sweep through the
+backend's gradient: DifferentiationInterface's Enzyme pullback seeds only a
+scalar or array output. `ad_value_and_pullback` returns the tuple of port
+values, from the same sweep when the backend keeps it
+(`ad_retains_primal_sweep`, reverse-mode `AutoEnzyme`) and from one separate
+primal evaluation otherwise. Each pushforward direction yields a tuple with
+one tangent per port; forward-mode `AutoEnzyme` differentiates the
+tuple-valued kernel directly. A single WANT keeps its untupled value,
+cotangent and tangents.
 
 ## Retain other WANT values from the gradient sweep
 
@@ -339,10 +382,11 @@ structure: `log(d)` is cached and the cell computes `theta *` that value (see
 ## Accepted boundary
 
 - Gradient and Hessian-vector-product preparation require a scalar WANT.
-  Pullback preparation accepts one scalar or non-scalar WANT and an
-  output-cotangent exemplar; pushforward preparation accepts one scalar or
-  non-scalar WANT and a tuple of input-tangent exemplars. Further WANT ports
-  may be retained, not differentiated, with a gradient's `retain`.
+  Pullback preparation accepts one scalar or non-scalar WANT, or several, and
+  an output-cotangent exemplar (one per port for several); pushforward
+  preparation accepts the same WANT selection and a tuple of input-tangent
+  exemplars. Further WANT ports may be retained, not differentiated, with a
+  gradient's `retain`.
 - Exactly one HAVE port is active.
 - Integer active ports and aliased active boundaries reject.
 - An inactive HAVE downstream of the active port rejects rather than cutting a
