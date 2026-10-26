@@ -1073,7 +1073,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     ast = _observation_call_definitions(ast, data, mod)
     ast = _gathered_value_definitions(ast, data)
     sample, factors, det, plate_ctx, plate_specs, scans, joints, glms, cell_broadcasts,
-        cell_priors, cell_latents = _partition_statements(ast, data; array_entries)
+        cell_priors, cell_latents, cell_geometries =
+        _partition_statements(ast, data; array_entries, mod)
     for name in conditioned
         any(f -> f.lhs === name, factors) && continue
         input = _conditioned_input(name)
@@ -1295,7 +1296,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         union(data, derived_response_names), canonmap)
     union!(declaration_dependencies, (s.lhs for s in factors))
     union!(declaration_dependencies, cell_priors)
-    declaration_data = Set{Symbol}(nm for nm in declaration_dependencies
+    union!(declaration_dependencies, (g.logjac for g in values(cell_geometries)))
+    declaration_data =Set{Symbol}(nm for nm in declaration_dependencies
         if haskey(canonmap, nm) && _data_only(canonmap[nm], data, canonmap))
     # Design matrices leave `det` for the plan-level table (validated
     # here; `detshape` keeps their `:matrix` shape for downstream
@@ -1696,7 +1698,8 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
         indexed_observations,
         cell_broadcasts = Dict{Symbol,Vector{Symbol}}(k => v for (k, v) in cell_broadcasts
             if k in indexed_observations || k in indexed_external),
-        named_values, factors = factor_params, cell_priors, cell_latents)
+        named_values, factors = factor_params, cell_priors, cell_latents,
+        cell_geometries)
     _confirm_whole_value_data(plan, rawdata; whole)
     validate_structure(plan)
     return plan
@@ -3415,7 +3418,7 @@ function _is_retired_panel_sample(st::Expr)
 end
 
 function _partition_statements(ast::Expr, data::Set{Symbol};
-        array_entries::Set{Symbol} = Set{Symbol}())
+        array_entries::Set{Symbol} = Set{Symbol}(), mod::Module = Main)
     sample = SampleStmt[]
     factors = SampleStmt[]
     det = Pair{Symbol,Any}[]
@@ -3436,8 +3439,10 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
     cell_broadcasts = Dict{Symbol,Vector{Symbol}}()
     cell_priors = Symbol[]
     cell_latents = Dict{Symbol,Tuple{Symbol,Symbol}}()
+    cell_geometries = Dict{Symbol,CellGeometry}()
     args, plate_ctx, plate_params = _expand_plates(ast.args, data;
-        broadcasts = cell_broadcasts, array_entries, cell_priors, cell_latents)
+        broadcasts = cell_broadcasts, array_entries, cell_priors, cell_latents,
+        cell_geometries, mod)
     # Defined names, collected before lowering so the checks below admit
     # forward references. The scan never throws — the main loop below owns
     # every rejection.
@@ -3649,7 +3654,7 @@ function _partition_statements(ast::Expr, data::Set{Symbol};
         end
     end
     return sample, factors, det, plate_ctx, plate_params, scans, joints, glms, cell_broadcasts,
-        cell_priors, cell_latents
+        cell_priors, cell_latents, cell_geometries
 end
 
 # ── Design-matrix extraction (slice D1) ─────────────────────────────
@@ -4138,7 +4143,9 @@ function _expand_plates(args, data::Set{Symbol};
         broadcasts::Dict{Symbol,Vector{Symbol}} = Dict{Symbol,Vector{Symbol}}(),
         array_entries::Set{Symbol} = Set{Symbol}(),
         cell_priors::Vector{Symbol} = Symbol[],
-        cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}} = Dict{Symbol,Tuple{Symbol,Symbol}}())
+        cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}} = Dict{Symbol,Tuple{Symbol,Symbol}}(),
+        cell_geometries::Dict{Symbol,CellGeometry} = Dict{Symbol,CellGeometry}(),
+        mod::Module = Main)
     definitions = Dict{Symbol,Any}(arg.args[1] => arg.args[2] for arg in args
         if arg isa Expr && arg.head === :(=) && length(arg.args) == 2 &&
             arg.args[1] isa Symbol)
@@ -4153,6 +4160,8 @@ function _expand_plates(args, data::Set{Symbol};
     # whole-column evaluation splices its locals at model level, so a
     # model statement reading one is refused instead of reading the cell.
     taken = union(data, _expr_names(Expr(:block, args...)))
+    # The names a joint cell latent's RHS resolves module bindings around.
+    value_names = _program_value_names!(copy(data), Expr(:block, args...))
     plate_locals = Set{Symbol}()
     spliced = Dict{Symbol,Tuple{Symbol,Int}}()
     line = 0
@@ -4169,12 +4178,16 @@ function _expand_plates(args, data::Set{Symbol};
             if length(arg.args) >= 2 && arg.args[2] isa LineNumberNode
                 pl = arg.args[2].line
             end
+            joint, arg, geometries, jointpriors, jointsums = _expand_cell_joint_latents(
+                arg, taken, plate_data, mod, value_names)
+            merge!(cell_geometries, geometries)
             latents, arg, sites = _expand_cell_array_latents(arg, taken,
                 _CellLatentScope(plate_data, definitions, _scalar_parameter_names(args),
                     _number_value_names(args, data)))
             merge!(cell_latents, sites)
             prelude, arg, priors = _expand_stochastic_cell_scans(arg, taken)
-            prelude = vcat(latents, prelude)
+            prelude = vcat(joint, latents, prelude)
+            append!(cell_priors, jointpriors)
             append!(expanded, prelude)
             append!(cell_priors, priors)
             for st in prelude
@@ -4198,6 +4211,7 @@ function _expand_plates(args, data::Set{Symbol};
             for prior in priors
                 push!(expanded, :($prior = sum($(Symbol(prior, :_cells)))))
             end
+            append!(expanded, jointsums)
             continue
         end
         push!(expanded, arg)

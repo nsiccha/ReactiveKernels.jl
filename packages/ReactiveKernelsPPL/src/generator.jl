@@ -5471,6 +5471,11 @@ function _log_jacobian_statements(plan::StructuralPlan, layout::LayoutTable)
         end
         push!(terms, t)
     end
+    # A joint cell latent's cells add its geometry's log-Jacobians
+    # (`cell_latent.jl`); its packed array itself is untransformed.
+    for site in sort!(collect(keys(plan.cell_geometries)))
+        push!(terms, plan.cell_geometries[site].logjac)
+    end
     jac = isempty(terms) ? :(0.0) : foldl((a, b) -> :($a + $b), terms)
     push!(stmts, :(log_jacobian::Float64 = $jac))
     return stmts
