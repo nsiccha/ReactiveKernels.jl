@@ -4170,7 +4170,8 @@ function _expand_plates(args, data::Set{Symbol};
                 pl = arg.args[2].line
             end
             latents, arg, sites = _expand_cell_array_latents(arg, taken,
-                _CellLatentScope(plate_data, definitions, _scalar_parameter_names(args)))
+                _CellLatentScope(plate_data, definitions, _scalar_parameter_names(args),
+                    _number_value_names(args, data)))
             merge!(cell_latents, sites)
             prelude, arg, priors = _expand_stochastic_cell_scans(arg, taken)
             prelude = vcat(latents, prelude)

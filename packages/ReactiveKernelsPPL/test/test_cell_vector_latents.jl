@@ -254,6 +254,116 @@ end
     @test !isempty(structures[1])
 end
 
+# One program from statement blocks, as written one after the other.
+_cvl_join(blocks...) = Expr(:block, (a for b in blocks
+    for a in (Meta.isexpr(b, :block) ? b.args : Any[b]))...)
+
+# A model value holding numbers, read at an index, is a number there, as in
+# Julia: a declared vector, a dotted definition over scalars and data, its
+# cell local, a gather, a design product, an earlier latent plate and a scan
+# trajectory. Each `v[i]` then has `mu[i]`'s shape.
+@testset "cell latents: model values read at the index" begin
+    mu = [[10.0, 20.0, 5.0], [7.0, 3.0]]
+    lm = [log.(c) for c in mu]
+    x, g, gl, X = [0.3, -0.4], [3, 1], [20, 10], [1.0 0.3; 1.0 -0.4]
+    rows = [[1, 2, 2], [3, 1]]
+    cells(u) = [u[1:3], u[4:5]]
+    shifted(m) = [l .+ mk for (l, mk) in zip(lm, m)]
+    vlp(locs, v, s) = sum(sum(logpdf.(Normal.(l, s), w)) for (l, w) in zip(locs, v))
+    latent(read) = :(@plate for i in eachindex(mu)
+        v[i] .~ Normal.(log.(mu[i]) .+ $read, 0.5)
+    end)
+    affine = quote
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        m = a .+ b .* x
+    end
+    # The two leading coordinates locate the two cells by `m`.
+    two(m, u) = sum(logpdf.(Normal(), u[1:2])) + vlp(shifted(m), cells(u[3:7]), 0.5)
+    cases = [
+        # A declared vector, as `m ~ filldist(Normal(0, 1), 2)` reads in Turing.
+        (_cvl_join(:(m[1:2] .~ Normal.(0, 1)), latent(:(m[i]))), (; mu),
+            u -> two(u[1:2], u), [:m, :m]),
+        (_cvl_join(affine, latent(:(m[i]))), (; mu, x),
+            u -> two(u[1] .+ u[2] .* x, u), [:a, :b]),
+        (_cvl_join(affine, quote
+            @plate for i in eachindex(mu)
+                mi = m[i]
+                v[i] .~ Normal.(log.(mu[i]) .+ mi, 0.5)
+            end
+        end), (; mu, x), u -> two(u[1] .+ u[2] .* x, u), [:a, :b]),
+        (_cvl_join(:(m[1:3] .~ Normal.(0, 1)), latent(:(m[g[i]]))), (; mu, g),
+            u -> sum(logpdf.(Normal(), u[1:3])) + vlp(shifted(u[g]), cells(u[4:8]), 0.5),
+            [:m, :m, :m]),
+        # Labels of a `levels(…)` axis are looked up, as in any other read.
+        (_cvl_join(:(m[levels(gl)] .~ Normal.(0, 1)), latent(:(m[gl[i]]))), (; mu, gl),
+            u -> two(u[[2, 1]], u), [:m, :m]),
+        (_cvl_join(:(b[axes(X, 2)] .~ Normal.(0, 1)), :(m = X * b), latent(:(m[i]))),
+            (; mu, X), u -> two(X * u[1:2], u), [:b, :b]),
+        (_cvl_join(quote
+            @plate for j in eachindex(mu)
+                z[j] ~ Normal(0, 1)
+            end
+        end, latent(:(z[i]))), (; mu), u -> two(u[1:2], u), [:z, :z]),
+        (_cvl_join(quote
+            @scan begin
+                h[1] ~ Normal(0, 1)
+                for t in 2:T
+                    h[t] ~ Normal(h[t - 1], 0.3)
+                end
+            end
+        end, latent(:(h[i]))), (; mu, T = 2), u -> logpdf(Normal(), u[1]) +
+            logpdf(Normal(u[1], 0.3), u[2]) + vlp(shifted(u[1:2]), cells(u[3:7]), 0.5),
+            [:h, :h]),
+        # An index holding an array gathers that many entries.
+        (_cvl_join(:(m[1:3] .~ Normal.(0, 1)), latent(:(m[rows[i]]))), (; mu, rows),
+            u -> sum(logpdf.(Normal(), u[1:3])) +
+                vlp([l .+ u[r] for (l, r) in zip(lm, rows)], cells(u[4:8]), 0.5),
+            [:m, :m, :m]),
+        # A scale read at the index.
+        (_cvl_join(:(m[1:2] .~ Normal.(0, 1)), quote
+            @plate for i in eachindex(mu)
+                v[i] .~ Normal.(log.(mu[i]), exp(m[i]))
+            end
+        end), (; mu), u -> sum(logpdf.(Normal(), u[1:2])) +
+            sum(sum(logpdf.(Normal.(lm[k], exp(u[k])), w)) for (k, w) in enumerate(cells(u[3:7]))),
+            [:m, :m]),
+    ]
+    for (ast, data, oracle, heads) in cases
+        saved = deepcopy(data)
+        n = length(heads) + 5
+        for source in (data, keys(data))
+            bound = bind_data(lower_rkppl(ast, source), data)
+            built = build_kernel(bound)
+            names = coordinate_names(built.layout)
+            @test [Symbol(first(split(String(s), "."))) for s in names[1:(n - 5)]] == heads
+            @test names[(n - 4):end] == Symbol.(["v.1.1", "v.1.2", "v.1.3", "v.2.1", "v.2.2"])
+            u = collect(range(-0.4, 2.1; length = n))
+            @test constrain(built.layout, u).v == cells(u[(n - 4):end])
+            sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+            for w in (u, reverse(u))
+                value, gradient = sampler_value_and_gradient!(sampler, similar(w), w)
+                @test value ≈ oracle(w) rtol = 1e-12
+                @test gradient ≈ _cvl_fd(oracle, w) rtol = 1e-6 atol = 1e-8
+            end
+        end
+        @test data == saved
+    end
+    # Rebinding sizes each index again from the data.
+    plan = lower_rkppl(cases[2][1], (:mu, :x))
+    mus = [[1.0, 2.0], [3.0], [4.0, 5.0, 6.0]]
+    xs = [0.1, 0.2, 0.3]
+    bound = bind_data(plan, (; mu = mus, x = xs))
+    built = build_kernel(bound)
+    @test built.layout.total == 2 + 6
+    u = collect(range(0.1, 0.8; length = 8))
+    lt = constrain(built.layout, u).v
+    @test lt == [u[3:4], u[5:5], u[6:8]]
+    m = u[1] .+ u[2] .* xs
+    @test _cvl_q(built, bound, :prior, u) ≈ sum(logpdf.(Normal(), u[1:2])) +
+        sum(sum(logpdf.(Normal.(log.(mus[k]) .+ m[k], 0.5), lt[k])) for k in 1:3) rtol = 1e-12
+end
+
 @testset "cell latents: dimensions that differ by index, and shapes not built yet" begin
     # Valid Julia, but each cell then reads a value of another type: warned,
     # not refused (user feedback on `0027dq6`, review `1dvac2l`).
@@ -299,6 +409,53 @@ end
     catch err
         err isa SurfaceLoweringError &&
             occursin("not built yet", sprint(showerror, err)) || rethrow()
+        true
+    end
+    @test_broken !gap
+    # Not built yet either: a model value read with `:` (its extent is the
+    # declaration's), an earlier plate's outputs, and a definition holding
+    # one array per index (`b .* w` over arrays) read at the index.
+    mu = [[10.0, 20.0, 5.0], [7.0, 3.0]]
+    by_colon = quote
+        B[1:2, 1:3] .~ Normal.(0, 1)
+        @plate for i in eachindex(mu)
+            v[i] .~ Normal.(B[i, :], 0.5)
+        end
+    end
+    by_output = quote
+        a ~ Normal(0, 1)
+        @plate for j in eachindex(mu)
+            r[j] = a + j
+        end
+        @plate for i in eachindex(mu)
+            v[i] .~ Normal.(log.(mu[i]) .+ r[i], 0.5)
+        end
+    end
+    for ast in (by_colon, by_output)
+        gap = try
+            lower_rkppl(ast, (; mu))
+            false
+        catch err
+            err isa SurfaceLoweringError &&
+                occursin("must follow from data", sprint(showerror, err)) || rethrow()
+            true
+        end
+        @test_broken !gap
+    end
+    by_arrays = quote
+        b ~ Normal(0, 1)
+        m = b .* w
+        @plate for i in eachindex(mu)
+            v[i] .~ Normal.(log.(mu[i]) .+ m[i], 0.5)
+        end
+    end
+    data = (; mu, w = [[1.0, 2.0, 3.0], [4.0, 5.0]])
+    gap = try
+        bind_data(lower_rkppl(by_arrays, data), data)
+        false
+    catch err
+        err isa ContractValidationError &&
+            occursin("holds numbers", sprint(showerror, err)) || rethrow()
         true
     end
     @test_broken !gap
