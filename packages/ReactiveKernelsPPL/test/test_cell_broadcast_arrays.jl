@@ -414,3 +414,38 @@ end
     # (DimensionMismatch)
     @test_throws "does not broadcast" mismatched(; x = [[0.1, 0.2], [0.3, 0.4], Float64[]]) | (; y)
 end
+
+# A model value a cell reads at its index, here a `@scan` trajectory, is
+# read by the cell's array plate whole, as any other model value.
+@testset "dotted plate cells over arrays read a scan trajectory at the index" begin
+    mu = [[10.0, 20.0, 5.0], [7.0, 3.0]]
+    y = [[2.4, 3.1, 1.5], [1.9, 1.2]]
+    ast = quote
+        @scan begin
+            h[1] ~ Normal(0, 1)
+            for t in 2:T
+                h[t] ~ Normal(h[t - 1], 0.3)
+            end
+        end
+        @plate for i in eachindex(mu)
+            y[i] .~ Normal.(log.(mu[i]) .+ h[i], 0.5)
+        end
+    end
+    data = (; mu, T = 2, y)
+    oracle(u) = logpdf(Normal(), u[1]) + logpdf(Normal(u[1], 0.3), u[2]) +
+        sum(sum(logpdf.(Normal.(log.(mu[k]) .+ u[k], 0.5), y[k])) for k in 1:2)
+    for source in (data, keys(data))
+        bound = bind_data(lower_rkppl(ast, source; conditioned = (:y,)), data)
+        built = build_kernel(bound)
+        @test coordinate_names(built.layout) == [Symbol("h.1"), Symbol("h.2")]
+        sampler = prepare_sampler(built, bound, [0.2, -0.3];
+            backend = AutoEnzyme(; mode = Enzyme.Reverse))
+        for u in ([0.2, -0.3], [-0.5, 0.4])
+            value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+            @test value ≈ oracle(u) rtol = 1e-12
+            fd = [(oracle(u .+ h .* (1:2 .== j)) - oracle(u .- h .* (1:2 .== j))) / 2h
+                for j in 1:2 for h in (cbrt(eps()),)]
+            @test gradient ≈ fd rtol = 1e-6 atol = 1e-8
+        end
+    end
+end

@@ -7,12 +7,14 @@
 # argument's entries flattened in that order. The prior, transform and
 # Jacobian are therefore the array prior's, and each cell reads its own block.
 # The shapes must follow from data at binding. They are read from data per
-# index, from scalar parameters and from the dotted arithmetic between them.
+# index, from scalar parameters, from model values read at an index (as
+# Julia indexes them) and from the dotted arithmetic between them.
 
 struct _CellLatentScope
     data::Set{Symbol}               # data and data-only definitions
     definitions::Dict{Symbol,Any}   # model-level definitions
     scalars::Set{Symbol}            # scalar parameters declared at model level
+    numbers::Set{Symbol}            # sampled model values holding numbers
 end
 
 # Model-level `x ~ D(…)` with a scalar prior: a number wherever it is read.
@@ -28,6 +30,50 @@ end
 _scalar_prior_object(ex) = Meta.isexpr(ex, :call) && !isempty(ex.args) &&
     (ex.args[1] in _SCALAR_PRIOR_HEADS || ex.args[1] in (:truncated, :restricted) &&
         length(ex.args) >= 2 && _scalar_prior_object(ex.args[2]))
+
+# Sampled model values that hold numbers, so that reading one at an index
+# gives a number (or an array of numbers for an array index): every
+# model-level declaration (a number, or an array of numbers whatever its
+# prior), the scalar latents and multivariate rows of a latent `@plate`, and
+# the carried arrays of a `@scan`. Data are observations, not parameters.
+function _number_value_names(args, data::Set{Symbol})
+    out = Set{Symbol}()
+    add!(name) = name isa Symbol && !(name in data) && push!(out, name)
+    for st in args
+        st isa Expr || continue
+        if Meta.isexpr(st, :call, 3) && st.args[1] in (:~, :.~)
+            add!(_declared_value_name(st.args[2]))
+        elseif Meta.isexpr(st, :macrocall, 3) && st.args[1] === Symbol("@plate") &&
+                Meta.isexpr(st.args[3], :for) && Meta.isexpr(st.args[3].args[1], :(=), 2)
+            ivar = st.args[3].args[1].args[1]
+            for c in st.args[3].args[2].args
+                Meta.isexpr(c, :call, 3) && c.args[1] === :~ &&
+                    Meta.isexpr(c.args[2], :ref) && length(c.args[2].args) >= 2 &&
+                    c.args[2].args[2] === ivar || continue
+                rhs = c.args[3]
+                (length(c.args[2].args) == 2 ? _scalar_prior_object(rhs) :
+                    Meta.isexpr(rhs, :call) && rhs.args[1] in (:MvNormal, :MvNormalCholesky)) ||
+                    continue
+                add!(c.args[2].args[1])
+            end
+        elseif Meta.isexpr(st, :macrocall) && st.args[1] === Symbol("@scan") &&
+                Meta.isexpr(st.args[end], :block)
+            for c in st.args[end].args
+                lhs = Meta.isexpr(c, :(=), 2) ? c.args[1] :
+                    Meta.isexpr(c, :call, 3) && c.args[1] === :~ ? c.args[2] : nothing
+                Meta.isexpr(lhs, :ref) && add!(lhs.args[1])
+            end
+        end
+    end
+    return out
+end
+
+# The value a declaration's left-hand side names: `x`, `x[…]`, `eachrow(B[…])`.
+_declared_value_name(lhs::Symbol) = lhs
+_declared_value_name(lhs::Expr) = Meta.isexpr(lhs, :ref) ? _declared_value_name(lhs.args[1]) :
+    Meta.isexpr(lhs, :call, 2) && lhs.args[1] in (:eachrow, :eachcol) ?
+        _declared_value_name(lhs.args[2]) : nothing
+_declared_value_name(lhs) = nothing
 
 _is_cell_array_latent(c, ivar::Symbol, data::Set{Symbol}) =
     Meta.isexpr(c, :call, 3) && c.args[1] === :.~ &&
@@ -105,10 +151,15 @@ function _cell_latent_shape(ex, cx::_CellShapes, active::Set{Symbol} = Set{Symbo
             dims, pos = cx.arrays[ex.args[1]]
             return Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_axes), dims, pos)
         end
-        return (nothing, "`$(ex.args[1])` is not data or a latent of this cell")
     end
     if ex.head === :ref && all(i -> i isa Integer, ex.args[2:end])
         return :scalar
+    end
+    # A model value read at an index (`m[i]`, `m[g[i]]`, `B[i, 1]`).
+    if ex.head === :ref && ex.args[1] isa Symbol &&
+            !any(l -> first(l) === ex.args[1], cx.locals) &&
+            !(ex.args[1] in cx.scalars) && !haskey(cx.arrays, ex.args[1])
+        return _cell_read_shape(ex.args[1], ex.args[2:end], cx, active)
     end
     dotted = _is_dotted_call(ex) ? ex.args[2].args :
         Meta.isexpr(ex, :call) && ex.args[1] isa Symbol &&
@@ -120,19 +171,102 @@ function _cell_latent_shape(ex, cx::_CellShapes, active::Set{Symbol} = Set{Symbo
     if Meta.isexpr(ex, :call) && ex.args[1] isa Symbol
         f = ex.args[1]
         f in REDUCTION_FNS && length(ex.args) == 2 && return :scalar
-        if f in _CELL_SCALAR_CALLS
-            shapes = Any[_cell_latent_shape(a, cx, active) for a in ex.args[2:end]]
-            for s in shapes
-                s isa Tuple && return s
-            end
-            all(s -> s === :scalar, shapes) && return :scalar
-            f in (:+, :-, :*, :/) || return (nothing, "`$f` of an array is not elementwise")
-            return Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_call_axes),
-                QuoteNode(f), (s === :scalar ? :(()) : s for s in shapes)...)
-        end
+        f in _CELL_SCALAR_CALLS && return _cell_call_shape(f,
+            Any[_cell_latent_shape(a, cx, active) for a in ex.args[2:end]])
     end
     return (nothing, "`$ex` computes from sampled values, and its shape is " *
         "not known before sampling")
+end
+
+# The shape of an undotted scalar call over its arguments' shapes.
+function _cell_call_shape(f::Symbol, shapes)
+    for s in shapes
+        s isa Tuple && return s
+    end
+    all(s -> s === :scalar, shapes) && return :scalar
+    f in (:+, :-, :*, :/) || return (nothing, "`$f` of an array is not elementwise")
+    return Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_call_axes),
+        QuoteNode(f), (s === :scalar ? :(()) : s for s in shapes)...)
+end
+
+# The shape of `name[idx...]`, a model value read at an index in a cell:
+# Julia indexes an array of numbers to a number at scalar indices, and to
+# the indices' shapes otherwise. Data a definition computes from must hold
+# numbers too, which binding checks.
+function _cell_read_shape(name::Symbol, idx, cx::_CellShapes, active::Set{Symbol})
+    name in cx.scope.data && return (nothing, "`$name` is indexed by a sampled value")
+    checks = _cell_number_checks!(Any[], name, cx, active)
+    checks isa Tuple && return checks
+    index = _cell_index_shape(idx, cx, active)
+    (index isa Tuple || isempty(checks)) && return index
+    return Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_number_entries),
+        Expr(:tuple, (QuoteNode(c) for c in checks)...), Expr(:tuple, checks...),
+        index === :scalar ? :(()) : index)
+end
+
+# Does a model-level expression hold numbers? The data it reads are checked
+# at binding (`checks`); sampled values hold numbers; arithmetic, scalar
+# functions, concatenations and reads of numbers hold numbers.
+function _cell_number_checks!(checks, ex, cx::_CellShapes, active::Set{Symbol})
+    ex isa Number && return checks
+    if _cell_reads_only_data(ex, cx)
+        push!(checks, ex)
+        return checks
+    end
+    if ex isa Symbol
+        (ex in cx.scope.numbers || ex in cx.scope.scalars) && return checks
+        if haskey(cx.scope.definitions, ex) && !(ex in active)
+            push!(active, ex)
+            out = _cell_number_checks!(checks, cx.scope.definitions[ex], cx, active)
+            delete!(active, ex)
+            return out
+        end
+        return (nothing, "`$ex` is not data, a declared parameter or a model definition")
+    end
+    unknown = (nothing, "`$ex` computes from sampled values, and its shape is " *
+        "not known before sampling")
+    ex isa Expr || return unknown
+    Meta.isexpr(ex, :ref) && return _cell_number_checks!(checks, ex.args[1], cx, active)
+    Meta.isexpr(ex, Symbol("'"), 1) && return _cell_number_checks!(checks, ex.args[1], cx, active)
+    # `[a, b]` holds its elements, so they must be numbers; `[a; b]` and
+    # `[a b]` concatenate theirs.
+    if Meta.isexpr(ex, :vect)
+        all(a -> _cell_latent_shape(a, cx, active) === :scalar, ex.args) || return unknown
+        return checks
+    end
+    operands = ex.head in (:vcat, :hcat, :row) ? ex.args :
+        _is_dotted_call(ex) && ex.args[1] isa Symbol && ex.args[1] in _CELL_SCALAR_CALLS ?
+            ex.args[2].args :
+        Meta.isexpr(ex, :call) && ex.args[1] isa Symbol &&
+            (ex.args[1] in _CELL_SCALAR_CALLS || ex.args[1] in REDUCTION_FNS ||
+             ex.args[1] in (:adjoint, :transpose, :vec, :vcat, :hcat) ||
+             startswith(string(ex.args[1]), ".") &&
+                Symbol(string(ex.args[1])[2:end]) in _CELL_SCALAR_CALLS) ?
+            filter(a -> !Meta.isexpr(a, (:parameters, :kw)), ex.args[2:end]) : nothing
+    operands === nothing && return unknown
+    for a in operands
+        checks = _cell_number_checks!(checks, a, cx, active)
+        checks isa Tuple && return checks
+    end
+    return checks
+end
+
+# The shape of indexing an array of numbers: a number at scalar indices
+# (the loop index, positions, `end`, integers read per index), otherwise
+# the indices' shapes in order, as Julia's indexing gives.
+function _cell_index_shape(idx, cx::_CellShapes, active::Set{Symbol})
+    shapes = Any[]
+    for j in idx
+        j === :(:) && return (nothing, "a `:` read of a model value is not built yet; " *
+            "read its entries by position")
+        s = j === cx.ivar || j isa Integer || _is_endpoint_position(j) ? :scalar :
+            _cell_latent_shape(j, cx, active)
+        s isa Tuple && return s
+        push!(shapes, s)
+    end
+    all(s -> s === :scalar, shapes) && return :scalar
+    return Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_index_axes),
+        (s === :scalar ? :(()) : s for s in shapes)...)
 end
 
 function _cell_broadcast_shape(shapes)
@@ -287,6 +421,22 @@ function _ppl_cell_latent_call_axes(f::Symbol, axes::Tuple...)
     length(arrays) == 1 && return only(arrays)
     throw(ArgumentError("a cell latent argument applies `$f` to several arrays; " *
         "write its elementwise form (`.$f`)"))
+end
+
+# The axes of an array read at indices: the indices' axes in order.
+_ppl_cell_index_axes(axes::Tuple...) = (Iterators.flatten(axes)...,)
+
+# A model value read at an index is an array of numbers only when the data
+# it computes from hold numbers.
+function _ppl_cell_number_entries(names::Tuple, values::Tuple, axes::Tuple)
+    for (name, x) in zip(names, values)
+        x isa Number || x isa AbstractArray &&
+            (eltype(x) <: Number || all(v -> v isa Number, x)) ||
+            throw(ArgumentError("a cell latent argument reads a model value at an " *
+                "index, which is a number only when `$name` holds numbers; it " *
+                "holds a $(typeof(x))"))
+    end
+    return axes
 end
 
 # One index's entries of an argument, broadcast to that index's dimensions

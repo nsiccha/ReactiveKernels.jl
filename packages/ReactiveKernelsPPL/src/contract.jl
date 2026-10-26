@@ -3539,7 +3539,8 @@ function _collect_plate_column_refs!(refs, ex, plan, label, bound::Bool)
     known = union(_union_names(plan), _vector_value_names(plan),
         Set{Symbol}(d.name for d in plan.derived),
         Set{Symbol}(p.name for p in plan.array_parameters),
-        Set{Symbol}(p.name for p in plan.plate_parameters))
+        Set{Symbol}(p.name for p in plan.plate_parameters),
+        Set{Symbol}(a for s in plan.scans for a in s.states))
     for inp in ex.args[1].args[2:end]
         if Meta.isexpr(inp, :ref, 2) && inp.args[1] isa Expr &&
                 inp.args[1].head === :call &&
