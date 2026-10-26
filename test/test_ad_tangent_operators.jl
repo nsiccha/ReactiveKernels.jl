@@ -15,6 +15,14 @@ end
     mean = data .* exp.(s .* q)
 end
 
+# Two WANT ports read one shared intermediate, so one sweep computes both.
+@kernel tangent_ports(q::Vector{Float64}, s::Float64;
+                      data::Vector{Float64}) = begin
+    shared = exp.(s .* q)
+    mean = data .* shared
+    total::Float64 = sum(shared) + s^2
+end
+
 # A design-matrix product: reads its constant matrix to build an
 # intermediate array.
 @kernel tangent_design(beta::Vector{Float64}; X::Matrix{Float64}) = begin
@@ -149,6 +157,117 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
               _tangent_jacobian(q, s, data) * v
         @test_throws ArgumentError prepare_ad_pushforward(
             low_level, forward, (v,), q, s, data; active = :q, data)
+    end
+
+    # Several WANT ports differentiate as the kernel's tuple result: one
+    # cotangent per port in, the sum of the ports' vector-Jacobian products
+    # out; one tangent per port out of each direction.
+    @testset "several WANT ports in one sweep" begin
+        reverse = AutoEnzyme(; mode = Enzyme.Reverse)
+        wants = (:mean, :total)
+        shared(q, s) = exp.(s .* q)
+        port_values(q, s, data) = (data .* shared(q, s), sum(shared(q, s)) + s^2)
+        # Jᵀ seed in q and in s, summed over both ports.
+        vjp_q(q, s, data, (a, b)) =
+            data .* s .* shared(q, s) .* a .+ b .* s .* shared(q, s)
+        vjp_s(q, s, data, (a, b)) =
+            dot(a, data .* q .* shared(q, s)) +
+            b * (sum(q .* shared(q, s)) + 2s)
+        jvp_q(q, s, data, w) =
+            (data .* s .* shared(q, s) .* w, dot(s .* shared(q, s), w))
+        seed = ([1.0, -0.5, 2.0], 0.75)
+        seed2 = ([0.3, 0.2, -1.0], -2.0)
+
+        prepared = prepare_ad_pullback(tangent_ports, reverse, seed, q, s;
+                                       data, active = :q, want = wants)
+        @test prepared isa PreparedADPullback
+        @test occursin("PreparedADPullback(active=:q, want=(:mean, :total)",
+                       sprint(show, prepared))
+        @test ad_pullback(prepared, seed, q, s; data) ≈ vjp_q(q, s, data, seed)
+        for (newq, news, newdata) in (([0.1, 0.0, -0.1], 1.1, [1.0, 2.0, 3.0]),
+                                      ([-0.5, 0.4, 0.3], 0.2, [0.5, 0.5, -4.0]))
+            value, cotangent = ad_value_and_pullback(
+                prepared, seed2, newq, news; data = newdata)
+            @test all(value .≈ port_values(newq, news, newdata))
+            @test cotangent ≈ vjp_q(newq, news, newdata, seed2)
+        end
+        # The same as one pullback per port, summed.
+        per_port = sum(zip(wants, seed)) do (want, port_seed)
+            ad_pullback(prepare_ad_pullback(tangent_ports, reverse, port_seed,
+                                            q, s; data, active = :q, want),
+                        port_seed, q, s; data)
+        end
+        @test ad_pullback(prepared, seed, q, s; data) ≈ per_port
+        destination = similar(q)
+        value, returned = ad_value_and_pullback!(
+            prepared, destination, seed, q, s; data)
+        @test returned === destination
+        @test destination ≈ vjp_q(q, s, data, seed)
+        @test all(value .≈ port_values(q, s, data))
+        @test ad_pullback(tangent_ports, reverse, seed, q, s;
+                          data, active = :q, want = wants) ≈
+              vjp_q(q, s, data, seed)
+
+        # A tuple selector: one cotangent per active port.
+        both = prepare_ad_pullback(tangent_ports, reverse, seed, q, s;
+                                   data, active = (:q, :s), want = wants)
+        cotangent_q, cotangent_s = ad_pullback(both, seed2, q, s; data)
+        @test cotangent_q ≈ vjp_q(q, s, data, seed2)
+        @test cotangent_s ≈ vjp_s(q, s, data, seed2)
+
+        # A low-level kernel prepared with several WANT ports, with its data
+        # bound, as `prepare(spec; have, want, bound)` builds it.
+        low_level = prepare(tangent_ports; have = (:q, :s, :data), want = wants,
+                            bound = (; data))
+        direct = prepare_ad_pullback(low_level, reverse, seed, q, s;
+                                     active = :q)
+        @test ad_pullback(direct, seed2, q, s) ≈ vjp_q(q, s, data, seed2)
+        @test ad_pullback(low_level, reverse, seed2, q, s; active = :q) ≈
+              vjp_q(q, s, data, seed2)
+
+        # A backend that does not keep its primal sweep evaluates the port
+        # values separately.
+        @test !ad_retains_primal_sweep(forward)
+        forward_pullback = prepare_ad_pullback(
+            tangent_ports, forward, seed, q, s; data, active = :q, want = wants)
+        value, cotangent = ad_value_and_pullback(forward_pullback, seed2, q, s;
+                                                 data)
+        @test all(value .≈ port_values(q, s, data))
+        @test cotangent ≈ vjp_q(q, s, data, seed2)
+
+        # Pushforwards: one tangent per port in each direction.
+        units = ntuple(i -> _tangent_unit(3, i), 3)
+        pushforward = prepare_ad_pushforward(tangent_ports, forward, units, q, s;
+                                             data, active = :q, want = wants)
+        @test occursin("PreparedADPushforward(active=:q, want=(:mean, :total)",
+                       sprint(show, pushforward))
+        value, jvps = ad_value_and_pushforward(pushforward, units, q, s; data)
+        @test all(value .≈ port_values(q, s, data))
+        for (unit, jvp) in zip(units, jvps)
+            @test jvp isa Tuple{Vector{Float64},Float64}
+            @test all(jvp .≈ jvp_q(q, s, data, unit))
+        end
+        direct_pushforward = prepare_ad_pushforward(low_level, forward, (v,),
+                                                    q, s; active = :q)
+        @test all(only(ad_pushforward(direct_pushforward, (v,), q, s)) .≈
+                  jvp_q(q, s, data, v))
+
+        # refused: a vector-Jacobian product pairs each port with a cotangent
+        # of that port's structure, so a missing port or a misshapen cotangent
+        # has no meaning.
+        for wrong in (first(seed), (first(seed),), (first(seed), [1.0]),
+                      ([1.0, 2.0], 0.75))
+            @test_throws ArgumentError prepare_ad_pullback(
+                tangent_ports, reverse, wrong, q, s;
+                data, active = :q, want = wants)
+        end
+        # refused: a gradient or Hessian-vector product is of one scalar
+        # objective; several ports have no single gradient.
+        @test_throws ArgumentError prepare_ad(
+            tangent_ports, reverse, q, s; data, active = :q, want = wants)
+        @test_throws ArgumentError prepare_ad_hvp(
+            tangent_ports, second_order, (v,), q, s;
+            data, active = :q, want = wants)
     end
 
     @testset "tangent and WANT checks name the boundary" begin
