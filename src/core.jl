@@ -82,6 +82,8 @@ function __init__()
     # process that generates an image gives that image a key of its own.
     generating = ccall(:jl_generating_output, Cint, ()) != 0
     _VALUE_NAMESPACE[] = ValueNamespace(generating ? rand(RandomDevice(), UInt) : zero(UInt))
+    # Programs that package images loaded from now on compiled (`compile`).
+    push!(Base.package_callbacks, _register_image_programs)
     nothing
 end
 

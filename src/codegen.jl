@@ -5735,13 +5735,17 @@ Prepared callables may be stored as package-level constants: during package
 precompilation, the package being compiled owns the generated expression cache.
 Global names in the lowered body still resolve in `ReactiveKernels`. The
 callable does not hold the expression; the cache retains it for
-`RuntimeGeneratedFunctions.get_expression`.
+`RuntimeGeneratedFunctions.get_expression`. A program that a loaded package
+image compiled returns that image's generated function, with the code the
+image compiled for it.
 """
 function compile(ast::Expr)
     ast = _canonical_locals(ast)
+    f = RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast)
+    image = _image_program(f)
+    image === nothing || return image
     cache_module = _generated_function_cache_module()
-    cache_module === (@__MODULE__) && return RuntimeGeneratedFunctions.drop_expr(
-        RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast))
+    cache_module === (@__MODULE__) && return RuntimeGeneratedFunctions.drop_expr(f)
     Base.invokelatest(RuntimeGeneratedFunctions.init, cache_module)
     # The cache and generated method must share an owner on Julia 1.12: a
     # generator defined in an older dependency cannot read new global bindings.
@@ -5751,16 +5755,17 @@ function compile(ast::Expr)
         GlobalRef(@__MODULE__, Symbol("@_native_context")), LineNumberNode(0), ast))
     # Hygiene renames every local through the global `gensym` counter again.
     qualified = _canonical_locals(_native_parameter_names(ast, qualified))
-    f = Base.invokelatest(RuntimeGeneratedFunction, cache_module, cache_module, qualified)
+    native = Base.invokelatest(RuntimeGeneratedFunction, cache_module, cache_module, qualified)
     # The call needs only the callable's type. A retained body is a mutable
     # `Expr` in every prepared callable, and wherever the generated call is not
     # inlined, such as a prepared lazy-arm child, Julia passes the callable by
     # reference; ordinary Enzyme reverse then cannot prove it read-only.
-    f = Base.invokelatest(RuntimeGeneratedFunctions.drop_expr, f)
+    native = Base.invokelatest(RuntimeGeneratedFunctions.drop_expr, native)
+    _record_image_program!(cache_module, f, native)
     # Only functions prepared before the new context method becomes visible
     # need this barrier, e.g. a builder that immediately warms its first kernel.
-    applicable(RuntimeGeneratedFunctions.generated_callfunc, f) ? f :
-        _PrecompileWarmFunction(f)
+    applicable(RuntimeGeneratedFunctions.generated_callfunc, native) ? native :
+        _PrecompileWarmFunction(native)
 end
 
 macro _native_context(ast)
@@ -5872,6 +5877,82 @@ function _image_target_module()
     end
     # Non-package output generation has no package-loader target.
     target === nothing ? nothing : Base.root_module(target)
+end
+
+# A program compiled while a package image is generated gets a generated
+# function tagged with that image's cache, so an identical program prepared
+# after loading the image would mint a new RuntimeGeneratedFunction type and
+# compile it again in every process. The image therefore keeps, in its root
+# module, the function it made for each program, keyed by the identity of the
+# function `compile` makes from the same lowered expression in RK's own cache:
+# its argument names and the content id RuntimeGeneratedFunctions computes from
+# the body, which is the same in every process. Loading the image registers
+# that table, and `compile` returns the image's function for a program in it.
+struct _ImagePrograms
+    functions::Dict{Any,Any}
+end
+
+const _IMAGE_PROGRAMS = Symbol("#_ReactiveKernels_image_programs")
+
+mutable struct _LoadedImagePrograms
+    # Replaced, never mutated, so `compile` reads it without the lock.
+    @atomic tables::Vector{_ImagePrograms}
+    const lock::ReentrantLock
+end
+
+const _LOADED_IMAGE_PROGRAMS = _LoadedImagePrograms(_ImagePrograms[], ReentrantLock())
+
+# Its argument names and body id. These helpers read type parameters rather
+# than dispatch on them, and the key has one type for every argument count, so
+# they compile once, not once per program.
+Base.@nospecializeinfer function _image_program_key(@nospecialize(f::RuntimeGeneratedFunction))
+    parameters = typeof(f).parameters
+    argnames = parameters[1]::Tuple
+    names = Vector{Symbol}(undef, nfields(argnames))
+    for i in eachindex(names)
+        names[i] = getfield(argnames, i)::Symbol
+    end
+    (names, parameters[4])
+end
+
+# The generated function a loaded image compiled for the program `f` names.
+Base.@nospecializeinfer function _image_program(@nospecialize(f::RuntimeGeneratedFunction))
+    tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
+    isempty(tables) && return nothing
+    key = _image_program_key(f)
+    for table in tables
+        native = get(table.functions, key, nothing)
+        # A caller whose world predates the image cannot call its function.
+        native !== nothing &&
+            applicable(RuntimeGeneratedFunctions.generated_callfunc, native) &&
+            return native
+    end
+    nothing
+end
+
+# Record, in the image being generated, its function for the program `f` names.
+Base.@nospecializeinfer function _record_image_program!(target::Module,
+        @nospecialize(f::RuntimeGeneratedFunction), @nospecialize(native))
+    @lock _LOADED_IMAGE_PROGRAMS.lock begin
+        Base.invokelatest(isdefined, target, _IMAGE_PROGRAMS) ||
+            Core.eval(target, :(const $_IMAGE_PROGRAMS = $(_ImagePrograms(Dict{Any,Any}()))))
+        table = Base.invokelatest(getglobal, target, _IMAGE_PROGRAMS)::_ImagePrograms
+        table.functions[_image_program_key(f)] = native
+    end
+    nothing
+end
+
+# A `Base.package_callbacks` entry, installed by `__init__`: registers the
+# programs table of each package image loaded after ReactiveKernels.
+function _register_image_programs(package::Base.PkgId)
+    mod = Base.root_module(package)
+    isdefined(mod, _IMAGE_PROGRAMS) || return nothing
+    table = getglobal(mod, _IMAGE_PROGRAMS)::_ImagePrograms
+    @lock _LOADED_IMAGE_PROGRAMS.lock begin
+        tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
+        @atomic :release _LOADED_IMAGE_PROGRAMS.tables = push!(copy(tables), table)
+    end
+    nothing
 end
 
 # A plated kernel owns two compiled bodies but presents exactly the same

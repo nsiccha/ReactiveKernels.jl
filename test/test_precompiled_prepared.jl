@@ -219,7 +219,16 @@ using ReactiveKernels, Test
             @test normalized(code_expr(fresh)) == normalized(code_expr(C.BATCH))
             @test inputs(fresh) == inputs(C.BATCH)
             @test outputs(fresh) == outputs(C.BATCH)
-            @test owner(fresh.native) === ReactiveKernels
+            # The image compiled this program, so preparing it after load
+            # reuses the image's generated function, and with it the code the
+            # image compiled, instead of compiling a new one in every process.
+            @test owner(fresh.native) === C
+            @test typeof(fresh.native) ===
+                typeof(ReactiveKernels._native_generated_function(C.BATCH.native))
+            # A program no loaded image compiled is compiled here, as before.
+            total = prepare(C.trajectory; have = C.HAVE, want = :total)
+            @test total(positions[:, 1], args[2:end]...) == expected[2][1]
+            @test owner(total.f) === ReactiveKernels
             # Inputs and earlier outputs retain their contents across calls.
             earlier = C.BATCH(args...)
             @test C.BATCH(2 .* positions, args[2:end]...) != earlier
