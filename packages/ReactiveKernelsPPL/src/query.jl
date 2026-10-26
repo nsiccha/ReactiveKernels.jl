@@ -720,6 +720,11 @@ end
 @inline _compact_cell_point(base, active, indices) =
     _CompactCellPoint(base, active, indices)
 
+# A parameter block read from the overlay is not strided, so a product of it
+# would take LinearAlgebra's generic `mul!`; RK's native product computes it
+# with a typed loop instead (`_native_mul`).
+ReactiveKernels._native_mul_operand(::_CompactCellPoint) = true
+
 function _check_compact_cell_indices(base, active, indices, total)
     length(base) == total || throw(ContractValidationError(
         "[query] packed base length $(length(base)) ≠ layout total $total"))

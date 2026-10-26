@@ -3430,7 +3430,9 @@ end
 # Base; they exist for native Enzyme reverse, which cannot differentiate
 # Base's dense methods when constant and active operands meet, and keep
 # scalar and mixed literals off the generic methods SparseArrays substitutes
-# for Base's (core.jl).  A
+# for Base's (core.jl).  Base's `*` likewise calls `_native_mul`, which
+# computes a matrix product BLAS cannot take with a typed loop instead of
+# LinearAlgebra's generic `mul!` (core.jl).  A
 # callee that a port or local shadows keeps its own meaning, as does a
 # function that merely shares the name; bracket syntax always means Base's
 # functions, as in Julia.  The tensorized companion keeps its own lowering
@@ -3461,7 +3463,8 @@ _native_function_replacement(fn) =
     fn === Base.hcat ? :_native_hcat :
     fn === Base.vcat ? :_native_vcat :
     fn === Base.hvcat ? :_native_hvcat :
-    fn === Base.exp ? :_native_exp : nothing
+    fn === Base.exp ? :_native_exp :
+    fn === Base.:* ? :_native_mul : nothing
 function _native_callee_replacement(callee, mod)
     if callee isa GlobalRef
         isdefined(callee.mod, callee.name) || return nothing
