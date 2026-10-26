@@ -260,8 +260,8 @@ _cvl_join(blocks...) = Expr(:block, (a for b in blocks
 
 # A model value holding numbers, read at an index, is a number there, as in
 # Julia: a declared vector, a dotted definition over scalars and data, its
-# cell local, a gather, a design product, an earlier latent plate and a scan
-# trajectory. Each `v[i]` then has `mu[i]`'s shape.
+# cell local, a gather, a design product, a slice array's rows, an earlier
+# latent plate and a scan trajectory. Each `v[i]` then has `mu[i]`'s shape.
 @testset "cell latents: model values read at the index" begin
     mu = [[10.0, 20.0, 5.0], [7.0, 3.0]]
     lm = [log.(c) for c in mu]
@@ -300,6 +300,11 @@ _cvl_join(blocks...) = Expr(:block, (a for b in blocks
             u -> two(u[[2, 1]], u), [:m, :m]),
         (_cvl_join(:(b[axes(X, 2)] .~ Normal.(0, 1)), :(m = X * b), latent(:(m[i]))),
             (; mu, X), u -> two(X * u[1:2], u), [:b, :b]),
+        # Rows of a slice array; its coordinates are `B.i.j`, column-major.
+        (_cvl_join(:(eachrow(B[1:2, 1:2]) .~ MvNormal(zeros(2), [1.0 0.5; 0.5 2.0])),
+            latent(:(B[i, 2]))), (; mu),
+            u -> sum(logpdf(MvNormal(zeros(2), [1.0 0.5; 0.5 2.0]), u[[k, k + 2]]) for k in 1:2) +
+                vlp(shifted(u[3:4]), cells(u[5:9]), 0.5), [:B, :B, :B, :B]),
         (_cvl_join(quote
             @plate for j in eachindex(mu)
                 z[j] ~ Normal(0, 1)
