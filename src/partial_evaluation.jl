@@ -152,14 +152,81 @@ _partial_plate_input(::AbstractArray) = true
 # Keep the cache boundary on ordinary primitive numeric values and dense arrays
 # of them. A per-cell array (a ragged index list, say) is cached as an array of
 # arrays, the same operand representation as bound ragged data the cell could
-# already receive. An isbits tuple/struct is safe to hold natively, but an array
-# of those values would introduce a new operand representation at the tensor
-# backend boundary.
+# already receive. Records are cached through these leaves (below).
 const _PartialPlateScalar = Union{Bool,Int8,Int16,Int32,Int64,
     UInt8,UInt16,UInt32,UInt64,Float16,Float32,Float64}
 _partial_plate_cacheable(::Type) = false
 _partial_plate_cacheable(::Type{<:_PartialPlateScalar}) = true
 _partial_plate_cacheable(::Type{<:Array{<:_PartialPlateScalar}}) = true
+
+# A tuple, named tuple or immutable record (a per-subject design of index and
+# time vectors, say) whose fields the cache holds, directly or as such records
+# in turn, is cached field by field: one cache value per leaf, in the
+# representation above, and the cell rebuilds the record from its leaves
+# (`_PartialRebuild`). An array of records would be a new operand
+# representation at the backend and AD boundaries (todo `0r1g1v3`); its leaves
+# are the existing one. A field of any other type (a range, a view, an
+# abstract type) keeps the whole record in the residual.
+_partial_plate_record(::Type) = false
+function _partial_plate_record(T::DataType)
+    isconcretetype(T) && fieldcount(T) > 0 &&
+        (T <: Union{Tuple,NamedTuple} || _bound_record_type(T)) &&
+        all(1:fieldcount(T)) do i
+            F = fieldtype(T, i)
+            _partial_plate_cacheable(F) || _partial_plate_record(F)
+        end
+end
+
+"""
+    _PartialRebuild{T}()
+
+The cell operation rebuilding a cached record of type `T` from its fields,
+each one a cached per-cell value or a rebuilt record. It constructs exactly
+`T` from the field values a constructed `T` held, so it does not call `T`'s
+constructors again (as `_bound_rebuild_expr` rebuilds a bound record).
+"""
+struct _PartialRebuild{T} end
+@inline (::_PartialRebuild{T})(fields...) where {T<:NamedTuple} = T(fields)
+@inline (::_PartialRebuild{T})(fields...) where {T<:Tuple} = fields::T
+@generated function (::_PartialRebuild{T})(fields...) where {T}
+    Expr(:new, T, (:(fields[$i]) for i in 1:fieldcount(T))...)
+end
+_opname(::_PartialRebuild{T}) where {T} = "rebuild($T)"
+
+# The leaf columns of `data`, an array of records of type `T` named `name`, in
+# field order, depth first: `(leaf name, array of that field's values)`.
+function _partial_plate_leaves!(leaves, name::Symbol, @nospecialize(T::DataType),
+                                @nospecialize(data::AbstractArray))
+    for i in 1:fieldcount(T)
+        F = fieldtype(T, i)
+        field = Symbol(name, :_, fieldname(T, i))
+        column = similar(data, F)
+        for index in eachindex(data, column)
+            column[index] = getfield(data[index], i)
+        end
+        _partial_plate_cacheable(F) ? push!(leaves, (field, column)) :
+            _partial_plate_leaves!(leaves, field, F, column)
+    end
+    leaves
+end
+
+# The cell values for the leaves of record value `v` (of type `T`), registered
+# in `g` in the order of `_partial_plate_leaves!`, and the recipes rebuilding
+# `v` from them, children first.
+function _partial_plate_rebuild!(recipes::Vector{Recipe}, leaves::Vector{Value},
+                                 g::Graph, v::Value, @nospecialize(T::DataType), fresh)
+    fields = Value[]
+    for i in 1:fieldcount(T)
+        F = fieldtype(T, i)
+        field = value!(g, Symbol(v.name, :_, fieldname(T, i)), F)
+        _partial_plate_cacheable(F) ? push!(leaves, field) :
+            _partial_plate_rebuild!(recipes, leaves, g, field, F, fresh)
+        push!(fields, field)
+    end
+    push!(recipes, Recipe(fresh(), Tuple(fields), (v,), _PartialRebuild{T}(),
+                          0.0, nothing, false))
+    v
+end
 
 # A live array can make a singleton or previously absent dimension empty, so
 # the plate may visit fewer cells than its bound inputs span, or none: eager
@@ -721,15 +788,27 @@ Base.@nospecializeinfer function _partial_plate_recipe(
             isconcretetype(T) || return nothing
             cell_types[canon_id(inner.graph, only(r.outputs).id)] = T
         end
-        # A frontier value the cache cannot hold (a tuple, struct, view or
-        # range, such as a static-vector scan seed) keeps its producer in the
-        # residual cell, evaluated per cell as before; the values that producer
-        # reads become the frontier instead.
+        # A frontier value the cache cannot hold (a view or range, or a record
+        # holding one, such as a static-vector scan seed) keeps its producer in
+        # the residual cell, evaluated per cell as before; the values that
+        # producer reads become the frontier instead. A record is cached by
+        # its leaves when it reads bound data and is not the cell's result. A
+        # record built from no bound value (a named-tuple scan seed) is the
+        # same in every cell and stays in the cell; a cell result keeps the
+        # result rules below.
+        want_id = canon_id(inner.graph, only(inner.want).id)
+        derived = copy(bound)
+        for r in selected
+            any(v -> canon_id(inner.graph, v.id) in derived, r.inputs) &&
+                push!(derived, canon_id(inner.graph, only(r.outputs).id))
+        end
         frontier_ids = Set(canon_id(inner.graph, v.id) for v in frontier)
         uncached = Int[]
         for r in selected
             cid = canon_id(inner.graph, only(r.outputs).id)
-            cid in frontier_ids && !_partial_plate_cacheable(cell_types[cid]) &&
+            T = cell_types[cid]
+            cid in frontier_ids && !_partial_plate_cacheable(T) &&
+                !(cid != want_id && cid in derived && _partial_plate_record(T)) &&
                 push!(uncached, r.id)
         end
         isempty(uncached) && break
@@ -756,7 +835,6 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     # native-reverse-r-79fb001d). A live non-atomic input therefore keeps the
     # authored cell, its runtime domain check and a result allocated per
     # evaluation.
-    want_id = canon_id(inner.graph, only(inner.want).id)
     want_cached = any(v -> canon_id(inner.graph, v.id) == want_id, frontier)
     whole = want_cached && isempty(residual) && length(recipe.outputs) == 1 &&
         all(!isempty, op.axis_checks) &&
@@ -814,38 +892,77 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     position = Dict(index => p for (p, index) in enumerate(keep))
     atomic = Int[position[index] for index in atomic_inputs
                  if haskey(position, index)]
+    # A record that varies across cells is cached by its leaves; one shared by
+    # every cell (computed from atomic inputs alone) is an atomic value whole.
+    cache_names = Symbol[]
     cache_data = Any[]
-    for (index, v) in enumerate(frontier)
+    records = Pair{Value,DataType}[]
+    for v in frontier
         data = arguments[canon_id(inner.graph, v.id)]
         if data isa Ref
-            data = data[]
-            push!(atomic, length(keep) + index)
+            push!(cache_names, v.name)
+            push!(cache_data, data[])
+            push!(atomic, length(keep) + length(cache_data))
+        elseif _partial_plate_cacheable(eltype(data))
+            push!(cache_names, v.name)
+            push!(cache_data, data)
+        else
+            push!(records, v => eltype(data))
+            for (name, column) in _partial_plate_leaves!(Any[], v.name, eltype(data), data)
+                push!(cache_names, name)
+                push!(cache_data, column)
+            end
         end
-        push!(cache_data, data)
     end
     # The rewritten plate and its cache values follow from the decisions
     # above, not from the cached data, so a later binding of a cached bound
     # preparation that decides alike reuses them (`_PlateRewrites`): its
     # residual then differs only in its `_BoundConstant` values.
     key = (recipe.id, copy(bound), copy(excluded), copy(refused),
-           Tuple(r.id for r in residual), Tuple(v.name for v in frontier),
+           Tuple(r.id for r in residual), Tuple(cache_names),
            Tuple(keep), Tuple(atomic), whole,
-           Tuple(Any[typeof(data) for data in cache_data]))
+           Tuple(Any[typeof(data) for data in cache_data]), Tuple(records))
     rewrite = rewrites === nothing ? nothing : _plate_rewrite(rewrites, key)
     if rewrite === nothing
-        scalar_plan = _partial_subplan(inner, vcat(inner.have[keep], frontier),
-                                      inner.want, residual)
+        # The cell reads each cached record through recipes rebuilding it from
+        # its leaf values, which live in a copy of the inner graph.
+        cell_inputs = Value[v for v in frontier if !any(r -> first(r) == v, records)]
+        cell_recipes = residual
+        if !isempty(records)
+            leaves = Value[]
+            rebuilds = Recipe[]
+            next_id = Ref(minimum((r.id for r in inner.recipes); init = 0) - 1)
+            fresh = () -> (id = next_id[]; next_id[] -= 1; id)
+            ig = inner.graph
+            ig = Graph(copy(ig.values), copy(ig.recipes), copy(ig.producers),
+                       copy(ig.aliases), ig.version)
+            for v in frontier
+                index = findfirst(r -> first(r) == v, records)
+                if index === nothing
+                    push!(leaves, v)
+                else
+                    _partial_plate_rebuild!(rebuilds, leaves, ig, v,
+                                            last(records[index]), fresh)
+                end
+            end
+            foreach(r -> readable[r.id] = r, rebuilds)
+            cell_inputs, cell_recipes = leaves, vcat(rebuilds, residual)
+            inner = Plan(ig, inner.have, inner.want, inner.recipes, inner.producer,
+                         inner.cost, inner.candidates)
+        end
+        scalar_plan = _partial_subplan(inner, vcat(inner.have[keep], cell_inputs),
+                                      inner.want, cell_recipes)
         kernel = _prepare(scalar_plan,
             _lower_with_ops(scalar_plan; inline_embedded = false)...)
         kernel = _prepared_kernel(kernel.f, kernel.ops, kernel.inputs, kernel.outputs,
-            kernel.plan, kernel.ast, Tuple(readable[r.id] for r in residual))
+            kernel.plan, kernel.ast, Tuple(readable[r.id] for r in cell_recipes))
         axis_checks = Tuple(Tuple(position[index] for index in group)
                             for group in op.axis_checks)
         replacement = _AuthoredPlateOp{typeof(kernel),Tuple(atomic)}(
             kernel, axis_checks)
         cache_values = whole ? Value[] :
-            Value[value!(g, Symbol(:bound_plate_, v.name), typeof(data))
-                  for (v, data) in zip(frontier, cache_data)]
+            Value[value!(g, Symbol(:bound_plate_, name), typeof(data))
+                  for (name, data) in zip(cache_names, cache_data)]
         rewrite = (; replacement, cache_values)
         rewrites === nothing || (rewrite = _plate_rewrite!(rewrites, key, rewrite))
     end

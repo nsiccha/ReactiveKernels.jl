@@ -224,6 +224,19 @@ isdefined(@__MODULE__, :InnerPlateSplit) ||
         # The selected arm still throws on an invalid square root.
         bound = prepare(C.throwing_arm; bound = (; y = data))
         @test_throws DomainError bound(ones(3))
+        # A tuple arm value is cached by its fields over every lane.
+        plain = prepare(C.record_arm)
+        C.calls[] = 0
+        bound = prepare(C.record_arm; bound = (; y = data))
+        @test C.calls[] == length(data)
+        @test sort([r.op.value for r in caches(bound.plan)]) == [data, data .+ 1.0]
+        for x in ([-1.0, -2.0, -3.0], [1.0, -2.0, 3.0])
+            expected = plain(x, data)
+            C.calls[] = 0
+            @test bound(x) == expected
+            @test C.calls[] == 0
+            @test gradient(bound, x) == gradient(plain, x, data)
+        end
 
         # An array returned by an arm remains freshly allocated per call,
         # including when an unused live local appears before the result.
