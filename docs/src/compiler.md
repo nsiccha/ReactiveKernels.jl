@@ -335,7 +335,14 @@ kernel) are alpha-renamed to canonical names before the expression reaches its
 content-addressed cache, so an unchanged plan lowers to one callable type:
 preparing the same graph shape again — including a `bound=` rebinding to data
 of the same types — reuses that type and compiles once per process rather than
-once per preparation. The cache, not the callable, retains the expression:
+once per preparation. A program compiled while a package image is generated
+belongs to that image's cache instead, and an image records the generated
+function it made for each program under the identity the same expression has
+in ReactiveKernels' cache: its argument names and content id. Loading the image
+registers that record, so preparing an identical program afterwards returns the
+image's generated function and runs the code the image compiled for it, rather
+than compiling the program again in every process. The cache, not the callable,
+retains the expression:
 the callable is identified by its type alone, so a prepared callable holds no
 mutable `Expr` for Enzyme to prove read-only where its call is not inlined, as
 for a prepared lazy-arm child. The resulting

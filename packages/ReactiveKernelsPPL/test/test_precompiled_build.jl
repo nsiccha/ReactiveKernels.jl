@@ -46,6 +46,11 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
                     prepare_query(build_kernel(plan), plan, :sampler)([0.3, -0.2, 0.1])
                 end
             end
+            # Prepared after that workload, so its generated functions are the
+            # image's own rather than world-age wrappers. A process that
+            # prepares this build after loading the image reuses them.
+            const QUERY = prepare_query(BUILT, PLAN, :sampler)
+            const VALUE = QUERY([0.3, -0.2, 0.1])
             end
             """)
         write(joinpath(prepared, "Project.toml"), """
@@ -73,6 +78,8 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             # Julia 1.10 does not read the root package's [sources] table.
             Pkg.develop([PackageSpec[PackageSpec(path = path) for path in
                 $(repr((paths..., built, prepared)))]; rk_source_dependencies()])
+            # The probe takes reverse gradients after loading the images.
+            Pkg.add(["DifferentiationInterface", "Enzyme"])
             Pkg.precompile()
             """
         julia = Base.julia_cmd()
@@ -81,8 +88,8 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
         @test setup_ok
         setup_ok || return
         probe = """
-            using Test, ReactiveKernels, ReactiveKernelsPPL,
-                  PrecompiledPPLBuild, PrecompiledPPLPrepare
+            using Test, DifferentiationInterface, Enzyme, ReactiveKernels,
+                  ReactiveKernelsPPL, PrecompiledPPLBuild, PrecompiledPPLPrepare
             const RK = ReactiveKernels
             const B = PrecompiledPPLBuild
             const P = PrecompiledPPLPrepare
@@ -92,6 +99,12 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             density(u, x, y) = let a = u[1], b = u[2], s = exp(u[3])
                 normal_logpdf(a, 0, 5) + normal_logpdf(b, 0, 2) - s + u[3] +
                     sum(normal_logpdf.(y, a .+ b .* x, s))
+            end
+            function density_gradient(u, x, y)
+                a, b, s = u[1], u[2], exp(u[3])
+                r = y .- a .- b .* x
+                [-a / 25 + sum(r) / s^2, -b / 4 + sum(x .* r) / s^2,
+                 1 - s + sum(r .^ 2 ./ s^2 .- 1)]
             end
             closure_roots(spec) = Set(Base.moduleroot(RK._kernel_endpoint_source_module(r.op))
                                       for r in spec.graph.recipes)
@@ -116,6 +129,29 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             @test isdisjoint(closure_roots(runtime.spec), (B, P))
             @test prepare_query(runtime, B.PLAN, :sampler)([0.3, -0.2, 0.1]) ≈
                   density([0.3, -0.2, 0.1], x, y)
+            end
+            # B's image compiled the query of its build, and P's image prepared
+            # the same program. Preparing that build after loading, on either
+            # binding, reuses the image's generated functions: the query has
+            # the image query's type, so the code the image compiled for it
+            # applies, rather than compiling the program again in this process.
+            @testset "a run-time preparation reuses the image's program" begin
+            x, y = [0.0, 1.0, 2.0], [0.1, 0.9, 2.2]
+            x2, y2 = [0.5, 1.5, 2.5, 3.5], [0.4, 1.7, 2.1, 3.9]
+            @test B.VALUE ≈ density([0.3, -0.2, 0.1], x, y)
+            @test typeof(P.QUERY) === typeof(B.QUERY)
+            for plan in (B.PLAN, P.PLAN)
+                @test typeof(prepare_query(B.BUILT, plan, :sampler)) === typeof(B.QUERY)
+            end
+            backend = AutoEnzyme(; mode = Enzyme.Reverse)
+            for (plan, x, y) in ((B.PLAN, x, y), (P.PLAN, x2, y2)),
+                    u in ([0.3, -0.2, 0.1], [-1.1, 0.7, -0.4])
+                q = prepare_sampler(B.BUILT, plan, u; backend)
+                g = similar(u)
+                value, _ = sampler_value_and_gradient!(q, g, u)
+                @test value ≈ density(u, x, y)
+                @test g ≈ density_gradient(u, x, y)
+            end
             end
             println("PRECOMPILED_PPL_BUILD_PASS")
             """
