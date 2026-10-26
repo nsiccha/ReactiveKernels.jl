@@ -1601,6 +1601,9 @@ function _jax_function_call(ctx::_JaxContext, ::typeof(_native_exp), args::Vecto
 end
 _jax_function_call(ctx::_JaxContext, ::typeof(exp), args::Vector{_PyVal}) =
     _jax_function_call(ctx, _native_exp, args)
+# The native body's product companion computes Base's `*` (core.jl).
+_jax_function_call(ctx::_JaxContext, ::typeof(_native_mul), args::Vector{_PyVal}) =
+    _jax_function_call(ctx, *, args)
 _jax_function_call(ctx::_JaxContext, ::typeof(adjoint), args::Vector{_PyVal}) =
     _jax_result(adjoint, args, ndims(args[1].T) == 1 ? args[1].code :
                 "jnp.transpose(" * args[1].code * ")")

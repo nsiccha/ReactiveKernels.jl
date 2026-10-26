@@ -1,5 +1,6 @@
 include("test_native_broadcast.jl")
 include("test_native_concat.jl")
+include("test_native_mul.jl")
 
 module AuthoringScopeFixture
 using ..ReactiveKernels
