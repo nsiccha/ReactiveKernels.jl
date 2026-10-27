@@ -439,11 +439,21 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
         bound = prepare_ad_third(tangent_exp_design, third_order, (v,), beta;
                                  active = :beta, want = :density,
                                  bound = (; X))
+        # On Julia 1.12 and later, registered Enzyme returns NaN on some calls:
+        # its forward-mode `gemv` rule scales the output tangent by `beta`
+        # instead of overwriting it when `beta == 0`. The direction `w` is
+        # constant at both outer levels, so the doubly forward tangent product
+        # starts from an uninitialized shadow, which OpenBLAS 0.3.28 and later
+        # no longer zero-fill (Enzyme snag `nested-forward-o-9434176c`, whose
+        # proposed fix is a libEnzyme change). A NaN there is pinned as broken;
+        # every other result must be exact.
+        third_or_gap(result, expected) =
+            VERSION >= v"1.12" && any(isnan, result) ? (@test_broken false) :
+                (@test result ≈ expected)
         for w in (v, [0.3, -1.0, 0.7])
-            @test only(ad_third(unbound, (w,), beta; X)) ≈
-                  _tangent_design_third(X, beta, w)
-            @test only(ad_third(bound, (w,), beta)) ≈
-                  _tangent_design_third(X, beta, w)
+            expected = _tangent_design_third(X, beta, w)
+            third_or_gap(only(ad_third(unbound, (w,), beta; X)), expected)
+            third_or_gap(only(ad_third(bound, (w,), beta)), expected)
         end
     end
 
