@@ -724,6 +724,113 @@ end
     end
 end
 
+# A scalar location that another definition also reads stays a retained
+# value, read by name (`la = a; l = exp(la)`). It is still a proven scalar,
+# so a count response's log-rate or logit takes the plate path, not the
+# fused row path that reads its location as a row vector (`dot(w, la)`
+# raised a DimensionMismatch; snag poissonlog-scala-b87b0bf7).
+@testset "a scalar location read by another definition stays scalar" begin
+    D = Distributions
+    w = [mod(2j, 5) for j in 1:15]
+    k = [mod(j, 6) for j in 1:15]
+    n = fill(5, 15)
+    lg(v) = 1 / (1 + exp(-v))
+    prior = D.logpdf(D.Normal(0, 1), 0.4)
+    poisson = prior + sum(D.logpdf.(D.Poisson(exp(0.4)), w))
+    binomial = prior + sum(D.logpdf.(D.Binomial.(n, lg(0.4)), k))
+    counts = Dict{Symbol,AbstractVector}(:w => w)
+    trials = Dict{Symbol,AbstractVector}(:k => k, :n => n)
+    cases = [
+        ("l = exp.(la)", "w .~ PoissonLog.(la)", counts, poisson),
+        ("l = exp(la)", "w .~ PoissonLog.(la)", counts, poisson),
+        ("l = la + 1.0", "w .~ PoissonLog.(la)", counts, poisson),
+        ("l = exp(la)", "w .~ Poisson.(exp.(la))", counts, poisson),
+        ("l = exp(la)", "k .~ BinomialLogit.(n, la)", trials, binomial),
+        ("l = exp(la)", "k .~ Binomial.(n, logistic.(la))", trials, binomial),
+    ]
+    for (reader, response, cols, want) in cases
+        prog = Meta.parse("""begin
+            a ~ Normal(0, 1)
+            la = a
+            $reader
+            $response
+        end""")
+        bound, built, _, u = _rows_sampler(prog, cols)
+        src = string(kernel_expr(bound, built.layout))
+        @test !occursin("dot(", src) && !occursin("_ppl_rows", src)
+        @test _value_posterior(prog, cols, (; a = 0.4)) ≈ want rtol = 1e-12
+        _check_gradient(built.spec, bound, u)
+    end
+end
+
+# The same location beside a design matrix, a scan or a latent plate, where
+# every location gets its response's rows. The composition read by name got
+# none, so the fused count likelihood read `dot(w, la)` of a number and
+# raised a DimensionMismatch (snag scalar-alias-loc-6305553f).
+@testset "a scalar location read by another definition beside structured axes" begin
+    D = Distributions
+    w = [mod(2j, 5) for j in 1:15]
+    k = [mod(j, 6) for j in 1:15]
+    n = fill(5, 15)
+    y = [0.4 * sin(2.1j) + 1.5 for j in 1:15]
+    x = [cos(0.7j) for j in 1:15]
+    lg(v) = 1 / (1 + exp(-v))
+    normal(v) = sum(D.logpdf.(D.Normal(0, 1), v))
+    trajectory = zeros(15)
+    for t in 2:15
+        trajectory[t] = 0.5 * trajectory[t - 1] + 0.1
+    end
+    # (statements beside the scalar location, the density of `y` and of the
+    # other parameters given the constrained values)
+    beside = [
+        ("""X = hcat(ones(length(x)), x)
+            beta[1:2] .~ Normal.(0, 1)
+            m = X * beta
+            y .~ Normal.(m, 1.0)""",
+         p -> normal(p.beta) + sum(D.logpdf.(D.Normal.(p.beta[1] .+ p.beta[2] .* x, 1.0), y))),
+        ("""@scan begin
+                lev[1] = 0.0
+                for t in 2:T
+                    lev[t] = 0.5 * lev[t - 1] + 0.1
+                end
+            end
+            y .~ Normal.(lev, 1.0)""",
+         p -> sum(D.logpdf.(D.Normal.(trajectory, 1.0), y))),
+        ("""@plate for i in 1:3
+                z[i] ~ Normal(0, 1)
+            end
+            y .~ Normal.(sum(z), 1.0)""",
+         p -> normal(p.z) + sum(D.logpdf.(D.Normal(sum(p.z), 1.0), y))),
+    ]
+    responses = [
+        ("w .~ PoissonLog.(la)", :w, p -> sum(D.logpdf.(D.Poisson(exp(p.a)), w))),
+        ("w .~ Poisson.(exp.(la))", :w, p -> sum(D.logpdf.(D.Poisson(exp(p.a)), w))),
+        ("k .~ BinomialLogit.(n, la)", :k,
+         p -> sum(D.logpdf.(D.Binomial.(n, lg(p.a)), k))),
+        ("k .~ Binomial.(n, logistic.(la))", :k,
+         p -> sum(D.logpdf.(D.Binomial.(n, lg(p.a)), k))),
+    ]
+    for (statements, others) in beside, (response, observed, count) in responses
+        prog = Meta.parse("""begin
+            a ~ Normal(0, 1)
+            la = a
+            l = exp(la)
+            $statements
+            $response
+        end""")
+        cols = Dict{Symbol,AbstractVector}(:y => y, :x => x, :w => w, :k => k, :n => n)
+        plan = lower_rkppl(prog, cols; conditioned = (:y, observed))
+        bound = bind_data(plan, cols)
+        built = build_kernel(bound)
+        u = [0.3 * sin(1.7i) for i in 1:built.layout.total]
+        oracle(v) = begin
+            p = constrain(built.layout, v)
+            normal(p.a) + others(p) + count(p)
+        end
+        _check_model_math(built, bound, u, oracle)
+    end
+end
+
 # A per-observation gather of a declared array has the axes Julia indexing
 # gives it once its index column is bound: the column's axes in the gathered
 # position, the array's own axis for each `:`. A location adding a scalar to

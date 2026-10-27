@@ -21,6 +21,13 @@ end
     slot .~ Normal.(mu, s)
     slot
 end
+@rkppl chain_stream(a, s) = begin
+    b ~ Normal(0, 1)
+    mu = a + b
+    nu = 2 * mu
+    slot .~ Normal.(nu, s)
+    slot
+end
 end
 
 function _cap_empty_conditioned_prior()
@@ -140,4 +147,37 @@ end
         @test Base.invokelatest(prepare_query(fx.built, fx.bound, :likelihood), fx.u) == 0
         @test isempty(Base.invokelatest(prepare_query(fx.built, fx.bound, :pointwise), fx.u).y)
     end
+end
+
+# Per cell, `z[i] ~ chain_stream(a, s)` defines `z.mu[i]` and `z.nu[i]` in the
+# cell. The latent `z.slot[i] .~ Normal.(z.nu[i], s)` reads the definition
+# chain at the index, so it holds one number per index.
+@testset "a per-cell stream latent reads the cell's own definitions" begin
+    data = Dict(:y => [0.4, -0.1, 0.25])
+    plan = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        @plate for i in eachindex(y)
+            z[i] ~ chain_stream(a, s)
+            y[i] ~ Normal(z[i], 0.7)
+        end
+    end, data; mod=CapabilityGenerativeStreams, conditioned=keys(data))
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    values = (; a=0.3, s=0.9, z=(; b=[0.1, -0.2, 0.05], slot=[0.6, 0.2, 0.3]))
+    u = unconstrain(built.layout, values)
+    q = constrain(built.layout, u)
+    @test q.z.slot ≈ values.z.slot
+    @test q.z.slot isa Vector{Float64}
+    function oracle(v)
+        q = constrain(built.layout, v)
+        logpdf(Normal(), q.a) + logpdf(Exponential(), q.s) + log(q.s) +
+            sum(logpdf.(Normal(), q.z.b)) +
+            sum(logpdf.(Normal.(2 .* (q.a .+ q.z.b), q.s), q.z.slot)) +
+            sum(logpdf.(Normal.(q.z.slot, 0.7), data[:y]))
+    end
+    sampler = prepare_sampler(built, bound, u; backend=AutoEnzyme(; mode=Enzyme.Reverse))
+    value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+    @test value ≈ oracle(u)
+    @test gradient ≈ _cap_stream_fd(oracle, u) rtol=6e-6
 end

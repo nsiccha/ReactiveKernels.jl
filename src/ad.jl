@@ -1228,22 +1228,34 @@ end
 # `Σᵢ ⟨seedᵢ, yᵢ⟩`: one primal sweep computes every port and one reverse sweep
 # accumulates every port's cotangent. DifferentiationInterface's pullback
 # through Enzyme seeds only a scalar or array output (its reverse extension
-# adds the seed into the output shadow with `.+=`), so the seed crosses as the
-# trailing `Constant` context of a gradient instead. When `V`, the port values
-# of the sweep are stored in an AD-owned box, the `Cache` context before the
-# seed, as `_ADRetainingCall` stores its retained values.
+# adds the seed into the output shadow with `.+=`), so the seed crosses as a
+# `Constant` context of a gradient instead. When `V`, the port values of the
+# sweep are stored in an AD-owned box, a `Cache` context, as `_ADRetainingCall`
+# stores its retained values.
+#
+# The seed and the box are the callable's own leading arguments, ahead of the
+# wrapped call's contexts. Inside the `Vararg` tuple, the seed tuple is passed
+# to `_ad_seed_dot` by reference, so Julia builds that whole tuple in memory;
+# with the duplicated box beside the `Constant` operands in it, Enzyme's static
+# activity analysis rejects the constant stores, and plain `Reverse` raised
+# `EnzymeRuntimeActivityError` (snag several-port-pul-e6344d44).
 struct _ADSeededCall{V,F}
     call::F
 end
 
-@generated function (seeded::_ADSeededCall{V})(
-        active, contexts::Vararg{Any,C}) where {V,C}
-    inner = [:(getfield(contexts, $index)) for index in 1:(C - (V ? 2 : 1))]
-    store = V ? :(getfield(contexts, $(C - 1))[] = values) : nothing
+@generated function (seeded::_ADSeededCall{false})(
+        active, seed, contexts::Vararg{Any,C}) where {C}
+    inner = [:(getfield(contexts, $index)) for index in 1:C]
+    :(_ad_seed_dot(seed, Base.@inline seeded.call(active, $(inner...))))
+end
+
+@generated function (seeded::_ADSeededCall{true})(
+        active, seed, box, contexts::Vararg{Any,C}) where {C}
+    inner = [:(getfield(contexts, $index)) for index in 1:C]
     quote
         values = Base.@inline seeded.call(active, $(inner...))
-        $store
-        _ad_seed_dot(getfield(contexts, $C), values)
+        box[] = values
+        _ad_seed_dot(seed, values)
     end
 end
 
@@ -1273,8 +1285,13 @@ function _ad_seeded_call(kernel::_ADKernel, call, external_values,
         (external_values..., DifferentiationInterface.Cache(Ref(values)))
 end
 
-_ad_seeded_contexts(contexts::Tuple, seed) =
-    (contexts..., DifferentiationInterface.Constant(seed))
+# The seed leads the differentiated call's contexts, followed by the box, the
+# last prepared context, when the call keeps the port values.
+_ad_seeded_contexts(::_ADSeededCall{false}, contexts::Tuple, seed) =
+    (DifferentiationInterface.Constant(seed), contexts...)
+_ad_seeded_contexts(::_ADSeededCall{true}, contexts::Tuple, seed) =
+    (DifferentiationInterface.Constant(seed), last(contexts),
+     Base.front(contexts)...)
 
 # The port values of the differentiated sweep: stored in the box when the
 # backend kept the sweep, otherwise one separate primal evaluation.
@@ -1435,7 +1452,7 @@ _ad_operator_preparation(::Val{:pullback}, call, backend, point, seeds, contexts
 _ad_operator_preparation(::Val{:pullback}, call::_ADSeededCall, backend, point,
                          seeds, contexts) =
     DifferentiationInterface.prepare_gradient(
-        call, backend, point, _ad_seeded_contexts(contexts, only(seeds))...)
+        call, backend, point, _ad_seeded_contexts(call, contexts, only(seeds))...)
 
 # A pullback hands `_ad_call` its seed, which differentiates several WANT
 # ports as their seeded inner product (`_ADSeededCall`).
@@ -2116,7 +2133,7 @@ _ad_unprepared_pullback_call(call, backend, point, seed, contexts) =
 _ad_unprepared_pullback_call(call::_ADSeededCall, backend, point, seed,
                              contexts) =
     DifferentiationInterface.gradient(
-        call, backend, point, _ad_seeded_contexts(contexts, seed)...)
+        call, backend, point, _ad_seeded_contexts(call, contexts, seed)...)
 
 function ad_pullback(prepared::PreparedADPullback, seed, args...; kwargs...)
     point, contexts = _ad_prepared_arguments(
@@ -2132,7 +2149,7 @@ _ad_prepared_pullback(call, prepared, point, seed, contexts) =
 _ad_prepared_pullback(call::_ADSeededCall, prepared, point, seed, contexts) =
     DifferentiationInterface.gradient(
         call, prepared.preparation, prepared.backend,
-        point, _ad_seeded_contexts(contexts, seed)...)
+        point, _ad_seeded_contexts(call, contexts, seed)...)
 
 """
     ad_value_and_pullback(prepared, seed, args...; kwargs...)
@@ -2208,7 +2225,7 @@ function _ad_prepared_value_and_pullback_into!(
         call::_ADSeededCall, prepared, cotangent, seed, point, contexts)
     DifferentiationInterface.gradient!(
         call, cotangent, prepared.preparation, prepared.backend,
-        point, _ad_seeded_contexts(contexts, seed)...)
+        point, _ad_seeded_contexts(call, contexts, seed)...)
     _ad_seeded_values(prepared, call, point, contexts), cotangent
 end
 
@@ -2457,6 +2474,15 @@ extends [`prepare_ad_hvp`](@ref)'s reverse over forward by one forward layer
 and also differentiates objectives that multiply a constant matrix by the
 active vector. Each direction costs one reverse sweep over a doubly
 forward-differentiated primal.
+
+Registered Enzyme returns NaN on some calls through a dense matrix product. Its
+forward-mode BLAS rules scale the product's tangent by `beta` instead of
+overwriting it when `beta == 0`, and the tangent buffer of a product of values
+constant at the outer levels (the direction `v` among them) is uninitialized
+memory. On Julia 1.10, OpenBLAS zero-fills a matrix-vector product's tangent,
+so those are exact there; on Julia 1.12 and later they are not, and
+matrix-matrix products can be NaN on every Julia version. The reproducer is
+`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`.
 
 Directions with disjoint supports compress, as for Hessian-vector products:
 when active coordinates fall into groups that never interact (per-subject

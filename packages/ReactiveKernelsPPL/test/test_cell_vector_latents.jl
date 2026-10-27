@@ -465,3 +465,37 @@ end
     end
     @test_broken !gap
 end
+
+# An indexed cell definition `mu[i] = …` is a value of the cell. A dotted
+# latent that reads it at the index takes the shape of its right-hand side,
+# here one number per index. A per-cell submodel's values arrive in this form.
+@testset "cell latents read the cell's indexed definitions" begin
+    data = (; y = [0.4, -0.1, 0.25])
+    plan = lower_rkppl(quote
+        a ~ Normal(0, 1)
+        s ~ Exponential(1)
+        @plate for i in eachindex(y)
+            b[i] ~ Normal(0, 1)
+            mu[i] = a + b[i]
+            z[i] .~ Normal.(mu[i], s)
+            y[i] ~ Normal(z[i], 0.7)
+        end
+    end, data; conditioned = (:y,))
+    bound = bind_data(plan, data)
+    built = build_kernel(bound)
+    values = (; a = 0.3, s = 0.9, b = [0.1, -0.2, 0.05], z = [0.6, 0.2, 0.3])
+    u = unconstrain(built.layout, values)
+    q = constrain(built.layout, u)
+    @test q.z ≈ values.z
+    @test q.z isa Vector{Float64}
+    function oracle(v)
+        q = constrain(built.layout, v)
+        logpdf(Normal(), q.a) + logpdf(Exponential(), q.s) + log(q.s) +
+            sum(logpdf.(Normal(), q.b)) + sum(logpdf.(Normal.(q.a .+ q.b, q.s), q.z)) +
+            sum(logpdf.(Normal.(q.z, 0.7), data.y))
+    end
+    sampler = prepare_sampler(built, bound, u; backend = AutoEnzyme(; mode = Enzyme.Reverse))
+    value, gradient = sampler_value_and_gradient!(sampler, similar(u), u)
+    @test value ≈ oracle(u) rtol = 1e-12
+    @test gradient ≈ _cvl_fd(oracle, u) rtol = 1e-6 atol = 1e-8
+end

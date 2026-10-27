@@ -240,20 +240,27 @@ end
 
 # Every summand is a proven scalar (`_value_axes` is `Any[]`): an intercept
 # coefficient, a scalar offset or covariate, or a composition of sampled
-# scalars, numbers and scalar definitions. An opaque call result has an
-# unknown shape and keeps the location's rows.
+# scalars, numbers and scalar definitions. A composition's value leaves
+# (its columns) are proven scalars too: a scalar definition that another
+# definition also reads stays a retained value, read by name (`la = a;
+# l = exp(la)`). An opaque call result has an unknown shape and keeps the
+# location's rows.
 function _scalar_valued_predictor(plan::StructuralPlan, pred::PredictorSpec)
     isempty(pred.terms) && return false
-    scalar(ex) = _value_axes(plan, ex; data_axes = true) == Any[] &&
-        !_reads_rank0_data(plan, ex)
+    scalar(ex) = _proven_scalar(plan, ex)
     return all(pred.terms) do t
         t.kind === InterceptTerm && return true
         t.kind in (ContinuousTerm, OffsetTerm) && return all(scalar, t.columns)
         t.kind === ComposedTerm || return false
-        isempty(t.columns) && isempty(t.options.subs) || return false
-        return scalar(t.options.tree)
+        isempty(t.options.subs) || return false
+        return all(scalar, t.columns) && scalar(t.options.tree)
     end
 end
+
+# A value with no axes (`_value_axes` is `Any[]`) that reads no rank-0 array:
+# a sampled scalar, a number, or a scalar definition or expression.
+_proven_scalar(plan::StructuralPlan, ex) =
+    _value_axes(plan, ex; data_axes = true) == Any[] && !_reads_rank0_data(plan, ex)
 
 # A rank-0 array has no axes (`_value_axes` gives `Any[]`) yet stays an
 # array (`fill(0.5)`), so a value reading one is not a proven `Number`.
