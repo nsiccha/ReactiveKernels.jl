@@ -30,6 +30,7 @@ include("reactant_suite_selector.jl")
 
 const _MATRIX_CORE_TESTS = (
     "test_runtests_selector.jl",
+    "test_changelog.jl",
     "test_reactant_selector.jl",
     "test_stateless.jl",
     "test_planner_groundability.jl",

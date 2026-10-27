@@ -168,6 +168,41 @@ end
     end
 end
 
+# A summed plate whose cells hold vectors adds them elementwise, starting
+# from the first cell as Julia's `sum` does (snag `summing-a-plate-eba2648d`).
+@kernel vector_cell_total(q, groups, weights) = begin
+    cells = plate(groups) do xs
+        q[1] .* xs .+ q[2]
+    end
+    total = sum(cells)
+    value = sum(total .* weights)
+    return value
+end
+
+@testset "a fused total of vector cells under ordinary native Reverse" begin
+    backend = AutoEnzyme(; mode=Enzyme.Reverse)
+    for count in (1, 3, 17)
+        groups = [[cos(g), sin(g), 0.5g] for g in 1:count]
+        weights = [0.7, -1.3, 0.25]
+        saved_groups = deepcopy(groups)
+        unbound = prepare(vector_cell_total)
+        bound = prepare(vector_cell_total; bound=(; groups, weights))
+        unbound_ad = prepare_ad(unbound, backend, [0.4, -0.2], groups, weights; active=:q)
+        bound_ad = prepare_ad(bound, backend, [0.4, -0.2]; active=:q)
+        for q in ([0.4, -0.2], [-1.1, 0.6])
+            expected_value = sum((q[1] .* sum(groups) .+ count * q[2]) .* weights)
+            expected_gradient = [sum(sum(groups) .* weights), count * sum(weights)]
+            @test unbound(q, groups, weights) ≈ expected_value
+            @test bound(q) ≈ expected_value
+            value, gradient = ad_value_and_gradient(unbound_ad, q, groups, weights)
+            @test value ≈ expected_value
+            @test gradient ≈ expected_gradient
+            @test ad_gradient(bound_ad, q) ≈ expected_gradient
+        end
+        @test groups == saved_groups
+    end
+end
+
 # Base's scalar-array `*` and unary `-` broadcast into a fresh array of their
 # operand's length. Over an empty gather, after a branch on that length (here
 # the dimension check of the dotted result's materialization), native Enzyme
