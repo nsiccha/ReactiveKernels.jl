@@ -37,26 +37,18 @@ function total_coordinates(eta::AbstractVector)
     return vcat(logsumexp(eta), s2z_basis(length(eta))' * (eta .- sum(eta) / length(eta)))
 end
 
-# Each value's density, summed in a loop: a fused broadcast over a data
-# argument beside the active value (`sum(logpdf.(Normal.(loc, s), eta))`)
-# reaches Enzyme's runtime-activity boundary (reactivekernels-use §7ab).
-function normal_values_lpdf(family, loc, scale, x)
-    lp = 0.0
-    for k in eachindex(x)
-        lp += Distributions.logpdf(family(loc[k], scale), x[k])
-    end
-    return lp
-end
-
 # The reporter's spelling: the free coordinates are the latent (identity
-# geometry), and the law reads the values they give.
+# geometry), and the law reads the values they give. The family is a type
+# parameter, so the density is concretely typed (a `family::F` field holding
+# `Normal`, a `UnionAll`, is not, and Enzyme Reverse then refuses the cell).
 struct TotalLogSumExp{F,L,S}
-    family::F
     loc::L
     scale::S
 end
-ReactiveKernelsPPL.sampling_logdensity(d::TotalLogSumExp, c) =
-    normal_values_lpdf(d.family, d.loc, d.scale, total_values(c))
+TotalLogSumExp(::Type{F}, loc, scale) where {F} =
+    TotalLogSumExp{F,typeof(loc),typeof(scale)}(loc, scale)
+ReactiveKernelsPPL.sampling_logdensity(d::TotalLogSumExp{F}, c) where {F} =
+    sum(Distributions.logpdf.(F.(d.loc, d.scale), total_values(c)); init = 0.0)
 ReactiveKernelsPPL.sampling_geometry(::Type{TotalLogSumExp}, args, shape) =
     ParameterGeometry((:(length($(args[2]))),), :(length($(args[2]))); support = :real,
         constrain = (u, shape, args...) -> collect(u),
@@ -64,16 +56,16 @@ ReactiveKernelsPPL.sampling_geometry(::Type{TotalLogSumExp}, args, shape) =
         logjac = (u, shape, args...) -> 0.0)
 
 # The latent is the values themselves, sampled in total coordinates: a
-# constant Jacobian, √K per index.
-struct TotalCoordinates{F,L,S}
-    family::F
+# constant Jacobian, √K per index. As in the docs ("One joint latent per
+# index").
+struct TotalCoordinates{L,S}
     loc::L
     scale::S
 end
 ReactiveKernelsPPL.sampling_logdensity(d::TotalCoordinates, eta) =
-    normal_values_lpdf(d.family, d.loc, d.scale, eta)
+    sum(Distributions.logpdf.(Distributions.Normal.(d.loc, d.scale), eta); init = 0.0)
 ReactiveKernelsPPL.sampling_geometry(::Type{TotalCoordinates}, args, shape) =
-    ParameterGeometry((:(length($(args[2]))),), :(length($(args[2]))); support = :real,
+    ParameterGeometry((:(length($(args[1]))),), :(length($(args[1]))); support = :real,
         constrain = (u, shape, args...) -> total_values(u),
         unconstrain = (eta, shape, args...) -> total_coordinates(eta),
         logjac = (u, shape, args...) -> isempty(u) ? 0.0 : log(length(u)) / 2)
@@ -84,7 +76,7 @@ struct ZeroSum{L,S}
     scale::S
 end
 ReactiveKernelsPPL.sampling_logdensity(d::ZeroSum, x) =
-    normal_values_lpdf(Distributions.Normal, d.loc, d.scale, x)
+    sum(Distributions.logpdf.(Distributions.Normal.(d.loc, d.scale), x); init = 0.0)
 ReactiveKernelsPPL.sampling_geometry(::Type{ZeroSum}, args, shape) =
     ParameterGeometry((:(length($(args[1]))),), :(length($(args[1])) - 1); support = :zero_sum,
         constrain = (u, shape, args...) -> s2z_basis(only(shape)) * u,
@@ -202,7 +194,7 @@ end
 const _CJL_COORDINATES = quote
     sigma ~ Exponential(1.0)
     @plate for i in eachindex(total)
-        eta[i] ~ _CJLFixtures.TotalCoordinates(Distributions.Normal, log.(mu[i]), 0.5)
+        eta[i] ~ _CJLFixtures.TotalCoordinates(log.(mu[i]), 0.5)
         T = exp.(eta[i])
         y[i] .~ Normal.(T[obs[i]], sigma)
         total[i] ~ Normal(sum(T), 0.002 * total[i])

@@ -1297,7 +1297,7 @@ function _lower_rkppl_once(ast, data::Set{Symbol}, mod::Module;
     union!(declaration_dependencies, (s.lhs for s in factors))
     union!(declaration_dependencies, cell_priors)
     union!(declaration_dependencies, (g.logjac for g in values(cell_geometries)))
-    declaration_data =Set{Symbol}(nm for nm in declaration_dependencies
+    declaration_data = Set{Symbol}(nm for nm in declaration_dependencies
         if haskey(canonmap, nm) && _data_only(canonmap[nm], data, canonmap))
     # Design matrices leave `det` for the plan-level table (validated
     # here; `detshape` keeps their `:matrix` shape for downstream
