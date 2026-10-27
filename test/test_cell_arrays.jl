@@ -191,6 +191,24 @@ end
     value = table[1, 1] + token
     return value
 end
+# A per-row value of a live scalar and a data column, gathered by each group's
+# rows in a cell composed into the group plate.
+@kernel gathered_rows(rows, y, c::Vector{Float64}, s::Float64) = begin
+    scale = exp.(s .+ 0.5 .* c)
+    picked = plate(eachindex(rows)) do g
+        scale[rows[g]]
+    end
+    values = plate(picked, y) do p, yg
+        terms = plate(p, yg) do v, w
+            v * w
+        end
+        sum(terms)
+    end
+    total = sum(values)
+    return total
+end
+gathered_rows_data(groups, n) = (rows = [collect(g:groups:n) for g in 1:groups],
+    y = [[0.01 * r for r in g:groups:n] for g in 1:groups], c = [0.1 * sin(i) for i in 1:n])
 
 @testset "array recipes compose through nested scalar readers" begin
     groups = [[0.2, -0.4], Float64[], [0.7, 1.2, -0.1]]
@@ -316,5 +334,49 @@ end
         ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), q; active=:q)
         @test ad_gradient(ad, q) ≈ gradient
     end
+end
+
+@testset "composed arrays read nonscalar indices entry by entry" begin
+    x = [0.2, -0.4, 0.7, 1.1]
+    dense = 2.0 .* x
+    composed = ReactiveKernels._cell_array_broadcast(Base.broadcasted(*, 2.0, x))
+    @test composed isa ReactiveKernels._CellBroadcast
+    for I in ([3, 1, 3], 2:3, :, Bool[1, 0, 1, 1], Int[], [CartesianIndex(2)],
+              reshape([4, 1], 1, 2))
+        @test composed[I] == dense[I]
+        @test typeof(composed[I]) == typeof(dense[I])
+    end
+    @test composed[Int32(2)] === dense[2]
+    @test_throws BoundsError composed[[1, 5]]
+    table = ReactiveKernels._cell_array_hcat(x, composed)
+    full = hcat(x, dense)
+    for I in ((:, 2), ([4, 2], 1), (2, :), ([1, 3], [2, 1]), (3,), ([5, 8],), (2, 1, 1))
+        @test table[I...] == full[I...]
+    end
+    @test_throws BoundsError table[[1, 5], 1]
+end
+
+@testset "a composed value gathered by each group's rows computes those rows" begin
+    for groups in (3, 40)
+        d = gathered_rows_data(groups, 400)
+        reference(s) = sum(sum(exp.(s .+ 0.5 .* d.c[r]) .* yg)
+                           for (r, yg) in zip(d.rows, d.y))
+        for (k, inputs) in ((prepare(gathered_rows), (d.rows, d.y, d.c, 0.3)),
+                            (prepare(gathered_rows; bound=d), (0.3,)))
+            @test occursin("_cell_array_broadcast", string(code_expr(k)))
+            @test k(inputs...) ≈ reference(0.3)
+            # The derivative in `s` of a sum of `exp(s + ...)` terms is the sum.
+            ad = prepare_ad(k, AutoEnzyme(; mode=Enzyme.Reverse), inputs...; active=:s)
+            @test ad_gradient(ad, inputs...) ≈ reference(0.3)
+        end
+    end
+    # Each row is computed once per call. Before, every group computed the
+    # whole per-row value (40 groups: 40 vectors of 1200 entries).
+    bytes = map((3, 40)) do groups
+        k = prepare(gathered_rows; bound=gathered_rows_data(groups, 1200))
+        k(0.3)
+        @allocated k(0.3)
+    end
+    @test bytes[2] < 2bytes[1]
 end
 end

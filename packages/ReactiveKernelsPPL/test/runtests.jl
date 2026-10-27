@@ -311,6 +311,7 @@ const _PPL_TEST_FILES = (
     "test_varying_values_reactant.jl",
     "test_cell_broadcast_arrays.jl",
     "test_cell_index_gathers.jl",
+    "test_cell_composed_gathers.jl",
     "test_plate_cell_arrays.jl",
     "test_vector_plate_outputs.jl",
     "test_plate_cell_once.jl",
