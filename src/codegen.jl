@@ -7183,8 +7183,8 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
 end
 
 """
-    prepare(p::Plan; passes=(), bound=(), on_error=nothing, exemplars=nothing) -> PreparedKernel
-    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing, exemplars=nothing) -> PreparedKernel
+    prepare(p::Plan; passes=(), bound=(), on_error=nothing, exemplars=nothing, type_stability=nothing, type_stability_level=nothing) -> PreparedKernel
+    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing, exemplars=nothing, type_stability=nothing, type_stability_level=nothing) -> PreparedKernel
 
 Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
 tuple of AST passes applied before compilation.
@@ -7221,22 +7221,50 @@ for an intermediate, supplying it as HAVE, or selecting another consumer keeps
 that boundary. Whole-array (`Ref`) consumers and opaque intervening recipes
 also retain their materialization boundary.
 
-Preparation checks that the values of the program infer concrete types, from
-the declared types of the HAVE ports where those are concrete and from the
-bound data. A recipe whose inputs are concretely typed but whose result Julia
-does not infer concretely (`Any`, an abstract type, a `Union`, or an array of
-such elements), such as a call to a function whose result is not inferable,
-is reported with a warning naming the value and its recipe, once per process.
-Every recipe and plate cell that reads such a value dispatches dynamically, and
-native reverse-mode AD may refuse the program. Preparation still succeeds.
+Preparation checks that the program is type stable, from the declared types of
+the HAVE ports where those are concrete and from the bound data. How far it
+checks is `type_stability_level`:
+
+- `:values` checks that every value of the program infers a concrete type. A
+  recipe whose inputs are concretely typed but whose result Julia does not
+  infer concretely (`Any`, an abstract type, a `Union`, or an array of such
+  elements), such as a call to a function whose result is not inferable, is
+  reported, naming the value and its recipe.
+- `:rk` also audits the code of the prepared program: the body ReactiveKernels
+  generates and the functions of ReactiveKernels' packages it calls. A used
+  value Julia does not infer concretely, or a call dispatched at run time, is
+  reported with its method. Every other function the code calls is a leaf: its
+  call must be dispatched statically and return a concrete type.
+- `:all` (the default) also audits every function that code calls, a client
+  function's body included, except Julia's own Base, Core and standard
+  libraries, which stay leaves.
+
+Every recipe and plate cell that reads a non-concrete value dispatches
+dynamically, and native reverse-mode AD may refuse the program.
 [`prepare_ad`](@ref) repeats the check with the types of its exemplar
-arguments.
+arguments, auditing the callable its backend differentiates.
+
+`type_stability` is what preparation does with a finding: `:warn` (the
+default) logs a warning once per process and preparation succeeds; `:error`
+throws a [`TypeInstabilityError`](@ref) naming every finding, at every
+preparation. Either keyword's default `nothing` takes the setting of an
+enclosing preparation, else the project's ReactiveKernels preference of the
+same name (read at the first preparation of a Julia session), else the default.
+A project sets them for every preparation, including those other packages make
+for it, with for example
+`Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")`,
+which writes `[ReactiveKernels] type_stability = "error"` to its
+`LocalPreferences.toml`. A keyword applies to the preparations its call makes,
+nested ones included, and cached preparations are kept per setting.
 """
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
-                 exemplars = nothing)
-    _warn_uninferred_values(
-        _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
-                      exemplars))
+                 exemplars = nothing, type_stability = nothing,
+                 type_stability_level = nothing)
+    _with_type_stability(type_stability, type_stability_level) do
+        _check_uninferred_values(
+            _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
+                          exemplars))
+    end
 end
 
 # The two backend products of one preparation reuse each nested cell's composed
@@ -7333,11 +7361,14 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
 end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
-                 on_error = nothing, exemplars = nothing)
-    exemplars === nothing && _reuses_bound_preparation(bound, passes) &&
-        return _graph_bound_preparation(g, have, want, passes, bound, on_error)
-    p = plan(g; have = have, want = want)
-    prepare(p; passes = passes, bound = bound, on_error = on_error, exemplars)
+                 on_error = nothing, exemplars = nothing, type_stability = nothing,
+                 type_stability_level = nothing)
+    _with_type_stability(type_stability, type_stability_level) do
+        exemplars === nothing && _reuses_bound_preparation(bound, passes) &&
+            return _graph_bound_preparation(g, have, want, passes, bound, on_error)
+        p = plan(g; have = have, want = want)
+        prepare(p; passes = passes, bound = bound, on_error = on_error, exemplars)
+    end
 end
 
 """

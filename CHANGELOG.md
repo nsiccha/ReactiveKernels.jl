@@ -16,6 +16,40 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.3
+
+- Preparation checks the code of the prepared program, not only the types of
+  its values. `type_stability_level` sets how far: `:values` infers the type of
+  every value, as 0.1.2 did; `:rk` also audits the body ReactiveKernels
+  generates and the functions of its packages, with every other function a
+  leaf whose call must dispatch statically and return a concrete type; `:all`,
+  the new default, also audits every function that code calls, a client
+  helper's body included, except Julia's own Base, Core and standard libraries.
+  A finding names its method and each non-concrete value or call dispatched at
+  run time. A helper that dispatches at run time but asserts its result
+  (`f(x) = (g(x))::Float64`) now warns, and so does a declared local
+  (`mu::Vector{Float64} = f(x)`) over a helper whose result is not inferred.
+  `prepare_ad*` audit the callable their backend differentiates.
+- Preparation can refuse a type instability instead of warning once per
+  process. With `type_stability = :error`, `prepare`, `prepare!` and every
+  `prepare_ad*` throw a `TypeInstabilityError` whose `messages` name every
+  finding, at every preparation. The default stays `:warn`.
+- Both settings are keywords and ReactiveKernels preferences of the same name.
+  A project sets them for every preparation it makes, including those that
+  packages such as ReactiveKernelsPPL make for it, for example with
+  `Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")`
+  (`[ReactiveKernels] type_stability = "error"` in its `LocalPreferences.toml`,
+  which `Pkg.test` carries into the test environment). The preferences are read
+  at the first preparation of a Julia session; a new session picks up a change
+  without recompiling anything. A call's keywords take precedence for that call
+  and the preparations nested in it. Cached preparations are kept per setting,
+  so a kernel prepared under `:warn` or a lower level is never returned to a
+  stricter call. `Preferences` is a new dependency; `PrecompileTools` already
+  loaded it.
+- The typed-IR audit that held RK's own lowering to type-stable programs in the
+  test suite (`test/type_stability_audit.jl`) moved to
+  `src/type_stability_audit.jl`; the RK and RKPPL gates use it from there.
+
 ## 0.1.2
 
 - A summed plate whose cells hold arrays adds them elementwise, as Julia's
