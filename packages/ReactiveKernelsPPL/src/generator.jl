@@ -1167,12 +1167,16 @@ _composed_expr(plan::StructuralPlan, pred::PredictorSpec, t::TermSpec) =
     _composed_rewrite(t.options.tree, t.options.subs, plan, pred.name)
 
 # A composition reading no sub-predictor and no column has no row axis of
-# its own. Scalar shape is retained when observation operands need
-# broadcasting; ordinary full-length vector plans give it the location's rows.
+# its own, and neither does one whose columns are proven scalars (a scalar
+# definition another definition also reads, `la = a; l = exp(la)`, is a
+# retained value read by name). Scalar shape is retained when observation
+# operands need broadcasting; ordinary full-length vector plans, such as a
+# plan with a design matrix, scan or latent plate, give it the location's rows.
 function _composed_needs_rows(plan::StructuralPlan, pred::PredictorSpec,
         t::TermSpec, ex)
     !_is_plate_column_expr(ex) && isempty(t.options.subs) &&
-        isempty(t.columns) && !_broadcast_affine(plan, pred) || return false
+        all(c -> _proven_scalar(plan, c), t.columns) &&
+        !_broadcast_affine(plan, pred) || return false
     # A composed scalar leaf can be a full-row view of an observation matrix.
     # Its derived column already has the response row axis; normalizing it again
     # adds a runtime union of the view and broadcast fallback to every plate.
