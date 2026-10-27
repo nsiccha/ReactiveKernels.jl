@@ -6007,6 +6007,29 @@ Base.@nospecializeinfer function _record_image_program!(target::Module,
     nothing
 end
 
+# Record, in the image being generated, a closure type `_kernel_shared_closure`
+# shares, and find the one a loaded image recorded for a closure of `home`.
+Base.@nospecializeinfer function _record_image_closure!(target::Module, @nospecialize(key),
+                                                        @nospecialize(entry))
+    @lock _LOADED_IMAGE_PROGRAMS.lock begin
+        Base.invokelatest(isdefined, target, _IMAGE_PROGRAMS) ||
+            Core.eval(target, :(const $_IMAGE_PROGRAMS = $(_ImagePrograms(Dict{Any,Any}()))))
+        table = Base.invokelatest(getglobal, target, _IMAGE_PROGRAMS)::_ImagePrograms
+        entries = get!(() -> Any[], table.functions, key)
+        any(e -> e === entry, entries) || push!(entries, entry)
+    end
+    nothing
+end
+
+Base.@nospecializeinfer function _image_shared_closure(@nospecialize(key), home::Module,
+                                                       names::Set{Symbol})
+    tables = @atomic :acquire _LOADED_IMAGE_PROGRAMS.tables
+    for table in tables, entry in get(table.functions, key, ())
+        _kernel_same_scope(first(entry), home, names) && return entry
+    end
+    nothing
+end
+
 # A `Base.package_callbacks` entry, installed by `__init__`: registers the
 # programs table of each package image loaded after ReactiveKernels.
 function _register_image_programs(package::Base.PkgId)

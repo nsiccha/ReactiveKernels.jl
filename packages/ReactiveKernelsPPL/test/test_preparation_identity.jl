@@ -128,4 +128,29 @@ end
     draws = [0.3 -0.1; -0.2 0.4]
     @test Base.invokelatest(readers[1], draws) == Base.invokelatest(readers[2], draws)
 end
+
+@testset "a positive prior's support branch rebuilds to the same query" begin
+    # The tensorized arm of the support branch is a closure Julia lowers
+    # itself (`ReactantCore.@trace`); each build defined a new closure type, so
+    # the query and the readers had new types (snag `compiled-reader-be3cadbb`).
+    model = @rkppl begin
+        a ~ Normal(0, 5)
+        b ~ Normal(0, 2)
+        sigma ~ Exponential(1.0)
+        mu = a .+ b .* x
+        y .~ Normal.(mu, sigma)
+    end
+    x, y = [0.0, 1.0, 2.0], [0.1, 0.9, 2.2]
+    queries = map(1:2) do _
+        plan = model(; x) | (; y)
+        prepare_query(build_kernel(plan), plan, :sampler)
+    end
+    @test typeof(queries[1]) === typeof(queries[2])
+    u = [0.3, -0.2, 0.1]
+    @test Base.invokelatest(queries[1], u) == Base.invokelatest(queries[2], u)
+    s = exp(u[3])
+    expected = logpdf(Normal(0, 5), u[1]) + logpdf(Normal(0, 2), u[2]) +
+        logpdf(Exponential(1.0), s) + u[3] + sum(logpdf.(Normal.(u[1] .+ u[2] .* x, s), y))
+    @test Base.invokelatest(queries[2], u) ≈ expected
+end
 end
