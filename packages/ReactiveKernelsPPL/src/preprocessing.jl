@@ -247,8 +247,7 @@ end
 # location's rows.
 function _scalar_valued_predictor(plan::StructuralPlan, pred::PredictorSpec)
     isempty(pred.terms) && return false
-    scalar(ex) = _value_axes(plan, ex; data_axes = true) == Any[] &&
-        !_reads_rank0_data(plan, ex)
+    scalar(ex) = _proven_scalar(plan, ex)
     return all(pred.terms) do t
         t.kind === InterceptTerm && return true
         t.kind in (ContinuousTerm, OffsetTerm) && return all(scalar, t.columns)
@@ -257,6 +256,11 @@ function _scalar_valued_predictor(plan::StructuralPlan, pred::PredictorSpec)
         return all(scalar, t.columns) && scalar(t.options.tree)
     end
 end
+
+# A value with no axes (`_value_axes` is `Any[]`) that reads no rank-0 array:
+# a sampled scalar, a number, or a scalar definition or expression.
+_proven_scalar(plan::StructuralPlan, ex) =
+    _value_axes(plan, ex; data_axes = true) == Any[] && !_reads_rank0_data(plan, ex)
 
 # A rank-0 array has no axes (`_value_axes` gives `Any[]`) yet stays an
 # array (`fill(0.5)`), so a value reading one is not a proven `Number`.
