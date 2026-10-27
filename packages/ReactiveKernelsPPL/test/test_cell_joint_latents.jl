@@ -41,13 +41,16 @@ end
 # geometry), and the law reads the values they give. The family is a type
 # parameter, so the density is concretely typed (a `family::F` field holding
 # `Normal`, a `UnionAll`, is not, and Enzyme Reverse then refuses the cell).
+# The density is inlined: a law holding a data vector beside a sampled scale
+# that crosses a non-inlined call fails Enzyme's static activity analysis
+# (reactivekernels-use §7ak; pinned below).
 struct TotalLogSumExp{F,L,S}
     loc::L
     scale::S
 end
 TotalLogSumExp(::Type{F}, loc, scale) where {F} =
     TotalLogSumExp{F,typeof(loc),typeof(scale)}(loc, scale)
-ReactiveKernelsPPL.sampling_logdensity(d::TotalLogSumExp{F}, c) where {F} =
+@inline ReactiveKernelsPPL.sampling_logdensity(d::TotalLogSumExp{F}, c) where {F} =
     sum(Distributions.logpdf.(F.(d.loc, d.scale), total_values(c)); init = 0.0)
 ReactiveKernelsPPL.sampling_geometry(::Type{TotalLogSumExp}, args, shape) =
     ParameterGeometry((:(length($(args[2]))),), :(length($(args[2]))); support = :real,
@@ -70,18 +73,29 @@ ReactiveKernelsPPL.sampling_geometry(::Type{TotalCoordinates}, args, shape) =
         unconstrain = (eta, shape, args...) -> total_coordinates(eta),
         logjac = (u, shape, args...) -> isempty(u) ? 0.0 : log(length(u)) / 2)
 
-# A vector summing to zero: K values from K - 1 coordinates.
+# A vector summing to zero: K values from K - 1 coordinates. Its law holds a
+# data vector beside a sampled scale, so the density is inlined (as above).
 struct ZeroSum{L,S}
     loc::L
     scale::S
 end
-ReactiveKernelsPPL.sampling_logdensity(d::ZeroSum, x) =
+@inline ReactiveKernelsPPL.sampling_logdensity(d::ZeroSum, x) =
     sum(Distributions.logpdf.(Distributions.Normal.(d.loc, d.scale), x); init = 0.0)
-ReactiveKernelsPPL.sampling_geometry(::Type{ZeroSum}, args, shape) =
+zero_sum_geometry(args) =
     ParameterGeometry((:(length($(args[1]))),), :(length($(args[1])) - 1); support = :zero_sum,
         constrain = (u, shape, args...) -> s2z_basis(only(shape)) * u,
         unconstrain = (x, shape, args...) -> s2z_basis(only(shape))' * x,
         logjac = (u, shape, args...) -> 0.0)
+ReactiveKernelsPPL.sampling_geometry(::Type{ZeroSum}, args, shape) = zero_sum_geometry(args)
+
+# The same law behind a density Julia does not inline.
+struct ZeroSumCallee{L,S}
+    loc::L
+    scale::S
+end
+@noinline ReactiveKernelsPPL.sampling_logdensity(d::ZeroSumCallee, x) =
+    sum(Distributions.logpdf.(Distributions.Normal.(d.loc, d.scale), x); init = 0.0)
+ReactiveKernelsPPL.sampling_geometry(::Type{ZeroSumCallee}, args, shape) = zero_sum_geometry(args)
 
 # An m × 2 block of values above a live lower bound, at a rate given as a
 # keyword: a matrix per index, a live parent and a keyword in every endpoint.
@@ -270,6 +284,54 @@ end
         @test unconstrain(built.layout, nt) ≈ u
         _cjl_check(built, bound, u, oracle)
     end
+end
+
+@testset "a joint cell latent's law may hold data beside a sampled value" begin
+    # The reporter's law with a sampled scale: `loc` is data at each index.
+    ast = quote
+        s ~ Exponential(1.0)
+        @plate for i in eachindex(total)
+            loc = log.(mu[i])
+            c[i] ~ _CJLFixtures.TotalLogSumExp(Distributions.Normal, loc, s)
+            eta = _CJLFixtures.total_values(c[i])
+            total[i] ~ Normal(sum(exp.(eta)), 0.01 * total[i])
+        end
+    end
+    d = (; mu = [[10.0, 20.0, 5.0], Float64[], [7.0, 3.0]], total = [35.2, 0.3, 9.9])
+    lengths = length.(d.mu)
+    function oracle(u)
+        s = exp(u[1])
+        lp = logpdf(Exponential(1.0), s) + u[1]
+        for (i, c) in enumerate(_cjl_blocks(u[2:end], lengths))
+            eta = _CJLFixtures.total_values(c)
+            lp += sum(logpdf.(Normal.(log.(d.mu[i]), s), eta); init = 0.0)
+            lp += logpdf(Normal(sum(exp.(eta); init = 0.0), 0.01 * d.total[i]), d.total[i])
+        end
+        return lp
+    end
+    bound = bind_data(lower_rkppl(ast, d; conditioned = (:total,)), d)
+    built = build_kernel(bound)
+    @test built.layout.total == 1 + sum(lengths)
+    for u in ([0.1, 3.5, 0.2, -0.3, 2.2, 0.1], [-0.4, 3.6, -0.1, 0.4, 2.3, -0.2])
+        @test _cjl_q(built, bound, :sampler, u) ≈ oracle(u) rtol = 1e-12
+        _cjl_check(built, bound, u, oracle)
+    end
+    # Not built upstream: Enzyme's static activity analysis refuses the law
+    # object when it crosses a non-inlined density, as it refuses any fresh
+    # container storing constant data beside an active value
+    # (reactivekernels-use §7ak; Enzyme snag `fresh-container-48e64a0f`).
+    callee = quote
+        s ~ Exponential(1.0)
+        @plate for i in eachindex(x)
+            z[i] ~ _CJLFixtures.ZeroSumCallee(x[i], s)
+        end
+    end
+    dz = (; x = [[0.1, -0.2, 0.4], [0.3, 0.1]])
+    bound = bind_data(lower_rkppl(callee, dz), dz)
+    built = build_kernel(bound)
+    u = [0.2, 0.3, -0.1, 0.4]
+    @test_broken (sampler_value_and_gradient!(prepare_sampler(built, bound, u;
+        backend = AutoEnzyme(; mode = Enzyme.Reverse)), similar(u), u); true)
 end
 
 @testset "a joint cell latent: matrices, live parents and keywords" begin

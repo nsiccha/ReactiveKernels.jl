@@ -1146,6 +1146,16 @@ Native values and ordinary Enzyme Reverse gradients are supported. Not built
 yet: such latents over `levels(…)`, and predictive draws, `jax_source` and
 compiled execution of them.
 
+Two properties of the law keep its density differentiable by native Enzyme
+Reverse. Pass a distribution family as a type parameter, not a field: with
+`struct L{F,…}; family::F; …` holding `Normal` (a `UnionAll`), the density
+is not concretely typed, preparation warns, and the gradient fails. And a law
+holding data beside a sampled value (`TotalCoordinates(log.(mu[i]), s)`, with
+`s` sampled) fails Enzyme's static activity analysis when its
+`sampling_logdensity` is not inlined (see [Core constraints](constraints.md)):
+mark that method `@inline`, or prepare with
+`AutoEnzyme(mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`.
+
 ## Submodels
 
 `@rkppl name(args...) = begin … end` defines a reusable block. Using it,

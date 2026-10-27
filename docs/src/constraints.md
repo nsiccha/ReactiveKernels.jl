@@ -572,7 +572,12 @@ and lock the one Reactant 0.2.289 lifted:
   plate's output. Under `bound=` such a data-only plate is hoisted out of the
   gradient and differentiates. RK's lowering stores the authored cell result
   unchanged, and `test_plate_consumer_native_ad.jl` pins the unbound
-  gradients as broken. The repair belongs in Enzyme's activity analysis.
+  gradients as broken. A caller-owned `@rkppl` law that holds a bound array
+  beside a sampled value (`p[1:3] ~ D(x, s)`, or a joint cell latent's
+  `z[i] ~ D(x[i], s)`) is such a container when it crosses a non-inlined
+  `sampling_logdensity` call; an inlined density differentiates, and
+  `test_cell_joint_latents.jl` pins the non-inlined gradient as broken.
+  The repair belongs in Enzyme's activity analysis.
 - Native Enzyme reverse rejects Base's dense concatenation methods when
   constant and active arrays of one element type meet
   (`EnzymeRuntimeActivityError`): `vcat`/`hcat` of `Vector{T}`s, the
