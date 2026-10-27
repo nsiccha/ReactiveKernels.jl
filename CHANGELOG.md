@@ -16,6 +16,21 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.4
+
+- A per-row value that native lowering keeps as its arithmetic (a dotted
+  broadcast or an `hcat` read only by indexing, such as
+  `sigma = exp.(s0 .+ s1 .* x)`), indexed by an integer vector, a range, a
+  colon or a mask, computes only the entries it selects. A group cell
+  gathering its rows, `sigma[rows[g]]`, therefore computes those rows; it
+  computed the whole value at every read, once per group, so a density cost
+  a full pass over the rows per group (300 groups of 10 rows: 2.0 ms and
+  7.3 MB per call, now 40 µs and 110 KB, beside 37 µs and 91 KB for the
+  same rows gathered from a stored vector). Values are unchanged. Where the
+  value combined a sampled scalar with a data column, ordinary Enzyme
+  Reverse (registered 0.13.216) also refused the gradient with
+  `EnzymeRuntimeActivityError`; it now differentiates it.
+
 ## 0.1.3
 
 - Preparation checks the code of the prepared program, not only the types of
