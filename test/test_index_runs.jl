@@ -36,6 +36,16 @@ end
     total::Float64=sum(terms)
     return total
 end
+# Cells holding vectors: each run's partial total starts from its first cell.
+@kernel vector_subject(q::Vector{Float64},idx::Vector{Int},x::Vector{Float64})=begin
+    gathered=ReactiveKernels._readonly_gather(q,idx)
+    terms=plate(gathered,x) do a,z
+        [z-a,a*z]
+    end
+    total=sum(terms)
+    value=total[1]-0.5*total[2]
+    return value
+end
 function oracle(q,idx,x)
     value=0.;g=zero(q)
     for i in eachindex(idx)
@@ -179,6 +189,25 @@ end
         verify(k,q,(sum(first,refs),sum(last,refs)))
     end
     @test RK._lower_index_runs_native(k.ast,k.ops)==k.ast
+end
+
+@testset "index runs: cells that hold vectors" begin
+    # snag summing-a-plate-eba2648d: a run's partial total was seeded with
+    # `zero(total)`, which the first-cell placeholder of array cells lacks.
+    for idx in (repeat([2,1,3],inner=8),[fill(1,11);fill(3,19)])
+        x=sin.(eachindex(idx))./2
+        k=prepare(vector_subject;bound=(;idx,x))
+        @test occursin("run_partial",string(k.ast))
+        for q in ([.1,-.4,.3],[-.8,.6,1.2])
+            value=0.;g=zero(q)
+            for i in eachindex(idx)
+                a=q[idx[i]];z=x[i]
+                value+=(z-a)-0.5*a*z
+                g[idx[i]]+=-1-0.5*z
+            end
+            verify(k,q,(value,g))
+        end
+    end
 end
 
 @testset "index runs: nonlinear cells reuse the same transformation" begin

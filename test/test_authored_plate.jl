@@ -1108,6 +1108,76 @@ end
     @test scanned(Float64[]) === 0.0
 end
 
+module ArrayPlateCells
+using ReactiveKernels
+
+@kernel scaled_total(groups, b) = begin
+    cells = plate(groups) do xs
+        b .* xs
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel pair_total(x1, x2, b) = begin
+    cells = plate(x1, x2) do u, v
+        [b * u, b * v]
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel outer_total(groups) = begin
+    cells = plate(groups) do xs
+        xs * xs'
+    end
+    total = sum(cells)
+    return total
+end
+
+@kernel scan_pair_total(xs) = begin
+    trajectory = scan(xs; init = 0.0) do carry, x
+        next = carry + x
+        (next, next)
+    end
+    cells = plate(trajectory) do t
+        [t, 2.0 * t]
+    end
+    total = sum(cells)
+    return total
+end
+end
+
+@testset "authored plate total: cells that hold arrays" begin
+    # Regression (snag `summing-a-plate-eba2648d`): the fused total of cells
+    # inferred as a concrete array type was seeded with `zero(T)`, which
+    # `Vector{Float64}` lacks. As Julia's `sum`, the first cell starts it.
+    P = ArrayPlateCells
+    groups = [[1.0, 2.0], [3.0, -1.0], [0.5, 0.25]]
+    scaled = prepare(P.scaled_total)
+    @test occursin("_plate_total_seed", string(code_expr(scaled)))
+    @test scaled(groups, 0.3) ≈ sum([0.3 .* xs for xs in groups])
+    @test scaled([[1.0, 2.0]], 2.0) == [2.0, 4.0]
+    @test groups == [[1.0, 2.0], [3.0, -1.0], [0.5, 0.25]]
+    # refused: as Julia's `sum`, cells of different lengths do not add.
+    @test_throws DimensionMismatch scaled([[1.0, 2.0], [3.0]], 1.0)
+    # refused: as `sum(Vector{Float64}[])`, a sum of no arrays has no zero.
+    @test_throws MethodError sum(Vector{Float64}[])
+    @test_throws "zero(::Type{Vector{Float64}})" scaled(Vector{Float64}[], 1.0)
+
+    pairs = prepare(P.pair_total)
+    @test pairs([1.0, 3.0, 0.5], [2.0, -1.0, 0.25], 0.3) ≈ [0.3 * 4.5, 0.3 * 1.25]
+
+    outer = prepare(P.outer_total)
+    @test outer(groups) ≈ sum(xs * xs' for xs in groups)
+
+    # The same first-cell total when a summed plate consumes a scan.
+    scanned = prepare(P.scan_pair_total)
+    @test !occursin("trajectory", string(code_expr(scanned)))
+    @test scanned([1.0, 2.0, 0.5]) ≈ [1.0 + 3.0 + 3.5, 2.0 * (1.0 + 3.0 + 3.5)]
+    @test_throws "zero(::Type{Vector{Float64}})" scanned(Float64[])
+end
+
 @testset "authored plate chain: redundant axis-check elision + preserved domain guards" begin
     # snag composed-authore: a fused authored plate chain absorbed one axis-check
     # group per sub-plate, so it emitted redundant pre-loop

@@ -172,32 +172,45 @@ end
     body
 end
 # The running total of a fused summed plate. It starts at `zero(T)` for the
-# cells' inferred element type `T` when that type is concrete or numeric. A
-# non-numeric abstract `T` (usually `Any`, which Julia's inference can produce
+# cells' inferred element type `T` when that type is numeric. Any other cell
+# type starts from its first cell, as Julia's `sum` does: cells that hold
+# arrays (`zero(Vector{Float64})` has no method) add elementwise, with
+# Julia's `DimensionMismatch` for unequal shapes. `_PlateFirstCell{T}` holds
+# the place of a concrete `T`, and an empty plate's total is then Julia's sum
+# of no `T` values, `zero(T)`, which fails exactly as `sum(T[])` does.
+# A non-numeric abstract `T` (usually `Any`, which Julia's inference can produce
 # for a cell that calls a nested prepared kernel; see `_declare_typed_output!`)
-# has no zero, so `_PlateTotalSeed` holds the place and the first cell starts
-# the total, which is `sum`'s value for a nonempty plate. An empty plate still
-# needs a zero without any cell: the seed carries the fallback element type `F`
-# (the axis marker's element type, or a scan consumer's output type), whose
-# zero the total then takes, and a non-numeric `F` asks for the cell type to be
-# declared. The fallback is passed as the marker itself (or the type) and its
-# element type is taken only for a non-concrete `T`: an unconditional
-# `eltype(marker)` in the lowered code is a runtime call under native Enzyme
-# when the marker is not an array (Julia 1.12 fails to compile it).
+# says nothing about the cells, so `_PlateTotalSeed` holds the place instead.
+# An empty plate still needs a zero without any cell: that seed carries the
+# fallback element type `F` (the axis marker's element type, or a scan
+# consumer's output type), whose zero the total then takes, and a non-numeric
+# `F` asks for the cell type to be declared. The fallback is passed as the
+# marker itself (or the type) and its element type is taken only for a
+# non-concrete `T`: an unconditional `eltype(marker)` in the lowered code is a
+# runtime call under native Enzyme when the marker is not an array (Julia 1.12
+# fails to compile it).
 struct _PlateTotalSeed{F} end
+struct _PlateFirstCell{T} end
 
 @inline _plate_fallback_eltype(::Type{F}) where {F} = F
 @inline _plate_fallback_eltype(marker) = eltype(marker)
 
 @inline _plate_total_seed(::Type{T}, fallback) where {T<:Number} = zero(T)
-@inline _plate_total_seed(::Type{T}, fallback) where {T} =
-    isconcretetype(T) ? zero(T) : _PlateTotalSeed{_plate_fallback_eltype(fallback)}()
+@inline _plate_total_seed(::Type{T}, fallback) where {T} = isconcretetype(T) ?
+    _PlateFirstCell{T}() : _PlateTotalSeed{_plate_fallback_eltype(fallback)}()
 
 @inline _plate_total_add(total, cell) = total + cell
-@inline _plate_total_add(::_PlateTotalSeed, cell) = cell
+@inline _plate_total_add(::Union{_PlateTotalSeed,_PlateFirstCell}, cell) = cell
 
 @inline _plate_total_value(total) = total
 @inline _plate_total_value(::_PlateTotalSeed{F}) where {F} = _plate_empty_total(F)
+@inline _plate_total_value(::_PlateFirstCell{T}) where {T} = zero(T)
+
+# The partial total of one index run (`index_runs.jl`) starts as the plate
+# total does: at the numeric total's zero, or from the run's first cell.
+@inline _plate_run_seed(total) = zero(total)
+@inline _plate_run_seed(total::Union{_PlateTotalSeed,_PlateFirstCell}) = total
+@inline _plate_run_seed(total::AbstractArray) = _PlateFirstCell{typeof(total)}()
 
 _plate_empty_total(::Type{F}) where {F<:Number} = zero(F)
 _plate_empty_total(::Type{F}) where {F} = throw(ArgumentError(
