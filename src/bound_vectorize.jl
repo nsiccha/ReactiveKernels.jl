@@ -71,9 +71,11 @@ struct _RebindConstants
     ops::Vector{Any}
     recipes::Vector{Any}
 end
+# `getfield`, not `getindex`: on an unspecialized kernel each `getindex` was a
+# dynamic dispatch on the type of a table of hundreds of entries.
 _RebindConstants(@nospecialize(kernel::PreparedKernel), slots::Vector{Int}) =
-    _RebindConstants(Any[kernel.ops[k] for k in slots],
-                     Any[kernel.lowered_recipes[k] for k in slots])
+    _RebindConstants(Any[getfield(kernel.ops, k) for k in slots],
+                     Any[getfield(kernel.lowered_recipes, k) for k in slots])
 
 _holds_constant(@nospecialize(table), constants::Vector{Any}) =
     any(x -> any(c -> x === c, constants), table)

@@ -704,6 +704,15 @@ end
         k
     end
     @test all(k -> k.f === first(kernels).f && k.ast === first(kernels).ast, kernels)
+    # The pass keeps its decisions with the rewrites, so a later binding that
+    # decides alike only evaluates its cached cell values and records no
+    # further analysis (snag rebinding-a-prep-661c4370).
+    entry = only(values(ReactiveKernels._graph_preparations(F.model.graph).bound))
+    rewrites = only(values(entry.rewrites))
+    recorded = length(rewrites.analyses)
+    @test recorded > 0
+    prepare(F.model; have, want = (:values, :total), bound = (; data = [2.0, 4.0]))
+    @test length(rewrites.analyses) == recorded
 
     positions = 4
     q = reshape(collect(range(-1.0, 1.0; length = 2positions)), 2, positions)
