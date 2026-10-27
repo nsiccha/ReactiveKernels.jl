@@ -37,6 +37,17 @@ function total_coordinates(eta::AbstractVector)
     return vcat(logsumexp(eta), s2z_basis(length(eta))' * (eta .- sum(eta) / length(eta)))
 end
 
+# Each value's density, summed in a loop: a fused broadcast over a data
+# argument beside the active value (`sum(logpdf.(Normal.(loc, s), eta))`)
+# reaches Enzyme's runtime-activity boundary (reactivekernels-use §7ab).
+function normal_values_lpdf(family, loc, scale, x)
+    lp = 0.0
+    for k in eachindex(x)
+        lp += Distributions.logpdf(family(loc[k], scale), x[k])
+    end
+    return lp
+end
+
 # The reporter's spelling: the free coordinates are the latent (identity
 # geometry), and the law reads the values they give.
 struct TotalLogSumExp{F,L,S}
@@ -45,7 +56,7 @@ struct TotalLogSumExp{F,L,S}
     scale::S
 end
 ReactiveKernelsPPL.sampling_logdensity(d::TotalLogSumExp, c) =
-    sum(Distributions.logpdf.(d.family.(d.loc, d.scale), total_values(c)); init = 0.0)
+    normal_values_lpdf(d.family, d.loc, d.scale, total_values(c))
 ReactiveKernelsPPL.sampling_geometry(::Type{TotalLogSumExp}, args, shape) =
     ParameterGeometry((:(length($(args[2]))),), :(length($(args[2]))); support = :real,
         constrain = (u, shape, args...) -> collect(u),
@@ -60,7 +71,7 @@ struct TotalCoordinates{F,L,S}
     scale::S
 end
 ReactiveKernelsPPL.sampling_logdensity(d::TotalCoordinates, eta) =
-    sum(Distributions.logpdf.(d.family.(d.loc, d.scale), eta); init = 0.0)
+    normal_values_lpdf(d.family, d.loc, d.scale, eta)
 ReactiveKernelsPPL.sampling_geometry(::Type{TotalCoordinates}, args, shape) =
     ParameterGeometry((:(length($(args[2]))),), :(length($(args[2]))); support = :real,
         constrain = (u, shape, args...) -> total_values(u),
@@ -73,7 +84,7 @@ struct ZeroSum{L,S}
     scale::S
 end
 ReactiveKernelsPPL.sampling_logdensity(d::ZeroSum, x) =
-    sum(Distributions.logpdf.(Distributions.Normal.(d.loc, d.scale), x); init = 0.0)
+    normal_values_lpdf(Distributions.Normal, d.loc, d.scale, x)
 ReactiveKernelsPPL.sampling_geometry(::Type{ZeroSum}, args, shape) =
     ParameterGeometry((:(length($(args[1]))),), :(length($(args[1])) - 1); support = :zero_sum,
         constrain = (u, shape, args...) -> s2z_basis(only(shape)) * u,
@@ -90,8 +101,11 @@ end
 ShiftedBlock(m, lower; rate = 1.0) = ShiftedBlock(m, lower, rate)
 ReactiveKernelsPPL.sampling_logdensity(d::ShiftedBlock, x) =
     sum(log(d.rate) - d.rate * (v - d.lower) for v in x; init = 0.0)
+# The argument tuple keeps Julia's leading `Expr(:parameters, …)` keyword entry.
+_positional(args) = filter(a -> !Meta.isexpr(a, :parameters), collect(args))
 ReactiveKernelsPPL.sampling_geometry(::Type{ShiftedBlock}, args, shape) =
-    ParameterGeometry((args[1], 2), :(2 * $(args[1])); support = :lower_bounded,
+    ParameterGeometry((_positional(args)[1], 2), :(2 * $(_positional(args)[1]));
+        support = :lower_bounded,
         constrain = (u, shape, m, lower; rate = 1.0) -> lower .+ reshape(exp.(u), shape) ./ rate,
         unconstrain = (x, shape, m, lower; rate = 1.0) -> vec(log.(rate .* (x .- lower))),
         logjac = (u, shape, m, lower; rate = 1.0) -> sum(u; init = 0.0) - length(u) * log(rate))

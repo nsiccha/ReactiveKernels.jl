@@ -516,9 +516,8 @@ function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
         arguments = Pair{Symbol,Any}[hostvalue(a, Symbol(:arg, k)) for (k, a) in enumerate(positional)]
         hostkeywords = Pair{Symbol,Pair{Symbol,Any}}[k.args[1] => hostvalue(k.args[2], k.args[1])
             for k in keywords]
-        push!(prelude, Expr(:(=), geometry, Expr(:call, ref(:sampling_geometry),
-            call.args[1], Expr(:tuple, (_sampling_ast_literal(a) for a in call.args[2:end])...),
-            Expr(:tuple))))
+        push!(prelude, Expr(:(=), geometry, Expr(:call, ref(:_ppl_cell_joint_endpoints),
+            call.args[1], Expr(:tuple, (_cell_ast_literal(a) for a in call.args[2:end])...))))
         push!(prelude, Expr(:(=), shapecells, column(Expr(:tuple, deepcopy.(g.shape)...))))
         push!(prelude, Expr(:(=), shapes, Expr(:call, ref(:_ppl_cell_joint_shapes),
             QuoteNode(name), shapecells)))
@@ -633,6 +632,25 @@ function _ppl_cell_latent_flatten(cells::AbstractVector)
     return out
 end
 
+# The authored argument expressions, rebuilt as a value a definition holds.
+# A resolved binding stays a quoted `GlobalRef`: definitions hold no modules.
+_cell_ast_literal(x) = x
+_cell_ast_literal(x::Symbol) = QuoteNode(x)
+_cell_ast_literal(x::GlobalRef) = QuoteNode(x)
+_cell_ast_literal(x::QuoteNode) = Expr(:call, GlobalRef(Core, :QuoteNode), _cell_ast_literal(x.value))
+_cell_ast_literal(x::Expr) = Expr(:call, GlobalRef(Core, :Expr), QuoteNode(x.head),
+    (_cell_ast_literal(a) for a in x.args)...)
+
+# The geometry's `constrain` and `logjac` endpoints, the only parts the cells
+# call: its shape expressions are evaluated at binding instead, and as AST
+# they would make the folded constant mutable to Enzyme.
+function _ppl_cell_joint_endpoints(constructor, arguments::Tuple)
+    g = sampling_geometry(constructor, arguments, ())
+    g isa ParameterGeometry || throw(ArgumentError(
+        "sampling_geometry for $constructor must return ParameterGeometry"))
+    return (g.constrain, g.logjac)
+end
+
 _ppl_cell_joint_extent(n) = n isa Integer && !(n isa Bool) && n >= 0
 
 # Each index's constrained shape, from the joint geometry's extents there.
@@ -663,16 +681,16 @@ _ppl_cell_joint_block(site, offsets, pos::Int) =
 
 # A cell's constrained value of its joint latent: the geometry's `constrain`
 # on its packed block, read in place, with the cell's argument values.
-function _ppl_cell_joint_constrain(g::ParameterGeometry, site, offsets, shapes,
+function _ppl_cell_joint_constrain(endpoints::Tuple, site, offsets, shapes,
         pos::Int, args...; kwargs...)
     shape = shapes[pos]
-    value = g.constrain(_ppl_cell_joint_block(site, offsets, pos), shape, args...; kwargs...)
+    value = first(endpoints)(_ppl_cell_joint_block(site, offsets, pos), shape, args...; kwargs...)
     _ppl_cell_joint_check(value, shape, pos)
     return value
 end
-_ppl_cell_joint_logjac(g::ParameterGeometry, site, offsets, shapes, pos::Int,
+_ppl_cell_joint_logjac(endpoints::Tuple, site, offsets, shapes, pos::Int,
         args...; kwargs...) =
-    g.logjac(_ppl_cell_joint_block(site, offsets, pos), shapes[pos], args...; kwargs...)
+    last(endpoints)(_ppl_cell_joint_block(site, offsets, pos), shapes[pos], args...; kwargs...)
 
 function _ppl_cell_joint_check(value, shape::Tuple, pos::Int)
     (isempty(shape) ? value isa Number : value isa AbstractArray && size(value) == shape) ||
