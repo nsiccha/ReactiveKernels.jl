@@ -26,6 +26,24 @@ using DifferentiationInterface, Enzyme, ReactiveKernels, ReactiveKernelsPPL, Tes
     @test !same(identity(literal(gensym(:label))), identity(literal(gensym(:label))))
     @test mask == Bool[true, false, true]
 
+    # A gensym-created module is an isolation namespace in quoted data and as
+    # a value too. Stable modules, and which namespace a reference names, stay.
+    a, b = Module(gensym(:Lowering)), Module(gensym(:Lowering))
+    quoted(m, n = m) = Expr(:call, :+, QuoteNode(GlobalRef(m, :f)), GlobalRef(n, :g))
+    @test same(identity(quoted(a)), identity(quoted(b)))
+    @test !same(identity(quoted(a)), identity(quoted(a, b)))
+    @test !same(identity(quoted(Base)), identity(quoted(Main)))
+    rebuilt(m) = Expr(:call, GlobalRef(Core, :GlobalRef), m, QuoteNode(:f))
+    @test same(identity(rebuilt(a)), identity(rebuilt(b)))
+    @test !same(identity(rebuilt(Base)), identity(rebuilt(Main)))
+    @test !same(identity(rebuilt(a)), identity(rebuilt(Main)))
+    # A differing statement that holds a module is named, not copied.
+    held(m) = Expr(:function, :(f(x)), Expr(:block, LineNumberNode(1),
+        Expr(:(=), :ref, rebuilt(m))))
+    built, other = held(Base), held(Main)
+    @test occursin("statement 1:", ReactiveKernelsPPL._program_difference(built, other))
+    @test built.args[2].args[1] isa LineNumberNode
+
     # An equal quoted mask must not hide the later, actual difference.
     def(mask, value) = Expr(:function, :(f(x)), Expr(:block,
         Expr(:(=), :present, QuoteNode(mask)), Expr(:(=), :result, value)))
