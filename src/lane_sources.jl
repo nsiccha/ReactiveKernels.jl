@@ -179,13 +179,24 @@ function _lane_source_closure(r::Recipe; branches::Bool = false)
     branches || !(op.f isa _KernelBranch) || return nothing
     f = _kernel_native_source(_lane_source_callable(op.f))
     fieldcount(typeof(f)) == 0 || return nothing
+    params = _lane_source_params(f, length(r.inputs))
+    params === nothing && return nothing
+    (f, params, parentmodule(typeof(f)))
+end
+
+# The parameter names of a source closure's one method, when it takes `n`
+# distinct named parameters, or `nothing`. The source reads its inputs by these
+# names, which need not be the input values' names: a composed child's recipe
+# reads its formals (`A * w`) over the caller's values (`X`, `b`), or over
+# values scoped under the caller's name (`pointwise.X`).
+function _lane_source_params(f, n)
     candidates = methods(f)
     length(candidates) == 1 || return nothing
     params = Base.method_argnames(only(candidates))[2:end]
-    length(params) == length(r.inputs) || return nothing
+    length(params) == n || return nothing
     all(name -> name isa Symbol, params) || return nothing
     allunique(params) || return nothing
-    (f, params, parentmodule(typeof(f)))
+    params
 end
 
 # The source's names of the closure's parameters. A method stores a gensym

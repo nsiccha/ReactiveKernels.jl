@@ -59,6 +59,17 @@ logistic(x) = 1 / (1 + exp(-x))
 double(x) = 2 .* x
 end
 
+# Composed children whose formals are not the caller's argument names. The
+# const binding shares the name of a formal, which shadows it in the child.
+const na_child_scale = 3.0
+@kernel na_child_product(A, w) = begin
+    eta = A * w
+    return sum(exp.(eta))
+end
+@kernel na_child_scaled(x, na_child_scale) = begin
+    return sum(na_child_scale .* x)
+end
+
 function nonallocating_op_call_indices(ast)
     indices = Int[]
     function visit(node)
@@ -383,6 +394,36 @@ end
         # A non-const global in the captured source keeps the whole-recipe
         # fallback and stays correct.
         @test NonConstGlobalFixture.check_parity()
+    end
+
+    @testset "a composed child's sources decompose under its formal names" begin
+        # A child's recipes read its formals (`A * w`) over the caller's
+        # values (`X`, `b`): decomposition binds the source closure's
+        # parameter names, never the input values' names. The formal
+        # `na_child_scale` reads the caller's `s`, not the const binding of
+        # that name, exactly as the child's closure does.
+        spec = @kernel na_child_caller(X::Matrix{Float64}, b::Vector{Float64},
+                                       x::Vector{Float64}, s::Float64) = begin
+            fit::Float64 = na_child_product(X, b)
+            scaled::Float64 = na_child_scaled(x, s)
+            total::Float64 = fit + scaled
+        end
+        steady(k, args...) = (k(args...); k(args...); @allocated k(args...))
+        data(n) = (rand(n, 3), rand(3), rand(n), 0.5)
+
+        ordinary = prepare(spec; have = (:X, :b, :x, :s), want = :total)
+        k = prepare_nonallocating(spec; have = (:X, :b, :x, :s), want = :total)
+        args = data(8)
+        @test k(args...) == ordinary(args...)
+        @test !any(op -> op isa ReactiveKernels._KernelSourceOp, called_ops(k))
+        @test any(op -> op isa ReactiveKernels._MatMulStep, called_ops(k))
+
+        small = steady(k, data(8)...)
+        large = steady(k, data(200)...)
+        println("NONALLOCATING_ALLOC_BYTES\tcomposed_child_small\t", small)
+        println("NONALLOCATING_ALLOC_BYTES\tcomposed_child_large\t", large)
+        @test small == large
+        @test small <= 512
     end
 
     @testset "multi-output recipes fail at preparation" begin
