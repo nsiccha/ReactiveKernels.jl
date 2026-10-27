@@ -6838,22 +6838,26 @@ function Base.show(io::IO, k::GraphReplicatedKernel{B}) where {B}
     print(io, ")")
 end
 
-function _replica_graph(target::PreparedKernel, batched)
-    indices = _replica_batch_indices(inputs(target), batched)
-    _replicated_graph_plan(target.plan) || throw(ArgumentError(
+# Like the other construction helpers, these compile once rather than once per
+# kernel type: specialized, a large program's reader compiled its constructors
+# for seconds each (snag `compiled-reader-be3cadbb`).
+Base.@nospecializeinfer function _replica_graph(@nospecialize(target::PreparedKernel),
+                                                @nospecialize(batched))
+    plan = getfield(target, :plan)::Plan
+    boundary = getfield(target, :inputs)::Tuple
+    wants = getfield(target, :outputs)::Tuple
+    indices = _replica_batch_indices(boundary, batched)
+    _replicated_graph_plan(plan) || throw(ArgumentError(
         "scalar kernel requires the complete-callable replica fallback"))
-    ast, ops = _lower_replicated_with_ops(target.plan; batched)
+    ast, ops = _lower_replicated_with_ops(plan; batched)
     ops = _execution_source(ops)
     native = compile(ast)
-    boundary = inputs(target)
-    input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
-    output_types = Tuple{(valtype(value) for value in outputs(target))...}
-    GraphReplicatedKernel{indices,input_types,output_types,
-                          typeof(native),typeof(ops),typeof(target.plan),
-                          typeof(target),typeof(boundary),
-                          typeof(outputs(target))}(
-        target, native, ops, target.plan, ast,
-        boundary, outputs(target))
+    input_types = Tuple{Any[valtype(boundary[i]) for i in indices]...}
+    output_types = Tuple{Any[valtype(value) for value in wants]...}
+    T = GraphReplicatedKernel{indices,input_types,output_types,
+                              typeof(native),typeof(ops),Plan,
+                              typeof(target),typeof(boundary),typeof(wants)}
+    _kernel_new_instance(T, (target, native, ops, plan, ast, boundary, wants))
 end
 
 function replica_graph(kernel::PreparedKernel; batched)
@@ -6964,13 +6968,17 @@ end
 # lane buffer per WANT and one slot per position intermediate with a
 # destination form; `_lower_replicated_with_ops` returns the count.
 _borrowed_batch_caches(count::Int) = ntuple(_ -> Ref{Any}(nothing), count)
-_borrowed_batch(target::GraphReplicatedKernel) =
-    _borrowed_batch(target, target.plan, batched_ports(target))
+Base.@nospecializeinfer _borrowed_batch(@nospecialize(target::GraphReplicatedKernel)) =
+    _borrowed_batch(target, getfield(target, :plan)::Plan, batched_ports(target))
 # `target` answers `inputs`, `outputs` and `plan` for the borrowed driver of `p`.
-function _borrowed_batch(@nospecialize(target), p::Plan, batched)
+Base.@nospecializeinfer function _borrowed_batch(@nospecialize(target), p::Plan,
+                                                 @nospecialize(batched))
     ast, ops, slot_count = _lower_replicated_with_ops(p; batched, reuse=true)
-    BorrowedBatchedKernel(target, compile(ast), _execution_source(ops),
-        _borrowed_batch_caches(slot_count), ast)
+    native = compile(ast)
+    ops = _execution_source(ops)
+    caches = _borrowed_batch_caches(slot_count)
+    T = BorrowedBatchedKernel{typeof(target),typeof(native),typeof(ops),typeof(caches)}
+    _kernel_new_instance(T, (target, native, ops, caches, ast))
 end
 
 # A new native execution instance shares the read-only computation, not the
@@ -7328,9 +7336,10 @@ function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
                  exemplars = nothing, type_stability = nothing,
                  type_stability_level = nothing)
     _with_type_stability(type_stability, type_stability_level) do
-        _check_uninferred_values(
-            _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
-                          exemplars))
+        kernel = _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
+                               exemplars)
+        _check_uninferred_values(kernel)
+        kernel
     end
 end
 

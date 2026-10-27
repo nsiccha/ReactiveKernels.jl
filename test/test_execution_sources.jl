@@ -93,6 +93,29 @@ end
     @test RK.kernel_sourceop_token(source[1].op) !== RK.kernel_sourceop_token(source[2].op)
 end
 
+@testset "reader construction compiles once, not once per program" begin
+    # The type-stability check and the position-reader constructors read only
+    # a kernel's plan and fields; specialized on a large program's kernel type
+    # they took a third of its first read (snag `compiled-reader-be3cadbb`).
+    function reader(scale)
+        graph = Graph()
+        x = value!(graph, :x, Float64)
+        y = value!(graph, :y, Float64)
+        add!(graph, (x,) => y, v -> scale * v + Float64(length(string(scale))))
+        vectorize(prepare(graph; have = (x,), want = y); batched = :x, reuse = true)
+    end
+    count_specializations(f) = sum(m -> count(!isnothing, Base.specializations(m)), methods(f))
+    readers = [reader(2.0), reader(3)]
+    @test typeof(readers[1]) !== typeof(readers[2])
+    @test readers[1]([1.0, 2.0]) == [5.0, 7.0]
+    @test readers[2]([1.0, 2.0]) == [4.0, 7.0]
+    before = map(count_specializations, (RK._check_uninferred_values, RK._replica_graph,
+                                         RK._borrowed_batch))
+    readers = [reader(4.0f0), reader(5//1)]
+    @test map(count_specializations, (RK._check_uninferred_values, RK._replica_graph,
+                                      RK._borrowed_batch)) == before
+end
+
 @testset "execution branch metadata preserves host branch behavior" begin
     call(x, scale) = scale > 0 ? x * log(scale) : -x
     branch = RK._KernelBranch(Val((2,)), Val((1, 2)), Val((1,)), call,

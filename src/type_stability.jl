@@ -218,8 +218,8 @@ The values of a prepared kernel whose types are not inferred concretely when
 its HAVE ports have `argument_types`, one per recipe that introduces such a
 type. HAVE ports whose types are not concrete leave what they reach unchecked.
 """
-function _uninferred_values(kernel, argument_types)
-    p = kernel.plan
+Base.@nospecializeinfer function _uninferred_values(@nospecialize(kernel), argument_types)
+    p = getfield(kernel, :plan)::Plan
     found = _UninferredValue[]
     length(p.have) == length(argument_types) || return found
     _uninferred_values!(found, p, collect(Any, argument_types), Symbol[],
@@ -375,7 +375,7 @@ function _level_code_findings(level::Val, @nospecialize(f), argument_types)
     all(isconcretetype, argument_types) || return _CodeFinding[]
     _code_findings(f, Tuple(argument_types); recurse = _code_recursion(level))
 end
-_level_code_findings(level::Symbol, f, argument_types) =
+Base.@nospecializeinfer _level_code_findings(level::Symbol, @nospecialize(f), argument_types) =
     _level_code_findings(Val(level), f, argument_types)
 
 # A finding that starts an instability: a value whose operands are concretely
@@ -442,16 +442,20 @@ end
 # Check `kernel` over `argument_types` with the settings of the preparation in
 # progress: the type of every value, and at `:rk` and `:all` the code of the
 # prepared program. Warn once per process for each finding and continue, or
-# refuse the preparation, naming every finding.
-function _check_uninferred_values(kernel, argument_types)
+# refuse the preparation, naming every finding. The check reads only the
+# kernel's plan and calls it through inference, so it compiles once rather than
+# once per prepared kernel type: specialized on the type of a large program's
+# kernel, its compilation took a third of that program's first read (63 of
+# 187 s, Bruno's varyingsource3 simulator; snag `compiled-reader-be3cadbb`).
+Base.@nospecializeinfer function _check_uninferred_values(@nospecialize(kernel), argument_types)
     mode, level = _type_stability(), _type_stability_level()
     values = _uninferred_values(kernel, argument_types)
     code = _level_code_findings(level, kernel, argument_types)
     _report_type_stability(values, code, mode)
-    kernel
+    nothing
 end
 
 # Prepared kernels whose HAVE ports have concrete declared types are checked
 # from those declarations.
-_check_uninferred_values(kernel) =
-    _check_uninferred_values(kernel, map(valtype, kernel.plan.have))
+Base.@nospecializeinfer _check_uninferred_values(@nospecialize(kernel)) =
+    _check_uninferred_values(kernel, map(valtype, (getfield(kernel, :plan)::Plan).have))
