@@ -240,8 +240,11 @@ end
 
 # Every summand is a proven scalar (`_value_axes` is `Any[]`): an intercept
 # coefficient, a scalar offset or covariate, or a composition of sampled
-# scalars, numbers and scalar definitions. An opaque call result has an
-# unknown shape and keeps the location's rows.
+# scalars, numbers and scalar definitions. A composition's value leaves
+# (its columns) are proven scalars too: a scalar definition that another
+# definition also reads stays a retained value, read by name (`la = a;
+# l = exp(la)`). An opaque call result has an unknown shape and keeps the
+# location's rows.
 function _scalar_valued_predictor(plan::StructuralPlan, pred::PredictorSpec)
     isempty(pred.terms) && return false
     scalar(ex) = _value_axes(plan, ex; data_axes = true) == Any[] &&
@@ -250,8 +253,8 @@ function _scalar_valued_predictor(plan::StructuralPlan, pred::PredictorSpec)
         t.kind === InterceptTerm && return true
         t.kind in (ContinuousTerm, OffsetTerm) && return all(scalar, t.columns)
         t.kind === ComposedTerm || return false
-        isempty(t.columns) && isempty(t.options.subs) || return false
-        return scalar(t.options.tree)
+        isempty(t.options.subs) || return false
+        return all(scalar, t.columns) && scalar(t.options.tree)
     end
 end
 

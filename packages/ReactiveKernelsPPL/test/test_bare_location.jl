@@ -724,6 +724,45 @@ end
     end
 end
 
+# A scalar location that another definition also reads stays a retained
+# value, read by name (`la = a; l = exp(la)`). It is still a proven scalar,
+# so a count response's log-rate or logit takes the plate path, not the
+# fused row path that reads its location as a row vector (`dot(w, la)`
+# raised a DimensionMismatch; snag poissonlog-scala-b87b0bf7).
+@testset "a scalar location read by another definition stays scalar" begin
+    D = Distributions
+    w = [mod(2j, 5) for j in 1:15]
+    k = [mod(j, 6) for j in 1:15]
+    n = fill(5, 15)
+    lg(v) = 1 / (1 + exp(-v))
+    prior = D.logpdf(D.Normal(0, 1), 0.4)
+    poisson = prior + sum(D.logpdf.(D.Poisson(exp(0.4)), w))
+    binomial = prior + sum(D.logpdf.(D.Binomial.(n, lg(0.4)), k))
+    counts = Dict{Symbol,AbstractVector}(:w => w)
+    trials = Dict{Symbol,AbstractVector}(:k => k, :n => n)
+    cases = [
+        ("l = exp.(la)", "w .~ PoissonLog.(la)", counts, poisson),
+        ("l = exp(la)", "w .~ PoissonLog.(la)", counts, poisson),
+        ("l = la + 1.0", "w .~ PoissonLog.(la)", counts, poisson),
+        ("l = exp(la)", "w .~ Poisson.(exp.(la))", counts, poisson),
+        ("l = exp(la)", "k .~ BinomialLogit.(n, la)", trials, binomial),
+        ("l = exp(la)", "k .~ Binomial.(n, logistic.(la))", trials, binomial),
+    ]
+    for (reader, response, cols, want) in cases
+        prog = Meta.parse("""begin
+            a ~ Normal(0, 1)
+            la = a
+            $reader
+            $response
+        end""")
+        bound, built, _, u = _rows_sampler(prog, cols)
+        src = string(kernel_expr(bound, built.layout))
+        @test !occursin("dot(", src) && !occursin("_ppl_rows", src)
+        @test _value_posterior(prog, cols, (; a = 0.4)) ≈ want rtol = 1e-12
+        _check_gradient(built.spec, bound, u)
+    end
+end
+
 # A per-observation gather of a declared array has the axes Julia indexing
 # gives it once its index column is bound: the column's axes in the gathered
 # position, the array's own axis for each `:`. A location adding a scalar to
