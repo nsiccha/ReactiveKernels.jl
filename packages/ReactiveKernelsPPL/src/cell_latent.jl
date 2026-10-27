@@ -107,6 +107,9 @@ struct _CellShapes
     dataonly::Set{Symbol}                       # cell locals reading only data
     scalars::Set{Symbol}                        # scalar latents of the cell
     arrays::Dict{Symbol,Tuple{Symbol,Symbol}}   # array latent => (dims, position)
+    # Indexed cell definitions `v[i] = rhs`, such as a per-cell submodel's
+    # values (`z.mu[i]`): `v[i]` holds `rhs`.
+    defined::Dict{Symbol,Any}
 end
 
 _cell_reads_only_data(ex, cx::_CellShapes) = all(s -> s in cx.scope.data ||
@@ -150,6 +153,13 @@ function _cell_latent_shape(ex, cx::_CellShapes, active::Set{Symbol} = Set{Symbo
         if haskey(cx.arrays, ex.args[1])
             dims, pos = cx.arrays[ex.args[1]]
             return Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_latent_axes), dims, pos)
+        end
+        name = ex.args[1]
+        if haskey(cx.defined, name) && !(name in active)
+            push!(active, name)
+            shape = _cell_latent_shape(cx.defined[name], cx, active)
+            delete!(active, name)
+            return shape
         end
     end
     if ex.head === :ref && all(i -> i isa Integer, ex.args[2:end])
@@ -302,7 +312,7 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
     indices = Expr(:call, GlobalRef(Base, :collect), iterator)
     position = Expr(:call, GlobalRef(@__MODULE__, :_ppl_cell_scan_position), domain, ivar)
     cx = _CellShapes(ivar, scope, Pair{Symbol,Any}[], Set{Symbol}(), Set{Symbol}(),
-        Dict{Symbol,Tuple{Symbol,Symbol}}())
+        Dict{Symbol,Tuple{Symbol,Symbol}}(), Dict{Symbol,Any}())
     prelude, cells = Any[], Any[]
     column(rhs) = _plate_column_call(ivar, _needed_cell_locals(cx.locals, rhs), rhs,
         nothing; indices)
@@ -315,6 +325,10 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
             # A joint latent's value has its geometry's shape at the index.
             _, _, _, shapes, pos = filter(a -> !Meta.isexpr(a, :parameters), c.args[2].args[2:end])
             cx.arrays[c.args[1].args[1]] = (shapes, pos)
+        elseif Meta.isexpr(c, :(=), 2) && Meta.isexpr(c.args[1], :ref, 2) &&
+                c.args[1].args[2] === ivar && c.args[1].args[1] isa Symbol &&
+                !_is_cell_latent_block(c)
+            cx.defined[c.args[1].args[1]] = c.args[2]
         elseif Meta.isexpr(c, :call, 3) && c.args[1] === :~ &&
                 Meta.isexpr(c.args[2], :ref, 2) && c.args[2].args[2] === ivar &&
                 c.args[2].args[1] isa Symbol && !(c.args[2].args[1] in scope.data)
