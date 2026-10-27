@@ -38,6 +38,7 @@ include("bound_vectorize.jl")
 include("position_cells.jl")
 include("index_runs.jl")
 include("nonallocating.jl")
+include("type_stability_audit.jl")
 include("type_stability.jl")
 include("graphops.jl")
 include("scan_history.jl")
@@ -77,7 +78,7 @@ include("jax.jl")
 include("jax_host.jl")
 
 export Value, Recipe, Graph, Plan, PreparedKernel, PreparedADKernel, PreparedADPullback, ReplicatedKernel, NonAllocatingKernel, PlanningError
-export UninferredValuesError
+export TypeInstabilityError
 export PreparedADOperator, PreparedADPushforward, PreparedADHVP, PreparedADThird
 export value, value!, add!, plan, prepare, prepare_nonallocating, plate, scan, @plate, @scan
 export partial_evaluation

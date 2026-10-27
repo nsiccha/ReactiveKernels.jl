@@ -446,36 +446,48 @@ of Julia's iteration protocol, is accepted. A kernel calling a function whose
 result is uninferred is the test's negative control.
 
 An RK-introduced residue that cannot be removed would be exempted with its
-reason in `test/type_stability_audit.jl`; none is exempt.
+reason in `src/type_stability_audit.jl` (`_CODE_FINDINGS_JUSTIFIED`); none is
+exempt.
 
-Client code is checked when it is prepared. A recipe whose inputs are
-concretely typed but whose result Julia does not infer concretely (`Any`, an
-abstract type, a `Union`, or an array of such elements) is reported with a
-warning that names the value and its recipe. `prepare` checks from the
-declared types of the HAVE ports where they are concrete and from bound data;
-`prepare_ad`, and so `prepare_sampler`, checks from the exemplar arguments.
-Values computed from such a value, or from a HAVE port whose type is not
-known, are not reported again. Preparation still succeeds, so the primal of
-such a kernel keeps working.
+Client code is checked when it is prepared, with the same audit.
+`prepare` checks from the declared types of the HAVE ports where they are
+concrete and from bound data; `prepare_ad`, and so `prepare_sampler`, checks
+from the exemplar arguments and audits the callable its backend
+differentiates. How far the check reaches is `type_stability_level`:
 
-A project that wants such a program refused sets the ReactiveKernels
-preference `type_stability` to `"error"`:
+| level | checks |
+|---|---|
+| `:values` | every value of the program: a recipe whose inputs are concretely typed but whose result Julia does not infer concretely (`Any`, an abstract type, a `Union`, or an array of such elements) is reported, naming the value and its recipe. Values computed from such a value, or from a HAVE port whose type is not known, are not reported again. |
+| `:rk` | also the code of the prepared program: the body ReactiveKernels generates and the functions of ReactiveKernels' packages it calls. A used value Julia does not infer concretely, or a call dispatched at run time, is reported with its method. Every other function is a leaf: its call must dispatch statically and return a concrete type. |
+| `:all` (default) | also every function that code calls, a client helper's body included, except Julia's own Base, Core and standard libraries, which stay leaves. |
+
+So at `:all`, a helper that dispatches at run time but asserts its result
+(`f(x) = (g(x))::Float64` over an uninferred `g`) is reported, and so is a
+declared local (`mu::Vector{Float64} = f(x)`) over a helper whose result is
+not inferred; at `:values` neither is.
+
+`type_stability` is what preparation does with a finding. By default (`:warn`)
+it logs a warning once per process and succeeds, so the primal of such a
+kernel keeps working. `:error` refuses the program: every preparation throws a
+`TypeInstabilityError` listing each finding. Both settings are keywords of
+`prepare`, `prepare!` and the `prepare_ad*` functions, which take precedence
+for one call and the preparations nested in it, and ReactiveKernels
+preferences of the same name, which a project sets once:
 
 ```julia
 using Preferences, ReactiveKernels
 Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")
+Preferences.set_preferences!(ReactiveKernels, "type_stability_level" => "rk")
 ```
 
-This writes `[ReactiveKernels] type_stability = "error"` to the project's
-`LocalPreferences.toml`. Every preparation in that project then throws an
-`UninferredValuesError` listing each uninferred value with its recipe,
-including preparations that other packages make for it (RKPPL's
+This writes `[ReactiveKernels] type_stability = "error"` (and the level) to the
+project's `LocalPreferences.toml`. Every preparation in that project then
+follows it, including preparations that other packages make for it (RKPPL's
 `prepare_sampler`), its tests (`Pkg.test` copies the preferences), scripts and
-precompile workloads. The preference is read at the first preparation of a
-Julia session; a new session picks up a change without recompiling anything. The `type_stability = :error` (or `:warn`) keyword of
-`prepare`, `prepare!` and the `prepare_ad*` functions takes precedence for one
-call and the preparations nested in it. Cached preparations are kept per mode,
-so a kernel prepared under `:warn` is never returned to an `:error` call.
+precompile workloads. The preferences are read at the first preparation of a
+Julia session; a new session picks up a change without recompiling anything.
+Cached preparations are kept per setting, so a kernel prepared under `:warn`
+or a lower level is never returned to a stricter call.
 
 When an abstract HAVE declaration hides a concrete input type needed to infer
 an authored plate's rank, `prepare(...; exemplars = (x, ...))` opts the native

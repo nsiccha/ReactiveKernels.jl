@@ -132,6 +132,13 @@ recipe and continues. Refusal is opt-in, never the default: a project's
 keyword makes preparation throw instead (snag `type-stability-c-7eeae56d`,
 user decision
 `ReactiveKernels:snag.type-stability-c-7eeae56d/decisions/2026-10-27T20-42-40-959-1jkb0is`).
+The check covers "everything" by default: the code of the prepared program and
+of every function it calls except Julia's own, with lower
+`type_stability_level`s for the code ReactiveKernels prepares (`:rk`) or the
+values alone (`:values`) (user decision
+`ReactiveKernels:snag.type-stability-c-7eeae56d/decisions/2026-10-27T21-12-20-388-04ks7hd`
+and its comment: "maybe have different levels, which may then include either
+everything rk, or everything everything?").
 
 ## Derivative rules come from one mathematical graph, never by hand
 

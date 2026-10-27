@@ -5678,7 +5678,7 @@ function _kernel_bound_pairs(spec::KernelSpec, bound)
 end
 
 """
-    prepare(spec::KernelSpec; have, want, passes=(), bound=(;), on_error=nothing, exemplars=nothing, type_stability=nothing) -> callable
+    prepare(spec::KernelSpec; have, want, passes=(), bound=(;), on_error=nothing, exemplars=nothing, type_stability=nothing, type_stability_level=nothing) -> callable
 
 Prepare an authored kernel. With a non-empty `bound` NamedTuple
 (`bound = (; X, y)`), the [`partial_evaluation`](@ref) pre-pass runs first:
@@ -5704,14 +5704,16 @@ captured `@kernel` and `@traceable` source with `nothing`, including expanded
 mathematics. Ordinary opaque function bodies keep their behavior. This first
 policy continues execution; it does not catch exceptions or return a fallback.
 
-`type_stability` selects whether preparation warns about values that do not
-infer a concrete type or refuses them, as for [`prepare`](@ref) on a `Plan`.
+`type_stability` selects whether preparation warns about a type instability or
+refuses it, and `type_stability_level` how far it checks, as for
+[`prepare`](@ref) on a `Plan`.
 """
 function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
                  want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
                  bound = NamedTuple(), on_error = nothing,
-                 exemplars = nothing, type_stability = nothing)
-    _with_type_stability(type_stability) do
+                 exemplars = nothing, type_stability = nothing,
+                 type_stability_level = nothing)
+    _with_type_stability(type_stability, type_stability_level) do
         isempty(bound) || return prepare(spec.graph;
             have = _kernel_selection(spec, have, spec.have_names, :have),
             want = _kernel_selection(spec, want, spec.want_names, :want),
@@ -5725,7 +5727,7 @@ function prepare(spec::KernelSpec; have = _KERNEL_DEFAULT_BOUNDARY,
 end
 
 """
-    prepare!(cache, spec::KernelSpec; have, want, passes=(), bound=(;), type_stability=nothing) -> callable
+    prepare!(cache, spec::KernelSpec; have, want, passes=(), bound=(;), type_stability=nothing, type_stability_level=nothing) -> callable
 
 Like [`prepare`](@ref) on an authored kernel, reusing `cache`. With a
 non-empty `bound` NamedTuple the [`partial_evaluation`](@ref) pre-pass runs as
@@ -5739,16 +5741,18 @@ over the remaining HAVE ports exactly as `prepare(spec; bound)` returns it.
 function prepare!(cache::PreparationCache, spec::KernelSpec;
                   have = _KERNEL_DEFAULT_BOUNDARY,
                   want = _KERNEL_DEFAULT_BOUNDARY, passes = (),
-                  bound = NamedTuple(), on_error = nothing, type_stability = nothing)
+                  bound = NamedTuple(), on_error = nothing, type_stability = nothing,
+                  type_stability_level = nothing)
     isempty(bound) || return prepare!(cache, spec.graph;
         have = _kernel_selection(spec, have, spec.have_names, :have),
         want = _kernel_selection(spec, want, spec.want_names, :want),
         passes = passes, bound = _kernel_bound_pairs(spec, bound), on_error = on_error,
-        type_stability)
+        type_stability, type_stability_level)
     prepared = prepare!(cache, spec.graph;
                         have = _kernel_selection(spec, have, spec.have_names, :have),
                         want = _kernel_selection(spec, want, spec.want_names, :want),
-                        passes = passes, on_error = on_error, type_stability)
+                        passes = passes, on_error = on_error, type_stability,
+                        type_stability_level)
     have === _KERNEL_DEFAULT_BOUNDARY || return prepared
     _kernel_signature_callable(prepared, spec.call_signature)
 end

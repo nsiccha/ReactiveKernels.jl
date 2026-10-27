@@ -256,91 +256,198 @@ function _uninferred_value_message(u::_UninferredValue)
 end
 
 """
-    UninferredValuesError(messages)
+    TypeInstabilityError(messages)
 
-Thrown by a preparation checked with `type_stability = :error` when values of
-the prepared program do not infer concretely. `messages` holds one message per
-recipe that introduces such a type, as the warning of the default
-`type_stability = :warn` words it.
+Thrown by a preparation checked with `type_stability = :error` when the
+prepared program is not type stable at the checked `type_stability_level`.
+`messages` holds one message per finding, as the warning of the default
+`type_stability = :warn` words it: a value whose type the program does not
+infer concretely, or a method whose code holds non-concrete values or calls
+dispatched at run time.
 """
-struct UninferredValuesError <: Exception
+struct TypeInstabilityError <: Exception
     messages::Vector{String}
 end
 
-function Base.showerror(io::IO, e::UninferredValuesError)
+function Base.showerror(io::IO, e::TypeInstabilityError)
     n = length(e.messages)
-    print(io, "UninferredValuesError: ", n, n == 1 ? " value" : " values",
-          " of the prepared program", n == 1 ? " does" : " do",
-          " not infer a concrete type, and this preparation is checked with ",
-          "`type_stability = :error`.")
+    print(io, "TypeInstabilityError: the prepared program is not type stable (",
+          n, n == 1 ? " finding" : " findings",
+          "), and this preparation is checked with `type_stability = :error`.")
     foreach(message -> print(io, "\n\n", message), e.messages)
 end
 
-# What preparation does with an uninferred value: `:warn` logs it once per
-# process and continues; `:error` refuses the preparation.
-const _TYPE_STABILITY_MODES = (:warn, :error)
+# The type-stability settings. Each is a keyword of `prepare`, `prepare!` and
+# every `prepare_ad*`, and a ReactiveKernels preference of the same name; its
+# first choice is the default.
+#
+# - `type_stability`: what preparation does with a finding. `:warn` logs it
+#   once per process and continues; `:error` refuses the preparation (snag
+#   `type-stability-c-7eeae56d`, user decision `1jkb0is`).
+# - `type_stability_level`: how far preparation checks (user decision
+#   `ReactiveKernels:snag.type-stability-c-7eeae56d/decisions/2026-10-27T21-12-20-388-04ks7hd`:
+#   "everything", in levels "either everything rk, or everything everything").
+#   `:values` infers the type of every value of the program. `:rk` also audits
+#   the code RK prepares, its generated body and the functions of
+#   ReactiveKernels' packages it calls; every other function is a leaf, whose
+#   call must be dispatched statically and return a concrete type. `:all` also
+#   audits every function that code calls, except Julia's own (Base, Core and
+#   the standard libraries), which stay leaves.
+_type_stability_choices(::Val{:type_stability}) = (:warn, :error)
+_type_stability_choices(::Val{:type_stability_level}) = (:all, :rk, :values)
 
-_type_stability_mode(mode::Symbol) = mode in _TYPE_STABILITY_MODES ? mode :
-    throw(ArgumentError("`type_stability` must be one of " *
-                        "$(join(repr.(_TYPE_STABILITY_MODES), ", ")); got $(repr(mode))"))
-_type_stability_mode(mode) = throw(ArgumentError(
-    "`type_stability` must be a Symbol, one of " *
-    "$(join(repr.(_TYPE_STABILITY_MODES), ", ")); got $(repr(mode))"))
-
-# The project's `type_stability` preference, `[ReactiveKernels]
-# type_stability = "error"` in its `LocalPreferences.toml`, read at the first
-# preparation of a process: a read takes tens of microseconds, as long as
-# rebinding a small bound kernel. It is not compiled in, so a new session picks
-# up a change without recompiling. `__init__` forgets a value read while an
-# image was generated.
-const _TYPE_STABILITY_PREFERENCE = Ref{Union{Nothing,Symbol}}(nothing)
-
-function _type_stability_preference()
-    mode = _TYPE_STABILITY_PREFERENCE[]
-    mode === nothing || return mode
-    value = Preferences.load_preference(@__MODULE__, "type_stability", "warn")
-    value in ("warn", "error") || throw(ArgumentError(
-        "the ReactiveKernels preference `type_stability` must be \"warn\" or " *
-        "\"error\"; got $(repr(value))"))
-    _TYPE_STABILITY_PREFERENCE[] = Symbol(value)
+function _type_stability_choice(setting::Val{S}, value) where {S}
+    choices = _type_stability_choices(setting)
+    value isa Symbol && value in choices && return value
+    throw(ArgumentError("`$S` must be one of $(join(repr.(choices), ", ")); " *
+                        "got $(repr(value))"))
 end
 
-# The task-local key of the mode a `type_stability` keyword sets for the
-# preparations its call makes, nested ones included (a child kernel's, a bound
-# residual's).
-const _TYPE_STABILITY_SCOPE = :ReactiveKernels_type_stability
+# The project's preferences (`[ReactiveKernels] type_stability = "error"` in its
+# `LocalPreferences.toml`), read at the first preparation of a process: a read
+# takes tens of microseconds, as long as rebinding a small bound kernel. They
+# are not compiled in, so a new session picks up a change without recompiling.
+# `__init__` forgets values read while an image was generated.
+const _TYPE_STABILITY_PREFERENCES =
+    (Ref{Union{Nothing,Symbol}}(nothing), Ref{Union{Nothing,Symbol}}(nothing))
+_type_stability_preference_cache(::Val{:type_stability}) = _TYPE_STABILITY_PREFERENCES[1]
+_type_stability_preference_cache(::Val{:type_stability_level}) =
+    _TYPE_STABILITY_PREFERENCES[2]
 
-# The mode of the preparation in progress: the innermost enclosing
-# `type_stability` keyword, else the preference.
-_type_stability() =
-    get(_type_stability_preference, task_local_storage(), _TYPE_STABILITY_SCOPE)
+function _type_stability_preference(setting::Val{S}) where {S}
+    cache = _type_stability_preference_cache(setting)
+    cached = cache[]
+    cached === nothing || return cached
+    choices = string.(_type_stability_choices(setting))
+    value = Preferences.load_preference(@__MODULE__, string(S), first(choices))
+    value in choices || throw(ArgumentError(
+        "the ReactiveKernels preference `$S` must be one of " *
+        "$(join(repr.(choices), ", ")); got $(repr(value))"))
+    cache[] = Symbol(value)
+end
 
-# `f()` with every preparation inside it checked in `mode`; `nothing` keeps the
-# enclosing mode.
-_with_type_stability(f, ::Nothing) = f()
-_with_type_stability(f, mode) =
-    task_local_storage(f, _TYPE_STABILITY_SCOPE, _type_stability_mode(mode))
+# The task-local keys of the settings a call's keywords give the preparations it
+# makes, nested ones included (a child kernel's, a bound residual's).
+_type_stability_scope(::Val{:type_stability}) = :ReactiveKernels_type_stability
+_type_stability_scope(::Val{:type_stability_level}) = :ReactiveKernels_type_stability_level
 
-_report_uninferred_values(found, mode::Symbol) =
-    _report_uninferred_values(found, Val(mode))
+# A setting of the preparation in progress: the innermost enclosing keyword,
+# else the preference.
+_type_stability_setting(setting::Val) = get(() -> _type_stability_preference(setting),
+                                            task_local_storage(),
+                                            _type_stability_scope(setting))
+_type_stability() = _type_stability_setting(Val(:type_stability))
+_type_stability_level() = _type_stability_setting(Val(:type_stability_level))
 
-function _report_uninferred_values(found, ::Val{:warn})
-    for u in found
+# `f()` with every preparation inside it checked with the given settings;
+# `nothing` keeps the enclosing one.
+_with_type_stability(f, mode, level) =
+    _with_type_stability_setting(Val(:type_stability), mode) do
+        _with_type_stability_setting(f, Val(:type_stability_level), level)
+    end
+_with_type_stability_setting(f, ::Val, ::Nothing) = f()
+_with_type_stability_setting(f, setting::Val, value) =
+    task_local_storage(f, _type_stability_scope(setting),
+                       _type_stability_choice(setting, value))
+
+# Julia's own modules: Base, Core and the standard libraries.
+function _julia_own_module(m::Module)
+    root = Base.moduleroot(m)
+    (root === Base || root === Core) && return true
+    path = pathof(root)
+    path !== nothing && startswith(path, Sys.STDLIB)
+end
+
+# A module of ReactiveKernels or of a package of its repository
+# (ReactiveKernelsPPL, its extensions, ...), whose names all start so.
+_rk_module(m::Module) = startswith(string(nameof(Base.moduleroot(m))), "ReactiveKernels")
+
+# The callees the code audit of a level recurses into.
+_code_recursion(::Val{:rk}) = m::Method ->
+    _rk_module(m.module) || nameof(m.module) === :RuntimeGeneratedFunctions
+_code_recursion(::Val{:all}) = m::Method -> !_julia_own_module(m.module)
+
+# The code findings of `f` over `argument_types` at `level`; none at `:values`,
+# or where an argument type is not concrete, which leaves inference nothing to
+# check.
+_level_code_findings(::Val{:values}, f, argument_types) = _CodeFinding[]
+function _level_code_findings(level::Val, @nospecialize(f), argument_types)
+    all(isconcretetype, argument_types) || return _CodeFinding[]
+    _code_findings(f, Tuple(argument_types); recurse = _code_recursion(level))
+end
+_level_code_findings(level::Symbol, f, argument_types) =
+    _level_code_findings(Val(level), f, argument_types)
+
+# A finding that starts an instability: a value whose operands are concretely
+# typed, or a call dispatched at run time. Other findings follow from one.
+_code_source(f::_CodeFinding) = f.kind === :root || f.kind === :dynamic
+
+# The code findings grouped by method, in the order the audit met them.
+function _code_findings_by_method(found)
+    groups = Pair{String,Vector{_CodeFinding}}[]
+    for f in found
+        index = findfirst(g -> first(g) == f.method, groups)
+        index === nothing ? push!(groups, f.method => [f]) : push!(last(groups[index]), f)
+    end
+    groups
+end
+
+function _code_method_description(method::String)
+    method == "call" && return "The prepared program's entry call"
+    occursin("generated_callfunc", method) &&
+        return "The body ReactiveKernels generated for the prepared program"
+    "`$method`"
+end
+
+function _code_finding_message(method::String, found)
+    sources = filter(_code_source, found)
+    shown = isempty(sources) ? found : sources
+    lines = map(shown) do f
+        what = f.kind === :dynamic ? "is a call dispatched at run time" :
+            "infers `$(f.type)`"
+        "  - %$(f.index) $what: `$(f.statement)`"
+    end
+    following = length(found) - length(shown)
+    follow = following == 1 ? "1 further value follows" :
+        "$following further values follow"
+    "ReactiveKernels: $(_code_method_description(method)) is not type stable:\n" *
+    join(lines, "\n") * (following == 0 ? "" : "\n  and $follow from these.") *
+    "\nEvery evaluation pays for the dynamic dispatch, and native reverse-mode AD " *
+    "may refuse the prepared program. Make that code type stable; " *
+    "`type_stability_level = :values` checks only the types of the program's values."
+end
+
+_report_type_stability(values, code, mode::Symbol) =
+    _report_type_stability(values, code, Val(mode))
+
+function _report_type_stability(values, code, ::Val{:warn})
+    for u in values
         @warn _uninferred_value_message(u) _group = :type_stability maxlog = 1 _id = (
             :uninferred_value, u.path, u.value.name, _uninferred_recipe_text(u),
             u.input_types)
     end
+    for (method, found) in _code_findings_by_method(code)
+        id = (:code_finding, method, map(f -> (f.kind, f.statement), found))
+        @warn _code_finding_message(method, found) _group = :type_stability maxlog = 1 _id = id
+    end
 end
 
-_report_uninferred_values(found, ::Val{:error}) =
-    isempty(found) || throw(UninferredValuesError(map(_uninferred_value_message, found)))
+function _report_type_stability(values, code, ::Val{:error})
+    messages = [map(_uninferred_value_message, values);
+                [_code_finding_message(method, found)
+                 for (method, found) in _code_findings_by_method(code)]]
+    isempty(messages) || throw(TypeInstabilityError(messages))
+end
 
-# Check the values of `kernel` over `argument_types` in the mode of the
-# preparation in progress: warn once per process for each uninferred value and
-# continue, or refuse the preparation, naming every uninferred value.
+# Check `kernel` over `argument_types` with the settings of the preparation in
+# progress: the type of every value, and at `:rk` and `:all` the code of the
+# prepared program. Warn once per process for each finding and continue, or
+# refuse the preparation, naming every finding.
 function _check_uninferred_values(kernel, argument_types)
-    mode = _type_stability()
-    _report_uninferred_values(_uninferred_values(kernel, argument_types), mode)
+    mode, level = _type_stability(), _type_stability_level()
+    values = _uninferred_values(kernel, argument_types)
+    code = _level_code_findings(level, kernel, argument_types)
+    _report_type_stability(values, code, mode)
     kernel
 end
 
