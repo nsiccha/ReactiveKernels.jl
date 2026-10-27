@@ -41,6 +41,17 @@ end
     density::Float64 = sum(exp.(X * beta)) - 0.5 * sum(abs2, X * beta)
 end
 
+# Two regression ports read constant design matrices and a group index, as a
+# location and a shape predictor do.
+@kernel tangent_regression_ports(u::Vector{Float64}; X::Matrix{Float64},
+                                 Z::Matrix{Float64}, g::Vector{Int}) = begin
+    beta = u[1:2]
+    gamma = u[3:4]
+    effects = u[5:7]
+    location = exp.(X * beta .+ effects[g])
+    shape = exp.(Z * gamma)
+end
+
 _tangent_hessian(q, s, data) = Diagonal(data .* s^2 .* exp.(s .* q)) - I
 # ∇(vᵀ H v) of `tangent_density` in `q`, and of `tangent_exp_design`.
 _tangent_third(q, s, data, v) = data .* s^3 .* exp.(s .* q) .* v .^ 2
@@ -268,6 +279,42 @@ _tangent_unit(n, i) = (e = zeros(n); e[i] = 1.0; e)
         @test_throws ArgumentError prepare_ad_hvp(
             tangent_ports, second_order, (v,), q, s;
             data, active = :q, want = wants)
+    end
+
+    # Plain reverse mode, no runtime activity, over constant design matrices,
+    # unbound and bound (snag several-port-pul-e6344d44).
+    @testset "several WANT ports over constant design matrices" begin
+        reverse = AutoEnzyme(; mode = Enzyme.Reverse)
+        wants = (:location, :shape)
+        X = [1.0 0.5; -0.3 1.2; 0.8 -1.0; 0.2 0.4; -1.1 0.7; 0.6 0.9]
+        Z = [0.4 -0.2; 1.0 0.3; -0.5 0.8; 0.9 -0.6; 0.1 1.1; -0.7 0.2]
+        g = [1, 2, 3, 1, 2, 3]
+        u = [0.2, -0.1, 0.3, 0.05, -0.2, 0.1, 0.25]
+        seed = ([1.0, -0.5, 2.0, 0.3, -1.2, 0.7], [0.4, 1.1, -0.6, 0.9, 0.2, -0.3])
+        port_values(u) = (exp.(X * u[1:2] .+ u[5:7][g]), exp.(Z * u[3:4]))
+        function vjp(u, (a, b))
+            location, shape = port_values(u)
+            weighted = a .* location
+            [X' * weighted; Z' * (b .* shape);
+             [sum(weighted[g .== group]) for group in 1:3]]
+        end
+
+        unbound = prepare_ad_pullback(tangent_regression_ports, reverse, seed,
+                                      u; X, Z, g, active = :u, want = wants)
+        @test ad_pullback(unbound, seed, u; X, Z, g) ≈ vjp(u, seed)
+        value, cotangent = ad_value_and_pullback(unbound, seed, u; X, Z, g)
+        @test all(value .≈ port_values(u))
+        @test cotangent ≈ vjp(u, seed)
+
+        low_level = prepare(tangent_regression_ports; have = (:u, :X, :Z, :g),
+                            want = wants, bound = (; X, Z, g))
+        bound = prepare_ad_pullback(low_level, reverse, seed, u; active = :u)
+        @test ad_pullback(bound, seed, u) ≈ vjp(u, seed)
+        destination = similar(u)
+        value, returned = ad_value_and_pullback!(bound, destination, seed, u)
+        @test returned === destination
+        @test destination ≈ vjp(u, seed)
+        @test all(value .≈ port_values(u))
     end
 
     @testset "tangent and WANT checks name the boundary" begin
