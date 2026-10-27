@@ -690,22 +690,15 @@ function _partial_split_leaf(native, tensor, source, count)
 end
 
 _partial_plate_recipe(g, recipe, known, op, rewrites) = nothing
-# Generated inner-kernel types are data to this structural pass. Specializing
-# on them recompiles the entire partial evaluator once per authored plate.
-Base.@nospecializeinfer function _partial_plate_recipe(
-        g, recipe, known, @nospecialize(op::_AuthoredPlateOp), rewrites)
-    atomic_inputs = typeof(op).parameters[2]
-    inner = op.kernel.plan
-    length(inner.have) == length(recipe.inputs) || return nothing
-    length(inner.want) == 1 || return nothing
-    length(op.kernel.ops) == length(inner.recipes) || return nothing
 
-    # Native scalar plate lowering expects one output per recipe. Do not turn
-    # overlapping producer bindings or effects into a new specialization
-    # boundary; the ordinary lowering remains authoritative. A nested plate,
-    # scan or embedded kernel is never evaluated here: it stays in the residual
-    # cell, lowered exactly as before, and only the cell's other bound-only
-    # recipes are cached.
+# The cell recipes that stay in the cell whatever is bound, or `nothing` when
+# the plate is left alone. Native scalar plate lowering expects one output per
+# recipe. Do not turn overlapping producer bindings or effects into a new
+# specialization boundary; the ordinary lowering remains authoritative. A
+# nested plate, scan or embedded kernel is never evaluated here: it stays in
+# the residual cell, lowered exactly as before, and only the cell's other
+# bound-only recipes are cached.
+function _partial_plate_excluded(inner::Plan)
     assigned = Set(canon_id(inner.graph, v.id) for v in inner.have)
     excluded = Set{Int}()
     for r in inner.recipes
@@ -719,52 +712,54 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         cid in assigned && return nothing
         push!(assigned, cid)
     end
+    excluded
+end
 
-    bound = Set{ValueId}()
-    arguments = Dict{ValueId,Any}()
-    cell_types = Dict{ValueId,Any}()
-    for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
-        cid = canon_id(g, outer.id)
-        haskey(known, cid) || continue
-        data = known[cid]
-        index in atomic_inputs || _partial_plate_input(data) || return nothing
-        cid = canon_id(inner.graph, input.id)
-        push!(bound, cid)
-        arguments[cid] = index in atomic_inputs ? Ref(data) : data
-        cell_types[cid] = index in atomic_inputs || data isa Number ?
-            typeof(data) : eltype(data)
-    end
-    # Nullary inner recipes can form a prefix even when this plate has no
-    # bound inputs. Without a bound domain, retain its per-cell execution.
-    isempty(arguments) && return nothing
+# What a plate's analysis follows from besides the plate itself: the plate
+# recipe, the positions of its bound inputs and their cell types (in the same
+# order), and the speculative nodes refused so far. Its callers never change
+# these vectors and this set afterwards. A concrete type, so a lookup that
+# finds an entry compares keys with code kept in the package image: a tuple
+# key's comparison was compiled at the first rebinding in every process, once
+# per count of bound inputs.
+struct _PlateAnalysisKey
+    recipe::Int
+    inputs::Vector{Int}
+    types::Vector{Any}
+    refused::Set{Any}
+end
+Base.hash(k::_PlateAnalysisKey, h::UInt) =
+    hash(k.refused, hash(k.types, hash(k.inputs, hash(k.recipe, h))))
+Base.isequal(a::_PlateAnalysisKey, b::_PlateAnalysisKey) =
+    a.recipe == b.recipe && a.inputs == b.inputs && isequal(a.types, b.types) &&
+    isequal(a.refused, b.refused)
 
-    # A known empty domain has no data-dependent cells to evaluate. Keeping the
-    # original plate also preserves its empty-result typing and error behavior.
-    bound_axes = Base.Broadcast.combine_axes(values(arguments)...)
-    any(isempty, bound_axes) && return nothing
-    fixed_domain = all(enumerate(recipe.inputs)) do (index, input)
-        index in atomic_inputs || haskey(known, canon_id(g, input.id)) ||
-            _partial_plate_live_domain(valtype(input), bound_axes)
-    end
-    # No possible batched axis: preserve the ordinary rejection.
-    isempty(bound_axes) && return nothing
-
+# Everything `_partial_plate_recipe` decides before it evaluates a cell
+# recipe: the split and speculated cell (`inner`, `speculative`, `readable`),
+# the cell recipes run at bind time (`selected`) and their cell types, the
+# values crossing the cache boundary (`frontier`), the residual cell and
+# whether the whole plate result is a bind-time value. All of it follows from
+# the plate and `key`, never from the bound values, so a cached bound
+# preparation keeps it per key (`_plate_analysis`) and a later binding only
+# evaluates `selected` on its own data. `nothing` leaves the plate alone. The
+# result's `refused` extends the key's by the nodes refused here.
+Base.@nospecializeinfer function _partial_plate_analysis(
+        key::_PlateAnalysisKey, recipe, @nospecialize(op::_AuthoredPlateOp),
+        original_excluded::Set{Int}, bound::Set{ValueId},
+        bound_types::Dict{ValueId,Any})
+    atomic_inputs = typeof(op).parameters[2]
+    original = op.kernel.plan
     original_readable = Dict{Int,Any}(r.id => source for (r, source) in
-                                      zip(inner.recipes, op.kernel.lowered_recipes))
-    original, original_excluded = inner, copy(excluded)
-    original_arguments, bound_types = copy(arguments), cell_types
-    # Speculative arm nodes whose evaluation threw; each attempt splits
-    # without them.
-    refused = Set{Any}()
-    local readable, residual, frontier, selected, whole, want_id, want_cached
+                                      zip(original.recipes, op.kernel.lowered_recipes))
+    refused = copy(key.refused)
     while true
     readable, excluded = copy(original_readable), copy(original_excluded)
-    arguments = copy(original_arguments)
     inner = _partial_split_recipes(original, bound, excluded, readable)
     inner, speculative = _partial_speculate_recipes(inner, bound, excluded, readable,
                                                     refused)
     have_ids = Set(canon_id(inner.graph, v.id) for v in inner.have)
     retry_speculation = false
+    local residual, frontier, selected, cell_types, want_id
     while true
         prefix, residual, owned = _partial_split(inner, bound, excluded)
         isempty(prefix) && return nothing
@@ -838,13 +833,75 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     want_cached = any(v -> canon_id(inner.graph, v.id) == want_id, frontier)
     whole = want_cached && isempty(residual) && length(recipe.outputs) == 1 &&
         all(!isempty, op.axis_checks) &&
-        all(enumerate(recipe.inputs)) do (index, input)
-            index in atomic_inputs || haskey(known, canon_id(g, input.id))
-        end
+        all(index -> index in atomic_inputs || index in key.inputs,
+            eachindex(recipe.inputs))
     want_cached && !whole && cell_types[want_id] <: AbstractArray && return nothing
+    return (; inner, speculative, readable, excluded, residual, frontier, selected,
+            cell_types, want_id, whole, refused)
+    end
+end
+
+# Generated inner-kernel types are data to this structural pass. Specializing
+# on them recompiles the entire partial evaluator once per authored plate.
+Base.@nospecializeinfer function _partial_plate_recipe(
+        g, recipe, known, @nospecialize(op::_AuthoredPlateOp), rewrites)
+    atomic_inputs = typeof(op).parameters[2]
+    inner = op.kernel.plan
+    length(inner.have) == length(recipe.inputs) || return nothing
+    length(inner.want) == 1 || return nothing
+    length(op.kernel.ops) == length(inner.recipes) || return nothing
+    original_excluded = _plate_exclusions(rewrites, recipe.id, inner)
+    original_excluded === nothing && return nothing
+
+    bound = Set{ValueId}()
+    arguments = Dict{ValueId,Any}()
+    bound_types = Dict{ValueId,Any}()
+    known_indices = Int[]
+    known_types = Any[]
+    for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
+        cid = canon_id(g, outer.id)
+        haskey(known, cid) || continue
+        data = known[cid]
+        index in atomic_inputs || _partial_plate_input(data) || return nothing
+        cid = canon_id(inner.graph, input.id)
+        push!(bound, cid)
+        push!(known_indices, index)
+        arguments[cid] = index in atomic_inputs ? Ref(data) : data
+        bound_types[cid] = index in atomic_inputs || data isa Number ?
+            typeof(data) : eltype(data)
+        push!(known_types, bound_types[cid])
+    end
+    # Nullary inner recipes can form a prefix even when this plate has no
+    # bound inputs. Without a bound domain, retain its per-cell execution.
+    isempty(arguments) && return nothing
+
+    # A known empty domain has no data-dependent cells to evaluate. Keeping the
+    # original plate also preserves its empty-result typing and error behavior.
+    bound_axes = Base.Broadcast.combine_axes(values(arguments)...)
+    any(isempty, bound_axes) && return nothing
+    fixed_domain = all(enumerate(recipe.inputs)) do (index, input)
+        index in atomic_inputs || haskey(known, canon_id(g, input.id)) ||
+            _partial_plate_live_domain(valtype(input), bound_axes)
+    end
+    # No possible batched axis: preserve the ordinary rejection.
+    isempty(bound_axes) && return nothing
+
+    original_arguments = arguments
+    # Speculative arm nodes whose evaluation threw; each attempt splits
+    # without them.
+    refused = Set{Any}()
+    local analysis
+    while true
+    analysis_key = _PlateAnalysisKey(recipe.id, known_indices, known_types, refused)
+    analysis = _plate_analysis(rewrites, analysis_key, recipe, op, original_excluded,
+                               bound, bound_types)
+    analysis === nothing && return nothing
+    refused = copy(analysis.refused)
+    arguments = copy(original_arguments)
+    inner = analysis.inner
     current = 0
     try
-        for r in selected
+        for r in analysis.selected
             current = r.id
             args = Tuple(arguments[canon_id(inner.graph, v.id)] for v in r.inputs)
             batch = Base.Broadcast.instantiate(Base.broadcasted(r.op, args...))
@@ -855,7 +912,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
                 # Preserve the broadcast container and concrete element type.
                 # Bool results may use packed BitArrays; bound-array
                 # externalization also supports these at the tensor boundary.
-                result = similar(batch, cell_types[cid])
+                result = similar(batch, analysis.cell_types[cid])
                 for index in CartesianIndices(axes(batch))
                     result[index] = batch[index]
                 end
@@ -866,8 +923,8 @@ Base.@nospecializeinfer function _partial_plate_recipe(
         err isa InterruptException && rethrow()
         # A speculative arm node runs on lanes whose arm may never be taken:
         # it stays in its arm.
-        if haskey(speculative, current)
-            push!(refused, speculative[current])
+        if haskey(analysis.speculative, current)
+            push!(refused, analysis.speculative[current])
             continue
         end
         # A live input whose declaration does not fix its rank can leave the
@@ -882,6 +939,7 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     end
     break
     end
+    (; excluded, residual, frontier, whole) = analysis
 
     # A whole-plate value is computed by the same plate over its bound inputs
     # alone; its unread live atomic inputs are dropped.
@@ -924,6 +982,8 @@ Base.@nospecializeinfer function _partial_plate_recipe(
            Tuple(Any[typeof(data) for data in cache_data]), Tuple(records))
     rewrite = rewrites === nothing ? nothing : _plate_rewrite(rewrites, key)
     if rewrite === nothing
+        # The analysis may be kept for later bindings: extend a copy.
+        readable = copy(analysis.readable)
         # The cell reads each cached record through recipes rebuilding it from
         # its leaf values, which live in a copy of the inner graph.
         cell_inputs = Value[v for v in frontier if !any(r -> first(r) == v, records)]
@@ -1417,6 +1477,9 @@ function _partial_inner_plates(p::Plan, known, rewrites)
     pending = copy(p.recipes)
     while !isempty(pending)
         r = popfirst!(pending)
+        # Both passes below leave every other recipe as it is. Testing here
+        # spares a dynamic call per recipe of the residual and binding.
+        r.op isa _AuthoredPlateOp || (push!(recipes, r); continue)
         # Plates a partition emits get ids of this pass, which another binding
         # may give a different plate: only the plan's own plates share rewrites.
         specialized = _partial_plate_recipe(copied, r, known, r.op,
@@ -1798,16 +1861,55 @@ end
 # The rewrites of a residual's authored plates by the inner-plate pass
 # (`_partial_plate_recipe`) for one plate class tuple of a cached entry, keyed
 # by everything they follow from. A rewrite holds a prepared cell kernel and
-# the cache values' identities, never a binding's cached data.
+# the cache values' identities, never a binding's cached data. `exclusions`
+# (per plate recipe id) and `analyses` keep the decisions a rewrite follows
+# from (`_plate_exclusions`, `_plate_analysis`).
 struct _PlateRewrites
     rewrites::Dict{Any,Any}
+    exclusions::Dict{Int,Any}
+    analyses::Dict{_PlateAnalysisKey,Any}
     lock::ReentrantLock
 end
-_PlateRewrites() = _PlateRewrites(Dict{Any,Any}(), ReentrantLock())
+_PlateRewrites() = _PlateRewrites(Dict{Any,Any}(), Dict{Int,Any}(),
+                                  Dict{_PlateAnalysisKey,Any}(), ReentrantLock())
 _plate_rewrite(r::_PlateRewrites, @nospecialize(key)) =
     lock(() -> get(r.rewrites, key, nothing), r.lock)
 _plate_rewrite!(r::_PlateRewrites, @nospecialize(key), @nospecialize(rewrite)) =
     lock(() -> get!(r.rewrites, key, rewrite), r.lock)
+
+# A plate's value-independent decisions, its cell's exclusions and its
+# `_partial_plate_analysis`, are computed once per key of a cached entry: the
+# inner-plate pass otherwise repeated them for every binding, ~1 ms of each
+# rebinding of a simulator graph whose two rewritten plates cache one
+# subject's design (snag rebinding-a-prep-661c4370). They hold plans, recipes
+# and types, never a binding's values. Without a cache (an uncached `prepare`,
+# or the plates a branch partition emitted) they are computed every time.
+# `nothing` is a decision too, so an absent one is `_NotKept`.
+struct _NotKept end
+_plate_kept(r::_PlateRewrites, table::Dict, key) =
+    lock(() -> get(table, key, _NotKept()), r.lock)
+_plate_keep!(r::_PlateRewrites, table::Dict, key, @nospecialize(decision)) =
+    lock(() -> get!(table, key, decision), r.lock)
+
+_plate_exclusions(::Nothing, ::Int, inner::Plan) = _partial_plate_excluded(inner)
+function _plate_exclusions(r::_PlateRewrites, id::Int, inner::Plan)
+    kept = _plate_kept(r, r.exclusions, id)
+    kept isa _NotKept || return kept
+    _plate_keep!(r, r.exclusions, id, _partial_plate_excluded(inner))
+end
+
+_plate_analysis(::Nothing, key::_PlateAnalysisKey, recipe::Recipe,
+                @nospecialize(op::_AuthoredPlateOp), excluded::Set{Int},
+                bound::Set{ValueId}, bound_types::Dict{ValueId,Any}) =
+    _partial_plate_analysis(key, recipe, op, excluded, bound, bound_types)
+function _plate_analysis(r::_PlateRewrites, key::_PlateAnalysisKey, recipe::Recipe,
+                         @nospecialize(op::_AuthoredPlateOp), excluded::Set{Int},
+                         bound::Set{ValueId}, bound_types::Dict{ValueId,Any})
+    kept = _plate_kept(r, r.analyses, key)
+    kept isa _NotKept || return kept
+    _plate_keep!(r, r.analyses, key,
+                 _partial_plate_analysis(key, recipe, op, excluded, bound, bound_types))
+end
 
 # A table (an operation table, a recipe list) without one binding's
 # constants: `fixed` holds every other entry and `slots[j]` the position of
