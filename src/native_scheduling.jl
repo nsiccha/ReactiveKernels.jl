@@ -47,11 +47,18 @@ _scheduled_slice(x::AbstractArray, range) =
     view(x, ntuple(_ -> Colon(), ndims(x) - 1)..., range)
 _scheduled_slice(x::Union{Tuple,NamedTuple}, range) = map(y -> _scheduled_slice(y, range), x)
 
-struct _ScheduledBatchedKernel{Reuse,S,B,BT,PS,N,K,P,W,C}
-    serial::K
-    prefix::P
-    workers::W
-    caches::C
+# The serial driver, the prefix kernel and the workers are untyped fields. Each
+# is called once per call or per chunk, and their types grow with the graph
+# (hundreds of thousands of characters for a composed simulation graph): every
+# type built around them, this struct, the workers' vector and the spawned
+# tasks' closures among them, cost seconds of compilation, so a scheduled
+# reader compiled several times longer than its serial driver (snag
+# nativescheduling-51b0fbf9).
+struct _ScheduledBatchedKernel{Reuse,S,B,BT,PS,N}
+    serial::Any
+    prefix::Any
+    workers::Vector{Any}
+    caches::NTuple{N,Base.RefValue{Any}}
     schedule::NativeScheduling
 end
 
@@ -59,13 +66,39 @@ _batch_output_mode(kernel, ::Val{false}) = kernel
 _batch_output_mode(kernel, ::Val{true}) = _borrowed_batch(kernel)
 _position_schedule(kernel, ::Nothing, mode) = _batch_output_mode(kernel, mode)
 
-function _position_schedule(kernel::GraphReplicatedKernel, schedule::NativeScheduling,
-                            mode::Val{Reuse}) where {Reuse}
+# The boundary of the workers' residual driver, which the scheduler lowers from
+# the residual plan alone: a scalar kernel and an owning driver around it would
+# only answer these three queries, at the cost of two more lowerings of the
+# residual.
+struct _ScheduledResidual{IN,OUT}
+    plan::Plan
+    inputs::IN
+    outputs::OUT
+end
+inputs(r::_ScheduledResidual) = r.inputs
+outputs(r::_ScheduledResidual) = r.outputs
+plan(r::_ScheduledResidual) = r.plan
+
+_scheduled_residual(p::Plan, batched) =
+    _borrowed_batch(_ScheduledResidual(p, Tuple(p.have), Tuple(p.want)), p, batched)
+
+# One empty copy of the residual driver per worker, without a container or
+# closure typed by the driver.
+function _scheduled_workers(@nospecialize(residual), schedule::NativeScheduling)
+    workers = Vector{Any}(undef, min(schedule.workers, Threads.nthreads()))
+    for index in eachindex(workers)
+        workers[index] = copy(residual)
+    end
+    workers
+end
+
+function _position_schedule(@nospecialize(kernel::GraphReplicatedKernel),
+                            schedule::NativeScheduling, mode::Val{Reuse}) where {Reuse}
     batched = batched_ports(kernel)
     analysis = _replicated_dependency_analysis(kernel.plan, batched)
     parts = _replicated_parts(kernel.plan, analysis)
     prefix = isempty(parts.prefix.want) ? nothing : prepare(parts.prefix)
-    residual = vectorize(prepare(parts.residual); batched, reuse=true)
+    residual = _scheduled_residual(parts.residual, batched)
     graph = kernel.plan.graph
     input_ids = [canon_id(graph, value.id) for value in inputs(kernel)]
     prefix_ids = [canon_id(graph, value.id) for value in parts.prefix.want]
@@ -77,19 +110,22 @@ function _position_schedule(kernel::GraphReplicatedKernel, schedule::NativeSched
     prefix_sources = Tuple(only(findall(==(canon_id(graph, value.id)), input_ids))
                            for value in parts.prefix.have)
     serial = _batch_output_mode(kernel, mode)
-    workers = [copy(residual) for _ in 1:min(schedule.workers, Threads.nthreads())]
     nout = length(outputs(kernel))
-    caches = _borrowed_batch_caches(nout)
     _ScheduledBatchedKernel{Reuse,Tuple(sources),analysis.positions,analysis.input_types,
-                           prefix_sources,nout,typeof(serial),typeof(prefix),
-                           typeof(workers),typeof(caches)}(serial, prefix, workers, caches, schedule)
+                           prefix_sources,nout}(serial, prefix,
+                           _scheduled_workers(residual, schedule),
+                           _borrowed_batch_caches(nout), schedule)
 end
 
 _scheduled_copy_serial(kernel::GraphReplicatedKernel) = kernel
 _scheduled_copy_serial(kernel::BorrowedBatchedKernel) = copy(kernel)
-function Base.copy(k::_ScheduledBatchedKernel{R,S,B,BT,PS,N,K,P,W,C}) where {R,S,B,BT,PS,N,K,P,W,C}
-    _ScheduledBatchedKernel{R,S,B,BT,PS,N,K,P,W,C}(
-        _scheduled_copy_serial(k.serial), k.prefix, copy.(k.workers),
+function Base.copy(k::_ScheduledBatchedKernel{R,S,B,BT,PS,N}) where {R,S,B,BT,PS,N}
+    workers = Vector{Any}(undef, length(k.workers))
+    for index in eachindex(workers)
+        workers[index] = copy(k.workers[index])
+    end
+    _ScheduledBatchedKernel{R,S,B,BT,PS,N}(
+        _scheduled_copy_serial(k.serial), k.prefix, workers,
         _borrowed_batch_caches(N), k.schedule)
 end
 
