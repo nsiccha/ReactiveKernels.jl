@@ -6777,6 +6777,7 @@ function _replica_graph(target::PreparedKernel, batched)
     _replicated_graph_plan(target.plan) || throw(ArgumentError(
         "scalar kernel requires the complete-callable replica fallback"))
     ast, ops = _lower_replicated_with_ops(target.plan; batched)
+    ops = _execution_source(ops)
     native = compile(ast)
     boundary = inputs(target)
     input_types = Tuple{(valtype(boundary[i]) for i in indices)...}
@@ -6902,7 +6903,7 @@ _borrowed_batch(target::GraphReplicatedKernel) =
 # `target` answers `inputs`, `outputs` and `plan` for the borrowed driver of `p`.
 function _borrowed_batch(@nospecialize(target), p::Plan, batched)
     ast, ops, slot_count = _lower_replicated_with_ops(p; batched, reuse=true)
-    BorrowedBatchedKernel(target, compile(ast), ops,
+    BorrowedBatchedKernel(target, compile(ast), _execution_source(ops),
         _borrowed_batch_caches(slot_count), ast)
 end
 

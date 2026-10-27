@@ -1,5 +1,5 @@
 module PreparationIdentityTests
-using ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Enzyme, Test
+using ReactiveKernels, ReactiveKernelsPPL, DifferentiationInterface, Distributions, Enzyme, Test
 
 function model(kind)
     kind === :plate && return @rkppl begin
@@ -57,6 +57,17 @@ end
                 @test typeof(q.kernel.f) === typeof(first_query.kernel.f)
                 @test typeof(q.kernel.ops) === typeof(first_query.kernel.ops)
                 @test typeof(q.ad) === typeof(first_query.ad)
+                # The position reader of a rebuild reuses the first build's
+                # compiled reader (snag `compiled-reader-be3cadbb`).
+                readers = map((first_built, built)) do b
+                    kernel = prepare_predictive(b, plan).kernel
+                    Base.invokelatest(ReactiveKernels.vectorize, kernel;
+                        batched = :unconstrained, reuse = true)
+                end
+                @test typeof(readers[1]) === typeof(readers[2])
+                draws = [0.3 -0.1; -0.2 0.4]
+                @test Base.invokelatest(readers[1], draws) ==
+                    Base.invokelatest(readers[2], draws)
                 rebound = prepare_sampler(first_built, plan, [0.3, -0.2]; backend,
                     native_forward_batch=false)
                 check(rebound, x, y, 1.3)

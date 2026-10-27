@@ -60,6 +60,36 @@ end
     @test Base.invokelatest(kernels[1], 2.0) == 8.0
 end
 
+@testset "vectorized readers of fresh identical builds share executable types" begin
+    # A rebuilt graph's position readers hold the token-free execution copies
+    # `prepare` holds, so a rebuild of one program reuses the reader compiled
+    # for the first build (snag `compiled-reader-be3cadbb`).
+    mod = Module(gensym(:ExecutionSource))
+    Core.eval(mod, :(using ReactiveKernels; shift(x) = x + 1.0))
+    definition = :(model(position, shared::Float64) = begin
+        invariant::Float64 = 2.0 * shared
+        result = shift(position) * invariant
+        return result
+    end)
+    specs = [RK._kernel_eval_definition(mod, deepcopy(definition)) for _ in 1:2]
+    kernels = [prepare(spec) for spec in specs]
+    positions = [1.0, 2.0, 3.0]
+    expected = (positions .+ 1.0) .* 3.0
+    schedule = NativeScheduling(; chunk_size = 2)
+    for options in ((; reuse = false), (; reuse = true), (; reuse = true, schedule))
+        readers = [Base.invokelatest(vectorize, kernel; batched = :position, options...)
+                   for kernel in kernels]
+        @test typeof(readers[1]) === typeof(readers[2])
+        for reader in readers
+            @test Base.invokelatest(reader, positions, 1.5) == expected
+        end
+    end
+    # Each reader's lowered recipes still name its own definition.
+    source = [first(filter(r -> r.op isa RK._KernelSourceOp, kernel.lowered_recipes))
+              for kernel in kernels]
+    @test RK.kernel_sourceop_token(source[1].op) !== RK.kernel_sourceop_token(source[2].op)
+end
+
 @testset "execution branch metadata preserves host branch behavior" begin
     call(x, scale) = scale > 0 ? x * log(scale) : -x
     branch = RK._KernelBranch(Val((2,)), Val((1, 2)), Val((1,)), call,
