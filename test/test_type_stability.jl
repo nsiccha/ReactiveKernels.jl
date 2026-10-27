@@ -508,6 +508,10 @@ code_warning(pattern) = (:warn, Regex("ReactiveKernels: .*" * pattern, "s"))
                                                  active = :a, type_stability = :error)
     @test_logs min_level = Base.CoreLogging.Warn prepare_ad(
         kernel, backend, hidden_args...; active = :a, type_stability_level = :rk)
+    # From a spec, the kernel's own preparation checks values only; the
+    # differentiated callable's audit still finds the helper.
+    @test_throws TypeInstabilityError prepare_ad(U.hidden, backend, hidden_args...;
+        active = :a, want = :total, type_stability = :error)
 
     # A declared local asserts the value, so the value check is silent, but the
     # body RK generates still receives the helper's `Any` result: `:rk` reports

@@ -1345,8 +1345,12 @@ _ad_retained_box(call, prepared) = throw(ArgumentError(
 # A gradient, Hessian-vector product or third-order derivative selects exactly
 # one scalar WANT; a pullback or pushforward (`scalar_output = false`) selects
 # one or several, differentiated together as the kernel's tuple result.
+# `audited = true` says the caller audits the code of the callable its backend
+# differentiates (`_prepare_ad_operator`), which runs this kernel, so this
+# preparation checks only its values rather than infer the same code twice.
 function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple();
-                         retain::Tuple = (), scalar_output::Bool = true)
+                         retain::Tuple = (), scalar_output::Bool = true,
+                         audited::Bool = false)
     _ad_validate_unique_haves(spec)
     selected_wants = _kernel_selection(spec, want, spec.want_names, :want)
     names = Tuple(output.name for output in selected_wants)
@@ -1362,9 +1366,11 @@ function _ad_spec_kernel(spec::KernelSpec, want, bound = NamedTuple();
     wants = (selected_wants...,
              _kernel_selection(spec, retain, spec.want_names, :retain)...)
     selected = length(wants) == 1 ? only(wants) : wants
-    isempty(bound) && return prepare(plan(spec; want = selected))
-    prepare(plan(spec; want = selected);
-            bound = _kernel_bound_pairs(spec, bound))
+    _with_type_stability(nothing, audited ? :values : nothing) do
+        isempty(bound) && return prepare(plan(spec; want = selected))
+        prepare(plan(spec; want = selected);
+                bound = _kernel_bound_pairs(spec, bound))
+    end
 end
 
 # A partially-evaluated kernel is positional over the remaining HAVE ports;
@@ -1981,7 +1987,7 @@ function prepare_ad_pullback(
         type_stability_level = nothing,
         kwargs...)
     _with_type_stability(type_stability, type_stability_level) do
-        kernel = _ad_spec_kernel(spec, want; scalar_output = false)
+        kernel = _ad_spec_kernel(spec, want; scalar_output = false, audited = true)
         _prepare_ad_pullback(
             kernel, _ad_resolver(spec), backend, seed, args,
             NamedTuple(kwargs), active)
@@ -2269,7 +2275,7 @@ end
 # authored defaults and keywords resolve as `prepare(spec)` does.
 function _ad_spec_boundary(spec::KernelSpec, want, bound, kwargs;
                            retain::Tuple = (), scalar_output::Bool = true)
-    kernel = _ad_spec_kernel(spec, want, bound; retain, scalar_output)
+    kernel = _ad_spec_kernel(spec, want, bound; retain, scalar_output, audited = true)
     isempty(bound) && return kernel, _ad_resolver(spec), NamedTuple(kwargs)
     kernel, tuple, _ad_reject_bound_keywords(NamedTuple(kwargs))
 end
