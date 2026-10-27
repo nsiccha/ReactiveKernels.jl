@@ -720,6 +720,19 @@ and lock the one Reactant 0.2.289 lifted:
   release carries it yet. `test_multivariate_prior_values.jl` checks the
   latent GP exactly under the `Const` annotation and accepts only the exact
   gradient or that specific exception under the plain backend.
+  On Julia 1.10.12, a `BetaBinomial2` response whose mean or precision is a
+  sampled scalar, read directly or through a value with other readers
+  (`c .~ BetaBinomial2.(10, logistic.(a), 5.0)`,
+  `BetaBinomial2.(10, 0.4, exp.(a))`), fails at a store into `innerparm` as
+  well. The scalar stays a scalar, so the observation plate hoists its cell
+  invariant `logbeta(alpha, beta)`, a derivative-rule call; a location with
+  the response's rows takes no hoist and differentiates. Enzyme `dogfood`
+  `31d31ec` accepts that store, and its proof then rejects the hoisted call
+  itself, although LLVM marks the call's pointer into the callable `readonly`
+  and `nocapture`. Dogfood does not repair this second site; it is Enzyme
+  snag `readonly-proof-h-bcbe23d3`. `test_betabinomial2.jl` checks these
+  shapes against an independent density and central differences, and accepts
+  only the exact gradient or this exception.
 - On Julia 1.12.7 and 1.13.1, Enzyme 0.13.216 reverse mode allocates 16 bytes
   per element when a loop stores into an array that is either a reused buffer
   or a fresh `similar` one and the store keeps its bounds check. Julia 1.12's
