@@ -45,8 +45,11 @@ end
         op isa RK._KernelSourceOp || continue
         @test RK.kernel_sourceop_token(op) === nothing
         @test RK.kernel_sourceop_token(recipe.op) === RK._kernel_source_token(original.op)
-        @test RK._kernel_endpoint_source_module(op) === mod ===
-            RK._kernel_endpoint_source_module(recipe.op)
+        @test RK._kernel_endpoint_source_module(recipe.op) === mod
+        # refused: an execution copy's type names no authoring module, or each
+        # lowering module would make one program a new executable (snag
+        # `compiled-reader-be3cadbb`); lowering reads the original operation.
+        @test_throws ArgumentError RK._kernel_endpoint_source_module(op)
         @test RK._source_parameter_names(recipe.op, recipe.source, length(recipe.inputs)) !==
             nothing
         # refused: keying a token-free copy would merge separately authored

@@ -102,4 +102,30 @@ end
         @test gradient ≈ expected_gradient + [1.0, 0.0]
     end
 end
+
+@testset "a lazy branch over bound lanes rebuilds to the same reader" begin
+    # The bound lanes of a lazy arm are named after a generated plate argument
+    # (`lane_then_##plate_argument#N`). The reader's generated body must not
+    # keep that counter, or each rebuild compiles its reader again (snag
+    # `compiled-reader-be3cadbb`).
+    model = @rkppl begin
+        a ~ Normal(0, 1)
+        b ~ Normal(0, 1)
+        @plate for i in eachindex(y)
+            mu = x[i] > 0 ? a + b * x[i] : a - exp(b) * x[i]
+            y[i] ~ Normal(mu, 1.0)
+        end
+    end
+    x = collect(range(-1, 1; length = 12))
+    y = collect(range(0, 1; length = 12))
+    readers = map(1:2) do _
+        plan = model(; x) | (; y)
+        kernel = prepare_predictive(build_kernel(plan), plan).kernel
+        Base.invokelatest(ReactiveKernels.vectorize, kernel;
+            batched = :unconstrained, reuse = true)
+    end
+    @test typeof(readers[1]) === typeof(readers[2])
+    draws = [0.3 -0.1; -0.2 0.4]
+    @test Base.invokelatest(readers[1], draws) == Base.invokelatest(readers[2], draws)
+end
 end

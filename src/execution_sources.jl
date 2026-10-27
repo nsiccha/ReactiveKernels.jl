@@ -4,9 +4,13 @@
 # eval-created closure types and provenance tokens from specializing the same
 # executable on every fresh build. No plan or source recipe is replaced.
 # Provenance stays with the plan and lowered recipes. Every field here is part
-# of the differentiated callable, so it holds only what execution reads; the
-# authoring module `M` is shared by repeated builds and costs no field.
-struct _ExecutableSourceFunction{F,C,M} <: Function
+# of the differentiated callable, so it holds only what execution reads. Its
+# type names no authoring module either: a program generator evaluates each
+# lowering in its own module (BRM's `##RKEmittedModels#N`, or a scope module
+# while an image is generated), and a module in the type made every such
+# lowering of one program a new executable (snag `compiled-reader-be3cadbb`).
+# The generated body already qualifies every global it reads.
+struct _ExecutableSourceFunction{F,C} <: Function
     f::F
     captures::C
 end
@@ -18,7 +22,11 @@ end
             getfield(f, :f), getfield(f, :captures), $(forwarded...))))
 end
 
-_kernel_endpoint_source_module(::_ExecutableSourceFunction{F,C,M}) where {F,C,M} = M
+# Lowering resolves a recipe's globals through its original operation, which
+# the plan and `lowered_recipes` keep; an execution copy never reaches it.
+_kernel_endpoint_source_module(::_ExecutableSourceFunction) = throw(ArgumentError(
+    "an execution copy of a source operation keeps no authoring module; " *
+    "read the plan's or the lowered recipe's original operation"))
 
 _execution_source(@nospecialize(x)) = x
 Base.@nospecializeinfer function _execution_source(@nospecialize(xs::Tuple))
@@ -35,8 +43,7 @@ Base.@nospecializeinfer function _execution_source(@nospecialize(f::_KernelSourc
     # and boxed lexical cells; they have no generated-source companion.
     runtime === nothing && return f
     captures = getfield(f, :captures)
-    mod = parentmodule(typeof(getfield(f, :f)))
-    T = _ExecutableSourceFunction{typeof(runtime),typeof(captures),mod}
+    T = _ExecutableSourceFunction{typeof(runtime),typeof(captures)}
     _kernel_new_instance(T, (runtime, captures))
 end
 

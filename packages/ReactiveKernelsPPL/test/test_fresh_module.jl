@@ -121,6 +121,10 @@ end
     own = build_kernel(other_plan)
     reused = prepare_query(built, other_plan, :sampler)
     direct = prepare_query(own, other_plan, :sampler)
+    # Each lowering namespace is a new module, and `basis` a new kernel in it;
+    # the two builds still prepare to one executable type, so the second
+    # reuses the code compiled for the first (snag `compiled-reader-be3cadbb`).
+    @test typeof(reused) === typeof(direct)
     for u in ([-0.3], [0.0], [0.6])
         @test Base.invokelatest(reused, u) == Base.invokelatest(direct, u)
     end

@@ -5762,7 +5762,7 @@ image compiled returns that image's generated function, with the code the
 image compiled for it.
 """
 function compile(ast::Expr)
-    ast = _canonical_locals(ast)
+    ast = _canonical_locals(_canonical_globals(ast))
     f = RuntimeGeneratedFunction(@__MODULE__, @__MODULE__, ast)
     image = _image_program(f)
     image === nothing || return image
@@ -5809,8 +5809,12 @@ end
 # reaches the cache: identical lowerings then produce byte-identical bodies,
 # one callable type, and one compilation per graph shape. Distinct originals
 # map to distinct names (the map is a bijection on the symbols it touches), so
-# hygiene is preserved; quoted data and every non-`#` symbol are untouched.
-_lowering_gensym(s::Symbol) = (str = String(s); !isempty(str) && str[1] == '#')
+# hygiene is preserved; quoted data and every other symbol are untouched. A
+# name derived from a gensym carries its counter too (a bound lazy-arm lane,
+# `lane_then_##plate_argument#245`), so a `##` anywhere marks one; an authored
+# identifier cannot contain it (snag `compiled-reader-be3cadbb`).
+_lowering_gensym(s::Symbol) =
+    (str = String(s); !isempty(str) && (str[1] == '#' || occursin("##", str)))
 
 function _canonical_locals(ast::Expr)
     names = Dict{Symbol,Symbol}()
@@ -5824,6 +5828,45 @@ function _canonical_locals(ast::Expr)
         node isa Expr || return node
         node.head === :quote && return node
         Expr(node.head, map(walk, node.args)...)
+    end
+    walk(ast)
+end
+
+# A program generator evaluates each lowering in a fresh module (BRM's
+# `##RKEmittedModels#N`, an image's scope module), and hygiene qualifies every
+# global a body reads in that module: `ones`, `eltype` and an imported helper
+# become `##RKEmittedModels#231.ones`, and so on. The body then differs in
+# every lowering of one program, and so does the callable's type (snag
+# `compiled-reader-be3cadbb`). Name each such global by the module that owns
+# its binding instead, or, for a constant bound there to a module or a named
+# function, by that value's own binding: the same reference in every lowering.
+# A binding the fresh module itself owns otherwise stays as qualified.
+_anonymous_module(m::Module) = (name = String(nameof(m)); !isempty(name) && name[1] == '#')
+
+Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
+    m, name = ref.mod, ref.name
+    _anonymous_module(m) || return ref
+    owner = Base.invokelatest(Base.binding_module, m, name)::Module
+    owner === m || return _canonical_global(GlobalRef(owner, name))
+    (Base.invokelatest(isdefined, m, name) && Base.invokelatest(isconst, m, name)) ||
+        return ref
+    value = Base.invokelatest(getglobal, m, name)
+    home = value isa Module ? value :
+        value isa Function && Base.issingletontype(typeof(value)) ?
+            parentmodule(typeof(value)) : nothing
+    home === nothing && return ref
+    own = nameof(value)
+    (!_anonymous_module(home) && Base.invokelatest(isdefined, home, own) &&
+     Base.invokelatest(getglobal, home, own) === value) || return ref
+    GlobalRef(home, own)
+end
+
+function _canonical_globals(ast::Expr)
+    function walk(node)
+        node isa GlobalRef && return _canonical_global(node)
+        node isa Expr || return node
+        node.head === :quote && return node
+        Expr(node.head, Any[walk(arg) for arg in node.args]...)
     end
     walk(ast)
 end
