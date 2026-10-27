@@ -1289,7 +1289,7 @@ _lane_may_reference(result, @nospecialize(buffer)) = true
 _lane_may_reference(::Number, @nospecialize(buffer)) = false
 function _lane_may_reference(result::AbstractArray, @nospecialize(buffer))
     buffer isa _LaneCalleeState && return _lane_state_may_reference(result, buffer)
-    buffer isa AbstractArray && Base.mightalias(result, buffer) && return true
+    _lane_mightalias(result, buffer) && return true
     _replicated_may_contain_array(eltype(result)) || return false
     for item in result
         _lane_may_reference(item, buffer) && return true
@@ -1302,6 +1302,14 @@ _lane_may_reference(::Tuple{}, @nospecialize(buffer)) = false
 @inline _lane_may_reference(result::Tuple, @nospecialize(buffer)) =
     _lane_may_reference(first(result), buffer) ||
     _lane_may_reference(Base.tail(result), buffer)
+# `Base.mightalias` on the untyped buffer was found at run time on every check
+# (about 110 ns, 8 % of a borrowed population read, snag
+# lane-cell-take-e-45c66e49). A slot holds a dense `Array` (`_lane_reuse`),
+# usually of the result's own type: those checks are compiled in.
+@inline _lane_mightalias(result::A, @nospecialize(buffer)) where {A<:AbstractArray} =
+    buffer isa A ? Base.mightalias(result, buffer::A) :
+    buffer isa Array ? Base.mightalias(result, buffer::Array) :
+    buffer isa AbstractArray && Base.mightalias(result, buffer)
 
 # The buffer an authored plate or scan fills (`_lane_allocation`): the matching
 # recycled buffer, or `allocate(args...)`, kept when `recycled` is a lane slot.

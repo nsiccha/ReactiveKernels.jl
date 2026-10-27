@@ -143,4 +143,44 @@ end
     @test ReactiveKernels._replicated_aliases((; a = shared), ((1, (; b = view(shared, 1:2))),))
 end
 
+# The per-cell bookkeeping of a plate whose cells are records is compiled in
+# (snag lane-cell-take-e-45c66e49): whether a cell type may hold an array is a
+# constant of the compiled caller, and a result checked against a slot's dense
+# buffer calls `Base.mightalias` without a run-time method lookup. Before, the
+# first walked `fieldtypes(T)` at every cell and the second looked the method
+# up at every check: 36 % and 23 % of a borrowed read of 256 record cells on
+# RK a1d6a5f86.
+@testset "position lane forms: cell bookkeeping is compiled in" begin
+    may = ReactiveKernels._replicated_may_contain_array
+    numbers = typeof((; a = 1.0, b = 2, c = (1.0, 2.0), d = (; x = 1f0)))
+    holding = typeof((; a = 1.0, conc = [1.0]))
+    for (T, answer) in ((Float64, false), (numbers, false), (Union{}, false),
+                        (NamedTuple{(:a,),Tuple{Real}}, false), (holding, true),
+                        (Vector{Float64}, true), (Tuple{Int,Vector{Int}}, true),
+                        (Tuple, true), (Tuple{Int,Any}, true), (Any, true))
+        @test may(T) === answer
+        @test only(code_typed(may, (Type{T},))).first.code == Any[Core.ReturnNode(answer)]
+    end
+    calls(code) = filter(s -> Meta.isexpr(s, (:invoke, :call)), code)
+    take(T) = only(code_typed(ReactiveKernels._lane_cell_take!,
+        (Base.RefValue{Any}, Base.RefValue{Any}, Int, Type{T}, Bool))).first.code
+    # A record of numbers keeps no table: the take does nothing.
+    @test isempty(calls(take(numbers)))
+    # A record holding an array keeps its table, without walking its fields.
+    @test !isempty(calls(take(holding)))
+    @test !any(s -> occursin("_any", string(s)), take(holding))
+
+    check(result, slot) = ReactiveKernels._lane_may_reference(result, slot[])
+    v = rand(8)
+    own, other, reshaped = Base.RefValue{Any}(v), Base.RefValue{Any}(rand(8)),
+        Base.RefValue{Any}(reshape(v, 2, 4))
+    @test check(v, own) && check(v, reshaped) && !check(v, other)
+    @test check(view(v, 1:2), own) && check((; a = 1.0, b = v), own) && check([v], own)
+    @test !check([rand(2)], own) && !check((; a = 1.0, b = rand(2)), own)
+    for slot in (own, other, reshaped)
+        check(v, slot)
+        @test (@allocated check(v, slot)) == 0
+    end
+end
+
 end

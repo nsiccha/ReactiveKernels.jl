@@ -6836,12 +6836,21 @@ end
 # An array of concrete numeric records cannot hide an array that aliases an
 # output. Keep the outer-array check, and walk elements when their type leaves
 # room for a nested array (including abstract fields and custom records).
-_replicated_may_contain_array(::Type) = true
-_replicated_may_contain_array(::Type{<:Number}) = false
-@inline function _replicated_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
+# The answer depends on the type alone, so the walk runs once per type, when a
+# caller compiles, and the predicate is a constant there. Walked at run time,
+# `any` over `fieldtypes(T)`, a tuple of `DataType` values, dispatched on every
+# field at every call: 17 % of a borrowed population read whose plate cells
+# are records (`_lane_cell_take!`, snag lane-cell-take-e-45c66e49). An element
+# type with no values (`Union{}`) holds no array.
+_replicated_type_may_contain_array(::Type) = true
+_replicated_type_may_contain_array(::Type{<:Number}) = false
+_replicated_type_may_contain_array(::Type{Union{}}) = false
+function _replicated_type_may_contain_array(::Type{T}) where {T<:Union{Tuple,NamedTuple}}
     isconcretetype(T) || return true
-    any(_replicated_may_contain_array, fieldtypes(T))
+    any(_replicated_type_may_contain_array, fieldtypes(T))
 end
+@generated _replicated_may_contain_array(::Type{T}) where {T} =
+    _replicated_type_may_contain_array(T)
 
 # These walks run on every borrowed call, over every input. They unroll tuples
 # by their type and loop over arrays, so the walk allocates nothing: `any` with
