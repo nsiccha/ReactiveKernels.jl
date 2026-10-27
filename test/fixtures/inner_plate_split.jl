@@ -8,6 +8,7 @@ counted_term(y) = (calls[] += 1; log(y + 1.0))
 counted_root(y) = (calls[] += 1; sqrt(y))
 counted_sum(y) = (calls[] += 1; sum(log1p, y))
 counted_pair(y) = (calls[] += 1; (y, y + 1.0))
+counted_span(y) = (calls[] += 1; y:(y + 1.0))
 
 # A data-only call beside a live term in one top-level recipe.
 @kernel top_level(q::Vector{Float64}, y) = begin
@@ -140,7 +141,21 @@ end
     total::Float64 = sum(pointwise)
 end
 
+# A range is no cache value, so the arm keeps its producer.
 @kernel uncacheable_arm(q, y) = begin
+    pointwise = plate(y, q) do d, parameter
+        if parameter > 0
+            span = counted_span(d)
+            parameter * first(span) + last(span)
+        else
+            parameter
+        end
+    end
+    total::Float64 = sum(pointwise)
+end
+
+# A tuple is cached by its fields (todo 0r1g1v3), speculatively over every lane.
+@kernel record_arm(q, y) = begin
     pointwise = plate(y, q) do d, parameter
         if parameter > 0
             pair = counted_pair(d)

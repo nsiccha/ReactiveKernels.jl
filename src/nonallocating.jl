@@ -537,13 +537,13 @@ function _decompose_fused_recipe!(prog::_StepProgram, r::Recipe, callargs,
     kernel_sourceop_form(op) === :fused || return nothing
     source_f = _kernel_native_source(op.f)
     fieldcount(typeof(source_f)) == 0 || return nothing # capturing closure
-    argmap = Dict{Symbol,Any}()
-    argtypes = Dict{Symbol,Any}()
-    for (v, aexpr, at) in zip(r.inputs, callargs, input_types)
-        argmap[v.name] = aexpr
-        argtypes[v.name] = at
-    end
-    ctx = _FusedDecomposition(parentmodule(typeof(source_f)), argmap, argtypes,
+    # The source reads its inputs by the closure's parameter names, not by the
+    # input values' names (`_lane_source_params`).
+    params = _lane_source_params(source_f, length(r.inputs))
+    params === nothing && return nothing
+    ctx = _FusedDecomposition(parentmodule(typeof(source_f)),
+                              _lane_source_arguments(params, callargs),
+                              _lane_source_arguments(params, input_types),
                               Any[], Any[], Any[], length(prog.ops),
                               prog.cache_apply)
     d = _decompose(ctx, r.source, false)

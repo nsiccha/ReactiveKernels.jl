@@ -180,8 +180,12 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
         mutable_result = prepare(C.mutable_result; bound = (; data))
         @test only(caches(mutable_result.plan)).op.value == 2 .* data
         @test mutable_result(2.0) == prepare(C.mutable_result)(2.0, data)
+        # A tuple cell value is cached by its fields (todo 0r1g1v3).
         tuple_result = prepare(C.tuple_result; bound = (; data))
-        @test isempty(caches(tuple_result.plan))
+        tuple_caches = Dict(only(r.outputs).name => r.op.value
+                            for r in caches(tuple_result.plan))
+        @test tuple_caches == Dict(:bound_plate_transformed_1 => data,
+                                   :bound_plate_transformed_2 => data .+ 1.0)
         @test tuple_result(2.0) == prepare(C.tuple_result)(2.0, data)
         bool_data = [-2, 0, 3]
         boolean = prepare(C.boolean; bound = (; data = bool_data))
@@ -269,6 +273,69 @@ isdefined(@__MODULE__, :InnerPlatePartialEvaluation) ||
                 @test C.calls[] == 0
             end
         end
+    end
+
+    @testset "record cell values: cached by their leaves (todo 0r1g1v3)" begin
+        times = [[0.0, 0.5, 1.5, 2.0], [0.0, 1.0], [0.0], [0.0, 0.25, 0.75]]
+        subjects = 1:4
+        data = (; times_by_subject = times, subjects)
+        designs = [(; idx = findall(>(0.0), t), dt = diff(t)) for t in times]
+        cache_names(p) = sort([only(r.outputs).name for r in caches(p)])
+        cases = (
+            (C.record_reads, 1, [:bound_plate_design_dt, :bound_plate_design_idx]),
+            (C.tuple_reads, 1, [:bound_plate_design_1, :bound_plate_design_2]),
+            # the record's own constructor counts too, and is not run again
+            (C.struct_reads, 2, [:bound_plate_design_dt, :bound_plate_design_idx]),
+            (C.nested_record_reads, 1,
+             [:bound_plate_design_scale, :bound_plate_design_steps_dt,
+              :bound_plate_design_steps_idx]))
+        lives = ([0.3, 0.7, 1.1, 0.2], [1.2, -0.4, 0.0, 2.0])
+        for (spec, per_cell, names) in cases
+            plain = prepare(spec)
+            C.calls[] = 0
+            bound = prepare(spec; bound = data)
+            @test C.calls[] == per_cell * length(subjects)
+            @test cache_names(bound.plan) == names
+            for live in lives
+                expected = plain(live, times, subjects)
+                C.calls[] = 0
+                @test bound(live) == expected
+                @test C.calls[] == 0
+            end
+            @test !occursin("counted_", string(code_expr(bound)))
+            external, values = RK._externalize_bound_arrays(bound)
+            @test external(first(lives), values...) == plain(first(lives), times, subjects)
+            # A position batch reads the same cached leaves.
+            batch = vectorize(bound; batched = :rates)
+            positions = reduce(hcat, lives)
+            expected = [plain(live, times, subjects) for live in lives]
+            C.calls[] = 0
+            @test batch(positions) == expected
+            @test C.calls[] == 0
+        end
+        record = only(filter(r -> only(r.outputs).name === :bound_plate_design_idx,
+                             caches(prepare(C.record_reads; bound = data).plan)))
+        @test record.op.value == getproperty.(designs, :idx)
+        @test record.op.value isa Vector{Vector{Int}}
+        # A range field is no cache leaf, so the record stays in the cell; the
+        # per-subject times it reads are cached instead.
+        plain = prepare(C.ranged_record_reads)
+        bound = prepare(C.ranged_record_reads; bound = data)
+        @test cache_names(bound.plan) == [:bound_plate_times]
+        expected = plain(first(lives), times, subjects)
+        C.calls[] = 0
+        @test bound(first(lives)) == expected
+        @test C.calls[] == length(subjects)
+        # Rebinding to records of the same type reuses the rewritten plate
+        # (`_PlateRewrites`) with the new binding's leaves.
+        first_bound = prepare(C.record_reads; bound = data)
+        other = (; times_by_subject = [[0.0, 2.0, 3.0], [0.0, 0.5]], subjects = 1:2)
+        rebound = prepare(C.record_reads; bound = other)
+        @test only(filter(r -> only(r.outputs).name === :bound_plate_design_dt,
+                          caches(rebound.plan))).op.value == [[2.0, 1.0], [0.5]]
+        @test rebound([0.5, 0.25]) == prepare(C.record_reads)([0.5, 0.25], other...)
+        @test first_bound(first(lives)) ==
+              prepare(C.record_reads)(first(lives), times, subjects)
     end
 
     @testset "data-only cell results" begin
@@ -434,5 +501,34 @@ import Enzyme
         C.calls[] = 0
         ad_value_and_gradient(bound, point)
         @test C.calls[] == 0
+    end
+
+    # Records rebuilt in the cell from cached leaves differentiate under plain
+    # Reverse (todo 0r1g1v3). The unbound cell, which builds the record from
+    # constant data in every evaluation, is not the reference: registered
+    # Enzyme rejects it ("Constant memory is stored (or returned) to a
+    # differentiable variable"), so the reference is the analytic derivative.
+    times = [[0.0, 0.5, 1.5, 2.0], [0.0, 1.0], [0.0], [0.0, 0.25, 0.75]]
+    data = (; times_by_subject = times, subjects = 1:4)
+    rates = [0.3, 0.7, 1.1, 0.2]
+    steps = diff.(times)
+    for (spec, scale) in ((C.record_reads, ones(4)), (C.tuple_reads, ones(4)),
+                          (C.struct_reads, ones(4)),
+                          (C.nested_record_reads, 2.0 .+ length.(times)))
+        primal = prepare(spec)
+        bound = prepare_ad(spec, backend, rates; active=:rates, want=:total, bound=data)
+        @test !isempty(filter(r -> r.op isa ReactiveKernels._BoundConstant &&
+            startswith(String(only(r.outputs).name), "bound_plate_design"),
+            bound.kernel.plan.recipes))
+        for point in (rates, [1.2, -0.4, 0.5, 2.0])
+            expected_value = primal(point, data...)
+            expected_gradient = [-scale[s] * sum(steps[s] .* exp.(-point[s] .* steps[s]);
+                                                 init = 0.0) for s in 1:4]
+            C.calls[] = 0
+            value, gradient = ad_value_and_gradient(bound, point)
+            @test C.calls[] == 0
+            @test value == expected_value
+            @test gradient ≈ expected_gradient
+        end
     end
 end

@@ -344,4 +344,72 @@ end
     total = sum(flat .* live)
 end
 
+# Per-cell records built from bound data and read whole by a live call: a
+# subject's design of observed indices and time steps (todo `0r1g1v3`).
+struct SubjectDesign
+    idx::Vector{Int}
+    dt::Vector{Float64}
+    function SubjectDesign(idx, dt)
+        calls[] += 1 # the rebuild in the cell must not run this again
+        new(idx, dt)
+    end
+end
+counted_design(times) =
+    (calls[] += 1; (; idx = findall(>(0.0), times), dt = diff(times)))
+counted_pair(times) = (calls[] += 1; (findall(>(0.0), times), diff(times)))
+counted_struct(times) =
+    (calls[] += 1; SubjectDesign(findall(>(0.0), times), diff(times)))
+counted_nested(times) =
+    (calls[] += 1; (; steps = (; idx = findall(>(0.0), times), dt = diff(times)),
+                    scale = 2.0 + length(times)))
+counted_ranged(times) =
+    (calls[] += 1; (; idx = 1:length(times), dt = diff(times)))
+design_weight(d::NamedTuple, rate) = sum(exp.(-rate .* d.dt); init = 0.0) + length(d.idx)
+design_weight(d::Tuple, rate) = sum(exp.(-rate .* d[2]); init = 0.0) + length(d[1])
+design_weight(d::SubjectDesign, rate) =
+    sum(exp.(-rate .* d.dt); init = 0.0) + length(d.idx)
+nested_weight(d, rate) = d.scale * design_weight(d.steps, rate)
+
+@kernel record_reads(rates, times_by_subject, subjects) = begin
+    out = plate(subjects) do s
+        design = counted_design(times_by_subject[s])
+        design_weight(design, rates[s])
+    end
+    total = sum(out)
+end
+
+@kernel tuple_reads(rates, times_by_subject, subjects) = begin
+    out = plate(subjects) do s
+        design = counted_pair(times_by_subject[s])
+        design_weight(design, rates[s])
+    end
+    total = sum(out)
+end
+
+@kernel struct_reads(rates, times_by_subject, subjects) = begin
+    out = plate(subjects) do s
+        design = counted_struct(times_by_subject[s])
+        design_weight(design, rates[s])
+    end
+    total = sum(out)
+end
+
+@kernel nested_record_reads(rates, times_by_subject, subjects) = begin
+    out = plate(subjects) do s
+        design = counted_nested(times_by_subject[s])
+        nested_weight(design, rates[s])
+    end
+    total = sum(out)
+end
+
+# A range field is not a cache leaf: the record stays in the cell.
+@kernel ranged_record_reads(rates, times_by_subject, subjects) = begin
+    out = plate(subjects) do s
+        times = times_by_subject[s]
+        design = counted_ranged(times)
+        design_weight(design, rates[s])
+    end
+    total = sum(out)
+end
+
 end
