@@ -2539,7 +2539,10 @@ constant at the outer levels (the direction `v` among them) is uninitialized
 memory. On Julia 1.10, OpenBLAS zero-fills a matrix-vector product's tangent,
 so those are exact there; on Julia 1.12 and later they are not, and
 matrix-matrix products can be NaN on every Julia version. The reproducer is
-`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`.
+`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`. The local Enzyme
+`dogfood` line overwrites the tangent from libEnzyme build `4be29b19`, and its
+third-order derivatives are then exact; no registered `Enzyme_jll` release
+carries the fix yet.
 
 Directions with disjoint supports compress, as for Hessian-vector products:
 when active coordinates fall into groups that never interact (per-subject
