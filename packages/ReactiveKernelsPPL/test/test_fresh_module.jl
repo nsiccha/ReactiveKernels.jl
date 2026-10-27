@@ -196,6 +196,81 @@ end
     end
 end
 
+# Caller-owned laws whose geometry reads an argument: the program holds the
+# authored argument expressions as data, so a function of the model module
+# they call is a module reference in that data. `Block`'s shape at each index
+# is its first argument; `Shifted`'s support starts at its argument.
+module CallerLawHelpers
+using ReactiveKernelsPPL
+import Distributions
+struct Block{L,S}
+    n::Int
+    loc::L
+    scale::S
+end
+ReactiveKernelsPPL.sampling_logdensity(d::Block, x) =
+    sum(Distributions.logpdf.(Distributions.Normal.(d.loc, d.scale), x); init = 0.0)
+ReactiveKernelsPPL.sampling_geometry(::Type{Block}, args, shape) =
+    ParameterGeometry((args[1],), args[1]; support = :real,
+        constrain = (u, shape, args...) -> collect(u),
+        unconstrain = (x, shape, args...) -> collect(x),
+        logjac = (u, shape, args...) -> 0.0)
+struct Shifted{L}
+    lower::L
+end
+# Unnormalized, so the value shows the bound the program evaluated.
+ReactiveKernelsPPL.sampling_logdensity(d::Shifted, x) = x > d.lower ? -x : -Inf
+ReactiveKernelsPPL.sampling_geometry(::Type{Shifted}, args, shape) =
+    ParameterGeometry(shape, 1; support = :lower_bounded,
+        constrain = (u, shape, lower) -> lower + exp(u[1]),
+        unconstrain = (x, shape, lower) -> [log(x - lower)],
+        logjac = (u, shape, lower) -> u[1])
+end
+
+function caller_law_namespace()
+    mod = Module(gensym(:FreshCallerLaw))
+    Core.eval(mod, :(using ReactiveKernelsPPL, Distributions))
+    Core.eval(mod, :(const Helpers = $CallerLawHelpers))
+    Core.eval(mod, :(using .Helpers: Block, Shifted))
+    Core.eval(mod, :(block_size(k) = k + 1))
+    Core.eval(mod, :(lower_of(k) = k / 4))
+    mod
+end
+
+@testset "a caller-owned law's arguments call model-module functions across fresh lowerings" begin
+    # One joint latent per index, of `block_size(k[i])` values: 3 + 4 + 2
+    # coordinates beside `s`'s.
+    cell = quote
+        s ~ LogNormal(0.0, 1.0)
+        @plate for i in eachindex(k)
+            z[i] ~ Block(block_size(k[i]), 0.0, s)
+        end
+    end
+    cell_prior(u) = logpdf(LogNormal(0.0, 1.0), exp(u[1])) +
+        sum(logpdf.(Normal(0.0, exp(u[1])), u[2:end]))
+    # One model-level latent above `lower_of(k)` = 0.5.
+    model = quote
+        z ~ Shifted(lower_of(k))
+    end
+    model_prior(u) = -(0.5 + exp(u[1]))
+    for (ast, data, total, prior) in ((cell, (; k = [2, 3, 1]), 10, cell_prior),
+            (model, (; k = 2), 1, model_prior))
+        lower() = bind_data(lower_rkppl(ast, data; mod = caller_law_namespace()), data)
+        first_plan = lower()
+        built = build_kernel(first_plan)
+        @test built.layout.total == total
+        u = [0.1i - 0.4 for i in 1:total]
+        @test Base.invokelatest(prepare_query(built, first_plan, :prior), u) ≈ prior(u)
+        # Only the first coordinate is transformed: `s`, or `z` above its bound.
+        @test Base.invokelatest(prepare_query(built, first_plan, :log_jacobian), u) ≈ u[1]
+        for _ in 1:2
+            other = lower()
+            own = Base.invokelatest(prepare_query(build_kernel(other), other, :prior), u)
+            @test Base.invokelatest(prepare_query(built, other, :prior), u) == own
+        end
+    end
+end
+
 @testset "undefined names still fail at lowering" begin
     mod = fresh_namespace()
     ast = :(begin
