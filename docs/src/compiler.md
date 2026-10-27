@@ -941,15 +941,20 @@ cell reads those results whole; the rest of its graph, including inner loops,
 runs per outer coordinate.
 
 Work that varies per outer coordinate cannot move out of the loop. When such a
-cell computes an `hcat` or a broadcast whose only readers are scalar indexing
-and shape queries, including readers in an embedded kernel's nested plates,
-native lowering reads its entries through those readers instead of storing it
-per cell. For example, `present = p .* offsets[event]` followed by
+cell computes an `hcat` or a broadcast whose only readers index it or query
+its shape, including readers in an embedded kernel's nested plates, native
+lowering reads its entries through those readers instead of storing it per
+cell. A value computed before the loop and read only that way in its cells is
+composed the same way. For example, `present = p .* offsets[event]` followed by
 `components = hcat(present, absent)` builds neither array per event. The graph
 and its queries keep both authored values, and ordinary Enzyme Reverse
 differentiates the composed reads without a derivative rule. Shape checks and
 declarations still run at the authored statement, and scalar reads keep bounds
-checks. The composition covers dense `Float32`/`Float64` arrays and real
+checks. A reader that indexes the value with an integer vector, a range, a
+colon or a mask computes the entries it selects into a fresh array of Julia's
+result shape, so a group cell's `x[rows[g]]` computes that group's rows only.
+Before ReactiveKernels 0.1.4, such a read computed the whole value at every
+read, once per group. The composition covers dense `Float32`/`Float64` arrays and real
 scalars, `hcat` of vectors and matrices, and one-dimensional broadcasts of
 total arithmetic (`+ - * /`, `exp`, `abs`, `abs2`, `logistic`, `log1pexp`,
 `identity`). Other values,
