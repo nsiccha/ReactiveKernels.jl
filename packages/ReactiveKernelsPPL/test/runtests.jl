@@ -5,6 +5,7 @@ using Test
 # constants and modules that earlier files define at top level.
 const _PPL_TEST_FILES = (
     "backend_inventory_reactant.jl",
+    "test_changelog.jl",
     "test_parse_hygiene.jl",
     "test_contract.jl",
     "test_layout.jl",
@@ -311,6 +312,7 @@ const _PPL_TEST_FILES = (
     "test_cell_broadcast_arrays.jl",
     "test_cell_index_gathers.jl",
     "test_plate_cell_arrays.jl",
+    "test_vector_plate_outputs.jl",
     "test_plate_cell_once.jl",
     "test_plate_cell_once_reactant.jl",
     "test_index_endpoints.jl",
@@ -343,7 +345,7 @@ const _PPL_TEST_FAILURES = _run_ppl_test_files(_PPL_TEST_FILES, ENV)
 
 @testset "package skeleton" begin
     @test isdefined(ReactiveKernelsPPL, :ReactiveKernels)
-    @test pkgversion(ReactiveKernelsPPL) == v"0.1.0"
+    # The version is checked against CHANGELOG.md (test_changelog.jl).
 end
 
 @testset "test-file shards" begin
