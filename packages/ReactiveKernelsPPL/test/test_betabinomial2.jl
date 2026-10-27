@@ -282,6 +282,62 @@ end
     end
 end
 
+# A scalar location or precision stays a scalar (rkppl-use §1), so the
+# observation plate hoists its cell invariant `logbeta(alpha, beta)` once.
+# Plain Reverse through that program meets Enzyme's readonly-proof gap
+# (docs/src/constraints.md, snag generic-betabino-8a854de2): registered
+# 0.13.216 flags its own by-value copy of the callable (`innerparm`), and
+# dogfood 31d31ec, which accepts that copy, flags the hoisted rule call
+# (Enzyme snag readonly-proof-h-bcbe23d3).
+@testset "betabinomial scalar location and precision" begin
+    y = [3, 5, 7, 2, 6, 4]
+    cols = Dict{Symbol,AbstractVector}(:c => copy(y))
+    sigmoid(a) = 1 / (1 + exp(-a))
+    density(a, mu, phi) = logpdf(Normal(0, 5), a) + sum(_bb_ref(k, 10, mu, phi) for k in y)
+    cases = [
+        "sampled scalar location" => (quote
+            a ~ Normal(0, 5)
+            c .~ BetaBinomial2.(10, logistic.(a), 5.0)
+        end, a -> density(a, sigmoid(a), 5.0)),
+        "alias location with another reader" => (quote
+            a ~ Normal(0, 5)
+            la = a
+            m = exp.(la)
+            c .~ BetaBinomial2.(10, logistic.(la), 5.0)
+        end, a -> density(a, sigmoid(a), 5.0)),
+        "sampled scalar precision" => (quote
+            a ~ Normal(0, 5)
+            c .~ BetaBinomial2.(10, 0.4, exp.(a))
+        end, a -> density(a, 0.4, exp(a))),
+    ]
+    @testset "$label" for (label, (prog, oracle)) in cases
+        bound, built, kern, lay = _bb_query(prog, cols)
+        for a in (0.5, -1.3)
+            u = [a]
+            @test Base.invokelatest(kern, u) ≈ oracle(a) rtol = 1e-12
+            outcome = try
+                prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+                g = similar(u)
+                sampler_value_and_gradient!(prep, g, u)
+                g
+            catch err
+                err
+            end
+            if outcome isa Enzyme.Compiler.EnzymeMutabilityException
+                @test occursin("cannot be proven readonly", sprint(showerror, outcome))
+                # Drop with docs/src/constraints.md once a registered Enzyme
+                # carries the readonly-proof repair.
+                @test_broken false
+            elseif outcome isa Exception
+                throw(outcome)
+            else
+                @test isapprox(outcome, _findiff_grad(oracle ∘ only, u);
+                    rtol = 1e-6, atol = 1e-8)
+            end
+        end
+    end
+end
+
 # Statement-head histogram of the generated kernel (the joint-parity
 # O(1) pattern): the betabinomial plate must not unroll over observations.
 function _bb_statement_heads(prog::Expr, cols::Dict{Symbol,AbstractVector})

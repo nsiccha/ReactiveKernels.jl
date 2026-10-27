@@ -142,13 +142,8 @@ function _rebind_template(@nospecialize(product::_ScheduledBatchedKernel),
              _rebind_prefix(product.prefix, constants)
     product.prefix === nothing || prefix !== nothing || return nothing
     residual = first(product.workers)
-    scalar = residual.target.target
-    for table in (residual.ops, residual.target.ops, scalar.ops)
-        _holds_constant(table, constants.ops) && return nothing
-    end
-    for table in (scalar.lowered_recipes, scalar.plan.recipes)
-        _holds_constant(table, constants.recipes) && return nothing
-    end
+    _holds_constant(residual.ops, constants.ops) && return nothing
+    _holds_constant(plan(residual).recipes, constants.recipes) && return nothing
     _RebindScheduled(typeof(product), serial, prefix, copy(residual))
 end
 
@@ -184,9 +179,9 @@ function _rebound(kept::_RebindScheduled, @nospecialize(kernel::PreparedKernel),
     serial = _rebound(kept.serial, kernel, constants, schedule)
     prefix = kept.prefix === nothing ? nothing :
              _rebound(kept.prefix, kernel, constants, schedule)
-    workers = [copy(kept.residual) for _ in 1:min(schedule.workers, Threads.nthreads())]
     caches = _borrowed_batch_caches(length(outputs(kernel)))
-    _kernel_new_instance(kept.type, (serial, prefix, workers, caches, schedule))
+    _kernel_new_instance(kept.type, (serial, prefix, _scheduled_workers(kept.residual, schedule),
+                                     caches, schedule))
 end
 
 # Untyped, so compiled once for every graph; these directives put that in the

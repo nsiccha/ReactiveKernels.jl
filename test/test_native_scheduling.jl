@@ -85,6 +85,39 @@ end
     @test empty_batch([2.0]) == [4.0]
 end
 
+@testset "a scheduled reader's type holds none of its drivers' types" begin
+    # A driver's type grows with its graph, and each type built around one
+    # costs compilation in proportion: a scheduled reader whose own type, its
+    # workers' vector and its tasks' closures held its drivers' types compiled
+    # several times longer than its serial driver (snag
+    # nativescheduling-51b0fbf9).
+    schedule = NativeScheduling(chunk_size=2, workers=4)
+    for reuse in (false, true)
+        raw = _scheduled_raw(vectorize(scheduled_response; batched=:position, schedule, reuse))
+        name = string(typeof(raw))
+        @test !occursin(string(typeof(raw.serial)), name)
+        @test !occursin(string(typeof(raw.prefix)), name)
+        @test !occursin(string(typeof(first(raw.workers))), name)
+        @test raw.workers isa Vector{Any}
+        @test all(raw.workers[i] !== raw.workers[j]
+                  for i in eachindex(raw.workers), j in eachindex(raw.workers) if i < j)
+        # Each worker is the residual's borrowed driver alone, lowered from
+        # the residual plan: the program `vectorize` of its scalar kernel
+        # would compile, without that kernel and its owning driver.
+        worker = first(raw.workers)
+        @test worker.target isa ReactiveKernels._ScheduledResidual
+        owning = _scheduled_raw(vectorize(scheduled_response; batched=:position))
+        analysis = ReactiveKernels._replicated_dependency_analysis(owning.plan, (:position,))
+        parts = ReactiveKernels._replicated_parts(owning.plan, analysis)
+        reference = vectorize(prepare(parts.residual); batched=(:position,), reuse=true)
+        @test typeof(worker.native) === typeof(reference.native)
+        @test typeof(worker.ops) === typeof(reference.ops)
+        @test inputs(worker) == inputs(reference)
+        @test outputs(worker) == outputs(reference)
+        @test length(worker.caches) == length(reference.caches)
+    end
+end
+
 @testset "scheduled dense lanes, multiple ports, aliasing and copies" begin
     schedule = NativeScheduling(chunk_size=2, workers=4)
     @kernel scheduled_abstract_lane(x::AbstractVector{Float64}, original) = begin

@@ -253,8 +253,10 @@ function _absent_typed_as(plan::StructuralPlan, program::Expr)
 end
 
 function _program_difference(built::Expr, other::Expr)
+    # Fresh `Expr` nodes for `remove_linenums!` to edit; the values they hold
+    # (modules among them, which `deepcopy` refuses) are only printed.
     text(x) = x === nothing ? "(absent)" :
-        sprint(print, Base.remove_linenums!(deepcopy(x)))
+        sprint(print, x isa Expr ? Base.remove_linenums!(copy(x)) : x)
     sig(def) = def.args[1]
     _same_program(sig(built), sig(other)) || return "in the data arguments:\n  built: " *
         text(sig(built)) * "\n  this:  " * text(sig(other))

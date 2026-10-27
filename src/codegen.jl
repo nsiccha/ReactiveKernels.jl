@@ -6897,9 +6897,11 @@ end
 # lane buffer per WANT and one slot per position intermediate with a
 # destination form; `_lower_replicated_with_ops` returns the count.
 _borrowed_batch_caches(count::Int) = ntuple(_ -> Ref{Any}(nothing), count)
-function _borrowed_batch(target::GraphReplicatedKernel)
-    ast, ops, slot_count = _lower_replicated_with_ops(
-        target.plan; batched=batched_ports(target), reuse=true)
+_borrowed_batch(target::GraphReplicatedKernel) =
+    _borrowed_batch(target, target.plan, batched_ports(target))
+# `target` answers `inputs`, `outputs` and `plan` for the borrowed driver of `p`.
+function _borrowed_batch(@nospecialize(target), p::Plan, batched)
+    ast, ops, slot_count = _lower_replicated_with_ops(p; batched, reuse=true)
     BorrowedBatchedKernel(target, compile(ast), ops,
         _borrowed_batch_caches(slot_count), ast)
 end

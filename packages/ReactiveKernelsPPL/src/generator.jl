@@ -138,17 +138,30 @@ end
 # A generated definition with its private names (`gensym`s, which differ
 # between lowerings) renamed in order of first appearance. References owned
 # by a gensym-created lowering module get the same treatment: the module is an
-# isolation namespace, not part of the emitted program. Stable named modules
-# remain part of the identity. Compare the results with `_same_program`:
-# Julia's Expr equality need not compare embedded array literals by value.
+# isolation namespace, not part of the emitted program. That holds for such a
+# module held as a value or inside quoted data too: a caller-owned law's
+# authored argument expressions are rebuilt as data, so a function of the
+# model module they call is a quoted `GlobalRef` (cell latents) or a
+# `GlobalRef(module, name)` call (model-level latents). Other names in quoted
+# data are data and keep their spelling. Stable named modules remain part of
+# the identity. Compare the results with `_same_program`: Julia's Expr
+# equality need not compare embedded array literals by value.
 function _program_identity(def)
     names = Dict{Symbol,Symbol}()
     modules = IdDict{Module,Symbol}()
+    generated(m::Module) =
+        get!(() -> Symbol("_rkppl_generated_module_", length(modules) + 1), modules, m)
+    owner(x::Module) = Base.isgensym(nameof(x)) ? generated(x) : x
+    owner(x::GlobalRef) = Base.isgensym(nameof(x.mod)) ?
+        Expr(:., generated(x.mod), QuoteNode(x.name)) : x
+    quoted(x::Union{Module,GlobalRef}) = owner(x)
+    quoted(x::QuoteNode) = QuoteNode(quoted(x.value))
+    quoted(x::Expr) = Expr(x.head, Any[quoted(a) for a in x.args]...)
+    quoted(x) = x
     rename(x::Symbol) = Base.isgensym(x) ?
         get!(() -> Symbol("##", length(names) + 1), names, x) : x
-    rename(x::GlobalRef) = Base.isgensym(nameof(x.mod)) ?
-        Expr(:., get!(() -> Symbol("_rkppl_generated_module_", length(modules) + 1),
-            modules, x.mod), QuoteNode(x.name)) : x
+    rename(x::Union{Module,GlobalRef}) = owner(x)
+    rename(x::QuoteNode) = QuoteNode(quoted(x.value))
     rename(x::Expr) = Expr(x.head, Any[rename(a) for a in x.args]...)
     rename(x) = x
     return rename(def)
