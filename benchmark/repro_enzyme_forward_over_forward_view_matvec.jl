@@ -13,6 +13,14 @@
 # coefficients as views of the unconstrained vector, so a design-matrix
 # linear predictor meets this shape (`packages/ReactiveKernelsPPL/test/
 # test_query_derivatives.jl`). Enzyme snag `nested-forward-o-9434176c`.
+#
+# Cause: libEnzyme's forward-mode BLAS rules scale a product's output tangent
+# by `beta` instead of overwriting it when `beta == 0`, and a forward-mode
+# shadow allocation is uninitialized memory. The view is constant at the outer
+# level, so the inner tangent product meets that rule; the copied slice is
+# active there and does not. On Julia 1.10 OpenBLAS zero-fills the
+# matrix-vector tangent. The local Enzyme `dogfood` line fixes it from
+# libEnzyme build `4be29b19`.
 # Recorded on gordito, Enzyme 0.13.216, Enzyme_jll 0.0.303, 300 calls each,
 # 2026-10-25:
 #   Julia 1.10.12: view 0 NaN, slice 0 NaN

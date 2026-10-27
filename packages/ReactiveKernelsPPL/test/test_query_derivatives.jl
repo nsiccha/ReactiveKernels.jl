@@ -405,20 +405,6 @@ end
 
 _qd_poisson_third(A, u, v) = -(A' * (exp.(A * u) .* (A * v) .^ 2))
 
-# On Julia 1.12 and 1.13, registered Enzyme 0.13.216 returns NaN on some calls
-# of forward over forward through a constant matrix times a view of the active
-# vector, which is how an RKPPL design matrix reads its coefficients (Enzyme
-# snag `nested-forward-o-9434176c`,
-# `benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`). There a NaN
-# result is recorded as broken; every finite result must still be exact.
-function _qd_test_third(result, expected)
-    if VERSION >= v"1.12" && (any(isnan, result) || any(isnan, expected))
-        @test_broken all(isfinite, result) && all(isfinite, expected)
-    else
-        @test result ≈ expected rtol = 1e-10
-    end
-end
-
 @testset "query third-order derivatives of design-matrix GLMs" begin
     cases = (
         (_QD_NORMAL_GLM, Dict(:y => _QD_Y, :X => _QD_X, :g => _QD_G),
@@ -440,7 +426,7 @@ end
         for trial in 1:2
             u = [0.15 * cos(i + trial) for i in 1:d]
             v = [sin(i * trial) for i in 1:d]
-            _qd_test_third(only(ad_third(q, (v,), u)), oracle(u, v))
+            @test only(ad_third(q, (v,), u)) ≈ oracle(u, v) rtol = 1e-10
 
             gradient, (hv,), (third,) = ad_gradient_hvp_and_third(q, (v,), u)
             sampler = prepare_sampler(fx.built, fx.bound, u; backend = _QD_REVERSE)
@@ -448,10 +434,10 @@ end
             hvp = prepare_query_ad(prepare_ad_hvp, fx.built, fx.bound, :sampler,
                 _QD_SECOND_ORDER, (v,), u)
             @test hv ≈ only(ad_hvp(hvp, (v,), u))
-            _qd_test_third(third, oracle(u, v))
+            @test third ≈ oracle(u, v) rtol = 1e-10
             results = (similar(u),)
             @test ad_third!(q, results, (v,), u) === results
-            _qd_test_third(only(results), oracle(u, v))
+            @test only(results) ≈ oracle(u, v) rtol = 1e-10
         end
 
         # One direction summed over every unit's effects returns the sum of
@@ -467,6 +453,6 @@ end
             e[effects[j]] = weights[j]
             only(ad_third(q, (e,), u))
         end
-        _qd_test_third(only(ad_third(q, (colored,), u)), sum(parts))
+        @test only(ad_third(q, (colored,), u)) ≈ sum(parts) rtol = 1e-10
     end
 end

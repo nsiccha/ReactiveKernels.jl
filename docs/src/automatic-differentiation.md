@@ -278,13 +278,15 @@ products apply unchanged: on Julia 1.10 a `NonAllocatingKernel`'s third-order
 derivatives fail Enzyme's static activity analysis, as its Hessian-vector
 products do.
 
-On Julia 1.12 and 1.13, Enzyme 0.13.216's forward mode over forward mode
-returns NaN on some calls when the objective multiplies a constant matrix by a
-view of the active vector, and identical calls disagree
+Registered Enzyme 0.13.216's forward mode over forward mode returns NaN on
+some calls through a dense matrix product, and identical calls disagree
 (`benchmark/repro_enzyme_forward_over_forward_view_matvec.jl`, Enzyme only).
-An RKPPL design matrix reads its coefficients that way, so its third-order
-derivatives can be NaN there; on Julia 1.10 every call is exact. The section
-on current backend limitations in `constraints.md` tracks it.
+Third-order derivatives of an objective that multiplies a constant matrix by
+the active vector, as an RKPPL design matrix does, can therefore be NaN:
+through a matrix-vector product on Julia 1.12 and later, through a
+matrix-matrix product on every Julia version. The local Enzyme `dogfood` line
+fixes it from libEnzyme build `4be29b19`. The section on current backend
+limitations in `constraints.md` tracks it.
 
 ## Freeze data-only work during preparation
 

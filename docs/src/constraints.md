@@ -448,19 +448,26 @@ and lock the one Reactant 0.2.289 lifted:
   on Julia 1.12.7 and 1.13.1 with that Enzyme version; its pushforwards and
   the dataflow kernel's Hessian-vector products work. No activity configuration
   or derivative rule is involved.
-- On Julia 1.12.7 and 1.13.1, native Enzyme 0.13.216 forward mode over forward
-  mode returns NaN on some calls when the objective multiplies a constant
-  matrix by a view of the active vector; identical calls in one process
-  disagree. The single forward pass, the same nested call over a slice, and
-  every call on Julia 1.10.12 are exact:
+- Native Enzyme 0.13.216 forward mode over forward mode returns NaN on some
+  calls through a dense matrix product; identical calls in one process
+  disagree. Its forward-mode BLAS rules (`gemv`, `symv`, `gemm`, `symm`,
+  `syrk`) scale the product's output tangent by `beta` instead of overwriting
+  it when `beta == 0`, and a forward-mode shadow allocation is uninitialized
+  memory. When the factors are constant at the outer levels, as the inner
+  tangent product `X * w` of a constant direction `w` is, that tangent is
+  `0 * NaN` whenever the memory holds a NaN. On Julia 1.10.12 OpenBLAS
+  zero-fills a matrix-vector product's tangent, so those calls are exact
+  there; on Julia 1.12.7 and 1.13.1 they are not, and matrix-matrix products
+  can be NaN on every Julia version.
   `repro_enzyme_forward_over_forward_view_matvec.jl` reproduces it with Enzyme
   only (Enzyme snag `nested-forward-o-9434176c`). `prepare_ad_third` runs
-  reverse over forward over forward, and RKPPL reads its coefficients as views
-  of the unconstrained vector, so its third-order derivatives of design-matrix
-  programs inherit the NaN there; the RKPPL tests record a NaN result on Julia
-  1.12 and later as broken and require every finite result to be exact.
-  Hessian-vector products (reverse over forward) are unaffected. No activity
-  configuration or derivative rule is involved.
+  reverse over forward over forward, so third-order derivatives of
+  design-matrix programs, RKPPL's included, inherit the NaN. The local Enzyme
+  `dogfood` line fixes it from libEnzyme build `4be29b19`: on Julia 1.12.7
+  `test_ad_tangent_operators.jl` and RKPPL's `test_query_derivatives.jl` are
+  then exact, and both assert exact values. No registered `Enzyme_jll`
+  release carries the fix yet. Hessian-vector products (reverse over forward)
+  are unaffected. No activity configuration or derivative rule is involved.
 - On Julia 1.10, native Enzyme 0.13.210 reverse mode fails static activity
   analysis (`EnzymeRuntimeActivityError`) for an empty array when a function
   branches on the array's length and then allocates over it, for example
