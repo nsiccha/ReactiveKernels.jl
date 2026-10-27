@@ -1227,7 +1227,8 @@ end
 # whether the slot's value is computed at every cell, a constant of the
 # compiled body (`every_cell` in `_lower_authored_plate_loop_native!`); if
 # not, one computed value can serve several cells, so the slot is released
-# instead, as `_lane_release!` releases it.
+# instead, as `_lane_release!` releases it. The take receives
+# `every && _replicated_may_contain_array(T)`, decided before the plate's cells.
 @inline function _lane_cell_table(table::Base.RefValue{Any}, cell::Int)
     entries = table[]
     entries isa Vector{Any} || (entries = Any[]; table[] = entries)
@@ -1238,8 +1239,8 @@ end
     entries
 end
 @inline function _lane_cell_take!(slot::Base.RefValue{Any}, table::Base.RefValue{Any},
-                                  cell::Int, ::Type{T}, every::Bool) where {T}
-    every && _replicated_may_contain_array(T) || return nothing
+                                  cell::Int, takes::Bool)
+    takes || return nothing
     entries = _lane_cell_table(table, cell)
     held = @inbounds entries[cell]
     held === nothing && return nothing

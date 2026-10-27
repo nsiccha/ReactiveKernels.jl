@@ -143,13 +143,29 @@ end
     @test ReactiveKernels._replicated_aliases((; a = shared), ((1, (; b = view(shared, 1:2))),))
 end
 
-# The per-cell bookkeeping of a plate whose cells are records is compiled in
-# (snag lane-cell-take-e-45c66e49): whether a cell type may hold an array is a
-# constant of the compiled caller, and a result checked against a slot's dense
-# buffer calls `Base.mightalias` without a run-time method lookup. Before, the
-# first walked `fieldtypes(T)` at every cell and the second looked the method
-# up at every check: 36 % and 23 % of a borrowed read of 256 record cells on
-# RK a1d6a5f86.
+# The per-cell bookkeeping of a plate whose cells are records costs no lookup
+# per cell (snag lane-cell-take-e-45c66e49):
+# - whether a cell type may hold an array is a constant of its compiled caller;
+# - a plate decides whether its cells take their table entries before its
+#   cells run, so a run-time element type is looked at once per plate run;
+# - a result checked against a slot's dense buffer calls `Base.mightalias`
+#   without a run-time method lookup.
+# Before, the first walked `fieldtypes(T)` at every cell and the last looked
+# the method up at every check: 36 % and 23 % of a borrowed read of 256 record
+# cells on RK a1d6a5f86.
+_callee(ex::Expr) = ex.head === :call ?
+    (f = ex.args[1]; f isa GlobalRef ? f.name : f) : nothing
+# The innermost `for` loop around each call of `name` (`nothing` outside any).
+function enclosing_loops(ex, name, loop = nothing, found = Any[])
+    ex isa Expr || return found
+    _callee(ex) === name && push!(found, loop)
+    for (k, arg) in enumerate(ex.args)
+        # A loop's iteration specification is evaluated outside its body.
+        enclosing_loops(arg, name, ex.head === :for && k > 1 ? ex : loop, found)
+    end
+    found
+end
+
 @testset "position lane forms: cell bookkeeping is compiled in" begin
     may = ReactiveKernels._replicated_may_contain_array
     numbers = typeof((; a = 1.0, b = 2, c = (1.0, 2.0), d = (; x = 1f0)))
@@ -161,14 +177,13 @@ end
         @test may(T) === answer
         @test only(code_typed(may, (Type{T},))).first.code == Any[Core.ReturnNode(answer)]
     end
-    calls(code) = filter(s -> Meta.isexpr(s, (:invoke, :call)), code)
-    take(T) = only(code_typed(ReactiveKernels._lane_cell_take!,
-        (Base.RefValue{Any}, Base.RefValue{Any}, Int, Type{T}, Bool))).first.code
-    # A record of numbers keeps no table: the take does nothing.
-    @test isempty(calls(take(numbers)))
-    # A record holding an array keeps its table, without walking its fields.
-    @test !isempty(calls(take(holding)))
-    @test !any(s -> occursin("_any", string(s)), take(holding))
+    # Every take runs in a cell loop; its flag is computed outside that loop.
+    ex = code_expr(reader(:total; reuse = true))
+    takes = enclosing_loops(ex, :_lane_cell_take!)
+    flags = enclosing_loops(ex, :_replicated_may_contain_array)
+    @test !isempty(takes) && all(!isnothing, takes)
+    @test length(flags) == length(takes)
+    @test !any(flag -> any(take -> take === flag, takes), flags)
 
     check(result, slot) = ReactiveKernels._lane_may_reference(result, slot[])
     v = rand(8)

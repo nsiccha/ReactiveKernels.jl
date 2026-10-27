@@ -4016,11 +4016,20 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         end
     end
     cell_number = gensym(:plate_cell_number)
+    # Whether a cell takes its table entry depends on the plate's arguments
+    # and element type only, so it is decided once per run of the plate, before
+    # its cells (`take_flags`, bound with `cell_number` below). Passed the
+    # element type instead, the take was looked up at run time at every cell
+    # whenever that type is a run-time value (snag lane-cell-take-e-45c66e49).
+    take_flags = Any[:($(gensym(Symbol(slot, :_takes))) =
+                       $condition && $(GlobalRef(@__MODULE__, :_replicated_may_contain_array))(
+                           $plate_eltype))
+                     for (slot, _, condition) in table_entries]
     if !isempty(table_entries)
         prepend!(loopbody.args, Any[:($cell_number += 1);
             Any[:($(GlobalRef(@__MODULE__, :_lane_cell_take!))(
-                    $slot, $table, $cell_number, $plate_eltype, $condition))
-                for (slot, table, condition) in table_entries]])
+                    $slot, $table, $cell_number, $(first(flag.args))))
+                for ((slot, table, _), flag) in zip(table_entries, take_flags)]])
         kept = Expr(:call, GlobalRef(@__MODULE__, :_lane_cell_release!), scalar_result,
                     cell_number, (Expr(:tuple, entry...) for entry in table_entries)...)
         result = gensym(:plate_cell_result)
@@ -4068,7 +4077,8 @@ Base.@nospecializeinfer function _lower_authored_plate_loop_native!(
         push!(body.args, :($first_coordinate = true))
     end
     cell_loop = Expr(:for, Expr(:(=), index, iteration), loopbody)
-    isempty(table_entries) || (cell_loop = Expr(:block, :($cell_number = 0), cell_loop))
+    isempty(table_entries) ||
+        (cell_loop = Expr(:block, :($cell_number = 0), take_flags..., cell_loop))
     # A pure total-only plate is a scalar reduction, so it runs under `@simd`.
     # SIMD needs an indexable iteration space, whereas `_plate_cells` returns
     # a Generator for one axis: `_plate_simd_cells` iterates that axis's range
