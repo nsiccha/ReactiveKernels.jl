@@ -58,14 +58,30 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             uuid = "6b3e9d4f-7a5c-4b8d-8e2f-3c4d5e6f7a8b"
             version = "0.1.0"
             [deps]
+            ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
+            Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+            PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
             PrecompiledPPLBuild = "5a2d8c3e-6f4b-4a7c-9d1e-2b3c4d5e6f7a"
             ReactiveKernelsPPL = "e266ea2a-6817-46cd-8bec-6238f0035f44"
             """)
         write(joinpath(prepared, "src", "PrecompiledPPLPrepare.jl"), """
             module PrecompiledPPLPrepare
-            using ReactiveKernelsPPL, PrecompiledPPLBuild
+            using ReactiveKernelsPPL, PrecompiledPPLBuild, Enzyme
+            using ADTypes: AutoEnzyme
+            using PrecompileTools: @setup_workload, @compile_workload
             const B = PrecompiledPPLBuild
             const WAS_PRECOMPILED = ccall(:jl_generating_output, Cint, ()) != 0
+            const BACKEND = AutoEnzyme(; mode = Enzyme.Reverse)
+            # Prepares B's build for reverse-mode gradients without taking one
+            # (rkppl-use §1). The workload comes first: the image does not keep
+            # a lowering that the constants below compiled first.
+            @setup_workload begin
+                @compile_workload begin
+                    plan = B.MODEL(; x = [0.2, 1.2]) | (; y = [0.5, 1.1])
+                    prepare_sampler(B.BUILT, plan, [0.3, -0.2, 0.1]; backend = BACKEND)(
+                        [0.3, -0.2, 0.1])
+                end
+            end
             const QUERY = prepare_query(B.BUILT, B.PLAN, :sampler)
             const VALUE = QUERY([0.3, -0.2, 0.1])
             const PLAN = B.MODEL(; x = [0.5, 1.5, 2.5, 3.5]) | (; y = [0.4, 1.7, 2.1, 3.9])
@@ -157,5 +173,21 @@ using ReactiveKernels, ReactiveKernelsPPL, ReactiveKernelsDistributionKernels, T
             """
         @test success(pipeline(`$julia --startup-file=no --project=$env -e $probe`;
                                stdout = stdout, stderr = stderr))
+
+        # P's image prepared B's build as a reverse-mode sampler, so preparing
+        # that build on another binding after loading compiles no lowering.
+        # Julia 1.10 kept RK's recursive lowering in such an image for its
+        # return type only, without code, and every process compiled it again.
+        trace = joinpath(env, "trace_compile.jl")
+        lowering = """
+            using ReactiveKernelsPPL, PrecompiledPPLBuild, PrecompiledPPLPrepare
+            const P = PrecompiledPPLPrepare
+            prepare_sampler(PrecompiledPPLBuild.BUILT, P.PLAN, [0.3, -0.2, 0.1];
+                            backend = P.BACKEND)
+            """
+        @test success(pipeline(
+            `$julia --startup-file=no --project=$env --trace-compile=$trace -e $lowering`;
+            stdout = stdout, stderr = stderr))
+        @test isempty(filter(contains("_lower_with_ops_collecting"), readlines(trace)))
     end
 end

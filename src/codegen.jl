@@ -4465,12 +4465,21 @@ end
 # `cell_tables` collects, the same way, the per-cell tables of the plates at
 # this lowering's own top level (`_lane_cell_take!`); a cell's own lowering
 # collects those of its own plates (`_plate_nested_native!`).
+#
+# Lowering recurses: plate cells, parts and partial-evaluation arms lower
+# their own plans through this function, with keywords of other types.
+# Inferred through, that recursion reaches Julia's recursion limit, and Julia
+# 1.10 then caches the lowering for its return type only, without its code, so
+# a package image that prepared a program held no compiled lowering and every
+# process inferred and compiled it again at its first preparation. Behind the
+# barrier each lowering is inferred on its own, and an image keeps its code.
 function _lower_with_ops(p::Plan; cell_slots::Union{Nothing,Vector{Symbol}} = nothing,
                          cell_tables::Union{Nothing,Vector{Symbol}} = nothing,
                          kwargs...)
     task_local_storage(_CELL_TABLES, cell_tables) do
-        task_local_storage(() -> _lower_with_ops_collecting(p; kwargs...),
-                           _CELL_SLOTS, cell_slots)
+        task_local_storage(_CELL_SLOTS, cell_slots) do
+            Base.inferencebarrier(_lower_with_ops_collecting)(p; kwargs...)::Tuple{Expr,Tuple,Tuple}
+        end
     end
 end
 const _CELL_SLOTS = :ReactiveKernels_cell_slots
