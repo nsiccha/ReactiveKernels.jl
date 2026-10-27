@@ -26,6 +26,8 @@
 #   Julia 1.10.12: view 0 NaN, slice 0 NaN
 #   Julia 1.12.7:  view 14 NaN, slice 0 NaN
 #   Julia 1.13.1:  view 19 NaN, slice 0 NaN
+# With Enzyme dogfood f69ebce9 (libEnzyme build 4be29b19), Julia 1.12.7,
+# 2026-10-27 UTC: view 0 NaN, slice 0 NaN.
 using Enzyme
 
 const A = hcat(ones(20), [0.3 * sin(i) for i in 1:20],
