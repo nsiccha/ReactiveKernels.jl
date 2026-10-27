@@ -196,6 +196,20 @@ end
     return total
 end
 
+# Two independent uninferred values: the location and the scale.
+uninferred_scale(s) = Base.inferencebarrier(abs(s))
+
+@kernel two_roots(a::Float64, s::Float64, t::Vector{Float64},
+                  y::Vector{Float64}) = begin
+    mu = uninferred_curve(t, a)
+    sd = uninferred_scale(s)
+    pointwise = plate(y, mu) do yi, mi
+        -0.5 * ((yi - mi) / sd)^2 - log(sd)
+    end
+    total::Float64 = sum(pointwise)
+    return total
+end
+
 @kernel untyped(a, s, t, y) = begin
     mu = uninferred_curve(t, a)
     total = sum(-0.5 .* ((y .- mu) ./ s) .^ 2 .- log(s))
@@ -320,6 +334,122 @@ uninferred_warning(name) = (:warn, Regex("`$name` is not concretely typed"))
 
     # A scan step's uninferred value is named with the scan that encloses it.
     @test_logs (:warn, r"`next` in the body of `path` is not concretely typed.*uninferred_curve\(x, a\)") prepare(U.step_arm)
+end
+
+# `type_stability = :error` refuses the program instead of warning (snag
+# `type-stability-c-7eeae56d`, user decision
+# `ReactiveKernels:snag.type-stability-c-7eeae56d/decisions/2026-10-27T20-42-40-959-1jkb0is`).
+refusal(f) = try
+    f()
+    nothing
+catch e
+    e
+end
+
+# A project environment, ahead of the active one on the load path, whose
+# ReactiveKernels preference `type_stability` is `value`. A session reads the
+# preference at its first preparation; forgetting that read stands in for a
+# new session.
+function with_type_stability_preference(f, value)
+    dir = mktempdir()
+    uuid = string(Base.PkgId(ReactiveKernels).uuid)
+    write(joinpath(dir, "Project.toml"), """
+        [deps]
+        ReactiveKernels = "$uuid"
+
+        [preferences.ReactiveKernels]
+        type_stability = $(repr(value))
+        """)
+    pushfirst!(LOAD_PATH, dir)
+    ReactiveKernels._TYPE_STABILITY_PREFERENCE[] = nothing
+    try
+        f()
+    finally
+        popfirst!(LOAD_PATH)
+        ReactiveKernels._TYPE_STABILITY_PREFERENCE[] = nothing
+        rm(dir; recursive = true)
+    end
+end
+
+@testset "uninferred client values: refusal with type_stability = :error" begin
+    U = Uninferred
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    args = (0.1, 0.8, t, y)
+
+    # The error names every uninferred value of the preparation, and nothing is
+    # logged.
+    e = @test_logs refusal(() -> prepare(U.two_roots; type_stability = :error))
+    @test e isa UninferredValuesError
+    @test length(e.messages) == 2
+    @test any(m -> occursin(r"`mu` is not concretely typed.*uninferred_curve\(t, a\)", m),
+              e.messages)
+    @test any(m -> occursin(r"`sd` is not concretely typed.*uninferred_scale\(s\)", m),
+              e.messages)
+    shown = sprint(showerror, e)
+    @test startswith(shown, "UninferredValuesError: 2 values of the prepared program")
+    @test all(m -> occursin(m, shown), e.messages)
+
+    # Every preparation is refused, not only the first in the process.
+    @test_throws UninferredValuesError prepare(U.two_roots; type_stability = :error)
+    @test_throws UninferredValuesError prepare(U.location; type_stability = :error)
+    @test_throws UninferredValuesError prepare(U.location; type_stability = :error,
+                                               bound = (; t, y))
+    @test_throws UninferredValuesError prepare(U.subject_cells; type_stability = :error)
+    @test_throws UninferredValuesError prepare(U.step_arm; type_stability = :error)
+
+    # A concretely typed program prepares, and a declared local still asserts.
+    @test_logs min_level = Base.CoreLogging.Warn prepare(
+        Corpus.plate_location; type_stability = :error)
+    @test_logs min_level = Base.CoreLogging.Warn prepare(U.declared; type_stability = :error)
+
+    # The AD preparation checks its exemplars in the same mode.
+    untyped = @test_logs min_level = Base.CoreLogging.Warn prepare(U.untyped)
+    @test_throws UninferredValuesError prepare_ad(untyped, backend, args...; active = :a,
+                                                  type_stability = :error)
+    @test_throws UninferredValuesError prepare_ad(U.location, backend, args...;
+        active = :a, want = :total, type_stability = :error)
+
+    # A preparation cached under `:warn` is not handed to an `:error` call.
+    cache = PreparationCache()
+    @test_logs uninferred_warning("mu") prepare!(cache, U.location)
+    @test_throws UninferredValuesError prepare!(cache, U.location; type_stability = :error)
+    # The graph holds this binding under `:warn`; its rebindings are not
+    # checked again, so an `:error` binding must not reuse it.
+    Base.CoreLogging.with_logger(() -> prepare(U.location; bound = (; t, y)),
+                                 Base.CoreLogging.NullLogger())
+    @test_throws UninferredValuesError prepare(U.location; bound = (; t, y),
+                                               type_stability = :error)
+    @test_throws UninferredValuesError prepare!(cache, U.location; bound = (; t, y),
+                                                type_stability = :error)
+
+    # The keyword is checked.
+    @test_throws ArgumentError prepare(Corpus.plate_location; type_stability = :strict)
+    @test_throws ArgumentError prepare(Corpus.plate_location; type_stability = "error")
+end
+
+@testset "uninferred client values: the type_stability preference" begin
+    U = Uninferred
+    backend = AutoEnzyme(; mode = Enzyme.Reverse)
+    args = (0.1, 0.8, t, y)
+    with_type_stability_preference("error") do
+        @test_throws UninferredValuesError prepare(U.location)
+        @test_throws UninferredValuesError prepare(U.location; bound = (; t, y))
+        @test_throws UninferredValuesError prepare_ad(prepare(U.untyped), backend, args...;
+                                                      active = :a)
+        # A call's keyword takes precedence, nested preparations included.
+        @test_logs uninferred_warning("mu") prepare(U.location; type_stability = :warn)
+        @test_logs uninferred_warning("mu") prepare_ad(U.location, backend, args...;
+            active = :a, want = :total, type_stability = :warn)
+        @test_logs min_level = Base.CoreLogging.Warn prepare(Corpus.plate_location)
+    end
+    with_type_stability_preference("warn") do
+        @test_logs uninferred_warning("mu") prepare(U.location)
+    end
+    with_type_stability_preference("strict") do
+        @test_throws ArgumentError prepare(Corpus.plate_location)
+    end
+    # Without a preference, preparation warns.
+    @test_logs uninferred_warning("mu") prepare(U.location)
 end
 
 end # module

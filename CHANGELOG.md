@@ -16,6 +16,25 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.3
+
+- Preparation can refuse a program whose values do not infer a concrete type,
+  instead of warning once per process. With `type_stability = :error`,
+  `prepare`, `prepare!` and every `prepare_ad*` throw an
+  `UninferredValuesError` whose `messages` name each such value and its
+  recipe, at every preparation. The default stays `:warn`. A project opts in
+  for every preparation it makes, including those that packages such as
+  ReactiveKernelsPPL make for it, with the preference
+  `Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")`
+  (`[ReactiveKernels] type_stability = "error"` in its
+  `LocalPreferences.toml`, which `Pkg.test` carries into the test
+  environment). The preference is read at the first preparation of a Julia
+  session; a new session picks up a change without recompiling anything. A
+  call's keyword takes precedence for that call and the preparations nested
+  in it. Cached preparations are kept per mode, so a kernel prepared under
+  `:warn` is never returned to an `:error` call.
+  `Preferences` is a new dependency; `PrecompileTools` already loaded it.
+
 ## 0.1.2
 
 - A summed plate whose cells hold arrays adds them elementwise, as Julia's

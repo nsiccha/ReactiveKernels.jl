@@ -458,6 +458,25 @@ Values computed from such a value, or from a HAVE port whose type is not
 known, are not reported again. Preparation still succeeds, so the primal of
 such a kernel keeps working.
 
+A project that wants such a program refused sets the ReactiveKernels
+preference `type_stability` to `"error"`:
+
+```julia
+using Preferences, ReactiveKernels
+Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")
+```
+
+This writes `[ReactiveKernels] type_stability = "error"` to the project's
+`LocalPreferences.toml`. Every preparation in that project then throws an
+`UninferredValuesError` listing each uninferred value with its recipe,
+including preparations that other packages make for it (RKPPL's
+`prepare_sampler`), its tests (`Pkg.test` copies the preferences), scripts and
+precompile workloads. The preference is read at the first preparation of a
+Julia session; a new session picks up a change without recompiling anything. The `type_stability = :error` (or `:warn`) keyword of
+`prepare`, `prepare!` and the `prepare_ad*` functions takes precedence for one
+call and the preparations nested in it. Cached preparations are kept per mode,
+so a kernel prepared under `:warn` is never returned to an `:error` call.
+
 When an abstract HAVE declaration hides a concrete input type needed to infer
 an authored plate's rank, `prepare(...; exemplars = (x, ...))` opts the native
 lowering into type evidence from one exemplar per remaining positional HAVE

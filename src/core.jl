@@ -84,6 +84,8 @@ function __init__()
     _VALUE_NAMESPACE[] = ValueNamespace(generating ? rand(RandomDevice(), UInt) : zero(UInt))
     # Programs that package images loaded from now on compiled (`compile`).
     push!(Base.package_callbacks, _register_image_programs)
+    # This process reads its own project's `type_stability` preference.
+    _TYPE_STABILITY_PREFERENCE[] = nothing
     nothing
 end
 

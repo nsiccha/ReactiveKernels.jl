@@ -7,10 +7,14 @@
 # dynamically on each evaluation, and native reverse-mode AD can refuse the
 # program long into its derivative compilation (snag
 # `joint-nlme-enzym-f8d3cb5f`, where one `Any` result made every downstream
-# plate dynamic). Preparation does not fail on such a kernel. It warns once per
-# value, naming the value and the recipe that computes it (user decision
+# plate dynamic). By default preparation does not fail on such a kernel. It
+# warns once per value, naming the value and the recipe that computes it (user
+# decision
 # `ReactiveKernels:snag.joint-nlme-enzym-f8d3cb5f/decisions/2026-10-12T20-13-15-811-1hui2qi`,
-# principle review `…/2026-10-12T20-09-11-062-114x8kz`).
+# principle review `…/2026-10-12T20-09-11-062-114x8kz`). A project or a call
+# opts into refusing it instead, `type_stability = :error`: a warning scrolls
+# past in a long log (snag `type-stability-c-7eeae56d`, user decision
+# `ReactiveKernels:snag.type-stability-c-7eeae56d/decisions/2026-10-27T20-42-40-959-1jkb0is`).
 #
 # The check walks the plan's recipes in execution order from concrete input
 # types, inferring each recipe's output types with `promote_op` and recursing
@@ -251,18 +255,96 @@ function _uninferred_value_message(u::_UninferredValue)
     "assert its type inside that function (`f(args...) = (...)::T`)."
 end
 
-# Warn once per process for each uninferred value of `kernel` over
-# `argument_types`. Preparation continues either way.
-function _warn_uninferred_values(kernel, argument_types)
-    for u in _uninferred_values(kernel, argument_types)
+"""
+    UninferredValuesError(messages)
+
+Thrown by a preparation checked with `type_stability = :error` when values of
+the prepared program do not infer concretely. `messages` holds one message per
+recipe that introduces such a type, as the warning of the default
+`type_stability = :warn` words it.
+"""
+struct UninferredValuesError <: Exception
+    messages::Vector{String}
+end
+
+function Base.showerror(io::IO, e::UninferredValuesError)
+    n = length(e.messages)
+    print(io, "UninferredValuesError: ", n, n == 1 ? " value" : " values",
+          " of the prepared program", n == 1 ? " does" : " do",
+          " not infer a concrete type, and this preparation is checked with ",
+          "`type_stability = :error`.")
+    foreach(message -> print(io, "\n\n", message), e.messages)
+end
+
+# What preparation does with an uninferred value: `:warn` logs it once per
+# process and continues; `:error` refuses the preparation.
+const _TYPE_STABILITY_MODES = (:warn, :error)
+
+_type_stability_mode(mode::Symbol) = mode in _TYPE_STABILITY_MODES ? mode :
+    throw(ArgumentError("`type_stability` must be one of " *
+                        "$(join(repr.(_TYPE_STABILITY_MODES), ", ")); got $(repr(mode))"))
+_type_stability_mode(mode) = throw(ArgumentError(
+    "`type_stability` must be a Symbol, one of " *
+    "$(join(repr.(_TYPE_STABILITY_MODES), ", ")); got $(repr(mode))"))
+
+# The project's `type_stability` preference, `[ReactiveKernels]
+# type_stability = "error"` in its `LocalPreferences.toml`, read at the first
+# preparation of a process: a read takes tens of microseconds, as long as
+# rebinding a small bound kernel. It is not compiled in, so a new session picks
+# up a change without recompiling. `__init__` forgets a value read while an
+# image was generated.
+const _TYPE_STABILITY_PREFERENCE = Ref{Union{Nothing,Symbol}}(nothing)
+
+function _type_stability_preference()
+    mode = _TYPE_STABILITY_PREFERENCE[]
+    mode === nothing || return mode
+    value = Preferences.load_preference(@__MODULE__, "type_stability", "warn")
+    value in ("warn", "error") || throw(ArgumentError(
+        "the ReactiveKernels preference `type_stability` must be \"warn\" or " *
+        "\"error\"; got $(repr(value))"))
+    _TYPE_STABILITY_PREFERENCE[] = Symbol(value)
+end
+
+# The task-local key of the mode a `type_stability` keyword sets for the
+# preparations its call makes, nested ones included (a child kernel's, a bound
+# residual's).
+const _TYPE_STABILITY_SCOPE = :ReactiveKernels_type_stability
+
+# The mode of the preparation in progress: the innermost enclosing
+# `type_stability` keyword, else the preference.
+_type_stability() =
+    get(_type_stability_preference, task_local_storage(), _TYPE_STABILITY_SCOPE)
+
+# `f()` with every preparation inside it checked in `mode`; `nothing` keeps the
+# enclosing mode.
+_with_type_stability(f, ::Nothing) = f()
+_with_type_stability(f, mode) =
+    task_local_storage(f, _TYPE_STABILITY_SCOPE, _type_stability_mode(mode))
+
+_report_uninferred_values(found, mode::Symbol) =
+    _report_uninferred_values(found, Val(mode))
+
+function _report_uninferred_values(found, ::Val{:warn})
+    for u in found
         @warn _uninferred_value_message(u) _group = :type_stability maxlog = 1 _id = (
             :uninferred_value, u.path, u.value.name, _uninferred_recipe_text(u),
             u.input_types)
     end
+end
+
+_report_uninferred_values(found, ::Val{:error}) =
+    isempty(found) || throw(UninferredValuesError(map(_uninferred_value_message, found)))
+
+# Check the values of `kernel` over `argument_types` in the mode of the
+# preparation in progress: warn once per process for each uninferred value and
+# continue, or refuse the preparation, naming every uninferred value.
+function _check_uninferred_values(kernel, argument_types)
+    mode = _type_stability()
+    _report_uninferred_values(_uninferred_values(kernel, argument_types), mode)
     kernel
 end
 
 # Prepared kernels whose HAVE ports have concrete declared types are checked
 # from those declarations.
-_warn_uninferred_values(kernel) =
-    _warn_uninferred_values(kernel, map(valtype, kernel.plan.have))
+_check_uninferred_values(kernel) =
+    _check_uninferred_values(kernel, map(valtype, kernel.plan.have))

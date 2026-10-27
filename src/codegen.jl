@@ -7183,8 +7183,8 @@ function _bind_nonallocating_constants(ast::Expr, ops::Tuple, caches::Tuple,
 end
 
 """
-    prepare(p::Plan; passes=(), bound=(), on_error=nothing, exemplars=nothing) -> PreparedKernel
-    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing, exemplars=nothing) -> PreparedKernel
+    prepare(p::Plan; passes=(), bound=(), on_error=nothing, exemplars=nothing, type_stability=nothing) -> PreparedKernel
+    prepare(g::Graph; have, want, passes=(), bound=(), on_error=nothing, exemplars=nothing, type_stability=nothing) -> PreparedKernel
 
 Ergonomic composition of `plan -> lower -> transform -> compile`. `passes` is a
 tuple of AST passes applied before compilation.
@@ -7231,12 +7231,25 @@ Every recipe and plate cell that reads such a value dispatches dynamically, and
 native reverse-mode AD may refuse the program. Preparation still succeeds.
 [`prepare_ad`](@ref) repeats the check with the types of its exemplar
 arguments.
+
+`type_stability = :error` refuses such a program instead: preparation throws an
+[`UninferredValuesError`](@ref) naming every uninferred value, at every
+preparation. The default `nothing` takes the mode of an enclosing preparation,
+else the project's ReactiveKernels preference `type_stability` (`"warn"` or
+`"error"`, read at the first preparation of a Julia session), else `:warn`. A
+project opts every preparation in, including those other packages make for it,
+with `Preferences.set_preferences!(ReactiveKernels, "type_stability" => "error")`,
+which writes `[ReactiveKernels] type_stability = "error"` to its
+`LocalPreferences.toml`. The mode applies to the preparations this call makes,
+nested ones included, and cached preparations are kept per mode.
 """
 function prepare(p::Plan; passes = (), bound = (), on_error = nothing,
-                 exemplars = nothing)
-    _warn_uninferred_values(
-        _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
-                      exemplars))
+                 exemplars = nothing, type_stability = nothing)
+    _with_type_stability(type_stability) do
+        _check_uninferred_values(
+            _prepare_plan(p; passes = passes, bound = bound, on_error = on_error,
+                          exemplars))
+    end
 end
 
 # The two backend products of one preparation reuse each nested cell's composed
@@ -7333,11 +7346,13 @@ function _prepare_plan(p::Plan; passes = (), bound = (), on_error = nothing,
 end
 
 function prepare(g::Graph; have = (), want = (), passes = (), bound = (),
-                 on_error = nothing, exemplars = nothing)
-    exemplars === nothing && _reuses_bound_preparation(bound, passes) &&
-        return _graph_bound_preparation(g, have, want, passes, bound, on_error)
-    p = plan(g; have = have, want = want)
-    prepare(p; passes = passes, bound = bound, on_error = on_error, exemplars)
+                 on_error = nothing, exemplars = nothing, type_stability = nothing)
+    _with_type_stability(type_stability) do
+        exemplars === nothing && _reuses_bound_preparation(bound, passes) &&
+            return _graph_bound_preparation(g, have, want, passes, bound, on_error)
+        p = plan(g; have = have, want = want)
+        prepare(p; passes = passes, bound = bound, on_error = on_error, exemplars)
+    end
 end
 
 """
