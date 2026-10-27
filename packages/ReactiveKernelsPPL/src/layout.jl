@@ -248,7 +248,14 @@ struct LayoutTable
     bound_exprs::Dict{Symbol,Any}
     # The packed array of a dotted cell latent => (authored name, dimensions).
     cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}
+    # The packed array of a joint cell latent => its caller-owned geometry.
+    cell_geometries::Dict{Symbol,CellGeometry}
 end
+LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
+        bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any},
+        cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}) =
+    LayoutTable(entries, total, paths, bound_values, bound_exprs, cell_latents,
+        Dict{Symbol,CellGeometry}())
 LayoutTable(entries::Vector{LayoutEntry}, total::Int, paths::Dict{Symbol,Tuple{Vararg{Symbol}}},
         bound_values::Dict{Symbol,Any}, bound_exprs::Dict{Symbol,Any}) =
     LayoutTable(entries, total, paths, bound_values, bound_exprs,
@@ -513,10 +520,14 @@ function assign_layout(plan::StructuralPlan)
     for (site, (name, _)) in plan.cell_latents
         paths[site] = get(paths, name, (name,))
     end
+    # So does a joint cell latent's.
+    for (site, g) in plan.cell_geometries
+        paths[site] = get(paths, g.name, (g.name,))
+    end
     return LayoutTable(entries, offset - 1, paths,
         Dict{Symbol,Any}(plan.columns),
         Dict{Symbol,Any}(a.name => a.expr for a in _definitions(plan)),
-        plan.cell_latents)
+        plan.cell_latents, plan.cell_geometries)
 end
 
 """Constrained length of a `:vector` entry: simplex packs K−1 logits
@@ -987,6 +998,8 @@ function coordinate_names(layout::LayoutTable)
             end
         elseif e.kind === :array && haskey(layout.cell_latents, e.name)
             append!(names, _cell_latent_coordinates(layout, e.name))
+        elseif e.kind === :array && haskey(layout.cell_geometries, e.name)
+            append!(names, _cell_geometry_coordinates(layout, e.name))
         elseif e.kind === :vector || e.kind === :array || e.kind === :external || e.kind === :external_plate
             append!(names, [_authored_coordinate(layout, e.name, label)
                 for label in e.labels])
@@ -1192,6 +1205,8 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
     values = Dict{Symbol,Any}()
     T = _host_eltype(u)
     for entry in _bound_entry_order(layout)
+        # A joint cell latent's arguments may read any other value.
+        haskey(layout.cell_geometries, entry.name) && continue
         e = _resolved_entry(layout, entry, values)
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :external_plate
@@ -1241,6 +1256,11 @@ function constrain(layout::LayoutTable, u::AbstractVector{<:Real})
         lastpair = last(pairs)
         values[first(lastpair)] = last(lastpair)
     end
+    for e in layout.entries
+        haskey(layout.cell_geometries, e.name) || continue
+        seg = u[e.offset:(e.offset + e.size - 1)]
+        push!(pairs, e.name => _cell_geometry_constrain(layout, e.name, seg, values))
+    end
     order = Dict(e.name => i for (i, e) in enumerate(layout.entries))
     sort!(pairs; by = p -> get(order, first(p), 0))
     return _scoped_draw_values(layout, pairs)
@@ -1260,7 +1280,11 @@ function unconstrain(layout::LayoutTable, nt::NamedTuple)
     seen_coef = Set{Symbol}()
     for entry in layout.entries
         e = _resolved_entry(layout, entry, nt)
-        if e.kind === :external_plate
+        if haskey(layout.cell_geometries, e.name)
+            haskey(nt, e.name) || throw(ContractValidationError("[layout] missing parameter $(e.name)"))
+            u[e.offset:(e.offset + e.size - 1)] .= _cell_geometry_unconstrain(layout,
+                e.name, nt[e.name], nt)
+        elseif e.kind === :external_plate
             haskey(nt, e.name) || throw(ContractValidationError("[layout] missing parameter $(e.name)"))
             v = nt[e.name]
             v isa AbstractVector && length(v) == e.size ||
@@ -1404,10 +1428,15 @@ function logjac(layout::LayoutTable, u::AbstractVector{<:Real})
         throw(ContractValidationError("[layout] unconstrained length $(length(u)) ≠ $(layout.total)"))
     T = _host_eltype(u)
     total = zero(T)
-    values = any(_dynamic_bounds, layout.entries) ?
+    values = any(_dynamic_bounds, layout.entries) || !isempty(layout.cell_geometries) ?
         _flat_draw_values(layout, constrain(layout, u)) : NamedTuple()
     for entry in layout.entries
         e = _resolved_entry(layout, entry, values)
+        if haskey(layout.cell_geometries, e.name)
+            total += _cell_geometry_logjac(layout, e.name,
+                u[e.offset:(e.offset + e.size - 1)], values)
+            continue
+        end
         e.transform === :identity && continue
         seg = u[e.offset:(e.offset + e.size - 1)]
         if e.kind === :external_plate

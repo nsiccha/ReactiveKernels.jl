@@ -319,8 +319,15 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
     for c in loop.args[2].args
         if Meta.isexpr(c, :(=), 2) && c.args[1] isa Symbol
             _push_cell_local!(cx, c.args[1], c.args[2])
+        elseif _is_cell_latent_block(c) && Meta.isexpr(c.args[1], :ref, 2) &&
+                c.args[1].args[2] === ivar &&
+                c.args[2].args[1] == GlobalRef(@__MODULE__, :_ppl_cell_joint_constrain)
+            # A joint latent's value has its geometry's shape at the index.
+            _, _, _, shapes, pos = filter(a -> !Meta.isexpr(a, :parameters), c.args[2].args[2:end])
+            cx.arrays[c.args[1].args[1]] = (shapes, pos)
         elseif Meta.isexpr(c, :(=), 2) && Meta.isexpr(c.args[1], :ref, 2) &&
-                c.args[1].args[2] === ivar && c.args[1].args[1] isa Symbol
+                c.args[1].args[2] === ivar && c.args[1].args[1] isa Symbol &&
+                !_is_cell_latent_block(c)
             cx.defined[c.args[1].args[1]] = c.args[2]
         elseif Meta.isexpr(c, :call, 3) && c.args[1] === :~ &&
                 Meta.isexpr(c.args[2], :ref, 2) && c.args[2].args[2] === ivar &&
@@ -387,10 +394,170 @@ function _expand_cell_array_latents(st, taken, scope::_CellLatentScope)
         Expr(:for, loop.args[1], Expr(:block, cells...))), sites
 end
 
-# A cell reading its array latent's block. Such a plate is retained, one
-# iteration per index, as a cell `@scan` is.
+# A cell reading its array latent's block, or constraining its joint latent's
+# block. Such a plate is retained, one iteration per index, as a cell `@scan`
+# is.
 _is_cell_latent_block(c) = Meta.isexpr(c, :(=), 2) && Meta.isexpr(c.args[2], :call) &&
-    c.args[2].args[1] == GlobalRef(@__MODULE__, :_ppl_cell_latent_block)
+    (c.args[2].args[1] == GlobalRef(@__MODULE__, :_ppl_cell_latent_block) ||
+     c.args[2].args[1] == GlobalRef(@__MODULE__, :_ppl_cell_joint_constrain))
+
+# --- Joint cell latents: `c[i] ~ F(args…)` with a caller-owned geometry ---
+#
+# An undotted cell latent whose caller-owned RHS has a geometry other than one
+# scalar coordinate states one draw of `F(args…)` at each index: a value of
+# the geometry's shape there, under ONE density of the whole value. The
+# geometry's shape and packed dimension are data-only expressions of the
+# authored arguments, evaluated at each index at binding. The coordinates of
+# every index are one flat array parameter in plate order, with no density or
+# transform of its own. Each cell constrains its block through the geometry
+# and adds its density and log-Jacobian, so the iteration stays in the
+# retained plate.
+
+# Names the program gives values: data, every left-hand side (in plates and
+# scans too) and every loop variable. They shadow module bindings, as Julia's
+# local names do.
+function _program_value_names!(out::Set{Symbol}, ex)
+    ex isa Expr || return out
+    if Meta.isexpr(ex, :(=), 2) || Meta.isexpr(ex, :call, 3) && ex.args[1] in (:~, :.~)
+        lhs = Meta.isexpr(ex, :(=)) ? ex.args[1] : ex.args[2]
+        name = _declared_value_name(lhs)
+        name isa Symbol && push!(out, name)
+        Meta.isexpr(ex, :(=)) && _program_value_names!(out, ex.args[2])
+        return out
+    end
+    if Meta.isexpr(ex, :for) && Meta.isexpr(ex.args[1], :(=), 2) && ex.args[1].args[1] isa Symbol
+        push!(out, ex.args[1].args[1])
+    end
+    foreach(a -> _program_value_names!(out, a), ex.args)
+    return out
+end
+
+_is_cell_joint_candidate(c, ivar::Symbol, data::Set{Symbol}) =
+    Meta.isexpr(c, :call, 3) && c.args[1] === :~ &&
+    Meta.isexpr(c.args[2], :ref, 2) && c.args[2].args[1] isa Symbol &&
+    c.args[2].args[2] === ivar && !(c.args[2].args[1] in data) &&
+    Meta.isexpr(c.args[3], :call) && _external_rhs(c.args[3])
+
+# The resolved RHS and its geometry, when that geometry is not one scalar
+# coordinate; `nothing` leaves the statement to the scalar cell path, which
+# reports any resolution or geometry error itself.
+function _cell_joint_geometry(rhs::Expr, mod::Module, names::Set{Symbol})
+    head = rhs.args[1]
+    head isa Symbol && (head in names || !isdefined(mod, head)) && return nothing
+    call = try
+        _resolve_module_calls(rhs, mod, names, "sampling RHS")
+    catch e
+        e isa SurfaceLoweringError || rethrow()
+        return nothing
+    end
+    Meta.isexpr(call, :call) && call.args[1] isa GlobalRef || return nothing
+    constructor = getglobal(call.args[1].mod, call.args[1].name)
+    geometry = try
+        sampling_geometry(constructor, Tuple(deepcopy(call.args[2:end])), ())
+    catch e
+        e isa Union{ArgumentError,MethodError} || rethrow()
+        return nothing
+    end
+    geometry isa ParameterGeometry || return nothing
+    geometry.shape == () && geometry.unconstrained == 1 && return nothing
+    return call, geometry
+end
+
+# Rewrite one plate's joint cell latents. Returns the model-level statements
+# before the plate, the plate, the geometry of each packed array, the cells'
+# prior sums and the statements after the plate that sum the cells.
+function _expand_cell_joint_latents(st, taken, data::Set{Symbol}, mod::Module,
+        names::Set{Symbol})
+    sites = Dict{Symbol,CellGeometry}()
+    loop = st.args[3]
+    (Meta.isexpr(loop, :for) && Meta.isexpr(loop.args[1], :(=), 2) &&
+        Meta.isexpr(loop.args[2], :block)) || return Any[], st, sites, Symbol[], Any[]
+    ivar, domain = loop.args[1].args
+    ivar isa Symbol || return Any[], st, sites, Symbol[], Any[]
+    any(c -> _is_cell_joint_candidate(c, ivar, data), loop.args[2].args) ||
+        return Any[], st, sites, Symbol[], Any[]
+    cellnames = _program_value_names!(union(names, Set([ivar])), loop)
+    fresh(base) = _cell_scan_fresh!(taken, base)
+    iterator = deepcopy(domain)
+    if Meta.isexpr(iterator, :call) && iterator.args[1] in (:eachindex, :axes)
+        iterator.args[1] = GlobalRef(Base, iterator.args[1])
+    end
+    indices = Expr(:call, GlobalRef(Base, :collect), iterator)
+    locals = Pair{Symbol,Any}[]
+    column(rhs) = _plate_column_call(ivar, _needed_cell_locals(locals, rhs), rhs,
+        nothing; indices)
+    prelude, cells, priors, post = Any[], Any[], Symbol[], Any[]
+    ref(f) = GlobalRef(@__MODULE__, f)
+    for c in loop.args[2].args
+        Meta.isexpr(c, :(=), 2) && c.args[1] isa Symbol && push!(locals, c.args[1] => c.args[2])
+        found = _is_cell_joint_candidate(c, ivar, data) ?
+            _cell_joint_geometry(c.args[3], mod, cellnames) : nothing
+        found === nothing && (push!(cells, c); continue)
+        call, g = deepcopy(found[1]), found[2]
+        name = c.args[2].args[1]
+        Meta.isexpr(domain, :call) && domain.args[1] === :levels && _sfail("cell " *
+            "latent `$name[$ivar] ~ …` with a joint geometry over `levels(…)` is " *
+            "not built yet; iterate `eachindex`, `axes` or a range")
+        prefix = Symbol(:_rkppl_latent_, name)
+        site, geometry = fresh(prefix), fresh(Symbol(prefix, :_geometry))
+        shapecells, shapes = fresh(Symbol(prefix, :_shape_cells)), fresh(Symbol(prefix, :_shapes))
+        sizecells, offsets = fresh(Symbol(prefix, :_size_cells)), fresh(Symbol(prefix, :_offsets))
+        count, pos = fresh(Symbol(prefix, :_size)), fresh(Symbol(prefix, :_cell))
+        prior, logjac = fresh(Symbol(prefix, :_prior)), fresh(Symbol(prefix, :_logjac))
+        for s in (prior, logjac)
+            Symbol(s, :_cells) in taken && _sfail("cell latent `$name`: internal " *
+                "name `$(Symbol(s, :_cells))` is already used by the model")
+            push!(taken, Symbol(s, :_cells))
+        end
+        positional = Any[a for a in call.args[2:end] if !Meta.isexpr(a, :parameters)]
+        keywords = Any[k for a in call.args[2:end] if Meta.isexpr(a, :parameters) for k in a.args]
+        for k in keywords
+            Meta.isexpr(k, :kw, 2) && k.args[1] isa Symbol || _sfail("cell latent " *
+                "`$name[$ivar] ~ …`: keyword argument $(repr(k)) is not built yet; " *
+                "write `keyword = value`")
+        end
+        # How the host reads an argument at an index: a value that reads the
+        # loop index or a cell local is a column of its per-index values.
+        cellvalue(a) = !(a isa Union{Number,QuoteNode,GlobalRef}) &&
+            !isdisjoint(_cell_free_syms!(Set{Symbol}(), a),
+                union(Set([ivar]), Set(first.(locals))))
+        function hostvalue(a, label)
+            cellvalue(a) || return :shared => a
+            col = fresh(Symbol(prefix, :_, label))
+            push!(prelude, Expr(:(=), col, column(a)))
+            return :cells => col
+        end
+        arguments = Pair{Symbol,Any}[hostvalue(a, Symbol(:arg, k)) for (k, a) in enumerate(positional)]
+        hostkeywords = Pair{Symbol,Pair{Symbol,Any}}[k.args[1] => hostvalue(k.args[2], k.args[1])
+            for k in keywords]
+        push!(prelude, Expr(:(=), geometry, Expr(:call, ref(:_ppl_cell_joint_endpoints),
+            call.args[1], Expr(:tuple, (_cell_ast_literal(a) for a in call.args[2:end])...))))
+        push!(prelude, Expr(:(=), shapecells, column(Expr(:tuple, deepcopy.(g.shape)...))))
+        push!(prelude, Expr(:(=), shapes, Expr(:call, ref(:_ppl_cell_joint_shapes),
+            QuoteNode(name), shapecells)))
+        push!(prelude, Expr(:(=), sizecells, column(deepcopy(g.unconstrained))))
+        push!(prelude, Expr(:(=), offsets, Expr(:call, ref(:_ppl_cell_joint_offsets),
+            QuoteNode(name), sizecells)))
+        push!(prelude, Expr(:(=), count, Expr(:call, ref(:_ppl_cell_latent_size), offsets)))
+        push!(prelude, Expr(:call, :.~, Expr(:ref, site, Expr(:call, :(:), 1, count)),
+            :(Flat.())))
+        endpoint(f) = _external_endpoint_call(ref(f),
+            Any[geometry, site, offsets, shapes, pos, positional...], keywords)
+        push!(cells, Expr(:(=), pos, Expr(:call, ref(:_ppl_cell_scan_position), domain, ivar)))
+        push!(locals, pos => Expr(:call, ref(:_ppl_cell_scan_position), domain, ivar))
+        push!(cells, Expr(:(=), c.args[2], endpoint(:_ppl_cell_joint_constrain)))
+        push!(cells, Expr(:(=), Expr(:ref, Symbol(prior, :_cells), ivar),
+            Expr(:call, ref(:sampling_logdensity), deepcopy(call), c.args[2])))
+        push!(cells, Expr(:(=), Expr(:ref, Symbol(logjac, :_cells), ivar),
+            endpoint(:_ppl_cell_joint_logjac)))
+        push!(priors, prior)
+        push!(post, :($prior = sum($(Symbol(prior, :_cells)))))
+        push!(post, :($logjac = sum($(Symbol(logjac, :_cells)))))
+        sites[site] = CellGeometry(name, g, shapes, offsets, arguments, hostkeywords, logjac)
+    end
+    return prelude, Expr(st.head, st.args[1:2]...,
+        Expr(:for, loop.args[1], Expr(:block, cells...))), sites, priors, post
+end
 
 # --- Values the rewritten program computes -------------------------------
 
@@ -479,6 +646,73 @@ function _ppl_cell_latent_flatten(cells::AbstractVector)
     return out
 end
 
+# The authored argument expressions, rebuilt as a value a definition holds.
+# A resolved binding stays a quoted `GlobalRef`: definitions hold no modules.
+_cell_ast_literal(x) = x
+_cell_ast_literal(x::Symbol) = QuoteNode(x)
+_cell_ast_literal(x::GlobalRef) = QuoteNode(x)
+_cell_ast_literal(x::QuoteNode) = Expr(:call, GlobalRef(Core, :QuoteNode), _cell_ast_literal(x.value))
+_cell_ast_literal(x::Expr) = Expr(:call, GlobalRef(Core, :Expr), QuoteNode(x.head),
+    (_cell_ast_literal(a) for a in x.args)...)
+
+# The geometry's `constrain` and `logjac` endpoints, the only parts the cells
+# call: its shape expressions are evaluated at binding instead, and as AST
+# they would make the folded constant mutable to Enzyme.
+function _ppl_cell_joint_endpoints(constructor, arguments::Tuple)
+    g = sampling_geometry(constructor, arguments, ())
+    g isa ParameterGeometry || throw(ArgumentError(
+        "sampling_geometry for $constructor must return ParameterGeometry"))
+    return (g.constrain, g.logjac)
+end
+
+_ppl_cell_joint_extent(n) = n isa Integer && !(n isa Bool) && n >= 0
+
+# Each index's constrained shape, from the joint geometry's extents there.
+function _ppl_cell_joint_shapes(name::Symbol, cells::AbstractVector)
+    for (k, extents) in enumerate(cells)
+        extents isa Tuple && all(_ppl_cell_joint_extent, extents) || throw(ArgumentError(
+            "cell latent `$name`: its geometry's shape at index $k must be a tuple " *
+            "of nonnegative integers, got $(repr(extents))"))
+    end
+    return _ppl_cell_latent_shapes(name, [map(Int, extents) for extents in cells])
+end
+
+# Each index's packed block is `(offsets[k] + 1):offsets[k + 1]`.
+function _ppl_cell_joint_offsets(name::Symbol, sizes::AbstractVector)
+    offsets = Vector{Int}(undef, length(sizes) + 1)
+    offsets[1] = 0
+    for (k, n) in enumerate(sizes)
+        _ppl_cell_joint_extent(n) || throw(ArgumentError("cell latent `$name`: its " *
+            "geometry's packed dimension at index $k must be a nonnegative integer, " *
+            "got $(repr(n))"))
+        offsets[k + 1] = offsets[k] + n
+    end
+    return offsets
+end
+
+_ppl_cell_joint_block(site, offsets, pos::Int) =
+    view(site, (offsets[pos] + 1):offsets[pos + 1])
+
+# A cell's constrained value of its joint latent: the geometry's `constrain`
+# on its packed block, read in place, with the cell's argument values.
+function _ppl_cell_joint_constrain(endpoints::Tuple, site, offsets, shapes,
+        pos::Int, args...; kwargs...)
+    shape = shapes[pos]
+    value = first(endpoints)(_ppl_cell_joint_block(site, offsets, pos), shape, args...; kwargs...)
+    _ppl_cell_joint_check(value, shape, pos)
+    return value
+end
+_ppl_cell_joint_logjac(endpoints::Tuple, site, offsets, shapes, pos::Int,
+        args...; kwargs...) =
+    last(endpoints)(_ppl_cell_joint_block(site, offsets, pos), shapes[pos], args...; kwargs...)
+
+function _ppl_cell_joint_check(value, shape::Tuple, pos::Int)
+    (isempty(shape) ? value isa Number : value isa AbstractArray && size(value) == shape) ||
+        throw(ArgumentError("a cell latent's geometry constrained index $pos to " *
+            "$(summary(value)); its shape there is $shape"))
+    return nothing
+end
+
 # A cell's block of the packed array: a number, a vector, or an array of
 # its dimensions. The packed values are read in place.
 _ppl_cell_latent_block(site, offsets, dims::AbstractVector{<:Tuple}, pos::Int) =
@@ -528,6 +762,90 @@ function _cell_latent_coordinates(layout, site::Symbol)
             for j in CartesianIndices(d)
                 push!(names, Symbol(shown, ".", k, ".", join(Tuple(j), ".")))
             end
+        end
+    end
+    return names
+end
+
+# --- Draws of a joint cell latent: its geometry at each index -------------
+
+# Each index's shape and packed block, and a reader of the arguments the
+# geometry's endpoints take there. `values` holds the constrained values of
+# the other parameters, which the arguments may read.
+function _cell_geometry_frame(layout, site::Symbol, values)
+    g = layout.cell_geometries[site]
+    lookup = _layout_lookup(layout, values)
+    shapes, offsets = lookup(g.shapes), lookup(g.offsets)
+    read((kind, v)) = kind === :cells ? lookup(v) : _eval_value_expr(v, lookup, g.name)
+    args = map(read, g.arguments)
+    keywords = map(k -> first(k) => read(last(k)), g.keywords)
+    at(k) = (Tuple(kind === :cells ? x[k] : x for ((kind, _), x) in zip(g.arguments, args)),
+        (; (first(kw) => (first(last(kw)) === :cells ? last(v)[k] : last(v))
+            for (kw, v) in zip(g.keywords, keywords))...))
+    return g, shapes, offsets, at
+end
+
+function _cell_geometry_constrain(layout, site::Symbol, seg::AbstractVector, values)
+    g, shapes, offsets, at = _cell_geometry_frame(layout, site, values)
+    last(offsets) == length(seg) || throw(ContractValidationError(
+        "[layout] cell latent $(g.name) packs $(last(offsets)) coordinates, got $(length(seg))"))
+    out = Any[]
+    for k in eachindex(shapes)
+        args, kwargs = at(k)
+        v = g.geometry.constrain(_ppl_cell_joint_block(seg, offsets, k), shapes[k], args...; kwargs...)
+        _ppl_cell_joint_check(v, shapes[k], k)
+        push!(out, v)
+    end
+    return isempty(out) ? out : [x for x in out]
+end
+
+function _cell_geometry_unconstrain(layout, site::Symbol, value, values)
+    g, shapes, offsets, at = _cell_geometry_frame(layout, site, values)
+    value isa AbstractVector && length(value) == length(shapes) || throw(
+        ContractValidationError("[layout] cell latent $(g.name) needs one value per " *
+            "index ($(length(shapes)))"))
+    u = Vector{_host_value_type(value)}(undef, last(offsets))
+    for k in eachindex(shapes)
+        _ppl_cell_joint_check(value[k], shapes[k], k)
+        args, kwargs = at(k)
+        block = g.geometry.unconstrain(value[k], shapes[k], args...; kwargs...)
+        n = offsets[k + 1] - offsets[k]
+        block isa AbstractVector && length(block) == n || throw(ContractValidationError(
+            "[layout] cell latent $(g.name)[$k]: its geometry's inverse returned " *
+            "$(summary(block)), want $n packed coordinates"))
+        u[(offsets[k] + 1):offsets[k + 1]] .= block
+    end
+    return u
+end
+
+function _cell_geometry_logjac(layout, site::Symbol, seg::AbstractVector, values)
+    g, shapes, offsets, at = _cell_geometry_frame(layout, site, values)
+    total = zero(_host_eltype(seg))
+    for k in eachindex(shapes)
+        args, kwargs = at(k)
+        total += g.geometry.logjac(_ppl_cell_joint_block(seg, offsets, k), shapes[k],
+            args...; kwargs...)
+    end
+    return total
+end
+
+# `c.k.j` for packed coordinate `j` of index `k`, or `c.k.<label>` with the
+# geometry's coordinate names.
+function _cell_geometry_coordinates(layout, site::Symbol)
+    g = layout.cell_geometries[site]
+    lookup = _layout_lookup(layout, Dict{Symbol,Any}())
+    offsets = lookup(g.offsets)
+    shown = _draw_name(layout, site)
+    labels = g.geometry.coordinate_names
+    names = Symbol[]
+    for k in 1:(length(offsets) - 1)
+        n = offsets[k + 1] - offsets[k]
+        if labels === nothing
+            append!(names, (Symbol(shown, ".", k, ".", j) for j in 1:n))
+        else
+            length(labels) == n || throw(ContractValidationError("[layout] cell latent " *
+                "$(g.name)[$k]: its geometry names $(length(labels)) coordinates, it packs $n"))
+            append!(names, (Symbol(shown, ".", k, ".", label) for label in labels))
         end
     end
     return names

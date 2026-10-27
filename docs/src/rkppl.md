@@ -371,9 +371,11 @@ support metadata, constrain, inverse and log absolute Jacobian. Shape and
 packed dimension may differ: a two-component simplex can pack one coordinate.
 Declare constrained array dimensions on the LHS, for example `p[1:2] ~ D()`;
 dimensions and packed extents may depend on bound data, never sampled values.
-Optional `coordinate_names` names every packed coordinate. A scalar `@plate`
-cell uses scalar geometry with one packed coordinate. The density and inverse
-must enforce the declared support; metadata alone adds no support check.
+Optional `coordinate_names` names every packed coordinate. In a `@plate` cell,
+`b[i] ~ D(…)` with scalar geometry and one packed coordinate is one number per
+index; any other geometry makes it a joint latent per index (see "One joint
+latent per index"). The density and inverse must enforce the declared support;
+metadata alone adds no support check.
 
 An external frontend can supply a submodel without defining it through
 `@rkppl`: extend `sampling_fragment(binding)` to return a stable
@@ -1097,6 +1099,62 @@ every index give one scalar per index, exactly as `v[i] ~ D(…)`. Dimensions
 that differ by index are valid but make the cells type unstable, so binding
 warns. Not built yet: an argument whose shape a call of sampled values
 decides, and such latents over `levels(…)`.
+
+### One joint latent per index
+
+An undotted latent in a cell, `c[i] ~ F(args…)`, whose caller-owned `F` has a
+geometry other than one scalar coordinate, holds at each index one draw of
+`F(args…)` there: a value of the geometry's shape, under one density of the
+whole value. Its length may follow from the index's data. For example, a
+vector per sector sampled in total coordinates (its first coordinate is the
+log of the sum of `exp.(eta)`), so an observed total pins one coordinate:
+
+```julia
+struct TotalCoordinates{L,S}
+    loc::L
+    scale::S
+end
+ReactiveKernelsPPL.sampling_logdensity(d::TotalCoordinates, eta) =
+    sum(logpdf.(Normal.(d.loc, d.scale), eta))
+ReactiveKernelsPPL.sampling_geometry(::Type{TotalCoordinates}, args, shape) =
+    ParameterGeometry((:(length($(args[1]))),), :(length($(args[1]))); support = :real,
+        constrain = (u, shape, args...) -> total_values(u),        # (a, y) -> eta
+        unconstrain = (eta, shape, args...) -> total_coordinates(eta),
+        logjac = (u, shape, args...) -> log(length(u)) / 2)
+# Inside a model:
+@plate for i in eachindex(total)
+    eta[i] ~ TotalCoordinates(log.(mu[i]), 0.5)    # length(mu[i]) values
+    total[i] ~ Normal(sum(exp.(eta[i])), 0.002 * total[i])
+end
+```
+
+In a cell, `sampling_geometry` receives the declared shape `()`: return the
+shape and packed dimension as data-only expressions of the authored argument
+expressions (`length(loc)`, `m[i]`, a literal), which binding evaluates at every
+index. Each index packs its own coordinates, in plate order; the cell
+constrains them with the geometry's `constrain`, and adds the density of
+`F(args…)` at that value to `prior` and the geometry's `logjac` to
+`log_jacobian`. The endpoints receive the index's argument values, sampled
+parents and keywords included, and its packed block as an `AbstractVector`
+read in place. Outside the plate, `c` holds one value per index.
+`coordinate_names` reads `c.1.1 … c.2.3` (index, then packed coordinate, or
+the geometry's `coordinate_names`), `constrain` returns one constrained value
+per index, and `unconstrain` and `restore_draws` take and give that shape. A
+dotted latent of the same cell may read `c[i]`, which has the geometry's shape
+there. A geometry whose shape reads a sampled value is refused at binding.
+Native values and ordinary Enzyme Reverse gradients are supported. Not built
+yet: such latents over `levels(…)`, and predictive draws, `jax_source` and
+compiled execution of them.
+
+Two properties of the law keep its density differentiable by native Enzyme
+Reverse. Pass a distribution family as a type parameter, not a field: with
+`struct L{F,…}; family::F; …` holding `Normal` (a `UnionAll`), the density
+is not concretely typed, preparation warns, and the gradient fails. And a law
+holding data beside a sampled value (`TotalCoordinates(log.(mu[i]), s)`, with
+`s` sampled) fails Enzyme's static activity analysis when its
+`sampling_logdensity` is not inlined (see [Core constraints](constraints.md)):
+mark that method `@inline`, or prepare with
+`AutoEnzyme(mode = Enzyme.set_runtime_activity(Enzyme.Reverse))`.
 
 ## Submodels
 

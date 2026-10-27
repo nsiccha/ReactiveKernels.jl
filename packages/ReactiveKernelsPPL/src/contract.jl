@@ -980,6 +980,27 @@ Base.isequal(a::FrozenValues, b::FrozenValues) =
 Base.hash(f::FrozenValues, h::UInt) = hash(f.inputs, hash(f.values, hash(FrozenValues, h)))
 
 """
+    CellGeometry
+
+The caller-owned geometry of an undotted `@plate` cell latent `c[i] ~ F(args…)`
+(`cell_latent.jl`): the authored name, the `ParameterGeometry` that
+`sampling_geometry(F, args, ())` returned at lowering, the definitions holding
+each index's constrained shape and packed block bounds, how the host reads each
+argument at an index (`:cells => column` for a per-index value, `:shared =>
+expression` otherwise; keywords likewise), and the graph value summing the
+cells' log-Jacobians.
+"""
+struct CellGeometry
+    name::Symbol
+    geometry::Any
+    shapes::Symbol
+    offsets::Symbol
+    arguments::Vector{Pair{Symbol,Any}}
+    keywords::Vector{Pair{Symbol,Pair{Symbol,Any}}}
+    logjac::Symbol
+end
+
+"""
     StructuralPlan(responses, predictors, population_priors, parameters,
                    assignments, derived, columns, n_obs)
 
@@ -1014,6 +1035,10 @@ array parameters.
 latent (`v[i] .~ D.(…)` over arrays) to its authored name and the data-only
 definition holding each index's dimensions; draws show it as one array per
 index under that name.
+`cell_geometries` maps the packed array parameter of each undotted `@plate`
+cell latent with a caller-owned joint geometry (`c[i] ~ F(…)`) to its
+[`CellGeometry`](@ref ReactiveKernelsPPL.CellGeometry); draws show it as one
+constrained value per index under the authored name.
 """
 struct StructuralPlan
     responses::Vector{LikelihoodSpec}
@@ -1044,7 +1069,23 @@ struct StructuralPlan
     frozen::FrozenValues
     # Packed array of each dotted cell latent => (authored name, dimensions).
     cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}
+    # Packed array of each joint cell latent => its caller-owned geometry.
+    cell_geometries::Dict{Symbol,CellGeometry}
 end
+
+# Plans authored before joint cell latents carry none.
+StructuralPlan(responses, predictors, population_priors, parameters,
+    assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+    scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+    conditioned, indexed_observations, external_observations,
+    cell_broadcasts, named_values, factors, cell_priors, frozen::FrozenValues,
+    cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}}) =
+    StructuralPlan(responses, predictors, population_priors, parameters,
+        assignments, derived, columns, n_obs, roles, levelmaps, plate_parameters,
+        scans, vector_parameters, matrices, array_parameters, submodel_scopes,
+        conditioned, indexed_observations, external_observations,
+        cell_broadcasts, named_values, factors, cell_priors, frozen, cell_latents,
+        Dict{Symbol,CellGeometry}())
 
 # Plans authored before dotted cell latents over arrays carry none.
 StructuralPlan(responses, predictors, population_priors, parameters,
@@ -1241,14 +1282,15 @@ function StructuralPlan(
         cell_priors::Vector{Symbol} = Symbol[],
         frozen::FrozenValues = FrozenValues(),
         cell_latents::Dict{Symbol,Tuple{Symbol,Symbol}} =
-            Dict{Symbol,Tuple{Symbol,Symbol}}())
+            Dict{Symbol,Tuple{Symbol,Symbol}}(),
+        cell_geometries::Dict{Symbol,CellGeometry} = Dict{Symbol,CellGeometry}())
     return StructuralPlan(responses, predictors, population_priors,
         parameters, assignments, derived, _checked_columns(columns), n_obs,
         roles, levelmaps, plate_parameters, scans,
         vector_parameters, matrices,
         array_parameters, submodel_scopes, conditioned, indexed_observations,
         external_observations, cell_broadcasts, named_values, factors, cell_priors,
-        frozen, cell_latents)
+        frozen, cell_latents, cell_geometries)
 end
 
 # Every definition of `plan`: its assignments, then its per-observation
@@ -1665,8 +1707,8 @@ end
 
 """Plan slots whose dimensions resolve from their authored inputs or uses.
 New slots must establish the same property before joining this list.
-`named_values`, `cell_priors` and `cell_latents` only name existing nodes,
-so they have their dimensions.
+`named_values`, `cell_priors`, `cell_latents` and `cell_geometries` only name
+existing nodes, so they have their dimensions.
 Scalar density `factors` read their definitions and arguments, never an
 observation count, and contribute once irrespective of response axes."""
 const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
@@ -1676,7 +1718,7 @@ const _MULTI_AXIS_SLOTS = (:responses, :predictors, :population_priors,
     :matrices,
     :array_parameters, :indexed_observations, :external_observations,
     :cell_broadcasts, :named_values, :factors, :cell_priors, :frozen,
-    :cell_latents)
+    :cell_latents, :cell_geometries)
 
 # Observation-shaped values and their data dependencies. Parameters sized
 # by levels or coefficient width are shared values, so their priors do not
@@ -3997,6 +4039,16 @@ function _validate_factors(plan::StructuralPlan)
             "a dotted cell latent's coordinates must be an array parameter")
         (dims in _defined_names(plan) || haskey(plan.columns, dims)) || _fail(name,
             "a dotted cell latent's dimensions must be a definition")
+    end
+    for (site, g) in plan.cell_geometries
+        site in arrays || _fail(g.name,
+            "a joint cell latent's coordinates must be an array parameter")
+        for d in (g.shapes, g.offsets)
+            (d in _defined_names(plan) || haskey(plan.columns, d)) || _fail(g.name,
+                "a joint cell latent's shapes and offsets must be definitions")
+        end
+        g.logjac in scalar_definitions || _fail(g.name,
+            "a joint cell latent's log-Jacobian must be a scalar graph assignment")
     end
     return nothing
 end
