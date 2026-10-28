@@ -1462,10 +1462,13 @@ const TERM_NAMES = Dict{Symbol,TermKind}(
 
 """Allowlisted assignment functions (slice 1: scalar ops + whole-column
 reductions; elementwise math over columns deferred with vector assignments;
-the AR(1) slice adds `tanh` for the `phi = tanh(phi_raw)` stationarity map)."""
+the AR(1) slice adds `tanh` for the `phi = tanh(phi_raw)` stationarity map).
+`logistic` is the inverse logit, the same function its dotted form
+broadcasts (`_ppl_logistic`)."""
 const ASSIGNMENT_FNS = (
     :+, :-, :*, :/, :^,
     :log, :log10, :log1p, :exp, :expm1, :sqrt, :abs, :tanh, :logaddexp,
+    :logistic,
     :sum, :mean, :std, :var, :minimum, :maximum, :length,
 )
 

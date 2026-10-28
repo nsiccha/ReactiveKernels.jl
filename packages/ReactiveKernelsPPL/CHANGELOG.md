@@ -16,6 +16,35 @@ older ReactiveKernelsPPL commit is then refused when it resolves, with
 of failing or silently behaving differently at run time. Changes before 0.1.1
 are recorded in the git history only.
 
+## 0.1.2
+
+- `logistic` is a scalar value function, as `exp` is. Undotted over a scalar,
+  `logistic(x)` is the inverse logit, the same function `logistic.` broadcasts
+  (`exp(-log1pexp(-x))`, with finite derivatives at any argument): in a
+  definition (`p = logistic(logit_p)`, `e = logistic(z) .* exp.(r)`), a prior
+  argument, a distribution argument (`Binomial.(n, logistic(a))`), a
+  data-only definition, a plate cell, and a `@scan` seed or step.
+  `admitted_functions()` lists it. Before, lowering refused it as a value
+  (``calls `logistic`, which only lowers in `.~` responses, not as a value``),
+  and a `@scan` body read it as the logistic distribution kernel
+  (``kernel object :location_scale has 0 unbound kernel port(s)``).
+- A count response's rate or mean is any value, inline as its named
+  definition: `Poisson.(logistic(a) .* x)`, `Poisson.(.*(0.25, logistic(a),
+  exp.(b .* x) .* p))`, `Poisson.(e[g])`, `NegativeBinomial2.(exp.(d) .* (u .+
+  v), phi)`, a dotted function that is not a link (`Poisson.(abs.(eta) .+
+  0.1)`), and a mixture component's rate. This covers `Poisson`,
+  `NegativeBinomial2`, `NegativeBinomial`, `HurdlePoisson`,
+  `ZeroInflatedPoisson`, `InverseGaussian`, `Exponential`, `BetaBinomial2` and
+  `ZeroInflatedBinomial`. Before, those slots took only a name or a dotted
+  inverse link (``broadcast the link (`exp.(eta)` …)``), while
+  `rate = logistic(a) .* x; Poisson.(rate)` lowered.
+- **Breaking:** an undotted inverse link over a vector in a link slot
+  (`Bernoulli.(exp(eta))`, `Binomial.(n, normcdf(eta))`) fails at lowering with
+  the dotted spelling, as Julia's `MethodError` and the same call in a
+  definition do. A Bernoulli or Binomial probability read it as the dotted
+  link; write `exp.(eta)`. Over a scalar it is the dotted link's value
+  (`Poisson.(exp(a))`).
+
 ## 0.1.1
 
 - A `@plate` output whose cells are vectors is one vector per cell at model
