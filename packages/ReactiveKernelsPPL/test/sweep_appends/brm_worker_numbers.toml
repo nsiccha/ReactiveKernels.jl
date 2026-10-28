@@ -1,0 +1,15 @@
+# machine-written by test/rk_append_worker.jl — case fixture-gauss
+[[probe]]
+posterior = -15.886646898631646
+grad = "PASS"
+grad_maxdiff = 5.164917382671774e-10
+sb_value = -15.886646898631646
+sb_grad_maxdiff = 2.6645352591003757e-15
+sb_fd_maxdiff = 1.4376186907583133e-9
+[pins]
+BridgeStan = "v2.9.0"
+ReactiveKernels = "e32d442c629af3889865a3611bef131cb91d2a0a"
+ReactiveKernelsPPL = "e32d442c629af3889865a3611bef131cb91d2a0a"
+StanBlocks = "ffbaff097bbbe2f5c7b8153d6033ce9b0387c248"
+brm = "cf016d61bf43b6c05890df881087bb350832fba7"
+julia = "1.10.12"

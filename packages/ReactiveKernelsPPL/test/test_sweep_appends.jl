@@ -481,6 +481,8 @@ end
         sb_want = -100.0 - (-100.0 + 1.0e-12)
         @test pr.sb_delta == sb_want
         @test abs(pr.sb_delta) < 1.0e-11
+        @test pr.sb_grad_maxdiff == 2.0e-12
+        @test pr.sb_fd_maxdiff == 3.0e-8
         # Closeout file: header + spliced worker sections + re-sweep.
         md = read(joinpath(dir, "out", "stubdemo.md"), String)
         @test occursin("# Closeout: stubdemo", md)
@@ -491,6 +493,8 @@ end
         @test occursin("## Layer SB (stub)", md)
         @test occursin("## Re-sweep verdict", md)
         @test occursin("Δ = 0.0 MATCH", md)
+        @test occursin("SB gradient max|Δ| vs RK 2.0e-12; " *
+            "SB gradient max|Δ| vs central differences 3.0e-8; VERIFY_OK", md)
         @test occursin("case verdict: VERIFY_OK", md)
         # Worker artifact copied opaque; worker log captured; spec recorded.
         @test read(joinpath(dir, "out", "stubdemo.jls"), String) ==
@@ -510,9 +514,42 @@ end
         @test index["case"][1]["worker_pins"] == Dict("worker" => "stub")
         @test index["case"][1]["probe"][1]["posterior"] == -100.0
         @test index["case"][1]["probe"][1]["sb_delta"] == sb_want
+        @test index["case"][1]["probe"][1]["sb_grad_maxdiff"] == 2.0e-12
+        @test index["case"][1]["probe"][1]["sb_fd_maxdiff"] == 3.0e-8
         tab = read(joinpath(dir, "out", "verdict-table.md"), String)
         @test occursin("| stubdemo | 1 | brm-probe | -100.0 | -100.0 | 0.0 " *
             "| PASS | $(repr(sb_want)) | VERIFY_OK |", tab)
+    end
+end
+
+# brm_worker_numbers.toml is the numbers.toml the real BRM worker
+# (test/rk_append_worker.jl at BRM cf016d61, RK e32d442c6, StanBlocks
+# ffbaff09, BridgeStan 2.9.0) wrote for its fixture-gauss case, verbatim.
+@testset "sweep brm-probe reads a real BRM worker's numbers.toml" begin
+    mktempdir() do dir
+        numbers = joinpath(_SWEEP_FIXDIR, "brm_worker_numbers.toml")
+        mani = _write_brm_manifest(dir; id = "fixture-gauss",
+            u_probes = "[[0.1, 0.5, -0.25]]", expected = "[-15.886646898631646]",
+            extra_worker_args = ["--numbers-from", numbers])
+        res = sweep_appends(mani, joinpath(dir, "out"))
+        @test res.ok
+        r = only(res.results)
+        @test r.verdict == "VERIFY_OK"
+        pr = only(r.probes)
+        @test pr.posterior == -15.886646898631646
+        @test pr.delta == 0.0
+        @test pr.grad == "PASS"
+        @test pr.grad_maxdiff == 5.164917382671774e-10
+        @test pr.sb_delta == 0.0
+        @test pr.sb_grad_maxdiff == 2.6645352591003757e-15
+        @test pr.sb_fd_maxdiff == 1.4376186907583133e-9
+        md = read(joinpath(dir, "out", "fixture-gauss.md"), String)
+        @test occursin("SB gradient max|Δ| vs central differences " *
+            "1.4376186907583133e-9", md)
+        index = TOML.parsefile(joinpath(dir, "out", "manifest.toml"))
+        c = only(index["case"])
+        @test c["probe"][1]["sb_fd_maxdiff"] == 1.4376186907583133e-9
+        @test c["worker_pins"]["brm"] == "cf016d61bf43b6c05890df881087bb350832fba7"
     end
 end
 
@@ -585,7 +622,11 @@ end
             read(joinpath(dir, "out", "stubdemo.worker.log"), String))
         # Malformed numbers.
         for (kind, needle) in (("missing-key", "missing \"grad\""),
-                ("bad-grad", "must be one of"), ("count", "returned 2 probe(s)"))
+                ("bad-grad", "must be one of"), ("count", "returned 2 probe(s)"),
+                ("unknown-key", "unknown key \"sb_new_check\" (the driver reads " *
+                    "posterior, grad, grad_maxdiff, sb_value, sb_grad_maxdiff, " *
+                    "sb_fd_maxdiff, oracle)"),
+                ("bad-maxdiff", "sb_fd_maxdiff must be a number"))
             m = _write_brm_manifest(dir;
                 extra_worker_args = ["--bad-numbers", kind])
             out = joinpath(dir, "out-$kind")

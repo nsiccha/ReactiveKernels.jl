@@ -63,10 +63,18 @@
 # `sections.md` (rendered Layer 1/2/3, Boundary, Layer 4, Verification,
 # Layer SB — spliced verbatim under the closeout header), `numbers.toml`
 # (`[[probe]]` parallel to the expanded probes: `posterior` (required),
-# `grad` in PASS|FAIL|not run (required), `grad_maxdiff?`, `sb_value?`,
-# `sb_grad_maxdiff?`, `oracle?`; optional `[pins]` String table), and
-# `artifact.jls` (v2, opaque). Missing outputs, bad numbers, a probe-count
-# mismatch, or a nonzero exit become an ERROR row (never a silent skip).
+# `grad` in PASS|FAIL|not run (required), `grad_maxdiff?` (RK AD gradient
+# vs central differences), `sb_value?`, `sb_grad_maxdiff?` (Stan AD
+# gradient vs RK's), `sb_fd_maxdiff?` (Stan AD gradient vs central
+# differences of the same Stan model), `oracle?` (the worker's
+# `[probe.oracle]` table, rendered by the worker's own Layer SB and not
+# read here); optional `[pins]` String table), and `artifact.jls` (v2,
+# opaque). The SB Δ (`posterior - sb_value`) and the two SB maxdiffs go to
+# the re-sweep block and the index, `grad_maxdiff` to the index. Any other
+# probe key, missing outputs, bad numbers, a probe-count mismatch, or a
+# nonzero exit become an ERROR row (never a silent skip): a key the worker
+# starts emitting is added here, together with the stub worker
+# (test/sweep_appends/stub_worker.jl).
 #
 # Token gating (coordinator supplemental ruling on 1womb1l): at fusion the
 # DRIVER wraps worker invocations with `kb-acquire-compute-token` and passes
@@ -102,6 +110,8 @@ const _SWEEP_VERSION = 1
 const _SWEEP_ID_RE = r"^[A-Za-z0-9][A-Za-z0-9_.-]*(/[A-Za-z0-9][A-Za-z0-9_.-]*)*$"
 const _SWEEP_REF_RE = r"^\S+$"
 const _SWEEP_GRADS = ("PASS", "FAIL", "not run")
+const _SWEEP_PROBE_KEYS = ("posterior", "grad", "grad_maxdiff", "sb_value",
+    "sb_grad_maxdiff", "sb_fd_maxdiff", "oracle")
 
 # ---------------------------------------------------------------- manifest
 
@@ -308,6 +318,8 @@ struct SweepProbeResult
     grad::String
     grad_maxdiff::Union{Nothing,Float64}
     sb_delta::Union{Nothing,Float64}
+    sb_grad_maxdiff::Union{Nothing,Float64}
+    sb_fd_maxdiff::Union{Nothing,Float64}
     verdict::String
 end
 
@@ -366,6 +378,17 @@ _show_sweep_expected(x::Float64) = repr(x)
 _show_sweep_opt(::Nothing) = "—"
 _show_sweep_opt(x::Float64) = repr(x)
 
+# Only worker probes carry SB gradient checks; surface lines stay as before.
+function _resweep_sb_grads(pr::SweepProbeResult)
+    s = ""
+    pr.sb_grad_maxdiff !== nothing &&
+        (s *= "SB gradient max|Δ| vs RK $(repr(pr.sb_grad_maxdiff)); ")
+    pr.sb_fd_maxdiff !== nothing &&
+        (s *= "SB gradient max|Δ| vs central differences " *
+            "$(repr(pr.sb_fd_maxdiff)); ")
+    return s
+end
+
 function _resweep_block(probes, verdict)
     lines = ["## Re-sweep verdict", "", "- probes: $(length(probes))"]
     for (i, pr) in enumerate(probes)
@@ -375,7 +398,7 @@ function _resweep_block(probes, verdict)
             "`posterior(u) = $(repr(pr.posterior))`; expected " *
             "$(_show_sweep_expected(pr.expected)) ($expbit); " *
             "gradient $(pr.grad); SB Δ $(_show_sweep_opt(pr.sb_delta)); " *
-            "$(pr.verdict)")
+            _resweep_sb_grads(pr) * "$(pr.verdict)")
     end
     push!(lines, "- case verdict: $verdict")
     push!(lines, "")
@@ -424,7 +447,7 @@ function _run_surface_case(c::SweepCase, mani::SweepManifest, out_dir;
         push!(probes, SweepProbeResult(repr(pr.u), pr.val, exp,
             exp === nothing ? NaN : pr.val - exp,
             pr.grad_ok === nothing ? "not run" : pr.grad_ok ? "PASS" : "FAIL",
-            pr.grad_maxdiff, nothing,
+            pr.grad_maxdiff, nothing, nothing, nothing,
             _probe_verdict(pr.val, exp,
                 pr.grad_ok === nothing ? "not run" :
                     pr.grad_ok ? "PASS" : "FAIL")))
@@ -498,6 +521,13 @@ end
 
 _worker_case_error(id, what) = ErrorException("worker case \"$id\": $what")
 
+function _worker_maxdiff(p, k, id, i)
+    haskey(p, k) || return nothing
+    p[k] isa Real ||
+        throw(_worker_case_error(id, "probe $i $k must be a number"))
+    return Float64(p[k])
+end
+
 function _read_worker_numbers(case_out, c::SweepCase)
     sec_path = joinpath(case_out, "sections.md")
     isfile(sec_path) ||
@@ -546,9 +576,9 @@ function _read_worker_numbers(case_out, c::SweepCase)
         p isa AbstractDict ||
             throw(_worker_case_error(c.id, "probe $i must be a table"))
         for k in keys(p)
-            k in ("posterior", "grad", "grad_maxdiff", "sb_value",
-                "sb_grad_maxdiff", "oracle") ||
-                throw(_worker_case_error(c.id, "probe $i has unknown key \"$k\""))
+            k in _SWEEP_PROBE_KEYS ||
+                throw(_worker_case_error(c.id, "probe $i has unknown key " *
+                    "\"$k\" (the driver reads $(join(_SWEEP_PROBE_KEYS, ", ")))"))
         end
         for k in ("posterior", "grad")
             haskey(p, k) || throw(_worker_case_error(c.id,
@@ -562,9 +592,9 @@ function _read_worker_numbers(case_out, c::SweepCase)
         grad in _SWEEP_GRADS ||
             throw(_worker_case_error(c.id, "probe $i grad must be one of " *
                 "$(_SWEEP_GRADS), got $(repr(grad))"))
-        gmd = haskey(p, "grad_maxdiff") ? Float64(p["grad_maxdiff"]) : nothing
-        gmd !== nothing && !(p["grad_maxdiff"] isa Real) &&
-            throw(_worker_case_error(c.id, "probe $i grad_maxdiff must be a number"))
+        gmd = _worker_maxdiff(p, "grad_maxdiff", c.id, i)
+        sb_gmd = _worker_maxdiff(p, "sb_grad_maxdiff", c.id, i)
+        sb_fmd = _worker_maxdiff(p, "sb_fd_maxdiff", c.id, i)
         sb = nothing
         if haskey(p, "sb_value")
             p["sb_value"] isa Real && isfinite(Float64(p["sb_value"])) ||
@@ -575,7 +605,7 @@ function _read_worker_numbers(case_out, c::SweepCase)
         ushow = c.uprobes === nothing ? "origin (worker-expanded)" : repr(c.uprobes[i])
         push!(probes, SweepProbeResult(ushow, val, exp,
             exp === nothing ? NaN : val - exp, String(grad), gmd, sb,
-            _probe_verdict(val, exp, String(grad))))
+            sb_gmd, sb_fmd, _probe_verdict(val, exp, String(grad))))
     end
     return read(sec_path, String), probes, art_path, wpins
 end
@@ -617,6 +647,8 @@ function _probe_index_dict(pr::SweepProbeResult)
         d["delta"] = pr.delta)
     pr.grad_maxdiff !== nothing && (d["grad_maxdiff"] = pr.grad_maxdiff)
     pr.sb_delta !== nothing && (d["sb_delta"] = pr.sb_delta)
+    pr.sb_grad_maxdiff !== nothing && (d["sb_grad_maxdiff"] = pr.sb_grad_maxdiff)
+    pr.sb_fd_maxdiff !== nothing && (d["sb_fd_maxdiff"] = pr.sb_fd_maxdiff)
     return d
 end
 
