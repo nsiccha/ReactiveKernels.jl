@@ -4112,15 +4112,13 @@ Base.@nospecializeinfer function _kernel_shared_closure(@nospecialize(f), source
     _kernel_new_instance(S, Tuple(Any[getfield(f, i) for i in 1:fieldcount(T)]))
 end
 
-# Whether `names` resolve to the same bindings in both modules.
+# Whether `names` denote the same values in both modules. `names` holds every
+# name the source mentions, its own parameters and locals too, so reading them
+# must bind none (`_global_value`).
 function _kernel_same_scope(a::Module, b::Module, names::Set{Symbol})
     a === b && return true
     for name in names
-        defined = Base.invokelatest(isdefined, a, name)
-        defined == Base.invokelatest(isdefined, b, name) || return false
-        defined || continue
-        Base.invokelatest(getglobal, a, name) === Base.invokelatest(getglobal, b, name) ||
-            return false
+        _global_value(a, name) === _global_value(b, name) || return false
     end
     true
 end
@@ -5555,8 +5553,9 @@ _kernel_scope_origin(mod::Module) =
 function _kernel_scope_aliases(mod::Module, names::Set{Symbol})
     aliases = Any[]
     for name in names
-        isdefined(mod, name) &&
-            push!(aliases, Expr(:const, Expr(:(=), name, QuoteNode(getglobal(mod, name)))))
+        value = _global_value(mod, name)
+        value === nothing ||
+            push!(aliases, Expr(:const, Expr(:(=), name, QuoteNode(something(value)))))
     end
     aliases
 end
