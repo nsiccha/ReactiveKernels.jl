@@ -164,6 +164,38 @@ end
     end
 end
 
+@testset "sweep surface case binds a matrix column" begin
+    # Model, data and probe from test_report.jl (included first); its
+    # testset checks the value against a vector-column twin.
+    expected = _report_posterior(transpile_report(_REPORT_MATRIX_SURFACE,
+        _report_matrix_data(); u = _REPORT_MATRIX_U))
+    mktempdir() do dir
+        model = joinpath(dir, "matrix.jl")
+        data = joinpath(dir, "matrix_data.jl")
+        write(model, _REPORT_MATRIX_SURFACE)
+        write(data, "DATA = $(repr(_report_matrix_data()))\n")
+        mani = joinpath(dir, "mani.toml")
+        write(mani, """
+            [[case]]
+            id = "matrix"
+            kind = "surface"
+            surface = $(_toml_str(model))
+            data = $(_toml_str(data))
+            u_probes = [$(repr(_REPORT_MATRIX_U))]
+            expected = [$(repr(expected))]
+            """)
+        res = sweep_appends(mani, joinpath(dir, "out"); backend = _GEN_BACKEND)
+        @test res.ok
+        @test res.results[1].verdict == "VERIFY_OK"
+        @test res.results[1].probes[1].posterior == expected
+        @test res.results[1].probes[1].grad == "PASS"
+        md = read(joinpath(dir, "out", "matrix.md"), String)
+        @test occursin("mu = a .+ X * w", md)
+        art = Serialization.deserialize(joinpath(dir, "out", "matrix.jls"))
+        @test art.data[:X] == _REPORT_MATRIX_X
+    end
+end
+
 @testset "sweep mismatch + supersedes + based_on" begin
     mktempdir() do dir
         mani = joinpath(dir, "mani.toml")

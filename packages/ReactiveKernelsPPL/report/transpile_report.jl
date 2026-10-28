@@ -5,7 +5,8 @@
 #   --surface model.jl --data data.jl   hand-written/demo path: model.jl holds
 #                                       the `@rkppl begin ... end` block (or a
 #                                       bare `begin ... end` block), data.jl
-#                                       defines `DATA` (NamedTuple or Dict).
+#                                       defines `DATA` (NamedTuple or Dict of
+#                                       the values `bind_data` takes).
 #   --artifact model.jls                BRM path: `Serialization.serialize`d
 #                                       `(; ast::Expr, data, meta)` as emitted
 #                                       by the BRM RK backend (`_rk_emit_ast`
@@ -26,12 +27,15 @@ const _REPORT_VERSION = 1
 
 # ---------------------------------------------------------------- data input
 
+# Only the keys and the container are normalized here. Values reach
+# `bind_data` unchanged: it owns what a data value may be (`ColumnData`:
+# numbers and arrays of any shape) and refuses anything else, so the report
+# binds exactly what the pipeline binds.
 function _norm_cols(data)
     if data isa NamedTuple
-        return Dict{Symbol,AbstractVector}(k => _norm_col(k, v) for (k, v) in pairs(data))
+        return Dict{Symbol,Any}(pairs(data))
     elseif data isa AbstractDict
-        return Dict{Symbol,AbstractVector}(
-            _norm_key(k) => _norm_col(k, v) for (k, v) in data)
+        return Dict{Symbol,Any}(_norm_key(k) => v for (k, v) in data)
     end
     throw(ArgumentError(
         "report data must be a NamedTuple or Dict of columns, got $(typeof(data))"))
@@ -40,10 +44,6 @@ end
 _norm_key(k::Symbol) = k
 _norm_key(k::AbstractString) = Symbol(k)
 _norm_key(k) = throw(ArgumentError("report data keys must be Symbols, got $(repr(k))"))
-
-_norm_col(k, v::AbstractVector) = v
-_norm_col(k, v) = throw(ArgumentError(
-    "report data column $k must be an AbstractVector, got $(typeof(v))"))
 
 # ------------------------------------------------------------- AST fidelity
 
@@ -178,10 +178,15 @@ function _run_report_probe(prep, u_probe; backend = nothing)
     return (; u, val, grad_line, grad_ok, grad_maxdiff)
 end
 
-function _run_pipeline(ast::Expr, cols::Dict{Symbol,AbstractVector}, u_probe;
+# Lower with the data values, as every `@rkppl` entry point does: a number
+# lowers as a model-level value and a value holding one array per index is
+# seen at lowering. Lowering from the names alone refuses both.
+_bind_surface(ast::Expr, cols::AbstractDict{Symbol}) =
+    bind_data(lower_rkppl(ast, cols; conditioned = keys(cols)), cols)
+
+function _run_pipeline(ast::Expr, cols::AbstractDict{Symbol}, u_probe;
         backend = nothing)
-    plan = lower_rkppl(ast, keys(cols); conditioned = keys(cols))
-    bound = bind_data(plan, cols)
+    bound = _bind_surface(ast, cols)
     prep = _prepare_bound_report(bound)
     pr = _run_report_probe(prep, u_probe; backend = backend)
     kex = kernel_expr(bound, prep.built.layout)
