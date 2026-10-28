@@ -2259,7 +2259,8 @@ end
 
 function _authored_plate_condition(callargs, roots, positions, atomic)
     tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_authored_plate_is_axis),
-                     callargs[positions[root]]) for root in sort!(collect(roots))
+                     callargs[positions[root]])
+                for root in sort!(collect(roots); by = root -> positions[root])
                 if !(positions[root] in atomic)]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
@@ -2293,7 +2294,8 @@ function _authored_plate_changed(callargs, roots, positions, atomic,
     tests = Any[
         Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
              index, previous, callargs[positions[root]])
-        for root in sort!(collect(roots)) if !(positions[root] in atomic)
+        for root in sort!(collect(roots); by = root -> positions[root])
+        if !(positions[root] in atomic)
     ]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
@@ -2349,7 +2351,8 @@ end
 
 function _authored_plate_runtime_unconditional(callargs, roots, positions, atomic)
     tests = Any[Expr(:call, GlobalRef(@__MODULE__, :_plate_unconditional_root),
-                     callargs[positions[root]]) for root in sort!(collect(roots))
+                     callargs[positions[root]])
+                for root in sort!(collect(roots); by = root -> positions[root])
                 if !(positions[root] in atomic)]
     isempty(tests) && return false
     foldl((left, right) -> Expr(:||, left, right), tests)
@@ -3495,8 +3498,8 @@ function _plate_nested_native!(runtime_ops, runtime_recipes, kernel, input_types
                                 atomic, callvalues; result_slot::Bool = false)
     hoisted, scalar = _nested_cell_plan(kernel, atomic, callvalues)
     types = _plate_body_types!(runtime_ops, runtime_recipes, kernel, input_types)
-    hint_ids = sort!(collect(keys(types)))
-    type_hints = Dict(cid => gensym(:plate_input_type) for cid in hint_ids)
+    hint_ids = _declaration_order(kernel.plan, keys(types))
+    type_hints = Pair{ValueId,Symbol}[cid => gensym(:plate_input_type) for cid in hint_ids]
     cell_slots = get(task_local_storage(), _CELL_SLOTS, nothing)
     recycle = Pair{ValueId,Symbol}[]
     cell_tables = cell_slots === nothing ? nothing : Symbol[]
@@ -4467,8 +4470,8 @@ end
 # declared array output (`y::Vector{Float64} = plate(...)`), each cell
 # converting on store, instead of converting a buffer of the cells' own type
 # into the declaration afterwards.
-# `type_hints` maps logical value ids to extra type-only arguments in an
-# embedded native region. Empty coordinates can use the enclosing DAG's types;
+# `type_hints` pairs logical value ids with extra type-only arguments of an
+# embedded native region, in the order of those arguments. Empty coordinates can use the enclosing DAG's types;
 # no sample value or scalar recipe is evaluated to discover them.
 # `cell_slots` collects the lane slots that the cells of this lowering's plates
 # give their own intermediates (`_plate_nested_native!`), at every nesting
@@ -4540,8 +4543,8 @@ function _lower_with_ops_collecting(p::Plan; tensorized::Bool = false,
         push!(argexprs, :($(nm(v))::$(valtype(v))))
     end
     append!(argexprs, (last(pair) for pair in recycle))
-    type_hints === nothing ||
-        append!(argexprs, (type_hints[cid] for cid in sort!(collect(keys(type_hints)))))
+    type_hints === nothing || append!(argexprs, (last(pair) for pair in type_hints))
+    type_hints = type_hints === nothing ? nothing : Dict{ValueId,Symbol}(type_hints)
     recycled(cid) = (index = findfirst(pair -> first(pair) == cid, recycle);
                      index === nothing ? nothing : last(recycle[index]))
     body = Expr(:block)
@@ -5548,6 +5551,7 @@ function lower_batched(p::Plan; batched, reduce = :+)
     first_coordinate = gensym(:plate_first)
     raw_arguments = Dict{ValueId,Symbol}()
     prepared_arguments = Dict{ValueId,Symbol}()
+    have_rank = Dict{ValueId,Int}(canon_id(g, v.id) => i for (i, v) in enumerate(p.have))
     for value in analysis.mapped
         cid = canon_id(g, value.id)
         raw_arguments[cid] = gensym(Symbol(:plate_argument_, value.name))
@@ -5615,7 +5619,7 @@ function lower_batched(p::Plan; batched, reduce = :+)
         changed = foldl((left, right) -> Expr(:||, left, right),
             (Expr(:call, GlobalRef(@__MODULE__, :_plate_dependency_changed),
                   index, previous, prepared_arguments[root])
-             for root in sort!(collect(roots))))
+             for root in sort!(collect(roots); by = root -> have_rank[root])))
         condition = Expr(:||, first_coordinate, changed)
         push!(loopbody.args,
               Expr(:if, condition, Expr(:(=), nm(out), callexpr(k, r))))
@@ -5839,9 +5843,34 @@ end
 # every lowering of one program, and so does the callable's type (snag
 # `compiled-reader-be3cadbb`). Name each such global by the module that owns
 # its binding instead, or, for a constant bound there to a module or a named
-# function, by that value's own binding: the same reference in every lowering.
+# function or a named type, by that value's own binding: the same reference
+# in every lowering.
 # A binding the fresh module itself owns otherwise stays as qualified.
 _anonymous_module(m::Module) = (name = String(nameof(m)); !isempty(name) && name[1] == '#')
+
+# The ids of `p`'s values in declaration order: its HAVE ports, then each
+# recipe's outputs. Generated code orders values this way, never by identity: a
+# `ValueId` orders by the key of the namespace that allocated it, and that key
+# differs in every process. A program composed of values a package image made
+# and values made at run time (Bruno's simulator: its summary graph and its
+# model) ordered them one way while the image was generated and another at run
+# time, so the image's compiled reader did not apply (snag
+# `compiled-reader-be3cadbb`).
+function _declaration_order(p::Plan, ids)
+    wanted = Set{ValueId}(ids)
+    order = ValueId[]
+    function take(v)
+        cid = canon_id(p.graph, v.id)
+        cid in wanted && !(cid in order) && push!(order, cid)
+    end
+    foreach(take, p.have)
+    for r in p.recipes
+        foreach(take, r.outputs)
+    end
+    length(order) == length(wanted) || throw(ArgumentError(
+        "values to order are not all values of the plan"))
+    order
+end
 
 Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
     m, name = ref.mod, ref.name
@@ -5851,11 +5880,13 @@ Base.@nospecializeinfer function _canonical_global(ref::GlobalRef)
     (Base.invokelatest(isdefined, m, name) && Base.invokelatest(isconst, m, name)) ||
         return ref
     value = Base.invokelatest(getglobal, m, name)
+    named = value isa Type ? Base.unwrap_unionall(value) : nothing
     home = value isa Module ? value :
         value isa Function && Base.issingletontype(typeof(value)) ?
-            parentmodule(typeof(value)) : nothing
+            parentmodule(typeof(value)) :
+        named isa DataType ? named.name.module : nothing
     home === nothing && return ref
-    own = nameof(value)
+    own = named isa DataType ? named.name.name : nameof(value)
     (!_anonymous_module(home) && Base.invokelatest(isdefined, home, own) &&
      Base.invokelatest(getglobal, home, own) === value) || return ref
     GlobalRef(home, own)
@@ -6627,7 +6658,8 @@ function _embedded_marker_candidates(p::Plan)
         for position in positions
             input = recipe.inputs[position]
             roots = sort!(collect(get(
-                dependencies, canon_id(p.graph, input.id), Set{ValueId}())))
+                dependencies, canon_id(p.graph, input.id), Set{ValueId}()));
+                by = root -> root_positions[root])
             for root in roots
                 position = root_positions[root]
                 position in candidates || push!(candidates, position)

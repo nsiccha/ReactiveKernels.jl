@@ -122,6 +122,33 @@ end
                                       RK._borrowed_batch, copy)) == before
 end
 
+@testset "generated code orders values by declaration, not by identity" begin
+    # A value's identity orders by the key of the namespace that allocated it,
+    # which differs in every process: values a package image made and values
+    # made at run time sorted one way while an image was generated and another
+    # at run time, so the image's compiled reader did not apply (snag
+    # `compiled-reader-be3cadbb`). Generated code takes the plan's order.
+    function in_namespace(f, key)
+        previous = RK._VALUE_NAMESPACE[]
+        RK._VALUE_NAMESPACE[] = RK.ValueNamespace(UInt(key))
+        try
+            f()
+        finally
+            RK._VALUE_NAMESPACE[] = previous
+        end
+    end
+    graph = Graph()
+    a = in_namespace(() -> value!(graph, :a, Float64), 2)
+    b = in_namespace(() -> value!(graph, :b, Float64), 1)
+    c = value!(graph, :c, Float64)
+    add!(graph, (a, b) => c, +)
+    p = plan(graph; have = (a, b), want = c)
+    ids = [RK.canon_id(graph, v.id) for v in (c, b, a)]
+    @test sort(ids) != ids[[3, 2, 1]]
+    @test RK._declaration_order(p, ids) == ids[[3, 2, 1]]
+    @test_throws ArgumentError RK._declaration_order(p, [RK.canon_id(graph, value!(graph, :d, Float64).id)])
+end
+
 @testset "execution branch metadata preserves host branch behavior" begin
     call(x, scale) = scale > 0 ? x * log(scale) : -x
     branch = RK._KernelBranch(Val((2,)), Val((1, 2)), Val((1,)), call,
