@@ -2544,12 +2544,11 @@ end
 # Top-down unknown-head screen (vocabulary layer runs before shape and
 # structure layers, so the error names the function, not its fallout).
 # Factor references are skipped (the factor machinery owns that position).
-# Heads that only lower inside `.~` responses, never as values (`exp` is
-# excluded: undotted it is admitted scalar math, dotted admitted
-# elementwise math — only the Poisson-link position is response-only, and
-# that position never reaches this screen).
+# Heads that only lower inside `.~` responses, never as values (`exp` and
+# `logistic` are excluded: undotted they are admitted scalar math, dotted
+# admitted elementwise math).
 const _RESPONSE_ONLY_FNS =
-    (:weighted, :truncated, :censored, :interval_censored, :logistic)
+    (:weighted, :truncated, :censored, :interval_censored)
 const _DIST_VALUE_FNS =
     (:Normal, :Cauchy, :Exponential, :Gamma, :LogNormal, :Beta,
         :InverseGamma, :Bernoulli, :Poisson, :HalfNormal, :HalfCauchy, :Flat,
@@ -7880,9 +7879,43 @@ function _broadcast_lhs_msg(lhs::Symbol, detshape)
         "(scalar parameters use `~`)"
 end
 
+# The argument a family reads under an inverse link (`_dot2call_spine_arg`):
+# a probability, rate or mean.
+const _LINK_SLOTS = Dict{Symbol,Int}(:Bernoulli => 1, :Binomial => 2,
+    :Poisson => 1, :NegativeBinomial2 => 1, :NegativeBinomial => 1,
+    :HurdlePoisson => 1, :ZeroInflatedPoisson => 1,
+    :ZeroInflatedBinomial => 2, :InverseGaussian => 1, :Exponential => 1,
+    :BetaBinomial2 => 2)
+
+# An undotted inverse link in a link slot is the function applied to its
+# argument whole, as in Julia: over a scalar it is the dotted link's value,
+# over an array Julia's MethodError. The dotted pre-pass reads both
+# spellings alike, so the argument's shape is checked before it.
+function _check_undotted_links(lhs, ex, ctx)
+    ex isa Expr || return nothing
+    if ex.head === :. && length(ex.args) == 2 &&
+            haskey(_LINK_SLOTS, ex.args[1]) && ex.args[2] isa Expr &&
+            ex.args[2].head === :tuple
+        targs = ex.args[2].args
+        slot = _LINK_SLOTS[ex.args[1]]
+        p = length(targs) >= slot ? targs[slot] : nothing
+        if p isa Expr && p.head === :call && length(p.args) == 2 &&
+                p.args[1] isa Symbol && haskey(_AUXILIARY_LINKS, p.args[1])
+            shape = _canon_shape(p.args[2], ctx)
+            shape in (:vector, :array, :matrix) && _sfail(_julia_mismatch_msg(
+                p.args[1], "response $lhs", p, [shape]))
+        end
+    end
+    for a in ex.args
+        _check_undotted_links(lhs, a, ctx)
+    end
+    return nothing
+end
+
 function _lower_response(lhs, rhs, range, ctx, predictors, pred_idx, coefuse;
         count_columns = nothing)
     dotted = _desugar_fused_head(lhs, rhs)
+    _check_undotted_links(lhs, dotted, ctx)
     call = _dot2call_response(lhs, dotted)
     weights, call = _peel_weighted(lhs, call, ctx)
     evidence, call = _peel_evidence(lhs, call, ctx)
@@ -8826,21 +8859,12 @@ end
 
 function _dot2call_nested_link(lhs, a, base)
     (a isa Symbol || a isa Real) && return a
-    # Probability arguments are ordinary Julia values. Preserve their
+    # Probabilities, rates and means are ordinary Julia values: an inline
+    # expression means what its named definition does. Preserve the
     # broadcast tree unless this is a recognized inverse-link spelling.
-    if base in (:Bernoulli, :Binomial) &&
-            !(_is_dotted_call(a) && a.args[1] isa Symbol &&
-              (haskey(_BERNOULLI_LINKS, a.args[1]) ||
-               haskey(_LEGACY_INVERSE_LINKS, a.args[1])))
-        return a
-    end
-    want = (base === :Bernoulli || base === :Binomial) ? "logistic/normcdf/cexpexp" :
-        (base === :Beta || base === :BetaBinomial2) ? "logistic" : "exp"
-    a isa Expr && a.head === :. && length(a.args) == 2 &&
-        a.args[1] isa Symbol && a.args[2] isa Expr &&
-        a.args[2].head === :tuple ||
-        _sfail("response $lhs: broadcast the link " *
-               "(`$want.(eta)` — `.~` is elementwise at every level)")
+    _is_dotted_call(a) && a.args[1] isa Symbol &&
+        (haskey(_link_names(base), a.args[1]) ||
+         haskey(_LEGACY_INVERSE_LINKS, a.args[1])) || return a
     targs = a.args[2].args
     any(x -> x isa Expr && x.head === :parameters, targs) && _sfail(
         "response $lhs: dotted objects take positional arguments " *
@@ -9356,10 +9380,13 @@ function _lower_slot_link(lhs, arg)
             haskey(_AUXILIARY_LINKS, arg.args[1])
         return _AUXILIARY_LINKS[arg.args[1]], arg.args[2]
     end
-    (arg isa Symbol || arg isa Real) && return IdentityLink, arg
-    _sfail("response $lhs: parameter takes a Julia value or a dotted " *
-        "exp/logistic/normcdf/cexpexp wrapper, got $(repr(arg))")
+    # Any other value is the rate or mean itself, as its named twin is.
+    return IdentityLink, arg
 end
+
+# The inverse links a response slot recognizes (`_dot2call_spine_arg`).
+_link_names(base) = base in (:Bernoulli, :Binomial) ? _BERNOULLI_LINKS :
+    _AUXILIARY_LINKS
 
 function _lower_bernoulli_link(lhs, arg)
     _reject_legacy_inverse_link(lhs, arg)
@@ -9442,9 +9469,11 @@ function _lower_argument_value(lhs, slot, value, ctx)
     rhs = _resolve_module_calls(value, ctx.mod, ctx.taken,
         "response $lhs $slot")
     _reject_unknown_calls("response $lhs $slot", rhs; composed_maps = true)
-    rhs = _argument_value_calls(rhs)
+    # Canonicalize before resolving `logistic`: as a vocabulary head its
+    # undotted use over a vector fails as `exp`'s does.
     rhs = _canonical_expr(rhs, ctx.data, ctx.detmap, ctx.detshape,
         ctx.shape_env, "response $lhs $slot")
+    rhs = _argument_value_calls(rhs)
     for name in _value_symbols(rhs)
         name in ctx.taken || name in (:pi, :Inf) || _sfail(
             "response $lhs $slot references undeclared name $name")

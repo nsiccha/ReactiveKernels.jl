@@ -5095,7 +5095,10 @@ end
 # module path (`Base.sqrt`) stays as written.
 _scan_computed_head(h) = h isa Expr &&
     (h.head === :call || (h.head === :. && _scan_computed_head(h.args[1])))
-_scan_translate_head(h, translate) = _scan_computed_head(h) ? translate(h) : h
+# `logistic` is the inverse logit, as in a definition (`_value_math_rewrite`):
+# the generated scope's `logistic` names a distribution kernel.
+_scan_translate_head(h, translate) = _scan_computed_head(h) ? translate(h) :
+    h === :logistic ? :_ppl_logistic : h
 
 # The carry window: each carried array read at backward lags keeps its last
 # `L` values as `<state>_lag1 … <state>_lagL` fields of a NamedTuple carry.

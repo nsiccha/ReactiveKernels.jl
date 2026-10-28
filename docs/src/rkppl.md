@@ -434,7 +434,15 @@ generated values to sampler coordinates.
 - Distribution arguments use their ordinary values. `exp.`, `logistic.`,
   `normcdf.` and `cexpexp.` apply at each use, including means, rates,
   probabilities, scales, shapes, Student degrees of freedom and zero
-  inflation. One predictor may feed several slots or responses under
+  inflation. Undotted, `logistic(x)` is the inverse logit of a scalar, as
+  `exp(x)` is the exponential: `p = logistic(logit_p)`,
+  `e = logistic(z) .* exp.(r)`, `Binomial.(n, logistic(a))`, a prior
+  argument, a plate cell or a `@scan` step. Over an array an undotted
+  `logistic`, `exp`, `normcdf` or `cexpexp` is Julia's `MethodError`, and
+  lowering refuses it with the dotted spelling, a probability argument
+  included. A count rate or mean is any value, inline as named:
+  `Poisson.(logistic(a) .* x)` and `NegativeBinomial2.(exp.(d) .* (u .+ v),
+  phi)` mean what `rate = …; Poisson.(rate)` does. One predictor may feed several slots or responses under
   different links, with its original parameter names and priors.
   Values outside parameter support contribute `-Inf` through a lazy
   density branch. Mixture components may use independent links.
