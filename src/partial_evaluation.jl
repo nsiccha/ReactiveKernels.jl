@@ -853,15 +853,23 @@ function _partial_cell_values!(result, batch)
     result
 end
 
+# A plate's cell kernel, and the length of its operation table from its
+# type. Each read of a field of an unspecialized plate operation boxes a copy
+# of what it holds inline, so reading `op.kernel.ops` twice per plate copied
+# the cell kernel twice and its table once on every binding.
+_plate_cell_kernel(@nospecialize(op::_AuthoredPlateOp)) = getfield(op, :kernel)
+_plate_cell_ops_length(@nospecialize(op::_AuthoredPlateOp)) =
+    fieldcount(fieldtype(fieldtype(typeof(op), :kernel), :ops))
+
 # Generated inner-kernel types are data to this structural pass. Specializing
 # on them recompiles the entire partial evaluator once per authored plate.
 Base.@nospecializeinfer function _partial_plate_recipe(
         g, recipe, known, @nospecialize(op::_AuthoredPlateOp), rewrites)
     atomic_inputs = typeof(op).parameters[2]
-    inner = op.kernel.plan
+    inner = _plate_cell_kernel(op).plan
     length(inner.have) == length(recipe.inputs) || return nothing
     length(inner.want) == 1 || return nothing
-    length(op.kernel.ops) == length(inner.recipes) || return nothing
+    _plate_cell_ops_length(op) == length(inner.recipes) || return nothing
     original_excluded = _plate_exclusions(rewrites, recipe.id, inner)
     original_excluded === nothing && return nothing
 
@@ -870,7 +878,10 @@ Base.@nospecializeinfer function _partial_plate_recipe(
     bound_types = Dict{ValueId,Any}()
     known_indices = Int[]
     known_types = Any[]
-    for (index, (outer, input)) in enumerate(zip(recipe.inputs, inner.have))
+    # An index loop: iterating `zip` over the plate's heterogeneous input
+    # tuple allocated at every step of this untyped pass.
+    for index in eachindex(inner.have)
+        outer, input = recipe.inputs[index]::Value, inner.have[index]
         cid = canon_id(g, outer.id)
         haskey(known, cid) || continue
         data = known[cid]
@@ -1202,10 +1213,10 @@ Base.@nospecializeinfer function _partition_plate_recipe(
         g, recipe, known, @nospecialize(op::_AuthoredPlateOp),
         pending::Vector{Recipe}, want, fresh)
     atomic_inputs = typeof(op).parameters[2]
-    inner = op.kernel.plan
+    inner = _plate_cell_kernel(op).plan
     length(inner.have) == length(recipe.inputs) || return nothing
     length(inner.want) == 1 || return nothing
-    length(op.kernel.ops) == length(inner.recipes) || return nothing
+    _plate_cell_ops_length(op) == length(inner.recipes) || return nothing
     length(recipe.outputs) == 1 || return nothing
     for r in inner.recipes
         r.effectful && return nothing
