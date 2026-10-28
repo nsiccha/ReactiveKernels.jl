@@ -225,11 +225,14 @@ end
 # How a source recipe computes its value row by row. `roles[j]` is how input
 # `j` is read: `:leaf` (a broadcast operand), `:index` (a gather index, and
 # possibly a broadcast operand), `:gather` / `:linear_gather` (the source of
-# `A[I, j...]` / `A[I]`, by input `gather_index[j]`), `:factor` (a product's
-# left factor), or `:whole`. `leaves` are the inputs whose axes make up a
-# pointwise value's full shape. `operand` is the input `v` of a product
-# `A * v` of exactly two inputs (0 otherwise): with a matrix `A` and a vector
-# `v`, its full axes are `(axes(A, 1),)`.
+# `A[I, j...]` / `A[I]`, by input `gather_index[j]`), `:column` (a broadcast
+# operand read as a column `A[:, k...]`), `:factor_leaf` (the left factor of a
+# broadcast operand `A * w`, `w` input `gather_index[j]`), `:factor` (a
+# product's left factor), `:scalar` (an array of numbers read at literal
+# positions, `a[1]`, so whole), or `:whole`. `leaves` are the inputs whose
+# axes make up a pointwise value's full shape. `operand` is the input `v` of a
+# product `A * v` of exactly two inputs (0 otherwise): with a matrix `A` and a
+# vector `v`, its full axes are `(axes(A, 1),)`.
 struct _CellForm
     kind::Symbol
     roles::Vector{Symbol}
@@ -295,7 +298,9 @@ function _cell_form(r::Recipe)
     position = Dict{Symbol,Int}(name => j for (j, name) in enumerate(params))
     uses = [Set{Symbol}() for _ in params]
     gathers = Dict{Int,Tuple{Int,Bool}}()
+    products = Dict{Int,Int}()
     leaves = Int[]
+    param(x) = x isa Symbol && haskey(position, x)
     function gather!(ex)
         length(ex.args) >= 2 || return false
         source, index = ex.args[1], ex.args[2]
@@ -318,8 +323,35 @@ function _cell_form(r::Recipe)
             return true
         end
         ex isa Union{Int,Float64,Bool} && return true
-        ex isa Expr && ex.head === :ref && return gather!(ex)
+        ex isa Expr && ex.head === :ref && return gather!(ex) || column!(ex) || scalar!(ex)
+        ex isa Expr && ex.head === :call && return product!(ex)
         false
+    end
+    # `A[:, k...]`: row `r` is `A[r, k...]`.
+    function column!(ex)
+        length(ex.args) >= 3 && param(ex.args[1]) && ex.args[2] === :(:) &&
+            all(i -> i isa Int, ex.args[3:end]) || return false
+        push!(uses[position[ex.args[1]]], :column)
+        push!(leaves, position[ex.args[1]])
+        true
+    end
+    # `a[1]`: one element, the same for every row.
+    function scalar!(ex)
+        length(ex.args) >= 2 && param(ex.args[1]) && all(i -> i isa Int, ex.args[2:end]) ||
+            return false
+        push!(uses[position[ex.args[1]]], :scalar)
+        true
+    end
+    # `A * w`: row `r` is `A[r:r, ...] * w`.
+    function product!(ex)
+        length(ex.args) == 3 && _cell_base_product(ex.args[1], mod, params) &&
+            param(ex.args[2]) && param(ex.args[3]) && ex.args[2] != ex.args[3] || return false
+        factor, w = position[ex.args[2]], position[ex.args[3]]
+        get!(products, factor, w) == w || return false
+        push!(uses[factor], :factor_leaf)
+        push!(uses[w], :whole)
+        push!(leaves, factor)
+        true
     end
     lazy!(ex) = _cell_free_of(ex.args[2], params) && all(operand!, ex.args[3:end])
     kind = :pointwise
@@ -368,7 +400,8 @@ function _cell_form(r::Recipe)
         role === nothing && return nothing
         push!(roles, role)
     end
-    gather_index = Int[first(get(gathers, j, (0, false))) for j in eachindex(params)]
+    gather_index = Int[first(get(gathers, j, (get(products, j, 0), false)))
+                       for j in eachindex(params)]
     _CellForm(kind, roles, gather_index, kind === :hcat ? leaves : unique!(leaves), operand)
 end
 
@@ -453,6 +486,25 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
     root(params, recipe, name) = let j = findfirst(==(name), params)
         j === nothing ? nothing : findfirst(==(canon_id(ig, recipe.inputs[j].id)), roots)
     end
+    # The shared argument an index array is: itself, or `vec` of it, which
+    # reads the same at every linear position.
+    function via_root(params, recipe, name)
+        k = root(params, recipe, name)
+        k === nothing || return k
+        j = findfirst(==(name), params)
+        j === nothing && return nothing
+        cid = canon_id(ig, recipe.inputs[j].id)
+        for producer in inner.recipes
+            length(producer.outputs) == 1 &&
+                canon_id(ig, only(producer.outputs).id) == cid || continue
+            analyzed = _cell_native(producer)
+            analyzed === nothing && return nothing
+            native, vec_params, _ = analyzed
+            native == Expr(:call, GlobalRef(Base, :vec), only(vec_params)) || return nothing
+            return findfirst(==(canon_id(ig, only(producer.inputs).id)), roots)
+        end
+        nothing
+    end
     for recipe in inner.recipes
         slots = findall(v -> canon_id(ig, v.id) == cid, collect(recipe.inputs))
         isempty(slots) && continue
@@ -466,7 +518,7 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
             q, via = read isa Symbol ? (read, nothing) : (read.args[2], read.args[1])
             b = root(params, recipe, q)
             (b === nothing || b in atomic) && return nothing
-            w = via === nothing ? 0 : root(params, recipe, via)
+            w = via === nothing ? 0 : via_root(params, recipe, via)
             (w === nothing || (w != 0 && !(w in atomic)) || w == b) && return nothing
             found === nothing && (found = (b, w))
             found == (b, w) || return nothing
@@ -518,8 +570,8 @@ struct _CellPushdowns
     plates::Dict{Int,Any}
 end
 
-# The roles in which a producer reads an input at its own rows.
-const _CELL_ROW_ROLES = (:leaf, :gather, :linear_gather, :factor)
+# Whether a producer reads an input in `role` at its own rows.
+_cell_row_role(role) = role in (:leaf, :gather, :linear_gather, :column, :factor_leaf, :factor)
 
 function _cell_pushdowns(p::Plan)
     any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return nothing
@@ -563,15 +615,21 @@ function _cell_pushdowns(p::Plan)
     end
     fits(cid, role) = form(cid) !== nothing && (!needs_shape(role) || shaped(cid))
     # Static operand requirements: integer vector indices, array factors (a
-    # column read and an `hcat` are arrays).
+    # column read and an `hcat` are arrays) and the right operand of a dotted
+    # operand's product (`_cell_product_shape`), arrays of numbers read at
+    # literal positions.
     array_form(v) = let f = form(cidof(v))
         f !== nothing && f.kind in (:columns, :hcat)
     end
     function operands_fit(cid)
         r = only(producers[cid])
-        all(zip(forms[r.id].roles, r.inputs)) do (role, input)
+        f = forms[r.id]
+        all(zip(f.roles, r.inputs, f.gather_index)) do (role, input, paired)
             role === :index ? static_type(input) <: AbstractVector{<:Integer} :
             role === :factor ? static_type(input) <: AbstractArray || array_form(input) :
+            role === :factor_leaf ? (static_type(input) <: AbstractArray || array_form(input)) &&
+                static_type(r.inputs[paired]) <: Union{AbstractVecOrMat,Number} :
+            role === :scalar ? static_type(input) <: AbstractArray{<:Number} :
             true
         end
     end
@@ -600,7 +658,7 @@ function _cell_pushdowns(p::Plan)
         r = only(producers[cid])
         f = forms[r.id]
         for (j, input) in enumerate(r.inputs)
-            f.roles[j] in _CELL_ROW_ROLES && reach!(cidof(input), f.roles[j])
+            _cell_row_role(f.roles[j]) && reach!(cidof(input), f.roles[j])
         end
     end
     # Keep a value at rows only while every reader reads it at rows.
@@ -622,7 +680,7 @@ function _cell_pushdowns(p::Plan)
                 length(reader.outputs) == 1 && cidof(only(reader.outputs)) in pushed ||
                     return false
                 f = forms[reader.id]
-                all(s -> f.roles[s] in _CELL_ROW_ROLES && fits(cid, f.roles[s]), slots)
+                all(s -> _cell_row_role(f.roles[s]) && fits(cid, f.roles[s]), slots)
             end
             ok && continue
             delete!(pushed, cid)
@@ -679,12 +737,25 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
             Expr(:call, _cell_ref(:_cell_product_shape), input_shape(factor),
                 e.names[operand]))
     end
-    parts = Any[input_shape(canon_id(d.graph, r.inputs[j].id)) for j in f.leaves]
+    parts = Any[_cell_part_shape!(e, r, f, j) for j in f.leaves]
     shape = f.kind === :columns ?
         Expr(:call, _cell_ref(:_cell_column_shape), only(parts)) :
         f.kind === :hcat ? Expr(:call, _cell_ref(:_cell_hcat_shape), Expr(:tuple, parts...)) :
         Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple, parts...))
     e.shapes[cid] = _cell_bind!(e, :cell_shape, shape)
+end
+
+# The full axes of the broadcast operand that input `j` of recipe `r` (form `f`)
+# makes: the input itself, its column `A[:, k...]`, or its product `A * w`.
+function _cell_part_shape!(e::_CellEmitter, r::Recipe, f::_CellForm, j::Int)
+    d = e.pushdowns
+    input = canon_id(d.graph, r.inputs[j].id)
+    shape = input in d.pushed ? _cell_shape!(e, input) :
+        Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input])
+    f.roles[j] === :column && return Expr(:call, _cell_ref(:_cell_column_shape), shape)
+    f.roles[j] === :factor_leaf || return shape
+    w = e.names[canon_id(d.graph, r.inputs[f.gather_index[j]].id)]
+    _cell_bind!(e, :cell_shape, Expr(:call, _cell_ref(:_cell_product_shape), shape, w))
 end
 
 function _cell_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
@@ -708,7 +779,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
     for (j, input) in enumerate(r.inputs)
         icid = canon_id(d.graph, input.id)
         role = f.roles[j]
-        if role in (:leaf, :index)
+        if role in (:leaf, :index, :column)
             if icid in d.pushed
                 inner = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_leaf_row),
                     _cell_shape!(e, icid), row))
@@ -727,6 +798,12 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
             window = _cell_window!(e, icid, source_row)
             push!(args, _cell_bind!(e, :cell_window, Expr(:call,
                 _cell_ref(:_CellWindow), window, source_row, shape)))
+        elseif role === :factor_leaf
+            # The rows of the product `A * w` this operand broadcasts: rows of `A`.
+            inner = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_leaf_row),
+                _cell_part_shape!(e, r, f, j), row))
+            push!(args, icid in d.pushed ? _cell_window!(e, icid, inner) :
+                Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], inner))
         elseif role === :factor && icid in d.pushed
             push!(args, _cell_window!(e, icid, row))
         elseif role === :factor
