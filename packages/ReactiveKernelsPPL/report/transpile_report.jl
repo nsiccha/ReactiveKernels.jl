@@ -93,7 +93,7 @@ _show_vals(vals) = "[" * join(repr.(vals), ", ") * "]"
 _show_subset(s::Colon) = ":"
 _show_subset(s::UnitRange) = string(s)
 _show_subset(s::Vector) = "[" * join(string.(s), ", ") * "]"
-_show_subset(s::Tuple) = "($(s[1]), :end)"
+_show_subset(s::Tuple) = "(" * join(repr.(s), ", ") * ")"
 _show_expr(e::Expr) = sprint(Base.show_unquoted, e)
 _show_expr(e) = repr(e)
 
@@ -131,6 +131,7 @@ end
 _show_scale(s::Nothing) = "nothing"
 _show_scale(s::Real) = repr(s)
 _show_scale(s::Symbol) = ":$s"
+_show_scale(s::ScalePredictorRef) = "ScalePredictorRef(:$(s.predictor), $(s.link))"
 _show_ev(::Nothing) = "nothing"
 _show_ev(x) = repr(x)
 _show_args(nt::NamedTuple) = "(" * join(["$k=$(repr(v))" for (k, v) in pairs(nt)], ", ") * ")"

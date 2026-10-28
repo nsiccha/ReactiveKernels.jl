@@ -39,6 +39,34 @@ _report_factor_data() = Dict{Symbol,AbstractVector}(
     :y => [1.0, 2.0, 1.5, 2.5, 3.0, 2.0],
     :g => [1, 2, 1, 3, 2, 3])
 
+# A scale fed by its own predictor lowers to a `ScalePredictorRef`; a stepped
+# level subset lowers to `(lo, step, :end)`.
+const _REPORT_VSCALE_SURFACE = """
+@rkppl begin
+    a ~ Normal(0, 1)
+    b ~ Normal(0, 1)
+    c ~ Normal(0, 1)
+    d ~ Normal(0, 1)
+    mu = a .+ b .* x
+    sigma = c .+ d .* z
+    y .~ Normal.(mu, exp.(sigma))
+end
+"""
+
+_report_vscale_data() = Dict{Symbol,AbstractVector}(
+    :y => [-0.8, 0.1, 0.4, -0.2, 1.0, 1.3],
+    :x => [-1.2, -0.6, -0.1, 0.0, 0.3, 0.7],
+    :z => [0.4, -0.3, 0.9, -1.0, 0.2, 0.5])
+
+const _REPORT_STEPPED_SURFACE = """
+@rkppl begin
+    a ~ Normal(0, 1)
+    z[levels(g)[1:2:end]] .~ Normal.(0, 1)
+    mu = a .+ z[g]
+    y .~ Normal.(mu, 0.7)
+end
+"""
+
 const _REPORT_U = [0.5, -0.25, 0.1]
 # Peer's old-spelling value (brief 2026-09-18T13-50-37-077-124g6vh Layer 4).
 const _REPORT_POSTERIOR = "posterior(u) = -15.886646898631646"
@@ -150,6 +178,21 @@ _report_posterior(md) =
     # refused: a data value must be a number or an array (bind_data's ColumnData contract)
     @test err isa ContractValidationError
     @test occursin("data value X must be a number or an array", sprint(showerror, err))
+end
+
+@testset "report modeled scale and stepped level subset" begin
+    md = transpile_report(_REPORT_VSCALE_SURFACE, _report_vscale_data();
+        meta = (; model = "demo-vscale"), backend = _GEN_BACKEND)
+    @test occursin("predictor mu, scale ScalePredictorRef(:sigma, LogLink)", md)
+    @test occursin("(finite)", md)
+    @test occursin("PASS", md)
+    md = transpile_report(_REPORT_STEPPED_SURFACE, _report_factor_data();
+        meta = (; model = "demo-stepped"), backend = _GEN_BACKEND)
+    @test occursin(
+        "levelmaps   = [(mu, g, values [1, 3], source levels, subset (1, 2, :end))]",
+        md)
+    @test occursin("(finite)", md)
+    @test occursin("PASS", md)
 end
 
 @testset "report AST mode fidelity + artifact round-trip" begin
