@@ -87,6 +87,15 @@
 # bound a hung worker, prefix its argv with `timeout` (the manifest argv is
 # yours; the helper prefix composes outside it).
 #
+# The helper refuses a run that does not say what it is for (rule v44, user
+# decision 0hnl0s8: exit 64, nothing runs), and the user reads that reason
+# beside each run on the KB's /compute page. So every wrapped worker run
+# passes `--why "<purpose>: brm-probe case <id>"`, naming its own case.
+# `<purpose>` is `KB_COMPUTE_WHY` when the caller exports it (the helper's
+# variable for what a run is for), else `RKPPL sweep_appends <manifest file>`.
+# `--why` takes precedence over `KB_COMPUTE_WHY` in the helper, which is why
+# the driver carries the caller's purpose into each case's reason.
+#
 # Exit codes: 0 iff every case reaches VERIFY_OK. A case that throws is
 # caught into an ERROR row; the driver still writes every good case plus
 # the table, then exits 1. Manifest-level problems throw before anything
@@ -487,18 +496,31 @@ end
 
 const _TOKEN_HELPER = "kb-acquire-compute-token"
 
-# Pure argv builder, factored for token-free tests: wrap and `--no-token`
-# are coupled here so exactly one side gates per invocation (see header).
-function _worker_cmd(worker::Vector{String}, spec_path, case_out;
-        wrap_token::Bool = false)
-    argv = vcat(worker, ["--spec", spec_path, "--out", case_out])
-    wrap_token || return Cmd(argv)
-    return Cmd(vcat([_TOKEN_HELPER, "--"], argv, ["--no-token"]))
+# What a wrapped worker run is for, as the helper's `--why` (see header).
+function _worker_why(c::SweepCase, mani::SweepManifest;
+        purpose = get(ENV, "KB_COMPUTE_WHY", ""))
+    purpose = strip(purpose)
+    isempty(purpose) && (purpose = "RKPPL $(_SWEEP_NAME) $(basename(mani.path))")
+    return "$purpose: brm-probe case $(c.id)"
 end
 
-function _run_worker(c::SweepCase, spec_path, case_out; wrap_token::Bool = false)
+# Pure argv builder, factored for token-free tests: wrap and `--no-token`
+# are coupled here so exactly one side gates per invocation (see header).
+# A wrapped run needs `why`: the helper refuses one without it.
+function _worker_cmd(worker::Vector{String}, spec_path, case_out;
+        wrap_token::Bool = false, why::Union{Nothing,AbstractString} = nothing)
+    argv = vcat(worker, ["--spec", spec_path, "--out", case_out])
+    wrap_token || return Cmd(argv)
+    (why === nothing || isempty(strip(why))) && throw(ArgumentError(
+        "wrap_token needs `why`: $(_TOKEN_HELPER) refuses a run that does " *
+        "not say what it is for"))
+    return Cmd(vcat([_TOKEN_HELPER, "--why", why, "--"], argv, ["--no-token"]))
+end
+
+function _run_worker(c::SweepCase, spec_path, case_out; wrap_token::Bool = false,
+        why = nothing)
     mkpath(case_out)
-    cmd = _worker_cmd(c.worker, spec_path, case_out; wrap_token)
+    cmd = _worker_cmd(c.worker, spec_path, case_out; wrap_token, why)
     outbuf, errbuf = IOBuffer(), IOBuffer()
     run_ok = try
         run(pipeline(cmd; stdout = outbuf, stderr = errbuf))
@@ -614,7 +636,8 @@ function _run_brm_case(c::SweepCase, mani::SweepManifest, out_dir;
         wrap_token::Bool = false)
     spec_path = _write_worker_spec(c, mani, out_dir)
     case_out = _case_path(joinpath(out_dir, ".worker"), c.id, ".out")
-    run_ok, log = _run_worker(c, spec_path, case_out; wrap_token)
+    why = wrap_token ? _worker_why(c, mani) : nothing
+    run_ok, log = _run_worker(c, spec_path, case_out; wrap_token, why)
     log_path = _case_path(out_dir, c.id, ".worker.log")
     mkpath(dirname(log_path))
     write(log_path, log)
@@ -716,16 +739,21 @@ function _write_sweep_table(mani::SweepManifest, results, out_dir)
 end
 
 """
-    sweep_appends(manifest_path, out_dir; backend=nothing) -> (; results, ok)
+    sweep_appends(manifest_path, out_dir; backend=nothing, wrap_token=false)
+        -> (; results, ok)
 
 Run the sweep: one real pipeline + machine render per manifest case, plus
 `<id>.jls` artifacts, `manifest.toml`, and `verdict-table.md` in `out_dir`
 (created when missing). Surface-kind cases run in-process; brm-probe-kind
 cases shell out to their manifest `worker` script (argv array, no shell).
 `backend` (any `DifferentiationInterface` AD type) enables the per-case
-gradient cross-check for surface-kind cases. Per-case failures are caught
-into ERROR rows; `ok` is true iff every case reaches VERIFY_OK.
-Manifest-level problems throw before anything is written.
+gradient cross-check for surface-kind cases. `wrap_token=true` runs each
+brm-probe worker under `kb-acquire-compute-token --why "<purpose>: brm-probe
+case <id>"` and passes it `--no-token`; `<purpose>` is `KB_COMPUTE_WHY` when
+set, else `RKPPL sweep_appends <manifest file>` (see the file header).
+Per-case failures are caught into ERROR rows; `ok` is true iff every case
+reaches VERIFY_OK. Manifest-level problems throw before anything is
+written.
 """
 function sweep_appends(manifest_path::AbstractString, out_dir::AbstractString;
         backend = nothing, wrap_token::Bool = false)

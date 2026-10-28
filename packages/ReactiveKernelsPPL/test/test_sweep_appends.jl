@@ -582,12 +582,71 @@ end
     @test _worker_cmd(worker, "s.toml", "o").exec ==
         ["julia", "--startup-file=no", "/abs/worker.jl",
         "--spec", "s.toml", "--out", "o"]
-    # Wrapped: helper prefix coupled to --no-token (exactly one side gates).
-    @test _worker_cmd(worker, "s.toml", "o"; wrap_token = true).exec ==
-        ["kb-acquire-compute-token", "--",
+    # Wrapped: helper prefix coupled to --no-token (exactly one side gates),
+    # and the helper is told what the run is for.
+    @test _worker_cmd(worker, "s.toml", "o"; wrap_token = true,
+            why = "fusion: brm-probe case escs").exec ==
+        ["kb-acquire-compute-token", "--why", "fusion: brm-probe case escs", "--",
         "julia", "--startup-file=no", "/abs/worker.jl",
         "--spec", "s.toml", "--out", "o", "--no-token"]
+    # refused: the helper refuses a run without a reason (rule v44, user
+    # decision 0hnl0s8), so a wrapped command without one fails here
+    @test_throws ArgumentError _worker_cmd(worker, "s.toml", "o"; wrap_token = true)
+    @test_throws ArgumentError _worker_cmd(worker, "s.toml", "o";
+        wrap_token = true, why = "  ")
     # No execution happens above: safe in CI without the helper or a token.
+end
+
+@testset "sweep token wrap: --why names the case" begin
+    mani = SweepManifest("/abs/fusion_manifest.toml", Dict{String,String}(), SweepCase[])
+    c = SweepCase("escs", :brm, nothing, nothing, "docs/examples/escs.jl",
+        ["julia"], nothing, nothing, nothing, nothing)
+    @test _worker_why(c, mani; purpose = "parity fusion sweep") ==
+        "parity fusion sweep: brm-probe case escs"
+    @test _worker_why(c, mani; purpose = "") ==
+        "RKPPL sweep_appends fusion_manifest.toml: brm-probe case escs"
+    # The default purpose is the caller's KB_COMPUTE_WHY, which the helper
+    # would otherwise drop in favour of the driver's --why.
+    withenv("KB_COMPUTE_WHY" => "parity fusion sweep") do
+        @test _worker_why(c, mani) == "parity fusion sweep: brm-probe case escs"
+    end
+    withenv("KB_COMPUTE_WHY" => nothing) do
+        @test _worker_why(c, mani) ==
+            "RKPPL sweep_appends fusion_manifest.toml: brm-probe case escs"
+    end
+end
+
+# A stand-in helper on PATH that, like the real one, refuses a run without
+# --why (exit 64) and otherwise runs the command after `--`, recording its
+# reason. No token is acquired.
+Sys.isunix() && @testset "sweep wrap_token runs each worker with its --why" begin
+    mktempdir() do dir
+        bin = mkpath(joinpath(dir, "bin"))
+        seen = joinpath(dir, "why.log")
+        helper = joinpath(bin, "kb-acquire-compute-token")
+        write(helper, """
+            #!/bin/sh
+            why="\${KB_COMPUTE_WHY:-}"
+            while [ "\$#" -gt 0 ] && [ "\$1" != "--" ]; do
+                if [ "\$1" = "--why" ]; then why="\$2"; shift; fi
+                shift
+            done
+            [ -n "\$why" ] || { echo "say what this run is for" >&2; exit 64; }
+            printf '%s\\n' "\$why" >> $(repr(seen))
+            shift
+            exec "\$@"
+            """)
+        chmod(helper, 0o755)
+        mani = _write_brm_manifest(dir)
+        withenv("PATH" => bin * ":" * ENV["PATH"], "KB_COMPUTE_WHY" => nothing) do
+            res = sweep_appends(mani, joinpath(dir, "out"); wrap_token = true)
+            @test res.ok
+            @test res.results[1].verdict == "VERIFY_OK"
+        end
+        @test readlines(seen) == ["RKPPL sweep_appends brm.toml: brm-probe case stubdemo"]
+        log = read(joinpath(dir, "out", "stubdemo.worker.log"), String)
+        @test occursin("--no-token", log)
+    end
 end
 
 @testset "sweep CLI --wrap-token parses (no execution)" begin
