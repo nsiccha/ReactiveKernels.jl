@@ -332,6 +332,13 @@ _hur_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
         u = _hur_sb_vec(names, [:a => 0.5,
             :b => -0.25, :e => 0.1,
             :f => 0.2])
+        # H1 and H2 were bit-exact against SB when fam-hurdle landed
+        # (8dfe240). Later mainline changes reordered the emitted arithmetic:
+        # at main 97737cc2 the values sit -3.98e-13 (H1) and -5.97e-13 (H2)
+        # and the gradients 2.75e-12 from these pins (verdict
+        # 2026-09-27T20-14-37-417-1aindy4 first reported the H1 drift). That
+        # is floating-point reordering of the same math, not a regression;
+        # do not re-assert bit-exactness against SB.
         @test abs(Base.invokelatest(kern, u) - (-162.24640396336227)) < 1e-12
         prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
         g = similar(u)
@@ -368,5 +375,44 @@ _hur_sb_vec(names, pairs) = [Dict(pairs)[n] for n in names]
             :b => 50.24468439856483,
             :e => -23.02333499831524])
         @test maximum(abs.(g .- want)) < 1e-10
+    end
+    @testset "Z2 p_zero on its own predictor column" begin
+        # SB (brief 2026-09-28T05-14-33-679-1jfyeo3 on
+        # BayesianRegressionModels:rk:parity-nuisance-hurdle-p0, BRM 869db5c,
+        # StanBlocks 342436de, BridgeStan 2.9.0, Julia 1.10.11):
+        # log(lambda) ~ 1 + x; logit(p_zero) ~ 1 + z; every effect
+        # ~ Normal(0, 1); c ~ HurdlePoisson(lambda, p_zero);
+        # u = [0.2, -0.1, -0.5, 0.3]. Pinned at the oracle bar (rtol 1e-8
+        # value, 1e-6 gradient), not bit-exact: RK sits 1 ulp from SB here
+        # because the hurdle cell reuses the eta-direct Poisson endpoint
+        # (`observed * log_rate`, no `log(exp(eta))` round trip)
+        # (verdict 2026-09-27T20-14-37-417-1aindy4).
+        prog = quote
+            a ~ Normal(0, 1)
+            b ~ Normal(0, 1)
+            e ~ Normal(0, 1)
+            f ~ Normal(0, 1)
+            eta = a .+ b .* x
+            hu = e .+ f .* z
+            y .~ HurdlePoisson.(exp.(eta), logistic.(hu))
+        end
+        cols = Dict{Symbol,AbstractVector}(:y => [0, 1, 3, 0, 2, 1],
+            :x => copy(_HUR_X), :z => [1.0, 0.5, -0.5, 1.5, 0.0, -1.0])
+        bound, built, kern, lay = _hur_query(prog, cols)
+        names = coordinate_names(lay)
+        u = _hur_sb_vec(names, [:a => 0.2,
+            :b => -0.1, :e => -0.5,
+            :f => 0.3])
+        @test isapprox(Base.invokelatest(kern, u), -11.954631019953592;
+            rtol = 1e-8)
+        prep = prepare_sampler(built, bound, u; backend = _GEN_BACKEND)
+        g = similar(u)
+        sampler_value_and_gradient!(prep, g, u)
+        @test all(isfinite, g)
+        want = _hur_sb_vec(names, [:a => -0.06656148569502013,
+            :b => 2.2337634843341343,
+            :e => 0.11839324771698401,
+            :f => 1.2934091690330964])
+        @test isapprox(g, want; rtol = 1e-6)
     end
 end
