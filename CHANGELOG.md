@@ -16,6 +16,23 @@ older ReactiveKernels commit is then refused when it resolves, with
 failing or silently behaving differently at run time. Changes before 0.1.2
 are recorded in the git history only.
 
+## 0.1.5
+
+- A rebuild of one program reuses the code compiled for the first build: in
+  the same process, when a program generator evaluates each build in a module
+  of its own (BRM's lowering modules), and from a package image whose workload
+  built the same program. On 0.1.4 and earlier a position reader (`vectorize`,
+  `prepare_batched`, a `NativeScheduling` reader) of a rebuilt graph had new
+  types, and its first read compiled the whole reader again; so did every
+  executable of a program lowered in a fresh module, or holding a closure Julia
+  lowers itself (a local function, a generator, an exception scope, a boxed
+  cell, the `@trace` arms of a tensorized branch). A native function defined
+  anew in each lowering module is still a different function, and code that
+  calls it compiles again.
+- Preparation's type-stability check, the position-reader constructors and a
+  borrowed reader's `copy` compile once per process instead of once per
+  prepared program.
+
 ## 0.1.4
 
 - A per-row value that native lowering keeps as its arithmetic (a dotted

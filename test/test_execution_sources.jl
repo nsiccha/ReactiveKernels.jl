@@ -45,8 +45,11 @@ end
         op isa RK._KernelSourceOp || continue
         @test RK.kernel_sourceop_token(op) === nothing
         @test RK.kernel_sourceop_token(recipe.op) === RK._kernel_source_token(original.op)
-        @test RK._kernel_endpoint_source_module(op) === mod ===
-            RK._kernel_endpoint_source_module(recipe.op)
+        @test RK._kernel_endpoint_source_module(recipe.op) === mod
+        # refused: an execution copy's type names no authoring module, or each
+        # lowering module would make one program a new executable (snag
+        # `compiled-reader-be3cadbb`); lowering reads the original operation.
+        @test_throws ArgumentError RK._kernel_endpoint_source_module(op)
         @test RK._source_parameter_names(recipe.op, recipe.source, length(recipe.inputs)) !==
             nothing
         # refused: keying a token-free copy would merge separately authored
@@ -58,6 +61,111 @@ end
     newer = prepare(RK._kernel_eval_definition(mod, deepcopy(definition)))
     @test Base.invokelatest(newer, 2.0) == 8.0
     @test Base.invokelatest(kernels[1], 2.0) == 8.0
+end
+
+@testset "vectorized readers of fresh identical builds share executable types" begin
+    # A rebuilt graph's position readers hold the token-free execution copies
+    # `prepare` holds, so a rebuild of one program reuses the reader compiled
+    # for the first build (snag `compiled-reader-be3cadbb`).
+    mod = Module(gensym(:ExecutionSource))
+    Core.eval(mod, :(using ReactiveKernels; shift(x) = x + 1.0))
+    definition = :(model(position, shared::Float64) = begin
+        invariant::Float64 = 2.0 * shared
+        result = shift(position) * invariant
+        return result
+    end)
+    specs = [RK._kernel_eval_definition(mod, deepcopy(definition)) for _ in 1:2]
+    kernels = [prepare(spec) for spec in specs]
+    positions = [1.0, 2.0, 3.0]
+    expected = (positions .+ 1.0) .* 3.0
+    schedule = NativeScheduling(; chunk_size = 2)
+    for options in ((; reuse = false), (; reuse = true), (; reuse = true, schedule))
+        readers = [Base.invokelatest(vectorize, kernel; batched = :position, options...)
+                   for kernel in kernels]
+        @test typeof(readers[1]) === typeof(readers[2])
+        for reader in readers
+            @test Base.invokelatest(reader, positions, 1.5) == expected
+        end
+    end
+    # Each reader's lowered recipes still name its own definition.
+    source = [first(filter(r -> r.op isa RK._KernelSourceOp, kernel.lowered_recipes))
+              for kernel in kernels]
+    @test RK.kernel_sourceop_token(source[1].op) !== RK.kernel_sourceop_token(source[2].op)
+end
+
+@testset "reader construction compiles once, not once per program" begin
+    # The type-stability check and the position-reader constructors read only
+    # a kernel's plan and fields; specialized on a large program's kernel type
+    # they took a third of its first read (snag `compiled-reader-be3cadbb`).
+    function reader(scale)
+        graph = Graph()
+        x = value!(graph, :x, Float64)
+        y = value!(graph, :y, Float64)
+        add!(graph, (x,) => y, v -> scale * v + Float64(length(string(scale))))
+        vectorize(prepare(graph; have = (x,), want = y); batched = :x, reuse = true)
+    end
+    count_specializations(f) = sum(m -> count(!isnothing, Base.specializations(m)), methods(f))
+    copy_method = which(copy, (RK.BorrowedBatchedKernel,))
+    count_specializations(::typeof(copy)) = count(!isnothing, Base.specializations(copy_method))
+    readers = [reader(2.0), reader(3)]
+    @test typeof(readers[1]) !== typeof(readers[2])
+    @test readers[1]([1.0, 2.0]) == [5.0, 7.0]
+    @test readers[2]([1.0, 2.0]) == [4.0, 7.0]
+    copies = map(copy, readers)
+    @test copies[1]([1.0, 2.0]) == [5.0, 7.0]
+    before = map(count_specializations, (RK._check_uninferred_values, RK._replica_graph,
+                                         RK._borrowed_batch, copy))
+    readers = [reader(4.0f0), reader(5//1)]
+    copies = map(copy, readers)
+    @test copies[2]([1.0, 2.0]) == [9.0, 14.0]
+    @test map(count_specializations, (RK._check_uninferred_values, RK._replica_graph,
+                                      RK._borrowed_batch, copy)) == before
+end
+
+@testset "generated code orders values by declaration, not by identity" begin
+    # A value's identity orders by the key of the namespace that allocated it,
+    # which differs in every process: values a package image made and values
+    # made at run time sorted one way while an image was generated and another
+    # at run time, so the image's compiled reader did not apply (snag
+    # `compiled-reader-be3cadbb`). Generated code takes the plan's order.
+    function in_namespace(f, key)
+        previous = RK._VALUE_NAMESPACE[]
+        RK._VALUE_NAMESPACE[] = RK.ValueNamespace(UInt(key))
+        try
+            f()
+        finally
+            RK._VALUE_NAMESPACE[] = previous
+        end
+    end
+    graph = Graph()
+    a = in_namespace(() -> value!(graph, :a, Float64), 2)
+    b = in_namespace(() -> value!(graph, :b, Float64), 1)
+    c = value!(graph, :c, Float64)
+    add!(graph, (a, b) => c, +)
+    p = plan(graph; have = (a, b), want = c)
+    ids = [RK.canon_id(graph, v.id) for v in (c, b, a)]
+    @test sort(ids) != ids[[3, 2, 1]]
+    @test RK._declaration_order(p, ids) == ids[[3, 2, 1]]
+    @test_throws ArgumentError RK._declaration_order(p, [RK.canon_id(graph, value!(graph, :d, Float64).id)])
+end
+
+@testset "generated bodies name globals by their owners" begin
+    # A lowering module (a program generator's, or an image's scope module
+    # standing in for it) qualifies the globals a body reads; naming them by the
+    # bindings they resolve to gives one body in every lowering and process
+    # (snag `compiled-reader-be3cadbb`).
+    named = Module(:LoweringModule)
+    Core.eval(named, :(const data = [1.0]; helper(x) = x))
+    scope = RK._kernel_scope_module(Module(gensym(:Image)), named,
+        :(reshape(view(data, :), 1) .* Float64(helper(1))))
+    for (name, owner) in ((:reshape, Base), (:view, Base), (:(:), Base), (:Float64, Core))
+        @test RK._canonical_global(GlobalRef(named, name)) == GlobalRef(owner, name)
+        @test RK._canonical_global(GlobalRef(scope, name)) == GlobalRef(owner, name)
+    end
+    for name in (:data, :helper)
+        @test RK._canonical_global(GlobalRef(named, name)) == GlobalRef(named, name)
+        @test RK._canonical_global(GlobalRef(scope, name)) == GlobalRef(named, name)
+    end
 end
 
 @testset "execution branch metadata preserves host branch behavior" begin

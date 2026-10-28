@@ -4052,13 +4052,13 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     # itself. Do not reinterpret those scopes through RGF's closure converter.
     # The native closure remains the ordinary path in its visible world.
     _kernel_source_native_scope(source.args[2]) &&
-        return _KernelSourceFunction(f, nothing, nothing)
+        return _KernelSourceFunction(_kernel_shared_closure(f, source), nothing, nothing)
     names = fieldnames(typeof(f))
     captures = NamedTuple{names}(Tuple(Any[getfield(f, i) for i in 1:length(names)]))
     # Julia owns shared lexical cells too: retain their exact read/write and
     # undefined-binding behavior rather than reconstructing Box operations.
     any(value -> value isa Core.Box, values(captures)) &&
-        return _KernelSourceFunction(f, nothing, nothing)
+        return _KernelSourceFunction(_kernel_shared_closure(f, source), nothing, nothing)
     environment = gensym(:captures)
     bindings = [Expr(:(=), name, Expr(:call, GlobalRef(Core, :getfield),
         environment, QuoteNode(name))) for name in names]
@@ -4070,6 +4070,59 @@ Base.@nospecializeinfer function _kernel_source_function(@nospecialize(f), sourc
     runtime_f = compile(qualified)
     T = _KernelSourceFunction{typeof(f),typeof(runtime_f),typeof(captures),Val{:guarded}}
     _kernel_new_instance(T, (f, runtime_f, captures))::_KernelSourceFunction
+end
+
+# Julia lowers a closure it owns (above) itself, and each evaluation of one
+# source defines a new closure type, so each build of one program had its own
+# executable types and compiled its readers and kernels again (snag
+# `compiled-reader-be3cadbb`: the tensorized arms of a branch in a kernel BRM
+# evaluates into a fresh module per build). A closure whose source, up to
+# generated names and the owners of its qualified globals (`_canonical_globals`),
+# equals an earlier closure's, from a module that binds every unqualified name
+# the source mentions to the same value, takes that closure's type,
+# holding its own captured values: the two lower to the same method and read
+# the same bindings. A package image records its closures, so a build after
+# loading the image takes the image's types and runs the code it compiled.
+const _SHARED_CLOSURES = Dict{Any,Vector{Any}}()
+const _SHARED_CLOSURES_LOCK = ReentrantLock()
+
+Base.@nospecializeinfer function _kernel_shared_closure(@nospecialize(f), source::Expr)
+    T = typeof(f)
+    T isa DataType || return f
+    home = parentmodule(T)
+    names = _kernel_mentioned_names!(Set{Symbol}(), source)
+    key = (:closure, RuntimeGeneratedFunctions.expr_to_id(
+        _canonical_locals(_canonical_globals(source))))
+    entry = _image_shared_closure(key, home, names)
+    if entry === nothing
+        entry = @lock _SHARED_CLOSURES_LOCK begin
+            entries = get!(() -> Any[], _SHARED_CLOSURES, key)
+            index = findfirst(e -> _kernel_same_scope(first(e), home, names), entries)
+            index === nothing ? (push!(entries, (home, T.name.wrapper)); last(entries)) :
+                entries[index]
+        end
+        target = _image_target_module()
+        target === nothing || _record_image_closure!(target, key, entry)
+    end
+    wrapper = last(entry)
+    wrapper === T.name.wrapper && return f
+    S = isempty(T.parameters) ? wrapper : wrapper{T.parameters...}
+    (S isa DataType && fieldnames(S) == fieldnames(T) && fieldtypes(S) == fieldtypes(T)) ||
+        return f
+    _kernel_new_instance(S, Tuple(Any[getfield(f, i) for i in 1:fieldcount(T)]))
+end
+
+# Whether `names` resolve to the same bindings in both modules.
+function _kernel_same_scope(a::Module, b::Module, names::Set{Symbol})
+    a === b && return true
+    for name in names
+        defined = Base.invokelatest(isdefined, a, name)
+        defined == Base.invokelatest(isdefined, b, name) || return false
+        defined || continue
+        Base.invokelatest(getglobal, a, name) === Base.invokelatest(getglobal, b, name) ||
+            return false
+    end
+    true
 end
 
 function _kernel_source_native_scope(ex)
@@ -5481,13 +5534,23 @@ function _kernel_eval_module(mod::Module, construction::Expr)
 end
 
 # A fresh child module of `parent` in which `construction` resolves every name
-# it reads as in `mod`.
+# it reads as in `mod`. It records `mod` as its origin (`_kernel_scope_origin`).
 function _kernel_scope_module(parent::Module, mod::Module, construction::Expr)
     names = _kernel_mentioned_names!(Set{Symbol}(), construction)
     # The construction may read bindings `mod` gained just before it was built.
     aliases = Base.invokelatest(_kernel_scope_aliases, mod, names)
+    push!(aliases, Expr(:const, Expr(:(=), _KERNEL_SCOPE_ORIGIN, mod)))
     Core.eval(parent, Expr(:module, false, gensym(nameof(mod)), Expr(:block, aliases...)))
 end
+
+# The module a scope module stands in for, or `mod` itself. A generated body
+# names a scope module's alias by the binding it stands in for
+# (`_canonical_globals`), so a program built while an image is generated reads
+# the same references as one built at run time.
+const _KERNEL_SCOPE_ORIGIN = Symbol("#_ReactiveKernels_scope_origin")
+_kernel_scope_origin(mod::Module) =
+    Base.invokelatest(isdefined, mod, _KERNEL_SCOPE_ORIGIN) ?
+        Base.invokelatest(getglobal, mod, _KERNEL_SCOPE_ORIGIN)::Module : mod
 
 function _kernel_scope_aliases(mod::Module, names::Set{Symbol})
     aliases = Any[]

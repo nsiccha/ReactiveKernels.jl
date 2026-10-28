@@ -121,8 +121,47 @@ end
     own = build_kernel(other_plan)
     reused = prepare_query(built, other_plan, :sampler)
     direct = prepare_query(own, other_plan, :sampler)
+    # Each lowering namespace is a new module, and `basis` a new kernel in it;
+    # the two builds still prepare to one executable type, so the second
+    # reuses the code compiled for the first (snag `compiled-reader-be3cadbb`).
+    @test typeof(reused) === typeof(direct)
     for u in ([-0.3], [0.0], [0.6])
         @test Base.invokelatest(reused, u) == Base.invokelatest(direct, u)
+    end
+end
+
+@testset "fresh namespaces share a kernel's branch closures" begin
+    # A kernel with a lazy branch, evaluated anew in each lowering namespace (as
+    # BRM evaluates its kernels). Julia lowers the branch's tensorized arms
+    # itself, so each namespace defined new closure types; the two builds now
+    # take one type, as they read the same bindings (snag `compiled-reader-be3cadbb`).
+    function branch_namespace()
+        mod = Module(gensym(:FreshBranch))
+        Core.eval(mod, :(using ReactiveKernelsPPL, Distributions))
+        Core.eval(mod, :(import ReactiveKernels))
+        Core.eval(mod, :(ReactiveKernels.@kernel signed(v) = begin
+            w = sum(v) > 0 ? v : -v
+            return w
+        end))
+        mod
+    end
+    ast = quote
+        intercept ~ Normal(0.0, 1.0)
+        mean = signed(intercept .+ x)
+        y .~ Normal.(mean, 1.0)
+    end
+    queries = map(1:2) do _
+        plan = bind_data(lower_rkppl(ast, keys(DATA); mod = branch_namespace(),
+            conditioned = (:y,)), DATA)
+        prepare_query(build_kernel(plan), plan, :sampler)
+    end
+    @test typeof(queries[1]) === typeof(queries[2])
+    for intercept in (-0.3, 0.6)
+        v = intercept .+ DATA.x
+        location = sum(v) > 0 ? v : -v
+        expected = logpdf(Normal(), intercept) + sum(logpdf.(Normal.(location, 1.0), DATA.y))
+        @test Base.invokelatest(queries[2], [intercept]) ≈ expected
+        @test Base.invokelatest(queries[1], [intercept]) == Base.invokelatest(queries[2], [intercept])
     end
 end
 
