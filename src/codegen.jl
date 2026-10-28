@@ -4225,15 +4225,16 @@ Base.@nospecializeinfer function _lower_authored_plate_cell!(
             Expr(:call, GlobalRef(@__MODULE__, :_plate_cell_slice), raw[position], cell)))
         push!(slices, slice)
     end
-    # A shared array read only at the cell's own row whose producer computes
-    # it row by row is computed at that row (`_CellEmitter`, cell_windows.jl).
+    # A shared array read only at the cell's own rows whose producer computes
+    # it row by row is computed at those rows (`_CellEmitter`, cell_windows.jl).
     if windows !== nothing
         d = windows.pushdowns
-        for (position, batched) in sort!(collect(get(d.captures, recipe.id,
-                Dict{Int,Int}())))
+        for (position, (batched, via)) in sort!(collect(get(d.captures, recipe.id,
+                Dict{Int,Tuple{Int,Int}}())))
             value = canon_id(d.graph, plate_values[position].id)
             value in d.pushed || continue
-            slices[position] = _cell_capture!(windows, value, slices[batched])
+            slices[position] = _cell_capture!(windows, value, slices[batched],
+                via == 0 ? nothing : slices[via])
         end
     end
     pointwise = gensym(:cell_pointwise)

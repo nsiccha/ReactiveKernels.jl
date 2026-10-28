@@ -50,44 +50,70 @@
 # operation table, and `on_error = :ignore` twins, is unchanged.
 
 """
-    _CellWindow(data, row, shape)
+    _CellWindow(data, rows, shape)
 
-Rows of a value read by one cell. `data` holds the value's rows `row:row`,
-every later dimension whole; `shape` is the value's full axes, or `nothing`
-when only row reads `v[I, j...]` are made of it. Reading any other row throws
-`BoundsError`.
+Rows of a value read by one cell. `rows` is one row (an `Int`), or the rows a
+gather by an integer vector reads (a `Vector{Int}`, in the order read, repeats
+allowed). `data` holds the value at those rows, in that order along its first
+axis, every later dimension whole; `shape` is the value's full axes, or
+`nothing` when only row reads `v[I, j...]` are made of it. Reading any other
+row throws `BoundsError`.
 """
-struct _CellWindow{D,S}
+struct _CellWindow{D,R<:Union{Int,Vector{Int}},S}
     data::D
-    row::Int
+    rows::R
     shape::S
 end
 
-@inline _cell_local_row(data) = firstindex(data, 1)
+# The position along `data`'s first axis of row `row`; `at` is the read.
+@inline function _cell_local_row(w::_CellWindow{<:Any,Int}, row, at)
+    row == w.rows || throw(BoundsError(w, at))
+    firstindex(w.data, 1)
+end
+@inline function _cell_local_row(w::_CellWindow{<:Any,Vector{Int}}, row, at)
+    k = findfirst(==(row), w.rows)
+    k === nothing && throw(BoundsError(w, at))
+    firstindex(w.data, 1) + k - 1
+end
+
+# Whether gather index `I` reads exactly a vector value's window rows, in
+# order: then the gather is the window's data.
+@inline _cell_reads_rows(w::_CellWindow{<:Any,Int}, I) = false
+@inline _cell_reads_rows(w::_CellWindow{<:Any,Vector{Int}}, I) =
+    isone(firstindex(w.data, 1)) && I == w.rows
 
 # Linear reads `v[q]`, as the cell and single-index gathers make them.
-@inline function Base.getindex(w::_CellWindow{<:Any,Tuple{}}, q::Integer)
+@inline function Base.getindex(w::_CellWindow{<:Any,<:Any,Tuple{}}, q::Integer)
     q == 1 || throw(BoundsError(w, q))
     w.data[]
 end
-@inline function Base.getindex(w::_CellWindow{<:Any,<:Tuple{Any,Vararg{Any}}}, q::Integer)
+@inline function Base.getindex(w::_CellWindow{<:Any,<:Any,<:Tuple{Any,Vararg{Any}}},
+                               q::Integer)
     position = Tuple(CartesianIndices(w.shape)[q])
-    first(position) == w.row || throw(BoundsError(w, q))
-    w.data[_cell_local_row(w.data), Base.tail(position)...]
+    w.data[_cell_local_row(w, first(position), q), Base.tail(position)...]
 end
-@inline Base.getindex(w::_CellWindow{<:Any,<:Tuple}, I::AbstractVector{<:Integer}) =
+@inline Base.getindex(w::_CellWindow{<:Any,<:Any,<:Tuple}, I::AbstractVector{<:Integer}) =
     [w[q] for q in I]
+# A vector value with one-based axes: linear position `q` is row `q`.
+@inline function Base.getindex(w::_CellWindow{<:Any,<:Any,<:Tuple{Base.OneTo}},
+                               I::AbstractVector{<:Integer})
+    _cell_reads_rows(w, I) && return w.data[:]
+    [w[q] for q in I]
+end
 
 # Row reads `v[i, j...]` and gathers `v[I, j...]`.
-@inline function Base.getindex(w::_CellWindow, i::Integer, j::Integer, rest::Integer...)
-    i == w.row || throw(BoundsError(w, (i, j, rest...)))
-    w.data[_cell_local_row(w.data), j, rest...]
+@inline Base.getindex(w::_CellWindow, i::Integer, j::Integer, rest::Integer...) =
+    w.data[_cell_local_row(w, i, (i, j, rest...)), j, rest...]
+@inline function Base.getindex(w::_CellWindow, I::AbstractVector{<:Integer}, j::Integer,
+                               rest::Integer...)
+    _cell_reads_rows(w, I) && return w.data[:, j, rest...]
+    [w[i, j, rest...] for i in I]
 end
-@inline Base.getindex(w::_CellWindow, I::AbstractVector{<:Integer}, j::Integer,
-                      rest::Integer...) = [w[i, j, rest...] for i in I]
 
-Base.show(io::IO, w::_CellWindow) =
-    print(io, "cell window at row ", w.row, " of ", summary(w.data))
+Base.show(io::IO, w::_CellWindow{<:Any,Int}) =
+    print(io, "cell window at row ", w.rows, " of ", summary(w.data))
+Base.show(io::IO, w::_CellWindow{<:Any,Vector{Int}}) =
+    print(io, "cell window at rows ", w.rows, " of ", summary(w.data))
 
 # The full broadcast axes of an operand (`Base.broadcastable` as `broadcasted`
 # applies it); folded across operands by `_plate_broadcast_shape`.
@@ -95,34 +121,79 @@ Base.show(io::IO, w::_CellWindow) =
 
 # Row `row` of a broadcast operand: a one-row view, or the operand itself when
 # broadcasting extrudes its first dimension. Always a `UnitRange` view (a
-# union of range types defeats native Reverse type analysis).
+# union of range types defeats native Reverse type analysis). Rows `rows` are
+# a view at those rows, and an extruded operand repeats its row.
 @inline _cell_row_slice(arg, row) = arg
-@inline _cell_row_slice(arg::Tuple, row) = length(arg) == 1 ? arg : (arg[row],)
-@inline function _cell_row_slice(arg::AbstractArray{<:Any,N}, row) where {N}
+@inline _cell_row_slice(arg::Tuple, row::Integer) = length(arg) == 1 ? arg : (arg[row],)
+@inline _cell_row_slice(arg::Tuple, rows::Vector{Int}) =
+    [arg[length(arg) == 1 ? 1 : row] for row in rows]
+@inline function _cell_row_slice(arg::AbstractArray{<:Any,N}, row::Integer) where {N}
     N == 0 && return arg
     axis = axes(arg, 1)
     position = length(axis) == 1 ? first(axis) : row
     view(arg, position:position, ntuple(_ -> Colon(), Val(N - 1))...)
 end
+@inline function _cell_row_slice(arg::AbstractArray{<:Any,N}, rows::Vector{Int}) where {N}
+    N == 0 && return arg
+    axis = axes(arg, 1)
+    positions = length(axis) == 1 ? fill(Int(first(axis)), length(rows)) : rows
+    view(arg, positions, ntuple(_ -> Colon(), Val(N - 1))...)
+end
 
 # The full axes of a matrix-vector product `A * v`.
 @inline _cell_factor_shape(A::AbstractMatrix) = (axes(A, 1),)
 
-# Row `row` of a product's left factor; bounds-checked, never extruded.
-@inline _cell_factor_rows(arg::AbstractArray{<:Any,N}, row) where {N} =
-    view(arg, row:row, ntuple(_ -> Colon(), Val(N - 1))...)
+# The full axes of a product `A * w` of two operands, from the full axes of its
+# left factor, as `*` forms them: a matrix-vector product is a vector, a
+# product with a matrix spans its columns, a scaling keeps the factor's axes.
+@inline _cell_product_shape(factor::Tuple, w::AbstractVector) = (first(factor),)
+@inline _cell_product_shape(factor::Tuple, w::AbstractMatrix) = (first(factor), axes(w, 2))
+@inline _cell_product_shape(factor::Tuple, w::Number) = factor
 
-# A dotted expression's row must lie in its full first axis.
-@inline function _cell_check_row(shape::Tuple, row)
+# The full axes of a column read `A[:, j...]`: `A`'s first axis.
+@inline _cell_column_shape(shape::Tuple) = (first(shape),)
+
+# The full axes of `hcat(xs...)` from its operands' full axes (`()` for a
+# number), as `hcat` forms them: the second dimension adds up, every other
+# must agree (a missing trailing dimension counts as 1), or `DimensionMismatch`.
+@generated function _cell_hcat_shape(shapes::Tuple)
+    ranks = Int[fieldcount(T) for T in fieldtypes(shapes)]
+    n = max(2, maximum(ranks; init = 0))
+    size(i, d) = d <= ranks[i] ? :(length(shapes[$i][$d])) : 1
+    checks = Any[]
+    for i in 2:length(ranks), d in 1:n
+        d == 2 && continue
+        push!(checks, :($(size(1, d)) == $(size(i, d)) || throw(DimensionMismatch(
+            string("hcat operands mismatch in dimension ", $d)))))
+    end
+    width = foldl((a, i) -> :($a + $(size(i, 2))), 2:length(ranks); init = size(1, 2))
+    axes = Any[d == 2 ? :(Base.OneTo($width)) : :(Base.OneTo($(size(1, d)))) for d in 1:n]
+    Expr(:block, checks..., Expr(:tuple, axes...))
+end
+
+# Rows of a product's left factor; bounds-checked, never extruded.
+@inline _cell_factor_rows(arg::AbstractArray{<:Any,N}, row::Integer) where {N} =
+    view(arg, row:row, ntuple(_ -> Colon(), Val(N - 1))...)
+@inline _cell_factor_rows(arg::AbstractArray{<:Any,N}, rows::Vector{Int}) where {N} =
+    view(arg, rows, ntuple(_ -> Colon(), Val(N - 1))...)
+
+# A dotted expression's rows must lie in its full first axis.
+@inline function _cell_check_row(shape::Tuple, row::Integer)
     valid = isempty(shape) ? row == 1 : checkindex(Bool, first(shape), row)
     valid || throw(BoundsError(CartesianIndices(shape), row))
     row
 end
+@inline function _cell_check_row(shape::Tuple, rows::Vector{Int})
+    foreach(row -> _cell_check_row(shape, row), rows)
+    rows
+end
 
-# The row of a computed operand that row `row` of its reader needs.
-@inline _cell_leaf_row(shape::Tuple{}, row) = 1
-@inline _cell_leaf_row(shape::Tuple, row) =
+# The rows of a computed operand that rows `row` of its reader need.
+@inline _cell_leaf_row(shape::Tuple{}, row::Integer) = 1
+@inline _cell_leaf_row(shape::Tuple, row::Integer) =
     length(first(shape)) == 1 ? Int(first(first(shape))) : row
+@inline _cell_leaf_row(shape::Tuple, rows::Vector{Int}) =
+    Int[_cell_leaf_row(shape, row) for row in rows]
 
 # A row window still spans a plate's trailing axes. A multidimensional cell
 # selects its remaining coordinates from that window; a vector row is already
@@ -134,16 +205,20 @@ end
     _plate_cell_slice(value, local_cell)
 end
 
-# The row holding linear position `q` of a value with full axes `shape`.
+# The row holding linear position `q` of a value with full axes `shape`; the
+# rows holding positions `q`, for a gather by an integer vector.
 @inline function _cell_linear_row(shape::Tuple{}, q::Integer)
     q == 1 || throw(BoundsError(CartesianIndices(shape), q))
     1
 end
 @inline _cell_linear_row(shape::Tuple, q::Integer) =
     Int(first(Tuple(CartesianIndices(shape)[q])))
+@inline _cell_linear_row(shape::Tuple, q::AbstractVector{<:Integer}) =
+    Int[_cell_linear_row(shape, p) for p in q]
 
-# The one index a row of a gather index holds.
-@inline _cell_gather_row(index) = Int(only(index))
+# The index a row of a gather index holds, or the indices its rows hold.
+@inline _cell_gather_row(index, row::Integer) = Int(only(index))
+@inline _cell_gather_row(index, rows::Vector{Int}) = Int[i for i in index]
 
 # ---------------------------------------------------------------- analysis
 
@@ -252,8 +327,25 @@ function _cell_form(r::Recipe)
     if _cell_materialize(native)
         lazy = native.args[2]
         _cell_broadcasted(lazy) && lazy!(lazy) || return nothing
+    elseif native isa Expr && native.head === :ref && length(native.args) >= 3 &&
+           native.args[2] === :(:) && native.args[1] isa Symbol &&
+           haskey(position, native.args[1]) && all(i -> i isa Int, native.args[3:end])
+        # A column read `A[:, j...]`: row `r` is `A[r, j...]`.
+        kind = :columns
+        push!(uses[position[native.args[1]]], :leaf)
+        push!(leaves, position[native.args[1]])
     elseif native isa Expr && native.head === :ref
         gather!(native) || return nothing
+    elseif native isa Expr && native.head === :call && length(native.args) >= 2 &&
+           native.args[1] == GlobalRef(@__MODULE__, :_native_hcat) &&
+           all(arg -> arg isa Symbol && haskey(position, arg), native.args[2:end])
+        # `hcat(a, b, ...)`: row `r` is the `hcat` of each operand's row `r`.
+        # `leaves` keeps every operand in order, repeats included.
+        kind = :hcat
+        for arg in native.args[2:end]
+            push!(uses[position[arg]], :leaf)
+            push!(leaves, position[arg])
+        end
     elseif native isa Expr && native.head === :call && length(native.args) >= 3 &&
            _cell_base_product(native.args[1], mod, params) &&
            native.args[2] isa Symbol && haskey(position, native.args[2])
@@ -277,7 +369,7 @@ function _cell_form(r::Recipe)
         push!(roles, role)
     end
     gather_index = Int[first(get(gathers, j, (0, false))) for j in eachindex(params)]
-    _CellForm(kind, roles, gather_index, unique!(leaves), operand)
+    _CellForm(kind, roles, gather_index, kind === :hcat ? leaves : unique!(leaves), operand)
 end
 
 # An authored plate's value, row by row: its batched arguments are broadcast
@@ -298,8 +390,10 @@ function _cell_plate_form(r::Recipe)
     wants = Set(canon_id(ig, w.id) for w in inner.want)
     for k in atomic
         roots[k] in wants && continue
-        b = _cell_capture_reader(inner, roots, atomic, roots[k])
-        b === nothing && continue
+        read = _cell_capture_reader(inner, roots, atomic, roots[k])
+        read === nothing && continue
+        b, via = read
+        via == 0 || continue
         roles[k] = :linear_gather
         gather_index[k] = b
         roles[b] = :index
@@ -317,29 +411,48 @@ function _cell_base_product(callee, mod, params)
 end
 
 # The positions `k` of the cell's shared arguments that its body reads only as
-# `v[q]`, `q` the element of one batched argument `b`, as `k => b`.
+# `v[q]` or `v[w[q]]`, `q` the element of one batched argument `b` and `w`
+# another shared argument, as `k => (b, w)` (`w = 0` for `v[q]`). The element
+# `q`, or `w[q]`, is a linear position or an integer vector of them.
 function _cell_capture_positions(r::Recipe, static_type)
     plate = (r.op::_AuthoredPlateCellOp).plate
     atomic = typeof(plate).parameters[2]
     inner = plate.kernel.plan
     ig = inner.graph
     roots = ValueId[canon_id(ig, v.id) for v in inner.have]
-    length(roots) == length(r.inputs) - 1 && allunique(roots) || return Dict{Int,Int}()
+    captures = Dict{Int,Tuple{Int,Int}}()
+    length(roots) == length(r.inputs) - 1 && allunique(roots) || return captures
     wants = Set(canon_id(ig, w.id) for w in inner.want)
-    captures = Dict{Int,Int}()
     for k in atomic
         roots[k] in wants && continue
-        b = _cell_capture_reader(inner, roots, atomic, roots[k])
-        b === nothing && continue
-        static_type(r.inputs[1 + b]) <: AbstractArray{<:Integer} || continue
-        captures[k] = b
+        read = _cell_capture_reader(inner, roots, atomic, roots[k])
+        read === nothing && continue
+        b, via = read
+        lane = static_type(r.inputs[1 + b])
+        if via == 0
+            _cell_positions_type(lane) || continue
+        else
+            lane <: AbstractArray{<:Integer} &&
+                _cell_positions_type(static_type(r.inputs[1 + via])) || continue
+        end
+        captures[k] = read
     end
     captures
 end
 
+# An array whose elements are linear positions, or integer vectors of them.
+_cell_positions_type(T) =
+    T <: AbstractArray{<:Integer} || T <: AbstractArray{<:AbstractVector{<:Integer}}
+
+# How the plate body reads shared argument `cid`: only as `v[q]` or `v[w[q]]`,
+# `q` the element of one batched argument `b`, `w` one other shared argument,
+# the same way at every read. `(b, w)`, `w = 0` for `v[q]`, or `nothing`.
 function _cell_capture_reader(inner::Plan, roots, atomic, cid)
     ig = inner.graph
-    batched = nothing
+    found = nothing
+    root(params, recipe, name) = let j = findfirst(==(name), params)
+        j === nothing ? nothing : findfirst(==(canon_id(ig, recipe.inputs[j].id)), roots)
+    end
     for recipe in inner.recipes
         slots = findall(v -> canon_id(ig, v.id) == cid, collect(recipe.inputs))
         isempty(slots) && continue
@@ -347,30 +460,34 @@ function _cell_capture_reader(inner::Plan, roots, atomic, cid)
         analyzed = _cell_native(recipe)
         analyzed === nothing && return nothing
         native, params, _ = analyzed
-        reads = Symbol[]
+        reads = Any[]
         _cell_capture_reads!(reads, native, Set(params[slots])) || return nothing
-        for q in reads
-            j = findfirst(==(q), params)
-            j === nothing && return nothing
-            b = findfirst(==(canon_id(ig, recipe.inputs[j].id)), roots)
+        for read in reads
+            q, via = read isa Symbol ? (read, nothing) : (read.args[2], read.args[1])
+            b = root(params, recipe, q)
             (b === nothing || b in atomic) && return nothing
-            batched === nothing && (batched = b)
-            batched == b || return nothing
+            w = via === nothing ? 0 : root(params, recipe, via)
+            (w === nothing || (w != 0 && !(w in atomic)) || w == b) && return nothing
+            found === nothing && (found = (b, w))
+            found == (b, w) || return nothing
         end
     end
-    batched
+    found
 end
 
-# Whether `ex` reads the names `captured` only as `v[q]` with `q` a name;
-# each such `q` is recorded.
+# Whether `ex` reads the names `captured` only as `v[q]` or `v[w[q]]`, with `q`
+# and `w` names; each such `q`, or `w[q]`, is recorded.
 function _cell_capture_reads!(reads, ex, captured)
     ex isa Symbol && return !(ex in captured)
     ex isa Expr || return true
     ex.head in _CELL_PLAIN_HEADS || return false
     if ex.head === :ref && length(ex.args) == 2 && ex.args[1] isa Symbol &&
        ex.args[1] in captured
-        ex.args[2] isa Symbol && !(ex.args[2] in captured) || return false
-        push!(reads, ex.args[2])
+        index = ex.args[2]
+        name(x) = x isa Symbol && !(x in captured)
+        name(index) || Meta.isexpr(index, :ref, 2) && all(name, index.args) ||
+            return false
+        push!(reads, index)
         return true
     end
     all(arg -> _cell_capture_reads!(reads, arg, captured), ex.args)
@@ -384,9 +501,10 @@ producers computed only at their readers' rows (their table slots are kept and
 recorded in `slots` as lowering reaches them: an operation's slot, or, for an
 authored plate, the table length before its reserved slots, with the
 argument values it is lowered with in `plates`). `captures[cell recipe id]`
-maps each shared argument position read at the cell's own row to the batched
-argument holding that row; `batched[cell recipe id]` names the cell's ordinary
-batched argument positions.
+maps each shared argument position read at the cell's own rows to the batched
+argument holding those rows and the shared argument they are read through
+(`_cell_capture_positions`); `batched[cell recipe id]` names the cell's
+ordinary batched argument positions.
 """
 struct _CellPushdowns
     graph::Graph
@@ -394,11 +512,14 @@ struct _CellPushdowns
     recipes::Set{Int}
     producer::Dict{ValueId,Recipe}
     forms::Dict{Int,_CellForm}
-    captures::Dict{Int,Dict{Int,Int}}
+    captures::Dict{Int,Dict{Int,Tuple{Int,Int}}}
     batched::Dict{Int,Set{Int}}
     slots::Dict{Int,Int}
     plates::Dict{Int,Any}
 end
+
+# The roles in which a producer reads an input at its own rows.
+const _CELL_ROW_ROLES = (:leaf, :gather, :linear_gather, :factor)
 
 function _cell_pushdowns(p::Plan)
     any(r -> r.op isa _AuthoredPlateCellOp, p.recipes) || return nothing
@@ -425,27 +546,36 @@ function _cell_pushdowns(p::Plan)
         f === nothing || (forms[r.id] = f)
         f
     end
-    # A read needs the value's full shape unless it reads rows `v[I, j...]`.
-    needs_shape(role) = role !== :gather
-    # Full axes are known for pointwise values and matrix-vector products.
+    # A read needs the value's full shape unless it reads rows `v[I, j...]`
+    # or takes rows of a product's left factor.
+    needs_shape(role) = !(role in (:gather, :factor))
+    # Full axes are known for pointwise values, column reads and `hcat`s, and
+    # for a product of two operands whose right operand is an array or a number
+    # (`_cell_product_shape`) and whose left factor's axes are known.
     function shaped(cid)
         f = forms[only(producers[cid]).id]
-        f.kind === :pointwise && return true
+        f.kind in (:pointwise, :columns, :hcat) && return true
         f.operand == 0 && return false
         inputs = only(producers[cid]).inputs
-        static_type(inputs[findfirst(==(:factor), f.roles)]) <: AbstractMatrix &&
-            static_type(inputs[f.operand]) <: AbstractVector
+        factor = cidof(inputs[findfirst(==(:factor), f.roles)])
+        static_type(inputs[f.operand]) <: Union{AbstractVecOrMat,Number} &&
+            (form(factor) === nothing || shaped(factor))
     end
     fits(cid, role) = form(cid) !== nothing && (!needs_shape(role) || shaped(cid))
-    # Static operand requirements: integer vector indices, array factors.
+    # Static operand requirements: integer vector indices, array factors (a
+    # column read and an `hcat` are arrays).
+    array_form(v) = let f = form(cidof(v))
+        f !== nothing && f.kind in (:columns, :hcat)
+    end
     function operands_fit(cid)
         r = only(producers[cid])
         all(zip(forms[r.id].roles, r.inputs)) do (role, input)
             role === :index ? static_type(input) <: AbstractVector{<:Integer} :
-            role === :factor ? static_type(input) <: AbstractArray : true
+            role === :factor ? static_type(input) <: AbstractArray || array_form(input) :
+            true
         end
     end
-    captures = Dict{Int,Dict{Int,Int}}()
+    captures = Dict{Int,Dict{Int,Tuple{Int,Int}}}()
     batched = Dict{Int,Set{Int}}()
     pushed = Set{ValueId}()
     work = ValueId[]
@@ -470,7 +600,7 @@ function _cell_pushdowns(p::Plan)
         r = only(producers[cid])
         f = forms[r.id]
         for (j, input) in enumerate(r.inputs)
-            f.roles[j] in (:leaf, :gather, :linear_gather) && reach!(cidof(input), f.roles[j])
+            f.roles[j] in _CELL_ROW_ROLES && reach!(cidof(input), f.roles[j])
         end
     end
     # Keep a value at rows only while every reader reads it at rows.
@@ -481,7 +611,7 @@ function _cell_pushdowns(p::Plan)
             ok = all(get(readers, cid, Recipe[])) do reader
                 slots = findall(v -> cidof(v) == cid, collect(reader.inputs))
                 if reader.op isa _AuthoredPlateCellOp
-                    positions = get(captures, reader.id, Dict{Int,Int}())
+                    positions = get(captures, reader.id, Dict{Int,Tuple{Int,Int}}())
                     lanes = get(batched, reader.id, Set{Int}())
                     return all(slots) do s
                         s > 1 && ((haskey(positions, s - 1) &&
@@ -492,8 +622,7 @@ function _cell_pushdowns(p::Plan)
                 length(reader.outputs) == 1 && cidof(only(reader.outputs)) in pushed ||
                     return false
                 f = forms[reader.id]
-                all(s -> f.roles[s] in (:leaf, :gather, :linear_gather) &&
-                         fits(cid, f.roles[s]), slots)
+                all(s -> f.roles[s] in _CELL_ROW_ROLES && fits(cid, f.roles[s]), slots)
             end
             ok && continue
             delete!(pushed, cid)
@@ -541,19 +670,21 @@ function _cell_shape!(e::_CellEmitter, cid::ValueId)
     d = e.pushdowns
     r = d.producer[cid]
     f = d.forms[r.id]
+    input_shape(input) = input in d.pushed ? _cell_shape!(e, input) :
+        Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input])
     if f.kind === :product
         factor = canon_id(d.graph, r.inputs[findfirst(==(:factor), f.roles)].id)
+        operand = canon_id(d.graph, r.inputs[f.operand].id)
         return e.shapes[cid] = _cell_bind!(e, :cell_shape,
-            Expr(:call, _cell_ref(:_cell_factor_shape), e.names[factor]))
+            Expr(:call, _cell_ref(:_cell_product_shape), input_shape(factor),
+                e.names[operand]))
     end
-    parts = Any[]
-    for j in f.leaves
-        input = canon_id(d.graph, r.inputs[j].id)
-        push!(parts, input in d.pushed ? _cell_shape!(e, input) :
-            Expr(:call, _cell_ref(:_cell_leaf_shape), e.names[input]))
-    end
-    e.shapes[cid] = _cell_bind!(e, :cell_shape,
-        Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple, parts...)))
+    parts = Any[input_shape(canon_id(d.graph, r.inputs[j].id)) for j in f.leaves]
+    shape = f.kind === :columns ?
+        Expr(:call, _cell_ref(:_cell_column_shape), only(parts)) :
+        f.kind === :hcat ? Expr(:call, _cell_ref(:_cell_hcat_shape), Expr(:tuple, parts...)) :
+        Expr(:call, _cell_ref(:_plate_broadcast_shape), Expr(:tuple, parts...))
+    e.shapes[cid] = _cell_bind!(e, :cell_shape, shape)
 end
 
 function _cell_operand_row!(e::_CellEmitter, cid::ValueId, row::Symbol)
@@ -569,7 +700,7 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
     d = e.pushdowns
     r = d.producer[cid]
     f = d.forms[r.id]
-    if f.kind === :pointwise
+    if f.kind in (:pointwise, :columns, :hcat)
         push!(e.body.args, Expr(:call, _cell_ref(:_cell_check_row),
             _cell_shape!(e, cid), row))
     end
@@ -587,7 +718,8 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
             end
         elseif role in (:gather, :linear_gather) && icid in d.pushed
             index = canon_id(d.graph, r.inputs[f.gather_index[j]].id)
-            at = Expr(:call, _cell_ref(:_cell_gather_row), _cell_operand_row!(e, index, row))
+            at = Expr(:call, _cell_ref(:_cell_gather_row), _cell_operand_row!(e, index, row),
+                row)
             shape = role === :gather ? nothing : _cell_shape!(e, icid)
             role === :gather ||
                 (at = Expr(:call, _cell_ref(:_cell_linear_row), shape, at))
@@ -595,6 +727,8 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
             window = _cell_window!(e, icid, source_row)
             push!(args, _cell_bind!(e, :cell_window, Expr(:call,
                 _cell_ref(:_CellWindow), window, source_row, shape)))
+        elseif role === :factor && icid in d.pushed
+            push!(args, _cell_window!(e, icid, row))
         elseif role === :factor
             push!(args, Expr(:call, _cell_ref(:_cell_factor_rows), e.names[icid], row))
         else
@@ -615,9 +749,12 @@ function _cell_window!(e::_CellEmitter, cid::ValueId, row::Symbol)
 end
 
 # The window a cell reads in place of pushed capture `cid`, at linear
-# position `only(slice)` (the cell's batched element).
-function _cell_capture!(e::_CellEmitter, cid::ValueId, slice)
-    position = _cell_bind!(e, :cell_read, Expr(:call, GlobalRef(Base, :only), slice))
+# position `only(slice)` (the cell's batched element), or at `via[only(slice)]`;
+# either is one position or an integer vector of them.
+function _cell_capture!(e::_CellEmitter, cid::ValueId, slice, via = nothing)
+    element = Expr(:call, GlobalRef(Base, :only), slice)
+    via === nothing || (element = Expr(:call, GlobalRef(Base, :getindex), via, element))
+    position = _cell_bind!(e, :cell_read, element)
     shape = _cell_shape!(e, cid)
     row = _cell_bind!(e, :cell_row, Expr(:call, _cell_ref(:_cell_linear_row), shape, position))
     window = _cell_window!(e, cid, row)
